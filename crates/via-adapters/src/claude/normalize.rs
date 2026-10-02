@@ -813,7 +813,16 @@ fn denial_kind(tool: &str) -> DenialKind {
 /// Q9: what a call acts on: the file path, command, URL or query its input
 /// names, else the tool's name; cut to [`TARGET_MAX`].
 fn target(tool: &str, input: &Value) -> String {
-    let member = match tool {
+    let named = input
+        .get(target_member(tool))
+        .and_then(Value::as_str)
+        .unwrap_or(tool);
+    cut(named, TARGET_MAX)
+}
+
+/// The input member naming what `tool` acts on; `""` for none.
+fn target_member(tool: &str) -> &'static str {
+    match tool {
         "Write" | "Edit" | "MultiEdit" | "Read" => "file_path",
         "NotebookEdit" => "notebook_path",
         "Bash" => "command",
@@ -821,20 +830,23 @@ fn target(tool: &str, input: &Value) -> String {
         "WebSearch" => "query",
         "Glob" | "Grep" => "pattern",
         _ => "",
-    };
-    let named = input.get(member).and_then(Value::as_str).unwrap_or(tool);
-    cut(named, TARGET_MAX)
+    }
 }
 
-/// A terminal entry's target, from its raw input; an input that does not
-/// parse names the tool.
+/// A terminal entry's target, from its raw input: only the target member
+/// is parsed, the others are skipped raw (review r3 #2); without a
+/// readable member, the tool's name.
 fn denial_target(denial: &PermissionDenial) -> String {
-    let input = denial
+    let tool = denial.tool_name.as_str();
+    let named = denial
         .tool_input
         .as_ref()
-        .and_then(|raw| serde_json::from_str(raw.get()).ok())
-        .unwrap_or(Value::Null);
-    target(&denial.tool_name, &input)
+        .and_then(|raw| serde_json::from_str::<BTreeMap<String, Box<RawValue>>>(raw.get()).ok())
+        .and_then(|members| {
+            let member = members.get(target_member(tool))?;
+            serde_json::from_str::<String>(member.get()).ok()
+        });
+    cut(named.as_deref().unwrap_or(tool), TARGET_MAX)
 }
 
 /// `text` cut at a character boundary to at most `max` bytes.

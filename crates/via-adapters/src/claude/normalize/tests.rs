@@ -1113,11 +1113,11 @@ fn authentication_reason_alone_is_auth() {
     );
 }
 
-/// Review r2 #3: deep raw output reaches the terminal verbatim, and deep
-/// unknown metadata never rejects the result.
+/// Review r2 #3: nested raw output within the limits reaches the terminal
+/// verbatim, and nested unknown metadata never rejects the result.
 #[test]
 fn deep_raw_members_reach_the_terminal() {
-    let deep = format!("{}{}", "[".repeat(130), "]".repeat(130));
+    let deep = format!("{}{}", "[".repeat(60), "]".repeat(60));
     let base = result_line(&json!({}));
     let with = |member: &str| base.replacen('{', &format!("{{\"{member}\":{deep},"), 1);
     let (_, run) = run_lines(
@@ -1136,4 +1136,27 @@ fn deep_raw_members_reach_the_terminal() {
         &[init_line(NEW_SID), with("new_stat")],
     );
     assert_eq!(run.terminal().status, VendorTerminalStatus::Completed);
+}
+
+/// Review r3 #2: a terminal denial's target is read from its member alone;
+/// an unrelated member that would not parse as a whole leaves it intact.
+#[test]
+fn denial_target_reads_its_member_only() {
+    let result = result_line(&json!({})).replacen(
+        r#""permission_denials":[]"#,
+        r#""permission_denials":[{"tool_name":"Write","tool_use_id":"t9","tool_input":{"content":"\ud800","file_path":"/f","big":[1,2,3]}}]"#,
+        1,
+    );
+    let (_, run) = run_lines(&facts(NEW_SID, false), &[init_line(NEW_SID), result]);
+    let targets: Vec<_> = run
+        .observations()
+        .filter_map(|o| {
+            if let Observation::ActionDenied(denial) = o {
+                Some(denial.target.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(targets, ["/f"]);
 }

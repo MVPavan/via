@@ -319,15 +319,38 @@ fn vendor_refusal(route: &'static str, vendor: &VendorOptions) -> Option<Refusal
 }
 
 /// Normalized prefixes of the flag, setting and environment-override
-/// families the recipe owns (C2 §6.1, packet §4).
-const RESERVED_PREFIXES: [&str; 41] = [
+/// families the recipe owns (C2 §6.1, packet §4): each names several
+/// spellings or members (`permissionMode`, `permissionPromptTool`, …;
+/// `ANTHROPIC_*`, `CLAUDE_CODE_*`; `env` and `environment`).
+const RESERVED_PREFIXES: [&str; 20] = [
     "permission",
     "dangerously",
     "allowdangerously",
     "allowedtool",
     "disallowedtool",
-    "tool",
     "adddir",
+    "systemprompt",
+    "appendsystemprompt",
+    "maxturn",
+    "includepartial",
+    "replayuser",
+    "setting",
+    "agent",
+    "mcp",
+    "plugin",
+    "disableslashcommand",
+    "env",
+    "claudeconfig",
+    "anthropic",
+    "claudecode",
+];
+
+/// Normalized names matched exactly (review r2 #7, r3 #3 and #4): the
+/// recipe's singleton flags, the launch environment's variables (the
+/// known locale variables included), and VIA's canonical parameters.
+const RESERVED_NAMES: [&str; 46] = [
+    "tool",
+    "tools",
     "resume",
     "sessionid",
     "continue",
@@ -335,38 +358,26 @@ const RESERVED_PREFIXES: [&str; 41] = [
     "model",
     "fallbackmodel",
     "effort",
-    "systemprompt",
-    "appendsystemprompt",
-    "maxturn",
     "jsonschema",
     "inputformat",
     "outputformat",
     "print",
     "verbose",
-    "includepartial",
-    "replayuser",
     "bare",
-    "setting",
     "restricted",
     "safemode",
-    "agent",
-    "mcp",
-    "strictmcp",
-    "plugin",
+    "strictmcpconfig",
     "nosessionpersistence",
     "sessionpersistence",
-    "disableslashcommand",
     "worktree",
-    "env",
-    "claudeconfig",
     "configdir",
-    "anthropic",
-    "claudecode",
-];
-
-/// Normalized names matched exactly (review r2 #7): the launch
-/// environment's variables and VIA's canonical parameters.
-const RESERVED_NAMES: [&str; 17] = [
+    "lcall",
+    "lcctype",
+    "lccollate",
+    "lcmessages",
+    "lcmonetary",
+    "lcnumeric",
+    "lctime",
     "home",
     "path",
     "lang",
@@ -447,6 +458,11 @@ mod tests {
             "promptly",
             "homepage",
             "lcd",
+            "modeling",
+            "effortless",
+            "printer",
+            "barely",
+            "toolbox",
         ] {
             assert!(!reserved(key), "{key}");
         }
@@ -463,6 +479,10 @@ mod tests {
             "LANG",
             "lang",
             "LC_ALL",
+            "lcAll",
+            "lc.all",
+            "--lc-all",
+            "LC_CTYPE",
             "HOME",
             "instructions",
             "INSTRUCTIONS",

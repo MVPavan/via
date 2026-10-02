@@ -25,6 +25,10 @@ pub enum DecodeError {
     /// wrong shape, or one past its bound.
     #[error("a malformed {0} message")]
     Malformed(&'static str),
+    /// The line passes the JSON structure limits (runtime §8: depth 64,
+    /// 65,536 nodes).
+    #[error("a message past the JSON structure limits")]
+    Limits,
 }
 
 /// One decoded stream-json message.
@@ -409,6 +413,8 @@ const RESULT_READ: [&str; 15] = [
 
 /// Decodes one stream-json line (without its LF).
 pub fn decode(line: &[u8]) -> Result<Message, DecodeError> {
+    // Runtime §8 structure limits, before any serde pass (review r3 #1).
+    via_wire::json_limits::scan(line).map_err(|_| DecodeError::Limits)?;
     let envelope: Envelope = serde_json::from_slice(line).map_err(|_| DecodeError::NotTyped)?;
     let subtype = if envelope.kind == "system" {
         let system: SystemEnvelope = typed(line, "system")?;
@@ -789,20 +795,44 @@ mod tests {
         format!("{}{}", "[".repeat(n), "]".repeat(n))
     }
 
-    /// Review r2 #5: a deeply nested non-string `system` subtype is
-    /// bounded unknown activity, never malformed.
+    /// Review r3 #1: past depth 64 or 65,536 nodes, before any serde
+    /// pass, a line is a limits error: a 65-level tool input, a
+    /// 70,000-node one, and a 130-level output.
+    #[test]
+    fn structure_limits_come_first() {
+        let tool = |input: &str| {
+            format!(
+                r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"t","name":"Bash","input":{input}}}]}}}}"#
+            )
+        };
+        let wide = format!("[{}]", vec!["0"; 70_000].join(","));
+        for line in [
+            tool(&nested(65)),
+            tool(&wide),
+            format!(
+                r#"{{"type":"result","subtype":"success","is_error":false,"session_id":"u","structured_output":{}}}"#,
+                nested(130)
+            ),
+        ] {
+            assert_eq!(decode(line.as_bytes()).unwrap_err(), DecodeError::Limits);
+        }
+    }
+
+    /// Review r2 #5: a nested non-string `system` subtype is bounded
+    /// unknown activity, never malformed.
     #[test]
     fn deep_system_subtype_is_unknown() {
-        let line = format!(r#"{{"type":"system","subtype":{}}}"#, nested(130));
+        let line = format!(r#"{{"type":"system","subtype":{}}}"#, nested(60));
         let message = decode(line.as_bytes()).unwrap();
         assert!(matches!(message, Message::Unknown { tag } if tag == "system"));
     }
 
-    /// Review r2 #3: deep raw output and deep unknown metadata decode; the
-    /// output stays verbatim and the members are kept raw.
+    /// Review r2 #3: nested raw output and unknown metadata within the
+    /// limits decode; the output stays verbatim and the members are kept
+    /// raw.
     #[test]
     fn deep_result_members_decode() {
-        let deep = nested(130);
+        let deep = nested(60);
         for line in [
             format!(
                 r#"{{"type":"result","subtype":"success","is_error":false,"session_id":"u","structured_output":{deep}}}"#
