@@ -370,6 +370,7 @@ impl Rig {
             RuntimeConfig {
                 anchor_binary: binary("via"),
                 anchor_dir: dir.path().join("runtime"),
+                vendor_state_dir: dir.path().join("vendor"),
             },
             store.runtime_resources(),
         )

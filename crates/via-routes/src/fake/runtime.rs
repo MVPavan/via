@@ -13,7 +13,7 @@ use lane::{Facts, Interrupt, LaneState, steer_request, turn_result};
 use via_wire::{
     CloseMode, CloseRequest, ExitReport, FailureCause, HostError, LatchState, PendingWrite,
     WireCleanup, WireCloseReport, WireError, WireFailure, WireMessages, WireParts, WireSender,
-    WireSignals,
+    WireSignals, WriteBounds,
 };
 
 mod lane;
@@ -410,7 +410,9 @@ impl FakeRoute {
         serving.phase = Phase::Submitted;
         // While the start is pending no message is read: nothing the vendor
         // answers is taken before its whole input is written.
-        let write = serving.sender.write(start, serving.deadline);
+        let write = serving
+            .sender
+            .write(start, WriteBounds::CutAt(serving.deadline));
         let sent = serving
             .serve(write)
             .await?

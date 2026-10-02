@@ -29,6 +29,9 @@ pub struct RuntimeConfig {
     pub anchor_binary: std::path::PathBuf,
     /// Validated private anchor socket/control directory.
     pub anchor_dir: std::path::PathBuf,
+    /// `<state>/vendor/`, the bootstrap's private directory for vendor
+    /// state VIA owns (x.3.2 X0 item 4), for a shared route's launch.
+    pub vendor_state_dir: std::path::PathBuf,
 }
 
 /// Wire owns the evidence root and process capabilities split from one
@@ -38,6 +41,7 @@ pub struct WireRuntime {
     host: Host,
     /// Connection tasks that missed their join bound (design §8.6).
     stragglers: Stragglers,
+    vendor_state_dir: std::path::PathBuf,
 }
 
 impl WireRuntime {
@@ -49,14 +53,47 @@ impl WireRuntime {
             evidence,
             host,
             stragglers: Stragglers::default(),
+            vendor_state_dir: config.vendor_state_dir,
         })
     }
 
-    /// Opens one private connection for the turn `spec.owner` names. First
-    /// the turn's evidence folder is created by an owned blob step (design
-    /// §7.2); a failure, an overrun of 2 s or a refusal at the cap there is
-    /// [`WireError::Evidence`] and nothing is
-    /// acquired. Host then creates `stderr.log` in it for the vendor.
+    /// `<state>/vendor/` (x.3.2 X0 item 4).
+    pub fn vendor_state_dir(&self) -> &std::path::Path {
+        &self.vendor_state_dir
+    }
+
+    /// Host's sticky journal-uncertain watch (x.3.2 X0 item 2.6): `true`
+    /// once any Host journal outcome was uncertain, whatever its owner.
+    pub fn journal_uncertain(&self) -> watch::Receiver<bool> {
+        self.host.journal_uncertain()
+    }
+
+    /// Creates the evidence folder `<state>/evidence/<session>/<turn>/` of a
+    /// turn on a shared route (x.3.2 X0 item 1.4), by an owned blob step as
+    /// [`Self::open_connection`] does; a failure is
+    /// [`WireError::Evidence`].
+    pub async fn turn_folder(
+        &self,
+        session: &via_store::SessionId,
+        turn: via_store::TurnNumber,
+    ) -> Result<connection::TurnFolder, WireError> {
+        let root = self.evidence.clone();
+        let tasks = self.evidence.blob_tasks().clone();
+        let session = session.clone();
+        let folder = tasks
+            .run(move || root.create_turn(&session, turn))
+            .await
+            .map_err(|error| WireError::Evidence(std::io::Error::other(error)))?;
+        Ok(connection::TurnFolder::new(folder, tasks))
+    }
+
+    /// Opens one private connection for `spec.owner`. First the owner's
+    /// evidence folder is created by an owned blob step (design §7.2): the
+    /// turn's, or for a shared server `evidence/servers/<server_id>/`, with
+    /// no turn folder (x.3.2 X0 item 1.3). A failure, an overrun of 2 s or a
+    /// refusal at the cap there is [`WireError::Evidence`] and nothing is
+    /// acquired. Host then creates `stderr.log` in it for the vendor, and
+    /// the connection keeps its undecoded message there.
     /// Once `signals.force` is set, waits for vendor input, output or exit
     /// end with [`WireError::Cancelled`]. A failed acquisition is
     /// [`WireError::Acquire`] with Host's cleanup evidence.
@@ -68,19 +105,16 @@ impl WireRuntime {
     ) -> Result<WireConnection, WireError> {
         let root = self.evidence.clone();
         let tasks = self.evidence.blob_tasks().clone();
-        let via_host::ProcessOwner::Turn {
-            session_id: session,
-            turn,
-        } = spec.owner.clone()
-        else {
-            return Err(WireError::Host(via_host::HostError::Invalid(
-                "a shared server's connection is not opened here yet",
-            )));
-        };
+        let owner = spec.owner.clone();
         // An owned blob step (coding-style §5): answered within 2 s, and
         // still counted at final shutdown if it overran or its caller ended.
         let folder = tasks
-            .run(move || root.create_turn(&session, turn))
+            .run(move || match owner {
+                via_host::ProcessOwner::Turn { session_id, turn } => {
+                    root.create_turn(&session_id, turn)
+                }
+                via_host::ProcessOwner::Server { server_id } => root.create_server(&server_id),
+            })
             .await
             .map_err(|error| WireError::Evidence(std::io::Error::other(error)))?;
         spec.stderr_path = folder.join("stderr.log");
@@ -245,6 +279,9 @@ pub struct WireCloseReport {
     /// The absence proof's commit had an uncertain outcome: the daemon must
     /// latch (design §7.2 row 12).
     pub journal_uncertain: bool,
+    /// Host's typed reply to this close's own `Stop`, unchanged (runtime §5
+    /// stop reply): `None` when no valid reply arrived in time.
+    pub stopped_live: Option<bool>,
 }
 
 /// Failure of a private byte transport; an uncertain write never permits resend.

@@ -107,6 +107,21 @@ impl RouteRuntime {
     pub fn watch_force(&self, forced: watch::Receiver<Option<tokio::time::Instant>>) {
         self.wire.watch_force(forced);
     }
+
+    /// Host's sticky journal-uncertain watch (x.3.2 X0 item 2.6).
+    pub fn journal_uncertain(&self) -> watch::Receiver<bool> {
+        self.wire.journal_uncertain()
+    }
+
+    /// Creates a turn's evidence folder on a shared route (x.3.2 X0 item
+    /// 1.4).
+    pub async fn turn_folder(
+        &self,
+        session: &crate::SessionId,
+        turn: crate::TurnNumber,
+    ) -> Result<via_wire::TurnFolder, WireError> {
+        self.wire.turn_folder(session, turn).await
+    }
 }
 
 /// A turn's process facts once its route retired it: on a persistent

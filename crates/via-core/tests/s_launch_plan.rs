@@ -59,6 +59,7 @@ fn s_launch_plan_inherit_per_harness() {
         RuntimeConfig {
             anchor_binary: dir.path().join("anchor"),
             anchor_dir: dir.path().join("runtime"),
+            vendor_state_dir: dir.path().join("vendor"),
         },
         store.runtime_resources(),
     )

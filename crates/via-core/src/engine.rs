@@ -380,6 +380,7 @@ impl Engine {
             RuntimeConfig {
                 anchor_binary: binary,
                 anchor_dir: runtime.join("anchors"),
+                vendor_state_dir: state.join("vendor"),
             },
             owner.runtime_resources(),
         )
