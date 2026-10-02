@@ -22,8 +22,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use serde_json::value::RawValue;
-use serde_json::{Map, Value};
 use tokio::time::Instant;
 use via_routes::claude::{
     AssistantMessage, Block, ControlRequest, ControlResponse, Init, Message, PermissionDenial,
@@ -41,10 +42,16 @@ use crate::{
     VendorTerminal, VendorTerminalStatus, final_text_pieces,
 };
 
-/// The most IDs each per-launch set tracks: calls (open and completed
-/// together), denials and declines. The first new ID past it is a
-/// protocol failure, never inaccurate correlation (review r1 #4).
+/// The most IDs each per-launch set admits: calls (open and completed
+/// together), denials and declines. The first new ID past it, or past
+/// [`TRACKED_BYTES`], is an explicit [`End::Overflow`], never inaccurate
+/// correlation (review r1 #4, r2 #6).
 const TRACKED: usize = 4096;
+
+/// The bytes all the sets together admit: every ID, and each call's
+/// target. As the Codex adapter's bound (256 KiB); an E2E measurement
+/// item, not a qualified figure.
+const TRACKED_BYTES: usize = 256 * 1024;
 
 /// The longest `action.denied` target or reason.
 const TARGET_MAX: usize = 1024;
@@ -61,8 +68,8 @@ const VENDOR_MAX: usize = 16 * 1024;
 /// The most unread result members considered for vendor data.
 const EXTRA_MAX: usize = 64;
 
-/// What an encoded payload spends beyond the variable fields counted:
-/// member names, numbers, enums and punctuation.
+/// What a terminal's encoding spends beyond the variable fields counted:
+/// member names, numbers, enums and punctuation, all well under it.
 const PAYLOAD_OVERHEAD: usize = 1024;
 
 /// What the normalizer must know of its launch.
@@ -85,8 +92,9 @@ pub(crate) struct LaunchFacts {
 /// How a message ends the turn.
 #[derive(Debug)]
 pub(crate) enum End {
-    /// The one retained terminal; its observations precede it.
-    Terminal(Box<VendorTerminal>),
+    /// The turn's terminal ended it: [`Batch::terminal`] holds it, after
+    /// its observations.
+    Terminal,
     /// A pre-init rejection: nothing was confirmed or accepted.
     Rejected(StartRejected),
     /// The vendor runs another session than the expected one.
@@ -95,6 +103,10 @@ pub(crate) enum End {
     Refused(Incompatibility),
     /// A protocol contradiction, or a count or payload past its bound.
     Protocol(&'static str),
+    /// A call, denial or decline ID that VIA could not admit to its
+    /// bounded set: the driver reports it on the health path as an
+    /// ingress overflow (C2). The normalizer takes nothing after it.
+    Overflow,
 }
 
 /// A control request the driver must decline at once on the control lane,
@@ -116,6 +128,9 @@ pub(crate) struct Batch {
     pub(crate) observations: Vec<Observation>,
     /// A request to decline.
     pub(crate) decline: Option<PendingDecline>,
+    /// The one retained terminal (AD4: kept beside a failure that ends
+    /// the turn with it).
+    pub(crate) terminal: Option<Box<VendorTerminal>>,
     /// The end of the turn, after the observations.
     pub(crate) end: Option<End>,
 }
@@ -161,7 +176,15 @@ pub(crate) struct Normalizer {
     /// Frozen at the terminal: the receipt and the qualified abort.
     acknowledged: bool,
     unmatched: u64,
+    /// The bytes the tracked sets hold, against [`TRACKED_BYTES`].
+    tracked_bytes: usize,
+    /// An ID overflowed: the normalizer takes nothing more.
+    overflowed: bool,
 }
+
+/// An ID could not be admitted to its bounded set.
+#[derive(Debug)]
+struct Overflow;
 
 impl Normalizer {
     pub(crate) fn new(launch: LaunchFacts) -> Self {
@@ -181,6 +204,8 @@ impl Normalizer {
             receipt: false,
             acknowledged: false,
             unmatched: 0,
+            tracked_bytes: 0,
+            overflowed: false,
         }
     }
 
@@ -215,12 +240,19 @@ impl Normalizer {
     /// The decline `pending` was written whole: its
     /// `vendor.request_declined`, and from now its call's denial is
     /// suppressed (review r1 #9).
+    /// The written decline is reported even past an overflow: it happened.
     pub(crate) fn declined(&mut self, pending: PendingDecline) -> Batch {
         let mut batch = Batch::default();
-        if let Some(id) = &pending.tool_use_id
-            && !track(&mut self.declined, id)
-        {
-            batch.end = Some(End::Protocol("declines past the tracking bound"));
+        let admitted = match &pending.tool_use_id {
+            Some(id) if !self.overflowed => {
+                admit(&mut self.declined, id, 0, &mut self.tracked_bytes).is_ok()
+            }
+            Some(_) => false,
+            None => !self.overflowed,
+        };
+        if !admitted {
+            self.overflowed = true;
+            batch.end = Some(End::Overflow);
         }
         batch
             .observations
@@ -228,8 +260,17 @@ impl Normalizer {
         batch
     }
 
-    /// Normalizes one decoded message.
+    /// Normalizes one decoded message; after an overflow, nothing.
     pub(crate) fn message(&mut self, message: Message, at: Instant) -> Batch {
+        if self.overflowed {
+            return Batch::ended(End::Overflow);
+        }
+        let batch = self.dispatch(message, at);
+        self.overflowed = matches!(batch.end, Some(End::Overflow));
+        batch
+    }
+
+    fn dispatch(&mut self, message: Message, at: Instant) -> Batch {
         match message {
             Message::Init(init) => self.init(init),
             Message::PermissionDenied(denied) => self.permission_denied(&denied),
@@ -304,8 +345,8 @@ impl Normalizer {
                 requested: self.launch.expected_session.clone(),
                 returned: returned.to_owned(),
             }],
-            decline: None,
             end: Some(End::ResumeMismatch),
+            ..Batch::default()
         }
     }
 
@@ -338,9 +379,10 @@ impl Normalizer {
             None => "denied by the vendor's permission policy".to_owned(),
         };
         let mut batch = Batch::default();
-        match self.denial(&denied.tool_name, &denied.tool_use_id, target, &reason) {
-            Ok(denial) => batch.observations.extend(denial),
-            Err(why) => batch.end = Some(End::Protocol(why)),
+        if let Ok(denial) = self.denial(&denied.tool_name, &denied.tool_use_id, target, &reason) {
+            batch.observations.extend(denial);
+        } else {
+            batch.end = Some(End::Overflow);
         }
         batch
     }
@@ -353,13 +395,11 @@ impl Normalizer {
         tool_use_id: &str,
         target: Option<String>,
         reason: &str,
-    ) -> Result<Option<Observation>, &'static str> {
+    ) -> Result<Option<Observation>, Overflow> {
         if self.declined.contains(tool_use_id) || self.denied.contains(tool_use_id) {
             return Ok(None);
         }
-        if !track(&mut self.denied, tool_use_id) {
-            return Err("denials past the tracking bound");
-        }
+        admit(&mut self.denied, tool_use_id, 0, &mut self.tracked_bytes)?;
         Ok(Some(Observation::ActionDenied(Denial {
             kind: denial_kind(tool),
             target: target.unwrap_or_else(|| cut(tool, TARGET_MAX)),
@@ -392,10 +432,16 @@ impl Normalizer {
                     if self.open.contains_key(id) || self.done.contains_key(id) {
                         continue;
                     }
-                    if self.open.len() + self.done.len() >= TRACKED {
-                        return Batch::ended(End::Protocol("tool calls past the tracking bound"));
+                    let target = target(name, input);
+                    let charged = self
+                        .tracked_bytes
+                        .saturating_add(id.len())
+                        .saturating_add(target.len());
+                    if self.open.len() + self.done.len() >= TRACKED || charged > TRACKED_BYTES {
+                        return Batch::ended(End::Overflow);
                     }
-                    self.open.insert(id.clone(), target(name, input));
+                    self.tracked_bytes = charged;
+                    self.open.insert(id.clone(), target);
                     marks.tools_started.push((id.clone(), name.clone()));
                 }
                 Block::ToolResult { .. } | Block::Other => {}
@@ -466,22 +512,23 @@ impl Normalizer {
                 return batch;
             }
         };
+        // AD4: an overflow here ends the turn beside its terminal, which
+        // is kept (review r2 #2).
+        let mut end = End::Terminal;
         for denial in &result.permission_denials {
             let target = self
                 .known_target(&denial.tool_use_id)
                 .unwrap_or_else(|| denial_target(denial));
-            match self.denial(
+            let Ok(denial) = self.denial(
                 &denial.tool_name,
                 &denial.tool_use_id,
                 Some(target),
                 "denied by the vendor's permission policy",
-            ) {
-                Ok(denial) => batch.observations.extend(denial),
-                Err(why) => {
-                    batch.end = Some(End::Protocol(why));
-                    return batch;
-                }
-            }
+            ) else {
+                end = End::Overflow;
+                break;
+            };
+            batch.observations.extend(denial);
         }
         if !result.is_error
             && let Some(text) = result.result.as_deref()
@@ -490,7 +537,8 @@ impl Normalizer {
                 final_text_pieces(text).map(|piece| Observation::FinalText(piece.to_owned())),
             );
         }
-        batch.end = Some(End::Terminal(Box::new(terminal)));
+        batch.terminal = Some(Box::new(terminal));
+        batch.end = Some(end);
         batch
     }
 
@@ -515,7 +563,7 @@ impl Normalizer {
 
     /// Packet §5 and §7 terminal mapping, on qualified combinations of
     /// `is_error`, `subtype`, `terminal_reason`, `api_error_status` and
-    /// the synthetic error code (review r1 #6), in this order: success;
+    /// the synthetic error code (review r1 #6, r2 #4), in this order: success;
     /// the acknowledged abort; authentication evidence; the max-turns
     /// pair; any other vendor error. The vendor code is always one the
     /// vendor sent. The retained payload is bounded (review r1 #3).
@@ -548,6 +596,7 @@ impl Normalizer {
                 None,
             )
         } else if self.synthetic_error.as_deref() == Some("authentication_failed")
+            || reason == Some("authentication_failed")
             || matches!(result.api_error_status, Some(401 | 403))
         {
             (
@@ -641,17 +690,25 @@ impl Normalizer {
     }
 }
 
-/// Inserts `id` into `set` unless the set is full; whether `id` is
-/// tracked.
-fn track(set: &mut BTreeSet<String>, id: &str) -> bool {
+/// Admits `id` to `set`, charging its bytes and `extra` to `bytes`; an ID
+/// already held is admitted free. Past [`TRACKED`] IDs in the set or
+/// [`TRACKED_BYTES`] in all, an overflow.
+fn admit(
+    set: &mut BTreeSet<String>,
+    id: &str,
+    extra: usize,
+    bytes: &mut usize,
+) -> Result<(), Overflow> {
     if set.contains(id) {
-        return true;
+        return Ok(());
     }
-    if set.len() >= TRACKED {
-        return false;
+    let charged = bytes.saturating_add(id.len()).saturating_add(extra);
+    if set.len() >= TRACKED || charged > TRACKED_BYTES {
+        return Err(Overflow);
     }
     set.insert(id.to_owned());
-    true
+    *bytes = charged;
+    Ok(())
 }
 
 /// `text`'s bytes as a JSON string.
@@ -659,19 +716,37 @@ fn encoded(text: &str) -> usize {
     serde_json::to_string(text).map_or(usize::MAX, |json| json.len())
 }
 
-/// A progress mark's encoded bytes, its tool IDs and names counted.
+/// The progress fields as they encode: each start an `[id, name]` pair.
+#[derive(Serialize)]
+struct ProgressFields<'a> {
+    model: bool,
+    tools_started: &'a [(String, String)],
+    tools_ended: &'a [String],
+}
+
+/// A progress mark's exact encoded bytes (review r2 #1): its model flag,
+/// its starts and its ends; a sample is never on a Claude mark.
 fn progress_len(marks: &ProgressMarks) -> usize {
-    let started = marks
-        .tools_started
-        .iter()
-        .map(|(id, name)| encoded(id).saturating_add(encoded(name)).saturating_add(3));
-    let ended = marks
-        .tools_ended
-        .iter()
-        .map(|id| encoded(id).saturating_add(1));
-    started
-        .chain(ended)
-        .fold(PAYLOAD_OVERHEAD, usize::saturating_add)
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    let fields = ProgressFields {
+        model: marks.model,
+        tools_started: &marks.tools_started,
+        tools_ended: &marks.tools_ended,
+    };
+    match serde_json::to_writer(&mut count, &fields) {
+        Ok(()) => count.0,
+        Err(_) => usize::MAX,
+    }
 }
 
 /// A terminal's retained encoded bytes: its variable fields, raw JSON
@@ -751,8 +826,15 @@ fn target(tool: &str, input: &Value) -> String {
     cut(named, TARGET_MAX)
 }
 
+/// A terminal entry's target, from its raw input; an input that does not
+/// parse names the tool.
 fn denial_target(denial: &PermissionDenial) -> String {
-    target(&denial.tool_name, &denial.tool_input)
+    let input = denial
+        .tool_input
+        .as_ref()
+        .and_then(|raw| serde_json::from_str(raw.get()).ok())
+        .unwrap_or(Value::Null);
+    target(&denial.tool_name, &input)
 }
 
 /// `text` cut at a character boundary to at most `max` bytes.
@@ -814,53 +896,79 @@ fn usage(usage: &ResultUsage) -> Result<UsageSample, &'static str> {
 /// count, a non-null `fallback_credit`, each model's `costBasis`, then
 /// the result's unread members under `extra` (the first [`EXTRA_MAX`]).
 /// Each member is kept only if it still fits, so one oversized member
-/// drops alone (review r1 #12); `None` when nothing is kept.
+/// drops alone (review r1 #12). Raw values are copied verbatim, never
+/// parsed (review r2 #3); `None` when nothing is kept.
 fn vendor_data(result: &ResultMessage) -> Option<Box<RawValue>> {
-    let mut data = Map::new();
-    let fit = |data: &mut Map<String, Value>, key: &str, value: Value| {
-        data.insert(key.to_owned(), value);
-        if Value::Object(data.clone()).to_string().len() > VENDOR_MAX {
-            data.remove(key);
-        }
+    let key = |name: &str| serde_json::to_string(name).ok();
+    let mut known: Vec<(String, String)> = Vec::new();
+    let mut extra: Vec<(String, String)> = Vec::new();
+    let fits = |known: &[(String, String)], extra: &[(String, String)]| {
+        render(known, extra).len() <= VENDOR_MAX
     };
     let usage = result.usage.as_ref();
+    let mut candidates: Vec<(Option<String>, String)> = Vec::new();
     if let Some(created) = usage.and_then(|usage| usage.cache_creation_input_tokens) {
-        fit(&mut data, "cache_creation_input_tokens", created.into());
+        candidates.push((key("cache_creation_input_tokens"), created.to_string()));
     }
-    if let Some(credit) = usage.and_then(|usage| usage.fallback_credit.clone()) {
-        fit(&mut data, "fallback_credit", credit);
+    if let Some(credit) = usage.and_then(|usage| usage.fallback_credit.as_ref()) {
+        candidates.push((key("fallback_credit"), credit.get().to_owned()));
     }
-    let bases: Map<String, Value> = result
+    let bases: Vec<(String, String)> = result
         .model_usage
         .iter()
         .flatten()
-        .filter_map(|(model, usage)| Some((model.clone(), usage.get("costBasis")?.clone())))
+        .filter_map(|(model, usage)| {
+            let basis: CostBasis = serde_json::from_str(usage.get()).ok()?;
+            Some((key(model)?, basis.cost_basis?.get().to_owned()))
+        })
         .collect();
     if !bases.is_empty() {
-        fit(&mut data, "cost_basis", Value::Object(bases));
+        candidates.push((key("cost_basis"), object(&bases)));
     }
-    data.insert("extra".to_owned(), Value::Object(Map::new()));
-    for (key, value) in result.extra.iter().take(EXTRA_MAX) {
-        if let Some(Value::Object(extra)) = data.get_mut("extra") {
-            extra.insert(key.clone(), value.clone());
-        }
-        if Value::Object(data.clone()).to_string().len() > VENDOR_MAX
-            && let Some(Value::Object(extra)) = data.get_mut("extra")
-        {
-            extra.remove(key);
+    for (name, value) in candidates {
+        let Some(name) = name else { continue };
+        known.push((name, value));
+        if !fits(&known, &extra) {
+            known.pop();
         }
     }
-    if data
-        .get("extra")
-        .and_then(Value::as_object)
-        .is_some_and(Map::is_empty)
-    {
-        data.remove("extra");
+    for (name, value) in result.extra.iter().take(EXTRA_MAX) {
+        let Some(name) = key(name) else { continue };
+        extra.push((name, value.get().to_owned()));
+        if !fits(&known, &extra) {
+            extra.pop();
+        }
     }
-    if data.is_empty() {
+    if known.is_empty() && extra.is_empty() {
         return None;
     }
-    RawValue::from_string(Value::Object(data).to_string()).ok()
+    RawValue::from_string(render(&known, &extra)).ok()
+}
+
+/// A model's `modelUsage` entry, read for its `costBasis` only.
+#[derive(Deserialize)]
+struct CostBasis {
+    #[serde(rename = "costBasis")]
+    cost_basis: Option<Box<RawValue>>,
+}
+
+/// A JSON object of encoded keys and raw values.
+fn object(entries: &[(String, String)]) -> String {
+    let members: Vec<String> = entries
+        .iter()
+        .map(|(key, value)| format!("{key}:{value}"))
+        .collect();
+    format!("{{{}}}", members.join(","))
+}
+
+/// Vendor data: the known members, then `extra` when it has any.
+fn render(known: &[(String, String)], extra: &[(String, String)]) -> String {
+    if extra.is_empty() {
+        return object(known);
+    }
+    let mut all = known.to_vec();
+    all.push(("\"extra\"".to_owned(), object(extra)));
+    object(&all)
 }
 
 #[cfg(test)]

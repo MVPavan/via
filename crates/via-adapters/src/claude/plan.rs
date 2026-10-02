@@ -318,10 +318,9 @@ fn vendor_refusal(route: &'static str, vendor: &VendorOptions) -> Option<Refusal
     })
 }
 
-/// Normalized prefixes of the flags, settings and environment overrides
-/// the recipe owns (C2 §6.1, packet §4), the launch environment's names
-/// (`HOME`, `PATH`, `LANG`, `LC_*`) and VIA's canonical parameters.
-const RESERVED_PREFIXES: [&str; 56] = [
+/// Normalized prefixes of the flag, setting and environment-override
+/// families the recipe owns (C2 §6.1, packet §4).
+const RESERVED_PREFIXES: [&str; 41] = [
     "permission",
     "dangerously",
     "allowdangerously",
@@ -358,26 +357,33 @@ const RESERVED_PREFIXES: [&str; 56] = [
     "sessionpersistence",
     "disableslashcommand",
     "worktree",
-    "cwd",
     "env",
     "claudeconfig",
     "configdir",
     "anthropic",
     "claudecode",
+];
+
+/// Normalized names matched exactly (review r2 #7): the launch
+/// environment's variables and VIA's canonical parameters.
+const RESERVED_NAMES: [&str; 17] = [
     "home",
     "path",
     "lang",
-    "lc",
+    "cwd",
+    "prompt",
     "instructions",
     "outputschema",
-    "maxstep",
+    "maxsteps",
     "bound",
-    "prompt",
-    "extrawritedir",
+    "extrawritedirs",
     "inherit",
     "harness",
     "session",
     "vendor",
+    "require",
+    "handle",
+    "allowuntested",
 ];
 
 /// Single-letter flags the recipe owns: `-p`, `-r` and `-c`.
@@ -395,8 +401,15 @@ fn normalize(key: &str) -> String {
 }
 
 fn reserved(key: &str) -> bool {
+    // The locale family, `LC_*`, before normalization drops its `_`.
+    let locale = key
+        .trim_start_matches('-')
+        .get(..3)
+        .is_some_and(|head| head.eq_ignore_ascii_case("lc_"));
     let key = normalize(key);
-    RESERVED_SHORT.contains(&key.as_str())
+    locale
+        || RESERVED_SHORT.contains(&key.as_str())
+        || RESERVED_NAMES.contains(&key.as_str())
         || RESERVED_PREFIXES
             .iter()
             .any(|prefix| key.starts_with(prefix))
@@ -423,7 +436,18 @@ mod tests {
         ] {
             assert!(reserved(key), "{key}");
         }
-        for key in ["--debug", "temperature", "pp", "x"] {
+        for key in [
+            "--debug",
+            "temperature",
+            "pp",
+            "x",
+            "pathology",
+            "language",
+            "boundary",
+            "promptly",
+            "homepage",
+            "lcd",
+        ] {
             assert!(!reserved(key), "{key}");
         }
     }

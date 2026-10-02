@@ -49,10 +49,10 @@ impl Run {
     }
 
     fn terminal(&self) -> &VendorTerminal {
-        match self.end() {
-            Some(End::Terminal(terminal)) => terminal,
-            other => panic!("no terminal: {other:?}"),
-        }
+        self.batches
+            .iter()
+            .find_map(|batch| batch.terminal.as_deref())
+            .unwrap_or_else(|| panic!("no terminal: {:?}", self.end()))
     }
 
     fn final_text(&self) -> String {
@@ -774,7 +774,7 @@ fn retained_payload_is_bounded() {
     let (_, run) = run_lines(&schema, &[init.clone(), result_line(&output(300 * 1024))]);
     assert!(matches!(run.end(), Some(End::Protocol(_))));
     let (_, run) = run_lines(&schema, &[init, result_line(&output(200 * 1024))]);
-    assert!(matches!(run.end(), Some(End::Terminal(_))));
+    assert!(matches!(run.end(), Some(End::Terminal)));
 
     let blocks: Vec<Value> = (0..150)
         .map(|i| {
@@ -786,7 +786,10 @@ fn retained_payload_is_bounded() {
         "message":{"id":"m","model":"m","content":blocks}})
     .to_string();
     let (_, run) = run_lines(&facts(NEW_SID, false), &[init_line(NEW_SID), many]);
-    assert!(matches!(run.end(), Some(End::Protocol(_))));
+    // These calls pass the tracking byte bound before the progress bound
+    // (`progress_encoding_is_exact` covers that one): either way the turn
+    // ends without an oversized mark.
+    assert!(matches!(run.end(), Some(End::Protocol(_) | End::Overflow)));
     assert_eq!(run.count("progress"), 0);
 }
 
@@ -808,7 +811,7 @@ fn tool_result(id: &str) -> String {
 #[test]
 fn tracking_overflow_is_explicit() {
     let ids = |n: usize| (0..n).map(|i| format!("t{i}")).collect::<Vec<_>>();
-    let protocol = |batch: &Batch| matches!(batch.end, Some(End::Protocol(_)));
+    let protocol = |batch: &Batch| matches!(batch.end, Some(End::Overflow));
     let uses = |ids: &[String]| {
         let blocks: Vec<Value> = ids
             .iter()
@@ -865,6 +868,22 @@ fn tracking_overflow_is_explicit() {
         assert!(!protocol(&feed(&mut normalizer, &request(&id))));
     }
     assert!(protocol(&feed(&mut normalizer, &request("new"))));
+    // Sticky: nothing is taken after an overflow.
+    let after = feed(&mut normalizer, &result_line(&json!({})));
+    assert!(protocol(&after) && after.terminal.is_none());
+
+    // By bytes: 300 calls with 1000-byte IDs pass the shared byte bound
+    // long before the count bound.
+    let long: Vec<String> = (0..300)
+        .map(|i| format!("{i:04}{}", "i".repeat(996)))
+        .collect();
+    let mut normalizer = Normalizer::new(facts(NEW_SID, false));
+    feed(&mut normalizer, &init_line(NEW_SID));
+    let overflowed = long
+        .iter()
+        .map(|id| feed(&mut normalizer, &tool_use(id, "Read", &json!({}))))
+        .position(|batch| protocol(&batch));
+    assert!(overflowed.is_some_and(|at| at < 300), "{overflowed:?}");
 }
 
 /// Review r1 #5: a completed call keeps its target: a replayed block does
@@ -1018,4 +1037,103 @@ fn vendor_data_keeps_what_fits() {
     assert_eq!(big["extra"]["new_vendor_stat"], 3);
     assert!(big["extra"].get("huge").is_none());
     assert_eq!(big["cost_basis"]["m"], "list");
+}
+
+/// Review r2 #1: the progress mark's exact encoding is bounded. With
+/// 4,096 short starts, the largest ID length that encodes within 256 KiB
+/// passes and one more byte per ID is protocol.
+#[test]
+fn progress_encoding_is_exact() {
+    let ids = |len: usize| -> Vec<String> {
+        (0..TRACKED)
+            .map(|i| format!("{i:04}{}", "i".repeat(len - 4)))
+            .collect()
+    };
+    let encoded = |ids: &[String]| {
+        let pairs: Vec<Value> = ids.iter().map(|id| json!([id, "R"])).collect();
+        json!({"model":true,"tools_started":pairs,"tools_ended":[]})
+            .to_string()
+            .len()
+    };
+    let over = (8..200)
+        .find(|len| encoded(&ids(*len)) > MAX_OBSERVATION_BYTES)
+        .unwrap();
+    for (len, fits) in [(over - 1, true), (over, false)] {
+        let blocks: Vec<Value> = ids(len)
+            .iter()
+            .map(|id| json!({"type":"tool_use","id":id,"name":"R","input":{}}))
+            .collect();
+        let line = json!({"type":"assistant","session_id":NEW_SID,
+            "message":{"id":"m","model":"m","content":blocks}})
+        .to_string();
+        let (_, run) = run_lines(&facts(NEW_SID, false), &[init_line(NEW_SID), line]);
+        assert_eq!(run.count("progress") == 1, fits, "{len}");
+        assert_eq!(matches!(run.end(), Some(End::Protocol(_))), !fits, "{len}");
+    }
+}
+
+/// Review r2 #2 (AD4): a denial overflow at the terminal keeps the
+/// terminal, its structured output, usage and cost, beside the failure.
+#[test]
+fn terminal_survives_a_denial_overflow() {
+    let mut normalizer = Normalizer::new(facts(NEW_SID, false));
+    feed(&mut normalizer, &init_line(NEW_SID));
+    for i in 0..TRACKED {
+        feed(&mut normalizer, &denied_line(&format!("t{i}"), "Read"));
+    }
+    let result = result_line(&json!({"structured_output":{"a":1},"total_cost_usd":0.5,
+        "permission_denials":[{"tool_name":"Read","tool_use_id":"new","tool_input":{}}]}));
+    let batch = feed(&mut normalizer, &result);
+    assert!(matches!(batch.end, Some(End::Overflow)), "{:?}", batch.end);
+    let terminal = batch.terminal.expect("the terminal is kept");
+    assert_eq!(
+        terminal.structured_output.as_ref().map(|raw| raw.get()),
+        Some(r#"{"a":1}"#)
+    );
+    assert!(terminal.usage.is_some());
+    assert_eq!(terminal.cost.as_ref().map(|cost| cost.usd), Some(0.5));
+}
+
+/// Review r2 #4: `terminal_reason: authentication_failed` alone is `auth`,
+/// keeping the vendor's code.
+#[test]
+fn authentication_reason_alone_is_auth() {
+    let (_, run) = run_lines(
+        &facts(NEW_SID, false),
+        &[
+            init_line(NEW_SID),
+            result_line(&json!({"subtype":"error_during_execution","is_error":true,
+                "terminal_reason":"authentication_failed","result":"x"})),
+        ],
+    );
+    assert_eq!(run.terminal().class_hint, Some(ClassHint::Auth));
+    assert_eq!(
+        run.terminal().vendor_code.as_deref(),
+        Some("authentication_failed")
+    );
+}
+
+/// Review r2 #3: deep raw output reaches the terminal verbatim, and deep
+/// unknown metadata never rejects the result.
+#[test]
+fn deep_raw_members_reach_the_terminal() {
+    let deep = format!("{}{}", "[".repeat(130), "]".repeat(130));
+    let base = result_line(&json!({}));
+    let with = |member: &str| base.replacen('{', &format!("{{\"{member}\":{deep},"), 1);
+    let (_, run) = run_lines(
+        &facts(NEW_SID, false),
+        &[init_line(NEW_SID), with("structured_output")],
+    );
+    assert_eq!(
+        run.terminal()
+            .structured_output
+            .as_ref()
+            .map(|raw| raw.get()),
+        Some(deep.as_str())
+    );
+    let (_, run) = run_lines(
+        &facts(NEW_SID, false),
+        &[init_line(NEW_SID), with("new_stat")],
+    );
+    assert_eq!(run.terminal().status, VendorTerminalStatus::Completed);
 }

@@ -5,10 +5,12 @@
 //! malformed message of a known type is a [`DecodeError`], which the route
 //! turns into `protocol`.
 
+use std::collections::BTreeMap;
+
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::value::RawValue;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::{OutboundMessage, SHORT_FIELD_MAX, UNKNOWN_TAG_MAX};
@@ -212,9 +214,9 @@ pub struct PermissionDenial {
     pub tool_name: String,
     /// The denied call.
     pub tool_use_id: String,
-    /// Its input.
+    /// Its input, kept raw; read for the denial's target.
     #[serde(default)]
-    pub tool_input: Value,
+    pub tool_input: Option<Box<RawValue>>,
 }
 
 /// `result.usage`: the turn aggregate.
@@ -235,9 +237,9 @@ pub struct ResultUsage {
     /// Output details.
     #[serde(default)]
     pub output_tokens_details: Option<OutputDetails>,
-    /// The fallback credit, kept for vendor data.
+    /// The fallback credit, kept raw for vendor data.
     #[serde(default)]
-    pub fallback_credit: Option<Value>,
+    pub fallback_credit: Option<Box<RawValue>>,
 }
 
 /// `result.usage.output_tokens_details`.
@@ -279,9 +281,9 @@ pub struct ResultMessage {
     /// The turn aggregate.
     #[serde(default)]
     pub usage: Option<ResultUsage>,
-    /// Per-model usage, read for `costBasis`.
+    /// Per-model usage, kept raw; read for `costBasis`.
     #[serde(default, rename = "modelUsage")]
-    pub model_usage: Option<Map<String, Value>>,
+    pub model_usage: Option<BTreeMap<String, Box<RawValue>>>,
     /// Actions the vendor denied during the turn.
     #[serde(default)]
     pub permission_denials: Vec<PermissionDenial>,
@@ -294,7 +296,7 @@ pub struct ResultMessage {
     /// The members VIA does not read, for bounded vendor data (packet §5:
     /// unknown metadata is preserved).
     #[serde(skip)]
-    pub extra: Map<String, Value>,
+    pub extra: BTreeMap<String, Box<RawValue>>,
 }
 
 /// `control_request`, flattened.
@@ -367,11 +369,23 @@ struct Envelope {
 }
 
 /// A `system` message's subtype: read only for that family (review r1
-/// #10), and only a string names one.
+/// #10), and only a string names one. Kept raw, so a subtype of any
+/// other shape or depth is skipped, never materialized (review r2 #5).
 #[derive(Deserialize)]
 struct SystemEnvelope {
     #[serde(default)]
-    subtype: Value,
+    subtype: Option<Box<RawValue>>,
+}
+
+impl SystemEnvelope {
+    fn name(&self) -> Option<String> {
+        let raw = self.subtype.as_ref()?.get();
+        if raw.starts_with('"') {
+            serde_json::from_str(raw).ok()
+        } else {
+            None
+        }
+    }
 }
 
 /// The `result` members [`ResultMessage`] reads; the rest are its extra.
@@ -398,14 +412,11 @@ pub fn decode(line: &[u8]) -> Result<Message, DecodeError> {
     let envelope: Envelope = serde_json::from_slice(line).map_err(|_| DecodeError::NotTyped)?;
     let subtype = if envelope.kind == "system" {
         let system: SystemEnvelope = typed(line, "system")?;
-        Some(system.subtype)
+        system.name()
     } else {
         None
     };
-    let message = match (
-        envelope.kind.as_str(),
-        subtype.as_ref().and_then(Value::as_str),
-    ) {
+    let message = match (envelope.kind.as_str(), subtype.as_deref()) {
         ("system", Some("init")) => Message::Init(Box::new(typed(line, "init")?)),
         ("system", Some("permission_denied")) => {
             Message::PermissionDenied(typed(line, "permission_denied")?)
@@ -420,7 +431,11 @@ pub fn decode(line: &[u8]) -> Result<Message, DecodeError> {
         }
         ("result", _) => {
             let mut result: ResultMessage = typed(line, "result")?;
-            let mut members: Map<String, Value> = typed(line, "result")?;
+            // Raw, the read members dropped before anything else: unread
+            // metadata is never parsed, and never rejects the result
+            // (review r2 #3).
+            let mut members: BTreeMap<String, Box<RawValue>> =
+                serde_json::from_slice(line).unwrap_or_default();
             members.retain(|key, _| !RESULT_READ.contains(&key.as_str()));
             result.extra = members;
             Message::Result(Box::new(result))
@@ -769,6 +784,44 @@ mod tests {
         assert!(matches!(system, Message::Unknown { tag } if tag == "system"));
     }
 
+    /// `n` nested arrays: past `serde_json`'s 128-level `Value` limit.
+    fn nested(n: usize) -> String {
+        format!("{}{}", "[".repeat(n), "]".repeat(n))
+    }
+
+    /// Review r2 #5: a deeply nested non-string `system` subtype is
+    /// bounded unknown activity, never malformed.
+    #[test]
+    fn deep_system_subtype_is_unknown() {
+        let line = format!(r#"{{"type":"system","subtype":{}}}"#, nested(130));
+        let message = decode(line.as_bytes()).unwrap();
+        assert!(matches!(message, Message::Unknown { tag } if tag == "system"));
+    }
+
+    /// Review r2 #3: deep raw output and deep unknown metadata decode; the
+    /// output stays verbatim and the members are kept raw.
+    #[test]
+    fn deep_result_members_decode() {
+        let deep = nested(130);
+        for line in [
+            format!(
+                r#"{{"type":"result","subtype":"success","is_error":false,"session_id":"u","structured_output":{deep}}}"#
+            ),
+            format!(
+                r#"{{"type":"result","subtype":"success","is_error":false,"session_id":"u","new_stat":{deep}}}"#
+            ),
+        ] {
+            let Message::Result(result) = decode(line.as_bytes()).unwrap() else {
+                panic!("not a result: {line}")
+            };
+            if let Some(output) = &result.structured_output {
+                assert_eq!(output.get(), deep);
+            } else {
+                assert_eq!(result.extra["new_stat"].get(), deep);
+            }
+        }
+    }
+
     /// Review r1 #7: an init without a nonempty version is malformed.
     #[test]
     fn init_needs_a_version() {
@@ -798,10 +851,12 @@ mod tests {
         let Message::Result(result) = result else {
             panic!("result: {result:?}")
         };
-        assert_eq!(
-            Value::Object(result.extra.clone()),
-            json!({"new_vendor_stat":3,"duration_ms":9})
-        );
+        let extra: Vec<(&str, &str)> = result
+            .extra
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.get()))
+            .collect();
+        assert_eq!(extra, [("duration_ms", "9"), ("new_vendor_stat", "3")]);
     }
 
     /// The encoders write the packet's pinned lines.
