@@ -572,10 +572,8 @@ impl Engine {
             .map_err(|_| ApiError::STORE)?;
         #[cfg(test)]
         self.hold(&self.faults.hold_after_history).await;
-        let (cwd, identity, mut plan) = self
-            .frozen(&session, true)
-            .await
-            .map_err(|_| ApiError::STORE)?;
+        let frozen = self.frozen(&session, true).await;
+        let (cwd, identity, mut plan) = frozen.map_err(|_| ApiError::STORE)?;
         // Sol r1 #12: the envelope reports this turn's own frozen values.
         // Critical r1 #10: values that do not decode are corrupt evidence,
         // which fails recovery, and so startup, as Store's own corrupt
