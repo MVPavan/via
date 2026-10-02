@@ -1,31 +1,38 @@
 # Codex server ownership and connection design (x.3.2 chunk X0)
 
-Status: revision 1, 2026-10-02, answering Sol review x32-x0-r1 (UNSOUND:
-2 Blocker, 23 Important, 3 Minor; every finding accepted by the
-coordinator). Bead `via-5lr.3.2`, chunk X0. Worker: implementer-high
-(Opus 5.5 high), design mode. Base `42ee47b`; revision 0 was `a141496`.
+Status: revision 2, 2026-10-02, answering Sol review x32-x0-r2 (UNSOUND:
+1 Blocker, 18 Important, 4 Minor; all accepted by the coordinator), on top
+of revision 1 (Sol r1: 28 findings). Bead `via-5lr.3.2`, chunk X0. Worker:
+implementer-high (Opus 5.5 high), design mode. Base `42ee47b`; revision 0
+was `a141496`, revision 1 `20ae3aa`.
 
-Sources: the x.3.2 plan (chunk X0, §1.3, §6 G1–G7), the coordinator's
-rulings (Q2 G1–G7, Q6, Q7, and the round-1 fix rulings); the Codex packet
-[`docs/specs/vendors/codex.md`](../../../specs/vendors/codex.md);
-[C2](../../../specs/adapter-contract.md) §2–§7;
-[runtime contracts](../../../specs/runtime-contracts.md) §2, §4–§8 and AR6;
-[C1](../../../specs/via-api-v1.md) §3.5, §3.6, §3.12, §3.14, §5, §7;
-[adapter design](design.md) AD4, AD16, AD18–AD20;
-[lifecycle-harnesses.md](lifecycle-harnesses.md) and
-[reprobe-codex.md](reprobe-codex.md); and the code at `42ee47b` in
-`crates/via-host`, `crates/via-wire`, `crates/via-store`,
-`crates/via-core/src/engine/{drive,recovery,stop,read}.rs`,
-`crates/via-routes/src/fake/` and `crates/via-fake-agent/src/replay/`.
+Sources:
+- the x.3.2 plan (chunk X0, §1.3, §6 G1–G7); the coordinator's rulings
+  (Q2 G1–G7, Q6, Q7, and the round-1 and round-2 fix rulings);
+- the Codex packet [`docs/specs/vendors/codex.md`](../../../specs/vendors/codex.md);
+  [C2](../../../specs/adapter-contract.md) §2–§7;
+  [runtime contracts](../../../specs/runtime-contracts.md) §2, §4–§8 and
+  AR6; [C1](../../../specs/via-api-v1.md) §3.5–§3.7, §3.12, §3.14, §5, §7;
+- [adapter design](design.md) AD4, AD16, AD18–AD20;
+  [lifecycle-harnesses.md](lifecycle-harnesses.md),
+  [reprobe-codex.md](reprobe-codex.md);
+- the code at `42ee47b` in `crates/via-host`, `crates/via-wire`,
+  `crates/via-store`, `crates/via-core/src/engine/{drive,lane,recovery,reprobe,stop,read}.rs`,
+  `crates/via-routes/src/fake/` and `crates/via-fake-agent/src/replay/`;
+- **J0, merged into `rust-foundation` at `14c0a0a`:** Wire's ticketed
+  `ControlQueue` (`OutboundMessage::Control`: 8 outstanding, 64 KiB, a
+  deadline that bounds only the wait for the first byte, expiry exactly
+  once, the writer sweeping queued deadlines while it holds stdin);
+  `RouteRuntime`; `AdapterSet::servers()`, `ServerReport` and the opaque
+  `ServerKey(String)` in `RoutePlan.server_key`; C2's
+  `SessionDriver::journal_uncertain()` and `DriverFailure::RetirementUncertain`;
+- **K1's amendments** to C1 §5, C1 §7.6 and runtime §6/§7 (revision of an
+  `unknown` turn attributed only through the acceptance vendor turn ID;
+  `cancel_cause` kept for a caller-stopped `unknown` turn; a revision known
+  not to have committed does not latch). §9 does not re-amend those clauses.
 
-J0 runs in parallel. This design names its types as the J0 brief gives
-them: `RouteRuntime` (the Wire holder, `crates/via-routes/src/runtime.rs`),
-`OutboundMessage::Control` (non-coalesced Wire control writes with
-first-byte deadline semantics, 8 queued and 64 KiB) and
-`AdapterSet::servers()`.
-
-Labels: **fact** (read in code or a spec at `42ee47b`), **decision** (this
-design), **E2E** (a measurement item, simple-first).
+Labels: **fact** (read in code or a spec), **decision** (this design),
+**E2E** (a measurement item, simple-first).
 
 ---
 
@@ -33,54 +40,82 @@ design), **E2E** (a measurement item, simple-first).
 
 | # | Item | Decision | Owner (crate, module) | Chunk |
 |---|---|---|---|---|
-| 0 | Dispatch admission | Core opens the logical driver and calls `prepare()` before reserving a connection slot; a queued turn re-prepares on registry readiness changes | Core `engine/drive.rs`, C2 `SessionDriver::readiness` | X2 |
-| 1 | Non-turn server owner | `ProcessOwner { Turn, Server }`; server anchors; a durable turn → server-anchor link written before the turn's first vendor byte; a server evidence folder; a turn folder per `run_turn` | Store, Host, Wire | X2 |
-| 2 | Lease registry and retirement | A Route registry `codex::Servers`; holders = launch reservations + pins + leases; instance-fenced transitions; supervised launch, connection and retirement tasks | Routes `codex/servers.rs` | X3 (single), X4 (shared) |
-| 3 | `ServerKey`/`config_hash` | SHA-256 over the launch recipe; version observed, not hashed | Adapters `codex/launch.rs` | X1 |
-| 4 | `CODEX_SQLITE_HOME` | `<state>/vendor/codex`, 0700, persistent; `RuntimeConfig.vendor_state_dir` | CLI bootstrap, Wire config, Adapters | X1, X2 |
-| 5 | Server evidence and `logs` | `evidence/servers/<server-id>/`, never returned by `logs`; only a typed-correlation failure is unattributable | Wire, Routes | X2, X3 |
-| 6 | Recovery, shutdown, close and status | Cleanup of a server-route turn comes from its linked anchor; shutdown cleanup never waits on the link read; daemon force keeps C1's `unknown/unknown`; shared-session close/status cleanup from durable turn facts | Store, Host, Core | X2 |
-| 7 | `daemon/status.servers` | `AdapterSet::servers()` reads the registry snapshot | Adapters, Routes | J0, X4 |
-| 8 | Late traffic, reopen, close cutoff | Per-generation tombstones; lease-fenced registrations; the admitted ingress prefix is delivered before ownership clears; later items dropped and counted | Routes `codex/threads.rs` | X4 |
-| 9 | Caps and RSS | No lease or RPC admission cap; abandoned request records share the correlation budget and its exhaustion retires the connection; X5 measures 32 sessions and qualifies only that | Routes, X5 | X4, X5 |
-| 10 | Overflow and quarantine | Sticky `ObservationOverflow`; the driver ends affected turns through a non-awaiting reserved interrupt; a public `observations_lost` warning | Adapters, Routes, Core, C1 | X5 |
-| 11 | Decline hand-off | Adapter's `DECLINES` in a Route `DeclineTable`; an ordered placeholder captured at decode | Adapters, Routes | X1, X3 |
-| 12 | Write scheduling on a shared connection | Wire distinguishes queued, started and completed writes; withdrawal never closes stdin; a data hold makes control priority visible at Wire's choice; reserved interrupt and unsubscribe capacity | Wire, Routes `codex/feeder.rs` | X2, X3 |
-| 13 | Server loss | One owned sequence: latch, drain prior order, bounded Host evidence, fan-out | Routes `codex/connection.rs` | X4 |
-| 14 | Test harness | A named `via-fake-agent` replay join: streamed large-input steps and an explicit reader pause | `via-fake-agent` (shared join) | X3 |
+| 0 | Dispatch admission | Core opens the logical driver, subscribes to its readiness, then prepares before any connection slot; the subscription is kept through the slot wait | Core `engine/drive.rs`; C2 `SessionDriver::readiness` | X2 |
+| 1 | Non-turn server owner | `ProcessOwner { Turn, Server }`; server anchors; a durable turn → server-anchor link before the turn's first vendor byte; server and turn evidence folders | Store, Host, Wire | X2 |
+| 2 | Lease registry | `codex::Servers`; holders = reservations + pins + leases; instance-fenced; one supervisor exclusively owning the task set; shutdown fences, then runs Host cleanup and the joins together | Routes `codex/servers.rs` | X3 (single), X4 (shared) |
+| 3 | `config_hash` | SHA-256 over the launch recipe; recomputed from a fresh stat before registry insertion; publication refused if the binary changed | Adapters `codex/launch.rs` | X1, X3 |
+| 4 | `CODEX_SQLITE_HOME` | `<state>/vendor/codex`, 0700, persistent | CLI, Wire config, Adapters | X1, X2 |
+| 5 | Server evidence, decode failures | Server folder never returned by `logs`; closed generations dropped before decoding; evidence to the original turn, continuity failure to the current one | Wire, Routes | X2, X3 |
+| 6 | Recovery, shutdown, close, status | Cleanup from the linked anchor; ownerless re-probe refusals at daemon scope | Store, Host, Core | X2 |
+| 7 | `daemon/status.servers` | Registry snapshot behind J0's `servers()` | Routes | X4 |
+| 8 | Threads | Per-generation tombstones; lease fencing; connection-owned cleanup intents; a reattach fence until unsubscribe resolves; Core drains during driver close | Routes `codex/threads.rs`; Core `engine/lane.rs` | X2 (Core), X4 |
+| 9 | Caps, request records, RSS | No admission cap; request owners `Server` or `Lease`; one correlation budget; RSS qualifies only 32 turns on one server | Routes; X5 | X4, X5 |
+| 10 | Overflow, loss record | Sticky health; a non-withdrawable cleanup interrupt; one Core loss helper fed by `TurnEnd` and every close | Adapters, Routes, Core | X5 |
+| 11 | Decline hand-off | Static table; ordered placeholder at decode | Adapters, Routes | X1, X3 |
+| 12 | Writes on a shared connection | Built on J0's `ControlQueue`: ticketed data slot, `withdraw`, data holds under the queue lock, staging permits; an owning turn-write guard; reserved control sizes from maximum encodings | Wire `connection.rs`; Routes `codex/feeder.rs` | X2 (Wire), X3 |
+| 13 | Server loss | Latch, Host cleanup and the admitted-prefix drain at once; the original cause kept | Routes, Wire | X2 (Wire), X4 |
+| 14 | Replay join | `expect_large`, `pause_input`/`resume_input` with acknowledged reader-mode transitions | `via-fake-agent` | X3 |
 
 ### 0.1 Round-1 findings and where each is answered
 
 | Finding | Decision (short) | Section |
 |---|---|---|
-| 1 (Blocker) slot before join | Logical driver opened and prepared before any connection slot; readiness wake re-prepares a queued turn | Item 0 |
-| 2 (Blocker) dropped wait can send late input | Wire `WriteState` (queued, started, done), `PendingWrite::withdraw`, `WriteBounds::start_by`; a settled turn sends no further input | Item 12.1–12.2 |
-| 3 launch hand-off | `Launching` entries count reservations; publication carries holders over atomically; zero holders publish straight to `Retiring` | Item 2.2 |
-| 4 `Retiring` and stale callbacks | `by_key` names only the non-retiring instance; a `Retiring` key launches a new instance; every transition is fenced by `ServerId` | Item 2.3 |
-| 5 task ownership | `Servers` owns a `JoinSet<ServerTaskOutcome>` and a supervisor (runtime §2 pattern); waiters resolve on failure; shutdown reports unjoined tasks | Item 2.5 |
-| 6 G9 coverage | Host-wide sticky journal-uncertain watch, set wherever a journal outcome resolves `Uncertain`; server lifecycle Host calls run only on supervised tasks | Item 2.6 |
-| 7 retirement backstop | One deadline set first; stdin close bounded to 2 s; Host close always requested | Item 2.4 |
-| 8 link-read failure | Host closes controls first; the link read is bounded and its failure is recorded so unattributed turns are uncertain | Item 6.3 |
-| 9 partial commits | A linked turn's recovered cleanup is the meet of the durable settlement and the anchor's absence proof | Item 6.2 |
-| 10 close/status cleanup | Shared sessions: uncertain while a turn of theirs settled `uncertain` on a server group not yet proven absent | Item 6.5 |
-| 11 daemon force | Shared-route launched turns end `unknown`, outcome `unknown`; cleanup from the anchor; C1 unchanged | Item 6.4 |
-| 12 server loss | One owned sequence | Item 13 |
-| 13 reopen | Per-generation tombstones; lease-fenced registrations; old unsubscribe resolved before reattach; conflicting registration refused | Item 8.1 |
-| 14 close prefix | Close cutoff in the demux; admitted prefix delivered (or explicit loss) before ownership clears | Item 8.2 |
-| 15 abandoned RPC state | Abandoned records live until their reply or connection retirement, charged to the correlation budget; exhaustion retires | Item 9.1 |
-| 16 staging transfer | Wire's staging charge travels with the message (`StagingPermit`) until the ingress consumer drops it | Item 12.5 |
-| 17 reply race | `WireSender::hold_data()`: Wire starts no data message while a hold exists | Item 12.3 |
-| 18 mandatory controls | Two reserved coalesced slots per driver (interrupt, unsubscribe); steer gets 6 slots and 62 KiB | Item 12.4 |
-| 19 decline ordering | Ordered placeholder in the thread lane at decode, resolved by the write outcome | Item 11 |
-| 20 quarantine interrupt | Posted to the reserved slot without awaiting; the driver returns at once | Item 10 |
-| 21 loss record | C1 warning `observations_lost` on affected envelopes; a late `warning` event on an already terminal triggering turn | Item 10 |
-| 22 RSS scenario | Achievable maxima, both F24 assertions, qualification limited to what is measured | Item 9.2 |
-| 23 replay harness | Named `via-fake-agent` join in X3 | Item 14 |
-| 24 classification | Typed-schema correlation failure is the prerequisite; unknown threads and untagged traffic stay diagnostic | Item 5 |
-| 25 runtime contradictions | §9.2 replaces runtime §4 sketch and paragraphs, §6 journal rule, §6.1 stderr, §6.2 step 3 | §9.2 |
-| 26 G1/G7 wording | §9.1 and §9.4 replace the C2 and packet quarantine and late-attribution sentences | §9.1, §9.4 |
-| 27 32 active turns | §9.4 replaces the packet paragraph | §9.4 |
-| 28 owner shape | `owner: ProcessOwner` everywhere | Item 1, §9.1 |
+| 1 (Blocker) slot before join | Driver opened and prepared before any slot; readiness re-prepares (subscription order: r2 N1) | Item 0 |
+| 2 (Blocker) late input after settlement | Ticketed data writes, `withdraw`, owning guard (r2 N2) | Item 12.2 |
+| 3 launch hand-off | Reservations become pins atomically at publication | Item 2.2 |
+| 4 `Retiring` and stale callbacks | `by_key` names only non-retiring instances; `ServerId` fencing | Item 2.3 |
+| 5 task ownership | Supervisor and outcomes (r2 N6–N8) | Item 2.5 |
+| 6 G9 coverage | Host-wide sticky journal-uncertain watch | Item 2.6 |
+| 7 retirement backstop | One deadline first; bounded stdin close; Host close always | Item 2.4 |
+| 8 link-read failure | Host closes controls first; failed read leaves turns uncertain | Item 6.3 |
+| 9 partial commits | Recovered cleanup = settlement meet anchor proof | Item 6.2 |
+| 10 close/status cleanup | `session_cleanup_uncertain` from durable turn facts | Item 6.5 |
+| 11 daemon force | Shared launched turn `unknown/unknown` | Item 6.4 |
+| 12 server loss | Owned sequence (r2 N9–N11) | Item 13 |
+| 13 reopen | Generations, lease fencing, reattach fence (r2 N13) | Item 8.1 |
+| 14 close prefix | Cutoff; delivery and durable barriers (r2 N12) | Item 8.2 |
+| 15 abandoned requests | Record lifetime and shared budget (owners: r2 N16) | Item 9.1 |
+| 16 staging transfer | `StagingPermit` | Item 12.5 |
+| 17 reply race | Hold under J0's queue lock (r2 N5) | Item 12.3 |
+| 18 mandatory controls | Reserved slots sized from maximum encodings (r2 N4) | Item 12.4 |
+| 19 decline ordering | Placeholder at decode | Item 11 |
+| 20 quarantine interrupt | Connection-owned cleanup intent (r2 N3) | Items 8.3, 10 |
+| 21 loss record | `observations_lost`; one Core helper (r2 N14) | Item 10 |
+| 22 RSS scenario | Achievable maxima; qualification limits (r2 N22) | Item 9.2 |
+| 23 replay harness | Named join; acknowledged transitions (r2 N23) | Item 14 |
+| 24 classification | Typed-schema failure prerequisite | Item 5 |
+| 25 runtime contradictions | §9.2 (write ordering location: r2 N21) | §9.2 |
+| 26 G1/G7 wording | §9.1, §9.4 | §9.1, §9.4 |
+| 27 32 active turns | Packet paragraph replaced | §9.4 |
+| 28 owner shape | `ProcessOwner` everywhere | Item 1, §9.1 |
+
+### 0.2 Round-2 findings and where each is answered
+
+| Finding | Decision (short) | Section |
+|---|---|---|
+| N1 (Blocker) readiness subscription race | Receiver taken before the first `prepare`; epoch marked seen before every check; kept through the slot wait | Item 0 |
+| N2 abandonment and unwind | `codex::TurnWrites` guard: synchronous `Drop` withdraws unstarted writes from the feeder and Wire | Item 12.2 |
+| N3 quarantine interrupt vs withdrawal | Interrupt and unsubscribe are connection-owned cleanup intents, never withdrawn, surviving settlement and close; target resolved from a delayed acceptance reply | Item 8.3, Item 10 |
+| N4 reserved sizes | Interrupt 12,800 B, unsubscribe 6,400 B, from maximum encodings with 1 KiB IDs fully escaped; steer 6 slots and 46,336 B | Item 12.4 |
+| N5 hold vs data start | Hold acquisition and the data slot's take (= `Started`) share J0's `ControlQueue` lock | Item 12.3 |
+| N6 supervision mechanics | Supervisor task exclusively owns the `JoinSet` and `task::Id → (ServerId, kind)`; spawns arrive on a bounded channel | Item 2.5 |
+| N7 shutdown order | Fence registry admission; run Host shutdown and the registry join concurrently under one absolute deadline and the existing 1 s reserve | Item 2.7 |
+| N8 clean-exit accounting | Registry outcomes folded into `pending_tasks`, `failed_tasks` and `failure`; `AdapterShutdown.registry` dropped | Item 2.7 |
+| N9 loss waits for EOF | Loss deadline and Host cleanup start at the latch; prefix drain concurrent and EOF-independent | Item 13 |
+| N10 staged prefix after a latch | Wire `WireMessages::drain_admitted` (X2) | Item 13, §9.2 |
+| N11 transport vs server death | Original cause kept; `ServerLost` only when Host found the leader already exited, else `TransportLost` (`unknown`) | Item 13 |
+| N12 close drain vs Core actor | Core's lane actor disposes observations concurrently with driver close (X2); Route delivery barrier vs Core durable barrier; no 10 s stall inside a close | Item 8.2 |
+| N13 abandoned unsubscribe | Per-thread reattach fence until the unsubscribe reply or connection retirement | Item 8.1 |
+| N14 late-warning source | Driver's sticky loss record in `TurnEnd.loss` and every `CloseReport.loss`; one Core helper with bounded deduplication | Item 10 |
+| N15 attributable protocol failure | Closed-generation drop before decoding; evidence to the original turn; continuity failure to the open generation's nonterminal turn | Item 5 |
+| N16 request owner | `RequestOwner { Server(ServerId), Lease { .. } }`, by value, one budget | Item 9.1 |
+| N17 ownerless re-probe refusal | `ReprobeReport.not_committed: Vec<ProcessOwner>`; server proofs recorded at `daemon` scope, token held, retried | Item 6.1 |
+| N18 binary change | `prepare` matches the driver's cached hash (no syscall); `run_turn` recomputes from a fresh stat before insertion; the launch re-stats after the handshake and refuses publication on change | Item 3 |
+| N19 §9 contradictions | C2 A8 and process-shape rows, packet §2 key, handshake deadline and last-lease text, runtime §6 write order steps 2–3, §6.2 force exception | §9.1, §9.2, §9.4 |
+| N20 sketches | `ConnectionKind` defined; `TurnEnd`/`CloseReport` declarations; rule 1 replaced, not duplicated | §9.1 |
+| N21 locations | Runtime §6 write ordering step 3; C1 §3.7 | §9.2, §9.3 |
+| N22 RSS wording | Per-server vs per-session holders; decode allowance explicit; four servers labelled extrapolation | Item 9.2, §9.4 |
+| N23 replay transitions | Reader-mode transitions acknowledged in the progress log before the tested write | Item 14 |
 
 ---
 
@@ -93,84 +128,83 @@ design), **E2E** (a measurement item, simple-first).
   the server's evidence folder, its anchor row's owner and its registry
   instance. Internal: no C1 field carries it.
 - **Holder.** Anything that keeps a server from idle retirement: a
-  **reservation** (a dispatch that joined a `Launching` server), a **pin**
-  (a dispatch that `prepare` answered `Pinned` on a `Live` server, not yet
-  a lease) or a **lease** (one session driver attached to the server).
+  **reservation** (a dispatch that pinned a `Launching` server), a **pin**
+  (a dispatch pinned on a `Live` server, not yet a lease) or a **lease**
+  (one session driver attached to the server).
 - **Lease ID.** `LeaseId(u64)`, unique per connection, minted when a pin
-  becomes a lease. Every thread registration and release carries it.
-- **Lane generation.** The driver's thread-registration generation on a
-  connection: a new one at every `thread/start` or `thread/resume`.
+  becomes a lease.
+- **Lane generation.** A driver's thread registration on a connection: a
+  new one at every `thread/start` or `thread/resume`.
 - **Link.** The durable row `server_turns (session_id, turn) → anchor_id`.
-- **Cutoff.** The point in the connection's demux at which a driver's
-  close takes effect for its registration (item 8.2).
+- **Cutoff.** The point in the connection's decode order at which a
+  driver's close takes effect for its registration (item 8.2).
+- **Cleanup intent.** A connection-owned interrupt or unsubscribe that a
+  driver admitted and that is written even after its turn settled or its
+  driver closed (item 8.3).
 
 ---
 
 ## 2. Items
 
-### Item 0. Prepare before admission (finding 1, Blocker)
+### Item 0. Prepare before admission (r1 #1, r2 N1)
 
-**Fact.** Core prepares only an already resident driver; a session without
-one gets `NeedsConnection`, reserves a connection slot, and only after
-submission opens its driver (`drive.rs` `dispatch`, `open_lane` after
-`submit`). Four live servers therefore keep a fifth session from joining an
-equal-key server, and a waiter has no wake to reconsider.
+**Fact.** At `42ee47b` Core prepares only an already resident driver; a
+session without one gets `NeedsConnection`, reserves a slot, and opens its
+driver after submission (`drive.rs` `dispatch`).
 
-**Decision** (generic Core, X2).
-1. **Order.** In `Engine::dispatch`:
-   1. claim the session's lane, or reserve a resident permit (unchanged);
-   2. if no lane was claimed, read the head turn's frozen route, effective
-      values, inherit plan and cwd through the same head read
-      `commit_submission` uses (a read, no write), and open the lane with
-      them (`open_lane`; C2 `open_session` does no vendor I/O). The lane is
-      installed and claimed;
-   3. call `prepare()` on the claimed driver;
-   4. `Pinned`: no connection slot. `NeedsConnection`: reserve a slot, with
-      the readiness wake below;
-   5. claim, grant and submit as today.
-2. **A lane opened for a turn that is not then submitted** (head changed,
-   force, close, Store latch, refusal before submission) is retired before
-   `dispatch` returns. Its driver had no vendor I/O, so the close does
-   nothing but release the lane and its resident permit. This keeps a
-   driver's `SessionSpec` (initial bound, model) always that of the first
-   turn it actually runs.
-3. **Readiness wake.** C2 adds
-   `SessionDriver::readiness(&self) -> Option<watch::Receiver<u64>>`: an
-   epoch the route bumps when anything that could change this driver's
-   `prepare()` answer changes. `None` for per-turn routes (fake, Claude).
-   For Codex it is the registry's epoch, bumped on every entry insert,
-   publication, retirement and removal. `Engine::reserve` for `Pool::Slots`
-   selects on it; on a change it re-runs `prepare()` on the claimed driver.
-   `Pinned` abandons the slot wait (the turn no longer needs a slot; its
-   FIFO place is given up) and continues at step 5. Spurious wakes cost one
-   synchronous `prepare()`.
-4. **Codex `prepare()`** answers `Pinned` for a `Launching` equal-key entry
-   too, by taking a reservation (item 2.2). So a turn joining a server that
-   is still launching never needs a slot.
+**Decision** (generic Core, X2). In `Engine::dispatch`:
+1. Claim the session's lane, or reserve a resident permit (unchanged).
+2. If no lane was claimed, read the head turn's frozen route, effective
+   values, inherit plan and cwd (a read, no write) and open the lane
+   (`open_lane`; C2 `open_session` does no vendor I/O). The lane is
+   installed and claimed.
+3. Take `let ready = driver.readiness()` **before** the first `prepare()`
+   and keep it until the dispatch leaves the slot wait.
+4. Loop:
+   1. mark the epoch seen (`ready.borrow_and_update()`);
+   2. `prepare()`;
+   3. `Pinned` → leave the loop with no slot;
+   4. `NeedsConnection` → wait on the slot's FIFO acquire (pinned across
+      iterations, so the turn keeps its place) **or** `ready.changed()`; a
+      change goes back to 4.1; a permit leaves the loop.
+5. Claim, grant and submit as today.
+
+The registry bumps its epoch **after** each state change, under or after
+its mutex. So any change after 4.1 fires `changed()`, and any change
+before 4.1 is visible to 4.2. A spurious wake costs one synchronous
+`prepare()`.
+
+- `readiness()` is `None` for per-turn routes (fake, Claude): step 4 is
+  today's single prepare and slot wait.
+- A lane opened for a turn that is then not submitted (head changed,
+  force, close, Store latch, refusal before submission) is retired before
+  `dispatch` returns. Its driver did no vendor I/O.
+- Codex `prepare()` also pins a `Launching` equal-key entry, as a
+  reservation (item 2.2).
 
 **Why nothing smaller works.** Without a driver before admission there is
-nothing to ask; without the wake, a turn that began waiting before an
-equal-key server appeared keeps waiting for a slot it does not need.
+nothing to ask. Without a subscription that precedes the check, an
+equal-key server published between the check and the wait is never seen
+while four slots stay held.
 
 **Failure behaviour.** The head read fails: as `submit`'s read failure
-today (`SubmitFailure::Unread`, nothing written). A readiness channel
-closed: treated as no wake (the slot wait continues).
+today (`SubmitFailure::Unread`, nothing written). A closed readiness
+channel is treated as no wake.
 
 **Tests that fail first (X2, fake route and a stand-in `readiness`).**
-- `pinned_join_needs_no_slot`: four slots held by live connections; a new
-  session whose stand-in driver answers `Pinned` dispatches without a slot.
-- `queued_turn_reprepares_on_readiness`: a turn waiting for a slot gets
-  `Pinned` after an epoch bump and dispatches while all slots stay held.
-- `unsubmitted_lane_is_retired`: a lane opened for a head that is
-  cancelled before the grant is retired, with no vendor I/O.
-- The fake suite and conformance stay green (the fake's `prepare` keeps
-  answering as today; the fake has no readiness).
+- `pinned_join_needs_no_slot`.
+- `queued_turn_reprepares_on_readiness`.
+- `readiness_insert_between_prepare_and_wait`: a test hook between 4.2
+  and the slot wait's registration publishes an equal-key server and bumps
+  the epoch; with all four slots held the turn dispatches `Pinned`.
+- `unsubmitted_lane_is_retired`.
+- The fake suite and conformance stay green.
 
 ### Item 1. The non-turn server owner (runtime AR6)
 
 **Decision.**
 1. **Owner variant.** A closed enum in `via-store`, re-exported by
-   `via-host`, and used unchanged in every passive DTO (finding 28):
+   `via-host`, used unchanged in every passive DTO:
    ```rust
    pub enum ProcessOwner {
        Turn { session_id: SessionId, turn: TurnNumber },
@@ -179,11 +213,9 @@ closed: treated as no wake (the slot wait continues).
    ```
    `PrivateProcessSpec.owner`, `AnchorIntent.owner`, `AnchorOwner.owner`
    (with `turn_running` on the `Turn` arm of the inventory row only),
-   `RecoveryReport.owner`, `WireRecovery.owner` and C2's
-   `AnchorRecovery.owner` are all `ProcessOwner`. Host stays protocol- and
-   key-free: it starts a server, holds its slot for its life, supervises its
-   exit, and stops it only when asked (retirement, loss, failed open,
-   shutdown).
+   `RecoveryReport.owner`, `WireRecovery.owner`, C2's
+   `AnchorRecovery.owner` and `ReprobeReport.not_committed` (item 6.1) all
+   use it. Host stays protocol- and key-free.
 2. **Store schema** (one bump; the next free `user_version` at merge,
    serialized with K1 and K2: whoever merges later takes the next number
    and updates the complete frozen-schema test).
@@ -205,13 +237,12 @@ closed: treated as no wake (the slot wait continues).
    - `ProcessJournal` gains exactly two operations, a narrow exception to
      its no-turn rule (runtime §6 amendment):
      - `commit_server_turn(anchor_id, session, turn) -> CommitOutcome<()>`:
-       one `INSERT … SELECT` that inserts only when the anchor's
+       one `INSERT … SELECT` inserting only when the anchor's
        `owner_server` is non-null and the turn's state is `running`; zero
        rows is `NotCommitted`;
-     - `server_links(turns: &[(SessionId, TurnNumber)])`: at most 256 links
-       (the unresolved-turn bound), for Host's shutdown.
+     - `server_links(turns: &[(SessionId, TurnNumber)])`: at most 256 links.
    - Store reads: `UnfinishedTurn.server_anchor: Option<String>` (`LEFT
-     JOIN server_turns`); status and close predicates in item 6.5.
+     JOIN server_turns`); the close and status predicate of item 6.5.
 3. **Wire server connection without a turn folder.**
    `WireRuntime::open_connection` branches on `spec.owner`: `Turn` keeps
    today's path; `Server` creates `evidence/servers/<server-id>/` through
@@ -228,10 +259,9 @@ closed: treated as no wake (the slot wait continues).
 5. **Link order.** `ProcessControl::link_turn(session, turn, deadline)`
    (forwarded as `WireSender::link_turn`) commits the link. In `run_turn`:
    turn folder → pin/join/launch → link → only then the turn's first byte
-   (`thread/start`, `thread/resume` or `turn/start`) to Wire. A crash before
-   the link leaves a turn that sent nothing.
+   (`thread/start`, `thread/resume` or `turn/start`) to Wire.
 6. **`launched` on a server route** is "the turn's first byte was handed to
-   Wire" (C2 amendment).
+   Wire".
 
 **Failure behaviour.**
 - Turn folder fails: `RouteError::Store` (evidence), nothing sent, cleanup
@@ -244,9 +274,9 @@ closed: treated as no wake (the slot wait continues).
   evidence applies as on a private route.
 
 **Tests that fail first (X2).** `host_server_owner_outlives_turns`,
-`store_server_anchor_and_link` (including refusal of a second link, of a
-link to a turn-owned anchor, of a link for a non-running turn, and the
-frozen-schema bump), `wire_server_open_has_no_turn_folder`,
+`store_server_anchor_and_link` (refusal of a second link, of a link to a
+turn-owned anchor, of a link for a non-running turn; the frozen-schema
+bump), `wire_server_open_has_no_turn_folder`,
 `link_turn_on_turn_owner_is_invalid`.
 
 ### Item 2. The lease registry
@@ -254,203 +284,250 @@ frozen-schema bump), `wire_server_open_has_no_turn_folder`,
 **Owner.** Routes: `via_routes::codex::Servers`
 (`crates/via-routes/src/codex/servers.rs`), owned by the Codex adapter,
 built over J0's `Arc<RouteRuntime>`. Host is protocol-free and key-free;
-lease release is protocol I/O; registration and lease must change together
-with the thread table under one lock. The packet's "Host owns …
-shared-server leases" is amended (§9.4).
+lease release is protocol I/O; registration and lease change together with
+the thread table under one lock.
 
 #### 2.1 State
 
 ```rust
 pub struct Servers {
-    state: Mutex<Registry>,            // std mutex, never held across .await
-    epoch: watch::Sender<u64>,         // item 0 readiness
-    tasks: Mutex<JoinSet<ServerTaskOutcome>>, // item 2.5
+    state: Mutex<Registry>,              // std mutex, never held across .await
+    epoch: watch::Sender<u64>,           // item 0 readiness
+    spawn: mpsc::Sender<ServerTask>,     // to the supervisor (item 2.5), capacity 16
+    supervisor: Mutex<Option<JoinHandle<SupervisorReport>>>,
     cancel: CancellationToken,
-    declines: DeclineTable,            // item 11
+    declines: DeclineTable,              // item 11
 }
 struct Registry {
     by_key: HashMap<ConfigHash, ServerId>,   // the one non-retiring instance per key
     servers: HashMap<ServerId, Entry>,       // every instance not yet removed
-    closed: bool,                            // shutdown began
+    fenced: bool,                            // shutdown began
 }
 enum Entry {
-    Launching { key: ConfigHash, holders: u32, ready: watch::Sender<Launch> },
+    Launching { key: ConfigHash, holders: u32, ready: watch::Sender<Launch>, connection: Option<Arc<Connection>> },
     Live      { key: ConfigHash, holders: u32, leases: u32, connection: Arc<Connection>, report: InstanceReport },
     Retiring  { connection: Option<Arc<Connection>> },
     Lost      { connection: Arc<Connection> },
 }
 pub struct ServerPin { server: ServerId, /* Arc<Servers>; releases on Drop */ }
-pub struct Lease     { server: ServerId, id: LeaseId, /* the pin; thread registration */ }
+pub struct Lease     { server: ServerId, id: LeaseId, /* the pin */ }
 ```
 
-#### 2.2 Launch, reservations and publication (finding 3)
+`Launching.connection` is set as soon as Wire opened the server's
+connection, before the handshake, so a failed launch's cleanup always has
+its owner (item 2.5).
 
-- `prepare()` (sync), under the registry mutex:
+#### 2.2 Launch, reservations and publication
+
+- `prepare()` (sync, no syscall), under the registry mutex, with the
+  driver's cached `ConfigHash` (item 3):
   - the session's own lease on a `Live` instance → `Pinned` (a pin cloned
-    from the lease, `holders + 1`);
-  - else `by_key[hash]` names a `Live` instance → `Pinned` (`holders + 1`);
-  - else `by_key[hash]` names a `Launching` instance → `Pinned` holding a
-    **reservation** (`holders + 1` on the `Launching` entry);
-  - else `NeedsConnection`.
-  - `Retiring` and `Lost` instances are never in `by_key`.
-- `run_turn` with `NeedsConnection` and a capacity token calls
-  `Servers::launch_or_join(key, spec, token)`: under the mutex, if a
-  `Live`/`Launching` instance exists now, it takes a pin/reservation and
-  drops the token (releasing the slot); otherwise it inserts
-  `Launching { holders: 1 }` under a new `ServerId`, maps `by_key`, and
-  spawns the **launch task** on the registry `JoinSet` (item 2.5) with the
-  token. The launch is owned by that task, not by the opener.
-- A holder of a reservation waits on the entry's `ready` watch, bounded by
-  its own wall, stop and force. Dropping the wait drops the reservation
-  (`holders − 1`, instance-fenced).
-- **Publication** (launch task, handshake done), one critical section:
-  `Launching { holders: n }` becomes `Live { holders: n, leases: 0 }`;
-  every surviving reservation is now a pin on the same instance, with no
-  window at zero. If `n == 0`, the instance is published straight to
-  `Retiring` (item 2.4) and `by_key` is cleared for it. Then `ready` is
-  sent `Ok` and the epoch bumped.
-- **Launch failure** (spawn, handshake refusal, `protocol`, the task's
-  panic or cancellation): `ready` is sent `Err(LaunchFailure)` by the task,
-  or by the supervisor when the task ended without sending (item 2.5); the
-  entry and its `by_key` mapping are removed (fenced); every waiter's turn
-  fails with that cause and nothing of it sent. A handshake refusal is
-  cached per C2 §5.
-- **Launch gates.** The handshake runs under its own deadline
-  `SERVER_HANDSHAKE = 60 s` (packet: cold `initialize` took 38 s), the
-  daemon force, and registry shutdown; a turn's stop or wall ends only that
-  turn's wait. The opener's pre-ARM gate is the daemon force only.
+    from the lease);
+  - else `by_key[hash]` is `Live` → `Pinned` (`holders + 1`);
+  - else `by_key[hash]` is `Launching` → `Pinned` holding a reservation
+    (`holders + 1`);
+  - else `NeedsConnection`. `Retiring` and `Lost` instances are never in
+    `by_key`.
+- `run_turn` with `NeedsConnection` and a capacity token recomputes the
+  recipe from a fresh stat on a blocking step (item 3), then calls
+  `Servers::launch_or_join(recipe, token)`. Under the mutex it pins an
+  existing `Live`/`Launching` instance for that hash and drops the token,
+  or inserts `Launching { holders: 1 }` under a new `ServerId`, maps
+  `by_key`, and sends the launch task to the supervisor with the token.
+- A reservation holder waits on `ready`, bounded by its own wall, stop and
+  force; dropping the wait drops the reservation (fenced).
+- **Publication** (launch task), one critical section: `Launching {
+  holders: n }` becomes `Live { holders: n, leases: 0 }`, every surviving
+  reservation now a pin. If `n == 0` it is published straight to
+  `Retiring` and the retirement task is started. Then `ready ← Ok`, epoch
+  bump.
+- **Launch gates.** The handshake (`initialize`, `initialized`, paginated
+  `model/list`) runs under `SERVER_HANDSHAKE = 60 s` from spawn
+  (packet: cold `initialize` took 38 s), the daemon force and the registry
+  fence. A turn's stop or wall ends only that turn's wait.
+- **Launch failure:** item 2.5. Each waiter's turn fails with the cause,
+  nothing of it sent. A handshake refusal is cached per C2 §5.
 
-#### 2.3 Instance fencing and the `Retiring` branch (finding 4)
+#### 2.3 Instance fencing and the `Retiring` branch
 
-- Every callback carries its `ServerId` and acts only if
-  `servers[id]` exists in the expected state: pin and reservation drops,
-  lease release, publication, launch failure, retirement completion, loss.
-  `by_key[hash]` is removed only if it still maps to that `ServerId`.
-- `prepare`/`launch_or_join` on a key whose instance is `Retiring` or
-  `Lost`: that instance is not in `by_key`, so a **new** instance launches
-  under the same key. It needs its own slot; the retiring one keeps its
-  slot until Host proves absence. At most one non-retiring instance per key
-  exists at any time; instances in total are bounded by the four slots.
+- Every callback carries its `ServerId` and acts only if `servers[id]` is
+  in the expected state: pin, reservation and lease drops, publication,
+  launch failure, retirement completion, loss. `by_key[hash]` is removed
+  only if it still maps to that `ServerId`.
+- A key whose instance is `Retiring` or `Lost` is not in `by_key`, so a new
+  instance launches under the same key with its own slot. At most one
+  non-retiring instance per key; instances in total are bounded by the four
+  slots.
 - A late callback for a removed or replaced instance is a no-op, counted in
   diagnostics.
 
-#### 2.4 Idle retirement (finding 7)
+#### 2.4 Idle retirement
 
-- **Trigger.** `holders` reaching 0 on a `Live` instance under the mutex
-  (pin dropped, lease released, reservation-turned-pin dropped). The entry
-  becomes `Retiring`, `by_key` is cleared (fenced), the epoch bumped, and a
-  **retirement task** spawned on the `JoinSet`.
+- **Trigger.** `holders` reaching 0 on a `Live` instance under the mutex.
+  The entry becomes `Retiring`, `by_key` is cleared (fenced), the epoch
+  bumped, and a retirement task sent to the supervisor.
 - **Retirement task.**
   1. `deadline = now + SERVER_RETIRE` (5 s), set first.
   2. `close_input(min(deadline, now + 2 s))`; a timeout or error is
      recorded and ignored.
-  3. `WireSender::close(CloseRequest { Graceful, deadline })`: always
-     requested, whatever step 2 did. Host waits for the exit until 400 ms
-     before the deadline, then `Stop`, then proves absence (fact:
-     `ProcessControl::close`). Codex exits within 50 ms of stdin close
-     (lifecycle E2c).
-  4. Remove the entry (fenced). Host keeps the slot until absence is
-     proved; an unproven retirement leaves the slot held and the re-probe
-     loop releases it later.
-- There is no idle grace: a server retires as soon as it has no holder.
-  **E2E:** launches per hour and warm `initialize` latency with the
-  persistent `CODEX_SQLITE_HOME`.
+  3. `WireSender::close(CloseRequest { Graceful, deadline })`, always
+     requested. Host waits for the exit until 400 ms before the deadline,
+     then `Stop`, then proves absence.
+  4. Return its outcome; the supervisor removes the entry (fenced). Host
+     keeps the slot until absence is proved; an unproven retirement leaves
+     the slot held and the re-probe loop releases it later.
+- No idle grace. **E2E:** launches per hour and warm `initialize` latency.
 - A retirement has no turn and no leftover report (AD20 limitation).
 - **Daemon idle exit.** Host's `pending_cleanup()` excludes live
-  server-owned controls (an idle server must not block idle exit); final
-  shutdown stops it.
+  server-owned controls; final shutdown stops them.
 
-#### 2.5 Supervised tasks (finding 5)
+#### 2.5 Supervision (r2 N6)
 
-- **Pattern** (runtime §2): `Servers` owns a cancellation token and a
-  `JoinSet<ServerTaskOutcome>`; each task returns a typed outcome
-  `ServerTaskOutcome { server: ServerId, kind: Launch | Connection | Retire, result }`.
-  One **supervisor** task, spawned at construction and joined by
-  `AdapterSet::shutdown`, loops on `join_next` and applies each outcome:
-  - a launch that ended (panic or cancel included) without publishing:
-    `ready` gets `Err`, the entry is removed (fenced);
-  - a connection task's end: the server-loss sequence (item 13) if the
-    instance is `Live`, otherwise recorded;
-  - a retirement's end: entry removed, outcome recorded.
-- No requester's dropped future cancels a launch, a connection or a
-  retirement, or loses a Host journal outcome.
-- **Shutdown.** `Servers::shutdown(deadline)`: set `closed` (no new pins
-  or launches), cancel the token, then join the set by the deadline. Joins
-  still pending stay in the registry (runtime §2: no caller deadline
-  abandons an owner). `AdapterShutdown` gains
-  `registry: RegistryShutdown { unjoined: u32, failed: u32 }`, a passive
-  report.
+**Mechanism** (runtime §2: each owner has a cancellation token and a
+`JoinSet`; tasks return typed outcomes; a `TaskTracker` alone is
+insufficient).
+- One supervisor task, spawned at construction, **exclusively owns** the
+  `JoinSet<ServerTaskOutcome>` and a map `task::Id → (ServerId, TaskKind)`,
+  `TaskKind = Launch | Connection | Retire`. Nothing else touches the set.
+- Registry code sends `ServerTask { server, kind, future }` on the bounded
+  channel. Capacity 16 cannot fill: at most four instances exist (one per
+  slot), each with at most two live tasks (its connection task, and a
+  launch or a retirement). A full channel is treated as a launch failure.
+- Loop (`select!`, biased): a spawn request → `set.spawn`, record its id;
+  `set.join_next_with_id()` only while the set is non-empty → apply the
+  outcome, using the id from `Ok((id, outcome))` or `JoinError::id()` to
+  find `(server, kind)` on panic or cancellation; the loop ends when the
+  token is cancelled, the channel is closed and the set is empty.
+- **Who cleans up when a task fails before its normal cleanup:**
+  - **Launch** ended without publication (an error, a panic, a
+    cancellation): the supervisor sends `ready ← Err`, removes `by_key`
+    (fenced) and, if `connection` was set, moves the instance to
+    `Retiring` and spawns its retirement. If Wire's open itself failed,
+    Host's acquisition failure path already owns the group (fact: an
+    acquisition failure ends with its own cleanup) and the entry is
+    removed.
+  - **Connection** task ended: on a normal end the instance is already
+    `Lost` or `Retiring`; a panic or cancellation starts the server-loss
+    sequence (item 13) with cause `Transport` from the supervisor.
+  - **Retirement** panicked or was cancelled: the instance stays
+    `Retiring` (never pinned). Host still holds its live control, which
+    final shutdown force-closes; nothing else retries.
+- Each panic or cancellation increments the supervisor's `failed` count.
+  An ordinary error outcome (handshake refused, spawn failure) is not a
+  task failure.
 
-#### 2.6 Journal uncertainty outside any driver (G9, finding 6)
+#### 2.6 Journal uncertainty outside any driver (G9)
 
-- **Mechanism.** Host owns one sticky `watch::Sender<bool>`
-  (`Host::journal_uncertain()`), set wherever any journal operation's
-  outcome resolves `Uncertain`: anchor intent, identified, ARM intent,
-  vendor facts, group absence, the link, failed-open and retirement
-  cleanup, server-loss cleanup. It is set where the outcome is observed
-  inside Host, so it does not depend on whether a turn or requester still
-  waits. Wire, Route and the adapter set forward it:
-  `AdapterSet::journal_uncertain() -> watch::Receiver<bool>`. Core
-  subscribes at engine start and latches Store failure on `true`
-  (runtime §7).
-- Turn-owned writes keep their per-turn reports too; latching twice is
-  harmless.
-- Server launch, retirement and loss Host calls run only on the registry's
-  supervised tasks (item 2.5), so no dropped requester discards their
-  outcome before Host sees it.
+- Host owns one sticky `watch::Sender<bool>` (`Host::journal_uncertain()`),
+  set wherever any journal operation's outcome resolves `Uncertain`: anchor
+  intent, identified, ARM intent, vendor facts, group absence, the link,
+  failed-open, retirement and server-loss cleanup. It is set where Host
+  observes the outcome, whether or not a requester still waits. Wire,
+  Route and the adapter set forward it as
+  `AdapterSet::journal_uncertain() -> watch::Receiver<bool>`; Core
+  subscribes at engine start and latches Store failure on `true`.
+- C2's existing per-driver `SessionDriver::journal_uncertain()` stays: it
+  covers the driver's own retirements. The aggregate covers writes when no
+  driver is alive (a server's retirement after its last lease). Latching
+  twice is harmless.
+- Server launch, retirement and loss Host calls run only on the
+  supervisor's tasks, so no dropped requester discards an outcome.
 
-#### 2.7 Daemon shutdown
+#### 2.7 Daemon shutdown (r2 N7, N8)
 
-`AdapterSet::shutdown` first calls `Servers::shutdown(deadline)`, then the
-existing Route, Wire and Host shutdown. Host force-closes every live
-control, servers included (Codex handles TERM gracefully, lifecycle §Codex
-"Graceful paths").
+`AdapterSet::shutdown(deadline, turns)`:
+1. `Servers::fence()` (sync): `fenced = true`, cancel the token. No new
+   pin, reservation or launch; launch handshakes stop at their next await.
+2. Run concurrently, both under the same absolute `deadline`:
+   - the existing Route, Wire and Host shutdown (Host closes every live
+     control, servers included, with its existing 1 s finalization reserve;
+     Codex handles TERM gracefully);
+   - `Servers::join(deadline − FINALIZE_RESERVE)`: drop the spawn sender
+     and wait for the supervisor's `SupervisorReport { unjoined, failed }`.
+     Connection and retirement tasks end once Host has stopped their
+     groups.
+3. Fold into the existing report: `pending_tasks += unjoined`,
+   `failed_tasks += failed`, and append to `failure` the bounded text
+   "server registry: {unjoined} tasks unjoined, {failed} failed" when
+   either is non-zero. Core's clean-exit predicate (`pending_tasks == 0 &&
+   failed_tasks == 0`) then covers the registry unchanged. No new report
+   field.
+
+A supervisor still running at the deadline stays owned by the adapter set
+until the process exits (runtime §2, §6.2).
 
 **Tests that fail first.**
-- X3 unit (`codex/servers.rs`, stand-in connection):
-  `reservation_survives_publication` (an opener stops during launch while a
-  joiner waits: publication makes the joiner a pin; no retirement);
-  `zero_holder_publication_retires`; `retiring_key_launches_new_instance`;
-  `stale_release_does_not_touch_replacement`; `launch_panic_resolves_waiters`;
-  `retire_requests_host_close_when_stdin_close_stalls`;
-  `retire_uncertain_absence_sets_journal_uncertain`.
+- X3, unit (`codex/servers.rs`, stand-in connection):
+  `reservation_survives_publication`, `zero_holder_publication_retires`,
+  `retiring_key_launches_new_instance`,
+  `stale_release_does_not_touch_replacement`,
+  `launch_panic_resolves_waiters_and_retires_connection`,
+  `retire_requests_host_close_when_stdin_close_stalls`,
+  `retire_uncertain_absence_sets_journal_uncertain`,
+  `supervisor_collects_tasks_spawned_after_empty_set` (the set empties,
+  then a launch is spawned: it is still collected).
 - X2: `daemon_idle_exit_not_blocked_by_idle_server`;
-  `host_journal_uncertain_watch` (each server-owned journal write forced
-  uncertain sets the watch; Core latches).
+  `host_journal_uncertain_watch`.
+- X3: `shutdown_stalled_registry_task_does_not_delay_host_cleanup` (a
+  stand-in retirement that never ends: Host still stops every group before
+  its deadline; the report counts one pending task and the exit is not
+  clean); `registry_panic_counts_failed_task`.
 - X4: `c4_two_sessions`, `codex_server_close`.
 
-### Item 3. `ServerKey` and `config_hash`
+### Item 3. `config_hash` and binary changes (r2 N18)
 
-**Decision.** `config_hash: [u8; 32]` (`codex::ConfigHash`), matched by
-the registry; `ServerKey { config_hash, vendor_version: Option<String> }`,
-reported, its version from the instance's handshake (observed, never
-hashed). SHA-256 over a length-prefixed canonical encoding of, in order:
-1. the domain tag `"via codex server key v1"`;
-2. `adapter_version`;
-3. the resolved program path bytes;
-4. its `BinaryIdentity` (device, inode, size, mtime s and ns; symlinks
-   followed), from a fresh `stat` at `prepare` and at launch;
-5. argv after the program (`app-server`, `--disable hooks` when hooks are
-   off, later verified switches);
-6. the environment VIA passes, sorted `(name, value)` pairs: the
-   allow-list values and `CODEX_SQLITE_HOME`; Host's random
-   `VIA_PROCESS_MARKER` excluded;
-7. the server cwd (`<state>/vendor/codex`);
-8. the protocol pin
-   `"initialize-v1;app-server-v2;client=via;experimental=none;opt-out=none"`.
+**Decision.**
+- `codex::ConfigHash([u8; 32])`: SHA-256 over a length-prefixed canonical
+  encoding of, in order:
+  1. the domain tag `"via codex server key v1"`;
+  2. `adapter_version`;
+  3. the resolved program path bytes;
+  4. its `BinaryIdentity` (device, inode, size, mtime s and ns; symlinks
+     followed);
+  5. argv after the program (`app-server`, `--disable hooks` when hooks are
+     off, later verified switches);
+  6. the passed environment, sorted `(name, value)` pairs: the allow-list
+     values and `CODEX_SQLITE_HOME`; Host's random `VIA_PROCESS_MARKER`
+     excluded;
+  7. the server cwd (`<state>/vendor/codex`);
+  8. the protocol pin
+     `"initialize-v1;app-server-v2;client=via;experimental=none;opt-out=none"`.
+- Excluded: credentials, bound, model, instructions, session cwd, effort,
+  VIA version. The observed vendor version is reported, never hashed.
+- J0's opaque `ServerKey(String)` (`RoutePlan.server_key`,
+  `ServerReport.key`) holds the first 16 lowercase hex digits of the hash.
+- The refusal-cache recipe key is `config_hash` plus the bound and policy
+  inputs, so a refusal for one binary identity never applies to another.
+- `via-adapters` gains the workspace dependency `sha2` (shared with
+  Claude's Q4).
 
-Excluded: credentials, bound, model, instructions, session cwd, effort,
-VIA version. Display (status `key`): first 16 lowercase hex digits. The
-refusal-cache recipe key is `config_hash` plus bound and policy inputs.
-`via-adapters` gains the workspace dependency `sha2` (shared with
-Claude's Q4).
+**Binary change between prepare and launch.**
+1. `prepare` is synchronous and does no syscall: it matches the driver's
+   cached hash, computed at `open_session` from the `InstanceCache`'s
+   identity. A pin on an existing instance is always valid: an existing
+   server keeps its leases after a binary change ("a new server key
+   follows only for new connections", C2 §5).
+2. `run_turn` with `NeedsConnection` recomputes the whole recipe from a
+   fresh `stat` before registry insertion. Insertion and lookup use that
+   hash, which may differ from the cached one; the driver's cache is
+   updated.
+3. The launch task spawns exactly the recipe it hashed. After the handshake
+   it re-stats the program path; an identity different from the recipe's
+   refuses publication: the launch fails as a spawn failure (never cached)
+   and the instance retires. So no instance is published under a hash
+   belonging to another binary identity. (A replacement and restoration
+   with identical device, inode, size and nanosecond mtime between the two
+   stats is not detected; accepted.)
 
-**Failure behaviour.** A `stat` failure at `prepare` answers
-`NeedsConnection`; at launch it is a spawn failure, never cached.
+**Failure behaviour.** A `stat` failure in `run_turn` is a spawn failure,
+never cached, nothing sent.
 
-**Tests that fail first (X1).** Equal inputs → equal hash; each component
-changes it; excluded inputs do not; display is 16 hex digits. X4: different
-hook settings launch two servers.
+**Tests that fail first.** X1: equal inputs → equal hash; each component
+changes it; excluded inputs do not; display is 16 hex digits. X3:
+`binary_change_before_launch_uses_fresh_hash` (prepare saw the old
+identity, the turn launches under the new hash, and a later old-hash
+`prepare` does not match it); `binary_change_during_handshake_refuses_publication`.
+X4: different hook settings launch two servers.
 
 ### Item 4. `CODEX_SQLITE_HOME` (Q6, G4)
 
@@ -473,47 +550,70 @@ symlink. X3: a symlinked `vendor/codex` refuses the launch with no
 acquisition. X5: the directory persists across a restart. **E2E:**
 concurrent servers on one home; resume across restart (x.3.4).
 
-### Item 5. Server evidence and `logs` (G6, finding 24)
+### Item 5. Server evidence and decode failures (G6, r1 #24, r2 N15)
 
 **Decision.**
 1. The server folder `evidence/servers/<server-id>/` holds `stderr.log`
    (uncapped, OS-written) and at most one `undecoded.bin`. `logs` reads
-   only `turns.evidence_dir` (fact), so never a server folder.
-2. Turn folders never hold `stderr.log`; `logs` lists what exists.
-3. **Classification** (Route `codex::Connection`, after Wire framing).
-   The prerequisite for any decode failure is a failure of the typed
-   schema; well-formed traffic is never a decode failure.
-   - **Unattributable decode failure** → server `undecoded.bin`, the
-     connection fails `protocol` for every associated session:
-     invalid UTF-8 or JSON; Wire `MessageTooLarge` or `Unterminated`; a
-     message whose correlation fields fail their typed schema (a known
-     method whose required `threadId` or `turnId` is missing or not a
-     string; a response whose `id` is not an integer; an `id` that is
-     neither outstanding nor abandoned, item 9.1).
-   - **Attributable decode failure** → that turn's `undecoded.bin`
-     (through its `TurnFolder`), only that turn fails `protocol`, and the
-     driver retires as for quarantine: correlation fields are valid and
-     resolve to a registration or tombstone, and another field fails the
-     typed schema.
-   - **Diagnostics only, not failures:** a well-formed message naming an
-     unknown `threadId` (no registration and no tombstone; packet §5);
-     well-formed connection-scoped or untagged traffic (handled at
-     connection level, never given fabricated thread ownership); an
-     unknown notification method (activity only).
-4. An unattributable failure's turn messages name the length and "the
-   shared connection's evidence", never a path (D4); `via.log` records the
-   server ID and path. **E2E:** `stderr.log` growth over a server's life.
+   only `turns.evidence_dir`, so never a server folder. Turn folders never
+   hold `stderr.log`.
+2. **Order of classification** in the connection task's demux, after Wire
+   framing:
+   1. **Routing peek.** Parse only the correlation fields (`id`, `method`,
+      `params.threadId`, `params.turnId`) against their typed schema.
+   2. **Correlation fields fail their typed schema** (invalid UTF-8 or
+      JSON; Wire `MessageTooLarge` or `Unterminated`; a known method whose
+      required `threadId` or `turnId` is missing or not a string; a
+      response `id` not an integer, or neither outstanding nor abandoned,
+      item 9.1) → **unattributable**: first 64 KiB to the server's
+      `undecoded.bin`; the connection fails `protocol` for every associated
+      session; failure messages name the length and "the shared
+      connection's evidence", no path (D4); `via.log` records the server
+      ID and path.
+   3. **Diagnostics only** (no failure): a well-formed message for an
+      unknown `threadId` (no registration, no tombstone); well-formed
+      connection-scoped or untagged traffic (never given fabricated thread
+      ownership); an unknown notification method (activity only).
+   4. **Closed generation.** The correlation resolves to a tombstone whose
+      generation's sink is closed (item 8): dropped and counted
+      (`late_after_close`) **before** full decoding. No evidence, no
+      failure.
+   5. **Open generation.** The message goes to that registration's lane;
+      the normalizer decodes it fully. A typed-schema failure of another
+      field is an **attributable** decode failure:
+      - **evidence** goes to the turn the correlation names (the original
+        turn, possibly already terminal): its `undecoded.bin` through its
+        `TurnFolder` (`create_new`; an existing file is kept);
+      - **continuity:** the registration's generation fails `protocol`.
+        Every nonterminal turn of that generation (the original turn if
+        still running, or its successor A2) fails `protocol` through the
+        driver's sticky health, its failure message naming the original
+        turn's `undecoded.bin` (same session, so D4 allows it). A terminal
+        original turn's envelope is not rewritten. The driver is retired;
+        a reopen uses a new generation.
+      - The connection and other sessions continue.
+3. **E2E:** `stderr.log` growth over a server's life.
 
-**Tests that fail first (X3).** `logs` for a Codex turn lists no
-`stderr.log`; an undecodable line on a two-session connection writes only
-the server `undecoded.bin` and both turns fail `protocol` with no path in
-their messages; a malformed `turn/completed` for A writes A's turn
-`undecoded.bin` and only A fails; a well-formed notification for an
-unknown thread and an untagged status message fail nothing.
+**Failure behaviour.** Saving `undecoded.bin` is best effort, bounded by
+2 s, and never blocks the failure.
 
-### Item 6. Recovery, shutdown, close and status (G3, findings 8–11)
+**Tests that fail first (X3).**
+- `logs` for a Codex turn lists no `stderr.log`.
+- An undecodable line on a two-session connection: only the server
+  `undecoded.bin`; both turns fail `protocol`; no path in their messages.
+- A malformed `turn/completed` for running A: A's `undecoded.bin`; only A
+  fails.
+- A malformed item for terminal A while A2 runs on the same generation:
+  evidence in A's folder, A's envelope unchanged, A2 fails `protocol`
+  naming A's file.
+- A malformed item for A after A's driver closed: dropped and counted, no
+  evidence written.
+- A well-formed notification for an unknown thread and an untagged status
+  message fail nothing.
 
-#### 6.1 Restart recovery
+### Item 6. Recovery, shutdown, close and status (G3)
+
+#### 6.1 Restart recovery and re-probe (r2 N17)
 
 - `Engine::reconcile` collects `server_anchor` IDs from
   `unfinished_turns()` (≤ 1,000). `Reconciled::add` keeps
@@ -521,456 +621,522 @@ unknown thread and an untagged status message fail nothing.
   only; turn owners keep today's path.
 - `Reconciled::cleanup(session, turn, server_anchor)`: linked → that
   anchor's facts (none reported → `(false, false)`); unlinked → today's
-  rule (no link means no vendor byte; item 1 order). Both `&& !incomplete`.
-- `hold_unproven` passes `Option<SessionId>` (`None` for servers); Host's
-  `Held.owner: Option<SessionId>`, so a session-filtered re-probe never
+  rule. Both `&& !incomplete`.
+- `hold_unproven` passes the anchor's `ProcessOwner`. Host's
+  `Held.owner: ProcessOwner`. A session-filtered re-probe (C1 close's
+  absence check) matches only `Turn` owners of that session, so it never
   waits on a shared server.
-- `recover` facts: Core passes none for server anchors; the Codex adapter's
-  `recover` always returns `Unknown { reason: "codex live recovery is unsupported" }`
-  (X0-Q3, ruled). Cleanup still comes from the link.
+- **Ownerless refusal.** `ReprobeReport.not_committed` becomes
+  `Vec<ProcessOwner>`. Core's `proof_failures` records a `Turn` owner
+  against its session as today. A `Server` owner is recorded with C1 scope
+  `daemon` and no address (`FailureScope::Daemon`, a new arm whose
+  addresses are empty; C1 `store_failure.scope` already allows `daemon`).
+  It does not latch. Its token stays held and the existing re-probe loop
+  retries it. No session owner is fabricated.
+- `recover`: no server-anchor facts; the Codex adapter returns
+  `Unknown { reason: "codex live recovery is unsupported" }`. Cleanup still
+  comes from the link.
 
-#### 6.2 A durable settlement without its terminal (finding 9)
+**Test (X2).** `reprobe_ownerless_not_committed`: a held server anchor
+whose absence commit is refused: `store_failure` scope `daemon`, no
+address, no latch, token still held, the next pass proves it.
 
-**Fact.** `settle_recovered` returns an existing `cancel.settled` as is
-(`recovery.rs`). For a Codex turn that settlement's `quiescent` came from
-vendor tool tracking (C1 §3.5's second ground), while C1 §7.5 makes a
-recovered turn's cleanup `quiescent` only on a proof of group absence.
+#### 6.2 A durable settlement without its terminal
 
-**Decision.** For a linked turn, the recovered terminal's
-`cancel.cleanup` is the meet: `quiescent` only when the durable
-settlement says `quiescent` **and** the linked anchor's absence is proved;
-otherwise `uncertain`. The settlement stays the turn's one settlement: the
-terminal cites its outcome and times, nothing new is committed, and the
-`cancel.settled` event keeps its historical value. Private routes are
-unchanged (their settled `quiescent` already came from group absence).
+For a linked turn, the recovered terminal's `cancel.cleanup` is the meet:
+`quiescent` only when the durable settlement says `quiescent` **and** the
+linked anchor's absence is proved; otherwise `uncertain`. The settlement
+stays the turn's one settlement (R1-Q1, accepted). Private routes are
+unchanged.
 
-**Test (X2).** `recovery_partial_settlement_rechecks_server_anchor`: a
-crash between `cancel.settled` (cleanup `quiescent`) and `turn.ended` on a
-linked turn with an unproven anchor recovers with cleanup `uncertain`; with
-a proved anchor, `quiescent`.
+**Test (X2).** `recovery_partial_settlement_rechecks_server_anchor`.
 
-#### 6.3 Final shutdown (finding 8)
+#### 6.3 Final shutdown
 
-- `Host::shutdown(deadline, turns)` keeps its existing first step: close
-  every live control (servers included). Only then does it read
-  `journal.server_links(turns)`, bounded by
-  `min(deadline, now + 1 s)`.
-- While paging anchors it folds each `Server` record into every requested
-  turn linked to it: **cleanup only** (`quiescent` = group absence proved);
-  `forced` is never folded from a server anchor (item 6.4).
-- **Link read failed or timed out:** Host records
-  `RecoveryFailure::LinksUnread` in the report's `failure`. Turns with their
-  own turn-owned record keep their facts; every other requested turn gets
-  Core's existing default for a failed report (`recovered_quiescent =
-  report.failure.is_none()`, so `uncertain`). Control cleanup never waits
-  on the read.
+- `Host::shutdown(deadline, turns)` closes every live control first
+  (servers included). Then it reads `journal.server_links(turns)`, bounded
+  by `min(deadline, now + 1 s)`.
+- It folds each `Server` record into every requested turn linked to it:
+  **cleanup only**; `forced` is never folded from a server anchor.
+- Link read failed or timed out: `RecoveryFailure::LinksUnread` in the
+  report's `failure`; turns with their own record keep their facts; every
+  other requested turn gets Core's existing default for a failed report
+  (`uncertain`).
 
-**Test (X2).** `shutdown_link_read_failure_still_stops_groups`: with the
-link read failing, every server group is stopped and proved absent; linked
-turns end with cleanup `uncertain`; a private-route turn keeps its
-`quiescent`.
+**Test (X2).** `shutdown_link_read_failure_still_stops_groups`.
 
-#### 6.4 Daemon force on a shared server (finding 11)
+#### 6.4 Daemon force on a shared server
 
 C1 §7.6 "Force deadline, shared server: `unknown`, outcome `unknown`" is
 kept; C1 is not amended for this.
-- C2 adds `SessionDriver::connection_kind() -> ConnectionKind { PerTurn, Shared }`
-  (Codex `Shared`; fake and Claude `PerTurn`). Core records it in
-  `ForcedTurn`.
+- C2 adds `SessionDriver::connection_kind() -> ConnectionKind`, with
+  `pub enum ConnectionKind { PerTurn, Shared }` (Codex `Shared`; fake and
+  Claude `PerTurn`). Core records it in `ForcedTurn`.
 - Under daemon force the Codex driver returns `RouteError::ForceStopped`
-  promptly, with `launched`.
-- Core's `forced_terminal` for a `Shared` turn: not launched → `cancelled`,
-  outcome `requested` (as today); launched → state `unknown`, outcome
-  `unknown`; cleanup from the folded server-anchor facts (`quiescent` only
-  with group absence). `stop_outcome` gains the `unknown` outcome for this
-  case only.
+  at once, with `launched`; it asks for no stop.
+- Core's `forced_terminal` for a `Shared` turn: not launched →
+  `cancelled`, outcome `requested`; launched → state `unknown`, outcome
+  `unknown`; cleanup from the folded server-anchor facts. `stop_outcome`
+  gains the `unknown` outcome for this case only. `cancel_cause` is
+  recorded as K1 defines.
 
-**Test (X2, stand-in shared route).** `shutdown_force_shared_is_unknown`:
-a launched linked turn under daemon force ends `unknown`/`unknown` with
-cleanup `quiescent` after the server group was proved absent; an
-unlaunched one ends `cancelled`/`requested`.
+**Test (X2).** `shutdown_force_shared_is_unknown`.
 
-#### 6.5 Close and status cleanup for shared sessions (finding 10)
+#### 6.5 Close and status cleanup for shared sessions
 
-**Fact.** `derive_close_result` and `cleanup_uncertain` read only
-session-owned anchors; for a Codex session that set is empty, so close
-would report `quiescent` even after a turn settled `uncertain`.
-
-**Decision.** One Store predicate, `session_cleanup_uncertain(session)`,
-used by both the close result and status `process.cleanup`:
+One Store predicate, `session_cleanup_uncertain(session)`, used by the
+close result and status `process.cleanup`:
 - any session-owned anchor without an absence proof (today's rule); or
 - any turn of the session with a link whose terminal envelope has
   `cancel.cleanup = "uncertain"` and whose linked anchor has no absence
   proof.
 
-A shared server's other work is excluded: the predicate never reads
-another session's turns, and a linked anchor matters only through this
-session's own uncertain turns. A later absence proof of that server clears
-it. Unsubscribe proves detachment, never cleanup.
+It never reads another session's turns. `process.alive` keeps
+`live_armed(unproven_anchors)`, the status read adding the unproven server
+anchors linked to the session's turns.
 
-`process.alive` keeps `live_armed(unproven_anchors)`, with the status read
-adding the unproven server anchors linked to the session's turns (positive
-evidence that the process that served the session is live).
-
-**Tests (X2).** `shared_close_cleanup_from_turn_facts`: a session with a
-linked turn settled `uncertain` on a live server closes `uncertain`; after
-the server's absence proof its status reports `quiescent`; a second
-session's uncertain turn on the same server does not affect the first.
+**Test (X2).** `shared_close_cleanup_from_turn_facts`.
 
 ### Item 7. `daemon/status.servers` (G2)
 
-J0: `AdapterSet::servers() -> Vec<ServerReport { harness, vendor_version, key, sessions }>`,
-empty everywhere, wired into `dispatch.rs`. X4: `Servers::reports()`, a pure
-snapshot under the mutex: `Live` instances only, `sessions` = leases, sorted
-by server ID, bounded by four slots.
+J0 merged `AdapterSet::servers()` (empty everywhere) and its wiring. X4:
+`Servers::reports()`, a pure snapshot under the mutex: `Live` instances
+only, `key` = J0's `ServerKey` (16 hex digits), `sessions` = leases,
+sorted by server ID.
 
-**Tests.** J0: empty list. X4 in `c4_two_sessions`: `sessions` 2 → 1 →
-absent after retirement.
+**Test (X4).** In `c4_two_sessions`: `sessions` 2 → 1 → absent after
+retirement.
 
-### Item 8. Threads: reopen, close cutoff and late traffic (G1, findings 13, 14)
+### Item 8. Threads: reopen, close and cleanup intents (G1)
 
-#### 8.1 Registrations and tombstones (finding 13)
+#### 8.1 Registrations, tombstones and the reattach fence (r2 N13)
 
 `codex::ThreadTable` (`crates/via-routes/src/codex/threads.rs`), owned by
 the connection task:
 ```rust
-struct ThreadEntry { open: Option<Registration>, generations: SmallVec<[u64; 2]> }
+struct ThreadEntry { open: Option<Registration>, fence: Option<RequestId> }
 struct Registration { lease: LeaseId, generation: u64, lane: IngressLane }
 // tombstones: (threadId, turnId) → Tombstone { lease, generation, session, turn, sink_open: bool }
 ```
-- One open registration per `threadId`. Registering while another is open
-  is refused (`RouteError::Protocol`, an internal invariant: Core retires a
-  session's old lane before opening its successor, so it never happens in
-  correct operation).
-- Every tombstone keeps the `(lease, generation)` that accepted its turn.
-  Vendor `turnId`s are unique, so an item for an old turn resolves to its
-  old generation even after the same thread reopened. Items of a closed
-  generation are dropped and counted (`late_after_close`); they never enter
-  the new generation's lane. Thread-level items without a `turnId` go to the
-  open registration only.
-- Release is fenced by `LeaseId`: an old lease's release cannot clear a
-  newer registration.
-- **Reattach barrier.** A driver's close completes only after its
-  `thread/unsubscribe` is resolved: withdrawn if still queued (item 12.2),
-  or written with its reply paired or its request record abandoned
-  (item 9.1). Core already finishes the old lane's close before opening a
-  successor (fact: `open_lane` awaits `retire_now`), so a `thread/resume`
-  never overtakes the old unsubscribe.
+- One open registration per `threadId`; a second while one is open is
+  refused (`RouteError::Protocol`, an internal invariant).
+- Every tombstone keeps the `(lease, generation)` that accepted its turn,
+  so an old turn's items never reach a newer generation. Thread-level
+  items without a `turnId` go to the open registration only.
+- Release is fenced by `LeaseId`.
+- **Reattach fence.** When a driver's unsubscribe intent (item 8.3) is
+  posted, `fence = Some(id)`. It clears only when that unsubscribe's reply
+  is paired (any result) or the connection retires. A successor driver's
+  `run_turn` on the same thread **and the same connection** waits for the
+  fence before `thread/resume`, bounded by its own wall, stop and force; if
+  that bound passes first, the turn fails with no byte sent (no-launch
+  evidence, its cause's class). On another connection there is no fence
+  (the old server's state does not reach it).
 
-#### 8.2 Close cutoff and the admitted prefix (finding 14)
+#### 8.2 Close: cutoff, delivery barrier, durable barrier (r2 N12)
 
-- Driver close posts `Close { lease }` to the connection task, which
-  applies it in demux order: that is the **cutoff**. Items decoded before
-  it are the admitted prefix, already in the registration's ingress lane
-  (≤ 16 messages / 1 MiB).
-- The prefix is delivered: the normalizer drains the lane into the C2
-  observation channel (durable ones `late: true` when their turn already
-  settled). It is bounded by C2's 10 s no-drain timer; a stall takes the
-  quarantine path and its explicit loss record (item 10).
-- Only after the drain does the connection task clear the registration
-  (`sink_open = false` on its tombstones). The driver close returns after
-  that and after unsubscribe resolution.
-- Items decoded after the cutoff and attributed to that registration are
-  dropped and counted.
-- A late terminal after the cutoff is not applied: an `unknown` turn stays
-  `unknown` (C1 §7.6 revision then cannot happen for it; documented
-  limitation). **E2E:** frequency of late completions after idle eviction.
+**Route side.**
+- Driver close posts `Close { lease }` to the connection task, applied in
+  decode order: the cutoff. Items decoded before it are the admitted
+  prefix, already in the registration's lane (≤ 16 messages / 1 MiB).
+- **Route delivery barrier:** the normalizer hands the prefix to the C2
+  observation sink by `close_deadline − 500 ms`. Inside a close the C2
+  10 s no-drain timer does not apply. Anything not handed over by then is
+  counted into the driver's `ObservationLoss` (item 10), reported in
+  `CloseReport.loss`.
+- Only then are the registration's tombstones marked `sink_open = false`;
+  later items attributed to them are dropped and counted. A late terminal
+  for an `unknown` turn decoded before the cutoff is delivered as C2's
+  `Observation::LateTerminal`, attributed by the tombstone's `turnId` (the
+  acceptance vendor turn ID, as K1 requires); after the cutoff it is not
+  applied (documented limitation). **E2E:** late completions after idle
+  eviction.
+- The driver posts its unsubscribe intent (item 8.3), waits for its reply
+  until `close_deadline`, and returns either way; the reattach fence
+  covers a reply still outstanding. The lease is released when close
+  returns.
 
-**Tests (X4, `codex_two_threads` additions).** An A durable item queued in
-A's lane when A's driver closes is committed `late: true` before close
-returns; an A completion after the cutoff is dropped with
-`late_after_close = 1` and no B or `turn: null` event; A reopened on the
-same thread: an old-turn item is dropped, a new-turn item reaches the new
-generation; a stale release of A's first lease leaves the second intact.
+**Core side (generic, X2).** Today the lane actor awaits `driver.close`
+before draining its inbox (fact: `lane.rs` actor). The actor now runs
+`driver.close(mode, deadline)` **concurrently** with a dispose loop over
+the inbox (admission still open), so the C2 channel keeps draining while
+the driver delivers its prefix. When close returns, the actor closes
+admission and drains the remainder (today's code). That is **Core's
+durable barrier**: every item the driver handed over is committed (late
+ones `late: true`) before the lane ends, and C1 close, eviction and
+replacement waiters wait for the lane's end. The concurrent loop is
+bounded by the same absolute close deadline. No bound changes: an idle
+eviction's 3 s graceful close (runtime §8) bounds both.
 
-### Item 9. Caps, request records and RSS (G5 a, findings 15, 22)
+**Tests.**
+- X2 (Core, stand-in driver that emits observations during close):
+  `lane_close_drains_concurrently` (a full observation channel while the
+  driver's close emits more: close completes, every item commits before
+  the lane ends).
+- X4 (`codex_two_threads` additions): an A durable item queued when A's
+  driver closes is committed `late: true` before the lane ends; an A
+  completion after the cutoff is dropped (`late_after_close = 1`), no B or
+  `turn: null` event; A reopened on the same thread waits for the
+  outstanding unsubscribe reply before `thread/resume`; an old-turn item
+  never reaches the new generation; a stale release leaves the newer lease
+  intact.
 
-#### 9.1 No admission cap; request records (finding 15)
+#### 8.3 Cleanup intents (r2 N3)
 
-- No lease cap and no outstanding-RPC admission cap (G5 a stands).
-- `codex::RequestTable` holds every client request record
-  `{ id: u64, method, owner: (LeaseId, generation, Option<TurnNumber>) }`.
-  IDs are connection-local, monotonic, never reused.
-- When a record's driver closes or its waiter is dropped, the record is
-  **abandoned**, not removed: it lives until its reply arrives (consumed,
-  counted, and, for a `turn/start` reply, its `turnId` registered as a
-  tombstone of the settled turn so later items are attributed) or the
-  connection retires.
-- **Accounting.** Outstanding and abandoned records, mappings and
-  tombstones share one correlation budget: 1,024 entries and 256 KiB per
-  connection (packet §5), each record charged one entry and 64 bytes.
-  Exhaustion latches connection `overflow`: every associated session is
-  told and the connection retires (packet §5's existing rule). This is a
-  retirement on exhaustion, not an admission refusal.
+- A driver's **interrupt** and **unsubscribe** are cleanup intents, not
+  turn input. Each is posted synchronously into its reserved slot (item
+  12.4) in the connection's thread table, keyed by thread and generation:
+  at most one interrupt and one unsubscribe per generation.
+- Intents are owned by the connection, not by the turn's write guard:
+  they are never withdrawn, and they survive the turn's settlement, the
+  `run_turn` future's drop and the driver's close.
+- **Target.** An interrupt posted before the turn's `turnId` is known
+  waits on the turn's `turn/start` request record: a reply with a
+  `turnId` releases it; an error reply, or a `turn/start` withdrawn or not
+  written, drops it (nothing to interrupt). A reply arriving after
+  settlement still releases it.
+- An intent ends when its write is `Done` and its reply paired or
+  abandoned (item 9.1), or when the connection retires.
+- **Amended rule:** after a turn settles, no **turn input** (start, steer)
+  of it is written. A cleanup intent admitted before settlement, and the
+  remainder of a line already started, may be written after.
 
-#### 9.2 RSS measurement (X5, finding 22)
+**Tests (X3).** `quarantine_interrupt_survives_settlement` (A2's interrupt
+queued behind a large data write is written after A2 returned);
+`interrupt_waits_for_delayed_acceptance` (posted before the `turn/start`
+reply; written once the reply brings the `turnId`);
+`interrupt_dropped_when_start_withdrawn`.
 
-- **Scenario `codex_rss_leases`** (daemon test, replay-fake server, one
-  server, 32 leased sessions, 32 concurrent active turns). Holders driven
-  to achievable simultaneous maxima, each counted once:
+### Item 9. Caps, request records and RSS (G5 a)
+
+#### 9.1 No admission cap; request records (r1 #15, r2 N16)
+
+- No lease cap and no outstanding-RPC admission cap.
+- `codex::RequestTable` holds every client request record:
+  ```rust
+  struct RequestRecord { id: u64, method: Method, owner: RequestOwner }
+  enum RequestOwner {
+      Server(ServerId),                                  // initialize, initialized, model/list
+      Lease { lease: LeaseId, generation: u64, thread: ThreadId, turn: Option<TurnNumber> },
+  }
+  ```
+  Owners are held by value, so a record outlives its lease. IDs are
+  connection-local, monotonic, never reused.
+- A record whose waiter is gone is **abandoned**, not removed: it lives
+  until its reply (consumed, counted; a `turn/start` reply's `turnId`
+  registered as a tombstone of its turn, and releasing a pending interrupt
+  intent) or the connection retires. Server-owned records end with the
+  handshake (a timed-out handshake fails the launch and retires the
+  connection).
+- **Budget.** Records of both owners, mappings and tombstones share one
+  correlation budget: 1,024 entries and 256 KiB per connection (packet
+  §5), each record charged one entry and 64 bytes plus its thread ID's
+  length. Exhaustion latches connection `overflow` and retires the
+  connection. That is a retirement on exhaustion, not admission refusal.
+
+#### 9.2 RSS measurement (X5, r2 N22)
+
+- **Scenario `codex_rss_leases`:** one replay-fake server, 32 leased
+  sessions, 32 concurrent active turns, every holder driven to its
+  achievable simultaneous maximum, each counted once.
 
   | Holder | Simultaneous maximum | Count |
   |---|---|---|
-  | Wire staging + all ingress lanes (one budget, item 12.5) | 1,024 messages / 4 MiB | per server |
-  | C2 observation channels, Core drain held by `core.observations.pause`; tool metadata is charged inside it | 1,024 items / 4 MiB | per session (32) |
-  | Correlation (records, mappings, tombstones) | 1,024 entries / 256 KiB | per server |
-  | Pending server-request replies | 8 / 64 KiB | per server |
-  | Driver controls | 8 / 64 KiB | per session (32) |
-  | Dispatched prompt | 16 MiB | per active turn (32) |
-  | Normalizer decode in flight | 1 MiB message, depth 64, 65,536 nodes | per session (32) |
-  | Wire read buffer | 64 KiB | per server |
+  | **Per server** | | |
+  | Staging: Wire's queue and all ingress lanes (one budget, item 12.5) | 1,024 messages / 4 MiB | 1 |
+  | Correlation: records, mappings, tombstones | 1,024 entries / 256 KiB | 1 |
+  | Pending server-request replies | 8 / 64 KiB | 1 |
+  | Wire read buffer | 64 KiB | 1 |
+  | Demux routing peek (one message) | 1 MiB | 1 |
+  | **Per session** | | |
+  | C2 observation channel, Core drain held (`core.observations.pause`); open-tool metadata is charged inside it | 1,024 items / 4 MiB | 32 |
+  | Driver controls | 8 / 64 KiB | 32 |
+  | Normalizer decode in flight: `DECODE_ALLOWANCE` = 1 MiB of owned strings + 65,536 nodes × 64 B = 5 MiB | 5 MiB | 32 |
+  | **Per active turn** | | |
+  | Dispatched prompt | 16 MiB | 32 |
 
-  The computed sum is assembled by the test from the constants, not
-  hand-written here.
-- **Assertions:** runtime §8 F24's two, unchanged: (1) peak RSS less the
-  idle baseline within the computed sum plus 25%; (2) growth below 32 MiB
-  after the first 64 MiB of a 256 MiB flood. 10 ms sampling; the musl build
-  is authoritative; glibc with `MALLOC_ARENA_MAX=2` is the development
-  proxy. Report the absolute peak, the counts reached and the marginal RSS
-  per active turn.
-- **What it qualifies:** at most 32 concurrent active turns on one server
-  (and so on the four servers within the four slots, by the same per-turn
-  cost). Nothing above 32 is claimed: the 256-turn unresolved bound
-  remains unmeasured for Codex (X0-Q1, ruled: no extra cap). A failure of
-  either assertion needs a design review, not a larger ceiling.
-- If fixture generation proves disproportionate, the plan lets the
-  coordinator move this to `via-5lr.3.3`.
+  The computed sum is assembled by the test from these constants.
+  `DECODE_ALLOWANCE` is an allowance, not the wire length; X5 also
+  records the measured peak of one maximal decode, and a measurement above
+  the allowance needs a design review.
+- **Assertions:** runtime §8 F24's two, unchanged: peak RSS less the idle
+  baseline within the computed sum plus 25%; growth below 32 MiB after the
+  first 64 MiB of a 256 MiB flood. 10 ms sampling; musl authoritative;
+  glibc `MALLOC_ARENA_MAX=2` as proxy. Report the absolute peak, the counts
+  reached and the marginal RSS per active turn.
+- **What it qualifies:** at most 32 concurrent active turns on one
+  server. Four loaded servers is an **extrapolation** from the per-server
+  and per-turn costs, not measured. The 256-turn unresolved bound remains
+  unmeasured for Codex (X0-Q1, ruled: no extra cap).
 
-### Item 10. Overflow and quarantine (G7, findings 20, 21)
+### Item 10. Overflow, quarantine and the loss record (G7, r2 N3, N14)
 
-- **Health.** A full thread ingress lane, or the C2 10 s stall, latches the
-  driver's sticky `DriverFailure::ObservationOverflow` (no payload).
-- **The loss record** `ObservationLoss { trigger: (SessionId, TurnNumber), generation, first_unqueued: u64, omitted: u64 (saturating) }`
-  goes to the connection's diagnostics (`via.log`, with the server ID) and
-  to Core (below).
-- **The driver ends affected turns** (Core does not act on driver health
-  during a run; fact: `drive.rs`). For every nonterminal turn of the
-  quarantined generation, including a successor A2, the driver:
-  1. posts `turn/interrupt` into its reserved interrupt slot (item 12.4)
-     with a synchronous `try` that never awaits the write; the feeder writes
-     it, and its request record pairs or abandons the reply;
-  2. wakes its own blocked waits (its `run_turn` select includes the
-     health watch) and returns at once:
-     `Err(Route(Overflow))`, any retained terminal, cleanup `Uncertain`,
-     and `TurnEnd.loss = Some(ObservationLoss)`.
-- **Public record (finding 21).** A new C1 warning code
-  `observations_lost`, one per envelope:
-  - Core adds it to the envelope of every affected turn whose `TurnEnd`
-    carries `loss`, whichever row of C1 §7.6 wins (so a retained natural
-    terminal that wins still shows the loss);
-  - when the triggering turn was already terminal, Core commits a durable
-    `warning` event with this code on that turn, `late: true`, from the
-    driver's `CloseReport.loss` (the lane actor retires the quarantined
-    driver between turns; fact: `lane.rs`). Its envelope is not rewritten.
-  - `message` (VIA's, ≤ 1 KiB): "observations were lost after a thread
-    ingress overflow; this result may be incomplete";
-    `data` (≤ 4 KiB, well under): `{trigger_turn: "s_…/N", generation, first_unqueued, omitted}`.
-- After the turn ends, the lane actor retires the driver; a new driver
-  reopens with `thread/resume` under a new generation. Quarantined traffic
-  is read, counted and discarded; replies still pair, requests still get
-  declined. Reserved-path or global exhaustion fails the connection.
+- **Health.** A full thread ingress lane, or the C2 10 s stall outside a
+  close, latches the driver's sticky `DriverFailure::ObservationOverflow`.
+- **Loss record.** The driver keeps one sticky
+  `ObservationLoss { trigger: (SessionId, TurnNumber), generation, first_unqueued: u64, omitted: u64 }`
+  (saturating), updated by later loss in the same generation (a close's
+  undelivered prefix included, item 8.2). It goes to connection
+  diagnostics (`via.log`, with the server ID), and to Core:
+  - `TurnEnd.loss: Option<ObservationLoss>` on every turn the generation's
+    loss affected;
+  - `CloseReport.loss: Option<ObservationLoss>` on **every** close of the
+    driver, whatever closed it (C1 close, idle eviction, replacement,
+    retirement), whenever the driver holds a record.
+- **The driver ends affected turns.** For every nonterminal turn of the
+  quarantined generation (including a successor A2): it posts its
+  interrupt cleanup intent (item 8.3; never awaited, never withdrawn) and
+  returns at once with `Err(Route(Overflow))`, any retained terminal,
+  cleanup `Uncertain` and `TurnEnd.loss`.
+- **One Core helper** (`Engine::record_loss`, X5): called with the
+  session, the loss and, from a `TurnEnd`, the ending turn's terminal.
+  1. If called from a `TurnEnd`: add the `observations_lost` warning to
+     that turn's envelope, whichever C1 §7.6 row wins.
+  2. If the trigger turn is not the ending turn and is terminal: commit
+     one durable `warning` event with code `observations_lost` on the
+     trigger turn, `late: true`; its envelope is not rewritten.
+  3. Deduplicate by `(trigger turn, generation)` in the lane state (kept
+     across successor lanes), bounded at 8 entries, oldest dropped: each
+     generation's late warning is committed at most once whichever of
+     `TurnEnd` or the close report arrives first.
+  The lane actor calls the helper for every close outcome, not only the
+  caller-owned close whose report it keeps today (fact: `lane.rs` keeps
+  only `Ending::Close` reports).
+- **Public record.** C1 warning `observations_lost`: `message` (≤ 1 KiB)
+  "observations were lost after a thread ingress overflow; this result may
+  be incomplete"; `data` (≤ 4 KiB) `{trigger_turn: "s_…/N", generation,
+  first_unqueued, omitted}`.
+- Quarantined traffic is read, counted and discarded; replies still pair,
+  requests are still declined. Reserved-path or global exhaustion fails
+  the connection.
+- A daemon crash between the turn's end and the late warning's commit
+  loses that warning; diagnostics keep it (accepted limitation).
 
 **Tests (X5, `codex_bounds_overflow` additions).** A2's interrupt is
-posted while a large data write blocks the writer, and A2 still returns
-before its wall; A2 with a retained `completed` terminal carries
-`observations_lost`; an already terminal A gets a `late: true` warning
-event and an unchanged envelope.
+written after A2 returned, behind a large data write; A2 returns before
+its wall with `observations_lost`; A, already terminal, gets exactly one
+`late: true` warning event when the loss arrives through both `TurnEnd`
+and a later idle-eviction close report; A's envelope is unchanged.
 
-### Item 11. Decline hand-off (finding 19)
+### Item 11. Decline hand-off
 
 - **Type and content.** `via_routes::codex::DeclineTable`
   (`&'static [(method, result_json)]`, `-32601` "Method not supported by
-  VIA" for anything else); content `via_adapters::codex::DECLINES` (the six
-  no-grant bodies of packet §4). The adapter passes the table and the 5 s
-  deadline (C2 A6) to `Servers`, which passes them to every connection.
-- **At decode** the connection task, in one step:
-  1. encodes the reply with the exact incoming ID and queues it as a
-     pending reply (item 12.3; ≤ 8 and 64 KiB, beyond that connection
-     overflow);
-  2. resolves the request's thread now: if it names an open registration,
-     inserts a `DeclinePlaceholder { method, summary, turn, decoded_at, outcome: oneshot }`
-     into that registration's ingress lane at this decode position
-     (charged one message and its bytes against the staging budget). The
-     registration and generation are captured here, so a later reopen
-     cannot receive it.
+  VIA" otherwise); content `via_adapters::codex::DECLINES` (packet §4's
+  six no-grant bodies). The adapter passes the table and the 5 s deadline
+  to `Servers`, which passes them to every connection.
+- **At decode**, in one step: encode the reply with the exact incoming ID
+  and queue it as a pending reply (item 12.3; ≤ 8 and 64 KiB, else
+  connection overflow); resolve the thread now and, for an open
+  registration, insert a
+  `DeclinePlaceholder { method, summary, turn, decoded_at, outcome: oneshot }`
+  into its lane at this decode position (charged one message against
+  staging), capturing the registration and generation.
 - **Reporting.** The normalizer reaching a placeholder waits on its
-  outcome, bounded by `decoded_at + 5 s`: `Written` → emits
-  `vendor.request_declined` in its decode position; anything else → no
-  event (the connection fails anyway). An unknown or closed thread gets the
-  reply and a diagnostics entry only.
-- **E2E/limitation:** a vendor that floods notifications while not reading
-  stdin can fill the lane during that ≤ 5 s wait and quarantine the
-  thread; the connection then fails at the deadline in any case.
+  outcome until `decoded_at + 5 s`: `Written` → `vendor.request_declined`
+  in decode position; otherwise no event. An unknown or closed thread gets
+  the reply and a diagnostics entry only.
+- **E2E/limitation (R1-Q4, accepted):** a vendor flooding while not
+  reading stdin can quarantine the thread during that wait; connection
+  failure and cleanup never depend on the blocked normalizer.
 
-**Tests (X1 bodies, X3 behaviour).** `codex_never_ask` per packet §8, plus:
-the decline report precedes a notification decoded after the request but
-written before the reply completed; a request for a closed thread is
-declined with no observation; a request decoded before A's reopen is never
-reported on the new generation.
+**Tests (X1 bodies, X3 behaviour).** `codex_never_ask` per packet §8, plus
+the placeholder ordering, the closed-thread decline and the reopen case.
 
-### Item 12. Write scheduling on a shared connection (findings 2, 16–18)
+### Item 12. Writes on a shared connection (r1 #2, #16–18; r2 N2, N4, N5)
 
-#### 12.1 Facts
+#### 12.1 Facts (J0 merged)
 
 1. Wire's writer writes one message at a time, picks control before data
-   only between messages, and streams a `Start` in 16 KiB slices without
-   interleaving.
-2. A JSONL line cannot be split.
-3. Today any message cut by its deadline, or not written, ends the writer
-   and drops stdin.
-4. Dropping a `PendingWrite` leaves an enqueued message owned by Wire
-   (`connection.rs`, `Io::write`).
-5. Wire releases a message's staging charge when Route receives it
-   (`WireMessages::received`).
+   between messages, and streams a `Start` in 16 KiB slices.
+2. J0's `ControlQueue` (one std mutex) holds control jobs with tickets and
+   their 8 / 64 KiB budget. A `Control` message's deadline bounds only the
+   wait for its first byte: expired queued or unstarted, it answers
+   `NotWritten` exactly once and stdin stays open; started, it is written
+   whole. The writer sweeps queued deadlines while it holds stdin, so a
+   dropped caller still expires.
+3. Data writes still travel a capacity-1 `mpsc` and keep the old rule: a
+   message cut by its deadline ends the writer and drops stdin.
+4. Wire releases a message's staging charge when Route receives it.
 
-#### 12.2 Queued, started, done; withdrawal (finding 2, Blocker)
+#### 12.2 Data on J0's queue; withdrawal; the turn-write guard (r2 N2)
 
-**Wire API (X2, built on J0's `Control` first-byte semantics).**
-```rust
-pub enum WriteBounds {
-    CutAt(Deadline),                               // today's semantics; private routes
-    StartBy { start_by: Deadline, finish_by: Deadline }, // shared connections
-}
-pub enum WriteState { Queued, Started, Done(SendOutcome) }
-impl WireSender { pub fn write(&self, m: OutboundMessage, b: WriteBounds) -> PendingWrite; }
-impl PendingWrite {
-    pub fn state(&self) -> WriteState;
-    pub fn withdraw(&self) -> WriteState; // Queued → removed; returns the state that won
-}
-```
-- Each queued write carries an atomic state. The writer moves `Queued →
-  Started` before its first byte; `withdraw` moves `Queued → Withdrawn`.
-  Whichever wins decides. A withdrawn or `start_by`-expired message is
-  `NotWritten`; the writer skips it and **stdin stays open**.
-- A started message under `StartBy` is finished whole by `finish_by` (the
-  connection's own far deadline). Only connection retirement cuts it.
-- `CutAt` is today's behaviour exactly, so private routes and every
-  characterization test are unchanged.
-- **Route rule.** A turn passes its own deadline as `start_by`. Before
-  `run_turn` returns, the driver withdraws every one of the turn's queued
-  writes. A write that already `Started` is finished whole and its request
-  record kept (item 9.1). After the turn settles the driver admits no
-  further input for it (steer and interrupt for a settled turn are
-  refused). So no byte of a turn is written after it settled except the
-  remainder of a line that had started before.
+**What X2 adds to J0's `ControlQueue`** (renamed `WriteQueue`, same lock):
+- **A ticketed data slot** (capacity 1, as today's channel) for
+  `OutboundMessage::Start` with `WriteBounds::StartBy`. It follows J0's
+  control rules: `start_by` bounds the wait for the first byte (swept by
+  the writer like a control deadline); a started message is written whole
+  by `finish_by` (the connection's own far deadline); expiry never closes
+  stdin. `WriteBounds::CutAt(deadline)` keeps today's data path and rule
+  unchanged, so private routes and characterization tests do not move.
+- **`withdraw(ticket) -> WriteState`**: J0's `expire(ticket)` generalized
+  to data tickets and to a caller's removal before the deadline;
+  synchronous, under the lock; the job's state is `Queued` until the
+  writer takes it, which is `Started` (item 12.3); `withdraw` and the take
+  decide under the same lock, exactly once.
+- `PendingWrite::ticket()` exposes the ticket. Dropping a `PendingWrite`
+  still withdraws nothing (J0's rule).
+
+**Route: the owning guard.** `codex::TurnWrites` lives in the driver's
+`run_turn` future and records every turn-input write of the turn: those
+still in the feeder's queue and the tickets handed to Wire. Its `Drop` is
+synchronous: under the feeder's std mutex it removes the turn's queued
+items, then calls `WireSender::withdraw` for each ticket. It runs on
+return, on the future's drop (`TurnAbandoned`) and on panic unwinding.
+- A write already `Started` is finished whole; its request record stays
+  (abandoned, item 9.1).
+- Cleanup intents (item 8.3) are not in the guard.
 - A stop order while the turn's `turn/start` is `Started`: the driver
-  waits for the write until `force_at`, then interrupts once the reply's
-  `turnId` is known; if `force_at` passes first, the turn returns
-  `unknown`/`unknown` and no interrupt follows (C1 §7.6 shared row).
+  waits for it until `force_at`, posting its interrupt intent at once; if
+  `force_at` passes first the turn returns `unknown`/`unknown` (C1 §7.6
+  shared row).
 
-#### 12.3 Control priority at Wire's choice (finding 17)
+#### 12.3 Control priority decided under the queue lock (r2 N5)
 
-- **Wire API (X2):** `WireSender::hold_data() -> DataHold`. While any hold
-  exists, the writer starts no data message between messages; it waits for
-  a control or the last hold's release. Holds are counted (an atomic and a
-  notify).
-- **Route feeder** (`codex::Feeder`, `crates/via-routes/src/codex/feeder.rs`,
-  in the connection task) is Wire's only producer on the connection. It
-  takes a `DataHold` the moment a reply or driver control becomes pending,
-  and releases it when that control's write is `Done`. It submits controls
-  to Wire one at a time, replies first, then driver controls FIFO (Wire's
-  control limit of 8 never binds). Data messages are submitted one at a
-  time.
-- **Bound.** A reply decoded while data is being written waits for at most
-  that one started data message, plus at most 7 earlier replies and one
-  in-flight driver control (each ≤ 64 KiB). No other data message can be
-  dequeued ahead of it. The started data message's duration is the
-  vendor's read rate times its size (≤ about 6 × 16 MiB escaped). Missing
-  the 5 s decline deadline fails the connection (packet §4).
-  **E2E:** write time of a 16 MiB `turn/start` and decline latency during
-  it.
+- **`WireSender::hold_data() -> DataHold`** increments `holds` under the
+  `WriteQueue` lock; dropping it decrements under the lock and wakes the
+  writer.
+- The writer takes the next job under the same lock: any control job
+  first; the data job only when `holds == 0`. **Taking the data job is its
+  `Queued → Started` transition**, inside that critical section. So a hold
+  acquired before the take always keeps the data job queued, and a data
+  job taken before the hold is the one in-flight data message the bound
+  allows.
+- **Feeder** (`codex::Feeder`, in the connection task) is Wire's only
+  producer on the connection. It takes a `DataHold` the moment a reply or
+  driver control becomes pending, and releases it when that control's
+  write is `Done`. It submits controls one at a time, replies first, then
+  reserved cleanup intents, then steers FIFO; data one at a time.
+- **Bound.** A reply decoded while data is written waits for at most that
+  one started data message, plus at most 7 earlier replies and one
+  in-flight driver control. Missing the 5 s decline deadline fails the
+  connection (packet §4). **E2E:** write time of a 16 MiB `turn/start` and
+  decline latency during it.
 
-#### 12.4 Reserved mandatory controls (finding 18)
+#### 12.4 Reserved mandatory controls (r2 N4)
 
 Per driver, within C2's 8 commands / 64 KiB:
-- two reserved, coalesced slots, each ≤ 1 KiB: **interrupt** (one per
-  active turn; duplicates coalesce in the driver) and **unsubscribe** (one
-  per lease);
-- steer may use at most 6 slots and 62 KiB; past that,
-  `SteerError::OverCapacity`.
-The feeder takes reserved slots before queued steers of the same driver.
-A shared connection never uses `OutboundMessage::Interrupt` (coalesced
-once per connection, which would swallow another session's interrupt).
+- **Maximum encodings.** C2 A1 allows IDs of up to 1 KiB each; JSON
+  escaping can multiply a 1 KiB ID by 6 (`\u00XX` per byte), so 6,144
+  bytes encoded. With the JSON-RPC wrapper and a 20-digit request ID:
+  - `turn/interrupt {threadId, turnId}` ≤ 2 × 6,144 + 256 → reserved
+    **12,800 bytes**;
+  - `thread/unsubscribe {threadId}` ≤ 6,144 + 256 → reserved
+    **6,400 bytes**.
+  The encoder's maxima are constants checked by a test.
+- **Two reserved, coalesced slots** (the cleanup intents of item 8.3).
+- **Steer** may use at most 6 slots and 65,536 − 12,800 − 6,400 =
+  **46,336 bytes** encoded; past that, `SteerError::OverCapacity`, nothing
+  written.
+- A shared connection never uses `OutboundMessage::Interrupt` (coalesced
+  once per connection).
 
 **Lanes.** Data (`Start`, streamed): `thread/start`, `thread/resume`,
 `turn/start`. Control (`Control`, ≤ 64 KiB): `initialize`, `initialized`,
 `model/list`, `turn/steer`, `turn/interrupt`, `thread/unsubscribe`,
 server-request replies.
 
-#### 12.5 Staging permits (finding 16)
+#### 12.5 Staging permits
 
-- **Wire API (X2):** `VendorMessage` carries a `StagingPermit` (one
-  message and its bytes of the connection's 1,024 / 4 MiB staging), released
-  on drop instead of at receive. For private routes Route drops the message
-  after decoding, so nothing observable changes.
-- **Route (X3):** the demux peeks only the routing fields (method, `id`,
-  `threadId`, `turnId`), drops that parse, and enqueues the raw message
-  with its permit and a fixed routing header into the ingress lane. The
-  normalizer decodes it fully when it consumes it and drops the permit
-  after. So Wire's queue and every ingress lane share the one 4 MiB
-  budget, and a decoded representation exists only for the message a
-  normalizer is processing (bounded by the 1 MiB / depth 64 / 65,536-node
-  limits).
+- **Wire (X2):** `VendorMessage` carries a `StagingPermit` (one message
+  and its bytes of the 1,024 / 4 MiB staging), released on drop instead of
+  at receive. Private routes drop the message after decoding: no change.
+- **Route (X3):** the demux peeks the routing fields, drops that parse,
+  and enqueues the raw message with its permit into the ingress lane; the
+  normalizer decodes it when it consumes it and drops the permit after.
 
 **Tests that fail first.**
 - X2 (Wire, harness-free): `withdraw_queued_keeps_stdin_open`;
   `start_by_expiry_keeps_stdin_open`; `started_line_finishes_whole`;
-  `cut_at_unchanged` (characterization); `data_hold_defers_queued_data`
-  (a control submitted after a hold is written before a data message queued
-  before it); `staging_permit_held_until_drop`.
-- X3: `codex_control_budget` (a reply decoded right after a control
-  completes, with data queued, is written before that data — the
-  completion/wake race; a steer whose turn's wall passes while queued is
-  withdrawn and stdin stays open; no queued write of a settled turn is
-  written after settlement); interrupt admitted with all six steer slots
-  full; `staging_aggregate_includes_ingress` (Wire refuses at 4 MiB counted
-  across its queue and the lanes).
+  `cut_at_unchanged` (characterization); `hold_and_take_are_atomic` (a
+  test hook between the writer's empty-holds check and its take cannot be
+  reached with a hold acquired: the hold either precedes the take and the
+  data waits, or follows it and the data is the in-flight message);
+  `staging_permit_held_until_drop`.
+- X3: `turn_writes_guard_withdraws_on_drop` (dropping the `run_turn`
+  future with a queued `turn/start` and a queued steer: neither is
+  written, stdin open); `turn_writes_guard_withdraws_on_panic`;
+  `codex_control_budget` (reply priority over queued data; a queued steer
+  withdrawn at its turn's settlement; no turn input written after
+  settlement); `reserved_controls_fit_max_ids` (1 KiB IDs of control
+  characters: interrupt and unsubscribe admitted with six steers queued at
+  46,336 bytes); `staging_aggregate_includes_ingress`.
 - X5: decline deadline with the reader paused (item 14).
 
-### Item 13. Server loss (finding 12)
+### Item 13. Server loss (r2 N9–N11)
 
-One owned sequence, run by the connection task and finished by the
-supervisor, on a Host-confirmed leader exit or a Wire transport failure:
-1. **Latch.** Connection health `ServerLost` (sticky); the instance moves
-   `Live → Lost` and leaves `by_key` (fenced); the epoch bumps. No new pin,
-   lease or write.
-2. **Preserve prior order.** The demux drains every message Wire already
-   staged (until Wire's end marker), routing each as usual. Each driver
-   observes the loss only as an in-band end after its lane's prefix, so a
-   terminal decoded before the loss is applied first (C1 §7.6: a vendor
-   terminal row wins).
-3. **Bounded Host evidence.** `WireSender::close(CloseRequest { Stop, now + SERVER_LOSS_EVIDENCE })`,
-   `SERVER_LOSS_EVIDENCE = 5 s`; collect one `CloseReport` (group
-   absence; the shared leftover snapshot once S-LEFTOVER lands in Host,
-   until then `leftovers: null`).
-4. **Fan-out.** Post `ServerLost { report }` to every registration with a
-   nonterminal turn; each driver's `run_turn` returns
-   `Err(Route(ServerLost))` with cleanup `Quiescent` only when the group
-   absence was proved, else `Uncertain`, and the shared leftovers.
-   A turn's own wall, stop or force still ends its wait first.
-5. Remove the instance (fenced). Host keeps the slot until absence is
-   proved; an uncertain journal write sets the watch (item 2.6).
+One owned sequence, run by the connection task (or the supervisor when the
+connection task itself failed). It starts on the first of: Wire health
+`Exited` (Host confirmed the leader's exit), or a Wire transport failure
+(writer error, stdout end or error). Steps 2–4 run concurrently:
+1. **Latch** (at once): connection health `Lost { cause }`, `cause =
+   Exited | Transport`; the instance `Live → Lost`, out of `by_key`
+   (fenced); epoch bump; no new pin, lease or write.
+   `loss_deadline = now + SERVER_LOSS_EVIDENCE` (5 s).
+2. **Host cleanup** (at once): `WireSender::close(CloseRequest { Stop,
+   loss_deadline })`. It never waits for stdout EOF.
+3. **Prefix drain:** Wire's new `WireMessages::drain_admitted()` (X2)
+   yields every complete message admitted to the staging queue before the
+   latch, then `Boundary { cause, discarded_bytes }`. It never waits for
+   more stdout; bytes after the latch are discarded and counted (today's
+   reader rule). The demux routes each message as usual, and each
+   registration receives the boundary after its prefix, so a terminal
+   decoded before the loss is applied first.
+4. **Fan-out**, after the prefix reached every lane and Host's report is
+   in (or `loss_deadline` passed). The cause is the one at the latch,
+   checked against Host's report:
+   - `ServerLost` only if Host confirmed the leader had exited before VIA's
+     stop (Wire `Exited` health, or Host's `Stop` found the leader already
+     gone: `forced == false` with an exit report);
+   - otherwise `TransportLost`: the process was alive or unconfirmed at
+     the loss, so the turn is `unknown` (C1 §7.6 "Transport lost, process
+     alive or unconfirmed"), even though VIA's stop then ended it.
+   Each nonterminal turn's driver returns that cause, with cleanup
+   `Quiescent` only when Host proved group absence, else `Uncertain`, and
+   the shared leftover snapshot for `ServerLost` once S-LEFTOVER lands in
+   Host (until then `leftovers: null`). A turn's own wall, stop or force
+   still ends its wait first.
+5. The supervisor removes the instance (fenced); Host keeps the slot until
+   absence is proved; an uncertain journal write sets the watch (item 2.6).
 
-**Test (X4).** `codex_server_lost_order`: A's `turn/completed` staged
-before the exit completes A; B (no terminal) fails `server_lost` with the
-cleanup from Host's proof; no turn fails before Host's evidence is in.
+**Tests.**
+- X2 (Wire): `drain_admitted_yields_prefix_then_boundary` (messages queued
+  before a latched failure are yielded, then the boundary; a child holding
+  stdout open does not delay it).
+- X4: `codex_server_lost_order` (A's staged `turn/completed` completes A;
+  B fails `server_lost` with the cleanup from Host's proof);
+  `codex_transport_loss_is_unknown` (writer error with the server alive:
+  B ends `unknown`; Host's stop proves absence, so cleanup `quiescent`);
+  `server_loss_cleanup_not_blocked_by_inherited_stdout` (a stand-in child
+  keeps stdout open: Host's stop starts at the latch and fan-out happens by
+  `loss_deadline`).
 
-### Item 14. The replay-harness join (finding 23)
+### Item 14. The replay-harness join (r1 #23, r2 N23)
 
 **Fact.** Replay reads stdin on its own thread (`read_stdin`) whatever
-step runs; `await_signal` does not pause it; its reader rejects lines over
-`MAX_READ` (1 MiB).
+step runs; `await_signal` does not pause it; it reads a whole line with
+`read_until` under `MAX_READ` (1 MiB).
 
-**Decision.** A named `via-fake-agent` join, owned by X3 (shared-join file
-`crates/via-fake-agent/src/replay.rs` and `replay/input.rs`), with bounds:
-- **`expect_large { min_bytes, max_bytes }`**, `max_bytes ≤ 128 MiB`: one
-  line consumed in 64 KiB chunks without retaining it; records its length
-  and SHA-256 for assertion. Other steps keep `MAX_READ`.
-- **`pause_input` / `resume_input`**: the reader thread stops reading
-  stdin (so the pipe fills) until `resume_input` or a 30 s ceiling; the
-  fixture's end resumes it. A paused reader is not a detached reader:
-  finalization still drains to EOF.
-- Both are fixture steps only; no CLI surface (runtime §3).
+**Decision.** A named `via-fake-agent` join owned by X3 (shared-join files
+`crates/via-fake-agent/src/replay.rs` and `replay/input.rs`):
+- The reader reads in 64 KiB chunks and keeps one line buffer, so it can
+  change mode between chunks. Its mode (`Normal | Large { min, max } |
+  Paused`) is in the shared state under the existing mutex.
+- **`expect_large { min_bytes, max_bytes }`** (`max ≤ 128 MiB`): installs
+  `Large` at a line boundary, before the line's first chunk is read; the
+  line is consumed in chunks without being kept, recording its length and
+  SHA-256 for assertion.
+- **`pause_input` / `resume_input`**: `Paused` stops reading between
+  chunks until `resume_input` or a 30 s ceiling; the fixture's end
+  resumes. A paused reader is not a detached reader: finalization still
+  drains to EOF.
+- **Acknowledged transitions.** The reader writes each mode change to the
+  progress log when it takes effect (`input large at line N`, `input
+  paused at byte B`, `input resumed`). The test's acceptance criterion: it
+  waits for the acknowledgement before it causes the tested write (submits
+  the large turn, or triggers the server request). A step alone proves
+  nothing.
+- Fixture steps only; no CLI surface (runtime §3).
 
 ---
 
@@ -982,34 +1148,34 @@ step runs; `await_signal` does not pause it; its reader rejects lines over
 | Codex `recover` always `Unknown` | Server facts to `recover` | — |
 | One shared `CODEX_SQLITE_HOME` | One per key | Concurrent servers on one home; resume across restart |
 | Drop items after the cutoff (G1) | Keep sinks for closed drivers | Late completions after idle eviction |
-| Data hold + one control at a time | Control queue with priorities in Wire | 16 MiB start write time; decline latency during it |
+| Data on J0's queue lock; one control at a time | Priority queue in Wire | 16 MiB start write time; decline latency during it |
+| Reattach fence waits on the same connection | Force a new connection | Fence wait times in practice |
 | No lease or RPC admission cap (G5 a) | `OverCapacity` admission | X5 RSS at 32 |
-| Normalizer waits ≤ 5 s on a decline placeholder | Out-of-order decline reports | Lane fill during a stalled reply |
+| Late warning lost on a crash before its commit | Durable loss journal | — |
 | Server `stderr.log` uncapped | Rotation | Its growth |
 
 ---
 
 ## 4. Interface observations (C2 needs one harness has and another lacks)
 
-1. **`ConnectionPin` needs a per-harness payload:**
-   `ConnectionPin { Generation(u64), Server(ServerPin) }`. Codex's pin is a
-   registry guard that must drop on every path; Claude needs none.
-2. **`SessionDriver::readiness()`**: Codex has a shared readiness that can
-   change a queued turn's slot need; per-turn routes do not (`None`).
-3. **`SessionDriver::connection_kind()`**: daemon force maps differently on
-   shared servers (C1 §7.6). Claude and fake are `PerTurn`.
-4. **G9 `AdapterSet::journal_uncertain()`**: Host journal writes with no
-   turn (server lifecycle; later OpenCode's idle policy). Claude never
-   needs it, but the watch is Host-wide and harmless for it.
+1. **`ConnectionPin`** needs a per-route payload:
+   `ConnectionPin { Generation(u64), Server(ServerPin) }`.
+2. **`SessionDriver::readiness()`**: only a shared registry can change a
+   queued turn's slot need.
+3. **`SessionDriver::connection_kind() -> ConnectionKind { PerTurn, Shared }`**:
+   daemon force maps differently on shared servers (C1 §7.6).
+4. **`AdapterSet::journal_uncertain()`**: Host journal writes with no
+   driver alive. Claude's per-driver watch suffices for it.
 5. **`TurnEnd.loss` and `CloseReport.loss`**: only shared-ingress routes
-   can lose observations of an already terminal turn.
-6. **`AnchorRecovery.owner: ProcessOwner`** and `hold_capacity`'s optional
-   session owner. Claude uses only `Turn`.
-7. **Wire write semantics.** `WriteBounds::StartBy`, `withdraw`,
-   `hold_data`, `StagingPermit`: needed by any shared connection, unused by
-   private routes (`CutAt` unchanged).
-8. **`OutboundMessage::Interrupt`'s once-per-connection coalescing** is
-   wrong for shared connections; Codex uses `Control`.
+   lose observations of an already terminal turn.
+6. **`AnchorRecovery.owner`, `ReprobeReport.not_committed`**:
+   `ProcessOwner`; Claude uses only `Turn`.
+7. **Wire:** `WriteBounds::StartBy`, `withdraw`, `hold_data`,
+   `StagingPermit`, `drain_admitted`: needed by any shared connection,
+   unused by private routes.
+8. **Steer size on Codex:** 46,336 encoded bytes per driver (the reserved
+   cleanup slots come out of C2's 64 KiB). A larger steer is
+   `OverCapacity`, an existing C2 error; Claude has no steer.
 9. **`launched` on server routes** means the turn's first byte reached
    Wire.
 10. **Daemon idle predicate** excludes server-owned controls.
@@ -1020,15 +1186,13 @@ step runs; `await_signal` does not pause it; its reader rejects lines over
 
 | # | Question | Recommendation |
 |---|---|---|
-| X0-R1-Q1 | Item 6.2: a recovered linked turn's envelope `cancel.cleanup` can be stricter (`uncertain`) than its historical `cancel.settled` event (`quiescent`). Accept that difference? | Accept. The event is history of the live settlement; the envelope applies C1 §7.5's recovery rule. The alternative, a second settlement event, breaks "one settlement per turn". |
-| X0-R1-Q2 | Item 10: new C1 warning code `observations_lost`. C1 is the public contract. | Accept. No existing code fits (`cancel_cleanup_uncertain` and `structured_output_*` mean other things); the shape follows C1's existing warning bounds. |
-| X0-R1-Q3 | Item 0 is a generic Core change on the dispatch path. Owner chunk? | X2: its tests run on the fake route with stand-in readiness and it must land before X3's registry relies on it. |
-| X0-R1-Q4 | Item 11's placeholder wait can let a non-reading, flooding vendor quarantine a thread before the 5 s connection failure. | Accept, with the E2E item; the connection fails at the same deadline either way. |
+| X0-R2-Q1 | Item 8.1: a successor's turn on the same thread waits for the old unsubscribe's reply on that connection, bounded only by its own wall. A server that never answers that unsubscribe blocks the session's turns on that server until the server retires. | Accept, with the E2E item. The registry keeps the server alive while the session holds it; the alternative (forcing a new connection) costs a slot and a 38 s cold start. Revisit if the E2E shows unanswered unsubscribes. |
+| X0-R2-Q2 | Item 12.4: Codex steer limited to 46,336 encoded bytes. | Accept; `OverCapacity` is C2's existing answer. If callers hit it, raise the per-driver control budget in C2 rather than shrink the reservations. |
+| X0-R2-Q3 | Item 13: a server whose stdout fails while the process is alive ends its turns `unknown`, then VIA stops it. | Accept: it is C1 §7.6's transport row; the stop is cleanup, not death. |
 
-The round-0 questions are ruled: Q1 no extra cap, the RSS result qualifies
-only what it measures; Q2 the relative method; Q3 `recover` always
-`Unknown` with cleanup derived correctly (item 6); Q4 G9, aggregate (item
-2.6); Q5 serialized schema numbering (item 1).
+The round-0 and round-1 questions are ruled (no extra cap, the relative
+RSS method, `recover` always `Unknown`, aggregate G9, serialized schema
+numbering, R1-Q1 to R1-Q4 accepted).
 
 ---
 
@@ -1036,18 +1200,15 @@ only what it measures; Q2 the relative method; Q3 `recover` always
 
 - Whether concurrent Codex servers can share one `CODEX_SQLITE_HOME`, and
   whether `thread/resume` works across a server restart (x.3.4).
-- Real Codex stdin read throughput for a 16 MiB line, and so real reply
-  latency during one.
+- Real Codex stdin read throughput for a 16 MiB line.
 - Whether Codex sends server requests at all under `approvalPolicy:
   "never"` (the re-probe saw none).
-- J0's final shapes (`RouteRuntime`, `ConnectionPin`, the `DriverKind`
-  arms, `Control`'s exact first-byte semantics), designed here from the
-  brief's names.
-- K1's schema version.
-- When Host's leftover scan (S-LEFTOVER) lands; until then
-  `server_lost` turns carry `leftovers: null`.
-- Whether the head read in item 0 step 2 can reuse `slot.head` without a
-  Store read; X2 decides (the design needs only that it writes nothing).
+- Whether Codex executes RPCs in byte order (item 8.1's fence assumes
+  nothing about it).
+- K1's final schema number; the exact J0 `RouteRuntime` methods X3 extends.
+- When Host's leftover scan (S-LEFTOVER) lands.
+- The real decode cost per node; `DECODE_ALLOWANCE` is an allowance X5
+  checks.
 
 ---
 
@@ -1055,12 +1216,11 @@ only what it measures; Q2 the relative method; Q3 `recover` always
 
 | Chunk | Tests |
 |---|---|
-| J0 | `servers()` empty |
 | X1 | `config_hash` (item 3); launch environment (item 4); decline bodies (item 11) |
-| X2 | Item 0: `pinned_join_needs_no_slot`, `queued_turn_reprepares_on_readiness`, `unsubmitted_lane_is_retired`. Item 1: `host_server_owner_outlives_turns`, `store_server_anchor_and_link`, `wire_server_open_has_no_turn_folder`, `link_turn_on_turn_owner_is_invalid`. Item 2: `daemon_idle_exit_not_blocked_by_idle_server`, `host_journal_uncertain_watch`. Item 4: bootstrap `vendor/`. Item 6: `recovery_server_anchor_proved_absent`, `recovery_server_anchor_unproven`, `recovery_unlinked_server_turn_sent_nothing`, `recovery_partial_settlement_rechecks_server_anchor`, `shutdown_link_read_failure_still_stops_groups`, `shutdown_force_shared_is_unknown`, `shared_close_cleanup_from_turn_facts`, `close_absence_check_ignores_server`. Item 12: the six Wire tests |
-| X3 | Registry unit tests (item 2); classification (item 5); `codex_never_ask` additions (item 11); `codex_control_budget`, reserved interrupt, `staging_aggregate_includes_ingress` (item 12); symlinked `vendor/codex` (item 4); the replay join (item 14) |
-| X4 | `c4_two_sessions`, `codex_server_close`, two keys → two servers, `servers` (items 2, 3, 7); `codex_two_threads` G1, cutoff, reopen and fence assertions (item 8); request-record exhaustion retires the connection (item 9.1); `codex_server_lost_order` (item 13) |
-| X5 | `codex_bounds_overflow` additions (item 10); `codex_rss_leases` (item 9.2); decline deadline with the reader paused (items 11, 14); `CODEX_SQLITE_HOME` persists (item 4) |
+| X2 | Item 0: `pinned_join_needs_no_slot`, `queued_turn_reprepares_on_readiness`, `readiness_insert_between_prepare_and_wait`, `unsubmitted_lane_is_retired`. Item 1: `host_server_owner_outlives_turns`, `store_server_anchor_and_link`, `wire_server_open_has_no_turn_folder`, `link_turn_on_turn_owner_is_invalid`. Item 2: `daemon_idle_exit_not_blocked_by_idle_server`, `host_journal_uncertain_watch`. Item 4: bootstrap `vendor/`. Item 6: `recovery_server_anchor_proved_absent`, `recovery_server_anchor_unproven`, `recovery_unlinked_server_turn_sent_nothing`, `recovery_partial_settlement_rechecks_server_anchor`, `reprobe_ownerless_not_committed`, `shutdown_link_read_failure_still_stops_groups`, `shutdown_force_shared_is_unknown`, `shared_close_cleanup_from_turn_facts`, `close_absence_check_ignores_server`. Item 8: `lane_close_drains_concurrently`. Item 12: the six Wire tests. Item 13: `drain_admitted_yields_prefix_then_boundary` |
+| X3 | Registry and supervision unit tests, shutdown ordering and failed-task count (item 2); binary-change tests (item 3); classification (item 5); cleanup-intent tests (item 8.3); `codex_never_ask` additions (item 11); guard, budget, reserved-size and staging tests (item 12); symlinked `vendor/codex` (item 4); the replay join (item 14) |
+| X4 | `c4_two_sessions`, `codex_server_close`, two keys → two servers, `servers` (items 2, 3, 7); `codex_two_threads` cutoff, reopen, fence and lease-fence assertions (item 8); request-record exhaustion (item 9.1); `codex_server_lost_order`, `codex_transport_loss_is_unknown`, `server_loss_cleanup_not_blocked_by_inherited_stdout` (item 13) |
+| X5 | `codex_bounds_overflow` additions and the Core loss helper (item 10); `codex_rss_leases` (item 9.2); decline deadline with the reader paused (items 11, 14); `CODEX_SQLITE_HOME` persists (item 4) |
 
 ---
 
@@ -1069,22 +1229,39 @@ only what it measures; Q2 the relative method; Q3 `recover` always
 | Crate | Change | Chunk |
 |---|---|---|
 | `via-store` | `ServerId`, `ProcessOwner`; schema bump (`anchors` owner, `server_turns`); `commit_server_turn`, `server_links`; `EvidenceRoot::create_server`; `UnfinishedTurn.server_anchor`; `session_cleanup_uncertain`; status unproven server anchors | X2 |
-| `via-host` | Re-export `ProcessOwner`; `link_turn`; `RecoveryReport.owner`; shutdown closes first, then bounded link read and cleanup-only fold; `Held.owner: Option`; `pending_cleanup` excludes server controls; `journal_uncertain()` watch | X2 |
-| `via-wire` | `open_connection` by owner; `turn_folder`; `link_turn`; `RuntimeConfig.vendor_state_dir`; `WriteBounds`, `WriteState`, `withdraw`; `hold_data`; `StagingPermit`; journal-uncertain passthrough | X2 (after J0's `Control`) |
-| `via-core` | Item 0 dispatch order and readiness wake; `Reconciled` server facts; partial-settlement meet; shared force `unknown/unknown`; `journal_uncertain` latch; `observations_lost` warning and late warning event | X2 (item 10's Core part: X5) |
-| `via-routes` | `RouteRuntime` pass-throughs (X2); `codex::{Servers, ServerPin, Lease, ConfigHash, DeclineTable, Connection, ThreadTable, RequestTable, Feeder}` | X3, X4 |
-| `via-adapters` | `codex::{ServerKey, DECLINES}`, launch recipe; `AnchorRecovery.owner`; `servers()` (J0); `journal_uncertain()`; `ConnectionPin` payload; `SessionDriver::{readiness, connection_kind}`; `TurnEnd.loss`, `CloseReport.loss`; `AdapterShutdown.registry` | J0, X1, X2, X3, X4, X5 |
-| `via-cli` | Bootstrap `<state>/vendor/`; `servers` wiring (J0) | J0, X2 |
-| `via-fake-agent` | `expect_large`, `pause_input`/`resume_input` | X3 |
+| `via-host` | Re-export `ProcessOwner`; `link_turn`; `RecoveryReport.owner`; `ReprobeReport.not_committed: Vec<ProcessOwner>`; shutdown closes first, then bounded link read and cleanup-only fold; `Held.owner: ProcessOwner`; `pending_cleanup` excludes server controls; `journal_uncertain()` watch | X2 |
+| `via-wire` | `open_connection` by owner; `turn_folder`; `link_turn`; `RuntimeConfig.vendor_state_dir`; on J0's queue: ticketed `StartBy` data slot, `withdraw`, `hold_data`; `StagingPermit`; `drain_admitted`; journal-uncertain passthrough | X2 |
+| `via-core` | Item 0 dispatch order and readiness subscription; lane actor drains during driver close; `Reconciled` server facts; partial-settlement meet; `FailureScope::Daemon` for ownerless proofs; shared force `unknown/unknown`; `journal_uncertain` latch; registry counts folded by the adapter set (no Core change); `record_loss` and `observations_lost` | X2 (`record_loss`: X5) |
+| `via-routes` | `RouteRuntime` pass-throughs (X2); `codex::{Servers, supervisor, ServerPin, Lease, ConfigHash, DeclineTable, Connection, ThreadTable, RequestTable, Feeder, TurnWrites}` | X3, X4 |
+| `via-adapters` | `codex::DECLINES`, launch recipe; `AnchorRecovery.owner`; `journal_uncertain()`; `ConnectionPin` payload; `SessionDriver::{readiness, connection_kind}`; `TurnEnd.loss`, `CloseReport.loss`; registry counts into `pending_tasks`/`failed_tasks` | X1, X2, X3, X4, X5 |
+| `via-cli` | Bootstrap `<state>/vendor/` | X2 |
+| `via-fake-agent` | Chunked reader, `expect_large`, `pause_input`/`resume_input`, acknowledged transitions | X3 |
 
 ---
 
 ## 9. Amendment text for the coordinator
 
-Exact text to apply before X2 starts. "Replace" quotes the current text at
-`42ee47b`.
+Exact text to apply before X2 starts. "Replace" quotes the current text:
+C2 as on `rust-foundation` after J0 (`14c0a0a`); runtime and C1 at
+`42ee47b` with K1's uncommitted amendments, which this section does not
+touch (C1 §5 envelope paragraph, C1 §7.6 late-terminal row and the
+paragraph after the table, runtime §6 `Unknown` sentence, runtime §7 Store
+failure paragraphs).
 
 ### 9.1 C2 (`docs/specs/adapter-contract.md`)
+
+**A8 row.** Replace "Codex owned stdio server key: `(codex,
+observed_binary_version, config_hash)` where hash covers VIA-controlled
+startup/environment, not credentials;" with:
+
+> Codex owned stdio server key: `config_hash`, covering the resolved
+> binary's path and identity and VIA-controlled startup/environment, not
+> credentials; the observed binary version is reported, not keyed;
+
+**§6.2 Process shape row, Codex cell.** Replace "key `(codex,
+observed_binary_version, config_hash)` excluding credentials and bound
+(A8)" with "key `config_hash` (binary identity included) excluding
+credentials and bound (A8)".
 
 **§2, RuntimeConfig paragraph (G4).** Replace "The Wire-defined
 `RuntimeConfig` carries validated `anchor_binary` and `anchor_dir` paths
@@ -1104,31 +1281,63 @@ folder and owns its narrow connection." with:
 > server's connection evidence folder (runtime §4), and owns its narrow
 > connection.
 
-**§2 sketch, `impl AdapterSet`.** After `recover`, add:
+**§2 sketch, `impl AdapterSet`.** After the `servers` line, add:
 
 ```rust
-    /// Pure, in memory: the live shared servers (C1 §3.14). Empty for per-turn routes.
-    pub fn servers(&self) -> Vec<ServerReport>;
-    /// Sticky: some Host journal write's outcome was uncertain, including writes no turn owns.
+    /// Sticky: some Host journal write's outcome was uncertain, including writes no driver owns.
     pub fn journal_uncertain(&self) -> watch::Receiver<bool>;
 ```
 
-**§2 sketch, the driver.** Add:
+**§2 sketch, `impl SessionDriver`.** After `prepare`, add:
 
 ```rust
-    /// An epoch that changes whenever this driver's `prepare()` answer may change; None on per-turn routes.
+    /// Changes whenever this driver's `prepare()` answer may change; None on per-turn routes (§3).
     pub fn readiness(&self) -> Option<watch::Receiver<u64>>;
-    /// Per-turn private process, or a shared server (C1 §7.6 force rows).
     pub fn connection_kind(&self) -> ConnectionKind;
 ```
 
-**§2 types table, new or replaced rows.**
+After `pub enum Prepared { Pinned(ConnectionPin), NeedsConnection }`, add:
 
-> | `ServerReport` | `harness: &'static str`, `vendor_version: Option<String>` (the server's handshake), `key: String` (16 hex digits of its configuration hash), `sessions: u32` (leases); only servers whose handshake succeeded and that are not retiring |
-> | `AnchorRecovery` | `anchor_id`, `generation`, `owner: ProcessOwner` (`Turn { session_id, turn }` or `Server { server_id }`), `cleanup`, `forced`: Host's passive facts for one committed anchor. A server anchor's facts reach a turn only through the turn → server-anchor link (runtime §6), and only as cleanup |
-> | `ConnectionPin` | A closed per-route payload: `Generation(u64)` (the fake's persistent profile) or `Server(ServerPin)` (a shared-server holder that keeps the server from idle retirement until the turn becomes a lease or the pin drops) |
-> | `ObservationLoss` | `trigger: (SessionId, TurnNumber)`, `generation`, `first_unqueued`, `omitted` (saturating): carried by `TurnEnd.loss` for each affected turn, and once by `CloseReport.loss` when no affected turn was running |
-> | `AdapterShutdown.registry` | `{unjoined, failed}`: route-owned tasks (a shared-server registry's launches, connections, retirements) not joined, or failed, by the shutdown deadline |
+```rust
+pub enum ConnectionPin { Generation(u64), Server(ServerPin) }
+pub enum ConnectionKind { PerTurn, Shared }   // C1 §7.6 force rows
+pub struct ObservationLoss { pub trigger: (SessionId, TurnNumber), pub generation: u64,
+    pub first_unqueued: u64, pub omitted: u64 /* saturating */ }
+```
+
+Replace the `TurnEnd` declaration's last line
+`    pub outcome: Result<TurnEvidence, AdapterError> }` with:
+
+```rust
+    pub outcome: Result<TurnEvidence, AdapterError>,
+    pub loss: Option<ObservationLoss> /* shared-ingress routes: this generation lost observations (§4) */ }
+```
+
+**§2 types table.**
+- Replace the `ServerReport` row's cell "`harness`, `vendor_version:
+  Option<String>`, `key: ServerKey`, `sessions: u32` (sessions leasing it)"
+  with:
+
+  > `harness`, `vendor_version: Option<String>` (the server's handshake),
+  > `key: ServerKey` (Codex: 16 hex digits of its configuration hash),
+  > `sessions: u32` (sessions leasing it); only servers whose handshake
+  > succeeded and that are not retiring
+
+- Replace the `CloseReport` row's cell "`vendor_closed: bool`,
+  `process_exit: Option<Exit>`, `cleanup: Cleanup`, `warnings`,
+  `leftovers: Option<LeftoverReport>` (only when this close stopped the
+  server, §4.2)" with:
+
+  > `vendor_closed: bool`, `process_exit: Option<Exit>`, `cleanup:
+  > Cleanup`, `warnings`, `leftovers: Option<LeftoverReport>` (only when
+  > this close stopped the server, §4.2), `loss: Option<ObservationLoss>`
+  > (the driver's loss record, on every close, whatever closed it)
+
+- Add rows:
+
+  > | `AnchorRecovery` | `anchor_id`, `generation`, `owner: ProcessOwner` (`Turn { session_id, turn }` or `Server { server_id }`), `cleanup`, `forced`: Host's passive facts for one committed anchor. A server anchor's facts reach a turn only through the turn → server-anchor link (runtime §6), and only as cleanup |
+  > | `ConnectionPin` | `Generation(u64)` (the fake's persistent profile) or `Server(ServerPin)` (a shared-server holder, keeping the server from idle retirement until the turn becomes a lease or the pin drops) |
+  > | `ObservationLoss` | the driver's sticky loss record for one thread generation: original triggering turn, generation, first unqueued message sequence, saturating omitted count. Core adds the `observations_lost` warning to each affected turn and commits one `late` warning event on a triggering turn already terminal (C1 §5) |
 
 **§2 types table, `AdapterError` row.** After "On either kind of route,
 only a failure before any vendor launch has the no-launch evidence", add:
@@ -1150,28 +1359,35 @@ only a failure before any vendor launch has the no-launch evidence", add:
 > nothing. Final shutdown folds a server anchor's cleanup into every linked
 > turn; a failed link read leaves those turns `Uncertain` and never delays
 > stopping groups. Server anchors are not part of any session's `recover`
-> facts; the Codex route returns `Unknown`.
+> facts; the Codex route returns `Unknown`. A server anchor's absence proof
+> that does not commit is a daemon-scope Store failure: its slot stays held
+> and the re-probe loop retries it.
 
 **§2, Independent lanes bullet (item 12).** Append:
 
 > On a shared connection the route is Wire's only writer. A turn's queued
-> writes are withdrawn when it settles, never cutting stdin; a write that
-> started is finished whole. Pending server-request replies and driver
-> controls hold back new data messages at Wire, so a reply waits for at
-> most the data message already being written. Each driver reserves one
-> interrupt and one unsubscribe slot within its control budget, which
-> steer cannot occupy. A shared connection never uses the per-connection
-> coalescing interrupt.
+> input (start, steer) is withdrawn when the turn ends by any path, its
+> `run_turn` dropped included, never cutting stdin; a write that started is
+> finished whole. After a turn settles no input of it is written, except a
+> cleanup interrupt admitted before settlement and the remainder of a
+> started line. Interrupt and unsubscribe are connection-owned cleanup
+> intents with reserved room in the driver's control budget, sized for
+> their maximum encodings, which steer cannot use. Pending server-request
+> replies and driver controls hold back new data messages, decided under
+> Wire's queue lock, so a reply waits for at most the data message already
+> started. A shared connection never uses the per-connection coalescing
+> interrupt.
 
-**§3, Connection admission (finding 1, item 2).** Add as a new first rule,
-before rule 1:
+**§3, Connection admission.** Replace "At dispatch, before the grant:" and
+rule 1 "1. Core calls `driver.prepare()`." with:
 
-> 0. Core opens a session's logical driver (no vendor I/O) and calls
->    `prepare()` before it reserves a connection slot; `Pinned` needs none.
->    A lane opened for a turn that is then not submitted is retired at
->    once. While a turn waits for a slot, Core re-runs `prepare()` whenever
->    the driver's `readiness()` epoch changes, and stops waiting on
->    `Pinned`.
+> At dispatch, before the grant:
+> 1. Core opens the session's logical driver if it has none (no vendor
+>    I/O; a lane opened for a turn that is then not submitted is retired
+>    at once), takes its `readiness()` receiver, marks the epoch seen and
+>    calls `prepare()`. While the turn then waits for a slot, Core keeps
+>    that receiver; on each change it marks the epoch seen and calls
+>    `prepare()` again, and stops waiting on `Pinned`.
 
 After rule 4, add:
 
@@ -1180,18 +1396,27 @@ After rule 4, add:
 > from idle retirement until the turn becomes the session's lease or the
 > pin is dropped, and publication converts surviving reservations to pins
 > atomically. Concurrent equal-key `NeedsConnection` turns launch one
-> server; the others release their slots. Idle retirement starts when the
-> server's last reservation, pin and lease are gone.
+> server; the others release their slots.
 
-**§3, Idle lanes (G1).** Append:
+Replace "Idle retirement releases the slot. Codex: the last lease
+released." with:
 
-> On a shared connection a driver's close takes effect at a cutoff in the
-> connection's decode order. Items decoded before it are delivered
-> (durable ones `late: true` when their turn settled) before the session's
-> ownership clears; items attributed to the session after it are dropped
-> and counted in the connection's diagnostics. Tombstones keep their
-> connection generation, so a reopened thread never receives an older
-> turn's items.
+> Idle retirement releases the slot once Host proves the group absent.
+> Codex: the last reservation, pin and lease released.
+
+**§3, Idle lanes.** Append:
+
+> Core disposes the session's observations while the driver's close runs,
+> under the close's deadline, and closes admission only after it. On a
+> shared connection a driver's close takes effect at a cutoff in the
+> connection's decode order: items decoded before it are handed to the
+> session's channel by the close's deadline (what cannot be is recorded as
+> observation loss), and items attributed to the session after it are
+> dropped and counted in the connection's diagnostics. Tombstones keep
+> their connection generation, so a reopened thread never receives an
+> older turn's items. A successor does not resume the same thread on the
+> same connection until the old unsubscribe's reply arrived or the
+> connection retired.
 
 **§4, Codex paragraph (G7).** Replace from "The first full lane
 immediately quarantines that thread generation," through "Unsent queued
@@ -1200,37 +1425,38 @@ turns retain C1 queue rules." with:
 > The first full lane immediately quarantines that thread generation and
 > latches the driver's sticky `ObservationOverflow` health. The lane
 > generation, the original triggering turn, the first unqueued message
-> reference and the saturating omitted count form the `ObservationLoss`
-> record, which goes to the connection's diagnostics and to Core through
-> `TurnEnd.loss` (or `CloseReport.loss`). The triggering turn identifies
-> lost evidence; continuity loss applies to every **nonterminal** turn
-> submitted in that generation, including a successor active after an
-> older turn's late tool flood. The driver ends each such turn itself: it
-> posts interrupt to its reserved control slot without awaiting the write
-> and returns at once with the overflow failure and cleanup `Uncertain`;
-> Core commits each disposition under C1 precedence and adds the
+> reference and the saturating omitted count form the driver's
+> `ObservationLoss`, which goes to the connection's diagnostics and to
+> Core through `TurnEnd.loss` and every `CloseReport.loss`. The triggering
+> turn identifies lost evidence; continuity loss applies to every
+> **nonterminal** turn submitted in that generation, including a successor
+> active after an older turn's late tool flood. The driver ends each such
+> turn itself: it posts its interrupt cleanup intent, never awaited or
+> withdrawn, and returns at once with the overflow failure and cleanup
+> `Uncertain`; Core commits each disposition under C1 precedence with the
 > `observations_lost` warning. Older terminal envelopes are preserved, and
 > same-thread dispatch closes until the driver is retired and reopened.
 > Unsent queued turns retain C1 queue rules.
 
 **§4.1, Late observations (G1).** Append:
 
-> On a shared server, late observations reach Core only up to the
-> session's close cutoff (§3 idle lanes); after it they are dropped and
-> counted. A late terminal arriving then is not applied: the turn keeps
-> its result.
+> On a shared server, late observations, a late terminal included, reach
+> Core only up to the session's close cutoff (§3 idle lanes), attributed by
+> the vendor turn ID recorded at acceptance; after it they are dropped and
+> counted, and a late terminal is not applied.
 
 **§7, item 7 (G6).** Replace "A decode failure saves the message to the
 turn's evidence folder before the route fails `protocol`." with:
 
-> A decode failure (a typed-schema failure; well-formed traffic for an
-> unknown thread, or untagged connection traffic, is diagnostics only)
-> saves the message's first 64 KiB before the route fails `protocol`: to
-> the turn's evidence folder when its correlation fields resolve to one
-> turn; on a shared connection, an unattributable one goes to the
-> connection's evidence folder, which `logs` never returns, and fails the
-> connection `protocol` for every associated session, whose failure
-> messages name no path.
+> A decode failure is a typed-schema failure; well-formed traffic for an
+> unknown thread, untagged connection traffic and items of a closed
+> generation are not. When the message's correlation fields fail, its
+> first 64 KiB go to the connection's evidence folder, which `logs` never
+> returns, and the connection fails `protocol` for every associated
+> session, whose failure messages name no path. Otherwise they go to the
+> evidence folder of the turn the correlation names, and the open
+> generation's nonterminal turns fail `protocol`; a terminal turn's
+> envelope is not rewritten.
 
 ### 9.2 Runtime contracts (`docs/specs/runtime-contracts.md`)
 
@@ -1253,19 +1479,28 @@ In the same sketch, add to `impl WireRuntime`:
 ```
 
 replace `WireSender::write`'s signature with
-`pub fn write(&self, message: InputMessage, bounds: WriteBounds) -> PendingWrite;`
-and add to `impl WireSender`:
+`pub fn write(&self, message: InputMessage, bounds: WriteBounds) -> PendingWrite;`,
+add to `impl WireSender`:
 
 ```rust
+    pub fn withdraw(&self, ticket: WriteTicket) -> WriteState;
     pub fn hold_data(&self) -> DataHold;
     pub fn link_turn(&self, session: &SessionId, turn: TurnNumber, deadline: Deadline)
         -> impl Future<Output = CommitOutcome<()>> + Send;
 ```
 
+add to `impl WireMessages`:
+
+```rust
+    /// After a latched failure: the complete messages admitted before it, then the boundary.
+    pub fn drain_admitted(&mut self) -> impl Future<Output = Admitted> + Send;
+```
+
 and add:
 
 ```rust
-impl PendingWrite { pub fn state(&self) -> WriteState; pub fn withdraw(&self) -> WriteState; }
+impl PendingWrite { pub fn ticket(&self) -> WriteTicket; }
+pub enum Admitted { Message(VendorMessage), Boundary { cause: WireFailure, discarded_bytes: u64 } }
 impl VendorMessage { /* holds its StagingPermit until dropped */ }
 ```
 
@@ -1280,13 +1515,18 @@ and invokes Host acquisition." with:
 
 **§4, `close_input` paragraph.** After "and never interleaves bytes.", add:
 
-> Writes carry `WriteBounds`. `CutAt(deadline)` is the private-route rule
-> above: a message cut by its deadline ends the writer and drops stdin.
-> `StartBy` is for shared connections: a message withdrawn, or not started
-> by `start_by`, is not written and the writer continues with stdin open;
-> a started message is finished whole by `finish_by`. While any `DataHold`
-> exists the writer starts no data message. A `VendorMessage`'s staging
-> charge is released when the message is dropped, not when it is received.
+> Data writes carry `WriteBounds`. `CutAt(deadline)` is the private-route
+> rule above: a data message cut by its deadline ends the writer and drops
+> stdin. `StartBy` is for shared connections and follows the control
+> queue's rule: one queue and lock hold control messages and the ticketed
+> data slot; `start_by` bounds only the wait for the first byte; a
+> withdrawn or unstarted-expired message is not written and stdin stays
+> open; a started one is written whole by `finish_by`. The writer takes
+> the data job only while no `DataHold` exists, under the queue lock, and
+> that take is the write's start. A `VendorMessage`'s staging charge is
+> released when the message is dropped, not when it is received. After a
+> latched failure `drain_admitted` yields the messages already admitted,
+> then the boundary; it never waits for more output.
 
 **§4, evidence paragraph.** Replace from "Each submitted turn has an
 evidence folder, `<state>/evidence/<session_id>/<turn>/`." through "and the
@@ -1300,10 +1540,10 @@ turn's failure names the file and the message's length." with:
 > anchor as stderr, the vendor inherits it, and the operating system
 > writes it; no VIA task reads it. When Route cannot decode a message, and
 > when a message exceeds 1 MiB or ends unterminated, its first 64 KiB is
-> written to `undecoded.bin`: in the turn's folder when the message is
-> attributable to one turn, and the turn's failure names the file and the
-> message's length; otherwise in the connection's folder, and the failures
-> name only the length (D4). C1 `logs` returns only turn folders.
+> written to `undecoded.bin`: in the folder of the turn its correlation
+> names, and that turn's failure names the file and the message's length;
+> otherwise in the connection's folder, and the failures name only the
+> length (D4). C1 `logs` returns only turn folders.
 
 **§5, replace the "Non-turn owners (AR6)" paragraph.**
 
@@ -1318,9 +1558,11 @@ turn's failure names the file and the message's length." with:
 > daemon idle exit. Host's shutdown closes every control first, then reads
 > the links of the requested turns under a bounded deadline and folds a
 > server anchor's cleanup (never `forced`) into them; a failed read is
-> reported, leaving those turns uncertain. Host keeps one sticky
-> journal-uncertain watch, set by every uncertain journal outcome whatever
-> its owner. Shared-server leases and idle retirement belong to the route
+> reported, leaving those turns uncertain. A re-probe report names each
+> not-committed proof's `ProcessOwner`; a server's is a daemon-scope Store
+> failure. Host keeps one sticky journal-uncertain watch, set by every
+> uncertain journal outcome whatever its owner. Shared-server leases,
+> their supervised tasks and idle retirement belong to the route
 > (`vendors/codex.md` §2).
 
 **§6, `anchors` row of the schema table.** Replace with the two rows:
@@ -1340,6 +1582,24 @@ no spawn, turn, handle, result, event or log-query method." with:
 > for a server-owned anchor and a `running` turn, and `server_links(turns)`,
 > a bounded read of at most 256 links.
 
+**§6, Write ordering, step 2.** Replace "Only a positive commit receipt
+permits Adapter open/start." with:
+
+> Only a positive commit receipt permits the turn's vendor I/O
+> (`run_turn`); the session's logical driver may be opened and prepared
+> before it, with no vendor I/O (C2 §3).
+
+**§6, Write ordering, step 3.** Replace "Anchor spawns vendor in its
+inherited group with the turn's stderr file" with "Anchor spawns vendor in
+its inherited group with its owner's stderr file". After "Vendor
+acceptance is independent evidence.", add:
+
+> On a shared-server route the turn's `run_turn` instead creates the
+> turn's evidence folder, pins, joins or launches its server (a launch runs
+> this step for the server, with the server's stderr file, under the
+> route's own handshake deadline), commits the turn's link to the server
+> anchor, and only then writes the turn's first message.
+
 **§6.1, directory tree.** Add:
 
 ```text
@@ -1355,9 +1615,14 @@ under it; Host opens the turn's `stderr.log` for the child;" with:
 > the child; daemon bootstrap creates `vendor/`, and each adapter its own
 > subdirectory, under the managed-directory rules above;
 
-**§6.2, step 3.** Replace "Anchor spawns vendor in its inherited group with
-the turn's stderr file" with "Anchor spawns vendor in its inherited group
-with its owner's stderr file".
+**§6.2, force bullet.** After "and drains its pipes under its cleanup
+bound.", add:
+
+> On a shared-server route the driver asks for no stop and returns at
+> once: Host's final shutdown stops the server's group, a launched turn
+> ends `unknown` with outcome `unknown` (C1 §7.6 shared row), and its
+> cleanup comes from the server anchor its link names; `forced` is never
+> derived from a server anchor.
 
 **§7, restart paragraph.** After "For each last-durable nonterminal turn:
 submission intent -> `unknown`, no automatic resend; cancel queued
@@ -1369,7 +1634,7 @@ successors.", add:
 
 **§8 table, new row after "Codex shared Route ingress".**
 
-> | Codex shared connection writes | 8 pending server-request replies, 64 KiB; one control in flight; data held back while any control is pending; two reserved controls per driver | Past the reply bound, a reply not written within 5 s of decode, or correlation exhaustion: connection overflow, every associated session fails through health, the server retires |
+> | Codex shared connection writes | 8 pending server-request replies, 64 KiB; one control in flight; data held back while any control is pending; per driver, reserved interrupt (12,800 B) and unsubscribe (6,400 B) slots, steer 6 commands and 46,336 B | Past the reply bound, a reply not written within 5 s of decode, or correlation exhaustion: connection overflow, every associated session fails through health, the server retires |
 
 **§8, replace "The Codex shared server's lanes and tool metadata are fixed
 buffers counted per server by the Codex task, which measures 32 loaded
@@ -1378,13 +1643,16 @@ admission allows (C2 §3; up to one per leased session) against the RSS
 gate." with:**
 
 > The Codex shared server has no lease or RPC admission cap beyond these
-> bounds; its staging (shared by Wire's queue and the ingress lanes),
-> correlation records and tool metadata are fixed buffers. The Codex task
-> measures one server with 32 leased sessions and 32 concurrent active
-> turns under both assertions above, with the Codex holders added to the
-> sum, and reports the marginal cost per active turn; that result
-> qualifies at most 32 concurrent active turns per server, not the
-> unresolved-turn maximum.
+> bounds. Per server, its staging (shared by Wire's queue and the ingress
+> lanes) and correlation records are fixed buffers; per session, the
+> observation channel (open-tool metadata charged inside it), the driver
+> controls and one decode allowance; per active turn, its prompt. The
+> Codex task measures one server with 32 leased sessions and 32 concurrent
+> active turns under both assertions above, with these holders added to
+> the sum, and reports the marginal cost per active turn; that result
+> qualifies at most 32 concurrent active turns on one server. Four loaded
+> servers are an extrapolation, and the unresolved-turn maximum is not
+> qualified.
 
 **§8, "Cleanup / daemon idle" row.** Append to the behaviour cell:
 
@@ -1400,6 +1668,13 @@ cancelled_turns, cleanup, leftovers}`;", insert:
 > settled with cleanup `uncertain` and the server group it ran on lacks a
 > proof of absence; otherwise `quiescent`.
 
+**§3.7 `status`.** Replace "`process.cleanup` is `uncertain` when any
+process group of the session lacks a proof of absence, else `quiescent`
+(T4-A23)." with:
+
+> `process.cleanup` is `uncertain` under the same rule as `close`'s
+> `cleanup` (§3.6), else `quiescent` (T4-A23).
+
 **§3.12 `logs`.** After "`stderr.log` (the agent's stderr),", insert:
 
 > (absent on a shared-server route, where the agent's stderr belongs to
@@ -1412,14 +1687,7 @@ key, sessions}]` field list sentence, add:
 > `key` is an opaque 16-hex-digit server key, and `sessions` counts the
 > sessions holding a lease on it.
 
-**§3.14 (session status).** Replace "`process.cleanup` is `uncertain` when
-any process group of the session lacks a proof of absence, else
-`quiescent` (T4-A23)." with:
-
-> `process.cleanup` is `uncertain` under the same rule as `close`'s
-> `cleanup` (§3.6), else `quiescent` (T4-A23).
-
-**§5 warnings row.** Add `observations_lost` to the closed list, and
+**§5, `warnings` row.** Add `observations_lost` to the closed list, and
 append:
 
 > `observations_lost` (a shared-server thread's observations were lost
@@ -1440,15 +1708,26 @@ identity, shared-server leases and whole-server shutdown." with:
 > the connection's thread table.
 
 **§2, Shared ownership, first paragraph.** Replace "Host acquires a lease
-on a VIA-started server keyed by" with "A session acquires a lease on a
-VIA-started server keyed by". After "It does not hash credential
-contents.", add:
+on a VIA-started server keyed by `(codex, observed_binary_version,
+config_hash)`." with:
+
+> A session acquires a lease on a VIA-started server keyed by
+> `config_hash`; the observed binary version is reported, not keyed.
+
+After "It does not hash credential contents.", add:
 
 > The hash covers, in order, a domain tag, the adapter version, the
 > resolved program path and binary identity, the exact argv, the passed
 > environment (names and values, without Host's process marker), the
-> server's cwd and the protocol pin; the observed version comes from the
-> server's handshake and is reported, not hashed.
+> server's cwd and the protocol pin. A launch recomputes it from a fresh
+> stat before joining or reserving, and refuses to publish a server whose
+> binary identity changed before its handshake ended.
+
+Replace "so the handshake deadline is the turn's remaining wall time."
+with:
+
+> so the handshake has its own 60 s deadline from spawn, independent of
+> any turn; a waiting turn's own wall, stop or force ends only its wait.
 
 **§2, Shared ownership, second paragraph (G5 a).** Replace from "Initially
 cap loaded Codex leases at 32 daemon-wide" through "releasing its vendor
@@ -1456,12 +1735,19 @@ lease does not free that slot." with:
 
 > No lease or outstanding-RPC admission cap applies beyond the runtime's
 > bounds: resident lanes, eight controls per driver (two reserved for
-> interrupt and unsubscribe) and eight pending server requests per
-> connection. Request IDs are never reused; abandoned request records stay
-> until their reply or the connection's retirement and share the
-> correlation budget, whose exhaustion retires the connection. Idle leases
-> can detach and later reopen; no unbounded map of every historical
+> interrupt and unsubscribe, sized for their maximum encodings) and eight
+> pending server requests per connection. Request IDs are never reused;
+> request records are server-owned (the handshake) or lease-owned, held by
+> value, kept until their reply or the connection's retirement, and share
+> the correlation budget, whose exhaustion retires the connection. Idle
+> leases can detach and later reopen; no unbounded map of every historical
 > thread remains in memory.
+
+**§2, lease release.** Replace "When the last lease releases, Host may
+retire the owned idle server;" with:
+
+> When the last lease, pin and reservation are released, the route retires
+> the owned idle server through Host (stdin close, then Host's stop);
 
 **§4, environment.** Replace "VIA supplies a writable, user-private
 `CODEX_SQLITE_HOME` and its Host marker." with:
@@ -1473,9 +1759,9 @@ lease does not free that slot." with:
 defined by this adapter's task under D4: it never returns another
 session's evidence." with:
 
-> The server's `stderr.log` and an unattributable undecoded message go to
-> the connection's evidence folder (runtime §4), which `logs` never
-> returns (D4); an unattributable decode failure fails the connection
+> The server's `stderr.log` and an undecoded message whose correlation
+> fails go to the connection's evidence folder (runtime §4), which `logs`
+> never returns (D4); such a decode failure fails the connection
 > `protocol` for every associated session.
 
 **§5, tombstones (G1).** Replace from "After settlement it is a tombstone,
@@ -1492,10 +1778,11 @@ that session is closed." with:
 > yields (`action.denied`, `vendor.request_declined`, `warning`) is
 > committed with `late:true`, up to the driver's close cutoff (C2 §3).
 > Items decoded after the cutoff are dropped and counted in connection
-> diagnostics; tombstones still prevent misattribution, including to a
-> reopened generation of the same thread. A tool completion alone is no
-> event (C1 §6.1). `thread/unsubscribe` does not promise more vendor
-> notifications.
+> diagnostics before they are decoded; tombstones still prevent
+> misattribution, including to a reopened generation of the same thread,
+> which waits for the old unsubscribe's reply on that connection. A tool
+> completion alone is no event (C1 §6.1). `thread/unsubscribe` does not
+> promise more vendor notifications.
 
 Replace "retain at most the 32 resident session sinks above." with "retain
 session sinks only for open drivers."
@@ -1505,46 +1792,48 @@ report containing" through "the entire failure target." with:
 
 > Latch the driver's sticky `ObservationOverflow` health. The thread/lane
 > generation, triggering original turn correlation, first unqueued
-> message's sequence and saturating omitted count form the
-> `ObservationLoss` record, which goes to connection diagnostics and to
-> Core with the affected turns' results. The triggering turn identifies
-> lost evidence, not the entire failure target.
+> message's sequence and saturating omitted count form the driver's
+> `ObservationLoss`, which goes to connection diagnostics and to Core with
+> every affected turn's result and every close of the driver. The
+> triggering turn identifies lost evidence, not the entire failure target.
 
 Replace from "Core applies sticky continuity loss to **every nonterminal
 turn" through "cannot escape continuity-loss handling." with:
 
 > The driver ends **every nonterminal turn whose submission belongs to
 > that quarantined thread generation**, including a successor A2 when an
-> old, already settled A tool triggers overflow: it posts interrupt to its
-> reserved control slot without awaiting the write and returns at once,
-> without waiting for A2's wall deadline; Core commits each disposition
-> under C1 precedence with the `observations_lost` warning. Preserve A's
-> immutable envelope; A's late-event loss is a `late` `warning` event on
-> A. Close same-thread dispatch until the driver is retired and a clean
-> reopen; unsent queued work retains C1 queue/unknown-predecessor rules
-> and is never treated as submitted merely by this failure. Quarantine is
-> tied to the lane generation the driver registered, so an in-flight
-> start/acceptance race cannot escape continuity-loss handling.
+> old, already settled A tool triggers overflow: it posts its interrupt
+> cleanup intent (written even after A2 settles, once the `turnId` is
+> known) and returns at once, without waiting for A2's wall deadline; Core
+> commits each disposition under C1 precedence with the `observations_lost`
+> warning. Preserve A's immutable envelope; A's late-event loss is one
+> `late` `warning` event on A. Close same-thread dispatch until the driver
+> is retired and a clean reopen; unsent queued work retains C1
+> queue/unknown-predecessor rules and is never treated as submitted merely
+> by this failure. Quarantine is tied to the lane generation the driver
+> registered, so an in-flight start/acceptance race cannot escape
+> continuity-loss handling.
 
 Replace "Core records explicit normalized-event loss with the overflow."
 with "The `observations_lost` warning records the normalized-event loss
 publicly (C1 §5)."
 
-**§5, last paragraph (finding 27, X0-Q2).** Replace from "Independent
-sticky health delivery bypasses data lanes." through "requires design
-review, not silent ceiling growth." with:
+**§5, last paragraph.** Replace from "Independent sticky health delivery
+bypasses data lanes." through "requires design review, not silent ceiling
+growth." with:
 
-> Independent sticky health delivery bypasses data lanes. Codex staging
-> (shared by Wire's queue and the ingress lanes through staging permits),
-> correlation records and retained tool metadata are fixed per-server
-> buffers. No lease cap bounds active turns on one server below the
-> runtime's unresolved-turn bound. The RSS measurement uses one server
+> Independent sticky health delivery bypasses data lanes. Per server,
+> Codex staging (shared by Wire's queue and the ingress lanes through
+> staging permits) and correlation records are fixed buffers; per
+> session, retained tool metadata is charged to that session's
+> observation budget. No lease cap bounds active turns on one server below
+> the runtime's unresolved-turn bound. The RSS measurement uses one server
 > with 32 leased sessions and 32 concurrent active turns, applies runtime
 > §8's relative method and growth assertion with these holders added, and
-> qualifies only up to 32 concurrent active turns per server; do not
-> preallocate 4 MiB for every idle lease or assume S1's RSS result covers
-> this extension. A failure requires design review, not silent ceiling
-> growth.
+> qualifies only up to 32 concurrent active turns on one server; four
+> loaded servers are an extrapolation. Do not preallocate 4 MiB for every
+> idle lease or assume S1's RSS result covers this extension. A failure
+> requires design review, not silent ceiling growth.
 
 **§8, `codex_two_threads` row (G1).** Replace "Deliver an A completion
 after uncertain settlement and again after A lease release while B is
@@ -1553,7 +1842,8 @@ session-level/B;" with:
 
 > Deliver an A completion after uncertain settlement with A's driver open:
 > it keeps A's original TurnNo and late:true; queue an A durable item when
-> A's driver closes: it is committed late:true before the close returns;
+> A's driver closes: it is committed late:true before A's lane ends;
 > deliver another A completion after the close cutoff while B is active:
 > it is dropped and counted, never session-level/B; reopen A on the same
-> thread: an old-turn item never reaches the new generation;
+> thread: it waits for the old unsubscribe's reply, and an old-turn item
+> never reaches the new generation;
