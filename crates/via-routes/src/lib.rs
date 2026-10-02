@@ -219,13 +219,21 @@ fn undecoded_note(note: Option<&str>) -> String {
     note.map(|note| format!("; {note}")).unwrap_or_default()
 }
 
+pub mod claude;
+pub mod codex;
 mod fake;
+mod runtime;
+pub mod steer;
 
 pub use fake::{
-    CONTROL_BYTES, CONTROL_COMMANDS, FakeClassHint, FakeCost, FakeDenialKind, FakeMessage,
-    FakeRoute, FakeRouteResult, FakeTerminal, FakeTurn, FakeUsage, Handshake, Lane, Retirement,
-    RouteMessage, SteerAnswer, SteerRefused, SteerRequest, SteerSender, TerminalDetails,
-    TerminalStatus, TurnStart, VENDOR_DATA_MAX, steer_lane,
+    FakeClassHint, FakeCost, FakeDenialKind, FakeMessage, FakeRoute, FakeRouteResult, FakeTerminal,
+    FakeTurn, FakeUsage, Handshake, Lane, RouteMessage, TerminalDetails, TerminalStatus, TurnStart,
+    VENDOR_DATA_MAX,
+};
+pub use runtime::{Retirement, RouteRuntime};
+pub use steer::{
+    CONTROL_BYTES, CONTROL_COMMANDS, SteerAnswer, SteerRefused, SteerRequest, SteerSender,
+    steer_lane,
 };
 pub use via_wire::StoreError;
 /// Test builds only: the failpoint controller, for the layers above.

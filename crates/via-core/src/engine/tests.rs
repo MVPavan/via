@@ -6931,3 +6931,89 @@ fn plain_effective() -> crate::intake::Effective {
     }))
     .unwrap()
 }
+
+/// x.3.2 G8 (C2 §2 `ParamSizes`): Core fills the encoded sizes of the
+/// session's instructions and the turn's schema at intake. Spawn's plan
+/// and `check_turn` carry the instructions' UTF-8 bytes and the schema's
+/// compact JSON bytes; a resume inherits the frozen instructions and the
+/// latest schema, a set schema replaces it, and a null one clears it.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_fills_param_sizes_on_spawn_and_resume() {
+    let Some(root) = child("core_fills_param_sizes_on_spawn_and_resume") else {
+        return;
+    };
+    let profile = json!({"capabilities": {
+        "verbs": {"spawn":{"support":"native"},"resume":{"support":"native"},
+                  "steer":{"support":"native"},"cancel":{"support":"native"},
+                  "close":{"support":"native"}},
+        "params": {"instructions":{"support":"native"},"output_schema":{"support":"native"},
+                   "effort":{"support":"unsupported","reason":"no"},
+                   "max_steps":{"support":"unsupported","reason":"no"}},
+        "bounds": [], "network_control": false,
+        "recover": {"support":"unsupported","reason":"no"},
+        "usage": {"tokens":"turn","cost":"unavailable"}
+    }});
+    fs::write(
+        root.join("scenario.json"),
+        json!({"profile":profile,"scripts":[]}).to_string(),
+    )
+    .unwrap();
+    run(async {
+        let engine = open(&root);
+        let sizes = |instructions, output_schema| via_adapters::ParamSizes {
+            instructions,
+            output_schema,
+        };
+        // "é" is two UTF-8 bytes; the schema's compact encoding is 17.
+        let instructions = "be brief é";
+        let schema = json!({"type": "object"});
+        let raw = json!({"harness":"fake","model":"fake","prompt":"p","handle":HANDLE,
+            "instructions":{"text":instructions},"output_schema":schema});
+        let session = engine
+            .spawn(
+                serde_json::from_value(raw.clone()).unwrap(),
+                &raw.to_string(),
+            )
+            .await
+            .unwrap()
+            .enqueued
+            .unwrap()
+            .0;
+        let spawned = sizes(11, 17);
+        assert_eq!(
+            engine.adapter.param_sizes_seen(),
+            [spawned, spawned],
+            "spawn's plan and check_turn"
+        );
+        let resume = |extra: Value| {
+            let mut raw = json!({"session":session.as_str(),"handle":HANDLE,"prompt":"q"});
+            raw.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            raw
+        };
+        for (extra, expected) in [
+            (json!({}), sizes(11, 17)),
+            (
+                json!({"output_schema":{"type":"object","required":[]}}),
+                sizes(11, 31),
+            ),
+            (json!({"output_schema":null}), sizes(11, 0)),
+        ] {
+            let raw = resume(extra.clone());
+            let before = engine.adapter.param_sizes_seen().len();
+            engine
+                .resume(
+                    serde_json::from_value(raw.clone()).unwrap(),
+                    &raw.to_string(),
+                )
+                .await
+                .unwrap();
+            // The resume's `check_turn` comes first; the plan behind its
+            // version warning carries neither value.
+            let seen = engine.adapter.param_sizes_seen();
+            assert_eq!(seen.get(before), Some(&expected), "{extra}: {seen:?}");
+        }
+    });
+}

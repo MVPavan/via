@@ -533,12 +533,32 @@ fn marking_script(path: &Path, marker: &Path) -> TestResult {
     Ok(())
 }
 
+/// What one vendor harness answers once configured (C2 §7 item 1): its
+/// `describe` refusal kind, `None` once it plans, and its `models` list.
+struct LaunchRow {
+    harness: &'static str,
+    refused: Option<&'static str>,
+    models: Value,
+}
+
+/// The per-harness expectations of the merged base: no vendor adapter
+/// plans or catalogs yet, so `describe` refuses `harness_unavailable` and
+/// `models` lists nothing. Each adapter track flips its own row.
+fn launch_rows() -> [LaunchRow; 3] {
+    let row = |harness| LaunchRow {
+        harness,
+        refused: Some("harness_unavailable"),
+        models: json!([]),
+    };
+    [row("claude"), row("codex"), row("opencode")]
+}
+
 /// C2 §7 item 1, design §7 S-LAUNCH acceptance: with `harnesses.claude`
 /// and `harnesses.codex` pinned to marker-writing executables, and
 /// `opencode` (and the defaults) on the client's `PATH`, `describe` and
-/// `models` for each vendor harness run no binary. Their result is the
-/// merged base's: no adapter exists before x.3.2, so `describe` refuses
-/// `harness_unavailable` and `models` lists nothing. A guard for x.3.2.
+/// `models` for each vendor harness run no binary, and neither does
+/// `daemon status`, which lists no shared server. Each harness's result is
+/// its [`launch_rows`] row. A guard for x.3.2.
 #[test]
 fn s_launch_describe_starts_nothing() -> TestResult {
     evidenced(|| {
@@ -561,26 +581,39 @@ fn s_launch_describe_starts_nothing() -> TestResult {
         )?;
         sandbox.start_daemon()?;
         let mut outcomes = Vec::new();
-        for harness in ["claude", "codex", "opencode"] {
+        for row in launch_rows() {
+            let harness = row.harness;
             let described = sandbox.run(&["describe", "--harness", harness, "--json"])?;
             // A request error is printed on stderr.
-            let reply: Value = serde_json::from_slice(&described.stderr).unwrap_or(Value::Null);
-            outcomes.push(json!({"describe":harness,"exit":described.status.code(),
-                "stdout":reply,"stderr":String::from_utf8_lossy(&described.stderr)}));
-            check(
-                described.status.code() == Some(2)
-                    && reply["data"]["kind"] == "harness_unavailable",
-                || format!("describe {harness}: {outcomes:?}"),
-            )?;
+            let planned = if let Some(kind) = row.refused {
+                let reply: Value = serde_json::from_slice(&described.stderr).unwrap_or(Value::Null);
+                let refused = described.status.code() == Some(2) && reply["data"]["kind"] == kind;
+                outcomes.push(json!({"describe":harness,"exit":described.status.code(),
+                    "stdout":reply,"stderr":String::from_utf8_lossy(&described.stderr)}));
+                refused
+            } else {
+                let plan: Value = serde_json::from_slice(&described.stdout).unwrap_or(Value::Null);
+                let planned = described.status.success() && plan["harness"] == harness;
+                outcomes.push(json!({"describe":harness,"exit":described.status.code(),
+                    "stdout":plan,"stderr":String::from_utf8_lossy(&described.stderr)}));
+                planned
+            };
+            check(planned, || format!("describe {harness}: {outcomes:?}"))?;
             let models = sandbox.run(&["models", "--harness", harness, "--json"])?;
             let listed: Value = serde_json::from_slice(&models.stdout).unwrap_or(Value::Null);
             outcomes.push(json!({"models":harness,"exit":models.status.code(),
                 "stdout":listed,"stderr":String::from_utf8_lossy(&models.stderr)}));
             check(
-                models.status.success() && listed["models"] == json!([]),
+                models.status.success() && listed["models"] == row.models,
                 || format!("models {harness}: {outcomes:?}"),
             )?;
         }
+        let status = sandbox.run(&["daemon", "status", "--json"])?;
+        let reported: Value = serde_json::from_slice(&status.stdout).unwrap_or(Value::Null);
+        check(
+            status.status.success() && reported["servers"] == json!([]),
+            || format!("daemon status: {reported}"),
+        )?;
         check(!marker.exists(), || {
             format!(
                 "a vendor binary ran: {}",

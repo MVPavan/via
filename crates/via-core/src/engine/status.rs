@@ -166,6 +166,12 @@ impl Engine {
         params.models(&self.adapter)
     }
 
+    /// `daemon/status.servers` (C1 §3.14, C2 §2 `servers`): the adapters'
+    /// live shared servers, from memory.
+    pub fn servers(&self) -> Vec<via_adapters::ServerReport> {
+        self.adapter.servers()
+    }
+
     /// When this Engine opened (Task 4 design §11.2).
     pub fn started_at(&self) -> &str {
         &self.started_at

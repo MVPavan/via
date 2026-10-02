@@ -4,10 +4,7 @@
 //! observations in decode order, and builds the turn's one `TurnEnd`.
 
 use std::borrow::Cow;
-use std::convert::Infallible;
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -16,6 +13,10 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use super::{FakeAdapter, FakeProfile};
+use crate::driver::turn::{
+    Abandonment, CLEANUP_ALLOWANCE, Normalize, Rest, deliver_beside, earliest, end_active,
+    merge_stops, ordered,
+};
 use crate::driver::{
     Active, Delivering, DriverState, ForceWatch, Prepared, Reservation, SessionDriver,
     SteerEmissions, SteerTurn, TurnCx, TurnSpec, latch, lock, rejected,
@@ -24,13 +25,13 @@ use crate::harness::Harness;
 use crate::observation::{
     Acceptance, AdapterError, ClassHint, CostReport, Decline, Denial, DenialKind, Identity,
     InstanceReport, Observation, ObservationItem, ObservationSink, ProgressMarks, SteerDelivery,
-    SteerToken, StopReason, TurnEnd, TurnEvidence, Undelivered, UsageSample, VendorTerminal,
+    SteerToken, StopReason, TurnEnd, TurnEvidence, UsageSample, VendorTerminal,
 };
-use crate::plan::{Refusal, RefusalKind, TurnParams, VersionStatus};
+use crate::plan::{ParamSizes, Refusal, RefusalKind, TurnParams, VersionStatus};
 use crate::runtime::{cleanup, event_stall};
 use crate::{
     AcceptanceToken, Deadline, DriverFailure, DriverHealth, PrivateProcessSpec, ProcessOwner,
-    RouteError, RouteFailure, StartRejected, StopCause, StopOrder, StopWatch, VendorTerminalStatus,
+    RouteError, RouteFailure, StartRejected, StopOrder, StopWatch, VendorTerminalStatus,
     VendorTurnId, final_text_pieces,
 };
 use via_routes::{
@@ -38,25 +39,8 @@ use via_routes::{
     Handshake, Lane, Retirement, RouteMessage, StopSources, TerminalStatus, TurnStart, WireCleanup,
 };
 
-/// S1's cleanup allowance: the wall's one cutoff is this after the wall
-/// (C2 §4.1).
-const CLEANUP_ALLOWANCE: Duration = Duration::from_secs(3);
-
 /// How often the idle source looks for its scenario gate.
 const IDLE_POLL: Duration = Duration::from_millis(10);
-
-/// How the delivery after Route ended went.
-enum Rest {
-    /// Everything Route handed over reached the session channel.
-    Delivered,
-    /// A delivery failed: Core stalled or went away.
-    Undelivered,
-    /// The daemon force ended a delivery that had to wait.
-    Forced,
-}
-
-/// A pending delivery, polled beside the route (Task 4 design §9).
-type Delivery = Pin<Box<dyn Future<Output = Result<(), Undelivered>> + Send>>;
 
 /// The turn's reservation, shared by its task and `run_turn`.
 type Shared = Arc<Mutex<Reservation>>;
@@ -64,19 +48,6 @@ type Shared = Arc<Mutex<Reservation>>;
 /// Locks the shared reservation; no code panics while holding it.
 fn held(reservation: &Shared) -> MutexGuard<'_, Reservation> {
     reservation.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// Armed while `run_turn` awaits its result: dropped armed, the future was
-/// abandoned, which latches its own first cause (C2 §2 health) before
-/// Route sees the closed hop.
-struct Abandonment<'a>(Option<&'a watch::Sender<DriverHealth>>);
-
-impl Drop for Abandonment<'_> {
-    fn drop(&mut self) {
-        if let Some(health) = self.0 {
-            latch(health, DriverFailure::TurnAbandoned);
-        }
-    }
 }
 
 /// The ID identity confirmations name for connection `generation`.
@@ -126,7 +97,7 @@ pub(crate) async fn run_turn(
     };
     let profile = adapter.profile();
     let persistent = profile.persistent;
-    let (steer, steer_lane) = via_routes::steer_lane();
+    let (steer, steer_lane) = FakeRoute::steer_lane();
     let (close, close_rx) = watch::channel(None);
     let (done, retiring) = watch::channel(false);
     let active = Active::new(turn, steer, close);
@@ -153,7 +124,7 @@ pub(crate) async fn run_turn(
     };
     let (logical, logical_rx) = oneshot::channel();
     driver.tracker.spawn(turn_task(TurnTask {
-        route: Arc::clone(&driver.route),
+        route: FakeRoute::new(Arc::clone(&driver.runtime)),
         process,
         start,
         hop,
@@ -240,6 +211,8 @@ fn refused_values(adapter: &FakeAdapter, spec: &TurnSpec) -> Option<TurnEnd> {
         output_schema: spec.output_schema.is_some(),
         max_steps: spec.max_steps,
         vendor: spec.vendor.clone(),
+        // The fake has no size limit: it never reads them.
+        sizes: ParamSizes::default(),
     };
     let refusal = adapter
         .check_turn(Harness::Fake.route(), &params)
@@ -357,31 +330,6 @@ fn after_persistent_turn(
     }
 }
 
-/// Resolves once the turn is ordered to end: Core's stop order, the
-/// daemon force, its wall, or the session's cancellation, which a driver
-/// close includes.
-async fn ordered(
-    (mut stop, mut force, wall): (StopWatch, ForceWatch, Deadline),
-    cancel: CancellationToken,
-) {
-    let stopped = async {
-        if stop.wait_for(Option::is_some).await.is_err() {
-            std::future::pending::<()>().await;
-        }
-    };
-    let forced = async {
-        if force.wait_for(Option::is_some).await.is_err() {
-            std::future::pending::<()>().await;
-        }
-    };
-    tokio::select! {
-        () = stopped => {}
-        () = forced => {}
-        () = tokio::time::sleep_until(wall.instant()) => {}
-        () = cancel.cancelled() => {}
-    }
-}
-
 /// The C2 start's effective values (adapter design §3.2): the turn's own,
 /// which `check_turn` admitted, and on a connection generation's first
 /// turn the session's model and supported instructions.
@@ -432,19 +380,6 @@ fn steer_delivery(profile: &FakeProfile) -> SteerDelivery {
             SteerDelivery::Partial(Cow::Owned(semantics.clone()))
         }
         crate::Support::Native | crate::Support::Unsupported { .. } => SteerDelivery::Injected,
-    }
-}
-
-/// The running turn's steer lane and close order end with its logical
-/// turn; a later turn's are kept.
-fn end_active(state: &Mutex<DriverState>, turn: crate::TurnNumber) {
-    let mut state = lock(state);
-    if state
-        .active
-        .as_ref()
-        .is_some_and(|active| active.turn == turn)
-    {
-        state.active = None;
     }
 }
 
@@ -531,7 +466,7 @@ fn retirement_uncertain(
 
 /// One turn's route work, owned by the session's tracker.
 struct TurnTask {
-    route: Arc<FakeRoute>,
+    route: FakeRoute,
     process: PrivateProcessSpec,
     start: TurnStart,
     hop: mpsc::Sender<RouteMessage>,
@@ -624,79 +559,6 @@ async fn turn_task(task: TurnTask) {
     done.send_replace(true);
 }
 
-/// Keeps `merged` at the earliest of Core's stop order, the driver's close
-/// order and, once the session is cancelled, an immediate close. Never
-/// returns.
-async fn merge_stops(
-    mut core: StopWatch,
-    mut close: watch::Receiver<Option<StopOrder>>,
-    cancel: &CancellationToken,
-    merged: &watch::Sender<Option<StopOrder>>,
-) -> Infallible {
-    let (mut core_open, mut close_open, mut cancelled) = (true, true, false);
-    loop {
-        let mut order = earliest(
-            core.borrow_and_update().clone(),
-            close.borrow_and_update().clone(),
-        );
-        if cancelled {
-            let now = tokio::time::Instant::now();
-            order = earliest(
-                order,
-                Some(StopOrder {
-                    cause: StopCause::Close,
-                    // Route acts only on the times; Core never sees this order.
-                    requested_at: String::new(),
-                    force_at: Deadline::at(now),
-                    close_by: Deadline::at(now + CLEANUP_ALLOWANCE),
-                }),
-            );
-        }
-        merged.send_if_modified(|current| {
-            if same_order(current.as_ref(), order.as_ref()) {
-                false
-            } else {
-                *current = order;
-                true
-            }
-        });
-        tokio::select! {
-            changed = core.changed(), if core_open => core_open = changed.is_ok(),
-            changed = close.changed(), if close_open => close_open = changed.is_ok(),
-            () = cancel.cancelled(), if !cancelled => cancelled = true,
-            else => std::future::pending::<()>().await,
-        }
-    }
-}
-
-/// The order whose `force_at` comes first.
-fn earliest(first: Option<StopOrder>, second: Option<StopOrder>) -> Option<StopOrder> {
-    match (first, second) {
-        (Some(first), Some(second)) => {
-            Some(if second.force_at.instant() < first.force_at.instant() {
-                second
-            } else {
-                first
-            })
-        }
-        (first, None) => first,
-        (None, second) => second,
-    }
-}
-
-/// Whether two orders act the same: cause and times.
-fn same_order(first: Option<&StopOrder>, second: Option<&StopOrder>) -> bool {
-    match (first, second) {
-        (Some(first), Some(second)) => {
-            first.cause == second.cause
-                && first.force_at.instant() == second.force_at.instant()
-                && first.close_by.instant() == second.close_by.instant()
-        }
-        (None, None) => true,
-        (Some(_), None) | (None, Some(_)) => false,
-    }
-}
-
 /// The persistent emulation's idle source (decision H1, C2 §4): once the
 /// scenario's gate `release` exists, the emulated server closes its idle
 /// session: the slot is released, the pin invalidated, and a session-level
@@ -765,85 +627,6 @@ async fn idle_source(
             }
         }
     }
-}
-
-/// Polls `route` while delivering what it hands over, then delivers the
-/// rest by the wall's cutoff: data deliverable at once still goes under
-/// the daemon force.
-async fn deliver_beside(
-    route: impl Future<Output = Option<FakeTurn>>,
-    hop_rx: mpsc::Receiver<RouteMessage>,
-    normalizer: &mut Normalizer,
-    sink: &ObservationSink,
-    activity: &crate::TurnActivity,
-    (mut force, cutoff): (ForceWatch, Deadline),
-    health: &watch::Sender<DriverHealth>,
-) -> (Option<FakeTurn>, Rest) {
-    tokio::pin!(route);
-    let stall = event_stall();
-    let mut hop_rx = Some(hop_rx);
-    let mut delivery: Option<Delivery> = None;
-    let mut delivered = true;
-    let result = loop {
-        tokio::select! {
-            biased;
-            outcome = poll_delivery(delivery.as_mut()), if delivery.is_some() => {
-                delivery = None;
-                normalizer.emitted(outcome.is_ok());
-                if outcome.is_err() {
-                    // Latched at once (C2 §2); Route observes the closed hop
-                    // as overflow, or as the force's stop under a force.
-                    latch(health, DriverFailure::ObservationOverflow);
-                    hop_rx = None;
-                    delivered = false;
-                }
-            }
-            message = recv(hop_rx.as_mut()), if delivery.is_none() && hop_rx.is_some() => {
-                match message {
-                    Some(message) => {
-                        let at = tokio::time::Instant::now();
-                        activity.record(at);
-                        let items = normalizer.items(message, at);
-                        delivery = Some(Box::pin(send_all(items, sink.clone(), stall)));
-                    }
-                    None => hop_rx = None,
-                }
-            }
-            result = &mut route => break result,
-        }
-    };
-    if !delivered {
-        return (result, Rest::Undelivered);
-    }
-    let rest = async {
-        if let Some(delivery) = delivery {
-            let outcome = delivery.await;
-            normalizer.emitted(outcome.is_ok());
-            if outcome.is_err() {
-                return Rest::Undelivered;
-            }
-        }
-        if let Some(receiver) = hop_rx.as_mut() {
-            while let Ok(message) = receiver.try_recv() {
-                let at = tokio::time::Instant::now();
-                activity.record(at);
-                let items = normalizer.items(message, at);
-                let outcome = send_all(items, sink.clone(), stall).await;
-                normalizer.emitted(outcome.is_ok());
-                if outcome.is_err() {
-                    return Rest::Undelivered;
-                }
-            }
-        }
-        Rest::Delivered
-    };
-    // One cutoff (C2 §4.1): no delivery outlives the wall plus 3 s.
-    let rest = tokio::select! {
-        biased;
-        rest = tokio::time::timeout_at(cutoff.instant(), rest) => rest.unwrap_or(Rest::Undelivered),
-        () = forced(&mut force) => Rest::Forced,
-    };
-    (result, rest)
 }
 
 /// The turn's one result (C2 §4.1). A Route failure is the first cause;
@@ -1046,25 +829,8 @@ struct Normalizer {
     emitting: Vec<u64>,
 }
 
-impl Normalizer {
-    /// The normalizer of one turn on connection `generation`.
-    fn new(
-        generation: u64,
-        state: Arc<Mutex<DriverState>>,
-        profile: &FakeProfile,
-        steers: Arc<SteerEmissions>,
-    ) -> Self {
-        Self {
-            generation,
-            state,
-            steer: steer_delivery(profile),
-            vendor_closed: false,
-            checked: checked(profile),
-            instance: None,
-            steers,
-            emitting: Vec::new(),
-        }
-    }
+impl Normalize for Normalizer {
+    type Message = RouteMessage;
 
     /// The delivery of the last message's items ended, `delivered` or
     /// not: each steer whose `steer.delivered` it carried learns whether
@@ -1120,6 +886,27 @@ impl Normalizer {
             .map(|(vendor_turn, observation)| item(vendor_turn, observation))
             .into_iter()
             .collect()
+    }
+}
+
+impl Normalizer {
+    /// The normalizer of one turn on connection `generation`.
+    fn new(
+        generation: u64,
+        state: Arc<Mutex<DriverState>>,
+        profile: &FakeProfile,
+        steers: Arc<SteerEmissions>,
+    ) -> Self {
+        Self {
+            generation,
+            state,
+            steer: steer_delivery(profile),
+            vendor_closed: false,
+            checked: checked(profile),
+            instance: None,
+            steers,
+            emitting: Vec::new(),
+        }
     }
 
     /// A non-terminal message's observation and vendor turn, if any.
@@ -1243,42 +1030,6 @@ fn denial_kind(kind: FakeDenialKind) -> DenialKind {
         FakeDenialKind::Command => DenialKind::Command,
         FakeDenialKind::Network => DenialKind::Network,
         FakeDenialKind::Other => DenialKind::Other,
-    }
-}
-
-/// Sends each item in order.
-async fn send_all(
-    items: Vec<ObservationItem>,
-    sink: ObservationSink,
-    stall: Duration,
-) -> Result<(), Undelivered> {
-    // Test builds: one message's items are stamped, not yet delivered.
-    #[cfg(feature = "test-failpoints")]
-    let _ = via_routes::failpoint::hit_async("adapter.fake.stamped").await;
-    for item in items {
-        sink.send(item, stall).await?;
-    }
-    Ok(())
-}
-
-async fn poll_delivery(delivery: Option<&mut Delivery>) -> Result<(), Undelivered> {
-    match delivery {
-        Some(delivery) => delivery.await,
-        None => std::future::pending().await,
-    }
-}
-
-async fn recv(receiver: Option<&mut mpsc::Receiver<RouteMessage>>) -> Option<RouteMessage> {
-    match receiver {
-        Some(receiver) => receiver.recv().await,
-        None => None,
-    }
-}
-
-/// Resolves once `force` is set; never when its sender is gone unset.
-async fn forced(force: &mut watch::Receiver<Option<tokio::time::Instant>>) {
-    if force.wait_for(Option::is_some).await.is_err() {
-        std::future::pending::<()>().await;
     }
 }
 

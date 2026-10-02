@@ -142,6 +142,8 @@ pub enum DriverHealth {
 }
 
 mod capabilities;
+mod claude;
+mod codex;
 mod config;
 mod driver;
 mod fake;
@@ -176,9 +178,9 @@ pub use observation::{
 };
 pub use plan::{
     AdapterSet, Bound, CatalogModel, Category, CategoryDecl, DescribeRequest, Inherit, InheritPlan,
-    InheritState, ModelChoice, ModelEntry, ModelSource, Refusal, RefusalKind, RoutePlan, ServerKey,
-    SessionRef, Switch, TurnCheck, TurnParams, VendorOptions, VersionStatus, Warning,
-    resolve_model,
+    InheritState, ModelChoice, ModelEntry, ModelSource, ParamSizes, Refusal, RefusalKind,
+    RoutePlan, ServerKey, ServerReport, SessionRef, Switch, TurnCheck, TurnParams, VendorOptions,
+    VersionStatus, Warning, resolve_model,
 };
 pub use runtime::{
     AdapterShutdown, AnchorRecovery, AnchorTurnRecovery, OBSERVATION_BYTES, OBSERVATION_ITEMS,

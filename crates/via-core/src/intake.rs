@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use via_adapters::{
-    AdapterSet, Bound, DescribeRequest, Harness, Refusal, RefusalKind, RoutePlan, SessionRef,
-    Support, TurnParams, TurnSpec, VendorOptions, Verb, VerbReq, harness_names,
+    AdapterSet, Bound, DescribeRequest, Harness, ParamSizes, Refusal, RefusalKind, RoutePlan,
+    SessionRef, Support, TurnParams, TurnSpec, VendorOptions, Verb, VerbReq, harness_names,
 };
 use via_store::json_limits::{self, Shape};
 
@@ -438,6 +438,19 @@ impl SpawnParams {
     }
 }
 
+/// The encoded sizes C2 §2 `ParamSizes` carries: the instructions' UTF-8
+/// bytes, and the schema's compact JSON bytes, as the turn's `TurnSpec`
+/// carries it; 0 for an absent one.
+pub(crate) fn param_sizes(instructions: Option<&str>, schema: Option<&Value>) -> ParamSizes {
+    ParamSizes {
+        instructions: instructions.map_or(0, str::len),
+        // A `Value` always encodes: its keys are strings.
+        output_schema: schema.map_or(0, |schema| {
+            serde_json::to_string(schema).map_or(0, |text| text.len())
+        }),
+    }
+}
+
 /// A planned spawn (C2 §2 `plan`): the route, its turn-1 values and what
 /// its session freezes.
 pub(crate) struct Planned {
@@ -466,6 +479,7 @@ pub(crate) fn plan_spawn(
         vendor: overrides.vendor.given().cloned().unwrap_or_default(),
         cwd: Some(cwd.into()),
         allow_untested: params.allow_untested,
+        sizes: param_sizes(members.instructions.as_deref(), overrides.schema()),
     };
     let plan = adapter
         .plan(&request)
@@ -514,7 +528,10 @@ pub(crate) fn plan_spawn(
         adapter_version: plan.adapter_version.clone(),
     };
     adapter
-        .check_turn(&session, &effective.turn_params())
+        .check_turn(
+            &session,
+            &effective.turn_params(members.instructions.as_deref()),
+        )
         .map_err(|refusal| refused(&refusal))?;
     Ok(Planned { plan, effective })
 }
@@ -557,6 +574,8 @@ impl DescribeParams {
             vendor: shapes.vendor.given().cloned().unwrap_or_default(),
             cwd: self.cwd.as_ref().map(Into::into),
             allow_untested: self.allow_untested,
+            // `describe` carries neither instructions nor a schema.
+            sizes: ParamSizes::default(),
         };
         let plan = adapter
             .plan(&request)
@@ -758,14 +777,16 @@ impl Effective {
     }
 
     /// The values `check_turn` validates against the frozen route: the
-    /// bound as requested.
-    pub(crate) fn turn_params(&self) -> TurnParams {
+    /// bound as requested, and the sizes of the session's frozen
+    /// `instructions` and the turn's effective schema.
+    pub(crate) fn turn_params(&self, instructions: Option<&str>) -> TurnParams {
         TurnParams {
             effort: self.effort.clone(),
             bound: self.requested_bound().cloned(),
             output_schema: self.output_schema.is_some(),
             max_steps: self.max_steps,
             vendor: self.vendor.clone(),
+            sizes: param_sizes(instructions, self.output_schema.as_ref()),
         }
     }
 

@@ -11,12 +11,16 @@ use serde_json::{Map, Value, json};
 
 use std::sync::Arc;
 
-use via_routes::FakeRoute;
+use via_routes::RouteRuntime;
 
 use crate::capabilities::{BoundMode, Capabilities, Verb, VerbReq};
+use crate::claude::{self, ClaudeAdapter};
+use crate::codex::{self, CodexAdapter};
 use crate::config::AdapterConfig;
+use crate::driver::DriverKind;
 use crate::fake::FakeAdapter;
-use crate::harness::Harness;
+use crate::harness::{FAKE, HARNESSES, Harness};
+use crate::instance::{InstanceCache, resolve_binary};
 use crate::{AdapterError, RuntimeConfig, RuntimeResources};
 
 /// A C1 §4 `bound`.
@@ -53,6 +57,22 @@ pub struct DescribeRequest {
     pub cwd: Option<PathBuf>,
     /// Stored for C1 compatibility; no effect (C2 §5).
     pub allow_untested: bool,
+    /// The encoded sizes of the session's instructions and the turn's
+    /// schema, which Core fills; `describe` has neither.
+    pub sizes: ParamSizes,
+}
+
+/// The encoded byte sizes of the values a route may carry where a lower
+/// limit applies (C2 §2), such as a per-argument limit; 0 when absent. Core
+/// fills them from the values it holds, so a route refuses purely, before
+/// any receipt; the values themselves never reach `plan` or `check_turn`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ParamSizes {
+    /// The session's `instructions` text, in UTF-8 bytes.
+    pub instructions: usize,
+    /// The turn's `output_schema`, in bytes of its compact JSON encoding,
+    /// as the turn's `TurnSpec` carries it.
+    pub output_schema: usize,
 }
 
 /// A resume turn's per-turn values, the input to `check_turn`.
@@ -68,6 +88,9 @@ pub struct TurnParams {
     pub max_steps: Option<u64>,
     /// Vendor options.
     pub vendor: VendorOptions,
+    /// The encoded sizes of the session's frozen instructions and the
+    /// turn's effective schema, inherited or set.
+    pub sizes: ParamSizes,
 }
 
 /// What `check_turn` reports of a resume turn it accepts (C2 §2).
@@ -504,8 +527,23 @@ pub struct RoutePlan {
 
 /// An opaque key naming one persistent server a route may share across
 /// sessions (C2 §2); Core only compares it.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(transparent)]
 pub struct ServerKey(String);
+
+/// One live shared server, as C1 `daemon/status.servers` lists it (C2 §2
+/// `servers`).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ServerReport {
+    /// The harness it serves.
+    pub harness: &'static str,
+    /// The version its handshake reported, if any.
+    pub vendor_version: Option<String>,
+    /// Its key.
+    pub key: ServerKey,
+    /// The sessions leasing it.
+    pub sessions: u32,
+}
 
 impl ServerKey {
     /// The key's opaque text.
@@ -575,52 +613,165 @@ pub fn resolve_model<'a>(
     found.ok_or(RefusalKind::UnknownModel)
 }
 
-/// The adapters this daemon can plan for and run: in S-CORE only the fake,
-/// when its fixture is configured, over the Route runtime.
+/// One configured adapter (adapter design §6 step 2): the closed set this
+/// build compiles in, dispatched by match.
+#[derive(Clone, Copy)]
+pub(crate) enum Adapter<'a> {
+    /// The fake test double.
+    Fake(&'a Arc<FakeAdapter>),
+    /// Claude Code (a stub until via-p98.3.2).
+    Claude(&'a Arc<ClaudeAdapter>),
+    /// Codex (a stub until via-5lr.3.2).
+    Codex(&'a Arc<CodexAdapter>),
+}
+
+impl<'a> Adapter<'a> {
+    /// The harness it serves.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Fake(_) => FAKE,
+            Self::Claude(_) => claude::HARNESS,
+            Self::Codex(_) => codex::HARNESS,
+        }
+    }
+
+    /// Its bundled catalog; the vendor stubs have none yet.
+    fn catalog(self) -> &'a [CatalogModel] {
+        match self {
+            Self::Fake(fake) => fake.catalog(),
+            Self::Claude(_) | Self::Codex(_) => &[],
+        }
+    }
+
+    /// The driver arm of its sessions.
+    pub(crate) fn driver_kind(self) -> DriverKind {
+        match self {
+            Self::Fake(fake) => DriverKind::Fake(Arc::clone(fake)),
+            Self::Claude(claude) => DriverKind::Claude(Arc::clone(claude)),
+            Self::Codex(codex) => DriverKind::Codex(Arc::clone(codex)),
+        }
+    }
+}
+
+/// The adapters this daemon can plan for and run, over the Route runtime:
+/// the fake when its fixture is configured, and each vendor harness whose
+/// binary resolves at start (design §5.4).
 pub struct AdapterSet {
     pub(crate) fake: Option<Arc<FakeAdapter>>,
+    pub(crate) claude: Option<Arc<ClaudeAdapter>>,
+    pub(crate) codex: Option<Arc<CodexAdapter>>,
     /// The rest of the start-time configuration (design §5.4).
     config: AdapterConfig,
     /// The Route runtime: Wire and Host, which own every connection.
-    pub(crate) route: Arc<FakeRoute>,
+    pub(crate) runtime: Arc<RouteRuntime>,
+    /// Test builds: the sizes each `plan` and `check_turn` received, the
+    /// latest last ([`Self::param_sizes_seen`]).
+    #[cfg(feature = "test-failpoints")]
+    sizes_seen: std::sync::Mutex<Vec<ParamSizes>>,
 }
 
 impl AdapterSet {
     /// One adapter per configured harness over the Route runtime; Core
-    /// hands the unopened Store resources down unsplit (C2 §2).
+    /// hands the unopened Store resources down unsplit (C2 §2). A vendor
+    /// adapter is built when its binary resolves, `stat` and access checks
+    /// only; every vendor adapter shares one instance cache (C2 §5 AD7).
     pub fn new(
         mut config: AdapterConfig,
         runtime: RuntimeConfig,
         resources: RuntimeResources,
     ) -> Result<Self, AdapterError> {
-        let route = FakeRoute::new(runtime, resources)?;
+        let runtime = RouteRuntime::new(runtime, resources)?;
+        let instances = Arc::new(InstanceCache::default());
+        let binary = |name: &str| {
+            let row = HARNESSES.iter().find(|row| row.name == name)?;
+            resolve_binary(
+                config.harness(row).binary(),
+                row.default_binary,
+                config.env().var("PATH"),
+            )
+        };
+        let claude = binary(claude::HARNESS)
+            .map(|binary| Arc::new(ClaudeAdapter::new(binary, Arc::clone(&instances))));
+        let codex = binary(codex::HARNESS)
+            .map(|binary| Arc::new(CodexAdapter::new(binary, Arc::clone(&instances))));
         Ok(Self {
             fake: config
                 .take_fake()
                 .map(|fixture| Arc::new(FakeAdapter::new(fixture))),
+            claude,
+            codex,
             config,
-            route: Arc::new(route),
+            runtime: Arc::new(runtime),
+            #[cfg(feature = "test-failpoints")]
+            sizes_seen: std::sync::Mutex::default(),
         })
     }
 
     /// The configured adapter for `harness`, if any.
-    pub(crate) fn adapter(&self, harness: Harness) -> Option<&Arc<FakeAdapter>> {
+    pub(crate) fn adapter(&self, harness: Harness) -> Option<Adapter<'_>> {
         match harness {
-            Harness::Fake => self.fake.as_ref(),
-            Harness::Vendor(_) => None,
+            Harness::Fake => self.fake.as_ref().map(Adapter::Fake),
+            Harness::Vendor(row) => match row.name {
+                claude::HARNESS => self.claude.as_ref().map(Adapter::Claude),
+                codex::HARNESS => self.codex.as_ref().map(Adapter::Codex),
+                // No adapter serves this harness in this build.
+                _ => None,
+            },
         }
+    }
+
+    /// Every configured adapter, in C1 harness order, the fake last.
+    fn adapters(&self) -> impl Iterator<Item = Adapter<'_>> {
+        [
+            self.claude.as_ref().map(Adapter::Claude),
+            self.codex.as_ref().map(Adapter::Codex),
+            self.fake.as_ref().map(Adapter::Fake),
+        ]
+        .into_iter()
+        .flatten()
+    }
+
+    /// The live shared servers (C2 §2 `servers`): a pure in-memory
+    /// snapshot. Every route today runs per-turn processes, so none is
+    /// listed.
+    pub fn servers(&self) -> Vec<ServerReport> {
+        Vec::new()
+    }
+
+    /// Test builds: records the sizes a `plan` or `check_turn` received.
+    #[cfg(feature = "test-failpoints")]
+    fn saw(&self, sizes: ParamSizes) {
+        let mut seen = self
+            .sizes_seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if seen.len() == 64 {
+            seen.remove(0);
+        }
+        seen.push(sizes);
+    }
+
+    /// Test builds only: the sizes each `plan` and `check_turn` received,
+    /// the latest last, up to 64 (x.3.2 G8).
+    #[cfg(feature = "test-failpoints")]
+    pub fn param_sizes_seen(&self) -> Vec<ParamSizes> {
+        self.sizes_seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Pure; no I/O. Resolves the harness string, the route and the model,
     /// and lists what the route refuses of the request.
     pub fn plan(&self, req: &DescribeRequest) -> Result<RoutePlan, Refusal> {
+        #[cfg(feature = "test-failpoints")]
+        self.saw(req.sizes);
         let harness = match (&req.harness, &req.model) {
             (Some(name), _) => Harness::parse(name).ok_or_else(|| unavailable(None))?,
             (None, Some(model)) => {
                 let catalogs = self
-                    .fake
-                    .iter()
-                    .map(|fake| (Harness::Fake.name(), fake.catalog()));
+                    .adapters()
+                    .map(|adapter| (adapter.name(), adapter.catalog()));
                 let (name, _) = resolve_model(model, catalogs).map_err(|kind| {
                     Refusal::new(kind, None, "no unique harness catalogs the model")
                 })?;
@@ -635,9 +786,13 @@ impl AdapterSet {
             }
         };
         let route = harness.route();
-        let adapter = self
-            .adapter(harness)
-            .ok_or_else(|| unavailable(Some(route)))?;
+        let adapter = match self.adapter(harness) {
+            Some(Adapter::Fake(fake)) => fake,
+            // The vendor stubs plan nothing yet (via-p98.3.2, via-5lr.3.2).
+            Some(Adapter::Claude(_) | Adapter::Codex(_)) | None => {
+                return Err(unavailable(Some(route)));
+            }
+        };
         let resolved = adapter.resolve(req.model.as_deref()).ok_or_else(|| {
             Refusal::new(
                 RefusalKind::UnknownModel,
@@ -666,12 +821,17 @@ impl AdapterSet {
         session: &SessionRef,
         turn: &TurnParams,
     ) -> Result<TurnCheck, Refusal> {
+        #[cfg(feature = "test-failpoints")]
+        self.saw(turn.sizes);
         let harness = Harness::parse(&session.harness).ok_or_else(|| unavailable(None))?;
         let route = harness.route();
-        let adapter = self
-            .adapter(harness)
-            .filter(|_| session.route == route)
-            .ok_or_else(|| unavailable(Some(route)))?;
+        let adapter = match self.adapter(harness).filter(|_| session.route == route) {
+            Some(Adapter::Fake(fake)) => fake,
+            // The vendor stubs run no turn yet (via-p98.3.2, via-5lr.3.2).
+            Some(Adapter::Claude(_) | Adapter::Codex(_)) | None => {
+                return Err(unavailable(Some(route)));
+            }
+        };
         adapter.check_version(route, &session.adapter_version)?;
         match adapter.check_turn(route, turn).into_iter().next() {
             Some(refusal) => Err(refusal),
@@ -686,18 +846,15 @@ impl AdapterSet {
 
     /// The bundled catalog of each configured harness, or of `harness` only.
     pub fn models(&self, harness: Option<&str>) -> Vec<ModelEntry> {
-        let name = Harness::Fake.name();
-        if harness.is_some_and(|harness| harness != name) {
-            return Vec::new();
-        }
-        self.fake
-            .iter()
-            .flat_map(|fake| fake.catalog())
-            .map(|entry| ModelEntry {
-                model: entry.model.clone(),
-                harness: name,
-                aliases: entry.aliases.clone(),
-                source: ModelSource::Bundled,
+        self.adapters()
+            .filter(|adapter| harness.is_none_or(|harness| harness == adapter.name()))
+            .flat_map(|adapter| {
+                adapter.catalog().iter().map(move |entry| ModelEntry {
+                    model: entry.model.clone(),
+                    harness: adapter.name(),
+                    aliases: entry.aliases.clone(),
+                    source: ModelSource::Bundled,
+                })
             })
             .collect()
     }
@@ -717,6 +874,18 @@ mod tests {
     use serde_json::json;
 
     use super::Inherit;
+    use crate::harness::Harness;
+
+    /// Each vendor stub names a row of the harness table, with its route.
+    #[test]
+    fn each_vendor_stub_names_a_harness_row() {
+        for (name, route) in [
+            (crate::claude::HARNESS, "claude-cli"),
+            (crate::codex::HARNESS, "codex-app-server"),
+        ] {
+            assert_eq!(Harness::parse(name).map(Harness::route), Some(route));
+        }
+    }
 
     /// Critical r2 #8: `inherit` names every category exactly once; seven
     /// members with `hooks` twice are refused, as are five.

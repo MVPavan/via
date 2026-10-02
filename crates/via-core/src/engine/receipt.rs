@@ -536,7 +536,7 @@ impl Engine {
         // requested bound, given or inherited, takes the effective one the
         // route reports now (Sol r2 #4, r3 #2); an inherited one stays
         // marked so.
-        let params = effective.turn_params();
+        let params = effective.turn_params(frozen.instructions.as_deref());
         let checked = self
             .adapter
             .check_turn(&frozen.session_ref(), &params)
