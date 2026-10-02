@@ -1162,3 +1162,64 @@ async fn s1_wire_queued_control_expires_behind_a_blocked_message()
     assert_eq!(input.stragglers(), 0);
     Ok(())
 }
+
+/// x.3.2 J0 r2: a queued control expires on its own deadline though its
+/// write is dropped or never polled again: the writer, blocked on a started
+/// message, removes it and returns its share, so fresh controls fit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s1_wire_abandoned_control_expires_in_the_queue() -> Result<(), Box<dyn std::error::Error>>
+{
+    use tokio::io::AsyncReadExt;
+    let folder = Scratch::new("control-abandoned")?;
+    let long = after(Duration::from_secs(10));
+    let (stdout, vendor) = tokio::io::duplex(1024);
+    let (stdin, mut vendor_stdin) = tokio::io::duplex(16);
+    let (stdin, started) = first_byte(stdin);
+    let TestPipes { messages, input } = pipes(stdout, stdin, folder.0.clone());
+    let mut predecessor = [input.write(control(&[b'p'; 48]), long)];
+    enqueue_all(&mut predecessor).await;
+    tokio::time::timeout(Duration::from_secs(5), started).await??;
+
+    // Seven queued with short deadlines: four dropped, three kept unpolled.
+    let short = after(Duration::from_millis(20));
+    let mut abandoned: Vec<_> = (0..7_u8)
+        .map(|n| input.write(control(&[b'x' + n % 2; 4]), short))
+        .collect();
+    enqueue_all(&mut abandoned).await;
+    let kept = abandoned.split_off(4);
+    drop(abandoned);
+    tokio::time::sleep_until(short.instant() + Duration::from_millis(60)).await;
+
+    // Every expired share returned: seven fresh fit beside the predecessor.
+    let mut fresh: Vec<_> = (0..7_u8)
+        .map(|n| input.write(control(&[b'0' + n; 4]), long))
+        .collect();
+    enqueue_all(&mut fresh).await;
+    let ninth = tokio::time::timeout(
+        Duration::from_secs(2),
+        input.write(control(b"ninth\n"), long),
+    )
+    .await?;
+    assert_eq!(ninth?, SendOutcome::NotWritten);
+    for write in kept {
+        assert_eq!(write.await?, SendOutcome::NotWritten, "expired unpolled");
+    }
+
+    let reading = tokio::spawn(async move {
+        let mut bytes = vec![0_u8; 48 + 7 * 4];
+        vendor_stdin.read_exact(&mut bytes).await.map(|_| bytes)
+    });
+    let [predecessor] = predecessor;
+    assert_eq!(predecessor.await?, SendOutcome::Written);
+    for write in fresh {
+        assert_eq!(write.await?, SendOutcome::Written);
+    }
+    let read = reading.await??;
+    let mut expected = vec![b'p'; 48];
+    expected.extend((0..7_u8).flat_map(|n| [b'0' + n; 4]));
+    assert_eq!(read, expected, "no expired control was written");
+    drop(vendor);
+    messages.finish(after(Duration::from_secs(2))).await;
+    assert_eq!(input.stragglers(), 0);
+    Ok(())
+}

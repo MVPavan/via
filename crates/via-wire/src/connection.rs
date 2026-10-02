@@ -110,8 +110,8 @@ pub enum OutboundMessage {
     /// stdin stays open; expiry wins over a writable stdin. One started is
     /// written whole, cut only by the connection's stop. A deadline thus
     /// never closes a stdin other sessions may share. A queued message
-    /// expires at its deadline only while its write is polled; dropped, it
-    /// expires when the writer reaches it.
+    /// expires at its deadline whether its write is polled, kept or
+    /// dropped: the writer, while it holds stdin, removes it too.
     Control(Vec<u8>),
 }
 
@@ -188,13 +188,15 @@ struct Shared {
 /// messages and the close, first in first out, beside the budget of the
 /// distinct control messages outstanding (queued or being written), under
 /// one lock. A queued control message is owned by whichever comes first of
-/// its caller's expiry and the writer's take, so it is answered and its
-/// share returned exactly once (runtime §8, C2 §2).
+/// its expiry (by its caller, or by the writer while it holds stdin) and the
+/// writer's take, so it is answered and its share returned exactly once
+/// (runtime §8, C2 §2).
 #[derive(Default)]
 struct ControlQueue {
     state: StdMutex<ControlState>,
-    /// Wakes the writer: one consumer, so a push before it waits leaves a
-    /// permit.
+    /// Wakes the writer, in `next` or in `expire_queued`, never both at
+    /// once: a push before it waits leaves a permit, and `next` checks the
+    /// queue before it waits.
     ready: Notify,
 }
 
@@ -279,6 +281,64 @@ impl ControlQueue {
             }
             self.ready.notified().await;
         }
+    }
+
+    /// Services queued deadlines while the writer holds stdin; never
+    /// resolves. Each queued message whose deadline passed is removed, its
+    /// share returned and `NotWritten` answered, to nobody if its caller is
+    /// gone; then it waits for the earliest deadline left, or a push.
+    async fn expire_queued(&self) -> std::convert::Infallible {
+        loop {
+            let earliest = self.take_expired();
+            // A push consumes the writer's wake; `next` checks the queue
+            // before it waits, so nothing is lost.
+            let pushed = self.ready.notified();
+            match earliest {
+                Some(earliest) => {
+                    tokio::select! {
+                        () = sleep_until(earliest) => {}
+                        () = pushed => {}
+                    }
+                }
+                None => pushed.await,
+            }
+        }
+    }
+
+    /// Removes, under the lock, each queued message whose deadline passed,
+    /// returning its share, and answers it `NotWritten`; the earliest
+    /// deadline left.
+    fn take_expired(&self) -> Option<tokio::time::Instant> {
+        let now = tokio::time::Instant::now();
+        let mut expired = Vec::new();
+        let mut earliest: Option<tokio::time::Instant> = None;
+        let mut state = self.state();
+        let mut kept = VecDeque::with_capacity(state.jobs.len());
+        while let Some(job) = state.jobs.pop_front() {
+            match job {
+                Control::Message {
+                    bytes,
+                    deadline,
+                    reply,
+                    ..
+                } if deadline.instant() <= now => {
+                    state.release(bytes.len());
+                    expired.push(reply);
+                }
+                Control::Message { deadline, .. } => {
+                    let at = deadline.instant();
+                    earliest = Some(earliest.map_or(at, |earliest| earliest.min(at)));
+                    kept.push_back(job);
+                }
+                job @ (Control::Interrupt { .. } | Control::Close) => kept.push_back(job),
+            }
+        }
+        state.jobs = kept;
+        drop(state);
+        for reply in expired {
+            let _ = reply.send(Ok(SendOutcome::NotWritten));
+        }
+        earliest
     }
 
     /// Returns the share of a message the writer resolved.
@@ -1089,7 +1149,12 @@ async fn write_stdin<W: AsyncWrite + Unpin>(
             written: false,
             timed_out: false,
         };
-        let outcome = writing.message(&job.message, &mut piece).await;
+        // While it holds stdin, queued control messages still expire.
+        let outcome = tokio::select! {
+            biased;
+            outcome = writing.message(&job.message, &mut piece) => outcome,
+            never = queues.shared.control.expire_queued() => match never {},
+        };
         let (written, timed_out) = (writing.written, writing.timed_out);
         // Resolved, whatever the outcome: its share returns before the
         // answer, so a caller answered may enqueue the next at once.
