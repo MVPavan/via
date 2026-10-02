@@ -81,6 +81,10 @@ const OPEN_SETTLE: Duration = Duration::from_millis(100);
 /// How a case is driven beyond its expectation: a test seam for cases the
 /// schema cannot state.
 #[derive(Clone, Copy, Debug, Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each is one independent test seam"
+)]
 pub(crate) struct Knobs {
     /// Core takes no observation of launch 1 until the fake has read its
     /// `n`th input line (`read <n> launch 1`): the session's channel
@@ -101,6 +105,11 @@ pub(crate) struct Knobs {
     pub(crate) hold_for: Option<Duration>,
     /// A cancel is ordered this long after the turn starts.
     pub(crate) stop_after: Option<Duration>,
+    /// A cancel's stop order is already set when the turn starts (x.3.2
+    /// Q5: nothing launches).
+    pub(crate) stop_before: bool,
+    /// The daemon force is already set when the turn starts (x.3.2 Q5).
+    pub(crate) force_before: bool,
 }
 
 /// What a running turn has shown so far, for its side actions.
@@ -465,12 +474,11 @@ impl<'a> Run<'a> {
         let tool_grace = turn["tool_grace_ms"]
             .as_u64()
             .map_or(TOOL_GRACE, Duration::from_millis);
-        let (stop, stop_rx) = watch::channel(None);
-        let (force, force_rx) = watch::channel(None);
+        let now = tokio::time::Instant::now();
+        let ((stop, stop_rx), (force, force_rx)) = self.ordered_before(now);
         let prepared = session.driver.prepare();
         let capacity = matches!(prepared, Prepared::NeedsConnection)
             .then(|| Box::new(()) as via_adapters::CapacityToken);
-        let now = tokio::time::Instant::now();
         let cx = TurnCx {
             turn: number,
             prepared,
@@ -538,6 +546,37 @@ impl<'a> Run<'a> {
             self.judge_launch(launches_before + 1, session, number, &end)?;
         }
         Ok(outcome)
+    }
+
+    /// The turn's stop and force channels: a turn starting at `now` finds
+    /// them set with [`Knobs::stop_before`] and [`Knobs::force_before`].
+    #[expect(
+        clippy::type_complexity,
+        reason = "the two channel pairs a turn's controls are made of"
+    )]
+    fn ordered_before(
+        &self,
+        now: tokio::time::Instant,
+    ) -> (
+        (
+            watch::Sender<Option<StopOrder>>,
+            watch::Receiver<Option<StopOrder>>,
+        ),
+        (
+            watch::Sender<Option<tokio::time::Instant>>,
+            watch::Receiver<Option<tokio::time::Instant>>,
+        ),
+    ) {
+        let stop = self.knobs.stop_before.then(|| StopOrder {
+            cause: StopCause::Cancel,
+            requested_at: "2026-01-01T00:00:00.000Z".to_owned(),
+            force_at: Deadline::at(now + STOP_FORCE),
+            close_by: Deadline::at(now + STOP_FORCE + CLOSE_BY),
+        });
+        (
+            watch::channel(stop),
+            watch::channel(self.knobs.force_before.then_some(now)),
+        )
     }
 
     /// Sets the daemon force at [`Knobs::force_on`]'s progress line, and

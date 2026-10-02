@@ -151,21 +151,18 @@ impl ClaudeAdapter {
     }
 
     /// The last version an init reported for `harness` run from this
-    /// program path, and a live cached handshake refusal for `requested`'s
-    /// recipe (C2 §5).
+    /// program path, and a handshake refusal for `requested`'s recipe
+    /// cached and live at `now` (C2 §5).
     fn version(
         &self,
         harness: Harness,
         requested: Inherit,
         schema: bool,
+        now: std::time::Instant,
     ) -> (Option<String>, VersionStatus) {
         let version = self.instances.last_version(harness.name(), &self.binary);
         let recipe = launch::recipe_key(requested, schema);
-        let status = if self
-            .instances
-            .refusal(&self.binary, &recipe, std::time::Instant::now())
-            .is_some()
-        {
+        let status = if self.instances.refusal(&self.binary, &recipe, now).is_some() {
             VersionStatus::Refused
         } else if version
             .as_deref()
@@ -206,8 +203,12 @@ impl ClaudeAdapter {
                 ),
             ));
         }
-        let (vendor_version, version_status) =
-            self.version(harness, requested, req.sizes.output_schema > 0);
+        let (vendor_version, version_status) = self.version(
+            harness,
+            requested,
+            req.sizes.output_schema > 0,
+            std::time::Instant::now(),
+        );
         if version_status == VersionStatus::Refused {
             let mut refusal = Refusal::new(
                 RefusalKind::VersionRefused,
@@ -535,14 +536,80 @@ mod tests {
             std::time::Instant::now(),
         );
         let harness = Harness::Vendor(&crate::harness::HARNESSES[0]);
+        let now = std::time::Instant::now();
         assert_eq!(
-            adapter.version(harness, requested, true).1,
+            adapter.version(harness, requested, true, now).1,
             VersionStatus::Refused
         );
         assert_ne!(
-            adapter.version(harness, requested, false).1,
+            adapter.version(harness, requested, false, now).1,
             VersionStatus::Refused
         );
+    }
+
+    /// C2 §5 refusal cache, with controlled time (the plan's clock is the
+    /// `now` it passes): while an entry is live a plan of the same recipe
+    /// is refused `harness_unavailable` with `reason:"handshake_refused"`
+    /// (its version status `refused`); 10 minutes after the entry was
+    /// written it has expired, so the plan admits the turn, which launches
+    /// and re-checks. The last version seen stays reported throughout.
+    #[test]
+    fn cached_refusal_refuses_until_ten_minutes() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("claude");
+        std::fs::write(&binary, b"").unwrap();
+        let instances = std::sync::Arc::new(crate::instance::InstanceCache::default());
+        let adapter = ClaudeAdapter::new(
+            binary.clone(),
+            instances.clone(),
+            &crate::config::BootstrapEnv::from_vars::<_, &str, &str>([]),
+        );
+        let requested = Inherit::OD2_DEFAULT;
+        let harness = Harness::Vendor(&crate::harness::HARNESSES[0]);
+        instances.record_version(harness.name(), &binary, "2.1.285".to_owned());
+        let written = std::time::Instant::now();
+        instances.record_refusal(
+            &binary,
+            launch::recipe_key(requested, false),
+            crate::instance::Incompatibility::FeatureAbsent("interrupt_receipt_v1"),
+            written,
+        );
+        let ttl = crate::instance::REFUSAL_TTL;
+        assert_eq!(ttl, std::time::Duration::from_secs(600));
+        let at = |now| adapter.version(harness, requested, false, now);
+        let refused = (Some("2.1.285".to_owned()), VersionStatus::Refused);
+        assert_eq!(at(written), refused);
+        let last = written + std::time::Duration::from_millis(599_999);
+        assert_eq!(at(last), refused);
+        assert_eq!(
+            at(written + ttl),
+            (Some("2.1.285".to_owned()), VersionStatus::Tested)
+        );
+        // Through `plan` (its own clock, within the entry's life): the
+        // refusal C1 reports.
+        instances.record_refusal(
+            &binary,
+            launch::recipe_key(requested, false),
+            crate::instance::Incompatibility::FeatureAbsent("interrupt_receipt_v1"),
+            std::time::Instant::now(),
+        );
+        let request = DescribeRequest {
+            harness: Some("claude".to_owned()),
+            ..DescribeRequest::default()
+        };
+        let model = crate::plan::ModelChoice {
+            requested: None,
+            resolved: adapter.resolve(None),
+        };
+        let plan = adapter.plan(harness, &request, model, requested);
+        assert_eq!(plan.version_status, VersionStatus::Refused);
+        let refusal = plan
+            .refusals
+            .iter()
+            .find(|refusal| refusal.kind == RefusalKind::VersionRefused)
+            .expect("a version refusal");
+        assert_eq!(refusal.kind.code(), "harness_unavailable");
+        assert_eq!(refusal.reason, Some("handshake_refused"));
     }
 
     /// AD18 and G8: efforts outside the table and values past the argument

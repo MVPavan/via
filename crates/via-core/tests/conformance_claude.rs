@@ -149,6 +149,7 @@ const NAMED: &[&str] = &[
     "claude_lazy_init_acceptance",
     "claude_lazy_init_acceptance_result_only",
     "claude_fifo_busy_input",
+    "claude_identity_resume",
     "claude_schema_replace_clear",
     "claude_agentic_step_limit",
     "claude_instructions_effort",
@@ -260,6 +261,242 @@ fn claude_lazy_init_acceptance() {
 #[test]
 fn claude_fifo_busy_input() {
     check("claude_fifo_busy_input").unwrap();
+}
+
+/// F10 (packet §9 `claude_identity_resume`), the driver half: three
+/// launches on one UUID, a new session (`--session-id`, ruling Q4) then
+/// two `--resume`s of the exact confirmed ID (the replay pins it). Each
+/// launch confirms its own generation once, from its own init, before its
+/// acceptance; at the gate after the second prompt nothing of that launch
+/// is confirmed, so the earlier confirmation never verifies a reopening.
+/// The Core half (status keeps the historical ID with
+/// `vendor_identity_verified:false` while reopening, one `session.opened`,
+/// one `session.reopened` per reopen) runs through the daemon in
+/// via-cli's `claude_identity_resume_through_daemon`.
+///
+/// Ruling Q5 (generation barrier by construction): a per-turn process is
+/// retired, its last message delivered, before the next turn's launch, so
+/// no prior-generation message can reach a later turn. The fake's progress
+/// log orders it: launch n's stdin EOF comes before launch n+1 reads its
+/// prompt. The variants keep the chain whole when a launch fails: another
+/// session's init (`resume_mismatch`, no confirmation, and the driver ends
+/// the connection), a missing session (`session_gone`, and the next launch
+/// still resumes the same UUID, never a fresh `--session-id`), and a lost
+/// submission (the process exits after the prompt): the next launch reads
+/// only its own prompt, never the lost one again.
+#[test]
+fn claude_identity_resume() {
+    let name = "claude_identity_resume";
+    let expect = conformance_expect::load(&fixtures(), name).unwrap();
+    let replay = fixtures().join(format!("{name}.replay.json"));
+    let mut progress = String::new();
+    let outcome = conformance_drive::Pure::run("claude", name, &expect, &replay)
+        .unwrap()
+        .drive_then(
+            &expect,
+            &replay,
+            conformance_run::Knobs::default(),
+            |pure| {
+                progress = std::fs::read_to_string(pure.case_file("progress"))
+                    .map_err(|e| format!("progress: {e}"))?;
+                Ok(())
+            },
+        )
+        .unwrap();
+    conformance_expect::check(&expect, &outcome).unwrap();
+    let at = |line: &str| {
+        progress
+            .lines()
+            .position(|seen| seen == line)
+            .unwrap_or_else(|| panic!("no {line:?} in the progress log:\n{progress}"))
+    };
+    for n in 1..3 {
+        assert!(
+            at(&format!("eof launch {n}")) < at(&format!("read 1 launch {}", n + 1)),
+            "launch {} read its prompt before launch {n}'s stdin EOF:\n{progress}",
+            n + 1
+        );
+    }
+}
+
+/// The chain's UUID, as its third turn's confirmation names it.
+fn chain_uuid(expect: &Value) -> String {
+    expect["turns"][2]["expect"]["observations_include"][0]["vendor_session_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// [`claude_identity_resume`] with another session's init on launch 3
+/// (`c1b_resume_mismatch`'s AD19 stop): `resume_mismatch`, no confirmation,
+/// and the driver's health ends the connection.
+#[test]
+fn claude_identity_resume_mismatch() {
+    let name = "claude_identity_resume";
+    let expect = conformance_expect::load(&fixtures(), name).unwrap();
+    let base = replay_of(name).unwrap();
+    let other = "99999999-9999-4999-8999-999999999999";
+    let u1 = chain_uuid(&expect);
+    let mut mismatch = base.clone();
+    let mut steps = base["lifetimes"][2]["steps"].as_array().unwrap()[..3].to_vec();
+    let init = steps[2]["emit"]["line"].as_str().unwrap().to_owned();
+    steps[2] = json!({"emit": {"line": init.replace(&u1, other)}});
+    let recorded = replay_of("c1b_resume_mismatch").unwrap();
+    steps.extend_from_slice(&recorded["steps"].as_array().unwrap()[3..]);
+    mismatch["lifetimes"][2]["steps"] = json!(steps);
+    let mut wanted = expect.clone();
+    let recorded = conformance_expect::load(&fixtures(), "c1b_resume_mismatch").unwrap();
+    wanted["sessions"]["main"]["health"] =
+        json!({"state": "failed", "first_cause": "resume_mismatch"});
+    let mut third = recorded["turns"][0]["expect"].clone();
+    third["observations_include"][0]["requested"] = json!(u1);
+    third["observations_include"][0]["returned"] = json!(other);
+    wanted["turns"][2]["expect"] = third;
+    check_variant(
+        "claude_identity_resume_mismatch",
+        &mismatch,
+        &wanted,
+        conformance_run::Knobs::default(),
+    )
+    .unwrap();
+}
+
+/// [`claude_identity_resume`] with a missing session on launch 2
+/// (`c0_invalid_resume`'s rejection): `session_gone`, and launch 3 still
+/// resumes the same UUID, never a fresh `--session-id`.
+#[test]
+fn claude_identity_resume_missing() {
+    let name = "claude_identity_resume";
+    let expect = conformance_expect::load(&fixtures(), name).unwrap();
+    let base = replay_of(name).unwrap();
+    let u1 = chain_uuid(&expect);
+    let mut missing = base.clone();
+    let recorded = replay_of("c0_invalid_resume").unwrap();
+    let rejection = serde_json::to_string(&recorded["steps"])
+        .unwrap()
+        .replace("33333333-3333-4333-8333-333333333333", &u1);
+    missing["lifetimes"][1]["steps"] = serde_json::from_str(&rejection).unwrap();
+    missing["lifetimes"][1]["steps"][0] = base["lifetimes"][1]["steps"][0].clone();
+    let mut wanted = expect.clone();
+    let recorded = conformance_expect::load(&fixtures(), "c0_invalid_resume").unwrap();
+    wanted["turns"][1]["expect"] = recorded["turns"][0]["expect"].clone();
+    wanted["turns"][1]
+        .as_object_mut()
+        .unwrap()
+        .insert("gates".to_owned(), json!([]));
+    // Launch 2 confirmed nothing: launch 3's is the case's second ID.
+    wanted["turns"][2]["expect"]["observations_include"][0]["generation"] = json!(2);
+    check_variant(
+        "claude_identity_resume_missing",
+        &missing,
+        &wanted,
+        conformance_run::Knobs::default(),
+    )
+    .unwrap();
+}
+
+/// [`claude_identity_resume`] with a lost submission on launch 2 (the
+/// process exits after the prompt): launch 3 reads only its own prompt,
+/// never the lost one again.
+#[test]
+fn claude_identity_resume_lost() {
+    let name = "claude_identity_resume";
+    let expect = conformance_expect::load(&fixtures(), name).unwrap();
+    let mut lost = replay_of(name).unwrap();
+    lost["lifetimes"][1]["steps"] = json!([
+        lost["lifetimes"][1]["steps"][0].clone(),
+        {"exit": {"code": 1, "stderr": ""}},
+    ]);
+    let mut wanted = expect;
+    let second = &mut wanted["turns"][1];
+    second["gates"] = json!([]);
+    let lost_turn = &mut second["expect"];
+    for (field, value) in [
+        ("accepted", json!(false)),
+        ("terminal", Value::Null),
+        ("usage", Value::Null),
+        ("final_text", Value::Null),
+        ("instance", Value::Null),
+        ("error", json!("process_exit")),
+        ("exit", json!({"code": 1, "signal": null})),
+        ("observations_include", json!([])),
+        (
+            "observations_exclude",
+            json!(["session.vendor_identity_confirmed", "turn.accepted"]),
+        ),
+        (
+            "observation_counts",
+            json!({"turn.accepted": 0, "session.vendor_identity_confirmed": 0}),
+        ),
+        ("observations_order", json!([])),
+    ] {
+        lost_turn[field] = value;
+    }
+    wanted["turns"][2]["expect"]["observations_include"][0]["generation"] = json!(2);
+    check_variant(
+        "claude_identity_resume_lost",
+        &lost,
+        &wanted,
+        conformance_run::Knobs::default(),
+    )
+    .unwrap();
+}
+
+/// Ruling Q5, the generation barrier's stop and force check: a turn whose
+/// stop order (a cancel) or the daemon force is already set when it
+/// starts launches nothing (Route's entry check after the barrier wait,
+/// which those orders end), so it offers no observation to order: no
+/// launch, no acceptance, no terminal; a stop has no failure, the force
+/// is `force_stop`. The session stays open.
+#[test]
+fn claude_generation_barrier_orders_before_launch() {
+    let name = "claude_lazy_init_acceptance_result_only";
+    let replay = replay_of(name).unwrap();
+    let mut expect = conformance_expect::load(&fixtures(), name).unwrap();
+    expect["launches"] = json!(0);
+    expect["launch_checkpoints"]["after_turn"] = json!([0]);
+    expect["sessions"]["main"]["health"] = json!({"state": "open", "first_cause": null});
+    let wanted = &mut expect["turns"][0]["expect"];
+    for (field, value) in [
+        ("accepted", json!(false)),
+        ("terminal", Value::Null),
+        ("usage", Value::Null),
+        ("final_text", Value::Null),
+        ("instance", Value::Null),
+        ("exit", Value::Null),
+        ("group_absent", json!(false)),
+        ("observations_include", json!([])),
+        (
+            "observations_exclude",
+            json!(["session.vendor_identity_confirmed"]),
+        ),
+        ("observation_counts", json!({"turn.accepted": 0})),
+        ("observations_order", json!([])),
+    ] {
+        wanted[field] = value;
+    }
+    for (variant, knobs, error) in [
+        (
+            "claude_barrier_stop",
+            conformance_run::Knobs {
+                stop_before: true,
+                ..conformance_run::Knobs::default()
+            },
+            Value::Null,
+        ),
+        (
+            "claude_barrier_force",
+            conformance_run::Knobs {
+                force_before: true,
+                ..conformance_run::Knobs::default()
+            },
+            json!("force_stop"),
+        ),
+    ] {
+        let mut expect = expect.clone();
+        expect["turns"][0]["expect"]["error"] = error;
+        check_variant(variant, &replay, &expect, knobs).unwrap();
+    }
 }
 
 /// Disjoint schemas A and B, then null, on one UUID: each launch carries
@@ -572,6 +809,76 @@ fn claude_preflight_pure_version() {
             )
             .unwrap();
         conformance_expect::check(&expect, &outcome).unwrap_or_else(|e| panic!("{name}:\n{e}"));
+    }
+}
+
+/// C2 §5: only a demonstrated incompatibility is cached. A launch that
+/// fails before any handshake (its process exits after the prompt, the
+/// wall passes before init, or the binary cannot be started) leaves no
+/// refusal: the next plan of the same recipe is not `refused`.
+#[test]
+fn claude_refusal_never_cached_without_handshake() {
+    let name = "claude_lazy_init_acceptance_result_only";
+    let base = replay_of(name).unwrap();
+    let expect = conformance_expect::load(&fixtures(), name).unwrap();
+    let mut exited = base.clone();
+    exited["steps"] = json!([base["steps"][0].clone(), {"exit": {"code": 1, "stderr": ""}}]);
+    let mut walled = base.clone();
+    walled["steps"] = json!([
+        base["steps"][0].clone(),
+        {"await_signal": {"signal": "SIGTERM"}},
+        {"exit": {"code": 143, "stderr": ""}},
+    ]);
+    let mut wall = expect.clone();
+    wall["turns"][0]["deadlines"] = json!({"wall_ms": 500, "idle_ms": 60000});
+    for (variant, replay, expect, unlinked, error) in [
+        (
+            "claude_uncached_exit",
+            &exited,
+            &expect,
+            false,
+            "process_exit",
+        ),
+        ("claude_uncached_wall", &walled, &wall, false, "deadline"),
+        (
+            "claude_uncached_spawn",
+            &base,
+            &expect,
+            true,
+            "transport_lost",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{variant}.replay.json"));
+        std::fs::write(&path, serde_json::to_vec(replay).unwrap()).unwrap();
+        let pure = conformance_drive::Pure::run("claude", variant, expect, &path).unwrap();
+        if unlinked {
+            std::fs::remove_file(pure.case_dir.path().join(variant)).unwrap();
+        }
+        let outcome = pure
+            .drive_then(expect, &path, conformance_run::Knobs::default(), |pure| {
+                let request = via_adapters::DescribeRequest {
+                    harness: Some("claude".to_owned()),
+                    model: Some("haiku".to_owned()),
+                    ..via_adapters::DescribeRequest::default()
+                };
+                let plan = pure.set.plan(&request).map_err(|e| format!("{e:?}"))?;
+                let plan = serde_json::to_value(&plan).map_err(|e| e.to_string())?;
+                if plan["version_status"] == "refused" {
+                    return Err(format!("{variant}: a refusal was cached: {plan}"));
+                }
+                Ok(())
+            })
+            .unwrap();
+        let turn = &outcome.turns[0];
+        assert!(
+            !turn.accepted && turn.error.as_deref() == Some(error) && turn.instance.is_none(),
+            "{variant}: accepted {}, error {:?}, instance {:?}",
+            turn.accepted,
+            turn.error,
+            turn.instance
+        );
+        assert_eq!(outcome.launches, u64::from(!unlinked), "{variant}");
     }
 }
 
