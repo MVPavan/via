@@ -120,6 +120,7 @@ fn text(seq: u64) -> EventRecord {
         session_id: session(),
         turn: turn(1),
         event: event("assistant.text", seq),
+        steer: None,
     }
 }
 
@@ -425,6 +426,7 @@ fn s1_store_full_disk_rolls_back_known() {
         session_id: session(),
         turn: turn(1),
         event: json!({"type":"assistant.text","seq":seq,"at":"2026-01-01T00:00:00.000Z","text":"x".repeat(256 * 1024)}),
+        steer: None,
     };
     seams.runtime.block_on(async {
         let id = session();

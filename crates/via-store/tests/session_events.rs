@@ -63,6 +63,7 @@ fn observation(seq: u64, turn: Option<u32>, late: bool) -> SessionEventRecord {
         session_id: session(),
         event: Some(event("action.denied", seq, turn, late)),
         identity: None,
+        steer: None,
     }
 }
 
@@ -185,6 +186,7 @@ fn an_identity_commit_writes_the_session_columns_with_its_event() {
                 vendor_session_id: "v1".to_owned(),
                 transcript: transcript.map(str::to_owned),
             }),
+            steer: None,
         };
         client
             .commit_identity(opened(2, Some("/t/v1.jsonl")))
@@ -231,6 +233,7 @@ fn a_repeated_confirmation_writes_the_columns_without_an_event() {
                 vendor_session_id: "v1".to_owned(),
                 transcript: Some(transcript.to_owned()),
             }),
+            steer: None,
         };
         client.commit_identity(columns("/t/a.jsonl")).await.unwrap();
         client.commit_identity(columns("/t/b.jsonl")).await.unwrap();

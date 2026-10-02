@@ -6410,6 +6410,7 @@ fn a_recovered_envelope_keeps_the_stored_identity() {
                         vendor_session_id: "vs-1".to_owned(),
                         transcript: Some("/t/vs-1.jsonl".to_owned()),
                     }),
+                    steer: None,
                 })
                 .await
                 .unwrap();
@@ -8203,6 +8204,7 @@ async fn running_turn_one(root: &Path, settled: bool) -> SessionId {
                     session_id: session.clone(),
                     turn: turn(1),
                     event,
+                    steer: None,
                 })
                 .await
                 .unwrap();

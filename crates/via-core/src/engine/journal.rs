@@ -437,6 +437,7 @@ pub(super) async fn commit_event_as(
             session_id: record.session.clone(),
             turn: record.turn,
             event: event.clone(),
+            steer: None,
         })
         .await;
     if let Err(error) = committed {
@@ -498,6 +499,7 @@ pub(super) async fn commit_session_event(
         session_id: session.clone(),
         event: Some(event),
         identity,
+        steer: None,
     };
     let committed = if record.identity.is_some() {
         store.commit_identity(record).await
@@ -534,6 +536,7 @@ pub(super) async fn commit_identity_columns(
         session_id: session.clone(),
         event: None,
         identity: Some(identity),
+        steer: None,
     };
     match store.commit_identity(record).await {
         Ok(()) => SessionWrite::Committed,
