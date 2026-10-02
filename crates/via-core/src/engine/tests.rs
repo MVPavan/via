@@ -3132,6 +3132,9 @@ fn a_lane_opens_from_the_sessions_stored_route_identity() {
 /// restart, though that daemon's own plan would differ. (A dispatched
 /// turn here ends `unknown`, since no anchor exists, which would cancel
 /// its successors, so the reopened session's turn 1 ends `failed`.)
+/// The driver's `spec()` is a test seam of the failpoint builds (critical
+/// r2 #11).
+#[cfg(feature = "test-failpoints")]
 #[test]
 fn a_lane_opens_with_the_sessions_frozen_inherit() {
     let Some(root) = child("a_lane_opens_with_the_sessions_frozen_inherit") else {

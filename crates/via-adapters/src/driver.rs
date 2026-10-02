@@ -361,7 +361,9 @@ impl SessionDriver {
             .map(|adapter| adapter.profile().adapter_version.clone())
     }
 
-    /// The `SessionSpec` the driver was opened with.
+    /// The `SessionSpec` the driver was opened with: a test seam, absent
+    /// from release builds (critical r2 #11).
+    #[cfg(any(test, feature = "test-failpoints"))]
     pub fn spec(&self) -> &SessionSpec {
         &self.spec
     }
