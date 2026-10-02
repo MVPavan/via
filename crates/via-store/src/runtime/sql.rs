@@ -2467,29 +2467,49 @@ fn read_list_page(conn: &Connection, query: &ListQuery) -> Result<ListPage, Stor
 
 /// Design §4.4, §6.7: the addressed turn, or the session's running turn,
 /// else its latest submitted turn, else its latest turn; with the turn's
-/// `evidence_dir` and the session's vendor identity and transcript hint.
+/// `evidence_dir`, the structured-output file its committed envelope
+/// names, and the session's vendor identity and transcript hint.
 /// One small row: no file is read.
 fn read_evidence_refs(
     conn: &Connection,
     session: &SessionId,
     turn: Option<TurnNumber>,
 ) -> Result<Option<EvidenceRefs>, StoreError> {
-    /// Vendor session ID, transcript hint, turn number and its folder.
-    type Row = (Option<String>, Option<String>, Option<u32>, Option<String>);
+    /// Vendor session ID, transcript hint, turn number, its folder and
+    /// its envelope's structured-output file.
+    type Row = (
+        Option<String>,
+        Option<String>,
+        Option<u32>,
+        Option<String>,
+        Option<String>,
+    );
     let row: Option<Row> = conn
         .query_row(
-            "SELECT s.vendor_session_id,s.transcript_hint,t.number,t.evidence_dir
+            "SELECT s.vendor_session_id,s.transcript_hint,t.number,t.evidence_dir,
+                iif(json_type(t.envelope,'$.structured_output_file.path')='text',
+                    json_extract(t.envelope,'$.structured_output_file.path'),NULL)
              FROM sessions s LEFT JOIN turns t ON t.session_id=s.id AND t.number=coalesce(?2,
                 (SELECT number FROM turns WHERE session_id=s.id AND state='running'),
                 (SELECT max(number) FROM turns WHERE session_id=s.id AND submitted_at IS NOT NULL),
                 (SELECT max(number) FROM turns WHERE session_id=s.id))
              WHERE s.id=?1",
             params![session.as_str(), turn.map(TurnNumber::get)],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .optional()
         .map_err(sql_error)?;
-    let Some((vendor_session_id, transcript_hint, number, evidence_dir)) = row else {
+    let Some((vendor_session_id, transcript_hint, number, evidence_dir, structured_output_file)) =
+        row
+    else {
         return Ok(None);
     };
     Ok(Some(EvidenceRefs {
@@ -2500,6 +2520,7 @@ fn read_evidence_refs(
         evidence_dir,
         vendor_session_id,
         transcript_hint,
+        structured_output_file,
     }))
 }
 

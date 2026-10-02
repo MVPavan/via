@@ -359,3 +359,45 @@ fn a_close_counts_a_close_stopped_turn_only_once_cancelled() {
         assert_eq!(closed_turns(&client, RETAINED, 5).await, json!([]));
     });
 }
+
+/// Fix round 4 #3 (C1 §5 as amended): a revision's spill whose write or
+/// sync failed keeps its file, even a whole one whose folder could not be
+/// synced; a turn's first spill still leaves no partial file to name.
+/// (The folder is made unreadable, so its sync cannot open it.)
+#[test]
+#[expect(
+    clippy::print_stderr,
+    reason = "a skipped check under root is reported"
+)]
+fn a_failed_revision_spill_keeps_its_file() {
+    let root = private_dir();
+    let store = Store::open(root.path()).unwrap();
+    let client = store.client();
+    let folder = root.path().join("evidence").join(UNKNOWN).join("1");
+    fs::create_dir_all(&folder).unwrap();
+    let encoded = vec![b'7'; 40_000];
+    fs::set_permissions(&folder, fs::Permissions::from_mode(0o300)).unwrap();
+    let (revision, first) = runtime().block_on(async {
+        let turn = (&id(UNKNOWN), first());
+        let revision = client
+            .write_structured_output(turn, Some(1), encoded.clone())
+            .await;
+        let first = client
+            .write_structured_output(turn, None, encoded.clone())
+            .await;
+        (revision, first)
+    });
+    fs::set_permissions(&folder, fs::Permissions::from_mode(0o700)).unwrap();
+    if revision.is_ok() {
+        eprintln!("skipped: this process bypasses file permissions (root)");
+        return;
+    }
+    assert!(first.is_err());
+    let names: Vec<String> = fs::read_dir(&folder)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names.len(), 1, "{names:?}");
+    assert!(names[0].starts_with("structured_output.r1-"), "{names:?}");
+    assert_eq!(fs::read(folder.join(&names[0])).unwrap(), encoded);
+}

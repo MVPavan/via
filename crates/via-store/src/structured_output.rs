@@ -1,7 +1,7 @@
 //! A turn's `structured_output.json` and its revisions' own files (C1 §5): a structured output whose
 //! encoding passes the envelope's inline limit, written whole in the turn's
 //! evidence folder and synced with the folder before the commit that names
-//! it. A written file is never changed, and a whole one never deleted.
+//! it. A written file is never changed; a whole one, and any revision's, is never deleted.
 
 use std::{
     fs::{self, File, OpenOptions},
@@ -35,8 +35,9 @@ pub struct StructuredOutputRef {
 /// is `structured_output.json`, or for a `revision` (C1 §7.6)
 /// `structured_output.r<revision>-<nonce>.json` with a random 8-hex
 /// nonce: a file an earlier attempt wrote, which no committed envelope
-/// names, is never a result, never deleted and never in the way. A failed
-/// step removes what it created, so no partial file stays to be named.
+/// names, is never a result, never deleted and never in the way: a failed
+/// write or sync keeps it too (fix r4 #3). A turn's first file is removed
+/// when a step fails, so no partial file stays to be named.
 /// Test builds: `structured_output.write.fail` fails the write.
 pub(crate) async fn write(
     (evidence, tasks): (&EvidenceRoot, &BlobTasks),
@@ -70,7 +71,7 @@ pub(crate) async fn write(
                 file.sync_all()?;
                 sync_dir(&folder)
             })();
-            if written.is_err() {
+            if written.is_err() && revision.is_none() {
                 drop(file);
                 // Never named; best effort, the write's error is the answer.
                 let _ = fs::remove_file(&target);

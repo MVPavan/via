@@ -903,6 +903,9 @@ pub struct EvidenceRefs {
     pub vendor_session_id: Option<String>,
     /// The route's path hint for the vendor transcript; never opened.
     pub transcript_hint: Option<String>,
+    /// The path of the structured-output file the turn's committed
+    /// envelope names (C1 §3.12, §5), when it names one.
+    pub structured_output_file: Option<String>,
 }
 
 /// Full Host-created anchor intent, before process creation.

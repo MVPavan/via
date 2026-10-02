@@ -1025,6 +1025,9 @@ impl Lane {
         // until no sender holds a slot. A disposal the close's end found
         // under way is then finished, never cut off (fix r3 #2).
         inbox.close();
+        // Test builds: admission is closed, a disposal under way unfinished.
+        #[cfg(feature = "test-failpoints")]
+        let _ = via_store::failpoint::hit_async("core.lane.admission_closed").await;
         if let Some(disposing) = disposing {
             disposing.await;
         }

@@ -2948,6 +2948,54 @@ fn core_an_undecodable_retired_message_keeps_its_evidence() {
     });
 }
 
+/// Fix round 4 #1 (C2 §2 health, runtime §7): a failure of the retired
+/// helper's output fails the driver's health as soon as its reading met
+/// it, while the helper still runs: its message that does not decode is
+/// kept, Core's lane sees the failed health (`core.lane.retire`), and the
+/// retirement's cleanup (`adapter.fake.retirement_cleaned`) has not
+/// ended, as the helper holds at its gate.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_a_retirement_failure_fails_health_before_its_cleanup() {
+    let malformed = emit(&json!({"type":"terminal","vendor_turn_id":vendor_turn(1)}));
+    let scripts = [script(
+        "late",
+        &[accepted(1), gate("late"), malformed, gate("hold")],
+    )];
+    let Some(root) = child(
+        "core_a_retirement_failure_fails_health_before_its_cleanup",
+        &scenario(&persistent(), &scripts),
+        &[],
+    ) else {
+        return;
+    };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    acknowledge(&root, "core.lane.retire", 1);
+    acknowledge(&root, "adapter.fake.retirement_cleaned", 1);
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = unknown_turn(&daemon, "late", &json!({})).await;
+        let before = stored(&daemon, &session, 1).await;
+        let kept =
+            PathBuf::from(before["evidence"]["folder"].as_str().unwrap()).join("undecoded.bin");
+        daemon.release("late");
+        until_acked(&root, "core.lane.retire", 1).await;
+        assert!(kept.exists(), "the undecodable message was kept");
+        assert!(
+            !root
+                .join("points")
+                .join("adapter.fake.retirement_cleaned.1.ack")
+                .exists(),
+            "the cleanup still waits for the helper"
+        );
+        daemon.entered("hold").await;
+        daemon.release("hold");
+        until_acked(&root, "adapter.fake.retirement_cleaned", 1).await;
+        assert!(revisions(&daemon, &session).await.is_empty());
+        daemon.shutdown().await;
+    });
+}
+
 /// Every event of `session`, page by page.
 #[cfg(feature = "test-failpoints")]
 async fn all_events(daemon: &Daemon, session: &SessionId) -> Vec<Value> {
@@ -3093,13 +3141,16 @@ fn core_a_closing_lane_drains_what_its_driver_still_delivers() {
     });
 }
 
-/// Fix round 3 #2 (C1 §3.6): the driver's close is polled while the lane
-/// disposes of an item, so its deadline never waits behind Store work.
-/// A close under a 150 ms deadline starts; the retired helper's first
-/// denial is then held in its disposal (`core.lane.dispose`). Past the
-/// deadline the close has ended and the channel's admission closed: a
-/// denial the helper reports then is never committed, while the held one
-/// still is.
+/// Fix round 3 #2, round 4 #4 (C1 §3.6): the driver's close is polled
+/// while the lane disposes of an item, so its deadline never waits behind
+/// Store work. A close under a 1 s deadline starts; the retired helper's
+/// first denial is then held in its disposal (`core.lane.dispose`), and
+/// its second at the driver's delivery (`adapter.fake.retirement_item`),
+/// so the close's delivery ends at the deadline. The close has then ended
+/// and the channel's admission closed while the first is still held
+/// (`core.lane.admission_closed`); the second, sent only then, is refused
+/// (`adapter.fake.retirement_delivered`) and never committed, while the
+/// held one still is.
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn core_a_held_disposal_delays_no_close() {
@@ -3110,7 +3161,6 @@ fn core_a_held_disposal_delays_no_close() {
             terminal(1, "completed", "end_turn"),
             gate("before"),
             denial(1, "held"),
-            gate("after"),
             denial(1, "late"),
         ],
     )];
@@ -3123,7 +3173,10 @@ fn core_a_held_disposal_delays_no_close() {
     };
     via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
     arm(&root, "core.lane.dispose", "pause");
+    arm_at(&root, "adapter.fake.retirement_item", 2, "pause");
     acknowledge(&root, "core.lane.close_draining", 1);
+    acknowledge(&root, "core.lane.admission_closed", 1);
+    acknowledge(&root, "adapter.fake.retirement_delivered", 1);
     run(async {
         let daemon = Daemon::open(&root);
         let session = daemon.spawn("first", &json!({})).await;
@@ -3134,13 +3187,14 @@ fn core_a_held_disposal_delays_no_close() {
             until_acked(&root, "core.lane.close_draining", 1).await;
             daemon.release("before");
             until_acked(&root, "core.lane.dispose", 1).await;
-            // Past the close's deadline: the helper's next denial comes.
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            daemon.release("after");
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            fs::write(root.join("points").join("core.lane.dispose.1.release"), b"").unwrap();
+            until_acked(&root, "adapter.fake.retirement_item", 2).await;
+            // The close ended at its deadline, the first denial still held.
+            until_acked(&root, "core.lane.admission_closed", 1).await;
+            release_point(&root, "adapter.fake.retirement_item", 2);
+            until_acked(&root, "adapter.fake.retirement_delivered", 1).await;
+            release_point(&root, "core.lane.dispose", 1);
         };
-        let (_closed, ()) = tokio::join!(daemon.close_within(&session, 150), steps);
+        let (_closed, ()) = tokio::join!(daemon.close_within(&session, 1_000), steps);
         let events = events(&daemon, &session).await;
         let denied: Vec<&Value> = events
             .iter()

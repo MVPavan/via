@@ -3572,6 +3572,47 @@ fn a_revision_not_made_blocks_no_later_spill() {
     });
 }
 
+/// Fix round 4 #2 (C1 §3.12 as amended): `logs` lists the structured-output
+/// file the committed envelope names, a revision's own file included, and
+/// no file no envelope names.
+#[test]
+fn logs_lists_the_revisions_own_file() {
+    let Some(root) = child("logs_lists_the_revisions_own_file") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = unknown_session(&engine, (Value::Null, None), json!({})).await;
+        evidence_folder(&root, &session, 1);
+        let folder = root
+            .join("state")
+            .join("evidence")
+            .join(session.as_str())
+            .join("1");
+        let orphan = "structured_output.r1-0badf00d.json";
+        fs::write(folder.join(orphan), b"{\"orphan\":true}").unwrap();
+        engine
+            .revise(&session, turn(1), &spilling_terminal(40_000))
+            .await;
+        let envelope = stored_envelope(&engine, &session, 1).await;
+        let named = Path::new(envelope["structured_output_file"]["path"].as_str().unwrap());
+        let name = named.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(revision_spill(&name, 1) && name != orphan, "{name}");
+        let params = serde_json::from_value(json!({"turn": format!("{session}/1")})).unwrap();
+        let logs = engine.logs(params).await.unwrap();
+        assert_eq!(
+            logs["folder"].as_str().map(Path::new),
+            Some(folder.as_path()),
+            "{logs}"
+        );
+        assert_eq!(
+            logs["files"],
+            json!([{"name": name, "bytes": 40_000}]),
+            "{logs}"
+        );
+    });
+}
+
 /// Fix round 2 #2, round 3 #1 (C1 §5 as amended): files that no committed
 /// envelope names, as a crash between a revision's spill and its commit
 /// leaves, are not results and are never deleted: after a restart, the
