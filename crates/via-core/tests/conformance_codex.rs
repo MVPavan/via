@@ -3311,17 +3311,18 @@ fn codex_overflow_beside_a_retained_terminal() {
 /// x.3.2 X3 fix r3 #5: a server whose connection failed is not live for
 /// its catalog, though the registry still lists it `Live` until its
 /// connection task is collected. c7's first turn discovers the catalog;
-/// the connection then fails on an undecodable line and is held in its
-/// owned sequence (a failpoint) while main's resumed `ultra` turn is
-/// checked: no catalog refuses it, so it launches a second server, which
-/// discovers the catalog again and refuses the effort after attach.
+/// the connection then fails on an undecodable line and is paused in its
+/// owned sequence (a failpoint) until main's resumed `ultra` turn, admitted
+/// only once the pause is acknowledged, has run (x.3.2 X3 fix r4 #7). No
+/// catalog refuses it, so it launches a second server, which discovers
+/// the catalog again and refuses the effort after attach.
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn codex_failed_connection_catalog_is_not_live() {
     let name = "codex_failed_connection_catalog_is_not_live";
     let _points = armed(
         "codex.connection.fail_sequence",
-        json!({"occurrence": 1, "action": "delay", "value": 2000}),
+        json!({"occurrence": 1, "action": "pause"}),
     )
     .unwrap();
     let full = replay_of("c7_effort_catalog").unwrap();
@@ -3349,7 +3350,7 @@ fn codex_failed_connection_catalog_is_not_live() {
     expect["launch_checkpoints"] =
         json!({"after_pure": 0, "after_open": {"main": 0}, "after_turn": [1, 2]});
     let knobs = conformance_run::Knobs {
-        admit_after: Some((1, std::time::Duration::from_millis(700))),
+        admit_while_paused: Some((1, "codex.connection.fail_sequence")),
         ..conformance_run::Knobs::default()
     };
     check_variant(name, &replay, &expect, knobs).unwrap();

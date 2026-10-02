@@ -123,10 +123,12 @@ pub(crate) struct Knobs {
     /// The case injects this many server-registry task panics: the final
     /// shutdown reports exactly them failed, and nothing else unsettled.
     pub(crate) panicked_tasks: usize,
-    /// The turn at this index is admitted this long after its start
-    /// condition held (x.3.2 X3 fix r3 #5: inside a window the case holds
-    /// open).
-    pub(crate) admit_after: Option<(usize, Duration)>,
+    /// `(admitted, point)`: the turn at index `admitted` is admitted only
+    /// once failpoint `point` paused its first occurrence (its `ack`
+    /// marker exists), and the point is released once that turn's run
+    /// ended (x.3.2 X3 fix r4 #7: an observable gate holds the case's
+    /// window open).
+    pub(crate) admit_while_paused: Option<(usize, &'static str)>,
     /// `(admitted, earlier)`: the turn at index `admitted` is admitted only
     /// once Route read, under turn `earlier`'s decode fence, a message it
     /// delivered for no turn (x.3.2 X3 fix r3 #7: a routing gate).
@@ -404,6 +406,13 @@ impl<'a> Run<'a> {
         self.start_condition(index, turn).await?;
         let label = session_of(turn).to_owned();
         let mut ran = Ran::default();
+        // Dropped once the turn's run ended, or on an early error, so the
+        // paused point never holds the case past it.
+        let release = self
+            .knobs
+            .admit_while_paused
+            .filter(|(at, _)| *at == index)
+            .map(|(_, point)| Release(point));
         if !self.pure.pending.contains(&index) {
             self.dispatch(index, turn).await?;
         }
@@ -420,6 +429,7 @@ impl<'a> Run<'a> {
                 },
                 None => self.run_turn(index, turn, session).await?,
             };
+            drop(release);
             let last = self.expect["turns"]
                 .as_array()
                 .and_then(|turns| turns.iter().rposition(|t| session_of(t) == label));
@@ -469,10 +479,10 @@ impl<'a> Run<'a> {
             let mut seen = self.seen[index - 1].subscribe();
             let _ = seen.wait_for(|seen| seen.settled).await;
         }
-        if let Some((at, after)) = self.knobs.admit_after
+        if let Some((at, point)) = self.knobs.admit_while_paused
             && at == index
         {
-            tokio::time::sleep(after).await;
+            paused(point).await?;
         }
         if let Some((at, earlier)) = self.knobs.admit_after_routed
             && at == index
@@ -1945,5 +1955,38 @@ impl Pure {
     /// The Store the adapter set runs on.
     fn store(&self) -> &via_store::Store {
         &self.store
+    }
+}
+
+/// The marker failpoint `point`'s first occurrence publishes, of `kind`
+/// (`ack` or `release`), in the active controller's folder.
+fn marker(point: &str, kind: &str) -> Result<PathBuf, String> {
+    let (dir, _) = via_store::failpoint::activation()
+        .ok_or_else(|| format!("failpoint {point} is not armed"))?;
+    Ok(dir.join(format!("{point}.1.{kind}")))
+}
+
+/// Resolves once failpoint `point` paused its first occurrence: its
+/// acknowledgement is published before it pauses, within [`FIXTURE_WAIT`].
+async fn paused(point: &str) -> Result<(), String> {
+    let ack = marker(point, "ack")?;
+    let published = async {
+        while fs::symlink_metadata(&ack).is_err() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::time::timeout(FIXTURE_WAIT, published)
+        .await
+        .map_err(|_| format!("failpoint {point} never paused"))
+}
+
+/// Releases failpoint `point`'s first occurrence when dropped.
+struct Release(&'static str);
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        if let Ok(release) = marker(self.0, "release") {
+            let _ = fs::write(release, b"");
+        }
     }
 }
