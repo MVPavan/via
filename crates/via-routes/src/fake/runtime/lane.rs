@@ -13,13 +13,16 @@ use super::super::{
     FakeMessage, Handshake, STEER_ID, TerminalDetails, TerminalStatus, escape_json,
     escaped_text_len, paired_vendor_turn,
 };
-use super::{Failed, FakeRouteResult, Next, Serving, protocol, transport};
+use super::{FakeRouteResult, Phase, sleep_until_set};
+use crate::private::{
+    CLEANUP_ALLOWANCE, Failed, Interrupt, Next, Serving, pending, protocol, wire_cause,
+};
 use crate::steer::{ControlPermit, SteerProgress, SteerRefused, SteerRequest};
 use crate::{
     CloseRequest, Deadline, ExitReport, OutboundMessage, Retirement, RouteError, RouteFailure,
     SendOutcome, StopCause, TurnNumber, WireCleanup,
 };
-use via_wire::{CloseMode, WireCloseReport, WireMessages, WireSender};
+use via_wire::{CloseMode, WireCloseReport, WireError, WireMessages, WireSender};
 
 /// Reported tool items a turn tracks for cleanup (AD9); one more marks the
 /// set incomplete, which keeps cleanup `Uncertain`.
@@ -110,29 +113,6 @@ pub(super) struct SteerPending {
     _permit: ControlPermit,
 }
 
-impl Retirement {
-    /// The facts of the fake route's S1-shaped result.
-    pub(super) fn of(result: &Result<FakeRouteResult, RouteFailure>) -> Self {
-        match result {
-            Ok(result) => Self {
-                launched: true,
-                exit: (result.exit.code.is_some() || result.exit.signal.is_some())
-                    .then_some(result.exit),
-                cleanup: Some(result.cleanup),
-                forced: result.forced,
-                journal_uncertain: result.journal_uncertain,
-            },
-            Err(failure) => Self {
-                launched: failure.launched,
-                exit: failure.exit,
-                cleanup: failure.cleanup,
-                forced: failure.forced,
-                journal_uncertain: failure.journal_uncertain,
-            },
-        }
-    }
-}
-
 /// The decoded vendor terminal, retained even when the turn then fails
 /// (AD4).
 #[derive(Clone, Debug)]
@@ -186,19 +166,6 @@ pub(super) struct Facts {
     pub(super) logical: Option<oneshot::Sender<FakeTurn>>,
 }
 
-/// The one interrupt's write (design §2 rule 3).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum Interrupt {
-    /// Not sent.
-    NotSent,
-    /// Enqueued; its write has not answered.
-    Queued,
-    /// Written whole.
-    Written,
-    /// Not written whole: the vendor was not asked.
-    Failed,
-}
-
 /// C2 §7 item 10: an interrupt is acknowledged only by vendor evidence, an
 /// interrupted terminal read in phase after it was sent, together with its
 /// confirmed write.
@@ -211,8 +178,11 @@ pub(super) fn acknowledges(evidence: bool, interrupt: Interrupt) -> bool {
     clippy::struct_excessive_bools,
     reason = "each flag is a distinct, independent fact of the turn"
 )]
-pub(super) struct LaneState {
+pub(crate) struct LaneState {
     pub(super) persistent: bool,
+    /// The connection's protocol phase; every read message is checked
+    /// against it before any fact is recorded.
+    pub(super) phase: Phase,
     pub(super) handshake: Option<Vec<String>>,
     pub(super) tool_grace: Duration,
     pub(super) steer: Option<mpsc::Receiver<SteerRequest>>,
@@ -232,8 +202,6 @@ pub(super) struct LaneState {
     /// P7's bound after an interrupted terminal (persistent profile).
     pub(super) grace: Option<tokio::time::Instant>,
     pub(super) grace_expired: bool,
-    /// The one interrupt's write.
-    pub(super) interrupt: Interrupt,
     /// An interrupted terminal was read in phase after the interrupt was
     /// sent.
     ack_evidence: bool,
@@ -247,6 +215,7 @@ impl LaneState {
     pub(super) fn new(lane: Lane, logical: Option<oneshot::Sender<FakeTurn>>) -> Self {
         Self {
             persistent: lane.persistent,
+            phase: Phase::Opening,
             handshake: lane.handshake,
             tool_grace: lane.tool_grace,
             steer: lane.steer,
@@ -263,7 +232,6 @@ impl LaneState {
             tools_incomplete: false,
             grace: None,
             grace_expired: false,
-            interrupt: Interrupt::NotSent,
             ack_evidence: false,
             identity: lane.identity,
             effort: lane.effort,
@@ -276,14 +244,14 @@ impl LaneState {
         self.open_tools.is_empty() && !self.tools_incomplete
     }
 
-    /// The interrupt was acknowledged.
-    pub(super) fn acknowledged(&self) -> bool {
-        acknowledges(self.ack_evidence, self.interrupt)
+    /// The interrupt, in its final state `interrupt`, was acknowledged.
+    fn acknowledged(&self, interrupt: Interrupt) -> bool {
+        acknowledges(self.ack_evidence, interrupt)
     }
 
-    /// The facts at the turn's end.
-    pub(super) fn into_facts(self) -> Facts {
-        let acknowledged = self.acknowledged();
+    /// The facts at the turn's end, the interrupt in its final state.
+    pub(super) fn into_facts(self, interrupt: Interrupt) -> Facts {
+        let acknowledged = self.acknowledged(interrupt);
         let tools_settled = self.tools_settled();
         Facts {
             acknowledged,
@@ -293,7 +261,83 @@ impl LaneState {
     }
 }
 
-impl Serving<'_> {
+impl LaneState {
+    /// Whether [`Self::next_event`] may resolve now: P7's bound, a steer
+    /// write, or a steer request while none is pending.
+    pub(super) fn has_event(&self) -> bool {
+        (self.grace.is_some() && !self.tools_settled())
+            || self.steer_write.is_some()
+            || self.steer_request_open()
+    }
+
+    /// The lane takes a steer request: none is written or awaiting its
+    /// report.
+    fn steer_request_open(&self) -> bool {
+        self.steer.is_some() && self.steer_reply.is_none() && self.steer_write.is_none()
+    }
+
+    /// The lane's next control event, biased: (1) C1 P7's bound, once a
+    /// reported tool outlived the window (persistent profile); (2) the
+    /// pending steer write; (3) a steer request. Cancel-safe.
+    pub(super) async fn next_event(&mut self) -> LaneEvent {
+        let grace = self.grace.is_some() && !self.tools_settled();
+        let writing = self.steer_write.is_some();
+        let requesting = self.steer_request_open();
+        tokio::select! {
+            biased;
+            () = sleep_until_set(self.grace), if grace => LaneEvent::GraceExpired,
+            written = pending(self.steer_write.as_mut()), if writing => {
+                LaneEvent::SteerWritten(written)
+            }
+            request = steer_request(self.steer.as_mut()), if requesting => {
+                LaneEvent::SteerRequest(request)
+            }
+            else => std::future::pending().await,
+        }
+    }
+}
+
+/// An event of the fake lane's own controls.
+pub(crate) enum LaneEvent {
+    /// C1 P7: a reported tool outlived the window.
+    GraceExpired,
+    /// The pending steer write answered.
+    SteerWritten(Result<SendOutcome, WireError>),
+    /// A steer request, or `None` once the driver's lane closed.
+    SteerRequest(Option<SteerRequest>),
+}
+
+/// A failure whose emulated server stays (persistent profile).
+pub(crate) struct KeepServer;
+
+impl Serving<'_, LaneState> {
+    /// The interrupt was acknowledged.
+    fn acknowledged(&self) -> bool {
+        self.lane.acknowledged(self.interrupt)
+    }
+
+    /// Acts on a lane event.
+    pub(super) fn on_event(&mut self, event: LaneEvent) -> Result<(), Failed> {
+        match event {
+            LaneEvent::GraceExpired => {
+                self.lane.grace_expired = true;
+                Err(RouteError::Deadline { turn: self.turn }.into())
+            }
+            LaneEvent::SteerWritten(written) => {
+                self.steer_written(&written);
+                Ok(())
+            }
+            LaneEvent::SteerRequest(Some(request)) => {
+                self.on_steer(request);
+                Ok(())
+            }
+            LaneEvent::SteerRequest(None) => {
+                self.lane.steer = None;
+                Ok(())
+            }
+        }
+    }
+
     /// Records the lane facts one decoded, phase-valid message carries: tool
     /// items, the acceptance, the interrupt acknowledgement, the steer
     /// delivery and the vendor identity. Returns whether the message is
@@ -302,6 +346,7 @@ impl Serving<'_> {
     pub(super) fn note(&mut self, message: &FakeMessage) -> Result<bool, Failed> {
         let turn = self.turn;
         let terminated = self.terminated;
+        let interrupted = self.interrupt != Interrupt::NotSent;
         let lane = &mut self.lane;
         match message {
             FakeMessage::Accepted { .. } => lane.accepted = true,
@@ -316,7 +361,7 @@ impl Serving<'_> {
                 lane.open_tools.remove(tool_id);
             }
             FakeMessage::Terminal { status, .. } => {
-                if *status == TerminalStatus::Interrupted && lane.interrupt != Interrupt::NotSent {
+                if *status == TerminalStatus::Interrupted && interrupted {
                     lane.ack_evidence = true;
                 }
             }
@@ -382,7 +427,7 @@ impl Serving<'_> {
             Next::Message(message) => message,
             end @ (Next::Eof | Next::Unterminated) => return Err(self.ended(end).await),
         };
-        let FakeMessage::Hello(handshake) = &message.payload else {
+        let FakeMessage::Hello(handshake) = &message.0.payload else {
             return Err(protocol(turn, "fake handshake expected").into());
         };
         let missing = required
@@ -407,29 +452,8 @@ impl Serving<'_> {
         // C2 §4 `turn.accepted` (Sol r1 #13): an accepted handshake goes on
         // the hop too, ahead of everything the turn reports, so the Adapter
         // knows the instance before its acceptance.
-        self.held = Some(message);
+        self.hold(message);
         Ok(())
-    }
-
-    /// The end of stdout before a terminal: a Host-confirmed exit is
-    /// `ProcessExited` (the persistent profile's server loss), anything else
-    /// as [`Self::exit_before_terminal`] decides. The persistent profile
-    /// waits for the exit only for the cleanup allowance: a live process
-    /// that closed stdout is transport loss.
-    pub(super) async fn ended(&mut self, end: Next) -> Failed {
-        let bounded = matches!(end, Next::Unterminated) || self.lane.persistent;
-        let exit = match self.exit_before_terminal(bounded).await {
-            Ok(exit) => exit,
-            Err(failed) => return failed,
-        };
-        if let Err(failed) = self.after_terminal() {
-            return failed;
-        }
-        Failed {
-            cause: RouteError::ProcessExited { turn: self.turn },
-            exit: Some(exit),
-            close_by: None,
-        }
     }
 
     /// Keeps the decoded terminal (AD4) and, on the persistent profile,
@@ -440,59 +464,6 @@ impl Serving<'_> {
             self.lane.grace = Some(bound.min(self.deadline.instant()));
         }
         self.lane.facts.terminal = Some(terminal.clone());
-    }
-
-    /// Enqueues the one interrupt (design §2 rule 3).
-    pub(super) fn send_interrupt(&mut self) {
-        if self.lane.interrupt != Interrupt::NotSent {
-            return;
-        }
-        self.lane.interrupt = Interrupt::Queued;
-        let interrupt = format!(
-            "{{\"type\":\"interrupt\",\"id\":2,\"vendor_turn_id\":\"fake-turn-{}\"}}\n",
-            self.turn.get()
-        );
-        self.pending = Some(self.sender.write(
-            OutboundMessage::Interrupt(interrupt.into_bytes()),
-            self.deadline,
-        ));
-    }
-
-    /// The interrupt's write answered. One not written whole asked the
-    /// vendor nothing: before the terminal, a stop order's force rule
-    /// applies at once and the wall's soft stop ends as transport loss.
-    pub(super) fn interrupt_written(
-        &mut self,
-        outcome: &Result<SendOutcome, via_wire::WireError>,
-    ) -> Result<(), Failed> {
-        self.pending = None;
-        if matches!(outcome, Ok(SendOutcome::Written)) {
-            self.lane.interrupt = Interrupt::Written;
-            return Ok(());
-        }
-        self.lane.interrupt = Interrupt::Failed;
-        if self.terminated {
-            return Ok(());
-        }
-        let close_by = self
-            .signals
-            .stop
-            .borrow()
-            .as_ref()
-            .map(|order| order.close_by);
-        Err(match close_by {
-            Some(close_by) => Failed::stopped(self.turn, close_by),
-            None => transport(self.turn).into(),
-        })
-    }
-
-    /// Serves until the interrupt's write answered.
-    async fn settle_interrupt(&mut self) -> Result<(), Failed> {
-        let mut never = std::pin::pin!(std::future::pending::<()>());
-        while self.lane.interrupt == Interrupt::Queued {
-            self.serve_once(never.as_mut()).await?;
-        }
-        Ok(())
     }
 
     /// Starts one steer write, or answers why not.
@@ -570,17 +541,17 @@ impl Serving<'_> {
     pub(super) async fn soft_stop(&mut self, messages: &mut WireMessages, cutoff: Deadline) {
         self.deadline = cutoff;
         self.send_interrupt();
-        while !self.lane.acknowledged() {
+        while !self.acknowledged() {
             let Ok(Next::Message(message)) = self.next(messages).await else {
                 break;
             };
-            if matches!(message.payload, FakeMessage::Terminal { .. }) {
+            if matches!(message.0.payload, FakeMessage::Terminal { .. }) {
                 // Its write answers in order before the cutoff, or the
                 // turn's failure stands unacknowledged.
                 let _settled = self.settle_interrupt().await;
                 break;
             }
-            self.held = Some(message);
+            self.hold(message);
         }
         // What is not on the hop by the cutoff goes with the turn, which
         // already failed at the wall.
@@ -601,7 +572,7 @@ impl Serving<'_> {
         if interrupted {
             self.await_tools(messages).await?;
         }
-        let cutoff = Deadline::at(self.deadline.instant() + super::CLEANUP_ALLOWANCE);
+        let cutoff = Deadline::at(self.deadline.instant() + CLEANUP_ALLOWANCE);
         self.deliver_held(cutoff).await.map_err(Failed::from)?;
         Ok(if !interrupted || self.lane.tools_settled() {
             WireCleanup::Quiescent
@@ -625,7 +596,7 @@ impl Serving<'_> {
                 self.next(messages).await.map(Some)
             };
             match step {
-                Ok(Some(Next::Message(message))) => self.held = Some(message),
+                Ok(Some(Next::Message(message))) => self.hold(message),
                 // The helper's stdout ended: its reported tools still count
                 // until they end or the bound passes (C1 P7).
                 Ok(Some(Next::Eof | Next::Unterminated)) => ended = true,
@@ -659,7 +630,7 @@ impl Serving<'_> {
     /// The logical failure of a turn whose server stays: no kill, no exit;
     /// cleanup is the reported tools' once acknowledged, else `Uncertain`.
     pub(super) fn kept_failure(&self, cause: RouteError) -> RouteFailure {
-        let acknowledged = self.lane.acknowledged();
+        let acknowledged = self.acknowledged();
         RouteFailure {
             cause,
             undecoded: None,
@@ -683,7 +654,7 @@ impl Serving<'_> {
             let turn = FakeTurn {
                 terminal: self.lane.facts.terminal.clone(),
                 handshake: self.lane.facts.handshake.clone(),
-                acknowledged: self.lane.acknowledged(),
+                acknowledged: self.acknowledged(),
                 outcome,
                 server_kept: true,
                 late_mismatch: self.lane.facts.late_mismatch.clone(),
@@ -731,8 +702,8 @@ impl Serving<'_> {
             }) => (Some((items, failure)), Some(cleaned)),
             None => (None, None),
         };
-        let interrupted = self.lane.interrupt != Interrupt::NotSent;
-        let reading = (self.turn, &mut self.phase, interrupted);
+        let interrupted = self.interrupt != Interrupt::NotSent;
+        let reading = (self.turn, &mut self.lane.phase, interrupted);
         let close = async {
             let report = sender.close(CloseRequest { mode, deadline: by }).await;
             if let Some(cleaned) = cleaned {
@@ -765,7 +736,7 @@ impl Serving<'_> {
 async fn read_retired(
     messages: &mut WireMessages,
     sender: &WireSender,
-    (turn, phase, interrupted): (TurnNumber, &mut super::Phase, bool),
+    (turn, phase, interrupted): (TurnNumber, &mut Phase, bool),
     (items, failure): (mpsc::Sender<FakeRetiredItem>, oneshot::Sender<RouteError>),
     by: Deadline,
 ) {
@@ -777,7 +748,7 @@ async fn read_retired(
                 Ok(None) | Err(via_wire::WireError::Cancelled | via_wire::WireError::Deadline) => {
                     return None;
                 }
-                Err(error) => return Some(super::wire_cause(turn, &error)),
+                Err(error) => return Some(wire_cause::<LaneState>(turn, &error)),
             };
             let payload = match FakeMessage::decode(message.bytes(), turn) {
                 Ok(payload) => payload,
