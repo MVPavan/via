@@ -71,7 +71,7 @@ decided in the slice that needs them, after re-probing.
 | P8 | Error code table §8.1 | as written |
 | P9 | Deprecation: kept for one minor release minimum; removed only in v2 | as written |
 | P10 | Socket `$XDG_RUNTIME_DIR/via/via.sock` else `~/.via/run/via.sock`; 0700/0600; peer uid check both ends | as written |
-| P11 | Codex owned stdio server key is `(codex, observed_binary_version, config_hash)` without bound; `config_hash` includes VIA-controlled startup/environment configuration, not credentials. Every turn sets `sandboxPolicy`; mixed-bound sharing waits for pinned enforcement proof. OpenCode keys include the full effective bound, VIA owner session and durable private namespace; no cross-owner server sharing or live-session migration. Bound-keyed routes refuse bound changes on resume | as reviewed in `docs/specs/vendors/codex.md` §9 and `docs/specs/vendors/opencode.md` §2 |
+| P11 | Codex owned stdio server key is `config_hash` without bound; `config_hash` covers VIA-controlled launch settings (resolved program path, arguments, passed environment, server cwd, protocol pin), not credentials or binary contents; the observed binary version is reported, not keyed. Every turn sets `sandboxPolicy`; mixed-bound sharing waits for pinned enforcement proof. OpenCode keys include the full effective bound, VIA owner session and durable private namespace; no cross-owner server sharing or live-session migration. Bound-keyed routes refuse bound changes on resume | as reviewed in `docs/specs/vendors/codex.md` §9 and `docs/specs/vendors/opencode.md` §2 |
 | P12 | Live recovery after daemon restart is `unknown` for every route in v1; `resumed` only when a route's rejoin is probe-verified on the configured transport (Codex stdio server dies with the daemon, P3) | as written |
 | P13 | Version rule: every vendor version is supported; refused only on demonstrated handshake breakage; `untested` warns until the maintainers' check (owner OD1, 2026-09-30, superseding the 2026-09-26 P13 approval) | decided; C2 §5 (adapter design AD7) |
 
@@ -314,7 +314,11 @@ Sets the admission gate `closing` (new `resume` → `session_closed`),
 cancels the active turn, drops queued turns as `cancelled`, closes the
 vendor session (`close(mode, deadline)` down to Host, D7), then sets
 `closed`. Result `{session_id, state: "closed", cancelled_turns, cleanup,
-leftovers}`; `leftovers` (§5) is always present and non-null only when this
+leftovers}`; `cleanup` is `uncertain` while any process group the session owns
+lacks a proof of absence or, on a shared server, while a turn of the session
+runs or ended without its own cleanup proved quiescent (whether or not it was
+cancelled) and the server group it ran on lacks a proof of absence; otherwise
+`quiescent`. `leftovers` (§5) is always present and non-null only when this
 close stopped the session's server, where a keyed replay returns the stored
 report; otherwise `null`.
 Idempotent; a second `close` during closing waits for the first. A close
@@ -379,8 +383,8 @@ terminal synthesized by crash recovery or by the failure-resolution batch
 after a Store write of uncertain outcome (runtime §7).
 
 `process.alive` is true only on positive evidence that the vendor process
-is live; `process.cleanup` is `uncertain` when any process group of the
-session lacks a proof of absence, else `quiescent` (T4-A23).
+is live; `process.cleanup` is `uncertain` under the same rule as `close`'s
+`cleanup` (§3.6), else `quiescent` (T4-A23).
 
 `adapter_version` is the session's recorded adapter version, advanced by a
 compatible resume (C2 §1 rule 2). `vendor_version` and `version_status` are
@@ -468,7 +472,9 @@ files: [{name, bytes}]}`. `transcript` is the path of the vendor's own
 transcript, a hint that follows the vendor's layout, or `null`. `folder`
 is the turn's evidence folder in VIA's state directory, or `null` for a
 turn never submitted. `files` lists the files there that exist:
-`stderr.log` (the agent's stderr), `undecoded.bin` (the first 64 KiB of a
+`stderr.log` (the agent's stderr),
+(absent on a shared-server route, where the agent's stderr belongs to
+the server, not to a turn), `undecoded.bin` (the first 64 KiB of a
 vendor message VIA could not decode, named by the turn's failure) and
 `final_text.txt` and the structured-output file the envelope names
 (`structured_output.json`, or a revision's own file; a final text or
@@ -484,6 +490,10 @@ socket_path, store_path, health, store_failure, connections, limits,
 storage}`. `limits` holds the effective disk and WAL thresholds; `storage`
 holds `free_bytes`, `data_bytes`, `data_measured_at`, `below_free_floor`
 and `over_warn_size`.
+
+`servers` lists the live shared servers whose handshake succeeded:
+`key` is an opaque 16-hex-digit server key, and `sessions` counts the
+sessions holding a lease on it.
 
 `health` reports `healthy`, or `store_failed` once the daemon has latched
 a Store failure (runtime §7); it stays `store_failed` until the daemon
@@ -687,7 +697,7 @@ below 1 MiB, and a conformance test assembles that maximum.
 | `cost` | `usd`; `scope` as above; `provenance` `reported`, `estimated`, `unavailable`. Scopes are per field: Claude P5 showed per-result tokens with rising cumulative `total_cost_usd` |
 | `exit` | `{code, signal}` for per-session processes that ended in this turn; `null` for server routes |
 | `evidence` | the turn's evidence folder and the vendor's transcript hint, as `logs` returns them (§3.12) |
-| `warnings` | `instructions_partial`, `vendor_version_untested`, `usage_interval_unverified`, `structured_output_missing`, `structured_output_invalid`, `cancel_cleanup_uncertain`, `predecessor_cleanup_uncertain`, `config_switch_unverified`, `deprecated`. `config_switch_unverified` is one warning per receipt or envelope listing every category whose requested inheritance setting VIA could not apply or could not verify, `data.categories: [{category, requested, effective}]` (C2 §6.2) |
+| `warnings` | `instructions_partial`, `vendor_version_untested`, `usage_interval_unverified`, `structured_output_missing`, `structured_output_invalid`, `cancel_cleanup_uncertain`, `predecessor_cleanup_uncertain`, `config_switch_unverified`, `deprecated`, `observations_lost`.  `config_switch_unverified` is one warning per receipt or envelope listing every category whose requested inheritance setting VIA could not apply or could not verify, `data.categories: [{category, requested, effective}]` (C2 §6.2) `observations_lost` (some observations of a shared-server thread were lost: by ingress overflow, an observation stall, a close's deadline or an internal task failure) carries `data: {trigger_turn, generation, first_unqueued, omitted}`, where `omitted` is `null` when the count is unknown or saturated; it is on the envelope of every turn the loss affected, and, when the triggering turn was already terminal, a durable `late` `warning` event on that turn; that envelope is not rewritten. |
 | `leftovers` | processes the coding agent started that were observed after its own process exited; the agent's responsibility, never signalled by VIA (C2 §4.2). `{scope: "turn"\|"server", processes: [{pid, comm, started_at}], total, incomplete, best_effort: true}` or `null`. `processes`: at most 16, oldest first (start ticks, then pid). `total`: the matches found, exact when not `incomplete`, a lower bound otherwise; `total` greater than the list length is the only truncation signal. `started_at`: RFC 3339 UTC, boot time (`/proc/stat` `btime`, whole seconds) plus the process's start ticks, so accurate to about 1 s and emitted with second precision. `comm`: the kernel's process name (at most 15 bytes), lossy UTF-8; it is process-controlled, so a process can name itself anything. Always present; non-null only on per-turn-route envelopes and on `server_lost` envelopes (one shared snapshot per lost server); `null` elsewhere, including recovered turns. Produced best effort by Host's report-only scan for VIA's process marker (C2 §4.2, runtime §5) wherever these destinations apply; `null` when no scan ran. `incomplete: true` means the scan could not settle the full set (C2 §4.2); entries mean "observed during the scan", not "alive" |
 
 ## 6. Durable events

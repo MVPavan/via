@@ -64,8 +64,11 @@ Core owns receipts, submission intent, queues, deadlines, results and Store
 transactions. Adapter owns canonical mapping, capabilities, normalization
 and cleanup evidence. A concrete `CodexConnection` in Routes owns typed
 methods, request pairing and thread demultiplexing. Wire owns bounded JSONL,
-and transport. Host owns the process, verified identity,
-shared-server leases and whole-server shutdown. Follow runtime §2's opaque
+and transport. Host owns the server process, its verified identity, its
+connection slot and whole-server shutdown. Routes owns the shared-server
+registry: the server key map, reservations, pins and leases, the
+idle-retirement trigger, and supervised launch, connection and retirement
+tasks, beside the connection's thread table. Follow runtime §2's opaque
 resource wiring; no Adapter access to SQLite or credentials.
 
 Extend the typed route with only `initialize`, `model_list` (catalog
@@ -80,33 +83,40 @@ the connection after drain, never reuses an ID.
 
 ### Shared ownership (A8/P11)
 
-Host acquires a lease on a VIA-started server keyed by
-`(codex, observed_binary_version, config_hash)`. The hash covers the resolved
-binary path and VIA-controlled startup arguments, effective non-secret
-environment/path configuration and protocol pin. It does not hash credential
-contents. The bound, model, instructions and session cwd are thread/turn
-settings, not key components. Never attach to a pre-existing vendor server.
-Reserve ownership before launch and publish the connection only after a
-successful handshake; concurrent equal-key acquisition shares that result.
-The first `initialize` took 38 s on a fresh SQLite home (single re-probe
-observation), so the handshake deadline is the turn's remaining wall time.
+A session acquires a lease on a VIA-started server keyed by `config_hash`; the
+observed binary version is reported, not keyed. It does not hash credential
+contents. The hash covers, in order, a domain tag, the adapter version, the
+resolved program path, the exact argv, the passed environment (names and
+values, without Host's process marker), the server's cwd and the protocol pin;
+never file stats or binary contents. A server runs the binary it launched
+with; an upgrade takes effect at the next launch. The bound, model,
+instructions and session cwd are thread/turn settings, not key components.
+Never attach to a pre-existing vendor server. Reserve ownership before launch
+and publish the connection only after a successful handshake; concurrent
+equal-key acquisition shares that result. The first `initialize` took 38 s on
+a fresh SQLite home (single re-probe observation), so the handshake has its
+own 60 s deadline from spawn, independent of any turn; a waiting turn's own
+wall, stop or force ends only its wait.
 
-Each session has one lease and a registered thread ID. One shared server
-holds one of the runtime's four connection slots for its life; a turn on a
-live server pins it and takes no further slot (C2 §3 connection admission). Initially cap
-loaded Codex leases at 32 daemon-wide and outstanding client RPCs at 64 per
-connection, with eight slots reserved for control. Refuse excess admission
-before submitting input. Idle leases can detach and later reopen; no
-unbounded map of every historical thread remains in memory. A detached
-session with retained correlation still occupies one of the 32 resident
-session slots (§5); releasing its vendor lease does not free that slot.
+Each session has one lease and a registered thread ID. One shared server holds
+one of the runtime's four connection slots for its life; a turn on a live
+server pins it and takes no further slot (C2 §3 connection admission). No
+lease or outstanding-RPC admission cap applies beyond the runtime's bounds:
+resident lanes, eight controls per driver (two reserved for interrupt and
+unsubscribe, sized for their maximum encodings) and eight pending server
+requests per connection. Request IDs are never reused; request records are
+server-owned (the handshake) or lease-owned, held by value, kept until their
+reply or the connection's retirement, and share the correlation budget, whose
+exhaustion retires the connection. Idle leases can detach and later reopen; no
+unbounded map of every historical thread remains in memory.
 
 Releasing one lease calls `thread/unsubscribe`, never closes stdin or kills
 the server. Its `unsubscribed`, `notSubscribed` and `notLoaded` results prove
 detachment only: `CloseReport.vendor_closed` stays false and per-turn
 `exit` stays null for this shared-server route. Keep a lease while a turn
-or cleanup is pending. When the
-last lease releases, Host may retire the owned idle server; daemon stop
+or cleanup is pending. When the last lease, pin and reservation are released,
+the route retires the owned idle server through Host (stdin close, then Host's
+stop); daemon stop
 first stops admission and drains/cancels all leases, then performs its
 bounded owned-group shutdown. Follow runtime §5's anchor/identity rules.
 Server loss reaches every associated session; detached historical sessions
@@ -238,8 +248,9 @@ connection. This is connection failure, not an assertion of per-thread
 forced cancellation. Successful refusal must precede “declined” reporting.
 
 Start from an explicit environment allow-list: `HOME`, `PATH`, `USER`,
-`LOGNAME`, `LANG`, optional `XDG_RUNTIME_DIR`; VIA supplies a writable,
-user-private `CODEX_SQLITE_HOME` and its Host marker. The server itself uses
+`LOGNAME`, `LANG`, optional `XDG_RUNTIME_DIR`; VIA supplies
+`CODEX_SQLITE_HOME=<state>/vendor/codex` (0700, persistent across daemon
+restarts, also the server's cwd) and its Host marker. The server itself uses
 the user's vendor login state; VIA never reads/copies credential contents.
 The one exception is C2 §4.2's report-only leftover scan: it matches only
 the exact `VIA_PROCESS_MARKER` entry of a same-uid process started at or
@@ -280,28 +291,32 @@ correlation tombstones before classifying a thread or turn as unknown.
 Truly unknown thread IDs are connection diagnostics; genuinely unseen turn
 IDs on known threads may become C2 session-level observations. A previously
 accepted turn must never take either fallback. Untagged connection status
-does not get fabricated thread ownership. Evidence for the shared server
-(`logs`) is defined by this adapter's task under D4: it never returns
-another session's evidence.
+does not get fabricated thread ownership. The server's `stderr.log` and an
+undecoded message that names no turn go to the connection's evidence folder
+(runtime §4), which `logs` never returns (D4). A decode failure of the
+correlation fields fails the connection `protocol` for every associated
+session; one inside an open thread generation fails only that generation's
+nonterminal turns.
 
-Retain `(connection generation, threadId, turnId) → (session_id, TurnNo)`
-for every accepted turn until that connection retires. After settlement it
-is a tombstone, retaining unresolved-tool metadata and a bounded session
-observation sender independent of the vendor lease. Unsubscribe, close,
-uncertain settlement and a successor turn do not evict it. Thus an already
-received or later delivered completion after lease release is still
-attributed to its original turn: it still counts for P7 cleanup within
-the driver's window (C2 §4.1), and any durable observation it yields (`action.denied`,
-`vendor.request_declined`, `warning`) is committed with `late:true`. A tool
-completion alone is no event (C1 §6.1). `thread/unsubscribe` does not
-promise more vendor notifications. A detached session's Core observation
-sink remains eligible for these late observations even though admission to
-that session is closed.
+Retain `(connection generation, threadId, turnId) → (session_id, TurnNo)` for
+every accepted turn until that connection retires. After settlement it is a
+tombstone, keeping its connection generation, unresolved-tool metadata and the
+session's observation sender while the session's driver is open. Unsubscribe,
+close, uncertain settlement and a successor turn do not evict it. An already
+received or later delivered completion is attributed to its original turn: it
+counts for P7 cleanup within the driver's window (C2 §4.1), and any durable
+observation it yields (`action.denied`, `vendor.request_declined`, `warning`)
+is committed with `late:true`, up to the driver's close cutoff (C2 §3). Items
+decoded after the cutoff are dropped and counted in connection diagnostics
+before they are decoded; tombstones still prevent misattribution, including to
+a reopened generation of the same thread, which waits for the old
+unsubscribe's reply on that connection. A tool completion alone is no event
+(C1 §6.1). `thread/unsubscribe` does not promise more vendor notifications.
 
 Cap active mappings plus tombstones at 1024 entries and 256 KiB per
-connection; retain at most the
-32 resident session sinks above. This deliberate bound avoids adding Store
-lookups to Routes. Reserve correlation space before writing turn/start.
+connection; retain session sinks only for open drivers. This deliberate bound
+avoids adding Store lookups to Routes. Reserve correlation space before
+writing turn/start.
 If reservation or unresolved-tool metadata admission fails, latch explicit
 connection `overflow`, stop new writes, notify every associated session and
 retire the connection through its owned lifecycle. Never evict a mapping
@@ -354,22 +369,27 @@ unchanged 1,024-message/4 MiB connection aggregate; this adds no buffer tier.
 These ingress lanes precede the existing C2 observation channel. The shared
 receiver uses nonblocking ingress admission: **the first full ingress-lane
 result immediately quarantines that thread's data lane**, without waiting
-for the 10-second C2 observation-stall timer. Latch a per-thread `overflow`
-health report containing the thread/lane generation, triggering original
-turn correlation, first unqueued message's sequence and a saturating count of
-omitted observations. The triggering turn identifies lost evidence, not
-the entire failure target.
+for the 10-second C2 observation-stall timer. Latch the driver's sticky
+`ObservationOverflow` health. The thread/lane generation, triggering original
+turn correlation, first unqueued message's sequence and saturating omitted
+count form the driver's `ObservationLoss`, which goes to connection
+diagnostics and to Core with every affected turn's result and every close of
+the driver. The triggering turn identifies lost evidence, not the entire
+failure target.
 
-Core applies sticky continuity loss to **every nonterminal turn whose
-submission belongs to that quarantined thread generation**, including a
-successor A2 when an old, already settled A tool triggers overflow. Resolve
-A2 promptly under C1 disposition precedence and request interrupt through
-reserved control; do not wait for A2's wall deadline. Preserve A's immutable
-envelope and attribute its late-event loss to A. Close same-thread dispatch
-until detach and clean reopen; unsent queued work retains C1 queue/unknown-
-predecessor rules and is never treated as submitted merely by this failure.
-Health includes the generation, so an in-flight start/acceptance race cannot
-escape continuity-loss handling. Existing queued observation prefixes retain
+The driver ends **every nonterminal turn whose submission belongs to
+that quarantined thread generation**, including a successor A2 when an
+old, already settled A tool triggers overflow: it posts its interrupt
+cleanup intent (written even after A2 settles, once the `turnId` is
+known) and returns at once, without waiting for A2's wall deadline; Core
+commits each disposition under C1 precedence with the `observations_lost`
+warning. Preserve A's immutable envelope; A's late-event loss is one
+`late` `warning` event on A. Close same-thread dispatch until the driver
+is retired and a clean reopen; unsent queued work retains C1
+queue/unknown-predecessor rules and is never treated as submitted merely
+by this failure. Quarantine is tied to the lane generation the driver
+registered, so an in-flight start/acceptance race cannot escape
+continuity-loss handling. Existing queued observation prefixes retain
 their ordering. Do not enqueue lost observations into B's lane or start an
 unbounded spill queue.
 
@@ -377,8 +397,9 @@ While quarantined, continue reading and counting A's traffic, then
 discard it (C2 §4), pairing responses and declining requests on reserved
 paths; do not produce further ordinary A observations. Its bounded
 correlation/tool metadata remains owned by A, with continuity marked
-incomplete; do not infer quiescence from the surviving subset. Core records
-explicit normalized-event loss with the overflow. VIA keeps no copy of
+incomplete; do not infer quiescence from the surviving subset. The
+`observations_lost` warning records the normalized-event loss publicly (C1
+§5). VIA keeps no copy of
 vendor traffic beyond the bounded decode-failure evidence (runtime §4). B's ordinary lane and
 control replies remain independently serviceable. Quarantine remains until
 that thread detaches; a later reopen uses a new lane generation and never
@@ -393,13 +414,17 @@ quarantine transition if ingress has not already overflowed. Thus C2 stall
 and Route ingress exhaustion are distinct stages, not two deadlines for
 one full queue. A full C2 channel with no further ingress waits for that
 timer; continued ingress may exhaust its staging earlier.
-Independent sticky health delivery bypasses data lanes. Codex observation/staging
-lanes and retained tool metadata are fixed per-server buffers. Measure the expanded
-aggregate budget for 32 loaded leases and the maximum concurrent active
-turns that per-connection admission allows (one per leased session, so up to
-32 on one server; C2 §3); do not
-preallocate 4 MiB for every idle lease or assume S1's RSS result covers this
-extension. Retain the runtime's 256 MiB RSS acceptance target; a failure
+Independent sticky health delivery bypasses data lanes. Per server,
+Codex staging (shared by Wire's queue and the ingress lanes through
+staging permits) and correlation records are fixed buffers; per
+session, retained tool metadata is charged to that session's
+observation budget. No lease cap bounds active turns on one server below
+the runtime's unresolved-turn bound. The RSS measurement uses one server
+with 32 leased sessions and 32 concurrent active turns, applies runtime
+§8's relative method and growth assertion with these holders added, and
+qualifies only up to 32 concurrent active turns on one server; four
+loaded servers are an extrapolation. Do not preallocate 4 MiB for every
+idle lease or assume S1's RSS result covers this extension. A failure
 requires design review, not silent ceiling growth.
 
 ## 6. Cancellation and cleanup (P7)
@@ -493,7 +518,7 @@ time; retain raw-span evidence for every scenario.
 | `codex_steer_precondition` | Active matching ID returns injected; stale/idle/submitting/raced terminal handled; one vendor turn only; mismatched steer reply never succeeds. |
 | `codex_never_ask` | Each six-body reply validates against its pinned schema; legacy/unknown/auth requests get -32601; no grants; 5 s deadline holds while data lane full; failed write never recorded as successful decline. |
 | `codex_bound_gate` | Every admitted start contains never, user reviewer and explicit current bound; inheritance/reset and reserved-key refusal; limited bounds refused until proof flag enabled; full+network:false always refused. Frozen non-null `instructions` are sent byte for byte as `developerInstructions` on `thread/start` and in the canonical thread settings of every `thread/resume`; null instructions send none. |
-| `codex_two_threads` | Interleave A/B IDs and repeated item IDs; each observation stays in its owner; A cancel/unsubscribe leaves B running; unknown thread never leaks; equal-key acquisition launches one owned process. Deliver an A completion after uncertain settlement and again after A lease release while B is active: both retain A's original TurnNo and late:true, never session-level/B; tombstone count/byte exhaustion causes explicit connection overflow, no eviction or reassignment. |
+| `codex_two_threads` | Interleave A/B IDs and repeated item IDs; each observation stays in its owner; A cancel/unsubscribe leaves B running; unknown thread never leaks; equal-key acquisition launches one owned process. Deliver an A completion after uncertain settlement with A's driver open: it keeps A's original TurnNo and late:true; queue an A durable item when A's driver closes: it is committed late:true before A's lane ends; deliver another A completion after the close cutoff while B is active: it is dropped and counted, never session-level/B; reopen A on the same thread: it waits for the old unsubscribe's reply, and an old-turn item never reaches the new generation; tombstone count/byte exhaustion causes explicit connection overflow, no eviction or reassignment. |
 | `codex_cleanup_60s` | The driver applies the window from Core's `tool_grace`, not the stop order's `close_by`. With fake time and wall budget >60 s, ack plus open tool yields pending/no same-session dispatch at 59.999 s and uncertain terminal/warned successor at 60 s; a tool ending 20 s after acknowledgement settles `quiescent`; final completion settles early. c3 (interrupt only) settles `uncertain` at the window. Repeat with 1 s remaining wall budget: pending at 0.999 s, acknowledged/uncertain cancellation at 1 s, no extra wait. With zero remaining budget settle immediately. Late completion never mutates the terminal; no shared kill. |
 | `codex_control_races` | Interrupt during pending start; terminal-before-interrupt; ack missing; close/detach; all return by deadline with truthful evidence and no resend. |
 | `codex_bounds_overflow` | Exact boundary/excess messages, JSON depth/nodes and item ledger. Fill A's Route ingress lane then send one extra A event: observe immediate per-thread overflow/quarantine, original correlation and no spill allocation. Before advancing fake time to 10 s, deliver B's terminal and a control response; both must complete. Repeat with old A already immutable/uncertain and successor A2 active: old A's late tool flood triggers sticky loss for A2, A2 resolves before its wall deadline, A stays immutable, same-thread dispatch closes and B/control progress. Race A2 acceptance with quarantine and assert the same outcome. Separately fill only C2 observations with no further ingress: no early Route overflow, C2 stalls at 10 s. Continued A flood is read, counted and discarded within bounds, with the normalized loss explicit and no copy of the discarded traffic. Exhaust reserved metadata/health or global budget separately and assert explicit shared-connection failure; measure memory and blast radius. |
@@ -555,8 +580,10 @@ Applied; the adapter design (AD4) makes the window driver-applied from Core's
 **C1 P11; C2 A8 and §6.2 Process shape:**
 
 > Codex uses an owned stdio app-server shared by compatible leases with key
-> `(codex, observed_binary_version, config_hash)`; config_hash includes
-> VIA-controlled startup and environment configuration, not credentials.
+> `config_hash`; config_hash covers VIA-controlled launch settings (resolved
+> program path, arguments, passed environment, server cwd, protocol pin),
+> not credentials or binary contents; the observed binary version is
+> reported, not keyed.
 > The bound is excluded because sandboxPolicy is set explicitly on every
 > turn/start. Mixed-bound operation may be enabled only after the pinned
 > enforcement gate passes. Closing one session detaches its thread and

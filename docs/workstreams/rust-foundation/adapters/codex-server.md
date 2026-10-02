@@ -1,7 +1,8 @@
 # Codex server ownership and connection design (x.3.2 chunk X0)
 
-Status: revision 9, 2026-10-02, answering Sol review x32-x0-r9 (NOT
-SOUND, no Blocker: 1 Important, 2 Minor) on top of revision 7's
+Status: revision 9, SOUND at Sol r10; §9 applied to the specs after
+merging `rust-foundation` at `5b22f35` (2026-10-02). Revision 9 answered
+Sol review x32-x0-r9 (NOT SOUND, no Blocker: 1 Important, 2 Minor) on top of revision 7's
 simplification (Ruling C: no binary-change detection, an owner scope
 rule; Ruling D: crash-only handling of VIA's own panics in the Codex
 server owner, superseding r6 Ruling A) and revisions 1–8 (Sol r1–r8).
@@ -51,8 +52,8 @@ Sources:
   4 MiB retention bound; present and invalid, `reason:
   validation_limit`); a Codex turn's final text maps to it when a schema
   was requested (Core side X2, Codex side X3). X1 has the recipe's
-  `config_hash` (`codex/launch.rs`), whose binary-identity input item 3
-  removes; `RoutePlan.server_key` stays `None`
+  `config_hash` (`codex/launch.rs`), whose binary-identity input
+  via-xm2 (`5b22f35`) removed; `RoutePlan.server_key` stays `None`
   until X2/X3. This design does not re-amend the carrier; the §9.1 C2
   quotes still match C2 at `e567cc5`.
 
@@ -850,15 +851,15 @@ has no failed outcome to count.
   instructions, session cwd, effort, VIA version. The vendor version
   observed at the handshake is reported and checked against the
   supported versions (C2 §5), never hashed.
-- X1's merged `ServerRecipe::config_hash(adapter_version, identity)`
-  drops its `identity` input, and its test drops the identity case (X3).
+- X1's `ServerRecipe::config_hash` has no binary-identity input since
+  via-xm2 (`5b22f35`, invariant 13).
 - `prepare` and `launch_or_join` hash the driver's launch settings; no
   syscall.
 - J0's opaque `ServerKey(String)` (`RoutePlan.server_key`,
   `ServerReport.key`) holds the first 16 lowercase hex digits of the hash.
-- The C2 §5 refusal cache keeps its key: the binary identity `plan`
-  already stats for it, plus the recipe digest, which for Codex is
-  `config_hash` plus the bound and policy inputs.
+- The C2 §5 refusal cache keeps its key: the resolved program path plus
+  the recipe digest, which for Codex is `config_hash` plus the bound and
+  policy inputs.
 - `via-adapters` gains the workspace dependency `sha2` (shared with
   Claude's Q4).
 
@@ -1986,9 +1987,9 @@ schema numbering, R1-Q1 to R1-Q4) likewise.
 
 | Chunk | Tests |
 |---|---|
-| X1 | `config_hash` (item 3; its identity case is removed in X3); launch environment (item 4); decline bodies (item 11) |
+| X1 | `config_hash` (item 3); launch environment (item 4); decline bodies (item 11) |
 | X2 | Item 0: `pinned_join_needs_no_slot`, `queued_turn_reprepares_on_readiness`, `readiness_insert_between_prepare_and_wait`, `unsubmitted_lane_is_retired`. Item 1: `host_server_owner_outlives_turns`, `store_server_anchor_and_link`, `wire_server_open_has_no_turn_folder`, `link_turn_on_turn_owner_is_invalid`. Item 2: `daemon_idle_exit_not_blocked_by_idle_server`, `host_journal_uncertain_watch`. Item 4: bootstrap `vendor/`. Item 6: `recovery_server_anchor_proved_absent`, `recovery_server_anchor_unproven`, `recovery_unlinked_server_turn_sent_nothing`, `recovery_partial_settlement_rechecks_server_anchor`, `reprobe_ownerless_not_committed`, `shutdown_link_read_failure_still_stops_groups`, `shutdown_force_shared_is_unknown`, `shared_close_cleanup_from_turn_facts`, `spontaneous_uncertain_end_keeps_link`, `quiescent_terminal_releases_link`, `close_absence_check_ignores_server`. Item 12: the Wire tests of 12.5 (claim versus first byte, holds, expiry, permits). Item 13: `drain_admitted_yields_prefix_then_boundary`, `seal_is_exact_prefix`, `seal_is_idempotent`, `close_reports_stop_reply`. (The concurrent lane drain's test is K1's.) |
-| X3 | Registry and supervision unit tests: coalesced work, retained entries, the connection-task handoff, zero-holder publication, fenced launch and retirement, the supervisor's end at the fence, its handle at the cutoff, failed-task count, `close_deadline_leaves_normalizer_on_tracker`, the daemon-level `registry_panic_aborts_daemon`, and the subprocess tests `panic_hook_aborts_with_full_stderr`, `crash_on_panic_aborts_on_destruction` and `guard_during_unrelated_unwind_does_not_abort` (item 2); `config_hash` without the binary identity (item 3); classification including the generation-only branch (item 5); cleanup-intent tests (item 8.3); `codex_never_ask` additions (item 11); guard, budget, reserved-size and staging tests (item 12); `connection_task_panic_with_staged_terminal`, `connection_task_panic_idle_driver_reports_loss`, `abnormal_health_not_behind_delivery`, `blocked_normalizer_prefix_keeps_attribution`, `every_delivery_cutoff_seals`, `retained_terminal_wins_at_every_cutoff`, `seal_right_after_final_send_is_stable`, `seal_between_observations_of_one_message`, `successive_losses_keep_earliest_sequence`, `correlation_failure_is_protocol_not_unknown`, `first_failure_cause_wins` (item 13); symlinked `vendor/codex` (item 4); the replay join, `replay_mode_ack_with_empty_stdin` and `replay_paused_nonempty_pipe_waits` (item 14) |
+| X3 | Registry and supervision unit tests: coalesced work, retained entries, the connection-task handoff, zero-holder publication, fenced launch and retirement, the supervisor's end at the fence, its handle at the cutoff, failed-task count, `close_deadline_leaves_normalizer_on_tracker`, the daemon-level `registry_panic_aborts_daemon`, and the subprocess tests `panic_hook_aborts_with_full_stderr`, `crash_on_panic_aborts_on_destruction` and `guard_during_unrelated_unwind_does_not_abort` (item 2); classification including the generation-only branch (item 5); cleanup-intent tests (item 8.3); `codex_never_ask` additions (item 11); guard, budget, reserved-size and staging tests (item 12); `connection_task_panic_with_staged_terminal`, `connection_task_panic_idle_driver_reports_loss`, `abnormal_health_not_behind_delivery`, `blocked_normalizer_prefix_keeps_attribution`, `every_delivery_cutoff_seals`, `retained_terminal_wins_at_every_cutoff`, `seal_right_after_final_send_is_stable`, `seal_between_observations_of_one_message`, `successive_losses_keep_earliest_sequence`, `correlation_failure_is_protocol_not_unknown`, `first_failure_cause_wins` (item 13); symlinked `vendor/codex` (item 4); the replay join, `replay_mode_ack_with_empty_stdin` and `replay_paused_nonempty_pipe_waits` (item 14) |
 | X4 | `c4_two_sessions`, `codex_server_close`, two keys → two servers, `servers` (items 2, 3, 7); `codex_two_threads` cutoff, reopen, fence and lease-fence assertions (item 8); request-record exhaustion (item 9.1); `codex_server_lost_order`, `codex_transport_loss_is_unknown`, `stop_reply_missing_stays_transport`, `stdout_end_then_dead_on_stop_is_server_lost`, `server_loss_cleanup_not_blocked_by_inherited_stdout`, `overflow_failure_keeps_overflow_class` (item 13) |
 | X5 | `codex_bounds_overflow` additions and the Core loss helper (item 10); `codex_rss_leases` (item 9.2); decline deadline with the reader paused (items 11, 14); `CODEX_SQLITE_HOME` persists (item 4) |
 
@@ -2003,20 +2004,36 @@ schema numbering, R1-Q1 to R1-Q4) likewise.
 | `via-wire` | `open_connection` by owner; `turn_folder`; `link_turn`; `RuntimeConfig.vendor_state_dir`; on J0's queue: ticketed `StartBy` data slot, `Claimed`/`Started` states with the first byte under the lock, `withdraw`, `hold_data`; `StagingPermit`; cause-free idempotent `seal`, `drain_admitted`; `WireCloseReport.stopped_live`; journal-uncertain passthrough | X2 |
 | `via-core` | Item 0 dispatch order and readiness subscription; (the lane actor's concurrent drain during driver close is K1's); `Reconciled` server facts; partial-settlement meet; `FailureScope::Daemon` for ownerless proofs; shared force `unknown/unknown`; `journal_uncertain` latch; registry counts folded by the adapter set (no Core change); `link_released` from the committed terminal's cleanup; `record_loss` and `observations_lost` (`omitted: null` when unknown) | X2 (`record_loss`: X5) |
 | `via-routes` | `RouteRuntime` pass-throughs (X2); `codex::{Servers, supervisor, RegistryGuard (aborts on unwind), crash_on_panic, ServerPin, Lease, LeaseSignal, ConfigHash, DeclineTable, Connection, ConnectionFailure, ThreadTable, RequestTable, Feeder, TurnWrites}` | X3, X4 |
-| `via-adapters` | `codex::DECLINES`, launch recipe; `AnchorRecovery.owner`; `journal_uncertain()`; `ConnectionPin` payload; `SessionDriver::{readiness, connection_kind}`; `TurnEnd.loss`, `CloseReport.loss`; registry counts into `pending_tasks`/`failed_tasks`; `ServerRecipe::config_hash` without the binary identity; the driver's abnormal-end handler (loss and health at once, the earliest-sequence merge); the crash-only normalizer on the session's tracker, the prefix wait and the `DeliverySeal` (with a reserve-then-send path in `ObservationSink`) | X1, X2, X3, X4, X5 |
+| `via-adapters` | `codex::DECLINES`, launch recipe; `AnchorRecovery.owner`; `journal_uncertain()`; `ConnectionPin` payload; `SessionDriver::{readiness, connection_kind}`; `TurnEnd.loss`, `CloseReport.loss`; registry counts into `pending_tasks`/`failed_tasks`; the driver's abnormal-end handler (loss and health at once, the earliest-sequence merge); the crash-only normalizer on the session's tracker, the prefix wait and the `DeliverySeal` (with a reserve-then-send path in `ObservationSink`) | X1, X2, X3, X4, X5 |
 | `via-cli` | Bootstrap `<state>/vendor/`; the panic hook writing one `via.log` line (replaces the default, never chains it, file only, `try_lock`) | X2 |
 | `via-fake-agent` | Polling chunked reader, timed condition wait while paused, `expect_large`, `pause_input`/`resume_input`, acknowledged transitions | X3 |
 
 ---
 
-## 9. Amendment text for the coordinator
+## 9. Amendment text (applied)
 
-Exact text to apply before X2 starts. "Replace" quotes the current text:
-C2 as on `rust-foundation` after J0 (`14c0a0a`); runtime and C1 at
-`42ee47b` with K1's uncommitted amendments, which this section does not
-touch (C1 §5 envelope paragraph, C1 §7.6 late-terminal row and the
-paragraph after the table, runtime §6 `Unknown` sentence, runtime §7 Store
-failure paragraphs).
+**Applied** on `wt/x32-x0` after merging `rust-foundation` at `5b22f35`
+(via-mnx `e957482`, via-xm2 invariant 13): every amendment below is now in
+`docs/specs/adapter-contract.md`, `runtime-contracts.md`, `via-api-v1.md`
+and `vendors/codex.md`. Every quoted anchor still matched the merged text,
+so nothing was re-anchored. Differences from the text below:
+- runtime §6: the schema becomes v9 ("v8 lacked server anchors and the
+  turn → server-anchor link");
+- packet §2, Shared ownership: the old sentence "The hash covers the
+  resolved binary path and VIA-controlled startup arguments, effective
+  non-secret environment/path configuration and protocol pin." is removed,
+  since the added hash-input sentence replaces it;
+- packet §9, the applied "C1 P11; C2 A8 and §6.2 Process shape" record:
+  its key text now reads `config_hash` covering VIA-controlled launch
+  settings, not credentials or binary contents, the observed binary
+  version reported, not keyed;
+- inserted sentences joined their paragraphs and were rewrapped.
+
+The original framing: "Replace" quotes the text as it then stood (C2 on
+`rust-foundation` after J0, `14c0a0a`; runtime and C1 at `42ee47b` with
+K1's amendments, which this section does not touch: C1 §5 envelope
+paragraph, C1 §7.6 late-terminal row and the paragraph after the table,
+runtime §6 `Unknown` sentence, runtime §7 Store failure paragraphs).
 
 ### 9.1 C2 (`docs/specs/adapter-contract.md`)
 

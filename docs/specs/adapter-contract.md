@@ -71,7 +71,7 @@ the agent's responsibility: VIA stops only the agent and reports leftovers
 | A5 | ACP decline: choose a reject-kind option, else `cancelled`; never counted as enforcement | as written; shape unverified |
 | A6 | Auto-decline deadline 5 s, from Core config, served on the control path, one value for every adapter (AD17); fail closed when an unknown request cannot be answered, without fabricating a decline | as reviewed in Claude §10; AD17 withdraws the Codex and OpenCode packets' 1 s |
 | A7 | Codex live recovery is unsupported on owned stdio; `thread/resume` continues a conversation after a resolved turn, not an in-flight turn. `Dead` requires verified death, otherwise `Unknown`; no resend | as reviewed in Codex §9 |
-| A8 | Codex owned stdio server key: `(codex, observed_binary_version, config_hash)` where hash covers VIA-controlled startup/environment, not credentials; bound omitted due per-turn `sandboxPolicy`, mixed-bound use gated on pinned enforcement proof. OpenCode's key includes route revision, program path, cwd, profile identity/epoch, config/environment revisions, full effective bound, owning VIA session ID and durable private namespace; one owner per server, no cross-owner sharing or live-session migration (C1 P11) | as reviewed in Codex §9 and OpenCode §2 |
+| A8 | Codex owned stdio server key: `config_hash`, covering VIA-controlled launch settings (resolved program path, arguments, passed environment, server cwd, protocol pin), not credentials or binary contents; the observed binary version is reported, not keyed; bound omitted due per-turn `sandboxPolicy`, mixed-bound use gated on pinned enforcement proof. OpenCode's key includes route revision, program path, cwd, profile identity/epoch, config/environment revisions, full effective bound, owning VIA session ID and durable private namespace; one owner per server, no cross-owner sharing or live-session migration (C1 P11) | as reviewed in Codex §9 and OpenCode §2 |
 
 ## 1. Purpose and rules
 
@@ -121,10 +121,15 @@ immediate parent facades; no extra dependency edge is implied. Each owner
 retains task joins and sends failures through independent health, even if
 observations are full.
 The Wire-defined `RuntimeConfig` carries validated `anchor_binary` and
-`anchor_dir` paths through Route/Adapter aliases; per-harness settings and
+`anchor_dir` paths and the private `vendor_state_dir`
+(`<state>/vendor`, 0700, runtime §6.1) through Route/Adapter aliases; an
+adapter keeps vendor state only in its own subdirectory of
+`vendor_state_dir`, which it creates and validates under runtime §6.1's
+managed-directory rules; per-harness settings and
 fake fixture data remain Adapter-owned in the opaque `AdapterConfig`. No production Core/Adapter/Route call site splits resources,
-opens raw access or constructs Host. Wire creates each turn's evidence folder
-and owns its narrow connection. Operational Host, ProcessControl and
+opens raw access or constructs Host. Wire creates each submitted turn's
+evidence folder, and each shared server's connection evidence folder (runtime
+§4), and owns its narrow connection. Operational Host, ProcessControl and
 ProcessJournal re-exports/getters are removed from Wire,
 Route and Adapter facades; passive IDs, deadlines, errors and evidence DTOs
 remain available. Core supplies canonical IDs/prompt/deadline to Adapter,
@@ -156,6 +161,8 @@ impl AdapterSet {
     pub fn models(&self, harness: Option<&str>) -> Vec<ModelEntry>;              // bundled + discovered
     /// Pure, in-memory: the live shared servers for C1 `daemon/status.servers`; empty for per-turn routes.
     pub fn servers(&self) -> Vec<ServerReport>;
+    /// Sticky: some Host journal write's outcome was uncertain, including writes no driver owns.
+    pub fn journal_uncertain(&self) -> watch::Receiver<bool>;
     /// Logical: no vendor I/O. Attaches the session observation channel in `cx`.
     pub fn open_session(&self, session: &SessionRef, spec: SessionSpec, cx: SessionCx) -> SessionDriver;
     /// After daemon restart. Never submits input.
@@ -165,6 +172,9 @@ pub struct SessionCx { pub observations: ObservationSink /* A1: 1024 items, 4 Mi
                        pub tracker: TaskTracker, pub cancel: CancellationToken }
 impl SessionDriver {
     pub fn prepare(&self) -> Prepared;   // pins a live connection, or reports that a new one is needed (§3)
+    /// Changes whenever this driver's `prepare()` answer may change; None on per-turn routes (§3).
+    pub fn readiness(&self) -> Option<watch::Receiver<u64>>;
+    pub fn connection_kind(&self) -> ConnectionKind;
     pub async fn run_turn(&self, spec: TurnSpec, cx: TurnCx) -> TurnEnd;
     pub async fn steer(&self, input: SteerInput) -> Result<SteerDelivery, SteerError>;
     pub async fn close(&self, mode: CloseMode, deadline: Deadline) -> CloseReport;
@@ -172,13 +182,19 @@ impl SessionDriver {
     pub fn journal_uncertain(&self) -> watch::Receiver<bool>; // sticky: a journal write outside any turn was uncertain
 }
 pub enum Prepared { Pinned(ConnectionPin), NeedsConnection }
+pub enum ConnectionPin { Generation(u64), Server(ServerPin) }
+pub enum ConnectionKind { PerTurn, Shared }   // C1 §7.6 force rows
+pub struct ObservationLoss { pub trigger: (SessionId, TurnNumber), pub generation: u64,
+    pub first_unqueued: u64 /* lower bound: no earlier message lost */,
+    pub omitted: u64 /* saturating; u64::MAX: unknown or saturated */ }
 pub struct TurnCx { pub turn: TurnNumber, pub prepared: Prepared, pub capacity: Option<CapacityToken>,
     pub activity: TurnActivity, pub wall: Deadline, pub tool_grace: Duration /* C1 P7: 60 s */,
     pub stop: StopWatch, pub force: ForceWatch }
 pub struct TurnEnd { pub terminal: Option<VendorTerminal>,
     pub instance: Option<InstanceReport> /* once the handshake was read, on every outcome (§5) */,
     pub leftovers: Option<LeftoverReport> /* per-turn routes on every outcome, and `ServerLost` (§4.2) */,
-    pub outcome: Result<TurnEvidence, AdapterError> }
+    pub outcome: Result<TurnEvidence, AdapterError>,
+    pub loss: Option<ObservationLoss> /* shared-ingress routes: this generation lost observations (§4) */ }
 pub struct TurnEvidence { pub exit: Option<ExitReport>, pub cleanup: Cleanup, pub journal_uncertain: bool }
 pub enum Cleanup { Quiescent, Uncertain, Pending }
 pub enum Recovery { Resumed(SessionDriver), Unknown { reason: String }, Dead { evidence: String } }
@@ -200,19 +216,22 @@ pub struct VendorIdentity {
 | `SessionRef` | `harness`, `route`, `adapter_version`, handed back on resume, reopen and recovery; unknown or incompatible → `harness_unavailable` (rule 2) |
 | `SessionSpec` | `session_id`, `model`, `instructions: Option<Instructions>`, `initial_bound`, `cwd`, `vendor`, `inherit: {requested, effective}` (the inherited-configuration settings and states frozen at spawn, §6.2), `confirmed_vendor_session_id: Option<VendorSessionId>`, immutable `allow_untested`; a confirmed historical ID is not verification of this connection |
 | `TurnParams` | a resume turn's per-turn values (effort, bound, `output_schema`, `max_steps`, vendor keys) and their `sizes: ParamSizes` (the session's frozen instructions, the turn's effective schema, inherited or set), the input to `check_turn` |
-| `ServerReport` | `harness`, `vendor_version: Option<String>`, `key: ServerKey`, `sessions: u32` (sessions leasing it) |
+| `ServerReport` | `harness`, `vendor_version: Option<String>` (the server's handshake), `key: ServerKey` (Codex: 16 hex digits of its configuration hash), `sessions: u32` (sessions leasing it); only servers whose handshake succeeded and that are not retiring |
 | `TurnCheck` | `effective_bound`: the turn's bound as the route will apply it, like `RoutePlan.effective_bound` |
 | `TurnSpec` | `turn: TurnNo`, `prompt`, `effort`, `bound`, `output_schema`, `max_steps`, `vendor`, `wall_deadline: Instant`, `idle_deadline: IdleDeadline` |
 | `SteerInput` | `turn: TurnNo`, `token: SteerToken`, `text`, `expected_vendor_turn: Option<VendorTurnId>`; the driver checks `turn` atomically with control-lane admission (§2): `TurnMismatch` unless it is running that turn, `NoActiveTurn` when it runs none, so input never reaches a successor. Core mints `token`, unique within the session, before the call; the driver emits the `steer.delivered` observation carrying it before it returns `Ok`, and Core answers the C1 steer only after committing that observation (C1 §3.4) |
 | `SteerDelivery` | `Injected`, `Partial(Cow<'static, str>)` (real adapters pass static text; the fake passes its profile's text) |
 | `SteerError` | `Unsupported`, `NoActiveTurn`, `TurnMismatch`, `OverCapacity` (the control lane is full; nothing was written), `NotSteerable` (the vendor refused steer in the active turn's current phase; nothing was applied), `NotDelivered` (writing the input began, in part or whole, but the vendor never acknowledged it; whether it was applied is unknown), `NotRecorded { delivery }` (the vendor took the input whole, as `delivery` says, but its `steer.delivered` observation could not be emitted, for example on a full observation queue or a forced stop, so no event records it). A steer never outlives its turn: when the turn ends by any path, a forced stop or cutoff included, the driver answers every steer still waiting on it. Core maps them under C1 §3.4 |
-| `CloseReport` | `vendor_closed: bool`, `process_exit: Option<Exit>`, `cleanup: Cleanup`, `warnings`, `leftovers: Option<LeftoverReport>` (only when this close stopped the server, §4.2) |
+| `CloseReport` | `vendor_closed: bool`, `process_exit: Option<Exit>`, `cleanup: Cleanup`, `warnings`, `leftovers: Option<LeftoverReport>` (only when this close stopped the server, §4.2), `loss: Option<ObservationLoss>` (the driver's loss record, on every close, whatever closed it) |
+| `AnchorRecovery` | `anchor_id`, `generation`, `owner: ProcessOwner` (`Turn { session_id, turn }` or `Server { server_id }`), `cleanup`, `forced`: Host's passive facts for one committed anchor. A server anchor's facts reach a turn only through the turn → server-anchor link (runtime §6), and only as cleanup |
+| `ConnectionPin` | `Generation(u64)` (the fake's persistent profile) or `Server(ServerPin)` (a shared-server holder, keeping the server from idle retirement until the turn becomes a lease or the pin drops) |
+| `ObservationLoss` | the driver's sticky loss record for one thread generation: original triggering turn, generation, first unqueued message sequence (a lower bound: no earlier message of the generation was lost), saturating omitted count (`u64::MAX`: unknown or saturated). Recorded even when no turn of the driver is running, and then reported by its close. Core adds the `observations_lost` warning to each affected turn and commits one `late` warning event on a triggering turn already terminal (C1 §5) |
 | `VendorTerminal` | `at`, `status: Completed\|Interrupted\|Failed`, `stop_reason: StopReason`, `vendor_stop_reason`, `vendor_code?`, `class_hint: Option<ClassHint>`, `detail?`, `structured_output: Option<StructuredOutput>` (`Json(raw)`; `NotJson` when the route's structured output is text that does not parse as JSON, which Core treats as present and invalid with `reason: invalid`; `OverLimit` when a route that assembles it from text exceeds its 4 MiB retention bound, which Core treats as present and invalid with `reason: validation_limit`, C1 §5), `steps?`, `usage?` (turn aggregate), `cost?`, `vendor?` (bounded 16 KiB) |
 | `InstanceReport` | `vendor_version: Option<String>`, `version_status: Tested\|Untested` |
 | `ClassHint` | `Auth`, `RateLimit`, `ContextExceeded`, `BudgetExceeded`, `VendorError`, `Protocol`, `ResumeMismatch` |
 | `StopReason` | `EndTurn`, `MaxSteps`, `Budget`, `Refusal`, `Interrupted`, `Error`, `Other` |
 | `Refusal` | `kind: UnsupportedVerb\|BoundUnsupported\|HarnessUnavailable\|UnknownModel\|VersionRefused\|VendorOptionConflict\|InvalidParam { field }\|MissingCapability { verb }`, `message`, `verb: Option<Verb>`, `route` (every refusal) |
-| `AdapterError` | S1's `Route(RouteFailure)` causes (deadline, force stop, overflow, protocol, process exit, unknown submission), each with Route's exit, cleanup and force facts, plus `Rejected { reason: StartRejected, evidence: TurnEvidence }`, `ResumeMismatch { evidence: TurnEvidence }` (identity below), `ServerLost` (Host-confirmed death of a persistent server) and `TransportLost` (connection lost, server alive or unconfirmed). Every failure carries evidence, decided by the cleanup rules (the §2 cleanup table and §4.1), so the cleanup gate always has facts: a per-turn process's exit and group cleanup; a server route's reported tool items, server loss or close facts. On a server route a turn's `exit` is always `None`: the server's exit belongs to the server (`ServerLost` health), not to any one turn. While the server lives, a failed or rejected turn's cleanup is its reported tool items (`Quiescent` when every one ended, or none was reported; the §2 cleanup table); after a server crash it derives from Host's group evidence for the server's group: `Quiescent` only with positive `GroupAbsent` proof, otherwise `Uncertain`. On either kind of route, only a failure before any vendor launch has the no-launch evidence: `exit: None`, with `cleanup: Quiescent` only when Host's journal is complete (C1 §7.4), else `Uncertain` |
+| `AdapterError` | S1's `Route(RouteFailure)` causes (deadline, force stop, overflow, protocol, process exit, unknown submission), each with Route's exit, cleanup and force facts, plus `Rejected { reason: StartRejected, evidence: TurnEvidence }`, `ResumeMismatch { evidence: TurnEvidence }` (identity below), `ServerLost` (Host-confirmed death of a persistent server) and `TransportLost` (connection lost, server alive or unconfirmed). Every failure carries evidence, decided by the cleanup rules (the §2 cleanup table and §4.1), so the cleanup gate always has facts: a per-turn process's exit and group cleanup; a server route's reported tool items, server loss or close facts. On a server route a turn's `exit` is always `None`: the server's exit belongs to the server (`ServerLost` health), not to any one turn. While the server lives, a failed or rejected turn's cleanup is its reported tool items (`Quiescent` when every one ended, or none was reported; the §2 cleanup table); after a server crash it derives from Host's group evidence for the server's group: `Quiescent` only with positive `GroupAbsent` proof, otherwise `Uncertain`. On either kind of route, only a failure before any vendor launch has the no-launch evidence (on a server route, "launch" for a turn is its first vendor byte handed to Wire, after the turn's link to its server is durable; a turn that failed before it sent nothing to any server, so its cleanup is `Quiescent` unless its own server acquisition failed, when Host's acquisition evidence applies as on a private route): `exit: None`, with `cleanup: Quiescent` only when Host's journal is complete (C1 §7.4), else `Uncertain` |
 | `DriverFailure` | the sticky first cause of `DriverHealth::Failed`, published when detected, independent of observation delivery: protocol, transport loss, overflow (route or observation channel), Store, an owned task's failure, `ServerLost`, `ResumeMismatch`, `RetirementUncertain` (a launched persistent connection's retirement whose group cleanup is not proven quiescent, or whose journal write was uncertain; no turn reports it. An uncertain journal write is also published on the sticky `journal_uncertain()` watch, whatever the first cause, and Core latches Store failure on it, runtime §7), and `TurnAbandoned` (Core dropped a pending `run_turn`). A turn's own uncertain cleanup is reported in its `TurnEnd`, not as health |
 | `StartRejected` | `BoundUnsupported(String)`, `InvalidParam { field }` (§5), `VendorError(VendorCode, String)`, `SessionGone`, `Protocol(String)` |
 
@@ -324,6 +343,18 @@ Contract points:
   and latest state, plus at most one exit report per connection; it cannot be
   blocked by data/normalizer congestion. Host cleanup requests and reports
   traverse Adapter → Route → Wire → Host and back; Core does not call Host.
+  On a shared connection the route is Wire's only writer. A turn's queued
+  input (start, steer) is withdrawn when the turn ends by any path, its
+  `run_turn` dropped included, never cutting stdin; a write that started is
+  finished whole. After a turn settles no input of it is written, except a
+  cleanup interrupt admitted before settlement and the remainder of a
+  started line. Interrupt and unsubscribe are connection-owned cleanup
+  intents with reserved room in the driver's control budget, sized for
+  their maximum encodings, which steer cannot use. Pending server-request
+  replies and driver controls hold back new data messages, decided under
+  Wire's queue lock, so a reply waits for at most the data message already
+  started. A shared connection never uses the per-connection coalescing
+  interrupt.
 - **Close(Graceful)** ends the vendor session politely and detaches with the
   route's close recipe (§6.2); one session's close must not close a shared
   server's stdin. **Close(Force)** asks the verified anchor to stop its private
@@ -349,6 +380,19 @@ Contract points:
   non-submission or no vendor action. Core's turn recovery remains `unknown`
   and does not resend, even when cleanup is proven quiescent. Recovery
   carries no leftover report.
+  A shared server's anchor has no turn owner. Each server-route turn
+  records, before its first vendor byte, the server anchor it runs on
+  (runtime §6 `server_turns`). After a restart Core derives such a turn's
+  cleanup from that anchor's Host facts: `Quiescent` only with
+  `GroupAbsent`, and, when a `cancel.settled` of the turn is durable, only
+  when that settlement was `quiescent` as well. A recovered nonterminal
+  turn with no link sent nothing. Final shutdown folds a server anchor's
+  cleanup into every linked turn; a failed link read leaves those turns
+  `Uncertain` and never delays stopping groups. Server anchors are not
+  part of any session's `recover` facts; the Codex route returns
+  `Unknown`. A server anchor's absence proof that does not commit is a
+  daemon-scope Store failure: its slot stays held and the re-probe loop
+  retries it.
 
 ## 3. Division of responsibility
 
@@ -366,9 +410,14 @@ Contract points:
 
 **Connection admission (AD16).** A daemon connection slot (runtime §8: four)
 is held by each live connection: a per-turn process, a Codex shared server,
-or an OpenCode server. It is not held per turn. At dispatch, before the
-grant:
-1. Core calls `driver.prepare()`.
+or an OpenCode server. It is not held per turn.
+At dispatch, before the grant:
+1. Core opens the session's logical driver if it has none (no vendor
+   I/O; a lane opened for a turn that is then not submitted is retired
+   at once), takes its `readiness()` receiver, marks the epoch seen and
+   calls `prepare()`. While the turn then waits for a slot, Core keeps
+   that receiver; on each change it marks the epoch seen and calls
+   `prepare()` again, and stops waiting on `Pinned`.
 2. `Pinned` means a live connection is pinned against idle retirement until
    the turn ends, and needs no slot.
 3. `NeedsConnection` means Core reserves a slot exactly as S1 does, and Host
@@ -376,7 +425,15 @@ grant:
 4. A pinned connection that dies before submission ends the turn with a
    definite rejection (nothing was sent) and no retry.
 
-Idle retirement releases the slot. Codex: the last lease released. OpenCode:
+On a shared server, `Pinned` may name a live or still-launching server
+another session started; the pin (a reservation while launching) keeps it
+from idle retirement until the turn becomes the session's lease or the
+pin is dropped, and publication converts surviving reservations to pins
+atomically. Concurrent equal-key `NeedsConnection` turns launch one
+server; the others release their slots.
+
+Idle retirement releases the slot once Host proves the group absent.
+Codex: the last reservation, pin and lease released. OpenCode:
 the route's idle policy, defined in `via-4sw.3.2` within runtime §8.
 
 **Idle lanes.** To bound resident sessions (runtime §8), Core may close an
@@ -389,6 +446,17 @@ during an eviction joins it (C1 §3.6). Before the driver close starts, the
 C1 close takes it over: its mode and deadline apply, and its report goes
 to that close (§4.2). After, the C1 close waits for it; that driver close
 stays an idle-lane close.
+On a shared connection a driver's close takes effect at a cutoff in the
+connection's decode order: items decoded before it are handed to the
+session's channel within the close's deadline (the A1 no-drain timer
+still applies; what is not handed over is recorded as observation loss),
+Core's durable disposal of what was handed over then continues as C1
+§3.6 describes, and items attributed to the session after it are
+dropped and counted in the connection's diagnostics. Tombstones keep
+their connection generation, so a reopened thread never receives an
+older turn's items. A successor does not resume the same thread on the
+same connection until the old unsubscribe's reply arrived or the
+connection retired.
 
 ## 4. Observations and ordering
 
@@ -424,14 +492,20 @@ and cleanup evidence remain deliverable when observations are saturated.
 For Codex shared stdio, Route partitions its existing 1,024-message/4 MiB
 message staging into per-thread ingress lanes capped at 16 messages/1 MiB,
 before C2 observations. This adds no extra buffer tier. The first full lane
-immediately quarantines that thread generation, with sticky overflow health
-carrying lane generation, the original triggering turn, first unqueued message
-reference and saturating omitted count. The triggering turn identifies lost
-evidence; continuity loss applies to every **nonterminal** turn submitted in
-that generation, including a successor active after an older turn's late
-tool flood. Core promptly resolves affected turns under C1 precedence and
-requests interrupt, preserves older terminal envelopes, and closes same-thread
-dispatch until detach/clean reopen. Unsent queued turns retain C1 queue rules.
+immediately quarantines that thread generation and latches the driver's sticky
+`ObservationOverflow` health. The lane generation, the original triggering
+turn, the first unqueued message reference and the saturating omitted count
+form the driver's `ObservationLoss`, which goes to the connection's
+diagnostics and to Core through `TurnEnd.loss` and every `CloseReport.loss`.
+The triggering turn identifies lost evidence; continuity loss applies to every
+**nonterminal** turn submitted in that generation, including a successor
+active after an older turn's late tool flood. The driver ends each such turn
+itself: it posts its interrupt cleanup intent, never awaited or withdrawn, and
+returns at once with the overflow failure and cleanup `Uncertain`; Core
+commits each disposition under C1 precedence with the `observations_lost`
+warning. Older terminal envelopes are preserved, and same-thread dispatch
+closes until the driver is retired and reopened. Unsent queued turns retain C1
+queue rules.
 Other threads and reserved control continue. Quarantined data is still read
 and counted; normal observations stop. Retained tombstones and bounded
 metadata cannot be reassigned. Reserved-path or global budget exhaustion
@@ -528,6 +602,10 @@ separately from any cleanup reconciliation.
 vendor turn attribution (tombstones). Durable ones (denials, declines) are
 committed `late: true`. A `turn.late_terminal` for a turn that ended without
 a terminal revises `unknown` under C1 §7.6. Non-durable ones are dropped.
+On a shared server, late observations, a late terminal included, reach
+Core only up to the session's close cutoff (§3 idle lanes), attributed by
+the vendor turn ID recorded at acceptance; after it they are dropped and
+counted, and a late terminal is not applied.
 
 ### 4.2 Leftover report (AD20)
 
@@ -608,8 +686,11 @@ default.
   effect; it never waives unsupported bounds, protocol/identity checks,
   required capabilities or never-ask.
 - A persistent server keeps the version it reported at its own handshake, even
-  after the executable changes on disk. A new server key follows only for new
-  connections.
+  after the executable changes on disk. Whether a binary change makes a new
+  key is the route's key rule (A8).
+  Codex's key does not cover binary contents: a Codex binary replaced
+  under a live server is not detected, and takes effect at the next
+  server launch.
 
 The fake without a handshake profile never refuses: it reports
 `vendor_version: null` and `version_status: untested` with the warning "the
@@ -674,7 +755,7 @@ for exact validation; canonical never-ask, identity and bound settings win.
 
 | Operation | Claude `claude-cli` | Codex `codex-app-server` | OpenCode `opencode-serve` | Generic ACP |
 |---|---|---|---|---|
-| Process shape | one private `claude -p --input-format stream-json --output-format stream-json --verbose` process per VIA turn, persistent same vendor UUID across launches | owned shared `codex app-server` on stdio, key `(codex, observed_binary_version, config_hash)` excluding credentials and bound (A8); stdin stays open for leases | one owned server/private no-login namespace per VIA session: `opencode serve --pure --hostname 127.0.0.1 --port <explicit-port>`; private HOME/all XDG roots including DATA and absolute private `OPENCODE_DB`; generated password in daemon memory/launch env; authenticated health/version after Host provenance; no cross-owner sharing or foreign attach (§§2–3) | per-session agent process over stdio |
+| Process shape | one private `claude -p --input-format stream-json --output-format stream-json --verbose` process per VIA turn, persistent same vendor UUID across launches | owned shared `codex app-server` on stdio, key `config_hash` (VIA-controlled launch settings) excluding credentials and bound (A8); stdin stays open for leases | one owned server/private no-login namespace per VIA session: `opencode serve --pure --hostname 127.0.0.1 --port <explicit-port>`; private HOME/all XDG roots including DATA and absolute private `OPENCODE_DB`; generated password in daemon memory/launch env; authenticated health/version after Host provenance; no cross-owner sharing or foreign attach (§§2–3) | per-session agent process over stdio |
 | `describe` | bundled catalog; last version seen from an init for this program path, else `null`/`untested` (§5); no vendor process/file write or model prompt | bundled effort mapping; last version seen and the `model/list` catalog cached from a live instance (§5); no process/file write during describe | bundled profile; last version seen from a live server's health and its cached `/provider` catalog (§5); no hidden process/file write during describe (§3) | agent version; cached `initialize` capabilities from the last probe |
 | `open_session` (logical) and the first `run_turn` of a connection generation | logical open keeps the expected UUID unverified before input; every per-turn launch applies frozen flags, matching init/non-rejection result confirms identity; pre-init rejection does not | version from `initialize` (§5); initialize without notification opt-outs; `thread/start` with explicit model/cwd/instructions/sandbox, `approvalPolicy:"never"`, `approvalsReviewer:"user"`, `ephemeral:false`; `thread/resume` exact ID/current sandbox/`excludeTurns:true` and verify identity/policy | persist one owner/key/namespace mapping before vendor creation; subscribe SSE, `POST /session?directory=<cwd>`, persist returned vendor ID; resume verifies exact ID and directory in retained namespace (§§2, 4) | `initialize {protocolVersion, clientCapabilities:{fs:{readTextFile:false,writeTextFile:false},terminal:false}}`; `session/new {cwd, mcpServers:[]}`; reopen `session/load` when `loadSession` (docs) |
 | `run_turn` submission | launch one process with frozen effective settings and exact expected UUID, write one `user` line; Core holds queued prompts and never writes busy input; later launch uses `--resume` with same UUID even when settings are unchanged | `turn/start {threadId,input:[{type:"text",text}],cwd,model,effort,outputSchema,approvalPolicy:"never",approvalsReviewer:"user",sandboxPolicy}` → paired `turn.id`; full frozen structured policy on every turn | one caller `messageID`, then one `POST /session/{id}/prompt_async`; HTTP 204 is acceptance only, terminal SSE must correlate; no resend after uncertainty (§4) | `session/prompt {sessionId, prompt:[{type:"text",text}]}` (docs) |
@@ -799,8 +880,17 @@ opt-in live check, never in the default gate):
    conditions. Tool completion and other evidence may arrive afterward and
    keep the original turn ID; a durable observation is committed `late` after
    Core terminal commit.
-7. A decode failure saves the message to the turn's evidence folder before
-   the route fails `protocol`.
+7. A decode failure is a typed-schema failure; well-formed traffic for an
+   unknown thread, untagged connection traffic and items of a closed
+   generation are not. When the message's correlation fields fail, its
+   first 64 KiB go to the connection's evidence folder, which `logs` never
+   returns, and the connection fails `protocol` for every associated
+   session, whose failure messages name no path. When the correlation names
+   an open generation and a turn, they go to that turn's evidence folder;
+   when it names an open generation but no turn, to the connection's
+   evidence folder, with no turn credited. Either way the generation's
+   nonterminal turns fail `protocol`; a terminal turn's envelope is not
+   rewritten.
 8. Unknown notifications → activity only; unknown requests are declined
    within the 5 s control deadline with `vendor.request_declined`, or the
    connection fails closed with explicit evidence. No fabricated decline or
