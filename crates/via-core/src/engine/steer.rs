@@ -9,10 +9,12 @@
 //! or by a daemon restart, gets the uncertain outcome; the input is never
 //! sent again.
 
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 use std::{borrow::Cow, collections::HashMap, sync::Mutex as StdMutex};
 
 use serde_json::{Value, json};
-use tokio::sync::watch;
+use tokio::{sync::watch, task::JoinSet};
 use via_adapters::{SteerDelivery, Verb};
 use via_store::{KeyedOperation, OperationVerb, SteerIntent, SteerOutcome, StoreError};
 
@@ -89,6 +91,77 @@ fn replay(stored: Value, frozen: &Frozen) -> Result<Value, ApiError> {
     })
 }
 
+/// The keyed steer attempts, which the Engine owns, never their callers
+/// (runtime §2, K2 r2 #1). Each runs as a task of the set until its result
+/// is collected: a finished one at the next spawn, the rest at final
+/// shutdown ([`Self::join`]). A failed attempt, one that panicked, is
+/// counted, and final shutdown reports the count.
+#[derive(Default)]
+pub(super) struct KeyedAttempts(StdMutex<AttemptSet>);
+
+#[derive(Default)]
+struct AttemptSet {
+    tasks: JoinSet<()>,
+    /// Collected attempts that failed.
+    failed: usize,
+}
+
+impl AttemptSet {
+    /// Collects every finished attempt without waiting.
+    fn collect_finished(&mut self) {
+        while let Some(result) = self.tasks.try_join_next() {
+            if result.is_err() {
+                self.failed += 1;
+            }
+        }
+    }
+}
+
+impl KeyedAttempts {
+    /// Runs `attempt` as the set's task, after collecting the finished
+    /// ones, so the set holds only attempts still running and the
+    /// unreported ones.
+    fn spawn(&self, attempt: impl Future<Output = ()> + Send + 'static) {
+        let mut set = lock(&self.0);
+        set.collect_finished();
+        set.tasks.spawn(attempt);
+    }
+
+    /// Final shutdown (runtime §6.2): collects the attempts until `by`, and
+    /// returns how many had not ended then and how many failed, ever. One
+    /// still running at `by` is counted, then aborted: it holds neither the
+    /// Engine, nor so its Store, nor the report past the deadline, and its
+    /// intent, if any, stays open for restart recovery.
+    pub(super) async fn join(&self, by: tokio::time::Instant) -> (usize, usize) {
+        let mut tasks = std::mem::take(&mut lock(&self.0).tasks);
+        let mut failed = 0;
+        let _ = tokio::time::timeout_at(by, async {
+            while let Some(result) = tasks.join_next().await {
+                if result.is_err() {
+                    failed += 1;
+                }
+            }
+        })
+        .await;
+        while let Some(result) = tasks.try_join_next() {
+            if result.is_err() {
+                failed += 1;
+            }
+        }
+        let mut set = lock(&self.0);
+        set.failed += failed;
+        // Attempts spawned while the join ran are past the deadline too.
+        set.collect_finished();
+        let pending = tasks.len() + set.tasks.len();
+        let late = std::mem::take(&mut set.tasks);
+        let failed = set.failed;
+        drop(set);
+        // Dropping a set aborts its tasks.
+        drop((tasks, late));
+        (pending, failed)
+    }
+}
+
 /// The keyed steers whose first attempt is in flight, by session and key:
 /// a repeat waits on the attempt's watch, which closes when it ends.
 #[derive(Default)]
@@ -127,13 +200,38 @@ impl Drop for Attempt<'_> {
     }
 }
 
+/// Test builds: a keyed steer attempt that stalls at its start, forever.
+#[cfg(test)]
+pub(super) const ATTEMPT_STALLS: u8 = 1;
+
+/// Test builds: a keyed steer attempt that waits at its start for
+/// `steer_attempt_release`, then panics.
+#[cfg(test)]
+pub(super) const ATTEMPT_PANICS: u8 = 2;
+
 impl Engine {
+    /// Test builds: the fault a keyed steer attempt meets at its start.
+    #[cfg(test)]
+    async fn attempt_fault(&self) {
+        let fault = self.faults.steer_attempt.load(Ordering::Acquire);
+        if fault == 0 {
+            return;
+        }
+        self.faults.steer_attempt_entered.notify_one();
+        if fault == ATTEMPT_STALLS {
+            std::future::pending::<()>().await;
+        }
+        self.faults.steer_attempt_release.notified().await;
+        panic!("injected keyed steer attempt failure");
+    }
+
     /// C1 §3.4 `steer` under `op_key`, after authentication and the latch:
-    /// the attempt ([`Self::keyed_attempt`]) runs on its own task, so the
-    /// caller going away, its future dropped, ends none of it (K2 r1 #1):
-    /// its intent, its delivery and the lane's commit of its
-    /// `steer.delivered` with its outcome, or its refusal's record, all
-    /// happen whatever the caller does.
+    /// the attempt ([`Self::keyed_attempt`]) runs as the Engine's own task
+    /// ([`KeyedAttempts`]), so the caller going away, its future dropped,
+    /// ends none of it (K2 r1 #1): its intent, its delivery and the lane's
+    /// commit of its `steer.delivered` with its outcome, or its refusal's
+    /// record, all happen whatever the caller does. An attempt that failed,
+    /// or that final shutdown ended, answers `store_error`.
     pub(super) async fn keyed_steer(
         &self,
         params: SteerParams,
@@ -144,13 +242,12 @@ impl Engine {
         let Some(engine) = self.me.upgrade() else {
             return Err(ApiError::STORE);
         };
-        let attempt = tokio::spawn(async move { engine.keyed_attempt(params, &frozen, key).await });
-        match attempt.await {
-            Ok(answer) => answer,
-            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-            // The runtime is ending under the daemon.
-            Err(_) => Err(ApiError::STORE),
-        }
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        self.keyed_attempts.spawn(async move {
+            // The caller may be gone: the attempt's work is done either way.
+            let _ = reply.send(engine.keyed_attempt(params, &frozen, key).await);
+        });
+        answer.await.unwrap_or(Err(ApiError::STORE))
     }
 
     /// A keyed steer's attempt. Under `admission`, before any route or
@@ -172,6 +269,8 @@ impl Engine {
         frozen: &Frozen,
         (op_key, identity): (String, via_store::Identity),
     ) -> Result<Value, ApiError> {
+        #[cfg(test)]
+        self.attempt_fault().await;
         let key = (params.session.clone(), op_key);
         loop {
             let admission = self.admission.lock().await;

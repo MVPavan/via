@@ -9272,3 +9272,77 @@ fn a_keyed_steer_retains_a_transient_refusal() {
         dispatching.await.unwrap();
     });
 }
+
+/// K2 r2 #1 (runtime §2): a keyed steer attempt is the Engine's, not its
+/// caller's. Its caller cancelled, the attempt then panics: final shutdown
+/// collects it as a failed join and is not clean.
+#[test]
+fn a_cancelled_keyed_steers_panicking_attempt_is_a_failed_join() {
+    let Some(root) = child("a_cancelled_keyed_steers_panicking_attempt_is_a_failed_join") else {
+        return;
+    };
+    let scenario = json!({"profile": steer_profile(&json!({})), "scripts": []});
+    run(async {
+        let engine = open_fake(&root, &scenario);
+        let session = new_session(&engine).await;
+        engine
+            .faults
+            .steer_attempt
+            .store(super::steer::ATTEMPT_PANICS, Ordering::Release);
+        let raw = json!({"session":session.as_str(),"handle":HANDLE,"text":"x","op_key":"k-1"});
+        let caller = steer_task(&engine, &raw);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            engine.faults.steer_attempt_entered.notified(),
+        )
+        .await
+        .expect("the attempt starts");
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        engine.faults.steer_attempt_release.notify_one();
+        let report = shutdown(&engine).await;
+        assert_eq!(report.failed_tasks, 1, "{report:?}");
+        assert!(!report.is_clean());
+    });
+}
+
+/// K2 r2 #1 (runtime §2, §6.2): a keyed steer attempt whose caller was
+/// cancelled stalls past final shutdown's deadline. Shutdown reports it
+/// unjoined, ends by its deadline, and the attempt then holds no Engine,
+/// so its Store can be released.
+#[test]
+fn a_cancelled_keyed_steers_stalled_attempt_is_unjoined_at_shutdown() {
+    let Some(root) = child("a_cancelled_keyed_steers_stalled_attempt_is_unjoined_at_shutdown")
+    else {
+        return;
+    };
+    let scenario = json!({"profile": steer_profile(&json!({})), "scripts": []});
+    run(async {
+        let engine = open_fake(&root, &scenario);
+        let session = new_session(&engine).await;
+        engine
+            .faults
+            .steer_attempt
+            .store(super::steer::ATTEMPT_STALLS, Ordering::Release);
+        let raw = json!({"session":session.as_str(),"handle":HANDLE,"text":"x","op_key":"k-1"});
+        let caller = steer_task(&engine, &raw);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            engine.faults.steer_attempt_entered.notified(),
+        )
+        .await
+        .expect("the attempt starts");
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        let budget = super::latch::FINALIZE_RESERVE + Duration::from_secs(2);
+        let by = tokio::time::Instant::now() + budget;
+        let report = engine.shutdown(Deadline::at(by)).await;
+        assert!(
+            tokio::time::Instant::now() <= by + Duration::from_secs(1),
+            "shutdown ended by its deadline"
+        );
+        assert_eq!(report.pending_tasks, 1, "{report:?}");
+        assert!(!report.is_clean());
+        until(|| std::sync::Arc::strong_count(&engine) == 1).await;
+    });
+}

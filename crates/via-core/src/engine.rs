@@ -137,6 +137,8 @@ pub struct Engine {
     /// `Closing` (design §4 step 7, §6.6 [r3.5]); a confirmed `Closed`
     /// removes one. Changed only under `admission`.
     closing: StdMutex<HashSet<SessionId>>,
+    /// The keyed steer attempts, joined at final shutdown (runtime §2).
+    keyed_attempts: steer::KeyedAttempts,
     /// Keyed steers whose first attempt is in flight (C1 §3.4): a repeat
     /// waits for its outcome.
     keyed_steers: steer::KeyedSteers,
@@ -248,6 +250,13 @@ struct Faults {
     steer_key_waiting: tokio::sync::Notify,
     /// Steer inputs handed to a driver.
     steer_calls: AtomicUsize,
+    /// What the next keyed steer attempts do when they start
+    /// ([`steer::ATTEMPT_STALLS`], [`steer::ATTEMPT_PANICS`]); 0, nothing.
+    steer_attempt: std::sync::atomic::AtomicU8,
+    /// Notified when a keyed steer attempt enters its fault.
+    steer_attempt_entered: tokio::sync::Notify,
+    /// Lets a keyed steer attempt held by its fault go on, to panic.
+    steer_attempt_release: tokio::sync::Notify,
 }
 
 /// Committed facts of a turn whose execution a force stop abandoned.
@@ -434,6 +443,7 @@ impl Engine {
             recovered: slots::RecoveredSlots::default(),
             closing: StdMutex::new(HashSet::new()),
             keyed_steers: steer::KeyedSteers::default(),
+            keyed_attempts: steer::KeyedAttempts::default(),
             final_shutdown: watch::Sender::new(false),
             dispatching: StdMutex::new(HashSet::new()),
             limits,

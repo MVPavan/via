@@ -539,6 +539,12 @@ impl Engine {
         )
         .await
         .is_ok();
+        // K2 r2 #1 (runtime §2, §6.2): the keyed steer attempts, which the
+        // lanes' end has answered, are joined by the same bound.
+        let (attempts_pending, attempts_failed) = self
+            .keyed_attempts
+            .join(host_by.max(tokio::time::Instant::now()))
+            .await;
         // A dispatcher that has not joined still owns its session: none of
         // its turns is settled here, and they stay unresolved for restart
         // recovery (design §6.8 step 3).
@@ -582,8 +588,11 @@ impl Engine {
             // owns what its channel has, and a turn it still runs (Sol r3
             // N5): pending work, never dropped. A turn it runs is in no
             // step above until its run hands it over.
-            pending_tasks: report.pending_tasks + usize::from(!drivers_joined) + undrained,
-            failed_tasks: report.failed_tasks,
+            pending_tasks: report.pending_tasks
+                + usize::from(!drivers_joined)
+                + undrained
+                + attempts_pending,
+            failed_tasks: report.failed_tasks + attempts_failed,
             failure: report.failure,
             uncommitted_turns,
             unresolved_turns,
