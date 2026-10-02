@@ -61,11 +61,38 @@ pub struct Lane {
     /// The turn's effort: an instance whose handshake reports its catalog
     /// must list it (AD18).
     pub effort: Option<String>,
-    /// Where the persistent profile's retirement sends a terminal its
-    /// helper reports after a logical turn that retained none (C2 §4
-    /// `turn.late_terminal`); `None` drops it.
-    pub late: Option<oneshot::Sender<FakeLateTerminal>>,
+    /// Where the persistent profile's retirement sends what its helper
+    /// reported meanwhile ([`FakeRetired`]); `None` reads nothing.
+    pub retired: Option<oneshot::Sender<FakeRetired>>,
 }
+
+/// What the persistent profile's helper reported while it was retired,
+/// read in decode order up to its first terminal (C2 §4.1 late
+/// observations, §4 `turn.late_terminal`).
+#[derive(Default)]
+pub struct FakeRetired {
+    /// The durable messages (denials, declines) and, after a logical turn
+    /// that retained no terminal, that terminal, in decode order.
+    pub items: Vec<FakeRetiredItem>,
+    /// The failure that ended the reading: a message that does not decode,
+    /// kept in `undecoded.bin` as the turn's own reader keeps one, a failed
+    /// read, or more than the retirement keeps. The connection failed.
+    pub failure: Option<RouteError>,
+}
+
+/// One message of [`FakeRetired`].
+pub enum FakeRetiredItem {
+    /// A durable message, to be normalized as the turn's own are.
+    Durable(super::super::RouteMessage),
+    /// The terminal of a logical turn that retained none.
+    Terminal(FakeLateTerminal),
+}
+
+/// Most messages a retirement keeps, and their encoded bytes: the session
+/// channel's item and byte bounds (C2 A1). Past them the reading fails
+/// `overflow`.
+const RETIRED_ITEMS: usize = 1_024;
+const RETIRED_BYTES: usize = 4 * 1024 * 1024;
 
 /// A terminal the persistent profile's helper reported while it was
 /// retired, after its logical turn ended with no terminal (C2 §4
@@ -379,8 +406,8 @@ pub(super) struct LaneState {
     ack_evidence: bool,
     identity: Option<String>,
     effort: Option<String>,
-    /// Where a late terminal goes ([`Lane::late`]).
-    late: Option<oneshot::Sender<FakeLateTerminal>>,
+    /// Where the retirement's report goes ([`Lane::retired`]).
+    retired: Option<oneshot::Sender<FakeRetired>>,
 }
 
 impl LaneState {
@@ -407,7 +434,7 @@ impl LaneState {
             ack_evidence: false,
             identity: lane.identity,
             effort: lane.effort,
-            late: lane.late,
+            retired: lane.retired,
         }
     }
 
@@ -837,9 +864,8 @@ impl Serving<'_> {
     /// Retires the persistent profile's helper apart from the logical turn
     /// (decision H1): input closed, then Host's close under `by`, forced at
     /// once for a session close, then the drain. Meanwhile the helper's
-    /// output is read: after a logical turn that retained no terminal, the
-    /// first terminal it reports goes on the lane's `late` (C2 §4
-    /// `turn.late_terminal`); anything else is dropped.
+    /// output is read ([`read_retired`]) and its report goes on the lane's
+    /// `retired`.
     pub(super) async fn retire(
         &mut self,
         sender: &WireSender,
@@ -859,59 +885,99 @@ impl Serving<'_> {
         };
         // A half-close that failed leaves Host's close below to stop it.
         let _half_closed = sender.close_input(by).await;
-        let late = self
-            .lane
-            .late
-            .take()
-            .filter(|_| self.lane.facts.terminal.is_none());
+        let keep_terminal = self.lane.facts.terminal.is_none();
+        let retired = self.lane.retired.take();
         let close = sender.close(CloseRequest { mode, deadline: by });
-        let (report, ()) = tokio::join!(close, late_terminal(&mut messages, self.turn, late, by));
+        let read = async {
+            if retired.is_some() {
+                read_retired(&mut messages, sender, (self.turn, keep_terminal), by).await
+            } else {
+                FakeRetired::default()
+            }
+        };
+        let (report, read) = tokio::join!(close, read);
+        if let Some(retired) = retired {
+            // The driver's turn task is gone: nobody takes the report.
+            let _unread = retired.send(read);
+        }
         messages.finish(by).await;
         report
     }
 }
 
-/// Reads a retired helper's output until it ends, a message cannot be
-/// read or decoded, or `by`, and sends the first terminal it reports for
-/// `turn` on `late` (C2 §4 `turn.late_terminal`). Everything else is
-/// dropped: the logical turn already ended. Without `late` nothing is read.
-async fn late_terminal(
+/// Reads a retired helper's output for `turn` in decode order until it
+/// ends, its first terminal, a failure, or `by`. Its durable messages
+/// (denials, declines) are kept, and with `keep_terminal` its terminal;
+/// everything else is dropped, as the logical turn already ended. A
+/// message that does not decode is kept in `undecoded.bin` and, like a
+/// failed read, ends the reading with its cause; a stop order's wake, the
+/// daemon force and `by` end it quietly.
+async fn read_retired(
     messages: &mut WireMessages,
-    turn: TurnNumber,
-    late: Option<oneshot::Sender<FakeLateTerminal>>,
+    sender: &WireSender,
+    (turn, keep_terminal): (TurnNumber, bool),
     by: Deadline,
-) {
-    let Some(late) = late else {
-        return;
-    };
+) -> FakeRetired {
+    let mut retired = FakeRetired::default();
+    let mut bytes = 0_usize;
     let read = async {
         loop {
             let message = match messages.next_message().await {
                 Ok(Some(message)) => message,
-                // A stop order's wake: nothing was lost.
                 Err(via_wire::WireError::Woken) => continue,
-                Ok(None) | Err(_) => return None,
+                Ok(None) | Err(via_wire::WireError::Cancelled | via_wire::WireError::Deadline) => {
+                    return;
+                }
+                Err(error) => {
+                    retired.failure = Some(super::wire_cause(turn, &error));
+                    return;
+                }
             };
-            let Ok(payload) = FakeMessage::decode(message.bytes(), turn) else {
-                return None;
+            let payload = match FakeMessage::decode(message.bytes(), turn) {
+                Ok(payload) => payload,
+                Err(cause) => {
+                    let what = format!(
+                        "undecodable vendor message: {} bytes",
+                        message.bytes().len()
+                    );
+                    sender.keep_undecoded(message.bytes(), &what).await;
+                    retired.failure = Some(cause);
+                    return;
+                }
             };
-            if let FakeMessage::Terminal { vendor_turn_id, .. } = &payload {
+            let durable = matches!(
+                payload,
+                FakeMessage::Denial { .. } | FakeMessage::Decline { .. }
+            );
+            if durable {
+                bytes = bytes.saturating_add(message.bytes().len());
+                if retired.items.len() >= RETIRED_ITEMS || bytes > RETIRED_BYTES {
+                    retired.failure = Some(RouteError::Overflow { turn });
+                    return;
+                }
+            }
+            let message = super::super::RouteMessage {
+                payload,
+                steer: None,
+            };
+            if durable {
+                retired.items.push(FakeRetiredItem::Durable(message));
+            } else if let FakeMessage::Terminal { vendor_turn_id, .. } = &message.payload {
                 let vendor_turn_id = vendor_turn_id.clone();
-                let message = super::super::RouteMessage {
-                    payload,
-                    steer: None,
-                };
-                return super::terminal_evidence(&message).map(|terminal| FakeLateTerminal {
-                    vendor_turn_id,
-                    terminal,
-                });
+                if keep_terminal && let Some(terminal) = super::terminal_evidence(&message) {
+                    retired
+                        .items
+                        .push(FakeRetiredItem::Terminal(FakeLateTerminal {
+                            vendor_turn_id,
+                            terminal,
+                        }));
+                }
+                return;
             }
         }
     };
-    if let Ok(Some(terminal)) = tokio::time::timeout_at(by.instant(), read).await {
-        // The driver's turn task is gone: nobody takes the terminal.
-        let _unread = late.send(terminal);
-    }
+    let _ended = tokio::time::timeout_at(by.instant(), read).await;
+    retired
 }
 
 /// Builds the C2-lane result from Route's S1 result and the lane's facts.

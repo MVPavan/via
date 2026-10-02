@@ -7,7 +7,7 @@ use std::time::SystemTime;
 
 use serde_json::{Map, Value};
 use via_adapters::{Cleanup, TurnEvidence, VendorTerminal, VendorTerminalStatus};
-use via_store::{RevisionRecord, StoreError};
+use via_store::{CancelCause, RevisableTurn, RevisionRecord, StoreError};
 
 use super::journal::Head;
 use super::lane::Retained;
@@ -17,7 +17,7 @@ use super::progress::UsageLedger;
 use super::terminal::classify;
 use super::{Admission, Engine, Terminal, release_write_slot, write_slot};
 use crate::api::{Cost, Event, EventBody, Usage, Warning, rfc3339};
-use crate::intake::TurnPlan;
+use crate::intake::{Effective, Frozen, TurnPlan};
 use crate::{SessionId, TurnNumber};
 
 /// `turn.revised` `evidence` of a revision by a late vendor terminal.
@@ -30,22 +30,26 @@ struct Revised {
     revision: u32,
     /// The structured output's spill took the commit's one retry.
     retried: bool,
+    /// The revision names the `structured_output.json` it wrote.
+    spilled: bool,
 }
 
 impl Engine {
     /// Revises `session`'s turn `turn` by its late vendor terminal (C1
     /// §7.6): only while it is `unknown` and its end retained no terminal,
-    /// which the Store's guard holds to (a turn that kept its terminal, one
-    /// revised already or a closed session is left as it is). The state
-    /// is Core's classification of the late terminal as of an accepted
-    /// turn; a stored cancel the vendor's terminal answers is settled by
-    /// it. The present structured output is validated against the frozen
-    /// schema and spilled as at the turn's end (C1 Q2, §5). A revision not
-    /// committed is retried once at the same sequence and, failing again,
-    /// is not made: the failure is scoped to the turn. An uncertain or
-    /// corrupt outcome latches Store failure and is reconciled at restart
-    /// (runtime §7), never assumed absent. Nothing is written once Store
-    /// failure is pending.
+    /// which the Store's guard holds to (a turn never accepted, one that
+    /// kept its terminal, one revised already or a closed session is left
+    /// as it is). The state is Core's classification of the late terminal
+    /// as of an accepted turn; a stored cancel the vendor's terminal
+    /// answers is settled by it. The present structured output is
+    /// validated against the frozen schema and spilled as at the turn's
+    /// end (C1 Q2, §5); frozen values that do not decode are a corrupt row,
+    /// and the revision is declined. A revision not committed is retried
+    /// once at the same sequence and, failing again, is not made: the
+    /// failure is scoped to the turn, and the spill it wrote is removed.
+    /// An uncertain or corrupt outcome latches Store failure and is
+    /// reconciled at restart (runtime §7), never assumed absent; its spill
+    /// is kept. Nothing is written once Store failure is pending.
     pub(super) async fn revise(
         &self,
         session: &SessionId,
@@ -67,11 +71,16 @@ impl Engine {
                 return;
             }
         };
-        let plan = TurnPlan::of(&revisable.route, Some(&revisable.effective));
-        let Some(revised) = self
-            .revised((session, turn), &plan, revisable.envelope, late)
-            .await
-        else {
+        let Some(plan) = frozen_plan(&revisable) else {
+            // C1 Q2, design §7.3 (fix r1 #6): never validated against
+            // inputs that are absent only because they do not decode.
+            self.store_failure(FailureSite::CorruptRow, WriteOutcome::NotCommitted, scope)
+                .finish()
+                .await;
+            return;
+        };
+        let stored = (revisable.envelope, revisable.cancel_cause);
+        let Some(revised) = self.revised((session, turn), &plan, stored, late).await else {
             // The spill that the revision names failed, its retry too.
             self.store_failure(FailureSite::Revision, WriteOutcome::NotCommitted, scope)
                 .finish()
@@ -87,14 +96,25 @@ impl Engine {
         }
         let (slot, made) = write_slot(&self.sessions, session);
         let head = std::sync::Arc::clone(&slot.head);
+        let spilled = revised.spilled;
         let outcome = self
             .commit_revision((session, turn), &head, revised, &admission)
             .await;
         drop(head);
         release_write_slot(&self.sessions, session, &slot, made);
-        if let Some(outcome) = outcome {
-            self.store_failure(FailureSite::Revision, outcome, scope)
-                .finish_held(&admission);
+        let not_made = match outcome {
+            Ok(committed) => !committed,
+            Err(outcome) => {
+                self.store_failure(FailureSite::Revision, outcome, scope)
+                    .finish_held(&admission);
+                outcome == WriteOutcome::NotCommitted
+            }
+        };
+        drop(admission);
+        if spilled && not_made {
+            // C1 §5 (fix r1 #7): no commit names the file, so a later
+            // revision may write its own; best effort.
+            let _ = self.store.discard_structured_output(session, turn).await;
         }
     }
 
@@ -113,8 +133,8 @@ impl Engine {
 
     /// Commits `revised` at the session's next sequence on `head`, under
     /// `admission`; the retry, unless the spill took it, holds the same
-    /// head. The failed outcome to report, `None` once committed or
-    /// refused by the guard. A first attempt not committed is reported
+    /// head. Whether it committed (`false`: the guard refused it), or the
+    /// failed outcome to report. A first attempt not committed is reported
     /// here, before its retry.
     async fn commit_revision(
         &self,
@@ -122,10 +142,10 @@ impl Engine {
         head: &Head,
         mut revised: Revised,
         admission: &Admission<'_>,
-    ) -> Option<WriteOutcome> {
+    ) -> Result<bool, WriteOutcome> {
         let head = match head.lock(&self.store, session).await {
             Ok(head) => head,
-            Err(error) => return Some(WriteOutcome::of_read(&error)),
+            Err(error) => return Err(WriteOutcome::of_read(&error)),
         };
         let seq = head.next();
         let at = rfc3339(SystemTime::now());
@@ -143,7 +163,7 @@ impl Engine {
             },
         })
         .to_value() else {
-            return Some(WriteOutcome::NotCommitted);
+            return Err(WriteOutcome::NotCommitted);
         };
         // C1 §5: the range runs to the revision's event.
         if let Some(events) = revised.envelope.get_mut("events")
@@ -163,18 +183,18 @@ impl Engine {
             let error = match self.store.commit_revision(record).await {
                 Ok(()) => {
                     head.committed(1);
-                    return None;
+                    return Ok(true);
                 }
-                Err(StoreError::Refused(_)) => return None,
+                Err(StoreError::Refused(_)) => return Ok(false),
                 Err(error) => error,
             };
             let outcome = WriteOutcome::of(&error);
             if outcome.head_unknown() {
                 head.lost();
-                return Some(outcome);
+                return Err(outcome);
             }
             if !retry {
-                return Some(outcome);
+                return Err(outcome);
             }
             // The first attempt rolled back; the retry holds the same head.
             retry = false;
@@ -187,13 +207,16 @@ impl Engine {
         }
     }
 
-    /// The revised envelope of the turn's stored `envelope` by `late`:
-    /// `None` when the structured output it names could not be written.
+    /// The revised envelope of the turn's stored `envelope`, stopped by
+    /// the caller's `cause` if one did, by `late`: `None` when the
+    /// structured output it names could not be written. A spill whose
+    /// retry wrote it reports its first failure, scoped to the turn, as a
+    /// retried terminal's does (fix r1 #11).
     async fn revised(
         &self,
         (session, turn): (&SessionId, TurnNumber),
         plan: &TurnPlan,
-        mut envelope: Value,
+        (mut envelope, cause): (Value, Option<CancelCause>),
         late: &VendorTerminal,
     ) -> Option<Revised> {
         let mut retained = Retained::of(late);
@@ -204,6 +227,13 @@ impl Engine {
         let retried = self
             .spill_retained((session, turn), Some(&mut retained), true)
             .await?;
+        if retried {
+            let scope = FailureScope::Turn(session, turn);
+            self.store_failure(FailureSite::Revision, WriteOutcome::NotCommitted, scope)
+                .finish()
+                .await;
+        }
+        let spilled = retained.structured_output_file.is_some();
         // Only the exit comes from the evidence; the stored one stands.
         let evidence = TurnEvidence {
             exit: None,
@@ -211,7 +241,7 @@ impl Engine {
             journal_uncertain: false,
         };
         let mut terminal = classify(true, Some(late), Ok(evidence));
-        settle_cancel(&mut envelope, &mut terminal, late.status);
+        settle_cancel(&mut envelope, &mut terminal, (late.status, cause));
         if missing && terminal.state == "completed" {
             terminal.warnings.push(Warning::STRUCTURED_OUTPUT_MISSING);
         }
@@ -229,43 +259,63 @@ impl Engine {
             state,
             revision,
             retried,
+            spilled,
         })
     }
 }
 
-/// C1 §7.6 rows 1 and 3 for a stored cancel the late terminal answers: an
-/// interrupted terminal is the vendor's acknowledgement, so the turn is
-/// `cancelled`; any other ended on its own, ignoring the cancel. An
-/// outcome left `unknown` (a shared server's unanswered force) becomes
-/// `acknowledged` or `requested` accordingly; a proved one stands.
-fn settle_cancel(envelope: &mut Value, terminal: &mut Terminal, status: VendorTerminalStatus) {
+/// The plan of the revisable turn's frozen inputs, decoded strictly (C1
+/// Q2): `None` when its session's frozen values or the turn's effective
+/// values do not decode, a corrupt row.
+fn frozen_plan(revisable: &RevisableTurn) -> Option<TurnPlan> {
+    let frozen = Frozen::decode(&revisable.route)?;
+    let effective = serde_json::from_value::<Effective>(revisable.effective.clone()).ok()?;
+    Some(TurnPlan {
+        frozen,
+        effective: Some(effective),
+    })
+}
+
+/// C1 §7.6 late row for the stop the late terminal answers. Only a
+/// caller's `cancel` or `close` (its recorded `cause`) makes an interrupted
+/// terminal the vendor's acknowledgement, so the turn is `cancelled`; a
+/// Core deadline's, Store's or protocol's stop leaves it a vendor
+/// terminal, classified. A stored outcome `requested` or `unknown` becomes
+/// `acknowledged` for an interrupted terminal; for any other, which ended
+/// on its own, `unknown` becomes `requested`. `acknowledged` and `forced`
+/// stand.
+fn settle_cancel(
+    envelope: &mut Value,
+    terminal: &mut Terminal,
+    (status, cause): (VendorTerminalStatus, Option<CancelCause>),
+) {
+    let interrupted = status == VendorTerminalStatus::Interrupted;
+    if interrupted && cause.is_some() {
+        terminal.state = "cancelled";
+        terminal.failure = None;
+        terminal.stop_reason = "interrupted";
+    }
     let Some(cancel) = envelope
         .get_mut("cancel")
         .filter(|cancel| cancel.is_object())
     else {
         return;
     };
-    let interrupted = status == VendorTerminalStatus::Interrupted;
-    if interrupted {
-        terminal.state = "cancelled";
-        terminal.failure = None;
-        terminal.stop_reason = "interrupted";
-    }
-    if cancel.get("outcome").and_then(Value::as_str) == Some("unknown") {
-        cancel["outcome"] = if interrupted {
-            "acknowledged"
-        } else {
-            "requested"
-        }
-        .into();
-    }
+    let settled = match (interrupted, cancel.get("outcome").and_then(Value::as_str)) {
+        (true, Some("requested" | "unknown")) => "acknowledged",
+        (false, Some("unknown")) => "requested",
+        _ => return,
+    };
+    cancel["outcome"] = settled.into();
 }
 
 /// Writes the revision's facts into the stored envelope: `revision`, the
 /// state, failure and stop reasons, the structured output, and what the
 /// late terminal reports of steps, usage, cost and vendor data (AD4, AD6);
-/// its warnings are added once per code. The final text, timestamps,
-/// exit and cleanup stand: a vendor terminal carries no text.
+/// its warnings are added once per code. A usage aggregate supersedes the
+/// stored usage and its warning of an unverified interval (C1 §5). The
+/// final text, timestamps, exit and cleanup stand: a vendor terminal
+/// carries no text.
 fn apply(
     envelope: &mut Value,
     terminal: Terminal,
@@ -307,6 +357,10 @@ fn apply(
         );
         if let Ok(usage) = serde_json::to_value(usage) {
             members.insert("usage".into(), usage);
+            if let Some(Value::Array(warnings)) = members.get_mut("warnings") {
+                let interval = Warning::USAGE_INTERVAL_UNVERIFIED.code();
+                warnings.retain(|kept| kept.get("code").and_then(Value::as_str) != Some(interval));
+            }
         }
     }
     if let Some((usd, scope)) = &retained.cost

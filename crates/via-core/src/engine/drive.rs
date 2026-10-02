@@ -163,9 +163,14 @@ struct Control<'a> {
 }
 
 impl Control<'_> {
-    /// Keeps the turn's first own late terminal for its revision.
-    fn keep_late(&mut self, terminal: via_adapters::VendorTerminal) {
-        self.late.get_or_insert(terminal);
+    /// Keeps the turn's first own late terminal for its revision, when it
+    /// is `named`: it names a vendor turn that the lane attributed as
+    /// current, so the acceptance mapped it (fix r1 #2). One naming none is
+    /// the running turn's by position alone, which never revises a turn.
+    fn keep_late(&mut self, named: bool, terminal: via_adapters::VendorTerminal) {
+        if named {
+            self.late.get_or_insert(terminal);
+        }
     }
 }
 
@@ -918,9 +923,11 @@ impl Engine {
         // envelope warns.
         self.check_output(&effective, &mut record, &mut terminal)
             .await;
+        // Runtime §6: the caller's stop is kept for a `cancelled` or an
+        // `unknown` turn, which a late terminal may still settle.
         let cause = disposed
             .cancel_cause
-            .filter(|_| terminal.state == "cancelled");
+            .filter(|_| matches!(terminal.state, "cancelled" | "unknown"));
         // A terminal that did not commit reads `store_error` and latches.
         let _ = self.finish_with(started, (record, terminal), cause).await;
         self.revise_kept(&session, turn, control.late.take()).await;
@@ -1978,23 +1985,9 @@ impl Engine {
                     // establishes nothing.
                     return;
                 }
-                let correlation = acceptance_turn(&acceptance, vendor_turn.as_deref()).map_or_else(
-                    || format!("{TOKEN_CORRELATION}{}", acceptance.correlation.get()),
-                    |vendor_turn| format!("{VENDOR_CORRELATION}{vendor_turn}"),
-                );
-                let vendor_turn_id = acceptance
-                    .vendor_turn_id
-                    .as_ref()
-                    .map(|id| id.as_str().to_owned());
-                let running = lane.and_then(|lane| lane.driver.adapter_version());
-                let instance = acceptance.instance.map(instance_record);
-                self.observe_acceptance(
-                    record,
-                    slot,
-                    effective,
-                    (correlation, vendor_turn_id, running, instance),
-                )
-                .await;
+                let evidence = acceptance_evidence(acceptance, vendor_turn.as_deref(), lane);
+                self.observe_acceptance(record, slot, effective, evidence)
+                    .await;
             }
             Observation::Progress(marks) => {
                 // A refused item changes nothing; the run loop stops the
@@ -2051,8 +2044,10 @@ impl Engine {
             // what it did to the turn. An identity was handled before
             // attribution.
             // C1 §7.6: the turn's own late terminal, after its end, waits
-            // for the turn's terminal; only its first is kept.
-            Observation::LateTerminal(terminal) => control.keep_late(terminal),
+            // for the turn's terminal.
+            Observation::LateTerminal(terminal) => {
+                control.keep_late(lane.is_some() && vendor_turn.is_some(), terminal);
+            }
             Observation::IdentityConfirmed(_)
             | Observation::ResumeMismatch { .. }
             | Observation::VendorClosed(_) => {}
@@ -2933,6 +2928,27 @@ pub(super) fn current_progress(lane: &Lane, turn: TurnNumber, item: &Observation
 
 /// The vendor turn an acceptance names: its own vendor turn ID, else the
 /// item's.
+/// What an acceptance commits: its Store correlation (by the vendor turn
+/// it names, the item's, else its token), its own vendor turn ID, the
+/// running adapter's version and its instance.
+fn acceptance_evidence(
+    acceptance: Acceptance,
+    item: Option<&str>,
+    lane: Option<&Lane>,
+) -> AcceptanceEvidence {
+    let correlation = acceptance_turn(&acceptance, item).map_or_else(
+        || format!("{TOKEN_CORRELATION}{}", acceptance.correlation.get()),
+        |vendor_turn| format!("{VENDOR_CORRELATION}{vendor_turn}"),
+    );
+    let vendor_turn_id = acceptance
+        .vendor_turn_id
+        .as_ref()
+        .map(|id| id.as_str().to_owned());
+    let running = lane.and_then(|lane| lane.driver.adapter_version());
+    let instance = acceptance.instance.map(instance_record);
+    (correlation, vendor_turn_id, running, instance)
+}
+
 fn acceptance_turn(acceptance: &Acceptance, item: Option<&str>) -> Option<String> {
     acceptance
         .vendor_turn_id

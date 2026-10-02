@@ -460,6 +460,8 @@ pub struct RevisableTurn {
     pub effective: Value,
     /// The session's frozen route identity.
     pub route: SessionRoute,
+    /// The caller `cancel` or `close` that stopped the turn, if one did.
+    pub cancel_cause: Option<CancelCause>,
 }
 
 /// The revision of an `unknown` turn by late evidence (C1 §7.6), one
@@ -620,6 +622,15 @@ pub enum CancelCause {
 }
 
 impl CancelCause {
+    /// The recorded cause for its stored word.
+    fn of(word: &str) -> Option<Self> {
+        match word {
+            "cancel" => Some(Self::Cancel),
+            "close" => Some(Self::Close),
+            _ => None,
+        }
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             Self::Cancel => "cancel",
@@ -2161,7 +2172,7 @@ impl StoreClient {
 
     /// Commits `Closed` for a durably `closing` session: `session.closed`,
     /// the closed state and the close result, derived in the transaction
-    /// from the turns with `cancel_cause = 'close'` and the session's
+    /// from the `cancelled` turns with `cancel_cause = 'close'` and the session's
     /// unproven groups, plus a keyed close's result. Refused, not failed,
     /// while a turn of the session is queued or running.
     pub async fn commit_closed(&self, record: ClosedRecord) -> Result<ClosedOutcome, StoreError> {
@@ -2496,6 +2507,17 @@ impl StoreClient {
     ) -> Result<crate::StructuredOutputRef, StoreError> {
         crate::structured_output::write(&self.evidence, &self.blobs.tasks, session, turn, encoded)
             .await
+    }
+
+    /// Removes the turn's `structured_output.json` that no commit names: the
+    /// revision that wrote it is known not to have committed (C1 §5). A
+    /// file whose naming commit is uncertain is never removed.
+    pub async fn discard_structured_output(
+        &self,
+        session: &SessionId,
+        turn: TurnNumber,
+    ) -> Result<(), StoreError> {
+        crate::structured_output::discard(&self.evidence, &self.blobs.tasks, session, turn).await
     }
 
     /// A stored relative evidence folder made absolute; no I/O. Core gets

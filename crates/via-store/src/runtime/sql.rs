@@ -1699,8 +1699,10 @@ fn insert_terminal(
 /// `turn.revised` appended, only while the turn is `unknown` with an
 /// envelope naming no vendor stop reason (its end retained no terminal)
 /// and holding the revision before the new envelope's, and its session is
-/// not closed. A guard that does not hold is `Refused`. A `completed`
-/// revision needs the turn's acceptance, as a terminal does.
+/// not closed. A guard that does not hold is `Refused`. Any revision needs
+/// the turn's acceptance correlation: its late terminal is attributed only
+/// through the vendor turn recorded there (C1 §7.6). The turn's
+/// `cancel_cause` is kept.
 fn commit_revision(conn: &mut Connection, record: &RevisionRecord) -> Result<(), StoreError> {
     let state = record
         .envelope
@@ -1737,7 +1739,7 @@ fn commit_revision(conn: &mut Connection, record: &RevisionRecord) -> Result<(),
             "UPDATE turns SET state=?3,envelope=?4 WHERE session_id=?1 AND number=?2
                AND state='unknown' AND json_extract(envelope,'$.vendor_stop_reason') IS NULL
                AND coalesce(json_extract(envelope,'$.revision'),0)=?5-1
-               AND (?3!='completed' OR correlation IS NOT NULL)",
+               AND correlation IS NOT NULL",
             params![
                 record.session_id.as_str(),
                 record.turn.get(),
@@ -1873,12 +1875,13 @@ fn commit_closed(
 }
 
 /// C1 §3.6 close result from durable rows only [r1.6, r1.8]: the turns a
-/// close cancelled, in turn order, and `quiescent` cleanup only when every
+/// close cancelled, in turn order (state `cancelled` with cause `close`:
+/// a close-stopped `unknown` turn counts once revised to `cancelled`), and `quiescent` cleanup only when every
 /// group of the session's turns has an absence proof.
 fn derive_close_result(conn: &Connection, session: &SessionId) -> Result<Value, StoreError> {
     let mut query = conn
         .prepare_cached(
-            "SELECT number FROM turns WHERE session_id=?1 AND cancel_cause='close' ORDER BY number",
+            "SELECT number FROM turns WHERE session_id=?1 AND state='cancelled' AND cancel_cause='close' ORDER BY number",
         )
         .map_err(sql_error)?;
     let cancelled = query
@@ -2143,20 +2146,21 @@ fn read_revisable(
     session: &SessionId,
     turn: TurnNumber,
 ) -> Result<Option<RevisableTurn>, StoreError> {
-    let row: Option<(String, String, SessionRoute)> = conn
+    let row: Option<(String, String, Option<String>, SessionRoute)> = conn
         .query_row(
             &format!(
-                "SELECT t.envelope,t.effective,{ROUTE_COLUMNS}
+                "SELECT t.envelope,t.effective,t.cancel_cause,{ROUTE_COLUMNS}
                  FROM turns t JOIN sessions s ON s.id=t.session_id
                  WHERE t.session_id=?1 AND t.number=?2 AND t.state='unknown'
+                   AND t.correlation IS NOT NULL
                    AND json_extract(t.envelope,'$.vendor_stop_reason') IS NULL"
             ),
             params![session.as_str(), turn.get()],
-            |row| Ok((row.get(0)?, row.get(1)?, route_at(row, 2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, route_at(row, 3)?)),
         )
         .optional()
         .map_err(sql_error)?;
-    row.map(|(envelope, effective, route)| {
+    row.map(|(envelope, effective, cause, route)| {
         let parse = |text: &str| {
             serde_json::from_str::<Value>(text).map_err(|_| StoreError::CorruptEvidence)
         };
@@ -2164,6 +2168,9 @@ fn read_revisable(
             envelope: parse(&envelope)?,
             effective: parse(&effective)?,
             route,
+            cancel_cause: cause
+                .map(|cause| CancelCause::of(&cause).ok_or(StoreError::CorruptEvidence))
+                .transpose()?,
         })
     })
     .transpose()

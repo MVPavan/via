@@ -34,9 +34,9 @@ use crate::{
     VendorTurnId, final_text_pieces,
 };
 use via_routes::{
-    FakeClassHint, FakeDenialKind, FakeLateTerminal, FakeMessage, FakeRoute, FakeTerminal,
-    FakeTurn, FakeUsage, Handshake, Lane, Retirement, RouteMessage, StopSources, TerminalStatus,
-    TurnStart, WireCleanup,
+    FakeClassHint, FakeDenialKind, FakeMessage, FakeRetired, FakeRetiredItem, FakeRoute,
+    FakeTerminal, FakeTurn, FakeUsage, Handshake, Lane, Retirement, RouteMessage, StopSources,
+    TerminalStatus, TurnStart, WireCleanup,
 };
 
 /// S1's cleanup allowance: the wall's one cutoff is this after the wall
@@ -151,7 +151,7 @@ pub(crate) async fn run_turn(
         steer: Some(steer_lane),
         identity,
         effort: spec.effort,
-        late: None,
+        retired: None,
     };
     let (logical, logical_rx) = oneshot::channel();
     driver.tracker.spawn(turn_task(TurnTask {
@@ -587,9 +587,9 @@ async fn turn_task(task: TurnTask) {
             core.borrow().is_some() || close.borrow().is_some() || cancel.is_cancelled()
         })
     };
-    // C2 §4 `turn.late_terminal`: a persistent helper's, read as it retires.
-    let (late_terminal, mut late) = oneshot::channel();
-    lane.late = persistent.then_some(late_terminal);
+    // C2 §4.1: what a persistent helper reports as it retires.
+    let (retired, mut retired_rx) = oneshot::channel();
+    lane.retired = persistent.then_some(retired);
     let (inner, inner_rx) = oneshot::channel();
     let stop = (merged_rx, sources);
     let route_turn = route.turn(process, start, hop, (wall, force, stop), lane, inner);
@@ -611,51 +611,99 @@ async fn turn_task(task: TurnTask) {
         (retirement, ()) = async { tokio::join!(route_turn, relay) } => retirement,
         never = merge_stops(core_stop, close, &cancel, &merged) => match never {},
     };
-    // C2 §4 `turn.late_terminal`: what the retired helper reported after
-    // a logical turn that retained no terminal, before any health failure
-    // that retires the lane.
-    if let Ok(terminal) = late.try_recv() {
-        report_late(terminal, &observations, &health).await;
-    }
-    // A persistent connection's retirement journal is no turn's: its
-    // uncertainty is reported apart from the cleanup's, before the health
-    // failure that retires the lane (critical r1 #4).
-    if persistent && retirement.launched && retirement.journal_uncertain {
-        journal.send_replace(true);
-    }
-    if persistent
+    let uncertain = persistent
         && retirement_uncertain(
             &retirement,
             #[cfg(feature = "test-failpoints")]
             lock(&state).retirement_fault.as_deref(),
-        )
-    {
-        latch(&health, DriverFailure::RetirementUncertain);
-    }
-    held(&reservation).retired(retirement);
-    // An uncommitted slot is released with the last share, after the
-    // cleanup and after `run_turn`.
-    drop(reservation);
+        );
+    let reports = RetiredReports {
+        health: &health,
+        journal: &journal,
+        observations: &observations,
+    };
+    let retired = retired_rx.try_recv().unwrap_or_default();
+    settle_retired((retirement, uncertain), retired, reports, |retirement| {
+        held(&reservation).retired(retirement);
+        // An uncommitted slot is released with the last share, after the
+        // cleanup and after `run_turn`.
+        drop(reservation);
+    })
+    .await;
     done.send_replace(true);
 }
 
-/// Sends a retired helper's late terminal on the session channel (C2 §4
-/// `turn.late_terminal`). One the channel does not take in time latches
-/// `overflow`; once the lane ended and its channel closed, it is dropped
-/// (ruling G1).
-async fn report_late(
-    late: FakeLateTerminal,
+/// Where a persistent connection's retirement reports (C2 §2 health,
+/// runtime §7) and where its helper's observations go.
+struct RetiredReports<'a> {
+    health: &'a watch::Sender<DriverHealth>,
+    journal: &'a watch::Sender<bool>,
+    observations: &'a ObservationSink,
+}
+
+/// Ends a persistent connection's retirement. Its journal's uncertainty,
+/// its unproven cleanup (`uncertain`) and a failure of the helper's
+/// output each fail the connection, published at once, apart from any
+/// observation (critical r1 #4); `release` then records the retirement.
+/// Only then are the helper's observations delivered ([`deliver_retired`]).
+async fn settle_retired(
+    (retirement, uncertain): (Retirement, bool),
+    retired: FakeRetired,
+    reports: RetiredReports<'_>,
+    release: impl FnOnce(Retirement),
+) {
+    let FakeRetired { items, failure } = retired;
+    // A persistent connection's retirement journal is no turn's: its
+    // uncertainty is reported apart from the cleanup's, before the health
+    // failure that retires the lane (critical r1 #4).
+    if retirement.launched && retirement.journal_uncertain {
+        reports.journal.send_replace(true);
+    }
+    if uncertain {
+        latch(reports.health, DriverFailure::RetirementUncertain);
+    }
+    if let Some(cause) = failure {
+        latch(reports.health, DriverFailure::Route(cause));
+    }
+    release(retirement);
+    deliver_retired(items, reports.observations, reports.health).await;
+}
+
+/// Sends a retired helper's observations on the session channel in decode
+/// order (C2 §4.1): its durable ones normalized as the turn's own are, and
+/// a late terminal (§4 `turn.late_terminal`). One the channel does not
+/// take in time latches `overflow` and ends the delivery; once the lane
+/// ended and its channel closed, the rest is dropped (ruling G1).
+async fn deliver_retired(
+    items: Vec<FakeRetiredItem>,
     sink: &ObservationSink,
     health: &watch::Sender<DriverHealth>,
 ) {
-    let item = ObservationItem {
-        at: tokio::time::Instant::now(),
-        // Route pairs it with `fake-turn-N`, never empty.
-        vendor_turn: VendorTurnId::try_from(late.vendor_turn_id).ok(),
-        observation: Observation::LateTerminal(vendor_terminal(late.terminal)),
-    };
-    if let Err(Undelivered::Stalled) = sink.send(item, event_stall()).await {
-        latch(health, DriverFailure::ObservationOverflow);
+    for retired in items {
+        let (vendor_turn, observation) = match retired {
+            FakeRetiredItem::Durable(message) => match durable(message.payload) {
+                Some(durable) => durable,
+                None => continue,
+            },
+            FakeRetiredItem::Terminal(late) => (
+                late.vendor_turn_id,
+                Observation::LateTerminal(vendor_terminal(late.terminal)),
+            ),
+        };
+        let item = ObservationItem {
+            at: tokio::time::Instant::now(),
+            // Route pairs it with `fake-turn-N`, never empty.
+            vendor_turn: VendorTurnId::try_from(vendor_turn).ok(),
+            observation,
+        };
+        match sink.send(item, event_stall()).await {
+            Ok(()) => {}
+            Err(Undelivered::Stalled) => {
+                latch(health, DriverFailure::ObservationOverflow);
+                return;
+            }
+            Err(Undelivered::Closed) => return,
+        }
     }
 }
 
@@ -1214,32 +1262,9 @@ impl Normalizer {
                 vendor_session_id,
                 transcript,
             } => Some((None, self.identity(vendor_session_id, transcript))),
-            FakeMessage::Denial {
-                vendor_turn_id,
-                kind,
-                target,
-                reason,
-            } => Some((
-                Some(vendor_turn_id),
-                Observation::ActionDenied(Denial {
-                    kind: denial_kind(kind),
-                    target,
-                    reason,
-                }),
-            )),
-            FakeMessage::Decline {
-                vendor_turn_id,
-                vendor_method,
-                summary,
-                blocking,
-            } => Some((
-                Some(vendor_turn_id),
-                Observation::RequestDeclined(Decline {
-                    vendor_method,
-                    summary,
-                    blocking,
-                }),
-            )),
+            payload @ (FakeMessage::Denial { .. } | FakeMessage::Decline { .. }) => {
+                durable(payload).map(|(vendor_turn, observation)| (Some(vendor_turn), observation))
+            }
             FakeMessage::VendorClosed { reason } => {
                 self.vendor_closed = true;
                 Some((None, Observation::VendorClosed(reason)))
@@ -1269,6 +1294,52 @@ impl Normalizer {
             // The fake's handshake carries none at confirmation.
             vendor_version: None,
         })
+    }
+}
+
+/// A durable message's observation and vendor turn (C2 §4.1): a denial or
+/// a decline, whether the turn's own reader or a retirement read it.
+fn durable(payload: FakeMessage) -> Option<(String, Observation)> {
+    match payload {
+        FakeMessage::Denial {
+            vendor_turn_id,
+            kind,
+            target,
+            reason,
+        } => Some((
+            vendor_turn_id,
+            Observation::ActionDenied(Denial {
+                kind: denial_kind(kind),
+                target,
+                reason,
+            }),
+        )),
+        FakeMessage::Decline {
+            vendor_turn_id,
+            vendor_method,
+            summary,
+            blocking,
+        } => Some((
+            vendor_turn_id,
+            Observation::RequestDeclined(Decline {
+                vendor_method,
+                summary,
+                blocking,
+            }),
+        )),
+        // Nothing else is durable.
+        FakeMessage::Accepted { .. }
+        | FakeMessage::Text { .. }
+        | FakeMessage::Terminal { .. }
+        | FakeMessage::ToolStarted { .. }
+        | FakeMessage::ToolEnded { .. }
+        | FakeMessage::Usage { .. }
+        | FakeMessage::Hello(_)
+        | FakeMessage::Identity { .. }
+        | FakeMessage::SteerDelivered { .. }
+        | FakeMessage::VendorClosed { .. }
+        | FakeMessage::InterruptAck { .. }
+        | FakeMessage::Unknown { .. } => None,
     }
 }
 
@@ -1319,7 +1390,94 @@ async fn forced(force: &mut watch::Receiver<Option<tokio::time::Instant>>) {
 
 #[cfg(all(test, feature = "test-failpoints"))]
 mod tests {
-    use super::{Retirement, RetirementFault, WireCleanup, retirement_uncertain};
+    use std::{
+        sync::atomic::{AtomicBool, Ordering},
+        time::Duration,
+    };
+
+    use tokio::sync::watch;
+    use via_routes::{
+        FakeDenialKind, FakeMessage, FakeRetired, FakeRetiredItem, RouteError, RouteMessage,
+        TurnNumber,
+    };
+
+    use super::{
+        RetiredReports, Retirement, RetirementFault, WireCleanup, retirement_uncertain,
+        settle_retired,
+    };
+    use crate::{
+        DriverFailure, DriverHealth, OBSERVATION_BYTES, ObservationBudget, observation_channel_in,
+    };
+
+    /// Fix round 1 #1, #9 (C2 §2 health, runtime §7): a retirement's
+    /// journal uncertainty, its unproven cleanup and a failure of its
+    /// helper's output are published at once, and the retirement is
+    /// recorded, while the helper's observations still wait on a saturated
+    /// session channel.
+    #[test]
+    fn a_saturated_channel_delays_no_retirement_report() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let turn = TurnNumber::try_from(1).unwrap();
+        let protocol = RouteError::Protocol {
+            turn,
+            detail: "malformed known fake message",
+        };
+        let cases = [
+            (true, None, DriverFailure::RetirementUncertain),
+            (
+                false,
+                Some(protocol.clone()),
+                DriverFailure::Route(protocol),
+            ),
+        ];
+        runtime.block_on(async {
+            for (uncertain, failure, cause) in cases {
+                let budget = ObservationBudget::new();
+                let _saturated = budget
+                    .charge(u32::try_from(OBSERVATION_BYTES).unwrap())
+                    .unwrap();
+                let (sink, _receiver) = observation_channel_in(&budget);
+                let (health, _health) = watch::channel(DriverHealth::Open);
+                let (journal, _journal) = watch::channel(false);
+                let mut retirement = retirement(WireCleanup::Quiescent);
+                retirement.journal_uncertain = uncertain;
+                let denial = FakeMessage::Denial {
+                    vendor_turn_id: "fake-turn-1".to_owned(),
+                    kind: FakeDenialKind::Command,
+                    target: "t".to_owned(),
+                    reason: "r".to_owned(),
+                };
+                let retired = FakeRetired {
+                    items: vec![FakeRetiredItem::Durable(RouteMessage {
+                        payload: denial,
+                        steer: None,
+                    })],
+                    failure,
+                };
+                let released = AtomicBool::new(false);
+                let reports = RetiredReports {
+                    health: &health,
+                    journal: &journal,
+                    observations: &sink,
+                };
+                let settle = settle_retired((retirement, uncertain), retired, reports, |_| {
+                    released.store(true, Ordering::Release);
+                });
+                let mut settle = std::pin::pin!(settle);
+                let waited = tokio::time::timeout(Duration::from_millis(50), &mut settle).await;
+                assert!(waited.is_err(), "the observation waits for the channel");
+                assert_eq!(
+                    *health.borrow(),
+                    DriverHealth::Failed { first_cause: cause }
+                );
+                assert_eq!(*journal.borrow(), uncertain);
+                assert!(released.load(Ordering::Acquire));
+            }
+        });
+    }
 
     fn retirement(cleanup: WireCleanup) -> Retirement {
         Retirement {

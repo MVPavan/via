@@ -6,6 +6,7 @@
 //! `status` reports each terminal turn's revision.
 #![expect(
     clippy::unwrap_used,
+    clippy::panic,
     reason = "test fixtures and assertions fail loudly"
 )]
 
@@ -14,8 +15,9 @@ use std::{fs, os::unix::fs::PermissionsExt};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use via_store::{
-    AcceptanceRecord, ClosingRecord, RevisionRecord, SessionId, SpawnRecord, StatusTurn, Store,
-    StoreClient, StoreError, SubmissionRecord, TerminalExtras, TerminalRecord, TurnNumber,
+    AcceptanceRecord, CancelCause, ClosedOutcome, ClosedRecord, ClosingRecord, RevisionRecord,
+    SessionId, SpawnRecord, StatusTurn, Store, StoreClient, StoreError, SubmissionRecord,
+    TerminalExtras, TerminalRecord, TurnNumber,
 };
 
 const UNKNOWN: &str = "s_7f3k9q2mzr4c";
@@ -50,6 +52,17 @@ fn event(kind: &str, seq: u64, late: bool) -> Value {
 /// Session `session`'s turn 1, accepted and ended with `envelope` at
 /// sequence 4.
 async fn ended(client: &StoreClient, session: &str, envelope: Value) {
+    ended_with(client, session, envelope, (true, None)).await;
+}
+
+/// [`ended`], accepted only with `accepted`, its terminal recording
+/// `cause`; an unaccepted turn ends at sequence 3.
+async fn ended_with(
+    client: &StoreClient,
+    session: &str,
+    envelope: Value,
+    (accepted, cause): (bool, Option<CancelCause>),
+) {
     client
         .commit_spawn(SpawnRecord {
             session_id: id(session),
@@ -71,30 +84,69 @@ async fn ended(client: &StoreClient, session: &str, envelope: Value) {
         })
         .await
         .unwrap();
-    client
-        .commit_acceptance(AcceptanceRecord {
-            session_id: id(session),
-            turn: first(),
-            correlation: "v:fake-turn-1".to_owned(),
-            event: event("turn.started", 3, false),
-            adapter_version: None,
-            instance: None,
-        })
-        .await
-        .unwrap();
+    if accepted {
+        client
+            .commit_acceptance(AcceptanceRecord {
+                session_id: id(session),
+                turn: first(),
+                correlation: "v:fake-turn-1".to_owned(),
+                event: event("turn.started", 3, false),
+                adapter_version: None,
+                instance: None,
+            })
+            .await
+            .unwrap();
+    }
     client
         .commit_terminal_with(
             TerminalRecord {
                 session_id: id(session),
                 turn: first(),
                 envelope,
-                event: event("turn.ended", 4, false),
+                event: event("turn.ended", 3 + u64::from(accepted), false),
                 steps: Vec::new(),
             },
-            TerminalExtras::default(),
+            TerminalExtras {
+                cancel_cause: cause,
+            },
         )
         .await
         .unwrap();
+}
+
+/// The revision of session `session`'s turn 1 to `state` as revision 1.
+fn revised_to(session: &str, state: &str, seq: u64) -> RevisionRecord {
+    RevisionRecord {
+        session_id: id(session),
+        turn: first(),
+        envelope: json!({"state":state,"revision":1,"vendor_stop_reason":"stop"}),
+        event: event("turn.revised", seq, true),
+    }
+}
+
+/// Closes session `session`, whose next sequence is `seq`, and returns its
+/// close result's `cancelled_turns`.
+async fn closed_turns(client: &StoreClient, session: &str, seq: u64) -> Value {
+    client
+        .commit_closing(ClosingRecord {
+            session_id: id(session),
+            operation: None,
+        })
+        .await
+        .unwrap();
+    let outcome = client
+        .commit_closed(ClosedRecord {
+            session_id: id(session),
+            event: json!({"type":"session.closed","seq":seq,"turn":null,"late":false,
+                          "at":"2026-01-01T00:00:00.000Z","reason":"close","leftovers":null}),
+            operation: None,
+        })
+        .await
+        .unwrap();
+    let ClosedOutcome::Closed(result) = outcome else {
+        panic!("the close did not commit: {outcome:?}");
+    };
+    result["cancelled_turns"].clone()
 }
 
 /// The revision of session `session`'s turn 1 to `completed` as
@@ -240,5 +292,70 @@ fn a_closed_session_refuses_a_revision() {
             .unwrap()
             .unwrap();
         assert_eq!(facts.state, "unknown");
+    });
+}
+
+/// Runtime §6 (fix round 1 #2): a revision needs the turn's acceptance
+/// correlation whatever the state it revises to; an unaccepted `unknown`
+/// turn is not revisable.
+#[test]
+fn an_unaccepted_turn_is_never_revised() {
+    let root = private_dir();
+    let store = Store::open(root.path()).unwrap();
+    let client = store.client();
+    runtime().block_on(async {
+        ended_with(&client, UNKNOWN, unknown(None), (false, None)).await;
+        assert!(
+            client
+                .revisable(&id(UNKNOWN), first())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        for state in ["failed", "cancelled", "completed"] {
+            let refused = client.commit_revision(revised_to(UNKNOWN, state, 4)).await;
+            assert!(
+                matches!(refused, Err(StoreError::Refused(_))),
+                "{state}: {refused:?}"
+            );
+        }
+        let facts = client
+            .terminal_facts(&id(UNKNOWN), first())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(facts.state, "unknown");
+    });
+}
+
+/// Runtime §6 (fix round 1 #3): `cancel_cause` records the `close` that
+/// stopped a turn ending `unknown`, `revisable` reads it and a revision
+/// keeps it. A close result counts the turn only once it is `cancelled`:
+/// revised to `cancelled` before the closure it is counted, unrevised it
+/// is not.
+#[test]
+fn a_close_counts_a_close_stopped_turn_only_once_cancelled() {
+    let root = private_dir();
+    let store = Store::open(root.path()).unwrap();
+    let client = store.client();
+    runtime().block_on(async {
+        let close = (true, Some(CancelCause::Close));
+        ended_with(&client, UNKNOWN, unknown(None), close).await;
+        ended_with(&client, RETAINED, unknown(None), close).await;
+        let revisable = client
+            .revisable(&id(UNKNOWN), first())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(revisable.cancel_cause, Some(CancelCause::Close));
+        client
+            .commit_revision(revised_to(UNKNOWN, "cancelled", 5))
+            .await
+            .unwrap();
+        assert_eq!(
+            closed_turns(&client, UNKNOWN, 6).await,
+            json!([format!("{UNKNOWN}/1")])
+        );
+        assert_eq!(closed_turns(&client, RETAINED, 5).await, json!([]));
     });
 }

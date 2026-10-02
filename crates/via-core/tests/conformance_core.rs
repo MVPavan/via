@@ -2705,7 +2705,21 @@ async fn unknown_turn(daemon: &Daemon, prompt: &str, extra: &Value) -> SessionId
         status_turns(daemon, &session).await,
         json!([{"n":1,"state":"unknown","revision":0}])
     );
+    // Runtime §6 (fix round 1 #3): the caller's cancel that stopped it.
+    assert_eq!(cancel_cause(daemon, &session).as_deref(), Some("cancel"));
     session
+}
+
+/// Turn 1's recorded `cancel_cause`, read from the Store's row.
+fn cancel_cause(daemon: &Daemon, session: &SessionId) -> Option<String> {
+    let db = rusqlite::Connection::open(daemon.root.join("state").join("store.sqlite3")).unwrap();
+    db.busy_timeout(Duration::from_secs(10)).unwrap();
+    db.query_row(
+        "SELECT cancel_cause FROM turns WHERE session_id=?1 AND number=1",
+        [session.as_str()],
+        |row| row.get(0),
+    )
+    .unwrap()
 }
 
 /// via-jm4.35 (C1 §7.6 late row, C2 §4 `turn.late_terminal`), items 1 and
@@ -2766,6 +2780,8 @@ fn core_late_terminal_revises_an_unknown_turn() {
             status_turns(&daemon, &session).await,
             json!([{"n":1,"state":"completed","revision":1}])
         );
+        // A revision keeps the cause (runtime §6).
+        assert_eq!(cancel_cause(&daemon, &session).as_deref(), Some("cancel"));
 
         let schema = json!({"type":"object","properties":{"a":{"type":"integer"}},
                             "required":["a"]});
@@ -2828,6 +2844,98 @@ fn core_a_turn_that_retained_its_terminal_is_not_revised() {
             status_turns(&daemon, &session).await,
             json!([{"n":1,"state":"completed","revision":0}])
         );
+        daemon.shutdown().await;
+    });
+}
+
+/// Fix round 1 #8 (C2 §4.1 late observations): a durable observation the
+/// retired helper reports before its late terminal is forwarded in decode
+/// order and committed `late: true` with its turn, before the revision.
+#[test]
+fn core_a_retired_helpers_denial_commits_late_before_the_revision() {
+    let denial = emit(&json!({"type":"denial","vendor_turn_id":vendor_turn(1),
+                              "kind":"command","target":"retired","reason":"policy"}));
+    let scripts = [script(
+        "late",
+        &[
+            accepted(1),
+            gate("late"),
+            denial,
+            terminal(1, "completed", "end_turn"),
+        ],
+    )];
+    let Some(root) = child(
+        "core_a_retired_helpers_denial_commits_late_before_the_revision",
+        &scenario(&persistent(), &scripts),
+        &[],
+    ) else {
+        return;
+    };
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = unknown_turn(&daemon, "late", &json!({})).await;
+        daemon.release("late");
+        until_revised(&daemon, &session).await;
+        let events = events(&daemon, &session).await;
+        let denied: Vec<&Value> = events
+            .iter()
+            .filter(|event| event["type"] == "action.denied")
+            .collect();
+        assert_eq!(denied.len(), 1, "{events:?}");
+        assert_eq!(
+            (&denied[0]["turn"], &denied[0]["late"], &denied[0]["target"]),
+            (&json!(1), &json!(true), &json!("retired")),
+            "{events:?}"
+        );
+        let revised = &revisions(&daemon, &session).await[0];
+        assert!(
+            denied[0]["seq"].as_u64() < revised["seq"].as_u64(),
+            "{events:?}"
+        );
+        daemon.shutdown().await;
+    });
+}
+
+/// Fix round 1 #9 (design §7.3): a message the retired helper reports that
+/// does not decode is kept in the turn's `undecoded.bin`, as the turn's
+/// own reader keeps one; reading stops there, so the terminal after it
+/// revises nothing and the committed result stands.
+#[test]
+fn core_an_undecodable_retired_message_keeps_its_evidence() {
+    let malformed = emit(&json!({"type":"terminal","vendor_turn_id":vendor_turn(1)}));
+    let scripts = [script(
+        "late",
+        &[
+            accepted(1),
+            gate("late"),
+            malformed,
+            terminal(1, "completed", "end_turn"),
+        ],
+    )];
+    let Some(root) = child(
+        "core_an_undecodable_retired_message_keeps_its_evidence",
+        &scenario(&persistent(), &scripts),
+        &[],
+    ) else {
+        return;
+    };
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = unknown_turn(&daemon, "late", &json!({})).await;
+        let before = stored(&daemon, &session, 1).await;
+        let kept =
+            PathBuf::from(before["evidence"]["folder"].as_str().unwrap()).join("undecoded.bin");
+        daemon.release("late");
+        let by = tokio::time::Instant::now() + Duration::from_secs(30);
+        while !kept.exists() || daemon.engine.connections().in_use != 0 {
+            assert!(
+                tokio::time::Instant::now() < by,
+                "the retirement kept no undecoded.bin, or never ended"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(revisions(&daemon, &session).await.is_empty());
+        assert_eq!(stored(&daemon, &session, 1).await, before);
         daemon.shutdown().await;
     });
 }

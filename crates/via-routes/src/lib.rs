@@ -222,9 +222,9 @@ mod fake;
 
 pub use fake::{
     CONTROL_BYTES, CONTROL_COMMANDS, FakeClassHint, FakeCost, FakeDenialKind, FakeLateTerminal,
-    FakeMessage, FakeRoute, FakeRouteResult, FakeTerminal, FakeTurn, FakeUsage, Handshake, Lane,
-    Retirement, RouteMessage, SteerAnswer, SteerRefused, SteerRequest, SteerSender,
-    TerminalDetails, TerminalStatus, TurnStart, VENDOR_DATA_MAX, steer_lane,
+    FakeMessage, FakeRetired, FakeRetiredItem, FakeRoute, FakeRouteResult, FakeTerminal, FakeTurn,
+    FakeUsage, Handshake, Lane, Retirement, RouteMessage, SteerAnswer, SteerRefused, SteerRequest,
+    SteerSender, TerminalDetails, TerminalStatus, TurnStart, VENDOR_DATA_MAX, steer_lane,
 };
 pub use via_wire::StoreError;
 /// Test builds only: the failpoint controller, for the layers above.

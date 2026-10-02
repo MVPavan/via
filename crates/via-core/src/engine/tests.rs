@@ -3101,14 +3101,164 @@ fn a_late_denial_is_committed_late_and_kept_out_of_the_running_turn() {
     });
 }
 
-/// via-jm4.35 (C1 §7.6, C2 §4 `turn.late_terminal`): the running turn's
-/// own late terminal, met in its final drain, is kept for the revision
-/// that follows the turn's terminal; nothing commits for it yet. One of an
-/// earlier turn that did not end `unknown` (turn 1 here ended `failed`) is
-/// not revised and commits nothing.
+/// A late vendor terminal (C2 §4 `turn.late_terminal`) of `status`, whose
+/// vendor stop reason is `reason`.
+fn late_terminal(
+    status: via_adapters::VendorTerminalStatus,
+    reason: &str,
+) -> via_adapters::VendorTerminal {
+    via_adapters::VendorTerminal {
+        at: tokio::time::Instant::now(),
+        status,
+        stop_reason: if status == via_adapters::VendorTerminalStatus::Interrupted {
+            via_adapters::StopReason::Interrupted
+        } else {
+            via_adapters::StopReason::EndTurn
+        },
+        vendor_stop_reason: reason.to_owned(),
+        vendor_code: None,
+        class_hint: None,
+        detail: None,
+        structured_output: None,
+        steps: None,
+        usage: None,
+        cost: None,
+        vendor: None,
+    }
+}
+
+/// Ends `session`'s running turn `n` `unknown` with no retained terminal,
+/// as a stop or a lost transport leaves it: accepted as `fake-turn-<n>`,
+/// its envelope's `cancel` being `cancel` and its `cancel_cause` `cause`,
+/// with `extra`'s members over the stored envelope's. The slot's head is
+/// read again first, as other writers of the test committed directly.
+async fn end_unknown(
+    engine: &Engine,
+    (session, n): (&SessionId, u32),
+    (cancel, cause): (Value, Option<via_store::CancelCause>),
+    extra: Value,
+) {
+    let slot = engine.slot(session).unwrap();
+    slot.head.lock(&engine.store, session).await.unwrap().lost();
+    let head = slot.head.lock(&engine.store, session).await.unwrap();
+    let at = rfc3339(std::time::SystemTime::now());
+    let event = |seq, body| {
+        Event {
+            seq,
+            session_id: session,
+            turn: Some(n),
+            late: false,
+            at: &at,
+            body,
+        }
+        .to_value()
+        .unwrap()
+    };
+    let seq = head.next();
+    engine
+        .store
+        .commit_acceptance(via_store::AcceptanceRecord {
+            session_id: session.clone(),
+            turn: turn(n),
+            correlation: format!("v:fake-turn-{n}"),
+            event: event(
+                seq,
+                EventBody::TurnStarted {
+                    effective: json!({}),
+                },
+            ),
+            adapter_version: None,
+            instance: None,
+        })
+        .await
+        .unwrap();
+    let mut envelope = json!({
+        "api_version":1,"session_id":session,"turn":n,
+        "address":format!("{session}/{n}"),"revision":0,"state":"unknown",
+        "failure":null,"stop_reason":"error","vendor_stop_reason":null,"cancel":cancel,
+        "final_text":"","final_text_file":null,
+        "structured_output":null,"structured_output_file":null,"steps":null,
+        "usage":{"input_tokens":null,"cached_input_tokens":null,"output_tokens":null,
+                 "reasoning_output_tokens":null,"total_tokens":null,"scope":"turn",
+                 "provenance":"unavailable"},
+        "cost":{"usd":null,"scope":"turn","provenance":"unavailable"},
+        "events":{"first_seq":1,"last_seq":seq + 1,"count":seq + 1},
+        "warnings":[],"vendor":{"turn_id":format!("fake-turn-{n}")}
+    });
+    for (member, value) in extra.as_object().unwrap() {
+        envelope[member] = value.clone();
+    }
+    engine
+        .store
+        .commit_terminal_with(
+            TerminalRecord {
+                session_id: session.clone(),
+                turn: turn(n),
+                envelope,
+                event: event(
+                    seq + 1,
+                    EventBody::TurnEnded {
+                        state: "unknown",
+                        failure: None,
+                        stop_reason: "error",
+                        cancel: None,
+                    },
+                ),
+                steps: Vec::new(),
+            },
+            via_store::TerminalExtras {
+                cancel_cause: cause,
+            },
+        )
+        .await
+        .unwrap();
+    head.committed(2);
+}
+
+/// A new session whose turn 1 ended `unknown` ([`end_unknown`]).
+async fn unknown_session(
+    engine: &Engine,
+    stop: (Value, Option<via_store::CancelCause>),
+    extra: Value,
+) -> SessionId {
+    let session = new_session(engine).await;
+    end_turn_one(engine, &session, None).await;
+    end_unknown(engine, (&session, 1), stop, extra).await;
+    session
+}
+
+/// The stored envelope of `session`'s turn `n`.
+async fn stored_envelope(engine: &Engine, session: &SessionId, n: u32) -> Value {
+    let envelope = engine.result(&format!("{session}/{n}")).await.unwrap();
+    serde_json::from_str(envelope.get()).unwrap()
+}
+
+/// The session's `turn.revised` events.
+async fn revised_events(engine: &Engine, session: &SessionId) -> Vec<Value> {
+    events_page(engine, session).await["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["type"] == "turn.revised")
+        .cloned()
+        .collect()
+}
+
+/// A stored `cancel` object with `outcome`.
+fn stored_cancel(outcome: &str) -> Value {
+    json!({"outcome":outcome,"cleanup":"uncertain",
+           "requested_at":"2026-01-01T00:00:00.000Z","settled_at":"2026-01-01T00:00:01.000Z"})
+}
+
+/// via-jm4.35, fix round 1 #2 (C1 §7.6, C2 §4 `turn.late_terminal`): the
+/// running turn's own late terminal, met in its final drain, is kept only
+/// when it names the vendor turn its acceptance mapped; one naming none is
+/// never the running turn's to revise by. The kept one revises the turn
+/// once its `unknown` terminal committed. One of an earlier turn that did
+/// not end `unknown` (turn 1 here ended `failed`) commits nothing.
 #[test]
-fn the_running_turns_late_terminal_waits_for_its_terminal() {
-    let Some(root) = child("the_running_turns_late_terminal_waits_for_its_terminal") else {
+fn the_running_turns_late_terminal_revises_it_after_its_terminal() {
+    let Some(root) = child("the_running_turns_late_terminal_revises_it_after_its_terminal") else {
         return;
     };
     run(async {
@@ -3116,30 +3266,18 @@ fn the_running_turns_late_terminal_waits_for_its_terminal() {
         let (session, slot, lane, mut record, effective, orders) =
             running_turn_2(&engine, &root).await;
         let before = event_types(&engine, &session).await;
-        let terminal = |vendor_turn: &str, reason: &str| via_adapters::ObservationItem {
+        let completed = via_adapters::VendorTerminalStatus::Completed;
+        let item = |vendor_turn: Option<&str>, reason: &str| via_adapters::ObservationItem {
             at: tokio::time::Instant::now(),
-            vendor_turn: Some(
-                via_adapters::VendorTurnId::try_from(vendor_turn.to_owned()).unwrap(),
-            ),
-            observation: via_adapters::Observation::LateTerminal(via_adapters::VendorTerminal {
-                at: tokio::time::Instant::now(),
-                status: via_adapters::VendorTerminalStatus::Completed,
-                stop_reason: via_adapters::StopReason::EndTurn,
-                vendor_stop_reason: reason.to_owned(),
-                vendor_code: None,
-                class_hint: None,
-                detail: None,
-                structured_output: None,
-                steps: None,
-                usage: None,
-                cost: None,
-                vendor: None,
-            }),
+            vendor_turn: vendor_turn
+                .map(|id| via_adapters::VendorTurnId::try_from(id.to_owned()).unwrap()),
+            observation: via_adapters::Observation::LateTerminal(late_terminal(completed, reason)),
         };
         let queued = vec![
-            terminal("fake-turn-1", "earlier"),
-            terminal("fake-turn-2", "own"),
-            terminal("fake-turn-2", "second"),
+            item(None, "anonymous"),
+            item(Some("fake-turn-1"), "earlier"),
+            item(Some("fake-turn-2"), "own"),
+            item(Some("fake-turn-2"), "second"),
         ];
         let kept = engine
             .drain_queued(
@@ -3151,12 +3289,285 @@ fn the_running_turns_late_terminal_waits_for_its_terminal() {
             )
             .await;
         assert_eq!(
-            kept.map(|terminal| terminal.vendor_stop_reason).as_deref(),
+            kept.as_ref()
+                .map(|terminal| terminal.vendor_stop_reason.as_str()),
             Some("own"),
-            "the first of the running turn's own"
+            "the first of the running turn's own that names its vendor turn"
         );
         assert_eq!(event_types(&engine, &session).await, before);
         assert!(record.first_failure.is_none());
+        end_unknown(&engine, (&session, 2), (Value::Null, None), json!({})).await;
+        engine.revise_kept(&session, turn(2), kept).await;
+        let revised = revised_events(&engine, &session).await;
+        assert_eq!(revised.len(), 1, "{revised:?}");
+        assert_eq!(
+            (&revised[0]["turn"], &revised[0]["state"]),
+            (&json!(2), &json!("completed"))
+        );
+        let envelope = stored_envelope(&engine, &session, 2).await;
+        assert_eq!(
+            (&envelope["revision"], &envelope["vendor_stop_reason"]),
+            (&json!(1), &json!("own"))
+        );
+        assert!(!engine.store_failed());
+    });
+}
+
+/// Fix round 1 #4, #5 (C1 §7.6 late row): a late `interrupted` terminal
+/// makes the turn `cancelled` only when a caller `cancel` or `close`
+/// stopped it (its recorded cause); a stored cancel without one, as a Core
+/// deadline leaves, is a vendor terminal's failure. The stored outcome:
+/// `requested` or `unknown` becomes `acknowledged` for an interrupted
+/// terminal, `unknown` becomes `requested` for any other, and
+/// `acknowledged` and `forced` stand. The cause is kept.
+#[test]
+fn a_late_terminal_settles_the_stored_cancel_by_its_origin() {
+    let Some(root) = child("a_late_terminal_settles_the_stored_cancel_by_its_origin") else {
+        return;
+    };
+    run(async {
+        use via_adapters::VendorTerminalStatus::{Completed, Interrupted};
+        use via_store::CancelCause::{Cancel, Close};
+        let engine = open(&root);
+        let rows = [
+            (
+                Some(Cancel),
+                "requested",
+                Interrupted,
+                "cancelled",
+                "acknowledged",
+            ),
+            (
+                Some(Close),
+                "unknown",
+                Interrupted,
+                "cancelled",
+                "acknowledged",
+            ),
+            (Some(Cancel), "forced", Interrupted, "cancelled", "forced"),
+            (Some(Cancel), "unknown", Completed, "completed", "requested"),
+            (
+                Some(Cancel),
+                "requested",
+                Completed,
+                "completed",
+                "requested",
+            ),
+            (
+                Some(Cancel),
+                "acknowledged",
+                Completed,
+                "completed",
+                "acknowledged",
+            ),
+            (None, "requested", Interrupted, "failed", "acknowledged"),
+        ];
+        for (cause, stored, status, state, outcome) in rows {
+            let session = unknown_session(&engine, (stored_cancel(stored), cause), json!({})).await;
+            engine
+                .revise(&session, turn(1), &late_terminal(status, "late"))
+                .await;
+            let envelope = stored_envelope(&engine, &session, 1).await;
+            assert_eq!(
+                (&envelope["state"], &envelope["cancel"]["outcome"]),
+                (&json!(state), &json!(outcome)),
+                "{cause:?} {stored} {status:?}: {envelope}"
+            );
+            assert_eq!(envelope["revision"], 1, "{envelope}");
+            if state == "failed" {
+                assert_eq!(envelope["failure"]["class"], "vendor_error", "{envelope}");
+            }
+            let db = rusqlite::Connection::open(root.join("state").join("store.sqlite3")).unwrap();
+            let kept: Option<String> = db
+                .query_row(
+                    "SELECT cancel_cause FROM turns WHERE session_id=?1 AND number=1",
+                    [session.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                kept.as_deref(),
+                cause.map(|cause| if cause == Cancel { "cancel" } else { "close" })
+            );
+        }
+        assert!(!engine.store_failed());
+    });
+}
+
+/// Fix round 1 #6 (C1 Q2, design §7.3): a revision's frozen inputs decode
+/// strictly. A stored effective value that does not decode (a numeric
+/// model) is a corrupt row: the revision is declined and reported
+/// `corrupt_row`, never validated against absent inputs.
+#[test]
+fn a_corrupt_frozen_row_declines_the_revision() {
+    let Some(root) = child("a_corrupt_frozen_row_declines_the_revision") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = unknown_session(&engine, (Value::Null, None), json!({})).await;
+        let db = rusqlite::Connection::open(root.join("state").join("store.sqlite3")).unwrap();
+        db.busy_timeout(Duration::from_secs(10)).unwrap();
+        let changed = db
+            .execute(
+                "UPDATE turns SET effective=json_set(effective,'$.model',42) WHERE session_id=?1 AND number=1",
+                [session.as_str()],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        let completed = via_adapters::VendorTerminalStatus::Completed;
+        engine
+            .revise(&session, turn(1), &late_terminal(completed, "late"))
+            .await;
+        assert!(revised_events(&engine, &session).await.is_empty());
+        let envelope = stored_envelope(&engine, &session, 1).await;
+        assert_eq!(
+            (&envelope["state"], &envelope["revision"]),
+            (&json!("unknown"), &json!(0))
+        );
+        let failure = engine.store_failure_status().unwrap();
+        assert_eq!(
+            (&failure["kind"], &failure["scope"]),
+            (&json!("corrupt_row"), &json!("turn")),
+            "{failure}"
+        );
+        assert!(!engine.store_failed());
+    });
+}
+
+/// Fix round 1 #10 (C1 §5 as amended): a late usage aggregate supersedes
+/// the stored usage and its warnings: an interval the ledger could not
+/// verify is no longer warned.
+#[test]
+fn a_late_usage_aggregate_supersedes_the_interval_warning() {
+    let Some(root) = child("a_late_usage_aggregate_supersedes_the_interval_warning") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let interval = json!({"input_tokens":null,"cached_input_tokens":null,
+            "output_tokens":null,"reasoning_output_tokens":null,"total_tokens":9,
+            "scope":"vendor_interval","provenance":"reported"});
+        let warning = json!({"code":"usage_interval_unverified",
+            "message":"the reported usage covers an interval VIA could not verify"});
+        let extra = json!({"usage":interval,"warnings":[warning]});
+        let session = unknown_session(&engine, (Value::Null, None), extra).await;
+        let mut late = late_terminal(via_adapters::VendorTerminalStatus::Completed, "late");
+        late.usage = Some(via_adapters::UsageSample {
+            key: None,
+            input: Some(3),
+            cached_input: None,
+            output: Some(4),
+            reasoning_output: None,
+            total: Some(7),
+        });
+        engine.revise(&session, turn(1), &late).await;
+        let envelope = stored_envelope(&engine, &session, 1).await;
+        assert_eq!(envelope["revision"], 1, "{envelope}");
+        assert_eq!(
+            (
+                &envelope["usage"]["total_tokens"],
+                &envelope["usage"]["scope"]
+            ),
+            (&json!(7), &json!("turn")),
+            "{envelope}"
+        );
+        assert_eq!(envelope["warnings"], json!([]), "{envelope}");
+    });
+}
+
+/// Creates turn `n`'s evidence folder, as its launch would have.
+fn evidence_folder(root: &Path, session: &SessionId, n: u32) {
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(
+            root.join("state")
+                .join("evidence")
+                .join(session.as_str())
+                .join(n.to_string()),
+        )
+        .unwrap();
+}
+
+/// A late terminal with a structured output of `bytes` encoded, over the
+/// inline limit.
+fn spilling_terminal(bytes: usize) -> via_adapters::VendorTerminal {
+    let mut late = late_terminal(via_adapters::VendorTerminalStatus::Completed, "late");
+    let value = json!({"a":"x".repeat(bytes - 8)});
+    late.structured_output =
+        Some(serde_json::value::RawValue::from_string(value.to_string()).unwrap());
+    late
+}
+
+/// Fix round 1 #7 (C1 §5 as amended): the spill a revision wrote is
+/// removed once the revision is known not to have committed after its
+/// retry, so a later eligible revision spills and commits.
+#[test]
+fn a_revision_not_made_removes_its_spill() {
+    let Some(root) = child("a_revision_not_made_removes_its_spill") else {
+        return;
+    };
+    let dir = root.join("failpoints");
+    fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    let command = dir.join("store.commit.revision.json");
+    fs::write(
+        &command,
+        json!({"token":FAILPOINT_TOKEN,"occurrence":1,"action":"fail_io","persist":true})
+            .to_string(),
+    )
+    .unwrap();
+    via_store::failpoint::activate(&dir, FAILPOINT_TOKEN).unwrap();
+    run(async {
+        let engine = open(&root);
+        let session = unknown_session(&engine, (Value::Null, None), json!({})).await;
+        evidence_folder(&root, &session, 1);
+        let late = spilling_terminal(40_000);
+        engine.revise(&session, turn(1), &late).await;
+        assert!(dir.join("store.commit.revision.2.ack").exists(), "retried");
+        assert!(revised_events(&engine, &session).await.is_empty());
+        assert!(!engine.store_failed());
+        let spill = root
+            .join("state")
+            .join("evidence")
+            .join(session.as_str())
+            .join("1")
+            .join("structured_output.json");
+        assert!(!spill.exists(), "the unnamed spill is removed");
+        fs::remove_file(&command).unwrap();
+        engine.revise(&session, turn(1), &late).await;
+        let envelope = stored_envelope(&engine, &session, 1).await;
+        assert_eq!(envelope["revision"], 1, "{envelope}");
+        let file = &envelope["structured_output_file"];
+        assert_eq!(file["bytes"], 40_000, "{envelope}");
+        assert!(Path::new(file["path"].as_str().unwrap()).exists());
+    });
+}
+
+/// Fix round 1 #11 (runtime §7): a revision whose spill failed once and
+/// was retried commits, and its first failure is reported, scoped to the
+/// turn, as a retried terminal's is.
+#[test]
+fn a_retried_revision_spill_reports_its_first_failure() {
+    let Some(root) = child("a_retried_revision_spill_reports_its_first_failure") else {
+        return;
+    };
+    let _dir = fail_first(&root, "structured_output.write.fail");
+    run(async {
+        let engine = open(&root);
+        let session = unknown_session(&engine, (Value::Null, None), json!({})).await;
+        evidence_folder(&root, &session, 1);
+        engine
+            .revise(&session, turn(1), &spilling_terminal(40_000))
+            .await;
+        let envelope = stored_envelope(&engine, &session, 1).await;
+        assert_eq!(envelope["revision"], 1, "{envelope}");
+        let failure = engine.store_failure_status().unwrap();
+        assert_eq!(
+            (&failure["kind"], &failure["scope"], &failure["count"]),
+            (&json!("commit_failed"), &json!("turn"), &json!(1)),
+            "{failure}"
+        );
         assert!(!engine.store_failed());
     });
 }

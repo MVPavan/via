@@ -70,3 +70,22 @@ pub(crate) async fn write(
         .await?;
     Ok(StructuredOutputRef { path, bytes })
 }
+
+/// Removes the turn's `structured_output.json`, which no commit names (C1
+/// §5: its naming commit is known not to have committed), and syncs the
+/// folder, on the Store's blocking pool. A missing file is not an error.
+pub(crate) async fn discard(
+    evidence: &EvidenceRoot,
+    tasks: &BlobTasks,
+    session: &SessionId,
+    turn: TurnNumber,
+) -> Result<(), StoreError> {
+    let folder = evidence.path(session, turn);
+    tasks
+        .run(move || match fs::remove_file(folder.join(FILE_NAME)) {
+            Ok(()) => sync_dir(&folder),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        })
+        .await
+}
