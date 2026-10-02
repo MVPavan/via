@@ -41,8 +41,9 @@ impl Engine {
     /// as of an accepted turn; a stored cancel the vendor's terminal
     /// answers is settled by it. The present structured output is
     /// validated against the frozen schema and spilled as at the turn's
-    /// end (C1 Q2, §5), replacing a file no committed envelope names;
-    /// frozen values that do not decode are a corrupt row, and the
+    /// end (C1 Q2, §5), under a file name of the revision's own, so a file
+    /// an attempt that did not commit wrote is never in the way; frozen
+    /// values that do not decode are a corrupt row, and the
     /// revision is declined. A revision not committed is retried once at
     /// the same sequence and, failing again, is not made: the failure is
     /// scoped to the turn. An uncertain or corrupt outcome latches Store
@@ -207,23 +208,18 @@ impl Engine {
         late: &VendorTerminal,
     ) -> Option<Revised> {
         let mut retained = Retained::of(late);
-        let named = envelope
-            .get("structured_output_file")
-            .is_some_and(|file| !file.is_null());
-        if late.structured_output.is_some() && !named {
-            // C1 §5 (fix r2 #2): a file no committed envelope names, as an
-            // earlier revision that did not commit or a crash left, is not
-            // a result. The turn was read revisable, and its revisions run
-            // one at a time on its session's lane, so none names it now.
-            // Should this fail, the spill below fails and reports it.
-            let _ = self.store.discard_structured_output(session, turn).await;
-        }
+        let revision = envelope
+            .get("revision")
+            .and_then(Value::as_u64)
+            .and_then(|revision| u32::try_from(revision).ok())
+            .unwrap_or(0)
+            .saturating_add(1);
         let missing = match &plan.effective {
             Some(effective) => self.validate_retained(effective, Some(&mut retained)).await,
             None => false,
         };
         let retried = self
-            .spill_retained((session, turn), Some(&mut retained), true)
+            .spill_retained((session, turn), Some(revision), Some(&mut retained), true)
             .await?;
         if retried {
             let scope = FailureScope::Turn(session, turn);
@@ -243,12 +239,6 @@ impl Engine {
             terminal.warnings.push(Warning::STRUCTURED_OUTPUT_MISSING);
         }
         project_invalid(retained.output_invalid, &mut terminal);
-        let revision = envelope
-            .get("revision")
-            .and_then(Value::as_u64)
-            .and_then(|revision| u32::try_from(revision).ok())
-            .unwrap_or(0)
-            .saturating_add(1);
         let state = terminal.state;
         apply(&mut envelope, terminal, retained, plan, revision);
         Some(Revised {

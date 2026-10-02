@@ -3500,9 +3500,35 @@ fn spilling_terminal(bytes: usize) -> via_adapters::VendorTerminal {
     late
 }
 
-/// Fix round 1 #7, round 2 #2 (C1 §5 as amended): the spill of a revision
-/// known not to have committed after its retry is named by no envelope;
-/// a later eligible revision replaces it, spills and commits.
+/// The files of turn 1's evidence folder of `session` whose names start
+/// with `structured_output`, sorted.
+fn spills(root: &Path, session: &SessionId) -> Vec<String> {
+    let folder = root
+        .join("state")
+        .join("evidence")
+        .join(session.as_str())
+        .join("1");
+    let mut names: Vec<String> = fs::read_dir(folder)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("structured_output"))
+        .collect();
+    names.sort();
+    names
+}
+
+/// Whether `name` is a revision spill's name for `revision`
+/// (`structured_output.r<revision>-<8 hex>.json`, C1 §5 as amended).
+fn revision_spill(name: &str, revision: u32) -> bool {
+    name.strip_prefix(&format!("structured_output.r{revision}-"))
+        .and_then(|rest| rest.strip_suffix(".json"))
+        .is_some_and(|nonce| nonce.len() == 8 && nonce.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+/// Fix round 1 #7, rounds 2 and 3 #2/#1 (C1 §5 as amended): the spill of
+/// a revision known not to have committed after its retry is named by no
+/// envelope, and is left in place: a later eligible revision spills under
+/// a name of its own and commits. Nothing is deleted.
 #[test]
 fn a_revision_not_made_blocks_no_later_spill() {
     let Some(root) = child("a_revision_not_made_blocks_no_later_spill") else {
@@ -3527,30 +3553,32 @@ fn a_revision_not_made_blocks_no_later_spill() {
         assert!(dir.join("store.commit.revision.2.ack").exists(), "retried");
         assert!(revised_events(&engine, &session).await.is_empty());
         assert!(!engine.store_failed());
-        let spill = root
-            .join("state")
-            .join("evidence")
-            .join(session.as_str())
-            .join("1")
-            .join("structured_output.json");
-        assert!(spill.exists(), "the spill is left, unnamed");
+        let orphans = spills(&root, &session);
+        assert_eq!(orphans.len(), 1, "{orphans:?}");
+        assert!(revision_spill(&orphans[0], 1), "{orphans:?}");
         fs::remove_file(&command).unwrap();
         engine.revise(&session, turn(1), &late).await;
         let envelope = stored_envelope(&engine, &session, 1).await;
         assert_eq!(envelope["revision"], 1, "{envelope}");
         let file = &envelope["structured_output_file"];
         assert_eq!(file["bytes"], 40_000, "{envelope}");
-        assert!(Path::new(file["path"].as_str().unwrap()).exists());
+        let named = Path::new(file["path"].as_str().unwrap());
+        let name = named.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(revision_spill(&name, 1) && name != orphans[0], "{name}");
+        assert_eq!(fs::metadata(named).unwrap().len(), 40_000);
+        let after = spills(&root, &session);
+        assert_eq!(after.len(), 2, "{after:?}");
+        assert!(after.contains(&orphans[0]), "the orphan stays: {after:?}");
     });
 }
 
-/// Fix round 2 #2 (C1 §5 as amended): a `structured_output.json` that no
-/// committed envelope names, as a crash between a revision's spill and its
-/// commit leaves, is not a result: after a restart, the next eligible
-/// revision replaces it and names its own.
+/// Fix round 2 #2, round 3 #1 (C1 §5 as amended): files that no committed
+/// envelope names, as a crash between a revision's spill and its commit
+/// leaves, are not results and are never deleted: after a restart, the
+/// next eligible revision commits its own file beside them.
 #[test]
-fn a_revision_replaces_an_unnamed_spill_after_a_restart() {
-    let Some(root) = child("a_revision_replaces_an_unnamed_spill_after_a_restart") else {
+fn an_orphan_spill_blocks_no_revision_after_a_restart() {
+    let Some(root) = child("an_orphan_spill_blocks_no_revision_after_a_restart") else {
         return;
     };
     let session = run(async {
@@ -3560,13 +3588,18 @@ fn a_revision_replaces_an_unnamed_spill_after_a_restart() {
         shutdown(&engine).await;
         session
     });
-    let spill = root
+    let folder = root
         .join("state")
         .join("evidence")
         .join(session.as_str())
-        .join("1")
-        .join("structured_output.json");
-    fs::write(&spill, b"{\"orphan\":true}").unwrap();
+        .join("1");
+    let orphans = [
+        "structured_output.json",
+        "structured_output.r1-0badf00d.json",
+    ];
+    for orphan in orphans {
+        fs::write(folder.join(orphan), b"{\"orphan\":true}").unwrap();
+    }
     run(async {
         let engine = open(&root);
         engine
@@ -3574,11 +3607,16 @@ fn a_revision_replaces_an_unnamed_spill_after_a_restart() {
             .await;
         let envelope = stored_envelope(&engine, &session, 1).await;
         assert_eq!(envelope["revision"], 1, "{envelope}");
-        assert_eq!(
-            envelope["structured_output_file"]["bytes"], 40_000,
-            "{envelope}"
-        );
-        assert_eq!(fs::metadata(&spill).unwrap().len(), 40_000);
+        let file = &envelope["structured_output_file"];
+        assert_eq!(file["bytes"], 40_000, "{envelope}");
+        let named = Path::new(file["path"].as_str().unwrap());
+        let name = named.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(revision_spill(&name, 1), "{name}");
+        assert!(!orphans.contains(&name.as_str()), "{name}");
+        assert_eq!(fs::metadata(named).unwrap().len(), 40_000);
+        for orphan in orphans {
+            assert_eq!(fs::read(folder.join(orphan)).unwrap(), b"{\"orphan\":true}");
+        }
         assert!(!engine.store_failed());
     });
 }

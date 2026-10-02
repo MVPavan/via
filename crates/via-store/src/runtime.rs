@@ -2496,28 +2496,18 @@ impl StoreClient {
         crate::FinalTextFile::create(&self.evidence, self.blobs.tasks.clone(), session, turn).await
     }
 
-    /// Writes the turn's `structured_output.json` whole in its evidence
-    /// folder and syncs it and the folder (C1 §5), before the commit that
-    /// names it. A failure leaves no file to name.
+    /// Writes the turn's structured output whole in its evidence folder
+    /// and syncs it and the folder (C1 §5), before the commit that names
+    /// it: `structured_output.json`, or for its `revision` a file of that
+    /// revision's own name. A failure leaves no file to name.
     pub async fn write_structured_output(
         &self,
-        session: &SessionId,
-        turn: TurnNumber,
+        (session, turn): (&SessionId, TurnNumber),
+        revision: Option<u32>,
         encoded: Vec<u8>,
     ) -> Result<crate::StructuredOutputRef, StoreError> {
-        crate::structured_output::write(&self.evidence, &self.blobs.tasks, session, turn, encoded)
-            .await
-    }
-
-    /// Removes the turn's `structured_output.json` that no committed
-    /// envelope names (C1 §5), before a revision of the still revisable
-    /// turn writes its own. The caller holds that no commit names it.
-    pub async fn discard_structured_output(
-        &self,
-        session: &SessionId,
-        turn: TurnNumber,
-    ) -> Result<(), StoreError> {
-        crate::structured_output::discard(&self.evidence, &self.blobs.tasks, session, turn).await
+        let (evidence, tasks) = (&self.evidence, &self.blobs.tasks);
+        crate::structured_output::write((evidence, tasks), (session, turn), revision, encoded).await
     }
 
     /// A stored relative evidence folder made absolute; no I/O. Core gets

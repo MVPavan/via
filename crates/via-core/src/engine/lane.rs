@@ -573,6 +573,17 @@ impl LaneState {
     }
 }
 
+/// One item's disposal under way ([`Lane::close_draining`]).
+type Disposal<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+/// Awaits the disposal under way, if any; never ends without one.
+async fn disposal(current: Option<&mut Disposal<'_>>) {
+    match current {
+        Some(current) => current.await,
+        None => std::future::pending().await,
+    }
+}
+
 /// The driver's journal report's own consumer (critical r2 F3, C2 §2
 /// `journal_uncertain`), on the daemon's tracker apart from the lane's
 /// actor, so no turn job delays it: an uncertain Host journal write no
@@ -998,8 +1009,10 @@ impl Lane {
             // reconciliation owns their groups (final shutdown).
             None => None,
         };
+        let mut disposing = None;
         if let Some((mode, deadline)) = close {
-            let report = self.close_draining(&mut inbox, mode, deadline).await;
+            let (report, current) = self.close_draining(&mut inbox, mode, deadline).await;
+            disposing = current;
             if owned {
                 *lock(&self.report) = Some(report);
             }
@@ -1009,8 +1022,12 @@ impl Lane {
         let _ = via_store::failpoint::hit_async("core.lane.admission_close").await;
         // Admission closes first (Sol r4 R3): what the driver sends from now
         // on is refused at its sink, and an empty channel is not its end
-        // until no sender holds a slot.
+        // until no sender holds a slot. A disposal the close's end found
+        // under way is then finished, never cut off (fix r3 #2).
         inbox.close();
+        if let Some(disposing) = disposing {
+            disposing.await;
+        }
         let mut handled = 0;
         while let Some(admitted) = inbox.recv().await {
             self.dispose(admitted).await;
@@ -1062,28 +1079,34 @@ impl Lane {
     /// Closes the driver while disposing of what its channel receives
     /// meanwhile, one item at a time (fix r2 #1): what the driver still
     /// delivers before its close ends, such as a retired process's late
-    /// observations, waits for no close, and the close waits for no
-    /// disposal. The driver's close and its delivery are bounded by the
-    /// close's absolute `deadline` (C1 §3.6); a disposal is never cut off
-    /// there: an item being handled is finished, and what the channel
-    /// still holds is disposed of after the close.
+    /// observations, waits for no close. The close is polled apart from
+    /// the disposal under way (fix r3 #2), so its absolute `deadline` (C1
+    /// §3.6), which bounds the driver's close and its delivery, never
+    /// waits behind Store work. Returns the close's report as soon as it
+    /// ends, with the disposal then under way, which the caller finishes
+    /// once the channel's admission closed: a commit is never cut off.
     async fn close_draining(
         &self,
         inbox: &mut Inbox,
         mode: CloseMode,
         deadline: Deadline,
-    ) -> CloseReport {
+    ) -> (CloseReport, Option<Disposal<'_>>) {
+        // Test builds: the lane starts the driver's close.
+        #[cfg(feature = "test-failpoints")]
+        let _ = via_store::failpoint::hit_async("core.lane.close_draining").await;
         let mut closing = std::pin::pin!(self.driver.close(mode, deadline));
+        let mut current: Option<Disposal<'_>> = None;
         let (mut open, mut handled) = (true, 0);
         loop {
             tokio::select! {
                 biased;
-                report = &mut closing => return report,
-                admitted = inbox.recv(), if open => match admitted {
-                    Some(admitted) => {
-                        self.dispose(admitted).await;
-                        ready_item(&mut handled).await;
-                    }
+                report = &mut closing => return (report, current),
+                () = disposal(current.as_mut()), if current.is_some() => {
+                    current = None;
+                    ready_item(&mut handled).await;
+                }
+                admitted = inbox.recv(), if open && current.is_none() => match admitted {
+                    Some(admitted) => current = Some(Box::pin(self.dispose(admitted))),
                     None => open = false,
                 },
             }

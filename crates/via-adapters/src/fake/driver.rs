@@ -591,7 +591,12 @@ async fn turn_task(task: TurnTask) {
     // at a time, as the turn's own hop.
     let (items, items_rx) = mpsc::channel(1);
     let (failure, mut failure_rx) = oneshot::channel();
-    lane.retired = persistent.then_some(FakeRetired { items, failure });
+    let (cleaned, cleaned_rx) = oneshot::channel();
+    lane.retired = persistent.then_some(FakeRetired {
+        items,
+        failure,
+        cleaned,
+    });
     let (inner, inner_rx) = oneshot::channel();
     let stop = (merged_rx, sources);
     let route_turn = route.turn(process, start, hop, (wall, force, stop), lane, inner);
@@ -615,14 +620,21 @@ async fn turn_task(task: TurnTask) {
         }
     };
     let routed = async {
-        tokio::select! {
+        let retirement = tokio::select! {
             (retirement, ()) = async { tokio::join!(route_turn, relay) } => retirement,
             never = merge_stops(core_stop, close, &cancel, &merged) => match never {},
+        };
+        // The retirement's reading ended: a failure of the helper's output
+        // fails the connection.
+        if let Ok(cause) = failure_rx.try_recv() {
+            latch(&health, DriverFailure::Route(cause));
         }
+        retirement
     };
     let delivery = deliver_retired(items_rx, &observations, &health);
     // Boxed: Route's turn is a large future.
-    retire_beside(Box::pin(routed), delivery, |retirement| {
+    let routed = Box::pin(routed);
+    retire_beside((routed, cleaned_rx), delivery, |retirement| {
         let uncertain = persistent
             && retirement_uncertain(
                 &retirement,
@@ -633,7 +645,7 @@ async fn turn_task(task: TurnTask) {
             health: &health,
             journal: &journal,
         };
-        settle_retired((retirement, uncertain), failure_rx.try_recv().ok(), reports);
+        settle_retired((retirement, uncertain), reports);
         held(&reservation).retired(retirement);
         // An uncommitted slot is released with the last share, after the
         // cleanup and after `run_turn`.
@@ -642,33 +654,62 @@ async fn turn_task(task: TurnTask) {
     })
     .await;
     done.send_replace(Retiring::Delivered);
+    // Test builds: the retirement's delivery ended.
+    #[cfg(feature = "test-failpoints")]
+    let _ = via_routes::failpoint::hit_async("adapter.fake.retirement_delivered").await;
 }
 
 /// Runs the turn through Route (`routed`) while delivering what its
-/// retiring helper reports (`delivery`), so neither waits for the other;
-/// `settle` runs once the process is retired, before the delivery is
-/// awaited to its end: a retirement's reports and cleanup wait for no
-/// observation (critical r1 #4, fix r1 #1, fix r2 #1).
-async fn retire_beside(
-    routed: impl Future<Output = Retirement>,
+/// retiring helper reports (`delivery`), so neither waits for the other.
+/// `settle` runs once the process is retired: when Route reports its
+/// close ended (`cleaned`), whatever its reading and the delivery are
+/// doing, or else when Route's turn returns. A retirement's cleanup and
+/// reports wait for no observation (critical r1 #4, fix r1 #1, fix r2 #1,
+/// fix r3 #3). Returns once Route's turn returned and the delivery ended.
+async fn retire_beside<F>(
+    (routed, mut cleaned): (F, oneshot::Receiver<Retirement>),
     delivery: impl Future<Output = ()>,
     settle: impl FnOnce(Retirement),
-) {
+) where
+    F: Future<Output = Retirement> + Unpin,
+{
     let mut delivery = std::pin::pin!(delivery);
-    let mut delivered = false;
-    let retirement = {
-        // Dropped once it returned, with what it holds.
-        let mut routed = std::pin::pin!(routed);
-        loop {
-            tokio::select! {
-                retirement = &mut routed => break retirement,
-                () = &mut delivery, if !delivered => delivered = true,
+    // Dropped once it returned, with what it holds.
+    let mut routed = Some(routed);
+    let mut settle = Some(settle);
+    let (mut delivered, mut reported) = (false, false);
+    while routed.is_some() || !delivered {
+        let ended = tokio::select! {
+            biased;
+            facts = &mut cleaned, if !reported => {
+                reported = true;
+                facts.ok()
             }
+            retirement = poll_routed(routed.as_mut()), if routed.is_some() => {
+                routed = None;
+                Some(retirement)
+            }
+            () = &mut delivery, if !delivered => {
+                delivered = true;
+                None
+            }
+        };
+        if let Some(retirement) = ended
+            && let Some(settle) = settle.take()
+        {
+            settle(retirement);
+            // Test builds: the retirement's cleanup and reports are out.
+            #[cfg(feature = "test-failpoints")]
+            let _ = via_routes::failpoint::hit_async("adapter.fake.retirement_cleaned").await;
         }
-    };
-    settle(retirement);
-    if !delivered {
-        delivery.await;
+    }
+}
+
+/// Awaits Route's turn, if it still runs; never ends without one.
+async fn poll_routed<F: Future<Output = Retirement> + Unpin>(routed: Option<&mut F>) -> Retirement {
+    match routed {
+        Some(routed) => routed.await,
+        None => std::future::pending().await,
     }
 }
 
@@ -681,14 +722,9 @@ struct RetiredReports<'a> {
 }
 
 /// Publishes a persistent connection's retirement reports at once: its
-/// journal's uncertainty, its unproven cleanup (`uncertain`) and a
-/// `failure` of the helper's output each fail the connection, apart from
-/// any observation (critical r1 #4).
-fn settle_retired(
-    (retirement, uncertain): (Retirement, bool),
-    failure: Option<RouteError>,
-    reports: RetiredReports<'_>,
-) {
+/// journal's uncertainty and its unproven cleanup (`uncertain`) each fail
+/// the connection, apart from any observation (critical r1 #4).
+fn settle_retired((retirement, uncertain): (Retirement, bool), reports: RetiredReports<'_>) {
     // A persistent connection's retirement journal is no turn's: its
     // uncertainty is reported apart from the cleanup's, before the health
     // failure that retires the lane (critical r1 #4).
@@ -697,9 +733,6 @@ fn settle_retired(
     }
     if uncertain {
         latch(reports.health, DriverFailure::RetirementUncertain);
-    }
-    if let Some(cause) = failure {
-        latch(reports.health, DriverFailure::Route(cause));
     }
 }
 
@@ -1432,9 +1465,7 @@ mod tests {
     };
 
     use tokio::sync::watch;
-    use via_routes::{
-        FakeDenialKind, FakeMessage, FakeRetiredItem, RouteError, RouteMessage, TurnNumber,
-    };
+    use via_routes::{FakeDenialKind, FakeMessage, FakeRetiredItem, RouteMessage};
 
     use super::{
         RetiredReports, Retirement, RetirementFault, WireCleanup, deliver_retired, retire_beside,
@@ -1444,32 +1475,20 @@ mod tests {
         DriverFailure, DriverHealth, OBSERVATION_BYTES, ObservationBudget, observation_channel_in,
     };
 
-    /// Fix round 1 #1, #9, round 2 #1 (C2 §2 health, runtime §7): a
-    /// retirement's journal uncertainty, its unproven cleanup and a failure
-    /// of its helper's output are published at once, and the retirement is
-    /// recorded, while the helper's observations still wait on a saturated
-    /// session channel.
+    /// Fix round 1 #1, round 2 #1 (C2 §2 health, runtime §7): a
+    /// retirement's journal uncertainty and its unproven cleanup are
+    /// published at once, and the retirement is recorded, while the
+    /// helper's observations still wait on a saturated session channel. (A
+    /// failure of its output is reported once its reading ended: the
+    /// conformance tests of an undecodable or out-of-phase message.)
     #[test]
     fn a_saturated_channel_delays_no_retirement_report() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .unwrap();
-        let turn = TurnNumber::try_from(1).unwrap();
-        let protocol = RouteError::Protocol {
-            turn,
-            detail: "malformed known fake message",
-        };
-        let cases = [
-            (true, None, DriverFailure::RetirementUncertain),
-            (
-                false,
-                Some(protocol.clone()),
-                DriverFailure::Route(protocol),
-            ),
-        ];
         runtime.block_on(async {
-            for (uncertain, failure, cause) in cases {
+            for uncertain in [false, true] {
                 let budget = ObservationBudget::new();
                 let _saturated = budget
                     .charge(u32::try_from(OBSERVATION_BYTES).unwrap())
@@ -1493,14 +1512,16 @@ mod tests {
                     }))
                     .unwrap();
                 drop(items);
+                let (_cleaned, cleaned_rx) = tokio::sync::oneshot::channel();
                 let released = AtomicBool::new(false);
                 let delivery = deliver_retired(items_rx, &sink, &health);
-                let settle = retire_beside(async { retirement }, delivery, |retirement| {
+                let routed = Box::pin(async move { retirement });
+                let settle = retire_beside((routed, cleaned_rx), delivery, |retirement| {
                     let reports = RetiredReports {
                         health: &health,
                         journal: &journal,
                     };
-                    settle_retired((retirement, uncertain), failure, reports);
+                    settle_retired((retirement, true), reports);
                     released.store(true, Ordering::Release);
                 });
                 let mut settle = std::pin::pin!(settle);
@@ -1508,11 +1529,88 @@ mod tests {
                 assert!(waited.is_err(), "the observation waits for the channel");
                 assert_eq!(
                     *health.borrow(),
-                    DriverHealth::Failed { first_cause: cause }
+                    DriverHealth::Failed {
+                        first_cause: DriverFailure::RetirementUncertain
+                    }
                 );
                 assert_eq!(*journal.borrow(), uncertain);
                 assert!(released.load(Ordering::Acquire));
             }
+        });
+    }
+
+    /// Fix round 3 #3 (C2 §2 health, runtime §7): the retirement's
+    /// cleanup and its reports are published once its physical close
+    /// ended, while its reader is still blocked handing a message to a
+    /// delivery that waits on a saturated session channel.
+    #[test]
+    fn a_blocked_retirement_reader_delays_no_cleanup() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let budget = ObservationBudget::new();
+            let _saturated = budget
+                .charge(u32::try_from(OBSERVATION_BYTES).unwrap())
+                .unwrap();
+            let (sink, _receiver) = observation_channel_in(&budget);
+            let (health, _health) = watch::channel(DriverHealth::Open);
+            let (journal, _journal) = watch::channel(false);
+            let mut retirement = retirement(WireCleanup::Quiescent);
+            retirement.journal_uncertain = true;
+            let denial = || {
+                FakeRetiredItem::Durable(RouteMessage {
+                    payload: FakeMessage::Denial {
+                        vendor_turn_id: "fake-turn-1".to_owned(),
+                        kind: FakeDenialKind::Command,
+                        target: "t".to_owned(),
+                        reason: "r".to_owned(),
+                    },
+                    steer: None,
+                })
+            };
+            let (items, items_rx) = tokio::sync::mpsc::channel(1);
+            let read = std::sync::Arc::new(AtomicBool::new(false));
+            let reading = std::sync::Arc::clone(&read);
+            // The reader: the delivery takes the first message and waits on
+            // the channel, the hand-over holds the second, and the third
+            // waits for room.
+            let reader = async move {
+                for _ in 0..3 {
+                    items.send(denial()).await.unwrap();
+                }
+                reading.store(true, Ordering::Release);
+            };
+            let routed = Box::pin(async move {
+                reader.await;
+                retirement
+            });
+            // Route's close ended: its facts come apart from the reading.
+            let (cleaned, cleaned_rx) = tokio::sync::oneshot::channel();
+            cleaned.send(retirement).unwrap();
+            let released = AtomicBool::new(false);
+            let delivery = deliver_retired(items_rx, &sink, &health);
+            let settle = retire_beside((routed, cleaned_rx), delivery, |retirement| {
+                let reports = RetiredReports {
+                    health: &health,
+                    journal: &journal,
+                };
+                settle_retired((retirement, true), reports);
+                released.store(true, Ordering::Release);
+            });
+            let mut settle = std::pin::pin!(settle);
+            let waited = tokio::time::timeout(Duration::from_millis(50), &mut settle).await;
+            assert!(waited.is_err(), "the delivery waits for the channel");
+            assert!(!read.load(Ordering::Acquire), "the reader is blocked");
+            assert_eq!(
+                *health.borrow(),
+                DriverHealth::Failed {
+                    first_cause: DriverFailure::RetirementUncertain
+                }
+            );
+            assert!(*journal.borrow());
+            assert!(released.load(Ordering::Acquire));
         });
     }
 

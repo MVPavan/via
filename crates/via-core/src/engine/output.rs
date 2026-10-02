@@ -86,15 +86,17 @@ impl Engine {
     /// fields are `null`.
     pub(super) async fn spill(&self, record: &mut TurnRecord, retry: bool) -> Option<bool> {
         let address = (&record.session, record.turn);
-        self.spill_retained(address, record.vendor.retained.as_mut(), retry)
+        self.spill_retained(address, None, record.vendor.retained.as_mut(), retry)
             .await
     }
 
     /// [`Engine::spill`] of turn `(session, turn)`'s retained vendor
-    /// terminal, `None` without one.
+    /// terminal, `None` without one; for its `revision`, under a file name
+    /// of that revision's own (C1 §5, §7.6).
     pub(super) async fn spill_retained(
         &self,
         (session, turn): (&SessionId, TurnNumber),
+        revision: Option<u32>,
         retained: Option<&mut Retained>,
         retry: bool,
     ) -> Option<bool> {
@@ -114,7 +116,7 @@ impl Engine {
         for attempt in 0..=u8::from(retry) {
             let written = self
                 .store
-                .write_structured_output(session, turn, encoded.clone())
+                .write_structured_output((session, turn), revision, encoded.clone())
                 .await;
             if let Ok(file) = written {
                 retained.structured_output_file = Some(StructuredOutputFile {

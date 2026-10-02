@@ -79,6 +79,9 @@ pub struct FakeRetired {
     /// of the connection's protocol phase, or a failed read. The
     /// connection failed.
     pub failure: oneshot::Sender<RouteError>,
+    /// The retirement's facts, sent as soon as Host's close of the helper
+    /// ended, whatever the reading is doing (fix r3 #3).
+    pub cleaned: oneshot::Sender<Retirement>,
 }
 
 /// One message [`FakeRetired`] forwards.
@@ -273,6 +276,21 @@ pub struct Retirement {
 }
 
 impl Retirement {
+    /// The facts of a launched helper's close `report`, with the `exit`
+    /// its turn already saw.
+    fn closed(exit: Option<ExitReport>, report: &WireCloseReport) -> Self {
+        let reported = report
+            .vendor_exit
+            .filter(|exit| exit.code.is_some() || exit.signal.is_some());
+        Self {
+            launched: true,
+            exit: exit.or(reported),
+            cleanup: Some(report.cleanup),
+            forced: report.forced,
+            journal_uncertain: report.journal_uncertain,
+        }
+    }
+
     /// The facts of Route's S1-shaped result.
     pub(super) fn of(result: &Result<FakeRouteResult, RouteFailure>) -> Self {
         match result {
@@ -859,13 +877,14 @@ impl Serving<'_> {
     /// Retires the persistent profile's helper apart from the logical turn
     /// (decision H1): input closed, then Host's close under `by`, forced at
     /// once for a session close, then the drain. Meanwhile the helper's
-    /// output is read ([`read_retired`]) and its report goes on the lane's
-    /// `retired`.
+    /// output is read ([`read_retired`]) and its messages go on the lane's
+    /// `retired`. The retirement's facts, with the `exit` the turn saw, go
+    /// there as soon as Host's close ended, apart from the reading.
     pub(super) async fn retire(
         &mut self,
         sender: &WireSender,
         mut messages: WireMessages,
-        by: Deadline,
+        (exit, by): (Option<ExitReport>, Deadline),
     ) -> WireCloseReport {
         let closing = self
             .signals
@@ -880,13 +899,27 @@ impl Serving<'_> {
         };
         // A half-close that failed leaves Host's close below to stop it.
         let _half_closed = sender.close_input(by).await;
-        let retired = self.lane.retired.take();
+        let (reader, cleaned) = match self.lane.retired.take() {
+            Some(FakeRetired {
+                items,
+                failure,
+                cleaned,
+            }) => (Some((items, failure)), Some(cleaned)),
+            None => (None, None),
+        };
         let interrupted = self.lane.interrupt != Interrupt::NotSent;
         let reading = (self.turn, &mut self.phase, interrupted);
-        let close = sender.close(CloseRequest { mode, deadline: by });
+        let close = async {
+            let report = sender.close(CloseRequest { mode, deadline: by }).await;
+            if let Some(cleaned) = cleaned {
+                // The driver's turn task is gone: nobody takes the facts.
+                let _unread = cleaned.send(Retirement::closed(exit, &report));
+            }
+            report
+        };
         let read = async {
-            if let Some(retired) = retired {
-                read_retired(&mut messages, sender, reading, retired, by).await;
+            if let Some(reader) = reader {
+                read_retired(&mut messages, sender, reading, reader, by).await;
             }
         };
         let (report, ()) = tokio::join!(close, read);
@@ -900,19 +933,18 @@ impl Serving<'_> {
 /// (its lane closed). Each message is checked against the connection's
 /// `phase` as the turn's own are; the durable ones (denials, declines)
 /// and the first terminal, when the logical turn retained none (the only
-/// one the phase admits), go on `retired.items`; everything else is
+/// one the phase admits), go on `items`; everything else is
 /// dropped, as the logical turn already ended. A message that does not
 /// decode is kept in `undecoded.bin`; it, a phase violation and a failed
-/// read end the reading with their cause on `retired.failure`. A stop
+/// read end the reading with their cause on `failure`. A stop
 /// order's wake, the daemon force and `by` end it quietly.
 async fn read_retired(
     messages: &mut WireMessages,
     sender: &WireSender,
     (turn, phase, interrupted): (TurnNumber, &mut super::Phase, bool),
-    retired: FakeRetired,
+    (items, failure): (mpsc::Sender<FakeRetiredItem>, oneshot::Sender<RouteError>),
     by: Deadline,
 ) {
-    let FakeRetired { items, failure } = retired;
     let read = async {
         loop {
             let message = match messages.next_message().await {

@@ -177,6 +177,14 @@ impl Daemon {
         self.engine.close(params, &raw.to_string()).await.unwrap()
     }
 
+    /// Closes `session` gracefully under a `deadline_ms` deadline.
+    #[cfg(feature = "test-failpoints")]
+    async fn close_within(&self, session: &SessionId, deadline_ms: u64) -> Value {
+        let raw = json!({"session":session,"handle":HANDLE,"deadline_ms":deadline_ms});
+        let params: CloseParams = serde_json::from_value(raw.clone()).unwrap();
+        self.engine.close(params, &raw.to_string()).await.unwrap()
+    }
+
     /// Releases the fake agent's gate `name`.
     fn release(&self, name: &str) {
         fs::write(self.root.join("sync").join(format!("{name}.release")), b"").unwrap();
@@ -3013,13 +3021,15 @@ fn core_a_failed_retirement_delivers_its_observations_while_it_closes() {
     });
 }
 
-/// Fix round 2 #1 (C2 §2 health, §4.1): the lane disposes of what its
-/// channel receives while it closes the driver. Core holds its first
-/// late item (`core.lane.dispose`), so the session channel fills with the
-/// retired helper's denials while its terminal still waits behind them.
-/// The retirement's unproven cleanup fails the driver's health; once the
-/// item is released the lane closes the driver, and its close waits for
-/// that delivery while the lane drains: the terminal revises the turn.
+/// Fix round 2 #1, round 3 #3 and #4 (C2 §2 health, §4.1): the lane
+/// disposes of what its channel receives while it closes the driver.
+/// Core holds its first late item (`core.lane.dispose`), so the session
+/// channel fills with the retired helper's denials while its terminal
+/// still waits behind them. The retirement's cleanup ends and its
+/// unproven cleanup is reported while that delivery is still blocked;
+/// once the item is released the failed driver is closed, and its close
+/// waits for the delivery while the lane drains: the terminal revises the
+/// turn.
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn core_a_closing_lane_drains_what_its_driver_still_delivers() {
@@ -3042,15 +3052,26 @@ fn core_a_closing_lane_drains_what_its_driver_still_delivers() {
     };
     via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
     arm(&root, "core.lane.dispose", "pause");
+    acknowledge(&root, "adapter.fake.retirement_cleaned", 1);
+    acknowledge(&root, "adapter.fake.retirement_delivered", 1);
+    acknowledge(&root, "core.lane.close_draining", 1);
     run(async {
         let daemon = Daemon::open(&root);
         let session = unknown_turn(&daemon, "late", &json!({})).await;
         daemon.release("late");
         until_acked(&root, "core.lane.dispose", 1).await;
-        // The helper's output is read to its end and its retirement
-        // settled meanwhile; the channel stays full.
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // The retirement's cleanup and its reports are published while
+        // its delivery is still blocked behind the held item.
+        until_acked(&root, "adapter.fake.retirement_cleaned", 1).await;
+        let delivered = root
+            .join("points")
+            .join("adapter.fake.retirement_delivered.1.ack");
+        assert!(!delivered.exists(), "the delivery was not blocked");
         fs::write(root.join("points").join("core.lane.dispose.1.release"), b"").unwrap();
+        // The failed driver's close starts, and the delivery ends only
+        // while the lane drains beside it.
+        until_acked(&root, "core.lane.close_draining", 1).await;
+        until_acked(&root, "adapter.fake.retirement_delivered", 1).await;
         let by = tokio::time::Instant::now() + Duration::from_secs(30);
         let events = loop {
             let events = all_events(&daemon, &session).await;
@@ -3068,6 +3089,65 @@ fn core_a_closing_lane_drains_what_its_driver_still_delivers() {
             .filter(|event| event["type"] == "action.denied")
             .count();
         assert_eq!(denied, RETIRED_DENIALS);
+        daemon.shutdown().await;
+    });
+}
+
+/// Fix round 3 #2 (C1 §3.6): the driver's close is polled while the lane
+/// disposes of an item, so its deadline never waits behind Store work.
+/// A close under a 150 ms deadline starts; the retired helper's first
+/// denial is then held in its disposal (`core.lane.dispose`). Past the
+/// deadline the close has ended and the channel's admission closed: a
+/// denial the helper reports then is never committed, while the held one
+/// still is.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_a_held_disposal_delays_no_close() {
+    let scripts = [script(
+        "first",
+        &[
+            accepted(1),
+            terminal(1, "completed", "end_turn"),
+            gate("before"),
+            denial(1, "held"),
+            gate("after"),
+            denial(1, "late"),
+        ],
+    )];
+    let Some(root) = child(
+        "core_a_held_disposal_delays_no_close",
+        &scenario(&persistent(), &scripts),
+        &[],
+    ) else {
+        return;
+    };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    arm(&root, "core.lane.dispose", "pause");
+    acknowledge(&root, "core.lane.close_draining", 1);
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = daemon.spawn("first", &json!({})).await;
+        let envelope = daemon.wait(&session, 1).await;
+        assert_eq!(envelope["state"], "completed", "{envelope}");
+        daemon.entered("before").await;
+        let steps = async {
+            until_acked(&root, "core.lane.close_draining", 1).await;
+            daemon.release("before");
+            until_acked(&root, "core.lane.dispose", 1).await;
+            // Past the close's deadline: the helper's next denial comes.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            daemon.release("after");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            fs::write(root.join("points").join("core.lane.dispose.1.release"), b"").unwrap();
+        };
+        let (_closed, ()) = tokio::join!(daemon.close_within(&session, 150), steps);
+        let events = events(&daemon, &session).await;
+        let denied: Vec<&Value> = events
+            .iter()
+            .filter(|event| event["type"] == "action.denied")
+            .collect();
+        assert_eq!(denied.len(), 1, "{events:?}");
+        assert_eq!(denied[0]["target"], "held", "{events:?}");
         daemon.shutdown().await;
     });
 }
