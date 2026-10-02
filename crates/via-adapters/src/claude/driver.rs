@@ -402,7 +402,7 @@ impl Delivery<'_> {
                     &adapter.binary,
                     self.reports.recipe.clone(),
                     cause,
-                    std::time::Instant::now(),
+                    super::plan::clock(),
                 );
                 self.fail(Verdict::Refused(cause));
             }

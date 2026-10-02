@@ -108,17 +108,21 @@ pub(crate) fn categories() -> BTreeMap<Category, CategoryDecl> {
     ])
 }
 
-/// The plan's clock. Test builds: the failpoint
-/// `adapter.claude.plan_clock_ms` (a `value`) moves it that many
-/// milliseconds ahead, so a refusal's expiry runs under controlled time
-/// (x.3.2 C3).
-fn plan_clock() -> std::time::Instant {
+/// The refusal cache's clock: a plan reads entries and the driver writes
+/// refusals at its instant. Test builds: while the failpoint
+/// `adapter.claude.plan_clock_ms` (a `value`) is armed, the clock is
+/// frozen at a fixed origin (the real time of its first armed reading in
+/// this process) plus that many milliseconds, so a refusal's expiry runs
+/// under controlled time that real elapsed time never moves (x.3.2 C3).
+pub(super) fn clock() -> std::time::Instant {
     let now = std::time::Instant::now();
     #[cfg(feature = "test-failpoints")]
     if let Ok(Some(ahead)) = via_routes::failpoint::value("adapter.claude.plan_clock_ms") {
-        return now
+        static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let origin = *ORIGIN.get_or_init(|| now);
+        return origin
             .checked_add(std::time::Duration::from_millis(ahead))
-            .unwrap_or(now);
+            .unwrap_or(origin);
     }
     now
 }
@@ -197,7 +201,7 @@ impl ClaudeAdapter {
         model: ModelChoice,
         requested: Inherit,
     ) -> RoutePlan {
-        self.plan_at(harness, req, model, requested, plan_clock())
+        self.plan_at(harness, req, model, requested, clock())
     }
 
     /// [`Self::plan`] with its clock at `now`: the refusal cache's entries

@@ -210,10 +210,7 @@ impl Deployment {
         std::os::unix::fs::symlink(&self.fake, &real)?;
         let script = self.claude();
         fs::remove_file(&script)?;
-        // One single-quoted shell word: each `'` closes the quote, adds an
-        // escaped quote and reopens it.
-        let quoted = real.to_string_lossy().replace('\'', "'\\''");
-        let text = format!("#!/bin/sh\n{prelude}\nexec '{quoted}' \"$@\"\n");
+        let text = format!("#!/bin/sh\n{prelude}\nexec {} \"$@\"\n", shell_word(&real));
         fs::write(&script, &text)?;
         fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
         self.stimulus(&script, "script", &json!(text));
@@ -1332,21 +1329,60 @@ fn contend(d: &Deployment, evidence: &Evidence) -> Result<(String, String), Scen
     Ok((session, uuid))
 }
 
+/// Wire's message dequeue (one hit per stdout message and one for the end
+/// of stdout), Route's observed exit (after its read to EOF), and Host's
+/// committed ARM intent, the last step before a vendor spawns.
+#[cfg(feature = "test-failpoints")]
+const RECEIVED: &str = "wire.messages.received";
+#[cfg(feature = "test-failpoints")]
+const EXITED: &str = "wire.exit.observed";
+#[cfg(feature = "test-failpoints")]
+const ARMING: &str = "host.anchor.after_arm_intent_commit";
+
 /// Ruling Q5, the generation barrier under contention: launch 1 has read
-/// its stdin EOF but still owes a late observation (it holds at a gate)
-/// while turn 2 waits behind it. Turn 2 launches only after launch 1 was
-/// released and its late message delivered: that message is turn 1's,
-/// committed before any event of turn 2, and it verifies nothing: while
-/// launch 2 waits before its own init, `status` keeps the historical ID
-/// unverified and no `session.reopened` exists. Launch 2's own init
-/// reopens the session once. Both launches ran their replays through
-/// (exit 0): launch 1 emitted its late message.
+/// its stdin EOF but still owes a late message (it holds at a gate) while
+/// turn 2 waits behind it. Turn 2 launches only after launch 1's reader
+/// finished: at launch 2's ARM, held before its vendor spawns, Wire has
+/// handed Route all five of launch 1's stdout reads (init, reply, result,
+/// the late message, end of stdout) and Route has observed launch 1's
+/// exit, which it waits for only after reading stdout to EOF; no sixth
+/// read exists yet. A post-result assistant message is no observation by
+/// contract, so its delivery is read from Wire's dequeue, not from an
+/// event. It verifies nothing: while launch 2 waits before its own init,
+/// `status` keeps the historical ID unverified and no `session.reopened`
+/// exists. Launch 2's own init reopens the session once. Both launches ran
+/// their replays through (exit 0).
+#[cfg(feature = "test-failpoints")]
 #[test]
 fn claude_generation_barrier_holds_late_messages() -> TestResult {
     scenario("claude_generation_barrier_late", |d, evidence| {
-        let _daemon = Daemon::start(d, evidence, "final")?;
+        for (point, action) in [(RECEIVED, "value_persist:1"), (EXITED, "value_persist:1")] {
+            d.failpoints.arm(point, 1, action).map_err(infra)?;
+        }
+        d.failpoints.arm(ARMING, 2, "pause").map_err(infra)?;
+        let daemon = Daemon::start(d, evidence, "final")?;
         let (session, uuid) = contend(d, evidence)?;
         d.release(1)?;
+        d.failpoints
+            .wait_ack(ARMING, 2, "pause", daemon.pid(), WAIT)
+            .map_err(infra)?;
+        let acked = |point: &str, n: u64| {
+            d.root
+                .path()
+                .join("failpoints")
+                .join(format!("{point}.{n}.ack"))
+                .exists()
+        };
+        let reads = (1..=6).filter(|n| acked(RECEIVED, *n)).count();
+        let exited = acked(EXITED, 1);
+        let spawned = d.launches()?.len();
+        d.failpoints.release(ARMING, 2).map_err(infra)?;
+        check(reads == 5 && exited && spawned == 1, || {
+            format!(
+                "at launch 2's ARM: {reads} stdout reads of launch 1, its exit observed \
+                 {exited}, {spawned} launches"
+            )
+        })?;
         d.await_progress("at 3 launch 2")?;
         let reopening = d.status(evidence, "status-reopening", &session)?;
         check(
@@ -1366,13 +1402,11 @@ fn claude_generation_barrier_holds_late_messages() -> TestResult {
     })
 }
 
-/// Launch 1's late message is delivered before turn 2's first event. An
-/// assistant message after the result leaves no durable event of its own,
-/// so the order is read through what must follow it: turn 1 ends only
-/// once Route read its stdout to EOF, after the late message (its
-/// process then exits 0, checked by the caller), and that `turn.ended`
-/// precedes turn 2's `turn.submitted`; in the fake's log launch 1 was
-/// released before launch 2 read its prompt.
+/// The durable side of the barrier's order: turn 1's `turn.ended`
+/// precedes turn 2's `turn.submitted`, and in the fake's log launch 1 was
+/// released before launch 2 read its prompt. (The late message's delivery
+/// itself is read at launch 2's ARM.)
+#[cfg(feature = "test-failpoints")]
 fn late_before_next(d: &Deployment, session: &str) -> Result<(), ScenarioError> {
     let events = d.events(session)?;
     let seq = |kind: &str, turn: u32| {
@@ -1798,18 +1832,19 @@ fn refused_handshake(text: &str) -> Value {
     )
 }
 
-/// The plan's clock seam (test builds): milliseconds ahead of real time.
+/// The refusal-cache clock seam (test builds): a frozen origin plus milliseconds.
 #[cfg(feature = "test-failpoints")]
 const PLAN_CLOCK: &str = "adapter.claude.plan_clock_ms";
 
-/// C2 §5's refusal expiry under controlled time through the daemon: the
-/// plan's clock is moved ahead by `adapter.claude.plan_clock_ms`. A
-/// refused handshake's entry, 590 s on, still refuses `describe` and a
-/// spawn of the same recipe (`harness_unavailable`,
+/// C2 §5's refusal expiry under controlled time through the daemon. The
+/// Claude adapter's refusal-cache clock (`adapter.claude.plan_clock_ms`)
+/// is frozen at one origin before anything runs, so the refused
+/// handshake's entry is written at the origin and real elapsed time never
+/// moves it. 590 s and 599.999 s on, the entry still refuses `describe`
+/// and a spawn of the same recipe (`harness_unavailable`,
 /// `handshake_refused`, nothing launched); 600 s on it has expired: the
 /// plan is admitted (`tested`, the version its init reported), the spawn
 /// launches, and that launch's handshake succeeds through the fixture.
-/// The exact boundary (599.999 s) is `plan.rs`'s unit test.
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn claude_refusal_expires_through_daemon() -> TestResult {
@@ -1826,6 +1861,12 @@ fn claude_refusal_expires_through_daemon() -> TestResult {
             "haiku",
             "--json",
         ];
+        let at = |ms: u64| {
+            d.failpoints
+                .arm(PLAN_CLOCK, 1, &format!("value_persist:{ms}"))
+                .map_err(infra)
+        };
+        at(0)?;
         let _daemon = Daemon::start(d, evidence, "final")?;
         let session = session_of(&d.spawn(evidence, "spawn-1", &ask("ONE"), &[])?)?;
         let refused = d.wait(evidence, &format!("{session}/1"))?;
@@ -1833,40 +1874,37 @@ fn claude_refusal_expires_through_daemon() -> TestResult {
             refused["failure"]["class"] == "protocol" && replay_ran(&refused, 0),
             || format!("the refused handshake: {refused}"),
         )?;
-        d.failpoints
-            .arm(PLAN_CLOCK, 1, "value_persist:590000")
-            .map_err(infra)?;
-        let live = d.ok(evidence, "describe-590s", &describe)?;
-        let error = d.refused(
-            evidence,
-            "spawn-590s",
-            &[
-                "spawn",
-                "--harness",
-                "claude",
-                "--model",
-                "haiku",
-                "--prompt",
-                "p",
-                "--handle",
-                HANDLE,
-                "--json",
-            ],
-            "harness_unavailable",
-        )?;
-        check(
-            live["version_status"] == "refused"
-                && error["data"]["reason"] == "handshake_refused"
-                && d.launches()?.len() == 1,
-            || format!("590 s on: describe {live}, spawn {error}"),
-        )?;
-        d.failpoints
-            .arm(PLAN_CLOCK, 1, "value_persist:600000")
-            .map_err(infra)?;
-        let expired = d.ok(evidence, "describe-600s", &describe)?;
-        let next = session_of(&d.spawn(evidence, "spawn-600s", &ask("TWO"), &[])?)?;
+        for ms in [590_000, 599_999] {
+            at(ms)?;
+            let live = d.ok(evidence, &format!("describe-{ms}"), &describe)?;
+            let error = d.refused(
+                evidence,
+                &format!("spawn-{ms}"),
+                &[
+                    "spawn",
+                    "--harness",
+                    "claude",
+                    "--model",
+                    "haiku",
+                    "--prompt",
+                    "p",
+                    "--handle",
+                    HANDLE,
+                    "--json",
+                ],
+                "harness_unavailable",
+            )?;
+            check(
+                live["version_status"] == "refused"
+                    && error["data"]["reason"] == "handshake_refused"
+                    && d.launches()?.len() == 1,
+                || format!("{ms} ms on: describe {live}, spawn {error}"),
+            )?;
+        }
+        at(600_000)?;
+        let expired = d.ok(evidence, "describe-600000", &describe)?;
+        let next = session_of(&d.spawn(evidence, "spawn-600000", &ask("TWO"), &[])?)?;
         let envelope = d.wait(evidence, &format!("{next}/1"))?;
-        d.failpoints.disarm(PLAN_CLOCK).map_err(infra)?;
         check(
             expired["version_status"] == "tested"
                 && expired["vendor_version"] == TESTED
@@ -1999,61 +2037,121 @@ enum CallerStop {
     Close,
 }
 
-/// The stderr flood's size: 256 chunks of 256 KiB, one every 20 ms or
-/// more, so it runs for 5 s or longer.
-const FLOOD: u64 = 64 * 1024 * 1024;
+/// `path` as one single-quoted shell word: each `'` closes the quote, adds
+/// an escaped quote and reopens it.
+fn shell_word(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
 
-/// Packet §9 `claude_stream_limits`, a stderr flood under a caller's stop:
-/// beside the vendor a writer in its group keeps flooding stderr (the
-/// turn's `stderr.log`, which the operating system writes and no VIA task
-/// reads, runtime §4). While the flood is still being written (the log
-/// non-empty and short of it), the caller stops the turn during its
-/// tool: the interrupt is serviced (the nested receipt and the abort
-/// terminal acknowledge it) and the group's cleanup, the writer included,
-/// is proved within the stop's bound, before the flood could end. The
-/// daemon's peak RSS stays within [`RSS_BOUND_KIB`] of its baseline.
+/// The lifetime of a turn whose Bash tool a caller stops: the interrupt
+/// is answered with the nested receipt, then the abort result.
+fn interrupted_tool() -> Value {
+    let id = "${sid}";
+    lifetime(
+        &argv(Launch::New, true),
+        vec![
+            prompt("Run sleep 30 with Bash."),
+            init(id),
+            emit(
+                &json!({"type": "assistant", "message": {"model": "claude-haiku-4-5-20251001",
+                "id": "msg_01SYNTH000001", "type": "message", "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_01SYNTH000001", "name": "Bash",
+                    "input": {"command": "sleep 30"}}],
+                "usage": {"input_tokens": 7, "output_tokens": 3}},
+                "parent_tool_use_id": null, "session_id": id}),
+            ),
+            json!({"expect": {"line": {"type": "control_request",
+                "request": {"subtype": "interrupt"}}, "capture": {"rid": "/request_id"}}}),
+            json!({"emit": {"line": "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":${rid},\"response\":{\"still_queued\":[]}}}"}}),
+            emit(
+                &json!({"type": "result", "subtype": "error_during_execution",
+                "is_error": true, "session_id": id, "stop_reason": "tool_use",
+                "terminal_reason": "aborted_tools"}),
+            ),
+            await_eof(),
+        ],
+    )
+}
+
+/// A file in the deployment's `sync` directory, once it exists.
+fn await_sync(d: &Deployment, name: &str) -> Result<String, ScenarioError> {
+    let path = d.root.path().join("sync").join(name);
+    let deadline = Instant::now() + WAIT;
+    loop {
+        match fs::read_to_string(&path) {
+            Ok(text) => return Ok(text.trim().to_owned()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(infra(error)),
+        }
+        if Instant::now() >= deadline {
+            return Err(ScenarioError::Timeout(format!("no {name} in sync")));
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Whether process `pid` exists (signal 0).
+fn alive(pid: u32) -> Result<bool, ScenarioError> {
+    let pid = i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .ok_or_else(|| infra(format!("bad pid {pid}")))?;
+    match rustix::process::test_kill_process(pid) {
+        Ok(()) => Ok(true),
+        Err(rustix::io::Errno::SRCH) => Ok(false),
+        Err(error) => Err(infra(error)),
+    }
+}
+
+/// Packet §9 `claude_stream_limits`, control service under a stderr flood:
+/// beside the vendor a writer in its group floods stderr (the turn's
+/// `stderr.log`, which the operating system writes and no VIA task reads,
+/// runtime §4) without end, 256 KiB at a time. It records its pid and a
+/// readiness marker, then a heartbeat after every chunk. The caller stops
+/// the turn during its tool only once the writer is ready, alive and its
+/// heartbeat still advancing, so the stop lands mid-flood. The interrupt
+/// is serviced (the nested receipt and the abort terminal acknowledge it)
+/// within the stop's bound, and the group's cleanup is proved with the
+/// writer dead. Memory under a flood is
+/// `claude_stream_limits_stderr_flood_memory`'s.
 fn stderr_flood_under(stop: CallerStop, name: &str) -> TestResult {
     scenario(name, |d, evidence| {
-        d.wrap(
-            "( i=0; while [ \"$i\" -lt 256 ]; do head -c 262144 /dev/zero | tr '\\000' e >&2; \
-             sleep 0.02; i=$((i+1)); done ) >/dev/null &",
-        )
+        let sync = shell_word(&d.root.path().join("sync"));
+        d.wrap(&format!(
+            "sh -c 'echo $$ > \"$1/flood.pid\"; : > \"$1/flood.ready\"; i=0; \
+             while :; do head -c 262144 /dev/zero | tr \"\\000\" e >&2; sleep 0.01; \
+             i=$((i+1)); echo $i > \"$1/flood.beat.tmp\"; \
+             mv \"$1/flood.beat.tmp\" \"$1/flood.beat\"; done' flood {sync} >/dev/null &"
+        ))
         .map_err(infra)?;
-        let id = "${sid}";
-        d.replay(&[lifetime(
-            &argv(Launch::New, true),
-            vec![
-                prompt("Run sleep 30 with Bash."),
-                init(id),
-                emit(&json!({"type": "assistant", "message": {"model": "claude-haiku-4-5-20251001",
-                    "id": "msg_01SYNTH000001", "type": "message", "role": "assistant",
-                    "content": [{"type": "tool_use", "id": "toolu_01SYNTH000001", "name": "Bash",
-                        "input": {"command": "sleep 30"}}],
-                    "usage": {"input_tokens": 7, "output_tokens": 3}},
-                    "parent_tool_use_id": null, "session_id": id})),
-                json!({"expect": {"line": {"type": "control_request",
-                    "request": {"subtype": "interrupt"}}, "capture": {"rid": "/request_id"}}}),
-                json!({"emit": {"line": "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":${rid},\"response\":{\"still_queued\":[]}}}"}}),
-                emit(&json!({"type": "result", "subtype": "error_during_execution",
-                    "is_error": true, "session_id": id, "stop_reason": "tool_use",
-                    "terminal_reason": "aborted_tools"})),
-                await_eof(),
-            ],
-        )])?;
-        let daemon = Daemon::start_with(d, evidence, "final", MEASURED)?;
-        let rss = Rss::watch(daemon.pid())?;
+        d.replay(&[interrupted_tool()])?;
+        let _daemon = Daemon::start(d, evidence, "final")?;
         let session = session_of(&d.spawn(evidence, "spawn", "Run sleep 30 with Bash.", &[])?)?;
         d.await_event(&session, 1, "turn.started")?;
         await_running_tool(d, evidence, &session)?;
-        let log = d
-            .state
-            .join("evidence")
-            .join(&session)
-            .join("1")
-            .join("stderr.log");
-        let flooded = fs::metadata(&log).map_err(infra)?.len();
-        check(flooded > 0 && flooded < FLOOD, || {
-            format!("the stop is not mid-flood: stderr.log has {flooded} bytes")
+        await_sync(d, "flood.ready")?;
+        let writer: u32 = await_sync(d, "flood.pid")?.parse().map_err(infra)?;
+        // The heartbeat advances past a value read now: the writer is
+        // still flooding just before the stop.
+        let beat = |d: &Deployment| -> Result<u64, ScenarioError> {
+            await_sync(d, "flood.beat")?.parse().map_err(infra)
+        };
+        let first = beat(d)?;
+        let deadline = Instant::now() + WAIT;
+        let before = loop {
+            let now = beat(d)?;
+            if now > first {
+                break now;
+            }
+            if Instant::now() >= deadline {
+                return Err(ScenarioError::Timeout(
+                    "the flood's heartbeat stalled".to_owned(),
+                ));
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        check(alive(writer)?, || {
+            "the flood writer exited before the stop".to_owned()
         })?;
         let stopped = Instant::now();
         let reply = match stop {
@@ -2072,18 +2170,16 @@ fn stderr_flood_under(stop: CallerStop, name: &str) -> TestResult {
         };
         let envelope = d.wait(evidence, &format!("{session}/1"))?;
         let took = stopped.elapsed();
-        let written = fs::metadata(&log).map_err(infra)?.len();
-        let (baseline, peak) = rss.finish()?;
-        let measured = json!({"baseline_kib": baseline, "peak_kib": peak,
-            "bound_kib": RSS_BOUND_KIB, "stderr_at_stop": flooded, "stderr_at_end": written,
-            "flood": FLOOD, "ended_after_stop_ms": took.as_millis()});
-        evidence
-            .write("measured.json", measured.to_string().as_bytes())
-            .map_err(infra)?;
+        let dead = !alive(writer)?;
         let closed = match stop {
             CallerStop::Cancel => true,
             CallerStop::Close => reply["state"] == "closed" && reply["cleanup"] == "quiescent",
         };
+        let measured = json!({"beat_at_stop": before, "ended_after_stop_ms": took.as_millis(),
+            "writer_dead_after": dead});
+        evidence
+            .write("measured.json", measured.to_string().as_bytes())
+            .map_err(infra)?;
         check(
             envelope["state"] == "cancelled"
                 && envelope["cancel"]["outcome"] == "acknowledged"
@@ -2091,12 +2187,11 @@ fn stderr_flood_under(stop: CallerStop, name: &str) -> TestResult {
                 && replay_ran(&envelope, 0)
                 && closed
                 && took < STOP_BOUND
-                && written < FLOOD
-                && peak.saturating_sub(baseline) < RSS_BOUND_KIB,
+                && dead,
             || {
                 format!(
                     "stop {reply}; envelope {envelope}; ended {took:?} after the stop; \
-                     stderr.log {flooded} then {written} bytes; RSS {baseline} KiB to {peak} KiB"
+                     writer dead after cleanup {dead}"
                 )
             },
         )
@@ -2116,6 +2211,53 @@ fn claude_stream_limits_stderr_flood_keeps_cancel() -> TestResult {
 #[test]
 fn claude_stream_limits_stderr_flood_keeps_close() -> TestResult {
     stderr_flood_under(CallerStop::Close, "claude_stream_limits_stderr_flood_close")
+}
+
+/// The sustained flood's size: twice [`RSS_BOUND_KIB`].
+const FLOOD: u64 = 64 * 1024 * 1024;
+
+/// Packet §9 `claude_stream_limits`, memory under a sustained stderr
+/// flood: before the vendor runs, its stderr receives the whole 64 MiB
+/// (`stderr.log` holds exactly that when the turn ends), then the turn
+/// completes. The daemon's peak RSS stays within [`RSS_BOUND_KIB`] of its
+/// baseline, half the flood, so a daemon that held the flood in memory
+/// fails. Accepted limitation: Claude's observation-stall path (C2 A1) is
+/// outside every RSS measurement here; it is bounded by count and bytes
+/// (runtime §8) and exercised by `claude_observation_stall_interrupts`.
+#[test]
+fn claude_stream_limits_stderr_flood_memory() -> TestResult {
+    scenario("claude_stream_limits_stderr_memory", |d, evidence| {
+        d.wrap(&format!("head -c {FLOOD} /dev/zero | tr '\\000' e >&2"))
+            .map_err(infra)?;
+        d.replay(&[completing(Launch::New, true, "ONE", 0.001)])?;
+        let daemon = Daemon::start_with(d, evidence, "final", MEASURED)?;
+        let rss = Rss::watch(daemon.pid())?;
+        let session = session_of(&d.spawn(evidence, "spawn", &ask("ONE"), &[])?)?;
+        let envelope = d.wait(evidence, &format!("{session}/1"))?;
+        let (baseline, peak) = rss.finish()?;
+        let written = envelope["evidence"]["folder"]
+            .as_str()
+            .map(|folder| fs::metadata(Path::new(folder).join("stderr.log")))
+            .transpose()
+            .map_err(infra)?
+            .map_or(0, |meta| meta.len());
+        let measured = json!({"baseline_kib": baseline, "peak_kib": peak,
+            "bound_kib": RSS_BOUND_KIB, "stderr": written, "flood": FLOOD});
+        evidence
+            .write("measured.json", measured.to_string().as_bytes())
+            .map_err(infra)?;
+        check(
+            completed(&envelope)
+                && written == FLOOD
+                && peak.saturating_sub(baseline) < RSS_BOUND_KIB,
+            || {
+                format!(
+                    "stderr flood: {envelope}; stderr.log {written} bytes; \
+                     RSS {baseline} KiB to {peak} KiB"
+                )
+            },
+        )
+    })
 }
 
 /// Waits until `status` shows the turn's tool running.
@@ -2216,12 +2358,14 @@ const MEASURED: &[(&str, &str)] = if cfg!(target_env = "gnu") {
 
 /// F24's measurement (`s1_f24_memory.rs`): the daemon's `VmRSS` sampled
 /// every 10 ms from `/proc/<pid>/status` after a settled baseline, and
-/// its peak the higher of the samples and `VmHWM`.
+/// its peak the higher of the samples and `VmHWM`. Every reading must
+/// succeed: a missing sample is an infrastructure failure, never a pass.
+/// Dropped without [`Rss::finish`], the sampler stops and is joined.
 struct Rss {
     pid: u32,
     baseline: u64,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    sampler: thread::JoinHandle<u64>,
+    sampler: Option<thread::JoinHandle<Result<u64, String>>>,
 }
 
 impl Rss {
@@ -2233,32 +2377,46 @@ impl Rss {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stopping = std::sync::Arc::clone(&stop);
         let sampler = thread::spawn(move || {
-            let mut peak = 0;
+            let mut peak = None;
             while !stopping.load(Ordering::Acquire) {
-                if let Some(rss) = status_kib(pid, "VmRSS:") {
-                    peak = peak.max(rss);
-                }
+                let rss = status_kib(pid, "VmRSS:")
+                    .ok_or_else(|| format!("no VmRSS sample of daemon {pid}"))?;
+                peak = Some(peak.map_or(rss, |peak: u64| peak.max(rss)));
                 thread::sleep(Duration::from_millis(10));
             }
-            peak
+            peak.ok_or_else(|| format!("no RSS sample of daemon {pid}"))
         });
         Ok(Self {
             pid,
             baseline,
             stop,
-            sampler,
+            sampler: Some(sampler),
         })
     }
 
-    /// Stops sampling: `(baseline, peak)` in KiB.
-    fn finish(self) -> Result<(u64, u64), ScenarioError> {
+    /// Stops sampling: `(baseline, peak)` in KiB, or an infrastructure
+    /// failure when any reading is missing.
+    fn finish(mut self) -> Result<(u64, u64), ScenarioError> {
         self.stop.store(true, Ordering::Release);
         let sampled = self
             .sampler
+            .take()
+            .ok_or_else(|| infra("the RSS sampler is gone"))?
             .join()
-            .map_err(|_| infra("the RSS sampler panicked"))?;
-        let peak = status_kib(self.pid, "VmHWM:").unwrap_or(0).max(sampled);
-        Ok((self.baseline, peak))
+            .map_err(|_| infra("the RSS sampler panicked"))?
+            .map_err(infra)?;
+        let hwm = status_kib(self.pid, "VmHWM:")
+            .ok_or_else(|| infra(format!("no VmHWM of daemon {}", self.pid)))?;
+        Ok((self.baseline, hwm.max(sampled)))
+    }
+}
+
+impl Drop for Rss {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(sampler) = self.sampler.take() {
+            let _ = sampler.join();
+        }
     }
 }
 
