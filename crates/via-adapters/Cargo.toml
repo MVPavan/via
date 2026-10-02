@@ -18,8 +18,11 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rustix = { workspace = true, features = ["fs"] }
+sha2 = { workspace = true }
 
 [dev-dependencies]
+# The Codex decline bodies validate against the vendor schemas (x.3.2 X1).
+boon = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt"] }
 

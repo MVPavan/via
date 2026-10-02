@@ -621,7 +621,7 @@ pub(crate) enum Adapter<'a> {
     Fake(&'a Arc<FakeAdapter>),
     /// Claude Code (a stub until via-p98.3.2).
     Claude(&'a Arc<ClaudeAdapter>),
-    /// Codex (a stub until via-5lr.3.2).
+    /// Codex (`codex-app-server`).
     Codex(&'a Arc<CodexAdapter>),
 }
 
@@ -788,8 +788,11 @@ impl AdapterSet {
         let route = harness.route();
         let adapter = match self.adapter(harness) {
             Some(Adapter::Fake(fake)) => fake,
-            // The vendor stubs plan nothing yet (via-p98.3.2, via-5lr.3.2).
-            Some(Adapter::Claude(_) | Adapter::Codex(_)) | None => {
+            Some(Adapter::Codex(codex)) => {
+                return codex.plan(harness, req, self.config.inherit(harness));
+            }
+            // The Claude stub plans nothing yet (via-p98.3.2).
+            Some(Adapter::Claude(_)) | None => {
                 return Err(unavailable(Some(route)));
             }
         };
@@ -827,8 +830,11 @@ impl AdapterSet {
         let route = harness.route();
         let adapter = match self.adapter(harness).filter(|_| session.route == route) {
             Some(Adapter::Fake(fake)) => fake,
-            // The vendor stubs run no turn yet (via-p98.3.2, via-5lr.3.2).
-            Some(Adapter::Claude(_) | Adapter::Codex(_)) | None => {
+            Some(Adapter::Codex(_)) => {
+                return CodexAdapter::check_turn(route, &session.adapter_version, turn);
+            }
+            // The Claude stub runs no turn yet (via-p98.3.2).
+            Some(Adapter::Claude(_)) | None => {
                 return Err(unavailable(Some(route)));
             }
         };

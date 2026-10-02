@@ -1,0 +1,11 @@
+{
+  "source": "Synthetic (x.3.2 X1): codex_bound_gate's pure refusals (vendors/codex.md \u00a73, \u00a78; C2 \u00a76.1), 0.159.2 recipe",
+  "argv": [
+    "app-server",
+    "--disable",
+    "hooks"
+  ],
+  "version": "codex-cli 0.159.2",
+  "deadline_ms": 20000,
+  "steps": []
+}

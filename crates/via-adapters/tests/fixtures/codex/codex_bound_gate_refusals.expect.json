@@ -1,0 +1,398 @@
+{
+  "source": "Synthetic (x.3.2 X1): codex_bound_gate's pure refusals (vendors/codex.md §3, §8; C2 §6.1), 0.159.2 recipe",
+  "harness": "codex",
+  "launches": 0,
+  "launch_checkpoints": {
+    "after_pure": 0,
+    "after_open": {
+      "config_key": 0,
+      "empty_effort": 0,
+      "full_offline": 0,
+      "max_steps": 0,
+      "reserved": 0,
+      "unknown_key": 0
+    },
+    "after_turn": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  },
+  "pure_writes": [],
+  "plan_checks": [
+    {
+      "require": "steer",
+      "refusal": null
+    },
+    {
+      "require": "cancel",
+      "refusal": null
+    },
+    {
+      "require": "close",
+      "refusal": null
+    }
+  ],
+  "describe": {
+    "params": {
+      "harness": "codex",
+      "model": "gpt-6-sol",
+      "bound": {
+        "mode": "read_only",
+        "extra_write_dirs": [],
+        "network": true
+      }
+    },
+    "capabilities": {
+      "verbs": {
+        "spawn": {
+          "support": "native"
+        },
+        "resume": {
+          "support": "native"
+        },
+        "steer": {
+          "support": "native"
+        },
+        "cancel": {
+          "support": "native"
+        },
+        "close": {
+          "support": "native"
+        }
+      },
+      "params": {
+        "instructions": {
+          "support": "native"
+        },
+        "output_schema": {
+          "support": "native"
+        },
+        "effort": {
+          "support": "native"
+        },
+        "max_steps": {
+          "support": "unsupported"
+        }
+      },
+      "bounds": [
+        "full"
+      ],
+      "network_control": false,
+      "recover": {
+        "support": "unsupported"
+      },
+      "usage": {
+        "tokens": "turn",
+        "cost": "unavailable"
+      }
+    },
+    "vendor_version": null,
+    "version_status": "untested",
+    "launches": 0
+  },
+  "sessions": {
+    "config_key": {
+      "model": "gpt-6-sol",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "close": null,
+      "vendor_options": {
+        "codex": {
+          "model_reasoning_effort": "high"
+        }
+      }
+    },
+    "empty_effort": {
+      "model": "gpt-6-sol",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "close": null
+    },
+    "full_offline": {
+      "model": "gpt-6-sol",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "close": null
+    },
+    "max_steps": {
+      "model": "gpt-6-sol",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "close": null
+    },
+    "reserved": {
+      "model": "gpt-6-sol",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "close": null,
+      "vendor_options": {
+        "codex": {
+          "sandbox": "danger-full-access"
+        }
+      }
+    },
+    "unknown_key": {
+      "model": "gpt-6-sol",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "close": null,
+      "vendor_options": {
+        "codex": {
+          "personality": "friendly"
+        }
+      }
+    }
+  },
+  "turns": [
+    {
+      "session": "config_key",
+      "start_after": null,
+      "params": {
+        "prompt": "Bound gate check.",
+        "effort": "low",
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "turn.accepted"
+        ],
+        "observation_counts": {
+          "turn.accepted": 0
+        },
+        "unasserted": [],
+        "notes": "A Codex config key VIA sets (C2 §6.1) is a reserved vendor key: refused before any launch."
+      }
+    },
+    {
+      "session": "empty_effort",
+      "start_after": null,
+      "params": {
+        "prompt": "Bound gate check.",
+        "effort": "",
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "invalid_param:effort",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "turn.accepted"
+        ],
+        "observation_counts": {
+          "turn.accepted": 0
+        },
+        "unasserted": [],
+        "notes": "An empty effort is a value the route knows to be invalid (C2 §5 AD18): refused purely."
+      }
+    },
+    {
+      "session": "full_offline",
+      "start_after": null,
+      "params": {
+        "prompt": "Bound gate check.",
+        "effort": "low",
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": false
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "bound_unsupported",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "turn.accepted"
+        ],
+        "observation_counts": {
+          "turn.accepted": 0
+        },
+        "unasserted": [],
+        "notes": "full with network:false has no Codex policy variant: always refused, never relaxed (vendors/codex.md §3 Bound mapping and gate)."
+      }
+    },
+    {
+      "session": "max_steps",
+      "start_after": null,
+      "params": {
+        "prompt": "Bound gate check.",
+        "effort": "low",
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": 5
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "invalid_param:max_steps",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "turn.accepted"
+        ],
+        "observation_counts": {
+          "turn.accepted": 0
+        },
+        "unasserted": [],
+        "notes": "This route has no step limit (vendors/codex.md §3): an explicit max_steps is refused by check_turn at spawn."
+      }
+    },
+    {
+      "session": "reserved",
+      "start_after": null,
+      "params": {
+        "prompt": "Bound gate check.",
+        "effort": "low",
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "turn.accepted"
+        ],
+        "observation_counts": {
+          "turn.accepted": 0
+        },
+        "unasserted": [],
+        "notes": "sandbox is a reserved key (C2 §6.1): canonical bound settings win, refused before any launch."
+      }
+    },
+    {
+      "session": "unknown_key",
+      "start_after": null,
+      "params": {
+        "prompt": "Bound gate check.",
+        "effort": "low",
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": "invalid_param:vendor",
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": null,
+        "cleanup": null,
+        "stop_facts": null,
+        "instance": null,
+        "warnings": [],
+        "observations_include": [],
+        "observations_exclude": [
+          "turn.accepted"
+        ],
+        "observation_counts": {
+          "turn.accepted": 0
+        },
+        "unasserted": [],
+        "notes": "Codex's vendor-option allow-list is empty (C2 §6.1): any other key is invalid_params."
+      }
+    }
+  ]
+}
