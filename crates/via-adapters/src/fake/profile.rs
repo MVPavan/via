@@ -61,7 +61,7 @@ pub(crate) enum SteerRefusalDecl {
     OverCapacity,
     /// The vendor refused steer in the turn's current phase.
     NotSteerable,
-    /// The input was not written whole.
+    /// Writing the input began, but the vendor never acknowledged it.
     NotDelivered,
     /// The vendor took the input, but its report was not recorded
     /// (critical r2 #3).

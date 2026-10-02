@@ -1227,8 +1227,9 @@ impl ApiError {
     };
     /// C1 -32021 `steer_failed` for `reason`, with what is known of its
     /// `delivery` (C1 §3.4, §8.1): `not_steerable` was not applied
-    /// (`none`); `not_delivered` was not written whole, and its message
-    /// keeps that uncertainty (critical r1 #13); `not_recorded` reached the
+    /// (`none`); `not_delivered` began to be written, in part or whole,
+    /// without the vendor's acknowledgement, and its message keeps that
+    /// uncertainty (critical r1 #13, r4 #1); `not_recorded` reached the
     /// vendor as `delivery` says, but no event records it (critical r2 #3).
     pub(crate) fn steer_failed(reason: &'static str, delivery: Cow<'static, str>) -> Self {
         Self {
@@ -1236,7 +1237,7 @@ impl ApiError {
             kind: "steer_failed",
             message: match reason {
                 "not_delivered" => {
-                    "the steer input was not written whole; whether it was applied is unknown"
+                    "the steer input was not acknowledged by the vendor; whether it was applied is unknown"
                 }
                 "not_recorded" => {
                     "the vendor took the steer input, but its steer.delivered event could not be recorded"

@@ -147,7 +147,9 @@ pub enum SteerError {
     /// The vendor refused steer in the active turn's current phase
     /// (Codex `activeTurnNotSteerable`): nothing was applied.
     NotSteerable,
-    /// The input was not written whole: its delivery is uncertain.
+    /// Writing the input began, in part or whole, but the vendor never
+    /// acknowledged it: whether it was applied is unknown (a write that
+    /// failed, or the turn's end first; critical r3 #1, r4 #1).
     NotDelivered,
     /// The vendor took the input whole, as `delivery` says, but its
     /// `steer.delivered` observation could not be emitted (a full

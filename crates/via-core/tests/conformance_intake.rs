@@ -1659,10 +1659,11 @@ fn conformance_intake_instructions_path() {
 /// an admitted steer map to C1 errors: a full control lane is
 /// `admission_refused` with `data.reason: "control_lane_full"`; a vendor
 /// that refuses steer in the turn's phase is `steer_failed` with
-/// `data.reason: "not_steerable"` and `data.delivery: "none"`; input not
-/// written whole is `steer_failed` with `data.reason: "not_delivered"` and
+/// `data.reason: "not_steerable"` and `data.delivery: "none"`; input whose
+/// writing began, in part or whole, without the vendor's acknowledgement
+/// is `steer_failed` with `data.reason: "not_delivered"` and
 /// `data.delivery: "uncertain"`, whose message keeps that uncertainty
-/// (critical r1 #13); a delivery the vendor took whose report was not
+/// (critical r1 #13, r4 #1); a delivery the vendor took whose report was not
 /// recorded is `steer_failed` with `data.reason: "not_recorded"` and the
 /// delivery a success would give (critical r2 #3). None commits
 /// `steer.delivered`.
@@ -1691,7 +1692,7 @@ fn conformance_intake_steer_error_mapping() {
             "steer_failed",
             "not_delivered",
             json!("uncertain"),
-            "the steer input was not written whole; whether it was applied is unknown",
+            "the steer input was not acknowledged by the vendor; whether it was applied is unknown",
         ),
         (
             "not_recorded",
