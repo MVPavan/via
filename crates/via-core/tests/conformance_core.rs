@@ -3053,6 +3053,57 @@ fn core_a_retirement_failure_fails_health_before_its_cleanup() {
     });
 }
 
+/// Critical fix r1 #2 (C2 §4: one order across a session's producers):
+/// the retired helper's observations follow the turn's own. The turn's
+/// acceptance is decoded and handed over, but its delivery is held
+/// (`adapter.fake.stamped`) while the cancel's force ends the turn with no
+/// terminal and the retired helper's late terminal is read and offered
+/// (`adapter.fake.retirement_item`). Released, the acceptance commits
+/// first, so the late terminal names a mapped vendor turn and revises it.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_a_late_terminal_follows_the_turns_own_delivery() {
+    let scripts = [script(
+        "late",
+        &[
+            accepted(1),
+            gate("late"),
+            terminal(1, "completed", "end_turn"),
+        ],
+    )];
+    let Some(root) = child(
+        "core_a_late_terminal_follows_the_turns_own_delivery",
+        &scenario(&persistent(), &scripts),
+        &[],
+    ) else {
+        return;
+    };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    arm(&root, "adapter.fake.stamped", "pause");
+    acknowledge(&root, "routes.fake.retiring", 1);
+    acknowledge(&root, "adapter.fake.retirement_item", 1);
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = daemon.spawn("late", &json!({})).await;
+        until_acked(&root, "adapter.fake.stamped", 1).await;
+        daemon.entered("late").await;
+        cancel(&daemon, &session, 1, 500).await;
+        until_acked(&root, "routes.fake.retiring", 1).await;
+        daemon.release("late");
+        until_acked(&root, "adapter.fake.retirement_item", 1).await;
+        release_point(&root, "adapter.fake.stamped", 1);
+        daemon.wait(&session, 1).await;
+        until_revised(&daemon, &session).await;
+        let envelope = stored(&daemon, &session, 1).await;
+        assert_eq!(
+            (&envelope["state"], &envelope["revision"]),
+            (&json!("completed"), &json!(1)),
+            "{envelope}"
+        );
+        daemon.shutdown().await;
+    });
+}
+
 /// Every event of `session`, page by page.
 #[cfg(feature = "test-failpoints")]
 async fn all_events(daemon: &Daemon, session: &SessionId) -> Vec<Value> {

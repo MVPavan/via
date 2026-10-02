@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use serde_json::{Map, Value};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{OwnedMutexGuard, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use super::{FakeAdapter, FakeProfile};
@@ -124,7 +124,7 @@ pub(crate) async fn run_turn(
         effort: spec.effort,
         retired: None,
     };
-    let (logical, logical_rx) = oneshot::channel();
+    let ((logical, logical_rx), (fence, fence_rx)) = (oneshot::channel(), oneshot::channel());
     driver.tracker.spawn(turn_task(TurnTask {
         route: FakeRoute::new(Arc::clone(&driver.runtime)),
         process,
@@ -139,7 +139,7 @@ pub(crate) async fn run_turn(
         state: Arc::clone(&driver.state),
         reports: (Arc::clone(&driver.health), Arc::clone(&driver.journal)),
         observations: driver.observations.clone(),
-        done,
+        retiring: (done, fence_rx),
     }));
     let mut normalizer = Normalizer::new(generation, Arc::clone(&driver.state), profile, steers);
     let cutoff = Deadline::at(wall.instant() + CLEANUP_ALLOWANCE);
@@ -170,11 +170,33 @@ pub(crate) async fn run_turn(
     after_persistent_turn(
         driver,
         adapter,
-        (turn, generation, delivering),
+        (turn, generation, delivering, fence),
         &end,
         normalizer.vendor_closed,
     );
     end
+}
+
+/// The generation's delivery fence (C2 §2, §4 generation barrier) as the
+/// retirement takes it: the barrier's acquisition, already queued.
+type Fence = std::pin::Pin<Box<dyn Future<Output = OwnedMutexGuard<()>> + Send>>;
+
+/// Hands the generation's delivery fence to the turn's retirement once the
+/// turn's own delivery ended (critical fix r1 #2, #3): what the retired
+/// helper reports follows the turn's observations, and the retirement holds
+/// the fence until its delivery ends, so an idle close and a later
+/// generation follow it too. The acquisition is queued here, before the
+/// turn returns and its idle close may start, behind whatever holds the
+/// barrier now; the turn itself never waits on it.
+fn hand_fence(barrier: &Arc<tokio::sync::Mutex<()>>, fence: oneshot::Sender<Fence>) {
+    let mut taking: Fence = Box::pin(Arc::clone(barrier).lock_owned());
+    let mut queued = std::task::Context::from_waker(std::task::Waker::noop());
+    let taking: Fence = match taking.as_mut().poll(&mut queued) {
+        std::task::Poll::Ready(guard) => Box::pin(std::future::ready(guard)),
+        std::task::Poll::Pending => taking,
+    };
+    // A retirement that already ended takes nothing: the fence is freed.
+    let _unheld = fence.send(taking);
 }
 
 /// After the final delivery: one that failed latches `overflow` (C2 §2),
@@ -297,21 +319,28 @@ async fn report_mismatch(driver: &SessionDriver, result: &FakeTurn, cutoff: Dead
     }
 }
 
-/// The persistent profile after a turn returned: a vendor close in the
+/// The persistent profile after a turn returned: its retirement takes the
+/// generation's delivery fence ([`hand_fence`]), a vendor close in the
 /// turn ends its connection, and the scenario's idle close starts now.
 /// Nothing on the per-turn profile. The turn's last delivery is done: it
 /// no longer holds off an idle close (`delivering`, C2 D4).
 fn after_persistent_turn(
     driver: &SessionDriver,
     adapter: &FakeAdapter,
-    (turn, generation, delivering): (crate::TurnNumber, u64, Delivering),
+    (turn, generation, delivering, fence): (
+        crate::TurnNumber,
+        u64,
+        Delivering,
+        oneshot::Sender<Fence>,
+    ),
     end: &TurnEnd,
     vendor_closed: bool,
 ) {
-    drop(delivering);
     if !adapter.profile().persistent {
         return;
     }
+    hand_fence(&driver.barrier, fence);
+    drop(delivering);
     if vendor_closed {
         driver.state().vendor_closed = true;
         driver.disconnect(generation);
@@ -484,7 +513,10 @@ struct TurnTask {
     reports: (Arc<watch::Sender<DriverHealth>>, Arc<watch::Sender<bool>>),
     /// The session channel a retired helper's observations go on.
     observations: ObservationSink,
-    done: watch::Sender<Retiring>,
+    /// How far the retirement is, and the generation's delivery fence once
+    /// the turn's own delivery ended ([`hand_fence`]); the fence's sender
+    /// dropped unsent, the turn abandoned it.
+    retiring: (watch::Sender<Retiring>, oneshot::Receiver<Fence>),
 }
 
 /// Runs the turn through Route with Core's stop order merged with the
@@ -508,7 +540,7 @@ async fn turn_task(task: TurnTask) {
         state,
         reports: (health, journal),
         observations,
-        done,
+        retiring: (done, fence),
     } = task;
     let turn = start.turn();
     let persistent = lane.persistent;
@@ -560,7 +592,7 @@ async fn turn_task(task: TurnTask) {
             never = merge_stops(core_stop, close, &cancel, &merged) => match never {},
         }
     };
-    let delivery = deliver_retired(items_rx, &observations, &health);
+    let delivery = deliver_retired((items_rx, fence), &observations, &health);
     // Boxed: Route's turn is a large future.
     let routed = Box::pin(routed);
     let retiring = (routed, cleaned_rx, failure_rx);
@@ -597,8 +629,9 @@ async fn turn_task(task: TurnTask) {
 /// output fails the connection (`health`) as soon as its reading reports
 /// it (`failure`), whatever the close is doing. A retirement's cleanup and
 /// reports wait for no observation (critical r1 #4, fix r1 #1, fix r2 #1,
-/// fix r3 #3, fix r4 #1). Returns once Route's turn returned and the
-/// delivery ended.
+/// fix r3 #3, fix r4 #1). Returns once Route's turn returned, the
+/// delivery ended and both reports resolved (critical fix r1 #1); the
+/// retirement settles exactly once.
 async fn retire_beside<F>(
     (routed, mut cleaned, mut failure): (
         F,
@@ -615,7 +648,9 @@ async fn retire_beside<F>(
     let mut routed = Some(routed);
     let mut settle = Some(settle);
     let (mut delivered, mut reported, mut failed) = (false, false, false);
-    while routed.is_some() || !delivered {
+    // Each report is read until it resolves or its sender is gone, which
+    // Route's return guarantees: none is lost to the others ending first.
+    while routed.is_some() || !delivered || !reported || !failed {
         let ended = tokio::select! {
             biased;
             facts = &mut cleaned, if !reported => {
@@ -687,11 +722,17 @@ fn settle_retired((retirement, uncertain): (Retirement, bool), reports: RetiredR
 /// channel does not take in time latches `overflow` and ends the
 /// delivery; once the lane ended and its channel closed, the rest is
 /// dropped (ruling G1). Either way Route then forwards nothing more.
+/// Nothing is sent before the turn's own delivery ended (`fence`, critical
+/// fix r1 #2, #3): the generation's delivery fence is then held until this
+/// delivery ends; a turn that abandoned it leaves the delivery unfenced.
 async fn deliver_retired(
-    mut items: mpsc::Receiver<FakeRetiredItem>,
+    (mut items, fence): (mpsc::Receiver<FakeRetiredItem>, oneshot::Receiver<Fence>),
     sink: &ObservationSink,
     health: &watch::Sender<DriverHealth>,
 ) {
+    let mut fence = Some(fence);
+    // Held until the delivery ends.
+    let mut _fenced = None;
     while let Some(retired) = items.recv().await {
         let (vendor_turn, observation) = match retired {
             FakeRetiredItem::Durable(message) => match durable(message.payload) {
@@ -712,6 +753,11 @@ async fn deliver_retired(
         // Test builds: the delivery holds each retired item before its send.
         #[cfg(feature = "test-failpoints")]
         let _ = via_routes::failpoint::hit_async("adapter.fake.retirement_item").await;
+        if let Some(fence) = fence.take()
+            && let Ok(taking) = fence.await
+        {
+            _fenced = Some(taking.await);
+        }
         match sink.send(item, event_stall()).await {
             Ok(()) => {}
             Err(Undelivered::Stalled) => {
@@ -748,6 +794,12 @@ async fn idle_source(
             () = cancel.cancelled() => return,
             () = tokio::time::sleep(IDLE_POLL) => {}
         }
+    }
+    // Test builds: `adapter.fake.idle_barrier_wait` acknowledges an idle
+    // close that finds the barrier held.
+    #[cfg(feature = "test-failpoints")]
+    if barrier.try_lock().is_err() {
+        let _ = via_routes::failpoint::hit_async("adapter.fake.idle_barrier_wait").await;
     }
     // Held until the close's item was delivered (C2 §4 generation barrier).
     let _barrier = tokio::select! {
@@ -1278,7 +1330,7 @@ mod tests {
                 let (_cleaned, cleaned_rx) = tokio::sync::oneshot::channel();
                 let (_failure, failure_rx) = tokio::sync::oneshot::channel();
                 let released = AtomicBool::new(false);
-                let delivery = deliver_retired(items_rx, &sink, &health);
+                let delivery = deliver_retired((items_rx, unfenced()), &sink, &health);
                 let routed = Box::pin(async move { retirement });
                 let retiring = (routed, cleaned_rx, failure_rx);
                 let settle = retire_beside(retiring, (delivery, &health), |retirement| {
@@ -1356,7 +1408,7 @@ mod tests {
             cleaned.send(retirement).unwrap();
             let (_failure, failure_rx) = tokio::sync::oneshot::channel();
             let released = AtomicBool::new(false);
-            let delivery = deliver_retired(items_rx, &sink, &health);
+            let delivery = deliver_retired((items_rx, unfenced()), &sink, &health);
             let retiring = (routed, cleaned_rx, failure_rx);
             let settle = retire_beside(retiring, (delivery, &health), |retirement| {
                 let reports = RetiredReports {
@@ -1407,7 +1459,7 @@ mod tests {
             failure.send(cause.clone()).unwrap();
             drop(items);
             let released = AtomicBool::new(false);
-            let delivery = deliver_retired(items_rx, &sink, &health);
+            let delivery = deliver_retired((items_rx, unfenced()), &sink, &health);
             let retiring = (routed, cleaned_rx, failure_rx);
             let settle = retire_beside(retiring, (delivery, &health), |_| {
                 released.store(true, Ordering::Release);
@@ -1422,6 +1474,53 @@ mod tests {
                 }
             );
         });
+    }
+
+    /// Critical fix r1 #1 (C2 §2 health): a failure Route publishes in the
+    /// same poll that returns its turn, once the delivery already ended, is
+    /// still read and fails the connection; the retirement settles once.
+    #[test]
+    fn a_failure_published_as_route_returns_is_not_lost() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (health, _health) = watch::channel(DriverHealth::Open);
+            let (cleaned, cleaned_rx) = tokio::sync::oneshot::channel::<Retirement>();
+            let (failure, failure_rx) = tokio::sync::oneshot::channel();
+            let cause = RouteError::Protocol {
+                turn: crate::TurnNumber::try_from(7).unwrap(),
+                detail: "phase",
+            };
+            let reported = cause.clone();
+            // Pending once, so the delivery ends first; then Route publishes
+            // its failure, drops its lane and returns, in one poll.
+            let routed = Box::pin(async move {
+                tokio::task::yield_now().await;
+                failure.send(reported).unwrap();
+                drop(cleaned);
+                retirement(WireCleanup::Quiescent)
+            });
+            let settled = std::sync::atomic::AtomicUsize::new(0);
+            let retiring = (routed, cleaned_rx, failure_rx);
+            retire_beside(retiring, (async {}, &health), |_| {
+                settled.fetch_add(1, Ordering::AcqRel);
+            })
+            .await;
+            assert_eq!(settled.load(Ordering::Acquire), 1);
+            assert_eq!(
+                *health.borrow(),
+                DriverHealth::Failed {
+                    first_cause: DriverFailure::Route(cause)
+                }
+            );
+        });
+    }
+
+    /// A fence its turn abandoned: the delivery goes unfenced.
+    fn unfenced() -> tokio::sync::oneshot::Receiver<super::Fence> {
+        tokio::sync::oneshot::channel().1
     }
 
     fn retirement(cleanup: WireCleanup) -> Retirement {

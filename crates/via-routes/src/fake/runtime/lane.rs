@@ -717,6 +717,10 @@ impl Serving<'_> {
         } else {
             CloseMode::Graceful
         };
+        // Test builds: the logical turn ended and its helper's retirement
+        // begins.
+        #[cfg(feature = "test-failpoints")]
+        let _ = via_wire::failpoint::hit_async("routes.fake.retiring").await;
         // A half-close that failed leaves Host's close below to stop it.
         let _half_closed = sender.close_input(by).await;
         let (reader, cleaned) = match self.lane.retired.take() {
