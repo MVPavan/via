@@ -1,13 +1,14 @@
 # Codex server ownership and connection design (x.3.2 chunk X0)
 
-Status: revision 8, 2026-10-02, answering Sol review x32-x0-r8 (NOT
-SOUND, no Blocker: 3 Important, 3 Minor) on top of revision 7's
+Status: revision 9, 2026-10-02, answering Sol review x32-x0-r9 (NOT
+SOUND, no Blocker: 1 Important, 2 Minor) on top of revision 7's
 simplification (Ruling C: no binary-change detection, an owner scope
 rule; Ruling D: crash-only handling of VIA's own panics in the Codex
-server owner, superseding r6 Ruling A) and revisions 1–6 (Sol r1–r6).
+server owner, superseding r6 Ruling A) and revisions 1–8 (Sol r1–r8).
 Bead `via-5lr.3.2`, chunk X0. Worker: implementer-high (Opus 5.5 high),
-design mode. Base `42ee47b`; revisions 0–7 were `a141496`, `20ae3aa`,
-`348d5d7`, `8d277c1`, `dbce82b`, `b6a4d19`, `42fb246`, `d597365`.
+design mode. Base `42ee47b`; revisions 0–8 were `a141496`, `20ae3aa`,
+`348d5d7`, `8d277c1`, `dbce82b`, `b6a4d19`, `42fb246`, `d597365`,
+`09b5b0b`.
 
 Sources:
 - the x.3.2 plan (chunk X0, §1.3, §6 G1–G7); the coordinator's rulings
@@ -263,6 +264,22 @@ Tests (§7): `panic_hook_aborts_with_full_stderr`,
 `guard_during_unrelated_unwind_does_not_abort`,
 `delivered_terminal_wins_at_every_cutoff`,
 `seal_between_observations_of_one_message`. §9 is unchanged.
+
+### 0.9 Round-9 findings and where each is answered
+
+via-mnx is merged into `rust-foundation` at `e957482`; Sol confirmed the
+seal's send exclusion over its plain sink.
+
+| Finding | Decision (short) | Section |
+|---|---|---|
+| R9-1 the current terminal is retained, not sent | The normalizer publishes the current turn's terminal into the driver's retained slot under the seal's mutex, refused once sealed; at a cutoff the driver seals first, then reads that slot. Force and the `LateTerminal` path are unchanged | Item 13.2 |
+| R9-2 completion changing after the seal | Every seal-state change (taking a message, each send, the terminal's publication, a zero-output message's completion) happens in one critical section that first checks `sealed`; the last output marks completion in the same section. After the seal nothing changes, so `seal()` returns the same position each time | Item 13.2 |
+| R9-3 `current + 1` is not exact | The reported position is a conservative lower bound: no message of the registration before it was lost. `ObservationLoss.first_unqueued` is described the same way | Items 10, 13.2; §9.1 |
+
+Tests (§7): `delivered_terminal_wins_at_every_cutoff` is now
+`retained_terminal_wins_at_every_cutoff`;
+`seal_right_after_final_send_is_stable` is new. The reservation path keeps
+`admit`'s `item_cost`, shared byte budget and single stall deadline.
 
 ---
 
@@ -1257,7 +1274,9 @@ reply; written once the reply brings the `turnId`);
   `ObservationLoss { trigger: (SessionId, TurnNumber), generation, first_unqueued: u64, omitted: u64 }`
   (saturating; `omitted == u64::MAX` means **unknown or saturated**, as on
   the abnormal path of item 13.2; publicly `omitted: null` then, r4
-  R4-14), updated by later loss in the same generation (the
+  R4-14); `first_unqueued` is a conservative lower bound: no message of
+  the generation before it was lost (r9 R9-3). It is updated by later
+  loss in the same generation (the
   undelivered rest at a close or a delivery cutoff included, items 8.2,
   13.2). **Merge rule (r6
   R6-8):** a later loss keeps the record's `trigger`, `generation` and
@@ -1653,17 +1672,21 @@ Health is published at once, but `run_turn` returns only at the
 - the turn's own wall, stop or force;
 - a concurrent driver close's delivery bound (item 8.2).
 
-At that cutoff, before returning, the driver **seals** the registration's
-delivery (below) and merges what was not delivered into its loss record:
-`first_unqueued` becomes the earliest undelivered position (the merge
-rule, item 10), `omitted` unknown. It then returns:
+At that cutoff, before returning, the driver first **seals** the
+registration's delivery (below), then reads the retained-terminal slot
+and merges what was not delivered into its loss record: `first_unqueued`
+becomes the seal's position (the merge rule, item 10), `omitted`
+unknown. It then returns:
 - under force, item 6.4's `ForceStopped` at once (the seal is
   synchronous), so a launched turn still ends `unknown`/`unknown`,
   whatever was delivered;
-- at any other cutoff, when the turn's terminal was delivered to the sink
-  before the seal (the driver retains it): that terminal decides the
+- at any other cutoff, when the normalizer published the turn's terminal
+  into the retained slot before the seal (a terminal is retained for
+  `TurnEnd`, never sent to the sink; C2 §4): that terminal decides the
   result, as on server loss (13.1 step 3) and by C1 §7.6's
-  terminal-first precedence, with `TurnEnd.loss` for the rest (r8 R8-3);
+  terminal-first precedence, with `TurnEnd.loss` for the rest (r8 R8-3,
+  r9 R9-1). A terminal for an earlier `unknown` turn is still sent as
+  `Observation::LateTerminal` (item 8.2);
 - otherwise, at the lane's end or the loss deadline, `TransportLost`
   (`unknown`), cleanup `Uncertain`, with `TurnEnd.loss`; at the wall or a
   stop, their existing results.
@@ -1677,38 +1700,47 @@ a turn that ended first would leave a queued denial session-level and a
 queued terminal unattributable. Core retires the failed driver after the
 turn's end, as for any driver failure.
 
-**The delivery seal (R7-5, r8 R8-4).** Each registration has one
-`DeliverySeal`, a std mutex over `{ sealed, current: u64, complete: bool
-}` in ingress-message units: `current` is the connection decode sequence
-(the one `LeaseSignal.enqueued` counts) of the message the normalizer is
-delivering or last delivered, and `complete` says whether every
-observation it yields was sent.
-- **Initialization:** at registration, `current` is the last decode
-  sequence before the registration starts and `complete = true`; no
-  message up to it is the registration's.
-- **Taking a message:** under the mutex, unless sealed, `current = seq`,
-  `complete = false`.
-- **Each observation it yields:** the normalizer first acquires the sink
-  capacity (the byte-budget permit, then a channel slot through
-  `mpsc::Sender::reserve`: the same steps as the sink's `admit`, with
-  `reserve` for `try_send`/`send`; both cancel-safe, within the C2 stall
-  bound), then, under the mutex, either sends with the synchronous
-  `Permit::send` or, when sealed, releases both and returns.
-- **After its last observation, or at once for a message that yields
-  none:** under the mutex, `complete = true`.
-- **`seal()`** sets `sealed` under the mutex and returns the first
-  undelivered position: `current` when `!complete` (a message expanded
-  only in part counts as undelivered), else `current + 1`. Messages of
-  other registrations between positions are not this one's, so the
-  position is exact.
+**The delivery seal (R7-5, r8 R8-4, r9 R9-1–R9-3).** Each registration
+has one `DeliverySeal`, a std mutex over `{ sealed, current: u64,
+complete: bool }` in ingress-message units, plus the turn's retained
+terminal slot, written only under that mutex. `current` is the
+connection decode sequence (the one `LeaseSignal.enqueued` counts) of the
+message the normalizer is delivering or last delivered; `complete` says
+whether all of its outputs went out. A message's outputs are its sink
+observations and, for the running turn's terminal, the retained
+terminal.
 
-The seal needs no lock in the sink. With via-mnx final, `admit` is plain
-`try_send`/`send` and C2 §4 orders per producer only; the normalizer is
-one producer. Every `Permit::send` before `seal()` took the mutex has
-enqueued its item, so it is in the channel when `run_turn` returns and in
-Core's return-time drain; every later send finds `sealed` and is
-refused. `seal()` is idempotent; a close's delivery barrier (item 8.2)
-uses the same seal.
+Every change below is one critical section that first checks `sealed`;
+if sealed it changes nothing, and the normalizer releases what it holds
+and returns. So nothing changes after the seal (R9-2):
+- **Initialization:** at registration, `current` is the last decode
+  sequence before the registration starts and `complete = true`.
+- **Taking a message:** `current = seq`, `complete = false`.
+- **Each output:** for an observation, the normalizer first reserves its
+  sink capacity exactly as the sink's `admit` does: the same `item_cost`
+  against the session's shared byte budget, then a channel slot through
+  `mpsc::Sender::reserve` in place of `try_send`/`send`, with one stall
+  deadline set at the first block and shared by both waits. In the
+  critical section it sends with the synchronous `Permit::send`, which
+  moves the byte permit into `Admitted`; a refusal or a cancelled wait
+  releases both permits. The running turn's terminal is published into
+  the retained slot instead (R9-1). The message's last output sets
+  `complete = true` in the same section.
+- **A message with no output:** `complete = true` in one section.
+- **`seal()`** sets `sealed` and returns `current` when `!complete` (a
+  message expanded only in part counts as undelivered), else
+  `current + 1`. Repeated calls return the same value. The value is a
+  **conservative lower bound** (R9-3): no message of the registration
+  before it went undelivered, but the first undelivered one can be later
+  (messages of other registrations lie in between).
+
+The seal needs no lock in the sink. via-mnx, merged at `e957482`, keeps
+`admit` as plain `try_send`/`send`, and C2 §4 orders per producer only;
+the normalizer is one producer. Every `Permit::send` before `seal()`
+took the mutex has enqueued its item, so it is in the channel when
+`run_turn` returns and in Core's return-time drain; every later send
+finds `sealed` and is refused. A close's delivery barrier (item 8.2) uses
+the same seal.
 
 An idle driver has no `run_turn` to return it: its loss reaches Core
 through its close report, and `record_loss` commits one `late: true`
@@ -1771,13 +1803,17 @@ one counter outside the connection task.
   `every_delivery_cutoff_seals` (the same queue with the sink blocked,
   once per cutoff: loss deadline, wall, stop, force and a close's
   delivery bound: when `run_turn` or the close returns, the loss record's
-  `first_unqueued` is the first undelivered item, and after the sink
+  `first_unqueued` is at or before the first undelivered item, and after the sink
   unblocks nothing of that registration reaches Core; under force A ends
   `unknown`/`unknown` at once, item 6.4; R7-5);
-  `delivered_terminal_wins_at_every_cutoff` (A's terminal delivered, then
-  the sink blocked on a later item, once per cutoff but force: A ends
-  with its terminal's result, and `TurnEnd.loss` starts at the blocked
-  item's message; R8-3); `seal_between_observations_of_one_message` (one
+  `retained_terminal_wins_at_every_cutoff` (the normalizer retains A's
+  `turn/completed`, never sending it to the sink, then blocks on a later
+  observation; once per cutoff but force: A ends with its terminal's
+  result, and `TurnEnd.loss` starts no later than the blocked item's
+  message; a terminal published after the seal is refused; R8-3, R9-1);
+  `seal_right_after_final_send_is_stable` (a cutoff right after a
+  message's final send: `seal()` reports the next position, and a second
+  `seal()` returns the same; R9-2); `seal_between_observations_of_one_message` (one
   `item/completed` yields a `Progress` and an `ActionDenied`; sealing
   after the first send reports that message's sequence as the first
   undelivered, a zero-observation message before it does not move the
@@ -1952,7 +1988,7 @@ schema numbering, R1-Q1 to R1-Q4) likewise.
 |---|---|
 | X1 | `config_hash` (item 3; its identity case is removed in X3); launch environment (item 4); decline bodies (item 11) |
 | X2 | Item 0: `pinned_join_needs_no_slot`, `queued_turn_reprepares_on_readiness`, `readiness_insert_between_prepare_and_wait`, `unsubmitted_lane_is_retired`. Item 1: `host_server_owner_outlives_turns`, `store_server_anchor_and_link`, `wire_server_open_has_no_turn_folder`, `link_turn_on_turn_owner_is_invalid`. Item 2: `daemon_idle_exit_not_blocked_by_idle_server`, `host_journal_uncertain_watch`. Item 4: bootstrap `vendor/`. Item 6: `recovery_server_anchor_proved_absent`, `recovery_server_anchor_unproven`, `recovery_unlinked_server_turn_sent_nothing`, `recovery_partial_settlement_rechecks_server_anchor`, `reprobe_ownerless_not_committed`, `shutdown_link_read_failure_still_stops_groups`, `shutdown_force_shared_is_unknown`, `shared_close_cleanup_from_turn_facts`, `spontaneous_uncertain_end_keeps_link`, `quiescent_terminal_releases_link`, `close_absence_check_ignores_server`. Item 12: the Wire tests of 12.5 (claim versus first byte, holds, expiry, permits). Item 13: `drain_admitted_yields_prefix_then_boundary`, `seal_is_exact_prefix`, `seal_is_idempotent`, `close_reports_stop_reply`. (The concurrent lane drain's test is K1's.) |
-| X3 | Registry and supervision unit tests: coalesced work, retained entries, the connection-task handoff, zero-holder publication, fenced launch and retirement, the supervisor's end at the fence, its handle at the cutoff, failed-task count, `close_deadline_leaves_normalizer_on_tracker`, the daemon-level `registry_panic_aborts_daemon`, and the subprocess tests `panic_hook_aborts_with_full_stderr`, `crash_on_panic_aborts_on_destruction` and `guard_during_unrelated_unwind_does_not_abort` (item 2); `config_hash` without the binary identity (item 3); classification including the generation-only branch (item 5); cleanup-intent tests (item 8.3); `codex_never_ask` additions (item 11); guard, budget, reserved-size and staging tests (item 12); `connection_task_panic_with_staged_terminal`, `connection_task_panic_idle_driver_reports_loss`, `abnormal_health_not_behind_delivery`, `blocked_normalizer_prefix_keeps_attribution`, `every_delivery_cutoff_seals`, `delivered_terminal_wins_at_every_cutoff`, `seal_between_observations_of_one_message`, `successive_losses_keep_earliest_sequence`, `correlation_failure_is_protocol_not_unknown`, `first_failure_cause_wins` (item 13); symlinked `vendor/codex` (item 4); the replay join, `replay_mode_ack_with_empty_stdin` and `replay_paused_nonempty_pipe_waits` (item 14) |
+| X3 | Registry and supervision unit tests: coalesced work, retained entries, the connection-task handoff, zero-holder publication, fenced launch and retirement, the supervisor's end at the fence, its handle at the cutoff, failed-task count, `close_deadline_leaves_normalizer_on_tracker`, the daemon-level `registry_panic_aborts_daemon`, and the subprocess tests `panic_hook_aborts_with_full_stderr`, `crash_on_panic_aborts_on_destruction` and `guard_during_unrelated_unwind_does_not_abort` (item 2); `config_hash` without the binary identity (item 3); classification including the generation-only branch (item 5); cleanup-intent tests (item 8.3); `codex_never_ask` additions (item 11); guard, budget, reserved-size and staging tests (item 12); `connection_task_panic_with_staged_terminal`, `connection_task_panic_idle_driver_reports_loss`, `abnormal_health_not_behind_delivery`, `blocked_normalizer_prefix_keeps_attribution`, `every_delivery_cutoff_seals`, `retained_terminal_wins_at_every_cutoff`, `seal_right_after_final_send_is_stable`, `seal_between_observations_of_one_message`, `successive_losses_keep_earliest_sequence`, `correlation_failure_is_protocol_not_unknown`, `first_failure_cause_wins` (item 13); symlinked `vendor/codex` (item 4); the replay join, `replay_mode_ack_with_empty_stdin` and `replay_paused_nonempty_pipe_waits` (item 14) |
 | X4 | `c4_two_sessions`, `codex_server_close`, two keys → two servers, `servers` (items 2, 3, 7); `codex_two_threads` cutoff, reopen, fence and lease-fence assertions (item 8); request-record exhaustion (item 9.1); `codex_server_lost_order`, `codex_transport_loss_is_unknown`, `stop_reply_missing_stays_transport`, `stdout_end_then_dead_on_stop_is_server_lost`, `server_loss_cleanup_not_blocked_by_inherited_stdout`, `overflow_failure_keeps_overflow_class` (item 13) |
 | X5 | `codex_bounds_overflow` additions and the Core loss helper (item 10); `codex_rss_leases` (item 9.2); decline deadline with the reader paused (items 11, 14); `CODEX_SQLITE_HOME` persists (item 4) |
 
@@ -2045,7 +2081,8 @@ After `pub enum Prepared { Pinned(ConnectionPin), NeedsConnection }`, add:
 pub enum ConnectionPin { Generation(u64), Server(ServerPin) }
 pub enum ConnectionKind { PerTurn, Shared }   // C1 §7.6 force rows
 pub struct ObservationLoss { pub trigger: (SessionId, TurnNumber), pub generation: u64,
-    pub first_unqueued: u64, pub omitted: u64 /* saturating; u64::MAX: unknown or saturated */ }
+    pub first_unqueued: u64 /* lower bound: no earlier message lost */,
+    pub omitted: u64 /* saturating; u64::MAX: unknown or saturated */ }
 ```
 
 Replace the `TurnEnd` declaration's last line
@@ -2080,7 +2117,7 @@ Replace the `TurnEnd` declaration's last line
 
   > | `AnchorRecovery` | `anchor_id`, `generation`, `owner: ProcessOwner` (`Turn { session_id, turn }` or `Server { server_id }`), `cleanup`, `forced`: Host's passive facts for one committed anchor. A server anchor's facts reach a turn only through the turn → server-anchor link (runtime §6), and only as cleanup |
   > | `ConnectionPin` | `Generation(u64)` (the fake's persistent profile) or `Server(ServerPin)` (a shared-server holder, keeping the server from idle retirement until the turn becomes a lease or the pin drops) |
-  > | `ObservationLoss` | the driver's sticky loss record for one thread generation: original triggering turn, generation, first unqueued message sequence, saturating omitted count (`u64::MAX`: unknown or saturated). Recorded even when no turn of the driver is running, and then reported by its close. Core adds the `observations_lost` warning to each affected turn and commits one `late` warning event on a triggering turn already terminal (C1 §5) |
+  > | `ObservationLoss` | the driver's sticky loss record for one thread generation: original triggering turn, generation, first unqueued message sequence (a lower bound: no earlier message of the generation was lost), saturating omitted count (`u64::MAX`: unknown or saturated). Recorded even when no turn of the driver is running, and then reported by its close. Core adds the `observations_lost` warning to each affected turn and commits one `late` warning event on a triggering turn already terminal (C1 §5) |
 
 **§2 types table, `AdapterError` row.** After "On either kind of route,
 only a failure before any vendor launch has the no-launch evidence", add:
