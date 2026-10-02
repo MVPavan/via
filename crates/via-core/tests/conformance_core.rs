@@ -365,6 +365,33 @@ fn core_rate_limit_hint_fails_rate_limit() {
     });
 }
 
+/// x.3.2 J0: a route failure's envelope message is harness-neutral, since
+/// every route shares the failure vocabulary: the fake's process exiting
+/// after acceptance with no terminal names no harness.
+#[test]
+fn core_route_failure_message_names_no_harness() {
+    let steps = [accepted(1), json!({"action":"exit","code":3})];
+    let Some(root) = child(
+        "core_route_failure_message_names_no_harness",
+        &scenario(&json!({}), &[script("p", &steps)]),
+        &[],
+    ) else {
+        return;
+    };
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = daemon.spawn("p", &json!({})).await;
+        let envelope = daemon.wait(&session, 1).await;
+        assert_eq!(envelope["state"], "failed", "{envelope}");
+        let message = envelope["failure"]["message"].as_str().unwrap();
+        assert!(!message.is_empty(), "{envelope}");
+        for harness in via_adapters::harness_names() {
+            assert!(!message.contains(harness), "{harness}: {message}");
+        }
+        daemon.shutdown().await;
+    });
+}
+
 /// One usage message of `turn`.
 fn usage(turn: u32, key: Option<&str>, total: u64, cached: Option<u64>) -> Value {
     let mut message = json!({"type":"usage","vendor_turn_id":vendor_turn(turn),
