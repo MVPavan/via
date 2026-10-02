@@ -1907,6 +1907,67 @@ fn host_journal_uncertain_watch() {
     });
 }
 
+/// x.3.2 X0 item 2.6 (X2 r1 #4): observation does not depend on the
+/// requester staying alive. A link whose future is dropped once its write
+/// is enqueued leaves an outcome no one observes, which may be a commit:
+/// Host's sticky watch is set.
+#[test]
+fn dropped_link_sets_journal_uncertain() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        let watch = host.journal_uncertain();
+        fixture.run_turn_one(session()).await;
+        let server = host
+            .acquire(server_spec(&fixture), within(4))
+            .await
+            .unwrap();
+        fixture.arm("store.journal.server_turn", "pause");
+        let linked = session();
+        let link = server.control.link_turn(&linked, turn(1), within(10));
+        let dropped = tokio::time::timeout(Duration::from_millis(500), link).await;
+        assert!(dropped.is_err(), "the link was not held: {dropped:?}");
+        assert!(fixture.acked("store.journal.server_turn"));
+        fixture.release("store.journal.server_turn");
+        assert!(
+            eventually(Duration::from_secs(2), || *watch.borrow()).await,
+            "a dropped link's write did not set the watch"
+        );
+        let _ = host.shutdown(within(5), &[]).await;
+    });
+}
+
+/// x.3.2 X0 item 2.6 (X2 r1 #4): an acquisition whose deadline cuts an
+/// outstanding journal write leaves its outcome unobserved, and it may be
+/// a commit: Host's sticky watch is set.
+#[test]
+fn acquisition_cut_during_a_write_sets_journal_uncertain() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        let watch = host.journal_uncertain();
+        fixture.arm("store.journal.anchor_intent", "pause");
+        let acquired = host
+            .acquire(
+                fixture.spec("/bin/cat", &[]),
+                Deadline::at(tokio::time::Instant::now() + Duration::from_millis(500)),
+            )
+            .await;
+        assert!(
+            matches!(acquired, Err(HostError::Deadline)),
+            "{:?}",
+            acquired.err()
+        );
+        assert!(fixture.acked("store.journal.anchor_intent"));
+        fixture.release("store.journal.anchor_intent");
+        assert!(
+            eventually(Duration::from_secs(2), || *watch.borrow()).await,
+            "an acquisition cut during its write did not set the watch"
+        );
+        let _ = host.shutdown(within(5), &[]).await;
+    });
+}
+
 /// x.3.2 X0 item 13.1 (runtime §5 stop reply): the close reports the
 /// anchor's own reply to its `Stop`: `Some(true)` for a live vendor,
 /// `Some(false)` once the vendor had exited, `None` when the reply is lost

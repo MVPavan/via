@@ -8496,3 +8496,76 @@ fn terminal_link_release_follows_its_cleanup() {
         assert_eq!(record.link_released, quiescent);
     }
 }
+
+/// x.3.2 X0 item 6.5 (X2 r1 #7): harness-free, the real chain from a
+/// `TurnEnd`'s cleanup to the link. Its evidence goes through disposition
+/// and the terminal record; the terminal's first commit is known not
+/// committed (`store.commit.terminal`), so the same-sequence retry's copy
+/// commits it. A `quiescent` turn's link is released with it; an
+/// `uncertain` one's stays.
+#[test]
+fn turn_end_cleanup_reaches_the_link_through_the_retry() {
+    let Some(root) = child("turn_end_cleanup_reaches_the_link_through_the_retry") else {
+        return;
+    };
+    let dir = root.join("failpoints");
+    fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    via_store::failpoint::activate(&dir, FAILPOINT_TOKEN).unwrap();
+    run(async {
+        let quiet = running_turn_one(&root, false).await;
+        let unsure = running_turn_one(&root, false).await;
+        server_anchor(&root, "0-server", false, &[(&quiet, 1), (&unsure, 1)]).await;
+        // Each terminal takes two hits: the failed first attempt, then the
+        // retry.
+        for (first, session, cleanup) in [
+            (1, &quiet, via_adapters::Cleanup::Quiescent),
+            (3, &unsure, via_adapters::Cleanup::Uncertain),
+        ] {
+            let store = via_store::Store::open(&root.join("state")).unwrap();
+            let client = store.client();
+            let evidence = via_adapters::TurnEvidence {
+                exit: None,
+                cleanup,
+                journal_uncertain: false,
+            };
+            let disposed = super::terminal::dispose(
+                false,
+                (None, Ok(evidence)),
+                None,
+                tokio::time::Instant::now(),
+            );
+            let seq = client.next_seq(session).await.unwrap().unwrap();
+            let record = super::drive::ended_record(
+                &started_one(session),
+                turn_one(session, false),
+                disposed.terminal,
+                seq,
+            )
+            .unwrap();
+            assert_eq!(
+                record.link_released,
+                cleanup == via_adapters::Cleanup::Quiescent
+            );
+            let command = json!({"token":FAILPOINT_TOKEN,"occurrence":first,"action":"fail_io"});
+            fs::write(dir.join("store.commit.terminal.json"), command.to_string()).unwrap();
+            let durable = super::journal::commit_terminal_with(
+                &client,
+                record,
+                None,
+                via_store::TerminalExtras::default(),
+                (true, None),
+            )
+            .await
+            .unwrap();
+            assert!(durable.retried, "the first attempt committed: {durable:?}");
+            assert!(
+                dir.join(format!("store.commit.terminal.{first}.ack"))
+                    .exists()
+            );
+            drop(client);
+            drop(store);
+        }
+        assert_eq!(links_of(&root, &[(&quiet, 1)]).await, 0, "the link stays");
+        assert_eq!(links_of(&root, &[(&unsure, 1)]).await, 1, "the link went");
+    });
+}

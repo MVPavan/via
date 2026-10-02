@@ -1033,9 +1033,18 @@ impl Host {
         }
     }
 
+    /// Awaits `write` where this Host observes it ([`observed`]), then
     /// [`committed`] with this Host's journal-uncertain watch.
-    fn commit<T>(&self, outcome: CommitOutcome<T>, site: JournalSite) -> Result<T, HostError> {
-        committed(outcome, site, &self.uncertain)
+    async fn commit<T>(
+        &self,
+        write: impl Future<Output = CommitOutcome<T>>,
+        site: JournalSite,
+    ) -> Result<T, HostError> {
+        committed(
+            observed(write, &self.uncertain).await,
+            site,
+            &self.uncertain,
+        )
     }
 
     /// Holds capacity for a group this Host did not launch, such as one an
@@ -1279,7 +1288,7 @@ impl Host {
         let absence = absence_record(&record.intent.anchor_id, &generation, &identity, &proof);
         match timeout_at(
             deadline.instant(),
-            self.journal.commit_group_absence(absence),
+            observed(self.journal.commit_group_absence(absence), &self.uncertain),
         )
         .await
         {
@@ -1323,10 +1332,12 @@ impl Host {
             boot_id: linux::boot_id()?,
             pid_namespace: linux::pid_namespace()?,
         };
-        let receipt = self.commit(
-            self.journal.commit_anchor_intent(intent.clone()).await,
-            JournalSite::AnchorIntent,
-        )?;
+        let receipt = self
+            .commit(
+                self.journal.commit_anchor_intent(intent.clone()),
+                JournalSite::AnchorIntent,
+            )
+            .await?;
         state.intent = true;
         let bootstrap = Bootstrap {
             anchor_id: anchor_id.clone(),
@@ -1388,17 +1399,13 @@ impl Host {
             state.stop_early(deadline);
             return Err(HostError::Stopped);
         }
-        let version = self.commit(
-            self.journal
-                .commit_anchor_identified(
-                    &anchor_id,
-                    &generation,
-                    receipt.record_version,
-                    identity_to_store(&identity),
-                )
-                .await,
-            JournalSite::Identified,
-        )?;
+        let identified = self.journal.commit_anchor_identified(
+            &anchor_id,
+            &generation,
+            receipt.record_version,
+            identity_to_store(&identity),
+        );
+        let version = self.commit(identified, JournalSite::Identified).await?;
         Ok(StartedAnchor {
             anchor_id,
             generation,
@@ -1481,12 +1488,10 @@ impl Host {
             .await?;
         let vendor = vendor_config(&spec)?;
         configure(&control, vendor).await?;
-        self.commit(
-            self.journal
-                .commit_arm_intent(&anchor_id, &generation, version)
-                .await,
-            JournalSite::ArmIntent,
-        )?;
+        let arm = self
+            .journal
+            .commit_arm_intent(&anchor_id, &generation, version);
+        self.commit(arm, JournalSite::ArmIntent).await?;
         #[cfg(feature = "test-failpoints")]
         via_store::failpoint::hit_async("host.anchor.after_arm_intent_commit")
             .await
@@ -1535,12 +1540,14 @@ impl Host {
             let _ = via_store::failpoint::hit_async("host.early_stop.sent").await;
             return Err(HostError::Stopped);
         }
-        if let Err(error) = self.commit(
-            self.journal
-                .commit_vendor_facts(&anchor_id, &generation, vendor_pid)
-                .await,
-            JournalSite::VendorFacts,
-        ) {
+        if let Err(error) = self
+            .commit(
+                self.journal
+                    .commit_vendor_facts(&anchor_id, &generation, vendor_pid),
+                JournalSite::VendorFacts,
+            )
+            .await
+        {
             // Design §7.2 row 4: after ARM the vendor runs; Host stops the
             // group through the still-live control and keeps its evidence.
             // The `Stop` and the absence check share this one deadline.
@@ -2070,33 +2077,7 @@ impl ProcessControl {
                 .unwrap_or_else(Instant::now);
             wait_graceful_exit(&mut exit, force_at).await;
         }
-        let stopping = timeout_at(request.deadline.instant(), async {
-            let mut stream = self.stream.lock().await;
-            stream
-                .transact(
-                    &Request::Stop {
-                        generation: self.generation.clone(),
-                        deadline_monotonic_ns: monotonic_deadline(request.deadline),
-                    },
-                    1024,
-                )
-                .await
-        })
-        .await;
-        // A `Stop` cut short by the deadline left the control retired: shut
-        // it down now, unless a holder has it and will on its next exchange.
-        if stopping.is_err()
-            && let Ok(mut control) = self.stream.try_lock()
-            && control.retired
-        {
-            control.retire().await;
-        }
-        // Only the anchor knows whether the vendor was still live when its
-        // cleanup signalled the group; Host's polled exit watch may be stale.
-        let stopped_live = match stopping {
-            Ok(Ok(Reply::Stopping { stopped_live })) => Some(stopped_live),
-            Ok(Ok(_) | Err(_)) | Err(_) => None,
-        };
+        let stopped_live = stop_report(&self.stream, &self.generation, request.deadline).await;
         let forced = stopped_live == Some(true);
         if forced {
             self.stop.forced.store(true, Ordering::Release);
@@ -2146,7 +2127,8 @@ impl ProcessControl {
     /// link: [`HostError::Invalid`]. Not committed is
     /// [`HostError::Journal`] at [`JournalSite::Link`]; an uncertain
     /// outcome, or no outcome by `deadline`, is the same with `uncertain`,
-    /// and sets Host's journal-uncertain watch.
+    /// and sets Host's journal-uncertain watch, as does dropping this future
+    /// once its write is enqueued ([`observed`]).
     pub async fn link_turn(
         &self,
         session: &crate::SessionId,
@@ -2162,9 +2144,11 @@ impl ProcessControl {
         if Instant::now() >= deadline.instant() {
             return Err(HostError::Deadline);
         }
-        let link = self
-            .journal
-            .commit_server_turn(&self.anchor_id, session, turn);
+        let link = observed(
+            self.journal
+                .commit_server_turn(&self.anchor_id, session, turn),
+            &self.uncertain,
+        );
         let Ok(outcome) = timeout_at(deadline.instant(), link).await else {
             return Err(no_outcome(JournalSite::Link, &self.uncertain));
         };
@@ -2337,7 +2321,7 @@ async fn wait_absence(
                         site: JournalSite::Absence,
                         uncertain: false,
                     })?;
-                let commit = journal.commit_group_absence(record);
+                let commit = observed(journal.commit_group_absence(record), uncertain);
                 let Ok(outcome) = timeout_at(deadline.instant(), commit).await else {
                     return Err(no_outcome(JournalSite::Absence, uncertain));
                 };
@@ -2402,6 +2386,33 @@ fn committed<T>(
     }
 }
 
+/// Awaits a journal write's outcome where Host observes it (design item
+/// 2.6). The write's command is enqueued at its first poll; dropped after
+/// that and before its outcome (the requester was cancelled, or a deadline
+/// such as acquisition's cut it), the outcome is never observed and may be
+/// a commit, so the watch is set, as for [`no_outcome`].
+async fn observed<T>(
+    write: impl Future<Output = CommitOutcome<T>>,
+    uncertain: &watch::Sender<bool>,
+) -> CommitOutcome<T> {
+    let mut pending = Unobserved(Some(uncertain));
+    let outcome = write.await;
+    pending.0 = None;
+    outcome
+}
+
+/// Sets the journal-uncertain watch when dropped still armed: see
+/// [`observed`].
+struct Unobserved<'a>(Option<&'a watch::Sender<bool>>);
+
+impl Drop for Unobserved<'_> {
+    fn drop(&mut self) {
+        if let Some(uncertain) = self.0.take() {
+            uncertain.send_replace(true);
+        }
+    }
+}
+
 /// A journal write with no outcome by its deadline: it may have committed,
 /// so the watch is set as for an uncertain one.
 fn no_outcome(site: JournalSite, uncertain: &watch::Sender<bool>) -> HostError {
@@ -2459,6 +2470,45 @@ async fn stop_through(
         stop.forced.store(true, Ordering::Release);
     }
     forced
+}
+
+/// The close's `Stop` and the anchor's reply to it (runtime §5): only the
+/// anchor knows whether the vendor was still live when its cleanup
+/// signalled the group; Host's polled exit watch may be stale. The lock,
+/// the write and the reply are all bounded by `deadline`; no reply by then,
+/// or one in hand only at or after it ([`ControlConnection::transact_by`]'s
+/// late check), is `None`.
+async fn stop_report(
+    control: &Mutex<ControlConnection>,
+    generation: &str,
+    deadline: Deadline,
+) -> Option<bool> {
+    let stopping = timeout_at(deadline.instant(), async {
+        let mut stream = control.lock().await;
+        stream
+            .transact_by(
+                &Request::Stop {
+                    generation: generation.to_owned(),
+                    deadline_monotonic_ns: monotonic_deadline(deadline),
+                },
+                1024,
+                deadline.instant(),
+            )
+            .await
+    })
+    .await;
+    // A `Stop` cut short by the deadline left the control retired: shut
+    // it down now, unless a holder has it and will on its next exchange.
+    if stopping.is_err()
+        && let Ok(mut stream) = control.try_lock()
+        && stream.retired
+    {
+        stream.retire().await;
+    }
+    match stopping {
+        Ok(Ok(Reply::Stopping { stopped_live })) => Some(stopped_live),
+        Ok(Ok(_) | Err(_)) | Err(_) => None,
+    }
 }
 
 /// One early stop (design §6.8): `Stop` through the live control, then the
@@ -2799,6 +2849,33 @@ mod tests {
                 .checked_sub(Duration::from_secs(1))
                 .expect("a second before now"),
         )
+    }
+
+    /// x.3.2 X2 r1 #5 (runtime §5): a `Stop` reply already in hand when a
+    /// close that runs late first polls it is past the deadline, so it is
+    /// no stop report: `None`, never `Some(false)`, as for `stop_through`.
+    #[tokio::test]
+    async fn a_ready_stop_reply_polled_after_the_deadline_is_none() {
+        let (control, mut peer) = control_pair();
+        protocol::write_message(
+            &mut peer,
+            &Reply::Stopping {
+                stopped_live: false,
+            },
+            1024,
+        )
+        .await
+        .expect("the anchor's reply");
+        // The reactor has seen the socket writable and the reply readable,
+        // so the late close's first poll finds the reply in hand.
+        {
+            let held = control.lock().await;
+            held.stream.writable().await.expect("writable");
+            held.stream.readable().await.expect("readable");
+        }
+        let report = stop_report(&control, "g1", already_past()).await;
+        assert_eq!(report, None);
+        assert!(received_stop(&mut peer, "g1").await, "no Stop was written");
     }
 
     /// Sol review of Task 3 round 2, decision D5-3: a task or owner that runs

@@ -560,3 +560,89 @@ async fn seal_is_idempotent() -> TestResult {
     end(messages, &input).await;
     Ok(())
 }
+
+/// Item 13.1: a message `next_message` already dequeued when a failure
+/// latches is not dropped with the error. It was admitted before the seal,
+/// so the drain still yields it, then the boundary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn failure_during_next_message_keeps_its_message() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+    const TOKEN: &str = "x2-wire-received-failure-token";
+    let points = Scratch::new("received-points")?;
+    std::fs::set_permissions(&points.0, std::fs::Permissions::from_mode(0o700))?;
+    via_store::failpoint::activate(&points.0, TOKEN)?;
+    std::fs::write(
+        points.0.join("wire.messages.received.json"),
+        format!(r#"{{"token":"{TOKEN}","occurrence":1,"action":"pause"}}"#),
+    )?;
+    let folder = Scratch::new("received")?;
+    let (stdout, mut vendor) = tokio::io::duplex(64 * 1024);
+    let (stdin, _vendor_stdin) = tokio::io::duplex(1024);
+    let TestPipes { messages, input } = pipes(stdout, stdin, folder.0.clone());
+    vendor.write_all(b"terminal\n").await?;
+    queued(&input, 9).await;
+    let next = tokio::spawn(async move {
+        let mut messages = messages;
+        let next = messages
+            .next_message()
+            .await
+            .map(|message| message.is_some());
+        (messages, next)
+    });
+    let ack = points.0.join("wire.messages.received.1.ack");
+    let bound = Instant::now() + Duration::from_secs(5);
+    while !ack.exists() {
+        assert!(Instant::now() < bound, "next_message never dequeued");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    // The reader fails (an oversized message) while the terminal is held.
+    let writer = tokio::spawn(async move {
+        vendor
+            .write_all(&vec![b'h'; MAX_STDOUT_MESSAGE_BYTES + 1])
+            .await?;
+        Ok::<_, io::Error>(vendor)
+    });
+    while input.failure().is_none() {
+        assert!(Instant::now() < bound, "no reader failure");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    std::fs::write(points.0.join("wire.messages.received.1.release"), b"")?;
+    let (mut messages, next) = next.await?;
+    assert!(next.is_err(), "the latched failure is reported: {next:?}");
+    assert_eq!(drained(&mut messages).await, Ok(b"terminal\n".to_vec()));
+    assert!(drained(&mut messages).await.is_err(), "then the boundary");
+    let vendor = writer.await??;
+    drop(vendor);
+    end(messages, &input).await;
+    Ok(())
+}
+
+/// Item 13.1: `drain_admitted` dequeues only when polled. A drain future
+/// dropped unpolled, or losing a `select!` to a ready deadline, loses no
+/// admitted message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unpolled_drain_loses_nothing() -> TestResult {
+    let folder = Scratch::new("unpolled")?;
+    let (stdout, mut vendor) = tokio::io::duplex(1024);
+    let (stdin, _vendor_stdin) = tokio::io::duplex(1024);
+    let TestPipes {
+        mut messages,
+        input,
+    } = pipes(stdout, stdin, folder.0.clone());
+    vendor.write_all(b"one\ntwo\n").await?;
+    queued(&input, 8).await;
+    input.seal();
+    drop(messages.drain_admitted());
+    let lost = tokio::select! {
+        biased;
+        () = std::future::ready(()) => true,
+        _ = messages.drain_admitted() => false,
+    };
+    assert!(lost, "the deadline branch wins");
+    assert_eq!(drained(&mut messages).await, Ok(b"one\n".to_vec()));
+    assert_eq!(drained(&mut messages).await, Ok(b"two\n".to_vec()));
+    assert_eq!(drained(&mut messages).await, Err(0));
+    drop(vendor);
+    end(messages, &input).await;
+    Ok(())
+}

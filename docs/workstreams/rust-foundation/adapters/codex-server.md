@@ -980,11 +980,11 @@ concurrent servers on one home; resume across restart (x.3.4).
 
 - `Engine::reconcile` collects `server_anchor` IDs from
   `unfinished_turns()` (≤ 1,000). `Reconciled::add` keeps
-  `servers: HashMap<anchor_id, (quiescent, forced)>` for those anchors
-  only; turn owners keep today's path.
+  `servers: HashMap<anchor_id, quiescent>` for those anchors only (a
+  server's `forced` is discarded); turn owners keep today's path.
 - `Reconciled::cleanup(session, turn, server_anchor)`: linked → that
-  anchor's facts (none reported → `(false, false)`); unlinked → today's
-  rule. Both `&& !incomplete`.
+  anchor's cleanup, never forced (none reported → `(false, false)`);
+  unlinked → today's rule. Both `&& !incomplete`.
 - `hold_unproven` passes the anchor's `ProcessOwner`. Host's
   `Held.owner: ProcessOwner`. A session-filtered re-probe (C1 close's
   absence check) matches only `Turn` owners of that session, so it never

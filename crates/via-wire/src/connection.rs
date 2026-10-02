@@ -801,8 +801,13 @@ pub enum Admitted {
     Message(VendorMessage),
     /// The admitted prefix is over.
     Boundary {
-        /// Bytes read and not delivered: complete messages after the seal,
-        /// and what the reader discarded after its own failure.
+        /// A lower bound on bytes read and not delivered, as of this
+        /// boundary: complete messages the reader split after the seal,
+        /// plus whole reads it skipped after its own failure. It omits the
+        /// bytes of the read that failed it (the refused or oversized
+        /// message, the partial assembly and the rest of that read buffer),
+        /// so it can be zero although output was lost. A later boundary
+        /// may report more, as the reader goes on counting until EOF.
         discarded_bytes: u64,
     },
 }
@@ -833,8 +838,9 @@ impl Shared {
             .sealed = true;
     }
 
-    /// Bytes read and not delivered: complete messages after the seal and
-    /// the reader's discards after its failure.
+    /// The boundary's `discarded_bytes` ([`Admitted::Boundary`]): complete
+    /// messages split after the seal and whole reads skipped after the
+    /// reader's failure; not the read that failed it.
     fn undelivered(&self) -> u64 {
         let sealed = self
             .admission
@@ -1255,6 +1261,10 @@ pub struct WireMessages {
     wake: watch::Receiver<u64>,
     stragglers: Stragglers,
     finished: bool,
+    /// A message [`Self::next_message`] dequeued, then withheld because a
+    /// failure latched meanwhile: admitted before the seal, it is the
+    /// drain's first ([`Self::drain_admitted`]).
+    held: Option<VendorMessage>,
 }
 
 impl WireMessages {
@@ -1272,7 +1282,12 @@ impl WireMessages {
             biased;
             () = cancelled(&mut self.force) => Err(WireError::Cancelled),
             () = woken(&mut self.wake) => Err(WireError::Woken),
-            message = self.queue.recv() => self.received(message),
+            message = self.queue.recv() => {
+                // Test builds: a message is dequeued, not yet returned.
+                #[cfg(feature = "test-failpoints")]
+                let _ = via_store::failpoint::hit_async("wire.messages.received").await;
+                self.received(message)
+            }
             cause = latched(&mut self.latch) => Err(cause.error()),
         }
     }
@@ -1282,6 +1297,11 @@ impl WireMessages {
         message: Option<VendorMessage>,
     ) -> Result<Option<VendorMessage>, WireError> {
         if let Some(cause) = self.shared.failure() {
+            // In the queue, so admitted before any seal: kept for the
+            // drain, never dropped (x.3.2 X0 item 13.1 exact prefix).
+            if message.is_some() {
+                self.held = message;
+            }
             return Err(cause.error());
         }
         match message {
@@ -1303,16 +1323,26 @@ impl WireMessages {
     /// failure): the complete messages admitted before it, in order, then
     /// [`Admitted::Boundary`]; it never waits for more output (x.3.2 X0
     /// item 13.1). It seals first, so a drain alone also stops admission.
-    /// A latched failure does not hide the prefix.
-    pub fn drain_admitted(&mut self) -> impl Future<Output = Admitted> + Send + use<> {
-        self.shared.seal();
-        let next = match self.queue.try_recv() {
-            Ok(message) => Admitted::Message(message),
-            Err(_) => Admitted::Boundary {
-                discarded_bytes: self.shared.undelivered(),
-            },
-        };
-        std::future::ready(next)
+    /// A latched failure does not hide the prefix, nor a message
+    /// [`Self::next_message`] withheld from it. Nothing is sealed or
+    /// dequeued until the future is polled, and it completes at its first
+    /// poll, so a drain dropped unpolled, or losing a `select!`, loses
+    /// nothing.
+    pub fn drain_admitted(&mut self) -> impl Future<Output = Admitted> + Send + '_ {
+        std::future::poll_fn(move |_| {
+            self.shared.seal();
+            let next = match self
+                .held
+                .take()
+                .map_or_else(|| self.queue.try_recv().ok(), Some)
+            {
+                Some(message) => Admitted::Message(message),
+                None => Admitted::Boundary {
+                    discarded_bytes: self.shared.undelivered(),
+                },
+            };
+            std::task::Poll::Ready(next)
+        })
     }
 
     /// Ends the connection under one absolute deadline (design §8.6): the
@@ -1568,6 +1598,7 @@ where
         wake: waits.wake,
         stragglers: stragglers.clone(),
         finished: false,
+        held: None,
     };
     (io, messages)
 }
@@ -1625,6 +1656,8 @@ async fn read_stdout<R: AsyncRead + Unpin>(
                 .fetch_add(u64::try_from(count).unwrap_or(u64::MAX), Ordering::AcqRel);
             continue;
         }
+        // A refusal or an oversized message switches to discard mode
+        // without counting this read: `discarded_bytes` is a lower bound.
         match splitter.push(&buffer[..count], |message| {
             enqueue(&shared, &queue, message)
         }) {
