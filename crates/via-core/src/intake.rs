@@ -245,14 +245,20 @@ pub(crate) fn require(raw: Option<&RawValue>) -> Result<Vec<VerbReq>, ApiError> 
         .collect()
 }
 
-/// C1 §4 `instructions`: `{text}` or `{path}`.
+/// C1 §4 `instructions`: exactly `{text}` or exactly `{path}`, each a
+/// string. Each shape refuses the other's member, so an explicit null
+/// member or both members are refused (critical r1 #12).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Instructions {
-    #[serde(default)]
-    text: Option<String>,
-    #[serde(default)]
-    path: Option<String>,
+struct InstructionsText {
+    text: String,
+}
+
+/// See [`InstructionsText`].
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstructionsPath {
+    path: String,
 }
 
 /// A spawn's `instructions` as given (C1 §4): its text, or the path of
@@ -268,20 +274,16 @@ pub(crate) fn instructions(raw: Option<&RawValue>) -> Result<Option<Instructions
     let Some(raw) = raw else {
         return Ok(None);
     };
-    match serde_json::from_str::<Instructions>(raw.get()) {
-        Ok(Instructions {
-            text: Some(text),
-            path: None,
-        }) => Ok(Some(InstructionsSource::Text(text))),
-        Ok(Instructions {
-            text: None,
-            path: Some(path),
-        }) => Ok(Some(InstructionsSource::Path(path))),
-        Ok(_) | Err(_) => Err(instructions_refused(
-            "instructions is {text} or {path}",
-            None,
-        )),
+    if let Ok(InstructionsText { text }) = serde_json::from_str(raw.get()) {
+        return Ok(Some(InstructionsSource::Text(text)));
     }
+    if let Ok(InstructionsPath { path }) = serde_json::from_str(raw.get()) {
+        return Ok(Some(InstructionsSource::Path(path)));
+    }
+    Err(instructions_refused(
+        "instructions is {text} or {path}",
+        None,
+    ))
 }
 
 /// `invalid_params` naming `instructions`, with a file's `reason`.
@@ -868,5 +870,43 @@ mod tests {
                    "deadlines":{"wall_ms":3_600_000,"idle_ms":600_000},"max_steps":null})
         );
         assert!(Member::<u8>::Null.or(Some(1)).is_none());
+    }
+
+    /// Critical r1 #12 (C1 §4 `instructions`): exactly `{text}` or
+    /// `{path}`, each a string; an explicit null member, or both members,
+    /// is refused naming `instructions`.
+    #[test]
+    fn instructions_is_strictly_text_or_path() {
+        let parse = |value: serde_json::Value| {
+            let raw = serde_json::value::to_raw_value(&value).unwrap();
+            super::instructions(Some(&raw))
+        };
+        assert!(matches!(
+            parse(json!({"text":"x"})),
+            Ok(Some(super::InstructionsSource::Text(text))) if text == "x"
+        ));
+        assert!(matches!(
+            parse(json!({"path":"/f"})),
+            Ok(Some(super::InstructionsSource::Path(path))) if path == "/f"
+        ));
+        for refused in [
+            json!({"text":"x","path":null}),
+            json!({"text":null,"path":"/f"}),
+            json!({"text":"x","path":"/f"}),
+            json!({"text":null}),
+            json!({"path":null}),
+            json!({}),
+            json!({"text":"x","other":1}),
+            json!("x"),
+        ] {
+            let error = parse(refused.clone())
+                .err()
+                .unwrap_or_else(|| panic!("{refused}"));
+            assert_eq!(
+                error.data()["field"],
+                "instructions",
+                "{refused}: {error:?}"
+            );
+        }
     }
 }
