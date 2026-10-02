@@ -2732,6 +2732,7 @@ pub(super) fn ended_record(
         envelope,
         event,
         steps,
+        link_released: false,
     })
 }
 

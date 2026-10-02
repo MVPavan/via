@@ -221,6 +221,14 @@ impl Engine {
     /// until a later proof.
     fn hold_unread(&self, owners: &[AnchorOwner], reports: &[via_adapters::AnchorRecovery]) {
         for owner in owners {
+            // No server-owned anchor is committed before Host owns servers.
+            let via_store::ProcessOwner::Turn {
+                session_id: owner_session,
+                ..
+            } = &owner.owner
+            else {
+                continue;
+            };
             let proved = reports.iter().any(|report| {
                 report.anchor_id == owner.anchor_id && report.cleanup == Cleanup::Quiescent
             });
@@ -228,7 +236,7 @@ impl Engine {
                 let token = self.recovered.hold(&self.slots);
                 self.adapter.hold_capacity(
                     owner.anchor_id.clone(),
-                    owner.session_id.clone(),
+                    owner_session.clone(),
                     Box::new(token),
                 );
             }

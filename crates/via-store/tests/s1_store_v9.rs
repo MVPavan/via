@@ -1,6 +1,6 @@
-//! Task 4 design §6.6, runtime §6: the schema, v8 since each turn's
-//! recorded instance (v7: the session's persisted adapter version), is
-//! frozen by a golden DDL.
+//! Task 4 design §6.6, runtime §6: the schema, v9 since server-owned
+//! anchors and the turn → server-anchor link (v8: each turn's recorded
+//! instance), is frozen by a golden DDL.
 #![expect(
     clippy::unwrap_used,
     reason = "test fixtures and assertions fail loudly"
@@ -11,9 +11,15 @@ use std::{fs, os::unix::fs::PermissionsExt};
 use tempfile::TempDir;
 use via_store::Store;
 
-/// The v8 schema: every `sqlite_master` entry as `type name tbl_name sql`,
+/// The v9 schema: every `sqlite_master` entry as `type name tbl_name sql`,
 /// with the SQL's whitespace collapsed. Changing it is a schema change.
 const GOLDEN: &[(&str, &str, &str, &str)] = &[
+    (
+        "index",
+        "anchors_one_server",
+        "anchors",
+        "CREATE UNIQUE INDEX anchors_one_server ON anchors(owner_server) WHERE owner_server IS NOT NULL",
+    ),
     (
         "index",
         "anchors_unproven",
@@ -25,6 +31,12 @@ const GOLDEN: &[(&str, &str, &str, &str)] = &[
         "events_turn",
         "events",
         "CREATE INDEX events_turn ON events(session_id,turn,seq)",
+    ),
+    (
+        "index",
+        "server_turns_anchor",
+        "server_turns",
+        "CREATE INDEX server_turns_anchor ON server_turns(anchor_id)",
     ),
     ("index", "sqlite_autoindex_anchors_1", "anchors", ""),
     ("index", "sqlite_autoindex_events_1", "events", ""),
@@ -44,10 +56,12 @@ const GOLDEN: &[(&str, &str, &str, &str)] = &[
         "anchors",
         "anchors",
         "CREATE TABLE anchors ( anchor_id TEXT PRIMARY KEY, generation TEXT NOT NULL, \
-         marker TEXT NOT NULL, socket_path TEXT NOT NULL, owner_session TEXT NOT NULL, \
-         owner_turn INTEGER NOT NULL, uid INTEGER NOT NULL, boot_id TEXT NOT NULL, \
+         marker TEXT NOT NULL, socket_path TEXT NOT NULL, owner_session TEXT, \
+         owner_turn INTEGER, owner_server TEXT, uid INTEGER NOT NULL, boot_id TEXT NOT NULL, \
          pid_namespace TEXT NOT NULL, phase TEXT NOT NULL, record_version INTEGER NOT NULL, \
          pid INTEGER, pgid INTEGER, start_ticks INTEGER, vendor_pid INTEGER, absence_time TEXT, \
+         CHECK((owner_session IS NULL) = (owner_turn IS NULL)), \
+         CHECK((owner_server IS NULL) <> (owner_session IS NULL)), \
          FOREIGN KEY(owner_session,owner_turn) REFERENCES turns(session_id,number))",
     ),
     (
@@ -70,6 +84,15 @@ const GOLDEN: &[(&str, &str, &str, &str)] = &[
          PRIMARY KEY(session_id,op_key), \
          CHECK(verb='close' OR (turn IS NOT NULL AND result IS NOT NULL)), \
          FOREIGN KEY(session_id,turn) REFERENCES turns(session_id,number))",
+    ),
+    (
+        "table",
+        "server_turns",
+        "server_turns",
+        "CREATE TABLE server_turns ( session_id TEXT NOT NULL, turn INTEGER NOT NULL, \
+         anchor_id TEXT NOT NULL REFERENCES anchors(anchor_id), \
+         PRIMARY KEY(session_id, turn), \
+         FOREIGN KEY(session_id, turn) REFERENCES turns(session_id, number) ) WITHOUT ROWID",
     ),
     (
         "table",
@@ -133,17 +156,17 @@ fn collapse(sql: &str) -> String {
     sql.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Design §6.6, runtime §6: a fresh Store is v8 exactly as frozen here, with the
+/// Design §6.6, runtime §6: a fresh Store is v9 exactly as frozen here, with the
 /// `session_ord` counter at `(1, 0)` and the evidence root beside it.
 #[test]
-fn s1_store_v8_schema_is_frozen() {
+fn s1_store_v9_schema_is_frozen() {
     let root = private_dir();
     drop(Store::open(root.path()).unwrap());
     let conn = rusqlite::Connection::open(root.path().join("store.sqlite3")).unwrap();
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
     let mut query = conn
         .prepare("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name")
         .unwrap();

@@ -171,6 +171,7 @@ fn persistent_fail_io_fails_every_later_commit() {
                 envelope: json!({"state":"failed"}),
                 event: event("turn.ended", 3),
                 steps: Vec::new(),
+                link_released: false,
             })
             .await;
         assert!(
@@ -183,8 +184,10 @@ fn persistent_fail_io_fails_every_later_commit() {
                 generation: "g".to_owned(),
                 marker: "m".to_owned(),
                 socket_path: "/private/a.sock".into(),
-                owner_session: session(),
-                owner_turn: turn(),
+                owner: via_store::ProcessOwner::Turn {
+                    session_id: session(),
+                    turn: turn(),
+                },
                 uid: 1000,
                 boot_id: "boot".to_owned(),
                 pid_namespace: "pid:[1]".to_owned(),
@@ -225,6 +228,7 @@ fn rider_seam_rolls_back_the_cancellation_and_the_close() {
             envelope: json!({"state":"cancelled"}),
             event: event("turn.ended", 2),
             steps: Vec::new(),
+            link_released: false,
         };
         let failed = client
             .commit_closing_terminal(cancelled(), event("session.closed", 3))
@@ -289,6 +293,7 @@ fn rider_seam_is_not_reached_when_another_turn_prevents_the_close() {
                     envelope: json!({"state":"cancelled"}),
                     event: event("turn.ended", 3),
                     steps: Vec::new(),
+                    link_released: false,
                 },
                 event("session.closed", 4),
             )

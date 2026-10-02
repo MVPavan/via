@@ -2,10 +2,43 @@
 
 use super::{
     AnchorCohort, AnchorIdentity, AnchorIntent, AnchorIntentReceipt, AnchorOwner, AnchorPhase,
-    AnchorQuery, AnchorRecord, Connection, GroupAbsenceRecord, PathBuf, SessionId, StoreError,
-    TransactionBehavior, TurnNumber, params,
+    AnchorQuery, AnchorRecord, Connection, GroupAbsenceRecord, OptionalExtension, PathBuf,
+    ProcessOwner, SERVER_LINKS_LIMIT, ServerLink, SessionId, StoreError, TransactionBehavior,
+    TurnNumber, params,
     sql::{before_commit, commit, sql_error},
 };
+use crate::ServerId;
+
+/// An anchor row's owner columns, consecutive from `first`, as one
+/// [`ProcessOwner`].
+fn owner_at(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<ProcessOwner> {
+    owner_columns(row, first, first + 1, first + 2)
+}
+
+/// An anchor row's owner columns as one [`ProcessOwner`]; any other
+/// combination is a corrupt row.
+fn owner_columns(
+    row: &rusqlite::Row<'_>,
+    session: usize,
+    turn: usize,
+    server: usize,
+) -> rusqlite::Result<ProcessOwner> {
+    let session: Option<String> = row.get(session)?;
+    let turn: Option<u32> = row.get(turn)?;
+    let server: Option<String> = row.get(server)?;
+    match (session, turn, server) {
+        (Some(session), Some(turn), None) => Ok(ProcessOwner::Turn {
+            session_id: SessionId::try_from(session.as_str())
+                .map_err(|_| rusqlite::Error::InvalidQuery)?,
+            turn: TurnNumber::try_from(turn).map_err(|_| rusqlite::Error::InvalidQuery)?,
+        }),
+        (None, None, Some(server)) => Ok(ProcessOwner::Server {
+            server_id: ServerId::try_from(server.as_str())
+                .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        }),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
 
 pub(super) fn commit_anchor_intent(
     conn: &mut Connection,
@@ -24,14 +57,20 @@ pub(super) fn commit_anchor_intent(
         .socket_path
         .to_str()
         .ok_or(StoreError::Constraint("socket path is not UTF-8"))?;
+    let (session, turn, server) = match &intent.owner {
+        ProcessOwner::Turn { session_id, turn } => {
+            (Some(session_id.as_str()), Some(turn.get()), None)
+        }
+        ProcessOwner::Server { server_id } => (None, None, Some(server_id.as_str())),
+    };
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sql_error)?;
     tx.execute(
-        "INSERT INTO anchors(anchor_id,generation,marker,socket_path,owner_session,owner_turn,uid,boot_id,pid_namespace,phase,record_version)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'intent',1)",
+        "INSERT INTO anchors(anchor_id,generation,marker,socket_path,owner_session,owner_turn,owner_server,uid,boot_id,pid_namespace,phase,record_version)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'intent',1)",
         params![intent.anchor_id,intent.generation,intent.marker,socket_path,
-            intent.owner_session.as_str(),intent.owner_turn.get(),intent.uid,intent.boot_id,intent.pid_namespace],
+            session,turn,server,intent.uid,intent.boot_id,intent.pid_namespace],
     ).map_err(sql_error)?;
     before_commit!("store.journal.anchor_intent");
     commit(tx)?;
@@ -202,7 +241,7 @@ pub(super) fn read_anchor_records(
 ) -> Result<Vec<AnchorRecord>, StoreError> {
     let mut query = conn.prepare(
         "SELECT anchor_id,generation,marker,socket_path,owner_session,owner_turn,uid,boot_id,pid_namespace,
-                phase,record_version,pid,pgid,start_ticks,vendor_pid,absence_time FROM anchors
+                phase,record_version,pid,pgid,start_ticks,vendor_pid,absence_time,owner_server FROM anchors
                 WHERE (?1 IS NULL OR anchor_id>?1) AND (?3=0 OR absence_time IS NULL)
                   AND (?4 IS NULL OR owner_session=?4) AND (?5 IS NULL OR rowid<=?5)
                 ORDER BY anchor_id LIMIT ?2"
@@ -217,18 +256,13 @@ pub(super) fn read_anchor_records(
                 page.cohort.map(|cohort| cohort.0)
             ],
             |row| {
-                let owner: String = row.get(4)?;
-                let owner_session = SessionId::try_from(owner.as_str())
-                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
-                let owner_turn = TurnNumber::try_from(row.get::<_, u32>(5)?)
-                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
+                let owner = owner_columns(row, 4, 5, 16)?;
                 let intent = AnchorIntent {
                     anchor_id: row.get(0)?,
                     generation: row.get(1)?,
                     marker: row.get(2)?,
                     socket_path: PathBuf::from(row.get::<_, String>(3)?),
-                    owner_session,
-                    owner_turn,
+                    owner,
                     uid: row.get(6)?,
                     boot_id: row.get(7)?,
                     pid_namespace: row.get(8)?,
@@ -306,8 +340,8 @@ pub(super) fn count_unproven_anchors(
 }
 
 /// One page of committed anchors, in `anchor_id` order after `after`, with
-/// their owning turns, for recovery's coverage check; no marker, identity or
-/// control path.
+/// their owners, for recovery's coverage check; no marker, identity or
+/// control path. A server anchor has no owning turn (`turn_running` false).
 pub(super) fn read_anchor_owners(
     conn: &Connection,
     after: Option<&str>,
@@ -316,8 +350,8 @@ pub(super) fn read_anchor_owners(
 ) -> Result<Vec<AnchorOwner>, StoreError> {
     let mut query = conn
         .prepare(
-            "SELECT a.anchor_id,a.owner_session,a.owner_turn,t.state='running',a.phase FROM anchors a
-             JOIN turns t ON t.session_id=a.owner_session AND t.number=a.owner_turn
+            "SELECT a.anchor_id,a.owner_session,a.owner_turn,a.owner_server,coalesce(t.state='running',0),a.phase FROM anchors a
+             LEFT JOIN turns t ON t.session_id=a.owner_session AND t.number=a.owner_turn
              WHERE (?1 IS NULL OR a.anchor_id>?1) AND (?3 IS NULL OR a.rowid<=?3)
              ORDER BY a.anchor_id LIMIT ?2",
         )
@@ -326,22 +360,75 @@ pub(super) fn read_anchor_owners(
         .query_map(
             params![after, limit, cohort.map(|cohort| cohort.0)],
             |row| {
-                let owner: String = row.get(1)?;
-                let session = SessionId::try_from(owner.as_str())
-                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
-                let turn = TurnNumber::try_from(row.get::<_, u32>(2)?)
-                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
                 Ok(AnchorOwner {
                     anchor_id: row.get(0)?,
-                    session_id: session,
-                    turn,
-                    turn_running: row.get(3)?,
-                    phase: AnchorPhase::parse(&row.get::<_, String>(4)?).ok(),
+                    owner: owner_at(row, 1)?,
+                    turn_running: row.get(4)?,
+                    phase: AnchorPhase::parse(&row.get::<_, String>(5)?).ok(),
                 })
             },
         )
         .map_err(sql_error)?;
     rows.map(|row| row.map_err(sql_error)).collect()
+}
+
+/// Commits a turn's link to a server anchor (runtime §6 `server_turns`):
+/// one `INSERT … SELECT` that inserts only for a server-owned anchor and a
+/// `running` turn. Zero rows, or a second link of the turn, is
+/// `Constraint`, so nothing committed.
+pub(super) fn commit_server_turn(
+    conn: &mut Connection,
+    anchor_id: &str,
+    session: &SessionId,
+    turn: TurnNumber,
+) -> Result<(), StoreError> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sql_error)?;
+    let inserted = tx
+        .execute(
+            "INSERT OR IGNORE INTO server_turns(session_id,turn,anchor_id)
+             SELECT t.session_id,t.number,a.anchor_id FROM anchors a, turns t
+             WHERE a.anchor_id=?1 AND a.owner_server IS NOT NULL
+               AND t.session_id=?2 AND t.number=?3 AND t.state='running'",
+            params![anchor_id, session.as_str(), turn.get()],
+        )
+        .map_err(sql_error)?;
+    if inserted != 1 {
+        return Err(StoreError::Constraint(
+            "a link needs a server anchor, a running turn and no earlier link",
+        ));
+    }
+    before_commit!("store.journal.server_turn");
+    commit(tx)
+}
+
+/// The links of `turns`, at most [`SERVER_LINKS_LIMIT`] of them.
+pub(super) fn read_server_links(
+    conn: &Connection,
+    turns: &[(SessionId, TurnNumber)],
+) -> Result<Vec<ServerLink>, StoreError> {
+    if turns.len() > SERVER_LINKS_LIMIT {
+        return Err(StoreError::Constraint("too many turns for one link read"));
+    }
+    let mut query = conn
+        .prepare_cached("SELECT anchor_id FROM server_turns WHERE session_id=?1 AND turn=?2")
+        .map_err(sql_error)?;
+    let mut links = Vec::new();
+    for (session, turn) in turns {
+        let anchor: Option<String> = query
+            .query_row(params![session.as_str(), turn.get()], |row| row.get(0))
+            .optional()
+            .map_err(sql_error)?;
+        if let Some(anchor_id) = anchor {
+            links.push(ServerLink {
+                session_id: session.clone(),
+                turn: *turn,
+                anchor_id,
+            });
+        }
+    }
+    Ok(links)
 }
 
 /// The cohort of every committed anchor: the largest anchor rowid, 0 when

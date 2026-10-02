@@ -1240,8 +1240,10 @@ impl Host {
             generation: generation.clone(),
             marker: marker.clone(),
             socket_path: socket_path.clone(),
-            owner_session: owner.session_id.clone(),
-            owner_turn: owner.turn,
+            owner: via_store::ProcessOwner::Turn {
+                session_id: owner.session_id.clone(),
+                turn: owner.turn,
+            },
             uid: rustix::process::getuid().as_raw(),
             boot_id: linux::boot_id()?,
             pid_namespace: linux::pid_namespace()?,
@@ -1709,8 +1711,14 @@ impl Host {
         for record in records {
             let anchor_id = record.intent.anchor_id.clone();
             let generation = record.intent.generation.clone();
-            let owner_session = record.intent.owner_session.clone();
-            let owner_turn = record.intent.owner_turn;
+            // No server-owned anchor is committed before Host owns servers.
+            let via_store::ProcessOwner::Turn {
+                session_id: owner_session,
+                turn: owner_turn,
+            } = record.intent.owner.clone()
+            else {
+                continue;
+            };
             let cleanup = self.recover_one(record, deadline).await?;
             self.capacity.settle(&anchor_id, &cleanup);
             let forced = self

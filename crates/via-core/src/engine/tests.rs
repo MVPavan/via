@@ -293,6 +293,7 @@ async fn end_turn(engine: &Engine, session: &SessionId, n: u32, state: Option<&s
                     },
                 ),
                 steps: Vec::new(),
+                link_released: false,
             })
             .await
             .unwrap();
@@ -1535,8 +1536,10 @@ async fn closing_with_anchors(root: &Path, provable: bool, count: usize) -> Sess
             generation: generation.clone(),
             marker: "marker".to_owned(),
             socket_path: root.join(format!("runtime/anchors/{n}.sock")),
-            owner_session: session.clone(),
-            owner_turn: turn(1),
+            owner: via_store::ProcessOwner::Turn {
+                session_id: session.clone(),
+                turn: turn(1),
+            },
             uid,
             boot_id: boot_id.clone(),
             pid_namespace: pid_namespace.clone(),
@@ -3205,6 +3208,7 @@ async fn end_unknown(
                     },
                 ),
                 steps: Vec::new(),
+                link_released: false,
             },
             via_store::TerminalExtras {
                 cancel_cause: cause,

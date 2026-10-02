@@ -542,6 +542,14 @@ impl Engine {
     /// no new child starts until cleanup proves room.
     fn hold_unproven(&self, owners: &[AnchorOwner], reports: &[AnchorRecovery]) {
         for owner in owners {
+            // No server-owned anchor is committed before Host owns servers.
+            let via_store::ProcessOwner::Turn {
+                session_id: owner_session,
+                ..
+            } = &owner.owner
+            else {
+                continue;
+            };
             let proved = reports.iter().any(|report| {
                 report.anchor_id == owner.anchor_id && report.cleanup == Cleanup::Quiescent
             });
@@ -549,7 +557,7 @@ impl Engine {
                 let token = self.recovered.hold(&self.slots);
                 self.adapter.hold_capacity(
                     owner.anchor_id.clone(),
-                    owner.session_id.clone(),
+                    owner_session.clone(),
                     Box::new(token),
                 );
             }
@@ -575,8 +583,8 @@ impl Engine {
             turn,
             submitted_at,
             correlation,
-            effective: _,
             instance,
+            ..
         } = unfinished;
         let History {
             last_seq,
@@ -666,6 +674,7 @@ impl Engine {
                 envelope,
                 event,
                 steps: Vec::new(),
+                link_released: false,
             },
             None,
         )
@@ -941,10 +950,20 @@ impl Reconciled {
 
     /// Folds one inventory page and Host's reports for the same id range.
     fn add(&mut self, owners: &[AnchorOwner], reports: &[AnchorRecovery]) {
-        for owner in owners {
+        for anchor in owners {
+            // No server-owned anchor is committed before Host owns servers.
+            let via_store::ProcessOwner::Turn { session_id, turn } = &anchor.owner else {
+                continue;
+            };
+            let owner = TurnOwner {
+                anchor_id: &anchor.anchor_id,
+                session_id,
+                turn: *turn,
+                turn_running: anchor.turn_running,
+            };
             let report = reports.iter().find(|report| {
-                report.anchor_id == owner.anchor_id
-                    && report.session_id == owner.session_id
+                report.anchor_id == *owner.anchor_id
+                    && report.session_id == *owner.session_id
                     && report.turn == owner.turn
             });
             if report.is_none() {
@@ -952,7 +971,7 @@ impl Reconciled {
             }
             // Critical r1 #9: only a session recovery asks about keeps its
             // facts, within the cap; past it the session's are incomplete.
-            if self.relevant.contains(&owner.session_id) {
+            if self.relevant.contains(owner.session_id) {
                 match report {
                     Some(report) if self.kept < RECOVERY_FACTS => {
                         self.kept += 1;
@@ -1014,6 +1033,14 @@ impl Reconciled {
             .unwrap_or((true, false));
         (quiescent && !self.incomplete, forced)
     }
+}
+
+/// A turn-owned anchor of the inventory.
+struct TurnOwner<'a> {
+    anchor_id: &'a String,
+    session_id: &'a SessionId,
+    turn: TurnNumber,
+    turn_running: bool,
 }
 
 /// An adapter's recovery answer on facts that are `complete` or not:
@@ -1090,8 +1117,10 @@ mod tests {
     ) -> AnchorOwner {
         AnchorOwner {
             anchor_id: anchor_id.to_owned(),
-            session_id: session.clone(),
-            turn: TurnNumber::try_from(1).expect("turn"),
+            owner: via_store::ProcessOwner::Turn {
+                session_id: session.clone(),
+                turn: TurnNumber::try_from(1).expect("turn"),
+            },
             turn_running,
             phase,
         }
