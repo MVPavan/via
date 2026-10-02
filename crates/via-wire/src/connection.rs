@@ -4,6 +4,7 @@
 //! (§9): every wait selects on the stop signal or its own deadline, and the
 //! reader never awaits a consumer or the Store.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt;
@@ -15,9 +16,9 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
-use tokio::time::timeout_at;
+use tokio::time::{sleep_until, timeout_at};
 
 use super::{BoundedBytes, Deadline, SendOutcome, VendorMessage, WireFailure};
 use crate::runtime::{WireCloseReport, WireError, wire_cleanup};
@@ -39,8 +40,14 @@ const QUEUE_BYTES: usize = 4 * 1024 * 1024;
 /// escaped into one reused buffer (design §8.3).
 const PROMPT_SLICE: usize = 16 * 1024;
 
-/// A control message (an interrupt) is at most 64 KiB (design §8.3).
+/// A control message is at most 64 KiB (design §8.3); the distinct
+/// control messages outstanding on a connection are at most this many
+/// bytes in total (runtime §8, C2 §2).
 const CONTROL_BYTES: usize = 64 * 1024;
+
+/// The distinct control messages outstanding on a connection, enqueued and
+/// not yet answered (runtime §8, C2 §2).
+const CONTROL_MESSAGES: usize = 8;
 
 /// `finish` drains until this long before its deadline, then aborts and
 /// joins until the deadline (design §8.6).
@@ -94,6 +101,18 @@ pub enum OutboundMessage {
     /// one is coalesced into the first: it is not written and answers
     /// `NotWritten`.
     Interrupt(Vec<u8>),
+    /// A distinct control message, written whole between messages and
+    /// never coalesced (runtime §8, C2 §2). At most eight are outstanding,
+    /// 64 KiB in total; one past either is refused at once with
+    /// `NotWritten`, nothing written. Its deadline bounds only the wait for
+    /// its first byte, queued or at the writer: one expired before it
+    /// answers `NotWritten`, returns its share, is never written, and
+    /// stdin stays open; expiry wins over a writable stdin. One started is
+    /// written whole, cut only by the connection's stop. A deadline thus
+    /// never closes a stdin other sessions may share. A queued message
+    /// expires at its deadline whether its write is polled, kept or
+    /// dropped: the writer, while it holds stdin, removes it too.
+    Control(Vec<u8>),
 }
 
 /// A write enqueued to the stdin writer (design §8.3). It is cancel-safe:
@@ -119,6 +138,14 @@ struct DataWrite {
 /// A job on the writer's control queue.
 enum Control {
     Interrupt {
+        bytes: Vec<u8>,
+        deadline: Deadline,
+        reply: oneshot::Sender<Result<SendOutcome, WireError>>,
+    },
+    /// A distinct control message holding its share of the budget.
+    Message {
+        /// Its place in the queue, by which its caller expires it.
+        ticket: u64,
         bytes: Vec<u8>,
         deadline: Deadline,
         reply: oneshot::Sender<Result<SendOutcome, WireError>>,
@@ -152,7 +179,193 @@ struct Shared {
     interrupt_sent: AtomicBool,
     /// A close of stdin was enqueued (coalescing).
     close_sent: AtomicBool,
+    /// The writer's control queue and the control budget.
+    control: ControlQueue,
     undecoded: Undecoded,
+}
+
+/// The writer's control queue (design §8.3): interrupts, distinct control
+/// messages and the close, first in first out, beside the budget of the
+/// distinct control messages outstanding (queued or being written), under
+/// one lock. A queued control message is owned by whichever comes first of
+/// its expiry (by its caller, or by the writer while it holds stdin) and the
+/// writer's take, so it is answered and its share returned exactly once
+/// (runtime §8, C2 §2).
+#[derive(Default)]
+struct ControlQueue {
+    state: StdMutex<ControlState>,
+    /// Wakes the writer, in `next` or in `expire_queued`, never both at
+    /// once: a push before it waits leaves a permit, and `next` checks the
+    /// queue before it waits.
+    ready: Notify,
+}
+
+#[derive(Default)]
+struct ControlState {
+    jobs: VecDeque<Control>,
+    /// The next control message's ticket.
+    ticket: u64,
+    /// The writer ended: nothing is queued any more.
+    closed: bool,
+    /// The distinct control messages outstanding and their bytes.
+    messages: usize,
+    bytes: usize,
+}
+
+impl ControlQueue {
+    fn state(&self) -> std::sync::MutexGuard<'_, ControlState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Queues an interrupt or the close; false once the writer ended.
+    fn push(&self, control: Control) -> bool {
+        let mut state = self.state();
+        if state.closed {
+            return false;
+        }
+        state.jobs.push_back(control);
+        drop(state);
+        self.ready.notify_one();
+        true
+    }
+
+    /// Queues a distinct control message with its share of the budget;
+    /// its ticket, or `None`, taking nothing, when it would pass
+    /// [`CONTROL_MESSAGES`] or [`CONTROL_BYTES`] or the writer ended.
+    fn push_message(
+        &self,
+        bytes: Vec<u8>,
+        deadline: Deadline,
+        reply: oneshot::Sender<Result<SendOutcome, WireError>>,
+    ) -> Option<u64> {
+        let mut state = self.state();
+        let total = state.bytes.saturating_add(bytes.len());
+        if state.closed || state.messages >= CONTROL_MESSAGES || total > CONTROL_BYTES {
+            return None;
+        }
+        state.messages += 1;
+        state.bytes = total;
+        let ticket = state.ticket;
+        state.ticket += 1;
+        state.jobs.push_back(Control::Message {
+            ticket,
+            bytes,
+            deadline,
+            reply,
+        });
+        drop(state);
+        self.ready.notify_one();
+        Some(ticket)
+    }
+
+    /// Its caller's deadline passed: removes the message `ticket` if the
+    /// writer has not taken it, returning its share; true when removed.
+    fn expire(&self, ticket: u64) -> bool {
+        let mut state = self.state();
+        let queued = state.jobs.iter().position(
+            |job| matches!(job, Control::Message { ticket: queued, .. } if *queued == ticket),
+        );
+        let Some(Control::Message { bytes, .. }) = queued.and_then(|at| state.jobs.remove(at))
+        else {
+            return false;
+        };
+        state.release(bytes.len());
+        true
+    }
+
+    /// The writer's next control job, in queue order.
+    async fn next(&self) -> Control {
+        loop {
+            if let Some(job) = self.state().jobs.pop_front() {
+                return job;
+            }
+            self.ready.notified().await;
+        }
+    }
+
+    /// Services queued deadlines while the writer holds stdin; never
+    /// resolves. Each queued message whose deadline passed is removed, its
+    /// share returned and `NotWritten` answered, to nobody if its caller is
+    /// gone; then it waits for the earliest deadline left, or a push.
+    async fn expire_queued(&self) -> std::convert::Infallible {
+        loop {
+            let earliest = self.take_expired();
+            // A push consumes the writer's wake; `next` checks the queue
+            // before it waits, so nothing is lost.
+            let pushed = self.ready.notified();
+            match earliest {
+                Some(earliest) => {
+                    tokio::select! {
+                        () = sleep_until(earliest) => {}
+                        () = pushed => {}
+                    }
+                }
+                None => pushed.await,
+            }
+        }
+    }
+
+    /// Removes, under the lock, each queued message whose deadline passed,
+    /// returning its share, and answers it `NotWritten`; the earliest
+    /// deadline left.
+    fn take_expired(&self) -> Option<tokio::time::Instant> {
+        let now = tokio::time::Instant::now();
+        let mut expired = Vec::new();
+        let mut earliest: Option<tokio::time::Instant> = None;
+        let mut state = self.state();
+        let mut kept = VecDeque::with_capacity(state.jobs.len());
+        while let Some(job) = state.jobs.pop_front() {
+            match job {
+                Control::Message {
+                    bytes,
+                    deadline,
+                    reply,
+                    ..
+                } if deadline.instant() <= now => {
+                    state.release(bytes.len());
+                    expired.push(reply);
+                }
+                Control::Message { deadline, .. } => {
+                    let at = deadline.instant();
+                    earliest = Some(earliest.map_or(at, |earliest| earliest.min(at)));
+                    kept.push_back(job);
+                }
+                job @ (Control::Interrupt { .. } | Control::Close) => kept.push_back(job),
+            }
+        }
+        state.jobs = kept;
+        drop(state);
+        for reply in expired {
+            let _ = reply.send(Ok(SendOutcome::NotWritten));
+        }
+        earliest
+    }
+
+    /// Returns the share of a message the writer resolved.
+    fn release(&self, length: usize) {
+        self.state().release(length);
+    }
+
+    /// The writer ended: nothing more is queued. Takes every queued job,
+    /// each message's share returned.
+    fn close(&self) -> VecDeque<Control> {
+        let mut state = self.state();
+        state.closed = true;
+        let jobs = std::mem::take(&mut state.jobs);
+        for job in &jobs {
+            if let Control::Message { bytes, .. } = job {
+                state.release(bytes.len());
+            }
+        }
+        jobs
+    }
+}
+
+impl ControlState {
+    fn release(&mut self, length: usize) {
+        self.messages = self.messages.saturating_sub(1);
+        self.bytes = self.bytes.saturating_sub(length);
+    }
 }
 
 impl Shared {
@@ -173,12 +386,11 @@ impl Shared {
     }
 
     /// Enqueues a close of stdin once.
-    fn request_close(&self, control: &mpsc::Sender<Control>) {
+    fn request_close(&self) {
         if !self.close_sent.swap(true, Ordering::AcqRel) {
-            // At most one interrupt and one close are ever queued, so the
-            // queue of eight is never full; a closed one means the writer
-            // already ended and dropped stdin.
-            let _ = control.try_send(Control::Close);
+            // A closed queue means the writer already ended and dropped
+            // stdin.
+            let _ = self.control.push(Control::Close);
         }
     }
 
@@ -227,7 +439,6 @@ impl Shared {
 pub(crate) struct Io {
     shared: Arc<Shared>,
     data: mpsc::Sender<DataWrite>,
-    control: mpsc::Sender<Control>,
     closed: watch::Receiver<bool>,
 }
 
@@ -252,14 +463,18 @@ impl Io {
                     {
                         return Ok(SendOutcome::NotWritten);
                     }
-                    io.control
-                        .send(Control::Interrupt {
-                            bytes,
-                            deadline,
-                            reply,
-                        })
-                        .await
-                        .is_ok()
+                    io.shared.control.push(Control::Interrupt {
+                        bytes,
+                        deadline,
+                        reply,
+                    })
+                }
+                OutboundMessage::Control(bytes) => {
+                    let Some(ticket) = io.shared.control.push_message(bytes, deadline, reply)
+                    else {
+                        return Ok(SendOutcome::NotWritten);
+                    };
+                    return io.control_answer(ticket, deadline, answer).await;
                 }
             };
             if !enqueued {
@@ -272,8 +487,28 @@ impl Io {
         }))
     }
 
+    /// A queued control message's answer: it expires on its own deadline,
+    /// even while another message holds stdin, unless the writer took it
+    /// first, which then answers.
+    async fn control_answer(
+        &self,
+        ticket: u64,
+        deadline: Deadline,
+        mut answer: oneshot::Receiver<Result<SendOutcome, WireError>>,
+    ) -> Result<SendOutcome, WireError> {
+        tokio::select! {
+            biased;
+            answered = &mut answer => return answered.unwrap_or(Ok(SendOutcome::Indeterminate)),
+            () = sleep_until(deadline.instant()) => {}
+        }
+        if self.shared.control.expire(ticket) {
+            return Ok(SendOutcome::NotWritten);
+        }
+        answer.await.unwrap_or(Ok(SendOutcome::Indeterminate))
+    }
+
     pub(crate) async fn close_input(&self, deadline: Deadline) -> Result<(), WireError> {
-        self.shared.request_close(&self.control);
+        self.shared.request_close();
         let mut closed = self.closed.clone();
         match timeout_at(deadline.instant(), closed.wait_for(|closed| *closed)).await {
             // A writer that ended without the mark dropped stdin with it.
@@ -325,7 +560,9 @@ struct Process {
 impl WireSender {
     /// Enqueues one input message; the returned write resolves once the
     /// writer answered. `deadline` bounds the write itself: a message cut
-    /// short by it closes stdin and answers `Indeterminate`.
+    /// short by it closes stdin and answers `Indeterminate`, or `NotWritten`
+    /// when nothing of it was written. A `Control` message differs: see
+    /// [`OutboundMessage::Control`].
     pub fn write(&self, message: OutboundMessage, deadline: Deadline) -> PendingWrite {
         self.io.write(message, deadline)
     }
@@ -406,7 +643,6 @@ pub struct WireMessages {
     stop: watch::Sender<bool>,
     shared: Arc<Shared>,
     latch: watch::Receiver<LatchState>,
-    control: mpsc::Sender<Control>,
     force: watch::Receiver<Option<tokio::time::Instant>>,
     wake: watch::Receiver<u64>,
     stragglers: Stragglers,
@@ -469,7 +705,7 @@ impl WireMessages {
     /// A `finish` cancelled before its handoff leaves `finished` unset, so
     /// `Drop` hands the tasks over instead.
     pub async fn finish(mut self, deadline: Deadline) {
-        self.shared.request_close(&self.control);
+        self.shared.request_close();
         let drain_by = deadline
             .instant()
             .checked_sub(FINISH_JOIN)
@@ -674,6 +910,7 @@ where
         discarded: AtomicU64::new(0),
         interrupt_sent: AtomicBool::new(false),
         close_sent: AtomicBool::new(false),
+        control: ControlQueue::default(),
         undecoded: Undecoded {
             folder,
             tasks,
@@ -683,7 +920,6 @@ where
     });
     let (queue_tx, queue) = mpsc::channel(QUEUE_MESSAGES);
     let (data_tx, data_rx) = mpsc::channel(1);
-    let (control_tx, control_rx) = mpsc::channel(8);
     let (stop, stop_rx) = watch::channel(false);
     let (closed_tx, closed) = watch::channel(false);
     let mut tasks = JoinSet::new();
@@ -695,10 +931,9 @@ where
     ));
     tasks.spawn(write_stdin(
         stdin,
-        Arc::clone(&shared),
         Queues {
             data: data_rx,
-            control: control_rx,
+            shared: Arc::clone(&shared),
         },
         stop_rx,
         closed_tx,
@@ -706,7 +941,6 @@ where
     let io = Io {
         shared: Arc::clone(&shared),
         data: data_tx,
-        control: control_tx.clone(),
         closed,
     };
     let messages = WireMessages {
@@ -715,7 +949,6 @@ where
         stop,
         shared,
         latch: latch_rx,
-        control: control_tx,
         force: waits.force,
         wake: waits.wake,
         stragglers: stragglers.clone(),
@@ -835,10 +1068,19 @@ fn enqueue(shared: &Shared, queue: &mpsc::Sender<VendorMessage>, message: Vec<u8
     sent
 }
 
-/// The writer's two queues.
+/// The writer's two queues: the data channel and the shared control queue.
 struct Queues {
     data: mpsc::Receiver<DataWrite>,
-    control: mpsc::Receiver<Control>,
+    shared: Arc<Shared>,
+}
+
+/// A writer aborted mid-wait still closes the control queue, so no queued
+/// job outlives it: each one's answer is dropped (`Indeterminate`), as its
+/// channel's would be, and each message's share returns.
+impl Drop for Queues {
+    fn drop(&mut self) {
+        drop(self.shared.control.close());
+    }
 }
 
 /// One message for the writer and where its answer goes.
@@ -847,6 +1089,9 @@ struct Job {
     deadline: Deadline,
     reply: oneshot::Sender<Result<SendOutcome, WireError>>,
     start: bool,
+    /// A distinct control message's budgeted bytes, returned before its
+    /// answer.
+    budgeted: Option<usize>,
 }
 
 /// The stdin writer (design §8.3): owns stdin and writes one message at a
@@ -855,7 +1100,6 @@ struct Job {
 /// whole closes stdin. On its end it drops stdin and marks it closed.
 async fn write_stdin<W: AsyncWrite + Unpin>(
     mut stdin: W,
-    shared: Arc<Shared>,
     mut queues: Queues,
     mut stop: watch::Receiver<bool>,
     closed: watch::Sender<bool>,
@@ -866,14 +1110,22 @@ async fn write_stdin<W: AsyncWrite + Unpin>(
         let job = tokio::select! {
             biased;
             () = stopped(&mut stop) => break,
-            control = queues.control.recv() => match control {
-                Some(Control::Interrupt { bytes, deadline, reply }) => Job {
+            control = queues.shared.control.next() => match control {
+                Control::Interrupt { bytes, deadline, reply } => Job {
                     message: OutboundMessage::Interrupt(bytes),
                     deadline,
                     reply,
                     start: false,
+                    budgeted: None,
                 },
-                Some(Control::Close) | None => break,
+                Control::Message { bytes, deadline, reply, .. } => Job {
+                    budgeted: Some(bytes.len()),
+                    message: OutboundMessage::Control(bytes),
+                    deadline,
+                    reply,
+                    start: false,
+                },
+                Control::Close => break,
             },
             data = queues.data.recv(), if data_open => {
                 let Some(DataWrite { message, deadline, reply }) = data else {
@@ -885,6 +1137,7 @@ async fn write_stdin<W: AsyncWrite + Unpin>(
                     deadline,
                     reply,
                     start: true,
+                    budgeted: None,
                 }
             }
         };
@@ -892,10 +1145,22 @@ async fn write_stdin<W: AsyncWrite + Unpin>(
             stdin: &mut stdin,
             stop: &mut stop,
             deadline: job.deadline,
+            whole: job.budgeted.is_some(),
             written: false,
+            timed_out: false,
         };
-        let outcome = writing.message(&job.message, &mut piece).await;
-        let written = writing.written;
+        // While it holds stdin, queued control messages still expire.
+        let outcome = tokio::select! {
+            biased;
+            outcome = writing.message(&job.message, &mut piece) => outcome,
+            never = queues.shared.control.expire_queued() => match never {},
+        };
+        let (written, timed_out) = (writing.written, writing.timed_out);
+        // Resolved, whatever the outcome: its share returns before the
+        // answer, so a caller answered may enqueue the next at once.
+        if let Some(length) = job.budgeted {
+            queues.shared.control.release(length);
+        }
         match outcome {
             Ok(true) => {
                 // The whole input message (in S1 first the start carrying the
@@ -911,6 +1176,11 @@ async fn write_stdin<W: AsyncWrite + Unpin>(
                 let _ = job.start;
                 let _ = job.reply.send(Ok(SendOutcome::Written));
             }
+            // A control message's deadline passed before its first byte:
+            // refused, and stdin stays open for the messages after it.
+            Ok(false) if job.budgeted.is_some() && timed_out && !written => {
+                let _ = job.reply.send(Ok(SendOutcome::NotWritten));
+            }
             Ok(false) => {
                 let _ = job.reply.send(Ok(if written {
                     SendOutcome::Indeterminate
@@ -920,25 +1190,32 @@ async fn write_stdin<W: AsyncWrite + Unpin>(
                 break;
             }
             Err(error) => {
-                shared.fail(FailureCause::Writer(error.kind()));
+                queues.shared.fail(FailureCause::Writer(error.kind()));
                 let _ = job.reply.send(Err(WireError::Io(error)));
                 break;
             }
         }
     }
     drop(stdin);
-    // Nothing queued after the end is written.
-    queues.control.close();
+    refuse_queued(&mut queues);
+    closed.send_replace(true);
+}
+
+/// The writer's end: nothing queued after it is written, so each queued
+/// write answers `NotWritten` and a control message returns its share.
+fn refuse_queued(queues: &mut Queues) {
     queues.data.close();
-    while let Ok(control) = queues.control.try_recv() {
-        if let Control::Interrupt { reply, .. } = control {
-            let _ = reply.send(Ok(SendOutcome::NotWritten));
+    for control in queues.shared.control.close() {
+        match control {
+            Control::Interrupt { reply, .. } | Control::Message { reply, .. } => {
+                let _ = reply.send(Ok(SendOutcome::NotWritten));
+            }
+            Control::Close => {}
         }
     }
     while let Ok(data) = queues.data.try_recv() {
         let _ = data.reply.send(Ok(SendOutcome::NotWritten));
     }
-    closed.send_replace(true);
 }
 
 /// One message being written.
@@ -946,8 +1223,14 @@ struct Writing<'a, W> {
     stdin: &'a mut W,
     stop: &'a mut watch::Receiver<bool>,
     deadline: Deadline,
+    /// A control message: the deadline bounds only the wait for its first
+    /// byte, and one started is written whole, so a deadline never leaves a
+    /// partial line nor closes a stdin other sessions may share.
+    whole: bool,
     /// Some byte of the message was written.
     written: bool,
+    /// The deadline cut the message.
+    timed_out: bool,
 }
 
 impl<W: AsyncWrite + Unpin> Writing<'_, W> {
@@ -959,7 +1242,9 @@ impl<W: AsyncWrite + Unpin> Writing<'_, W> {
         piece: &mut Vec<u8>,
     ) -> std::io::Result<bool> {
         match message {
-            OutboundMessage::Interrupt(bytes) => self.put(bytes).await,
+            OutboundMessage::Interrupt(bytes) | OutboundMessage::Control(bytes) => {
+                self.put(bytes).await
+            }
             OutboundMessage::Start {
                 prefix,
                 prompt,
@@ -991,22 +1276,55 @@ impl<W: AsyncWrite + Unpin> Writing<'_, W> {
         let mut offset = 0;
         while offset < bytes.len() {
             // A pipe write is cancel-safe: a cancelled one wrote nothing.
+            let (whole, written) = (self.whole, self.written);
+            let (deadline, stdin, chunk) =
+                (self.deadline.instant(), &mut *self.stdin, &bytes[offset..]);
+            let pending = async move {
+                match (whole, written) {
+                    (true, false) => first_write(stdin, chunk, deadline).await,
+                    (true, true) => Some(stdin.write(chunk).await),
+                    (false, _) => timeout_at(deadline, stdin.write(chunk)).await.ok(),
+                }
+            };
             let write = tokio::select! {
                 biased;
                 () = stopped(self.stop) => return Ok(false),
-                write = timeout_at(self.deadline.instant(), self.stdin.write(&bytes[offset..])) => write,
+                write = pending => write,
             };
             match write {
-                Err(_) | Ok(Ok(0)) => return Ok(false),
-                Ok(Ok(count)) => {
+                None => {
+                    self.timed_out = true;
+                    return Ok(false);
+                }
+                Some(Ok(0)) => return Ok(false),
+                Some(Ok(count)) => {
                     self.written = true;
                     offset += count;
                 }
-                Ok(Err(error)) => return Err(error),
+                Some(Err(error)) => return Err(error),
             }
         }
         Ok(true)
     }
+}
+
+/// A control message's first write: its expiry wins before every poll that
+/// could write a byte, so an expired message never starts, though stdin is
+/// writable; `None` once expired.
+async fn first_write<W: AsyncWrite + Unpin>(
+    stdin: &mut W,
+    chunk: &[u8],
+    deadline: tokio::time::Instant,
+) -> Option<std::io::Result<usize>> {
+    let expiry = sleep_until(deadline);
+    tokio::pin!(expiry);
+    std::future::poll_fn(|cx| {
+        if tokio::time::Instant::now() >= deadline || expiry.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(None);
+        }
+        Pin::new(&mut *stdin).poll_write(cx, chunk).map(Some)
+    })
+    .await
 }
 
 /// Resolves once the stop signal is set, or its sender is gone.

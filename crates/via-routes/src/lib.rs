@@ -18,11 +18,12 @@ pub const UNKNOWN_TAG_MAX: usize = 256;
 /// rule 2).
 pub const MAX_OBSERVATION_BYTES: usize = 256 * 1024;
 
-/// Error from the typed fake route boundary.
+/// A route turn's typed failure cause, shared by every route; its text is
+/// harness-neutral, since it reaches C1 `failure.message`.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum RouteError {
     /// A known message was malformed or a response did not match this turn.
-    #[error("fake protocol error in turn {turn:?}: {detail}")]
+    #[error("protocol error in turn {turn:?}: {detail}")]
     Protocol {
         /// Turn whose connection produced the error.
         turn: TurnNumber,
@@ -30,19 +31,19 @@ pub enum RouteError {
         detail: &'static str,
     },
     /// The transport failed while ownership remained with Wire.
-    #[error("fake transport lost in turn {turn:?}")]
+    #[error("transport lost in turn {turn:?}")]
     TransportLost {
         /// Affected turn.
         turn: TurnNumber,
     },
     /// Host confirmed the process exited before terminal evidence.
-    #[error("fake process exited in turn {turn:?}")]
+    #[error("process exited in turn {turn:?}")]
     ProcessExited {
         /// Affected turn.
         turn: TurnNumber,
     },
     /// A bounded route or observation queue was exhausted.
-    #[error("fake route overflow in turn {turn:?}")]
+    #[error("route overflow in turn {turn:?}")]
     Overflow {
         /// Affected turn.
         turn: TurnNumber,
@@ -50,7 +51,7 @@ pub enum RouteError {
     /// A storage step the turn depends on failed: the evidence folder or
     /// `stderr.log` (Task 4 design §7.2) or a Host journal write (rows 3 and
     /// 4), with its classified outcome [r5.5].
-    #[error("fake store failed in turn {turn:?}: {kind:?}")]
+    #[error("store failed in turn {turn:?}: {kind:?}")]
     Store {
         /// Affected turn.
         turn: TurnNumber,
@@ -60,41 +61,41 @@ pub enum RouteError {
     /// The turn's stop order was honoured (design §2): before launch nothing
     /// started; after it, the group was force-closed at `force_at` under
     /// `close_by` and stdout was drained.
-    #[error("fake turn stopped in turn {turn:?}")]
+    #[error("turn stopped in turn {turn:?}")]
     Stopped {
         /// Affected turn.
         turn: TurnNumber,
     },
     /// Core's absolute turn deadline elapsed before terminal evidence and exit.
-    #[error("fake turn deadline elapsed in turn {turn:?}")]
+    #[error("turn deadline elapsed in turn {turn:?}")]
     Deadline {
         /// Affected turn.
         turn: TurnNumber,
     },
     /// The caller's force stop ended the turn; its private group was
     /// force-closed and stdout drained when launched.
-    #[error("fake turn force-stopped in turn {turn:?}")]
+    #[error("turn force-stopped in turn {turn:?}")]
     ForceStopped {
         /// Affected turn.
         turn: TurnNumber,
     },
     /// Host confirmed the persistent connection's server died before any
     /// terminal (C1 §7.6 `server_lost`).
-    #[error("fake server lost in turn {turn:?}")]
+    #[error("server lost in turn {turn:?}")]
     ServerLost {
         /// Affected turn.
         turn: TurnNumber,
     },
     /// The handshake lacked a feature VIA relies on; the start was not
     /// written (AD7 `handshake_refused`).
-    #[error("fake handshake refused in turn {turn:?}")]
+    #[error("handshake refused in turn {turn:?}")]
     HandshakeRefused {
         /// Affected turn.
         turn: TurnNumber,
     },
     /// The catalog the instance reported at its handshake lacks the turn's
     /// value; the start was not written (AD18 `invalid_params`).
-    #[error("fake instance catalog lacks the turn's {field} in turn {turn:?}")]
+    #[error("instance catalog lacks the turn's {field} in turn {turn:?}")]
     InvalidParam {
         /// Affected turn.
         turn: TurnNumber,
@@ -104,7 +105,7 @@ pub enum RouteError {
     /// An identity the vendor reported before the turn's terminal differs
     /// from the session's (C2 §2 Reopen `resume_mismatch`); nothing was
     /// replaced or resent.
-    #[error("fake resume mismatch in turn {turn:?}")]
+    #[error("resume mismatch in turn {turn:?}")]
     ResumeMismatch {
         /// Affected turn.
         turn: TurnNumber,
@@ -218,13 +219,21 @@ fn undecoded_note(note: Option<&str>) -> String {
     note.map(|note| format!("; {note}")).unwrap_or_default()
 }
 
+pub mod claude;
+pub mod codex;
 mod fake;
+mod runtime;
+pub mod steer;
 
 pub use fake::{
-    CONTROL_BYTES, CONTROL_COMMANDS, FakeClassHint, FakeCost, FakeDenialKind, FakeMessage,
-    FakeRoute, FakeRouteResult, FakeTerminal, FakeTurn, FakeUsage, Handshake, Lane, Retirement,
-    RouteMessage, SteerAnswer, SteerRefused, SteerRequest, SteerSender, TerminalDetails,
-    TerminalStatus, TurnStart, VENDOR_DATA_MAX, steer_lane,
+    FakeClassHint, FakeCost, FakeDenialKind, FakeMessage, FakeRoute, FakeRouteResult, FakeTerminal,
+    FakeTurn, FakeUsage, Handshake, Lane, RouteMessage, TerminalDetails, TerminalStatus, TurnStart,
+    VENDOR_DATA_MAX,
+};
+pub use runtime::{Retirement, RouteRuntime};
+pub use steer::{
+    CONTROL_BYTES, CONTROL_COMMANDS, SteerAnswer, SteerRefused, SteerRequest, SteerSender,
+    steer_lane,
 };
 pub use via_wire::StoreError;
 /// Test builds only: the failpoint controller, for the layers above.

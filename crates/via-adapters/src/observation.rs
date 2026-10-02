@@ -384,7 +384,7 @@ pub struct TurnEnd {
 pub enum AdapterError {
     /// A route cause with Route's evidence: S1's causes, `ServerLost` and
     /// transport loss on the persistent profile, and `HandshakeRefused`.
-    #[error("fake route failed: {0}")]
+    #[error("route failed: {0}")]
     Route(RouteFailure),
     /// A definite rejection before acceptance; nothing was resent.
     #[error("the turn was rejected before submission: {reason:?}")]

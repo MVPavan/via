@@ -43,10 +43,13 @@ fn s_launch_plan_inherit_per_harness() {
         ("VIA_FAKE_SCENARIO", scenario.into_os_string()),
         ("VIA_FAKE_SYNC_DIR", sync.into_os_string()),
     ]);
+    // Pinned, so each vendor harness's adapter is built: its plan, not a
+    // missing binary, answers. Nothing here runs either.
     let harnesses = RawValue::from_string(
-        r#"{"claude":{"inherit":{"hooks":true,"mcp_servers":true}},
-            "codex":{"inherit":{"skills":false}}}"#
-            .to_owned(),
+        json!({"claude":{"binary":dir.path().join("claude"),
+                         "inherit":{"hooks":true,"mcp_servers":true}},
+               "codex":{"binary":dir.path().join("codex"),"inherit":{"skills":false}}})
+        .to_string(),
     )
     .unwrap();
     let config = AdapterConfig::load(env, Some(&harnesses)).unwrap();
@@ -64,18 +67,25 @@ fn s_launch_plan_inherit_per_harness() {
         harness: Some(harness.to_owned()),
         ..DescribeRequest::default()
     };
-    let fake = set.plan(&describe("fake")).unwrap();
-    assert_eq!(
-        fake.inherit,
-        InheritPlan {
-            requested: Inherit::OD2_DEFAULT,
-            effective: Inherit::OD2_DEFAULT,
-        }
-    );
-    // No vendor adapter exists before x.3.2: a configured vendor harness
-    // still refuses, starting nothing.
-    for harness in ["claude", "codex"] {
-        let refusal = set.plan(&describe(harness)).unwrap_err();
-        assert_eq!(refusal.kind, RefusalKind::HarnessUnavailable, "{harness}");
+    let od2 = InheritPlan {
+        requested: Inherit::OD2_DEFAULT,
+        effective: Inherit::OD2_DEFAULT,
+    };
+    // Per harness: the plan's inherit, or the refusal. No vendor adapter
+    // plans before x.3.2: a configured vendor harness still refuses,
+    // starting nothing. Each adapter track flips its own row.
+    let rows: [(&str, Result<InheritPlan, RefusalKind>); 3] = [
+        ("claude", Err(RefusalKind::HarnessUnavailable)),
+        ("codex", Err(RefusalKind::HarnessUnavailable)),
+        ("fake", Ok(od2)),
+    ];
+    for (harness, expected) in rows {
+        let planned = set
+            .plan(&describe(harness))
+            .map(|plan| plan.inherit)
+            .map_err(|refusal| refusal.kind);
+        assert_eq!(planned, expected, "{harness}");
     }
+    // Per-turn routes only: no shared server (C2 §2 `servers`).
+    assert!(set.servers().is_empty());
 }
