@@ -30,6 +30,10 @@ pub(crate) struct Bootstrap {
     pub failpoints: Option<(PathBuf, String)>,
 }
 
+/// The largest control request the anchor reads, `Configure` included:
+/// the one cap Host writes and the anchor reads under.
+pub(crate) const REQUEST_MAX: usize = 65_536;
+
 #[derive(Serialize, Deserialize)]
 pub(crate) struct VendorConfig {
     pub program: Vec<u8>,

@@ -107,7 +107,7 @@ pub(crate) fn end_active(state: &Mutex<DriverState>, turn: crate::TurnNumber) {
 /// the daemon force.
 pub(crate) async fn deliver_beside<N: Normalize, R>(
     route: impl Future<Output = Option<R>>,
-    hop_rx: mpsc::Receiver<N::Message>,
+    hop_rx: mpsc::Receiver<via_routes::Decoded<N::Message>>,
     normalizer: &mut N,
     sink: &ObservationSink,
     activity: &crate::TurnActivity,
@@ -118,6 +118,10 @@ pub(crate) async fn deliver_beside<N: Normalize, R>(
     let stall = event_stall();
     let mut hop_rx = Some(hop_rx);
     let mut delivery: Option<Delivery> = None;
+    // The decode position of the message `delivery` carries (critical r2
+    // #2): once its observations are in the session channel, Core's decode
+    // fence counts it delivered.
+    let mut carrying = 0;
     let mut delivered = true;
     let result = loop {
         tokio::select! {
@@ -125,6 +129,9 @@ pub(crate) async fn deliver_beside<N: Normalize, R>(
             outcome = poll_delivery(delivery.as_mut()), if delivery.is_some() => {
                 delivery = None;
                 normalizer.emitted(outcome.is_ok());
+                if outcome.is_ok() {
+                    activity.delivered_through(carrying);
+                }
                 if outcome.is_err() {
                     // Latched at once (C2 §2); Route observes the closed hop
                     // as overflow, or as the force's stop under a force.
@@ -136,9 +143,10 @@ pub(crate) async fn deliver_beside<N: Normalize, R>(
             message = recv(hop_rx.as_mut()), if delivery.is_none() && hop_rx.is_some() => {
                 match message {
                     Some(message) => {
-                        let at = tokio::time::Instant::now();
-                        activity.record(at);
-                        let items = normalizer.items(message, at);
+                        // Its read instant, not now (critical r1 #3).
+                        activity.record(message.at);
+                        carrying = message.seq;
+                        let items = normalizer.items(message.item, message.at);
                         delivery = Some(Box::pin(send_all(items, sink.clone(), stall)));
                     }
                     None => hop_rx = None,
@@ -157,17 +165,18 @@ pub(crate) async fn deliver_beside<N: Normalize, R>(
             if outcome.is_err() {
                 return Rest::Undelivered;
             }
+            activity.delivered_through(carrying);
         }
         if let Some(receiver) = hop_rx.as_mut() {
             while let Ok(message) = receiver.try_recv() {
-                let at = tokio::time::Instant::now();
-                activity.record(at);
-                let items = normalizer.items(message, at);
+                activity.record(message.at);
+                let items = normalizer.items(message.item, message.at);
                 let outcome = send_all(items, sink.clone(), stall).await;
                 normalizer.emitted(outcome.is_ok());
                 if outcome.is_err() {
                     return Rest::Undelivered;
                 }
+                activity.delivered_through(message.seq);
             }
         }
         Rest::Delivered

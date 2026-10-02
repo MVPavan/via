@@ -108,6 +108,25 @@ pub(crate) fn categories() -> BTreeMap<Category, CategoryDecl> {
     ])
 }
 
+/// The refusal cache's clock: a plan reads entries and the driver writes
+/// refusals at its instant. Test builds: while the failpoint
+/// `adapter.claude.plan_clock_ms` (a `value`) is armed, the clock is
+/// frozen at a fixed origin (the real time of its first armed reading in
+/// this process) plus that many milliseconds, so a refusal's expiry runs
+/// under controlled time that real elapsed time never moves (x.3.2 C3).
+pub(super) fn clock() -> std::time::Instant {
+    let now = std::time::Instant::now();
+    #[cfg(feature = "test-failpoints")]
+    if let Ok(Some(ahead)) = via_routes::failpoint::value("adapter.claude.plan_clock_ms") {
+        static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let origin = *ORIGIN.get_or_init(|| now);
+        return origin
+            .checked_add(std::time::Duration::from_millis(ahead))
+            .unwrap_or(origin);
+    }
+    now
+}
+
 /// The values a turn sets that the route must accept.
 struct PerTurn<'a> {
     effort: Option<&'a str>,
@@ -151,21 +170,18 @@ impl ClaudeAdapter {
     }
 
     /// The last version an init reported for `harness` run from this
-    /// program path, and a live cached handshake refusal for `requested`'s
-    /// recipe (C2 §5).
+    /// program path, and a handshake refusal for `requested`'s recipe
+    /// cached and live at `now` (C2 §5).
     fn version(
         &self,
         harness: Harness,
         requested: Inherit,
         schema: bool,
+        now: std::time::Instant,
     ) -> (Option<String>, VersionStatus) {
         let version = self.instances.last_version(harness.name(), &self.binary);
         let recipe = launch::recipe_key(requested, schema);
-        let status = if self
-            .instances
-            .refusal(&self.binary, &recipe, std::time::Instant::now())
-            .is_some()
-        {
+        let status = if self.instances.refusal(&self.binary, &recipe, now).is_some() {
             VersionStatus::Refused
         } else if version
             .as_deref()
@@ -184,6 +200,19 @@ impl ClaudeAdapter {
         req: &DescribeRequest,
         model: ModelChoice,
         requested: Inherit,
+    ) -> RoutePlan {
+        self.plan_at(harness, req, model, requested, clock())
+    }
+
+    /// [`Self::plan`] with its clock at `now`: the refusal cache's entries
+    /// are live or expired as of `now`.
+    fn plan_at(
+        &self,
+        harness: Harness,
+        req: &DescribeRequest,
+        model: ModelChoice,
+        requested: Inherit,
+        now: std::time::Instant,
     ) -> RoutePlan {
         let route = harness.route();
         let capabilities = capabilities();
@@ -207,15 +236,9 @@ impl ClaudeAdapter {
             ));
         }
         let (vendor_version, version_status) =
-            self.version(harness, requested, req.sizes.output_schema > 0);
+            self.version(harness, requested, req.sizes.output_schema > 0, now);
         if version_status == VersionStatus::Refused {
-            let mut refusal = Refusal::new(
-                RefusalKind::VersionRefused,
-                Some(route),
-                "a recent handshake check of this binary failed on something VIA relies on",
-            );
-            refusal.reason = Some("handshake_refused");
-            refusals.push(refusal);
+            refusals.push(handshake_refused(route));
         }
         let effective_bound = req.bound.clone().filter(|_| {
             !refusals
@@ -241,8 +264,41 @@ impl ClaudeAdapter {
         }
     }
 
-    /// Every per-turn refusal of a resume turn, in C1 member order.
-    pub(crate) fn check_turn(route: &'static str, turn: &TurnParams) -> Vec<Refusal> {
+    /// Every refusal of a turn the route would launch, spawn's turn 1 and
+    /// a resume's alike: its values in C1 member order
+    /// ([`Self::check_values`]), then a launch request past Host's cap
+    /// ([`Self::frame_refusal`]), then a handshake refusal cached for the
+    /// session's recipe on this binary (C2 §5; critical r1 #1, #2).
+    pub(crate) fn check_turn(&self, route: &'static str, turn: &TurnParams) -> Vec<Refusal> {
+        self.check_turn_at(route, turn, clock())
+    }
+
+    /// [`Self::check_turn`] with the refusal cache read at `now`.
+    fn check_turn_at(
+        &self,
+        route: &'static str,
+        turn: &TurnParams,
+        now: std::time::Instant,
+    ) -> Vec<Refusal> {
+        let mut refusals = Self::check_values(route, turn);
+        refusals.extend(self.frame_refusal(route, turn));
+        if let Some(inherit) = turn.inherit
+            && self
+                .instances
+                .refusal(
+                    &self.binary,
+                    &launch::recipe_key(inherit, turn.output_schema),
+                    now,
+                )
+                .is_some()
+        {
+            refusals.push(handshake_refused(route));
+        }
+        refusals
+    }
+
+    /// The refusals of a turn's values alone, in C1 member order.
+    pub(crate) fn check_values(route: &'static str, turn: &TurnParams) -> Vec<Refusal> {
         refusals(
             route,
             &PerTurn {
@@ -253,6 +309,77 @@ impl ClaudeAdapter {
             },
         )
     }
+
+    /// Critical r1 #1: the turn's launch request (Host's `Configure`
+    /// frame: binary, argv, `cwd`, environment and Host's marker) past the
+    /// cap the anchor reads under is `invalid_params`, naming the larger of
+    /// `instructions` and `output_schema` (`bound`, its extra directories,
+    /// when neither is set), so nothing is accepted that Host cannot start.
+    ///
+    /// Host computes the encoded size ([`crate::PrivateProcessSpec::configure_fits`]).
+    /// The values known only by size (C2 §2) stand in at their largest
+    /// encoding: every byte of the instructions, schema, `cwd` and model as
+    /// one of three digits, the session flag the longer `--session-id` with
+    /// such an ID, and the MCP switch present when `inherit` is unknown. So
+    /// spawn and resume judge the same session alike, and a launch that
+    /// passes always fits; one near the cap may be refused that would fit.
+    fn frame_refusal(&self, route: &'static str, turn: &TurnParams) -> Option<Refusal> {
+        let widest = |len: usize| "z".repeat(len);
+        let model = widest(turn.sizes.model);
+        let session = "f".repeat(36);
+        let instructions = widest(turn.sizes.instructions);
+        // A JSON string of the schema's length, quotes besides, parses.
+        let schema = serde_json::value::RawValue::from_string(format!(
+            "\"{}\"",
+            widest(turn.sizes.output_schema)
+        ))
+        .ok()?;
+        let extra_write_dirs = turn
+            .bound
+            .as_ref()
+            .map_or(&[][..], |bound| bound.extra_write_dirs.as_slice());
+        let recipe = launch::Recipe {
+            model: &model,
+            session: launch::Continue::New(&session),
+            // OD2's default requests MCP servers off: the switch is passed.
+            inherit: turn.inherit.unwrap_or(Inherit::OD2_DEFAULT),
+            extra_write_dirs,
+            // Present instructions pass the flag, empty ones too (critical r2 #1).
+            instructions: turn.instructions.then_some(instructions.as_str()),
+            effort: turn.effort.as_deref(),
+            output_schema: turn.output_schema.then_some(&*schema),
+            max_steps: turn.max_steps,
+        };
+        let args = launch::argv(&recipe).ok()?;
+        let cwd = std::path::PathBuf::from(widest(turn.sizes.cwd));
+        if crate::PrivateProcessSpec::configure_fits(&self.binary, &args, &cwd, &self.env_list()) {
+            return None;
+        }
+        let field = match (turn.sizes.instructions, turn.sizes.output_schema) {
+            (0, 0) => "bound",
+            (instructions, schema) if schema > instructions => "output_schema",
+            _ => "instructions",
+        };
+        Some(Refusal::new(
+            RefusalKind::InvalidParam { field },
+            Some(route),
+            format!(
+                "the launch's arguments together, instructions and output_schema \
+                 included, exceed route {route}'s 64 KiB launch request limit"
+            ),
+        ))
+    }
+}
+
+/// C2 §5: a recent handshake check of the binary failed for the recipe.
+fn handshake_refused(route: &'static str) -> Refusal {
+    let mut refusal = Refusal::new(
+        RefusalKind::VersionRefused,
+        Some(route),
+        "a recent handshake check of this binary failed on something VIA relies on",
+    );
+    refusal.reason = Some("handshake_refused");
+    refusal
 }
 
 /// The refusals of one turn's values, in C1 §4 member order: `effort`,
@@ -535,13 +662,334 @@ mod tests {
             std::time::Instant::now(),
         );
         let harness = Harness::Vendor(&crate::harness::HARNESSES[0]);
+        let now = std::time::Instant::now();
         assert_eq!(
-            adapter.version(harness, requested, true).1,
+            adapter.version(harness, requested, true, now).1,
             VersionStatus::Refused
         );
         assert_ne!(
-            adapter.version(harness, requested, false).1,
+            adapter.version(harness, requested, false, now).1,
             VersionStatus::Refused
+        );
+    }
+
+    /// An adapter over a fresh instance cache, its binary in `dir`.
+    fn adapter_in(
+        dir: &std::path::Path,
+    ) -> (
+        ClaudeAdapter,
+        std::sync::Arc<crate::instance::InstanceCache>,
+        std::path::PathBuf,
+    ) {
+        let binary = dir.join("claude");
+        std::fs::write(&binary, b"").unwrap();
+        let instances = std::sync::Arc::new(crate::instance::InstanceCache::default());
+        let adapter = ClaudeAdapter::new(
+            binary.clone(),
+            instances.clone(),
+            &crate::config::BootstrapEnv::from_vars::<_, &str, &str>([]),
+        );
+        (adapter, instances, binary)
+    }
+
+    /// Critical r1 #1: the cap Host's anchor reads its `Configure` frame
+    /// under, through `check_turn` and Host's own encoding. The largest
+    /// instructions `check_turn` admits launch: the real recipe's process
+    /// (its UUID, model and `cwd`) fits Host's cap, and one byte more is
+    /// refused `invalid_params` naming `instructions`. The bound is tight
+    /// to the stand-ins' slack: the real launch 11 bytes past it does not
+    /// fit. Instructions and a schema that each fit alone are refused
+    /// together, naming the larger; under the per-argument limit all.
+    #[test]
+    fn launch_request_past_host_cap_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("claude");
+        let adapter = ClaudeAdapter::new(
+            binary,
+            std::sync::Arc::new(crate::instance::InstanceCache::default()),
+            &crate::config::BootstrapEnv::from_vars([
+                ("HOME", "/home/user"),
+                ("PATH", "/usr/bin:/bin"),
+                ("LANG", "C.UTF-8"),
+            ]),
+        );
+        let cwd = std::path::Path::new("/work/project");
+        let model = adapter.resolve(None);
+        let turn = |instructions: usize, output_schema: usize| TurnParams {
+            output_schema: output_schema > 0,
+            instructions: instructions > 0,
+            sizes: ParamSizes {
+                instructions,
+                output_schema,
+                cwd: cwd.as_os_str().len(),
+                model: model.len(),
+            },
+            inherit: Some(Inherit::OD2_DEFAULT),
+            ..TurnParams::default()
+        };
+        let now = std::time::Instant::now();
+        let fields = |turn: &TurnParams| {
+            adapter
+                .check_turn_at("claude-cli", turn, now)
+                .iter()
+                .map(Refusal::field)
+                .collect::<Vec<_>>()
+        };
+        let (mut fits, mut over) = (0, ARG_MAX);
+        while over - fits > 1 {
+            let mid = fits.midpoint(over);
+            if fields(&turn(mid, 0)).is_empty() {
+                fits = mid;
+            } else {
+                over = mid;
+            }
+        }
+        assert!(fits > 4 * 1024 && fits < 16 * 1024, "{fits}");
+        assert_eq!(fields(&turn(fits + 1, 0)), [Some("instructions")]);
+        let id = crate::SessionId::try_from("s_7f3k9q2mzr4c").unwrap();
+        let session = launch::expected_session_id(&id);
+        let real = |n: usize| {
+            let text = "z".repeat(n);
+            let recipe = launch::Recipe {
+                model: &model,
+                session: launch::Continue::New(&session),
+                inherit: Inherit::OD2_DEFAULT,
+                extra_write_dirs: &[],
+                instructions: Some(&text),
+                effort: None,
+                output_schema: None,
+                max_steps: None,
+            };
+            let owner = crate::ProcessOwner::Turn {
+                session_id: id.clone(),
+                turn: crate::TurnNumber::try_from(1).unwrap(),
+            };
+            let spec = adapter.process_spec(owner, cwd, &recipe).unwrap();
+            crate::PrivateProcessSpec::configure_fits(
+                &spec.program,
+                &spec.args,
+                &spec.cwd,
+                &spec.env,
+            )
+        };
+        assert!(real(fits), "the largest admitted launch fits Host's cap");
+        assert!(
+            !real(fits + 11),
+            "the bound is tight to the stand-ins' slack"
+        );
+        let half = fits / 2 + 64;
+        assert!(fields(&turn(half, 0)).is_empty());
+        assert!(fields(&turn(0, half)).is_empty());
+        assert_eq!(fields(&turn(half, half + 1)), [Some("output_schema")]);
+        assert_eq!(fields(&turn(half, half)), [Some("instructions")]);
+    }
+
+    /// Critical r2 #1: present but empty instructions still pass
+    /// `--append-system-prompt ""`, which `check_turn` counts. With empty
+    /// instructions, the largest schema it admits launches: the real
+    /// recipe's process (the empty flag and a schema of that compact
+    /// length) fits Host's cap; one byte more is refused naming
+    /// `output_schema`.
+    #[test]
+    fn empty_instructions_count_their_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = ClaudeAdapter::new(
+            dir.path().join("claude"),
+            std::sync::Arc::new(crate::instance::InstanceCache::default()),
+            &crate::config::BootstrapEnv::from_vars([("PATH", "/usr/bin:/bin")]),
+        );
+        let cwd = std::path::Path::new("/work/project");
+        let model = adapter.resolve(None);
+        let turn = |output_schema: usize| TurnParams {
+            output_schema: true,
+            instructions: true,
+            sizes: ParamSizes {
+                instructions: 0,
+                output_schema,
+                cwd: cwd.as_os_str().len(),
+                model: model.len(),
+            },
+            inherit: Some(Inherit::OD2_DEFAULT),
+            ..TurnParams::default()
+        };
+        let now = std::time::Instant::now();
+        let fields = |turn: &TurnParams| {
+            adapter
+                .check_turn_at("claude-cli", turn, now)
+                .iter()
+                .map(Refusal::field)
+                .collect::<Vec<_>>()
+        };
+        let (mut fits, mut over) = (18, ARG_MAX);
+        while over - fits > 1 {
+            let mid = fits.midpoint(over);
+            if fields(&turn(mid)).is_empty() {
+                fits = mid;
+            } else {
+                over = mid;
+            }
+        }
+        assert_eq!(fields(&turn(fits + 1)), [Some("output_schema")]);
+        // `{"description":"…"}` encodes to 18 bytes besides the text.
+        let schema = format!(r#"{{"description":"{}"}}"#, "z".repeat(fits - 18));
+        assert_eq!(schema.len(), fits);
+        let schema = serde_json::value::RawValue::from_string(schema).unwrap();
+        let id = crate::SessionId::try_from("s_7f3k9q2mzr4c").unwrap();
+        let session = launch::expected_session_id(&id);
+        let recipe = launch::Recipe {
+            model: &model,
+            session: launch::Continue::New(&session),
+            inherit: Inherit::OD2_DEFAULT,
+            extra_write_dirs: &[],
+            instructions: Some(""),
+            effort: None,
+            output_schema: Some(&schema),
+            max_steps: None,
+        };
+        let owner = crate::ProcessOwner::Turn {
+            session_id: id.clone(),
+            turn: crate::TurnNumber::try_from(1).unwrap(),
+        };
+        let spec = adapter.process_spec(owner, cwd, &recipe).unwrap();
+        assert!(spec.args.iter().any(|arg| arg == "--append-system-prompt"));
+        assert!(
+            crate::PrivateProcessSpec::configure_fits(
+                &spec.program,
+                &spec.args,
+                &spec.cwd,
+                &spec.env
+            ),
+            "the largest admitted launch with empty instructions fits Host's cap"
+        );
+    }
+
+    /// Critical r1 #2: `check_turn`, a resume's admission, reads the
+    /// refusal cache for the session's recipe on this binary: a live
+    /// entry refuses `harness_unavailable` with `handshake_refused`; the
+    /// other schema mode's recipe, an unknown `inherit` and an expired
+    /// entry do not.
+    #[test]
+    fn check_turn_reads_the_refusal_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let (adapter, instances, binary) = adapter_in(dir.path());
+        let written = std::time::Instant::now();
+        instances.record_refusal(
+            &binary,
+            launch::recipe_key(Inherit::OD2_DEFAULT, false),
+            crate::instance::Incompatibility::FeatureAbsent("interrupt_receipt_v1"),
+            written,
+        );
+        let turn = |schema: bool, inherit: Option<Inherit>| TurnParams {
+            output_schema: schema,
+            inherit,
+            ..TurnParams::default()
+        };
+        let refused = adapter.check_turn_at(
+            "claude-cli",
+            &turn(false, Some(Inherit::OD2_DEFAULT)),
+            written,
+        );
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0].kind.code(), "harness_unavailable");
+        assert_eq!(refused[0].reason, Some("handshake_refused"));
+        let ttl = crate::instance::REFUSAL_TTL;
+        for (turn, at) in [
+            (turn(true, Some(Inherit::OD2_DEFAULT)), written),
+            (turn(false, None), written),
+            (turn(false, Some(Inherit::OD2_DEFAULT)), written + ttl),
+        ] {
+            assert!(adapter.check_turn_at("claude-cli", &turn, at).is_empty());
+        }
+    }
+
+    /// A plan of the default model and recipe at `now`.
+    fn plan_of(adapter: &ClaudeAdapter, now: std::time::Instant) -> RoutePlan {
+        let request = DescribeRequest {
+            harness: Some("claude".to_owned()),
+            ..DescribeRequest::default()
+        };
+        let model = crate::plan::ModelChoice {
+            requested: None,
+            resolved: adapter.resolve(None),
+        };
+        let harness = Harness::Vendor(&crate::harness::HARNESSES[0]);
+        adapter.plan_at(harness, &request, model, Inherit::OD2_DEFAULT, now)
+    }
+
+    /// C2 §5 refusal cache, with controlled time through `plan` itself:
+    /// while the entry is live (to 599.999 s after it was written) the plan
+    /// is refused `harness_unavailable` with `reason:"handshake_refused"`
+    /// and its version status is `refused`; at 600 s it has expired and the
+    /// plan admits the launch, which re-checks. The last version seen stays
+    /// reported throughout.
+    #[test]
+    fn cached_refusal_refuses_until_ten_minutes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (adapter, instances, binary) = adapter_in(dir.path());
+        let harness = Harness::Vendor(&crate::harness::HARNESSES[0]);
+        instances.record_version(harness.name(), &binary, "2.1.285".to_owned());
+        let written = std::time::Instant::now();
+        instances.record_refusal(
+            &binary,
+            launch::recipe_key(Inherit::OD2_DEFAULT, false),
+            crate::instance::Incompatibility::FeatureAbsent("interrupt_receipt_v1"),
+            written,
+        );
+        let ttl = crate::instance::REFUSAL_TTL;
+        assert_eq!(ttl, std::time::Duration::from_secs(600));
+        for at in [written, written + std::time::Duration::from_millis(599_999)] {
+            let plan = plan_of(&adapter, at);
+            assert_eq!(plan.version_status, VersionStatus::Refused);
+            assert_eq!(plan.vendor_version.as_deref(), Some("2.1.285"));
+            let refusal = plan
+                .refusals
+                .iter()
+                .find(|refusal| refusal.kind == RefusalKind::VersionRefused)
+                .expect("a version refusal");
+            assert_eq!(refusal.kind.code(), "harness_unavailable");
+            assert_eq!(refusal.reason, Some("handshake_refused"));
+        }
+        let plan = plan_of(&adapter, written + ttl);
+        assert_eq!(
+            (plan.vendor_version.as_deref(), plan.version_status),
+            (Some("2.1.285"), VersionStatus::Tested)
+        );
+        assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    }
+
+    /// Invariant 13 through Claude's plan (which `describe` reports): the
+    /// last version is looked up for this harness and this program path
+    /// only, and a refusal for this program path only. Another harness's
+    /// version on this path, this harness's on another path, and another
+    /// path's refusal leave the plan `null`/`untested`; this pair's own
+    /// entry is then reported.
+    #[test]
+    fn plan_reads_only_its_own_harness_and_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let (adapter, instances, binary) = adapter_in(dir.path());
+        let other = dir.path().join("other-claude");
+        let harness = Harness::Vendor(&crate::harness::HARNESSES[0]);
+        assert_eq!(harness.name(), "claude");
+        let now = std::time::Instant::now();
+        instances.record_version("codex", &binary, "2.1.285".to_owned());
+        instances.record_version(harness.name(), &other, "2.1.290".to_owned());
+        instances.record_refusal(
+            &other,
+            launch::recipe_key(Inherit::OD2_DEFAULT, false),
+            crate::instance::Incompatibility::FeatureAbsent("interrupt_receipt_v1"),
+            now,
+        );
+        let plan = plan_of(&adapter, now);
+        assert_eq!(
+            (plan.vendor_version.as_deref(), plan.version_status),
+            (None, VersionStatus::Untested)
+        );
+        assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+        instances.record_version(harness.name(), &binary, "2.1.285".to_owned());
+        let plan = plan_of(&adapter, now);
+        assert_eq!(
+            (plan.vendor_version.as_deref(), plan.version_status),
+            (Some("2.1.285"), VersionStatus::Tested)
         );
     }
 
@@ -560,6 +1008,7 @@ mod tests {
                     sizes: ParamSizes {
                         instructions,
                         output_schema,
+                        ..ParamSizes::default()
                     },
                 },
             )

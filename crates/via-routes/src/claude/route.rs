@@ -11,14 +11,14 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{oneshot, watch};
 
 use super::messages::{
     ControlRequest, DecodeError, Message, ResultMessage, control_decline, decode,
     interrupt_request, user_start,
 };
 use crate::private::{
-    self, AfterTerminal, Closed, Failed, Interrupt, PrivateProtocol, Serving, protocol,
+    self, AfterTerminal, Closed, Failed, Hop, Interrupt, PrivateProtocol, Serving, protocol,
 };
 use crate::{
     Deadline, PrivateProcessSpec, Retirement, RouteError, RouteFailure, RouteRuntime, SendOutcome,
@@ -120,7 +120,7 @@ impl ClaudeRoute {
         &self,
         process: PrivateProcessSpec,
         start: ClaudeStart,
-        hop: mpsc::Sender<ClaudeItem>,
+        hop: Hop<ClaudeItem>,
         signals: (
             Deadline,
             watch::Receiver<Option<tokio::time::Instant>>,
@@ -334,7 +334,8 @@ impl PrivateProtocol for ClaudeLane {
     fn interrupt(serving: &mut Serving<'_, Self>) -> OutboundMessage {
         let id = format!("via-interrupt-{}", serving.turn.get());
         let bytes = interrupt_request(&id);
-        serving.hold((ClaudeItem::InterruptSent(id), 0));
+        let sent = serving.hop.made(ClaudeItem::InterruptSent(id));
+        serving.hold((sent, 0));
         OutboundMessage::Interrupt(bytes)
     }
 

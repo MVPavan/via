@@ -427,7 +427,7 @@ impl Serving<'_, LaneState> {
             Next::Message(message) => message,
             end @ (Next::Eof | Next::Unterminated) => return Err(self.ended(end).await),
         };
-        let FakeMessage::Hello(handshake) = &message.0.payload else {
+        let FakeMessage::Hello(handshake) = &message.0.item.payload else {
             return Err(protocol(turn, "fake handshake expected").into());
         };
         let missing = required
@@ -545,7 +545,7 @@ impl Serving<'_, LaneState> {
             let Ok(Next::Message(message)) = self.next(messages).await else {
                 break;
             };
-            if matches!(message.0.payload, FakeMessage::Terminal { .. }) {
+            if matches!(message.0.item.payload, FakeMessage::Terminal { .. }) {
                 // Its write answers in order before the cutoff, or the
                 // turn's failure stands unacknowledged.
                 let _settled = self.settle_interrupt().await;

@@ -75,6 +75,8 @@ pub(crate) struct Frozen {
     pub(crate) adapter_version: String,
     /// The model as the caller requested it.
     pub(crate) model: String,
+    /// The session's frozen working directory.
+    pub(crate) cwd: Option<String>,
     pub(crate) instructions: Option<String>,
     pub(crate) vendor: VendorOptions,
     pub(crate) allow_untested: bool,
@@ -140,6 +142,7 @@ impl Frozen {
         };
         if let Some(params) = params {
             frozen.model = params.model;
+            frozen.cwd = params.cwd;
             frozen.instructions = params.instructions;
             frozen.vendor = params.vendor;
             frozen.allow_untested = params.allow_untested;

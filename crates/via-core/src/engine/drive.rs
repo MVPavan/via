@@ -648,9 +648,8 @@ impl Engine {
         let job = turn_job(move |inbox| {
             Box::pin(async move {
                 let held: &Lane = &claim;
-                engine
-                    .run(&slot, submission, (held, prepared, connection), inbox)
-                    .await;
+                // Boxed: the turn's future is large (x.3.2 critical r2 #2).
+                Box::pin(engine.run(&slot, submission, (held, prepared, connection), inbox)).await;
                 engine.active.fetch_sub(1, Ordering::AcqRel);
                 drop(claim);
                 // The dispatcher may be gone: nothing waits for the end.
@@ -1702,6 +1701,8 @@ impl Engine {
             lane.new_generation();
         }
         record.vendor.identity = lane.identity();
+        // The fired idle deadline's frontier (critical r3 #1, r2 #2).
+        let mut idle = IdleFrontier::new(&cx.activity);
         let mut run = Box::pin(lane.driver.run_turn(spec, cx));
         // Design §9: every commit here runs inside `while_polling`, so the
         // driver keeps servicing its controls; a result it returns early is
@@ -1710,13 +1711,15 @@ impl Engine {
         let mut early = None;
         // Items the fired idle deadline handled, for the control checks.
         let mut frontier = 0;
-        // Items queued when the idle deadline fired, still to reconcile.
-        let mut queued = None;
         let end = loop {
             if let Some(end) = early.take() {
                 break end;
             }
             let idle_at = control.idle_at;
+            // Critical r2 #2 (runtime §8): the fired deadline waits for its
+            // decode fence while the channel's items are handled as they
+            // come; delivery wakes the loop.
+            let fenced = idle.fenced(idle_at);
             // Critical r1b #12 (runtime §8): biased, controls first. A ready
             // order or idle deadline is serviced before the next data item,
             // and the driver's return before it too: the final drain then
@@ -1738,19 +1741,20 @@ impl Engine {
                         stop_for_store(record, control);
                     }
                 }
-                () = sleep_until_some(idle_at), if idle_at.is_some() => {
+                () = sleep_until_some(idle_at), if idle_at.is_some() && !fenced => {
                     // Design §5, decided at the item frontier (critical r3
-                    // #1).
+                    // #1), behind its decode fence (critical r2 #2).
                     self.idle_fired(
                         record,
                         (lane, effective),
                         control,
                         (&mut run, &mut early),
-                        (inbox, idle_at, &mut queued),
+                        (inbox, idle_at, &mut idle),
                     )
                     .await;
                     super::lane::ready_item(&mut frontier).await;
                 }
+                () = idle.delivery(), if fenced => {}
                 end = &mut run => {
                     // What the driver delivered by its return (critical
                     // r2 F2), counted at its first `Ready`.
@@ -1843,7 +1847,10 @@ impl Engine {
     }
 
     /// The turn's idle deadline fired (Task 4 design §5), decided at the
-    /// item frontier (critical r3 #1): every item `queued` in the channel
+    /// item frontier (critical r3 #1). Behind its decode fence (x.3.2
+    /// critical r2 #2): while the Adapter has not delivered every message
+    /// Route read by the firing, it only records the fence
+    /// ([`IdleFrontier`]). Then every item `queued` in the channel
     /// when it fired is reconciled first, one per firing, as the run loop
     /// handles it ([`Self::run_item`]), the turn's order checked first each
     /// time (runtime §8). Concurrent producers' items may be admitted out
@@ -1860,10 +1867,14 @@ impl Engine {
         (lane, effective): (&Lane, &Effective),
         control: &mut Control<'_>,
         run: (&mut E, &mut Option<(TurnEnd, usize)>),
-        (inbox, deadline, queued): (&mut Inbox, Option<tokio::time::Instant>, &mut Option<usize>),
+        (inbox, deadline, idle): (&mut Inbox, Option<tokio::time::Instant>, &mut IdleFrontier),
     ) where
         E: std::future::Future<Output = TurnEnd> + Unpin,
     {
+        if idle.fence(deadline) {
+            return;
+        }
+        let queued = &mut idle.queued;
         let pending = queued.get_or_insert_with(|| inbox.len());
         let next = if *pending > 0 { inbox.try_recv() } else { None };
         let Some(admitted) = next else {
@@ -3005,6 +3016,66 @@ fn wall_deadline(
         Deadline::at(origin.checked_add(wall).unwrap_or_else(far)),
         rfc3339(at),
     )
+}
+
+/// A running turn's fired idle deadline, reconciled before it is decided
+/// (runtime §8). Two frontiers, one mechanism:
+///
+/// - Its decode fence (x.3.2 critical r2 #2): Route's decode watermark
+///   when the deadline fired. Until the Adapter delivered every message
+///   through it, the deadline waits while the run loop handles each item
+///   as it arrives, which moves the deadline by its own decode instant.
+///   Messages Route reads later never enlarge it. The wall, the stall
+///   bound, health and the force still end the turn meanwhile; a route
+///   that keeps no watermark leaves it open.
+/// - Then the items `queued` in the channel (critical r3 #1), at most the
+///   1,024 it holds, one per firing ([`Engine::idle_fired`]).
+///
+/// A moved deadline fences and counts afresh when it fires.
+struct IdleFrontier {
+    activity: TurnActivity,
+    delivery: watch::Receiver<u64>,
+    /// The fired deadline and the watermark then.
+    fence: Option<(Option<tokio::time::Instant>, u64)>,
+    /// Items queued when the fence was reconciled, still to handle.
+    queued: Option<usize>,
+}
+
+impl IdleFrontier {
+    fn new(activity: &TurnActivity) -> Self {
+        Self {
+            activity: activity.clone(),
+            delivery: activity.watch_delivered(),
+            fence: None,
+            queued: None,
+        }
+    }
+
+    /// Whether deadline `idle_at` fired and waits for delivery; a moved
+    /// deadline drops the old fence.
+    fn fenced(&mut self, idle_at: Option<tokio::time::Instant>) -> bool {
+        if self.fence.is_some_and(|(deadline, _)| deadline != idle_at) {
+            self.fence = None;
+        }
+        self.fence
+            .is_some_and(|(_, watermark)| self.activity.delivered() < watermark)
+    }
+
+    /// Deadline `idle_at` fired: fences it at the watermark now, unless it
+    /// already is; whether it waits for delivery.
+    fn fence(&mut self, idle_at: Option<tokio::time::Instant>) -> bool {
+        let activity = &self.activity;
+        let (_, watermark) = *self
+            .fence
+            .get_or_insert_with(|| (idle_at, activity.decoded()));
+        self.activity.delivered() < watermark
+    }
+
+    /// Resolves once the Adapter delivers further.
+    async fn delivery(&mut self) {
+        // The activity holds the sender: it never closes.
+        let _ = self.delivery.changed().await;
+    }
 }
 
 /// Sleeps until `at`; never resolves for `None`.

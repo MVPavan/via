@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use via_routes::{
-    Deadline, MAX_OBSERVATION_BYTES, ReprobeReport, RouteError, RouteFailure, StopCause, StopOrder,
-    StopWatch, StoreFailure, TurnNumber,
+    Deadline, DecodeWatermark, MAX_OBSERVATION_BYTES, ReprobeReport, RouteError, RouteFailure,
+    StopCause, StopOrder, StopWatch, StoreFailure, TurnNumber,
 };
 
 /// Correlates a start reply with its acceptance observation within one turn.
@@ -251,10 +251,20 @@ pub fn final_text_pieces(text: &str) -> impl Iterator<Item = &str> {
 /// The turn's activity clock (design §2.4): the arrival of the last vendor
 /// message attributed to the turn, unknown types included, as milliseconds
 /// since the clock's base instant. The Adapter stores; Core reads.
+///
+/// It also carries the turn's decode fence (runtime §8; x.3.2 critical r2
+/// #2): Route's [`DecodeWatermark`], which a route that reads ahead of the
+/// Adapter advances as it reads, and the position through which the
+/// Adapter delivered every message's observations to the session channel.
+/// When the idle deadline fires, Core reconciles everything Route had read
+/// by then before it decides. A driver whose route keeps no watermark
+/// leaves both at 0: the fence is open.
 #[derive(Clone, Debug)]
 pub struct TurnActivity {
     base: tokio::time::Instant,
     last_ms: Arc<AtomicU64>,
+    decoded: DecodeWatermark,
+    delivered: Arc<tokio::sync::watch::Sender<u64>>,
 }
 
 impl TurnActivity {
@@ -263,7 +273,40 @@ impl TurnActivity {
         Self {
             base,
             last_ms: Arc::new(AtomicU64::new(0)),
+            decoded: DecodeWatermark::default(),
+            delivered: Arc::new(tokio::sync::watch::Sender::new(0)),
         }
+    }
+
+    /// The turn's decode watermark, for its route to advance.
+    pub fn decode_watermark(&self) -> DecodeWatermark {
+        self.decoded.clone()
+    }
+
+    /// The messages Route has read so far.
+    pub fn decoded(&self) -> u64 {
+        self.decoded.get()
+    }
+
+    /// The Adapter delivered the observations of every message through
+    /// decode position `seq` to the session channel.
+    pub fn delivered_through(&self, seq: u64) {
+        self.delivered.send_if_modified(|through| {
+            let advanced = seq > *through;
+            *through = (*through).max(seq);
+            advanced
+        });
+    }
+
+    /// The position through which every message's observations were
+    /// delivered.
+    pub fn delivered(&self) -> u64 {
+        *self.delivered.borrow()
+    }
+
+    /// A receiver that wakes as delivery advances.
+    pub fn watch_delivered(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.delivered.subscribe()
     }
 
     /// Records a message arrival at `at`.

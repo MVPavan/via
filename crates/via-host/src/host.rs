@@ -2167,14 +2167,42 @@ async fn wait_graceful_exit(exit: &mut ExitReceiver, force_at: Instant) {
 /// The vendor launch configuration, with Host's own random
 /// `VIA_PROCESS_MARKER` added to the allow-listed environment (design §9).
 fn vendor_config(spec: &PrivateProcessSpec) -> Result<VendorConfig, HostError> {
-    let mut vendor_env = spec.env.entries().to_vec();
-    vendor_env.push(("VIA_PROCESS_MARKER".into(), linux::random_hex()?.into()));
-    Ok(VendorConfig::from_parts(
-        &spec.program,
-        &spec.args,
-        &spec.cwd,
-        &vendor_env,
+    Ok(vendor_config_with(
+        (&spec.program, &spec.args, &spec.cwd),
+        &spec.env,
+        linux::random_hex()?,
     ))
+}
+
+/// The vendor launch configuration with `marker` as `VIA_PROCESS_MARKER`.
+fn vendor_config_with(
+    (program, args, cwd): (&std::path::Path, &[std::ffi::OsString], &std::path::Path),
+    env: &crate::EnvAllowList,
+    marker: String,
+) -> VendorConfig {
+    let mut vendor_env = env.entries().to_vec();
+    vendor_env.push(("VIA_PROCESS_MARKER".into(), marker.into()));
+    VendorConfig::from_parts(program, args, cwd, &vendor_env)
+}
+
+impl PrivateProcessSpec {
+    /// Whether a launch of `program` with `args` in `cwd` under `env`
+    /// fits the anchor's control request cap: its encoded `Configure`
+    /// request, with Host's process marker at the marker's fixed length
+    /// and its largest encoding, is at most that cap. A launch that does
+    /// not fit is refused by the anchor's control, after acquisition
+    /// began; a caller checks first.
+    pub fn configure_fits(
+        program: &std::path::Path,
+        args: &[std::ffi::OsString],
+        cwd: &std::path::Path,
+        env: &crate::EnvAllowList,
+    ) -> bool {
+        let marker = "f".repeat(linux::RANDOM_HEX_LEN);
+        let vendor = vendor_config_with((program, args, cwd), env, marker);
+        serde_json::to_vec(&Request::Configure { vendor })
+            .is_ok_and(|bytes| bytes.len() <= protocol::REQUEST_MAX)
+    }
 }
 
 /// Sends the vendor launch configuration through the verified control.
@@ -2185,7 +2213,7 @@ async fn configure(
     let Reply::Configured = control
         .lock()
         .await
-        .transact(&Request::Configure { vendor }, 65_536)
+        .transact(&Request::Configure { vendor }, protocol::REQUEST_MAX)
         .await?
     else {
         return Err(HostError::Protocol("anchor configuration refused"));
@@ -3401,5 +3429,69 @@ mod tests {
         assert_eq!(capacity.begin_arming("a1"), Ok(()));
         assert_eq!(capacity.armed("a1", watch::channel(None).1), None);
         assert!(capacity.begin_stopping().is_none());
+    }
+}
+
+#[cfg(test)]
+mod configure_size {
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    use super::*;
+    use crate::EnvAllowList;
+
+    /// The largest second argument, in bytes, whose launch fits.
+    fn largest_fitting(env: &EnvAllowList) -> usize {
+        let fits = |n: usize| {
+            PrivateProcessSpec::configure_fits(
+                Path::new("/bin/claude"),
+                &[OsString::from("-p"), OsString::from("z".repeat(n))],
+                Path::new("/work"),
+                env,
+            )
+        };
+        let (mut low, mut high) = (0, protocol::REQUEST_MAX);
+        while low < high {
+            let mid = (low + high).div_ceil(2);
+            if fits(mid) {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        low
+    }
+
+    /// x.3.2 C3 (critical r1 #1): `configure_fits` is the anchor's own cap
+    /// on the encoded request: at the largest fitting argument the request
+    /// encodes within it with any marker (a random one, and the marker of
+    /// largest encoding), and one byte more exceeds it under a marker of
+    /// largest encoding, which a random marker can be.
+    #[test]
+    fn configure_fits_is_the_anchor_cap() {
+        let env = EnvAllowList::try_from_entries(vec![("PATH".into(), "/usr/bin".into())])
+            .expect("valid env");
+        let n = largest_fitting(&env);
+        assert!(n > 0 && n < protocol::REQUEST_MAX / 3, "{n}");
+        let encoded = |n: usize, marker: String| {
+            let vendor = vendor_config_with(
+                (
+                    Path::new("/bin/claude"),
+                    &[OsString::from("-p"), OsString::from("z".repeat(n))],
+                    Path::new("/work"),
+                ),
+                &env,
+                marker,
+            );
+            serde_json::to_vec(&Request::Configure { vendor })
+                .expect("encodes")
+                .len()
+        };
+        let largest = || "f".repeat(linux::RANDOM_HEX_LEN);
+        let random = linux::random_hex().expect("random marker");
+        assert_eq!(random.len(), linux::RANDOM_HEX_LEN);
+        assert!(encoded(n, random) <= protocol::REQUEST_MAX);
+        assert!(encoded(n, largest()) <= protocol::REQUEST_MAX);
+        assert!(encoded(n + 1, largest()) > protocol::REQUEST_MAX);
     }
 }

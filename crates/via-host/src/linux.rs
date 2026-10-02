@@ -51,9 +51,12 @@ pub(crate) fn uid_of(pid: u32) -> io::Result<u32> {
         .map_err(|_| io::Error::other("bad uid"))
 }
 
+/// The length of [`random_hex`]'s value: 16 random bytes in hex.
+pub(crate) const RANDOM_HEX_LEN: usize = 32;
+
 pub(crate) fn random_hex() -> io::Result<String> {
     use io::Read;
-    let mut bytes = [0_u8; 16];
+    let mut bytes = [0_u8; RANDOM_HEX_LEN / 2];
     fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
     Ok(hex_encode(&bytes))
 }

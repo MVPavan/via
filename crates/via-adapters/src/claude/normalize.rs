@@ -464,11 +464,12 @@ impl Normalizer {
                     marks.model = true;
                 }
                 Block::ToolUse { id, name, input } => {
-                    marks.model = true;
-                    // A repeated or completed call starts nothing again.
+                    // A repeated or completed call starts nothing again and
+                    // is no model output (critical r1 #4).
                     if self.open.contains_key(id) || self.done.contains_key(id) {
                         continue;
                     }
+                    marks.model = true;
                     let target = target(name, input);
                     let charged = self
                         .tracked_bytes

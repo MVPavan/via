@@ -83,7 +83,7 @@ const OPEN_SETTLE: Duration = Duration::from_millis(100);
 #[derive(Clone, Copy, Debug, Default)]
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "each is one independent seam a case turns on"
+    reason = "each is one independent test seam"
 )]
 pub(crate) struct Knobs {
     /// Core takes no observation of launch 1 until the fake has read its
@@ -109,6 +109,11 @@ pub(crate) struct Knobs {
     /// [`FIXTURE_WAIT`]): a failure an idle driver latches after its last
     /// turn settled (x.3.2 X0 item 13.2).
     pub(crate) await_failure: bool,
+    /// A cancel's stop order is already set when the turn starts (x.3.2
+    /// Q5: nothing launches).
+    pub(crate) stop_before: bool,
+    /// The daemon force is already set when the turn starts (x.3.2 Q5).
+    pub(crate) force_before: bool,
 }
 
 /// What a running turn has shown so far, for its side actions.
@@ -353,6 +358,9 @@ impl<'a> Run<'a> {
         self.start_condition(index, turn).await?;
         let label = session_of(turn).to_owned();
         let mut ran = Ran::default();
+        if !self.pure.pending.contains(&index) {
+            self.dispatch(index, turn).await?;
+        }
         if self.pure.pending.contains(&index) {
             let session = self
                 .sessions
@@ -385,11 +393,12 @@ impl<'a> Run<'a> {
         Ok((ran, after))
     }
 
-    /// A turn starts at its `start_after` event, else once the turn before
-    /// it settled; never before its session's previous turn settled.
+    /// A turn is admitted (committed, as Core queues it) at its
+    /// `start_after` event, else once the turn before it settled; it runs
+    /// only once its session's previous turn settled ([`Self::dispatch`]),
+    /// so a turn admitted during its predecessor's tool waits queued
+    /// (critical r1 #5).
     async fn start_condition(&self, index: usize, turn: &Value) -> Result<(), String> {
-        let label = session_of(turn);
-        let turns = self.expect["turns"].as_array().ok_or("turns")?;
         if let Some(after) = turn.get("start_after").filter(|after| !after.is_null()) {
             let earlier = after["turn"]
                 .as_u64()
@@ -403,6 +412,14 @@ impl<'a> Run<'a> {
             let mut seen = self.seen[index - 1].subscribe();
             let _ = seen.wait_for(|seen| seen.settled).await;
         }
+        Ok(())
+    }
+
+    /// Core's FIFO: a turn runs only once its session's previous turn
+    /// settled.
+    async fn dispatch(&self, index: usize, turn: &Value) -> Result<(), String> {
+        let label = session_of(turn);
+        let turns = self.expect["turns"].as_array().ok_or("turns")?;
         for earlier in (0..index).rev() {
             if session_of(&turns[earlier]) == label {
                 let mut seen = self.seen[earlier].subscribe();
@@ -536,18 +553,18 @@ impl<'a> Run<'a> {
     ) -> Result<TurnOutcome, String> {
         let spec = self.turn_spec(turn)?;
         let number = self.commit(session, &spec.prompt).await?;
+        self.dispatch(index, turn).await?;
         let wall = turn["deadlines"]["wall_ms"]
             .as_u64()
             .map_or(WALL, Duration::from_millis);
         let tool_grace = turn["tool_grace_ms"]
             .as_u64()
             .map_or(TOOL_GRACE, Duration::from_millis);
-        let (stop, stop_rx) = watch::channel(None);
-        let (force, force_rx) = watch::channel(None);
+        let now = tokio::time::Instant::now();
+        let ((stop, stop_rx), (force, force_rx)) = self.ordered_before(now);
         let prepared = session.driver.prepare();
         let capacity = matches!(prepared, Prepared::NeedsConnection)
             .then(|| Box::new(()) as via_adapters::CapacityToken);
-        let now = tokio::time::Instant::now();
         let cx = TurnCx {
             turn: number,
             prepared,
@@ -629,6 +646,37 @@ impl<'a> Run<'a> {
             self.judge_launch(launches_before + 1, session, number, &end)?;
         }
         Ok(outcome)
+    }
+
+    /// The turn's stop and force channels: a turn starting at `now` finds
+    /// them set with [`Knobs::stop_before`] and [`Knobs::force_before`].
+    #[expect(
+        clippy::type_complexity,
+        reason = "the two channel pairs a turn's controls are made of"
+    )]
+    fn ordered_before(
+        &self,
+        now: tokio::time::Instant,
+    ) -> (
+        (
+            watch::Sender<Option<StopOrder>>,
+            watch::Receiver<Option<StopOrder>>,
+        ),
+        (
+            watch::Sender<Option<tokio::time::Instant>>,
+            watch::Receiver<Option<tokio::time::Instant>>,
+        ),
+    ) {
+        let stop = self.knobs.stop_before.then(|| StopOrder {
+            cause: StopCause::Cancel,
+            requested_at: "2026-01-01T00:00:00.000Z".to_owned(),
+            force_at: Deadline::at(now + STOP_FORCE),
+            close_by: Deadline::at(now + STOP_FORCE + CLOSE_BY),
+        });
+        (
+            watch::channel(stop),
+            watch::channel(self.knobs.force_before.then_some(now)),
+        )
     }
 
     /// Sets the daemon force at [`Knobs::force_on`]'s progress line, and

@@ -115,7 +115,7 @@
         "observations_exclude": [],
         "observation_counts": {
           "turn.accepted": 1,
-          "progress": 4,
+          "progress": 3,
           "final_text": 1
         },
         "observations_order": [
@@ -123,7 +123,7 @@
           "turn.accepted"
         ],
         "unasserted": [],
-        "notes": "A vendor-synthetic API-error message is never acceptance or progress; a repeated tool_use block starts its call once; usage is the result.usage aggregate, never the assistant snapshots; cost is session_cumulative; a non-null fallback_credit is kept verbatim in the terminal's vendor data."
+        "notes": "A vendor-synthetic API-error message is never acceptance or progress; a repeated tool_use block starts its call once and is no progress (critical r1 #4); usage is the result.usage aggregate, never the assistant snapshots; cost is session_cumulative; a non-null fallback_credit is kept verbatim in the terminal's vendor data."
       }
     }
   ]

@@ -105,7 +105,7 @@ async fn serve(
     let mut configured: Option<VendorConfig> = None;
     loop {
         let request = tokio::select! {
-            result = protocol::read_message::<Request>(&mut stream, 65_536) => result?,
+            result = protocol::read_message::<Request>(&mut stream, protocol::REQUEST_MAX) => result?,
             () = tokio::time::sleep_until(bootstrap_deadline) => return Ok(()),
             _ = terminate.recv() => return Ok(()),
         };
