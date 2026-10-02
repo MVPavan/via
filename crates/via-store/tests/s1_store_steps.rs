@@ -169,6 +169,7 @@ fn step_rows_commit_while_running_and_ride_in_the_terminal() {
                 envelope: json!({"state":"failed"}),
                 event: event("turn.ended", 3, 1),
                 steps: vec![row(2), row(3)],
+                link_released: false,
             })
             .await
             .unwrap();

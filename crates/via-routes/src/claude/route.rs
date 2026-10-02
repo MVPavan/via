@@ -26,6 +26,7 @@ use crate::{
 };
 use via_wire::{
     ExitReport, OutboundMessage, WireCleanup, WireCloseReport, WireMessages, WireSender,
+    WriteBounds,
 };
 
 /// The packet §6 bound on answering a control request: its decline's
@@ -180,7 +181,7 @@ impl ClaudeLane {
         } else {
             let write = serving.sender.write(
                 OutboundMessage::Control(control_decline(&request.request_id)),
-                by,
+                WriteBounds::CutAt(by),
             );
             serving.serve(write).await?
         };

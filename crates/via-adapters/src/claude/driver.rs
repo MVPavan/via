@@ -200,7 +200,7 @@ fn launch(
         output_schema: spec.output_schema.as_deref(),
         max_steps: spec.max_steps,
     };
-    let owner = ProcessOwner {
+    let owner = ProcessOwner::Turn {
         session_id: driver.spec.session_id.clone(),
         turn,
     };

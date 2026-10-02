@@ -94,6 +94,7 @@ fn spawn_submission_and_terminal_survive_reopen_without_leaking_handle() {
                         envelope: json!({"state":"completed"}),
                         event: ended(4),
                         steps: Vec::new(),
+                        link_released: false,
                     })
                     .await
                     .is_err()
@@ -111,6 +112,7 @@ fn spawn_submission_and_terminal_survive_reopen_without_leaking_handle() {
                         envelope: json!({"state":"completed"}),
                         event: ended(3),
                         steps: Vec::new(),
+                        link_released: false,
                     })
                     .await
                     .is_err()
@@ -123,6 +125,7 @@ fn spawn_submission_and_terminal_survive_reopen_without_leaking_handle() {
                     envelope: json!({"state":"completed","final_text":"reply"}),
                     event: ended(4),
                     steps: Vec::new(),
+                    link_released: false,
                 })
                 .await
                 .unwrap();
@@ -178,6 +181,7 @@ fn failure_before_vendor_acceptance_is_still_durable() {
                 envelope: json!({"state":"failed","failure":{"class":"process_exited"}}),
                 event: ended(3),
                 steps: Vec::new(),
+                link_released: false,
             })
             .await
             .unwrap();
@@ -211,8 +215,10 @@ fn anchor_arm_requires_committed_matching_identity_and_version() {
                 generation: "gen-1".to_owned(),
                 marker: "private-marker".to_owned(),
                 socket_path: root.path().join("a_01.sock"),
-                owner_session: session(),
-                owner_turn: turn(),
+                owner: via_store::ProcessOwner::Turn {
+                    session_id: session(),
+                    turn: turn(),
+                },
                 uid: fs::metadata(root.path()).unwrap().uid(),
                 boot_id: "boot-1".to_owned(),
                 pid_namespace: "pid:[42]".to_owned(),
@@ -474,6 +480,7 @@ fn frozen_turn_values_are_stored_and_the_latest_turn_supplies_inheritance() {
         envelope: json!({"state":"cancelled"}),
         event: ended(3),
         steps: Vec::new(),
+        link_released: false,
     }))
     .unwrap();
     let snapshot = rt

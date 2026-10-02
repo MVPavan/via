@@ -93,7 +93,7 @@ impl Fixture {
             args: Vec::new(),
             cwd: self.root.clone(),
             env: EnvAllowList::default(),
-            owner: ProcessOwner {
+            owner: ProcessOwner::Turn {
                 session_id: SessionId::try_from("s_0123456789ab").unwrap(),
                 turn: TurnNumber::try_from(1).unwrap(),
             },
@@ -844,8 +844,10 @@ async fn reconcile_forged(
         generation: generation.to_owned(),
         marker: identity.marker.clone(),
         socket_path: socket.clone(),
-        owner_session: SessionId::try_from("s_0123456789ab").unwrap(),
-        owner_turn: TurnNumber::try_from(1).unwrap(),
+        owner: via_store::ProcessOwner::Turn {
+            session_id: SessionId::try_from("s_0123456789ab").unwrap(),
+            turn: TurnNumber::try_from(1).unwrap(),
+        },
         uid: identity.uid,
         boot_id: identity.boot_id.clone(),
         pid_namespace: identity.pid_namespace.clone(),

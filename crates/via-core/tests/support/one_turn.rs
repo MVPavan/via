@@ -33,6 +33,7 @@ impl OneTurn {
             RuntimeConfig {
                 anchor_binary: anchor,
                 anchor_dir: root.join("runtime"),
+                vendor_state_dir: root.join("vendor"),
             },
             store.runtime_resources(),
         )

@@ -902,10 +902,17 @@ impl<'a> Run<'a> {
                 .map_err(|e| format!("anchor records: {e:?}"))?;
             let full = page.len() == 256;
             after = page.last().map(|record| record.intent.anchor_id.clone());
-            owned.extend(page.into_iter().filter(|record| {
-                record.intent.owner_session == *session
-                    && record.intent.owner_turn.get() == turn.get()
-            }));
+            owned.extend(
+                page.into_iter()
+                    .filter(|record| match &record.intent.owner {
+                        via_store::ProcessOwner::Turn {
+                            session_id,
+                            turn: owner_turn,
+                        } => session_id == session && owner_turn.get() == turn.get(),
+                        // A shared server's anchor is no turn's own group.
+                        via_store::ProcessOwner::Server { .. } => false,
+                    }),
+            );
             if !full {
                 break;
             }

@@ -281,8 +281,29 @@ pub(super) struct Disposed {
 /// and its evidence or typed failure. A failure stays the first cause, as
 /// in S1; the retained terminal still gives the envelope its vendor stop
 /// reason. `wall` is the turn's wall deadline: a `Deadline` coincident with
-/// an order's `force_at` takes the order's row [r1.9].
+/// an order's `force_at` takes the order's row [r1.9]. The terminal's
+/// cleanup fact (x.3.2 X0 item 6.5) is the stop's settled cleanup, or
+/// without one the `TurnEnd`'s.
 pub(super) fn dispose(
+    accepted: bool,
+    (vendor, outcome): (Option<&VendorTerminal>, Result<TurnEvidence, AdapterError>),
+    order: Option<&StopOrder>,
+    wall: tokio::time::Instant,
+) -> Disposed {
+    let quiescent = outcome
+        .as_ref()
+        .map_or_else(AdapterError::evidence, Clone::clone)
+        .cleanup
+        == Cleanup::Quiescent;
+    let mut disposed = dispose_by(accepted, (vendor, outcome), order, wall);
+    disposed.terminal.quiescent = disposed
+        .stop
+        .map_or(quiescent, |(_, cleanup)| cleanup == "quiescent");
+    disposed
+}
+
+/// [`dispose`]'s table.
+fn dispose_by(
     accepted: bool,
     (vendor, outcome): (Option<&VendorTerminal>, Result<TurnEvidence, AdapterError>),
     order: Option<&StopOrder>,
@@ -567,6 +588,8 @@ pub(super) fn classify(
         exit,
         warnings: Vec::new(),
         cancel: None,
+        // The drive sets the turn's cleanup fact.
+        quiescent: false,
     }
 }
 
@@ -621,6 +644,8 @@ pub(super) fn blank(
         exit,
         warnings: Vec::new(),
         cancel: None,
+        // The drive sets the turn's cleanup fact.
+        quiescent: false,
     }
 }
 
@@ -739,6 +764,7 @@ pub fn envelope_at_maximum(
             requested_at: at.to_owned(),
             settled_at: at.to_owned(),
         }),
+        quiescent: false,
     };
     let accepted = Accepted {
         at: at.to_owned(),

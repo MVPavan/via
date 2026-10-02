@@ -105,6 +105,7 @@ async fn ended_with(
                 envelope,
                 event: event("turn.ended", 3 + u64::from(accepted), false),
                 steps: Vec::new(),
+                link_released: false,
             },
             TerminalExtras {
                 cancel_cause: cause,

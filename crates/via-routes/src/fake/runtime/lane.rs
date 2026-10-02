@@ -22,7 +22,7 @@ use crate::{
     CloseRequest, Deadline, ExitReport, OutboundMessage, Retirement, RouteError, RouteFailure,
     SendOutcome, StopCause, TurnNumber, WireCleanup,
 };
-use via_wire::{CloseMode, WireCloseReport, WireError, WireMessages, WireSender};
+use via_wire::{CloseMode, WireCloseReport, WireError, WireMessages, WireSender, WriteBounds};
 
 /// Reported tool items a turn tracks for cleanup (AD9); one more marks the
 /// set incomplete, which keeps cleanup `Uncertain`.
@@ -502,7 +502,7 @@ impl Serving<'_, LaneState> {
             escape: escape_json,
         };
         progress.mark_write_started();
-        self.lane.steer_write = Some(self.sender.write(steer, self.deadline));
+        self.lane.steer_write = Some(self.sender.write(steer, WriteBounds::CutAt(self.deadline)));
         self.lane.steer_reply = Some(SteerPending {
             reply,
             progress,

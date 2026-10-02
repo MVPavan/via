@@ -2,7 +2,7 @@
 
 use std::{collections::HashSet, sync::atomic::Ordering, time::SystemTime};
 
-use via_adapters::{Cleanup, StopCause};
+use via_adapters::{Cleanup, ConnectionKind, StopCause};
 use via_store::StoreClient;
 
 use std::sync::Arc;
@@ -217,9 +217,15 @@ impl Engine {
     /// [r4.3, r5.1]), carrying the instant it was raised so Host's 3 s
     /// bound runs from the force. Daemon main calls it once, from within
     /// its runtime, before it serves; Host's shutdown retires the task when
-    /// force never came.
+    /// force never came. Core's latch subscribes to the adapter set's
+    /// journal uncertainty here too ([`daemon_journal`]).
     pub fn watch_force(&self) {
         self.adapter.watch_force(self.signal.force.subscribe());
+        self.tracker.spawn(daemon_journal(
+            self.adapter.journal_uncertain(),
+            self.cancel.clone(),
+            std::sync::Weak::clone(&self.me),
+        ));
     }
 
     /// When final shutdown's dispatcher join (pipeline step 3) gives up, so
@@ -378,13 +384,22 @@ impl Engine {
         turn: super::ForcedTurn,
         (quiescent, forced): (bool, bool),
     ) -> (super::Started, TurnRecord, Terminal) {
-        let state = if forced || !turn.launched {
-            "cancelled"
-        } else {
-            "unknown"
+        let (state, (outcome, cleanup)) = match (turn.connection_kind, turn.launched) {
+            // C1 §7.6 force row, shared server (x.3.2 X0 item 6.4): the
+            // driver asked for no stop, and no proof says the turn's work
+            // on the server ended; cleanup is the folded server facts.
+            (ConnectionKind::Shared, true) => ("unknown", shared_stop_outcome(quiescent)),
+            (ConnectionKind::Shared, false) => ("cancelled", stop_outcome(quiescent, false, false)),
+            // A private route's own close: no vendor acknowledgement.
+            (ConnectionKind::PerTurn, launched) => (
+                if forced || !launched {
+                    "cancelled"
+                } else {
+                    "unknown"
+                },
+                stop_outcome(quiescent, forced, false),
+            ),
         };
-        // A private route's own close: no vendor acknowledgement.
-        let (outcome, cleanup) = stop_outcome(quiescent, forced, false);
         let mut record = turn.record;
         let cancel = self
             .settle_on(
@@ -414,6 +429,7 @@ impl Engine {
             final_text_file: None,
             exit: None,
             warnings: Vec::new(),
+            quiescent,
             cancel: Some(cancel),
         };
         if turn.cause == Some(StopCause::IdleDeadline) {
@@ -741,6 +757,49 @@ pub(super) fn stop_outcome(
         },
         if quiescent { "quiescent" } else { "uncertain" },
     )
+}
+
+/// x.3.2 X0 item 2.6 (C2 §2 `AdapterSet::journal_uncertain`): latches
+/// Store failure once any Host journal write's outcome was uncertain, one
+/// no driver owns included, as a shared server's retirement after its last
+/// lease. A driver's own report may latch it too, which is harmless. The
+/// failure is the daemon's, with no address. It ends once reported, once
+/// the watch is gone, or at final shutdown's cancellation, whose Host
+/// shutdown reports its own failures.
+async fn daemon_journal(
+    mut journal: tokio::sync::watch::Receiver<bool>,
+    cancel: via_adapters::CancellationToken,
+    engine: std::sync::Weak<Engine>,
+) {
+    loop {
+        if *journal.borrow_and_update() {
+            if let Some(engine) = engine.upgrade() {
+                engine
+                    .store_failure(
+                        FailureSite::Journal,
+                        WriteOutcome::Uncertain,
+                        FailureScope::Daemon,
+                    )
+                    .finish()
+                    .await;
+            }
+            return;
+        }
+        tokio::select! {
+            () = cancel.cancelled() => return,
+            changed = journal.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// [`stop_outcome`]'s `unknown` outcome, for a launched shared-server turn
+/// under daemon force only (C1 §7.6, x.3.2 X0 item 6.4).
+fn shared_stop_outcome(quiescent: bool) -> (&'static str, &'static str) {
+    ("unknown", stop_outcome(quiescent, false, false).1)
 }
 
 /// A running dispatcher's claim on its session (design §6.8 step 3),

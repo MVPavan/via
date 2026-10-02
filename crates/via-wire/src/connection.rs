@@ -24,7 +24,7 @@ use super::{BoundedBytes, Deadline, SendOutcome, VendorMessage, WireFailure};
 use crate::runtime::{WireCloseReport, WireError, wire_cleanup};
 use crate::split::{LineSplitter, Pushed};
 use via_host::{ExitReceiver, ProcessControl};
-use via_store::BlobTasks;
+use via_store::{BlobTasks, CommitOutcome, StoreFailureKind};
 
 /// The prefix of an undecoded message VIA keeps (design §7.3).
 pub const UNDECODED_BYTES: usize = 64 * 1024;
@@ -115,24 +115,125 @@ pub enum OutboundMessage {
     Control(Vec<u8>),
 }
 
+/// How a write is bounded (runtime §4; x.3.2 X0 item 12.2).
+#[derive(Clone, Copy, Debug)]
+pub enum WriteBounds {
+    /// The private-route rule. A data message cut by the deadline ends the
+    /// writer and drops stdin; a control message's deadline bounds only the
+    /// wait for its first byte; an interrupt is cut by it.
+    CutAt(Deadline),
+    /// The shared-connection rule, for data and control messages alike:
+    /// `start_by` bounds only the wait for the first byte. A withdrawn or
+    /// unstarted-expired message is not written and stdin stays open; a
+    /// started data message is written whole by `finish_by`, and one cut
+    /// there ends the writer as a `CutAt` cut does.
+    StartBy {
+        /// The first byte's bound.
+        start_by: Deadline,
+        /// The whole data message's bound, the connection's own far deadline.
+        finish_by: Deadline,
+    },
+}
+
+impl WriteBounds {
+    /// The deadline of the first byte, or of an interrupt's whole write.
+    fn first_byte(self) -> Deadline {
+        match self {
+            Self::CutAt(deadline) => deadline,
+            Self::StartBy { start_by, .. } => start_by,
+        }
+    }
+}
+
+/// Where one write is (x.3.2 X0 item 12.2). Withdrawal, expiry and the
+/// first byte written are decided under the write queue's one lock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WriteState {
+    /// Not yet taken by the writer.
+    Queued,
+    /// Taken by the writer to be written next; nothing written yet, and
+    /// still withdrawable.
+    Claimed,
+    /// A byte was written: the message is finished whole.
+    Started,
+    /// Answered.
+    Done(SendOutcome),
+    /// Withdrawn before its first byte: `NotWritten`, stdin open.
+    Withdrawn,
+    /// Its first byte's deadline passed first: `NotWritten`, stdin open.
+    Expired,
+}
+
+/// One write's handle for [`WireSender::withdraw`] (x.3.2 X0 item 12.2).
+#[derive(Clone)]
+pub struct WriteTicket(Arc<JobCell>);
+
+impl WriteTicket {
+    /// The write's state now.
+    pub fn state(&self) -> WriteState {
+        self.0.get()
+    }
+}
+
+/// A write's state. Changed only under the write queue's lock (the cell's
+/// own lock nests inside it), except by the writer for writes that are not
+/// withdrawable, which nothing else changes.
+struct JobCell {
+    state: StdMutex<WriteState>,
+    /// A distinct control message or `StartBy` data: [`WireSender::withdraw`]
+    /// can take it back before its first byte.
+    withdrawable: bool,
+}
+
+impl JobCell {
+    fn new(withdrawable: bool) -> Arc<Self> {
+        Arc::new(Self {
+            state: StdMutex::new(WriteState::Queued),
+            withdrawable,
+        })
+    }
+
+    fn get(&self) -> WriteState {
+        *self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn set(&self, state: WriteState) {
+        *self.state.lock().unwrap_or_else(PoisonError::into_inner) = state;
+    }
+}
+
 /// A write enqueued to the stdin writer (design §8.3). It is cancel-safe:
 /// the caller keeps it pinned while it services other waits, and dropping
-/// it never cuts a message the writer started.
-pub struct PendingWrite(Pin<Box<dyn Future<Output = Result<SendOutcome, WireError>> + Send>>);
+/// it never cuts a message the writer started, nor withdraws one.
+pub struct PendingWrite {
+    ticket: WriteTicket,
+    future: Pin<Box<dyn Future<Output = Result<SendOutcome, WireError>> + Send>>,
+}
+
+impl PendingWrite {
+    /// The write's ticket, for [`WireSender::withdraw`].
+    pub fn ticket(&self) -> WriteTicket {
+        self.ticket.clone()
+    }
+}
 
 impl Future for PendingWrite {
     type Output = Result<SendOutcome, WireError>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.0.as_mut().poll(cx)
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().future.as_mut().poll(cx)
     }
 }
 
-/// A job on the writer's data queue.
+/// A write's answer.
+type Reply = oneshot::Sender<Result<SendOutcome, WireError>>;
+
+/// A `CutAt` job on the writer's data channel.
 struct DataWrite {
     message: OutboundMessage,
     deadline: Deadline,
-    reply: oneshot::Sender<Result<SendOutcome, WireError>>,
+    reply: Reply,
+    cell: Arc<JobCell>,
 }
 
 /// A job on the writer's control queue.
@@ -140,18 +241,31 @@ enum Control {
     Interrupt {
         bytes: Vec<u8>,
         deadline: Deadline,
-        reply: oneshot::Sender<Result<SendOutcome, WireError>>,
+        reply: Reply,
+        cell: Arc<JobCell>,
     },
     /// A distinct control message holding its share of the budget.
     Message {
-        /// Its place in the queue, by which its caller expires it.
-        ticket: u64,
+        /// Its state, by which its caller expires or withdraws it.
+        cell: Arc<JobCell>,
         bytes: Vec<u8>,
         deadline: Deadline,
-        reply: oneshot::Sender<Result<SendOutcome, WireError>>,
+        reply: Reply,
     },
     /// Drop stdin once the current message is written.
     Close,
+}
+
+/// The ticketed data slot (x.3.2 X0 item 12.2): one `StartBy` data
+/// message, kept here until its first byte, while the writer has claimed it
+/// too, so it holds the slot's one place.
+struct DataSlot {
+    cell: Arc<JobCell>,
+    /// The message and its answer; with the writer while it is claimed, or
+    /// while the writer returns it to the slot.
+    job: Option<(OutboundMessage, Reply)>,
+    start_by: Deadline,
+    finish_by: Deadline,
 }
 
 /// The note of the first undecoded message kept, and where it goes.
@@ -163,12 +277,59 @@ struct Undecoded {
     note: StdMutex<Option<String>>,
 }
 
+/// The staging budget of messages read and not yet dropped (runtime §4,
+/// design §8.2): 1,024 messages and 4 MiB.
+#[derive(Default)]
+struct Staging {
+    messages: AtomicUsize,
+    bytes: AtomicUsize,
+}
+
+/// One staged message's share of [`Staging`], returned when the message is
+/// dropped, not when it is received (x.3.2 X0 item 12.5).
+pub(crate) struct StagingPermit {
+    staging: Arc<Staging>,
+    bytes: usize,
+}
+
+impl StagingPermit {
+    /// Takes one message of `bytes`, or `None`, taking nothing, past either
+    /// bound.
+    fn reserve(staging: &Arc<Staging>, bytes: usize) -> Option<Self> {
+        let messages = staging.messages.fetch_add(1, Ordering::AcqRel) + 1;
+        let total = staging.bytes.fetch_add(bytes, Ordering::AcqRel) + bytes;
+        let permit = Self {
+            staging: Arc::clone(staging),
+            bytes,
+        };
+        // Past a bound the permit is dropped at once, returning its share.
+        (messages <= QUEUE_MESSAGES && total <= QUEUE_BYTES).then_some(permit)
+    }
+}
+
+impl Drop for StagingPermit {
+    fn drop(&mut self) {
+        self.staging.messages.fetch_sub(1, Ordering::AcqRel);
+        self.staging.bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+/// Stdout admission (x.3.2 X0 item 13.1): the reader admits each complete
+/// message under this lock; the first seal stops admission, and later
+/// messages are discarded and counted.
+#[derive(Default)]
+struct Admission {
+    sealed: bool,
+    /// Bytes of complete messages discarded after the seal.
+    discarded: u64,
+}
+
 /// State the connection's halves and tasks share.
 struct Shared {
     latch: watch::Sender<LatchState>,
-    /// Bytes of messages in the queue: counted before `try_send`, released
-    /// on receive.
-    queued_bytes: AtomicUsize,
+    /// Messages read and not yet dropped, with their bytes.
+    staging: Arc<Staging>,
+    admission: StdMutex<Admission>,
     /// Stdout ended; set before the reader drops its queue sender.
     eof: AtomicBool,
     /// Stdout ended inside a message (in-band `Unterminated`).
@@ -179,32 +340,36 @@ struct Shared {
     interrupt_sent: AtomicBool,
     /// A close of stdin was enqueued (coalescing).
     close_sent: AtomicBool,
-    /// The writer's control queue and the control budget.
-    control: ControlQueue,
+    /// The writer's queue and the control budget.
+    control: WriteQueue,
     undecoded: Undecoded,
 }
 
-/// The writer's control queue (design §8.3): interrupts, distinct control
-/// messages and the close, first in first out, beside the budget of the
-/// distinct control messages outstanding (queued or being written), under
-/// one lock. A queued control message is owned by whichever comes first of
-/// its expiry (by its caller, or by the writer while it holds stdin) and the
-/// writer's take, so it is answered and its share returned exactly once
-/// (runtime §8, C2 §2).
+/// The writer's queue (design §8.3; x.3.2 X0 item 12.2): interrupts,
+/// distinct control messages and the close, first in first out, the
+/// ticketed data slot, the data holds, and the budget of the distinct
+/// control messages outstanding (queued or being written), under one lock.
+/// A queued message is owned by whichever comes first of its expiry (by its
+/// caller, or by the writer), its withdrawal and the writer's claim, so it
+/// is answered and its share returned exactly once (runtime §8, C2 §2).
 #[derive(Default)]
-struct ControlQueue {
-    state: StdMutex<ControlState>,
+struct WriteQueue {
+    state: StdMutex<QueueState>,
     /// Wakes the writer, in `next` or in `expire_queued`, never both at
     /// once: a push before it waits leaves a permit, and `next` checks the
     /// queue before it waits.
     ready: Notify,
+    /// Wakes a writer waiting for a claimed job's first byte: a withdrawal
+    /// or a new hold.
+    changed: Notify,
 }
 
 #[derive(Default)]
-struct ControlState {
+struct QueueState {
     jobs: VecDeque<Control>,
-    /// The next control message's ticket.
-    ticket: u64,
+    data: Option<DataSlot>,
+    /// Live [`DataHold`]s: while any exists the writer claims no data job.
+    holds: usize,
     /// The writer ended: nothing is queued any more.
     closed: bool,
     /// The distinct control messages outstanding and their bytes.
@@ -212,8 +377,30 @@ struct ControlState {
     bytes: usize,
 }
 
-impl ControlQueue {
-    fn state(&self) -> std::sync::MutexGuard<'_, ControlState> {
+/// What the writer claimed.
+enum Claimed {
+    Control(Control),
+    Data {
+        cell: Arc<JobCell>,
+        message: OutboundMessage,
+        reply: Reply,
+        start_by: Deadline,
+        finish_by: Deadline,
+    },
+}
+
+/// One attempt at a claimed job's first byte, decided under the queue lock.
+enum FirstByte {
+    /// The attempt wrote, or the pipe failed.
+    Wrote(std::io::Result<usize>),
+    /// Withdrawn, or its deadline passed, before any byte: `NotWritten`.
+    Refused,
+    /// A data job met a hold before any byte: back in its slot, `Queued`.
+    Unclaimed,
+}
+
+impl WriteQueue {
+    fn state(&self) -> std::sync::MutexGuard<'_, QueueState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -230,56 +417,181 @@ impl ControlQueue {
     }
 
     /// Queues a distinct control message with its share of the budget;
-    /// its ticket, or `None`, taking nothing, when it would pass
-    /// [`CONTROL_MESSAGES`] or [`CONTROL_BYTES`] or the writer ended.
+    /// false, taking nothing, when it was withdrawn before, would pass
+    /// [`CONTROL_MESSAGES`] or [`CONTROL_BYTES`], or the writer ended.
     fn push_message(
         &self,
+        cell: &Arc<JobCell>,
         bytes: Vec<u8>,
         deadline: Deadline,
-        reply: oneshot::Sender<Result<SendOutcome, WireError>>,
-    ) -> Option<u64> {
+        reply: Reply,
+    ) -> bool {
         let mut state = self.state();
+        if cell.get() != WriteState::Queued {
+            return false;
+        }
         let total = state.bytes.saturating_add(bytes.len());
         if state.closed || state.messages >= CONTROL_MESSAGES || total > CONTROL_BYTES {
-            return None;
+            cell.set(WriteState::Done(SendOutcome::NotWritten));
+            return false;
         }
         state.messages += 1;
         state.bytes = total;
-        let ticket = state.ticket;
-        state.ticket += 1;
         state.jobs.push_back(Control::Message {
-            ticket,
+            cell: Arc::clone(cell),
             bytes,
             deadline,
             reply,
         });
         drop(state);
         self.ready.notify_one();
-        Some(ticket)
-    }
-
-    /// Its caller's deadline passed: removes the message `ticket` if the
-    /// writer has not taken it, returning its share; true when removed.
-    fn expire(&self, ticket: u64) -> bool {
-        let mut state = self.state();
-        let queued = state.jobs.iter().position(
-            |job| matches!(job, Control::Message { ticket: queued, .. } if *queued == ticket),
-        );
-        let Some(Control::Message { bytes, .. }) = queued.and_then(|at| state.jobs.remove(at))
-        else {
-            return false;
-        };
-        state.release(bytes.len());
         true
     }
 
-    /// The writer's next control job, in queue order.
-    async fn next(&self) -> Control {
-        loop {
-            if let Some(job) = self.state().jobs.pop_front() {
-                return job;
+    /// Puts a `StartBy` data message in the slot; false, taking nothing,
+    /// when it was withdrawn before, the slot is taken, or the writer ended.
+    fn push_data(
+        &self,
+        cell: &Arc<JobCell>,
+        message: OutboundMessage,
+        (start_by, finish_by): (Deadline, Deadline),
+        reply: Reply,
+    ) -> bool {
+        let mut state = self.state();
+        if cell.get() != WriteState::Queued {
+            return false;
+        }
+        if state.closed || state.data.is_some() {
+            cell.set(WriteState::Done(SendOutcome::NotWritten));
+            return false;
+        }
+        state.data = Some(DataSlot {
+            cell: Arc::clone(cell),
+            job: Some((message, reply)),
+            start_by,
+            finish_by,
+        });
+        drop(state);
+        self.ready.notify_one();
+        true
+    }
+
+    /// Takes back the queued or claimed write `cell` before its first byte
+    /// (x.3.2 X0 item 12.2): it is `Withdrawn`, answers `NotWritten` and
+    /// returns its share; stdin stays open. A started, answered, expired or
+    /// not withdrawable write is left as it is and its state returned.
+    fn withdraw(&self, cell: &Arc<JobCell>) -> WriteState {
+        let mut state = self.state();
+        let now = cell.get();
+        if !cell.withdrawable || !matches!(now, WriteState::Queued | WriteState::Claimed) {
+            return now;
+        }
+        let at = state.jobs.iter().position(
+            |job| matches!(job, Control::Message { cell: queued, .. } if Arc::ptr_eq(queued, cell)),
+        );
+        let mut answer = None;
+        if let Some(Control::Message { bytes, reply, .. }) = at.and_then(|at| state.jobs.remove(at))
+        {
+            state.release(bytes.len());
+            answer = Some(reply);
+        }
+        if state
+            .data
+            .as_ref()
+            .is_some_and(|slot| Arc::ptr_eq(&slot.cell, cell))
+        {
+            answer = state
+                .data
+                .take()
+                .and_then(|slot| slot.job)
+                .map(|(_, reply)| reply);
+        }
+        // Not yet queued, claimed, or on its way back to the slot: whoever
+        // holds it next sees the state and answers.
+        cell.set(WriteState::Withdrawn);
+        drop(state);
+        if let Some(reply) = answer {
+            let _ = reply.send(Ok(SendOutcome::NotWritten));
+        }
+        self.changed.notify_waiters();
+        WriteState::Withdrawn
+    }
+
+    /// Its caller's first-byte deadline passed: expires the write `cell` if
+    /// the writer has not claimed it, returning its share; true when it did.
+    fn expire(&self, cell: &Arc<JobCell>) -> bool {
+        let mut state = self.state();
+        if cell.get() != WriteState::Queued {
+            return false;
+        }
+        let at = state.jobs.iter().position(
+            |job| matches!(job, Control::Message { cell: queued, .. } if Arc::ptr_eq(queued, cell)),
+        );
+        if let Some(Control::Message { bytes, .. }) = at.and_then(|at| state.jobs.remove(at)) {
+            state.release(bytes.len());
+        } else if state
+            .data
+            .as_ref()
+            .is_some_and(|slot| Arc::ptr_eq(&slot.cell, cell))
+        {
+            state.data = None;
+        } else {
+            return false;
+        }
+        cell.set(WriteState::Expired);
+        true
+    }
+
+    /// Claims the writer's next job under the lock: any control job first,
+    /// then the slot's data only while no hold exists.
+    fn claim(&self) -> Option<Claimed> {
+        let mut state = self.state();
+        if let Some(job) = state.jobs.pop_front() {
+            match &job {
+                Control::Interrupt { cell, .. } | Control::Message { cell, .. } => {
+                    cell.set(WriteState::Claimed);
+                }
+                Control::Close => {}
             }
-            self.ready.notified().await;
+            return Some(Claimed::Control(job));
+        }
+        if state.holds > 0 {
+            return None;
+        }
+        let slot = state.data.as_mut()?;
+        let (message, reply) = slot.job.take()?;
+        // Test builds: between the empty-holds check and the claim, inside
+        // the lock, so no hold can be taken here.
+        #[cfg(feature = "test-failpoints")]
+        let _ = via_store::failpoint::hit("wire.queue.claim");
+        slot.cell.set(WriteState::Claimed);
+        Some(Claimed::Data {
+            cell: Arc::clone(&slot.cell),
+            message,
+            reply,
+            start_by: slot.start_by,
+            finish_by: slot.finish_by,
+        })
+    }
+
+    /// The writer's next job, in queue order; queued deadlines are swept
+    /// while it waits, so a data message no hold lets through still expires.
+    async fn next(&self) -> Claimed {
+        loop {
+            let earliest = self.take_expired();
+            if let Some(claimed) = self.claim() {
+                return claimed;
+            }
+            let pushed = self.ready.notified();
+            match earliest {
+                Some(earliest) => {
+                    tokio::select! {
+                        () = sleep_until(earliest) => {}
+                        () = pushed => {}
+                    }
+                }
+                None => pushed.await,
+            }
         }
     }
 
@@ -305,40 +617,143 @@ impl ControlQueue {
         }
     }
 
-    /// Removes, under the lock, each queued message whose deadline passed,
-    /// returning its share, and answers it `NotWritten`; the earliest
-    /// deadline left.
+    /// Removes, under the lock, each queued message whose first-byte
+    /// deadline passed, returning its share, and answers it `NotWritten`;
+    /// the earliest deadline left.
     fn take_expired(&self) -> Option<tokio::time::Instant> {
         let now = tokio::time::Instant::now();
         let mut expired = Vec::new();
         let mut earliest: Option<tokio::time::Instant> = None;
+        let mut sooner = |at: tokio::time::Instant| {
+            earliest = Some(earliest.map_or(at, |earliest| earliest.min(at)));
+        };
         let mut state = self.state();
         let mut kept = VecDeque::with_capacity(state.jobs.len());
         while let Some(job) = state.jobs.pop_front() {
             match job {
                 Control::Message {
+                    cell,
                     bytes,
                     deadline,
                     reply,
-                    ..
                 } if deadline.instant() <= now => {
                     state.release(bytes.len());
+                    cell.set(WriteState::Expired);
                     expired.push(reply);
                 }
                 Control::Message { deadline, .. } => {
-                    let at = deadline.instant();
-                    earliest = Some(earliest.map_or(at, |earliest| earliest.min(at)));
+                    sooner(deadline.instant());
                     kept.push_back(job);
                 }
                 job @ (Control::Interrupt { .. } | Control::Close) => kept.push_back(job),
             }
         }
         state.jobs = kept;
+        let queued = state
+            .data
+            .as_ref()
+            .filter(|slot| slot.cell.get() == WriteState::Queued)
+            .map(|slot| slot.start_by.instant());
+        match queued {
+            Some(at) if at <= now => {
+                if let Some(slot) = state.data.take() {
+                    slot.cell.set(WriteState::Expired);
+                    // A job on its way back is answered by the writer.
+                    expired.extend(slot.job.map(|(_, reply)| reply));
+                }
+            }
+            Some(at) => sooner(at),
+            None => {}
+        }
         drop(state);
         for reply in expired {
             let _ = reply.send(Ok(SendOutcome::NotWritten));
         }
         earliest
+    }
+
+    /// One attempt at the claimed job `cell`'s first byte, under the lock
+    /// (x.3.2 X0 item 12.2, F1): refused once withdrawn or past `deadline`;
+    /// a data job returns to its slot while a hold exists; otherwise one
+    /// non-blocking `poll_write`, and a byte written makes it `Started`
+    /// before the lock is released.
+    fn attempt_first<W: AsyncWrite + Unpin>(
+        &self,
+        cx: &mut Context<'_>,
+        (stdin, chunk): (&mut W, &[u8]),
+        cell: &Arc<JobCell>,
+        (deadline, data): (tokio::time::Instant, bool),
+    ) -> Poll<FirstByte> {
+        let mut state = self.state();
+        let slot_is_job = |state: &QueueState| {
+            state
+                .data
+                .as_ref()
+                .is_some_and(|slot| Arc::ptr_eq(&slot.cell, cell))
+        };
+        if cell.get() != WriteState::Claimed {
+            return Poll::Ready(FirstByte::Refused);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            cell.set(WriteState::Expired);
+            if slot_is_job(&state) {
+                state.data = None;
+            }
+            return Poll::Ready(FirstByte::Refused);
+        }
+        if data && state.holds > 0 {
+            cell.set(WriteState::Queued);
+            return Poll::Ready(FirstByte::Unclaimed);
+        }
+        match Pin::new(stdin).poll_write(cx, chunk) {
+            Poll::Ready(Ok(count)) if count > 0 => {
+                cell.set(WriteState::Started);
+                if slot_is_job(&state) {
+                    state.data = None;
+                }
+                Poll::Ready(FirstByte::Wrote(Ok(count)))
+            }
+            Poll::Ready(written) => Poll::Ready(FirstByte::Wrote(written)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    /// Returns an unclaimed data job to its slot; its answer back when it
+    /// was withdrawn or expired meanwhile, for the writer to give.
+    fn unclaim(
+        &self,
+        cell: &Arc<JobCell>,
+        message: OutboundMessage,
+        reply: Reply,
+    ) -> Option<Reply> {
+        let mut state = self.state();
+        let slot = state
+            .data
+            .as_mut()
+            .filter(|slot| Arc::ptr_eq(&slot.cell, cell) && cell.get() == WriteState::Queued);
+        match slot {
+            Some(slot) => {
+                slot.job = Some((message, reply));
+                drop(state);
+                self.ready.notify_one();
+                None
+            }
+            None => Some(reply),
+        }
+    }
+
+    /// A [`DataHold`] is taken.
+    fn hold(&self) {
+        self.state().holds += 1;
+        self.changed.notify_waiters();
+    }
+
+    /// A [`DataHold`] is dropped: the writer may claim data again.
+    fn unhold(&self) {
+        let mut state = self.state();
+        state.holds = state.holds.saturating_sub(1);
+        drop(state);
+        self.ready.notify_one();
     }
 
     /// Returns the share of a message the writer resolved.
@@ -347,8 +762,8 @@ impl ControlQueue {
     }
 
     /// The writer ended: nothing more is queued. Takes every queued job,
-    /// each message's share returned.
-    fn close(&self) -> VecDeque<Control> {
+    /// each message's share returned, and the slot's data.
+    fn close(&self) -> (VecDeque<Control>, Option<DataSlot>) {
         let mut state = self.state();
         state.closed = true;
         let jobs = std::mem::take(&mut state.jobs);
@@ -357,20 +772,54 @@ impl ControlQueue {
                 state.release(bytes.len());
             }
         }
-        jobs
+        (jobs, state.data.take())
     }
 }
 
-impl ControlState {
+impl QueueState {
     fn release(&mut self, length: usize) {
         self.messages = self.messages.saturating_sub(1);
         self.bytes = self.bytes.saturating_sub(length);
     }
 }
 
+/// Holds the writer off data messages it has not started (x.3.2 X0 item
+/// 12.3): while any hold exists it claims no data job, and returns a
+/// claimed one to its slot before its first byte. Dropping it lets data
+/// through again.
+pub struct DataHold(Arc<Shared>);
+
+impl Drop for DataHold {
+    fn drop(&mut self) {
+        self.0.control.unhold();
+    }
+}
+
+/// What [`WireMessages::drain_admitted`] yields (x.3.2 X0 item 13.1).
+pub enum Admitted {
+    /// A complete message admitted before the seal.
+    Message(VendorMessage),
+    /// The admitted prefix is over.
+    Boundary {
+        /// A lower bound on bytes read and not delivered, as of this
+        /// boundary: complete messages the reader split after the seal,
+        /// plus whole reads it skipped after its own failure. It omits the
+        /// bytes of the read that failed it (the refused or oversized
+        /// message, the partial assembly and the rest of that read buffer),
+        /// so it can be zero although output was lost. A later boundary
+        /// may report more, as the reader goes on counting until EOF.
+        discarded_bytes: u64,
+    },
+}
+
 impl Shared {
-    /// Latches `cause` unless a failure came first; true when it won.
+    /// Latches `cause` unless a failure came first; true when it won. A
+    /// reader failure also stops admission, as a seal does (x.3.2 X0 item
+    /// 13.1): its reader admits nothing more.
     fn fail(&self, cause: FailureCause) -> bool {
+        if matches!(cause, FailureCause::Reader(_)) {
+            self.seal();
+        }
         self.latch.send_if_modified(|state| {
             if state.first.is_none() {
                 state.first = Some(cause);
@@ -379,6 +828,26 @@ impl Shared {
                 false
             }
         })
+    }
+
+    /// Stops stdout admission; idempotent (x.3.2 X0 item 13.1).
+    fn seal(&self) {
+        self.admission
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .sealed = true;
+    }
+
+    /// The boundary's `discarded_bytes` ([`Admitted::Boundary`]): complete
+    /// messages split after the seal and whole reads skipped after the
+    /// reader's failure; not the read that failed it.
+    fn undelivered(&self) -> u64 {
+        let sealed = self
+            .admission
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .discarded;
+        sealed.saturating_add(self.discarded.load(Ordering::Acquire))
     }
 
     fn failure(&self) -> Option<FailureCause> {
@@ -394,43 +863,88 @@ impl Shared {
         }
     }
 
-    /// Writes the first 64 KiB of a message VIA cannot decode to the turn's
-    /// `undecoded.bin` (design §7.3): the first message only, `create_new`,
-    /// one owned blob step answered within 2 s (coding-style §5): one that
-    /// overran stays owned until it ends. `what` describes the message; the
-    /// note names the file or the error. Nothing fails here.
     async fn keep_undecoded(&self, bytes: &[u8], what: &str) {
-        let undecoded = &self.undecoded;
-        if undecoded.claimed.swap(true, Ordering::AcqRel) {
+        self.undecoded.keep(bytes, what).await;
+    }
+
+    fn take_undecoded(&self) -> Option<String> {
+        self.undecoded.take()
+    }
+}
+
+impl Undecoded {
+    fn new(folder: PathBuf, tasks: BlobTasks) -> Self {
+        Self {
+            folder,
+            tasks,
+            claimed: AtomicBool::new(false),
+            note: StdMutex::new(None),
+        }
+    }
+
+    /// Writes the first 64 KiB of a message VIA cannot decode to the
+    /// folder's `undecoded.bin` (design §7.3): the first message only,
+    /// `create_new`, one owned blob step answered within 2 s (coding-style
+    /// §5): one that overran stays owned until it ends. `what` describes
+    /// the message; the note names the file or the error. Nothing fails
+    /// here.
+    async fn keep(&self, bytes: &[u8], what: &str) {
+        if self.claimed.swap(true, Ordering::AcqRel) {
             return;
         }
-        let path = undecoded.folder.join("undecoded.bin");
+        let path = self.folder.join("undecoded.bin");
         let prefix = bytes[..bytes.len().min(UNDECODED_BYTES)].to_vec();
         let kept = prefix.len();
         let target = path.clone();
-        let note = match undecoded
-            .tasks
-            .run(move || write_new(&target, &prefix))
-            .await
-        {
+        let note = match self.tasks.run(move || write_new(&target, &prefix)).await {
             Ok(()) => format!("{what}; first {kept} in {}", path.display()),
             Err(error) => format!("{what}; not saved: {error}"),
         };
         // Test builds: the save's outcome is known and not yet noted.
         #[cfg(feature = "test-failpoints")]
         let _ = via_store::failpoint::hit_async("wire.undecoded.before_note").await;
-        *undecoded
-            .note
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(note);
+        *self.note.lock().unwrap_or_else(PoisonError::into_inner) = Some(note);
     }
 
-    fn take_undecoded(&self) -> Option<String> {
-        self.undecoded
-            .note
+    fn take(&self) -> Option<String> {
+        self.note
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take()
+    }
+}
+
+/// One turn's evidence folder on a shared route (x.3.2 X0 item 1.4):
+/// `<state>/evidence/<session_id>/<turn>/`, created by
+/// [`crate::WireRuntime::turn_folder`]. A connection's own folder is its
+/// server's; a message whose correlation names this turn keeps its
+/// undecoded prefix here.
+pub struct TurnFolder {
+    undecoded: Undecoded,
+}
+
+impl TurnFolder {
+    pub(crate) fn new(folder: PathBuf, tasks: BlobTasks) -> Self {
+        Self {
+            undecoded: Undecoded::new(folder, tasks),
+        }
+    }
+
+    /// The folder.
+    pub fn path(&self) -> &Path {
+        &self.undecoded.folder
+    }
+
+    /// Keeps the first 64 KiB of a message Route cannot decode in this
+    /// turn's `undecoded.bin` (design §7.3); only the first is kept. Best
+    /// effort, bounded by 2 s.
+    pub async fn keep_undecoded(&self, bytes: &[u8], what: &str) {
+        self.undecoded.keep(bytes, what).await;
+    }
+
+    /// The note naming the kept message or why it was not kept, once.
+    pub fn take_undecoded(&self) -> Option<String> {
+        self.undecoded.take()
     }
 }
 
@@ -443,38 +957,71 @@ pub(crate) struct Io {
 }
 
 impl Io {
-    pub(crate) fn write(&self, message: OutboundMessage, deadline: Deadline) -> PendingWrite {
+    /// Enqueues `message` under `bounds` (runtime §4): the write enqueues
+    /// when first polled, and its ticket exists at once.
+    pub(crate) fn write(&self, message: OutboundMessage, bounds: WriteBounds) -> PendingWrite {
+        let withdrawable = match (&message, bounds) {
+            (OutboundMessage::Control(_), _)
+            | (OutboundMessage::Start { .. }, WriteBounds::StartBy { .. }) => true,
+            (OutboundMessage::Start { .. }, WriteBounds::CutAt(_))
+            | (OutboundMessage::Interrupt(_), _) => false,
+        };
+        let cell = JobCell::new(withdrawable);
+        let ticket = WriteTicket(Arc::clone(&cell));
         let io = self.clone();
-        PendingWrite(Box::pin(async move {
+        let deadline = bounds.first_byte();
+        let future = Box::pin(async move {
             let (reply, answer) = oneshot::channel();
-            let enqueued = match message {
-                start @ OutboundMessage::Start { .. } => io
+            let enqueued = match (message, bounds) {
+                (start @ OutboundMessage::Start { .. }, WriteBounds::CutAt(deadline)) => io
                     .data
                     .send(DataWrite {
                         message: start,
                         deadline,
                         reply,
+                        cell,
                     })
                     .await
                     .is_ok(),
-                OutboundMessage::Interrupt(bytes) => {
+                (
+                    start @ OutboundMessage::Start { .. },
+                    WriteBounds::StartBy {
+                        start_by,
+                        finish_by,
+                    },
+                ) => {
+                    if !io
+                        .shared
+                        .control
+                        .push_data(&cell, start, (start_by, finish_by), reply)
+                    {
+                        return Ok(SendOutcome::NotWritten);
+                    }
+                    return io.queued_answer(&cell, start_by, answer).await;
+                }
+                (OutboundMessage::Interrupt(bytes), _) => {
                     if bytes.len() > CONTROL_BYTES
                         || io.shared.interrupt_sent.swap(true, Ordering::AcqRel)
                     {
+                        cell.set(WriteState::Done(SendOutcome::NotWritten));
                         return Ok(SendOutcome::NotWritten);
                     }
                     io.shared.control.push(Control::Interrupt {
                         bytes,
                         deadline,
                         reply,
+                        cell,
                     })
                 }
-                OutboundMessage::Control(bytes) => {
-                    let Some(ticket) = io.shared.control.push_message(bytes, deadline, reply)
-                    else {
+                (OutboundMessage::Control(bytes), _) => {
+                    if !io
+                        .shared
+                        .control
+                        .push_message(&cell, bytes, deadline, reply)
+                    {
                         return Ok(SendOutcome::NotWritten);
-                    };
-                    return io.control_answer(ticket, deadline, answer).await;
+                    }
+                    return io.queued_answer(&cell, deadline, answer).await;
                 }
             };
             if !enqueued {
@@ -484,15 +1031,17 @@ impl Io {
             // A writer stopped mid-message answers nothing: bytes may have
             // reached the vendor.
             answer.await.unwrap_or(Ok(SendOutcome::Indeterminate))
-        }))
+        });
+        PendingWrite { ticket, future }
     }
 
-    /// A queued control message's answer: it expires on its own deadline,
-    /// even while another message holds stdin, unless the writer took it
-    /// first, which then answers.
-    async fn control_answer(
+    /// A queued control or `StartBy` data message's answer: it expires on
+    /// its own first-byte deadline, even while another message holds stdin
+    /// or a hold keeps data back, unless the writer claimed it first, which
+    /// then answers.
+    async fn queued_answer(
         &self,
-        ticket: u64,
+        cell: &Arc<JobCell>,
         deadline: Deadline,
         mut answer: oneshot::Receiver<Result<SendOutcome, WireError>>,
     ) -> Result<SendOutcome, WireError> {
@@ -501,10 +1050,24 @@ impl Io {
             answered = &mut answer => return answered.unwrap_or(Ok(SendOutcome::Indeterminate)),
             () = sleep_until(deadline.instant()) => {}
         }
-        if self.shared.control.expire(ticket) {
+        if self.shared.control.expire(cell) {
             return Ok(SendOutcome::NotWritten);
         }
         answer.await.unwrap_or(Ok(SendOutcome::Indeterminate))
+    }
+
+    pub(crate) fn withdraw(&self, ticket: WriteTicket) -> WriteState {
+        let WriteTicket(cell) = ticket;
+        self.shared.control.withdraw(&cell)
+    }
+
+    pub(crate) fn hold_data(&self) -> DataHold {
+        self.shared.control.hold();
+        DataHold(Arc::clone(&self.shared))
+    }
+
+    pub(crate) fn seal(&self) {
+        self.shared.seal();
     }
 
     pub(crate) async fn close_input(&self, deadline: Deadline) -> Result<(), WireError> {
@@ -540,7 +1103,7 @@ impl Io {
 
     #[cfg(feature = "test-failpoints")]
     pub(crate) fn queued_bytes(&self) -> usize {
-        self.shared.queued_bytes.load(Ordering::Acquire)
+        self.shared.staging.bytes.load(Ordering::Acquire)
     }
 }
 
@@ -559,12 +1122,62 @@ struct Process {
 
 impl WireSender {
     /// Enqueues one input message; the returned write resolves once the
-    /// writer answered. `deadline` bounds the write itself: a message cut
-    /// short by it closes stdin and answers `Indeterminate`, or `NotWritten`
-    /// when nothing of it was written. A `Control` message differs: see
-    /// [`OutboundMessage::Control`].
-    pub fn write(&self, message: OutboundMessage, deadline: Deadline) -> PendingWrite {
-        self.io.write(message, deadline)
+    /// writer answered. Under [`WriteBounds::CutAt`] the deadline bounds a
+    /// data message's write itself: a message cut short by it closes stdin
+    /// and answers `Indeterminate`, or `NotWritten` when nothing of it was
+    /// written. A `Control` message differs: see
+    /// [`OutboundMessage::Control`]. Under [`WriteBounds::StartBy`] a data
+    /// message takes the ticketed data slot, one at a time (a second while
+    /// it is taken answers `NotWritten` at once), and follows the control
+    /// rule (x.3.2 X0 item 12.2).
+    pub fn write(&self, message: OutboundMessage, bounds: WriteBounds) -> PendingWrite {
+        self.io.write(message, bounds)
+    }
+
+    /// Takes back a control or `StartBy` data write before its first byte:
+    /// from `Queued` or `Claimed` it is `Withdrawn`, answers `NotWritten`,
+    /// and stdin stays open; a started or answered write, or one not
+    /// withdrawable, is left as it is and its state returned (x.3.2 X0
+    /// item 12.2).
+    pub fn withdraw(&self, ticket: WriteTicket) -> WriteState {
+        self.io.withdraw(ticket)
+    }
+
+    /// Keeps the writer off unstarted data messages while it lives, so
+    /// control messages go first (x.3.2 X0 item 12.3).
+    pub fn hold_data(&self) -> DataHold {
+        self.io.hold_data()
+    }
+
+    /// Synchronous and idempotent: the first call stops admitting stdout
+    /// messages; the prefix is kept for [`WireMessages::drain_admitted`].
+    /// The failure's disposition is the route's (x.3.2 X0 item 13.1).
+    pub fn seal(&self) {
+        self.io.seal();
+    }
+
+    /// Commits the link of the `running` turn `(session, turn)` to this
+    /// connection's shared server anchor, before the turn's first vendor
+    /// byte (x.3.2 X0 item 1). A turn-owned connection has none:
+    /// `NotCommitted`. A link with no outcome by `deadline` is `Uncertain`.
+    pub async fn link_turn(
+        &self,
+        session: &via_store::SessionId,
+        turn: via_store::TurnNumber,
+        deadline: Deadline,
+    ) -> CommitOutcome<()> {
+        match self
+            .process
+            .control
+            .link_turn(session, turn, deadline)
+            .await
+        {
+            Ok(()) => CommitOutcome::Committed(()),
+            Err(via_host::HostError::Journal {
+                uncertain: true, ..
+            }) => CommitOutcome::Uncertain(StoreFailureKind::Write),
+            Err(_) => CommitOutcome::NotCommitted(StoreFailureKind::Write),
+        }
     }
 
     /// Closes vendor stdin once the current message is written;
@@ -582,6 +1195,7 @@ impl WireSender {
             vendor_exit: report.vendor_exit,
             forced: report.forced,
             journal_uncertain: report.journal_uncertain,
+            stopped_live: report.stopped_live,
         }
     }
 
@@ -647,6 +1261,11 @@ pub struct WireMessages {
     wake: watch::Receiver<u64>,
     stragglers: Stragglers,
     finished: bool,
+    /// A message [`Self::next_message`] dequeued, then withheld because a
+    /// failure latched meanwhile: admitted before the seal, it is the
+    /// drain's first ([`Self::drain_admitted`]). Test builds also keep a
+    /// message here across the `wire.messages.received` pause.
+    held: Option<VendorMessage>,
 }
 
 impl WireMessages {
@@ -660,11 +1279,28 @@ impl WireMessages {
         if let Some(cause) = self.shared.failure() {
             return Err(cause.error());
         }
+        // Test builds: a message an earlier call dequeued and was dropped
+        // at `wire.messages.received` holding comes first.
+        #[cfg(feature = "test-failpoints")]
+        if let Some(message) = self.held.take() {
+            return Ok(Some(message));
+        }
         tokio::select! {
             biased;
             () = cancelled(&mut self.force) => Err(WireError::Cancelled),
             () = woken(&mut self.wake) => Err(WireError::Woken),
-            message = self.queue.recv() => self.received(message),
+            message = self.queue.recv() => {
+                // Test builds: a message is dequeued, not yet returned. It
+                // waits in `held`, so a call dropped at the pause loses
+                // nothing.
+                #[cfg(feature = "test-failpoints")]
+                let message = {
+                    self.held = message;
+                    let _ = via_store::failpoint::hit_async("wire.messages.received").await;
+                    self.held.take()
+                };
+                self.received(message)
+            }
             cause = latched(&mut self.latch) => Err(cause.error()),
         }
     }
@@ -673,12 +1309,12 @@ impl WireMessages {
         &mut self,
         message: Option<VendorMessage>,
     ) -> Result<Option<VendorMessage>, WireError> {
-        if let Some(message) = &message {
-            self.shared
-                .queued_bytes
-                .fetch_sub(message.bytes().len(), Ordering::AcqRel);
-        }
         if let Some(cause) = self.shared.failure() {
+            // In the queue, so admitted before any seal: kept for the
+            // drain, never dropped (x.3.2 X0 item 13.1 exact prefix).
+            if message.is_some() {
+                self.held = message;
+            }
             return Err(cause.error());
         }
         match message {
@@ -694,6 +1330,32 @@ impl WireMessages {
                 Err(self.shared.failure().unwrap_or(cause).error())
             }
         }
+    }
+
+    /// After a seal (Route's, or the end of Wire's own reader on its
+    /// failure): the complete messages admitted before it, in order, then
+    /// [`Admitted::Boundary`]; it never waits for more output (x.3.2 X0
+    /// item 13.1). It seals first, so a drain alone also stops admission.
+    /// A latched failure does not hide the prefix, nor a message
+    /// [`Self::next_message`] withheld from it. Nothing is sealed or
+    /// dequeued until the future is polled, and it completes at its first
+    /// poll, so a drain dropped unpolled, or losing a `select!`, loses
+    /// nothing.
+    pub fn drain_admitted(&mut self) -> impl Future<Output = Admitted> + Send + '_ {
+        std::future::poll_fn(move |_| {
+            self.shared.seal();
+            let next = match self
+                .held
+                .take()
+                .map_or_else(|| self.queue.try_recv().ok(), Some)
+            {
+                Some(message) => Admitted::Message(message),
+                None => Admitted::Boundary {
+                    discarded_bytes: self.shared.undelivered(),
+                },
+            };
+            std::task::Poll::Ready(next)
+        })
     }
 
     /// Ends the connection under one absolute deadline (design §8.6): the
@@ -904,19 +1566,15 @@ where
     let (latch, latch_rx) = watch::channel(LatchState::default());
     let shared = Arc::new(Shared {
         latch,
-        queued_bytes: AtomicUsize::new(0),
+        staging: Arc::default(),
+        admission: StdMutex::default(),
         eof: AtomicBool::new(false),
         unterminated: AtomicBool::new(false),
         discarded: AtomicU64::new(0),
         interrupt_sent: AtomicBool::new(false),
         close_sent: AtomicBool::new(false),
-        control: ControlQueue::default(),
-        undecoded: Undecoded {
-            folder,
-            tasks,
-            claimed: AtomicBool::new(false),
-            note: StdMutex::new(None),
-        },
+        control: WriteQueue::default(),
+        undecoded: Undecoded::new(folder, tasks),
     });
     let (queue_tx, queue) = mpsc::channel(QUEUE_MESSAGES);
     let (data_tx, data_rx) = mpsc::channel(1);
@@ -953,6 +1611,7 @@ where
         wake: waits.wake,
         stragglers: stragglers.clone(),
         finished: false,
+        held: None,
     };
     (io, messages)
 }
@@ -1010,6 +1669,8 @@ async fn read_stdout<R: AsyncRead + Unpin>(
                 .fetch_add(u64::try_from(count).unwrap_or(u64::MAX), Ordering::AcqRel);
             continue;
         }
+        // A refusal or an oversized message switches to discard mode
+        // without counting this read: `discarded_bytes` is a lower bound.
         match splitter.push(&buffer[..count], |message| {
             enqueue(&shared, &queue, message)
         }) {
@@ -1048,24 +1709,41 @@ async fn read_stdout<R: AsyncRead + Unpin>(
     shared.eof.store(true, Ordering::Release);
 }
 
-/// Counts `message` against the queue's bytes, then `try_send`s it; a
-/// full queue latches `Overflow`. False stops the splitting.
+/// Admits `message` under the admission lock (x.3.2 X0 item 13.1): after
+/// a seal it is discarded and counted, and reading goes on. Otherwise it
+/// takes its staging permit, then is `try_send`ed; a full staging budget
+/// or queue latches `Overflow`. False stops the splitting.
 fn enqueue(shared: &Shared, queue: &mpsc::Sender<VendorMessage>, message: Vec<u8>) -> bool {
     let length = message.len();
-    let Ok(bounded) = BoundedBytes::try_from_message(message) else {
-        shared.fail(FailureCause::Reader(WireFailure::MessageTooLarge));
-        return false;
-    };
-    let queued = shared.queued_bytes.fetch_add(length, Ordering::AcqRel) + length;
-    let sent = queued <= QUEUE_BYTES && queue.try_send(VendorMessage::new(bounded)).is_ok();
-    if !sent {
-        shared.queued_bytes.fetch_sub(length, Ordering::AcqRel);
-        // A closed queue means the consumer is gone: only discard.
-        if !queue.is_closed() {
-            shared.fail(FailureCause::Reader(WireFailure::Overflow));
-        }
+    let mut admission = shared
+        .admission
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if admission.sealed {
+        admission.discarded = admission
+            .discarded
+            .saturating_add(u64::try_from(length).unwrap_or(u64::MAX));
+        return true;
     }
-    sent
+    let cause = match BoundedBytes::try_from_message(message) {
+        Ok(bounded) => {
+            let sent = StagingPermit::reserve(&shared.staging, length).is_some_and(|permit| {
+                queue
+                    .try_send(VendorMessage::staged(bounded, permit))
+                    .is_ok()
+            });
+            // A closed queue means the consumer is gone: only discard.
+            if sent || queue.is_closed() {
+                return sent;
+            }
+            WireFailure::Overflow
+        }
+        Err(_) => WireFailure::MessageTooLarge,
+    };
+    // `fail` seals, which takes this lock.
+    drop(admission);
+    shared.fail(FailureCause::Reader(cause));
+    false
 }
 
 /// The writer's two queues: the data channel and the shared control queue.
@@ -1086,18 +1764,100 @@ impl Drop for Queues {
 /// One message for the writer and where its answer goes.
 struct Job {
     message: OutboundMessage,
+    /// A `CutAt` data message's cut, an interrupt's cut, or a whole
+    /// message's first-byte bound.
     deadline: Deadline,
-    reply: oneshot::Sender<Result<SendOutcome, WireError>>,
+    reply: Reply,
+    cell: Arc<JobCell>,
     start: bool,
     /// A distinct control message's budgeted bytes, returned before its
     /// answer.
     budgeted: Option<usize>,
+    /// A distinct control message or `StartBy` data: its first byte is
+    /// decided under the queue lock, and once started it is written whole.
+    whole: Option<Whole>,
+}
+
+/// How a whole message is finished once started.
+#[derive(Clone, Copy)]
+enum Whole {
+    /// A control message: cut only by the connection's stop.
+    Control,
+    /// `StartBy` data: by `finish_by`, the connection's own far deadline.
+    Data { finish_by: Deadline },
+}
+
+impl Job {
+    /// The writer's job for a claim; `None` for the close.
+    fn claimed(claimed: Claimed) -> Option<Self> {
+        Some(match claimed {
+            Claimed::Control(Control::Interrupt {
+                bytes,
+                deadline,
+                reply,
+                cell,
+            }) => Self {
+                message: OutboundMessage::Interrupt(bytes),
+                deadline,
+                reply,
+                cell,
+                start: false,
+                budgeted: None,
+                whole: None,
+            },
+            Claimed::Control(Control::Message {
+                cell,
+                bytes,
+                deadline,
+                reply,
+            }) => Self {
+                budgeted: Some(bytes.len()),
+                message: OutboundMessage::Control(bytes),
+                deadline,
+                reply,
+                cell,
+                start: false,
+                whole: Some(Whole::Control),
+            },
+            Claimed::Control(Control::Close) => return None,
+            Claimed::Data {
+                cell,
+                message,
+                reply,
+                start_by,
+                finish_by,
+            } => Self {
+                message,
+                deadline: start_by,
+                reply,
+                cell,
+                start: true,
+                budgeted: None,
+                whole: Some(Whole::Data { finish_by }),
+            },
+        })
+    }
+
+    /// The writer's job for a `CutAt` data message.
+    fn cut_at(data: DataWrite) -> Self {
+        data.cell.set(WriteState::Claimed);
+        Self {
+            message: data.message,
+            deadline: data.deadline,
+            reply: data.reply,
+            cell: data.cell,
+            start: true,
+            budgeted: None,
+            whole: None,
+        }
+    }
 }
 
 /// The stdin writer (design §8.3): owns stdin and writes one message at a
 /// time, controls first between messages, never interleaving bytes. Every
 /// write selects on the stop signal and its deadline; a message not written
-/// whole closes stdin. On its end it drops stdin and marks it closed.
+/// whole closes stdin, while a whole message refused before its first byte
+/// leaves it open. On its end it drops stdin and marks it closed.
 async fn write_stdin<W: AsyncWrite + Unpin>(
     mut stdin: W,
     mut queues: Queues,
@@ -1110,90 +1870,20 @@ async fn write_stdin<W: AsyncWrite + Unpin>(
         let job = tokio::select! {
             biased;
             () = stopped(&mut stop) => break,
-            control = queues.shared.control.next() => match control {
-                Control::Interrupt { bytes, deadline, reply } => Job {
-                    message: OutboundMessage::Interrupt(bytes),
-                    deadline,
-                    reply,
-                    start: false,
-                    budgeted: None,
-                },
-                Control::Message { bytes, deadline, reply, .. } => Job {
-                    budgeted: Some(bytes.len()),
-                    message: OutboundMessage::Control(bytes),
-                    deadline,
-                    reply,
-                    start: false,
-                },
-                Control::Close => break,
+            claimed = queues.shared.control.next() => match Job::claimed(claimed) {
+                Some(job) => job,
+                None => break,
             },
             data = queues.data.recv(), if data_open => {
-                let Some(DataWrite { message, deadline, reply }) = data else {
+                let Some(data) = data else {
                     data_open = false;
                     continue;
                 };
-                Job {
-                    message,
-                    deadline,
-                    reply,
-                    start: true,
-                    budgeted: None,
-                }
+                Job::cut_at(data)
             }
         };
-        let mut writing = Writing {
-            stdin: &mut stdin,
-            stop: &mut stop,
-            deadline: job.deadline,
-            whole: job.budgeted.is_some(),
-            written: false,
-            timed_out: false,
-        };
-        // While it holds stdin, queued control messages still expire.
-        let outcome = tokio::select! {
-            biased;
-            outcome = writing.message(&job.message, &mut piece) => outcome,
-            never = queues.shared.control.expire_queued() => match never {},
-        };
-        let (written, timed_out) = (writing.written, writing.timed_out);
-        // Resolved, whatever the outcome: its share returns before the
-        // answer, so a caller answered may enqueue the next at once.
-        if let Some(length) = job.budgeted {
-            queues.shared.control.release(length);
-        }
-        match outcome {
-            Ok(true) => {
-                // The whole input message (in S1 first the start carrying the
-                // prompt) is in the vendor's stdin.
-                #[cfg(feature = "test-failpoints")]
-                if job.start
-                    && let Err(error) =
-                        via_store::failpoint::hit_async("wire.prompt.after_write").await
-                {
-                    let _ = job.reply.send(Err(WireError::Io(error)));
-                    break;
-                }
-                let _ = job.start;
-                let _ = job.reply.send(Ok(SendOutcome::Written));
-            }
-            // A control message's deadline passed before its first byte:
-            // refused, and stdin stays open for the messages after it.
-            Ok(false) if job.budgeted.is_some() && timed_out && !written => {
-                let _ = job.reply.send(Ok(SendOutcome::NotWritten));
-            }
-            Ok(false) => {
-                let _ = job.reply.send(Ok(if written {
-                    SendOutcome::Indeterminate
-                } else {
-                    SendOutcome::NotWritten
-                }));
-                break;
-            }
-            Err(error) => {
-                queues.shared.fail(FailureCause::Writer(error.kind()));
-                let _ = job.reply.send(Err(WireError::Io(error)));
-                break;
-            }
+        if !write_job((&mut stdin, &mut stop), &queues.shared, job, &mut piece).await {
+            break;
         }
     }
     drop(stdin);
@@ -1201,41 +1891,140 @@ async fn write_stdin<W: AsyncWrite + Unpin>(
     closed.send_replace(true);
 }
 
+/// Writes one job and answers it; false when the writer must end and drop
+/// stdin.
+async fn write_job<W: AsyncWrite + Unpin>(
+    (stdin, stop): (&mut W, &mut watch::Receiver<bool>),
+    shared: &Shared,
+    job: Job,
+    piece: &mut Vec<u8>,
+) -> bool {
+    let mut writing = Writing {
+        stdin,
+        stop,
+        queue: &shared.control,
+        cell: &job.cell,
+        deadline: job.deadline,
+        whole: job.whole,
+        written: false,
+        refused: None,
+    };
+    // While it holds stdin, queued messages still expire.
+    let outcome = tokio::select! {
+        biased;
+        outcome = writing.message(&job.message, piece) => outcome,
+        never = shared.control.expire_queued() => match never {},
+    };
+    let (written, refused) = (writing.written, writing.refused);
+    // Resolved, whatever the outcome: its share returns before the answer,
+    // so a caller answered may enqueue the next at once.
+    if let Some(length) = job.budgeted {
+        shared.control.release(length);
+    }
+    let (answer, go_on) = match outcome {
+        Ok(true) => {
+            // The whole input message (in S1 first the start carrying the
+            // prompt) is in the vendor's stdin.
+            #[cfg(feature = "test-failpoints")]
+            if job.start
+                && let Err(error) = via_store::failpoint::hit_async("wire.prompt.after_write").await
+            {
+                job.cell.set(WriteState::Done(SendOutcome::Indeterminate));
+                let _ = job.reply.send(Err(WireError::Io(error)));
+                return false;
+            }
+            let _ = job.start;
+            (Ok(SendOutcome::Written), true)
+        }
+        // A hold came before the data's first byte: back to its slot.
+        Ok(false) if refused == Some(Refusal::Unclaimed) => {
+            if let Some(reply) = shared.control.unclaim(&job.cell, job.message, job.reply) {
+                let _ = reply.send(Ok(SendOutcome::NotWritten));
+            }
+            return true;
+        }
+        // Withdrawn, or its deadline passed, before its first byte:
+        // refused, and stdin stays open for the messages after it.
+        Ok(false) if refused == Some(Refusal::Refused) => {
+            let _ = job.reply.send(Ok(SendOutcome::NotWritten));
+            return true;
+        }
+        Ok(false) if written => (Ok(SendOutcome::Indeterminate), false),
+        Ok(false) => (Ok(SendOutcome::NotWritten), false),
+        Err(error) => {
+            shared.fail(FailureCause::Writer(error.kind()));
+            (Err(WireError::Io(error)), false)
+        }
+    };
+    job.cell.set(WriteState::Done(match &answer {
+        Ok(outcome) => *outcome,
+        Err(_) => SendOutcome::Indeterminate,
+    }));
+    let _ = job.reply.send(answer);
+    go_on
+}
+
 /// The writer's end: nothing queued after it is written, so each queued
 /// write answers `NotWritten` and a control message returns its share.
 fn refuse_queued(queues: &mut Queues) {
+    let refuse = |cell: &JobCell, reply: Reply| {
+        cell.set(WriteState::Done(SendOutcome::NotWritten));
+        let _ = reply.send(Ok(SendOutcome::NotWritten));
+    };
     queues.data.close();
-    for control in queues.shared.control.close() {
+    let (jobs, slot) = queues.shared.control.close();
+    for control in jobs {
         match control {
-            Control::Interrupt { reply, .. } | Control::Message { reply, .. } => {
-                let _ = reply.send(Ok(SendOutcome::NotWritten));
+            Control::Interrupt { reply, cell, .. } | Control::Message { reply, cell, .. } => {
+                refuse(&cell, reply);
             }
             Control::Close => {}
         }
     }
-    while let Ok(data) = queues.data.try_recv() {
-        let _ = data.reply.send(Ok(SendOutcome::NotWritten));
+    if let Some(DataSlot {
+        cell,
+        job: Some((_, reply)),
+        ..
+    }) = slot
+    {
+        refuse(&cell, reply);
     }
+    while let Ok(data) = queues.data.try_recv() {
+        refuse(&data.cell, data.reply);
+    }
+}
+
+/// Why a whole message ended before its first byte.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Refusal {
+    /// Withdrawn or expired: `NotWritten`, stdin open.
+    Refused,
+    /// A data job met a hold: back in its slot.
+    Unclaimed,
 }
 
 /// One message being written.
 struct Writing<'a, W> {
     stdin: &'a mut W,
     stop: &'a mut watch::Receiver<bool>,
+    queue: &'a WriteQueue,
+    cell: &'a Arc<JobCell>,
     deadline: Deadline,
-    /// A control message: the deadline bounds only the wait for its first
-    /// byte, and one started is written whole, so a deadline never leaves a
-    /// partial line nor closes a stdin other sessions may share.
-    whole: bool,
+    /// A whole message: the deadline bounds only the wait for its first
+    /// byte, decided under the queue lock, and one started is written
+    /// whole, so a deadline never leaves a partial line nor closes a stdin
+    /// other sessions may share.
+    whole: Option<Whole>,
     /// Some byte of the message was written.
     written: bool,
-    /// The deadline cut the message.
-    timed_out: bool,
+    /// A whole message ended before its first byte.
+    refused: Option<Refusal>,
 }
 
 impl<W: AsyncWrite + Unpin> Writing<'_, W> {
     /// Writes the whole message: true once complete, false when the stop
-    /// signal or the deadline cut it.
+    /// signal or the deadline cut it, or it was refused before its first
+    /// byte.
     async fn message(
         &mut self,
         message: &OutboundMessage,
@@ -1279,11 +2068,24 @@ impl<W: AsyncWrite + Unpin> Writing<'_, W> {
             let (whole, written) = (self.whole, self.written);
             let (deadline, stdin, chunk) =
                 (self.deadline.instant(), &mut *self.stdin, &bytes[offset..]);
+            let (queue, cell) = (self.queue, self.cell);
             let pending = async move {
                 match (whole, written) {
-                    (true, false) => first_write(stdin, chunk, deadline).await,
-                    (true, true) => Some(stdin.write(chunk).await),
-                    (false, _) => timeout_at(deadline, stdin.write(chunk)).await.ok(),
+                    (Some(whole), false) => {
+                        let data = matches!(whole, Whole::Data { .. });
+                        match first_byte(queue, (stdin, chunk), cell, (deadline, data)).await {
+                            FirstByte::Wrote(write) => Ok(Some(write)),
+                            FirstByte::Refused => Err(Refusal::Refused),
+                            FirstByte::Unclaimed => Err(Refusal::Unclaimed),
+                        }
+                    }
+                    (Some(Whole::Data { finish_by }), true) => {
+                        Ok(timeout_at(finish_by.instant(), stdin.write(chunk))
+                            .await
+                            .ok())
+                    }
+                    (Some(Whole::Control), true) => Ok(Some(stdin.write(chunk).await)),
+                    (None, _) => Ok(timeout_at(deadline, stdin.write(chunk)).await.ok()),
                 }
             };
             let write = tokio::select! {
@@ -1292,39 +2094,49 @@ impl<W: AsyncWrite + Unpin> Writing<'_, W> {
                 write = pending => write,
             };
             match write {
-                None => {
-                    self.timed_out = true;
+                Err(refusal) => {
+                    self.refused = Some(refusal);
                     return Ok(false);
                 }
-                Some(Ok(0)) => return Ok(false),
-                Some(Ok(count)) => {
+                Ok(None | Some(Ok(0))) => return Ok(false),
+                Ok(Some(Ok(count))) => {
+                    if !self.written && self.whole.is_none() {
+                        self.cell.set(WriteState::Started);
+                    }
                     self.written = true;
                     offset += count;
                 }
-                Some(Err(error)) => return Err(error),
+                Ok(Some(Err(error))) => return Err(error),
             }
         }
         Ok(true)
     }
 }
 
-/// A control message's first write: its expiry wins before every poll that
-/// could write a byte, so an expired message never starts, though stdin is
-/// writable; `None` once expired.
-async fn first_write<W: AsyncWrite + Unpin>(
-    stdin: &mut W,
-    chunk: &[u8],
-    deadline: tokio::time::Instant,
-) -> Option<std::io::Result<usize>> {
-    let expiry = sleep_until(deadline);
-    tokio::pin!(expiry);
-    std::future::poll_fn(|cx| {
-        if tokio::time::Instant::now() >= deadline || expiry.as_mut().poll(cx).is_ready() {
-            return Poll::Ready(None);
+/// A whole message's first byte (x.3.2 X0 item 12.2): each attempt is
+/// decided under the queue lock ([`WriteQueue::attempt_first`]); between
+/// attempts it waits for stdin, a withdrawal or hold, or its deadline, so
+/// an expired or withdrawn message never starts, though stdin is writable.
+async fn first_byte<W: AsyncWrite + Unpin>(
+    queue: &WriteQueue,
+    (stdin, chunk): (&mut W, &[u8]),
+    cell: &Arc<JobCell>,
+    (deadline, data): (tokio::time::Instant, bool),
+) -> FirstByte {
+    loop {
+        let changed = queue.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        let attempt = std::future::poll_fn(|cx| {
+            queue.attempt_first(cx, (&mut *stdin, chunk), cell, (deadline, data))
+        });
+        tokio::select! {
+            biased;
+            first = attempt => return first,
+            () = changed => {}
+            () = sleep_until(deadline) => {}
         }
-        Pin::new(&mut *stdin).poll_write(cx, chunk).map(Some)
-    })
-    .await
+    }
 }
 
 /// Resolves once the stop signal is set, or its sender is gone.
@@ -1385,8 +2197,8 @@ pub mod testing {
     use tokio::sync::watch;
 
     use super::{
-        BlobTasks, Deadline, FailureCause, Io, OutboundMessage, PendingWrite, Stragglers, Waits,
-        WireError, WireMessages, connect,
+        BlobTasks, DataHold, Deadline, FailureCause, Io, OutboundMessage, PendingWrite, Stragglers,
+        Waits, WireError, WireMessages, WriteBounds, WriteState, WriteTicket, connect,
     };
 
     /// A connection's message half and its input, over test pipes.
@@ -1430,9 +2242,29 @@ pub mod testing {
     }
 
     impl TestInput {
-        /// See `WireSender::write`.
+        /// See `WireSender::write`, under [`WriteBounds::CutAt`].
         pub fn write(&self, message: OutboundMessage, deadline: Deadline) -> PendingWrite {
-            self.io.write(message, deadline)
+            self.io.write(message, WriteBounds::CutAt(deadline))
+        }
+
+        /// See `WireSender::write`.
+        pub fn write_bounded(&self, message: OutboundMessage, bounds: WriteBounds) -> PendingWrite {
+            self.io.write(message, bounds)
+        }
+
+        /// See `WireSender::withdraw`.
+        pub fn withdraw(&self, ticket: WriteTicket) -> WriteState {
+            self.io.withdraw(ticket)
+        }
+
+        /// See `WireSender::hold_data`.
+        pub fn hold_data(&self) -> DataHold {
+            self.io.hold_data()
+        }
+
+        /// See `WireSender::seal`.
+        pub fn seal(&self) {
+            self.io.seal();
         }
 
         /// See `WireSender::close_input`.

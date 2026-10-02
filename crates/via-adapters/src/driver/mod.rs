@@ -105,6 +105,69 @@ pub enum Prepared {
     NeedsConnection,
 }
 
+/// How a driver's connections are owned (C2 §2, C1 §7.6 force rows).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectionKind {
+    /// A process per turn, or the session's own persistent connection.
+    PerTurn,
+    /// A server shared by sessions: under daemon force a launched turn's
+    /// state and outcome are `unknown` (C1 §7.6).
+    Shared,
+}
+
+/// Test builds only: a stand-in for a shared route's admission (x.3.2 X0
+/// item 0), installed on the adapter set ([`crate::AdapterSet::stand_in`])
+/// before a driver opens. Drivers opened after it answer `readiness()`
+/// with its epoch, `prepare()` with `Pinned` once [`Self::pin`] was called,
+/// and `connection_kind()` with `Shared` once [`Self::share`] was called.
+/// A stand-in pin names no live connection: the fake refuses it at
+/// `run_turn` with a definite rejection (AD16 rule 4).
+#[cfg(feature = "test-failpoints")]
+#[derive(Debug)]
+pub struct StandIn {
+    epoch: watch::Sender<u64>,
+    pinned: std::sync::atomic::AtomicBool,
+    shared: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(feature = "test-failpoints")]
+impl Default for StandIn {
+    fn default() -> Self {
+        Self {
+            epoch: watch::Sender::new(0),
+            pinned: std::sync::atomic::AtomicBool::new(false),
+            shared: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+#[cfg(feature = "test-failpoints")]
+impl StandIn {
+    /// Every later `prepare()` answers `Pinned`, as an equal-key server
+    /// published; the epoch is not bumped ([`Self::bump`]).
+    pub fn pin(&self) {
+        self.pinned.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Advances the epoch, after a state change, as the registry does.
+    pub fn bump(&self) {
+        self.epoch.send_modify(|epoch| *epoch += 1);
+    }
+
+    /// Drivers report `ConnectionKind::Shared`.
+    pub fn share(&self) {
+        self.shared.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn pinned(&self) -> bool {
+        self.pinned.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn shared(&self) -> bool {
+        self.shared.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 /// The per-turn context (C2 §2 `TurnCx`).
 pub struct TurnCx {
     /// The canonical turn.
@@ -401,6 +464,9 @@ pub struct SessionDriver {
     /// connection takes it to advance the generation. So a new
     /// generation's first observation follows the previous one's last.
     pub(crate) barrier: Arc<tokio::sync::Mutex<()>>,
+    /// Test builds: the adapter set's stand-in admission, if installed.
+    #[cfg(feature = "test-failpoints")]
+    pub(crate) stand_in: Option<Arc<StandIn>>,
 }
 
 impl SessionDriver {
@@ -430,6 +496,8 @@ impl SessionDriver {
             journal: Arc::new(watch::Sender::new(false)),
             state: Arc::new(Mutex::new(state)),
             barrier: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(feature = "test-failpoints")]
+            stand_in: None,
         }
     }
 
@@ -491,12 +559,52 @@ impl SessionDriver {
     /// opens a new connection and Core reserves a slot for it.
     pub fn prepare(&self) -> Prepared {
         let state = self.state();
+        #[cfg(feature = "test-failpoints")]
+        if self
+            .stand_in
+            .as_ref()
+            .is_some_and(|stand_in| stand_in.pinned())
+        {
+            return Prepared::Pinned(ConnectionPin {
+                generation: state.generation,
+            });
+        }
         if self.persistent() && state.live && !state.closed {
             Prepared::Pinned(ConnectionPin {
                 generation: state.generation,
             })
         } else {
             Prepared::NeedsConnection
+        }
+    }
+
+    /// Changes whenever this driver's `prepare()` answer may change (C2 §3
+    /// connection admission): a shared route's registry epoch. `None` on
+    /// per-turn routes, whose answer changes only through the session's
+    /// own turns; test builds answer a stand-in's epoch
+    /// ([`crate::AdapterSet::stand_in`]).
+    pub fn readiness(&self) -> Option<watch::Receiver<u64>> {
+        #[cfg(feature = "test-failpoints")]
+        if let Some(stand_in) = &self.stand_in {
+            return Some(stand_in.epoch.subscribe());
+        }
+        None
+    }
+
+    /// How the driver's connections are owned (C2 §2): `Shared` on the
+    /// Codex route, `PerTurn` on the fake and Claude routes.
+    pub fn connection_kind(&self) -> ConnectionKind {
+        #[cfg(feature = "test-failpoints")]
+        if self
+            .stand_in
+            .as_ref()
+            .is_some_and(|stand_in| stand_in.shared())
+        {
+            return ConnectionKind::Shared;
+        }
+        match &self.kind {
+            Some(DriverKind::Codex(_)) => ConnectionKind::Shared,
+            Some(DriverKind::Fake(_) | DriverKind::Claude(_)) | None => ConnectionKind::PerTurn,
         }
     }
 

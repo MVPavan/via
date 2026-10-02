@@ -359,6 +359,7 @@ fn adapter_set(harness: &str, binary: &Path, state: &Path) -> Result<(AdapterSet
             // The real anchor, when built: the run half launches through it.
             anchor_binary: sibling("via").unwrap_or_else(|_| state.join("anchor")),
             anchor_dir: state.join("runtime"),
+            vendor_state_dir: state.join("vendor"),
         },
         store.runtime_resources(),
     )

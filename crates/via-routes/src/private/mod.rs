@@ -18,7 +18,7 @@ use crate::{
 };
 use via_wire::{
     CloseMode, CloseRequest, ExitReport, OutboundMessage, WireCleanup, WireCloseReport,
-    WireMessages, WireParts, WireSender, WireSignals,
+    WireMessages, WireParts, WireSender, WireSignals, WriteBounds,
 };
 
 mod serving;
@@ -500,7 +500,9 @@ async fn drive<P: PrivateProtocol>(
     serving.lane.submitted();
     // While the start is pending no message is read: nothing the vendor
     // answers is taken before its whole input is written.
-    let write = serving.sender.write(start, serving.deadline);
+    let write = serving
+        .sender
+        .write(start, WriteBounds::CutAt(serving.deadline));
     let sent = serving
         .serve(write)
         .await?

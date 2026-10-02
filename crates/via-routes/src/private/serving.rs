@@ -12,7 +12,7 @@ use super::{Closed, ForceWatch, PrivateProtocol};
 use crate::{Deadline, RouteError, RouteFailure, SendOutcome, StopWatch, StoreFailure, TurnNumber};
 use via_wire::{
     ExitReport, FailureCause, HostError, LatchState, PendingWrite, WireError, WireFailure,
-    WireMessages, WireSender,
+    WireMessages, WireSender, WriteBounds,
 };
 
 /// The bytes of decoded messages that may wait for room on the hop: the
@@ -558,7 +558,10 @@ impl<'a, P: PrivateProtocol> Serving<'a, P> {
         }
         self.interrupt = Interrupt::Queued;
         let interrupt = P::interrupt(self);
-        self.pending = Some(self.sender.write(interrupt, self.deadline));
+        self.pending = Some(
+            self.sender
+                .write(interrupt, WriteBounds::CutAt(self.deadline)),
+        );
     }
 
     /// The interrupt's write answered. One not written whole asked the

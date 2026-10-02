@@ -55,6 +55,7 @@ async fn end(client: &StoreClient, number: u32, seq: u64, state: &str) {
                 envelope: json!({"state":state}),
                 event: event("turn.ended", seq, number),
                 steps: Vec::new(),
+                link_released: false,
             },
             TerminalExtras {
                 cancel_cause: (state == "cancelled").then_some(CancelCause::Cancel),

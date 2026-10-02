@@ -82,6 +82,7 @@ fn ended(number: u32, seq: u64, state: &str) -> TerminalRecord {
         envelope: json!({"state":state}),
         event: event("turn.ended", seq),
         steps: Vec::new(),
+        link_released: false,
     }
 }
 
@@ -95,32 +96,32 @@ fn read_db(root: &TempDir) -> rusqlite::Connection {
     rusqlite::Connection::open(root.path().join("store.sqlite3")).unwrap()
 }
 
-/// Task 4 design §6.6, runtime §6: a fresh Store is schema v8; a v7 Store,
+/// Task 4 design §6.6, runtime §6: a fresh Store is schema v9; a v8 Store,
 /// older than the build, is an unreleased format refused with the named
 /// recreate instruction, bytes untouched.
 #[test]
-fn fresh_store_is_v8_and_a_v7_store_is_refused() {
+fn fresh_store_is_v9_and_a_v8_store_is_refused() {
     let root = private_dir();
     drop(Store::open(root.path()).unwrap());
     let version: i64 = read_db(&root)
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
 
-    // A full Store stamped v7, as a v7 build left it but for the columns.
+    // A full Store stamped v8, as a v8 build left it but for the columns.
     let old = private_dir();
     drop(Store::open(old.path()).unwrap());
     let db = old.path().join("store.sqlite3");
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
-        conn.pragma_update(None, "user_version", 7).unwrap();
+        conn.pragma_update(None, "user_version", 8).unwrap();
         conn.pragma_update(None, "journal_mode", "DELETE").unwrap();
     }
     let before = fs::read(&db).unwrap();
     let Err(error) = Store::open(old.path()) else {
-        panic!("a v7 Store opened");
+        panic!("a v8 Store opened");
     };
-    assert!(error.to_string().contains("schema v7"), "{error}");
+    assert!(error.to_string().contains("schema v8"), "{error}");
     assert!(error.to_string().contains("recreate"), "{error}");
     assert_eq!(fs::read(&db).unwrap(), before);
 }
@@ -611,8 +612,10 @@ fn intent(anchor_id: &str) -> AnchorIntent {
         generation: format!("g-{anchor_id}"),
         marker: "m".to_owned(),
         socket_path: PathBuf::from("/private/a.sock"),
-        owner_session: session(),
-        owner_turn: turn(1),
+        owner: via_store::ProcessOwner::Turn {
+            session_id: session(),
+            turn: turn(1),
+        },
         uid: 1000,
         boot_id: "boot".to_owned(),
         pid_namespace: "pid:[1]".to_owned(),
@@ -674,7 +677,10 @@ fn absence_proof_records_the_identity_of_an_intent_phase_anchor() {
         }
         let CommitOutcome::Committed(_) = journal
             .commit_anchor_intent(AnchorIntent {
-                owner_session: SessionId::try_from(OTHER).unwrap(),
+                owner: via_store::ProcessOwner::Turn {
+                    session_id: SessionId::try_from(OTHER).unwrap(),
+                    turn: turn(1),
+                },
                 ..intent("b1")
             })
             .await

@@ -426,8 +426,14 @@ impl Engine {
             .await
             .map_err(|error| format!("store_error: {error}"))?;
         let every = unfinished.len() < UNFINISHED_LIST;
+        // x.3.2 X0 item 6.1: the server anchors the turns' links name.
+        let linked = unfinished
+            .iter()
+            .filter_map(|turn| turn.server_anchor.clone())
+            .collect();
         let relevant = unfinished.into_iter().map(|turn| turn.session_id).collect();
         let mut reconciled = Reconciled::for_sessions(relevant, every);
+        reconciled.linked = linked;
         let mut after = None;
         loop {
             // At expiry paging stops: the unread rest of the inventory leaves
@@ -540,6 +546,8 @@ impl Engine {
     /// not prove, holds a connection slot until a later Host absence proof
     /// drops its token. Past the pool the groups share the permits held, so
     /// no new child starts until cleanup proves room.
+    /// A server-owned group holds one by its server owner, never a
+    /// session's (x.3.2 X0 item 6.1).
     fn hold_unproven(&self, owners: &[AnchorOwner], reports: &[AnchorRecovery]) {
         for owner in owners {
             let proved = reports.iter().any(|report| {
@@ -549,7 +557,7 @@ impl Engine {
                 let token = self.recovered.hold(&self.slots);
                 self.adapter.hold_capacity(
                     owner.anchor_id.clone(),
-                    owner.session_id.clone(),
+                    owner.owner.clone(),
                     Box::new(token),
                 );
             }
@@ -575,8 +583,9 @@ impl Engine {
             turn,
             submitted_at,
             correlation,
-            effective: _,
             instance,
+            server_anchor,
+            ..
         } = unfinished;
         let History {
             last_seq,
@@ -601,18 +610,10 @@ impl Engine {
         let accepted = recovered_acceptance(correlation, started);
         // Recovery runs before admission: this turn's writes are the session's only ones.
         let head = Head::new(Some(last_seq + 1));
-        let mut record = TurnRecord {
-            session: session.clone(),
-            turn,
-            head: std::sync::Arc::clone(&head),
-            accepted,
-            first_failure: None,
-            uncertain: None,
-            steps: super::progress::StepTracker::default(),
-            vendor: super::lane::VendorRecord::default(),
-        };
+        let mut record = recovered_record((&session, turn), &head, accepted);
+        let linked = (reconciled, server_anchor.as_deref());
         let cancel = self
-            .settle_recovered(&mut record, reconciled, requested_at, settled)
+            .settle_recovered(&mut record, linked, requested_at, settled)
             .await?;
         let head = head
             .lock(&self.store, &session)
@@ -621,6 +622,7 @@ impl Engine {
         let seq = head.next();
         let ended_at = rfc3339(SystemTime::now());
         let terminal = recovered_terminal(cancel.clone());
+        let link_released = terminal.quiescent;
         let event = Event {
             seq,
             session_id: &session,
@@ -666,6 +668,7 @@ impl Engine {
                 envelope,
                 event,
                 steps: Vec::new(),
+                link_released,
             },
             None,
         )
@@ -689,28 +692,36 @@ impl Engine {
     /// (design §9); otherwise recovery commits it. A durable `cancel.settled`
     /// (`settled`, from a live settlement or an earlier recovery whose
     /// terminal did not commit) is likewise the turn's one settlement: the
-    /// terminal cites it and nothing new is committed.
+    /// terminal cites it and nothing new is committed. A turn linked to a
+    /// server anchor (`server_anchor`) has its cleanup from that anchor's
+    /// facts; with a settlement, the meet (x.3.2 X0 item 6.2): `quiescent`
+    /// only when the settlement says so and the anchor's absence is
+    /// proved.
     async fn settle_recovered(
         &self,
         record: &mut TurnRecord,
-        reconciled: &Reconciled,
+        (reconciled, server_anchor): (&Reconciled, Option<&str>),
         requested: Option<String>,
         settled: Option<DurableSettlement>,
     ) -> Result<Cancel, ApiError> {
+        let (quiescent, forced) = reconciled.cleanup(&record.session, record.turn, server_anchor);
         if let Some(settled) = settled {
             if record.first_failure.is_some() {
                 return Err(ApiError::STORE);
             }
             // A settlement is only ever committed after its request.
             let requested_at = requested.ok_or(ApiError::STORE)?;
+            let cleanup = match server_anchor {
+                Some(_) if !quiescent => "uncertain",
+                Some(_) | None => settled.cleanup,
+            };
             return Ok(Cancel {
                 outcome: settled.outcome,
-                cleanup: settled.cleanup,
+                cleanup,
                 requested_at,
                 settled_at: settled.at,
             });
         }
-        let (quiescent, forced) = reconciled.cleanup(&record.session, record.turn);
         let (outcome, cleanup) = stop_outcome(quiescent, forced, false);
         let requested_at = if let Some(at) = requested {
             at
@@ -791,6 +802,24 @@ impl Engine {
     }
 }
 
+/// A recovered turn's record at `head`, the session's only writer.
+fn recovered_record(
+    (session, turn): (&SessionId, TurnNumber),
+    head: &std::sync::Arc<Head>,
+    accepted: Option<Accepted>,
+) -> TurnRecord {
+    TurnRecord {
+        session: session.clone(),
+        turn,
+        head: std::sync::Arc::clone(head),
+        accepted,
+        first_failure: None,
+        uncertain: None,
+        steps: super::progress::StepTracker::default(),
+        vendor: super::lane::VendorRecord::default(),
+    }
+}
+
 /// A recovered turn's terminal: `unknown` with Core's restart class and the
 /// recovery settlement.
 fn recovered_terminal(cancel: Cancel) -> Terminal {
@@ -809,6 +838,7 @@ fn recovered_terminal(cancel: Cancel) -> Terminal {
         final_text_file: None,
         exit: None,
         warnings: Vec::new(),
+        quiescent: cancel.cleanup == "quiescent",
         cancel: Some(cancel),
     }
 }
@@ -900,6 +930,13 @@ impl DurableSettlement {
 struct Reconciled {
     /// `(quiescent, forced)` per running owning turn of a committed anchor.
     turns: HashMap<(SessionId, TurnNumber), (bool, bool)>,
+    /// The server anchors the unfinished turns' links name (x.3.2 X0 item
+    /// 6.1).
+    linked: HashSet<String>,
+    /// Whether each [`Self::linked`] anchor Host reported is quiescent.
+    /// Its force is the server's: C2 lets server-anchor facts reach turns
+    /// only as cleanup.
+    servers: HashMap<String, bool>,
     /// Host's reports for every committed anchor of each session with an
     /// unfinished turn, one an earlier, ended turn owns included: the facts
     /// its adapter recovery is given (C2 §2 Recover, Sol r2 #7). At most
@@ -941,18 +978,29 @@ impl Reconciled {
 
     /// Folds one inventory page and Host's reports for the same id range.
     fn add(&mut self, owners: &[AnchorOwner], reports: &[AnchorRecovery]) {
-        for owner in owners {
+        for anchor in owners {
+            let (session_id, turn) = match &anchor.owner {
+                via_store::ProcessOwner::Turn { session_id, turn } => (session_id, turn),
+                via_store::ProcessOwner::Server { .. } => {
+                    self.add_server(anchor, reports);
+                    continue;
+                }
+            };
+            let owner = TurnOwner {
+                anchor_id: &anchor.anchor_id,
+                session_id,
+                turn: *turn,
+                turn_running: anchor.turn_running,
+            };
             let report = reports.iter().find(|report| {
-                report.anchor_id == owner.anchor_id
-                    && report.session_id == owner.session_id
-                    && report.turn == owner.turn
+                report.anchor_id == *owner.anchor_id && report.owner == anchor.owner
             });
             if report.is_none() {
                 self.missing += 1;
             }
             // Critical r1 #9: only a session recovery asks about keeps its
             // facts, within the cap; past it the session's are incomplete.
-            if self.relevant.contains(&owner.session_id) {
+            if self.relevant.contains(owner.session_id) {
                 match report {
                     Some(report) if self.kept < RECOVERY_FACTS => {
                         self.kept += 1;
@@ -960,10 +1008,9 @@ impl Reconciled {
                             .entry(owner.session_id.clone())
                             .or_default()
                             .push(AnchorRecovery {
-                                session_id: report.session_id.clone(),
                                 anchor_id: report.anchor_id.clone(),
                                 generation: report.generation.clone(),
-                                turn: report.turn,
+                                owner: report.owner.clone(),
                                 cleanup: report.cleanup,
                                 forced: report.forced,
                             });
@@ -990,6 +1037,23 @@ impl Reconciled {
         }
     }
 
+    /// Folds a server-owned anchor (x.3.2 X0 item 6.1): its cleanup is kept
+    /// only when a link of an unfinished turn names it, and its force never
+    /// (C2: server-anchor facts reach turns only as cleanup). No session's
+    /// facts are fabricated from it.
+    fn add_server(&mut self, anchor: &AnchorOwner, reports: &[AnchorRecovery]) {
+        let report = reports
+            .iter()
+            .find(|report| report.anchor_id == anchor.anchor_id && report.owner == anchor.owner);
+        if report.is_none() {
+            self.missing += 1;
+        }
+        if self.linked.contains(&anchor.anchor_id) {
+            let quiescent = report.is_some_and(|report| report.cleanup == Cleanup::Quiescent);
+            self.servers.insert(anchor.anchor_id.clone(), quiescent);
+        }
+    }
+
     /// Host's reports for every committed anchor of `session` (C2 §2
     /// Recover), and whether they are complete: the whole inventory was
     /// read, `session` was among those whose facts were kept, and every
@@ -1003,17 +1067,36 @@ impl Reconciled {
         )
     }
 
-    /// `(quiescent, forced)` for a turn. With a complete inventory and no
-    /// committed anchor intent no process could exist, so nothing needs
-    /// cleaning; an incomplete inventory proves nothing for any turn.
-    fn cleanup(&self, session: &SessionId, turn: TurnNumber) -> (bool, bool) {
-        let (quiescent, forced) = self
-            .turns
-            .get(&(session.clone(), turn))
-            .copied()
-            .unwrap_or((true, false));
+    /// `(quiescent, forced)` for a turn. A turn linked to `server_anchor`
+    /// has that anchor's cleanup, none reported proving nothing, and is
+    /// never forced by it (x.3.2 X0 item 6.1). Otherwise, with a complete
+    /// inventory and no committed anchor intent no process could exist, so
+    /// nothing needs cleaning. An incomplete inventory proves nothing for
+    /// any turn.
+    fn cleanup(
+        &self,
+        session: &SessionId,
+        turn: TurnNumber,
+        server_anchor: Option<&str>,
+    ) -> (bool, bool) {
+        let (quiescent, forced) = match server_anchor {
+            Some(anchor) => (self.servers.get(anchor).copied().unwrap_or(false), false),
+            None => self
+                .turns
+                .get(&(session.clone(), turn))
+                .copied()
+                .unwrap_or((true, false)),
+        };
         (quiescent && !self.incomplete, forced)
     }
+}
+
+/// A turn-owned anchor of the inventory.
+struct TurnOwner<'a> {
+    anchor_id: &'a String,
+    session_id: &'a SessionId,
+    turn: TurnNumber,
+    turn_running: bool,
 }
 
 /// An adapter's recovery answer on facts that are `complete` or not:
@@ -1090,8 +1173,10 @@ mod tests {
     ) -> AnchorOwner {
         AnchorOwner {
             anchor_id: anchor_id.to_owned(),
-            session_id: session.clone(),
-            turn: TurnNumber::try_from(1).expect("turn"),
+            owner: via_store::ProcessOwner::Turn {
+                session_id: session.clone(),
+                turn: TurnNumber::try_from(1).expect("turn"),
+            },
             turn_running,
             phase,
         }
@@ -1099,10 +1184,12 @@ mod tests {
 
     fn report(anchor_id: &str, session: &SessionId, cleanup: Cleanup) -> AnchorRecovery {
         AnchorRecovery {
-            session_id: session.clone(),
             anchor_id: anchor_id.to_owned(),
             generation: "g".to_owned(),
-            turn: TurnNumber::try_from(1).expect("turn"),
+            owner: via_store::ProcessOwner::Turn {
+                session_id: session.clone(),
+                turn: TurnNumber::try_from(1).expect("turn"),
+            },
             cleanup,
             forced: false,
         }
@@ -1118,7 +1205,7 @@ mod tests {
             &[report("a1", &session, Cleanup::Quiescent)],
         );
         assert_eq!(reconciled.missing, 1);
-        assert_eq!(reconciled.cleanup(&session, turn), (false, false));
+        assert_eq!(reconciled.cleanup(&session, turn, None), (false, false));
     }
 
     #[test]
@@ -1132,7 +1219,7 @@ mod tests {
         );
         reconciled.add(&[owner("a2", &session, true)], &[]);
         assert_eq!(reconciled.missing, 1);
-        assert_eq!(reconciled.cleanup(&session, turn), (false, false));
+        assert_eq!(reconciled.cleanup(&session, turn, None), (false, false));
     }
 
     #[test]
@@ -1146,8 +1233,8 @@ mod tests {
             &[report("a1", &session, Cleanup::Quiescent)],
         );
         reconciled.incomplete = true;
-        assert_eq!(reconciled.cleanup(&session, turn), (false, false));
-        assert_eq!(reconciled.cleanup(&unseen, turn), (false, false));
+        assert_eq!(reconciled.cleanup(&session, turn, None), (false, false));
+        assert_eq!(reconciled.cleanup(&unseen, turn, None), (false, false));
     }
 
     #[test]
@@ -1170,8 +1257,8 @@ mod tests {
             ],
         );
         assert_eq!(reconciled.missing, 0);
-        assert_eq!(reconciled.cleanup(&session, turn), (false, false));
-        assert_eq!(reconciled.cleanup(&other, turn), (true, false));
+        assert_eq!(reconciled.cleanup(&session, turn, None), (false, false));
+        assert_eq!(reconciled.cleanup(&other, turn, None), (true, false));
         assert_eq!(reconciled.turns.len(), 2);
     }
 
@@ -1285,5 +1372,39 @@ mod tests {
         // A list that may have missed sessions proves nothing for them.
         let partial = Reconciled::for_sessions(std::iter::once(session.clone()).collect(), false);
         assert!(!partial.session_facts(&historical).1);
+    }
+
+    /// x.3.2 X0 item 6.1 (C2: server-anchor facts reach turns only as
+    /// cleanup): recovery's stop found a linked server live (`forced`,
+    /// Host's `stopped_live: true`) and proved its group gone. The linked
+    /// turn's cleanup is `quiescent`, but the force is the server's, never
+    /// the turn's: no `cancel.outcome: forced`.
+    #[test]
+    fn a_server_force_never_reaches_its_linked_turns() {
+        let session = SessionId::try_from("s_000000000000").expect("session");
+        let turn = TurnNumber::try_from(1).expect("turn");
+        let mut reconciled = relevant(&[&session]);
+        reconciled.linked.insert("0-server".to_owned());
+        let server = via_store::ProcessOwner::Server {
+            server_id: via_store::ServerId::try_from("v_000000000001").expect("server"),
+        };
+        let anchor = AnchorOwner {
+            owner: server.clone(),
+            ..owner("0-server", &session, false)
+        };
+        let stopped = AnchorRecovery {
+            owner: server,
+            forced: true,
+            ..report("0-server", &session, Cleanup::Quiescent)
+        };
+        reconciled.add(&[anchor], &[stopped]);
+        assert_eq!(
+            reconciled.cleanup(&session, turn, Some("0-server")),
+            (true, false)
+        );
+        assert_eq!(
+            super::stop_outcome(true, false, false),
+            ("requested", "quiescent")
+        );
     }
 }

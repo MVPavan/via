@@ -72,6 +72,7 @@ fn planner(config: AdapterConfig) -> Planner {
         RuntimeConfig {
             anchor_binary: dir.path().join("anchor"),
             anchor_dir: dir.path().join("runtime"),
+            vendor_state_dir: dir.path().join("vendor"),
         },
         store.runtime_resources(),
     )

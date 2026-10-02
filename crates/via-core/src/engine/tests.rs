@@ -293,6 +293,7 @@ async fn end_turn(engine: &Engine, session: &SessionId, n: u32, state: Option<&s
                     },
                 ),
                 steps: Vec::new(),
+                link_released: false,
             })
             .await
             .unwrap();
@@ -1535,8 +1536,10 @@ async fn closing_with_anchors(root: &Path, provable: bool, count: usize) -> Sess
             generation: generation.clone(),
             marker: "marker".to_owned(),
             socket_path: root.join(format!("runtime/anchors/{n}.sock")),
-            owner_session: session.clone(),
-            owner_turn: turn(1),
+            owner: via_store::ProcessOwner::Turn {
+                session_id: session.clone(),
+                turn: turn(1),
+            },
             uid,
             boot_id: boot_id.clone(),
             pid_namespace: pid_namespace.clone(),
@@ -1577,9 +1580,14 @@ fn a_failed_proof_write_fails_the_restart_close_before_closed() {
     run(async {
         let session = closing_with_anchor(&root, true).await;
         let engine = open(&root);
-        engine
-            .adapter
-            .hold_capacity("0-anchor".to_owned(), session.clone(), Box::new(()));
+        engine.adapter.hold_capacity(
+            "0-anchor".to_owned(),
+            via_store::ProcessOwner::Turn {
+                session_id: session.clone(),
+                turn: via_store::TurnNumber::try_from(1).expect("turn"),
+            },
+            Box::new(()),
+        );
         let refused = engine.hand_off_queued().await.unwrap_err();
         assert!(refused.starts_with("store_error:"), "{refused}");
         assert!(acked(&points, "store.journal.absence", 1));
@@ -1611,9 +1619,14 @@ fn an_uncertain_proof_write_fails_the_restart_close_before_closed() {
         // Declared after the Engine, so it drops first: Store's writer is
         // released before the Engine joins it.
         let release = Release(points.join("store.journal.absence.1.release"));
-        engine
-            .adapter
-            .hold_capacity("0-anchor".to_owned(), session.clone(), Box::new(()));
+        engine.adapter.hold_capacity(
+            "0-anchor".to_owned(),
+            via_store::ProcessOwner::Turn {
+                session_id: session.clone(),
+                turn: via_store::TurnNumber::try_from(1).expect("turn"),
+            },
+            Box::new(()),
+        );
         // Store's writer stays paused: a `Closed` commit would wait on it.
         let refused = tokio::time::timeout(Duration::from_secs(10), engine.hand_off_queued())
             .await
@@ -1660,9 +1673,14 @@ fn a_failed_proof_before_a_page_read_failure_fails_the_restart_close() {
         // released before the Engine joins it.
         let release = Release(points.join(format!("{proof}.1.release")));
         for n in 0..anchors {
-            engine
-                .adapter
-                .hold_capacity(anchor_id(n), session.clone(), Box::new(()));
+            engine.adapter.hold_capacity(
+                anchor_id(n),
+                via_store::ProcessOwner::Turn {
+                    session_id: session.clone(),
+                    turn: via_store::TurnNumber::try_from(1).expect("turn"),
+                },
+                Box::new(()),
+            );
         }
         let (refused, read_hit) = tokio::join!(
             async {
@@ -1716,9 +1734,14 @@ fn an_unprovable_group_leaves_the_restart_close_cleanup_uncertain() {
     run(async {
         let session = closing_with_anchor(&root, false).await;
         let engine = open(&root);
-        engine
-            .adapter
-            .hold_capacity("0-anchor".to_owned(), session.clone(), Box::new(()));
+        engine.adapter.hold_capacity(
+            "0-anchor".to_owned(),
+            via_store::ProcessOwner::Turn {
+                session_id: session.clone(),
+                turn: via_store::TurnNumber::try_from(1).expect("turn"),
+            },
+            Box::new(()),
+        );
         let handoff = engine.hand_off_queued().await.unwrap();
         assert_eq!((handoff.cancelled, handoff.closed), (1, 1), "{handoff:?}");
         assert_eq!(
@@ -1994,16 +2017,26 @@ fn an_added_holding_resets_the_reprobe_backoff() {
         let engine = open(&root);
         let session = new_session(&engine).await;
         let passes = || engine.faults.reprobe_passes.load(Ordering::Acquire);
-        engine
-            .adapter
-            .hold_capacity("0-held".to_owned(), session.clone(), Box::new(()));
+        engine.adapter.hold_capacity(
+            "0-held".to_owned(),
+            via_store::ProcessOwner::Turn {
+                session_id: session.clone(),
+                turn: via_store::TurnNumber::try_from(1).expect("turn"),
+            },
+            Box::new(()),
+        );
         let stop = force();
         let ((), ()) = tokio::join!(engine.reprobe(), async {
             // During the third pass or the 8 s wait after it.
             until(|| passes() == 3).await;
-            engine
-                .adapter
-                .hold_capacity("1-held".to_owned(), session.clone(), Box::new(()));
+            engine.adapter.hold_capacity(
+                "1-held".to_owned(),
+                via_store::ProcessOwner::Turn {
+                    session_id: session.clone(),
+                    turn: via_store::TurnNumber::try_from(1).expect("turn"),
+                },
+                Box::new(()),
+            );
             let added = tokio::time::Instant::now();
             let reset = tokio::time::timeout(Duration::from_millis(2_500), async {
                 while passes() < 4 {
@@ -2206,6 +2239,7 @@ fn a_corrupt_head_read_before_a_terminal_latches() {
             exit: None,
             warnings: Vec::new(),
             cancel: None,
+            quiescent: false,
         };
         let finished = engine.finish(&started, record, terminal, false, None).await;
         assert_eq!(finished.unwrap_err().kind, "store_error");
@@ -2428,6 +2462,7 @@ fn store_terminal() -> super::Terminal {
         exit: None,
         warnings: Vec::new(),
         cancel: None,
+        quiescent: false,
     }
 }
 
@@ -3205,6 +3240,7 @@ async fn end_unknown(
                     },
                 ),
                 steps: Vec::new(),
+                link_released: false,
             },
             via_store::TerminalExtras {
                 cancel_cause: cause,
@@ -7880,5 +7916,656 @@ fn core_fills_param_sizes_on_spawn_and_resume() {
             let seen = engine.adapter.param_sizes_seen();
             assert_eq!(seen.get(before), Some(&expected), "{extra}: {seen:?}");
         }
+    });
+}
+
+/// x.3.2 X0 item 0: every connection slot, held by the test.
+#[cfg(feature = "test-failpoints")]
+fn hold_slots(engine: &Engine) -> tokio::sync::OwnedSemaphorePermit {
+    let available = u32::try_from(engine.slots.available_permits()).unwrap();
+    std::sync::Arc::clone(&engine.slots)
+        .try_acquire_many_owned(available)
+        .unwrap()
+}
+
+/// Runs the session's dispatcher for up to 5 s: whether it returned with
+/// turn `n` submitted.
+#[cfg(feature = "test-failpoints")]
+async fn dispatched(engine: &Engine, session: &SessionId, n: u32) -> bool {
+    let returned =
+        tokio::time::timeout(Duration::from_secs(5), engine.dispatcher(session.clone())).await;
+    if returned.is_err() {
+        return false;
+    }
+    let result = engine
+        .result(&format!("{}/{n}", session.as_str()))
+        .await
+        .unwrap();
+    let result: Value = serde_json::from_str(result.get()).unwrap();
+    !result["timestamps"]["submitted_at"].is_null()
+}
+
+/// x.3.2 X0 item 0 (C2 §3 connection admission): a session with no lane
+/// opens its driver before admission, so a `Pinned` answer, as an
+/// equal-key server another session started, needs no slot: the turn
+/// dispatches while every slot is held. The stand-in's pin names no live
+/// connection, so the fake refuses it, launching nothing.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn pinned_join_needs_no_slot() {
+    let Some(root) = child("pinned_join_needs_no_slot") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        engine.adapter.stand_in().pin();
+        let slots = hold_slots(&engine);
+        let session = new_session(&engine).await;
+        assert!(
+            dispatched(&engine, &session, 1).await,
+            "a pinned turn waited for a slot"
+        );
+        drop(slots);
+        let report = shutdown(&engine).await;
+        assert_eq!(report.anchors, 0, "nothing launched: {report:?}");
+    });
+}
+
+/// x.3.2 X0 item 0: a turn waiting for a slot keeps its driver's
+/// readiness receiver; a change re-prepares it, and `Pinned` ends the
+/// wait with no slot.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn queued_turn_reprepares_on_readiness() {
+    let Some(root) = child("queued_turn_reprepares_on_readiness") else {
+        return;
+    };
+    let point = "core.dispatch.awaiting_slot";
+    let dir = count_points(&root, &[point]);
+    run(async {
+        let engine = open(&root);
+        let stand_in = engine.adapter.stand_in();
+        let slots = hold_slots(&engine);
+        let session = new_session(&engine).await;
+        let (submitted, ()) = tokio::join!(dispatched(&engine, &session, 1), async {
+            until(|| dir.join(format!("{point}.1.refused")).exists()).await;
+            stand_in.pin();
+            stand_in.bump();
+        });
+        assert!(submitted, "the waiting turn was not re-prepared");
+        drop(slots);
+        let report = shutdown(&engine).await;
+        assert_eq!(report.anchors, 0, "nothing launched: {report:?}");
+    });
+}
+
+/// x.3.2 X0 item 0: the receiver is taken before the first `prepare()`,
+/// so a server published between that `prepare()` and the slot wait's
+/// registration (the test hook) is seen: with every slot held the turn
+/// dispatches `Pinned`.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn readiness_insert_between_prepare_and_wait() {
+    let Some(root) = child("readiness_insert_between_prepare_and_wait") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let stand_in = engine.adapter.stand_in();
+        let slots = hold_slots(&engine);
+        let session = new_session(&engine).await;
+        engine
+            .faults
+            .hold_after_prepare
+            .store(true, Ordering::Release);
+        let (submitted, ()) = tokio::join!(dispatched(&engine, &session, 1), async {
+            engine.faults.granted.notified().await;
+            stand_in.pin();
+            stand_in.bump();
+            engine.faults.release.notify_one();
+        });
+        assert!(submitted, "the publication before the wait was missed");
+        drop(slots);
+        let report = shutdown(&engine).await;
+        assert_eq!(report.anchors, 0, "nothing launched: {report:?}");
+    });
+}
+
+/// x.3.2 X0 item 0: a lane opened before admission for a turn that is
+/// then not submitted (here force refuses its grant) is retired before
+/// the dispatch returns; its driver did no vendor I/O, and the queued-only
+/// session still closes.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn unsubmitted_lane_is_retired() {
+    let Some(root) = child("unsubmitted_lane_is_retired") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        engine
+            .faults
+            .hold_before_grant
+            .store(true, Ordering::Release);
+        let ((), ()) = tokio::join!(dispatch(&engine, &session), async {
+            engine.faults.grant_paused.notified().await;
+            engine.request_stop(&force()).await.unwrap();
+            engine.faults.grant_release.notify_one();
+        });
+        assert_eq!(
+            engine.faults.lanes_opened.load(Ordering::Acquire),
+            1,
+            "the lane opened before admission"
+        );
+        assert_eq!(engine.lane_census().1, 0, "the unsubmitted lane is live");
+        assert_eq!(
+            event_types(&engine, &session).await,
+            ["turn.queued", "turn.ended", "session.closed"]
+        );
+        let report = shutdown(&engine).await;
+        assert!(report.is_clean(), "{report:?}");
+    });
+}
+
+/// x.3.2 X0 item 6: the server ID of [`server_anchor`]'s anchors.
+const SERVER: &str = "v_000000000001";
+
+fn server_owner() -> via_store::ProcessOwner {
+    via_store::ProcessOwner::Server {
+        server_id: via_store::ServerId::try_from(SERVER).unwrap(),
+    }
+}
+
+/// Commits `owner`'s anchor `id` through `journal`, `identified`: in this
+/// boot and namespace with a group id above any `pid_max` when `provable`,
+/// so a probe proves it absent; otherwise of another boot, which no probe
+/// proves.
+async fn identified_anchor(
+    journal: &via_store::ProcessJournal,
+    root: &Path,
+    (id, owner): (&str, via_store::ProcessOwner),
+    provable: bool,
+) {
+    use std::os::unix::fs::MetadataExt;
+    let (boot_id, pid_namespace) = if provable {
+        (
+            fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .unwrap()
+                .trim()
+                .to_owned(),
+            fs::read_link("/proc/self/ns/pid")
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        )
+    } else {
+        ("another-boot".to_owned(), "another-namespace".to_owned())
+    };
+    let uid = fs::metadata("/proc/self").unwrap().uid();
+    let generation = format!("g-{id}");
+    let intent = via_store::AnchorIntent {
+        anchor_id: id.to_owned(),
+        generation: generation.clone(),
+        marker: "marker".to_owned(),
+        socket_path: root.join(format!("runtime/anchors/{id}.sock")),
+        owner,
+        uid,
+        boot_id: boot_id.clone(),
+        pid_namespace: pid_namespace.clone(),
+    };
+    let via_store::CommitOutcome::Committed(receipt) = journal.commit_anchor_intent(intent).await
+    else {
+        panic!("the anchor intent did not commit");
+    };
+    let identity = via_store::AnchorIdentity {
+        pid: 4_194_305,
+        pgid: 4_194_305,
+        uid,
+        boot_id,
+        pid_namespace,
+        start_ticks: 1,
+        marker: "marker".to_owned(),
+    };
+    let identified = journal
+        .commit_anchor_identified(id, &generation, receipt.record_version, identity)
+        .await;
+    assert!(matches!(identified, via_store::CommitOutcome::Committed(_)));
+}
+
+/// x.3.2 X0 item 6: through a second Store handle, a server anchor `id`
+/// ([`identified_anchor`]), and each of `links`, a running turn, linked to
+/// it (runtime §6 `server_turns`).
+async fn server_anchor(root: &Path, id: &str, provable: bool, links: &[(&SessionId, u32)]) {
+    let store = via_store::Store::open(&root.join("state")).unwrap();
+    let (_evidence, journal) = store.runtime_resources().into_wire_parts();
+    identified_anchor(&journal, root, (id, server_owner()), provable).await;
+    for (session, n) in links {
+        let linked = journal.commit_server_turn(id, session, turn(*n)).await;
+        assert!(
+            matches!(linked, via_store::CommitOutcome::Committed(())),
+            "the link did not commit"
+        );
+    }
+}
+
+/// x.3.2 X0 item 6: the links of `turns` that remain.
+async fn links_of(root: &Path, turns: &[(&SessionId, u32)]) -> usize {
+    let store = via_store::Store::open(&root.join("state")).unwrap();
+    let (_evidence, journal) = store.runtime_resources().into_wire_parts();
+    let turns = turns
+        .iter()
+        .map(|(session, n)| ((*session).clone(), turn(*n)))
+        .collect();
+    journal.server_links(turns).await.unwrap().len()
+}
+
+/// An earlier daemon's session whose turn 1 is submitted (running), and,
+/// with `settled`, has a durable `cancel.requested` and `cancel.settled`
+/// (`requested`, `quiescent`) and no terminal.
+async fn running_turn_one(root: &Path, settled: bool) -> SessionId {
+    let earlier = open(root);
+    let session = new_session(&earlier).await;
+    end_turn_one(&earlier, &session, None).await;
+    if settled {
+        let at = rfc3339(std::time::SystemTime::now());
+        for (seq, body) in [
+            (3, EventBody::CancelRequested {}),
+            (
+                4,
+                EventBody::CancelSettled {
+                    outcome: "requested",
+                    cleanup: "quiescent",
+                },
+            ),
+        ] {
+            let event = Event {
+                seq,
+                session_id: &session,
+                turn: Some(1),
+                late: false,
+                at: &at,
+                body,
+            }
+            .to_value()
+            .unwrap();
+            earlier
+                .store
+                .commit_event(via_store::EventRecord {
+                    session_id: session.clone(),
+                    turn: turn(1),
+                    event,
+                })
+                .await
+                .unwrap();
+        }
+    }
+    session
+}
+
+/// The stored envelope of `session`'s turn 1.
+async fn envelope_one(engine: &Engine, session: &SessionId) -> Value {
+    let envelope = engine.result(&format!("{session}/1")).await.unwrap();
+    serde_json::from_str(envelope.get()).unwrap()
+}
+
+/// x.3.2 X0 item 6.1: a recovered turn linked to a server anchor Host
+/// proves absent ends `unknown` with `quiescent` cleanup from that
+/// anchor's facts, and its terminal's commit releases the link (item 6.5);
+/// the proved group holds no slot.
+#[test]
+fn recovery_server_anchor_proved_absent() {
+    let Some(root) = child("recovery_server_anchor_proved_absent") else {
+        return;
+    };
+    run(async {
+        let session = running_turn_one(&root, false).await;
+        server_anchor(&root, "0-server", true, &[(&session, 1)]).await;
+        let engine = open(&root);
+        assert_eq!(engine.recover().await.unwrap(), 1);
+        let envelope = envelope_one(&engine, &session).await;
+        assert_eq!(envelope["state"], "unknown", "{envelope}");
+        assert_eq!(envelope["cancel"]["cleanup"], "quiescent", "{envelope}");
+        assert_eq!(engine.adapter.held_unproven(), 0);
+        drop(engine);
+        assert_eq!(links_of(&root, &[(&session, 1)]).await, 0, "the link stays");
+    });
+}
+
+/// x.3.2 X0 item 6.1: the linked server anchor's absence is not proved:
+/// the turn's cleanup is `uncertain`, its link stays, and the group holds
+/// a slot by its server owner, never a session's.
+#[test]
+fn recovery_server_anchor_unproven() {
+    let Some(root) = child("recovery_server_anchor_unproven") else {
+        return;
+    };
+    run(async {
+        let session = running_turn_one(&root, false).await;
+        server_anchor(&root, "0-server", false, &[(&session, 1)]).await;
+        let engine = open(&root);
+        assert_eq!(engine.recover().await.unwrap(), 1);
+        let envelope = envelope_one(&engine, &session).await;
+        assert_eq!(envelope["state"], "unknown", "{envelope}");
+        assert_eq!(envelope["cancel"]["outcome"], "requested", "{envelope}");
+        assert_eq!(envelope["cancel"]["cleanup"], "uncertain", "{envelope}");
+        assert_eq!(
+            engine.adapter.held_unproven(),
+            1,
+            "the server holds no slot"
+        );
+        drop(engine);
+        assert_eq!(links_of(&root, &[(&session, 1)]).await, 1, "the link went");
+    });
+}
+
+/// x.3.2 X0 item 6.1: a server-route turn with no link sent nothing: an
+/// unproven server anchor is never attributed to it, so its cleanup is
+/// today's rule (`quiescent`, no own anchor), while the server group
+/// still holds its slot.
+#[test]
+fn recovery_unlinked_server_turn_sent_nothing() {
+    let Some(root) = child("recovery_unlinked_server_turn_sent_nothing") else {
+        return;
+    };
+    run(async {
+        let session = running_turn_one(&root, false).await;
+        server_anchor(&root, "0-server", false, &[]).await;
+        let engine = open(&root);
+        assert_eq!(engine.recover().await.unwrap(), 1);
+        let envelope = envelope_one(&engine, &session).await;
+        assert_eq!(envelope["cancel"]["cleanup"], "quiescent", "{envelope}");
+        assert_eq!(
+            engine.adapter.held_unproven(),
+            1,
+            "the server holds no slot"
+        );
+    });
+}
+
+/// x.3.2 X0 item 6.2: a linked turn's durable settlement (`quiescent`)
+/// without its terminal: the recovered terminal's cleanup is the meet with
+/// the linked anchor's absence, here unproven, so `uncertain`; the
+/// settlement stays the turn's one, and its link stays.
+#[test]
+fn recovery_partial_settlement_rechecks_server_anchor() {
+    let Some(root) = child("recovery_partial_settlement_rechecks_server_anchor") else {
+        return;
+    };
+    run(async {
+        let session = running_turn_one(&root, true).await;
+        server_anchor(&root, "0-server", false, &[(&session, 1)]).await;
+        let engine = open(&root);
+        assert_eq!(engine.recover().await.unwrap(), 1);
+        let envelope = envelope_one(&engine, &session).await;
+        assert_eq!(envelope["cancel"]["outcome"], "requested", "{envelope}");
+        assert_eq!(envelope["cancel"]["cleanup"], "uncertain", "{envelope}");
+        assert_eq!(
+            event_types(&engine, &session).await,
+            [
+                "turn.queued",
+                "turn.submitted",
+                "cancel.requested",
+                "cancel.settled",
+                "turn.ended"
+            ]
+        );
+        drop(engine);
+        assert_eq!(links_of(&root, &[(&session, 1)]).await, 1, "the link went");
+    });
+}
+
+/// x.3.2 X0 item 6.1: a held server anchor's absence proof that did not
+/// commit is no session's: `store_failure` scope `daemon` with no address,
+/// no latch, and the token stays held until the next pass proves it.
+#[test]
+fn reprobe_ownerless_not_committed() {
+    let Some(root) = child("reprobe_ownerless_not_committed") else {
+        return;
+    };
+    let points = fail_first(&root, "store.journal.absence");
+    run(async {
+        server_anchor(&root, "0-server", true, &[]).await;
+        let engine = open(&root);
+        engine
+            .adapter
+            .hold_capacity("0-server".to_owned(), server_owner(), Box::new(()));
+        let stop = force();
+        let ((), ()) = tokio::join!(engine.reprobe(), async {
+            until(|| engine.store_failure_status().is_some()).await;
+            assert!(acked(&points, "store.journal.absence", 1));
+            let status = engine.store_failure_status().unwrap();
+            assert_eq!(status["scope"], "daemon", "{status}");
+            assert_eq!(status["affected"]["count"], 0, "{status}");
+            assert!(!engine.store_failed(), "a not-committed proof latched");
+            assert_eq!(engine.adapter.held_unproven(), 1, "the token went");
+            until(|| engine.adapter.held_unproven() == 0).await;
+            engine.request_stop(&stop).await.unwrap();
+        });
+    });
+}
+
+/// x.3.2 X0 item 6.5: close and status cleanup come from the session's own
+/// turns' links, never from the shared server's state: two sessions'
+/// turns linked to one unproven server anchor; the one whose terminal kept
+/// its link (cleanup not known quiescent) reads `uncertain`, the one whose
+/// terminal released it `quiescent`, and neither reads alive.
+#[test]
+fn shared_close_cleanup_from_turn_facts() {
+    let Some(root) = child("shared_close_cleanup_from_turn_facts") else {
+        return;
+    };
+    run(async {
+        let (kept, released) = {
+            let earlier = open(&root);
+            let kept = new_session(&earlier).await;
+            let released = new_session(&earlier).await;
+            end_turn_one(&earlier, &kept, None).await;
+            end_turn_one(&earlier, &released, None).await;
+            (kept, released)
+        };
+        server_anchor(&root, "0-server", false, &[(&kept, 1), (&released, 1)]).await;
+        {
+            let store = via_store::Store::open(&root.join("state")).unwrap();
+            for (session, link_released) in [(&kept, false), (&released, true)] {
+                let event = Event {
+                    seq: 3,
+                    session_id: session,
+                    turn: Some(1),
+                    late: false,
+                    at: &rfc3339(std::time::SystemTime::now()),
+                    body: EventBody::TurnEnded {
+                        state: "failed",
+                        failure: None,
+                        stop_reason: "error",
+                        cancel: None,
+                    },
+                }
+                .to_value()
+                .unwrap();
+                store
+                    .client()
+                    .commit_terminal(TerminalRecord {
+                        session_id: session.clone(),
+                        turn: turn(1),
+                        envelope: json!({"state":"failed","cancel":null}),
+                        event,
+                        steps: Vec::new(),
+                        link_released,
+                    })
+                    .await
+                    .unwrap();
+            }
+        }
+        let engine = open(&root);
+        engine.recover().await.unwrap();
+        engine.hand_off_queued().await.unwrap();
+        for (session, cleanup) in [(&kept, "uncertain"), (&released, "quiescent")] {
+            let params = serde_json::from_value(json!({"session": session})).unwrap();
+            let status = engine.status(params).await.unwrap();
+            assert_eq!(status["process"]["cleanup"], cleanup, "{status}");
+            assert_eq!(status["process"]["alive"], false, "{status}");
+            let (closed, ()) = tokio::join!(
+                close(&engine, session, None),
+                dispatch_closing(&engine, session)
+            );
+            let closed = closed.unwrap();
+            assert_eq!(closed["cleanup"], cleanup, "{closed}");
+        }
+    });
+}
+
+/// x.3.2 X0 item 6.1 (C1 §3.6 close): the close's absence check re-probes
+/// only the session's own groups; a held shared server group, unprovable,
+/// is never waited on, so the check ends at once and the close is
+/// `quiescent`.
+#[test]
+fn close_absence_check_ignores_server() {
+    let Some(root) = child("close_absence_check_ignores_server") else {
+        return;
+    };
+    run(async {
+        server_anchor(&root, "0-server", false, &[]).await;
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        engine
+            .adapter
+            .hold_capacity("0-server".to_owned(), server_owner(), Box::new(()));
+        let started = tokio::time::Instant::now();
+        let (closed, ()) = tokio::join!(
+            close(&engine, &session, None),
+            dispatch_closing(&engine, &session)
+        );
+        let closed = closed.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the check waited on the server: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(closed["cleanup"], "quiescent", "{closed}");
+        assert_eq!(engine.adapter.held_unproven(), 1);
+    });
+}
+
+/// x.3.2 X0 item 2.6: an uncertain Host journal write no driver owns (here
+/// a re-probe's absence proof Core did not ask for) latches Store failure
+/// through the adapter set's watch, subscribed at `watch_force`.
+#[test]
+fn daemon_journal_uncertainty_latches() {
+    let Some(root) = child("daemon_journal_uncertainty_latches") else {
+        return;
+    };
+    let dir = root.join("failpoints");
+    fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    for point in ["store.journal.absence", "store.rollback.fail"] {
+        let command = json!({"token":FAILPOINT_TOKEN,"occurrence":1,"action":"fail_io"});
+        fs::write(dir.join(format!("{point}.json")), command.to_string()).unwrap();
+    }
+    via_store::failpoint::activate(&dir, FAILPOINT_TOKEN).unwrap();
+    run(async {
+        server_anchor(&root, "0-server", true, &[]).await;
+        let engine = open(&root);
+        engine.watch_force();
+        engine
+            .adapter
+            .hold_capacity("0-server".to_owned(), server_owner(), Box::new(()));
+        let deadline = Deadline::at(tokio::time::Instant::now() + Duration::from_secs(3));
+        let pass = engine.adapter.reprobe_held(deadline, None).await;
+        assert!(pass.is_err(), "the proof was not uncertain: {pass:?}");
+        until(|| engine.store_failed()).await;
+        let status = engine.store_failure_status().unwrap();
+        assert_eq!(status["scope"], "daemon", "{status}");
+    });
+}
+
+/// x.3.2 X0 item 6.5: a terminal's record releases the turn's server link
+/// exactly when its cleanup is known `quiescent`; otherwise it keeps it.
+#[test]
+fn terminal_link_release_follows_its_cleanup() {
+    let session = SessionId::try_from("s_000000000001").unwrap();
+    for quiescent in [true, false] {
+        let mut terminal = store_terminal();
+        terminal.quiescent = quiescent;
+        let record = super::drive::ended_record(
+            &started_one(&session),
+            turn_one(&session, false),
+            terminal,
+            2,
+        )
+        .unwrap();
+        assert_eq!(record.link_released, quiescent);
+    }
+}
+
+/// x.3.2 X0 item 6.5 (X2 r1 #7): harness-free, the real chain from a
+/// `TurnEnd`'s cleanup to the link. Its evidence goes through disposition
+/// and the terminal record; the terminal's first commit is known not
+/// committed (`store.commit.terminal`), so the same-sequence retry's copy
+/// commits it. A `quiescent` turn's link is released with it; an
+/// `uncertain` one's stays.
+#[test]
+fn turn_end_cleanup_reaches_the_link_through_the_retry() {
+    let Some(root) = child("turn_end_cleanup_reaches_the_link_through_the_retry") else {
+        return;
+    };
+    let dir = root.join("failpoints");
+    fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    via_store::failpoint::activate(&dir, FAILPOINT_TOKEN).unwrap();
+    run(async {
+        let quiet = running_turn_one(&root, false).await;
+        let unsure = running_turn_one(&root, false).await;
+        server_anchor(&root, "0-server", false, &[(&quiet, 1), (&unsure, 1)]).await;
+        // Each terminal takes two hits: the failed first attempt, then the
+        // retry.
+        for (first, session, cleanup) in [
+            (1, &quiet, via_adapters::Cleanup::Quiescent),
+            (3, &unsure, via_adapters::Cleanup::Uncertain),
+        ] {
+            let store = via_store::Store::open(&root.join("state")).unwrap();
+            let client = store.client();
+            let evidence = via_adapters::TurnEvidence {
+                exit: None,
+                cleanup,
+                journal_uncertain: false,
+            };
+            let disposed = super::terminal::dispose(
+                false,
+                (None, Ok(evidence)),
+                None,
+                tokio::time::Instant::now(),
+            );
+            let seq = client.next_seq(session).await.unwrap().unwrap();
+            let record = super::drive::ended_record(
+                &started_one(session),
+                turn_one(session, false),
+                disposed.terminal,
+                seq,
+            )
+            .unwrap();
+            assert_eq!(
+                record.link_released,
+                cleanup == via_adapters::Cleanup::Quiescent
+            );
+            let command = json!({"token":FAILPOINT_TOKEN,"occurrence":first,"action":"fail_io"});
+            fs::write(dir.join("store.commit.terminal.json"), command.to_string()).unwrap();
+            let durable = super::journal::commit_terminal_with(
+                &client,
+                record,
+                None,
+                via_store::TerminalExtras::default(),
+                (true, None),
+            )
+            .await
+            .unwrap();
+            assert!(durable.retried, "the first attempt committed: {durable:?}");
+            assert!(
+                dir.join(format!("store.commit.terminal.{first}.ack"))
+                    .exists()
+            );
+            drop(client);
+            drop(store);
+        }
+        assert_eq!(links_of(&root, &[(&quiet, 1)]).await, 0, "the link stays");
+        assert_eq!(links_of(&root, &[(&unsure, 1)]).await, 1, "the link went");
     });
 }

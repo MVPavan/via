@@ -422,6 +422,7 @@ pub(super) async fn commit_submit_failed(
         exit: None,
         warnings: Vec::new(),
         cancel: None,
+        quiescent: false,
     };
     let event = |seq, body| {
         Event {
