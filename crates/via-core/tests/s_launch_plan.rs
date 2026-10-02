@@ -63,25 +63,39 @@ fn s_launch_plan_inherit_per_harness() {
         store.runtime_resources(),
     )
     .unwrap();
-    let describe = |harness: &str| DescribeRequest {
+    let describe = |harness: &str, model: Option<&str>| DescribeRequest {
         harness: Some(harness.to_owned()),
+        model: model.map(str::to_owned),
         ..DescribeRequest::default()
     };
     let od2 = InheritPlan {
         requested: Inherit::OD2_DEFAULT,
         effective: Inherit::OD2_DEFAULT,
     };
-    // Per harness: the plan's inherit, or the refusal. No vendor adapter
-    // plans before x.3.2: a configured vendor harness still refuses,
-    // starting nothing. Each adapter track flips its own row.
-    let rows: [(&str, Result<InheritPlan, RefusalKind>); 3] = [
-        ("claude", Err(RefusalKind::HarnessUnavailable)),
-        ("codex", Err(RefusalKind::HarnessUnavailable)),
-        ("fake", Ok(od2)),
+    // Codex (x.3.2 X1): `harnesses.codex.inherit` sets skills off, and
+    // only its hooks switch is verified (packet §4), so every other
+    // category is effectively `unknown`.
+    let inherit = |states: serde_json::Value| serde_json::from_value::<Inherit>(states).unwrap();
+    let codex = InheritPlan {
+        requested: inherit(
+            json!({"hooks": "off", "mcp_servers": "off", "plugins": "on",
+            "skills": "off", "agents": "on", "instruction_files": "on"}),
+        ),
+        effective: inherit(json!({"hooks": "off", "mcp_servers": "unknown",
+            "plugins": "unknown", "skills": "unknown", "agents": "unknown",
+            "instruction_files": "unknown"})),
+    };
+    // Per harness, with the model the request names: the plan's inherit,
+    // or the refusal. Nothing here runs a binary. Each adapter track flips
+    // its own row; Codex has no bundled catalog, so it plans a named model.
+    let rows: [(&str, Option<&str>, Result<InheritPlan, RefusalKind>); 3] = [
+        ("claude", None, Err(RefusalKind::HarnessUnavailable)),
+        ("codex", Some("gpt-6-sol"), Ok(codex)),
+        ("fake", None, Ok(od2)),
     ];
-    for (harness, expected) in rows {
+    for (harness, model, expected) in rows {
         let planned = set
-            .plan(&describe(harness))
+            .plan(&describe(harness, model))
             .map(|plan| plan.inherit)
             .map_err(|refusal| refusal.kind);
         assert_eq!(planned, expected, "{harness}");

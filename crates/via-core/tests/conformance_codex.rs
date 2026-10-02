@@ -3,9 +3,11 @@
 //!
 //! Each case pairs `<case>.replay.json` (the recorded `codex app-server`
 //! exchange, replayed by the fake agent) with `<case>.expect.json` (what the
-//! C2 driver must produce, in the unified expectation schema). The case
-//! tests are red by construction until the adapter slice `via-5lr.3.2`
-//! replaces [`drive`] and removes the `ignore`.
+//! C2 driver must produce, in the unified expectation schema). [`drive`]
+//! runs the pure half (describe, plan checks, each spawn's plan): the
+//! cases every spawn of which is refused before any vendor I/O are green;
+//! the rest are red until the adapter slice `via-5lr.3.2` lands the
+//! server driver and removes their `ignore`.
 //!
 //! A resumed thread is pinned literally: each `thread/resume` expects the
 //! case's `sessions.<label>.resume` as its `threadId`.
@@ -18,6 +20,8 @@
 //! re-probes of 2026-09-30). The synthetic untested case is `via-5lr.3.2`'s
 //! `codex_pin_handshake`.
 
+#[path = "support/conformance_drive.rs"]
+mod conformance_drive;
 #[path = "support/conformance_expect.rs"]
 mod conformance_expect;
 
@@ -38,12 +42,13 @@ fn fixtures() -> PathBuf {
 /// collects the outcome (see the checker's module docs for its obligations:
 /// `launches` from `<case>.launches`, the replay's end judged by
 /// [`conformance_expect::replay_exit`] for every launch, and the
-/// server's stdin close at an `await_eof` step).
-/// Replaced by `via-5lr.3.2`.
-fn drive(name: &str, _expect: &Value, _replay: &Path) -> Result<Outcome, String> {
-    Err(format!(
-        "adapter not implemented: {ADAPTER_BEAD} (case {name})"
-    ))
+/// server's stdin close at an `await_eof` step). The pure steps run
+/// through the shared [`conformance_drive::Pure`]; a case with a turn that
+/// plans needs the run half, which `via-5lr.3.2`'s later chunks add.
+fn drive(name: &str, expect: &Value, replay: &Path) -> Result<Outcome, String> {
+    conformance_drive::Pure::run("codex", name, expect, replay)?
+        .planned_only()
+        .map_err(|error| format!("adapter not implemented: {ADAPTER_BEAD} ({error})"))
 }
 
 fn check(name: &str) -> Result<(), String> {
@@ -54,16 +59,22 @@ fn check(name: &str) -> Result<(), String> {
 }
 
 macro_rules! cases {
-    ($($name:ident),* $(,)?) => {
+    (green: $($green:ident),* $(,)?; red: $($red:ident),* $(,)?) => {
         /// Every case with a test below.
-        const CASES: &[&str] = &[$(stringify!($name)),*];
+        const CASES: &[&str] = &[$(stringify!($green),)* $(stringify!($red)),*];
 
         mod conformance_codex_cases {
             $(
                 #[test]
+                fn $green() {
+                    super::check(stringify!($green)).unwrap();
+                }
+            )*
+            $(
+                #[test]
                 #[ignore = "red until via-5lr.3.2"]
-                fn $name() {
-                    super::check(stringify!($name)).unwrap();
+                fn $red() {
+                    super::check(stringify!($red)).unwrap();
                 }
             )*
         }
@@ -71,15 +82,18 @@ macro_rules! cases {
 }
 
 cases! {
-    c0_server_lost,
+    green:
     c10_read_only_refused,
+    c4b_workspace_write_refused,
+    codex_bound_gate_refusals;
+    red:
+    c0_server_lost,
     c11_failed_command,
     c1_commentary_usage,
     c2_steer,
     c3_interrupt_uncertain,
     c3_wall_interrupt,
     c4_two_sessions,
-    c4b_workspace_write_refused,
     c5_resume,
     c5_resume_missing,
     c6_cold_initialize,

@@ -534,23 +534,36 @@ fn marking_script(path: &Path, marker: &Path) -> TestResult {
 }
 
 /// What one vendor harness answers once configured (C2 §7 item 1): its
-/// `describe` refusal kind, `None` once it plans, and its `models` list.
+/// `describe` refusal kind, `None` once it plans, for the model its row
+/// names (or none), and its `models` list.
 struct LaunchRow {
     harness: &'static str,
+    model: Option<&'static str>,
     refused: Option<&'static str>,
     models: Value,
 }
 
-/// The per-harness expectations of the merged base: no vendor adapter
-/// plans or catalogs yet, so `describe` refuses `harness_unavailable` and
-/// `models` lists nothing. Each adapter track flips its own row.
+/// The per-harness expectations. A vendor adapter that does not plan yet
+/// refuses `describe` with `harness_unavailable` and lists no models. Each
+/// adapter track flips its own row: Codex (x.3.2 X1) plans a named model,
+/// and lists none before discovery, since it has no bundled catalog.
 fn launch_rows() -> [LaunchRow; 3] {
     let row = |harness| LaunchRow {
         harness,
+        model: None,
         refused: Some("harness_unavailable"),
         models: json!([]),
     };
-    [row("claude"), row("codex"), row("opencode")]
+    [
+        row("claude"),
+        LaunchRow {
+            harness: "codex",
+            model: Some("gpt-6-sol"),
+            refused: None,
+            models: json!([]),
+        },
+        row("opencode"),
+    ]
 }
 
 /// C2 §7 item 1, design §7 S-LAUNCH acceptance: with `harnesses.claude`
@@ -583,7 +596,11 @@ fn s_launch_describe_starts_nothing() -> TestResult {
         let mut outcomes = Vec::new();
         for row in launch_rows() {
             let harness = row.harness;
-            let described = sandbox.run(&["describe", "--harness", harness, "--json"])?;
+            let mut describe = vec!["describe", "--harness", harness, "--json"];
+            if let Some(model) = row.model {
+                describe.extend(["--model", model]);
+            }
+            let described = sandbox.run(&describe)?;
             // A request error is printed on stderr.
             let planned = if let Some(kind) = row.refused {
                 let reply: Value = serde_json::from_slice(&described.stderr).unwrap_or(Value::Null);
