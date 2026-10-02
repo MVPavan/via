@@ -4381,7 +4381,7 @@ fn a_steer_in_the_submitting_window_waits_for_the_acceptance() {
         let steering = {
             let engine = std::sync::Arc::clone(&engine);
             let raw = json!({"session":session.as_str(),"handle":HANDLE,"text":"x"});
-            tokio::spawn(async move { engine.steer(serde_json::from_value(raw).unwrap()).await })
+            tokio::spawn(async move { steer(&engine, &raw).await })
         };
         tokio::time::timeout(
             Duration::from_secs(10),
@@ -4447,7 +4447,7 @@ fn a_steer_between_the_submission_commit_and_its_publication_waits() {
         let steering = {
             let engine = std::sync::Arc::clone(&engine);
             let raw = json!({"session":session.as_str(),"handle":HANDLE,"text":"x"});
-            tokio::spawn(async move { engine.steer(serde_json::from_value(raw).unwrap()).await })
+            tokio::spawn(async move { steer(&engine, &raw).await })
         };
         tokio::time::timeout(
             Duration::from_secs(10),
@@ -4547,7 +4547,7 @@ fn a_steer_before_acceptance_waits_and_is_delivered() {
         let steering = {
             let engine = std::sync::Arc::clone(&engine);
             let raw = json!({"session":session.as_str(),"handle":HANDLE,"text":"also"});
-            tokio::spawn(async move { engine.steer(serde_json::from_value(raw).unwrap()).await })
+            tokio::spawn(async move { steer(&engine, &raw).await })
         };
         tokio::time::timeout(
             Duration::from_secs(10),
@@ -4631,6 +4631,177 @@ fn a_suspended_steer_keeps_its_outcome() {
             0,
             "a request's end retires its ticket"
         );
+    });
+}
+
+/// `steer` with the members `raw`, its retry identity their bytes.
+async fn steer(engine: &Engine, raw: &Value) -> Result<Value, ApiError> {
+    engine
+        .steer(
+            serde_json::from_value(raw.clone()).unwrap(),
+            &raw.to_string(),
+        )
+        .await
+}
+
+/// A fake profile whose steer is native, plus `extra` profile members.
+fn steer_profile(extra: &Value) -> Value {
+    let unsupported = json!({"support":"unsupported","reason":"no"});
+    let mut profile = json!({"capabilities": {
+        "verbs": {"spawn":{"support":"native"},"resume":{"support":"native"},
+                  "steer":{"support":"native"},"cancel":{"support":"native"},
+                  "close":{"support":"native"}},
+        "params": {"instructions":unsupported,"output_schema":unsupported,
+                   "effort":unsupported,"max_steps":unsupported},
+        "bounds": [], "network_control": false, "recover": unsupported,
+        "usage": {"tokens":"turn","cost":"unavailable"}
+    }});
+    for (member, value) in extra.as_object().unwrap() {
+        profile[member] = value.clone();
+    }
+    profile
+}
+
+/// An Engine on `root` running the real anchor and the fake agent on
+/// `scenario`.
+fn open_fake(root: &Path, scenario: &Value) -> std::sync::Arc<Engine> {
+    fs::write(root.join("scenario.json"), scenario.to_string()).unwrap();
+    let config = AdapterConfig::load(
+        BootstrapEnv::from_vars([
+            ("VIA_FAKE_AGENT_BINARY", sibling("via-fake-agent")),
+            ("VIA_FAKE_SCENARIO", root.join("scenario.json")),
+            ("VIA_FAKE_SYNC_DIR", root.join("sync")),
+        ]),
+        None,
+    )
+    .unwrap();
+    Engine::open_with(
+        &root.join("state"),
+        &root.join("runtime"),
+        config,
+        sibling("via"),
+        super::DAEMON_QUEUE_LIMIT,
+        None,
+    )
+    .unwrap()
+}
+
+/// K2 (via-jm4.36, C1 §3.4): a repeat of a keyed steer whose first attempt
+/// is still in flight, its input with the vendor and unacknowledged, waits
+/// for that attempt and is answered with its outcome. The driver is asked
+/// once; one `steer.delivered` is committed.
+#[test]
+fn a_keyed_steer_repeat_while_in_flight_waits_for_its_outcome() {
+    let Some(root) = child("a_keyed_steer_repeat_while_in_flight_waits_for_its_outcome") else {
+        return;
+    };
+    let turn = "fake-turn-1";
+    let scenario = json!({
+        "profile": steer_profile(&json!({})),
+        "scripts": [{"expected_request":{"type":"start","prompt":"p"},"steps":[
+            {"action":"emit","message":{"type":"accepted","id":1,"vendor_turn_id":turn}},
+            {"action":"expect_request","expected":{"type":"steer","id":3}},
+            {"action":"gate","name":"delivering"},
+            {"action":"emit","message":{"type":"steer_delivered","id":3,"vendor_turn_id":turn}},
+            {"action":"emit","message":{"type":"terminal","vendor_turn_id":turn,
+             "status":"completed","final_text":"done","stop_reason":"end_turn"}},
+        ]}],
+    });
+    let sync = root.join("sync");
+    run(async {
+        let engine = open_fake(&root, &scenario);
+        let session = new_session(&engine).await;
+        let dispatching = {
+            let engine = std::sync::Arc::clone(&engine);
+            let session = session.clone();
+            tokio::spawn(async move { dispatch(&engine, &session).await })
+        };
+        let raw = json!({"session":session.as_str(),"handle":HANDLE,"text":"also","op_key":"k-1"});
+        let first = {
+            let engine = std::sync::Arc::clone(&engine);
+            let raw = raw.clone();
+            tokio::spawn(async move { steer(&engine, &raw).await })
+        };
+        until(|| sync.join("delivering.entered").exists()).await;
+        let repeat = {
+            let engine = std::sync::Arc::clone(&engine);
+            let raw = raw.clone();
+            tokio::spawn(async move { steer(&engine, &raw).await })
+        };
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            engine.faults.steer_key_waiting.notified(),
+        )
+        .await
+        .expect("the repeat waits for the first attempt");
+        assert!(!first.is_finished() && !repeat.is_finished());
+        fs::write(sync.join("delivering.release"), b"").unwrap();
+        let delivered = json!({"turn":format!("{session}/1"),"delivery":"injected"});
+        assert_eq!(first.await.unwrap().unwrap(), delivered);
+        assert_eq!(repeat.await.unwrap().unwrap(), delivered);
+        dispatching.await.unwrap();
+        assert_eq!(engine.faults.steer_calls.load(Ordering::Acquire), 1);
+        assert_eq!(steers(&engine, &session).await, [(json!(1), json!(false))]);
+    });
+}
+
+/// K2 (via-jm4.36, C1 §3.4): a keyed steer the driver answers
+/// `NotDelivered` stores that refusal; a repeat replays it and never asks
+/// the driver again, while a new key does.
+#[test]
+fn a_keyed_steer_repeat_after_not_delivered_replays_the_refusal() {
+    let Some(root) = child("a_keyed_steer_repeat_after_not_delivered_replays_the_refusal") else {
+        return;
+    };
+    let turn = "fake-turn-1";
+    let scenario = json!({
+        "profile": steer_profile(&json!({"steer_refusal":"not_delivered"})),
+        "scripts": [{"expected_request":{"type":"start","prompt":"p"},"steps":[
+            {"action":"emit","message":{"type":"accepted","id":1,"vendor_turn_id":turn}},
+            {"action":"gate","name":"running"},
+            {"action":"emit","message":{"type":"terminal","vendor_turn_id":turn,
+             "status":"completed","final_text":"done","stop_reason":"end_turn"}},
+        ]}],
+    });
+    let sync = root.join("sync");
+    run(async {
+        let engine = open_fake(&root, &scenario);
+        let session = new_session(&engine).await;
+        let dispatching = {
+            let engine = std::sync::Arc::clone(&engine);
+            let session = session.clone();
+            tokio::spawn(async move { dispatch(&engine, &session).await })
+        };
+        until(|| sync.join("running.entered").exists()).await;
+        let raw = json!({"session":session.as_str(),"handle":HANDLE,"text":"x","op_key":"k-1"});
+        let not_delivered = |error: ApiError| {
+            let data = error.data();
+            (error.kind, data["reason"].clone(), data["delivery"].clone())
+        };
+        let expected = ("steer_failed", json!("not_delivered"), json!("uncertain"));
+        assert_eq!(
+            not_delivered(steer(&engine, &raw).await.unwrap_err()),
+            expected
+        );
+        assert_eq!(engine.faults.steer_calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            not_delivered(steer(&engine, &raw).await.unwrap_err()),
+            expected
+        );
+        assert_eq!(
+            engine.faults.steer_calls.load(Ordering::Acquire),
+            1,
+            "a repeat never reaches the driver"
+        );
+        let other = json!({"session":session.as_str(),"handle":HANDLE,"text":"x","op_key":"k-2"});
+        assert_eq!(
+            not_delivered(steer(&engine, &other).await.unwrap_err()),
+            expected
+        );
+        assert_eq!(engine.faults.steer_calls.load(Ordering::Acquire), 2);
+        fs::write(sync.join("running.release"), b"").unwrap();
+        dispatching.await.unwrap();
+        assert!(steers(&engine, &session).await.is_empty());
     });
 }
 

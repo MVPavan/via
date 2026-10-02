@@ -475,6 +475,9 @@ pub struct SteerParams {
     /// like a wrong one (F15).
     #[serde(default)]
     pub handle: Option<String>,
+    /// Retry key (C1 §3): a repeat replays the first attempt's answer.
+    #[serde(default)]
+    pub op_key: Option<String>,
 }
 
 /// Strict C1 read-address parameter set.

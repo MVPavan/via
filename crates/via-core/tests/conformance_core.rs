@@ -2395,12 +2395,11 @@ fn core_steer_delivery_commit_failure_is_store_error() {
             assert!(tokio::time::Instant::now() < accepted, "never accepted");
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        let params = serde_json::from_value(json!({"session":session,"handle":HANDLE,
-                                                   "text":"also"}))
-        .unwrap();
+        let raw = json!({"session":session,"handle":HANDLE,"text":"also"});
+        let params = serde_json::from_value(raw.clone()).unwrap();
         let steering = tokio::spawn({
             let engine = Arc::clone(&daemon.engine);
-            async move { engine.steer(params).await }
+            async move { engine.steer(params, &raw.to_string()).await }
         });
         daemon.entered("delivered").await;
         let reply = tokio::time::timeout(Duration::from_secs(20), steering)
@@ -2414,6 +2413,84 @@ fn core_steer_delivery_commit_failure_is_store_error() {
         );
         let error = reply.expect_err("a failed delivery commit is no success");
         assert_eq!(error.kind, "store_error", "{error:?}");
+        daemon.release("delivered");
+        assert!(
+            !events(&daemon, &session)
+                .await
+                .iter()
+                .any(|event| event["type"] == "steer.delivered")
+        );
+        let engine = Arc::clone(&daemon.engine);
+        let _report = engine
+            .shutdown(Deadline::at(
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            ))
+            .await;
+        daemon.starter.abort();
+    });
+}
+
+/// K2 (via-jm4.36, C1 §3.4): a keyed steer whose `steer.delivered` write
+/// fails (`store.commit.event`'s second hit) is `store_error`, and its
+/// outcome is not recorded with it. A repeat under the key, with no first
+/// attempt in flight, gets the stored uncertain outcome, `steer_failed`
+/// with `data.reason: "not_delivered"` and `data.delivery: "uncertain"`,
+/// and never sends the input again: it is answered while the vendor holds
+/// the turn, and no `steer.delivered` exists.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_keyed_steer_whose_outcome_was_not_recorded_replays_uncertain() {
+    let mut profile = schema_profile();
+    profile["capabilities"]["verbs"]["steer"] = json!({"support":"native"});
+    let steps = [
+        accepted(1),
+        json!({"action":"expect_request","expected":{"type":"steer","id":3}}),
+        emit(&json!({"type":"steer_delivered","id":3,"vendor_turn_id":vendor_turn(1)})),
+        gate("delivered"),
+        terminal(1, "completed", "end_turn"),
+    ];
+    let Some(root) = child(
+        "core_keyed_steer_whose_outcome_was_not_recorded_replays_uncertain",
+        &scenario(&profile, &[script("p", &steps)]),
+        &[],
+    ) else {
+        return;
+    };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    arm_at(&root, "store.commit.event", 2, "fail_io");
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = daemon.spawn("p", &json!({})).await;
+        let raw = json!({"session":session,"handle":HANDLE,"text":"also","op_key":"k-1"});
+        let steer = || {
+            let engine = Arc::clone(&daemon.engine);
+            let raw = raw.clone();
+            async move {
+                let params = serde_json::from_value(raw.clone()).unwrap();
+                engine.steer(params, &raw.to_string()).await
+            }
+        };
+        let first = tokio::time::timeout(Duration::from_secs(20), steer())
+            .await
+            .expect("the steer is answered");
+        let error = first.expect_err("a failed delivery commit is no success");
+        assert_eq!(error.kind, "store_error", "{error:?}");
+        daemon.entered("delivered").await;
+        let repeat = tokio::time::timeout(Duration::from_secs(10), steer())
+            .await
+            .expect("the repeat is answered while the vendor holds the turn");
+        let error = repeat.expect_err("the stored outcome is uncertain");
+        assert_eq!(
+            (
+                error.kind,
+                &error.data()["reason"],
+                &error.data()["delivery"]
+            ),
+            ("steer_failed", &json!("not_delivered"), &json!("uncertain")),
+            "{error:?}"
+        );
+        let again = steer().await.expect_err("replayed");
+        assert_eq!(again.data()["delivery"], "uncertain", "{again:?}");
         daemon.release("delivered");
         assert!(
             !events(&daemon, &session)
@@ -2474,12 +2551,11 @@ fn core_steer_report_overflow_is_not_recorded() {
         acknowledge(&root, "adapter.observation.admitted", 1026);
         daemon.release("flood");
         until_acked(&root, "adapter.observation.admitted", 1026).await;
-        let params = serde_json::from_value(json!({"session":session,"handle":HANDLE,
-                                                   "text":"also"}))
-        .unwrap();
+        let raw = json!({"session":session,"handle":HANDLE,"text":"also"});
+        let params = serde_json::from_value(raw.clone()).unwrap();
         let steering = tokio::spawn({
             let engine = Arc::clone(&daemon.engine);
-            async move { engine.steer(params).await }
+            async move { engine.steer(params, &raw.to_string()).await }
         });
         until_acked(&root, "adapter.observation.stalled", 1).await;
         let reply = tokio::time::timeout(Duration::from_secs(20), steering)

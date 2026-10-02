@@ -41,7 +41,7 @@ use via_adapters::{
     OBSERVATION_BYTES, Observation, ObservationBudget, SessionCx, SessionDriver, SessionRef,
     SessionSpec, SteerToken, UsageSample, VendorTerminal, observation_channel_in,
 };
-use via_store::{SessionIdentity, SessionRoute};
+use via_store::{SessionIdentity, SessionRoute, SteerOutcome};
 
 use super::journal::SessionWrite;
 use super::progress::UsageLedger;
@@ -310,7 +310,7 @@ struct SteerTickets(StdMutex<TicketBook>);
 
 #[derive(Default)]
 struct TicketBook {
-    tickets: HashMap<SteerToken, tokio::sync::oneshot::Sender<bool>>,
+    tickets: HashMap<SteerToken, (tokio::sync::oneshot::Sender<bool>, Option<SteerKey>)>,
     /// The lane ended: a later request's ticket is resolved at once.
     closed: bool,
 }
@@ -323,7 +323,7 @@ impl SteerTickets {
     /// Resolves the ticket of `token`, if its request still waits.
     fn resolve(&self, token: SteerToken, committed: bool) {
         let ticket = self.book().tickets.remove(&token);
-        if let Some(ticket) = ticket {
+        if let Some((ticket, _)) = ticket {
             // The request ended meanwhile: nobody waits for the answer.
             let _ = ticket.send(committed);
         }
@@ -336,10 +336,20 @@ impl SteerTickets {
             book.closed = true;
             std::mem::take(&mut book.tickets)
         };
-        for ticket in tickets.into_values() {
+        for (ticket, _) in tickets.into_values() {
             let _ = ticket.send(false);
         }
     }
+}
+
+/// A keyed steer's key and the turn it steers, which its live ticket
+/// carries so the commit of its `steer.delivered` records its outcome
+/// (C1 §3.4).
+pub(super) struct SteerKey {
+    /// The steer's `op_key`.
+    pub(super) op_key: String,
+    /// The steered turn's address.
+    pub(super) turn: String,
 }
 
 /// One live steer request's completion ticket on its lane (critical r2
@@ -821,6 +831,21 @@ impl Lane {
         }
     }
 
+    /// The outcome the `steer.delivered` of `token` records when it is a
+    /// keyed steer's still waiting for it (C1 §3.4).
+    pub(super) fn keyed_outcome(
+        &self,
+        token: SteerToken,
+        delivery: &via_adapters::SteerDelivery,
+    ) -> Option<SteerOutcome> {
+        let book = self.steers.book();
+        let (_, key) = book.tickets.get(&token)?;
+        key.as_ref().map(|key| SteerOutcome {
+            op_key: key.op_key.clone(),
+            result: super::steer::delivered(&key.turn, delivery),
+        })
+    }
+
     /// Records whether the `steer.delivered` observation of `token`
     /// committed, once consumed on any of its paths (critical r1 #5): its
     /// request's ticket, if it still waits, learns it.
@@ -830,12 +855,19 @@ impl Lane {
 
     /// Registers a steer request's completion ticket, with a new token,
     /// before the request calls `steer` (critical r2 #2).
+    #[cfg(test)]
     pub(super) fn steer_ticket(&self) -> SteerTicket {
+        self.keyed_steer_ticket(None)
+    }
+
+    /// [`Self::steer_ticket`] for a steer keyed by `key`, if any: the
+    /// commit of the token's `steer.delivered` records its outcome.
+    pub(super) fn keyed_steer_ticket(&self, key: Option<SteerKey>) -> SteerTicket {
         let token = SteerToken::new(STEER_TOKENS.fetch_add(1, Ordering::Relaxed) + 1);
         let (sender, resolved) = tokio::sync::oneshot::channel();
         let mut book = self.steers.book();
         if !book.closed {
-            book.tickets.insert(token, sender);
+            book.tickets.insert(token, (sender, key));
         }
         SteerTicket {
             token,
@@ -914,7 +946,7 @@ impl Lane {
                         let columns = Some(confirmed.columns());
                         let written = self
                             .writer
-                            .commit((body, &at, (None, false)), columns)
+                            .commit((body, &at, (None, false)), (columns, None))
                             .await;
                         if let SessionWrite::Committed = written {
                             self.opened(identity.connection_id.clone(), confirmed);
@@ -944,7 +976,17 @@ impl Lane {
                     Attribution::Expired => return self.steer_dropped(&item.observation),
                 };
                 if let Some(body) = super::drive::held_body(&item.observation) {
-                    let written = self.writer.commit((body, &at, attributed), None).await;
+                    let keyed = if let Observation::SteerDelivered { delivery, token } =
+                        &item.observation
+                    {
+                        self.keyed_outcome(*token, delivery)
+                    } else {
+                        None
+                    };
+                    let written = self
+                        .writer
+                        .commit((body, &at, attributed), (None, keyed))
+                        .await;
                     if let Some(token) = steer {
                         self.steer_outcome(token, matches!(written, SessionWrite::Committed));
                     }

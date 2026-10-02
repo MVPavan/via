@@ -79,6 +79,8 @@ POINTS = [
     "core.cancel.settling",
     "core.run.idle_expired",
     "core.cancel.ordered",
+    # x.3.2 K2: a keyed steer's report about to commit with its outcome.
+    "core.steer.before_outcome",
     # Task 3 S3 (design §6, §10): daemon lifecycle seams.
     "daemon.startup.after_lock",
     "daemon.dispatcher.before_start",

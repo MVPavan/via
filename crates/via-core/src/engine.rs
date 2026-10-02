@@ -38,6 +38,7 @@ mod resolve;
 mod revision;
 mod slots;
 mod status;
+mod steer;
 mod stop;
 mod terminal;
 #[cfg(test)]
@@ -136,6 +137,9 @@ pub struct Engine {
     /// `Closing` (design §4 step 7, §6.6 [r3.5]); a confirmed `Closed`
     /// removes one. Changed only under `admission`.
     closing: StdMutex<HashSet<SessionId>>,
+    /// Keyed steers whose first attempt is in flight (C1 §3.4): a repeat
+    /// waits for its outcome.
+    keyed_steers: steer::KeyedSteers,
     /// The `final_shutdown` fence (design §6.8 [r3.2]): set once, under
     /// `admission`, when daemon main stops accepting work; read under
     /// `admission` by the close fence. Its watch also stops the re-probe
@@ -239,6 +243,11 @@ struct Faults {
     lanes_opened: AtomicUsize,
     /// Notified when a `steer` starts selecting the turn it addresses.
     steer_selecting: tokio::sync::Notify,
+    /// Notified when a keyed `steer` repeat starts waiting for the first
+    /// attempt under its key.
+    steer_key_waiting: tokio::sync::Notify,
+    /// Steer inputs handed to a driver.
+    steer_calls: AtomicUsize,
 }
 
 /// Committed facts of a turn whose execution a force stop abandoned.
@@ -424,6 +433,7 @@ impl Engine {
             pressed: AtomicUsize::new(0),
             recovered: slots::RecoveredSlots::default(),
             closing: StdMutex::new(HashSet::new()),
+            keyed_steers: steer::KeyedSteers::default(),
             final_shutdown: watch::Sender::new(false),
             dispatching: StdMutex::new(HashSet::new()),
             limits,
@@ -566,8 +576,9 @@ struct SessionWriter {
 
 impl SessionWriter {
     /// Commits `body`, attributed `(turn, late)`, at the session's next
-    /// sequence, with `identity` the session's identity columns in the same
-    /// transaction ([`journal::commit_session_event`]). Under `admission`,
+    /// sequence, with `identity` the session's identity columns and `steer`
+    /// a keyed steer's outcome in the same transaction
+    /// ([`journal::commit_session_event_with`]). Under `admission`,
     /// on the session's slot head: a slot made for the write when the
     /// session has none, and removed after it, so no receipt or dispatcher
     /// meets it. The Store refuses it once the session is closed. A failed
@@ -577,7 +588,10 @@ impl SessionWriter {
     async fn commit(
         &self,
         (body, at, attributed): (EventBody, &str, (Option<u32>, bool)),
-        identity: Option<via_store::SessionIdentity>,
+        (identity, steer): (
+            Option<via_store::SessionIdentity>,
+            Option<via_store::SteerOutcome>,
+        ),
     ) -> journal::SessionWrite {
         let _admission = self.admission.lock().await;
         if self.signal.failure_pending.load(Ordering::Acquire)
@@ -587,11 +601,11 @@ impl SessionWriter {
         }
         let (slot, made) = write_slot(&self.sessions, &self.session);
         let head = Arc::clone(&slot.head);
-        let written = journal::commit_session_event(
+        let written = journal::commit_session_event_with(
             &self.store,
             (&head, &self.session),
             (body, at, attributed),
-            identity,
+            (identity, steer),
         )
         .await;
         drop(head);

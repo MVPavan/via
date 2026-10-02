@@ -381,7 +381,8 @@ async fn dispatch(method: &str, params: &str, client: &Client) -> Result<Box<Raw
             };
             raw(&receipt)
         }
-        "steer" => raw(&engine.steer(typed::<SteerParams>(params)?).await?),
+        // A keyed steer's retry identity is the params' exact bytes.
+        "steer" => raw(&engine.steer(typed::<SteerParams>(params)?, params).await?),
         "cancel" => raw(&engine.cancel(typed::<CancelParams>(params)?).await?),
         "close" => {
             // A keyed close's retry identity is the params' exact bytes.

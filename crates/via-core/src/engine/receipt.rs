@@ -6,7 +6,7 @@ use std::{
     time::SystemTime,
 };
 
-use serde_json::{Value, json};
+use serde_json::Value;
 use via_store::{
     BLOB_CHUNK, BlobRef, INLINE_MAX, OperationRecord, Prompt, PromptFileError, ResumeRecord,
     SessionSnapshot, SpawnKey, SpawnRecord, StoreError,
@@ -18,6 +18,7 @@ use via_adapters::{
 
 use super::drive::steer_delivery;
 use super::journal::{self, Head};
+use super::lane::SteerKey;
 use super::latch::{FailureScope, FailureSite, WriteOutcome};
 use super::queue::{DAEMON_QUEUE_LIMIT, SESSION_QUEUE_LIMIT, Slot, Steering};
 use super::{Admission, Engine, Receipted, lock};
@@ -701,9 +702,11 @@ impl Engine {
     /// answered only once the lane committed that observation, which
     /// resolves the ticket (C1 §3.4, critical r1 #5): a failed commit, or
     /// the lane's end first, is `store_error`, never success. The ticket
-    /// retires with the request, whichever way it ends.
-    pub async fn steer(&self, params: SteerParams) -> Result<Value, ApiError> {
-        let (_, snapshot) = self
+    /// retires with the request, whichever way it ends. With `op_key`, the
+    /// steer is keyed ([`Self::keyed_steer`]): its retry identity is
+    /// `raw_params`' bytes with the handle replaced by its hash.
+    pub async fn steer(&self, params: SteerParams, raw_params: &str) -> Result<Value, ApiError> {
+        let (hash, snapshot) = self
             .authenticate_existing(&params.session, params.handle.as_deref())
             .await?;
         if self.store_failed() {
@@ -716,6 +719,25 @@ impl Engine {
         ) {
             return Err(intake::unsupported_on(Verb::Steer, &frozen));
         }
+        match retry_key(params.op_key.as_deref())?.map(str::to_owned) {
+            Some(key) => {
+                let identity = retry_identity(raw_params, &hash, None)?;
+                self.keyed_steer(params, &frozen, (key, identity)).await
+            }
+            None => self.deliver_steer(params, &frozen, None).await,
+        }
+    }
+
+    /// Selects the steered turn, waits for its acceptance, then hands the
+    /// input to the driver and answers once its `steer.delivered` committed
+    /// ([`Self::steer`]). A keyed steer's `op_key` rides on its ticket, so
+    /// that commit records the steer's outcome.
+    pub(super) async fn deliver_steer(
+        &self,
+        params: SteerParams,
+        frozen: &Frozen,
+        op_key: Option<&str>,
+    ) -> Result<Value, ApiError> {
         #[cfg(test)]
         self.faults.steer_selecting.notify_one();
         // Sol r2 #5: selected under the slot's `selection`, so a submission
@@ -757,7 +779,11 @@ impl Engine {
         // Critical r2 #2: the request's completion ticket, registered
         // before the driver can emit its report; dropped with the request,
         // whichever way it ends, it retires itself.
-        let mut ticket = lane.steer_ticket();
+        let address = format!("{}/{}", params.session.as_str(), turn.get());
+        let mut ticket = lane.keyed_steer_ticket(op_key.map(|op_key| SteerKey {
+            op_key: op_key.to_owned(),
+            turn: address.clone(),
+        }));
         let input = SteerInput {
             // Sol r1 #8: the driver admits it only into the selected turn.
             turn,
@@ -765,13 +791,15 @@ impl Engine {
             text: params.text,
             expected_vendor_turn: vendor_turn.and_then(|id| VendorTurnId::try_from(id).ok()),
         };
+        #[cfg(test)]
+        self.faults.steer_calls.fetch_add(1, Ordering::AcqRel);
         let delivery = lane
             .driver
             .steer(input)
             .await
             .map_err(|error| match error {
                 // Sol r1 #11 (C1 §3.4, C2 §2).
-                SteerError::Unsupported => intake::unsupported_on(Verb::Steer, &frozen),
+                SteerError::Unsupported => intake::unsupported_on(Verb::Steer, frozen),
                 SteerError::NoActiveTurn => ApiError::NO_ACTIVE_TURN,
                 SteerError::TurnMismatch => ApiError::TURN_MISMATCH,
                 SteerError::OverCapacity => ApiError::CONTROL_LANE_FULL,
@@ -788,10 +816,7 @@ impl Engine {
         if !ticket.committed().await {
             return Err(ApiError::STORE);
         }
-        Ok(json!({
-            "turn": format!("{}/{}", params.session.as_str(), turn.get()),
-            "delivery": steer_delivery(&delivery),
-        }))
+        Ok(super::steer::delivered(&address, &delivery))
     }
 }
 

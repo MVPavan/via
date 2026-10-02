@@ -250,6 +250,8 @@ struct SteerArgs {
     #[arg(long)]
     text: String,
     #[arg(long)]
+    op_key: Option<String>,
+    #[arg(long)]
     handle: Option<String>,
     #[arg(long)]
     handle_file: Option<PathBuf>,
@@ -438,12 +440,11 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
                 args.handle.as_deref(),
                 false,
             )?;
-            client::call(
-                "steer",
-                &json!({"session":args.session,"text":args.text,"handle":handle}),
-                true,
-                true,
-            )
+            let mut params = json!({"session":args.session,"text":args.text,"handle":handle});
+            if let Some(key) = args.op_key {
+                params["op_key"] = Value::String(key);
+            }
+            client::call("steer", &params, true, true)
         }
         Command::Cancel(args) => cancel(&args),
         Command::Close(args) => close(args),

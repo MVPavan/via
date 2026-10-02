@@ -2420,9 +2420,10 @@ impl Engine {
     }
 
     /// Commits `steer.delivered` attributed to `(turn, late)` under the
-    /// running turn's record, and records on the lane whether it committed,
-    /// which answers the steer that is waiting on its token (C1 §3.4,
-    /// critical r1 #5).
+    /// running turn's record, with a keyed steer's outcome in the same
+    /// transaction, and records on the lane whether it committed, which
+    /// answers the steer that is waiting on its token (C1 §3.4, critical r1
+    /// #5).
     async fn commit_steer(
         &self,
         record: &mut TurnRecord,
@@ -2435,9 +2436,18 @@ impl Engine {
         };
         let at = rfc3339(SystemTime::now());
         let failed = record.first_failure.is_some();
-        let committed = journal::commit_event_as(&self.store, record, body, &at, attributed)
-            .await
-            .is_some();
+        // K2 (C1 §3.4): a keyed steer's outcome commits with its report.
+        let keyed = lane.and_then(|lane| lane.keyed_outcome(token, delivery));
+        // Test builds: a keyed steer's report is about to commit with its
+        // outcome (K2's restart case).
+        #[cfg(feature = "test-failpoints")]
+        if keyed.is_some() {
+            let _ = via_store::failpoint::hit_async("core.steer.before_outcome").await;
+        }
+        let committed =
+            journal::commit_event_keyed(&self.store, record, (body, &at, attributed), keyed)
+                .await
+                .is_some();
         self.report_first_failure(record, failed).await;
         if let Some(lane) = lane {
             lane.steer_outcome(token, committed);
