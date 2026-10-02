@@ -775,6 +775,7 @@ pub fn envelope_at_maximum(
                 path: path.clone(),
                 bytes: u64::MAX,
             }),
+            output_invalid: None,
             steps: Some(u64::MAX),
             usage: None,
             cost: Some((f64::MAX, "session_cumulative".to_owned())),

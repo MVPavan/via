@@ -274,6 +274,12 @@ impl Engine {
             .instant()
             .min(tokio::time::Instant::now() + FINALIZE_WRITE);
         let mut turn = turn;
+        // C1 §5 (critical r1 #3): the structured output is validated before
+        // it spills, as on the natural path; the forced terminal is never
+        // `completed`, so its envelope warns when the value is invalid.
+        if let Some(effective) = turn.started.plan.effective.as_ref() {
+            self.validate_output(effective, &mut turn.record).await;
+        }
         // C1 §5, §7.6: a spilled structured output's write is part of the
         // terminal's commit; when it fails, the turn resolves through the
         // failure-resolution batch, as a terminal that did not commit.
@@ -442,11 +448,8 @@ impl Engine {
         if turn.text.apply(&mut terminal) {
             terminal.fail(FailureClass::Store, "the final text could not be written");
         }
-        // C1 §5 (fix round 1 #16): a kept structured output is validated
-        // before it is stored, whatever the state.
-        if let Some(effective) = turn.started.plan.effective.as_ref() {
-            self.check_output(effective, &record, &mut terminal).await;
-        }
+        // C1 §5 (fix round 1 #16): the kept structured output was validated
+        // before it spilled ([`Engine::finalize_forced`]).
         (turn.started, record, terminal)
     }
 

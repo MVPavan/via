@@ -900,10 +900,12 @@ impl Engine {
         if text_failed {
             terminal.fail(FailureClass::Store, "the final text could not be written");
         }
-        // Sol r2 #7 (C1 §5): validated after the final text, evidence and
-        // Store classification, as on the forced path: a failure found
-        // there stands, and the envelope warns.
-        self.check_output(&effective, &record, &mut terminal).await;
+        // C1 §5: validated before the spill, as on the forced path; the
+        // outcome is projected once the classification is final (Sol r2
+        // #7, critical r1 #4): a failure found by then stands, and the
+        // envelope warns.
+        self.check_output(&effective, &mut record, &mut terminal)
+            .await;
         let cause = disposed
             .cancel_cause
             .filter(|_| terminal.state == "cancelled");
@@ -2637,9 +2639,11 @@ fn instance_record(instance: via_adapters::InstanceReport) -> via_store::Instanc
 pub(super) fn ended_record(
     started: &Started,
     record: TurnRecord,
-    terminal: Terminal,
+    mut terminal: Terminal,
     seq: u64,
 ) -> Result<TerminalRecord, ApiError> {
+    // Critical r1 #4: the validation outcome on the final classification.
+    super::output::project_output(&record, &mut terminal);
     let ended_at = rfc3339(SystemTime::now());
     // Design §3.2: every terminal built from the record carries the rows it
     // could not commit and the open step's.

@@ -11,34 +11,27 @@ use crate::intake::Effective;
 use crate::schema::{self, Checked};
 
 impl Engine {
-    /// C1 Q2, §5 (fix round 1 #16): a present structured output is checked
-    /// against the turn's frozen `output_schema` before it is stored, inline
-    /// or spilled, whatever the turn's state. On a turn that would complete,
-    /// an invalid value fails it `structured_output_invalid`, the value kept;
-    /// on one that ends otherwise its state and failure stand, and the
-    /// envelope warns `structured_output_invalid`. Either way `data.reason`
-    /// is `"invalid"`, or `"validation_limit"` when the validation bound was
-    /// reached first. A completed turn with no structured output keeps its
-    /// state and warns `structured_output_missing`.
-    pub(super) async fn check_output(
+    /// C1 Q2, §5 (fix round 1 #16; critical r1 #3, #4): a present
+    /// structured output is checked against the turn's frozen
+    /// `output_schema` before it is stored, inline or spilled, whatever the
+    /// turn's state, on the natural and the forced path alike: before
+    /// [`Engine::spill`] takes it. The outcome is kept in the record
+    /// (`Retained::output_invalid`), apart from the failure class, and
+    /// [`project_output`] applies it once the terminal's classification is
+    /// final. Whether the schema found no output to check.
+    pub(super) async fn validate_output(
         &self,
         effective: &Effective,
-        record: &TurnRecord,
-        terminal: &mut Terminal,
-    ) {
+        record: &mut TurnRecord,
+    ) -> bool {
         let Some(schema) = effective.output_schema() else {
-            return;
+            return false;
         };
-        let output = record
-            .vendor
-            .retained
-            .as_ref()
-            .and_then(|retained| retained.structured_output.as_ref());
-        let Some(output) = output else {
-            if terminal.state == "completed" {
-                terminal.warnings.push(Warning::STRUCTURED_OUTPUT_MISSING);
-            }
-            return;
+        let Some(retained) = record.vendor.retained.as_mut() else {
+            return true;
+        };
+        let Some(output) = retained.structured_output.as_ref() else {
+            return retained.structured_output_file.is_none();
         };
         // Off the executor, as a Store blocking step owned until it ends; a
         // step that could not run is the validation bound reached.
@@ -48,23 +41,25 @@ impl Engine {
             .blocking_step(move || Ok(schema::validate(&schema, &output)))
             .await
             .unwrap_or(Checked::Limit);
-        let reason = match checked {
-            Checked::Valid => return,
-            Checked::Invalid => "invalid",
-            Checked::Limit => "validation_limit",
+        retained.output_invalid = match checked {
+            Checked::Valid => None,
+            Checked::Invalid => Some("invalid"),
+            Checked::Limit => Some("validation_limit"),
         };
-        if terminal.state == "completed" {
-            terminal.fail(
-                FailureClass::StructuredOutputInvalid,
-                "the structured output does not satisfy output_schema",
-            );
-            if let Some(failure) = terminal.failure.as_mut() {
-                failure.data = Some(json!({ "reason": reason }));
-            }
-        } else {
-            terminal
-                .warnings
-                .push(Warning::structured_output_invalid(reason));
+        false
+    }
+
+    /// The natural path's check: [`Engine::validate_output`], and a
+    /// completed turn with no structured output keeps its state and warns
+    /// `structured_output_missing`.
+    pub(super) async fn check_output(
+        &self,
+        effective: &Effective,
+        record: &mut TurnRecord,
+        terminal: &mut Terminal,
+    ) {
+        if self.validate_output(effective, record).await && terminal.state == "completed" {
+            terminal.warnings.push(Warning::STRUCTURED_OUTPUT_MISSING);
         }
     }
 
@@ -106,5 +101,37 @@ impl Engine {
             }
         }
         None
+    }
+}
+
+/// C1 Q2, §5 (critical r1 #4): the kept validation outcome on the terminal
+/// whose classification is final, as its `turn.ended` and envelope are
+/// built, the failure-resolution batch's included. On a turn that would
+/// complete, an invalid value fails it `structured_output_invalid`, the
+/// value kept; on one that ends otherwise its state and failure stand, and
+/// the envelope warns `structured_output_invalid`. Either way `data.reason`
+/// is `"invalid"`, or `"validation_limit"` when the validation bound was
+/// reached first.
+pub(super) fn project_output(record: &TurnRecord, terminal: &mut Terminal) {
+    let Some(reason) = record
+        .vendor
+        .retained
+        .as_ref()
+        .and_then(|retained| retained.output_invalid)
+    else {
+        return;
+    };
+    if terminal.state == "completed" {
+        terminal.fail(
+            FailureClass::StructuredOutputInvalid,
+            "the structured output does not satisfy output_schema",
+        );
+        if let Some(failure) = terminal.failure.as_mut() {
+            failure.data = Some(json!({ "reason": reason }));
+        }
+    } else {
+        terminal
+            .warnings
+            .push(Warning::structured_output_invalid(reason));
     }
 }

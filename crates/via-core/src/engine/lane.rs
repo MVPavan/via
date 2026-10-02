@@ -1205,6 +1205,11 @@ pub(super) struct Retained {
     pub(super) structured_output: Option<Value>,
     /// The durable `structured_output.json` of a spilled value (C1 §5).
     pub(super) structured_output_file: Option<StructuredOutputFile>,
+    /// Why the structured output does not satisfy the turn's frozen
+    /// `output_schema` (`"invalid"` or `"validation_limit"`), once checked
+    /// before it is stored: the validation outcome, kept apart from the
+    /// turn's failure class until its terminal is built (critical r1 #4).
+    pub(super) output_invalid: Option<&'static str>,
     pub(super) steps: Option<u64>,
     pub(super) usage: Option<UsageSample>,
     pub(super) cost: Option<(f64, String)>,
@@ -1224,6 +1229,7 @@ impl Retained {
             vendor_stop_reason: terminal.vendor_stop_reason.clone(),
             structured_output: terminal.structured_output.as_deref().and_then(parse),
             structured_output_file: None,
+            output_invalid: None,
             steps: terminal.steps,
             usage: terminal.usage.clone(),
             cost: terminal
