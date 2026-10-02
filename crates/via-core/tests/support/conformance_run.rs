@@ -1389,7 +1389,8 @@ fn error_name(error: &AdapterError) -> Option<String> {
 
 fn route_cause(cause: &RouteError) -> &'static str {
     match cause {
-        RouteError::Protocol { .. } | RouteError::HandshakeRefused { .. } => "protocol",
+        RouteError::Protocol { .. } => "protocol",
+        RouteError::HandshakeRefused { .. } => "handshake_refused",
         RouteError::TransportLost { .. } => "transport_lost",
         RouteError::ProcessExited { .. } => "process_exit",
         RouteError::Overflow { .. } => "overflow",

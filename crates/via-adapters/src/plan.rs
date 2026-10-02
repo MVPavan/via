@@ -2,6 +2,7 @@
 //! AD18): `AdapterSet::plan`, `check_turn` and `models` read only bundled
 //! data and configuration; they start nothing and write nothing.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -641,12 +642,25 @@ impl<'a> Adapter<'a> {
         }
     }
 
-    /// Its bundled catalog; the Codex stub has none yet.
-    fn catalog(self) -> &'a [CatalogModel] {
+    /// Its catalog: bundled, or for Codex what the live server of the
+    /// harness's configured `inherit` discovered (none before discovery).
+    fn catalog(self, config: &AdapterConfig) -> Cow<'a, [CatalogModel]> {
         match self {
-            Self::Fake(fake) => fake.catalog(),
-            Self::Claude(claude) => claude.catalog(),
-            Self::Codex(_) => &[],
+            Self::Fake(fake) => Cow::Borrowed(fake.catalog()),
+            Self::Claude(claude) => Cow::Borrowed(claude.catalog()),
+            Self::Codex(codex) => Cow::Owned(
+                Harness::parse(codex::HARNESS)
+                    .map(|harness| codex.listed(config.inherit(harness)))
+                    .unwrap_or_default(),
+            ),
+        }
+    }
+
+    /// Where its catalog comes from (C1 §3.13 `source`).
+    fn source(self) -> ModelSource {
+        match self {
+            Self::Fake(_) | Self::Claude(_) => ModelSource::Bundled,
+            Self::Codex(_) => ModelSource::Discovered,
         }
     }
 
@@ -815,9 +829,11 @@ impl AdapterSet {
         let harness = match (&req.harness, &req.model) {
             (Some(name), _) => Harness::parse(name).ok_or_else(|| unavailable(None))?,
             (None, Some(model)) => {
-                let catalogs = self
+                let catalogs: Vec<_> = self
                     .adapters()
-                    .map(|adapter| (adapter.name(), adapter.catalog()));
+                    .map(|adapter| (adapter.name(), adapter.catalog(&self.config)))
+                    .collect();
+                let catalogs = catalogs.iter().map(|(name, catalog)| (*name, &**catalog));
                 let (name, _) = resolve_model(model, catalogs).map_err(|kind| {
                     Refusal::new(kind, None, "no unique harness catalogs the model")
                 })?;
@@ -911,16 +927,18 @@ impl AdapterSet {
         }
     }
 
-    /// The bundled catalog of each configured harness, or of `harness` only.
+    /// The catalog of each configured harness, or of `harness` only:
+    /// bundled, or discovered by Codex's live server.
     pub fn models(&self, harness: Option<&str>) -> Vec<ModelEntry> {
         self.adapters()
             .filter(|adapter| harness.is_none_or(|harness| harness == adapter.name()))
             .flat_map(|adapter| {
-                adapter.catalog().iter().map(move |entry| ModelEntry {
-                    model: entry.model.clone(),
+                let catalog = adapter.catalog(&self.config).into_owned();
+                catalog.into_iter().map(move |entry| ModelEntry {
+                    model: entry.model,
                     harness: adapter.name(),
-                    aliases: entry.aliases.clone(),
-                    source: ModelSource::Bundled,
+                    aliases: entry.aliases,
+                    source: adapter.source(),
                 })
             })
             .collect()

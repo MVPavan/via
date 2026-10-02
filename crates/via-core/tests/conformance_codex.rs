@@ -1249,6 +1249,51 @@ fn check_variant(
     conformance_expect::check(expect, &outcome).map_err(|wrong| format!("{name}:\n{wrong}"))
 }
 
+/// [`check_variant`] with the default knobs, then `then` on the adapter
+/// set the case ran on, once every turn settled.
+fn check_variant_then(
+    name: &str,
+    replay: &Value,
+    expect: &Value,
+    then: impl FnOnce(&conformance_drive::Pure) -> Result<(), String>,
+) -> Result<(), String> {
+    conformance_expect::validate(expect).map_err(|e| format!("{name}: {e}"))?;
+    let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let path = dir.path().join(format!("{name}.replay.json"));
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(replay).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let outcome = conformance_drive::Pure::run("codex", name, expect, &path)?
+        .drive_then(expect, &path, conformance_run::Knobs::default(), then)
+        .map_err(|why| format!("{why} ({ADAPTER_BEAD} variant {name})"))?;
+    conformance_expect::check(expect, &outcome).map_err(|wrong| format!("{name}:\n{wrong}"))
+}
+
+/// C2 §5 AD7 (x.3.2 X3 fix r1, finding 14): once a handshake check
+/// refused the recipe, the next identical spawn's plan refuses it,
+/// `harness_unavailable` with `reason: "handshake_refused"`, before any
+/// receipt or launch.
+fn refused_from_cache(pure: &conformance_drive::Pure) -> Result<(), String> {
+    let request = via_adapters::DescribeRequest {
+        harness: Some("codex".to_owned()),
+        model: Some("gpt-6-sol".to_owned()),
+        cwd: Some("/work/project".into()),
+        ..via_adapters::DescribeRequest::default()
+    };
+    let plan = pure.set.plan(&request).map_err(|e| format!("{e:?}"))?;
+    let plan = serde_json::to_value(&plan).map_err(|e| e.to_string())?;
+    let refusal = &plan["refusals"][0];
+    if plan["version_status"] != "refused"
+        || refusal["kind"] != "harness_unavailable"
+        || refusal["reason"] != "handshake_refused"
+    {
+        return Err(format!("no cached refusal: {plan}"));
+    }
+    Ok(())
+}
+
 /// [`check_variant`] with the default knobs.
 fn variant(name: &str, replay: &Value, expect: &Value) -> Result<(), String> {
     check_variant(name, replay, expect, conformance_run::Knobs::default())
@@ -1260,11 +1305,67 @@ fn sigterm() -> Value {
     json!({"await_signal": {"signal": "SIGTERM"}})
 }
 
+/// C2 §5, C1 §3.13 (x.3.2 X3 fix r1, finding 17): once the live server
+/// discovered its catalog, `models --harness codex` lists it as
+/// `discovered`, a model-only plan resolves Codex from it, and a plan
+/// naming no model takes its default. Before discovery there is none.
+#[test]
+fn codex_discovery_feeds_models() {
+    let name = "codex_discovery_feeds_models";
+    let (replay, expect) = plain(name).unwrap();
+    let pure = |set: &via_adapters::AdapterSet| -> Result<(), String> {
+        let models = serde_json::to_value(set.models(Some("codex"))).map_err(|e| e.to_string())?;
+        let want = json!([
+            {"model": "gpt-6.1-sol", "harness": "codex", "aliases": [], "source": "discovered"},
+            {"model": "gpt-6-sol", "harness": "codex", "aliases": [], "source": "discovered"},
+            {"model": "gpt-6-luna", "harness": "codex", "aliases": [], "source": "discovered"},
+        ]);
+        if models != want {
+            return Err(format!("models: {models}"));
+        }
+        let only_model = via_adapters::DescribeRequest {
+            model: Some("gpt-6-luna".to_owned()),
+            ..via_adapters::DescribeRequest::default()
+        };
+        let plan = set
+            .plan(&only_model)
+            .map_err(|e| format!("model-only: {e:?}"))?;
+        if plan.harness != "codex" {
+            return Err(format!("model-only resolved {}", plan.harness));
+        }
+        let no_model = via_adapters::DescribeRequest {
+            harness: Some("codex".to_owned()),
+            ..via_adapters::DescribeRequest::default()
+        };
+        let plan = set
+            .plan(&no_model)
+            .map_err(|e| format!("no model: {e:?}"))?;
+        if plan.model.resolved != "gpt-6.1-sol" {
+            return Err(format!("default: {}", plan.model.resolved));
+        }
+        Ok(())
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(format!("{name}.replay.json"));
+    std::fs::write(&path, serde_json::to_vec_pretty(&replay).unwrap()).unwrap();
+    let before = conformance_drive::Pure::run("codex", name, &expect, &path).unwrap();
+    assert!(
+        before.set.models(Some("codex")).is_empty(),
+        "none before discovery"
+    );
+    let outcome = before
+        .drive_then(&expect, &path, conformance_run::Knobs::default(), |run| {
+            pure(&run.set)
+        })
+        .unwrap();
+    conformance_expect::check(&expect, &outcome).unwrap();
+}
+
 /// F13 (packet §8 `codex_pin_handshake`): one initialize/initialized per
 /// connection, with neither an experimental capability nor an opt-out
 /// (every fixture's first step pins their absence); the version comes
 /// from `userAgent`, and one outside `checked` proceeds as untested; a
-/// malformed handshake and a policy or sandbox echo mismatch refuse the
+/// malformed handshake and a policy, sandbox, model or cwd echo mismatch refuse the
 /// turn (`protocol`) before any `turn/start`; a `model/list` cursor left at
 /// the page bound or past the byte bound fails discovery as `protocol`.
 #[test]
@@ -1306,13 +1407,29 @@ fn codex_pin_handshake() {
             "\"sandbox\":{\"type\":\"dangerFullAccess\"}",
             "\"sandbox\":{\"type\":\"readOnly\"}",
         ),
+        // The thread reply's own model and cwd, not the thread record's
+        // (packet §3 readback; x.3.2 X3 fix r1, finding 13).
+        (
+            "codex_pin_handshake_model_echo",
+            "\"model\":\"gpt-6-sol\",\"modelProvider\":\"openai\",\"serviceTier\"",
+            "\"model\":\"gpt-6-luna\",\"modelProvider\":\"openai\",\"serviceTier\"",
+        ),
+        (
+            "codex_pin_handshake_cwd_echo",
+            "\"disabledPluginIds\":[],\"cwd\":\"/work/project\"",
+            "\"disabledPluginIds\":[],\"cwd\":\"/work/elsewhere\"",
+        ),
     ] {
         let (mut replay, mut expect) = plain(name).unwrap();
         let answer = step_with(&replay, "\"result\":{\"thread\"").unwrap();
         edit_emit(&mut replay, answer, from, to).unwrap();
         cut_after(&mut replay, answer, &[json!({"await_eof": {}})]).unwrap();
-        unaccepted(&mut expect, "protocol", tested());
-        variant(name, &replay, &expect).unwrap();
+        // `HandshakeRefused`, which Core reports as `submit_failed` with
+        // `failure.data.reason: "handshake_refused"` (C1 §5; Core's mapping
+        // is pinned by `core_handshake_refused_is_submit_failed`), never
+        // `protocol` (x.3.2 X3 fix r1, finding 22).
+        unaccepted(&mut expect, "handshake_refused", tested());
+        check_variant_then(name, &replay, &expect, refused_from_cache).unwrap();
     }
 
     // model/list: a cursor left at the page bound, then a catalog past
@@ -1678,6 +1795,141 @@ fn codex_never_ask() {
         ..conformance_run::Knobs::default()
     };
     check_variant("codex_never_ask", &replay, &expect, knobs).unwrap();
+}
+
+/// c1's second vendor turn.
+const TURN2: &str = "019a0000-0000-7000-8000-000000200002";
+
+/// `c1_commentary_usage` with `inserted` emitted right after its second
+/// turn started, cut after them with `tail`; turn 2 loses its gate.
+fn c1_turn2_with(name: &str, inserted: &[Value], tail: &[Value]) -> Result<(Value, Value), String> {
+    let mut replay = replay_of("c1_commentary_usage")?;
+    let mut expect = expect_of("c1_commentary_usage")?;
+    replay["source"] = json!(format!("{name}: a variant of c1_commentary_usage"));
+    expect["source"] = replay["source"].clone();
+    let started = step_with(
+        &replay,
+        &format!(
+            "\"turn/started\",\"params\":{{\"threadId\":\"{THREAD}\",\"turn\":{{\"id\":\"{TURN2}\""
+        ),
+    )?;
+    let all = steps(&mut replay)?;
+    // Turn 2's gate goes with its expectation.
+    let gate = all[started..]
+        .iter()
+        .position(|step| step.get("await_signal").is_some())
+        .ok_or("turn 2 has no gate")?;
+    all.remove(started + gate);
+    for (offset, step) in inserted.iter().enumerate() {
+        all.insert(started + 1 + offset, step.clone());
+    }
+    if !tail.is_empty() {
+        cut_after(&mut replay, started + inserted.len(), tail)?;
+    }
+    turn_mut(&mut expect, 1)
+        .as_object_mut()
+        .ok_or("turn 2")?
+        .remove("gates");
+    Ok((replay, expect))
+}
+
+/// Every `undecoded.bin` under `root`, relative to it.
+fn undecoded_under(root: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.file_name().is_some_and(|name| name == "undecoded.bin") {
+                let relative = path.strip_prefix(root).unwrap_or(&path);
+                found.push(relative.display().to_string());
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// X0 item 5 steps 5 and 6 (x.3.2 X3 fix r1, finding 10): a malformed
+/// message is evidence of the turn it names, else of the server, never of
+/// whichever turn runs. While turn 2 runs, a malformed `turn/completed`
+/// naming turn 1 is kept in turn 1's folder, and a malformed thread-level
+/// notification in the server folder; either way the generation fails
+/// turn 2 `protocol`.
+#[test]
+fn codex_malformed_evidence_owner() {
+    let base = turn_mut(&mut expect_of("c1_commentary_usage").unwrap(), 1)["expect"].clone();
+    for (name, malformed, owner) in [
+        (
+            "codex_malformed_evidence_earlier_turn",
+            json!({"method": "turn/completed",
+                "params": {"threadId": THREAD, "turn": {"id": TURN, "status": 7}}}),
+            "s_000000000001/1/",
+        ),
+        (
+            "codex_malformed_evidence_thread_level",
+            // Past the full decode's nesting bound (64), within the peek's.
+            json!({"method": "thread/status/changed",
+                "params": {"threadId": THREAD, "status": {"type": "idle"},
+                    "nested": serde_json::from_str::<Value>(
+                        &format!("{}{}", "[".repeat(80), "]".repeat(80))).unwrap()}}),
+            "evidence/servers/",
+        ),
+    ] {
+        let (replay, mut expect) =
+            c1_turn2_with(name, &[emit(&malformed)], &[json!({"await_eof": {}})]).unwrap();
+        let turn = &mut turn_mut(&mut expect, 1)["expect"];
+        turn["terminal"] = Value::Null;
+        turn["usage"] = Value::Null;
+        turn["final_text"] = Value::Null;
+        turn["error"] = json!("protocol");
+        turn["observations_include"] = json!([base["observations_include"][0].clone()]);
+        turn["observations_exclude"] = json!(["final_text"]);
+        turn["observations_order"] = json!(["turn.accepted"]);
+        let mut kept = Vec::new();
+        check_variant_then(name, &replay, &expect, |run| {
+            kept = undecoded_under(run.state.path());
+            kept.extend(undecoded_under(run.case_dir.path()));
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            kept.len() == 1 && kept[0].contains(owner),
+            "{name}: evidence kept at {kept:?}, not under {owner}"
+        );
+    }
+}
+
+/// X0 items 5 and 11 (x.3.2 X3 fix r1, finding 11): a declined request
+/// belongs to the turn it names. While turn 2 runs, the connection
+/// answers requests naming turn 1 and an unknown turn as it answers turn
+/// 2's own, but only turn 2's is reported to turn 2.
+#[test]
+fn codex_decline_owner() {
+    let name = "codex_decline_owner";
+    let mut inserted = Vec::new();
+    for (n, turn) in [TURN, "019a0000-0000-7000-8000-000000200099", TURN2]
+        .into_iter()
+        .enumerate()
+    {
+        let id = json!(80 + n);
+        inserted.push(emit(&json!({"id": id,
+            "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": THREAD, "turnId": turn, "itemId": format!("item-{n}")}})));
+        inserted.push(json!({"expect": {
+            "line": {"id": id, "result": {"decision": "decline"}},
+            "absent": ["/error"],
+            "within_ms": 5250,
+        }}));
+    }
+    let (replay, mut expect) = c1_turn2_with(name, &inserted, &[]).unwrap();
+    turn_mut(&mut expect, 1)["expect"]["observation_counts"] =
+        json!({"turn.accepted": 1, "vendor.request_declined": 1});
+    turn_mut(&mut expect, 0)["expect"]["observation_counts"] =
+        json!({"turn.accepted": 1, "vendor.request_declined": 0});
+    variant(name, &replay, &expect).unwrap();
 }
 
 /// F8 remainder (packet §8 `codex_bound_gate`; the pure refusals are

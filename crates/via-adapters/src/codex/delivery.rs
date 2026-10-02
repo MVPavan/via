@@ -20,12 +20,12 @@
 //! reaches Core after `run_turn` returned. The seal reports the first
 //! message it may have left undelivered, a conservative lower bound.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use via_routes::RouteRuntime;
 use via_routes::codex::{
     Connection, DECLINE_DEADLINE, Incoming, Lane, LaneEnd, LaneEvent, LaneItem, Notification,
     Routed, ServerRequest, TurnFolder, decode,
@@ -37,7 +37,7 @@ use crate::observation::{
     Acceptance, Observation, ObservationItem, ObservationSink, Reserved, VendorTerminal, admitted,
 };
 use crate::runtime::event_stall;
-use crate::{DriverFailure, DriverHealth, SessionId, TurnActivity, TurnNumber, VendorTurnId};
+use crate::{DriverFailure, DriverHealth, TurnActivity, TurnNumber, VendorTurnId};
 
 /// `omitted` when the count of lost messages is unknown or saturated
 /// (X0 item 10).
@@ -296,12 +296,15 @@ fn flow(open: bool) -> Flow {
     if open { Flow::Next } else { Flow::Done }
 }
 
-/// Where a malformed message's evidence is kept (X0 item 5).
+/// The evidence folder of each turn a generation ran, by turn.
+pub(crate) type Folders = Arc<Mutex<BTreeMap<TurnNumber, Arc<TurnFolder>>>>;
+
+/// Where a malformed message's evidence is kept (X0 item 5): the turn's
+/// folder, an earlier turn's of the generation, or the server folder.
 pub(crate) struct Evidence {
     pub(crate) folder: Arc<TurnFolder>,
     pub(crate) connection: Arc<Connection>,
-    pub(crate) runtime: Arc<RouteRuntime>,
-    pub(crate) session: SessionId,
+    pub(crate) earlier: Folders,
 }
 
 /// One accepted turn's normalizer task.
@@ -398,15 +401,21 @@ impl Normalizing {
                 folder.take_undecoded()
             }
             Owner::Earlier(turn) => {
-                let evidence = &self.evidence;
-                match evidence.runtime.turn_folder(&evidence.session, turn).await {
-                    Ok(folder) => {
+                let folder = self
+                    .evidence
+                    .earlier
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(&turn)
+                    .cloned();
+                match folder {
+                    Some(folder) => {
                         folder
                             .keep_undecoded(bytes, "an earlier turn's message")
                             .await;
                         folder.take_undecoded()
                     }
-                    Err(_) => None,
+                    None => None,
                 }
             }
             Owner::Unknown | Owner::Thread => {

@@ -39,15 +39,16 @@ use via_routes::codex::{
 use via_routes::{Retirement, SendOutcome, StoreFailure, WireCleanup};
 
 use super::delivery::{
-    Delivery, Evidence, Losses, Normalizing, Retained, Stop, UNKNOWN, losses as lock_losses,
+    Delivery, Evidence, Folders, Losses, Normalizing, Retained, Stop, UNKNOWN,
+    losses as lock_losses,
 };
 use super::normalize::{self, DiscoveredModel, StructuredOutput, TurnNormalizer};
 use super::plan::{self as codex_plan, Sandbox};
 use super::{ADAPTER_VERSION, CodexAdapter, HARNESS, PerTurn, refusals};
 use crate::driver::turn::{CLEANUP_ALLOWANCE, end_active};
 use crate::driver::{
-    Active, ConnectionPin, DriverState, ForceWatch, Prepared, Retiring, SessionDriver, TurnCx,
-    TurnSpec, latch, lock, rejected,
+    Active, ConnectionPin, DriverState, ForceWatch, Prepared, Retiring, SessionDriver, SessionSpec,
+    TurnCx, TurnSpec, latch, lock, rejected,
 };
 use crate::harness::Harness;
 use crate::instance::Incompatibility;
@@ -100,6 +101,9 @@ struct Attached {
     registered: Arc<AtomicBool>,
     connection: Arc<Connection>,
     generation: u64,
+    /// The evidence folder of each turn this generation ran: a malformed
+    /// message naming an earlier one is kept there (X0 item 5).
+    folders: Folders,
     /// The session's lease, held from its first join until close (AD16).
     lease: ServerPin,
 }
@@ -115,6 +119,7 @@ struct Generation {
     number: u64,
     thread: Option<Arc<Thread>>,
     signal: Arc<LeaseSignal>,
+    folders: Folders,
 }
 
 impl CodexSession {
@@ -193,6 +198,7 @@ impl CodexSession {
                 number: current.generation,
                 thread: current.thread.clone(),
                 signal: Arc::clone(&current.signal),
+                folders: Arc::clone(&current.folders),
             });
         }
         let lease = pin.duplicate()?;
@@ -209,6 +215,7 @@ impl CodexSession {
             generation,
         )));
         let subscription = connection.subscribe(Arc::clone(&signal));
+        let folders = Folders::default();
         let replaced = attached.replace(Attached {
             thread: None,
             _subscription: subscription,
@@ -216,6 +223,7 @@ impl CodexSession {
             registered: Arc::clone(&registered),
             connection: Arc::clone(connection),
             generation,
+            folders: Arc::clone(&folders),
             lease,
         });
         drop(attached);
@@ -224,6 +232,7 @@ impl CodexSession {
             number: generation,
             thread: None,
             signal,
+            folders,
         })
     }
 
@@ -781,10 +790,16 @@ async fn turn(
             Err(end) => return *end,
         }
     };
+    generation
+        .folders
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(turn, Arc::clone(&folder));
     let start = Started {
         thread: &thread,
         connection: &connection,
         generation: generation.number,
+        folders: &generation.folders,
         signal: &generation.signal,
         sandbox: &sandbox,
         effort: effort.as_deref(),
@@ -916,7 +931,8 @@ fn adopt(facts: &mut Turn<'_>, server: &via_routes::codex::ServerFacts) -> Arc<[
             .record_version(HARNESS, &adapter.binary, version.to_owned());
     }
     let catalog: Arc<[DiscoveredModel]> = server.models.iter().map(normalize::discovered).collect();
-    adapter.discovered(Arc::clone(&catalog));
+    let key = adapter.server_key(facts.driver.spec.inherit.requested);
+    adapter.discovered(key, Arc::clone(&catalog));
     catalog
 }
 
@@ -1152,13 +1168,10 @@ async fn confirm(
 ) -> Result<(), Box<TurnEnd>> {
     let driver = facts.driver;
     let turn = facts.number;
-    if let Some(field) = echo_differs(opened, mode) {
+    if let Some(field) = echo_differs(opened, mode, &driver.spec) {
         let adapter = &facts.session.adapter;
         // The recipe key the refused handshake is cached under.
-        let hash = adapter
-            .recipe(driver.spec.inherit.requested)
-            .config_hash(ADAPTER_VERSION)
-            .hex();
+        let hash = adapter.server_key(driver.spec.inherit.requested);
         adapter.instances.record_refusal(
             &adapter.binary,
             hash,
@@ -1206,15 +1219,24 @@ async fn confirm(
     Ok(())
 }
 
-/// The first echoed policy field that is not the one requested (packet §3:
-/// never, the user reviewer, the bound's sandbox).
-fn echo_differs(opened: &ThreadResult, mode: SandboxMode) -> Option<&'static str> {
+/// The first echoed field that is not the one requested (packet §3:
+/// never, the user reviewer, the bound's sandbox, the session's model and
+/// directory).
+fn echo_differs(
+    opened: &ThreadResult,
+    mode: SandboxMode,
+    spec: &SessionSpec,
+) -> Option<&'static str> {
     let sandbox = match mode {
         SandboxMode::ReadOnly => "readOnly",
         SandboxMode::WorkspaceWrite => "workspaceWrite",
         SandboxMode::DangerFullAccess => "dangerFullAccess",
     };
-    if opened.approval_policy.as_str() != Some("never") {
+    if opened.model != spec.model {
+        Some("model")
+    } else if Path::new(&opened.cwd) != spec.cwd {
+        Some("cwd")
+    } else if opened.approval_policy.as_str() != Some("never") {
         Some("approvalPolicy")
     } else if opened.approvals_reviewer.as_deref() != Some("user") {
         Some("approvalsReviewer")
@@ -1333,6 +1355,7 @@ struct Started<'a> {
     thread: &'a Arc<Thread>,
     connection: &'a Arc<Connection>,
     generation: u64,
+    folders: &'a Folders,
     /// The generation's abnormal-end signal: its decode positions.
     signal: &'a LeaseSignal,
     sandbox: &'a Sandbox,
@@ -1469,8 +1492,7 @@ fn normalize_on_tracker(
             evidence: Evidence {
                 folder: Arc::clone(start.folder),
                 connection: Arc::clone(start.connection),
-                runtime: Arc::clone(&driver.runtime),
-                session: driver.spec.session_id.clone(),
+                earlier: Arc::clone(start.folders),
             },
             activity: activity.clone(),
             cancel: driver.cancel.clone(),

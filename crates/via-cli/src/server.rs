@@ -191,6 +191,8 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
         StoreLock::acquire(&paths.state).map_err(|error| anyhow::anyhow!("store lock: {error}"))?;
     // Task 4 design §7.6: after both locks, before the Store opens.
     log::open(&paths.state).map_err(|error| anyhow::anyhow!("open via.log: {error}"))?;
+    // x.3.2 X0 item 2.5: from here a panic's line goes to `via.log` only.
+    log::panic_hook();
     // Both locks precede every mutation of the State directory (§6.1).
     ensure_dir(&paths.runtime.join("anchors"))?;
     ensure_vendor_dir(&paths.state)?;

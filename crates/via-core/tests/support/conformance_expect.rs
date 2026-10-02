@@ -506,6 +506,7 @@ const DRIVER_FAILURE: &[&str] = &[
     "server_lost",
     "resume_mismatch",
     "retirement_uncertain",
+    "handshake_refused",
 ];
 const CLOSE_MODE: &[&str] = &["graceful", "force"];
 /// C2 §4 observation kinds and the fields an entry may state for each.
@@ -1258,6 +1259,9 @@ const ERROR: &[&str] = &[
     // C2 §2 identity: `AdapterError::ResumeMismatch { evidence }`, for a
     // mismatch before a terminal was retained; never `Rejected`.
     "resume_mismatch",
+    // C2 §5 AD7: `RouteError::HandshakeRefused`, which Core reports as
+    // `submit_failed` with `failure.data.reason: "handshake_refused"`.
+    "handshake_refused",
 ];
 /// C2 `StartRejected`; a name ending in `:` takes a non-empty suffix.
 const REJECTED: &[&str] = &[

@@ -14,6 +14,7 @@ mod plan;
 #[cfg(test)]
 mod tests;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -24,8 +25,8 @@ use crate::config::BootstrapEnv;
 use crate::harness::Harness;
 use crate::instance::InstanceCache;
 use crate::plan::{
-    Bound, DescribeRequest, Inherit, ModelChoice, Refusal, RefusalKind, RoutePlan, ServerKey,
-    TurnCheck, TurnParams, VendorOptions, effective_inherit,
+    Bound, CatalogModel, DescribeRequest, Inherit, ModelChoice, Refusal, RefusalKind, RoutePlan,
+    ServerKey, TurnCheck, TurnParams, VendorOptions, effective_inherit,
 };
 
 pub(crate) use driver::{CodexSession, connection_id, run_turn};
@@ -57,10 +58,12 @@ pub(crate) struct CodexAdapter {
     env: BootstrapEnv,
     /// The shared-server registry (x.3.2 X0 item 2).
     servers: Arc<Servers>,
-    /// The last catalog a server's `model/list` discovery returned, whole
-    /// (packet §3): it resolves a plan with no model to its default (ruling
-    /// Q1) and judges a vendor effort.
-    catalog: Mutex<Option<Arc<[DiscoveredModel]>>>,
+    /// Each server key's catalog, whole, as its live instance's
+    /// `model/list` discovery last returned it (packet §3: cached per
+    /// server instance): it resolves a plan with no model to its default
+    /// (ruling Q1), lists the route's models and resolves a model-only
+    /// plan (C1 §3.13), and judges a vendor effort.
+    catalogs: Mutex<BTreeMap<String, Arc<[DiscoveredModel]>>>,
 }
 
 /// One turn's values the route judges purely.
@@ -83,7 +86,7 @@ impl CodexAdapter {
             instances,
             env: env.clone(),
             servers: Servers::new(runtime, normalize::DECLINES),
-            catalog: Mutex::new(None),
+            catalogs: Mutex::default(),
         }
     }
 
@@ -103,17 +106,39 @@ impl CodexAdapter {
         ServerRecipe::new(&self.binary, requested, &self.env, &self.vendor_home())
     }
 
-    /// The last discovered catalog, if any.
-    fn catalog(&self) -> Option<Arc<[DiscoveredModel]>> {
-        self.catalog
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+    /// The server key of `requested`'s recipe: what equal sessions share.
+    fn server_key(&self, requested: Inherit) -> String {
+        self.recipe(requested).config_hash(ADAPTER_VERSION).hex()
     }
 
-    /// Keeps a server's whole discovered catalog.
-    fn discovered(&self, models: Arc<[DiscoveredModel]>) {
-        *self.catalog.lock().unwrap_or_else(PoisonError::into_inner) = Some(models);
+    /// The catalog server key `key`'s instance discovered, if any.
+    fn catalog(&self, key: &str) -> Option<Arc<[DiscoveredModel]>> {
+        self.catalogs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(key)
+            .cloned()
+    }
+
+    /// Keeps the whole catalog server key `key`'s instance discovered.
+    fn discovered(&self, key: String, models: Arc<[DiscoveredModel]>) {
+        self.catalogs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key, models);
+    }
+
+    /// The models `requested`'s server discovered (C1 §3.13 `models`, and
+    /// model-only resolution): none before its discovery.
+    pub(crate) fn listed(&self, requested: Inherit) -> Vec<CatalogModel> {
+        self.catalog(&self.server_key(requested))
+            .iter()
+            .flat_map(|catalog| catalog.iter())
+            .map(|model| CatalogModel {
+                model: model.model.clone(),
+                aliases: Vec::new(),
+            })
+            .collect()
     }
 
     /// The plan of a spawn or `describe` (C2 §2): pure but for one `stat`
@@ -129,7 +154,8 @@ impl CodexAdapter {
         requested: Inherit,
     ) -> Result<RoutePlan, Refusal> {
         let route = harness.route();
-        let catalog = self.catalog();
+        let key = self.server_key(requested);
+        let catalog = self.catalog(&key);
         let model = resolved_model(req.model.as_deref(), catalog.as_deref()).ok_or_else(|| {
             Refusal::new(
                 RefusalKind::UnknownModel,
@@ -162,13 +188,20 @@ impl CodexAdapter {
             .clone()
             .filter(|bound| plan::sandbox(bound).is_ok());
         let (inherit, switch_warning) = effective_inherit(&plan::categories(), requested);
-        let key = self.recipe(requested).config_hash(ADAPTER_VERSION);
         let vendor_version = self.instances.last_version(harness.name(), &self.binary);
         let refused = self
             .instances
-            .refusal(&self.binary, &key.hex(), std::time::Instant::now())
+            .refusal(&self.binary, &key, std::time::Instant::now())
             .is_some();
         let version_status = if refused {
+            // C2 §5 AD7: a cached refusal refuses the plan, as Claude's.
+            let mut refusal = Refusal::new(
+                RefusalKind::VersionRefused,
+                Some(route),
+                "a recent handshake check of this binary failed on something VIA relies on",
+            );
+            refusal.reason = Some("handshake_refused");
+            refusals.push(refusal);
             crate::plan::VersionStatus::Refused
         } else {
             vendor_version.as_deref().map_or(
@@ -194,7 +227,7 @@ impl CodexAdapter {
             inherit,
             // VIA's launch settings only (ruling: X0 item 3): sessions with
             // equal keys share one server.
-            server_key: Some(ServerKey::new(key.hex())),
+            server_key: Some(ServerKey::new(key)),
         })
     }
 

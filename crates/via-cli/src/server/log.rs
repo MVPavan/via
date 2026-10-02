@@ -93,3 +93,219 @@ pub(super) fn open(state: &Path) -> io::Result<()> {
 pub(super) fn serving() {
     LOG.startup.store(false, Ordering::Release);
 }
+
+/// The most bytes of a panic's `via.log` line.
+const PANIC_LINE: usize = 1024;
+
+/// Installs the daemon's panic hook once `via.log` is open (x.3.2 X0 item
+/// 2.5, r8 R8-1). It replaces the default hook and never chains it: the
+/// default writes stderr, which can block on an undrained pipe before the
+/// unwind reaches an abort. The hook formats one JSON line, message and
+/// location, truncated to 1 KiB, in a stack buffer and writes it to the
+/// `via.log` file only, under `try_lock`: a held or poisoned log skips the
+/// line and a write error is ignored. It never panics and never waits.
+pub(super) fn panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let mut line = Bounded::default();
+        line.push(br#"{"level":"ERROR","panic":""#);
+        let message = info.payload_as_str().unwrap_or("Box<dyn Any>");
+        line.escaped(message);
+        line.push(br#"","location":""#);
+        if let Some(location) = info.location() {
+            line.escaped(location.file());
+            let mut digits = itoa_buffer();
+            line.push(b":");
+            line.push(itoa(location.line(), &mut digits));
+            line.push(b":");
+            line.push(itoa(location.column(), &mut digits));
+        }
+        line.close(b"\"}\n");
+        if let Ok(mut file) = LOG.file.try_lock()
+            && let Some(file) = file.as_mut()
+        {
+            let _ = file.write_all(line.bytes());
+        }
+    }));
+}
+
+/// A line in a stack buffer, truncated at [`PANIC_LINE`] with room kept
+/// for its close.
+struct Bounded {
+    buffer: [u8; PANIC_LINE],
+    len: usize,
+}
+
+impl Default for Bounded {
+    fn default() -> Self {
+        Self {
+            buffer: [0; PANIC_LINE],
+            len: 0,
+        }
+    }
+}
+
+impl Bounded {
+    /// Room kept for the close: `"}` and the newline.
+    const CLOSE: usize = 3;
+
+    /// Appends `bytes` whole, or nothing once they would not fit.
+    fn push(&mut self, bytes: &[u8]) -> bool {
+        let end = self.len + bytes.len();
+        if end > PANIC_LINE - Self::CLOSE {
+            return false;
+        }
+        self.buffer[self.len..end].copy_from_slice(bytes);
+        self.len = end;
+        true
+    }
+
+    /// Appends `text` as JSON string content, up to the bound.
+    fn escaped(&mut self, text: &str) {
+        for c in text.chars() {
+            let mut utf8 = [0; 4];
+            let fits = match c {
+                '"' => self.push(b"\\\""),
+                '\\' => self.push(b"\\\\"),
+                '\n' => self.push(b"\\n"),
+                c if u32::from(c) < 0x20 => {
+                    let hex = b"0123456789abcdef";
+                    let code = u32::from(c) as usize;
+                    self.push(&[b'\\', b'u', b'0', b'0', hex[code >> 4], hex[code & 15]])
+                }
+                c => self.push(c.encode_utf8(&mut utf8).as_bytes()),
+            };
+            if !fits {
+                return;
+            }
+        }
+    }
+
+    /// Appends the close, for which room was kept.
+    fn close(&mut self, bytes: &[u8]) {
+        let end = self.len + bytes.len();
+        self.buffer[self.len..end].copy_from_slice(bytes);
+        self.len = end;
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.buffer[..self.len]
+    }
+}
+
+/// A buffer for [`itoa`].
+fn itoa_buffer() -> [u8; 10] {
+    [0; 10]
+}
+
+/// `value` in decimal, in `buffer`.
+fn itoa(mut value: u32, buffer: &mut [u8; 10]) -> &[u8] {
+    let mut start = buffer.len();
+    loop {
+        start -= 1;
+        buffer[start] = b'0' + u8::try_from(value % 10).unwrap_or(0);
+        value /= 10;
+        if value == 0 {
+            return &buffer[start..];
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The hook's case runs in a child copy of this test binary, since the
+    //! abort ends it: the parent re-executes itself on the one test and
+    //! reads how the child ended (x.3.2 X0 item 2.5, Ruling D).
+
+    use std::io::Write;
+    use std::os::unix::process::ExitStatusExt;
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    /// Names the scenario a child runs, with its state directory.
+    const CHILD: &str = "VIA_PANIC_HOOK_CHILD";
+    const SIGABRT: i32 = 6;
+
+    /// The hook's line stays within 1 KiB and stays one JSON line, its
+    /// message escaped and truncated whole characters at a time.
+    #[test]
+    fn panic_line_is_bounded_json() {
+        let mut line = super::Bounded::default();
+        line.push(br#"{"panic":""#);
+        line.escaped(&format!("a\"b\\c\nd\u{1}é{}", "x".repeat(4096)));
+        line.close(b"\"}\n");
+        let bytes = line.bytes();
+        assert!(bytes.len() <= super::PANIC_LINE);
+        let text = std::str::from_utf8(bytes).unwrap();
+        assert_eq!(text.matches('\n').count(), 1);
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert!(
+            value["panic"]
+                .as_str()
+                .unwrap()
+                .starts_with("a\"b\\c\nd\u{1}éxx")
+        );
+        let mut digits = super::itoa_buffer();
+        assert_eq!(super::itoa(0, &mut digits), b"0");
+        assert_eq!(super::itoa(u32::MAX, &mut digits), b"4294967295");
+    }
+
+    /// X0 item 2.7 `panic_hook_aborts_with_full_stderr`: with its stderr a
+    /// full pipe nobody reads, a panic the daemon turns into an abort
+    /// (`crash_on_panic`, the registry guard) still ends the daemon by
+    /// `SIGABRT` within a bound: the hook writes its one line to `via.log`
+    /// and never to stderr, where the default hook would block.
+    #[test]
+    fn panic_hook_aborts_with_full_stderr() {
+        if let Ok(dir) = std::env::var(CHILD) {
+            super::open(Path::new(&dir)).unwrap();
+            super::serving();
+            super::panic_hook();
+            let unwound = std::panic::catch_unwind(|| panic!("registry step \"failed\""));
+            if unwound.is_err() {
+                std::process::abort();
+            }
+            std::process::exit(0);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        rustix::fs::fcntl_setfl(&writer, rustix::fs::OFlags::NONBLOCK).unwrap();
+        let block = [b'x'; 4096];
+        while writer.write(&block).is_ok() {}
+        rustix::fs::fcntl_setfl(&writer, rustix::fs::OFlags::empty()).unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "server::log::tests::panic_hook_aborts_with_full_stderr",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, dir.path())
+            .stdout(Stdio::null())
+            .stderr(writer)
+            .spawn()
+            .unwrap();
+        let bound = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() > bound {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        drop(reader);
+        let status = status.expect("the child blocked on its full stderr");
+        assert_eq!(status.signal(), Some(SIGABRT), "child ended {status:?}");
+        let log = std::fs::read_to_string(dir.path().join("via.log")).unwrap();
+        let line: serde_json::Value = serde_json::from_str(log.trim_end()).unwrap();
+        assert_eq!(line["panic"], "registry step \"failed\"", "{log}");
+        assert!(
+            line["location"].as_str().unwrap().contains("log.rs"),
+            "{log}"
+        );
+    }
+}
