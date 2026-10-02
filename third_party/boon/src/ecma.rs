@@ -8,8 +8,9 @@ use regex_syntax::ast::{self, *};
 //
 // VIA patch: linear in the pattern's length. Upstream fixed one `\c` escape
 // or translated one perl class per round, reparsing the whole pattern each
-// time (quadratic). The result is upstream's: every `\c{letter}` the parser
-// reaches as an escape becomes its control character, then every perl class
+// time (quadratic). The result is upstream's but for the ECMA fixes below
+// (critical r2 #7): every `\c{letter}` the parser reaches as an escape
+// becomes its control character, then every perl class, `.`, `\b` and `\B`
 // is replaced in one pass over one parse.
 pub(crate) fn convert(pattern: &str) -> Result<Cow<str>, Box<dyn std::error::Error>> {
     let (pattern, ast) = parse_fixing_controls(pattern)?;
@@ -30,6 +31,20 @@ pub(crate) fn convert(pattern: &str) -> Result<Cow<str>, Box<dyn std::error::Err
     Ok(Cow::Owned(out))
 }
 
+// VIA patch (critical r2 #7): ECMA-262's meaning of `\s`, `.` and `\b`,
+// where upstream kept Rust's. `\s` is WhiteSpace plus LineTerminator
+// (upstream's set lacked U+1680, U+2000-U+2002, U+2004-U+200A, U+2028,
+// U+202F, U+205F and U+3000); `.` is any character but a LineTerminator
+// (Rust's excludes only U+000A); `\b` and `\B` take ECMA's word
+// characters `[A-Za-z0-9_]` (Rust's are Unicode's). JSON Schema patterns
+// carry no flags. Every character is written as an escape, so an
+// extended-mode pattern keeps it.
+const SPACE: &str = r"[\t\n\x0B\x0C\r\x20\u{A0}\u{1680}\u{2000}-\u{200A}\u{2028}\u{2029}\u{202F}\u{205F}\u{3000}\u{FEFF}]";
+const NOT_SPACE: &str = r"[^\t\n\x0B\x0C\r\x20\u{A0}\u{1680}\u{2000}-\u{200A}\u{2028}\u{2029}\u{202F}\u{205F}\u{3000}\u{FEFF}]";
+const DOT: &str = r"[^\n\r\u{2028}\u{2029}]";
+const WORD_BOUNDARY: &str = r"(?-u:\b)";
+const NOT_WORD_BOUNDARY: &str = r"(?-u:\B)";
+
 // VIA patch: most `\c` fixes an extended-mode pattern may need; past it the
 // pattern is refused rather than reparsed again.
 const EXTENDED_CONTROL_FIXES: usize = 32;
@@ -38,7 +53,8 @@ const EXTENDED_CONTROL_FIXES: usize = 32;
 // control character, as upstream's fix-and-reparse loop leaves it, and its
 // parse. Without extended mode no comment can hide a `\c`, so one scan
 // fixes every escape the parser would reach, and one parse follows; with
-// it, upstream's loop runs, at most [`EXTENDED_CONTROL_FIXES`] times.
+// it, upstream's loop runs, fixing at most [`EXTENDED_CONTROL_FIXES`]
+// escapes and parsing after each.
 fn parse_fixing_controls(pattern: &str) -> Result<(Cow<str>, Ast), Box<dyn std::error::Error>> {
     let first = match Parser::new().parse(pattern) {
         Ok(ast) => return Ok((Cow::Borrowed(pattern), ast)),
@@ -52,16 +68,24 @@ fn parse_fixing_controls(pattern: &str) -> Result<(Cow<str>, Ast), Box<dyn std::
         let ast = Parser::new().parse(&fixed)?;
         return Ok((Cow::Owned(fixed), ast));
     }
-    for _ in 1..EXTENDED_CONTROL_FIXES {
+    // VIA patch (critical r2 #9): the pattern is parsed after each fix,
+    // the last allowed one included.
+    let mut fixes = 1;
+    loop {
         match Parser::new().parse(&fixed) {
             Ok(ast) => return Ok((Cow::Owned(fixed), ast)),
             Err(e) => match fix_error(&e) {
-                Some(s) => fixed = s,
+                Some(_) if fixes == EXTENDED_CONTROL_FIXES => {
+                    Err("too many control escapes in an extended-mode pattern")?
+                }
+                Some(s) => {
+                    fixed = s;
+                    fixes += 1;
+                }
                 None => Err(e)?,
             },
         }
     }
-    Err("too many control escapes in an extended-mode pattern")?
 }
 
 // VIA patch: every `\c{ascii letter}` at an escape position (each `\`
@@ -147,14 +171,17 @@ impl Translator {
             }
             ClassPerlKind::Space => {
                 if perl.negated {
-                    "[^ \t\n\r\u{000b}\u{000c}\u{00a0}\u{feff}\u{2003}\u{2029}]"
+                    NOT_SPACE
                 } else {
-                    "[ \t\n\r\u{000b}\u{000c}\u{00a0}\u{feff}\u{2003}\u{2029}]"
+                    SPACE
                 }
             }
         };
-        self.spans
-            .push((perl.span.start.offset, perl.span.end.offset, with));
+        self.replace(&perl.span, with);
+    }
+
+    fn replace(&mut self, span: &Span, with: &'static str) {
+        self.spans.push((span.start.offset, span.end.offset, with));
     }
 }
 
@@ -178,6 +205,15 @@ impl Visitor for Translator {
             Ast::ClassPerl(perl) => {
                 self.replace_class_class(perl);
             }
+            // VIA patch (critical r2 #7).
+            Ast::Dot(span) => self.replace(span, DOT),
+            Ast::Assertion(assertion) => match assertion.kind {
+                AssertionKind::WordBoundary => self.replace(&assertion.span, WORD_BOUNDARY),
+                AssertionKind::NotWordBoundary => {
+                    self.replace(&assertion.span, NOT_WORD_BOUNDARY)
+                }
+                _ => (),
+            },
             Ast::Literal(ref literal) => {
                 if let Literal {
                     kind: LiteralKind::Special(SpecialLiteralKind::Bell),
@@ -452,8 +488,20 @@ mod tests {
         r"a{\cA}",
     ];
 
+    // VIA patch (critical r2 #7): upstream's text for each ECMA fix's
+    // replacement, so the differential checks that the conversion differs
+    // from upstream's only where those fixes say.
+    fn as_upstream(converted: String) -> String {
+        converted
+            .replace(SPACE, "[ \t\n\r\u{000b}\u{000c}\u{00a0}\u{feff}\u{2003}\u{2029}]")
+            .replace(NOT_SPACE, "[^ \t\n\r\u{000b}\u{000c}\u{00a0}\u{feff}\u{2003}\u{2029}]")
+            .replace(DOT, ".")
+            .replace(WORD_BOUNDARY, r"\b")
+            .replace(NOT_WORD_BOUNDARY, r"\B")
+    }
+
     fn same(input: &str) {
-        let got = convert(input).map(|c| c.into_owned()).map_err(|_| ());
+        let got = convert(input).map(|c| as_upstream(c.into_owned())).map_err(|_| ());
         let want = super::upstream::convert(input)
             .map(|c| c.into_owned())
             .map_err(|_| ());
@@ -474,7 +522,8 @@ mod tests {
         const TOKENS: &[&str] = &[
             r"\d", r"\D", r"\w", r"\W", r"\s", r"\S", r"\cA", r"\cz", r"\cJ", r"\c1", r"\c", r"\\",
             r"\a", "[", "]", "[^", "-", "(", ")", "(?x)", "(?-x)", "(?x:", "(?i)", "#", "\n", " ",
-            "a", "b", "*", "+", "?", "{2}", "|", "^", "$", ".", r"\p{L}", r"\x41", "&&",
+            "a", "b", "*", "+", "?", "{2}", "|", "^", "$", ".", r"\p{L}", r"\x41", "&&", r"\b",
+            r"\B", r"\.",
         ];
         let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
         let mut next = || {
@@ -503,5 +552,120 @@ mod tests {
             elapsed < std::time::Duration::from_millis(500),
             "took {elapsed:?}"
         );
+    }
+
+    // VIA patch (critical r2 #9): an extended-mode pattern needing 32
+    // control-escape fixes converts; one needing 33 is refused.
+    #[test]
+    fn extended_mode_takes_exactly_32_control_fixes() {
+        for (fixes, converts) in [(31, true), (32, true), (33, false)] {
+            let input = format!("(?x)#\n{}", r"\cA".repeat(fixes));
+            let got = convert(&input).map(|c| c.into_owned());
+            assert_eq!(got.is_ok(), converts, "{fixes} fixes: {got:?}");
+            if let Ok(got) = got {
+                assert_eq!(got, format!("(?x)#\n{}", "\u{1}".repeat(fixes)));
+            }
+        }
+    }
+
+    fn matches(pattern: &str, subject: &str) -> bool {
+        let converted = convert(pattern).expect("converts");
+        regex::Regex::new(&converted)
+            .expect("compiles")
+            .is_match(subject)
+    }
+
+    // VIA patch (critical r2 #7): `\s` and `\S` are ECMA-262's WhiteSpace
+    // and LineTerminator set and its complement, inside bracket classes
+    // too; U+0085, in Rust's `\s`, is not in it.
+    #[test]
+    fn space_classes_are_ecma_whitespace() {
+        let spaces = [
+            '\t', '\n', '\u{b}', '\u{c}', '\r', ' ', '\u{a0}', '\u{1680}', '\u{2000}', '\u{2009}',
+            '\u{200a}', '\u{2028}', '\u{2029}', '\u{202f}', '\u{205f}', '\u{3000}', '\u{feff}',
+        ];
+        let others = ['a', '0', '_', '\u{85}', '\u{180e}', '\u{200b}', '\u{1}'];
+        for (subject, space) in spaces
+            .iter()
+            .map(|c| (c, true))
+            .chain(others.iter().map(|c| (c, false)))
+        {
+            let subject = subject.to_string();
+            for (pattern, want) in [
+                (r"^\s$", space),
+                (r"^\S$", !space),
+                (r"^[\s]$", space),
+                (r"^[\S]$", !space),
+                (r"^[^\s]$", !space),
+                (r"^[^\S]$", space),
+                (r"^[x\s]$", space),
+            ] {
+                assert_eq!(matches(pattern, &subject), want, "{pattern} on {subject:?}");
+            }
+        }
+    }
+
+    // VIA patch (critical r2 #7): `.` is any character but the four line
+    // terminators; inside a bracket class it is a literal dot.
+    #[test]
+    fn dot_excludes_ecma_line_terminators() {
+        for (subject, dot) in [
+            ("\n", false),
+            ("\r", false),
+            ("\u{2028}", false),
+            ("\u{2029}", false),
+            ("a", true),
+            ("\u{85}", true),
+            ("\t", true),
+            ("\u{1f600}", true),
+        ] {
+            assert_eq!(matches("^.$", subject), dot, "dot on {subject:?}");
+            assert_eq!(matches("^[.]$", subject), false, "[.] on {subject:?}");
+        }
+        assert!(matches("^a.c$", "abc"));
+        assert!(!matches("^a.c$", "a\r\nc"));
+        assert!(matches("^[.]$", "."));
+        assert!(matches(r"^\.$", "."));
+        assert!(!matches(r"^\.$", "a"));
+    }
+
+    // VIA patch (critical r2 #7): `\b` and `\B` use ECMA-262's word
+    // characters, `[A-Za-z0-9_]`.
+    #[test]
+    fn word_boundaries_are_ascii() {
+        for (pattern, subject, want) in [
+            (r"\bfoo\b", "αfooβ", true),
+            (r"\bfoo\b", "afoob", false),
+            (r"\bβ\b", " β ", false),
+            (r"^a\Bβ$", "aβ", false),
+            (r"^a\Bb$", "ab", true),
+            (r"^β\Bγ$", "βγ", true),
+            (r"\Bfoo", "αfoo", false),
+            (r"\Bfoo", "xfoo", true),
+        ] {
+            assert_eq!(matches(pattern, subject), want, "{pattern} on {subject:?}");
+        }
+    }
+
+    // VIA patch (critical r2 #7): the classes upstream already translated
+    // keep ECMA-262's ASCII meaning, inside bracket classes too.
+    #[test]
+    fn digit_and_word_classes_are_ascii() {
+        for (pattern, subject, want) in [
+            (r"^\d$", "5", true),
+            (r"^\d$", "\u{663}", false),
+            (r"^\D$", "\u{663}", true),
+            (r"^[\d]$", "5", true),
+            (r"^[\d]$", "\u{663}", false),
+            (r"^[\D]$", "\u{663}", true),
+            (r"^\w$", "_", true),
+            (r"^\w$", "é", false),
+            (r"^\W$", "é", true),
+            (r"^[\w]$", "z", true),
+            (r"^[\w]$", "é", false),
+            (r"^[\W]$", "é", true),
+        ] {
+            assert_eq!(matches(pattern, subject), want, "{pattern} on {subject:?}");
+        }
     }
 }

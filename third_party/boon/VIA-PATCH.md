@@ -80,11 +80,13 @@ commit that vendored the unchanged copy shows the whole patch.
    is fixed in one scan and one parse follows, then every perl class is
    replaced in one pass over that parse. Only an extended-mode pattern
    (`(?x)`, whose `#` comments can hide a `\c`) keeps upstream's
-   fix-and-reparse loop, for at most 32 fixes; past them it is refused.
-   The output is upstream's otherwise: `ecma.rs`'s tests compare it with
-   upstream's conversion, kept there verbatim, on the JSON-Schema-Test-Suite
-   patterns (written out, as the suite is not vendored) and on 100,000
-   seeded random patterns. Upstream also stopped converting, keeping a
+   fix-and-reparse loop, parsing after each fix, for at most 32 fixes; a
+   pattern needing a 33rd is refused. The output is upstream's otherwise,
+   but for item 7's replacements: `ecma.rs`'s tests map those back to
+   upstream's text and compare the result with upstream's conversion,
+   kept there verbatim, on the JSON-Schema-Test-Suite patterns (written
+   out, as the suite is not vendored) and on 100,000 seeded random
+   patterns. Upstream also stopped converting, keeping a
    partial result, if a replacement made the pattern fail to parse (a case
    its own debug assertion calls a bug); the linear conversion returns the
    whole replacement, which then fails to compile.
@@ -137,7 +139,23 @@ commit that vendored the unchanged copy shows the whole patch.
      divisor whose digits, scaled to the value's exponent, exceed 128
      bits divides no non-zero value. The test-suite cases (small
      divisors, the division that overflows a float) keep their results.
-7. **Manifest** (`Cargo.toml`): `mismatched_lifetime_syntaxes` is allowed, so
+7. **ECMA-262 class escapes, dot and word boundaries** (`ecma.rs`): a
+   behaviour fix against upstream, which kept Rust's meanings.
+   - `\s` and `\S`, inside bracket classes too, are ECMA's WhiteSpace plus
+     LineTerminator set and its complement: U+0009-U+000D, U+0020, U+00A0,
+     U+1680, U+2000-U+200A, U+2028, U+2029, U+202F, U+205F, U+3000 and
+     U+FEFF (upstream's set lacked U+1680, U+2000-U+2002, U+2004-U+200A,
+     U+2028, U+202F, U+205F and U+3000; U+0085, in Rust's `\s`, is not in
+     either). The set is written with escapes, so `(?x)` does not drop its
+     space and tab as upstream's literal characters were dropped.
+   - `.` is any character but U+000A, U+000D, U+2028 and U+2029 (Rust's
+     excludes only U+000A). JSON Schema patterns carry no flags.
+   - `\b` and `\B` use ECMA's word characters `[A-Za-z0-9_]`, as
+     `(?-u:\b)` and `(?-u:\B)`, which the engine accepts for `&str`
+     haystacks (Rust's `\b` uses Unicode's word characters).
+   - `\d`, `\D`, `\w` and `\W` keep upstream's ASCII translations, which
+     are ECMA's.
+8. **Manifest** (`Cargo.toml`): `mismatched_lifetime_syntaxes` is allowed, so
    newer toolchains do not warn on upstream's elided lifetimes. The
    dev-dependencies and the `bench` target (criterion, rustls, serde_yaml,
    ureq; used only by upstream's excluded `tests/` and by `benches/`) are
