@@ -201,6 +201,19 @@ pub enum Recovery {
     },
 }
 
+/// How far a turn's process retirement is, as [`SessionDriver::close`]
+/// waits on it (fix r2 #1): its physical cleanup ends before, and apart
+/// from, the delivery of what the retired process reported.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum Retiring {
+    /// The process is being retired.
+    Running,
+    /// Its cleanup ended: the retirement is recorded.
+    CleanedUp,
+    /// What it reported meanwhile was delivered, or dropped.
+    Delivered,
+}
+
 /// The driver's mutable state; never locked across an await.
 #[derive(Default)]
 pub(crate) struct DriverState {
@@ -213,8 +226,8 @@ pub(crate) struct DriverState {
     pub(crate) generation: u64,
     /// The running turn, until its logical end.
     pub(crate) active: Option<Active>,
-    /// Set once the last turn's process was retired.
-    pub(crate) retiring: Option<watch::Receiver<bool>>,
+    /// How far the last turn's process retirement is.
+    pub(crate) retiring: Option<watch::Receiver<Retiring>>,
     /// The last turn's retirement facts.
     pub(crate) retirement: Option<Retirement>,
     /// The session's confirmed vendor session ID, which every later
@@ -764,9 +777,12 @@ impl SessionDriver {
     /// waits, within `deadline`, for the last process's retirement and
     /// carries only what was established: the vendor's own close, the exit
     /// this close caused and the retirement's cleanup. The persistent
-    /// profile's slot is released once that retirement ended: here when it
-    /// did by `deadline`, else by the retirement itself. Nothing happens
-    /// before the first poll: a close dropped unpolled changes nothing.
+    /// profile's slot is released once that retirement's cleanup ended:
+    /// here when it did by `deadline`, else by the retirement itself. The
+    /// report then waits, within `deadline`, for the delivery of what the
+    /// retired process reported, so the channel stays open for it while
+    /// the caller drains it (fix r2 #1). Nothing happens before the first
+    /// poll: a close dropped unpolled changes nothing.
     pub fn close(
         &self,
         mode: CloseMode,
@@ -800,10 +816,14 @@ impl SessionDriver {
                     close_by: deadline,
                 }));
             }
-            let settled = match retiring {
-                Some(mut retiring) => matches!(
-                    tokio::time::timeout_at(deadline.instant(), retiring.wait_for(|done| *done))
-                        .await,
+            let mut retiring = retiring;
+            let settled = match retiring.as_mut() {
+                Some(retiring) => matches!(
+                    tokio::time::timeout_at(
+                        deadline.instant(),
+                        retiring.wait_for(|stage| *stage >= Retiring::CleanedUp)
+                    )
+                    .await,
                     Ok(Ok(_))
                 ),
                 // No turn ever ran: nothing to clean up.
@@ -820,6 +840,10 @@ impl SessionDriver {
                 (released, state.retirement, state.vendor_closed)
             };
             drop(released);
+            if let Some(retiring) = retiring.as_mut() {
+                let delivered = retiring.wait_for(|stage| *stage == Retiring::Delivered);
+                let _delivered = tokio::time::timeout_at(deadline.instant(), delivered).await;
+            }
             health.send_replace(DriverHealth::Closed);
             let quiescent = match retirement {
                 Some(retirement) => {

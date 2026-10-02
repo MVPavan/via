@@ -2940,6 +2940,242 @@ fn core_an_undecodable_retired_message_keeps_its_evidence() {
     });
 }
 
+/// Every event of `session`, page by page.
+#[cfg(feature = "test-failpoints")]
+async fn all_events(daemon: &Daemon, session: &SessionId) -> Vec<Value> {
+    let mut all = Vec::new();
+    loop {
+        let after = all
+            .last()
+            .map_or(0, |event: &Value| event["seq"].as_u64().unwrap());
+        let params =
+            serde_json::from_value(json!({"session":session,"after":after,"limit":1000})).unwrap();
+        let page = daemon.engine.events(params).await.unwrap();
+        let page: Value = serde_json::from_str(page.get()).unwrap();
+        let events = page["events"].as_array().unwrap().clone();
+        if events.is_empty() {
+            return all;
+        }
+        all.extend(events);
+    }
+}
+
+/// A denial of `target` for turn `turn`'s vendor turn.
+fn denial(turn: u32, target: &str) -> Value {
+    emit(&json!({"type":"denial","vendor_turn_id":vendor_turn(turn),
+                 "kind":"command","target":target,"reason":"policy"}))
+}
+
+/// Fix round 2 #1 (C2 §2 health, §4.1; runtime §7): a retirement whose
+/// cleanup is unproven fails the driver's health, and the lane closes the
+/// driver while the helper's 1,024 denials and its late terminal are
+/// still being delivered. The lane drains its channel while the close
+/// runs, so the delivery and the close wait for nothing of each other:
+/// every denial commits late and the terminal revises the turn.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_a_failed_retirement_delivers_its_observations_while_it_closes() {
+    let mut steps = vec![accepted(1), gate("late")];
+    steps.extend((0..1_024).map(|n| denial(1, &format!("retired-{n}"))));
+    steps.push(terminal(1, "completed", "end_turn"));
+    let Some(root) = child(
+        "core_a_failed_retirement_delivers_its_observations_while_it_closes",
+        &scenario(&persistent(), &[script("late", &steps)]),
+        &[("VIA_TEST_FAKE_RETIREMENT_UNCERTAIN", "1")],
+    ) else {
+        return;
+    };
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = unknown_turn(&daemon, "late", &json!({})).await;
+        daemon.release("late");
+        // Past the first events page: `until_revised` reads only that one.
+        let by = tokio::time::Instant::now() + Duration::from_secs(30);
+        let events = loop {
+            let events = all_events(&daemon, &session).await;
+            if events.iter().any(|event| event["type"] == "turn.revised") {
+                break events;
+            }
+            assert!(
+                tokio::time::Instant::now() < by,
+                "the turn was never revised"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let denied = events
+            .iter()
+            .filter(|event| event["type"] == "action.denied")
+            .filter(|event| event["late"] == true && event["turn"] == 1)
+            .count();
+        assert_eq!(denied, 1_024);
+        assert_eq!(stored(&daemon, &session, 1).await["state"], "completed");
+        daemon.shutdown().await;
+    });
+}
+
+/// Fix round 2 #1 (C2 §2 health, §4.1): the lane disposes of what its
+/// channel receives while it closes the driver. Core holds its first
+/// late item (`core.lane.dispose`), so the session channel fills with the
+/// retired helper's denials while its terminal still waits behind them.
+/// The retirement's unproven cleanup fails the driver's health; once the
+/// item is released the lane closes the driver, and its close waits for
+/// that delivery while the lane drains: the terminal revises the turn.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_a_closing_lane_drains_what_its_driver_still_delivers() {
+    let line = json!({"type":"denial","vendor_turn_id":vendor_turn(1),
+                      "kind":"command","target":"t","reason":"policy"})
+    .to_string()
+        + "\n";
+    let steps = [
+        accepted(1),
+        gate("late"),
+        json!({"action":"flood","text":line,"count":RETIRED_DENIALS}),
+        terminal(1, "completed", "end_turn"),
+    ];
+    let Some(root) = child(
+        "core_a_closing_lane_drains_what_its_driver_still_delivers",
+        &scenario(&persistent(), &[script("late", &steps)]),
+        &[("VIA_TEST_FAKE_RETIREMENT_UNCERTAIN", "1")],
+    ) else {
+        return;
+    };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    arm(&root, "core.lane.dispose", "pause");
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = unknown_turn(&daemon, "late", &json!({})).await;
+        daemon.release("late");
+        until_acked(&root, "core.lane.dispose", 1).await;
+        // The helper's output is read to its end and its retirement
+        // settled meanwhile; the channel stays full.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        fs::write(root.join("points").join("core.lane.dispose.1.release"), b"").unwrap();
+        let by = tokio::time::Instant::now() + Duration::from_secs(30);
+        let events = loop {
+            let events = all_events(&daemon, &session).await;
+            if events.iter().any(|event| event["type"] == "turn.revised") {
+                break events;
+            }
+            assert!(
+                tokio::time::Instant::now() < by,
+                "the turn was never revised"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let denied = events
+            .iter()
+            .filter(|event| event["type"] == "action.denied")
+            .count();
+        assert_eq!(denied, RETIRED_DENIALS);
+        daemon.shutdown().await;
+    });
+}
+
+/// The retired helper's denials in
+/// [`core_a_closing_lane_drains_what_its_driver_still_delivers`]: one
+/// held by Core, the session channel's 1,024 items, and one waiting at
+/// the driver, so its terminal waits on Route's hand-over.
+#[cfg(feature = "test-failpoints")]
+const RETIRED_DENIALS: usize = 1_025;
+
+/// Fix round 2 #4 (C2 §4.1 late observations): the retired helper's
+/// durable observations are forwarded until its output ends, not only up
+/// to its late terminal: a denial after the terminal commits late too.
+#[test]
+fn core_a_denial_after_the_late_terminal_commits_late() {
+    let scripts = [script(
+        "late",
+        &[
+            accepted(1),
+            gate("late"),
+            terminal(1, "completed", "end_turn"),
+            denial(1, "after"),
+        ],
+    )];
+    let Some(root) = child(
+        "core_a_denial_after_the_late_terminal_commits_late",
+        &scenario(&persistent(), &scripts),
+        &[],
+    ) else {
+        return;
+    };
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = unknown_turn(&daemon, "late", &json!({})).await;
+        daemon.release("late");
+        until_revised(&daemon, &session).await;
+        let by = tokio::time::Instant::now() + Duration::from_secs(30);
+        let denied = loop {
+            let events = events(&daemon, &session).await;
+            if let Some(denied) = events
+                .into_iter()
+                .find(|event| event["type"] == "action.denied")
+            {
+                break denied;
+            }
+            assert!(
+                tokio::time::Instant::now() < by,
+                "the denial after the late terminal never committed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(
+            (&denied["turn"], &denied["late"], &denied["target"]),
+            (&json!(1), &json!(true), &json!("after")),
+            "{denied}"
+        );
+        daemon.shutdown().await;
+    });
+}
+
+/// Fix round 2 #5 (C2 §2 health, §4.1): the retired helper's messages are
+/// checked against the connection's protocol phase as the turn's own are.
+/// A second terminal is a protocol failure: the driver's health fails and
+/// the lane retires it, releasing its slot, while the revision the first
+/// terminal made stands.
+#[test]
+fn core_a_second_retired_terminal_fails_the_connection() {
+    let scripts = [script(
+        "late",
+        &[
+            accepted(1),
+            gate("late"),
+            terminal(1, "completed", "end_turn"),
+            terminal(1, "failed", "error"),
+        ],
+    )];
+    let Some(root) = child(
+        "core_a_second_retired_terminal_fails_the_connection",
+        &scenario(&persistent(), &scripts),
+        &[],
+    ) else {
+        return;
+    };
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = unknown_turn(&daemon, "late", &json!({})).await;
+        daemon.release("late");
+        until_revised(&daemon, &session).await;
+        let by = tokio::time::Instant::now() + Duration::from_secs(30);
+        while daemon.engine.connections().in_use != 0 {
+            assert!(
+                tokio::time::Instant::now() < by,
+                "the connection outlived its protocol failure"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let envelope = stored(&daemon, &session, 1).await;
+        assert_eq!(
+            (&envelope["state"], &envelope["revision"]),
+            (&json!("completed"), &json!(1)),
+            "{envelope}"
+        );
+        assert_eq!(revisions(&daemon, &session).await.len(), 1);
+        daemon.shutdown().await;
+    });
+}
+
 /// The hits of failpoint `point` a wrong-token command counted so far.
 #[cfg(feature = "test-failpoints")]
 fn hits(root: &Path, point: &str) -> u64 {

@@ -965,7 +965,8 @@ impl Lane {
     /// The lane's actor (C2 §2; Sol r1 F2, F4, Sol r2 #1-#3, Sol r3
     /// N1-N5, Sol r4 R2, R3, Sol r5 R8), on the daemon's tracker for the
     /// lane's life: it serves the lane until it ends ([`Self::serve`]).
-    /// Then it closes the driver, unless the drivers' cancellation ended
+    /// Then it closes the driver, draining the channel meanwhile
+    /// ([`Self::close_draining`]), unless the drivers' cancellation ended
     /// the lane; closes the channel's admission and disposes of everything
     /// admitted before, to the channel's end, one item at a time (durable
     /// items committed, the rest dropped); runs a turn handed over
@@ -998,7 +999,7 @@ impl Lane {
             None => None,
         };
         if let Some((mode, deadline)) = close {
-            let report = self.driver.close(mode, deadline).await;
+            let report = self.close_draining(&mut inbox, mode, deadline).await;
             if owned {
                 *lock(&self.report) = Some(report);
             }
@@ -1056,6 +1057,37 @@ impl Lane {
         // (runtime §8, critical r3 #3).
         drop(resident);
         self.changed.send_replace(());
+    }
+
+    /// Closes the driver while disposing of what its channel receives
+    /// meanwhile, one item at a time (fix r2 #1): what the driver still
+    /// delivers before its close ends, such as a retired process's late
+    /// observations, waits for no close, and the close waits for no
+    /// disposal. The driver's close and its delivery are bounded by the
+    /// close's absolute `deadline` (C1 §3.6); a disposal is never cut off
+    /// there: an item being handled is finished, and what the channel
+    /// still holds is disposed of after the close.
+    async fn close_draining(
+        &self,
+        inbox: &mut Inbox,
+        mode: CloseMode,
+        deadline: Deadline,
+    ) -> CloseReport {
+        let mut closing = std::pin::pin!(self.driver.close(mode, deadline));
+        let (mut open, mut handled) = (true, 0);
+        loop {
+            tokio::select! {
+                biased;
+                report = &mut closing => return report,
+                admitted = inbox.recv(), if open => match admitted {
+                    Some(admitted) => {
+                        self.dispose(admitted).await;
+                        ready_item(&mut handled).await;
+                    }
+                    None => open = false,
+                },
+            }
+        }
     }
 
     /// Serves the lane until it ends (Sol r3 N1-N3): runs each turn handed

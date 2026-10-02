@@ -449,13 +449,12 @@ fn stopped(
     }
     if !by_order {
         // Deadline before the order's force, process exit, transport loss
-        // and other failures keep their own row. A caller's stop is still
-        // recorded when the turn ends `unknown`, so that a late terminal
-        // can settle it (C1 §7.6, runtime §6).
+        // and other failures keep their own row: the order did not stop
+        // the turn, so it is no cause of it (C1 §7.6, fix r2 #3).
         return Disposed {
-            cancel_cause: requested.filter(|_| terminal.state == "unknown"),
             terminal,
             stop: Some((outcome, cleanup)),
+            cancel_cause: None,
         };
     }
     match cause {
@@ -1010,7 +1009,9 @@ mod tests {
         for (outcome, order, cause) in [
             (unanswered(), &cancel, Some(CancelCause::Cancel)),
             (unanswered(), &close, Some(CancelCause::Close)),
-            (lost(), &cancel, Some(CancelCause::Cancel)),
+            // Fix round 2 #3: an order in force that did not stop the turn
+            // is not its cause.
+            (lost(), &cancel, None),
             (lost(), &idle, None),
         ] {
             let disposed = super::dispose(true, (None, Err(outcome)), Some(order), now);

@@ -71,9 +71,9 @@ pub(crate) async fn write(
     Ok(StructuredOutputRef { path, bytes })
 }
 
-/// Removes the turn's `structured_output.json`, which no commit names (C1
-/// §5: its naming commit is known not to have committed), and syncs the
-/// folder, on the Store's blocking pool. A missing file is not an error.
+/// Removes the turn's `structured_output.json`, which no committed
+/// envelope names (C1 §5), and syncs the folder, on the Store's blocking
+/// pool. A missing file is not an error.
 pub(crate) async fn discard(
     evidence: &EvidenceRoot,
     tasks: &BlobTasks,

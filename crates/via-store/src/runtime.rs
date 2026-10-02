@@ -2509,9 +2509,9 @@ impl StoreClient {
             .await
     }
 
-    /// Removes the turn's `structured_output.json` that no commit names: the
-    /// revision that wrote it is known not to have committed (C1 §5). A
-    /// file whose naming commit is uncertain is never removed.
+    /// Removes the turn's `structured_output.json` that no committed
+    /// envelope names (C1 §5), before a revision of the still revisable
+    /// turn writes its own. The caller holds that no commit names it.
     pub async fn discard_structured_output(
         &self,
         session: &SessionId,

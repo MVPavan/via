@@ -30,8 +30,6 @@ struct Revised {
     revision: u32,
     /// The structured output's spill took the commit's one retry.
     retried: bool,
-    /// The revision names the `structured_output.json` it wrote.
-    spilled: bool,
 }
 
 impl Engine {
@@ -43,13 +41,13 @@ impl Engine {
     /// as of an accepted turn; a stored cancel the vendor's terminal
     /// answers is settled by it. The present structured output is
     /// validated against the frozen schema and spilled as at the turn's
-    /// end (C1 Q2, §5); frozen values that do not decode are a corrupt row,
-    /// and the revision is declined. A revision not committed is retried
-    /// once at the same sequence and, failing again, is not made: the
-    /// failure is scoped to the turn, and the spill it wrote is removed.
-    /// An uncertain or corrupt outcome latches Store failure and is
-    /// reconciled at restart (runtime §7), never assumed absent; its spill
-    /// is kept. Nothing is written once Store failure is pending.
+    /// end (C1 Q2, §5), replacing a file no committed envelope names;
+    /// frozen values that do not decode are a corrupt row, and the
+    /// revision is declined. A revision not committed is retried once at
+    /// the same sequence and, failing again, is not made: the failure is
+    /// scoped to the turn. An uncertain or corrupt outcome latches Store
+    /// failure and is reconciled at restart (runtime §7), never assumed
+    /// absent. Nothing is written once Store failure is pending.
     pub(super) async fn revise(
         &self,
         session: &SessionId,
@@ -96,25 +94,14 @@ impl Engine {
         }
         let (slot, made) = write_slot(&self.sessions, session);
         let head = std::sync::Arc::clone(&slot.head);
-        let spilled = revised.spilled;
         let outcome = self
             .commit_revision((session, turn), &head, revised, &admission)
             .await;
         drop(head);
         release_write_slot(&self.sessions, session, &slot, made);
-        let not_made = match outcome {
-            Ok(committed) => !committed,
-            Err(outcome) => {
-                self.store_failure(FailureSite::Revision, outcome, scope)
-                    .finish_held(&admission);
-                outcome == WriteOutcome::NotCommitted
-            }
-        };
-        drop(admission);
-        if spilled && not_made {
-            // C1 §5 (fix r1 #7): no commit names the file, so a later
-            // revision may write its own; best effort.
-            let _ = self.store.discard_structured_output(session, turn).await;
+        if let Some(outcome) = outcome {
+            self.store_failure(FailureSite::Revision, outcome, scope)
+                .finish_held(&admission);
         }
     }
 
@@ -133,8 +120,8 @@ impl Engine {
 
     /// Commits `revised` at the session's next sequence on `head`, under
     /// `admission`; the retry, unless the spill took it, holds the same
-    /// head. Whether it committed (`false`: the guard refused it), or the
-    /// failed outcome to report. A first attempt not committed is reported
+    /// head. The failed outcome to report, `None` once committed or
+    /// refused by the guard. A first attempt not committed is reported
     /// here, before its retry.
     async fn commit_revision(
         &self,
@@ -142,10 +129,10 @@ impl Engine {
         head: &Head,
         mut revised: Revised,
         admission: &Admission<'_>,
-    ) -> Result<bool, WriteOutcome> {
+    ) -> Option<WriteOutcome> {
         let head = match head.lock(&self.store, session).await {
             Ok(head) => head,
-            Err(error) => return Err(WriteOutcome::of_read(&error)),
+            Err(error) => return Some(WriteOutcome::of_read(&error)),
         };
         let seq = head.next();
         let at = rfc3339(SystemTime::now());
@@ -163,7 +150,7 @@ impl Engine {
             },
         })
         .to_value() else {
-            return Err(WriteOutcome::NotCommitted);
+            return Some(WriteOutcome::NotCommitted);
         };
         // C1 §5: the range runs to the revision's event.
         if let Some(events) = revised.envelope.get_mut("events")
@@ -183,18 +170,18 @@ impl Engine {
             let error = match self.store.commit_revision(record).await {
                 Ok(()) => {
                     head.committed(1);
-                    return Ok(true);
+                    return None;
                 }
-                Err(StoreError::Refused(_)) => return Ok(false),
+                Err(StoreError::Refused(_)) => return None,
                 Err(error) => error,
             };
             let outcome = WriteOutcome::of(&error);
             if outcome.head_unknown() {
                 head.lost();
-                return Err(outcome);
+                return Some(outcome);
             }
             if !retry {
-                return Err(outcome);
+                return Some(outcome);
             }
             // The first attempt rolled back; the retry holds the same head.
             retry = false;
@@ -220,6 +207,17 @@ impl Engine {
         late: &VendorTerminal,
     ) -> Option<Revised> {
         let mut retained = Retained::of(late);
+        let named = envelope
+            .get("structured_output_file")
+            .is_some_and(|file| !file.is_null());
+        if late.structured_output.is_some() && !named {
+            // C1 §5 (fix r2 #2): a file no committed envelope names, as an
+            // earlier revision that did not commit or a crash left, is not
+            // a result. The turn was read revisable, and its revisions run
+            // one at a time on its session's lane, so none names it now.
+            // Should this fail, the spill below fails and reports it.
+            let _ = self.store.discard_structured_output(session, turn).await;
+        }
         let missing = match &plan.effective {
             Some(effective) => self.validate_retained(effective, Some(&mut retained)).await,
             None => false,
@@ -233,7 +231,6 @@ impl Engine {
                 .finish()
                 .await;
         }
-        let spilled = retained.structured_output_file.is_some();
         // Only the exit comes from the evidence; the stored one stands.
         let evidence = TurnEvidence {
             exit: None,
@@ -259,7 +256,6 @@ impl Engine {
             state,
             revision,
             retried,
-            spilled,
         })
     }
 }
