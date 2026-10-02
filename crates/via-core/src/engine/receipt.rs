@@ -690,10 +690,10 @@ impl Engine {
     /// ([`Self::authenticate_existing`]), then the latch, then `op_key`
     /// ([`Self::keyed_steer`]), whose look-up comes before every other
     /// check (K2 r1 #3); then a route whose stored capabilities do not
-    /// support steer is `unsupported_verb`. The
-    /// running turn is the one steered: none is `no_active_turn`, another
-    /// than `expect_turn` is `turn_mismatch`, and one still submitting is
-    /// waited for until its acceptance, `no_active_turn` if it ends first.
+    /// support steer is `unsupported_verb`. The running turn is the one
+    /// steered: none is `no_active_turn`, another than `expect_turn` is
+    /// `turn_mismatch`, and one still submitting is waited for until its
+    /// acceptance, `no_active_turn` if it ends first.
     /// Core mints the input's token, unique within the session, and
     /// registers the request's completion ticket on the session's lane
     /// under it before the input goes to the driver (C2 §2
@@ -726,8 +726,9 @@ impl Engine {
 
     /// Checks the route's steer support, selects the steered turn, waits
     /// for its acceptance, then hands the input to the driver and answers
-    /// once its `steer.delivered` committed ([`Self::steer`]). A keyed steer's `op_key` rides on its ticket, so
-    /// that commit records the steer's outcome.
+    /// once its `steer.delivered` committed ([`Self::steer`]). A keyed
+    /// steer's `op_key` rides on its ticket, so that commit records the
+    /// steer's outcome.
     pub(super) async fn deliver_steer(
         &self,
         params: SteerParams,
