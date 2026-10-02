@@ -1139,12 +1139,27 @@ fn conformance_intake_cwd_over_4_kib_encoded_is_refused() {
     });
 }
 
+/// Set in the child process the startup-directory case runs in.
+const CWD_CHILD: &str = "VIA_INTAKE_CWD_CHILD";
+
 /// Sol r1 #15 (C1 §5): an omitted `cwd` is the daemon's startup
 /// directory, held to the same 4 KiB encoded cap: a startup directory over
-/// it is `invalid_params` naming `cwd`. (Nextest runs each test in its own
-/// process, so the working directory is this test's alone.)
+/// it is `invalid_params` naming `cwd`. The working directory is the
+/// process's, so the case changes it only in a child process of its own
+/// (critical r1 #11): plain `cargo test` runs this binary's tests as
+/// threads of one process.
 #[test]
 fn conformance_intake_startup_cwd_over_4_kib_encoded_is_refused() {
+    const NAME: &str = "conformance_intake_startup_cwd_over_4_kib_encoded_is_refused";
+    if env::var_os(CWD_CHILD).is_none() {
+        let status = std::process::Command::new(env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture"])
+            .env(CWD_CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "{NAME} child failed: {status}");
+        return;
+    }
     let root = Root::new();
     let path = root.scenario(
         "scenario.json",
