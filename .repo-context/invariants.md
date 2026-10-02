@@ -78,24 +78,28 @@ implementation develops.
     each adapter declares actual support and returns named refusals where
     unsupported. ACP agents and additional harnesses are later scope, not
     first-release gates. Source: `docs/brainstorms/README.md` §16.
-13. **Thin wrapper: vendor upgrades are the vendor's.** VIA wraps the coding
-    agent and nothing more. VIA owns its integration with whatever vendor
-    version runs:
-    - launching the configured binary;
-    - reporting the version it actually speaks, and refusing unsupported
-      versions;
-    - fixing its adapter when a version changes the protocol VIA reads;
-    - keeping VIA's own state consistent (invariant 2 covers VIA's adapter
-      versions).
+13. **Thin wrapper: vendor upgrades are the vendor's.** This applies to every
+    harness: Claude Code, Codex, OpenCode and any agent added later. VIA wraps
+    the coding agent and nothing more.
 
-    How the vendor behaves across its own upgrades is out of scope:
+    After a vendor upgrade, VIA's only question is whether the upgrade broke
+    VIA's protocol: the communication and connection between the adapter and
+    the agent. That covers launch arguments, handshake, messages, events and
+    controls. VIA's response is limited to:
+    - detecting it: report the version actually spoken, and refuse
+      unsupported versions;
+    - fixing the adapter.
+
+    How the vendor handles its own sessions and internals across versions is
+    out of scope:
     - resuming or migrating threads or sessions an older version made;
     - vendor data compatibility;
     - detecting a binary replaced under a running vendor process, or moving
       live work onto it;
     - vendor regressions.
 
-    Do not add machinery for these. Owner decision, 2026-10-02.
+    Do not add machinery for these. VIA's own adapter versions and stored
+    state remain ours (invariant 2). Owner decision, 2026-10-02.
 
 ## Contract status and remaining decisions
 
