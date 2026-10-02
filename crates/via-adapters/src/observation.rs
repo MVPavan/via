@@ -4,7 +4,7 @@
 
 use std::borrow::Cow;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use serde_json::value::RawValue;
@@ -35,7 +35,9 @@ pub struct ProgressMarks {
 /// One observation, stamped when the driver decoded it (C2 §4).
 #[derive(Debug)]
 pub struct ObservationItem {
-    /// When the driver decoded it; Core records wall time.
+    /// When the driver decoded it; Core records wall time. The session
+    /// channel raises it at admission to the previous item's when another
+    /// producer's later stamp was admitted first ([`ObservationSink`]).
     pub at: Instant,
     /// The vendor turn it belongs to, which Core maps to a turn number.
     pub vendor_turn: Option<VendorTurnId>,
@@ -466,6 +468,9 @@ pub struct Admitted {
 pub struct ObservationSink {
     sender: mpsc::Sender<Admitted>,
     budget: Arc<Semaphore>,
+    /// The last admitted item's `at`, held across stamping and enqueueing
+    /// so the channel's order is the stamps' order (C2 §4).
+    last_at: Arc<Mutex<Option<Instant>>>,
 }
 
 /// One session's observation channel (C2 §2 `SessionCx`).
@@ -521,7 +526,12 @@ pub fn observation_channel_in(
     // `overflow` (C2 §7 item 12).
     let (sender, receiver) = mpsc::channel(OBSERVATION_ITEMS);
     let budget = Arc::clone(&budget.0);
-    (ObservationSink { sender, budget }, receiver)
+    let sink = ObservationSink {
+        sender,
+        budget,
+        last_at: Arc::new(Mutex::new(None)),
+    };
+    (sink, receiver)
 }
 
 /// An item the channel did not take.
@@ -534,7 +544,8 @@ pub(crate) enum Undelivered {
 }
 
 impl ObservationSink {
-    /// Sends `item`: acquires its byte cost, then a slot. The item owns one
+    /// Sends `item`: acquires its byte cost, then a slot, then enters the
+    /// channel no earlier than the item before it. The item owns one
     /// stall deadline, set at its first block; at it the send gives up.
     /// Test builds: `adapter.observation.admitted` acknowledges each item
     /// the channel took, `adapter.observation.stalled` a send that gave
@@ -576,20 +587,34 @@ impl ObservationSink {
             }
             Err(TryAcquireError::Closed) => return Err(Undelivered::Closed),
         };
-        let admitted = Admitted { item, permit };
-        match self.sender.try_send(admitted) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(admitted)) => {
+        let slot = match self.sender.try_reserve() {
+            Ok(slot) => slot,
+            Err(mpsc::error::TrySendError::Full(())) => {
                 #[cfg(feature = "test-failpoints")]
                 blocked().await;
                 let at = *stall_at.get_or_insert_with(|| Instant::now() + stall);
-                timeout_at(at, self.sender.send(admitted))
+                timeout_at(at, self.sender.reserve())
                     .await
                     .map_err(|_| Undelivered::Stalled)?
-                    .map_err(|_| Undelivered::Closed)
+                    .map_err(|_| Undelivered::Closed)?
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(Undelivered::Closed),
-        }
+            Err(mpsc::error::TrySendError::Closed(())) => return Err(Undelivered::Closed),
+        };
+        self.enqueue(slot, Admitted { item, permit });
+        Ok(())
+    }
+
+    /// Puts `admitted` in its reserved `slot` with `at` never earlier than
+    /// the item admitted before it (C2 §4). Producers stamp before they
+    /// send, so on a full channel an earlier stamp can be admitted after a
+    /// later one; raising it here, under the lock that orders the
+    /// channel's items, keeps the decode time whenever it is in order.
+    fn enqueue(&self, slot: mpsc::Permit<'_, Admitted>, mut admitted: Admitted) {
+        let mut last_at = self.last_at.lock().unwrap_or_else(PoisonError::into_inner);
+        let at = last_at.map_or(admitted.item.at, |last| last.max(admitted.item.at));
+        admitted.item.at = at;
+        *last_at = Some(at);
+        slot.send(admitted);
     }
 }
 
@@ -761,6 +786,55 @@ mod tests {
             // A small item still fits what is left.
             assert!(sink.send(tool("n"), stall).await.is_ok());
             assert_eq!(receiver.len(), fits + 1);
+        });
+    }
+
+    /// C2 §4 (`at` never earlier than the previous observation's), bead
+    /// via-mnx: producers stamp an item before they send it, so on a full
+    /// channel a later-stamped sender (a pinned next turn) can reach the
+    /// channel before an earlier-stamped one (the last turn's retirement)
+    /// and be admitted first. The channel still delivers `at` in order.
+    #[test]
+    fn concurrent_senders_on_a_full_channel_never_run_at_back() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        let (sink, mut receiver) = observation_channel();
+        runtime.block_on(async {
+            let stall = Duration::from_secs(5);
+            for _ in 0..OBSERVATION_ITEMS {
+                assert!(sink.send(tool("n"), stall).await.is_ok());
+            }
+            let stamped = Instant::now();
+            let mut earlier = tool("earlier");
+            earlier.at = stamped;
+            let mut later = tool("later");
+            later.at = stamped + Duration::from_millis(1);
+            // The later-stamped sender reaches the full channel first.
+            let mut later = std::pin::pin!(sink.send(later, stall));
+            let mut earlier = std::pin::pin!(sink.send(earlier, stall));
+            for send in [&mut later, &mut earlier] {
+                tokio::select! {
+                    biased;
+                    _ = send => panic!("admitted into a full channel"),
+                    () = std::future::ready(()) => {}
+                }
+            }
+            let mut previous = None;
+            for _ in 0..OBSERVATION_ITEMS {
+                previous = Some(receiver.try_recv().expect("a filler").item.at);
+            }
+            assert!(later.await.is_ok());
+            assert!(earlier.await.is_ok());
+            for _ in 0..2 {
+                let at = receiver.try_recv().expect("a sender's item").item.at;
+                assert!(
+                    previous.is_none_or(|previous| at >= previous),
+                    "`at` ran back"
+                );
+                previous = Some(at);
+            }
         });
     }
 
