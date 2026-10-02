@@ -778,7 +778,6 @@ Target columns and tables not implemented yet, with their owners:
 | `sessions`: record version | none yet (deferred) |
 | `sessions`: vendor session ID and transcript hint values (the columns exist) | the first vendor adapter slice |
 | `turns`: separate phase and cancel/cleanup columns (today inside `envelope`) | none yet (deferred) |
-| `turns`: revision of an `unknown` result by late evidence (C1 §7.6) | `via-jm4.35` |
 | `turns`: event-bound columns (today the envelope's `events` range) | none yet (deferred) |
 | `operations`: phase intent/done | none yet (deferred) |
 | `operations`: keyed `steer` (C1 §3) | `via-jm4.36` |
@@ -792,7 +791,7 @@ transaction. A partial index on anchor process IDs without absence evidence
 (`anchor_id` where `absence_time IS NULL`) lets recovery count unproven
 anchors past a cursor, saturating at the connection bound, without scanning
 history. Terminal state requires envelope; nonterminal state forbids it.
-Unknown is terminal but may be revised using C1's explicit revision batch.
+Unknown is terminal but may be revised using C1's explicit revision batch: guarded on state `unknown`, an acceptance `correlation`, no retained vendor terminal, the expected previous revision and a session not closed; the revision lives in the envelope's `revision` and the `turn.revised` event, with no column. `cancel_cause` records the caller `cancel` or `close` that stopped a turn, whether it ended `cancelled` or `unknown`, and a revision keeps it; the close result counts the turns in state `cancelled` with `cancel_cause` `close`.
 Append events, resulting state, envelope and next seq commit together.
 `turn.ended` is the final non-late event for that turn. Session events share
 the same dense sequence.
@@ -1037,12 +1036,14 @@ it. A receipt fails with `store_error` and `commit_outcome:
 not_committed`. A turn's first failed write stops that turn: no further
 agent I/O is started for it, and the turn ends `failed(store)` with its
 cleanup evidence through one resolution write. A natural terminal that
-did not commit is retried once. Other requests, turns and sessions are
-unaffected.
+did not commit is retried once. A revision of an `unknown` turn (C1 §7.6)
+is retried once too; if it, or the spill it names, is known not to have
+committed, the revision is not made, the turn stays `unknown` and nothing
+latches. Other requests, turns and sessions are unaffected.
 
 Core latches daemon health to `StoreFailed` when any write's outcome is
 uncertain, when a turn's resolution write or terminal retry fails in any
-way, or when SQLite reports corruption. The latch broadcasts through a
+way (a revision known not to have committed excepted), or when SQLite reports corruption. The latch broadcasts through a
 reserved watch channel and stops admission and dispatch immediately. A
 watcher is independent of Store's work queue.
 
@@ -1053,6 +1054,7 @@ silently swallows failure.
 |---|---|---|
 | Unacknowledged spawn/resume | `store_error`, `commit_outcome: not_committed`; a keyed retry may succeed | `store_error`; `commit_outcome: unknown` and `retry: same_key_only` when uncertain; a timeout never proves absence |
 | Receipted turn whose own write failed | the turn ends `failed(store)` with cleanup evidence, except that a natural terminal whose one retry commits keeps its result, and a dispatcher-owned queued cancellation whose retry commits stays `cancelled`; `wait` and `result` return that envelope | `store_error` with session/turn, `durable_state` from the last known commit, `terminal_persisted:false`; no invented envelope |
+| Revision of an `unknown` turn, or its spill, not committed (C1 §7.6) | the revision is not made; the turn stays `unknown`, its last envelope is returned, and the failure is reported scoped to the turn | the readable committed envelope is returned with its actual `revision`; only when none can be read, `store_error` as for a receipted turn |
 | Durable terminal result readable after failure | return it | return that committed result, not a fabricated new failure |
 | Other mutations and dispatch | unaffected | refuse with `store_error`; `cancel` and `close` return `store_error`, and the latch's force stop performs cleanup |
 | `daemon/status` | `health: healthy`; `store_failure` reports the latest failure and its scope | `health: store_failed`, which is sticky; `store_failure` reports the latest recorded failure and its scope; no prompts, payloads or handle |

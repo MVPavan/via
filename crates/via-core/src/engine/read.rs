@@ -248,9 +248,11 @@ impl Engine {
 
     /// C1 §3.12 `logs` (Task 4 design §4.4): where the addressed turn's
     /// evidence is, or for a session its running turn's, else its latest
-    /// submitted one's. Each fixed file name is `stat`ed once, in one owned
-    /// blob step answered within 2 s (coding-style §5), without following a
-    /// symlink; no file is opened.
+    /// submitted one's. Each fixed file name, and the structured-output
+    /// file its committed envelope names (fix r4 #2, Sol r5 #1), is
+    /// `stat`ed once, in one owned blob step answered within 2 s
+    /// (coding-style §5), without following a symlink; no file is opened
+    /// and the folder is never listed.
     pub async fn logs(&self, params: LogsParams) -> Result<Value, ApiError> {
         let (session, turn) = params.address()?;
         let refs = self
@@ -262,6 +264,10 @@ impl Engine {
             .ok_or(ApiError::SESSION_NOT_FOUND)?;
         let number = refs.turn.ok_or(ApiError::TURN_NOT_FOUND)?;
         let folder = refs.evidence_dir.map(|dir| self.store.evidence_path(&dir));
+        let named = refs
+            .structured_output_file
+            .as_deref()
+            .and_then(structured_output_file);
         // A failed `lstat` is a failed evidence read: `store_error`, as for
         // the Store read above; so is a diagnostic permit not available.
         let files = match folder.clone() {
@@ -273,7 +279,7 @@ impl Engine {
                     .blocking_step(move || {
                         // Released when the checks end, even after 2 s.
                         let _permit = permit;
-                        evidence_files(&folder)
+                        evidence_files(&folder, named.as_deref())
                     })
                     .await
                     .map_err(|_| ApiError::STORE)?
@@ -400,11 +406,12 @@ fn status_value(
     let turns: Vec<Value> = status
         .turns
         .iter()
-        .map(|(turn, state)| {
-            if terminal(state) {
-                json!({"n": turn, "state": state, "revision": 0})
+        .map(|turn| {
+            // C1 §3.7, §7.6: a terminal turn reports its envelope's revision.
+            if terminal(&turn.state) {
+                json!({"n": turn.number, "state": turn.state, "revision": turn.revision})
             } else {
-                json!({"n": turn, "state": state})
+                json!({"n": turn.number, "state": turn.state})
             }
         })
         .collect();
@@ -451,13 +458,28 @@ fn status_value(
     })
 }
 
-/// The fixed evidence files present in `folder`, as `{name, bytes}`: one
-/// `lstat` each, and only regular files count (design §4.4, §7.1). A
-/// missing name is absent; any other `lstat` error fails the read, so an
-/// existing file never drops out of the list (C1 §3.12).
-fn evidence_files(folder: &std::path::Path) -> std::io::Result<Vec<Value>> {
+/// The basename of the structured-output file a committed envelope names
+/// (C1 §5): `structured_output.json`, or a revision's own
+/// `structured_output.r…json`; else `None`.
+fn structured_output_file(path: &str) -> Option<String> {
+    let name = std::path::Path::new(path).file_name()?.to_str()?;
+    let named = name == "structured_output.json"
+        || name
+            .strip_prefix("structured_output.r")
+            .and_then(|rest| rest.strip_suffix(".json"))
+            .is_some();
+    named.then(|| name.to_owned())
+}
+
+/// The fixed evidence files present in `folder`, and the structured-output
+/// file `named` by the committed envelope, as `{name, bytes}`: one `lstat`
+/// each, and only regular files count (design §4.4, §7.1). A missing name
+/// is absent; any other `lstat` error fails the read, so an existing file
+/// never drops out of the list (C1 §3.12). No other file is looked for:
+/// a structured-output file no envelope names is never listed.
+fn evidence_files(folder: &std::path::Path, named: Option<&str>) -> std::io::Result<Vec<Value>> {
     let mut files = Vec::new();
-    for name in via_store::EVIDENCE_FILES {
+    for name in via_store::EVIDENCE_FILES.into_iter().chain(named) {
         let metadata = match std::fs::symlink_metadata(folder.join(name)) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -500,12 +522,12 @@ mod tests {
         let folder = root.path().join("1");
         std::fs::create_dir(&folder)?;
         std::fs::write(folder.join("stderr.log"), b"abc")?;
-        let listed = evidence_files(&folder)?;
+        let listed = evidence_files(&folder, None)?;
         assert_eq!(listed, [serde_json::json!({"name":"stderr.log","bytes":3})]);
         // No search permission: each `lstat` fails with EACCES.
         std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o600))?;
         let bypassed = std::fs::symlink_metadata(folder.join("stderr.log")).is_ok();
-        let unstated = evidence_files(&folder);
+        let unstated = evidence_files(&folder, None);
         std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700))?;
         if bypassed {
             eprintln!("skipped: this process bypasses file permissions (root)");

@@ -5,19 +5,19 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 
 use super::super::{
     FakeMessage, Handshake, STEER_ID, TerminalDetails, TerminalStatus, escape_json,
     escaped_text_len, paired_vendor_turn,
 };
 use super::{Failed, FakeRouteResult, Next, Serving, protocol, transport};
+use crate::steer::{ControlPermit, SteerProgress, SteerRefused, SteerRequest};
 use crate::{
-    CloseRequest, Deadline, ExitReport, OutboundMessage, RouteError, RouteFailure, SendOutcome,
-    StopCause, WireCleanup,
+    CloseRequest, Deadline, ExitReport, OutboundMessage, Retirement, RouteError, RouteFailure,
+    SendOutcome, StopCause, TurnNumber, WireCleanup,
 };
 use via_wire::{CloseMode, WireCloseReport, WireMessages, WireSender};
 
@@ -25,16 +25,16 @@ use via_wire::{CloseMode, WireCloseReport, WireMessages, WireSender};
 /// set incomplete, which keeps cleanup `Uncertain`.
 const OPEN_TOOLS_MAX: usize = 1024;
 
-/// C2 §2 independent lanes: control commands admitted at once.
-pub const CONTROL_COMMANDS: usize = 8;
-
-/// C2 §2 independent lanes: the admitted commands' total encoded bytes.
-pub const CONTROL_BYTES: usize = 64 * 1024;
-
 /// A steer line's bytes besides its escaped text, for any turn number:
 /// `{"type":"steer","id":3,"vendor_turn_id":"fake-turn-N","text":""}` and
 /// its newline.
 const STEER_OVERHEAD: usize = 96;
+
+/// The encoded bytes of a fake steer line carrying `text`, for the steer
+/// lane's budget.
+pub(super) fn steer_line_len(text: &str) -> usize {
+    escaped_text_len(text).saturating_add(STEER_OVERHEAD)
+}
 
 /// What the C2 lane asks of one fake turn beyond S1's inputs.
 pub struct Lane {
@@ -61,27 +61,45 @@ pub struct Lane {
     /// The turn's effort: an instance whose handshake reports its catalog
     /// must list it (AD18).
     pub effort: Option<String>,
+    /// Where the persistent profile's retirement streams what its helper
+    /// reports meanwhile ([`FakeRetired`]); `None` reads nothing.
+    pub retired: Option<FakeRetired>,
 }
 
-/// One steer input for the running turn, admitted by [`SteerSender`];
-/// `reply` answers once the input was written whole and the vendor reported
-/// its delivery, or with why it was not delivered. A reply dropped
-/// unanswered means the turn ended first.
-pub struct SteerRequest {
-    /// The steer text.
-    pub text: String,
-    /// The vendor turn the caller means, if it names one.
-    pub expected_vendor_turn: Option<String>,
-    /// The caller's token for the request, which Route pairs with the
-    /// vendor's delivery report on the hop ([`RouteMessage::steer`]).
-    pub token: u64,
-    /// The delivery answer.
-    pub reply: oneshot::Sender<Result<(), SteerRefused>>,
-    /// What Route established of the input ([`SteerAnswer`]).
-    progress: Arc<SteerProgress>,
-    /// The request's share of the control budget, returned when it is
-    /// dropped.
-    permit: ControlPermit,
+/// Where the persistent profile's retirement sends what its helper
+/// reports while it is retired (C2 §4.1 late observations, §4
+/// `turn.late_terminal`).
+pub struct FakeRetired {
+    /// Each forwarded message in decode order, one at a time, as the
+    /// turn's own hop takes them: Route reads no further message while it
+    /// is full. A closed receiver ends the forwarding.
+    pub items: mpsc::Sender<FakeRetiredItem>,
+    /// The failure that ended the reading: a message that does not decode,
+    /// kept in `undecoded.bin` as the turn's own reader keeps one, one out
+    /// of the connection's protocol phase, or a failed read. The
+    /// connection failed.
+    pub failure: oneshot::Sender<RouteError>,
+    /// The retirement's facts, sent as soon as Host's close of the helper
+    /// ended, whatever the reading is doing (fix r3 #3).
+    pub cleaned: oneshot::Sender<Retirement>,
+}
+
+/// One message [`FakeRetired`] forwards.
+pub enum FakeRetiredItem {
+    /// A durable message, to be normalized as the turn's own are.
+    Durable(super::super::RouteMessage),
+    /// The terminal of a logical turn that retained none.
+    Terminal(FakeLateTerminal),
+}
+
+/// A terminal the persistent profile's helper reported while it was
+/// retired, after its logical turn ended with no terminal (C2 §4
+/// `turn.late_terminal`).
+pub struct FakeLateTerminal {
+    /// The vendor turn it names, the turn's own.
+    pub vendor_turn_id: String,
+    /// The decoded terminal.
+    pub terminal: FakeTerminal,
 }
 
 /// The steer awaiting its write and the vendor's delivery report.
@@ -92,152 +110,8 @@ pub(super) struct SteerPending {
     _permit: ControlPermit,
 }
 
-/// One admitted command's share of the control budget (C2 §2): a command
-/// slot and its encoded bytes, held until the command is resolved.
-pub(super) struct ControlPermit {
-    _command: OwnedSemaphorePermit,
-    _bytes: OwnedSemaphorePermit,
-}
-
-/// Why Route did not deliver a steer input.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SteerRefused {
-    /// The turn is not accepted yet, or already ended.
-    NotActive,
-    /// The input was not written whole.
-    NotWritten,
-    /// The input names another vendor turn than the running one.
-    TurnMismatch,
-    /// The control lane's eight commands or 64 KiB are taken (C2 §2).
-    OverCapacity,
-}
-
-/// The admitting side of a turn's steer lane (C2 §2 independent lanes): at
-/// most [`CONTROL_COMMANDS`] requests and [`CONTROL_BYTES`] encoded in
-/// total are outstanding, queued or awaiting their answer; anything more is
-/// refused before it is enqueued.
-#[derive(Clone)]
-pub struct SteerSender {
-    sender: mpsc::Sender<SteerRequest>,
-    commands: Arc<Semaphore>,
-    budget: Arc<Semaphore>,
-}
-
-/// A turn's steer lane: the admitting sender and Route's receiver.
-pub fn steer_lane() -> (SteerSender, mpsc::Receiver<SteerRequest>) {
-    let (sender, receiver) = mpsc::channel(CONTROL_COMMANDS);
-    let commands = Arc::new(Semaphore::new(CONTROL_COMMANDS));
-    let budget = Arc::new(Semaphore::new(CONTROL_BYTES));
-    (
-        SteerSender {
-            sender,
-            commands,
-            budget,
-        },
-        receiver,
-    )
-}
-
-impl SteerSender {
-    /// Admits one steer input with its caller's `token`, or refuses it
-    /// at once.
-    pub fn send(
-        &self,
-        text: String,
-        expected_vendor_turn: Option<String>,
-        token: u64,
-    ) -> Result<SteerAnswer, SteerRefused> {
-        let command = Arc::clone(&self.commands)
-            .try_acquire_owned()
-            .map_err(|_| SteerRefused::OverCapacity)?;
-        let encoded = escaped_text_len(&text).saturating_add(STEER_OVERHEAD);
-        // A size past `u32` is past the budget too: both refuse it.
-        let bytes = u32::try_from(encoded)
-            .ok()
-            .and_then(|bytes| Arc::clone(&self.budget).try_acquire_many_owned(bytes).ok())
-            .ok_or(SteerRefused::OverCapacity)?;
-        let permit = ControlPermit {
-            _command: command,
-            _bytes: bytes,
-        };
-        let (reply, answer) = oneshot::channel();
-        let progress = Arc::new(SteerProgress::default());
-        let request = SteerRequest {
-            text,
-            expected_vendor_turn,
-            token,
-            reply,
-            progress: Arc::clone(&progress),
-            permit,
-        };
-        match self.sender.try_send(request) {
-            Ok(()) => Ok(SteerAnswer {
-                reply: answer,
-                progress,
-            }),
-            Err(mpsc::error::TrySendError::Full(_)) => Err(SteerRefused::OverCapacity),
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(SteerRefused::NotActive),
-        }
-    }
-}
-
-/// What Route established of one steer input, as it happens (critical r3
-/// #1, r5 #1).
-#[derive(Default)]
-pub(super) struct SteerProgress {
-    /// Route started writing the input.
-    write_started: AtomicBool,
-    /// The vendor reported the input's delivery; set before the report is
-    /// handed over, so before its observation can be emitted.
-    acknowledged: AtomicBool,
-}
-
-/// An admitted steer input's answer, as its caller holds it (critical r3
-/// #1, r5 #1): Route's reply, and what Route established of the input,
-/// which tells a caller whose turn ended unanswered whether the vendor
-/// acknowledged it, may have it, or never had it.
-pub struct SteerAnswer {
-    /// Route's reply; dropped unanswered when the turn ended first. Route
-    /// answers an acknowledged input only once its write is answered too.
-    pub reply: oneshot::Receiver<Result<(), SteerRefused>>,
-    progress: Arc<SteerProgress>,
-}
-
-impl SteerAnswer {
-    /// Whether Route started writing the input: it may have been written,
-    /// in part or whole. False means it never left the control lane.
-    #[must_use]
-    pub fn write_started(&self) -> bool {
-        self.progress.write_started.load(Ordering::Acquire)
-    }
-
-    /// Whether the vendor reported the input's delivery, whatever Route's
-    /// reply: its `steer.delivered` report was then handed over.
-    #[must_use]
-    pub fn acknowledged(&self) -> bool {
-        self.progress.acknowledged.load(Ordering::Acquire)
-    }
-}
-
-/// The turn's process facts once Route retired it: on the persistent
-/// profile the emulated helper's housekeeping close, never a fact of the
-/// logical turn (decision H1); otherwise the turn's own close.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Retirement {
-    /// A process may have launched.
-    pub launched: bool,
-    /// Host-confirmed exit, when observed.
-    pub exit: Option<ExitReport>,
-    /// Cleanup certainty, when Route established one.
-    pub cleanup: Option<WireCleanup>,
-    /// Host stopped the group while its process was live.
-    pub forced: bool,
-    /// A Host journal write had an uncertain outcome.
-    pub journal_uncertain: bool,
-}
-
 impl Retirement {
-    /// The facts of Route's S1-shaped result.
+    /// The facts of the fake route's S1-shaped result.
     pub(super) fn of(result: &Result<FakeRouteResult, RouteFailure>) -> Self {
         match result {
             Ok(result) => Self {
@@ -365,6 +239,8 @@ pub(super) struct LaneState {
     ack_evidence: bool,
     identity: Option<String>,
     effort: Option<String>,
+    /// Where the retirement's messages go ([`Lane::retired`]).
+    retired: Option<FakeRetired>,
 }
 
 impl LaneState {
@@ -391,6 +267,7 @@ impl LaneState {
             ack_evidence: false,
             identity: lane.identity,
             effort: lane.effort,
+            retired: lane.retired,
         }
     }
 
@@ -450,7 +327,7 @@ impl Serving<'_> {
                 };
                 // Critical r5 #1: established before the report is handed
                 // over, whatever the write's answer.
-                pending.progress.acknowledged.store(true, Ordering::Release);
+                pending.progress.mark_acknowledged();
                 if lane.steer_write.is_some() {
                     // Answered once its write is confirmed.
                     lane.steer_evidence = true;
@@ -653,7 +530,7 @@ impl Serving<'_> {
             suffix: b"\"}\n".to_vec(),
             escape: escape_json,
         };
-        progress.write_started.store(true, Ordering::Release);
+        progress.mark_write_started();
         self.lane.steer_write = Some(self.sender.write(steer, self.deadline));
         self.lane.steer_reply = Some(SteerPending {
             reply,
@@ -819,12 +696,15 @@ impl Serving<'_> {
 
     /// Retires the persistent profile's helper apart from the logical turn
     /// (decision H1): input closed, then Host's close under `by`, forced at
-    /// once for a session close, then the drain.
+    /// once for a session close, then the drain. Meanwhile the helper's
+    /// output is read ([`read_retired`]) and its messages go on the lane's
+    /// `retired`. The retirement's facts, with the `exit` the turn saw, go
+    /// there as soon as Host's close ended, apart from the reading.
     pub(super) async fn retire(
         &mut self,
         sender: &WireSender,
-        messages: WireMessages,
-        by: Deadline,
+        mut messages: WireMessages,
+        (exit, by): (Option<ExitReport>, Deadline),
     ) -> WireCloseReport {
         let closing = self
             .signals
@@ -837,11 +717,122 @@ impl Serving<'_> {
         } else {
             CloseMode::Graceful
         };
+        // Test builds: the logical turn ended and its helper's retirement
+        // begins.
+        #[cfg(feature = "test-failpoints")]
+        let _ = via_wire::failpoint::hit_async("routes.fake.retiring").await;
         // A half-close that failed leaves Host's close below to stop it.
         let _half_closed = sender.close_input(by).await;
-        let report = sender.close(CloseRequest { mode, deadline: by }).await;
+        let (reader, cleaned) = match self.lane.retired.take() {
+            Some(FakeRetired {
+                items,
+                failure,
+                cleaned,
+            }) => (Some((items, failure)), Some(cleaned)),
+            None => (None, None),
+        };
+        let interrupted = self.lane.interrupt != Interrupt::NotSent;
+        let reading = (self.turn, &mut self.phase, interrupted);
+        let close = async {
+            let report = sender.close(CloseRequest { mode, deadline: by }).await;
+            if let Some(cleaned) = cleaned {
+                // The driver's turn task is gone: nobody takes the facts.
+                let _unread = cleaned.send(Retirement::closed(exit, &report));
+            }
+            report
+        };
+        let read = async {
+            if let Some(reader) = reader {
+                read_retired(&mut messages, sender, reading, reader, by).await;
+            }
+        };
+        let (report, ()) = tokio::join!(close, read);
         messages.finish(by).await;
         report
+    }
+}
+
+/// Reads a retired helper's output for `turn` in decode order until it
+/// ends, a failure, `by`, or the driver no longer takes what it forwards
+/// (its lane closed). Each message is checked against the connection's
+/// `phase` as the turn's own are; the durable ones (denials, declines)
+/// and the first terminal, when the logical turn retained none (the only
+/// one the phase admits), go on `items`; everything else is
+/// dropped, as the logical turn already ended. A message that does not
+/// decode is kept in `undecoded.bin`; it, a phase violation and a failed
+/// read end the reading with their cause on `failure`. A stop
+/// order's wake, the daemon force and `by` end it quietly.
+async fn read_retired(
+    messages: &mut WireMessages,
+    sender: &WireSender,
+    (turn, phase, interrupted): (TurnNumber, &mut super::Phase, bool),
+    (items, failure): (mpsc::Sender<FakeRetiredItem>, oneshot::Sender<RouteError>),
+    by: Deadline,
+) {
+    let read = async {
+        loop {
+            let message = match messages.next_message().await {
+                Ok(Some(message)) => message,
+                Err(via_wire::WireError::Woken) => continue,
+                Ok(None) | Err(via_wire::WireError::Cancelled | via_wire::WireError::Deadline) => {
+                    return None;
+                }
+                Err(error) => return Some(super::wire_cause(turn, &error)),
+            };
+            let payload = match FakeMessage::decode(message.bytes(), turn) {
+                Ok(payload) => payload,
+                Err(cause) => {
+                    let what = format!(
+                        "undecodable vendor message: {} bytes",
+                        message.bytes().len()
+                    );
+                    sender.keep_undecoded(message.bytes(), &what).await;
+                    return Some(cause);
+                }
+            };
+            if let Err(cause) = phase.advance(&payload, turn, interrupted) {
+                return Some(cause);
+            }
+            let message = super::super::RouteMessage {
+                payload,
+                steer: None,
+            };
+            let item = match &message.payload {
+                FakeMessage::Denial { .. } | FakeMessage::Decline { .. } => {
+                    FakeRetiredItem::Durable(message)
+                }
+                FakeMessage::Terminal { vendor_turn_id, .. } => {
+                    let vendor_turn_id = vendor_turn_id.clone();
+                    let Some(terminal) = super::terminal_evidence(&message) else {
+                        continue;
+                    };
+                    FakeRetiredItem::Terminal(FakeLateTerminal {
+                        vendor_turn_id,
+                        terminal,
+                    })
+                }
+                // Not durable: the logical turn already ended.
+                FakeMessage::Accepted { .. }
+                | FakeMessage::Text { .. }
+                | FakeMessage::ToolStarted { .. }
+                | FakeMessage::ToolEnded { .. }
+                | FakeMessage::Usage { .. }
+                | FakeMessage::Hello(_)
+                | FakeMessage::Identity { .. }
+                | FakeMessage::SteerDelivered { .. }
+                | FakeMessage::VendorClosed { .. }
+                | FakeMessage::InterruptAck { .. }
+                | FakeMessage::Unknown { .. } => continue,
+            };
+            if items.send(item).await.is_err() {
+                // The lane closed: nothing more is delivered (ruling G1).
+                return None;
+            }
+        }
+    };
+    if let Ok(Some(cause)) = tokio::time::timeout_at(by.instant(), read).await {
+        // The driver's turn task is gone: nobody takes the failure.
+        let _unread = failure.send(cause);
     }
 }
 

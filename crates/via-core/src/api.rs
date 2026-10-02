@@ -2278,6 +2278,14 @@ pub(crate) enum EventBody {
         #[serde(skip_serializing_if = "Option::is_none")]
         cancel: Option<Cancel>,
     },
+    /// C1 §5, §7.6: an `unknown` turn revised by late evidence.
+    #[serde(rename = "turn.revised")]
+    TurnRevised {
+        revision: u32,
+        from_state: &'static str,
+        state: &'static str,
+        evidence: &'static str,
+    },
     #[serde(rename = "action.denied")]
     ActionDenied {
         kind: &'static str,

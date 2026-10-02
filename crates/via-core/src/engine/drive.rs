@@ -156,6 +156,22 @@ struct Control<'a> {
     idle: Duration,
     /// The final text's pieces so far (design §6.4).
     final_text: FinalText,
+    /// The turn's own late terminal, received after its end and before
+    /// its run returned: it revises the turn once its terminal committed
+    /// (C1 §7.6).
+    late: Option<via_adapters::VendorTerminal>,
+}
+
+impl Control<'_> {
+    /// Keeps the turn's first own late terminal for its revision, when it
+    /// is `named`: it names a vendor turn that the lane attributed as
+    /// current, so the acceptance mapped it (fix r1 #2). One naming none is
+    /// the running turn's by position alone, which never revises a turn.
+    fn keep_late(&mut self, named: bool, terminal: via_adapters::VendorTerminal) {
+        if named {
+            self.late.get_or_insert(terminal);
+        }
+    }
 }
 
 /// What the dispatcher does after one step.
@@ -831,6 +847,7 @@ impl Engine {
             idle_at: Some(origin + effective.idle()),
             idle: effective.idle(),
             final_text: FinalText::new(),
+            late: None,
         };
         // C2 §2 `TurnSpec`: the prompt with the turn's frozen values.
         let spec = effective.turn_spec(prompt);
@@ -906,11 +923,14 @@ impl Engine {
         // envelope warns.
         self.check_output(&effective, &mut record, &mut terminal)
             .await;
+        // Runtime §6: the caller's stop is kept for a `cancelled` or an
+        // `unknown` turn, which a late terminal may still settle.
         let cause = disposed
             .cancel_cause
-            .filter(|_| terminal.state == "cancelled");
+            .filter(|_| matches!(terminal.state, "cancelled" | "unknown"));
         // A terminal that did not commit reads `store_error` and latches.
         let _ = self.finish_with(started, (record, terminal), cause).await;
+        self.revise_kept(&session, turn, control.late.take()).await;
         // Test builds: the terminal committed, `Running` not yet cleared
         // (Task 4 design §4.2).
         #[cfg(feature = "test-failpoints")]
@@ -1559,6 +1579,8 @@ impl Engine {
         let mut early = None;
         // Items the fired idle deadline handled, for the control checks.
         let mut frontier = 0;
+        // Items queued when the idle deadline fired, still to reconcile.
+        let mut queued = None;
         let end = loop {
             if let Some(end) = early.take() {
                 break end;
@@ -1593,7 +1615,7 @@ impl Engine {
                         (lane, effective),
                         control,
                         (&mut run, &mut early),
-                        (inbox, idle_at),
+                        (inbox, idle_at, &mut queued),
                     )
                     .await;
                     super::lane::ready_item(&mut frontier).await;
@@ -1689,31 +1711,31 @@ impl Engine {
     }
 
     /// The turn's idle deadline fired (Task 4 design §5), decided at the
-    /// item frontier (critical r3 #1): the turn expires only when the
-    /// channel is empty or its next item was decoded after the deadline
-    /// (its own `at`). That item, taken to read it, is then handled after
-    /// the idle order, as ordinary late progress. Otherwise the next item
-    /// is handled now, in order, as the run loop handles it ([`Self::run_item`]):
-    /// the turn's own progress moves the deadline by its `at`, and the loop
-    /// fires again while the deadline stays passed, the turn's order
-    /// checked first each time (runtime §8). It is finite: only items
-    /// decoded before a deadline qualify, and the deadline moves only on
-    /// progress.
+    /// item frontier (critical r3 #1): every item `queued` in the channel
+    /// when it fired is reconciled first, one per firing, as the run loop
+    /// handles it ([`Self::run_item`]), the turn's order checked first each
+    /// time (runtime §8). Concurrent producers' items may be admitted out
+    /// of `at` order (C2 §4), so a late-stamped item may stand ahead of
+    /// the turn's timely progress, which moves the deadline by its own
+    /// `at`; a moved deadline counts the channel afresh when it fires. The
+    /// turn expires only once those items are handled and the deadline
+    /// stays passed. It is finite: at most the 1,024 items the channel held
+    /// when the deadline fired, and it moves only on progress decoded
+    /// before it.
     async fn idle_fired<E>(
         &self,
         record: &mut TurnRecord,
         (lane, effective): (&Lane, &Effective),
         control: &mut Control<'_>,
         run: (&mut E, &mut Option<(TurnEnd, usize)>),
-        (inbox, deadline): (&mut Inbox, Option<tokio::time::Instant>),
+        (inbox, deadline, queued): (&mut Inbox, Option<tokio::time::Instant>, &mut Option<usize>),
     ) where
         E: std::future::Future<Output = TurnEnd> + Unpin,
     {
-        let next = inbox.try_recv();
-        let expires = next
-            .as_ref()
-            .is_none_or(|admitted| deadline.is_none_or(|deadline| admitted.item.at > deadline));
-        if expires {
+        let pending = queued.get_or_insert_with(|| inbox.len());
+        let next = if *pending > 0 { inbox.try_recv() } else { None };
+        let Some(admitted) = next else {
+            *queued = None;
             control.idle_at = None;
             // The timer fired; its order is not issued yet (design §10).
             #[cfg(feature = "test-failpoints")]
@@ -1721,10 +1743,13 @@ impl Engine {
             control
                 .slot
                 .idle_order(control.turn, tokio::time::Instant::now());
-        }
-        if let Some(admitted) = next {
-            self.run_item(record, (lane, effective), control, run, (admitted, &*inbox))
-                .await;
+            return;
+        };
+        *pending -= 1;
+        self.run_item(record, (lane, effective), control, run, (admitted, &*inbox))
+            .await;
+        if control.idle_at != deadline {
+            *queued = None;
         }
     }
 
@@ -1844,6 +1869,7 @@ impl Engine {
             idle_at: idle.map(|idle| tokio::time::Instant::now() + idle),
             idle: idle.unwrap_or_default(),
             final_text: FinalText::new(),
+            late: None,
         };
         let _driven = self
             .execute(record, (lane, effective), (spec, cx), (&mut control, inbox))
@@ -1853,7 +1879,8 @@ impl Engine {
     /// Test builds: drains `queued` for the running `turn` of `slot` as
     /// `execute`'s completion does, with the run loop's own order receiver
     /// and the session's `lane`; without one every item is the running
-    /// turn's.
+    /// turn's. The running turn's own late terminal it kept for the
+    /// revision.
     #[cfg(test)]
     pub(super) async fn drain_queued(
         &self,
@@ -1862,7 +1889,7 @@ impl Engine {
         effective: &Effective,
         orders: watch::Receiver<Option<StopOrder>>,
         queued: Vec<ObservationItem>,
-    ) {
+    ) -> Option<via_adapters::VendorTerminal> {
         let budget = Arc::new(tokio::sync::Semaphore::new(queued.len()));
         let queued: Vec<Admitted> = queued
             .into_iter()
@@ -1883,6 +1910,7 @@ impl Engine {
             idle_at: None,
             idle: Duration::ZERO,
             final_text: FinalText::new(),
+            late: None,
         };
         let (sender, receiver) = tokio::sync::mpsc::channel(queued.len().max(1));
         for admitted in queued {
@@ -1901,6 +1929,7 @@ impl Engine {
             (&mut inbox, delivered),
         )
         .await;
+        control.late
     }
 
     /// Handles one observation in decode order (C2 §4): commits the
@@ -1961,23 +1990,9 @@ impl Engine {
                     // establishes nothing.
                     return;
                 }
-                let correlation = acceptance_turn(&acceptance, vendor_turn.as_deref()).map_or_else(
-                    || format!("{TOKEN_CORRELATION}{}", acceptance.correlation.get()),
-                    |vendor_turn| format!("{VENDOR_CORRELATION}{vendor_turn}"),
-                );
-                let vendor_turn_id = acceptance
-                    .vendor_turn_id
-                    .as_ref()
-                    .map(|id| id.as_str().to_owned());
-                let running = lane.and_then(|lane| lane.driver.adapter_version());
-                let instance = acceptance.instance.map(instance_record);
-                self.observe_acceptance(
-                    record,
-                    slot,
-                    effective,
-                    (correlation, vendor_turn_id, running, instance),
-                )
-                .await;
+                let evidence = acceptance_evidence(acceptance, vendor_turn.as_deref(), lane);
+                self.observe_acceptance(record, slot, effective, evidence)
+                    .await;
             }
             Observation::Progress(marks) => {
                 // A refused item changes nothing; the run loop stops the
@@ -2033,12 +2048,14 @@ impl Engine {
             // the driver ends the connection, and the turn's end carries
             // what it did to the turn. An identity was handled before
             // attribution.
+            // C1 §7.6: the turn's own late terminal, after its end, waits
+            // for the turn's terminal.
+            Observation::LateTerminal(terminal) => {
+                control.keep_late(lane.is_some() && vendor_turn.is_some(), terminal);
+            }
             Observation::IdentityConfirmed(_)
             | Observation::ResumeMismatch { .. }
-            | Observation::VendorClosed(_)
-            // Discarded until via-jm4.35: a late terminal's revision
-            // write is not in the Store yet.
-            | Observation::LateTerminal(_) => {}
+            | Observation::VendorClosed(_) => {}
         }
     }
 
@@ -2217,9 +2234,8 @@ impl Engine {
     /// `late: true`, or session-level with `turn: null`. A durable one, a
     /// denial, a decline, a warning or a steer report, is committed under
     /// the running turn, the one the Store admits events for; it never
-    /// changes an envelope.
-    /// Non-durable ones are dropped, and so is a late terminal, until
-    /// via-jm4.35.
+    /// changes an envelope. A late terminal of an earlier turn revises it
+    /// (C1 §7.6, [`Engine::revise`]). Other non-durable ones are dropped.
     async fn observe_other(
         &self,
         record: &mut TurnRecord,
@@ -2242,15 +2258,21 @@ impl Engine {
                 self.commit_steer(record, lane, attributed, (&delivery, token))
                     .await;
             }
+            // C1 §7.6: an earlier turn's late terminal revises it, when
+            // its end retained none.
+            Observation::LateTerminal(terminal) => {
+                if let (Some(turn), true) = attributed
+                    && let Ok(turn) = TurnNumber::try_from(turn)
+                {
+                    self.revise(&record.session, turn, &terminal).await;
+                }
+            }
             Observation::Accepted(_)
             | Observation::IdentityConfirmed(_)
             | Observation::Progress(_)
             | Observation::FinalText(_)
             | Observation::VendorClosed(_)
-            | Observation::ResumeMismatch { .. }
-            // Discarded until via-jm4.35: a late terminal's revision
-            // write is not in the Store yet.
-            | Observation::LateTerminal(_) => {}
+            | Observation::ResumeMismatch { .. } => {}
         }
     }
 
@@ -2911,6 +2933,27 @@ pub(super) fn current_progress(lane: &Lane, turn: TurnNumber, item: &Observation
 
 /// The vendor turn an acceptance names: its own vendor turn ID, else the
 /// item's.
+/// What an acceptance commits: its Store correlation (by the vendor turn
+/// it names, the item's, else its token), its own vendor turn ID, the
+/// running adapter's version and its instance.
+fn acceptance_evidence(
+    acceptance: Acceptance,
+    item: Option<&str>,
+    lane: Option<&Lane>,
+) -> AcceptanceEvidence {
+    let correlation = acceptance_turn(&acceptance, item).map_or_else(
+        || format!("{TOKEN_CORRELATION}{}", acceptance.correlation.get()),
+        |vendor_turn| format!("{VENDOR_CORRELATION}{vendor_turn}"),
+    );
+    let vendor_turn_id = acceptance
+        .vendor_turn_id
+        .as_ref()
+        .map(|id| id.as_str().to_owned());
+    let running = lane.and_then(|lane| lane.driver.adapter_version());
+    let instance = acceptance.instance.map(instance_record);
+    (correlation, vendor_turn_id, running, instance)
+}
+
 fn acceptance_turn(acceptance: &Acceptance, item: Option<&str>) -> Option<String> {
     acceptance
         .vendor_turn_id

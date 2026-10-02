@@ -384,7 +384,7 @@ pub struct TurnEnd {
 pub enum AdapterError {
     /// A route cause with Route's evidence: S1's causes, `ServerLost` and
     /// transport loss on the persistent profile, and `HandshakeRefused`.
-    #[error("fake route failed: {0}")]
+    #[error("route failed: {0}")]
     Route(RouteFailure),
     /// A definite rejection before acceptance; nothing was resent.
     #[error("the turn was rejected before submission: {reason:?}")]
@@ -534,6 +534,13 @@ pub(crate) enum Undelivered {
 }
 
 impl ObservationSink {
+    /// Test builds only: sends `item` as a driver does ([`Self::send`]);
+    /// whether the channel took it.
+    #[cfg(feature = "test-failpoints")]
+    pub async fn deliver(&self, item: ObservationItem, stall: Duration) -> bool {
+        self.send(item, stall).await.is_ok()
+    }
+
     /// Sends `item`: acquires its byte cost, then a slot. The item owns one
     /// stall deadline, set at its first block; at it the send gives up.
     /// Test builds: `adapter.observation.admitted` acknowledges each item
@@ -762,6 +769,55 @@ mod tests {
             assert!(sink.send(tool("n"), stall).await.is_ok());
             assert_eq!(receiver.len(), fits + 1);
         });
+    }
+
+    /// Bead via-mnx: distinct clones, each on its own thread, send
+    /// together while a reader drains the channel. Each producer's items
+    /// arrive in its own order with their own `at`, none lost or repeated;
+    /// concurrent producers' items may interleave out of `at` order (C2 §4).
+    #[test]
+    fn clones_on_threads_keep_each_producers_order() {
+        const SENDERS: usize = 4;
+        const ITEMS: usize = 20_000;
+        let (sink, mut receiver) = observation_channel();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(SENDERS));
+        let senders: Vec<_> = (0..SENDERS)
+            .map(|producer| {
+                let (sink, start) = (sink.clone(), std::sync::Arc::clone(&start));
+                std::thread::spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_time()
+                        .build()
+                        .expect("runtime");
+                    start.wait();
+                    runtime.block_on(async {
+                        for sequence in 0..ITEMS {
+                            let item = tool(&format!("{producer}:{sequence}"));
+                            assert!(sink.send(item, Duration::from_secs(10)).await.is_ok());
+                        }
+                    });
+                })
+            })
+            .collect();
+        drop(sink);
+        // Per producer: the next sequence number and the last `at`.
+        let mut next = [(0_usize, None); SENDERS];
+        while let Some(admitted) = receiver.blocking_recv() {
+            let Observation::Progress(marks) = &admitted.item.observation else {
+                panic!("not a sent item");
+            };
+            let (producer, sequence) = marks.tools_started[0].1.split_once(':').unwrap();
+            let (producer, sequence): (usize, usize) =
+                (producer.parse().unwrap(), sequence.parse().unwrap());
+            let (expected, last) = &mut next[producer];
+            assert_eq!(sequence, *expected, "lost, repeated or reordered");
+            assert!(last.is_none_or(|last| admitted.item.at >= last));
+            (*expected, *last) = (sequence + 1, Some(admitted.item.at));
+        }
+        for sender in senders {
+            sender.join().expect("a sender");
+        }
+        assert!(next.iter().all(|(sent, _)| *sent == ITEMS));
     }
 
     fn cost(observation: Observation) -> usize {

@@ -71,7 +71,7 @@ the agent's responsibility: VIA stops only the agent and reports leftovers
 | A5 | ACP decline: choose a reject-kind option, else `cancelled`; never counted as enforcement | as written; shape unverified |
 | A6 | Auto-decline deadline 5 s, from Core config, served on the control path, one value for every adapter (AD17); fail closed when an unknown request cannot be answered, without fabricating a decline | as reviewed in Claude §10; AD17 withdraws the Codex and OpenCode packets' 1 s |
 | A7 | Codex live recovery is unsupported on owned stdio; `thread/resume` continues a conversation after a resolved turn, not an in-flight turn. `Dead` requires verified death, otherwise `Unknown`; no resend | as reviewed in Codex §9 |
-| A8 | Codex owned stdio server key: `(codex, observed_binary_version, config_hash)` where hash covers VIA-controlled startup/environment, not credentials; bound omitted due per-turn `sandboxPolicy`, mixed-bound use gated on pinned enforcement proof. OpenCode's key includes route revision, binary/version, cwd, profile identity/epoch, config/environment revisions, full effective bound, owning VIA session ID and durable private namespace; one owner per server, no cross-owner sharing or live-session migration (C1 P11) | as reviewed in Codex §9 and OpenCode §2 |
+| A8 | Codex owned stdio server key: `(codex, observed_binary_version, config_hash)` where hash covers VIA-controlled startup/environment, not credentials; bound omitted due per-turn `sandboxPolicy`, mixed-bound use gated on pinned enforcement proof. OpenCode's key includes route revision, program path, cwd, profile identity/epoch, config/environment revisions, full effective bound, owning VIA session ID and durable private namespace; one owner per server, no cross-owner sharing or live-session migration (C1 P11) | as reviewed in Codex §9 and OpenCode §2 |
 
 ## 1. Purpose and rules
 
@@ -154,6 +154,8 @@ impl AdapterSet {
     /// Pure: validates a resume turn's values against the frozen route.
     pub fn check_turn(&self, session: &SessionRef, turn: &TurnParams) -> Result<TurnCheck, Refusal>;
     pub fn models(&self, harness: Option<&str>) -> Vec<ModelEntry>;              // bundled + discovered
+    /// Pure, in-memory: the live shared servers for C1 `daemon/status.servers`; empty for per-turn routes.
+    pub fn servers(&self) -> Vec<ServerReport>;
     /// Logical: no vendor I/O. Attaches the session observation channel in `cx`.
     pub fn open_session(&self, session: &SessionRef, spec: SessionSpec, cx: SessionCx) -> SessionDriver;
     /// After daemon restart. Never submits input.
@@ -190,20 +192,22 @@ pub struct VendorIdentity {
 
 | Type | Fields |
 |---|---|
-| `DescribeRequest` | `harness: Option<String>` (passed unchanged; Core never compares it), `model: Option<String>`, `effort: Option<String>` (spawn's turn-1 effort, validated purely by `plan`, §5; C1 `describe` passes none, so its public parameters are unchanged), `bound: Bound`, `require: Vec<VerbReq>`, `vendor: VendorOptions`, `cwd: Option<PathBuf>`, `allow_untested: bool` (stored, no effect, §5) |
-| `RoutePlan` | `harness: &'static str` (canonical), `route: RouteId`, `model: {requested, resolved}`, `inherit: {requested, effective}` (§6.2), `adapter_version`, `vendor_version: Option<String>` (last seen for the binary identity, or null), `version_status: Tested\|Untested\|Refused`, `capabilities: Capabilities` (C1 §4.1), `effective_bound`, `server_key: Option<ServerKey>`, `refusals`, `warnings` |
+| `DescribeRequest` | `harness: Option<String>` (passed unchanged; Core never compares it), `model: Option<String>`, `effort: Option<String>` (spawn's turn-1 effort, validated purely by `plan`, §5; C1 `describe` passes none, so its public parameters are unchanged), `bound: Bound`, `require: Vec<VerbReq>`, `vendor: VendorOptions`, `cwd: Option<PathBuf>`, `allow_untested: bool` (stored, no effect, §5), `sizes: ParamSizes` |
+| `ParamSizes` | the encoded byte sizes of the session's `instructions` text and the turn's `output_schema` (0 when absent), filled by Core from the values it holds, so a route with a lower limit (for example a per-argument limit) refuses purely with `InvalidParam` naming the member, before any receipt; the values themselves never reach `plan` |
+| `RoutePlan` | `harness: &'static str` (canonical), `route: RouteId`, `model: {requested, resolved}`, `inherit: {requested, effective}` (§6.2), `adapter_version`, `vendor_version: Option<String>` (last seen for the harness and resolved program path, or null), `version_status: Tested\|Untested\|Refused`, `capabilities: Capabilities` (C1 §4.1), `effective_bound`, `server_key: Option<ServerKey>`, `refusals`, `warnings` |
 | `Capabilities` | the C1 §4.1 DTO with `Support { Native, Partial { semantics }, Unsupported { reason } }` |
 | `ModelEntry` | a model with `source: bundled \| discovered` |
 | `SessionRef` | `harness`, `route`, `adapter_version`, handed back on resume, reopen and recovery; unknown or incompatible → `harness_unavailable` (rule 2) |
 | `SessionSpec` | `session_id`, `model`, `instructions: Option<Instructions>`, `initial_bound`, `cwd`, `vendor`, `inherit: {requested, effective}` (the inherited-configuration settings and states frozen at spawn, §6.2), `confirmed_vendor_session_id: Option<VendorSessionId>`, immutable `allow_untested`; a confirmed historical ID is not verification of this connection |
-| `TurnParams` | a resume turn's per-turn values (effort, bound, `output_schema`, `max_steps`, vendor keys), the input to `check_turn` |
+| `TurnParams` | a resume turn's per-turn values (effort, bound, `output_schema`, `max_steps`, vendor keys) and their `sizes: ParamSizes` (the session's frozen instructions, the turn's effective schema, inherited or set), the input to `check_turn` |
+| `ServerReport` | `harness`, `vendor_version: Option<String>`, `key: ServerKey`, `sessions: u32` (sessions leasing it) |
 | `TurnCheck` | `effective_bound`: the turn's bound as the route will apply it, like `RoutePlan.effective_bound` |
 | `TurnSpec` | `turn: TurnNo`, `prompt`, `effort`, `bound`, `output_schema`, `max_steps`, `vendor`, `wall_deadline: Instant`, `idle_deadline: IdleDeadline` |
 | `SteerInput` | `turn: TurnNo`, `token: SteerToken`, `text`, `expected_vendor_turn: Option<VendorTurnId>`; the driver checks `turn` atomically with control-lane admission (§2): `TurnMismatch` unless it is running that turn, `NoActiveTurn` when it runs none, so input never reaches a successor. Core mints `token`, unique within the session, before the call; the driver emits the `steer.delivered` observation carrying it before it returns `Ok`, and Core answers the C1 steer only after committing that observation (C1 §3.4) |
 | `SteerDelivery` | `Injected`, `Partial(Cow<'static, str>)` (real adapters pass static text; the fake passes its profile's text) |
 | `SteerError` | `Unsupported`, `NoActiveTurn`, `TurnMismatch`, `OverCapacity` (the control lane is full; nothing was written), `NotSteerable` (the vendor refused steer in the active turn's current phase; nothing was applied), `NotDelivered` (writing the input began, in part or whole, but the vendor never acknowledged it; whether it was applied is unknown), `NotRecorded { delivery }` (the vendor took the input whole, as `delivery` says, but its `steer.delivered` observation could not be emitted, for example on a full observation queue or a forced stop, so no event records it). A steer never outlives its turn: when the turn ends by any path, a forced stop or cutoff included, the driver answers every steer still waiting on it. Core maps them under C1 §3.4 |
 | `CloseReport` | `vendor_closed: bool`, `process_exit: Option<Exit>`, `cleanup: Cleanup`, `warnings`, `leftovers: Option<LeftoverReport>` (only when this close stopped the server, §4.2) |
-| `VendorTerminal` | `at`, `status: Completed\|Interrupted\|Failed`, `stop_reason: StopReason`, `vendor_stop_reason`, `vendor_code?`, `class_hint: Option<ClassHint>`, `detail?`, `structured_output?`, `steps?`, `usage?` (turn aggregate), `cost?`, `vendor?` (bounded 16 KiB) |
+| `VendorTerminal` | `at`, `status: Completed\|Interrupted\|Failed`, `stop_reason: StopReason`, `vendor_stop_reason`, `vendor_code?`, `class_hint: Option<ClassHint>`, `detail?`, `structured_output: Option<StructuredOutput>` (`Json(raw)`; `NotJson` when the route's structured output is text that does not parse as JSON, which Core treats as present and invalid with `reason: invalid`; `OverLimit` when a route that assembles it from text exceeds its 4 MiB retention bound, which Core treats as present and invalid with `reason: validation_limit`, C1 §5), `steps?`, `usage?` (turn aggregate), `cost?`, `vendor?` (bounded 16 KiB) |
 | `InstanceReport` | `vendor_version: Option<String>`, `version_status: Tested\|Untested` |
 | `ClassHint` | `Auth`, `RateLimit`, `ContextExceeded`, `BudgetExceeded`, `VendorError`, `Protocol`, `ResumeMismatch` |
 | `StopReason` | `EndTurn`, `MaxSteps`, `Budget`, `Refusal`, `Interrupted`, `Error`, `Other` |
@@ -405,11 +409,13 @@ terminal is not an observation: it is retained in the turn's `TurnEnd`
 | `progress` | `at`, `model: bool`, `tools_started: [(id, name)]`, `tools_ended: [id]`, `usage?: UsageSample` | no commit: Core folds it into the running turn's progress snapshot and commits a `steps` row when a step ends (C1 §3.7). `model` marks model output (text, reasoning or a tool request); `usage` is a per-model-call sample, never a cumulative total. A message with no mark sends no item |
 | `final_text` | `text` | no commit: Core appends the text to the turn's final text, inline up to 256 KiB encoded, else in the turn's `final_text.txt` (C1 §5). The adapter sends completed text only, cut so that the whole encoded observation, escaping included, is at most 256 KiB |
 
-Each observation carries `at: Instant` (Core records wall time).
-Ordering (D4): per session, the order the driver
-decoded them, across all of the driver's producers, with `at` never
-earlier than the previous observation's (Core times idle progress by it,
-runtime §8); none across sessions. `class_hint` is a suggestion from the
+Each observation carries `at: Instant`, when the driver decoded it (Core
+records wall time); Core times idle progress and step boundaries by it
+(runtime §8). Ordering (D4): per session, in channel order; `at` never
+decreases within one producer, while items of concurrent producers of one
+session may be admitted out of `at` order, so Core never moves an idle
+deadline back and never ends a step before it started. None across
+sessions. `class_hint` is a suggestion from the
 vendor code table (§6); Core applies C1 §7.6 precedence (cancel evidence
 before generic errors). Control acknowledgement may bypass observations, but
 cannot commit a terminal envelope ahead of earlier data. Sticky health failure
@@ -575,17 +581,17 @@ default.
   - After Claude's prompt line, it fails `protocol` with no resend.
 - **Refusal cache.** Only a demonstrated incompatibility is cached: a
   relied-on feature absent from the handshake, or a readback that differs from
-  the value VIA sent. The key is the binary identity (device, inode, size,
-  mtime of the resolved target) plus the route's recipe digest (launch
-  arguments, category switches, bound and policy inputs). While an entry is
-  live, plans with the same key refuse `harness_unavailable`
-  (`data.reason:"handshake_refused"`). Spawn failures, timeouts, transport
-  loss, auth, quota and rate-limit failures are never cached. An entry
+  the value VIA sent. The key is the resolved program path plus the
+  route's recipe digest (launch arguments, category switches, bound and
+  policy inputs). While an entry is live, plans with the same key refuse
+  `harness_unavailable` (`data.reason:"handshake_refused"`). Spawn
+  failures, timeouts, transport loss, auth, quota and rate-limit failures
+  are never cached. An entry
   expires 10 minutes after it was written, and at daemon restart. The next
   turn after expiry launches and re-checks, so a fixed environment recovers
   without a binary change.
-- `describe` and receipts report the last version seen for that binary
-  identity, or `null`/`untested`, and start nothing.
+- `describe` and receipts report the last version seen for that harness
+  and resolved program path, or `null`/`untested`, and start nothing.
 - A handshake check that exposes a relied-on feature (Claude
   `interrupt_receipt_v1`, permission-mode echo and tool list; Codex policy and
   sandbox echo; OpenCode permission readback) refuses the instance when that
@@ -669,7 +675,7 @@ for exact validation; canonical never-ask, identity and bound settings win.
 | Operation | Claude `claude-cli` | Codex `codex-app-server` | OpenCode `opencode-serve` | Generic ACP |
 |---|---|---|---|---|
 | Process shape | one private `claude -p --input-format stream-json --output-format stream-json --verbose` process per VIA turn, persistent same vendor UUID across launches | owned shared `codex app-server` on stdio, key `(codex, observed_binary_version, config_hash)` excluding credentials and bound (A8); stdin stays open for leases | one owned server/private no-login namespace per VIA session: `opencode serve --pure --hostname 127.0.0.1 --port <explicit-port>`; private HOME/all XDG roots including DATA and absolute private `OPENCODE_DB`; generated password in daemon memory/launch env; authenticated health/version after Host provenance; no cross-owner sharing or foreign attach (§§2–3) | per-session agent process over stdio |
-| `describe` | bundled catalog; last version seen from an init for this binary identity, else `null`/`untested` (§5); no vendor process/file write or model prompt | bundled effort mapping; last version seen and the `model/list` catalog cached from a live instance (§5); no process/file write during describe | bundled profile; last version seen from a live server's health and its cached `/provider` catalog (§5); no hidden process/file write during describe (§3) | agent version; cached `initialize` capabilities from the last probe |
+| `describe` | bundled catalog; last version seen from an init for this program path, else `null`/`untested` (§5); no vendor process/file write or model prompt | bundled effort mapping; last version seen and the `model/list` catalog cached from a live instance (§5); no process/file write during describe | bundled profile; last version seen from a live server's health and its cached `/provider` catalog (§5); no hidden process/file write during describe (§3) | agent version; cached `initialize` capabilities from the last probe |
 | `open_session` (logical) and the first `run_turn` of a connection generation | logical open keeps the expected UUID unverified before input; every per-turn launch applies frozen flags, matching init/non-rejection result confirms identity; pre-init rejection does not | version from `initialize` (§5); initialize without notification opt-outs; `thread/start` with explicit model/cwd/instructions/sandbox, `approvalPolicy:"never"`, `approvalsReviewer:"user"`, `ephemeral:false`; `thread/resume` exact ID/current sandbox/`excludeTurns:true` and verify identity/policy | persist one owner/key/namespace mapping before vendor creation; subscribe SSE, `POST /session?directory=<cwd>`, persist returned vendor ID; resume verifies exact ID and directory in retained namespace (§§2, 4) | `initialize {protocolVersion, clientCapabilities:{fs:{readTextFile:false,writeTextFile:false},terminal:false}}`; `session/new {cwd, mcpServers:[]}`; reopen `session/load` when `loadSession` (docs) |
 | `run_turn` submission | launch one process with frozen effective settings and exact expected UUID, write one `user` line; Core holds queued prompts and never writes busy input; later launch uses `--resume` with same UUID even when settings are unchanged | `turn/start {threadId,input:[{type:"text",text}],cwd,model,effort,outputSchema,approvalPolicy:"never",approvalsReviewer:"user",sandboxPolicy}` → paired `turn.id`; full frozen structured policy on every turn | one caller `messageID`, then one `POST /session/{id}/prompt_async`; HTTP 204 is acceptance only, terminal SSE must correlate; no resend after uncertainty (§4) | `session/prompt {sessionId, prompt:[{type:"text",text}]}` (docs) |
 | Observations | `assistant`, `user`, `result` (probe); `result` fields `subtype` (`success`, `error_during_execution`), `is_error`, `terminal_reason` (`completed`, `aborted_tools`), `stop_reason`, `num_turns`, `permission_denials`, `usage`, `total_cost_usd`, `session_id`, `queued_turn_count` (probe, 2.1.283); `structured_output` (docs); a vendor-synthetic API-error message is never acceptance, progress or final text (§2) | `turn/started`, `item/started`, `item/agentMessage/delta`, `item/completed` (`agentMessage`, `commandExecution{processId, exitCode, status}`, `fileChange`, `reasoning`), `turn/diff/updated`, `thread/tokenUsage/updated`, `turn/completed` (`turn.status` `completed`/`interrupted`/`failed`, `turn.error`), `error {willRetry}`, `thread/status/changed`, `thread/closed` (schema); final text comes only from `agentMessage` items with `phase:"final_answer"` | pinned legacy `message.*`/`session.*` SSE family; correlate session, caller message, assistant parent and part IDs; unknown notifications bounded, malformed known payloads protocol errors (§§4–5); the terminal follows the packet's three steps, acknowledgement, terminal and cleanup (§4) | `session/update` (`agent_message_chunk`, `tool_call`, `tool_call_update`, `usage_update`) (docs) |
@@ -716,9 +722,9 @@ Codex tool items carry a `processId` that is not an OS pid; mapping OS
 groups (bwrap `--new-session`) to a thread is unverified (P2b), so per-tool
 kill is not offered.
 OpenCode's exact logical server key is
-`(route_revision, resolved_binary_identity, exact_vendor_version,
-canonical_cwd, provider_profile_id, provider_profile_epoch,
-generated_config_digest, environment_policy_revision, full_effective_bound,
+`(route_revision, resolved_program_path, canonical_cwd,
+provider_profile_id, provider_profile_epoch, generated_config_digest,
+environment_policy_revision, full_effective_bound,
 owning_via_session_id, private_storage_namespace)` (`vendors/opencode.md`
 §2). The owner/namespace mapping commits before vendor creation and is reused
 on spawn replay, resume and restart. Server generation, port and password are

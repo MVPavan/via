@@ -5,10 +5,12 @@
 
 use serde_json::json;
 
+use super::lane::Retained;
 use super::{Engine, Terminal, TurnRecord};
 use crate::api::{FailureClass, STRUCTURED_OUTPUT_INLINE, StructuredOutputFile, Warning};
 use crate::intake::Effective;
 use crate::schema::{self, Checked};
+use crate::{SessionId, TurnNumber};
 
 impl Engine {
     /// C1 Q2, §5 (fix round 1 #16; critical r1 #3, #4): a present
@@ -24,10 +26,21 @@ impl Engine {
         effective: &Effective,
         record: &mut TurnRecord,
     ) -> bool {
+        self.validate_retained(effective, record.vendor.retained.as_mut())
+            .await
+    }
+
+    /// [`Engine::validate_output`] of a retained vendor terminal, `None`
+    /// without one.
+    pub(super) async fn validate_retained(
+        &self,
+        effective: &Effective,
+        retained: Option<&mut Retained>,
+    ) -> bool {
         let Some(schema) = effective.output_schema() else {
             return false;
         };
-        let Some(retained) = record.vendor.retained.as_mut() else {
+        let Some(retained) = retained else {
             return true;
         };
         let Some(output) = retained.structured_output.as_ref() else {
@@ -72,9 +85,22 @@ impl Engine {
     /// write failed: the commit that would name the file fails, and both
     /// fields are `null`.
     pub(super) async fn spill(&self, record: &mut TurnRecord, retry: bool) -> Option<bool> {
-        let session = record.session.clone();
-        let turn = record.turn;
-        let Some(retained) = record.vendor.retained.as_mut() else {
+        let address = (&record.session, record.turn);
+        self.spill_retained(address, None, record.vendor.retained.as_mut(), retry)
+            .await
+    }
+
+    /// [`Engine::spill`] of turn `(session, turn)`'s retained vendor
+    /// terminal, `None` without one; for its `revision`, under a file name
+    /// of that revision's own (C1 §5, §7.6).
+    pub(super) async fn spill_retained(
+        &self,
+        (session, turn): (&SessionId, TurnNumber),
+        revision: Option<u32>,
+        retained: Option<&mut Retained>,
+        retry: bool,
+    ) -> Option<bool> {
+        let Some(retained) = retained else {
             return Some(false);
         };
         let Some(encoded) = retained
@@ -90,7 +116,7 @@ impl Engine {
         for attempt in 0..=u8::from(retry) {
             let written = self
                 .store
-                .write_structured_output(&session, turn, encoded.clone())
+                .write_structured_output((session, turn), revision, encoded.clone())
                 .await;
             if let Ok(file) = written {
                 retained.structured_output_file = Some(StructuredOutputFile {
@@ -113,12 +139,20 @@ impl Engine {
 /// is `"invalid"`, or `"validation_limit"` when the validation bound was
 /// reached first.
 pub(super) fn project_output(record: &TurnRecord, terminal: &mut Terminal) {
-    let Some(reason) = record
-        .vendor
-        .retained
-        .as_ref()
-        .and_then(|retained| retained.output_invalid)
-    else {
+    project_invalid(
+        record
+            .vendor
+            .retained
+            .as_ref()
+            .and_then(|retained| retained.output_invalid),
+        terminal,
+    );
+}
+
+/// [`project_output`] of a kept validation outcome, `None` when the value
+/// is valid or absent.
+pub(super) fn project_invalid(invalid: Option<&'static str>, terminal: &mut Terminal) {
+    let Some(reason) = invalid else {
         return;
     };
     if terminal.state == "completed" {

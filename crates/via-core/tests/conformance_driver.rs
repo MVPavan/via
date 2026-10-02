@@ -3123,6 +3123,88 @@ fn a_pinned_turns_stamped_progress_is_not_overtaken_by_the_idle_close() {
     assert!(end.outcome.is_ok(), "{end:?}");
 }
 
+/// Critical fix r1 #3 (C2 §2, §4 generation barrier, persistent profile):
+/// a retired helper's delivery is its generation's last, so it holds the
+/// barrier. Turn 1 completes while its helper, held at a gate, still has a
+/// denial to report. The idle close released meanwhile waits on the
+/// barrier (`adapter.fake.idle_barrier_wait`); it closes the generation
+/// (`VendorClosed`) only once the denial was delivered, and the next
+/// turn's new generation follows both. A barrier the retirement does not
+/// hold lets the close decide at once and precede the denial.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn an_idle_close_waits_for_the_retirements_delivery() {
+    let mut profile = persistent();
+    profile["idle_close"] = json!({"after_turn": 1, "gate": "idle", "reason": "idle_timeout"});
+    let denial = emit(&json!({"type":"denial","vendor_turn_id":vendor_turn(1),
+                              "kind":"command","target":"t","reason":"policy"}));
+    let rig = Rig::new(
+        &profile,
+        &[
+            script(
+                1,
+                &[
+                    accepted(1),
+                    terminal(1, "completed", "end_turn"),
+                    gate("after"),
+                    denial,
+                ],
+            ),
+            script(2, &[accepted(2), terminal(2, "completed", "end_turn")]),
+        ],
+    );
+    let points = rig.points();
+    let (waiting, decided) = (
+        "adapter.fake.idle_barrier_wait",
+        "adapter.fake.idle_decided",
+    );
+    acknowledge(&points, waiting);
+    acknowledge(&points, decided);
+    let (driver, mut receiver) = rig.session();
+    let (cx, _first) = turn_cx(1, driver.prepare(), WALL);
+    let (end, _) = rig.run(&driver, &mut receiver, prompt(), cx, |_| {});
+    assert!(end.outcome.is_ok(), "{end:?}");
+    let sync = rig.sync();
+    release(&sync, "idle");
+    let drained = rig.runtime.block_on(async {
+        // The close waits on the barrier, or has already decided.
+        let by = tokio::time::Instant::now() + FIXTURE_WAIT;
+        while ![waiting, decided]
+            .iter()
+            .any(|point| points.join(format!("{point}.1.ack")).exists())
+        {
+            assert!(tokio::time::Instant::now() < by, "the idle close never ran");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        release(&sync, "after");
+        let mut drained = Vec::new();
+        while drained.len() < 2 {
+            let admitted = tokio::time::timeout(FIXTURE_WAIT, receiver.recv()).await;
+            drained.push(admitted.unwrap().unwrap().item);
+        }
+        drained
+    });
+    assert!(
+        matches!(drained[0].observation, Observation::ActionDenied(_))
+            && matches!(drained[1].observation, Observation::VendorClosed(_)),
+        "the generation closed before its retirement's last delivery: {:?}",
+        observations(&drained)
+    );
+    let prepared = driver.prepare();
+    assert!(matches!(prepared, Prepared::NeedsConnection));
+    let (cx, _second) = turn_cx(2, prepared, WALL);
+    let (end, items) = rig.run(&driver, &mut receiver, prompt(), cx, |_| {});
+    assert!(end.outcome.is_ok(), "{end:?}");
+    assert!(
+        items.iter().all(|item| item
+            .vendor_turn
+            .as_ref()
+            .is_none_or(|id| id.as_str() == vendor_turn(2))),
+        "{:?}",
+        observations(&items)
+    );
+}
+
 /// C2 §4 generation barrier: a turn waiting on it has not launched, so a
 /// stop, the daemon force or its wall (turn `wall`) ends it there as before
 /// any launch, promptly and well within the stall bound that holds the old

@@ -573,6 +573,17 @@ impl LaneState {
     }
 }
 
+/// One item's disposal under way ([`Lane::close_draining`]).
+type Disposal<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+/// Awaits the disposal under way, if any; never ends without one.
+async fn disposal(current: Option<&mut Disposal<'_>>) {
+    match current {
+        Some(current) => current.await,
+        None => std::future::pending().await,
+    }
+}
+
 /// The driver's journal report's own consumer (critical r2 F3, C2 §2
 /// `journal_uncertain`), on the daemon's tracker apart from the lane's
 /// actor, so no turn job delays it: an uncertain Host journal write no
@@ -881,9 +892,9 @@ impl Lane {
     /// committed at once with its own attribution: an identity as the
     /// session's open event with its columns, a denial, decline or warning
     /// session-level, or late with its turn when it names an earlier turn;
-    /// so is a steer report (Sol r1 #9). An expired one and every
-    /// non-durable one (acceptance, progress, final text, vendor close,
-    /// mismatch, late terminal) is
+    /// so is a steer report (Sol r1 #9). A late terminal of an earlier turn
+    /// revises it (C1 §7.6). An expired one and every other non-durable
+    /// one (acceptance, progress, final text, vendor close, mismatch) is
     /// dropped. A vendor close needs nothing of Core: the driver ends the
     /// connection, and the next turn reopens it. Its budget returns once
     /// it is handled.
@@ -901,7 +912,10 @@ impl Lane {
                 match self.open_event(&identity.connection_id, &confirmed, version) {
                     Some(body) => {
                         let columns = Some(confirmed.columns());
-                        let written = self.writer.commit((body, &at, (None, false)), columns).await;
+                        let written = self
+                            .writer
+                            .commit((body, &at, (None, false)), columns)
+                            .await;
                         if let SessionWrite::Committed = written {
                             self.opened(identity.connection_id.clone(), confirmed);
                         }
@@ -936,15 +950,25 @@ impl Lane {
                     }
                 }
             }
+            // C1 §7.6: an ended turn's own late terminal revises it, when
+            // its end retained none ([`Engine::revise`]).
+            Observation::LateTerminal(terminal) => {
+                let vendor_turn = item
+                    .vendor_turn
+                    .as_ref()
+                    .map(via_adapters::VendorTurnId::as_str);
+                if let Attribution::Late(turn) = self.attribute(vendor_turn, None)
+                    && let Some(engine) = self.engine.upgrade()
+                {
+                    engine.revise(&self.writer.session, turn, terminal).await;
+                }
+            }
             Observation::IdentityConfirmed(_)
             | Observation::Accepted(_)
             | Observation::Progress(_)
             | Observation::FinalText(_)
             | Observation::VendorClosed(_)
-            | Observation::ResumeMismatch { .. }
-            // Discarded until via-jm4.35: a late terminal's revision
-            // write is not in the Store yet.
-            | Observation::LateTerminal(_) => {}
+            | Observation::ResumeMismatch { .. } => {}
         }
         drop(permit);
     }
@@ -952,7 +976,8 @@ impl Lane {
     /// The lane's actor (C2 §2; Sol r1 F2, F4, Sol r2 #1-#3, Sol r3
     /// N1-N5, Sol r4 R2, R3, Sol r5 R8), on the daemon's tracker for the
     /// lane's life: it serves the lane until it ends ([`Self::serve`]).
-    /// Then it closes the driver, unless the drivers' cancellation ended
+    /// Then it closes the driver, draining the channel meanwhile
+    /// ([`Self::close_draining`]), unless the drivers' cancellation ended
     /// the lane; closes the channel's admission and disposes of everything
     /// admitted before, to the channel's end, one item at a time (durable
     /// items committed, the rest dropped); runs a turn handed over
@@ -984,8 +1009,10 @@ impl Lane {
             // reconciliation owns their groups (final shutdown).
             None => None,
         };
+        let mut disposing = None;
         if let Some((mode, deadline)) = close {
-            let report = self.driver.close(mode, deadline).await;
+            let (report, current) = self.close_draining(&mut inbox, mode, deadline).await;
+            disposing = current;
             if owned {
                 *lock(&self.report) = Some(report);
             }
@@ -995,8 +1022,15 @@ impl Lane {
         let _ = via_store::failpoint::hit_async("core.lane.admission_close").await;
         // Admission closes first (Sol r4 R3): what the driver sends from now
         // on is refused at its sink, and an empty channel is not its end
-        // until no sender holds a slot.
+        // until no sender holds a slot. A disposal the close's end found
+        // under way is then finished, never cut off (fix r3 #2).
         inbox.close();
+        // Test builds: admission is closed, a disposal under way unfinished.
+        #[cfg(feature = "test-failpoints")]
+        let _ = via_store::failpoint::hit_async("core.lane.admission_closed").await;
+        if let Some(disposing) = disposing {
+            disposing.await;
+        }
         let mut handled = 0;
         while let Some(admitted) = inbox.recv().await {
             self.dispose(admitted).await;
@@ -1043,6 +1077,43 @@ impl Lane {
         // (runtime §8, critical r3 #3).
         drop(resident);
         self.changed.send_replace(());
+    }
+
+    /// Closes the driver while disposing of what its channel receives
+    /// meanwhile, one item at a time (fix r2 #1): what the driver still
+    /// delivers before its close ends, such as a retired process's late
+    /// observations, waits for no close. The close is polled apart from
+    /// the disposal under way (fix r3 #2), so its absolute `deadline` (C1
+    /// §3.6), which bounds the driver's close and its delivery, never
+    /// waits behind Store work. Returns the close's report as soon as it
+    /// ends, with the disposal then under way, which the caller finishes
+    /// once the channel's admission closed: a commit is never cut off.
+    async fn close_draining(
+        &self,
+        inbox: &mut Inbox,
+        mode: CloseMode,
+        deadline: Deadline,
+    ) -> (CloseReport, Option<Disposal<'_>>) {
+        // Test builds: the lane starts the driver's close.
+        #[cfg(feature = "test-failpoints")]
+        let _ = via_store::failpoint::hit_async("core.lane.close_draining").await;
+        let mut closing = std::pin::pin!(self.driver.close(mode, deadline));
+        let mut current: Option<Disposal<'_>> = None;
+        let (mut open, mut handled) = (true, 0);
+        loop {
+            tokio::select! {
+                biased;
+                report = &mut closing => return (report, current),
+                () = disposal(current.as_mut()), if current.is_some() => {
+                    current = None;
+                    ready_item(&mut handled).await;
+                }
+                admitted = inbox.recv(), if open && current.is_none() => match admitted {
+                    Some(admitted) => current = Some(Box::pin(self.dispose(admitted))),
+                    None => open = false,
+                },
+            }
+        }
     }
 
     /// Serves the lane until it ends (Sol r3 N1-N3): runs each turn handed

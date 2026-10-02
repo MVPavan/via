@@ -82,7 +82,7 @@ const IDENTITY_FIELDS: [&str; 5] = ["user", "username", "login", "email", "accou
 const PLACEHOLDERS: [&str; 4] = ["", "<redacted>", "REDACTED", "PLACEHOLDER"];
 /// Fixtures whose input is not sealed by a final `await_eof` (alone, or
 /// right before the closing `exit`), each with its reason.
-const ENDS_WITHOUT_EOF: [(&str, &str); 4] = [
+const ENDS_WITHOUT_EOF: [(&str, &str); 5] = [
     (
         "claude/c10_early_eof.replay.json",
         "a vendor record of stdin EOF right after the prompt: its await_eof is step 2 and the \
@@ -100,6 +100,10 @@ const ENDS_WITHOUT_EOF: [(&str, &str); 4] = [
     (
         "codex/c4b_workspace_write_refused.replay.json",
         "no launch: the bound is refused before any vendor I/O, so the fixture has no steps",
+    ),
+    (
+        "codex/codex_bound_gate_refusals.replay.json",
+        "no launch: every spawn is refused before any vendor I/O, so the fixture has no steps",
     ),
 ];
 

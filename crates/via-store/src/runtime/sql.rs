@@ -7,15 +7,15 @@ use super::{
     EvidenceRefs, EvidenceRoot, FAILURE_BATCH_CANCELLATIONS, FailureResolutionRecord, Identity,
     InstanceRecord, KeyedOperation, ListPage, ListQuery, MetadataExt, OperationRecord,
     OperationVerb, OptionalExtension, PAGE_MAX, PAGE_SCAN, PAGE_WRAPPER, Path, Predecessors,
-    Prompt, QueuedSummary, QueuedTurn, ReadCorruption, ReceiptRecord, ResumeRecord,
-    SESSION_QUEUE_LIMIT, STATUS_ANCHORS, STATUS_QUEUE, STATUS_TURNS, SessionEventRecord, SessionId,
-    SessionRoute, SessionSnapshot, SessionStatus, SessionSummary, SpawnKey, SpawnRecord,
-    StatusQuery, StepRow, StepsRecord, StoreError, StoredEvent, StoredSpawnKey, SubmissionRecord,
-    SubmitFailedRecord, TerminalCancel, TerminalExtras, TerminalFacts, TerminalRecord,
-    TransactionBehavior, TurnNumber, UnfinishedTurn, Value, check_schema_version,
-    commit_anchor_identified, commit_anchor_intent, commit_arm_intent, commit_group_absence,
-    commit_vendor_facts, count_unproven_anchors, fs, oneshot, params, read_anchor_cohort,
-    read_anchor_owners, read_anchor_records,
+    Prompt, QueuedSummary, QueuedTurn, ReadCorruption, ReceiptRecord, ResumeRecord, RevisableTurn,
+    RevisionRecord, SESSION_QUEUE_LIMIT, STATUS_ANCHORS, STATUS_QUEUE, STATUS_TURNS,
+    SessionEventRecord, SessionId, SessionRoute, SessionSnapshot, SessionStatus, SessionSummary,
+    SpawnKey, SpawnRecord, StatusQuery, StatusTurn, StepRow, StepsRecord, StoreError, StoredEvent,
+    StoredSpawnKey, SubmissionRecord, SubmitFailedRecord, TerminalCancel, TerminalExtras,
+    TerminalFacts, TerminalRecord, TransactionBehavior, TurnNumber, UnfinishedTurn, Value,
+    check_schema_version, commit_anchor_identified, commit_anchor_intent, commit_arm_intent,
+    commit_group_absence, commit_vendor_facts, count_unproven_anchors, fs, oneshot, params,
+    read_anchor_cohort, read_anchor_owners, read_anchor_records,
 };
 use crate::{
     blob::{BlobRef, Blobs},
@@ -348,6 +348,7 @@ impl Command {
                 | Self::NextSeq(..)
                 | Self::ResultText(..)
                 | Self::TerminalFacts(..)
+                | Self::Revisable(..)
                 | Self::CloseResult(..)
                 | Self::ClosingSessions(..)
                 | Self::Terminated(..)
@@ -380,6 +381,7 @@ impl Command {
             Self::NextSeq(..) => "store.read.corrupt.next_seq",
             Self::ResultText(..) => "store.read.corrupt.result",
             Self::TerminalFacts(..) => "store.read.corrupt.terminal_facts",
+            Self::Revisable(..) => "store.read.corrupt.revisable",
             Self::CloseResult(..) => "store.read.corrupt.close_result",
             Self::ClosingSessions(..) => "store.read.corrupt.closing_sessions",
             Self::Terminated(..) => "store.read.corrupt.terminated",
@@ -403,6 +405,7 @@ impl Command {
             | Self::SessionEvent(..)
             | Self::Steps(..)
             | Self::Terminal(..)
+            | Self::Revision(..)
             | Self::Closing(..)
             | Self::Closed(..)
             | Self::SubmitFailed(..)
@@ -489,6 +492,9 @@ fn serve_read(conn: &Connection, command: Command, corruption: &ReadCorruption) 
         Command::TerminalFacts(session, turn, reply) => {
             reply!(reply, read_terminal_facts(conn, &session, turn));
         }
+        Command::Revisable(session, turn, reply) => {
+            reply!(reply, read_revisable(conn, &session, turn));
+        }
         Command::CloseResult(session, reply) => reply!(reply, read_close_result(conn, &session)),
         Command::ClosingSessions(after, limit, reply) => {
             reply!(reply, read_closing_sessions(conn, after.as_ref(), limit));
@@ -535,6 +541,7 @@ fn serve_read(conn: &Connection, command: Command, corruption: &ReadCorruption) 
         | Command::SessionEvent(..)
         | Command::Steps(..)
         | Command::Terminal(..)
+        | Command::Revision(..)
         | Command::ClosingTerminal(..)
         | Command::SessionClosed(..)
         | Command::Closing(..)
@@ -632,6 +639,7 @@ fn serve_mutation(conn: &mut Connection, command: Command) {
         Command::SessionClosed(session, closed, reply) => {
             reply!(reply, commit_session_closed(conn, &session, &closed));
         }
+        Command::Revision(record, reply) => reply!(reply, commit_revision(conn, &record)),
         Command::ClosingTerminal(record, closed, reply) => {
             let extras = TerminalExtras::default();
             reply!(
@@ -671,6 +679,7 @@ fn serve_mutation(conn: &mut Connection, command: Command) {
         | Command::Predecessors(..)
         | Command::ResultText(..)
         | Command::TerminalFacts(..)
+        | Command::Revisable(..)
         | Command::CloseResult(..)
         | Command::ClosingSessions(..)
         | Command::Terminated(..)
@@ -1685,6 +1694,69 @@ fn insert_terminal(
     Ok(closed)
 }
 
+/// Commits the guarded revision batch of an `unknown` turn (C1 §7.6,
+/// [`RevisionRecord`]): the turn's state and envelope are replaced and
+/// `turn.revised` appended, only while the turn is `unknown` with an
+/// envelope naming no vendor stop reason (its end retained no terminal)
+/// and holding the revision before the new envelope's, and its session is
+/// not closed. A guard that does not hold is `Refused`. Any revision needs
+/// the turn's acceptance correlation: its late terminal is attributed only
+/// through the vendor turn recorded there (C1 §7.6). The turn's
+/// `cancel_cause` is kept.
+fn commit_revision(conn: &mut Connection, record: &RevisionRecord) -> Result<(), StoreError> {
+    let state = record
+        .envelope
+        .get("state")
+        .and_then(Value::as_str)
+        .ok_or(StoreError::Constraint("revised state missing"))?;
+    if !matches!(state, "completed" | "failed" | "cancelled") {
+        return Err(StoreError::Constraint("revised state invalid"));
+    }
+    let revision = record
+        .envelope
+        .get("revision")
+        .and_then(Value::as_u64)
+        .filter(|revision| *revision >= 1)
+        .and_then(|revision| i64::try_from(revision).ok())
+        .ok_or(StoreError::Constraint("revision invalid"))?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sql_error)?;
+    let session = tx
+        .query_row(
+            "SELECT state FROM sessions WHERE id=?1",
+            [record.session_id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(sql_error)?
+        .ok_or(StoreError::Constraint("session does not exist"))?;
+    if session == "closed" {
+        return Err(StoreError::Refused("session is closed"));
+    }
+    let changed = tx
+        .execute(
+            "UPDATE turns SET state=?3,envelope=?4 WHERE session_id=?1 AND number=?2
+               AND state='unknown' AND json_extract(envelope,'$.vendor_stop_reason') IS NULL
+               AND coalesce(json_extract(envelope,'$.revision'),0)=?5-1
+               AND correlation IS NOT NULL",
+            params![
+                record.session_id.as_str(),
+                record.turn.get(),
+                state,
+                json(&record.envelope)?,
+                revision
+            ],
+        )
+        .map_err(sql_error)?;
+    if changed != 1 {
+        return Err(StoreError::Refused("turn is not revisable"));
+    }
+    insert_event(&tx, &record.session_id, &record.event)?;
+    before_commit!("store.commit.revision");
+    commit(tx)
+}
+
 /// Recomputes a session's state after a terminal; `closed` makes it final.
 fn update_session_state(
     tx: &rusqlite::Transaction<'_>,
@@ -1803,12 +1875,13 @@ fn commit_closed(
 }
 
 /// C1 §3.6 close result from durable rows only [r1.6, r1.8]: the turns a
-/// close cancelled, in turn order, and `quiescent` cleanup only when every
+/// close cancelled, in turn order (state `cancelled` with cause `close`:
+/// a close-stopped `unknown` turn counts once revised to `cancelled`), and `quiescent` cleanup only when every
 /// group of the session's turns has an absence proof.
 fn derive_close_result(conn: &Connection, session: &SessionId) -> Result<Value, StoreError> {
     let mut query = conn
         .prepare_cached(
-            "SELECT number FROM turns WHERE session_id=?1 AND cancel_cause='close' ORDER BY number",
+            "SELECT number FROM turns WHERE session_id=?1 AND state='cancelled' AND cancel_cause='close' ORDER BY number",
         )
         .map_err(sql_error)?;
     let cancelled = query
@@ -2064,6 +2137,43 @@ fn read_terminal_facts(
         state: state.ok_or(StoreError::CorruptEvidence)?,
         cancel,
     }))
+}
+
+/// Reads `turn` when a late vendor terminal may revise it (C1 §7.6):
+/// `unknown`, its envelope naming no vendor stop reason; `None` otherwise.
+fn read_revisable(
+    conn: &Connection,
+    session: &SessionId,
+    turn: TurnNumber,
+) -> Result<Option<RevisableTurn>, StoreError> {
+    let row: Option<(String, String, Option<String>, SessionRoute)> = conn
+        .query_row(
+            &format!(
+                "SELECT t.envelope,t.effective,t.cancel_cause,{ROUTE_COLUMNS}
+                 FROM turns t JOIN sessions s ON s.id=t.session_id
+                 WHERE t.session_id=?1 AND t.number=?2 AND t.state='unknown'
+                   AND t.correlation IS NOT NULL
+                   AND json_extract(t.envelope,'$.vendor_stop_reason') IS NULL"
+            ),
+            params![session.as_str(), turn.get()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, route_at(row, 3)?)),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    row.map(|(envelope, effective, cause, route)| {
+        let parse = |text: &str| {
+            serde_json::from_str::<Value>(text).map_err(|_| StoreError::CorruptEvidence)
+        };
+        Ok(RevisableTurn {
+            envelope: parse(&envelope)?,
+            effective: parse(&effective)?,
+            route,
+            cancel_cause: cause
+                .map(|cause| CancelCause::of(&cause).ok_or(StoreError::CorruptEvidence))
+                .transpose()?,
+        })
+    })
+    .transpose()
 }
 
 fn read_unfinished(conn: &Connection) -> Result<Vec<UnfinishedTurn>, StoreError> {
@@ -2357,29 +2467,49 @@ fn read_list_page(conn: &Connection, query: &ListQuery) -> Result<ListPage, Stor
 
 /// Design §4.4, §6.7: the addressed turn, or the session's running turn,
 /// else its latest submitted turn, else its latest turn; with the turn's
-/// `evidence_dir` and the session's vendor identity and transcript hint.
+/// `evidence_dir`, the structured-output file its committed envelope
+/// names, and the session's vendor identity and transcript hint.
 /// One small row: no file is read.
 fn read_evidence_refs(
     conn: &Connection,
     session: &SessionId,
     turn: Option<TurnNumber>,
 ) -> Result<Option<EvidenceRefs>, StoreError> {
-    /// Vendor session ID, transcript hint, turn number and its folder.
-    type Row = (Option<String>, Option<String>, Option<u32>, Option<String>);
+    /// Vendor session ID, transcript hint, turn number, its folder and
+    /// its envelope's structured-output file.
+    type Row = (
+        Option<String>,
+        Option<String>,
+        Option<u32>,
+        Option<String>,
+        Option<String>,
+    );
     let row: Option<Row> = conn
         .query_row(
-            "SELECT s.vendor_session_id,s.transcript_hint,t.number,t.evidence_dir
+            "SELECT s.vendor_session_id,s.transcript_hint,t.number,t.evidence_dir,
+                iif(json_type(t.envelope,'$.structured_output_file.path')='text',
+                    json_extract(t.envelope,'$.structured_output_file.path'),NULL)
              FROM sessions s LEFT JOIN turns t ON t.session_id=s.id AND t.number=coalesce(?2,
                 (SELECT number FROM turns WHERE session_id=s.id AND state='running'),
                 (SELECT max(number) FROM turns WHERE session_id=s.id AND submitted_at IS NOT NULL),
                 (SELECT max(number) FROM turns WHERE session_id=s.id))
              WHERE s.id=?1",
             params![session.as_str(), turn.map(TurnNumber::get)],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .optional()
         .map_err(sql_error)?;
-    let Some((vendor_session_id, transcript_hint, number, evidence_dir)) = row else {
+    let Some((vendor_session_id, transcript_hint, number, evidence_dir, structured_output_file)) =
+        row
+    else {
         return Ok(None);
     };
     Ok(Some(EvidenceRefs {
@@ -2390,6 +2520,7 @@ fn read_evidence_refs(
         evidence_dir,
         vendor_session_id,
         transcript_hint,
+        structured_output_file,
     }))
 }
 
@@ -2541,16 +2672,21 @@ fn read_status_queue(conn: &Connection, session: &str) -> Result<Vec<QueuedSumma
 }
 
 /// The session's newest [`STATUS_TURNS`] turns and their states (§11.3).
-fn read_status_turns(conn: &Connection, session: &str) -> Result<Vec<(u32, String)>, StoreError> {
+fn read_status_turns(conn: &Connection, session: &str) -> Result<Vec<StatusTurn>, StoreError> {
     conn.prepare_cached(
-        "SELECT number,state FROM turns WHERE session_id=?1 ORDER BY number DESC LIMIT ?2",
+        "SELECT number,state,coalesce(json_extract(envelope,'$.revision'),0) FROM turns
+         WHERE session_id=?1 ORDER BY number DESC LIMIT ?2",
     )
     .and_then(|mut statement| {
         statement
             .query_map(params![session, STATUS_TURNS], |row| {
-                Ok((row.get(0)?, row.get(1)?))
+                Ok(StatusTurn {
+                    number: row.get(0)?,
+                    state: row.get(1)?,
+                    revision: row.get(2)?,
+                })
             })?
-            .collect::<Result<Vec<(u32, String)>, _>>()
+            .collect::<Result<Vec<StatusTurn>, _>>()
     })
     .map_err(sql_error)
 }

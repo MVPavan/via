@@ -179,9 +179,10 @@ Params: `harness?`, `model?` (one required), `bound?`, `require?`,
 ```
 
 Never starts a process or server (Q5). `vendor_version` is the last version
-seen for the resolved binary identity, or `null`; `version_status` is
-`tested` (in the adapter's `checked` set), `untested` (not yet checked by the
-maintainers, warning `vendor_version_untested`) or `refused` (a cached
+seen for the harness and resolved program path, or `null`;
+`version_status` is `tested` (in the adapter's `checked` set), `untested`
+(not yet checked by the maintainers, warning `vendor_version_untested`) or
+`refused` (a cached
 handshake-check failure on something VIA relies on). Every vendor version is
 supported by default (P13, C2 §5). Errors: `unknown_model`,
 `harness_unavailable`, `invalid_params`.
@@ -469,8 +470,9 @@ is the turn's evidence folder in VIA's state directory, or `null` for a
 turn never submitted. `files` lists the files there that exist:
 `stderr.log` (the agent's stderr), `undecoded.bin` (the first 64 KiB of a
 vendor message VIA could not decode, named by the turn's failure) and
-`final_text.txt` and `structured_output.json` (a final text or structured
-output too long for the envelope, §5). VIA does
+`final_text.txt` and the structured-output file the envelope names
+(`structured_output.json`, or a revision's own file; a final text or
+structured output too long for the envelope, §5). VIA does
 not read or decode them; the caller reads the files. There is no paging.
 
 ### 3.13 `models`; 3.14 `daemon/status`, `daemon/stop`
@@ -590,7 +592,12 @@ qualification claim.
 ## 5. Result envelope
 
 Immutable once terminal, except `unknown` revised by late evidence (§7.6);
-`revision` counts revisions and `turn.revised` announces them.
+`revision` counts revisions and `turn.revised` announces them. A revision
+replaces the envelope: state, failure, stop reason, steps, cost,
+structured output (validated as in Q2) and vendor data come from the late
+terminal; a usage aggregate in the late terminal supersedes the stored usage
+and its warnings, and without one the stored usage stands; `events` extends to the `turn.revised` event; the stored
+`final_text` is kept, since a late terminal carries no text.
 The encoded envelope is at most 1 MiB by construction, and no turn fails
 for the size of its result. `final_text` is inline up to 256 KiB encoded.
 A longer final text is written to `final_text.txt` in the turn's evidence
@@ -605,7 +612,11 @@ and both syncs succeed; otherwise the envelope names no file.
 written to `structured_output.json` in the same folder: `structured_output`
 is then `null` and `structured_output_file` gives `{path, bytes}`. VIA writes the whole file and syncs it and its folder
 before committing the envelope or revision that names it, and never changes
-a written file. The write is part of the commit that names the file: if it
+a written file. A revision's spill uses a file name of its own
+(`structured_output.r<revision>-<nonce>.json`), so a file that an attempt
+wrote but no committed envelope names is never a result, is never deleted
+and never blocks a later revision. A revision's file is kept even when
+its write or sync fails. The write is part of the commit that names the file: if it
 fails, that commit fails and resolves under §7.6's Store rule, and a partial
 file is never named. Validation (Q2) runs on every present value before it
 is stored, whatever the turn's state, including a late revision (§7.6); a
@@ -671,7 +682,7 @@ below 1 MiB, and a conformance test assembles that maximum.
 | `steps` | the vendor's own count of model steps in the turn (Claude `num_turns`), or `null` when the vendor reports none; VIA's count is only in `status` `progress` (§3.7) |
 | `events` | `{first_seq, last_seq, count}` of the turn's durable events (§6.1) |
 | `final_text_file` | `{path, bytes, truncated}` when the final text is in `final_text.txt`, else `null` |
-| `structured_output_file` | `{path, bytes}` when the structured output is in `structured_output.json`, else `null` |
+| `structured_output_file` | `{path, bytes}` when the structured output is in a file (`structured_output.json`, or a revision's own file, §5), else `null` |
 | `denied_actions_total`, `auto_declined_requests_total` | entries of each list, including those past the first 1,000 |
 | `cost` | `usd`; `scope` as above; `provenance` `reported`, `estimated`, `unavailable`. Scopes are per field: Claude P5 showed per-result tokens with rising cumulative `total_cost_usd` |
 | `exit` | `{code, signal}` for per-session processes that ended in this turn; `null` for server routes |
@@ -698,7 +709,7 @@ envelope except through §7.6.
 | `session.opened` / `session.closed` / `session.reopened` | `route`, confirmed `vendor_session_id`, `vendor_version` / `reason`, `leftovers` (§5; non-null only when the close stopped the server) / `route`, confirmed `vendor_session_id`, `vendor_version`, `reason` | Core |
 | `turn.queued` / `turn.submitted` / `turn.started` | `queue_position` / `attempt` / `effective` | Core |
 | `turn.ended` | `state`, `failure?`, `stop_reason`, `cancel?` | **Core only** |
-| `turn.revised` | `revision`, `from_state`, `state`, `evidence` | Core |
+| `turn.revised` | `revision`, `from_state`, `state`, `evidence` (`late_terminal`); always `late: true` | Core |
 | `action.denied`, `vendor.request_declined` | as envelope lists; `blocking` on declines | Adapter |
 | `steer.delivered` | `delivery` | Adapter |
 | `cancel.requested` / `cancel.settled` | — / `outcome`, `cleanup` | Core |
@@ -836,7 +847,7 @@ that does not prove its submitted work had no effect.
 | Observation or message overflow failed the connection | running | `failed(overflow)` |
 | Submission rejected definitively | submitting | `failed(submit_failed)` |
 | Daemon restart | any | §7.5 |
-| Late vendor terminal for an `unknown` turn | unknown | revise to that state, `revision + 1`, `turn.revised`; a caller that already read the result must read it again |
+| Late vendor terminal for an `unknown` turn | unknown | revise to that state, `revision + 1`, `turn.revised`; a caller that already read the result must read it again. The terminal is attributed through the vendor turn ID recorded at acceptance, never by position, so a turn never accepted is not revised. Only a caller `cancel` or `close` that stopped the turn makes an `interrupted` terminal `cancelled`; otherwise (a Core deadline, a Store or protocol stop) it is classified as a vendor terminal (§8.2). A stored cancel outcome `unknown` or `requested` becomes `acknowledged` for an `interrupted` terminal; for any other terminal `unknown` becomes `requested`; `acknowledged` and `forced` stand |
 
 Rows 1–2 cover caller-originated cancels (`cancel`, `close`). A Core-deadline
 stop resolves `failed(deadline_*)` after rows 3–4. A `Deadline` coincident
@@ -844,7 +855,8 @@ with an order's `force_at` takes the order's cause. Only the resolution
 cases in [Task 3 design](../workstreams/rust-foundation/t3/design.md) §7.2 (runtime §7) end `failed(store)`; a failed write of
 a spilled `structured_output.json` (§5) is a failure of the commit that names
 it and resolves the same way. A revision known not to have committed, after
-the applicable retry, is not made and the turn stays `unknown`; an uncertain
+the applicable retry, is not made and the turn stays `unknown` (a Store
+failure scoped to the turn, which does not latch); an uncertain
 revision commit latches and is reconciled under runtime §7, never assumed
 absent. A natural
 terminal whose one retry commits keeps its result, and a dispatcher-owned

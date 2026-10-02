@@ -359,7 +359,7 @@ async fn dispatch(method: &str, params: &str, client: &Client) -> Result<Box<Raw
                 "sessions":{"idle":counts.idle,"active":counts.active,"closing":counts.closing},
                 "connections":{"limit":connections.limit,"in_use":connections.in_use,
                     "held_unproven":connections.held_unproven},
-                "servers":[],
+                "servers":engine.servers(),
                 // Task 4 design §5.3, §5.5 (A37).
                 "limits":engine.limits().to_value(),
                 "storage":engine.storage().await}),

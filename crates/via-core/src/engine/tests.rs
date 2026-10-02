@@ -3101,6 +3101,630 @@ fn a_late_denial_is_committed_late_and_kept_out_of_the_running_turn() {
     });
 }
 
+/// A late vendor terminal (C2 §4 `turn.late_terminal`) of `status`, whose
+/// vendor stop reason is `reason`.
+fn late_terminal(
+    status: via_adapters::VendorTerminalStatus,
+    reason: &str,
+) -> via_adapters::VendorTerminal {
+    via_adapters::VendorTerminal {
+        at: tokio::time::Instant::now(),
+        status,
+        stop_reason: if status == via_adapters::VendorTerminalStatus::Interrupted {
+            via_adapters::StopReason::Interrupted
+        } else {
+            via_adapters::StopReason::EndTurn
+        },
+        vendor_stop_reason: reason.to_owned(),
+        vendor_code: None,
+        class_hint: None,
+        detail: None,
+        structured_output: None,
+        steps: None,
+        usage: None,
+        cost: None,
+        vendor: None,
+    }
+}
+
+/// Ends `session`'s running turn `n` `unknown` with no retained terminal,
+/// as a stop or a lost transport leaves it: accepted as `fake-turn-<n>`,
+/// its envelope's `cancel` being `cancel` and its `cancel_cause` `cause`,
+/// with `extra`'s members over the stored envelope's. The slot's head is
+/// read again first, as other writers of the test committed directly.
+async fn end_unknown(
+    engine: &Engine,
+    (session, n): (&SessionId, u32),
+    (cancel, cause): (Value, Option<via_store::CancelCause>),
+    extra: Value,
+) {
+    let slot = engine.slot(session).unwrap();
+    slot.head.lock(&engine.store, session).await.unwrap().lost();
+    let head = slot.head.lock(&engine.store, session).await.unwrap();
+    let at = rfc3339(std::time::SystemTime::now());
+    let event = |seq, body| {
+        Event {
+            seq,
+            session_id: session,
+            turn: Some(n),
+            late: false,
+            at: &at,
+            body,
+        }
+        .to_value()
+        .unwrap()
+    };
+    let seq = head.next();
+    engine
+        .store
+        .commit_acceptance(via_store::AcceptanceRecord {
+            session_id: session.clone(),
+            turn: turn(n),
+            correlation: format!("v:fake-turn-{n}"),
+            event: event(
+                seq,
+                EventBody::TurnStarted {
+                    effective: json!({}),
+                },
+            ),
+            adapter_version: None,
+            instance: None,
+        })
+        .await
+        .unwrap();
+    let mut envelope = json!({
+        "api_version":1,"session_id":session,"turn":n,
+        "address":format!("{session}/{n}"),"revision":0,"state":"unknown",
+        "failure":null,"stop_reason":"error","vendor_stop_reason":null,"cancel":cancel,
+        "final_text":"","final_text_file":null,
+        "structured_output":null,"structured_output_file":null,"steps":null,
+        "usage":{"input_tokens":null,"cached_input_tokens":null,"output_tokens":null,
+                 "reasoning_output_tokens":null,"total_tokens":null,"scope":"turn",
+                 "provenance":"unavailable"},
+        "cost":{"usd":null,"scope":"turn","provenance":"unavailable"},
+        "events":{"first_seq":1,"last_seq":seq + 1,"count":seq + 1},
+        "warnings":[],"vendor":{"turn_id":format!("fake-turn-{n}")}
+    });
+    for (member, value) in extra.as_object().unwrap() {
+        envelope[member] = value.clone();
+    }
+    engine
+        .store
+        .commit_terminal_with(
+            TerminalRecord {
+                session_id: session.clone(),
+                turn: turn(n),
+                envelope,
+                event: event(
+                    seq + 1,
+                    EventBody::TurnEnded {
+                        state: "unknown",
+                        failure: None,
+                        stop_reason: "error",
+                        cancel: None,
+                    },
+                ),
+                steps: Vec::new(),
+            },
+            via_store::TerminalExtras {
+                cancel_cause: cause,
+            },
+        )
+        .await
+        .unwrap();
+    head.committed(2);
+}
+
+/// A new session whose turn 1 ended `unknown` ([`end_unknown`]).
+async fn unknown_session(
+    engine: &Engine,
+    stop: (Value, Option<via_store::CancelCause>),
+    extra: Value,
+) -> SessionId {
+    let session = new_session(engine).await;
+    end_turn_one(engine, &session, None).await;
+    end_unknown(engine, (&session, 1), stop, extra).await;
+    session
+}
+
+/// The stored envelope of `session`'s turn `n`.
+async fn stored_envelope(engine: &Engine, session: &SessionId, n: u32) -> Value {
+    let envelope = engine.result(&format!("{session}/{n}")).await.unwrap();
+    serde_json::from_str(envelope.get()).unwrap()
+}
+
+/// The session's `turn.revised` events.
+async fn revised_events(engine: &Engine, session: &SessionId) -> Vec<Value> {
+    events_page(engine, session).await["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["type"] == "turn.revised")
+        .cloned()
+        .collect()
+}
+
+/// A stored `cancel` object with `outcome`.
+fn stored_cancel(outcome: &str) -> Value {
+    json!({"outcome":outcome,"cleanup":"uncertain",
+           "requested_at":"2026-01-01T00:00:00.000Z","settled_at":"2026-01-01T00:00:01.000Z"})
+}
+
+/// via-jm4.35, fix round 1 #2 (C1 §7.6, C2 §4 `turn.late_terminal`): the
+/// running turn's own late terminal, met in its final drain, is kept only
+/// when it names the vendor turn its acceptance mapped; one naming none is
+/// never the running turn's to revise by. The kept one revises the turn
+/// once its `unknown` terminal committed. One of an earlier turn that did
+/// not end `unknown` (turn 1 here ended `failed`) commits nothing.
+#[test]
+fn the_running_turns_late_terminal_revises_it_after_its_terminal() {
+    let Some(root) = child("the_running_turns_late_terminal_revises_it_after_its_terminal") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let (session, slot, lane, mut record, effective, orders) =
+            running_turn_2(&engine, &root).await;
+        let before = event_types(&engine, &session).await;
+        let completed = via_adapters::VendorTerminalStatus::Completed;
+        let item = |vendor_turn: Option<&str>, reason: &str| via_adapters::ObservationItem {
+            at: tokio::time::Instant::now(),
+            vendor_turn: vendor_turn
+                .map(|id| via_adapters::VendorTurnId::try_from(id.to_owned()).unwrap()),
+            observation: via_adapters::Observation::LateTerminal(late_terminal(completed, reason)),
+        };
+        let queued = vec![
+            item(None, "anonymous"),
+            item(Some("fake-turn-1"), "earlier"),
+            item(Some("fake-turn-2"), "own"),
+            item(Some("fake-turn-2"), "second"),
+        ];
+        let kept = engine
+            .drain_queued(
+                (&slot, Some(&*lane)),
+                &mut record,
+                &effective,
+                orders,
+                queued,
+            )
+            .await;
+        assert_eq!(
+            kept.as_ref()
+                .map(|terminal| terminal.vendor_stop_reason.as_str()),
+            Some("own"),
+            "the first of the running turn's own that names its vendor turn"
+        );
+        assert_eq!(event_types(&engine, &session).await, before);
+        assert!(record.first_failure.is_none());
+        end_unknown(&engine, (&session, 2), (Value::Null, None), json!({})).await;
+        engine.revise_kept(&session, turn(2), kept).await;
+        let revised = revised_events(&engine, &session).await;
+        assert_eq!(revised.len(), 1, "{revised:?}");
+        assert_eq!(
+            (&revised[0]["turn"], &revised[0]["state"]),
+            (&json!(2), &json!("completed"))
+        );
+        let envelope = stored_envelope(&engine, &session, 2).await;
+        assert_eq!(
+            (&envelope["revision"], &envelope["vendor_stop_reason"]),
+            (&json!(1), &json!("own"))
+        );
+        assert!(!engine.store_failed());
+    });
+}
+
+/// Fix round 1 #4, #5 (C1 §7.6 late row): a late `interrupted` terminal
+/// makes the turn `cancelled` only when a caller `cancel` or `close`
+/// stopped it (its recorded cause); a stored cancel without one, as a Core
+/// deadline leaves, is a vendor terminal's failure. The stored outcome:
+/// `requested` or `unknown` becomes `acknowledged` for an interrupted
+/// terminal, `unknown` becomes `requested` for any other, and
+/// `acknowledged` and `forced` stand. The cause is kept.
+#[test]
+fn a_late_terminal_settles_the_stored_cancel_by_its_origin() {
+    let Some(root) = child("a_late_terminal_settles_the_stored_cancel_by_its_origin") else {
+        return;
+    };
+    run(async {
+        use via_adapters::VendorTerminalStatus::{Completed, Interrupted};
+        use via_store::CancelCause::{Cancel, Close};
+        let engine = open(&root);
+        let rows = [
+            (
+                Some(Cancel),
+                "requested",
+                Interrupted,
+                "cancelled",
+                "acknowledged",
+            ),
+            (
+                Some(Close),
+                "unknown",
+                Interrupted,
+                "cancelled",
+                "acknowledged",
+            ),
+            (Some(Cancel), "forced", Interrupted, "cancelled", "forced"),
+            (Some(Cancel), "unknown", Completed, "completed", "requested"),
+            (
+                Some(Cancel),
+                "requested",
+                Completed,
+                "completed",
+                "requested",
+            ),
+            (
+                Some(Cancel),
+                "acknowledged",
+                Completed,
+                "completed",
+                "acknowledged",
+            ),
+            (None, "requested", Interrupted, "failed", "acknowledged"),
+        ];
+        for (cause, stored, status, state, outcome) in rows {
+            let session = unknown_session(&engine, (stored_cancel(stored), cause), json!({})).await;
+            engine
+                .revise(&session, turn(1), &late_terminal(status, "late"))
+                .await;
+            let envelope = stored_envelope(&engine, &session, 1).await;
+            assert_eq!(
+                (&envelope["state"], &envelope["cancel"]["outcome"]),
+                (&json!(state), &json!(outcome)),
+                "{cause:?} {stored} {status:?}: {envelope}"
+            );
+            assert_eq!(envelope["revision"], 1, "{envelope}");
+            if state == "failed" {
+                assert_eq!(envelope["failure"]["class"], "vendor_error", "{envelope}");
+            }
+            let db = rusqlite::Connection::open(root.join("state").join("store.sqlite3")).unwrap();
+            let kept: Option<String> = db
+                .query_row(
+                    "SELECT cancel_cause FROM turns WHERE session_id=?1 AND number=1",
+                    [session.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                kept.as_deref(),
+                cause.map(|cause| if cause == Cancel { "cancel" } else { "close" })
+            );
+        }
+        assert!(!engine.store_failed());
+    });
+}
+
+/// Fix round 1 #6 (C1 Q2, design §7.3): a revision's frozen inputs decode
+/// strictly. A stored effective value that does not decode (a numeric
+/// model) is a corrupt row: the revision is declined and reported
+/// `corrupt_row`, never validated against absent inputs.
+#[test]
+fn a_corrupt_frozen_row_declines_the_revision() {
+    let Some(root) = child("a_corrupt_frozen_row_declines_the_revision") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = unknown_session(&engine, (Value::Null, None), json!({})).await;
+        let db = rusqlite::Connection::open(root.join("state").join("store.sqlite3")).unwrap();
+        db.busy_timeout(Duration::from_secs(10)).unwrap();
+        let changed = db
+            .execute(
+                "UPDATE turns SET effective=json_set(effective,'$.model',42) WHERE session_id=?1 AND number=1",
+                [session.as_str()],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        let completed = via_adapters::VendorTerminalStatus::Completed;
+        engine
+            .revise(&session, turn(1), &late_terminal(completed, "late"))
+            .await;
+        assert!(revised_events(&engine, &session).await.is_empty());
+        let envelope = stored_envelope(&engine, &session, 1).await;
+        assert_eq!(
+            (&envelope["state"], &envelope["revision"]),
+            (&json!("unknown"), &json!(0))
+        );
+        let failure = engine.store_failure_status().unwrap();
+        assert_eq!(
+            (&failure["kind"], &failure["scope"]),
+            (&json!("corrupt_row"), &json!("turn")),
+            "{failure}"
+        );
+        assert!(!engine.store_failed());
+    });
+}
+
+/// Fix round 1 #10 (C1 §5 as amended): a late usage aggregate supersedes
+/// the stored usage and its warnings: an interval the ledger could not
+/// verify is no longer warned.
+#[test]
+fn a_late_usage_aggregate_supersedes_the_interval_warning() {
+    let Some(root) = child("a_late_usage_aggregate_supersedes_the_interval_warning") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let interval = json!({"input_tokens":null,"cached_input_tokens":null,
+            "output_tokens":null,"reasoning_output_tokens":null,"total_tokens":9,
+            "scope":"vendor_interval","provenance":"reported"});
+        let warning = json!({"code":"usage_interval_unverified",
+            "message":"the reported usage covers an interval VIA could not verify"});
+        let extra = json!({"usage":interval,"warnings":[warning]});
+        let session = unknown_session(&engine, (Value::Null, None), extra).await;
+        let mut late = late_terminal(via_adapters::VendorTerminalStatus::Completed, "late");
+        late.usage = Some(via_adapters::UsageSample {
+            key: None,
+            input: Some(3),
+            cached_input: None,
+            output: Some(4),
+            reasoning_output: None,
+            total: Some(7),
+        });
+        engine.revise(&session, turn(1), &late).await;
+        let envelope = stored_envelope(&engine, &session, 1).await;
+        assert_eq!(envelope["revision"], 1, "{envelope}");
+        assert_eq!(
+            (
+                &envelope["usage"]["total_tokens"],
+                &envelope["usage"]["scope"]
+            ),
+            (&json!(7), &json!("turn")),
+            "{envelope}"
+        );
+        assert_eq!(envelope["warnings"], json!([]), "{envelope}");
+    });
+}
+
+/// Creates turn `n`'s evidence folder, as its launch would have.
+fn evidence_folder(root: &Path, session: &SessionId, n: u32) {
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(
+            root.join("state")
+                .join("evidence")
+                .join(session.as_str())
+                .join(n.to_string()),
+        )
+        .unwrap();
+}
+
+/// A late terminal with a structured output of `bytes` encoded, over the
+/// inline limit.
+fn spilling_terminal(bytes: usize) -> via_adapters::VendorTerminal {
+    let mut late = late_terminal(via_adapters::VendorTerminalStatus::Completed, "late");
+    let value = json!({"a":"x".repeat(bytes - 8)});
+    late.structured_output =
+        Some(serde_json::value::RawValue::from_string(value.to_string()).unwrap());
+    late
+}
+
+/// The files of turn 1's evidence folder of `session` whose names start
+/// with `structured_output`, sorted.
+fn spills(root: &Path, session: &SessionId) -> Vec<String> {
+    let folder = root
+        .join("state")
+        .join("evidence")
+        .join(session.as_str())
+        .join("1");
+    let mut names: Vec<String> = fs::read_dir(folder)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("structured_output"))
+        .collect();
+    names.sort();
+    names
+}
+
+/// Whether `name` is a revision spill's name for `revision`
+/// (`structured_output.r<revision>-<8 hex>.json`, C1 §5 as amended).
+fn revision_spill(name: &str, revision: u32) -> bool {
+    name.strip_prefix(&format!("structured_output.r{revision}-"))
+        .and_then(|rest| rest.strip_suffix(".json"))
+        .is_some_and(|nonce| nonce.len() == 8 && nonce.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+/// Fix round 1 #7, rounds 2 and 3 #2/#1 (C1 §5 as amended): the spill of
+/// a revision known not to have committed after its retry is named by no
+/// envelope, and is left in place: a later eligible revision spills under
+/// a name of its own and commits. Nothing is deleted.
+#[test]
+fn a_revision_not_made_blocks_no_later_spill() {
+    let Some(root) = child("a_revision_not_made_blocks_no_later_spill") else {
+        return;
+    };
+    let dir = root.join("failpoints");
+    fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    let command = dir.join("store.commit.revision.json");
+    fs::write(
+        &command,
+        json!({"token":FAILPOINT_TOKEN,"occurrence":1,"action":"fail_io","persist":true})
+            .to_string(),
+    )
+    .unwrap();
+    via_store::failpoint::activate(&dir, FAILPOINT_TOKEN).unwrap();
+    run(async {
+        let engine = open(&root);
+        let session = unknown_session(&engine, (Value::Null, None), json!({})).await;
+        evidence_folder(&root, &session, 1);
+        let late = spilling_terminal(40_000);
+        engine.revise(&session, turn(1), &late).await;
+        assert!(dir.join("store.commit.revision.2.ack").exists(), "retried");
+        assert!(revised_events(&engine, &session).await.is_empty());
+        assert!(!engine.store_failed());
+        let orphans = spills(&root, &session);
+        assert_eq!(orphans.len(), 1, "{orphans:?}");
+        assert!(revision_spill(&orphans[0], 1), "{orphans:?}");
+        fs::remove_file(&command).unwrap();
+        engine.revise(&session, turn(1), &late).await;
+        let envelope = stored_envelope(&engine, &session, 1).await;
+        assert_eq!(envelope["revision"], 1, "{envelope}");
+        let file = &envelope["structured_output_file"];
+        assert_eq!(file["bytes"], 40_000, "{envelope}");
+        let named = Path::new(file["path"].as_str().unwrap());
+        let name = named.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(revision_spill(&name, 1) && name != orphans[0], "{name}");
+        assert_eq!(fs::metadata(named).unwrap().len(), 40_000);
+        let after = spills(&root, &session);
+        assert_eq!(after.len(), 2, "{after:?}");
+        assert!(after.contains(&orphans[0]), "the orphan stays: {after:?}");
+    });
+}
+
+/// Fix round 4 #2 (C1 §3.12 as amended): `logs` lists the structured-output
+/// file the committed envelope names, a revision's own file included, and
+/// no file no envelope names.
+#[test]
+fn logs_lists_the_revisions_own_file() {
+    let Some(root) = child("logs_lists_the_revisions_own_file") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = unknown_session(&engine, (Value::Null, None), json!({})).await;
+        evidence_folder(&root, &session, 1);
+        let folder = root
+            .join("state")
+            .join("evidence")
+            .join(session.as_str())
+            .join("1");
+        let orphan = "structured_output.r1-0badf00d.json";
+        fs::write(folder.join(orphan), b"{\"orphan\":true}").unwrap();
+        engine
+            .revise(&session, turn(1), &spilling_terminal(40_000))
+            .await;
+        let envelope = stored_envelope(&engine, &session, 1).await;
+        let named = Path::new(envelope["structured_output_file"]["path"].as_str().unwrap());
+        let name = named.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(revision_spill(&name, 1) && name != orphan, "{name}");
+        let params = serde_json::from_value(json!({"turn": format!("{session}/1")})).unwrap();
+        let logs = engine.logs(params).await.unwrap();
+        assert_eq!(
+            logs["folder"].as_str().map(Path::new),
+            Some(folder.as_path()),
+            "{logs}"
+        );
+        assert_eq!(
+            logs["files"],
+            json!([{"name": name, "bytes": 40_000}]),
+            "{logs}"
+        );
+    });
+}
+
+/// Sol r5 #1 (C1 §3.12 as amended): a fixed-name `structured_output.json`
+/// no committed envelope names, beside the revision's own file, is not
+/// listed: `logs` states only the file the envelope names.
+#[test]
+fn logs_lists_no_unnamed_fixed_spill() {
+    let Some(root) = child("logs_lists_no_unnamed_fixed_spill") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = unknown_session(&engine, (Value::Null, None), json!({})).await;
+        evidence_folder(&root, &session, 1);
+        let folder = root
+            .join("state")
+            .join("evidence")
+            .join(session.as_str())
+            .join("1");
+        fs::write(folder.join("structured_output.json"), b"{\"orphan\":true}").unwrap();
+        engine
+            .revise(&session, turn(1), &spilling_terminal(40_000))
+            .await;
+        let envelope = stored_envelope(&engine, &session, 1).await;
+        let named = Path::new(envelope["structured_output_file"]["path"].as_str().unwrap());
+        let name = named.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(revision_spill(&name, 1), "{name}");
+        let params = serde_json::from_value(json!({"turn": format!("{session}/1")})).unwrap();
+        let logs = engine.logs(params).await.unwrap();
+        assert_eq!(
+            logs["files"],
+            json!([{"name": name, "bytes": 40_000}]),
+            "{logs}"
+        );
+    });
+}
+
+/// Fix round 2 #2, round 3 #1 (C1 §5 as amended): files that no committed
+/// envelope names, as a crash between a revision's spill and its commit
+/// leaves, are not results and are never deleted: after a restart, the
+/// next eligible revision commits its own file beside them.
+#[test]
+fn an_orphan_spill_blocks_no_revision_after_a_restart() {
+    let Some(root) = child("an_orphan_spill_blocks_no_revision_after_a_restart") else {
+        return;
+    };
+    let session = run(async {
+        let engine = open(&root);
+        let session = unknown_session(&engine, (Value::Null, None), json!({})).await;
+        evidence_folder(&root, &session, 1);
+        shutdown(&engine).await;
+        session
+    });
+    let folder = root
+        .join("state")
+        .join("evidence")
+        .join(session.as_str())
+        .join("1");
+    let orphans = [
+        "structured_output.json",
+        "structured_output.r1-0badf00d.json",
+    ];
+    for orphan in orphans {
+        fs::write(folder.join(orphan), b"{\"orphan\":true}").unwrap();
+    }
+    run(async {
+        let engine = open(&root);
+        engine
+            .revise(&session, turn(1), &spilling_terminal(40_000))
+            .await;
+        let envelope = stored_envelope(&engine, &session, 1).await;
+        assert_eq!(envelope["revision"], 1, "{envelope}");
+        let file = &envelope["structured_output_file"];
+        assert_eq!(file["bytes"], 40_000, "{envelope}");
+        let named = Path::new(file["path"].as_str().unwrap());
+        let name = named.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(revision_spill(&name, 1), "{name}");
+        assert!(!orphans.contains(&name.as_str()), "{name}");
+        assert_eq!(fs::metadata(named).unwrap().len(), 40_000);
+        for orphan in orphans {
+            assert_eq!(fs::read(folder.join(orphan)).unwrap(), b"{\"orphan\":true}");
+        }
+        assert!(!engine.store_failed());
+    });
+}
+
+/// Fix round 1 #11 (runtime §7): a revision whose spill failed once and
+/// was retried commits, and its first failure is reported, scoped to the
+/// turn, as a retried terminal's is.
+#[test]
+fn a_retried_revision_spill_reports_its_first_failure() {
+    let Some(root) = child("a_retried_revision_spill_reports_its_first_failure") else {
+        return;
+    };
+    let _dir = fail_first(&root, "structured_output.write.fail");
+    run(async {
+        let engine = open(&root);
+        let session = unknown_session(&engine, (Value::Null, None), json!({})).await;
+        evidence_folder(&root, &session, 1);
+        engine
+            .revise(&session, turn(1), &spilling_terminal(40_000))
+            .await;
+        let envelope = stored_envelope(&engine, &session, 1).await;
+        assert_eq!(envelope["revision"], 1, "{envelope}");
+        let failure = engine.store_failure_status().unwrap();
+        assert_eq!(
+            (&failure["kind"], &failure["scope"], &failure["count"]),
+            (&json!("commit_failed"), &json!("turn"), &json!(1)),
+            "{failure}"
+        );
+        assert!(!engine.store_failed());
+    });
+}
+
 /// Sol r1 F12 (C2 §2, H3): a session's lane opens its driver from the
 /// session's stored route identity: its harness, its receipt's route and
 /// its recorded adapter version, never a constant.
@@ -6279,6 +6903,247 @@ fn timely_progress_read_after_the_idle_deadline_keeps_the_turn() {
     });
 }
 
+/// Bead via-mnx (runtime §8, C2 §4): the turn's progress moves its idle
+/// deadline by the progress's own decode time, even when the session
+/// channel admits an item another producer stamped later ahead of it (a
+/// retirement's, beside a pinned next turn); the channel never rewrites
+/// `at`. The progress decoded at 0.0
+/// is read after an item stamped at 0.8, both before the deadline at 1.0;
+/// the deadline moves to 1.0 + ε, not to 1.8, so the turn expires by 1.5.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn progress_admitted_behind_a_later_stamp_keeps_its_decode_time() {
+    let Some(root) = child("progress_admitted_behind_a_later_stamp_keeps_its_decode_time") else {
+        return;
+    };
+    let intent = "store.journal.anchor_intent";
+    let points = count_points(&root, &[intent]);
+    run(async {
+        use via_adapters::{Observation, ObservationItem, ProgressMarks};
+        let engine = open(&root);
+        let (_session, slot, claim, mut record, effective, orders) =
+            running_turn_2(&engine, &root).await;
+        let probe = orders.clone();
+        // The turn's launch is held, so its driver has not returned.
+        let held_launch = arm_next_with(&points, intent, &json!({"action":"pause"}));
+        let (sink, receiver) =
+            via_adapters::observation_channel_in(&via_adapters::ObservationBudget::new());
+        let mut inbox = super::lane::Inbox::of(receiver);
+        let (spec, cx) = turn_2_cx();
+        let idle = Duration::from_millis(1_000);
+        let stall = Duration::from_secs(10);
+        let start = tokio::time::Instant::now();
+        let at = |tenths: u32| start + idle * tenths / 10;
+        let (expired, ()) = tokio::join!(
+            async {
+                until(|| acked(&points, intent, held_launch)).await;
+                // The turn's own progress, decoded now; its sender is slow.
+                let progress = ObservationItem {
+                    at: tokio::time::Instant::now(),
+                    vendor_turn: None,
+                    observation: Observation::Progress(ProgressMarks {
+                        model: true,
+                        ..ProgressMarks::default()
+                    }),
+                };
+                tokio::time::sleep_until(at(8)).await;
+                // Another producer's item, stamped at 0.8, is admitted first.
+                let other = ObservationItem {
+                    at: tokio::time::Instant::now(),
+                    vendor_turn: None,
+                    observation: Observation::FinalText("t".to_owned()),
+                };
+                assert!(sink.clone().deliver(other, stall).await);
+                assert!(sink.deliver(progress, stall).await);
+                tokio::time::sleep_until(at(15)).await;
+                let expired = probe.borrow().as_ref().map(|order| order.cause);
+                release_point(&points, intent, held_launch);
+                expired
+            },
+            async {
+                tokio::time::timeout(
+                    Duration::from_secs(20),
+                    engine.execute_turn_idle(
+                        (&slot, &claim),
+                        (&mut record, &effective),
+                        (orders, &mut inbox),
+                        (spec, cx),
+                        Some(idle),
+                    ),
+                )
+                .await
+                .expect("the turn ends");
+            }
+        );
+        assert!(
+            matches!(expired, Some(via_adapters::StopCause::IdleDeadline)),
+            "the idle deadline did not expire by its decode time: {expired:?}"
+        );
+    });
+}
+
+/// Bead via-mnx (C2 §4, runtime §8): concurrent producers' items may be
+/// admitted out of `at` order. The turn's progress decoded at 0.6 moves
+/// the idle deadline to 1.6; progress decoded at 0.2, admitted after it,
+/// leaves it there: the turn is live at 1.4 and expired by 2.0.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn older_progress_admitted_after_newer_leaves_the_idle_deadline() {
+    let Some(root) = child("older_progress_admitted_after_newer_leaves_the_idle_deadline") else {
+        return;
+    };
+    let intent = "store.journal.anchor_intent";
+    let points = count_points(&root, &[intent]);
+    run(async {
+        use via_adapters::{Observation, ObservationItem, ProgressMarks};
+        let engine = open(&root);
+        let (_session, slot, claim, mut record, effective, orders) =
+            running_turn_2(&engine, &root).await;
+        let probe = orders.clone();
+        // The turn's launch is held, so its driver has not returned.
+        let held_launch = arm_next_with(&points, intent, &json!({"action":"pause"}));
+        let (sink, receiver) =
+            via_adapters::observation_channel_in(&via_adapters::ObservationBudget::new());
+        let mut inbox = super::lane::Inbox::of(receiver);
+        let (spec, cx) = turn_2_cx();
+        let idle = Duration::from_millis(1_000);
+        let stall = Duration::from_secs(10);
+        let start = tokio::time::Instant::now();
+        let at = |tenths: u32| start + idle * tenths / 10;
+        let progress = || ObservationItem {
+            at: tokio::time::Instant::now(),
+            vendor_turn: None,
+            observation: Observation::Progress(ProgressMarks {
+                model: true,
+                ..ProgressMarks::default()
+            }),
+        };
+        let ((live, expired), ()) = tokio::join!(
+            async {
+                until(|| acked(&points, intent, held_launch)).await;
+                tokio::time::sleep_until(at(2)).await;
+                let older = progress();
+                tokio::time::sleep_until(at(6)).await;
+                assert!(sink.clone().deliver(progress(), stall).await);
+                assert!(sink.deliver(older, stall).await);
+                tokio::time::sleep_until(at(14)).await;
+                let live = probe.borrow().is_none();
+                tokio::time::sleep_until(at(20)).await;
+                let expired = probe.borrow().as_ref().map(|order| order.cause);
+                release_point(&points, intent, held_launch);
+                (live, expired)
+            },
+            async {
+                tokio::time::timeout(
+                    Duration::from_secs(20),
+                    engine.execute_turn_idle(
+                        (&slot, &claim),
+                        (&mut record, &effective),
+                        (orders, &mut inbox),
+                        (spec, cx),
+                        Some(idle),
+                    ),
+                )
+                .await
+                .expect("the turn ends");
+            }
+        );
+        assert!(live, "the older progress moved the idle deadline back");
+        assert!(
+            matches!(expired, Some(via_adapters::StopCause::IdleDeadline)),
+            "the idle deadline moved past the newer progress's: {expired:?}"
+        );
+    });
+}
+
+/// Bead via-mnx r3 (C2 §4, runtime §8): concurrent producers' items may
+/// be admitted out of `at` order, so an item decoded after the deadline
+/// at the head of the channel does not prove the turn idle. Core is held
+/// across the deadline (1.0) while another producer's item stamped 1.1
+/// is queued ahead of the turn's progress decoded at 0.8; once released,
+/// that progress moves the deadline to 1.8 before any idle order.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn timely_progress_behind_a_late_stamp_keeps_the_turn() {
+    let Some(root) = child("timely_progress_behind_a_late_stamp_keeps_the_turn") else {
+        return;
+    };
+    let (intent, pause) = ("store.journal.anchor_intent", "core.observations.pause");
+    let points = count_points(&root, &[intent, pause]);
+    run(async {
+        use via_adapters::{Observation, ProgressMarks};
+        let engine = open(&root);
+        let (_session, slot, claim, mut record, effective, orders) =
+            running_turn_2(&engine, &root).await;
+        let probe = orders.clone();
+        // The turn's launch is held, so its driver has not returned.
+        let held_launch = arm_next_with(&points, intent, &json!({"action":"pause"}));
+        let held_item = arm_next_with(&points, pause, &json!({"action":"pause"}));
+        let (sender, receiver) = tokio::sync::mpsc::channel(16);
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1_000));
+        let mut inbox = super::lane::Inbox::of(receiver);
+        let (spec, cx) = turn_2_cx();
+        let idle = Duration::from_millis(1_000);
+        let start = tokio::time::Instant::now();
+        let at = |tenths: u32| start + idle * tenths / 10;
+        let admitted = |observation: Observation| via_adapters::Admitted {
+            item: via_adapters::ObservationItem {
+                at: tokio::time::Instant::now(),
+                vendor_turn: None,
+                observation,
+            },
+            permit: std::sync::Arc::clone(&budget)
+                .try_acquire_many_owned(10)
+                .unwrap(),
+        };
+        let (live, ()) = tokio::join!(
+            async {
+                until(|| acked(&points, intent, held_launch)).await;
+                // A final text piece holds Core across the deadline.
+                sender
+                    .send(admitted(Observation::FinalText("a".to_owned())))
+                    .await
+                    .unwrap();
+                until(|| acked(&points, pause, held_item)).await;
+                // The turn's progress, decoded at 0.8; its sender is slow.
+                tokio::time::sleep_until(at(8)).await;
+                let progress = admitted(Observation::Progress(ProgressMarks {
+                    model: true,
+                    ..ProgressMarks::default()
+                }));
+                // Another producer's item, stamped at 1.1, is admitted first.
+                tokio::time::sleep_until(at(11)).await;
+                sender
+                    .send(admitted(Observation::FinalText("r".to_owned())))
+                    .await
+                    .unwrap();
+                sender.send(progress).await.unwrap();
+                tokio::time::sleep_until(at(12)).await;
+                release_point(&points, pause, held_item);
+                tokio::time::sleep_until(at(15)).await;
+                let live = probe.borrow().as_ref().map(|order| order.cause);
+                release_point(&points, intent, held_launch);
+                live
+            },
+            async {
+                tokio::time::timeout(
+                    Duration::from_secs(20),
+                    engine.execute_turn_idle(
+                        (&slot, &claim),
+                        (&mut record, &effective),
+                        (orders, &mut inbox),
+                        (spec, cx),
+                        Some(idle),
+                    ),
+                )
+                .await
+                .expect("the turn ends");
+            }
+        );
+        assert!(live.is_none(), "the idle deadline expired: {live:?}");
+    });
+}
+
 /// Critical r3 #1 (Task 4 design §5, runtime §8): idle expiry is decided
 /// at the item frontier. Reconciliation at the fired deadline is itself
 /// held in an item's handling while more of the turn's progress, decoded
@@ -6930,4 +7795,90 @@ fn plain_effective() -> crate::intake::Effective {
         "deadlines":{"wall_ms":30_000,"idle_ms":600_000},"max_steps":null
     }))
     .unwrap()
+}
+
+/// x.3.2 G8 (C2 §2 `ParamSizes`): Core fills the encoded sizes of the
+/// session's instructions and the turn's schema at intake. Spawn's plan
+/// and `check_turn` carry the instructions' UTF-8 bytes and the schema's
+/// compact JSON bytes; a resume inherits the frozen instructions and the
+/// latest schema, a set schema replaces it, and a null one clears it.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_fills_param_sizes_on_spawn_and_resume() {
+    let Some(root) = child("core_fills_param_sizes_on_spawn_and_resume") else {
+        return;
+    };
+    let profile = json!({"capabilities": {
+        "verbs": {"spawn":{"support":"native"},"resume":{"support":"native"},
+                  "steer":{"support":"native"},"cancel":{"support":"native"},
+                  "close":{"support":"native"}},
+        "params": {"instructions":{"support":"native"},"output_schema":{"support":"native"},
+                   "effort":{"support":"unsupported","reason":"no"},
+                   "max_steps":{"support":"unsupported","reason":"no"}},
+        "bounds": [], "network_control": false,
+        "recover": {"support":"unsupported","reason":"no"},
+        "usage": {"tokens":"turn","cost":"unavailable"}
+    }});
+    fs::write(
+        root.join("scenario.json"),
+        json!({"profile":profile,"scripts":[]}).to_string(),
+    )
+    .unwrap();
+    run(async {
+        let engine = open(&root);
+        let sizes = |instructions, output_schema| via_adapters::ParamSizes {
+            instructions,
+            output_schema,
+        };
+        // "é" is two UTF-8 bytes; the schema's compact encoding is 17.
+        let instructions = "be brief é";
+        let schema = json!({"type": "object"});
+        let raw = json!({"harness":"fake","model":"fake","prompt":"p","handle":HANDLE,
+            "instructions":{"text":instructions},"output_schema":schema});
+        let session = engine
+            .spawn(
+                serde_json::from_value(raw.clone()).unwrap(),
+                &raw.to_string(),
+            )
+            .await
+            .unwrap()
+            .enqueued
+            .unwrap()
+            .0;
+        let spawned = sizes(11, 17);
+        assert_eq!(
+            engine.adapter.param_sizes_seen(),
+            [spawned, spawned],
+            "spawn's plan and check_turn"
+        );
+        let resume = |extra: Value| {
+            let mut raw = json!({"session":session.as_str(),"handle":HANDLE,"prompt":"q"});
+            raw.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            raw
+        };
+        for (extra, expected) in [
+            (json!({}), sizes(11, 17)),
+            (
+                json!({"output_schema":{"type":"object","required":[]}}),
+                sizes(11, 31),
+            ),
+            (json!({"output_schema":null}), sizes(11, 0)),
+        ] {
+            let raw = resume(extra.clone());
+            let before = engine.adapter.param_sizes_seen().len();
+            engine
+                .resume(
+                    serde_json::from_value(raw.clone()).unwrap(),
+                    &raw.to_string(),
+                )
+                .await
+                .unwrap();
+            // The resume's `check_turn` comes first; the plan behind its
+            // version warning carries neither value.
+            let seen = engine.adapter.param_sizes_seen();
+            assert_eq!(seen.get(before), Some(&expected), "{extra}: {seen:?}");
+        }
+    });
 }

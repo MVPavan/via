@@ -177,6 +177,14 @@ impl Daemon {
         self.engine.close(params, &raw.to_string()).await.unwrap()
     }
 
+    /// Closes `session` gracefully under a `deadline_ms` deadline.
+    #[cfg(feature = "test-failpoints")]
+    async fn close_within(&self, session: &SessionId, deadline_ms: u64) -> Value {
+        let raw = json!({"session":session,"handle":HANDLE,"deadline_ms":deadline_ms});
+        let params: CloseParams = serde_json::from_value(raw.clone()).unwrap();
+        self.engine.close(params, &raw.to_string()).await.unwrap()
+    }
+
     /// Releases the fake agent's gate `name`.
     fn release(&self, name: &str) {
         fs::write(self.root.join("sync").join(format!("{name}.release")), b"").unwrap();
@@ -361,6 +369,33 @@ fn core_rate_limit_hint_fails_rate_limit() {
         assert_eq!(class(&envelope), "rate_limit", "{envelope}");
         assert_eq!(envelope["failure"]["message"], "slow down", "{envelope}");
         assert_eq!(envelope["failure"]["vendor_code"], "429", "{envelope}");
+        daemon.shutdown().await;
+    });
+}
+
+/// x.3.2 J0: a route failure's envelope message is harness-neutral, since
+/// every route shares the failure vocabulary: the fake's process exiting
+/// after acceptance with no terminal names no harness.
+#[test]
+fn core_route_failure_message_names_no_harness() {
+    let steps = [accepted(1), json!({"action":"exit","code":3})];
+    let Some(root) = child(
+        "core_route_failure_message_names_no_harness",
+        &scenario(&json!({}), &[script("p", &steps)]),
+        &[],
+    ) else {
+        return;
+    };
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = daemon.spawn("p", &json!({})).await;
+        let envelope = daemon.wait(&session, 1).await;
+        assert_eq!(envelope["state"], "failed", "{envelope}");
+        let message = envelope["failure"]["message"].as_str().unwrap();
+        assert!(!message.is_empty(), "{envelope}");
+        for harness in via_adapters::harness_names() {
+            assert!(!message.contains(harness), "{harness}: {message}");
+        }
         daemon.shutdown().await;
     });
 }
@@ -1347,6 +1382,36 @@ fn core_structured_output_spills_past_32_kib() {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        // C1 §3.12: `logs` states the file the envelope names, and none
+        // that no envelope names (Sol r5 #1).
+        let spill = |logs: &Value| {
+            logs["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|file| {
+                    file["name"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("structured_output")
+                })
+                .cloned()
+                .collect::<Vec<Value>>()
+        };
+        let logs = |turn: u32| {
+            serde_json::from_value(json!({"turn": format!("{session}/{turn}")})).unwrap()
+        };
+        let second_logs = daemon.engine.logs(logs(2)).await.unwrap();
+        assert_eq!(
+            spill(&second_logs),
+            [json!({"name":"structured_output.json","bytes":32 * 1024 + 1})],
+            "{second_logs}"
+        );
+        let orphan =
+            Path::new(first["evidence"]["folder"].as_str().unwrap()).join("structured_output.json");
+        fs::write(&orphan, b"{}").unwrap();
+        let first_logs = daemon.engine.logs(logs(1)).await.unwrap();
+        assert!(spill(&first_logs).is_empty(), "{first_logs}");
         daemon.shutdown().await;
     });
 }
@@ -2614,6 +2679,939 @@ fn core_an_eviction_racing_a_dispatch_keeps_the_turn_and_opens_once() {
             .count();
         assert_eq!(reopened, 1, "one new driver's generation: {after:?}");
         until_bounded(&daemon).await;
+        daemon.shutdown().await;
+    });
+}
+
+/// The persistent profile with a native `output_schema` (via-jm4.35).
+fn persistent_with_schema() -> Value {
+    json!({"persistent": true, "capabilities": {
+        "verbs": {"spawn":{"support":"native"},"resume":{"support":"native"},
+                  "steer":{"support":"unsupported","reason":"no steer input"},
+                  "cancel":{"support":"native"},"close":{"support":"native"}},
+        "params": {"instructions":{"support":"unsupported","reason":"no instructions input"},
+                   "output_schema":{"support":"native"},
+                   "effort":{"support":"unsupported","reason":"no effort setting"},
+                   "max_steps":{"support":"unsupported","reason":"no step limit"}},
+        "bounds": [], "network_control": false,
+        "recover": {"support":"unsupported","reason":"no recovery"},
+        "usage": {"tokens":"turn","cost":"unavailable"}
+    }})
+}
+
+/// The late scripts (via-jm4.35): the turn's acceptance, then a gate the
+/// test releases once the turn ended `unknown`, then the helper's terminal.
+fn late_scripts() -> Vec<Value> {
+    let invalid = emit(&json!({"type":"terminal","vendor_turn_id":vendor_turn(1),
+                               "status":"completed","final_text":"done",
+                               "stop_reason":"end_turn","structured_output":{"a":"x"}}));
+    vec![
+        script(
+            "late",
+            &[
+                accepted(1),
+                gate("late"),
+                terminal(1, "completed", "end_turn"),
+            ],
+        ),
+        script("invalid", &[accepted(1), gate("invalid"), invalid]),
+    ]
+}
+
+/// The session's `status` `turns`.
+async fn status_turns(daemon: &Daemon, session: &SessionId) -> Value {
+    let params = serde_json::from_value(json!({"session":session})).unwrap();
+    daemon.engine.status(params).await.unwrap()["turns"].clone()
+}
+
+/// The stored envelope of `session`'s turn `turn`.
+async fn stored(daemon: &Daemon, session: &SessionId, turn: u32) -> Value {
+    let envelope = daemon
+        .engine
+        .result(&format!("{session}/{turn}"))
+        .await
+        .unwrap();
+    serde_json::from_str(envelope.get()).unwrap()
+}
+
+/// The session's committed `turn.revised` events.
+async fn revisions(daemon: &Daemon, session: &SessionId) -> Vec<Value> {
+    events(daemon, session)
+        .await
+        .into_iter()
+        .filter(|event| event["type"] == "turn.revised")
+        .collect()
+}
+
+/// Waits until `session` committed a `turn.revised`.
+async fn until_revised(daemon: &Daemon, session: &SessionId) {
+    let by = tokio::time::Instant::now() + Duration::from_secs(30);
+    while revisions(daemon, session).await.is_empty() {
+        assert!(
+            tokio::time::Instant::now() < by,
+            "the turn was never revised"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Runs `prompt`'s session to its `unknown` end: the cancel's force passes
+/// unanswered on the shared server, so the turn retained no terminal.
+async fn unknown_turn(daemon: &Daemon, prompt: &str, extra: &Value) -> SessionId {
+    let session = daemon.spawn(prompt, extra).await;
+    daemon.entered(prompt).await;
+    cancel(daemon, &session, 1, 500).await;
+    let envelope = daemon.wait(&session, 1).await;
+    assert_eq!(envelope["state"], "unknown", "{envelope}");
+    assert_eq!(envelope["cancel"]["outcome"], "unknown", "{envelope}");
+    assert!(envelope["vendor_stop_reason"].is_null(), "{envelope}");
+    assert_eq!(envelope["revision"], 0, "{envelope}");
+    assert_eq!(
+        status_turns(daemon, &session).await,
+        json!([{"n":1,"state":"unknown","revision":0}])
+    );
+    // Runtime §6 (fix round 1 #3): the caller's cancel that stopped it.
+    assert_eq!(cancel_cause(daemon, &session).as_deref(), Some("cancel"));
+    session
+}
+
+/// Turn 1's recorded `cancel_cause`, read from the Store's row.
+fn cancel_cause(daemon: &Daemon, session: &SessionId) -> Option<String> {
+    let db = rusqlite::Connection::open(daemon.root.join("state").join("store.sqlite3")).unwrap();
+    db.busy_timeout(Duration::from_secs(10)).unwrap();
+    db.query_row(
+        "SELECT cancel_cause FROM turns WHERE session_id=?1 AND number=1",
+        [session.as_str()],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+/// via-jm4.35 (C1 §7.6 late row, C2 §4 `turn.late_terminal`), items 1 and
+/// 4: on the persistent profile a cancel's force passes unanswered, so the
+/// turn ends `unknown` with no retained terminal. The helper's terminal,
+/// read while it is retired, revises the turn once: `turn.revised
+/// {revision: 1, from_state: unknown, state: completed, evidence:
+/// late_terminal}`, `late: true`, and an envelope with `revision: 1`, the
+/// vendor's result and the vendor ignoring the cancel (`requested`);
+/// `status` and the read report the revision. C1 Q2: a late structured
+/// output is validated against the frozen schema, an invalid one revising
+/// to `failed(structured_output_invalid)`.
+#[test]
+fn core_late_terminal_revises_an_unknown_turn() {
+    let Some(root) = child(
+        "core_late_terminal_revises_an_unknown_turn",
+        &scenario(&persistent_with_schema(), &late_scripts()),
+        &[],
+    ) else {
+        return;
+    };
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = unknown_turn(&daemon, "late", &json!({})).await;
+        daemon.release("late");
+        until_revised(&daemon, &session).await;
+        let revised = revisions(&daemon, &session).await;
+        assert_eq!(revised.len(), 1, "{revised:?}");
+        let event = &revised[0];
+        assert_eq!(
+            (
+                &event["turn"],
+                &event["late"],
+                &event["revision"],
+                &event["from_state"],
+                &event["state"],
+                &event["evidence"]
+            ),
+            (
+                &json!(1),
+                &json!(true),
+                &json!(1),
+                &json!("unknown"),
+                &json!("completed"),
+                &json!("late_terminal")
+            ),
+            "{event}"
+        );
+        let envelope = stored(&daemon, &session, 1).await;
+        assert_eq!(envelope["revision"], 1, "{envelope}");
+        assert_eq!(envelope["state"], "completed", "{envelope}");
+        assert!(envelope["failure"].is_null(), "{envelope}");
+        assert_eq!(envelope["stop_reason"], "end_turn", "{envelope}");
+        assert_eq!(envelope["vendor_stop_reason"], "end_turn", "{envelope}");
+        assert_eq!(envelope["cancel"]["outcome"], "requested", "{envelope}");
+        assert_eq!(envelope["events"]["last_seq"], event["seq"], "{envelope}");
+        assert_eq!(
+            status_turns(&daemon, &session).await,
+            json!([{"n":1,"state":"completed","revision":1}])
+        );
+        // A revision keeps the cause (runtime §6).
+        assert_eq!(cancel_cause(&daemon, &session).as_deref(), Some("cancel"));
+
+        let schema = json!({"type":"object","properties":{"a":{"type":"integer"}},
+                            "required":["a"]});
+        let session = unknown_turn(&daemon, "invalid", &json!({"output_schema":schema})).await;
+        daemon.release("invalid");
+        until_revised(&daemon, &session).await;
+        let envelope = stored(&daemon, &session, 1).await;
+        assert_eq!(envelope["revision"], 1, "{envelope}");
+        assert_eq!(envelope["state"], "failed", "{envelope}");
+        assert_eq!(class(&envelope), "structured_output_invalid", "{envelope}");
+        assert_eq!(
+            envelope["failure"]["data"]["reason"], "invalid",
+            "{envelope}"
+        );
+        assert_eq!(
+            envelope["structured_output"],
+            json!({"a":"x"}),
+            "{envelope}"
+        );
+        daemon.shutdown().await;
+    });
+}
+
+/// via-jm4.35 item 2 (C2 §4: only a turn whose end carried no terminal):
+/// a turn that retained its terminal is never revised. On the persistent
+/// profile the helper reports a second terminal while it is retired; the
+/// turn keeps its envelope and revision 0, and no `turn.revised` commits.
+/// The session's close waits for the retirement, so the second terminal
+/// was read before the events are.
+#[test]
+fn core_a_turn_that_retained_its_terminal_is_not_revised() {
+    let scripts = [script(
+        "kept",
+        &[
+            accepted(1),
+            terminal(1, "completed", "end_turn"),
+            gate("second"),
+            terminal(1, "failed", "error"),
+        ],
+    )];
+    let Some(root) = child(
+        "core_a_turn_that_retained_its_terminal_is_not_revised",
+        &scenario(&persistent(), &scripts),
+        &[],
+    ) else {
+        return;
+    };
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = daemon.spawn("kept", &json!({})).await;
+        let envelope = daemon.wait(&session, 1).await;
+        assert_eq!(envelope["state"], "completed", "{envelope}");
+        daemon.entered("second").await;
+        daemon.release("second");
+        daemon.close(&session).await;
+        assert!(revisions(&daemon, &session).await.is_empty());
+        let after = stored(&daemon, &session, 1).await;
+        assert_eq!(after, envelope);
+        assert_eq!(
+            status_turns(&daemon, &session).await,
+            json!([{"n":1,"state":"completed","revision":0}])
+        );
+        daemon.shutdown().await;
+    });
+}
+
+/// Fix round 1 #8 (C2 §4.1 late observations): a durable observation the
+/// retired helper reports before its late terminal is forwarded in decode
+/// order and committed `late: true` with its turn, before the revision.
+#[test]
+fn core_a_retired_helpers_denial_commits_late_before_the_revision() {
+    let denial = emit(&json!({"type":"denial","vendor_turn_id":vendor_turn(1),
+                              "kind":"command","target":"retired","reason":"policy"}));
+    let scripts = [script(
+        "late",
+        &[
+            accepted(1),
+            gate("late"),
+            denial,
+            terminal(1, "completed", "end_turn"),
+        ],
+    )];
+    let Some(root) = child(
+        "core_a_retired_helpers_denial_commits_late_before_the_revision",
+        &scenario(&persistent(), &scripts),
+        &[],
+    ) else {
+        return;
+    };
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = unknown_turn(&daemon, "late", &json!({})).await;
+        daemon.release("late");
+        until_revised(&daemon, &session).await;
+        let events = events(&daemon, &session).await;
+        let denied: Vec<&Value> = events
+            .iter()
+            .filter(|event| event["type"] == "action.denied")
+            .collect();
+        assert_eq!(denied.len(), 1, "{events:?}");
+        assert_eq!(
+            (&denied[0]["turn"], &denied[0]["late"], &denied[0]["target"]),
+            (&json!(1), &json!(true), &json!("retired")),
+            "{events:?}"
+        );
+        let revised = &revisions(&daemon, &session).await[0];
+        assert!(
+            denied[0]["seq"].as_u64() < revised["seq"].as_u64(),
+            "{events:?}"
+        );
+        daemon.shutdown().await;
+    });
+}
+
+/// Fix round 1 #9 (design §7.3): a message the retired helper reports that
+/// does not decode is kept in the turn's `undecoded.bin`, as the turn's
+/// own reader keeps one; reading stops there, so the terminal after it
+/// revises nothing and the committed result stands.
+#[test]
+fn core_an_undecodable_retired_message_keeps_its_evidence() {
+    let malformed = emit(&json!({"type":"terminal","vendor_turn_id":vendor_turn(1)}));
+    let scripts = [script(
+        "late",
+        &[
+            accepted(1),
+            gate("late"),
+            malformed,
+            terminal(1, "completed", "end_turn"),
+        ],
+    )];
+    let Some(root) = child(
+        "core_an_undecodable_retired_message_keeps_its_evidence",
+        &scenario(&persistent(), &scripts),
+        &[],
+    ) else {
+        return;
+    };
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = unknown_turn(&daemon, "late", &json!({})).await;
+        let before = stored(&daemon, &session, 1).await;
+        let kept =
+            PathBuf::from(before["evidence"]["folder"].as_str().unwrap()).join("undecoded.bin");
+        daemon.release("late");
+        let by = tokio::time::Instant::now() + Duration::from_secs(30);
+        while !kept.exists() || daemon.engine.connections().in_use != 0 {
+            assert!(
+                tokio::time::Instant::now() < by,
+                "the retirement kept no undecoded.bin, or never ended"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(revisions(&daemon, &session).await.is_empty());
+        assert_eq!(stored(&daemon, &session, 1).await, before);
+        daemon.shutdown().await;
+    });
+}
+
+/// Fix round 4 #1 (C2 §2 health, runtime §7): a failure of the retired
+/// helper's output fails the driver's health as soon as its reading met
+/// it, while the helper still runs: its message that does not decode is
+/// kept, Core's lane sees the failed health (`core.lane.retire`), and the
+/// retirement's cleanup (`adapter.fake.retirement_cleaned`) has not
+/// ended, as the helper holds at its gate.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_a_retirement_failure_fails_health_before_its_cleanup() {
+    let malformed = emit(&json!({"type":"terminal","vendor_turn_id":vendor_turn(1)}));
+    let scripts = [script(
+        "late",
+        &[accepted(1), gate("late"), malformed, gate("hold")],
+    )];
+    let Some(root) = child(
+        "core_a_retirement_failure_fails_health_before_its_cleanup",
+        &scenario(&persistent(), &scripts),
+        &[],
+    ) else {
+        return;
+    };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    acknowledge(&root, "core.lane.retire", 1);
+    acknowledge(&root, "adapter.fake.retirement_cleaned", 1);
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = unknown_turn(&daemon, "late", &json!({})).await;
+        let before = stored(&daemon, &session, 1).await;
+        let kept =
+            PathBuf::from(before["evidence"]["folder"].as_str().unwrap()).join("undecoded.bin");
+        daemon.release("late");
+        until_acked(&root, "core.lane.retire", 1).await;
+        assert!(kept.exists(), "the undecodable message was kept");
+        assert!(
+            !root
+                .join("points")
+                .join("adapter.fake.retirement_cleaned.1.ack")
+                .exists(),
+            "the cleanup still waits for the helper"
+        );
+        daemon.entered("hold").await;
+        daemon.release("hold");
+        until_acked(&root, "adapter.fake.retirement_cleaned", 1).await;
+        assert!(revisions(&daemon, &session).await.is_empty());
+        daemon.shutdown().await;
+    });
+}
+
+/// Critical fix r1 #2 (C2 §4: one order across a session's producers):
+/// the retired helper's observations follow the turn's own. The turn's
+/// acceptance is decoded and handed over, but its delivery is held
+/// (`adapter.fake.stamped`) while the cancel's force ends the turn with no
+/// terminal and the retired helper's late terminal is read and offered
+/// (`adapter.fake.retirement_item`). Released, the acceptance commits
+/// first, so the late terminal names a mapped vendor turn and revises it.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_a_late_terminal_follows_the_turns_own_delivery() {
+    let scripts = [script(
+        "late",
+        &[
+            accepted(1),
+            gate("late"),
+            terminal(1, "completed", "end_turn"),
+        ],
+    )];
+    let Some(root) = child(
+        "core_a_late_terminal_follows_the_turns_own_delivery",
+        &scenario(&persistent(), &scripts),
+        &[],
+    ) else {
+        return;
+    };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    arm(&root, "adapter.fake.stamped", "pause");
+    acknowledge(&root, "routes.fake.retiring", 1);
+    acknowledge(&root, "adapter.fake.retirement_item", 1);
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = daemon.spawn("late", &json!({})).await;
+        until_acked(&root, "adapter.fake.stamped", 1).await;
+        daemon.entered("late").await;
+        cancel(&daemon, &session, 1, 500).await;
+        until_acked(&root, "routes.fake.retiring", 1).await;
+        daemon.release("late");
+        until_acked(&root, "adapter.fake.retirement_item", 1).await;
+        release_point(&root, "adapter.fake.stamped", 1);
+        daemon.wait(&session, 1).await;
+        until_revised(&daemon, &session).await;
+        let envelope = stored(&daemon, &session, 1).await;
+        assert_eq!(
+            (&envelope["state"], &envelope["revision"]),
+            (&json!("completed"), &json!(1)),
+            "{envelope}"
+        );
+        daemon.shutdown().await;
+    });
+}
+
+/// Every event of `session`, page by page.
+#[cfg(feature = "test-failpoints")]
+async fn all_events(daemon: &Daemon, session: &SessionId) -> Vec<Value> {
+    let mut all = Vec::new();
+    loop {
+        let after = all
+            .last()
+            .map_or(0, |event: &Value| event["seq"].as_u64().unwrap());
+        let params =
+            serde_json::from_value(json!({"session":session,"after":after,"limit":1000})).unwrap();
+        let page = daemon.engine.events(params).await.unwrap();
+        let page: Value = serde_json::from_str(page.get()).unwrap();
+        let events = page["events"].as_array().unwrap().clone();
+        if events.is_empty() {
+            return all;
+        }
+        all.extend(events);
+    }
+}
+
+/// A denial of `target` for turn `turn`'s vendor turn.
+fn denial(turn: u32, target: &str) -> Value {
+    emit(&json!({"type":"denial","vendor_turn_id":vendor_turn(turn),
+                 "kind":"command","target":target,"reason":"policy"}))
+}
+
+/// Fix round 2 #1 (C2 §2 health, §4.1; runtime §7): a retirement whose
+/// cleanup is unproven fails the driver's health, and the lane closes the
+/// driver while the helper's 1,024 denials and its late terminal are
+/// still being delivered. The lane drains its channel while the close
+/// runs, so the delivery and the close wait for nothing of each other:
+/// every denial commits late and the terminal revises the turn.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_a_failed_retirement_delivers_its_observations_while_it_closes() {
+    let mut steps = vec![accepted(1), gate("late")];
+    steps.extend((0..1_024).map(|n| denial(1, &format!("retired-{n}"))));
+    steps.push(terminal(1, "completed", "end_turn"));
+    let Some(root) = child(
+        "core_a_failed_retirement_delivers_its_observations_while_it_closes",
+        &scenario(&persistent(), &[script("late", &steps)]),
+        &[("VIA_TEST_FAKE_RETIREMENT_UNCERTAIN", "1")],
+    ) else {
+        return;
+    };
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = unknown_turn(&daemon, "late", &json!({})).await;
+        daemon.release("late");
+        // Past the first events page: `until_revised` reads only that one.
+        let by = tokio::time::Instant::now() + Duration::from_secs(30);
+        let events = loop {
+            let events = all_events(&daemon, &session).await;
+            if events.iter().any(|event| event["type"] == "turn.revised") {
+                break events;
+            }
+            assert!(
+                tokio::time::Instant::now() < by,
+                "the turn was never revised"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let denied = events
+            .iter()
+            .filter(|event| event["type"] == "action.denied")
+            .filter(|event| event["late"] == true && event["turn"] == 1)
+            .count();
+        assert_eq!(denied, 1_024);
+        assert_eq!(stored(&daemon, &session, 1).await["state"], "completed");
+        daemon.shutdown().await;
+    });
+}
+
+/// Fix round 2 #1, round 3 #3 and #4 (C2 §2 health, §4.1): the lane
+/// disposes of what its channel receives while it closes the driver.
+/// Core holds its first late item (`core.lane.dispose`), so the session
+/// channel fills with the retired helper's denials while its terminal
+/// still waits behind them. The retirement's cleanup ends and its
+/// unproven cleanup is reported while that delivery is still blocked;
+/// once the item is released the failed driver is closed, and its close
+/// waits for the delivery while the lane drains: the terminal revises the
+/// turn.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_a_closing_lane_drains_what_its_driver_still_delivers() {
+    let line = json!({"type":"denial","vendor_turn_id":vendor_turn(1),
+                      "kind":"command","target":"t","reason":"policy"})
+    .to_string()
+        + "\n";
+    let steps = [
+        accepted(1),
+        gate("late"),
+        json!({"action":"flood","text":line,"count":RETIRED_DENIALS}),
+        terminal(1, "completed", "end_turn"),
+    ];
+    let Some(root) = child(
+        "core_a_closing_lane_drains_what_its_driver_still_delivers",
+        &scenario(&persistent(), &[script("late", &steps)]),
+        &[("VIA_TEST_FAKE_RETIREMENT_UNCERTAIN", "1")],
+    ) else {
+        return;
+    };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    arm(&root, "core.lane.dispose", "pause");
+    acknowledge(&root, "adapter.fake.retirement_cleaned", 1);
+    acknowledge(&root, "adapter.fake.retirement_delivered", 1);
+    acknowledge(&root, "core.lane.close_draining", 1);
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = unknown_turn(&daemon, "late", &json!({})).await;
+        daemon.release("late");
+        until_acked(&root, "core.lane.dispose", 1).await;
+        // The retirement's cleanup and its reports are published while
+        // its delivery is still blocked behind the held item.
+        until_acked(&root, "adapter.fake.retirement_cleaned", 1).await;
+        let delivered = root
+            .join("points")
+            .join("adapter.fake.retirement_delivered.1.ack");
+        assert!(!delivered.exists(), "the delivery was not blocked");
+        fs::write(root.join("points").join("core.lane.dispose.1.release"), b"").unwrap();
+        // The failed driver's close starts, and the delivery ends only
+        // while the lane drains beside it.
+        until_acked(&root, "core.lane.close_draining", 1).await;
+        until_acked(&root, "adapter.fake.retirement_delivered", 1).await;
+        let by = tokio::time::Instant::now() + Duration::from_secs(30);
+        let events = loop {
+            let events = all_events(&daemon, &session).await;
+            if events.iter().any(|event| event["type"] == "turn.revised") {
+                break events;
+            }
+            assert!(
+                tokio::time::Instant::now() < by,
+                "the turn was never revised"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let denied = events
+            .iter()
+            .filter(|event| event["type"] == "action.denied")
+            .count();
+        assert_eq!(denied, RETIRED_DENIALS);
+        daemon.shutdown().await;
+    });
+}
+
+/// Fix round 3 #2, round 4 #4 (C1 §3.6): the driver's close is polled
+/// while the lane disposes of an item, so its deadline never waits behind
+/// Store work. A close under a 1 s deadline starts; the retired helper's
+/// first denial is then held in its disposal (`core.lane.dispose`), and
+/// its second at the driver's delivery (`adapter.fake.retirement_item`),
+/// so the close's delivery ends at the deadline. The close has then ended
+/// and the channel's admission closed while the first is still held
+/// (`core.lane.admission_closed`); the second, sent only then, is refused
+/// (`adapter.fake.retirement_delivered`) and never committed, while the
+/// held one still is.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_a_held_disposal_delays_no_close() {
+    let scripts = [script(
+        "first",
+        &[
+            accepted(1),
+            terminal(1, "completed", "end_turn"),
+            gate("before"),
+            denial(1, "held"),
+            denial(1, "late"),
+        ],
+    )];
+    let Some(root) = child(
+        "core_a_held_disposal_delays_no_close",
+        &scenario(&persistent(), &scripts),
+        &[],
+    ) else {
+        return;
+    };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    arm(&root, "core.lane.dispose", "pause");
+    arm_at(&root, "adapter.fake.retirement_item", 2, "pause");
+    acknowledge(&root, "core.lane.close_draining", 1);
+    acknowledge(&root, "core.lane.admission_closed", 1);
+    acknowledge(&root, "adapter.fake.retirement_delivered", 1);
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = daemon.spawn("first", &json!({})).await;
+        let envelope = daemon.wait(&session, 1).await;
+        assert_eq!(envelope["state"], "completed", "{envelope}");
+        daemon.entered("before").await;
+        let steps = async {
+            until_acked(&root, "core.lane.close_draining", 1).await;
+            daemon.release("before");
+            until_acked(&root, "core.lane.dispose", 1).await;
+            until_acked(&root, "adapter.fake.retirement_item", 2).await;
+            // The close ended at its deadline, the first denial still held.
+            until_acked(&root, "core.lane.admission_closed", 1).await;
+            release_point(&root, "adapter.fake.retirement_item", 2);
+            until_acked(&root, "adapter.fake.retirement_delivered", 1).await;
+            release_point(&root, "core.lane.dispose", 1);
+        };
+        let (_closed, ()) = tokio::join!(daemon.close_within(&session, 1_000), steps);
+        let events = events(&daemon, &session).await;
+        let denied: Vec<&Value> = events
+            .iter()
+            .filter(|event| event["type"] == "action.denied")
+            .collect();
+        assert_eq!(denied.len(), 1, "{events:?}");
+        assert_eq!(denied[0]["target"], "held", "{events:?}");
+        daemon.shutdown().await;
+    });
+}
+
+/// The retired helper's denials in
+/// [`core_a_closing_lane_drains_what_its_driver_still_delivers`]: one
+/// held by Core, the session channel's 1,024 items, and one waiting at
+/// the driver, so its terminal waits on Route's hand-over.
+#[cfg(feature = "test-failpoints")]
+const RETIRED_DENIALS: usize = 1_025;
+
+/// Fix round 2 #4 (C2 §4.1 late observations): the retired helper's
+/// durable observations are forwarded until its output ends, not only up
+/// to its late terminal: a denial after the terminal commits late too.
+#[test]
+fn core_a_denial_after_the_late_terminal_commits_late() {
+    let scripts = [script(
+        "late",
+        &[
+            accepted(1),
+            gate("late"),
+            terminal(1, "completed", "end_turn"),
+            denial(1, "after"),
+        ],
+    )];
+    let Some(root) = child(
+        "core_a_denial_after_the_late_terminal_commits_late",
+        &scenario(&persistent(), &scripts),
+        &[],
+    ) else {
+        return;
+    };
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = unknown_turn(&daemon, "late", &json!({})).await;
+        daemon.release("late");
+        until_revised(&daemon, &session).await;
+        let by = tokio::time::Instant::now() + Duration::from_secs(30);
+        let denied = loop {
+            let events = events(&daemon, &session).await;
+            if let Some(denied) = events
+                .into_iter()
+                .find(|event| event["type"] == "action.denied")
+            {
+                break denied;
+            }
+            assert!(
+                tokio::time::Instant::now() < by,
+                "the denial after the late terminal never committed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(
+            (&denied["turn"], &denied["late"], &denied["target"]),
+            (&json!(1), &json!(true), &json!("after")),
+            "{denied}"
+        );
+        daemon.shutdown().await;
+    });
+}
+
+/// Fix round 2 #5 (C2 §2 health, §4.1): the retired helper's messages are
+/// checked against the connection's protocol phase as the turn's own are.
+/// A second terminal is a protocol failure: the driver's health fails and
+/// the lane retires it, releasing its slot, while the revision the first
+/// terminal made stands.
+#[test]
+fn core_a_second_retired_terminal_fails_the_connection() {
+    let scripts = [script(
+        "late",
+        &[
+            accepted(1),
+            gate("late"),
+            terminal(1, "completed", "end_turn"),
+            terminal(1, "failed", "error"),
+        ],
+    )];
+    let Some(root) = child(
+        "core_a_second_retired_terminal_fails_the_connection",
+        &scenario(&persistent(), &scripts),
+        &[],
+    ) else {
+        return;
+    };
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = unknown_turn(&daemon, "late", &json!({})).await;
+        daemon.release("late");
+        until_revised(&daemon, &session).await;
+        let by = tokio::time::Instant::now() + Duration::from_secs(30);
+        while daemon.engine.connections().in_use != 0 {
+            assert!(
+                tokio::time::Instant::now() < by,
+                "the connection outlived its protocol failure"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let envelope = stored(&daemon, &session, 1).await;
+        assert_eq!(
+            (&envelope["state"], &envelope["revision"]),
+            (&json!("completed"), &json!(1)),
+            "{envelope}"
+        );
+        assert_eq!(revisions(&daemon, &session).await.len(), 1);
+        daemon.shutdown().await;
+    });
+}
+
+/// The hits of failpoint `point` a wrong-token command counted so far.
+#[cfg(feature = "test-failpoints")]
+fn hits(root: &Path, point: &str) -> u64 {
+    let prefix = format!("{point}.");
+    fs::read_dir(root.join("points"))
+        .unwrap()
+        .filter_map(|entry| {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            name.strip_prefix(&prefix)
+                .and_then(|rest| rest.strip_suffix(".refused"))
+                .and_then(|number| number.parse::<u64>().ok())
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Releases `point`'s paused hit `occurrence`.
+#[cfg(feature = "test-failpoints")]
+fn release_point(root: &Path, point: &str, occurrence: u64) {
+    fs::write(
+        root.join("points")
+            .join(format!("{point}.{occurrence}.release")),
+        b"",
+    )
+    .unwrap();
+}
+
+impl Daemon {
+    /// Ends a daemon whose Store failure latched, as its process would:
+    /// final shutdown, then every task holding the Engine, so the next
+    /// daemon on the same root takes the Store lock.
+    #[cfg(feature = "test-failpoints")]
+    async fn end_latched(self) {
+        let _report = self
+            .engine
+            .shutdown(Deadline::at(
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            ))
+            .await;
+        self.starter.abort();
+        let _ = self.starter.await;
+        let handles = std::mem::take(&mut *self.dispatchers.lock().unwrap());
+        for handle in handles {
+            handle.abort();
+            let _ = handle.await;
+        }
+        assert_eq!(Arc::strong_count(&self.engine), 1, "the Engine is held");
+    }
+}
+
+/// Waits until the daemon's Store failure latched.
+#[cfg(feature = "test-failpoints")]
+async fn until_latched(daemon: &Daemon) {
+    let by = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !daemon.engine.store_failed() {
+        assert!(
+            tokio::time::Instant::now() < by,
+            "Store failure never latched"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// via-jm4.35 item 3 (C1 §7.6, runtime §7): an uncertain revision commit
+/// latches Store failure and is never assumed absent; the restarted daemon
+/// reads what is durable. Case `durable`: the commit's reply is lost after
+/// it committed (`store.commit.reply_lost`), and the restart reads the
+/// first revision. Case `absent`: the commit fails and its rollback is
+/// reported failed (`store.commit.revision`, `store.rollback.fail`), and
+/// the restart reads the turn `unknown` at revision 0 with no
+/// `turn.revised`.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_an_uncertain_revision_latches_and_reconciles_at_restart() {
+    const NAME: &str = "core_an_uncertain_revision_latches_and_reconciles_at_restart";
+    let scenario = scenario(&persistent(), &late_scripts()[..1]);
+    let Some(root) = child(NAME, &scenario, &[]) else {
+        child_case(NAME, &scenario, "absent");
+        return;
+    };
+    let durable = case().is_none();
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    // The revision is held before its commit is sent.
+    arm(&root, "core.revision.commit", "pause");
+    if durable {
+        // Counted with a wrong token until the revision's own hit is known.
+        let counting = json!({"token":"counting","occurrence":1,"action":"pause"});
+        fs::write(
+            root.join("points").join("store.commit.reply_lost.json"),
+            counting.to_string(),
+        )
+        .unwrap();
+    } else {
+        arm(&root, "store.commit.revision", "fail_io");
+        arm(&root, "store.rollback.fail", "fail_io");
+    }
+    run(async {
+        let session = {
+            let daemon = Daemon::open(&root);
+            let session = unknown_turn(&daemon, "late", &json!({})).await;
+            daemon.release("late");
+            until_acked(&root, "core.revision.commit", 1).await;
+            if durable {
+                let next = hits(&root, "store.commit.reply_lost") + 1;
+                arm_at(&root, "store.commit.reply_lost", next, "fail_io");
+            }
+            release_point(&root, "core.revision.commit", 1);
+            until_latched(&daemon).await;
+            daemon.end_latched().await;
+            session
+        };
+        let daemon = Daemon::open(&root);
+        daemon.engine.recover().await.unwrap();
+        let envelope = stored(&daemon, &session, 1).await;
+        let revised = revisions(&daemon, &session).await;
+        if durable {
+            assert_eq!(envelope["revision"], 1, "{envelope}");
+            assert_eq!(envelope["state"], "completed", "{envelope}");
+            assert_eq!(revised.len(), 1, "{revised:?}");
+            assert_eq!(
+                status_turns(&daemon, &session).await,
+                json!([{"n":1,"state":"completed","revision":1}])
+            );
+        } else {
+            assert_eq!(envelope["revision"], 0, "{envelope}");
+            assert_eq!(envelope["state"], "unknown", "{envelope}");
+            assert!(revised.is_empty(), "{revised:?}");
+            assert_eq!(
+                status_turns(&daemon, &session).await,
+                json!([{"n":1,"state":"unknown","revision":0}])
+            );
+        }
+        daemon.shutdown().await;
+    });
+}
+
+/// via-jm4.35 (C1 §7.6, runtime §7): a revision known not committed is
+/// retried once at the same sequence. Case `retried`: the first attempt
+/// rolls back and the retry commits, revision 1, nothing latched. Case
+/// `not_made`: the retry fails too, so the revision is not made, the turn
+/// stays `unknown` at revision 0 with no `turn.revised`; both failures are
+/// the turn's, scoped, and nothing latches.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_a_revision_not_committed_is_retried_once() {
+    const NAME: &str = "core_a_revision_not_committed_is_retried_once";
+    let scenario = scenario(&persistent(), &late_scripts()[..1]);
+    let Some(root) = child(NAME, &scenario, &[]) else {
+        child_case(NAME, &scenario, "not_made");
+        return;
+    };
+    let retried = case().is_none();
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    arm_failing(&root, "store.commit.revision", !retried);
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = unknown_turn(&daemon, "late", &json!({})).await;
+        daemon.release("late");
+        // The first attempt's hit, and with `persist` the retry's.
+        until_acked(&root, "store.commit.revision", if retried { 1 } else { 2 }).await;
+        if retried {
+            until_revised(&daemon, &session).await;
+            let envelope = stored(&daemon, &session, 1).await;
+            assert_eq!(envelope["revision"], 1, "{envelope}");
+            assert_eq!(envelope["state"], "completed", "{envelope}");
+            assert!(!daemon.engine.store_failed());
+            daemon.shutdown().await;
+            return;
+        }
+        let by = tokio::time::Instant::now() + Duration::from_secs(30);
+        let failure = loop {
+            let failure = daemon.engine.store_failure_status();
+            if failure
+                .as_ref()
+                .is_some_and(|failure| failure["count"] == 2)
+            {
+                break failure.unwrap();
+            }
+            assert!(
+                tokio::time::Instant::now() < by,
+                "both failures were never recorded: {failure:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(
+            (&failure["kind"], &failure["scope"]),
+            (&json!("commit_failed"), &json!("turn")),
+            "{failure}"
+        );
+        assert!(!daemon.engine.store_failed());
+        let envelope = stored(&daemon, &session, 1).await;
+        assert_eq!(envelope["revision"], 0, "{envelope}");
+        assert_eq!(envelope["state"], "unknown", "{envelope}");
+        assert!(revisions(&daemon, &session).await.is_empty());
         daemon.shutdown().await;
     });
 }
