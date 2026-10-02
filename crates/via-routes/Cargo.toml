@@ -15,7 +15,8 @@ via-wire = { path = "../via-wire" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync", "time"] }
+# "rt": the Codex server registry's supervisor owns its task set (x.3.2 X3).
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
 
 [lints]
 workspace = true

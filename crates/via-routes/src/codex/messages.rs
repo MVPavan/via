@@ -119,6 +119,55 @@ pub enum Notification {
     },
 }
 
+impl Notification {
+    /// The thread the notification names, if any: the demux routes by it
+    /// (packet §5). Untagged connection traffic names none.
+    pub fn thread_id(&self) -> Option<&str> {
+        match self {
+            Self::TurnStarted(event) | Self::TurnCompleted(event) => Some(&event.thread_id),
+            Self::ItemStarted(event) | Self::ItemCompleted(event) => Some(&event.thread_id),
+            Self::AgentMessageDelta(event) | Self::ReasoningDelta(event) => Some(&event.thread_id),
+            Self::TokenUsage(event) => Some(&event.thread_id),
+            Self::Error(event) => Some(&event.thread_id),
+            Self::ThreadStatusChanged { thread_id } | Self::ThreadClosed { thread_id } => {
+                Some(thread_id)
+            }
+            Self::Unknown { thread_id, .. } => thread_id.as_deref(),
+        }
+    }
+
+    /// The turn the notification names, if any.
+    pub fn turn_id(&self) -> Option<&str> {
+        match self {
+            Self::TurnStarted(event) | Self::TurnCompleted(event) => Some(&event.turn.id),
+            Self::ItemStarted(event) | Self::ItemCompleted(event) => Some(&event.turn_id),
+            Self::AgentMessageDelta(event) | Self::ReasoningDelta(event) => Some(&event.turn_id),
+            Self::TokenUsage(event) => Some(&event.turn_id),
+            Self::Error(event) => Some(&event.turn_id),
+            Self::ThreadStatusChanged { .. } | Self::ThreadClosed { .. } | Self::Unknown { .. } => {
+                None
+            }
+        }
+    }
+}
+
+/// The routing peek of a line [`decode`] refused (x.3.2 X0 item 5 step
+/// 1): the `params.threadId` of a well-formed JSON object with no `id`,
+/// when it is a string within its bound. `None` is no attribution: the
+/// failure is the connection's.
+pub fn peek_thread(line: &[u8]) -> Option<String> {
+    if limits(line).is_err() {
+        return None;
+    }
+    let raw: RawEnvelope = serde_json::from_slice(line).ok()?;
+    if raw.id.is_some() {
+        return None;
+    }
+    loose_ids(raw.params.as_deref())
+        .thread
+        .filter(|thread| thread.len() <= SHORT_FIELD_MAX)
+}
+
 /// `turn/started` and `turn/completed` params.
 #[derive(Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]

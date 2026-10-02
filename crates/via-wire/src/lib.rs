@@ -5,7 +5,9 @@ pub use via_host::{
     CapacityToken, CleanupEvidence, CloseMode, CloseRequest, EnvAllowList, ExitReport, HostError,
     PrivateProcessSpec, ProcessOwner, TurnNumber,
 };
-pub use via_store::{AnchorCohort, Deadline, RuntimeResources, SessionId};
+pub use via_store::{
+    AnchorCohort, CommitOutcome, Deadline, RuntimeResources, ServerId, SessionId, StoreFailureKind,
+};
 
 /// The maximum complete stdout message, including its trailing LF.
 pub const MAX_STDOUT_MESSAGE_BYTES: usize = 1024 * 1024;
