@@ -370,7 +370,7 @@ it seals and dequeues only when polled. `Boundary.discarded_bytes` is a lower
 bound read when the boundary is yielded: it counts complete messages split
 after the seal and whole reads skipped after a reader failure, but not the read
 that failed the reader, so it can be 0 although output was lost, and a later
-boundary may report more. A second `StartBy` write while the ticketed data slot
+boundary may report more. A second `StartBy` data write while the ticketed data slot
 is occupied is refused at once with `NotWritten`, writing nothing. `withdraw`
 does nothing for `CutAt` data and interrupts; a `Control` message stays
 withdrawable under either bounds variant until its first byte. The connection
