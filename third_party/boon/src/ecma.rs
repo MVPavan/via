@@ -13,8 +13,24 @@ use regex_syntax::ast::{self, *};
 // becomes its control character, then every perl class, `.`, `\b` and `\B`
 // is replaced in one pass over one parse.
 pub(crate) fn convert(pattern: &str) -> Result<Cow<str>, Box<dyn std::error::Error>> {
+    convert_with(pattern, &ECMA)
+}
+
+// VIA patch (critical r3 #3): the conversion with `with`'s replacement
+// texts for the ECMA fixes; the tests' oracle passes upstream's, so only
+// replacements of translated nodes ever differ, never the caller's text.
+fn convert_with<'p>(
+    pattern: &'p str,
+    with: &'static Replacements,
+) -> Result<Cow<'p, str>, Box<dyn std::error::Error>> {
     let (pattern, ast) = parse_fixing_controls(pattern)?;
-    let mut spans = ast::visit(&ast, Translator { spans: Vec::new() })?;
+    let mut spans = ast::visit(
+        &ast,
+        Translator {
+            spans: Vec::new(),
+            with,
+        },
+    )?;
     if spans.is_empty() {
         return Ok(pattern);
     }
@@ -44,6 +60,23 @@ const NOT_SPACE: &str = r"[^\t\n\x0B\x0C\r\x20\u{A0}\u{1680}\u{2000}-\u{200A}\u{
 const DOT: &str = r"[^\n\r\u{2028}\u{2029}]";
 const WORD_BOUNDARY: &str = r"(?-u:\b)";
 const NOT_WORD_BOUNDARY: &str = r"(?-u:\B)";
+
+// VIA patch (critical r3 #3): the replacement texts of the ECMA fixes.
+struct Replacements {
+    space: &'static str,
+    not_space: &'static str,
+    dot: &'static str,
+    word_boundary: &'static str,
+    not_word_boundary: &'static str,
+}
+
+const ECMA: Replacements = Replacements {
+    space: SPACE,
+    not_space: NOT_SPACE,
+    dot: DOT,
+    word_boundary: WORD_BOUNDARY,
+    not_word_boundary: NOT_WORD_BOUNDARY,
+};
 
 // VIA patch: most `\c` fixes an extended-mode pattern may need; past it the
 // pattern is refused rather than reparsed again.
@@ -150,6 +183,7 @@ VIA patch: collects every replacement of one parse, as byte spans.
 */
 struct Translator {
     spans: Vec<(usize, usize, &'static str)>,
+    with: &'static Replacements,
 }
 
 impl Translator {
@@ -171,9 +205,9 @@ impl Translator {
             }
             ClassPerlKind::Space => {
                 if perl.negated {
-                    NOT_SPACE
+                    self.with.not_space
                 } else {
-                    SPACE
+                    self.with.space
                 }
             }
         };
@@ -206,11 +240,13 @@ impl Visitor for Translator {
                 self.replace_class_class(perl);
             }
             // VIA patch (critical r2 #7).
-            Ast::Dot(span) => self.replace(span, DOT),
+            Ast::Dot(span) => self.replace(span, self.with.dot),
             Ast::Assertion(assertion) => match assertion.kind {
-                AssertionKind::WordBoundary => self.replace(&assertion.span, WORD_BOUNDARY),
+                AssertionKind::WordBoundary => {
+                    self.replace(&assertion.span, self.with.word_boundary);
+                }
                 AssertionKind::NotWordBoundary => {
-                    self.replace(&assertion.span, NOT_WORD_BOUNDARY)
+                    self.replace(&assertion.span, self.with.not_word_boundary);
                 }
                 _ => (),
             },
@@ -488,24 +524,51 @@ mod tests {
         r"a{\cA}",
     ];
 
-    // VIA patch (critical r2 #7): upstream's text for each ECMA fix's
-    // replacement, so the differential checks that the conversion differs
-    // from upstream's only where those fixes say.
-    fn as_upstream(converted: String) -> String {
-        converted
-            .replace(SPACE, "[ \t\n\r\u{000b}\u{000c}\u{00a0}\u{feff}\u{2003}\u{2029}]")
-            .replace(NOT_SPACE, "[^ \t\n\r\u{000b}\u{000c}\u{00a0}\u{feff}\u{2003}\u{2029}]")
-            .replace(DOT, ".")
-            .replace(WORD_BOUNDARY, r"\b")
-            .replace(NOT_WORD_BOUNDARY, r"\B")
-    }
+    // VIA patch (critical r2 #7, r3 #3): upstream's text for each ECMA
+    // fix's replacement, so the differential checks that the conversion
+    // differs from upstream's only in the replacements of the nodes those
+    // fixes translate.
+    const UPSTREAM: Replacements = Replacements {
+        space: "[ \t\n\r\u{000b}\u{000c}\u{00a0}\u{feff}\u{2003}\u{2029}]",
+        not_space: "[^ \t\n\r\u{000b}\u{000c}\u{00a0}\u{feff}\u{2003}\u{2029}]",
+        dot: ".",
+        word_boundary: r"\b",
+        not_word_boundary: r"\B",
+    };
 
     fn same(input: &str) {
-        let got = convert(input).map(|c| as_upstream(c.into_owned())).map_err(|_| ());
+        let got = convert_with(input, &UPSTREAM)
+            .map(|c| c.into_owned())
+            .map_err(|_| ());
         let want = super::upstream::convert(input)
             .map(|c| c.into_owned())
             .map_err(|_| ());
         assert_eq!(got, want, "convert({input:?})");
+    }
+
+    // VIA patch (critical r3 #5): `[\b]`, ECMA's backspace in a bracket
+    // class, is refused, as upstream's conversion refuses it.
+    #[test]
+    fn a_class_backspace_is_refused() {
+        assert!(convert(r"[\b]").is_err());
+        assert!(super::upstream::convert(r"[\b]").is_err());
+    }
+
+    // VIA patch (critical r3 #3): patterns whose own text is a
+    // replacement's form; neither conversion rewrites them.
+    #[test]
+    fn matches_upstream_on_caller_authored_replacement_forms() {
+        for input in [
+            DOT,
+            SPACE,
+            NOT_SPACE,
+            WORD_BOUNDARY,
+            NOT_WORD_BOUNDARY,
+            r"a[^\n\r\u{2028}\u{2029}]b",
+            r"(?x)[^\n\r\u{2028}\u{2029}]#\cA",
+        ] {
+            same(input);
+        }
     }
 
     #[test]

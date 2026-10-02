@@ -82,11 +82,13 @@ commit that vendored the unchanged copy shows the whole patch.
    (`(?x)`, whose `#` comments can hide a `\c`) keeps upstream's
    fix-and-reparse loop, parsing after each fix, for at most 32 fixes; a
    pattern needing a 33rd is refused. The output is upstream's otherwise,
-   but for item 7's replacements: `ecma.rs`'s tests map those back to
-   upstream's text and compare the result with upstream's conversion,
-   kept there verbatim, on the JSON-Schema-Test-Suite patterns (written
-   out, as the suite is not vendored) and on 100,000 seeded random
-   patterns. Upstream also stopped converting, keeping a
+   but for item 7's replacements: `ecma.rs`'s tests run the conversion
+   with upstream's replacement texts for the nodes item 7 translates
+   (never rewriting the caller's own text) and compare the result with
+   upstream's conversion, kept there verbatim, on the
+   JSON-Schema-Test-Suite patterns (written out, as the suite is not
+   vendored), on patterns whose own text is a replacement's form, and on
+   100,000 seeded random patterns. Upstream also stopped converting, keeping a
    partial result, if a replacement made the pattern fail to parse (a case
    its own debug assertion calls a bug); the linear conversion returns the
    whole replacement, which then fails to compile.
@@ -160,6 +162,9 @@ commit that vendored the unchanged copy shows the whole patch.
      haystacks (Rust's `\b` uses Unicode's word characters).
    - `\d`, `\D`, `\w` and `\W` keep upstream's ASCII translations, which
      are ECMA's.
+   - Limitation: `[\b]`, ECMA's backspace inside a bracket class, is
+     refused by the parser, as upstream's is, so a schema using it is
+     refused (C1 `invalid_params`), never misread.
 8. **Manifest** (`Cargo.toml`): `mismatched_lifetime_syntaxes` is allowed, so
    newer toolchains do not warn on upstream's elided lifetimes. The
    dev-dependencies and the `bench` target (criterion, rustls, serde_yaml,
