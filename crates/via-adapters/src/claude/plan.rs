@@ -321,8 +321,8 @@ fn vendor_refusal(route: &'static str, vendor: &VendorOptions) -> Option<Refusal
 /// Normalized prefixes of the flag, setting and environment-override
 /// families the recipe owns (C2 §6.1, packet §4): each names several
 /// spellings or members (`permissionMode`, `permissionPromptTool`, …;
-/// `ANTHROPIC_*`, `CLAUDE_CODE_*`; `env` and `environment`).
-const RESERVED_PREFIXES: [&str; 20] = [
+/// `ANTHROPIC_*`, `CLAUDE_CODE_*`).
+const RESERVED_PREFIXES: [&str; 19] = [
     "permission",
     "dangerously",
     "allowdangerously",
@@ -339,7 +339,6 @@ const RESERVED_PREFIXES: [&str; 20] = [
     "mcp",
     "plugin",
     "disableslashcommand",
-    "env",
     "claudeconfig",
     "anthropic",
     "claudecode",
@@ -348,7 +347,9 @@ const RESERVED_PREFIXES: [&str; 20] = [
 /// Normalized names matched exactly (review r2 #7, r3 #3 and #4): the
 /// recipe's singleton flags, the launch environment's variables (the
 /// known locale variables included), and VIA's canonical parameters.
-const RESERVED_NAMES: [&str; 46] = [
+const RESERVED_NAMES: [&str; 48] = [
+    "env",
+    "environment",
     "tool",
     "tools",
     "resume",
@@ -463,6 +464,7 @@ mod tests {
             "printer",
             "barely",
             "toolbox",
+            "envoy",
         ] {
             assert!(!reserved(key), "{key}");
         }
@@ -478,6 +480,8 @@ mod tests {
             "path",
             "LANG",
             "lang",
+            "env",
+            "ENVIRONMENT",
             "LC_ALL",
             "lcAll",
             "lc.all",
