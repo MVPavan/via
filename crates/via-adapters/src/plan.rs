@@ -778,11 +778,11 @@ impl AdapterSet {
         Vec::new()
     }
 
-    /// Test builds only: each shared server that ended, oldest first (at
-    /// most 16), as its ID and Host's confirmed exit code: the replay
-    /// harness judges a server launch by them (x.3.2 X3).
-    #[cfg(feature = "test-failpoints")]
-    pub fn ended_servers(&self) -> Vec<(String, Option<i32>)> {
+    /// Each shared server that ended, oldest first (at most 16), as its
+    /// ID, its launch ordinal (1 for the registry's first launch) and
+    /// Host's confirmed exit code: the replay harness judges a server
+    /// launch by them (x.3.2 X3). A pure in-memory snapshot.
+    pub fn ended_servers(&self) -> Vec<(String, u64, Option<i32>)> {
         self.codex.as_ref().map_or_else(Vec::new, |codex| {
             codex
                 .servers()
@@ -791,6 +791,7 @@ impl AdapterSet {
                 .map(|end| {
                     (
                         end.server.as_str().to_owned(),
+                        end.launch,
                         end.exit.and_then(|exit| exit.code),
                     )
                 })

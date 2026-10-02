@@ -30,7 +30,7 @@
 //! before it has fired.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -43,11 +43,11 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, watch};
 use via_adapters::{
     AdapterError, Admitted, CancellationToken, ClassHint, Cleanup, CloseMode, Deadline, DenialKind,
-    DriverFailure, DriverHealth, InheritPlan, Observation, Prepared, RouteError, RoutePlan,
-    SessionCx, SessionDriver, SessionRef, SessionSpec, StartRejected, SteerDelivery, SteerError,
-    SteerInput, SteerToken, StopCause, StopOrder, StopReason, TaskTracker, TurnActivity, TurnCx,
-    TurnEnd, TurnNumber, TurnSpec, VendorTerminal, VendorTerminalStatus, VendorTurnId,
-    observation_channel,
+    DriverFailure, DriverHealth, InheritPlan, Observation, ObservationItem, Prepared, RouteError,
+    RoutePlan, SessionCx, SessionDriver, SessionRef, SessionSpec, StartRejected, SteerDelivery,
+    SteerError, SteerInput, SteerToken, StopCause, StopOrder, StopReason, TaskTracker,
+    TurnActivity, TurnCx, TurnEnd, TurnNumber, TurnSpec, VendorTerminal, VendorTerminalStatus,
+    VendorTurnId, observation_channel,
 };
 use via_store::{ResumeRecord, SessionId, SpawnRecord, SubmissionRecord, TerminalRecord};
 
@@ -504,19 +504,12 @@ impl<'a> Run<'a> {
         Ok(turn)
     }
 
-    /// Runs one planned turn beside its side actions and collects its
-    /// outcome.
-    async fn run_turn(
-        &self,
-        index: usize,
-        turn: &Value,
-        session: &Session,
-    ) -> Result<TurnOutcome, String> {
+    /// The turn's spec, from its `params` and its session's vendor
+    /// options.
+    fn turn_spec(&self, turn: &Value) -> Result<TurnSpec, String> {
         let params = &turn["params"];
-        let prompt = params["prompt"].as_str().unwrap_or_default().to_owned();
-        let number = self.commit(session, &prompt).await?;
-        let spec = TurnSpec {
-            prompt,
+        Ok(TurnSpec {
+            prompt: params["prompt"].as_str().unwrap_or_default().to_owned(),
             effort: params["effort"].as_str().map(str::to_owned),
             bound: optional(&params["bound"])?,
             output_schema: if params["output_schema"].is_null() {
@@ -530,7 +523,19 @@ impl<'a> Run<'a> {
             max_steps: params["max_steps"].as_u64(),
             vendor: optional(&self.expect["sessions"][session_of(turn)]["vendor_options"])?
                 .unwrap_or_default(),
-        };
+        })
+    }
+
+    /// Runs one planned turn beside its side actions and collects its
+    /// outcome.
+    async fn run_turn(
+        &self,
+        index: usize,
+        turn: &Value,
+        session: &Session,
+    ) -> Result<TurnOutcome, String> {
+        let spec = self.turn_spec(turn)?;
+        let number = self.commit(session, &spec.prompt).await?;
         let wall = turn["deadlines"]["wall_ms"]
             .as_u64()
             .map_or(WALL, Duration::from_millis);
@@ -562,6 +567,8 @@ impl<'a> Run<'a> {
             .ok_or("the session's channel is in use")?;
         let seen = &self.seen[index];
         let (ended_tx, ended) = watch::channel(false);
+        let tools = RefCell::new(Tools::default());
+        let settled = std::cell::Cell::new(None);
         let drain = async {
             let waiting = self.consumer_hold();
             tokio::pin!(waiting);
@@ -574,9 +581,13 @@ impl<'a> Run<'a> {
                         result = &mut waiting, if released.is_none() => released = Some(result),
                         Some(admitted) = receiver.recv(),
                             if released.is_some() && !self.knobs.stall_consumer => {
+                            tools.borrow_mut().track(&admitted.item);
                             self.observe(&admitted.item.observation, seen, &observed);
                         }
-                        end = &mut running => break end,
+                        end = &mut running => {
+                            settled.set(Some(tokio::time::Instant::now()));
+                            break end;
+                        }
                     }
                 }
             };
@@ -586,6 +597,7 @@ impl<'a> Run<'a> {
                 waiting.await
             };
             while let Ok(admitted) = receiver.try_recv() {
+                tools.borrow_mut().track(&admitted.item);
                 self.observe(&admitted.item.observation, seen, &observed);
             }
             ended_tx.send_replace(true);
@@ -606,6 +618,13 @@ impl<'a> Run<'a> {
         outcome.steer = steer;
         outcome.gates = gates?;
         outcome.stop_facts = stop_facts(turn, &end);
+        // Only a stopped turn on a server route settles its cleanup apart
+        // from its end (C1 P7); elsewhere the field is null.
+        if session.plan.server_key.is_some() && !turn["stop"].is_null() {
+            outcome.cleanup_settles = settled.get().map(|settled| {
+                settles(&end, &tools.borrow(), settled, (now + wall, tool_grace)).to_owned()
+            });
+        }
         if self.pure.launches()? > launches_before && session.plan.server_key.is_none() {
             self.judge_launch(launches_before + 1, session, number, &end)?;
         }
@@ -1037,37 +1056,52 @@ impl<'a> Run<'a> {
     }
 
     /// Closes every server-route session whose case states no close, so
-    /// its lease goes and the idle server retires (x.3.2 X3); then ends the
-    /// sessions' owned work and the adapter set's. Test builds then judge
-    /// each server launch by the replay's own verdict
-    /// ([`Self::judge_servers`]).
+    /// its lease goes and the idle server retires (x.3.2 X3), checking each
+    /// report; judges each server launch by the replay's own verdict
+    /// ([`Self::judge_servers`]); then ends the sessions' owned work and
+    /// the adapter set's.
     async fn shutdown(self) -> Result<(), String> {
+        let mut unclean = Vec::new();
         for (label, session) in &self.sessions {
             if session.plan.server_key.is_some()
                 && self.expect["sessions"][label]["close"].is_null()
             {
+                let failed = matches!(
+                    *session.driver.health().borrow(),
+                    DriverHealth::Failed { .. }
+                );
                 let deadline = Deadline::at(tokio::time::Instant::now() + CLOSE_DEADLINE);
-                let _report = session.driver.close(CloseMode::Graceful, deadline).await;
+                let report = session.driver.close(CloseMode::Graceful, deadline).await;
+                // An unstated close of a healthy session must leave nothing
+                // uncertain; a case whose close does states it, and a failed
+                // session's uncertainty is its health's (x.3.2 X3 fix r1,
+                // ruling 21).
+                if !failed && report.cleanup != Cleanup::Quiescent {
+                    unclean.push(format!(
+                        "session {label}'s shutdown close: cleanup {}",
+                        cleanup_name(report.cleanup)
+                    ));
+                }
             }
         }
-        #[cfg(feature = "test-failpoints")]
         let judged = self.judge_servers().await;
-        #[cfg(not(feature = "test-failpoints"))]
-        let judged = Ok(());
         self.cancel.cancel();
         self.tracker.close();
         let _ = tokio::time::timeout(FIXTURE_WAIT, self.tracker.wait()).await;
         let deadline = Deadline::at(tokio::time::Instant::now() + FIXTURE_WAIT);
         self.pure.set.shutdown(deadline, &[]).await;
-        judged
+        judged?;
+        match unclean.first() {
+            Some(first) => Err(first.clone()),
+            None => Ok(()),
+        }
     }
 
-    /// Test builds: once every server launch ended (its last lease went,
-    /// so its idle retirement closed stdin), each is judged by the replay's
-    /// own verdict ([`replay_exit`]) from its exit and its `stderr.log`, in
-    /// launch order (x.3.2 X3). Other builds have no seam for a server's
-    /// exit and judge none.
-    #[cfg(feature = "test-failpoints")]
+    /// Once every server launch ended (its last lease went, so its idle
+    /// retirement closed stdin), each is judged by the replay's own verdict
+    /// ([`replay_exit`]) from its exit and its `stderr.log`: launch `n`
+    /// (the registry's launch ordinal) against lifetime `n` (x.3.2 X3; fix
+    /// r1, ruling 21 and minor 24), in every build.
     async fn judge_servers(&self) -> Result<(), String> {
         let launches = usize::try_from(self.pure.launches()?).map_err(|e| e.to_string())?;
         let shared = self
@@ -1091,8 +1125,8 @@ impl<'a> Run<'a> {
             }
             tokio::time::sleep(POLL).await;
         };
-        for (index, (server, code)) in ended.iter().enumerate() {
-            let launch = index + 1;
+        for (server, launch, code) in &ended {
+            let index = usize::try_from(launch.saturating_sub(1)).map_err(|e| e.to_string())?;
             let fixture = match self.replay.get("lifetimes").and_then(Value::as_array) {
                 Some(lifetimes) => lifetimes
                     .get(index)
@@ -1114,7 +1148,66 @@ impl<'a> Run<'a> {
     }
 }
 
-/// One turn's future in the run: its result and the launches after it.
+/// When a turn's reported tools last all ended, from the observations'
+/// decode stamps.
+#[derive(Default)]
+struct Tools {
+    open: BTreeSet<String>,
+    all_ended: Option<tokio::time::Instant>,
+}
+
+impl Tools {
+    fn track(&mut self, item: &ObservationItem) {
+        let Observation::Progress(marks) = &item.observation else {
+            return;
+        };
+        for (id, _) in &marks.tools_started {
+            self.open.insert(id.clone());
+        }
+        let mut ended = false;
+        for id in &marks.tools_ended {
+            ended |= self.open.remove(id);
+        }
+        if ended && self.open.is_empty() {
+            self.all_ended = Some(item.at);
+        }
+    }
+}
+
+/// How close two instants must be to count as one moment.
+const SETTLE_SLACK: Duration = Duration::from_millis(100);
+
+/// `cleanup_settles` (the checker's module docs): `at_terminal` when the
+/// turn settled with its terminal, `when_tools_end` when its last tool
+/// ended first, `at_p7_bound` when it settled at `min(ack + tool_grace,
+/// wall)` (the acknowledgement is the interrupted terminal), else a name
+/// the checker refuses.
+fn settles(
+    end: &TurnEnd,
+    tools: &Tools,
+    settled: tokio::time::Instant,
+    (wall, tool_grace): (tokio::time::Instant, Duration),
+) -> &'static str {
+    let near = |at: tokio::time::Instant| {
+        settled.saturating_duration_since(at) <= SETTLE_SLACK
+            && at.saturating_duration_since(settled) <= SETTLE_SLACK
+    };
+    let ack = end.terminal.as_ref().map(|terminal| terminal.at);
+    if ack.is_some_and(near) {
+        return "at_terminal";
+    }
+    if tools.all_ended.is_some_and(near) {
+        return "when_tools_end";
+    }
+    let bound = ack.map_or(wall, |ack| wall.min(ack + tool_grace));
+    if near(bound) {
+        "at_p7_bound"
+    } else {
+        "unclassified"
+    }
+}
+
+/// One turn's future in the run: its result and the launches after it./// One turn's future in the run: its result and the launches after it.
 type Running<'a> = Pin<Box<dyn Future<Output = Result<(Ran, u64), String>> + 'a>>;
 
 /// Polls every future to completion, in place; outputs in input order.

@@ -183,6 +183,8 @@ impl From<LaunchFailure> for LaunchError {
 pub struct ServerEnd {
     /// The server.
     pub server: ServerId,
+    /// Its launch ordinal in this registry: 1 for the first launch.
+    pub launch: u64,
     /// Host's confirmed exit, if any.
     pub exit: Option<ExitReport>,
 }
@@ -243,6 +245,8 @@ enum TaskKind {
 
 struct Instance {
     entry: Entry,
+    /// The launch ordinal ([`ServerEnd::launch`]).
+    launch: u64,
     work: Option<Work>,
     /// Tasks spawned and not yet collected (at most two, R4-11).
     tasks: u8,
@@ -270,16 +274,19 @@ struct Registry {
     failed: usize,
     /// Late callbacks for removed or replaced instances.
     stale: u64,
+    /// Launches so far: the last launch's ordinal.
+    launches: u64,
     ended: VecDeque<ServerEnd>,
 }
 
 impl Registry {
-    fn record_end(&mut self, server: &ServerId, exit: Option<ExitReport>) {
+    fn record_end(&mut self, server: &ServerId, launch: u64, exit: Option<ExitReport>) {
         if self.ended.len() == ENDED_KEPT {
             self.ended.pop_front();
         }
         self.ended.push_back(ServerEnd {
             server: server.clone(),
+            launch,
             exit,
         });
     }
@@ -602,9 +609,12 @@ impl Servers {
                 return Ok(pin);
             }
             registry.by_key.insert(key, server.clone());
+            registry.launches = registry.launches.saturating_add(1);
+            let launch = registry.launches;
             registry.servers.insert(
                 server.clone(),
                 Instance {
+                    launch,
                     entry: Entry::Launching {
                         key,
                         holders: 1,
@@ -858,7 +868,7 @@ impl Servers {
                     registry.unmap(&key, server);
                 }
                 if let ConnectionEnd::Failed(loss) = end {
-                    registry.record_end(server, loss.exit);
+                    registry.record_end(server, instance.launch, loss.exit);
                 }
             }
             (TaskKind::Connection, _) => {
@@ -889,7 +899,7 @@ impl Servers {
             }
             (TaskKind::Retire, Some(Outcome::Retired(exit)))
             | (TaskKind::Stop, Some(Outcome::Stopped(exit))) => {
-                registry.record_end(server, exit);
+                registry.record_end(server, instance.launch, exit);
             }
             // A retirement or stop that panicked, or an outcome of another
             // kind: the group stays a live Host control, which final

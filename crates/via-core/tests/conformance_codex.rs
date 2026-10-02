@@ -1091,6 +1091,50 @@ fn conformance_codex_replay_exit_is_judged() {
     assert!(checked > 0, "no replay lifetimes checked");
 }
 
+/// Ruling 21 (x.3.2 X3 fix r1): every build judges each server launch by
+/// the replay's own verdict. A replay still waiting for a line VIA never
+/// sends ends failed at VIA's stdin close, and the case fails with it even
+/// though every turn's outcome holds.
+#[test]
+fn conformance_codex_server_verdict_is_judged() {
+    let name = "conformance_codex_server_verdict_is_judged";
+    let (mut replay, expect) = plain(name).unwrap();
+    let all = steps(&mut replay).unwrap();
+    let last = all.len() - 1;
+    all.insert(last, json!({"expect": {"line": {"method": "never/sent"}}}));
+    let verdict = variant(name, &replay, &expect).unwrap_err();
+    assert!(verdict.contains("server launch 1"), "{verdict}");
+}
+
+/// Ruling 21 (x.3.2 X3 fix r1): the harness's own close of a session whose
+/// case states none is checked. A healthy session left uncertain by its
+/// interrupted turn (a tool still open) fails the case unless its close is
+/// stated.
+#[test]
+fn conformance_codex_shutdown_close_is_checked() {
+    let name = "conformance_codex_shutdown_close_is_checked";
+    let mut replay = replay_of("c3_interrupt_uncertain").unwrap();
+    let mut expect = expect_of("c3_interrupt_uncertain").unwrap();
+    replay["source"] = json!(format!("{name}: a variant of c3_interrupt_uncertain"));
+    expect["source"] = replay["source"].clone();
+    let turn = &mut turn_mut(&mut expect, 0)["expect"];
+    let fields = turn.as_object_mut().unwrap();
+    fields.remove("cleanup_settles");
+    fields.remove("stop_facts");
+    let why = "the interrupt's acknowledgement and the P7 window are x.3.2 X4's";
+    turn["unasserted"].as_array_mut().unwrap().extend([
+        json!({"field": "cleanup_settles", "why": why}),
+        json!({"field": "stop_facts", "why": why}),
+    ]);
+    variant(name, &replay, &expect).unwrap();
+    expect["sessions"]["main"]["close"] = Value::Null;
+    let unchecked = variant(name, &replay, &expect).unwrap_err();
+    assert!(
+        unchecked.contains("shutdown close: cleanup uncertain"),
+        "{unchecked}"
+    );
+}
+
 // Packet §8's named tests (`test(/^codex_/)` selects them), x.3.2 X3's
 // part. Each runs variants of a recorded fixture, built here and written
 // only to a scratch directory, never under the fixtures.
@@ -2143,4 +2187,47 @@ fn codex_interrupt_written() {
         };
         check_variant(name, &replay, &expect, knobs).unwrap();
     }
+}
+
+/// Ruling 21 (x.3.2 X3 fix r1): the harness measures `cleanup_settles`.
+/// A variant of `c3_interrupt_uncertain` whose command ends before the
+/// interrupted terminal: no tool is open at the acknowledgement, so the
+/// turn settles at its terminal, quiescent, under X4's P7 too.
+#[test]
+fn codex_interrupt_settles_at_terminal() {
+    let name = "codex_interrupt_settles_at_terminal";
+    let mut replay = replay_of("c3_interrupt_uncertain").unwrap();
+    let mut expect = expect_of("c3_interrupt_uncertain").unwrap();
+    replay["source"] = json!(format!("{name}: a variant of c3_interrupt_uncertain"));
+    expect["source"] = replay["source"].clone();
+    let started = step_with(&replay, "\"type\":\"commandExecution\"").unwrap();
+    let ended = line_of(&replay, started)
+        .unwrap()
+        .replace(
+            "\"method\":\"item/started\"",
+            "\"method\":\"item/completed\"",
+        )
+        .replace("\"status\":\"inProgress\"", "\"status\":\"failed\"")
+        .replace("\"exitCode\":null", "\"exitCode\":130")
+        .replace("\"startedAtMs\"", "\"completedAtMs\"");
+    let acknowledged = step_with(&replay, "\"result\":{}}").unwrap();
+    steps(&mut replay)
+        .unwrap()
+        .insert(acknowledged + 1, json!({"emit": {"line": ended}}));
+    let exec = "exec-019a0000-0000-7000-8000-000000400004";
+    let turn = &mut turn_mut(&mut expect, 0)["expect"];
+    turn["cleanup"] = json!("quiescent");
+    turn["cleanup_settles"] = json!("at_terminal");
+    turn.as_object_mut().unwrap().remove("stop_facts");
+    turn["unasserted"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"field": "stop_facts",
+        "why": "the interrupt's acknowledgement facts are x.3.2 X4's"}));
+    turn["observations_include"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"kind": "progress", "tools_ended": [exec]}));
+    expect["sessions"]["main"]["close"]["cleanup"] = json!("quiescent");
+    variant(name, &replay, &expect).unwrap();
 }
