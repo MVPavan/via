@@ -208,6 +208,7 @@ Store transaction, then returns the receipt; dispatch follows.
 ```
 
 Errors: `invalid_params` (incl. `vendor_option_conflict`), `unknown_model`,
+`unsupported_verb` (`data.verb:"spawn"`, with `harness` and `route`),
 `harness_unavailable`, `missing_capability`, `bound_unsupported`,
 `admission_refused`, `store_error`. When the daemon already retains its
 bound of unresolved turns (runtime contract §8), `spawn` is refused
@@ -244,8 +245,20 @@ CLI: `via steer <session> --text "…" [--expect-turn N] [--op-key K]`
 Result: `{turn, delivery}`; `delivery` is `injected` or the declared partial
 semantics (§4.1). Steer on an idle session is `no_active_turn`; a steer
 that arrives while the turn is `submitting` waits for acceptance then
-applies, or fails `no_active_turn` if acceptance fails. Errors:
-`unsupported_verb`, `no_active_turn`, `turn_mismatch`, `invalid_handle`.
+applies, or fails `no_active_turn` if acceptance fails. A successful reply
+follows the commit of its `steer.delivered` event; if that commit fails, the
+reply is `store_error`, never success. A steer reaches
+only the turn it selected: if that turn ends before the input is admitted,
+the steer is `turn_mismatch` or `no_active_turn` and no successor receives
+it (C2 `SteerInput.turn`). Errors: `unsupported_verb` (`data.verb:"steer"`),
+`no_active_turn`, `turn_mismatch`, `invalid_handle`, `admission_refused`
+(`data.reason:"control_lane_full"`: the session's control lane is full and
+nothing was written, C2 §2), and `steer_failed`: `data.reason` `not_steerable`
+with `data.delivery:"none"` (the vendor refused steer in the turn's current
+phase), `not_delivered` with `data.delivery:"uncertain"` (writing the input
+began but the vendor never acknowledged it), or `not_recorded` with
+`data.delivery` as a success would give it (the vendor took the input, but
+VIA could not record its `steer.delivered` event).
 
 ### 3.5 `cancel` — stop the active or a queued turn
 
@@ -370,8 +383,13 @@ session lacks a proof of absence, else `quiescent` (T4-A23).
 
 `adapter_version` is the session's recorded adapter version, advanced by a
 compatible resume (C2 §1 rule 2). `vendor_version` and `version_status` are
-from the described turn's instance handshake (`vendor_version` null before
-any handshake; C2 §5). `inherit` holds the effective state (`on`, `off` or
+from the handshake of the instance running the described turn (on a
+persistent connection, that connection's handshake, even when read for an
+earlier turn): recorded when the turn is accepted, and in its terminal
+envelope, which also carries it for a turn rejected after the handshake.
+Before either, or when no handshake was read, `vendor_version` is null and
+`version_status` is `untested` (C2 §5).
+`inherit` holds the effective state (`on`, `off` or
 `unknown`) of each inherited-configuration category, frozen at spawn
 (C2 §6.2). `warnings` repeats the standing warnings:
 `vendor_version_untested` while the described turn's `version_status` is
@@ -502,12 +520,12 @@ only after positive cleanup, joins and durable records, otherwise 4
 | `model` | string | session (P5) | `resolved` reported in the envelope |
 | `allow_untested` | bool, default false | session | immutable after spawn; accepted and stored for compatibility; no effect (P13): every version is supported unless refused for breakage, which it cannot waive |
 | `effort` | `low`…`max` or vendor value | per turn | unknown values refused; a vendor value that can be judged only against a discovered catalog is refused at submission, `failed(submit_failed)` with `failure.data.field:"effort"`; no vendor turn starts (C2 §5) |
-| `instructions` | `{text}` or `{path}` | session | native or `prepended_to_prompt` (partial) |
+| `instructions` | `{text}` or `{path}` | session | native or `prepended_to_prompt` (partial). `path` is absolute: a regular UTF-8 file of at most 1 MiB that the daemon's user can read, copied when the request is received and frozen as its text; a file that changes during the copy is `invalid_params` naming `instructions`. The path is not stored; the retry identity uses the copy's SHA-256 and length |
 | `prompt` | string | per turn | exactly one of `prompt` and `prompt_file` |
 | `prompt_file` | absolute path | per turn | a regular UTF-8 file of at most 16 MiB that the daemon's user can read; the daemon copies it when the request is received and refuses it (`invalid_params`, kind2 `prompt_file`) if it changes during the copy. The path is not stored; the retry identity uses the copy's SHA-256 and length |
 | `bound` | `{mode: read_only\|workspace_write\|full, extra_write_dirs: [path], network: bool}` | per turn (D5): inherited unless set on `resume` | always never-ask (D3); combinations per §4.2 |
 | `cwd` | absolute path | session | must exist |
-| `output_schema` | JSON Schema object or `null` | per turn | `null` clears an inherited schema; validated by VIA (Q2, draft 2020-12, size ≤ 256 KiB) |
+| `output_schema` | JSON Schema object or `null` | per turn | `null` clears an inherited schema; validated by VIA (Q2, draft 2020-12 only: a `$schema` in any schema position (not inside instance values such as `const`, `enum`, `default` or `examples`) that names another dialect is `invalid_params`; size ≤ 256 KiB; at most 2,048 subschemas and 64 patterns, counted over every schema position whether referenced or not, each pattern within the regular-expression limit, else `invalid_params`; runtime §8). Patterns keep ECMA-262's meaning of class escapes, `.` and `\b`; one VIA cannot compile is `invalid_params` |
 | `deadlines` | `{wall_ms?, idle_ms?}` | per turn | Core-owned absolute deadlines (D7); defaults 3 600 000 / 600 000. `idle_ms` is a positive integer; `0` is `invalid_params`. Like `wall_ms`, it is frozen at receipt and inherited (P5) |
 | `max_steps` | integer or `null` | per turn | steps inside one turn (D5) |
 | `require` | `[verb]` / `[verb:partial]` | spawn | preflight |
@@ -589,15 +607,23 @@ is then `null` and `structured_output_file` gives `{path, bytes}`. VIA writes th
 before committing the envelope or revision that names it, and never changes
 a written file. The write is part of the commit that names the file: if it
 fails, that commit fails and resolves under §7.6's Store rule, and a partial
-file is never named. Validation (Q2) runs on the
-value before it is stored, and a spilled value counts as present for
-`structured_output_missing`. `denied_actions` and `auto_declined_requests`
+file is never named. Validation (Q2) runs on every present value before it
+is stored, whatever the turn's state, including a late revision (§7.6); a
+spilled value counts as present for `structured_output_missing`. Validation
+work is bounded (runtime §8): a value it cannot finish is treated as invalid
+with `reason: validation_limit` (otherwise `reason: invalid`). An invalid value
+is kept. On a turn that would complete it fails the turn
+`structured_output_invalid` (`failure.data.reason`); on a turn that ends
+otherwise the state and failure class stand, and the envelope carries the
+warning `structured_output_invalid` (`data.reason`). `denied_actions` and
+`auto_declined_requests`
 hold the first 1,000 entries each; `denied_actions_total` and
 `auto_declined_requests_total` count all. An entry's strings are cut at a
 character boundary to keep it within 256 bytes; its `event_seq` cites the
 event with the full payload. At receipt a `bound` over 32 KiB, a `vendor`
-over 16 KiB, a `cwd` over 4 KiB, or a `model` or `effort` over 1 KiB encoded is
-`invalid_params` naming the member; `bound.effective` is at most 32 KiB
+over 16 KiB, a `cwd` over 4 KiB, or a `model` (as requested or as resolved)
+or `effort` over 1 KiB encoded is `invalid_params` naming the member;
+`bound.effective` is at most 32 KiB
 encoded too. `failure.message` is at most 2 KiB,
 cut at a character boundary. `warnings` holds at most one entry per code
 (the closed list below), each with VIA's own `message` of at most 1 KiB and
@@ -635,7 +661,7 @@ below 1 MiB, and a conformance test assembles that maximum.
 
 | Field | Meaning |
 |---|---|
-| `state`, `failure` | §7.2; `failure` = `{class, message, vendor_code?, retryable, data?}` (§8.2). `data` is present only for an adapter-side `submit_failed` and has `reason` (`"invalid_param"` or `"handshake_refused"`) and, with `invalid_param`, `field` (the C1 parameter name). It is bounded to 256 bytes, never holds vendor text, and follows §8.1's `data.field` naming. `vendor_code` keeps only vendor codes |
+| `state`, `failure` | §7.2; `failure` = `{class, message, vendor_code?, retryable, data?}` (§8.2). `data` is present only for an adapter-side `submit_failed`, where it has `reason` (`"invalid_param"` or `"handshake_refused"`) and, with `invalid_param`, `field` (the C1 parameter name), and for `structured_output_invalid`, where it has `reason` (`"invalid"` or `"validation_limit"`, §5). It is bounded to 256 bytes, never holds vendor text, and follows §8.1's `data.field` naming. `vendor_code` keeps only vendor codes |
 | `stop_reason` | `end_turn`, `max_steps`, `budget`, `refusal`, `interrupted`, `deadline`, `error`, `other`; vendor word in `vendor_stop_reason` |
 | `cancel` | outcome and cleanup certainty (§3.5, §7.4) |
 | `bound` | requested, effective, and whether it was inherited |
@@ -650,7 +676,7 @@ below 1 MiB, and a conformance test assembles that maximum.
 | `cost` | `usd`; `scope` as above; `provenance` `reported`, `estimated`, `unavailable`. Scopes are per field: Claude P5 showed per-result tokens with rising cumulative `total_cost_usd` |
 | `exit` | `{code, signal}` for per-session processes that ended in this turn; `null` for server routes |
 | `evidence` | the turn's evidence folder and the vendor's transcript hint, as `logs` returns them (§3.12) |
-| `warnings` | `instructions_partial`, `vendor_version_untested`, `usage_interval_unverified`, `structured_output_missing`, `cancel_cleanup_uncertain`, `predecessor_cleanup_uncertain`, `config_switch_unverified`, `deprecated`. `config_switch_unverified` is one warning per receipt or envelope listing every category whose requested inheritance setting VIA could not apply or could not verify, `data.categories: [{category, requested, effective}]` (C2 §6.2) |
+| `warnings` | `instructions_partial`, `vendor_version_untested`, `usage_interval_unverified`, `structured_output_missing`, `structured_output_invalid`, `cancel_cleanup_uncertain`, `predecessor_cleanup_uncertain`, `config_switch_unverified`, `deprecated`. `config_switch_unverified` is one warning per receipt or envelope listing every category whose requested inheritance setting VIA could not apply or could not verify, `data.categories: [{category, requested, effective}]` (C2 §6.2) |
 | `leftovers` | processes the coding agent started that were observed after its own process exited; the agent's responsibility, never signalled by VIA (C2 §4.2). `{scope: "turn"\|"server", processes: [{pid, comm, started_at}], total, incomplete, best_effort: true}` or `null`. `processes`: at most 16, oldest first (start ticks, then pid). `total`: the matches found, exact when not `incomplete`, a lower bound otherwise; `total` greater than the list length is the only truncation signal. `started_at`: RFC 3339 UTC, boot time (`/proc/stat` `btime`, whole seconds) plus the process's start ticks, so accurate to about 1 s and emitted with second precision. `comm`: the kernel's process name (at most 15 bytes), lossy UTF-8; it is process-controlled, so a process can name itself anything. Always present; non-null only on per-turn-route envelopes and on `server_lost` envelopes (one shared snapshot per lost server); `null` elsewhere, including recovered turns. Produced best effort by Host's report-only scan for VIA's process marker (C2 §4.2, runtime §5) wherever these destinations apply; `null` when no scan ran. `incomplete: true` means the scan could not settle the full set (C2 §4.2); entries mean "observed during the scan", not "alive" |
 
 ## 6. Durable events
@@ -848,15 +874,16 @@ queued cancellation whose retry commits stays `cancelled`.
 | -32009 | `harness_unavailable` | binary missing, handshake check refused (C2 §5, `data.reason: handshake_refused`), server failed to start, or the stored adapter version is not compatible (`data.reason: adapter_version`) |
 | -32010 | `unknown_model` | |
 | -32011 | `queue_full` | |
-| -32012 | `admission_refused` | resource/aggregate result cannot fit a bounded page or response; Store read lane full; disk free space below the floor |
+| -32012 | `admission_refused` | resource/aggregate result cannot fit a bounded page or response; Store read lane full; disk free space below the floor; a session's control lane full for `steer` (`data.reason:"control_lane_full"`, §3.4) |
 | -32013 | `no_active_turn` | |
 | -32014 | `turn_mismatch` | |
 | -32015 | `turn_not_finished` | |
 | -32016 | `wait_timeout` | |
 | -32017 | `daemon_stopping` | |
-| -32018 | `store_error` | Before a receipt: `data.commit_outcome: not_committed\|unknown` and `retry: same_key_only` when uncertain. Before a receipt, `commit_outcome: not_committed` is also used for a request that was never enqueued because the writer's queue was full. A disconnected writer is `unknown` and latches. For an affected receipted nonterminal turn that cannot be resolved durably: `data.session`, `data.turn`, last-known `data.durable_state`, `data.terminal_persisted:false`. No terminal envelope is invented. |
+| -32018 | `store_error` | Before a receipt: `data.commit_outcome: not_committed\|unknown` and `retry: same_key_only` when uncertain. Before a receipt, `commit_outcome: not_committed` is also used for a request that was never enqueued because the writer's queue was full. A disconnected writer is `unknown` and latches. `commit_outcome` describes receipts only: a steer whose `steer.delivered` commit fails is `store_error` without data (the input was delivered; §3.4). For an affected receipted nonterminal turn that cannot be resolved durably: `data.session`, `data.turn`, last-known `data.durable_state`, `data.terminal_persisted:false`. No terminal envelope is invented. |
 | -32019 | `history_pruned` | `data.earliest_seq` |
 | -32020 | `request_too_large` | request line over 1 MiB; `data.max_bytes`; the connection closes |
+| -32021 | `steer_failed` | steer input refused, not acknowledged, or delivered without a record (§3.4): `data.reason` `not_steerable` (nothing was applied, `data.delivery:"none"`), `not_delivered` (writing began, in part or whole, without the vendor's acknowledgement; whether it was applied is unknown, `data.delivery:"uncertain"`) or `not_recorded` (the vendor took it, `data.delivery` as on success, but no `steer.delivered` event records it) |
 
 A receipt whose commit outcome is `unknown` latches Store failure (runtime
 §7). Restart recovery settles it; a keyed retry after restart learns its

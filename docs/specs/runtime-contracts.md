@@ -753,17 +753,18 @@ refused at open with a named error telling the user to recreate the dev Store
 untouched. `user_version = 0` is initialized only in a database file that
 open itself creates (exclusively); an existing file at version 0, empty or
 not, gets the same refusal before any writable open. Migrations as described
-above start with the first released schema. Schema v7 (v1 was the unreleased
+above start with the first released schema. Schema v8 (v1 was the unreleased
 single-turn format; v2 lacked the unproven-anchor index; v3 lacked frozen
 per-turn values; v4 lacked the close admission state and cancel cause; v5
 lacked step rows, event columns, list order and evidence folders; v6 lacked
-the session's persisted adapter version) is exactly:
+the session's persisted adapter version; v7 lacked the turn's recorded
+instance version) is exactly:
 
 | Table | Implemented columns and constraints |
 |---|---|
-| `sessions` | PK `id`; `handle_hash` BLOB, 32 bytes checked; `receipt` (the spawn receipt: route plan, capabilities, turn 1's `effective`); `params` (session-scope values: harness, model, cwd, `allow_untested`); `state` `active`, `idle` or `closed`; `next_seq` ≥ 2; `admission` `open` or `closing`; `close_result`; `created_ms`, `updated_ms` (the `at` of the transaction's highest-`seq` event: `last_active_at`); `harness`; `label`; `ord INTEGER NOT NULL UNIQUE` (its index serves `list`); nullable `vendor_session_id` and `transcript_hint`; nullable `adapter_version` (the session's persisted adapter version, C2 §1 rule 2: written in the `turn.started` commit of each started turn; null until a turn starts; while the column is null, readers use the receipt's version) |
+| `sessions` | PK `id`; `handle_hash` BLOB, 32 bytes checked; `receipt` (the spawn receipt: route plan, capabilities, turn 1's `effective`); `params` (the frozen session values: harness, model, cwd, `allow_untested`, instructions text, session vendor options, and the requested inherited-configuration settings with their effective states, C2 §6.2; the receipt keeps the public fields); `state` `active`, `idle` or `closed`; `next_seq` ≥ 2; `admission` `open` or `closing`; `close_result`; `created_ms`, `updated_ms` (the `at` of the transaction's highest-`seq` event: `last_active_at`); `harness`; `label`; `ord INTEGER NOT NULL UNIQUE` (its index serves `list`); nullable `vendor_session_id` and `transcript_hint`; nullable `adapter_version` (the session's persisted adapter version, C2 §1 rule 2: written in the `turn.started` commit of each started turn; null until a turn starts; while the column is null, readers use the receipt's version) |
 | `session_ord` | one row, `only INTEGER PRIMARY KEY CHECK(only = 1)`, `next INTEGER NOT NULL`, created as `(1, 0)`; a spawn's receipt transaction increments `next` and stores it as `sessions.ord`; never decremented or reused |
-| `turns` | PK (`session_id`, `number`), FK session; `prompt` or `prompt_blob`, exactly one non-null; `effective` (the turn's frozen per-turn values, the receipt's `effective`, written once at receipt commit); `state` `queued`, `running`, `completed`, `failed`, `cancelled` or `unknown`; `queued_at`, `queued_seq`; `submitted_at`; `accepted_at`, `correlation` (vendor acceptance evidence, tagged `v:<vendor turn id>` or `t:<acceptance token>`); `envelope` (terminal); `cancel_cause` `cancel` or `close`; `ended_seq`, non-null exactly when the state is terminal; `evidence_dir` (relative to the state directory, written with `turn.submitted`). Partial unique index `turns_one_running` on `session_id` where `state='running'` |
+| `turns` | PK (`session_id`, `number`), FK session; `prompt` or `prompt_blob`, exactly one non-null; `effective` (the turn's frozen per-turn values: the receipt's public `effective` plus internal frozen values such as the requested bound and vendor options; written once at receipt commit); `state` `queued`, `running`, `completed`, `failed`, `cancelled` or `unknown`; `queued_at`, `queued_seq`; `submitted_at`; `accepted_at`, `correlation` (vendor acceptance evidence, tagged `v:<vendor turn id>` or `t:<acceptance token>`); `envelope` (terminal); `cancel_cause` `cancel` or `close`; `ended_seq`, non-null exactly when the state is terminal; `evidence_dir` (relative to the state directory, written with `turn.submitted`); nullable `vendor_version` and `version_status` `tested` or `untested` (the accepted turn's instance handshake, written in the `turn.started` commit, C2 `turn.accepted`; status reads them until the envelope exists). Partial unique index `turns_one_running` on `session_id` where `state='running'` |
 | `steps` | PK (`session_id`, `turn`, `step`), `WITHOUT ROWID`; FK (`session_id`, `turn`) to turns; `step` ≥ 1; `started_ms`, `ended_ms`; nullable `tokens` ≥ 0; one row per completed model step |
 | `spawn_keys` | PK `key`; FK `session_id`; `identity_len`, `identity_sha256` (32 bytes checked: the exact retry identity's length and SHA-256, never its bytes); `receipt`; kept for the session's lifetime |
 | `operations` | PK (`session_id`, `op_key`); `verb` `resume` or `close`; `identity_len`, `identity_sha256`; `turn` with FK (`session_id`, `turn`); `result`; a `resume` row is committed in the same transaction as the queued turn |
@@ -774,16 +775,14 @@ Target columns and tables not implemented yet, with their owners:
 
 | Target | Owner |
 |---|---|
-| `sessions`: `closing` admission state, record version and timestamps, frozen instructions/cwd/`allow_untested` | `via-jm4.7.7` (cancel/close, Task 3) |
-| `sessions`: vendor session ID and transcript hint | columns `via-jm4.7.8`, values the first vendor adapter slice |
-| `turns`: separate phase, cancel/cleanup columns (today inside `envelope`), revision of an `unknown` result by late evidence | `via-jm4.7.7` |
-| `turns`: event-bound columns (today the envelope's `events` range) | `via-jm4.7.8` |
-| `operations`: phase intent/done and other keyed verbs (`steer`, `close`) | `via-jm4.7.7` |
-| `events`: separate `turn` and `type` columns (late and time stay in the event JSON); no raw reference columns | `via-jm4.7.8` |
-| `steps`: `(session_id, turn, step, started_ms, ended_ms, tokens)`, primary key `(session_id, turn, step)`, one row per completed model step, the last in the terminal transaction; a session's rows go by one keyed delete | `via-jm4.7.8` |
-| `turns.evidence_dir` (runtime §4) | `via-jm4.7.8` |
-| `session_ord`: a one-row counter that allocates `sessions.ord` and never goes back | `via-jm4.7.8` |
-| `processes` as a general table: vendor rows, exit and cleanup evidence beyond `anchors.vendor_pid` and `absence_time` | `via-jm4.7.7` |
+| `sessions`: record version | none yet (deferred) |
+| `sessions`: vendor session ID and transcript hint values (the columns exist) | the first vendor adapter slice |
+| `turns`: separate phase and cancel/cleanup columns (today inside `envelope`) | none yet (deferred) |
+| `turns`: revision of an `unknown` result by late evidence (C1 §7.6) | `via-jm4.35` |
+| `turns`: event-bound columns (today the envelope's `events` range) | none yet (deferred) |
+| `operations`: phase intent/done | none yet (deferred) |
+| `operations`: keyed `steer` (C1 §3) | `via-jm4.36` |
+| `processes` as a general table: vendor rows, exit and cleanup evidence beyond `anchors.vendor_pid` and `absence_time` | none yet (deferred) |
 | `metadata` table: retention low-water marks (the schema version is `user_version`) | none in S1, which prunes nothing |
 
 There is no separate queue table: ordered queued turns without submission
@@ -1134,6 +1133,7 @@ payload limits count encoded bytes plus separately bounded decoded structure.
 | C1 line | 1 MiB including LF | `request_too_large`, then close |
 | Global C1 input buffers | 32 MiB by construction (32 sockets × 1 MiB) | 5 s partial-request deadline prevents monopolization |
 | JSON structure | depth 64, 65,536 nodes per document | Bound during streaming parse, before constructing a `Value`; named invalid params/protocol error |
+| Structured-output validation (C1 Q2) | Compile: 2,048 subschemas, 64 regular expressions, each program at most 1 MiB, counted over every schema position, referenced or not (reference targets included); one 1,000,000-unit budget at depth 512 shared by the schema's own metaschema check, the pattern bytes (one unit per 2 bytes before conversion, two per converted byte) and the metaschema's format checks (one unit per 2 bytes); an extended-mode pattern needing more than 32 control-escape rewrites is refused. Validation of one value: 1,000,000 work units (one per subschema evaluation, plus charges in proportion to the values compared, the names scanned, the string lengths counted and the pattern subjects matched), active evaluation depth 512, nested evaluations included, on a blocking thread with a 16 MiB stack, never an executor thread | Over a compile limit: `invalid_params` naming `output_schema` at receipt. Budget spent: the value counts as invalid with `reason: validation_limit` (C1 §5). A value at C1's JSON maximum against an ordinary schema needs about 381,000 units; the recorded worst cases finish within about 60 ms and 40 MB, including building the value |
 | Vendor stdout message | 1 MiB including LF | Fail connection; the first 64 KiB saved as evidence |
 | Pipe read buffer | 64 KiB per pipe | Reuse; never grows |
 | Route message staging | 1,024 messages and 4 MiB/connection | Fail connection if saturated; health/control bypass |

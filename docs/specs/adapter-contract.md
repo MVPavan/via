@@ -36,11 +36,11 @@ turns vendor traffic into **observations**. Core alone commits states,
 | Operation | Direction | Input → output |
 |---|---|---|
 | `describe` (`plan`) | call | canonical params → route plan (C1 §3.1); pure, no I/O |
-| `check_turn` | call | session, turn params → ok or refusal; pure (AD2) |
+| `check_turn` | call | session, turn params → the turn's effective bound, or a refusal; pure (AD2) |
 | `open_session` | call | session, session spec, session context → session driver; logical, no vendor I/O (AD3) |
 | `recover` | call | session, anchor recovery facts, session context → `Resumed` / `Unknown` / `Dead` |
 | `run_turn` | driver call | turn spec, turn context → one `TurnEnd` (retained vendor terminal, instance version, leftovers, evidence or typed failure); acceptance is an observation (AD3, AD4) |
-| `steer` | driver call | text, expected vendor turn → delivery |
+| `steer` | driver call | canonical turn, Core's steer token, text, expected vendor turn → delivery |
 | interrupt | stop order | S1 stop order on `TurnCx.stop` → the turn's end result carries the cancel outcome and cleanup (AD4) |
 | `close` | driver call | mode, deadline → close report |
 | observations | stream | the durable C1 event payloads an adapter reports (`action.denied`, `vendor.request_declined`, `steer.delivered`, `warning`), `progress` and `final_text`, plus acceptance, identity and the other internal observations of §4 |
@@ -152,7 +152,7 @@ impl AdapterSet {
     /// Pure; no I/O. Resolves the harness string, the route and the model.
     pub fn plan(&self, req: &DescribeRequest) -> Result<RoutePlan, Refusal>;
     /// Pure: validates a resume turn's values against the frozen route.
-    pub fn check_turn(&self, session: &SessionRef, turn: &TurnParams) -> Result<(), Refusal>;
+    pub fn check_turn(&self, session: &SessionRef, turn: &TurnParams) -> Result<TurnCheck, Refusal>;
     pub fn models(&self, harness: Option<&str>) -> Vec<ModelEntry>;              // bundled + discovered
     /// Logical: no vendor I/O. Attaches the session observation channel in `cx`.
     pub fn open_session(&self, session: &SessionRef, spec: SessionSpec, cx: SessionCx) -> SessionDriver;
@@ -191,15 +191,17 @@ pub struct VendorIdentity {
 | Type | Fields |
 |---|---|
 | `DescribeRequest` | `harness: Option<String>` (passed unchanged; Core never compares it), `model: Option<String>`, `effort: Option<String>` (spawn's turn-1 effort, validated purely by `plan`, §5; C1 `describe` passes none, so its public parameters are unchanged), `bound: Bound`, `require: Vec<VerbReq>`, `vendor: VendorOptions`, `cwd: Option<PathBuf>`, `allow_untested: bool` (stored, no effect, §5) |
-| `RoutePlan` | `harness: &'static str` (canonical), `route: RouteId`, `model: {requested, resolved}`, `adapter_version`, `vendor_version: Option<String>` (last seen for the binary identity, or null), `version_status: Tested\|Untested\|Refused`, `capabilities: Capabilities` (C1 §4.1), `effective_bound`, `server_key: Option<ServerKey>`, `refusals`, `warnings` |
+| `RoutePlan` | `harness: &'static str` (canonical), `route: RouteId`, `model: {requested, resolved}`, `inherit: {requested, effective}` (§6.2), `adapter_version`, `vendor_version: Option<String>` (last seen for the binary identity, or null), `version_status: Tested\|Untested\|Refused`, `capabilities: Capabilities` (C1 §4.1), `effective_bound`, `server_key: Option<ServerKey>`, `refusals`, `warnings` |
 | `Capabilities` | the C1 §4.1 DTO with `Support { Native, Partial { semantics }, Unsupported { reason } }` |
 | `ModelEntry` | a model with `source: bundled \| discovered` |
 | `SessionRef` | `harness`, `route`, `adapter_version`, handed back on resume, reopen and recovery; unknown or incompatible → `harness_unavailable` (rule 2) |
-| `SessionSpec` | `session_id`, `model`, `instructions: Option<Instructions>`, `initial_bound`, `cwd`, `vendor`, inherited-configuration settings (§6.2), `confirmed_vendor_session_id: Option<VendorSessionId>`, immutable `allow_untested`; a confirmed historical ID is not verification of this connection |
+| `SessionSpec` | `session_id`, `model`, `instructions: Option<Instructions>`, `initial_bound`, `cwd`, `vendor`, `inherit: {requested, effective}` (the inherited-configuration settings and states frozen at spawn, §6.2), `confirmed_vendor_session_id: Option<VendorSessionId>`, immutable `allow_untested`; a confirmed historical ID is not verification of this connection |
 | `TurnParams` | a resume turn's per-turn values (effort, bound, `output_schema`, `max_steps`, vendor keys), the input to `check_turn` |
+| `TurnCheck` | `effective_bound`: the turn's bound as the route will apply it, like `RoutePlan.effective_bound` |
 | `TurnSpec` | `turn: TurnNo`, `prompt`, `effort`, `bound`, `output_schema`, `max_steps`, `vendor`, `wall_deadline: Instant`, `idle_deadline: IdleDeadline` |
-| `SteerInput` | `text`, `expected_vendor_turn: Option<VendorTurnId>` |
+| `SteerInput` | `turn: TurnNo`, `token: SteerToken`, `text`, `expected_vendor_turn: Option<VendorTurnId>`; the driver checks `turn` atomically with control-lane admission (§2): `TurnMismatch` unless it is running that turn, `NoActiveTurn` when it runs none, so input never reaches a successor. Core mints `token`, unique within the session, before the call; the driver emits the `steer.delivered` observation carrying it before it returns `Ok`, and Core answers the C1 steer only after committing that observation (C1 §3.4) |
 | `SteerDelivery` | `Injected`, `Partial(Cow<'static, str>)` (real adapters pass static text; the fake passes its profile's text) |
+| `SteerError` | `Unsupported`, `NoActiveTurn`, `TurnMismatch`, `OverCapacity` (the control lane is full; nothing was written), `NotSteerable` (the vendor refused steer in the active turn's current phase; nothing was applied), `NotDelivered` (writing the input began, in part or whole, but the vendor never acknowledged it; whether it was applied is unknown), `NotRecorded { delivery }` (the vendor took the input whole, as `delivery` says, but its `steer.delivered` observation could not be emitted, for example on a full observation queue or a forced stop, so no event records it). A steer never outlives its turn: when the turn ends by any path, a forced stop or cutoff included, the driver answers every steer still waiting on it. Core maps them under C1 §3.4 |
 | `CloseReport` | `vendor_closed: bool`, `process_exit: Option<Exit>`, `cleanup: Cleanup`, `warnings`, `leftovers: Option<LeftoverReport>` (only when this close stopped the server, §4.2) |
 | `VendorTerminal` | `at`, `status: Completed\|Interrupted\|Failed`, `stop_reason: StopReason`, `vendor_stop_reason`, `vendor_code?`, `class_hint: Option<ClassHint>`, `detail?`, `structured_output?`, `steps?`, `usage?` (turn aggregate), `cost?`, `vendor?` (bounded 16 KiB) |
 | `InstanceReport` | `vendor_version: Option<String>`, `version_status: Tested\|Untested` |
@@ -396,7 +398,7 @@ terminal is not an observation: it is retained in the turn's `TurnEnd`
 | Observation | Fields | Core commit |
 |---|---|---|
 | `session.vendor_identity_confirmed` | `vendor_session_id`, `connection_id`, `vendor_version?` (when the confirming handshake carries it; the `session.opened`/`session.reopened` field, else null), `transcript?` (committed with the ID into the session record, never an event field; fills `evidence.transcript`) | if current generation, atomically persist ID/verified and `session.opened` or `session.reopened` once, before same-message acceptance |
-| `turn.accepted` | `correlation: AcceptanceToken`, `vendor_turn_id` | phase `accepted`, `turn.started` once |
+| `turn.accepted` | `correlation: AcceptanceToken`, `vendor_turn_id`, `instance: Option<InstanceReport>` (the handshake of the instance running the turn, read before acceptance; on a persistent connection, the connection's handshake, even when it was read for an earlier turn; `None` only where no handshake is read, as for the fake without a handshake profile) | phase `accepted`, `turn.started` once, with `instance` in the turn record (C1 §3.7) |
 | `turn.late_terminal` | `VendorTerminal` | only for a turn whose `TurnEnd` carried no terminal: revises `unknown` under C1 §7.6 |
 | `session.vendor_closed` | `reason` | no direct commit, and no session state change (C1 §7.1: a vendor-process idle shutdown leaves the session `idle`). A running turn is disposed from its `TurnEnd`; between turns the driver's next `prepare` reconnects, and the next turn reopens the vendor session (`session.reopened`) or fails its resume (`SessionGone`, `resume_mismatch`) when the vendor session no longer exists |
 | `resume.mismatch` | `requested`, `returned` | no direct turn commit: the turn is disposed from its `TurnEnd`, where `Err(ResumeMismatch)` gives `failed(resume_mismatch)`. When the turn's terminal was retained before the mismatch, the turn keeps its result, and the driver's `ResumeMismatch` health failure ends the connection (§2 identity) |
@@ -603,7 +605,7 @@ default.
   after the executable changes on disk. A new server key follows only for new
   connections.
 
-The fake has no handshake and never refuses: it reports
+The fake without a handshake profile never refuses: it reports
 `vendor_version: null` and `version_status: untested` with the warning "the
 fake agent reports no version".
 
@@ -697,7 +699,10 @@ for any reason (the request cannot be applied, the switch is unverified, or
 no switch is applied and the vendor default is unverified), the spawn
 receipt and every turn envelope carry one warning `config_switch_unverified`
 with `data.categories: [{category, requested, effective}]`. The effective
-states are part of the frozen session parameters (visible in status). VIA
+states and the requested settings are both frozen session parameters:
+status shows the effective states, and `open_session` receives both
+(`SessionSpec.inherit`), so a reopened session's launch recipe applies the
+settings requested at its spawn, whatever the configuration says now. VIA
 never claims a suppression or an inheritance it has not verified. Switches in
 effect enter the route's launch recipe and server key. Per-harness
 categories are in the vendor packets.
