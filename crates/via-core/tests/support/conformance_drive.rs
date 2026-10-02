@@ -1,373 +1,409 @@
-//! The shared `drive()` harness of the adapter conformance cases (adapters
-//! design §6 step 6): the harness-neutral **pure half**. It installs the
-//! replaying fake as the harness's configured binary, runs the case's pure
-//! operations (`describe`, each `plan_checks` entry, each session's spawn
-//! plan) and reports them in the checker's [`Outcome`] vocabulary, with the
-//! launch log and the files those operations changed. A harness's own
-//! `drive()` continues from [`Pure`] with the driver half (sessions opened,
-//! turns run); a case whose every session's spawn plan refuses ends here
-//! ([`Pure::refused_case`]).
+//! The shared `drive()` harness's pure half (x.3.2 plan, C1 and X1): the
+//! steps of a conformance case that start nothing, over the real
+//! [`AdapterSet`] of one vendor harness.
 //!
-//! Include it beside `conformance_expect.rs`, at the test crate's root:
-//! `#[path = "support/conformance_drive.rs"] mod conformance_drive;`.
+//! The harness binary is the replaying fake: `via-fake-agent` linked as
+//! `<case dir>/<case>` beside a copy of `<case>.replay.json`, so its launch
+//! log `<case>.launches` (one line per start) lands in the case's own scratch
+//! directory and every case starts with none. The Store and the runtime
+//! directory live in a separate state directory; `pure_writes` scans it
+//! too, beside the fixture and case directories.
+//!
+//! In the checker's order (see `conformance_expect.rs`, `drive()`
+//! obligations), [`Pure::run`]:
+//! 1. answers `describe` with its `params`, and each `plan_checks` entry with
+//!    one plan of the case's harness, the first session's model and cwd,
+//!    and that `require`;
+//! 2. plans each session's spawn at its logical open, in label order, as
+//!    Core's spawn intake does: `plan`, its first refusal, then `check_turn`
+//!    of the turn-1 values; a refusal is that turn's `plan_refusal`, in the
+//!    C2 name of its `RefusalKind`;
+//! 3. records `launches`, the checkpoints and `pure_writes` from the case's
+//!    directories; `pure_writes` spans steps 1 and 2, and a directory that
+//!    cannot be read fails the case.
+//!
+//! The turns that plan run in the run half (the route's driver), which
+//! [`Pure::planned_only`] does not have: it finishes only a case whose
+//! every turn was refused before any receipt.
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::{DirBuilderExt, symlink};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use serde_json::value::RawValue;
-use serde_json::{Value, json};
-use tempfile::TempDir;
+use serde_json::{Map, Value};
 use via_adapters::{
     AdapterConfig, AdapterSet, BootstrapEnv, Bound, DescribeRequest, ParamSizes, Refusal,
-    RefusalKind, RoutePlan, RuntimeConfig, VendorOptions, VerbReq,
+    RefusalKind, RoutePlan, RuntimeConfig, SessionRef, TurnParams, VendorOptions, VerbReq,
 };
 use via_store::Store;
 
 use crate::conformance_expect::{Outcome, TurnOutcome};
 
-/// A workspace binary beside this test executable's `deps` directory; it
-/// is only resolved here, never required to exist by the pure half.
-pub(crate) fn workspace_binary(name: &str) -> PathBuf {
-    let exe = std::env::current_exe().unwrap_or_default();
-    exe.parent()
-        .and_then(Path::parent)
-        .map_or_else(|| PathBuf::from(name), |dir| dir.join(name))
-}
+/// A file's size and modification time: what `pure_writes` compares.
+type Listing = BTreeMap<PathBuf, (u64, SystemTime)>;
 
-/// One case's deployment: the replaying fake installed as `<vendor>/<case>`
-/// beside a copy of its fixture, configured as `harnesses.<harness>.binary`,
-/// and an [`AdapterSet`] over a private Store and runtime directory.
-pub(crate) struct Rig {
-    dir: TempDir,
-    name: String,
-    fixtures: PathBuf,
-    set: AdapterSet,
+/// The pure steps of one case, done, with what the run half needs.
+pub(crate) struct Pure {
+    /// The outcome so far: launches, checkpoints, `pure_writes`,
+    /// `plan_checks`, `describe`, and the turns refused before any receipt.
+    pub(crate) outcome: Outcome,
+    /// Each opened session's spawn plan, by label.
+    pub(crate) plans: BTreeMap<String, RoutePlan>,
+    /// The turns the run half still runs, by index.
+    pub(crate) pending: Vec<usize>,
+    /// The case's scratch directory: the replay copy, the linked fake and
+    /// its launch log.
+    pub(crate) case_dir: tempfile::TempDir,
+    /// The adapter set under test.
+    pub(crate) set: AdapterSet,
+    /// The Store's and the runtime directory's parent.
+    state: tempfile::TempDir,
     _store: Store,
+    name: String,
 }
 
-impl Rig {
-    /// Installs case `name` of `fixtures` for `harness`.
-    pub(crate) fn new(harness: &str, fixtures: &Path, name: &str) -> Result<Self, String> {
-        let fail = |what: &str, error: &dyn std::fmt::Display| format!("rig {what}: {error}");
-        let dir = tempfile::tempdir().map_err(|e| fail("tempdir", &e))?;
-        for part in ["state", "runtime", "vendor"] {
-            fs::DirBuilder::new()
-                .mode(0o700)
-                .create(dir.path().join(part))
-                .map_err(|e| fail(part, &e))?;
-        }
-        let vendor = dir.path().join("vendor");
-        let binary = vendor.join(name);
-        symlink(workspace_binary("via-fake-agent"), &binary).map_err(|e| fail("binary", &e))?;
-        fs::copy(
-            fixtures.join(format!("{name}.replay.json")),
-            vendor.join(format!("{name}.replay.json")),
-        )
-        .map_err(|e| fail("replay", &e))?;
-        let harnesses = RawValue::from_string(json!({harness: {"binary": binary}}).to_string())
-            .map_err(|e| fail("harnesses", &e))?;
-        let config = AdapterConfig::load(
-            BootstrapEnv::from_vars::<_, &str, &str>([]),
-            Some(&harnesses),
-        )
-        .map_err(|e| fail("config", &e))?;
-        let store = Store::open(&dir.path().join("state")).map_err(|e| fail("store", &e))?;
-        let set = AdapterSet::new(
-            config,
-            RuntimeConfig {
-                anchor_binary: workspace_binary("via"),
-                anchor_dir: dir.path().join("runtime"),
-            },
-            store.runtime_resources(),
-        )
-        .map_err(|e| fail("adapters", &e))?;
-        Ok(Self {
-            dir,
-            name: name.to_owned(),
-            fixtures: fixtures.to_path_buf(),
+impl Pure {
+    /// Runs the pure steps of case `name` of `harness` against the fixture
+    /// `replay`.
+    pub(crate) fn run(
+        harness: &str,
+        name: &str,
+        expect: &Value,
+        replay: &Path,
+    ) -> Result<Self, String> {
+        let fixtures = replay
+            .parent()
+            .ok_or("the replay fixture has no directory")?
+            .to_path_buf();
+        let case_dir = tempfile::tempdir().map_err(|e| format!("case dir: {e}"))?;
+        let state = tempfile::tempdir().map_err(|e| format!("state dir: {e}"))?;
+        fs::copy(replay, case_dir.path().join(format!("{name}.replay.json")))
+            .map_err(|e| format!("replay copy: {e}"))?;
+        let binary = case_dir.path().join(name);
+        std::os::unix::fs::symlink(fake_agent()?, &binary)
+            .map_err(|e| format!("fake link: {e}"))?;
+        let (set, store) = adapter_set(harness, &binary, state.path())?;
+        let mut pure = Self {
+            outcome: Outcome::default(),
+            plans: BTreeMap::new(),
+            pending: Vec::new(),
+            case_dir,
             set,
+            state,
             _store: store,
+            name: name.to_owned(),
+        };
+        let before = pure.listing(&fixtures)?;
+        pure.pure_operations(harness, expect)?;
+        pure.outcome.checkpoints.after_pure = pure.launches()?;
+        // The spawn plans are pure too: the interval covers them.
+        pure.open_sessions(harness, expect)?;
+        let after = pure.listing(&fixtures)?;
+        pure.outcome.pure_writes = changed(&before, &after);
+        Ok(pure)
+    }
+
+    /// The outcome of a case none of whose turns runs: each was refused
+    /// before any receipt. Otherwise the turns that run need the run half.
+    pub(crate) fn planned_only(mut self) -> Result<Outcome, String> {
+        if let Some(turn) = self.pending.first() {
+            return Err(format!(
+                "case {}: turn {turn} plans, and running it needs the route's driver",
+                self.name
+            ));
+        }
+        let launches = self.launches()?;
+        for _ in 0..self.outcome.turns.len() {
+            self.outcome.checkpoints.after_turn.push(launches);
+        }
+        self.outcome.launches = launches;
+        Ok(self.outcome)
+    }
+
+    /// `describe`, then each `plan_checks` entry.
+    fn pure_operations(&mut self, harness: &str, expect: &Value) -> Result<(), String> {
+        if let Some(describe) = expect.get("describe") {
+            let before = self.launches()?;
+            let request = describe_request(&describe["params"])?;
+            let plan = self
+                .set
+                .plan(&request)
+                .map_err(|refusal| format!("describe refused: {refusal:?}"))?;
+            let plan = serde_json::to_value(&plan).map_err(|e| e.to_string())?;
+            let launches = self.launches()? - before;
+            self.outcome.describe = Some(serde_json::json!({
+                "capabilities": plan["capabilities"],
+                "vendor_version": plan["vendor_version"],
+                "version_status": plan["version_status"],
+                "launches": launches,
+            }));
+        }
+        let first = expect["sessions"]
+            .as_object()
+            .and_then(|sessions| sessions.values().next())
+            .cloned()
+            .unwrap_or(Value::Null);
+        for check in expect["plan_checks"].as_array().into_iter().flatten() {
+            let entry = check["require"].as_str().ok_or("plan_checks: require")?;
+            let request = DescribeRequest {
+                harness: Some(harness.to_owned()),
+                model: first["model"].as_str().map(str::to_owned),
+                require: vec![VerbReq::parse(entry).ok_or("plan_checks: no verb")?],
+                cwd: first["cwd"].as_str().map(PathBuf::from),
+                ..DescribeRequest::default()
+            };
+            let refusal = match self.set.plan(&request) {
+                Ok(plan) => plan.refusals.first().map(refusal_name),
+                Err(refusal) => Some(refusal_name(&refusal)),
+            };
+            self.outcome.plan_checks.push(refusal);
+        }
+        Ok(())
+    }
+
+    /// Each session's logical open, in label order: its spawn plan, from
+    /// its first turn's values.
+    fn open_sessions(&mut self, harness: &str, expect: &Value) -> Result<(), String> {
+        let turns = expect["turns"].as_array().ok_or("turns")?;
+        self.outcome.turns = vec![TurnOutcome::default(); turns.len()];
+        let mut refused = BTreeMap::new();
+        for (label, session) in expect["sessions"].as_object().into_iter().flatten() {
+            self.outcome.closes.insert(label.clone(), None);
+            let first = turns
+                .iter()
+                .position(|turn| session_of(turn) == label)
+                .ok_or_else(|| format!("session {label} has no turn"))?;
+            match self.plan_spawn(harness, session, &turns[first]["params"])? {
+                Ok(plan) => {
+                    self.plans.insert(label.clone(), plan);
+                }
+                Err(name) => {
+                    self.outcome.turns[first].plan_refusal = Some(name);
+                    refused.insert(label.clone(), first);
+                }
+            }
+            let launches = self.launches()?;
+            self.outcome
+                .checkpoints
+                .after_open
+                .insert(label.clone(), launches);
+        }
+        for (index, turn) in turns.iter().enumerate() {
+            match refused.get(session_of(turn)) {
+                Some(&first) if first == index => {}
+                Some(_) => return Err(format!("turn {index} follows a refused spawn")),
+                None => self.pending.push(index),
+            }
+        }
+        Ok(())
+    }
+
+    /// Core's spawn intake: the plan, its first refusal, then `check_turn`
+    /// of the turn-1 values. `Err` is the refusal's C2 name.
+    fn plan_spawn(
+        &self,
+        harness: &str,
+        session: &Value,
+        params: &Value,
+    ) -> Result<Result<RoutePlan, String>, String> {
+        let bound = optional_bound(&params["bound"])?;
+        let vendor = vendor_options(&session["vendor_options"])?;
+        let sizes = ParamSizes {
+            instructions: session["instructions"].as_str().map_or(0, str::len),
+            output_schema: if params["output_schema"].is_null() {
+                0
+            } else {
+                params["output_schema"].to_string().len()
+            },
+        };
+        let request = DescribeRequest {
+            harness: Some(harness.to_owned()),
+            model: session["model"].as_str().map(str::to_owned),
+            effort: params["effort"].as_str().map(str::to_owned),
+            bound: bound.clone(),
+            vendor: vendor.clone(),
+            cwd: session["cwd"].as_str().map(PathBuf::from),
+            sizes,
+            ..DescribeRequest::default()
+        };
+        let plan = match self.set.plan(&request) {
+            Ok(plan) => plan,
+            Err(refusal) => return Ok(Err(refusal_name(&refusal))),
+        };
+        if let Some(refusal) = plan.refusals.first() {
+            return Ok(Err(refusal_name(refusal)));
+        }
+        let session_ref = SessionRef {
+            harness: plan.harness.to_owned(),
+            route: plan.route.to_owned(),
+            adapter_version: plan.adapter_version.clone(),
+        };
+        let turn = TurnParams {
+            effort: request.effort.clone(),
+            bound,
+            output_schema: !params["output_schema"].is_null(),
+            max_steps: params["max_steps"].as_u64(),
+            vendor,
+            sizes,
+        };
+        Ok(match self.set.check_turn(&session_ref, &turn) {
+            Ok(_) => Ok(plan),
+            Err(refusal) => Err(refusal_name(&refusal)),
         })
     }
 
-    /// The adapters under test.
-    pub(crate) fn set(&self) -> &AdapterSet {
-        &self.set
-    }
-
-    /// The directory the fake runs from, its fixture copy and logs beside it.
-    pub(crate) fn vendor_dir(&self) -> PathBuf {
-        self.dir.path().join("vendor")
-    }
-
-    /// The launch log: one line per start of the replaying fake.
-    pub(crate) fn launch_log(&self) -> PathBuf {
-        self.vendor_dir().join(format!("{}.launches", self.name))
-    }
-
-    /// The launches so far: the launch log's lines. Only an absent log
-    /// is 0; any other read error fails the case.
-    pub(crate) fn launches(&self) -> Result<u64, String> {
-        match fs::read_to_string(self.launch_log()) {
-            Ok(log) => Ok(log.lines().count() as u64),
+    /// The launch log's line count: the fake's starts so far.
+    fn launches(&self) -> Result<u64, String> {
+        let log = self.case_dir.path().join(format!("{}.launches", self.name));
+        match fs::read_to_string(&log) {
+            Ok(text) => Ok(text.lines().count() as u64),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
             Err(error) => Err(format!("launch log: {error}")),
         }
     }
 
-    /// Every file under the case's fixture directory and the rig's own
-    /// directories (vendor, State and runtime), the launch log excepted,
-    /// with its size and modification time; a traversal error fails the
-    /// case.
-    fn snapshot(&self) -> Result<BTreeMap<PathBuf, (u64, Option<SystemTime>)>, String> {
-        let mut files = BTreeMap::new();
-        for root in [
-            self.fixtures.clone(),
-            self.vendor_dir(),
-            self.dir.path().join("state"),
-            self.dir.path().join("runtime"),
-        ] {
-            list(&root, &mut files)?;
+    /// Every file of the fixture, case and state directories (the Store
+    /// and the runtime directory) but the launch log.
+    fn listing(&self, fixtures: &Path) -> Result<Listing, String> {
+        let mut listing = Listing::new();
+        for dir in [fixtures, self.case_dir.path(), self.state.path()] {
+            list(dir, &mut listing).map_err(|e| format!("{}: {e}", dir.display()))?;
         }
-        files.remove(&self.launch_log());
-        Ok(files)
+        listing.remove(&self.case_dir.path().join(format!("{}.launches", self.name)));
+        Ok(listing)
     }
 }
 
-fn list(dir: &Path, into: &mut BTreeMap<PathBuf, (u64, Option<SystemTime>)>) -> Result<(), String> {
-    let fail = |path: &Path, error: std::io::Error| format!("snapshot {}: {error}", path.display());
-    for entry in fs::read_dir(dir).map_err(|e| fail(dir, e))? {
-        let path = entry.map_err(|e| fail(dir, e))?.path();
-        let meta = fs::symlink_metadata(&path).map_err(|e| fail(&path, e))?;
-        if meta.is_dir() {
-            list(&path, into)?;
-        } else {
-            into.insert(path, (meta.len(), meta.modified().ok()));
-        }
-    }
-    Ok(())
-}
-
-/// The files that differ between two snapshots, as display paths.
-fn changed(
-    before: &BTreeMap<PathBuf, (u64, Option<SystemTime>)>,
-    after: &BTreeMap<PathBuf, (u64, Option<SystemTime>)>,
-) -> Vec<String> {
-    let mut paths: Vec<&PathBuf> = before.keys().chain(after.keys()).collect();
-    paths.sort();
-    paths.dedup();
-    paths
-        .into_iter()
-        .filter(|path| before.get(*path) != after.get(*path))
-        .map(|path| path.display().to_string())
-        .collect()
-}
-
-/// A refusal in the checker's vocabulary: the C2 kind, with its field or
-/// verb after a colon where it has one.
-pub(crate) fn refusal_code(refusal: &Refusal) -> String {
+/// The C2 name of a refusal's kind, as `plan_refusal` and `plan_checks`
+/// state it.
+pub(crate) fn refusal_name(refusal: &Refusal) -> String {
     match &refusal.kind {
-        RefusalKind::InvalidParam { field } => format!("invalid_param:{field}"),
-        RefusalKind::MissingCapability { verb } => format!("missing_capability:{}", verb.as_str()),
         RefusalKind::UnsupportedVerb => "unsupported_verb".to_owned(),
         RefusalKind::BoundUnsupported => "bound_unsupported".to_owned(),
         RefusalKind::HarnessUnavailable => "harness_unavailable".to_owned(),
         RefusalKind::UnknownModel => "unknown_model".to_owned(),
         RefusalKind::VersionRefused => "version_refused".to_owned(),
         RefusalKind::VendorOptionConflict => "vendor_option_conflict".to_owned(),
+        RefusalKind::InvalidParam { field } => format!("invalid_param:{field}"),
+        RefusalKind::MissingCapability { verb } => format!("missing_capability:{}", verb.as_str()),
     }
 }
 
-/// A plan's first refusal, the way Core refuses a request on it.
-fn first_refusal(planned: &Result<RoutePlan, Refusal>) -> Option<String> {
-    match planned {
-        Ok(plan) => plan.refusals.first().map(refusal_code),
-        Err(refusal) => Some(refusal_code(refusal)),
-    }
+/// The label of the session a turn runs on; `main` when absent.
+fn session_of(turn: &Value) -> &str {
+    turn["session"].as_str().unwrap_or("main")
 }
 
-/// The encoded sizes Core fills (C2 §2 `ParamSizes`): the instructions'
-/// UTF-8 bytes and the schema's compact JSON bytes.
-pub(crate) fn param_sizes(instructions: &Value, schema: &Value) -> ParamSizes {
-    ParamSizes {
-        instructions: instructions.as_str().map_or(0, str::len),
-        output_schema: if schema.is_null() {
-            0
-        } else {
-            schema.to_string().len()
-        },
-    }
-}
-
-fn parsed<T: serde::de::DeserializeOwned>(value: &Value, what: &str) -> Result<T, String> {
-    serde_json::from_value(value.clone()).map_err(|e| format!("{what}: {e}"))
-}
-
-/// Session `session`'s spawn as `plan` sees it, with turn `turn`'s
-/// parameters (`expect.turns[i].params`).
-pub(crate) fn spawn_request(
-    harness: &str,
-    session: &Value,
-    params: &Value,
-) -> Result<DescribeRequest, String> {
-    let bound: Option<Bound> = parsed(&params["bound"], "params.bound")?;
-    let vendor: VendorOptions = if session["vendor_options"].is_null() {
-        VendorOptions::new()
+/// The built `via-fake-agent`, beside this test's directory.
+fn fake_agent() -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let path = exe
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("no target directory")?
+        .join("via-fake-agent");
+    if path.is_file() {
+        Ok(path)
     } else {
-        parsed(&session["vendor_options"], "vendor_options")?
-    };
-    Ok(DescribeRequest {
-        harness: Some(harness.to_owned()),
-        model: session["model"].as_str().map(str::to_owned),
-        effort: params["effort"].as_str().map(str::to_owned),
-        bound,
-        require: Vec::new(),
-        vendor,
-        cwd: session["cwd"].as_str().map(PathBuf::from),
-        allow_untested: false,
-        sizes: param_sizes(&session["instructions"], &params["output_schema"]),
-    })
+        Err(format!(
+            "missing {}; build the workspace first",
+            path.display()
+        ))
+    }
 }
 
-/// C1 §3.1 `describe` params as `plan` takes them.
+/// An adapter set with `harness` pinned to `binary`, over a fresh Store.
+fn adapter_set(harness: &str, binary: &Path, state: &Path) -> Result<(AdapterSet, Store), String> {
+    for part in ["state", "runtime"] {
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(state.join(part))
+            .map_err(|e| format!("{part}: {e}"))?;
+    }
+    let mut harnesses = Map::new();
+    harnesses.insert(harness.to_owned(), serde_json::json!({ "binary": binary }));
+    let raw = serde_json::value::RawValue::from_string(Value::Object(harnesses).to_string())
+        .map_err(|e| e.to_string())?;
+    let env = BootstrapEnv::from_vars(std::env::var_os("PATH").map(|path| ("PATH", path)));
+    let config = AdapterConfig::load(env, Some(&raw)).map_err(|e| e.to_string())?;
+    let store = Store::open(&state.join("state")).map_err(|e| e.to_string())?;
+    let set = AdapterSet::new(
+        config,
+        RuntimeConfig {
+            anchor_binary: state.join("anchor"),
+            anchor_dir: state.join("runtime"),
+        },
+        store.runtime_resources(),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok((set, store))
+}
+
+/// A `describe` request from C1 §3.1 `params`.
 fn describe_request(params: &Value) -> Result<DescribeRequest, String> {
     let require = params["require"]
         .as_array()
         .into_iter()
         .flatten()
-        .map(|entry| {
-            entry
-                .as_str()
-                .and_then(VerbReq::parse)
-                .ok_or_else(|| format!("describe.params.require: {entry}"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|entry| entry.as_str().and_then(VerbReq::parse))
+        .collect::<Option<Vec<_>>>()
+        .ok_or("describe.params.require: not verbs")?;
     Ok(DescribeRequest {
         harness: params["harness"].as_str().map(str::to_owned),
         model: params["model"].as_str().map(str::to_owned),
-        bound: parsed(&params["bound"], "describe.params.bound")?,
+        bound: optional_bound(&params["bound"])?,
         require,
-        vendor: if params["vendor"].is_null() {
-            VendorOptions::new()
-        } else {
-            parsed(&params["vendor"], "describe.params.vendor")?
-        },
+        vendor: vendor_options(&params["vendor"])?,
         cwd: params["cwd"].as_str().map(PathBuf::from),
         allow_untested: params["allow_untested"].as_bool().unwrap_or(false),
         ..DescribeRequest::default()
     })
 }
 
-/// What the pure half established.
-pub(crate) struct Pure {
-    /// `describe`, `plan_checks`, `pure_writes` and
-    /// `launch_checkpoints.after_pure` filled; the rest default.
-    pub(crate) outcome: Outcome,
-    /// Each session's spawn plan, by label: the plan, or the code of the
-    /// refusal Core would answer the spawn with.
-    pub(crate) spawns: BTreeMap<String, Result<RoutePlan, String>>,
+/// A C1 `bound`, or none when null or absent.
+fn optional_bound(value: &Value) -> Result<Option<Bound>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .map_err(|e| format!("bound: {e}"))
 }
 
-/// Runs the case's pure operations in the checker's order: `describe`,
-/// each `plan_checks` entry (a plan of the case's harness with that
-/// `require`), then each session's spawn plan with its first turn's
-/// parameters. None may launch or write: the launch log and the files
-/// changed are part of the outcome.
-pub(crate) fn pure(rig: &Rig, expect: &Value) -> Result<Pure, String> {
-    let harness = expect["harness"].as_str().ok_or("case.harness")?;
-    let before = rig.snapshot()?;
-    let mut outcome = Outcome::default();
-    if let Some(describe) = expect.get("describe") {
-        let launched = rig.launches()?;
-        let plan = rig
-            .set()
-            .plan(&describe_request(&describe["params"])?)
-            .map_err(|refusal| format!("describe refused: {}", refusal_code(&refusal)))?;
-        outcome.describe = Some(json!({
-            "capabilities": plan.capabilities,
-            "vendor_version": plan.vendor_version,
-            "version_status": plan.version_status,
-            "launches": rig.launches()? - launched,
-        }));
+/// C1 `vendor` options, or none when null or absent.
+fn vendor_options(value: &Value) -> Result<VendorOptions, String> {
+    if value.is_null() {
+        return Ok(VendorOptions::new());
     }
-    for check in expect["plan_checks"].as_array().into_iter().flatten() {
-        let require = check["require"]
-            .as_str()
-            .and_then(VerbReq::parse)
-            .ok_or_else(|| format!("plan_checks.require: {}", check["require"]))?;
-        let request = DescribeRequest {
-            harness: Some(harness.to_owned()),
-            require: vec![require],
-            ..DescribeRequest::default()
-        };
-        outcome
-            .plan_checks
-            .push(first_refusal(&rig.set().plan(&request)));
-    }
-    let mut spawns = BTreeMap::new();
-    let sessions = expect["sessions"].as_object().ok_or("case.sessions")?;
-    for (label, session) in sessions {
-        let first = expect["turns"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .find(|turn| turn["session"].as_str().unwrap_or("main") == label)
-            .ok_or_else(|| format!("session {label} has no turn"))?;
-        let planned = rig
-            .set()
-            .plan(&spawn_request(harness, session, &first["params"])?);
-        let spawn = match first_refusal(&planned) {
-            Some(code) => Err(code),
-            None => planned.map_err(|refusal| refusal_code(&refusal)),
-        };
-        spawns.insert(label.clone(), spawn);
-    }
-    outcome.pure_writes = changed(&before, &rig.snapshot()?);
-    outcome.checkpoints.after_pure = rig.launches()?;
-    Ok(Pure { outcome, spawns })
+    serde_json::from_value(value.clone()).map_err(|e| format!("vendor: {e}"))
 }
 
-impl Pure {
-    /// The whole outcome of a case whose every session's spawn plan
-    /// refused: nothing opens, and each session's one turn is its plan
-    /// refusal. A case with a planned session needs the driver half.
-    pub(crate) fn refused_case(self, rig: &Rig, expect: &Value) -> Result<Outcome, String> {
-        let Self {
-            mut outcome,
-            spawns,
-        } = self;
-        if let Some((label, _)) = spawns.iter().find(|(_, spawn)| spawn.is_ok()) {
-            return Err(format!(
-                "session {label} planned: its turns need the driver half"
-            ));
+/// Adds every file under `dir`, recursively, to `into`.
+fn list(dir: &Path, into: &mut Listing) -> std::io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.is_dir() {
+            list(&path, into)?;
+        } else {
+            into.insert(path, (metadata.len(), metadata.modified()?));
         }
-        for label in spawns.keys() {
-            outcome
-                .checkpoints
-                .after_open
-                .insert(label.clone(), rig.launches()?);
-        }
-        let mut seen = Vec::new();
-        for turn in expect["turns"].as_array().into_iter().flatten() {
-            let label = turn["session"].as_str().unwrap_or("main");
-            if seen.contains(&label) {
-                return Err(format!("session {label}: a refused spawn has one turn"));
-            }
-            seen.push(label);
-            let code = spawns
-                .get(label)
-                .and_then(|spawn| spawn.as_ref().err())
-                .ok_or_else(|| format!("turn of unknown session {label}"))?;
-            outcome.turns.push(TurnOutcome {
-                plan_refusal: Some(code.clone()),
-                ..TurnOutcome::default()
-            });
-            outcome.checkpoints.after_turn.push(rig.launches()?);
-        }
-        outcome.launches = rig.launches()?;
-        Ok(outcome)
     }
+    Ok(())
+}
+
+/// The file names created, changed or removed between two listings.
+fn changed(before: &Listing, after: &Listing) -> Vec<String> {
+    let mut names: Vec<String> = before
+        .iter()
+        .filter(|(path, stamp)| after.get(*path) != Some(stamp))
+        .map(|(path, _)| path)
+        .chain(after.keys().filter(|path| !before.contains_key(*path)))
+        .map(|path| path.display().to_string())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }

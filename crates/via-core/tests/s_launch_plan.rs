@@ -63,19 +63,20 @@ fn s_launch_plan_inherit_per_harness() {
         store.runtime_resources(),
     )
     .unwrap();
-    let describe = |harness: &str| DescribeRequest {
+    let describe = |harness: &str, model: Option<&str>| DescribeRequest {
         harness: Some(harness.to_owned()),
+        model: model.map(str::to_owned),
         ..DescribeRequest::default()
     };
     let od2 = InheritPlan {
         requested: Inherit::OD2_DEFAULT,
         effective: Inherit::OD2_DEFAULT,
     };
+    let inherit = |states: serde_json::Value| serde_json::from_value::<Inherit>(states).unwrap();
     // Claude plans (x.3.2 C1) with its configured request, hooks and MCP
     // servers on; neither has a verified switch to on, so both are
     // `unknown`, as are instruction files (no inventory). Plugins, skills
     // and agents are on by the init inventory.
-    let inherit = |states: serde_json::Value| serde_json::from_value::<Inherit>(states).unwrap();
     let claude = InheritPlan {
         requested: inherit(json!({"hooks":"on","mcp_servers":"on","plugins":"on",
             "skills":"on","agents":"on","instruction_files":"on"})),
@@ -84,17 +85,29 @@ fn s_launch_plan_inherit_per_harness() {
             "skills":"on","agents":"on","instruction_files":"unknown"}),
         ),
     };
-    // Per harness: the plan's inherit, or the refusal. A configured vendor
-    // harness without its adapter still refuses, starting nothing. Each
-    // adapter track flips its own row.
-    let rows: [(&str, Result<InheritPlan, RefusalKind>); 3] = [
-        ("claude", Ok(claude)),
-        ("codex", Err(RefusalKind::HarnessUnavailable)),
-        ("fake", Ok(od2)),
+    // Codex (x.3.2 X1): `harnesses.codex.inherit` sets skills off, and
+    // only its hooks switch is verified (packet §4), so every other
+    // category is effectively `unknown`.
+    let codex = InheritPlan {
+        requested: inherit(
+            json!({"hooks": "off", "mcp_servers": "off", "plugins": "on",
+            "skills": "off", "agents": "on", "instruction_files": "on"}),
+        ),
+        effective: inherit(json!({"hooks": "off", "mcp_servers": "unknown",
+            "plugins": "unknown", "skills": "unknown", "agents": "unknown",
+            "instruction_files": "unknown"})),
+    };
+    // Per harness, with the model the request names: the plan's inherit,
+    // or the refusal. Nothing here runs a binary. Each adapter track flips
+    // its own row; Codex has no bundled catalog, so it plans a named model.
+    let rows: [(&str, Option<&str>, Result<InheritPlan, RefusalKind>); 3] = [
+        ("claude", None, Ok(claude)),
+        ("codex", Some("gpt-6-sol"), Ok(codex)),
+        ("fake", None, Ok(od2)),
     ];
-    for (harness, expected) in rows {
+    for (harness, model, expected) in rows {
         let planned = set
-            .plan(&describe(harness))
+            .plan(&describe(harness, model))
             .map(|plan| plan.inherit)
             .map_err(|refusal| refusal.kind);
         assert_eq!(planned, expected, "{harness}");

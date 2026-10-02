@@ -109,7 +109,7 @@ pub(crate) fn escaped_text_len(text: &str) -> usize {
 
 /// Appends `slice` as the contents of a JSON string, escaped as `serde_json`
 /// writes it.
-fn escape_json(slice: &str, piece: &mut Vec<u8>) {
+pub(crate) fn escape_json(slice: &str, piece: &mut Vec<u8>) {
     let start = piece.len();
     if serde_json::to_writer(&mut *piece, slice).is_ok() {
         // Drop the quotes around the string.

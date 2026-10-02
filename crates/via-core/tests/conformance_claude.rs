@@ -70,9 +70,9 @@ fn fixtures() -> PathBuf {
 /// result at an `await_eof` step). The pure half runs; a case with a
 /// planned session needs the driver half (`via-p98.3.2` C2).
 fn drive(name: &str, expect: &Value) -> Result<Outcome, String> {
-    let rig = conformance_drive::Rig::new("claude", &fixtures(), name)?;
-    let pure = conformance_drive::pure(&rig, expect)?;
-    pure.refused_case(&rig, expect)
+    let replay = fixtures().join(format!("{name}.replay.json"));
+    conformance_drive::Pure::run("claude", name, expect, &replay)?
+        .planned_only()
         .map_err(|why| format!("{why}: the driver half is {ADAPTER_BEAD} C2 (case {name})"))
 }
 
@@ -177,7 +177,10 @@ fn claude_argv_budget_refused_before_launch() {
     expect["turns"][0]["params"]["effort"] = json!("low");
     expect["turns"][0]["params"]["output_schema"] = schema_of(ARG_MAX);
     let planned = drive("c0_bad_effort", &expect).err().unwrap_or_default();
-    assert!(planned.contains("session main planned"), "{planned}");
+    assert!(
+        planned.contains("plans, and running it needs the route's driver"),
+        "{planned}"
+    );
 }
 
 /// Every case, named fixture and vendor record, sorted.

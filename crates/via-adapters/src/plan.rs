@@ -621,7 +621,7 @@ pub(crate) enum Adapter<'a> {
     Fake(&'a Arc<FakeAdapter>),
     /// Claude Code (plans; runs turns from via-p98.3.2's C2).
     Claude(&'a Arc<ClaudeAdapter>),
-    /// Codex (a stub until via-5lr.3.2).
+    /// Codex (`codex-app-server`).
     Codex(&'a Arc<CodexAdapter>),
 }
 
@@ -801,8 +801,10 @@ impl AdapterSet {
                 };
                 return Ok(claude.plan(harness, req, model, self.config.inherit(harness)));
             }
-            // The Codex stub plans nothing yet (via-5lr.3.2).
-            Some(Adapter::Codex(_)) | None => {
+            Some(Adapter::Codex(codex)) => {
+                return codex.plan(harness, req, self.config.inherit(harness));
+            }
+            None => {
                 return Err(unavailable(Some(route)));
             }
         };
@@ -850,8 +852,10 @@ impl AdapterSet {
                     }),
                 };
             }
-            // The Codex stub runs no turn yet (via-5lr.3.2).
-            Some(Adapter::Codex(_)) | None => {
+            Some(Adapter::Codex(_)) => {
+                return CodexAdapter::check_turn(route, &session.adapter_version, turn);
+            }
+            None => {
                 return Err(unavailable(Some(route)));
             }
         };

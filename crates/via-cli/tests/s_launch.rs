@@ -534,30 +534,43 @@ fn marking_script(path: &Path, marker: &Path) -> TestResult {
 }
 
 /// What one vendor harness answers once configured (C2 §7 item 1): its
-/// `describe` refusal kind, `None` once it plans, and its `models` list.
+/// `describe` refusal kind, `None` once it plans, for the model its row
+/// names (or none), and its `models` list.
 struct LaunchRow {
     harness: &'static str,
+    model: Option<&'static str>,
     refused: Option<&'static str>,
     models: Value,
 }
 
-/// The per-harness expectations: Claude plans from its bundled catalog
-/// (x.3.2 C1); a harness without its adapter refuses `describe` with
-/// `harness_unavailable` and lists no model. Each adapter track flips its
-/// own row.
+/// The per-harness expectations. A vendor adapter that does not plan yet
+/// refuses `describe` with `harness_unavailable` and lists no models. Each
+/// adapter track flips its own row: Claude (x.3.2 C1) plans from its
+/// bundled catalog; Codex (x.3.2 X1) plans a named model, and lists none
+/// before discovery, since it has no bundled catalog.
 fn launch_rows() -> [LaunchRow; 3] {
     let row = |harness| LaunchRow {
         harness,
+        model: None,
         refused: Some("harness_unavailable"),
         models: json!([]),
     };
     let bundled = |model| json!({"model":model,"harness":"claude","aliases":[],"source":"bundled"});
-    let claude = LaunchRow {
-        harness: "claude",
-        refused: None,
-        models: json!([bundled("sonnet"), bundled("opus"), bundled("haiku")]),
-    };
-    [claude, row("codex"), row("opencode")]
+    [
+        LaunchRow {
+            harness: "claude",
+            model: None,
+            refused: None,
+            models: json!([bundled("sonnet"), bundled("opus"), bundled("haiku")]),
+        },
+        LaunchRow {
+            harness: "codex",
+            model: Some("gpt-6-sol"),
+            refused: None,
+            models: json!([]),
+        },
+        row("opencode"),
+    ]
 }
 
 /// C2 §7 item 1, design §7 S-LAUNCH acceptance: with `harnesses.claude`
@@ -590,7 +603,11 @@ fn s_launch_describe_starts_nothing() -> TestResult {
         let mut outcomes = Vec::new();
         for row in launch_rows() {
             let harness = row.harness;
-            let described = sandbox.run(&["describe", "--harness", harness, "--json"])?;
+            let mut describe = vec!["describe", "--harness", harness, "--json"];
+            if let Some(model) = row.model {
+                describe.extend(["--model", model]);
+            }
+            let described = sandbox.run(&describe)?;
             // A request error is printed on stderr.
             let planned = if let Some(kind) = row.refused {
                 let reply: Value = serde_json::from_slice(&described.stderr).unwrap_or(Value::Null);

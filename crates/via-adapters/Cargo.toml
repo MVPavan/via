@@ -18,10 +18,12 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rustix = { workspace = true, features = ["fs"] }
-# Ruling Q4: the expected Claude session UUID (SHA-256).
+# The expected Claude session UUID (ruling Q4) and the Codex launch digest.
 sha2 = { workspace = true }
 
 [dev-dependencies]
+# The Codex decline bodies validate against the vendor schemas (x.3.2 X1).
+boon = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt"] }
 
