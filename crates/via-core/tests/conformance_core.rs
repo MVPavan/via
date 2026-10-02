@@ -2442,8 +2442,11 @@ fn core_steer_delivery_commit_failure_is_store_error() {
 fn core_keyed_steer_whose_outcome_was_not_recorded_replays_uncertain() {
     let mut profile = schema_profile();
     profile["capabilities"]["verbs"]["steer"] = json!({"support":"native"});
+    // `ready`: the steer goes out once the turn runs, never racing its
+    // dispatch into `no_active_turn`.
     let steps = [
         accepted(1),
+        gate("ready"),
         json!({"action":"expect_request","expected":{"type":"steer","id":3}}),
         emit(&json!({"type":"steer_delivered","id":3,"vendor_turn_id":vendor_turn(1)})),
         gate("delivered"),
@@ -2470,6 +2473,8 @@ fn core_keyed_steer_whose_outcome_was_not_recorded_replays_uncertain() {
                 engine.steer(params, &raw.to_string()).await
             }
         };
+        daemon.entered("ready").await;
+        daemon.release("ready");
         let first = tokio::time::timeout(Duration::from_secs(20), steer())
             .await
             .expect("the steer is answered");
