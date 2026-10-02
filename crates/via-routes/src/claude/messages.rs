@@ -50,16 +50,15 @@ pub enum Message {
     },
 }
 
-/// `system/init`. Only `session_id` is required to decode: the handshake
-/// check, not the decoder, judges the version, permission mode, tools and
-/// capabilities.
-#[derive(Debug, Deserialize)]
+/// `system/init`. The session and a nonempty version are required to
+/// decode: the handshake check, not the decoder, judges the permission
+/// mode, tools and capabilities.
+#[derive(Debug, Deserialize, PartialEq)]
 pub struct Init {
     /// The vendor session this process runs.
     pub session_id: String,
     /// The complete version string.
-    #[serde(default)]
-    pub claude_code_version: Option<String>,
+    pub claude_code_version: String,
     /// The permission-mode echo.
     #[serde(default, rename = "permissionMode")]
     pub permission_mode: Option<String>,
@@ -292,6 +291,10 @@ pub struct ResultMessage {
     /// Error lines (a pre-init rejection's reason).
     #[serde(default)]
     pub errors: Vec<String>,
+    /// The members VIA does not read, for bounded vendor data (packet §5:
+    /// unknown metadata is preserved).
+    #[serde(skip)]
+    pub extra: Map<String, Value>,
 }
 
 /// `control_request`, flattened.
@@ -361,14 +364,48 @@ struct RawReceipt {
 struct Envelope {
     #[serde(rename = "type")]
     kind: String,
-    #[serde(default)]
-    subtype: Option<String>,
 }
+
+/// A `system` message's subtype: read only for that family (review r1
+/// #10), and only a string names one.
+#[derive(Deserialize)]
+struct SystemEnvelope {
+    #[serde(default)]
+    subtype: Value,
+}
+
+/// The `result` members [`ResultMessage`] reads; the rest are its extra.
+const RESULT_READ: [&str; 15] = [
+    "type",
+    "subtype",
+    "is_error",
+    "session_id",
+    "result",
+    "stop_reason",
+    "terminal_reason",
+    "api_error_status",
+    "num_turns",
+    "total_cost_usd",
+    "usage",
+    "modelUsage",
+    "permission_denials",
+    "structured_output",
+    "errors",
+];
 
 /// Decodes one stream-json line (without its LF).
 pub fn decode(line: &[u8]) -> Result<Message, DecodeError> {
     let envelope: Envelope = serde_json::from_slice(line).map_err(|_| DecodeError::NotTyped)?;
-    let message = match (envelope.kind.as_str(), envelope.subtype.as_deref()) {
+    let subtype = if envelope.kind == "system" {
+        let system: SystemEnvelope = typed(line, "system")?;
+        Some(system.subtype)
+    } else {
+        None
+    };
+    let message = match (
+        envelope.kind.as_str(),
+        subtype.as_ref().and_then(Value::as_str),
+    ) {
         ("system", Some("init")) => Message::Init(Box::new(typed(line, "init")?)),
         ("system", Some("permission_denied")) => {
             Message::PermissionDenied(typed(line, "permission_denied")?)
@@ -381,7 +418,13 @@ pub fn decode(line: &[u8]) -> Result<Message, DecodeError> {
                 session_id: raw.session_id,
             })
         }
-        ("result", _) => Message::Result(Box::new(typed(line, "result")?)),
+        ("result", _) => {
+            let mut result: ResultMessage = typed(line, "result")?;
+            let mut members: Map<String, Value> = typed(line, "result")?;
+            members.retain(|key, _| !RESULT_READ.contains(&key.as_str()));
+            result.extra = members;
+            Message::Result(Box::new(result))
+        }
         ("control_request", _) => {
             let raw: RawControlRequest = typed(line, "control_request")?;
             Message::ControlRequest(ControlRequest {
@@ -446,7 +489,9 @@ fn bounded(message: &Message) -> Result<(), DecodeError> {
     };
     let (ok, what) = match message {
         Message::Init(init) => (
-            short(Some(&init.session_id)) && short(init.claude_code_version.as_deref()),
+            short(Some(&init.session_id))
+                && !init.claude_code_version.is_empty()
+                && short(Some(&init.claude_code_version)),
             "init",
         ),
         Message::PermissionDenied(denied) => (
@@ -574,7 +619,7 @@ mod tests {
         let Message::Init(init) = init else {
             panic!("init: {init:?}")
         };
-        assert_eq!(init.claude_code_version.as_deref(), Some("2.1.285"));
+        assert_eq!(init.claude_code_version, "2.1.285");
         assert_eq!(init.permission_mode.as_deref(), Some("dontAsk"));
 
         let assistant = decoded(&json!({"type":"assistant","session_id":"u","message":{
@@ -705,6 +750,58 @@ mod tests {
                 "{line}"
             );
         }
+    }
+
+    /// Review r1 #10: `subtype` is read only where the family needs it. An
+    /// unknown type's object subtype and an assistant's numeric subtype
+    /// are tolerated; a `system` subtype that is not a string is unknown
+    /// activity.
+    #[test]
+    fn subtype_is_read_by_family() {
+        let notice = decoded(&json!({"type":"notice","subtype":{"x":1}}));
+        assert!(matches!(notice, Message::Unknown { tag } if tag == "notice"));
+        let assistant = decoded(&json!({"type":"assistant","subtype":7,"message":{
+            "content":[{"type":"text","text":"hi"}]}}));
+        assert!(matches!(assistant, Message::Assistant(_)));
+        let user = decoded(&json!({"type":"user","subtype":[1],"message":{"content":"x"}}));
+        assert!(matches!(user, Message::User(_)));
+        let system = decoded(&json!({"type":"system","subtype":{"x":1}}));
+        assert!(matches!(system, Message::Unknown { tag } if tag == "system"));
+    }
+
+    /// Review r1 #7: an init without a nonempty version is malformed.
+    #[test]
+    fn init_needs_a_version() {
+        for version in [json!(null), json!("")] {
+            let line = json!({"type":"system","subtype":"init","session_id":"u",
+                "claude_code_version":version});
+            assert_eq!(
+                decode(line.to_string().as_bytes()).unwrap_err(),
+                DecodeError::Malformed("init")
+            );
+        }
+        let line = json!({"type":"system","subtype":"init","session_id":"u"});
+        assert_eq!(
+            decode(line.to_string().as_bytes()).unwrap_err(),
+            DecodeError::Malformed("init")
+        );
+    }
+
+    /// Review r1 #12: a result's unread members are kept as its extra
+    /// metadata; the members VIA reads are not.
+    #[test]
+    fn result_keeps_unknown_members() {
+        let result = decoded(
+            &json!({"type":"result","subtype":"success","is_error":false,
+            "session_id":"u","result":"ok","new_vendor_stat":3,"duration_ms":9}),
+        );
+        let Message::Result(result) = result else {
+            panic!("result: {result:?}")
+        };
+        assert_eq!(
+            Value::Object(result.extra.clone()),
+            json!({"new_vendor_stat":3,"duration_ms":9})
+        );
     }
 
     /// The encoders write the packet's pinned lines.

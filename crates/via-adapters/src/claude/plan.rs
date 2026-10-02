@@ -153,13 +153,13 @@ impl ClaudeAdapter {
 
     /// The last version an init reported for this binary identity, and a
     /// live cached handshake refusal for `requested`'s recipe (C2 §5).
-    fn version(&self, requested: Inherit) -> (Option<String>, VersionStatus) {
+    fn version(&self, requested: Inherit, schema: bool) -> (Option<String>, VersionStatus) {
         // A binary that cannot be `stat`ed has no identity: nothing seen.
         let Ok(identity) = BinaryIdentity::of(&self.binary) else {
             return (None, VersionStatus::Untested);
         };
         let version = self.instances.last_version(&identity);
-        let recipe = launch::recipe_key(requested);
+        let recipe = launch::recipe_key(requested, schema);
         let status = if self
             .instances
             .refusal(&identity, &recipe, std::time::Instant::now())
@@ -205,7 +205,7 @@ impl ClaudeAdapter {
                 ),
             ));
         }
-        let (vendor_version, version_status) = self.version(requested);
+        let (vendor_version, version_status) = self.version(requested, req.sizes.output_schema > 0);
         if version_status == VersionStatus::Refused {
             let mut refusal = Refusal::new(
                 RefusalKind::VersionRefused,
@@ -319,8 +319,9 @@ fn vendor_refusal(route: &'static str, vendor: &VendorOptions) -> Option<Refusal
 }
 
 /// Normalized prefixes of the flags, settings and environment overrides
-/// the recipe owns (C2 §6.1, packet §4).
-const RESERVED_PREFIXES: [&str; 43] = [
+/// the recipe owns (C2 §6.1, packet §4), the launch environment's names
+/// (`HOME`, `PATH`, `LANG`, `LC_*`) and VIA's canonical parameters.
+const RESERVED_PREFIXES: [&str; 56] = [
     "permission",
     "dangerously",
     "allowdangerously",
@@ -364,6 +365,19 @@ const RESERVED_PREFIXES: [&str; 43] = [
     "anthropic",
     "claudecode",
     "home",
+    "path",
+    "lang",
+    "lc",
+    "instructions",
+    "outputschema",
+    "maxstep",
+    "bound",
+    "prompt",
+    "extrawritedir",
+    "inherit",
+    "harness",
+    "session",
+    "vendor",
 ];
 
 /// Single-letter flags the recipe owns: `-p`, `-r` and `-c`.
@@ -412,6 +426,66 @@ mod tests {
         for key in ["--debug", "temperature", "pp", "x"] {
             assert!(!reserved(key), "{key}");
         }
+    }
+
+    /// Review r1 #11, specified apart from the prefix table: the canonical
+    /// parameters and the launch environment's names are owned, in their
+    /// normalized spellings.
+    #[test]
+    fn owned_names_are_reserved() {
+        for key in [
+            "PATH",
+            "path",
+            "LANG",
+            "lang",
+            "LC_ALL",
+            "HOME",
+            "instructions",
+            "INSTRUCTIONS",
+            "output_schema",
+            "outputSchema",
+            "--output-schema",
+            "max_steps",
+            "maxSteps",
+            "bound",
+            "prompt",
+            "cwd",
+            "extra_write_dirs",
+            "extraWriteDirs",
+            "inherit",
+            "harness",
+            "model",
+            "effort",
+            "session",
+            "session_id",
+            "vendor",
+        ] {
+            assert!(reserved(key), "{key}");
+        }
+    }
+
+    /// Review r1 #8: a handshake refusal cached for the schema recipe does
+    /// not refuse the plain recipe, and the other way round.
+    #[test]
+    fn refusal_cache_keys_on_the_schema_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("claude");
+        std::fs::write(&binary, b"").unwrap();
+        let instances = std::sync::Arc::new(crate::instance::InstanceCache::default());
+        let adapter = ClaudeAdapter::new(
+            binary.clone(),
+            instances.clone(),
+            &crate::config::BootstrapEnv::from_vars::<_, &str, &str>([]),
+        );
+        let requested = Inherit::OD2_DEFAULT;
+        instances.record_refusal(
+            BinaryIdentity::of(&binary).unwrap(),
+            launch::recipe_key(requested, true),
+            crate::instance::Incompatibility::ReadbackDiffers("tools"),
+            std::time::Instant::now(),
+        );
+        assert_eq!(adapter.version(requested, true).1, VersionStatus::Refused);
+        assert_ne!(adapter.version(requested, false).1, VersionStatus::Refused);
     }
 
     /// AD18 and G8: efforts outside the table and values past the argument

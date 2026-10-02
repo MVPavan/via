@@ -37,12 +37,13 @@ use crate::observation::{Acceptance, Identity};
 use crate::plan::VersionStatus;
 use crate::{
     AcceptanceToken, ClassHint, CostReport, Decline, Denial, DenialKind, InstanceReport,
-    Observation, ProgressMarks, StartRejected, StopReason, UsageSample, VendorTerminal,
-    VendorTerminalStatus, final_text_pieces,
+    MAX_OBSERVATION_BYTES, Observation, ProgressMarks, StartRejected, StopReason, UsageSample,
+    VendorTerminal, VendorTerminalStatus, final_text_pieces,
 };
 
-/// The most tool calls, denials and declines whose IDs one launch tracks;
-/// past it, a later denial of an untracked call may be reported twice.
+/// The most IDs each per-launch set tracks: calls (open and completed
+/// together), denials and declines. The first new ID past it is a
+/// protocol failure, never inaccurate correlation (review r1 #4).
 const TRACKED: usize = 4096;
 
 /// The longest `action.denied` target or reason.
@@ -56,6 +57,13 @@ const DETAIL_MAX: usize = 2048;
 
 /// C2 `VendorTerminal.vendor`'s bound.
 const VENDOR_MAX: usize = 16 * 1024;
+
+/// The most unread result members considered for vendor data.
+const EXTRA_MAX: usize = 64;
+
+/// What an encoded payload spends beyond the variable fields counted:
+/// member names, numbers, enums and punctuation.
+const PAYLOAD_OVERHEAD: usize = 1024;
 
 /// What the normalizer must know of its launch.
 #[derive(Clone, Debug)]
@@ -85,24 +93,20 @@ pub(crate) enum End {
     ResumeMismatch,
     /// The handshake check refused this instance (cache it).
     Refused(Incompatibility),
-    /// A protocol contradiction.
+    /// A protocol contradiction, or a count or payload past its bound.
     Protocol(&'static str),
 }
 
 /// A control request the driver must decline at once on the control lane,
-/// then report with [`Normalizer::declined`] once the write completed.
+/// then report with [`Normalizer::declined`] once the whole write
+/// completed; dropped unwritten, it reports and suppresses nothing.
 #[derive(Debug)]
 pub(crate) struct PendingDecline {
     /// The ID the decline echoes.
     pub(crate) request_id: String,
+    /// The call whose denial the written decline suppresses.
+    tool_use_id: Option<String>,
     decline: Decline,
-}
-
-impl PendingDecline {
-    /// The decline was written whole: its `vendor.request_declined`.
-    pub(crate) fn written(self) -> Observation {
-        Observation::RequestDeclined(self.decline)
-    }
 }
 
 /// What one message produced.
@@ -125,35 +129,37 @@ impl Batch {
     }
 }
 
-/// One open tool call: what it acts on, for its denial's target.
-#[derive(Debug)]
-struct OpenTool {
-    target: String,
-}
-
 /// One launch's normalizer.
 #[derive(Debug)]
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "identity, acceptance, the end, the receipt and the abort are independent facts"
+    reason = "identity, acceptance, the end, the receipt and the acknowledgement are independent facts"
 )]
 pub(crate) struct Normalizer {
     launch: LaunchFacts,
     instance: Option<InstanceReport>,
+    /// The first init, which every later init must repeat (review r1 #7).
+    init: Option<Box<Init>>,
     confirmed: bool,
     accepted: bool,
     ended: bool,
-    open: BTreeMap<String, OpenTool>,
+    /// Calls started and not ended, with their targets.
+    open: BTreeMap<String, String>,
+    /// Calls ended, with their targets (review r1 #5): never restarted,
+    /// and a later denial keeps the target. Counted with `open`.
+    done: BTreeMap<String, String>,
     /// Calls whose denial was reported.
     denied: BTreeSet<String>,
-    /// Calls VIA declined: their denials are suppressed.
+    /// Calls whose decline VIA wrote: their denials are suppressed.
     declined: BTreeSet<String>,
     /// The last synthetic error message's code.
     synthetic_error: Option<String>,
     /// The interrupt VIA sent, by request ID.
     interrupt: Option<String>,
+    /// A qualified receipt for it was read before the terminal.
     receipt: bool,
-    interrupted: bool,
+    /// Frozen at the terminal: the receipt and the qualified abort.
+    acknowledged: bool,
     unmatched: u64,
 }
 
@@ -162,16 +168,18 @@ impl Normalizer {
         Self {
             launch,
             instance: None,
+            init: None,
             confirmed: false,
             accepted: false,
             ended: false,
             open: BTreeMap::new(),
+            done: BTreeMap::new(),
             denied: BTreeSet::new(),
             declined: BTreeSet::new(),
             synthetic_error: None,
             interrupt: None,
             receipt: false,
-            interrupted: false,
+            acknowledged: false,
             unmatched: 0,
         }
     }
@@ -196,60 +204,83 @@ impl Normalizer {
         self.interrupt = Some(request_id);
     }
 
-    /// Packet §7: a matching success receipt and the abort terminal after
-    /// VIA's interrupt acknowledge the cancellation.
+    /// Packet §7: a qualified receipt of VIA's interrupt, then the
+    /// `error_during_execution` / `aborted_tools` terminal, acknowledge the
+    /// cancellation. Decided when the terminal is read; nothing later
+    /// changes it.
     pub(crate) fn acknowledged(&self) -> bool {
-        self.receipt && self.interrupted
+        self.acknowledged
+    }
+
+    /// The decline `pending` was written whole: its
+    /// `vendor.request_declined`, and from now its call's denial is
+    /// suppressed (review r1 #9).
+    pub(crate) fn declined(&mut self, pending: PendingDecline) -> Batch {
+        let mut batch = Batch::default();
+        if let Some(id) = &pending.tool_use_id
+            && !track(&mut self.declined, id)
+        {
+            batch.end = Some(End::Protocol("declines past the tracking bound"));
+        }
+        batch
+            .observations
+            .push(Observation::RequestDeclined(pending.decline));
+        batch
     }
 
     /// Normalizes one decoded message.
     pub(crate) fn message(&mut self, message: Message, at: Instant) -> Batch {
         match message {
-            Message::Init(init) => self.init(&init),
+            Message::Init(init) => self.init(init),
             Message::PermissionDenied(denied) => self.permission_denied(&denied),
             Message::Assistant(assistant) => self.assistant(&assistant),
             Message::User(user) => self.user(&user),
             Message::Result(result) => self.result(&result, at),
-            Message::ControlRequest(request) => self.control_request(&request),
+            Message::ControlRequest(request) => Self::control_request(&request),
             Message::ControlResponse(response) => self.control_response(&response),
             // Activity only: the driver moved the turn's clock.
             Message::Unknown { .. } => Batch::default(),
         }
     }
 
-    fn init(&mut self, init: &Init) -> Batch {
+    fn init(&mut self, init: Box<Init>) -> Batch {
         if self.ended {
             return Batch::ended(End::Protocol("an init after the result"));
         }
-        if self.confirmed {
-            return if init.session_id == self.launch.expected_session {
+        if let Some(first) = &self.init {
+            if init.session_id != self.launch.expected_session {
+                return self.mismatch(&init.session_id);
+            }
+            // The first was checked; an identical one adds nothing.
+            return if init == *first {
                 Batch::default()
             } else {
-                self.mismatch(&init.session_id)
+                self.ended = true;
+                Batch::ended(End::Protocol("a contradictory init"))
             };
         }
         let version = init.claude_code_version.clone();
-        let version_status = if version
-            .as_deref()
-            .is_some_and(|version| CHECKED.contains(&version))
-        {
+        let version_status = if CHECKED.contains(&version.as_str()) {
             VersionStatus::Tested
         } else {
             VersionStatus::Untested
         };
         self.instance = Some(InstanceReport {
-            vendor_version: version.clone(),
+            vendor_version: Some(version),
             version_status,
         });
         if init.session_id != self.launch.expected_session {
             return self.mismatch(&init.session_id);
         }
         let mut batch = Batch::default();
-        batch.observations.push(self.confirm());
-        if let Err(cause) = handshake(init, &self.launch) {
+        if !self.confirmed {
+            batch.observations.push(self.confirm());
+        }
+        if let Err(cause) = handshake(&init, &self.launch) {
             batch.end = Some(End::Refused(cause));
             self.ended = true;
         }
+        self.init = Some(init);
         batch
     }
 
@@ -289,48 +320,51 @@ impl Normalizer {
         }
     }
 
+    /// A call's known target, open or completed.
+    fn known_target(&self, tool_use_id: &str) -> Option<String> {
+        self.open
+            .get(tool_use_id)
+            .or_else(|| self.done.get(tool_use_id))
+            .cloned()
+    }
+
     fn permission_denied(&mut self, denied: &PermissionDenied) -> Batch {
         if !self.confirmed {
             return Batch::ended(End::Protocol("a denial before init"));
         }
-        let target = self
-            .open
-            .get(&denied.tool_use_id)
-            .map(|open| open.target.clone());
+        let target = self.known_target(&denied.tool_use_id);
         let reason = match &denied.decision_reason_type {
             Some(kind) => format!("denied by the vendor's permission policy ({kind})"),
             None => "denied by the vendor's permission policy".to_owned(),
         };
         let mut batch = Batch::default();
-        batch.observations.extend(self.denial(
-            &denied.tool_name,
-            &denied.tool_use_id,
-            target,
-            &reason,
-        ));
+        match self.denial(&denied.tool_name, &denied.tool_use_id, target, &reason) {
+            Ok(denial) => batch.observations.extend(denial),
+            Err(why) => batch.end = Some(End::Protocol(why)),
+        }
         batch
     }
 
     /// One `action.denied` for `tool_use_id`, unless it was reported or
-    /// VIA declined it.
+    /// VIA's written decline caused it.
     fn denial(
         &mut self,
         tool: &str,
         tool_use_id: &str,
         target: Option<String>,
         reason: &str,
-    ) -> Option<Observation> {
+    ) -> Result<Option<Observation>, &'static str> {
         if self.declined.contains(tool_use_id) || self.denied.contains(tool_use_id) {
-            return None;
+            return Ok(None);
         }
-        if self.denied.len() < TRACKED {
-            self.denied.insert(tool_use_id.to_owned());
+        if !track(&mut self.denied, tool_use_id) {
+            return Err("denials past the tracking bound");
         }
-        Some(Observation::ActionDenied(Denial {
+        Ok(Some(Observation::ActionDenied(Denial {
             kind: denial_kind(tool),
             target: target.unwrap_or_else(|| cut(tool, TARGET_MAX)),
             reason: cut(reason, TARGET_MAX),
-        }))
+        })))
     }
 
     fn assistant(&mut self, assistant: &AssistantMessage) -> Batch {
@@ -354,24 +388,24 @@ impl Normalizer {
                 }
                 Block::ToolUse { id, name, input } => {
                     marks.model = true;
-                    // A repeated block starts nothing twice.
-                    if !self.open.contains_key(id) {
-                        if self.open.len() < TRACKED {
-                            self.open.insert(
-                                id.clone(),
-                                OpenTool {
-                                    target: target(name, input),
-                                },
-                            );
-                        }
-                        marks.tools_started.push((id.clone(), name.clone()));
+                    // A repeated or completed call starts nothing again.
+                    if self.open.contains_key(id) || self.done.contains_key(id) {
+                        continue;
                     }
+                    if self.open.len() + self.done.len() >= TRACKED {
+                        return Batch::ended(End::Protocol("tool calls past the tracking bound"));
+                    }
+                    self.open.insert(id.clone(), target(name, input));
+                    marks.tools_started.push((id.clone(), name.clone()));
                 }
                 Block::ToolResult { .. } | Block::Other => {}
             }
         }
         let mut batch = Batch::default();
         if marks.model {
+            if progress_len(&marks) > MAX_OBSERVATION_BYTES {
+                return Batch::ended(End::Protocol("a progress mark past 256 KiB"));
+            }
             self.accept(&mut batch.observations);
             batch.observations.push(Observation::Progress(marks));
         }
@@ -386,21 +420,24 @@ impl Normalizer {
         let mut ended = Vec::new();
         for block in blocks {
             if let Block::ToolResult { tool_use_id, .. } = block {
-                if self.open.remove(tool_use_id).is_some() {
+                if let Some(target) = self.open.remove(tool_use_id) {
+                    self.done.insert(tool_use_id.clone(), target);
                     ended.push(tool_use_id.clone());
-                } else {
-                    self.unmatched += 1;
+                } else if !self.done.contains_key(tool_use_id) {
+                    self.unmatched = self.unmatched.saturating_add(1);
                 }
             }
         }
         let mut batch = Batch::default();
         if !ended.is_empty() {
-            batch
-                .observations
-                .push(Observation::Progress(ProgressMarks {
-                    tools_ended: ended,
-                    ..ProgressMarks::default()
-                }));
+            let marks = ProgressMarks {
+                tools_ended: ended,
+                ..ProgressMarks::default()
+            };
+            if progress_len(&marks) > MAX_OBSERVATION_BYTES {
+                return Batch::ended(End::Protocol("a progress mark past 256 KiB"));
+            }
+            batch.observations.push(Observation::Progress(marks));
         }
         batch
     }
@@ -422,14 +459,29 @@ impl Normalizer {
         }
         self.ended = true;
         self.accept(&mut batch.observations);
+        let terminal = match self.terminal(result, at) {
+            Ok(terminal) => terminal,
+            Err(why) => {
+                batch.end = Some(End::Protocol(why));
+                return batch;
+            }
+        };
         for denial in &result.permission_denials {
-            let target = denial_target(denial);
-            batch.observations.extend(self.denial(
+            let target = self
+                .known_target(&denial.tool_use_id)
+                .unwrap_or_else(|| denial_target(denial));
+            match self.denial(
                 &denial.tool_name,
                 &denial.tool_use_id,
                 Some(target),
                 "denied by the vendor's permission policy",
-            ));
+            ) {
+                Ok(denial) => batch.observations.extend(denial),
+                Err(why) => {
+                    batch.end = Some(End::Protocol(why));
+                    return batch;
+                }
+            }
         }
         if !result.is_error
             && let Some(text) = result.result.as_deref()
@@ -438,7 +490,6 @@ impl Normalizer {
                 final_text_pieces(text).map(|piece| Observation::FinalText(piece.to_owned())),
             );
         }
-        let terminal = self.terminal(result, at);
         batch.end = Some(End::Terminal(Box::new(terminal)));
         batch
     }
@@ -462,75 +513,89 @@ impl Normalizer {
         )
     }
 
-    /// Packet §5 terminal mapping: classified on `is_error`,
-    /// `terminal_reason`, `api_error_status` and the synthetic error code,
-    /// never on `subtype` alone.
-    fn terminal(&mut self, result: &ResultMessage, at: Instant) -> VendorTerminal {
-        let aborted = result.terminal_reason.as_deref() == Some("aborted_tools");
+    /// Packet §5 and §7 terminal mapping, on qualified combinations of
+    /// `is_error`, `subtype`, `terminal_reason`, `api_error_status` and
+    /// the synthetic error code (review r1 #6), in this order: success;
+    /// the acknowledged abort; authentication evidence; the max-turns
+    /// pair; any other vendor error. The vendor code is always one the
+    /// vendor sent. The retained payload is bounded (review r1 #3).
+    fn terminal(
+        &mut self,
+        result: &ResultMessage,
+        at: Instant,
+    ) -> Result<VendorTerminal, &'static str> {
+        let reason = result.terminal_reason.as_deref();
+        let code = self
+            .synthetic_error
+            .clone()
+            .or_else(|| result.terminal_reason.clone())
+            .unwrap_or_else(|| result.subtype.clone());
         let (status, stop_reason, class_hint, vendor_code) = if !result.is_error {
             let stop = match result.stop_reason.as_deref() {
                 Some("end_turn") => StopReason::EndTurn,
                 _ => StopReason::Other,
             };
             (VendorTerminalStatus::Completed, stop, None, None)
-        } else if self.interrupt.is_some() && aborted {
-            self.interrupted = true;
+        } else if self.interrupt.is_some()
+            && self.receipt
+            && result.subtype == "error_during_execution"
+            && reason == Some("aborted_tools")
+        {
             (
                 VendorTerminalStatus::Interrupted,
                 StopReason::Interrupted,
                 None,
                 None,
             )
-        } else if result.subtype == "error_max_turns"
-            || result.terminal_reason.as_deref() == Some("max_turns")
+        } else if self.synthetic_error.as_deref() == Some("authentication_failed")
+            || matches!(result.api_error_status, Some(401 | 403))
         {
+            (
+                VendorTerminalStatus::Failed,
+                StopReason::Error,
+                Some(ClassHint::Auth),
+                Some(code),
+            )
+        } else if result.subtype == "error_max_turns" && reason == Some("max_turns") {
             (
                 VendorTerminalStatus::Failed,
                 StopReason::MaxSteps,
                 Some(ClassHint::BudgetExceeded),
-                Some("error_max_turns".to_owned()),
+                Some(result.subtype.clone()),
             )
         } else {
-            let code = self
-                .synthetic_error
-                .clone()
-                .or_else(|| result.terminal_reason.clone())
-                .unwrap_or_else(|| result.subtype.clone());
-            let auth = code == "authentication_failed"
-                || matches!(result.api_error_status, Some(401 | 403));
-            let hint = if auth {
-                ClassHint::Auth
-            } else {
-                ClassHint::VendorError
-            };
             (
                 VendorTerminalStatus::Failed,
                 StopReason::Error,
-                Some(hint),
+                Some(ClassHint::VendorError),
                 Some(code),
             )
         };
-        let detail = result.is_error.then(|| detail(result));
-        VendorTerminal {
+        let terminal = VendorTerminal {
             at,
             status,
             stop_reason,
             vendor_stop_reason: result.stop_reason.clone().unwrap_or_default(),
             vendor_code,
             class_hint,
-            detail,
+            detail: result.is_error.then(|| detail(result)),
             structured_output: result.structured_output.clone(),
             steps: result.num_turns,
-            usage: result.usage.as_ref().map(usage),
+            usage: result.usage.as_ref().map(usage).transpose()?,
             cost: result.total_cost_usd.map(|usd| CostReport {
                 usd,
                 scope: "session_cumulative".to_owned(),
             }),
             vendor: vendor_data(result),
+        };
+        if terminal_len(&terminal) > MAX_OBSERVATION_BYTES {
+            return Err("a terminal payload past 256 KiB");
         }
+        self.acknowledged = terminal.status == VendorTerminalStatus::Interrupted;
+        Ok(terminal)
     }
 
-    fn control_request(&mut self, request: &ControlRequest) -> Batch {
+    fn control_request(request: &ControlRequest) -> Batch {
         let summary = match (request.subtype.as_str(), &request.tool_name) {
             ("can_use_tool", Some(tool)) => cut(
                 &format!("{tool} {}", target(tool, &request.input)),
@@ -538,16 +603,10 @@ impl Normalizer {
             ),
             _ => "an unsupported control request".to_owned(),
         };
-        // Suppress the declined call's denial from now: the vendor waits
-        // for the answer before it reports one.
-        if let Some(id) = &request.tool_use_id
-            && self.declined.len() < TRACKED
-        {
-            self.declined.insert(id.clone());
-        }
         Batch {
             decline: Some(PendingDecline {
                 request_id: request.request_id.clone(),
+                tool_use_id: request.tool_use_id.clone(),
                 decline: Decline {
                     vendor_method: request.subtype.clone(),
                     summary,
@@ -558,25 +617,81 @@ impl Normalizer {
         }
     }
 
+    /// Packet §7: a receipt qualifies when it answers VIA's interrupt with
+    /// `success` and the nested `still_queued` body, read before the
+    /// terminal; after it, a receipt changes nothing.
     fn control_response(&mut self, response: &ControlResponse) -> Batch {
-        if self.interrupt.is_none() || response.request_id != self.interrupt {
-            // Not an answer to VIA's request: no receipt.
-            return Batch::default();
-        }
-        if response.subtype != "success" {
-            return Batch::default();
-        }
-        if response
-            .still_queued
-            .as_ref()
-            .is_some_and(|queued| !queued.is_empty())
+        if self.ended
+            || self.interrupt.is_none()
+            || response.request_id != self.interrupt
+            || response.subtype != "success"
         {
-            // One input per process: queued input is a contradiction.
-            return Batch::ended(End::Protocol("an interrupt receipt with queued input"));
+            return Batch::default();
         }
-        self.receipt = true;
-        Batch::default()
+        match &response.still_queued {
+            // No nested body: not the qualified receipt.
+            None => Batch::default(),
+            Some(queued) if queued.is_empty() => {
+                self.receipt = true;
+                Batch::default()
+            }
+            // One input per process: queued input is a contradiction.
+            Some(_) => Batch::ended(End::Protocol("an interrupt receipt with queued input")),
+        }
     }
+}
+
+/// Inserts `id` into `set` unless the set is full; whether `id` is
+/// tracked.
+fn track(set: &mut BTreeSet<String>, id: &str) -> bool {
+    if set.contains(id) {
+        return true;
+    }
+    if set.len() >= TRACKED {
+        return false;
+    }
+    set.insert(id.to_owned());
+    true
+}
+
+/// `text`'s bytes as a JSON string.
+fn encoded(text: &str) -> usize {
+    serde_json::to_string(text).map_or(usize::MAX, |json| json.len())
+}
+
+/// A progress mark's encoded bytes, its tool IDs and names counted.
+fn progress_len(marks: &ProgressMarks) -> usize {
+    let started = marks
+        .tools_started
+        .iter()
+        .map(|(id, name)| encoded(id).saturating_add(encoded(name)).saturating_add(3));
+    let ended = marks
+        .tools_ended
+        .iter()
+        .map(|id| encoded(id).saturating_add(1));
+    started
+        .chain(ended)
+        .fold(PAYLOAD_OVERHEAD, usize::saturating_add)
+}
+
+/// A terminal's retained encoded bytes: its variable fields, raw JSON
+/// verbatim.
+fn terminal_len(terminal: &VendorTerminal) -> usize {
+    let strings = [
+        Some(terminal.vendor_stop_reason.as_str()),
+        terminal.vendor_code.as_deref(),
+        terminal.detail.as_deref(),
+    ];
+    let raws = [
+        terminal.structured_output.as_deref(),
+        terminal.vendor.as_deref(),
+    ];
+    strings
+        .into_iter()
+        .flatten()
+        .map(encoded)
+        .chain(raws.into_iter().flatten().map(|raw| raw.get().len()))
+        .fold(PAYLOAD_OVERHEAD, usize::saturating_add)
 }
 
 /// Packet §3: what the route relies on, read back from init.
@@ -660,18 +775,29 @@ fn detail(result: &ResultMessage) -> String {
 
 /// Packet §5 usage: all input processed (uncached, cache writes and cache
 /// reads), cached = cache reads; any missing count leaves its sum
-/// unavailable, never zero.
-fn usage(usage: &ResultUsage) -> UsageSample {
+/// unavailable, never zero; a sum past `u64` is a protocol failure
+/// (review r1 #2).
+fn usage(usage: &ResultUsage) -> Result<UsageSample, &'static str> {
+    const PAST: &str = "usage counts past their range";
     let input = match (
         usage.input_tokens,
         usage.cache_creation_input_tokens,
         usage.cache_read_input_tokens,
     ) {
-        (Some(input), Some(created), Some(read)) => Some(input + created + read),
+        (Some(input), Some(created), Some(read)) => Some(
+            input
+                .checked_add(created)
+                .and_then(|sum| sum.checked_add(read))
+                .ok_or(PAST)?,
+        ),
         _ => None,
     };
     let output = usage.output_tokens;
-    UsageSample {
+    let total = match input.zip(output) {
+        Some((input, output)) => Some(input.checked_add(output).ok_or(PAST)?),
+        None => None,
+    };
+    Ok(UsageSample {
         key: None,
         input,
         cached_input: usage.cache_read_input_tokens,
@@ -680,28 +806,29 @@ fn usage(usage: &ResultUsage) -> UsageSample {
             .output_tokens_details
             .as_ref()
             .and_then(|details| details.thinking_tokens),
-        total: input.zip(output).map(|(input, output)| input + output),
-    }
+        total,
+    })
 }
 
-/// Packet §5 vendor data: the cache-creation count, a non-null
-/// `fallback_credit` and each model's `costBasis`; `None` when empty or
-/// past [`VENDOR_MAX`].
+/// Packet §5 vendor data, within [`VENDOR_MAX`] encoded: the cache-creation
+/// count, a non-null `fallback_credit`, each model's `costBasis`, then
+/// the result's unread members under `extra` (the first [`EXTRA_MAX`]).
+/// Each member is kept only if it still fits, so one oversized member
+/// drops alone (review r1 #12); `None` when nothing is kept.
 fn vendor_data(result: &ResultMessage) -> Option<Box<RawValue>> {
     let mut data = Map::new();
-    if let Some(created) = result
-        .usage
-        .as_ref()
-        .and_then(|usage| usage.cache_creation_input_tokens)
-    {
-        data.insert("cache_creation_input_tokens".to_owned(), created.into());
+    let fit = |data: &mut Map<String, Value>, key: &str, value: Value| {
+        data.insert(key.to_owned(), value);
+        if Value::Object(data.clone()).to_string().len() > VENDOR_MAX {
+            data.remove(key);
+        }
+    };
+    let usage = result.usage.as_ref();
+    if let Some(created) = usage.and_then(|usage| usage.cache_creation_input_tokens) {
+        fit(&mut data, "cache_creation_input_tokens", created.into());
     }
-    if let Some(credit) = result
-        .usage
-        .as_ref()
-        .and_then(|usage| usage.fallback_credit.clone())
-    {
-        data.insert("fallback_credit".to_owned(), credit);
+    if let Some(credit) = usage.and_then(|usage| usage.fallback_credit.clone()) {
+        fit(&mut data, "fallback_credit", credit);
     }
     let bases: Map<String, Value> = result
         .model_usage
@@ -710,15 +837,30 @@ fn vendor_data(result: &ResultMessage) -> Option<Box<RawValue>> {
         .filter_map(|(model, usage)| Some((model.clone(), usage.get("costBasis")?.clone())))
         .collect();
     if !bases.is_empty() {
-        data.insert("cost_basis".to_owned(), Value::Object(bases));
+        fit(&mut data, "cost_basis", Value::Object(bases));
+    }
+    data.insert("extra".to_owned(), Value::Object(Map::new()));
+    for (key, value) in result.extra.iter().take(EXTRA_MAX) {
+        if let Some(Value::Object(extra)) = data.get_mut("extra") {
+            extra.insert(key.clone(), value.clone());
+        }
+        if Value::Object(data.clone()).to_string().len() > VENDOR_MAX
+            && let Some(Value::Object(extra)) = data.get_mut("extra")
+        {
+            extra.remove(key);
+        }
+    }
+    if data
+        .get("extra")
+        .and_then(Value::as_object)
+        .is_some_and(Map::is_empty)
+    {
+        data.remove("extra");
     }
     if data.is_empty() {
         return None;
     }
-    let text = Value::Object(data).to_string();
-    (text.len() <= VENDOR_MAX)
-        .then(|| RawValue::from_string(text).ok())
-        .flatten()
+    RawValue::from_string(Value::Object(data).to_string()).ok()
 }
 
 #[cfg(test)]

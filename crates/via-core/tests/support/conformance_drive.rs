@@ -108,38 +108,47 @@ impl Rig {
         self.vendor_dir().join(format!("{}.launches", self.name))
     }
 
-    /// The launches so far: the launch log's lines, 0 with no log.
-    pub(crate) fn launches(&self) -> u64 {
-        fs::read_to_string(self.launch_log()).map_or(0, |log| log.lines().count() as u64)
+    /// The launches so far: the launch log's lines. Only an absent log
+    /// is 0; any other read error fails the case.
+    pub(crate) fn launches(&self) -> Result<u64, String> {
+        match fs::read_to_string(self.launch_log()) {
+            Ok(log) => Ok(log.lines().count() as u64),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(format!("launch log: {error}")),
+        }
     }
 
-    /// Every file under the case's fixture and vendor directories, the
-    /// launch log excepted, with its size and modification time.
-    fn snapshot(&self) -> BTreeMap<PathBuf, (u64, Option<SystemTime>)> {
+    /// Every file under the case's fixture directory and the rig's own
+    /// directories (vendor, State and runtime), the launch log excepted,
+    /// with its size and modification time; a traversal error fails the
+    /// case.
+    fn snapshot(&self) -> Result<BTreeMap<PathBuf, (u64, Option<SystemTime>)>, String> {
         let mut files = BTreeMap::new();
-        for root in [self.fixtures.clone(), self.vendor_dir()] {
-            list(&root, &mut files);
+        for root in [
+            self.fixtures.clone(),
+            self.vendor_dir(),
+            self.dir.path().join("state"),
+            self.dir.path().join("runtime"),
+        ] {
+            list(&root, &mut files)?;
         }
         files.remove(&self.launch_log());
-        files
+        Ok(files)
     }
 }
 
-fn list(dir: &Path, into: &mut BTreeMap<PathBuf, (u64, Option<SystemTime>)>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(meta) = fs::symlink_metadata(&path) else {
-            continue;
-        };
+fn list(dir: &Path, into: &mut BTreeMap<PathBuf, (u64, Option<SystemTime>)>) -> Result<(), String> {
+    let fail = |path: &Path, error: std::io::Error| format!("snapshot {}: {error}", path.display());
+    for entry in fs::read_dir(dir).map_err(|e| fail(dir, e))? {
+        let path = entry.map_err(|e| fail(dir, e))?.path();
+        let meta = fs::symlink_metadata(&path).map_err(|e| fail(&path, e))?;
         if meta.is_dir() {
-            list(&path, into);
+            list(&path, into)?;
         } else {
             into.insert(path, (meta.len(), meta.modified().ok()));
         }
     }
+    Ok(())
 }
 
 /// The files that differ between two snapshots, as display paths.
@@ -269,10 +278,10 @@ pub(crate) struct Pure {
 /// changed are part of the outcome.
 pub(crate) fn pure(rig: &Rig, expect: &Value) -> Result<Pure, String> {
     let harness = expect["harness"].as_str().ok_or("case.harness")?;
-    let before = rig.snapshot();
+    let before = rig.snapshot()?;
     let mut outcome = Outcome::default();
     if let Some(describe) = expect.get("describe") {
-        let launched = rig.launches();
+        let launched = rig.launches()?;
         let plan = rig
             .set()
             .plan(&describe_request(&describe["params"])?)
@@ -281,7 +290,7 @@ pub(crate) fn pure(rig: &Rig, expect: &Value) -> Result<Pure, String> {
             "capabilities": plan.capabilities,
             "vendor_version": plan.vendor_version,
             "version_status": plan.version_status,
-            "launches": rig.launches() - launched,
+            "launches": rig.launches()? - launched,
         }));
     }
     for check in expect["plan_checks"].as_array().into_iter().flatten() {
@@ -316,8 +325,8 @@ pub(crate) fn pure(rig: &Rig, expect: &Value) -> Result<Pure, String> {
         };
         spawns.insert(label.clone(), spawn);
     }
-    outcome.pure_writes = changed(&before, &rig.snapshot());
-    outcome.checkpoints.after_pure = rig.launches();
+    outcome.pure_writes = changed(&before, &rig.snapshot()?);
+    outcome.checkpoints.after_pure = rig.launches()?;
     Ok(Pure { outcome, spawns })
 }
 
@@ -339,7 +348,7 @@ impl Pure {
             outcome
                 .checkpoints
                 .after_open
-                .insert(label.clone(), rig.launches());
+                .insert(label.clone(), rig.launches()?);
         }
         let mut seen = Vec::new();
         for turn in expect["turns"].as_array().into_iter().flatten() {
@@ -356,9 +365,9 @@ impl Pure {
                 plan_refusal: Some(code.clone()),
                 ..TurnOutcome::default()
             });
-            outcome.checkpoints.after_turn.push(rig.launches());
+            outcome.checkpoints.after_turn.push(rig.launches()?);
         }
-        outcome.launches = rig.launches();
+        outcome.launches = rig.launches()?;
         Ok(outcome)
     }
 }

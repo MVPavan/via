@@ -89,7 +89,9 @@ fn feed(normalizer: &mut Normalizer, line: &str) -> Batch {
     let mut batch = normalizer.message(message, Instant::now());
     // The driver writes a decline at once; here every write completes.
     if let Some(pending) = batch.decline.take() {
-        batch.observations.push(pending.written());
+        let written = normalizer.declined(pending);
+        batch.observations.extend(written.observations);
+        batch.end = batch.end.or(written.end);
     }
     batch
 }
@@ -187,7 +189,9 @@ fn c11b_decline_suppresses_the_denial() {
             assert_eq!(pending.request_id, "00000000-0000-4000-8000-000000000011");
             // Nothing is reported before the write completes.
             assert!(batch.observations.is_empty());
-            batch.observations.push(pending.written());
+            batch
+                .observations
+                .extend(normalizer.declined(pending).observations);
         }
         run.batches.push(batch);
     }
@@ -550,7 +554,8 @@ fn unknown_control_requests_are_declined() {
     let batch = normalizer.message(decode(request.as_bytes()).unwrap(), Instant::now());
     let pending = batch.decline.unwrap();
     assert_eq!(pending.request_id, "q9");
-    let Observation::RequestDeclined(decline) = pending.written() else {
+    let written = normalizer.declined(pending);
+    let Some(Observation::RequestDeclined(decline)) = written.observations.first() else {
         panic!("not a decline")
     };
     assert_eq!(decline.vendor_method, "elicit");
@@ -667,4 +672,350 @@ fn order_and_contradictions() {
     let other = result_line(&json!({"session_id":"another"}));
     let (_, run) = run_lines(&facts, &[init_line(NEW_SID), other]);
     assert!(matches!(run.end(), Some(End::ResumeMismatch)));
+}
+
+fn receipt_line(id: &str, response: &Value) -> String {
+    let mut line = json!({"type":"control_response","response":{"subtype":"success",
+        "request_id":id}});
+    if !response.is_null() {
+        line["response"]["response"] = response.clone();
+    }
+    line.to_string()
+}
+
+fn abort_line(subtype: &str) -> String {
+    result_line(&json!({"subtype":subtype,"is_error":true,
+        "terminal_reason":"aborted_tools","stop_reason":"tool_use","result":null}))
+}
+
+/// Review r1 #1: only a qualified receipt (matching, `success`, the nested
+/// `still_queued` body) read before an `error_during_execution` /
+/// `aborted_tools` terminal acknowledges; acknowledgement is frozen at the
+/// terminal; without it the abort is an ordinary vendor terminal.
+#[test]
+fn receipt_must_precede_the_abort() {
+    let queued = json!({"still_queued":[]});
+    let receipt = receipt_line(RID, &queued);
+    for (lines, interrupted) in [
+        (
+            vec![receipt.clone(), abort_line("error_during_execution")],
+            true,
+        ),
+        (
+            vec![abort_line("error_during_execution"), receipt.clone()],
+            false,
+        ),
+        (
+            vec![
+                receipt_line(RID, &Value::Null),
+                abort_line("error_during_execution"),
+            ],
+            false,
+        ),
+        (
+            vec![
+                receipt_line(RID, &json!({})),
+                abort_line("error_during_execution"),
+            ],
+            false,
+        ),
+        (vec![receipt.clone(), abort_line("success")], false),
+    ] {
+        let mut normalizer = Normalizer::new(facts(NEW_SID, false));
+        feed(&mut normalizer, &init_line(NEW_SID));
+        normalizer.interrupt_sent(RID.to_owned());
+        let mut run = Run::default();
+        for line in &lines {
+            run.batches.push(feed(&mut normalizer, line));
+        }
+        assert_eq!(normalizer.acknowledged(), interrupted, "{lines:?}");
+        let terminal = run.terminal();
+        if interrupted {
+            assert_eq!(terminal.status, VendorTerminalStatus::Interrupted);
+        } else {
+            assert_eq!(terminal.status, VendorTerminalStatus::Failed, "{lines:?}");
+            assert_eq!(terminal.class_hint, Some(ClassHint::VendorError));
+            assert_eq!(terminal.vendor_code.as_deref(), Some("aborted_tools"));
+        }
+    }
+}
+
+/// Review r1 #2: usage sums past `u64` are a protocol failure, never a
+/// panic or a wrapped count.
+#[test]
+fn usage_overflow_is_protocol() {
+    for usage in [
+        json!({"input_tokens":u64::MAX,"cache_creation_input_tokens":1,
+            "cache_read_input_tokens":0,"output_tokens":0}),
+        json!({"input_tokens":u64::MAX,"cache_creation_input_tokens":0,
+            "cache_read_input_tokens":0,"output_tokens":1}),
+    ] {
+        let (_, run) = run_lines(
+            &facts(NEW_SID, false),
+            &[init_line(NEW_SID), result_line(&json!({"usage":usage}))],
+        );
+        assert!(matches!(run.end(), Some(End::Protocol(_))), "{usage}");
+    }
+}
+
+/// Review r1 #3: the retained terminal and each emitted observation stay
+/// within 256 KiB encoded: a 300 KiB structured output and a progress mark
+/// of 150 long tool starts are protocol; 200 KiB is retained.
+#[test]
+fn retained_payload_is_bounded() {
+    let mut schema = facts(NEW_SID, false);
+    schema.schema = true;
+    let init = json!({"type":"system","subtype":"init","session_id":NEW_SID,
+        "claude_code_version":"2.1.300","permissionMode":"dontAsk",
+        "tools":["Bash","Edit","Glob","Grep","Read","StructuredOutput","Write"],
+        "capabilities":["interrupt_receipt_v1"]})
+    .to_string();
+    let output = |bytes: usize| json!({"structured_output":{"a":"x".repeat(bytes)}});
+    let (_, run) = run_lines(&schema, &[init.clone(), result_line(&output(300 * 1024))]);
+    assert!(matches!(run.end(), Some(End::Protocol(_))));
+    let (_, run) = run_lines(&schema, &[init, result_line(&output(200 * 1024))]);
+    assert!(matches!(run.end(), Some(End::Terminal(_))));
+
+    let blocks: Vec<Value> = (0..150)
+        .map(|i| {
+            json!({"type":"tool_use","id":format!("{i:04}{}", "i".repeat(996)),
+                "name":"n".repeat(1000),"input":{}})
+        })
+        .collect();
+    let many = json!({"type":"assistant","session_id":NEW_SID,
+        "message":{"id":"m","model":"m","content":blocks}})
+    .to_string();
+    let (_, run) = run_lines(&facts(NEW_SID, false), &[init_line(NEW_SID), many]);
+    assert!(matches!(run.end(), Some(End::Protocol(_))));
+    assert_eq!(run.count("progress"), 0);
+}
+
+fn denied_line(id: &str, tool: &str) -> String {
+    json!({"type":"system","subtype":"permission_denied","tool_name":tool,
+        "tool_use_id":id,"decision_reason_type":"mode"})
+    .to_string()
+}
+
+fn tool_result(id: &str) -> String {
+    json!({"type":"user","session_id":NEW_SID,"message":{"role":"user",
+        "content":[{"type":"tool_result","tool_use_id":id,"content":"x"}]}})
+    .to_string()
+}
+
+/// Review r1 #4: the first new ID past a tracking bound is an explicit
+/// protocol failure, for each set: calls (open and completed together),
+/// denials and declines.
+#[test]
+fn tracking_overflow_is_explicit() {
+    let ids = |n: usize| (0..n).map(|i| format!("t{i}")).collect::<Vec<_>>();
+    let protocol = |batch: &Batch| matches!(batch.end, Some(End::Protocol(_)));
+    let uses = |ids: &[String]| {
+        let blocks: Vec<Value> = ids
+            .iter()
+            .map(|id| json!({"type":"tool_use","id":id,"name":"Read","input":{}}))
+            .collect();
+        json!({"type":"assistant","session_id":NEW_SID,
+            "message":{"id":"m","model":"m","content":blocks}})
+        .to_string()
+    };
+
+    // Open calls.
+    let mut normalizer = Normalizer::new(facts(NEW_SID, false));
+    feed(&mut normalizer, &init_line(NEW_SID));
+    assert!(!protocol(&feed(&mut normalizer, &uses(&ids(TRACKED)))));
+    assert!(protocol(&feed(
+        &mut normalizer,
+        &tool_use("new", "Read", &json!({}))
+    )));
+
+    // Completed calls count in the same bound.
+    let mut normalizer = Normalizer::new(facts(NEW_SID, false));
+    feed(&mut normalizer, &init_line(NEW_SID));
+    let all = ids(TRACKED);
+    feed(&mut normalizer, &uses(&all));
+    for id in &all {
+        assert!(!protocol(&feed(&mut normalizer, &tool_result(id))));
+    }
+    assert_eq!(normalizer.open_tools(), 0);
+    assert!(protocol(&feed(
+        &mut normalizer,
+        &tool_use("new", "Read", &json!({}))
+    )));
+
+    // Denials.
+    let mut normalizer = Normalizer::new(facts(NEW_SID, false));
+    feed(&mut normalizer, &init_line(NEW_SID));
+    for id in ids(TRACKED) {
+        assert!(!protocol(&feed(&mut normalizer, &denied_line(&id, "Read"))));
+    }
+    assert!(protocol(&feed(
+        &mut normalizer,
+        &denied_line("new", "Read")
+    )));
+
+    // Declines.
+    let request = |id: &str| {
+        json!({"type":"control_request","request_id":format!("q{id}"),"request":{
+            "subtype":"can_use_tool","tool_name":"Read","tool_use_id":id,"input":{}}})
+        .to_string()
+    };
+    let mut normalizer = Normalizer::new(facts(NEW_SID, false));
+    feed(&mut normalizer, &init_line(NEW_SID));
+    for id in ids(TRACKED) {
+        assert!(!protocol(&feed(&mut normalizer, &request(&id))));
+    }
+    assert!(protocol(&feed(&mut normalizer, &request("new"))));
+}
+
+/// Review r1 #5: a completed call keeps its target: a replayed block does
+/// not start it again, and a later denial names what it acted on.
+#[test]
+fn completed_calls_keep_their_target() {
+    let edit = tool_use("t1", "Edit", &json!({"file_path":"/a"}));
+    let (_, run) = run_lines(
+        &facts(NEW_SID, false),
+        &[
+            init_line(NEW_SID),
+            edit.clone(),
+            tool_result("t1"),
+            edit,
+            denied_line("t1", "Edit"),
+            result_line(&json!({"permission_denials":[
+                {"tool_name":"Edit","tool_use_id":"t1","tool_input":{}}]})),
+        ],
+    );
+    let started: usize = run
+        .observations()
+        .filter_map(|o| {
+            if let Observation::Progress(marks) = o {
+                Some(marks.tools_started.len())
+            } else {
+                None
+            }
+        })
+        .sum();
+    assert_eq!(started, 1, "a completed call started again");
+    let targets: Vec<_> = run
+        .observations()
+        .filter_map(|o| {
+            if let Observation::ActionDenied(denial) = o {
+                Some(denial.target.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(targets, ["/a"]);
+}
+
+/// Review r1 #6: classification reads the qualified combinations. HTTP
+/// 401 is `auth` whatever the subtype; `max_turns` without
+/// `error_max_turns` is an ordinary vendor error keeping its own code.
+#[test]
+fn classification_follows_qualified_evidence() {
+    let facts = facts(NEW_SID, false);
+    let classify = |extra: Value| {
+        let (_, run) = run_lines(&facts, &[init_line(NEW_SID), result_line(&extra)]);
+        let terminal = run.terminal();
+        (
+            terminal.stop_reason,
+            terminal.class_hint,
+            terminal.vendor_code.clone(),
+        )
+    };
+    assert_eq!(
+        classify(json!({"subtype":"error_max_turns","is_error":true,
+            "terminal_reason":"api_error","api_error_status":401,"result":"x"})),
+        (
+            StopReason::Error,
+            Some(ClassHint::Auth),
+            Some("api_error".to_owned())
+        )
+    );
+    assert_eq!(
+        classify(json!({"subtype":"error_during_execution","is_error":true,
+            "terminal_reason":"max_turns","result":"x"})),
+        (
+            StopReason::Error,
+            Some(ClassHint::VendorError),
+            Some("max_turns".to_owned())
+        )
+    );
+    assert_eq!(
+        classify(json!({"subtype":"error_max_turns","is_error":true,"result":"x"})),
+        (
+            StopReason::Error,
+            Some(ClassHint::VendorError),
+            Some("error_max_turns".to_owned())
+        )
+    );
+    assert_eq!(
+        classify(json!({"subtype":"error_max_turns","is_error":true,
+            "terminal_reason":"max_turns","result":"x"})),
+        (
+            StopReason::MaxSteps,
+            Some(ClassHint::BudgetExceeded),
+            Some("error_max_turns".to_owned())
+        )
+    );
+}
+
+/// Review r1 #7: every init is checked: a same-session init that differs
+/// is a protocol contradiction; an identical one is nothing new.
+#[test]
+fn duplicate_inits_must_agree() {
+    let facts = facts(NEW_SID, false);
+    let (_, run) = run_lines(&facts, &[init_line(NEW_SID), init_line(NEW_SID)]);
+    assert!(run.end().is_none());
+    assert_eq!(run.count("session.vendor_identity_confirmed"), 1);
+    let mut other: Value = serde_json::from_str(&init_line(NEW_SID)).unwrap();
+    other["claude_code_version"] = json!("9.9.9");
+    other["permissionMode"] = json!("default");
+    let (_, run) = run_lines(&facts, &[init_line(NEW_SID), other.to_string()]);
+    assert!(matches!(run.end(), Some(End::Protocol(_))));
+}
+
+/// Review r1 #9: suppression waits for the whole decline write; a pending
+/// decline dropped unwritten suppresses nothing.
+#[test]
+fn decline_suppresses_only_once_written() {
+    let mut normalizer = Normalizer::new(facts(NEW_SID, false));
+    feed(&mut normalizer, &init_line(NEW_SID));
+    let request = json!({"type":"control_request","request_id":"q1","request":{
+        "subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"t1",
+        "input":{"command":"ls"}}})
+    .to_string();
+    let batch = normalizer.message(decode(request.as_bytes()).unwrap(), Instant::now());
+    let pending = batch.decline.unwrap();
+    assert!(batch.observations.is_empty());
+    drop(pending);
+    let denied = feed(&mut normalizer, &denied_line("t1", "Bash"));
+    assert!(matches!(
+        denied.observations.as_slice(),
+        [Observation::ActionDenied(_)]
+    ));
+}
+
+/// Review r1 #12: unknown result metadata is kept in vendor data, and one
+/// oversized member drops alone.
+#[test]
+fn vendor_data_keeps_what_fits() {
+    let facts = facts(NEW_SID, false);
+    let vendor = |extra: Value| {
+        let (_, run) = run_lines(&facts, &[init_line(NEW_SID), result_line(&extra)]);
+        let raw = run
+            .terminal()
+            .vendor
+            .as_ref()
+            .map(|raw| raw.get().to_owned());
+        serde_json::from_str::<Value>(&raw.unwrap()).unwrap()
+    };
+    let small = vendor(json!({"new_vendor_stat":3}));
+    assert_eq!(small["extra"]["new_vendor_stat"], 3);
+    assert_eq!(small["cache_creation_input_tokens"], 2);
+    let big = vendor(json!({"new_vendor_stat":3,"huge":"h".repeat(20 * 1024),
+        "modelUsage":{"m":{"costBasis":"list"}}}));
+    assert_eq!(big["extra"]["new_vendor_stat"], 3);
+    assert!(big["extra"].get("huge").is_none());
+    assert_eq!(big["cost_basis"]["m"], "list");
 }

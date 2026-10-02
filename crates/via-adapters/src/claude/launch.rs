@@ -110,10 +110,17 @@ fn fixed(inherit: Inherit) -> Vec<&'static str> {
     flags
 }
 
-/// The handshake-refusal cache's recipe key (C2 §5): what a launch fixes
-/// whatever the turn, the category switches included.
-pub(crate) fn recipe_key(inherit: Inherit) -> String {
-    fixed(inherit).join(" ")
+/// The handshake-refusal cache's recipe key (C2 §5), for insertion and
+/// lookup alike: every launch input the handshake check reads. That is
+/// the fixed flags (the MCP switch, which decides whether `mcp__` tools
+/// may appear, included) and the schema mode, which adds the
+/// `StructuredOutput` tool (review r1 #8).
+pub(crate) fn recipe_key(inherit: Inherit, schema: bool) -> String {
+    let mut key = fixed(inherit).join(" ");
+    if schema {
+        key.push_str(" --json-schema");
+    }
+    key
 }
 
 /// The exact argv (packet §4, in the fixtures' order): `-p`, the stream
@@ -282,7 +289,14 @@ mod tests {
     fn switches_and_options_follow_the_recipe_order() {
         let mut on = Inherit::OD2_DEFAULT;
         on.set(Category::McpServers, InheritState::On);
-        assert_ne!(recipe_key(on), recipe_key(Inherit::OD2_DEFAULT));
+        assert_ne!(
+            recipe_key(on, false),
+            recipe_key(Inherit::OD2_DEFAULT, false)
+        );
+        assert_ne!(
+            recipe_key(Inherit::OD2_DEFAULT, true),
+            recipe_key(Inherit::OD2_DEFAULT, false)
+        );
         let schema = RawValue::from_string(r#"{"type":"object","a":1}"#.to_owned()).unwrap();
         let dirs = [PathBuf::from("/x")];
         let args = argv(&Recipe {
