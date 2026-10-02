@@ -4235,7 +4235,11 @@ async fn send_held(
     };
     tokio::time::timeout(
         Duration::from_secs(2),
-        sender.send(via_adapters::Admitted { item, permit }),
+        sender.send(via_adapters::Admitted {
+            at: item.at,
+            item,
+            permit,
+        }),
     )
     .await
     .expect("the lane's actor drains the channel between turns")
@@ -4757,7 +4761,12 @@ fn a_between_turn_identity_commits_its_open_event_and_the_columns() {
             observation: via_adapters::Observation::IdentityConfirmed(identity),
         };
         let permit = std::sync::Arc::clone(&budget).try_acquire_owned().unwrap();
-        lane.dispose(via_adapters::Admitted { item, permit }).await;
+        lane.dispose(via_adapters::Admitted {
+            at: item.at,
+            item,
+            permit,
+        })
+        .await;
         assert!(lane.verified());
         let page = events_page(&engine, &session).await;
         let opened: Vec<&Value> = page["events"]
@@ -4920,6 +4929,7 @@ fn identity_counts_only_for_the_current_connection_generation() {
         let confirm = |connection: &str, transcript: Option<&str>| {
             let permit = std::sync::Arc::clone(&budget).try_acquire_owned().unwrap();
             via_adapters::Admitted {
+                at: tokio::time::Instant::now(),
                 item: via_adapters::ObservationItem {
                     at: tokio::time::Instant::now(),
                     vendor_turn: None,
@@ -6074,7 +6084,11 @@ fn a_never_empty_channel_holds_neither_the_turn_nor_its_end() {
                         ..ProgressMarks::default()
                     }),
                 };
-                via_adapters::Admitted { item, permit }
+                via_adapters::Admitted {
+                    at: item.at,
+                    item,
+                    permit,
+                }
             };
             loop {
                 let Ok(slot) = sender.reserve().await else {
@@ -6707,6 +6721,7 @@ fn admitted_denial(
     target: &str,
 ) -> via_adapters::Admitted {
     via_adapters::Admitted {
+        at: tokio::time::Instant::now(),
         item: via_adapters::ObservationItem {
             at: tokio::time::Instant::now(),
             vendor_turn: None,
@@ -6860,6 +6875,7 @@ fn timely_progress_read_after_the_idle_deadline_keeps_the_turn() {
                 until(|| acked(&points, intent, held_launch)).await;
                 // A final text piece: its handling writes nothing.
                 let held = via_adapters::Admitted {
+                    at: tokio::time::Instant::now(),
                     item: via_adapters::ObservationItem {
                         at: tokio::time::Instant::now(),
                         vendor_turn: None,
@@ -6874,6 +6890,7 @@ fn timely_progress_read_after_the_idle_deadline_keeps_the_turn() {
                 // The turn's own progress, decoded well before the deadline.
                 tokio::time::sleep_until(start + idle * 6 / 10).await;
                 let progress = via_adapters::Admitted {
+                    at: tokio::time::Instant::now(),
                     item: via_adapters::ObservationItem {
                         at: tokio::time::Instant::now(),
                         vendor_turn: None,
@@ -6899,6 +6916,84 @@ fn timely_progress_read_after_the_idle_deadline_keeps_the_turn() {
             probe.borrow().is_none(),
             "the idle deadline expired: {:?}",
             probe.borrow().as_ref().map(|order| order.cause)
+        );
+    });
+}
+
+/// Bead via-mnx r1 (runtime §8, C2 §4): the turn's progress moves its idle
+/// deadline by the progress's own decode time, even when the session
+/// channel admits an item another producer stamped later ahead of it (a
+/// retirement's, beside a pinned next turn). The progress decoded at 0.0
+/// is read after an item stamped at 0.8, both before the deadline at 1.0;
+/// the deadline moves to 1.0 + ε, not to 1.8, so the turn expires by 1.5.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn progress_admitted_behind_a_later_stamp_keeps_its_decode_time() {
+    let Some(root) = child("progress_admitted_behind_a_later_stamp_keeps_its_decode_time") else {
+        return;
+    };
+    let intent = "store.journal.anchor_intent";
+    let points = count_points(&root, &[intent]);
+    run(async {
+        use via_adapters::{Observation, ObservationItem, ProgressMarks};
+        let engine = open(&root);
+        let (_session, slot, claim, mut record, effective, orders) =
+            running_turn_2(&engine, &root).await;
+        let probe = orders.clone();
+        // The turn's launch is held, so its driver has not returned.
+        let held_launch = arm_next_with(&points, intent, &json!({"action":"pause"}));
+        let (sink, receiver) =
+            via_adapters::observation_channel_in(&via_adapters::ObservationBudget::new());
+        let mut inbox = super::lane::Inbox::of(receiver);
+        let (spec, cx) = turn_2_cx();
+        let idle = Duration::from_millis(1_000);
+        let stall = Duration::from_secs(10);
+        let start = tokio::time::Instant::now();
+        let at = |tenths: u32| start + idle * tenths / 10;
+        let (expired, ()) = tokio::join!(
+            async {
+                until(|| acked(&points, intent, held_launch)).await;
+                // The turn's own progress, decoded now; its sender is slow.
+                let progress = ObservationItem {
+                    at: tokio::time::Instant::now(),
+                    vendor_turn: None,
+                    observation: Observation::Progress(ProgressMarks {
+                        model: true,
+                        ..ProgressMarks::default()
+                    }),
+                };
+                tokio::time::sleep_until(at(8)).await;
+                // Another producer's item, stamped at 0.8, is admitted first.
+                let other = ObservationItem {
+                    at: tokio::time::Instant::now(),
+                    vendor_turn: None,
+                    observation: Observation::FinalText("t".to_owned()),
+                };
+                assert!(sink.clone().deliver(other, stall).await);
+                assert!(sink.deliver(progress, stall).await);
+                tokio::time::sleep_until(at(15)).await;
+                let expired = probe.borrow().as_ref().map(|order| order.cause);
+                release_point(&points, intent, held_launch);
+                expired
+            },
+            async {
+                tokio::time::timeout(
+                    Duration::from_secs(20),
+                    engine.execute_turn_idle(
+                        (&slot, &claim),
+                        (&mut record, &effective),
+                        (orders, &mut inbox),
+                        (spec, cx),
+                        Some(idle),
+                    ),
+                )
+                .await
+                .expect("the turn ends");
+            }
+        );
+        assert!(
+            matches!(expired, Some(via_adapters::StopCause::IdleDeadline)),
+            "the idle deadline did not expire by its decode time: {expired:?}"
         );
     });
 }
@@ -6933,6 +7028,7 @@ fn progress_admitted_while_reconciliation_commits_keeps_the_turn() {
         let idle = Duration::from_millis(1_000);
         let start = tokio::time::Instant::now();
         let item = |observation: Observation| via_adapters::Admitted {
+            at: tokio::time::Instant::now(),
             item: via_adapters::ObservationItem {
                 at: tokio::time::Instant::now(),
                 vendor_turn: None,
@@ -7171,6 +7267,7 @@ fn lanes_idle_only_by_draining_come_back_to_the_bound() {
             let (sender, receiver) = tokio::sync::mpsc::channel(4);
             let budget = via_adapters::ObservationBudget::new();
             let item = via_adapters::Admitted {
+                at: tokio::time::Instant::now(),
                 item: via_adapters::ObservationItem {
                     at: tokio::time::Instant::now(),
                     vendor_turn: None,
