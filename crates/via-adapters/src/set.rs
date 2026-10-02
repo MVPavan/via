@@ -30,7 +30,28 @@ impl AdapterSet {
             .filter(|harness| harness.route() == session.route)
             .and_then(|harness| self.adapter(harness))
             .map(Adapter::driver_kind);
-        SessionDriver::new(Arc::clone(&self.runtime), kind, spec, cx)
+        let driver = SessionDriver::new(Arc::clone(&self.runtime), kind, spec, cx);
+        #[cfg(feature = "test-failpoints")]
+        let driver = SessionDriver {
+            stand_in: self.stand_in.get().cloned(),
+            ..driver
+        };
+        driver
+    }
+
+    /// Test builds only: the stand-in admission (x.3.2 X0 item 0) every
+    /// driver opened from now on takes, installed on first call.
+    #[cfg(feature = "test-failpoints")]
+    pub fn stand_in(&self) -> Arc<crate::StandIn> {
+        Arc::clone(self.stand_in.get_or_init(Arc::default))
+    }
+
+    /// Sticky (C2 §2): some Host journal write's outcome was uncertain,
+    /// including writes no driver owns, as a shared server's retirement
+    /// after its last lease (x.3.2 X0 item 2.6). Core latches Store
+    /// failure on it.
+    pub fn journal_uncertain(&self) -> watch::Receiver<bool> {
+        self.runtime.journal_uncertain()
     }
 
     /// After a daemon restart (C2 §2 Recover): never submits input. No

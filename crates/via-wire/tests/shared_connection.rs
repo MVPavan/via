@@ -334,7 +334,11 @@ async fn claimed_job_withdrawable_until_first_byte() -> TestResult {
     drained?;
     assert_eq!(next?, SendOutcome::Written, "stdin stayed open");
     assert_eq!(read, [&[b'f'; 16][..], b"next\n"].concat());
-    assert_eq!(rest(&input, vendor_stdin).await?, b"", "nothing of the data");
+    assert_eq!(
+        rest(&input, vendor_stdin).await?,
+        b"",
+        "nothing of the data"
+    );
     drop(vendor);
     end(messages, &input).await;
     Ok(())

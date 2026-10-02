@@ -232,6 +232,11 @@ struct Faults {
     /// The next submission waits for `release` after its commit, before
     /// a `steer` can address it.
     hold_before_publish: AtomicBool,
+    /// The next dispatch waits for `release` after its first `prepare()`,
+    /// before its slot wait registers (x.3.2 X0 item 0).
+    hold_after_prepare: AtomicBool,
+    /// Lanes dispatch opened for a turn.
+    lanes_opened: AtomicUsize,
     /// Notified when a `steer` starts selecting the turn it addresses.
     steer_selecting: tokio::sync::Notify,
 }
@@ -243,6 +248,8 @@ struct ForcedTurn {
     requested_at: String,
     /// A vendor may have launched: Host sent ARM.
     launched: bool,
+    /// The driver's connection ownership (C2 §2, x.3.2 X0 item 6.4).
+    connection_kind: via_adapters::ConnectionKind,
     /// Route's own Host close: its stop found the vendor live, and whether it
     /// proved group absence; recovery can add to these, never retract them.
     close: RouteClose,
@@ -744,6 +751,12 @@ struct Terminal {
     exit: Option<Exit>,
     warnings: Vec<Warning>,
     cancel: Option<Cancel>,
+    /// The turn's cleanup is known `quiescent`, whatever decided it: its
+    /// `TurnEnd`, a durable settlement, recovery's meet or shutdown's fold
+    /// (x.3.2 X0 item 6.5). The terminal's commit then releases the turn's
+    /// server link, if any (runtime §6 `server_turns`); otherwise the link
+    /// stays.
+    quiescent: bool,
 }
 
 impl Terminal {

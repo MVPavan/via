@@ -129,7 +129,11 @@ async fn wire_server_open_has_no_turn_folder() {
     assert!(folder.path().is_dir());
     folder.keep_undecoded(b"not json\n", "undecodable").await;
     assert!(folder.path().join("undecoded.bin").is_file());
-    assert!(folder.take_undecoded().is_some_and(|note| note.contains("undecoded.bin")));
+    assert!(
+        folder
+            .take_undecoded()
+            .is_some_and(|note| note.contains("undecoded.bin"))
+    );
     assert!(
         !folder.path().join("stderr.log").exists(),
         "the server's stderr.log in a turn folder"

@@ -8,9 +8,10 @@ use std::{
 
 use tokio::sync::watch;
 use via_adapters::{
-    AdapterError, Admitted, Decline, Denial, DenialKind, InheritPlan, Observation, ObservationItem,
-    Prepared, RouteError, SteerDelivery, StopOrder, StopWatch, TurnActivity, TurnCx, TurnEnd,
-    TurnEvidence, TurnSpec, VendorTerminal, VersionStatus, WireCleanup, observation::Acceptance,
+    AdapterError, Admitted, ConnectionKind, Decline, Denial, DenialKind, InheritPlan, Observation,
+    ObservationItem, Prepared, RouteError, SteerDelivery, StopOrder, StopWatch, TurnActivity,
+    TurnCx, TurnEnd, TurnEvidence, TurnSpec, VendorTerminal, VersionStatus, WireCleanup,
+    observation::Acceptance,
 };
 use via_store::{
     AcceptanceRecord, CancelCause, Prompt, QueuedTurn, StepRow, StepsRecord, StoreError,
@@ -239,6 +240,9 @@ struct Forced {
     close: RouteClose,
     /// A Host journal write of the turn had an uncertain outcome (§7.1).
     journal_uncertain: bool,
+    /// The driver's connection ownership (C2 §2): a shared server's
+    /// launched turn ends `unknown` under force (C1 §7.6).
+    connection_kind: ConnectionKind,
 }
 
 impl Engine {
@@ -401,39 +405,101 @@ impl Engine {
     /// keeps its queued count until Store confirms the submission. A failed
     /// submission is [`Engine::submit_failure`]'s (design §7.2, §7.3).
     /// Every other path that does not submit rolls the claim back.
+    ///
+    /// The claimed lane, or the resident permit of the lane this dispatch
+    /// opens: one that needs a new lane first waits for a resident one
+    /// (runtime §8, critical r3 #3), before any connection slot, its turn
+    /// still queued. The session's lane is claimed before its driver is
+    /// prepared, and a failed driver is retired first, so its own slot is
+    /// free for its successor (C2 §2, Sol r2 #1). A dispatch that found no
+    /// lane opens one before admission from the head turn's frozen values
+    /// (x.3.2 X0 item 0, C2 §3 connection admission: no vendor I/O), so
+    /// its driver can answer `prepare()`; a lane so opened for a turn that
+    /// is then not submitted is retired before this returns.
     async fn dispatch(&self, slot: &Arc<Slot>, session: &SessionId, turn: TurnNumber) -> Step {
+        let (claim, read) = if let Some(claim) = self.claim_lane(session).await {
+            (Ok(claim), None)
+        } else {
+            let Some(resident) = self.reserve_resident(slot, turn).await else {
+                return Step::Next;
+            };
+            match self.open_for(session, turn, resident).await {
+                Opened::Lane(claim, read) => (Ok(claim), Some(read)),
+                Opened::Unopened(resident, read) => (Err(resident), Some(read)),
+                // As `submit`'s read failure: nothing claimed or written.
+                Opened::Unread => return Step::Unread(turn),
+            }
+        };
+        let opened = match (&claim, &read) {
+            (Ok(claim), Some(_)) => Some(Arc::clone(claim.lane())),
+            (Ok(_) | Err(_), _) => None,
+        };
+        let (step, submitted) = self.admit(slot, (session, turn), claim, read).await;
+        if let Some(lane) = opened
+            && !submitted
+        {
+            lane.retire_now().await;
+        }
+        step
+    }
+
+    /// The head turn's frozen values for a dispatch that found no lane to
+    /// claim (x.3.2 X0 item 0): one read of the queued row, no write, kept
+    /// for the submission, which then reads it no more. A row that reads
+    /// opens the session's lane, claimed; a row Store or Core cannot parse
+    /// opens none, and its submission fails it as corrupt (design §7.3).
+    async fn open_for(
+        &self,
+        session: &SessionId,
+        turn: TurnNumber,
+        resident: tokio::sync::OwnedSemaphorePermit,
+    ) -> Opened {
+        let read = self.store.queued_turn(session, turn).await;
+        let queued = match &read {
+            Ok(Some(queued)) => queued,
+            Err(StoreError::CorruptEvidence) => return Opened::Unopened(resident, read),
+            Ok(None) | Err(_) => return Opened::Unread,
+        };
+        let Some((effective, inherit)) = frozen_values(queued) else {
+            return Opened::Unopened(resident, read);
+        };
+        let cwd = queued
+            .cwd
+            .as_ref()
+            .map_or_else(|| self.cwd.clone(), PathBuf::from);
+        let claim = self
+            .open_lane(
+                session,
+                ((&queued.route, &effective, inherit), cwd),
+                resident,
+            )
+            .await;
+        Opened::Lane(claim, read)
+    }
+
+    /// The claimed head turn's connection, grant, submission and run
+    /// (design §3.1), and whether it was submitted. `read` is the queued
+    /// row read when the lane was opened ([`Self::open_for`]).
+    async fn admit(
+        &self,
+        slot: &Arc<Slot>,
+        (session, turn): (&SessionId, TurnNumber),
+        claim: Result<LaneClaim, tokio::sync::OwnedSemaphorePermit>,
+        read: Option<QueuedRead>,
+    ) -> (Step, bool) {
         // AD16: a pinned live connection of the session's driver needs no
         // slot; a session without a usable driver needs one. Otherwise
         // design §11: a connection slot before the grant. It is dropped at
         // once if nothing launches; at launch Host takes it for the group's
         // life. Force, the latch or a change of the head gives up the wait:
-        // the queued path, never submitted. The session's lane is claimed
-        // before its driver is prepared, and a failed driver is retired
-        // first, so its own slot is free for its successor (C2 §2, Sol r2
-        // #1). The claim is given back on every path that does not run.
-        // The claimed lane, or the resident permit of the lane this
-        // dispatch opens: one that needs a new lane first waits for a
-        // resident one (runtime §8, critical r3 #3), before any connection
-        // slot, its turn still queued.
-        let claim = match self.claim_lane(session).await {
-            Some(claim) => Ok(claim),
-            None => match self.reserve_resident(slot, turn).await {
-                Some(resident) => Err(resident),
-                None => return Step::Next,
-            },
-        };
-        let prepared = claim
-            .as_ref()
-            .map_or(Prepared::NeedsConnection, |claim| claim.driver.prepare());
-        let connection = match prepared {
-            Prepared::Pinned(_) => None,
-            Prepared::NeedsConnection => match self.reserve_connection(slot, turn).await {
-                Some(permit) => Some(permit),
-                None => return Step::Next,
-            },
+        // the queued path, never submitted. The claim is given back on
+        // every path that does not run.
+        let Some((prepared, connection)) = self.connect(slot, turn, claim.as_ref().ok()).await
+        else {
+            return (Step::Next, false);
         };
         if !slot.claim(turn) {
-            return Step::Next;
+            return (Step::Next, false);
         }
         #[cfg(test)]
         if self.faults.hold_before_grant.swap(false, Ordering::AcqRel) {
@@ -448,20 +514,23 @@ impl Engine {
             .is_err()
         {
             slot.rollback(turn);
-            return Step::Wait;
+            return (Step::Wait, false);
         }
         // Design §3.1 [r1.1]: a close order found by the claim step releases
         // the permit and leaves the turn to the close pass.
         if slot.closing() || !self.grant() {
             slot.rollback(turn);
-            return Step::Next;
+            return (Step::Next, false);
         }
         // Task 4 design §5.3, §5.4: below the free-space floor or at
         // `wal.max`, the turn fails `store` before submission; no agent I/O,
         // so the connection slot is released first.
         if let Some(message) = self.dispatch_refusal().await {
             drop(connection);
-            return self.fail_at_dispatch(slot, session, turn, message).await;
+            return (
+                self.fail_at_dispatch(slot, session, turn, message).await,
+                false,
+            );
         }
         #[cfg(test)]
         if self.faults.hold_after_grant.load(Ordering::Acquire) {
@@ -476,19 +545,21 @@ impl Engine {
         // happened yet; bounded shutdown reports the turn unresolved, and
         // restart recovery settles it. It is a limit before the actor owns
         // the turn, not a cancellation guarantee.
-        let submission = match self.submit(slot, session, turn).await {
+        let submission = match self.submit(slot, (session, turn), read).await {
             Ok(submission) => submission,
             Err(failure) => {
-                return self
+                let step = self
                     .submit_failure(slot, (session, turn), failure, connection)
                     .await;
+                return (step, false);
             }
         };
         #[cfg(test)]
         self.hold(&self.faults.hold_after_submit).await;
-        // C2 §2: the session's driver, opened at its first dispatch, or
-        // replaced when its health failed. A pin that went stale meanwhile
-        // is the driver's to refuse (AD16 rule 4).
+        // C2 §2: the session's driver, opened before admission, or here
+        // when its queued row could not be read then (it fails above). A
+        // pin that went stale meanwhile is the driver's to refuse (AD16
+        // rule 4).
         let cwd = submission
             .queued
             .cwd
@@ -505,7 +576,47 @@ impl Engine {
         self.queued.fetch_sub(1, Ordering::AcqRel);
         self.run_on_lane(slot, submission, (claim, prepared, connection))
             .await;
-        Step::Next
+        (Step::Next, true)
+    }
+
+    /// The turn's connection (C2 §3 connection admission): `Pinned` needs
+    /// no slot; `NeedsConnection` waits for one, FIFO. The driver's
+    /// `readiness()` receiver is taken before its first `prepare()` and
+    /// kept through the slot wait: each change marks the epoch seen and
+    /// prepares again, and `Pinned` ends the wait (x.3.2 X0 item 0). A
+    /// dispatch with no lane needs a slot. `None` when the wait was given
+    /// up ([`Self::reserve`]).
+    async fn connect(
+        &self,
+        slot: &Slot,
+        turn: TurnNumber,
+        claim: Option<&LaneClaim>,
+    ) -> Option<(Prepared, Option<tokio::sync::OwnedSemaphorePermit>)> {
+        let Some(claim) = claim else {
+            let permit = self.reserve_connection(slot, turn, None).await?;
+            return match permit {
+                Reserved::Permit(permit) => Some((Prepared::NeedsConnection, Some(permit))),
+                Reserved::Pinned(prepared) => Some((prepared, None)),
+            };
+        };
+        let mut ready = claim.driver.readiness().map(|receiver| Ready {
+            receiver,
+            driver: &claim.driver,
+        });
+        let prepared = match ready.as_mut() {
+            Some(ready) => ready.prepare(),
+            None => claim.driver.prepare(),
+        };
+        // Test builds: between the first `prepare()` and the slot wait.
+        #[cfg(test)]
+        self.hold(&self.faults.hold_after_prepare).await;
+        match prepared {
+            Prepared::Pinned(_) => Some((prepared, None)),
+            Prepared::NeedsConnection => match self.reserve_connection(slot, turn, ready).await? {
+                Reserved::Permit(permit) => Some((Prepared::NeedsConnection, Some(permit))),
+                Reserved::Pinned(prepared) => Some((prepared, None)),
+            },
+        }
     }
 
     /// Hands the submitted turn, with its lane's claim, to the lane's
@@ -565,8 +676,10 @@ impl Engine {
         &self,
         slot: &Slot,
         turn: TurnNumber,
-    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        self.reserve(&self.slots, (slot, turn), Pool::Slots).await
+        ready: Option<Ready<'_>>,
+    ) -> Option<Reserved> {
+        self.reserve(&self.slots, (slot, turn), (Pool::Slots, ready))
+            .await
     }
 
     /// Waits for a resident lane, FIFO daemon-wide, for a dispatch that
@@ -580,8 +693,14 @@ impl Engine {
         slot: &Slot,
         turn: TurnNumber,
     ) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        self.reserve(&self.resident, (slot, turn), Pool::Resident)
-            .await
+        match self
+            .reserve(&self.resident, (slot, turn), (Pool::Resident, None))
+            .await?
+        {
+            Reserved::Permit(permit) => Some(permit),
+            // Only a connection wait re-prepares.
+            Reserved::Pinned(_) => None,
+        }
     }
 
     /// Waits for a permit of `pool`, FIFO daemon-wide, the turn still
@@ -591,18 +710,20 @@ impl Engine {
     /// cancel or a close order changes it). `None` once force is accepted
     /// or Store failure is pending (the force signal carries both), or once
     /// the head changed: the permit, if any, is dropped and the dispatcher
-    /// decides again. Test builds: `kind`'s point acknowledges the
-    /// registered wait.
+    /// decides again. With `ready`, a driver readiness change prepares
+    /// the turn again, and `Pinned` ends the wait with no permit (x.3.2 X0
+    /// item 0); a closed readiness channel is no wake. Test builds:
+    /// `kind`'s point acknowledges the registered wait.
     async fn reserve(
         &self,
         pool: &Arc<tokio::sync::Semaphore>,
         (slot, turn): (&Slot, TurnNumber),
-        kind: Pool,
-    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        (kind, mut ready): (Pool, Option<Ready<'_>>),
+    ) -> Option<Reserved> {
         #[cfg(not(feature = "test-failpoints"))]
         let _ = kind;
         if let Ok(permit) = Arc::clone(pool).try_acquire_owned() {
-            return Some(permit);
+            return Some(Reserved::Permit(permit));
         }
         let mut force = self.signal.force.subscribe();
         let acquire = Arc::clone(pool).acquire_owned();
@@ -610,7 +731,9 @@ impl Engine {
         // One poll registers the waiter in the semaphore's FIFO queue.
         tokio::select! {
             biased;
-            permit = &mut acquire => return permit.ok().filter(|_| slot.waiting_head(turn)),
+            permit = &mut acquire => {
+                return permit.ok().filter(|_| slot.waiting_head(turn)).map(Reserved::Permit);
+            }
             () = std::future::ready(()) => {}
         }
         // A resident wait is owed an idle lane's retirement (critical r4
@@ -626,11 +749,18 @@ impl Engine {
                 biased;
                 _ = force.wait_for(Option::is_some) => return None,
                 permit = &mut acquire => {
-                    return permit.ok().filter(|_| slot.waiting_head(turn));
+                    return permit.ok().filter(|_| slot.waiting_head(turn)).map(Reserved::Permit);
                 }
                 () = slot.woken() => {
                     if !slot.waiting_head(turn) {
                         return None;
+                    }
+                }
+                () = Ready::changed(ready.as_mut()) => {
+                    if let Some(ready) = ready.as_mut()
+                        && let prepared @ Prepared::Pinned(_) = ready.prepare()
+                    {
+                        return Some(Reserved::Pinned(prepared));
                     }
                 }
             }
@@ -965,6 +1095,7 @@ impl Engine {
             record,
             requested_at,
             launched: forced.launched,
+            connection_kind: forced.connection_kind,
             close: forced.close,
             cause: order.map(|order| order.cause),
             text,
@@ -1675,6 +1806,7 @@ impl Engine {
                         quiescent: route.cleanup == Some(WireCleanup::Quiescent),
                     },
                     journal_uncertain: route.journal_uncertain,
+                    connection_kind: lane.driver.connection_kind(),
                 })
             }
             outcome => Driven::Finished(Box::new((terminal, outcome))),
@@ -2451,8 +2583,8 @@ impl Engine {
     async fn submit(
         &self,
         slot: &Slot,
-        session: &SessionId,
-        turn: TurnNumber,
+        (session, turn): (&SessionId, TurnNumber),
+        read: Option<QueuedRead>,
     ) -> Result<Submission, SubmitFailure> {
         #[cfg(test)]
         if self.faults.submission_unread.swap(false, Ordering::AcqRel) {
@@ -2461,7 +2593,12 @@ impl Engine {
         }
         // Sol r2 #5: held through the publication below, on every path.
         let _selection = slot.selection.lock().await;
-        let submitted = Self::commit_submission(&self.store, session, turn, &slot.head).await;
+        let submitted = match read {
+            Some(read) => {
+                Self::commit_read_submission(&self.store, (session, turn), &slot.head, read).await
+            }
+            None => Self::commit_submission(&self.store, session, turn, &slot.head).await,
+        };
         #[cfg(test)]
         if submitted.is_ok()
             && self
@@ -2514,20 +2651,26 @@ impl Engine {
         turn: TurnNumber,
         head: &Head,
     ) -> Result<Submission, SubmitFailure> {
-        let mut queued = match journal.queued_turn(session, turn).await {
+        let read = journal.queued_turn(session, turn).await;
+        Self::commit_read_submission(journal, (session, turn), head, read).await
+    }
+
+    /// [`Self::commit_submission`] from the queued row's `read`, already
+    /// made (x.3.2 X0 item 0).
+    async fn commit_read_submission(
+        journal: &impl TurnJournal,
+        (session, turn): (&SessionId, TurnNumber),
+        head: &Head,
+        read: QueuedRead,
+    ) -> Result<Submission, SubmitFailure> {
+        let mut queued = match read {
             Ok(Some(queued)) => queued,
             // Store could not parse the row's frozen values (design §7.3).
             Err(StoreError::CorruptEvidence) => return Err(SubmitFailure::Corrupt(None)),
             Ok(None) | Err(_) => return Err(SubmitFailure::Unread),
         };
         let queueing = |queued: &QueuedTurn| Queueing::from(queued);
-        // A frozen row Core cannot read fails the turn: nothing is sent.
-        let Ok(effective) = serde_json::from_value::<Effective>(queued.effective.clone()) else {
-            return Err(SubmitFailure::Corrupt(Some(queueing(&queued))));
-        };
-        // Sol r1 #14: so does a session's frozen parameters or capabilities,
-        // and critical r1 #2 a frozen `inherit` that is not there to read.
-        let Some(inherit) = Frozen::decode(&queued.route).and_then(|frozen| frozen.inherit) else {
+        let Some((effective, inherit)) = frozen_values(&queued) else {
             return Err(SubmitFailure::Corrupt(Some(queueing(&queued))));
         };
         // Design §6.5: a blob prompt is loaded into one exact `String` with
@@ -2687,6 +2830,9 @@ pub(super) fn ended_record(
 ) -> Result<TerminalRecord, ApiError> {
     // Critical r1 #4: the validation outcome on the final classification.
     super::output::project_output(&record, &mut terminal);
+    // x.3.2 X0 item 6.5: the turn's known-quiescent cleanup releases its
+    // server link in the terminal's transaction.
+    let link_released = terminal.quiescent;
     let ended_at = rfc3339(SystemTime::now());
     // Design §3.2: every terminal built from the record carries the rows it
     // could not commit and the open step's.
@@ -2732,7 +2878,7 @@ pub(super) fn ended_record(
         envelope,
         event,
         steps,
-        link_released: false,
+        link_released,
     })
 }
 
@@ -2758,6 +2904,66 @@ fn stop_for_store(record: &TurnRecord, control: &mut Control<'_>) {
         control
             .slot
             .store_order(control.turn, tokio::time::Instant::now());
+    }
+}
+
+/// A queued row's read, made once per dispatch (x.3.2 X0 item 0).
+type QueuedRead = Result<Option<QueuedTurn>, StoreError>;
+
+/// [`Engine::open_for`]'s answer.
+enum Opened {
+    /// The session's lane, opened and claimed, and the row's read.
+    Lane(LaneClaim, QueuedRead),
+    /// The row reads but cannot be parsed: no lane; the submission fails
+    /// it as corrupt.
+    Unopened(tokio::sync::OwnedSemaphorePermit, QueuedRead),
+    /// The row could not be read: nothing claimed or written.
+    Unread,
+}
+
+/// A queued turn's frozen effective values and its session's frozen
+/// `inherit`; `None` when Core cannot read them. A frozen row Core cannot
+/// read fails the turn: nothing is sent. So does a session's frozen
+/// parameters or capabilities (Sol r1 #14), and a frozen `inherit` that is
+/// not there to read (critical r1 #2).
+fn frozen_values(queued: &QueuedTurn) -> Option<(Effective, InheritPlan)> {
+    let effective = serde_json::from_value::<Effective>(queued.effective.clone()).ok()?;
+    let inherit = Frozen::decode(&queued.route).and_then(|frozen| frozen.inherit)?;
+    Some((effective, inherit))
+}
+
+/// What a wait for a pool gives a dispatch.
+enum Reserved {
+    /// A permit of the pool.
+    Permit(tokio::sync::OwnedSemaphorePermit),
+    /// A connection wait's driver answered `Pinned` on a readiness change.
+    Pinned(Prepared),
+}
+
+/// A connection wait's driver readiness (x.3.2 X0 item 0, C2 §3): the
+/// receiver taken before the first `prepare()`.
+struct Ready<'a> {
+    receiver: watch::Receiver<u64>,
+    driver: &'a via_adapters::SessionDriver,
+}
+
+impl Ready<'_> {
+    /// Marks the epoch seen, then prepares: a change after the mark wakes
+    /// [`Self::changed`], and one before it is visible to `prepare()`.
+    fn prepare(&mut self) -> Prepared {
+        self.receiver.borrow_and_update();
+        self.driver.prepare()
+    }
+
+    /// The next readiness change; never without a receiver or once its
+    /// channel closed (no wake).
+    async fn changed(ready: Option<&mut Self>) {
+        let Some(ready) = ready else {
+            return std::future::pending().await;
+        };
+        if ready.receiver.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
     }
 }
 
@@ -3092,6 +3298,8 @@ pub(super) fn queued_cancellation(
             requested_at: requested_at.clone(),
             settled_at: rfc3339(SystemTime::now()),
         }),
+        // Never submitted: no server link.
+        quiescent: false,
     };
     let extras = TerminalExtras {
         cancel_cause: cause.map(|(cause, _)| cause),

@@ -211,7 +211,10 @@ fn build(
     } = affected;
     let session = &started.session;
     let mut seq = first;
-    let ended = ended_record(&started, record, terminal, seq).ok()?;
+    let mut ended = ended_record(&started, record, terminal, seq).ok()?;
+    // x.3.2 X0 item 6.5: a terminal committed after a Store write of
+    // uncertain outcome has no known quiescent cleanup: its link stays.
+    ended.link_released = false;
     let mut cancellations = Vec::with_capacity(queued.len());
     if let Some(slot) = slot {
         for (turn, row) in queued {

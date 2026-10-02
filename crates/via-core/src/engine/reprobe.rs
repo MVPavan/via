@@ -135,15 +135,14 @@ impl Engine {
         match pass {
             Ok(report) => {
                 for owner in &report.not_committed {
-                    // No server-owned anchor is committed before Host owns
-                    // servers.
-                    let via_adapters::ProcessOwner::Turn {
-                        session_id: owner, ..
-                    } = owner
-                    else {
-                        continue;
+                    // A shared server's proof is no session's (x.3.2 X0
+                    // item 6.1): scope `daemon`, no address.
+                    let owner = match owner {
+                        via_adapters::ProcessOwner::Turn { session_id, .. } => {
+                            FailureScope::Session(session_id)
+                        }
+                        via_adapters::ProcessOwner::Server { .. } => FailureScope::Daemon,
                     };
-                    let owner = FailureScope::Session(owner);
                     self.store_failure(FailureSite::Absence, WriteOutcome::NotCommitted, owner)
                         .finish()
                         .await;
@@ -229,14 +228,6 @@ impl Engine {
     /// until a later proof.
     fn hold_unread(&self, owners: &[AnchorOwner], reports: &[via_adapters::AnchorRecovery]) {
         for owner in owners {
-            // No server-owned anchor is committed before Host owns servers.
-            let via_store::ProcessOwner::Turn {
-                session_id: owner_session,
-                turn,
-            } = &owner.owner
-            else {
-                continue;
-            };
             let proved = reports.iter().any(|report| {
                 report.anchor_id == owner.anchor_id && report.cleanup == Cleanup::Quiescent
             });
@@ -244,10 +235,7 @@ impl Engine {
                 let token = self.recovered.hold(&self.slots);
                 self.adapter.hold_capacity(
                     owner.anchor_id.clone(),
-                    via_store::ProcessOwner::Turn {
-                        session_id: owner_session.clone(),
-                        turn: *turn,
-                    },
+                    owner.owner.clone(),
                     Box::new(token),
                 );
             }

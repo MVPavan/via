@@ -851,7 +851,7 @@ impl Lane {
     }
 
     /// Retires the lane once no turn holds it, and waits for its end.
-    async fn retire_now(&self) {
+    pub(super) async fn retire_now(&self) {
         let mut changes = self.changed.subscribe();
         while !self.begin_retire() {
             if changes.changed().await.is_err() {
@@ -1519,6 +1519,8 @@ impl Engine {
             cancel: self.cancel.child_token(),
         };
         let driver = self.adapter.open_session(&reference, spec, cx);
+        #[cfg(test)]
+        self.faults.lanes_opened.fetch_add(1, Ordering::AcqRel);
         let lane = self.install_lane(
             session,
             ((driver, reference), (receiver, budget)),
@@ -1685,6 +1687,14 @@ impl Engine {
         self.pressed.fetch_add(1, Ordering::SeqCst);
         self.evict_idle();
         Pressed(&self.pressed)
+    }
+
+    /// Test builds only: the adapter set's stand-in admission (x.3.2 X0
+    /// item 0), installed on first call; drivers opened later take it.
+    #[cfg(feature = "test-failpoints")]
+    #[must_use]
+    pub fn stand_in(&self) -> Arc<via_adapters::StandIn> {
+        self.adapter.stand_in()
     }
 
     /// Test builds: the lanes registered, those of them whose actor has

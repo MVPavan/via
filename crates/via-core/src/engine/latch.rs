@@ -225,13 +225,17 @@ pub(super) enum FailureScope<'a> {
     Turn(&'a SessionId, TurnNumber),
     /// A session-level write.
     Session(&'a SessionId),
+    /// A write no session owns, as a shared server anchor's absence proof
+    /// (x.3.2 X0 item 6.1): C1 scope `daemon`, with no address. A
+    /// not-committed one does not latch.
+    Daemon,
 }
 
 impl FailureScope<'_> {
     /// The C1 addresses of the failure's turn or session.
     fn addresses(self) -> Vec<String> {
         match self {
-            Self::Request => Vec::new(),
+            Self::Request | Self::Daemon => Vec::new(),
             Self::Turn(session, turn) => vec![format!("{}/{}", session.as_str(), turn.get())],
             Self::Session(session) => vec![session.as_str().to_owned()],
         }
@@ -552,7 +556,11 @@ impl Signal {
     ) {
         let latest = LatestFailure {
             kind: failure_kind(site, outcome),
-            scope: if latches { "daemon" } else { site.scope() },
+            scope: if latches || matches!(scope, FailureScope::Daemon) {
+                "daemon"
+            } else {
+                site.scope()
+            },
             since: rfc3339(SystemTime::now()),
             addresses: scope.addresses(),
         };

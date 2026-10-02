@@ -670,6 +670,10 @@ pub struct AdapterSet {
     /// latest last ([`Self::param_sizes_seen`]).
     #[cfg(feature = "test-failpoints")]
     sizes_seen: std::sync::Mutex<Vec<ParamSizes>>,
+    /// Test builds: the stand-in admission drivers opened later take
+    /// ([`Self::stand_in`]).
+    #[cfg(feature = "test-failpoints")]
+    pub(crate) stand_in: std::sync::OnceLock<Arc<crate::StandIn>>,
 }
 
 impl AdapterSet {
@@ -711,6 +715,8 @@ impl AdapterSet {
             runtime: Arc::new(runtime),
             #[cfg(feature = "test-failpoints")]
             sizes_seen: std::sync::Mutex::default(),
+            #[cfg(feature = "test-failpoints")]
+            stand_in: std::sync::OnceLock::new(),
         })
     }
 
