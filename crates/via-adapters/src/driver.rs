@@ -5,7 +5,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
 use serde_json::value::RawValue;
@@ -15,7 +15,7 @@ use tokio_util::task::TaskTracker;
 
 use crate::fake::FakeAdapter;
 use crate::observation::{
-    AdapterError, ObservationSink, SteerDelivery, SteerReceipt, SteerToken, TurnEnd, TurnEvidence,
+    AdapterError, ObservationSink, SteerDelivery, SteerToken, TurnEnd, TurnEvidence,
 };
 use crate::plan::{Bound, InheritPlan, VendorOptions};
 use crate::{
@@ -122,14 +122,18 @@ pub struct SteerInput {
     /// The canonical turn the caller selected; the driver refuses the
     /// input unless it is running that turn (C2 §2).
     pub turn: TurnNumber,
+    /// Core's token for this input, unique within the session: the
+    /// `steer.delivered` observation the driver emits for it carries it
+    /// (C2 `SteerInput.token`, critical r2 #2).
+    pub token: SteerToken,
     /// The text.
     pub text: String,
     /// The vendor turn the caller means; another running turn refuses it.
     pub expected_vendor_turn: Option<VendorTurnId>,
 }
 
-/// Why steer input was not delivered.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Why steer input was not delivered, or not recorded.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SteerError {
     /// The route does not support steer.
     Unsupported,
@@ -145,6 +149,14 @@ pub enum SteerError {
     NotSteerable,
     /// The input was not written whole: its delivery is uncertain.
     NotDelivered,
+    /// The vendor took the input whole, as `delivery` says, but its
+    /// `steer.delivered` observation could not be emitted (a full
+    /// observation queue, or the turn's end, a forced stop included), so no
+    /// event records it (critical r2 #3).
+    NotRecorded {
+        /// How the input reached the vendor.
+        delivery: SteerDelivery,
+    },
 }
 
 /// How a session closes (C2 §2).
@@ -213,8 +225,6 @@ pub(crate) struct DriverState {
     /// The generation a turn holds and may still deliver on
     /// ([`Delivering`]).
     pub(crate) delivering: Option<u64>,
-    /// The last [`SteerToken`] minted (critical r1 #5).
-    pub(crate) steer_tokens: u64,
     /// Test builds: the daemon adapter's nth-retirement fault (Sol r3 N10).
     #[cfg(feature = "test-failpoints")]
     pub(crate) retirement_fault: Option<Arc<crate::fake::RetirementFault>>,
@@ -233,18 +243,109 @@ impl Drop for Delivering {
     }
 }
 
-/// The steer callers waiting for their `steer.delivered` observation to be
-/// emitted, by token (C2 §2 `SteerReceipt`, critical r1 #5): the turn's
-/// normalizer answers `true` once the observation is on the session
-/// channel, `false` when it could not put it there; a sender dropped with
-/// the turn answers nothing either.
-pub(crate) type SteerEmissions = Arc<Mutex<HashMap<u64, oneshot::Sender<bool>>>>;
+/// The running turn's steer callers waiting for their `steer.delivered`
+/// observation's emission, by token (C2 `SteerInput.token`; critical r1
+/// #5, r2 #1). The turn's normalizer answers each `true` once the
+/// observation is on the session channel, `false` when it could not put it
+/// there. The turn's end, by any path, closes the registry and answers
+/// every caller left ([`SteerTurn`]); none registers after. A caller holds
+/// only its receiver and retires its own entry when its future is dropped
+/// ([`SteerWait`]), so the registry holds at most the turn's live callers.
+#[derive(Default)]
+pub(crate) struct SteerEmissions(Mutex<SteerRegistry>);
 
-/// Locks a turn's [`SteerEmissions`]; never held across an await.
-pub(crate) fn emissions(
-    emissions: &Mutex<HashMap<u64, oneshot::Sender<bool>>>,
-) -> MutexGuard<'_, HashMap<u64, oneshot::Sender<bool>>> {
-    emissions.lock().unwrap_or_else(PoisonError::into_inner)
+#[derive(Default)]
+struct SteerRegistry {
+    waiting: HashMap<u64, oneshot::Sender<bool>>,
+    closed: bool,
+}
+
+impl SteerEmissions {
+    /// Never held across an await; a poisoned registry is still consistent.
+    fn lock(&self) -> MutexGuard<'_, SteerRegistry> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Registers the caller of `token`; `None` once the turn ended.
+    fn wait(self: &Arc<Self>, token: u64) -> Option<SteerWait> {
+        let mut registry = self.lock();
+        if registry.closed {
+            return None;
+        }
+        let (sender, receiver) = oneshot::channel();
+        registry.waiting.insert(token, sender);
+        Some(SteerWait {
+            receiver,
+            registry: Arc::downgrade(self),
+            token,
+        })
+    }
+
+    /// Answers the caller of `token`, if it still waits: whether its
+    /// observation is on the session channel.
+    pub(crate) fn answer(&self, token: u64, emitted: bool) {
+        let waiting = self.lock().waiting.remove(&token);
+        if let Some(waiting) = waiting {
+            // The caller went away meanwhile: nobody waits for the answer.
+            let _ = waiting.send(emitted);
+        }
+    }
+
+    /// The turn ended: every caller left learns its observation was not
+    /// emitted, and none registers after.
+    fn close(&self) {
+        let waiting = {
+            let mut registry = self.lock();
+            registry.closed = true;
+            std::mem::take(&mut registry.waiting)
+        };
+        for waiting in waiting.into_values() {
+            let _ = waiting.send(false);
+        }
+    }
+
+    /// How many callers wait.
+    #[cfg(any(test, feature = "test-failpoints"))]
+    fn len(&self) -> usize {
+        self.lock().waiting.len()
+    }
+}
+
+/// Owned by a turn's `run_turn` for its life: dropped when the turn ends
+/// by any path (its return, its future dropped, a forced stop or the
+/// cutoff), it closes the turn's [`SteerEmissions`], so a steer never
+/// outlives its turn (critical r2 #1).
+pub(crate) struct SteerTurn(pub(crate) Arc<SteerEmissions>);
+
+impl Drop for SteerTurn {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
+/// One steer caller's wait for its observation's emission. It holds only
+/// its receiver and a weak handle on the registry, so it never keeps its
+/// own completion alive; dropped unanswered, it retires its entry.
+struct SteerWait {
+    receiver: oneshot::Receiver<bool>,
+    registry: Weak<SteerEmissions>,
+    token: u64,
+}
+
+impl SteerWait {
+    /// Whether the observation was emitted; the turn's end without an
+    /// answer is not.
+    async fn emitted(mut self) -> bool {
+        (&mut self.receiver).await.unwrap_or(false)
+    }
+}
+
+impl Drop for SteerWait {
+    fn drop(&mut self) {
+        if let Some(registry) = self.registry.upgrade() {
+            registry.lock().waiting.remove(&self.token);
+        }
+    }
 }
 
 /// The running turn's driver-side lanes.
@@ -254,7 +355,7 @@ pub(crate) struct Active {
     /// Its steer lane.
     pub(crate) steer: SteerSender,
     /// Its steer callers awaiting their observation's emission.
-    pub(crate) emissions: SteerEmissions,
+    pub(crate) emissions: Arc<SteerEmissions>,
     /// Its driver-side stop order: a session close.
     pub(crate) close: watch::Sender<Option<StopOrder>>,
 }
@@ -270,7 +371,7 @@ impl Active {
             turn,
             steer,
             close,
-            emissions: SteerEmissions::default(),
+            emissions: Arc::default(),
         }
     }
 }
@@ -368,6 +469,16 @@ impl SessionDriver {
     #[cfg(any(test, feature = "test-failpoints"))]
     pub fn spec(&self) -> &SessionSpec {
         &self.spec
+    }
+
+    /// Test builds: how many steer callers of the running turn wait for
+    /// their observation's emission (critical r2 #1).
+    #[cfg(any(test, feature = "test-failpoints"))]
+    pub fn steers_waiting(&self) -> usize {
+        self.state()
+            .active
+            .as_ref()
+            .map_or(0, |active| active.emissions.len())
     }
 
     /// The ID identity confirmations name for the driver's current
@@ -510,12 +621,12 @@ impl SessionDriver {
     /// Admission checks `input.turn` against the turn the driver runs under
     /// the state lock it enqueues under: another turn is `TurnMismatch`,
     /// none `NoActiveTurn`, so the input never reaches a successor. The
-    /// receipt's token is the one the `steer.delivered` observation
-    /// carries, which the turn emitted before this returns (C2 §2
-    /// `SteerReceipt`). A delivery the turn could not put on the session
-    /// channel (overflow, or the daemon force cutting the delivery) is
-    /// `NotDelivered`: the vendor took it, but VIA holds no record of it.
-    pub async fn steer(&self, input: SteerInput) -> Result<SteerReceipt, SteerError> {
+    /// `steer.delivered` observation carrying `input.token` is on the
+    /// session channel before this returns `Ok` (C2 `SteerInput.token`). A
+    /// delivery the vendor took whose observation the turn could not put
+    /// there (a full queue, or the turn's end first, a forced stop
+    /// included) is `NotRecorded`; the turn's end always answers.
+    pub async fn steer(&self, input: SteerInput) -> Result<SteerDelivery, SteerError> {
         let delivery = match self
             .adapter
             .as_ref()
@@ -530,8 +641,10 @@ impl SessionDriver {
         let expected = input
             .expected_vendor_turn
             .map(|turn| turn.as_str().to_owned());
-        let (token, emitted, answer, waiting) = {
-            let mut state = self.state();
+        let token = input.token.get();
+        // Dropped unanswered, `wait` retires its entry.
+        let (wait, answer) = {
+            let state = self.state();
             let Some(active) = state.active.as_ref() else {
                 return Err(SteerError::NoActiveTurn);
             };
@@ -544,45 +657,28 @@ impl SessionDriver {
                 .as_ref()
                 .and_then(|adapter| adapter.profile().steer_refusal)
             {
-                return Err(refusal.error());
+                return Err(refusal.error(&delivery));
             }
-            let waiting = Arc::clone(&active.emissions);
-            state.steer_tokens += 1;
-            let token = state.steer_tokens;
-            let (sender, emitted) = oneshot::channel();
-            emissions(&waiting).insert(token, sender);
-            let sent = state
-                .active
-                .as_ref()
-                .map(|active| active.steer.send(input.text, expected, token));
-            match sent {
-                Some(Ok(answer)) => (token, emitted, answer, waiting),
-                Some(Err(refused)) => {
-                    emissions(&waiting).remove(&token);
-                    return Err(steer_error(refused));
-                }
-                None => {
-                    emissions(&waiting).remove(&token);
-                    return Err(SteerError::NoActiveTurn);
-                }
-            }
-        };
-        let refused = |error| {
-            emissions(&waiting).remove(&token);
-            Err(error)
+            let wait = active
+                .emissions
+                .wait(token)
+                .ok_or(SteerError::NoActiveTurn)?;
+            let answer = active
+                .steer
+                .send(input.text, expected, token)
+                .map_err(steer_error)?;
+            (wait, answer)
         };
         match answer.await {
             Ok(Ok(())) => {}
-            Ok(Err(refused_by)) => return refused(steer_error(refused_by)),
+            Ok(Err(refused)) => return Err(steer_error(refused)),
             // The turn ended first.
-            Err(_) => return refused(SteerError::NoActiveTurn),
+            Err(_) => return Err(SteerError::NoActiveTurn),
         }
-        match emitted.await {
-            Ok(true) => Ok(SteerReceipt {
-                delivery,
-                token: SteerToken::new(token),
-            }),
-            Ok(false) | Err(_) => Err(SteerError::NotDelivered),
+        if wait.emitted().await {
+            Ok(delivery)
+        } else {
+            Err(SteerError::NotRecorded { delivery })
         }
     }
 

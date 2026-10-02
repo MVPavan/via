@@ -38,8 +38,8 @@ use serde_json::{Map, Value};
 use tokio::sync::{OwnedSemaphorePermit, mpsc, watch};
 use via_adapters::{
     Admitted, CancellationToken, CloseMode, CloseReport, DriverFailure, DriverHealth, InheritPlan,
-    OBSERVATION_BYTES, OBSERVATION_ITEMS, Observation, ObservationBudget, SessionCx, SessionDriver,
-    SessionRef, SessionSpec, SteerToken, UsageSample, VendorTerminal, observation_channel_in,
+    OBSERVATION_BYTES, Observation, ObservationBudget, SessionCx, SessionDriver, SessionRef,
+    SessionSpec, SteerToken, UsageSample, VendorTerminal, observation_channel_in,
 };
 use via_store::{SessionIdentity, SessionRoute};
 
@@ -288,19 +288,88 @@ pub(super) struct Lane {
     /// close asked for that driver close or took it over before it started:
     /// that close takes it ([`Engine::close_lane`]).
     report: StdMutex<Option<CloseReport>>,
-    /// How each `steer.delivered` the lane consumed fared (critical r1 #5).
-    steers: SteerOutcomes,
+    /// The completion tickets of the lane's live steer requests (critical
+    /// r2 #2).
+    steers: Arc<SteerTickets>,
 }
 
-/// Critical r1 #5 (C1 §3.4, C2 §2 `SteerReceipt`): whether each
-/// `steer.delivered` observation the lane consumed committed, by its
-/// token, until the steer waiting on it takes it. At most
-/// [`OBSERVATION_ITEMS`] are kept, as many as the channel holds: the
-/// oldest, one whose steer caller went away, is dropped first.
+/// The tokens Core gives steer input, unique within every session (C2
+/// `SteerInput.token`): one counter for the daemon.
+static STEER_TOKENS: AtomicU64 = AtomicU64::new(0);
+
+/// Critical r1 #5, r2 #2 (C1 §3.4, C2 `SteerInput.token`): the completion
+/// ticket of each live steer request on the lane, by its token. A request
+/// registers one before it calls `steer` and retires it when it ends by
+/// any path ([`SteerTicket`]); consuming the token's `steer.delivered`
+/// resolves it, committed or not, and an observation whose ticket is gone
+/// just commits. The lane's end resolves every ticket left as not
+/// committed. So the tickets are the lane's live steer requests, never
+/// evicted: each holds one from its registration until it is answered.
 #[derive(Default)]
-struct SteerOutcomes {
-    outcomes: StdMutex<VecDeque<(SteerToken, bool)>>,
-    recorded: tokio::sync::Notify,
+struct SteerTickets(StdMutex<TicketBook>);
+
+#[derive(Default)]
+struct TicketBook {
+    tickets: HashMap<SteerToken, tokio::sync::oneshot::Sender<bool>>,
+    /// The lane ended: a later request's ticket is resolved at once.
+    closed: bool,
+}
+
+impl SteerTickets {
+    fn book(&self) -> std::sync::MutexGuard<'_, TicketBook> {
+        lock(&self.0)
+    }
+
+    /// Resolves the ticket of `token`, if its request still waits.
+    fn resolve(&self, token: SteerToken, committed: bool) {
+        let ticket = self.book().tickets.remove(&token);
+        if let Some(ticket) = ticket {
+            // The request ended meanwhile: nobody waits for the answer.
+            let _ = ticket.send(committed);
+        }
+    }
+
+    /// The lane ended: every ticket left is not committed.
+    fn close(&self) {
+        let tickets = {
+            let mut book = self.book();
+            book.closed = true;
+            std::mem::take(&mut book.tickets)
+        };
+        for ticket in tickets.into_values() {
+            let _ = ticket.send(false);
+        }
+    }
+}
+
+/// One live steer request's completion ticket on its lane (critical r2
+/// #2): its token, which the request passes to `steer`, and whether the
+/// token's `steer.delivered` committed. Dropped, it retires itself.
+pub(super) struct SteerTicket {
+    token: SteerToken,
+    resolved: tokio::sync::oneshot::Receiver<bool>,
+    tickets: Weak<SteerTickets>,
+}
+
+impl SteerTicket {
+    /// The token the request's input carries.
+    pub(super) const fn token(&self) -> SteerToken {
+        self.token
+    }
+
+    /// Whether the token's `steer.delivered` observation committed: the
+    /// wait ends with its consumption, committed or not, or the lane's end.
+    pub(super) async fn committed(&mut self) -> bool {
+        (&mut self.resolved).await.unwrap_or(false)
+    }
+}
+
+impl Drop for SteerTicket {
+    fn drop(&mut self) {
+        if let Some(tickets) = self.tickets.upgrade() {
+            tickets.book().tickets.remove(&self.token);
+        }
+    }
 }
 
 /// What the lane learned from the session's observations.
@@ -577,7 +646,7 @@ impl Lane {
             used: AtomicU64::new(use_tick()),
             engine,
             report: StdMutex::new(None),
-            steers: SteerOutcomes::default(),
+            steers: Arc::default(),
         }
     }
 
@@ -742,44 +811,32 @@ impl Lane {
     }
 
     /// Records whether the `steer.delivered` observation of `token`
-    /// committed, once consumed on any of its paths (critical r1 #5).
+    /// committed, once consumed on any of its paths (critical r1 #5): its
+    /// request's ticket, if it still waits, learns it.
     pub(super) fn steer_outcome(&self, token: SteerToken, committed: bool) {
-        {
-            let mut outcomes = lock(&self.steers.outcomes);
-            if outcomes.len() == OBSERVATION_ITEMS {
-                outcomes.pop_front();
-            }
-            outcomes.push_back((token, committed));
-        }
-        self.steers.recorded.notify_waiters();
+        self.steers.resolve(token, committed);
     }
 
-    /// Whether the `steer.delivered` observation of `token`, which its
-    /// driver emitted on this lane's channel before answering the steer,
-    /// committed (C1 §3.4, C2 §2 `SteerReceipt`). The wait ends with the
-    /// observation's commit, or its consumption without one; the lane's
-    /// end, its channel drained, without either is no commit.
-    pub(super) async fn steer_committed(&self, token: SteerToken) -> bool {
-        loop {
-            let recorded = self.steers.recorded.notified();
-            tokio::pin!(recorded);
-            recorded.as_mut().enable();
-            {
-                let mut outcomes = lock(&self.steers.outcomes);
-                if let Some(index) = outcomes.iter().position(|(known, _)| *known == token) {
-                    return outcomes
-                        .remove(index)
-                        .is_some_and(|(_, committed)| committed);
-                }
-            }
-            if self.ended() {
-                return false;
-            }
-            tokio::select! {
-                () = &mut recorded => {}
-                () = self.retired() => {}
-            }
+    /// Registers a steer request's completion ticket, with a new token,
+    /// before the request calls `steer` (critical r2 #2).
+    pub(super) fn steer_ticket(&self) -> SteerTicket {
+        let token = SteerToken::new(STEER_TOKENS.fetch_add(1, Ordering::Relaxed) + 1);
+        let (sender, resolved) = tokio::sync::oneshot::channel();
+        let mut book = self.steers.book();
+        if !book.closed {
+            book.tickets.insert(token, sender);
         }
+        SteerTicket {
+            token,
+            resolved,
+            tickets: Arc::downgrade(&self.steers),
+        }
+    }
+
+    /// The live steer tickets.
+    #[cfg(test)]
+    pub(super) fn steer_tickets(&self) -> usize {
+        self.steers.book().tickets.len()
     }
 
     /// Retires the lane once no turn holds it, and waits for its end.
@@ -967,6 +1024,9 @@ impl Lane {
                 Err(removed) => break removed,
             }
         };
+        // Critical r2 #2: the channel is drained to its end; a steer
+        // request still waiting learns its report never committed.
+        self.steers.close();
         // Only an ended lane leaves the session's registration (Sol r5 R8),
         // when its session closed or the daemon's drivers were cancelled;
         // a retired one stays for its successor's state.

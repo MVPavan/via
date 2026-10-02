@@ -740,13 +740,18 @@ impl Engine {
         let lane = self
             .kept_lane(&params.session)
             .ok_or(ApiError::NO_ACTIVE_TURN)?;
+        // Critical r2 #2: the request's completion ticket, registered
+        // before the driver can emit its report; dropped with the request,
+        // whichever way it ends, it retires itself.
+        let mut ticket = lane.steer_ticket();
         let input = SteerInput {
             // Sol r1 #8: the driver admits it only into the selected turn.
             turn,
+            token: ticket.token(),
             text: params.text,
             expected_vendor_turn: vendor_turn.and_then(|id| VendorTurnId::try_from(id).ok()),
         };
-        let receipt = lane
+        let delivery = lane
             .driver
             .steer(input)
             .await
@@ -756,15 +761,22 @@ impl Engine {
                 SteerError::NoActiveTurn => ApiError::NO_ACTIVE_TURN,
                 SteerError::TurnMismatch => ApiError::TURN_MISMATCH,
                 SteerError::OverCapacity => ApiError::CONTROL_LANE_FULL,
-                SteerError::NotSteerable => ApiError::steer_failed("not_steerable", "none"),
-                SteerError::NotDelivered => ApiError::steer_failed("not_delivered", "uncertain"),
+                SteerError::NotSteerable => ApiError::steer_failed("not_steerable", "none".into()),
+                SteerError::NotDelivered => {
+                    ApiError::steer_failed("not_delivered", "uncertain".into())
+                }
+                // Critical r2 #3: the vendor took it; no event records it.
+                SteerError::NotRecorded { delivery } => ApiError::steer_failed(
+                    "not_recorded",
+                    steer_delivery(&delivery).to_owned().into(),
+                ),
             })?;
-        if !lane.steer_committed(receipt.token).await {
+        if !ticket.committed().await {
             return Err(ApiError::STORE);
         }
         Ok(json!({
             "turn": format!("{}/{}", params.session.as_str(), turn.get()),
-            "delivery": steer_delivery(&receipt.delivery),
+            "delivery": steer_delivery(&delivery),
         }))
     }
 }

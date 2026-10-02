@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use super::{FakeAdapter, FakeProfile};
 use crate::driver::{
     Active, Delivering, DriverState, ForceWatch, Prepared, Reservation, SessionDriver,
-    SteerEmissions, TurnCx, TurnSpec, emissions, latch, lock, rejected,
+    SteerEmissions, SteerTurn, TurnCx, TurnSpec, latch, lock, rejected,
 };
 use crate::harness::Harness;
 use crate::observation::{
@@ -131,6 +131,9 @@ pub(crate) async fn run_turn(
     let (done, retiring) = watch::channel(false);
     let active = Active::new(turn, steer, close);
     let steers = Arc::clone(&active.emissions);
+    // Critical r2 #1: the turn's end, by any path, answers every steer
+    // still waiting on it.
+    let _steer_turn = SteerTurn(Arc::clone(&steers));
     let identity = {
         let mut state = driver.state();
         state.active = Some(active);
@@ -1038,7 +1041,7 @@ struct Normalizer {
     /// acceptance carries it (C2 §4 `turn.accepted`).
     instance: Option<InstanceReport>,
     /// The turn's steer callers awaiting their observation's emission.
-    steers: SteerEmissions,
+    steers: Arc<SteerEmissions>,
     /// The tokens of the `steer.delivered` items being delivered.
     emitting: Vec<u64>,
 }
@@ -1049,7 +1052,7 @@ impl Normalizer {
         generation: u64,
         state: Arc<Mutex<DriverState>>,
         profile: &FakeProfile,
-        steers: SteerEmissions,
+        steers: Arc<SteerEmissions>,
     ) -> Self {
         Self {
             generation,
@@ -1065,13 +1068,10 @@ impl Normalizer {
 
     /// The delivery of the last message's items ended, `delivered` or
     /// not: each steer whose `steer.delivered` it carried learns whether
-    /// that observation is on the session channel (C2 §2 `SteerReceipt`).
+    /// that observation is on the session channel (C2 `SteerInput.token`).
     fn emitted(&mut self, delivered: bool) {
         for token in self.emitting.drain(..) {
-            if let Some(waiting) = emissions(&self.steers).remove(&token) {
-                // The steer caller went away: nobody waits for the answer.
-                let _ = waiting.send(delivered);
-            }
+            self.steers.answer(token, delivered);
         }
     }
 

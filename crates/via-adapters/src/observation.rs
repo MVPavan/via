@@ -59,11 +59,11 @@ pub enum Observation {
     /// `vendor.request_declined`.
     RequestDeclined(Decline),
     /// `steer.delivered`, carrying the token of the steer it answers
-    /// (C2 §2 `SteerReceipt`).
+    /// (C2 `SteerInput.token`).
     SteerDelivered {
         /// How the input reached the vendor.
         delivery: SteerDelivery,
-        /// The token `steer` returned for the same input.
+        /// The token Core gave the same input.
         token: SteerToken,
     },
     /// `warning`.
@@ -154,14 +154,15 @@ pub struct Decline {
     pub blocking: bool,
 }
 
-/// A steer's correlation (C2 §2 `SteerReceipt`): `steer` returns it, and
-/// the `steer.delivered` observation the driver emitted for the same
-/// input carries it. Opaque; unique within its driver.
+/// A steer's correlation (C2 `SteerInput.token`, critical r2 #2): Core
+/// mints it, unique within the session, and passes it in `SteerInput`;
+/// the `steer.delivered` observation the driver emits for the same input
+/// carries it. Opaque to the driver.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct SteerToken(u64);
 
 impl SteerToken {
-    /// The token numbered `value`, as a driver mints it.
+    /// The token numbered `value`, as Core mints it.
     #[must_use]
     pub const fn new(value: u64) -> Self {
         Self(value)
@@ -172,18 +173,6 @@ impl SteerToken {
     pub const fn get(self) -> u64 {
         self.0
     }
-}
-
-/// `steer`'s answer once the vendor took the input (C2 §2): the driver
-/// emitted the `steer.delivered` observation carrying `token` before it
-/// returned this, so Core answers its caller after committing that
-/// observation (C1 §3.4).
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SteerReceipt {
-    /// How the input reached the vendor.
-    pub delivery: SteerDelivery,
-    /// The token the observation carries.
-    pub token: SteerToken,
 }
 
 /// How steer input reached the vendor.

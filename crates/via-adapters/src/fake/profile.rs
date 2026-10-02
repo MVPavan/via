@@ -8,6 +8,7 @@ use serde::Deserialize;
 
 use crate::capabilities::{Capabilities, ParamSupport, Support, UsageSupport, Verbs};
 use crate::driver::SteerError;
+use crate::observation::SteerDelivery;
 use crate::plan::{Bound, CatalogModel, Category, CategoryDecl};
 
 /// A fake capability profile.
@@ -62,15 +63,21 @@ pub(crate) enum SteerRefusalDecl {
     NotSteerable,
     /// The input was not written whole.
     NotDelivered,
+    /// The vendor took the input, but its report was not recorded
+    /// (critical r2 #3).
+    NotRecorded,
 }
 
 impl SteerRefusalDecl {
-    /// The driver's error.
-    pub(crate) fn error(self) -> SteerError {
+    /// The driver's error for a steer `delivery` would describe.
+    pub(crate) fn error(self, delivery: &SteerDelivery) -> SteerError {
         match self {
             Self::OverCapacity => SteerError::OverCapacity,
             Self::NotSteerable => SteerError::NotSteerable,
             Self::NotDelivered => SteerError::NotDelivered,
+            Self::NotRecorded => SteerError::NotRecorded {
+                delivery: delivery.clone(),
+            },
         }
     }
 }

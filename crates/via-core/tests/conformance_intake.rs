@@ -1662,7 +1662,10 @@ fn conformance_intake_instructions_path() {
 /// `data.reason: "not_steerable"` and `data.delivery: "none"`; input not
 /// written whole is `steer_failed` with `data.reason: "not_delivered"` and
 /// `data.delivery: "uncertain"`, whose message keeps that uncertainty
-/// (critical r1 #13). None commits `steer.delivered`.
+/// (critical r1 #13); a delivery the vendor took whose report was not
+/// recorded is `steer_failed` with `data.reason: "not_recorded"` and the
+/// delivery a success would give (critical r2 #3). None commits
+/// `steer.delivered`.
 #[test]
 fn conformance_intake_steer_error_mapping() {
     for (refusal, code, kind, reason, delivery, message) in [
@@ -1689,6 +1692,14 @@ fn conformance_intake_steer_error_mapping() {
             "not_delivered",
             json!("uncertain"),
             "the steer input was not written whole; whether it was applied is unknown",
+        ),
+        (
+            "not_recorded",
+            -32021,
+            "steer_failed",
+            "not_recorded",
+            json!("injected"),
+            "the vendor took the steer input, but its steer.delivered event could not be recorded",
         ),
     ] {
         let root = Root::new();

@@ -2366,6 +2366,89 @@ fn core_steer_delivery_commit_failure_is_store_error() {
     });
 }
 
+/// Critical r2 #3 (C1 §3.4 `steer_failed`, C2 `SteerError::NotRecorded`):
+/// Core holds the turn's first text item (`core.observations.pause`), so
+/// the session channel is exactly full when the vendor reports a steer it
+/// took; the report's delivery stalls past the lowered bound. The steer is
+/// `steer_failed` with `data.reason: "not_recorded"` and the delivery a
+/// success would give (`injected`), and no `steer.delivered` exists.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_steer_report_overflow_is_not_recorded() {
+    let mut profile = schema_profile();
+    profile["capabilities"]["verbs"]["steer"] = json!({"support":"native"});
+    let flood_line = json!({"type":"text","vendor_turn_id":vendor_turn(1)}).to_string() + "\n";
+    // The acceptance, then one text item Core holds and the channel's
+    // worth behind it.
+    let steps = [
+        accepted(1),
+        json!({"action":"flood","text":flood_line,"count":512}),
+        gate("flood"),
+        json!({"action":"flood","text":flood_line,"count":513}),
+        json!({"action":"expect_request","expected":{"type":"steer","id":3}}),
+        emit(&json!({"type":"steer_delivered","id":3,"vendor_turn_id":vendor_turn(1)})),
+        terminal(1, "completed", "end_turn"),
+    ];
+    let Some(root) = child(
+        "core_steer_report_overflow_is_not_recorded",
+        &scenario(&profile, &[script("p", &steps)]),
+        &[("VIA_TEST_EVENT_STALL_MS", "250")],
+    ) else {
+        return;
+    };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    arm_at(&root, "core.observations.pause", 2, "pause");
+    acknowledge(&root, "adapter.observation.admitted", 513);
+    acknowledge(&root, "adapter.observation.stalled", 1);
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = daemon.spawn("p", &json!({})).await;
+        until_acked(&root, "core.observations.pause", 2).await;
+        daemon.entered("flood").await;
+        until_acked(&root, "adapter.observation.admitted", 513).await;
+        acknowledge(&root, "adapter.observation.admitted", 1026);
+        daemon.release("flood");
+        until_acked(&root, "adapter.observation.admitted", 1026).await;
+        let params = serde_json::from_value(json!({"session":session,"handle":HANDLE,
+                                                   "text":"also"}))
+        .unwrap();
+        let steering = tokio::spawn({
+            let engine = Arc::clone(&daemon.engine);
+            async move { engine.steer(params).await }
+        });
+        until_acked(&root, "adapter.observation.stalled", 1).await;
+        let reply = tokio::time::timeout(Duration::from_secs(20), steering)
+            .await
+            .expect("the steer is answered")
+            .unwrap();
+        let error = reply.expect_err("an unrecorded steer is no success");
+        assert_eq!(
+            (
+                error.kind,
+                &error.data()["reason"],
+                &error.data()["delivery"]
+            ),
+            ("steer_failed", &json!("not_recorded"), &json!("injected")),
+            "{error:?}"
+        );
+        fs::write(
+            root.join("points")
+                .join("core.observations.pause.2.release"),
+            b"",
+        )
+        .unwrap();
+        let envelope = daemon.wait(&session, 1).await;
+        assert_eq!(class(&envelope), "overflow", "{envelope}");
+        assert!(
+            !events(&daemon, &session)
+                .await
+                .iter()
+                .any(|event| event["type"] == "steer.delivered")
+        );
+        daemon.shutdown().await;
+    });
+}
+
 /// Idle session lanes the daemon keeps (runtime §8).
 #[cfg(feature = "test-failpoints")]
 const IDLE_LANES: usize = 32;

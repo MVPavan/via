@@ -3910,6 +3910,70 @@ fn a_steer_before_acceptance_waits_and_is_delivered() {
     });
 }
 
+/// Critical r2 #2 (C2 `SteerInput.token`): a live steer caller's outcome
+/// is its own. Its report commits, then more than 1,024 others, of
+/// callers that went away, are consumed before it asks: it still learns
+/// that its report committed.
+#[test]
+fn a_suspended_steer_keeps_its_outcome() {
+    let Some(root) = child("a_suspended_steer_keeps_its_outcome") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let (session, lane, sender) = idle_session_with_lane(&engine, &root).await;
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1 << 20));
+        let report = |token| via_adapters::Observation::SteerDelivered {
+            delivery: via_adapters::observation::SteerDelivery::Injected,
+            token: via_adapters::SteerToken::new(token),
+        };
+        let mut ticket = lane.steer_ticket();
+        assert_eq!(lane.steer_tickets(), 1);
+        send_held(&sender, &budget, Some("vt-1"), report(ticket.token().get())).await;
+        for token in 1..=1025 {
+            send_held(
+                &sender,
+                &budget,
+                Some("vt-1"),
+                report(1_000_000_000 + token),
+            )
+            .await;
+        }
+        let db = rusqlite::Connection::open(root.join("state").join("store.sqlite3")).unwrap();
+        db.busy_timeout(Duration::from_secs(10)).unwrap();
+        let reports = || -> i64 {
+            db.query_row(
+                "SELECT count(*) FROM events WHERE session_id=?1 AND type='steer.delivered'",
+                [session.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while reports() < 1026 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("every report commits");
+        let committed = tokio::time::timeout(Duration::from_secs(5), ticket.committed()).await;
+        assert_eq!(committed, Ok(true));
+        assert_eq!(
+            lane.steer_tickets(),
+            0,
+            "its consumption resolved the ticket"
+        );
+        let unanswered = lane.steer_ticket();
+        assert_eq!(lane.steer_tickets(), 1);
+        drop(unanswered);
+        assert_eq!(
+            lane.steer_tickets(),
+            0,
+            "a request's end retires its ticket"
+        );
+    });
+}
+
 /// A steer report (C2 §4 `steer.delivered`).
 fn steered() -> via_adapters::Observation {
     via_adapters::Observation::SteerDelivered {

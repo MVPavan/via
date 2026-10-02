@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::sync::{mpsc, watch};
 use via_adapters::observation::{
-    AdapterError, Admitted, Observation, ObservationItem, SteerDelivery, SteerReceipt, StopReason,
+    AdapterError, Admitted, Observation, ObservationItem, SteerDelivery, SteerToken, StopReason,
     TurnEnd, observation_channel,
 };
 use via_adapters::{
@@ -560,7 +560,7 @@ fn failure(end: &TurnEnd) -> &RouteFailure {
 }
 
 /// A steer call in flight beside its turn.
-type Steer<'a> = Pin<Box<dyn Future<Output = Result<SteerReceipt, SteerError>> + 'a>>;
+type Steer<'a> = Pin<Box<dyn Future<Output = Result<SteerDelivery, SteerError>> + 'a>>;
 
 fn observations(items: &[ObservationItem]) -> Vec<&Observation> {
     items.iter().map(|item| &item.observation).collect()
@@ -753,6 +753,7 @@ fn conformance_steer_native_delivered_unsupported_refused() {
         turn: TurnNumber::try_from(1).unwrap(),
         text: "early".to_owned(),
         expected_vendor_turn: None,
+        token: SteerToken::new(1),
     }));
     assert_eq!(idle.unwrap_err(), SteerError::NoActiveTurn);
 
@@ -767,20 +768,20 @@ fn conformance_steer_native_delivered_unsupported_refused() {
             tokio::select! {
                 Some(admitted) = receiver.recv() => {
                     if matches!(admitted.item.observation, Observation::Accepted(_)) {
-                        steer = Some(Box::pin(driver.steer(SteerInput { turn: TurnNumber::try_from(1).unwrap(), text: "also \"this\"".to_owned(), expected_vendor_turn: Some(VendorTurnId::try_from(vendor_turn(1)).unwrap()) })));
+                        steer = Some(Box::pin(driver.steer(SteerInput { turn: TurnNumber::try_from(1).unwrap(), text: "also \"this\"".to_owned(), expected_vendor_turn: Some(VendorTurnId::try_from(vendor_turn(1)).unwrap()), token: SteerToken::new(2) })));
                     }
                     items.push(admitted.item);
                 }
                 result = async { steer.as_mut().unwrap().await }, if steer.is_some() => {
-                    // C2 §2 `SteerReceipt` (critical r1 #5): the observation
-                    // carrying the receipt's token was emitted first.
+                    // C2 §2 `SteerInput.token` (critical r2 #2): the
+                    // observation carrying the input's token was emitted first.
                     while let Ok(admitted) = receiver.try_recv() {
                         items.push(admitted.item);
                     }
-                    if let Ok(receipt) = &result {
+                    if result.is_ok() {
                         assert!(items.iter().any(|item| matches!(
                             &item.observation,
-                            Observation::SteerDelivered { token, .. } if *token == receipt.token
+                            Observation::SteerDelivered { token, .. } if *token == SteerToken::new(2)
                         )));
                     }
                     answer = Some(result);
@@ -794,7 +795,6 @@ fn conformance_steer_native_delivered_unsupported_refused() {
         }
         (answer, checked(end), items)
     });
-    let answer = answer.map(|answer| answer.map(|receipt| receipt.delivery));
     assert_eq!(answer, Some(Ok(SteerDelivery::Injected)), "{end:?}");
     assert!(end.outcome.is_ok(), "{end:?}");
     assert!(
@@ -809,6 +809,7 @@ fn conformance_steer_native_delivered_unsupported_refused() {
         turn: TurnNumber::try_from(1).unwrap(),
         text: "no".to_owned(),
         expected_vendor_turn: None,
+        token: SteerToken::new(1),
     }));
     assert_eq!(refused.unwrap_err(), SteerError::Unsupported);
 }
@@ -2075,7 +2076,7 @@ fn session_cancellation_stops_owned_work() {
 fn steer_once(
     profile: &Value,
     input: impl FnOnce() -> SteerInput,
-) -> (Result<SteerReceipt, SteerError>, Vec<ObservationItem>) {
+) -> (Result<SteerDelivery, SteerError>, Vec<ObservationItem>) {
     let rig = Rig::new(
         profile,
         &[script(
@@ -2111,6 +2112,7 @@ fn a_steer_naming_another_vendor_turn_is_refused() {
             turn: TurnNumber::try_from(1).unwrap(),
             text: "more".to_owned(),
             expected_vendor_turn: Some(VendorTurnId::try_from("fake-turn-9".to_owned()).unwrap()),
+            token: SteerToken::new(1),
         }
     });
     assert_eq!(answer, Err(SteerError::TurnMismatch));
@@ -2125,6 +2127,7 @@ fn an_over_budget_steer_is_refused_before_enqueue() {
             turn: TurnNumber::try_from(1).unwrap(),
             text: "s".repeat(65 * 1024),
             expected_vendor_turn: None,
+            token: SteerToken::new(1),
         }
     });
     assert_eq!(answer, Err(SteerError::OverCapacity));
@@ -2162,23 +2165,182 @@ fn a_partial_steer_profile_reports_its_semantics() {
                     turn: TurnNumber::try_from(1).unwrap(),
                     text: "more".to_owned(),
                     expected_vendor_turn: None,
+                    token: SteerToken::new(1),
                 })
                 .await
         },
     );
     assert!(end.outcome.is_ok(), "{end:?}");
     let partial = SteerDelivery::Partial("after_tool".into());
-    let receipt = answer.unwrap();
-    assert_eq!(receipt.delivery, partial);
+    assert_eq!(answer, Ok(partial.clone()));
     assert!(observations(&items).iter().any(|observation| matches!(
         observation,
         Observation::SteerDelivered { delivery, token }
-            if *delivery == partial && *token == receipt.token
+            if *delivery == partial && *token == SteerToken::new(1)
     )));
 }
 
+/// Critical r2 #1, #3 (C2 `SteerError::NotRecorded`; a steer never
+/// outlives its turn): the vendor took the steer, but its report waits
+/// behind a full observation channel when the daemon forces the turn. The
+/// steer is answered at once, `NotRecorded` with its delivery, never left
+/// pending.
+#[test]
+fn a_forced_turn_answers_its_acknowledged_steer() {
+    let steps = [
+        vec![accepted(1)],
+        // With the acceptance, the channel is exactly full.
+        staged_flood(1, OBSERVATION_ITEMS - 1),
+        vec![
+            json!({"action":"expect_request","expected":{"type":"steer","id":3}}),
+            emit(&json!({"type":"steer_delivered","id":3,"vendor_turn_id":vendor_turn(1)})),
+            gate("forced"),
+            json!({"action":"hang"}),
+        ],
+    ]
+    .concat();
+    let rig = Rig::new(
+        &json!({"capabilities": native_capabilities()}),
+        &[script(1, &steps)],
+    );
+    let (driver, receiver) = rig.session();
+    let (cx, controls) = turn_cx(1, driver.prepare(), WALL);
+    let sync = rig.sync();
+    let answer = rig.runtime.block_on(async {
+        let run = driver.run_turn(prompt(), cx);
+        let side = async {
+            release_flood(&sync, &receiver, OBSERVATION_ITEMS / 2).await;
+            let mut steer: Steer<'_> = Box::pin(driver.steer(SteerInput {
+                turn: TurnNumber::try_from(1).unwrap(),
+                text: "also".to_owned(),
+                expected_vendor_turn: None,
+                token: SteerToken::new(1),
+            }));
+            // The vendor reported the delivery (its gate follows the
+            // report) and Route has taken the report.
+            let by = tokio::time::Instant::now() + FIXTURE_WAIT;
+            let mut settled: Option<tokio::time::Instant> = None;
+            loop {
+                if let Some(early) = poll_once(&mut steer).await {
+                    return format!("{early:?} before the force");
+                }
+                let now = tokio::time::Instant::now();
+                match settled {
+                    Some(at) if now >= at => break,
+                    Some(_) => {}
+                    None if sync.join("forced.entered").exists() => {
+                        settled = Some(now + Duration::from_millis(500));
+                    }
+                    None => assert!(now < by, "the vendor never reported the steer"),
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            controls
+                .force
+                .send_replace(Some(tokio::time::Instant::now()));
+            format!(
+                "{:?}",
+                tokio::time::timeout(Duration::from_secs(3), steer).await
+            )
+        };
+        tokio::join!(run, side).1
+    });
+    assert_eq!(answer, "Ok(Err(NotRecorded { delivery: Injected }))");
+}
+
+/// Critical r2 #3 (C2 `SteerError::NotRecorded`): a steer the vendor took
+/// whose report the full channel never takes (the stall bound lowered to
+/// 250 ms in a child; builds without test failpoints keep 10 s, so the
+/// wait allows for it) is `NotRecorded` with its delivery, not
+/// `NotDelivered`: the input was written whole.
+#[test]
+fn an_unrecorded_steer_report_is_not_recorded() {
+    if rerun_with_short_stall("an_unrecorded_steer_report_is_not_recorded") {
+        return;
+    }
+    let steps = [
+        vec![accepted(1)],
+        staged_flood(1, OBSERVATION_ITEMS - 1),
+        vec![
+            json!({"action":"expect_request","expected":{"type":"steer","id":3}}),
+            emit(&json!({"type":"steer_delivered","id":3,"vendor_turn_id":vendor_turn(1)})),
+            terminal(1, "completed", "end_turn"),
+        ],
+    ]
+    .concat();
+    let rig = Rig::new(
+        &json!({"capabilities": native_capabilities()}),
+        &[script(1, &steps)],
+    );
+    let (driver, receiver) = rig.session();
+    let (cx, _controls) = turn_cx(1, driver.prepare(), WALL);
+    let sync = rig.sync();
+    let answer = rig.runtime.block_on(async {
+        let run = driver.run_turn(prompt(), cx);
+        let side = async {
+            release_flood(&sync, &receiver, OBSERVATION_ITEMS / 2).await;
+            let steer = driver.steer(SteerInput {
+                turn: TurnNumber::try_from(1).unwrap(),
+                text: "also".to_owned(),
+                expected_vendor_turn: None,
+                token: SteerToken::new(1),
+            });
+            // The stall bound, then the fixture's own wait.
+            let within = Duration::from_secs(10) + FIXTURE_WAIT;
+            format!("{:?}", tokio::time::timeout(within, steer).await)
+        };
+        tokio::join!(run, side).1
+    });
+    assert_eq!(answer, "Ok(Err(NotRecorded { delivery: Injected }))");
+}
+
+/// Critical r2 #1: a steer whose future is dropped retires its own entry:
+/// one cancelled after it was admitted, which Route then refuses (another
+/// vendor turn), leaves no steer waiting.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_cancelled_steer_leaves_no_entry() {
+    let rig = Rig::new(
+        &json!({"capabilities": native_capabilities()}),
+        &[script(
+            1,
+            &[accepted(1), gate("g"), terminal(1, "completed", "end_turn")],
+        )],
+    );
+    let (driver, mut receiver) = rig.session();
+    let (cx, _controls) = turn_cx(1, driver.prepare(), WALL);
+    let sync = rig.sync();
+    let driver_ref = &driver;
+    let (end, _, waiting) = rig.run_beside(
+        &driver,
+        &mut receiver,
+        (prompt(), cx),
+        |mut seen| async move {
+            until_seen(&mut seen, |seen| seen.accepted).await;
+            let mut steer: Steer<'_> = Box::pin(driver_ref.steer(SteerInput {
+                turn: TurnNumber::try_from(1).unwrap(),
+                text: "elsewhere".to_owned(),
+                expected_vendor_turn: Some(VendorTurnId::try_from(vendor_turn(2)).unwrap()),
+                token: SteerToken::new(1),
+            }));
+            assert!(
+                poll_once(&mut steer).await.is_none(),
+                "admitted, unanswered"
+            );
+            drop(steer);
+            // Route refuses it meanwhile, with nobody waiting.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let waiting = driver_ref.steers_waiting();
+            release(&sync, "g");
+            waiting
+        },
+    );
+    assert!(end.outcome.is_ok(), "{end:?}");
+    assert_eq!(waiting, 0);
+}
+
 /// Polls `steer` once: its answer if it has one at once.
-async fn poll_once(steer: &mut Steer<'_>) -> Option<Result<SteerReceipt, SteerError>> {
+async fn poll_once(steer: &mut Steer<'_>) -> Option<Result<SteerDelivery, SteerError>> {
     tokio::select! {
         biased;
         answer = steer.as_mut() => Some(answer),
@@ -2441,11 +2603,14 @@ fn a_ninth_outstanding_steer_is_refused() {
     let (cx, _controls) = turn_cx(1, driver.prepare(), WALL);
     let sync = rig.sync();
     let driver_ref = &driver;
+    let tokens = &std::cell::Cell::new(0);
     let steer = move || -> Steer<'_> {
+        tokens.set(tokens.get() + 1);
         Box::pin(driver_ref.steer(SteerInput {
             turn: TurnNumber::try_from(1).unwrap(),
             text: "more".to_owned(),
             expected_vendor_turn: None,
+            token: SteerToken::new(tokens.get()),
         }))
     };
     let (end, _, (queued, ninth)) = rig.run_beside(
@@ -2922,6 +3087,7 @@ fn a_steer_for_an_ended_turn_never_reaches_its_successor() {
         turn: TurnNumber::try_from(1).unwrap(),
         text: "for turn 1".to_owned(),
         expected_vendor_turn: None,
+        token: SteerToken::new(1),
     };
     let idle = rig.runtime.block_on(driver.steer(selected()));
     assert_eq!(idle.unwrap_err(), SteerError::NoActiveTurn);
