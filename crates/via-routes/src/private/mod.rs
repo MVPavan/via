@@ -374,16 +374,32 @@ async fn serve_turn<P: PrivateProtocol>(
     if let Some(keep) = P::keeps_server(serving, &failed.cause) {
         return Err(P::keep(serving, (sender, messages), keep, (failed, cleanup)).await);
     }
-    let report = sender
-        .close(CloseRequest {
-            mode: CloseMode::Force,
+    let report = if stalled(serving, &failed.cause) {
+        // C2 A1: the Adapter's stall fails the connection, which
+        // interrupts the vendor first, in AD19's order: the one interrupt,
+        // its terminal awaited, then stdin EOF and the graceful close, all
+        // under the cleanup bound; the vendor's stdout is drained
+        // meanwhile and discarded.
+        interrupt_before_close(serving, &mut messages, cleanup).await;
+        let close = sender.close(CloseRequest {
+            mode: CloseMode::Graceful,
             deadline: cleanup,
-        })
-        .await;
-    // The group is stopping; the reader reads its stdout to EOF and
-    // discards it, so it never blocks. The original failure stays
-    // authoritative.
-    messages.finish(cleanup).await;
+        });
+        let (report, ()) = tokio::join!(close, messages.finish(cleanup));
+        report
+    } else {
+        let report = sender
+            .close(CloseRequest {
+                mode: CloseMode::Force,
+                deadline: cleanup,
+            })
+            .await;
+        // The group is stopping; the reader reads its stdout to EOF and
+        // discards it, so it never blocks. The original failure stays
+        // authoritative.
+        messages.finish(cleanup).await;
+        report
+    };
     Err(RouteFailure {
         cause: failed.cause,
         // The one message this turn could not decode, if any (design §7.3).
@@ -396,6 +412,61 @@ async fn serve_turn<P: PrivateProtocol>(
         acknowledged: false,
         shared: false,
     })
+}
+
+/// The Adapter stalled (it closed the hop: `Overflow` without the daemon
+/// force) on a submitted turn whose terminal was not read: the vendor is
+/// still working on it.
+fn stalled<P: PrivateProtocol>(serving: &Serving<'_, P>, cause: &RouteError) -> bool {
+    matches!(cause, RouteError::Overflow { .. })
+        && serving.hop.is_closed()
+        && serving.signals.force.borrow().is_none()
+        && serving.submitted
+        && !serving.terminated
+}
+
+/// Sends the one interrupt through the protocol's path, unless it was
+/// sent, waits for its write, then reads the vendor's messages (admitted
+/// under the phase rules, never delivered: the hop is closed) until its
+/// terminal or the end of stdout; all until `by`. The hop is closed, so
+/// these waits do not go through [`Serving::serve`].
+async fn interrupt_before_close<P: PrivateProtocol>(
+    serving: &mut Serving<'_, P>,
+    messages: &mut WireMessages,
+    by: Deadline,
+) {
+    serving.send_interrupt();
+    if let Some(write) = serving.pending.as_mut() {
+        let written = tokio::time::timeout_at(by.instant(), pending(Some(write))).await;
+        serving.pending = None;
+        serving.interrupt = if matches!(written, Ok(Ok(SendOutcome::Written))) {
+            Interrupt::Written
+        } else {
+            Interrupt::Failed
+        };
+    }
+    if serving.interrupt != Interrupt::Written {
+        return;
+    }
+    let turn = serving.turn;
+    let terminal = async {
+        loop {
+            let message = match messages.next_message().await {
+                Ok(Some(message)) => message,
+                Err(via_wire::WireError::Woken) => continue,
+                Ok(None) | Err(_) => return,
+            };
+            let Ok(payload) = P::decode(message.bytes(), turn) else {
+                return;
+            };
+            match P::admit(serving, payload).await {
+                Ok(Some(admitted)) if P::terminal(&admitted).is_some() => return,
+                Ok(_) => {}
+                Err(_) => return,
+            }
+        }
+    };
+    let _ended = tokio::time::timeout_at(by.instant(), terminal).await;
 }
 
 /// Design §2 rule 3 [r1.23]: a decoded terminal whose finalization

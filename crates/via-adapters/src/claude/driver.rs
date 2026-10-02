@@ -408,6 +408,11 @@ impl Delivery<'_> {
             }
             Some(End::Protocol(why)) => self.fail(Verdict::Protocol(why)),
             Some(End::Overflow) => self.fail(Verdict::Overflow),
+            // C2 §2: the retained terminal and outcome stand; the
+            // connection's identity is broken, so no later turn runs.
+            Some(End::MismatchAfterTerminal) => {
+                latch(self.reports.health, DriverFailure::ResumeMismatch);
+            }
         }
         observations
     }
@@ -481,6 +486,20 @@ impl Delivery<'_> {
         let acknowledged = self.normalizer.acknowledged();
         let turn = self.turn;
         let failure = |cause| failure_of(cause, &outcome, acknowledged);
+        // S1 rule 4: the daemon force decides the outcome, even beside a
+        // verdict whose abort came first; health keeps the verdict's cause.
+        let forced = matches!(rest, Rest::Forced)
+            || matches!(&outcome, Err(failure) if matches!(failure.cause, RouteError::ForceStopped { .. }));
+        if forced && self.verdict.is_some() {
+            return TurnEnd {
+                terminal: self.terminal.map(|terminal| *terminal),
+                instance,
+                leftovers: None,
+                outcome: Err(AdapterError::Route(failure(RouteError::ForceStopped {
+                    turn,
+                }))),
+            };
+        }
         let (terminal, outcome) = match self.verdict {
             Some(Verdict::Rejected(reason)) => {
                 let evidence = evidence_of(&outcome);

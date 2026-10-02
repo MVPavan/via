@@ -1,5 +1,5 @@
 {
-  "source": "synthetic (x.3.2 C2, via-p98.3.2): no vendor run. Lines follow the 2026-09-30 c1a-c11b recordings' shapes, trimmed to what the adapter reads. A repeated tool_use block, assistant usage snapshots, a vendor-synthetic API error message and the result.usage aggregate with a non-null fallback_credit.",
+  "source": "synthetic (x.3.2 C2, via-p98.3.2): no vendor run. Lines follow the 2026-09-30 c1a-c11b recordings' shapes, trimmed to what the adapter reads. After the turn's own result, a result naming another session's UUID.",
   "harness": "claude",
   "launches": 1,
   "launch_checkpoints": {
@@ -19,7 +19,11 @@
       "instructions": null,
       "cwd": "/work/project",
       "resume": null,
-      "close": null
+      "close": null,
+      "health": {
+        "state": "failed",
+        "first_cause": "resume_mismatch"
+      }
     }
   },
   "turns": [
@@ -27,7 +31,7 @@
       "session": "main",
       "start_after": null,
       "params": {
-        "prompt": "Read a.txt, then reply READ.",
+        "prompt": "Reply KEPT.",
         "effort": null,
         "bound": {
           "mode": "full",
@@ -54,14 +58,7 @@
             "scope": "session_cumulative",
             "provenance": "reported"
           },
-          "structured_output": null,
-          "vendor": {
-            "cache_creation_input_tokens": 100,
-            "fallback_credit": {
-              "amount_usd": 0.0004,
-              "reason": "fallback_model"
-            }
-          }
+          "structured_output": null
         },
         "usage": {
           "from": "terminal",
@@ -71,7 +68,7 @@
           "scope": "turn"
         },
         "final_text": [
-          "READ"
+          "KEPT"
         ],
         "error": null,
         "cleanup": "quiescent",
@@ -96,34 +93,22 @@
             "generation": 1
           },
           "turn.accepted",
+          "final_text",
           {
-            "kind": "progress",
-            "tools_started": [
-              [
-                "toolu_01SYNTH000001",
-                "Read"
-              ]
-            ]
-          },
-          {
-            "kind": "progress",
-            "tools_ended": [
-              "toolu_01SYNTH000001"
-            ]
+            "kind": "resume.mismatch",
+            "returned": "33333333-3333-4333-8333-333333333333"
           }
         ],
         "observations_exclude": [],
         "observation_counts": {
-          "turn.accepted": 1,
-          "progress": 4,
-          "final_text": 1
+          "turn.accepted": 1
         },
         "observations_order": [
           "session.vendor_identity_confirmed",
           "turn.accepted"
         ],
         "unasserted": [],
-        "notes": "A vendor-synthetic API-error message is never acceptance or progress; a repeated tool_use block starts its call once; usage is the result.usage aggregate, never the assistant snapshots; cost is session_cumulative; a non-null fallback_credit is kept verbatim in the terminal's vendor data."
+        "notes": "C2 \u00a72's third mismatch case: the turn's terminal was retained, so its terminal and outcome stand; the later message's identity mismatch emits resume.mismatch and fails health resume_mismatch, so no later turn runs on the connection. Never a protocol failure of the turn."
       }
     }
   ]

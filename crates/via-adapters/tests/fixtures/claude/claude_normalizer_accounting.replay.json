@@ -1,5 +1,5 @@
 {
-  "source": "synthetic (x.3.2 C2, via-p98.3.2): no vendor run. Lines follow the 2026-09-30 c1a-c11b recordings' shapes, trimmed to what the adapter reads. A repeated tool_use block, assistant usage snapshots, a vendor-synthetic API error message and the result.usage aggregate.",
+  "source": "synthetic (x.3.2 C2, via-p98.3.2): no vendor run. Lines follow the 2026-09-30 c1a-c11b recordings' shapes, trimmed to what the adapter reads. A repeated tool_use block, assistant usage snapshots, a vendor-synthetic API error message and the result.usage aggregate with a non-null fallback_credit.",
   "argv": [
     "-p",
     "--input-format",
@@ -80,7 +80,7 @@
     },
     {
       "emit": {
-        "line": "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"${sid}\",\"stop_reason\":\"end_turn\",\"terminal_reason\":\"completed\",\"num_turns\":2,\"total_cost_usd\":0.001,\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":100,\"cache_read_input_tokens\":1000,\"output_tokens\":20},\"permission_denials\":[],\"result\":\"READ\"}"
+        "line": "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"${sid}\",\"stop_reason\":\"end_turn\",\"terminal_reason\":\"completed\",\"num_turns\":2,\"total_cost_usd\":0.001,\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":100,\"cache_read_input_tokens\":1000,\"output_tokens\":20,\"fallback_credit\":{\"amount_usd\":0.0004,\"reason\":\"fallback_model\"}},\"permission_denials\":[],\"result\":\"READ\"}"
       }
     },
     {

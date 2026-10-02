@@ -22,6 +22,10 @@
 //!    directories; `pure_writes` spans steps 1 and 2, and a directory that
 //!    cannot be read fails the case.
 //!
+//! The run half performs each planned session's real `open_session()`; it
+//! samples that session's `after_open` right after it and extends the
+//! `pure_writes` interval past every open (review r1 #6).
+//!
 //! The turns that plan run in the run half (the route's driver), which
 //! [`Pure::planned_only`] does not have: it finishes only a case whose
 //! every turn was refused before any receipt.
@@ -63,6 +67,10 @@ pub(crate) struct Pure {
     /// The Store the adapter set runs on; the run half commits turns to it.
     pub(crate) _store: Store,
     pub(crate) name: String,
+    /// The fixture directory, listed with the case and state directories.
+    fixtures: PathBuf,
+    /// The listing before the pure steps: where `pure_writes` starts.
+    before: Listing,
 }
 
 impl Pure {
@@ -95,14 +103,15 @@ impl Pure {
             state,
             _store: store,
             name: name.to_owned(),
+            before: Listing::new(),
+            fixtures,
         };
-        let before = pure.listing(&fixtures)?;
+        pure.before = pure.listing()?;
         pure.pure_operations(harness, expect)?;
         pure.outcome.checkpoints.after_pure = pure.launches()?;
         // The spawn plans are pure too: the interval covers them.
         pure.open_sessions(harness, expect)?;
-        let after = pure.listing(&fixtures)?;
-        pure.outcome.pure_writes = changed(&before, &after);
+        pure.outcome.pure_writes = pure.writes()?;
         Ok(pure)
     }
 
@@ -265,11 +274,20 @@ impl Pure {
         }
     }
 
+    /// The files created, changed or removed since the pure steps began.
+    pub(crate) fn writes(&self) -> Result<Vec<String>, String> {
+        Ok(changed(&self.before, &self.listing()?))
+    }
+
     /// Every file of the fixture, case and state directories (the Store
     /// and the runtime directory) but the launch log.
-    fn listing(&self, fixtures: &Path) -> Result<Listing, String> {
+    fn listing(&self) -> Result<Listing, String> {
         let mut listing = Listing::new();
-        for dir in [fixtures, self.case_dir.path(), self.state.path()] {
+        for dir in [
+            self.fixtures.as_path(),
+            self.case_dir.path(),
+            self.state.path(),
+        ] {
             list(dir, &mut listing).map_err(|e| format!("{}: {e}", dir.display()))?;
         }
         listing.remove(&self.case_dir.path().join(format!("{}.launches", self.name)));

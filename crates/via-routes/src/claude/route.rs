@@ -266,14 +266,34 @@ impl PrivateProtocol for ClaudeLane {
 
     /// The phase rules Route keeps: after the result, a second result, an
     /// init or a control request (stdin is closed: it cannot be declined)
-    /// fails the turn `protocol`. Before it, a control request is declined
-    /// at once, and handed on only once its decline was written whole.
+    /// fails the turn `protocol`, unless that init or result names another
+    /// session than the result Route kept: that is the Adapter's identity
+    /// check (C2 §2's mismatch after a retained terminal), handed on.
+    /// Before the result, a control request is declined at once, and
+    /// handed on only once its decline was written whole.
     async fn admit(
         serving: &mut Serving<'_, Self>,
         message: Message,
     ) -> Result<Option<ClaudeItem>, Failed> {
         let turn = serving.turn;
         let read = serving.lane.result.is_some();
+        let foreign = serving
+            .lane
+            .result
+            .as_ref()
+            .is_some_and(|kept| match &message {
+                Message::Result(result) => result.session_id != kept.session_id,
+                Message::Init(init) => init.session_id != kept.session_id,
+                Message::PermissionDenied(_)
+                | Message::Assistant(_)
+                | Message::User(_)
+                | Message::ControlRequest(_)
+                | Message::ControlResponse(_)
+                | Message::Unknown { .. } => false,
+            });
+        if foreign {
+            return Ok(Some(ClaudeItem::Message(message)));
+        }
         match message {
             Message::Result(_) if read => Err(protocol(turn, "a second result").into()),
             Message::Init(_) if read => Err(protocol(turn, "an init after the result").into()),

@@ -70,6 +70,9 @@ const FIXTURE_WAIT: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(10);
 /// A gate's observations are taken once none arrived for this long.
 const QUIET: Duration = Duration::from_millis(200);
+/// How long the real opens' interval stays open after the last one: a
+/// start or write an open spawned asynchronously counts there.
+const OPEN_SETTLE: Duration = Duration::from_millis(100);
 
 /// How a case is driven beyond its expectation: a test seam for cases the
 /// schema cannot state.
@@ -84,6 +87,12 @@ pub(crate) struct Knobs {
     pub(crate) repeat_stop: bool,
     /// Every session is opened with `allow_untested` set.
     pub(crate) allow_untested: bool,
+    /// Core never takes an observation while the turn runs: its consumer
+    /// stalls past the driver's stall bound.
+    pub(crate) stall_consumer: bool,
+    /// The daemon force is set once the fake logs this progress line (for
+    /// example `at 5 launch 1`).
+    pub(crate) force_on: Option<&'static str>,
 }
 
 /// What a running turn has shown so far, for its side actions.
@@ -127,6 +136,9 @@ struct Run<'a> {
     replay: &'a Value,
     knobs: Knobs,
     sessions: BTreeMap<String, Session>,
+    /// Each opened session's launch count right after its real
+    /// `open_session()`: its `after_open` checkpoint.
+    opened: BTreeMap<String, u64>,
     /// Each turn's progress, by index.
     seen: Vec<watch::Sender<Seen>>,
     /// The connection IDs and acceptance tokens of the case, first seen
@@ -170,13 +182,23 @@ impl Pure {
             .map_err(|e| format!("runtime: {e}"))?;
         let mut pure = self;
         let result = runtime.block_on(async {
-            let run = Run::open(&pure, expect, &replay, knobs)?;
+            let mut run = Run::open(&pure, expect, &replay, knobs)?;
+            // The open interval ends once whatever the opens spawned had
+            // its chance to run: a start counts at the last open.
+            tokio::time::sleep(OPEN_SETTLE).await;
+            let settled = pure.launches()?;
+            if let Some(last) = run.opened.values_mut().last() {
+                *last = settled;
+            }
+            let opened = (std::mem::take(&mut run.opened), pure.writes()?);
             let turns = run.all().await;
             let health = run.health();
             run.shutdown().await;
-            Ok::<_, String>((turns?, health))
+            Ok::<_, String>((turns?, health, opened))
         });
-        let (turns, health) = result?;
+        let (turns, health, (opened, writes)) = result?;
+        pure.outcome.checkpoints.after_open.extend(opened);
+        pure.outcome.pure_writes = writes;
         then(&pure)?;
         let launches = pure.launches()?;
         for (index, (outcome, after)) in turns.into_iter().enumerate() {
@@ -214,6 +236,7 @@ impl<'a> Run<'a> {
         let tracker = TaskTracker::new();
         let cancel = CancellationToken::new();
         let mut sessions = BTreeMap::new();
+        let mut opened = BTreeMap::new();
         for (number, (label, plan)) in pure.plans.iter().enumerate() {
             let session = &expect["sessions"][label];
             let first = turns
@@ -250,6 +273,7 @@ impl<'a> Run<'a> {
                 cancel: cancel.clone(),
             };
             let driver = pure.set.open_session(&session_ref, spec, cx);
+            opened.insert(label.clone(), pure.launches()?);
             sessions.insert(
                 label.clone(),
                 Session {
@@ -271,6 +295,7 @@ impl<'a> Run<'a> {
             replay,
             knobs,
             sessions,
+            opened,
             seen,
             ordinals: RefCell::new((Vec::new(), Vec::new())),
             tracker,
@@ -433,7 +458,7 @@ impl<'a> Run<'a> {
             .as_u64()
             .map_or(TOOL_GRACE, Duration::from_millis);
         let (stop, stop_rx) = watch::channel(None);
-        let (_force, force_rx) = watch::channel(None);
+        let (force, force_rx) = watch::channel(None);
         let prepared = session.driver.prepare();
         let capacity = matches!(prepared, Prepared::NeedsConnection)
             .then(|| Box::new(()) as via_adapters::CapacityToken);
@@ -467,7 +492,8 @@ impl<'a> Run<'a> {
                 loop {
                     tokio::select! {
                         result = &mut waiting, if released.is_none() => released = Some(result),
-                        Some(admitted) = receiver.recv(), if released.is_some() => {
+                        Some(admitted) = receiver.recv(),
+                            if released.is_some() && !self.knobs.stall_consumer => {
                             self.observe(&admitted.item.observation, seen, &observed);
                         }
                         end = &mut running => break end,
@@ -491,18 +517,39 @@ impl<'a> Run<'a> {
             (seen, ended.clone()),
             (&stop, &observed),
         );
-        let (end, (steer, gates)) = tokio::join!(drain, side);
+        let forcing = self.daemon_force(&force, ended.clone());
+        let (end, (steer, gates), ()) = tokio::join!(drain, side, forcing);
         *session.receiver.borrow_mut() = Some(receiver);
         let end = end?;
-        let launched = self.pure.launches()? > launches_before;
-        let mut outcome = Self::outcome(&end, session, launched, &observed.borrow());
+        let mut outcome = Self::outcome(&end, session, &observed.borrow());
+        outcome.group_absent = self.group_absent(&session.id, number).await?;
         outcome.steer = steer;
         outcome.gates = gates?;
         outcome.stop_facts = stop_facts(turn, &end);
-        if launched && session.plan.server_key.is_none() {
+        if self.pure.launches()? > launches_before && session.plan.server_key.is_none() {
             self.judge_launch(launches_before + 1, session, number, &end)?;
         }
         Ok(outcome)
+    }
+
+    /// Sets the daemon force at [`Knobs::force_on`]'s progress line, unless
+    /// the turn ended first.
+    async fn daemon_force(
+        &self,
+        force: &watch::Sender<Option<tokio::time::Instant>>,
+        mut ended: watch::Receiver<bool>,
+    ) {
+        let Some(line) = self.knobs.force_on else {
+            return;
+        };
+        tokio::select! {
+            seen = self.until_progress(line) => {
+                if seen.is_ok() {
+                    force.send_replace(Some(tokio::time::Instant::now()));
+                }
+            }
+            _ = ended.wait_for(|ended| *ended) => {}
+        }
     }
 
     /// Resolves once Core may take the turn's observations: at once, or
@@ -775,12 +822,7 @@ impl<'a> Run<'a> {
     }
 
     /// One settled turn's outcome in the checker's vocabulary.
-    fn outcome(
-        end: &TurnEnd,
-        session: &Session,
-        launched: bool,
-        observed: &[Value],
-    ) -> TurnOutcome {
+    fn outcome(end: &TurnEnd, session: &Session, observed: &[Value]) -> TurnOutcome {
         let evidence = match &end.outcome {
             Ok(evidence) => evidence.clone(),
             Err(error) => error.evidence(),
@@ -815,8 +857,42 @@ impl<'a> Run<'a> {
             .exit
             .map(|exit| json!({"code": exit.code, "signal": exit.signal}));
         outcome.journal_uncertain = evidence.journal_uncertain;
-        outcome.group_absent = launched && evidence.cleanup == Cleanup::Quiescent;
         outcome
+    }
+
+    /// Whether Host's journal holds positive group-absence evidence for
+    /// the turn's own process group: every anchor the turn owns has a
+    /// committed absence proof (review r1 #5: never inferred from the
+    /// adapter's cleanup claim). A turn with no anchor of its own (nothing
+    /// launched, or a server route's turn) has none.
+    async fn group_absent(&self, session: &SessionId, turn: TurnNumber) -> Result<bool, String> {
+        let mut owned = Vec::new();
+        let mut after = None;
+        loop {
+            let (_, journal) = self.pure.store().runtime_resources().into_wire_parts();
+            let page = journal
+                .list_anchor_records_page(after.clone(), 256)
+                .await
+                .map_err(|e| format!("anchor records: {e:?}"))?;
+            let full = page.len() == 256;
+            after = page.last().map(|record| record.intent.anchor_id.clone());
+            owned.extend(page.into_iter().filter(|record| {
+                record.intent.owner_session == *session
+                    && record.intent.owner_turn.get() == turn.get()
+            }));
+            if !full {
+                break;
+            }
+        }
+        Ok(!owned.is_empty()
+            && owned.iter().all(|record| {
+                record.absence.as_ref().is_some_and(|proof| {
+                    record
+                        .identity
+                        .as_ref()
+                        .is_none_or(|identity| identity.pgid == proof.pgid)
+                })
+            }))
     }
 
     /// Each session's health after the case.

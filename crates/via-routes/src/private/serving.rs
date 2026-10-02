@@ -19,6 +19,46 @@ use via_wire::{
 /// route data bound (runtime §8).
 const READ_AHEAD_BYTES: usize = 4 * 1024 * 1024;
 
+/// Decoded messages waiting for room on the hop, in decode order, with
+/// their encoded bytes: at most a protocol's read-ahead count and
+/// [`READ_AHEAD_BYTES`]; one message alone may pass the bytes (Wire's
+/// line cap bounds it).
+pub(crate) struct ReadAhead<M> {
+    held: VecDeque<(M, usize)>,
+    bytes: usize,
+}
+
+impl<M> ReadAhead<M> {
+    fn new() -> Self {
+        Self {
+            held: VecDeque::new(),
+            bytes: 0,
+        }
+    }
+
+    fn push(&mut self, (message, bytes): (M, usize)) {
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.held.push_back((message, bytes));
+    }
+
+    fn pop(&mut self) -> Option<M> {
+        let (message, bytes) = self.held.pop_front()?;
+        self.bytes = self.bytes.saturating_sub(bytes);
+        Some(message)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.held.is_empty()
+    }
+
+    /// Whether a message of `bytes` may join, under `ahead` messages: it
+    /// counts against the bytes before it is held.
+    fn admits(&self, bytes: usize, ahead: usize) -> bool {
+        self.held.is_empty()
+            || (self.held.len() < ahead && self.bytes.saturating_add(bytes) <= READ_AHEAD_BYTES)
+    }
+}
+
 /// S1's cleanup allowance after a failure (AD4's one cutoff after the wall).
 pub(crate) const CLEANUP_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(3);
 
@@ -109,11 +149,8 @@ pub(crate) struct Serving<'a, P: PrivateProtocol> {
     pub(crate) interrupt: Interrupt,
     /// The pending interrupt write, kept pinned while other waits run.
     pub(crate) pending: Option<PendingWrite>,
-    /// Decoded messages waiting for room on the hop, in decode order, with
-    /// their encoded bytes.
-    held: VecDeque<(P::Message, usize)>,
-    /// The bytes `held` keeps.
-    held_bytes: usize,
+    /// Decoded messages waiting for room on the hop.
+    held: ReadAhead<P::Message>,
     /// The protocol's state.
     pub(crate) lane: P,
 }
@@ -138,8 +175,7 @@ impl<'a, P: PrivateProtocol> Serving<'a, P> {
             terminated: false,
             interrupt: Interrupt::NotSent,
             pending: None,
-            held: VecDeque::new(),
-            held_bytes: 0,
+            held: ReadAhead::new(),
             lane,
         }
     }
@@ -151,8 +187,7 @@ impl<'a, P: PrivateProtocol> Serving<'a, P> {
 
     /// Queues a decoded message for the hop, behind those already held.
     pub(crate) fn hold(&mut self, (message, bytes): (P::Message, usize)) {
-        self.held_bytes = self.held_bytes.saturating_add(bytes);
-        self.held.push_back((message, bytes));
+        self.held.push((message, bytes));
     }
 
     /// Whether a decoded message waits for the hop.
@@ -162,9 +197,7 @@ impl<'a, P: PrivateProtocol> Serving<'a, P> {
 
     /// The oldest held message, its bytes released.
     fn take_held(&mut self) -> Option<P::Message> {
-        let (message, bytes) = self.held.pop_front()?;
-        self.held_bytes = self.held_bytes.saturating_sub(bytes);
-        Some(message)
+        self.held.pop()
     }
 
     /// Awaits `op` while servicing every control, biased (design §9):
@@ -197,9 +230,15 @@ impl<'a, P: PrivateProtocol> Serving<'a, P> {
     /// protocol's [`PrivateProtocol::READ_AHEAD`] messages; after it, none
     /// may wait, so what the turn's end hands on is on the hop first.
     async fn make_room(&mut self) -> Result<(), Failed> {
+        self.make_room_for(0).await
+    }
+
+    /// Serves until a message of `bytes` fits the read-ahead (review r1
+    /// #4: the incoming message counts before it is held).
+    async fn make_room_for(&mut self, bytes: usize) -> Result<(), Failed> {
         let ahead = if self.terminated { 1 } else { P::READ_AHEAD };
         let mut never = std::pin::pin!(std::future::pending::<()>());
-        while self.held.len() >= ahead || self.held_bytes >= READ_AHEAD_BYTES {
+        while !self.held.admits(bytes, ahead) {
             self.serve_once(never.as_mut()).await?;
         }
         Ok(())
@@ -333,7 +372,10 @@ impl<'a, P: PrivateProtocol> Serving<'a, P> {
                 Ok(payload) => {
                     let bytes = message.bytes().len();
                     match P::admit(self, payload).await? {
-                        Some(admitted) => Ok(Next::Message((admitted, bytes))),
+                        Some(admitted) => {
+                            self.make_room_for(bytes).await?;
+                            Ok(Next::Message((admitted, bytes)))
+                        }
                         // Recorded, not handed over (C2 §2 Reopen).
                         None => continue,
                     }
@@ -647,4 +689,36 @@ pub(crate) fn protocol(turn: TurnNumber, detail: &'static str) -> RouteError {
 /// A transport loss of `turn`.
 pub(crate) fn transport(turn: TurnNumber) -> RouteError {
     RouteError::TransportLost { turn }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{READ_AHEAD_BYTES, ReadAhead};
+
+    /// Review r1 #4: with the hop blocked, messages of about 0.9 MiB are
+    /// held only while the next one fits: never more than 4 MiB.
+    #[test]
+    fn read_ahead_never_holds_more_than_its_bytes() {
+        let mut ahead = ReadAhead::new();
+        let message = 900 * 1024;
+        for n in 0..10 {
+            if !ahead.admits(message, 1024) {
+                break;
+            }
+            ahead.push((n, message));
+        }
+        assert!(
+            ahead.bytes <= READ_AHEAD_BYTES,
+            "{} bytes held",
+            ahead.bytes
+        );
+        assert_eq!(ahead.held.len(), 4);
+        // One message alone may pass the bytes: nothing else waits.
+        let mut alone = ReadAhead::new();
+        assert!(alone.admits(READ_AHEAD_BYTES + 1, 1024));
+        alone.push(((), READ_AHEAD_BYTES + 1));
+        assert!(!alone.admits(1, 1024));
+        assert_eq!(alone.pop(), Some(()));
+        assert!(alone.is_empty());
+    }
 }

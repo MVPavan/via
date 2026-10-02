@@ -160,6 +160,7 @@ const NAMED: &[&str] = &[
     "claude_normalizer_accounting",
     "claude_normalizer_accounting_duplicate_result",
     "claude_normalizer_accounting_cross_generation",
+    "claude_normalizer_accounting_mismatch_after_terminal",
     "claude_preflight_pure_version",
     "claude_preflight_pure_version_no_receipt",
     "claude_preflight_pure_version_echo",
@@ -445,9 +446,22 @@ fn claude_normalizer_accounting() {
         "claude_normalizer_accounting",
         "claude_normalizer_accounting_duplicate_result",
         "claude_normalizer_accounting_cross_generation",
+        "claude_normalizer_accounting_mismatch_after_terminal",
     ] {
         check(name).unwrap();
     }
+    // C2 §2's third case by init: another session's init after the
+    // retained terminal leaves the turn's outcome and fails health.
+    let name = "claude_normalizer_accounting_mismatch_after_terminal";
+    let mut late_init = replay_of(name).unwrap();
+    let (at, line) = emit_step(&mut late_init, None, "\"OTHER\"").unwrap();
+    let other: Value = serde_json::from_str(&line).unwrap();
+    let (_, init) = emit_step(&mut late_init, None, "\"subtype\":\"init\"").unwrap();
+    let init = init.replace("${sid}", other["session_id"].as_str().unwrap());
+    late_init["steps"][at] = json!({"emit": {"line": init}});
+    let expect = conformance_expect::load(&fixtures(), name).unwrap();
+    let knobs = conformance_run::Knobs::default();
+    check_variant("claude_late_init_mismatch", &late_init, &expect, knobs).unwrap();
     let base = replay_of("claude_lazy_init_acceptance_result_only").unwrap();
     let mut malformed = base.clone();
     malformed["steps"][2] = emit(&json!({
@@ -559,6 +573,97 @@ fn claude_preflight_pure_version() {
             .unwrap();
         conformance_expect::check(&expect, &outcome).unwrap_or_else(|e| panic!("{name}:\n{e}"));
     }
+}
+
+/// S1 rule 4 (review r1 #2): the daemon force decides the turn's outcome
+/// (`force_stop`) even when a normalizer verdict posted its abort first;
+/// health keeps the verdict's first cause. Here a refused handshake's
+/// abort sent the interrupt, which the fake never answers; the force
+/// comes while the fake waits (it exits at the anchor's SIGTERM).
+#[test]
+fn claude_force_outranks_verdict() {
+    let name = "claude_preflight_pure_version_no_receipt";
+    let mut replay = replay_of(name).unwrap();
+    let steps = replay["steps"].as_array_mut().unwrap();
+    // The prompt, the pause, init and the interrupt.
+    steps.truncate(4);
+    steps.push(json!({"await_signal": {"signal": "SIGTERM"}}));
+    steps.push(json!({"exit": {"code": 143, "stderr": ""}}));
+    let mut expect = conformance_expect::load(&fixtures(), name).unwrap();
+    let wanted = &mut expect["turns"][0]["expect"];
+    wanted["error"] = json!("force_stop");
+    wanted["exit"] = json!({"code": 143, "signal": null});
+    let knobs = conformance_run::Knobs {
+        force_on: Some("at 5 launch 1"),
+        ..conformance_run::Knobs::default()
+    };
+    check_variant("claude_force_after_verdict", &replay, &expect, knobs).unwrap();
+}
+
+/// C2 A1 (review r1 #3): Core stalls past the driver's stall bound (10 s)
+/// while the vendor runs; the driver closes the hop and the private
+/// connection fails `overflow`, which interrupts the vendor before Host
+/// closes it, in AD19's order: the interrupt, its terminal awaited, stdin
+/// EOF, then the graceful close, all bounded by the cleanup allowance. The
+/// replay requires the interrupt (a force close without it ends the fake
+/// by its SIGTERM) and EOF only after the terminal. The terminal Route
+/// read is kept beside the overflow (AD4); its receipt never reached the
+/// normalizer (the hop was closed), so it is no acknowledged cancel.
+#[test]
+fn claude_observation_stall_interrupts() {
+    let base = replay_of("claude_lazy_init_acceptance").unwrap();
+    // The prompt, the vendor's pause and init.
+    let mut steps = base["steps"].as_array().unwrap()[..3].to_vec();
+    // Past the session channel's 1024 items.
+    for n in 0..1100 {
+        steps.push(emit(&json!({
+            "type": "assistant",
+            "message": {"id": format!("msg_{n}"), "role": "assistant",
+                "content": [{"type": "text", "text": "."}]},
+            "session_id": "${sid}",
+        })));
+    }
+    steps.push(json!({"expect": {
+        "line": {"type": "control_request", "request": {"subtype": "interrupt"}},
+        "capture": {"rid": "/request_id"},
+    }}));
+    steps.push(json!({"emit": {"line": "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":${rid},\"response\":{\"still_queued\":[]}}}"}}));
+    steps.push(emit(&json!({
+        "type": "result", "subtype": "error_during_execution", "is_error": true,
+        "session_id": "${sid}", "stop_reason": "end_turn", "terminal_reason": "aborted_tools",
+    })));
+    steps.push(json!({"await_eof": {}}));
+    let mut replay = base;
+    replay["deadline_ms"] = json!(30000);
+    replay["steps"] = json!(steps);
+    let mut expect = conformance_expect::load(&fixtures(), "claude_lazy_init_acceptance").unwrap();
+    expect["sessions"]["main"]["health"] = json!({"state": "failed", "first_cause": "overflow"});
+    let turn = &mut expect["turns"][0];
+    turn["gates"] = json!([]);
+    turn["deadlines"] = json!({"wall_ms": 60000, "idle_ms": 60000});
+    let wanted = &mut turn["expect"];
+    for (field, value) in [
+        (
+            "terminal",
+            json!({"status": "failed", "stop_reason": "error", "class_hint": "vendor_error",
+                "vendor_code": "aborted_tools"}),
+        ),
+        ("usage", Value::Null),
+        ("final_text", Value::Null),
+        ("error", json!("overflow")),
+        (
+            "observations_include",
+            json!([{"kind": "session.vendor_identity_confirmed", "generation": 1}, "turn.accepted"]),
+        ),
+        ("observations_exclude", json!(["final_text"])),
+    ] {
+        wanted[field] = value;
+    }
+    let knobs = conformance_run::Knobs {
+        stall_consumer: true,
+        ..conformance_run::Knobs::default()
+    };
+    check_variant("claude_stall_interrupt", &replay, &expect, knobs).unwrap();
 }
 
 /// Carry-item 1 (Claude ruling C1, packet §5): a session-cumulative cost

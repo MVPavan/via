@@ -103,6 +103,10 @@ pub(crate) enum End {
     Refused(Incompatibility),
     /// A protocol contradiction, or a count or payload past its bound.
     Protocol(&'static str),
+    /// An init or result naming another session after the turn's
+    /// terminal was retained (C2 §2's third mismatch case): the terminal
+    /// and outcome stand; only health fails `ResumeMismatch`.
+    MismatchAfterTerminal,
     /// A call, denial or decline ID that VIA could not admit to its
     /// bounded set: the driver reports it on the health path as an
     /// ingress overflow (C2). The normalizer takes nothing after it.
@@ -165,6 +169,8 @@ pub(crate) struct Normalizer {
     confirmed: bool,
     accepted: bool,
     ended: bool,
+    /// The turn's terminal was produced (and retained by the driver).
+    retained: bool,
     /// Calls started and not ended, with their targets.
     open: BTreeMap<String, String>,
     /// Calls ended, with their targets (review r1 #5): never restarted,
@@ -202,6 +208,7 @@ impl Normalizer {
             confirmed: false,
             accepted: false,
             ended: false,
+            retained: false,
             open: BTreeMap::new(),
             done: BTreeMap::new(),
             denied: BTreeSet::new(),
@@ -301,6 +308,9 @@ impl Normalizer {
 
     fn init(&mut self, init: Box<Init>) -> Batch {
         if self.ended {
+            if self.retained && init.session_id != self.launch.expected_session {
+                return self.mismatch_after_terminal(&init.session_id);
+            }
             return Batch::ended(End::Protocol("an init after the result"));
         }
         if let Some(first) = &self.init {
@@ -361,6 +371,18 @@ impl Normalizer {
                 returned: returned.to_owned(),
             }],
             end: Some(End::ResumeMismatch),
+            ..Batch::default()
+        }
+    }
+
+    /// C2 §2's third case: `resume.mismatch`, and only health fails.
+    fn mismatch_after_terminal(&self, returned: &str) -> Batch {
+        Batch {
+            observations: vec![Observation::ResumeMismatch {
+                requested: self.launch.expected_session.clone(),
+                returned: returned.to_owned(),
+            }],
+            end: Some(End::MismatchAfterTerminal),
             ..Batch::default()
         }
     }
@@ -505,6 +527,9 @@ impl Normalizer {
 
     fn result(&mut self, result: &ResultMessage, at: Instant) -> Batch {
         if self.ended {
+            if self.retained && result.session_id != self.launch.expected_session {
+                return self.mismatch_after_terminal(&result.session_id);
+            }
             return Batch::ended(End::Protocol("a second result"));
         }
         if result.session_id != self.launch.expected_session {
@@ -552,6 +577,7 @@ impl Normalizer {
                 final_text_pieces(text).map(|piece| Observation::FinalText(piece.to_owned())),
             );
         }
+        self.retained = true;
         batch.terminal = Some(Box::new(terminal));
         batch.end = Some(end);
         batch
