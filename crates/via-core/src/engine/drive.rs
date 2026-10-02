@@ -156,6 +156,17 @@ struct Control<'a> {
     idle: Duration,
     /// The final text's pieces so far (design §6.4).
     final_text: FinalText,
+    /// The turn's own late terminal, received after its end and before
+    /// its run returned: it revises the turn once its terminal committed
+    /// (C1 §7.6).
+    late: Option<via_adapters::VendorTerminal>,
+}
+
+impl Control<'_> {
+    /// Keeps the turn's first own late terminal for its revision.
+    fn keep_late(&mut self, terminal: via_adapters::VendorTerminal) {
+        self.late.get_or_insert(terminal);
+    }
 }
 
 /// What the dispatcher does after one step.
@@ -831,6 +842,7 @@ impl Engine {
             idle_at: Some(origin + effective.idle()),
             idle: effective.idle(),
             final_text: FinalText::new(),
+            late: None,
         };
         // C2 §2 `TurnSpec`: the prompt with the turn's frozen values.
         let spec = effective.turn_spec(prompt);
@@ -911,6 +923,7 @@ impl Engine {
             .filter(|_| terminal.state == "cancelled");
         // A terminal that did not commit reads `store_error` and latches.
         let _ = self.finish_with(started, (record, terminal), cause).await;
+        self.revise_kept(&session, turn, control.late.take()).await;
         // Test builds: the terminal committed, `Running` not yet cleared
         // (Task 4 design §4.2).
         #[cfg(feature = "test-failpoints")]
@@ -1844,6 +1857,7 @@ impl Engine {
             idle_at: idle.map(|idle| tokio::time::Instant::now() + idle),
             idle: idle.unwrap_or_default(),
             final_text: FinalText::new(),
+            late: None,
         };
         let _driven = self
             .execute(record, (lane, effective), (spec, cx), (&mut control, inbox))
@@ -1853,7 +1867,8 @@ impl Engine {
     /// Test builds: drains `queued` for the running `turn` of `slot` as
     /// `execute`'s completion does, with the run loop's own order receiver
     /// and the session's `lane`; without one every item is the running
-    /// turn's.
+    /// turn's. The running turn's own late terminal it kept for the
+    /// revision.
     #[cfg(test)]
     pub(super) async fn drain_queued(
         &self,
@@ -1862,7 +1877,7 @@ impl Engine {
         effective: &Effective,
         orders: watch::Receiver<Option<StopOrder>>,
         queued: Vec<ObservationItem>,
-    ) {
+    ) -> Option<via_adapters::VendorTerminal> {
         let budget = Arc::new(tokio::sync::Semaphore::new(queued.len()));
         let queued: Vec<Admitted> = queued
             .into_iter()
@@ -1883,6 +1898,7 @@ impl Engine {
             idle_at: None,
             idle: Duration::ZERO,
             final_text: FinalText::new(),
+            late: None,
         };
         let (sender, receiver) = tokio::sync::mpsc::channel(queued.len().max(1));
         for admitted in queued {
@@ -1901,6 +1917,7 @@ impl Engine {
             (&mut inbox, delivered),
         )
         .await;
+        control.late
     }
 
     /// Handles one observation in decode order (C2 §4): commits the
@@ -2033,12 +2050,12 @@ impl Engine {
             // the driver ends the connection, and the turn's end carries
             // what it did to the turn. An identity was handled before
             // attribution.
+            // C1 §7.6: the turn's own late terminal, after its end, waits
+            // for the turn's terminal; only its first is kept.
+            Observation::LateTerminal(terminal) => control.keep_late(terminal),
             Observation::IdentityConfirmed(_)
             | Observation::ResumeMismatch { .. }
-            | Observation::VendorClosed(_)
-            // Discarded until via-jm4.35: a late terminal's revision
-            // write is not in the Store yet.
-            | Observation::LateTerminal(_) => {}
+            | Observation::VendorClosed(_) => {}
         }
     }
 
@@ -2217,9 +2234,8 @@ impl Engine {
     /// `late: true`, or session-level with `turn: null`. A durable one, a
     /// denial, a decline, a warning or a steer report, is committed under
     /// the running turn, the one the Store admits events for; it never
-    /// changes an envelope.
-    /// Non-durable ones are dropped, and so is a late terminal, until
-    /// via-jm4.35.
+    /// changes an envelope. A late terminal of an earlier turn revises it
+    /// (C1 §7.6, [`Engine::revise`]). Other non-durable ones are dropped.
     async fn observe_other(
         &self,
         record: &mut TurnRecord,
@@ -2242,15 +2258,21 @@ impl Engine {
                 self.commit_steer(record, lane, attributed, (&delivery, token))
                     .await;
             }
+            // C1 §7.6: an earlier turn's late terminal revises it, when
+            // its end retained none.
+            Observation::LateTerminal(terminal) => {
+                if let (Some(turn), true) = attributed
+                    && let Ok(turn) = TurnNumber::try_from(turn)
+                {
+                    self.revise(&record.session, turn, &terminal).await;
+                }
+            }
             Observation::Accepted(_)
             | Observation::IdentityConfirmed(_)
             | Observation::Progress(_)
             | Observation::FinalText(_)
             | Observation::VendorClosed(_)
-            | Observation::ResumeMismatch { .. }
-            // Discarded until via-jm4.35: a late terminal's revision
-            // write is not in the Store yet.
-            | Observation::LateTerminal(_) => {}
+            | Observation::ResumeMismatch { .. } => {}
         }
     }
 

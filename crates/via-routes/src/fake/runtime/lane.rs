@@ -17,7 +17,7 @@ use super::super::{
 use super::{Failed, FakeRouteResult, Next, Serving, protocol, transport};
 use crate::{
     CloseRequest, Deadline, ExitReport, OutboundMessage, RouteError, RouteFailure, SendOutcome,
-    StopCause, WireCleanup,
+    StopCause, TurnNumber, WireCleanup,
 };
 use via_wire::{CloseMode, WireCloseReport, WireMessages, WireSender};
 
@@ -61,6 +61,20 @@ pub struct Lane {
     /// The turn's effort: an instance whose handshake reports its catalog
     /// must list it (AD18).
     pub effort: Option<String>,
+    /// Where the persistent profile's retirement sends a terminal its
+    /// helper reports after a logical turn that retained none (C2 §4
+    /// `turn.late_terminal`); `None` drops it.
+    pub late: Option<oneshot::Sender<FakeLateTerminal>>,
+}
+
+/// A terminal the persistent profile's helper reported while it was
+/// retired, after its logical turn ended with no terminal (C2 §4
+/// `turn.late_terminal`).
+pub struct FakeLateTerminal {
+    /// The vendor turn it names, the turn's own.
+    pub vendor_turn_id: String,
+    /// The decoded terminal.
+    pub terminal: FakeTerminal,
 }
 
 /// One steer input for the running turn, admitted by [`SteerSender`];
@@ -365,6 +379,8 @@ pub(super) struct LaneState {
     ack_evidence: bool,
     identity: Option<String>,
     effort: Option<String>,
+    /// Where a late terminal goes ([`Lane::late`]).
+    late: Option<oneshot::Sender<FakeLateTerminal>>,
 }
 
 impl LaneState {
@@ -391,6 +407,7 @@ impl LaneState {
             ack_evidence: false,
             identity: lane.identity,
             effort: lane.effort,
+            late: lane.late,
         }
     }
 
@@ -819,11 +836,14 @@ impl Serving<'_> {
 
     /// Retires the persistent profile's helper apart from the logical turn
     /// (decision H1): input closed, then Host's close under `by`, forced at
-    /// once for a session close, then the drain.
+    /// once for a session close, then the drain. Meanwhile the helper's
+    /// output is read: after a logical turn that retained no terminal, the
+    /// first terminal it reports goes on the lane's `late` (C2 §4
+    /// `turn.late_terminal`); anything else is dropped.
     pub(super) async fn retire(
         &mut self,
         sender: &WireSender,
-        messages: WireMessages,
+        mut messages: WireMessages,
         by: Deadline,
     ) -> WireCloseReport {
         let closing = self
@@ -839,9 +859,58 @@ impl Serving<'_> {
         };
         // A half-close that failed leaves Host's close below to stop it.
         let _half_closed = sender.close_input(by).await;
-        let report = sender.close(CloseRequest { mode, deadline: by }).await;
+        let late = self
+            .lane
+            .late
+            .take()
+            .filter(|_| self.lane.facts.terminal.is_none());
+        let close = sender.close(CloseRequest { mode, deadline: by });
+        let (report, ()) = tokio::join!(close, late_terminal(&mut messages, self.turn, late, by));
         messages.finish(by).await;
         report
+    }
+}
+
+/// Reads a retired helper's output until it ends, a message cannot be
+/// read or decoded, or `by`, and sends the first terminal it reports for
+/// `turn` on `late` (C2 §4 `turn.late_terminal`). Everything else is
+/// dropped: the logical turn already ended. Without `late` nothing is read.
+async fn late_terminal(
+    messages: &mut WireMessages,
+    turn: TurnNumber,
+    late: Option<oneshot::Sender<FakeLateTerminal>>,
+    by: Deadline,
+) {
+    let Some(late) = late else {
+        return;
+    };
+    let read = async {
+        loop {
+            let message = match messages.next_message().await {
+                Ok(Some(message)) => message,
+                // A stop order's wake: nothing was lost.
+                Err(via_wire::WireError::Woken) => continue,
+                Ok(None) | Err(_) => return None,
+            };
+            let Ok(payload) = FakeMessage::decode(message.bytes(), turn) else {
+                return None;
+            };
+            if let FakeMessage::Terminal { vendor_turn_id, .. } = &payload {
+                let vendor_turn_id = vendor_turn_id.clone();
+                let message = super::super::RouteMessage {
+                    payload,
+                    steer: None,
+                };
+                return super::terminal_evidence(&message).map(|terminal| FakeLateTerminal {
+                    vendor_turn_id,
+                    terminal,
+                });
+            }
+        }
+    };
+    if let Ok(Some(terminal)) = tokio::time::timeout_at(by.instant(), read).await {
+        // The driver's turn task is gone: nobody takes the terminal.
+        let _unread = late.send(terminal);
     }
 }
 

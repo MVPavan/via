@@ -3101,6 +3101,66 @@ fn a_late_denial_is_committed_late_and_kept_out_of_the_running_turn() {
     });
 }
 
+/// via-jm4.35 (C1 §7.6, C2 §4 `turn.late_terminal`): the running turn's
+/// own late terminal, met in its final drain, is kept for the revision
+/// that follows the turn's terminal; nothing commits for it yet. One of an
+/// earlier turn that did not end `unknown` (turn 1 here ended `failed`) is
+/// not revised and commits nothing.
+#[test]
+fn the_running_turns_late_terminal_waits_for_its_terminal() {
+    let Some(root) = child("the_running_turns_late_terminal_waits_for_its_terminal") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let (session, slot, lane, mut record, effective, orders) =
+            running_turn_2(&engine, &root).await;
+        let before = event_types(&engine, &session).await;
+        let terminal = |vendor_turn: &str, reason: &str| via_adapters::ObservationItem {
+            at: tokio::time::Instant::now(),
+            vendor_turn: Some(
+                via_adapters::VendorTurnId::try_from(vendor_turn.to_owned()).unwrap(),
+            ),
+            observation: via_adapters::Observation::LateTerminal(via_adapters::VendorTerminal {
+                at: tokio::time::Instant::now(),
+                status: via_adapters::VendorTerminalStatus::Completed,
+                stop_reason: via_adapters::StopReason::EndTurn,
+                vendor_stop_reason: reason.to_owned(),
+                vendor_code: None,
+                class_hint: None,
+                detail: None,
+                structured_output: None,
+                steps: None,
+                usage: None,
+                cost: None,
+                vendor: None,
+            }),
+        };
+        let queued = vec![
+            terminal("fake-turn-1", "earlier"),
+            terminal("fake-turn-2", "own"),
+            terminal("fake-turn-2", "second"),
+        ];
+        let kept = engine
+            .drain_queued(
+                (&slot, Some(&*lane)),
+                &mut record,
+                &effective,
+                orders,
+                queued,
+            )
+            .await;
+        assert_eq!(
+            kept.map(|terminal| terminal.vendor_stop_reason).as_deref(),
+            Some("own"),
+            "the first of the running turn's own"
+        );
+        assert_eq!(event_types(&engine, &session).await, before);
+        assert!(record.first_failure.is_none());
+        assert!(!engine.store_failed());
+    });
+}
+
 /// Sol r1 F12 (C2 §2, H3): a session's lane opens its driver from the
 /// session's stored route identity: its harness, its receipt's route and
 /// its recorded adapter version, never a constant.

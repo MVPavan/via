@@ -400,11 +400,12 @@ fn status_value(
     let turns: Vec<Value> = status
         .turns
         .iter()
-        .map(|(turn, state)| {
-            if terminal(state) {
-                json!({"n": turn, "state": state, "revision": 0})
+        .map(|turn| {
+            // C1 §3.7, §7.6: a terminal turn reports its envelope's revision.
+            if terminal(&turn.state) {
+                json!({"n": turn.number, "state": turn.state, "revision": turn.revision})
             } else {
-                json!({"n": turn, "state": state})
+                json!({"n": turn.number, "state": turn.state})
             }
         })
         .collect();

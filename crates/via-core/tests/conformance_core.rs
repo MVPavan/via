@@ -2617,3 +2617,415 @@ fn core_an_eviction_racing_a_dispatch_keeps_the_turn_and_opens_once() {
         daemon.shutdown().await;
     });
 }
+
+/// The persistent profile with a native `output_schema` (via-jm4.35).
+fn persistent_with_schema() -> Value {
+    json!({"persistent": true, "capabilities": {
+        "verbs": {"spawn":{"support":"native"},"resume":{"support":"native"},
+                  "steer":{"support":"unsupported","reason":"no steer input"},
+                  "cancel":{"support":"native"},"close":{"support":"native"}},
+        "params": {"instructions":{"support":"unsupported","reason":"no instructions input"},
+                   "output_schema":{"support":"native"},
+                   "effort":{"support":"unsupported","reason":"no effort setting"},
+                   "max_steps":{"support":"unsupported","reason":"no step limit"}},
+        "bounds": [], "network_control": false,
+        "recover": {"support":"unsupported","reason":"no recovery"},
+        "usage": {"tokens":"turn","cost":"unavailable"}
+    }})
+}
+
+/// The late scripts (via-jm4.35): the turn's acceptance, then a gate the
+/// test releases once the turn ended `unknown`, then the helper's terminal.
+fn late_scripts() -> Vec<Value> {
+    let invalid = emit(&json!({"type":"terminal","vendor_turn_id":vendor_turn(1),
+                               "status":"completed","final_text":"done",
+                               "stop_reason":"end_turn","structured_output":{"a":"x"}}));
+    vec![
+        script(
+            "late",
+            &[
+                accepted(1),
+                gate("late"),
+                terminal(1, "completed", "end_turn"),
+            ],
+        ),
+        script("invalid", &[accepted(1), gate("invalid"), invalid]),
+    ]
+}
+
+/// The session's `status` `turns`.
+async fn status_turns(daemon: &Daemon, session: &SessionId) -> Value {
+    let params = serde_json::from_value(json!({"session":session})).unwrap();
+    daemon.engine.status(params).await.unwrap()["turns"].clone()
+}
+
+/// The stored envelope of `session`'s turn `turn`.
+async fn stored(daemon: &Daemon, session: &SessionId, turn: u32) -> Value {
+    let envelope = daemon
+        .engine
+        .result(&format!("{session}/{turn}"))
+        .await
+        .unwrap();
+    serde_json::from_str(envelope.get()).unwrap()
+}
+
+/// The session's committed `turn.revised` events.
+async fn revisions(daemon: &Daemon, session: &SessionId) -> Vec<Value> {
+    events(daemon, session)
+        .await
+        .into_iter()
+        .filter(|event| event["type"] == "turn.revised")
+        .collect()
+}
+
+/// Waits until `session` committed a `turn.revised`.
+async fn until_revised(daemon: &Daemon, session: &SessionId) {
+    let by = tokio::time::Instant::now() + Duration::from_secs(30);
+    while revisions(daemon, session).await.is_empty() {
+        assert!(
+            tokio::time::Instant::now() < by,
+            "the turn was never revised"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Runs `prompt`'s session to its `unknown` end: the cancel's force passes
+/// unanswered on the shared server, so the turn retained no terminal.
+async fn unknown_turn(daemon: &Daemon, prompt: &str, extra: &Value) -> SessionId {
+    let session = daemon.spawn(prompt, extra).await;
+    daemon.entered(prompt).await;
+    cancel(daemon, &session, 1, 500).await;
+    let envelope = daemon.wait(&session, 1).await;
+    assert_eq!(envelope["state"], "unknown", "{envelope}");
+    assert_eq!(envelope["cancel"]["outcome"], "unknown", "{envelope}");
+    assert!(envelope["vendor_stop_reason"].is_null(), "{envelope}");
+    assert_eq!(envelope["revision"], 0, "{envelope}");
+    assert_eq!(
+        status_turns(daemon, &session).await,
+        json!([{"n":1,"state":"unknown","revision":0}])
+    );
+    session
+}
+
+/// via-jm4.35 (C1 §7.6 late row, C2 §4 `turn.late_terminal`), items 1 and
+/// 4: on the persistent profile a cancel's force passes unanswered, so the
+/// turn ends `unknown` with no retained terminal. The helper's terminal,
+/// read while it is retired, revises the turn once: `turn.revised
+/// {revision: 1, from_state: unknown, state: completed, evidence:
+/// late_terminal}`, `late: true`, and an envelope with `revision: 1`, the
+/// vendor's result and the vendor ignoring the cancel (`requested`);
+/// `status` and the read report the revision. C1 Q2: a late structured
+/// output is validated against the frozen schema, an invalid one revising
+/// to `failed(structured_output_invalid)`.
+#[test]
+fn core_late_terminal_revises_an_unknown_turn() {
+    let Some(root) = child(
+        "core_late_terminal_revises_an_unknown_turn",
+        &scenario(&persistent_with_schema(), &late_scripts()),
+        &[],
+    ) else {
+        return;
+    };
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = unknown_turn(&daemon, "late", &json!({})).await;
+        daemon.release("late");
+        until_revised(&daemon, &session).await;
+        let revised = revisions(&daemon, &session).await;
+        assert_eq!(revised.len(), 1, "{revised:?}");
+        let event = &revised[0];
+        assert_eq!(
+            (
+                &event["turn"],
+                &event["late"],
+                &event["revision"],
+                &event["from_state"],
+                &event["state"],
+                &event["evidence"]
+            ),
+            (
+                &json!(1),
+                &json!(true),
+                &json!(1),
+                &json!("unknown"),
+                &json!("completed"),
+                &json!("late_terminal")
+            ),
+            "{event}"
+        );
+        let envelope = stored(&daemon, &session, 1).await;
+        assert_eq!(envelope["revision"], 1, "{envelope}");
+        assert_eq!(envelope["state"], "completed", "{envelope}");
+        assert!(envelope["failure"].is_null(), "{envelope}");
+        assert_eq!(envelope["stop_reason"], "end_turn", "{envelope}");
+        assert_eq!(envelope["vendor_stop_reason"], "end_turn", "{envelope}");
+        assert_eq!(envelope["cancel"]["outcome"], "requested", "{envelope}");
+        assert_eq!(envelope["events"]["last_seq"], event["seq"], "{envelope}");
+        assert_eq!(
+            status_turns(&daemon, &session).await,
+            json!([{"n":1,"state":"completed","revision":1}])
+        );
+
+        let schema = json!({"type":"object","properties":{"a":{"type":"integer"}},
+                            "required":["a"]});
+        let session = unknown_turn(&daemon, "invalid", &json!({"output_schema":schema})).await;
+        daemon.release("invalid");
+        until_revised(&daemon, &session).await;
+        let envelope = stored(&daemon, &session, 1).await;
+        assert_eq!(envelope["revision"], 1, "{envelope}");
+        assert_eq!(envelope["state"], "failed", "{envelope}");
+        assert_eq!(class(&envelope), "structured_output_invalid", "{envelope}");
+        assert_eq!(
+            envelope["failure"]["data"]["reason"], "invalid",
+            "{envelope}"
+        );
+        assert_eq!(
+            envelope["structured_output"],
+            json!({"a":"x"}),
+            "{envelope}"
+        );
+        daemon.shutdown().await;
+    });
+}
+
+/// via-jm4.35 item 2 (C2 §4: only a turn whose end carried no terminal):
+/// a turn that retained its terminal is never revised. On the persistent
+/// profile the helper reports a second terminal while it is retired; the
+/// turn keeps its envelope and revision 0, and no `turn.revised` commits.
+/// The session's close waits for the retirement, so the second terminal
+/// was read before the events are.
+#[test]
+fn core_a_turn_that_retained_its_terminal_is_not_revised() {
+    let scripts = [script(
+        "kept",
+        &[
+            accepted(1),
+            terminal(1, "completed", "end_turn"),
+            gate("second"),
+            terminal(1, "failed", "error"),
+        ],
+    )];
+    let Some(root) = child(
+        "core_a_turn_that_retained_its_terminal_is_not_revised",
+        &scenario(&persistent(), &scripts),
+        &[],
+    ) else {
+        return;
+    };
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = daemon.spawn("kept", &json!({})).await;
+        let envelope = daemon.wait(&session, 1).await;
+        assert_eq!(envelope["state"], "completed", "{envelope}");
+        daemon.entered("second").await;
+        daemon.release("second");
+        daemon.close(&session).await;
+        assert!(revisions(&daemon, &session).await.is_empty());
+        let after = stored(&daemon, &session, 1).await;
+        assert_eq!(after, envelope);
+        assert_eq!(
+            status_turns(&daemon, &session).await,
+            json!([{"n":1,"state":"completed","revision":0}])
+        );
+        daemon.shutdown().await;
+    });
+}
+
+/// The hits of failpoint `point` a wrong-token command counted so far.
+#[cfg(feature = "test-failpoints")]
+fn hits(root: &Path, point: &str) -> u64 {
+    let prefix = format!("{point}.");
+    fs::read_dir(root.join("points"))
+        .unwrap()
+        .filter_map(|entry| {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            name.strip_prefix(&prefix)
+                .and_then(|rest| rest.strip_suffix(".refused"))
+                .and_then(|number| number.parse::<u64>().ok())
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Releases `point`'s paused hit `occurrence`.
+#[cfg(feature = "test-failpoints")]
+fn release_point(root: &Path, point: &str, occurrence: u64) {
+    fs::write(
+        root.join("points")
+            .join(format!("{point}.{occurrence}.release")),
+        b"",
+    )
+    .unwrap();
+}
+
+impl Daemon {
+    /// Ends a daemon whose Store failure latched, as its process would:
+    /// final shutdown, then every task holding the Engine, so the next
+    /// daemon on the same root takes the Store lock.
+    #[cfg(feature = "test-failpoints")]
+    async fn end_latched(self) {
+        let _report = self
+            .engine
+            .shutdown(Deadline::at(
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            ))
+            .await;
+        self.starter.abort();
+        let _ = self.starter.await;
+        let handles = std::mem::take(&mut *self.dispatchers.lock().unwrap());
+        for handle in handles {
+            handle.abort();
+            let _ = handle.await;
+        }
+        assert_eq!(Arc::strong_count(&self.engine), 1, "the Engine is held");
+    }
+}
+
+/// Waits until the daemon's Store failure latched.
+#[cfg(feature = "test-failpoints")]
+async fn until_latched(daemon: &Daemon) {
+    let by = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !daemon.engine.store_failed() {
+        assert!(
+            tokio::time::Instant::now() < by,
+            "Store failure never latched"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// via-jm4.35 item 3 (C1 §7.6, runtime §7): an uncertain revision commit
+/// latches Store failure and is never assumed absent; the restarted daemon
+/// reads what is durable. Case `durable`: the commit's reply is lost after
+/// it committed (`store.commit.reply_lost`), and the restart reads the
+/// first revision. Case `absent`: the commit fails and its rollback is
+/// reported failed (`store.commit.revision`, `store.rollback.fail`), and
+/// the restart reads the turn `unknown` at revision 0 with no
+/// `turn.revised`.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_an_uncertain_revision_latches_and_reconciles_at_restart() {
+    const NAME: &str = "core_an_uncertain_revision_latches_and_reconciles_at_restart";
+    let scenario = scenario(&persistent(), &late_scripts()[..1]);
+    let Some(root) = child(NAME, &scenario, &[]) else {
+        child_case(NAME, &scenario, "absent");
+        return;
+    };
+    let durable = case().is_none();
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    // The revision is held before its commit is sent.
+    arm(&root, "core.revision.commit", "pause");
+    if durable {
+        // Counted with a wrong token until the revision's own hit is known.
+        let counting = json!({"token":"counting","occurrence":1,"action":"pause"});
+        fs::write(
+            root.join("points").join("store.commit.reply_lost.json"),
+            counting.to_string(),
+        )
+        .unwrap();
+    } else {
+        arm(&root, "store.commit.revision", "fail_io");
+        arm(&root, "store.rollback.fail", "fail_io");
+    }
+    run(async {
+        let session = {
+            let daemon = Daemon::open(&root);
+            let session = unknown_turn(&daemon, "late", &json!({})).await;
+            daemon.release("late");
+            until_acked(&root, "core.revision.commit", 1).await;
+            if durable {
+                let next = hits(&root, "store.commit.reply_lost") + 1;
+                arm_at(&root, "store.commit.reply_lost", next, "fail_io");
+            }
+            release_point(&root, "core.revision.commit", 1);
+            until_latched(&daemon).await;
+            daemon.end_latched().await;
+            session
+        };
+        let daemon = Daemon::open(&root);
+        daemon.engine.recover().await.unwrap();
+        let envelope = stored(&daemon, &session, 1).await;
+        let revised = revisions(&daemon, &session).await;
+        if durable {
+            assert_eq!(envelope["revision"], 1, "{envelope}");
+            assert_eq!(envelope["state"], "completed", "{envelope}");
+            assert_eq!(revised.len(), 1, "{revised:?}");
+            assert_eq!(
+                status_turns(&daemon, &session).await,
+                json!([{"n":1,"state":"completed","revision":1}])
+            );
+        } else {
+            assert_eq!(envelope["revision"], 0, "{envelope}");
+            assert_eq!(envelope["state"], "unknown", "{envelope}");
+            assert!(revised.is_empty(), "{revised:?}");
+            assert_eq!(
+                status_turns(&daemon, &session).await,
+                json!([{"n":1,"state":"unknown","revision":0}])
+            );
+        }
+        daemon.shutdown().await;
+    });
+}
+
+/// via-jm4.35 (C1 §7.6, runtime §7): a revision known not committed is
+/// retried once at the same sequence. Case `retried`: the first attempt
+/// rolls back and the retry commits, revision 1, nothing latched. Case
+/// `not_made`: the retry fails too, so the revision is not made, the turn
+/// stays `unknown` at revision 0 with no `turn.revised`; both failures are
+/// the turn's, scoped, and nothing latches.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_a_revision_not_committed_is_retried_once() {
+    const NAME: &str = "core_a_revision_not_committed_is_retried_once";
+    let scenario = scenario(&persistent(), &late_scripts()[..1]);
+    let Some(root) = child(NAME, &scenario, &[]) else {
+        child_case(NAME, &scenario, "not_made");
+        return;
+    };
+    let retried = case().is_none();
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    arm_failing(&root, "store.commit.revision", !retried);
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = unknown_turn(&daemon, "late", &json!({})).await;
+        daemon.release("late");
+        // The first attempt's hit, and with `persist` the retry's.
+        until_acked(&root, "store.commit.revision", if retried { 1 } else { 2 }).await;
+        if retried {
+            until_revised(&daemon, &session).await;
+            let envelope = stored(&daemon, &session, 1).await;
+            assert_eq!(envelope["revision"], 1, "{envelope}");
+            assert_eq!(envelope["state"], "completed", "{envelope}");
+            assert!(!daemon.engine.store_failed());
+            daemon.shutdown().await;
+            return;
+        }
+        let by = tokio::time::Instant::now() + Duration::from_secs(30);
+        let failure = loop {
+            let failure = daemon.engine.store_failure_status();
+            if failure
+                .as_ref()
+                .is_some_and(|failure| failure["count"] == 2)
+            {
+                break failure.unwrap();
+            }
+            assert!(
+                tokio::time::Instant::now() < by,
+                "both failures were never recorded: {failure:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(
+            (&failure["kind"], &failure["scope"]),
+            (&json!("commit_failed"), &json!("turn")),
+            "{failure}"
+        );
+        assert!(!daemon.engine.store_failed());
+        let envelope = stored(&daemon, &session, 1).await;
+        assert_eq!(envelope["revision"], 0, "{envelope}");
+        assert_eq!(envelope["state"], "unknown", "{envelope}");
+        assert!(revisions(&daemon, &session).await.is_empty());
+        daemon.shutdown().await;
+    });
+}

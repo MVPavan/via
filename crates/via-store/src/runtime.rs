@@ -414,6 +414,17 @@ pub struct SessionEventRecord {
     pub identity: Option<SessionIdentity>,
 }
 
+/// One of the turns `status` lists (Task 4 design §11.3).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StatusTurn {
+    /// The turn's number.
+    pub number: u32,
+    /// `turns.state`.
+    pub state: String,
+    /// The terminal envelope's `revision` (C1 §7.6); 0 before it exists.
+    pub revision: u32,
+}
+
 /// A session's confirmed vendor identity, as its columns hold it.
 pub struct SessionIdentity {
     /// The confirmed vendor session ID.
@@ -436,6 +447,46 @@ pub struct TerminalRecord {
     /// the open step's and any a refused step commit carried. The
     /// transaction cap does not count them (§6.4).
     pub steps: Vec<StepRow>,
+}
+
+/// An `unknown` turn a late vendor terminal may revise (C1 §7.6): one
+/// whose envelope names no vendor stop reason, as its end retained no
+/// terminal. Its stored envelope, its frozen effective values and its
+/// session's route identity, which the revision is built from.
+pub struct RevisableTurn {
+    /// The stored C1 envelope.
+    pub envelope: Value,
+    /// The turn's frozen effective values.
+    pub effective: Value,
+    /// The session's frozen route identity.
+    pub route: SessionRoute,
+}
+
+/// The revision of an `unknown` turn by late evidence (C1 §7.6), one
+/// guarded batch: the turn must still be `unknown` with an envelope that
+/// names no vendor stop reason and holds the revision before `envelope`'s,
+/// in a session that is not closed. Its state becomes `envelope`'s, the
+/// envelope is replaced and `event` (`turn.revised`) is appended, together.
+/// A guard that does not hold is [`StoreError::Refused`]: nothing written.
+pub struct RevisionRecord {
+    /// Owning session.
+    pub session_id: SessionId,
+    /// One-based turn number.
+    pub turn: TurnNumber,
+    /// The revised C1 envelope, with `revision` one more.
+    pub envelope: Value,
+    /// `turn.revised` at the session's next sequence.
+    pub event: Value,
+}
+
+impl RevisionRecord {
+    /// Payload bytes besides its envelope, and the envelope's.
+    fn sizes(&self) -> (usize, usize) {
+        (
+            self.session_id.as_str().len() + encoded(&self.event),
+            encoded(&self.envelope),
+        )
+    }
 }
 
 /// One completed model step (Task 4 design §3.1): its number and its start
@@ -549,8 +600,8 @@ pub struct SessionStatus {
     pub active: Option<ActiveTurn>,
     /// The first [`STATUS_QUEUE`] queued turns.
     pub queue: Vec<QueuedSummary>,
-    /// The newest [`STATUS_TURNS`] turns and their states, newest first.
-    pub turns: Vec<(u32, String)>,
+    /// The newest [`STATUS_TURNS`] turns, newest first.
+    pub turns: Vec<StatusTurn>,
     /// The selected turn's rows after `after_step`, at most `limit`.
     pub steps: Vec<StepRow>,
     /// More rows follow the page.
@@ -1106,6 +1157,12 @@ pub(crate) enum Command {
         TurnNumber,
         oneshot::Sender<Result<Option<TerminalFacts>, StoreError>>,
     ),
+    Revisable(
+        SessionId,
+        TurnNumber,
+        oneshot::Sender<Result<Option<RevisableTurn>, StoreError>>,
+    ),
+    Revision(RevisionRecord, oneshot::Sender<Result<(), StoreError>>),
     Terminated(
         Vec<(SessionId, TurnNumber)>,
         oneshot::Sender<Result<Vec<(SessionId, TurnNumber)>, StoreError>>,
@@ -1278,6 +1335,7 @@ impl Command {
             | Self::CloseResult(session, _)
             | Self::ResultText(session, _, _)
             | Self::TerminalFacts(session, _, _)
+            | Self::Revisable(session, _, _)
             | Self::Events(session, _, _, _)
             | Self::EvidenceRefs(session, _, _)
             | Self::Authenticate(session, _, _) => (session.as_str().len(), 0, 0),
@@ -1332,6 +1390,10 @@ impl Command {
                 1,
             ),
             Self::Terminal(record, _, _) => {
+                let (payload, envelope) = record.sizes();
+                (payload, envelope, 1)
+            }
+            Self::Revision(record, _) => {
                 let (payload, envelope) = record.sizes();
                 (payload, envelope, 1)
             }
@@ -2226,6 +2288,28 @@ impl StoreClient {
     ) -> Result<Option<TerminalFacts>, StoreError> {
         let (reply, receive) = oneshot::channel();
         self.send(Command::TerminalFacts(session_id.clone(), turn, reply))?;
+        receive.await.map_err(|_| StoreError::WriterLost)?
+    }
+
+    /// Reads `turn` when a late vendor terminal may revise it (C1 §7.6):
+    /// `unknown`, its envelope naming no vendor stop reason; `None`
+    /// otherwise.
+    pub async fn revisable(
+        &self,
+        session_id: &SessionId,
+        turn: TurnNumber,
+    ) -> Result<Option<RevisableTurn>, StoreError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::Revisable(session_id.clone(), turn, reply))?;
+        receive.await.map_err(|_| StoreError::WriterLost)?
+    }
+
+    /// Commits the guarded revision batch of an `unknown` turn
+    /// ([`RevisionRecord`]); a guard that does not hold is
+    /// [`StoreError::Refused`].
+    pub async fn commit_revision(&self, record: RevisionRecord) -> Result<(), StoreError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::Revision(record, reply))?;
         receive.await.map_err(|_| StoreError::WriterLost)?
     }
 

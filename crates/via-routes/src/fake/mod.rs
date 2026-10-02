@@ -12,8 +12,8 @@ use crate::{
 mod runtime;
 
 pub use runtime::{
-    CONTROL_BYTES, CONTROL_COMMANDS, FakeRoute, FakeRouteResult, FakeTerminal, FakeTurn, Lane,
-    Retirement, SteerAnswer, SteerRefused, SteerRequest, SteerSender, steer_lane,
+    CONTROL_BYTES, CONTROL_COMMANDS, FakeLateTerminal, FakeRoute, FakeRouteResult, FakeTerminal,
+    FakeTurn, Lane, Retirement, SteerAnswer, SteerRefused, SteerRequest, SteerSender, steer_lane,
 };
 
 /// The one prompt submission of a private fake connection. Wire streams it

@@ -13,8 +13,8 @@ use std::{fs, os::unix::fs::PermissionsExt};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use via_store::{
-    ResumeRecord, SessionId, SpawnRecord, StepRow, StepsRecord, Store, StoreClient, StoreError,
-    SubmissionRecord, TerminalRecord, TurnNumber,
+    ResumeRecord, SessionId, SpawnRecord, StatusTurn, StepRow, StepsRecord, Store, StoreClient,
+    StoreError, SubmissionRecord, TerminalRecord, TurnNumber,
 };
 
 const SESSION: &str = "s_7f3k9q2mzr4c";
@@ -256,7 +256,18 @@ fn session_status_selects_a_turn_and_pages_its_rows() {
         );
         assert_eq!(
             status.turns,
-            [(2, "queued".to_owned()), (1, "running".to_owned())]
+            [
+                StatusTurn {
+                    number: 2,
+                    state: "queued".to_owned(),
+                    revision: 0,
+                },
+                StatusTurn {
+                    number: 1,
+                    state: "running".to_owned(),
+                    revision: 0,
+                },
+            ]
         );
         assert_eq!(status.steps, [row(2), row(3)]);
         assert!(status.more);

@@ -881,9 +881,9 @@ impl Lane {
     /// committed at once with its own attribution: an identity as the
     /// session's open event with its columns, a denial, decline or warning
     /// session-level, or late with its turn when it names an earlier turn;
-    /// so is a steer report (Sol r1 #9). An expired one and every
-    /// non-durable one (acceptance, progress, final text, vendor close,
-    /// mismatch, late terminal) is
+    /// so is a steer report (Sol r1 #9). A late terminal of an earlier turn
+    /// revises it (C1 §7.6). An expired one and every other non-durable
+    /// one (acceptance, progress, final text, vendor close, mismatch) is
     /// dropped. A vendor close needs nothing of Core: the driver ends the
     /// connection, and the next turn reopens it. Its budget returns once
     /// it is handled.
@@ -901,7 +901,10 @@ impl Lane {
                 match self.open_event(&identity.connection_id, &confirmed, version) {
                     Some(body) => {
                         let columns = Some(confirmed.columns());
-                        let written = self.writer.commit((body, &at, (None, false)), columns).await;
+                        let written = self
+                            .writer
+                            .commit((body, &at, (None, false)), columns)
+                            .await;
                         if let SessionWrite::Committed = written {
                             self.opened(identity.connection_id.clone(), confirmed);
                         }
@@ -936,15 +939,25 @@ impl Lane {
                     }
                 }
             }
+            // C1 §7.6: an ended turn's own late terminal revises it, when
+            // its end retained none ([`Engine::revise`]).
+            Observation::LateTerminal(terminal) => {
+                let vendor_turn = item
+                    .vendor_turn
+                    .as_ref()
+                    .map(via_adapters::VendorTurnId::as_str);
+                if let Attribution::Late(turn) = self.attribute(vendor_turn, None)
+                    && let Some(engine) = self.engine.upgrade()
+                {
+                    engine.revise(&self.writer.session, turn, terminal).await;
+                }
+            }
             Observation::IdentityConfirmed(_)
             | Observation::Accepted(_)
             | Observation::Progress(_)
             | Observation::FinalText(_)
             | Observation::VendorClosed(_)
-            | Observation::ResumeMismatch { .. }
-            // Discarded until via-jm4.35: a late terminal's revision
-            // write is not in the Store yet.
-            | Observation::LateTerminal(_) => {}
+            | Observation::ResumeMismatch { .. } => {}
         }
         drop(permit);
     }

@@ -19,8 +19,8 @@ use via_wire::{
 mod lane;
 
 pub use lane::{
-    CONTROL_BYTES, CONTROL_COMMANDS, FakeTerminal, FakeTurn, Lane, Retirement, SteerAnswer,
-    SteerRefused, SteerRequest, SteerSender, steer_lane,
+    CONTROL_BYTES, CONTROL_COMMANDS, FakeLateTerminal, FakeTerminal, FakeTurn, Lane, Retirement,
+    SteerAnswer, SteerRefused, SteerRequest, SteerSender, steer_lane,
 };
 
 /// Final fake protocol evidence, including independently confirmed process exit.

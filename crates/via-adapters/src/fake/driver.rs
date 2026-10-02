@@ -34,8 +34,9 @@ use crate::{
     VendorTurnId, final_text_pieces,
 };
 use via_routes::{
-    FakeClassHint, FakeDenialKind, FakeMessage, FakeRoute, FakeTerminal, FakeTurn, FakeUsage,
-    Handshake, Lane, Retirement, RouteMessage, StopSources, TerminalStatus, TurnStart, WireCleanup,
+    FakeClassHint, FakeDenialKind, FakeLateTerminal, FakeMessage, FakeRoute, FakeTerminal,
+    FakeTurn, FakeUsage, Handshake, Lane, Retirement, RouteMessage, StopSources, TerminalStatus,
+    TurnStart, WireCleanup,
 };
 
 /// S1's cleanup allowance: the wall's one cutoff is this after the wall
@@ -150,6 +151,7 @@ pub(crate) async fn run_turn(
         steer: Some(steer_lane),
         identity,
         effort: spec.effort,
+        late: None,
     };
     let (logical, logical_rx) = oneshot::channel();
     driver.tracker.spawn(turn_task(TurnTask {
@@ -165,6 +167,7 @@ pub(crate) async fn run_turn(
         reservation: Arc::clone(&reservation),
         state: Arc::clone(&driver.state),
         reports: (Arc::clone(&driver.health), Arc::clone(&driver.journal)),
+        observations: driver.observations.clone(),
         done,
     }));
     let mut normalizer = Normalizer::new(generation, Arc::clone(&driver.state), profile, steers);
@@ -544,6 +547,8 @@ struct TurnTask {
     state: Arc<Mutex<DriverState>>,
     /// The driver's health lane and its journal report.
     reports: (Arc<watch::Sender<DriverHealth>>, Arc<watch::Sender<bool>>),
+    /// The session channel a retired helper's late terminal goes on.
+    observations: ObservationSink,
     done: watch::Sender<bool>,
 }
 
@@ -562,11 +567,12 @@ async fn turn_task(task: TurnTask) {
         signals: (wall, force, core_stop),
         close,
         cancel,
-        lane,
+        mut lane,
         logical,
         reservation,
         state,
         reports: (health, journal),
+        observations,
         done,
     } = task;
     let turn = start.turn();
@@ -581,6 +587,9 @@ async fn turn_task(task: TurnTask) {
             core.borrow().is_some() || close.borrow().is_some() || cancel.is_cancelled()
         })
     };
+    // C2 §4 `turn.late_terminal`: a persistent helper's, read as it retires.
+    let (late_terminal, mut late) = oneshot::channel();
+    lane.late = persistent.then_some(late_terminal);
     let (inner, inner_rx) = oneshot::channel();
     let stop = (merged_rx, sources);
     let route_turn = route.turn(process, start, hop, (wall, force, stop), lane, inner);
@@ -602,6 +611,12 @@ async fn turn_task(task: TurnTask) {
         (retirement, ()) = async { tokio::join!(route_turn, relay) } => retirement,
         never = merge_stops(core_stop, close, &cancel, &merged) => match never {},
     };
+    // C2 §4 `turn.late_terminal`: what the retired helper reported after
+    // a logical turn that retained no terminal, before any health failure
+    // that retires the lane.
+    if let Ok(terminal) = late.try_recv() {
+        report_late(terminal, &observations, &health).await;
+    }
     // A persistent connection's retirement journal is no turn's: its
     // uncertainty is reported apart from the cleanup's, before the health
     // failure that retires the lane (critical r1 #4).
@@ -622,6 +637,26 @@ async fn turn_task(task: TurnTask) {
     // cleanup and after `run_turn`.
     drop(reservation);
     done.send_replace(true);
+}
+
+/// Sends a retired helper's late terminal on the session channel (C2 §4
+/// `turn.late_terminal`). One the channel does not take in time latches
+/// `overflow`; once the lane ended and its channel closed, it is dropped
+/// (ruling G1).
+async fn report_late(
+    late: FakeLateTerminal,
+    sink: &ObservationSink,
+    health: &watch::Sender<DriverHealth>,
+) {
+    let item = ObservationItem {
+        at: tokio::time::Instant::now(),
+        // Route pairs it with `fake-turn-N`, never empty.
+        vendor_turn: VendorTurnId::try_from(late.vendor_turn_id).ok(),
+        observation: Observation::LateTerminal(vendor_terminal(late.terminal)),
+    };
+    if let Err(Undelivered::Stalled) = sink.send(item, event_stall()).await {
+        latch(health, DriverFailure::ObservationOverflow);
+    }
 }
 
 /// Keeps `merged` at the earliest of Core's stop order, the driver's close
