@@ -340,7 +340,8 @@ fn sibling(name: &str) -> Result<PathBuf, String> {
 
 /// An adapter set with `harness` pinned to `binary`, over a fresh Store.
 fn adapter_set(harness: &str, binary: &Path, state: &Path) -> Result<(AdapterSet, Store), String> {
-    for part in ["state", "runtime"] {
+    // `vendor`: the server routes' state, as bootstrap creates it.
+    for part in ["state", "runtime", "vendor"] {
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(state.join(part))

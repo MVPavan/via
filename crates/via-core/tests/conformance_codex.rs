@@ -4,10 +4,11 @@
 //! Each case pairs `<case>.replay.json` (the recorded `codex app-server`
 //! exchange, replayed by the fake agent) with `<case>.expect.json` (what the
 //! C2 driver must produce, in the unified expectation schema). [`drive`]
-//! runs the pure half (describe, plan checks, each spawn's plan): the
-//! cases every spawn of which is refused before any vendor I/O are green;
-//! the rest are red until the adapter slice `via-5lr.3.2` lands the
-//! server driver and removes their `ignore`.
+//! runs the pure half (describe, plan checks, each spawn's plan), then the
+//! shared run half (`support/conformance_run.rs`): each planned turn through
+//! the real Codex driver over Route, Wire and Host, against one replaying
+//! fake per server launch. The cases X4 and X5 of `via-5lr.3.2` own stay
+//! ignored until their chunks land.
 //!
 //! A resumed thread is pinned literally: each `thread/resume` expects the
 //! case's `sessions.<label>.resume` as its `threadId`.
@@ -24,6 +25,8 @@
 mod conformance_drive;
 #[path = "support/conformance_expect.rs"]
 mod conformance_expect;
+#[path = "support/conformance_run.rs"]
+mod conformance_run;
 
 use std::path::{Path, PathBuf};
 
@@ -38,17 +41,14 @@ fn fixtures() -> PathBuf {
 }
 
 /// Runs the case's sessions and turns through the Codex C2 driver against
-/// the fake agent replaying `<case>.replay.json`, with controlled time, and
-/// collects the outcome (see the checker's module docs for its obligations:
-/// `launches` from `<case>.launches`, the replay's end judged by
-/// [`conformance_expect::replay_exit`] for every launch, and the
-/// server's stdin close at an `await_eof` step). The pure steps run
-/// through the shared [`conformance_drive::Pure`]; a case with a turn that
-/// plans needs the run half, which `via-5lr.3.2`'s later chunks add.
+/// the fake agent replaying `<case>.replay.json` (see the checker's module
+/// docs for its obligations: `launches` from `<case>.launches`, the
+/// replay's end judged by [`conformance_expect::replay_exit`] for every
+/// launch, and the server's stdin close at an `await_eof` step).
 fn drive(name: &str, expect: &Value, replay: &Path) -> Result<Outcome, String> {
     conformance_drive::Pure::run("codex", name, expect, replay)?
-        .planned_only()
-        .map_err(|error| format!("adapter not implemented: {ADAPTER_BEAD} ({error})"))
+        .drive(expect, replay, conformance_run::Knobs::default())
+        .map_err(|error| format!("{error} ({ADAPTER_BEAD} case {name})"))
 }
 
 fn check(name: &str) -> Result<(), String> {
@@ -59,7 +59,7 @@ fn check(name: &str) -> Result<(), String> {
 }
 
 macro_rules! cases {
-    (green: $($green:ident),* $(,)?; red: $($red:ident),* $(,)?) => {
+    (green: $($green:ident),* $(,)?; red: $($red:ident = $why:literal),* $(,)?) => {
         /// Every case with a test below.
         const CASES: &[&str] = &[$(stringify!($green),)* $(stringify!($red)),*];
 
@@ -72,7 +72,7 @@ macro_rules! cases {
             )*
             $(
                 #[test]
-                #[ignore = "red until via-5lr.3.2"]
+                #[ignore = $why]
                 fn $red() {
                     super::check(stringify!($red)).unwrap();
                 }
@@ -85,22 +85,22 @@ cases! {
     green:
     c10_read_only_refused,
     c4b_workspace_write_refused,
-    codex_bound_gate_refusals;
-    red:
-    c0_server_lost,
+    codex_bound_gate_refusals,
     c11_failed_command,
     c1_commentary_usage,
-    c2_steer,
-    c3_interrupt_uncertain,
-    c3_wall_interrupt,
-    c4_two_sessions,
     c5_resume,
     c5_resume_missing,
     c6_cold_initialize,
     c7_bad_model,
-    c7_effort_catalog,
     c8_auth,
-    c9_output_schema,
+    c9_output_schema;
+    red:
+    c0_server_lost = "red until via-5lr.3.2 X4 (server loss across sessions)",
+    c2_steer = "red until via-5lr.3.2 X4 (native steer)",
+    c3_interrupt_uncertain = "red until via-5lr.3.2 X4 (interrupt and P7)",
+    c3_wall_interrupt = "red until via-5lr.3.2 X4 (the wall's soft stop)",
+    c4_two_sessions = "red until via-5lr.3.2 X4 (leases across sessions)",
+    c7_effort_catalog = "red until C2 gives check_turn the session's model (x.3.2 X3 gap)",
 }
 
 /// Green now: every expectation file has a case test and a replay fixture,

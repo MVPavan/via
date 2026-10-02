@@ -7,7 +7,7 @@
     "hooks"
   ],
   "version": "codex-cli 0.159.2",
-  "deadline_ms": 20000,
+  "deadline_ms": 60000,
   "steps": [
     {
       "expect": {

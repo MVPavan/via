@@ -1,10 +1,12 @@
 //! `Adapter::Codex` (`codex-app-server`, adapter design §6;
 //! docs/specs/vendors/codex.md). The daemon builds it when the harness's
-//! binary resolves, with the daemon's instance cache. It plans purely
-//! (capabilities, bound gate, effort and vendor-key refusals, inherited
-//! configuration); its driver runs no turn until via-5lr.3.2's server
-//! driver lands, so a planned turn still ends `harness_unavailable`.
+//! binary resolves, with the daemon's instance cache and the Route
+//! runtime, over which it keeps the shared-server registry. It plans
+//! purely (capabilities, bound gate, effort and vendor-key refusals,
+//! inherited configuration, the server key); its driver runs each turn on
+//! a shared `codex app-server` (x.3.2 X3).
 
+mod driver;
 mod launch;
 mod normalize;
 mod plan;
@@ -12,14 +14,22 @@ mod plan;
 mod tests;
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
+use via_routes::RouteRuntime;
+use via_routes::codex::Servers;
+
+use crate::config::BootstrapEnv;
 use crate::harness::Harness;
 use crate::instance::InstanceCache;
 use crate::plan::{
-    Bound, DescribeRequest, Inherit, ModelChoice, Refusal, RefusalKind, RoutePlan, TurnCheck,
-    TurnParams, VendorOptions, effective_inherit,
+    Bound, DescribeRequest, Inherit, ModelChoice, Refusal, RefusalKind, RoutePlan, ServerKey,
+    TurnCheck, TurnParams, VendorOptions, effective_inherit,
 };
+
+pub(crate) use driver::{CodexSession, connection_id, run_turn};
+use launch::ServerRecipe;
+use normalize::DiscoveredModel;
 
 /// The harness this adapter serves, a [`crate::HARNESSES`] name.
 pub(crate) const HARNESS: &str = "codex";
@@ -27,6 +37,11 @@ pub(crate) const HARNESS: &str = "codex";
 /// This adapter's version (AD12): changed when stored session state or the
 /// server recipe changes.
 const ADAPTER_VERSION: &str = "1";
+
+/// The adapter version a session's turns record (AD12).
+pub(crate) fn adapter_version() -> String {
+    ADAPTER_VERSION.to_owned()
+}
 
 /// The stored adapter versions this one resumes; none before the first.
 const COMPATIBLE: &[&str] = &[];
@@ -37,6 +52,14 @@ pub(crate) struct CodexAdapter {
     binary: PathBuf,
     /// The daemon's instance cache (C2 §5 AD7).
     instances: Arc<InstanceCache>,
+    /// The daemon's bootstrap environment, which the recipe filters.
+    env: BootstrapEnv,
+    /// The shared-server registry (x.3.2 X0 item 2).
+    servers: Arc<Servers>,
+    /// The last catalog a server's `model/list` discovery returned, whole
+    /// (packet §3): it resolves a plan with no model to its default (ruling
+    /// Q1) and judges a vendor effort.
+    catalog: Mutex<Option<Arc<[DiscoveredModel]>>>,
 }
 
 /// One turn's values the route judges purely.
@@ -48,14 +71,56 @@ struct PerTurn<'a> {
 }
 
 impl CodexAdapter {
-    pub(crate) fn new(binary: PathBuf, instances: Arc<InstanceCache>) -> Self {
-        Self { binary, instances }
+    pub(crate) fn new(
+        binary: PathBuf,
+        instances: Arc<InstanceCache>,
+        env: &BootstrapEnv,
+        runtime: Arc<RouteRuntime>,
+    ) -> Self {
+        Self {
+            binary,
+            instances,
+            env: env.clone(),
+            servers: Servers::new(runtime, normalize::DECLINES),
+            catalog: Mutex::new(None),
+        }
+    }
+
+    /// The shared-server registry.
+    pub(crate) fn servers(&self) -> &Arc<Servers> {
+        &self.servers
+    }
+
+    /// The route's vendor home, `<state>/vendor/codex`: the server's SQLite
+    /// home and working directory.
+    fn vendor_home(&self) -> PathBuf {
+        self.servers.vendor_state_dir().join(HARNESS)
+    }
+
+    /// The launch recipe of a server for `requested`'s inherited settings.
+    fn recipe(&self, requested: Inherit) -> ServerRecipe {
+        ServerRecipe::new(&self.binary, requested, &self.env, &self.vendor_home())
+    }
+
+    /// The last discovered catalog, if any.
+    fn catalog(&self) -> Option<Arc<[DiscoveredModel]>> {
+        self.catalog
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Keeps a server's whole discovered catalog.
+    fn discovered(&self, models: Arc<[DiscoveredModel]>) {
+        *self.catalog.lock().unwrap_or_else(PoisonError::into_inner) = Some(models);
     }
 
     /// The plan of a spawn or `describe` (C2 §2): pure but for one `stat`
     /// of the binary, which names the last version seen for it. With no
-    /// bundled catalog the model is taken as given; discovery judges it
-    /// at the first turn.
+    /// bundled catalog a named model is taken as given (discovery judges
+    /// it at the first turn); with none named, the discovered catalog's
+    /// default once a server reported one, else `unknown_model` (ruling
+    /// Q1).
     pub(crate) fn plan(
         &self,
         harness: Harness,
@@ -63,17 +128,22 @@ impl CodexAdapter {
         requested: Inherit,
     ) -> Result<RoutePlan, Refusal> {
         let route = harness.route();
-        let model = req
-            .model
-            .clone()
-            .filter(|model| !model.is_empty())
-            .ok_or_else(|| {
-                Refusal::new(
-                    RefusalKind::UnknownModel,
-                    Some(route),
-                    format!("route {route} has no default model: name one"),
-                )
-            })?;
+        let model = match req.model.clone().filter(|model| !model.is_empty()) {
+            Some(model) => Some(model),
+            None => self.catalog().and_then(|catalog| {
+                catalog
+                    .iter()
+                    .find(|model| model.default)
+                    .map(|model| model.model.clone())
+            }),
+        }
+        .ok_or_else(|| {
+            Refusal::new(
+                RefusalKind::UnknownModel,
+                Some(route),
+                format!("route {route} has no default model: name one"),
+            )
+        })?;
         let capabilities = plan::capabilities();
         let mut refusals = refusals(
             route,
@@ -99,11 +169,20 @@ impl CodexAdapter {
             .clone()
             .filter(|bound| plan::sandbox(bound).is_ok());
         let (inherit, switch_warning) = effective_inherit(&plan::categories(), requested);
+        let key = self.recipe(requested).config_hash(ADAPTER_VERSION);
         let vendor_version = self.instances.last_version(harness.name(), &self.binary);
-        let version_status = vendor_version.as_deref().map_or(
-            crate::plan::VersionStatus::Untested,
-            normalize::version_status,
-        );
+        let refused = self
+            .instances
+            .refusal(&self.binary, &key.hex(), std::time::Instant::now())
+            .is_some();
+        let version_status = if refused {
+            crate::plan::VersionStatus::Refused
+        } else {
+            vendor_version.as_deref().map_or(
+                crate::plan::VersionStatus::Untested,
+                normalize::version_status,
+            )
+        };
         Ok(RoutePlan {
             harness: harness.name(),
             model: ModelChoice {
@@ -120,9 +199,9 @@ impl CodexAdapter {
             // Core derives `vendor_version_untested` from the status.
             warnings: switch_warning.into_iter().collect(),
             inherit,
-            // The server key needs the route's vendor state directory,
-            // which the server driver supplies (x.3.2 X2).
-            server_key: None,
+            // VIA's launch settings only (ruling: X0 item 3): sessions with
+            // equal keys share one server.
+            server_key: Some(ServerKey::new(key.hex())),
         })
     }
 

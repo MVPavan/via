@@ -1,11 +1,6 @@
 //! The `codex app-server` launch recipe (vendors/codex.md §4, Q6) and the
 //! key that names a server built from it (x.3.2 X0 item 3).
 
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the server driver uses it (x.3.2 X2, X3)")
-)]
-
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -14,6 +9,7 @@ use sha2::{Digest, Sha256};
 
 use crate::config::BootstrapEnv;
 use crate::plan::{Category, Inherit, InheritState};
+use crate::{EnvAllowList, PrivateProcessSpec, ProcessOwner};
 
 /// The environment names the server inherits from the daemon's bootstrap
 /// environment (packet §4): nothing else, credentials and `CODEX_HOME`
@@ -80,6 +76,23 @@ impl ServerRecipe {
         }
     }
 
+    /// The server's process: the recipe as Host runs it. The registry
+    /// replaces `owner` with the server it mints and sets the capacity;
+    /// Wire names its `stderr.log` in the server's evidence folder.
+    pub(crate) fn process_spec(&self, owner: ProcessOwner) -> PrivateProcessSpec {
+        PrivateProcessSpec {
+            program: self.program.clone(),
+            args: self.args.iter().map(OsString::from).collect(),
+            cwd: self.cwd.clone(),
+            // The names are the fixed allow-list plus one: always valid.
+            env: EnvAllowList::try_from_entries(self.env.clone())
+                .unwrap_or_else(|_| EnvAllowList::default()),
+            owner,
+            stderr_path: PathBuf::new(),
+            capacity: None,
+        }
+    }
+
     /// The server key: SHA-256 over the domain tag, the adapter version,
     /// the resolved program path, the argv, the environment, the working
     /// directory and the protocol pin, each length-prefixed.
@@ -113,12 +126,32 @@ pub(crate) struct ConfigHash([u8; 32]);
 
 impl ConfigHash {
     /// The first 16 lowercase hex digits, as status shows the key.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "status lists the servers (x.3.2 X5)")
+    )]
     pub(crate) fn display(&self) -> String {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        self.0[..8]
-            .iter()
-            .flat_map(|byte| [byte >> 4, byte & 0xf])
-            .map(|nibble| char::from(HEX[usize::from(nibble)]))
-            .collect()
+        hex(&self.0[..8])
     }
+
+    /// The whole key in lowercase hex: the plan's opaque `server_key` and
+    /// the instance cache's recipe key.
+    pub(crate) fn hex(&self) -> String {
+        hex(&self.0)
+    }
+
+    /// The key's bytes, as the registry keys its servers.
+    pub(crate) fn bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+/// `bytes` in lowercase hex.
+fn hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    bytes
+        .iter()
+        .flat_map(|byte| [byte >> 4, byte & 0xf])
+        .map(|nibble| char::from(HEX[usize::from(nibble)]))
+        .collect()
 }

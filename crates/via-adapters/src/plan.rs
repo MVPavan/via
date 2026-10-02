@@ -547,6 +547,11 @@ pub struct ServerReport {
 }
 
 impl ServerKey {
+    /// A key of the opaque text `text`.
+    pub(crate) fn new(text: String) -> Self {
+        Self(text)
+    }
+
     /// The key's opaque text.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -650,7 +655,9 @@ impl<'a> Adapter<'a> {
         match self {
             Self::Fake(fake) => DriverKind::Fake(Arc::clone(fake)),
             Self::Claude(claude) => DriverKind::Claude(Arc::clone(claude)),
-            Self::Codex(codex) => DriverKind::Codex(Arc::clone(codex)),
+            Self::Codex(codex) => {
+                DriverKind::Codex(Arc::new(codex::CodexSession::new(Arc::clone(codex))))
+            }
         }
     }
 }
@@ -686,7 +693,7 @@ impl AdapterSet {
         runtime: RuntimeConfig,
         resources: RuntimeResources,
     ) -> Result<Self, AdapterError> {
-        let runtime = RouteRuntime::new(runtime, resources)?;
+        let runtime = Arc::new(RouteRuntime::new(runtime, resources)?);
         let instances = Arc::new(InstanceCache::default());
         let binary = |name: &str| {
             let row = HARNESSES.iter().find(|row| row.name == name)?;
@@ -703,8 +710,14 @@ impl AdapterSet {
                 config.env(),
             ))
         });
-        let codex = binary(codex::HARNESS)
-            .map(|binary| Arc::new(CodexAdapter::new(binary, Arc::clone(&instances))));
+        let codex = binary(codex::HARNESS).map(|binary| {
+            Arc::new(CodexAdapter::new(
+                binary,
+                Arc::clone(&instances),
+                config.env(),
+                Arc::clone(&runtime),
+            ))
+        });
         Ok(Self {
             fake: config
                 .take_fake()
@@ -712,7 +725,7 @@ impl AdapterSet {
             claude,
             codex,
             config,
-            runtime: Arc::new(runtime),
+            runtime,
             #[cfg(feature = "test-failpoints")]
             sizes_seen: std::sync::Mutex::default(),
             #[cfg(feature = "test-failpoints")]
@@ -749,6 +762,26 @@ impl AdapterSet {
     /// listed.
     pub fn servers(&self) -> Vec<ServerReport> {
         Vec::new()
+    }
+
+    /// Test builds only: each shared server that ended, oldest first (at
+    /// most 16), as its ID and Host's confirmed exit code: the replay
+    /// harness judges a server launch by them (x.3.2 X3).
+    #[cfg(feature = "test-failpoints")]
+    pub fn ended_servers(&self) -> Vec<(String, Option<i32>)> {
+        self.codex.as_ref().map_or_else(Vec::new, |codex| {
+            codex
+                .servers()
+                .ended()
+                .into_iter()
+                .map(|end| {
+                    (
+                        end.server.as_str().to_owned(),
+                        end.exit.and_then(|exit| exit.code),
+                    )
+                })
+                .collect()
+        })
     }
 
     /// Test builds: records the sizes a `plan` or `check_turn` received.

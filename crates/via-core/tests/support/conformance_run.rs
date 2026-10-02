@@ -49,7 +49,7 @@ use via_adapters::{
     TurnEnd, TurnNumber, TurnSpec, VendorTerminal, VendorTerminalStatus, VendorTurnId,
     observation_channel,
 };
-use via_store::{ResumeRecord, SessionId, SpawnRecord};
+use via_store::{ResumeRecord, SessionId, SpawnRecord, SubmissionRecord, TerminalRecord};
 
 use crate::conformance_drive::Pure;
 use crate::conformance_expect::{TurnOutcome, replay_exit};
@@ -201,8 +201,10 @@ impl Pure {
             let opened = (std::mem::take(&mut run.opened), pure.writes()?);
             let turns = run.all().await;
             let health = run.health();
-            run.shutdown().await;
-            Ok::<_, String>((turns?, health, opened))
+            let servers = run.shutdown().await;
+            let turns = turns?;
+            servers?;
+            Ok::<_, String>((turns, health, opened))
         });
         let (turns, health, (opened, writes)) = result?;
         pure.outcome.checkpoints.after_open.extend(opened);
@@ -253,8 +255,17 @@ impl<'a> Run<'a> {
                 .ok_or_else(|| format!("session {label} has no turn"))?;
             let id = SessionId::try_from(format!("s_{:012}", number + 1).as_str())
                 .map_err(str::to_owned)?;
-            let cwd = pure.case_dir.path().join(format!("work-{label}"));
-            fs::create_dir_all(&cwd).map_err(|e| format!("cwd: {e}"))?;
+            // A server route sends the session's directory to the vendor,
+            // which the fixture pins: the recorded `cwd` itself, never
+            // created (x.3.2 X3). A per-turn route gets one of the case's.
+            let cwd = if let (Some(_), Some(recorded)) = (&plan.server_key, session["cwd"].as_str())
+            {
+                PathBuf::from(recorded)
+            } else {
+                let cwd = pure.case_dir.path().join(format!("work-{label}"));
+                fs::create_dir_all(&cwd).map_err(|e| format!("cwd: {e}"))?;
+                cwd
+            };
             let spec = SessionSpec {
                 session_id: id.clone(),
                 model: plan.model.resolved.clone(),
@@ -416,19 +427,69 @@ impl<'a> Run<'a> {
                 .await
                 .map(drop)
         } else {
+            // A server route's turn stays running until its terminal
+            // commits, as Core commits it; the harness ends it here so the
+            // next submission may run (x.3.2 X3).
+            if session.plan.server_key.is_some() {
+                let previous =
+                    TurnNumber::try_from(number - 1).map_err(|e| format!("turn number: {e:?}"))?;
+                let seq = client
+                    .next_seq(&session.id)
+                    .await
+                    .map_err(|e| format!("next seq: {e}"))?
+                    .ok_or("no next seq")?;
+                client
+                    .commit_terminal(TerminalRecord {
+                        session_id: session.id.clone(),
+                        turn: previous,
+                        envelope: json!({"state": "failed"}),
+                        event: json!({"seq": seq, "type": "turn.ended", "turn": number - 1, "at": at}),
+                        steps: Vec::new(),
+                        link_released: true,
+                    })
+                    .await
+                    .map_err(|e| format!("end turn {}: {e}", number - 1))?;
+            }
+            // A server route's submissions took sequence numbers too.
+            let seq = if session.plan.server_key.is_some() {
+                client
+                    .next_seq(&session.id)
+                    .await
+                    .map_err(|e| format!("next seq: {e}"))?
+                    .ok_or("no next seq")?
+            } else {
+                u64::from(number)
+            };
             client
                 .commit_resume(ResumeRecord {
                     session_id: session.id.clone(),
                     turn,
                     prompt: prompt.into(),
                     effective: json!({"deadlines": {"wall_ms": 1}}),
-                    event: json!({"seq": number, "type": "turn.queued", "turn": number, "at": at}),
+                    event: json!({"seq": seq, "type": "turn.queued", "turn": number, "at": at}),
                     operation: None,
                 })
                 .await
                 .map(drop)
         };
         committed.map_err(|e| format!("commit turn {number}: {e}"))?;
+        // A server route links the turn to its server, which needs the
+        // turn running, as Core's submission makes it (x.3.2 X3).
+        if session.plan.server_key.is_some() {
+            let seq = client
+                .next_seq(&session.id)
+                .await
+                .map_err(|e| format!("next seq: {e}"))?
+                .ok_or("no next seq")?;
+            client
+                .commit_submission(SubmissionRecord {
+                    session_id: session.id.clone(),
+                    turn,
+                    event: json!({"seq": seq, "type": "turn.submitted", "turn": number, "at": at}),
+                })
+                .await
+                .map_err(|e| format!("submit turn {number}: {e}"))?;
+        }
         Ok(turn)
     }
 
@@ -873,6 +934,11 @@ impl<'a> Run<'a> {
                 usage["scope"] = json!(session.plan.capabilities.usage.tokens);
                 usage
             });
+        // A server route's terminal carries no usage: Core sums its samples
+        // (x.3.2 X3).
+        if outcome.usage.is_none() && session.plan.server_key.is_some() {
+            outcome.usage = sampled_usage(observed, &session.plan);
+        }
         outcome.cleanup = Some(cleanup.to_owned());
         outcome.instance = end.instance.as_ref().map(|instance| {
             json!({"vendor_version": instance.vendor_version,
@@ -946,13 +1012,81 @@ impl<'a> Run<'a> {
             .collect()
     }
 
-    /// Ends the sessions' owned work, then the adapter set's.
-    async fn shutdown(self) {
+    /// Closes every server-route session whose case states no close, so
+    /// its lease goes and the idle server retires (x.3.2 X3); then ends the
+    /// sessions' owned work and the adapter set's. Test builds then judge
+    /// each server launch by the replay's own verdict
+    /// ([`Self::judge_servers`]).
+    async fn shutdown(self) -> Result<(), String> {
+        for (label, session) in &self.sessions {
+            if session.plan.server_key.is_some()
+                && self.expect["sessions"][label]["close"].is_null()
+            {
+                let deadline = Deadline::at(tokio::time::Instant::now() + CLOSE_DEADLINE);
+                let _report = session.driver.close(CloseMode::Graceful, deadline).await;
+            }
+        }
+        #[cfg(feature = "test-failpoints")]
+        let judged = self.judge_servers().await;
+        #[cfg(not(feature = "test-failpoints"))]
+        let judged = Ok(());
         self.cancel.cancel();
         self.tracker.close();
         let _ = tokio::time::timeout(FIXTURE_WAIT, self.tracker.wait()).await;
         let deadline = Deadline::at(tokio::time::Instant::now() + FIXTURE_WAIT);
         self.pure.set.shutdown(deadline, &[]).await;
+        judged
+    }
+
+    /// Test builds: once every server launch ended (its last lease went,
+    /// so its idle retirement closed stdin), each is judged by the replay's
+    /// own verdict ([`replay_exit`]) from its exit and its `stderr.log`, in
+    /// launch order (x.3.2 X3). Other builds have no seam for a server's
+    /// exit and judge none.
+    #[cfg(feature = "test-failpoints")]
+    async fn judge_servers(&self) -> Result<(), String> {
+        let launches = usize::try_from(self.pure.launches()?).map_err(|e| e.to_string())?;
+        let shared = self
+            .sessions
+            .values()
+            .any(|session| session.plan.server_key.is_some());
+        if !shared || launches == 0 {
+            return Ok(());
+        }
+        let started = tokio::time::Instant::now();
+        let ended = loop {
+            let ended = self.pure.set.ended_servers();
+            if ended.len() >= launches {
+                break ended;
+            }
+            if started.elapsed() > FIXTURE_WAIT {
+                return Err(format!(
+                    "{} of {launches} server launches ended",
+                    ended.len()
+                ));
+            }
+            tokio::time::sleep(POLL).await;
+        };
+        for (index, (server, code)) in ended.iter().enumerate() {
+            let launch = index + 1;
+            let fixture = match self.replay.get("lifetimes").and_then(Value::as_array) {
+                Some(lifetimes) => lifetimes
+                    .get(index)
+                    .ok_or_else(|| format!("launch {launch} has no lifetime"))?,
+                None => self.replay,
+            };
+            let stderr = fs::read_to_string(
+                self.pure
+                    .evidence_dir()
+                    .join("servers")
+                    .join(server)
+                    .join("stderr.log"),
+            )
+            .unwrap_or_default();
+            replay_exit(fixture, *code, &stderr)
+                .map_err(|why| format!("server launch {launch}: {why}"))?;
+        }
+        Ok(())
     }
 }
 
@@ -1095,6 +1229,37 @@ fn number(value: f64) -> Value {
     #[expect(clippy::float_cmp, reason = "an exact round trip is the test")]
     let exact = whole as f64 == value && value.abs() < 9.0e15;
     if exact { json!(whole) } else { json!(value) }
+}
+
+/// A server route's turn usage when its terminal carries none: the sum
+/// of its keyless progress samples (C2 §5 AD6; Codex's samples are
+/// keyless), as Core figures it (x.3.2 X3). `None` without a sample.
+fn sampled_usage(observed: &[Value], plan: &RoutePlan) -> Option<Value> {
+    const FIELDS: [&str; 5] = [
+        "input_tokens",
+        "cached_input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+        "total_tokens",
+    ];
+    let samples: Vec<&Value> = observed
+        .iter()
+        .filter(|observation| observation["kind"] == "progress")
+        .map(|observation| &observation["usage"])
+        .filter(|usage| !usage.is_null())
+        .collect();
+    if samples.is_empty() {
+        return None;
+    }
+    let mut usage = json!({"from": "samples", "scope": plan.capabilities.usage.tokens});
+    for field in FIELDS {
+        let sum = samples
+            .iter()
+            .map(|sample| sample[field].as_u64())
+            .sum::<Option<u64>>();
+        usage[field] = json!(sum);
+    }
+    Some(usage)
 }
 
 fn usage_sample(sample: &via_adapters::UsageSample) -> Value {

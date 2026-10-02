@@ -673,6 +673,10 @@ pub(super) async fn serve(
                     if let Err(cause) = connection.demux(message, &mut replies) {
                         connection.fail(cause);
                     }
+                    // A burst is routed one message at a time, each driver
+                    // given its turn to take from its lane: never a wait on
+                    // a driver, so a blocked one still overflows its lane.
+                    tokio::task::yield_now().await;
                 }
                 Ok(None) if connection.retiring.load(Ordering::Acquire) => break None,
                 Ok(None) => connection.fail(ConnectionFailure::Transport { stdio_end: true }),

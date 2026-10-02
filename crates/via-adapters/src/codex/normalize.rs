@@ -2,19 +2,14 @@
 //! the handshake version, a `model/list` page, the no-grant declines and
 //! one turn's notifications.
 
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the server driver uses it (x.3.2 X2, X3)")
-)]
-
 use serde_json::json;
 use std::collections::HashSet;
 
 use serde_json::value::RawValue;
 use tokio::time::Instant;
 use via_routes::codex::{
-    CodexErrorInfo, DeclineTable, Item, ItemKind, JsonTextError, ModelListResult, Notification,
-    ServerRequest, TokenBreakdown, Turn, TurnError, TurnStatus, json_text,
+    CodexErrorInfo, DeclineTable, Item, ItemKind, JsonTextError, Model, ModelListResult,
+    Notification, ServerRequest, TokenBreakdown, Turn, TurnError, TurnStatus, json_text,
 };
 
 use super::plan::CHECKED;
@@ -103,23 +98,31 @@ impl DiscoveredModel {
 }
 
 /// The models and next cursor of one `model/list` reply.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Routes follows the pages; the driver maps each model"
+    )
+)]
 pub(crate) fn catalog_page(page: ModelListResult) -> CatalogPage {
     CatalogPage {
-        models: page
-            .data
-            .into_iter()
-            .map(|model| DiscoveredModel {
-                model: model.model,
-                efforts: model
-                    .supported_reasoning_efforts
-                    .into_iter()
-                    .map(|option| option.reasoning_effort)
-                    .collect(),
-                hidden: model.hidden,
-                default: model.is_default,
-            })
-            .collect(),
+        models: page.data.iter().map(discovered).collect(),
         next_cursor: page.next_cursor,
+    }
+}
+
+/// A `model/list` model as the adapter keeps it.
+pub(crate) fn discovered(model: &Model) -> DiscoveredModel {
+    DiscoveredModel {
+        model: model.model.clone(),
+        efforts: model
+            .supported_reasoning_efforts
+            .iter()
+            .map(|option| option.reasoning_effort.clone())
+            .collect(),
+        hidden: model.hidden,
+        default: model.is_default,
     }
 }
 
@@ -370,6 +373,10 @@ impl TurnNormalizer {
     }
 
     /// Bytes of final text retained for structured output.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the memory measurement reads it (x.3.2 X5)")
+    )]
     pub(crate) fn retained(&self) -> usize {
         match &self.answer {
             Answer::Text(text) => text.len(),

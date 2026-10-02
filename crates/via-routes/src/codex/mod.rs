@@ -25,6 +25,9 @@ pub use servers::{
     AcquireCause, LaunchFailure, LiveServer, MODEL_BYTES, MODEL_PAGES, SERVER_HANDSHAKE,
     SERVER_RETIRE, ServerEnd, ServerFacts, ServerKey, ServerPin, Servers,
 };
+/// The Wire types a shared-route driver handles: its writes' bounds and
+/// answers, a turn's link and evidence folder.
+pub use via_wire::{CommitOutcome, PendingWrite, TurnFolder, WriteBounds};
 
 #[cfg(test)]
 mod tests;
