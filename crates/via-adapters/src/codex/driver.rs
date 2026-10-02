@@ -1035,9 +1035,15 @@ fn lost(facts: &Turn<'_>, connection: &Connection, cause: Unanswered) -> TurnEnd
             unsent.failed(RouteError::TransportLost { turn }, None)
         }
         Unanswered::NotWritten(_) => facts.failed(RouteError::TransportLost { turn }, None),
-        Unanswered::Forced => facts.failed(RouteError::ForceStopped { turn }, None),
-        Unanswered::Ended(EndCause::Stopped) => facts.failed(RouteError::Stopped { turn }, None),
-        Unanswered::Ended(EndCause::Wall) => facts.failed(RouteError::Deadline { turn }, None),
+        // A stop's cleanup stays unproven: the written request may have
+        // started work the vendor never reported (P7's acknowledgement).
+        Unanswered::Forced => facts.failure(RouteError::ForceStopped { turn }, None, None),
+        Unanswered::Ended(EndCause::Stopped) => {
+            facts.failure(RouteError::Stopped { turn }, None, None)
+        }
+        Unanswered::Ended(EndCause::Wall) => {
+            facts.failure(RouteError::Deadline { turn }, None, None)
+        }
     }
 }
 

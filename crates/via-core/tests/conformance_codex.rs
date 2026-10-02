@@ -1378,10 +1378,15 @@ fn failed_after_acceptance(expect: &mut Value, error: &str, cleanup: &str) {
 /// F18 (packet §8 `codex_start_order`): a notification before the paired
 /// `turn/start` reply is buffered and the reply accepts once; a reply under
 /// an unknown, a duplicate or a mismatched (string) ID fails the connection
-/// `protocol`; a start the server never answered is no acceptance; a
+/// `protocol`; a start the server never answered is no acceptance, and
+/// one cancelled unanswered leaves its cleanup unproven; a
 /// malformed known notification of the turn fails it `protocol`; a second,
 /// contradictory `turn/completed` never replaces the retained terminal.
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one variant per F18 ordering, each a few lines"
+)]
 fn codex_start_order() {
     let reply_marker = "\"result\":{\"turn\"";
     let started_marker = "\"method\":\"turn/started\"";
@@ -1459,6 +1464,26 @@ fn codex_start_order() {
     .unwrap();
     unaccepted(&mut expect, "server_lost", tested());
     variant("codex_start_order_lost_start", &replay, &expect).unwrap();
+
+    // A cancel while the written start is unanswered: the vendor may run
+    // the turn, so its cleanup stays unproven (P7's acknowledgement is
+    // X4's), whatever the server reported.
+    let (mut replay, mut expect) = plain("codex_start_order_stopped_unanswered").unwrap();
+    let start = step_with(&replay, "\"method\":\"turn/start\"").unwrap();
+    let close = step_with(&replay, "\"method\":\"thread/unsubscribe\"").unwrap();
+    let tail: Vec<Value> = replay["steps"].as_array().unwrap()[close..].to_vec();
+    cut_after(&mut replay, start, &tail).unwrap();
+    unaccepted(&mut expect, "", tested());
+    let turn = turn_mut(&mut expect, 0);
+    turn["stop"] = json!({"kind": "interrupt", "after": "handshake"});
+    turn["expect"]["error"] = Value::Null;
+    turn["expect"]["cleanup"] = json!("uncertain");
+    turn["expect"]["stop_facts"] = json!({"acknowledged": false, "forced": false, "shared": true});
+    turn["expect"]["observations_include"] = json!([
+        {"kind": "session.vendor_identity_confirmed", "vendor_session_id": THREAD,
+            "generation": 1},
+    ]);
+    variant("codex_start_order_stopped_unanswered", &replay, &expect).unwrap();
 
     // A malformed turn/completed of the turn.
     let (mut replay, mut expect) = plain("codex_start_order_malformed").unwrap();
