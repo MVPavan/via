@@ -338,6 +338,23 @@ the unanswered request and protocol failure; do not claim a delivered decline.
 a partial write is uncertain. Failed response/cleanup cannot hang
 the session or be counted as a passing auto-decline test.
 
+Field derivations (x.3.2 Q9):
+
+| Observation | Field | Derivation |
+|---|---|---|
+| `action.denied` (live `system/permission_denied`, terminal `permission_denials[]`) | `kind` | Write, Edit, MultiEdit, NotebookEdit → `file_write`; Bash → `command`; WebFetch, WebSearch → `network`; any other tool → `other` |
+| | `target` | from the tool input: `file_path`, `notebook_path`, `command`, `url`, `query` or `pattern`, else the tool name; only that member is read, cut to 1 KiB at a character boundary; a live denial uses the open or completed call's input, a terminal entry its `tool_input` |
+| | `reason` | `denied by the vendor's permission policy`, with the live `decision_reason_type` in parentheses when present |
+| | deduplication | one per `tool_use_id` across the live and terminal forms; none for an ID whose decline VIA wrote |
+| `vendor.request_declined` (a `control_request` other than an interrupt receipt) | `vendor_method` | the request's `subtype`, for example `can_use_tool` |
+| | `summary` | `<tool_name> <target>` cut to 256 bytes, or `an unsupported control request` without a tool |
+| | `blocking` | `true` |
+| | timing | emitted, and the denial suppressed, only after the whole decline is written |
+
+Tracking of call, denial and decline IDs is bounded (4,096 per set and
+256 KiB in all); the first ID that cannot be tracked fails the turn
+`overflow`, keeping a terminal already read beside the failure.
+
 Carry runtime §8 ceilings unchanged: 1 MiB inbound vendor message; 1,024 messages/4 MiB route
 data; 1024 observations/4 MiB; 256 KiB known observation (final text in pieces);
 one data command and eight controls
