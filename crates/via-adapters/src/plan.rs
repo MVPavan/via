@@ -89,6 +89,9 @@ pub struct TurnParams {
     pub bound: Option<Bound>,
     /// Whether a non-null `output_schema` is set.
     pub output_schema: bool,
+    /// Whether the session has `instructions`, empty text included (the
+    /// size alone cannot tell an empty value from none).
+    pub instructions: bool,
     /// The turn's step limit, when set.
     pub max_steps: Option<u64>,
     /// Vendor options.

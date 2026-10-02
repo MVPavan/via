@@ -129,7 +129,7 @@ pub(crate) async fn run_turn(
         route: FakeRoute::new(Arc::clone(&driver.runtime)),
         process,
         start,
-        hop,
+        hop: via_routes::Hop::new(hop, activity.decode_watermark()),
         signals: (wall, force.clone(), stop),
         close: close_rx,
         cancel: driver.cancel.clone(),
@@ -242,6 +242,7 @@ fn refused_values(adapter: &FakeAdapter, spec: &TurnSpec) -> Option<TurnEnd> {
         // The fake has no size limit: it never reads them.
         sizes: ParamSizes::default(),
         inherit: None,
+        instructions: false,
     };
     let refusal = adapter
         .check_turn(Harness::Fake.route(), &params)
@@ -505,7 +506,7 @@ struct TurnTask {
     route: FakeRoute,
     process: PrivateProcessSpec,
     start: TurnStart,
-    hop: mpsc::Sender<via_routes::Decoded<RouteMessage>>,
+    hop: via_routes::Hop<RouteMessage>,
     signals: (Deadline, ForceWatch, StopWatch),
     close: watch::Receiver<Option<StopOrder>>,
     cancel: CancellationToken,

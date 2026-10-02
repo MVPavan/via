@@ -41,6 +41,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
+#[cfg(feature = "test-failpoints")]
+use std::time::SystemTime;
 use std::time::{Duration, Instant};
 
 use daemon::collect_available;
@@ -2064,6 +2066,30 @@ fn claude_s_launch_request_past_host_cap_refused() -> TestResult {
 #[cfg(feature = "test-failpoints")]
 const ADMITTED: &str = "adapter.observation.admitted";
 
+/// When Wire handed Route its `n`th stdout message: the modification time
+/// of `wire.messages.received`'s `n`th acknowledgement, once it exists
+/// (armed `value_persist`, which acknowledges every hit).
+#[cfg(feature = "test-failpoints")]
+fn received_at(d: &Deployment, n: u64) -> Result<SystemTime, ScenarioError> {
+    let path = d
+        .root
+        .path()
+        .join("failpoints")
+        .join(format!("{RECEIVED}.{n}.ack"));
+    let deadline = Instant::now() + WAIT;
+    loop {
+        match fs::metadata(&path) {
+            Ok(metadata) => return metadata.modified().map_err(infra),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(infra(error)),
+        }
+        if Instant::now() >= deadline {
+            return Err(ScenarioError::Timeout(format!("no read {n} acknowledged")));
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// Critical r1 #3 (bead via-mnx, C2 §4, runtime §8): an observation's
 /// instant is when Route read its message, not when the Adapter dequeued
 /// it, so a delayed dequeue under backpressure neither extends nor expires
@@ -2071,11 +2097,13 @@ const ADMITTED: &str = "adapter.observation.admitted";
 /// delivery is held after the channel took its first item (the init's
 /// identity), so the two assistant messages that follow wait in Route's
 /// read-ahead and on the hop; the fake then emits nothing more. Released
-/// 1 s after the second message was written, the delivery hands both on.
-/// The idle deadline counts from the read: the interrupt of the idle
-/// order reaches the vendor 2 s after it (1.9 s to 2.5 s), not 2 s after
-/// the dequeue (about 3 s), and not before. The turn ends `deadline_idle`
-/// and the fake answered the interrupt and saw its EOF (exit 0).
+/// 1 s after Route read the second message (Wire's third read, its
+/// `wire.messages.received` acknowledgement, critical r2 #3), the
+/// delivery hands both on. The idle deadline counts from that read: the
+/// interrupt of the idle order reaches the vendor 2 s after it (1.9 s to
+/// 2.5 s), not 2 s after the dequeue (about 3 s), and not before. The turn
+/// ends `deadline_idle` and the fake answered the interrupt and saw its
+/// EOF (exit 0).
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn claude_progress_keeps_its_read_instant_under_backpressure() -> TestResult {
@@ -2108,19 +2136,27 @@ fn claude_progress_keeps_its_read_instant_under_backpressure() -> TestResult {
             ],
         )])?;
         d.failpoints.arm(ADMITTED, 1, "pause").map_err(infra)?;
+        d.failpoints
+            .arm(RECEIVED, 1, "value_persist:1")
+            .map_err(infra)?;
         let daemon = Daemon::start(d, evidence, "final")?;
         let session =
             session_of(&d.spawn(evidence, "spawn", &ask("ONE"), &["--idle-ms", "2000"])?)?;
         d.failpoints
             .wait_ack(ADMITTED, 1, "pause", daemon.pid(), WAIT)
             .map_err(infra)?;
+        let read = received_at(d, 3)?;
         d.await_progress("at 6 launch 1")?;
-        let written = Instant::now();
         d.release(1)?;
-        thread::sleep(Duration::from_secs(1).saturating_sub(written.elapsed()));
+        let held = SystemTime::now()
+            .duration_since(read)
+            .unwrap_or(Duration::ZERO);
+        thread::sleep(Duration::from_secs(1).saturating_sub(held));
         d.failpoints.release(ADMITTED, 1).map_err(infra)?;
         d.await_progress("read 2 launch 1")?;
-        let interrupted = written.elapsed();
+        let interrupted = SystemTime::now()
+            .duration_since(read)
+            .unwrap_or(Duration::ZERO);
         let envelope = d.wait(evidence, &format!("{session}/1"))?;
         check(
             envelope["state"] == "failed"
@@ -2128,7 +2164,86 @@ fn claude_progress_keeps_its_read_instant_under_backpressure() -> TestResult {
                 && replay_ran(&envelope, 0)
                 && interrupted >= Duration::from_millis(1_900)
                 && interrupted <= Duration::from_millis(2_500),
-            || format!("the idle order's interrupt {interrupted:?} after the read: {envelope}"),
+            || format!("the idle order's interrupt {interrupted:?} after Route's read: {envelope}"),
+        )
+    })
+}
+
+/// Critical r2 #2 (runtime §8): Core's idle deadline waits for its decode
+/// fence. The turn's idle budget is 2 s. The Adapter's delivery is held
+/// after the channel took its first item (the init's identity). Route
+/// then reads three unknown messages (non-progress noise) and, 1.5 s
+/// after the spawn call began and so before the deadline, the turn's
+/// first assistant message (its acceptance and progress), all held behind
+/// the delivery in its read-ahead. The hold outlasts the deadline by at
+/// least 500 ms, and ends before that progress's own deadline (its read
+/// plus 2 s). When the deadline fires,
+/// Route had read that progress, so Core reconciles everything read by
+/// then before it decides: released, the delivery hands it on, its read
+/// instant moves the deadline, and the turn completes with no cancel (the
+/// fake's replay, strict about input, saw no interrupt, and its EOF:
+/// exit 0). Bounds are wall-clock: the submission is after the spawn call
+/// began and before the fake read its prompt.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn claude_idle_waits_for_the_decode_fence() -> TestResult {
+    scenario("claude_idle_decode_fence", |d, evidence| {
+        let id = "${sid}";
+        let noise = |n: u64| emit(&json!({"type": "via_test_noise", "n": n}));
+        d.replay(&[lifetime(
+            &argv(Launch::New, true),
+            vec![
+                prompt(&ask("ONE")),
+                init(id),
+                noise(1),
+                noise(2),
+                noise(3),
+                gate(),
+                reply(id, "ONE"),
+                gate(),
+                result(id, "ONE", 0.001),
+                await_eof(),
+            ],
+        )])?;
+        d.failpoints.arm(ADMITTED, 1, "pause").map_err(infra)?;
+        d.failpoints
+            .arm(RECEIVED, 1, "value_persist:1")
+            .map_err(infra)?;
+        let daemon = Daemon::start(d, evidence, "final")?;
+        let asked = SystemTime::now();
+        let session =
+            session_of(&d.spawn(evidence, "spawn", &ask("ONE"), &["--idle-ms", "2000"])?)?;
+        d.await_progress("read 1 launch 1")?;
+        // The submission was by now: the deadline is by now plus 2 s.
+        let deadline_by = SystemTime::now() + Duration::from_secs(2);
+        d.failpoints
+            .wait_ack(ADMITTED, 1, "pause", daemon.pid(), WAIT)
+            .map_err(infra)?;
+        d.await_progress("at 7 launch 1")?;
+        // The progress comes late enough that its own deadline, its read
+        // plus 2 s, is still ahead when the fence opens.
+        let late = asked + Duration::from_millis(1_500);
+        if let Ok(left) = late.duration_since(SystemTime::now()) {
+            thread::sleep(left);
+        }
+        d.release(1)?;
+        // Route read the progress (Wire's fifth read) before the deadline,
+        // which is no earlier than the spawn call's start plus 2 s.
+        let progress = received_at(d, 5)?;
+        let read_after = progress.duration_since(asked).ok();
+        d.await_progress("at 9 launch 1")?;
+        let hold = deadline_by + Duration::from_millis(500);
+        if let Ok(left) = hold.duration_since(SystemTime::now()) {
+            thread::sleep(left);
+        }
+        d.failpoints.release(ADMITTED, 1).map_err(infra)?;
+        d.release(1)?;
+        let envelope = d.wait(evidence, &format!("{session}/1"))?;
+        check(
+            read_after.is_some_and(|after| after < Duration::from_millis(1_800))
+                && completed(&envelope)
+                && envelope["cancel"].is_null(),
+            || format!("progress read {read_after:?} after the spawn began: {envelope}"),
         )
     })
 }

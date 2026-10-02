@@ -797,6 +797,7 @@ impl Effective {
             effort: self.effort.clone(),
             bound: self.requested_bound().cloned(),
             output_schema: self.output_schema.is_some(),
+            instructions: instructions.is_some(),
             max_steps: self.max_steps,
             vendor: self.vendor.clone(),
             sizes: ParamSizes {

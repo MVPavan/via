@@ -344,7 +344,8 @@ impl ClaudeAdapter {
             // OD2's default requests MCP servers off: the switch is passed.
             inherit: turn.inherit.unwrap_or(Inherit::OD2_DEFAULT),
             extra_write_dirs,
-            instructions: (turn.sizes.instructions > 0).then_some(instructions.as_str()),
+            // Present instructions pass the flag, empty ones too (critical r2 #1).
+            instructions: turn.instructions.then_some(instructions.as_str()),
             effort: turn.effort.as_deref(),
             output_schema: turn.output_schema.then_some(&*schema),
             max_steps: turn.max_steps,
@@ -716,6 +717,7 @@ mod tests {
         let model = adapter.resolve(None);
         let turn = |instructions: usize, output_schema: usize| TurnParams {
             output_schema: output_schema > 0,
+            instructions: instructions > 0,
             sizes: ParamSizes {
                 instructions,
                 output_schema,
@@ -780,6 +782,85 @@ mod tests {
         assert!(fields(&turn(0, half)).is_empty());
         assert_eq!(fields(&turn(half, half + 1)), [Some("output_schema")]);
         assert_eq!(fields(&turn(half, half)), [Some("instructions")]);
+    }
+
+    /// Critical r2 #1: present but empty instructions still pass
+    /// `--append-system-prompt ""`, which `check_turn` counts. With empty
+    /// instructions, the largest schema it admits launches: the real
+    /// recipe's process (the empty flag and a schema of that compact
+    /// length) fits Host's cap; one byte more is refused naming
+    /// `output_schema`.
+    #[test]
+    fn empty_instructions_count_their_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = ClaudeAdapter::new(
+            dir.path().join("claude"),
+            std::sync::Arc::new(crate::instance::InstanceCache::default()),
+            &crate::config::BootstrapEnv::from_vars([("PATH", "/usr/bin:/bin")]),
+        );
+        let cwd = std::path::Path::new("/work/project");
+        let model = adapter.resolve(None);
+        let turn = |output_schema: usize| TurnParams {
+            output_schema: true,
+            instructions: true,
+            sizes: ParamSizes {
+                instructions: 0,
+                output_schema,
+                cwd: cwd.as_os_str().len(),
+                model: model.len(),
+            },
+            inherit: Some(Inherit::OD2_DEFAULT),
+            ..TurnParams::default()
+        };
+        let now = std::time::Instant::now();
+        let fields = |turn: &TurnParams| {
+            adapter
+                .check_turn_at("claude-cli", turn, now)
+                .iter()
+                .map(Refusal::field)
+                .collect::<Vec<_>>()
+        };
+        let (mut fits, mut over) = (18, ARG_MAX);
+        while over - fits > 1 {
+            let mid = fits.midpoint(over);
+            if fields(&turn(mid)).is_empty() {
+                fits = mid;
+            } else {
+                over = mid;
+            }
+        }
+        assert_eq!(fields(&turn(fits + 1)), [Some("output_schema")]);
+        // `{"description":"…"}` encodes to 18 bytes besides the text.
+        let schema = format!(r#"{{"description":"{}"}}"#, "z".repeat(fits - 18));
+        assert_eq!(schema.len(), fits);
+        let schema = serde_json::value::RawValue::from_string(schema).unwrap();
+        let id = crate::SessionId::try_from("s_7f3k9q2mzr4c").unwrap();
+        let session = launch::expected_session_id(&id);
+        let recipe = launch::Recipe {
+            model: &model,
+            session: launch::Continue::New(&session),
+            inherit: Inherit::OD2_DEFAULT,
+            extra_write_dirs: &[],
+            instructions: Some(""),
+            effort: None,
+            output_schema: Some(&schema),
+            max_steps: None,
+        };
+        let owner = crate::ProcessOwner::Turn {
+            session_id: id.clone(),
+            turn: crate::TurnNumber::try_from(1).unwrap(),
+        };
+        let spec = adapter.process_spec(owner, cwd, &recipe).unwrap();
+        assert!(spec.args.iter().any(|arg| arg == "--append-system-prompt"));
+        assert!(
+            crate::PrivateProcessSpec::configure_fits(
+                &spec.program,
+                &spec.args,
+                &spec.cwd,
+                &spec.env
+            ),
+            "the largest admitted launch with empty instructions fits Host's cap"
+        );
     }
 
     /// Critical r1 #2: `check_turn`, a resume's admission, reads the

@@ -6,9 +6,9 @@
 use std::collections::VecDeque;
 use std::future::Future;
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 
-use super::{Closed, Decoded, ForceWatch, PrivateProtocol};
+use super::{Closed, Decoded, ForceWatch, Hop, PrivateProtocol};
 use crate::{Deadline, RouteError, RouteFailure, SendOutcome, StopWatch, StoreFailure, TurnNumber};
 use via_wire::{
     ExitReport, FailureCause, HostError, LatchState, PendingWrite, WireError, WireFailure,
@@ -149,7 +149,7 @@ impl From<RouteError> for Failed {
 pub(crate) struct Serving<'a, P: PrivateProtocol> {
     pub(crate) turn: TurnNumber,
     pub(crate) sender: &'a WireSender,
-    pub(crate) hop: &'a mpsc::Sender<Decoded<P::Message>>,
+    pub(crate) hop: &'a Hop<P::Message>,
     pub(crate) deadline: Deadline,
     pub(crate) signals: Signals,
     pub(crate) latch: watch::Receiver<LatchState>,
@@ -177,7 +177,7 @@ impl<'a, P: PrivateProtocol> Serving<'a, P> {
     pub(crate) fn new(
         turn: TurnNumber,
         sender: &'a WireSender,
-        hop: &'a mpsc::Sender<Decoded<P::Message>>,
+        hop: &'a Hop<P::Message>,
         deadline: Deadline,
         signals: Signals,
         lane: P,
@@ -281,7 +281,7 @@ impl<'a, P: PrivateProtocol> Serving<'a, P> {
     ) -> Result<(), RouteError> {
         while let Some(message) = self.take_held().or_else(|| last.take()) {
             let turn = self.turn;
-            let hop = self.hop;
+            let hop = self.hop.items();
             tokio::select! {
                 biased;
                 permit = hop.reserve() => match permit {
@@ -350,7 +350,7 @@ impl<'a, P: PrivateProtocol> Serving<'a, P> {
         op: std::pin::Pin<&mut impl Future<Output = T>>,
     ) -> Result<Option<T>, Failed> {
         let turn = self.turn;
-        let hop = self.hop;
+        let hop = self.hop.items();
         let has_event = self.lane.has_event();
         tokio::select! {
             biased;
@@ -408,13 +408,17 @@ impl<'a, P: PrivateProtocol> Serving<'a, P> {
                     let bytes = message.bytes().len();
                     match P::admit(self, payload).await? {
                         Some(admitted) => {
+                            let waits = self.terminated || P::terminal(&admitted).is_none();
+                            // Counted decoded before any wait for room
+                            // (critical r2 #2).
+                            let decoded = self.hop.read(admitted, at);
                             // S1 rule 3 (review r2 #4): the turn's first
                             // terminal waits for room only once its reader
                             // retained it and marked the turn terminated.
-                            if self.terminated || P::terminal(&admitted).is_none() {
+                            if waits {
                                 self.make_room_for(bytes, P::READ_AHEAD).await?;
                             }
-                            Ok(Next::Message((Decoded { item: admitted, at }, bytes)))
+                            Ok(Next::Message((decoded, bytes)))
                         }
                         // Recorded, not handed over (C2 §2 Reopen).
                         None => continue,

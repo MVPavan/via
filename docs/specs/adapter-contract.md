@@ -215,7 +215,7 @@ pub struct VendorIdentity {
 | `ModelEntry` | a model with `source: bundled \| discovered` |
 | `SessionRef` | `harness`, `route`, `adapter_version`, handed back on resume, reopen and recovery; unknown or incompatible → `harness_unavailable` (rule 2) |
 | `SessionSpec` | `session_id`, `model`, `instructions: Option<Instructions>`, `initial_bound`, `cwd`, `vendor`, `inherit: {requested, effective}` (the inherited-configuration settings and states frozen at spawn, §6.2), `confirmed_vendor_session_id: Option<VendorSessionId>`, immutable `allow_untested`; a confirmed historical ID is not verification of this connection |
-| `TurnParams` | a resume turn's per-turn values (effort, bound, `output_schema`, `max_steps`, vendor keys) and their `sizes: ParamSizes` (the session's frozen instructions, the turn's effective schema, inherited or set), with the session's requested `inherit` (`None` when unknown), which a route's launch recipe and its handshake-refusal cache key read; the input to `check_turn` |
+| `TurnParams` | a resume turn's per-turn values (effort, bound, `output_schema`, `max_steps`, vendor keys) and their `sizes: ParamSizes` (the session's frozen instructions, the turn's effective schema, inherited or set), with the session's requested `inherit` (`None` when unknown) and whether the session has `instructions` (`instructions: bool`, empty text included, since an empty value still has its flag), which a route's launch recipe and its handshake-refusal cache key read; the input to `check_turn` |
 | `ServerReport` | `harness`, `vendor_version: Option<String>` (the server's handshake), `key: ServerKey` (Codex: 16 hex digits of its configuration hash), `sessions: u32` (sessions leasing it); only servers whose handshake succeeded and that are not retiring |
 | `TurnCheck` | `effective_bound`: the turn's bound as the route will apply it, like `RoutePlan.effective_bound` |
 | `TurnSpec` | `turn: TurnNo`, `prompt`, `effort`, `bound`, `output_schema`, `max_steps`, `vendor`, `wall_deadline: Instant`, `idle_deadline: IdleDeadline` |
@@ -483,7 +483,18 @@ records wall time); Core times idle progress and step boundaries by it
 decreases within one producer, while items of concurrent producers of one
 session may be admitted out of `at` order, so Core never moves an idle
 deadline back and never ends a step before it started. None across
-sessions. `class_hint` is a suggestion from the
+sessions. Decode fence (x.3.2 critical r2 #2): a route that reads ahead
+of the Adapter advances the turn's `DecodeWatermark` (a count of the
+messages it has read, carried by `TurnActivity`) as it reads, and the
+Adapter reports, beside it, the position through which it delivered every
+message's observations. When the idle deadline fires, Core snapshots the
+watermark and does not decide expiry until delivery reaches it. Meanwhile
+it handles the items as they arrive, each moving the deadline only by its
+own `at`. Later reads never enlarge the fence. The wall, stall, health and
+force bounds still end the wait, and raw activity never resets idle. The
+via-mnx reconciliation of the channel's queued items then runs as before.
+A route that keeps no watermark leaves the fence open: Claude Code and the
+fake keep one, through the shared private lifecycle; Codex does not yet. `class_hint` is a suggestion from the
 vendor code table (§6); Core applies C1 §7.6 precedence (cancel evidence
 before generic errors). Control acknowledgement may bypass observations, but
 cannot commit a terminal envelope ahead of earlier data. Sticky health failure

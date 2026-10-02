@@ -231,7 +231,7 @@ pub use fake::{
     FakeRetiredItem, FakeRoute, FakeRouteResult, FakeTerminal, FakeTurn, FakeUsage, Handshake,
     Lane, RouteMessage, TerminalDetails, TerminalStatus, TurnStart, VENDOR_DATA_MAX,
 };
-pub use private::Decoded;
+pub use private::{DecodeWatermark, Decoded, Hop};
 pub use runtime::{Retirement, RouteRuntime};
 pub use steer::{
     CONTROL_BYTES, CONTROL_COMMANDS, SteerAnswer, SteerRefused, SteerRequest, SteerSender,

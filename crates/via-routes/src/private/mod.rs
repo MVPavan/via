@@ -40,14 +40,72 @@ pub struct Decoded<M> {
     pub item: M,
     /// When Route read it.
     pub at: tokio::time::Instant,
+    /// The turn's [`DecodeWatermark`] once Route admitted it: its position
+    /// in decode order. An item Route made itself carries the watermark
+    /// as it stood, the decoded messages before it.
+    pub seq: u64,
 }
 
-impl<M> Decoded<M> {
-    /// `item`, as of now: one Route made rather than read.
-    pub(crate) fn now(item: M) -> Self {
-        Self {
+/// A turn's decode watermark (runtime §8; x.3.2 critical r2 #2): how many
+/// vendor messages Route has read and admitted for the hop, advanced as
+/// each is admitted, before it waits for read-ahead room or the hop. The
+/// Adapter reports how far it delivered against it, so Core's idle
+/// deadline is decided only once what Route read by then was reconciled.
+/// The Adapter creates it with the turn's activity clock; Route only
+/// advances it.
+#[derive(Clone, Debug, Default)]
+pub struct DecodeWatermark(Arc<std::sync::atomic::AtomicU64>);
+
+impl DecodeWatermark {
+    /// The messages admitted so far.
+    #[must_use]
+    pub fn get(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Counts one more admitted message; its position.
+    fn advance(&self) -> u64 {
+        self.0
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            .saturating_add(1)
+    }
+}
+
+/// What a turn hands the Adapter: the hop's sending side, and the turn's
+/// decode watermark, which Route advances as it reads.
+#[derive(Debug)]
+pub struct Hop<M> {
+    items: mpsc::Sender<Decoded<M>>,
+    decoded: DecodeWatermark,
+}
+
+impl<M> Hop<M> {
+    /// The hop `items` with the turn's watermark `decoded`.
+    pub fn new(items: mpsc::Sender<Decoded<M>>, decoded: DecodeWatermark) -> Self {
+        Self { items, decoded }
+    }
+
+    /// The hop's sending side.
+    pub(crate) fn items(&self) -> &mpsc::Sender<Decoded<M>> {
+        &self.items
+    }
+
+    /// `item`, read now: its position the watermark's next.
+    pub(crate) fn read(&self, item: M, at: tokio::time::Instant) -> Decoded<M> {
+        Decoded {
+            item,
+            at,
+            seq: self.decoded.advance(),
+        }
+    }
+
+    /// `item`, as of now: one Route made rather than read, behind every
+    /// message admitted so far.
+    pub(crate) fn made(&self, item: M) -> Decoded<M> {
+        Decoded {
             item,
             at: tokio::time::Instant::now(),
+            seq: self.decoded.get(),
         }
     }
 }
@@ -249,7 +307,7 @@ pub(crate) async fn turn<P: PrivateProtocol>(
     runtime: &RouteRuntime,
     process: PrivateProcessSpec,
     start: P::Start,
-    hop: mpsc::Sender<Decoded<P::Message>>,
+    hop: Hop<P::Message>,
     signals: (Deadline, ForceWatch, (StopWatch, StopSources)),
     input: P::Input,
 ) -> Retirement {
@@ -267,7 +325,7 @@ async fn run<P: PrivateProtocol>(
     runtime: &RouteRuntime,
     process: PrivateProcessSpec,
     start: P::Start,
-    hop: mpsc::Sender<Decoded<P::Message>>,
+    hop: Hop<P::Message>,
     (deadline, force, (stop, sources)): (Deadline, ForceWatch, (StopWatch, StopSources)),
     input: P::Input,
 ) -> (Result<P::Result, RouteFailure>, Lane<P>) {
@@ -334,7 +392,7 @@ async fn run<P: PrivateProtocol>(
 async fn run_turn<P: PrivateProtocol>(
     runtime: &RouteRuntime,
     (process, start): (PrivateProcessSpec, P::Start),
-    hop: &mpsc::Sender<Decoded<P::Message>>,
+    hop: &Hop<P::Message>,
     deadline: Deadline,
     wire_signals: WireSignals,
     signals: Signals,
