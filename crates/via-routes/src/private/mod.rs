@@ -64,7 +64,7 @@ impl DecodeWatermark {
     }
 
     /// Counts one more admitted message; its position.
-    fn advance(&self) -> u64 {
+    pub(crate) fn advance(&self) -> u64 {
         self.0
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
             .saturating_add(1)

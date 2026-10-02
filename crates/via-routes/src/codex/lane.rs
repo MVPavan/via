@@ -18,7 +18,7 @@ use tokio::time::Instant;
 use via_wire::{ExitReport, TurnNumber, VendorMessage, WireCleanup};
 
 use super::ServerRequest;
-use crate::{DecodeWatermark, Hop};
+use crate::DecodeWatermark;
 
 /// The most messages a lane holds.
 pub const LANE_MESSAGES: usize = 16;
@@ -197,9 +197,8 @@ struct Queue {
 struct Fence {
     /// The fences set so far: the current one's number.
     count: u64,
-    /// The running turn's watermark, advanced through Route's [`Hop`],
-    /// the one place a route advances one; its channel is never used.
-    hop: Option<Hop<()>>,
+    /// The running turn's watermark.
+    decoded: Option<DecodeWatermark>,
 }
 
 /// One thread's ingress lane: the connection task pushes, one driver
@@ -222,10 +221,9 @@ impl Lane {
     /// from now on advances it and carries its position, under the
     /// returned fence number, until the next turn's fence replaces it.
     pub fn fence(&self, decoded: DecodeWatermark) -> u64 {
-        let (unused, _) = tokio::sync::mpsc::channel(1);
         let mut fence = self.fence.lock().unwrap_or_else(PoisonError::into_inner);
         fence.count = fence.count.saturating_add(1);
-        fence.hop = Some(Hop::new(unused, decoded));
+        fence.decoded = Some(decoded);
         fence.count
     }
 
@@ -251,9 +249,9 @@ impl Lane {
         let routed = item.routed_mut();
         routed.mark = {
             let fence = self.fence.lock().unwrap_or_else(PoisonError::into_inner);
-            fence.hop.as_ref().map(|hop| Mark {
+            fence.decoded.as_ref().map(|decoded| Mark {
                 fence: fence.count,
-                seq: hop.read((), routed.at).seq,
+                seq: decoded.advance(),
             })
         };
         queue.bytes = queue.bytes.saturating_add(bytes);

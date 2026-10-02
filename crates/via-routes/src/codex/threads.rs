@@ -55,8 +55,11 @@ struct LaneEntry {
     lane: Arc<Lane>,
     signal: Option<Arc<LeaseSignal>>,
     thread: Option<String>,
-    /// The lane's one interrupt intent was posted (item 8.3).
-    interrupted: bool,
+    /// The `turn/start` record of the last turn whose stop posted its
+    /// interrupt (item 8.3): each turn's stop posts its own.
+    interrupted: Option<i64>,
+    /// The generation's one cleanup interrupt intent was taken (item 8.3).
+    cleanup: bool,
     /// The lane's one unsubscribe intent was posted (item 8.3).
     unsubscribed: bool,
 }
@@ -106,7 +109,8 @@ impl ThreadTable {
                 lane,
                 signal,
                 thread: None,
-                interrupted: false,
+                interrupted: None,
+                cleanup: false,
                 unsubscribed: false,
             },
         );
@@ -174,28 +178,55 @@ impl ThreadTable {
         }
     }
 
-    /// Maps the accepted vendor turn `turn` of lane `id`'s thread to VIA
-    /// turn `number`, with a charge already taken. False when the lane is
-    /// gone or names no thread (the charge is the caller's to release).
-    pub(super) fn map_turn(&mut self, id: u64, turn: &str, number: TurnNumber) -> bool {
-        let Some(thread) = self.thread(id).map(str::to_owned) else {
-            return false;
-        };
+    /// Maps the accepted vendor turn `turn` of `thread`, started on lane
+    /// `id`, to VIA turn `number` until the connection retires, charged
+    /// for both IDs (packet §5): kept even when the lane closed before the
+    /// reply, so the turn's later traffic is late. `Ok(false)` when the
+    /// budget is exhausted; `Err(())` when the vendor turn is already
+    /// mapped, a protocol failure (X0 §5): the first mapping stays.
+    pub(super) fn map_turn(
+        &mut self,
+        id: u64,
+        (thread, turn): (&str, &str),
+        number: TurnNumber,
+        budget: &mut Budget,
+    ) -> Result<bool, ()> {
+        let key = (thread.to_owned(), turn.to_owned());
+        if self.turns.contains_key(&key) {
+            return Err(());
+        }
+        if !budget.charge(thread.len().saturating_add(turn.len())) {
+            return Ok(false);
+        }
         self.turns.insert(
-            (thread, turn.to_owned()),
+            key,
             Mapping {
                 lane: id,
                 turn: number,
             },
         );
-        true
+        Ok(true)
     }
 
-    /// Whether lane `id` may post its interrupt intent; marks it posted.
-    pub(super) fn take_interrupt(&mut self, id: u64) -> bool {
+    /// Whether lane `id` may post the stop interrupt of the turn started
+    /// by `turn/start` record `start`: once per turn; marks it posted.
+    pub(super) fn take_interrupt(&mut self, id: u64, start: i64) -> bool {
         self.lanes
             .get_mut(&id)
-            .is_some_and(|entry| !std::mem::replace(&mut entry.interrupted, true))
+            .is_some_and(|entry| entry.interrupted.replace(start) != Some(start))
+    }
+
+    /// Whether lane `id` may post the generation's cleanup interrupt for
+    /// the turn of record `start`: once per lane, and not when that turn's
+    /// stop already posted its interrupt; marks it taken.
+    pub(super) fn take_cleanup(&mut self, id: u64, start: i64) -> bool {
+        let Some(entry) = self.lanes.get_mut(&id) else {
+            return false;
+        };
+        if std::mem::replace(&mut entry.cleanup, true) {
+            return false;
+        }
+        entry.interrupted.replace(start) != Some(start)
     }
 
     /// Whether lane `id` may post its unsubscribe intent; marks it posted.

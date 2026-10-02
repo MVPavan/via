@@ -2140,6 +2140,36 @@ fn codex_turns_keep_a_decode_fence() {
     .unwrap();
 }
 
+/// Runtime §8 (x.3.2 X3 fix r2, the stale-fence check): a message the
+/// lane took under turn 1's fence, after turn 1's terminal, is counted in
+/// turn 1's watermark only. Turn 2's normalizer takes it first, as an
+/// earlier turn's, and reports nothing delivered for it: turn 2's
+/// watermark and delivery stay its own ten messages.
+#[test]
+fn codex_stale_fence_counts_nothing() {
+    let name = "codex_stale_fence_counts_nothing";
+    let mut replay = replay_of("c9_output_schema").unwrap();
+    let mut expect = expect_of("c9_output_schema").unwrap();
+    replay["source"] = json!(format!("{name}: a variant of c9_output_schema"));
+    expect["source"] = replay["source"].clone();
+    let usage = step_with(&replay, "thread/tokenUsage/updated").unwrap();
+    let completed = step_with(&replay, "\"turn/completed\"").unwrap();
+    let stale = replay["steps"][usage].clone();
+    steps(&mut replay).unwrap().insert(completed + 1, stale);
+    check_variant_then(name, &replay, &expect, |pure| {
+        let fences = pure.fences.borrow();
+        match (fences.get(&0), fences.get(&1)) {
+            (Some(&(first, through)), Some(&second)) if through <= first && second == (10, 10) => {
+                Ok(())
+            }
+            _ => Err(format!(
+                "decode fences (watermark, delivered) by turn: {fences:?}"
+            )),
+        }
+    })
+    .unwrap();
+}
+
 /// Arms `codex.connection.message` to fail the connection task when it
 /// takes its `occurrence`th admitted message (x.3.2 X0 item 13.2's seam).
 #[cfg(feature = "test-failpoints")]

@@ -60,11 +60,15 @@ impl Drop for Scratch {
 struct TestStdio {
     input: TestInput,
     kept: Mutex<Vec<Vec<u8>>>,
+    /// Every write handed to Wire, in order: the tests' write-state gate.
+    tickets: Mutex<Vec<WriteTicket>>,
 }
 
 impl Stdio for TestStdio {
     fn write(&self, message: OutboundMessage, bounds: WriteBounds) -> PendingWrite {
-        self.input.write_bounded(message, bounds)
+        let pending = self.input.write_bounded(message, bounds);
+        self.tickets.lock().unwrap().push(pending.ticket());
+        pending
     }
 
     fn withdraw(&self, ticket: WriteTicket) -> WriteState {
@@ -117,6 +121,8 @@ struct Vendor {
     stdout: DuplexStream,
     stdin: BufReader<DuplexStream>,
     task: JoinHandle<ConnectionEnd>,
+    /// The vendor lines written so far.
+    emitted: u64,
     _scratch: Scratch,
 }
 
@@ -130,6 +136,7 @@ impl Vendor {
         let wire = Arc::new(TestStdio {
             input: pipes.input,
             kept: Mutex::new(Vec::new()),
+            tickets: Mutex::new(Vec::new()),
         });
         let connection = Connection::over(
             ServerId::mint().unwrap(),
@@ -143,6 +150,7 @@ impl Vendor {
             stdout,
             stdin: BufReader::new(stdin),
             task,
+            emitted: 0,
             _scratch: scratch,
         }
     }
@@ -152,11 +160,13 @@ impl Vendor {
         let mut bytes = serde_json::to_vec(line).unwrap();
         bytes.push(b'\n');
         self.stdout.write_all(&bytes).await.unwrap();
+        self.emitted += 1;
     }
 
-    /// Writes raw vendor bytes.
-    async fn emit_raw(&mut self, bytes: &[u8]) {
-        self.stdout.write_all(bytes).await.unwrap();
+    /// Writes one raw vendor line, its newline included.
+    async fn emit_raw(&mut self, line: &[u8]) {
+        self.stdout.write_all(line).await.unwrap();
+        self.emitted += 1;
     }
 
     /// The next line VIA wrote, within 2 s.
@@ -177,13 +187,49 @@ impl Vendor {
             .is_err()
     }
 
-    /// Waits until the connection task has routed what was written.
+    /// Waits until the connection task has routed every line written.
     async fn settle(&self) {
-        for _ in 0..50 {
-            tokio::task::yield_now().await;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        let emitted = self.emitted;
+        until("every emitted line routed", || {
+            self.connection.routed() >= emitted
+        })
+        .await;
     }
+
+    /// Waits until Wire holds write `n` (from 1) in a state `state` takes.
+    async fn wrote(&self, n: usize, state: fn(WriteState) -> bool) {
+        until("the write's state", || {
+            self.stdio
+                .tickets
+                .lock()
+                .unwrap()
+                .get(n - 1)
+                .is_some_and(|ticket| state(ticket.state()))
+        })
+        .await;
+    }
+}
+
+/// Waits until `done`, polling, within 5 s.
+async fn until(what: &str, done: impl Fn() -> bool) {
+    let started = tokio::time::Instant::now();
+    while !done() {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "never reached: {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+/// A write blocked mid-line, its first byte written.
+fn started(state: WriteState) -> bool {
+    state == WriteState::Started
+}
+
+/// A write handed to Wire with nothing written.
+fn unstarted(state: WriteState) -> bool {
+    matches!(state, WriteState::Queued | WriteState::Claimed)
 }
 
 fn far() -> Deadline {
@@ -292,7 +338,7 @@ async fn turn_writes_guard_withdraws_on_drop() {
     big.extend(br#""}}"#);
     big.push(b'\n');
     let control = vendor.connection.notify(big, start_by()).unwrap();
-    vendor.settle().await;
+    vendor.wrote(1, started).await;
     let mut writes = TurnWrites::new(&vendor.connection);
     let first = vendor
         .connection
@@ -312,7 +358,7 @@ async fn turn_writes_guard_withdraws_on_drop() {
             Some(&mut writes),
         )
         .unwrap();
-    vendor.settle().await;
+    vendor.wrote(2, unstarted).await;
     drop(writes);
     assert_eq!(
         promptly(first.written).await.unwrap(),
@@ -348,7 +394,7 @@ async fn turn_writes_guard_withdraws_on_panic() {
     big.extend(vec![b'x'; 16 * 1024]);
     big.extend(b"\"}}\n");
     let _control = vendor.connection.notify(big, start_by()).unwrap();
-    vendor.settle().await;
+    vendor.wrote(1, started).await;
     let mut writes = TurnWrites::new(&vendor.connection);
     let start = vendor
         .connection
@@ -397,7 +443,7 @@ async fn reply_goes_before_queued_data() {
     big.extend(vec![b'x'; 16 * 1024]);
     big.extend(b"\"}}\n");
     let _control = vendor.connection.notify(big, start_by()).unwrap();
-    vendor.settle().await;
+    vendor.wrote(1, started).await;
     let start = vendor
         .connection
         .request(
@@ -779,7 +825,7 @@ async fn interrupt_waits_for_delayed_acceptance() {
         !vendor
             .connection
             .interrupt(&lane, start.id, Some("u1"), far()),
-        "once per lane"
+        "once per turn"
     );
 }
 
@@ -793,7 +839,7 @@ async fn interrupt_dropped_when_start_withdrawn() {
     big.extend(vec![b'x'; 16 * 1024]);
     big.extend(b"\"}}\n");
     let _control = vendor.connection.notify(big, start_by()).unwrap();
-    vendor.settle().await;
+    vendor.wrote(2, started).await;
     let mut writes = TurnWrites::new(&vendor.connection);
     let start = vendor
         .connection
@@ -807,7 +853,7 @@ async fn interrupt_dropped_when_start_withdrawn() {
             Some(&mut writes),
         )
         .unwrap();
-    vendor.settle().await;
+    vendor.wrote(3, unstarted).await;
     assert!(vendor.connection.interrupt(&lane, start.id, None, far()));
     drop(writes);
     assert_eq!(vendor.read().await["method"], "note");
@@ -834,7 +880,7 @@ async fn quarantine_interrupt_survives_settlement() {
             Some(&mut writes),
         )
         .unwrap();
-    vendor.settle().await;
+    vendor.wrote(2, started).await;
     assert!(
         vendor
             .connection
@@ -847,4 +893,161 @@ async fn quarantine_interrupt_survives_settlement() {
         seen.push(vendor.read().await["method"].as_str().unwrap().to_owned());
     }
     assert_eq!(seen, ["turn/start", "turn/interrupt"]);
+}
+
+/// Queues a `turn/start` on `lane` for VIA turn `number`, reads it, and
+/// answers it accepted as vendor turn `accepted`.
+async fn accepted(vendor: &mut Vendor, lane: &LaneLease, number: u32, accepted: &str) -> ClientId {
+    let start = vendor
+        .connection
+        .request(
+            |id| Ok(turn_start_line(id, "t", "go")),
+            start_by(),
+            Purpose::Starts {
+                lane,
+                turn: turn(number),
+            },
+            None,
+        )
+        .unwrap();
+    assert_eq!(vendor.read().await["method"], "turn/start");
+    vendor.emit(&start_reply(start.id.get(), accepted)).await;
+    start.reply.await.unwrap();
+    start.id
+}
+
+/// Item 8.3 (x.3.2 X3 fix r2 #6): each turn's stop posts its own
+/// interrupt. Turn 1 was stopped; turn 2 on the same registration is
+/// stopped too, and its interrupt is written. The generation's cleanup
+/// intent is separate and once only: none for a turn whose stop already
+/// posted one.
+#[tokio::test]
+async fn each_turn_stop_writes_its_own_interrupt() {
+    let mut vendor = Vendor::open(1 << 16);
+    let lane = registered(&mut vendor, "t").await;
+    let first = accepted(&mut vendor, &lane, 1, "u1").await;
+    assert!(vendor.connection.interrupt(&lane, first, Some("u1"), far()));
+    assert_eq!(vendor.read().await["params"]["turnId"], "u1");
+    let second = accepted(&mut vendor, &lane, 2, "u2").await;
+    assert!(
+        vendor
+            .connection
+            .interrupt(&lane, second, Some("u2"), far())
+    );
+    assert_eq!(vendor.read().await["params"]["turnId"], "u2");
+    assert!(
+        !vendor
+            .connection
+            .cleanup_interrupt(&lane, second, Some("u2"), far()),
+        "turn 2's stop already posted its interrupt"
+    );
+    let third = accepted(&mut vendor, &lane, 3, "u3").await;
+    assert!(
+        !vendor
+            .connection
+            .cleanup_interrupt(&lane, third, Some("u3"), far()),
+        "the cleanup intent is the generation's, once"
+    );
+    assert!(vendor.silent(Duration::from_millis(100)).await);
+}
+
+/// Packet §5 (x.3.2 X3 fix r2 #8): a successful `turn/start` reply that
+/// comes after its lane closed still keeps the accepted turn, so the
+/// turn's later traffic is late and dropped before decoding, never routed
+/// to the thread's next registration.
+#[tokio::test]
+async fn late_start_reply_keeps_its_turn() {
+    let mut vendor = Vendor::open(1 << 16);
+    let lane = registered(&mut vendor, "t").await;
+    let start = vendor
+        .connection
+        .request(
+            |id| Ok(turn_start_line(id, "t", "go")),
+            start_by(),
+            Purpose::Starts {
+                lane: &lane,
+                turn: turn(1),
+            },
+            None,
+        )
+        .unwrap();
+    assert_eq!(vendor.read().await["method"], "turn/start");
+    drop(lane);
+    vendor.emit(&start_reply(start.id.get(), "u1")).await;
+    let again = registered(&mut vendor, "t").await;
+    let deep = format!(
+        r#"{{"method":"item/completed","params":{{"threadId":"t","turnId":"u1","item":{}{}}}}}"#,
+        "[".repeat(100),
+        "]".repeat(100)
+    );
+    vendor.emit_raw(format!("{deep}\n").as_bytes()).await;
+    vendor.settle().await;
+    assert_eq!(vendor.connection.counts().late_after_close, 1);
+    assert!(taken(again.lane()).is_empty());
+    assert_eq!(vendor.connection.failure(), None);
+}
+
+/// X0 §5 (x.3.2 X3 fix r2 #8): a vendor turn ID accepted twice on one
+/// thread never replaces its first mapping: it is a protocol failure.
+#[tokio::test]
+async fn repeated_turn_id_fails_protocol() {
+    let mut vendor = Vendor::open(1 << 16);
+    let lane = registered(&mut vendor, "t").await;
+    accepted(&mut vendor, &lane, 1, "u1").await;
+    let start = vendor
+        .connection
+        .request(
+            |id| Ok(turn_start_line(id, "t", "again")),
+            start_by(),
+            Purpose::Starts {
+                lane: &lane,
+                turn: turn(2),
+            },
+            None,
+        )
+        .unwrap();
+    vendor.read().await;
+    vendor.emit(&start_reply(start.id.get(), "u1")).await;
+    let end = tokio::time::timeout(Duration::from_secs(10), &mut vendor.task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(end, ConnectionEnd::Failed(loss) if loss.cause == LossCause::Protocol));
+}
+
+/// Item 9.1 (x.3.2 X3 fix r2 #9): an accepted turn's mapping is charged
+/// its vendor turn ID's bytes too. Turns with 1,000-byte IDs exhaust the
+/// 256 KiB correlation bytes long before the entry count: the connection
+/// fails `overflow`.
+#[tokio::test]
+async fn correlation_bytes_count_turn_ids() {
+    let mut vendor = Vendor::open(1 << 16);
+    let lane = registered(&mut vendor, "t").await;
+    let fits = CORRELATION_BYTES / 1000;
+    let mut mapped = 0;
+    for index in 0..CORRELATION_ENTRIES {
+        let Ok(start) = vendor.connection.request(
+            |id| Ok(turn_start_line(id, "t", "go")),
+            start_by(),
+            Purpose::Starts {
+                lane: &lane,
+                turn: turn(1),
+            },
+            None,
+        ) else {
+            break;
+        };
+        vendor.read().await;
+        let long = format!("{index:01000}");
+        vendor.emit(&start_reply(start.id.get(), &long)).await;
+        if start.reply.await.is_err() {
+            break;
+        }
+        mapped += 1;
+    }
+    assert!(mapped < fits, "{mapped} turns of 1,000-byte IDs mapped");
+    assert_eq!(
+        vendor.connection.failure(),
+        Some(ConnectionFailure::Overflow)
+    );
 }

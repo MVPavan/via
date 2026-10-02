@@ -175,6 +175,9 @@ struct State {
     next_signal: u64,
     /// Replies queued or being written, and their bytes.
     replies: (usize, usize),
+    /// Messages fully routed: the unit tests' observable gate.
+    #[cfg(test)]
+    routed: u64,
 }
 
 /// The connection's diagnostic counts.
@@ -313,6 +316,8 @@ impl Connection {
                 signals: HashMap::new(),
                 next_signal: 0,
                 replies: (0, 0),
+                #[cfg(test)]
+                routed: 0,
             }),
             failure: watch::Sender::new(None),
             end: watch::Sender::new(None),
@@ -551,12 +556,13 @@ impl Connection {
         }
     }
 
-    /// Posts `lane`'s interrupt intent (item 8.3), at most once per lane:
+    /// Posts the stop interrupt intent (item 8.3) of `lane`'s turn
+    /// started by the `turn/start` record `start`, at most once per turn:
     /// owned by the connection, never withdrawn, it survives the turn's
     /// settlement. With the turn's vendor ID `accepted` it is queued now;
-    /// before it, it waits on the `turn/start` record `start` and is
-    /// queued once its reply names the turn (an error reply, or a start
-    /// never written, drops it). Whether it was posted.
+    /// before it, it waits on the record and is queued once its reply
+    /// names the turn (an error reply, or a start never written, drops
+    /// it). Whether it was posted.
     pub fn interrupt(
         &self,
         lane: &LaneLease,
@@ -564,9 +570,39 @@ impl Connection {
         accepted: Option<&str>,
         by: Deadline,
     ) -> bool {
+        self.intent(lane, (start, false), accepted, by)
+    }
+
+    /// Posts the generation's cleanup interrupt intent (item 8.3) for
+    /// `lane`'s turn of record `start`, as [`Self::interrupt`] does, but
+    /// once per lane, and nothing when that turn's stop already posted
+    /// its interrupt. Whether it was posted.
+    pub fn cleanup_interrupt(
+        &self,
+        lane: &LaneLease,
+        start: ClientId,
+        accepted: Option<&str>,
+        by: Deadline,
+    ) -> bool {
+        self.intent(lane, (start, true), accepted, by)
+    }
+
+    /// [`Self::interrupt`], or with `cleanup` [`Self::cleanup_interrupt`].
+    fn intent(
+        &self,
+        lane: &LaneLease,
+        (start, cleanup): (ClientId, bool),
+        accepted: Option<&str>,
+        by: Deadline,
+    ) -> bool {
         let thread = {
             let mut state = self.state();
-            if state.ended || !state.threads.take_interrupt(lane.id) {
+            let taken = if cleanup {
+                state.threads.take_cleanup(lane.id, start.get())
+            } else {
+                state.threads.take_interrupt(lane.id, start.get())
+            };
+            if state.ended || !taken {
                 return false;
             }
             let Some(thread) = state.threads.thread(lane.id).map(str::to_owned) else {
@@ -704,13 +740,15 @@ impl Connection {
                     Ok(raw),
                 ) => {
                     if let Ok(accepted) = result::<TurnStartResult>(raw) {
-                        // The record's own charge, just released, carries
-                        // over to the mapping (packet §5: reserved before
-                        // the start was written).
-                        if state.budget.charge(thread.len())
-                            && !state.threads.map_turn(lane, &accepted.turn.id, turn)
-                        {
-                            state.budget.release(thread.len());
+                        // Kept whether or not the lane is still open: the
+                        // turn's later traffic is late (packet §5).
+                        if !thread.is_empty() {
+                            let ids = (thread.as_str(), accepted.turn.id.as_str());
+                            match state.threads.map_turn(lane, ids, turn, &mut state.budget) {
+                                Ok(true) => {}
+                                Ok(false) => return Err(ConnectionFailure::Overflow),
+                                Err(()) => return Err(ConnectionFailure::Protocol),
+                            }
                         }
                         interrupt = delayed.map(|by| (thread, accepted.turn.id, by));
                     }
@@ -753,6 +791,23 @@ impl Connection {
     /// to its registration's lane. An unattributable message is the
     /// connection's failure; its bytes are kept for the server folder.
     fn demux(&self, message: VendorMessage) -> Result<(), ConnectionFailure> {
+        let routed = self.route_message(message);
+        #[cfg(test)]
+        {
+            let mut state = self.state();
+            state.routed = state.routed.saturating_add(1);
+        }
+        routed
+    }
+
+    /// The messages [`Self::demux`] finished routing.
+    #[cfg(all(test, feature = "test-failpoints"))]
+    pub(super) fn routed(&self) -> u64 {
+        self.state().routed
+    }
+
+    /// [`Self::demux`]'s routing.
+    fn route_message(&self, message: VendorMessage) -> Result<(), ConnectionFailure> {
         // The read instant (C2 §4): the routed message's, whatever it waits.
         let at = Instant::now();
         let seq = {
