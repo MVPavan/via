@@ -79,6 +79,11 @@ pub(crate) struct Knobs {
     /// `n`th input line (`read <n> launch 1`): the session's channel
     /// fills, as when Core's consumer stalls.
     pub(crate) hold_until_read: Option<usize>,
+    /// The stop is ordered twice, a fresh order 50 ms after the first: a
+    /// duplicate cancel, which must not write a second interrupt.
+    pub(crate) repeat_stop: bool,
+    /// Every session is opened with `allow_untested` set.
+    pub(crate) allow_untested: bool,
 }
 
 /// What a running turn has shown so far, for its side actions.
@@ -140,7 +145,21 @@ impl Pure {
         replay: &Path,
         knobs: Knobs,
     ) -> Result<crate::conformance_expect::Outcome, String> {
+        self.drive_then(expect, replay, knobs, |_| Ok(()))
+    }
+
+    /// [`Pure::drive`], then `then` on the adapter set the case ran on,
+    /// once every turn settled: a test's checks of what the run left behind
+    /// (a cached refusal).
+    pub(crate) fn drive_then(
+        self,
+        expect: &Value,
+        replay: &Path,
+        knobs: Knobs,
+        then: impl FnOnce(&Self) -> Result<(), String>,
+    ) -> Result<crate::conformance_expect::Outcome, String> {
         if self.pending.is_empty() {
+            then(&self)?;
             return self.planned_only();
         }
         let text = fs::read_to_string(replay).map_err(|e| format!("replay: {e}"))?;
@@ -158,6 +177,7 @@ impl Pure {
             Ok::<_, String>((turns?, health))
         });
         let (turns, health) = result?;
+        then(&pure)?;
         let launches = pure.launches()?;
         for (index, (outcome, after)) in turns.into_iter().enumerate() {
             if pure.pending.contains(&index) {
@@ -216,7 +236,7 @@ impl<'a> Run<'a> {
                     effective: plan.inherit.effective,
                 },
                 confirmed_vendor_session_id: session["resume"].as_str().map(str::to_owned),
-                allow_untested: false,
+                allow_untested: knobs.allow_untested,
             };
             let session_ref = SessionRef {
                 harness: plan.harness.to_owned(),
@@ -437,32 +457,33 @@ impl<'a> Run<'a> {
             .ok_or("the session's channel is in use")?;
         let seen = &self.seen[index];
         let (ended_tx, ended) = watch::channel(false);
-        let run = async {
-            if let Some(read) = self.knobs.hold_until_read {
-                self.until_progress(&format!("read {read} launch 1"))
-                    .await?;
-            }
-            Ok::<(), String>(())
-        };
         let drain = async {
-            let held = run.await;
+            let waiting = self.consumer_hold();
+            tokio::pin!(waiting);
+            let mut released = None;
             let end = {
                 let running = session.driver.run_turn(spec, cx);
                 tokio::pin!(running);
                 loop {
                     tokio::select! {
-                        Some(admitted) = receiver.recv() => {
+                        result = &mut waiting, if released.is_none() => released = Some(result),
+                        Some(admitted) = receiver.recv(), if released.is_some() => {
                             self.observe(&admitted.item.observation, seen, &observed);
                         }
                         end = &mut running => break end,
                     }
                 }
             };
+            let released = if let Some(result) = released {
+                result
+            } else {
+                waiting.await
+            };
             while let Ok(admitted) = receiver.try_recv() {
                 self.observe(&admitted.item.observation, seen, &observed);
             }
             ended_tx.send_replace(true);
-            held.map(|()| end)
+            released.map(|()| end)
         };
         let side = self.side(
             turn,
@@ -482,6 +503,16 @@ impl<'a> Run<'a> {
             self.judge_launch(launches_before + 1, session, number, &end)?;
         }
         Ok(outcome)
+    }
+
+    /// Resolves once Core may take the turn's observations: at once, or
+    /// with [`Knobs::hold_until_read`] once the fake read that line.
+    async fn consumer_hold(&self) -> Result<(), String> {
+        if let Some(read) = self.knobs.hold_until_read {
+            self.until_progress(&format!("read {read} launch 1"))
+                .await?;
+        }
+        Ok(())
     }
 
     /// Takes one observation: its checker shape, and the turn's events.
@@ -592,21 +623,21 @@ impl<'a> Run<'a> {
                 return;
             }
             let now = tokio::time::Instant::now();
-            match order["kind"].as_str() {
-                Some("close") => {
-                    let deadline = Deadline::at(now + CLOSE_DEADLINE);
-                    let _report = session.driver.close(CloseMode::Graceful, deadline).await;
-                }
+            if order["kind"].as_str() == Some("close") {
+                let deadline = Deadline::at(now + CLOSE_DEADLINE);
+                let _report = session.driver.close(CloseMode::Graceful, deadline).await;
+            } else {
                 // A cancel (`interrupt`); the wall is the turn's own.
-                _ => {
-                    stop_order.send_replace(Some(StopOrder {
-                        cause: StopCause::Cancel,
-                        requested_at: "2026-01-01T00:00:00.000Z".to_owned(),
-                        force_at: Deadline::at(now + STOP_FORCE),
-                        close_by: Deadline::at(now + STOP_FORCE + CLOSE_BY),
-                    }));
-                    // A second order is a duplicate cancel: Core keeps the
-                    // first, and Route sends one interrupt.
+                let order = |now| StopOrder {
+                    cause: StopCause::Cancel,
+                    requested_at: "2026-01-01T00:00:00.000Z".to_owned(),
+                    force_at: Deadline::at(now + STOP_FORCE),
+                    close_by: Deadline::at(now + STOP_FORCE + CLOSE_BY),
+                };
+                stop_order.send_replace(Some(order(now)));
+                if self.knobs.repeat_stop {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    stop_order.send_replace(Some(order(tokio::time::Instant::now())));
                 }
             }
         };

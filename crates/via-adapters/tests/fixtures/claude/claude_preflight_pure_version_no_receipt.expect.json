@@ -1,0 +1,89 @@
+{
+  "source": "synthetic (x.3.2 C2, via-p98.3.2): no vendor run. Lines follow the 2026-09-30 c1a-c11b recordings' shapes, trimmed to what the adapter reads. An init without interrupt_receipt_v1; the vendor then answers VIA's interrupt with c7's abort terminal.",
+  "harness": "claude",
+  "launches": 1,
+  "launch_checkpoints": {
+    "after_pure": 0,
+    "after_open": {
+      "main": 0
+    },
+    "after_turn": [
+      1
+    ]
+  },
+  "pure_writes": [],
+  "plan_checks": [],
+  "sessions": {
+    "main": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "close": null,
+      "health": {
+        "state": "failed",
+        "first_cause": "protocol"
+      }
+    }
+  },
+  "turns": [
+    {
+      "session": "main",
+      "start_after": null,
+      "params": {
+        "prompt": "Reply NEVER.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": null,
+      "steer": [],
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": false,
+        "terminal": null,
+        "usage": null,
+        "final_text": null,
+        "error": "protocol",
+        "cleanup": "quiescent",
+        "cleanup_settles": null,
+        "stop_facts": null,
+        "instance": {
+          "vendor_version": "2.1.285",
+          "version_status": "tested"
+        },
+        "exit": {
+          "code": 0,
+          "signal": null
+        },
+        "journal_uncertain": false,
+        "group_absent": true,
+        "warnings": [
+          "config_switch_unverified"
+        ],
+        "observations_include": [
+          {
+            "kind": "session.vendor_identity_confirmed",
+            "generation": 1
+          }
+        ],
+        "observations_exclude": [
+          "turn.accepted"
+        ],
+        "observation_counts": {
+          "turn.accepted": 0
+        },
+        "observations_order": [],
+        "unasserted": [],
+        "notes": "Packet \u00a73: an init without interrupt_receipt_v1 fails the handshake: protocol, the prompt is never resent, and the driver latches failed. The adapter stops the vendor with the AD19 sequence, as at a mismatched init (c1b_resume_mismatch): the interrupt, the result, then stdin EOF. The refusal is cached for this recipe only (the test's plan check)."
+      }
+    }
+  ]
+}
