@@ -248,6 +248,7 @@ fn store_failure() -> Terminal {
         exit: None,
         warnings: Vec::new(),
         cancel: None,
+        quiescent: false,
     }
 }
 

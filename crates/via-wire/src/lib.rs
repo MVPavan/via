@@ -41,16 +41,38 @@ impl BoundedBytes {
 /// let bytes = BoundedBytes::try_from_message(b"ok\n".to_vec()).unwrap();
 /// let _invalid = VendorMessage { bytes };
 /// ```
-#[derive(Eq, PartialEq)]
 pub struct VendorMessage {
     /// Exact bytes delivered to Route.
     bytes: BoundedBytes,
+    /// Its share of the connection's staging, held until the message is
+    /// dropped (x.3.2 X0 item 12.5); none for a message not read by Wire.
+    _permit: Option<connection::StagingPermit>,
 }
+
+impl PartialEq for VendorMessage {
+    /// Equal bytes; the staging share is not part of the message.
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+
+impl Eq for VendorMessage {}
 
 impl VendorMessage {
     /// Wraps one complete bounded message.
     pub fn new(bytes: BoundedBytes) -> Self {
-        Self { bytes }
+        Self {
+            bytes,
+            _permit: None,
+        }
+    }
+
+    /// A message Wire read, holding its staging share.
+    pub(crate) fn staged(bytes: BoundedBytes, permit: connection::StagingPermit) -> Self {
+        Self {
+            bytes,
+            _permit: Some(permit),
+        }
     }
 
     /// Returns the exact message bytes, including the trailing LF.
@@ -99,8 +121,9 @@ mod split;
 // Route needs the narrow connection handles returned by WireRuntime; their
 // constructor and Host process control remain private to Wire.
 pub use connection::{
-    FailureCause, LatchState, OutboundMessage, PendingWrite, UNDECODED_BYTES, WireConnection,
-    WireMessages, WireParts, WireSender,
+    Admitted, DataHold, FailureCause, LatchState, OutboundMessage, PendingWrite, TurnFolder,
+    UNDECODED_BYTES, WireConnection, WireMessages, WireParts, WireSender, WriteBounds, WriteState,
+    WriteTicket,
 };
 #[cfg(feature = "test-failpoints")]
 pub use connection::{fallback_drops, testing};

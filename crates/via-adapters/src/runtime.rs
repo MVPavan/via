@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use crate::{Cleanup, SessionId, TurnNumber};
+use crate::{Cleanup, ProcessOwner, SessionId, TurnNumber};
 use via_routes::WireRecovery;
 
 /// C2 A1: the observation channel holds at most 1,024 items ...
@@ -32,14 +32,14 @@ pub(crate) fn event_stall() -> Duration {
 
 /// Passive recovery facts for Core's later crash reconciliation.
 pub struct AnchorRecovery {
-    /// Owning VIA session.
-    pub session_id: SessionId,
     /// Opaque committed anchor identifier.
     pub anchor_id: String,
     /// Opaque launch generation.
     pub generation: String,
-    /// Owning turn.
-    pub turn: TurnNumber,
+    /// Owner: `Turn { session_id, turn }` or `Server { server_id }`. A
+    /// server anchor's facts reach a turn only through the turn's link
+    /// (runtime §6 `server_turns`), and only as cleanup.
+    pub owner: ProcessOwner,
     /// Cleanup certainty under Host's validated group.
     pub cleanup: Cleanup,
     /// Host stopped the group while its vendor was live (Host force evidence).
@@ -77,10 +77,9 @@ pub(crate) fn cleanup(cleanup: via_routes::WireCleanup) -> Cleanup {
 
 pub(crate) fn normalize_recovery(report: WireRecovery) -> AnchorRecovery {
     AnchorRecovery {
-        session_id: report.owner_session,
         anchor_id: report.anchor_id,
         generation: report.generation,
-        turn: report.owner_turn,
+        owner: report.owner,
         cleanup: cleanup(report.cleanup),
         forced: report.forced,
     }

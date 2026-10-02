@@ -334,6 +334,7 @@ fn adapter_set(harness: &str, binary: &Path, state: &Path) -> Result<(AdapterSet
         RuntimeConfig {
             anchor_binary: state.join("anchor"),
             anchor_dir: state.join("runtime"),
+            vendor_state_dir: state.join("vendor"),
         },
         store.runtime_resources(),
     )

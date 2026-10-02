@@ -255,15 +255,18 @@ fn force_after_arm_abandonment_leaves_the_turn_unknown() {
 /// `barrier`, completes final shutdown and returns the durable envelope and
 /// events.
 fn force_over_stand_in(root: &Path, after_arm: &AfterArm, barrier: &str) -> (Value, Vec<Value>) {
-    force_over_stand_in_within(root, after_arm, barrier, Duration::from_secs(3))
+    force_over_stand_in_within(root, after_arm, barrier, Duration::from_secs(3), false)
 }
 
-/// [`force_over_stand_in`] with final shutdown bounded by `shutdown`.
+/// [`force_over_stand_in`] with final shutdown bounded by `shutdown`; with
+/// `shared`, the session's driver reports a shared connection (test builds'
+/// stand-in, x.3.2 X0 item 6.4).
 fn force_over_stand_in_within(
     root: &Path,
     after_arm: &AfterArm,
     barrier: &str,
     shutdown: Duration,
+    shared: bool,
 ) -> (Value, Vec<Value>) {
     let anchor = root.join("stand-in-anchor");
     after_arm.install(&anchor);
@@ -279,6 +282,12 @@ fn force_over_stand_in_within(
             anchor,
         )
         .unwrap();
+        #[cfg(feature = "test-failpoints")]
+        if shared {
+            engine.stand_in().share();
+        }
+        #[cfg(not(feature = "test-failpoints"))]
+        let _ = shared;
         let params: SpawnParams = serde_json::from_value(json!({
             "harness":"fake","model":"fake","prompt":"hello",
             "handle":format!("h_{}", "A".repeat(43)),
@@ -379,8 +388,41 @@ fn proved_stop_survives_recovery_failure() {
         &after_arm,
         "spawned",
         Duration::from_secs(1),
+        false,
     );
     assert_eq!(envelope["state"], "cancelled", "{envelope}");
     assert_eq!(envelope["cancel"]["outcome"], "forced", "{envelope}");
     assert_eq!(envelope["cancel"]["cleanup"], "quiescent", "{envelope}");
+}
+
+/// x.3.2 X0 item 6.4 (C1 §7.6 force row, shared server): a launched turn
+/// of a driver on a shared connection ends `unknown` under daemon force,
+/// with outcome `unknown`, even when the stop found the vendor live: the
+/// shared route asks for no stop, and nothing proves the turn's work on
+/// the server ended. Cleanup comes from the folded facts.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn shutdown_force_shared_is_unknown() {
+    let Some(root) = env::var_os(CHILD) else {
+        return run_child("shutdown_force_shared_is_unknown");
+    };
+    let after_arm = AfterArm::Serve {
+        stopped_live: true,
+        linger: false,
+    };
+    let (envelope, events) = force_over_stand_in_within(
+        Path::new(&root),
+        &after_arm,
+        "spawned",
+        Duration::from_secs(3),
+        true,
+    );
+    assert_eq!(envelope["state"], "unknown", "{envelope}");
+    assert_eq!(envelope["cancel"]["outcome"], "unknown", "{envelope}");
+    assert_eq!(envelope["cancel"]["cleanup"], "quiescent", "{envelope}");
+    let settled = events
+        .iter()
+        .find(|event| event["type"] == "cancel.settled")
+        .unwrap();
+    assert_eq!(settled["outcome"], "unknown", "{settled}");
 }

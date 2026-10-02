@@ -10,12 +10,13 @@ use super::{
     Prompt, QueuedSummary, QueuedTurn, ReadCorruption, ReceiptRecord, ResumeRecord, RevisableTurn,
     RevisionRecord, SESSION_QUEUE_LIMIT, STATUS_ANCHORS, STATUS_QUEUE, STATUS_TURNS,
     SessionEventRecord, SessionId, SessionRoute, SessionSnapshot, SessionStatus, SessionSummary,
-    SpawnKey, SpawnRecord, StatusQuery, StatusTurn, StepRow, StepsRecord, StoreError, StoredEvent,
-    StoredSpawnKey, SubmissionRecord, SubmitFailedRecord, TerminalCancel, TerminalExtras,
-    TerminalFacts, TerminalRecord, TransactionBehavior, TurnNumber, UnfinishedTurn, Value,
-    check_schema_version, commit_anchor_identified, commit_anchor_intent, commit_arm_intent,
-    commit_group_absence, commit_vendor_facts, count_unproven_anchors, fs, oneshot, params,
-    read_anchor_cohort, read_anchor_owners, read_anchor_records,
+    SpawnKey, SpawnRecord, StatusQuery, StatusTurn, StepRow, StepsRecord, StoreError,
+    StoreFailureKind, StoredEvent, StoredSpawnKey, SubmissionRecord, SubmitFailedRecord,
+    TerminalCancel, TerminalExtras, TerminalFacts, TerminalRecord, TransactionBehavior, TurnNumber,
+    UnfinishedTurn, Value, check_schema_version, commit_anchor_identified, commit_anchor_intent,
+    commit_arm_intent, commit_group_absence, commit_server_turn, commit_vendor_facts,
+    count_unproven_anchors, fs, oneshot, params, read_anchor_cohort, read_anchor_owners,
+    read_anchor_records, read_server_links,
 };
 use crate::{
     blob::{BlobRef, Blobs},
@@ -156,10 +157,11 @@ pub(super) fn validate_regular(path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// Schema v8 (runtime §6; Task 4 design §6.6 plus the session's persisted
-/// `adapter_version` and the instance each turn's `turn.started` recorded),
-/// frozen by `s1_store_v8_schema_is_frozen`.
-const SCHEMA_V8: &str = "CREATE TABLE sessions (
+/// Schema v9 (runtime §6; Task 4 design §6.6 plus the session's persisted
+/// `adapter_version`, the instance each turn's `turn.started` recorded,
+/// server-owned anchors and the turn → server-anchor link), frozen by
+/// `s1_store_v9_schema_is_frozen`.
+const SCHEMA_V9: &str = "CREATE TABLE sessions (
     id TEXT PRIMARY KEY, handle_hash BLOB NOT NULL CHECK(length(handle_hash)=32),
     receipt TEXT NOT NULL, params TEXT NOT NULL, state TEXT NOT NULL,
     next_seq INTEGER NOT NULL CHECK(next_seq>=2),
@@ -211,14 +213,24 @@ const SCHEMA_V8: &str = "CREATE TABLE sessions (
  ) WITHOUT ROWID;
  CREATE TABLE anchors (
     anchor_id TEXT PRIMARY KEY, generation TEXT NOT NULL, marker TEXT NOT NULL,
-    socket_path TEXT NOT NULL, owner_session TEXT NOT NULL, owner_turn INTEGER NOT NULL,
+    socket_path TEXT NOT NULL, owner_session TEXT, owner_turn INTEGER, owner_server TEXT,
     uid INTEGER NOT NULL, boot_id TEXT NOT NULL, pid_namespace TEXT NOT NULL,
     phase TEXT NOT NULL, record_version INTEGER NOT NULL,
     pid INTEGER, pgid INTEGER, start_ticks INTEGER, vendor_pid INTEGER,
     absence_time TEXT,
+    CHECK((owner_session IS NULL) = (owner_turn IS NULL)),
+    CHECK((owner_server IS NULL) <> (owner_session IS NULL)),
     FOREIGN KEY(owner_session,owner_turn) REFERENCES turns(session_id,number));
  CREATE INDEX anchors_unproven ON anchors(anchor_id) WHERE absence_time IS NULL;
- PRAGMA user_version=8;";
+ CREATE UNIQUE INDEX anchors_one_server ON anchors(owner_server) WHERE owner_server IS NOT NULL;
+ CREATE TABLE server_turns (
+    session_id TEXT NOT NULL, turn INTEGER NOT NULL,
+    anchor_id TEXT NOT NULL REFERENCES anchors(anchor_id),
+    PRIMARY KEY(session_id, turn),
+    FOREIGN KEY(session_id, turn) REFERENCES turns(session_id, number)
+ ) WITHOUT ROWID;
+ CREATE INDEX server_turns_anchor ON server_turns(anchor_id);
+ PRAGMA user_version=9;";
 
 /// Configures the sole writable connection; initializes the schema only in
 /// a database this open `created`. The version is checked again before the
@@ -266,7 +278,7 @@ pub(super) fn configure(
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| StoreError::Open(error.to_string()))?;
-        tx.execute_batch(SCHEMA_V8)
+        tx.execute_batch(SCHEMA_V9)
             .map_err(|error| StoreError::Open(error.to_string()))?;
         commit(tx)?;
     }
@@ -364,6 +376,7 @@ impl Command {
                 | Self::AnchorCohort(..)
                 | Self::QueuedTurns(..)
                 | Self::AnchorRecords(..)
+                | Self::ServerLinks(..)
         )
     }
 
@@ -397,6 +410,7 @@ impl Command {
             Self::AnchorCohort(..) => "store.read.corrupt.anchor_cohort",
             Self::QueuedTurns(..) => "store.read.corrupt.queued_turns",
             Self::AnchorRecords(..) => "store.read.corrupt.anchor_records",
+            Self::ServerLinks(..) => "store.read.corrupt.server_links",
             Self::Spawn(..)
             | Self::Resume(..)
             | Self::Submission(..)
@@ -417,6 +431,7 @@ impl Command {
             | Self::ArmIntent(..)
             | Self::VendorFacts(..)
             | Self::GroupAbsence(..)
+            | Self::ServerTurn(..)
             | Self::VerifyBlobs(..)
             | Self::SweepBlobs(..) => return None,
         })
@@ -470,6 +485,7 @@ fn serve_read(conn: &Connection, command: Command, corruption: &ReadCorruption) 
             answer(corruption, $reply, seam.and_then(|()| $read));
         }};
     }
+
     match command {
         Command::SpawnKey(key, reply) => reply!(reply, read_spawn_key(conn, &key)),
         Command::Operation(session, op_key, reply) => {
@@ -527,10 +543,11 @@ fn serve_read(conn: &Connection, command: Command, corruption: &ReadCorruption) 
         }
         Command::AnchorRecords(query, reply) => {
             let records = seam.and_then(|()| read_anchor_records(conn, &query));
-            if matches!(records, Err(StoreError::Corrupt(_))) {
-                corruption.report();
-            }
-            let _ = reply.send(records.map_err(|error| error.kind()));
+            answer_journal(corruption, reply, records);
+        }
+        Command::ServerLinks(turns, reply) => {
+            let links = seam.and_then(|()| read_server_links(conn, &turns));
+            answer_journal(corruption, reply, links);
         }
         // `is_read` returned every other command above.
         command @ (Command::Spawn(..)
@@ -553,10 +570,24 @@ fn serve_read(conn: &Connection, command: Command, corruption: &ReadCorruption) 
         | Command::ArmIntent(..)
         | Command::VendorFacts(..)
         | Command::GroupAbsence(..)
+        | Command::ServerTurn(..)
         | Command::VerifyBlobs(..)
         | Command::SweepBlobs(..)) => return Some(command),
     }
     None
+}
+
+/// Sends a journal read's reply as its failure kind; SQLite corruption
+/// reaches the observer first (design §7.1).
+fn answer_journal<T>(
+    corruption: &ReadCorruption,
+    reply: oneshot::Sender<Result<T, StoreFailureKind>>,
+    result: Result<T, StoreError>,
+) {
+    if matches!(result, Err(StoreError::Corrupt(_))) {
+        corruption.report();
+    }
+    let _ = reply.send(result.map_err(|error| error.kind()));
 }
 
 /// Sends a read reply; SQLite corruption reaches the observer first
@@ -669,6 +700,9 @@ fn serve_mutation(conn: &mut Connection, command: Command) {
             journal!(reply, commit_vendor_facts(conn, &id, &generation, pid));
         }
         Command::GroupAbsence(proof, reply) => journal!(reply, commit_group_absence(conn, &proof)),
+        Command::ServerTurn(anchor_id, session, turn, reply) => {
+            journal!(reply, commit_server_turn(conn, &anchor_id, &session, turn));
+        }
         // `writer_loop` serves reads first and `serve_write` the blob checks.
         Command::SpawnKey(..)
         | Command::Operation(..)
@@ -695,6 +729,7 @@ fn serve_mutation(conn: &mut Connection, command: Command) {
         | Command::AnchorCohort(..)
         | Command::QueuedTurns(..)
         | Command::AnchorRecords(..)
+        | Command::ServerLinks(..)
         | Command::VerifyBlobs(..)
         | Command::SweepBlobs(..) => {}
     }
@@ -1671,6 +1706,16 @@ fn insert_terminal(
     }
     insert_event(tx, &record.session_id, &record.event)?;
     insert_steps(tx, &record.session_id, record.turn, &record.steps)?;
+    // Runtime §6 `server_turns`: a turn whose cleanup is known quiescent
+    // releases its link with its terminal; otherwise the link stays, read
+    // by the close and status cleanup predicate.
+    if record.link_released {
+        tx.execute(
+            "DELETE FROM server_turns WHERE session_id=?1 AND turn=?2",
+            params![record.session_id.as_str(), record.turn.get()],
+        )
+        .map_err(sql_error)?;
+    }
     // `session.closed` only when no other turn of the session is queued or
     // running (this turn is already terminal); otherwise the terminal commits
     // alone and the close is reported as not written.
@@ -1876,8 +1921,8 @@ fn commit_closed(
 
 /// C1 §3.6 close result from durable rows only [r1.6, r1.8]: the turns a
 /// close cancelled, in turn order (state `cancelled` with cause `close`:
-/// a close-stopped `unknown` turn counts once revised to `cancelled`), and `quiescent` cleanup only when every
-/// group of the session's turns has an absence proof.
+/// a close-stopped `unknown` turn counts once revised to `cancelled`), and
+/// `quiescent` cleanup only when [`session_cleanup_uncertain`] is false.
 fn derive_close_result(conn: &Connection, session: &SessionId) -> Result<Value, StoreError> {
     let mut query = conn
         .prepare_cached(
@@ -1893,13 +1938,7 @@ fn derive_close_result(conn: &Connection, session: &SessionId) -> Result<Value, 
                 .map_err(sql_error)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let unproven: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM anchors WHERE owner_session=?1 AND absence_time IS NULL)",
-            [session.as_str()],
-            |row| row.get(0),
-        )
-        .map_err(sql_error)?;
+    let unproven = session_cleanup_uncertain(conn, session.as_str())?;
     Ok(serde_json::json!({
         "session_id": session.as_str(),
         "state": "closed",
@@ -2179,7 +2218,9 @@ fn read_revisable(
 fn read_unfinished(conn: &Connection) -> Result<Vec<UnfinishedTurn>, StoreError> {
     let mut statement = conn
         .prepare_cached(
-            "SELECT session_id,number,submitted_at,correlation,effective,vendor_version,version_status FROM turns WHERE state='running' ORDER BY session_id,number LIMIT 1000",
+            "SELECT t.session_id,t.number,t.submitted_at,t.correlation,t.effective,t.vendor_version,t.version_status,l.anchor_id
+             FROM turns t LEFT JOIN server_turns l ON l.session_id=t.session_id AND l.turn=t.number
+             WHERE t.state='running' ORDER BY t.session_id,t.number LIMIT 1000",
         )
         .map_err(sql_error)?;
     let rows = statement
@@ -2192,12 +2233,13 @@ fn read_unfinished(conn: &Connection) -> Result<Vec<UnfinishedTurn>, StoreError>
                 row.get::<_, String>(4)?,
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
             ))
         })
         .map_err(sql_error)?;
     let mut turns = Vec::new();
     for row in rows {
-        let (session, number, submitted_at, correlation, effective, vendor_version, status) =
+        let (session, number, submitted_at, correlation, effective, vendor_version, status, link) =
             row.map_err(sql_error)?;
         // The acceptance records a status with every instance it records.
         let instance = match status.as_deref() {
@@ -2219,6 +2261,7 @@ fn read_unfinished(conn: &Connection) -> Result<Vec<UnfinishedTurn>, StoreError>
             // decodes, never absence.
             effective,
             instance,
+            server_anchor: link,
         });
     }
     Ok(turns)
@@ -2627,11 +2670,29 @@ fn read_session_status(
     }))
 }
 
-/// The newest [`STATUS_ANCHORS`] anchors of the session with no absence
-/// proof (§11.3 `process`).
+/// The close and status cleanup predicate (runtime §6 `server_turns`):
+/// some anchor the session owns has no absence proof, or a remaining link
+/// of one of its turns names an anchor with none. It never reads another
+/// session's turns.
+fn session_cleanup_uncertain(conn: &Connection, session: &str) -> Result<bool, StoreError> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM anchors WHERE owner_session=?1 AND absence_time IS NULL)
+             OR EXISTS(SELECT 1 FROM server_turns l JOIN anchors a ON a.anchor_id=l.anchor_id
+                       WHERE l.session_id=?1 AND a.absence_time IS NULL)",
+        [session],
+        |row| row.get(0),
+    )
+    .map_err(sql_error)
+}
+
+/// The newest [`STATUS_ANCHORS`] anchors with no absence proof that the
+/// session owns or that a remaining link of its turns names (§11.3
+/// `process`, runtime §6 `server_turns`); non-empty exactly when
+/// [`session_cleanup_uncertain`] holds.
 fn read_unproven_anchors(conn: &Connection, session: &str) -> Result<Vec<String>, StoreError> {
     conn.prepare_cached(
-        "SELECT anchor_id FROM anchors WHERE owner_session=?1 AND absence_time IS NULL
+        "SELECT anchor_id FROM anchors WHERE absence_time IS NULL AND (owner_session=?1
+             OR anchor_id IN (SELECT anchor_id FROM server_turns WHERE session_id=?1))
              ORDER BY rowid DESC LIMIT ?2",
     )
     .and_then(|mut statement| {

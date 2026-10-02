@@ -52,6 +52,34 @@ fn ensure_dir(path: &Path) -> anyhow::Result<()> {
     validate_dir(path)
 }
 
+/// Creates or validates `<state>/vendor/`, adapter-private vendor state
+/// (runtime §6.1; x.3.2 X0 item 4): created 0700 when absent; one that
+/// exists must be a directory, not a symlink, of the daemon's user, mode
+/// 0700. It is never chmod-ed. It names no harness: each adapter creates
+/// its own `vendor/<harness>/` the same way. Anything else refuses daemon
+/// start with the named error.
+fn ensure_vendor_dir(state: &Path) -> anyhow::Result<()> {
+    let path = state.join("vendor");
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .with_context(|| {
+                    format!("create the VIA vendor state directory {}", path.display())
+                })?;
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("read the VIA vendor state directory {}", path.display())
+            });
+        }
+    }
+    validate_dir(&path)
+        .map_err(|_| anyhow::anyhow!("unsafe VIA vendor state directory: {}", path.display()))
+}
+
 /// Longest state directory path, JSON-encoded with its quotes (runtime
 /// §6.1): it bounds every evidence path an envelope names (C1 §5).
 const STATE_PATH_MAX: usize = 1024;
@@ -165,6 +193,7 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
     log::open(&paths.state).map_err(|error| anyhow::anyhow!("open via.log: {error}"))?;
     // Both locks precede every mutation of the State directory (§6.1).
     ensure_dir(&paths.runtime.join("anchors"))?;
+    ensure_vendor_dir(&paths.state)?;
     let socket = paths.runtime.join("via.sock");
     if socket.exists() {
         let metadata = fs::symlink_metadata(&socket)?;
@@ -436,5 +465,55 @@ mod tests {
         // 200 bytes, each control character encoded as `\u0001`.
         let escaped = PathBuf::from(format!("/{}", "\u{1}".repeat(199)));
         assert!(super::check_state_path(&escaped).is_err());
+    }
+
+    /// x.3.2 X0 item 4 (runtime §6.1): bootstrap creates `<state>/vendor/`
+    /// 0700, and accepts it as it is on the next start.
+    #[test]
+    fn bootstrap_creates_vendor_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let state = tempfile::tempdir().unwrap();
+        super::ensure_vendor_dir(state.path()).unwrap();
+        let vendor = std::fs::symlink_metadata(state.path().join("vendor")).unwrap();
+        assert!(vendor.is_dir());
+        assert_eq!(vendor.permissions().mode() & 0o777, 0o700);
+        super::ensure_vendor_dir(state.path()).unwrap();
+    }
+
+    /// x.3.2 X0 item 4: a symlinked `vendor/`, or one of another mode,
+    /// refuses daemon start with the named error; it is never chmod-ed.
+    #[test]
+    fn bootstrap_refuses_symlinked_vendor() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let state = tempfile::tempdir().unwrap();
+        let target = state.path().join("elsewhere");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&target)
+            .unwrap();
+        std::os::unix::fs::symlink(&target, state.path().join("vendor")).unwrap();
+        let refused = super::ensure_vendor_dir(state.path()).unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("unsafe VIA vendor state directory"),
+            "{refused}"
+        );
+        let open = tempfile::tempdir().unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o755)
+            .create(open.path().join("vendor"))
+            .unwrap();
+        std::fs::set_permissions(
+            open.path().join("vendor"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        assert!(super::ensure_vendor_dir(open.path()).is_err());
+        let mode = std::fs::metadata(open.path().join("vendor"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755, "never chmod-ed");
     }
 }

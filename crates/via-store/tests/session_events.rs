@@ -140,6 +140,7 @@ fn session_events_commit_outside_a_running_turn_until_the_session_closes() {
                     envelope: json!({"state":"cancelled"}),
                     event: event("turn.ended", 4, Some(1), false),
                     steps: Vec::new(),
+                    link_released: false,
                 },
                 TerminalExtras {
                     cancel_cause: Some(CancelCause::Close),
@@ -260,6 +261,7 @@ fn a_repeated_confirmation_writes_the_columns_without_an_event() {
                     envelope: json!({"state":"cancelled"}),
                     event: event("turn.ended", 3, Some(1), false),
                     steps: Vec::new(),
+                    link_released: false,
                 },
                 TerminalExtras {
                     cancel_cause: Some(CancelCause::Close),

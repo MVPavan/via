@@ -23,9 +23,10 @@ use std::{
 
 use via_host::{
     CleanupEvidence, CloseMode, CloseRequest, Deadline, EnvAllowList, Host, HostError, JournalSite,
-    LaunchPipes, PrivateProcessSpec, ProcessOwner, SessionId, TurnNumber, run_anchor_from_args,
+    LaunchPipes, PrivateProcessSpec, ProcessOwner, ServerId, SessionId, TurnNumber,
+    run_anchor_from_args,
 };
-use via_store::{AnchorPhase, SpawnRecord, Store, failpoint};
+use via_store::{AnchorPhase, SpawnRecord, Store, SubmissionRecord, TerminalRecord, failpoint};
 
 const TOKEN: &str = "s1-host-failpoint-token-01";
 
@@ -122,7 +123,7 @@ impl Fixture {
             args: args.iter().map(OsString::from).collect(),
             cwd: self.root.clone(),
             env: EnvAllowList::default(),
-            owner: ProcessOwner {
+            owner: ProcessOwner::Turn {
                 session_id: session(),
                 turn: TurnNumber::try_from(1).unwrap(),
             },
@@ -608,7 +609,10 @@ fn a_session_filtered_reprobe_counts_only_that_sessions_groups() {
         fixture.arm("host.anchor.before_eof_cleanup", "pause");
         for owner in [session(), session(), other_session()] {
             let mut spec = fixture.spec("/bin/cat", &[]);
-            spec.owner.session_id = owner;
+            spec.owner = ProcessOwner::Turn {
+                session_id: owner,
+                turn: TurnNumber::try_from(1).unwrap(),
+            };
             spec.capacity = Some(Box::new(Token(Arc::new(AtomicBool::new(false)))));
             let failure = host
                 .acquire_retaining(spec, within(4), &LaunchPipes::default(), &never())
@@ -1672,4 +1676,436 @@ fn a_retired_control_is_shut_down_and_the_anchor_cleans_up_on_eof() {
 fn next_stderr() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// x.3.2 X0 item 1: a shared server's spec. Its owner is no turn.
+fn server_spec(fixture: &Fixture) -> PrivateProcessSpec {
+    let mut spec = fixture.spec("/bin/cat", &[]);
+    spec.owner = ProcessOwner::Server {
+        server_id: ServerId::try_from("v_0123456789ab").unwrap(),
+    };
+    spec
+}
+
+fn turn(number: u32) -> TurnNumber {
+    TurnNumber::try_from(number).unwrap()
+}
+
+impl Fixture {
+    fn journal(&self) -> via_store::ProcessJournal {
+        self.store.runtime_resources().into_wire_parts().1
+    }
+
+    /// Submits the fixture session's turn 1, so it is `running`.
+    async fn run_turn_one(&self, session_id: SessionId) {
+        self.store
+            .client()
+            .commit_submission(SubmissionRecord {
+                session_id,
+                turn: turn(1),
+                event: serde_json::json!({"seq":2,"turn":1,"type":"turn.submitted","at":"2026-01-01T00:00:00.000Z"}),
+            })
+            .await
+            .unwrap();
+    }
+
+    /// The links of `session`'s turn 1, as anchor ids.
+    async fn links(&self, session_id: SessionId) -> Vec<String> {
+        self.journal()
+            .server_links(vec![(session_id, turn(1))])
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|link| link.anchor_id)
+            .collect()
+    }
+}
+
+/// x.3.2 X0 item 1 (runtime §5 AR6): a shared server's group has no turn
+/// owner and outlives the turns linked to it. The turn's link commits once,
+/// before its first byte, and goes with the turn's quiescent terminal; the
+/// server stays live, and its own close still proves it absent.
+#[test]
+fn host_server_owner_outlives_turns() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        fixture.run_turn_one(session()).await;
+        let acquired = host.acquire(server_spec(&fixture), within(4)).await.unwrap();
+        let records = fixture.records().await;
+        assert_eq!(records.len(), 1);
+        assert!(matches!(
+            records[0].intent.owner,
+            ProcessOwner::Server { .. }
+        ));
+        let anchor_id = records[0].intent.anchor_id.clone();
+        acquired
+            .control
+            .link_turn(&session(), turn(1), within(2))
+            .await
+            .unwrap();
+        assert_eq!(fixture.links(session()).await, vec![anchor_id.clone()]);
+        // A second link for the same turn is refused, nothing written.
+        let again = acquired
+            .control
+            .link_turn(&session(), turn(1), within(2))
+            .await;
+        assert!(
+            matches!(
+                again,
+                Err(HostError::Journal {
+                    site: JournalSite::Link,
+                    uncertain: false
+                })
+            ),
+            "{again:?}"
+        );
+        fixture
+            .store
+            .client()
+            .commit_terminal(TerminalRecord {
+                session_id: session(),
+                turn: turn(1),
+                envelope: serde_json::json!({"state":"failed"}),
+                event: serde_json::json!({"seq":3,"turn":1,"type":"turn.ended","at":"2026-01-01T00:00:00.000Z"}),
+                steps: Vec::new(),
+                link_released: true,
+            })
+            .await
+            .unwrap();
+        assert!(fixture.links(session()).await.is_empty());
+        // The turn ended; its server did not.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(host.live_armed(std::slice::from_ref(&anchor_id)));
+        assert!(acquired.exits.borrow().is_none());
+        assert!(!group_gone(acquired.control.identity().pgid));
+        let close = acquired
+            .control
+            .close(CloseRequest {
+                mode: CloseMode::Force,
+                deadline: within(3),
+            })
+            .await;
+        assert!(
+            matches!(close.cleanup, CleanupEvidence::GroupAbsent(_)),
+            "{close:?}"
+        );
+    });
+}
+
+/// x.3.2 X0 item 1: only a shared server's control links turns.
+#[test]
+fn link_turn_on_turn_owner_is_invalid() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        fixture.run_turn_one(session()).await;
+        let acquired = host
+            .acquire(fixture.spec("/bin/cat", &[]), within(4))
+            .await
+            .unwrap();
+        let linked = acquired
+            .control
+            .link_turn(&session(), turn(1), within(2))
+            .await;
+        assert!(matches!(linked, Err(HostError::Invalid(_))), "{linked:?}");
+        assert!(fixture.links(session()).await.is_empty());
+        acquired
+            .control
+            .close(CloseRequest {
+                mode: CloseMode::Force,
+                deadline: within(3),
+            })
+            .await;
+    });
+}
+
+/// x.3.2 X0 item 2.4: a live, idle shared server is not pending cleanup, so
+/// it never blocks daemon idle exit (runtime §5 AR6); a turn's live group
+/// still is. Final shutdown stops both.
+#[test]
+fn daemon_idle_exit_not_blocked_by_idle_server() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        let server = host
+            .acquire(server_spec(&fixture), within(4))
+            .await
+            .unwrap();
+        assert_eq!(host.pending_cleanup(), 0);
+        let private = host
+            .acquire(fixture.spec("/bin/cat", &[]), within(4))
+            .await
+            .unwrap();
+        assert_eq!(host.pending_cleanup(), 1);
+        let pgids = [
+            server.control.identity().pgid,
+            private.control.identity().pgid,
+        ];
+        let report = host.shutdown(within(5), &[]).await;
+        assert!(report.failure.is_none(), "{report:?}");
+        assert_eq!((report.anchors, report.uncertain_anchors), (2, 0));
+        assert!(pgids.into_iter().all(group_gone));
+    });
+}
+
+/// x.3.2 X0 item 2.6: Host's sticky journal-uncertain watch is set where
+/// Host observes an uncertain outcome, whatever the owner: a server link,
+/// then (on a fresh Host) a turn's absence proof.
+#[test]
+fn host_journal_uncertain_watch() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        let watch = host.journal_uncertain();
+        fixture.run_turn_one(session()).await;
+        let server = host
+            .acquire(server_spec(&fixture), within(4))
+            .await
+            .unwrap();
+        assert!(!*watch.borrow());
+        fixture.arm("store.journal.server_turn", "fail_io");
+        fixture.arm("store.rollback.fail", "fail_io");
+        let linked = server
+            .control
+            .link_turn(&session(), turn(1), within(2))
+            .await;
+        assert!(
+            matches!(
+                linked,
+                Err(HostError::Journal {
+                    site: JournalSite::Link,
+                    uncertain: true
+                })
+            ),
+            "{linked:?}"
+        );
+        assert!(*watch.borrow(), "an uncertain link did not set the watch");
+        let _ = host.shutdown(within(5), &[]).await;
+
+        let host = fixture.host();
+        let watch = host.journal_uncertain();
+        let private = host
+            .acquire(fixture.spec("/bin/cat", &[]), within(4))
+            .await
+            .unwrap();
+        // From here every absence commit fails and its rollback too.
+        fixture.arm_with("store.journal.absence", "fail_io", true);
+        fixture.arm_with("store.rollback.fail", "fail_io", true);
+        let close = private
+            .control
+            .close(CloseRequest {
+                mode: CloseMode::Force,
+                deadline: within(3),
+            })
+            .await;
+        assert!(close.journal_uncertain, "{close:?}");
+        assert!(
+            *watch.borrow(),
+            "an uncertain absence did not set the watch"
+        );
+    });
+}
+
+/// x.3.2 X0 item 2.6 (X2 r1 #4): observation does not depend on the
+/// requester staying alive. A link whose future is dropped once its write
+/// is enqueued leaves an outcome no one observes, which may be a commit:
+/// Host's sticky watch is set.
+#[test]
+fn dropped_link_sets_journal_uncertain() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        let watch = host.journal_uncertain();
+        fixture.run_turn_one(session()).await;
+        let server = host
+            .acquire(server_spec(&fixture), within(4))
+            .await
+            .unwrap();
+        fixture.arm("store.journal.server_turn", "pause");
+        let linked = session();
+        let link = server.control.link_turn(&linked, turn(1), within(10));
+        let dropped = tokio::time::timeout(Duration::from_millis(500), link).await;
+        assert!(dropped.is_err(), "the link was not held: {dropped:?}");
+        assert!(fixture.acked("store.journal.server_turn"));
+        fixture.release("store.journal.server_turn");
+        assert!(
+            eventually(Duration::from_secs(2), || *watch.borrow()).await,
+            "a dropped link's write did not set the watch"
+        );
+        let _ = host.shutdown(within(5), &[]).await;
+    });
+}
+
+/// x.3.2 X0 item 2.6 (X2 r1 #4): an acquisition whose deadline cuts an
+/// outstanding journal write leaves its outcome unobserved, and it may be
+/// a commit: Host's sticky watch is set.
+#[test]
+fn acquisition_cut_during_a_write_sets_journal_uncertain() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        let watch = host.journal_uncertain();
+        fixture.arm("store.journal.anchor_intent", "pause");
+        let acquired = host
+            .acquire(
+                fixture.spec("/bin/cat", &[]),
+                Deadline::at(tokio::time::Instant::now() + Duration::from_millis(500)),
+            )
+            .await;
+        assert!(
+            matches!(acquired, Err(HostError::Deadline)),
+            "{:?}",
+            acquired.err()
+        );
+        assert!(fixture.acked("store.journal.anchor_intent"));
+        fixture.release("store.journal.anchor_intent");
+        assert!(
+            eventually(Duration::from_secs(2), || *watch.borrow()).await,
+            "an acquisition cut during its write did not set the watch"
+        );
+        let _ = host.shutdown(within(5), &[]).await;
+    });
+}
+
+/// x.3.2 X0 item 13.1 (runtime §5 stop reply): the close reports the
+/// anchor's own reply to its `Stop`: `Some(true)` for a live vendor,
+/// `Some(false)` once the vendor had exited, `None` when the reply is lost
+/// or the deadline passed.
+#[test]
+fn close_reports_stop_reply() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        let force = |deadline| CloseRequest {
+            mode: CloseMode::Force,
+            deadline,
+        };
+        let live = host
+            .acquire(fixture.spec("/bin/cat", &[]), within(4))
+            .await
+            .unwrap();
+        let close = live.control.close(force(within(3))).await;
+        assert_eq!(close.stopped_live, Some(true), "{close:?}");
+
+        let exited = host
+            .acquire(fixture.spec("/bin/true", &[]), within(4))
+            .await
+            .unwrap();
+        let mut exits = exited.exits.clone();
+        exits.wait_for(Option::is_some).await.map(|_| ()).unwrap();
+        let close = exited.control.close(force(within(3))).await;
+        assert_eq!(close.stopped_live, Some(false), "{close:?}");
+
+        fixture.arm("host.anchor.final_reply_lost", "fail_io");
+        let lost = host
+            .acquire(fixture.spec("/bin/cat", &[]), within(4))
+            .await
+            .unwrap();
+        let close = lost.control.close(force(within(3))).await;
+        assert!(fixture.acked("host.anchor.final_reply_lost"));
+        assert_eq!(close.stopped_live, None, "{close:?}");
+        fixture.disarm("host.anchor.final_reply_lost");
+
+        // The anchor holds the `Stop` past the close's deadline.
+        fixture.arm("host.anchor.stop_received", "pause");
+        let late = host
+            .acquire(fixture.spec("/bin/cat", &[]), within(4))
+            .await
+            .unwrap();
+        let close = late
+            .control
+            .close(force(Deadline::at(
+                tokio::time::Instant::now() + Duration::from_millis(500),
+            )))
+            .await;
+        assert!(fixture.acked("host.anchor.stop_received"));
+        assert_eq!(close.stopped_live, None, "{close:?}");
+        fixture.release("host.anchor.stop_received");
+        let _ = host.shutdown(within(5), &[]).await;
+    });
+}
+
+/// x.3.2 X0 item 6.3: final shutdown closes every group first, then folds a
+/// server anchor's cleanup, never its `forced`, into each requested turn
+/// linked to it.
+#[test]
+fn shutdown_folds_server_cleanup_into_linked_turns() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        fixture.run_turn_one(session()).await;
+        let server = host
+            .acquire(server_spec(&fixture), within(4))
+            .await
+            .unwrap();
+        server
+            .control
+            .link_turn(&session(), turn(1), within(2))
+            .await
+            .unwrap();
+        let report = host.shutdown(within(5), &[(session(), turn(1))]).await;
+        assert!(report.failure.is_none(), "{report:?}");
+        let [recovery] = report.recovery.as_slice() else {
+            panic!("{report:?}");
+        };
+        assert_eq!(
+            (&recovery.owner_session, recovery.owner_turn),
+            (&session(), turn(1))
+        );
+        assert!(
+            matches!(recovery.cleanup, CleanupEvidence::GroupAbsent(_)),
+            "{report:?}"
+        );
+        assert!(!recovery.forced, "a server's forced reached a turn");
+        assert!(group_gone(server.control.identity().pgid));
+    });
+}
+
+/// x.3.2 X0 item 6.3: a link read that fails never delays stopping groups.
+/// It is reported; a requested turn with its own anchor keeps its facts,
+/// and a linked turn gets none (Core's default for a failed report).
+#[test]
+fn shutdown_link_read_failure_still_stops_groups() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        fixture.spawn_session(other_session()).await;
+        let host = fixture.host();
+        fixture.run_turn_one(session()).await;
+        let server = host
+            .acquire(server_spec(&fixture), within(4))
+            .await
+            .unwrap();
+        server
+            .control
+            .link_turn(&session(), turn(1), within(2))
+            .await
+            .unwrap();
+        let mut spec = fixture.spec("/bin/cat", &[]);
+        spec.owner = ProcessOwner::Turn {
+            session_id: other_session(),
+            turn: turn(1),
+        };
+        let private = host.acquire(spec, within(4)).await.unwrap();
+        fixture.arm("store.read.corrupt.server_links", "fail_io");
+        let report = host
+            .shutdown(
+                within(5),
+                &[(session(), turn(1)), (other_session(), turn(1))],
+            )
+            .await;
+        assert!(fixture.acked("store.read.corrupt.server_links"));
+        assert!(
+            matches!(report.failure, Some(HostError::LinksUnread)),
+            "{report:?}"
+        );
+        assert!(group_gone(server.control.identity().pgid));
+        assert!(group_gone(private.control.identity().pgid));
+        assert_eq!(report.anchors, 2);
+        let [recovery] = report.recovery.as_slice() else {
+            panic!("{report:?}");
+        };
+        assert_eq!(recovery.owner_session, other_session());
+        assert!(matches!(recovery.cleanup, CleanupEvidence::GroupAbsent(_)));
+    });
 }

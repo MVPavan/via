@@ -718,6 +718,7 @@ fn duplicate(record: &TerminalRecord) -> TerminalRecord {
         envelope: record.envelope.clone(),
         event: record.event.clone(),
         steps: record.steps.clone(),
+        link_released: record.link_released,
     }
 }
 

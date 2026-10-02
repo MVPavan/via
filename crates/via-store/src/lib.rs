@@ -17,19 +17,22 @@ impl SessionId {
     }
 }
 
+/// The lowercase Crockford base-32 digits VIA's internal IDs use.
+const CROCKFORD: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
+
+/// Whether `suffix` is exactly 12 lowercase Crockford digits.
+fn crockford12(suffix: &str) -> bool {
+    suffix.len() == 12 && suffix.bytes().all(|byte| CROCKFORD.contains(&byte))
+}
+
 impl TryFrom<&str> for SessionId {
     type Error = &'static str;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
-        const CROCKFORD: &str = "0123456789abcdefghjkmnpqrstvwxyz";
         let Some(suffix) = value.strip_prefix("s_") else {
             return Err("session id must start with s_");
         };
-        if suffix.len() != 12
-            || !suffix
-                .bytes()
-                .all(|byte| CROCKFORD.as_bytes().contains(&byte))
-        {
+        if !crockford12(suffix) {
             return Err("session id must contain 12 lowercase Crockford digits");
         }
         Ok(Self(value.to_owned()))
@@ -47,6 +50,78 @@ impl fmt::Display for SessionId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
     }
+}
+
+/// An internal shared-server identifier (runtime §5 AR6): `v_` and 12
+/// lowercase Crockford digits. It names the server's evidence folder and
+/// its anchor's owner; no C1 field carries it. It never collides with a
+/// session folder, whose IDs start `s_`.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ServerId(String);
+
+impl ServerId {
+    /// Mints a fresh ID from 60 bits of `/dev/urandom`, as session IDs are
+    /// made.
+    pub fn mint() -> std::io::Result<Self> {
+        use std::io::Read as _;
+        let mut random = [0_u8; 8];
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
+        let mut bits = u64::from_le_bytes(random);
+        let mut id = String::with_capacity(14);
+        id.push_str("v_");
+        for _ in 0..12 {
+            id.push(char::from(
+                CROCKFORD[usize::try_from(bits & 31).unwrap_or(0)],
+            ));
+            bits >>= 5;
+        }
+        Ok(Self(id))
+    }
+
+    /// Returns the canonical representation.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<&str> for ServerId {
+    type Error = &'static str;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        let Some(suffix) = value.strip_prefix("v_") else {
+            return Err("server id must start with v_");
+        };
+        if !crockford12(suffix) {
+            return Err("server id must contain 12 lowercase Crockford digits");
+        }
+        Ok(Self(value.to_owned()))
+    }
+}
+
+impl fmt::Display for ServerId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// The durable owner of a VIA-owned private process group (runtime §5
+/// AR6): one turn of a per-turn route, or one shared server, which no turn
+/// owns; a server-route turn reaches its server's anchor only through its
+/// link (runtime §6 `server_turns`).
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum ProcessOwner {
+    /// The turn that owns a per-turn process.
+    Turn {
+        /// VIA session that admitted the turn.
+        session_id: SessionId,
+        /// One-based turn number.
+        turn: TurnNumber,
+    },
+    /// A shared server.
+    Server {
+        /// The server's internal ID.
+        server_id: ServerId,
+    },
 }
 
 /// One-based turn number within a session.
@@ -169,10 +244,10 @@ pub use runtime::{
     GroupAbsenceRecord, InstanceRecord, KeyedOperation, ListPage, ListQuery, OperationRecord,
     OperationVerb, PAGE_BYTES, PAGE_MAX, Predecessors, ProcessJournal, Prompt, QueuedSummary,
     QueuedTurn, ReceiptRecord, ResumeRecord, RevisableTurn, RevisionRecord, RuntimeResources,
-    SESSION_QUEUE_LIMIT, STATUS_ANCHORS, STATUS_QUEUE, STATUS_STEPS, STATUS_TURNS,
-    SessionEventRecord, SessionIdentity, SessionRoute, SessionSnapshot, SessionStatus,
-    SessionSummary, SpawnKey, SpawnRecord, StatusTurn, StepRow, StepsRecord, Store, StoreClient,
-    StoreError, StoreLock, StoredEvent, StoredSpawnKey, SubmissionRecord, SubmitFailedRecord,
-    TerminalCancel, TerminalExtras, TerminalFacts, TerminalRecord, UnfinishedTurn, WalLimits,
-    at_ms,
+    SERVER_LINKS_LIMIT, SESSION_QUEUE_LIMIT, STATUS_ANCHORS, STATUS_QUEUE, STATUS_STEPS,
+    STATUS_TURNS, ServerLink, SessionEventRecord, SessionIdentity, SessionRoute, SessionSnapshot,
+    SessionStatus, SessionSummary, SpawnKey, SpawnRecord, StatusTurn, StepRow, StepsRecord, Store,
+    StoreClient, StoreError, StoreLock, StoredEvent, StoredSpawnKey, SubmissionRecord,
+    SubmitFailedRecord, TerminalCancel, TerminalExtras, TerminalFacts, TerminalRecord,
+    UnfinishedTurn, WalLimits, at_ms,
 };

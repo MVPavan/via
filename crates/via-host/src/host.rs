@@ -33,7 +33,7 @@ use via_store::{
 
 use crate::{
     CleanupEvidence, CleanupReason, CloseMode, CloseRequest, Deadline, ExitReport,
-    PrivateProcessSpec, ProcessIdentity, linux,
+    PrivateProcessSpec, ProcessIdentity, ProcessOwner, linux,
     protocol::{self, Bootstrap, Reply, Request, VendorConfig},
 };
 
@@ -55,7 +55,14 @@ pub struct Host {
     capacity: Capacity,
     /// Retires the early-stop task at shutdown when force never came.
     retire: watch::Sender<bool>,
+    /// Sticky: set once any Host journal outcome is uncertain (design item
+    /// 2.6), see [`Host::journal_uncertain`].
+    uncertain: watch::Sender<bool>,
 }
+
+/// Bound on the turn → server-anchor link read at final shutdown, inside
+/// its own deadline (design item 6.3).
+const LINK_READ: Duration = Duration::from_secs(1);
 
 /// Host's ledger (design §8): capacity tokens by anchor id, one per group
 /// that may still live, each dropped exactly once, when Host proves that
@@ -103,6 +110,9 @@ struct LiveControl {
     /// The group's exit watch, from `Armed` on: [`Host::live_armed`] reads
     /// it (Task 4 design §11.3).
     exit: Option<watch::Receiver<Option<ExitReport>>>,
+    /// A shared server's group (runtime §5 AR6): its live control is not
+    /// [`Host::pending_cleanup`], so an idle server never blocks idle exit.
+    server: bool,
 }
 
 /// Where a verified control's launch is (design §6.8 [r6.1]). Only an
@@ -126,7 +136,7 @@ impl Ledger {
     fn hold(
         &mut self,
         anchor_id: String,
-        owner: crate::SessionId,
+        owner: ProcessOwner,
         token: crate::CapacityToken,
     ) -> Option<Held> {
         // A group an acquisition still owns is not a holding yet: its
@@ -185,9 +195,10 @@ struct Held {
     /// Owned for its drop, which releases the capacity.
     _token: crate::CapacityToken,
     identity: Option<(ProcessIdentity, String)>,
-    /// The session that owns the group, for a session-filtered re-probe's
-    /// count [T3-S2 r2.5].
-    owner: crate::SessionId,
+    /// The group's owner: a session-filtered re-probe counts and probes
+    /// only `Turn` owners of that session [T3-S2 r2.5], never a shared
+    /// server (design item 6.1).
+    owner: ProcessOwner,
 }
 
 impl Capacity {
@@ -197,7 +208,7 @@ impl Capacity {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn hold(&self, anchor_id: String, owner: crate::SessionId, token: crate::CapacityToken) {
+    fn hold(&self, anchor_id: String, owner: ProcessOwner, token: crate::CapacityToken) {
         let replaced = self.lock().hold(anchor_id, owner, token);
         drop(replaced);
     }
@@ -393,6 +404,7 @@ impl TrackedTask {
 #[derive(Clone)]
 struct TrackedControl {
     stream: Weak<Mutex<ControlConnection>>,
+    owner: ProcessOwner,
     identity: ProcessIdentity,
     anchor_id: String,
     generation: String,
@@ -422,6 +434,9 @@ pub enum JournalSite {
     VendorFacts,
     /// Group absence proof (row 12).
     Absence,
+    /// A turn's link to the shared server anchor it runs on, before the
+    /// turn's first vendor byte (design item 1).
+    Link,
 }
 
 /// Host launch, durable journal or private-control failure.
@@ -452,6 +467,10 @@ pub enum HostError {
     Evidence(io::Error),
     /// The caller's stop signal was set at the pre-ARM gate: nothing launched.
     Stopped,
+    /// Final shutdown could not read the turn → server-anchor links within
+    /// its bound (design item 6.3): the requested turns without their own
+    /// anchor records stay uncertain. Groups were still stopped.
+    LinksUnread,
 }
 
 impl std::fmt::Display for HostError {
@@ -474,6 +493,7 @@ impl std::fmt::Display for HostError {
                     JournalSite::VendorFacts => "vendor facts not durably committed",
                     JournalSite::Absence if *uncertain => "group absence commit outcome uncertain",
                     JournalSite::Absence => "group absence commit failed",
+                    JournalSite::Link => "turn link to its server not durably committed",
                 })?;
                 if *uncertain && *site != JournalSite::Absence {
                     formatter.write_str(" (outcome uncertain)")?;
@@ -482,6 +502,7 @@ impl std::fmt::Display for HostError {
             }
             Self::Deadline => formatter.write_str("Host deadline expired"),
             Self::Stopped => formatter.write_str("stopped before ARM"),
+            Self::LinksUnread => formatter.write_str("turn links to server anchors unread"),
         }
     }
 }
@@ -558,12 +579,13 @@ pub struct ReprobeReport {
     pub held: usize,
     /// Groups proved absent and released by this pass.
     pub proved: usize,
-    /// Owner sessions of proofs observed whose commit was not committed;
-    /// their tokens stay held and the next pass retries (design §7.2 row
-    /// 12). Core records each failure against its session. A pass ends at
+    /// Owners of proofs observed whose commit was not committed; their
+    /// tokens stay held and the next pass retries (design §7.2 row 12).
+    /// Core records a `Turn` owner's failure against its session, and a
+    /// `Server` owner's with daemon scope (design item 6.1). A pass ends at
     /// its first such proof, so this holds at most one owner, and a pass
     /// that returns an error has none: an error never hides a failed proof.
-    pub not_committed: Vec<crate::SessionId>,
+    pub not_committed: Vec<ProcessOwner>,
 }
 
 /// Successfully launched process after durable vendor facts and pipe detachment.
@@ -735,6 +757,7 @@ impl ControlConnection {
 #[derive(Clone)]
 pub struct ProcessControl {
     stream: Arc<Mutex<ControlConnection>>,
+    owner: ProcessOwner,
     identity: ProcessIdentity,
     anchor_id: String,
     generation: String,
@@ -742,6 +765,7 @@ pub struct ProcessControl {
     exit: ExitReceiver,
     stop: Arc<StopFacts>,
     capacity: Capacity,
+    uncertain: watch::Sender<bool>,
 }
 
 /// Process facts and cleanup evidence from a close request.
@@ -757,6 +781,11 @@ pub struct CloseReport {
     /// The absence proof's commit had an uncertain outcome: the daemon must
     /// latch (design §7.2 row 12).
     pub journal_uncertain: bool,
+    /// The verified anchor's `Stopping { stopped_live }` reply to this
+    /// close's own `Stop` (runtime §5 stop reply), or `None` when no valid
+    /// reply arrived in time (lost, invalid, or past the deadline). Passive
+    /// evidence beside `forced`, which it does not change.
+    pub stopped_live: Option<bool>,
 }
 
 /// Recovery result for one committed anchor intent.
@@ -766,10 +795,8 @@ pub struct RecoveryReport {
     pub anchor_id: String,
     /// Immutable launch generation used to correlate the durable proof.
     pub generation: String,
-    /// Owning session for passive Core correlation.
-    pub owner_session: crate::SessionId,
-    /// Owning turn for passive Core correlation.
-    pub owner_turn: crate::TurnNumber,
+    /// Owner, the turn or the shared server, for passive Core correlation.
+    pub owner: ProcessOwner,
     /// Positive absence or explicit uncertainty.
     pub cleanup: CleanupEvidence,
     /// This Host's close stopped the group while its vendor was live, as the
@@ -795,13 +822,32 @@ pub struct TurnRecovery {
     pub forced: bool,
 }
 
-impl TurnRecovery {
-    fn fold(&mut self, report: RecoveryReport) {
-        self.anchors += 1;
-        self.forced |= report.forced;
-        if matches!(self.cleanup, CleanupEvidence::GroupAbsent(_)) {
-            self.cleanup = report.cleanup;
+/// Folds one anchor's facts into the requested turn's aggregate in
+/// `recovery`, adding it on its first anchor.
+fn fold_turn(
+    recovery: &mut Vec<TurnRecovery>,
+    (session, turn): (crate::SessionId, crate::TurnNumber),
+    cleanup: CleanupEvidence,
+    forced: bool,
+) {
+    match recovery
+        .iter_mut()
+        .find(|entry| entry.owner_session == session && entry.owner_turn == turn)
+    {
+        Some(entry) => {
+            entry.anchors += 1;
+            entry.forced |= forced;
+            if matches!(entry.cleanup, CleanupEvidence::GroupAbsent(_)) {
+                entry.cleanup = cleanup;
+            }
         }
+        None => recovery.push(TurnRecovery {
+            owner_session: session,
+            owner_turn: turn,
+            anchors: 1,
+            cleanup,
+            forced,
+        }),
     }
 }
 
@@ -843,6 +889,7 @@ impl Host {
             tasks: Arc::new(StdMutex::new(HostTasks::default())),
             capacity: Capacity::default(),
             retire: watch::Sender::new(false),
+            uncertain: watch::Sender::new(false),
         })
     }
 
@@ -948,22 +995,27 @@ impl Host {
                 let cleanup = state
                     .cleanup_by
                     .unwrap_or_else(|| Deadline::at(Instant::now() + FAILED_ACQUIRE_CLEANUP));
-                let evidence =
-                    match wait_absence(&self.journal, anchor_id, generation, identity, cleanup)
-                        .await
-                    {
-                        Ok(evidence) => evidence,
-                        Err(error) => {
-                            journal_uncertain |= matches!(
-                                error,
-                                HostError::Journal {
-                                    uncertain: true,
-                                    ..
-                                }
-                            );
-                            CleanupEvidence::Uncertain(CleanupReason::EvidenceStoreFailure)
-                        }
-                    };
+                let evidence = match wait_absence(
+                    (&self.journal, &self.uncertain),
+                    anchor_id,
+                    generation,
+                    identity,
+                    cleanup,
+                )
+                .await
+                {
+                    Ok(evidence) => evidence,
+                    Err(error) => {
+                        journal_uncertain |= matches!(
+                            error,
+                            HostError::Journal {
+                                uncertain: true,
+                                ..
+                            }
+                        );
+                        CleanupEvidence::Uncertain(CleanupReason::EvidenceStoreFailure)
+                    }
+                };
                 self.capacity.settle(anchor_id, &evidence);
                 Some(evidence)
             }
@@ -981,16 +1033,39 @@ impl Host {
         }
     }
 
+    /// Awaits `write` where this Host observes it ([`observed`]), then
+    /// [`committed`] with this Host's journal-uncertain watch.
+    async fn commit<T>(
+        &self,
+        write: impl Future<Output = CommitOutcome<T>>,
+        site: JournalSite,
+    ) -> Result<T, HostError> {
+        committed(
+            observed(write, &self.uncertain).await,
+            site,
+            &self.uncertain,
+        )
+    }
+
     /// Holds capacity for a group this Host did not launch, such as one an
     /// earlier daemon left whose absence recovery did not prove, owned by
-    /// session `owner`; a later absence proof for `anchor_id` releases it.
+    /// `owner` (a turn or a shared server); a later absence proof for
+    /// `anchor_id` releases it.
     pub fn hold_capacity(
         &self,
         anchor_id: String,
-        owner: crate::SessionId,
+        owner: ProcessOwner,
         token: crate::CapacityToken,
     ) {
         self.capacity.hold(anchor_id, owner, token);
+    }
+
+    /// Sticky: becomes `true` once any Host journal operation's outcome is
+    /// uncertain, whatever its owner and whether or not a requester still
+    /// waits (design item 2.6; runtime §5 AR6). Core latches Store failure
+    /// on it.
+    pub fn journal_uncertain(&self) -> watch::Receiver<bool> {
+        self.uncertain.subscribe()
     }
 
     /// Advances on every added holding (design §8): Core's re-probe loop
@@ -1013,14 +1088,18 @@ impl Host {
     /// Groups this Host launched whose cleanup is still owned by a live
     /// control or an acquisition in flight: runtime §8 "pending cleanup",
     /// which blocks idle exit (design §6.4). Groups left `uncertain` or held
-    /// for an earlier daemon do not count.
+    /// for an earlier daemon do not count, nor does a live shared server's
+    /// control: an idle server does not block idle exit, and final shutdown
+    /// stops it (runtime §5 AR6).
     pub fn pending_cleanup(&self) -> usize {
         let ledger = self.capacity.lock();
         let live = ledger
             .live
             .iter()
             .filter(|(anchor_id, control)| {
-                control.stream.strong_count() > 0 && !ledger.acquiring.contains(*anchor_id)
+                !control.server
+                    && control.stream.strong_count() > 0
+                    && !ledger.acquiring.contains(*anchor_id)
             })
             .count();
         live + ledger.acquiring.len()
@@ -1119,14 +1198,19 @@ impl Host {
         deadline: Deadline,
         owner: Option<crate::SessionId>,
     ) -> Result<ReprobeReport, HostError> {
-        let mut remaining: HashMap<String, (Option<(ProcessIdentity, String)>, crate::SessionId)> = {
+        let mut remaining: HashMap<String, (Option<(ProcessIdentity, String)>, ProcessOwner)> = {
             let ledger = self.capacity.lock();
             ledger
                 .held
                 .iter()
                 .filter(|(anchor_id, held)| {
                     !ledger.busy(anchor_id)
-                        && owner.as_ref().is_none_or(|owner| *owner == held.owner)
+                        && owner.as_ref().is_none_or(|owner| match &held.owner {
+                            ProcessOwner::Turn { session_id, .. } => session_id == owner,
+                            // A session's re-probe never waits on a shared
+                            // server (design item 6.1).
+                            ProcessOwner::Server { .. } => false,
+                        })
                 })
                 .map(|(anchor_id, held)| {
                     (
@@ -1204,7 +1288,7 @@ impl Host {
         let absence = absence_record(&record.intent.anchor_id, &generation, &identity, &proof);
         match timeout_at(
             deadline.instant(),
-            self.journal.commit_group_absence(absence),
+            observed(self.journal.commit_group_absence(absence), &self.uncertain),
         )
         .await
         {
@@ -1216,16 +1300,19 @@ impl Host {
                 Ok(Reprobed::Proved)
             }
             Ok(CommitOutcome::NotCommitted(_)) => Ok(Reprobed::NotCommitted),
-            Ok(CommitOutcome::Uncertain(_)) | Err(_) => Err(HostError::Journal {
-                site: JournalSite::Absence,
-                uncertain: true,
-            }),
+            Ok(CommitOutcome::Uncertain(_)) | Err(_) => {
+                self.uncertain.send_replace(true);
+                Err(HostError::Journal {
+                    site: JournalSite::Absence,
+                    uncertain: true,
+                })
+            }
         }
     }
 
     async fn start_anchor(
         &self,
-        owner: crate::ProcessOwner,
+        owner: ProcessOwner,
         capacity: Option<crate::CapacityToken>,
         stderr: fs::File,
         state: &mut Acquisition,
@@ -1240,16 +1327,17 @@ impl Host {
             generation: generation.clone(),
             marker: marker.clone(),
             socket_path: socket_path.clone(),
-            owner_session: owner.session_id.clone(),
-            owner_turn: owner.turn,
+            owner: owner.clone(),
             uid: rustix::process::getuid().as_raw(),
             boot_id: linux::boot_id()?,
             pid_namespace: linux::pid_namespace()?,
         };
-        let receipt = committed(
-            self.journal.commit_anchor_intent(intent.clone()).await,
-            JournalSite::AnchorIntent,
-        )?;
+        let receipt = self
+            .commit(
+                self.journal.commit_anchor_intent(intent.clone()),
+                JournalSite::AnchorIntent,
+            )
+            .await?;
         state.intent = true;
         let bootstrap = Bootstrap {
             anchor_id: anchor_id.clone(),
@@ -1267,7 +1355,7 @@ impl Host {
         let replaced = {
             let mut ledger = self.capacity.lock();
             ledger.acquiring.insert(anchor_id.clone());
-            capacity.and_then(|token| ledger.hold(anchor_id.clone(), owner.session_id, token))
+            capacity.and_then(|token| ledger.hold(anchor_id.clone(), owner.clone(), token))
         };
         drop(replaced);
         state.spawned = Some(anchor_id.clone());
@@ -1304,23 +1392,20 @@ impl Host {
                 stop: stop.clone(),
                 phase: LaunchPhase::Verified,
                 exit: None,
+                server: matches!(owner, ProcessOwner::Server { .. }),
             },
         );
         if let Some(deadline) = registered {
             state.stop_early(deadline);
             return Err(HostError::Stopped);
         }
-        let version = committed(
-            self.journal
-                .commit_anchor_identified(
-                    &anchor_id,
-                    &generation,
-                    receipt.record_version,
-                    identity_to_store(&identity),
-                )
-                .await,
-            JournalSite::Identified,
-        )?;
+        let identified = self.journal.commit_anchor_identified(
+            &anchor_id,
+            &generation,
+            receipt.record_version,
+            identity_to_store(&identity),
+        );
+        let version = self.commit(identified, JournalSite::Identified).await?;
         Ok(StartedAnchor {
             anchor_id,
             generation,
@@ -1403,12 +1488,10 @@ impl Host {
             .await?;
         let vendor = vendor_config(&spec)?;
         configure(&control, vendor).await?;
-        committed(
-            self.journal
-                .commit_arm_intent(&anchor_id, &generation, version)
-                .await,
-            JournalSite::ArmIntent,
-        )?;
+        let arm = self
+            .journal
+            .commit_arm_intent(&anchor_id, &generation, version);
+        self.commit(arm, JournalSite::ArmIntent).await?;
         #[cfg(feature = "test-failpoints")]
         via_store::failpoint::hit_async("host.anchor.after_arm_intent_commit")
             .await
@@ -1457,12 +1540,14 @@ impl Host {
             let _ = via_store::failpoint::hit_async("host.early_stop.sent").await;
             return Err(HostError::Stopped);
         }
-        if let Err(error) = committed(
-            self.journal
-                .commit_vendor_facts(&anchor_id, &generation, vendor_pid)
-                .await,
-            JournalSite::VendorFacts,
-        ) {
+        if let Err(error) = self
+            .commit(
+                self.journal
+                    .commit_vendor_facts(&anchor_id, &generation, vendor_pid),
+                JournalSite::VendorFacts,
+            )
+            .await
+        {
             // Design §7.2 row 4: after ARM the vendor runs; Host stops the
             // group through the still-live control and keeps its evidence.
             // The `Stop` and the absence check share this one deadline.
@@ -1483,6 +1568,7 @@ impl Host {
             .ok_or(HostError::Protocol("launch pipes already taken"))?;
         let control = ProcessControl {
             stream: control,
+            owner: spec.owner,
             identity,
             anchor_id,
             generation,
@@ -1490,6 +1576,7 @@ impl Host {
             exit: exits.clone(),
             stop,
             capacity: self.capacity.clone(),
+            uncertain: self.uncertain.clone(),
         };
         self.track_control(&control, sender);
         Ok(AcquiredProcess {
@@ -1512,6 +1599,7 @@ impl Host {
         tasks.track(task);
         tasks.controls.push(TrackedControl {
             stream: Arc::downgrade(&control.stream),
+            owner: control.owner.clone(),
             identity: control.identity.clone(),
             anchor_id: control.anchor_id.clone(),
             generation: control.generation.clone(),
@@ -1569,6 +1657,7 @@ impl Host {
             if let Some(stream) = tracked.stream.upgrade() {
                 let control = ProcessControl {
                     stream,
+                    owner: tracked.owner,
                     identity: tracked.identity,
                     anchor_id: tracked.anchor_id,
                     generation: tracked.generation,
@@ -1576,6 +1665,7 @@ impl Host {
                     exit: tracked.exit,
                     stop: tracked.stop,
                     capacity: self.capacity.clone(),
+                    uncertain: self.uncertain.clone(),
                 };
                 let close = control
                     .close(CloseRequest {
@@ -1592,11 +1682,16 @@ impl Host {
                 }
             }
         }
-        let (recovery, anchors, uncertain_anchors, failure) =
-            match self.reconcile_turns(turns, deadline).await {
-                Ok((recovery, anchors, uncertain)) => (recovery, anchors, uncertain, None),
-                Err(error) => (Vec::new(), 0, 0, Some(error)),
-            };
+        // Design item 6.3: every control is closed first, so a failed or
+        // slow link read never delays stopping a group.
+        let links = self.read_links(turns, deadline).await;
+        let (recovery, anchors, uncertain_anchors, failure) = match self
+            .reconcile_turns(turns, links.as_ref().ok(), deadline)
+            .await
+        {
+            Ok((recovery, anchors, uncertain)) => (recovery, anchors, uncertain, links.err()),
+            Err(error) => (Vec::new(), 0, 0, Some(error)),
+        };
         let (pending_tasks, failed_tasks) = join_owned_tasks(&self.tasks, deadline).await;
         let failure = failure.or((pending_tasks > 0).then_some(HostError::Deadline));
         ShutdownReport {
@@ -1609,12 +1704,43 @@ impl Host {
         }
     }
 
+    /// The links of `turns` to server anchors, by anchor id, read in pages
+    /// of [`via_store::SERVER_LINKS_LIMIT`] under `min(deadline, now + 1
+    /// s)` (design item 6.3). A failed or timed-out read is
+    /// [`HostError::LinksUnread`].
+    async fn read_links(
+        &self,
+        turns: &[(crate::SessionId, crate::TurnNumber)],
+        deadline: Deadline,
+    ) -> Result<HashMap<String, Vec<(crate::SessionId, crate::TurnNumber)>>, HostError> {
+        let by = deadline.instant().min(Instant::now() + LINK_READ);
+        let read = async {
+            let mut links: HashMap<String, Vec<_>> = HashMap::new();
+            for chunk in turns.chunks(via_store::SERVER_LINKS_LIMIT) {
+                for link in self.journal.server_links(chunk.to_vec()).await? {
+                    links
+                        .entry(link.anchor_id)
+                        .or_default()
+                        .push((link.session_id, link.turn));
+                }
+            }
+            Ok::<_, StoreFailureKind>(links)
+        };
+        match timeout_at(by, read).await {
+            Ok(Ok(links)) => Ok(links),
+            Ok(Err(_)) | Err(_) => Err(HostError::LinksUnread),
+        }
+    }
+
     /// Reconciles every committed anchor page by page, keeping per-turn
     /// aggregates only for `turns` plus totals; returns `(turns, anchors,
-    /// uncertain anchors)`.
+    /// uncertain anchors)`. A server anchor's cleanup, never its `forced`,
+    /// is folded into each requested turn `links` names (design item 6.3);
+    /// with no links read, nothing is folded.
     async fn reconcile_turns(
         &self,
         turns: &[(crate::SessionId, crate::TurnNumber)],
+        links: Option<&HashMap<String, Vec<(crate::SessionId, crate::TurnNumber)>>>,
         deadline: Deadline,
     ) -> Result<(Vec<TurnRecovery>, usize, usize), HostError> {
         let mut recovery: Vec<TurnRecovery> = Vec::new();
@@ -1631,22 +1757,24 @@ impl Host {
                 if !matches!(report.cleanup, CleanupEvidence::GroupAbsent(_)) {
                     uncertain += 1;
                 }
-                let owner = (report.owner_session.clone(), report.owner_turn);
-                if !turns.contains(&owner) {
-                    continue;
-                }
-                match recovery
-                    .iter_mut()
-                    .find(|turn| (&turn.owner_session, turn.owner_turn) == (&owner.0, owner.1))
-                {
-                    Some(turn) => turn.fold(report),
-                    None => recovery.push(TurnRecovery {
-                        owner_session: owner.0,
-                        owner_turn: owner.1,
-                        anchors: 1,
-                        cleanup: report.cleanup,
-                        forced: report.forced,
-                    }),
+                match &report.owner {
+                    ProcessOwner::Turn { session_id, turn } => {
+                        let owner = (session_id.clone(), *turn);
+                        if turns.contains(&owner) {
+                            fold_turn(&mut recovery, owner, report.cleanup, report.forced);
+                        }
+                    }
+                    ProcessOwner::Server { .. } => {
+                        for owner in links
+                            .and_then(|links| links.get(&report.anchor_id))
+                            .into_iter()
+                            .flatten()
+                        {
+                            // Cleanup only: a server's `forced` is never a
+                            // turn's.
+                            fold_turn(&mut recovery, owner.clone(), report.cleanup.clone(), false);
+                        }
+                    }
                 }
             }
             if !full {
@@ -1709,8 +1837,7 @@ impl Host {
         for record in records {
             let anchor_id = record.intent.anchor_id.clone();
             let generation = record.intent.generation.clone();
-            let owner_session = record.intent.owner_session.clone();
-            let owner_turn = record.intent.owner_turn;
+            let owner = record.intent.owner.clone();
             let cleanup = self.recover_one(record, deadline).await?;
             self.capacity.settle(&anchor_id, &cleanup);
             let forced = self
@@ -1722,8 +1849,7 @@ impl Host {
             results.push(RecoveryReport {
                 anchor_id,
                 generation,
-                owner_session,
-                owner_turn,
+                owner,
                 cleanup,
                 forced,
             });
@@ -1809,7 +1935,7 @@ impl Host {
                 .insert(record.intent.generation.clone());
         }
         wait_absence(
-            &self.journal,
+            (&self.journal, &self.uncertain),
             &record.intent.anchor_id,
             &record.intent.generation,
             &identity,
@@ -1951,37 +2077,15 @@ impl ProcessControl {
                 .unwrap_or_else(Instant::now);
             wait_graceful_exit(&mut exit, force_at).await;
         }
-        let stopping = timeout_at(request.deadline.instant(), async {
-            let mut stream = self.stream.lock().await;
-            stream
-                .transact(
-                    &Request::Stop {
-                        generation: self.generation.clone(),
-                        deadline_monotonic_ns: monotonic_deadline(request.deadline),
-                    },
-                    1024,
-                )
-                .await
-        })
-        .await;
-        // A `Stop` cut short by the deadline left the control retired: shut
-        // it down now, unless a holder has it and will on its next exchange.
-        if stopping.is_err()
-            && let Ok(mut control) = self.stream.try_lock()
-            && control.retired
-        {
-            control.retire().await;
-        }
-        // Only the anchor knows whether the vendor was still live when its
-        // cleanup signalled the group; Host's polled exit watch may be stale.
-        let forced = matches!(stopping, Ok(Ok(Reply::Stopping { stopped_live: true })));
+        let stopped_live = stop_report(&self.stream, &self.generation, request.deadline).await;
+        let forced = stopped_live == Some(true);
         if forced {
             self.stop.forced.store(true, Ordering::Release);
         }
         // A proof that did not commit stays unproven here; an uncertain
         // commit is reported so the daemon latches (design §7.2 row 12).
         let (cleanup, journal_uncertain) = match wait_absence(
-            &self.journal,
+            (&self.journal, &self.uncertain),
             &self.anchor_id,
             &self.generation,
             &self.identity,
@@ -2013,7 +2117,42 @@ impl ProcessControl {
             vendor_exit: *self.exit.borrow(),
             forced,
             journal_uncertain,
+            stopped_live,
         }
+    }
+
+    /// Commits the link of the `running` turn `(session, turn)` to this
+    /// shared server's anchor (design item 1, runtime §6 `server_turns`),
+    /// before the turn's first vendor byte. A turn-owned control has no
+    /// link: [`HostError::Invalid`]. Not committed is
+    /// [`HostError::Journal`] at [`JournalSite::Link`]; an uncertain
+    /// outcome, or no outcome by `deadline`, is the same with `uncertain`,
+    /// and sets Host's journal-uncertain watch, as does dropping this future
+    /// once its write is enqueued ([`observed`]).
+    pub async fn link_turn(
+        &self,
+        session: &crate::SessionId,
+        turn: crate::TurnNumber,
+        deadline: Deadline,
+    ) -> Result<(), HostError> {
+        match &self.owner {
+            ProcessOwner::Turn { .. } => {
+                return Err(HostError::Invalid("a turn-owned process has no turn links"));
+            }
+            ProcessOwner::Server { .. } => {}
+        }
+        if Instant::now() >= deadline.instant() {
+            return Err(HostError::Deadline);
+        }
+        let link = observed(
+            self.journal
+                .commit_server_turn(&self.anchor_id, session, turn),
+            &self.uncertain,
+        );
+        let Ok(outcome) = timeout_at(deadline.instant(), link).await else {
+            return Err(no_outcome(JournalSite::Link, &self.uncertain));
+        };
+        committed(outcome, JournalSite::Link, &self.uncertain)
     }
 }
 
@@ -2160,7 +2299,7 @@ async fn verify_peer_and_challenge(
 }
 
 async fn wait_absence(
-    journal: &ProcessJournal,
+    (journal, uncertain): (&ProcessJournal, &watch::Sender<bool>),
     anchor_id: &str,
     generation: &str,
     identity: &ProcessIdentity,
@@ -2182,15 +2321,11 @@ async fn wait_absence(
                         site: JournalSite::Absence,
                         uncertain: false,
                     })?;
-                return match timeout_at(deadline.instant(), journal.commit_group_absence(record))
-                    .await
-                {
-                    Ok(outcome) => committed(outcome, JournalSite::Absence).map(|()| evidence),
-                    Err(_) => Err(HostError::Journal {
-                        site: JournalSite::Absence,
-                        uncertain: true,
-                    }),
+                let commit = observed(journal.commit_group_absence(record), uncertain);
+                let Ok(outcome) = timeout_at(deadline.instant(), commit).await else {
+                    return Err(no_outcome(JournalSite::Absence, uncertain));
                 };
+                return committed(outcome, JournalSite::Absence, uncertain).map(|()| evidence);
             }
             CleanupEvidence::Uncertain(CleanupReason::GroupPresent)
                 if Instant::now() < deadline.instant() =>
@@ -2227,18 +2362,64 @@ fn absence_record(
     }
 }
 
-/// A journal write's value, or its failure classified by outcome.
-fn committed<T>(outcome: CommitOutcome<T>, site: JournalSite) -> Result<T, HostError> {
+/// A journal write's value, or its failure classified by outcome. An
+/// uncertain outcome also sets Host's sticky journal-uncertain watch here,
+/// where Host observes it (design item 2.6).
+fn committed<T>(
+    outcome: CommitOutcome<T>,
+    site: JournalSite,
+    uncertain: &watch::Sender<bool>,
+) -> Result<T, HostError> {
     match outcome {
         CommitOutcome::Committed(value) => Ok(value),
         CommitOutcome::NotCommitted(_) => Err(HostError::Journal {
             site,
             uncertain: false,
         }),
-        CommitOutcome::Uncertain(_) => Err(HostError::Journal {
-            site,
-            uncertain: true,
-        }),
+        CommitOutcome::Uncertain(_) => {
+            uncertain.send_replace(true);
+            Err(HostError::Journal {
+                site,
+                uncertain: true,
+            })
+        }
+    }
+}
+
+/// Awaits a journal write's outcome where Host observes it (design item
+/// 2.6). The write's command is enqueued at its first poll; dropped after
+/// that and before its outcome (the requester was cancelled, or a deadline
+/// such as acquisition's cut it), the outcome is never observed and may be
+/// a commit, so the watch is set, as for [`no_outcome`].
+async fn observed<T>(
+    write: impl Future<Output = CommitOutcome<T>>,
+    uncertain: &watch::Sender<bool>,
+) -> CommitOutcome<T> {
+    let mut pending = Unobserved(Some(uncertain));
+    let outcome = write.await;
+    pending.0 = None;
+    outcome
+}
+
+/// Sets the journal-uncertain watch when dropped still armed: see
+/// [`observed`].
+struct Unobserved<'a>(Option<&'a watch::Sender<bool>>);
+
+impl Drop for Unobserved<'_> {
+    fn drop(&mut self) {
+        if let Some(uncertain) = self.0.take() {
+            uncertain.send_replace(true);
+        }
+    }
+}
+
+/// A journal write with no outcome by its deadline: it may have committed,
+/// so the watch is set as for an uncertain one.
+fn no_outcome(site: JournalSite, uncertain: &watch::Sender<bool>) -> HostError {
+    uncertain.send_replace(true);
+    HostError::Journal {
+        site,
+        uncertain: true,
     }
 }
 
@@ -2289,6 +2470,45 @@ async fn stop_through(
         stop.forced.store(true, Ordering::Release);
     }
     forced
+}
+
+/// The close's `Stop` and the anchor's reply to it (runtime §5): only the
+/// anchor knows whether the vendor was still live when its cleanup
+/// signalled the group; Host's polled exit watch may be stale. The lock,
+/// the write and the reply are all bounded by `deadline`; no reply by then,
+/// or one in hand only at or after it ([`ControlConnection::transact_by`]'s
+/// late check), is `None`.
+async fn stop_report(
+    control: &Mutex<ControlConnection>,
+    generation: &str,
+    deadline: Deadline,
+) -> Option<bool> {
+    let stopping = timeout_at(deadline.instant(), async {
+        let mut stream = control.lock().await;
+        stream
+            .transact_by(
+                &Request::Stop {
+                    generation: generation.to_owned(),
+                    deadline_monotonic_ns: monotonic_deadline(deadline),
+                },
+                1024,
+                deadline.instant(),
+            )
+            .await
+    })
+    .await;
+    // A `Stop` cut short by the deadline left the control retired: shut
+    // it down now, unless a holder has it and will on its next exchange.
+    if stopping.is_err()
+        && let Ok(mut stream) = control.try_lock()
+        && stream.retired
+    {
+        stream.retire().await;
+    }
+    match stopping {
+        Ok(Ok(Reply::Stopping { stopped_live })) => Some(stopped_live),
+        Ok(Ok(_) | Err(_)) | Err(_) => None,
+    }
 }
 
 /// One early stop (design §6.8): `Stop` through the live control, then the
@@ -2380,8 +2600,11 @@ mod tests {
     fn a_replaced_token_is_dropped_outside_the_ledger_lock() {
         let capacity = Capacity::default();
         let locked = Arc::new(AtomicBool::new(false));
-        let owner = crate::SessionId::try_from("s_0123456789ab")
-            .unwrap_or_else(|_| unreachable!("valid session id"));
+        let owner = ProcessOwner::Turn {
+            session_id: crate::SessionId::try_from("s_0123456789ab")
+                .unwrap_or_else(|_| unreachable!("valid session id")),
+            turn: crate::TurnNumber::try_from(1).unwrap_or_else(|_| unreachable!("valid turn")),
+        };
         let first = Probe {
             ledger: capacity.clone(),
             locked: Arc::clone(&locked),
@@ -2626,6 +2849,33 @@ mod tests {
                 .checked_sub(Duration::from_secs(1))
                 .expect("a second before now"),
         )
+    }
+
+    /// x.3.2 X2 r1 #5 (runtime §5): a `Stop` reply already in hand when a
+    /// close that runs late first polls it is past the deadline, so it is
+    /// no stop report: `None`, never `Some(false)`, as for `stop_through`.
+    #[tokio::test]
+    async fn a_ready_stop_reply_polled_after_the_deadline_is_none() {
+        let (control, mut peer) = control_pair();
+        protocol::write_message(
+            &mut peer,
+            &Reply::Stopping {
+                stopped_live: false,
+            },
+            1024,
+        )
+        .await
+        .expect("the anchor's reply");
+        // The reactor has seen the socket writable and the reply readable,
+        // so the late close's first poll finds the reply in hand.
+        {
+            let held = control.lock().await;
+            held.stream.writable().await.expect("writable");
+            held.stream.readable().await.expect("readable");
+        }
+        let report = stop_report(&control, "g1", already_past()).await;
+        assert_eq!(report, None);
+        assert!(received_stop(&mut peer, "g1").await, "no Stop was written");
     }
 
     /// Sol review of Task 3 round 2, decision D5-3: a task or owner that runs
@@ -2920,6 +3170,9 @@ mod tests {
         let (_sender, exit) = watch::channel(None);
         tasks.controls.push(TrackedControl {
             stream: Arc::downgrade(&control),
+            owner: ProcessOwner::Server {
+                server_id: crate::ServerId::try_from("v_0123456789ab").expect("server id"),
+            },
             identity: ProcessIdentity {
                 pid: 1,
                 pgid: 1,
@@ -2961,6 +3214,7 @@ mod tests {
             stop: Arc::new(StopFacts::default()),
             phase: LaunchPhase::Verified,
             exit: None,
+            server: false,
         };
         (live, (control, peer))
     }

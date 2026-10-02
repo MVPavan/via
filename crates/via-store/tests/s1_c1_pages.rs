@@ -350,6 +350,7 @@ fn s1_c1_list_page_examines_at_most_1000_sessions_each_once() {
                             envelope: json!({"state":"failed"}),
                             event: event("turn.ended", 3, Some(1), 99_000),
                             steps: Vec::new(),
+                            link_released: false,
                         })
                         .await
                         .unwrap();

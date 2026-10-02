@@ -135,7 +135,14 @@ impl Engine {
         match pass {
             Ok(report) => {
                 for owner in &report.not_committed {
-                    let owner = FailureScope::Session(owner);
+                    // A shared server's proof is no session's (x.3.2 X0
+                    // item 6.1): scope `daemon`, no address.
+                    let owner = match owner {
+                        via_adapters::ProcessOwner::Turn { session_id, .. } => {
+                            FailureScope::Session(session_id)
+                        }
+                        via_adapters::ProcessOwner::Server { .. } => FailureScope::Daemon,
+                    };
                     self.store_failure(FailureSite::Absence, WriteOutcome::NotCommitted, owner)
                         .finish()
                         .await;
@@ -228,7 +235,7 @@ impl Engine {
                 let token = self.recovered.hold(&self.slots);
                 self.adapter.hold_capacity(
                     owner.anchor_id.clone(),
-                    owner.session_id.clone(),
+                    owner.owner.clone(),
                     Box::new(token),
                 );
             }

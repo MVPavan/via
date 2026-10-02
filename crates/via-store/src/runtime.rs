@@ -17,13 +17,13 @@ use serde_json::{Value, value::RawValue};
 use tokio::sync::oneshot;
 
 use crate::{
-    CommitOutcome, EvidenceRoot, Identity, SessionId, StoreFailureKind, TurnNumber,
+    CommitOutcome, EvidenceRoot, Identity, ProcessOwner, SessionId, StoreFailureKind, TurnNumber,
     blob::{BlobReader, BlobRef, BlobTasks, BlobWriter, Blobs, PromptFileError},
     evidence::sync_dir,
     lanes::{Lane, Lanes},
 };
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 /// Largest terminal envelope, encoded (C1 §5): at most one rides outside a
 /// transaction's payload cap (design §6.4).
@@ -447,6 +447,11 @@ pub struct TerminalRecord {
     /// the open step's and any a refused step commit carried. The
     /// transaction cap does not count them (§6.4).
     pub steps: Vec<StepRow>,
+    /// The turn's cleanup is known `quiescent`: the same transaction
+    /// deletes its link to a server anchor, if any (runtime §6
+    /// `server_turns`). False keeps the link, so a remaining link means the
+    /// turn runs or may have left work on its server.
+    pub link_released: bool,
 }
 
 /// An `unknown` turn a late vendor terminal may revise (C1 §7.6): one
@@ -751,17 +756,35 @@ pub struct UnfinishedTurn {
     /// that accepted the turn (C1 §3.7); `None` before an acceptance
     /// recorded one.
     pub instance: Option<InstanceRecord>,
+    /// The server anchor the turn's link names (runtime §6
+    /// `server_turns`); `None` for a per-turn route, or a server-route
+    /// turn that sent nothing.
+    pub server_anchor: Option<String>,
 }
 
-/// A committed anchor and its owning turn; no marker, identity or control path.
+/// One turn's link to the server anchor it may have left work on (runtime
+/// §6 `server_turns`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServerLink {
+    /// The linked turn's session.
+    pub session_id: SessionId,
+    /// The linked turn.
+    pub turn: TurnNumber,
+    /// The server anchor.
+    pub anchor_id: String,
+}
+
+/// Most turns one [`ProcessJournal::server_links`] read names (runtime §6).
+pub const SERVER_LINKS_LIMIT: usize = 256;
+
+/// A committed anchor and its owner; no marker, identity or control path.
 pub struct AnchorOwner {
     /// Opaque committed anchor identifier.
     pub anchor_id: String,
-    /// Owning session.
-    pub session_id: SessionId,
-    /// Owning turn.
-    pub turn: TurnNumber,
-    /// The owning turn is still `running`: recovery resolves it.
+    /// The owning turn or server.
+    pub owner: ProcessOwner,
+    /// A `Turn` owner is still `running`: recovery resolves it. Always
+    /// false for a `Server` owner, which no turn owns.
     pub turn_running: bool,
     /// The anchor's last committed launch phase (design §9); `None` when the
     /// stored phase is unreadable, which Host reconciliation then reports.
@@ -919,10 +942,8 @@ pub struct AnchorIntent {
     pub marker: String,
     /// Exact private control socket path validated by Host.
     pub socket_path: PathBuf,
-    /// Owning session.
-    pub owner_session: SessionId,
-    /// Owning turn.
-    pub owner_turn: TurnNumber,
+    /// The owning turn, or the shared server (runtime §5 AR6).
+    pub owner: ProcessOwner,
     /// User ID at intent creation.
     pub uid: u32,
     /// Boot identifier at intent creation.
@@ -1236,6 +1257,16 @@ pub(crate) enum Command {
         AnchorQuery,
         oneshot::Sender<Result<Vec<AnchorRecord>, StoreFailureKind>>,
     ),
+    ServerTurn(
+        String,
+        SessionId,
+        TurnNumber,
+        oneshot::Sender<CommitOutcome<()>>,
+    ),
+    ServerLinks(
+        Vec<(SessionId, TurnNumber)>,
+        oneshot::Sender<Result<Vec<ServerLink>, StoreFailureKind>>,
+    ),
     VerifyBlobs(oneshot::Sender<Result<(), StoreError>>),
     SweepBlobs(oneshot::Sender<Result<u64, StoreError>>),
 }
@@ -1490,7 +1521,10 @@ impl Command {
                     + intent.generation.len()
                     + intent.marker.len()
                     + intent.socket_path.as_os_str().len()
-                    + intent.owner_session.as_str().len()
+                    + match &intent.owner {
+                        ProcessOwner::Turn { session_id, .. } => session_id.as_str().len(),
+                        ProcessOwner::Server { server_id } => server_id.as_str().len(),
+                    }
                     + intent.boot_id.len()
                     + intent.pid_namespace.len(),
                 0,
@@ -1515,6 +1549,17 @@ impl Command {
             Self::AnchorRecords(query, _) => (
                 query.after.as_ref().map_or(0, String::len)
                     + query.owner.as_ref().map_or(0, |owner| owner.as_str().len()),
+                0,
+                0,
+            ),
+            Self::ServerTurn(anchor_id, session, _, _) => {
+                (anchor_id.len() + session.as_str().len() + 4, 0, 0)
+            }
+            Self::ServerLinks(turns, _) => (
+                turns
+                    .iter()
+                    .map(|(session, _)| session.as_str().len() + 4)
+                    .sum(),
                 0,
                 0,
             ),
@@ -2651,6 +2696,43 @@ impl ProcessJournal {
         self.records_page(after, limit, true, owner, None).await
     }
 
+    /// Commits a server-route turn's link to its server anchor (runtime
+    /// §6 `server_turns`), before the turn's first vendor byte. Inserted
+    /// only when `anchor_id` is a server-owned anchor and the turn is
+    /// `running`; anything else, a second link of the turn included, is
+    /// `NotCommitted`.
+    pub async fn commit_server_turn(
+        &self,
+        anchor_id: &str,
+        session: &SessionId,
+        turn: TurnNumber,
+    ) -> CommitOutcome<()> {
+        let (reply, receive) = oneshot::channel();
+        let command = Command::ServerTurn(anchor_id.to_owned(), session.clone(), turn, reply);
+        self.commit(command, receive).await
+    }
+
+    /// The links of at most [`SERVER_LINKS_LIMIT`] `turns` (runtime §6):
+    /// one bounded read, for final shutdown's fold of a server anchor's
+    /// cleanup into the turns it served.
+    pub async fn server_links(
+        &self,
+        turns: Vec<(SessionId, TurnNumber)>,
+    ) -> Result<Vec<ServerLink>, StoreFailureKind> {
+        if turns.len() > SERVER_LINKS_LIMIT {
+            return Err(StoreFailureKind::Write);
+        }
+        if turns.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::ServerLinks(turns, reply))
+            .map_err(|error| error.kind())?;
+        receive
+            .await
+            .unwrap_or(Err(StoreFailureKind::UncertainCommit))
+    }
+
     async fn records_page(
         &self,
         after: Option<String>,
@@ -2705,8 +2787,8 @@ pub use disk::{PAGE_BYTES, WalLimits};
 
 use anchor::{
     commit_anchor_identified, commit_anchor_intent, commit_arm_intent, commit_group_absence,
-    commit_vendor_facts, count_unproven_anchors, read_anchor_cohort, read_anchor_owners,
-    read_anchor_records,
+    commit_server_turn, commit_vendor_facts, count_unproven_anchors, read_anchor_cohort,
+    read_anchor_owners, read_anchor_records, read_server_links,
 };
 use sql::{configure, current_uid, validate_regular, validate_state, writer_loop};
 
