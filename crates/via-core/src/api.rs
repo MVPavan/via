@@ -1220,13 +1220,19 @@ impl ApiError {
         reason: Some("control_lane_full"),
         floor: None,
     };
-    /// C1 -32021 `steer_failed`: the steer input was not applied, for
-    /// `reason`, with what is known of its `delivery` (C1 §3.4, §8.1).
+    /// C1 -32021 `steer_failed` for `reason`, with what is known of its
+    /// `delivery` (C1 §3.4, §8.1): `none` was not applied; `uncertain`
+    /// was not written whole, and its message keeps that uncertainty
+    /// (critical r1 #13).
     pub(crate) fn steer_failed(reason: &'static str, delivery: &'static str) -> Self {
         Self {
             code: -32021,
             kind: "steer_failed",
-            message: "the steer input was not applied",
+            message: if delivery == "uncertain" {
+                "the steer input was not written whole; whether it was applied is unknown"
+            } else {
+                "the steer input was not applied"
+            },
             unpersisted: None,
             kind2: None,
             commit_outcome: None,

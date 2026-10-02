@@ -1627,16 +1627,18 @@ fn conformance_intake_instructions_path() {
 /// that refuses steer in the turn's phase is `steer_failed` with
 /// `data.reason: "not_steerable"` and `data.delivery: "none"`; input not
 /// written whole is `steer_failed` with `data.reason: "not_delivered"` and
-/// `data.delivery: "uncertain"`. None commits `steer.delivered`.
+/// `data.delivery: "uncertain"`, whose message keeps that uncertainty
+/// (critical r1 #13). None commits `steer.delivered`.
 #[test]
 fn conformance_intake_steer_error_mapping() {
-    for (refusal, code, kind, reason, delivery) in [
+    for (refusal, code, kind, reason, delivery, message) in [
         (
             "over_capacity",
             -32012,
             "admission_refused",
             "control_lane_full",
             Value::Null,
+            "the session's control lane is full",
         ),
         (
             "not_steerable",
@@ -1644,6 +1646,7 @@ fn conformance_intake_steer_error_mapping() {
             "steer_failed",
             "not_steerable",
             json!("none"),
+            "the steer input was not applied",
         ),
         (
             "not_delivered",
@@ -1651,6 +1654,7 @@ fn conformance_intake_steer_error_mapping() {
             "steer_failed",
             "not_delivered",
             json!("uncertain"),
+            "the steer input was not written whole; whether it was applied is unknown",
         ),
     ] {
         let root = Root::new();
@@ -1674,8 +1678,14 @@ fn conformance_intake_steer_error_mapping() {
                 .unwrap_err();
             let data = error.data();
             assert_eq!(
-                (error.code, error.kind, &data["reason"], &data["delivery"]),
-                (code, kind, &json!(reason), &delivery),
+                (
+                    error.code,
+                    error.kind,
+                    &data["reason"],
+                    &data["delivery"],
+                    error.message
+                ),
+                (code, kind, &json!(reason), &delivery, message),
                 "{refusal}: {data}"
             );
             daemon.release("running");
