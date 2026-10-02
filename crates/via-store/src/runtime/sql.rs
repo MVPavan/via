@@ -616,8 +616,9 @@ fn answer<T>(
     let _ = reply.send(result);
 }
 
-/// Serves one mutation command, or a blob check the thread runs before
-/// admission. Every mutation's result passes [`settled`] before its reply.
+/// Serves one mutation command, or a blob check or the steer intents'
+/// recovery the thread runs before admission. Every mutation's result
+/// passes [`settled`] before its reply.
 fn serve_write(conn: &mut Connection, command: Command, blobs: &Blobs) {
     if let Command::VerifyBlobs(reply) = command {
         let _ = reply.send(verify_blobs(conn, blobs));
@@ -625,6 +626,13 @@ fn serve_write(conn: &mut Connection, command: Command, blobs: &Blobs) {
     }
     if let Command::SweepBlobs(reply) = command {
         let _ = reply.send(sweep_blobs(conn, blobs));
+        return;
+    }
+    // Restart recovery's bookkeeping before admission, like the blob
+    // sweep: no per-mutation test seam, so it moves no seam's hit count.
+    if let Command::SteerIntentsResolved(result, reply) = command {
+        let resolved = resolve_steer_intents(conn, &result);
+        let _ = reply.send(settled(conn, resolved));
         return;
     }
     #[cfg(feature = "test-failpoints")]
@@ -697,9 +705,6 @@ fn serve_mutation(conn: &mut Connection, command: Command) {
         Command::SteerOutcome(session, outcome, reply) => {
             reply!(reply, commit_steer_outcome(conn, &session, &outcome));
         }
-        Command::SteerIntentsResolved(result, reply) => {
-            reply!(reply, resolve_steer_intents(conn, &result));
-        }
         Command::SubmitFailed(record, reply) => reply!(reply, commit_submit_failed(conn, &record)),
         Command::FailureResolution(record, reply) => {
             reply!(reply, commit_failure_resolution(conn, &record));
@@ -723,7 +728,8 @@ fn serve_mutation(conn: &mut Connection, command: Command) {
         Command::ServerTurn(anchor_id, session, turn, reply) => {
             journal!(reply, commit_server_turn(conn, &anchor_id, &session, turn));
         }
-        // `writer_loop` serves reads first and `serve_write` the blob checks.
+        // `writer_loop` serves reads first and `serve_write` the blob checks
+        // and the steer intents' recovery.
         Command::SpawnKey(..)
         | Command::Operation(..)
         | Command::KeyedOperation(..)
@@ -751,7 +757,8 @@ fn serve_mutation(conn: &mut Connection, command: Command) {
         | Command::AnchorRecords(..)
         | Command::ServerLinks(..)
         | Command::VerifyBlobs(..)
-        | Command::SweepBlobs(..) => {}
+        | Command::SweepBlobs(..)
+        | Command::SteerIntentsResolved(..) => {}
     }
 }
 
