@@ -1,11 +1,11 @@
 # Codex server ownership and connection design (x.3.2 chunk X0)
 
-Status: revision 3, 2026-10-02, answering Sol review x32-x0-r3 (UNSOUND:
-1 Blocker, 13 Important, 4 Minor; all accepted, Sol's smaller option
-preferred), on top of revisions 1 (Sol r1: 28 findings) and 2 (Sol r2:
-N1–N23). Bead `via-5lr.3.2`, chunk X0. Worker: implementer-high (Opus 5.5
-high), design mode. Base `42ee47b`; revisions 0–2 were `a141496`,
-`20ae3aa`, `348d5d7`.
+Status: revision 4, 2026-10-02, answering Sol review x32-x0-r4 (UNSOUND,
+no Blocker: 9 Important, 5 Minor; all accepted, Sol's smaller option
+preferred), on top of revisions 1 (Sol r1: 28 findings), 2 (Sol r2:
+N1–N23) and 3 (Sol r3: F1–F18). Bead `via-5lr.3.2`, chunk X0. Worker:
+implementer-high (Opus 5.5 high), design mode. Base `42ee47b`; revisions
+0–3 were `a141496`, `20ae3aa`, `348d5d7`, `8d277c1`.
 
 Sources:
 - the x.3.2 plan (chunk X0, §1.3, §6 G1–G7); the coordinator's rulings
@@ -35,7 +35,12 @@ Sources:
   concurrently with driver close, under C1 §3.6's rule: driver close and
   Route delivery are bounded by the close deadline; Core's durable disposal
   of delivered observations continues past it until it completes or the
-  existing Store-failure resolution applies, never cancelled mid-commit;
+  existing Store-failure resolution applies, never cancelled mid-commit.
+  At K1's `820e9fb` (under review) that is `Lane::close_draining`, which
+  polls the driver's close apart from the disposal under way, and the
+  generic driver's `Retiring { Running, CleanedUp, Delivered }` stages in
+  `via-adapters/src/driver.rs`, which a driver close waits on (cleanup
+  facts first, then delivery);
 - **X1's C2 amendment** (uncommitted): `VendorTerminal.structured_output:
   Option<StructuredOutput>` with `Json(raw)` or `NotJson` (Core treats
   `NotJson` as present and invalid); a Codex turn's final text maps to it
@@ -55,18 +60,18 @@ Labels: **fact** (read in code or a spec), **decision** (this design),
 |---|---|---|---|---|
 | 0 | Dispatch admission | Core opens the logical driver, subscribes to its readiness, then prepares before any connection slot; the subscription is kept through the slot wait | Core `engine/drive.rs`; C2 `SessionDriver::readiness` | X2 |
 | 1 | Non-turn server owner | `ProcessOwner { Turn, Server }`; server anchors; a durable turn → server-anchor link before the turn's first vendor byte; server and turn evidence folders | Store, Host, Wire | X2 |
-| 2 | Lease registry | `codex::Servers`; holders = reservations + pins + leases; instance-fenced; coalesced pending work on each entry; one supervisor exclusively owning the task set and answering a shutdown snapshot at the cutoff | Routes `codex/servers.rs` | X3 (single), X4 (shared) |
-| 3 | `config_hash` | SHA-256 over the launch recipe; recomputed from a fresh stat before registry insertion; publication refused if the binary changed | Adapters `codex/launch.rs` | X1, X3 |
+| 2 | Lease registry | `codex::Servers`; holders = reservations + pins + leases; instance-fenced; coalesced pending work on each entry; one supervisor exclusively owning the task set, receiving each launch's connection task and publishing only after spawning it; shutdown awaits the supervisor's own handle until the cutoff and reads counts kept under the registry mutex | Routes `codex/servers.rs` | X3 (single), X4 (shared) |
+| 3 | `config_hash` | SHA-256 over the launch recipe; recomputed from a fresh stat before registry insertion; publication refused if the binary changed; identity cache writes fenced by a stat ticket | Adapters `codex/launch.rs` | X1, X3 |
 | 4 | `CODEX_SQLITE_HOME` | `<state>/vendor/codex`, 0700, persistent | CLI, Wire config, Adapters | X1, X2 |
 | 5 | Server evidence, decode failures | Server folder never returned by `logs`; closed generations dropped before decoding; evidence to the original turn, continuity failure to the current one | Wire, Routes | X2, X3 |
-| 6 | Recovery, shutdown, close, status | Cleanup from the linked anchor; ownerless re-probe refusals at daemon scope | Store, Host, Core | X2 |
+| 6 | Recovery, shutdown, close, status | Cleanup from the linked anchor; ownerless re-probe refusals at daemon scope; a turn's link kept exactly while its cleanup is not quiescent, and read by the close and status predicate | Store, Host, Core | X2 |
 | 7 | `daemon/status.servers` | Registry snapshot behind J0's `servers()` | Routes | X4 |
 | 8 | Threads | Per-generation tombstones; lease fencing; connection-owned cleanup intents; a reattach fence until unsubscribe resolves; Core's concurrent drain during driver close is K1's | Routes `codex/threads.rs` | K1 (Core), X4 |
 | 9 | Caps, request records, RSS | No admission cap; request owners `Server` or `Lease`; one correlation budget; RSS qualifies only 32 turns on one server | Routes; X5 | X4, X5 |
 | 10 | Overflow, loss record | Sticky health; a non-withdrawable cleanup interrupt; one Core loss helper fed by `TurnEnd` and every close | Adapters, Routes, Core | X5 |
 | 11 | Decline hand-off | Static table; ordered placeholder at decode | Adapters, Routes | X1, X3 |
 | 12 | Writes on a shared connection | Built on J0's `ControlQueue`: ticketed data slot; a claimed job stays withdrawable until its first byte, decided under the queue lock; data holds; staging permits; an owning turn-write guard; reserved control sizes from maximum encodings | Wire `connection.rs`; Routes `codex/feeder.rs` | X2 (Wire), X3 |
-| 13 | Connection failure | One owned sequence for exit, transport, protocol and overflow: a synchronous Wire seal at the latch, Host cleanup and the sealed-prefix drain at once; `ServerLost` only with positive prior-death evidence; an abnormal path when the connection task itself fails | Routes, Wire | X2 (Wire), X3, X4 |
+| 13 | Connection failure | One owned sequence for exit, transport, protocol and overflow: Route's first-wins failure latch, an idempotent cause-free Wire seal, Host cleanup and the sealed-prefix drain at once; `ServerLost` only with positive prior-death evidence, carried as Host's typed stop reply; an abnormal path when the connection task itself fails, whose loss the driver-owned normalizer records even for an idle driver | Routes, Wire, Host | X2 (Wire, Host), X3, X4 |
 | 14 | Replay join | `expect_large`, `pause_input`/`resume_input`; a polling reader that acknowledges mode changes even with no input | `via-fake-agent` | X3 |
 
 ### 0.1 Round-1 findings and where each is answered
@@ -135,15 +140,15 @@ Labels: **fact** (read in code or a spec), **decision** (this design),
 | Finding | Decision (short) | Section |
 |---|---|---|
 | F1 (Blocker) claim is not the first byte | The writer's claim of a job and its first byte are separate; a claimed, unwritten job stays withdrawable; withdrawal, J0's per-attempt expiry check and the first successful byte write are decided under J0's queue lock; `Started` = first byte written | Item 12.2, 12.3; §9.2 |
-| F2 shutdown snapshot | The supervisor answers a snapshot request at the cutoff with its current counts and keeps running and owning unfinished tasks | Item 2.5, 2.7 |
+| F2 shutdown snapshot | The supervisor answers a snapshot request at the cutoff with its current counts and keeps running and owning unfinished tasks (r4: no request; R4-1, R4-2) | Item 2.5, 2.7 |
 | F3 connection-task panic | Abnormal path: seal Wire, request Host stop, end every registration's turns `TransportLost` with an undrainable `ObservationLoss` | Item 2.5, 13.2 |
 | F4 channel capacity | No spawn channel: coalesced pending work on each registry entry, picked up by the supervisor; a retirement's cleanup ownership is state on the entry and is never dropped | Item 2.1, 2.5 |
 | F5 durable barrier | The close deadline bounds driver close and Route delivery only; Core's durable disposal continues past it (K1, C1 §3.6) | Item 8.2 |
 | F6 `thread/start` owner | `RequestOwner::Lease` carries `thread: Option<ThreadId>` and the session and turn by value | Item 9.1 |
 | F7 positive death evidence | `ServerLost` only when the latch was Host's exit report, or a stdio end followed by Host's explicit `Stopping { stopped_live: false }`; never from `forced == false` | Item 13.1 |
-| F8 seal at the latch | `WireSender::seal(cause)`, synchronous, serialized with the reader's admission; leader exit with inherited stdout included | Item 13.1; §9.2 |
+| F8 seal at the latch | `WireSender::seal(cause)`, synchronous, serialized with the reader's admission; leader exit with inherited stdout included (r4: cause-free and idempotent; R4-6) | Item 13.1; §9.2 |
 | F9 protocol and overflow | The same owned sequence with causes `Protocol` and `Overflow`, keeping `failed(protocol)` and `failed(overflow)` | Item 13.1 |
-| F10 cached hash vs readiness | `prepare` hashes the driver's recipe with the `InstanceCache`'s current identity (no syscall); a launch's fresh stat updates the cache before publication | Item 0, Item 3 |
+| F10 cached hash vs readiness | `prepare` hashes the driver's recipe with the `InstanceCache`'s current identity (no syscall); a launch's fresh stat updates the cache before publication (r4: ticketed writes, final stat; R4-7) | Item 0, Item 3 |
 | F11 generation-only decode failure | Correlation names an open generation but no turn: evidence to the connection evidence folder, the generation fails `protocol`, no turn invented | Item 5 |
 | F12 idle replay reader | The reader polls stdin readiness with a 10 ms timeout and checks its mode between polls; tested with an empty pipe | Item 14 |
 | F13 C1 P11 | Exact replacement keeping its bound and enforcement clauses | §9.3 |
@@ -153,6 +158,26 @@ Labels: **fact** (read in code or a spec), **decision** (this design),
 | F17 loss text | `observations_lost` describes lost shared-server observations generally (C1 public text changed) | Item 10; §9.3 |
 | F18 Q1 summary | Wall, stop and force listed | §5 |
 | Simplification | One `reported` flag on the lane's loss record replaces the 8-entry history: a driver has at most one loss record, and both consumers run inside the lane before its replacement | Item 10 |
+
+### 0.4 Round-4 findings and where each is answered
+
+| Finding | Decision (short) | Section |
+|---|---|---|
+| R4-1 snapshot responder can exit unanswered | No request exists to be lost: the fence is registry state the supervisor's exit condition reads under the mutex; `join` awaits the supervisor's own handle until the cutoff and reads the task counts the supervisor keeps under that mutex (smaller than an atomically installed request; X0-R4-Q1) | Item 2.5, 2.7 |
+| R4-2 supervisor's own join omitted | `Servers::join`, inside the adapter set's existing shutdown, collects the supervisor's `JoinHandle`: ended → its counts; panicked → `failed + 1` plus the tasks its dropped set aborted; still running at the cutoff → `unjoined = live tasks + 1`, the handle kept. A panic guard resolves waiters and refuses later launches | Item 2.5, 2.7 |
+| R4-3 fenced work accounting | Counts change only at an actual spawn (same critical section as the take) and at collection. After the fence, launch work is resolved explicitly (token dropped, waiters `Err(Shutdown)`, entry removed); retire and stop work are delegated to Host's shutdown, whose own report covers the group; nothing is counted for them | Item 2.5, 2.7 |
+| R4-4 connection-task handoff | The launch task drives the connection future during the handshake and returns it in its outcome; the supervisor spawns it into its set and only then publishes, in one critical section. After the fence, or with zero holders, the future is dropped unspawned | Item 2.1, 2.2, 2.5 |
+| R4-5 stop reply discarded | Host `CloseReport.stopped_live: Option<bool>` (this close's own `Stop` reply; `None` when missing or invalid), forwarded by `WireCloseReport`; only `Some(false)` after a stdio end upgrades to `ServerLost` (X2) | Item 13.1; §9.2 |
+| R4-6 seal cause type | Admission sealing separated from the disposition: `WireSender::seal()` takes no cause and is idempotent; the boundary carries only the discarded bytes; Route keeps a first-wins `ConnectionFailure` latch, with Wire's causes mapped into it | Item 13.1; §9.2 |
+| R4-7 cache freshness | Every stat takes an `InstanceCache` ticket just before its syscall; a write with an older ticket than the stored one is rejected; a launch writes its final post-handshake stat before publication or refusal (never its earlier capture), and an identity change bumps the epoch | Item 0, Item 3 |
+| R4-8 cleanup predicate without a cancel | A turn's link row is the persisted fact: the terminal commit deletes it, in the same transaction, when the committed cleanup is quiescent, and keeps it otherwise, cancel or not. The predicate reads remaining links to unproven anchors. No new column, no new C1 field (X0-R4-Q2) | Item 1, Item 6.5; §9.2, §9.3 |
+| R4-9 idle-driver loss | The registration's normalizer is driver-owned (the adapter normalizes), outside the connection task; when its lane ends without a boundary it installs the sticky loss and latches the driver's failure whether or not a turn runs; the loss reaches Core through `TurnEnd.loss` or the driver's close report and `record_loss` | Item 13.2, Item 10 |
+| R4-10 four-entry claim | Live and unproven server groups are bounded by the four slots; retained registry entries are not, and are bounded by their tasks | Item 2.3 |
+| R4-11 per-entry task bound | Publication happens when the launch outcome is collected, so an entry has either its launch task alone, or its connection task plus at most one cleanup task; zero-holder publication spawns no connection task; tested | Item 2.1, 2.2, 2.5 |
+| R4-12 old-identity test | A later `prepare` from any session hashes with the cache's fresh identity and pins the new server; separately, an already held old instance stays valid | Item 3 |
+| R4-13 paused reader | While paused the reader does not poll stdin; it waits on the mode's condition variable with a 10 ms timeout; a paused, non-empty-pipe test | Item 14 |
+| R4-14 unknown loss count | Internally `u64::MAX` means unknown or saturated; publicly `omitted` is `null` then (X0-R4-Q3) | Item 10; §9.1, §9.3 |
+| R4-15 "one syscall" | "One non-blocking `poll_write` call" | Item 12.2; §9.2 |
 
 ---
 
@@ -172,7 +197,10 @@ Labels: **fact** (read in code or a spec), **decision** (this design),
   becomes a lease.
 - **Lane generation.** A driver's thread registration on a connection: a
   new one at every `thread/start` or `thread/resume`.
-- **Link.** The durable row `server_turns (session_id, turn) → anchor_id`.
+- **Link.** The durable row `server_turns (session_id, turn) → anchor_id`,
+  committed before the turn's first vendor byte and kept while the turn
+  may have left work on that server: its terminal commit deletes it when
+  the turn's cleanup is quiescent (item 6.5).
 - **Cutoff.** The point in the connection's decode order at which a
   driver's close takes effect for its registration (item 8.2).
 - **Cleanup intent.** A connection-owned interrupt or unsubscribe that a
@@ -220,10 +248,11 @@ before 4.1 is visible to 4.2. A spurious wake costs one synchronous
   reservation (item 2.2).
 - Codex `prepare()` hashes the driver's recipe with the `InstanceCache`'s
   current identity for its binary on every call (a SHA-256 over a few KiB,
-  no syscall; item 3). A launch that stat'ed a changed binary updates the
-  cache before it publishes, so a waiter woken by that publication
-  re-prepares with the new identity and finds the new server without a
-  slot (r3 F10).
+  no syscall; item 3). A launch writes its final post-handshake stat to
+  the cache (rejected if a newer-ticketed stat already wrote) before the
+  supervisor publishes it, and an identity change bumps the epoch, so a
+  waiter woken by that publication re-prepares with the new identity and
+  finds the new server without a slot (r3 F10, r4 R4-7).
 
 **Why nothing smaller works.** Without a driver before admission there is
 nothing to ask. Without a subscription that precedes the check, an
@@ -286,6 +315,11 @@ channel is treated as no wake.
      - `server_links(turns: &[(SessionId, TurnNumber)])`: at most 256 links.
    - Store reads: `UnfinishedTurn.server_anchor: Option<String>` (`LEFT
      JOIN server_turns`); the close and status predicate of item 6.5.
+   - Link release (r4 R4-8): every Store record that commits a turn's
+     terminal (`TerminalRecord` and the closing-terminal,
+     failure-resolution and recovery records) gains
+     `link_released: bool`, default `false`; when `true` the same
+     transaction deletes the turn's `server_turns` row, if any (item 6.5).
 3. **Wire server connection without a turn folder.**
    `WireRuntime::open_connection` branches on `spec.owner`: `Turn` keeps
    today's path; `Server` creates `evidence/servers/<server-id>/` through
@@ -337,38 +371,54 @@ pub struct Servers {
     state: Mutex<Registry>,              // std mutex, never held across .await
     epoch: watch::Sender<u64>,           // item 0 readiness
     work: Notify,                        // wakes the supervisor (item 2.5)
-    snapshot: Mutex<Option<(Instant, oneshot::Sender<SupervisorReport>)>>, // item 2.7
-    supervisor: Mutex<Option<JoinHandle<()>>>,
-    cancel: CancellationToken,
+    supervisor: Mutex<Option<JoinHandle<()>>>, // collected by `join` (item 2.7)
+    cancel: CancellationToken,           // stops launch handshakes at the fence
     declines: DeclineTable,              // item 11
 }
 struct Registry {
     by_key: HashMap<ConfigHash, ServerId>,   // the one non-retiring instance per key
-    servers: HashMap<ServerId, Entry>,       // every instance not yet removed
-    fenced: bool,                            // shutdown began
+    servers: HashMap<ServerId, Instance>,    // every instance not yet removed
+    fenced: bool,                            // shutdown began (item 2.7)
+    orphaned: bool,                          // the supervisor unwound (item 2.5)
+    live_tasks: usize,                       // spawned and not yet collected
+    failed_tasks: usize,                     // collected as panicked or cancelled
 }
+struct Instance { entry: Entry, work: Option<Work>, tasks: u8 /* spawned, not collected */ }
 enum Entry {
     Launching { key: ConfigHash, holders: u32, ready: watch::Sender<Launch>, connection: Option<Arc<Connection>> },
     Live      { key: ConfigHash, holders: u32, leases: u32, connection: Arc<Connection>, report: InstanceReport },
     Retiring  { connection: Option<Arc<Connection>> },
     Lost      { connection: Arc<Connection> },
 }
-// Beside each Entry, under the same mutex:
-struct Owned { work: Option<Work>, tasks: u8 /* live tasks of this instance */ }
 enum Work { Launch(LaunchSpec, CapacityToken), Retire, Stop /* abnormal end, item 13.2 */ }
+enum TaskKind { Launch, Connection, Retire, Stop }
+enum LaunchOutcome {
+    /// Handshake done and the final stat matched the recipe (item 3).
+    Ready { task: ConnectionTask, report: InstanceReport },
+    /// `task` is the connection future when Wire's open succeeded and it has not ended.
+    Failed { cause: LaunchFailure, task: Option<ConnectionTask> },
+}
+/// The connection task (items 5, 8, 12, 13): owns the unique `WireMessages`
+/// receiver, the thread table, the request table and the feeder.
+type ConnectionTask = Pin<Box<dyn Future<Output = ConnectionEnd> + Send>>;
 pub struct ServerPin { server: ServerId, /* Arc<Servers>; releases on Drop */ }
 pub struct Lease     { server: ServerId, id: LeaseId, /* the pin */ }
 ```
 
-`Launching.connection` is set as soon as Wire opened the server's
-connection, before the handshake, so a failed launch's cleanup always has
-its owner (item 2.5). `work` is the instance's coalesced pending task
-request (r3 F4): setting it and notifying `work` replaces a spawn channel,
-so nothing can be full and a retirement's cleanup ownership is state on
-the entry, never a message that can be dropped. An entry is removed only
-when its terminal state is reached **and** `tasks == 0`, so retained
-entries bound retained tasks (at most two each: the connection task and
-one of launch, retire or stop).
+`Launching.connection` (the `Connection`'s sender side) is set as soon as
+Wire opened the server's connection, before the handshake, so a failed
+launch's cleanup always has its owner (item 2.5). `work` is the instance's
+coalesced pending task request (r3 F4): setting it and notifying `work`
+replaces a spawn channel, so nothing can be full and a retirement's
+cleanup ownership is state on the entry, never a message that can be
+dropped. `tasks`, `live_tasks` and `failed_tasks` change only when the
+supervisor spawns a task and when it collects one (item 2.5). An entry is
+removed only when its terminal state is reached **and** `tasks == 0`.
+**Per-entry bound (r4 R4-11):** publication happens when the launch
+outcome is collected (item 2.2), so an entry has either its launch task
+alone, or its connection task plus at most one cleanup task (retire or
+stop; a second request coalesces into the pending or running one): at
+most two.
 
 #### 2.2 Launch, reservations and publication
 
@@ -391,11 +441,25 @@ one of launch, retire or stop).
   supervisor.
 - A reservation holder waits on `ready`, bounded by its own wall, stop and
   force; dropping the wait drops the reservation (fenced).
-- **Publication** (launch task), one critical section: `Launching {
-  holders: n }` becomes `Live { holders: n, leases: 0 }`, every surviving
-  reservation now a pin. If `n == 0` it is published straight to
-  `Retiring` and the retirement task is started. Then `ready ← Ok`, epoch
-  bump.
+- **Launch task.** It opens the server's Wire connection (owner
+  `Server`), sets `Launching.connection` (fenced), builds the
+  `ConnectionTask` (which takes the unique `WireMessages` receiver) and
+  drives it **inside the launch task** during the handshake: one `select!`
+  over the handshake and `task.as_mut()`, so the connection task pairs the
+  handshake's replies (r4 R4-4). It then takes the final stat (item 3)
+  and returns `Ready { task, report }`, or `Failed { cause, task }`.
+  A connection task that ended during the handshake fails the launch with
+  its cause (`task: None`).
+- **Publication** (the supervisor, applying a `Ready` outcome; one
+  critical section): with `holders: n > 0` and no fence, it first spawns
+  `task` into its set (`tasks + 1`, item 2.5), and only then turns
+  `Launching { holders: n }` into `Live { holders: n, leases: 0 }`, every
+  surviving reservation now a pin, and sets `ready ← Ok`; the epoch is
+  bumped after the critical section. So the live connection is never
+  exposed before its connection task is owned. With `n == 0` the task is
+  dropped unspawned (no lease can exist), the entry becomes `Retiring`
+  with `work = Retire`, and `ready ← Err(Retired)`. After the fence, see
+  item 2.5.
 - **Launch gates.** The handshake (`initialize`, `initialized`, paginated
   `model/list`) runs under `SERVER_HANDSHAKE = 60 s` from spawn
   (packet: cold `initialize` took 38 s), the daemon force and the registry
@@ -411,8 +475,13 @@ one of launch, retire or stop).
   only if it still maps to that `ServerId`.
 - A key whose instance is `Retiring` or `Lost` is not in `by_key`, so a new
   instance launches under the same key with its own slot. At most one
-  non-retiring instance per key; instances in total are bounded by the four
-  slots.
+  non-retiring instance per key.
+- **Bounds (r4 R4-10).** Live and unproven server **groups** are bounded
+  by the four slots: Host holds a slot until it proves the group absent.
+  Retained registry **entries** are not: Host can release a slot before
+  the entry's tasks are collected, so an entry outlives its slot until
+  then. Each retained entry holds at most two tasks (item 2.1), and the
+  supervisor removes it when they are collected.
 - A late callback for a removed or replaced instance is a no-op, counted in
   diagnostics.
 
@@ -437,47 +506,82 @@ one of launch, retire or stop).
 - **Daemon idle exit.** Host's `pending_cleanup()` excludes live
   server-owned controls; final shutdown stops them.
 
-#### 2.5 Supervision (r2 N6; r3 F2–F4)
+#### 2.5 Supervision (r2 N6; r3 F2–F4; r4 R4-1–R4-4, R4-11)
 
 **Mechanism** (runtime §2: each owner has a cancellation token and a
 `JoinSet`; tasks return typed outcomes; a `TaskTracker` alone is
 insufficient).
-- One supervisor task, spawned at construction, **exclusively owns** the
-  `JoinSet<ServerTaskOutcome>` and a map `task::Id → (ServerId, TaskKind)`,
-  `TaskKind = Launch | Connection | Retire | Stop`. Nothing else touches
-  the set.
+- One supervisor task, spawned at construction (its handle in
+  `Servers::supervisor`), **exclusively owns** the
+  `JoinSet<ServerTaskOutcome>` and a map `task::Id → (ServerId, TaskKind)`.
+  Nothing else touches the set.
 - **Pending work, not a channel (F4).** Registry code sets an entry's
-  `work` and notifies `Servers::work`. The supervisor, woken, takes every
-  entry's `work` under the mutex (incrementing `tasks`), releases the
-  mutex, and spawns each. A `Retire` set while one runs, or while a `Stop`
-  is pending, coalesces. There is no full or closed state:
-  - after the registry fence (item 2.7) `Launch` work is not spawned: its
-    capacity token is dropped and its waiters get `Err(Shutdown)`;
-  - after the fence `Retire` and `Stop` work is not spawned either: the
-    instance's group is a live Host control, which Host's shutdown closes
-    in the same step (item 2.7); ownership passes by construction, and
-    the instance is counted as unjoined.
-- **Loop** (`select!`, biased): the work notification → take and spawn;
-  `set.join_next_with_id()` only while the set is non-empty → apply the
-  outcome (`tasks − 1`), using `Ok((id, outcome))` or `JoinError::id()`
-  to find `(server, kind)` on panic or cancellation; the snapshot request
-  (item 2.7). It ends only when the token is cancelled, no work is
-  pending and the set is empty.
-- **Who cleans up when a task fails before its normal cleanup:**
-  - **Launch** ended without publication (an error, a panic, a
-    cancellation): `ready ← Err`, `by_key` removed (fenced), and, if
-    `connection` was set, the instance moves to `Retiring` with
-    `work = Retire`. If Wire's open itself failed, Host's acquisition
-    failure path already owns the group and the entry is removed.
+  `work` and calls `Servers::work.notify_one()`, which keeps a permit when
+  the supervisor is not waiting. A `Retire` or `Stop` requested while
+  either is pending or running coalesces. There is no full or closed
+  state.
+- **Loop.** Each iteration:
+  1. Under the registry mutex, for every instance with `work`: before the
+     fence, take it and spawn it into the set in the same critical section
+     (`JoinSet::spawn` is synchronous; nothing between the take and the
+     spawn can skip it), recording its ID, `tasks + 1` and
+     `live_tasks + 1` (R4-3); after the fence, resolve it without
+     spawning (below). Then, if `fenced && live_tasks == 0`, return: the
+     set is empty and no work can be spawned any more.
+  2. Await, `select!` biased: `set.join_next_with_id()`, only while the set
+     is non-empty → under the mutex apply the outcome, `tasks − 1`,
+     `live_tasks − 1`, using `Ok((id, outcome))` or `JoinError::id()` to
+     find `(server, kind)`, and `failed_tasks + 1` on a panic or
+     cancellation; or the work notification. Either way, back to 1.
+
+  There is no request to answer and no other exit (R4-1): `fence()` sets
+  `fenced` under the mutex that step 1 reads, then notifies.
+- **Fenced work is resolved explicitly (R4-3):**
+  - `Launch(spec, token)`: the capacity token is dropped (no group was
+    acquired), `ready ← Err(Shutdown)`, `by_key` removed (fenced), the
+    entry removed. Nothing is counted.
+  - `Retire` and `Stop`: not spawned. The group is a live Host control,
+    which Host's shutdown, running concurrently (item 2.7), closes; Host's
+    own report (`anchors`, `uncertain_anchors`, its own pending and failed
+    tasks, `failure`) records that cleanup's completion. The registry
+    counts nothing for it. The entry is removed once its `tasks == 0`.
+- **Launch outcomes (R4-4):**
+  - `Ready` before the fence: publication (item 2.2) spawns the
+    connection task, then publishes; with zero holders the task is
+    dropped unspawned and the instance retires.
+  - `Ready` or `Failed` after the fence: the returned connection future is
+    dropped unspawned and `ready ← Err(Shutdown)`; a group that exists is
+    left to Host's shutdown, as fenced `Retire` work is.
+  - `Failed`, or the launch task's panic or cancellation, before the
+    fence: `ready ← Err(cause)`, `by_key` removed (fenced), a returned
+    future dropped, and, if `connection` was set, the instance moves to
+    `Retiring` with `work = Retire`. If Wire's open itself failed, Host's
+    acquisition failure path already owns the group and the entry is
+    removed.
+- **Other task ends:**
   - **Connection** task ended normally: the instance is already `Lost` or
-    `Retiring`. Ended by a panic or cancellation: the **abnormal path**
-    (item 13.2), `work = Stop`.
+    `Retiring` (its owned sequence ran, item 13.1). Ended by a panic or
+    cancellation: the **abnormal path** (item 13.2), `work = Stop`.
   - **Retirement** or **stop** panicked or was cancelled: the instance
     stays `Retiring`/`Lost` (never pinned). Host still holds its live
-    control, which final shutdown force-closes; nothing else retries.
-- Each panic or cancellation increments the supervisor's `failed` count.
-  An ordinary error outcome (handshake refused, spawn failure) is not a
-  task failure.
+    control, which final shutdown closes; nothing else retries.
+  - An ordinary error outcome (handshake refused, spawn failure) is not a
+    task failure.
+- **Connection tasks at the fence.** The cancellation token stops only
+  launch handshakes. A live connection task is not cancelled: it ends
+  through its owned sequence (item 13.1) once Host's shutdown stops its
+  group and its stdout ends, or it is counted unjoined at the cutoff
+  (item 2.7).
+- **The supervisor's own failure (R4-2).** A guard owned by the
+  supervisor's body, dropped on unwinding, takes the registry mutex
+  (ignoring poison), sets `orphaned`, resolves every `Launching` entry's
+  `ready` with `Err(Internal)`, moves every instance out of `by_key`
+  (`Live` → `Lost`) and bumps the epoch. The dropped set aborts the
+  children: their groups stay Host's live controls, and an aborted
+  connection task ends its drivers' lanes without a boundary (item 13.2).
+  Afterwards `launch_or_join` refuses (a spawn failure, never cached) and
+  new work is left to Host's final shutdown. `join` reports the failure
+  (item 2.7).
 
 #### 2.6 Journal uncertainty outside any driver (G9)
 
@@ -496,35 +600,53 @@ insufficient).
 - Server launch, retirement and loss Host calls run only on the
   supervisor's tasks, so no dropped requester discards an outcome.
 
-#### 2.7 Daemon shutdown (r2 N7, N8)
+#### 2.7 Daemon shutdown (r2 N7, N8; r4 R4-1–R4-3)
 
 `AdapterSet::shutdown(deadline, turns)`:
-1. `Servers::fence()` (sync): `fenced = true`, cancel the token. No new
-   pin, reservation or launch; launch handshakes stop at their next await.
+1. `Servers::fence()` (sync): under the registry mutex `fenced = true`;
+   then cancel the token and notify the supervisor. No new pin,
+   reservation or launch; launch handshakes stop at their next await;
+   pending work is resolved explicitly (item 2.5).
 2. Run concurrently, both under the same absolute `deadline`:
    - the existing Route, Wire and Host shutdown (Host closes every live
      control, servers included, with its existing 1 s finalization reserve;
      Codex handles TERM gracefully);
-   - `Servers::join(cutoff = deadline − FINALIZE_RESERVE)`: place a
-     snapshot request `(cutoff, reply)` and notify the supervisor. The
-     supervisor answers **at once** when its set is empty and no work is
-     pending, else **at the cutoff**, with its current
-     `SupervisorReport { unjoined: set.len() + pending work, failed }`
-     (r3 F2). Answering does not end it: it keeps running and owning the
-     unfinished tasks, which end once Host has stopped their groups.
-3. Fold into the existing report: `pending_tasks += unjoined`,
+   - `Servers::join(cutoff = deadline − FINALIZE_RESERVE)`: takes the
+     supervisor's `JoinHandle` and awaits it until the cutoff (a guard
+     puts the handle back if `join` is itself dropped). The supervisor
+     returns only when fenced with an empty set (item 2.5), so its normal
+     end means every task it spawned was collected.
+3. Read the counts under the registry mutex when `join` returns:
+
+   | Supervisor | `unjoined` | `failed` |
+   |---|---|---|
+   | Ended | 0 | `failed_tasks` |
+   | Panicked or cancelled (`JoinError`) | 0 | `failed_tasks + 1 + live_tasks` (itself and the children its dropped set aborted) |
+   | Still running at the cutoff | `live_tasks + 1` (its children and itself) | `failed_tasks` |
+
+   In the last case the handle goes back into `Servers::supervisor` and
+   stays owned by the adapter set until the process exits (runtime §2,
+   §6.2). A zero child count alone therefore never reads as clean: the
+   supervisor's own state is part of the report (R4-2). Fenced retire and
+   stop work counts nothing here; Host's report covers that cleanup
+   (item 2.5).
+4. Fold into the existing report: `pending_tasks += unjoined`,
    `failed_tasks += failed`, and append to `failure` the bounded text
    "server registry: {unjoined} tasks unjoined, {failed} failed" when
    either is non-zero. Core's clean-exit predicate (`pending_tasks == 0 &&
    failed_tasks == 0`) then covers the registry unchanged. No new report
    field.
 
-A supervisor still running at the deadline stays owned by the adapter set
-until the process exits (runtime §2, §6.2).
-
 **Tests that fail first.**
 - X3, unit (`codex/servers.rs`, stand-in connection):
-  `reservation_survives_publication`, `zero_holder_publication_retires`,
+  `reservation_survives_publication`;
+  `zero_holder_publication_spawns_no_connection_task` (holders reach zero
+  before the supervisor collects the launch outcome: the connection task
+  is dropped unspawned, one retirement task runs, and the entry never has
+  more than two tasks; R4-11);
+  `connection_task_spawned_before_publication` (a test hook between the
+  spawn and the publication: no pin is possible before the task is in the
+  set, and the first reply after publication is paired by it; R4-4);
   `retiring_key_launches_new_instance`,
   `stale_release_does_not_touch_replacement`,
   `launch_panic_resolves_waiters_and_retires_connection`,
@@ -534,16 +656,25 @@ until the process exits (runtime §2, §6.2).
   then a launch is requested: it is still collected);
   `retire_requests_coalesce` (two retirement requests, one task);
   `retained_entry_until_tasks_collected`;
+  `fence_resolves_pending_launch` (launch work pending at the fence: the
+  token is released, waiters get `Err(Shutdown)`, nothing is spawned or
+  counted); `ready_outcome_after_fence_is_not_published`;
   `fenced_retirement_left_to_host_shutdown` (a retirement requested after
-  the fence is not spawned, the group is stopped by Host's shutdown, and it
-  counts as unjoined).
+  the fence is not spawned and not counted; Host's shutdown stops the
+  group and proves it absent; the exit is clean);
+  `empty_supervisor_ends_at_fence` (nothing pending, a test hook holding
+  the supervisor between its wake and its state check: once released,
+  `join` returns `0/0` before the cutoff; R4-1).
 - X2: `daemon_idle_exit_not_blocked_by_idle_server`;
   `host_journal_uncertain_watch`.
 - X3: `shutdown_stalled_registry_task_does_not_delay_host_cleanup` (a
-  stand-in retirement that never ends: Host still stops every group before
-  its deadline; the supervisor answers the snapshot at the cutoff with one
-  unjoined task, and the exit is not clean);
-  `registry_panic_counts_failed_task`.
+  stand-in retirement started before the fence that never ends: Host
+  still stops every group before its deadline; at the cutoff `join`
+  reports `unjoined = 2`, the task and the supervisor, and the exit is not
+  clean); `registry_panic_counts_failed_task`;
+  `supervisor_panic_is_reported` (a test hook panics the supervisor during
+  a launch handshake: the waiters get `Err(Internal)`, `launch_or_join`
+  then refuses, and `join` reports `failed ≥ 2`).
 - X4: `c4_two_sessions`, `codex_server_close`.
 
 ### Item 3. `config_hash` and binary changes (r2 N18)
@@ -573,27 +704,56 @@ until the process exits (runtime §2, §6.2).
 - `via-adapters` gains the workspace dependency `sha2` (shared with
   Claude's Q4).
 
+**The identity cache (r4 R4-7).** `codex::InstanceCache` (Adapters
+`codex/launch.rs`) maps a program path to `Observed { identity, ticket }`
+under a std mutex, with a monotonic `next_ticket: u64`.
+- Every stat takes a ticket immediately before its syscall, on the same
+  blocking step, and then calls `observe(path, ticket, identity)`.
+- `observe` writes only when `ticket` is greater than the stored ticket; a
+  stale write is rejected and changes nothing. A write that changes the
+  identity bumps the registry epoch.
+- Two stats write: `run_turn`'s stat before registry insertion, and a
+  launch's **final** stat after its handshake. Publication writes nothing
+  else; in particular it never writes the identity captured before the
+  handshake.
+
+So an operation that stat'ed earlier can never overwrite an observation
+ticketed after it. The cache holds the identity seen by the
+latest-ticketed stat that wrote, and every launch ends with a stat newer
+than its own first one.
+
 **Binary change between prepare and launch.**
 1. `prepare` is synchronous and does no syscall: on every call it hashes
    the driver's recipe with the `InstanceCache`'s **current** identity for
    its binary path (r3 F10). A pin on an existing instance is always
    valid: an existing server keeps its leases after a binary change ("a
-   new server key follows only for new connections", C2 §5).
+   new server key follows only for new connections", C2 §5), and a
+   session's own lease is matched first (item 2.2).
 2. `run_turn` with `NeedsConnection` recomputes the whole recipe from a
-   fresh `stat` before registry insertion, and stores that identity in the
-   `InstanceCache`. Insertion and lookup use that hash.
-3. **Publication of a fresh recipe reaches waiters.** The launch task
-   updates the `InstanceCache` with the identity it stat'ed before it
-   publishes and bumps the epoch. A turn waiting for a slot with the old
-   identity is woken (item 0), re-prepares with the cache's new identity,
-   finds the new server and pins it without a slot.
-4. The launch task spawns exactly the recipe it hashed. After the handshake
-   it re-stats the program path; an identity different from the recipe's
-   refuses publication: the launch fails as a spawn failure (never cached)
-   and the instance retires. So no instance is published under a hash
-   belonging to another binary identity. (A replacement and restoration
-   with identical device, inode, size and nanosecond mtime between the two
-   stats is not detected; accepted.)
+   fresh `stat` before registry insertion and offers that identity to the
+   cache. Insertion and lookup use that stat's hash, whether or not the
+   cache accepted the write.
+3. The launch task spawns exactly the recipe it hashed. After the
+   handshake it re-stats the program path (the final stat) and offers it
+   to the cache **before** returning its outcome:
+   - same identity as the recipe: `Ready`; the supervisor publishes (item
+     2.2) and bumps the epoch. A turn waiting for a slot with the old
+     identity is woken (item 0), re-prepares with the cache's new
+     identity, finds the new server and pins it without a slot;
+   - a different identity: `Failed` (a spawn failure, never cached), the
+     instance retires; the final stat's write (if not stale) bumped the
+     epoch, so waiters re-prepare with the identity it saw.
+
+   So no instance is published under a hash belonging to another binary
+   identity. (A replacement and restoration with identical device, inode,
+   size and nanosecond mtime between the two stats is not detected;
+   accepted.)
+4. **Residual.** Tickets order stat starts, not observations: two stats
+   racing a replacement in opposite ticket and syscall order can leave the
+   cache one identity behind until the next stat. The cost is a slot wait,
+   never a second server: when the waiter gets its slot, its own fresh
+   stat in `run_turn` finds the live server through `launch_or_join`, which
+   pins it and releases the token.
 
 **Failure behaviour.** A `stat` failure in `run_turn` is a spawn failure,
 never cached, nothing sent.
@@ -601,8 +761,15 @@ never cached, nothing sent.
 **Tests that fail first.** X1: equal inputs → equal hash; each component
 changes it; excluded inputs do not; display is 16 hex digits. X3:
 `binary_change_before_launch_uses_fresh_hash` (prepare saw the old
-identity, the turn launches under the new hash, and a later old-hash
-`prepare` does not match it); `binary_change_during_handshake_refuses_publication`;
+identity, the turn launches under the new hash, and a later `prepare`
+from another session hashes with the cache's fresh identity and pins the
+new server; R4-12); `held_old_instance_stays_valid` (a session leasing
+the old-identity server keeps getting `Pinned` on its own lease after the
+change, while a new session pins the new server; R4-12);
+`binary_change_during_handshake_refuses_publication` (the cache then
+holds the final stat's identity and the epoch was bumped);
+`stale_identity_write_rejected` (a stat whose ticket is older than the
+stored one completes last: the cache keeps the newer observation; R4-7);
 `waiter_with_old_identity_joins_fresh_server` (four slots held, a waiter
 prepared with the old identity, another session's launch publishes the
 new identity's server: the waiter is woken and pins it without a slot).
@@ -777,20 +944,44 @@ kept; C1 is not amended for this.
 
 **Test (X2).** `shutdown_force_shared_is_unknown`.
 
-#### 6.5 Close and status cleanup for shared sessions
+#### 6.5 Close and status cleanup for shared sessions (r4 R4-8)
+
+**The persisted fact is the link.** A turn's link (item 1) is committed
+before its first vendor byte. Core's commit of the turn's terminal sets
+`link_released` (item 1) to whether the turn's cleanup is `Quiescent`,
+whatever decided it: the `TurnEnd` cleanup, a durable settlement,
+recovery's meet (item 6.2) or shutdown's fold (item 6.3). The same
+transaction deletes the link when `true` and keeps it otherwise.
+- So the turn's cleanup uncertainty is persisted atomically with its
+  terminal disposition, whether or not a cancel occurred: a spontaneous
+  transport, protocol or overflow failure with `cancel: null` and cleanup
+  `Uncertain` keeps its link.
+- No new column and no new C1 field.
+- A terminal committed without a known quiescent cleanup (the
+  failure-resolution batch after a Store write of uncertain outcome)
+  keeps the link by default. A K1 revision of an `unknown` turn leaves the
+  link as it is. A running turn has its link.
 
 One Store predicate, `session_cleanup_uncertain(session)`, used by the
 close result and status `process.cleanup`:
 - any session-owned anchor without an absence proof (today's rule); or
-- any turn of the session with a link whose terminal envelope has
-  `cancel.cleanup = "uncertain"` and whose linked anchor has no absence
+- any remaining link of the session's turns whose anchor has no absence
   proof.
 
 It never reads another session's turns. `process.alive` keeps
-`live_armed(unproven_anchors)`, the status read adding the unproven server
-anchors linked to the session's turns.
+`live_armed(unproven_anchors)`, the status read adding the anchors of the
+session's remaining links. On a shared route a session therefore reads
+alive while it runs a turn, or while a turn of it may have left work on a
+live server; an idle session whose turns all ended quiescent reads
+`alive: false` even while its server serves other sessions (X0-R4-Q2).
 
-**Test (X2).** `shared_close_cleanup_from_turn_facts`.
+**Tests (X2).** `shared_close_cleanup_from_turn_facts`;
+`spontaneous_uncertain_end_keeps_link` (a transport loss with
+`cancel: null` and cleanup `Uncertain`, the server group still unproven:
+close and status report `uncertain`; once the group is proved absent,
+`quiescent`); `quiescent_terminal_releases_link` (a completed turn: the
+link is deleted in the terminal's transaction; a crash injected before
+that commit leaves the turn nonterminal and the link in place).
 
 ### Item 7. `daemon/status.servers` (G2)
 
@@ -855,7 +1046,12 @@ struct Registration { lease: LeaseId, generation: u64, lane: IngressLane }
 
 **Core side: K1's change, not this design's.** K1 makes the lane actor
 dispose observations concurrently with `driver.close`, so the C2 channel
-keeps draining while the driver delivers its prefix. Under C1 §3.6 the
+keeps draining while the driver delivers its prefix: at `820e9fb`,
+`Lane::close_draining` polls the driver's close apart from the disposal
+under way and, when the close ends, closes admission and finishes that
+disposal, never cutting it off. A normal Codex close retires no process,
+so it publishes no `Retiring` stage (only a connection failure does, item
+13.1); its delivery barrier is the close future itself. Under C1 §3.6 the
 close deadline bounds driver close and Route delivery only (F5); Core's
 durable disposal of everything delivered continues past it until it
 completes or the existing Store-failure resolution applies, and is never
@@ -975,8 +1171,9 @@ reply; written once the reply brings the `turnId`);
 - **Health.** A full thread ingress lane, or the C2 10 s stall, latches the driver's sticky `DriverFailure::ObservationOverflow`.
 - **Loss record.** The driver keeps one sticky
   `ObservationLoss { trigger: (SessionId, TurnNumber), generation, first_unqueued: u64, omitted: u64 }`
-  (saturating; `u64::MAX` when the count is unknown, as on the abnormal
-  path of item 13.2), updated by later loss in the same generation (a
+  (saturating; `omitted == u64::MAX` means **unknown or saturated**, as on
+  the abnormal path of item 13.2; publicly `omitted: null` then, r4
+  R4-14), updated by later loss in the same generation (a
   close's undelivered prefix included, item 8.2). A driver holds at most
   one record: a quarantined or failed generation retires its driver. It goes to connection
   diagnostics (`via.log`, with the server ID), and to Core:
@@ -1012,8 +1209,10 @@ reply; written once the reply brings the `turnId`);
   `observations_lost`: `message` (≤ 1 KiB) "some observations of this
   turn's shared-server thread were lost; this result may be incomplete";
   `data` (≤ 4 KiB) `{trigger_turn: "s_…/N", generation, first_unqueued,
-  omitted}`. It covers every loss source: ingress overflow, the C2 stall,
-  a close's undelivered prefix and a failed connection task.
+  omitted}`, `omitted` being `null` when the count is unknown or
+  saturated. It covers every loss source: ingress overflow, the C2 stall,
+  a close's undelivered prefix and a failed connection task (an idle
+  driver's included, item 13.2).
 - Quarantined traffic is read, counted and discarded; replies still pair,
   requests are still declined. Reserved-path or global exhaustion fails
   the connection.
@@ -1099,7 +1298,9 @@ the placeholder ordering, the closed-thread decline and the reopen case.
   checks ends the attempt (withdrawn or expired: `NotWritten`, stdin
   open). So withdrawal, expiry and the first successful byte are decided
   by one lock, exactly once. The lock is held only across one
-  non-blocking syscall.
+  non-blocking `poll_write` call, never an `.await` (Tokio's Unix
+  `poll_write` may retry `WouldBlock` internally, so it is not
+  necessarily one syscall; r4 R4-15).
 - **`withdraw(ticket) -> WriteState`**: J0's `expire(ticket)` generalized
   to data tickets, to claimed jobs, and to a caller's removal before the
   deadline; synchronous, under the lock. From `Queued` or `Claimed` it
@@ -1200,102 +1401,181 @@ server-request replies.
   46,336 bytes); `staging_aggregate_includes_ingress`.
 - X5: decline deadline with the reader paused (item 14).
 
-### Item 13. Connection failure and server loss (r2 N9–N11; r3 F3, F7–F9)
+### Item 13. Connection failure and server loss (r2 N9–N11; r3 F3, F7–F9; r4 R4-5, R4-6, R4-9)
 
 #### 13.1 The owned sequence
 
 One sequence for every whole-connection failure, run by the connection
-task. Causes: `Exited` (Host's exit report for the leader reached the
-connection as Wire health), `Transport` (writer error, stdout end or
-read error), `Protocol` (an unattributable decode failure, item 5) and
-`Overflow` (staging, correlation or reply-bound exhaustion, an unanswered
-decline, items 9.1, 11, 12). Steps 2–4 run concurrently:
-1. **Latch** (at once, one step):
-   - connection health `Failed { cause }`;
-   - **`WireSender::seal(cause)`** (X2, synchronous, F8): under a std
-     mutex the stdout reader also takes around each admission, Wire stops
-     admitting; later complete messages are discarded and counted, so the
-     prefix is exactly what was admitted before the seal. This covers a
-     leader exit while descendants still hold stdout open. Wire's own
-     reader or writer failure seals with its cause before Route sees it;
-   - the instance `Live → Lost`, out of `by_key` (fenced); epoch bump;
-     no new pin, lease or write;
-   - `loss_deadline = now + SERVER_LOSS_EVIDENCE` (5 s).
+task (or by the supervisor on the abnormal path, 13.2).
+
+**Route's failure latch (R4-6).** Admission sealing is separated from the
+disposition. Each `codex::Connection` keeps one first-wins latch under a
+std mutex:
+```rust
+enum ConnectionFailure {
+    Exited(ExitReport),            // Host's exit report for the leader
+    Transport { stdio_end: bool }, // writer error, stdout end or read error
+    Protocol,                      // an unattributable decode failure (item 5)
+    Overflow,                      // staging, correlation or reply-bound exhaustion; an unanswered decline (items 9.1, 11, 12)
+    Internal,                      // the connection task failed (13.2)
+}
+```
+`Connection::fail(cause)` is the only writer: if a cause is already
+latched it returns, the later cause counted in diagnostics; otherwise it
+latches `cause` and, in the same critical section, calls
+`WireSender::seal()`. Competing detections therefore cannot produce
+different retained causes: the first one is the disposition.
+
+Wire's own failures, seen by the connection task through
+`next_message`/`drain_admitted` errors and `WireHealth`, map as:
+
+| Wire | `ConnectionFailure` |
+|---|---|
+| `WireHealth::Exited(report)` | `Exited(report)` |
+| stdout end (`Ok(None)`) | `Transport { stdio_end: true }` |
+| `FailureCause::Writer(BrokenPipe)` (`EPIPE`, which a dead leader produces) | `Transport { stdio_end: true }` |
+| any other `Writer(_)`; `Reader(Transport)` | `Transport { stdio_end: false }` |
+| `Reader(MessageTooLarge)`, `Reader(UnterminatedMessage)` | `Protocol` (evidence as item 5 step 2) |
+| `Reader(Overflow)` | `Overflow` |
+
+**Wire's seal** (X2, F8). `WireSender::seal()` is synchronous, takes no
+cause and is idempotent. Under a std mutex the stdout reader also takes
+around each admission, the first call stops admission; later calls change
+nothing. Later complete messages are discarded and their bytes counted,
+so the prefix is exactly what was admitted before the first seal. A Wire
+reader failure stops admission the same way (its reader stops), so the
+latch's `seal()` is then a no-op. This covers a leader exit while
+descendants still hold stdout open.
+
+Steps 2–4 run concurrently:
+1. **Latch** (at once, one step): `Connection::fail(cause)`; the instance
+   `Live → Lost`, out of `by_key` (fenced); epoch bump; no new pin, lease
+   or write; `loss_deadline = now + SERVER_LOSS_EVIDENCE` (5 s).
 2. **Host cleanup** (at once): `WireSender::close(CloseRequest { Stop,
-   loss_deadline })`. It never waits for stdout EOF.
+   loss_deadline })`. It never waits for stdout EOF. Its
+   `WireCloseReport.stopped_live: Option<bool>` forwards Host's typed stop
+   reply (R4-5, §9.2): `Some(b)` is the anchor's `Stopping
+   { stopped_live: b }` to this close's own `Stop`; `None` means no valid
+   reply arrived (lost, invalid, or the deadline passed).
 3. **Prefix drain:** `WireMessages::drain_admitted()` (X2) yields every
-   message admitted before the seal, then `Boundary { cause,
-   discarded_bytes }`; it never waits for more output. The demux routes
+   message admitted before the seal, then `Admitted::Boundary
+   { discarded_bytes }`; it never waits for more output. The demux routes
    each message as usual and each registration receives the boundary
    after its prefix, so a terminal decoded before the failure is applied
    first.
 4. **Fan-out**, after the prefix reached every lane and Host's report is
-   in (or `loss_deadline` passed). Disposition by cause, kept from the
-   latch (F9):
+   in (or `loss_deadline` passed). Disposition by the latched cause (F9):
    - `Protocol` → `failed(protocol)`; `Overflow` → `failed(overflow)`
      (C1 §7.6 "Observation or message overflow failed the connection");
      VIA's stop never changes them;
    - `Exited` → `ServerLost` (`failed(server_lost)`): Host's exit evidence
      was ordered before the boundary;
-   - `Transport` → `TransportLost` (`unknown`, C1 §7.6 "Transport lost,
-     process alive or unconfirmed"), **upgraded to `ServerLost` only**
-     when the latch was a stdio end (stdout end or `EPIPE` on stdin, which
-     a dead leader produces) **and** Host's `Stop` received the explicit
-     reply `Stopping { stopped_live: false }` (F7). A missing reply,
-     `stopped_live: true`, or `forced == false` alone never upgrades it.
-     (Residual window: a leader that closed its own stdio and then exited
-     before the anchor received `Stop` is counted as lost; accepted, as
-     the stop is requested at the latch.)
+   - `Transport { stdio_end }` → `TransportLost` (`unknown`, C1 §7.6
+     "Transport lost, process alive or unconfirmed"), **upgraded to
+     `ServerLost` only** when `stdio_end` **and** `stopped_live ==
+     Some(false)` (F7, R4-5). `None`, `Some(true)`, or `forced == false`
+     alone never upgrades it. Residual windows, accepted: a leader that
+     closed its own stdio and then exited before the anchor received
+     `Stop` is counted as lost; and the anchor also answers `false` when
+     its own cleanup had already begun before this `Stop` (a signal to the
+     anchor, or its control's end), which happens only while the anchor
+     itself is being torn down (fact: `anchor.rs` `stopped_by_host`);
+   - `Internal` → item 13.2.
+
    Each nonterminal turn's driver returns that cause, with cleanup
    `Quiescent` only when Host proved group absence, else `Uncertain`, and
    the shared leftover snapshot for `ServerLost` once S-LEFTOVER lands in
    Host (until then `leftovers: null`). A turn's own wall, stop or force
    still ends its wait first.
+
+   **K1's stages.** Each registration's teardown publishes the generic
+   driver's `Retiring` stages K1 defines: `CleanedUp` once Host's report
+   is in (or `loss_deadline` passed), so the cleanup facts are known;
+   `Delivered` once its prefix and boundary reached the C2 sink, or were
+   counted as loss. A driver close during the failure waits on them as
+   K1's generic close does, and Core's `Lane::close_draining` keeps
+   draining meanwhile.
 5. The supervisor removes the instance once its tasks are collected
    (fenced); Host keeps the slot until absence is proved; an uncertain
    journal write sets the watch (item 2.6).
 
-#### 13.2 The abnormal path: the connection task itself failed (F3)
+#### 13.2 The abnormal path: the connection task itself failed (F3, R4-9)
 
 The connection task owns the unique `WireMessages` receiver and the
 thread table, so a panic or cancellation loses both; nothing can drain
 them. The supervisor, on that `JoinError`:
-1. seals Wire through the `WireSender` the entry's `Connection` still
-   holds (`seal(Internal)`), sets the instance `Lost` and `work = Stop`;
-   the stop task runs `WireSender::close(Stop, now + 5 s)`;
+1. calls `Connection::fail(Internal)` through the entry's `Connection`
+   (a cause already latched stays, and its seal is already done), sets
+   the instance `Lost` and `work = Stop` (coalesced with a pending or
+   running retirement); the stop task runs `WireSender::close(Stop,
+   now + 5 s)`;
 2. counts the task as failed.
 
-Each driver's ingress lane ends without a boundary (its sender died with
-the task). The driver latches `DriverFailure` (an owned task's failure)
-and returns its nonterminal turn as `TransportLost` (`unknown`), cleanup
-`Uncertain`, with `TurnEnd.loss = { trigger: that turn, generation,
-first_unqueued: its next sequence, omitted: u64::MAX }`: staged
-observations, a staged terminal included, are explicitly lost. Core adds
-`observations_lost` (item 10). This is the smaller option: the receiver
-is not kept outside the unwinding body.
+**The loss is recorded outside the failed task (R4-9).** Each
+registration's normalizer is driver-owned (the adapter normalizes, packet
+§2): it runs on the session's `TaskTracker`, outside the connection task,
+and holds the minimal canonical facts it needs: its session, its
+generation, the driver's latest turn of that generation and the next
+sequence it would consume. The ingress lane's sender died with the
+connection task, so the lane ends without a boundary. On that end,
+**whether or not a turn is running**, the normalizer:
+- installs the driver's sticky loss `{ trigger: the generation's latest
+  turn, generation, first_unqueued: the next sequence it would have
+  consumed, omitted: u64::MAX }` (unknown), or, when the driver already
+  holds a record, sets its `omitted` to `u64::MAX`;
+- latches the driver's `DriverFailure` (an owned task failed), so Core
+  retires the driver through C2 health; every close of it carries
+  `CloseReport.loss` (item 10).
+
+A running turn returns `TransportLost` (`unknown`), cleanup `Uncertain`,
+with `TurnEnd.loss`: staged observations, a staged terminal included, are
+explicitly lost. An idle driver has no `run_turn` to return it: its loss
+reaches Core through its close report, and `record_loss` commits one
+`late: true` `observations_lost` warning on the trigger turn when that
+turn is terminal (item 10). Example: A already `unknown`, its driver
+open, A's late terminal staged when the connection task panics: A stays
+`unknown`, its envelope unchanged, and it gets exactly one late warning.
+A driver with no registration on that connection installs no loss. The
+same holds when the supervisor's own failure aborted the connection task
+(item 2.5).
+
+This is the smaller option: the receiver is not kept outside the
+unwinding body, and only facts the driver already holds are used.
 
 **Tests.**
 - X2 (Wire): `drain_admitted_yields_prefix_then_boundary`;
   `seal_is_exact_prefix` (messages admitted before `seal` are yielded,
   one arriving after it is discarded and counted, with stdout still open
-  from a child).
+  from a child); `seal_is_idempotent` (a second `seal`, and a `seal` after
+  Wire's own reader failure, change nothing).
+- X2 (Host): `close_reports_stop_reply` (`Some(false)` when the vendor
+  exited before the `Stop`, `Some(true)` when it was live, `None` when the
+  reply is lost under `host.anchor.final_reply_lost` or the deadline
+  passes).
 - X3: `connection_task_panic_with_staged_terminal` (A's `turn/completed`
   staged when the task panics: A ends `unknown` with `observations_lost`,
   the server group is stopped and proved absent, the slot released,
-  `failed_tasks` counted); `correlation_failure_is_protocol_not_unknown`
-  (an unattributable line: both turns `failed(protocol)` after the same
-  sequence, Host's stop included).
+  `failed_tasks` counted); `connection_task_panic_idle_driver_reports_loss`
+  (A `unknown`, its driver open, its late terminal staged, no turn
+  running: A's driver latches failure, its close report carries the loss
+  with `omitted` unknown, exactly one late `observations_lost` event on A
+  with `omitted: null`, A's envelope unchanged);
+  `correlation_failure_is_protocol_not_unknown` (an unattributable line:
+  both turns `failed(protocol)` after the same sequence, Host's stop
+  included); `first_failure_cause_wins` (a protocol failure and Host's
+  exit report race: the first latched cause decides every turn's class,
+  the second is counted).
 - X4: `codex_server_lost_order` (exit evidence first: A's staged
   `turn/completed` completes A; B `server_lost`);
   `codex_transport_loss_is_unknown` (writer error with the server alive:
   B `unknown`, cleanup `quiescent` after Host's stop);
   `stop_reply_missing_stays_transport` (stdout end, no `Stopping` reply:
   B `unknown`); `stdout_end_then_dead_on_stop_is_server_lost` (stdout end,
-  `stopped_live: false`: B `server_lost`);
+  `stopped_live: Some(false)`: B `server_lost`);
   `server_loss_cleanup_not_blocked_by_inherited_stdout`;
   `overflow_failure_keeps_overflow_class`.
 
-### Item 14. The replay-harness join (r1 #23, r2 N23, r3 F12)
+### Item 14. The replay-harness join (r1 #23, r2 N23, r3 F12, r4 R4-13)
 
 **Fact.** Replay reads stdin on its own thread (`read_stdin`) whatever
 step runs; `await_signal` does not pause it; it reads a whole line with
@@ -1315,8 +1595,12 @@ step runs; `await_signal` does not pause it; it reads a whole line with
   line is consumed in chunks without being kept, recording its length and
   SHA-256 for assertion.
 - **`pause_input` / `resume_input`**: `Paused` stops reading until
-  `resume_input` or a 30 s ceiling; the fixture's end resumes. A paused
-  reader is not a detached reader: finalization still drains to EOF.
+  `resume_input` or a 30 s ceiling; the fixture's end resumes. While
+  paused the reader does **not** poll stdin (readable stdin would return
+  at once and spin): it waits on the shared state's `Condvar` with
+  `wait_timeout(10 ms)`, re-checking the mode and the ceiling on each
+  wake; `resume_input` notifies it (R4-13). A paused reader is not a
+  detached reader: finalization still drains to EOF.
 - **Acknowledged transitions.** The reader writes each mode change to the
   progress log when it takes effect (`input large at line N`, `input
   paused at byte B`, `input resumed`). The test waits for the
@@ -1324,9 +1608,12 @@ step runs; `await_signal` does not pause it; it reads a whole line with
   nothing.
 - Fixture steps only; no CLI surface (runtime §3).
 
-**Test (X3).** `replay_mode_ack_with_empty_stdin`: with nothing written to
-the fixture's stdin, `pause_input` and `expect_large` are each
-acknowledged within 100 ms.
+**Tests (X3).** `replay_mode_ack_with_empty_stdin`: with nothing written
+to the fixture's stdin, `pause_input` and `expect_large` are each
+acknowledged within 100 ms. `replay_paused_nonempty_pipe_waits`: 1 MiB
+written to stdin while paused is not read (no byte consumed), the
+reader's wake count over 500 ms stays at most 60 (timed waits, no spin),
+and after `resume_input` the whole line is read.
 
 ---
 
@@ -1343,7 +1630,10 @@ acknowledged within 100 ms.
 | No lease or RPC admission cap (G5 a) | `OverCapacity` admission | X5 RSS at 32 |
 | Late warning lost on a crash before its commit | Durable loss journal | — |
 | Abnormal connection-task end loses staged observations explicitly | Keep the receiver outside the task | — |
-| Polling replay reader (10 ms) | Wake pipe | — |
+| Polling replay reader (10 ms); timed condition wait while paused | Wake pipe | — |
+| Shutdown awaits the supervisor's handle and reads counts kept under the registry mutex | A snapshot request answered by the supervisor | — |
+| A turn's link deleted at a quiescent terminal is its persisted cleanup fact | A cleanup column on `server_turns`, or a C1 envelope field | — |
+| Seal without a cause; Route keeps the first-wins disposition | A cause type carried through Wire's boundary | — |
 | Server `stderr.log` uncapped | Rotation | Its growth |
 
 ---
@@ -1363,8 +1653,10 @@ acknowledged within 100 ms.
 6. **`AnchorRecovery.owner`, `ReprobeReport.not_committed`**:
    `ProcessOwner`; Claude uses only `Turn`.
 7. **Wire:** `WriteBounds::StartBy`, the `Claimed`/`Started` job states,
-   `withdraw`, `hold_data`, `StagingPermit`, `seal`, `drain_admitted`:
-   needed by any shared connection, unused by private routes.
+   `withdraw`, `hold_data`, `StagingPermit`, the cause-free idempotent
+   `seal`, `drain_admitted`, and Host's `stopped_live` stop reply forwarded
+   in `WireCloseReport`: needed by any shared connection, unused by
+   private routes.
 8. **Steer size on Codex:** 46,336 encoded bytes per driver (the reserved
    cleanup slots come out of C2's 64 KiB). A larger steer is
    `OverCapacity`, an existing C2 error; Claude has no steer.
@@ -1378,16 +1670,20 @@ acknowledged within 100 ms.
 
 | # | Question | Recommendation |
 |---|---|---|
-| X0-R3-Q1 | Item 12.2: the writer calls one non-blocking `poll_write` while holding J0's queue lock, to serialize withdrawal with the first byte. | Accept: the lock is held across one non-blocking syscall, never an `.await`. The alternative is a per-job compare-and-swap (`Claimed → Writing → Claimed` around `Pending`), which needs a third state and a retry loop for the same guarantee. |
-| X0-R3-Q2 | Item 13.1: `Transport` is upgraded to `ServerLost` on a stdio end plus an explicit `stopped_live: false`, leaving a small window (a leader that closed its own stdio, then exited before `Stop` arrived). | Accept: the ruling names stop-response evidence; without it the common crash (stdout end before Host's exit report) would always be `unknown`. |
-| X0-R3-Q3 | Item 13.2: a panic in the connection task loses its staged observations, a staged terminal included; the turn ends `unknown` with `observations_lost`. | Accept: it is a bug path; keeping the receiver outside the unwinding body is the larger option and still loses the thread table. |
+| X0-R4-Q1 | Items 2.5, 2.7: the ruling asked for a shutdown request installed atomically with the fence and answered by the supervisor, with the cutoff taking priority. This design has no request: `join` awaits the supervisor's own handle until the cutoff and reads `live_tasks` and `failed_tasks`, which the supervisor changes only under the registry mutex. | Accept: it is smaller and removes the race by construction, since there is no answer to lose and no priority to arrange. It also covers R4-2 directly: the supervisor's own state is part of the report. |
+| X0-R4-Q2 | Item 6.5: the persisted cleanup fact is the link's presence; a quiescent terminal deletes it in the same transaction. A side effect is that `process.alive` on a shared route reads only the remaining links, so an idle session whose turns all ended quiescent reads `alive: false` while its server serves others. | Accept: it uses only rows this design already adds, needs no new column and no C1 field, and the C1 wording ("true only on positive evidence") permits `false`. If the owner wants `alive` to follow the lease instead, the alternative is a nullable `server_turns.cleanup` column, set at the terminal commit, that keeps every link. |
+| X0-R4-Q3 | Items 10, §9.3: publicly `omitted` is `null` when it is unknown or saturated, instead of the number 18446744073709551615. | Accept: C1 numbers are 64-bit integers, and `u64::MAX` does not fit a signed one or survive a JavaScript reader. `null` is unambiguous. |
+| X0-R4-Q4 | Item 13.1: `Some(false)` is also the anchor's answer when its own cleanup began before this `Stop` (a signal to the anchor, or its control's end). | Accept as a residual window beside R3-Q2's: it happens only while the anchor itself is being torn down. Distinguishing it would need a new anchor protocol field. |
 
-Ruled earlier: X0-R2-Q1 (the reattach fence wait, bounded by the turn's
-own wall, stop and force), X0-R2-Q2 (steer 46,336 bytes) and X0-R2-Q3
-(transport loss stays `unknown`) accepted by Sol and the coordinator; the
-round-0 and round-1 questions (no extra cap, the relative RSS method,
-`recover` always `Unknown`, aggregate G9, serialized schema numbering,
-R1-Q1 to R1-Q4) likewise.
+Ruled earlier: X0-R3-Q1 (one non-blocking `poll_write` under J0's queue
+lock), X0-R3-Q2 (the stop-reply upgrade and its residual window) and
+X0-R3-Q3 (a connection-task panic loses its staged observations
+explicitly), accepted by Sol in r4; X0-R2-Q1 (the reattach fence wait,
+bounded by the turn's own wall, stop and force), X0-R2-Q2 (steer 46,336
+bytes) and X0-R2-Q3 (transport loss stays `unknown`), accepted by Sol and
+the coordinator; the round-0 and round-1 questions (no extra cap, the
+relative RSS method, `recover` always `Unknown`, aggregate G9, serialized
+schema numbering, R1-Q1 to R1-Q4) likewise.
 
 ---
 
@@ -1400,7 +1696,9 @@ R1-Q1 to R1-Q4) likewise.
   "never"` (the re-probe saw none).
 - Whether Codex executes RPCs in byte order (item 8.1's fence assumes
   nothing about it).
-- K1's final schema number; the exact J0 `RouteRuntime` methods X3 extends.
+- K1's final schema number; the exact J0 `RouteRuntime` methods X3 extends;
+  the final form of K1's `Lane::close_draining` and `Retiring` stages
+  (under review at `820e9fb`).
 - When Host's leftover scan (S-LEFTOVER) lands.
 - The real decode cost per node; `DECODE_ALLOWANCE` is an allowance X5
   checks.
@@ -1412,8 +1710,8 @@ R1-Q1 to R1-Q4) likewise.
 | Chunk | Tests |
 |---|---|
 | X1 | `config_hash` (item 3); launch environment (item 4); decline bodies (item 11) |
-| X2 | Item 0: `pinned_join_needs_no_slot`, `queued_turn_reprepares_on_readiness`, `readiness_insert_between_prepare_and_wait`, `unsubmitted_lane_is_retired`. Item 1: `host_server_owner_outlives_turns`, `store_server_anchor_and_link`, `wire_server_open_has_no_turn_folder`, `link_turn_on_turn_owner_is_invalid`. Item 2: `daemon_idle_exit_not_blocked_by_idle_server`, `host_journal_uncertain_watch`. Item 4: bootstrap `vendor/`. Item 6: `recovery_server_anchor_proved_absent`, `recovery_server_anchor_unproven`, `recovery_unlinked_server_turn_sent_nothing`, `recovery_partial_settlement_rechecks_server_anchor`, `reprobe_ownerless_not_committed`, `shutdown_link_read_failure_still_stops_groups`, `shutdown_force_shared_is_unknown`, `shared_close_cleanup_from_turn_facts`, `close_absence_check_ignores_server`. Item 12: the Wire tests of 12.5 (claim versus first byte, holds, expiry, permits). Item 13: `drain_admitted_yields_prefix_then_boundary`, `seal_is_exact_prefix`. (The concurrent lane drain's test is K1's.) |
-| X3 | Registry and supervision unit tests: coalesced work, retained entries, fenced retirement, snapshot at the cutoff, failed-task count (item 2); binary-change tests including `waiter_with_old_identity_joins_fresh_server` (item 3); classification including the generation-only branch (item 5); cleanup-intent tests (item 8.3); `codex_never_ask` additions (item 11); guard, budget, reserved-size and staging tests (item 12); `connection_task_panic_with_staged_terminal`, `correlation_failure_is_protocol_not_unknown` (item 13); symlinked `vendor/codex` (item 4); the replay join and `replay_mode_ack_with_empty_stdin` (item 14) |
+| X2 | Item 0: `pinned_join_needs_no_slot`, `queued_turn_reprepares_on_readiness`, `readiness_insert_between_prepare_and_wait`, `unsubmitted_lane_is_retired`. Item 1: `host_server_owner_outlives_turns`, `store_server_anchor_and_link`, `wire_server_open_has_no_turn_folder`, `link_turn_on_turn_owner_is_invalid`. Item 2: `daemon_idle_exit_not_blocked_by_idle_server`, `host_journal_uncertain_watch`. Item 4: bootstrap `vendor/`. Item 6: `recovery_server_anchor_proved_absent`, `recovery_server_anchor_unproven`, `recovery_unlinked_server_turn_sent_nothing`, `recovery_partial_settlement_rechecks_server_anchor`, `reprobe_ownerless_not_committed`, `shutdown_link_read_failure_still_stops_groups`, `shutdown_force_shared_is_unknown`, `shared_close_cleanup_from_turn_facts`, `spontaneous_uncertain_end_keeps_link`, `quiescent_terminal_releases_link`, `close_absence_check_ignores_server`. Item 12: the Wire tests of 12.5 (claim versus first byte, holds, expiry, permits). Item 13: `drain_admitted_yields_prefix_then_boundary`, `seal_is_exact_prefix`, `seal_is_idempotent`, `close_reports_stop_reply`. (The concurrent lane drain's test is K1's.) |
+| X3 | Registry and supervision unit tests: coalesced work, retained entries, the connection-task handoff, zero-holder publication, fenced launch and retirement, the supervisor's end at the fence, its handle at the cutoff, its panic, failed-task count (item 2); binary-change and cache tests including `stale_identity_write_rejected`, `held_old_instance_stays_valid` and `waiter_with_old_identity_joins_fresh_server` (item 3); classification including the generation-only branch (item 5); cleanup-intent tests (item 8.3); `codex_never_ask` additions (item 11); guard, budget, reserved-size and staging tests (item 12); `connection_task_panic_with_staged_terminal`, `connection_task_panic_idle_driver_reports_loss`, `correlation_failure_is_protocol_not_unknown`, `first_failure_cause_wins` (item 13); symlinked `vendor/codex` (item 4); the replay join, `replay_mode_ack_with_empty_stdin` and `replay_paused_nonempty_pipe_waits` (item 14) |
 | X4 | `c4_two_sessions`, `codex_server_close`, two keys → two servers, `servers` (items 2, 3, 7); `codex_two_threads` cutoff, reopen, fence and lease-fence assertions (item 8); request-record exhaustion (item 9.1); `codex_server_lost_order`, `codex_transport_loss_is_unknown`, `stop_reply_missing_stays_transport`, `stdout_end_then_dead_on_stop_is_server_lost`, `server_loss_cleanup_not_blocked_by_inherited_stdout`, `overflow_failure_keeps_overflow_class` (item 13) |
 | X5 | `codex_bounds_overflow` additions and the Core loss helper (item 10); `codex_rss_leases` (item 9.2); decline deadline with the reader paused (items 11, 14); `CODEX_SQLITE_HOME` persists (item 4) |
 
@@ -1423,14 +1721,14 @@ R1-Q1 to R1-Q4) likewise.
 
 | Crate | Change | Chunk |
 |---|---|---|
-| `via-store` | `ServerId`, `ProcessOwner`; schema bump (`anchors` owner, `server_turns`); `commit_server_turn`, `server_links`; `EvidenceRoot::create_server`; `UnfinishedTurn.server_anchor`; `session_cleanup_uncertain`; status unproven server anchors | X2 |
-| `via-host` | Re-export `ProcessOwner`; `link_turn`; `RecoveryReport.owner`; `ReprobeReport.not_committed: Vec<ProcessOwner>`; shutdown closes first, then bounded link read and cleanup-only fold; `Held.owner: ProcessOwner`; `pending_cleanup` excludes server controls; `journal_uncertain()` watch | X2 |
-| `via-wire` | `open_connection` by owner; `turn_folder`; `link_turn`; `RuntimeConfig.vendor_state_dir`; on J0's queue: ticketed `StartBy` data slot, `Claimed`/`Started` states with the first byte under the lock, `withdraw`, `hold_data`; `StagingPermit`; `seal`, `drain_admitted`; journal-uncertain passthrough | X2 |
-| `via-core` | Item 0 dispatch order and readiness subscription; (the lane actor's concurrent drain during driver close is K1's); `Reconciled` server facts; partial-settlement meet; `FailureScope::Daemon` for ownerless proofs; shared force `unknown/unknown`; `journal_uncertain` latch; registry counts folded by the adapter set (no Core change); `record_loss` and `observations_lost` | X2 (`record_loss`: X5) |
-| `via-routes` | `RouteRuntime` pass-throughs (X2); `codex::{Servers, supervisor, ServerPin, Lease, ConfigHash, DeclineTable, Connection, ThreadTable, RequestTable, Feeder, TurnWrites}` | X3, X4 |
-| `via-adapters` | `codex::DECLINES`, launch recipe; `AnchorRecovery.owner`; `journal_uncertain()`; `ConnectionPin` payload; `SessionDriver::{readiness, connection_kind}`; `TurnEnd.loss`, `CloseReport.loss`; registry counts into `pending_tasks`/`failed_tasks`; `InstanceCache` identity updated by a launch's fresh stat | X1, X2, X3, X4, X5 |
+| `via-store` | `ServerId`, `ProcessOwner`; schema bump (`anchors` owner, `server_turns`); `commit_server_turn`, `server_links`; `EvidenceRoot::create_server`; `UnfinishedTurn.server_anchor`; `link_released` on every terminal-committing record (deletes the link); `session_cleanup_uncertain` over remaining links; status unproven server anchors | X2 |
+| `via-host` | Re-export `ProcessOwner`; `link_turn`; `RecoveryReport.owner`; `ReprobeReport.not_committed: Vec<ProcessOwner>`; shutdown closes first, then bounded link read and cleanup-only fold; `Held.owner: ProcessOwner`; `pending_cleanup` excludes server controls; `journal_uncertain()` watch; `CloseReport.stopped_live: Option<bool>` | X2 |
+| `via-wire` | `open_connection` by owner; `turn_folder`; `link_turn`; `RuntimeConfig.vendor_state_dir`; on J0's queue: ticketed `StartBy` data slot, `Claimed`/`Started` states with the first byte under the lock, `withdraw`, `hold_data`; `StagingPermit`; cause-free idempotent `seal`, `drain_admitted`; `WireCloseReport.stopped_live`; journal-uncertain passthrough | X2 |
+| `via-core` | Item 0 dispatch order and readiness subscription; (the lane actor's concurrent drain during driver close is K1's); `Reconciled` server facts; partial-settlement meet; `FailureScope::Daemon` for ownerless proofs; shared force `unknown/unknown`; `journal_uncertain` latch; registry counts folded by the adapter set (no Core change); `link_released` from the committed terminal's cleanup; `record_loss` and `observations_lost` (`omitted: null` when unknown) | X2 (`record_loss`: X5) |
+| `via-routes` | `RouteRuntime` pass-throughs (X2); `codex::{Servers, supervisor, ServerPin, Lease, ConfigHash, DeclineTable, Connection, ConnectionFailure, ThreadTable, RequestTable, Feeder, TurnWrites}` | X3, X4 |
+| `via-adapters` | `codex::DECLINES`, launch recipe; `AnchorRecovery.owner`; `journal_uncertain()`; `ConnectionPin` payload; `SessionDriver::{readiness, connection_kind}`; `TurnEnd.loss`, `CloseReport.loss`; registry counts into `pending_tasks`/`failed_tasks`; ticketed `InstanceCache` written by `run_turn`'s stat and a launch's final stat; driver-owned normalizer installing the abnormal-path loss | X1, X2, X3, X4, X5 |
 | `via-cli` | Bootstrap `<state>/vendor/` | X2 |
-| `via-fake-agent` | Polling chunked reader, `expect_large`, `pause_input`/`resume_input`, acknowledged transitions | X3 |
+| `via-fake-agent` | Polling chunked reader, timed condition wait while paused, `expect_large`, `pause_input`/`resume_input`, acknowledged transitions | X3 |
 
 ---
 
@@ -1497,7 +1795,7 @@ After `pub enum Prepared { Pinned(ConnectionPin), NeedsConnection }`, add:
 pub enum ConnectionPin { Generation(u64), Server(ServerPin) }
 pub enum ConnectionKind { PerTurn, Shared }   // C1 §7.6 force rows
 pub struct ObservationLoss { pub trigger: (SessionId, TurnNumber), pub generation: u64,
-    pub first_unqueued: u64, pub omitted: u64 /* saturating */ }
+    pub first_unqueued: u64, pub omitted: u64 /* saturating; u64::MAX: unknown or saturated */ }
 ```
 
 Replace the `TurnEnd` declaration's last line
@@ -1532,7 +1830,7 @@ Replace the `TurnEnd` declaration's last line
 
   > | `AnchorRecovery` | `anchor_id`, `generation`, `owner: ProcessOwner` (`Turn { session_id, turn }` or `Server { server_id }`), `cleanup`, `forced`: Host's passive facts for one committed anchor. A server anchor's facts reach a turn only through the turn → server-anchor link (runtime §6), and only as cleanup |
   > | `ConnectionPin` | `Generation(u64)` (the fake's persistent profile) or `Server(ServerPin)` (a shared-server holder, keeping the server from idle retirement until the turn becomes a lease or the pin drops) |
-  > | `ObservationLoss` | the driver's sticky loss record for one thread generation: original triggering turn, generation, first unqueued message sequence, saturating omitted count. Core adds the `observations_lost` warning to each affected turn and commits one `late` warning event on a triggering turn already terminal (C1 §5) |
+  > | `ObservationLoss` | the driver's sticky loss record for one thread generation: original triggering turn, generation, first unqueued message sequence, saturating omitted count (`u64::MAX`: unknown or saturated). Recorded even when no turn of the driver is running, and then reported by its close. Core adds the `observations_lost` warning to each affected turn and commits one `late` warning event on a triggering turn already terminal (C1 §5) |
 
 **§2 types table, `AdapterError` row.** After "On either kind of route,
 only a failure before any vendor launch has the no-launch evidence", add:
@@ -1682,8 +1980,9 @@ add to `impl WireSender`:
 ```rust
     pub fn withdraw(&self, ticket: WriteTicket) -> WriteState;
     pub fn hold_data(&self) -> DataHold;
-    /// Synchronous: stop admitting stdout messages; the prefix and the cause are kept for `drain_admitted`.
-    pub fn seal(&self, cause: WireFailure);
+    /// Synchronous and idempotent: the first call stops admitting stdout messages; the
+    /// prefix is kept for `drain_admitted`. The failure's disposition is the route's.
+    pub fn seal(&self);
     pub fn link_turn(&self, session: &SessionId, turn: TurnNumber, deadline: Deadline)
         -> impl Future<Output = CommitOutcome<()>> + Send;
 ```
@@ -1691,7 +1990,7 @@ add to `impl WireSender`:
 add to `impl WireMessages`:
 
 ```rust
-    /// After a seal (Route's, or Wire's own on a reader or writer failure):
+    /// After a seal (Route's, or the end of Wire's own reader on its failure):
     /// the complete messages admitted before it, then the boundary.
     pub fn drain_admitted(&mut self) -> impl Future<Output = Admitted> + Send;
 ```
@@ -1700,7 +1999,7 @@ and add:
 
 ```rust
 impl PendingWrite { pub fn ticket(&self) -> WriteTicket; }
-pub enum Admitted { Message(VendorMessage), Boundary { cause: WireFailure, discarded_bytes: u64 } }
+pub enum Admitted { Message(VendorMessage), Boundary { discarded_bytes: u64 } }
 impl VendorMessage { /* holds its StagingPermit until dropped */ }
 ```
 
@@ -1724,15 +2023,25 @@ and invokes Host acquisition." with:
 > open; a started one is written whole by `finish_by`. Claiming a job is
 > not starting it: a claimed job stays withdrawable until its first byte,
 > and the writer decides withdrawal, expiry and the first successful byte
-> write under the queue lock, calling one non-blocking write while it
-> holds it; `Started` means a byte was written. The writer claims the data
+> write under the queue lock, making one non-blocking `poll_write` call
+> while it holds it; `Started` means a byte was written. The writer claims the data
 > job only while no `DataHold` exists, and returns a claimed, unstarted
 > data job to the queue when a hold appears. A `VendorMessage`'s staging
 > charge is released when the message is dropped, not when it is
-> received. `seal` stops admission at once, under the lock the reader
-> takes around each admission; later messages are discarded and counted.
-> After a seal `drain_admitted` yields the messages admitted before it,
-> then the boundary; it never waits for more output.
+> received. `seal` takes no cause and is idempotent: its first call stops
+> admission at once, under the lock the reader takes around each
+> admission, and later messages are discarded and their bytes counted; a
+> reader failure stops admission the same way. After a seal
+> `drain_admitted` yields the messages admitted before it, then the
+> boundary; it never waits for more output. The connection failure's
+> disposition is kept by the route, not by Wire.
+
+**§4, close report (r4 R4-5).** Replace "Wire's close report
+(`WireCloseReport`) carries Host's `leftovers` unchanged (§5, C2 §4.2)."
+with:
+
+> Wire's close report (`WireCloseReport`) carries Host's `leftovers` and
+> `stopped_live` unchanged (§5, C2 §4.2).
 
 **§4, evidence paragraph.** Replace from "Each submitted turn has an
 evidence folder, `<state>/evidence/<session_id>/<turn>/`." through "and the
@@ -1753,6 +2062,19 @@ turn's failure names the file and the message's length." with:
 > file and the message's length when the file is in its own session's
 > turn folder, and only the length when it is in the connection's folder
 > (D4). C1 `logs` returns only turn folders.
+
+**§5, stop reply (r4 R4-5).** Before the paragraph that begins
+"**Leftover report (C2 §4.2).**", add:
+
+> **Stop reply.** Host's `CloseReport` gains `stopped_live: Option<bool>`:
+> the verified anchor's `Stopping { stopped_live }` reply to this close's
+> own `Stop`, or `None` when no valid reply arrived (the deadline passed,
+> the reply was lost or invalid, or no `Stop` was sent). It is passive
+> evidence beside `forced`, which it does not change. `Some(false)` says
+> the anchor's cleanup did not stop a live vendor for this `Stop`: the
+> vendor had already exited, or the anchor's own cleanup had begun
+> before it. Wire forwards it unchanged; only a shared-server route reads
+> it, to tell a dead server (`server_lost`) from a lost transport.
 
 **§5, replace the "Non-turn owners (AR6)" paragraph.**
 
@@ -1777,7 +2099,7 @@ turn's failure names the file and the message's length." with:
 **§6, `anchors` row of the schema table.** Replace with the two rows:
 
 > | `anchors` | PK `anchor_id`; `generation`, `marker`, `socket_path`; owner: either (`owner_session`, `owner_turn`) FK turn, or `owner_server` (exactly one, checked; unique where present); `uid`, `boot_id`, `pid_namespace`; `phase` `intent`, `identified` or `arm_intent`; `record_version`; nullable identity `pid`, `pgid`, `start_ticks`; `vendor_pid`; `absence_time`. Partial index `anchors_unproven` on `anchor_id` where `absence_time IS NULL` |
-> | `server_turns` | PK (`session_id`, `turn`) FK turn; `anchor_id` FK anchor (a server-owned anchor, checked at insert, for a `running` turn); `WITHOUT ROWID`; index on `anchor_id`. Written by Host before the turn's first vendor byte; read by restart recovery, final shutdown, and the close and status cleanup predicate |
+> | `server_turns` | PK (`session_id`, `turn`) FK turn; `anchor_id` FK anchor (a server-owned anchor, checked at insert, for a `running` turn); `WITHOUT ROWID`; index on `anchor_id`. Written by Host before the turn's first vendor byte; deleted in the transaction that commits the turn's terminal when the turn's cleanup is `quiescent`, so a remaining link means the turn runs or may have left work on that server; read by restart recovery, final shutdown, and the close and status cleanup predicate |
 
 Update "Schema v8 (…) is exactly:" to the new version, adding "v8 lacked
 server anchors and the turn → server-anchor link".
@@ -1886,9 +2208,10 @@ waits for pinned enforcement proof. …") is unchanged.
 cancelled_turns, cleanup, leftovers}`;", insert:
 
 > `cleanup` is `uncertain` while any process group the session owns lacks
-> a proof of absence or, on a shared server, while any turn of the session
-> settled with cleanup `uncertain` and the server group it ran on lacks a
-> proof of absence; otherwise `quiescent`.
+> a proof of absence or, on a shared server, while a turn of the session
+> runs or ended without its own cleanup proved quiescent (whether or not
+> it was cancelled) and the server group it ran on lacks a proof of
+> absence; otherwise `quiescent`.
 
 **§3.7 `status`.** Replace "`process.cleanup` is `uncertain` when any
 process group of the session lacks a proof of absence, else `quiescent`
@@ -1915,7 +2238,8 @@ append:
 > `observations_lost` (some observations of a shared-server thread were
 > lost: by ingress overflow, an observation stall, a close's deadline or a
 > failed connection task) carries `data: {trigger_turn, generation,
-> first_unqueued, omitted}`; it is on the envelope of every turn the loss
+> first_unqueued, omitted}`, where `omitted` is `null` when the count is
+> unknown or saturated; it is on the envelope of every turn the loss
 > affected, and, when the triggering turn was already terminal, a durable
 > `late` `warning` event on that turn; that envelope is not rewritten.
 
