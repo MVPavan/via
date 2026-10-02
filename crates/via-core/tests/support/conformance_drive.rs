@@ -227,6 +227,7 @@ impl Pure {
             } else {
                 params["output_schema"].to_string().len()
             },
+            ..ParamSizes::default()
         };
         let request = DescribeRequest {
             harness: Some(harness.to_owned()),
@@ -257,6 +258,7 @@ impl Pure {
             max_steps: params["max_steps"].as_u64(),
             vendor,
             sizes,
+            ..TurnParams::default()
         };
         Ok(match self.set.check_turn(&session_ref, &turn) {
             Ok(_) => Ok(plan),

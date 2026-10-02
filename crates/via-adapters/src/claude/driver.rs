@@ -101,7 +101,8 @@ pub(crate) async fn run_turn(
         state.retiring = Some(retiring);
     }
     // Route reads ahead up to its own bound; one item waits here.
-    let (hop, hop_rx) = mpsc::channel::<ClaudeItem>(1);
+    let (hop, hop_rx) = mpsc::channel::<via_routes::Decoded<ClaudeItem>>(1);
+    let hop = via_routes::Hop::new(hop, activity.decode_watermark());
     let (end, end_rx) = oneshot::channel();
     driver.tracker.spawn(turn_task(TurnTask {
         route: ClaudeRoute::new(Arc::clone(&driver.runtime)),
@@ -236,6 +237,7 @@ fn refused_values(driver: &SessionDriver, spec: &TurnSpec) -> Option<TurnEnd> {
         effort: spec.effort.clone(),
         bound: spec.bound.clone(),
         output_schema: spec.output_schema.is_some(),
+        instructions: driver.spec.instructions.is_some(),
         max_steps: spec.max_steps,
         vendor: spec.vendor.clone(),
         sizes: ParamSizes {
@@ -244,9 +246,11 @@ fn refused_values(driver: &SessionDriver, spec: &TurnSpec) -> Option<TurnEnd> {
                 .output_schema
                 .as_deref()
                 .map_or(0, |raw| raw.get().len()),
+            ..ParamSizes::default()
         },
+        ..TurnParams::default()
     };
-    let refusal = ClaudeAdapter::check_turn(route(), &params)
+    let refusal = ClaudeAdapter::check_values(route(), &params)
         .into_iter()
         .next()?;
     Some(rejected(AdapterError::Rejected {
@@ -402,7 +406,7 @@ impl Delivery<'_> {
                     &adapter.binary,
                     self.reports.recipe.clone(),
                     cause,
-                    std::time::Instant::now(),
+                    super::plan::clock(),
                 );
                 self.fail(Verdict::Refused(cause));
             }
@@ -641,7 +645,7 @@ struct TurnTask {
     route: ClaudeRoute,
     process: crate::PrivateProcessSpec,
     start: ClaudeStart,
-    hop: mpsc::Sender<ClaudeItem>,
+    hop: via_routes::Hop<ClaudeItem>,
     signals: (Deadline, ForceWatch, StopWatch),
     /// The driver's close order and its verdict's abort order.
     stops: (

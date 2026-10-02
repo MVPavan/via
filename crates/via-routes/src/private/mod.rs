@@ -29,6 +29,87 @@ pub(crate) use serving::{
 };
 use serving::{acquire_failure, wake_on_order};
 
+/// One hop item: what Route admitted, with the instant Route read it from
+/// the vendor's stdout. A message's observations take that instant, not
+/// the one the Adapter dequeues it at, so time it waits in Route's
+/// read-ahead or on the hop moves no idle deadline (bead via-mnx, C2 §4,
+/// runtime §8; x.3.2 critical r1 #3).
+#[derive(Debug)]
+pub struct Decoded<M> {
+    /// The admitted message.
+    pub item: M,
+    /// When Route read it.
+    pub at: tokio::time::Instant,
+    /// The turn's [`DecodeWatermark`] once Route admitted it: its position
+    /// in decode order. An item Route made itself carries the watermark
+    /// as it stood, the decoded messages before it.
+    pub seq: u64,
+}
+
+/// A turn's decode watermark (runtime §8; x.3.2 critical r2 #2): how many
+/// vendor messages Route has read and admitted for the hop, advanced as
+/// each is admitted, before it waits for read-ahead room or the hop. The
+/// Adapter reports how far it delivered against it, so Core's idle
+/// deadline is decided only once what Route read by then was reconciled.
+/// The Adapter creates it with the turn's activity clock; Route only
+/// advances it.
+#[derive(Clone, Debug, Default)]
+pub struct DecodeWatermark(Arc<std::sync::atomic::AtomicU64>);
+
+impl DecodeWatermark {
+    /// The messages admitted so far.
+    #[must_use]
+    pub fn get(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Counts one more admitted message; its position.
+    fn advance(&self) -> u64 {
+        self.0
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            .saturating_add(1)
+    }
+}
+
+/// What a turn hands the Adapter: the hop's sending side, and the turn's
+/// decode watermark, which Route advances as it reads.
+#[derive(Debug)]
+pub struct Hop<M> {
+    items: mpsc::Sender<Decoded<M>>,
+    decoded: DecodeWatermark,
+}
+
+impl<M> Hop<M> {
+    /// The hop `items` with the turn's watermark `decoded`.
+    pub fn new(items: mpsc::Sender<Decoded<M>>, decoded: DecodeWatermark) -> Self {
+        Self { items, decoded }
+    }
+
+    /// The hop's sending side.
+    pub(crate) fn items(&self) -> &mpsc::Sender<Decoded<M>> {
+        &self.items
+    }
+
+    /// `item`, read now: its position the watermark's next.
+    pub(crate) fn read(&self, item: M, at: tokio::time::Instant) -> Decoded<M> {
+        Decoded {
+            item,
+            at,
+            seq: self.decoded.advance(),
+        }
+    }
+
+    /// `item`, as of now: one Route made rather than read, behind every
+    /// message admitted so far.
+    pub(crate) fn made(&self, item: M) -> Decoded<M> {
+        Decoded {
+            item,
+            at: tokio::time::Instant::now(),
+            seq: self.decoded.get(),
+        }
+    }
+}
+
 /// The daemon force: `None` until raised, then the instant it was raised.
 pub(crate) type ForceWatch = watch::Receiver<Option<tokio::time::Instant>>;
 
@@ -226,7 +307,7 @@ pub(crate) async fn turn<P: PrivateProtocol>(
     runtime: &RouteRuntime,
     process: PrivateProcessSpec,
     start: P::Start,
-    hop: mpsc::Sender<P::Message>,
+    hop: Hop<P::Message>,
     signals: (Deadline, ForceWatch, (StopWatch, StopSources)),
     input: P::Input,
 ) -> Retirement {
@@ -244,7 +325,7 @@ async fn run<P: PrivateProtocol>(
     runtime: &RouteRuntime,
     process: PrivateProcessSpec,
     start: P::Start,
-    hop: mpsc::Sender<P::Message>,
+    hop: Hop<P::Message>,
     (deadline, force, (stop, sources)): (Deadline, ForceWatch, (StopWatch, StopSources)),
     input: P::Input,
 ) -> (Result<P::Result, RouteFailure>, Lane<P>) {
@@ -311,7 +392,7 @@ async fn run<P: PrivateProtocol>(
 async fn run_turn<P: PrivateProtocol>(
     runtime: &RouteRuntime,
     (process, start): (PrivateProcessSpec, P::Start),
-    hop: &mpsc::Sender<P::Message>,
+    hop: &Hop<P::Message>,
     deadline: Deadline,
     wire_signals: WireSignals,
     signals: Signals,
@@ -433,7 +514,7 @@ async fn late<P: PrivateProtocol>(
     serving: &mut Serving<'_, P>,
     sender: &WireSender,
     messages: WireMessages,
-    (terminal, last): (P::Terminal, Option<P::Message>),
+    (terminal, last): (P::Terminal, Option<Decoded<P::Message>>),
 ) -> Result<P::Result, RouteFailure> {
     // Test builds: the terminal is decoded and held, the late path
     // entered; nothing is closed or delivered yet.
@@ -469,7 +550,7 @@ enum Finished<P: PrivateProtocol> {
     Result(P::Result, Deadline),
     /// A decoded terminal whose finalization, or whose wait for read-ahead
     /// room (then still to go on the hop, last), outlived the wall deadline.
-    Late(P::Terminal, Option<P::Message>),
+    Late(P::Terminal, Option<Decoded<P::Message>>),
     /// The logical turn ended at its terminal with its server kept (C2
     /// §4.1).
     Kept(P::Kept),
@@ -526,7 +607,7 @@ async fn drive<P: PrivateProtocol>(
             // `ProcessExited`.
             end @ (Next::Eof | Next::Unterminated) => return Err(serving.ended(end).await),
         };
-        let Some(terminal) = P::terminal(&message.0) else {
+        let Some(terminal) = P::terminal(&message.0.item) else {
             serving.hold(message);
             continue;
         };

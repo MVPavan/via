@@ -192,6 +192,13 @@ Reject oversize combined argv before writing any prompt using platform Host
 argument-budget checks; the request's schema limit is not proof that a 256 KiB
 `--json-schema` argument fits the OS. Named `admission_refused` is preferable to
 truncation or changing input format. Test exact boundary on each target.
+The binding bound in S1 is conservative: Host's 64 KiB Configure frame,
+which carries the launch's encoded argv with worst-case stand-ins (JSON
+escaping included, and the `--append-system-prompt` flag whenever
+instructions are present, even when empty). The frame encodes each argv
+byte as a JSON decimal of up to three digits plus a separator, so
+instructions and a schema together get about 16 KB. The OS's 131,071-byte per-argument limit
+is checked too, but it cannot be reached independently.
 
 Environment: clear inheritance, add only configured nonsecret `HOME`, `PATH`,
 `LANG` and the Host-owned marker required by runtime contracts. C8 establishes
