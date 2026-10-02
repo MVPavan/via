@@ -521,6 +521,7 @@ impl TurnNormalizer {
             class_hint: failed.then(|| class_hint(info)),
             detail: error.map(detail),
             structured_output: None,
+            structured_output_unparsed: None,
             steps: None,
             usage: None,
             cost: None,

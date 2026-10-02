@@ -436,6 +436,9 @@ const TERMINAL: &[&str] = &[
     "class_hint",
     "detail",
     "structured_output",
+    // C2 `NotJson` / `OverLimit` as C1 §5's `reason` (`invalid`,
+    // `validation_limit`): a route's structured output that is no value.
+    "structured_output_invalid",
     "steps",
     "cost",
     "vendor",

@@ -2080,6 +2080,35 @@ fn codex_usage_snapshot() {
     variant("codex_usage_snapshot_other_turn", &replay, &expect).unwrap();
 }
 
+/// Sol r1 #15 (C2 §2 `VendorTerminal`, C1 §5): with a schema requested, a
+/// final answer that is not JSON is carried as `NotJson`, which Core treats
+/// as present and invalid with `reason: invalid`; it is never the missing
+/// output an absent value is. The answer's delta, completed item and
+/// `turn/completed` echo of c9's first turn say `VIA PLAIN` instead.
+#[test]
+fn codex_structured_output_not_json() {
+    const ANSWER: &str = r#"{\"answer\":\"VIA_SCHEMA_159\"}"#;
+    let name = "codex_structured_output_not_json";
+    let mut replay = replay_of("c9_output_schema").unwrap();
+    let mut edited = 0;
+    for step in steps(&mut replay).unwrap() {
+        if let Some(line) = step["emit"]["line"].as_str()
+            && line.contains(ANSWER)
+        {
+            step["emit"]["line"] = json!(line.replace(ANSWER, "VIA PLAIN"));
+            edited += 1;
+        }
+    }
+    assert_eq!(edited, 3, "the delta, the item and the turn's echo");
+    let mut expect = expect_of("c9_output_schema").unwrap();
+    expect["source"] = json!(format!("{name}: c9_output_schema with a plain answer"));
+    let turn = &mut turn_mut(&mut expect, 0)["expect"];
+    turn["terminal"]["structured_output"] = Value::Null;
+    turn["terminal"]["structured_output_invalid"] = json!("invalid");
+    turn["final_text"] = json!(["VIA PLAIN"]);
+    variant(name, &replay, &expect).unwrap();
+}
+
 /// Arms `codex.connection.message` to fail the connection task when it
 /// takes its `occurrence`th admitted message (x.3.2 X0 item 13.2's seam).
 #[cfg(feature = "test-failpoints")]

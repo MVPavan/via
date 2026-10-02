@@ -671,6 +671,7 @@ impl Normalizer {
             class_hint,
             detail: result.is_error.then(|| detail(result)),
             structured_output: result.structured_output.clone(),
+            structured_output_unparsed: None,
             steps: result.num_turns,
             usage: result.usage.as_ref().map(usage).transpose()?,
             cost: result.total_cost_usd.map(|usd| CostReport {

@@ -54,7 +54,7 @@ use crate::harness::Harness;
 use crate::instance::Incompatibility;
 use crate::observation::{
     Acceptance, AdapterError, Identity, InstanceReport, Observation, ObservationItem, TurnEnd,
-    TurnEvidence,
+    TurnEvidence, UnparsedOutput,
 };
 use crate::plan::{Bound, Inherit, RefusalKind};
 use crate::runtime::event_stall;
@@ -1633,13 +1633,10 @@ fn terminal_end(facts: &Turn<'_>, retained: Retained, tools_open: bool) -> TurnE
         mut terminal,
         structured,
     } = retained;
-    terminal.structured_output = match structured {
-        StructuredOutput::Json(json) => Some(json),
-        StructuredOutput::NotRequested
-        | StructuredOutput::Missing
-        | StructuredOutput::NotJson
-        | StructuredOutput::OverLimit => None,
-    };
+    (
+        terminal.structured_output,
+        terminal.structured_output_unparsed,
+    ) = carried(structured);
     TurnEnd {
         terminal: Some(terminal),
         instance: facts.instance.clone(),
@@ -1653,6 +1650,23 @@ fn terminal_end(facts: &Turn<'_>, retained: Retained, tools_open: bool) -> TurnE
             },
             journal_uncertain: false,
         }),
+    }
+}
+
+/// The terminal's structured output as C2 carries it (Sol r1 #15): a JSON
+/// value, or the reason text is none, which Core treats as present and
+/// invalid; absent when none was requested or the text was empty.
+pub(super) fn carried(
+    structured: StructuredOutput,
+) -> (
+    Option<Box<serde_json::value::RawValue>>,
+    Option<UnparsedOutput>,
+) {
+    match structured {
+        StructuredOutput::Json(json) => (Some(json), None),
+        StructuredOutput::NotJson => (None, Some(UnparsedOutput::NotJson)),
+        StructuredOutput::OverLimit => (None, Some(UnparsedOutput::OverLimit)),
+        StructuredOutput::NotRequested | StructuredOutput::Missing => (None, None),
     }
 }
 

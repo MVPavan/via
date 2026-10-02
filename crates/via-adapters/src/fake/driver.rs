@@ -973,6 +973,7 @@ fn vendor_terminal(terminal: FakeTerminal) -> VendorTerminal {
         class_hint: details.class_hint.map(class_hint),
         detail: details.detail,
         structured_output: details.structured_output,
+        structured_output_unparsed: None,
         steps: details.steps,
         usage: details.usage.map(usage),
         cost: details.cost.map(|cost| CostReport {

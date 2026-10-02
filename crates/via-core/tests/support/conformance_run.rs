@@ -47,7 +47,7 @@ use via_adapters::{
     Prepared, RouteError, RoutePlan, SessionCx, SessionDriver, SessionRef, SessionSpec,
     StartRejected, SteerDelivery, SteerError, SteerInput, SteerToken, StopCause, StopOrder,
     StopReason, TaskTracker, TurnActivity, TurnCx, TurnEnd, TurnNumber, TurnParams, TurnSpec,
-    VendorTerminal, VendorTerminalStatus, VendorTurnId, observation_channel,
+    UnparsedOutput, VendorTerminal, VendorTerminalStatus, VendorTurnId, observation_channel,
 };
 use via_store::{ResumeRecord, SessionId, SpawnRecord, SubmissionRecord, TerminalRecord};
 
@@ -1426,6 +1426,7 @@ fn terminal(terminal: &VendorTerminal) -> Value {
         "class_hint": terminal.class_hint.map(class_hint),
         "detail": terminal.detail,
         "structured_output": raw(terminal.structured_output.as_deref()),
+        "structured_output_invalid": terminal.structured_output_unparsed.map(UnparsedOutput::reason),
         "steps": terminal.steps,
         "cost": match &terminal.cost {
             Some(cost) => json!({"usd": number(cost.usd), "scope": cost.scope,

@@ -704,6 +704,35 @@ fn a_resume_turn_judges_effort_against_the_cached_catalog() {
     assert!(judge(&turn(Some("gpt-6-luna"), Some("xhigh")), None).is_ok());
 }
 
+/// Sol r1 #15 (C2 §2 `VendorTerminal`): the normalizer's structured
+/// output as the terminal carries it. A value passes through; text that
+/// is not JSON is `NotJson` (`reason: invalid`) and text over the bound is
+/// `OverLimit` (`reason: validation_limit`), each with no value; no
+/// schema, or an empty answer, carries neither.
+#[test]
+fn structured_output_is_carried_unparsed_when_it_is_no_value() {
+    use super::driver::carried;
+    use super::normalize::StructuredOutput;
+    use crate::UnparsedOutput;
+
+    let value = serde_json::value::to_raw_value(&json!({"answer": 1})).unwrap();
+    let (json, unparsed) = carried(StructuredOutput::Json(value));
+    assert_eq!(json.unwrap().get(), r#"{"answer":1}"#);
+    assert_eq!(unparsed, None);
+    for (output, reason) in [
+        (StructuredOutput::NotJson, "invalid"),
+        (StructuredOutput::OverLimit, "validation_limit"),
+    ] {
+        let (json, unparsed) = carried(output);
+        assert!(json.is_none());
+        assert_eq!(unparsed.map(UnparsedOutput::reason), Some(reason));
+    }
+    for output in [StructuredOutput::NotRequested, StructuredOutput::Missing] {
+        let (json, unparsed) = carried(output);
+        assert!(json.is_none() && unparsed.is_none());
+    }
+}
+
 /// One synthetic notification, decoded as the server's would be.
 fn note(line: &Value) -> Notification {
     match decode(line.to_string().as_bytes()).unwrap() {

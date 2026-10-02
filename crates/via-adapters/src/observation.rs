@@ -267,6 +267,10 @@ pub struct VendorTerminal {
     pub detail: Option<String>,
     /// Structured output, validated by Core.
     pub structured_output: Option<Box<RawValue>>,
+    /// Structured output the route assembled from text that is no value
+    /// Core can validate (C2 §2 `NotJson`, `OverLimit`): present and
+    /// invalid, with `structured_output` `None`.
+    pub structured_output_unparsed: Option<UnparsedOutput>,
     /// Steps the vendor counted.
     pub steps: Option<u64>,
     /// The turn aggregate, superseding call samples.
@@ -275,6 +279,28 @@ pub struct VendorTerminal {
     pub cost: Option<CostReport>,
     /// Bounded vendor data (16 KiB) for the envelope's `vendor` member.
     pub vendor: Option<Box<RawValue>>,
+}
+
+/// Why a route's structured output, assembled from text, is no value
+/// (C2 §2 `VendorTerminal`): Core treats it as present and invalid (C1 §5).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnparsedOutput {
+    /// The text does not parse as JSON: `reason: invalid`.
+    NotJson,
+    /// The text passed the route's retention bound or the JSON structure
+    /// limits: `reason: validation_limit`.
+    OverLimit,
+}
+
+impl UnparsedOutput {
+    /// C1 §5's `data.reason` of the invalid output.
+    #[must_use]
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::NotJson => "invalid",
+            Self::OverLimit => "validation_limit",
+        }
+    }
 }
 
 /// The version an instance reported at its own handshake (AD7);
@@ -949,6 +975,7 @@ mod tests {
                 structured_output: Some(
                     serde_json::value::to_raw_value(&serde_json::json!({ "x": big })).unwrap(),
                 ),
+                structured_output_unparsed: None,
                 steps: None,
                 usage: None,
                 cost: None,

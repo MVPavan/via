@@ -591,6 +591,7 @@ mod tests {
                 class_hint: None,
                 detail: None,
                 structured_output: None,
+                structured_output_unparsed: None,
                 steps: None,
                 usage: None,
                 cost: None,

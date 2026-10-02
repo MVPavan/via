@@ -3155,6 +3155,7 @@ fn late_terminal(
         class_hint: None,
         detail: None,
         structured_output: None,
+        structured_output_unparsed: None,
         steps: None,
         usage: None,
         cost: None,
@@ -3509,6 +3510,71 @@ fn a_late_usage_aggregate_supersedes_the_interval_warning() {
             "{envelope}"
         );
         assert_eq!(envelope["warnings"], json!([]), "{envelope}");
+    });
+}
+
+/// Sol r1 #15 (C2 §2 `VendorTerminal`, C1 §5): a route's structured
+/// output that is no value (`NotJson`, `OverLimit`) is present and
+/// invalid. Against a frozen `output_schema`, a completed late terminal
+/// carrying one fails `structured_output_invalid` with `data.reason`
+/// `invalid` or `validation_limit`, no value stored and no
+/// `structured_output_missing` warning; one carrying nothing completes with
+/// that warning.
+#[test]
+fn an_unparsed_structured_output_is_invalid_not_missing() {
+    let Some(root) = child("an_unparsed_structured_output_is_invalid_not_missing") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let db = rusqlite::Connection::open(root.join("state").join("store.sqlite3")).unwrap();
+        db.busy_timeout(Duration::from_secs(10)).unwrap();
+        let cases = [
+            (Some(via_adapters::UnparsedOutput::NotJson), Some("invalid")),
+            (
+                Some(via_adapters::UnparsedOutput::OverLimit),
+                Some("validation_limit"),
+            ),
+            (None, None),
+        ];
+        for (unparsed, reason) in cases {
+            let session = unknown_session(&engine, (Value::Null, None), json!({})).await;
+            let changed = db
+                .execute(
+                    "UPDATE turns SET effective=json_set(effective,'$.output_schema',json('{\"type\":\"object\"}')) WHERE session_id=?1 AND number=1",
+                    [session.as_str()],
+                )
+                .unwrap();
+            assert_eq!(changed, 1);
+            let mut late = late_terminal(via_adapters::VendorTerminalStatus::Completed, "late");
+            late.structured_output_unparsed = unparsed;
+            engine.revise(&session, turn(1), &late).await;
+            let envelope = stored_envelope(&engine, &session, 1).await;
+            assert_eq!(envelope["revision"], 1, "{envelope}");
+            assert_eq!(envelope["structured_output"], Value::Null, "{envelope}");
+            let missing = envelope["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning["code"] == "structured_output_missing");
+            if let Some(reason) = reason {
+                assert_eq!(envelope["state"], "failed", "{envelope}");
+                assert_eq!(
+                    envelope["failure"]["class"], "structured_output_invalid",
+                    "{envelope}"
+                );
+                assert_eq!(
+                    envelope["failure"]["data"],
+                    json!({"reason": reason}),
+                    "{envelope}"
+                );
+                assert!(!missing, "{envelope}");
+            } else {
+                assert_eq!(envelope["state"], "completed", "{envelope}");
+                assert!(missing, "{envelope}");
+            }
+        }
+        assert!(!engine.store_failed());
     });
 }
 
