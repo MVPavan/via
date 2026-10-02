@@ -137,8 +137,13 @@ commit that vendored the unchanged copy shows the whole patch.
      divisor whose digits, scaled to the value's exponent, exceed 128
      bits divides no non-zero value. The test-suite cases (small
      divisors, the division that overflows a float) keep their results.
-7. **Lint** (`Cargo.toml`): `mismatched_lifetime_syntaxes` is allowed, so
-   newer toolchains do not warn on upstream's elided lifetimes.
+7. **Manifest** (`Cargo.toml`): `mismatched_lifetime_syntaxes` is allowed, so
+   newer toolchains do not warn on upstream's elided lifetimes. The
+   dev-dependencies and the `bench` target (criterion, rustls, serde_yaml,
+   ureq; used only by upstream's excluded `tests/` and by `benches/`) are
+   removed, so the unit and doc tests run from the workspace root under its
+   lockfile, offline, writing nothing here:
+   `cargo test --locked --offline -p boon`.
 
 VIA's limits and the measurements behind them are in
 `crates/via-core/src/schema.rs`.

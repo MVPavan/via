@@ -39,11 +39,6 @@ repository = "https://github.com/santhosh-tekuri/boon"
 name = "boon"
 path = "src/lib.rs"
 
-[[bench]]
-name = "bench"
-path = "benches/bench.rs"
-harness = false
-
 # VIA patch: upstream's elided-lifetime style, warned by newer toolchains.
 [lints.rust]
 mismatched_lifetime_syntaxes = "allow"
@@ -83,19 +78,3 @@ version = "1"
 
 [dependencies.url]
 version = "2"
-
-[dev-dependencies.criterion]
-version = "0.5"
-
-[dev-dependencies.rustls]
-version = "0.23"
-
-[dev-dependencies.serde]
-version = "1.0"
-features = ["derive"]
-
-[dev-dependencies.serde_yaml]
-version = "0.9"
-
-[dev-dependencies.ureq]
-version = "2.12"
