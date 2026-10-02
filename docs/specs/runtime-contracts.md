@@ -365,8 +365,16 @@ first call stops admission at once, under the lock the reader takes around
 each admission, and later messages are discarded and their bytes counted; a
 reader failure stops admission the same way. After a seal `drain_admitted`
 yields the messages admitted before it, then the boundary; it never waits for
-more output. The connection failure's disposition is kept by the route, not by
-Wire. A partial write that cannot finish closes input and reports the existing
+more output. `drain_admitted` seals first, so a drain alone stops admission;
+it seals and dequeues only when polled. `Boundary.discarded_bytes` is a lower
+bound read when the boundary is yielded: it counts complete messages split
+after the seal and whole reads skipped after a reader failure, but not the read
+that failed the reader, so it can be 0 although output was lost, and a later
+boundary may report more. A second `StartBy` write while the ticketed data slot
+is occupied is refused at once with `NotWritten`, writing nothing. `withdraw`
+does nothing for `CutAt` data and interrupts; a `Control` message stays
+withdrawable under either bounds variant until its first byte. The connection
+failure's disposition is kept by the route, not by Wire. A partial write that cannot finish closes input and reports the existing
 indeterminate transport condition; it never reuses the connection or extends
 the deadline. This operation does not request Host group cleanup, stop output
 readers or fabricate a successful send. The future C4 owner implements it with
