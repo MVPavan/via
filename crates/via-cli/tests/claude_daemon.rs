@@ -478,6 +478,17 @@ impl Deployment {
             .count())
     }
 
+    /// How many rows `table` (`sessions` or `turns`) holds.
+    fn rows(&self, table: &str) -> Result<usize, ScenarioError> {
+        let count: i64 = self
+            .store()?
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .map_err(infra)?;
+        usize::try_from(count).map_err(infra)
+    }
+
     /// Waits for turn `n`'s first durable event of `kind`.
     fn await_event(&self, session: &str, n: u32, kind: &str) -> Result<Value, ScenarioError> {
         let deadline = Instant::now() + WAIT;
@@ -1913,6 +1924,383 @@ fn claude_refusal_expires_through_daemon() -> TestResult {
                 && envelope["version_status"] == "tested"
                 && d.launches()?.len() == 2,
             || format!("600 s on: describe {expired}, turn {envelope}"),
+        )
+    })
+}
+
+/// Critical r1 #2 through the daemon: a resume's admission reads the
+/// refusal cache. Session A completes its first turn; session B's launch
+/// of the same recipe on the same binary fails its handshake and caches a
+/// refusal; A's resume is then refused `harness_unavailable` with
+/// `data.reason:"handshake_refused"` before any receipt: no turn 2, no
+/// third launch.
+#[test]
+fn claude_s_launch_cached_refusal_refuses_resume() -> TestResult {
+    scenario("claude_s_launch_refusal_resume", |d, evidence| {
+        d.replay(&[
+            completing(Launch::New, true, "ONE", 0.001),
+            refused_handshake("TWO"),
+        ])?;
+        let _daemon = Daemon::start(d, evidence, "final")?;
+        let healthy = session_of(&d.spawn(evidence, "spawn-a", &ask("ONE"), &[])?)?;
+        let first = d.wait(evidence, &format!("{healthy}/1"))?;
+        check(completed(&first), || format!("session A's turn: {first}"))?;
+        let other = session_of(&d.spawn(evidence, "spawn-b", &ask("TWO"), &[])?)?;
+        let refused = d.wait(evidence, &format!("{other}/1"))?;
+        check(
+            refused["failure"]["class"] == "protocol" && replay_ran(&refused, 0),
+            || format!("session B's refused handshake: {refused}"),
+        )?;
+        let error = d.refused(
+            evidence,
+            "resume-a",
+            &[
+                "resume", &healthy, "--prompt", "p", "--handle", HANDLE, "--json",
+            ],
+            "harness_unavailable",
+        )?;
+        check(
+            error["data"]["reason"] == "handshake_refused"
+                && d.rows("turns")? == 2
+                && d.launches()?.len() == 2,
+            || format!("A's resume: {error}"),
+        )
+    })
+}
+
+/// Critical r1 #1 through the daemon: a launch request (Host's
+/// `Configure` frame) past the 64 KiB cap the anchor reads under is
+/// refused `invalid_params` before any receipt, naming the value that
+/// carries it: 16,500 bytes of instructions alone, and 8,300 bytes of
+/// instructions with a schema of about 8,450, each of which fits alone,
+/// naming the larger. Nothing is committed or launched. Instructions of
+/// 15,000 bytes are admitted and launch through Host with their whole
+/// argv (the replay pins it). The daemon's `PATH` is fixed so the
+/// launch environment's size is known.
+#[test]
+fn claude_s_launch_request_past_host_cap_refused() -> TestResult {
+    scenario("claude_s_launch_request_cap", |d, evidence| {
+        let file = |name: &str, content: &str| -> Result<String, ScenarioError> {
+            let path = d.root.path().join(name);
+            fs::write(&path, content).map_err(infra)?;
+            d.stimulus(&path, "input", &json!(content.len()));
+            Ok(path.to_string_lossy().into_owned())
+        };
+        let admitted = "z".repeat(15_000);
+        let mut lifetime_argv = argv(Launch::New, true);
+        if let Some(args) = lifetime_argv.as_array_mut() {
+            args.extend([json!("--append-system-prompt"), json!(admitted)]);
+        }
+        let id = sid(Launch::New);
+        d.replay(&[lifetime(
+            &lifetime_argv,
+            vec![
+                prompt(&ask("ONE")),
+                init(id),
+                reply(id, "ONE"),
+                result(id, "ONE", 0.001),
+                await_eof(),
+            ],
+        )])?;
+        let _daemon = Daemon::start_with(d, evidence, "final", &[("PATH", "/usr/bin:/bin")])?;
+        let over = file("over.txt", &"z".repeat(16_500))?;
+        let half = file("half.txt", &"z".repeat(8_300))?;
+        let schema = file(
+            "schema.json",
+            &json!({"type": "object", "description": "z".repeat(8_400)}).to_string(),
+        )?;
+        let spawn = |name: &str, extra: &[&str]| {
+            let work = d.work.to_string_lossy().into_owned();
+            let mut args = vec![
+                "spawn",
+                "--harness",
+                "claude",
+                "--model",
+                "haiku",
+                "--prompt",
+                "p",
+                "--cwd",
+                &work,
+                "--handle",
+                HANDLE,
+                "--background",
+                "--json",
+            ];
+            args.extend_from_slice(extra);
+            d.refused(evidence, name, &args, "invalid_params")
+        };
+        for (name, extra, field) in [
+            ("spawn-over", vec!["--instructions", &over], "instructions"),
+            (
+                "spawn-combined",
+                vec!["--instructions", &half, "--output-schema", &schema],
+                "output_schema",
+            ),
+        ] {
+            let error = spawn(name, &extra)?;
+            check(
+                error["data"]["field"] == field
+                    && d.rows("sessions")? == 0
+                    && d.launches()?.is_empty(),
+                || format!("{name}: {error}"),
+            )?;
+        }
+        let fits = file("fits.txt", &admitted)?;
+        let session = session_of(&d.spawn(
+            evidence,
+            "spawn-fits",
+            &ask("ONE"),
+            &["--instructions", &fits],
+        )?)?;
+        let envelope = d.wait(evidence, &format!("{session}/1"))?;
+        check(
+            completed(&envelope) && d.rows("sessions")? == 1 && d.launches()?.len() == 1,
+            || format!("the admitted launch: {envelope}"),
+        )
+    })
+}
+
+/// Each item the session channel took (test builds).
+#[cfg(feature = "test-failpoints")]
+const ADMITTED: &str = "adapter.observation.admitted";
+
+/// Critical r1 #3 (bead via-mnx, C2 §4, runtime §8): an observation's
+/// instant is when Route read its message, not when the Adapter dequeued
+/// it, so a delayed dequeue under backpressure neither extends nor expires
+/// the idle deadline wrongly. The turn's idle budget is 2 s. The Adapter's
+/// delivery is held after the channel took its first item (the init's
+/// identity), so the two assistant messages that follow wait in Route's
+/// read-ahead and on the hop; the fake then emits nothing more. Released
+/// 1 s after the second message was written, the delivery hands both on.
+/// The idle deadline counts from the read: the interrupt of the idle
+/// order reaches the vendor 2 s after it (1.9 s to 2.5 s), not 2 s after
+/// the dequeue (about 3 s), and not before. The turn ends `deadline_idle`
+/// and the fake answered the interrupt and saw its EOF (exit 0).
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn claude_progress_keeps_its_read_instant_under_backpressure() -> TestResult {
+    scenario("claude_progress_read_instant", |d, evidence| {
+        let id = "${sid}";
+        let second = emit(
+            &json!({"type": "assistant", "message": {"model": "claude-haiku-4-5-20251001",
+            "id": "msg_01SYNTH000002", "type": "message", "role": "assistant",
+            "content": [{"type": "text", "text": "still working"}],
+            "usage": {"input_tokens": 7, "output_tokens": 3}},
+            "parent_tool_use_id": null, "session_id": id}),
+        );
+        d.replay(&[lifetime(
+            &argv(Launch::New, true),
+            vec![
+                prompt(&ask("ONE")),
+                init(id),
+                reply(id, "ONE"),
+                second,
+                gate(),
+                json!({"expect": {"line": {"type": "control_request",
+                    "request": {"subtype": "interrupt"}}, "capture": {"rid": "/request_id"}}}),
+                json!({"emit": {"line": "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":${rid},\"response\":{\"still_queued\":[]}}}"}}),
+                emit(
+                    &json!({"type": "result", "subtype": "error_during_execution",
+                    "is_error": true, "session_id": id, "stop_reason": "tool_use",
+                    "terminal_reason": "aborted_tools"}),
+                ),
+                await_eof(),
+            ],
+        )])?;
+        d.failpoints.arm(ADMITTED, 1, "pause").map_err(infra)?;
+        let daemon = Daemon::start(d, evidence, "final")?;
+        let session =
+            session_of(&d.spawn(evidence, "spawn", &ask("ONE"), &["--idle-ms", "2000"])?)?;
+        d.failpoints
+            .wait_ack(ADMITTED, 1, "pause", daemon.pid(), WAIT)
+            .map_err(infra)?;
+        d.await_progress("at 6 launch 1")?;
+        let written = Instant::now();
+        d.release(1)?;
+        thread::sleep(Duration::from_secs(1).saturating_sub(written.elapsed()));
+        d.failpoints.release(ADMITTED, 1).map_err(infra)?;
+        d.await_progress("read 2 launch 1")?;
+        let interrupted = written.elapsed();
+        let envelope = d.wait(evidence, &format!("{session}/1"))?;
+        check(
+            envelope["state"] == "failed"
+                && envelope["failure"]["class"] == "deadline_idle"
+                && replay_ran(&envelope, 0)
+                && interrupted >= Duration::from_millis(1_900)
+                && interrupted <= Duration::from_millis(2_500),
+            || format!("the idle order's interrupt {interrupted:?} after the read: {envelope}"),
+        )
+    })
+}
+
+/// Critical r1 #5 (packet §6, `claude_fifo_busy_input` through the
+/// daemon): a resume admitted while turn 1's Bash tool runs is queued, not
+/// written to the busy process. Turn 1's process is gated inside its tool
+/// (`running_tools` reported); the resume's receipt is `queued`, and while
+/// the tool still runs that process has read one input line and nothing
+/// else launched. Released, turn 1 completes and its process exits 0
+/// (strict input: a second user line before its EOF would have failed it);
+/// turn 2 then runs as a second process resuming the confirmed UUID. The
+/// first process read exactly one line in all.
+#[test]
+fn claude_fifo_busy_input_through_daemon() -> TestResult {
+    scenario("claude_fifo_busy_input", |d, evidence| {
+        let id = "${sid}";
+        let tool = emit(
+            &json!({"type": "assistant", "message": {"model": "claude-haiku-4-5-20251001",
+            "id": "msg_01SYNTH000001", "type": "message", "role": "assistant",
+            "content": [{"type": "tool_use", "id": "toolu_01SYNTH000001", "name": "Bash",
+                "input": {"command": "sleep 1"}}],
+            "usage": {"input_tokens": 7, "output_tokens": 3}},
+            "parent_tool_use_id": null, "session_id": id}),
+        );
+        let ended = emit(&json!({"type": "user", "message": {"role": "user",
+            "content": [{"tool_use_id": "toolu_01SYNTH000001", "type": "tool_result",
+                "content": "ok", "is_error": false}]},
+            "parent_tool_use_id": null, "session_id": id}));
+        let mut lives = vec![lifetime(
+            &argv(Launch::New, true),
+            vec![
+                prompt(&ask("FIRST")),
+                init(id),
+                tool,
+                gate(),
+                ended,
+                reply(id, "FIRST"),
+                result(id, "FIRST", 0.001),
+                await_eof(),
+            ],
+        )];
+        d.replay(&lives)?;
+        let _daemon = Daemon::start(d, evidence, "final")?;
+        let session = session_of(&d.spawn(evidence, "spawn", &ask("FIRST"), &[])?)?;
+        d.await_progress("at 5 launch 1")?;
+        await_running_tool(d, evidence, &session)?;
+        let receipt = d.resume(evidence, "resume-busy", &session, &ask("SECOND"))?;
+        let uuid = d.status(evidence, "status-busy", &session)?["vendor_session_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let reads = |d: &Deployment| -> Result<usize, ScenarioError> {
+            Ok(Deployment::log_of(&d.replayed.borrow(), "progress")?
+                .lines()
+                .filter(|line| line.starts_with("read ") && line.ends_with(" launch 1"))
+                .count())
+        };
+        // Room for a wrongly dispatched prompt to arrive before the check.
+        thread::sleep(Duration::from_millis(300));
+        let (busy_reads, busy_launches) = (reads(d)?, d.launches()?.len());
+        check(
+            receipt["state"] == "queued"
+                && !uuid.is_empty()
+                && busy_reads == 1
+                && busy_launches == 1,
+            || {
+                format!(
+                    "during the tool: receipt {receipt}, {busy_reads} lines read, \
+                     {busy_launches} launches"
+                )
+            },
+        )?;
+        lives.push(completing(Launch::Resume(&uuid), true, "SECOND", 0.002));
+        d.replay(&lives)?;
+        d.release(1)?;
+        let first = d.wait(evidence, &format!("{session}/1"))?;
+        let second = d.wait(evidence, &format!("{session}/2"))?;
+        check(
+            completed(&first) && completed(&second) && reads(d)? == 1 && d.launches()?.len() == 2,
+            || format!("turn 1 {first}; turn 2 {second}"),
+        )
+    })
+}
+
+/// One schema launch (packet §9 `claude_schema_replace_clear` shapes): the
+/// `StructuredOutput` tool in the init, and a `success` result carrying
+/// `output`, or no `structured_output` member at all when `None`.
+fn schema_launch(launch: Launch<'_>, schema: &str, text: &str, output: Option<&Value>) -> Value {
+    let id = sid(launch);
+    let mut argv = argv(launch, true);
+    if let Some(args) = argv.as_array_mut() {
+        args.extend([json!("--json-schema"), json!(schema)]);
+    }
+    let init = json!({"type": "system", "subtype": "init", "cwd": "/work/project",
+        "session_id": id, "tools": ["Bash", "Edit", "Glob", "Grep", "Read", "Write",
+        "StructuredOutput"], "mcp_servers": [], "model": "claude-haiku-4-5-20251001",
+        "permissionMode": "dontAsk", "apiKeySource": "none", "claude_code_version": TESTED,
+        "uuid": "00000000-0000-4000-8000-000000000001",
+        "capabilities": ["interrupt_receipt_v1", "interrupt_cancel_queued_v1",
+            "msg_lifecycle_v1"]});
+    let mut result = json!({"type": "result", "subtype": "success", "is_error": false,
+        "session_id": id, "stop_reason": "end_turn", "terminal_reason": "completed",
+        "num_turns": 1, "total_cost_usd": 0.001,
+        "usage": {"input_tokens": 10, "cache_creation_input_tokens": 100,
+            "cache_read_input_tokens": 1000, "output_tokens": 20},
+        "permission_denials": [], "result": text});
+    if let Some(output) = output {
+        result["structured_output"] = output.clone();
+    }
+    lifetime(
+        &argv,
+        vec![
+            prompt(&ask(text)),
+            emit(&init),
+            reply(id, text),
+            emit(&result),
+            await_eof(),
+        ],
+    )
+}
+
+/// Critical r1 #6 (packet §9, C1 §5): Claude's structured output through
+/// Core's validation into the public envelope. Turn 1's result carries a
+/// value its schema refuses (`a` must be a string): the turn fails
+/// `structured_output_invalid` with `data.reason:"invalid"`, the value
+/// kept. Turn 2 inherits the schema and its result carries none: it
+/// completes with the `structured_output_missing` warning and a null
+/// output. Both launches pass the compact schema and ran their replays
+/// through (exit 0).
+#[test]
+fn claude_structured_output_invalid_and_missing() -> TestResult {
+    scenario("claude_structured_output_envelope", |d, evidence| {
+        let schema = json!({"type": "object", "properties": {"a": {"type": "string"}},
+            "required": ["a"]});
+        let compact = schema.to_string();
+        let path = d.root.path().join("schema.json");
+        fs::write(&path, &compact).map_err(infra)?;
+        d.stimulus(&path, "input", &schema);
+        let path = path.to_string_lossy().into_owned();
+        let invalid = json!({"a": 5});
+        let mut lives = vec![schema_launch(Launch::New, &compact, "ONE", Some(&invalid))];
+        d.replay(&lives)?;
+        let _daemon = Daemon::start(d, evidence, "final")?;
+        let session =
+            session_of(&d.spawn(evidence, "spawn", &ask("ONE"), &["--output-schema", &path])?)?;
+        let first = d.wait(evidence, &format!("{session}/1"))?;
+        let uuid = first["vendor_session_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        check(
+            first["state"] == "failed"
+                && first["failure"]["class"] == "structured_output_invalid"
+                && first["failure"]["data"]["reason"] == "invalid"
+                && first["structured_output"] == invalid
+                && replay_ran(&first, 0)
+                && !uuid.is_empty(),
+            || format!("an invalid structured output: {first}"),
+        )?;
+        lives.push(schema_launch(Launch::Resume(&uuid), &compact, "TWO", None));
+        d.replay(&lives)?;
+        d.resume(evidence, "resume", &session, &ask("TWO"))?;
+        let second = d.wait(evidence, &format!("{session}/2"))?;
+        let warned = second["warnings"].as_array().is_some_and(|warnings| {
+            warnings
+                .iter()
+                .any(|warning| warning["code"] == "structured_output_missing")
+        });
+        check(
+            completed(&second) && warned && second["structured_output"].is_null(),
+            || format!("a missing structured output: {second}"),
         )
     })
 }

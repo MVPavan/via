@@ -114,7 +114,7 @@ pub(crate) async fn run_turn(
     };
     // Route hands one message at a time: while it is full Route reads no
     // further message.
-    let (hop, hop_rx) = mpsc::channel::<RouteMessage>(1);
+    let (hop, hop_rx) = mpsc::channel::<via_routes::Decoded<RouteMessage>>(1);
     let lane = Lane {
         persistent,
         handshake: profile.handshake.as_ref().map(|decl| decl.requires.clone()),
@@ -241,6 +241,7 @@ fn refused_values(adapter: &FakeAdapter, spec: &TurnSpec) -> Option<TurnEnd> {
         vendor: spec.vendor.clone(),
         // The fake has no size limit: it never reads them.
         sizes: ParamSizes::default(),
+        inherit: None,
     };
     let refusal = adapter
         .check_turn(Harness::Fake.route(), &params)
@@ -504,7 +505,7 @@ struct TurnTask {
     route: FakeRoute,
     process: PrivateProcessSpec,
     start: TurnStart,
-    hop: mpsc::Sender<RouteMessage>,
+    hop: mpsc::Sender<via_routes::Decoded<RouteMessage>>,
     signals: (Deadline, ForceWatch, StopWatch),
     close: watch::Receiver<Option<StopOrder>>,
     cancel: CancellationToken,

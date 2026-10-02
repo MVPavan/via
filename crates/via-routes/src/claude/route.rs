@@ -18,7 +18,7 @@ use super::messages::{
     interrupt_request, user_start,
 };
 use crate::private::{
-    self, AfterTerminal, Closed, Failed, Interrupt, PrivateProtocol, Serving, protocol,
+    self, AfterTerminal, Closed, Decoded, Failed, Interrupt, PrivateProtocol, Serving, protocol,
 };
 use crate::{
     Deadline, PrivateProcessSpec, Retirement, RouteError, RouteFailure, RouteRuntime, SendOutcome,
@@ -120,7 +120,7 @@ impl ClaudeRoute {
         &self,
         process: PrivateProcessSpec,
         start: ClaudeStart,
-        hop: mpsc::Sender<ClaudeItem>,
+        hop: mpsc::Sender<Decoded<ClaudeItem>>,
         signals: (
             Deadline,
             watch::Receiver<Option<tokio::time::Instant>>,
@@ -334,7 +334,7 @@ impl PrivateProtocol for ClaudeLane {
     fn interrupt(serving: &mut Serving<'_, Self>) -> OutboundMessage {
         let id = format!("via-interrupt-{}", serving.turn.get());
         let bytes = interrupt_request(&id);
-        serving.hold((ClaudeItem::InterruptSent(id), 0));
+        serving.hold((Decoded::now(ClaudeItem::InterruptSent(id)), 0));
         OutboundMessage::Interrupt(bytes)
     }
 

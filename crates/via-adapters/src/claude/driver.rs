@@ -101,7 +101,7 @@ pub(crate) async fn run_turn(
         state.retiring = Some(retiring);
     }
     // Route reads ahead up to its own bound; one item waits here.
-    let (hop, hop_rx) = mpsc::channel::<ClaudeItem>(1);
+    let (hop, hop_rx) = mpsc::channel::<via_routes::Decoded<ClaudeItem>>(1);
     let (end, end_rx) = oneshot::channel();
     driver.tracker.spawn(turn_task(TurnTask {
         route: ClaudeRoute::new(Arc::clone(&driver.runtime)),
@@ -244,9 +244,11 @@ fn refused_values(driver: &SessionDriver, spec: &TurnSpec) -> Option<TurnEnd> {
                 .output_schema
                 .as_deref()
                 .map_or(0, |raw| raw.get().len()),
+            ..ParamSizes::default()
         },
+        ..TurnParams::default()
     };
-    let refusal = ClaudeAdapter::check_turn(route(), &params)
+    let refusal = ClaudeAdapter::check_values(route(), &params)
         .into_iter()
         .next()?;
     Some(rejected(AdapterError::Rejected {
@@ -641,7 +643,7 @@ struct TurnTask {
     route: ClaudeRoute,
     process: crate::PrivateProcessSpec,
     start: ClaudeStart,
-    hop: mpsc::Sender<ClaudeItem>,
+    hop: mpsc::Sender<via_routes::Decoded<ClaudeItem>>,
     signals: (Deadline, ForceWatch, StopWatch),
     /// The driver's close order and its verdict's abort order.
     stops: (

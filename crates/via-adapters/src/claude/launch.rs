@@ -169,6 +169,12 @@ pub(crate) fn argv(recipe: &Recipe<'_>) -> Result<Vec<OsString>, RecipeError> {
 }
 
 impl ClaudeAdapter {
+    /// The launch environment as Host takes it.
+    pub(crate) fn env_list(&self) -> EnvAllowList {
+        // The allow-list holds three distinct names: always valid.
+        EnvAllowList::try_from_entries(self.env.clone()).unwrap_or_else(|_| EnvAllowList::default())
+    }
+
     /// One launch's process (C2 §6.2): the binary with the recipe's argv in
     /// the session's frozen `cwd`, with the allow-listed environment.
     pub(crate) fn process_spec(
@@ -181,9 +187,7 @@ impl ClaudeAdapter {
             program: self.binary.clone(),
             args: argv(recipe)?,
             cwd: cwd.to_path_buf(),
-            // The allow-list holds three distinct names: always valid.
-            env: EnvAllowList::try_from_entries(self.env.clone())
-                .unwrap_or_else(|_| EnvAllowList::default()),
+            env: self.env_list(),
             owner,
             // Wire creates the turn's evidence folder and names the file in it.
             stderr_path: PathBuf::new(),

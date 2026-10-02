@@ -11,8 +11,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use via_adapters::{
-    AdapterSet, Bound, DescribeRequest, Harness, ParamSizes, Refusal, RefusalKind, RoutePlan,
-    SessionRef, Support, TurnParams, TurnSpec, VendorOptions, Verb, VerbReq, harness_names,
+    AdapterSet, Bound, DescribeRequest, Harness, Inherit, ParamSizes, Refusal, RefusalKind,
+    RoutePlan, SessionRef, Support, TurnParams, TurnSpec, VendorOptions, Verb, VerbReq,
+    harness_names,
 };
 use via_store::json_limits::{self, Shape};
 
@@ -448,6 +449,7 @@ pub(crate) fn param_sizes(instructions: Option<&str>, schema: Option<&Value>) ->
         output_schema: schema.map_or(0, |schema| {
             serde_json::to_string(schema).map_or(0, |text| text.len())
         }),
+        ..ParamSizes::default()
     }
 }
 
@@ -530,7 +532,11 @@ pub(crate) fn plan_spawn(
     adapter
         .check_turn(
             &session,
-            &effective.turn_params(members.instructions.as_deref()),
+            &effective.turn_params(
+                members.instructions.as_deref(),
+                cwd.len(),
+                Some(plan.inherit.requested),
+            ),
         )
         .map_err(|refusal| refused(&refusal))?;
     Ok(Planned { plan, effective })
@@ -777,16 +783,28 @@ impl Effective {
     }
 
     /// The values `check_turn` validates against the frozen route: the
-    /// bound as requested, and the sizes of the session's frozen
-    /// `instructions` and the turn's effective schema.
-    pub(crate) fn turn_params(&self, instructions: Option<&str>) -> TurnParams {
+    /// bound as requested; the sizes of the session's frozen
+    /// `instructions` and `cwd` (`cwd`'s length in bytes), of the turn's
+    /// effective schema and of its model; and the session's requested
+    /// `inherit`, which a route's launch reads (critical r1 #1, #2).
+    pub(crate) fn turn_params(
+        &self,
+        instructions: Option<&str>,
+        cwd: usize,
+        inherit: Option<Inherit>,
+    ) -> TurnParams {
         TurnParams {
             effort: self.effort.clone(),
             bound: self.requested_bound().cloned(),
             output_schema: self.output_schema.is_some(),
             max_steps: self.max_steps,
             vendor: self.vendor.clone(),
-            sizes: param_sizes(instructions, self.output_schema.as_ref()),
+            sizes: ParamSizes {
+                cwd,
+                model: self.model.len(),
+                ..param_sizes(instructions, self.output_schema.as_ref())
+            },
+            inherit,
         }
     }
 

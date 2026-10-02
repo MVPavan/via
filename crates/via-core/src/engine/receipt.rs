@@ -536,7 +536,16 @@ impl Engine {
         // requested bound, given or inherited, takes the effective one the
         // route reports now (Sol r2 #4, r3 #2); an inherited one stays
         // marked so.
-        let params = effective.turn_params(frozen.instructions.as_deref());
+        // The session's frozen `cwd`, else the daemon's, as its driver opens.
+        let cwd = frozen
+            .cwd
+            .as_deref()
+            .map_or_else(|| self.cwd.as_os_str().len(), str::len);
+        let params = effective.turn_params(
+            frozen.instructions.as_deref(),
+            cwd,
+            frozen.inherit.map(|inherit| inherit.requested),
+        );
         let checked = self
             .adapter
             .check_turn(&frozen.session_ref(), &params)

@@ -73,6 +73,11 @@ pub struct ParamSizes {
     /// The turn's `output_schema`, in bytes of its compact JSON encoding,
     /// as the turn's `TurnSpec` carries it.
     pub output_schema: usize,
+    /// The session's working directory, in bytes; `check_turn` only (a
+    /// plan reads [`DescribeRequest::cwd`]).
+    pub cwd: usize,
+    /// The session's resolved model, in UTF-8 bytes; `check_turn` only.
+    pub model: usize,
 }
 
 /// A resume turn's per-turn values, the input to `check_turn`.
@@ -91,6 +96,9 @@ pub struct TurnParams {
     /// The encoded sizes of the session's frozen instructions and the
     /// turn's effective schema, inherited or set.
     pub sizes: ParamSizes,
+    /// The session's `inherit` as requested at spawn, which a route's
+    /// launch recipe may read; `None` where the session's is unknown.
+    pub inherit: Option<Inherit>,
 }
 
 /// What `check_turn` reports of a resume turn it accepts (C2 §2).
@@ -849,9 +857,9 @@ impl AdapterSet {
         let route = harness.route();
         let adapter = match self.adapter(harness).filter(|_| session.route == route) {
             Some(Adapter::Fake(fake)) => fake,
-            Some(Adapter::Claude(_)) => {
+            Some(Adapter::Claude(claude)) => {
                 ClaudeAdapter::check_version(route, &session.adapter_version)?;
-                return match ClaudeAdapter::check_turn(route, turn).into_iter().next() {
+                return match claude.check_turn(route, turn).into_iter().next() {
                     Some(refusal) => Err(refusal),
                     // The route applies a supported bound as requested.
                     None => Ok(TurnCheck {

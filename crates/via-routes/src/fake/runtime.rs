@@ -4,8 +4,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use super::{FakeMessage, RouteMessage, TerminalStatus, TurnStart};
 use crate::private::{
-    self, AfterTerminal, Closed, Failed, Interrupt, PrivateProtocol, Serving, cleanup_deadline,
-    protocol,
+    self, AfterTerminal, Closed, Decoded, Failed, Interrupt, PrivateProtocol, Serving,
+    cleanup_deadline, protocol,
 };
 use crate::steer::{SteerRequest, SteerSender};
 use crate::{
@@ -96,7 +96,7 @@ impl FakeRoute {
         &self,
         process: PrivateProcessSpec,
         start: TurnStart,
-        hop: mpsc::Sender<RouteMessage>,
+        hop: mpsc::Sender<Decoded<RouteMessage>>,
         signals: (
             Deadline,
             watch::Receiver<Option<tokio::time::Instant>>,

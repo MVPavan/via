@@ -29,6 +29,29 @@ pub(crate) use serving::{
 };
 use serving::{acquire_failure, wake_on_order};
 
+/// One hop item: what Route admitted, with the instant Route read it from
+/// the vendor's stdout. A message's observations take that instant, not
+/// the one the Adapter dequeues it at, so time it waits in Route's
+/// read-ahead or on the hop moves no idle deadline (bead via-mnx, C2 §4,
+/// runtime §8; x.3.2 critical r1 #3).
+#[derive(Debug)]
+pub struct Decoded<M> {
+    /// The admitted message.
+    pub item: M,
+    /// When Route read it.
+    pub at: tokio::time::Instant,
+}
+
+impl<M> Decoded<M> {
+    /// `item`, as of now: one Route made rather than read.
+    pub(crate) fn now(item: M) -> Self {
+        Self {
+            item,
+            at: tokio::time::Instant::now(),
+        }
+    }
+}
+
 /// The daemon force: `None` until raised, then the instant it was raised.
 pub(crate) type ForceWatch = watch::Receiver<Option<tokio::time::Instant>>;
 
@@ -226,7 +249,7 @@ pub(crate) async fn turn<P: PrivateProtocol>(
     runtime: &RouteRuntime,
     process: PrivateProcessSpec,
     start: P::Start,
-    hop: mpsc::Sender<P::Message>,
+    hop: mpsc::Sender<Decoded<P::Message>>,
     signals: (Deadline, ForceWatch, (StopWatch, StopSources)),
     input: P::Input,
 ) -> Retirement {
@@ -244,7 +267,7 @@ async fn run<P: PrivateProtocol>(
     runtime: &RouteRuntime,
     process: PrivateProcessSpec,
     start: P::Start,
-    hop: mpsc::Sender<P::Message>,
+    hop: mpsc::Sender<Decoded<P::Message>>,
     (deadline, force, (stop, sources)): (Deadline, ForceWatch, (StopWatch, StopSources)),
     input: P::Input,
 ) -> (Result<P::Result, RouteFailure>, Lane<P>) {
@@ -311,7 +334,7 @@ async fn run<P: PrivateProtocol>(
 async fn run_turn<P: PrivateProtocol>(
     runtime: &RouteRuntime,
     (process, start): (PrivateProcessSpec, P::Start),
-    hop: &mpsc::Sender<P::Message>,
+    hop: &mpsc::Sender<Decoded<P::Message>>,
     deadline: Deadline,
     wire_signals: WireSignals,
     signals: Signals,
@@ -433,7 +456,7 @@ async fn late<P: PrivateProtocol>(
     serving: &mut Serving<'_, P>,
     sender: &WireSender,
     messages: WireMessages,
-    (terminal, last): (P::Terminal, Option<P::Message>),
+    (terminal, last): (P::Terminal, Option<Decoded<P::Message>>),
 ) -> Result<P::Result, RouteFailure> {
     // Test builds: the terminal is decoded and held, the late path
     // entered; nothing is closed or delivered yet.
@@ -469,7 +492,7 @@ enum Finished<P: PrivateProtocol> {
     Result(P::Result, Deadline),
     /// A decoded terminal whose finalization, or whose wait for read-ahead
     /// room (then still to go on the hop, last), outlived the wall deadline.
-    Late(P::Terminal, Option<P::Message>),
+    Late(P::Terminal, Option<Decoded<P::Message>>),
     /// The logical turn ended at its terminal with its server kept (C2
     /// §4.1).
     Kept(P::Kept),
@@ -526,7 +549,7 @@ async fn drive<P: PrivateProtocol>(
             // `ProcessExited`.
             end @ (Next::Eof | Next::Unterminated) => return Err(serving.ended(end).await),
         };
-        let Some(terminal) = P::terminal(&message.0) else {
+        let Some(terminal) = P::terminal(&message.0.item) else {
             serving.hold(message);
             continue;
         };

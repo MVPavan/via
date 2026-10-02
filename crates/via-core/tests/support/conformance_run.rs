@@ -340,6 +340,9 @@ impl<'a> Run<'a> {
         self.start_condition(index, turn).await?;
         let label = session_of(turn).to_owned();
         let mut ran = Ran::default();
+        if !self.pure.pending.contains(&index) {
+            self.dispatch(index, turn).await?;
+        }
         if self.pure.pending.contains(&index) {
             let session = self
                 .sessions
@@ -372,11 +375,12 @@ impl<'a> Run<'a> {
         Ok((ran, after))
     }
 
-    /// A turn starts at its `start_after` event, else once the turn before
-    /// it settled; never before its session's previous turn settled.
+    /// A turn is admitted (committed, as Core queues it) at its
+    /// `start_after` event, else once the turn before it settled; it runs
+    /// only once its session's previous turn settled ([`Self::dispatch`]),
+    /// so a turn admitted during its predecessor's tool waits queued
+    /// (critical r1 #5).
     async fn start_condition(&self, index: usize, turn: &Value) -> Result<(), String> {
-        let label = session_of(turn);
-        let turns = self.expect["turns"].as_array().ok_or("turns")?;
         if let Some(after) = turn.get("start_after").filter(|after| !after.is_null()) {
             let earlier = after["turn"]
                 .as_u64()
@@ -390,6 +394,14 @@ impl<'a> Run<'a> {
             let mut seen = self.seen[index - 1].subscribe();
             let _ = seen.wait_for(|seen| seen.settled).await;
         }
+        Ok(())
+    }
+
+    /// Core's FIFO: a turn runs only once its session's previous turn
+    /// settled.
+    async fn dispatch(&self, index: usize, turn: &Value) -> Result<(), String> {
+        let label = session_of(turn);
+        let turns = self.expect["turns"].as_array().ok_or("turns")?;
         for earlier in (0..index).rev() {
             if session_of(&turns[earlier]) == label {
                 let mut seen = self.seen[earlier].subscribe();
@@ -452,6 +464,7 @@ impl<'a> Run<'a> {
         let params = &turn["params"];
         let prompt = params["prompt"].as_str().unwrap_or_default().to_owned();
         let number = self.commit(session, &prompt).await?;
+        self.dispatch(index, turn).await?;
         let spec = TurnSpec {
             prompt,
             effort: params["effort"].as_str().map(str::to_owned),

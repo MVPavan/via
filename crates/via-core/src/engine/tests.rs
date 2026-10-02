@@ -7836,8 +7836,9 @@ fn plain_effective() -> crate::intake::Effective {
 /// x.3.2 G8 (C2 §2 `ParamSizes`): Core fills the encoded sizes of the
 /// session's instructions and the turn's schema at intake. Spawn's plan
 /// and `check_turn` carry the instructions' UTF-8 bytes and the schema's
-/// compact JSON bytes; a resume inherits the frozen instructions and the
-/// latest schema, a set schema replaces it, and a null one clears it.
+/// compact JSON bytes, and `check_turn` the `cwd` and model; a resume
+/// inherits the frozen instructions and the latest schema, a set schema
+/// replaces it, and a null one clears it.
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn core_fills_param_sizes_on_spawn_and_resume() {
@@ -7862,9 +7863,17 @@ fn core_fills_param_sizes_on_spawn_and_resume() {
     .unwrap();
     run(async {
         let engine = open(&root);
-        let sizes = |instructions, output_schema| via_adapters::ParamSizes {
+        let planned = |instructions, output_schema| via_adapters::ParamSizes {
             instructions,
             output_schema,
+            ..via_adapters::ParamSizes::default()
+        };
+        // Critical r1 #1: `check_turn` also carries the session's `cwd`
+        // (the daemon's here) and resolved model ("fake"), in bytes.
+        let sizes = |instructions, output_schema| via_adapters::ParamSizes {
+            cwd: engine.cwd.as_os_str().len(),
+            model: 4,
+            ..planned(instructions, output_schema)
         };
         // "é" is two UTF-8 bytes; the schema's compact encoding is 17.
         let instructions = "be brief é";
@@ -7881,10 +7890,9 @@ fn core_fills_param_sizes_on_spawn_and_resume() {
             .enqueued
             .unwrap()
             .0;
-        let spawned = sizes(11, 17);
         assert_eq!(
             engine.adapter.param_sizes_seen(),
-            [spawned, spawned],
+            [planned(11, 17), sizes(11, 17)],
             "spawn's plan and check_turn"
         );
         let resume = |extra: Value| {

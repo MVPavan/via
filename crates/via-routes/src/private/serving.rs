@@ -8,7 +8,7 @@ use std::future::Future;
 
 use tokio::sync::{mpsc, watch};
 
-use super::{Closed, ForceWatch, PrivateProtocol};
+use super::{Closed, Decoded, ForceWatch, PrivateProtocol};
 use crate::{Deadline, RouteError, RouteFailure, SendOutcome, StopWatch, StoreFailure, TurnNumber};
 use via_wire::{
     ExitReport, FailureCause, HostError, LatchState, PendingWrite, WireError, WireFailure,
@@ -103,11 +103,11 @@ pub(crate) struct Stall {
     close_by: Deadline,
 }
 
-/// What [`Serving::next`] read: a message admitted for the hop, with its
-/// encoded bytes.
+/// What [`Serving::next`] read: a message admitted for the hop, as of the
+/// instant it was read, with its encoded bytes.
 pub(crate) enum Next<M> {
     /// One decoded vendor message.
-    Message((M, usize)),
+    Message((Decoded<M>, usize)),
     /// Stdout ended.
     Eof,
     /// Stdout ended inside a message; Wire kept its bytes (F21, design §7.3).
@@ -149,7 +149,7 @@ impl From<RouteError> for Failed {
 pub(crate) struct Serving<'a, P: PrivateProtocol> {
     pub(crate) turn: TurnNumber,
     pub(crate) sender: &'a WireSender,
-    pub(crate) hop: &'a mpsc::Sender<P::Message>,
+    pub(crate) hop: &'a mpsc::Sender<Decoded<P::Message>>,
     pub(crate) deadline: Deadline,
     pub(crate) signals: Signals,
     pub(crate) latch: watch::Receiver<LatchState>,
@@ -166,7 +166,7 @@ pub(crate) struct Serving<'a, P: PrivateProtocol> {
     /// The pending interrupt write, kept pinned while other waits run.
     pub(crate) pending: Option<PendingWrite>,
     /// Decoded messages waiting for room on the hop.
-    held: ReadAhead<P::Message>,
+    held: ReadAhead<Decoded<P::Message>>,
     /// The Adapter stalled: the hop is closed, and nothing more goes on it.
     pub(crate) stall: Option<Stall>,
     /// The protocol's state.
@@ -177,7 +177,7 @@ impl<'a, P: PrivateProtocol> Serving<'a, P> {
     pub(crate) fn new(
         turn: TurnNumber,
         sender: &'a WireSender,
-        hop: &'a mpsc::Sender<P::Message>,
+        hop: &'a mpsc::Sender<Decoded<P::Message>>,
         deadline: Deadline,
         signals: Signals,
         lane: P,
@@ -207,7 +207,7 @@ impl<'a, P: PrivateProtocol> Serving<'a, P> {
 
     /// Queues a decoded message for the hop, behind those already held;
     /// after the Adapter's stall it is discarded.
-    pub(crate) fn hold(&mut self, (message, bytes): (P::Message, usize)) {
+    pub(crate) fn hold(&mut self, (message, bytes): (Decoded<P::Message>, usize)) {
         if self.stall.is_none() {
             self.held.push((message, bytes));
         }
@@ -219,7 +219,7 @@ impl<'a, P: PrivateProtocol> Serving<'a, P> {
     }
 
     /// The oldest held message, its bytes released.
-    fn take_held(&mut self) -> Option<P::Message> {
+    fn take_held(&mut self) -> Option<Decoded<P::Message>> {
         self.held.pop()
     }
 
@@ -277,7 +277,7 @@ impl<'a, P: PrivateProtocol> Serving<'a, P> {
     pub(crate) async fn deliver_held(
         &mut self,
         by: Deadline,
-        mut last: Option<P::Message>,
+        mut last: Option<Decoded<P::Message>>,
     ) -> Result<(), RouteError> {
         while let Some(message) = self.take_held().or_else(|| last.take()) {
             let turn = self.turn;
@@ -400,6 +400,9 @@ impl<'a, P: PrivateProtocol> Serving<'a, P> {
                 }
                 Err(error) => return Err(Failed::from(wire_cause::<P>(turn, &error))),
             };
+            // Its observations' instant (critical r1 #3): whatever it then
+            // waits for, on admission, read-ahead room or the hop.
+            let at = tokio::time::Instant::now();
             return match P::decode(message.bytes(), turn) {
                 Ok(payload) => {
                     let bytes = message.bytes().len();
@@ -411,7 +414,7 @@ impl<'a, P: PrivateProtocol> Serving<'a, P> {
                             if self.terminated || P::terminal(&admitted).is_none() {
                                 self.make_room_for(bytes, P::READ_AHEAD).await?;
                             }
-                            Ok(Next::Message((admitted, bytes)))
+                            Ok(Next::Message((Decoded { item: admitted, at }, bytes)))
                         }
                         // Recorded, not handed over (C2 §2 Reopen).
                         None => continue,

@@ -888,6 +888,9 @@ fn tracking_overflow_is_explicit() {
 
 /// Review r1 #5: a completed call keeps its target: a replayed block does
 /// not start it again, and a later denial names what it acted on.
+/// Critical r1 #4: a replayed block, of an open or a completed call, is no
+/// model output either: its message yields no observation, so no progress
+/// and no step; only the first block's message marks the model.
 #[test]
 fn completed_calls_keep_their_target() {
     let edit = tool_use("t1", "Edit", &json!({"file_path":"/a"}));
@@ -895,6 +898,7 @@ fn completed_calls_keep_their_target() {
         &facts(NEW_SID, false),
         &[
             init_line(NEW_SID),
+            edit.clone(),
             edit.clone(),
             tool_result("t1"),
             edit,
@@ -914,6 +918,18 @@ fn completed_calls_keep_their_target() {
         })
         .sum();
     assert_eq!(started, 1, "a completed call started again");
+    for (at, replayed) in [(2, "open"), (4, "completed")] {
+        assert!(
+            run.batches[at].observations.is_empty() && run.batches[at].end.is_none(),
+            "the {replayed} call's replayed block: {:?}",
+            run.batches[at].observations
+        );
+    }
+    let model = run
+        .observations()
+        .filter(|o| matches!(o, Observation::Progress(marks) if marks.model))
+        .count();
+    assert_eq!(model, 1, "only the first block is model output");
     let targets: Vec<_> = run
         .observations()
         .filter_map(|o| {

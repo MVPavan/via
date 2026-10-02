@@ -790,8 +790,8 @@ fn claude_preflight_pure_version() {
                             harness: Some("claude".to_owned()),
                             model: Some("haiku".to_owned()),
                             sizes: via_adapters::ParamSizes {
-                                instructions: 0,
                                 output_schema: schema,
+                                ..via_adapters::ParamSizes::default()
                             },
                             ..via_adapters::DescribeRequest::default()
                         };
@@ -1277,7 +1277,9 @@ fn claude_overflow_before_terminal() {
 /// `output_schema` past Linux's per-argument limit (128 KiB with its NUL)
 /// cannot travel as `--append-system-prompt` or `--json-schema`, so the
 /// plan refuses them `invalid_params` naming the member, before any
-/// receipt or launch; one byte less plans.
+/// receipt or launch. Host's 64 KiB launch request binds first (critical
+/// r1 #1): the two at that limit together are refused naming the larger
+/// (`instructions` on a tie), and 4 KiB of each plans.
 #[test]
 fn claude_argv_budget_refused_before_launch() {
     const ARG_MAX: usize = 128 * 1024 - 1;
@@ -1299,11 +1301,19 @@ fn claude_argv_budget_refused_before_launch() {
         conformance_expect::validate(&expect).unwrap();
         check_expect("c0_bad_effort", &expect).unwrap_or_else(|e| panic!("{member}: {e}"));
     }
-    // At the limit, both plan: the turn is left to the run half.
-    let mut expect = base;
+    let mut expect = base.clone();
     expect["sessions"]["main"]["instructions"] = json!("i".repeat(ARG_MAX));
+    let turn = &mut expect["turns"][0];
+    turn["params"]["effort"] = json!("low");
+    turn["params"]["output_schema"] = schema_of(ARG_MAX);
+    turn["expect"]["plan_refusal"] = json!("invalid_param:instructions");
+    conformance_expect::validate(&expect).unwrap();
+    check_expect("c0_bad_effort", &expect).unwrap();
+    // Under both limits, both plan: the turn is left to the run half.
+    let mut expect = base;
+    expect["sessions"]["main"]["instructions"] = json!("i".repeat(4096));
     expect["turns"][0]["params"]["effort"] = json!("low");
-    expect["turns"][0]["params"]["output_schema"] = schema_of(ARG_MAX);
+    expect["turns"][0]["params"]["output_schema"] = schema_of(4096);
     let replay = fixtures().join("c0_bad_effort.replay.json");
     let pure = conformance_drive::Pure::run("claude", "c0_bad_effort", &expect, &replay).unwrap();
     assert_eq!(pure.pending, [0]);
