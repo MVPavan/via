@@ -473,6 +473,7 @@ pub(crate) fn regex_units(converted: &str) -> u64 {
 // a lazy DFA that gives up falls back to a search whose work per byte is
 // proportional to the live states. The compiled program and the lazy
 // DFA cache are capped, so a pattern's memory is bounded.
+#[derive(Clone)]
 pub(crate) struct Pattern {
     regex: Regex,
     weight: u64,

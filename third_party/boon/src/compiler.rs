@@ -69,6 +69,37 @@ impl Default for Draft {
     }
 }
 
+// VIA patch: pattern `p`, at `url`, converted and built. With a compile
+// budget, converting it and building its regular expression are each
+// charged by their bytes before each runs.
+pub(crate) fn build_pattern(
+    p: &str,
+    url: String,
+    budget: Option<&crate::validator::Budget>,
+) -> Result<Pattern, CompileError> {
+    let charge = |units| budget.map_or(true, |budget| budget.charge(units));
+    if !charge(convert_units(p)) {
+        return Err(CompileError::LimitExceeded {
+            what: "pattern bytes",
+        });
+    }
+    let converted = ecma::convert(p).map_err(|src| CompileError::InvalidRegex {
+        url: url.clone(),
+        regex: p.to_owned(),
+        src,
+    })?;
+    if !charge(regex_units(&converted)) {
+        return Err(CompileError::LimitExceeded {
+            what: "pattern bytes",
+        });
+    }
+    Pattern::new(converted.as_ref()).map_err(|e| CompileError::InvalidRegex {
+        url,
+        regex: converted.into_owned(),
+        src: e.into(),
+    })
+}
+
 /// JsonSchema compiler.
 #[derive(Default)]
 pub struct Compiler {
@@ -122,6 +153,7 @@ impl Compiler {
     pub fn set_limits(&mut self, schemas: usize, patterns: usize) {
         self.max_schemas = Some(schemas);
         self.max_patterns = Some(patterns);
+        self.roots.limits = Some((schemas, patterns));
     }
 
     /**
@@ -141,34 +173,13 @@ impl Compiler {
     // `url`. Converting its ECMA escapes and building its regular
     // expression are each charged to the compile budget, when one is set,
     // by their bytes, before each runs.
+    // A pattern the limits census built is reused.
     fn pattern(&self, p: &str, url: String) -> Result<Pattern, CompileError> {
-        let charge = |units| {
-            self.roots
-                .meta_budget
-                .as_ref()
-                .map_or(true, |budget| budget.charge(units))
-        };
-        if !charge(convert_units(p)) {
-            return Err(CompileError::LimitExceeded {
-                what: "pattern bytes",
-            });
-        }
-        let converted = ecma::convert(p).map_err(|src| CompileError::InvalidRegex {
-            url: url.clone(),
-            regex: p.to_owned(),
-            src,
-        })?;
         self.count_pattern()?;
-        if !charge(regex_units(&converted)) {
-            return Err(CompileError::LimitExceeded {
-                what: "pattern bytes",
-            });
+        if let Some(built) = self.roots.patterns.borrow().get(p) {
+            return Ok(built.clone());
         }
-        Pattern::new(converted.as_ref()).map_err(|e| CompileError::InvalidRegex {
-            url,
-            regex: converted.into_owned(),
-            src: e.into(),
-        })
+        build_pattern(p, url, self.roots.meta_budget.as_ref())
     }
 
     // VIA patch: counts one compiled pattern against the limit.

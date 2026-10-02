@@ -444,6 +444,46 @@ impl Draft {
         Ok(())
     }
 
+    // VIA patch: calls `each` for `sch` and every schema (object or
+    // boolean) in a subschema position under it, reached or not, as
+    // `require` walks them.
+    pub(crate) fn each_schema(
+        &self,
+        sch: &Value,
+        each: &mut dyn FnMut(&Value) -> Result<(), CompileError>,
+    ) -> Result<(), CompileError> {
+        if !matches!(sch, Value::Object(_) | Value::Bool(_)) {
+            return Ok(());
+        }
+        each(sch)?;
+        let Value::Object(obj) = sch else {
+            return Ok(());
+        };
+        for (&kw, &pos) in &self.subschemas {
+            let Some(v) = obj.get(kw) else {
+                continue;
+            };
+            if pos & POS_SELF != 0 {
+                self.each_schema(v, each)?;
+            }
+            if pos & POS_ITEM != 0 {
+                if let Value::Array(arr) = v {
+                    for item in arr {
+                        self.each_schema(item, each)?;
+                    }
+                }
+            }
+            if pos & POS_PROP != 0 {
+                if let Value::Object(obj) = v {
+                    for pvalue in obj.values() {
+                        self.each_schema(pvalue, each)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn is_subschema(&self, ptr: &str) -> bool {
         if ptr.is_empty() {
             return true;

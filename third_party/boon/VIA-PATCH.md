@@ -108,10 +108,17 @@ commit that vendored the unchanged copy shows the whole patch.
    checked, in the yes/no mode. An invalid schema fails with the new
    `CompileError::SchemaInvalid` (no detail), a spent budget with
    `CompileError::LimitExceeded`.
-5. **Compile limits** (`compiler.rs`). `Compiler::set_limits(schemas,
-   patterns)` makes compiling fail with the new
-   `CompileError::LimitExceeded` beyond that many subschemas or regular
-   expressions in one `Schemas`.
+5. **Compile limits** (`compiler.rs`, `roots.rs`, `draft.rs`).
+   `Compiler::set_limits(schemas, patterns)` makes compiling fail with the
+   new `CompileError::LimitExceeded` beyond that many subschemas or regular
+   expressions in one `Schemas`. Each document is also held to them over
+   every schema position, reached or not (unused `$defs` included): when
+   its root is created, every object or boolean in a subschema position
+   counts as a subschema, every `pattern` and `patternProperties` name as
+   a regular expression, and each expression is built, so the program
+   limit and the compile budget apply to it; the compile reuses the
+   expressions built. A pattern that does not compile is therefore refused
+   in any schema position, reached or not.
 6. **Lint** (`Cargo.toml`): `mismatched_lifetime_syntaxes` is allowed, so
    newer toolchains do not warn on upstream's elided lifetimes.
 

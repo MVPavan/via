@@ -25,10 +25,12 @@ use serde_json::Value;
 /// The location the one schema is compiled under; nothing is loaded from it.
 const LOCATION: &str = "urn:via:output_schema";
 
-/// Most subschemas one `output_schema` compiles to.
+/// Most subschemas one `output_schema` has, counted over every schema
+/// position, reached or not (critical r1 #9).
 const SUBSCHEMAS: usize = 2048;
 
-/// Most `pattern` and `patternProperties` expressions in one schema.
+/// Most `pattern` and `patternProperties` expressions in one schema,
+/// counted the same way; each must build within the regex program limit.
 const PATTERNS: usize = 64;
 
 /// Work units one validation may spend (boon patch: one per subschema
@@ -329,6 +331,39 @@ mod tests {
             ),
             Checked::Limit
         );
+    }
+
+    /// Critical r1 #9 (C1 §4): the subschema and pattern limits and the
+    /// regex program limit hold over every schema position, reached or
+    /// not: 2,050 unused `$defs` schemas, 65 unused patterns, and one
+    /// unused pattern over the program limit are each refused.
+    #[test]
+    fn limits_count_unused_schema_positions() {
+        let schemas: serde_json::Map<String, Value> = (0..2050)
+            .map(|i| (format!("d{i}"), json!({"type":"integer"})))
+            .collect();
+        let patterns: serde_json::Map<String, Value> = (0..65)
+            .map(|i| (format!("d{i}"), json!({"pattern": format!("^a{i}$")})))
+            .collect();
+        let big = json!({"big": {"pattern": "(?:a{1000}){1000}"}});
+        let admitted: Vec<&str> = [
+            ("2,050 unused schemas", json!({"$defs": schemas})),
+            ("65 unused patterns", json!({"$defs": patterns})),
+            (
+                "an unused pattern over the program limit",
+                json!({"$defs": big}),
+            ),
+        ]
+        .iter()
+        .filter(|(_, schema)| compiles(schema))
+        .map(|(probe, _)| *probe)
+        .collect();
+        assert!(admitted.is_empty(), "admitted: {admitted:?}");
+        // Within the limits, unused positions compile.
+        let defs: serde_json::Map<String, Value> = (0..64)
+            .map(|i| (format!("d{i}"), json!({"pattern": format!("^a{i}$")})))
+            .collect();
+        assert!(compiles(&json!({"$defs": defs})), "64 unused patterns");
     }
 
     /// Critical r1 #1: converting a pattern's ECMA escapes is linear. A
