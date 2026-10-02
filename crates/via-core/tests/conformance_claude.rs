@@ -276,9 +276,11 @@ fn claude_fifo_busy_input() {
 ///
 /// Ruling Q5 (generation barrier by construction): a per-turn process is
 /// retired, its last message delivered, before the next turn's launch, so
-/// no prior-generation message can reach a later turn. The fake's progress
-/// log orders it: launch n's stdin EOF comes before launch n+1 reads its
-/// prompt. The variants keep the chain whole when a launch fails: another
+/// no prior-generation message can reach a later turn. Here the fake's
+/// progress log shows only the launch order (launch n's stdin EOF before
+/// launch n+1 reads its prompt); the barrier under contention, a late
+/// prior-generation message held past EOF while the next turn waits, is
+/// via-cli's `claude_generation_barrier_holds_late_messages`. The variants keep the chain whole when a launch fails: another
 /// session's init (`resume_mismatch`, no confirmation, and the driver ends
 /// the connection), a missing session (`session_gone`, and the next launch
 /// still resumes the same UUID, never a fresh `--session-id`), and a lost
@@ -812,74 +814,91 @@ fn claude_preflight_pure_version() {
     }
 }
 
+/// How a launch fails before any handshake.
+#[derive(Clone, Copy)]
+enum NoHandshake {
+    /// The process exits after the prompt.
+    Exit,
+    /// The wall passes before init.
+    Wall,
+    /// The binary cannot be started.
+    Spawn,
+}
+
 /// C2 §5: only a demonstrated incompatibility is cached. A launch that
-/// fails before any handshake (its process exits after the prompt, the
-/// wall passes before init, or the binary cannot be started) leaves no
-/// refusal: the next plan of the same recipe is not `refused`.
-#[test]
-fn claude_refusal_never_cached_without_handshake() {
+/// fails before any handshake (`how`) leaves no refusal: the next plan of
+/// the same recipe is not `refused`.
+fn never_cached(how: NoHandshake) -> Result<(), String> {
     let name = "claude_lazy_init_acceptance_result_only";
-    let base = replay_of(name).unwrap();
-    let expect = conformance_expect::load(&fixtures(), name).unwrap();
-    let mut exited = base.clone();
-    exited["steps"] = json!([base["steps"][0].clone(), {"exit": {"code": 1, "stderr": ""}}]);
-    let mut walled = base.clone();
-    walled["steps"] = json!([
-        base["steps"][0].clone(),
-        {"await_signal": {"signal": "SIGTERM"}},
-        {"exit": {"code": 143, "stderr": ""}},
-    ]);
-    let mut wall = expect.clone();
-    wall["turns"][0]["deadlines"] = json!({"wall_ms": 500, "idle_ms": 60000});
-    for (variant, replay, expect, unlinked, error) in [
-        (
-            "claude_uncached_exit",
-            &exited,
-            &expect,
-            false,
-            "process_exit",
-        ),
-        ("claude_uncached_wall", &walled, &wall, false, "deadline"),
-        (
-            "claude_uncached_spawn",
-            &base,
-            &expect,
-            true,
-            "transport_lost",
-        ),
-    ] {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(format!("{variant}.replay.json"));
-        std::fs::write(&path, serde_json::to_vec(replay).unwrap()).unwrap();
-        let pure = conformance_drive::Pure::run("claude", variant, expect, &path).unwrap();
-        if unlinked {
-            std::fs::remove_file(pure.case_dir.path().join(variant)).unwrap();
+    let mut replay = replay_of(name)?;
+    let mut expect = conformance_expect::load(&fixtures(), name)?;
+    let prompt = replay["steps"][0].clone();
+    let (variant, error) = match how {
+        NoHandshake::Exit => {
+            replay["steps"] = json!([prompt, {"exit": {"code": 1, "stderr": ""}}]);
+            ("claude_uncached_exit", "process_exit")
         }
-        let outcome = pure
-            .drive_then(expect, &path, conformance_run::Knobs::default(), |pure| {
-                let request = via_adapters::DescribeRequest {
-                    harness: Some("claude".to_owned()),
-                    model: Some("haiku".to_owned()),
-                    ..via_adapters::DescribeRequest::default()
-                };
-                let plan = pure.set.plan(&request).map_err(|e| format!("{e:?}"))?;
-                let plan = serde_json::to_value(&plan).map_err(|e| e.to_string())?;
-                if plan["version_status"] == "refused" {
-                    return Err(format!("{variant}: a refusal was cached: {plan}"));
-                }
-                Ok(())
-            })
-            .unwrap();
-        let turn = &outcome.turns[0];
-        assert!(
-            !turn.accepted && turn.error.as_deref() == Some(error) && turn.instance.is_none(),
-            "{variant}: accepted {}, error {:?}, instance {:?}",
-            turn.accepted,
-            turn.error,
-            turn.instance
-        );
-        assert_eq!(outcome.launches, u64::from(!unlinked), "{variant}");
+        NoHandshake::Wall => {
+            // C2 §4.1: a private route's wall is Host's force close.
+            replay["steps"] = json!([
+                prompt,
+                {"await_signal": {"signal": "SIGTERM"}},
+                {"exit": {"code": 143, "stderr": ""}},
+            ]);
+            expect["turns"][0]["deadlines"] = json!({"wall_ms": 500, "idle_ms": 60000});
+            ("claude_uncached_wall", "deadline")
+        }
+        NoHandshake::Spawn => ("claude_uncached_spawn", "transport_lost"),
+    };
+    let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let path = dir.path().join(format!("{variant}.replay.json"));
+    let bytes = serde_json::to_vec(&replay).map_err(|e| e.to_string())?;
+    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+    let pure = conformance_drive::Pure::run("claude", variant, &expect, &path)?;
+    let unlinked = matches!(how, NoHandshake::Spawn);
+    if unlinked {
+        std::fs::remove_file(pure.case_dir.path().join(variant)).map_err(|e| e.to_string())?;
     }
+    let outcome = pure.drive_then(&expect, &path, conformance_run::Knobs::default(), |pure| {
+        let request = via_adapters::DescribeRequest {
+            harness: Some("claude".to_owned()),
+            model: Some("haiku".to_owned()),
+            ..via_adapters::DescribeRequest::default()
+        };
+        let plan = pure.set.plan(&request).map_err(|e| format!("{e:?}"))?;
+        let plan = serde_json::to_value(&plan).map_err(|e| e.to_string())?;
+        if plan["version_status"] == "refused" {
+            return Err(format!("{variant}: a refusal was cached: {plan}"));
+        }
+        Ok(())
+    })?;
+    let turn = outcome.turns.first().ok_or("no turn")?;
+    if turn.accepted
+        || turn.error.as_deref() != Some(error)
+        || turn.instance.is_some()
+        || outcome.launches != u64::from(!unlinked)
+    {
+        return Err(format!(
+            "{variant}: accepted {}, error {:?}, instance {:?}, launches {}",
+            turn.accepted, turn.error, turn.instance, outcome.launches
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn claude_refusal_never_cached_on_exit() {
+    never_cached(NoHandshake::Exit).unwrap();
+}
+
+#[test]
+fn claude_refusal_never_cached_on_wall() {
+    never_cached(NoHandshake::Wall).unwrap();
+}
+
+#[test]
+fn claude_refusal_never_cached_on_spawn_failure() {
+    never_cached(NoHandshake::Spawn).unwrap();
 }
 
 /// S1 rule 4 (review r1 #2): the daemon force decides the turn's outcome

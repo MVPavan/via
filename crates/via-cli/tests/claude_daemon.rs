@@ -9,7 +9,10 @@
 //! and `claude.progress` (its gates and every input line it read).
 //! Waits are bounded waits on CLI replies, durable rows, the fake's logs or
 //! process exit; no sleep orders two events. Each scenario emits the S1
-//! evidence artifact (runtime §11.2).
+//! evidence artifact (runtime §11.2): with every replaying binary's logs,
+//! and `fixtures.json`, every replay and wrapper script as written, which
+//! its `fixture_sha256` hashes. A positive turn also requires the fake's
+//! exit 0: its replay validation passed.
 
 #[path = "support/daemon.rs"]
 #[expect(dead_code, reason = "shared support; this file uses part of it")]
@@ -72,8 +75,8 @@ struct Deployment {
     fake: PathBuf,
     state: PathBuf,
     runtime: PathBuf,
-    /// The fake harness's scenario: present so the evidence names it; no
-    /// scenario here runs the fake harness.
+    /// The stimuli manifest the evidence's `fixture_sha256` hashes:
+    /// written at collection from [`Self::stimuli`].
     fixture: PathBuf,
     /// The Claude binary's directory: the link, its replay and logs.
     vendor: PathBuf,
@@ -83,6 +86,14 @@ struct Deployment {
     /// wrapper script runs ([`Deployment::wrap`]). Its replay and logs
     /// sit beside it.
     replayed: RefCell<PathBuf>,
+    /// Every replaying binary the scenario configured, whose logs are
+    /// evidence.
+    binaries: RefCell<Vec<PathBuf>>,
+    /// Every stimulus the scenario wrote, in order: each replay fixture as
+    /// written (a scenario rewrites its replay before later turns) and
+    /// each wrapper script. Collected as `fixtures.json`, the file the
+    /// evidence's `fixture_sha256` hashes.
+    stimuli: RefCell<Vec<Value>>,
     #[cfg(feature = "test-failpoints")]
     failpoints: failpoints::Failpoints,
 }
@@ -124,6 +135,8 @@ impl Deployment {
             runtime,
             fixture,
             replayed: RefCell::new(vendor.join("claude")),
+            binaries: RefCell::new(vec![vendor.join("claude")]),
+            stimuli: RefCell::new(Vec::new()),
             vendor,
             work,
             #[cfg(feature = "test-failpoints")]
@@ -147,7 +160,9 @@ impl Deployment {
     }
 
     /// Writes the binary `binary`'s replay: lifetime *n* for launch *n*.
-    fn replay_for(binary: &Path, lifetimes: &[Value]) -> Result<(), ScenarioError> {
+    /// The replay is recorded as a stimulus and `binary` as one whose logs
+    /// are evidence.
+    fn replay_for(&self, binary: &Path, lifetimes: &[Value]) -> Result<(), ScenarioError> {
         let replay = json!({
             "source": "synthetic (x.3.2 C3): no vendor run; the shapes of the 2026-09-30 \
                        re-probe's recordings, trimmed to what the adapter reads",
@@ -155,12 +170,36 @@ impl Deployment {
         });
         let mut path = binary.as_os_str().to_owned();
         path.push(".replay.json");
-        fs::write(path, serde_json::to_vec_pretty(&replay).map_err(infra)?).map_err(infra)
+        let path = PathBuf::from(path);
+        fs::write(&path, serde_json::to_vec_pretty(&replay).map_err(infra)?).map_err(infra)?;
+        self.stimulus(&path, "replay", &replay);
+        let mut binaries = self.binaries.borrow_mut();
+        if !binaries.iter().any(|known| known == binary) {
+            binaries.push(binary.to_owned());
+        }
+        Ok(())
+    }
+
+    /// Records one stimulus written at `path`.
+    fn stimulus(&self, path: &Path, kind: &str, content: &Value) {
+        self.stimuli.borrow_mut().push(json!({
+            "file": self.relative(path),
+            kind: content,
+        }));
+    }
+
+    /// `path` relative to the deployment's root.
+    fn relative(&self, path: &Path) -> String {
+        path.strip_prefix(self.root.path())
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned()
     }
 
     /// [`Self::replay_for`] the replaying fake.
     fn replay(&self, lifetimes: &[Value]) -> Result<(), ScenarioError> {
-        Self::replay_for(&self.replayed.borrow(), lifetimes)
+        let binary = self.replayed.borrow().clone();
+        self.replay_for(&binary, lifetimes)
     }
 
     /// Makes the configured binary a `/bin/sh` script that runs `prelude`,
@@ -171,14 +210,14 @@ impl Deployment {
         std::os::unix::fs::symlink(&self.fake, &real)?;
         let script = self.claude();
         fs::remove_file(&script)?;
-        fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\n{prelude}\nexec '{}' \"$@\"\n",
-                real.to_string_lossy()
-            ),
-        )?;
+        // One single-quoted shell word: each `'` closes the quote, adds an
+        // escaped quote and reopens it.
+        let quoted = real.to_string_lossy().replace('\'', "'\\''");
+        let text = format!("#!/bin/sh\n{prelude}\nexec '{quoted}' \"$@\"\n");
+        fs::write(&script, &text)?;
         fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
+        self.stimulus(&script, "script", &json!(text));
+        self.binaries.borrow_mut().push(real.clone());
         *self.replayed.borrow_mut() = real;
         Ok(())
     }
@@ -520,14 +559,25 @@ impl Deployment {
             }
             evidence.write(name, &lines).map_err(infra)?;
         }
-        // The fake's own side: its replay, launches and progress.
-        for suffix in ["replay.json", "launches", "progress"] {
-            let text = Self::log_of(&self.replayed.borrow(), suffix)?;
-            evidence
-                .write(&format!("claude.{suffix}"), text.as_bytes())
-                .map_err(infra)?;
+        // The fake's own side: every replaying binary's launches and
+        // progress, named by its path under the root.
+        for binary in self.binaries.borrow().iter() {
+            let name = self.relative(binary).replace('/', "-");
+            for suffix in ["launches", "progress"] {
+                let text = Self::log_of(binary, suffix)?;
+                evidence
+                    .write(&format!("{name}.{suffix}"), text.as_bytes())
+                    .map_err(infra)?;
+            }
         }
-        Ok(())
+        // Every stimulus as written, in order; the evidence's
+        // `fixture_sha256` hashes the same bytes.
+        let manifest = serde_json::to_vec_pretty(&json!({
+            "stimuli": *self.stimuli.borrow(),
+        }))
+        .map_err(infra)?;
+        fs::write(&self.fixture, &manifest).map_err(infra)?;
+        evidence.write("fixtures.json", &manifest).map_err(infra)
     }
 
     /// Fails if any command output could not be written as evidence.
@@ -626,7 +676,8 @@ impl<'a> Daemon<'a> {
                 return Err(fail(&format!("daemon exited before readiness: {status}")));
             }
             // A direct probe: never auto-starts a second daemon.
-            let ready = daemon::serving_pid(&deployment.runtime) == Some(daemon.child.id());
+            let ready =
+                daemon::serving_pid_by(&deployment.runtime, deadline) == Some(daemon.child.id());
             if Instant::now() > deadline {
                 return Err(ScenarioError::Timeout("daemon readiness".to_owned()));
             }
@@ -635,6 +686,11 @@ impl<'a> Daemon<'a> {
             }
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// The daemon's pid.
+    fn pid(&self) -> u32 {
+        self.child.id()
     }
 
     /// Kills the daemon with SIGKILL, as a crash would, and reaps it. Keep
@@ -727,6 +783,20 @@ fn check(condition: bool, detail: impl FnOnce() -> String) -> Result<(), Scenari
     } else {
         Err(ScenarioError::Failure(detail()))
     }
+}
+
+/// Runtime §11.2: a positive turn is `completed` and its replaying fake
+/// ran its whole replay ([`replay_ran`]).
+fn completed(envelope: &Value) -> bool {
+    envelope["state"] == "completed" && replay_ran(envelope, 0)
+}
+
+/// The turn's process exited `code`, its lifetime's own: the fake
+/// validated its whole replay (every expected input, nothing extra, EOF
+/// where awaited). A failed check exits it 3 instead, whatever the turn's
+/// own outcome.
+fn replay_ran(envelope: &Value, code: i32) -> bool {
+    envelope["exit"] == json!({"code": code, "signal": null})
 }
 
 /// Runs `action` on a fresh deployment, then collects its evidence.
@@ -948,7 +1018,7 @@ fn claude_identity_resume_through_daemon() -> TestResult {
             .as_str()
             .unwrap_or_default()
             .to_owned();
-        check(first["state"] == "completed" && !uuid.is_empty(), || {
+        check(completed(&first) && !uuid.is_empty(), || {
             format!("turn 1: {first}")
         })?;
         let opened = d.status(evidence, "status-1", &session)?;
@@ -988,7 +1058,7 @@ fn claude_identity_resume_through_daemon() -> TestResult {
             }
             let envelope = d.wait(evidence, &format!("{session}/{n}"))?;
             check(
-                envelope["state"] == "completed" && envelope["vendor_session_id"] == uuid.as_str(),
+                completed(&envelope) && envelope["vendor_session_id"] == uuid.as_str(),
                 || format!("turn {n}: {envelope}"),
             )?;
         }
@@ -1027,7 +1097,10 @@ fn reopened_once_per_launch(
     for (at, turn) in reopened.iter().zip(turns) {
         let started = seq("turn.started", *turn);
         let submitted = seq("turn.submitted", *turn);
-        check(submitted < Some(*at) && Some(*at) < started, || {
+        let between = submitted
+            .zip(started)
+            .is_some_and(|(submitted, started)| submitted < *at && *at < started);
+        check(between, || {
             format!(
                 "turn {turn}'s session.reopened is not between its submission and acceptance: {events:?}"
             )
@@ -1061,7 +1134,9 @@ fn mismatch_never_reopens(
     d.resume(evidence, "resume-4", session, &ask("FOUR"))?;
     let envelope = d.wait(evidence, &format!("{session}/4"))?;
     check(
-        envelope["state"] == "failed" && envelope["failure"]["class"] == "resume_mismatch",
+        envelope["state"] == "failed"
+            && envelope["failure"]["class"] == "resume_mismatch"
+            && replay_ran(&envelope, 0),
         || format!("turn 4: {envelope}"),
     )?;
     let status = d.status(evidence, "status-4", session)?;
@@ -1090,6 +1165,9 @@ fn claude_identity_missing_session_through_daemon() -> TestResult {
             .as_str()
             .unwrap_or_default()
             .to_owned();
+        check(completed(&first) && !uuid.is_empty(), || {
+            format!("turn 1: {first}")
+        })?;
         let gone = emit(
             &json!({"type": "result", "subtype": "error_during_execution",
             "is_error": true, "num_turns": 0, "stop_reason": null, "session_id": uuid,
@@ -1111,6 +1189,7 @@ fn claude_identity_missing_session_through_daemon() -> TestResult {
         check(
             second["state"] == "failed"
                 && second["failure"]["class"] == "submit_failed"
+                && replay_ran(&second, 1)
                 && d.count(&session, "session.reopened")? == 0,
             || format!("turn 2: {second}"),
         )?;
@@ -1123,7 +1202,7 @@ fn claude_identity_missing_session_through_daemon() -> TestResult {
         d.resume(evidence, "resume-3", &session, &ask("THREE"))?;
         let third = d.wait(evidence, &format!("{session}/3"))?;
         check(
-            third["state"] == "completed" && third["vendor_session_id"] == uuid.as_str(),
+            completed(&third) && third["vendor_session_id"] == uuid.as_str(),
             || format!("turn 3: {third}"),
         )?;
         reopened_once_per_launch(d, &session, &[3])
@@ -1154,7 +1233,9 @@ fn claude_identity_lost_input_through_daemon() -> TestResult {
         d.release(1)?;
         let first = d.wait(evidence, &format!("{session}/1"))?;
         check(
-            first["timestamps"]["accepted_at"].is_null() && first["state"] != "completed",
+            first["timestamps"]["accepted_at"].is_null()
+                && first["state"] != "completed"
+                && replay_ran(&first, 1),
             || format!("turn 1: {first}"),
         )?;
         lives.push(completing(Launch::NewAs(&expected), true, "TWO", 0.001));
@@ -1162,7 +1243,7 @@ fn claude_identity_lost_input_through_daemon() -> TestResult {
         d.resume(evidence, "resume-2", &session, &ask("TWO"))?;
         let second = d.wait(evidence, &format!("{session}/2"))?;
         check(
-            second["state"] == "completed" && second["vendor_session_id"] == expected.as_str(),
+            completed(&second) && second["vendor_session_id"] == expected.as_str(),
             || format!("turn 2: {second}"),
         )?;
         let reads = |n| {
@@ -1180,6 +1261,172 @@ fn claude_identity_lost_input_through_daemon() -> TestResult {
             d.count(&session, "session.opened")? == 1
                 && d.count(&session, "session.reopened")? == 0,
             || "the lost launch opened the session".to_owned(),
+        )
+    })
+}
+
+// ------------------------------------------------- Q5 generation barrier
+
+/// The late message launch 1 emits after its stdin EOF.
+const LATE: &str = "LATE-ONE";
+
+/// Launch 1 of a barrier scenario: it answers, reads its stdin EOF, then
+/// holds at a gate (step 7) before it emits a late assistant message and
+/// exits 0: the old generation still owes an observation.
+fn held_past_eof() -> Value {
+    let id = "${sid}";
+    lifetime(
+        &argv(Launch::New, true),
+        vec![
+            prompt(&ask("ONE")),
+            init(id),
+            reply(id, "ONE"),
+            result(id, "ONE", 0.001),
+            await_eof(),
+            gate(),
+            emit(
+                &json!({"type": "assistant", "message": {"model": "claude-haiku-4-5-20251001",
+                "id": "msg_01SYNTH000009", "type": "message", "role": "assistant",
+                "content": [{"type": "text", "text": LATE}],
+                "usage": {"input_tokens": 1, "output_tokens": 1}},
+                "parent_tool_use_id": null, "session_id": id}),
+            ),
+        ],
+    )
+}
+
+/// Spawns turn 1 on [`held_past_eof`], waits until its process holds past
+/// EOF, then queues turn 2 behind it: the barrier is contended. Launch 2
+/// (if any) resumes turn 1's UUID, read from launch 1's argv, and waits at
+/// a gate (step 3) before its init. Returns the session and that UUID.
+fn contend(d: &Deployment, evidence: &Evidence) -> Result<(String, String), ScenarioError> {
+    d.replay(&[held_past_eof()])?;
+    let session = session_of(&d.spawn(evidence, "spawn", &ask("ONE"), &[])?)?;
+    d.await_progress("at 7 launch 1")?;
+    let uuid = d.launch_session(1)?;
+    d.replay(&[
+        held_past_eof(),
+        lifetime(
+            &argv(Launch::Resume(&uuid), true),
+            vec![
+                prompt(&ask("TWO")),
+                gate(),
+                init(&uuid),
+                reply(&uuid, "TWO"),
+                result(&uuid, "TWO", 0.002),
+                await_eof(),
+            ],
+        ),
+    ])?;
+    d.resume(evidence, "resume-2", &session, &ask("TWO"))?;
+    let status = d.status(evidence, "status-contended", &session)?;
+    let (turn_1, _) = d.turn(&session, 1)?;
+    check(
+        d.launches()?.len() == 1
+            && turn_1 != "completed"
+            && status["queue"]
+                .as_array()
+                .is_some_and(|queue| !queue.is_empty()),
+        || format!("turn 2 is not waiting behind launch 1: turn 1 {turn_1}, {status}"),
+    )?;
+    Ok((session, uuid))
+}
+
+/// Ruling Q5, the generation barrier under contention: launch 1 has read
+/// its stdin EOF but still owes a late observation (it holds at a gate)
+/// while turn 2 waits behind it. Turn 2 launches only after launch 1 was
+/// released and its late message delivered: that message is turn 1's,
+/// committed before any event of turn 2, and it verifies nothing: while
+/// launch 2 waits before its own init, `status` keeps the historical ID
+/// unverified and no `session.reopened` exists. Launch 2's own init
+/// reopens the session once. Both launches ran their replays through
+/// (exit 0): launch 1 emitted its late message.
+#[test]
+fn claude_generation_barrier_holds_late_messages() -> TestResult {
+    scenario("claude_generation_barrier_late", |d, evidence| {
+        let _daemon = Daemon::start(d, evidence, "final")?;
+        let (session, uuid) = contend(d, evidence)?;
+        d.release(1)?;
+        d.await_progress("at 3 launch 2")?;
+        let reopening = d.status(evidence, "status-reopening", &session)?;
+        check(
+            reopening["vendor_session_id"] == uuid.as_str()
+                && reopening["vendor_identity_verified"] == false
+                && d.count(&session, "session.reopened")? == 0,
+            || format!("launch 1's late message verified the reopening: {reopening}"),
+        )?;
+        late_before_next(d, &session)?;
+        d.release(2)?;
+        let first = d.wait(evidence, &format!("{session}/1"))?;
+        let second = d.wait(evidence, &format!("{session}/2"))?;
+        check(completed(&first) && completed(&second), || {
+            format!("turn 1 {first}; turn 2 {second}")
+        })?;
+        reopened_once_per_launch(d, &session, &[2])
+    })
+}
+
+/// Launch 1's late message is delivered before turn 2's first event. An
+/// assistant message after the result leaves no durable event of its own,
+/// so the order is read through what must follow it: turn 1 ends only
+/// once Route read its stdout to EOF, after the late message (its
+/// process then exits 0, checked by the caller), and that `turn.ended`
+/// precedes turn 2's `turn.submitted`; in the fake's log launch 1 was
+/// released before launch 2 read its prompt.
+fn late_before_next(d: &Deployment, session: &str) -> Result<(), ScenarioError> {
+    let events = d.events(session)?;
+    let seq = |kind: &str, turn: u32| {
+        events
+            .iter()
+            .find(|event| event["type"] == kind && event["turn"] == turn)
+            .and_then(|event| event["seq"].as_u64())
+    };
+    let (ended, submitted) = (seq("turn.ended", 1), seq("turn.submitted", 2));
+    let progress = Deployment::log_of(&d.replayed.borrow(), "progress")?;
+    let at = |line: &str| progress.lines().position(|seen| seen == line);
+    let released = at("signalled 7 launch 1")
+        .zip(at("read 1 launch 2"))
+        .is_some_and(|(released, read)| released < read);
+    check(
+        ended
+            .zip(submitted)
+            .is_some_and(|(ended, submitted)| ended < submitted)
+            && released,
+        || {
+            format!(
+                "turn 1 ended at {ended:?}, turn 2 submitted at {submitted:?}; progress:\n{progress}"
+            )
+        },
+    )
+}
+
+/// Ruling Q5's stop check under contention: turn 2, queued behind launch 1
+/// that holds past its EOF, is cancelled before the barrier opens. It
+/// never launches (one launch in all, no `session.reopened`) and ends
+/// `cancelled` with nothing accepted; launch 1, released, still emits its
+/// late message and completes turn 1 (exit 0).
+#[test]
+fn claude_generation_barrier_stop_while_contended() -> TestResult {
+    scenario("claude_generation_barrier_stop", |d, evidence| {
+        let _daemon = Daemon::start(d, evidence, "final")?;
+        let (session, _uuid) = contend(d, evidence)?;
+        d.ok(
+            evidence,
+            "cancel-2",
+            &[
+                "cancel", &session, "--turn", "2", "--handle", HANDLE, "--json",
+            ],
+        )?;
+        let second = d.wait(evidence, &format!("{session}/2"))?;
+        d.release(1)?;
+        let first = d.wait(evidence, &format!("{session}/1"))?;
+        check(
+            completed(&first)
+                && second["state"] == "cancelled"
+                && second["timestamps"]["accepted_at"].is_null()
+                && d.launches()?.len() == 1
+                && d.count(&session, "session.reopened")? == 0,
+            || format!("turn 1 {first}; turn 2 {second}"),
         )
     })
 }
@@ -1380,16 +1627,19 @@ fn claude_s_launch_config_applies_after_restart() -> TestResult {
             .as_str()
             .unwrap_or_default()
             .to_owned();
+        check(completed(&envelope) && !uuid.is_empty(), || {
+            format!("the old session's first turn: {envelope}")
+        })?;
         d.config(&json!({"harnesses":{"claude":{"binary":next,
             "inherit":{"mcp_servers":true}}}}))
             .map_err(infra)?;
         let unchanged = session_of(&d.spawn(evidence, "spawn-unchanged", &ask("TWO"), &[])?)?;
         let envelope = d.wait(evidence, &format!("{unchanged}/1"))?;
-        check(envelope["state"] == "completed", || {
+        check(completed(&envelope), || {
             format!("a session spawned before the restart: {envelope}")
         })?;
         daemon.shutdown()?;
-        Deployment::replay_for(
+        d.replay_for(
             &next,
             &[
                 completing(Launch::New, false, "THREE", 0.001),
@@ -1399,12 +1649,12 @@ fn claude_s_launch_config_applies_after_restart() -> TestResult {
         let _daemon = Daemon::start(d, evidence, "final")?;
         let new = session_of(&d.spawn(evidence, "spawn-new", &ask("THREE"), &[])?)?;
         let envelope = d.wait(evidence, &format!("{new}/1"))?;
-        check(envelope["state"] == "completed", || {
+        check(completed(&envelope), || {
             format!("a session spawned after the restart: {envelope}")
         })?;
         d.resume(evidence, "resume-old", &old, &ask("FOUR"))?;
         let envelope = d.wait(evidence, &format!("{old}/2"))?;
-        check(envelope["state"] == "completed", || {
+        check(completed(&envelope), || {
             format!("the old session after the restart: {envelope}")
         })?;
         let counts = (
@@ -1448,21 +1698,7 @@ fn claude_s_launch_last_version_and_cached_refusal() -> TestResult {
                 await_eof(),
             ],
         );
-        let no_receipt = lifetime(
-            &argv(Launch::New, true),
-            vec![
-                prompt(&ask("TWO")),
-                init_as(id, TESTED, &["msg_lifecycle_v1"]),
-                json!({"expect": {"line": {"type": "control_request",
-                    "request": {"subtype": "interrupt"}}, "capture": {"rid": "/request_id"}}}),
-                emit(
-                    &json!({"type": "result", "subtype": "error_during_execution",
-                    "is_error": true, "session_id": id, "stop_reason": "tool_use",
-                    "terminal_reason": "aborted_tools"}),
-                ),
-                await_eof(),
-            ],
-        );
+        let no_receipt = refused_handshake("TWO");
         let after = completing(Launch::New, true, "THREE", 0.001);
         d.replay(&[untested, no_receipt, after])?;
         let describe = [
@@ -1482,7 +1718,9 @@ fn claude_s_launch_last_version_and_cached_refusal() -> TestResult {
         let session = session_of(&d.spawn(evidence, "spawn-1", &ask("ONE"), &[])?)?;
         let envelope = d.wait(evidence, &format!("{session}/1"))?;
         check(
-            envelope["vendor_version"] == "2.1.290" && envelope["version_status"] == "untested",
+            completed(&envelope)
+                && envelope["vendor_version"] == "2.1.290"
+                && envelope["version_status"] == "untested",
             || format!("turn on an untested version: {envelope}"),
         )?;
         let plan = d.ok(evidence, "describe-1", &describe)?;
@@ -1495,7 +1733,9 @@ fn claude_s_launch_last_version_and_cached_refusal() -> TestResult {
         )?;
         let refused = d.wait(evidence, &format!("{}/1", session_of(&receipt)?))?;
         check(
-            refused["state"] == "failed" && refused["failure"]["class"] == "protocol",
+            refused["state"] == "failed"
+                && refused["failure"]["class"] == "protocol"
+                && replay_ran(&refused, 0),
             || format!("a refused handshake: {refused}"),
         )?;
         let error = d.refused(
@@ -1531,8 +1771,110 @@ fn claude_s_launch_last_version_and_cached_refusal() -> TestResult {
         check(
             plan["version_status"] == "untested"
                 && plan["vendor_version"].is_null()
-                && envelope["state"] == "completed",
+                && completed(&envelope),
             || format!("after the restart: describe {plan}, turn {envelope}"),
+        )
+    })
+}
+
+/// A launch whose init lacks `interrupt_receipt_v1`: the adapter refuses
+/// the handshake, interrupts, and the vendor's abort result ends it.
+fn refused_handshake(text: &str) -> Value {
+    let id = "${sid}";
+    lifetime(
+        &argv(Launch::New, true),
+        vec![
+            prompt(&ask(text)),
+            init_as(id, TESTED, &["msg_lifecycle_v1"]),
+            json!({"expect": {"line": {"type": "control_request",
+                "request": {"subtype": "interrupt"}}, "capture": {"rid": "/request_id"}}}),
+            emit(
+                &json!({"type": "result", "subtype": "error_during_execution",
+                "is_error": true, "session_id": id, "stop_reason": "tool_use",
+                "terminal_reason": "aborted_tools"}),
+            ),
+            await_eof(),
+        ],
+    )
+}
+
+/// The plan's clock seam (test builds): milliseconds ahead of real time.
+#[cfg(feature = "test-failpoints")]
+const PLAN_CLOCK: &str = "adapter.claude.plan_clock_ms";
+
+/// C2 §5's refusal expiry under controlled time through the daemon: the
+/// plan's clock is moved ahead by `adapter.claude.plan_clock_ms`. A
+/// refused handshake's entry, 590 s on, still refuses `describe` and a
+/// spawn of the same recipe (`harness_unavailable`,
+/// `handshake_refused`, nothing launched); 600 s on it has expired: the
+/// plan is admitted (`tested`, the version its init reported), the spawn
+/// launches, and that launch's handshake succeeds through the fixture.
+/// The exact boundary (599.999 s) is `plan.rs`'s unit test.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn claude_refusal_expires_through_daemon() -> TestResult {
+    scenario("claude_refusal_expires", |d, evidence| {
+        d.replay(&[
+            refused_handshake("ONE"),
+            completing(Launch::New, true, "TWO", 0.001),
+        ])?;
+        let describe = [
+            "describe",
+            "--harness",
+            "claude",
+            "--model",
+            "haiku",
+            "--json",
+        ];
+        let _daemon = Daemon::start(d, evidence, "final")?;
+        let session = session_of(&d.spawn(evidence, "spawn-1", &ask("ONE"), &[])?)?;
+        let refused = d.wait(evidence, &format!("{session}/1"))?;
+        check(
+            refused["failure"]["class"] == "protocol" && replay_ran(&refused, 0),
+            || format!("the refused handshake: {refused}"),
+        )?;
+        d.failpoints
+            .arm(PLAN_CLOCK, 1, "value_persist:590000")
+            .map_err(infra)?;
+        let live = d.ok(evidence, "describe-590s", &describe)?;
+        let error = d.refused(
+            evidence,
+            "spawn-590s",
+            &[
+                "spawn",
+                "--harness",
+                "claude",
+                "--model",
+                "haiku",
+                "--prompt",
+                "p",
+                "--handle",
+                HANDLE,
+                "--json",
+            ],
+            "harness_unavailable",
+        )?;
+        check(
+            live["version_status"] == "refused"
+                && error["data"]["reason"] == "handshake_refused"
+                && d.launches()?.len() == 1,
+            || format!("590 s on: describe {live}, spawn {error}"),
+        )?;
+        d.failpoints
+            .arm(PLAN_CLOCK, 1, "value_persist:600000")
+            .map_err(infra)?;
+        let expired = d.ok(evidence, "describe-600s", &describe)?;
+        let next = session_of(&d.spawn(evidence, "spawn-600s", &ask("TWO"), &[])?)?;
+        let envelope = d.wait(evidence, &format!("{next}/1"))?;
+        d.failpoints.disarm(PLAN_CLOCK).map_err(infra)?;
+        check(
+            expired["version_status"] == "tested"
+                && expired["vendor_version"] == TESTED
+                && expired["refusals"].as_array().is_none_or(Vec::is_empty)
+                && completed(&envelope)
+                && envelope["version_status"] == "tested"
+                && d.launches()?.len() == 2,
+            || format!("600 s on: describe {expired}, turn {envelope}"),
         )
     })
 }
@@ -1597,7 +1939,7 @@ fn claude_s_launch_env_is_the_allow_list() -> TestResult {
             || format!("the vendor's environment names: {names:?}"),
         )?;
         let envelope = d.wait(evidence, &format!("{session}/1"))?;
-        check(envelope["state"] == "completed", || envelope.to_string())
+        check(completed(&envelope), || envelope.to_string())
     })
 }
 
@@ -1633,7 +1975,7 @@ fn claude_stream_limits_final_text_file() -> TestResult {
             .map_err(infra)?
             .unwrap_or_default();
         check(
-            envelope["state"] == "completed"
+            completed(&envelope)
                 && envelope["final_text"].is_null()
                 && file["bytes"] == text.len()
                 && file["truncated"] == false
@@ -1648,17 +1990,35 @@ fn claude_stream_limits_final_text_file() -> TestResult {
     })
 }
 
-/// Packet §9 `claude_stream_limits`, a stderr flood: the vendor writes
-/// 16 MiB to stderr (the turn's `stderr.log`, which the operating system
-/// writes and no VIA task reads, runtime §4) before it runs; the turn
-/// still runs, and a cancel during its tool is serviced: the nested
-/// receipt and the abort terminal acknowledge it, with cleanup proved.
-#[test]
-fn claude_stream_limits_stderr_flood_keeps_cancel() -> TestResult {
-    scenario("claude_stream_limits_stderr_flood", |d, evidence| {
-        const FLOOD: u64 = 16 * 1024 * 1024;
-        d.wrap(&format!("head -c {FLOOD} /dev/zero | tr '\\000' e >&2"))
-            .map_err(infra)?;
+/// How a caller stops a turn under stream pressure.
+#[derive(Clone, Copy)]
+enum CallerStop {
+    /// `via cancel` of the turn.
+    Cancel,
+    /// `via close` of its session.
+    Close,
+}
+
+/// The stderr flood's size: 256 chunks of 256 KiB, one every 20 ms or
+/// more, so it runs for 5 s or longer.
+const FLOOD: u64 = 64 * 1024 * 1024;
+
+/// Packet §9 `claude_stream_limits`, a stderr flood under a caller's stop:
+/// beside the vendor a writer in its group keeps flooding stderr (the
+/// turn's `stderr.log`, which the operating system writes and no VIA task
+/// reads, runtime §4). While the flood is still being written (the log
+/// non-empty and short of it), the caller stops the turn during its
+/// tool: the interrupt is serviced (the nested receipt and the abort
+/// terminal acknowledge it) and the group's cleanup, the writer included,
+/// is proved within the stop's bound, before the flood could end. The
+/// daemon's peak RSS stays within [`RSS_BOUND_KIB`] of its baseline.
+fn stderr_flood_under(stop: CallerStop, name: &str) -> TestResult {
+    scenario(name, |d, evidence| {
+        d.wrap(
+            "( i=0; while [ \"$i\" -lt 256 ]; do head -c 262144 /dev/zero | tr '\\000' e >&2; \
+             sleep 0.02; i=$((i+1)); done ) >/dev/null &",
+        )
+        .map_err(infra)?;
         let id = "${sid}";
         d.replay(&[lifetime(
             &argv(Launch::New, true),
@@ -1680,32 +2040,82 @@ fn claude_stream_limits_stderr_flood_keeps_cancel() -> TestResult {
                 await_eof(),
             ],
         )])?;
-        let _daemon = Daemon::start(d, evidence, "final")?;
+        let daemon = Daemon::start_with(d, evidence, "final", MEASURED)?;
+        let rss = Rss::watch(daemon.pid())?;
         let session = session_of(&d.spawn(evidence, "spawn", "Run sleep 30 with Bash.", &[])?)?;
         d.await_event(&session, 1, "turn.started")?;
         await_running_tool(d, evidence, &session)?;
-        let reply = d.ok(
-            evidence,
-            "cancel",
-            &[
-                "cancel", &session, "--turn", "1", "--handle", HANDLE, "--json",
-            ],
-        )?;
+        let log = d
+            .state
+            .join("evidence")
+            .join(&session)
+            .join("1")
+            .join("stderr.log");
+        let flooded = fs::metadata(&log).map_err(infra)?.len();
+        check(flooded > 0 && flooded < FLOOD, || {
+            format!("the stop is not mid-flood: stderr.log has {flooded} bytes")
+        })?;
+        let stopped = Instant::now();
+        let reply = match stop {
+            CallerStop::Cancel => d.ok(
+                evidence,
+                "cancel",
+                &[
+                    "cancel", &session, "--turn", "1", "--handle", HANDLE, "--json",
+                ],
+            )?,
+            CallerStop::Close => d.ok(
+                evidence,
+                "close",
+                &["close", &session, "--handle", HANDLE, "--json"],
+            )?,
+        };
         let envelope = d.wait(evidence, &format!("{session}/1"))?;
-        let stderr = envelope["evidence"]["folder"]
-            .as_str()
-            .map(|folder| fs::metadata(Path::new(folder).join("stderr.log")))
-            .transpose()
-            .map_err(infra)?
-            .map_or(0, |meta| meta.len());
+        let took = stopped.elapsed();
+        let written = fs::metadata(&log).map_err(infra)?.len();
+        let (baseline, peak) = rss.finish()?;
+        let measured = json!({"baseline_kib": baseline, "peak_kib": peak,
+            "bound_kib": RSS_BOUND_KIB, "stderr_at_stop": flooded, "stderr_at_end": written,
+            "flood": FLOOD, "ended_after_stop_ms": took.as_millis()});
+        evidence
+            .write("measured.json", measured.to_string().as_bytes())
+            .map_err(infra)?;
+        let closed = match stop {
+            CallerStop::Cancel => true,
+            CallerStop::Close => reply["state"] == "closed" && reply["cleanup"] == "quiescent",
+        };
         check(
             envelope["state"] == "cancelled"
                 && envelope["cancel"]["outcome"] == "acknowledged"
                 && envelope["cancel"]["cleanup"] == "quiescent"
-                && stderr == FLOOD,
-            || format!("cancel {reply}; envelope {envelope}; stderr.log {stderr} bytes"),
+                && replay_ran(&envelope, 0)
+                && closed
+                && took < STOP_BOUND
+                && written < FLOOD
+                && peak.saturating_sub(baseline) < RSS_BOUND_KIB,
+            || {
+                format!(
+                    "stop {reply}; envelope {envelope}; ended {took:?} after the stop; \
+                     stderr.log {flooded} then {written} bytes; RSS {baseline} KiB to {peak} KiB"
+                )
+            },
         )
     })
+}
+
+/// The bound on a caller's stop under the flood: C1 §3.5's default force
+/// after 10 s is never needed here (the interrupt is answered), so the
+/// turn ends within the close's cleanup allowance; 10 s is generous.
+const STOP_BOUND: Duration = Duration::from_secs(10);
+
+#[test]
+fn claude_stream_limits_stderr_flood_keeps_cancel() -> TestResult {
+    stderr_flood_under(CallerStop::Cancel, "claude_stream_limits_stderr_flood")
+}
+
+#[test]
+fn claude_stream_limits_stderr_flood_keeps_close() -> TestResult {
+    stderr_flood_under(CallerStop::Close, "claude_stream_limits_stderr_flood_close")
 }
 
 /// Waits until `status` shows the turn's tool running.
@@ -1730,24 +2140,34 @@ fn await_running_tool(
     }
 }
 
+/// The oversize line's size: 256 times Wire's 1 MiB message bound.
+const OVERSIZE: u64 = 256 * 1024 * 1024;
+
 /// Packet §9 `claude_stream_limits`, oversize stdout: before the vendor
-/// runs, its stdout carries a 2 MiB line, past Wire's 1 MiB message
-/// bound (runtime §3). The turn fails `overflow`, never a successful
-/// truncated envelope; the message's first 64 KiB is kept as
-/// `undecoded.bin` in the turn's folder, and cleanup is proved.
+/// runs, its stdout carries one 256 MiB line, far past Wire's 1 MiB
+/// message bound (runtime §3). The turn fails `overflow`, never a
+/// successful truncated envelope; the message's first 64 KiB is kept as
+/// `undecoded.bin` in the turn's folder, and cleanup is proved. Memory is
+/// bounded: the daemon's peak RSS stays within [`RSS_BOUND_KIB`] of its
+/// baseline, a small fraction of the line, so a reader that buffered the
+/// stream before rejecting it fails.
 #[test]
 fn claude_stream_limits_oversize_stdout() -> TestResult {
     scenario("claude_stream_limits_oversize", |d, evidence| {
-        d.wrap("head -c 2097152 /dev/zero | tr '\\000' o; echo")
-            .map_err(infra)?;
+        d.wrap(&format!(
+            "head -c {OVERSIZE} /dev/zero | tr '\\000' o; echo"
+        ))
+        .map_err(infra)?;
         let [term, exit] = stopped_by_host();
         d.replay(&[lifetime(
             &argv(Launch::New, true),
             vec![prompt(&ask("ONE")), term, exit],
         )])?;
-        let _daemon = Daemon::start(d, evidence, "final")?;
+        let daemon = Daemon::start_with(d, evidence, "final", MEASURED)?;
+        let rss = Rss::watch(daemon.pid())?;
         let session = session_of(&d.spawn(evidence, "spawn", &ask("ONE"), &[])?)?;
         let envelope = d.wait(evidence, &format!("{session}/1"))?;
+        let (baseline, peak) = rss.finish()?;
         let undecoded = envelope["evidence"]["folder"]
             .as_str()
             .map(|folder| fs::metadata(Path::new(folder).join("undecoded.bin")))
@@ -1755,13 +2175,98 @@ fn claude_stream_limits_oversize_stdout() -> TestResult {
             .map_err(infra)?
             .map_or(0, |meta| meta.len());
         let status = d.status(evidence, "status", &session)?;
+        let measured = json!({"baseline_kib": baseline, "peak_kib": peak,
+            "bound_kib": RSS_BOUND_KIB, "line": OVERSIZE, "undecoded": undecoded});
+        evidence
+            .write("measured.json", measured.to_string().as_bytes())
+            .map_err(infra)?;
         check(
             envelope["state"] == "failed"
                 && envelope["failure"]["class"] == "overflow"
                 && envelope["final_text"] == ""
                 && status["process"]["cleanup"] == "quiescent"
-                && undecoded == 64 * 1024,
-            || format!("oversize stdout: {envelope}; undecoded.bin {undecoded} bytes"),
+                && undecoded == 64 * 1024
+                && peak.saturating_sub(baseline) < RSS_BOUND_KIB,
+            || {
+                format!(
+                    "oversize stdout: {envelope}; undecoded.bin {undecoded} bytes; \
+                     RSS {baseline} KiB to {peak} KiB"
+                )
+            },
         )
     })
+}
+
+// ------------------------------------------------------------ memory
+
+/// The bound on the daemon's RSS growth during one stream-limit scenario:
+/// one session's holders (the 1 MiB message bound, its 64 KiB undecoded
+/// prefix, the 4 MiB observation budget, runtime §8) with room for the
+/// allocator, far under the streams these scenarios push (64 MiB of
+/// stderr, a 256 MiB stdout line).
+const RSS_BOUND_KIB: u64 = 32 * 1024;
+
+/// The daemon environment of a measured run: F24's malloc arenas
+/// (`s1_f24_memory.rs`, runtime §8), two on glibc, none set on musl.
+const MEASURED: &[(&str, &str)] = if cfg!(target_env = "gnu") {
+    &[("MALLOC_ARENA_MAX", "2")]
+} else {
+    &[]
+};
+
+/// F24's measurement (`s1_f24_memory.rs`): the daemon's `VmRSS` sampled
+/// every 10 ms from `/proc/<pid>/status` after a settled baseline, and
+/// its peak the higher of the samples and `VmHWM`.
+struct Rss {
+    pid: u32,
+    baseline: u64,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    sampler: thread::JoinHandle<u64>,
+}
+
+impl Rss {
+    /// Settles (elapsed time only, as F24), reads the baseline and starts
+    /// sampling.
+    fn watch(pid: u32) -> Result<Self, ScenarioError> {
+        thread::sleep(Duration::from_millis(300));
+        let baseline = status_kib(pid, "VmRSS:").ok_or_else(|| infra("no daemon VmRSS"))?;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopping = std::sync::Arc::clone(&stop);
+        let sampler = thread::spawn(move || {
+            let mut peak = 0;
+            while !stopping.load(Ordering::Acquire) {
+                if let Some(rss) = status_kib(pid, "VmRSS:") {
+                    peak = peak.max(rss);
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            peak
+        });
+        Ok(Self {
+            pid,
+            baseline,
+            stop,
+            sampler,
+        })
+    }
+
+    /// Stops sampling: `(baseline, peak)` in KiB.
+    fn finish(self) -> Result<(u64, u64), ScenarioError> {
+        self.stop.store(true, Ordering::Release);
+        let sampled = self
+            .sampler
+            .join()
+            .map_err(|_| infra("the RSS sampler panicked"))?;
+        let peak = status_kib(self.pid, "VmHWM:").unwrap_or(0).max(sampled);
+        Ok((self.baseline, peak))
+    }
+}
+
+/// A `/proc/<pid>/status` field in KiB (F24's reader).
+fn status_kib(pid: u32, field: &str) -> Option<u64> {
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix(field))
+        .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse().ok())
 }

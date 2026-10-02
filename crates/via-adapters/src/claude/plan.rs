@@ -108,6 +108,21 @@ pub(crate) fn categories() -> BTreeMap<Category, CategoryDecl> {
     ])
 }
 
+/// The plan's clock. Test builds: the failpoint
+/// `adapter.claude.plan_clock_ms` (a `value`) moves it that many
+/// milliseconds ahead, so a refusal's expiry runs under controlled time
+/// (x.3.2 C3).
+fn plan_clock() -> std::time::Instant {
+    let now = std::time::Instant::now();
+    #[cfg(feature = "test-failpoints")]
+    if let Ok(Some(ahead)) = via_routes::failpoint::value("adapter.claude.plan_clock_ms") {
+        return now
+            .checked_add(std::time::Duration::from_millis(ahead))
+            .unwrap_or(now);
+    }
+    now
+}
+
 /// The values a turn sets that the route must accept.
 struct PerTurn<'a> {
     effort: Option<&'a str>,
@@ -182,6 +197,19 @@ impl ClaudeAdapter {
         model: ModelChoice,
         requested: Inherit,
     ) -> RoutePlan {
+        self.plan_at(harness, req, model, requested, plan_clock())
+    }
+
+    /// [`Self::plan`] with its clock at `now`: the refusal cache's entries
+    /// are live or expired as of `now`.
+    fn plan_at(
+        &self,
+        harness: Harness,
+        req: &DescribeRequest,
+        model: ModelChoice,
+        requested: Inherit,
+        now: std::time::Instant,
+    ) -> RoutePlan {
         let route = harness.route();
         let capabilities = capabilities();
         let mut refusals = refusals(
@@ -203,12 +231,8 @@ impl ClaudeAdapter {
                 ),
             ));
         }
-        let (vendor_version, version_status) = self.version(
-            harness,
-            requested,
-            req.sizes.output_schema > 0,
-            std::time::Instant::now(),
-        );
+        let (vendor_version, version_status) =
+            self.version(harness, requested, req.sizes.output_schema > 0, now);
         if version_status == VersionStatus::Refused {
             let mut refusal = Refusal::new(
                 RefusalKind::VersionRefused,
@@ -547,16 +571,15 @@ mod tests {
         );
     }
 
-    /// C2 §5 refusal cache, with controlled time (the plan's clock is the
-    /// `now` it passes): while an entry is live a plan of the same recipe
-    /// is refused `harness_unavailable` with `reason:"handshake_refused"`
-    /// (its version status `refused`); 10 minutes after the entry was
-    /// written it has expired, so the plan admits the turn, which launches
-    /// and re-checks. The last version seen stays reported throughout.
-    #[test]
-    fn cached_refusal_refuses_until_ten_minutes() {
-        let dir = tempfile::tempdir().unwrap();
-        let binary = dir.path().join("claude");
+    /// An adapter over a fresh instance cache, its binary in `dir`.
+    fn adapter_in(
+        dir: &std::path::Path,
+    ) -> (
+        ClaudeAdapter,
+        std::sync::Arc<crate::instance::InstanceCache>,
+        std::path::PathBuf,
+    ) {
+        let binary = dir.join("claude");
         std::fs::write(&binary, b"").unwrap();
         let instances = std::sync::Arc::new(crate::instance::InstanceCache::default());
         let adapter = ClaudeAdapter::new(
@@ -564,35 +587,11 @@ mod tests {
             instances.clone(),
             &crate::config::BootstrapEnv::from_vars::<_, &str, &str>([]),
         );
-        let requested = Inherit::OD2_DEFAULT;
-        let harness = Harness::Vendor(&crate::harness::HARNESSES[0]);
-        instances.record_version(harness.name(), &binary, "2.1.285".to_owned());
-        let written = std::time::Instant::now();
-        instances.record_refusal(
-            &binary,
-            launch::recipe_key(requested, false),
-            crate::instance::Incompatibility::FeatureAbsent("interrupt_receipt_v1"),
-            written,
-        );
-        let ttl = crate::instance::REFUSAL_TTL;
-        assert_eq!(ttl, std::time::Duration::from_secs(600));
-        let at = |now| adapter.version(harness, requested, false, now);
-        let refused = (Some("2.1.285".to_owned()), VersionStatus::Refused);
-        assert_eq!(at(written), refused);
-        let last = written + std::time::Duration::from_millis(599_999);
-        assert_eq!(at(last), refused);
-        assert_eq!(
-            at(written + ttl),
-            (Some("2.1.285".to_owned()), VersionStatus::Tested)
-        );
-        // Through `plan` (its own clock, within the entry's life): the
-        // refusal C1 reports.
-        instances.record_refusal(
-            &binary,
-            launch::recipe_key(requested, false),
-            crate::instance::Incompatibility::FeatureAbsent("interrupt_receipt_v1"),
-            std::time::Instant::now(),
-        );
+        (adapter, instances, binary)
+    }
+
+    /// A plan of the default model and recipe at `now`.
+    fn plan_of(adapter: &ClaudeAdapter, now: std::time::Instant) -> RoutePlan {
         let request = DescribeRequest {
             harness: Some("claude".to_owned()),
             ..DescribeRequest::default()
@@ -601,15 +600,85 @@ mod tests {
             requested: None,
             resolved: adapter.resolve(None),
         };
-        let plan = adapter.plan(harness, &request, model, requested);
-        assert_eq!(plan.version_status, VersionStatus::Refused);
-        let refusal = plan
-            .refusals
-            .iter()
-            .find(|refusal| refusal.kind == RefusalKind::VersionRefused)
-            .expect("a version refusal");
-        assert_eq!(refusal.kind.code(), "harness_unavailable");
-        assert_eq!(refusal.reason, Some("handshake_refused"));
+        let harness = Harness::Vendor(&crate::harness::HARNESSES[0]);
+        adapter.plan_at(harness, &request, model, Inherit::OD2_DEFAULT, now)
+    }
+
+    /// C2 §5 refusal cache, with controlled time through `plan` itself:
+    /// while the entry is live (to 599.999 s after it was written) the plan
+    /// is refused `harness_unavailable` with `reason:"handshake_refused"`
+    /// and its version status is `refused`; at 600 s it has expired and the
+    /// plan admits the launch, which re-checks. The last version seen stays
+    /// reported throughout.
+    #[test]
+    fn cached_refusal_refuses_until_ten_minutes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (adapter, instances, binary) = adapter_in(dir.path());
+        let harness = Harness::Vendor(&crate::harness::HARNESSES[0]);
+        instances.record_version(harness.name(), &binary, "2.1.285".to_owned());
+        let written = std::time::Instant::now();
+        instances.record_refusal(
+            &binary,
+            launch::recipe_key(Inherit::OD2_DEFAULT, false),
+            crate::instance::Incompatibility::FeatureAbsent("interrupt_receipt_v1"),
+            written,
+        );
+        let ttl = crate::instance::REFUSAL_TTL;
+        assert_eq!(ttl, std::time::Duration::from_secs(600));
+        for at in [written, written + std::time::Duration::from_millis(599_999)] {
+            let plan = plan_of(&adapter, at);
+            assert_eq!(plan.version_status, VersionStatus::Refused);
+            assert_eq!(plan.vendor_version.as_deref(), Some("2.1.285"));
+            let refusal = plan
+                .refusals
+                .iter()
+                .find(|refusal| refusal.kind == RefusalKind::VersionRefused)
+                .expect("a version refusal");
+            assert_eq!(refusal.kind.code(), "harness_unavailable");
+            assert_eq!(refusal.reason, Some("handshake_refused"));
+        }
+        let plan = plan_of(&adapter, written + ttl);
+        assert_eq!(
+            (plan.vendor_version.as_deref(), plan.version_status),
+            (Some("2.1.285"), VersionStatus::Tested)
+        );
+        assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    }
+
+    /// Invariant 13 through Claude's plan (which `describe` reports): the
+    /// last version is looked up for this harness and this program path
+    /// only, and a refusal for this program path only. Another harness's
+    /// version on this path, this harness's on another path, and another
+    /// path's refusal leave the plan `null`/`untested`; this pair's own
+    /// entry is then reported.
+    #[test]
+    fn plan_reads_only_its_own_harness_and_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let (adapter, instances, binary) = adapter_in(dir.path());
+        let other = dir.path().join("other-claude");
+        let harness = Harness::Vendor(&crate::harness::HARNESSES[0]);
+        assert_eq!(harness.name(), "claude");
+        let now = std::time::Instant::now();
+        instances.record_version("codex", &binary, "2.1.285".to_owned());
+        instances.record_version(harness.name(), &other, "2.1.290".to_owned());
+        instances.record_refusal(
+            &other,
+            launch::recipe_key(Inherit::OD2_DEFAULT, false),
+            crate::instance::Incompatibility::FeatureAbsent("interrupt_receipt_v1"),
+            now,
+        );
+        let plan = plan_of(&adapter, now);
+        assert_eq!(
+            (plan.vendor_version.as_deref(), plan.version_status),
+            (None, VersionStatus::Untested)
+        );
+        assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+        instances.record_version(harness.name(), &binary, "2.1.285".to_owned());
+        let plan = plan_of(&adapter, now);
+        assert_eq!(
+            (plan.vendor_version.as_deref(), plan.version_status),
+            (Some("2.1.285"), VersionStatus::Tested)
+        );
     }
 
     /// AD18 and G8: efforts outside the table and values past the argument
