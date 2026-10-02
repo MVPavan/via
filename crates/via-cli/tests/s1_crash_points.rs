@@ -2819,10 +2819,14 @@ fn steer_row(paths: &Paths, session: &str) -> Result<(String, Option<String>), S
 /// is durable with no result and no `steer.delivered` exists. Restart
 /// recovery stores the uncertain outcome. A repeat under the key is
 /// answered with it, `steer_failed` with `data.reason: "not_delivered"`
-/// and `data.delivery: "uncertain"`, where a new steer is
+/// and `data.delivery: "uncertain"`, its message saying the outcome was not
+/// durably recorded (K2 r1 #5), where a new steer is
 /// `no_active_turn` (the turn was recovered `unknown`, and C1 §7.3 cancels
 /// the queue behind it): the input is never sent again, and no
 /// `steer.delivered` exists.
+/// The message of a keyed steer's uncertain outcome (K2 r1 #5).
+const UNRECORDED: &str = "the steer's delivery outcome was not durably recorded; whether its input was applied is unknown";
+
 #[test]
 fn s1_crash_keyed_steer_before_its_outcome_is_never_resent() -> TestResult {
     scenario(
@@ -2864,8 +2868,8 @@ fn s1_crash_keyed_steer_before_its_outcome_is_never_resent() -> TestResult {
             daemon.shutdown()?;
 
             let _daemon = Daemon::start(paths, evidence, "final")?;
-            let uncertain =
-                json!({"refused":"steer_failed","reason":"not_delivered","delivery":"uncertain"});
+            let uncertain = json!({"refused":"steer_failed","reason":"not_delivered",
+                                   "delivery":"uncertain","recorded":false});
             let (_, result) = steer_row(paths, &session)?;
             let stored: Option<Value> = result
                 .as_deref()
@@ -2886,7 +2890,8 @@ fn s1_crash_keyed_steer_before_its_outcome_is_never_resent() -> TestResult {
                 !replayed.status.success()
                     && error["data"]["kind"] == "steer_failed"
                     && error["data"]["reason"] == "not_delivered"
-                    && error["data"]["delivery"] == "uncertain",
+                    && error["data"]["delivery"] == "uncertain"
+                    && error["message"] == UNRECORDED,
                 || format!("the repeat is not the stored outcome: {error}"),
             )?;
             let fresh = [

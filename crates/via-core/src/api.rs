@@ -1259,6 +1259,16 @@ impl ApiError {
             floor: None,
         }
     }
+    /// A keyed steer's stored outcome when its durable intent stayed
+    /// unresolved after its attempt ended (C1 §3.4, K2 r1 #5):
+    /// `steer_failed` `not_delivered`, delivery `uncertain`. Its message
+    /// claims nothing of the vendor: only that no outcome was recorded.
+    pub(crate) fn steer_unrecorded() -> Self {
+        Self {
+            message: "the steer's delivery outcome was not durably recorded; whether its input was applied is unknown",
+            ..Self::steer_failed("not_delivered", Cow::Borrowed("uncertain"))
+        }
+    }
     /// The turn has not yet ended.
     pub const TURN_NOT_FINISHED: Self = Self {
         code: -32015,

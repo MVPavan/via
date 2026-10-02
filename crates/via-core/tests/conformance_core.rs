@@ -2489,6 +2489,11 @@ fn core_keyed_steer_whose_outcome_was_not_recorded_replays_uncertain() {
             ("steer_failed", &json!("not_delivered"), &json!("uncertain")),
             "{error:?}"
         );
+        assert_eq!(
+            error.message,
+            "the steer's delivery outcome was not durably recorded; whether its input was applied is unknown",
+            "K2 r1 #5"
+        );
         let again = steer().await.expect_err("replayed");
         assert_eq!(again.data()["delivery"], "uncertain", "{again:?}");
         daemon.release("delivered");

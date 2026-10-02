@@ -5563,7 +5563,6 @@ async fn send_denials(
 }
 
 /// Releases the paused hit `n` of `point` in `dir`.
-#[cfg(feature = "test-failpoints")]
 fn release_point(dir: &Path, point: &str, n: u64) {
     fs::write(dir.join(format!("{point}.{n}.release")), b"").unwrap();
 }
@@ -8748,5 +8747,528 @@ fn turn_end_cleanup_reaches_the_link_through_the_retry() {
         }
         assert_eq!(links_of(&root, &[(&quiet, 1)]).await, 0, "the link stays");
         assert_eq!(links_of(&root, &[(&unsure, 1)]).await, 1, "the link went");
+    });
+}
+
+/// K2 r1: the keyed operation row `key` of `session`, its result: `None`
+/// with no row, `Some(None)` for an open intent.
+async fn steer_result(engine: &Engine, session: &SessionId, key: &str) -> Option<Option<Value>> {
+    engine
+        .store
+        .keyed_operation(session, key)
+        .await
+        .unwrap()
+        .map(|row| row.result)
+}
+
+/// A delivered steer's answer on turn `turn` of `session`.
+fn delivered_on(session: &SessionId, turn: u32) -> Value {
+    json!({"turn":format!("{session}/{turn}"),"delivery":"injected"})
+}
+
+/// `steer` with the params text `raw`, byte for byte.
+async fn steer_text(engine: &Engine, raw: &str) -> Result<Value, ApiError> {
+    engine.steer(serde_json::from_str(raw).unwrap(), raw).await
+}
+
+/// [`steer`] on its own task, so the test can drop the request.
+fn steer_task(
+    engine: &std::sync::Arc<Engine>,
+    raw: &Value,
+) -> tokio::task::JoinHandle<Result<Value, ApiError>> {
+    let engine = std::sync::Arc::clone(engine);
+    let raw = raw.clone();
+    tokio::spawn(async move { steer(&engine, &raw).await })
+}
+
+/// The session's dispatcher on its own task.
+fn dispatch_task(
+    engine: &std::sync::Arc<Engine>,
+    session: &SessionId,
+) -> tokio::task::JoinHandle<()> {
+    let engine = std::sync::Arc::clone(engine);
+    let session = session.clone();
+    tokio::spawn(async move { dispatch(&engine, &session).await })
+}
+
+/// Loses the reply of the Store mutation paused at its first hit of
+/// `paused`, which has committed by then: every later reply is lost until
+/// the first lost one is acknowledged, then the point is disarmed.
+async fn lose_reply_of_paused(dir: &Path, paused: &str) {
+    until(|| acked(dir, paused, 1)).await;
+    // The writer is held at `paused`, so the next reply is that write's.
+    let command = json!({"token":FAILPOINT_TOKEN,"occurrence":1,"action":"fail_io",
+                         "persist":true});
+    fs::write(
+        dir.join("store.commit.reply_lost.json"),
+        command.to_string(),
+    )
+    .unwrap();
+    release_point(dir, paused, 1);
+    let lost = || {
+        fs::read_dir(dir).unwrap().any(|entry| {
+            let name = entry.unwrap().file_name().into_string().unwrap();
+            // `store.commit.reply_lost.<occurrence>.ack`
+            name.strip_prefix("store.commit.reply_lost.")
+                .is_some_and(|marker| marker.split('.').nth(1) == Some("ack"))
+        })
+    };
+    until(lost).await;
+    fs::remove_file(dir.join("store.commit.reply_lost.json")).unwrap();
+}
+
+/// A fake turn script for `prompt`: accepted, then `steps`, then a
+/// completed terminal.
+fn turn_script(prompt: &str, vendor_turn: &str, steps: &[Value]) -> Value {
+    let mut all = vec![json!({"action":"emit","message":{"type":"accepted","id":1,
+                                                         "vendor_turn_id":vendor_turn}})];
+    all.extend_from_slice(steps);
+    all.push(
+        json!({"action":"emit","message":{"type":"terminal","vendor_turn_id":vendor_turn,
+                    "status":"completed","final_text":"done","stop_reason":"end_turn"}}),
+    );
+    json!({"expected_request":{"type":"start","prompt":prompt},"steps":all})
+}
+
+/// The vendor taking turn `vendor_turn`'s steer input, then reporting it.
+fn takes_steer(vendor_turn: &str) -> [Value; 2] {
+    [
+        json!({"action":"expect_request","expected":{"type":"steer","id":3}}),
+        json!({"action":"emit","message":{"type":"steer_delivered","id":3,
+                                          "vendor_turn_id":vendor_turn}}),
+    ]
+}
+
+/// K2 r1 #1 (C1 §3.4): a keyed steer whose caller goes away while its
+/// input is with the vendor still records its delivery. The lane commits
+/// `steer.delivered` with the key's outcome; a repeat meanwhile waits for
+/// it, never stores uncertainty, and replays the delivery. The driver is
+/// asked once.
+#[test]
+fn a_dropped_keyed_steer_still_records_its_delivery() {
+    let Some(root) = child("a_dropped_keyed_steer_still_records_its_delivery") else {
+        return;
+    };
+    let turn = "fake-turn-1";
+    let [expect, report] = takes_steer(turn);
+    let scenario = json!({"profile": steer_profile(&json!({})), "scripts": [turn_script(
+        "p", turn, &[expect, json!({"action":"gate","name":"delivering"}), report,
+                     json!({"action":"gate","name":"running"})])]});
+    let sync = root.join("sync");
+    run(async {
+        let engine = open_fake(&root, &scenario);
+        let session = new_session(&engine).await;
+        let dispatching = dispatch_task(&engine, &session);
+        let raw = json!({"session":session.as_str(),"handle":HANDLE,"text":"also","op_key":"k-1"});
+        let first = steer_task(&engine, &raw);
+        until(|| sync.join("delivering.entered").exists()).await;
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        let repeat = steer_task(&engine, &raw);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            engine.faults.steer_key_waiting.notified(),
+        )
+        .await
+        .expect("the repeat waits for the attempt the lane still owns");
+        assert!(!repeat.is_finished());
+        fs::write(sync.join("delivering.release"), b"").unwrap();
+        let delivered = delivered_on(&session, 1);
+        assert_eq!(repeat.await.unwrap().unwrap(), delivered);
+        assert_eq!(
+            steer_result(&engine, &session, "k-1").await,
+            Some(Some(delivered))
+        );
+        assert_eq!(steers(&engine, &session).await, [(json!(1), json!(false))]);
+        assert_eq!(engine.faults.steer_calls.load(Ordering::Acquire), 1);
+        fs::write(sync.join("running.release"), b"").unwrap();
+        dispatching.await.unwrap();
+    });
+}
+
+/// K2 r1 #1, #2 (C1 §3.4): the lane has taken a keyed steer's outcome for
+/// its `steer.delivered` commit (held at `core.steer.before_outcome`) when
+/// the caller goes away. A repeat waits for that commit rather than store
+/// uncertainty under it, then replays the delivery the commit recorded.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_keyed_steer_dropped_before_its_outcome_commit_keeps_it() {
+    let Some(root) = child("a_keyed_steer_dropped_before_its_outcome_commit_keeps_it") else {
+        return;
+    };
+    let points = pause_first(&root, "core.steer.before_outcome");
+    let turn = "fake-turn-1";
+    let [expect, report] = takes_steer(turn);
+    let scenario = json!({"profile": steer_profile(&json!({})), "scripts": [turn_script(
+        "p", turn, &[expect, report, json!({"action":"gate","name":"running"})])]});
+    let sync = root.join("sync");
+    run(async {
+        let engine = open_fake(&root, &scenario);
+        let session = new_session(&engine).await;
+        let dispatching = dispatch_task(&engine, &session);
+        let raw = json!({"session":session.as_str(),"handle":HANDLE,"text":"also","op_key":"k-1"});
+        let first = steer_task(&engine, &raw);
+        until(|| acked(&points, "core.steer.before_outcome", 1)).await;
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        let repeat = steer_task(&engine, &raw);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            engine.faults.steer_key_waiting.notified(),
+        )
+        .await
+        .expect("the repeat waits for the lane's commit");
+        assert!(!repeat.is_finished());
+        assert_eq!(steer_result(&engine, &session, "k-1").await, Some(None));
+        release_point(&points, "core.steer.before_outcome", 1);
+        let delivered = delivered_on(&session, 1);
+        assert_eq!(repeat.await.unwrap().unwrap(), delivered);
+        assert_eq!(
+            steer_result(&engine, &session, "k-1").await,
+            Some(Some(delivered))
+        );
+        assert_eq!(steers(&engine, &session).await, [(json!(1), json!(false))]);
+        assert_eq!(engine.faults.steer_calls.load(Ordering::Acquire), 1);
+        fs::write(sync.join("running.release"), b"").unwrap();
+        dispatching.await.unwrap();
+    });
+}
+
+/// K2 r1 #3 (C1 §3, §3.4): on a route whose steer is unsupported, a keyed
+/// steer's key is still looked up first: a key another verb holds is
+/// `idempotency_conflict`, and a new key stores the `unsupported_verb`
+/// refusal as its outcome, which binds the key like any other: other
+/// params under it, or a close under it, are `idempotency_conflict`.
+#[test]
+fn an_unsupported_keyed_steer_stores_its_refusal_under_its_key() {
+    let Some(root) = child("an_unsupported_keyed_steer_stores_its_refusal_under_its_key") else {
+        return;
+    };
+    let mut profile = steer_profile(&json!({}));
+    profile["capabilities"]["verbs"]["steer"] = json!({"support":"unsupported","reason":"no"});
+    let scenario = json!({"profile": profile, "scripts": []});
+    run(async {
+        let engine = open_fake(&root, &scenario);
+        let session = new_session(&engine).await;
+        let keyed = |key: &str, text: &str| json!({"session":session.as_str(),"handle":HANDLE,"text":text,"op_key":key});
+        resume(&engine, &session, Some("k-r")).await;
+        let held = steer(&engine, &keyed("k-r", "x")).await.unwrap_err();
+        assert_eq!(
+            (held.kind, held.kind2),
+            ("invalid_params", Some("idempotency_conflict"))
+        );
+        let first = steer(&engine, &keyed("k-1", "x")).await.unwrap_err();
+        assert_eq!(first.kind, "unsupported_verb", "{first:?}");
+        assert_eq!(
+            steer_result(&engine, &session, "k-1").await,
+            Some(Some(json!({"refused":"unsupported_verb"})))
+        );
+        let replayed = steer(&engine, &keyed("k-1", "x")).await.unwrap_err();
+        assert_eq!(
+            (replayed.code, replayed.kind, replayed.data()),
+            (first.code, first.kind, first.data())
+        );
+        let other = steer(&engine, &keyed("k-1", "y")).await.unwrap_err();
+        assert_eq!(
+            (other.kind, other.kind2),
+            ("invalid_params", Some("idempotency_conflict"))
+        );
+        let closing = close(&engine, &session, Some("k-1")).await.unwrap_err();
+        assert_eq!(
+            (closing.kind, closing.kind2),
+            ("invalid_params", Some("idempotency_conflict"))
+        );
+        assert_eq!(engine.faults.steer_calls.load(Ordering::Acquire), 0);
+    });
+}
+
+/// K2 r1 #7 (C1 §3): keys are one space per session across verbs. A steer
+/// under a resume's key, and a close under a steer's key, are
+/// `idempotency_conflict`; neither reaches the driver.
+#[test]
+fn a_keyed_steer_shares_its_key_space_with_resume_and_close() {
+    let Some(root) = child("a_keyed_steer_shares_its_key_space_with_resume_and_close") else {
+        return;
+    };
+    let scenario = json!({"profile": steer_profile(&json!({})), "scripts": []});
+    run(async {
+        let engine = open_fake(&root, &scenario);
+        let session = new_session(&engine).await;
+        let keyed =
+            |key: &str| json!({"session":session.as_str(),"handle":HANDLE,"text":"x","op_key":key});
+        resume(&engine, &session, Some("k-r")).await;
+        let held = steer(&engine, &keyed("k-r")).await.unwrap_err();
+        assert_eq!(
+            (held.kind, held.kind2),
+            ("invalid_params", Some("idempotency_conflict"))
+        );
+        let idle = steer(&engine, &keyed("k-s")).await.unwrap_err();
+        assert_eq!(idle.kind, "no_active_turn", "{idle:?}");
+        let closing = close(&engine, &session, Some("k-s")).await.unwrap_err();
+        assert_eq!(
+            (closing.kind, closing.kind2),
+            ("invalid_params", Some("idempotency_conflict"))
+        );
+        assert_eq!(engine.faults.steer_calls.load(Ordering::Acquire), 0);
+    });
+}
+
+/// K2 r1 #7 (C1 §3 retry identity): a keyed steer's identity is its params'
+/// bytes. The same members with other whitespace, or in another order, are
+/// other params: `idempotency_conflict`; the same bytes replay.
+#[test]
+fn a_keyed_steer_identity_is_its_raw_params_bytes() {
+    let Some(root) = child("a_keyed_steer_identity_is_its_raw_params_bytes") else {
+        return;
+    };
+    let scenario = json!({"profile": steer_profile(&json!({})), "scripts": []});
+    run(async {
+        let engine = open_fake(&root, &scenario);
+        let session = new_session(&engine).await;
+        let session = session.as_str();
+        let first =
+            format!(r#"{{"session":"{session}","handle":"{HANDLE}","text":"x","op_key":"k-1"}}"#);
+        let spaced = format!(
+            r#"{{ "session": "{session}", "handle": "{HANDLE}", "text": "x", "op_key": "k-1" }}"#
+        );
+        let reordered =
+            format!(r#"{{"text":"x","session":"{session}","handle":"{HANDLE}","op_key":"k-1"}}"#);
+        let answer = steer_text(&engine, &first).await.unwrap_err();
+        assert_eq!(answer.kind, "no_active_turn", "{answer:?}");
+        for other in [&spaced, &reordered] {
+            let error = steer_text(&engine, other).await.unwrap_err();
+            assert_eq!(
+                (error.kind, error.kind2),
+                ("invalid_params", Some("idempotency_conflict")),
+                "{other}"
+            );
+        }
+        let replayed = steer_text(&engine, &first).await.unwrap_err();
+        assert_eq!(replayed.kind, "no_active_turn", "{replayed:?}");
+    });
+}
+
+/// K2 r1 #4, #6 (C1 §3.4): a keyed steer whose intent write rolled back
+/// (`store.commit.steer_intent`) is `store_error` and leaves no key; the
+/// retry is a fresh first attempt and delivers, once.
+#[test]
+fn a_keyed_steer_whose_intent_rolled_back_leaves_no_key() {
+    let Some(root) = child("a_keyed_steer_whose_intent_rolled_back_leaves_no_key") else {
+        return;
+    };
+    let points = fail_first(&root, "store.commit.steer_intent");
+    let turn = "fake-turn-1";
+    let [expect, report] = takes_steer(turn);
+    let scenario = json!({"profile": steer_profile(&json!({})), "scripts": [turn_script(
+        "p", turn, &[json!({"action":"gate","name":"ready"}), expect, report,
+                     json!({"action":"gate","name":"running"})])]});
+    let sync = root.join("sync");
+    run(async {
+        let engine = open_fake(&root, &scenario);
+        let session = new_session(&engine).await;
+        let dispatching = dispatch_task(&engine, &session);
+        until(|| sync.join("ready.entered").exists()).await;
+        fs::write(sync.join("ready.release"), b"").unwrap();
+        let raw = json!({"session":session.as_str(),"handle":HANDLE,"text":"also","op_key":"k-1"});
+        let failed = steer(&engine, &raw).await.unwrap_err();
+        assert_eq!(failed.kind, "store_error", "{failed:?}");
+        assert!(acked(&points, "store.commit.steer_intent", 1));
+        assert_eq!(steer_result(&engine, &session, "k-1").await, None);
+        assert_eq!(engine.faults.steer_calls.load(Ordering::Acquire), 0);
+        let delivered = delivered_on(&session, 1);
+        assert_eq!(steer(&engine, &raw).await.unwrap(), delivered);
+        assert_eq!(steer(&engine, &raw).await.unwrap(), delivered);
+        assert_eq!(engine.faults.steer_calls.load(Ordering::Acquire), 1);
+        fs::write(sync.join("running.release"), b"").unwrap();
+        dispatching.await.unwrap();
+    });
+}
+
+/// K2 r1 #4 (C1 §3.4): a keyed steer's refusal committed, but its reply
+/// was lost: the caller got `store_error`, and after the restart the
+/// repeat replays the committed refusal, never asking the driver.
+#[test]
+fn a_keyed_steer_outcome_whose_reply_was_lost_replays_after_restart() {
+    let Some(root) = child("a_keyed_steer_outcome_whose_reply_was_lost_replays_after_restart")
+    else {
+        return;
+    };
+    let points = pause_first(&root, "store.commit.steer_outcome");
+    let scenario = json!({"profile": steer_profile(&json!({})), "scripts": []});
+    let session = run(async {
+        let engine = open_fake(&root, &scenario);
+        let session = new_session(&engine).await;
+        let raw = json!({"session":session.as_str(),"handle":HANDLE,"text":"x","op_key":"k-1"});
+        let first = steer_task(&engine, &raw);
+        lose_reply_of_paused(&points, "store.commit.steer_outcome").await;
+        let failed = first.await.unwrap().unwrap_err();
+        assert_eq!(failed.kind, "store_error", "{failed:?}");
+        shutdown(&engine).await;
+        session
+    });
+    run(async {
+        let engine = open_fake(&root, &scenario);
+        engine.recover().await.unwrap();
+        let raw = json!({"session":session.as_str(),"handle":HANDLE,"text":"x","op_key":"k-1"});
+        let replayed = steer(&engine, &raw).await.unwrap_err();
+        assert_eq!(replayed.kind, "no_active_turn", "{replayed:?}");
+        assert_eq!(
+            steer_result(&engine, &session, "k-1").await,
+            Some(Some(json!({"refused":"no_active_turn"})))
+        );
+        assert_eq!(engine.faults.steer_calls.load(Ordering::Acquire), 0);
+    });
+}
+
+/// K2 r1 #4, #5, #7 (C1 §3.4): a keyed steer's intent committed, but its
+/// reply was lost, so it never reached the driver. After the restart, its
+/// stored outcome is the uncertain one, whose message says the outcome was
+/// not durably recorded. A repeat while a successor turn runs replays it:
+/// no driver call, and no vendor input, since the first steer input the
+/// successor's vendor reads is a later one's.
+#[test]
+fn a_keyed_steer_intent_left_open_by_a_restart_is_never_sent() {
+    let Some(root) = child("a_keyed_steer_intent_left_open_by_a_restart_is_never_sent") else {
+        return;
+    };
+    let points = pause_first(&root, "store.commit.steer_intent");
+    let [_, report] = takes_steer("fake-turn-2");
+    let scenario = json!({"profile": steer_profile(&json!({})), "scripts": [
+        turn_script("p", "fake-turn-1", &[]),
+        turn_script("q", "fake-turn-2", &[
+            json!({"action":"gate","name":"second"}),
+            json!({"action":"expect_request","expected":{"type":"steer","id":3,"text":"fresh"}}),
+            report,
+        ]),
+    ]});
+    let sync = root.join("sync");
+    let session = run(async {
+        let engine = open_fake(&root, &scenario);
+        let session = new_session(&engine).await;
+        dispatch(&engine, &session).await;
+        let raw = json!({"session":session.as_str(),"handle":HANDLE,"text":"also","op_key":"k-1"});
+        let first = steer_task(&engine, &raw);
+        lose_reply_of_paused(&points, "store.commit.steer_intent").await;
+        let failed = first.await.unwrap().unwrap_err();
+        assert_eq!(failed.kind, "store_error", "{failed:?}");
+        shutdown(&engine).await;
+        session
+    });
+    run(async {
+        let engine = open_fake(&root, &scenario);
+        engine.recover().await.unwrap();
+        assert_eq!(
+            steer_result(&engine, &session, "k-1").await,
+            Some(Some(super::steer::uncertain()))
+        );
+        resume(&engine, &session, None).await;
+        let dispatching = dispatch_task(&engine, &session);
+        until(|| sync.join("second.entered").exists()).await;
+        let raw = json!({"session":session.as_str(),"handle":HANDLE,"text":"also","op_key":"k-1"});
+        let replayed = tokio::time::timeout(Duration::from_secs(10), steer(&engine, &raw))
+            .await
+            .expect("the repeat is answered while the successor's vendor is held")
+            .unwrap_err();
+        assert_eq!(
+            (
+                replayed.kind,
+                replayed.message,
+                &replayed.data()["reason"],
+                &replayed.data()["delivery"]
+            ),
+            (
+                "steer_failed",
+                "the steer's delivery outcome was not durably recorded; whether its input was applied is unknown",
+                &json!("not_delivered"),
+                &json!("uncertain")
+            )
+        );
+        assert_eq!(engine.faults.steer_calls.load(Ordering::Acquire), 0);
+        fs::write(sync.join("second.release"), b"").unwrap();
+        let fresh = json!({"session":session.as_str(),"handle":HANDLE,"text":"fresh"});
+        assert_eq!(
+            steer(&engine, &fresh).await.unwrap(),
+            delivered_on(&session, 2)
+        );
+        assert_eq!(engine.faults.steer_calls.load(Ordering::Acquire), 1);
+        assert_eq!(steers(&engine, &session).await, [(json!(2), json!(false))]);
+        dispatching.await.unwrap();
+    });
+}
+
+/// K2 r1 #7 (C1 §3): a key belongs to its session. The same key on two
+/// sessions names two steers, each with its own outcome.
+#[test]
+fn a_steer_key_belongs_to_its_session() {
+    let Some(root) = child("a_steer_key_belongs_to_its_session") else {
+        return;
+    };
+    let turn = "fake-turn-1";
+    let [expect, report] = takes_steer(turn);
+    let scenario = json!({"profile": steer_profile(&json!({})), "scripts": [turn_script(
+        "p", turn, &[json!({"action":"gate","name":"ready"}), expect, report,
+                     json!({"action":"gate","name":"running"})])]});
+    let sync = root.join("sync");
+    run(async {
+        let engine = open_fake(&root, &scenario);
+        let idle = new_session(&engine).await;
+        let busy = new_session(&engine).await;
+        let dispatching = dispatch_task(&engine, &busy);
+        until(|| sync.join("ready.entered").exists()).await;
+        fs::write(sync.join("ready.release"), b"").unwrap();
+        let keyed = |session: &SessionId| json!({"session":session.as_str(),"handle":HANDLE,"text":"x","op_key":"k-1"});
+        let refused = steer(&engine, &keyed(&idle)).await.unwrap_err();
+        assert_eq!(refused.kind, "no_active_turn", "{refused:?}");
+        let delivered = delivered_on(&busy, 1);
+        assert_eq!(steer(&engine, &keyed(&busy)).await.unwrap(), delivered);
+        let replayed = steer(&engine, &keyed(&idle)).await.unwrap_err();
+        assert_eq!(replayed.kind, "no_active_turn", "{replayed:?}");
+        assert_eq!(steer(&engine, &keyed(&busy)).await.unwrap(), delivered);
+        assert_eq!(engine.faults.steer_calls.load(Ordering::Acquire), 1);
+        fs::write(sync.join("running.release"), b"").unwrap();
+        dispatching.await.unwrap();
+    });
+}
+
+/// K2 r1 #7 (C1 §3.4): a transient refusal, `control_lane_full`, is the
+/// key's answer too: the repeat replays it without asking the driver, and
+/// only a new key asks again.
+#[test]
+fn a_keyed_steer_retains_a_transient_refusal() {
+    let Some(root) = child("a_keyed_steer_retains_a_transient_refusal") else {
+        return;
+    };
+    let turn = "fake-turn-1";
+    let scenario = json!({
+        "profile": steer_profile(&json!({"steer_refusal":"over_capacity"})),
+        "scripts": [turn_script("p", turn, &[json!({"action":"gate","name":"running"})])],
+    });
+    let sync = root.join("sync");
+    run(async {
+        let engine = open_fake(&root, &scenario);
+        let session = new_session(&engine).await;
+        let dispatching = dispatch_task(&engine, &session);
+        until(|| sync.join("running.entered").exists()).await;
+        let keyed =
+            |key: &str| json!({"session":session.as_str(),"handle":HANDLE,"text":"x","op_key":key});
+        let full = |error: ApiError| (error.kind, error.reason);
+        let expected = ("admission_refused", Some("control_lane_full"));
+        assert_eq!(
+            full(steer(&engine, &keyed("k-1")).await.unwrap_err()),
+            expected
+        );
+        assert_eq!(engine.faults.steer_calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            full(steer(&engine, &keyed("k-1")).await.unwrap_err()),
+            expected
+        );
+        assert_eq!(engine.faults.steer_calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            full(steer(&engine, &keyed("k-2")).await.unwrap_err()),
+            expected
+        );
+        assert_eq!(engine.faults.steer_calls.load(Ordering::Acquire), 2);
+        fs::write(sync.join("running.release"), b"").unwrap();
+        dispatching.await.unwrap();
     });
 }

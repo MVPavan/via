@@ -1,11 +1,13 @@
-//! Keyed `steer` (C1 §3, §3.4; via-jm4.36): a keyed steer's first answer
-//! is its answer. Its intent row is committed before its input goes to the
-//! driver; its outcome is recorded once, with the `steer.delivered` event
-//! that reports its delivery or alone for a refusal, and every repeat
-//! replays it. A repeat while the first attempt is in flight waits for that
-//! attempt. An intent left with no outcome, by a `store_error` reply or a
-//! daemon restart, gets the uncertain outcome; the input is never sent
-//! again.
+//! Keyed `steer` (C1 §3, §3.4; via-jm4.36): the key's answer is its
+//! durable intent's stored outcome. The intent row is committed before the
+//! input goes to the driver; the outcome is recorded once, with the
+//! `steer.delivered` event that reports the delivery, or alone for a
+//! refusal, and every repeat replays it. The attempt runs on its own task,
+//! never the caller's, so a caller that goes away ends none of it; a
+//! repeat while it runs waits for it. Only an intent left unresolved after
+//! its attempt ended, by the lane resolving it without a delivery commit
+//! or by a daemon restart, gets the uncertain outcome; the input is never
+//! sent again.
 
 use std::{borrow::Cow, collections::HashMap, sync::Mutex as StdMutex};
 
@@ -20,10 +22,13 @@ use super::{Admission, Engine, lock};
 use crate::intake::{self, Frozen};
 use crate::{ApiError, SessionId, SteerParams};
 
-/// The outcome recorded for a keyed steer whose first attempt ended with
-/// none (C1 §3.4): VIA cannot tell whether its input was applied.
+/// The outcome recorded for a keyed steer whose durable intent stayed
+/// unresolved after its attempt ended (C1 §3.4): VIA cannot tell whether
+/// its input was applied. `recorded: false` tells it from a driver's
+/// `NotDelivered` refusal, whose message speaks of the vendor (K2 r1 #5).
 pub(super) fn uncertain() -> Value {
-    json!({"refused":"steer_failed","reason":"not_delivered","delivery":"uncertain"})
+    json!({"refused":"steer_failed","reason":"not_delivered","delivery":"uncertain",
+           "recorded":false})
 }
 
 /// A delivered steer's reply, and its keyed outcome (C1 §3.4).
@@ -58,6 +63,9 @@ fn replay(stored: Value, frozen: &Frozen) -> Result<Value, ApiError> {
     let Some(refused) = stored.get("refused") else {
         return Ok(stored);
     };
+    if stored.get("recorded") == Some(&Value::Bool(false)) {
+        return Err(ApiError::steer_unrecorded());
+    }
     let reason = stored.get("reason").and_then(Value::as_str);
     Err(match (refused.as_str(), reason) {
         (Some("no_active_turn"), _) => ApiError::NO_ACTIVE_TURN,
@@ -120,16 +128,45 @@ impl Drop for Attempt<'_> {
 }
 
 impl Engine {
-    /// C1 §3.4 `steer` under `op_key`, after authentication and the route's
-    /// steer support: under `admission`, before any current-state check, a
-    /// row under the key of another verb or identity is
-    /// `idempotency_conflict`; a recorded outcome is replayed; an attempt
-    /// in flight is waited for, then the key is looked up again; an intent
-    /// with neither gets the uncertain outcome. Otherwise this is the first
-    /// attempt: its intent row commits, then the input goes to the driver,
-    /// and its outcome is recorded with its `steer.delivered` or, for a
-    /// refusal, alone. A `store_error` records none.
+    /// C1 §3.4 `steer` under `op_key`, after authentication and the latch:
+    /// the attempt ([`Self::keyed_attempt`]) runs on its own task, so the
+    /// caller going away, its future dropped, ends none of it (K2 r1 #1):
+    /// its intent, its delivery and the lane's commit of its
+    /// `steer.delivered` with its outcome, or its refusal's record, all
+    /// happen whatever the caller does.
     pub(super) async fn keyed_steer(
+        &self,
+        params: SteerParams,
+        frozen: Frozen,
+        key: (String, via_store::Identity),
+    ) -> Result<Value, ApiError> {
+        // Every Engine is made in its own `Arc` ([`Engine::open`]).
+        let Some(engine) = self.me.upgrade() else {
+            return Err(ApiError::STORE);
+        };
+        let attempt = tokio::spawn(async move { engine.keyed_attempt(params, &frozen, key).await });
+        match attempt.await {
+            Ok(answer) => answer,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            // The runtime is ending under the daemon.
+            Err(_) => Err(ApiError::STORE),
+        }
+    }
+
+    /// A keyed steer's attempt. Under `admission`, before any route or
+    /// current-state check (K2 r1 #3): a row under the key of another verb
+    /// or identity is `idempotency_conflict`; a recorded outcome is
+    /// replayed; an attempt still running is waited for, then the key is
+    /// looked up again; an intent whose attempt ended without an outcome
+    /// gets the uncertain one. Otherwise this is the first attempt: its
+    /// intent row commits, then the steer runs as an unkeyed one would,
+    /// the route's support first, and its outcome is recorded with its
+    /// `steer.delivered` or, for a refusal, alone. A `store_error` reply
+    /// records no outcome: a refused or rolled-back intent leaves no key,
+    /// and an intent the lane resolved without a delivery commit is left
+    /// open, so the next look-up, its attempt ended, records the uncertain
+    /// outcome.
+    async fn keyed_attempt(
         &self,
         params: SteerParams,
         frozen: &Frozen,
@@ -272,5 +309,7 @@ mod unit {
         assert!(stored_refusal(&ApiError::STORE).is_none());
         let uncertain = replay(uncertain(), &frozen).expect_err("uncertain is a refusal");
         assert_eq!(uncertain.data()["delivery"], "uncertain");
+        assert_eq!(uncertain.data()["reason"], "not_delivered");
+        assert_eq!(uncertain.message, ApiError::steer_unrecorded().message);
     }
 }

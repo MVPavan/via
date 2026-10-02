@@ -687,8 +687,10 @@ impl Engine {
     }
 
     /// C1 §3.4 `steer`: the session and its handle
-    /// ([`Self::authenticate_existing`]), then the latch; a route whose
-    /// stored capabilities do not support steer is `unsupported_verb`. The
+    /// ([`Self::authenticate_existing`]), then the latch, then `op_key`
+    /// ([`Self::keyed_steer`]), whose look-up comes before every other
+    /// check (K2 r1 #3); then a route whose stored capabilities do not
+    /// support steer is `unsupported_verb`. The
     /// running turn is the one steered: none is `no_active_turn`, another
     /// than `expect_turn` is `turn_mismatch`, and one still submitting is
     /// waited for until its acceptance, `no_active_turn` if it ends first.
@@ -702,8 +704,8 @@ impl Engine {
     /// answered only once the lane committed that observation, which
     /// resolves the ticket (C1 §3.4, critical r1 #5): a failed commit, or
     /// the lane's end first, is `store_error`, never success. The ticket
-    /// retires with the request, whichever way it ends. With `op_key`, the
-    /// steer is keyed ([`Self::keyed_steer`]): its retry identity is
+    /// retires with the request, whichever way it ends; a keyed steer's
+    /// request is its attempt's own task. A keyed steer's retry identity is
     /// `raw_params`' bytes with the handle replaced by its hash.
     pub async fn steer(&self, params: SteerParams, raw_params: &str) -> Result<Value, ApiError> {
         let (hash, snapshot) = self
@@ -713,24 +715,18 @@ impl Engine {
             return Err(ApiError::STORE);
         }
         let frozen = Frozen::of(&snapshot.route);
-        if !matches!(
-            frozen.steer(),
-            Some(Support::Native | Support::Partial { .. })
-        ) {
-            return Err(intake::unsupported_on(Verb::Steer, &frozen));
-        }
         match retry_key(params.op_key.as_deref())?.map(str::to_owned) {
             Some(key) => {
                 let identity = retry_identity(raw_params, &hash, None)?;
-                self.keyed_steer(params, &frozen, (key, identity)).await
+                self.keyed_steer(params, frozen, (key, identity)).await
             }
             None => self.deliver_steer(params, &frozen, None).await,
         }
     }
 
-    /// Selects the steered turn, waits for its acceptance, then hands the
-    /// input to the driver and answers once its `steer.delivered` committed
-    /// ([`Self::steer`]). A keyed steer's `op_key` rides on its ticket, so
+    /// Checks the route's steer support, selects the steered turn, waits
+    /// for its acceptance, then hands the input to the driver and answers
+    /// once its `steer.delivered` committed ([`Self::steer`]). A keyed steer's `op_key` rides on its ticket, so
     /// that commit records the steer's outcome.
     pub(super) async fn deliver_steer(
         &self,
@@ -738,6 +734,12 @@ impl Engine {
         frozen: &Frozen,
         op_key: Option<&str>,
     ) -> Result<Value, ApiError> {
+        if !matches!(
+            frozen.steer(),
+            Some(Support::Native | Support::Partial { .. })
+        ) {
+            return Err(intake::unsupported_on(Verb::Steer, frozen));
+        }
         #[cfg(test)]
         self.faults.steer_selecting.notify_one();
         // Sol r2 #5: selected under the slot's `selection`, so a submission
