@@ -1,0 +1,126 @@
+{
+  "source": "synthetic (x.3.2 C2, via-p98.3.2): no vendor run. Lines follow the 2026-09-30 c1a-c11b recordings' shapes, trimmed to what the adapter reads. c7's shape: a gate holds the fake between the nested receipt and the abort terminal.",
+  "harness": "claude",
+  "launches": 1,
+  "launch_checkpoints": {
+    "after_pure": 0,
+    "after_open": {
+      "main": 0
+    },
+    "after_turn": [
+      1
+    ]
+  },
+  "pure_writes": [],
+  "plan_checks": [],
+  "sessions": {
+    "main": {
+      "model": "haiku",
+      "instructions": null,
+      "cwd": "/work/project",
+      "resume": null,
+      "close": null
+    }
+  },
+  "turns": [
+    {
+      "session": "main",
+      "start_after": null,
+      "params": {
+        "prompt": "Run sleep 30 with Bash.",
+        "effort": null,
+        "bound": {
+          "mode": "full",
+          "extra_write_dirs": [],
+          "network": true
+        },
+        "output_schema": null,
+        "max_steps": null
+      },
+      "tool_grace_ms": null,
+      "stop": {
+        "kind": "interrupt",
+        "after": "tool_started"
+      },
+      "steer": [],
+      "expect": {
+        "plan_refusal": null,
+        "rejected": null,
+        "accepted": true,
+        "terminal": {
+          "status": "interrupted",
+          "stop_reason": "interrupted",
+          "vendor_stop_reason": "tool_use",
+          "class_hint": null
+        },
+        "usage": {
+          "from": "terminal",
+          "input_tokens": 1110,
+          "cached_input_tokens": 1000,
+          "output_tokens": 20,
+          "scope": "turn"
+        },
+        "final_text": null,
+        "error": null,
+        "cleanup": "quiescent",
+        "cleanup_settles": null,
+        "stop_facts": {
+          "acknowledged": true,
+          "forced": false
+        },
+        "instance": {
+          "vendor_version": "2.1.285",
+          "version_status": "tested"
+        },
+        "exit": {
+          "code": 0,
+          "signal": null
+        },
+        "journal_uncertain": false,
+        "group_absent": true,
+        "warnings": [
+          "config_switch_unverified"
+        ],
+        "observations_include": [
+          {
+            "kind": "session.vendor_identity_confirmed",
+            "generation": 1
+          },
+          "turn.accepted",
+          {
+            "kind": "progress",
+            "tools_started": [
+              [
+                "toolu_01SYNTH000001",
+                "Bash"
+              ]
+            ]
+          }
+        ],
+        "observations_exclude": [
+          "final_text"
+        ],
+        "observation_counts": {
+          "turn.accepted": 1
+        },
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
+        ],
+        "unasserted": [],
+        "notes": "Packet \u00a77: the receipt alone acknowledges nothing (at the gate: no terminal, no stop facts); the receipt paired by request_id, then the error_during_execution/aborted_tools terminal, is the acknowledgement. AD19: stdin EOF only after the result."
+      },
+      "gates": [
+        {
+          "step": 7,
+          "expect": {
+            "accepted": true,
+            "terminal": null,
+            "error": null,
+            "stop_facts": null
+          }
+        }
+      ]
+    }
+  ]
+}

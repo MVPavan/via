@@ -22,6 +22,10 @@
 //!    directories; `pure_writes` spans steps 1 and 2, and a directory that
 //!    cannot be read fails the case.
 //!
+//! The run half performs each planned session's real `open_session()`; it
+//! samples that session's `after_open` right after it and extends the
+//! `pure_writes` interval past every open (review r1 #6).
+//!
 //! The turns that plan run in the run half (the route's driver), which
 //! [`Pure::planned_only`] does not have: it finishes only a case whose
 //! every turn was refused before any receipt.
@@ -59,9 +63,14 @@ pub(crate) struct Pure {
     /// The adapter set under test.
     pub(crate) set: AdapterSet,
     /// The Store's and the runtime directory's parent.
-    state: tempfile::TempDir,
-    _store: Store,
-    name: String,
+    pub(crate) state: tempfile::TempDir,
+    /// The Store the adapter set runs on; the run half commits turns to it.
+    pub(crate) _store: Store,
+    pub(crate) name: String,
+    /// The fixture directory, listed with the case and state directories.
+    fixtures: PathBuf,
+    /// The listing before the pure steps: where `pure_writes` starts.
+    before: Listing,
 }
 
 impl Pure {
@@ -94,14 +103,15 @@ impl Pure {
             state,
             _store: store,
             name: name.to_owned(),
+            before: Listing::new(),
+            fixtures,
         };
-        let before = pure.listing(&fixtures)?;
+        pure.before = pure.listing()?;
         pure.pure_operations(harness, expect)?;
         pure.outcome.checkpoints.after_pure = pure.launches()?;
         // The spawn plans are pure too: the interval covers them.
         pure.open_sessions(harness, expect)?;
-        let after = pure.listing(&fixtures)?;
-        pure.outcome.pure_writes = changed(&before, &after);
+        pure.outcome.pure_writes = pure.writes()?;
         Ok(pure)
     }
 
@@ -255,7 +265,7 @@ impl Pure {
     }
 
     /// The launch log's line count: the fake's starts so far.
-    fn launches(&self) -> Result<u64, String> {
+    pub(crate) fn launches(&self) -> Result<u64, String> {
         let log = self.case_dir.path().join(format!("{}.launches", self.name));
         match fs::read_to_string(&log) {
             Ok(text) => Ok(text.lines().count() as u64),
@@ -264,11 +274,20 @@ impl Pure {
         }
     }
 
+    /// The files created, changed or removed since the pure steps began.
+    pub(crate) fn writes(&self) -> Result<Vec<String>, String> {
+        Ok(changed(&self.before, &self.listing()?))
+    }
+
     /// Every file of the fixture, case and state directories (the Store
     /// and the runtime directory) but the launch log.
-    fn listing(&self, fixtures: &Path) -> Result<Listing, String> {
+    fn listing(&self) -> Result<Listing, String> {
         let mut listing = Listing::new();
-        for dir in [fixtures, self.case_dir.path(), self.state.path()] {
+        for dir in [
+            self.fixtures.as_path(),
+            self.case_dir.path(),
+            self.state.path(),
+        ] {
             list(dir, &mut listing).map_err(|e| format!("{}: {e}", dir.display()))?;
         }
         listing.remove(&self.case_dir.path().join(format!("{}.launches", self.name)));
@@ -298,12 +317,17 @@ fn session_of(turn: &Value) -> &str {
 
 /// The built `via-fake-agent`, beside this test's directory.
 fn fake_agent() -> Result<PathBuf, String> {
+    sibling("via-fake-agent")
+}
+
+/// The workspace binary `name`, beside this test's directory.
+fn sibling(name: &str) -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let path = exe
         .parent()
         .and_then(Path::parent)
         .ok_or("no target directory")?
-        .join("via-fake-agent");
+        .join(name);
     if path.is_file() {
         Ok(path)
     } else {
@@ -332,7 +356,8 @@ fn adapter_set(harness: &str, binary: &Path, state: &Path) -> Result<(AdapterSet
     let set = AdapterSet::new(
         config,
         RuntimeConfig {
-            anchor_binary: state.join("anchor"),
+            // The real anchor, when built: the run half launches through it.
+            anchor_binary: sibling("via").unwrap_or_else(|_| state.join("anchor")),
             anchor_dir: state.join("runtime"),
             vendor_state_dir: state.join("vendor"),
         },

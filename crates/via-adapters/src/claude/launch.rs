@@ -247,37 +247,62 @@ mod tests {
             if expect["launches"] == json!(0) {
                 continue;
             }
-            let turn = &expect["turns"][0];
-            let session = &expect["sessions"][turn["session"].as_str().unwrap_or("main")];
-            let resume = session["resume"].as_str();
-            let schema = (!turn["params"]["output_schema"].is_null())
-                .then(|| RawValue::from_string(turn["params"]["output_schema"].to_string()))
-                .transpose()
-                .unwrap();
-            let captured = "CAPTURED";
-            let recipe = Recipe {
-                model: session["model"].as_str().unwrap(),
-                session: resume.map_or(Continue::New(captured), Continue::Resume),
-                inherit: Inherit::OD2_DEFAULT,
-                extra_write_dirs: &[],
-                instructions: session["instructions"].as_str(),
-                effort: turn["params"]["effort"].as_str(),
-                output_schema: schema.as_deref(),
-                max_steps: turn["params"]["max_steps"].as_u64(),
-            };
-            let built: Vec<Value> = argv(&recipe)
-                .unwrap()
-                .into_iter()
-                .map(|arg| {
-                    let arg = arg.into_string().unwrap();
-                    if arg == captured {
-                        json!({"capture": "sid"})
-                    } else {
-                        json!(arg)
-                    }
-                })
-                .collect();
-            assert_eq!(Value::Array(built), replay["argv"], "{name}");
+            // A lifetimes file runs turn n in lifetime n; a later lifetime
+            // resumes the UUID its first one confirmed: the expected UUID
+            // of the conformance run's session ID (`s_` and the session's
+            // 1-based position among the labels).
+            let lifetimes = replay["lifetimes"]
+                .as_array()
+                .map_or_else(|| vec![&replay], |all| all.iter().collect());
+            for (index, lifetime) in lifetimes.into_iter().enumerate() {
+                let turn = &expect["turns"][index];
+                let label = turn["session"].as_str().unwrap_or("main");
+                let session = &expect["sessions"][label];
+                let position = expect["sessions"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .position(|key| key == label)
+                    .unwrap();
+                let confirmed = expected_session_id(
+                    &SessionId::try_from(format!("s_{:012}", position + 1).as_str()).unwrap(),
+                );
+                let resume = session["resume"]
+                    .as_str()
+                    .or_else(|| (index > 0).then_some(confirmed.as_str()));
+                let schema = (!turn["params"]["output_schema"].is_null())
+                    .then(|| RawValue::from_string(turn["params"]["output_schema"].to_string()))
+                    .transpose()
+                    .unwrap();
+                let captured = "CAPTURED";
+                let recipe = Recipe {
+                    model: session["model"].as_str().unwrap(),
+                    session: resume.map_or(Continue::New(captured), Continue::Resume),
+                    inherit: Inherit::OD2_DEFAULT,
+                    extra_write_dirs: &[],
+                    instructions: session["instructions"].as_str(),
+                    effort: turn["params"]["effort"].as_str(),
+                    output_schema: schema.as_deref(),
+                    max_steps: turn["params"]["max_steps"].as_u64(),
+                };
+                let built: Vec<Value> = argv(&recipe)
+                    .unwrap()
+                    .into_iter()
+                    .map(|arg| {
+                        let arg = arg.into_string().unwrap();
+                        if arg == captured {
+                            json!({"capture": "sid"})
+                        } else {
+                            json!(arg)
+                        }
+                    })
+                    .collect();
+                assert_eq!(
+                    Value::Array(built),
+                    lifetime["argv"],
+                    "{name} lifetime {index}"
+                );
+            }
             checked += 1;
         }
         assert!(checked >= 10, "only {checked} fixtures checked");

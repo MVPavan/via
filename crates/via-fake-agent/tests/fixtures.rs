@@ -1379,9 +1379,11 @@ fn drive_all(deviation: Deviation) -> TestResult<Vec<(PathBuf, Result<(), String
         .collect()
 }
 
-/// The fixture's steps.
+/// The fixture's steps; a lifetimes file's first lifetime's, where a
+/// deviation that fails stops [`drive`].
 fn steps_of(path: &Path) -> TestResult<Vec<Value>> {
-    let fixture: Value = serde_json::from_slice(&fs::read(path)?)?;
+    let file: Value = serde_json::from_slice(&fs::read(path)?)?;
+    let fixture = lifetimes_of(&file).first().copied().ok_or("no lifetime")?;
     Ok(fixture["steps"].as_array().ok_or("steps")?.clone())
 }
 

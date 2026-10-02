@@ -307,6 +307,9 @@ pub(crate) struct DriverState {
     pub(crate) identity: Option<String>,
     /// The vendor reported that it closed the session.
     pub(crate) vendor_closed: bool,
+    /// The last session-cumulative cost a terminal reported (Claude,
+    /// packet §5): a lower one warns.
+    pub(crate) cost: Option<f64>,
     /// The session was closed.
     pub(crate) closed: bool,
     /// The generation a turn holds and may still deliver on
@@ -384,8 +387,8 @@ pub(crate) fn latch(health: &watch::Sender<DriverHealth>, cause: DriverFailure) 
 pub(crate) enum DriverKind {
     /// The fake test double.
     Fake(Arc<FakeAdapter>),
-    /// Claude Code: a stub that runs no turn until via-p98.3.2.
-    Claude(#[expect(dead_code, reason = "its turn reads it (via-p98.3.2)")] Arc<ClaudeAdapter>),
+    /// Claude Code: one private process per turn.
+    Claude(Arc<ClaudeAdapter>),
     /// Codex: a stub that runs no turn until via-5lr.3.2.
     Codex(#[expect(dead_code, reason = "its turn reads it (via-5lr.3.2)")] Arc<CodexAdapter>),
 }
@@ -403,11 +406,13 @@ impl DriverKind {
     fn adapter_version(&self) -> Option<String> {
         match self {
             Self::Fake(fake) => Some(fake.profile().adapter_version.clone()),
-            Self::Claude(_) | Self::Codex(_) => None,
+            Self::Claude(_) => Some(crate::claude::adapter_version()),
+            Self::Codex(_) => None,
         }
     }
 
-    /// Its declared steer support; none from a stub.
+    /// Its declared steer support; none from a stub, or from Claude, whose
+    /// steer is unsupported (packet §2).
     fn steer(&self) -> Option<&Support> {
         match self {
             Self::Fake(fake) => Some(&fake.profile().capabilities.verbs.steer),
@@ -431,8 +436,9 @@ impl DriverKind {
     fn connection_id(&self, generation: u64) -> Option<String> {
         match self {
             Self::Fake(_) => Some(crate::fake::connection_id(generation)),
+            Self::Claude(_) => Some(crate::claude::connection_id(generation)),
             // A stub never connects, so never advances a generation.
-            Self::Claude(_) | Self::Codex(_) => None,
+            Self::Codex(_) => None,
         }
     }
 }
@@ -609,10 +615,12 @@ impl SessionDriver {
                 let fake = Arc::clone(fake);
                 crate::fake::run_turn(self, &fake, spec, cx).await
             }
-            // The vendor stubs run no turn yet (via-p98.3.2, via-5lr.3.2).
-            Some(DriverKind::Claude(_) | DriverKind::Codex(_)) | None => {
-                rejected(AdapterError::Unavailable)
+            Some(DriverKind::Claude(claude)) => {
+                let claude = Arc::clone(claude);
+                crate::claude::run_turn(self, &claude, spec, cx).await
             }
+            // The Codex stub runs no turn yet (via-5lr.3.2).
+            Some(DriverKind::Codex(_)) | None => rejected(AdapterError::Unavailable),
         }
     }
 

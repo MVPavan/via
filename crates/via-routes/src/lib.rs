@@ -222,6 +222,7 @@ fn undecoded_note(note: Option<&str>) -> String {
 pub mod claude;
 pub mod codex;
 mod fake;
+mod private;
 mod runtime;
 pub mod steer;
 

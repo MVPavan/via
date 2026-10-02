@@ -1,0 +1,83 @@
+{
+  "source": "synthetic (x.3.2 C2, via-p98.3.2): no vendor run. Lines follow the 2026-09-30 c1a-c11b recordings' shapes, trimmed to what the adapter reads. An init whose permission mode echo is not dontAsk; the vendor then answers VIA's interrupt with c7's abort terminal.",
+  "argv": [
+    "-p",
+    "--input-format",
+    "stream-json",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--model",
+    "haiku",
+    "--session-id",
+    {
+      "capture": "sid"
+    },
+    "--restricted",
+    "--strict-mcp-config",
+    "--permission-mode",
+    "dontAsk",
+    "--permission-prompts",
+    "none",
+    "--tools",
+    "Read,Write,Edit,Glob,Grep,Bash",
+    "--allowedTools",
+    "Read,Write,Edit,Glob,Grep,Bash"
+  ],
+  "version": "2.1.285 (Claude Code)",
+  "deadline_ms": 20000,
+  "steps": [
+    {
+      "expect": {
+        "line": {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Reply NEVER."
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "delay": {
+        "ms": 100
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"system\",\"subtype\":\"init\",\"cwd\":\"/work/project\",\"session_id\":\"${sid}\",\"tools\":[\"Bash\",\"Edit\",\"Glob\",\"Grep\",\"Read\",\"Write\"],\"mcp_servers\":[],\"model\":\"claude-haiku-4-5-20251001\",\"permissionMode\":\"default\",\"apiKeySource\":\"none\",\"claude_code_version\":\"2.1.285\",\"uuid\":\"00000000-0000-4000-8000-000000000001\",\"capabilities\":[\"interrupt_receipt_v1\",\"interrupt_cancel_queued_v1\",\"msg_lifecycle_v1\"]}"
+      }
+    },
+    {
+      "expect": {
+        "line": {
+          "type": "control_request",
+          "request": {
+            "subtype": "interrupt"
+          }
+        },
+        "capture": {
+          "rid": "/request_id"
+        }
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":${rid},\"response\":{\"still_queued\":[]}}}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"session_id\":\"${sid}\",\"stop_reason\":\"tool_use\",\"terminal_reason\":\"aborted_tools\",\"num_turns\":1,\"total_cost_usd\":0.001,\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":100,\"cache_read_input_tokens\":1000,\"output_tokens\":20},\"permission_denials\":[]}"
+      }
+    },
+    {
+      "await_eof": {}
+    }
+  ]
+}
