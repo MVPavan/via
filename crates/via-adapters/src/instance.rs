@@ -72,6 +72,26 @@ impl BinaryIdentity {
             mtime_nsec: meta.mtime_nsec(),
         })
     }
+
+    /// The identity as fixed-width little-endian bytes, for a launch key.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the Codex server key uses it (x.3.2 X2)")
+    )]
+    pub(crate) fn to_bytes(self) -> [u8; 40] {
+        let mut bytes = [0; 40];
+        let fields = [
+            self.dev.to_le_bytes(),
+            self.ino.to_le_bytes(),
+            self.size.to_le_bytes(),
+            self.mtime.to_le_bytes(),
+            self.mtime_nsec.to_le_bytes(),
+        ];
+        for (chunk, field) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(fields) {
+            chunk.copy_from_slice(&field);
+        }
+        bytes
+    }
 }
 
 /// A demonstrated incompatibility, the only refusal the cache can hold

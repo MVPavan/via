@@ -12,9 +12,8 @@ use crate::{
 mod runtime;
 
 pub use runtime::{
-    CONTROL_BYTES, CONTROL_COMMANDS, FakeLateTerminal, FakeRetired, FakeRetiredItem, FakeRoute,
-    FakeRouteResult, FakeTerminal, FakeTurn, Lane, Retirement, SteerAnswer, SteerRefused,
-    SteerRequest, SteerSender, steer_lane,
+    FakeLateTerminal, FakeRetired, FakeRetiredItem, FakeRoute, FakeRouteResult, FakeTerminal,
+    FakeTurn, Lane,
 };
 
 /// The one prompt submission of a private fake connection. Wire streams it
@@ -113,7 +112,7 @@ pub(crate) fn escaped_text_len(text: &str) -> usize {
 
 /// Appends `slice` as the contents of a JSON string, escaped as `serde_json`
 /// writes it.
-fn escape_json(slice: &str, piece: &mut Vec<u8>) {
+pub(crate) fn escape_json(slice: &str, piece: &mut Vec<u8>) {
     let start = piece.len();
     if serde_json::to_writer(&mut *piece, slice).is_ok() {
         // Drop the quotes around the string.

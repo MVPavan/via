@@ -5,19 +5,19 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 
 use super::super::{
     FakeMessage, Handshake, STEER_ID, TerminalDetails, TerminalStatus, escape_json,
     escaped_text_len, paired_vendor_turn,
 };
 use super::{Failed, FakeRouteResult, Next, Serving, protocol, transport};
+use crate::steer::{ControlPermit, SteerProgress, SteerRefused, SteerRequest};
 use crate::{
-    CloseRequest, Deadline, ExitReport, OutboundMessage, RouteError, RouteFailure, SendOutcome,
-    StopCause, TurnNumber, WireCleanup,
+    CloseRequest, Deadline, ExitReport, OutboundMessage, Retirement, RouteError, RouteFailure,
+    SendOutcome, StopCause, TurnNumber, WireCleanup,
 };
 use via_wire::{CloseMode, WireCloseReport, WireMessages, WireSender};
 
@@ -25,16 +25,16 @@ use via_wire::{CloseMode, WireCloseReport, WireMessages, WireSender};
 /// set incomplete, which keeps cleanup `Uncertain`.
 const OPEN_TOOLS_MAX: usize = 1024;
 
-/// C2 §2 independent lanes: control commands admitted at once.
-pub const CONTROL_COMMANDS: usize = 8;
-
-/// C2 §2 independent lanes: the admitted commands' total encoded bytes.
-pub const CONTROL_BYTES: usize = 64 * 1024;
-
 /// A steer line's bytes besides its escaped text, for any turn number:
 /// `{"type":"steer","id":3,"vendor_turn_id":"fake-turn-N","text":""}` and
 /// its newline.
 const STEER_OVERHEAD: usize = 96;
+
+/// The encoded bytes of a fake steer line carrying `text`, for the steer
+/// lane's budget.
+pub(super) fn steer_line_len(text: &str) -> usize {
+    escaped_text_len(text).saturating_add(STEER_OVERHEAD)
+}
 
 /// What the C2 lane asks of one fake turn beyond S1's inputs.
 pub struct Lane {
@@ -102,27 +102,6 @@ pub struct FakeLateTerminal {
     pub terminal: FakeTerminal,
 }
 
-/// One steer input for the running turn, admitted by [`SteerSender`];
-/// `reply` answers once the input was written whole and the vendor reported
-/// its delivery, or with why it was not delivered. A reply dropped
-/// unanswered means the turn ended first.
-pub struct SteerRequest {
-    /// The steer text.
-    pub text: String,
-    /// The vendor turn the caller means, if it names one.
-    pub expected_vendor_turn: Option<String>,
-    /// The caller's token for the request, which Route pairs with the
-    /// vendor's delivery report on the hop ([`RouteMessage::steer`]).
-    pub token: u64,
-    /// The delivery answer.
-    pub reply: oneshot::Sender<Result<(), SteerRefused>>,
-    /// What Route established of the input ([`SteerAnswer`]).
-    progress: Arc<SteerProgress>,
-    /// The request's share of the control budget, returned when it is
-    /// dropped.
-    permit: ControlPermit,
-}
-
 /// The steer awaiting its write and the vendor's delivery report.
 pub(super) struct SteerPending {
     reply: oneshot::Sender<Result<(), SteerRefused>>,
@@ -131,167 +110,8 @@ pub(super) struct SteerPending {
     _permit: ControlPermit,
 }
 
-/// One admitted command's share of the control budget (C2 §2): a command
-/// slot and its encoded bytes, held until the command is resolved.
-pub(super) struct ControlPermit {
-    _command: OwnedSemaphorePermit,
-    _bytes: OwnedSemaphorePermit,
-}
-
-/// Why Route did not deliver a steer input.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SteerRefused {
-    /// The turn is not accepted yet, or already ended.
-    NotActive,
-    /// The input was not written whole.
-    NotWritten,
-    /// The input names another vendor turn than the running one.
-    TurnMismatch,
-    /// The control lane's eight commands or 64 KiB are taken (C2 §2).
-    OverCapacity,
-}
-
-/// The admitting side of a turn's steer lane (C2 §2 independent lanes): at
-/// most [`CONTROL_COMMANDS`] requests and [`CONTROL_BYTES`] encoded in
-/// total are outstanding, queued or awaiting their answer; anything more is
-/// refused before it is enqueued.
-#[derive(Clone)]
-pub struct SteerSender {
-    sender: mpsc::Sender<SteerRequest>,
-    commands: Arc<Semaphore>,
-    budget: Arc<Semaphore>,
-}
-
-/// A turn's steer lane: the admitting sender and Route's receiver.
-pub fn steer_lane() -> (SteerSender, mpsc::Receiver<SteerRequest>) {
-    let (sender, receiver) = mpsc::channel(CONTROL_COMMANDS);
-    let commands = Arc::new(Semaphore::new(CONTROL_COMMANDS));
-    let budget = Arc::new(Semaphore::new(CONTROL_BYTES));
-    (
-        SteerSender {
-            sender,
-            commands,
-            budget,
-        },
-        receiver,
-    )
-}
-
-impl SteerSender {
-    /// Admits one steer input with its caller's `token`, or refuses it
-    /// at once.
-    pub fn send(
-        &self,
-        text: String,
-        expected_vendor_turn: Option<String>,
-        token: u64,
-    ) -> Result<SteerAnswer, SteerRefused> {
-        let command = Arc::clone(&self.commands)
-            .try_acquire_owned()
-            .map_err(|_| SteerRefused::OverCapacity)?;
-        let encoded = escaped_text_len(&text).saturating_add(STEER_OVERHEAD);
-        // A size past `u32` is past the budget too: both refuse it.
-        let bytes = u32::try_from(encoded)
-            .ok()
-            .and_then(|bytes| Arc::clone(&self.budget).try_acquire_many_owned(bytes).ok())
-            .ok_or(SteerRefused::OverCapacity)?;
-        let permit = ControlPermit {
-            _command: command,
-            _bytes: bytes,
-        };
-        let (reply, answer) = oneshot::channel();
-        let progress = Arc::new(SteerProgress::default());
-        let request = SteerRequest {
-            text,
-            expected_vendor_turn,
-            token,
-            reply,
-            progress: Arc::clone(&progress),
-            permit,
-        };
-        match self.sender.try_send(request) {
-            Ok(()) => Ok(SteerAnswer {
-                reply: answer,
-                progress,
-            }),
-            Err(mpsc::error::TrySendError::Full(_)) => Err(SteerRefused::OverCapacity),
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(SteerRefused::NotActive),
-        }
-    }
-}
-
-/// What Route established of one steer input, as it happens (critical r3
-/// #1, r5 #1).
-#[derive(Default)]
-pub(super) struct SteerProgress {
-    /// Route started writing the input.
-    write_started: AtomicBool,
-    /// The vendor reported the input's delivery; set before the report is
-    /// handed over, so before its observation can be emitted.
-    acknowledged: AtomicBool,
-}
-
-/// An admitted steer input's answer, as its caller holds it (critical r3
-/// #1, r5 #1): Route's reply, and what Route established of the input,
-/// which tells a caller whose turn ended unanswered whether the vendor
-/// acknowledged it, may have it, or never had it.
-pub struct SteerAnswer {
-    /// Route's reply; dropped unanswered when the turn ended first. Route
-    /// answers an acknowledged input only once its write is answered too.
-    pub reply: oneshot::Receiver<Result<(), SteerRefused>>,
-    progress: Arc<SteerProgress>,
-}
-
-impl SteerAnswer {
-    /// Whether Route started writing the input: it may have been written,
-    /// in part or whole. False means it never left the control lane.
-    #[must_use]
-    pub fn write_started(&self) -> bool {
-        self.progress.write_started.load(Ordering::Acquire)
-    }
-
-    /// Whether the vendor reported the input's delivery, whatever Route's
-    /// reply: its `steer.delivered` report was then handed over.
-    #[must_use]
-    pub fn acknowledged(&self) -> bool {
-        self.progress.acknowledged.load(Ordering::Acquire)
-    }
-}
-
-/// The turn's process facts once Route retired it: on the persistent
-/// profile the emulated helper's housekeeping close, never a fact of the
-/// logical turn (decision H1); otherwise the turn's own close.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Retirement {
-    /// A process may have launched.
-    pub launched: bool,
-    /// Host-confirmed exit, when observed.
-    pub exit: Option<ExitReport>,
-    /// Cleanup certainty, when Route established one.
-    pub cleanup: Option<WireCleanup>,
-    /// Host stopped the group while its process was live.
-    pub forced: bool,
-    /// A Host journal write had an uncertain outcome.
-    pub journal_uncertain: bool,
-}
-
 impl Retirement {
-    /// The facts of a launched helper's close `report`, with the `exit`
-    /// its turn already saw.
-    fn closed(exit: Option<ExitReport>, report: &WireCloseReport) -> Self {
-        let reported = report
-            .vendor_exit
-            .filter(|exit| exit.code.is_some() || exit.signal.is_some());
-        Self {
-            launched: true,
-            exit: exit.or(reported),
-            cleanup: Some(report.cleanup),
-            forced: report.forced,
-            journal_uncertain: report.journal_uncertain,
-        }
-    }
-
-    /// The facts of Route's S1-shaped result.
+    /// The facts of the fake route's S1-shaped result.
     pub(super) fn of(result: &Result<FakeRouteResult, RouteFailure>) -> Self {
         match result {
             Ok(result) => Self {
@@ -507,7 +327,7 @@ impl Serving<'_> {
                 };
                 // Critical r5 #1: established before the report is handed
                 // over, whatever the write's answer.
-                pending.progress.acknowledged.store(true, Ordering::Release);
+                pending.progress.mark_acknowledged();
                 if lane.steer_write.is_some() {
                     // Answered once its write is confirmed.
                     lane.steer_evidence = true;
@@ -710,7 +530,7 @@ impl Serving<'_> {
             suffix: b"\"}\n".to_vec(),
             escape: escape_json,
         };
-        progress.write_started.store(true, Ordering::Release);
+        progress.mark_write_started();
         self.lane.steer_write = Some(self.sender.write(steer, self.deadline));
         self.lane.steer_reply = Some(SteerPending {
             reply,

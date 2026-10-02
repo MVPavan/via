@@ -154,6 +154,8 @@ impl AdapterSet {
     /// Pure: validates a resume turn's values against the frozen route.
     pub fn check_turn(&self, session: &SessionRef, turn: &TurnParams) -> Result<TurnCheck, Refusal>;
     pub fn models(&self, harness: Option<&str>) -> Vec<ModelEntry>;              // bundled + discovered
+    /// Pure, in-memory: the live shared servers for C1 `daemon/status.servers`; empty for per-turn routes.
+    pub fn servers(&self) -> Vec<ServerReport>;
     /// Logical: no vendor I/O. Attaches the session observation channel in `cx`.
     pub fn open_session(&self, session: &SessionRef, spec: SessionSpec, cx: SessionCx) -> SessionDriver;
     /// After daemon restart. Never submits input.
@@ -190,20 +192,22 @@ pub struct VendorIdentity {
 
 | Type | Fields |
 |---|---|
-| `DescribeRequest` | `harness: Option<String>` (passed unchanged; Core never compares it), `model: Option<String>`, `effort: Option<String>` (spawn's turn-1 effort, validated purely by `plan`, §5; C1 `describe` passes none, so its public parameters are unchanged), `bound: Bound`, `require: Vec<VerbReq>`, `vendor: VendorOptions`, `cwd: Option<PathBuf>`, `allow_untested: bool` (stored, no effect, §5) |
+| `DescribeRequest` | `harness: Option<String>` (passed unchanged; Core never compares it), `model: Option<String>`, `effort: Option<String>` (spawn's turn-1 effort, validated purely by `plan`, §5; C1 `describe` passes none, so its public parameters are unchanged), `bound: Bound`, `require: Vec<VerbReq>`, `vendor: VendorOptions`, `cwd: Option<PathBuf>`, `allow_untested: bool` (stored, no effect, §5), `sizes: ParamSizes` |
+| `ParamSizes` | the encoded byte sizes of the session's `instructions` text and the turn's `output_schema` (0 when absent), filled by Core from the values it holds, so a route with a lower limit (for example a per-argument limit) refuses purely with `InvalidParam` naming the member, before any receipt; the values themselves never reach `plan` |
 | `RoutePlan` | `harness: &'static str` (canonical), `route: RouteId`, `model: {requested, resolved}`, `inherit: {requested, effective}` (§6.2), `adapter_version`, `vendor_version: Option<String>` (last seen for the binary identity, or null), `version_status: Tested\|Untested\|Refused`, `capabilities: Capabilities` (C1 §4.1), `effective_bound`, `server_key: Option<ServerKey>`, `refusals`, `warnings` |
 | `Capabilities` | the C1 §4.1 DTO with `Support { Native, Partial { semantics }, Unsupported { reason } }` |
 | `ModelEntry` | a model with `source: bundled \| discovered` |
 | `SessionRef` | `harness`, `route`, `adapter_version`, handed back on resume, reopen and recovery; unknown or incompatible → `harness_unavailable` (rule 2) |
 | `SessionSpec` | `session_id`, `model`, `instructions: Option<Instructions>`, `initial_bound`, `cwd`, `vendor`, `inherit: {requested, effective}` (the inherited-configuration settings and states frozen at spawn, §6.2), `confirmed_vendor_session_id: Option<VendorSessionId>`, immutable `allow_untested`; a confirmed historical ID is not verification of this connection |
-| `TurnParams` | a resume turn's per-turn values (effort, bound, `output_schema`, `max_steps`, vendor keys), the input to `check_turn` |
+| `TurnParams` | a resume turn's per-turn values (effort, bound, `output_schema`, `max_steps`, vendor keys) and their `sizes: ParamSizes` (the session's frozen instructions, the turn's effective schema, inherited or set), the input to `check_turn` |
+| `ServerReport` | `harness`, `vendor_version: Option<String>`, `key: ServerKey`, `sessions: u32` (sessions leasing it) |
 | `TurnCheck` | `effective_bound`: the turn's bound as the route will apply it, like `RoutePlan.effective_bound` |
 | `TurnSpec` | `turn: TurnNo`, `prompt`, `effort`, `bound`, `output_schema`, `max_steps`, `vendor`, `wall_deadline: Instant`, `idle_deadline: IdleDeadline` |
 | `SteerInput` | `turn: TurnNo`, `token: SteerToken`, `text`, `expected_vendor_turn: Option<VendorTurnId>`; the driver checks `turn` atomically with control-lane admission (§2): `TurnMismatch` unless it is running that turn, `NoActiveTurn` when it runs none, so input never reaches a successor. Core mints `token`, unique within the session, before the call; the driver emits the `steer.delivered` observation carrying it before it returns `Ok`, and Core answers the C1 steer only after committing that observation (C1 §3.4) |
 | `SteerDelivery` | `Injected`, `Partial(Cow<'static, str>)` (real adapters pass static text; the fake passes its profile's text) |
 | `SteerError` | `Unsupported`, `NoActiveTurn`, `TurnMismatch`, `OverCapacity` (the control lane is full; nothing was written), `NotSteerable` (the vendor refused steer in the active turn's current phase; nothing was applied), `NotDelivered` (writing the input began, in part or whole, but the vendor never acknowledged it; whether it was applied is unknown), `NotRecorded { delivery }` (the vendor took the input whole, as `delivery` says, but its `steer.delivered` observation could not be emitted, for example on a full observation queue or a forced stop, so no event records it). A steer never outlives its turn: when the turn ends by any path, a forced stop or cutoff included, the driver answers every steer still waiting on it. Core maps them under C1 §3.4 |
 | `CloseReport` | `vendor_closed: bool`, `process_exit: Option<Exit>`, `cleanup: Cleanup`, `warnings`, `leftovers: Option<LeftoverReport>` (only when this close stopped the server, §4.2) |
-| `VendorTerminal` | `at`, `status: Completed\|Interrupted\|Failed`, `stop_reason: StopReason`, `vendor_stop_reason`, `vendor_code?`, `class_hint: Option<ClassHint>`, `detail?`, `structured_output?`, `steps?`, `usage?` (turn aggregate), `cost?`, `vendor?` (bounded 16 KiB) |
+| `VendorTerminal` | `at`, `status: Completed\|Interrupted\|Failed`, `stop_reason: StopReason`, `vendor_stop_reason`, `vendor_code?`, `class_hint: Option<ClassHint>`, `detail?`, `structured_output: Option<StructuredOutput>` (`Json(raw)`; `NotJson` when the route's structured output is text that does not parse as JSON, which Core treats as present and invalid with `reason: invalid`; `OverLimit` when a route that assembles it from text exceeds its 4 MiB retention bound, which Core treats as present and invalid with `reason: validation_limit`, C1 §5), `steps?`, `usage?` (turn aggregate), `cost?`, `vendor?` (bounded 16 KiB) |
 | `InstanceReport` | `vendor_version: Option<String>`, `version_status: Tested\|Untested` |
 | `ClassHint` | `Auth`, `RateLimit`, `ContextExceeded`, `BudgetExceeded`, `VendorError`, `Protocol`, `ResumeMismatch` |
 | `StopReason` | `EndTurn`, `MaxSteps`, `Budget`, `Refusal`, `Interrupted`, `Error`, `Other` |

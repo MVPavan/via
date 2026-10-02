@@ -43,10 +43,13 @@ fn s_launch_plan_inherit_per_harness() {
         ("VIA_FAKE_SCENARIO", scenario.into_os_string()),
         ("VIA_FAKE_SYNC_DIR", sync.into_os_string()),
     ]);
+    // Pinned, so each vendor harness's adapter is built: its plan, not a
+    // missing binary, answers. Nothing here runs either.
     let harnesses = RawValue::from_string(
-        r#"{"claude":{"inherit":{"hooks":true,"mcp_servers":true}},
-            "codex":{"inherit":{"skills":false}}}"#
-            .to_owned(),
+        json!({"claude":{"binary":dir.path().join("claude"),
+                         "inherit":{"hooks":true,"mcp_servers":true}},
+               "codex":{"binary":dir.path().join("codex"),"inherit":{"skills":false}}})
+        .to_string(),
     )
     .unwrap();
     let config = AdapterConfig::load(env, Some(&harnesses)).unwrap();
@@ -60,22 +63,43 @@ fn s_launch_plan_inherit_per_harness() {
         store.runtime_resources(),
     )
     .unwrap();
-    let describe = |harness: &str| DescribeRequest {
+    let describe = |harness: &str, model: Option<&str>| DescribeRequest {
         harness: Some(harness.to_owned()),
+        model: model.map(str::to_owned),
         ..DescribeRequest::default()
     };
-    let fake = set.plan(&describe("fake")).unwrap();
-    assert_eq!(
-        fake.inherit,
-        InheritPlan {
-            requested: Inherit::OD2_DEFAULT,
-            effective: Inherit::OD2_DEFAULT,
-        }
-    );
-    // No vendor adapter exists before x.3.2: a configured vendor harness
-    // still refuses, starting nothing.
-    for harness in ["claude", "codex"] {
-        let refusal = set.plan(&describe(harness)).unwrap_err();
-        assert_eq!(refusal.kind, RefusalKind::HarnessUnavailable, "{harness}");
+    let od2 = InheritPlan {
+        requested: Inherit::OD2_DEFAULT,
+        effective: Inherit::OD2_DEFAULT,
+    };
+    // Codex (x.3.2 X1): `harnesses.codex.inherit` sets skills off, and
+    // only its hooks switch is verified (packet §4), so every other
+    // category is effectively `unknown`.
+    let inherit = |states: serde_json::Value| serde_json::from_value::<Inherit>(states).unwrap();
+    let codex = InheritPlan {
+        requested: inherit(
+            json!({"hooks": "off", "mcp_servers": "off", "plugins": "on",
+            "skills": "off", "agents": "on", "instruction_files": "on"}),
+        ),
+        effective: inherit(json!({"hooks": "off", "mcp_servers": "unknown",
+            "plugins": "unknown", "skills": "unknown", "agents": "unknown",
+            "instruction_files": "unknown"})),
+    };
+    // Per harness, with the model the request names: the plan's inherit,
+    // or the refusal. Nothing here runs a binary. Each adapter track flips
+    // its own row; Codex has no bundled catalog, so it plans a named model.
+    let rows: [(&str, Option<&str>, Result<InheritPlan, RefusalKind>); 3] = [
+        ("claude", None, Err(RefusalKind::HarnessUnavailable)),
+        ("codex", Some("gpt-6-sol"), Ok(codex)),
+        ("fake", None, Ok(od2)),
+    ];
+    for (harness, model, expected) in rows {
+        let planned = set
+            .plan(&describe(harness, model))
+            .map(|plan| plan.inherit)
+            .map_err(|refusal| refusal.kind);
+        assert_eq!(planned, expected, "{harness}");
     }
+    // Per-turn routes only: no shared server (C2 §2 `servers`).
+    assert!(set.servers().is_empty());
 }

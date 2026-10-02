@@ -4,24 +4,21 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use super::{FakeMessage, RouteMessage, TerminalStatus, TurnStart};
+use crate::steer::{SteerRequest, SteerSender};
 use crate::{
-    Deadline, PrivateProcessSpec, ReprobeReport, RouteError, RouteFailure, RuntimeConfig,
-    RuntimeResources, SendOutcome, StopSources, StopWatch, StoreFailure, TurnNumber, WireRecovery,
-    WireShutdown,
+    Deadline, PrivateProcessSpec, Retirement, RouteError, RouteFailure, RouteRuntime, SendOutcome,
+    StopSources, StopWatch, StoreFailure, TurnNumber,
 };
 use lane::{Facts, Interrupt, LaneState, steer_request, turn_result};
 use via_wire::{
     CloseMode, CloseRequest, ExitReport, FailureCause, HostError, LatchState, PendingWrite,
-    WireCleanup, WireCloseReport, WireError, WireFailure, WireMessages, WireParts, WireRuntime,
-    WireSender, WireSignals,
+    WireCleanup, WireCloseReport, WireError, WireFailure, WireMessages, WireParts, WireSender,
+    WireSignals,
 };
 
 mod lane;
 
-pub use lane::{
-    CONTROL_BYTES, CONTROL_COMMANDS, FakeLateTerminal, FakeRetired, FakeRetiredItem, FakeTerminal,
-    FakeTurn, Lane, Retirement, SteerAnswer, SteerRefused, SteerRequest, SteerSender, steer_lane,
-};
+pub use lane::{FakeLateTerminal, FakeRetired, FakeRetiredItem, FakeTerminal, FakeTurn, Lane};
 
 /// Final fake protocol evidence, including independently confirmed process exit.
 #[derive(Clone, Debug)]
@@ -46,16 +43,22 @@ pub struct FakeRouteResult {
     pub forced: bool,
 }
 
-/// One-start state machine and opaque Wire runtime for the private fake route.
+/// One-start state machine of the private fake route, over the shared
+/// Route runtime that opens its connections.
 pub struct FakeRoute {
-    wire: WireRuntime,
+    runtime: Arc<RouteRuntime>,
 }
 
 impl FakeRoute {
-    /// Forwards the unopened resources to Wire's sole bootstrap split.
-    pub fn new(config: RuntimeConfig, resources: RuntimeResources) -> Result<Self, WireError> {
-        let wire = WireRuntime::new(config, resources)?;
-        Ok(Self { wire })
+    /// The fake route over the daemon's Route runtime.
+    pub fn new(runtime: Arc<RouteRuntime>) -> Self {
+        Self { runtime }
+    }
+
+    /// A fake turn's steer lane: each input is sized as the fake's steer
+    /// line encodes it.
+    pub fn steer_lane() -> (SteerSender, mpsc::Receiver<SteerRequest>) {
+        crate::steer_lane(lane::steer_line_len)
     }
 
     /// Sends one prompt after durable submission and awaits the paired
@@ -208,7 +211,8 @@ impl FakeRoute {
     ) -> (Result<FakeRouteResult, RouteFailure>, Facts) {
         let turn = start.turn();
         let connection = match self
-            .wire
+            .runtime
+            .wire()
             .open_connection(process, deadline, wire_signals)
             .await
         {
@@ -379,87 +383,6 @@ impl FakeRoute {
             Ok(()) => serving.unless_forced(result, undecoded),
             Err(cause) => Err(serving.failure_with(cause, &result, undecoded)),
         }
-    }
-
-    /// Drains Host controls and reapers before Core releases the Store owner.
-    pub async fn shutdown(
-        &self,
-        deadline: Deadline,
-        turns: &[(crate::SessionId, crate::TurnNumber)],
-    ) -> WireShutdown {
-        self.wire.shutdown(deadline, turns).await
-    }
-
-    /// Hands Host capacity for a group it did not launch (design §11).
-    pub fn hold_capacity(
-        &self,
-        anchor_id: String,
-        owner: crate::SessionId,
-        token: via_wire::CapacityToken,
-    ) {
-        self.wire.hold_capacity(anchor_id, owner, token);
-    }
-
-    /// Returns one page of passive Host recovery facts without exposing a
-    /// signal handle: up to `limit` anchors after the `after` id.
-    pub async fn recover_page(
-        &self,
-        after: Option<String>,
-        limit: u32,
-        deadline: Deadline,
-    ) -> Result<Vec<WireRecovery>, WireError> {
-        self.wire.recover_page(after, limit, deadline).await
-    }
-
-    /// [`Self::recover_page`] of the anchors in `cohort` only.
-    pub async fn recover_cohort_page(
-        &self,
-        after: Option<String>,
-        limit: u32,
-        cohort: via_wire::AnchorCohort,
-        deadline: Deadline,
-    ) -> Result<Vec<WireRecovery>, WireError> {
-        self.wire
-            .recover_cohort_page(after, limit, cohort, deadline)
-            .await
-    }
-
-    /// One non-signalling re-probe pass over held groups, optionally only
-    /// one session's (design §8).
-    pub async fn reprobe_held(
-        &self,
-        deadline: Deadline,
-        owner: Option<crate::SessionId>,
-    ) -> Result<ReprobeReport, WireError> {
-        self.wire.reprobe_held(deadline, owner).await
-    }
-
-    /// Held groups no live control owns (design §6.6).
-    pub fn held_unproven(&self) -> usize {
-        self.wire.held_unproven()
-    }
-
-    /// Advances on every added holding (design §8).
-    pub fn holdings_changed(&self) -> watch::Receiver<u64> {
-        self.wire.holdings_changed()
-    }
-
-    /// Positive evidence that a vendor of one of `anchors` is live (Task 4
-    /// design §11.3 `process.alive`).
-    pub fn live_armed(&self, anchors: &[String]) -> bool {
-        self.wire.live_armed(anchors)
-    }
-
-    /// Groups whose cleanup a live control or acquisition still owns
-    /// (design §6.4).
-    pub fn pending_cleanup(&self) -> usize {
-        self.wire.pending_cleanup()
-    }
-
-    /// Subscribes Host's early stop to the daemon force signal (design §6.8),
-    /// which carries the instant the force was raised.
-    pub fn watch_force(&self, forced: watch::Receiver<Option<tokio::time::Instant>>) {
-        self.wire.watch_force(forced);
     }
 
     /// Writes the start, reads and forwards messages to the terminal, then
