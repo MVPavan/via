@@ -14,13 +14,9 @@ use std::{
 use crate::{SessionId, TurnNumber, blob::BlobTasks};
 
 /// The fixed file names a turn's folder can hold, in the order `logs` lists
-/// them (design §7.1).
-pub const EVIDENCE_FILES: [&str; 4] = [
-    "stderr.log",
-    "undecoded.bin",
-    "final_text.txt",
-    "structured_output.json",
-];
+/// them (design §7.1). The structured-output file is not among them: `logs`
+/// lists the one the committed envelope names, after these (C1 §3.12).
+pub const EVIDENCE_FILES: [&str; 3] = ["stderr.log", "undecoded.bin", "final_text.txt"];
 
 /// `<state>/evidence`, validated or created by [`crate::Store::open`].
 /// Computing a path does no I/O.

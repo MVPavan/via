@@ -1355,6 +1355,36 @@ fn core_structured_output_spills_past_32_kib() {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        // C1 §3.12: `logs` states the file the envelope names, and none
+        // that no envelope names (Sol r5 #1).
+        let spill = |logs: &Value| {
+            logs["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|file| {
+                    file["name"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("structured_output")
+                })
+                .cloned()
+                .collect::<Vec<Value>>()
+        };
+        let logs = |turn: u32| {
+            serde_json::from_value(json!({"turn": format!("{session}/{turn}")})).unwrap()
+        };
+        let second_logs = daemon.engine.logs(logs(2)).await.unwrap();
+        assert_eq!(
+            spill(&second_logs),
+            [json!({"name":"structured_output.json","bytes":32 * 1024 + 1})],
+            "{second_logs}"
+        );
+        let orphan =
+            Path::new(first["evidence"]["folder"].as_str().unwrap()).join("structured_output.json");
+        fs::write(&orphan, b"{}").unwrap();
+        let first_logs = daemon.engine.logs(logs(1)).await.unwrap();
+        assert!(spill(&first_logs).is_empty(), "{first_logs}");
         daemon.shutdown().await;
     });
 }

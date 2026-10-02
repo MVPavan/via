@@ -3613,6 +3613,41 @@ fn logs_lists_the_revisions_own_file() {
     });
 }
 
+/// Sol r5 #1 (C1 §3.12 as amended): a fixed-name `structured_output.json`
+/// no committed envelope names, beside the revision's own file, is not
+/// listed: `logs` states only the file the envelope names.
+#[test]
+fn logs_lists_no_unnamed_fixed_spill() {
+    let Some(root) = child("logs_lists_no_unnamed_fixed_spill") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = unknown_session(&engine, (Value::Null, None), json!({})).await;
+        evidence_folder(&root, &session, 1);
+        let folder = root
+            .join("state")
+            .join("evidence")
+            .join(session.as_str())
+            .join("1");
+        fs::write(folder.join("structured_output.json"), b"{\"orphan\":true}").unwrap();
+        engine
+            .revise(&session, turn(1), &spilling_terminal(40_000))
+            .await;
+        let envelope = stored_envelope(&engine, &session, 1).await;
+        let named = Path::new(envelope["structured_output_file"]["path"].as_str().unwrap());
+        let name = named.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(revision_spill(&name, 1), "{name}");
+        let params = serde_json::from_value(json!({"turn": format!("{session}/1")})).unwrap();
+        let logs = engine.logs(params).await.unwrap();
+        assert_eq!(
+            logs["files"],
+            json!([{"name": name, "bytes": 40_000}]),
+            "{logs}"
+        );
+    });
+}
+
 /// Fix round 2 #2, round 3 #1 (C1 §5 as amended): files that no committed
 /// envelope names, as a crash between a revision's spill and its commit
 /// leaves, are not results and are never deleted: after a restart, the
