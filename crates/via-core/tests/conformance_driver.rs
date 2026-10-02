@@ -2409,6 +2409,144 @@ fn a_persistent_turns_end_answers_its_steers() {
     assert_eq!(answers, "(Ok(Err(NotDelivered)), Ok(Err(NoActiveTurn)))");
 }
 
+/// Critical r5 #1 (C2 `SteerError`): Route takes the vendor's delivery
+/// report while Wire has not yet answered the steer's write (held at
+/// `wire.prompt.after_write`, its second hit), and the report is emitted
+/// as `steer.delivered`; the persistent turn then ends with a completed
+/// terminal. The acknowledgement decides: the steer succeeds with its
+/// delivery, not `NotDelivered`.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn an_acknowledgement_before_the_writes_answer_decides_at_the_turns_end() {
+    let rig = Rig::new(
+        &json!({"persistent": true, "capabilities": native_capabilities()}),
+        &[script(
+            1,
+            &[
+                accepted(1),
+                json!({"action":"expect_request","expected":{"type":"steer","id":3}}),
+                emit(&json!({"type":"steer_delivered","id":3,"vendor_turn_id":vendor_turn(1)})),
+                terminal(1, "completed", "end_turn"),
+                gate("held"),
+            ],
+        )],
+    );
+    let (driver, mut receiver) = rig.session();
+    // Counted from here: the prompt's write is the first hit, the steer's
+    // the second.
+    let points = rig.points();
+    let held = json!({"token":POINTS_TOKEN,"occurrence":2,"action":"pause"});
+    fs::write(
+        points.join("wire.prompt.after_write.json"),
+        held.to_string(),
+    )
+    .unwrap();
+    let (cx, _controls) = turn_cx(1, driver.prepare(), WALL);
+    let (end, answer, items) = rig.runtime.block_on(async {
+        let run = driver.run_turn(prompt(), cx);
+        tokio::pin!(run);
+        let mut steer: Option<Steer<'_>> = None;
+        let mut items = Vec::new();
+        let end = loop {
+            tokio::select! {
+                Some(admitted) = receiver.recv() => {
+                    if matches!(admitted.item.observation, Observation::Accepted(_)) {
+                        steer = Some(Box::pin(driver.steer(SteerInput {
+                            turn: TurnNumber::try_from(1).unwrap(),
+                            text: "also".to_owned(),
+                            expected_vendor_turn: None,
+                            token: SteerToken::new(1),
+                        })));
+                    }
+                    items.push(admitted.item);
+                }
+                early = async { steer.as_mut().unwrap().await }, if steer.is_some() => {
+                    panic!("answered before the turn's end: {early:?}");
+                }
+                end = &mut run => break end,
+            }
+        };
+        while let Ok(admitted) = receiver.try_recv() {
+            items.push(admitted.item);
+        }
+        let steer = steer.expect("the turn was accepted");
+        let answer = tokio::time::timeout(Duration::from_secs(1), steer).await;
+        (checked(end), format!("{answer:?}"), items)
+    });
+    let ack = points.join("wire.prompt.after_write.2.ack").exists();
+    fs::write(points.join("wire.prompt.after_write.2.release"), b"").unwrap();
+    release(&rig.sync(), "held");
+    assert!(ack, "the steer's write was held before Wire answered it");
+    assert!(end.outcome.is_ok(), "{end:?}");
+    assert!(
+        observations(&items).iter().any(|observation| matches!(
+            observation,
+            Observation::SteerDelivered { token, .. } if *token == SteerToken::new(1)
+        )),
+        "the report was emitted"
+    );
+    assert_eq!(answer, "Ok(Ok(Injected))");
+}
+
+/// Critical r5 #1 (C2 `SteerError::NotRecorded`): as above, Route takes the
+/// delivery report before Wire answers the steer's write, but the full
+/// observation channel never takes the report (the stall bound lowered to
+/// 250 ms in a child) and the turn fails `overflow`. The acknowledgement
+/// still decides: `NotRecorded` with its delivery, not `NotDelivered`.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn an_acknowledgement_before_the_writes_answer_whose_report_is_lost_is_not_recorded() {
+    if rerun_with_short_stall(
+        "an_acknowledgement_before_the_writes_answer_whose_report_is_lost_is_not_recorded",
+    ) {
+        return;
+    }
+    let steps = [
+        vec![accepted(1)],
+        staged_flood(1, OBSERVATION_ITEMS - 1),
+        vec![
+            json!({"action":"expect_request","expected":{"type":"steer","id":3}}),
+            emit(&json!({"type":"steer_delivered","id":3,"vendor_turn_id":vendor_turn(1)})),
+            gate("held"),
+            terminal(1, "completed", "end_turn"),
+        ],
+    ]
+    .concat();
+    let rig = Rig::new(
+        &json!({"capabilities": native_capabilities()}),
+        &[script(1, &steps)],
+    );
+    let (driver, receiver) = rig.session();
+    let points = rig.points();
+    let held = json!({"token":POINTS_TOKEN,"occurrence":2,"action":"pause"});
+    fs::write(
+        points.join("wire.prompt.after_write.json"),
+        held.to_string(),
+    )
+    .unwrap();
+    let (cx, _controls) = turn_cx(1, driver.prepare(), WALL);
+    let sync = rig.sync();
+    let answer = rig.runtime.block_on(async {
+        let run = driver.run_turn(prompt(), cx);
+        let side = async {
+            release_flood(&sync, &receiver, OBSERVATION_ITEMS / 2).await;
+            let steer = driver.steer(SteerInput {
+                turn: TurnNumber::try_from(1).unwrap(),
+                text: "also".to_owned(),
+                expected_vendor_turn: None,
+                token: SteerToken::new(1),
+            });
+            let answer = tokio::time::timeout(FIXTURE_WAIT, steer).await;
+            fs::write(points.join("wire.prompt.after_write.2.release"), b"").unwrap();
+            release(&sync, "held");
+            format!("{answer:?}")
+        };
+        tokio::join!(run, side).1
+    });
+    assert!(points.join("wire.prompt.after_write.2.ack").exists());
+    assert_eq!(answer, "Ok(Err(NotRecorded { delivery: Injected }))");
+}
+
 /// Critical r3 #1 (C2 `SteerError`): on the per-turn profile, a turn
 /// whose future is dropped after the helper read its steer, with no
 /// report, answers the steer at once: Route started writing it, so

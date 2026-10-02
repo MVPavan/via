@@ -679,9 +679,11 @@ impl SessionDriver {
     /// delivery the vendor took whose observation the turn could not put
     /// there (a full queue, or the turn's end first, a forced stop
     /// included) is `NotRecorded`. The turn's end, by any path, always
-    /// answers (critical r3 #1): before Route's answer, an input Route
-    /// never took is `NoActiveTurn` and one it started writing
-    /// `NotDelivered`, since the vendor may have it.
+    /// answers (critical r3 #1): before Route's answer, an input the
+    /// vendor acknowledged is decided by its report's emission, as above
+    /// (critical r5 #1); otherwise one Route never took is `NoActiveTurn`
+    /// and one it started writing `NotDelivered`, since the vendor may
+    /// have it.
     pub async fn steer(&self, input: SteerInput) -> Result<SteerDelivery, SteerError> {
         let delivery = match self
             .adapter
@@ -735,6 +737,10 @@ impl SessionDriver {
         };
         match replied {
             Some(Ok(())) => {}
+            // Critical r5 #1: the vendor's acknowledgement decides first,
+            // whatever became of the write's answer: its report's emission
+            // tells success from `NotRecorded`.
+            _ if answer.acknowledged() => {}
             Some(Err(refused)) => return Err(steer_error(refused)),
             // The turn ended unanswered: an input Route started writing
             // may have reached the vendor; one it never took did not.
