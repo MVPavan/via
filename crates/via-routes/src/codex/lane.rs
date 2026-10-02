@@ -98,6 +98,10 @@ pub struct LeaseSignal {
     enqueued: AtomicU64,
     /// The driver's handler: synchronous, idempotent, never blocking.
     on_abnormal: Box<dyn Fn(AbnormalEnd) + Send + Sync>,
+    /// The driver's handler of a lane overflow, called at once by the
+    /// connection task as it drops a message (x.3.2 X3 fix r2 #1): the
+    /// same contract.
+    on_overflow: Option<Box<dyn Fn(AbnormalEnd) + Send + Sync>>,
 }
 
 impl LeaseSignal {
@@ -106,7 +110,20 @@ impl LeaseSignal {
         Self {
             enqueued: AtomicU64::new(0),
             on_abnormal: Box::new(on_abnormal),
+            on_overflow: None,
         }
+    }
+
+    /// The signal calling `on_overflow` too, whenever a lane of the lease
+    /// drops a message after it overflowed (synchronous, idempotent,
+    /// never blocking).
+    #[must_use]
+    pub fn on_overflow(
+        mut self,
+        on_overflow: impl Fn(AbnormalEnd) + Send + Sync + 'static,
+    ) -> Self {
+        self.on_overflow = Some(Box::new(on_overflow));
+        self
     }
 
     /// The last decode sequence queued into this lease's lanes.
@@ -122,6 +139,14 @@ impl LeaseSignal {
         (self.on_abnormal)(AbnormalEnd {
             first_unqueued: self.enqueued().saturating_add(1),
         });
+    }
+
+    pub(super) fn overflowed(&self) {
+        if let Some(on_overflow) = &self.on_overflow {
+            on_overflow(AbnormalEnd {
+                first_unqueued: self.enqueued().saturating_add(1),
+            });
+        }
     }
 }
 
@@ -208,6 +233,9 @@ pub struct Lane {
     queue: Mutex<Queue>,
     ready: Notify,
     fence: Mutex<Fence>,
+    /// Set, for good, when the lane overflowed: observable at once,
+    /// whether or not anything takes the lane (x.3.2 X3 fix r2 #1).
+    overflow: watch::Sender<bool>,
 }
 
 impl Lane {
@@ -243,6 +271,7 @@ impl Lane {
             queue.end = Some(LaneEnd::Overflow);
             queue.dropped = queue.dropped.saturating_add(1);
             drop(queue);
+            self.overflow.send_replace(true);
             self.ready.notify_one();
             return false;
         }
@@ -270,6 +299,19 @@ impl Lane {
         }
         drop(queue);
         self.ready.notify_one();
+    }
+
+    /// Whether the lane overflowed, however much of it was taken since.
+    pub fn overflowed_now(&self) -> bool {
+        *self.overflow.borrow()
+    }
+
+    /// Resolves once the lane overflowed (at once if it had).
+    pub async fn overflowed(&self) {
+        let mut overflow = self.overflow.subscribe();
+        if overflow.wait_for(|overflowed| *overflowed).await.is_err() {
+            std::future::pending::<()>().await;
+        }
     }
 
     /// Whether the lane has ended (messages may still be queued).

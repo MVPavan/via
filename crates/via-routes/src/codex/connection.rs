@@ -1031,12 +1031,18 @@ impl Connection {
     }
 }
 
-/// Pushes `item` into `lane`, advancing its lease's sequence when taken.
+/// Pushes `item` into `lane`, advancing its lease's sequence when taken;
+/// one an overflowed lane dropped reaches the lease's driver at once
+/// (x.3.2 X3 fix r2 #1).
 fn push(lane: &Lane, signal: Option<&Arc<LeaseSignal>>, item: LaneItem, bytes: usize, seq: u64) {
-    if lane.push(item, bytes)
-        && let Some(signal) = signal
-    {
+    let taken = lane.push(item, bytes);
+    let Some(signal) = signal else {
+        return;
+    };
+    if taken {
         signal.queued(seq);
+    } else if lane.overflowed_now() {
+        signal.overflowed();
     }
 }
 

@@ -114,6 +114,11 @@ pub(crate) struct Knobs {
     pub(crate) stop_before: bool,
     /// The daemon force is already set when the turn starts (x.3.2 Q5).
     pub(crate) force_before: bool,
+    /// The `run_turn` future of the turn at this index is dropped as Core
+    /// takes its acceptance (x.3.2 X3 fix r2 #7): the turn is abandoned,
+    /// with no end of its own. Its outcome is what was observed, its
+    /// error, terminal and cleanup null.
+    pub(crate) abandon_on_accept: Option<usize>,
 }
 
 /// What a running turn has shown so far, for its side actions.
@@ -570,12 +575,7 @@ impl<'a> Run<'a> {
         let spec = self.turn_spec(turn)?;
         let number = self.commit(session, &spec.prompt).await?;
         self.dispatch(index, turn).await?;
-        let wall = turn["deadlines"]["wall_ms"]
-            .as_u64()
-            .map_or(WALL, Duration::from_millis);
-        let tool_grace = turn["tool_grace_ms"]
-            .as_u64()
-            .map_or(TOOL_GRACE, Duration::from_millis);
+        let (wall, tool_grace) = bounds(turn);
         let now = tokio::time::Instant::now();
         let ((stop, stop_rx), (force, force_rx)) = self.ordered_before(now);
         let prepared = session.driver.prepare();
@@ -617,10 +617,15 @@ impl<'a> Run<'a> {
                             if released.is_some() && !self.knobs.stall_consumer => {
                             tools.borrow_mut().track(&admitted.item);
                             self.observe(&admitted.item.observation, seen, &observed);
+                            if self.knobs.abandon_on_accept == Some(index)
+                                && matches!(admitted.item.observation, Observation::Accepted(_))
+                            {
+                                break None;
+                            }
                         }
                         end = &mut running => {
                             settled.set(Some(tokio::time::Instant::now()));
-                            break end;
+                            break Some(end);
                         }
                     }
                 }
@@ -646,9 +651,11 @@ impl<'a> Run<'a> {
         let forcing = self.timed(&force, &stop, ended.clone());
         let (end, (steer, gates), ()) = tokio::join!(drain, side, forcing);
         *session.receiver.borrow_mut() = Some(receiver);
-        let end = end?;
         let fence = (activity.decoded(), activity.delivered());
         self.pure.fences.borrow_mut().insert(index, fence);
+        let Some(end) = end? else {
+            return Ok(abandoned(&observed.borrow(), session, steer, gates?));
+        };
         let mut outcome = Self::outcome(&end, session, &observed.borrow());
         outcome.group_absent = self.group_absent(&session.id, number).await?;
         outcome.steer = steer;
@@ -1213,6 +1220,32 @@ impl<'a> Run<'a> {
         }
         Ok(())
     }
+}
+
+/// A turn's wall and tool grace: its own, else the defaults.
+fn bounds(turn: &Value) -> (Duration, Duration) {
+    let wall = turn["deadlines"]["wall_ms"]
+        .as_u64()
+        .map_or(WALL, Duration::from_millis);
+    let tool_grace = turn["tool_grace_ms"]
+        .as_u64()
+        .map_or(TOOL_GRACE, Duration::from_millis);
+    (wall, tool_grace)
+}
+
+/// An abandoned turn's outcome ([`Knobs::abandon_on_accept`]): what was
+/// observed, with no end of its own (its cleanup null).
+fn abandoned(
+    observed: &[Value],
+    session: &Session,
+    steer: Vec<String>,
+    gates: Vec<TurnOutcome>,
+) -> TurnOutcome {
+    let mut outcome = snapshot(observed, &session.plan);
+    outcome.cleanup = None;
+    outcome.steer = steer;
+    outcome.gates = gates;
+    outcome
 }
 
 /// When a turn's reported tools last all ended, from the observations'

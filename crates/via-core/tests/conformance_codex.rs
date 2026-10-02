@@ -2170,10 +2170,10 @@ fn codex_stale_fence_counts_nothing() {
     .unwrap();
 }
 
-/// Arms `codex.connection.message` to fail the connection task when it
-/// takes its `occurrence`th admitted message (x.3.2 X0 item 13.2's seam).
+/// Arms failpoint `point` with `command` (its `occurrence` and `action`)
+/// for this test process; the folder lives as long as the returned guard.
 #[cfg(feature = "test-failpoints")]
-fn connection_task_fails_at(occurrence: usize) -> Result<tempfile::TempDir, String> {
+fn armed(point: &str, command: Value) -> Result<tempfile::TempDir, String> {
     use std::os::unix::fs::DirBuilderExt;
     let points = tempfile::tempdir().map_err(|e| e.to_string())?;
     let dir = points.path().join("points");
@@ -2181,14 +2181,23 @@ fn connection_task_fails_at(occurrence: usize) -> Result<tempfile::TempDir, Stri
         .mode(0o700)
         .create(&dir)
         .map_err(|e| e.to_string())?;
-    let token = "x3-connection-task";
-    std::fs::write(
-        dir.join("codex.connection.message.json"),
-        json!({"token": token, "occurrence": occurrence, "action": "fail_io"}).to_string(),
-    )
-    .map_err(|e| e.to_string())?;
+    let token = "x3-armed-failpoint";
+    let mut command = command;
+    command["token"] = json!(token);
+    std::fs::write(dir.join(format!("{point}.json")), command.to_string())
+        .map_err(|e| e.to_string())?;
     via_store::failpoint::activate(&dir, token)?;
     Ok(points)
+}
+
+/// Arms `codex.connection.message` to fail the connection task when it
+/// takes its `occurrence`th admitted message (x.3.2 X0 item 13.2's seam).
+#[cfg(feature = "test-failpoints")]
+fn connection_task_fails_at(occurrence: usize) -> Result<tempfile::TempDir, String> {
+    armed(
+        "codex.connection.message",
+        json!({"occurrence": occurrence, "action": "fail_io"}),
+    )
 }
 
 /// How many messages the server wrote up to and including step `at`.
@@ -2341,4 +2350,174 @@ fn codex_interrupt_settles_at_terminal() {
         .push(json!({"kind": "progress", "tools_ended": [exec]}));
     expect["sessions"]["main"]["close"]["cleanup"] = json!("quiescent");
     variant(name, &replay, &expect).unwrap();
+}
+
+/// `count` thread-level status changes of the session's thread.
+fn status_burst(count: usize) -> Vec<Value> {
+    let status = json!({"method": "thread/status/changed",
+        "params": {"threadId": THREAD, "status": {"type": "active", "activeFlags": []}}});
+    vec![emit(&status); count]
+}
+
+/// x.3.2 X3 fix r2 #1: a lane that overflows while its driver is idle
+/// (its turn settled; no normalizer takes the lane) reaches the driver's
+/// health at once: it latches `overflow`, so Core retires the driver.
+/// The burst comes once a second session's `thread/resume` shows the
+/// first turn settled; that resume is refused (`session_gone`) after the
+/// burst, so the case reads the health only after the burst was routed.
+#[test]
+fn codex_idle_overflow_latches_health() {
+    let name = "codex_idle_overflow_latches_health";
+    let (mut replay, mut expect) = plain(name).unwrap();
+    let missing = replay_of("c5_resume_missing").unwrap();
+    let missing_expect = expect_of("c5_resume_missing").unwrap();
+    let reopen = step_with(&missing, "\"method\":\"thread/resume\"").unwrap();
+    let completed = step_with(&replay, "\"method\":\"turn/completed\"").unwrap();
+    let mut inserted = vec![missing["steps"][reopen].clone()];
+    inserted.extend(status_burst(20));
+    inserted.push(missing["steps"][reopen + 1].clone());
+    for (offset, step) in inserted.into_iter().enumerate() {
+        steps(&mut replay)
+            .unwrap()
+            .insert(completed + 1 + offset, step);
+    }
+    let mut probe = missing_expect["turns"][0].clone();
+    probe["session"] = json!("probe");
+    expect["turns"].as_array_mut().unwrap().push(probe);
+    expect["sessions"]["probe"] = missing_expect["sessions"]["main"].clone();
+    expect["sessions"]["main"]["close"] = Value::Null;
+    expect["sessions"]["main"]["health"] = json!({"state": "failed", "first_cause": "overflow"});
+    expect["launch_checkpoints"] =
+        json!({"after_pure": 0, "after_open": {"main": 0, "probe": 0}, "after_turn": [1, 1]});
+    variant(name, &replay, &expect).unwrap();
+}
+
+/// x.3.2 X3 fix r2 #1 and #2, through the driver: once the acceptance
+/// was delivered (a gate), the turn's normalizer is held as it delivers a
+/// delta while twenty thread messages arrive, so the lane overflows. The
+/// turn ends `overflow` at once, not after the normalizer: what was
+/// dropped proves nothing, so its cleanup is uncertain and the
+/// generation's cleanup interrupt is written (the fake expects it), and
+/// the driver's health latches `overflow`.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn codex_overflow_interrupts_and_is_uncertain() {
+    let name = "codex_overflow_interrupts_and_is_uncertain";
+    // The identity's send, the acceptance's, then the delta's.
+    let _points = armed(
+        "adapter.observation.admitted",
+        json!({"occurrence": 3, "action": "delay", "value": 3000}),
+    )
+    .unwrap();
+    let (mut replay, mut expect) = plain(name).unwrap();
+    let started = step_with(&replay, "\"method\":\"turn/started\"").unwrap();
+    let delta = step_with(&replay, "\"method\":\"item/agentMessage/delta\"").unwrap();
+    let mut tail = vec![
+        json!({"await_signal": {"signal": "SIGUSR1"}}),
+        replay["steps"][delta].clone(),
+    ];
+    tail.extend(status_burst(20));
+    tail.push(json!({"expect": {
+        "line": {"method": "turn/interrupt", "params": {"threadId": THREAD, "turnId": TURN}},
+        "within_ms": 2000,
+    }}));
+    tail.push(json!({"await_eof": {}}));
+    cut_after(&mut replay, started, &tail).unwrap();
+    failed_after_acceptance(&mut expect, "overflow", "uncertain");
+    // Steps count from 1: the gate is the step after `turn/started`.
+    turn_mut(&mut expect, 0)["gates"] = json!([{"step": started + 2,
+        "expect": {"accepted": true, "terminal": null, "error": null}}]);
+    expect["sessions"]["main"]["close"] = Value::Null;
+    expect["sessions"]["main"]["health"] = json!({"state": "failed", "first_cause": "overflow"});
+    variant(name, &replay, &expect).unwrap();
+}
+
+/// X0, x.3.2 X3 fix r2 #4: before acceptance, a cancel is serviceable
+/// while delivery is blocked. The identity's send is held in the sink;
+/// the cancel ends the turn `stopped` at once, long before its force.
+/// Nothing of the turn was started: only its thread was opened, which
+/// the close unsubscribes.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn codex_stop_while_identity_blocked() {
+    let name = "codex_stop_while_identity_blocked";
+    let _points = armed(
+        "adapter.observation.admitted",
+        json!({"occurrence": 1, "action": "pause"}),
+    )
+    .unwrap();
+    let (mut replay, mut expect) = plain(name).unwrap();
+    let start = step_with(&replay, "\"method\":\"turn/start\"").unwrap();
+    let close = step_with(&replay, "\"method\":\"thread/unsubscribe\"").unwrap();
+    steps(&mut replay).unwrap().drain(start..close);
+    unaccepted(&mut expect, "stopped", tested());
+    let turn = &mut turn_mut(&mut expect, 0)["expect"];
+    // A stop is no error (C2 §2: `Stopped` reports none).
+    turn["error"] = Value::Null;
+    turn["cleanup"] = json!("quiescent");
+    turn["warnings"] = json!(["config_switch_unverified"]);
+    let knobs = conformance_run::Knobs {
+        stop_after: Some(std::time::Duration::from_millis(300)),
+        ..conformance_run::Knobs::default()
+    };
+    check_variant(name, &replay, &expect, knobs).unwrap();
+}
+
+/// x.3.2 X3 fix r2 #7, through the adapter: a keeper session holds the
+/// shared server (its turn was refused for its effort after it joined).
+/// Core drops session A's `run_turn` as it takes A's acceptance. The
+/// abandoned turn detaches its generation at once (its unsubscribe is
+/// written; the fake expects it), so session B can resume the same thread
+/// on the shared server and run its turn; A's health latches
+/// `turn_abandoned`.
+#[test]
+fn codex_abandoned_turn_detaches() {
+    let name = "codex_abandoned_turn_detaches";
+    let (mut replay, mut expect) = plain(name).unwrap();
+    let resumed = replay_of("c5_resume").unwrap();
+    let resumed_expect = expect_of("c5_resume").unwrap();
+    let refused_expect = expect_of("c7_effort_catalog").unwrap();
+    let started = step_with(&replay, "\"method\":\"turn/started\"").unwrap();
+    let reopen = step_with(&resumed, "\"method\":\"thread/resume\"").unwrap();
+    let mut tail = vec![
+        json!({"expect": {
+            "line": {"method": "thread/unsubscribe", "params": {"threadId": THREAD}},
+            "capture": {"gone": "/id"},
+        }}),
+        json!({"emit": {"line": "{\"id\":${gone},\"result\":{\"status\":\"unsubscribed\"}}"}}),
+    ];
+    tail.extend(
+        resumed["steps"].as_array().unwrap()[reopen..]
+            .iter()
+            .cloned(),
+    );
+    cut_after(&mut replay, started, &tail).unwrap();
+    let turn = &mut turn_mut(&mut expect, 0)["expect"];
+    turn["terminal"] = Value::Null;
+    turn["usage"] = Value::Null;
+    turn["final_text"] = Value::Null;
+    turn["cleanup"] = Value::Null;
+    turn["instance"] = Value::Null;
+    turn["observations_include"] = json!([{"kind": "turn.accepted", "vendor_turn_id": TURN}]);
+    turn["observations_exclude"] = json!(["final_text"]);
+    turn["observations_order"] = json!(["session.vendor_identity_confirmed", "turn.accepted"]);
+    let mut keeper = refused_expect["turns"][0].clone();
+    keeper["session"] = json!("keeper");
+    let mut second = resumed_expect["turns"][0].clone();
+    second["session"] = json!("second");
+    let main = expect["turns"][0].clone();
+    expect["turns"] = json!([keeper, main, second]);
+    expect["sessions"]["keeper"] = refused_expect["sessions"]["main"].clone();
+    expect["sessions"]["keeper"]["close"] = Value::Null;
+    expect["sessions"]["second"] = resumed_expect["sessions"]["main"].clone();
+    expect["sessions"]["main"]["close"] = Value::Null;
+    expect["sessions"]["main"]["health"] =
+        json!({"state": "failed", "first_cause": "turn_abandoned"});
+    expect["launch_checkpoints"] = json!({"after_pure": 0,
+        "after_open": {"keeper": 0, "main": 0, "second": 0}, "after_turn": [1, 1, 1]});
+    let knobs = conformance_run::Knobs {
+        abandon_on_accept: Some(1),
+        ..conformance_run::Knobs::default()
+    };
+    check_variant(name, &replay, &expect, knobs).unwrap();
 }

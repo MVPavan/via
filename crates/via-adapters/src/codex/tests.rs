@@ -1159,3 +1159,59 @@ fn abnormal_handler_latches_and_records_loss() {
     assert!(bare.lock().unwrap().record.is_none());
     assert!(matches!(*idle.borrow(), DriverHealth::Failed { .. }));
 }
+
+/// x.3.2 X3 fix r2 #1: a generation's lane-overflow handler, called by
+/// the connection task as the overflowed lane drops a message, latches
+/// the driver's failure at once (`overflow`, naming the session's latest
+/// turn), whether or not a turn runs, and records the loss, `omitted`
+/// unknown; a later drop merges into it.
+#[test]
+fn overflow_handler_latches_at_once() {
+    use std::sync::{Arc, Mutex};
+
+    use via_routes::codex::AbnormalEnd;
+
+    use super::delivery::{Losses, ObservationLoss, UNKNOWN};
+    use super::driver::overflow_handler;
+    use crate::{DriverFailure, DriverHealth, RouteError, TurnNumber};
+
+    let turn = TurnNumber::try_from(3).unwrap();
+    let losses = Arc::new(Mutex::new(Losses {
+        record: None,
+        latest: Some(turn),
+    }));
+    let health = Arc::new(tokio::sync::watch::Sender::new(DriverHealth::Open));
+    let handler = overflow_handler(Arc::clone(&losses), Arc::clone(&health), 5);
+    handler(AbnormalEnd { first_unqueued: 17 });
+    handler(AbnormalEnd { first_unqueued: 17 });
+    assert_eq!(
+        *health.borrow(),
+        DriverHealth::Failed {
+            first_cause: DriverFailure::Route(RouteError::Overflow { turn })
+        }
+    );
+    assert_eq!(
+        losses.lock().unwrap().record,
+        Some(ObservationLoss {
+            trigger: turn,
+            generation: 5,
+            first_unqueued: 17,
+            omitted: UNKNOWN,
+        })
+    );
+}
+
+/// X0 §13.2 (x.3.2 X3 fix r2 #5): when a turn's wait resumes with the
+/// daemon force and the delivery's decision both ready, the force wins,
+/// so a retained terminal never replaces its disposition; the decision
+/// wins over the lane's overflow.
+#[test]
+fn force_wins_over_a_ready_decision() {
+    use super::driver::{Cut, ready_cut};
+
+    assert_eq!(ready_cut(true, true, true), Some(Cut::Forced));
+    assert_eq!(ready_cut(true, true, false), Some(Cut::Forced));
+    assert_eq!(ready_cut(false, true, true), Some(Cut::Decided));
+    assert_eq!(ready_cut(false, false, true), Some(Cut::Overflow));
+    assert_eq!(ready_cut(false, false, false), None);
+}

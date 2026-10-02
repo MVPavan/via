@@ -208,12 +208,19 @@ impl CodexSession {
             state.generation
         };
         let registered = Arc::new(AtomicBool::new(false));
-        let signal = Arc::new(LeaseSignal::new(abnormal_handler(
-            Arc::clone(&self.losses),
-            Arc::clone(&driver.health),
-            Arc::clone(&registered),
-            generation,
-        )));
+        let signal = Arc::new(
+            LeaseSignal::new(abnormal_handler(
+                Arc::clone(&self.losses),
+                Arc::clone(&driver.health),
+                Arc::clone(&registered),
+                generation,
+            ))
+            .on_overflow(overflow_handler(
+                Arc::clone(&self.losses),
+                Arc::clone(&driver.health),
+                generation,
+            )),
+        );
         let subscription = connection.subscribe(Arc::clone(&signal));
         let folders = Folders::default();
         let replaced = attached.replace(Attached {
@@ -244,6 +251,24 @@ impl CodexSession {
             attached.thread = Some(Arc::clone(thread));
             attached.registered.store(true, Ordering::Release);
         }
+    }
+
+    /// A turn abandoned on the session's generation (its `run_turn` was
+    /// dropped; x.3.2 X3 fix r2 #7): the generation detaches at once, its
+    /// unsubscribe intent posted and its registration and lease released,
+    /// so the thread can register again; the next turn opens it as a new
+    /// generation.
+    fn abandon(&self) {
+        let Some(attached) = self.attached().take() else {
+            return;
+        };
+        if let Some(thread) = &attached.thread
+            && usable(&attached.connection)
+        {
+            let by = Deadline::at(Instant::now() + CLEANUP_ALLOWANCE);
+            let _unanswered = attached.connection.unsubscribe(&thread.lease, by);
+        }
+        drop(attached);
     }
 
     /// The generation is unfit for the next turn: its registration closes
@@ -280,6 +305,31 @@ pub(super) fn abnormal_handler(
     }
 }
 
+/// The lane-overflow handler of one generation (x.3.2 X3 fix r2 #1):
+/// the connection task calls it as the generation's overflowed lane drops
+/// a message, whether or not a turn runs. It records the loss and latches
+/// the driver's failure at once, so Core retires the driver without
+/// waiting on any normalizer. Synchronous, idempotent, never blocking.
+pub(super) fn overflow_handler(
+    losses: Arc<Mutex<Losses>>,
+    health: Arc<watch::Sender<DriverHealth>>,
+    generation: u64,
+) -> impl Fn(AbnormalEnd) + Send + Sync + 'static {
+    move |end: AbnormalEnd| {
+        let latest = {
+            let mut losses = lock_losses(&losses);
+            losses.note(generation, end.first_unqueued, UNKNOWN);
+            losses.latest
+        };
+        latch(
+            &health,
+            latest.map_or(DriverFailure::ObservationOverflow, |turn| {
+                DriverFailure::Route(RouteError::Overflow { turn })
+            }),
+        );
+    }
+}
+
 /// Whether a connection still takes requests.
 fn usable(connection: &Connection) -> bool {
     connection.failure().is_none() && connection.ended().is_none()
@@ -293,6 +343,7 @@ fn usable(connection: &Connection) -> bool {
 /// future) its cleanup is uncertain once anything was written, and the
 /// abandonment is latched.
 struct Settle<'a> {
+    session: &'a CodexSession,
     state: &'a Mutex<DriverState>,
     health: &'a watch::Sender<DriverHealth>,
     turn: TurnNumber,
@@ -306,8 +357,13 @@ struct Settle<'a> {
 }
 
 impl<'a> Settle<'a> {
-    fn new(driver: &'a SessionDriver, turn: TurnNumber, done: watch::Sender<Retiring>) -> Self {
+    fn new(
+        (driver, session): (&'a SessionDriver, &'a CodexSession),
+        turn: TurnNumber,
+        done: watch::Sender<Retiring>,
+    ) -> Self {
         Self {
+            session,
             state: &driver.state,
             health: &driver.health,
             turn,
@@ -367,6 +423,7 @@ impl Drop for Settle<'_> {
             .take();
         let facts = ended.unwrap_or_else(|| {
             latch(self.health, DriverFailure::TurnAbandoned);
+            self.session.abandon();
             let launched = self.launched.load(Ordering::Acquire);
             Retirement {
                 launched,
@@ -428,7 +485,7 @@ struct Ending {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum EndCause {
+pub(super) enum EndCause {
     Stopped,
     Wall,
 }
@@ -565,10 +622,16 @@ impl Turn<'_> {
     }
 
     /// Sends one observation of the turn before its acceptance, beside
-    /// the daemon force (X0: controls stay serviceable while delivery is
-    /// blocked); an undelivered one latches the observation overflow. A
-    /// send the force cut never reaches the sink.
-    async fn emit(&self, observation: Observation, force: &mut ForceWatch) -> Result<(), Emit> {
+    /// the daemon force and the turn's own orders (X0: controls stay
+    /// serviceable while delivery is blocked; x.3.2 X3 fix r2 #4): while
+    /// the sink has no room, a cancel, a close or the wall ends the turn at
+    /// once, as nothing of it was started. An undelivered one latches the observation overflow.
+    /// A send cut by either never reaches the sink.
+    async fn emit(
+        &self,
+        observation: Observation,
+        (orders, force): (&mut Orders, &mut ForceWatch),
+    ) -> Result<(), Emit> {
         let item = ObservationItem {
             at: Instant::now(),
             vendor_turn: None,
@@ -577,10 +640,12 @@ impl Turn<'_> {
         tokio::select! {
             biased;
             () = forced(force) => Err(Emit::Forced),
+            // A sink with room takes it at once, an order or not.
             sent = self.driver.observations.send(item, event_stall()) => sent.map_err(|_| {
                 self.driver.fail(DriverFailure::ObservationOverflow);
                 Emit::Undelivered
             }),
+            ending = orders.ordered() => Err(Emit::Ended(ending.cause)),
         }
     }
 }
@@ -590,6 +655,8 @@ impl Turn<'_> {
 enum Emit {
     Undelivered,
     Forced,
+    /// The turn's own order: a stop, a close or the wall.
+    Ended(EndCause),
 }
 
 /// The failure a route cause latches in the health lane (C2 §2).
@@ -708,7 +775,7 @@ pub(crate) async fn run_turn(
         });
     };
     lock_losses(&session.losses).latest = Some(cx.turn);
-    let settle = Settle::new(driver, cx.turn, done);
+    let settle = Settle::new((driver, session), cx.turn, done);
     let end = turn(driver, session, (spec, sandbox), cx, close_rx, &settle).await;
     settle.record(&end);
     end
@@ -1127,7 +1194,7 @@ async fn open_thread(
             None,
         )));
     };
-    confirm(facts, (&opened, mode), resume, &lease, force).await?;
+    confirm(facts, (&opened, mode), resume, &lease, (orders, force)).await?;
     let thread = Arc::new(Thread {
         id: opened.thread.id.clone(),
         lease,
@@ -1144,7 +1211,7 @@ async fn open_thread(
             .and_then(|instance| instance.vendor_version.clone()),
     };
     match facts
-        .emit(Observation::IdentityConfirmed(identity), force)
+        .emit(Observation::IdentityConfirmed(identity), (orders, force))
         .await
     {
         Ok(()) => Ok(thread),
@@ -1154,6 +1221,13 @@ async fn open_thread(
             None,
             None,
         ))),
+        // Nothing of the turn was started: only its thread was opened.
+        Err(Emit::Ended(EndCause::Stopped)) => {
+            Err(Box::new(facts.failed(RouteError::Stopped { turn }, None)))
+        }
+        Err(Emit::Ended(EndCause::Wall)) => {
+            Err(Box::new(facts.failed(RouteError::Deadline { turn }, None)))
+        }
     }
 }
 
@@ -1164,7 +1238,7 @@ async fn confirm(
     (opened, mode): (&ThreadResult, SandboxMode),
     resume: Option<String>,
     lease: &LaneLease,
-    force: &mut ForceWatch,
+    controls: (&mut Orders, &mut ForceWatch),
 ) -> Result<(), Box<TurnEnd>> {
     let driver = facts.driver;
     let turn = facts.number;
@@ -1193,7 +1267,7 @@ async fn confirm(
             requested,
             returned: returned.clone(),
         };
-        let _undelivered = facts.emit(mismatch, force).await;
+        let _undelivered = facts.emit(mismatch, controls).await;
         return Err(Box::new(TurnEnd {
             terminal: None,
             instance: facts.instance.clone(),
@@ -1517,7 +1591,7 @@ struct Accepted<'a> {
 
 /// What ended an accepted turn's wait.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Cut {
+pub(super) enum Cut {
     /// The daemon force.
     Forced,
     /// The delivery decided: the terminal, or why it stopped.
@@ -1527,6 +1601,25 @@ enum Cut {
     /// The connection failed and its evidence did not reach the turn in
     /// time (X0 items 13.1, 13.2).
     LossDeadline,
+    /// The thread's lane overflowed (x.3.2 X3 fix r2 #1): the turn ends
+    /// at once, whatever the normalizer is doing.
+    Overflow,
+}
+
+/// The cutoff a turn's wait finds already reached as it resumes: the
+/// daemon force before the delivery's decision (X0 §13.2: the force's
+/// disposition stands even with a retained terminal; x.3.2 X3 fix r2 #5),
+/// the decision before the lane's overflow.
+pub(super) fn ready_cut(forced: bool, decided: bool, overflowed: bool) -> Option<Cut> {
+    if forced {
+        Some(Cut::Forced)
+    } else if decided {
+        Some(Cut::Decided)
+    } else if overflowed {
+        Some(Cut::Overflow)
+    } else {
+        None
+    }
 }
 
 /// Waits for the turn's delivery to decide, beside its orders: never
@@ -1539,17 +1632,24 @@ async fn wait(
 ) -> Cut {
     let failing = start.connection.failing();
     tokio::pin!(failing);
+    let lane = start.thread.lease.lane();
     let mut ending: Option<Ending> = None;
     let mut loss_at: Option<Instant> = None;
     loop {
-        if accepted.delivery.decided() {
-            return Cut::Decided;
+        let ready = ready_cut(
+            force.borrow().is_some(),
+            accepted.delivery.decided(),
+            lane.overflowed_now(),
+        );
+        if let Some(cut) = ready {
+            return cut;
         }
         let end_at = ending.map(|ending| ending.by.instant());
         tokio::select! {
             biased;
             () = forced(force) => return Cut::Forced,
             () = accepted.delivery.changed() => {}
+            () = lane.overflowed() => {}
             found = orders.ordered(), if ending.is_none() => {
                 start.connection.interrupt(
                     &start.thread.lease,
@@ -1574,7 +1674,11 @@ async fn wait(
 /// nothing of the turn reaches Core after it; what the seal left
 /// undelivered at any cutoff but the terminal joins the driver's loss
 /// record. The force decides at once; otherwise a retained terminal wins
-/// (C1 §7.6 terminal first), then why delivery stopped, then the order.
+/// (C1 §7.6 terminal first), then an overflow, then why delivery
+/// stopped, then the order. An overflow (the lane's, or the normalizer's
+/// bounds or a stalled sink) proves nothing of what was dropped: the loss
+/// is recorded, the generation's cleanup interrupt is posted and the
+/// cleanup is uncertain (x.3.2 X3 fix r2 #2).
 fn settle_turn(
     facts: &Turn<'_>,
     start: &Started<'_>,
@@ -1586,7 +1690,12 @@ fn settle_turn(
     let terminal_decided = cut == Cut::Decided && sealed.terminal.is_some();
     let undelivered = sealed.partial || start.thread.lease.lane().front_seq().is_some();
     let abnormal = matches!(sealed.stop, Some(Stop::Lane(LaneEnd::Abnormal)));
-    if !terminal_decided && (undelivered || abnormal || cut == Cut::LossDeadline) {
+    let overflowed = cut == Cut::Overflow
+        || matches!(
+            sealed.stop,
+            Some(Stop::Lane(LaneEnd::Overflow) | Stop::Overflow)
+        );
+    if !terminal_decided && (undelivered || abnormal || overflowed || cut == Cut::LossDeadline) {
         lock_losses(&facts.session.losses).note(start.generation, sealed.position, UNKNOWN);
     }
     let reported = Some(if sealed.tools_open {
@@ -1602,6 +1711,20 @@ fn settle_turn(
         return terminal_end(facts, retained, sealed.tools_open);
     }
     match (cut, sealed.stop) {
+        (Cut::Overflow, _) | (_, Some(Stop::Lane(LaneEnd::Overflow) | Stop::Overflow)) => {
+            let by = Deadline::at(Instant::now() + CLEANUP_ALLOWANCE);
+            start.connection.cleanup_interrupt(
+                &start.thread.lease,
+                accepted.start,
+                Some(&accepted.id),
+                by,
+            );
+            facts.failure(
+                RouteError::Overflow { turn },
+                None,
+                Some(WireCleanup::Uncertain),
+            )
+        }
         (_, Some(Stop::Lane(end))) => {
             let (cause, loss) = lane_end(end, start.connection, turn);
             facts.failure(cause, loss, reported)
@@ -1613,7 +1736,6 @@ fn settle_turn(
             }
             end
         }
-        (_, Some(Stop::Overflow)) => facts.failure(RouteError::Overflow { turn }, None, reported),
         (Cut::Order(EndCause::Wall), None) => uncertain(RouteError::Deadline { turn }),
         (Cut::LossDeadline, None) => match connection_loss(start.connection) {
             Some(loss) => facts.failure(
