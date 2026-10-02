@@ -682,12 +682,17 @@ impl Engine {
     /// running turn is the one steered: none is `no_active_turn`, another
     /// than `expect_turn` is `turn_mismatch`, and one still submitting is
     /// waited for until its acceptance, `no_active_turn` if it ends first.
-    /// The input goes through the session's driver (C2 §2), which answers
-    /// once the vendor took it, with the token of the `steer.delivered`
-    /// observation it emitted first. The steer is answered only once that
-    /// observation committed (C1 §3.4, critical r1 #5): a failed commit, or
-    /// one the lane consumed or ended without, is `store_error`, never
-    /// success.
+    /// Core mints the input's token, unique within the session, and
+    /// registers the request's completion ticket on the session's lane
+    /// under it before the input goes to the driver (C2 §2
+    /// `SteerInput.token`, critical r2 #2). The driver answers with the
+    /// delivery once the vendor took the input and the `steer.delivered`
+    /// observation carrying that token is on the session channel; a refusal
+    /// or a delivery it could not record maps under C1 §3.4. The steer is
+    /// answered only once the lane committed that observation, which
+    /// resolves the ticket (C1 §3.4, critical r1 #5): a failed commit, or
+    /// the lane's end first, is `store_error`, never success. The ticket
+    /// retires with the request, whichever way it ends.
     pub async fn steer(&self, params: SteerParams) -> Result<Value, ApiError> {
         let (_, snapshot) = self
             .authenticate_existing(&params.session, params.handle.as_deref())
