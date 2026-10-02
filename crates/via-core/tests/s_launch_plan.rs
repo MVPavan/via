@@ -71,11 +71,24 @@ fn s_launch_plan_inherit_per_harness() {
         requested: Inherit::OD2_DEFAULT,
         effective: Inherit::OD2_DEFAULT,
     };
-    // Per harness: the plan's inherit, or the refusal. No vendor adapter
-    // plans before x.3.2: a configured vendor harness still refuses,
-    // starting nothing. Each adapter track flips its own row.
+    // Claude plans (x.3.2 C1) with its configured request, hooks and MCP
+    // servers on; neither has a verified switch to on, so both are
+    // `unknown`, as are instruction files (no inventory). Plugins, skills
+    // and agents are on by the init inventory.
+    let inherit = |states: serde_json::Value| serde_json::from_value::<Inherit>(states).unwrap();
+    let claude = InheritPlan {
+        requested: inherit(json!({"hooks":"on","mcp_servers":"on","plugins":"on",
+            "skills":"on","agents":"on","instruction_files":"on"})),
+        effective: inherit(
+            json!({"hooks":"unknown","mcp_servers":"unknown","plugins":"on",
+            "skills":"on","agents":"on","instruction_files":"unknown"}),
+        ),
+    };
+    // Per harness: the plan's inherit, or the refusal. A configured vendor
+    // harness without its adapter still refuses, starting nothing. Each
+    // adapter track flips its own row.
     let rows: [(&str, Result<InheritPlan, RefusalKind>); 3] = [
-        ("claude", Err(RefusalKind::HarnessUnavailable)),
+        ("claude", Ok(claude)),
         ("codex", Err(RefusalKind::HarnessUnavailable)),
         ("fake", Ok(od2)),
     ];

@@ -541,16 +541,23 @@ struct LaunchRow {
     models: Value,
 }
 
-/// The per-harness expectations of the merged base: no vendor adapter
-/// plans or catalogs yet, so `describe` refuses `harness_unavailable` and
-/// `models` lists nothing. Each adapter track flips its own row.
+/// The per-harness expectations: Claude plans from its bundled catalog
+/// (x.3.2 C1); a harness without its adapter refuses `describe` with
+/// `harness_unavailable` and lists no model. Each adapter track flips its
+/// own row.
 fn launch_rows() -> [LaunchRow; 3] {
     let row = |harness| LaunchRow {
         harness,
         refused: Some("harness_unavailable"),
         models: json!([]),
     };
-    [row("claude"), row("codex"), row("opencode")]
+    let bundled = |model| json!({"model":model,"harness":"claude","aliases":[],"source":"bundled"});
+    let claude = LaunchRow {
+        harness: "claude",
+        refused: None,
+        models: json!([bundled("sonnet"), bundled("opus"), bundled("haiku")]),
+    };
+    [claude, row("codex"), row("opencode")]
 }
 
 /// C2 §7 item 1, design §7 S-LAUNCH acceptance: with `harnesses.claude`

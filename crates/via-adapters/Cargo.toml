@@ -18,6 +18,8 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rustix = { workspace = true, features = ["fs"] }
+# Ruling Q4: the expected Claude session UUID (SHA-256).
+sha2 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
