@@ -193,10 +193,25 @@ pub(crate) enum Step {
 /// qualified figure.
 const STRUCTURED_MAX: usize = 4 * 1024 * 1024;
 
-/// The most item IDs each per-turn set holds. Past it the open-tool set
-/// reads as open for good (never a false quiescence), and the dedup sets
-/// stop growing (at worst a repeated or unsuppressed denial).
+/// The most item IDs each per-turn set admits (packet §5: 1024 entries).
 const TRACKED_ITEMS_MAX: usize = 1024;
+
+/// The ID bytes all the sets together admit (packet §5: 256 KiB per
+/// session). The first ID past either bound is an explicit overflow
+/// (review r2 #2): nothing continues with inaccurate correlation.
+const TRACKED_BYTES_MAX: usize = 256 * 1024;
+
+/// Why the normalizer cannot take a notification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NormalizeError {
+    /// A known notification contradicts the protocol, or counts pass
+    /// their range.
+    Protocol(&'static str),
+    /// An item ID could not be admitted to its bounded set: the driver
+    /// routes it through the health path as the per-thread ingress
+    /// overflow. The normalizer takes nothing after it.
+    Overflow,
+}
 
 /// The reason of every vendor denial (C1 Q9, as the Claude adapter words it).
 const DENIAL_REASON: &str = "denied by the vendor's permission policy";
@@ -221,20 +236,33 @@ enum CacheWrite {
     Unavailable,
 }
 
-/// A set of item IDs bounded at [`TRACKED_ITEMS_MAX`].
+/// A set of item IDs admitted by count ([`TRACKED_ITEMS_MAX`]) and by
+/// bytes, against the shared [`TRACKED_BYTES_MAX`].
 #[derive(Default)]
 struct Ids {
     ids: HashSet<String>,
-    /// An insert was refused at the bound.
-    overflowed: bool,
 }
 
 impl Ids {
-    fn insert(&mut self, id: &str) {
-        if self.ids.len() < TRACKED_ITEMS_MAX {
-            self.ids.insert(id.to_owned());
-        } else if !self.ids.contains(id) {
-            self.overflowed = true;
+    /// Admits `id`, charging its bytes to `bytes`; an ID already held is
+    /// admitted free.
+    fn admit(&mut self, id: &str, bytes: &mut usize) -> Result<(), NormalizeError> {
+        if self.ids.contains(id) {
+            return Ok(());
+        }
+        let charged = bytes.saturating_add(id.len());
+        if self.ids.len() >= TRACKED_ITEMS_MAX || charged > TRACKED_BYTES_MAX {
+            return Err(NormalizeError::Overflow);
+        }
+        self.ids.insert(id.to_owned());
+        *bytes = charged;
+        Ok(())
+    }
+
+    /// Releases `id` and its bytes.
+    fn release(&mut self, id: &str, bytes: &mut usize) {
+        if self.ids.remove(id) {
+            *bytes = bytes.saturating_sub(id.len());
         }
     }
 
@@ -262,6 +290,10 @@ pub(crate) struct TurnNormalizer {
     declined_by_via: Ids,
     /// Items already reported denied.
     denied: Ids,
+    /// The ID bytes the three sets hold.
+    id_bytes: usize,
+    /// An ID overflowed: the normalizer takes nothing more.
+    overflowed: bool,
 }
 
 impl TurnNormalizer {
@@ -275,23 +307,35 @@ impl TurnNormalizer {
             open_tools: Ids::default(),
             declined_by_via: Ids::default(),
             denied: Ids::default(),
+            id_bytes: 0,
+            overflowed: false,
         }
     }
 
     /// The step `notification` is; an error for a known notification that
-    /// contradicts the protocol, or counts past their range.
+    /// contradicts the protocol, counts past their range, or an ID past
+    /// its bounds (then for good).
     pub(crate) fn observe(
         &mut self,
         notification: &Notification,
         at: Instant,
-    ) -> Result<Step, &'static str> {
+    ) -> Result<Step, NormalizeError> {
+        if self.overflowed {
+            return Err(NormalizeError::Overflow);
+        }
+        let step = self.step(notification, at);
+        self.overflowed = matches!(step, Err(NormalizeError::Overflow));
+        step
+    }
+
+    fn step(&mut self, notification: &Notification, at: Instant) -> Result<Step, NormalizeError> {
         let progress =
             |marks: ProgressMarks| Step::Observations(vec![Observation::Progress(marks)]);
         Ok(match notification {
             Notification::ItemStarted(event) => self
-                .item_started(&event.item)
+                .item_started(&event.item)?
                 .map_or(Step::Activity, progress),
-            Notification::ItemCompleted(event) => self.item_completed(&event.item),
+            Notification::ItemCompleted(event) => self.item_completed(&event.item)?,
             Notification::AgentMessageDelta(_) | Notification::ReasoningDelta(_) => {
                 progress(ProgressMarks {
                     model: true,
@@ -303,10 +347,11 @@ impl TurnNormalizer {
                 self.cache_write = match (self.cache_write, last.cache_write_input_tokens) {
                     (CacheWrite::Unavailable, _) | (_, None) => CacheWrite::Unavailable,
                     (CacheWrite::None, Some(count)) => CacheWrite::Sum(count),
-                    (CacheWrite::Sum(sum), Some(count)) => CacheWrite::Sum(
-                        sum.checked_add(count)
-                            .ok_or("cache-write tokens past their range")?,
-                    ),
+                    (CacheWrite::Sum(sum), Some(count)) => {
+                        CacheWrite::Sum(sum.checked_add(count).ok_or(NormalizeError::Protocol(
+                            "cache-write tokens past their range",
+                        ))?)
+                    }
                 };
                 self.total = Some(event.usage.total);
                 self.window = event.usage.model_context_window.or(self.window);
@@ -335,58 +380,65 @@ impl TurnNormalizer {
     /// Records a request [`DECLINES`] answered, so the item's declined
     /// status is not reported again as a vendor denial (C2: VIA's own
     /// decline is `vendor.request_declined` only).
-    pub(crate) fn note_decline(&mut self, request: &ServerRequest) {
-        if let Some(item) = &request.item_id {
-            self.declined_by_via.insert(item);
+    /// An ID that cannot be admitted is an overflow, as in
+    /// [`Self::observe`].
+    pub(crate) fn note_decline(&mut self, request: &ServerRequest) -> Result<(), NormalizeError> {
+        if self.overflowed {
+            return Err(NormalizeError::Overflow);
         }
+        if let Some(item) = &request.item_id {
+            let admitted = self.declined_by_via.admit(item, &mut self.id_bytes);
+            self.overflowed = admitted.is_err();
+            admitted?;
+        }
+        Ok(())
     }
 
-    /// Whether a tool item started and has not completed; past the
-    /// tracking bound, always.
+    /// Whether a tool item started and has not completed.
     pub(crate) fn tools_open(&self) -> bool {
-        self.open_tools.overflowed || !self.open_tools.ids.is_empty()
+        !self.open_tools.ids.is_empty()
     }
 
     /// The marks of an item's start: model output, and a tool's ID and type.
-    fn item_started(&mut self, item: &Item) -> Option<ProgressMarks> {
+    fn item_started(&mut self, item: &Item) -> Result<Option<ProgressMarks>, NormalizeError> {
         let tools_started = if item.kind.is_tool() {
-            self.open_tools.insert(&item.id);
+            self.open_tools.admit(&item.id, &mut self.id_bytes)?;
             vec![(item.id.clone(), item.kind.as_str().to_owned())]
         } else if matches!(item.kind, ItemKind::AgentMessage | ItemKind::Reasoning) {
             Vec::new()
         } else {
-            return None;
+            return Ok(None);
         };
-        Some(ProgressMarks {
+        Ok(Some(ProgressMarks {
             model: true,
             tools_started,
             ..ProgressMarks::default()
-        })
+        }))
     }
 
-    fn item_completed(&mut self, item: &Item) -> Step {
+    fn item_completed(&mut self, item: &Item) -> Result<Step, NormalizeError> {
         if item.kind.is_tool() {
-            self.open_tools.ids.remove(&item.id);
+            self.open_tools.release(&item.id, &mut self.id_bytes);
             let mut observations = vec![Observation::Progress(ProgressMarks {
                 tools_ended: vec![item.id.clone()],
                 ..ProgressMarks::default()
             })];
-            observations.extend(self.denial(item).map(Observation::ActionDenied));
-            return Step::Observations(observations);
+            observations.extend(self.denial(item)?.map(Observation::ActionDenied));
+            return Ok(Step::Observations(observations));
         }
         let (ItemKind::AgentMessage, Some(FINAL_ANSWER), Some(text)) =
             (&item.kind, item.phase.as_deref(), item.text.as_deref())
         else {
-            return Step::Activity;
+            return Ok(Step::Activity);
         };
         if self.schema {
             self.retain(text);
         }
-        Step::Observations(
+        Ok(Step::Observations(
             final_text_pieces(text)
                 .map(|piece| Observation::FinalText(piece.to_owned()))
                 .collect(),
-        )
+        ))
     }
 
     /// Appends `text` to the structured-output text, within its bound.
@@ -402,7 +454,7 @@ impl TurnNormalizer {
 
     /// A command or file-change item the vendor declined, once per item,
     /// unless VIA's own decline caused it.
-    fn denial(&mut self, item: &Item) -> Option<Denial> {
+    fn denial(&mut self, item: &Item) -> Result<Option<Denial>, NormalizeError> {
         let kind = match item.kind {
             ItemKind::CommandExecution => DenialKind::Command,
             ItemKind::FileChange => DenialKind::FileWrite,
@@ -415,23 +467,23 @@ impl TurnNormalizer {
             | ItemKind::WebSearch
             | ItemKind::ImageGeneration
             | ItemKind::Sleep
-            | ItemKind::Other(_) => return None,
+            | ItemKind::Other(_) => return Ok(None),
         };
         if item.status.as_deref() != Some("declined")
             || self.declined_by_via.contains(&item.id)
             || self.denied.contains(&item.id)
         {
-            return None;
+            return Ok(None);
         }
-        self.denied.insert(&item.id);
-        Some(Denial {
+        self.denied.admit(&item.id, &mut self.id_bytes)?;
+        Ok(Some(Denial {
             kind,
             target: item.target.clone().unwrap_or_default(),
             reason: DENIAL_REASON.to_owned(),
-        })
+        }))
     }
 
-    fn terminal(&mut self, turn: &Turn, at: Instant) -> Result<Step, &'static str> {
+    fn terminal(&mut self, turn: &Turn, at: Instant) -> Result<Step, NormalizeError> {
         let (status, stop_reason, vendor_stop_reason) = match turn.status {
             TurnStatus::Completed => (
                 VendorTerminalStatus::Completed,
@@ -444,7 +496,11 @@ impl TurnNormalizer {
                 "interrupted",
             ),
             TurnStatus::Failed => (VendorTerminalStatus::Failed, StopReason::Error, "failed"),
-            TurnStatus::InProgress => return Err("turn/completed with an inProgress turn"),
+            TurnStatus::InProgress => {
+                return Err(NormalizeError::Protocol(
+                    "turn/completed with an inProgress turn",
+                ));
+            }
         };
         let failed = status == VendorTerminalStatus::Failed;
         let error = turn.error.as_ref();

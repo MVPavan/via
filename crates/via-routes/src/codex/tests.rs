@@ -644,3 +644,20 @@ fn json_text_keeps_the_limits() {
     let deep = format!("{}{}", "[".repeat(65), "]".repeat(65));
     assert_eq!(json_text(&deep).unwrap_err(), JsonTextError::Limits);
 }
+
+/// Review r2 #1: an item decodes by its type first, then only that type's
+/// retained fields; unrelated fields, of any shape, are ignored.
+#[test]
+fn items_decode_by_type_first() {
+    for item in [
+        r#"{"type":"commandExecution","id":"c","command":"ls","cwd":"/","commandActions":[],"status":"completed","durationMs":-1}"#,
+        r#"{"type":"webSearch","id":"w","query":"q","command":{}}"#,
+        r#"{"type":"hookPrompt","id":"h","fragments":[],"changes":7}"#,
+        r#"{"type":"reasoning","id":"r","text":{},"status":3}"#,
+    ] {
+        let line = format!(
+            r#"{{"method":"item/completed","params":{{"threadId":"t","turnId":"u","item":{item}}}}}"#
+        );
+        assert!(decode(line.as_bytes()).is_ok(), "{item}");
+    }
+}

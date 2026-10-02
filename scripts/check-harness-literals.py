@@ -350,7 +350,10 @@ def subwords(word):
 
 SIMPLE_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", "\\": "\\", "0": "\0", "'": "'", '"': '"'}
 HEX_ESCAPE = re.compile(r"x([0-9A-Fa-f]{2})")
-UNICODE_ESCAPE = re.compile(r"u\{([0-9A-Fa-f_]{1,8})\}")
+# Rust: `\u{` then one to six hex digits, each optionally followed by
+# underscores, then `}`; the underscores do not count toward the six.
+UNICODE_ESCAPE = re.compile(r"u\{((?:[0-9A-Fa-f]_*){1,6})\}")
+CONTINUATION_SPACE = " \t\n\r"
 
 
 def literal_chars(token):
@@ -383,7 +386,7 @@ def literal_chars(token):
         elif escape == "\n":
             # A line continuation: the newline and the whitespace after it.
             i += 2
-            while i < end and text[i].isspace():
+            while i < end and text[i] in CONTINUATION_SPACE:
                 i += 1
             continue
         else:
@@ -768,6 +771,10 @@ const E: &str = "open\\
     ai";
 const F: &str = "fa\\u{6B}e\\n";
 const G: &str = r"co\\x64ex";
+const H: &str = "co\\u{0_0_0_0_6_4}ex";
+const I: &str = "co\\
+\u00a0dex";
+const J: &str = "cl\\u{0000061}ude";
 """,
         },
         "expect": [
@@ -776,6 +783,7 @@ const G: &str = r"co\\x64ex";
             (CORE + "lib.rs", "const C", "claude"),
             (CORE + "lib.rs", "const E", "openai"),
             (CORE + "lib.rs", "const F", "fake"),
+            (CORE + "lib.rs", "const H", "codex"),
         ],
     },
     {

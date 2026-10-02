@@ -13,8 +13,8 @@ use via_routes::codex::{
 
 use super::launch::{ConfigHash, PROTOCOL_PIN, ServerRecipe};
 use super::normalize::{
-    DECLINES, Step, StructuredOutput, TurnNormalizer, catalog_page, decline, instance_version,
-    version_status,
+    DECLINES, NormalizeError, Step, StructuredOutput, TurnNormalizer, catalog_page, decline,
+    instance_version, version_status,
 };
 use crate::VendorTerminalStatus;
 use crate::config::BootstrapEnv;
@@ -898,7 +898,8 @@ fn a_declined_item_is_a_denial() {
         thread_id: Some("t".to_owned()),
         turn_id: Some("u".to_owned()),
         item_id: Some("c1".to_owned()),
-    });
+    })
+    .unwrap();
     assert!(
         denials(&observed(&mut ours, &command)).is_empty(),
         "VIA's own decline is reported as vendor.request_declined only"
@@ -937,4 +938,70 @@ fn an_open_sleep_is_an_open_tool() {
         &item("item/completed", &tool_item("sleep", "s1", "")),
     );
     assert!(!closed.tools_open());
+}
+
+/// Review r2 #2: each ID set admits 1,024 IDs and all share the 256 KiB
+/// metadata budget; the first ID that cannot be admitted is an explicit
+/// overflow, and the normalizer takes nothing after it.
+#[test]
+fn id_tracking_overflows_explicitly() {
+    let mut denied = TurnNormalizer::new(false);
+    for n in 0..1024 {
+        let declined = item(
+            "item/completed",
+            &tool_item("commandExecution", &format!("c{n}"), "declined"),
+        );
+        assert_eq!(denials(&observed(&mut denied, &declined)).len(), 1);
+    }
+    let next = item(
+        "item/completed",
+        &tool_item("commandExecution", "c1024", "declined"),
+    );
+    assert_eq!(
+        denied.observe(&next, Instant::now()).unwrap_err(),
+        NormalizeError::Overflow
+    );
+    assert_eq!(
+        denied
+            .observe(&completed("completed"), Instant::now())
+            .unwrap_err(),
+        NormalizeError::Overflow,
+        "overflowed for good"
+    );
+
+    let mut declines = TurnNormalizer::new(false);
+    let request = |n: usize| ServerRequest {
+        id: RequestId::Int(1),
+        method: "item/commandExecution/requestApproval".to_owned(),
+        thread_id: None,
+        turn_id: None,
+        item_id: Some(format!("c{n}")),
+    };
+    for n in 0..1024 {
+        declines.note_decline(&request(n)).unwrap();
+    }
+    assert_eq!(
+        declines.note_decline(&request(1024)).unwrap_err(),
+        NormalizeError::Overflow
+    );
+
+    let mut bytes = TurnNormalizer::new(false);
+    let long_id = |n: usize| format!("{n:0>1024}");
+    for n in 0..256 {
+        bytes
+            .observe(
+                &item("item/started", &tool_item("sleep", &long_id(n), "")),
+                Instant::now(),
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        bytes
+            .observe(
+                &item("item/started", &tool_item("sleep", &long_id(256), "")),
+                Instant::now()
+            )
+            .unwrap_err(),
+        NormalizeError::Overflow
+    );
 }

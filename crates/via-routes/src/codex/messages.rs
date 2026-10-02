@@ -699,97 +699,144 @@ fn notification(method: String, raw: Option<&RawValue>) -> Result<Notification, 
     Ok(notification)
 }
 
-/// `item/started` and `item/completed` params, tolerant of item types
-/// VIA does not know; an `agentMessage` needs its text.
+/// `item/started` and `item/completed` params. The item's `type` is read
+/// first, then only that type's retained fields (review r2 #1): unrelated
+/// fields of any shape, and the fields of an unknown type, are ignored.
 fn item_event(params: &str) -> Result<ItemEvent, DecodeError> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Raw {
         thread_id: String,
         turn_id: String,
-        item: RawItem,
+        item: Box<RawValue>,
     }
     #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct RawItem {
+    struct Head {
         #[serde(rename = "type")]
         kind: String,
         id: String,
-        #[serde(default)]
-        text: Option<String>,
-        #[serde(default)]
-        phase: Option<String>,
-        #[serde(default)]
-        status: Option<String>,
-        #[serde(default)]
-        command: Option<String>,
-        #[serde(default)]
-        changes: Option<Vec<RawChange>>,
-        #[serde(default)]
-        duration_ms: Option<u64>,
-    }
-    #[derive(Deserialize)]
-    struct RawChange {
-        path: String,
     }
     let raw: Raw = serde_json::from_str(params).map_err(|_| DecodeError("an item event"))?;
-    let item = raw.item;
-    let kind = ItemKind::parse(&short(item.kind)?);
-    let status = item.status.map(short).transpose()?;
-    check_status(&kind, status.as_deref())?;
-    let mut target = match kind {
-        ItemKind::CommandExecution => Some(
-            item.command
-                .ok_or(DecodeError("a commandExecution item without its command"))?,
-        ),
-        ItemKind::FileChange => item
-            .changes
-            .ok_or(DecodeError("a fileChange item without its changes"))?
-            .into_iter()
-            .next()
-            .map(|change| change.path),
-        ItemKind::AgentMessage => {
-            if item.text.is_none() {
-                return Err(DecodeError("an agentMessage item without text"));
-            }
-            if item
-                .phase
-                .as_deref()
-                .is_some_and(|phase| !["commentary", "final_answer"].contains(&phase))
-            {
-                return Err(DecodeError("an agentMessage item with an unknown phase"));
-            }
-            None
-        }
-        ItemKind::Sleep => {
-            item.duration_ms
-                .ok_or(DecodeError("a sleep item without its duration"))?;
-            None
-        }
-        ItemKind::UserMessage
-        | ItemKind::Reasoning
-        | ItemKind::McpToolCall
-        | ItemKind::DynamicToolCall
-        | ItemKind::CollabAgentToolCall
-        | ItemKind::WebSearch
-        | ItemKind::ImageGeneration
-        | ItemKind::Other(_) => None,
-    };
-    if let Some(target) = &mut target {
+    let head: Head = fields(&raw.item, "an item without its type or ID")?;
+    let kind = ItemKind::parse(&short(head.kind)?);
+    let mut item = item_fields(&kind, &raw.item)?;
+    if let Some(status) = item.status.take() {
+        item.status = Some(short(status)?);
+    }
+    check_status(&kind, item.status.as_deref())?;
+    if let Some(target) = &mut item.target {
         truncate(target, SHORT_FIELD_MAX);
     }
     Ok(ItemEvent {
         thread_id: raw.thread_id,
         turn_id: raw.turn_id,
         item: Item {
-            id: item.id,
+            id: head.id,
             kind,
             text: item.text,
             phase: item.phase,
-            status,
-            target,
+            status: item.status,
+            target: item.target,
         },
     })
+}
+
+/// The retained fields of one item type.
+#[derive(Default)]
+struct ItemFields {
+    text: Option<String>,
+    phase: Option<String>,
+    status: Option<String>,
+    target: Option<String>,
+}
+
+/// Decodes `kind`'s retained fields from `raw`, and nothing else.
+fn item_fields(kind: &ItemKind, raw: &RawValue) -> Result<ItemFields, DecodeError> {
+    #[derive(Deserialize)]
+    struct Message {
+        text: String,
+        #[serde(default)]
+        phase: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Status {
+        status: String,
+    }
+    #[derive(Deserialize)]
+    struct Command {
+        status: String,
+        command: String,
+    }
+    #[derive(Deserialize)]
+    struct Patch {
+        status: String,
+        changes: Vec<Change>,
+    }
+    #[derive(Deserialize)]
+    struct Change {
+        path: String,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Sleep {
+        #[expect(dead_code, reason = "validated, not retained")]
+        duration_ms: u64,
+    }
+    Ok(match kind {
+        ItemKind::AgentMessage => {
+            let message: Message = fields(raw, "an agentMessage item")?;
+            if message
+                .phase
+                .as_deref()
+                .is_some_and(|phase| !["commentary", "final_answer"].contains(&phase))
+            {
+                return Err(DecodeError("an agentMessage item with an unknown phase"));
+            }
+            ItemFields {
+                text: Some(message.text),
+                phase: message.phase,
+                ..ItemFields::default()
+            }
+        }
+        ItemKind::CommandExecution => {
+            let command: Command = fields(raw, "a commandExecution item")?;
+            ItemFields {
+                status: Some(command.status),
+                target: Some(command.command),
+                ..ItemFields::default()
+            }
+        }
+        ItemKind::FileChange => {
+            let patch: Patch = fields(raw, "a fileChange item")?;
+            ItemFields {
+                status: Some(patch.status),
+                target: patch.changes.into_iter().next().map(|change| change.path),
+                ..ItemFields::default()
+            }
+        }
+        ItemKind::McpToolCall
+        | ItemKind::DynamicToolCall
+        | ItemKind::CollabAgentToolCall
+        | ItemKind::ImageGeneration => {
+            let status: Status = fields(raw, "a tool item without its status")?;
+            ItemFields {
+                status: Some(status.status),
+                ..ItemFields::default()
+            }
+        }
+        ItemKind::Sleep => {
+            let _: Sleep = fields(raw, "a sleep item without its duration")?;
+            ItemFields::default()
+        }
+        ItemKind::UserMessage | ItemKind::Reasoning | ItemKind::WebSearch | ItemKind::Other(_) => {
+            ItemFields::default()
+        }
+    })
+}
+
+/// Typed fields of an already scanned value.
+fn fields<T: DeserializeOwned>(raw: &RawValue, what: &'static str) -> Result<T, DecodeError> {
+    serde_json::from_str(raw.get()).map_err(|_| DecodeError(what))
 }
 
 /// A tool item's status against its schema: required, and one of its
