@@ -1,14 +1,13 @@
 # Codex server ownership and connection design (x.3.2 chunk X0)
 
-Status: revision 7, 2026-10-02, a simplification round answering Sol
-review x32-x0-r7 (NOT SOUND, no Blocker: 6 Important, 2 Minor) under the
-coordinator's r7 rulings: no binary-change detection (Ruling C, an owner
-scope rule) and crash-only handling of VIA's own panics in the Codex
-server owner (Ruling D, superseding r6 Ruling A). On top of revisions
-1–6 (Sol r1–r6). Bead `via-5lr.3.2`, chunk X0. Worker: implementer-high
-(Opus 5.5 high), design mode. Base `42ee47b`; revisions 0–6 were
-`a141496`, `20ae3aa`, `348d5d7`, `8d277c1`, `dbce82b`, `b6a4d19`,
-`42fb246`.
+Status: revision 8, 2026-10-02, answering Sol review x32-x0-r8 (NOT
+SOUND, no Blocker: 3 Important, 3 Minor) on top of revision 7's
+simplification (Ruling C: no binary-change detection, an owner scope
+rule; Ruling D: crash-only handling of VIA's own panics in the Codex
+server owner, superseding r6 Ruling A) and revisions 1–6 (Sol r1–r6).
+Bead `via-5lr.3.2`, chunk X0. Worker: implementer-high (Opus 5.5 high),
+design mode. Base `42ee47b`; revisions 0–7 were `a141496`, `20ae3aa`,
+`348d5d7`, `8d277c1`, `dbce82b`, `b6a4d19`, `42fb246`, `d597365`.
 
 Sources:
 - the x.3.2 plan (chunk X0, §1.3, §6 G1–G7); the coordinator's rulings
@@ -242,6 +241,28 @@ collector and cache tests; `every_delivery_cutoff_seals` is new (§7).
 Placement: §8. §9 drops `fatal()`, the §6.2 incomplete-exit paragraph
 and the binary-identity wording, adjusts C2 §5's binary-change sentence,
 and adds a runtime §6.2 crash sentence (R7-Q1).
+
+### 0.8 Round-8 findings and where each is answered
+
+Sol accepted the r7 simplification, R7-Q1 and R7-Q2. Integration fact:
+the final via-mnx has no admission lock; `ObservationSink::admit` is
+plain `try_send`/`send` again, and C2 §4 orders per producer only. The
+delivery seal relies on neither.
+
+| Finding | Decision (short) | Section |
+|---|---|---|
+| R8-1 the chained default hook can block before the abort | The daemon's hook replaces the default and never chains it; it writes one bounded line to the `via.log` file only, under `try_lock`, skipping an unavailable log, and never panics | Item 2.5 |
+| R8-2 `crash_on_panic` misses destruction | The wrapper owns the inner future and drops it inside its catch-or-abort scope before returning `Ready`; its `Drop` does the same for a pending future | Item 2.5 |
+| R8-3 a delivered terminal loses at the loss deadline | At every cutoff but force, a delivered, retained terminal decides the turn's result; the rest is recorded as loss; force keeps item 6.4's result | Item 13.2 |
+| R8-4 the seal counter's unit | `DeliverySeal` tracks the ingress message being delivered (decode sequence and whether all its observations went out), so partial expansion, zero-observation messages and initialization are defined | Item 13.2 |
+| R8-5 the missing negative abort test | `guard_during_unrelated_unwind_does_not_abort`, a subprocess test | Item 2.7 |
+| R8-6 a stray heading | Deleted | Item 3 |
+
+Tests (§7): `panic_hook_aborts_with_full_stderr`,
+`crash_on_panic_aborts_on_destruction`,
+`guard_during_unrelated_unwind_does_not_abort`,
+`delivered_terminal_wins_at_every_cutoff`,
+`seal_between_observations_of_one_message`. §9 is unchanged.
 
 ---
 
@@ -609,13 +630,24 @@ insufficient).
     unrelated unwind (a pin dropped by a panicking Core task) does not
     abort for that panic.
   - The supervisor runs inside `codex::crash_on_panic(fut)`, a future
-    wrapper whose `poll` runs the inner `poll` under
-    `std::panic::catch_unwind` and aborts on `Err`; it covers the
-    supervisor's code outside the guard.
+    wrapper that owns the inner future in an `Option`. Its `poll` runs
+    the inner `poll` under `std::panic::catch_unwind` and aborts on
+    `Err`; on `Ready` it drops the inner future inside the same
+    catch-or-abort scope before returning. Its own `Drop`, for a wrapper
+    destroyed while pending, drops the inner future the same way. So a
+    panic while polling or destroying the wrapped VIA state aborts, and
+    Tokio's catch of a destruction panic never sees one (r8 R8-2). It
+    covers the supervisor's code outside the guard.
   - The `via.log` line comes from a panic hook daemon main installs once
-    `via.log` is open: one bounded JSON line with the panic's message and
-    location, written at the panic, before the unwind, under `try_lock`
-    (a panic inside logging writes nothing); then the previous hook runs.
+    `via.log` is open. It replaces the default hook and never chains it:
+    the default writes stderr, which can block on an undrained pipe
+    before the unwind reaches the abort (r8 R8-1). The hook formats one
+    JSON line (message and location, truncated to 1 KiB) into a stack
+    buffer and writes it to the `via.log` file only, never stderr, under
+    `try_lock`; an unavailable or poisoned log skips the line and a write
+    error is ignored. It never panics and never waits on a lock or pipe.
+    The daemon loses the default stderr message, which nobody reads once
+    it serves.
   - The workspace stays on `panic = "unwind"`; only these places abort.
     The connection, launch, retirement and stop tasks keep their collected
     outcomes (below; item 13.2).
@@ -769,9 +801,17 @@ has no failed outcome to count.
   daemon recovers the turn `unknown` with cleanup from its linked server
   anchor (runtime §7), and the server group is proved absent; repeated
   with the point in `prepare` and in the normalizer; Ruling D).
+- X3 (subprocess, since an abort ends the test process):
+  `panic_hook_aborts_with_full_stderr` (the child's stderr is a pipe the
+  test filled and never reads; a registry-step panic still ends the child
+  by `SIGABRT` within a bound, its line in `via.log`; R8-1);
+  `crash_on_panic_aborts_on_destruction` (a stand-in future whose `poll`
+  returns `Ready` and whose `Drop` panics aborts; so does one dropped
+  while pending; R8-2); `guard_during_unrelated_unwind_does_not_abort` (a
+  task panics while holding a pin; the pin's drop takes and releases the
+  registry guard during that unwind; the child goes on and exits 0;
+  R8-5).
 - X4: `c4_two_sessions`, `codex_server_close`.
-
-### Item 3.- X4: `c4_two_sessions`, `codex_server_close`.
 
 ### Item 3. `config_hash` (r2 N18; r7 Ruling C)
 
@@ -1615,16 +1655,21 @@ Health is published at once, but `run_turn` returns only at the
 
 At that cutoff, before returning, the driver **seals** the registration's
 delivery (below) and merges what was not delivered into its loss record:
-`first_unqueued` becomes the earliest undelivered sequence (the merge
-rule, item 10), `omitted` unknown. It then returns what that cutoff
-gives: at the lane's end a delivered terminal is applied first, as on
-server loss (13.1 step 3), otherwise, and at the loss deadline,
-`TransportLost` (`unknown`), cleanup `Uncertain`, with `TurnEnd.loss`;
-wall and stop keep their existing results; force returns item 6.4's
-`ForceStopped` at once (the seal is synchronous), so a launched turn
-still ends `unknown`/`unknown`. So an acceptance, a durable turn
-observation and a terminal queued before the panic reach Core in order
-while the turn still runs, and nothing of that registration reaches Core
+`first_unqueued` becomes the earliest undelivered position (the merge
+rule, item 10), `omitted` unknown. It then returns:
+- under force, item 6.4's `ForceStopped` at once (the seal is
+  synchronous), so a launched turn still ends `unknown`/`unknown`,
+  whatever was delivered;
+- at any other cutoff, when the turn's terminal was delivered to the sink
+  before the seal (the driver retains it): that terminal decides the
+  result, as on server loss (13.1 step 3) and by C1 §7.6's
+  terminal-first precedence, with `TurnEnd.loss` for the rest (r8 R8-3);
+- otherwise, at the lane's end or the loss deadline, `TransportLost`
+  (`unknown`), cleanup `Uncertain`, with `TurnEnd.loss`; at the wall or a
+  stop, their existing results.
+
+So an acceptance, a durable turn observation and a terminal queued
+before the panic reach Core in order while the turn still runs, and nothing of that registration reaches Core
 after `run_turn` returned. That matters for K1 at `820e9fb`:
 `LaneState::dispose` drops an idle `Accepted`, and `attribute` maps a
 vendor turn ID to a turn only through an acceptance the drive processed;
@@ -1632,17 +1677,38 @@ a turn that ended first would leave a queued denial session-level and a
 queued terminal unattributable. Core retires the failed driver after the
 turn's end, as for any driver failure.
 
-**The delivery seal.** Each registration has one `DeliverySeal`, a std
-mutex over `{ sealed: bool, next: u64 }`, `next` being the sequence of
-the next item to deliver. The normalizer first acquires an item's sink
-capacity (its byte-budget permit and a channel slot through
-`mpsc::Sender::reserve`, both cancel-safe, within the C2 stall bound);
-then, under the seal's mutex, it either sends with the synchronous
-`Permit::send` and advances `next`, or, when sealed, releases both and
-returns. `seal()` sets `sealed` under the same mutex and returns `next`.
-Once `seal()` returned, no item of that registration enters the sink,
-and `next` is exactly the first that did not. It is idempotent; a close's
-delivery barrier (item 8.2) uses the same seal.
+**The delivery seal (R7-5, r8 R8-4).** Each registration has one
+`DeliverySeal`, a std mutex over `{ sealed, current: u64, complete: bool
+}` in ingress-message units: `current` is the connection decode sequence
+(the one `LeaseSignal.enqueued` counts) of the message the normalizer is
+delivering or last delivered, and `complete` says whether every
+observation it yields was sent.
+- **Initialization:** at registration, `current` is the last decode
+  sequence before the registration starts and `complete = true`; no
+  message up to it is the registration's.
+- **Taking a message:** under the mutex, unless sealed, `current = seq`,
+  `complete = false`.
+- **Each observation it yields:** the normalizer first acquires the sink
+  capacity (the byte-budget permit, then a channel slot through
+  `mpsc::Sender::reserve`: the same steps as the sink's `admit`, with
+  `reserve` for `try_send`/`send`; both cancel-safe, within the C2 stall
+  bound), then, under the mutex, either sends with the synchronous
+  `Permit::send` or, when sealed, releases both and returns.
+- **After its last observation, or at once for a message that yields
+  none:** under the mutex, `complete = true`.
+- **`seal()`** sets `sealed` under the mutex and returns the first
+  undelivered position: `current` when `!complete` (a message expanded
+  only in part counts as undelivered), else `current + 1`. Messages of
+  other registrations between positions are not this one's, so the
+  position is exact.
+
+The seal needs no lock in the sink. With via-mnx final, `admit` is plain
+`try_send`/`send` and C2 §4 orders per producer only; the normalizer is
+one producer. Every `Permit::send` before `seal()` took the mutex has
+enqueued its item, so it is in the channel when `run_turn` returns and in
+Core's return-time drain; every later send finds `sealed` and is
+refused. `seal()` is idempotent; a close's delivery barrier (item 8.2)
+uses the same seal.
 
 An idle driver has no `run_turn` to return it: its loss reaches Core
 through its close report, and `record_loss` commits one `late: true`
@@ -1708,6 +1774,14 @@ one counter outside the connection task.
   `first_unqueued` is the first undelivered item, and after the sink
   unblocks nothing of that registration reaches Core; under force A ends
   `unknown`/`unknown` at once, item 6.4; R7-5);
+  `delivered_terminal_wins_at_every_cutoff` (A's terminal delivered, then
+  the sink blocked on a later item, once per cutoff but force: A ends
+  with its terminal's result, and `TurnEnd.loss` starts at the blocked
+  item's message; R8-3); `seal_between_observations_of_one_message` (one
+  `item/completed` yields a `Progress` and an `ActionDenied`; sealing
+  after the first send reports that message's sequence as the first
+  undelivered, a zero-observation message before it does not move the
+  position past it, and nothing more is delivered; R8-4);
   `successive_losses_keep_earliest_sequence` (the abnormal end records
   101 at once, the cutoff seals at 50: the record holds 50, `omitted`
   unknown, the original trigger and one late warning; R6-8);
@@ -1829,11 +1903,12 @@ and after `resume_input` the whole line is read.
 
 | # | Question | Recommendation |
 |---|---|---|
-| R7-Q1 | **Contract conflict, reported, not chosen.** Ruling D's abort is a process exit that a library starts. Runtime §6.2 says: "Only daemon main selects this path; a library timeout or dropped handle never exits the process or detaches work." A panic is neither a timeout nor a dropped handle, so the letter may not forbid it, but the contract has no rule for VIA's own panics, and §2's "spawned tasks return typed outcomes and are collected promptly" assumes the owner survives its children. C1 needs no change: a crash already ends in-flight turns through restart recovery. | Accept the §9.2 sentence that names this crash as the one exception: never exit 0 or 4, recovered by §7. |
-| R7-Q2 | Item 13.2 (the ruling's open choice): a normalizer panic is crash-only, not a counted failed task. | Accept: its counted failure needed the collector, its admission fence (R7-4) and its diagnostic (R7-8); crash-only needs only `crash_on_panic` and the tracker C2 already gives. The line stays where the rulings drew it: the connection, launch, retirement and stop tasks, which the supervisor collects anyway, keep their collected outcomes, so one connection's bug does not abort every session. Making them crash-only too would remove the abnormal path of 13.2 at that price; that is the owner's call. |
+| — | None open in r8. | — |
 
-Ruled earlier: R6-Q1 and R6-Q3 are superseded by Ruling D, and R6-Q2
-(the collector) is moot (r7); X0-R5-Q1 (degraded until restart) was
+Ruled earlier: R7-Q1 (the runtime §6.2 crash sentence, §9.2) and R7-Q2
+(the normalizer is crash-only; connection, launch, retirement and stop
+tasks keep collected outcomes), accepted by Sol in r8; R6-Q1 and R6-Q3
+are superseded by Ruling D, and R6-Q2 (the collector) is moot (r7); X0-R5-Q1 (degraded until restart) was
 superseded by Ruling A; X0-R5-Q2 (the synchronous lease handler),
 accepted by Sol in r6; X0-R5-Q3 (the owned gate in the blocking closure)
 is moot under Ruling C; X0-R4-Q1 (no shutdown request; the handle and
@@ -1877,7 +1952,7 @@ schema numbering, R1-Q1 to R1-Q4) likewise.
 |---|---|
 | X1 | `config_hash` (item 3; its identity case is removed in X3); launch environment (item 4); decline bodies (item 11) |
 | X2 | Item 0: `pinned_join_needs_no_slot`, `queued_turn_reprepares_on_readiness`, `readiness_insert_between_prepare_and_wait`, `unsubmitted_lane_is_retired`. Item 1: `host_server_owner_outlives_turns`, `store_server_anchor_and_link`, `wire_server_open_has_no_turn_folder`, `link_turn_on_turn_owner_is_invalid`. Item 2: `daemon_idle_exit_not_blocked_by_idle_server`, `host_journal_uncertain_watch`. Item 4: bootstrap `vendor/`. Item 6: `recovery_server_anchor_proved_absent`, `recovery_server_anchor_unproven`, `recovery_unlinked_server_turn_sent_nothing`, `recovery_partial_settlement_rechecks_server_anchor`, `reprobe_ownerless_not_committed`, `shutdown_link_read_failure_still_stops_groups`, `shutdown_force_shared_is_unknown`, `shared_close_cleanup_from_turn_facts`, `spontaneous_uncertain_end_keeps_link`, `quiescent_terminal_releases_link`, `close_absence_check_ignores_server`. Item 12: the Wire tests of 12.5 (claim versus first byte, holds, expiry, permits). Item 13: `drain_admitted_yields_prefix_then_boundary`, `seal_is_exact_prefix`, `seal_is_idempotent`, `close_reports_stop_reply`. (The concurrent lane drain's test is K1's.) |
-| X3 | Registry and supervision unit tests: coalesced work, retained entries, the connection-task handoff, zero-holder publication, fenced launch and retirement, the supervisor's end at the fence, its handle at the cutoff, failed-task count, `close_deadline_leaves_normalizer_on_tracker`, and the daemon-level `registry_panic_aborts_daemon` (item 2); `config_hash` without the binary identity (item 3); classification including the generation-only branch (item 5); cleanup-intent tests (item 8.3); `codex_never_ask` additions (item 11); guard, budget, reserved-size and staging tests (item 12); `connection_task_panic_with_staged_terminal`, `connection_task_panic_idle_driver_reports_loss`, `abnormal_health_not_behind_delivery`, `blocked_normalizer_prefix_keeps_attribution`, `every_delivery_cutoff_seals`, `successive_losses_keep_earliest_sequence`, `correlation_failure_is_protocol_not_unknown`, `first_failure_cause_wins` (item 13); symlinked `vendor/codex` (item 4); the replay join, `replay_mode_ack_with_empty_stdin` and `replay_paused_nonempty_pipe_waits` (item 14) |
+| X3 | Registry and supervision unit tests: coalesced work, retained entries, the connection-task handoff, zero-holder publication, fenced launch and retirement, the supervisor's end at the fence, its handle at the cutoff, failed-task count, `close_deadline_leaves_normalizer_on_tracker`, the daemon-level `registry_panic_aborts_daemon`, and the subprocess tests `panic_hook_aborts_with_full_stderr`, `crash_on_panic_aborts_on_destruction` and `guard_during_unrelated_unwind_does_not_abort` (item 2); `config_hash` without the binary identity (item 3); classification including the generation-only branch (item 5); cleanup-intent tests (item 8.3); `codex_never_ask` additions (item 11); guard, budget, reserved-size and staging tests (item 12); `connection_task_panic_with_staged_terminal`, `connection_task_panic_idle_driver_reports_loss`, `abnormal_health_not_behind_delivery`, `blocked_normalizer_prefix_keeps_attribution`, `every_delivery_cutoff_seals`, `delivered_terminal_wins_at_every_cutoff`, `seal_between_observations_of_one_message`, `successive_losses_keep_earliest_sequence`, `correlation_failure_is_protocol_not_unknown`, `first_failure_cause_wins` (item 13); symlinked `vendor/codex` (item 4); the replay join, `replay_mode_ack_with_empty_stdin` and `replay_paused_nonempty_pipe_waits` (item 14) |
 | X4 | `c4_two_sessions`, `codex_server_close`, two keys → two servers, `servers` (items 2, 3, 7); `codex_two_threads` cutoff, reopen, fence and lease-fence assertions (item 8); request-record exhaustion (item 9.1); `codex_server_lost_order`, `codex_transport_loss_is_unknown`, `stop_reply_missing_stays_transport`, `stdout_end_then_dead_on_stop_is_server_lost`, `server_loss_cleanup_not_blocked_by_inherited_stdout`, `overflow_failure_keeps_overflow_class` (item 13) |
 | X5 | `codex_bounds_overflow` additions and the Core loss helper (item 10); `codex_rss_leases` (item 9.2); decline deadline with the reader paused (items 11, 14); `CODEX_SQLITE_HOME` persists (item 4) |
 
@@ -1893,7 +1968,7 @@ schema numbering, R1-Q1 to R1-Q4) likewise.
 | `via-core` | Item 0 dispatch order and readiness subscription; (the lane actor's concurrent drain during driver close is K1's); `Reconciled` server facts; partial-settlement meet; `FailureScope::Daemon` for ownerless proofs; shared force `unknown/unknown`; `journal_uncertain` latch; registry counts folded by the adapter set (no Core change); `link_released` from the committed terminal's cleanup; `record_loss` and `observations_lost` (`omitted: null` when unknown) | X2 (`record_loss`: X5) |
 | `via-routes` | `RouteRuntime` pass-throughs (X2); `codex::{Servers, supervisor, RegistryGuard (aborts on unwind), crash_on_panic, ServerPin, Lease, LeaseSignal, ConfigHash, DeclineTable, Connection, ConnectionFailure, ThreadTable, RequestTable, Feeder, TurnWrites}` | X3, X4 |
 | `via-adapters` | `codex::DECLINES`, launch recipe; `AnchorRecovery.owner`; `journal_uncertain()`; `ConnectionPin` payload; `SessionDriver::{readiness, connection_kind}`; `TurnEnd.loss`, `CloseReport.loss`; registry counts into `pending_tasks`/`failed_tasks`; `ServerRecipe::config_hash` without the binary identity; the driver's abnormal-end handler (loss and health at once, the earliest-sequence merge); the crash-only normalizer on the session's tracker, the prefix wait and the `DeliverySeal` (with a reserve-then-send path in `ObservationSink`) | X1, X2, X3, X4, X5 |
-| `via-cli` | Bootstrap `<state>/vendor/`; the panic hook writing one `via.log` line | X2 |
+| `via-cli` | Bootstrap `<state>/vendor/`; the panic hook writing one `via.log` line (replaces the default, never chains it, file only, `try_lock`) | X2 |
 | `via-fake-agent` | Polling chunked reader, timed condition wait while paused, `expect_large`, `pause_input`/`resume_input`, acknowledged transitions | X3 |
 
 ---
