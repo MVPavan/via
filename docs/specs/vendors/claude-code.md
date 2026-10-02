@@ -174,7 +174,7 @@ an unexpected execution surface without detection (§8).
 | Canonical field | Mapping |
 |---|---|
 | model | Frozen `--model`; init `model` is a resolved identity only for aliases (a full model name is echoed unresolved); catalog aliases retain their provenance |
-| instructions | Frozen text via `--append-system-prompt`; for large values use Host-managed private temporary file plus `--append-system-prompt-file`, never reread a mutable caller file on resume; remove after child reads/exits through owned cleanup |
+| instructions | Frozen text via `--append-system-prompt`, never reread from a mutable caller file on resume. In S1, values that do not fit the conservative Configure bound below are refused `invalid_params` before receipt; a Host-managed private file with `--append-system-prompt-file` is deferred (via-ljn) |
 | effort | Optional `--effort VALUE`. Claude ignores an unknown effort with only a stderr warning, so VIA validates against `{low, medium, high, xhigh, max}` (help 2.1.285) before launch and refuses others `invalid_params`; never rounded or silently omitted. Effort is not observable |
 | output_schema | Non-null validated object serialized into `--json-schema`; null omits flag; C2 proves schema replacement and removal on the same UUID |
 | max_steps | Positive N maps one-to-one to `--max-turns N`; null omits it. C1's effective receipt retains N and capability semantics `agentic_turn_limit` |
@@ -373,7 +373,8 @@ silent drops, unbounded result collection or hidden vendor-process queue.
 
 ## 7. Interrupt, close and recovery
 
-Cancel (and the wall's cleanup step, C2 §4.1) sends the interrupt through
+Cancel sends the interrupt (on the wall, this private route instead
+force-closes through Host with no interrupt, C2 §4.1) through
 the independent control lane, then closes stdin, then follows S1's close:
 graceful, then the hard stop (the anchor's own-group stop) at the stop
 order's bound. The interrupt stops what is still in Claude's parent tree;
