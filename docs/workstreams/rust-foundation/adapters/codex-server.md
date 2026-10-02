@@ -1,12 +1,14 @@
 # Codex server ownership and connection design (x.3.2 chunk X0)
 
-Status: revision 6, 2026-10-02, answering Sol review x32-x0-r6 (UNSOUND,
-no Blocker: 7 Important, 2 Minor) under the coordinator's r6 rulings
-(fail-fast registry failure, one adapter-owned collector), on top of
-revisions 1–5 (Sol r1–r5). Bead `via-5lr.3.2`, chunk X0. Worker:
-implementer-high (Opus 5.5 high), design mode. Base `42ee47b`; revisions
-0–5 were `a141496`, `20ae3aa`, `348d5d7`, `8d277c1`, `dbce82b`,
-`b6a4d19`.
+Status: revision 7, 2026-10-02, a simplification round answering Sol
+review x32-x0-r7 (NOT SOUND, no Blocker: 6 Important, 2 Minor) under the
+coordinator's r7 rulings: no binary-change detection (Ruling C, an owner
+scope rule) and crash-only handling of VIA's own panics in the Codex
+server owner (Ruling D, superseding r6 Ruling A). On top of revisions
+1–6 (Sol r1–r6). Bead `via-5lr.3.2`, chunk X0. Worker: implementer-high
+(Opus 5.5 high), design mode. Base `42ee47b`; revisions 0–6 were
+`a141496`, `20ae3aa`, `348d5d7`, `8d277c1`, `dbce82b`, `b6a4d19`,
+`42fb246`.
 
 Sources:
 - the x.3.2 plan (chunk X0, §1.3, §6 G1–G7); the coordinator's rulings
@@ -49,7 +51,8 @@ Sources:
   4 MiB retention bound; present and invalid, `reason:
   validation_limit`); a Codex turn's final text maps to it when a schema
   was requested (Core side X2, Codex side X3). X1 has the recipe's
-  `config_hash` (`codex/launch.rs`); `RoutePlan.server_key` stays `None`
+  `config_hash` (`codex/launch.rs`), whose binary-identity input item 3
+  removes; `RoutePlan.server_key` stays `None`
   until X2/X3. This design does not re-amend the carrier; the §9.1 C2
   quotes still match C2 at `e567cc5`.
 
@@ -64,8 +67,8 @@ Labels: **fact** (read in code or a spec), **decision** (this design),
 |---|---|---|---|---|
 | 0 | Dispatch admission | Core opens the logical driver, subscribes to its readiness, then prepares before any connection slot; the subscription is kept through the slot wait | Core `engine/drive.rs`; C2 `SessionDriver::readiness` | X2 |
 | 1 | Non-turn server owner | `ProcessOwner { Turn, Server }`; server anchors; a durable turn → server-anchor link before the turn's first vendor byte; server and turn evidence folders | Store, Host, Wire | X2 |
-| 2 | Lease registry | `codex::Servers`; holders = reservations + pins + leases; instance-fenced; coalesced pending work on each entry; one supervisor exclusively owning the task set in a frame that survives a panicking step, receiving each launch's connection task and publishing only after spawning it; a panicking step fails the registry fast and requests the daemon's existing incomplete shutdown, the frame collecting its children; shutdown awaits the supervisor's own handle until the cutoff and reads counts kept under the registry mutex | Routes `codex/servers.rs` | X3 (single), X4 (shared) |
-| 3 | `config_hash` | SHA-256 over the launch recipe; recomputed from a fresh stat before registry insertion; publication refused if the binary changed; stat-and-observe serialized per program path behind a gate apart from the cache lock | Adapters `codex/launch.rs` | X1, X3 |
+| 2 | Lease registry | `codex::Servers`; holders = reservations + pins + leases; instance-fenced; coalesced pending work on each entry; one supervisor exclusively owning the task set, receiving each launch's connection task and publishing only after spawning it; a panic in the supervisor or under the registry guard aborts the daemon (crash-only, restart recovery); shutdown awaits the supervisor's handle until the cutoff and reads counts kept under the registry mutex | Routes `codex/servers.rs` | X3 (single), X4 (shared) |
+| 3 | `config_hash` | SHA-256 over VIA-controlled launch settings only; no binary-change detection: a server runs the binary it launched with (owner scope rule) | Adapters `codex/launch.rs` | X1, X3 |
 | 4 | `CODEX_SQLITE_HOME` | `<state>/vendor/codex`, 0700, persistent | CLI, Wire config, Adapters | X1, X2 |
 | 5 | Server evidence, decode failures | Server folder never returned by `logs`; closed generations dropped before decoding; evidence to the original turn, continuity failure to the current one | Wire, Routes | X2, X3 |
 | 6 | Recovery, shutdown, close, status | Cleanup from the linked anchor; ownerless re-probe refusals at daemon scope; a turn's link kept exactly while its cleanup is not quiescent, and read by the close and status predicate | Store, Host, Core | X2 |
@@ -75,7 +78,7 @@ Labels: **fact** (read in code or a spec), **decision** (this design),
 | 10 | Overflow, loss record | Sticky health; a non-withdrawable cleanup interrupt; one Core loss helper fed by `TurnEnd` and every close | Adapters, Routes, Core | X5 |
 | 11 | Decline hand-off | Static table; ordered placeholder at decode | Adapters, Routes | X1, X3 |
 | 12 | Writes on a shared connection | Built on J0's `ControlQueue`: ticketed data slot; a claimed job stays withdrawable until its first byte, decided under the queue lock; data holds; staging permits; an owning turn-write guard; reserved control sizes from maximum encodings | Wire `connection.rs`; Routes `codex/feeder.rs` | X2 (Wire), X3 |
-| 13 | Connection failure | One owned sequence for exit, transport, protocol and overflow: Route's first-wins failure latch, an idempotent cause-free Wire seal, Host cleanup and the sealed-prefix drain at once; `ServerLost` only with positive prior-death evidence, carried as Host's typed stop reply; an abnormal path when the connection task itself fails, signalled to every lease at once so the driver installs its loss and publishes its failure even when idle; a supervised driver-owned normalizer | Routes, Wire, Host | X2 (Wire, Host), X3, X4 |
+| 13 | Connection failure | One owned sequence for exit, transport, protocol and overflow: Route's first-wins failure latch, an idempotent cause-free Wire seal, Host cleanup and the sealed-prefix drain at once; `ServerLost` only with positive prior-death evidence, carried as Host's typed stop reply; an abnormal path when the connection task itself fails, signalled to every lease at once so the driver installs its loss and publishes its failure even when idle; one delivery seal at every delivery cutoff; a crash-only normalizer on the session's tracker | Routes, Wire, Host | X2 (Wire, Host), X3, X4 |
 | 14 | Replay join | `expect_large`, `pause_input`/`resume_input`; a polling reader that acknowledges mode changes even with no input | `via-fake-agent` | X3 |
 
 ### 0.1 Round-1 findings and where each is answered
@@ -132,7 +135,7 @@ Labels: **fact** (read in code or a spec), **decision** (this design),
 | N15 attributable protocol failure | Closed-generation drop before decoding; evidence to the original turn; continuity failure to the open generation's nonterminal turn | Item 5 |
 | N16 request owner | `RequestOwner { Server(ServerId), Lease { .. } }`, by value, one budget | Item 9.1 |
 | N17 ownerless re-probe refusal | `ReprobeReport.not_committed: Vec<ProcessOwner>`; server proofs recorded at `daemon` scope, token held, retried | Item 6.1 |
-| N18 binary change | `prepare` matches the driver's cached hash (no syscall); `run_turn` recomputes from a fresh stat before insertion; the launch re-stats after the handshake and refuses publication on change | Item 3 |
+| N18 binary change | Superseded by Ruling C (r7): no binary-change detection | Item 3 |
 | N19 §9 contradictions | C2 A8 and process-shape rows, packet §2 key, handshake deadline and last-lease text, runtime §6 write order steps 2–3, §6.2 force exception | §9.1, §9.2, §9.4 |
 | N20 sketches | `ConnectionKind` defined; `TurnEnd`/`CloseReport` declarations; rule 1 replaced, not duplicated | §9.1 |
 | N21 locations | Runtime §6 write ordering step 3; C1 §3.7 | §9.2, §9.3 |
@@ -152,7 +155,7 @@ Labels: **fact** (read in code or a spec), **decision** (this design),
 | F7 positive death evidence | `ServerLost` only when the latch was Host's exit report, or a stdio end followed by Host's explicit `Stopping { stopped_live: false }`; never from `forced == false` | Item 13.1 |
 | F8 seal at the latch | `WireSender::seal(cause)`, synchronous, serialized with the reader's admission; leader exit with inherited stdout included (r4: cause-free and idempotent; R4-6) | Item 13.1; §9.2 |
 | F9 protocol and overflow | The same owned sequence with causes `Protocol` and `Overflow`, keeping `failed(protocol)` and `failed(overflow)` | Item 13.1 |
-| F10 cached hash vs readiness | `prepare` hashes the driver's recipe with the `InstanceCache`'s current identity (no syscall); a launch's fresh stat updates the cache before publication (r4: ticketed writes, final stat; R4-7) | Item 0, Item 3 |
+| F10 cached hash vs readiness | Superseded by Ruling C (r7): `prepare` hashes launch settings only | Item 0, Item 3 |
 | F11 generation-only decode failure | Correlation names an open generation but no turn: evidence to the connection evidence folder, the generation fails `protocol`, no turn invented | Item 5 |
 | F12 idle replay reader | The reader polls stdin readiness with a 10 ms timeout and checks its mode between polls; tested with an empty pipe | Item 14 |
 | F13 C1 P11 | Exact replacement keeping its bound and enforcement clauses | §9.3 |
@@ -168,17 +171,17 @@ Labels: **fact** (read in code or a spec), **decision** (this design),
 | Finding | Decision (short) | Section |
 |---|---|---|
 | R4-1 snapshot responder can exit unanswered | No request exists to be lost: the fence is registry state the supervisor's exit condition reads under the mutex; `join` awaits the supervisor's own handle until the cutoff and reads the task counts the supervisor keeps under that mutex (smaller than an atomically installed request; X0-R4-Q1) | Item 2.5, 2.7 |
-| R4-2 supervisor's own join omitted | `Servers::join`, inside the adapter set's existing shutdown, collects the supervisor's `JoinHandle`: ended → its counts; panicked → `failed + 1` plus the tasks its dropped set aborted; still running at the cutoff → `unjoined = live tasks + 1`, the handle kept. A panic guard resolves waiters and refuses later launches (r5: replaced by the recovery frame; R5-1–R5-3) | Item 2.5, 2.7 |
+| R4-2 supervisor's own join omitted | `Servers::join`, inside the adapter set's existing shutdown, awaits the supervisor's `JoinHandle` until the cutoff: ended → its counts; still running → `unjoined = tasks + 1`, the handle kept (r7: a supervisor panic aborts the daemon, Ruling D) | Item 2.5, 2.7 |
 | R4-3 fenced work accounting | Counts change only at an actual spawn (same critical section as the take) and at collection. After the fence, launch work is resolved explicitly (token dropped, waiters `Err(Shutdown)`, entry removed); retire and stop work are delegated to Host's shutdown, whose own report covers the group; nothing is counted for them | Item 2.5, 2.7 |
 | R4-4 connection-task handoff | The launch task drives the connection future during the handshake and returns it in its outcome; the supervisor spawns it into its set and only then publishes, in one critical section. After the fence, or with zero holders, the future is dropped unspawned | Item 2.1, 2.2, 2.5 |
 | R4-5 stop reply discarded | Host `CloseReport.stopped_live: Option<bool>` (this close's own `Stop` reply; `None` when missing or invalid), forwarded by `WireCloseReport`; only `Some(false)` after a stdio end upgrades to `ServerLost` (X2) | Item 13.1; §9.2 |
 | R4-6 seal cause type | Admission sealing separated from the disposition: `WireSender::seal()` takes no cause and is idempotent; the boundary carries only the discarded bytes; Route keeps a first-wins `ConnectionFailure` latch, with Wire's causes mapped into it | Item 13.1; §9.2 |
-| R4-7 cache freshness | Every stat takes an `InstanceCache` ticket just before its syscall; a write with an older ticket than the stored one is rejected; a launch writes its final post-handshake stat before publication or refusal (never its earlier capture), and an identity change bumps the epoch (r5: tickets replaced by per-path serialization; R5-4) | Item 0, Item 3 |
+| R4-7 cache freshness | Superseded by Ruling C (r7) | Item 3 |
 | R4-8 cleanup predicate without a cancel | A turn's link row is the persisted fact: the terminal commit deletes it, in the same transaction, when the committed cleanup is quiescent, and keeps it otherwise, cancel or not. The predicate reads remaining links to unproven anchors. No new column, no new C1 field (X0-R4-Q2) | Item 1, Item 6.5; §9.2, §9.3 |
 | R4-9 idle-driver loss | The registration's normalizer is driver-owned (the adapter normalizes), outside the connection task; when its lane ends without a boundary it installs the sticky loss and latches the driver's failure whether or not a turn runs; the loss reaches Core through `TurnEnd.loss` or the driver's close report and `record_loss` | Item 13.2, Item 10 |
 | R4-10 four-entry claim | Live and unproven server groups are bounded by the four slots; retained registry entries are not, and are bounded by their tasks | Item 2.3 |
 | R4-11 per-entry task bound | Publication happens when the launch outcome is collected, so an entry has either its launch task alone, or its connection task plus at most one cleanup task; zero-holder publication spawns no connection task; tested | Item 2.1, 2.2, 2.5 |
-| R4-12 old-identity test | A later `prepare` from any session hashes with the cache's fresh identity and pins the new server; separately, an already held old instance stays valid | Item 3 |
+| R4-12 old-identity test | Superseded by Ruling C (r7) | Item 3 |
 | R4-13 paused reader | While paused the reader does not poll stdin; it waits on the mode's condition variable with a 10 ms timeout; a paused, non-empty-pipe test | Item 14 |
 | R4-14 unknown loss count | Internally `u64::MAX` means unknown or saturated; publicly `omitted` is `null` then (X0-R4-Q3) | Item 10; §9.1, §9.3 |
 | R4-15 "one syscall" | "One non-blocking `poll_write` call" | Item 12.2; §9.2 |
@@ -187,32 +190,58 @@ Labels: **fact** (read in code or a spec), **decision** (this design),
 
 | Finding | Decision (short) | Section |
 |---|---|---|
-| R5-1 panic abandons child joins | The supervisor is a frame that owns the set and the ID map and runs every registry action as a synchronous step under `catch_unwind`; a panicking step unwinds only to the frame, which keeps collecting actual outcomes and is counted at the cutoff. Counts are recomputed from the set and map. The `JoinError` row counts a dropped set's children as unjoined, not failed (r6: recovery replaced by fail-fast, Ruling A) | Item 2.5, 2.7 |
-| R5-2 panic keeps unstarted launch tokens | The same recovery takes and drops every unstarted `Work::Launch`, fails its waiters and removes its task-free entry, as the fenced branch does (r6: superseded by fail-fast) | Item 2.5 |
-| R5-3 panic starts no bounded cleanup | The same recovery sets `work = Stop` on every opened connection (coalesced with a retirement); the next step spawns the existing `close(Stop, now + 5 s)` at once, with no daemon shutdown; connection tasks are not aborted. Then the registry stays degraded (launches refused) until restart (X0-R5-Q1) (r6: superseded by fail-fast) | Item 2.5 |
-| R5-4 cache residual | Stat-and-observe serialized per program path: an async per-path gate whose owned guard moves into the one `spawn_blocking` closure that stats and writes, so writes land in syscall order; `prepare` keeps the short cache lock; tickets removed. Tested with reversed orders and four slots held | Item 0, Item 3 |
+| R5-1 panic abandons child joins | Superseded by Ruling D (r7): crash-only | Item 2.5 |
+| R5-2 panic keeps unstarted launch tokens | Superseded by Ruling D (r7) | Item 2.5 |
+| R5-3 panic starts no bounded cleanup | Superseded by Ruling D (r7) | Item 2.5 |
+| R5-4 cache residual | Superseded by Ruling C (r7) | Item 3 |
 | R5-5 abnormal health behind delivery | Each lease registers an `Arc<LeaseSignal>` with the `Connection`, outside the connection task; the supervisor's step calls its synchronous handler at once, which installs the driver's loss and publishes its failure. Close reads the record directly; prefix disposal stays separate | Item 13.2 |
-| R5-6 normalizer unsupervised | A `NormalizerGuard` reports a panic or drop through the same handler, even when idle; the driver keeps and collects the `JoinHandle` at close; shutdown accounting is Core's existing tracker wait (r6: the collector owns it; Ruling B) | Item 13.2 |
+| R5-6 normalizer unsupervised | The normalizer reports `done`; its panic aborts the daemon; it runs on the session's tracker, which Core's shutdown awaits (r7, Ruling D) | Item 13.2 |
 | R5-7 first-cause wording | The R3-Q3 panic policy overrides the latched cause's disposition before fan-out; the prior cause stays for diagnostics; added to the precedence test | Item 13.1, 13.2 |
 | R5-8 "no link" too broad | "A recovered nonterminal turn with no link sent nothing", in C2 and runtime §7 | §9.1, §9.2 |
 | R5-9 X1 references | X1 merged at `e567cc5`; carrier `Json`, `NotJson` or `OverLimit` (`validation_limit`), passed unchanged; §9.1 quotes re-checked against C2 at `e567cc5` | Sources, Item 10 |
 
 ### 0.6 Round-6 findings and where each is answered
 
-Ruling A (fail fast) answers R6-1, R6-2, R6-3 and R6-9 and supersedes
-X0-R5-Q1; Ruling B (one collector) answers R6-5, R6-6 and R6-7.
+Ruling A (fail fast) and Ruling B (one collector) are superseded by
+Rulings C and D in r7 (§0.7).
 
 | Finding | Decision (short) | Section |
 |---|---|---|
-| R6-1 recovery after an unlocked, poisoned registry | No recovery. The frame takes the registry guard outside `catch_unwind` and keeps it; a panicking step leaves the mutex unpoisoned and unseen, and under that same guard the frame sets `failed` and fails every launch's `ready`, then requests fatal. Poison from any other caller is itself the failure mark and is never cleared; `Servers::lock()` returns `None` for both. Shutdown's counts live outside the registry (`FrameCounts`, the set's length) | Item 2.1, 2.5, 2.7 |
-| R6-2 frame failure abandons ownership | The frame holds the set through a take/restore guard that puts it back into `Servers::set` on any exit and sends `fatal`; `Servers::join` collects a restored set itself until the cutoff. After the failure the daemon enters its existing incomplete shutdown (`AdapterSet::fatal()` → Core's existing force); nothing is dropped while it lives | Item 2.5, 2.7; §9.1, §9.2 |
-| R6-3 a launch acquires a connection after the sweep | The launch task installs an opened connection only under the guard and only when the registry is not failed; otherwise it writes no handshake byte and runs the bounded `close(Stop, now + 5 s)` itself. The token cancels a running handshake, followed by the same stop; a `Ready` collected after the failure gets a stop task | Item 2.2, 2.5 |
+| R6-1 recovery after an unlocked, poisoned registry | Superseded by Ruling D (r7) | Item 2.5 |
+| R6-2 frame failure abandons ownership | Superseded by Ruling D (r7) | Item 2.5 |
+| R6-3 a launch acquires a connection after the sweep | Superseded by Ruling D (r7) | Item 2.5 |
 | R6-4 immediate `unknown` overtakes the queued acceptance | Health is published at once, but `run_turn` returns only after the queued prefix reached the C2 sink, or at the 5 s loss cutoff, where the rest is discarded and recorded; this keeps K1's `LaneState::dispose` and acceptance-based `attribute` working. Test with acceptance, a denial and a terminal queued behind a blocked normalizer | Item 13.2 |
-| R6-5 normalizer join ends at the close deadline | The normalizer is spawned into the adapter's collector, which owns its join from the start; the close waits on a `done` signal, so a timed-out or cancelled close or a replaced driver leaves nothing to transfer | Item 2.7, 13.2 |
-| R6-6 a collected normalizer panic is not in `failed_tasks` | The collector's sticky abnormal count (a panic, or any end other than a normal return; a token-cancelled return is normal) is folded into `failed_tasks` | Item 2.7, 13.2 |
-| R6-7 the blocking stat has no join owner | The stat's `spawn_blocking` runs on the collector's set; the gate stays inside the closure (R5-Q3); unfinished at the cutoff counts as pending | Item 2.7, Item 3 |
+| R6-5 normalizer join ends at the close deadline | The normalizer runs on the session's tracker from its spawn; the close waits on its `done` signal, so a timed-out or cancelled close or a replaced driver leaves nothing to transfer (r7: no collector) | Item 13.2 |
+| R6-6 a collected normalizer panic is not in `failed_tasks` | Superseded by Ruling D (r7): a normalizer panic aborts the daemon | Item 13.2 |
+| R6-7 the blocking stat has no join owner | Superseded by Ruling C (r7): no stat | Item 3 |
 | R6-8 successive losses keep a wrong sequence | Merge rule: the earliest `first_unqueued`, counts saturating or unknown, the original trigger, generation and `reported` flag kept | Item 10, 13.2 |
-| R6-9 recovery loses the readiness sender | Recovery is gone; every transition out of `Launching` sends `ready` its result first, and the failure sends `Err(Internal)` to every launch under the held guard | Item 2.1, 2.5 |
+| R6-9 recovery loses the readiness sender | Every transition out of `Launching` sends `ready` its result first (the failure sweep is gone, Ruling D) | Item 2.1, 2.2 |
+
+### 0.7 Round-7 findings and where each is answered
+
+Ruling C removes the identity cache, the stat gates, the final stat, the
+identity-driven epoch bumps and the binary identity in `config_hash`.
+Ruling D removes the registry's failed mark, the `catch_unwind` steps,
+the take/restore set, `FrameCounts`, `AdapterSet::fatal()` and the
+frame-failure path, and supersedes r6 Ruling A, R6-Q1 and R6-Q3. The
+collector goes with both (R7-4).
+
+| Finding | Decision (short) | Section |
+|---|---|---|
+| R7-1 set length unreadable at the cutoff | A panic under the registry guard aborts, so the mutex is never poisoned or left half-mutated; the supervisor keeps `tasks` and `failed` under it again, and `join` reads them there | Item 2.1, 2.7 |
+| R7-2 frame failure without an admission fence | Ruling D: no frame-failure path; a frame panic aborts the daemon | Item 2.5 |
+| R7-3 poisoning and incomplete accounting | Ruling D: the registry guard aborts on unwind before it unlocks; there is no failure to publish | Item 2.5 |
+| R7-4 collector admission | Re-evaluated without the stat: the collector is removed. The normalizer, its only other task, runs on the session's C2 tracker, which Core's final shutdown already awaits and counts; its panic aborts the daemon | Item 2.7, 13.2 |
+| R7-5 an earlier prefix-wait exit | As Sol proposed: one delivery cutoff (lane end, loss deadline, the turn's wall, stop and force, a close's delivery bound); at it the driver seals the registration's delivery synchronously and records the undelivered rest as loss; force keeps item 6.4's result | Item 8.2, 10, 13.2 |
+| R7-6 post-failure cleanup handle | Ruling D: no post-failure cleanup | Item 2.5 |
+| R7-7 publication versus readiness | Publication sends `ready` before it replaces `Launching` | Item 2.2 |
+| R7-8 collector diagnostic | No collector; the registry's text carries only registry counts | Item 2.7 |
+
+Tests: `registry_panic_aborts_daemon` replaces the panic-survival,
+collector and cache tests; `every_delivery_cutoff_seals` is new (§7).
+Placement: §8. §9 drops `fatal()`, the §6.2 incomplete-exit paragraph
+and the binary-identity wording, adjusts C2 §5's binary-change sentence,
+and adds a runtime §6.2 crash sentence (R7-Q1).
 
 ---
 
@@ -281,14 +310,8 @@ before 4.1 is visible to 4.2. A spurious wake costs one synchronous
   `dispatch` returns. Its driver did no vendor I/O.
 - Codex `prepare()` also pins a `Launching` equal-key entry, as a
   reservation (item 2.2).
-- Codex `prepare()` hashes the driver's recipe with the `InstanceCache`'s
-  current identity for its binary on every call (a SHA-256 over a few KiB,
-  no syscall; item 3). A launch writes its final post-handshake stat to
-  the cache before the supervisor publishes it, stats of one path being
-  serialized so their writes land in syscall order, and an identity
-  change bumps the epoch; so a waiter woken by that publication
-  re-prepares with the new identity and finds the new server without a
-  slot (r3 F10, r4 R4-7, r5 R5-4).
+- Codex `prepare()` hashes the driver's launch settings (item 3; a
+  SHA-256 over a few KiB, no syscall).
 
 **Why nothing smaller works.** Without a driver before admission there is
 nothing to ask. Without a subscription that precedes the check, an
@@ -404,22 +427,19 @@ the thread table under one lock.
 
 ```rust
 pub struct Servers {
-    state: Mutex<Registry>,              // std mutex, never held across .await
+    state: Mutex<Registry>,              // std mutex, never held across .await; only through `lock()` (item 2.5)
     epoch: watch::Sender<u64>,           // item 0 readiness
     work: Notify,                        // wakes the supervisor (item 2.5)
-    supervisor: Mutex<Option<JoinHandle<()>>>, // collected by `join` (item 2.7)
-    set: Mutex<Option<JoinSet<ServerTaskOutcome>>>, // the frame takes it; restored on any exit (item 2.5)
-    counts: FrameCounts,                 // panic-free; never under `state` (item 2.5)
-    cancel: CancellationToken,           // stops launch handshakes at the fence or the failure
-    fatal: watch::Sender<bool>,          // registry failed: `AdapterSet::fatal()` (item 2.5)
+    supervisor: tokio::sync::Mutex<JoinHandle<()>>, // awaited by `join` (item 2.7)
+    cancel: CancellationToken,           // stops launch handshakes at the fence
     declines: DeclineTable,              // item 11
 }
-struct FrameCounts { failed: AtomicUsize /* collected abnormal outcomes, sticky */ }
 struct Registry {
     by_key: HashMap<ConfigHash, ServerId>,   // the one non-retiring instance per key
     servers: HashMap<ServerId, Instance>,    // every instance not yet removed
     fenced: bool,                            // shutdown began (item 2.7)
-    failed: bool,                            // a step panicked (item 2.5); never cleared
+    tasks: usize,                            // spawned, not collected, all instances (item 2.7)
+    failed: usize,                           // collected panicked or cancelled tasks; sticky (item 2.7)
 }
 struct Instance { entry: Entry, work: Option<Work>, tasks: u8 /* spawned, not collected */ }
 enum Entry {
@@ -431,7 +451,7 @@ enum Entry {
 enum Work { Launch(LaunchSpec, CapacityToken), Retire, Stop /* abnormal end, item 13.2 */ }
 enum TaskKind { Launch, Connection, Retire, Stop }
 enum LaunchOutcome {
-    /// Handshake done and the final stat matched the recipe (item 3).
+    /// Handshake done.
     Ready { task: ConnectionTask, report: InstanceReport },
     /// `task` is the connection future when Wire's open succeeded and it has not ended.
     Failed { cause: LaunchFailure, task: Option<ConnectionTask> },
@@ -450,9 +470,9 @@ launch's cleanup always has its owner (item 2.5). `work` is the instance's
 coalesced pending task request (r3 F4): setting it and notifying `work`
 replaces a spawn channel, so nothing can be full and a retirement's
 cleanup ownership is state on the entry, never a message that can be
-dropped. An instance's `tasks` changes only when the supervisor spawns a
-task and when it collects one (item 2.5); the daemon-wide counts are the
-set's length and `FrameCounts`, both outside the registry. An entry is
+dropped. An instance's `tasks`, and the registry's total, change only when the
+supervisor spawns a task and when it collects one (item 2.5), so the
+total is the set's length whenever the mutex is free. An entry is
 removed only when its terminal state is reached **and** `tasks == 0`.
 Every transition out of `Launching` sends `ready` its result first, so a
 waiter never sees only a closed channel (r6 R6-9).
@@ -465,8 +485,7 @@ most two.
 #### 2.2 Launch, reservations and publication
 
 - `prepare()` (sync, no syscall), under the registry mutex, with the
-  hash of the driver's recipe and the `InstanceCache`'s current identity
-  (item 3):
+  driver's `config_hash` (item 3):
   - the session's own lease on a `Live` instance → `Pinned` (a pin cloned
     from the lease);
   - else `by_key[hash]` is `Live` → `Pinned` (`holders + 1`);
@@ -474,8 +493,7 @@ most two.
     (`holders + 1`);
   - else `NeedsConnection`. `Retiring` and `Lost` instances are never in
     `by_key`.
-- `run_turn` with `NeedsConnection` and a capacity token recomputes the
-  recipe from a fresh stat on a blocking step (item 3), then calls
+- `run_turn` with `NeedsConnection` and a capacity token calls
   `Servers::launch_or_join(recipe, token)`. Under the mutex it pins an
   existing `Live`/`Launching` instance for that hash and drops the token,
   or inserts `Launching { holders: 1 }` under a new `ServerId`, maps
@@ -484,27 +502,23 @@ most two.
 - A reservation holder waits on `ready`, bounded by its own wall, stop and
   force; dropping the wait drops the reservation (fenced).
 - **Launch task.** It opens the server's Wire connection (owner
-  `Server`) and, under the registry guard, installs it as
-  `Launching.connection` (fenced) only if the registry is neither failed
-  nor poisoned. Otherwise it writes nothing to the connection, runs the
-  bounded `WireSender::close(Stop, now + 5 s)` itself and returns
-  `Failed(Internal)` (r6 R6-3). It then builds the
-  `ConnectionTask` (which takes the unique `WireMessages` receiver) and
-  drives it **inside the launch task** during the handshake: one `select!`
-  over the handshake and `task.as_mut()`, so the connection task pairs the
-  handshake's replies (r4 R4-4). It then takes the final stat (item 3)
-  and returns `Ready { task, report }`, or `Failed { cause, task }`.
+  `Server`) and installs it as `Launching.connection` (fenced). It then
+  builds the `ConnectionTask` (which takes the unique `WireMessages`
+  receiver) and drives it **inside the launch task** during the
+  handshake: one `select!` over the handshake and `task.as_mut()`, so the
+  connection task pairs the handshake's replies (r4 R4-4). It returns
+  `Ready { task, report }`, or `Failed { cause, task }`.
   A connection task that ended during the handshake fails the launch with
   its cause (`task: None`).
 - **Publication** (the supervisor, applying a `Ready` outcome; one
   critical section): with `holders: n > 0` and no fence, it first spawns
-  `task` into its set (`tasks + 1`, item 2.5), and only then turns
-  `Launching { holders: n }` into `Live { holders: n, leases: 0 }`, every
-  surviving reservation now a pin, and sets `ready ← Ok`; the epoch is
-  bumped after the critical section. So the live connection is never
-  exposed before its connection task is owned. With `n == 0` the task is
-  dropped unspawned (no lease can exist), the entry becomes `Retiring`
-  with `work = Retire`, and `ready ← Err(Retired)`. After the fence, see
+  `task` into its set (`tasks + 1`, item 2.5), and only then sets
+  `ready ← Ok` and turns `Launching { holders: n }` into `Live { holders:
+  n, leases: 0 }`, every surviving reservation now a pin (r7 R7-7); the
+  epoch is bumped after the critical section. So the live connection is
+  never exposed before its connection task is owned. With `n == 0` the task is
+  dropped unspawned (no lease can exist), `ready ← Err(Retired)`, and the
+  entry becomes `Retiring` with `work = Retire`. After the fence, see
   item 2.5.
 - **Launch gates.** The handshake (`initialize`, `initialized`, paginated
   `model/list`) runs under `SERVER_HANDSHAKE = 60 s` from spawn
@@ -552,102 +566,64 @@ most two.
 - **Daemon idle exit.** Host's `pending_cleanup()` excludes live
   server-owned controls; final shutdown stops them.
 
-#### 2.5 Supervision (r2 N6; r3 F2–F4; r4 R4-1–R4-4, R4-11; r6 R6-1–R6-3, R6-9)
+#### 2.5 Supervision (r2 N6; r3 F2–F4; r4 R4-1–R4-4, R4-11; r7 Ruling D)
 
 **Mechanism** (runtime §2: each owner has a cancellation token and a
 `JoinSet`; tasks return typed outcomes; a `TaskTracker` alone is
 insufficient).
 - One supervisor task, spawned at construction (its handle in
   `Servers::supervisor`), **exclusively owns** the
-  `JoinSet<ServerTaskOutcome>` while it runs, and a map
-  `task::Id → (ServerId, TaskKind)`. Nothing else touches the set while
-  the supervisor holds it.
+  `JoinSet<ServerTaskOutcome>`, a local, and a map
+  `task::Id → (ServerId, TaskKind)`. Nothing else touches the set.
 - **Pending work, not a channel (F4).** Registry code sets an entry's
   `work` and calls `Servers::work.notify_one()`, which keeps a permit when
   the supervisor is not waiting. A `Retire` or `Stop` requested while
   either is pending or running coalesces. There is no full or closed
   state.
-- **The frame.** The supervisor's body is an outer **frame**. It takes the
-  set out of `Servers::set` through a take/restore guard (the same guard
-  `Servers::join` uses for the supervisor's handle, item 2.7), so the set
-  goes back into `Servers::set` on every exit of the frame, a panic
-  included. Each collected outcome is counted by the frame before any
-  registry code runs: a panic or cancellation adds 1 to
-  `FrameCounts::failed`. The set's length and `FrameCounts` are the only
-  counts shutdown reads; neither lives under the registry mutex.
 - **Loop.** Each iteration:
-  1. **Step.** The frame takes the registry guard **outside**
-     `catch_unwind` and keeps it, then runs the step inside
-     `std::panic::catch_unwind(AssertUnwindSafe(..))` on that borrowed
-     guard. The step applies the event's outcome, if any (`tasks − 1`,
-     using `Ok((id, outcome))` or `JoinError::id()` to find
-     `(server, kind)`), then, for every instance with `work`: before the
-     fence, takes it and spawns it into the set in the same critical
-     section (`JoinSet::spawn` is synchronous; nothing between the take
-     and the spawn can skip it), recording its ID and `tasks + 1` (R4-3);
-     after the fence, resolves it without spawning (below). The step
-     returns whether `fenced` holds and the set is empty. A step holds
-     only that guard and never awaits.
-  2. **Frame.** If the step said so, return. Otherwise await, `select!`
-     biased: `set.join_next_with_id()`, only while the set is non-empty, or
-     the work notification. Back to 1 with that event.
+  1. **Step.** Under one registry guard, never across an await: apply the
+     event's outcome, if any (`tasks − 1` on the instance and the
+     registry, using `Ok((id, outcome))` or `JoinError::id()` to find
+     `(server, kind)`; a `JoinError` also adds 1 to `failed`); then, for
+     every instance with `work`: before the fence, take it and spawn it
+     into the set in the same critical section (`JoinSet::spawn` is
+     synchronous; nothing between the take and the spawn can skip it),
+     recording its ID and `tasks + 1` (R4-3); after the fence, resolve it
+     without spawning (below). The step returns whether `fenced` holds and
+     the set is empty.
+  2. If the step said so, return. Otherwise await, `select!` biased:
+     `set.join_next_with_id()`, only while the set is non-empty, or the
+     work notification. Back to 1 with that event.
 
   There is no request to answer and no other exit (R4-1): `fence()` sets
   `fenced` under the mutex that step 1 reads, then notifies.
-- **Fail fast (r6 Ruling A, R6-1–R6-3; supersedes X0-R5-Q1).** There is
-  no degraded continuation.
-  - **A panicking step.** The guard the step borrowed was never dropped
-    by the unwind, so the mutex is not poisoned and nobody else saw the
-    partial mutation. Under that **same guard**, before unlocking, the
-    frame sets `failed = true` and sends `Err(Internal)` to every
-    `Launching` entry's `ready` (R6-9). Those two writes read nothing the
-    panic could have broken: a flag, and one send on each sender found in
-    the map. Then it drops the guard, cancels the token (launch
-    handshakes stop at their next await), counts the step in
-    `FrameCounts::failed` and sends `fatal ← true`.
-  - **A poisoned registry.** A panic in any other registry caller (a
-    `prepare`, a pin's drop) poisons the mutex. Every registry access goes
-    through `Servers::lock() -> Option<Guard>`, which returns `None` when
-    the mutex is poisoned or `failed` is set; the first caller to see the
-    poison cancels the token, notifies the frame and sends `fatal ←
-    true`. Poison is never cleared.
-  - **No further normal mutation.** With `lock()` returning `None`:
-    `prepare` answers `NeedsConnection`; `launch_or_join` refuses with an
-    internal error (a spawn failure, never cached); a pin's or lease's drop
-    and a connection task's `Live → Lost` transition skip the registry and
-    keep their Host and driver duties (item 13.1). The frame runs no more
-    steps.
-  - **No connection starts after the failure (R6-3).** A launch task
-    installs an opened connection only under the guard (item 2.2): one
-    that Wire opened after the failure is never installed, gets no
-    handshake byte, and is stopped by the launch task's bounded
-    `close(Stop, now + 5 s)`. A handshake in progress is cancelled by the
-    token; the launch task then runs the same bounded stop before
-    returning. A `Ready` outcome collected after the failure (its
-    handshake ended just before it) is never published: the frame spawns a
-    stop task, `close(Stop, now + 5 s)`, for its connection into the set.
-  - **The daemon's existing incomplete shutdown.** `fatal` is forwarded as
-    `AdapterSet::fatal()`. Core raises its existing force exactly as an
-    accepted `daemon/stop` force or a latched Store failure does (stop
-    mode `Force`, the force signal), without marking a Store failure;
-    daemon main then enters final shutdown (runtime §6.2). The frame's
-    `FrameCounts::failed ≥ 1` makes the report's `failed_tasks` non-zero,
-    so the exit is incomplete (4). In-flight turns end under the existing
-    force rules (item 6.4 for a shared server). The next CLI call
-    auto-starts a fresh daemon.
-  - **What shutdown reads from a failed registry: nothing (Ruling A.4).**
-    Host's existing final shutdown closes every live control, server
-    groups included, from Host's own ledger. `Servers::join` reads only
-    the supervisor's handle, the set and `FrameCounts`. After the failure
-    the frame keeps the set and only collects: each outcome is counted, no
-    registry code runs, and a connection carried by an outcome is stopped
-    as above. Connection, retirement and stop tasks end once Host has
-    stopped their groups; the frame returns when the set is empty.
-  - **A failure of the frame itself.** The frame runs no registry code
-    outside the guarded step. If it still unwinds, its take/restore guard
-    puts the set back into `Servers::set` and sends `fatal ← true`; the
-    set is not dropped, and `Servers::join` collects it (item 2.7). Nothing
-    is dropped while the daemon lives.
+- **Crash-only (r7 Ruling D).** A panic in the supervisor, or in any
+  code holding the registry guard (a step, a `prepare`, a pin's or
+  lease's drop, a `Live → Lost` transition), is a VIA bug. The daemon
+  aborts; there is no in-process recovery:
+  - `Servers::lock()` returns a `RegistryGuard` wrapping the std guard.
+    It records `std::thread::panicking()` when taken, and its `Drop`,
+    which runs before the inner guard's, calls `std::process::abort()`
+    when a panic began while it was held. So the mutex is never poisoned
+    and no caller sees a half-applied mutation. A guard taken during an
+    unrelated unwind (a pin dropped by a panicking Core task) does not
+    abort for that panic.
+  - The supervisor runs inside `codex::crash_on_panic(fut)`, a future
+    wrapper whose `poll` runs the inner `poll` under
+    `std::panic::catch_unwind` and aborts on `Err`; it covers the
+    supervisor's code outside the guard.
+  - The `via.log` line comes from a panic hook daemon main installs once
+    `via.log` is open: one bounded JSON line with the panic's message and
+    location, written at the panic, before the unwind, under `try_lock`
+    (a panic inside logging writes nothing); then the previous hook runs.
+  - The workspace stays on `panic = "unwind"`; only these places abort.
+    The connection, launch, retirement and stop tasks keep their collected
+    outcomes (below; item 13.2).
+  - Recovery is the existing crash path: each anchor cleans its group on
+    its control's EOF (runtime §5), and the next daemon's restart recovery
+    (runtime §7, item 6.1) ends each in-flight turn `unknown`, its cleanup
+    from its linked server anchor. The next CLI call auto-starts the
+    daemon.
 - **Fenced work is resolved explicitly (R4-3):**
   - `Launch(spec, token)`: the capacity token is dropped (no group was
     acquired), `ready ← Err(Shutdown)`, `by_key` removed (fenced), the
@@ -702,75 +678,49 @@ insufficient).
 - Server launch, retirement and loss Host calls run only on the
   supervisor's tasks, so no dropped requester discards an outcome.
 
-#### 2.7 Daemon shutdown (r2 N7, N8; r4 R4-1–R4-3; r6 R6-1, R6-2, R6-5–R6-7)
+#### 2.7 Daemon shutdown (r2 N7, N8; r4 R4-1–R4-3; r7 R7-1, R7-4, R7-8)
 
 `AdapterSet::shutdown(deadline, turns)`:
-1. `Servers::fence()` (sync): through `lock()`, `fenced = true` (skipped
-   when the registry failed); then, either way, cancel the token and
-   notify the supervisor. No new pin, reservation or launch; launch
-   handshakes stop at their next await; pending work is resolved
+1. `Servers::fence()` (sync): under the guard, `fenced = true`; then cancel
+   the token and notify the supervisor. No new pin, reservation or launch;
+   launch handshakes stop at their next await; pending work is resolved
    explicitly (item 2.5).
 2. Run concurrently, all under the same absolute `deadline`:
    - the existing Route, Wire and Host shutdown (Host closes every live
      control, servers included, with its existing 1 s finalization reserve;
      Codex handles TERM gracefully);
-   - `Servers::join(cutoff = deadline − FINALIZE_RESERVE)`: takes the
-     supervisor's `JoinHandle` and awaits it until the cutoff (a
-     take/restore guard puts the handle back if `join` is itself
-     dropped). The supervisor returns only when its set is empty and
-     either `fenced` holds or the registry failed (item 2.5), so its
-     normal end means every task it spawned was collected. If it ended
-     with a `JoinError`, `join` takes the set its guard restored to
-     `Servers::set` and collects it itself until the cutoff, counting each
-     outcome as the frame does;
-   - `Collector::join(cutoff)` (r6 Ruling B, below), with the same
-     take/restore guard.
-3. Read the counts when the joins return. They come only from the
-   supervisor's handle, the set's length and `FrameCounts`, never from the
-   registry (R6-1, Ruling A.4):
+   - `Servers::join(cutoff = deadline − FINALIZE_RESERVE)`: locks
+     `Servers::supervisor` and awaits `&mut JoinHandle` until the cutoff;
+     a `join` that is itself dropped leaves the handle in place. The
+     supervisor returns only when its set is empty and `fenced` holds
+     (item 2.5), so its end means every task it spawned was collected.
+3. When the join returns, read `tasks` and `failed` under the guard
+   (R7-1):
 
    | Supervisor | `unjoined` | `failed` |
    |---|---|---|
-   | Ended | 0 | `FrameCounts::failed` |
-   | Panicked or cancelled (`JoinError`) | the restored set's tasks still running at the cutoff | `FrameCounts::failed + 1` |
-   | Still running at the cutoff | the set's length + 1 (its children and itself) | `FrameCounts::failed` |
+   | Ended | 0 | `failed` |
+   | Still running at the cutoff | `tasks` + 1 (its children and itself) | `failed` |
 
-   In the last case the handle goes back into `Servers::supervisor`, and in
-   the second the remaining set back into `Servers::set`; both stay owned
-   by the adapter set until the process exits (runtime §2, §6.2). A zero
-   child count alone therefore never reads as clean: the supervisor's own
-   state is part of the report (R4-2). Fenced retire and stop work counts
-   nothing here; Host's report covers that cleanup (item 2.5).
-4. Fold into the existing report: `pending_tasks += unjoined +
-   collector_unfinished`, `failed_tasks += failed + collector_abnormal`,
-   and append to `failure` the bounded text "server registry: {unjoined}
-   tasks unjoined, {failed} failed" (and "registry failed" after a fail-fast
-   failure) when any is non-zero. Core's clean-exit predicate
-   (`pending_tasks == 0 && failed_tasks == 0`) then covers the registry and
-   the collector unchanged. No new report field.
+   It never ends with a `JoinError`: its panic aborts the daemon, and
+   nothing aborts it. A running supervisor's handle stays in
+   `Servers::supervisor`, owned until the process exits (runtime §2,
+   §6.2). A zero child count alone therefore never reads as clean (R4-2).
+   Fenced retire and stop work counts nothing here; Host's report covers
+   that cleanup (item 2.5).
+4. Fold into the existing report: `pending_tasks += unjoined`,
+   `failed_tasks += failed`, and append to `failure` the bounded text
+   "server registry: {unjoined} tasks unjoined, {failed} failed" when
+   either is non-zero (R7-8). Core's clean-exit predicate
+   (`pending_tasks == 0 && failed_tasks == 0`) then covers the registry
+   unchanged. No new report field.
 
-**The adapter's collector (r6 Ruling B: R6-5, R6-6, R6-7).** One
-`codex::Collector` (Adapters `codex/collector.rs`), owned by the Codex
-adapter, owns every Codex task whose requester may stop waiting: each
-registration's normalizer (item 13.2) and each `spawn_blocking` stat of
-the identity cache (item 3).
-- **Ownership from the start.** Such a task is spawned into the
-  collector's `JoinSet` (`spawn` or `spawn_blocking`), and its requester
-  waits on a result channel instead of the join handle. A requester that
-  is cancelled, a close whose deadline passed, and a replaced driver
-  therefore leave nothing to transfer: the join was never theirs. This is
-  the smaller form of "moving the handle into the collector".
-- **Outcomes.** On each spawn the collector reaps finished tasks
-  (`try_join_next`, as Wire's `Stragglers` does). A collected outcome is
-  abnormal when it is a panic, or any end other than a normal return
-  (a normalizer returning on its session's `cancel` token is normal); a
-  sticky `abnormal` count records it and is folded into `failed_tasks`
-  (step 4).
-- **Shutdown.** `Collector::join(cutoff)` takes the set out through the
-  same take/restore guard as `Servers::join`, joins until the cutoff, and
-  reports the tasks still running as unfinished (`pending_tasks`); the
-  rest of the set goes back to the collector, owned until the process
-  exits.
+**No collector (R7-4).** Without the blocking stat (item 3), the
+normalizer was the collector's only task. It runs on the session's C2
+`SessionCx.tracker` instead (item 13.2), which Core's final shutdown
+already awaits until its Host bound and counts as pending when unfinished
+(fact: `stop.rs`, `drivers_joined`). Its panic aborts the daemon, so it
+has no failed outcome to count.
 
 **Tests that fail first.**
 - X3, unit (`codex/servers.rs`, stand-in connection):
@@ -806,149 +756,67 @@ the identity cache (item 3).
   stand-in retirement started before the fence that never ends: Host
   still stops every group before its deadline; at the cutoff `join`
   reports `unjoined = 2`, the task and the supervisor, and the exit is not
-  clean); `registry_panic_counts_failed_task`;
-  `step_panic_requests_incomplete_shutdown` (a test hook panics a step
-  while an unstarted launch is queued, a leased server is live and a
-  retirement runs: the registry is marked failed under the guard the step
-  held, the mutex is not poisoned, launch waiters get `Err(Internal)`,
-  `AdapterSet::fatal()` fires and Core raises its force; the frame keeps
-  collecting the retirement's and the connection task's actual outcomes
-  until Host's shutdown has stopped their groups; the report's
-  `failed_tasks ≥ 1` and the exit is incomplete; Ruling A);
-  `wire_open_after_failure_is_stopped` (a launch held in Wire's open
-  across the panic: it finds the registry failed when it installs the
-  connection, writes no handshake byte, runs its bounded stop, and the
-  group is proved absent; R6-3); `poisoned_registry_is_failed` (a panic
-  in a non-supervisor registry caller poisons the mutex: the next access
-  sends `fatal`, and the poison is never cleared);
-  `frame_panic_set_restored` (a test hook panics the frame outside its
-  steps: the set is back in `Servers::set`, `fatal` fires, and `join`
-  collects its children; R6-2).
-- X3 (collector): `collector_counts_normalizer_panic` (a normalizer
-  panics and is collected after its driver closed: shutdown
-  `failed_tasks ≥ 1`; R6-6); `normalizer_cancel_is_normal` (a session's
-  cancel ends it: not counted); `cancelled_stat_requester_join_collected`
-  (a `run_turn` dropped during a blocked stat: the closure keeps the gate,
-  is collected when it finishes, and counts as unfinished at a cutoff
-  before then; R6-7); `close_deadline_leaves_normalizer_to_collector` (a
-  close whose deadline passes while the normalizer still runs: the
-  normalizer is collected later; R6-5).
+  clean); `registry_panic_counts_failed_task` (a retirement task panics:
+  `failed_tasks = 1`); `close_deadline_leaves_normalizer_on_tracker` (a
+  close whose deadline passes while the normalizer runs: it still ends on
+  the session's tracker, and a final shutdown before then counts it
+  pending; R6-5).
+- X3 (daemon, replay harness): `registry_panic_aborts_daemon` (a
+  test-build point in a registry step, armed with the existing
+  failpoint `fail_io` action, which the hook turns into a `panic!` under
+  the guard, while a turn runs on a replayed server: the daemon dies by
+  `SIGABRT`, never exit 0 or 4; `via.log` has the panic line; a restarted
+  daemon recovers the turn `unknown` with cleanup from its linked server
+  anchor (runtime §7), and the server group is proved absent; repeated
+  with the point in `prepare` and in the normalizer; Ruling D).
 - X4: `c4_two_sessions`, `codex_server_close`.
 
-### Item 3. `config_hash` and binary changes (r2 N18)
+### Item 3.- X4: `c4_two_sessions`, `codex_server_close`.
+
+### Item 3. `config_hash` (r2 N18; r7 Ruling C)
 
 **Decision.**
 - `codex::ConfigHash([u8; 32])`: SHA-256 over a length-prefixed canonical
-  encoding of, in order:
+  encoding of the VIA-controlled launch settings, in order:
   1. the domain tag `"via codex server key v1"`;
   2. `adapter_version`;
   3. the resolved program path bytes;
-  4. its `BinaryIdentity` (device, inode, size, mtime s and ns; symlinks
-     followed);
-  5. argv after the program (`app-server`, `--disable hooks` when hooks are
+  4. argv after the program (`app-server`, `--disable hooks` when hooks are
      off, later verified switches);
-  6. the passed environment, sorted `(name, value)` pairs: the allow-list
+  5. the passed environment, sorted `(name, value)` pairs: the allow-list
      values and `CODEX_SQLITE_HOME`; Host's random `VIA_PROCESS_MARKER`
      excluded;
-  7. the server cwd (`<state>/vendor/codex`);
-  8. the protocol pin
+  6. the server cwd (`<state>/vendor/codex`);
+  7. the protocol pin
      `"initialize-v1;app-server-v2;client=via;experimental=none;opt-out=none"`.
-- Excluded: credentials, bound, model, instructions, session cwd, effort,
-  VIA version. The observed vendor version is reported, never hashed.
+- Excluded: file stats and binary contents, credentials, bound, model,
+  instructions, session cwd, effort, VIA version. The vendor version
+  observed at the handshake is reported and checked against the
+  supported versions (C2 §5), never hashed.
+- X1's merged `ServerRecipe::config_hash(adapter_version, identity)`
+  drops its `identity` input, and its test drops the identity case (X3).
+- `prepare` and `launch_or_join` hash the driver's launch settings; no
+  syscall.
 - J0's opaque `ServerKey(String)` (`RoutePlan.server_key`,
   `ServerReport.key`) holds the first 16 lowercase hex digits of the hash.
-- The refusal-cache recipe key is `config_hash` plus the bound and policy
-  inputs, so a refusal for one binary identity never applies to another.
+- The C2 §5 refusal cache keeps its key: the binary identity `plan`
+  already stats for it, plus the recipe digest, which for Codex is
+  `config_hash` plus the bound and policy inputs.
 - `via-adapters` gains the workspace dependency `sha2` (shared with
   Claude's Q4).
 
-**The identity cache (r4 R4-7, r5 R5-4).** `codex::InstanceCache`
-(Adapters `codex/launch.rs`) has two locks:
-- `identities: std::Mutex<HashMap<PathBuf, BinaryIdentity>>`, the cache
-  `prepare` reads; held only for a map lookup or insert, never across a
-  syscall or an await;
-- `gates: std::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>`, one
-  gate per program path (a handful of paths; never removed).
+**No binary-change detection (owner scope rule, Ruling C).** A server runs
+whatever binary was at the program path when it launched. A binary
+replaced under a live server is not detected: equal-key turns keep
+joining that server until it retires (idle, loss or daemon exit), and the
+new binary takes effect at the next launch. How a vendor behaves across
+its own upgrades (live work, threads made by an older version) is out of
+VIA's scope.
 
-**Stat-and-observe is serialized per path.** `InstanceCache::stat(path)`
-acquires the path's gate (`lock_owned().await`), then spawns one
-blocking closure **into the adapter's collector** (`spawn_blocking` on
-its set, item 2.7) that owns the gate guard and does both the `stat`
-syscall and the write of its result into `identities`, then drops the
-guard; the caller waits for the identity on a oneshot. Because the
-closure owns the guard, a caller dropped while waiting for it does not
-release the gate early: no two stats of one path overlap, and their
-writes land in syscall order. The closure's join belongs to the
-collector from its spawn, so a cancelled caller detaches nothing (r6
-R6-7). A write that changes the
-identity bumps the registry epoch. The cache therefore always holds the
-identity of the path's most recent stat. Tickets are gone.
-
-Two stats write: `run_turn`'s stat before registry insertion, and a
-launch's **final** stat after its handshake. Publication writes nothing
-else; it never writes the identity captured before the handshake.
-
-**Binary change between prepare and launch.**
-1. `prepare` is synchronous and does no syscall: on every call it hashes
-   the driver's recipe with the `InstanceCache`'s **current** identity for
-   its binary path (r3 F10). A pin on an existing instance is always
-   valid: an existing server keeps its leases after a binary change ("a
-   new server key follows only for new connections", C2 §5), and a
-   session's own lease is matched first (item 2.2).
-2. `run_turn` with `NeedsConnection` recomputes the whole recipe from a
-   fresh `InstanceCache::stat` before registry insertion. Insertion and
-   lookup use that stat's hash.
-3. The launch task spawns exactly the recipe it hashed. After the
-   handshake it re-stats the program path (the final stat, through the
-   same gate) **before** returning its outcome:
-   - same identity as the recipe: `Ready`; the supervisor publishes (item
-     2.2) and bumps the epoch. A turn waiting for a slot with the old
-     identity is woken (item 0), re-prepares with the cache's new
-     identity, finds the new server and pins it without a slot;
-   - a different identity: `Failed` (a spawn failure, never cached), the
-     instance retires; the final stat's write bumped the epoch, so waiters
-     re-prepare with the identity it saw.
-
-   So no instance is published under a hash belonging to another binary
-   identity. (A replacement and restoration with identical device, inode,
-   size and nanosecond mtime between the two stats is not detected;
-   accepted.)
-4. **No stale order remains.** Since writes follow syscall order, a
-   published server's identity is in the cache when the supervisor
-   publishes it, unless a later stat saw the binary change again, in which
-   case new connections correctly use the newer binary. A waiter woken by
-   the publication therefore matches the server without a slot, whatever
-   order the stats of competing recipes on the same path started in. The
-   cache can trail the file system only until the next stat, which is the
-   C2 rule anyway ("a new server key follows only for new connections").
-
-**Failure behaviour.** A `stat` failure in `run_turn` is a spawn failure,
-never cached, nothing sent.
-
-**Tests that fail first.** X1: equal inputs → equal hash; each component
-changes it; excluded inputs do not; display is 16 hex digits. X3:
-`binary_change_before_launch_uses_fresh_hash` (prepare saw the old
-identity, the turn launches under the new hash, and a later `prepare`
-from another session hashes with the cache's fresh identity and pins the
-new server; R4-12); `held_old_instance_stays_valid` (a session leasing
-the old-identity server keeps getting `Pinned` on its own lease after the
-change, while a new session pins the new server; R4-12);
-`binary_change_during_handshake_refuses_publication` (the cache then
-holds the final stat's identity and the epoch was bumped);
-`stat_and_observe_serialized` (two recipes on one path: a test hook
-holds the first stat's closure before its syscall while the binary is
-replaced and the second stat is requested; the second waits for the gate,
-and the cache ends with the later syscall's identity; R5-4);
-`reversed_stat_order_slots_full` (all four slots held by long-lived
-servers, one of them matching the new identity: with the two stats'
-start and syscall orders reversed by test hooks, a waiter prepared with
-the old identity is woken and pins the matching server without a slot;
-R5-4); `dropped_caller_keeps_gate` (a `run_turn` dropped while its stat
-runs: the next stat of that path waits for the closure to finish);
-`waiter_with_old_identity_joins_fresh_server` (four slots held, a waiter
-prepared with the old identity, another session's launch publishes the
-new identity's server: the waiter is woken and pins it without a slot).
-X4: different hook settings launch two servers.
+**Tests that fail first.** X1 (adjusted in X3): equal inputs → equal
+hash; each component changes it; excluded inputs, a file stat included,
+do not; display is 16 hex digits. X4: different hook settings launch two
+servers.
 
 ### Item 4. `CODEX_SQLITE_HOME` (Q6, G4)
 
@@ -1204,9 +1072,10 @@ struct Registration { lease: LeaseId, generation: u64, lane: IngressLane }
   observation sink, bounded by `close_deadline − 500 ms`. The C2 10 s
   no-drain timer stays in force during close as everywhere (F14); the
   shorter close deadline simply ends the wait earlier, so no exception
-  text is needed. Anything not handed over when the wait ends is counted
-  into the driver's `ObservationLoss` (item 10), reported in
-  `CloseReport.loss`.
+  text is needed. When the wait ends the driver seals the registration's
+  delivery (item 13.2's `DeliverySeal`, R7-5), so nothing is handed over
+  after the close returns, and counts the rest into the driver's
+  `ObservationLoss` (item 10), reported in `CloseReport.loss`.
 - Only then are the registration's tombstones marked `sink_open = false`;
   later items attributed to them are dropped and counted. A late terminal
   for an `unknown` turn decoded before the cutoff is delivered as C2's
@@ -1348,8 +1217,9 @@ reply; written once the reply brings the `turnId`);
   `ObservationLoss { trigger: (SessionId, TurnNumber), generation, first_unqueued: u64, omitted: u64 }`
   (saturating; `omitted == u64::MAX` means **unknown or saturated**, as on
   the abnormal path of item 13.2; publicly `omitted: null` then, r4
-  R4-14), updated by later loss in the same generation (a
-  close's undelivered prefix included, item 8.2). **Merge rule (r6
+  R4-14), updated by later loss in the same generation (the
+  undelivered rest at a close or a delivery cutoff included, items 8.2,
+  13.2). **Merge rule (r6
   R6-8):** a later loss keeps the record's `trigger`, `generation` and
   `reported` flag, sets `first_unqueued` to the minimum of the two (the
   earliest known affected sequence), and adds the counts saturating, or
@@ -1391,8 +1261,8 @@ reply; written once the reply brings the `turnId`);
   `data` (≤ 4 KiB) `{trigger_turn: "s_…/N", generation, first_unqueued,
   omitted}`, `omitted` being `null` when the count is unknown or
   saturated. It covers every loss source: ingress overflow, the C2 stall,
-  a close's undelivered prefix and a failed connection or normalizer
-  task (an idle driver's included, item 13.2).
+  a close's undelivered prefix and a failed connection task (an idle
+  driver's included, item 13.2).
 - Quarantined traffic is read, counted and discarded; replies still pair,
   requests are still declined. Reserved-path or global exhaustion fails
   the connection.
@@ -1685,7 +1555,7 @@ Steps 2–4 run concurrently:
    (fenced); Host keeps the slot until absence is proved; an uncertain
    journal write sets the watch (item 2.6).
 
-#### 13.2 The abnormal path: the connection task itself failed (F3, R4-9, R5-5, R5-6)
+#### 13.2 The abnormal path: the connection task itself failed (F3, R4-9, R5-5, R5-6, R7-5)
 
 The connection task owns the unique `WireMessages` receiver and the
 thread table, so a panic or cancellation loses both; nothing can drain
@@ -1732,29 +1602,50 @@ treats as the same abnormal end (the handler is idempotent). **Handler
 locks and panics:** the handler takes only the driver's loss mutex, a
 leaf lock (the driver never takes the registry guard while holding it),
 then sends on the driver's health watch. The supervisor calls it inside
-its guarded step, so a panic in it is a step panic (item 2.5, fail fast).
+its step, under the registry guard, so a panic in it aborts the daemon
+(item 2.5).
 
-**The running turn waits for its queued prefix (r6 R6-4).** Health is
-published at once, but `run_turn` does not return at once: it waits until
-the normalizer has handed the registration's queued prefix to the C2 sink
-(the lane's end), or until `loss_deadline = now + SERVER_LOSS_EVIDENCE`
-(5 s, the bounded loss cutoff of 13.1), or its own wall, stop or force.
-At the cutoff the normalizer discards what it has not delivered, and the
-loss record's `first_unqueued` becomes the earliest undelivered sequence
-(the merge rule, item 10). So an acceptance, a durable turn observation
-and a terminal queued before the panic reach Core in the same order as
-on a normal turn end, while the turn is still running. That matters for
-K1 at `820e9fb`: `LaneState::dispose` drops an idle `Accepted`, and
-`attribute` maps a vendor turn ID to a turn only through an acceptance
-the drive processed; a turn that ended first would leave a queued denial
-session-level and a queued terminal unattributable. The turn then
-returns: a delivered terminal is applied first, as on server loss (13.1
-step 3); otherwise `TransportLost` (`unknown`), cleanup `Uncertain`, with
-`TurnEnd.loss`: observations not yet queued, a staged terminal included,
-are explicitly lost. Core retires the failed driver after the turn's
-end, as for any driver failure. An idle driver has no `run_turn` to
-return it: its loss reaches
-Core through its close report, and `record_loss` commits one `late: true`
+**The running turn waits for its queued prefix (r6 R6-4, r7 R7-5).**
+Health is published at once, but `run_turn` returns only at the
+**delivery cutoff**, the earliest of:
+- the lane's end: the normalizer handed the queued prefix to the C2 sink;
+- `loss_deadline = now + SERVER_LOSS_EVIDENCE` (5 s, 13.1);
+- the turn's own wall, stop or force;
+- a concurrent driver close's delivery bound (item 8.2).
+
+At that cutoff, before returning, the driver **seals** the registration's
+delivery (below) and merges what was not delivered into its loss record:
+`first_unqueued` becomes the earliest undelivered sequence (the merge
+rule, item 10), `omitted` unknown. It then returns what that cutoff
+gives: at the lane's end a delivered terminal is applied first, as on
+server loss (13.1 step 3), otherwise, and at the loss deadline,
+`TransportLost` (`unknown`), cleanup `Uncertain`, with `TurnEnd.loss`;
+wall and stop keep their existing results; force returns item 6.4's
+`ForceStopped` at once (the seal is synchronous), so a launched turn
+still ends `unknown`/`unknown`. So an acceptance, a durable turn
+observation and a terminal queued before the panic reach Core in order
+while the turn still runs, and nothing of that registration reaches Core
+after `run_turn` returned. That matters for K1 at `820e9fb`:
+`LaneState::dispose` drops an idle `Accepted`, and `attribute` maps a
+vendor turn ID to a turn only through an acceptance the drive processed;
+a turn that ended first would leave a queued denial session-level and a
+queued terminal unattributable. Core retires the failed driver after the
+turn's end, as for any driver failure.
+
+**The delivery seal.** Each registration has one `DeliverySeal`, a std
+mutex over `{ sealed: bool, next: u64 }`, `next` being the sequence of
+the next item to deliver. The normalizer first acquires an item's sink
+capacity (its byte-budget permit and a channel slot through
+`mpsc::Sender::reserve`, both cancel-safe, within the C2 stall bound);
+then, under the seal's mutex, it either sends with the synchronous
+`Permit::send` and advances `next`, or, when sealed, releases both and
+returns. `seal()` sets `sealed` under the same mutex and returns `next`.
+Once `seal()` returned, no item of that registration enters the sink,
+and `next` is exactly the first that did not. It is idempotent; a close's
+delivery barrier (item 8.2) uses the same seal.
+
+An idle driver has no `run_turn` to return it: its loss reaches Core
+through its close report, and `record_loss` commits one `late: true`
 `observations_lost` warning on the trigger turn when that turn is
 terminal (item 10). Example: A already `unknown`, its driver open, A's
 late terminal not yet queued when the connection task panics: A stays
@@ -1762,33 +1653,22 @@ late terminal not yet queued when the connection task panics: A stays
 A driver with no registration on that connection installs no loss but
 still latches failure, so its next turn reopens on another connection.
 
-**The normalizer is a supervised task (R5-6, R6-5, R6-6).** Each
+**The normalizer is crash-only (R5-6, R6-5; r7 Ruling D).** Each
 registration's normalizer is driver-owned (the adapter normalizes, packet
-§2) and is spawned into the adapter's collector (item 2.7), not onto the
-session's `TaskTracker`, which alone is insufficient (runtime §2):
-- **Result reporting.** Its future is wrapped by a `NormalizerGuard`,
-  armed at spawn and disarmed only when the normalizer returns normally:
-  at its lane's boundary or end, or on the session's `cancel` token
-  (driver close or daemon shutdown). The guard's `Drop`, run by panic
-  unwinding or by the future's drop without completion, calls the same
-  driver abnormal-end handler with `first_unqueued` = the next sequence it
-  would have delivered: the driver installs the loss and publishes its
-  failure at once, even when idle. The lane's receiver is dropped with
-  it, so the demux drops and counts that generation's later items. A
-  running turn has no prefix left to wait for: it returns as above at
-  once and also posts its interrupt cleanup intent, since the connection
-  is alive.
-- **Collection.** The collector owns its join from the spawn. The
-  driver's close waits, bounded by the close deadline and after the
-  delivery barrier (item 8.2), on a `done` signal the normalizer sends
-  when it ends; a close that times out, a cancelled close and a replaced
-  driver leave the join with the collector, which collects it later
-  (R6-5).
-- **Shutdown accounting.** The collector counts a panic or any end other
-  than a normal return as abnormal, folded into the shutdown report's
-  `failed_tasks`, so a normalizer that panicked and was collected during a
-  close still makes the exit unclean; a normalizer still running at the
-  cutoff counts as pending (item 2.7, R6-6).
+§2) and is spawned on the session's C2 `SessionCx.tracker`, wrapped in
+`codex::crash_on_panic` (item 2.5):
+- It returns at its lane's boundary or end, at the seal, or on the
+  session's `cancel` token (driver close or daemon shutdown), and then
+  sends a `done` signal. A lane that ends without a boundary is the
+  abnormal end above (the handler is idempotent).
+- Its panic is a VIA bug: the daemon aborts and restart recovery applies
+  (item 2.5). So it has no failed outcome to report, and `done` is its
+  result, which a `TaskTracker` needs beside it (runtime §2).
+- The driver's close waits on `done`, bounded by the close deadline and
+  after the delivery barrier (item 8.2). A close that times out, a
+  cancelled close and a replaced driver leave the task on the tracker,
+  which Core's final shutdown awaits and counts as pending while it runs
+  (item 2.7, R6-5).
 
 This is the smaller option: the receiver is not kept outside the
 unwinding body; the signal uses only facts the driver already holds and
@@ -1821,17 +1701,16 @@ one counter outside the connection task.
   normalizer blocked on a full C2 sink when the connection task panics:
   A's driver publishes its failure at once; once Core drains, the
   acceptance is processed while A runs, the denial is attributed to A
-  (never session-level) and A ends with its terminal; with the sink
-  still blocked at the loss cutoff, A ends `unknown` with `first_unqueued`
-  at the earliest undelivered item and nothing becomes session-level;
-  R6-4); `successive_losses_keep_earliest_sequence` (a connection failure
-  recording 101, then a normalizer failure at 50: the record holds 50,
-  `omitted` unknown, the original trigger and one late warning; R6-8);
-  `normalizer_panic_reports_failure_when_idle` (a test
-  hook panics an idle driver's normalizer: the driver publishes its
-  failure and loss, the collector collects the panic and counts it
-  abnormal, and the shared connection and other sessions continue;
-  R5-6);
+  (never session-level) and A ends with its terminal; R6-4);
+  `every_delivery_cutoff_seals` (the same queue with the sink blocked,
+  once per cutoff: loss deadline, wall, stop, force and a close's
+  delivery bound: when `run_turn` or the close returns, the loss record's
+  `first_unqueued` is the first undelivered item, and after the sink
+  unblocks nothing of that registration reaches Core; under force A ends
+  `unknown`/`unknown` at once, item 6.4; R7-5);
+  `successive_losses_keep_earliest_sequence` (the abnormal end records
+  101 at once, the cutoff seals at 50: the record holds 50, `omitted`
+  unknown, the original trigger and one late warning; R6-8);
   `correlation_failure_is_protocol_not_unknown` (an unattributable line:
   both turns `failed(protocol)` after the same sequence, Host's stop
   included); `first_failure_cause_wins` (a protocol failure and Host's
@@ -1909,9 +1788,11 @@ and after `resume_input` the whole line is read.
 | Shutdown awaits the supervisor's handle and reads counts kept under the registry mutex | A snapshot request answered by the supervisor | — |
 | A turn's link deleted at a quiescent terminal is its persisted cleanup fact | A cleanup column on `server_turns`, or a C1 envelope field | — |
 | Seal without a cause; Route keeps the first-wins disposition | A cause type carried through Wire's boundary | — |
-| A panicking registry step fails fast into the daemon's existing incomplete shutdown | Degraded continuation, or restarting the supervisor on possibly inconsistent state | — |
-| Tasks whose waiter may leave are spawned into one collector from the start | Transferring handles on timeout, cancellation or replacement | — |
+| A panic in the supervisor or under the registry guard aborts the daemon; restart recovery applies | In-process recovery, a failed mark or a fatal signal | — |
+| The normalizer runs on the session's tracker and is crash-only | A collector counting its failures | — |
 | Abnormal end signalled through a per-lease handler | A watcher task per driver | — |
+| One synchronous delivery seal at every delivery cutoff | Waiting for the normalizer to acknowledge the cutoff | — |
+| A binary replaced under a live server is not detected (owner scope rule) | Stat gates, a final stat and the binary identity in the key | — |
 | Server `stderr.log` uncapped | Rotation | Its growth |
 
 ---
@@ -1924,26 +1805,23 @@ and after `resume_input` the whole line is read.
    queued turn's slot need.
 3. **`SessionDriver::connection_kind() -> ConnectionKind { PerTurn, Shared }`**:
    daemon force maps differently on shared servers (C1 §7.6).
-4. **`AdapterSet::fatal()`**: only a route with shared, daemon-wide state
-   (the Codex registry) can fail in a way no single turn or driver
-   reports; the fake and Claude never raise it.
-5. **`AdapterSet::journal_uncertain()`**: Host journal writes with no
+4. **`AdapterSet::journal_uncertain()`**: Host journal writes with no
    driver alive. Claude's per-driver watch suffices for it.
-6. **`TurnEnd.loss` and `CloseReport.loss`**: only shared-ingress routes
+5. **`TurnEnd.loss` and `CloseReport.loss`**: only shared-ingress routes
    lose observations of an already terminal turn.
-7. **`AnchorRecovery.owner`, `ReprobeReport.not_committed`**:
+6. **`AnchorRecovery.owner`, `ReprobeReport.not_committed`**:
    `ProcessOwner`; Claude uses only `Turn`.
-8. **Wire:** `WriteBounds::StartBy`, the `Claimed`/`Started` job states,
+7. **Wire:** `WriteBounds::StartBy`, the `Claimed`/`Started` job states,
    `withdraw`, `hold_data`, `StagingPermit`, the cause-free idempotent
    `seal`, `drain_admitted`, and Host's `stopped_live` stop reply forwarded
    in `WireCloseReport`: needed by any shared connection, unused by
    private routes.
-9. **Steer size on Codex:** 46,336 encoded bytes per driver (the reserved
+8. **Steer size on Codex:** 46,336 encoded bytes per driver (the reserved
    cleanup slots come out of C2's 64 KiB). A larger steer is
    `OverCapacity`, an existing C2 error; Claude has no steer.
-10. **`launched` on server routes** means the turn's first byte reached
+9. **`launched` on server routes** means the turn's first byte reached
    Wire.
-11. **Daemon idle predicate** excludes server-owned controls.
+10. **Daemon idle predicate** excludes server-owned controls.
 
 ---
 
@@ -1951,14 +1829,15 @@ and after `resume_input` the whole line is read.
 
 | # | Question | Recommendation |
 |---|---|---|
-| R6-Q1 | **Contract conflict, reported, not chosen.** Ruling A's fail-fast raises Core's existing force (Item 2.5). C1's force rows (§7.6) were written for a caller's `daemon/stop` force: every running turn, on any harness, then ends with a filled `cancel` (private: `cancelled`/`forced` or `unknown`/`requested`; shared: `unknown`/`unknown`), as if a caller had cancelled it, and C1 §8.2 has no failure class for "the daemon stopped itself after an internal adapter failure". Store failure has its own class (`store`); this path has none. | Recommend accepting the force rows as they are for now: it is a bug path, the `via.log` shutdown summary names the registry failure, and the exit is incomplete (4). If the owner wants such turns told apart, the smaller change is one C1 failure class (for example `daemon_failure`) committed in place of the force row's state, as `store` is; that needs a C1 amendment this design does not make. |
-| R6-Q2 | Item 2.7: the collector owns each normalizer's and blocking stat's join from its spawn, and requesters wait on a result channel, instead of moving handles into the collector on timeout, cancellation or driver replacement. | Accept: it is the smaller form of Ruling B, with no transfer cases to get wrong; the take/restore guard is reused for `Collector::join`. |
-| R6-Q3 | Items 2.5, §9.1: `AdapterSet::fatal()` is a new C2 accessor, a trigger only. Core reacts by raising its existing force without marking a Store failure (a new internal Core call beside the Store latch's `fail_pending`). | Accept: it is the smallest way for the adapter to request the existing incomplete shutdown; reusing `journal_uncertain()` would misreport the failure as a Store failure. |
+| R7-Q1 | **Contract conflict, reported, not chosen.** Ruling D's abort is a process exit that a library starts. Runtime §6.2 says: "Only daemon main selects this path; a library timeout or dropped handle never exits the process or detaches work." A panic is neither a timeout nor a dropped handle, so the letter may not forbid it, but the contract has no rule for VIA's own panics, and §2's "spawned tasks return typed outcomes and are collected promptly" assumes the owner survives its children. C1 needs no change: a crash already ends in-flight turns through restart recovery. | Accept the §9.2 sentence that names this crash as the one exception: never exit 0 or 4, recovered by §7. |
+| R7-Q2 | Item 13.2 (the ruling's open choice): a normalizer panic is crash-only, not a counted failed task. | Accept: its counted failure needed the collector, its admission fence (R7-4) and its diagnostic (R7-8); crash-only needs only `crash_on_panic` and the tracker C2 already gives. The line stays where the rulings drew it: the connection, launch, retirement and stop tasks, which the supervisor collects anyway, keep their collected outcomes, so one connection's bug does not abort every session. Making them crash-only too would remove the abnormal path of 13.2 at that price; that is the owner's call. |
 
-Ruled earlier: X0-R5-Q1 (degraded until restart) is superseded by Ruling
-A; X0-R5-Q2 (the synchronous lease handler) and X0-R5-Q3 (the owned gate
-in the blocking closure), accepted by Sol in r6; X0-R4-Q1 (no shutdown
-request; the handle and counts),
+Ruled earlier: R6-Q1 and R6-Q3 are superseded by Ruling D, and R6-Q2
+(the collector) is moot (r7); X0-R5-Q1 (degraded until restart) was
+superseded by Ruling A; X0-R5-Q2 (the synchronous lease handler),
+accepted by Sol in r6; X0-R5-Q3 (the owned gate in the blocking closure)
+is moot under Ruling C; X0-R4-Q1 (no shutdown request; the handle and
+counts),
 X0-R4-Q2 (link deletion; `alive: false` for an idle quiescent session),
 X0-R4-Q3 (public `omitted: null`) and X0-R4-Q4 (the anchor's
 autonomous-cleanup `Some(false)` residual), accepted by Sol in r5;
@@ -1996,9 +1875,9 @@ schema numbering, R1-Q1 to R1-Q4) likewise.
 
 | Chunk | Tests |
 |---|---|
-| X1 | `config_hash` (item 3); launch environment (item 4); decline bodies (item 11) |
+| X1 | `config_hash` (item 3; its identity case is removed in X3); launch environment (item 4); decline bodies (item 11) |
 | X2 | Item 0: `pinned_join_needs_no_slot`, `queued_turn_reprepares_on_readiness`, `readiness_insert_between_prepare_and_wait`, `unsubmitted_lane_is_retired`. Item 1: `host_server_owner_outlives_turns`, `store_server_anchor_and_link`, `wire_server_open_has_no_turn_folder`, `link_turn_on_turn_owner_is_invalid`. Item 2: `daemon_idle_exit_not_blocked_by_idle_server`, `host_journal_uncertain_watch`. Item 4: bootstrap `vendor/`. Item 6: `recovery_server_anchor_proved_absent`, `recovery_server_anchor_unproven`, `recovery_unlinked_server_turn_sent_nothing`, `recovery_partial_settlement_rechecks_server_anchor`, `reprobe_ownerless_not_committed`, `shutdown_link_read_failure_still_stops_groups`, `shutdown_force_shared_is_unknown`, `shared_close_cleanup_from_turn_facts`, `spontaneous_uncertain_end_keeps_link`, `quiescent_terminal_releases_link`, `close_absence_check_ignores_server`. Item 12: the Wire tests of 12.5 (claim versus first byte, holds, expiry, permits). Item 13: `drain_admitted_yields_prefix_then_boundary`, `seal_is_exact_prefix`, `seal_is_idempotent`, `close_reports_stop_reply`. (The concurrent lane drain's test is K1's.) |
-| X3 | Registry and supervision unit tests: coalesced work, retained entries, the connection-task handoff, zero-holder publication, fenced launch and retirement, the supervisor's end at the fence, its handle at the cutoff, `step_panic_requests_incomplete_shutdown`, `wire_open_after_failure_is_stopped`, `poisoned_registry_is_failed`, `frame_panic_set_restored`, the collector tests, failed-task count (item 2); binary-change and cache tests including `stat_and_observe_serialized`, `reversed_stat_order_slots_full`, `dropped_caller_keeps_gate`, `held_old_instance_stays_valid` and `waiter_with_old_identity_joins_fresh_server` (item 3); classification including the generation-only branch (item 5); cleanup-intent tests (item 8.3); `codex_never_ask` additions (item 11); guard, budget, reserved-size and staging tests (item 12); `connection_task_panic_with_staged_terminal`, `connection_task_panic_idle_driver_reports_loss`, `abnormal_health_not_behind_delivery`, `blocked_normalizer_prefix_keeps_attribution`, `successive_losses_keep_earliest_sequence`, `normalizer_panic_reports_failure_when_idle`, `correlation_failure_is_protocol_not_unknown`, `first_failure_cause_wins` (item 13); symlinked `vendor/codex` (item 4); the replay join, `replay_mode_ack_with_empty_stdin` and `replay_paused_nonempty_pipe_waits` (item 14) |
+| X3 | Registry and supervision unit tests: coalesced work, retained entries, the connection-task handoff, zero-holder publication, fenced launch and retirement, the supervisor's end at the fence, its handle at the cutoff, failed-task count, `close_deadline_leaves_normalizer_on_tracker`, and the daemon-level `registry_panic_aborts_daemon` (item 2); `config_hash` without the binary identity (item 3); classification including the generation-only branch (item 5); cleanup-intent tests (item 8.3); `codex_never_ask` additions (item 11); guard, budget, reserved-size and staging tests (item 12); `connection_task_panic_with_staged_terminal`, `connection_task_panic_idle_driver_reports_loss`, `abnormal_health_not_behind_delivery`, `blocked_normalizer_prefix_keeps_attribution`, `every_delivery_cutoff_seals`, `successive_losses_keep_earliest_sequence`, `correlation_failure_is_protocol_not_unknown`, `first_failure_cause_wins` (item 13); symlinked `vendor/codex` (item 4); the replay join, `replay_mode_ack_with_empty_stdin` and `replay_paused_nonempty_pipe_waits` (item 14) |
 | X4 | `c4_two_sessions`, `codex_server_close`, two keys → two servers, `servers` (items 2, 3, 7); `codex_two_threads` cutoff, reopen, fence and lease-fence assertions (item 8); request-record exhaustion (item 9.1); `codex_server_lost_order`, `codex_transport_loss_is_unknown`, `stop_reply_missing_stays_transport`, `stdout_end_then_dead_on_stop_is_server_lost`, `server_loss_cleanup_not_blocked_by_inherited_stdout`, `overflow_failure_keeps_overflow_class` (item 13) |
 | X5 | `codex_bounds_overflow` additions and the Core loss helper (item 10); `codex_rss_leases` (item 9.2); decline deadline with the reader paused (items 11, 14); `CODEX_SQLITE_HOME` persists (item 4) |
 
@@ -2011,10 +1890,10 @@ schema numbering, R1-Q1 to R1-Q4) likewise.
 | `via-store` | `ServerId`, `ProcessOwner`; schema bump (`anchors` owner, `server_turns`); `commit_server_turn`, `server_links`; `EvidenceRoot::create_server`; `UnfinishedTurn.server_anchor`; `link_released` on every terminal-committing record (deletes the link); `session_cleanup_uncertain` over remaining links; status unproven server anchors | X2 |
 | `via-host` | Re-export `ProcessOwner`; `link_turn`; `RecoveryReport.owner`; `ReprobeReport.not_committed: Vec<ProcessOwner>`; shutdown closes first, then bounded link read and cleanup-only fold; `Held.owner: ProcessOwner`; `pending_cleanup` excludes server controls; `journal_uncertain()` watch; `CloseReport.stopped_live: Option<bool>` | X2 |
 | `via-wire` | `open_connection` by owner; `turn_folder`; `link_turn`; `RuntimeConfig.vendor_state_dir`; on J0's queue: ticketed `StartBy` data slot, `Claimed`/`Started` states with the first byte under the lock, `withdraw`, `hold_data`; `StagingPermit`; cause-free idempotent `seal`, `drain_admitted`; `WireCloseReport.stopped_live`; journal-uncertain passthrough | X2 |
-| `via-core` | Item 0 dispatch order and readiness subscription; (the lane actor's concurrent drain during driver close is K1's); `Reconciled` server facts; partial-settlement meet; `FailureScope::Daemon` for ownerless proofs; shared force `unknown/unknown`; `journal_uncertain` latch; `AdapterSet::fatal()` raising the existing force without a Store failure; registry and collector counts folded by the adapter set (no Core change); `link_released` from the committed terminal's cleanup; `record_loss` and `observations_lost` (`omitted: null` when unknown) | X2 (`record_loss`: X5) |
-| `via-routes` | `RouteRuntime` pass-throughs (X2); `codex::{Servers, supervisor (frame, guarded steps, fail-fast, take/restore set), ServerPin, Lease, LeaseSignal, ConfigHash, DeclineTable, Connection, ConnectionFailure, ThreadTable, RequestTable, Feeder, TurnWrites}` | X3, X4 |
-| `via-adapters` | `codex::DECLINES`, launch recipe; `AnchorRecovery.owner`; `journal_uncertain()`; `ConnectionPin` payload; `SessionDriver::{readiness, connection_kind}`; `TurnEnd.loss`, `CloseReport.loss`; registry and collector counts into `pending_tasks`/`failed_tasks`; `AdapterSet::fatal()`; `codex::Collector` (normalizers and blocking stats, sticky abnormal count); `InstanceCache` with per-path serialized stat-and-observe on the collector, written by `run_turn`'s stat and a launch's final stat; the driver's abnormal-end handler (loss and health at once, the earliest-sequence merge) and the collector-owned normalizer with the prefix wait | X1, X2, X3, X4, X5 |
-| `via-cli` | Bootstrap `<state>/vendor/` | X2 |
+| `via-core` | Item 0 dispatch order and readiness subscription; (the lane actor's concurrent drain during driver close is K1's); `Reconciled` server facts; partial-settlement meet; `FailureScope::Daemon` for ownerless proofs; shared force `unknown/unknown`; `journal_uncertain` latch; registry counts folded by the adapter set (no Core change); `link_released` from the committed terminal's cleanup; `record_loss` and `observations_lost` (`omitted: null` when unknown) | X2 (`record_loss`: X5) |
+| `via-routes` | `RouteRuntime` pass-throughs (X2); `codex::{Servers, supervisor, RegistryGuard (aborts on unwind), crash_on_panic, ServerPin, Lease, LeaseSignal, ConfigHash, DeclineTable, Connection, ConnectionFailure, ThreadTable, RequestTable, Feeder, TurnWrites}` | X3, X4 |
+| `via-adapters` | `codex::DECLINES`, launch recipe; `AnchorRecovery.owner`; `journal_uncertain()`; `ConnectionPin` payload; `SessionDriver::{readiness, connection_kind}`; `TurnEnd.loss`, `CloseReport.loss`; registry counts into `pending_tasks`/`failed_tasks`; `ServerRecipe::config_hash` without the binary identity; the driver's abnormal-end handler (loss and health at once, the earliest-sequence merge); the crash-only normalizer on the session's tracker, the prefix wait and the `DeliverySeal` (with a reserve-then-send path in `ObservationSink`) | X1, X2, X3, X4, X5 |
+| `via-cli` | Bootstrap `<state>/vendor/`; the panic hook writing one `via.log` line | X2 |
 | `via-fake-agent` | Polling chunked reader, timed condition wait while paused, `expect_large`, `pause_input`/`resume_input`, acknowledged transitions | X3 |
 
 ---
@@ -2034,14 +1913,23 @@ failure paragraphs).
 observed_binary_version, config_hash)` where hash covers VIA-controlled
 startup/environment, not credentials;" with:
 
-> Codex owned stdio server key: `config_hash`, covering the resolved
-> binary's path and identity and VIA-controlled startup/environment, not
-> credentials; the observed binary version is reported, not keyed;
+> Codex owned stdio server key: `config_hash`, covering VIA-controlled
+> launch settings (resolved program path, arguments, passed environment,
+> server cwd, protocol pin), not credentials or binary contents; the
+> observed binary version is reported, not keyed;
 
 **§6.2 Process shape row, Codex cell.** Replace "key `(codex,
 observed_binary_version, config_hash)` excluding credentials and bound
-(A8)" with "key `config_hash` (binary identity included) excluding
-credentials and bound (A8)".
+(A8)" with "key `config_hash` (VIA-controlled launch settings)
+excluding credentials and bound (A8)".
+
+**§5, last version bullet (r7 Ruling C).** Replace "A new server key
+follows only for new connections." with:
+
+> Whether a binary change makes a new key is the route's key rule (A8).
+> Codex's key does not cover binary contents: a Codex binary replaced
+> under a live server is not detected, and takes effect at the next
+> server launch.
 
 **§2, RuntimeConfig paragraph (G4).** Replace "The Wire-defined
 `RuntimeConfig` carries validated `anchor_binary` and `anchor_dir` paths
@@ -2066,9 +1954,6 @@ folder and owns its narrow connection." with:
 ```rust
     /// Sticky: some Host journal write's outcome was uncertain, including writes no driver owns.
     pub fn journal_uncertain(&self) -> watch::Receiver<bool>;
-    /// Sticky: an adapter's daemon-wide owned state failed (a Codex registry step panicked);
-    /// Core raises its existing force, and final shutdown is incomplete (runtime §6.2).
-    pub fn fatal(&self) -> watch::Receiver<bool>;
 ```
 
 **§2 sketch, `impl SessionDriver`.** After `prepare`, add:
@@ -2437,17 +2322,15 @@ under it; Host opens the turn's `stderr.log` for the child;" with:
 > the child; daemon bootstrap creates `vendor/`, and each adapter its own
 > subdirectory, under the managed-directory rules above;
 
-**§6.2, incomplete exit (r6 Ruling A).** After "**Incomplete**: at the
-deadline, or after a failure that precludes clean completion, the daemon
-snapshots the remaining uncertainty, aborts unfinished tasks, reports
-those that did not join and exits **4**.", add:
+**§6.2, VIA's own panic (r7 Ruling D; R7-Q1).** After "Only daemon main
+selects this path; a library timeout or dropped handle never exits the
+process or detaches work.", add:
 
-> An adapter whose daemon-wide owned state failed (C2
-> `AdapterSet::fatal()`; a Codex registry step that panicked) does not
-> continue degraded: Core raises its force as an accepted force stop does,
-> without marking a Store failure, and daemon main enters final shutdown.
-> The adapter keeps every owned task until it is collected or the
-> deadline passes, and its failed task makes the exit incomplete.
+> The one exception is a panic in the Codex server registry, its
+> supervisor or a Codex normalizer: the process aborts after the panic
+> hook's best-effort `via.log` line. That is a daemon crash, never exit 0
+> or 4; the anchors clean their groups (§5) and restart recovery (§7)
+> ends the in-flight turns.
 
 **§6.2, force bullet.** After "and drains its pipes under its cleanup
 bound.", add:
@@ -2500,9 +2383,10 @@ is `(codex, observed_binary_version, config_hash)` without bound;
 not credentials." with:
 
 > Codex owned stdio server key is `config_hash` without bound;
-> `config_hash` includes the resolved binary's identity and VIA-controlled
-> startup/environment configuration, not credentials; the observed binary
-> version is reported, not keyed.
+> `config_hash` covers VIA-controlled launch settings (resolved program
+> path, arguments, passed environment, server cwd, protocol pin), not
+> credentials or binary contents; the observed binary version is
+> reported, not keyed.
 
 The rest of the row ("Every turn sets `sandboxPolicy`; mixed-bound sharing
 waits for pinned enforcement proof. …") is unchanged.
@@ -2567,11 +2451,10 @@ config_hash)`." with:
 After "It does not hash credential contents.", add:
 
 > The hash covers, in order, a domain tag, the adapter version, the
-> resolved program path and binary identity, the exact argv, the passed
-> environment (names and values, without Host's process marker), the
-> server's cwd and the protocol pin. A launch recomputes it from a fresh
-> stat before joining or reserving, and refuses to publish a server whose
-> binary identity changed before its handshake ended.
+> resolved program path, the exact argv, the passed environment (names
+> and values, without Host's process marker), the server's cwd and the
+> protocol pin; never file stats or binary contents. A server runs the
+> binary it launched with; an upgrade takes effect at the next launch.
 
 Replace "so the handshake deadline is the turn's remaining wall time."
 with:
