@@ -232,11 +232,30 @@ impl CodexAdapter {
     }
 
     /// A resume turn (C2 §2): AD12's version check, then the per-turn
-    /// refusals; the bound applies as requested.
+    /// refusals, then (AD18) the effort against the session's model in the
+    /// catalog its server key's live instance discovered, once one did; the
+    /// bound applies as requested.
     pub(crate) fn check_turn(
+        &self,
         route: &'static str,
         stored_version: &str,
         turn: &TurnParams,
+    ) -> Result<TurnCheck, Refusal> {
+        let catalog = turn
+            .inherit
+            .and_then(|inherit| self.catalog(&self.server_key(inherit)));
+        Self::judge_turn(route, stored_version, turn, catalog.as_deref())
+    }
+
+    /// [`Self::check_turn`] against `catalog`, the session's server key's
+    /// discovered catalog if any: a model it lists that does not advertise
+    /// the effort refuses it; no catalog, or a model it does not list,
+    /// leaves the effort to `run_turn`.
+    fn judge_turn(
+        route: &'static str,
+        stored_version: &str,
+        turn: &TurnParams,
+        catalog: Option<&[DiscoveredModel]>,
     ) -> Result<TurnCheck, Refusal> {
         if stored_version != ADAPTER_VERSION && !COMPATIBLE.contains(&stored_version) {
             let mut refusal = Refusal::new(
@@ -253,12 +272,21 @@ impl CodexAdapter {
             max_steps: turn.max_steps.is_some(),
             vendor: &turn.vendor,
         };
-        match refusals(route, &per_turn).into_iter().next() {
-            Some(refusal) => Err(refusal),
-            None => Ok(TurnCheck {
-                effective_bound: turn.bound.clone(),
-            }),
+        if let Some(refusal) = refusals(route, &per_turn).into_iter().next() {
+            return Err(refusal);
         }
+        if let (Some(model), Some(catalog)) = (turn.model.as_deref(), catalog)
+            && driver::vendor_effort(turn.effort.as_deref(), catalog, model).is_err()
+        {
+            return Err(Refusal::new(
+                RefusalKind::InvalidParam { field: "effort" },
+                Some(route),
+                format!("effort is not a value the session's model advertises on route {route}"),
+            ));
+        }
+        Ok(TurnCheck {
+            effective_bound: turn.bound.clone(),
+        })
     }
 }
 

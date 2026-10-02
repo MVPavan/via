@@ -42,16 +42,16 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, watch};
 use via_adapters::{
-    AdapterError, Admitted, CancellationToken, ClassHint, Cleanup, CloseMode, Deadline, DenialKind,
-    DriverFailure, DriverHealth, InheritPlan, Observation, ObservationItem, Prepared, RouteError,
-    RoutePlan, SessionCx, SessionDriver, SessionRef, SessionSpec, StartRejected, SteerDelivery,
-    SteerError, SteerInput, SteerToken, StopCause, StopOrder, StopReason, TaskTracker,
-    TurnActivity, TurnCx, TurnEnd, TurnNumber, TurnSpec, VendorTerminal, VendorTerminalStatus,
-    VendorTurnId, observation_channel,
+    AdapterError, AdapterSet, Admitted, CancellationToken, ClassHint, Cleanup, CloseMode, Deadline,
+    DenialKind, DriverFailure, DriverHealth, InheritPlan, Observation, ObservationItem, ParamSizes,
+    Prepared, RouteError, RoutePlan, SessionCx, SessionDriver, SessionRef, SessionSpec,
+    StartRejected, SteerDelivery, SteerError, SteerInput, SteerToken, StopCause, StopOrder,
+    StopReason, TaskTracker, TurnActivity, TurnCx, TurnEnd, TurnNumber, TurnParams, TurnSpec,
+    VendorTerminal, VendorTerminalStatus, VendorTurnId, observation_channel,
 };
 use via_store::{ResumeRecord, SessionId, SpawnRecord, SubmissionRecord, TerminalRecord};
 
-use crate::conformance_drive::Pure;
+use crate::conformance_drive::{Pure, refusal_name};
 use crate::conformance_expect::{TurnOutcome, replay_exit};
 
 /// The wall of a turn whose case states no deadline.
@@ -146,6 +146,10 @@ struct Session {
     driver: SessionDriver,
     receiver: RefCell<Option<mpsc::Receiver<Admitted>>>,
     plan: RoutePlan,
+    /// The frozen `instructions`' and `cwd`'s sizes in bytes, as Core's
+    /// `check_turn` of a later turn carries them; `None` instructions when
+    /// the session has none.
+    sizes: (Option<usize>, usize),
     /// The turns committed so far.
     turns: RefCell<u32>,
 }
@@ -282,6 +286,10 @@ impl<'a> Run<'a> {
                 fs::create_dir_all(&cwd).map_err(|e| format!("cwd: {e}"))?;
                 cwd
             };
+            let sizes = (
+                session["instructions"].as_str().map(str::len),
+                cwd.as_os_str().len(),
+            );
             let spec = SessionSpec {
                 session_id: id.clone(),
                 model: plan.model.resolved.clone(),
@@ -316,6 +324,7 @@ impl<'a> Run<'a> {
                     driver,
                     receiver: RefCell::new(Some(receiver)),
                     plan: plan.clone(),
+                    sizes,
                     turns: RefCell::new(0),
                 },
             );
@@ -366,7 +375,14 @@ impl<'a> Run<'a> {
                 .sessions
                 .get(&label)
                 .ok_or_else(|| format!("turn {index}: session {label} was not opened"))?;
-            ran.turn = self.run_turn(index, turn, session).await?;
+            let spec = self.turn_spec(turn)?;
+            ran.turn = match resume_refusal(&self.pure.set, session, &spec) {
+                Some(refusal) => TurnOutcome {
+                    plan_refusal: Some(refusal),
+                    ..TurnOutcome::default()
+                },
+                None => self.run_turn(index, turn, session).await?,
+            };
             let last = self.expect["turns"]
                 .as_array()
                 .and_then(|turns| turns.iter().rposition(|t| session_of(t) == label));
@@ -1287,6 +1303,43 @@ fn session_of(turn: &Value) -> &str {
 }
 
 /// A typed value, or none when null or absent.
+/// Core's resume intake: a later turn's `check_turn` of its values against
+/// the session's frozen ones, before its receipt (C2 §2, AD18). `Some` is
+/// the refusal's C2 name; a session's first turn was checked at its spawn.
+fn resume_refusal(set: &AdapterSet, session: &Session, spec: &TurnSpec) -> Option<String> {
+    if *session.turns.borrow() == 0 {
+        return None;
+    }
+    let (instructions, cwd) = session.sizes;
+    let params = TurnParams {
+        effort: spec.effort.clone(),
+        bound: spec.bound.clone(),
+        output_schema: spec.output_schema.is_some(),
+        instructions: instructions.is_some(),
+        max_steps: spec.max_steps,
+        vendor: spec.vendor.clone(),
+        sizes: ParamSizes {
+            instructions: instructions.unwrap_or_default(),
+            output_schema: spec
+                .output_schema
+                .as_ref()
+                .map_or(0, |schema| schema.get().len()),
+            cwd,
+            model: session.plan.model.resolved.len(),
+        },
+        inherit: Some(session.plan.inherit.requested),
+        model: Some(session.plan.model.resolved.clone()),
+    };
+    let session_ref = SessionRef {
+        harness: session.plan.harness.to_owned(),
+        route: session.plan.route.to_owned(),
+        adapter_version: session.plan.adapter_version.clone(),
+    };
+    set.check_turn(&session_ref, &params)
+        .err()
+        .map(|refusal| refusal_name(&refusal))
+}
+
 fn optional<T: serde::de::DeserializeOwned>(value: &Value) -> Result<Option<T>, String> {
     if value.is_null() {
         return Ok(None);

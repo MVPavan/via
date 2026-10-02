@@ -861,7 +861,7 @@ fn activate(
 
 /// The turn's effort as the vendor names it, refused when the session's
 /// model is in the catalog and does not advertise it (packet §4).
-fn vendor_effort(
+pub(super) fn vendor_effort(
     requested: Option<&str>,
     catalog: &[DiscoveredModel],
     model: &str,

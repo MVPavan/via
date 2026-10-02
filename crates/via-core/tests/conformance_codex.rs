@@ -92,6 +92,7 @@ cases! {
     c5_resume_missing,
     c6_cold_initialize,
     c7_bad_model,
+    c7_effort_catalog,
     c8_auth,
     c9_output_schema;
     red:
@@ -100,7 +101,6 @@ cases! {
     c3_interrupt_uncertain = "red until via-5lr.3.2 X4 (interrupt and P7)",
     c3_wall_interrupt = "red until via-5lr.3.2 X4 (the wall's soft stop)",
     c4_two_sessions = "red until via-5lr.3.2 X4 (leases across sessions)",
-    c7_effort_catalog = "red until C2 gives check_turn the session's model (x.3.2 X3 gap)",
 }
 
 /// Green now: every expectation file has a case test and a replay fixture,

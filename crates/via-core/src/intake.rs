@@ -806,6 +806,7 @@ impl Effective {
                 ..param_sizes(instructions, self.output_schema.as_ref())
             },
             inherit,
+            model: Some(self.model.clone()),
         }
     }
 
@@ -919,6 +920,21 @@ mod tests {
                    "deadlines":{"wall_ms":3_600_000,"idle_ms":600_000},"max_steps":null})
         );
         assert!(Member::<u8>::Null.or(Some(1)).is_none());
+    }
+
+    /// Sol r1 #16 (C2 §2 `TurnParams.model`): `check_turn` carries the
+    /// turn's frozen model, which a route judges a discovered catalog's
+    /// efforts against, beside its size.
+    #[test]
+    fn check_turn_carries_the_frozen_model() {
+        let params: SpawnParams =
+            serde_json::from_value(json!({"model":"m","prompt":"p","handle":"h"})).unwrap();
+        let overrides = params.per_turn().overrides().unwrap();
+        let planned = EffectiveBound::of(None, None, "r").unwrap();
+        let effective = Effective::first("gpt-6-luna".to_owned(), overrides, planned);
+        let turn = effective.turn_params(None, 0, None);
+        assert_eq!(turn.model.as_deref(), Some("gpt-6-luna"));
+        assert_eq!(turn.sizes.model, "gpt-6-luna".len());
     }
 
     /// Critical r1 #12 (C1 §4 `instructions`): exactly `{text}` or

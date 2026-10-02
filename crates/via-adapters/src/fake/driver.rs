@@ -243,6 +243,7 @@ fn refused_values(adapter: &FakeAdapter, spec: &TurnSpec) -> Option<TurnEnd> {
         sizes: ParamSizes::default(),
         inherit: None,
         instructions: false,
+        model: None,
     };
     let refusal = adapter
         .check_turn(Harness::Fake.route(), &params)

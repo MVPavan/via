@@ -628,11 +628,11 @@ fn a_resume_turn_is_checked() {
         bound: Some(full.clone()),
         ..TurnParams::default()
     };
-    let old = CodexAdapter::check_turn("codex-app-server", "0", &turn).unwrap_err();
+    let old = CodexAdapter::judge_turn("codex-app-server", "0", &turn, None).unwrap_err();
     assert_eq!(old.kind, RefusalKind::HarnessUnavailable);
     assert_eq!(old.reason, Some("adapter_version"));
     assert_eq!(
-        CodexAdapter::check_turn("codex-app-server", "1", &turn)
+        CodexAdapter::judge_turn("codex-app-server", "1", &turn, None)
             .unwrap()
             .effective_bound,
         Some(full)
@@ -648,7 +648,7 @@ fn a_resume_turn_is_checked() {
         ..TurnParams::default()
     };
     assert_eq!(
-        CodexAdapter::check_turn("codex-app-server", "1", &refused)
+        CodexAdapter::judge_turn("codex-app-server", "1", &refused, None)
             .unwrap_err()
             .kind,
         RefusalKind::InvalidParam { field: "effort" }
@@ -658,11 +658,50 @@ fn a_resume_turn_is_checked() {
         ..TurnParams::default()
     };
     assert_eq!(
-        CodexAdapter::check_turn("codex-app-server", "1", &bound_only)
+        CodexAdapter::judge_turn("codex-app-server", "1", &bound_only, None)
             .unwrap_err()
             .kind,
         RefusalKind::BoundUnsupported
     );
+}
+
+/// Sol r1 #16, AD18: once the session's server key has a discovered
+/// catalog, a later turn's effort the session's model does not advertise is
+/// refused before any receipt; a listed
+/// effort, a model the catalog does not list, a turn naming no effort or
+/// no model, and no catalog at all each pass to `run_turn`.
+#[test]
+fn a_resume_turn_judges_effort_against_the_cached_catalog() {
+    use super::CodexAdapter;
+    use super::normalize::DiscoveredModel;
+    use crate::plan::{RefusalKind, TurnParams};
+
+    let catalog = [DiscoveredModel {
+        model: "gpt-6-luna".to_owned(),
+        efforts: vec!["low".to_owned(), "medium".to_owned()],
+        hidden: false,
+        default: true,
+    }];
+    let turn = |model: Option<&str>, effort: Option<&str>| TurnParams {
+        model: model.map(str::to_owned),
+        effort: effort.map(str::to_owned),
+        ..TurnParams::default()
+    };
+    let judge = |turn: &TurnParams, catalog: Option<&[DiscoveredModel]>| {
+        CodexAdapter::judge_turn("codex-app-server", "1", turn, catalog)
+    };
+    let refused = judge(&turn(Some("gpt-6-luna"), Some("xhigh")), Some(&catalog)).unwrap_err();
+    assert_eq!(refused.kind, RefusalKind::InvalidParam { field: "effort" });
+    assert_eq!(refused.route, Some("codex-app-server"));
+    for passes in [
+        turn(Some("gpt-6-luna"), Some("low")),
+        turn(Some("other"), Some("xhigh")),
+        turn(Some("gpt-6-luna"), None),
+        turn(None, Some("xhigh")),
+    ] {
+        assert!(judge(&passes, Some(&catalog)).is_ok(), "{passes:?}");
+    }
+    assert!(judge(&turn(Some("gpt-6-luna"), Some("xhigh")), None).is_ok());
 }
 
 /// One synthetic notification, decoded as the server's would be.

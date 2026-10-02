@@ -103,6 +103,10 @@ pub struct TurnParams {
     /// The session's `inherit` as requested at spawn, which a route's
     /// launch recipe may read; `None` where the session's is unknown.
     pub inherit: Option<Inherit>,
+    /// The session's frozen model (`SessionSpec.model`), which Core copies
+    /// in: internal context a route judges a discovered catalog against,
+    /// never a caller value or override; `None` where unknown.
+    pub model: Option<String>,
 }
 
 /// What `check_turn` reports of a resume turn it accepts (C2 §2).
@@ -920,8 +924,8 @@ impl AdapterSet {
                     }),
                 };
             }
-            Some(Adapter::Codex(_)) => {
-                return CodexAdapter::check_turn(route, &session.adapter_version, turn);
+            Some(Adapter::Codex(codex)) => {
+                return codex.check_turn(route, &session.adapter_version, turn);
             }
             None => {
                 return Err(unavailable(Some(route)));
