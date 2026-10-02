@@ -13,7 +13,7 @@ mod runtime;
 
 pub use runtime::{
     CONTROL_BYTES, CONTROL_COMMANDS, FakeRoute, FakeRouteResult, FakeTerminal, FakeTurn, Lane,
-    Retirement, SteerRefused, SteerRequest, SteerSender, steer_lane,
+    Retirement, SteerAnswer, SteerRefused, SteerRequest, SteerSender, steer_lane,
 };
 
 /// The one prompt submission of a private fake connection. Wire streams it
@@ -861,6 +861,9 @@ pub(crate) const STEER_ID: u64 = 3;
 pub struct RouteMessage {
     /// Typed fake payload.
     pub payload: FakeMessage,
+    /// For a `SteerDelivered`, the token of the steer request it reports,
+    /// which Route paired it with; never decoded (critical r1 #5).
+    pub steer: Option<u64>,
 }
 
 #[cfg(test)]

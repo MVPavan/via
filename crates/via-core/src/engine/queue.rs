@@ -292,6 +292,21 @@ struct Running {
     wall: tokio::time::Instant,
     /// The published progress (Task 4 design §2.4).
     progress: Progress,
+    /// Where the turn's acceptance stands, for `steer` (C1 §3.4).
+    steering: watch::Sender<Steering>,
+}
+
+/// A running turn's acceptance as `steer` waits for it (C1 §3.4): a steer
+/// that arrives while the turn is submitting waits for its acceptance,
+/// and fails `no_active_turn` once the turn ends first.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum Steering {
+    /// Submitted, not yet accepted.
+    Submitting,
+    /// Accepted, with the vendor turn ID the acceptance named.
+    Accepted(Option<String>),
+    /// The turn's execution returned: nothing more reaches it.
+    Ended,
 }
 
 /// Mutable dispatch state of one session.
@@ -300,6 +315,10 @@ struct State {
     queue: VecDeque<Entry>,
     dispatcher: Dispatcher,
     running: Option<Running>,
+    /// Sol r1 #7 (C1 §3.4): a turn whose submission committed and that
+    /// does not run yet (its lane opening, its actor starting), with the
+    /// acceptance watch `Running` takes over.
+    submitting: Option<(TurnNumber, watch::Sender<Steering>)>,
     close: Option<CloseOrder>,
 }
 
@@ -357,6 +376,12 @@ pub(super) enum Sweep {
 /// while anyone else holds one.
 pub(super) struct Slot {
     pub(super) head: Arc<Head>,
+    /// Sol r2 #5 (C1 §3.4): a submission holds it from before its commit
+    /// through its publication ([`Self::submitted`]), and a `steer` while
+    /// it selects its turn ([`Self::steering`]), so no steer reads a
+    /// committed submission that is not yet published. The steer releases
+    /// it before it waits for the acceptance.
+    pub(super) selection: tokio::sync::Mutex<()>,
     state: StdMutex<State>,
     wake: Notify,
     /// The engine whose idle-lane bound the slot's emptying enforces
@@ -369,10 +394,12 @@ impl Slot {
         Arc::new(Self {
             engine,
             head,
+            selection: tokio::sync::Mutex::new(()),
             state: StdMutex::new(State {
                 queue: VecDeque::new(),
                 dispatcher: Dispatcher::None,
                 running: None,
+                submitting: None,
                 close: None,
             }),
             wake: Notify::new(),
@@ -504,14 +531,29 @@ impl Slot {
             .and_then(|mut entry| entry.stop.take())
             .unwrap_or_else(TurnStop::new);
         let receivers = (stop.order.subscribe(), stop.order.subscribe());
+        let steering = state
+            .submitting
+            .take_if(|(submitting, _)| *submitting == turn)
+            .map_or_else(
+                || watch::Sender::new(Steering::Submitting),
+                |(_, steering)| steering,
+            );
         state.running = Some(Running {
             turn,
             settling: false,
             stop,
             wall,
             progress,
+            steering,
         });
         receivers
+    }
+
+    /// `turn`'s submission committed (Sol r1 #7): from here a `steer`
+    /// addresses it and waits for its acceptance, through its lane's
+    /// opening and its actor's start, until it runs.
+    pub(super) fn submitted(&self, turn: TurnNumber) {
+        lock(&self.state).submitting = Some((turn, watch::Sender::new(Steering::Submitting)));
     }
 
     /// Applies one step-tracker delta to the running turn's published
@@ -628,7 +670,34 @@ impl Slot {
             .as_mut()
             .filter(|running| running.turn == turn)?;
         running.settling = true;
+        running.steering.send_replace(Steering::Ended);
         running.stop.order.borrow().clone()
+    }
+
+    /// The running turn, not yet settling, else the submitted turn that
+    /// does not run yet, and its acceptance watch: the turn a `steer`
+    /// addresses (C1 §3.4).
+    pub(super) fn steering(&self) -> Option<(TurnNumber, watch::Receiver<Steering>)> {
+        let state = lock(&self.state);
+        if let Some(running) = state.running.as_ref() {
+            return (!running.settling).then(|| (running.turn, running.steering.subscribe()));
+        }
+        let (turn, steering) = state.submitting.as_ref()?;
+        Some((*turn, steering.subscribe()))
+    }
+
+    /// The running turn's acceptance committed, naming `vendor_turn`.
+    pub(super) fn accepted(&self, turn: TurnNumber, vendor_turn: Option<String>) {
+        let state = lock(&self.state);
+        if let Some(running) = state
+            .running
+            .as_ref()
+            .filter(|running| running.turn == turn)
+        {
+            running
+                .steering
+                .send_replace(Steering::Accepted(vendor_turn));
+        }
     }
 
     /// The run loop is done with the turn: its stop channels drop, which
@@ -642,6 +711,13 @@ impl Slot {
                 .is_some_and(|running| running.turn == turn)
             {
                 state.running = None;
+            }
+            // A submitted turn that never ran ends its steer waits too.
+            if let Some((_, steering)) = state
+                .submitting
+                .take_if(|(submitting, _)| *submitting == turn)
+            {
+                steering.send_replace(Steering::Ended);
             }
         }
         self.wake();

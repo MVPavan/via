@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use tokio::sync::{mpsc, watch};
 use via_adapters::{
     AdapterConfig, AdapterSet, Admitted, BootstrapEnv, CancellationToken, Deadline, Inherit,
-    Prepared, RuntimeConfig, SessionCx, SessionDriver, SessionId, SessionRef, SessionSpec,
-    StopOrder, TaskTracker, TurnActivity, TurnCx, TurnNumber, TurnSpec, VendorOptions,
+    InheritPlan, Prepared, RuntimeConfig, SessionCx, SessionDriver, SessionId, SessionRef,
+    SessionSpec, StopOrder, TaskTracker, TurnActivity, TurnCx, TurnNumber, TurnSpec, VendorOptions,
     observation_channel,
 };
 use via_store::Store;
@@ -57,7 +57,10 @@ impl OneTurn {
             initial_bound: None,
             cwd: cwd.to_path_buf(),
             vendor: VendorOptions::new(),
-            inherit: Inherit::OD2_DEFAULT,
+            inherit: InheritPlan {
+                requested: Inherit::OD2_DEFAULT,
+                effective: Inherit::OD2_DEFAULT,
+            },
             confirmed_vendor_session_id: None,
             allow_untested: false,
         };

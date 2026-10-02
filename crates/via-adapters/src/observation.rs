@@ -58,8 +58,14 @@ pub enum Observation {
     ActionDenied(Denial),
     /// `vendor.request_declined`.
     RequestDeclined(Decline),
-    /// `steer.delivered`.
-    SteerDelivered(SteerDelivery),
+    /// `steer.delivered`, carrying the token of the steer it answers
+    /// (C2 `SteerInput.token`).
+    SteerDelivered {
+        /// How the input reached the vendor.
+        delivery: SteerDelivery,
+        /// The token Core gave the same input.
+        token: SteerToken,
+    },
     /// `warning`.
     Warning(Warning),
     /// `session.vendor_closed`, with its reason.
@@ -75,6 +81,18 @@ pub enum Observation {
     LateTerminal(VendorTerminal),
 }
 
+impl Observation {
+    /// The token a `steer.delivered` carries; `None` for any other.
+    #[must_use]
+    pub fn steer_token(&self) -> Option<SteerToken> {
+        if let Self::SteerDelivered { token, .. } = self {
+            Some(*token)
+        } else {
+            None
+        }
+    }
+}
+
 /// Acceptance of one submission, on vendor evidence.
 #[derive(Debug)]
 pub struct Acceptance {
@@ -82,6 +100,9 @@ pub struct Acceptance {
     pub correlation: AcceptanceToken,
     /// The vendor's turn ID, when the route has one.
     pub vendor_turn_id: Option<VendorTurnId>,
+    /// The handshake of the instance running the turn (AD7), read before
+    /// its acceptance; `None` when the route read none.
+    pub instance: Option<InstanceReport>,
 }
 
 /// A confirmed vendor identity for the current connection generation.
@@ -131,6 +152,27 @@ pub struct Decline {
     pub summary: String,
     /// Whether the vendor was blocked on it.
     pub blocking: bool,
+}
+
+/// A steer's correlation (C2 `SteerInput.token`, critical r2 #2): Core
+/// mints it, unique within the session, and passes it in `SteerInput`;
+/// the `steer.delivered` observation the driver emits for the same input
+/// carries it. Opaque to the driver.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct SteerToken(u64);
+
+impl SteerToken {
+    /// The token numbered `value`, as Core mints it.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Its number.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
 }
 
 /// How steer input reached the vendor.
@@ -570,8 +612,15 @@ fn item_cost(item: &ObservationItem) -> usize {
             if let Some(vendor_turn_id) = &acceptance.vendor_turn_id {
                 lengths.push(vendor_turn_id.as_str().len());
             }
+            if let Some(version) = acceptance
+                .instance
+                .as_ref()
+                .and_then(|instance| instance.vendor_version.as_ref())
+            {
+                lengths.push(version.len());
+            }
         }
-        Observation::SteerDelivered(delivery) => match delivery {
+        Observation::SteerDelivered { delivery, .. } => match delivery {
             SteerDelivery::Injected => {}
             SteerDelivery::Partial(semantics) => lengths.push(semantics.len()),
         },
@@ -774,6 +823,7 @@ mod tests {
             Observation::Accepted(super::Acceptance {
                 correlation: crate::AcceptanceToken::FIRST,
                 vendor_turn_id: id.map(|id| crate::VendorTurnId::try_from(id.to_owned()).unwrap()),
+                instance: None,
             })
         };
         let id = "i".repeat(4096);

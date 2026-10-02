@@ -95,32 +95,32 @@ fn read_db(root: &TempDir) -> rusqlite::Connection {
     rusqlite::Connection::open(root.path().join("store.sqlite3")).unwrap()
 }
 
-/// Task 4 design §6.6, runtime §6: a fresh Store is schema v7; a v6 Store,
+/// Task 4 design §6.6, runtime §6: a fresh Store is schema v8; a v7 Store,
 /// older than the build, is an unreleased format refused with the named
 /// recreate instruction, bytes untouched.
 #[test]
-fn fresh_store_is_v7_and_a_v6_store_is_refused() {
+fn fresh_store_is_v8_and_a_v7_store_is_refused() {
     let root = private_dir();
     drop(Store::open(root.path()).unwrap());
     let version: i64 = read_db(&root)
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
 
-    // A full Store stamped v6, as a v6 build left it but for the column.
+    // A full Store stamped v7, as a v7 build left it but for the columns.
     let old = private_dir();
     drop(Store::open(old.path()).unwrap());
     let db = old.path().join("store.sqlite3");
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
-        conn.pragma_update(None, "user_version", 6).unwrap();
+        conn.pragma_update(None, "user_version", 7).unwrap();
         conn.pragma_update(None, "journal_mode", "DELETE").unwrap();
     }
     let before = fs::read(&db).unwrap();
     let Err(error) = Store::open(old.path()) else {
-        panic!("a v6 Store opened");
+        panic!("a v7 Store opened");
     };
-    assert!(error.to_string().contains("schema v6"), "{error}");
+    assert!(error.to_string().contains("schema v7"), "{error}");
     assert!(error.to_string().contains("recreate"), "{error}");
     assert_eq!(fs::read(&db).unwrap(), before);
 }

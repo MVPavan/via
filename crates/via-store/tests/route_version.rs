@@ -107,6 +107,7 @@ fn a_started_turn_records_the_running_adapter_version() {
                     correlation: "fake-turn-1".to_owned(),
                     event: event("turn.started", 3, 1),
                     adapter_version: Some("9.9.9".to_owned()),
+                    instance: None,
                 })
                 .await
                 .unwrap();

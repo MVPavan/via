@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     fmt,
     fs::File,
     io::Read,
@@ -9,19 +10,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use via_store::json_limits::{self, Shape};
+use via_adapters::{Capabilities, VersionStatus};
 
 use crate::{SessionId, TurnNumber, TurnState};
 
-/// Strict C1 §3.2 parameters for creating a fake session and its first turn.
+/// Strict C1 §3.2 parameters for creating a session and its first turn.
 /// Free-form members are kept as their raw text (`Box<RawValue>`) and
 /// inspected only by [`json_limits::shape`] and [`json_limits::string_list`]
 /// (Task 4 design §10.2): no value is built from a peer's bytes.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpawnParams {
-    /// Selected harness, currently `fake` in S1.
-    pub harness: String,
+    /// Selected harness; omitted, the one whose catalog lists `model`
+    /// (adapter design §5.2).
+    #[serde(default, deserialize_with = "given")]
+    pub harness: Option<String>,
     /// Explicit model name.
     pub model: String,
     /// Inline prompt; exactly one of `prompt` and `prompt_file`.
@@ -35,7 +38,8 @@ pub struct SpawnParams {
     /// C1 P4 retry key: the same key, handle and params replay the receipt.
     #[serde(default)]
     pub idempotency_key: Option<String>,
-    /// Session working directory (design §11.1); the fake's default when omitted.
+    /// Session working directory (design §11.1); the daemon's startup
+    /// directory when omitted.
     #[serde(default, deserialize_with = "given")]
     pub cwd: Option<String>,
     /// Caller's session label, at most [`LABEL_MAX`] bytes.
@@ -45,9 +49,9 @@ pub struct SpawnParams {
     #[serde(default)]
     pub allow_untested: bool,
     #[serde(default, deserialize_with = "raw")]
-    instructions: Option<Box<RawValue>>,
+    pub(crate) instructions: Option<Box<RawValue>>,
     #[serde(default, deserialize_with = "raw")]
-    require: Option<Box<RawValue>>,
+    pub(crate) require: Option<Box<RawValue>>,
     #[serde(default, deserialize_with = "raw")]
     effort: Option<Box<RawValue>>,
     #[serde(default, deserialize_with = "raw")]
@@ -114,7 +118,7 @@ pub struct ResumeParams {
 /// a number; a nested `null` is `invalid_params` (A9).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DeadlineParams {
+pub(crate) struct DeadlineParams {
     #[serde(default, deserialize_with = "given")]
     wall_ms: Option<u64>,
     #[serde(default, deserialize_with = "given")]
@@ -137,7 +141,7 @@ fn given<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
 }
 
 /// A present typed member: an explicit `null`, or its value.
-enum Nullable<T> {
+pub(crate) enum Nullable<T> {
     Null,
     Given(T),
 }
@@ -152,20 +156,37 @@ fn nullable<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
     }))
 }
 
-/// The C1 §4 per-turn parameters of one `spawn` or `resume`, as sent.
+/// The C1 §4 per-turn parameters of one `spawn` or `resume`, as sent;
+/// [`crate::intake`] decodes them.
 pub(crate) struct PerTurn<'a> {
-    effort: Option<&'a RawValue>,
-    bound: Option<&'a RawValue>,
-    output_schema: Option<&'a RawValue>,
-    deadlines: Option<&'a Nullable<DeadlineParams>>,
-    max_steps: Option<&'a RawValue>,
-    vendor: Option<&'a RawValue>,
+    pub(crate) effort: Option<&'a RawValue>,
+    pub(crate) bound: Option<&'a RawValue>,
+    pub(crate) output_schema: Option<&'a RawValue>,
+    pub(crate) deadlines: Option<&'a Nullable<DeadlineParams>>,
+    pub(crate) max_steps: Option<&'a RawValue>,
+    pub(crate) vendor: Option<&'a RawValue>,
 }
 
-/// What a turn sets for itself on the fake route; anything else inherits.
-pub(crate) struct Overrides {
-    wall_ms: Option<u64>,
-    idle_ms: Option<u64>,
+impl DeadlineParams {
+    /// The budgets given; design §5: a budget of 0 would stop every turn
+    /// at once, so it is refused by name.
+    pub(crate) fn budgets(&self) -> Result<(Option<u64>, Option<u64>), ApiError> {
+        if self.idle_ms == Some(0) {
+            return Err(ApiError::naming(
+                ApiError::INVALID_PARAMS,
+                Named::field("deadlines.idle_ms"),
+                "deadlines.idle_ms must be at least 1",
+            ));
+        }
+        if self.wall_ms == Some(0) {
+            return Err(ApiError::naming(
+                ApiError::INVALID_PARAMS,
+                Named::field("deadlines.wall_ms"),
+                "deadlines.wall_ms must be at least 1",
+            ));
+        }
+        Ok((self.wall_ms, self.idle_ms))
+    }
 }
 
 /// Longest `label` (C1 §4), in bytes.
@@ -179,6 +200,11 @@ const VENDOR_MAX: usize = 16 * 1024;
 
 /// Longest `model` or `effort`, encoded (design §6.4).
 const SHORT_MEMBER_MAX: usize = 1024;
+
+/// Whether `text`, encoded with its quotes, is within [`SHORT_MEMBER_MAX`].
+pub(crate) fn short_member(text: &str) -> bool {
+    via_adapters::encoded_text_len(text) + 2 <= SHORT_MEMBER_MAX
+}
 
 /// Longest `cwd` or `prompt_file` path (design §10.4, §11.1), in bytes.
 pub(crate) const PATH_MAX: usize = 4096;
@@ -204,7 +230,7 @@ fn prompt_source(
         (None, Some(path)) => Ok(PromptSource::File(path)),
         _ => Err(ApiError::naming(
             ApiError::INVALID_PARAMS,
-            &const { Named::field("prompt") },
+            Named::field("prompt"),
             "exactly one of prompt and prompt_file is required",
         )),
     }
@@ -227,17 +253,16 @@ impl SpawnParams {
         prompt_source(self.prompt.take(), self.prompt_file.take())
     }
 
-    /// Design §11.1: checks the session members without I/O: `label` at
-    /// most [`LABEL_MAX`] bytes, `instructions` refused by the fake, and
-    /// each `require`d verb met by [`Capabilities::fake`], the first unmet
-    /// one refused by name.
+    /// Design §11.1: checks the session members' sizes without I/O: the
+    /// `model`, the per-turn members and `label` at most [`LABEL_MAX`]
+    /// bytes. The route's rules are the plan's ([`crate::intake`]).
     pub(crate) fn check_session_members(&self) -> Result<(), ApiError> {
         // Design §6.4: the envelope's members a caller sizes, refused at
         // receipt over their maxima.
-        if via_adapters::encoded_text_len(&self.model) + 2 > SHORT_MEMBER_MAX {
+        if !short_member(&self.model) {
             return Err(ApiError::naming(
                 ApiError::INVALID_PARAMS,
-                &const { Named::field("model") },
+                Named::field("model"),
                 "model is longer than 1 KiB encoded",
             ));
         }
@@ -249,19 +274,9 @@ impl SpawnParams {
         {
             return Err(ApiError::naming(
                 ApiError::INVALID_PARAMS,
-                &const { Named::field("label") },
+                Named::field("label"),
                 "label is longer than 120 bytes",
             ));
-        }
-        if self.instructions.is_some() {
-            return Err(ApiError::naming(
-                ApiError::INVALID_PARAMS,
-                &const { Named::fake("instructions") },
-                "instructions is unsupported on route fake",
-            ));
-        }
-        if let Some(require) = &self.require {
-            Capabilities::fake().require(require)?;
         }
         Ok(())
     }
@@ -290,37 +305,37 @@ impl ResumeParams {
         let members = [
             (
                 &self.harness,
-                &const { Named::field("harness") },
+                Named::field("harness"),
                 "harness is session scope; resume cannot set it",
             ),
             (
                 &self.model,
-                &const { Named::field("model") },
+                Named::field("model"),
                 "model is session scope; resume cannot set it",
             ),
             (
                 &self.allow_untested,
-                &const { Named::field("allow_untested") },
+                Named::field("allow_untested"),
                 "allow_untested is session scope; resume cannot set it",
             ),
             (
                 &self.instructions,
-                &const { Named::field("instructions") },
+                Named::field("instructions"),
                 "instructions is session scope; resume cannot set it",
             ),
             (
                 &self.cwd,
-                &const { Named::field("cwd") },
+                Named::field("cwd"),
                 "cwd is session scope; resume cannot set it",
             ),
             (
                 &self.require,
-                &const { Named::field("require") },
+                Named::field("require"),
                 "require is spawn scope; resume cannot set it",
             ),
             (
                 &self.label,
-                &const { Named::field("label") },
+                Named::field("label"),
                 "label is session scope; resume cannot set it",
             ),
         ];
@@ -338,24 +353,24 @@ impl PerTurn<'_> {
     /// Design §6.4: a `bound` over 32 KiB, a `vendor` over 16 KiB or an
     /// `effort` over 1 KiB encoded is `invalid_params` naming the member,
     /// before any route rule.
-    fn check_sizes(&self) -> Result<(), ApiError> {
+    pub(crate) fn check_sizes(&self) -> Result<(), ApiError> {
         let members = [
             (
                 self.bound,
                 BOUND_MAX,
-                &const { Named::field("bound") },
+                Named::field("bound"),
                 "bound is longer than 32 KiB encoded",
             ),
             (
                 self.vendor,
                 VENDOR_MAX,
-                &const { Named::field("vendor") },
+                Named::field("vendor"),
                 "vendor is longer than 16 KiB encoded",
             ),
             (
                 self.effort,
                 SHORT_MEMBER_MAX,
-                &const { Named::field("effort") },
+                Named::field("effort"),
                 "effort is longer than 1 KiB encoded",
             ),
         ];
@@ -368,125 +383,6 @@ impl PerTurn<'_> {
             }
             None => Ok(()),
         }
-    }
-
-    /// Validates the values against the fake route's capabilities
-    /// ([`Capabilities::fake`]). Omitted values inherit. C1 §1 lets only
-    /// members typed "or null" be null: a null `output_schema` or
-    /// `max_steps` is accepted (`output_schema: null` clears, which on this
-    /// route is already the state); a null `effort`, `bound` or `deadlines`,
-    /// or a nested null in `deadlines` (A9), is `invalid_params`.
-    pub(crate) fn fake_overrides(&self) -> Result<Overrides, ApiError> {
-        self.check_sizes()?;
-        let given = |value: Option<&RawValue>| {
-            value.is_some_and(|value| json_limits::shape(value.get()) != Shape::Null)
-        };
-        let null = |value: Option<&RawValue>| {
-            value.is_some_and(|value| json_limits::shape(value.get()) == Shape::Null)
-        };
-        if null(self.effort) {
-            return Err(ApiError::naming(
-                ApiError::INVALID_PARAMS,
-                &const { Named::fake("effort") },
-                "effort cannot be null",
-            ));
-        }
-        if given(self.effort) {
-            return Err(ApiError::naming(
-                ApiError::INVALID_PARAMS,
-                &const { Named::fake("effort") },
-                "effort is unsupported on route fake",
-            ));
-        }
-        if given(self.output_schema) {
-            return Err(ApiError::naming(
-                ApiError::INVALID_PARAMS,
-                &const { Named::fake("output_schema") },
-                "output_schema is unsupported on route fake",
-            ));
-        }
-        if given(self.max_steps) {
-            return Err(ApiError::naming(
-                ApiError::INVALID_PARAMS,
-                &const { Named::fake("max_steps") },
-                "max_steps is unsupported on route fake",
-            ));
-        }
-        if null(self.bound) {
-            return Err(ApiError::naming(
-                ApiError::INVALID_PARAMS,
-                &const { Named::fake("bound") },
-                "bound cannot be null",
-            ));
-        }
-        // The fake route declares no bounds, so any bound is unenforceable.
-        if self.bound.is_some() {
-            return Err(ApiError::naming(
-                ApiError::BOUND_UNSUPPORTED,
-                &const { Named::fake("bound") },
-                "bound is unsupported on route fake, which declares no bounds",
-            ));
-        }
-        // Only `{}` or empty per-harness objects: the fake declares no options.
-        if self.vendor.is_some_and(|vendor| !no_vendor_options(vendor)) {
-            return Err(ApiError::naming(
-                ApiError::INVALID_PARAMS,
-                &const { Named::fake("vendor") },
-                "vendor options are unsupported on route fake",
-            ));
-        }
-        let deadlines = match self.deadlines {
-            None => {
-                return Ok(Overrides {
-                    wall_ms: None,
-                    idle_ms: None,
-                });
-            }
-            Some(Nullable::Null) => {
-                return Err(ApiError::naming(
-                    ApiError::INVALID_PARAMS,
-                    &const { Named::fake("deadlines") },
-                    "deadlines cannot be null",
-                ));
-            }
-            Some(Nullable::Given(deadlines)) => deadlines,
-        };
-        // Design §5: an idle deadline of 0 would stop every turn at once.
-        if deadlines.idle_ms == Some(0) {
-            return Err(ApiError::naming(
-                ApiError::INVALID_PARAMS,
-                &const { Named::field("deadlines.idle_ms") },
-                "deadlines.idle_ms must be at least 1",
-            ));
-        }
-        if deadlines.wall_ms == Some(0) {
-            return Err(ApiError::naming(
-                ApiError::INVALID_PARAMS,
-                &const { Named::field("deadlines.wall_ms") },
-                "deadlines.wall_ms must be at least 1",
-            ));
-        }
-        Ok(Overrides {
-            wall_ms: deadlines.wall_ms,
-            idle_ms: deadlines.idle_ms,
-        })
-    }
-}
-
-/// Whether `vendor` is an object whose every member is an empty object:
-/// options for no harness. Each member is inspected by its shape only.
-fn no_vendor_options(vendor: &RawValue) -> bool {
-    match json_limits::shape(vendor.get()) {
-        Shape::Object { empty: true } => true,
-        Shape::Object { empty: false } => {
-            serde_json::from_str::<std::collections::BTreeMap<String, &RawValue>>(vendor.get())
-                .is_ok_and(|options| {
-                    options.values().all(|harness| {
-                        json_limits::shape(harness.get()) == (Shape::Object { empty: true })
-                    })
-                })
-        }
-        Shape::Null | Shape::Bool | Shape::Number | Shape::String | Shape::Array { .. } => false,
     }
 }
 
@@ -564,14 +460,17 @@ pub struct CloseParams {
 /// `close` deadline when the caller gives no `deadline_ms` (design §4).
 pub const DEFAULT_CLOSE_DEADLINE_MS: u64 = 10_000;
 
-/// Strict C1 steer parameters; fake must refuse after authentication.
+/// Strict C1 §3.4 `steer` parameters.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SteerParams {
-    /// Session to mutate.
+    /// Session whose active turn is steered.
     pub session: SessionId,
-    /// Text that will not be sent on unsupported routes.
+    /// The input; never sent on a route that does not support steer.
     pub text: String,
+    /// The turn the caller means; another active turn is `turn_mismatch`.
+    #[serde(default)]
+    pub expect_turn: Option<u32>,
     /// Caller-owned bearer handle; absent, the mutation is `invalid_handle`
     /// like a wrong one (F15).
     #[serde(default)]
@@ -863,97 +762,19 @@ pub struct DaemonStatusParams {}
 #[serde(deny_unknown_fields)]
 pub struct DescribeParams {
     #[serde(default)]
-    harness: Option<String>,
+    pub(crate) harness: Option<String>,
     #[serde(default)]
-    model: Option<String>,
+    pub(crate) model: Option<String>,
     #[serde(default)]
-    bound: Option<Box<RawValue>>,
+    pub(crate) bound: Option<Box<RawValue>>,
     #[serde(default)]
-    require: Option<Box<RawValue>>,
+    pub(crate) require: Option<Box<RawValue>>,
     #[serde(default)]
-    vendor: Option<Box<RawValue>>,
+    pub(crate) vendor: Option<Box<RawValue>>,
     #[serde(default)]
-    cwd: Option<String>,
+    pub(crate) cwd: Option<String>,
     #[serde(default)]
-    #[expect(
-        dead_code,
-        reason = "the fake route is untested either way; it changes no refusal"
-    )]
-    allow_untested: bool,
-}
-
-impl DescribeParams {
-    /// The fake route's plan (C1 §3.1), from [`Capabilities::fake`] with no
-    /// process and no write: a model other than `fake` is `unknown_model`,
-    /// a harness other than `fake` (or no fake agent) `harness_unavailable`.
-    /// What the route cannot do for the given `bound`, `vendor` or
-    /// `require` is listed in `refusals`, each by member and kind.
-    pub(crate) fn describe(&self, fake_available: bool) -> Result<Value, ApiError> {
-        if self.harness.is_none() && self.model.is_none() {
-            return Err(ApiError::naming(
-                ApiError::INVALID_PARAMS,
-                &const { Named::field("model") },
-                "describe takes a harness or a model",
-            ));
-        }
-        if self
-            .harness
-            .as_deref()
-            .is_some_and(|harness| harness != "fake")
-            || !fake_available
-        {
-            return Err(ApiError::HARNESS_UNAVAILABLE);
-        }
-        if self.model.as_deref().is_some_and(|model| model != "fake") {
-            return Err(ApiError::UNKNOWN_MODEL);
-        }
-        if self
-            .cwd
-            .as_deref()
-            .is_some_and(|cwd| cwd.len() > PATH_MAX || !std::path::Path::new(cwd).is_absolute())
-        {
-            return Err(ApiError::naming(
-                ApiError::INVALID_PARAMS,
-                &const { Named::field("cwd") },
-                "cwd must be an absolute path of at most 4096 bytes",
-            ));
-        }
-        let capabilities = Capabilities::fake();
-        let mut refusals = Vec::new();
-        let mut refuse = |error: ApiError| match error.named {
-            Some(named) if named.route.is_some() => {
-                refusals.push(json!({"field":named.field,"kind":error.kind,
-                    "message":error.message}));
-                Ok(())
-            }
-            _ => Err(error),
-        };
-        let per_turn = PerTurn {
-            effort: None,
-            bound: self.bound.as_deref(),
-            output_schema: None,
-            deadlines: None,
-            max_steps: None,
-            vendor: self.vendor.as_deref(),
-        };
-        if let Err(error) = per_turn.fake_overrides() {
-            refuse(error)?;
-        }
-        if let Some(require) = &self.require
-            && let Err(error) = capabilities.require(require)
-        {
-            refuse(error)?;
-        }
-        let plan = RoutePlan::fake();
-        let mut described = json!({"harness":"fake",
-            "model":{"requested":self.model,"resolved":"fake"},
-            "capabilities":capabilities,"effective_bound":null,
-            "refusals":refusals,"warnings":plan.warnings()});
-        if let (Some(described), Value::Object(plan)) = (described.as_object_mut(), json!(plan)) {
-            described.extend(plan);
-        }
-        Ok(described)
-    }
+    pub(crate) allow_untested: bool,
 }
 
 /// Strict C1 §3.13 `models` parameters (Task 4 design §4.6).
@@ -961,23 +782,7 @@ impl DescribeParams {
 #[serde(deny_unknown_fields)]
 pub struct ModelsParams {
     #[serde(default)]
-    harness: Option<String>,
-}
-
-impl ModelsParams {
-    /// The fake's one model; none for another harness.
-    pub(crate) fn models(&self) -> Value {
-        let models = if self
-            .harness
-            .as_deref()
-            .is_none_or(|harness| harness == "fake")
-        {
-            json!([{"model":"fake","harness":"fake","aliases":[],"source":"builtin"}])
-        } else {
-            json!([])
-        };
-        json!({ "models": models })
-    }
+    pub(crate) harness: Option<String>,
 }
 
 /// Strict C1 §3.14 `daemon/stop` parameters; `drain` and `force` exclude each other.
@@ -1008,7 +813,7 @@ pub struct ApiError {
     /// C1 §8.1 `store_error` before a receipt: what happened to its commit.
     pub commit_outcome: Option<ReceiptOutcome>,
     /// The refused request member and route, named in `data`.
-    pub named: Option<&'static Named>,
+    pub named: Option<Box<Named>>,
     /// Why a named member was refused (`data.reason`), such as a prompt
     /// file's (design §10.4).
     pub reason: Option<&'static str>,
@@ -1026,28 +831,47 @@ pub struct FreeFloor {
     pub floor_bytes: u64,
 }
 
-/// A refused request member (`data.field`) and, when a route's capabilities
-/// refused it, that route (`data.route`).
-#[derive(Debug)]
+/// A refusal's context in `data` (C1 §8.1, §9): the refused request member
+/// (`data.field`), and the harness, route and verb whenever known,
+/// independently of a field. Owned or static text, never request input.
+#[derive(Clone, Debug, Default)]
 pub struct Named {
     /// Request member, dotted for a nested one.
-    pub field: &'static str,
-    /// Route whose capabilities refuse the member.
-    pub route: Option<&'static str>,
+    pub field: Option<Cow<'static, str>>,
+    /// The harness the refusal concerns.
+    pub harness: Option<Cow<'static, str>>,
+    /// The route whose capabilities refuse.
+    pub route: Option<Cow<'static, str>>,
+    /// The refused verb.
+    pub verb: Option<Cow<'static, str>>,
+    /// A failed steer's delivery (`data.delivery`, C1 §3.4).
+    pub delivery: Option<Cow<'static, str>>,
 }
 
 impl Named {
     /// A member refused regardless of route.
     pub(crate) const fn field(field: &'static str) -> Self {
-        Self { field, route: None }
+        Self {
+            field: Some(Cow::Borrowed(field)),
+            harness: None,
+            route: None,
+            verb: None,
+            delivery: None,
+        }
     }
 
-    /// A per-turn member the fake route's capabilities refuse.
-    const fn fake(field: &'static str) -> Self {
-        Self {
-            field,
-            route: Some(FAKE_ROUTE),
-        }
+    /// Whether nothing is named.
+    fn is_empty(&self) -> bool {
+        self.field.is_none()
+            && self.harness.is_none()
+            && self.route.is_none()
+            && self.verb.is_none()
+            && self.delivery.is_none()
+    }
+
+    /// `self`, or `None` when it names nothing.
+    pub(crate) fn boxed(self) -> Option<Box<Self>> {
+        (!self.is_empty()).then(|| Box::new(self))
     }
 }
 
@@ -1134,10 +958,17 @@ impl ApiError {
             data["durable_state"] = json!(turn.durable_state.as_str());
             data["terminal_persisted"] = json!(false);
         }
-        if let Some(named) = self.named {
-            data["field"] = json!(named.field);
-            if let Some(route) = named.route {
-                data["route"] = json!(route);
+        if let Some(named) = &self.named {
+            for (member, value) in [
+                ("field", &named.field),
+                ("verb", &named.verb),
+                ("harness", &named.harness),
+                ("route", &named.route),
+                ("delivery", &named.delivery),
+            ] {
+                if let Some(value) = value {
+                    data[member] = json!(value);
+                }
             }
         }
         if let Some(reason) = self.reason {
@@ -1228,10 +1059,10 @@ impl ApiError {
     };
 
     /// A refusal naming the member (and route) in `named`.
-    pub(crate) fn naming(base: Self, named: &'static Named, message: &'static str) -> Self {
+    pub(crate) fn naming(base: Self, named: Named, message: &'static str) -> Self {
         Self {
             message,
-            named: Some(named),
+            named: Some(Box::new(named)),
             ..base
         }
     }
@@ -1272,7 +1103,7 @@ impl ApiError {
         reason: None,
         floor: None,
     };
-    /// The fake route is not configured or selected.
+    /// The harness is unknown, not configured, or cannot run the session.
     pub const HARNESS_UNAVAILABLE: Self = Self {
         code: -32009,
         kind: "harness_unavailable",
@@ -1357,6 +1188,74 @@ impl ApiError {
         reason: None,
         floor: None,
     };
+    /// `steer` found no active turn (C1 §3.4).
+    pub const NO_ACTIVE_TURN: Self = Self {
+        code: -32013,
+        kind: "no_active_turn",
+        message: "the session has no active turn",
+        unpersisted: None,
+        kind2: None,
+        commit_outcome: None,
+        named: None,
+        reason: None,
+        floor: None,
+    };
+    /// `steer`'s `expect_turn` names another turn than the active one.
+    pub const TURN_MISMATCH: Self = Self {
+        code: -32014,
+        kind: "turn_mismatch",
+        message: "the active turn is not the expected one",
+        unpersisted: None,
+        kind2: None,
+        commit_outcome: None,
+        named: None,
+        reason: None,
+        floor: None,
+    };
+    /// `steer` input the session's control lane had no room for (C1 §3.4,
+    /// C2 §2 `OverCapacity`): nothing was written; a later retry may fit.
+    pub const CONTROL_LANE_FULL: Self = Self {
+        code: -32012,
+        kind: "admission_refused",
+        message: "the session's control lane is full",
+        unpersisted: None,
+        kind2: None,
+        commit_outcome: None,
+        named: None,
+        reason: Some("control_lane_full"),
+        floor: None,
+    };
+    /// C1 -32021 `steer_failed` for `reason`, with what is known of its
+    /// `delivery` (C1 §3.4, §8.1): `not_steerable` was not applied
+    /// (`none`); `not_delivered` began to be written, in part or whole,
+    /// without the vendor's acknowledgement, and its message keeps that
+    /// uncertainty (critical r1 #13, r4 #1); `not_recorded` reached the
+    /// vendor as `delivery` says, but no event records it (critical r2 #3).
+    pub(crate) fn steer_failed(reason: &'static str, delivery: Cow<'static, str>) -> Self {
+        Self {
+            code: -32021,
+            kind: "steer_failed",
+            message: match reason {
+                "not_delivered" => {
+                    "the steer input was not acknowledged by the vendor; whether it was applied is unknown"
+                }
+                "not_recorded" => {
+                    "the vendor took the steer input, but its steer.delivered event could not be recorded"
+                }
+                _ => "the steer input was not applied",
+            },
+            unpersisted: None,
+            kind2: None,
+            commit_outcome: None,
+            named: Named {
+                delivery: Some(delivery),
+                ..Named::default()
+            }
+            .boxed(),
+            reason: Some(reason),
+            floor: None,
+        }
+    }
     /// The turn has not yet ended.
     pub const TURN_NOT_FINISHED: Self = Self {
         code: -32015,
@@ -1541,6 +1440,18 @@ pub fn retry_identity(
     handle_hash: &[u8; 32],
     prompt_file: Option<&str>,
 ) -> Result<via_store::Identity, ApiError> {
+    retry_identity_of(raw_params, handle_hash, prompt_file, None)
+}
+
+/// [`retry_identity`] with, for a spawn's `instructions {path}`, the
+/// top-level `instructions` value replaced by its file's content token
+/// (Sol r1 #4): the copy's SHA-256 and length, not the path.
+pub(crate) fn retry_identity_of(
+    raw_params: &str,
+    handle_hash: &[u8; 32],
+    prompt_file: Option<&str>,
+    instructions: Option<&str>,
+) -> Result<via_store::Identity, ApiError> {
     use std::collections::HashSet;
 
     use serde::de::{Deserializer, MapAccess, Visitor};
@@ -1551,6 +1462,7 @@ pub fn retry_identity(
     struct Spans {
         handle: Option<(usize, usize)>,
         prompt_file: Option<(usize, usize)>,
+        instructions: Option<(usize, usize)>,
     }
 
     struct Members<'a>(&'a str);
@@ -1573,6 +1485,7 @@ pub fn retry_identity(
                 match key.as_str() {
                     "handle" => spans.handle = span,
                     "prompt_file" => spans.prompt_file = span,
+                    "instructions" => spans.instructions = span,
                     _ => {}
                 }
                 if !seen.insert(key) {
@@ -1603,6 +1516,12 @@ pub fn retry_identity(
         (Some(span), Some(content)) => replaced.push((span, content.as_bytes())),
         (None, None) => {}
         _ => return Err(ApiError::INVALID_PARAMS),
+    }
+    let instructions = instructions.map(|content| format!("\"{content}\""));
+    match (spans.instructions, &instructions) {
+        (Some(span), Some(content)) => replaced.push((span, content.as_bytes())),
+        (_, None) => {}
+        (None, Some(_)) => return Err(ApiError::INVALID_PARAMS),
     }
     replaced.sort_by_key(|((start, _), _)| *start);
     let bytes = raw_params.as_bytes();
@@ -1642,233 +1561,33 @@ pub(crate) fn new_session_id() -> Result<SessionId, ApiError> {
 
 // ---- C1 response DTOs (receipt §3.2, capabilities §4.1, envelope §5, events §6.1) ----
 
-/// The only route this build can plan.
-pub(crate) const FAKE_ROUTE: &str = "fake";
-/// C1 §4 `deadlines.wall_ms` default (A3), for a fake turn that neither
-/// sets nor inherits one.
+/// C1 §4 `deadlines.wall_ms` default (A3), for a turn that neither sets
+/// nor inherits one.
 pub(crate) const DEFAULT_WALL_MS: u64 = 3_600_000;
 /// C1 §4 `deadlines.idle_ms` default (design §5).
 pub(crate) const DEFAULT_IDLE_MS: u64 = 600_000;
 
-/// One `support` entry of the C1 §4.1 capabilities DTO.
-#[derive(Clone, Copy, Serialize)]
-#[serde(tag = "support", rename_all = "snake_case")]
-pub(crate) enum Support {
-    Native,
-    Unsupported { reason: &'static str },
-}
-
-#[derive(Serialize)]
-pub(crate) struct Verbs {
-    spawn: Support,
-    resume: Support,
-    steer: Support,
-    cancel: Support,
-    close: Support,
-}
-
-#[derive(Serialize)]
-pub(crate) struct ParamSupport {
-    instructions: Support,
-    output_schema: Support,
-    effort: Support,
-    max_steps: Support,
-}
-
-#[derive(Serialize)]
-pub(crate) struct UsageSupport {
-    tokens: &'static str,
-    cost: &'static str,
-}
-
-/// The fake route's declared `capabilities.usage.tokens`, which labels
-/// `status` `progress.tokens` (Task 4 design §2.4) and the envelope's
-/// `usage`: its samples are exact per turn by construction (§2.5).
-pub(crate) const FAKE_TOKEN_SCOPE: &str = "turn";
-
-/// C1 §4.1 capabilities, stating only what this build actually does.
-#[derive(Serialize)]
-pub(crate) struct Capabilities {
-    verbs: Verbs,
-    params: ParamSupport,
-    bounds: [&'static str; 0],
-    network_control: bool,
-    recover: Support,
-    usage: UsageSupport,
-}
-
-impl Capabilities {
-    /// C1 §4.1 `require` (design §11.1): `require` is a list of verb names,
-    /// each met only by `native` support unless written `verb:partial`,
-    /// which `partial` support also meets. The first unmet verb is
-    /// `missing_capability` naming it; anything else is `invalid_params`.
-    pub(crate) fn require(&self, require: &RawValue) -> Result<(), ApiError> {
-        let invalid = || {
-            ApiError::naming(
-                ApiError::INVALID_PARAMS,
-                &const { Named::field("require") },
-                "require is a list of verb names",
-            )
-        };
-        let listed = json_limits::string_list(require.get()).ok_or_else(invalid)?;
-        for name in &listed {
-            // A verb met natively also meets `verb:partial`.
-            let verb = name.strip_suffix(":partial").unwrap_or(name);
-            let (named, support): (&'static Named, Support) = match verb {
-                "spawn" => (&const { Named::fake("spawn") }, self.verbs.spawn),
-                "resume" => (&const { Named::fake("resume") }, self.verbs.resume),
-                "steer" => (&const { Named::fake("steer") }, self.verbs.steer),
-                "cancel" => (&const { Named::fake("cancel") }, self.verbs.cancel),
-                "close" => (&const { Named::fake("close") }, self.verbs.close),
-                _ => return Err(invalid()),
-            };
-            let met = match support {
-                Support::Native => true,
-                Support::Unsupported { .. } => false,
-            };
-            if !met {
-                return Err(ApiError::naming(
-                    ApiError::MISSING_CAPABILITY,
-                    named,
-                    "a required verb is not supported natively on route fake",
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    /// The fake route: one prompt, one turn, no controls, bounds or usage.
-    pub(crate) fn fake() -> Self {
-        let unsupported = |reason| Support::Unsupported { reason };
-        Self {
-            verbs: Verbs {
-                spawn: Support::Native,
-                resume: Support::Native,
-                steer: unsupported("the fake route has no steer input"),
-                cancel: Support::Native,
-                close: Support::Native,
-            },
-            params: ParamSupport {
-                instructions: unsupported("the fake route has no instructions input"),
-                output_schema: unsupported("the fake route has no schema input"),
-                effort: unsupported("the fake route has no effort setting"),
-                max_steps: unsupported("the fake route has no step limit"),
-            },
-            bounds: [],
-            network_control: false,
-            recover: unsupported("fake turns do not survive a daemon restart"),
-            usage: UsageSupport {
-                tokens: FAKE_TOKEN_SCOPE,
-                cost: "unavailable",
-            },
-        }
-    }
-}
-
-#[derive(Clone, Copy, Deserialize, Serialize)]
-pub(crate) struct Deadlines {
-    wall_ms: u64,
-    /// Longest time without meaningful progress (design §5).
-    idle_ms: u64,
-}
-
-/// Values frozen at acceptance (§3.2 `effective`, `turn.started` payload),
-/// stored in the turn's Store row and driven from.
-#[derive(Clone, Deserialize, Serialize)]
-pub(crate) struct Effective {
-    model: String,
-    effort: Option<String>,
-    bound: Option<Value>,
-    deadlines: Deadlines,
-    max_steps: Option<u64>,
-}
-
-impl Effective {
-    /// The turn's frozen model.
-    pub(crate) fn model(&self) -> &str {
-        &self.model
-    }
-
-    /// Turn 1 of a fake session: its own values, else the fake route's defaults.
-    pub(crate) fn fake(model: &str, overrides: &Overrides) -> Self {
-        Self {
-            model: model.to_owned(),
-            effort: None,
-            bound: None,
-            deadlines: Deadlines {
-                wall_ms: overrides.wall_ms.unwrap_or(DEFAULT_WALL_MS),
-                idle_ms: overrides.idle_ms.unwrap_or(DEFAULT_IDLE_MS),
-            },
-            max_steps: None,
-        }
-    }
-
-    /// C1 P5: a later turn's values, each omitted one inherited from the
-    /// latest accepted turn's frozen `self`.
-    pub(crate) fn inherit(&self, overrides: &Overrides) -> Self {
-        let mut effective = self.clone();
-        if let Some(wall_ms) = overrides.wall_ms {
-            effective.deadlines.wall_ms = wall_ms;
-        }
-        if let Some(idle_ms) = overrides.idle_ms {
-            effective.deadlines.idle_ms = idle_ms;
-        }
-        effective
-    }
-
-    /// The turn's Core-owned wall deadline budget.
-    pub(crate) fn wall(&self) -> std::time::Duration {
-        std::time::Duration::from_millis(self.deadlines.wall_ms)
-    }
-
-    /// The turn's Core-owned idle deadline budget (design §5).
-    pub(crate) fn idle(&self) -> std::time::Duration {
-        std::time::Duration::from_millis(self.deadlines.idle_ms)
-    }
-}
-
-/// Route-plan fields shared by the receipt and the envelope.
+/// The route and version fields shared by the receipt and the envelope
+/// (C1 §3.2, §5; AD7, AD12).
 #[derive(Clone, Serialize)]
-pub(crate) struct RoutePlan {
-    route: &'static str,
-    adapter_version: &'static str,
-    vendor_version: Option<String>,
-    version_status: &'static str,
+pub(crate) struct PlanFields {
+    pub(crate) route: String,
+    pub(crate) adapter_version: String,
+    pub(crate) vendor_version: Option<String>,
+    pub(crate) version_status: VersionStatus,
 }
 
-impl RoutePlan {
-    /// The fake agent reports no version, so it is never inside a tested set.
-    pub(crate) fn fake() -> Self {
-        Self {
-            route: FAKE_ROUTE,
-            // Workspace crates share one version; via-adapters has no separate constant.
-            adapter_version: env!("CARGO_PKG_VERSION"),
-            vendor_version: None,
-            version_status: "untested",
-        }
-    }
-
-    /// The version the turn's own instance reported at its handshake
-    /// (AD7): `tested` only when the adapter checked it.
-    pub(crate) fn instance(mut self, vendor_version: Option<String>, tested: bool) -> Self {
-        self.vendor_version = vendor_version;
-        self.version_status = if tested { "tested" } else { "untested" };
-        self
-    }
-
-    pub(crate) fn warnings(&self) -> Vec<Warning> {
-        if self.version_status != "untested" {
-            Vec::new()
-        } else if self.vendor_version.is_none() {
-            vec![Warning::new(
-                "vendor_version_untested",
-                "the fake agent reports no version",
-            )]
-        } else {
-            vec![Warning::new(
-                "vendor_version_untested",
-                "the vendor version is not one the adapter checked",
-            )]
+impl PlanFields {
+    /// C1 §5 `vendor_version_untested`, unless the version is `tested`.
+    pub(crate) fn warning(&self) -> Option<Warning> {
+        match self.version_status {
+            VersionStatus::Tested => None,
+            VersionStatus::Untested | VersionStatus::Refused if self.vendor_version.is_none() => {
+                Some(Warning::VENDOR_VERSION_UNREPORTED)
+            }
+            VersionStatus::Untested | VersionStatus::Refused => {
+                Warning::adapter("vendor_version_untested", None)
+            }
         }
     }
 }
@@ -1892,7 +1611,7 @@ impl Warning {
         }
     }
 
-    /// This warning with `data`. No warning Core raises carries data yet.
+    /// This warning with `data`.
     #[cfg(any(test, feature = "test-failpoints"))]
     pub(crate) fn with_data(mut self, data: Value) -> Self {
         self.data = Some(data);
@@ -1923,6 +1642,27 @@ impl Warning {
         "cancel_cleanup_uncertain",
         "process group cleanup after cancellation is unconfirmed",
     );
+
+    /// C1 §5: a turn with an `output_schema` ended with no structured output.
+    pub(crate) const STRUCTURED_OUTPUT_MISSING: Self = Self::new(
+        "structured_output_missing",
+        "the vendor returned no structured output",
+    );
+
+    /// C1 §5, Q2 (fix round 1 #16): a turn that did not complete kept a
+    /// structured output that does not satisfy its `output_schema`;
+    /// `reason` is `"invalid"` or `"validation_limit"`.
+    pub(crate) fn structured_output_invalid(reason: &'static str) -> Self {
+        Self {
+            code: "structured_output_invalid",
+            message: "the structured output does not satisfy output_schema",
+            data: Some(serde_json::json!({ "reason": reason })),
+        }
+    }
+
+    /// C1 §5, AD7: no instance reported the vendor's version.
+    pub(crate) const VENDOR_VERSION_UNREPORTED: Self =
+        Self::new("vendor_version_untested", "the vendor reported no version");
 
     /// C1 §5, AD6: the turn's usage ledger overflowed its keys, so the
     /// reported numbers cover an interval VIA did not verify.
@@ -1996,9 +1736,10 @@ pub(crate) struct Receipt {
     pub(crate) turn: String,
     pub(crate) state: &'static str,
     #[serde(flatten)]
-    pub(crate) plan: RoutePlan,
+    pub(crate) plan: PlanFields,
     pub(crate) capabilities: Capabilities,
-    pub(crate) effective: Effective,
+    /// C1 §3.2's five members ([`crate::intake::Effective::c1`]).
+    pub(crate) effective: Value,
     pub(crate) warnings: Vec<Warning>,
 }
 
@@ -2008,7 +1749,7 @@ pub(crate) struct TurnReceipt {
     pub(crate) turn: String,
     pub(crate) state: &'static str,
     pub(crate) queue_position: u32,
-    pub(crate) effective: Effective,
+    pub(crate) effective: Value,
     pub(crate) warnings: Vec<Warning>,
 }
 
@@ -2018,11 +1759,13 @@ pub(crate) struct Requested<T> {
     pub(crate) resolved: T,
 }
 
+/// C1 §5 `bound`: as requested, as the route enforces it, and whether
+/// the turn inherited it.
 #[derive(Serialize)]
 pub(crate) struct Bound {
-    requested: Option<Value>,
-    effective: Option<Value>,
-    inherited: bool,
+    pub(crate) requested: Option<Value>,
+    pub(crate) effective: Option<Value>,
+    pub(crate) inherited: bool,
 }
 
 /// C1 §8.2 `failure.class` values Core commits.
@@ -2033,6 +1776,8 @@ pub(crate) enum FailureClass {
     /// C1 §8.2: no meaningful progress within `idle_ms` (design §5).
     DeadlineIdle,
     SubmitFailed,
+    /// C1 §8.2 (Q2): the structured output failed VIA's validation.
+    StructuredOutputInvalid,
     /// C1 §8.2: the vendor returned a different or fresh session.
     ResumeMismatch,
     VendorError,
@@ -2074,7 +1819,7 @@ pub(crate) struct Usage {
     output_tokens: Option<u64>,
     reasoning_output_tokens: Option<u64>,
     total_tokens: Option<u64>,
-    scope: &'static str,
+    scope: Cow<'static, str>,
     provenance: &'static str,
 }
 
@@ -2096,14 +1841,14 @@ impl Usage {
         output_tokens: None,
         reasoning_output_tokens: None,
         total_tokens: None,
-        scope: "turn",
+        scope: Cow::Borrowed("turn"),
         provenance: "unavailable",
     };
 
-    /// The turn's reported figure (AD6) under the route's declared scope,
-    /// or `vendor_interval` once its ledger overflowed; unavailable without
-    /// a sample.
-    pub(crate) fn reported(tokens: Option<Tokens>, interval: bool) -> Self {
+    /// The turn's reported figure (AD6) under the route's declared `scope`
+    /// (C1 §4.1 `usage.tokens`), or `vendor_interval` once its ledger
+    /// overflowed; unavailable without a sample.
+    pub(crate) fn reported(tokens: Option<Tokens>, interval: bool, scope: &str) -> Self {
         match tokens {
             Some(tokens) => Self {
                 input_tokens: tokens.input,
@@ -2112,9 +1857,9 @@ impl Usage {
                 reasoning_output_tokens: tokens.reasoning_output,
                 total_tokens: tokens.total,
                 scope: if interval {
-                    "vendor_interval"
+                    Cow::Borrowed("vendor_interval")
                 } else {
-                    FAKE_TOKEN_SCOPE
+                    Cow::Owned(scope.to_owned())
                 },
                 provenance: "reported",
             },
@@ -2479,11 +2224,11 @@ pub(crate) struct Envelope {
     pub(crate) vendor_stop_reason: Option<String>,
     /// Only a forced daemon stop cancels on this route; otherwise `null`.
     pub(crate) cancel: Option<Cancel>,
-    pub(crate) harness: &'static str,
+    pub(crate) harness: String,
     pub(crate) model: Requested<String>,
     pub(crate) effort: Requested<Option<String>>,
     #[serde(flatten)]
-    pub(crate) plan: RoutePlan,
+    pub(crate) plan: PlanFields,
     pub(crate) vendor_session_id: Option<String>,
     pub(crate) cwd: Option<String>,
     pub(crate) bound: Bound,
@@ -2515,15 +2260,6 @@ pub(crate) struct Envelope {
     pub(crate) vendor: VendorFields,
 }
 
-impl Bound {
-    /// The fake route enforces no bound; nothing was requested or applied.
-    pub(crate) const NONE: Self = Self {
-        requested: None,
-        effective: None,
-        inherited: false,
-    };
-}
-
 /// C1 §6.1 event payloads Core commits today.
 #[derive(Serialize)]
 #[serde(tag = "type")]
@@ -2533,7 +2269,7 @@ pub(crate) enum EventBody {
     #[serde(rename = "turn.submitted")]
     TurnSubmitted { attempt: u32 },
     #[serde(rename = "turn.started")]
-    TurnStarted { effective: Effective },
+    TurnStarted { effective: Value },
     #[serde(rename = "turn.ended")]
     TurnEnded {
         state: &'static str,
@@ -2563,6 +2299,9 @@ pub(crate) enum EventBody {
     },
     #[serde(rename = "session.closed")]
     SessionClosed { reason: &'static str },
+    /// C1 §3.4, §6.1: steer input the vendor took into the active turn.
+    #[serde(rename = "steer.delivered")]
+    SteerDelivered { delivery: String },
     /// C1 §6.1, C2 §2: the session's first confirmed connection
     /// generation. Its transcript hint goes to the session's columns.
     #[serde(rename = "session.opened")]
@@ -2655,62 +2394,7 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{EventBody, SpawnParams, UNIX_EPOCH, retry_identity, retry_key, rfc3339};
-
-    /// Fake-route edge rules: an empty options object per harness passes; a
-    /// null `bound`, `effort` or `deadlines` is `invalid_params` while a
-    /// present bound is `bound_unsupported`; nullable `output_schema` and
-    /// `max_steps` accept null; a zero wall budget is refused.
-    #[test]
-    fn fake_per_turn_edge_values() {
-        let check = |extra: serde_json::Value| {
-            let mut params = json!({"harness":"fake","model":"fake","prompt":"p","handle":"h"});
-            for (member, value) in extra.as_object().unwrap() {
-                params[member] = value.clone();
-            }
-            let params: SpawnParams = serde_json::from_value(params).unwrap();
-            params
-                .per_turn()
-                .fake_overrides()
-                .map(|overrides| overrides.wall_ms)
-                .map_err(|error| {
-                    (
-                        error.kind,
-                        error.named.map(|named| (named.field, named.route)),
-                    )
-                })
-        };
-        assert_eq!(check(json!({"vendor":{"fake":{},"codex":{}}})), Ok(None));
-        assert_eq!(check(json!({"deadlines":{"wall_ms":7}})), Ok(Some(7)));
-        assert_eq!(
-            check(json!({"bound":null})),
-            Err(("invalid_params", Some(("bound", Some("fake")))))
-        );
-        assert_eq!(
-            check(json!({"bound":{"mode":"full","extra_write_dirs":[],"network":true}})),
-            Err(("bound_unsupported", Some(("bound", Some("fake")))))
-        );
-        assert_eq!(
-            check(json!({"effort":null})),
-            Err(("invalid_params", Some(("effort", Some("fake")))))
-        );
-        assert_eq!(
-            check(json!({"deadlines":null})),
-            Err(("invalid_params", Some(("deadlines", Some("fake")))))
-        );
-        assert_eq!(
-            check(json!({"output_schema":null,"max_steps":null})),
-            Ok(None)
-        );
-        assert_eq!(
-            check(json!({"vendor":{"fake":{"k":"v"}}})),
-            Err(("invalid_params", Some(("vendor", Some("fake")))))
-        );
-        assert_eq!(
-            check(json!({"deadlines":{"wall_ms":0}})),
-            Err(("invalid_params", Some(("deadlines.wall_ms", None))))
-        );
-    }
+    use super::{EventBody, UNIX_EPOCH, retry_identity, retry_key, rfc3339};
 
     #[test]
     fn durable_events_use_c1_tags_and_fields() {

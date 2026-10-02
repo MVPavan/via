@@ -171,13 +171,14 @@ pub use instance::{
 pub use observation::{
     AdapterError, Admitted, ClassHint, CostReport, Decline, Denial, DenialKind, InstanceReport,
     LeftoverReport, Observation, ObservationBudget, ObservationItem, ObservationSink,
-    ProgressMarks, SteerDelivery, StopReason, TurnEnd, TurnEvidence, UsageSample, VendorTerminal,
-    observation_channel, observation_channel_in,
+    ProgressMarks, SteerDelivery, SteerToken, StopReason, TurnEnd, TurnEvidence, UsageSample,
+    VendorTerminal, observation_channel, observation_channel_in,
 };
 pub use plan::{
-    AdapterSet, Bound, CatalogModel, Category, CategoryDecl, DescribeRequest, Inherit,
+    AdapterSet, Bound, CatalogModel, Category, CategoryDecl, DescribeRequest, Inherit, InheritPlan,
     InheritState, ModelChoice, ModelEntry, ModelSource, Refusal, RefusalKind, RoutePlan, ServerKey,
-    SessionRef, Switch, TurnParams, VendorOptions, VersionStatus, Warning, resolve_model,
+    SessionRef, Switch, TurnCheck, TurnParams, VendorOptions, VersionStatus, Warning,
+    resolve_model,
 };
 pub use runtime::{
     AdapterShutdown, AnchorRecovery, AnchorTurnRecovery, OBSERVATION_BYTES, OBSERVATION_ITEMS,

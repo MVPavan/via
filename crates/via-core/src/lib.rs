@@ -80,6 +80,8 @@ pub enum C1TurnState {
 
 mod api;
 mod engine;
+mod intake;
+mod schema;
 
 /// Test builds only: the envelope with every member at its maximum (Task 4
 /// design §6.4, §13.2).

@@ -450,7 +450,7 @@ impl Blobs {
     /// Copies the prompt file at `path` into a new finished blob in one
     /// pass (design §10.4): opened read-only with `O_NONBLOCK`, so a FIFO
     /// cannot block the open, and `fstat`ed: a regular file of at most
-    /// [`PROMPT_MAX`]. It streams in 64 KiB chunks through the blob's
+    /// `max` bytes ([`PROMPT_MAX`] for a prompt file). It streams in 64 KiB chunks through the blob's
     /// running SHA-256 with a streaming UTF-8 check, then `fstat`s again:
     /// bytes read other than the first size, or a changed size, `mtime`
     /// or `ctime`, refuse it as `changed`. The whole pass ends by
@@ -459,6 +459,7 @@ impl Blobs {
         &self,
         path: PathBuf,
         deadline: tokio::time::Instant,
+        max: u64,
     ) -> Result<BlobRef, PromptFileError> {
         let opened = self
             .tasks
@@ -480,7 +481,7 @@ impl Blobs {
         if !first.is_file() {
             return Err(PromptFileError::Refused("not_regular"));
         }
-        if first.len() > PROMPT_MAX {
+        if first.len() > max {
             return Err(PromptFileError::Refused("too_large"));
         }
         // Test builds: the pass holds here, with no lock held (§13.2).

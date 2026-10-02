@@ -28,7 +28,8 @@ use super::resolve::{self, CORRUPT_ROW, Queueing};
 use super::stop::stop_outcome;
 use super::terminal::terminal_envelope;
 use super::{Accepted, Engine, Terminal, TurnRecord, failure, journal};
-use crate::api::{Cancel, Effective, Event, EventBody, FailureClass, Timestamps, Usage, rfc3339};
+use crate::api::{Cancel, Event, EventBody, FailureClass, Timestamps, Usage, rfc3339};
+use crate::intake::{Effective, Frozen, TurnPlan};
 use crate::{ApiError, Cleanup, Deadline, SessionId, TurnNumber};
 
 /// Event page size, Store's bound.
@@ -100,18 +101,27 @@ impl Engine {
             // Each resolution commits or fails recovery, so the next read
             // never returns the same turn again.
             for turn in turns {
+                // Critical r2 #10: a startup error names the turn or
+                // session it failed for, and its cause.
+                let scope = format!("turn {}/{}", turn.session_id, turn.turn.get());
+                // Critical r1 #10: the turn's frozen values that do not
+                // decode fail startup before anything is done for it.
+                let effective = serde_json::from_str(&turn.effective).map_err(|error| {
+                    RecoverError::Corrupt(format!("frozen effective values do not decode: {error}"))
+                        .startup(&scope)
+                })?;
                 if asked.insert(turn.session_id.clone())
                     && let Some(driver) = self
                         .recover_session(&turn.session_id, &reconciled)
                         .await
-                        .map_err(|error| format!("store_error: {}", error.kind))?
+                        .map_err(|error| error.startup(&format!("session {}", turn.session_id)))?
                 {
                     resumed.push((turn.session_id.clone(), driver));
                 }
                 on_turn(&turn.session_id, turn.turn);
-                self.recover_turn(turn, &reconciled)
+                self.recover_turn(turn, effective, &reconciled)
                     .await
-                    .map_err(|error| format!("store_error: {}", error.kind))?;
+                    .map_err(|error| error.startup(&scope))?;
                 recovered += 1;
             }
         }
@@ -235,7 +245,8 @@ impl Engine {
 
     /// Whether `turn`'s queued row holds a frozen value that is present but
     /// unparseable (design §7.3): Store cannot read the row, or, for a turn
-    /// the handoff would enqueue (`parse`), Core cannot read its `effective`.
+    /// the handoff would enqueue (`parse`), Core cannot read its `effective`
+    /// or its session's frozen parameters or capabilities (Sol r1 #14).
     /// Any other read failure fails startup.
     async fn frozen_row_corrupt(
         &self,
@@ -244,9 +255,9 @@ impl Engine {
         parse: bool,
     ) -> Result<bool, String> {
         match self.store.queued_turn(session, turn).await {
-            Ok(Some(queued)) => {
-                Ok(parse && serde_json::from_value::<Effective>(queued.effective).is_err())
-            }
+            Ok(Some(queued)) => Ok(parse
+                && (serde_json::from_value::<Effective>(queued.effective).is_err()
+                    || Frozen::decode(&queued.route).is_none())),
             // Store's own parse of the row's values failed.
             Err(StoreError::CorruptEvidence) => Ok(true),
             Ok(None) => Err(format!(
@@ -342,14 +353,19 @@ impl Engine {
             queued_seq,
             ..
         } = self.history(session, turn).await?;
-        let (cwd, _) = self
-            .frozen(session)
+        let (cwd, _, plan) = self
+            .frozen(session, false)
             .await
-            .map_err(|error| WriteOutcome::of_read(&error))?;
+            .map_err(|error| match error {
+                RecoverError::Store(error) => WriteOutcome::of_read(&error),
+                // Read leniently, the values are never refused.
+                RecoverError::Api(_) | RecoverError::Corrupt(_) => WriteOutcome::NotCommitted,
+            })?;
         Ok(Queueing {
             queued_at,
             queued_seq,
             cwd,
+            plan: Box::new(plan),
         })
     }
 
@@ -364,17 +380,35 @@ impl Engine {
     /// The session's frozen `cwd` (design §11.1) and its stored identity
     /// (decision H3), which a rebuilt envelope reports as the live drive
     /// and `logs` would (C1 §5, critical r1 #11).
+    ///
+    /// `strict` (critical r1 #10): the session's frozen parameters or
+    /// capabilities that do not decode are corrupt evidence, never absence,
+    /// for a recovered turn that ran under them. A queued turn failed or
+    /// cancelled because its row is corrupt (design §7.3) reads them
+    /// leniently: that corruption is what its `failed(store)` reports.
     async fn frozen(
         &self,
         session: &SessionId,
-    ) -> Result<(Option<String>, Option<Identity>), StoreError> {
-        Ok(self
+        strict: bool,
+    ) -> Result<(Option<String>, Option<Identity>, TurnPlan), RecoverError> {
+        let Some(snapshot) = self
             .store
             .session_snapshot(session)
-            .await?
-            .map_or((None, None), |snapshot| {
-                (snapshot.cwd, Identity::stored(&snapshot.route))
-            }))
+            .await
+            .map_err(RecoverError::Store)?
+        else {
+            return Ok((None, None, TurnPlan::default()));
+        };
+        // The turn's own frozen values are not read back here.
+        let plan = if strict {
+            TurnPlan {
+                frozen: Frozen::decode_cause(&snapshot.route).map_err(RecoverError::Corrupt)?,
+                effective: None,
+            }
+        } else {
+            TurnPlan::of(&snapshot.route, None)
+        };
+        Ok((snapshot.cwd, Identity::stored(&snapshot.route), plan))
     }
 
     /// Pages through every committed anchor with Host's reports for the same
@@ -459,13 +493,13 @@ impl Engine {
         &self,
         session: &SessionId,
         reconciled: &Reconciled,
-    ) -> Result<Option<Resumed>, ApiError> {
+    ) -> Result<Option<Resumed>, RecoverError> {
         let snapshot = self
             .store
             .session_snapshot(session)
             .await
-            .map_err(|_| ApiError::STORE)?
-            .ok_or(ApiError::STORE)?;
+            .map_err(RecoverError::Store)?
+            .ok_or(RecoverError::Api(ApiError::STORE))?;
         let (facts, complete) = reconciled.session_facts(session);
         let budget = ObservationBudget::new();
         let (sink, receiver) = observation_channel_in(&budget);
@@ -533,13 +567,16 @@ impl Engine {
     async fn recover_turn(
         &self,
         unfinished: UnfinishedTurn,
+        effective: Effective,
         reconciled: &Reconciled,
-    ) -> Result<(), ApiError> {
+    ) -> Result<(), RecoverError> {
         let UnfinishedTurn {
             session_id: session,
             turn,
             submitted_at,
             correlation,
+            effective: _,
+            instance,
         } = unfinished;
         let History {
             last_seq,
@@ -554,7 +591,13 @@ impl Engine {
             .map_err(|_| ApiError::STORE)?;
         #[cfg(test)]
         self.hold(&self.faults.hold_after_history).await;
-        let (cwd, identity) = self.frozen(&session).await.map_err(|_| ApiError::STORE)?;
+        // Sol r1 #12: the envelope reports this turn's own frozen values.
+        // Critical r1 #10: the session's values that do not decode are
+        // corrupt evidence, which fails recovery, and so startup, as
+        // Store's own corrupt evidence of an unfinished turn does: nothing
+        // is committed in their place.
+        let (cwd, identity, mut plan) = self.frozen(&session, true).await?;
+        plan.effective = Some(effective);
         let accepted = recovered_acceptance(correlation, started);
         // Recovery runs before admission: this turn's writes are the session's only ones.
         let head = Head::new(Some(last_seq + 1));
@@ -611,7 +654,8 @@ impl Engine {
             (queued_seq, seq),
             // The crashed daemon's samples are gone with it.
             Usage::UNAVAILABLE,
-            identity,
+            // Sol r2 #6 (C1 §3.7): the instance the turn recorded.
+            (identity, instance, &plan),
         );
         let envelope = serde_json::to_value(&envelope).map_err(|_| ApiError::STORE)?;
         let committed = journal::commit_terminal(
@@ -633,7 +677,7 @@ impl Engine {
             Ok(())
         } else {
             head.lost();
-            Err(ApiError::STORE)
+            Err(ApiError::STORE.into())
         }
     }
 
@@ -982,6 +1026,32 @@ fn bounded(recovery: Recovery, complete: bool) -> Recovery {
         },
         recovery @ (Recovery::Resumed(_) | Recovery::Unknown { .. } | Recovery::Dead { .. }) => {
             recovery
+        }
+    }
+}
+
+/// Why a turn's recovery, and so startup, failed (critical r2 #10): Core's
+/// or Store's error, or a frozen value that does not decode, with its
+/// cause.
+pub(super) enum RecoverError {
+    Api(ApiError),
+    Store(StoreError),
+    Corrupt(String),
+}
+
+impl From<ApiError> for RecoverError {
+    fn from(error: ApiError) -> Self {
+        Self::Api(error)
+    }
+}
+
+impl RecoverError {
+    /// The startup error, naming the turn or session it failed for.
+    fn startup(self, scope: &str) -> String {
+        match self {
+            Self::Api(error) => format!("store_error: {scope}: {}", error.kind),
+            Self::Store(error) => format!("store_error: {scope}: {error}"),
+            Self::Corrupt(cause) => format!("store_error: {scope}: {cause}"),
         }
     }
 }

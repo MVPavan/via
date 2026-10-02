@@ -70,6 +70,14 @@ pub struct TurnParams {
     pub vendor: VendorOptions,
 }
 
+/// What `check_turn` reports of a resume turn it accepts (C2 §2).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TurnCheck {
+    /// The turn's bound as the route will apply it, like
+    /// [`RoutePlan::effective_bound`]; `None` when the turn sets none.
+    pub effective_bound: Option<Bound>,
+}
+
 /// The route identity a session stores and hands back on resume, reopen
 /// and recovery (AD12).
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -312,6 +320,42 @@ impl Serialize for Inherit {
     }
 }
 
+/// The `Serialize` form back: every category exactly once, each a state;
+/// anything else, a repeated category included (critical r2 #8), is
+/// refused, never completed with a default.
+impl<'de> Deserialize<'de> for Inherit {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_map(InheritVisitor)
+    }
+}
+
+struct InheritVisitor;
+
+impl<'de> serde::de::Visitor<'de> for InheritVisitor {
+    type Value = Inherit;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a state for every category, each named once")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Inherit, A::Error> {
+        let mut states: [Option<InheritState>; 6] = [None; 6];
+        while let Some((category, state)) = map.next_entry::<Category, InheritState>()? {
+            let slot = &mut states[category.index()];
+            if slot.replace(state).is_some() {
+                return Err(serde::de::Error::custom("inherit names a category twice"));
+            }
+        }
+        let mut inherit = Inherit::OD2_DEFAULT;
+        for category in Category::ALL {
+            let state = states[category.index()]
+                .ok_or_else(|| serde::de::Error::custom("inherit names every category"))?;
+            inherit.set(category, state);
+        }
+        Ok(inherit)
+    }
+}
+
 /// Whether VIA can apply one direction of a category (AD13).
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -366,32 +410,62 @@ impl CategoryDecl {
     }
 }
 
-/// The effective states for `requested`, and the one
+/// A session's inherited-configuration settings (C2 §2, §6.2): as
+/// requested at spawn, and their effective states. Both are frozen
+/// session parameters: status shows the effective states, and a reopened
+/// session's launch recipe applies the requested settings, whatever the
+/// configuration says now (critical r2 #5).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InheritPlan {
+    /// The settings requested at spawn.
+    pub requested: Inherit,
+    /// Their effective states (AD13).
+    pub effective: Inherit,
+}
+
+impl InheritPlan {
+    /// The `config_switch_unverified` warning's `data.categories`: every
+    /// category whose effective state is not the requested one, as
+    /// `{category, requested, effective}`, in C1 order; empty when each is.
+    pub fn unverified(&self) -> Vec<Value> {
+        Category::ALL
+            .into_iter()
+            .filter_map(|category| {
+                let (asked, state) = (self.requested.get(category), self.effective.get(category));
+                (state != asked)
+                    .then(|| json!({"category": category, "requested": asked, "effective": state}))
+            })
+            .collect()
+    }
+}
+
+/// The settings `requested` with their effective states, and the one
 /// `config_switch_unverified` warning listing every category whose
 /// effective state is not the requested one (AD13, AC7).
 pub(crate) fn effective_inherit(
     decls: &BTreeMap<Category, CategoryDecl>,
     requested: Inherit,
-) -> (Inherit, Option<Warning>) {
+) -> (InheritPlan, Option<Warning>) {
     let mut effective = requested;
-    let mut unmet = Vec::new();
     for category in Category::ALL {
-        let asked = requested.get(category);
         let state = decls
             .get(&category)
             .unwrap_or(&CategoryDecl::VERIFIED)
-            .effective(asked);
+            .effective(requested.get(category));
         effective.set(category, state);
-        if state != asked {
-            unmet.push(json!({"category": category, "requested": asked, "effective": state}));
-        }
     }
+    let inherit = InheritPlan {
+        requested,
+        effective,
+    };
+    let unmet = inherit.unverified();
     let warning = (!unmet.is_empty()).then(|| Warning {
         code: "config_switch_unverified",
         message: "an inherited-configuration setting could not be applied or verified".to_owned(),
         data: Some(json!({ "categories": unmet })),
     });
-    (effective, warning)
+    (inherit, warning)
 }
 
 /// A route plan (C1 §3.1, C2 §2); serializes to the C1 `describe` result.
@@ -417,10 +491,11 @@ pub struct RoutePlan {
     pub refusals: Vec<Refusal>,
     /// Warnings.
     pub warnings: Vec<Warning>,
-    /// Effective inherited-configuration states, frozen at spawn (AD13);
-    /// reported in status, not in `describe`.
+    /// The inherited-configuration settings as requested, and their
+    /// effective states, frozen at spawn (AD13, C2 §6.2); the effective
+    /// states are reported in status, neither in `describe`.
     #[serde(skip)]
-    pub inherit: Inherit,
+    pub inherit: InheritPlan,
     /// The persistent server this plan's connections share, if any; not
     /// part of `describe`.
     #[serde(skip)]
@@ -584,8 +659,13 @@ impl AdapterSet {
     }
 
     /// Pure: validates a resume turn's values against the frozen route,
-    /// including AD12's adapter-version compatibility.
-    pub fn check_turn(&self, session: &SessionRef, turn: &TurnParams) -> Result<(), Refusal> {
+    /// including AD12's adapter-version compatibility, and reports the
+    /// turn's bound as the route will apply it.
+    pub fn check_turn(
+        &self,
+        session: &SessionRef,
+        turn: &TurnParams,
+    ) -> Result<TurnCheck, Refusal> {
         let harness = Harness::parse(&session.harness).ok_or_else(|| unavailable(None))?;
         let route = harness.route();
         let adapter = self
@@ -595,7 +675,12 @@ impl AdapterSet {
         adapter.check_version(route, &session.adapter_version)?;
         match adapter.check_turn(route, turn).into_iter().next() {
             Some(refusal) => Err(refusal),
-            None => Ok(()),
+            None => Ok(TurnCheck {
+                effective_bound: turn
+                    .bound
+                    .clone()
+                    .map(|bound| adapter.effective_bound(bound)),
+            }),
         }
     }
 
@@ -625,4 +710,34 @@ fn unavailable(route: Option<&'static str>) -> Refusal {
         route,
         "the harness is not available in this daemon",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::Inherit;
+
+    /// Critical r2 #8: `inherit` names every category exactly once; seven
+    /// members with `hooks` twice are refused, as are five.
+    #[test]
+    fn inherit_refuses_a_repeated_category() {
+        let all = r#""hooks":"off","mcp_servers":"off","plugins":"on","skills":"on","agents":"on","instruction_files":"on""#;
+        let parse = |text: String| serde_json::from_str::<Inherit>(&text);
+        assert_eq!(parse(format!("{{{all}}}")).unwrap(), Inherit::OD2_DEFAULT);
+        assert!(
+            parse(format!(r#"{{{all},"hooks":"on"}}"#)).is_err(),
+            "hooks twice"
+        );
+        assert!(
+            parse(format!(r#"{{"hooks":"on",{all}}}"#)).is_err(),
+            "hooks twice, first"
+        );
+        assert!(
+            serde_json::from_value::<Inherit>(json!({"hooks":"off","mcp_servers":"off",
+                "plugins":"on","skills":"on","agents":"on"}))
+            .is_err(),
+            "five categories"
+        );
+    }
 }

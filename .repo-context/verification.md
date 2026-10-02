@@ -14,7 +14,13 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo nextest run --locked --workspace
 cargo deny check
 python3 scripts/check-layers.py
+python3 scripts/check-harness-literals.py
+cargo test --locked --offline -p boon
 ```
+
+The last line runs the vendored boon's unit and doc tests (it is excluded
+from the workspace members, so the workspace lines skip them;
+`third_party/boon/VIA-PATCH.md`).
 
 Root or CI runs (a foreign-uid listener needs CAP_SETUID) also run the
 ignored peer-UID end-to-end check:
@@ -40,12 +46,14 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo nextest run --locked --workspace
 cargo deny check
 python3 scripts/check-layers.py
+python3 scripts/check-harness-literals.py
 cargo clippy --locked --workspace --all-targets --features via-cli/test-failpoints -- -D warnings
 cargo nextest run --locked --workspace --features via-cli/test-failpoints
 cargo nextest run --locked -p via-cli --features test-failpoints -E 'test(/^s1_f(08|09|10|12)_/)'
 cargo nextest run --locked --workspace --features via-cli/test-failpoints -E 'test(/^s1_(f05|f2[47]|bounds|store|blob|wire|c1|progress|evidence|config|daemon_log)_/)'
 cargo build --locked --release -p via-cli --no-default-features
 python3 scripts/check-release-features.py target/release/via
+cargo test --locked --offline -p boon
 ```
 
 F24 on the shipped allocator is the authoritative memory gate (runtime §8):

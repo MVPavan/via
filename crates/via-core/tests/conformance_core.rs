@@ -2106,6 +2106,349 @@ fn core_an_aborted_dispatcher_strands_no_turn_work() {
     });
 }
 
+/// Sol r2 #7 (C1 §5, §8.2): a structured output is validated after the
+/// turn's final text, evidence and Store classification. The vendor
+/// completes with an output the schema refuses and a final text past the
+/// inline limit, whose file then fails its sync (`final_text.sync.fail`)
+/// once the vendor's terminal is disposed: the turn fails `store`, which
+/// stands, and its envelope warns `structured_output_invalid` with
+/// `reason: "invalid"`.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_structured_output_validated_after_a_store_failure() {
+    let profile = json!({"capabilities": {
+        "verbs": {"spawn":{"support":"native"},"resume":{"support":"native"},
+                  "steer":{"support":"unsupported","reason":"no"},
+                  "cancel":{"support":"native"},"close":{"support":"native"}},
+        "params": {"instructions":{"support":"unsupported","reason":"no"},
+                   "output_schema":{"support":"native"},
+                   "effort":{"support":"unsupported","reason":"no"},
+                   "max_steps":{"support":"unsupported","reason":"no"}},
+        "bounds": [], "network_control": false,
+        "recover": {"support":"unsupported","reason":"no"},
+        "usage": {"tokens":"turn","cost":"unavailable"}
+    }});
+    // Past the 256 KiB inline limit, so the text goes to its file.
+    let spilled = "a".repeat(256 * 1024);
+    let steps = [
+        accepted(1),
+        emit(&json!({"type":"terminal","vendor_turn_id":vendor_turn(1),
+                     "status":"completed","final_text":spilled,"stop_reason":"end_turn",
+                     "structured_output":{"b":1}})),
+    ];
+    let Some(root) = child(
+        "core_structured_output_validated_after_a_store_failure",
+        &scenario(&profile, &[script("p", &steps)]),
+        &[],
+    ) else {
+        return;
+    };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    arm(&root, "final_text.sync.fail", "fail_io");
+    run(async {
+        let daemon = Daemon::open(&root);
+        let schema = json!({"type":"object","required":["a"]});
+        let session = daemon.spawn("p", &json!({"output_schema":schema})).await;
+        let envelope = daemon.wait(&session, 1).await;
+        assert_eq!(envelope["state"], "failed", "{envelope}");
+        assert_eq!(envelope["failure"]["class"], "store", "{envelope}");
+        assert!(envelope["final_text_file"].is_null(), "{envelope}");
+        let warned: Vec<&Value> = envelope["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|warning| warning["code"] == "structured_output_invalid")
+            .collect();
+        assert_eq!(warned.len(), 1, "{envelope}");
+        assert_eq!(warned[0]["data"], json!({"reason":"invalid"}), "{envelope}");
+        daemon.stop().await;
+    });
+}
+
+/// A fake profile that takes an `output_schema`.
+#[cfg(feature = "test-failpoints")]
+fn schema_profile() -> Value {
+    json!({"capabilities": {
+        "verbs": {"spawn":{"support":"native"},"resume":{"support":"native"},
+                  "steer":{"support":"unsupported","reason":"no"},
+                  "cancel":{"support":"native"},"close":{"support":"native"}},
+        "params": {"instructions":{"support":"unsupported","reason":"no"},
+                   "output_schema":{"support":"native"},
+                   "effort":{"support":"unsupported","reason":"no"},
+                   "max_steps":{"support":"unsupported","reason":"no"}},
+        "bounds": [], "network_control": false,
+        "recover": {"support":"unsupported","reason":"no"},
+        "usage": {"tokens":"turn","cost":"unavailable"}
+    }})
+}
+
+/// The envelope's `structured_output_invalid` warnings.
+#[cfg(feature = "test-failpoints")]
+fn invalid_warnings(envelope: &Value) -> Vec<&Value> {
+    envelope["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|warning| warning["code"] == "structured_output_invalid")
+        .collect()
+}
+
+/// Critical r1 #3 (C1 §5, Q2): the forced path validates the structured
+/// output before it spills, as the natural path does. A vendor terminal
+/// decoded before a daemon force, whose output the schema refuses and
+/// which is past 32 KiB, is spilled and the forced envelope warns
+/// `structured_output_invalid` with `reason: "invalid"`.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_forced_spilled_output_is_validated() {
+    let (terminal, spilled) = structured(1, 32 * 1024 + 1);
+    let steps = [accepted(1), terminal, gate("after_terminal")];
+    let Some(root) = child(
+        "core_forced_spilled_output_is_validated",
+        &scenario(&schema_profile(), &[script("p", &steps)]),
+        &[],
+    ) else {
+        return;
+    };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    acknowledge(&root, "routes.finalize.entered", 1);
+    run(async {
+        let daemon = Daemon::open(&root);
+        let schema = json!({"type":"object","required":["a"]});
+        let session = daemon.spawn("p", &json!({"output_schema":schema})).await;
+        daemon.entered("after_terminal").await;
+        until_acked(&root, "routes.finalize.entered", 1).await;
+        let engine = Arc::clone(&daemon.engine);
+        let report = daemon.force_stop().await;
+        assert_eq!(report.unresolved_turns, 0, "{report:?}");
+        let envelope = engine.result(&format!("{session}/1")).await.unwrap();
+        let envelope: Value = serde_json::from_str(envelope.get()).unwrap();
+        assert!(envelope["structured_output"].is_null(), "{envelope}");
+        let path = envelope["structured_output_file"]["path"].as_str().unwrap();
+        let written = fs::read(path).unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&written).unwrap(), spilled);
+        let warned = invalid_warnings(&envelope);
+        assert_eq!(warned.len(), 1, "{envelope}");
+        assert_eq!(warned[0]["data"], json!({"reason":"invalid"}), "{envelope}");
+    });
+}
+
+/// Critical r1 #4 (C1 §5, §8.2; design §7.4): the validation outcome is
+/// kept apart from the failure class and projected after the final Store
+/// classification. A completed turn whose output the schema refuses
+/// fails `structured_output_invalid`; its terminal write fails both
+/// attempts, so final shutdown's resolution batch ends it
+/// `failed(store)`, which still warns `structured_output_invalid` with
+/// `reason: "invalid"` and keeps the output.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_validation_survives_a_terminal_write_failure() {
+    let steps = [
+        accepted(1),
+        emit(&json!({"type":"terminal","vendor_turn_id":vendor_turn(1),
+                     "status":"completed","final_text":"done","stop_reason":"end_turn",
+                     "structured_output":{"b":1}})),
+    ];
+    let Some(root) = child(
+        "core_validation_survives_a_terminal_write_failure",
+        &scenario(&schema_profile(), &[script("p", &steps)]),
+        &[],
+    ) else {
+        return;
+    };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    arm_failing(&root, "store.commit.terminal", true);
+    run(async {
+        let daemon = Daemon::open(&root);
+        let schema = json!({"type":"object","required":["a"]});
+        let session = daemon.spawn("p", &json!({"output_schema":schema})).await;
+        let params = WaitParams {
+            address: format!("{session}/1"),
+            timeout_ms: Some(WAIT_MS),
+        };
+        let error = daemon.engine.wait(params).await.unwrap_err();
+        assert_eq!(error.kind, "store_error");
+        // Both attempts failed; the batch's own write then commits.
+        let points = root.join("points");
+        assert!(points.join("store.commit.terminal.2.ack").exists());
+        fs::remove_file(points.join("store.commit.terminal.json")).unwrap();
+        let engine = Arc::clone(&daemon.engine);
+        let report = engine
+            .shutdown(Deadline::at(
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            ))
+            .await;
+        daemon.starter.abort();
+        assert_eq!(report.failure_batches.committed, 1, "{report:?}");
+        let envelope = engine.result(&format!("{session}/1")).await.unwrap();
+        let envelope: Value = serde_json::from_str(envelope.get()).unwrap();
+        assert_eq!(envelope["state"], "failed", "{envelope}");
+        assert_eq!(class(&envelope), "store", "{envelope}");
+        assert_eq!(envelope["structured_output"], json!({"b":1}), "{envelope}");
+        let warned = invalid_warnings(&envelope);
+        assert_eq!(warned.len(), 1, "{envelope}");
+        assert_eq!(warned[0]["data"], json!({"reason":"invalid"}), "{envelope}");
+    });
+}
+
+/// Critical r1 #5 (C1 §3.4, C2 §2 `SteerReceipt`): a steer is answered
+/// only after its `steer.delivered` event committed. The vendor reports
+/// the delivery, and the event's write fails (`store.commit.event`'s
+/// second hit, after the acceptance's): the steer is `store_error`, never
+/// a success, and no `steer.delivered` event exists.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_steer_delivery_commit_failure_is_store_error() {
+    let mut profile = schema_profile();
+    profile["capabilities"]["verbs"]["steer"] = json!({"support":"native"});
+    let steps = [
+        accepted(1),
+        json!({"action":"expect_request","expected":{"type":"steer","id":3}}),
+        emit(&json!({"type":"steer_delivered","id":3,"vendor_turn_id":vendor_turn(1)})),
+        gate("delivered"),
+        terminal(1, "completed", "end_turn"),
+    ];
+    let Some(root) = child(
+        "core_steer_delivery_commit_failure_is_store_error",
+        &scenario(&profile, &[script("p", &steps)]),
+        &[],
+    ) else {
+        return;
+    };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    arm_at(&root, "store.commit.event", 2, "fail_io");
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = daemon.spawn("p", &json!({})).await;
+        // Accepted: the steer is admitted into the running turn.
+        let accepted = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !events(&daemon, &session)
+            .await
+            .iter()
+            .any(|event| event["type"] == "turn.started")
+        {
+            assert!(tokio::time::Instant::now() < accepted, "never accepted");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let params = serde_json::from_value(json!({"session":session,"handle":HANDLE,
+                                                   "text":"also"}))
+        .unwrap();
+        let steering = tokio::spawn({
+            let engine = Arc::clone(&daemon.engine);
+            async move { engine.steer(params).await }
+        });
+        daemon.entered("delivered").await;
+        let reply = tokio::time::timeout(Duration::from_secs(20), steering)
+            .await
+            .expect("the steer is answered")
+            .unwrap();
+        assert!(
+            root.join("points")
+                .join("store.commit.event.2.ack")
+                .exists()
+        );
+        let error = reply.expect_err("a failed delivery commit is no success");
+        assert_eq!(error.kind, "store_error", "{error:?}");
+        daemon.release("delivered");
+        assert!(
+            !events(&daemon, &session)
+                .await
+                .iter()
+                .any(|event| event["type"] == "steer.delivered")
+        );
+        let engine = Arc::clone(&daemon.engine);
+        let _report = engine
+            .shutdown(Deadline::at(
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            ))
+            .await;
+        daemon.starter.abort();
+    });
+}
+
+/// Critical r2 #3 (C1 §3.4 `steer_failed`, C2 `SteerError::NotRecorded`):
+/// Core holds the turn's first text item (`core.observations.pause`), so
+/// the session channel is exactly full when the vendor reports a steer it
+/// took; the report's delivery stalls past the lowered bound. The steer is
+/// `steer_failed` with `data.reason: "not_recorded"` and the delivery a
+/// success would give (`injected`), and no `steer.delivered` exists.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_steer_report_overflow_is_not_recorded() {
+    let mut profile = schema_profile();
+    profile["capabilities"]["verbs"]["steer"] = json!({"support":"native"});
+    let flood_line = json!({"type":"text","vendor_turn_id":vendor_turn(1)}).to_string() + "\n";
+    // The acceptance, then one text item Core holds and the channel's
+    // worth behind it.
+    let steps = [
+        accepted(1),
+        json!({"action":"flood","text":flood_line,"count":512}),
+        gate("flood"),
+        json!({"action":"flood","text":flood_line,"count":513}),
+        json!({"action":"expect_request","expected":{"type":"steer","id":3}}),
+        emit(&json!({"type":"steer_delivered","id":3,"vendor_turn_id":vendor_turn(1)})),
+        terminal(1, "completed", "end_turn"),
+    ];
+    let Some(root) = child(
+        "core_steer_report_overflow_is_not_recorded",
+        &scenario(&profile, &[script("p", &steps)]),
+        &[("VIA_TEST_EVENT_STALL_MS", "250")],
+    ) else {
+        return;
+    };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    arm_at(&root, "core.observations.pause", 2, "pause");
+    acknowledge(&root, "adapter.observation.admitted", 513);
+    acknowledge(&root, "adapter.observation.stalled", 1);
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = daemon.spawn("p", &json!({})).await;
+        until_acked(&root, "core.observations.pause", 2).await;
+        daemon.entered("flood").await;
+        until_acked(&root, "adapter.observation.admitted", 513).await;
+        acknowledge(&root, "adapter.observation.admitted", 1026);
+        daemon.release("flood");
+        until_acked(&root, "adapter.observation.admitted", 1026).await;
+        let params = serde_json::from_value(json!({"session":session,"handle":HANDLE,
+                                                   "text":"also"}))
+        .unwrap();
+        let steering = tokio::spawn({
+            let engine = Arc::clone(&daemon.engine);
+            async move { engine.steer(params).await }
+        });
+        until_acked(&root, "adapter.observation.stalled", 1).await;
+        let reply = tokio::time::timeout(Duration::from_secs(20), steering)
+            .await
+            .expect("the steer is answered")
+            .unwrap();
+        let error = reply.expect_err("an unrecorded steer is no success");
+        assert_eq!(
+            (
+                error.kind,
+                &error.data()["reason"],
+                &error.data()["delivery"]
+            ),
+            ("steer_failed", &json!("not_recorded"), &json!("injected")),
+            "{error:?}"
+        );
+        fs::write(
+            root.join("points")
+                .join("core.observations.pause.2.release"),
+            b"",
+        )
+        .unwrap();
+        let envelope = daemon.wait(&session, 1).await;
+        assert_eq!(class(&envelope), "overflow", "{envelope}");
+        assert!(
+            !events(&daemon, &session)
+                .await
+                .iter()
+                .any(|event| event["type"] == "steer.delivered")
+        );
+        daemon.shutdown().await;
+    });
+}
+
 /// Idle session lanes the daemon keeps (runtime §8).
 #[cfg(feature = "test-failpoints")]
 const IDLE_LANES: usize = 32;

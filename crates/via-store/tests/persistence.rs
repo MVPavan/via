@@ -58,6 +58,7 @@ fn acceptance() -> AcceptanceRecord {
         correlation: "fake-turn-1".to_owned(),
         event: json!({"type":"turn.started","seq":3,"turn":1,"at":"2026-01-01T00:00:01.000Z"}),
         adapter_version: None,
+        instance: None,
     }
 }
 

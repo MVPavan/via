@@ -214,6 +214,7 @@ fn started() -> Started {
         submitted: Some((AT.to_owned(), Instant::now())),
         folder: Some(FOLDER.to_owned()),
         cwd: None,
+        plan: Box::default(),
     }
 }
 
@@ -474,7 +475,13 @@ async fn receipt(store: &StoreClient, session: &SessionId, submitted: bool) {
             session_id: session.clone(),
             handle_hash: [7; 32],
             receipt: json!({"state":"queued"}),
-            params: json!({"harness":"fake"}),
+            // Core's frozen parameters: `inherit`, as requested and
+            // effective, is required.
+            params: json!({"harness":"fake","model":"fake","inherit":{
+                "requested": {"hooks":"off","mcp_servers":"off","plugins":"on","skills":"on",
+                              "agents":"on","instruction_files":"on"},
+                "effective": {"hooks":"off","mcp_servers":"off","plugins":"on","skills":"on",
+                              "agents":"on","instruction_files":"on"}}}),
             label: None,
             prompt: "hello".into(),
             effective: frozen(),

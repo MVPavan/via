@@ -158,13 +158,12 @@ impl Engine {
     /// `describe` (Task 4 design §4.6): the route one set of parameters
     /// would take, with nothing written.
     pub fn describe(&self, params: &DescribeParams) -> Result<Value, ApiError> {
-        // The intake stays fake-shaped until `describe` goes through `plan`.
-        params.describe(self.harness_available(via_adapters::FAKE))
+        params.describe(&self.adapter)
     }
 
-    /// `models` (Task 4 design §4.6).
+    /// `models` (Task 4 design §4.6): each configured harness's catalog.
     pub fn models(&self, params: &ModelsParams) -> Value {
-        params.models()
+        params.models(&self.adapter)
     }
 
     /// When this Engine opened (Task 4 design §11.2).

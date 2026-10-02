@@ -5,16 +5,17 @@ use super::{
     AcceptanceRecord, ActiveTurn, CancelCause, ClosedOutcome, ClosedRecord, ClosingRecord, Command,
     CommitOutcome, Connection, Duration, EventRecord, EventsPage, EventsQuery, EventsRead,
     EvidenceRefs, EvidenceRoot, FAILURE_BATCH_CANCELLATIONS, FailureResolutionRecord, Identity,
-    KeyedOperation, ListPage, ListQuery, MetadataExt, OperationRecord, OperationVerb,
-    OptionalExtension, PAGE_MAX, PAGE_SCAN, PAGE_WRAPPER, Path, Predecessors, Prompt,
-    QueuedSummary, QueuedTurn, ReadCorruption, ReceiptRecord, ResumeRecord, SESSION_QUEUE_LIMIT,
-    STATUS_ANCHORS, STATUS_QUEUE, STATUS_TURNS, SessionEventRecord, SessionId, SessionRoute,
-    SessionSnapshot, SessionStatus, SessionSummary, SpawnKey, SpawnRecord, StatusQuery, StepRow,
-    StepsRecord, StoreError, StoredEvent, StoredSpawnKey, SubmissionRecord, SubmitFailedRecord,
-    TerminalCancel, TerminalExtras, TerminalFacts, TerminalRecord, TransactionBehavior, TurnNumber,
-    UnfinishedTurn, Value, check_schema_version, commit_anchor_identified, commit_anchor_intent,
-    commit_arm_intent, commit_group_absence, commit_vendor_facts, count_unproven_anchors, fs,
-    oneshot, params, read_anchor_cohort, read_anchor_owners, read_anchor_records,
+    InstanceRecord, KeyedOperation, ListPage, ListQuery, MetadataExt, OperationRecord,
+    OperationVerb, OptionalExtension, PAGE_MAX, PAGE_SCAN, PAGE_WRAPPER, Path, Predecessors,
+    Prompt, QueuedSummary, QueuedTurn, ReadCorruption, ReceiptRecord, ResumeRecord,
+    SESSION_QUEUE_LIMIT, STATUS_ANCHORS, STATUS_QUEUE, STATUS_TURNS, SessionEventRecord, SessionId,
+    SessionRoute, SessionSnapshot, SessionStatus, SessionSummary, SpawnKey, SpawnRecord,
+    StatusQuery, StepRow, StepsRecord, StoreError, StoredEvent, StoredSpawnKey, SubmissionRecord,
+    SubmitFailedRecord, TerminalCancel, TerminalExtras, TerminalFacts, TerminalRecord,
+    TransactionBehavior, TurnNumber, UnfinishedTurn, Value, check_schema_version,
+    commit_anchor_identified, commit_anchor_intent, commit_arm_intent, commit_group_absence,
+    commit_vendor_facts, count_unproven_anchors, fs, oneshot, params, read_anchor_cohort,
+    read_anchor_owners, read_anchor_records,
 };
 use crate::{
     blob::{BlobRef, Blobs},
@@ -155,9 +156,10 @@ pub(super) fn validate_regular(path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// Schema v7 (runtime §6; Task 4 design §6.6 plus the session's persisted
-/// `adapter_version`), frozen by `s1_store_v6_schema_is_frozen`.
-const SCHEMA_V7: &str = "CREATE TABLE sessions (
+/// Schema v8 (runtime §6; Task 4 design §6.6 plus the session's persisted
+/// `adapter_version` and the instance each turn's `turn.started` recorded),
+/// frozen by `s1_store_v8_schema_is_frozen`.
+const SCHEMA_V8: &str = "CREATE TABLE sessions (
     id TEXT PRIMARY KEY, handle_hash BLOB NOT NULL CHECK(length(handle_hash)=32),
     receipt TEXT NOT NULL, params TEXT NOT NULL, state TEXT NOT NULL,
     next_seq INTEGER NOT NULL CHECK(next_seq>=2),
@@ -173,7 +175,8 @@ const SCHEMA_V7: &str = "CREATE TABLE sessions (
     queued_at TEXT, queued_seq INTEGER NOT NULL, submitted_at TEXT,
     accepted_at TEXT, correlation TEXT, envelope TEXT,
     cancel_cause TEXT CHECK(cancel_cause IN ('cancel','close')), ended_seq INTEGER,
-    evidence_dir TEXT,
+    evidence_dir TEXT, vendor_version TEXT,
+    version_status TEXT CHECK(version_status IN ('tested','untested')),
     CHECK((state IN ('completed','failed','cancelled','unknown')) = (ended_seq IS NOT NULL)),
     CHECK((prompt IS NULL) <> (prompt_blob IS NULL)),
     PRIMARY KEY(session_id,number));
@@ -215,7 +218,7 @@ const SCHEMA_V7: &str = "CREATE TABLE sessions (
     absence_time TEXT,
     FOREIGN KEY(owner_session,owner_turn) REFERENCES turns(session_id,number));
  CREATE INDEX anchors_unproven ON anchors(anchor_id) WHERE absence_time IS NULL;
- PRAGMA user_version=7;";
+ PRAGMA user_version=8;";
 
 /// Configures the sole writable connection; initializes the schema only in
 /// a database this open `created`. The version is checked again before the
@@ -263,7 +266,7 @@ pub(super) fn configure(
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| StoreError::Open(error.to_string()))?;
-        tx.execute_batch(SCHEMA_V7)
+        tx.execute_batch(SCHEMA_V8)
             .map_err(|error| StoreError::Open(error.to_string()))?;
         commit(tx)?;
     }
@@ -1051,12 +1054,13 @@ fn read_keyed_operation(
 /// The selected columns of a session's [`SessionRoute`], for a query whose
 /// row is `sessions` (decision H3): the adapter version the latest
 /// `turn.started` commit persisted, else the receipt's (runtime §6), with
-/// the confirmed identity its `session.opened`/`session.reopened` wrote.
+/// the confirmed identity its `session.opened`/`session.reopened` wrote,
+/// and the frozen session parameters and capabilities as stored text.
 const ROUTE_COLUMNS: &str = "harness,json_extract(receipt,'$.route'),
     coalesce(adapter_version,json_extract(receipt,'$.adapter_version')),
-    vendor_session_id,transcript_hint";
+    vendor_session_id,transcript_hint,params,json_extract(receipt,'$.capabilities')";
 
-/// The route identity read at `first` and the four columns after it.
+/// The route identity read at `first` and the six columns after it.
 fn route_at(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<SessionRoute> {
     Ok(SessionRoute {
         harness: row.get(first)?,
@@ -1064,6 +1068,8 @@ fn route_at(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<SessionRo
         adapter_version: row.get(first + 2)?,
         vendor_session_id: row.get(first + 3)?,
         transcript: row.get(first + 4)?,
+        params: row.get(first + 5)?,
+        capabilities: row.get(first + 6)?,
     })
 }
 
@@ -1318,10 +1324,30 @@ fn commit_acceptance(conn: &mut Connection, record: &AcceptanceRecord) -> Result
         ));
     }
     // The vendor correlation and accepted_at stay as internal C2 evidence; the
-    // public event is Core's canonical one.
+    // public event is Core's canonical one. The instance running the turn
+    // is recorded with it (C2 §4 `turn.accepted`, C1 §3.7).
+    let (vendor_version, version_status) =
+        record.instance.as_ref().map_or((None, None), |instance| {
+            (
+                instance.vendor_version.as_deref(),
+                Some(if instance.tested {
+                    "tested"
+                } else {
+                    "untested"
+                }),
+            )
+        });
     tx.execute(
-        "UPDATE turns SET correlation=?3,accepted_at=?4 WHERE session_id=?1 AND number=?2",
-        params![session.as_str(), turn.get(), correlation, at],
+        "UPDATE turns SET correlation=?3,accepted_at=?4,vendor_version=?5,version_status=?6
+         WHERE session_id=?1 AND number=?2",
+        params![
+            session.as_str(),
+            turn.get(),
+            correlation,
+            at,
+            vendor_version,
+            version_status
+        ],
     )
     .map_err(sql_error)?;
     // C1 §3.3: the turn.started commit advances the session's recorded
@@ -2043,7 +2069,7 @@ fn read_terminal_facts(
 fn read_unfinished(conn: &Connection) -> Result<Vec<UnfinishedTurn>, StoreError> {
     let mut statement = conn
         .prepare_cached(
-            "SELECT session_id,number,submitted_at,correlation FROM turns WHERE state='running' ORDER BY session_id,number LIMIT 1000",
+            "SELECT session_id,number,submitted_at,correlation,effective,vendor_version,version_status FROM turns WHERE state='running' ORDER BY session_id,number LIMIT 1000",
         )
         .map_err(sql_error)?;
     let rows = statement
@@ -2053,12 +2079,25 @@ fn read_unfinished(conn: &Connection) -> Result<Vec<UnfinishedTurn>, StoreError>
                 row.get::<_, u32>(1)?,
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
             ))
         })
         .map_err(sql_error)?;
     let mut turns = Vec::new();
     for row in rows {
-        let (session, number, submitted_at, correlation) = row.map_err(sql_error)?;
+        let (session, number, submitted_at, correlation, effective, vendor_version, status) =
+            row.map_err(sql_error)?;
+        // The acceptance records a status with every instance it records.
+        let instance = match status.as_deref() {
+            None => None,
+            Some(status @ ("tested" | "untested")) => Some(InstanceRecord {
+                vendor_version,
+                tested: status == "tested",
+            }),
+            Some(_) => return Err(StoreError::CorruptEvidence),
+        };
         turns.push(UnfinishedTurn {
             session_id: SessionId::try_from(session.as_str())
                 .map_err(|_| StoreError::CorruptEvidence)?,
@@ -2066,6 +2105,10 @@ fn read_unfinished(conn: &Connection) -> Result<Vec<UnfinishedTurn>, StoreError>
             // A running turn always has its submission time.
             submitted_at: submitted_at.ok_or(StoreError::CorruptEvidence)?,
             correlation,
+            // Critical r1 #10, r2 #10: the stored text, which Core
+            // decodes, never absence.
+            effective,
+            instance,
         });
     }
     Ok(turns)
@@ -2358,26 +2401,28 @@ fn read_session_status(
     conn: &Connection,
     query: &StatusQuery,
 ) -> Result<Option<SessionStatus>, StoreError> {
-    /// Session columns, `model`, `cwd` and `route`.
+    /// Session columns, `model`, `cwd` and the route identity.
     type Session = (
         String,
         String,
-        String,
         Option<String>,
         i64,
         i64,
         Option<String>,
         Option<String>,
-        Option<String>,
-        Option<String>,
+        SessionRoute,
     );
+    /// Number, state, and the envelope's `vendor_version` and
+    /// `version_status`.
+    type Selected = (u32, String, Option<String>, Option<String>);
     let session = query.session.as_str();
     let row: Option<Session> = conn
         .query_row(
-            "SELECT state,admission,harness,label,created_ms,updated_ms,
-                json_extract(params,'$.model'),json_extract(params,'$.cwd'),
-                json_extract(receipt,'$.route'),vendor_session_id
-             FROM sessions WHERE id=?1",
+            &format!(
+                "SELECT state,admission,label,created_ms,updated_ms,
+                    json_extract(params,'$.model'),json_extract(params,'$.cwd'),{ROUTE_COLUMNS}
+                 FROM sessions WHERE id=?1"
+            ),
             [session],
             |row| {
                 Ok((
@@ -2388,31 +2433,38 @@ fn read_session_status(
                     row.get(4)?,
                     row.get(5)?,
                     row.get(6)?,
-                    row.get(7)?,
-                    row.get(8)?,
-                    row.get(9)?,
+                    route_at(row, 7)?,
                 ))
             },
         )
         .optional()
         .map_err(sql_error)?;
-    let Some((state, admission, harness, label, created_ms, updated_ms, model, cwd, route, vendor)) =
-        row
-    else {
+    let Some((state, admission, label, created_ms, updated_ms, model, cwd, frozen)) = row else {
         return Ok(None);
     };
     let unproven_anchors = read_unproven_anchors(conn, session)?;
     let active = read_active_turn(conn, session)?;
-    let selected: Option<(u32, String)> = conn
+    let selected: Option<Selected> = conn
         .query_row(
-            "SELECT number,state FROM turns WHERE session_id=?1 AND number=coalesce(?2,
+            "SELECT number,state,
+                CASE WHEN envelope IS NULL THEN vendor_version
+                     ELSE json_extract(envelope,'$.vendor_version') END,
+                CASE WHEN envelope IS NULL THEN version_status
+                     ELSE json_extract(envelope,'$.version_status') END
+             FROM turns WHERE session_id=?1 AND number=coalesce(?2,
                 (SELECT number FROM turns WHERE session_id=?1 AND state='running'),
                 (SELECT max(number) FROM turns WHERE session_id=?1))",
             params![session, query.turn.map(TurnNumber::get)],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
         .map_err(sql_error)?;
+    let (selected, version) = match selected {
+        Some((number, state, vendor_version, version_status)) => {
+            (Some((number, state)), (vendor_version, version_status))
+        }
+        None => (None, (None, None)),
+    };
     let queue = read_status_queue(conn, session)?;
     let turns = read_status_turns(conn, session)?;
     let (steps, more) = match &selected {
@@ -2422,14 +2474,17 @@ fn read_session_status(
     Ok(Some(SessionStatus {
         state,
         admission,
-        harness,
+        harness: frozen.harness.clone(),
         label,
         created_ms,
         updated_ms,
         model,
         cwd,
-        route,
-        vendor_session_id: vendor,
+        route: frozen.route.clone(),
+        vendor_session_id: frozen.vendor_session_id.clone(),
+        frozen,
+        vendor_version: version.0,
+        version_status: version.1,
         cleanup_uncertain: !unproven_anchors.is_empty(),
         unproven_anchors,
         selected,

@@ -256,7 +256,7 @@ fn route_forwards_every_observation_in_order() {
             Observation::IdentityConfirmed(_)
             | Observation::ActionDenied(_)
             | Observation::RequestDeclined(_)
-            | Observation::SteerDelivered(_)
+            | Observation::SteerDelivered { .. }
             | Observation::Warning(_)
             | Observation::VendorClosed(_)
             | Observation::ResumeMismatch { .. }

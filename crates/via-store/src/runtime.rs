@@ -23,7 +23,7 @@ use crate::{
     lanes::{Lane, Lanes},
 };
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 /// Largest terminal envelope, encoded (C1 §5): at most one rides outside a
 /// transaction's payload cap (design §6.4).
@@ -202,13 +202,24 @@ pub struct SpawnRecord {
     pub handle_hash: [u8; 32],
     /// Exact C1 receipt to replay after a committed spawn.
     pub receipt: Value,
-    /// Frozen session parameters: `{harness, model, cwd, allow_untested}`.
+    /// Frozen session parameters, Core's internal JSON object and not a C1
+    /// document: `harness`, `model`, `cwd` and `allow_untested`, plus,
+    /// when the plan or the spawn has them, the effective inherited
+    /// configuration states (`inherit`), the categories whose effective
+    /// state is not the requested one (`inherit_unverified`), the
+    /// instructions text and the session's vendor options. Store keeps it
+    /// opaque; the public receipt fields are [`Self::receipt`]'s.
     pub params: Value,
     /// The caller's session label (C1 §4), at most 120 bytes.
     pub label: Option<String>,
     /// Frozen first-turn prompt.
     pub prompt: Prompt,
-    /// Turn 1's frozen effective per-turn values (C1 §3.2 `effective`).
+    /// Turn 1's frozen effective per-turn values, Core's internal JSON
+    /// object: the C1 §3.2 receipt `effective` members (`model`, `effort`,
+    /// `bound`, `deadlines`, `max_steps`) plus internal ones the receipt
+    /// does not show (the output schema, the vendor options, the requested
+    /// bound while it differs from the effective one, and whether the
+    /// bound was inherited). Store keeps it opaque.
     pub effective: Value,
     /// Core's initial canonical queued event, with sequence one.
     pub initial_event: Value,
@@ -258,7 +269,8 @@ pub struct ResumeRecord {
     /// Frozen prompt.
     pub prompt: Prompt,
     /// Frozen effective per-turn values, resolved by Core under admission
-    /// against [`SessionSnapshot::latest_effective`] (C1 P5).
+    /// against [`SessionSnapshot::latest_effective`] (C1 P5): the same
+    /// internal object as [`SpawnRecord::effective`].
     pub effective: Value,
     /// Core's canonical `turn.queued` event at the session's next sequence.
     pub event: Value,
@@ -303,6 +315,13 @@ pub struct SessionRoute {
     pub vendor_session_id: Option<String>,
     /// That event's transcript hint.
     pub transcript: Option<String>,
+    /// The frozen session parameters (`sessions.params`) as stored JSON
+    /// text, which Core reads its frozen session values from (adapter
+    /// design §5.1 #25).
+    pub params: Option<String>,
+    /// The receipt's `capabilities` as stored JSON text: the route's
+    /// declared capabilities frozen at spawn (#15, #26).
+    pub capabilities: Option<String>,
 }
 
 /// Durable state of a turn's predecessors, from which Core decides dispatch.
@@ -355,6 +374,18 @@ pub struct AcceptanceRecord {
     /// adapter version in the same transaction (C1 §3.3, decision H3);
     /// `None` leaves the recorded value.
     pub adapter_version: Option<String>,
+    /// The handshake of the instance running the turn (C2 §4
+    /// `turn.accepted`), recorded with it; `None` when none was read.
+    pub instance: Option<InstanceRecord>,
+}
+
+/// The version an instance reported at its handshake (C2 §5).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstanceRecord {
+    /// The handshake version.
+    pub vendor_version: Option<String>,
+    /// Whether the adapter's `checked` set holds it.
+    pub tested: bool,
 }
 
 /// One canonical event inside a running turn, such as an adapter observation.
@@ -498,6 +529,14 @@ pub struct SessionStatus {
     pub route: Option<String>,
     /// The confirmed vendor session ID.
     pub vendor_session_id: Option<String>,
+    /// The session's route identity and frozen parameters, as
+    /// [`SessionSnapshot`] reads them (adapter design §5.1 #38, #39).
+    pub frozen: SessionRoute,
+    /// The selected turn's `vendor_version`: its envelope's once terminal,
+    /// else the instance its `turn.started` recorded.
+    pub vendor_version: Option<String>,
+    /// The selected turn's `version_status`, from the same source.
+    pub version_status: Option<String>,
     /// A group of the session's turns lacks a durable absence proof.
     pub cleanup_uncertain: bool,
     /// The newest [`STATUS_ANCHORS`] anchors of the session with no
@@ -642,6 +681,14 @@ pub struct UnfinishedTurn {
     pub submitted_at: String,
     /// Recorded vendor acceptance correlation, if acceptance committed.
     pub correlation: Option<String>,
+    /// The turn's frozen effective values, as stored: Core decodes them,
+    /// and refuses text that does not decode, naming the turn and the
+    /// cause (critical r1 #10, r2 #10).
+    pub effective: String,
+    /// The recorded `vendor_version` and `version_status` of the instance
+    /// that accepted the turn (C1 §3.7); `None` before an acceptance
+    /// recorded one.
+    pub instance: Option<InstanceRecord>,
 }
 
 /// A committed anchor and its owning turn; no marker, identity or control path.
@@ -1261,7 +1308,11 @@ impl Command {
             Self::Acceptance(record, _) => (
                 record.session_id.as_str().len()
                     + record.correlation.len()
-                    + encoded(&record.event),
+                    + encoded(&record.event)
+                    + record.adapter_version.as_ref().map_or(0, String::len)
+                    + record.instance.as_ref().map_or(0, |instance| {
+                        instance.vendor_version.as_ref().map_or(0, String::len)
+                    }),
                 0,
                 1,
             ),
@@ -1786,7 +1837,22 @@ impl StoreClient {
         path: std::path::PathBuf,
         deadline: tokio::time::Instant,
     ) -> Result<BlobRef, PromptFileError> {
-        self.blobs.copy_file(path, deadline).await
+        self.blobs
+            .copy_file(path, deadline, crate::blob::PROMPT_MAX)
+            .await
+    }
+
+    /// [`Self::copy_prompt_file`] for another caller's text file of at
+    /// most `max` bytes, such as a spawn's `instructions {path}` (C1 §4).
+    pub async fn copy_text_file(
+        &self,
+        path: std::path::PathBuf,
+        deadline: tokio::time::Instant,
+        max: u64,
+    ) -> Result<BlobRef, PromptFileError> {
+        self.blobs
+            .copy_file(path, deadline, max.min(crate::blob::PROMPT_MAX))
+            .await
     }
 
     /// Unlinks a finished blob after a commit known not to have happened;
@@ -2568,6 +2634,34 @@ mod tests {
         tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("runtime")
+    }
+
+    /// Sol r2 #10, r3 #3 (design §6.4): an acceptance binds the instance's
+    /// handshake version and the adapter version it records, so the
+    /// command's size counts both.
+    #[test]
+    fn an_acceptance_counts_its_instance_version() {
+        let size = |vendor_version: Option<String>, adapter_version: Option<String>| {
+            let (reply, _receive) = tokio::sync::oneshot::channel();
+            super::Command::Acceptance(
+                super::AcceptanceRecord {
+                    session_id: session(),
+                    turn: super::TurnNumber::try_from(1).expect("turn"),
+                    correlation: "t:vt-1".to_owned(),
+                    event: serde_json::json!({}),
+                    adapter_version,
+                    instance: Some(super::InstanceRecord {
+                        vendor_version,
+                        tested: true,
+                    }),
+                },
+                reply,
+            )
+            .size()
+            .bytes
+        };
+        assert_eq!(size(Some("v".repeat(1000)), None), size(None, None) + 1000);
+        assert_eq!(size(None, Some("a".repeat(1000))), size(None, None) + 1000);
     }
 
     /// Design §6.1, §6.3, §7.1 [r3.9, r4.5]: a full lane or the fence

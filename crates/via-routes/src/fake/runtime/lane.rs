@@ -5,6 +5,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
@@ -71,11 +72,24 @@ pub struct SteerRequest {
     pub text: String,
     /// The vendor turn the caller means, if it names one.
     pub expected_vendor_turn: Option<String>,
+    /// The caller's token for the request, which Route pairs with the
+    /// vendor's delivery report on the hop ([`RouteMessage::steer`]).
+    pub token: u64,
     /// The delivery answer.
     pub reply: oneshot::Sender<Result<(), SteerRefused>>,
+    /// What Route established of the input ([`SteerAnswer`]).
+    progress: Arc<SteerProgress>,
     /// The request's share of the control budget, returned when it is
     /// dropped.
     permit: ControlPermit,
+}
+
+/// The steer awaiting its write and the vendor's delivery report.
+pub(super) struct SteerPending {
+    reply: oneshot::Sender<Result<(), SteerRefused>>,
+    progress: Arc<SteerProgress>,
+    /// Its share of the control budget.
+    _permit: ControlPermit,
 }
 
 /// One admitted command's share of the control budget (C2 §2): a command
@@ -125,12 +139,14 @@ pub fn steer_lane() -> (SteerSender, mpsc::Receiver<SteerRequest>) {
 }
 
 impl SteerSender {
-    /// Admits one steer input, or refuses it at once.
+    /// Admits one steer input with its caller's `token`, or refuses it
+    /// at once.
     pub fn send(
         &self,
         text: String,
         expected_vendor_turn: Option<String>,
-    ) -> Result<oneshot::Receiver<Result<(), SteerRefused>>, SteerRefused> {
+        token: u64,
+    ) -> Result<SteerAnswer, SteerRefused> {
         let command = Arc::clone(&self.commands)
             .try_acquire_owned()
             .map_err(|_| SteerRefused::OverCapacity)?;
@@ -145,17 +161,61 @@ impl SteerSender {
             _bytes: bytes,
         };
         let (reply, answer) = oneshot::channel();
+        let progress = Arc::new(SteerProgress::default());
         let request = SteerRequest {
             text,
             expected_vendor_turn,
+            token,
             reply,
+            progress: Arc::clone(&progress),
             permit,
         };
         match self.sender.try_send(request) {
-            Ok(()) => Ok(answer),
+            Ok(()) => Ok(SteerAnswer {
+                reply: answer,
+                progress,
+            }),
             Err(mpsc::error::TrySendError::Full(_)) => Err(SteerRefused::OverCapacity),
             Err(mpsc::error::TrySendError::Closed(_)) => Err(SteerRefused::NotActive),
         }
+    }
+}
+
+/// What Route established of one steer input, as it happens (critical r3
+/// #1, r5 #1).
+#[derive(Default)]
+pub(super) struct SteerProgress {
+    /// Route started writing the input.
+    write_started: AtomicBool,
+    /// The vendor reported the input's delivery; set before the report is
+    /// handed over, so before its observation can be emitted.
+    acknowledged: AtomicBool,
+}
+
+/// An admitted steer input's answer, as its caller holds it (critical r3
+/// #1, r5 #1): Route's reply, and what Route established of the input,
+/// which tells a caller whose turn ended unanswered whether the vendor
+/// acknowledged it, may have it, or never had it.
+pub struct SteerAnswer {
+    /// Route's reply; dropped unanswered when the turn ended first. Route
+    /// answers an acknowledged input only once its write is answered too.
+    pub reply: oneshot::Receiver<Result<(), SteerRefused>>,
+    progress: Arc<SteerProgress>,
+}
+
+impl SteerAnswer {
+    /// Whether Route started writing the input: it may have been written,
+    /// in part or whole. False means it never left the control lane.
+    #[must_use]
+    pub fn write_started(&self) -> bool {
+        self.progress.write_started.load(Ordering::Acquire)
+    }
+
+    /// Whether the vendor reported the input's delivery, whatever Route's
+    /// reply: its `steer.delivered` report was then handed over.
+    #[must_use]
+    pub fn acknowledged(&self) -> bool {
+        self.progress.acknowledged.load(Ordering::Acquire)
     }
 }
 
@@ -284,9 +344,11 @@ pub(super) struct LaneState {
     pub(super) steer: Option<mpsc::Receiver<SteerRequest>>,
     /// The pending steer write, kept pinned while other waits run.
     pub(super) steer_write: Option<via_wire::PendingWrite>,
-    /// The steer awaiting its write and the vendor's delivery report, with
-    /// its share of the control budget.
-    pub(super) steer_reply: Option<(oneshot::Sender<Result<(), SteerRefused>>, ControlPermit)>,
+    /// The steer awaiting its write and the vendor's delivery report.
+    pub(super) steer_reply: Option<SteerPending>,
+    /// The token of the steer written last, which the vendor's delivery
+    /// report is paired with on the hop (critical r1 #5).
+    pub(super) steer_token: Option<u64>,
     /// The vendor reported the steer's delivery before its write answered.
     steer_evidence: bool,
     pub(super) accepted: bool,
@@ -314,6 +376,7 @@ impl LaneState {
             steer: lane.steer,
             steer_write: None,
             steer_reply: None,
+            steer_token: None,
             steer_evidence: false,
             accepted: false,
             facts: Facts {
@@ -381,9 +444,13 @@ impl Serving<'_> {
                 }
             }
             FakeMessage::SteerDelivered { .. } => {
-                if lane.steer_reply.is_none() || lane.steer_evidence {
+                let Some(pending) = lane.steer_reply.as_ref().filter(|_| !lane.steer_evidence)
+                else {
                     return Err(protocol(turn, "unsolicited fake steer delivery").into());
-                }
+                };
+                // Critical r5 #1: established before the report is handed
+                // over, whatever the write's answer.
+                pending.progress.acknowledged.store(true, Ordering::Release);
                 if lane.steer_write.is_some() {
                     // Answered once its write is confirmed.
                     lane.steer_evidence = true;
@@ -428,6 +495,7 @@ impl Serving<'_> {
     /// AD7: on a profile with a handshake, reads it before the start. A
     /// missing relied-on feature refuses the instance, and a catalog that
     /// lacks the turn's effort rejects the turn (AD18); nothing was sent.
+    /// An accepted handshake is forwarded on the hop.
     pub(super) async fn handshake(&mut self, messages: &mut WireMessages) -> Result<(), Failed> {
         let Some(required) = self.lane.handshake.take() else {
             return Ok(());
@@ -437,7 +505,7 @@ impl Serving<'_> {
             Next::Message(message) => message,
             end @ (Next::Eof | Next::Unterminated) => return Err(self.ended(end).await),
         };
-        let FakeMessage::Hello(handshake) = message.payload else {
+        let FakeMessage::Hello(handshake) = &message.payload else {
             return Err(protocol(turn, "fake handshake expected").into());
         };
         let missing = required
@@ -447,7 +515,7 @@ impl Serving<'_> {
             (Some(effort), Some(efforts)) => !efforts.contains(effort),
             _ => false,
         };
-        self.lane.facts.handshake = Some(handshake);
+        self.lane.facts.handshake = Some(handshake.clone());
         if missing {
             self.lane.facts.cause = Some(RouteError::HandshakeRefused { turn });
             return Err(protocol(turn, "fake handshake refused").into());
@@ -459,6 +527,10 @@ impl Serving<'_> {
             });
             return Err(protocol(turn, "fake effort outside the instance catalog").into());
         }
+        // C2 §4 `turn.accepted` (Sol r1 #13): an accepted handshake goes on
+        // the hop too, ahead of everything the turn reports, so the Adapter
+        // knows the instance before its acceptance.
+        self.held = Some(message);
         Ok(())
     }
 
@@ -551,7 +623,9 @@ impl Serving<'_> {
         let SteerRequest {
             text,
             expected_vendor_turn,
+            token,
             reply,
+            progress,
             permit,
         } = request;
         let refused = if !self.lane.accepted || self.terminated {
@@ -579,8 +653,14 @@ impl Serving<'_> {
             suffix: b"\"}\n".to_vec(),
             escape: escape_json,
         };
+        progress.write_started.store(true, Ordering::Release);
         self.lane.steer_write = Some(self.sender.write(steer, self.deadline));
-        self.lane.steer_reply = Some((reply, permit));
+        self.lane.steer_reply = Some(SteerPending {
+            reply,
+            progress,
+            _permit: permit,
+        });
+        self.lane.steer_token = Some(token);
     }
 
     /// A finished steer write: one not written whole is answered at once,
@@ -596,10 +676,10 @@ impl Serving<'_> {
 
     /// Answers the pending steer and returns its control budget.
     fn resolve_steer(&mut self, answer: Result<(), SteerRefused>) {
-        if let Some((reply, permit)) = self.lane.steer_reply.take() {
-            // The steer caller went away: nobody waits for the answer.
-            let _ = reply.send(answer);
-            drop(permit);
+        if let Some(pending) = self.lane.steer_reply.take() {
+            // The steer caller went away: nobody waits for the answer. The
+            // control budget returns with `pending`.
+            let _ = pending.reply.send(answer);
         }
         self.lane.steer_evidence = false;
     }

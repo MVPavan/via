@@ -11,7 +11,8 @@ use serde_json::{Value, json};
 use via_store::{EventsRead, PAGE_MAX, StoreClient, TerminalFacts};
 
 use super::{Engine, journal};
-use crate::api::{DEFAULT_WAIT_MS, FAKE_TOKEN_SCOPE, rfc3339};
+use crate::api::{DEFAULT_WAIT_MS, PlanFields, Warning, rfc3339};
+use crate::intake::{self, Frozen};
 use crate::{
     ApiError, EventsParams, ListParams, LogsParams, SessionId, StatusParams, TurnNumber,
     WaitParams, parse_address,
@@ -295,7 +296,11 @@ impl Engine {
     /// selects the turn and returns the durable members and a page of its
     /// step rows; then, from memory, the published progress when the
     /// selected turn is not terminal in that read and is the running one,
-    /// and `process.alive`.
+    /// and `process.alive`. The session's frozen plan is read with it
+    /// (decision F12): its route's token scope labels `progress.tokens`,
+    /// and its recorded adapter version, inheritance states and warnings
+    /// are reported (C1 §3.7), with the described turn's vendor version
+    /// from its envelope once it is terminal.
     pub async fn status(&self, params: StatusParams) -> Result<Value, ApiError> {
         let limit = params.limit.unwrap_or(STATUS_DEFAULT_LIMIT);
         if limit == 0 || limit > via_store::STATUS_STEPS {
@@ -312,12 +317,13 @@ impl Engine {
         if params.turn.is_some() && status.selected.is_none() {
             return Err(ApiError::TURN_NOT_FOUND);
         }
+        let frozen = Frozen::of(&status.frozen);
         let progress = status
             .selected
             .as_ref()
             .filter(|(_, state)| !terminal(state))
             .and_then(|(turn, _)| self.slot(&params.session)?.progress(*turn))
-            .map(|progress| progress.to_value(FAKE_TOKEN_SCOPE));
+            .map(|progress| progress.to_value(frozen.token_scope()));
         let alive = self.adapter.live_armed(&status.unproven_anchors);
         // Decision H3: verified once this daemon committed the open of the
         // lane's current connection generation.
@@ -328,7 +334,7 @@ impl Engine {
             &params.session,
             status,
             after_step,
-            progress.as_ref(),
+            (progress.as_ref(), &frozen),
             (alive, verified),
         );
         debug_assert!(
@@ -355,9 +361,22 @@ fn status_value(
     session: &SessionId,
     status: via_store::SessionStatus,
     after_step: u32,
-    progress: Option<&Value>,
+    (progress, frozen): (Option<&Value>, &Frozen),
     (alive, verified): (bool, bool),
 ) -> Value {
+    let tested = status.version_status.as_deref() == Some("tested");
+    let version = PlanFields {
+        route: frozen.route.clone(),
+        adapter_version: frozen.adapter_version.clone(),
+        vendor_version: status.vendor_version.clone(),
+        version_status: if tested {
+            via_adapters::VersionStatus::Tested
+        } else {
+            via_adapters::VersionStatus::Untested
+        },
+    };
+    let mut warnings: Vec<Warning> = version.warning().into_iter().collect();
+    warnings.extend(frozen.config_warning());
     let active_turn = status.active.map(|active| {
         json!({
             "n": active.turn,
@@ -375,7 +394,7 @@ fn status_value(
         .into_iter()
         .map(|queued| {
             json!({"n": queued.turn, "op_key": queued.op_key, "queued_at": queued.queued_at,
-                "effective": queued.effective})
+                "effective": intake::c1_effective(&queued.effective)})
         })
         .collect();
     let turns: Vec<Value> = status
@@ -408,6 +427,11 @@ fn status_value(
         "harness": status.harness,
         "model": status.model,
         "route": status.route,
+        "adapter_version": version.adapter_version,
+        "vendor_version": version.vendor_version,
+        "version_status": version.version_status,
+        "inherit": frozen.inherit.map(|inherit| inherit.effective),
+        "warnings": warnings,
         "vendor_session_id": status.vendor_session_id,
         "vendor_identity_verified": verified,
         "cwd": status.cwd,

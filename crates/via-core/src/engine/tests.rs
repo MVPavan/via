@@ -59,12 +59,12 @@ fn child(name: &str) -> Option<PathBuf> {
     None
 }
 
-fn run(body: impl Future<Output = ()>) {
+fn run<T>(body: impl Future<Output = T>) -> T {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap()
-        .block_on(body);
+        .block_on(body)
 }
 
 fn open(root: &Path) -> std::sync::Arc<Engine> {
@@ -2099,7 +2099,7 @@ fn a_drained_observation_whose_write_fails_attaches_the_store_order() {
             steps: super::progress::StepTracker::default(),
             vendor: super::lane::VendorRecord::default(),
         };
-        let effective: crate::api::Effective = serde_json::from_value(json!({
+        let effective: crate::intake::Effective = serde_json::from_value(json!({
             "model":"fake","effort":null,"bound":null,
             "deadlines":{"wall_ms":30_000,"idle_ms":600_000},"max_steps":null
         }))
@@ -2180,6 +2180,7 @@ fn a_corrupt_head_read_before_a_terminal_latches() {
             submitted: None,
             folder: None,
             cwd: None,
+            plan: Box::default(),
         };
         let record = super::TurnRecord {
             session: session.clone(),
@@ -2407,6 +2408,7 @@ fn started_one(session: &SessionId) -> super::Started {
         submitted: None,
         folder: None,
         cwd: None,
+        plan: Box::default(),
     }
 }
 
@@ -2591,7 +2593,7 @@ fn a_corrupt_head_read_before_an_acceptance_records_one_failure() {
             head: super::journal::Head::new(None),
             ..turn_one(&session, false)
         };
-        let effective: crate::api::Effective = serde_json::from_value(json!({
+        let effective: crate::intake::Effective = serde_json::from_value(json!({
             "model":"fake","effort":null,"bound":null,
             "deadlines":{"wall_ms":30_000,"idle_ms":600_000},"max_steps":null
         }))
@@ -2604,6 +2606,7 @@ fn a_corrupt_head_read_before_an_acceptance_records_one_failure() {
                 via_adapters::observation::Acceptance {
                     correlation: via_adapters::AcceptanceToken::try_from(1).unwrap(),
                     vendor_turn_id: Some(vendor_turn),
+                    instance: None,
                 },
             ),
         };
@@ -2804,7 +2807,7 @@ async fn running_turn_2(
     std::sync::Arc<super::Slot>,
     super::lane::LaneClaim,
     super::TurnRecord,
-    crate::api::Effective,
+    crate::intake::Effective,
     tokio::sync::watch::Receiver<Option<via_adapters::StopOrder>>,
 ) {
     running_turn_2_with(engine, root, true).await
@@ -2820,7 +2823,7 @@ async fn running_turn_2_with(
     std::sync::Arc<super::Slot>,
     super::lane::LaneClaim,
     super::TurnRecord,
-    crate::api::Effective,
+    crate::intake::Effective,
     tokio::sync::watch::Receiver<Option<via_adapters::StopOrder>>,
 ) {
     let session = new_session(engine).await;
@@ -2837,7 +2840,10 @@ async fn running_turn_2_with(
     let lane = engine
         .open_lane(
             &session,
-            (&route, "fake", root.to_path_buf()),
+            (
+                (&route, &plain_effective(), frozen_inherit(&route)),
+                root.to_path_buf(),
+            ),
             resident(engine),
         )
         .await;
@@ -2861,7 +2867,7 @@ async fn turn_2_running(
 ) -> (
     std::sync::Arc<super::Slot>,
     super::TurnRecord,
-    crate::api::Effective,
+    crate::intake::Effective,
     tokio::sync::watch::Receiver<Option<via_adapters::StopOrder>>,
 ) {
     let session = session.clone();
@@ -2906,7 +2912,7 @@ async fn turn_2_running(
         steps: super::progress::StepTracker::default(),
         vendor: super::lane::VendorRecord::default(),
     };
-    let effective: crate::api::Effective = serde_json::from_value(json!({
+    let effective: crate::intake::Effective = serde_json::from_value(json!({
         "model":"fake","effort":null,"bound":null,
         "deadlines":{"wall_ms":30_000,"idle_ms":600_000},"max_steps":null
     }))
@@ -2940,6 +2946,7 @@ fn an_unfamiliar_vendor_turn_becomes_current_only_through_the_acceptance() {
             vendor_turn_id: Some(
                 via_adapters::VendorTurnId::try_from("fake-turn-2".to_owned()).unwrap(),
             ),
+            instance: None,
         });
         let queued = vec![
             item(Some("fake-turn-2"), denied("before")),
@@ -2993,6 +3000,7 @@ fn an_acceptance_naming_another_turns_vendor_turn_fails_protocol() {
                     vendor_turn_id: Some(
                         via_adapters::VendorTurnId::try_from("fake-turn-1".to_owned()).unwrap(),
                     ),
+                    instance: None,
                 },
             ),
         };
@@ -3118,6 +3126,84 @@ fn a_lane_opens_from_the_sessions_stored_route_identity() {
     });
 }
 
+/// Critical r1 #2 (C2 §2 `SessionSpec`, §6.2, AD13): the driver opens
+/// with the session's frozen `inherit`: a session's first lane,
+/// and the lane a later daemon reopens for a session spawned before the
+/// restart, though that daemon's own plan would differ. (A dispatched
+/// turn here ends `unknown`, since no anchor exists, which would cancel
+/// its successors, so the reopened session's turn 1 ends `failed`.)
+/// The driver's `spec()` is a test seam of the failpoint builds (critical
+/// r2 #11). Critical r2 #5 (C2 §2, §6.2): the spec carries the frozen
+/// request with the effective states; a session whose Store row froze a
+/// request other than today's default (hooks `on`) reopens with it, its
+/// `unknown` effective state keeping the requested direction.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_lane_opens_with_the_sessions_frozen_inherit() {
+    let Some(root) = child("a_lane_opens_with_the_sessions_frozen_inherit") else {
+        return;
+    };
+    let scenario = |profile: Value| {
+        let path = env::var_os("VIA_FAKE_SCENARIO").unwrap();
+        fs::write(path, json!({"profile": profile, "scripts": []}).to_string()).unwrap();
+    };
+    // Spawned under a profile whose switches leave hooks and plugins
+    // `unknown` and agents `off`.
+    scenario(json!({"categories": {
+        "hooks": {"off": "unverified"},
+        "plugins": {"on": "none"},
+        "agents": {"on": "none", "observed": "off"},
+    }}));
+    let effective = json!({"hooks":"unknown","mcp_servers":"off","plugins":"unknown",
+                           "skills":"on","agents":"off","instruction_files":"on"});
+    let requested = json!({"hooks":"off","mcp_servers":"off","plugins":"on",
+                           "skills":"on","agents":"on","instruction_files":"on"});
+    let frozen = json!({"requested": requested, "effective": effective});
+    let spec_inherit = |engine: &Engine, session: &SessionId| {
+        let lane = super::lock(&engine.lanes).get(session).cloned();
+        serde_json::to_value(lane.expect("the session's lane").driver.spec().inherit).unwrap()
+    };
+    let reopened = run(async {
+        let engine = open(&root);
+        let opened = new_session(&engine).await;
+        dispatch(&engine, &opened).await;
+        assert_eq!(spec_inherit(&engine, &opened), frozen);
+        let reopened = new_session(&engine).await;
+        end_turn_one(&engine, &reopened, Some("failed")).await;
+        shutdown(&engine).await;
+        reopened
+    });
+    let db = rusqlite::Connection::open(root.join("state").join("store.sqlite3")).unwrap();
+    db.busy_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(
+        db.execute(
+            "UPDATE sessions SET params=json_set(params,'$.inherit.requested.hooks','on') \
+             WHERE id=?1",
+            [reopened.as_str()],
+        )
+        .unwrap(),
+        1
+    );
+    drop(db);
+    let mut frozen = frozen;
+    frozen["requested"]["hooks"] = json!("on");
+    // The next daemon's plan would request the OD2 default with every
+    // switch verified: its lane still takes the frozen states.
+    let both = json!({"on": "verified", "off": "verified"});
+    scenario(
+        json!({"categories": {"hooks": both, "mcp_servers": both, "plugins": both,
+        "skills": both, "agents": both, "instruction_files": both}}),
+    );
+    run(async {
+        let engine = open(&root);
+        engine.recover().await.unwrap();
+        resume(&engine, &reopened, None).await;
+        dispatch(&engine, &reopened).await;
+        assert_eq!(spec_inherit(&engine, &reopened), frozen);
+        shutdown(&engine).await;
+    });
+}
+
 /// Sol r1 F12 (C2 §2 Recover, AD9): restart recovery asks the adapter set
 /// once per session with unfinished turns, from the session's stored
 /// route identity and with Host's reconciled facts for it; the fake never
@@ -3163,6 +3249,162 @@ fn recovery_asks_the_adapter_per_session_with_the_reconciled_facts() {
         let envelope: Value = serde_json::from_str(envelope.get()).unwrap();
         assert_eq!(envelope["state"], "unknown", "{envelope}");
     });
+}
+
+/// Sol r1 #12 (C1 §5): a recovered turn's envelope reads the recovering
+/// turn's own frozen values: the resolved model, effort, bound and its
+/// inheritance, and the vendor options, not the session's spawn request.
+#[test]
+fn a_recovered_envelope_reads_the_turns_own_frozen_values() {
+    let Some(root) = child("a_recovered_envelope_reads_the_turns_own_frozen_values") else {
+        return;
+    };
+    let unsupported = json!({"support":"unsupported","reason":"no"});
+    let profile = json!({
+        "models": [{"model":"fake-pro","aliases":["pro"]}],
+        "efforts": ["high"],
+        "capabilities": {
+            "verbs": {"spawn":{"support":"native"},"resume":{"support":"native"},
+                      "steer":unsupported,"cancel":{"support":"native"},
+                      "close":{"support":"native"}},
+            "params": {"instructions":unsupported,"output_schema":unsupported,
+                       "effort":{"support":"native"},"max_steps":unsupported},
+            "bounds": ["full"], "network_control": false, "recover": unsupported,
+            "usage": {"tokens":"turn","cost":"unavailable"}
+        },
+    });
+    fs::write(
+        root.join("scenario.json"),
+        json!({"profile":profile,"scripts":[]}).to_string(),
+    )
+    .unwrap();
+    let bound = json!({"mode":"full","extra_write_dirs":[],"network":true});
+    run(async {
+        let session = {
+            let earlier = open(&root);
+            let raw = json!({"harness":"fake","model":"pro","prompt":"p","handle":HANDLE,
+                             "effort":"high","bound":bound,"vendor":{"fake":{}}});
+            let receipted = earlier
+                .spawn(
+                    serde_json::from_value(raw.clone()).unwrap(),
+                    &raw.to_string(),
+                )
+                .await
+                .unwrap();
+            let session = receipted.enqueued.unwrap().0;
+            let submitted = Event {
+                seq: 2,
+                session_id: &session,
+                turn: Some(1),
+                late: false,
+                at: &rfc3339(std::time::SystemTime::now()),
+                body: EventBody::TurnSubmitted { attempt: 1 },
+            }
+            .to_value()
+            .unwrap();
+            earlier
+                .store
+                .commit_submission(SubmissionRecord {
+                    session_id: session.clone(),
+                    turn: turn(1),
+                    event: submitted,
+                })
+                .await
+                .unwrap();
+            session
+        };
+        let engine = open(&root);
+        assert_eq!(engine.recover().await.unwrap(), 1);
+        let envelope = engine.result(&format!("{session}/1")).await.unwrap();
+        let envelope: Value = serde_json::from_str(envelope.get()).unwrap();
+        assert_eq!(envelope["state"], "unknown", "{envelope}");
+        assert_eq!(
+            envelope["model"],
+            json!({"requested":"pro","resolved":"fake-pro"}),
+            "{envelope}"
+        );
+        assert_eq!(
+            envelope["effort"],
+            json!({"requested":"high","resolved":"high"}),
+            "{envelope}"
+        );
+        assert_eq!(
+            envelope["bound"],
+            json!({"requested":bound,"effective":bound,"inherited":false}),
+            "{envelope}"
+        );
+        assert_eq!(envelope["vendor_options"], json!({"fake":{}}), "{envelope}");
+    });
+}
+
+/// Critical r1 #10 (design §7.3): a running turn's frozen values that do
+/// not decode are corrupt evidence, never absence. Recovery treats them as
+/// it treats Store's other corrupt evidence of an unfinished turn (an
+/// unknown `version_status`): startup fails `store_error`, and nothing is
+/// committed in their place, so the turn stays `running` with no
+/// fallback envelope. Each case: malformed JSON, valid JSON of the wrong
+/// shape, and the session's frozen parameters of the wrong shape. Critical
+/// r2 #10: the startup error names the turn and the decode's cause.
+#[test]
+fn recovery_refuses_malformed_frozen_turn_values() {
+    let Some(root) = child("recovery_refuses_malformed_frozen_turn_values") else {
+        return;
+    };
+    // Each corruption, and the cause its startup error names (critical r2
+    // #10): with the session and turn, never a bare `store_error`.
+    let cases = [
+        (
+            "UPDATE turns SET effective='{\"model\":' WHERE session_id=?1",
+            "frozen effective values do not decode: EOF while parsing",
+        ),
+        (
+            "UPDATE turns SET effective='{\"model\":7}' WHERE session_id=?1",
+            "frozen effective values do not decode: invalid type: integer `7`",
+        ),
+        (
+            "UPDATE sessions SET params=json_set(params,'$.allow_untested','yes') WHERE id=?1",
+            "frozen session parameters do not decode: invalid type: string \"yes\"",
+        ),
+    ];
+    for (index, (corruption, cause)) in cases.into_iter().enumerate() {
+        let case = root.join(format!("case-{index}"));
+        for part in ["state", "runtime", "runtime/anchors"] {
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(case.join(part))
+                .unwrap();
+        }
+        let session = run(async {
+            let earlier = open(&case);
+            let session = new_session(&earlier).await;
+            end_turn_one(&earlier, &session, None).await;
+            session
+        });
+        let db = rusqlite::Connection::open(case.join("state").join("store.sqlite3")).unwrap();
+        db.busy_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(
+            db.execute(corruption, [session.as_str()]).unwrap(),
+            1,
+            "{corruption}"
+        );
+        let recovered = run(async { open(&case).recover().await });
+        let error = recovered.expect_err(corruption);
+        let named = format!("store_error: turn {session}/1: {cause}");
+        assert!(error.starts_with(&named), "{corruption}: {error}");
+        let (state, envelope): (String, Option<String>) = db
+            .query_row(
+                "SELECT state, envelope FROM turns WHERE session_id=?1 AND number=1",
+                [session.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (state.as_str(), envelope),
+            ("running", None),
+            "{corruption}"
+        );
+    }
 }
 
 /// Sol r1 F2, F13, Sol r2 F13 (C2 §2 health, `TurnAbandoned`): a turn
@@ -3308,7 +3550,9 @@ async fn open_test_driver(
     via_adapters::SessionRef,
     via_store::SessionRoute,
 ) {
-    use via_adapters::{Inherit, SessionCx, SessionSpec, VendorOptions, observation_channel};
+    use via_adapters::{
+        Inherit, InheritPlan, SessionCx, SessionSpec, VendorOptions, observation_channel,
+    };
     let route = engine
         .store
         .session_snapshot(session)
@@ -3327,7 +3571,10 @@ async fn open_test_driver(
             initial_bound: None,
             cwd: root.to_path_buf(),
             vendor: VendorOptions::new(),
-            inherit: Inherit::OD2_DEFAULT,
+            inherit: InheritPlan {
+                requested: Inherit::OD2_DEFAULT,
+                effective: Inherit::OD2_DEFAULT,
+            },
             confirmed_vendor_session_id: None,
             allow_untested: false,
         },
@@ -3338,6 +3585,11 @@ async fn open_test_driver(
         },
     );
     (driver, reference, route)
+}
+
+/// The session's frozen `inherit`, read from its stored route.
+fn frozen_inherit(route: &via_store::SessionRoute) -> via_adapters::InheritPlan {
+    crate::intake::Frozen::of(route).inherit.unwrap()
 }
 
 /// Sends `observation`, naming `vendor_turn`, into a test lane's channel
@@ -3420,6 +3672,393 @@ async fn until_denials(engine: &Engine, session: &SessionId, expected: &[(Value,
     })
     .await
     .expect("the denials are committed");
+}
+
+/// Sol r1 #7 (C1 §3.4): a steer that arrives once its turn's submission
+/// committed, while the lane opens and before the turn runs, waits for
+/// the acceptance; here the launch fails (no anchor), so it ends
+/// `no_active_turn` once the turn ended, never before.
+#[test]
+fn a_steer_in_the_submitting_window_waits_for_the_acceptance() {
+    let Some(root) = child("a_steer_in_the_submitting_window_waits_for_the_acceptance") else {
+        return;
+    };
+    let unsupported = json!({"support":"unsupported","reason":"no"});
+    let profile = json!({"capabilities": {
+        "verbs": {"spawn":{"support":"native"},"resume":{"support":"native"},
+                  "steer":{"support":"native"},"cancel":{"support":"native"},
+                  "close":{"support":"native"}},
+        "params": {"instructions":unsupported,"output_schema":unsupported,
+                   "effort":unsupported,"max_steps":unsupported},
+        "bounds": [], "network_control": false, "recover": unsupported,
+        "usage": {"tokens":"turn","cost":"unavailable"}
+    }});
+    fs::write(
+        root.join("scenario.json"),
+        json!({"profile":profile,"scripts":[]}).to_string(),
+    )
+    .unwrap();
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        engine
+            .faults
+            .hold_after_submit
+            .store(true, Ordering::Release);
+        let dispatching = {
+            let engine = std::sync::Arc::clone(&engine);
+            let session = session.clone();
+            tokio::spawn(async move { dispatch(&engine, &session).await })
+        };
+        tokio::time::timeout(Duration::from_secs(10), engine.faults.granted.notified())
+            .await
+            .expect("the submission committed and holds");
+        assert!(
+            event_types(&engine, &session)
+                .await
+                .contains(&"turn.submitted".to_owned())
+        );
+        let steering = {
+            let engine = std::sync::Arc::clone(&engine);
+            let raw = json!({"session":session.as_str(),"handle":HANDLE,"text":"x"});
+            tokio::spawn(async move { engine.steer(serde_json::from_value(raw).unwrap()).await })
+        };
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            engine.faults.steer_waiting.notified(),
+        )
+        .await
+        .expect("the steer waits for the acceptance");
+        assert!(!steering.is_finished(), "the steer waits");
+        engine.faults.release.notify_one();
+        let error = steering.await.unwrap().unwrap_err();
+        assert_eq!(error.kind, "no_active_turn", "{error:?}");
+        dispatching.await.unwrap();
+    });
+}
+
+/// Sol r2 #5 (C1 §3.4): steer selection is serialized with the submission
+/// commit and its publication, so a steer issued once `turn.submitted` is
+/// durable, while the dispatcher holds between the commit and the
+/// publication, waits for the publication and then for the acceptance;
+/// it never answers `no_active_turn` from the gap. The launch then fails
+/// (no anchor), so the steer ends `no_active_turn` after its wait.
+#[test]
+fn a_steer_between_the_submission_commit_and_its_publication_waits() {
+    let Some(root) = child("a_steer_between_the_submission_commit_and_its_publication_waits")
+    else {
+        return;
+    };
+    let unsupported = json!({"support":"unsupported","reason":"no"});
+    let profile = json!({"capabilities": {
+        "verbs": {"spawn":{"support":"native"},"resume":{"support":"native"},
+                  "steer":{"support":"native"},"cancel":{"support":"native"},
+                  "close":{"support":"native"}},
+        "params": {"instructions":unsupported,"output_schema":unsupported,
+                   "effort":unsupported,"max_steps":unsupported},
+        "bounds": [], "network_control": false, "recover": unsupported,
+        "usage": {"tokens":"turn","cost":"unavailable"}
+    }});
+    fs::write(
+        root.join("scenario.json"),
+        json!({"profile":profile,"scripts":[]}).to_string(),
+    )
+    .unwrap();
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        engine
+            .faults
+            .hold_before_publish
+            .store(true, Ordering::Release);
+        let dispatching = {
+            let engine = std::sync::Arc::clone(&engine);
+            let session = session.clone();
+            tokio::spawn(async move { dispatch(&engine, &session).await })
+        };
+        tokio::time::timeout(Duration::from_secs(10), engine.faults.granted.notified())
+            .await
+            .expect("the submission committed and holds before its publication");
+        assert!(
+            event_types(&engine, &session)
+                .await
+                .contains(&"turn.submitted".to_owned())
+        );
+        let steering = {
+            let engine = std::sync::Arc::clone(&engine);
+            let raw = json!({"session":session.as_str(),"handle":HANDLE,"text":"x"});
+            tokio::spawn(async move { engine.steer(serde_json::from_value(raw).unwrap()).await })
+        };
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            engine.faults.steer_selecting.notified(),
+        )
+        .await
+        .expect("the steer selects its turn");
+        engine.faults.release.notify_one();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            engine.faults.steer_waiting.notified(),
+        )
+        .await
+        .expect("the steer addresses the published turn and waits for its acceptance");
+        let error = steering.await.unwrap().unwrap_err();
+        assert_eq!(error.kind, "no_active_turn", "{error:?}");
+        dispatching.await.unwrap();
+    });
+}
+
+/// A workspace test build's sibling binary.
+fn sibling(name: &str) -> PathBuf {
+    let path = env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(name);
+    assert!(
+        path.is_file(),
+        "missing {}; build the workspace first",
+        path.display()
+    );
+    path
+}
+
+/// Sol r1 #18: a steer issued while its turn awaits acceptance enters the
+/// acceptance wait, observed through the `steer_waiting` hold rather than
+/// by elapsed time, and is delivered into that turn once it is accepted.
+/// The real anchor and fake agent run the turn; the agent holds its
+/// acceptance behind a gate.
+#[test]
+fn a_steer_before_acceptance_waits_and_is_delivered() {
+    let Some(root) = child("a_steer_before_acceptance_waits_and_is_delivered") else {
+        return;
+    };
+    let unsupported = json!({"support":"unsupported","reason":"no"});
+    let turn = "fake-turn-1";
+    let scenario = json!({
+        "profile": {"capabilities": {
+            "verbs": {"spawn":{"support":"native"},"resume":{"support":"native"},
+                      "steer":{"support":"native"},"cancel":{"support":"native"},
+                      "close":{"support":"native"}},
+            "params": {"instructions":unsupported,"output_schema":unsupported,
+                       "effort":unsupported,"max_steps":unsupported},
+            "bounds": [], "network_control": false, "recover": unsupported,
+            "usage": {"tokens":"turn","cost":"unavailable"}
+        }},
+        "scripts": [{"expected_request":{"type":"start","prompt":"p"},"steps":[
+            {"action":"gate","name":"submitting"},
+            {"action":"emit","message":{"type":"accepted","id":1,"vendor_turn_id":turn}},
+            {"action":"expect_request","expected":{"type":"steer","id":3}},
+            {"action":"emit","message":{"type":"steer_delivered","id":3,"vendor_turn_id":turn}},
+            {"action":"emit","message":{"type":"terminal","vendor_turn_id":turn,
+             "status":"completed","final_text":"done","stop_reason":"end_turn"}},
+        ]}],
+    });
+    fs::write(root.join("scenario.json"), scenario.to_string()).unwrap();
+    let sync = root.join("sync");
+    run(async {
+        let config = AdapterConfig::load(
+            BootstrapEnv::from_vars([
+                ("VIA_FAKE_AGENT_BINARY", sibling("via-fake-agent")),
+                ("VIA_FAKE_SCENARIO", root.join("scenario.json")),
+                ("VIA_FAKE_SYNC_DIR", sync.clone()),
+            ]),
+            None,
+        )
+        .unwrap();
+        let engine = Engine::open_with(
+            &root.join("state"),
+            &root.join("runtime"),
+            config,
+            sibling("via"),
+            super::DAEMON_QUEUE_LIMIT,
+            None,
+        )
+        .unwrap();
+        let session = new_session(&engine).await;
+        let dispatching = {
+            let engine = std::sync::Arc::clone(&engine);
+            let session = session.clone();
+            tokio::spawn(async move { dispatch(&engine, &session).await })
+        };
+        until(|| sync.join("submitting.entered").exists()).await;
+        let steering = {
+            let engine = std::sync::Arc::clone(&engine);
+            let raw = json!({"session":session.as_str(),"handle":HANDLE,"text":"also"});
+            tokio::spawn(async move { engine.steer(serde_json::from_value(raw).unwrap()).await })
+        };
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            engine.faults.steer_waiting.notified(),
+        )
+        .await
+        .expect("the steer enters the acceptance wait");
+        fs::write(sync.join("submitting.release"), b"").unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(20), steering)
+            .await
+            .expect("the steer returns once the turn is accepted")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&reply).unwrap(),
+            json!({"turn":format!("{session}/1"),"delivery":"injected"})
+        );
+        dispatching.await.unwrap();
+        assert_eq!(steers(&engine, &session).await, [(json!(1), json!(false))]);
+    });
+}
+
+/// Critical r2 #2 (C2 `SteerInput.token`): a live steer caller's outcome
+/// is its own. Its report commits, then more than 1,024 others, of
+/// callers that went away, are consumed before it asks: it still learns
+/// that its report committed.
+#[test]
+fn a_suspended_steer_keeps_its_outcome() {
+    let Some(root) = child("a_suspended_steer_keeps_its_outcome") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let (session, lane, sender) = idle_session_with_lane(&engine, &root).await;
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1 << 20));
+        let report = |token| via_adapters::Observation::SteerDelivered {
+            delivery: via_adapters::observation::SteerDelivery::Injected,
+            token: via_adapters::SteerToken::new(token),
+        };
+        let mut ticket = lane.steer_ticket();
+        assert_eq!(lane.steer_tickets(), 1);
+        send_held(&sender, &budget, Some("vt-1"), report(ticket.token().get())).await;
+        for token in 1..=1025 {
+            send_held(
+                &sender,
+                &budget,
+                Some("vt-1"),
+                report(1_000_000_000 + token),
+            )
+            .await;
+        }
+        let db = rusqlite::Connection::open(root.join("state").join("store.sqlite3")).unwrap();
+        db.busy_timeout(Duration::from_secs(10)).unwrap();
+        let reports = || -> i64 {
+            db.query_row(
+                "SELECT count(*) FROM events WHERE session_id=?1 AND type='steer.delivered'",
+                [session.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while reports() < 1026 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("every report commits");
+        let committed = tokio::time::timeout(Duration::from_secs(5), ticket.committed()).await;
+        assert_eq!(committed, Ok(true));
+        assert_eq!(
+            lane.steer_tickets(),
+            0,
+            "its consumption resolved the ticket"
+        );
+        let unanswered = lane.steer_ticket();
+        assert_eq!(lane.steer_tickets(), 1);
+        drop(unanswered);
+        assert_eq!(
+            lane.steer_tickets(),
+            0,
+            "a request's end retires its ticket"
+        );
+    });
+}
+
+/// A steer report (C2 §4 `steer.delivered`).
+fn steered() -> via_adapters::Observation {
+    via_adapters::Observation::SteerDelivered {
+        delivery: via_adapters::observation::SteerDelivery::Injected,
+        token: via_adapters::SteerToken::new(1),
+    }
+}
+
+/// The session's `steer.delivered` events as `(turn, late)`.
+async fn steers(engine: &Engine, session: &SessionId) -> Vec<(Value, Value)> {
+    events_page(engine, session).await["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["type"] == "steer.delivered")
+        .map(|event| (event["turn"].clone(), event["late"].clone()))
+        .collect()
+}
+
+/// Sol r1 #9 (C1 §6, C2 §2): a steer report that is not the running
+/// turn's own is still durable. While turn 2 runs, one naming turn 1's
+/// vendor turn commits `steer.delivered` with `turn: 1, late: true`, one
+/// naming an unseen vendor turn `turn: null`, and turn 2's own `turn: 2`.
+#[test]
+fn a_steer_report_of_another_turn_is_committed_during_a_turn() {
+    let Some(root) = child("a_steer_report_of_another_turn_is_committed_during_a_turn") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let (session, slot, lane, mut record, effective, orders) =
+            running_turn_2(&engine, &root).await;
+        let item = |vendor_turn: &str| via_adapters::ObservationItem {
+            at: tokio::time::Instant::now(),
+            vendor_turn: Some(
+                via_adapters::VendorTurnId::try_from(vendor_turn.to_owned()).unwrap(),
+            ),
+            observation: steered(),
+        };
+        let queued = vec![item("fake-turn-1"), item("stranger"), item("fake-turn-2")];
+        engine
+            .drain_queued(
+                (&slot, Some(&*lane)),
+                &mut record,
+                &effective,
+                orders,
+                queued,
+            )
+            .await;
+        assert!(record.first_failure.is_none());
+        assert_eq!(
+            steers(&engine, &session).await,
+            [
+                (json!(1), json!(true)),
+                (Value::Null, json!(false)),
+                (json!(2), json!(false)),
+            ]
+        );
+    });
+}
+
+/// Sol r1 #9 (C1 §6, C2 §2 session drain): a steer report received
+/// between turns is committed as it arrives, with its own attribution:
+/// `turn: null` with no vendor turn, and `turn: 1, late: true` naming turn
+/// 1's.
+#[test]
+fn a_between_turn_steer_report_is_committed() {
+    let Some(root) = child("a_between_turn_steer_report_is_committed") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let (session, _lane, sender) = idle_session_with_lane(&engine, &root).await;
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1_000));
+        send_held(&sender, &budget, None, steered()).await;
+        send_held(&sender, &budget, Some("vt-1"), steered()).await;
+        let expected = [(Value::Null, json!(false)), (json!(1), json!(true))];
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while steers(&engine, &session).await != expected {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the steer reports are committed");
+    });
 }
 
 /// S-CORE c4 r2 item 1b (C2 §2 session drain, decision H3 as narrowed):
@@ -3612,7 +4251,14 @@ fn tombstone_exhaustion_fails_and_retires_the_lane() {
             .unwrap()
             .route;
         let successor = engine
-            .open_lane(&session, (&route, "fake", root.clone()), resident(&engine))
+            .open_lane(
+                &session,
+                (
+                    (&route, &plain_effective(), frozen_inherit(&route)),
+                    root.clone(),
+                ),
+                resident(&engine),
+            )
             .await;
         assert!(!successor.failed());
         assert_eq!(
@@ -3830,7 +4476,14 @@ fn replacing_a_retired_lane_keeps_its_items_and_the_budget() {
             .unwrap()
             .route;
         let successor = engine
-            .open_lane(&session, (&route, "fake", root.clone()), resident(&engine))
+            .open_lane(
+                &session,
+                (
+                    (&route, &plain_effective(), frozen_inherit(&route)),
+                    root.clone(),
+                ),
+                resident(&engine),
+            )
             .await;
         // Committed before the successor was made.
         assert_eq!(
@@ -3936,7 +4589,7 @@ fn closed_list_adapter_warnings_reach_the_envelope_once_per_code() {
         assert!(codes.contains(&&json!("vendor_specific")), "{page}");
         let at = "2026-01-01T00:00:00.000Z".to_owned();
         let envelope = super::terminal::turn_envelope(
-            (&session, record.turn),
+            (&session, record.turn, &crate::intake::TurnPlan::default()),
             super::terminal::blank("completed", "end_turn", None),
             None,
             (None, None),
@@ -4202,9 +4855,13 @@ fn a_dropped_replacement_leaves_the_old_lane_owning_its_work() {
             .unwrap()
             .unwrap()
             .route;
+        let effective = plain_effective();
         {
-            let replacing =
-                engine.open_lane(&session, (&route, "fake", root.clone()), resident(&engine));
+            let replacing = engine.open_lane(
+                &session,
+                ((&route, &effective, frozen_inherit(&route)), root.clone()),
+                resident(&engine),
+            );
             assert!(
                 tokio::time::timeout(Duration::from_millis(100), replacing)
                     .await
@@ -4878,6 +5535,7 @@ fn only_the_running_turns_progress_resets_its_idle_deadline() {
         let accepted = Observation::Accepted(via_adapters::observation::Acceptance {
             correlation: via_adapters::AcceptanceToken::FIRST,
             vendor_turn_id: None,
+            instance: None,
         });
         assert!(super::drive::current_progress(
             &lane,
@@ -4942,6 +5600,7 @@ fn a_new_connection_generation_starts_with_no_old_ownership() {
                 via_adapters::observation::Acceptance {
                     correlation: via_adapters::AcceptanceToken::FIRST,
                     vendor_turn_id: None,
+                    instance: None,
                 },
             ),
         };
@@ -4986,6 +5645,7 @@ fn tombstone_exhaustion_stops_the_running_turn_at_once() {
                 via_adapters::observation::Acceptance {
                     correlation: via_adapters::AcceptanceToken::FIRST,
                     vendor_turn_id: None,
+                    instance: None,
                 },
             ),
         };
@@ -5028,6 +5688,7 @@ fn a_token_like_vendor_turn_id_survives_a_restart() {
                     via_adapters::observation::Acceptance {
                         correlation: via_adapters::AcceptanceToken::FIRST,
                         vendor_turn_id: Some(vendor_turn()),
+                        instance: None,
                     },
                 ),
             };
@@ -5131,6 +5792,88 @@ fn a_recovered_envelope_keeps_the_stored_identity() {
         );
         assert!(envelope["usage"]["total_tokens"].is_null(), "{envelope}");
         assert!(envelope["duration_ms"].is_null(), "{envelope}");
+    });
+}
+
+/// Sol r2 #6 (C1 §3.7): a turn accepted on a tested instance keeps that
+/// instance's version across a restart: its recovered envelope reports the
+/// recorded `vendor_version` and `tested`, with no untested warning.
+#[test]
+fn a_recovered_envelope_keeps_the_turns_instance() {
+    let Some(root) = child("a_recovered_envelope_keeps_the_turns_instance") else {
+        return;
+    };
+    run(async {
+        let session = {
+            let earlier = open(&root);
+            let session = new_session(&earlier).await;
+            let at = rfc3339(std::time::SystemTime::now());
+            let submitted = Event {
+                seq: 2,
+                session_id: &session,
+                turn: Some(1),
+                late: false,
+                at: &at,
+                body: EventBody::TurnSubmitted { attempt: 1 },
+            }
+            .to_value()
+            .unwrap();
+            earlier
+                .store
+                .commit_submission(SubmissionRecord {
+                    session_id: session.clone(),
+                    turn: turn(1),
+                    event: submitted,
+                })
+                .await
+                .unwrap();
+            let started = Event {
+                seq: 3,
+                session_id: &session,
+                turn: Some(1),
+                late: false,
+                at: &at,
+                body: EventBody::TurnStarted {
+                    effective: json!({}),
+                },
+            }
+            .to_value()
+            .unwrap();
+            earlier
+                .store
+                .commit_acceptance(via_store::AcceptanceRecord {
+                    session_id: session.clone(),
+                    turn: turn(1),
+                    correlation: "t:vt-1".to_owned(),
+                    event: started,
+                    adapter_version: None,
+                    instance: Some(via_store::InstanceRecord {
+                        vendor_version: Some("1.0".to_owned()),
+                        tested: true,
+                    }),
+                })
+                .await
+                .unwrap();
+            session
+        };
+        let engine = open(&root);
+        assert_eq!(engine.recover().await.unwrap(), 1);
+        let envelope = engine.result(&format!("{session}/1")).await.unwrap();
+        let envelope: Value = serde_json::from_str(envelope.get()).unwrap();
+        assert_eq!(envelope["state"], "unknown", "{envelope}");
+        assert_eq!(
+            (&envelope["vendor_version"], &envelope["version_status"]),
+            (&json!("1.0"), &json!("tested")),
+            "{envelope}"
+        );
+        assert!(
+            !envelope["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning["code"] == "vendor_version_untested"),
+            "{envelope}"
+        );
     });
 }
 
@@ -6178,4 +6921,13 @@ fn a_close_joining_a_started_eviction_waits_and_owns_no_report() {
             lane.close_order()
         );
     });
+}
+
+/// A turn's frozen values with C1's defaults and a 30 s wall budget.
+fn plain_effective() -> crate::intake::Effective {
+    serde_json::from_value(json!({
+        "model":"fake","effort":null,"bound":null,
+        "deadlines":{"wall_ms":30_000,"idle_ms":600_000},"max_steps":null
+    }))
+    .unwrap()
 }

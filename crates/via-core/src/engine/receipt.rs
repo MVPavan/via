@@ -12,14 +12,21 @@ use via_store::{
     SessionSnapshot, SpawnKey, SpawnRecord, StoreError,
 };
 
+use via_adapters::{
+    DescribeRequest, RoutePlan, SteerError, SteerInput, Support, VendorTurnId, Verb,
+};
+
+use super::drive::steer_delivery;
 use super::journal::{self, Head};
 use super::latch::{FailureScope, FailureSite, WriteOutcome};
-use super::queue::{DAEMON_QUEUE_LIMIT, SESSION_QUEUE_LIMIT, Slot};
+use super::queue::{DAEMON_QUEUE_LIMIT, SESSION_QUEUE_LIMIT, Slot, Steering};
 use super::{Admission, Engine, Receipted, lock};
+use crate::api::retry_identity_of;
 use crate::api::{
-    Capabilities, Effective, Event, EventBody, Named, PATH_MAX, PromptSource, Receipt, RoutePlan,
-    TurnReceipt, retry_key, rfc3339,
+    Event, EventBody, Named, PATH_MAX, PlanFields, PromptSource, Receipt, TurnReceipt, Warning,
+    retry_key, rfc3339,
 };
+use crate::intake::{self, Effective, Frozen, SessionMembers};
 use crate::{
     ApiError, ResumeParams, SessionId, SpawnParams, SteerParams, TurnNumber, hash_handle,
     retry_identity,
@@ -108,6 +115,44 @@ impl Engine {
         })
     }
 
+    /// Sol r1 #4 (C1 §4 `instructions`): the text of an `instructions
+    /// {path}`, read once when the request is received with the prompt
+    /// file's copy pass: an absolute path to a regular UTF-8 file of at
+    /// most 1 MiB that does not change during the copy, else
+    /// `invalid_params` naming `instructions` with the copy's `reason`.
+    /// The copy is then loaded and discarded; its content token is the
+    /// retry identity's. The path itself is never kept.
+    async fn read_instructions(&self, path: String) -> Result<(String, String), ApiError> {
+        if path.len() > PATH_MAX {
+            return Err(intake::instructions_refused(
+                "instructions path is too long",
+                Some("unreadable"),
+            ));
+        }
+        if !Path::new(&path).is_absolute() {
+            return Err(intake::instructions_refused(
+                "instructions path must be absolute",
+                Some("not_absolute"),
+            ));
+        }
+        let deadline = tokio::time::Instant::now() + PROMPT_FILE_PASS;
+        let blob = self
+            .store
+            .copy_text_file(PathBuf::from(path), deadline, INSTRUCTIONS_MAX)
+            .await
+            .map_err(|error| match error {
+                PromptFileError::Refused(reason) => {
+                    intake::instructions_refused("instructions file refused", Some(reason))
+                }
+                PromptFileError::Store(_) => WriteOutcome::NotCommitted.api_error(),
+            })?;
+        let text = self.store.load_prompt(&blob).await;
+        let content = content_token(&blob);
+        self.store.discard_blob(blob).await;
+        let text = text.map_err(|_| WriteOutcome::NotCommitted.api_error())?;
+        Ok((text, content))
+    }
+
     /// Design §6.5: a staged blob that no commit adopted (a replay, a
     /// conflict, a refusal, a commit known not to have happened) is
     /// discarded after `admission` is released.
@@ -117,28 +162,50 @@ impl Engine {
         }
     }
 
+    /// C1 §4 `output_schema` (Q2): a given schema must compile as a
+    /// self-contained draft 2020-12 schema within VIA's compile limits.
+    /// Compiling is bounded, and runs as a Store blocking step, off the
+    /// executor and owned until it ends (fix round 1 #1).
+    async fn check_schema(&self, schema: Option<&serde_json::Value>) -> Result<(), ApiError> {
+        let Some(schema) = schema.cloned() else {
+            return Ok(());
+        };
+        let compiles = self
+            .store
+            .blocking_step(move || Ok(crate::schema::compiles(&schema)))
+            .await
+            .map_err(|_| WriteOutcome::NotCommitted.api_error())?;
+        if compiles {
+            Ok(())
+        } else {
+            Err(intake::schema_refused())
+        }
+    }
+
     /// Design §11.1: the session's `cwd`, checked by an owned blocking step
-    /// with no lock held: at most 4096 bytes, absolute and an existing
-    /// directory. An omitted `cwd` is the daemon's working directory at
+    /// with no lock held: at most 4 KiB encoded (C1 §5), absolute and an
+    /// existing directory. An omitted `cwd` is the daemon's working directory at
     /// startup (§5.1 #22).
     async fn session_cwd(&self, cwd: Option<String>) -> Result<String, ApiError> {
-        let invalid = |message| {
-            ApiError::naming(
-                ApiError::INVALID_PARAMS,
-                &const { Named::field("cwd") },
-                message,
-            )
-        };
+        let invalid =
+            |message| ApiError::naming(ApiError::INVALID_PARAMS, Named::field("cwd"), message);
         let Some(cwd) = cwd else {
-            return self
+            // Sol r1 #15: the startup directory is held to the same cap.
+            let cwd = self
                 .cwd
                 .to_str()
-                .map(str::to_owned)
-                .ok_or_else(|| invalid("the daemon's working directory is not UTF-8; give cwd"));
+                .ok_or_else(|| invalid("the daemon's working directory is not UTF-8; give cwd"))?;
+            return if intake::cwd_fits(cwd) {
+                Ok(cwd.to_owned())
+            } else {
+                Err(invalid(
+                    "the daemon's working directory is over 4 KiB encoded; give cwd",
+                ))
+            };
         };
-        if cwd.len() > PATH_MAX || !Path::new(&cwd).is_absolute() {
+        if !intake::cwd_fits(&cwd) {
             return Err(invalid(
-                "cwd must be an absolute path of at most 4096 bytes",
+                "cwd must be an absolute path of at most 4 KiB encoded",
             ));
         }
         let path = PathBuf::from(&cwd);
@@ -173,7 +240,19 @@ impl Engine {
         raw_params: &str,
     ) -> Result<Receipted, ApiError> {
         let source = params.take_prompt()?;
-        params.check_session_members()?;
+        let mut members = params.session_members()?;
+        // Sol r1 #4: an `instructions {path}` is read when the request is received.
+        let instructions = match members.instructions_path.take() {
+            Some(path) => {
+                let (text, content) = self.read_instructions(path).await?;
+                members.instructions = Some(text);
+                Some(content)
+            }
+            None => None,
+        };
+        // Fix round 1 #1: the schema compiles off the executor, no lock held.
+        self.check_schema(params.per_turn().overrides()?.schema())
+            .await?;
         let hash = hash_handle(&params.handle)?;
         let key = retry_key(params.idempotency_key.as_deref())?.map(str::to_owned);
         // Checked with no lock held, applied only to new work: a keyed
@@ -188,14 +267,24 @@ impl Engine {
         let free = self.free_space().await;
         let receipted = match key
             .map(|key| {
-                retry_identity(raw_params, &hash, content.as_deref())
-                    .map(|identity| SpawnKey { key, identity })
+                retry_identity_of(
+                    raw_params,
+                    &hash,
+                    content.as_deref(),
+                    instructions.as_deref(),
+                )
+                .map(|identity| SpawnKey { key, identity })
             })
             .transpose()
         {
             Ok(key) => {
-                self.spawn_admitted(params, (prompt, cwd), (hash, key, free), &mut pending)
-                    .await
+                self.spawn_admitted(
+                    (params, members),
+                    (prompt, cwd),
+                    (hash, key, free),
+                    &mut pending,
+                )
+                .await
             }
             Err(error) => Err(error),
         };
@@ -232,7 +321,7 @@ impl Engine {
     /// have happened, and left for discard otherwise.
     async fn spawn_admitted(
         &self,
-        params: SpawnParams,
+        (params, members): (SpawnParams, SessionMembers),
         (prompt, cwd): (Prompt, Result<String, ApiError>),
         (hash, key, free): ([u8; 32], Option<SpawnKey>, Option<FreeSpace>),
         pending: &mut Option<BlobRef>,
@@ -254,29 +343,28 @@ impl Engine {
         }
         // Bounds the turns retained for their `store_error` reads.
         journal::admission(&self.store, &self.unresolved).await?;
-        if params.harness != "fake" || !self.harness_available(&params.harness) {
-            return Err(ApiError::HARNESS_UNAVAILABLE);
-        }
-        // Design §5.2: with its harness named, a model the catalog lacks
-        // passes through for the vendor to judge.
+        // C2 §2 `plan` (design §5.2): the harness, route and model, and the
+        // route's refusal of any member; with its harness named, a model
+        // the catalog lacks passes through for the vendor to judge.
+        let planned = intake::plan_spawn(&self.adapter, &params, &members, &cwd)?;
         if is_empty(&prompt) {
             return Err(ApiError::INVALID_PARAMS);
         }
-        let effective = Effective::fake(&params.model, &params.per_turn().fake_overrides()?);
         if self.queued.load(Ordering::Acquire) >= DAEMON_QUEUE_LIMIT {
             return Err(ApiError::QUEUED_AT_CAPACITY);
         }
         let turn = TurnNumber::try_from(1).map_err(|_| ApiError::STORE)?;
         let session = crate::api::new_session_id()?;
-        let plan = RoutePlan::fake();
+        let version = version_of(&planned.plan);
+        let warnings = plan_warnings(&version, &planned.plan);
         let receipt = Receipt {
             session_id: session.clone(),
             turn: format!("{}/{}", session.as_str(), turn.get()),
             state: "queued",
-            warnings: plan.warnings(),
-            plan,
-            capabilities: Capabilities::fake(),
-            effective,
+            warnings,
+            plan: version,
+            capabilities: planned.plan.capabilities.clone(),
+            effective: planned.effective.c1(),
         };
         let receipt = serde_json::to_value(&receipt).map_err(|_| ApiError::STORE)?;
         let at = rfc3339(SystemTime::now());
@@ -299,11 +387,11 @@ impl Engine {
                     session_id: session.clone(),
                     handle_hash: hash,
                     receipt: receipt.clone(),
-                    // Design §11.1 (A14): the frozen session parameters.
-                    params: json!({"harness":"fake","model":&params.model,"cwd":cwd,
-                        "allow_untested":params.allow_untested}),
+                    // Design §11.1 (A14), adapter design §5.1 #25: the
+                    // frozen session parameters, from the plan.
+                    params: intake::frozen_params(&planned, (&params, &members, &cwd))?,
                     label: params.label,
-                    effective: receipt["effective"].clone(),
+                    effective: planned.effective.stored()?,
                     prompt,
                     initial_event,
                 },
@@ -377,6 +465,10 @@ impl Engine {
         (operation, free): (Option<(String, via_store::Identity)>, Option<FreeSpace>),
         pending: &mut Option<BlobRef>,
     ) -> Result<Receipted, ApiError> {
+        params.refuse_session_scope()?;
+        let overrides = params.per_turn().overrides()?;
+        // Fix round 1 #1: the schema compiles off the executor, no lock held.
+        self.check_schema(overrides.schema()).await?;
         let admission = self.admission.lock().await;
         if self.store_failed() {
             return Err(ApiError::STORE);
@@ -384,8 +476,6 @@ impl Engine {
         if is_empty(&prompt) {
             return Err(ApiError::INVALID_PARAMS);
         }
-        params.refuse_session_scope()?;
-        let overrides = params.per_turn().fake_overrides()?;
         let session = params.session;
         let snapshot = self
             .store
@@ -393,6 +483,12 @@ impl Engine {
             .await
             .map_err(|_| ApiError::STORE)?
             .ok_or(ApiError::SESSION_NOT_FOUND)?;
+        // Sol r1 #5 (C1 §4.1): the session's frozen route cannot resume;
+        // refused before any receipt or driver call.
+        let frozen = Frozen::of(&snapshot.route);
+        if frozen.lacks(Verb::Resume) {
+            return Err(intake::unsupported_on(Verb::Resume, &frozen));
+        }
         if let Some((key, identity)) = &operation
             && let Some(stored) = self
                 .store
@@ -434,11 +530,30 @@ impl Engine {
             .clone()
             .and_then(|latest| serde_json::from_value(latest).ok())
             .ok_or(ApiError::STORE)?;
-        let effective = latest.inherit(&overrides);
+        let effective = latest.inherit(overrides);
+        // C2 §2 `check_turn` (decision F12): the turn's values against the
+        // session's frozen route, AD12's adapter version included. The
+        // requested bound, given or inherited, takes the effective one the
+        // route reports now (Sol r2 #4, r3 #2); an inherited one stays
+        // marked so.
+        let params = effective.turn_params();
+        let checked = self
+            .adapter
+            .check_turn(&frozen.session_ref(), &params)
+            .map_err(|refusal| intake::refused(&refusal))?;
+        let effective = match params.bound {
+            Some(requested) => effective.with_bound(intake::EffectiveBound::of(
+                Some(&requested),
+                checked.effective_bound,
+                intake::route_name(&frozen.route).ok_or(ApiError::STORE)?,
+            )?),
+            None => effective,
+        };
+        let warnings = self.resume_warnings(&frozen);
         self.queue_turn(
             session,
             &snapshot,
-            (prompt, effective),
+            (prompt, effective, warnings),
             operation,
             (&admission, pending),
         )
@@ -452,7 +567,7 @@ impl Engine {
         &self,
         session: SessionId,
         snapshot: &SessionSnapshot,
-        (prompt, effective): (Prompt, Effective),
+        (prompt, effective, warnings): (Prompt, Effective, Vec<Warning>),
         operation: Option<(String, via_store::Identity)>,
         (admission, pending): (&Admission<'_>, &mut Option<BlobRef>),
     ) -> Result<Receipted, ApiError> {
@@ -462,8 +577,8 @@ impl Engine {
             turn: format!("{}/{}", session.as_str(), turn.get()),
             state: "queued",
             queue_position: snapshot.queued,
-            effective,
-            warnings: RoutePlan::fake().warnings(),
+            effective: effective.c1(),
+            warnings,
         };
         let receipt = serde_json::to_value(&receipt).map_err(|_| ApiError::STORE)?;
         // Nothing was written; Store's read reply already reported SQLite
@@ -490,7 +605,7 @@ impl Engine {
                 session_id: session.clone(),
                 turn,
                 prompt,
-                effective: receipt["effective"].clone(),
+                effective: effective.stored()?,
                 event,
                 operation: operation.map(|(op_key, identity)| OperationRecord {
                     op_key,
@@ -541,16 +656,159 @@ impl Engine {
         })
     }
 
-    /// The session and its handle ([`Self::authenticate_existing`]), then
-    /// the latch, then fake's unsupported mutation capability.
+    /// A turn receipt's warnings (C1 §3.3): the route's version status, as
+    /// a fresh plan of the session's harness and model reports it, and the
+    /// session's frozen `config_switch_unverified`.
+    fn resume_warnings(&self, frozen: &Frozen) -> Vec<Warning> {
+        let request = DescribeRequest {
+            harness: Some(frozen.harness.clone()),
+            model: Some(frozen.model.clone()),
+            ..DescribeRequest::default()
+        };
+        let mut warnings: Vec<Warning> = self
+            .adapter
+            .plan(&request)
+            .ok()
+            .and_then(|plan| version_of(&plan).warning())
+            .into_iter()
+            .collect();
+        warnings.extend(frozen.config_warning());
+        warnings
+    }
+
+    /// C1 §3.4 `steer`: the session and its handle
+    /// ([`Self::authenticate_existing`]), then the latch; a route whose
+    /// stored capabilities do not support steer is `unsupported_verb`. The
+    /// running turn is the one steered: none is `no_active_turn`, another
+    /// than `expect_turn` is `turn_mismatch`, and one still submitting is
+    /// waited for until its acceptance, `no_active_turn` if it ends first.
+    /// Core mints the input's token, unique within the session, and
+    /// registers the request's completion ticket on the session's lane
+    /// under it before the input goes to the driver (C2 §2
+    /// `SteerInput.token`, critical r2 #2). The driver answers with the
+    /// delivery once the vendor took the input and the `steer.delivered`
+    /// observation carrying that token is on the session channel; a refusal
+    /// or a delivery it could not record maps under C1 §3.4. The steer is
+    /// answered only once the lane committed that observation, which
+    /// resolves the ticket (C1 §3.4, critical r1 #5): a failed commit, or
+    /// the lane's end first, is `store_error`, never success. The ticket
+    /// retires with the request, whichever way it ends.
     pub async fn steer(&self, params: SteerParams) -> Result<Value, ApiError> {
-        self.authenticate_existing(&params.session, params.handle.as_deref())
+        let (_, snapshot) = self
+            .authenticate_existing(&params.session, params.handle.as_deref())
             .await?;
         if self.store_failed() {
             return Err(ApiError::STORE);
         }
-        Err(ApiError::UNSUPPORTED_VERB)
+        let frozen = Frozen::of(&snapshot.route);
+        if !matches!(
+            frozen.steer(),
+            Some(Support::Native | Support::Partial { .. })
+        ) {
+            return Err(intake::unsupported_on(Verb::Steer, &frozen));
+        }
+        #[cfg(test)]
+        self.faults.steer_selecting.notify_one();
+        // Sol r2 #5: selected under the slot's `selection`, so a submission
+        // committed before this steer is published to it; released here,
+        // before the acceptance wait.
+        let selected = match self.slot(&params.session) {
+            Some(slot) => {
+                let _selection = slot.selection.lock().await;
+                slot.steering()
+            }
+            None => None,
+        };
+        let Some((turn, mut steering)) = selected else {
+            return Err(ApiError::NO_ACTIVE_TURN);
+        };
+        if params
+            .expect_turn
+            .is_some_and(|expected| expected != turn.get())
+        {
+            return Err(ApiError::TURN_MISMATCH);
+        }
+        let vendor_turn = loop {
+            let current = steering.borrow_and_update().clone();
+            match current {
+                Steering::Accepted(vendor_turn) => break vendor_turn,
+                Steering::Ended => return Err(ApiError::NO_ACTIVE_TURN),
+                Steering::Submitting => {}
+            }
+            #[cfg(test)]
+            self.faults.steer_waiting.notify_one();
+            // The turn ended without an acceptance.
+            if steering.changed().await.is_err() {
+                return Err(ApiError::NO_ACTIVE_TURN);
+            }
+        };
+        let lane = self
+            .kept_lane(&params.session)
+            .ok_or(ApiError::NO_ACTIVE_TURN)?;
+        // Critical r2 #2: the request's completion ticket, registered
+        // before the driver can emit its report; dropped with the request,
+        // whichever way it ends, it retires itself.
+        let mut ticket = lane.steer_ticket();
+        let input = SteerInput {
+            // Sol r1 #8: the driver admits it only into the selected turn.
+            turn,
+            token: ticket.token(),
+            text: params.text,
+            expected_vendor_turn: vendor_turn.and_then(|id| VendorTurnId::try_from(id).ok()),
+        };
+        let delivery = lane
+            .driver
+            .steer(input)
+            .await
+            .map_err(|error| match error {
+                // Sol r1 #11 (C1 §3.4, C2 §2).
+                SteerError::Unsupported => intake::unsupported_on(Verb::Steer, &frozen),
+                SteerError::NoActiveTurn => ApiError::NO_ACTIVE_TURN,
+                SteerError::TurnMismatch => ApiError::TURN_MISMATCH,
+                SteerError::OverCapacity => ApiError::CONTROL_LANE_FULL,
+                SteerError::NotSteerable => ApiError::steer_failed("not_steerable", "none".into()),
+                SteerError::NotDelivered => {
+                    ApiError::steer_failed("not_delivered", "uncertain".into())
+                }
+                // Critical r2 #3: the vendor took it; no event records it.
+                SteerError::NotRecorded { delivery } => ApiError::steer_failed(
+                    "not_recorded",
+                    steer_delivery(&delivery).to_owned().into(),
+                ),
+            })?;
+        if !ticket.committed().await {
+            return Err(ApiError::STORE);
+        }
+        Ok(json!({
+            "turn": format!("{}/{}", params.session.as_str(), turn.get()),
+            "delivery": steer_delivery(&delivery),
+        }))
     }
+}
+
+/// The receipt's route and version fields of a plan (C1 §3.2).
+fn version_of(plan: &RoutePlan) -> PlanFields {
+    PlanFields {
+        route: plan.route.to_owned(),
+        adapter_version: plan.adapter_version.clone(),
+        vendor_version: plan.vendor_version.clone(),
+        version_status: plan.version_status,
+    }
+}
+
+/// A spawn receipt's warnings (C1 §3.2, §5): the version status, then the
+/// plan's own warnings of C1's closed list with VIA's messages, its
+/// `config_switch_unverified` among them.
+fn plan_warnings(version: &PlanFields, plan: &RoutePlan) -> Vec<Warning> {
+    let mut warnings: Vec<Warning> = version.warning().into_iter().collect();
+    warnings.extend(
+        plan.warnings
+            .iter()
+            .filter(|warning| warning.code != "vendor_version_untested")
+            .filter_map(|warning| Warning::adapter(warning.code, warning.data.clone()))
+            .map(Warning::capped),
+    );
+    warnings
 }
 
 /// An empty prompt: an empty inline text, or an empty prompt file's blob.
@@ -564,6 +822,9 @@ fn is_empty(prompt: &Prompt) -> bool {
 /// A receipt's free-space read (Task 4 design §5.3); `None` with the
 /// floor off.
 type FreeSpace = Result<u64, StoreError>;
+
+/// Longest `instructions {path}` file (C1 §4).
+const INSTRUCTIONS_MAX: u64 = 1024 * 1024;
 
 /// Design §10.4: the whole prompt-file pass ends within this bound.
 const PROMPT_FILE_PASS: std::time::Duration = std::time::Duration::from_secs(10);

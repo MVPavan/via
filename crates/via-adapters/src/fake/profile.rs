@@ -7,7 +7,9 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 
 use crate::capabilities::{Capabilities, ParamSupport, Support, UsageSupport, Verbs};
-use crate::plan::{CatalogModel, Category, CategoryDecl};
+use crate::driver::SteerError;
+use crate::observation::SteerDelivery;
+use crate::plan::{Bound, CatalogModel, Category, CategoryDecl};
 
 /// A fake capability profile.
 #[derive(Clone, Debug, Deserialize)]
@@ -41,6 +43,43 @@ pub(crate) struct FakeProfile {
     /// The persistent emulation's idle close, when the scenario has one.
     #[serde(default)]
     pub(crate) idle_close: Option<IdleCloseDecl>,
+    /// The bound the route reports enforcing for any supported requested
+    /// one, when it normalizes bounds (C2 `RoutePlan.effective_bound`).
+    #[serde(default)]
+    pub(crate) normalized_bound: Option<Bound>,
+    /// How the driver refuses every steer admitted into the running turn,
+    /// when the scenario declares one (C2 §2 `SteerError`).
+    #[serde(default)]
+    pub(crate) steer_refusal: Option<SteerRefusalDecl>,
+}
+
+/// A declared steer refusal: what a vendor or the control lane answers.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SteerRefusalDecl {
+    /// The control lane is full.
+    OverCapacity,
+    /// The vendor refused steer in the turn's current phase.
+    NotSteerable,
+    /// Writing the input began, but the vendor never acknowledged it.
+    NotDelivered,
+    /// The vendor took the input, but its report was not recorded
+    /// (critical r2 #3).
+    NotRecorded,
+}
+
+impl SteerRefusalDecl {
+    /// The driver's error for a steer `delivery` would describe.
+    pub(crate) fn error(self, delivery: &SteerDelivery) -> SteerError {
+        match self {
+            Self::OverCapacity => SteerError::OverCapacity,
+            Self::NotSteerable => SteerError::NotSteerable,
+            Self::NotDelivered => SteerError::NotDelivered,
+            Self::NotRecorded => SteerError::NotRecorded {
+                delivery: delivery.clone(),
+            },
+        }
+    }
 }
 
 /// The persistent emulation's idle close (decision H1, C2 §4): after turn
@@ -82,6 +121,8 @@ impl Default for FakeProfile {
             persistent: false,
             handshake: None,
             idle_close: None,
+            normalized_bound: None,
+            steer_refusal: None,
         }
     }
 }

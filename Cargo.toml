@@ -1,5 +1,7 @@
 [workspace]
 members = ["crates/*"]
+# Vendored third-party crates are patched in, not built as members.
+exclude = ["third_party/boon"]
 resolver = "3"
 
 [workspace.package]
@@ -27,6 +29,13 @@ insta = "1.48"
 proptest = "1.11"
 tempfile = "3.27"
 sha2 = "0.10"
+# K14: JSON Schema draft 2020-12 validation of structured output (C1 Q2).
+boon = { version = "0.6", default-features = false }
+
+# boon 0.6.1 with VIA's validation step budget and draft pin
+# (third_party/boon/VIA-PATCH.md).
+[patch.crates-io]
+boon = { path = "third_party/boon" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

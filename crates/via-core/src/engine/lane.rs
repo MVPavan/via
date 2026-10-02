@@ -37,9 +37,9 @@ use std::{
 use serde_json::{Map, Value};
 use tokio::sync::{OwnedSemaphorePermit, mpsc, watch};
 use via_adapters::{
-    Admitted, CancellationToken, CloseMode, CloseReport, DriverFailure, DriverHealth, Inherit,
+    Admitted, CancellationToken, CloseMode, CloseReport, DriverFailure, DriverHealth, InheritPlan,
     OBSERVATION_BYTES, Observation, ObservationBudget, SessionCx, SessionDriver, SessionRef,
-    SessionSpec, UsageSample, VendorOptions, VendorTerminal, observation_channel_in,
+    SessionSpec, SteerToken, UsageSample, VendorTerminal, observation_channel_in,
 };
 use via_store::{SessionIdentity, SessionRoute};
 
@@ -49,6 +49,7 @@ use super::{Engine, SessionWriter, lock};
 use crate::api::{
     AutoDeclined, DeniedAction, EventBody, Kept, StructuredOutputFile, Warning, rfc3339,
 };
+use crate::intake::{Effective, Frozen};
 use crate::{Deadline, SessionId, TurnNumber};
 
 /// Vendor turn IDs a lane remembers: late observations of older turns are
@@ -287,6 +288,88 @@ pub(super) struct Lane {
     /// close asked for that driver close or took it over before it started:
     /// that close takes it ([`Engine::close_lane`]).
     report: StdMutex<Option<CloseReport>>,
+    /// The completion tickets of the lane's live steer requests (critical
+    /// r2 #2).
+    steers: Arc<SteerTickets>,
+}
+
+/// The tokens Core gives steer input, unique within every session (C2
+/// `SteerInput.token`): one counter for the daemon.
+static STEER_TOKENS: AtomicU64 = AtomicU64::new(0);
+
+/// Critical r1 #5, r2 #2 (C1 §3.4, C2 `SteerInput.token`): the completion
+/// ticket of each live steer request on the lane, by its token. A request
+/// registers one before it calls `steer` and retires it when it ends by
+/// any path ([`SteerTicket`]); consuming the token's `steer.delivered`
+/// resolves it, committed or not, and an observation whose ticket is gone
+/// just commits. The lane's end resolves every ticket left as not
+/// committed. So the tickets are the lane's live steer requests, never
+/// evicted: each holds one from its registration until it is answered.
+#[derive(Default)]
+struct SteerTickets(StdMutex<TicketBook>);
+
+#[derive(Default)]
+struct TicketBook {
+    tickets: HashMap<SteerToken, tokio::sync::oneshot::Sender<bool>>,
+    /// The lane ended: a later request's ticket is resolved at once.
+    closed: bool,
+}
+
+impl SteerTickets {
+    fn book(&self) -> std::sync::MutexGuard<'_, TicketBook> {
+        lock(&self.0)
+    }
+
+    /// Resolves the ticket of `token`, if its request still waits.
+    fn resolve(&self, token: SteerToken, committed: bool) {
+        let ticket = self.book().tickets.remove(&token);
+        if let Some(ticket) = ticket {
+            // The request ended meanwhile: nobody waits for the answer.
+            let _ = ticket.send(committed);
+        }
+    }
+
+    /// The lane ended: every ticket left is not committed.
+    fn close(&self) {
+        let tickets = {
+            let mut book = self.book();
+            book.closed = true;
+            std::mem::take(&mut book.tickets)
+        };
+        for ticket in tickets.into_values() {
+            let _ = ticket.send(false);
+        }
+    }
+}
+
+/// One live steer request's completion ticket on its lane (critical r2
+/// #2): its token, which the request passes to `steer`, and whether the
+/// token's `steer.delivered` committed. Dropped, it retires itself.
+pub(super) struct SteerTicket {
+    token: SteerToken,
+    resolved: tokio::sync::oneshot::Receiver<bool>,
+    tickets: Weak<SteerTickets>,
+}
+
+impl SteerTicket {
+    /// The token the request's input carries.
+    pub(super) const fn token(&self) -> SteerToken {
+        self.token
+    }
+
+    /// Whether the token's `steer.delivered` observation committed: the
+    /// wait ends with its consumption, committed or not, or the lane's end.
+    pub(super) async fn committed(&mut self) -> bool {
+        (&mut self.resolved).await.unwrap_or(false)
+    }
+}
+
+impl Drop for SteerTicket {
+    fn drop(&mut self) {
+        if let Some(tickets) = self.tickets.upgrade() {
+            tickets.book().tickets.remove(&self.token);
+        }
+    }
 }
 
 /// What the lane learned from the session's observations.
@@ -563,6 +646,7 @@ impl Lane {
             used: AtomicU64::new(use_tick()),
             engine,
             report: StdMutex::new(None),
+            steers: Arc::default(),
         }
     }
 
@@ -718,6 +802,43 @@ impl Lane {
         self.life() == Life::Ended
     }
 
+    /// Records that `observation`, consumed without a commit, was a
+    /// `steer.delivered` that did not commit, if it was one.
+    pub(super) fn steer_dropped(&self, observation: &Observation) {
+        if let Some(token) = observation.steer_token() {
+            self.steer_outcome(token, false);
+        }
+    }
+
+    /// Records whether the `steer.delivered` observation of `token`
+    /// committed, once consumed on any of its paths (critical r1 #5): its
+    /// request's ticket, if it still waits, learns it.
+    pub(super) fn steer_outcome(&self, token: SteerToken, committed: bool) {
+        self.steers.resolve(token, committed);
+    }
+
+    /// Registers a steer request's completion ticket, with a new token,
+    /// before the request calls `steer` (critical r2 #2).
+    pub(super) fn steer_ticket(&self) -> SteerTicket {
+        let token = SteerToken::new(STEER_TOKENS.fetch_add(1, Ordering::Relaxed) + 1);
+        let (sender, resolved) = tokio::sync::oneshot::channel();
+        let mut book = self.steers.book();
+        if !book.closed {
+            book.tickets.insert(token, sender);
+        }
+        SteerTicket {
+            token,
+            resolved,
+            tickets: Arc::downgrade(&self.steers),
+        }
+    }
+
+    /// The live steer tickets.
+    #[cfg(test)]
+    pub(super) fn steer_tickets(&self) -> usize {
+        self.steers.book().tickets.len()
+    }
+
     /// Retires the lane once no turn holds it, and waits for its end.
     async fn retire_now(&self) {
         let mut changes = self.changed.subscribe();
@@ -759,9 +880,10 @@ impl Lane {
     /// narrowed): an item received while no turn runs. A durable one is
     /// committed at once with its own attribution: an identity as the
     /// session's open event with its columns, a denial, decline or warning
-    /// session-level, or late with its turn when it names an earlier turn.
-    /// An expired one and every non-durable one (acceptance, progress,
-    /// final text, steer report, vendor close, mismatch, late terminal) is
+    /// session-level, or late with its turn when it names an earlier turn;
+    /// so is a steer report (Sol r1 #9). An expired one and every
+    /// non-durable one (acceptance, progress, final text, vendor close,
+    /// mismatch, late terminal) is
     /// dropped. A vendor close needs nothing of Core: the driver ends the
     /// connection, and the next turn reopens it. Its budget returns once
     /// it is handled.
@@ -795,7 +917,9 @@ impl Lane {
             }
             Observation::ActionDenied(_)
             | Observation::RequestDeclined(_)
-            | Observation::Warning(_) => {
+            | Observation::Warning(_)
+            | Observation::SteerDelivered { .. } => {
+                let steer = item.observation.steer_token();
                 let vendor_turn = item
                     .vendor_turn
                     .as_ref()
@@ -803,17 +927,19 @@ impl Lane {
                 let attributed = match self.attribute(vendor_turn, None) {
                     Attribution::Late(turn) => (Some(turn.get()), true),
                     Attribution::Current | Attribution::Session => (None, false),
-                    Attribution::Expired => return,
+                    Attribution::Expired => return self.steer_dropped(&item.observation),
                 };
                 if let Some(body) = super::drive::held_body(&item.observation) {
-                    self.writer.commit((body, &at, attributed), None).await;
+                    let written = self.writer.commit((body, &at, attributed), None).await;
+                    if let Some(token) = steer {
+                        self.steer_outcome(token, matches!(written, SessionWrite::Committed));
+                    }
                 }
             }
             Observation::IdentityConfirmed(_)
             | Observation::Accepted(_)
             | Observation::Progress(_)
             | Observation::FinalText(_)
-            | Observation::SteerDelivered(_)
             | Observation::VendorClosed(_)
             | Observation::ResumeMismatch { .. }
             // Discarded until via-jm4.35: a late terminal's revision
@@ -898,6 +1024,9 @@ impl Lane {
                 Err(removed) => break removed,
             }
         };
+        // Critical r2 #2: the channel is drained to its end; a steer
+        // request still waiting learns its report never committed.
+        self.steers.close();
         // Only an ended lane leaves the session's registration (Sol r5 R8),
         // when its session closed or the daemon's drivers were cancelled;
         // a retired one stays for its successor's state.
@@ -1185,6 +1314,8 @@ pub(super) struct VendorRecord {
     /// The handshake version of the instance that ran the turn, and
     /// whether the adapter checked it (AD7).
     pub(super) instance: Option<(Option<String>, bool)>,
+    /// The version of the adapter that ran the turn (AD12), when one did.
+    pub(super) adapter_version: Option<String>,
     /// The retained vendor terminal's envelope facts (AD4).
     pub(super) retained: Option<Retained>,
     /// The turn's acceptance found every tombstone taken (C2 §4.1,
@@ -1201,6 +1332,11 @@ pub(super) struct Retained {
     pub(super) structured_output: Option<Value>,
     /// The durable `structured_output.json` of a spilled value (C1 §5).
     pub(super) structured_output_file: Option<StructuredOutputFile>,
+    /// Why the structured output does not satisfy the turn's frozen
+    /// `output_schema` (`"invalid"` or `"validation_limit"`), once checked
+    /// before it is stored: the validation outcome, kept apart from the
+    /// turn's failure class until its terminal is built (critical r1 #4).
+    pub(super) output_invalid: Option<&'static str>,
     pub(super) steps: Option<u64>,
     pub(super) usage: Option<UsageSample>,
     pub(super) cost: Option<(f64, String)>,
@@ -1220,6 +1356,7 @@ impl Retained {
             vendor_stop_reason: terminal.vendor_stop_reason.clone(),
             structured_output: terminal.structured_output.as_deref().and_then(parse),
             structured_output_file: None,
+            output_invalid: None,
             steps: terminal.steps,
             usage: terminal.usage.clone(),
             cost: terminal
@@ -1262,8 +1399,9 @@ impl Engine {
     }
 
     /// The session's lane for its submitted turn, which found none to
-    /// claim, opened for the turn's `model` in `cwd` (C2 §2
-    /// `open_session`, logical: no vendor I/O) from the session's stored
+    /// claim, opened for the turn's frozen values and the session's frozen
+    /// `inherit` in `cwd` (C2 §2 `open_session`, logical: no vendor I/O;
+    /// critical r1 #2) from the session's stored
     /// route identity `route` (Sol r1 F12, decision H3), and claimed. A
     /// route identity the Store does not hold is not invented: the driver
     /// then has no adapter and refuses the turn. A lane it replaces stays
@@ -1274,7 +1412,7 @@ impl Engine {
     pub(super) async fn open_lane(
         &self,
         session: &SessionId,
-        (route, model, cwd): (&SessionRoute, &str, PathBuf),
+        ((route, effective, inherit), cwd): ((&SessionRoute, &Effective, InheritPlan), PathBuf),
         resident: OwnedSemaphorePermit,
     ) -> LaneClaim {
         let replaced = lock(&self.lanes).get(session).cloned();
@@ -1287,19 +1425,21 @@ impl Engine {
             None => (LaneState::recovered(route), ObservationBudget::new()),
         };
         let reference = session_ref(route);
+        // Decision F12: what the session's plan froze at spawn.
+        let frozen = Frozen::of(route);
         let spec = SessionSpec {
             session_id: session.clone(),
-            model: model.to_owned(),
-            instructions: None,
-            initial_bound: None,
+            model: effective.model().to_owned(),
+            instructions: frozen.instructions,
+            initial_bound: effective.bound().cloned(),
             cwd,
-            vendor: VendorOptions::new(),
-            inherit: Inherit::OD2_DEFAULT,
+            vendor: frozen.vendor,
+            inherit,
             confirmed_vendor_session_id: state
                 .identity
                 .as_ref()
                 .map(|identity: &Identity| identity.vendor_session_id.clone()),
-            allow_untested: false,
+            allow_untested: frozen.allow_untested,
         };
         let (sink, receiver) = observation_channel_in(&budget);
         let cx = SessionCx {
