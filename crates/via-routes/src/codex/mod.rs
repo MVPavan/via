@@ -7,27 +7,38 @@
 mod connection;
 mod crash;
 mod encode;
+mod feeder;
 mod lane;
 mod messages;
 mod servers;
+mod stdio;
+mod threads;
 
 pub use connection::{
     Connection, ConnectionEnd, ConnectionFailure, Counts, DECLINE_DEADLINE, FINISH_BY,
-    RequestError, Requested,
+    LOSS_EVIDENCE, LaneLease, Purpose, RequestError, Requested, Subscription, TurnWrites,
 };
 pub use crash::{CrashOnPanic, RegistryGuard, crash_on_panic, lock};
 pub use encode::*;
 pub use lane::{
-    ConnectionLoss, LANE_BYTES, LANE_MESSAGES, Lane, LaneEnd, LaneEvent, LaneItem, LossCause,
+    AbnormalEnd, ConnectionLoss, LANE_BYTES, LANE_MESSAGES, Lane, LaneEnd, LaneEvent, LaneItem,
+    LeaseSignal, LossCause, Routed,
 };
 pub use messages::*;
 pub use servers::{
-    AcquireCause, LaunchFailure, LiveServer, MODEL_BYTES, MODEL_PAGES, SERVER_HANDSHAKE,
-    SERVER_RETIRE, ServerEnd, ServerFacts, ServerKey, ServerPin, Servers,
+    AcquireCause, LaunchError, LaunchFailure, LiveServer, MODEL_BYTES, MODEL_PAGES,
+    SERVER_HANDSHAKE, SERVER_RETIRE, ServerEnd, ServerFacts, ServerKey, ServerPin, Servers,
 };
+pub use threads::{CORRELATION_BYTES, CORRELATION_ENTRIES};
 /// The Wire types a shared-route driver handles: its writes' bounds and
-/// answers, a turn's link and evidence folder.
-pub use via_wire::{CommitOutcome, PendingWrite, TurnFolder, WriteBounds};
+/// answers, a turn's link and evidence folder, and a routed message's raw
+/// form.
+pub use via_wire::{
+    BoundedBytes, CommitOutcome, PendingWrite, TurnFolder, VendorMessage, WriteBounds,
+};
 
+#[cfg(test)]
+#[cfg(feature = "test-failpoints")]
+mod connection_tests;
 #[cfg(test)]
 mod tests;

@@ -81,6 +81,10 @@ const OPEN_SETTLE: Duration = Duration::from_millis(100);
 /// How a case is driven beyond its expectation: a test seam for cases the
 /// schema cannot state.
 #[derive(Clone, Copy, Debug, Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each is one independent seam a case turns on"
+)]
 pub(crate) struct Knobs {
     /// Core takes no observation of launch 1 until the fake has read its
     /// `n`th input line (`read <n> launch 1`): the session's channel
@@ -101,6 +105,10 @@ pub(crate) struct Knobs {
     pub(crate) hold_for: Option<Duration>,
     /// A cancel is ordered this long after the turn starts.
     pub(crate) stop_after: Option<Duration>,
+    /// Each session's health is read once it left `open` (within
+    /// [`FIXTURE_WAIT`]): a failure an idle driver latches after its last
+    /// turn settled (x.3.2 X0 item 13.2).
+    pub(crate) await_failure: bool,
 }
 
 /// What a running turn has shown so far, for its side actions.
@@ -200,6 +208,9 @@ impl Pure {
             }
             let opened = (std::mem::take(&mut run.opened), pure.writes()?);
             let turns = run.all().await;
+            if knobs.await_failure {
+                run.until_failed().await;
+            }
             let health = run.health();
             let servers = run.shutdown().await;
             let turns = turns?;
@@ -995,6 +1006,19 @@ impl<'a> Run<'a> {
     }
 
     /// Each session's health after the case.
+    /// Waits until no session's driver is `open`, within [`FIXTURE_WAIT`].
+    async fn until_failed(&self) {
+        let started = tokio::time::Instant::now();
+        while started.elapsed() < FIXTURE_WAIT
+            && self
+                .sessions
+                .values()
+                .any(|session| *session.driver.health().borrow() == DriverHealth::Open)
+        {
+            tokio::time::sleep(POLL).await;
+        }
+    }
+
     fn health(&self) -> BTreeMap<String, Value> {
         self.sessions
             .iter()

@@ -151,21 +151,127 @@ impl Notification {
     }
 }
 
-/// The routing peek of a line [`decode`] refused (x.3.2 X0 item 5 step
-/// 1): the `params.threadId` of a well-formed JSON object with no `id`,
-/// when it is a string within its bound. `None` is no attribution: the
-/// failure is the connection's.
-pub fn peek_thread(line: &[u8]) -> Option<String> {
-    if limits(line).is_err() {
-        return None;
+/// Where one message goes, read from its correlation fields only (x.3.2
+/// X0 item 5 step 1), before any full decode.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Routing {
+    /// A reply to one of VIA's requests, by its integer ID.
+    Response(i64),
+    /// A request VIA must answer.
+    Request,
+    /// A notification, with the thread and turn it names.
+    Notification {
+        /// `params.threadId`.
+        thread: Option<String>,
+        /// `params.turnId`, or `params.turn.id` for `turn/*`.
+        turn: Option<String>,
+    },
+}
+
+/// The methods whose correlation names a thread and a turn: the turn by
+/// `params.turnId`, or by `params.turn.id` for the `turn/*` pair.
+const TURN_METHODS: [&str; 9] = [
+    "turn/started",
+    "turn/completed",
+    "item/started",
+    "item/completed",
+    "item/agentMessage/delta",
+    "item/reasoning/summaryTextDelta",
+    "item/reasoning/textDelta",
+    "thread/tokenUsage/updated",
+    "error",
+];
+
+/// The methods whose correlation names a thread only.
+const THREAD_METHODS: [&str; 2] = ["thread/status/changed", "thread/closed"];
+
+/// The routing peek (x.3.2 X0 item 5 step 1): only `id`, `method`,
+/// `params.threadId` and `params.turnId` (`params.turn.id` for `turn/*`),
+/// against their typed schema. An error is an unattributable message (step
+/// 2): not JSON, a reply ID that is not an integer, or a known method whose
+/// thread or turn is missing, not a string, or past [`SHORT_FIELD_MAX`].
+/// Every other field is the full decode's, at consumption.
+pub fn peek(line: &[u8]) -> Result<Routing, DecodeError> {
+    #[derive(Deserialize)]
+    struct Head {
+        #[serde(default, deserialize_with = "present")]
+        id: Option<Box<RawValue>>,
+        #[serde(default)]
+        method: Option<String>,
+        #[serde(default)]
+        params: Option<Box<RawValue>>,
     }
-    let raw: RawEnvelope = serde_json::from_slice(line).ok()?;
-    if raw.id.is_some() {
-        return None;
+    let head: Head =
+        serde_json::from_slice(line).map_err(|_| DecodeError("not a JSON-RPC message"))?;
+    match (head.id, head.method) {
+        (Some(id), None) => match serde_json::from_str::<Value>(id.get()) {
+            Ok(Value::Number(number)) => number
+                .as_i64()
+                .map(Routing::Response)
+                .ok_or(DecodeError("a reply ID that is not one of VIA's")),
+            _ => Err(DecodeError("a reply ID that is not one of VIA's")),
+        },
+        (Some(_), Some(_)) => Ok(Routing::Request),
+        (None, Some(method)) => notification_routing(&method, head.params.as_deref()),
+        (None, None) => Err(DecodeError(
+            "neither a response, a request nor a notification",
+        )),
     }
-    loose_ids(raw.params.as_deref())
-        .thread
-        .filter(|thread| thread.len() <= SHORT_FIELD_MAX)
+}
+
+/// A notification's correlation, by method.
+fn notification_routing(method: &str, params: Option<&RawValue>) -> Result<Routing, DecodeError> {
+    #[derive(Deserialize)]
+    struct Ids {
+        #[serde(default, rename = "threadId")]
+        thread: Option<Value>,
+        #[serde(default, rename = "turnId")]
+        turn_id: Option<Value>,
+        #[serde(default)]
+        turn: Option<Box<RawValue>>,
+    }
+    #[derive(Deserialize)]
+    struct TurnHead {
+        #[serde(default)]
+        id: Option<Value>,
+    }
+    let ids = match params {
+        Some(params) => serde_json::from_str::<Ids>(params.get()).ok(),
+        None => None,
+    };
+    let text = |value: Option<Value>| match value {
+        Some(Value::String(text)) if text.len() <= SHORT_FIELD_MAX => Some(text),
+        _ => None,
+    };
+    let (thread, turn_id, turn) = match ids {
+        Some(ids) => (text(ids.thread), text(ids.turn_id), ids.turn),
+        None => (None, None, None),
+    };
+    let known = TURN_METHODS.contains(&method);
+    if !known && !THREAD_METHODS.contains(&method) {
+        return Ok(Routing::Notification {
+            thread,
+            turn: turn_id,
+        });
+    }
+    let thread = thread.ok_or(DecodeError("a notification without its thread"))?;
+    if !known {
+        return Ok(Routing::Notification {
+            thread: Some(thread),
+            turn: None,
+        });
+    }
+    let turn = if method.starts_with("turn/") {
+        turn.and_then(|turn| serde_json::from_str::<TurnHead>(turn.get()).ok())
+            .and_then(|head| text(head.id))
+    } else {
+        turn_id
+    };
+    let turn = turn.ok_or(DecodeError("a notification without its turn"))?;
+    Ok(Routing::Notification {
+        thread: Some(thread),
+        turn: Some(turn),
+    })
 }
 
 /// `turn/started` and `turn/completed` params.

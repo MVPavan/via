@@ -6,6 +6,7 @@
 //! inherited configuration, the server key); its driver runs each turn on
 //! a shared `codex app-server` (x.3.2 X3).
 
+mod delivery;
 mod driver;
 mod launch;
 mod normalize;

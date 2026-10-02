@@ -598,6 +598,89 @@ impl ObservationSink {
             Err(mpsc::error::TrySendError::Closed(_)) => Err(Undelivered::Closed),
         }
     }
+
+    /// Reserves what [`Self::send`] would take for `item`: its byte cost,
+    /// then a channel slot, under one stall deadline set at the first
+    /// block (x.3.2 X0 item 13.2). The send itself is then synchronous
+    /// ([`Reserved::send`]), so a caller can make it under its own lock;
+    /// a dropped reservation releases both. Test builds hit the same
+    /// `adapter.observation.blocked` and `.stalled` points as a send.
+    pub(crate) async fn reserve(
+        &self,
+        item: &ObservationItem,
+        stall: Duration,
+    ) -> Result<Reserved<'_>, Undelivered> {
+        let reserved = self.reserve_in(item, stall).await;
+        #[cfg(feature = "test-failpoints")]
+        if matches!(reserved, Err(Undelivered::Stalled)) {
+            let _ = via_routes::failpoint::hit_async("adapter.observation.stalled").await;
+        }
+        reserved
+    }
+
+    async fn reserve_in(
+        &self,
+        item: &ObservationItem,
+        stall: Duration,
+    ) -> Result<Reserved<'_>, Undelivered> {
+        let mut stall_at = None;
+        let wanted = u32::try_from(item_cost(item)).map_err(|_| Undelivered::Stalled)?;
+        let permit = match Arc::clone(&self.budget).try_acquire_many_owned(wanted) {
+            Ok(permit) => permit,
+            Err(TryAcquireError::NoPermits) => {
+                #[cfg(feature = "test-failpoints")]
+                blocked().await;
+                let at = *stall_at.get_or_insert_with(|| Instant::now() + stall);
+                timeout_at(at, Arc::clone(&self.budget).acquire_many_owned(wanted))
+                    .await
+                    .map_err(|_| Undelivered::Stalled)?
+                    .map_err(|_| Undelivered::Closed)?
+            }
+            Err(TryAcquireError::Closed) => return Err(Undelivered::Closed),
+        };
+        let slot = match self.sender.try_reserve() {
+            Ok(slot) => slot,
+            Err(mpsc::error::TrySendError::Full(())) => {
+                #[cfg(feature = "test-failpoints")]
+                blocked().await;
+                let at = *stall_at.get_or_insert_with(|| Instant::now() + stall);
+                timeout_at(at, self.sender.reserve())
+                    .await
+                    .map_err(|_| Undelivered::Stalled)?
+                    .map_err(|_| Undelivered::Closed)?
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => return Err(Undelivered::Closed),
+        };
+        Ok(Reserved { permit, slot })
+    }
+}
+
+/// A send [`ObservationSink::reserve`] made room for.
+pub(crate) struct Reserved<'a> {
+    permit: OwnedSemaphorePermit,
+    slot: mpsc::Permit<'a, Admitted>,
+}
+
+impl Reserved<'_> {
+    /// Sends `item`, synchronously, into the reserved slot with the
+    /// reserved bytes. Test builds acknowledge it at
+    /// `adapter.observation.admitted` through [`admitted`], after the
+    /// caller's own lock.
+    pub(crate) fn send(self, item: ObservationItem) {
+        self.slot.send(Admitted {
+            item,
+            permit: self.permit,
+        });
+    }
+}
+
+/// Test builds: acknowledges a reserved send, as [`ObservationSink::send`]
+/// acknowledges each item the channel took.
+pub(crate) async fn admitted() {
+    #[cfg(feature = "test-failpoints")]
+    {
+        let _ = via_routes::failpoint::hit_async("adapter.observation.admitted").await;
+    }
 }
 
 /// A send blocked on the budget or the channel, before its wait.

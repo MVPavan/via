@@ -1,20 +1,23 @@
-//! A thread's ingress lane (x.3.2 X0 items 5, 10, 12.5): the messages the
-//! connection task routed to one registered thread, in decode order,
+//! A thread's ingress lane (x.3.2 X0 items 5, 10, 11, 12.5): the messages
+//! the connection task routed to one registered thread, in decode order,
 //! bounded at 16 messages and 1 MiB inside Wire's 1,024-message / 4 MiB
-//! staging. Each routed message keeps its staging permit until the
-//! driver consumes it, so the lanes count against the staging too. A full
-//! lane is not waited on: the connection task never blocks on a driver.
-//! The lane ends `Overflow` (the generation is quarantined) and later
-//! messages for it are counted and dropped.
+//! staging. Each routed message is kept raw with its staging permit until
+//! the driver's normalizer consumes and decodes it, so the lanes count
+//! against the staging; a decline's placeholder keeps the request's own
+//! message, so it is charged one message and its bytes too. A full lane is
+//! not waited on: the connection task never blocks on a driver. The lane
+//! ends `Overflow` (the generation is quarantined) and later messages for
+//! it are counted and dropped.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
-use via_wire::{ExitReport, VendorMessage, WireCleanup};
+use via_wire::{ExitReport, TurnNumber, VendorMessage, WireCleanup};
 
-use super::{Notification, ServerRequest};
+use super::ServerRequest;
 
 /// The most messages a lane holds.
 pub const LANE_MESSAGES: usize = 16;
@@ -22,20 +25,29 @@ pub const LANE_MESSAGES: usize = 16;
 /// The most message bytes a lane holds.
 pub const LANE_BYTES: usize = 1024 * 1024;
 
+/// One routed message, raw (item 12.5): decoded at consumption.
+pub struct Routed {
+    /// The raw message and its staging permit.
+    pub staged: VendorMessage,
+    /// The connection's decode sequence of the message (item 13.2).
+    pub seq: u64,
+    /// The vendor turn its correlation names, if any.
+    pub turn: Option<String>,
+    /// The VIA turn that vendor turn was accepted as, when the connection
+    /// had mapped it at routing (packet §5).
+    pub owner: Option<TurnNumber>,
+}
+
 /// One message routed to a thread.
 pub enum LaneItem {
-    /// A decoded notification naming the thread; its staged bytes are kept
-    /// until the driver takes it.
-    Notification {
-        /// The notification.
-        notification: Notification,
-        /// The raw message and its staging permit.
-        staged: VendorMessage,
-    },
+    /// A notification naming the thread.
+    Message(Routed),
     /// A server request VIA declined at decode, in its decode position
     /// (item 11): the driver reports `vendor.request_declined` only once
     /// `written` says the reply was written whole, by `decoded_at + 5 s`.
     Declined {
+        /// The request's own message: the placeholder's staging charge.
+        routed: Routed,
         /// The request.
         request: ServerRequest,
         /// When it was decoded.
@@ -44,15 +56,58 @@ pub enum LaneItem {
         /// when it was not.
         written: watch::Receiver<Option<bool>>,
     },
-    /// A message whose correlation names this thread but which is not a
-    /// valid message of its method (item 5 step 5): an attributable decode
-    /// failure of the generation.
-    Malformed {
-        /// The bytes, for the turn's `undecoded.bin`.
-        staged: VendorMessage,
-        /// The bounded diagnostic.
-        detail: &'static str,
-    },
+}
+
+impl LaneItem {
+    /// The routing facts of the item.
+    pub fn routed(&self) -> &Routed {
+        match self {
+            Self::Message(routed) | Self::Declined { routed, .. } => routed,
+        }
+    }
+}
+
+/// One lease's abnormal-end signal (item 13.2): registered with the
+/// connection, outside its task, so a dead connection task's end reaches
+/// the lease's driver without the data path.
+pub struct LeaseSignal {
+    /// The last decode sequence the demux queued into this lease's lanes.
+    enqueued: AtomicU64,
+    /// The driver's handler: synchronous, idempotent, never blocking.
+    on_abnormal: Box<dyn Fn(AbnormalEnd) + Send + Sync>,
+}
+
+impl LeaseSignal {
+    /// A signal calling `on_abnormal` at the abnormal end.
+    pub fn new(on_abnormal: impl Fn(AbnormalEnd) + Send + Sync + 'static) -> Self {
+        Self {
+            enqueued: AtomicU64::new(0),
+            on_abnormal: Box::new(on_abnormal),
+        }
+    }
+
+    /// The last decode sequence queued into this lease's lanes.
+    pub fn enqueued(&self) -> u64 {
+        self.enqueued.load(Ordering::Acquire)
+    }
+
+    pub(super) fn queued(&self, seq: u64) {
+        self.enqueued.fetch_max(seq, Ordering::AcqRel);
+    }
+
+    pub(super) fn signal(&self) {
+        (self.on_abnormal)(AbnormalEnd {
+            first_unqueued: self.enqueued().saturating_add(1),
+        });
+    }
+}
+
+/// The abnormal end of a connection task, as one lease learns it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AbnormalEnd {
+    /// The first decode sequence not queued into the lease's lanes: no
+    /// earlier message of the lease was lost with the task.
+    pub first_unqueued: u64,
 }
 
 /// Why a whole connection failed, as its sessions report it (item 13.1).
@@ -92,6 +147,9 @@ pub enum LaneEnd {
     Lost(ConnectionLoss),
     /// The server retired with the lane still registered.
     Retired,
+    /// The connection task itself failed (item 13.2): the lane ends with
+    /// no boundary, and what was staged in the task is lost.
+    Abnormal,
 }
 
 /// What [`Lane::next`] returns.
@@ -170,6 +228,14 @@ impl Lane {
         self.queue().dropped
     }
 
+    /// The decode sequence of the first message the lane holds, if any.
+    pub fn front_seq(&self) -> Option<u64> {
+        self.queue()
+            .items
+            .front()
+            .map(|(item, _)| item.routed().seq)
+    }
+
     /// Takes the next message without waiting, or the end once the lane
     /// holds no more; `None` when it is empty and open.
     pub fn try_next(&self) -> Option<LaneEvent> {
@@ -201,24 +267,24 @@ mod tests {
 
     use super::{
         ConnectionLoss, LANE_BYTES, LANE_MESSAGES, Lane, LaneEnd, LaneEvent, LaneItem, LossCause,
+        Routed,
     };
 
     fn item(text: &str) -> LaneItem {
         let line = format!("{{\"method\":\"x\",\"params\":{{\"note\":\"{text}\"}}}}\n");
-        LaneItem::Malformed {
+        LaneItem::Message(Routed {
             staged: VendorMessage::new(BoundedBytes::try_from_message(line.into_bytes()).unwrap()),
-            detail: "test",
-        }
+            seq: 1,
+            turn: None,
+            owner: None,
+        })
     }
 
     fn note(event: Option<LaneEvent>) -> Option<String> {
         match event? {
-            LaneEvent::Item(item) => match *item {
-                LaneItem::Malformed { staged, .. } => {
-                    Some(String::from_utf8(staged.bytes().to_vec()).unwrap())
-                }
-                LaneItem::Notification { .. } | LaneItem::Declined { .. } => None,
-            },
+            LaneEvent::Item(item) => {
+                Some(String::from_utf8(item.routed().staged.bytes().to_vec()).unwrap())
+            }
             LaneEvent::End(_) => None,
         }
     }

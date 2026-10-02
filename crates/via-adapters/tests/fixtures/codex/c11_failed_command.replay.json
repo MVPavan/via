@@ -1,6 +1,6 @@
 {
   "source": "Codex re-probe c11 (ls of a missing path, exit 2), 0.159.2, 2026-09-30; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded workspace-write policy to dangerFullAccess; the run ends at VIA's stdin close (await_eof) after its last close, as the probe closed stdin at the end of the run (exit 0 recorded)",
-  "notes": "Step 10 (turn/start) names step 8, the thread/start reply, as its causal predecessor (after_emit): VIA writes it on that reply, independently of the thread/started notification the server wrote after it.",
+  "notes": "Step 10 (turn/start) names step 8, the thread/start reply, as its causal predecessor (after_emit): VIA writes it on that reply, independently of the thread/started notification the server wrote after it. The turn's notification burst passes the 16-message ingress lane, so a gate splits it: step 24 holds the rest until the driver delivered the command's end (x.3.2 X3 fix r1, Minor 23).",
   "argv": [
     "app-server",
     "--disable",
@@ -183,6 +183,11 @@
     {
       "emit": {
         "line": "{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"commandExecution\",\"id\":\"exec-019a0000-0000-7000-8000-000000400004\",\"pluginId\":null,\"scriptPath\":null,\"command\":\"/bin/bash -lc 'ls /nonexistent-via-dir'\",\"cwd\":\"/work/project\",\"processId\":\"1004\",\"source\":\"unifiedExecStartup\",\"status\":\"failed\",\"commandActions\":[{\"type\":\"unknown\",\"command\":\"ls /nonexistent-via-dir\"}],\"aggregatedOutput\":\"ls: cannot access '/nonexistent-via-dir': No such file or directory\\n\",\"exitCode\":2,\"durationMs\":0},\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200001\",\"completedAtMs\":1790000007782},\"emittedAtMs\":1790000007782}"
+      }
+    },
+    {
+      "await_signal": {
+        "signal": "SIGUSR1"
       }
     },
     {

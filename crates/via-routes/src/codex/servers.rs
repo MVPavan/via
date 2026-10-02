@@ -25,7 +25,9 @@ use via_wire::{
     WireSignals, WriteBounds,
 };
 
-use super::connection::{Connection, ConnectionEnd, ConnectionFailure, RequestError, serve};
+use super::connection::{
+    Connection, ConnectionEnd, ConnectionFailure, Purpose, RequestError, serve,
+};
 use super::crash::{RegistryGuard, crash_on_panic, lock};
 use super::lane::LossCause;
 use super::{
@@ -156,6 +158,26 @@ impl LaunchFailure {
     }
 }
 
+/// A launch's failure as its waiters see it: the failure, and the version
+/// its handshake read when `initialize` was answered first (C2 §5 OD1: the
+/// observed version is on every later outcome).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LaunchError {
+    /// The failure.
+    pub failure: LaunchFailure,
+    /// `initialize`'s `userAgent`, once it was read.
+    pub user_agent: Option<String>,
+}
+
+impl From<LaunchFailure> for LaunchError {
+    fn from(failure: LaunchFailure) -> Self {
+        Self {
+            failure,
+            user_agent: None,
+        }
+    }
+}
+
 /// One server that ended, for diagnostics and the replay harness.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServerEnd {
@@ -178,7 +200,7 @@ pub struct LiveServer {
 
 /// A launch's published result, sent before any transition out of
 /// `Launching` (r6 R6-9).
-type Ready = watch::Sender<Option<Result<(), LaunchFailure>>>;
+type Ready = watch::Sender<Option<Result<(), LaunchError>>>;
 
 enum Entry {
     Launching {
@@ -231,7 +253,7 @@ type ConnectionTask = Pin<Box<dyn Future<Output = ConnectionEnd> + Send>>;
 
 /// A task's typed outcome.
 enum Outcome {
-    Launch(Result<(ConnectionTask, ServerFacts), LaunchFailure>),
+    Launch(Result<(ConnectionTask, ServerFacts), LaunchError>),
     Connection(ConnectionEnd),
     Retired(Option<ExitReport>),
     Stopped(Option<ExitReport>),
@@ -270,6 +292,47 @@ impl Registry {
     }
 }
 
+/// The supervisor's handle (item 2.7), owned here across every join's
+/// await: a join that is cancelled leaves it in place for the next one, so
+/// a later join still sees a supervisor that runs.
+#[derive(Default)]
+struct Handle(Mutex<Option<JoinHandle<()>>>);
+
+impl Handle {
+    fn handle(&self) -> std::sync::MutexGuard<'_, Option<JoinHandle<()>>> {
+        // One assignment at a time: the slot stays consistent.
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Spawns the task with `spawn` unless one was spawned.
+    fn spawn_once(&self, spawn: impl FnOnce() -> JoinHandle<()>) {
+        let mut handle = self.handle();
+        if handle.is_none() {
+            *handle = Some(spawn());
+        }
+    }
+
+    /// Whether the task ended by `cutoff`, or none runs. The handle is
+    /// polled in place, never moved out across the wait, and released only
+    /// once the task ended.
+    async fn join(&self, cutoff: Deadline) -> bool {
+        let ended = std::future::poll_fn(|cx| {
+            let mut handle = self.handle();
+            let Some(task) = handle.as_mut() else {
+                return std::task::Poll::Ready(());
+            };
+            match Pin::new(task).poll(cx) {
+                std::task::Poll::Ready(_) => {
+                    *handle = None;
+                    std::task::Poll::Ready(())
+                }
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            }
+        });
+        timeout_at(cutoff.instant(), ended).await.is_ok()
+    }
+}
+
 /// The registry (item 2.1).
 pub struct Servers {
     runtime: Arc<RouteRuntime>,
@@ -277,8 +340,8 @@ pub struct Servers {
     state: Mutex<Registry>,
     epoch: watch::Sender<u64>,
     work: Notify,
-    /// The supervisor's handle, once spawned; taken by [`Self::join`].
-    supervisor: Mutex<Option<JoinHandle<()>>>,
+    /// The supervisor's handle, once spawned; joined by [`Self::join`].
+    supervisor: Handle,
     /// Set by [`Self::fence`]: launch handshakes stop at their next await.
     fence: watch::Sender<bool>,
     /// Never set: a live connection is not cancelled by the daemon force
@@ -350,10 +413,7 @@ impl ServerPin {
     /// Waits until the pinned server is live, or its launch failed, or
     /// `until` resolves first (`Err(None)`: the turn's own wall, stop or
     /// force ended only its own wait).
-    pub async fn ready(
-        &self,
-        until: impl Future<Output = ()>,
-    ) -> Result<(), Option<LaunchFailure>> {
+    pub async fn ready(&self, until: impl Future<Output = ()>) -> Result<(), Option<LaunchError>> {
         let mut ready = {
             let registry = self.servers.registry();
             match registry
@@ -364,15 +424,18 @@ impl ServerPin {
                 Some(Entry::Live { .. }) => return Ok(()),
                 Some(Entry::Launching { ready, .. }) => ready.subscribe(),
                 Some(Entry::Retiring { .. } | Entry::Lost { .. }) | None => {
-                    return Err(Some(LaunchFailure::Lost(LossCause::TransportLost)));
+                    return Err(Some(LaunchFailure::Lost(LossCause::TransportLost).into()));
                 }
             }
         };
         tokio::select! {
             outcome = ready.wait_for(Option::is_some) => match outcome {
-                Ok(outcome) => (*outcome).unwrap_or(Err(LaunchFailure::Internal)).map_err(Some),
+                Ok(outcome) => outcome
+                    .clone()
+                    .unwrap_or_else(|| Err(LaunchFailure::Internal.into()))
+                    .map_err(Some),
                 // The entry went without its result: never expected.
-                Err(_) => Err(Some(LaunchFailure::Internal)),
+                Err(_) => Err(Some(LaunchFailure::Internal.into())),
             },
             () = until => Err(None),
         }
@@ -389,7 +452,7 @@ impl Servers {
             state: Mutex::new(Registry::default()),
             epoch: watch::Sender::new(0),
             work: Notify::new(),
-            supervisor: Mutex::new(None),
+            supervisor: Handle::default(),
             fence: watch::Sender::new(false),
             unforced: watch::Sender::new(None),
             unwoken: watch::Sender::new(0),
@@ -561,15 +624,10 @@ impl Servers {
 
     /// Spawns the supervisor once, inside the runtime that launches.
     fn start_supervisor(&self, servers: &Arc<Self>) {
-        let mut supervisor = self
-            .supervisor
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if supervisor.is_none() {
-            // Owned by `Servers::supervisor` and awaited by `join`; it ends
-            // only at the fence with its set empty (item 2.5).
-            *supervisor = Some(tokio::spawn(crash_on_panic(supervise(Arc::clone(servers)))));
-        }
+        // Owned by `Servers::supervisor` and awaited by `join`; it ends
+        // only at the fence with its set empty (item 2.5).
+        self.supervisor
+            .spawn_once(|| tokio::spawn(crash_on_panic(supervise(Arc::clone(servers)))));
     }
 
     /// Releases one hold on `server`; the last on a live server retires it
@@ -623,24 +681,11 @@ impl Servers {
     /// Item 2.7 steps 2–3: awaits the supervisor until `cutoff`. Its end
     /// means every task it spawned was collected. Returns `(unjoined,
     /// failed)`: a supervisor still running counts its tasks and itself.
+    /// Cancellation safe: the handle stays owned by the registry.
     pub async fn join(&self, cutoff: Deadline) -> (usize, usize) {
-        let handle = self
-            .supervisor
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        let Some(mut handle) = handle else {
-            return (0, self.registry().failed);
-        };
-        if timeout_at(cutoff.instant(), &mut handle).await.is_ok() {
+        if self.supervisor.join(cutoff).await {
             return (0, self.registry().failed);
         }
-        // Still running at the cutoff: its handle stays owned here until
-        // the process exits.
-        *self
-            .supervisor
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(handle);
         let registry = self.registry();
         (registry.tasks.saturating_add(1), registry.failed)
     }
@@ -759,7 +804,7 @@ impl Servers {
                 if let Some(instance) = registry.servers.remove(server)
                     && let Entry::Launching { key, ready, .. } = instance.entry
                 {
-                    ready.send_replace(Some(Err(LaunchFailure::Shutdown)));
+                    ready.send_replace(Some(Err(LaunchFailure::Shutdown.into())));
                     registry.unmap(&key, server);
                 }
             }
@@ -798,7 +843,7 @@ impl Servers {
                 } = &instance.entry
                 {
                     let (key, connection) = (*key, connection.clone());
-                    ready.send_replace(Some(Err(LaunchFailure::Internal)));
+                    ready.send_replace(Some(Err(LaunchFailure::Internal.into())));
                     retire_launch(&mut instance, connection);
                     registry.unmap(&key, server);
                 }
@@ -818,7 +863,8 @@ impl Servers {
             }
             (TaskKind::Connection, _) => {
                 // Item 13.2, the abnormal path: the connection task died
-                // with its receiver; latch `Internal` and stop the group.
+                // with its receiver; latch `Internal`, end the connection
+                // for its leases, and stop the group.
                 let connection = match &instance.entry {
                     Entry::Live { connection, .. } | Entry::Lost { connection } => {
                         Some(Arc::clone(connection))
@@ -832,6 +878,9 @@ impl Servers {
                 }
                 if let Some(connection) = connection {
                     connection.fail(ConnectionFailure::Internal);
+                    // The fan-out the dead task would have run: lanes,
+                    // waiters and every lease's driver, at once.
+                    connection.abnormal();
                     instance.entry = Entry::Lost { connection };
                     if instance.work.is_none() {
                         instance.work = Some(Work::Stop);
@@ -857,7 +906,7 @@ impl Servers {
     fn publish(
         registry: &mut Registry,
         (server, instance): (&ServerId, &mut Instance),
-        launched: Result<(ConnectionTask, ServerFacts), LaunchFailure>,
+        launched: Result<(ConnectionTask, ServerFacts), LaunchError>,
         (set, kinds): (
             &mut JoinSet<Outcome>,
             &mut HashMap<tokio::task::Id, (ServerId, TaskKind)>,
@@ -900,7 +949,7 @@ impl Servers {
                 } else {
                     LaunchFailure::Lost(LossCause::TransportLost)
                 };
-                ready.send_replace(Some(Err(failure)));
+                ready.send_replace(Some(Err(failure.into())));
                 retire_launch(instance, connection);
                 registry.unmap(&key, server);
             }
@@ -969,17 +1018,22 @@ async fn launch(servers: Arc<Servers>, server: ServerId, spec: PrivateProcessSpe
         .open_connection(spec, deadline, signals);
     let opened = tokio::select! {
         opened = open => opened,
-        () = &mut fenced => return Outcome::Launch(Err(LaunchFailure::Shutdown)),
+        () = &mut fenced => return Outcome::Launch(Err(LaunchFailure::Shutdown.into())),
     };
     let connection = match opened {
         Ok(connection) => connection,
-        Err(error) => return Outcome::Launch(Err(acquire_failure(&error))),
+        Err(error) => return Outcome::Launch(Err(acquire_failure(&error).into())),
     };
     let WireParts { sender, messages } = connection.into_parts();
     let connection = Connection::new(server.clone(), sender, servers.declines);
     servers.install(&server, &connection);
     let mut task: ConnectionTask = Box::pin(serve(Arc::clone(&connection), messages));
-    let handshake = timeout_at(deadline.instant(), handshake(&connection, deadline));
+    // The version `initialize` read, kept whatever fails after it.
+    let observed = std::sync::OnceLock::new();
+    let handshake = timeout_at(
+        deadline.instant(),
+        handshake(&connection, deadline, &observed),
+    );
     let outcome = tokio::select! {
         facts = handshake => match facts {
             Ok(Ok(facts)) => Ok(facts),
@@ -992,7 +1046,14 @@ async fn launch(servers: Arc<Servers>, server: ServerId, spec: PrivateProcessSpe
         }),
         () = &mut fenced => Err(LaunchFailure::Shutdown),
     };
-    Outcome::Launch(outcome.map(|facts| (task, facts)))
+    Outcome::Launch(
+        outcome
+            .map(|facts| (task, facts))
+            .map_err(|failure| LaunchError {
+                failure,
+                user_agent: observed.get().cloned(),
+            }),
+    )
 }
 
 /// Host's acquisition failure as a launch failure (as a private route's
@@ -1055,6 +1116,7 @@ fn acquire_failure(error: &WireError) -> LaunchFailure {
 async fn handshake(
     connection: &Connection,
     deadline: Deadline,
+    observed: &std::sync::OnceLock<String>,
 ) -> Result<ServerFacts, LaunchFailure> {
     let bounds = WriteBounds::StartBy {
         start_by: deadline,
@@ -1070,9 +1132,10 @@ async fn handshake(
     let user_agent = result::<InitializeResult>(&outcome(reply)?)
         .map_err(|error| LaunchFailure::Protocol(error.detail()))?
         .user_agent;
+    let _first = observed.set(user_agent.clone());
     let line = initialized().map_err(|_| LaunchFailure::Protocol("initialized not encoded"))?;
     let write = connection.notify(line, bounds).map_err(request_failure)?;
-    written(&write.await)?;
+    written(write.await.ok())?;
     let mut models = Vec::new();
     let mut cursor: Option<String> = None;
     let mut bytes = 0_usize;
@@ -1109,9 +1172,9 @@ async fn call(
     bounds: WriteBounds,
 ) -> Result<Response, LaunchFailure> {
     let requested = connection
-        .request(encode, bounds, None)
+        .request(encode, bounds, Purpose::Plain, None)
         .map_err(request_failure)?;
-    written(&requested.write.await)?;
+    written(requested.written.await.ok())?;
     requested
         .reply
         .await
@@ -1125,10 +1188,10 @@ fn outcome(response: Response) -> Result<Box<serde_json::value::RawValue>, Launc
         .map_err(|_| LaunchFailure::Protocol("the server refused its handshake"))
 }
 
-fn written(outcome: &Result<SendOutcome, WireError>) -> Result<(), LaunchFailure> {
+fn written(outcome: Option<SendOutcome>) -> Result<(), LaunchFailure> {
     match outcome {
-        Ok(SendOutcome::Written) => Ok(()),
-        Ok(SendOutcome::NotWritten | SendOutcome::Indeterminate) | Err(_) => {
+        Some(SendOutcome::Written) => Ok(()),
+        Some(SendOutcome::NotWritten | SendOutcome::Indeterminate) | None => {
             Err(LaunchFailure::Lost(LossCause::TransportLost))
         }
     }
@@ -1149,12 +1212,8 @@ async fn retire(connection: Arc<Connection>) -> Outcome {
     connection.retire();
     let input_by = deadline.min(Instant::now() + RETIRE_INPUT);
     // A timeout or error here is ignored: Host's close below always runs.
-    let _input = connection
-        .sender()
-        .close_input(Deadline::at(input_by))
-        .await;
+    let _input = connection.close_input(Deadline::at(input_by)).await;
     let report = connection
-        .sender()
         .close(CloseRequest {
             mode: CloseMode::Graceful,
             deadline: Deadline::at(deadline),
@@ -1166,11 +1225,45 @@ async fn retire(connection: Arc<Connection>) -> Outcome {
 /// The abnormal path's stop (item 13.2).
 async fn stop(connection: Arc<Connection>) -> Outcome {
     let report = connection
-        .sender()
         .close(CloseRequest {
             mode: CloseMode::Force,
             deadline: Deadline::at(Instant::now() + SERVER_STOP),
         })
         .await;
     Outcome::Stopped(report.vendor_exit)
+}
+
+#[cfg(test)]
+mod handle_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::sync::Notify;
+    use tokio::time::Instant;
+    use via_wire::Deadline;
+
+    use super::Handle;
+
+    /// Finding 7 (x.3.2 X3 fix r1; X0 item 2.7): a join cancelled while
+    /// the supervisor runs leaves its handle owned, so a later join still
+    /// waits for the running supervisor rather than reporting none.
+    #[tokio::test]
+    async fn a_cancelled_join_keeps_the_handle() {
+        let release = Arc::new(Notify::new());
+        let handle = Handle::default();
+        let task = Arc::clone(&release);
+        handle.spawn_once(|| tokio::spawn(async move { task.notified().await }));
+
+        let far = Deadline::at(Instant::now() + Duration::from_secs(60));
+        let cancelled = tokio::time::timeout(Duration::from_millis(20), handle.join(far)).await;
+        assert!(cancelled.is_err(), "the supervisor still runs");
+
+        let soon = Deadline::at(Instant::now() + Duration::from_millis(20));
+        assert!(!handle.join(soon).await, "a running supervisor is unjoined");
+
+        release.notify_one();
+        let far = Deadline::at(Instant::now() + Duration::from_secs(5));
+        assert!(handle.join(far).await, "the ended supervisor joins");
+        assert!(handle.handle().is_none(), "released once it ended");
+    }
 }

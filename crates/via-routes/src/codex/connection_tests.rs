@@ -1,0 +1,789 @@
+//! The shared connection over Wire's test pipes (x.3.2 X0 items 5, 8.3,
+//! 9.1, 11, 12, 13.2): the routing peek, the thread table and its budget,
+//! the feeder and its guard, the reply deadline and the abnormal end. The
+//! vendor's side is two in-memory pipes: the test writes its stdout and
+//! reads (or does not read) its stdin.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
+use tokio::task::JoinHandle;
+use via_wire::testing::{TestInput, pipes};
+use via_wire::{
+    CloseRequest, CommitOutcome, DataHold, Deadline, OutboundMessage, PendingWrite, SendOutcome,
+    ServerId, SessionId, TurnNumber, WireCleanup, WireCloseReport, WireError, WriteBounds,
+    WriteState, WriteTicket,
+};
+
+use super::connection::serve;
+use super::stdio::{Boxed, Stdio};
+use super::*;
+
+/// The decline table the tests answer with.
+const DECLINES: DeclineTable = DeclineTable::new(&[(
+    "item/commandExecution/requestApproval",
+    r#"{"decision":"decline"}"#,
+)]);
+
+/// A private scratch folder, removed on drop.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new() -> Self {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "via-codex-connection-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Wire's test input as the connection's seam; Host's stop is answered
+/// at once, and the server folder's evidence is kept in memory.
+struct TestStdio {
+    input: TestInput,
+    kept: Mutex<Vec<Vec<u8>>>,
+}
+
+impl Stdio for TestStdio {
+    fn write(&self, message: OutboundMessage, bounds: WriteBounds) -> PendingWrite {
+        self.input.write_bounded(message, bounds)
+    }
+
+    fn withdraw(&self, ticket: WriteTicket) -> WriteState {
+        self.input.withdraw(ticket)
+    }
+
+    fn hold_data(&self) -> DataHold {
+        self.input.hold_data()
+    }
+
+    fn seal(&self) {
+        self.input.seal();
+    }
+
+    fn close(&self, _request: CloseRequest) -> Boxed<'_, WireCloseReport> {
+        Box::pin(async {
+            WireCloseReport {
+                cleanup: WireCleanup::Quiescent,
+                vendor_exit: None,
+                forced: false,
+                journal_uncertain: false,
+                stopped_live: Some(true),
+            }
+        })
+    }
+
+    fn close_input(&self, deadline: Deadline) -> Boxed<'_, Result<(), WireError>> {
+        Box::pin(self.input.close_input(deadline))
+    }
+
+    fn keep_undecoded<'a>(&'a self, bytes: &'a [u8], _what: &'a str) -> Boxed<'a, ()> {
+        self.kept.lock().unwrap().push(bytes.to_vec());
+        Box::pin(async {})
+    }
+
+    fn link_turn<'a>(
+        &'a self,
+        _session: &'a SessionId,
+        _turn: TurnNumber,
+        _deadline: Deadline,
+    ) -> Boxed<'a, CommitOutcome<()>> {
+        Box::pin(async { CommitOutcome::Committed(()) })
+    }
+}
+
+/// One connection and the vendor's ends of its pipes.
+struct Vendor {
+    connection: Arc<Connection>,
+    stdio: Arc<TestStdio>,
+    stdout: DuplexStream,
+    stdin: BufReader<DuplexStream>,
+    task: JoinHandle<ConnectionEnd>,
+    _scratch: Scratch,
+}
+
+impl Vendor {
+    /// A connection whose stdin pipe buffers `stdin_buffer` bytes.
+    fn open(stdin_buffer: usize) -> Self {
+        let (stdout, vendor_out) = tokio::io::duplex(1 << 20);
+        let (vendor_in, stdin) = tokio::io::duplex(stdin_buffer);
+        let scratch = Scratch::new();
+        let pipes = pipes(vendor_out, vendor_in, scratch.path().to_path_buf());
+        let wire = Arc::new(TestStdio {
+            input: pipes.input,
+            kept: Mutex::new(Vec::new()),
+        });
+        let connection = Connection::over(
+            ServerId::mint().unwrap(),
+            Arc::clone(&wire) as Arc<dyn Stdio>,
+            DECLINES,
+        );
+        let task = tokio::spawn(serve(Arc::clone(&connection), pipes.messages));
+        Self {
+            connection,
+            stdio: wire,
+            stdout,
+            stdin: BufReader::new(stdin),
+            task,
+            _scratch: scratch,
+        }
+    }
+
+    /// Writes one vendor line.
+    async fn emit(&mut self, line: &Value) {
+        let mut bytes = serde_json::to_vec(line).unwrap();
+        bytes.push(b'\n');
+        self.stdout.write_all(&bytes).await.unwrap();
+    }
+
+    /// Writes raw vendor bytes.
+    async fn emit_raw(&mut self, bytes: &[u8]) {
+        self.stdout.write_all(bytes).await.unwrap();
+    }
+
+    /// The next line VIA wrote, within 2 s.
+    async fn read(&mut self) -> Value {
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(2), self.stdin.read_line(&mut line))
+            .await
+            .expect("a line within 2 s")
+            .unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    /// Whether VIA wrote nothing more within `wait`.
+    async fn silent(&mut self, wait: Duration) -> bool {
+        let mut line = String::new();
+        tokio::time::timeout(wait, self.stdin.read_line(&mut line))
+            .await
+            .is_err()
+    }
+
+    /// Waits until the connection task has routed what was written.
+    async fn settle(&self) {
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn far() -> Deadline {
+    Deadline::at(tokio::time::Instant::now() + Duration::from_secs(600))
+}
+
+/// `future`'s output, which must come at once: the far write bounds
+/// would otherwise answer a write the guard failed to withdraw.
+async fn promptly<F: std::future::Future>(future: F) -> F::Output {
+    tokio::time::timeout(Duration::from_secs(5), future)
+        .await
+        .expect("answered without waiting for a write bound")
+}
+
+fn start_by() -> WriteBounds {
+    WriteBounds::StartBy {
+        start_by: far(),
+        finish_by: far(),
+    }
+}
+
+fn turn(number: u32) -> TurnNumber {
+    TurnNumber::try_from(number).unwrap()
+}
+
+fn settings() -> ThreadSettings<'static> {
+    ThreadSettings {
+        model: "gpt-6-sol",
+        cwd: Path::new("/work/project"),
+        developer_instructions: None,
+        sandbox: SandboxMode::DangerFullAccess,
+    }
+}
+
+/// Queues a `thread/start` opening `lane`.
+fn open_thread(connection: &Connection, lane: &LaneLease) -> Requested {
+    connection
+        .request(
+            |id| thread_start(id, &settings()).map(data),
+            start_by(),
+            Purpose::Opens(lane),
+            None,
+        )
+        .unwrap()
+}
+
+/// A `turn/start` on `thread` with `prompt`.
+fn turn_start_line(id: ClientId, thread: &str, prompt: &str) -> OutboundMessage {
+    let start = TurnStart {
+        thread_id: thread,
+        cwd: Path::new("/work/project"),
+        model: "gpt-6-sol",
+        effort: None,
+        output_schema: None,
+        sandbox_policy: &SandboxPolicy::DangerFullAccess,
+    };
+    turn_start(id, &start, prompt.to_owned()).unwrap()
+}
+
+fn thread_reply(id: i64, thread: &str) -> Value {
+    json!({"id": id, "result": {"thread": {"id": thread}, "model": "gpt-6-sol",
+        "cwd": "/work/project", "approvalPolicy": "never", "approvalsReviewer": "user",
+        "sandbox": {"type": "dangerFullAccess"}}})
+}
+
+fn start_reply(id: i64, turn: &str) -> Value {
+    json!({"id": id, "result": {"turn": {"id": turn, "status": "inProgress"}}})
+}
+
+fn item_completed(thread: &str, turn: &str, item: &str) -> Value {
+    json!({"method": "item/completed", "params": {"threadId": thread, "turnId": turn,
+        "item": {"type": "agentMessage", "id": item, "text": "hi", "phase": "final_answer"}}})
+}
+
+/// Opens a lane and registers it for `thread` through a paired open.
+async fn registered(vendor: &mut Vendor, thread: &str) -> LaneLease {
+    let lane = vendor.connection.open_lane(None);
+    let requested = open_thread(&vendor.connection, &lane);
+    let sent = vendor.read().await;
+    assert_eq!(sent["method"], "thread/start");
+    vendor.emit(&thread_reply(requested.id.get(), thread)).await;
+    requested.reply.await.unwrap();
+    assert_eq!(lane.thread().as_deref(), Some(thread));
+    lane
+}
+
+/// The routed items of `lane` now, as their raw lines.
+fn taken(lane: &Lane) -> Vec<Value> {
+    let mut items = Vec::new();
+    while let Some(LaneEvent::Item(item)) = lane.try_next() {
+        items.push(serde_json::from_slice(item.routed().staged.bytes()).unwrap());
+    }
+    items
+}
+
+/// Item 12.2: dropping a turn's guard with one of its writes handed to
+/// Wire but unstarted behind a blocked control, and another still queued
+/// in the feeder, writes neither; stdin stays open and the next write goes
+/// out. Their records go: no reply is waited for.
+#[tokio::test]
+async fn turn_writes_guard_withdraws_on_drop() {
+    let mut vendor = Vendor::open(64);
+    let blocking = vec![b'x'; 16 * 1024];
+    let mut big = br#"{"method":"note","params":{"pad":""#.to_vec();
+    big.extend(&blocking);
+    big.extend(br#""}}"#);
+    big.push(b'\n');
+    let control = vendor.connection.notify(big, start_by()).unwrap();
+    vendor.settle().await;
+    let mut writes = TurnWrites::new(&vendor.connection);
+    let first = vendor
+        .connection
+        .request(
+            |id| Ok(turn_start_line(id, "t", "first")),
+            start_by(),
+            Purpose::Plain,
+            Some(&mut writes),
+        )
+        .unwrap();
+    let second = vendor
+        .connection
+        .request(
+            |id| Ok(turn_start_line(id, "t", "second")),
+            start_by(),
+            Purpose::Plain,
+            Some(&mut writes),
+        )
+        .unwrap();
+    vendor.settle().await;
+    drop(writes);
+    assert_eq!(
+        promptly(first.written).await.unwrap(),
+        SendOutcome::NotWritten
+    );
+    assert_eq!(
+        promptly(second.written).await.unwrap(),
+        SendOutcome::NotWritten
+    );
+    assert!(first.reply.await.is_err(), "the record went");
+    assert!(second.reply.await.is_err(), "the record went");
+    assert_eq!(vendor.read().await["method"], "note");
+    assert_eq!(control.await.unwrap(), SendOutcome::Written);
+    let next = vendor
+        .connection
+        .request(
+            |id| Ok(turn_start_line(id, "t", "next")),
+            start_by(),
+            Purpose::Plain,
+            None,
+        )
+        .unwrap();
+    let line = vendor.read().await;
+    assert_eq!(line["params"]["input"][0]["text"], "next");
+    assert_eq!(next.written.await.unwrap(), SendOutcome::Written);
+}
+
+/// Item 12.2: the guard withdraws on unwinding as on a drop.
+#[tokio::test]
+async fn turn_writes_guard_withdraws_on_panic() {
+    let mut vendor = Vendor::open(64);
+    let mut big = br#"{"method":"note","params":{"pad":""#.to_vec();
+    big.extend(vec![b'x'; 16 * 1024]);
+    big.extend(b"\"}}\n");
+    let _control = vendor.connection.notify(big, start_by()).unwrap();
+    vendor.settle().await;
+    let mut writes = TurnWrites::new(&vendor.connection);
+    let start = vendor
+        .connection
+        .request(
+            |id| Ok(turn_start_line(id, "t", "unwound")),
+            start_by(),
+            Purpose::Plain,
+            Some(&mut writes),
+        )
+        .unwrap();
+    let unwound = tokio::spawn(async move {
+        let _writes = writes;
+        std::panic::panic_any("the turn unwinds");
+    })
+    .await;
+    assert!(unwound.is_err());
+    assert_eq!(
+        promptly(start.written).await.unwrap(),
+        SendOutcome::NotWritten
+    );
+    assert_eq!(vendor.read().await["method"], "note");
+    assert!(vendor.silent(Duration::from_millis(200)).await);
+}
+
+/// Item 12.3 (ruling 20): the feeder is Wire's only producer, so two
+/// thread opens queued at once are both written, in order, never refused
+/// for Wire's one data slot.
+#[tokio::test]
+async fn feeder_serializes_data_writes() {
+    let mut vendor = Vendor::open(1 << 16);
+    let a = vendor.connection.open_lane(None);
+    let b = vendor.connection.open_lane(None);
+    let first = open_thread(&vendor.connection, &a);
+    let second = open_thread(&vendor.connection, &b);
+    assert_eq!(vendor.read().await["id"], first.id.get());
+    assert_eq!(vendor.read().await["id"], second.id.get());
+    assert_eq!(first.written.await.unwrap(), SendOutcome::Written);
+    assert_eq!(second.written.await.unwrap(), SendOutcome::Written);
+}
+
+/// Item 12.3: a reply decoded while data is queued goes first.
+#[tokio::test]
+async fn reply_goes_before_queued_data() {
+    let mut vendor = Vendor::open(64);
+    let mut big = br#"{"method":"note","params":{"pad":""#.to_vec();
+    big.extend(vec![b'x'; 16 * 1024]);
+    big.extend(b"\"}}\n");
+    let _control = vendor.connection.notify(big, start_by()).unwrap();
+    vendor.settle().await;
+    let start = vendor
+        .connection
+        .request(
+            |id| Ok(turn_start_line(id, "t", "data")),
+            start_by(),
+            Purpose::Plain,
+            None,
+        )
+        .unwrap();
+    vendor
+        .emit(
+            &json!({"id": "srv-1", "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "t", "turnId": "u", "itemId": "i"}}),
+        )
+        .await;
+    vendor.settle().await;
+    assert_eq!(vendor.read().await["method"], "note");
+    let reply = vendor.read().await;
+    assert_eq!(reply["id"], "srv-1");
+    assert_eq!(reply["result"]["decision"], "decline");
+    assert_eq!(vendor.read().await["method"], "turn/start");
+    assert_eq!(start.written.await.unwrap(), SendOutcome::Written);
+}
+
+/// Ruling 5: a reply started but not written whole by its 5 s deadline
+/// (the server stopped reading mid-line) fails the connection `overflow`
+/// at the deadline: Wire's first-byte bound alone never would.
+#[tokio::test(start_paused = true)]
+async fn reply_deadline_bounds_a_started_reply() {
+    let mut vendor = Vendor::open(16);
+    vendor
+        .emit(
+            &json!({"id": "srv-1", "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "t", "turnId": "u", "itemId": "i"}}),
+        )
+        .await;
+    let started = tokio::time::Instant::now();
+    let end = tokio::time::timeout(Duration::from_secs(30), &mut vendor.task)
+        .await
+        .expect("the connection fails by its deadline")
+        .unwrap();
+    assert!(started.elapsed() >= DECLINE_DEADLINE);
+    assert_eq!(
+        vendor.connection.failure(),
+        Some(ConnectionFailure::Overflow)
+    );
+    assert!(matches!(end, ConnectionEnd::Failed(loss) if loss.cause == LossCause::Overflow));
+}
+
+/// Item 13.2 (blocker 2): the abnormal end, run outside the dead task,
+/// ends every lane with no boundary after what it holds, closes every
+/// reply waiter, refuses new requests, and signals every lease at once
+/// with the first sequence its lanes did not get.
+#[tokio::test]
+async fn abnormal_end_reaches_every_lease() {
+    let mut vendor = Vendor::open(1 << 16);
+    let signalled = Arc::new(Mutex::new(Vec::new()));
+    let signal = {
+        let signalled = Arc::clone(&signalled);
+        Arc::new(LeaseSignal::new(move |end| {
+            signalled.lock().unwrap().push(end);
+        }))
+    };
+    let idle = Arc::new(Mutex::new(Vec::new()));
+    let idle_signal = {
+        let idle = Arc::clone(&idle);
+        Arc::new(LeaseSignal::new(move |end| idle.lock().unwrap().push(end)))
+    };
+    let _subscribed = vendor.connection.subscribe(Arc::clone(&signal));
+    let _idle = vendor.connection.subscribe(Arc::clone(&idle_signal));
+    let lane = vendor.connection.open_lane(Some(&signal));
+    let requested = open_thread(&vendor.connection, &lane);
+    vendor.read().await;
+    vendor.emit(&thread_reply(requested.id.get(), "t")).await;
+    requested.reply.await.unwrap();
+    vendor.emit(&item_completed("t", "u", "m1")).await;
+    vendor.settle().await;
+    let waiting = vendor
+        .connection
+        .request(
+            |id| thread_unsubscribe(id, "t").map(OutboundMessage::Control),
+            start_by(),
+            Purpose::Plain,
+            None,
+        )
+        .unwrap();
+    vendor.task.abort();
+    let _ = (&mut vendor.task).await;
+    vendor.connection.fail(ConnectionFailure::Internal);
+    vendor.connection.abnormal();
+    assert!(waiting.reply.await.is_err(), "the waiter sees the end");
+    assert_eq!(taken(lane.lane()).len(), 1, "the prefix stays");
+    assert!(matches!(
+        lane.lane().try_next(),
+        Some(LaneEvent::End(LaneEnd::Abnormal))
+    ));
+    let enqueued = signal.enqueued();
+    assert!(enqueued > 0);
+    assert_eq!(
+        *signalled.lock().unwrap(),
+        vec![AbnormalEnd {
+            first_unqueued: enqueued + 1
+        }]
+    );
+    assert_eq!(
+        *idle.lock().unwrap(),
+        vec![AbnormalEnd { first_unqueued: 1 }]
+    );
+    assert!(matches!(
+        vendor.connection.ended(),
+        Some(ConnectionEnd::Failed(loss))
+            if loss.cause == LossCause::TransportLost && loss.cleanup == WireCleanup::Uncertain
+    ));
+    assert!(matches!(
+        vendor.connection.request(
+            |id| thread_unsubscribe(id, "t").map(OutboundMessage::Control),
+            start_by(),
+            Purpose::Plain,
+            None,
+        ),
+        Err(RequestError::Closed)
+    ));
+    vendor.connection.abnormal();
+    assert_eq!(signalled.lock().unwrap().len(), 1, "idempotent");
+}
+
+/// Item 5 step 2 (finding 9): a known notification whose required turn
+/// correlation is missing is unattributable, even with a registered
+/// thread: the connection fails `protocol` and keeps the line as the
+/// server folder's evidence; no lane receives it.
+#[tokio::test]
+async fn correlation_failure_is_protocol_not_generation_local() {
+    let mut vendor = Vendor::open(1 << 16);
+    let lane = registered(&mut vendor, "t").await;
+    let untied = json!({"method": "item/completed", "params": {"threadId": "t",
+        "item": {"type": "agentMessage", "id": "m", "text": "x"}}});
+    vendor.emit(&untied).await;
+    let end = tokio::time::timeout(Duration::from_secs(10), &mut vendor.task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(end, ConnectionEnd::Failed(loss) if loss.cause == LossCause::Protocol));
+    assert!(taken(lane.lane()).is_empty());
+    let kept = vendor.stdio.kept.lock().unwrap().clone();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(serde_json::from_slice::<Value>(&kept[0]).unwrap(), untied);
+}
+
+/// Item 5 step 3: a well-formed message for an unknown thread and an
+/// untagged one fail nothing; they are counted.
+#[tokio::test]
+async fn unknown_thread_and_untagged_fail_nothing() {
+    let mut vendor = Vendor::open(1 << 16);
+    vendor.emit(&item_completed("nobody", "u", "m")).await;
+    vendor
+        .emit(&json!({"method": "account/updated", "params": {"authMode": "x"}}))
+        .await;
+    vendor.settle().await;
+    let counts = vendor.connection.counts();
+    assert_eq!((counts.unknown_thread, counts.untagged), (1, 1));
+    assert_eq!(vendor.connection.failure(), None);
+}
+
+/// Item 5 step 4 (finding 9): a message for a closed registration is
+/// dropped and counted before any full decode, so even one past the
+/// structure limits fails nothing.
+#[tokio::test]
+async fn closed_generation_dropped_before_decode() {
+    let mut vendor = Vendor::open(1 << 16);
+    let lane = registered(&mut vendor, "t").await;
+    drop(lane);
+    let deep = format!(
+        r#"{{"method":"item/completed","params":{{"threadId":"t","turnId":"u","item":{}{}}}}}"#,
+        "[".repeat(100),
+        "]".repeat(100)
+    );
+    vendor.emit_raw(format!("{deep}\n").as_bytes()).await;
+    vendor.settle().await;
+    assert_eq!(vendor.connection.counts().late_after_close, 1);
+    assert_eq!(vendor.connection.failure(), None);
+}
+
+/// Item 8.1 (finding 9): closed threads are kept until the connection
+/// retires, not evicted after 256: the first of 300 closed threads is
+/// still late, never unknown.
+#[tokio::test]
+async fn closed_threads_kept_until_retirement() {
+    let mut vendor = Vendor::open(1 << 20);
+    for index in 0..300 {
+        let thread = format!("t{index}");
+        let lane = registered(&mut vendor, &thread).await;
+        drop(lane);
+    }
+    vendor.emit(&item_completed("t0", "u", "m")).await;
+    vendor.settle().await;
+    let counts = vendor.connection.counts();
+    assert_eq!((counts.late_after_close, counts.unknown_thread), (1, 0));
+}
+
+/// Finding 8: a thread open whose waiter left before its reply registers
+/// nothing; the thread is kept as closed, so its traffic is late and a
+/// later open of the same thread on this connection succeeds.
+#[tokio::test]
+async fn abandoned_open_registers_nothing() {
+    let mut vendor = Vendor::open(1 << 16);
+    let lane = vendor.connection.open_lane(None);
+    let requested = open_thread(&vendor.connection, &lane);
+    vendor.read().await;
+    let id = requested.id.get();
+    drop(requested);
+    vendor.emit(&thread_reply(id, "t")).await;
+    vendor.settle().await;
+    assert_eq!(lane.thread(), None);
+    vendor.emit(&item_completed("t", "u", "m")).await;
+    vendor.settle().await;
+    assert_eq!(vendor.connection.counts().late_after_close, 1);
+    assert!(taken(lane.lane()).is_empty());
+    let again = registered(&mut vendor, "t").await;
+    assert_eq!(again.thread().as_deref(), Some("t"));
+}
+
+/// Finding 8: dropping a registered lane (a failed open, a quarantine, a
+/// close) unregisters its thread at once.
+#[tokio::test]
+async fn closed_lane_unregisters() {
+    let mut vendor = Vendor::open(1 << 16);
+    let lane = registered(&mut vendor, "t").await;
+    drop(lane);
+    let again = registered(&mut vendor, "t").await;
+    vendor.emit(&item_completed("t", "u", "m")).await;
+    vendor.settle().await;
+    assert_eq!(taken(again.lane()).len(), 1);
+}
+
+/// Item 9.1: records, mappings and closed threads share one budget of
+/// 1,024 entries; past it the connection fails `overflow` (a retirement
+/// on exhaustion, not an admission refusal).
+#[tokio::test]
+async fn correlation_budget_exhaustion_fails_overflow() {
+    let vendor = Vendor::open(1 << 20);
+    let mut kept = Vec::new();
+    let mut refused = None;
+    for _ in 0..=CORRELATION_ENTRIES {
+        match vendor.connection.request(
+            |id| thread_unsubscribe(id, "t").map(OutboundMessage::Control),
+            start_by(),
+            Purpose::Plain,
+            None,
+        ) {
+            Ok(requested) => kept.push(requested),
+            Err(error) => {
+                refused = Some(error);
+                break;
+            }
+        }
+    }
+    assert_eq!(kept.len(), CORRELATION_ENTRIES);
+    assert_eq!(refused, Some(RequestError::Exhausted));
+    assert_eq!(
+        vendor.connection.failure(),
+        Some(ConnectionFailure::Overflow)
+    );
+}
+
+/// Items 11, 12.5 (finding 12): routed messages and decline placeholders
+/// keep their staging permits until consumed: Wire's aggregate counts
+/// what the lanes hold, the placeholder charged the request's own bytes.
+#[tokio::test]
+async fn staging_aggregate_includes_ingress() {
+    let mut vendor = Vendor::open(1 << 16);
+    let lane = registered(&mut vendor, "t").await;
+    vendor.settle().await;
+    let before = vendor.stdio.input.queued_bytes();
+    let note = item_completed("t", "u", "m");
+    let request = json!({"id": "srv-9", "method": "item/commandExecution/requestApproval",
+        "params": {"threadId": "t", "turnId": "u", "itemId": "i", "pad": "x".repeat(2000)}});
+    vendor.emit(&note).await;
+    vendor.emit(&request).await;
+    vendor.settle().await;
+    vendor.read().await;
+    let held = vendor.stdio.input.queued_bytes() - before;
+    let lines =
+        serde_json::to_vec(&note).unwrap().len() + serde_json::to_vec(&request).unwrap().len() + 2;
+    assert_eq!(held, lines);
+    assert_eq!(taken(lane.lane()).len(), 2);
+    assert_eq!(vendor.stdio.input.queued_bytes(), before);
+}
+
+/// Item 8.3: an interrupt posted before `turn/start`'s reply waits on its
+/// record and is written once the reply names the turn.
+#[tokio::test]
+async fn interrupt_waits_for_delayed_acceptance() {
+    let mut vendor = Vendor::open(1 << 16);
+    let lane = registered(&mut vendor, "t").await;
+    let start = vendor
+        .connection
+        .request(
+            |id| Ok(turn_start_line(id, "t", "go")),
+            start_by(),
+            Purpose::Starts {
+                lane: &lane,
+                turn: turn(1),
+            },
+            None,
+        )
+        .unwrap();
+    assert_eq!(vendor.read().await["method"], "turn/start");
+    assert!(vendor.connection.interrupt(&lane, start.id, None, far()));
+    assert!(vendor.silent(Duration::from_millis(100)).await);
+    vendor.emit(&start_reply(start.id.get(), "u1")).await;
+    let interrupt = vendor.read().await;
+    assert_eq!(interrupt["method"], "turn/interrupt");
+    assert_eq!(
+        interrupt["params"],
+        json!({"threadId": "t", "turnId": "u1"})
+    );
+    assert!(
+        !vendor
+            .connection
+            .interrupt(&lane, start.id, Some("u1"), far()),
+        "once per lane"
+    );
+}
+
+/// Item 8.3: an interrupt waiting on a `turn/start` the guard withdrew
+/// is dropped: nothing was started, so nothing is interrupted.
+#[tokio::test]
+async fn interrupt_dropped_when_start_withdrawn() {
+    let mut vendor = Vendor::open(64);
+    let lane = registered(&mut vendor, "t").await;
+    let mut big = br#"{"method":"note","params":{"pad":""#.to_vec();
+    big.extend(vec![b'x'; 16 * 1024]);
+    big.extend(b"\"}}\n");
+    let _control = vendor.connection.notify(big, start_by()).unwrap();
+    vendor.settle().await;
+    let mut writes = TurnWrites::new(&vendor.connection);
+    let start = vendor
+        .connection
+        .request(
+            |id| Ok(turn_start_line(id, "t", "go")),
+            start_by(),
+            Purpose::Starts {
+                lane: &lane,
+                turn: turn(1),
+            },
+            Some(&mut writes),
+        )
+        .unwrap();
+    vendor.settle().await;
+    assert!(vendor.connection.interrupt(&lane, start.id, None, far()));
+    drop(writes);
+    assert_eq!(vendor.read().await["method"], "note");
+    assert!(vendor.silent(Duration::from_millis(200)).await);
+}
+
+/// Item 8.3: an interrupt intent is the connection's: posted while the
+/// turn's start is written behind a large data write, it is written after
+/// the turn settled (its guard and lane gone).
+#[tokio::test]
+async fn quarantine_interrupt_survives_settlement() {
+    let mut vendor = Vendor::open(64);
+    let lane = registered(&mut vendor, "t").await;
+    let mut writes = TurnWrites::new(&vendor.connection);
+    let start = vendor
+        .connection
+        .request(
+            |id| Ok(turn_start_line(id, "t", &"y".repeat(64 * 1024))),
+            start_by(),
+            Purpose::Starts {
+                lane: &lane,
+                turn: turn(1),
+            },
+            Some(&mut writes),
+        )
+        .unwrap();
+    vendor.settle().await;
+    assert!(
+        vendor
+            .connection
+            .interrupt(&lane, start.id, Some("u1"), far())
+    );
+    drop(writes);
+    drop(lane);
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        seen.push(vendor.read().await["method"].as_str().unwrap().to_owned());
+    }
+    assert_eq!(seen, ["turn/start", "turn/interrupt"]);
+}

@@ -1,56 +1,65 @@
 //! Codex's driver turn (C2 §2, §4, §4.1; vendors/codex.md §2–§5; x.3.2
-//! X0 items 1, 2, 8, 11, 12): one VIA turn on a shared `codex app-server`.
+//! X0 items 1, 2, 5, 8, 10–13): one VIA turn on a shared `codex
+//! app-server`.
 //!
 //! The session leases a server from its first join until its close (AD16):
 //! `prepare` pins the session's live server, or a live one of an equal key;
 //! otherwise the turn launches one, or joins one launching. On each
-//! connection generation the session opens its thread once, by
-//! `thread/start` or, when an identity was confirmed, by `thread/resume` of
-//! that exact thread; the reply's policy echoes are checked. Every turn is a
-//! `turn/start` with the full frozen policy, accepted on its paired reply;
-//! the thread's ingress lane is then normalized in decode order until the
-//! turn's own `turn/completed`. A close detaches with `thread/unsubscribe`
-//! and releases the lease; the last lease's release retires the server.
+//! connection generation the session subscribes to the connection task's
+//! abnormal end and opens its thread once, by `thread/start` or, when an
+//! identity was confirmed, by `thread/resume` of that exact thread; the
+//! reply's echoes are checked. Every turn is a `turn/start` with the full
+//! frozen policy, written under the turn's owning write guard and accepted
+//! on its paired reply; the turn's normalizer then delivers the thread's
+//! lane in decode order (`delivery`) while the turn waits for its
+//! terminal beside its own orders, sealing delivery at whichever comes
+//! first. A close detaches with `thread/unsubscribe` and releases the
+//! lease; the last lease's release retires the server.
 //!
-//! Interrupt, the P7 window and steer are x.3.2 X4's: here a stop order
-//! after acceptance writes one `turn/interrupt` and the turn ends at the
-//! order's `close_by` (`uncertain`) unless the vendor's terminal comes
+//! A stop order posts the turn's one interrupt intent, owned by the
+//! connection (before acceptance it waits on the start's reply). Its
+//! acknowledgement, the P7 window and steer are x.3.2 X4's: the turn ends
+//! at the order's `close_by` (`uncertain`) unless its terminal comes
 //! first.
 
 use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tokio::time::Instant;
 use via_routes::codex::{
-    CommitOutcome, Connection, ConnectionLoss, DECLINE_DEADLINE, FINISH_BY, Lane, LaneEnd,
-    LaneEvent, LaneItem, LossCause, Notification, PendingWrite, RequestError, Response, RpcError,
-    SandboxMode, ServerFacts, ServerKey, ServerPin, ThreadResult, ThreadSettings, TurnFolder,
-    TurnStart, TurnStartResult, WriteBounds, data, result, thread_resume, thread_start,
-    thread_unsubscribe, turn_interrupt, turn_start,
+    AbnormalEnd, ClientId, CommitOutcome, Connection, ConnectionEnd, ConnectionLoss, FINISH_BY,
+    LOSS_EVIDENCE, LaneEnd, LaneLease, LaunchError, LeaseSignal, LossCause, Purpose, RequestError,
+    Response, RpcError, SandboxMode, ServerKey, ServerPin, Subscription, ThreadResult,
+    ThreadSettings, TurnFolder, TurnStart, TurnStartResult, TurnWrites, WriteBounds,
+    crash_on_panic, data, result, thread_resume, thread_start, turn_start,
 };
-use via_routes::{OutboundMessage, SendOutcome, StoreFailure, WireCleanup};
+use via_routes::{Retirement, SendOutcome, StoreFailure, WireCleanup};
 
-use super::normalize::{self, DiscoveredModel, Step, StructuredOutput, TurnNormalizer};
+use super::delivery::{
+    Delivery, Evidence, Losses, Normalizing, Retained, Stop, UNKNOWN, losses as lock_losses,
+};
+use super::normalize::{self, DiscoveredModel, StructuredOutput, TurnNormalizer};
 use super::plan::{self as codex_plan, Sandbox};
 use super::{ADAPTER_VERSION, CodexAdapter, HARNESS, PerTurn, refusals};
 use crate::driver::turn::{CLEANUP_ALLOWANCE, end_active};
 use crate::driver::{
     Active, ConnectionPin, DriverState, ForceWatch, Prepared, Retiring, SessionDriver, TurnCx,
-    TurnSpec, lock, rejected,
+    TurnSpec, latch, lock, rejected,
 };
 use crate::harness::Harness;
 use crate::instance::Incompatibility;
 use crate::observation::{
     Acceptance, AdapterError, Identity, InstanceReport, Observation, ObservationItem, TurnEnd,
-    TurnEvidence, VendorTerminal,
+    TurnEvidence,
 };
 use crate::plan::{Bound, Inherit, RefusalKind};
 use crate::runtime::event_stall;
 use crate::{
-    AcceptanceToken, Cleanup, Deadline, DriverFailure, ProcessOwner, RouteError, RouteFailure,
-    StartRejected, StopOrder, StopWatch, TurnNumber, VendorTurnId,
+    AcceptanceToken, Cleanup, Deadline, DriverFailure, DriverHealth, ProcessOwner, RouteError,
+    RouteFailure, StartRejected, StopOrder, StopWatch, TurnNumber, VendorTurnId,
 };
 
 /// How long the link of a turn to its server may take (X0 item 1.5).
@@ -72,23 +81,40 @@ pub(crate) struct CodexSession {
     /// The bound the session's last turn applied (C1 P5): a later turn
     /// that names none inherits it.
     bound: Mutex<Option<Bound>>,
+    /// The driver's loss record (X0 item 10), which each generation's
+    /// abnormal-end handler writes too.
+    losses: Arc<Mutex<Losses>>,
 }
 
-/// The session's connection generation.
+/// The session's connection generation. The fields drop in order: the
+/// thread's registration closes, then the abnormal-end subscription, and
+/// the server lease is released last.
 struct Attached {
-    /// The session's lease, held from its first join until close (AD16).
-    lease: ServerPin,
+    /// The thread this generation opened, once it did.
+    thread: Option<Arc<Thread>>,
+    /// The connection task's abnormal end reaches the driver through it.
+    _subscription: Subscription,
+    signal: Arc<LeaseSignal>,
+    /// The generation holds a registration (the handler then records the
+    /// loss).
+    registered: Arc<AtomicBool>,
     connection: Arc<Connection>,
     generation: u64,
-    /// The thread this generation opened, once it did.
-    thread: Option<Thread>,
+    /// The session's lease, held from its first join until close (AD16).
+    lease: ServerPin,
 }
 
-/// An open thread and the ingress lane its traffic is routed to.
-#[derive(Clone)]
-struct Thread {
+/// An open thread: its ID and its registration on the connection.
+pub(crate) struct Thread {
     id: String,
-    lane: Arc<Lane>,
+    lease: LaneLease,
+}
+
+/// The facts a turn takes from the generation it runs on.
+struct Generation {
+    number: u64,
+    thread: Option<Arc<Thread>>,
+    signal: Arc<LeaseSignal>,
 }
 
 impl CodexSession {
@@ -97,6 +123,7 @@ impl CodexSession {
             adapter,
             attached: Mutex::new(None),
             bound: Mutex::new(None),
+            losses: Arc::new(Mutex::new(Losses::default())),
         }
     }
 
@@ -132,80 +159,87 @@ impl CodexSession {
         self.adapter.servers().epoch()
     }
 
-    /// The close's detach (packet §2): `thread/unsubscribe` of the
-    /// session's thread, its reply awaited by `deadline`, then the lease is
-    /// released. Never a stdin close: the server is shared.
+    /// The close's detach (packet §2): the thread's unsubscribe intent
+    /// (X0 item 8.3), its reply awaited by `deadline`; then the
+    /// registration closes and the lease is released. Never a stdin
+    /// close: the server is shared.
     pub(crate) async fn detach(&self, deadline: Deadline) {
         let Some(attached) = self.attached().take() else {
             return;
         };
         if let Some(thread) = &attached.thread
             && usable(&attached.connection)
+            && let Some(reply) = attached.connection.unsubscribe(&thread.lease, deadline)
         {
-            let bounds = WriteBounds::StartBy {
-                start_by: deadline,
-                finish_by: deadline,
-            };
-            let unsubscribe = attached.connection.request(
-                |id| thread_unsubscribe(id, &thread.id).map(OutboundMessage::Control),
-                bounds,
-                None,
-            );
-            if let Ok(requested) = unsubscribe {
-                let answered = async {
-                    let _written = requested.write.await;
-                    let _reply = requested.reply.await;
-                };
-                let _answered = tokio::time::timeout_at(deadline.instant(), answered).await;
-            }
-            attached.connection.unregister(&thread.id, &thread.lane);
+            let _answered = tokio::time::timeout_at(deadline.instant(), reply).await;
         }
         drop(attached);
     }
 
-    /// The generation and thread of `connection`, attaching the session to
-    /// it as a new generation when it is not the one attached (the earlier
-    /// lease is released).
+    /// The generation of `connection`, attaching the session to it as a
+    /// new generation, subscribed to its abnormal end, when it is not the
+    /// one attached (the earlier one is released).
     fn attach(
         &self,
         pin: &ServerPin,
         connection: &Arc<Connection>,
-        state: &Mutex<DriverState>,
-    ) -> Option<(u64, Option<Thread>)> {
+        driver: &SessionDriver,
+    ) -> Option<Generation> {
         let mut attached = self.attached();
         if let Some(current) = attached.as_ref()
             && Arc::ptr_eq(&current.connection, connection)
         {
-            return Some((current.generation, current.thread.clone()));
+            return Some(Generation {
+                number: current.generation,
+                thread: current.thread.clone(),
+                signal: Arc::clone(&current.signal),
+            });
         }
         let lease = pin.duplicate()?;
         let generation = {
-            let mut state = lock(state);
+            let mut state = driver.state();
             state.generation += 1;
             state.generation
         };
+        let registered = Arc::new(AtomicBool::new(false));
+        let signal = Arc::new(LeaseSignal::new(abnormal_handler(
+            Arc::clone(&self.losses),
+            Arc::clone(&driver.health),
+            Arc::clone(&registered),
+            generation,
+        )));
+        let subscription = connection.subscribe(Arc::clone(&signal));
         let replaced = attached.replace(Attached {
-            lease,
+            thread: None,
+            _subscription: subscription,
+            signal: Arc::clone(&signal),
+            registered: Arc::clone(&registered),
             connection: Arc::clone(connection),
             generation,
-            thread: None,
+            lease,
         });
         drop(attached);
         drop(replaced);
-        Some((generation, None))
+        Some(Generation {
+            number: generation,
+            thread: None,
+            signal,
+        })
     }
 
     /// Keeps the thread this generation opened.
-    fn opened(&self, connection: &Arc<Connection>, thread: &Thread) {
+    fn opened(&self, connection: &Arc<Connection>, thread: &Arc<Thread>) {
         if let Some(attached) = self.attached().as_mut()
             && Arc::ptr_eq(&attached.connection, connection)
         {
-            attached.thread = Some(thread.clone());
+            attached.thread = Some(Arc::clone(thread));
+            attached.registered.store(true, Ordering::Release);
         }
     }
 
-    /// The generation's thread is unusable (its lane ended): the next turn
-    /// opens it again on a new connection.
+    /// The generation is unfit for the next turn: its registration closes
+    /// (its later traffic is late) and the next turn opens the thread
+    /// again as a new generation.
     fn quarantine(&self, connection: &Arc<Connection>) {
         let mut attached = self.attached();
         if attached
@@ -219,24 +253,152 @@ impl CodexSession {
     }
 }
 
+/// The abnormal-end handler of one generation (X0 item 13.2):
+/// synchronous, idempotent and never blocking. With a registration it
+/// installs or merges the loss (`omitted` unknown); either way it latches
+/// the driver's failure, so Core retires the driver.
+pub(super) fn abnormal_handler(
+    losses: Arc<Mutex<Losses>>,
+    health: Arc<watch::Sender<DriverHealth>>,
+    registered: Arc<AtomicBool>,
+    generation: u64,
+) -> impl Fn(AbnormalEnd) + Send + Sync + 'static {
+    move |end: AbnormalEnd| {
+        if registered.load(Ordering::Acquire) {
+            lock_losses(&losses).note(generation, end.first_unqueued, UNKNOWN);
+        }
+        latch(&health, DriverFailure::OwnedTask);
+    }
+}
+
 /// Whether a connection still takes requests.
 fn usable(connection: &Connection) -> bool {
     connection.failure().is_none() && connection.ended().is_none()
 }
 
-/// Ends the turn's logical lanes when the turn returns or is dropped: its
-/// close order goes, and a waiting close sees the turn settled.
+/// The turn's settlement, when its `run_turn` returns, is dropped or
+/// unwinds (B1): the turn's delivery is sealed, its cleanup facts are
+/// recorded for the session's close, sticky across turns (an uncertain
+/// cleanup stays uncertain), and only then is the retirement published
+/// `CleanedUp` and `Delivered`. Without the turn's own end (a dropped
+/// future) its cleanup is uncertain once anything was written, and the
+/// abandonment is latched.
 struct Settle<'a> {
     state: &'a Mutex<DriverState>,
+    health: &'a watch::Sender<DriverHealth>,
     turn: TurnNumber,
     done: watch::Sender<Retiring>,
+    /// A byte of the turn may have reached the vendor.
+    launched: AtomicBool,
+    /// The turn's delivery, once accepted.
+    delivery: Mutex<Option<Arc<Delivery>>>,
+    /// The turn's own cleanup facts, from its end.
+    ended: Mutex<Option<Retirement>>,
+}
+
+impl<'a> Settle<'a> {
+    fn new(driver: &'a SessionDriver, turn: TurnNumber, done: watch::Sender<Retiring>) -> Self {
+        Self {
+            state: &driver.state,
+            health: &driver.health,
+            turn,
+            done,
+            launched: AtomicBool::new(false),
+            delivery: Mutex::new(None),
+            ended: Mutex::new(None),
+        }
+    }
+
+    fn launched(&self) {
+        self.launched.store(true, Ordering::Release);
+    }
+
+    fn deliver(&self, delivery: &Arc<Delivery>) {
+        *self.delivery.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(delivery));
+    }
+
+    /// Records the cleanup facts of the turn's `end`.
+    fn record(&self, end: &TurnEnd) {
+        let evidence = match &end.outcome {
+            Ok(evidence) => evidence.clone(),
+            Err(error) => error.evidence(),
+        };
+        let launched = match &end.outcome {
+            Err(AdapterError::Route(failure)) => failure.launched,
+            Ok(_) => true,
+            Err(_) => self.launched.load(Ordering::Acquire),
+        };
+        *self.ended.lock().unwrap_or_else(PoisonError::into_inner) = Some(Retirement {
+            launched,
+            exit: None,
+            cleanup: Some(match evidence.cleanup {
+                Cleanup::Quiescent => WireCleanup::Quiescent,
+                Cleanup::Uncertain | Cleanup::Pending => WireCleanup::Uncertain,
+            }),
+            forced: false,
+            journal_uncertain: evidence.journal_uncertain,
+        });
+    }
 }
 
 impl Drop for Settle<'_> {
     fn drop(&mut self) {
+        if let Some(delivery) = self
+            .delivery
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            delivery.seal();
+        }
+        let ended = self
+            .ended
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let facts = ended.unwrap_or_else(|| {
+            latch(self.health, DriverFailure::TurnAbandoned);
+            let launched = self.launched.load(Ordering::Acquire);
+            Retirement {
+                launched,
+                exit: None,
+                cleanup: Some(if launched {
+                    WireCleanup::Uncertain
+                } else {
+                    WireCleanup::Quiescent
+                }),
+                forced: false,
+                journal_uncertain: false,
+            }
+        });
+        {
+            let mut state = lock(self.state);
+            state.retirement = Some(match state.retirement {
+                Some(earlier) => sticky(earlier, facts),
+                None => facts,
+            });
+        }
         end_active(self.state, self.turn);
         self.done.send_replace(Retiring::CleanedUp);
         self.done.send_replace(Retiring::Delivered);
+    }
+}
+
+/// The session's cleanup facts after a later turn: uncertainty a turn
+/// left on the shared server is never erased by a later turn (ruling 6).
+fn sticky(earlier: Retirement, later: Retirement) -> Retirement {
+    let open = |facts: &Retirement| facts.launched && facts.cleanup != Some(WireCleanup::Quiescent);
+    let uncertain = open(&earlier) || open(&later);
+    Retirement {
+        launched: earlier.launched || later.launched,
+        exit: None,
+        cleanup: Some(if uncertain {
+            WireCleanup::Uncertain
+        } else {
+            WireCleanup::Quiescent
+        }),
+        forced: false,
+        journal_uncertain: earlier.journal_uncertain || later.journal_uncertain,
     }
 }
 
@@ -330,9 +492,17 @@ struct Turn<'a> {
     instance: Option<InstanceReport>,
     /// The turn's first byte was handed to Wire (X0 item 1.6).
     launched: bool,
+    /// The settlement, which learns the same.
+    settle: &'a Settle<'a>,
 }
 
 impl Turn<'_> {
+    /// A byte of the turn was handed to Wire.
+    fn launch(&mut self) {
+        self.launched = true;
+        self.settle.launched();
+    }
+
     /// The turn's end with `cause`, latched in the health lane as C2 §2
     /// latches a route failure.
     /// While the server lives, the cleanup is the turn's reported tool
@@ -385,20 +555,32 @@ impl Turn<'_> {
         }
     }
 
-    /// Sends one observation of the turn; an undelivered one latches the
-    /// observation overflow.
-    async fn emit(&self, observation: Observation, vendor_turn: Option<&str>) -> Result<(), ()> {
+    /// Sends one observation of the turn before its acceptance, beside
+    /// the daemon force (X0: controls stay serviceable while delivery is
+    /// blocked); an undelivered one latches the observation overflow. A
+    /// send the force cut never reaches the sink.
+    async fn emit(&self, observation: Observation, force: &mut ForceWatch) -> Result<(), Emit> {
         let item = ObservationItem {
             at: Instant::now(),
-            vendor_turn: vendor_turn.and_then(|id| VendorTurnId::try_from(id.to_owned()).ok()),
+            vendor_turn: None,
             observation,
         };
-        self.driver
-            .observations
-            .send(item, event_stall())
-            .await
-            .map_err(|_| self.driver.fail(DriverFailure::ObservationOverflow))
+        tokio::select! {
+            biased;
+            () = forced(force) => Err(Emit::Forced),
+            sent = self.driver.observations.send(item, event_stall()) => sent.map_err(|_| {
+                self.driver.fail(DriverFailure::ObservationOverflow);
+                Emit::Undelivered
+            }),
+        }
     }
+}
+
+/// Why a pre-acceptance observation was not sent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Emit {
+    Undelivered,
+    Forced,
 }
 
 /// The failure a route cause latches in the health lane (C2 §2).
@@ -432,19 +614,41 @@ fn loss_cause(loss: &ConnectionLoss, turn: TurnNumber) -> RouteError {
     }
 }
 
-/// How an ended lane fails the turn.
-fn lane_end(end: LaneEnd, turn: TurnNumber) -> (RouteError, Option<ConnectionLoss>) {
+/// The loss of an ended connection, if it failed.
+fn connection_loss(connection: &Connection) -> Option<ConnectionLoss> {
+    match connection.ended() {
+        Some(ConnectionEnd::Failed(loss)) => Some(loss),
+        Some(_) | None => None,
+    }
+}
+
+/// How an ended lane fails the turn. The connection task's own failure
+/// (X0 item 13.2) is a transport loss with its cleanup unproven.
+fn lane_end(
+    end: LaneEnd,
+    connection: &Connection,
+    turn: TurnNumber,
+) -> (RouteError, Option<ConnectionLoss>) {
     match end {
         LaneEnd::Overflow => (RouteError::Overflow { turn }, None),
         LaneEnd::Lost(loss) => (loss_cause(&loss, turn), Some(loss)),
         LaneEnd::Retired => (RouteError::TransportLost { turn }, None),
+        LaneEnd::Abnormal => {
+            let loss = connection_loss(connection).unwrap_or(ConnectionLoss {
+                cause: LossCause::TransportLost,
+                cleanup: WireCleanup::Uncertain,
+                exit: None,
+                journal_uncertain: false,
+            });
+            (RouteError::TransportLost { turn }, Some(loss))
+        }
     }
 }
 
 /// The handshake's instance report (C2 §5 OD1): the `userAgent` version
 /// and its status.
-fn instance_report(facts: &ServerFacts) -> InstanceReport {
-    let version = normalize::instance_version(&facts.user_agent).map(str::to_owned);
+fn instance_report(user_agent: &str) -> InstanceReport {
+    let version = normalize::instance_version(user_agent).map(str::to_owned);
     InstanceReport {
         version_status: version.as_deref().map_or(
             crate::plan::VersionStatus::Untested,
@@ -470,8 +674,8 @@ fn ensure_home(home: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Runs one submitted turn (C2 §4.1), inline: nothing outlives it but the
-/// session's lease and the connection's own tasks.
+/// Runs one submitted turn (C2 §4.1), inline but for its normalizer,
+/// which the session's tracker owns. Its settlement runs however it ends.
 pub(crate) async fn run_turn(
     driver: &SessionDriver,
     session: &CodexSession,
@@ -487,6 +691,29 @@ pub(crate) async fn run_turn(
             });
         }
     };
+    let (close, close_rx) = watch::channel(None);
+    let Some(done) = activate(driver, cx.turn, close) else {
+        return rejected(AdapterError::Rejected {
+            reason: StartRejected::SessionGone,
+            evidence: TurnEvidence::no_launch(false),
+        });
+    };
+    lock_losses(&session.losses).latest = Some(cx.turn);
+    let settle = Settle::new(driver, cx.turn, done);
+    let end = turn(driver, session, (spec, sandbox), cx, close_rx, &settle).await;
+    settle.record(&end);
+    end
+}
+
+/// The turn under its settlement.
+async fn turn(
+    driver: &SessionDriver,
+    session: &CodexSession,
+    (spec, sandbox): (TurnSpec, Sandbox),
+    cx: TurnCx,
+    close: watch::Receiver<Option<StopOrder>>,
+    settle: &Settle<'_>,
+) -> TurnEnd {
     let TurnCx {
         turn,
         prepared,
@@ -497,21 +724,9 @@ pub(crate) async fn run_turn(
         stop,
         mut force,
     } = cx;
-    let (close, close_rx) = watch::channel(None);
-    let Some(done) = activate(driver, turn, close) else {
-        return rejected(AdapterError::Rejected {
-            reason: StartRejected::SessionGone,
-            evidence: TurnEvidence::no_launch(false),
-        });
-    };
-    let _settle = Settle {
-        state: &driver.state,
-        turn,
-        done,
-    };
     let mut orders = Orders {
         stop,
-        close: close_rx,
+        close,
         wall,
         cancel: driver.cancel.clone(),
     };
@@ -521,12 +736,13 @@ pub(crate) async fn run_turn(
         number: turn,
         instance: None,
         launched: false,
+        settle,
     };
     let folder = match folder(&facts).await {
-        Ok(folder) => folder,
+        Ok(folder) => Arc::new(folder),
         Err(end) => return *end,
     };
-    let pin = match join(&facts, (prepared, capacity), (&mut orders, &mut force)).await {
+    let pin = match join(&mut facts, (prepared, capacity), (&mut orders, &mut force)).await {
         Ok(pin) => pin,
         Err(end) => return *end,
     };
@@ -534,7 +750,7 @@ pub(crate) async fn run_turn(
         return facts.failed(RouteError::TransportLost { turn }, None);
     };
     let catalog = adopt(&mut facts, &server);
-    let Some((generation, thread)) = session.attach(&pin, &connection, &driver.state) else {
+    let Some(generation) = session.attach(&pin, &connection, driver) else {
         return facts.failed(RouteError::TransportLost { turn }, None);
     };
     let Ok(effort) = vendor_effort(spec.effort.as_deref(), &catalog, &driver.spec.model) else {
@@ -543,22 +759,33 @@ pub(crate) async fn run_turn(
     if let Err(end) = link(&facts, &connection, wall).await {
         return *end;
     }
-    let ids = Ids {
-        connection: &connection,
-        generation,
-    };
-    let thread = match thread {
-        Some(thread) => thread,
-        None => {
-            match open_thread(&mut facts, &ids, sandbox.mode, (&mut orders, &mut force)).await {
-                Ok(thread) => thread,
-                Err(end) => return *end,
-            }
+    // The turn's input writes: withdrawn before their first byte however
+    // the turn ends (X0 item 12.2).
+    let mut writes = TurnWrites::new(&connection);
+    let thread = if let Some(thread) = generation.thread.clone() {
+        thread
+    } else {
+        let ids = Ids {
+            connection: &connection,
+            generation: &generation,
+        };
+        let opened = open_thread(
+            &mut facts,
+            &ids,
+            sandbox.mode,
+            (&mut orders, &mut force, &mut writes),
+        )
+        .await;
+        match opened {
+            Ok(thread) => thread,
+            Err(end) => return *end,
         }
     };
     let start = Started {
         thread: &thread,
         connection: &connection,
+        generation: generation.number,
+        signal: &generation.signal,
         sandbox: &sandbox,
         effort: effort.as_deref(),
         folder: &folder,
@@ -568,9 +795,10 @@ pub(crate) async fn run_turn(
         &mut facts,
         &start,
         spec,
-        (&activity, &mut orders, &mut force),
+        (&activity, &mut orders, &mut force, &mut writes),
     )
     .await;
+    drop(writes);
     if quarantines(&end) || !usable(&connection) {
         session.quarantine(&connection);
     }
@@ -679,9 +907,9 @@ fn admit(
 
 /// Records the live server's facts the turn reports (its instance and
 /// version) and caches its model catalog, which it returns.
-fn adopt(facts: &mut Turn<'_>, server: &ServerFacts) -> Arc<[DiscoveredModel]> {
+fn adopt(facts: &mut Turn<'_>, server: &via_routes::codex::ServerFacts) -> Arc<[DiscoveredModel]> {
     let adapter = &facts.session.adapter;
-    facts.instance = Some(instance_report(server));
+    facts.instance = Some(instance_report(&server.user_agent));
     if let Some(version) = normalize::instance_version(&server.user_agent) {
         adapter
             .instances
@@ -703,7 +931,6 @@ async fn link(
     let turn = facts.number;
     let link_by = Deadline::at((Instant::now() + LINK_BOUND).min(wall.instant()));
     let kind = match connection
-        .sender()
         .link_turn(&driver.spec.session_id, turn, link_by)
         .await
     {
@@ -722,7 +949,7 @@ async fn link(
 /// The pin of the turn's server, live: the session's own or an equal
 /// key's, else a launch or join with the turn's connection slot.
 async fn join(
-    facts: &Turn<'_>,
+    facts: &mut Turn<'_>,
     (prepared, capacity): (Prepared, Option<crate::CapacityToken>),
     (orders, force): (&mut Orders, &mut ForceWatch),
 ) -> Result<ServerPin, Box<TurnEnd>> {
@@ -763,7 +990,9 @@ async fn join(
                 .launch_or_join(key, recipe.process_spec(owner), capacity)
             {
                 Ok(pin) => pin,
-                Err(failure) => return Err(Box::new(launch_failed(facts, failure))),
+                Err(failure) => {
+                    return Err(Box::new(launch_failed(facts, &failure.into())));
+                }
             }
         }
     };
@@ -775,7 +1004,7 @@ async fn join(
     };
     match pin.ready(ordered).await {
         Ok(()) => Ok(pin),
-        Err(Some(failure)) => Err(Box::new(launch_failed(facts, failure))),
+        Err(Some(failure)) => Err(Box::new(launch_failed(facts, &failure))),
         // The turn's own order ended its wait: nothing of it was sent.
         Err(None) => Err(Box::new(
             facts.failed(unsent_cause(orders, force, turn), None),
@@ -783,9 +1012,14 @@ async fn join(
     }
 }
 
-/// A launch's failure as the waiting turn reports it (C2 §2 health).
-fn launch_failed(facts: &Turn<'_>, failure: via_routes::codex::LaunchFailure) -> TurnEnd {
-    let failure = failure.route_failure(facts.number);
+/// A launch's failure as the waiting turn reports it (C2 §2 health), with
+/// the instance its handshake read, when it read one (C2 AD7: every later
+/// outcome carries it).
+fn launch_failed(facts: &mut Turn<'_>, failure: &LaunchError) -> TurnEnd {
+    if let Some(user_agent) = &failure.user_agent {
+        facts.instance = Some(instance_report(user_agent));
+    }
+    let failure = failure.failure.route_failure(facts.number);
     if let Some(cause) = health_cause(&failure.cause) {
         facts.driver.fail(cause);
     }
@@ -811,21 +1045,23 @@ fn unsent_cause(orders: &Orders, force: &ForceWatch, turn: TurnNumber) -> RouteE
 /// The connection facts a thread open needs.
 struct Ids<'a> {
     connection: &'a Arc<Connection>,
-    generation: u64,
+    generation: &'a Generation,
 }
 
 /// Opens the session's thread on this generation (packet §3): a resume of
-/// the confirmed thread, else a start; the reply's echoes checked, its
-/// identity confirmed.
+/// the confirmed thread, else a start, written under the turn's guard on
+/// a lane subscribed to the generation's abnormal end; the reply's echoes
+/// checked, its identity confirmed. Any failure drops the lane, which
+/// closes a registration the reply made (X0 item 8.1).
 async fn open_thread(
     facts: &mut Turn<'_>,
     ids: &Ids<'_>,
     mode: SandboxMode,
-    (orders, force): (&mut Orders, &mut ForceWatch),
-) -> Result<Thread, Box<TurnEnd>> {
+    (orders, force, writes): (&mut Orders, &mut ForceWatch, &mut TurnWrites),
+) -> Result<Arc<Thread>, Box<TurnEnd>> {
     let driver = facts.driver;
     let turn = facts.number;
-    let lane = Arc::new(Lane::default());
+    let lease = ids.connection.open_lane(Some(&ids.generation.signal));
     let resume = driver.state().identity.clone();
     let settings = ThreadSettings {
         model: &driver.spec.model,
@@ -843,11 +1079,18 @@ async fn open_thread(
             None => thread_start(id, &settings).map(data),
         },
         bounds,
-        Some(Arc::clone(&lane)),
+        Purpose::Opens(&lease),
+        Some(writes),
     );
     let requested = requested.map_err(|error| Box::new(request_failed(facts, error)))?;
-    facts.launched = true;
-    let reply = match await_reply(requested.write, requested.reply, (orders, force)).await {
+    facts.launch();
+    let reply = await_reply(
+        (requested.written, requested.reply),
+        (orders, force),
+        &mut |_ending| {},
+    )
+    .await;
+    let reply = match reply {
         Ok(reply) => reply,
         Err(cause) => return Err(Box::new(lost(facts, ids.connection, cause))),
     };
@@ -868,45 +1111,48 @@ async fn open_thread(
             None,
         )));
     };
-    let thread = Thread {
+    confirm(facts, (&opened, mode), resume, &lease, force).await?;
+    let thread = Arc::new(Thread {
         id: opened.thread.id.clone(),
-        lane,
-    };
-    confirm(facts, ids, (&opened, mode), resume, &thread).await?;
+        lease,
+    });
     facts.session.opened(ids.connection, &thread);
     driver.state().identity = Some(thread.id.clone());
     let identity = Identity {
         vendor_session_id: thread.id.clone(),
-        connection_id: connection_id(ids.generation),
+        connection_id: connection_id(ids.generation.number),
         transcript: None,
         vendor_version: facts
             .instance
             .as_ref()
             .and_then(|instance| instance.vendor_version.clone()),
     };
-    if facts
-        .emit(Observation::IdentityConfirmed(identity), None)
+    match facts
+        .emit(Observation::IdentityConfirmed(identity), force)
         .await
-        .is_err()
     {
-        return Err(Box::new(facts.failed(RouteError::Overflow { turn }, None)));
+        Ok(()) => Ok(thread),
+        Err(Emit::Undelivered) => Err(Box::new(facts.failed(RouteError::Overflow { turn }, None))),
+        Err(Emit::Forced) => Err(Box::new(facts.failure(
+            RouteError::ForceStopped { turn },
+            None,
+            None,
+        ))),
     }
-    Ok(thread)
 }
 
 /// Checks an opened thread before its identity is confirmed: the echoed
 /// policy, a resume's thread ID, and its registration on the connection.
 async fn confirm(
     facts: &Turn<'_>,
-    ids: &Ids<'_>,
     (opened, mode): (&ThreadResult, SandboxMode),
     resume: Option<String>,
-    thread: &Thread,
+    lease: &LaneLease,
+    force: &mut ForceWatch,
 ) -> Result<(), Box<TurnEnd>> {
     let driver = facts.driver;
     let turn = facts.number;
     if let Some(field) = echo_differs(opened, mode) {
-        ids.connection.unregister(&thread.id, &thread.lane);
         let adapter = &facts.session.adapter;
         // The recipe key the refused handshake is cached under.
         let hash = adapter
@@ -923,18 +1169,18 @@ async fn confirm(
             facts.failed(RouteError::HandshakeRefused { turn }, None),
         ));
     }
+    let returned = &opened.thread.id;
     if let Some(requested) = resume
-        && requested != thread.id
+        && requested != *returned
     {
-        ids.connection.unregister(&thread.id, &thread.lane);
         driver.fail(DriverFailure::ResumeMismatch);
         // C2 §4 identity: the mismatch is reported; an undelivered report
         // latches the observation overflow after the mismatch.
         let mismatch = Observation::ResumeMismatch {
             requested,
-            returned: thread.id.clone(),
+            returned: returned.clone(),
         };
-        let _undelivered = facts.emit(mismatch, None).await;
+        let _undelivered = facts.emit(mismatch, force).await;
         return Err(Box::new(TurnEnd {
             terminal: None,
             instance: facts.instance.clone(),
@@ -948,7 +1194,7 @@ async fn confirm(
             }),
         }));
     }
-    if !ids.connection.registered(&thread.id, &thread.lane) {
+    if lease.thread().as_deref() != Some(returned.as_str()) {
         return Err(Box::new(facts.failed(
             RouteError::Protocol {
                 turn,
@@ -1002,9 +1248,9 @@ fn request_failed(facts: &Turn<'_>, error: RequestError) -> TurnEnd {
 /// Why a reply never came.
 #[derive(Clone, Copy)]
 enum Unanswered {
-    /// The connection ended: its loss, when it failed.
-    Lost(Option<ConnectionLoss>),
-    /// The start was not written whole.
+    /// The connection ended or its record went.
+    Lost,
+    /// The request was not written whole.
     NotWritten(SendOutcome),
     /// The daemon force.
     Forced,
@@ -1015,26 +1261,20 @@ enum Unanswered {
 /// A turn whose request went unanswered.
 fn lost(facts: &Turn<'_>, connection: &Connection, cause: Unanswered) -> TurnEnd {
     let turn = facts.number;
+    let ended = |facts: &Turn<'_>| match connection_loss(connection) {
+        Some(loss) => facts.failed(loss_cause(&loss, turn), Some(loss)),
+        None => facts.failed(RouteError::TransportLost { turn }, None),
+    };
     match cause {
-        Unanswered::Lost(loss) => {
-            let loss = loss.or_else(|| match connection.ended() {
-                Some(via_routes::codex::ConnectionEnd::Failed(loss)) => Some(loss),
-                _ => None,
-            });
-            match loss {
-                Some(loss) => facts.failed(loss_cause(&loss, turn), Some(loss)),
-                None => facts.failed(RouteError::TransportLost { turn }, None),
-            }
-        }
         Unanswered::NotWritten(SendOutcome::NotWritten) => {
             let unsent = Turn {
                 launched: false,
                 instance: facts.instance.clone(),
                 ..*facts
             };
-            unsent.failed(RouteError::TransportLost { turn }, None)
+            ended(&unsent)
         }
-        Unanswered::NotWritten(_) => facts.failed(RouteError::TransportLost { turn }, None),
+        Unanswered::Lost | Unanswered::NotWritten(_) => ended(facts),
         // A stop's cleanup stays unproven: the written request may have
         // started work the vendor never reported (P7's acknowledgement).
         Unanswered::Forced => facts.failure(RouteError::ForceStopped { turn }, None, None),
@@ -1047,29 +1287,33 @@ fn lost(facts: &Turn<'_>, connection: &Connection, cause: Unanswered) -> TurnEnd
     }
 }
 
-/// Awaits a written request's paired reply, bounded by the force and the
-/// end of the turn's own order.
+/// Awaits a queued request's paired reply, bounded by the force and the
+/// end of the turn's own order; `on_order` runs once, at the order.
 async fn await_reply(
-    write: PendingWrite,
-    reply: tokio::sync::oneshot::Receiver<Response>,
+    (written, reply): (oneshot::Receiver<SendOutcome>, oneshot::Receiver<Response>),
     (orders, force): (&mut Orders, &mut ForceWatch),
+    on_order: &mut (dyn FnMut(&Ending) + Send),
 ) -> Result<Response, Unanswered> {
-    tokio::pin!(write);
+    tokio::pin!(written);
     tokio::pin!(reply);
-    let mut written = false;
+    let mut answered = false;
     let mut ending: Option<Ending> = None;
     loop {
         let end_at = ending.map(|ending| ending.by.instant());
         tokio::select! {
             biased;
             () = forced(force) => return Err(Unanswered::Forced),
-            outcome = &mut write, if !written => match outcome {
-                Ok(SendOutcome::Written) => written = true,
+            outcome = &mut written, if !answered => match outcome {
+                Ok(SendOutcome::Written) => answered = true,
                 Ok(other) => return Err(Unanswered::NotWritten(other)),
-                Err(_) => return Err(Unanswered::NotWritten(SendOutcome::Indeterminate)),
+                // The connection ended before Wire answered.
+                Err(_) => return Err(Unanswered::Lost),
             },
-            answered = &mut reply => return answered.map_err(|_| Unanswered::Lost(None)),
-            found = orders.ordered(), if ending.is_none() => ending = Some(found),
+            paired = &mut reply => return paired.map_err(|_| Unanswered::Lost),
+            found = orders.ordered(), if ending.is_none() => {
+                on_order(&found);
+                ending = Some(found);
+            }
             () = sleep_until(end_at), if end_at.is_some() => {
                 return Err(Unanswered::Ended(ending.map_or(EndCause::Stopped, |ending| ending.cause)));
             }
@@ -1086,21 +1330,31 @@ async fn sleep_until(at: Option<Instant>) {
 
 /// A started turn's connection facts.
 struct Started<'a> {
-    thread: &'a Thread,
+    thread: &'a Arc<Thread>,
     connection: &'a Arc<Connection>,
+    generation: u64,
+    /// The generation's abnormal-end signal: its decode positions.
+    signal: &'a LeaseSignal,
     sandbox: &'a Sandbox,
     effort: Option<&'a str>,
-    folder: &'a TurnFolder,
+    folder: &'a Arc<TurnFolder>,
     schema: bool,
 }
 
-/// Writes `turn/start` with the full frozen policy, accepts on its paired
-/// reply, then normalizes the thread's lane until the turn's terminal.
+/// Writes `turn/start` with the full frozen policy under the turn's guard;
+/// a stop before its reply posts the delayed interrupt intent. On the
+/// paired reply the turn's normalizer takes the lane (its acceptance
+/// first) and the turn waits for its decision beside its orders.
 async fn run_started(
     facts: &mut Turn<'_>,
     start: &Started<'_>,
     spec: TurnSpec,
-    (activity, orders, force): (&crate::TurnActivity, &mut Orders, &mut ForceWatch),
+    (activity, orders, force, writes): (
+        &crate::TurnActivity,
+        &mut Orders,
+        &mut ForceWatch,
+        &mut TurnWrites,
+    ),
 ) -> TurnEnd {
     let driver = facts.driver;
     let turn = facts.number;
@@ -1117,19 +1371,37 @@ async fn run_started(
         start_by: orders.wall,
         finish_by: Deadline::at(Instant::now() + FINISH_BY),
     };
-    let requested = start
-        .connection
-        .request(|id| turn_start(id, &values, prompt), bounds, None);
+    let requested = start.connection.request(
+        |id| turn_start(id, &values, prompt),
+        bounds,
+        Purpose::Starts {
+            lane: &start.thread.lease,
+            turn,
+        },
+        Some(writes),
+    );
     let requested = match requested {
         Ok(requested) => requested,
         Err(error) => return request_failed(facts, error),
     };
-    facts.launched = true;
-    let correlation = u64::try_from(requested.id.get())
+    facts.launch();
+    let start_id = requested.id;
+    let correlation = u64::try_from(start_id.get())
         .ok()
         .and_then(|id| AcceptanceToken::try_from(id).ok())
         .unwrap_or(AcceptanceToken::FIRST);
-    let reply = match await_reply(requested.write, requested.reply, (orders, force)).await {
+    let reply = await_reply(
+        (requested.written, requested.reply),
+        (orders, force),
+        &mut |ending: &Ending| {
+            // Before acceptance the intent waits on the start's reply.
+            start
+                .connection
+                .interrupt(&start.thread.lease, start_id, None, ending.by);
+        },
+    )
+    .await;
+    let reply = match reply {
         Ok(reply) => reply,
         Err(cause) => return lost(facts, start.connection, cause),
     };
@@ -1158,229 +1430,208 @@ async fn run_started(
         vendor_turn_id: VendorTurnId::try_from(accepted.clone()).ok(),
         instance: facts.instance.clone(),
     };
-    if facts
-        .emit(Observation::Accepted(acceptance), Some(&accepted))
-        .await
-        .is_err()
-    {
-        return facts.failed(RouteError::Overflow { turn }, None);
-    }
-    let mut running = Running {
-        normalizer: TurnNormalizer::new(start.schema),
-        accepted,
-        terminal: None,
+    let delivery = normalize_on_tracker(facts, start, (&accepted, acceptance), activity);
+    let accepted_turn = Accepted {
+        id: accepted,
+        start: start_id,
+        delivery: &delivery,
     };
-    running.run(facts, start, (activity, orders, force)).await
+    let cut = wait(start, &accepted_turn, (orders, force)).await;
+    settle_turn(facts, start, &accepted_turn, cut)
 }
 
-/// An accepted turn's delivery state.
-struct Running {
-    normalizer: TurnNormalizer,
-    accepted: String,
-    /// The one retained terminal (AD4): a second never replaces it.
-    terminal: Option<VendorTerminal>,
-}
-
-/// How the delivery loop ended.
-enum Ended {
-    Terminal,
-    Failed(RouteError, Option<ConnectionLoss>),
-    Undecoded(&'static str),
-    Order(EndCause),
-    Forced,
-}
-
-impl Running {
-    async fn run(
-        &mut self,
-        facts: &Turn<'_>,
-        start: &Started<'_>,
-        (activity, orders, force): (&crate::TurnActivity, &mut Orders, &mut ForceWatch),
-    ) -> TurnEnd {
-        let turn = facts.number;
-        let mut ending: Option<Ending> = None;
-        let ended = loop {
-            let end_at = ending.map(|ending| ending.by.instant());
-            tokio::select! {
-                biased;
-                () = forced(force) => break Ended::Forced,
-                event = start.thread.lane.next() => {
-                    activity.record(Instant::now());
-                    if let Some(ended) = self.take(facts, start, event).await {
-                        break ended;
-                    }
-                }
-                found = orders.ordered(), if ending.is_none() => {
-                    ending = Some(found);
-                    interrupt(start, &self.accepted, found.by);
-                }
-                () = sleep_until(end_at), if end_at.is_some() => {
-                    break Ended::Order(ending.map_or(EndCause::Stopped, |ending| ending.cause));
-                }
-            }
-        };
-        let uncertain = |cause| facts.failure(cause, None, None);
-        let reported = Some(if self.normalizer.tools_open() {
-            WireCleanup::Uncertain
-        } else {
-            WireCleanup::Quiescent
-        });
-        match ended {
-            Ended::Terminal => TurnEnd {
-                terminal: self.terminal.take(),
-                instance: facts.instance.clone(),
-                leftovers: None,
-                outcome: Ok(TurnEvidence {
-                    exit: None,
-                    cleanup: if self.normalizer.tools_open() {
-                        Cleanup::Uncertain
-                    } else {
-                        Cleanup::Quiescent
-                    },
-                    journal_uncertain: false,
-                }),
+/// Starts the accepted turn's delivery: its normalizer, on the session's
+/// tracker under `crash_on_panic` (X0 item 13.2), takes the lane from the
+/// first message not yet taken, its acceptance first. The settlement
+/// seals it however the turn ends.
+fn normalize_on_tracker(
+    facts: &Turn<'_>,
+    start: &Started<'_>,
+    (accepted, acceptance): (&str, Acceptance),
+    activity: &crate::TurnActivity,
+) -> Arc<Delivery> {
+    let driver = facts.driver;
+    let lane = start.thread.lease.lane();
+    let before = lane
+        .front_seq()
+        .map_or_else(|| start.signal.enqueued(), |seq| seq.saturating_sub(1));
+    let delivery = Delivery::new(before);
+    facts.settle.deliver(&delivery);
+    driver.tracker.spawn(crash_on_panic(
+        Normalizing {
+            delivery: Arc::clone(&delivery),
+            lane: Arc::clone(lane),
+            sink: driver.observations.clone(),
+            normalizer: TurnNormalizer::new(start.schema),
+            turn: facts.number,
+            accepted: accepted.to_owned(),
+            acceptance: Some(acceptance),
+            evidence: Evidence {
+                folder: Arc::clone(start.folder),
+                connection: Arc::clone(start.connection),
+                runtime: Arc::clone(&driver.runtime),
+                session: driver.spec.session_id.clone(),
             },
-            Ended::Failed(cause, loss) => {
-                let mut end = facts.failure(cause, loss, reported);
-                end.terminal = self.terminal.take();
-                end
-            }
-            Ended::Undecoded(detail) => {
-                let mut end = facts.failure(RouteError::Protocol { turn, detail }, None, reported);
-                if let Err(AdapterError::Route(failure)) = &mut end.outcome {
-                    failure.undecoded = start.folder.take_undecoded();
-                }
-                end
-            }
-            Ended::Order(EndCause::Stopped) => uncertain(RouteError::Stopped { turn }),
-            Ended::Order(EndCause::Wall) => uncertain(RouteError::Deadline { turn }),
-            Ended::Forced => uncertain(RouteError::ForceStopped { turn }),
+            activity: activity.clone(),
+            cancel: driver.cancel.clone(),
+            health: Arc::clone(&driver.health),
         }
-    }
+        .run(),
+    ));
+    delivery
+}
 
-    /// Takes one lane event; the loop's end, if it is one.
-    async fn take(
-        &mut self,
-        facts: &Turn<'_>,
-        start: &Started<'_>,
-        event: LaneEvent,
-    ) -> Option<Ended> {
-        let turn = facts.number;
-        let item = match event {
-            LaneEvent::Item(item) => *item,
-            LaneEvent::End(end) => {
-                let (cause, loss) = lane_end(end, turn);
-                return Some(Ended::Failed(cause, loss));
-            }
-        };
-        match item {
-            LaneItem::Notification {
-                notification,
-                staged,
-            } => {
-                let ended = self.notification(facts, &notification).await;
-                drop(staged);
-                ended
-            }
-            LaneItem::Declined {
-                request,
-                decoded_at,
-                mut written,
-            } => {
-                if self.normalizer.note_decline(&request).is_err() {
-                    return Some(Ended::Failed(RouteError::Overflow { turn }, None));
-                }
-                // Reported only once written whole by its deadline (packet
-                // §4): a failed write fails the connection instead.
-                let whole = tokio::time::timeout_at(
-                    decoded_at + DECLINE_DEADLINE,
-                    written.wait_for(Option::is_some),
-                )
-                .await
-                .is_ok_and(|outcome| outcome.is_ok_and(|outcome| *outcome == Some(true)));
-                if whole {
-                    let declined = Observation::RequestDeclined(normalize::decline(&request));
-                    if facts.emit(declined, Some(&self.accepted)).await.is_err() {
-                        return Some(Ended::Failed(RouteError::Overflow { turn }, None));
-                    }
-                }
-                None
-            }
-            LaneItem::Malformed { staged, detail } => {
-                start
-                    .folder
-                    .keep_undecoded(staged.bytes(), "the turn's message")
-                    .await;
-                Some(Ended::Undecoded(detail))
-            }
-        }
-    }
+/// An accepted turn's facts.
+struct Accepted<'a> {
+    id: String,
+    start: ClientId,
+    delivery: &'a Arc<Delivery>,
+}
 
-    /// One notification of the thread: another turn's is dropped; this
-    /// turn's is normalized and delivered.
-    async fn notification(
-        &mut self,
-        facts: &Turn<'_>,
-        notification: &Notification,
-    ) -> Option<Ended> {
-        let turn = facts.number;
-        if notification.turn_id().is_some_and(|id| id != self.accepted) {
-            return None;
+/// What ended an accepted turn's wait.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Cut {
+    /// The daemon force.
+    Forced,
+    /// The delivery decided: the terminal, or why it stopped.
+    Decided,
+    /// The turn's own order reached its end.
+    Order(EndCause),
+    /// The connection failed and its evidence did not reach the turn in
+    /// time (X0 items 13.1, 13.2).
+    LossDeadline,
+}
+
+/// Waits for the turn's delivery to decide, beside its orders: never
+/// behind the normalizer, so a blocked sink delays no control. A stop
+/// order posts the turn's interrupt intent at once.
+async fn wait(
+    start: &Started<'_>,
+    accepted: &Accepted<'_>,
+    (orders, force): (&mut Orders, &mut ForceWatch),
+) -> Cut {
+    let failing = start.connection.failing();
+    tokio::pin!(failing);
+    let mut ending: Option<Ending> = None;
+    let mut loss_at: Option<Instant> = None;
+    loop {
+        if accepted.delivery.decided() {
+            return Cut::Decided;
         }
-        let step = match self.normalizer.observe(notification, Instant::now()) {
-            Ok(step) => step,
-            Err(normalize::NormalizeError::Protocol(detail)) => {
-                return Some(Ended::Failed(RouteError::Protocol { turn, detail }, None));
+        let end_at = ending.map(|ending| ending.by.instant());
+        tokio::select! {
+            biased;
+            () = forced(force) => return Cut::Forced,
+            () = accepted.delivery.changed() => {}
+            found = orders.ordered(), if ending.is_none() => {
+                start.connection.interrupt(
+                    &start.thread.lease,
+                    accepted.start,
+                    Some(&accepted.id),
+                    found.by,
+                );
+                ending = Some(found);
             }
-            Err(normalize::NormalizeError::Overflow) => {
-                return Some(Ended::Failed(RouteError::Overflow { turn }, None));
+            () = sleep_until(end_at), if end_at.is_some() => {
+                return Cut::Order(ending.map_or(EndCause::Stopped, |ending| ending.cause));
             }
-        };
-        match step {
-            Step::Activity => None,
-            Step::Observations(observations) => {
-                for observation in observations {
-                    if facts.emit(observation, Some(&self.accepted)).await.is_err() {
-                        return Some(Ended::Failed(RouteError::Overflow { turn }, None));
-                    }
-                }
-                None
+            () = &mut failing, if loss_at.is_none() => {
+                loss_at = Some(Instant::now() + LOSS_EVIDENCE);
             }
-            Step::Terminal {
-                mut terminal,
-                structured,
-            } => {
-                if self.terminal.is_none() {
-                    terminal.structured_output = match structured {
-                        StructuredOutput::Json(json) => Some(json),
-                        StructuredOutput::NotRequested
-                        | StructuredOutput::Missing
-                        | StructuredOutput::NotJson
-                        | StructuredOutput::OverLimit => None,
-                    };
-                    self.terminal = Some(*terminal);
-                }
-                Some(Ended::Terminal)
-            }
+            () = sleep_until(loss_at), if loss_at.is_some() => return Cut::LossDeadline,
         }
     }
 }
 
-/// Writes one `turn/interrupt` of the accepted turn on the control path,
-/// unanswered here: its terminal ends the turn.
-fn interrupt(start: &Started<'_>, accepted: &str, by: Deadline) {
-    let bounds = WriteBounds::StartBy {
-        start_by: by,
-        finish_by: by,
+/// The accepted turn's end at its cutoff: delivery is sealed first, so
+/// nothing of the turn reaches Core after it; what the seal left
+/// undelivered at any cutoff but the terminal joins the driver's loss
+/// record. The force decides at once; otherwise a retained terminal wins
+/// (C1 §7.6 terminal first), then why delivery stopped, then the order.
+fn settle_turn(
+    facts: &Turn<'_>,
+    start: &Started<'_>,
+    accepted: &Accepted<'_>,
+    cut: Cut,
+) -> TurnEnd {
+    let turn = facts.number;
+    let sealed = accepted.delivery.seal();
+    let terminal_decided = cut == Cut::Decided && sealed.terminal.is_some();
+    let undelivered = sealed.partial || start.thread.lease.lane().front_seq().is_some();
+    let abnormal = matches!(sealed.stop, Some(Stop::Lane(LaneEnd::Abnormal)));
+    if !terminal_decided && (undelivered || abnormal || cut == Cut::LossDeadline) {
+        lock_losses(&facts.session.losses).note(start.generation, sealed.position, UNKNOWN);
+    }
+    let reported = Some(if sealed.tools_open {
+        WireCleanup::Uncertain
+    } else {
+        WireCleanup::Quiescent
+    });
+    let uncertain = |cause| facts.failure(cause, None, None);
+    if cut == Cut::Forced {
+        return uncertain(RouteError::ForceStopped { turn });
+    }
+    if let Some(retained) = sealed.terminal {
+        return terminal_end(facts, retained, sealed.tools_open);
+    }
+    match (cut, sealed.stop) {
+        (_, Some(Stop::Lane(end))) => {
+            let (cause, loss) = lane_end(end, start.connection, turn);
+            facts.failure(cause, loss, reported)
+        }
+        (_, Some(Stop::Protocol { detail, undecoded })) => {
+            let mut end = facts.failure(RouteError::Protocol { turn, detail }, None, reported);
+            if let Err(AdapterError::Route(failure)) = &mut end.outcome {
+                failure.undecoded = undecoded;
+            }
+            end
+        }
+        (_, Some(Stop::Overflow)) => facts.failure(RouteError::Overflow { turn }, None, reported),
+        (Cut::Order(EndCause::Wall), None) => uncertain(RouteError::Deadline { turn }),
+        (Cut::LossDeadline, None) => match connection_loss(start.connection) {
+            Some(loss) => facts.failure(
+                loss_cause(&loss, turn),
+                Some(ConnectionLoss {
+                    cleanup: WireCleanup::Uncertain,
+                    ..loss
+                }),
+                None,
+            ),
+            None => uncertain(RouteError::TransportLost { turn }),
+        },
+        (Cut::Order(EndCause::Stopped) | Cut::Decided | Cut::Forced, None) => {
+            uncertain(RouteError::Stopped { turn })
+        }
+    }
+}
+
+/// The turn's end with its retained terminal.
+fn terminal_end(facts: &Turn<'_>, retained: Retained, tools_open: bool) -> TurnEnd {
+    let Retained {
+        mut terminal,
+        structured,
+    } = retained;
+    terminal.structured_output = match structured {
+        StructuredOutput::Json(json) => Some(json),
+        StructuredOutput::NotRequested
+        | StructuredOutput::Missing
+        | StructuredOutput::NotJson
+        | StructuredOutput::OverLimit => None,
     };
-    let written = start.connection.request(
-        |id| turn_interrupt(id, &start.thread.id, accepted).map(OutboundMessage::Control),
-        bounds,
-        None,
-    );
-    // The write proceeds without its future; its reply is paired and
-    // dropped as abandoned.
-    drop(written);
+    TurnEnd {
+        terminal: Some(terminal),
+        instance: facts.instance.clone(),
+        leftovers: None,
+        outcome: Ok(TurnEvidence {
+            exit: None,
+            cleanup: if tools_open {
+                Cleanup::Uncertain
+            } else {
+                Cleanup::Quiescent
+            },
+            journal_uncertain: false,
+        }),
+    }
 }
 
 /// A per-turn refusal as the definite rejection it is before submission.

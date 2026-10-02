@@ -1316,7 +1316,8 @@ fn codex_pin_handshake() {
     }
 
     // model/list: a cursor left at the page bound, then a catalog past
-    // the byte bound.
+    // the byte bound. `initialize` was read first: its instance stays on
+    // the failed outcome (C2 AD7; x.3.2 X3 fix r1, finding 18).
     let (mut replay, mut expect) = plain("codex_pin_handshake_page_bound").unwrap();
     let models = step_with(&replay, "\"result\":{\"data\"").unwrap();
     let page = replay["steps"][models]["emit"]["line"]
@@ -1336,7 +1337,7 @@ fn codex_pin_handshake() {
     }
     let tail: Vec<Value> = pages.into_iter().chain([sigterm()]).collect();
     cut_after(&mut replay, models - 1, &tail).unwrap();
-    unaccepted(&mut expect, "protocol", Value::Null);
+    unaccepted(&mut expect, "protocol", tested());
     variant("codex_pin_handshake_page_bound", &replay, &expect).unwrap();
 
     let (mut replay, _) = plain("codex_pin_handshake_byte_bound").unwrap();
@@ -1483,14 +1484,18 @@ fn codex_start_order() {
         {"kind": "session.vendor_identity_confirmed", "vendor_session_id": THREAD,
             "generation": 1},
     ]);
+    // The session's close never erases that uncertainty (x.3.2 X3 fix r1,
+    // finding 6): unsubscribing proves detachment, not tool cleanup.
+    expect["sessions"]["main"]["close"]["cleanup"] = json!("uncertain");
     variant("codex_start_order_stopped_unanswered", &replay, &expect).unwrap();
 
-    // A malformed turn/completed of the turn.
+    // A malformed turn/completed of the turn, its correlation intact (X0
+    // item 5 step 5): the turn fails `protocol`, the connection lives.
     let (mut replay, mut expect) = plain("codex_start_order_malformed").unwrap();
     let completed = step_with(&replay, completed_marker).unwrap();
     steps(&mut replay).unwrap()[completed] = emit(&json!({
         "method": "turn/completed",
-        "params": {"threadId": THREAD, "turn": "not a turn"},
+        "params": {"threadId": THREAD, "turn": {"id": TURN, "status": 7}},
     }));
     cut_after(&mut replay, completed, &[json!({"await_eof": {}})]).unwrap();
     let base = turn_mut(&mut expect, 0)["expect"].clone();
@@ -1502,7 +1507,25 @@ fn codex_start_order() {
         {"kind": "turn.accepted", "vendor_turn_id": TURN}, "final_text",
     ]);
     turn_mut(&mut expect, 0)["expect"]["observations_exclude"] = json!([]);
+    let malformed = expect.clone();
     variant("codex_start_order_malformed", &replay, &expect).unwrap();
+
+    // A turn/completed whose turn names no ID: its correlation fails, so
+    // the whole connection fails `protocol` and Host stops the server (X0
+    // item 5 step 2; x.3.2 X3 fix r1, finding 9).
+    let (mut replay, _) = plain("codex_start_order_uncorrelated").unwrap();
+    let completed = step_with(&replay, completed_marker).unwrap();
+    steps(&mut replay).unwrap()[completed] = emit(&json!({
+        "method": "turn/completed",
+        "params": {"threadId": THREAD, "turn": "not a turn"},
+    }));
+    cut_after(&mut replay, completed, &[sigterm()]).unwrap();
+    let mut expect = malformed;
+    expect["source"] = replay["source"].clone();
+    expect["sessions"]["main"]["close"] = json!({
+        "mode": "graceful", "vendor_closed": false, "cleanup": "quiescent",
+    });
+    variant("codex_start_order_uncorrelated", &replay, &expect).unwrap();
 
     // A second, contradictory turn/completed after the terminal.
     let (mut replay, mut expect) = plain("codex_start_order_second_terminal").unwrap();
@@ -1738,4 +1761,134 @@ fn codex_usage_snapshot() {
         json!({"usd": null, "provenance": "unavailable"})
     );
     variant("codex_usage_snapshot_other_turn", &replay, &expect).unwrap();
+}
+
+/// Arms `codex.connection.message` to fail the connection task when it
+/// takes its `occurrence`th admitted message (x.3.2 X0 item 13.2's seam).
+#[cfg(feature = "test-failpoints")]
+fn connection_task_fails_at(occurrence: usize) -> Result<tempfile::TempDir, String> {
+    use std::os::unix::fs::DirBuilderExt;
+    let points = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let dir = points.path().join("points");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&dir)
+        .map_err(|e| e.to_string())?;
+    let token = "x3-connection-task";
+    std::fs::write(
+        dir.join("codex.connection.message.json"),
+        json!({"token": token, "occurrence": occurrence, "action": "fail_io"}).to_string(),
+    )
+    .map_err(|e| e.to_string())?;
+    via_store::failpoint::activate(&dir, token)?;
+    Ok(points)
+}
+
+/// How many messages the server wrote up to and including step `at`.
+#[cfg(feature = "test-failpoints")]
+fn emitted_through(replay: &Value, at: usize) -> usize {
+    replay["steps"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .take(at + 1)
+        .filter(|step| step.get("emit").is_some())
+        .count()
+}
+
+/// X0 item 13.2 `connection_task_panic_with_staged_terminal` (B2): the
+/// connection task fails as it takes A's `turn/completed`, which is lost
+/// with it. The supervisor's abnormal fan-out ends A's lane and signals
+/// A's driver at once: the driver latches its own failure (an owned
+/// task), and A, with its acceptance and final text delivered, ends
+/// `transport_lost`, its cleanup unproven, long before its wall; Host
+/// stops the server (the fake takes its SIGTERM).
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn connection_task_panic_with_staged_terminal() {
+    let (mut replay, mut expect) = plain("connection_task_panic_with_staged_terminal").unwrap();
+    let completed = step_with(&replay, "\"method\":\"turn/completed\"").unwrap();
+    let _points = connection_task_fails_at(emitted_through(&replay, completed)).unwrap();
+    cut_after(&mut replay, completed, &[sigterm()]).unwrap();
+    let base = turn_mut(&mut expect, 0)["expect"].clone();
+    failed_after_acceptance(&mut expect, "transport_lost", "uncertain");
+    let turn = &mut turn_mut(&mut expect, 0)["expect"];
+    turn["usage"] = base["usage"].clone();
+    turn["final_text"] = base["final_text"].clone();
+    turn["observations_include"] = json!([
+        {"kind": "turn.accepted", "vendor_turn_id": TURN}, "final_text",
+    ]);
+    turn["observations_exclude"] = json!(["turn.late_terminal"]);
+    expect["sessions"]["main"]["close"] = Value::Null;
+    expect["sessions"]["main"]["health"] = json!({"state": "failed", "first_cause": "owned_task"});
+    variant(
+        "connection_task_panic_with_staged_terminal",
+        &replay,
+        &expect,
+    )
+    .unwrap();
+}
+
+/// X0 item 13.2 `connection_task_panic_idle_driver_reports_loss` (B2), as
+/// far as C2 carries it: A completed and its driver is idle when the
+/// connection task fails on a later message. A's result stands, and A's
+/// driver, with no turn running, still latches its failure (an owned
+/// task) through its abnormal-end signal, so Core retires it. The loss
+/// record it installs reaches Core with C2's `CloseReport.loss` (x.3.2
+/// X5); its handler's record is the adapter's unit test.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn connection_task_panic_idle_driver_reports_loss() {
+    let (mut replay, mut expect) = plain("connection_task_panic_idle_driver_reports_loss").unwrap();
+    let completed = step_with(&replay, "\"method\":\"turn/completed\"").unwrap();
+    let late = json!({"method": "thread/status/changed",
+        "params": {"threadId": THREAD, "status": {"type": "idle"}}});
+    cut_after(&mut replay, completed, &[emit(&late), sigterm()]).unwrap();
+    let _points = connection_task_fails_at(emitted_through(&replay, completed + 1)).unwrap();
+    expect["sessions"]["main"]["close"] = Value::Null;
+    expect["sessions"]["main"]["health"] = json!({"state": "failed", "first_cause": "owned_task"});
+    let knobs = conformance_run::Knobs {
+        await_failure: true,
+        ..conformance_run::Knobs::default()
+    };
+    check_variant(
+        "connection_task_panic_idle_driver_reports_loss",
+        &replay,
+        &expect,
+        knobs,
+    )
+    .unwrap();
+}
+
+/// Finding 3 (x.3.2 X3 fix r1): a stop order after acceptance writes the
+/// turn's one `turn/interrupt` on the control path; the fake expects it
+/// and answers with the interrupted terminal, which ends the turn. A
+/// repeated order writes no second interrupt. Its acknowledgement and the
+/// P7 window are x.3.2 X4's, so `c3_interrupt_uncertain` stays red for
+/// them and this variant leaves them unasserted.
+#[test]
+fn codex_interrupt_written() {
+    for (name, repeat_stop) in [
+        ("codex_interrupt_written", false),
+        ("codex_interrupt_written_once", true),
+    ] {
+        let mut replay = replay_of("c3_interrupt_uncertain").unwrap();
+        let mut expect = expect_of("c3_interrupt_uncertain").unwrap();
+        replay["source"] = json!(format!("{name}: a variant of c3_interrupt_uncertain"));
+        expect["source"] = replay["source"].clone();
+        let turn = &mut turn_mut(&mut expect, 0)["expect"];
+        let fields = turn.as_object_mut().unwrap();
+        fields.remove("cleanup_settles");
+        fields.remove("stop_facts");
+        let why = "the interrupt's acknowledgement and the P7 window are x.3.2 X4's";
+        turn["unasserted"].as_array_mut().unwrap().extend([
+            json!({"field": "cleanup_settles", "why": why}),
+            json!({"field": "stop_facts", "why": why}),
+        ]);
+        let knobs = conformance_run::Knobs {
+            repeat_stop,
+            ..conformance_run::Knobs::default()
+        };
+        check_variant(name, &replay, &expect, knobs).unwrap();
+    }
 }

@@ -1031,3 +1031,63 @@ fn the_plan_model_is_the_named_or_the_discovered_default() {
     );
     assert_eq!(resolved_model(None, Some(&catalog[..1])), None);
 }
+
+/// X0 item 13.2: a generation's abnormal-end handler, whether or not a
+/// turn runs, latches the driver's failure at once (an owned task failed)
+/// and, with a registration, installs the loss naming the session's latest
+/// turn, `omitted` unknown; a second signal merges into it. Without a
+/// registration it installs none.
+#[test]
+fn abnormal_handler_latches_and_records_loss() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use via_routes::codex::AbnormalEnd;
+
+    use super::delivery::{Losses, ObservationLoss, UNKNOWN};
+    use super::driver::abnormal_handler;
+    use crate::{DriverFailure, DriverHealth, TurnNumber};
+
+    let turn = TurnNumber::try_from(4).unwrap();
+    let losses = Arc::new(Mutex::new(Losses {
+        record: None,
+        latest: Some(turn),
+    }));
+    let health = Arc::new(tokio::sync::watch::Sender::new(DriverHealth::Open));
+    let registered = Arc::new(AtomicBool::new(true));
+    let handler = abnormal_handler(
+        Arc::clone(&losses),
+        Arc::clone(&health),
+        Arc::clone(&registered),
+        2,
+    );
+    handler(AbnormalEnd { first_unqueued: 9 });
+    assert_eq!(
+        *health.borrow(),
+        DriverHealth::Failed {
+            first_cause: DriverFailure::OwnedTask
+        }
+    );
+    handler(AbnormalEnd { first_unqueued: 12 });
+    assert_eq!(
+        losses.lock().unwrap().record,
+        Some(ObservationLoss {
+            trigger: turn,
+            generation: 2,
+            first_unqueued: 9,
+            omitted: UNKNOWN,
+        })
+    );
+
+    let bare = Arc::new(Mutex::new(Losses {
+        record: None,
+        latest: Some(turn),
+    }));
+    let idle = Arc::new(tokio::sync::watch::Sender::new(DriverHealth::Open));
+    registered.store(false, Ordering::Release);
+    abnormal_handler(Arc::clone(&bare), Arc::clone(&idle), registered, 2)(AbnormalEnd {
+        first_unqueued: 1,
+    });
+    assert!(bare.lock().unwrap().record.is_none());
+    assert!(matches!(*idle.borrow(), DriverHealth::Failed { .. }));
+}

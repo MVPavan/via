@@ -18,5 +18,9 @@ thiserror = { workspace = true }
 # "rt": the Codex server registry's supervisor owns its task set (x.3.2 X3).
 tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
 
+[dev-dependencies]
+# The connection's unit tests run over Wire's test pipes (x.3.2 X3).
+tokio = { workspace = true, features = ["io-util", "macros", "rt", "sync", "test-util", "time"] }
+
 [lints]
 workspace = true

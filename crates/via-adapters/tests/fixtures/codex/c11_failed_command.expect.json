@@ -122,7 +122,25 @@
         ],
         "unasserted": [],
         "notes": "A commandExecution item that ends failed with exit 2 is tools_started then tools_ended progress; a failed item or the model's prose is not a sandbox denial, so no action.denied (vendors/codex.md §4, §5)."
-      }
+      },
+      "gates": [
+        {
+          "step": 24,
+          "expect": {
+            "accepted": true,
+            "terminal": null,
+            "error": null,
+            "observations_include": [
+              {
+                "kind": "progress",
+                "tools_ended": [
+                  "exec-019a0000-0000-7000-8000-000000400004"
+                ]
+              }
+            ]
+          }
+        }
+      ]
     }
   ]
 }

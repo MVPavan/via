@@ -1,6 +1,6 @@
 {
   "source": "Codex re-probe c1 (two turns on one thread), 0.159.2, 2026-09-30; model/list reply spliced from re-probe cat (3 of 8 rows, descriptions neutralized); thread/start sandbox echo and turn/start sandboxPolicy adapted from the recorded read-only bound to dangerFullAccess (full, the only bound VIA admits); model text neutralized; rate-limit notifications dropped; the run ends at VIA's stdin close (await_eof) after its last close, as the probe closed stdin at the end of the run (exit 0 recorded)",
-  "notes": "Step 10 (turn/start) names step 8, the thread/start reply, as its causal predecessor (after_emit): VIA writes it on that reply, independently of the thread/started notification the server wrote after it.",
+  "notes": "Step 10 (turn/start) names step 8, the thread/start reply, as its causal predecessor (after_emit): VIA writes it on that reply, independently of the thread/started notification the server wrote after it. Each turn's notification burst passes the 16-message ingress lane, so a gate splits it: step 26 holds the rest of turn 1's burst until the driver delivered turn 1's final text, step 40 the rest of turn 2's until it delivered turn 2's first final text (x.3.2 X3 fix r1, Minor 23).",
   "argv": [
     "app-server",
     "--disable",
@@ -196,6 +196,11 @@
       }
     },
     {
+      "await_signal": {
+        "signal": "SIGUSR1"
+      }
+    },
+    {
       "emit": {
         "line": "{\"method\":\"thread/tokenUsage/updated\",\"params\":{\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200001\",\"tokenUsage\":{\"total\":{\"totalTokens\":41135,\"inputTokens\":40982,\"cachedInputTokens\":38400,\"cacheWriteInputTokens\":0,\"outputTokens\":153,\"reasoningOutputTokens\":26},\"last\":{\"totalTokens\":20613,\"inputTokens\":20588,\"cachedInputTokens\":20224,\"cacheWriteInputTokens\":0,\"outputTokens\":25,\"reasoningOutputTokens\":0},\"modelContextWindow\":258400}},\"emittedAtMs\":1790000008001}"
       }
@@ -281,6 +286,11 @@
     {
       "emit": {
         "line": "{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"agentMessage\",\"id\":\"call_0001\",\"text\":\"What would you like me to answer after your clarification: the `note.txt` result or a new request?\",\"phase\":\"final_answer\",\"memoryCitation\":null,\"delivery\":\"async\",\"questions\":[{\"title\":\"What would you like me to answer after your clarification: the `note.txt` result or a new request?\",\"options\":null}]},\"threadId\":\"019a0000-0000-7000-8000-000000100001\",\"turnId\":\"019a0000-0000-7000-8000-000000200002\",\"completedAtMs\":1790000013917},\"emittedAtMs\":1790000013917}"
+      }
+    },
+    {
+      "await_signal": {
+        "signal": "SIGUSR1"
       }
     },
     {
