@@ -502,7 +502,8 @@ pub struct RoutePlan {
     pub route: &'static str,
     /// The adapter version that plans and runs the turn (AD12).
     pub adapter_version: String,
-    /// The last vendor version seen for the binary identity, or `None`.
+    /// The last vendor version seen for the harness and resolved program
+    /// path, or `None`.
     pub vendor_version: Option<String>,
     /// The version status.
     pub version_status: VersionStatus,

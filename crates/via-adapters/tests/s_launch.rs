@@ -1,6 +1,6 @@
 //! S-LAUNCH (adapter design §5.4, §7; C2 §5 AD7; runtime §6.1, §8): the
 //! bootstrap environment, the `harnesses` section, binary resolution and
-//! identity, and the in-memory instance cache. Written before the code.
+//! the in-memory instance cache. Written before the code.
 #![expect(
     clippy::unwrap_used,
     reason = "test fixtures and assertions fail loudly"
@@ -14,9 +14,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::value::RawValue;
 use via_adapters::{
-    AdapterConfig, BOOTSTRAP_ENV, BinaryIdentity, BootstrapEnv, Category, ConfigError, HARNESSES,
-    Harness, HarnessSettings, HarnessesError, HarnessesRule, Incompatibility, Inherit,
-    InheritState, InstanceCache, VERSIONS_KEPT, resolve_binary,
+    AdapterConfig, BOOTSTRAP_ENV, BootstrapEnv, Category, ConfigError, HARNESSES, Harness,
+    HarnessSettings, HarnessesError, HarnessesRule, Incompatibility, Inherit, InheritState,
+    InstanceCache, VERSIONS_KEPT, resolve_binary,
 };
 
 fn raw(text: &str) -> Box<RawValue> {
@@ -341,148 +341,107 @@ fn s_launch_binary_resolution() {
     assert_eq!(resolve_binary(None, "tool", Some(&relative)), None);
 }
 
-fn identity_of(path: &Path) -> BinaryIdentity {
-    BinaryIdentity::of(path).unwrap()
-}
-
-/// C2 §5 AD7: refusals keyed by identity plus recipe key; a different
-/// recipe misses; the last version is looked up by identity.
+/// C2 §5 AD7: a refusal is keyed by the resolved program path plus the
+/// recipe key. A refusal for one recipe does not apply to another recipe,
+/// nor to the same recipe at another path.
 #[test]
-fn s_launch_refusal_cache_key_and_version() {
-    let dir = tempfile::tempdir().unwrap();
-    let binary = dir.path().join("vendor");
-    executable(&binary);
-    let link = dir.path().join("link");
-    std::os::unix::fs::symlink(&binary, &link).unwrap();
-    let identity = identity_of(&binary);
-    assert_eq!(identity_of(&link), identity, "symlinks are followed");
-
+fn s_launch_refusal_cache_keys_on_path_and_recipe() {
+    let program = Path::new("/opt/vendor/bin/vendor");
+    let other = Path::new("/usr/local/bin/vendor");
     let cache = InstanceCache::default();
     let now = Instant::now();
-    assert_eq!(cache.refusal(&identity, "recipe-a", now), None);
+    assert_eq!(cache.refusal(program, "recipe-a", now), None);
     let cause = Incompatibility::FeatureAbsent("interrupt_receipt_v1");
-    cache.record_refusal(identity, "recipe-a".to_owned(), cause, now);
-    assert_eq!(cache.refusal(&identity, "recipe-a", now), Some(cause));
-    assert_eq!(cache.refusal(&identity, "recipe-b", now), None);
-
-    assert_eq!(cache.last_version(&identity), None);
-    cache.record_version(identity, "2.1.0".to_owned());
-    cache.record_version(identity, "2.1.1".to_owned());
-    assert_eq!(cache.last_version(&identity).as_deref(), Some("2.1.1"));
-    let other = dir.path().join("other");
-    executable(&other);
-    assert_eq!(cache.last_version(&identity_of(&other)), None);
+    cache.record_refusal(program, "recipe-a".to_owned(), cause, now);
+    assert_eq!(cache.refusal(program, "recipe-a", now), Some(cause));
+    assert_eq!(cache.refusal(program, "recipe-b", now), None);
+    assert_eq!(cache.refusal(other, "recipe-a", now), None);
 }
 
-/// Touching the binary (size or mtime) gives a new identity, which misses.
+/// Invariant 13: the keys are paths, not file contents. Replacing the file
+/// at the path (a vendor upgrade) keeps both entries; the handshake on the
+/// next launch is what checks the new binary.
 #[test]
-fn s_launch_refusal_cache_identity_change_misses() {
+fn s_launch_instance_cache_ignores_the_file_behind_the_path() {
     let dir = tempfile::tempdir().unwrap();
     let binary = dir.path().join("vendor");
     executable(&binary);
-    let before = identity_of(&binary);
     let cache = InstanceCache::default();
     let now = Instant::now();
     let cause = Incompatibility::ReadbackDiffers("permission_mode");
-    cache.record_refusal(before, "recipe".to_owned(), cause, now);
-    cache.record_version(before, "1.0.0".to_owned());
+    cache.record_refusal(&binary, "recipe".to_owned(), cause, now);
+    cache.record_version("vendor", &binary, "1.0.0".to_owned());
 
-    // Size change.
-    fs::write(&binary, "#!/bin/sh\nexit 0\n# grown\n").unwrap();
-    let grown = identity_of(&binary);
-    assert_ne!(grown, before);
-    assert_eq!(cache.refusal(&grown, "recipe", now), None);
-    assert_eq!(cache.last_version(&grown), None);
-
-    // Mtime change only, same size.
-    let file = fs::File::options().write(true).open(&binary).unwrap();
-    let modified = fs::metadata(&binary).unwrap().modified().unwrap();
-    file.set_modified(modified + Duration::from_secs(5))
-        .unwrap();
-    drop(file);
-    let touched = identity_of(&binary);
-    assert_ne!(touched, grown);
-    assert_eq!(cache.refusal(&touched, "recipe", now), None);
-    // The original identity's entry is still live.
-    assert_eq!(cache.refusal(&before, "recipe", now), Some(cause));
+    fs::write(&binary, "#!/bin/sh\nexit 0\n# upgraded\n").unwrap();
+    assert_eq!(cache.refusal(&binary, "recipe", now), Some(cause));
+    assert_eq!(
+        cache.last_version("vendor", &binary).as_deref(),
+        Some("1.0.0")
+    );
 }
 
 /// An entry live at 9:59 after its write is gone at 10:00; time is passed in.
 #[test]
 fn s_launch_refusal_cache_expires_after_ten_minutes() {
-    let dir = tempfile::tempdir().unwrap();
-    let binary = dir.path().join("vendor");
-    executable(&binary);
-    let identity = identity_of(&binary);
+    let program = Path::new("/opt/vendor/bin/vendor");
     let cache = InstanceCache::default();
     let written = Instant::now();
     let cause = Incompatibility::FeatureAbsent("tool_list");
-    cache.record_refusal(identity, "recipe".to_owned(), cause, written);
+    cache.record_refusal(program, "recipe".to_owned(), cause, written);
     let live = written + Duration::from_secs(9 * 60 + 59);
-    assert_eq!(cache.refusal(&identity, "recipe", live), Some(cause));
+    assert_eq!(cache.refusal(program, "recipe", live), Some(cause));
     let expired = written + Duration::from_mins(10);
-    assert_eq!(cache.refusal(&identity, "recipe", expired), None);
+    assert_eq!(cache.refusal(program, "recipe", expired), None);
     // A rewrite starts a fresh ten minutes.
-    cache.record_refusal(identity, "recipe".to_owned(), cause, expired);
+    cache.record_refusal(program, "recipe".to_owned(), cause, expired);
     assert_eq!(
-        cache.refusal(&identity, "recipe", expired + Duration::from_secs(599)),
+        cache.refusal(program, "recipe", expired + Duration::from_secs(599)),
         Some(cause)
     );
 }
 
-/// C2 §5: the last version is per binary identity, whatever path reached
-/// it: a symlink alias hits, a newer version seen through the alias is
-/// seen through the original path, a late handshake from an older
-/// identity leaves the newer identity's record alone, and at most
-/// [`VERSIONS_KEPT`] identities are kept, the least recently written
-/// evicted first.
+/// C2 §5: the last version is per harness and resolved program path. The
+/// latest write wins; another path (a symlink alias included) or another
+/// harness misses; at most [`VERSIONS_KEPT`] pairs are kept, the least
+/// recently written evicted first.
 #[test]
-fn s_launch_version_cache_by_identity() {
-    let dir = tempfile::tempdir().unwrap();
-    let binary = dir.path().join("vendor");
-    executable(&binary);
-    let alias = dir.path().join("alias");
-    std::os::unix::fs::symlink(&binary, &alias).unwrap();
+fn s_launch_version_cache_by_harness_and_path() {
+    let program = Path::new("/opt/vendor/bin/vendor");
+    let alias = Path::new("/usr/local/bin/vendor");
     let cache = InstanceCache::default();
 
-    let old = identity_of(&binary);
-    cache.record_version(old, "1.0.0".to_owned());
+    assert_eq!(cache.last_version("first", program), None);
+    cache.record_version("first", program, "1.0.0".to_owned());
+    cache.record_version("first", program, "1.0.1".to_owned());
     assert_eq!(
-        cache.last_version(&identity_of(&alias)).as_deref(),
-        Some("1.0.0")
-    );
-    cache.record_version(identity_of(&alias), "1.0.1".to_owned());
-    assert_eq!(
-        cache.last_version(&identity_of(&binary)).as_deref(),
+        cache.last_version("first", program).as_deref(),
         Some("1.0.1")
     );
+    assert_eq!(cache.last_version("first", alias), None);
+    assert_eq!(cache.last_version("second", program), None);
 
-    // The binary is upgraded; the old instance's handshake arrives late.
-    fs::write(&binary, "#!/bin/sh\nexit 0\n# upgraded\n").unwrap();
-    let new = identity_of(&binary);
-    assert_ne!(new, old);
-    cache.record_version(new, "2.0.0".to_owned());
-    cache.record_version(old, "1.0.2".to_owned());
-    assert_eq!(cache.last_version(&new).as_deref(), Some("2.0.0"));
-    assert_eq!(cache.last_version(&old).as_deref(), Some("1.0.2"));
-
-    // The bound: one more identity than kept evicts the least recently
-    // written, here `new` (`old` was written after it).
+    // The bound: one more pair than kept evicts the least recently
+    // written, here `first` at `program` (`second` was written after it).
+    cache.record_version("second", program, "2.0.0".to_owned());
     let mut others = Vec::new();
     for index in 0..VERSIONS_KEPT - 1 {
-        let path = dir.path().join(format!("other-{index}"));
-        executable(&path);
-        let identity = identity_of(&path);
-        cache.record_version(identity, format!("0.{index}"));
-        others.push(identity);
+        let path = PathBuf::from(format!("/opt/other-{index}"));
+        cache.record_version("first", &path, format!("0.{index}"));
+        others.push(path);
     }
     assert_eq!(
-        cache.last_version(&new),
+        cache.last_version("first", program),
         None,
         "the oldest write is evicted"
     );
-    assert_eq!(cache.last_version(&old).as_deref(), Some("1.0.2"));
-    for (index, identity) in others.iter().enumerate() {
-        assert_eq!(cache.last_version(identity), Some(format!("0.{index}")));
+    assert_eq!(
+        cache.last_version("second", program).as_deref(),
+        Some("2.0.0")
+    );
+    for (index, path) in others.iter().enumerate() {
+        assert_eq!(
+            cache.last_version("first", path),
+            Some(format!("0.{index}"))
+        );
     }
 }

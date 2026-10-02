@@ -18,7 +18,6 @@ use super::normalize::{
 };
 use crate::VendorTerminalStatus;
 use crate::config::BootstrapEnv;
-use crate::instance::BinaryIdentity;
 use crate::observation::{
     ClassHint, DenialKind, Observation, ProgressMarks, StopReason, UsageSample,
 };
@@ -174,22 +173,19 @@ fn the_server_recipe_is_the_allow_list() {
     );
 }
 
-/// X0 item 3: equal inputs give an equal hash; each recipe component and
-/// the binary identity change it; the display is 16 lowercase hex digits.
+/// X0 item 3: equal inputs give an equal hash; each recipe component
+/// changes it; the display is 16 lowercase hex digits.
 #[test]
 fn the_config_hash_covers_the_recipe() {
-    let dir = tempfile::tempdir().unwrap();
-    let binary = dir.path().join("codex");
-    std::fs::write(&binary, "a").unwrap();
-    let identity = BinaryIdentity::of(&binary).unwrap();
+    let binary = Path::new("/opt/vendor/codex");
     let recipe = |hooks_state, home: &str| {
-        ServerRecipe::new(&binary, hooks(hooks_state), &env(), Path::new(home))
+        ServerRecipe::new(binary, hooks(hooks_state), &env(), Path::new(home))
     };
     let base = recipe(InheritState::Off, "/state/vendor/codex");
-    let hash = base.config_hash("0.1.0", &identity);
+    let hash = base.config_hash("0.1.0");
     assert_eq!(
         hash,
-        recipe(InheritState::Off, "/state/vendor/codex").config_hash("0.1.0", &identity)
+        recipe(InheritState::Off, "/state/vendor/codex").config_hash("0.1.0")
     );
     let display = hash.display();
     assert_eq!(display.len(), 16);
@@ -201,22 +197,19 @@ fn the_config_hash_covers_the_recipe() {
     let mut other_env = base.clone();
     other_env.env[1].1 = "/home/v".into();
     let mut other_program = base.clone();
-    other_program.program = dir.path().join("codex2");
-    std::fs::write(dir.path().join("b"), "bb").unwrap();
-    let other_identity = BinaryIdentity::of(&dir.path().join("b")).unwrap();
-    let changed: [(&str, ConfigHash); 6] = [
+    other_program.program = "/opt/vendor/codex2".into();
+    let changed: [(&str, ConfigHash); 5] = [
         (
             "argv",
-            recipe(InheritState::On, "/state/vendor/codex").config_hash("0.1.0", &identity),
+            recipe(InheritState::On, "/state/vendor/codex").config_hash("0.1.0"),
         ),
         (
             "home and cwd",
-            recipe(InheritState::Off, "/other").config_hash("0.1.0", &identity),
+            recipe(InheritState::Off, "/other").config_hash("0.1.0"),
         ),
-        ("environment", other_env.config_hash("0.1.0", &identity)),
-        ("program", other_program.config_hash("0.1.0", &identity)),
-        ("identity", base.config_hash("0.1.0", &other_identity)),
-        ("adapter version", base.config_hash("0.2.0", &identity)),
+        ("environment", other_env.config_hash("0.1.0")),
+        ("program", other_program.config_hash("0.1.0")),
+        ("adapter version", base.config_hash("0.2.0")),
     ];
     for (what, other) in changed {
         assert_ne!(hash, other, "{what}");

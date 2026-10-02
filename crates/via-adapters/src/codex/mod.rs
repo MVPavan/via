@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::harness::Harness;
-use crate::instance::{BinaryIdentity, InstanceCache};
+use crate::instance::InstanceCache;
 use crate::plan::{
     Bound, DescribeRequest, Inherit, ModelChoice, Refusal, RefusalKind, RoutePlan, TurnCheck,
     TurnParams, VendorOptions, effective_inherit,
@@ -99,9 +99,7 @@ impl CodexAdapter {
             .clone()
             .filter(|bound| plan::sandbox(bound).is_ok());
         let (inherit, switch_warning) = effective_inherit(&plan::categories(), requested);
-        let vendor_version = BinaryIdentity::of(&self.binary)
-            .ok()
-            .and_then(|identity| self.instances.last_version(&identity));
+        let vendor_version = self.instances.last_version(harness.name(), &self.binary);
         let version_status = vendor_version.as_deref().map_or(
             crate::plan::VersionStatus::Untested,
             normalize::version_status,
