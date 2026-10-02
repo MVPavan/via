@@ -1580,9 +1580,14 @@ fn a_failed_proof_write_fails_the_restart_close_before_closed() {
     run(async {
         let session = closing_with_anchor(&root, true).await;
         let engine = open(&root);
-        engine
-            .adapter
-            .hold_capacity("0-anchor".to_owned(), session.clone(), Box::new(()));
+        engine.adapter.hold_capacity(
+            "0-anchor".to_owned(),
+            via_store::ProcessOwner::Turn {
+                session_id: session.clone(),
+                turn: via_store::TurnNumber::try_from(1).expect("turn"),
+            },
+            Box::new(()),
+        );
         let refused = engine.hand_off_queued().await.unwrap_err();
         assert!(refused.starts_with("store_error:"), "{refused}");
         assert!(acked(&points, "store.journal.absence", 1));
@@ -1614,9 +1619,14 @@ fn an_uncertain_proof_write_fails_the_restart_close_before_closed() {
         // Declared after the Engine, so it drops first: Store's writer is
         // released before the Engine joins it.
         let release = Release(points.join("store.journal.absence.1.release"));
-        engine
-            .adapter
-            .hold_capacity("0-anchor".to_owned(), session.clone(), Box::new(()));
+        engine.adapter.hold_capacity(
+            "0-anchor".to_owned(),
+            via_store::ProcessOwner::Turn {
+                session_id: session.clone(),
+                turn: via_store::TurnNumber::try_from(1).expect("turn"),
+            },
+            Box::new(()),
+        );
         // Store's writer stays paused: a `Closed` commit would wait on it.
         let refused = tokio::time::timeout(Duration::from_secs(10), engine.hand_off_queued())
             .await
@@ -1663,9 +1673,14 @@ fn a_failed_proof_before_a_page_read_failure_fails_the_restart_close() {
         // released before the Engine joins it.
         let release = Release(points.join(format!("{proof}.1.release")));
         for n in 0..anchors {
-            engine
-                .adapter
-                .hold_capacity(anchor_id(n), session.clone(), Box::new(()));
+            engine.adapter.hold_capacity(
+                anchor_id(n),
+                via_store::ProcessOwner::Turn {
+                    session_id: session.clone(),
+                    turn: via_store::TurnNumber::try_from(1).expect("turn"),
+                },
+                Box::new(()),
+            );
         }
         let (refused, read_hit) = tokio::join!(
             async {
@@ -1719,9 +1734,14 @@ fn an_unprovable_group_leaves_the_restart_close_cleanup_uncertain() {
     run(async {
         let session = closing_with_anchor(&root, false).await;
         let engine = open(&root);
-        engine
-            .adapter
-            .hold_capacity("0-anchor".to_owned(), session.clone(), Box::new(()));
+        engine.adapter.hold_capacity(
+            "0-anchor".to_owned(),
+            via_store::ProcessOwner::Turn {
+                session_id: session.clone(),
+                turn: via_store::TurnNumber::try_from(1).expect("turn"),
+            },
+            Box::new(()),
+        );
         let handoff = engine.hand_off_queued().await.unwrap();
         assert_eq!((handoff.cancelled, handoff.closed), (1, 1), "{handoff:?}");
         assert_eq!(
@@ -1997,16 +2017,26 @@ fn an_added_holding_resets_the_reprobe_backoff() {
         let engine = open(&root);
         let session = new_session(&engine).await;
         let passes = || engine.faults.reprobe_passes.load(Ordering::Acquire);
-        engine
-            .adapter
-            .hold_capacity("0-held".to_owned(), session.clone(), Box::new(()));
+        engine.adapter.hold_capacity(
+            "0-held".to_owned(),
+            via_store::ProcessOwner::Turn {
+                session_id: session.clone(),
+                turn: via_store::TurnNumber::try_from(1).expect("turn"),
+            },
+            Box::new(()),
+        );
         let stop = force();
         let ((), ()) = tokio::join!(engine.reprobe(), async {
             // During the third pass or the 8 s wait after it.
             until(|| passes() == 3).await;
-            engine
-                .adapter
-                .hold_capacity("1-held".to_owned(), session.clone(), Box::new(()));
+            engine.adapter.hold_capacity(
+                "1-held".to_owned(),
+                via_store::ProcessOwner::Turn {
+                    session_id: session.clone(),
+                    turn: via_store::TurnNumber::try_from(1).expect("turn"),
+                },
+                Box::new(()),
+            );
             let added = tokio::time::Instant::now();
             let reset = tokio::time::timeout(Duration::from_millis(2_500), async {
                 while passes() < 4 {

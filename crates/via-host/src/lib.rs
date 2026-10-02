@@ -16,16 +16,13 @@ pub use host::{
     TurnRecovery,
 };
 
-pub use via_store::{Deadline, SessionId, TurnNumber};
-
-/// The one turn that owns a private fake process.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProcessOwner {
-    /// VIA session that admitted the turn.
-    pub session_id: SessionId,
-    /// One-based turn number.
-    pub turn: TurnNumber,
-}
+/// The owner of a private process group (runtime §5 AR6): the turn of a
+/// per-turn route, or a shared server, which no turn owns. Host stays
+/// protocol- and key-free: it only records the owner and, for a server,
+/// commits each turn's link before the turn's first vendor byte
+/// ([`ProcessControl::link_turn`]).
+pub use via_store::ProcessOwner;
+pub use via_store::{Deadline, ServerId, SessionId, TurnNumber};
 
 /// Explicit child environment; Host never inherits the daemon environment.
 #[derive(Clone, Default, Eq, PartialEq)]
@@ -77,10 +74,11 @@ pub struct PrivateProcessSpec {
     pub cwd: PathBuf,
     /// Explicit allow-listed environment.
     pub env: EnvAllowList,
-    /// Durable owning turn.
+    /// Durable owner: the turn, or the shared server (runtime §5 AR6).
     pub owner: ProcessOwner,
-    /// The turn's `stderr.log` (design §7.2): Host creates it and hands it to
-    /// the anchor as standard error, which the vendor inherits.
+    /// The owner's `stderr.log` (design §7.2, runtime §4), in the turn's or
+    /// the server's evidence folder: Host creates it and hands it to the
+    /// anchor as standard error, which the vendor inherits.
     pub stderr_path: PathBuf,
     /// Capacity held for the group's life; dropped at once if no group starts.
     pub capacity: Option<CapacityToken>,

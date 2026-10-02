@@ -135,6 +135,14 @@ impl Engine {
         match pass {
             Ok(report) => {
                 for owner in &report.not_committed {
+                    // No server-owned anchor is committed before Host owns
+                    // servers.
+                    let via_adapters::ProcessOwner::Turn {
+                        session_id: owner, ..
+                    } = owner
+                    else {
+                        continue;
+                    };
                     let owner = FailureScope::Session(owner);
                     self.store_failure(FailureSite::Absence, WriteOutcome::NotCommitted, owner)
                         .finish()
@@ -224,7 +232,7 @@ impl Engine {
             // No server-owned anchor is committed before Host owns servers.
             let via_store::ProcessOwner::Turn {
                 session_id: owner_session,
-                ..
+                turn,
             } = &owner.owner
             else {
                 continue;
@@ -236,7 +244,10 @@ impl Engine {
                 let token = self.recovered.hold(&self.slots);
                 self.adapter.hold_capacity(
                     owner.anchor_id.clone(),
-                    owner_session.clone(),
+                    via_store::ProcessOwner::Turn {
+                        session_id: owner_session.clone(),
+                        turn: *turn,
+                    },
                     Box::new(token),
                 );
             }

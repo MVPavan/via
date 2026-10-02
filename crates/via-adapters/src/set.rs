@@ -11,8 +11,8 @@ use crate::harness::Harness;
 use crate::plan::{Adapter, AdapterSet, SessionRef};
 use crate::runtime::{normalize_recovery, shutdown_report};
 use crate::{
-    AdapterError, AdapterShutdown, AnchorRecovery, CapacityToken, Cleanup, Deadline, ReprobeReport,
-    SessionId, TurnNumber,
+    AdapterError, AdapterShutdown, AnchorRecovery, CapacityToken, Cleanup, Deadline, ProcessOwner,
+    ReprobeReport, SessionId, TurnNumber,
 };
 
 impl AdapterSet {
@@ -66,7 +66,7 @@ impl AdapterSet {
     }
 
     /// Hands Host capacity for a group it did not launch (design §11).
-    pub fn hold_capacity(&self, anchor_id: String, owner: SessionId, token: CapacityToken) {
+    pub fn hold_capacity(&self, anchor_id: String, owner: ProcessOwner, token: CapacityToken) {
         self.runtime.hold_capacity(anchor_id, owner, token);
     }
 

@@ -68,7 +68,15 @@ impl WireRuntime {
     ) -> Result<WireConnection, WireError> {
         let root = self.evidence.clone();
         let tasks = self.evidence.blob_tasks().clone();
-        let (session, turn) = (spec.owner.session_id.clone(), spec.owner.turn);
+        let via_host::ProcessOwner::Turn {
+            session_id: session,
+            turn,
+        } = spec.owner.clone()
+        else {
+            return Err(WireError::Host(via_host::HostError::Invalid(
+                "a shared server's connection is not opened here yet",
+            )));
+        };
         // An owned blob step (coding-style §5): answered within 2 s, and
         // still counted at final shutdown if it overran or its caller ended.
         let folder = tasks
@@ -104,7 +112,7 @@ impl WireRuntime {
     pub fn hold_capacity(
         &self,
         anchor_id: String,
-        owner: via_store::SessionId,
+        owner: via_host::ProcessOwner,
         token: via_host::CapacityToken,
     ) {
         self.host.hold_capacity(anchor_id, owner, token);
@@ -218,10 +226,8 @@ pub struct WireRecovery {
     pub anchor_id: String,
     /// Opaque committed launch generation.
     pub generation: String,
-    /// Owning VIA session.
-    pub owner_session: via_store::SessionId,
-    /// Owning turn.
-    pub owner_turn: via_store::TurnNumber,
+    /// Owner: the turn, or the shared server (runtime §5 AR6).
+    pub owner: via_host::ProcessOwner,
     /// Group cleanup certainty under Host's identity and absence checks.
     pub cleanup: super::WireCleanup,
     /// Host stopped the group while its vendor was live (Host force evidence).
@@ -395,8 +401,7 @@ fn normalize_recovery(report: via_host::RecoveryReport) -> WireRecovery {
     WireRecovery {
         anchor_id: report.anchor_id,
         generation: report.generation,
-        owner_session: report.owner_session,
-        owner_turn: report.owner_turn,
+        owner: report.owner,
         cleanup: match report.cleanup {
             via_host::CleanupEvidence::GroupAbsent(_) => super::WireCleanup::Quiescent,
             via_host::CleanupEvidence::Uncertain(_) => super::WireCleanup::Uncertain,

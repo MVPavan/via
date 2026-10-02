@@ -93,7 +93,7 @@ impl Fixture {
             args: Vec::new(),
             cwd: self.root.clone(),
             env: EnvAllowList::default(),
-            owner: ProcessOwner {
+            owner: ProcessOwner::Turn {
                 session_id: SessionId::try_from("s_0123456789ab").unwrap(),
                 turn: TurnNumber::try_from(1).unwrap(),
             },

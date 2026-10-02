@@ -545,7 +545,7 @@ impl Engine {
             // No server-owned anchor is committed before Host owns servers.
             let via_store::ProcessOwner::Turn {
                 session_id: owner_session,
-                ..
+                turn,
             } = &owner.owner
             else {
                 continue;
@@ -557,7 +557,10 @@ impl Engine {
                 let token = self.recovered.hold(&self.slots);
                 self.adapter.hold_capacity(
                     owner.anchor_id.clone(),
-                    owner_session.clone(),
+                    via_store::ProcessOwner::Turn {
+                        session_id: owner_session.clone(),
+                        turn: *turn,
+                    },
                     Box::new(token),
                 );
             }
@@ -962,9 +965,7 @@ impl Reconciled {
                 turn_running: anchor.turn_running,
             };
             let report = reports.iter().find(|report| {
-                report.anchor_id == *owner.anchor_id
-                    && report.session_id == *owner.session_id
-                    && report.turn == owner.turn
+                report.anchor_id == *owner.anchor_id && report.owner == anchor.owner
             });
             if report.is_none() {
                 self.missing += 1;
@@ -979,10 +980,9 @@ impl Reconciled {
                             .entry(owner.session_id.clone())
                             .or_default()
                             .push(AnchorRecovery {
-                                session_id: report.session_id.clone(),
                                 anchor_id: report.anchor_id.clone(),
                                 generation: report.generation.clone(),
-                                turn: report.turn,
+                                owner: report.owner.clone(),
                                 cleanup: report.cleanup,
                                 forced: report.forced,
                             });
@@ -1128,10 +1128,12 @@ mod tests {
 
     fn report(anchor_id: &str, session: &SessionId, cleanup: Cleanup) -> AnchorRecovery {
         AnchorRecovery {
-            session_id: session.clone(),
             anchor_id: anchor_id.to_owned(),
             generation: "g".to_owned(),
-            turn: TurnNumber::try_from(1).expect("turn"),
+            owner: via_store::ProcessOwner::Turn {
+                session_id: session.clone(),
+                turn: TurnNumber::try_from(1).expect("turn"),
+            },
             cleanup,
             forced: false,
         }

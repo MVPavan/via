@@ -263,7 +263,7 @@ fn launch_inputs(
     capacity: Option<crate::CapacityToken>,
 ) -> Result<(PrivateProcessSpec, TurnStart), Box<TurnEnd>> {
     let session_id = driver.spec.session_id.clone();
-    let owner = ProcessOwner {
+    let owner = ProcessOwner::Turn {
         session_id: session_id.clone(),
         turn,
     };

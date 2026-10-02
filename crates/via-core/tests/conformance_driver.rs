@@ -1114,10 +1114,12 @@ fn conformance_persistent_acceptances_carry_the_connection_handshake() {
 fn conformance_recover_with_host_death_facts_is_dead() {
     let rig = Rig::new(&json!({}), &[]);
     let fact = |cleanup| AnchorRecovery {
-        session_id: SessionId::try_from(SESSION).unwrap(),
         anchor_id: "anchor-1".to_owned(),
         generation: "1".to_owned(),
-        turn: TurnNumber::try_from(1).unwrap(),
+        owner: via_adapters::ProcessOwner::Turn {
+            session_id: SessionId::try_from(SESSION).unwrap(),
+            turn: TurnNumber::try_from(1).unwrap(),
+        },
         cleanup,
         forced: false,
     };

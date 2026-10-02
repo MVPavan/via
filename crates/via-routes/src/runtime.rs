@@ -40,7 +40,7 @@ impl RouteRuntime {
     pub fn hold_capacity(
         &self,
         anchor_id: String,
-        owner: crate::SessionId,
+        owner: crate::ProcessOwner,
         token: via_wire::CapacityToken,
     ) {
         self.wire.hold_capacity(anchor_id, owner, token);

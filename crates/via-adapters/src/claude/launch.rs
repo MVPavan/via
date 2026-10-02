@@ -347,7 +347,7 @@ mod tests {
             std::sync::Arc::default(),
             &env,
         );
-        let owner = ProcessOwner {
+        let owner = ProcessOwner::Turn {
             session_id: SessionId::try_from("s_7f3k9q2mzr4c").unwrap(),
             turn: crate::TurnNumber::try_from(2).unwrap(),
         };
