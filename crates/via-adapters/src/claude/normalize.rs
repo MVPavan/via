@@ -115,6 +115,13 @@ pub(crate) enum End {
 #[derive(Debug)]
 pub(crate) struct PendingDecline {
     /// The ID the decline echoes.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Route echoes the request's own ID; the unit tests pin this one"
+        )
+    )]
     pub(crate) request_id: String,
     /// The call whose denial the written decline suppresses.
     tool_use_id: Option<String>,
@@ -215,11 +222,19 @@ impl Normalizer {
     }
 
     /// Tool calls started and not ended.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "diagnostic count, pinned by the unit tests")
+    )]
     pub(crate) fn open_tools(&self) -> usize {
         self.open.len()
     }
 
     /// Tool results that answered no known call (protocol evidence).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "diagnostic count, pinned by the unit tests")
+    )]
     pub(crate) fn unmatched_tool_results(&self) -> u64 {
         self.unmatched
     }

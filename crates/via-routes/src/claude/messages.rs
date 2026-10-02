@@ -212,7 +212,7 @@ struct RawUserBody {
 }
 
 /// One `result.permission_denials` entry.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct PermissionDenial {
     /// The denied tool.
     pub tool_name: String,
@@ -224,7 +224,7 @@ pub struct PermissionDenial {
 }
 
 /// `result.usage`: the turn aggregate.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct ResultUsage {
     /// Uncached input.
     #[serde(default)]
@@ -247,7 +247,7 @@ pub struct ResultUsage {
 }
 
 /// `result.usage.output_tokens_details`.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct OutputDetails {
     /// Reasoning output.
     #[serde(default)]
@@ -255,7 +255,7 @@ pub struct OutputDetails {
 }
 
 /// `result`.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct ResultMessage {
     /// `success`, `error_during_execution`, `error_max_turns`, …; never
     /// a classification on its own (a `success` can carry `is_error`).

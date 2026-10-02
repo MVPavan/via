@@ -32,7 +32,7 @@ pub(crate) const ARG_MAX: usize = 128 * 1024 - 1;
 const MODELS: [&str; 3] = ["sonnet", "opus", "haiku"];
 
 /// This adapter's version (AD12): capabilities belong to it.
-fn adapter_version() -> String {
+pub(crate) fn adapter_version() -> String {
     env!("CARGO_PKG_VERSION").to_owned()
 }
 
