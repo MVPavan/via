@@ -276,7 +276,9 @@ paths, not successful normal finalization. Existing input caps still apply.
 ```rust
 pub struct WireConnection { /* exclusive pipe/task ownership */ }
 pub struct WireRuntime { evidence: EvidenceRoot, host: Host }
-pub struct RuntimeConfig { pub anchor_binary: PathBuf, pub anchor_dir: PathBuf }
+pub struct RuntimeConfig { pub anchor_binary: PathBuf, pub anchor_dir: PathBuf, pub vendor_state_dir: PathBuf }
+pub enum WriteBounds { CutAt(Deadline), StartBy { start_by: Deadline, finish_by: Deadline } }
+pub enum WriteState { Queued, Claimed, Started, Done(SendOutcome), Withdrawn, Expired }
 pub struct WireParts { pub sender: WireSender, pub messages: WireMessages }
 pub struct VendorMessage { pub bytes: BoundedBytes }
 pub enum WireHealth {
@@ -292,31 +294,48 @@ impl WireRuntime {
                            spec: PrivateProcessSpec, evidence: EvidenceFolder,
                            deadline: Deadline)
         -> impl Future<Output = Result<WireConnection, WireError>> + Send;
+    pub fn turn_folder(&self, session: &SessionId, turn: TurnNumber)
+        -> impl Future<Output = Result<TurnFolder, WireError>> + Send;
+    pub fn journal_uncertain(&self) -> watch::Receiver<bool>;
 }
 impl WireConnection {
     pub fn into_parts(self) -> WireParts;
 }
 impl WireSender {
-    pub fn write(&self, message: InputMessage, deadline: Deadline)
-        -> impl Future<Output = Result<SendOutcome, WireError>> + Send;
+    pub fn write(&self, message: InputMessage, bounds: WriteBounds) -> PendingWrite;
     pub fn close_input(&self, deadline: Deadline)
         -> impl Future<Output = Result<(), WireError>> + Send;
     pub fn close(&self, request: CloseRequest)
         -> impl Future<Output = CloseReport> + Send;
+    pub fn withdraw(&self, ticket: WriteTicket) -> WriteState;
+    pub fn hold_data(&self) -> DataHold;
+    /// Synchronous and idempotent: the first call stops admitting stdout messages; the
+    /// prefix is kept for `drain_admitted`. The failure's disposition is the route's.
+    pub fn seal(&self);
+    pub fn link_turn(&self, session: &SessionId, turn: TurnNumber, deadline: Deadline)
+        -> impl Future<Output = CommitOutcome<()>> + Send;
 }
 impl WireMessages {
     pub fn next_message(&mut self)
         -> impl Future<Output = Result<Option<VendorMessage>, WireError>> + Send;
+    /// After a seal (Route's, or the end of Wire's own reader on its failure):
+    /// the complete messages admitted before it, then the boundary.
+    pub fn drain_admitted(&mut self) -> impl Future<Output = Admitted> + Send;
 }
+impl PendingWrite { pub fn ticket(&self) -> WriteTicket; }
+pub enum Admitted { Message(VendorMessage), Boundary { discarded_bytes: u64 } }
+impl VendorMessage { /* holds its StagingPermit until dropped */ }
 ```
 
-Wire's close report (`WireCloseReport`) carries Host's `leftovers` unchanged
-(§5, C2 §4.2).
+Wire's close report (`WireCloseReport`) carries Host's `leftovers` and
+`stopped_live` unchanged (§5, C2 §4.2).
 
 The clonable sender/control handle and unique message receiver allow reads and
 control writes concurrently without borrowing one object mutably twice.
-`WireRuntime::open_connection` creates the turn's evidence folder
-and invokes Host acquisition. Direct `WireConnection::open(&Host, spec,
+`WireRuntime::open_connection` creates the owner's evidence folder (the
+turn's for a turn owner, `evidence/servers/<server_id>/` for a server
+owner) and invokes Host acquisition; `turn_folder` creates a turn's
+folder on a shared route. Direct `WireConnection::open(&Host, spec,
 deadline)` is private to Wire; `WireConnection::control()` is
 private or removed. No public runtime/connection getter or facade re-export
 exposes Host, ProcessControl or ProcessJournal. Route
@@ -326,14 +345,33 @@ without exposing journal or Host getters; the separately reviewed outer
 test-supervisor identity snapshot/cleanup remains unchanged.
 `close_input` is idempotent, closes only vendor stdin and acknowledges only
 after its endpoint is dropped. The one stdin writer settles any previously
-admitted complete input message within the remaining 2 s finalization
-budget, then drops the endpoint. It starts no new write after close request
-and never interleaves bytes. A partial write that cannot finish closes input
-and reports the existing indeterminate transport condition; it never reuses
-the connection or extends the deadline. This operation does not request
-Host group cleanup, stop output readers or fabricate a
-successful send. The future C4 owner implements it with the real WireSender;
-the frozen contract-only increment needs no unimplemented stub.
+admitted complete input message within the remaining 2 s finalization budget,
+then drops the endpoint. It starts no new write after close request and never
+interleaves bytes. Data writes carry `WriteBounds`. `CutAt(deadline)` is the
+private-route rule above: a data message cut by its deadline ends the writer
+and drops stdin. `StartBy` is for shared connections and follows the control
+queue's rule: one queue and lock hold control messages and the ticketed data
+slot; `start_by` bounds only the wait for the first byte; a withdrawn or
+unstarted-expired message is not written and stdin stays open; a started one
+is written whole by `finish_by`. Claiming a job is not starting it: a claimed
+job stays withdrawable until its first byte, and the writer decides
+withdrawal, expiry and the first successful byte write under the queue lock,
+making one non-blocking `poll_write` call while it holds it; `Started` means a
+byte was written. The writer claims the data job only while no `DataHold`
+exists, and returns a claimed, unstarted data job to the queue when a hold
+appears. A `VendorMessage`'s staging charge is released when the message is
+dropped, not when it is received. `seal` takes no cause and is idempotent: its
+first call stops admission at once, under the lock the reader takes around
+each admission, and later messages are discarded and their bytes counted; a
+reader failure stops admission the same way. After a seal `drain_admitted`
+yields the messages admitted before it, then the boundary; it never waits for
+more output. The connection failure's disposition is kept by the route, not by
+Wire. A partial write that cannot finish closes input and reports the existing
+indeterminate transport condition; it never reuses the connection or extends
+the deadline. This operation does not request Host group cleanup, stop output
+readers or fabricate a successful send. The future C4 owner implements it with
+the real WireSender; the frozen contract-only increment needs no unimplemented
+stub.
 One task drains stdout. It never waits for Route, Core or SQLite. It
 splits bytes into vendor messages at LF, at most 1 MiB each including LF,
 and queues each with a nonblocking send; a full queue fails the connection
@@ -343,17 +381,23 @@ bytes, so the vendor never blocks on a full pipe. The splitter retains
 split UTF-8 without interpreting it; only Route decodes UTF-8/JSON. EOF
 with an unfinished message is the in-band end `Unterminated`.
 
-VIA keeps no copy of vendor traffic (T4 requirements R8). Each submitted
-turn has an evidence folder, `<state>/evidence/<session_id>/<turn>/`. The
-vendor's stderr is the file `stderr.log` there: Host opens it and gives
-it to the anchor as stderr, the vendor inherits it, and the operating
-system writes it; no VIA task reads it. When Route cannot decode a
-message, and when a message exceeds 1 MiB or ends unterminated, Wire
-writes its first 64 KiB to `undecoded.bin`, and the turn's failure names
-the file and the message's length. A final text too long for the
-envelope is written there as `final_text.txt`, and a structured output too
-long for it as `structured_output.json` (C1 §5). The vendor's stderr
-is not capped. The vendor's own transcript keeps the
+VIA keeps no copy of vendor traffic (T4 requirements R8). Each submitted turn
+has an evidence folder, `<state>/evidence/<session_id>/<turn>/`. A shared
+server's connection has its own, `<state>/evidence/servers/<server_id>/`. The
+vendor's stderr is the file `stderr.log` in its owner's folder (the turn's on
+a per-turn route, the server's on a shared one): Host opens it and gives it to
+the anchor as stderr, the vendor inherits it, and the operating system writes
+it; no VIA task reads it. When Route cannot decode a message, and when a
+message exceeds 1 MiB or ends unterminated, its first 64 KiB is written to
+`undecoded.bin`: in the folder of the turn its correlation names, when it
+names one; otherwise in the connection's folder. The failures go to the
+affected turns, which may differ from the turn holding the evidence (a
+successor of a terminal turn): each names the file and the message's length
+when the file is in its own session's turn folder, and only the length when it
+is in the connection's folder (D4). C1 `logs` returns only turn folders. A
+final text too long for the envelope is written there as `final_text.txt`, and
+a structured output too long for it as `structured_output.json` (C1 §5). The
+vendor's stderr is not capped. The vendor's own transcript keeps the
 conversation; SQLite keeps its path as a hint with the vendor session ID.
 
 ## 5. C5: private process supervision
@@ -404,6 +448,16 @@ Host starts argv arrays with explicit cwd and an environment from the fake
 allow-list (`PATH` only if required, explicit test variables and vendor VIA
 marker). It never inherits the complete daemon environment. Wire exclusively
 owns vendor pipes. Host control bypasses data and SQLite queues.
+
+**Stop reply.** Host's `CloseReport` gains `stopped_live: Option<bool>`:
+the verified anchor's `Stopping { stopped_live }` reply to this close's
+own `Stop`, or `None` when no valid reply arrived (the deadline passed,
+the reply was lost or invalid, or no `Stop` was sent). It is passive
+evidence beside `forced`, which it does not change. `Some(false)` says
+the anchor's cleanup did not stop a live vendor for this `Stop`: the
+vendor had already exited, or the anchor's own cleanup had begun
+before it. Wire forwards it unchanged; only a shared-server route reads
+it, to tell a dead server (`server_lost`) from a lost transport.
 
 **Leftover report (C2 §4.2).** Host's `CloseReport` gains
 `leftovers: Option<LeftoverReport>`, produced after Host's close of the
@@ -459,12 +513,23 @@ decision A, 2026-10-01; adapter design AD20 and AR2).
   (pid and errno only), logs or `Debug` output (coding-style §8). Where no
   destination exists, nothing is scanned or logged.
 
-**Non-turn owners (AR6).** `ProcessOwner {session_id, turn}` and the Store
-`anchors` table (which references `turns`) fit per-turn processes only. A
-persistent server's anchor has no turn owner. The Codex and OpenCode slices
-design a non-turn owner (server or session) with its Store schema, evidence
-folder, admission, recovery and shutdown, in `crates/via-store`,
-`crates/via-host` and `crates/via-wire`.
+**Non-turn owners (AR6).** `ProcessOwner` is `Turn {session_id, turn}`
+or `Server {server_id}`. A server is a private group with no turn owner:
+Host starts it, holds its connection slot for its life (C2 §3),
+supervises its exit and stops it only on idle retirement, server loss, a
+failed open or daemon shutdown; Host stays protocol- and key-free.
+`ProcessControl::link_turn` commits a server-route turn's link to its
+server anchor before the turn's first vendor byte. `pending_cleanup`
+excludes live server-owned controls, so an idle server does not block
+daemon idle exit. Host's shutdown closes every control first, then reads
+the links of the requested turns under a bounded deadline and folds a
+server anchor's cleanup (never `forced`) into them; a failed read is
+reported, leaving those turns uncertain. A re-probe report names each
+not-committed proof's `ProcessOwner`; a server's is a daemon-scope Store
+failure. Host keeps one sticky journal-uncertain watch, set by every
+uncertain journal outcome whatever its owner. Shared-server leases,
+their supervised tasks and idle retirement belong to the route
+(`vendors/codex.md` §2).
 
 ### 5.1 Group anchor: selected design, native proof required
 
@@ -704,7 +769,11 @@ existing `commit_anchor_intent`, `commit_anchor_identified`,
 `list_anchor_records` operations, retaining their typed parameters/results
 and transaction semantics, from `StoreClient` to `ProcessJournal`. Journal
 uses the same writer/sender and has no spawn, turn, handle, result, event or
-log-query method. Host/ProcessControl hold only that restricted journal.
+log-query method, except two narrow link operations:
+`commit_server_turn(anchor_id, session, turn)`, which inserts a link only for
+a server-owned anchor and a `running` turn, and `server_links(turns)`, a
+bounded read of at most 256 links. Host/ProcessControl hold only that
+restricted journal.
 Core's StoreClient has no evidence-root or journal accessor. Inspect production
 call sites: only Store owns `Store::open`, Wire calls `into_wire_parts` and
 creates evidence folders, and Host calls the journal operations. This no-call rule
@@ -753,12 +822,13 @@ refused at open with a named error telling the user to recreate the dev Store
 untouched. `user_version = 0` is initialized only in a database file that
 open itself creates (exclusively); an existing file at version 0, empty or
 not, gets the same refusal before any writable open. Migrations as described
-above start with the first released schema. Schema v8 (v1 was the unreleased
+above start with the first released schema. Schema v9 (v1 was the unreleased
 single-turn format; v2 lacked the unproven-anchor index; v3 lacked frozen
 per-turn values; v4 lacked the close admission state and cancel cause; v5
 lacked step rows, event columns, list order and evidence folders; v6 lacked
 the session's persisted adapter version; v7 lacked the turn's recorded
-instance version) is exactly:
+instance version; v8 lacked server anchors and the turn → server-anchor link)
+is exactly:
 
 | Table | Implemented columns and constraints |
 |---|---|
@@ -769,7 +839,8 @@ instance version) is exactly:
 | `spawn_keys` | PK `key`; FK `session_id`; `identity_len`, `identity_sha256` (32 bytes checked: the exact retry identity's length and SHA-256, never its bytes); `receipt`; kept for the session's lifetime |
 | `operations` | PK (`session_id`, `op_key`); `verb` `resume` or `close`; `identity_len`, `identity_sha256`; `turn` with FK (`session_id`, `turn`); `result`; a `resume` row is committed in the same transaction as the queued turn |
 | `events` | PK (`session_id`, `seq`), FK session; `turn` (deferred composite FK to `turns`); `type`; `event` (canonical JSON; late and time live inside it); index (`session_id`, `turn`, `seq`); `seq` allocated by Core and checked transactionally |
-| `anchors` | PK `anchor_id`; `generation`, `marker`, `socket_path`; owner (`owner_session`, `owner_turn`) FK turn; `uid`, `boot_id`, `pid_namespace`; `phase` `intent`, `identified` or `arm_intent`; `record_version`; nullable identity `pid`, `pgid`, `start_ticks`; `vendor_pid`; `absence_time`. Partial index `anchors_unproven` on `anchor_id` where `absence_time IS NULL` |
+| `anchors` | PK `anchor_id`; `generation`, `marker`, `socket_path`; owner: either (`owner_session`, `owner_turn`) FK turn, or `owner_server` (exactly one, checked; unique where present); `uid`, `boot_id`, `pid_namespace`; `phase` `intent`, `identified` or `arm_intent`; `record_version`; nullable identity `pid`, `pgid`, `start_ticks`; `vendor_pid`; `absence_time`. Partial index `anchors_unproven` on `anchor_id` where `absence_time IS NULL` |
+| `server_turns` | PK (`session_id`, `turn`) FK turn; `anchor_id` FK anchor (a server-owned anchor, checked at insert, for a `running` turn); `WITHOUT ROWID`; index on `anchor_id`. Written by Host before the turn's first vendor byte; deleted in the transaction that commits the turn's terminal when the turn's cleanup is `quiescent`, so a remaining link means the turn runs or may have left work on that server; read by restart recovery, final shutdown, and the close and status cleanup predicate |
 
 Target columns and tables not implemented yet, with their owners:
 
@@ -819,14 +890,21 @@ Write ordering is explicit:
 1. Core commits session, handle hash, spawn key, queued turn and queued/session
    events atomically; only then acknowledge the receipt. Lost reply is replayable.
 2. Acquire dispatch capacity, commit `submitted_at` and `turn.submitted`.
-   Only a positive commit receipt permits Adapter open/start. Unknown commit
+   Only a positive commit receipt permits the turn's vendor I/O
+   (`run_turn`); the session's logical driver may be opened and prepared
+   before it, with no vendor I/O (C2 §3). Unknown commit
    outcome causes Store-failed mode, never speculative send.
 3. Host commits anchor intent/generation, starts anchor, commits its
    verified identity, configures, commits `ArmIntent`, then sends ARM once.
-   Anchor spawns vendor in its inherited group with the turn's stderr file
+   Anchor spawns vendor in its inherited group with its owner's stderr file
    and detaches fd 0/1/2 before its acknowledgement; Host records vendor
    facts. Wire starts its stdout reader and writes the prompt. Vendor
    acceptance is independent evidence.
+   On a shared-server route the turn's `run_turn` instead creates the
+   turn's evidence folder, pins, joins or launches its server (a launch runs
+   this step for the server, with the server's stderr file, under the
+   route's own handshake deadline), commits the turn's link to the server
+   anchor, and only then writes the turn's first message.
 4. Adapter emits an observation; Core commits acceptance, durable events
    or a step row, or folds it into the progress snapshot. The two
    acceptance paths deduplicate by correlation token.
@@ -900,6 +978,8 @@ encoded, which bounds every evidence path an envelope names (C1 §5).
   store.sqlite3-wal          SQLite-owned sidecar when present
   store.sqlite3-shm          SQLite-owned sidecar when present
   evidence/<session-id>/<turn>/  stderr.log, undecoded.bin, final_text.txt, structured_output.json
+  evidence/servers/<server-id>/  a shared server's stderr.log and undecoded.bin
+  vendor/<harness>/              adapter-private vendor state (Codex: CODEX_SQLITE_HOME), persistent
   blobs/<blob-id>.blob       bounded immutable request/effective data
 <runtime>/
   daemon.lock                persistent daemon/socket-owner lock inode
@@ -925,8 +1005,11 @@ resistance remains a platform gate. Create regular state files and both
 socket classes mode 0600 from the start. Initialize daemon umask 0077 before
 threads or file creation, including SQLite sidecars. Store alone opens
 SQLite and blob files, and validates or creates the `evidence/` root; Wire
-creates each turn's folder under it; Host opens the turn's `stderr.log` for
-the child; `final_text.txt` and `structured_output.json` are written through `StoreClient`. Host owns
+creates each turn's folder and each shared server's folder under it; Host
+opens the owner's `stderr.log` (the turn's or the server's) for the child;
+daemon bootstrap creates `vendor/`, and each adapter its own subdirectory,
+under the managed-directory rules above; `final_text.txt` and
+`structured_output.json` are written through `StoreClient`. Host owns
 anchor sockets; daemon main owns the singleton/socket lock.
 
 Acquire nonblocking `daemon.lock` first, then nonblocking `store.lock`; hold
@@ -962,8 +1045,12 @@ Without `drain` or `force`, a stop with active turns is refused
   after acceptance. Force closes every running turn with mode `force`: Core
   signals the turn's route, which asks the verified anchor to stop its
   private group (C2 Close(Force)) and drains its pipes under its cleanup
-  bound. Messages already read are still delivered. A receipted turn not yet
-  launched starts nothing; with a complete Host journal and no anchor intent
+  bound. On a shared-server route the driver asks for no stop and returns at
+  once: Host's final shutdown stops the server's group, a launched turn ends
+  `unknown` with outcome `unknown` (C1 §7.6 shared row), and its cleanup comes
+  from the server anchor its link names; `forced` is never derived from a
+  server anchor. Messages already read are still delivered. A receipted turn
+  not yet launched starts nothing; with a complete Host journal and no anchor intent
   for it, its cancel is `requested` with cleanup `quiescent` (C1 §7.4). Core
   commits the turn in final shutdown (C1 §7.6
   force row) once Host has reconciled its anchor; `forced` requires the
@@ -998,6 +1085,11 @@ deadline, or after a failure that precludes clean completion, the daemon
 snapshots the remaining uncertainty, aborts unfinished tasks, reports those
 that did not join and exits **4**. Only daemon main selects this path; a
 library timeout or dropped handle never exits the process or detaches work.
+The one exception is a panic in the Codex server registry, its
+supervisor or a Codex normalizer: the process aborts after the panic
+hook's best-effort `via.log` line. That is a daemon crash, never exit 0
+or 4; the anchors clean their groups (§5) and restart recovery (§7)
+ends the in-flight turns.
 A Store join that does not finish is abandoned to process exit, whose
 termination releases the locks; this is crash-like termination with
 conservative recovery (§7), never a successful flush. Abort, handle drop,
@@ -1103,7 +1195,10 @@ kernel operation; this is distinct from F12's repeatable returned I/O error.
 
 Restart first performs Store validation and recovery writes, then enables
 admission. For each last-durable nonterminal turn: submission intent ->
-`unknown`, no automatic resend; cancel queued successors. A queued turn with
+`unknown`, no automatic resend; cancel queued successors. A server-route
+turn's cleanup comes from the server anchor its link names, met with any
+durable settlement's cleanup; a recovered nonterminal turn without a link sent
+nothing. A queued turn with
 no submission intent remains queued only when no predecessor is unknown.
 Recovered host exit alone cannot prove no vendor action happened. If Store
 is still unwritable, startup fails; it does not dispatch from an uncommitted
@@ -1140,6 +1235,7 @@ payload limits count encoded bytes plus separately bounded decoded structure.
 | Pipe read buffer | 64 KiB per pipe | Reuse; never grows |
 | Route message staging | 1,024 messages and 4 MiB/connection | Fail connection if saturated; health/control bypass |
 | Codex shared Route ingress | 16 messages and 1 MiB/thread within the existing connection staging; fixed per-server buffers (the Codex task) | First full thread lane quarantines that generation immediately, separate from C2's 10 s stall. Reserved-path or global budget failure escalates to connection overflow (C2 §4) |
+| Codex shared connection writes | 8 pending server-request replies, 64 KiB; one control in flight; data held back while any control is pending; per driver, reserved interrupt (12,800 B) and unsubscribe (6,400 B) slots, steer 6 commands and 46,336 B | Past the reply bound, a reply not written within 5 s of decode, or correlation exhaustion: connection overflow, every associated session fails through health, the server retires |
 | OpenCode HTTP/SSE transport metadata | Existing bounded Wire message splitting | Read, count and discard traffic as for pipes (§4: no copy of vendor traffic); only the bounded decode-failure evidence is written, never a Basic `Authorization` header or credential; route by owned server generation and vendor session/message IDs |
 | C2 observations | 1024 items and 4 MiB/session | Wait only normalizer; at 10 s without drain, the adapter closes the session's route hop; a private route fails the connection `overflow`, a shared route quarantines the thread generation (A1, C2 §4) |
 | C2 observation payload | 256 KiB encoded; final text sent in pieces; IDs, names, stop reasons and codes 1 KiB | Fail protocol, the message saved to the evidence folder; unknown messages keep no payload |
@@ -1151,7 +1247,7 @@ payload limits count encoded bytes plus separately bounded decoded structure.
 | Socket response serialization | 1 MiB per response (a page, `status` or an envelope) plus 512 B | Stream bounded encoding; page reads stop on bytes as well as count; each reply written within 10 s of being ready, else the socket closes |
 | Envelope | 1 MiB by construction (C1 §5): final text over 256 KiB goes to a file of at most 64 MiB; the denied and declined lists keep 1,000 entries each | Never fails the turn |
 | Work deadlines | wall 1 h, idle 10 min | C1 deadline disposition; idle resets on normalized meaningful progress, not stderr/noise, timed by when the progress was decoded: progress decoded before the deadline still resets it when Core reads it later |
-| Cleanup / daemon idle | §5 (3 s OS cleanup); daemon 60 s idle | No idle exit with a live client, running/queued work or pending cleanup |
+| Cleanup / daemon idle | §5 (3 s OS cleanup); daemon 60 s idle | No idle exit with a live client, running/queued work or pending cleanup; an idle shared server (no running turn) is not pending cleanup |
 | Leftover scan (§5, C2 §4.2) | Absolute deadline `min(close_by, scan_started + 1 s)`; one scanner task per report; 256 KiB per environment (plus one lookahead byte); at most 16 listed processes | No budget left: `incomplete`, nothing read; at the deadline the task is cancelled and the report is `incomplete`; an over-cap environment counts as no match and sets `incomplete` |
 
 Large C1 prompts are persisted from the bounded request buffer. Store command
@@ -1213,10 +1309,17 @@ instruction_files}` (booleans; default hooks and MCP servers `false`, the rest
 change applies to sessions spawned after the next start, and each session
 freezes its settings at spawn. It holds no credentials and no limits.
 C1, C2, memory and the other runtime §8 limits are not configurable.
-The Codex shared server's lanes and tool metadata are fixed buffers counted
-per server by the Codex task, which measures 32 loaded leases and the
-maximum concurrent active turns that per-connection admission allows (C2
-§3; up to one per leased session) against the RSS gate.
+The Codex shared server has no lease or RPC admission cap beyond these
+bounds. Per server, its staging (shared by Wire's queue and the ingress
+lanes) and correlation records are fixed buffers; per session, the
+observation channel (open-tool metadata charged inside it), the driver
+controls and one decode allowance; per active turn, its prompt. The
+Codex task measures one server with 32 leased sessions and 32 concurrent
+active turns under both assertions above, with these holders added to
+the sum, and reports the marginal cost per active turn; that result
+qualifies at most 32 concurrent active turns on one server. Four loaded
+servers are an extrapolation, and the unresolved-turn maximum is not
+qualified.
 The S1 fake RSS result alone does not qualify this shared-server extension.
 For the OpenCode extension, Adapter owns the frozen server key and vendor
 semantics; Routes owns typed HTTP/SSE correlation; Wire owns sockets, message splitting,
