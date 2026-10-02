@@ -342,19 +342,26 @@ impl SteerTickets {
     }
 }
 
-/// A keyed steer's key and the turn it steers, which its live ticket
-/// carries so the commit of its `steer.delivered` records its outcome
-/// (C1 §3.4).
+/// A keyed steer's key, the turn it steers and its ownership, which the
+/// lane's ticket book holds under the input's token once the request
+/// handed the steer over, so the commit of its `steer.delivered` records
+/// its outcome (C1 §3.4, K2 r3). Only the lane removes it: when it
+/// consumes the token's report, committed or not, or ends; the request's
+/// ticket leaving does not, unless the request takes the steer back after
+/// the driver refused it ([`SteerTicket::reclaim`]).
 pub(super) struct SteerKey {
     /// The steer's `op_key`.
     pub(super) op_key: String,
     /// The steered turn's address.
     pub(super) turn: String,
+    /// The steer's ownership, released when the lane resolves it.
+    pub(super) owner: super::steer::Owner,
 }
 
 /// One live steer request's completion ticket on its lane (critical r2
 /// #2): its token, which the request passes to `steer`, and whether the
-/// token's `steer.delivered` committed. Dropped, it retires itself.
+/// token's `steer.delivered` committed. Dropped, an unkeyed one retires
+/// itself; a keyed one is the lane's to resolve ([`SteerKey`]).
 pub(super) struct SteerTicket {
     token: SteerToken,
     resolved: tokio::sync::oneshot::Receiver<bool>,
@@ -367,6 +374,16 @@ impl SteerTicket {
         self.token
     }
 
+    /// Takes a keyed steer back from the lane after the driver refused its
+    /// input, which the driver then reports no delivery of: its ticket
+    /// leaves the book, and its ownership returns to the request, which
+    /// records the refusal. `None` once the lane resolved it, or unkeyed.
+    pub(super) fn reclaim(&self) -> Option<super::steer::Owner> {
+        let tickets = self.tickets.upgrade()?;
+        let (_, key) = tickets.book().tickets.remove(&self.token)?;
+        key.map(|key| key.owner)
+    }
+
     /// Whether the token's `steer.delivered` observation committed: the
     /// wait ends with its consumption, committed or not, or the lane's end.
     pub(super) async fn committed(&mut self) -> bool {
@@ -375,9 +392,18 @@ impl SteerTicket {
 }
 
 impl Drop for SteerTicket {
+    /// Retires an unkeyed ticket. A keyed one stays: the lane owns it
+    /// until it resolves it (K2 r3).
     fn drop(&mut self) {
         if let Some(tickets) = self.tickets.upgrade() {
-            tickets.book().tickets.remove(&self.token);
+            let mut book = tickets.book();
+            if book
+                .tickets
+                .get(&self.token)
+                .is_some_and(|(_, key)| key.is_none())
+            {
+                book.tickets.remove(&self.token);
+            }
         }
     }
 }

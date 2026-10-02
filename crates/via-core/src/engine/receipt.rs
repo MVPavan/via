@@ -718,7 +718,7 @@ impl Engine {
         match retry_key(params.op_key.as_deref())?.map(str::to_owned) {
             Some(key) => {
                 let identity = retry_identity(raw_params, &hash, None)?;
-                self.keyed_steer(params, frozen, (key, identity)).await
+                self.keyed_steer(params, &frozen, (key, identity)).await
             }
             None => self.deliver_steer(params, &frozen, None).await,
         }
@@ -727,13 +727,15 @@ impl Engine {
     /// Checks the route's steer support, selects the steered turn, waits
     /// for its acceptance, then hands the input to the driver and answers
     /// once its `steer.delivered` committed ([`Self::steer`]). A keyed
-    /// steer's `op_key` rides on its ticket, so that commit records the
-    /// steer's outcome.
+    /// steer (`keyed`: its `op_key` and its ownership) is handed to the
+    /// lane with its ticket, so that commit records its outcome whatever
+    /// becomes of this request (K2 r3); a refusal by the driver hands it
+    /// back.
     pub(super) async fn deliver_steer(
         &self,
         params: SteerParams,
         frozen: &Frozen,
-        op_key: Option<&str>,
+        keyed: Option<(&str, &mut Option<super::steer::Owner>)>,
     ) -> Result<Value, ApiError> {
         if !matches!(
             frozen.steer(),
@@ -781,12 +783,21 @@ impl Engine {
             .ok_or(ApiError::NO_ACTIVE_TURN)?;
         // Critical r2 #2: the request's completion ticket, registered
         // before the driver can emit its report; dropped with the request,
-        // whichever way it ends, it retires itself.
+        // whichever way it ends, an unkeyed one retires itself, and a keyed
+        // one stays the lane's to resolve (K2 r3).
         let address = format!("{}/{}", params.session.as_str(), turn.get());
-        let mut ticket = lane.keyed_steer_ticket(op_key.map(|op_key| SteerKey {
-            op_key: op_key.to_owned(),
-            turn: address.clone(),
-        }));
+        let (key, owner) = match keyed {
+            Some((op_key, owner)) => (
+                owner.take().map(|handed| SteerKey {
+                    op_key: op_key.to_owned(),
+                    turn: address.clone(),
+                    owner: handed,
+                }),
+                Some(owner),
+            ),
+            None => (None, None),
+        };
+        let mut ticket = lane.keyed_steer_ticket(key);
         let input = SteerInput {
             // Sol r1 #8: the driver admits it only into the selected turn.
             turn,
@@ -796,11 +807,13 @@ impl Engine {
         };
         #[cfg(test)]
         self.faults.steer_calls.fetch_add(1, Ordering::AcqRel);
-        let delivery = lane
-            .driver
-            .steer(input)
-            .await
-            .map_err(|error| match error {
+        let delivery = lane.driver.steer(input).await.map_err(|error| {
+            // The driver reports no delivery of a refused input: the
+            // request owns a keyed steer again, to record the refusal.
+            if let Some(owner) = owner {
+                *owner = ticket.reclaim();
+            }
+            match error {
                 // Sol r1 #11 (C1 §3.4, C2 §2).
                 SteerError::Unsupported => intake::unsupported_on(Verb::Steer, frozen),
                 SteerError::NoActiveTurn => ApiError::NO_ACTIVE_TURN,
@@ -815,7 +828,8 @@ impl Engine {
                     "not_recorded",
                     steer_delivery(&delivery).to_owned().into(),
                 ),
-            })?;
+            }
+        })?;
         if !ticket.committed().await {
             return Err(ApiError::STORE);
         }

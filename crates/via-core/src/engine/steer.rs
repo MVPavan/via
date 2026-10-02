@@ -2,19 +2,23 @@
 //! durable intent's stored outcome. The intent row is committed before the
 //! input goes to the driver; the outcome is recorded once, with the
 //! `steer.delivered` event that reports the delivery, or alone for a
-//! refusal, and every repeat replays it. The attempt runs on its own task,
-//! never the caller's, so a caller that goes away ends none of it; a
-//! repeat while it runs waits for it. Only an intent left unresolved after
-//! its attempt ended, by the lane resolving it without a delivery commit
-//! or by a daemon restart, gets the uncertain outcome; the input is never
+//! refusal, and every repeat replays it. The steer has one owner at a time
+//! (K2 r3): the request until it hands the steer to the session's lane,
+//! then the lane, whose ticket book keeps the key with the input's token
+//! until the lane commits the delivery with the outcome, or ends without
+//! one. A repeat while an owner remains waits for it. An intent whose
+//! owner ended without recording an outcome gets the daemon's uncertain
+//! outcome, from the next repeat or restart recovery; the input is never
 //! sent again.
 
-#[cfg(test)]
-use std::sync::atomic::Ordering;
-use std::{borrow::Cow, collections::HashMap, sync::Mutex as StdMutex};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    sync::{Arc, Mutex as StdMutex},
+};
 
 use serde_json::{Value, json};
-use tokio::{sync::watch, task::JoinSet};
+use tokio::sync::watch;
 use via_adapters::{SteerDelivery, Verb};
 use via_store::{KeyedOperation, OperationVerb, SteerIntent, SteerOutcome, StoreError};
 
@@ -91,186 +95,72 @@ fn replay(stored: Value, frozen: &Frozen) -> Result<Value, ApiError> {
     })
 }
 
-/// The keyed steer attempts, which the Engine owns, never their callers
-/// (runtime §2, K2 r2 #1). Each runs as a task of the set until its result
-/// is collected: a finished one at the next spawn, the rest at final
-/// shutdown ([`Self::join`]). A failed attempt, one that panicked, is
-/// counted, and final shutdown reports the count.
+/// The keyed steers that have an owner, by session and key: a repeat waits
+/// on the owner's watch, which closes when the owner ends ([`Owner`]).
 #[derive(Default)]
-pub(super) struct KeyedAttempts(StdMutex<AttemptSet>);
+pub(super) struct KeyedSteers(Arc<StdMutex<OwnerMap>>);
 
-#[derive(Default)]
-struct AttemptSet {
-    tasks: JoinSet<()>,
-    /// Collected attempts that failed.
-    failed: usize,
-}
-
-impl AttemptSet {
-    /// Collects every finished attempt without waiting.
-    fn collect_finished(&mut self) {
-        while let Some(result) = self.tasks.try_join_next() {
-            if result.is_err() {
-                self.failed += 1;
-            }
-        }
-    }
-}
-
-impl KeyedAttempts {
-    /// Runs `attempt` as the set's task, after collecting the finished
-    /// ones, so the set holds only attempts still running and the
-    /// unreported ones.
-    fn spawn(&self, attempt: impl Future<Output = ()> + Send + 'static) {
-        let mut set = lock(&self.0);
-        set.collect_finished();
-        set.tasks.spawn(attempt);
-    }
-
-    /// Final shutdown (runtime §6.2): collects the attempts until `by`, and
-    /// returns how many had not ended then and how many failed, ever. One
-    /// still running at `by` is counted, then aborted: it holds neither the
-    /// Engine, nor so its Store, nor the report past the deadline, and its
-    /// intent, if any, stays open for restart recovery.
-    pub(super) async fn join(&self, by: tokio::time::Instant) -> (usize, usize) {
-        let mut tasks = std::mem::take(&mut lock(&self.0).tasks);
-        let mut failed = 0;
-        let _ = tokio::time::timeout_at(by, async {
-            while let Some(result) = tasks.join_next().await {
-                if result.is_err() {
-                    failed += 1;
-                }
-            }
-        })
-        .await;
-        while let Some(result) = tasks.try_join_next() {
-            if result.is_err() {
-                failed += 1;
-            }
-        }
-        let mut set = lock(&self.0);
-        set.failed += failed;
-        // Attempts spawned while the join ran are past the deadline too.
-        set.collect_finished();
-        let pending = tasks.len() + set.tasks.len();
-        let late = std::mem::take(&mut set.tasks);
-        let failed = set.failed;
-        drop(set);
-        // Dropping a set aborts its tasks.
-        drop((tasks, late));
-        (pending, failed)
-    }
-}
-
-/// The keyed steers whose first attempt is in flight, by session and key:
-/// a repeat waits on the attempt's watch, which closes when it ends.
-#[derive(Default)]
-pub(super) struct KeyedSteers(StdMutex<HashMap<(SessionId, String), watch::Receiver<()>>>);
+type OwnerMap = HashMap<(SessionId, String), watch::Receiver<()>>;
 
 impl KeyedSteers {
-    /// The attempt in flight under `key`, if any.
+    /// The owner of the steer under `key`, if any.
     fn in_flight(&self, key: &(SessionId, String)) -> Option<watch::Receiver<()>> {
         lock(&self.0).get(key).cloned()
     }
 
-    /// Registers the first attempt under `key`; it ends when dropped.
-    fn begin(&self, key: (SessionId, String)) -> Attempt<'_> {
+    /// Registers the first attempt under `key`; its owner ends when dropped.
+    fn begin(&self, key: (SessionId, String)) -> Owner {
         let (done, waiting) = watch::channel(());
         lock(&self.0).insert(key.clone(), waiting);
-        Attempt {
-            steers: self,
+        Owner {
+            steers: Arc::clone(&self.0),
             key,
             _done: done,
         }
     }
 }
 
-/// A keyed steer's first attempt in flight. Dropped, by any path, it leaves
-/// the map, then closes its watch, so a waiting repeat looks the key up
-/// again and finds the recorded outcome or none.
-struct Attempt<'a> {
-    steers: &'a KeyedSteers,
+/// The ownership of a keyed steer whose outcome is not recorded yet: the
+/// request holds it until it hands the steer to its lane, whose ticket
+/// book then holds it until the lane resolves the steer ([`super::lane`]).
+/// Dropped, by any path, it leaves the map, then closes its watch, so a
+/// waiting repeat looks the key up again and finds the recorded outcome or
+/// an intent with no owner.
+pub(super) struct Owner {
+    steers: Arc<StdMutex<OwnerMap>>,
     key: (SessionId, String),
     _done: watch::Sender<()>,
 }
 
-impl Drop for Attempt<'_> {
+impl Drop for Owner {
     fn drop(&mut self) {
-        lock(&self.steers.0).remove(&self.key);
+        lock(&self.steers).remove(&self.key);
     }
 }
 
-/// Test builds: a keyed steer attempt that stalls at its start, forever.
-#[cfg(test)]
-pub(super) const ATTEMPT_STALLS: u8 = 1;
-
-/// Test builds: a keyed steer attempt that waits at its start for
-/// `steer_attempt_release`, then panics.
-#[cfg(test)]
-pub(super) const ATTEMPT_PANICS: u8 = 2;
-
 impl Engine {
-    /// Test builds: the fault a keyed steer attempt meets at its start.
-    #[cfg(test)]
-    async fn attempt_fault(&self) {
-        let fault = self.faults.steer_attempt.load(Ordering::Acquire);
-        if fault == 0 {
-            return;
-        }
-        self.faults.steer_attempt_entered.notify_one();
-        if fault == ATTEMPT_STALLS {
-            std::future::pending::<()>().await;
-        }
-        self.faults.steer_attempt_release.notified().await;
-        panic!("injected keyed steer attempt failure");
-    }
-
-    /// C1 §3.4 `steer` under `op_key`, after authentication and the latch:
-    /// the attempt ([`Self::keyed_attempt`]) runs as the Engine's own task
-    /// ([`KeyedAttempts`]), so the caller going away, its future dropped,
-    /// ends none of it (K2 r1 #1): its intent, its delivery and the lane's
-    /// commit of its `steer.delivered` with its outcome, or its refusal's
-    /// record, all happen whatever the caller does. An attempt that failed,
-    /// or that final shutdown ended, answers `store_error`.
+    /// C1 §3.4 `steer` under `op_key`, after authentication, the latch and
+    /// the params' validation, in the request's own future. Under
+    /// `admission`, before the route's support or any current-turn check
+    /// (K2 r1 #3): a row under the key of another verb or identity is
+    /// `idempotency_conflict`; a recorded outcome is replayed; a steer that
+    /// still has an owner is waited for, then the key is looked up again;
+    /// an intent whose owner ended without an outcome gets the uncertain
+    /// one. Otherwise this is the first attempt: its intent row commits
+    /// and the request owns the steer, which then runs as an unkeyed one
+    /// would, the route's support first. Handed to the lane with its input
+    /// ([`Self::deliver_steer`]), the steer is the lane's, which records
+    /// its outcome with its `steer.delivered` whatever becomes of the
+    /// request; a refusal is recorded alone, by the request, which owns
+    /// the steer again then. A `store_error` reply records no outcome: a
+    /// refused or rolled-back intent leaves no key, and an intent whose
+    /// owner ended is left for the uncertain outcome.
     pub(super) async fn keyed_steer(
-        &self,
-        params: SteerParams,
-        frozen: Frozen,
-        key: (String, via_store::Identity),
-    ) -> Result<Value, ApiError> {
-        // Every Engine is made in its own `Arc` ([`Engine::open`]).
-        let Some(engine) = self.me.upgrade() else {
-            return Err(ApiError::STORE);
-        };
-        let (reply, answer) = tokio::sync::oneshot::channel();
-        self.keyed_attempts.spawn(async move {
-            // The caller may be gone: the attempt's work is done either way.
-            let _ = reply.send(engine.keyed_attempt(params, &frozen, key).await);
-        });
-        answer.await.unwrap_or(Err(ApiError::STORE))
-    }
-
-    /// A keyed steer's attempt. Under `admission`, before any route or
-    /// current-state check (K2 r1 #3): a row under the key of another verb
-    /// or identity is `idempotency_conflict`; a recorded outcome is
-    /// replayed; an attempt still running is waited for, then the key is
-    /// looked up again; an intent whose attempt ended without an outcome
-    /// gets the uncertain one. Otherwise this is the first attempt: its
-    /// intent row commits, then the steer runs as an unkeyed one would,
-    /// the route's support first, and its outcome is recorded with its
-    /// `steer.delivered` or, for a refusal, alone. A `store_error` reply
-    /// records no outcome: a refused or rolled-back intent leaves no key,
-    /// and an intent the lane resolved without a delivery commit is left
-    /// open, so the next look-up, its attempt ended, records the uncertain
-    /// outcome.
-    async fn keyed_attempt(
         &self,
         params: SteerParams,
         frozen: &Frozen,
         (op_key, identity): (String, via_store::Identity),
     ) -> Result<Value, ApiError> {
-        #[cfg(test)]
-        self.attempt_fault().await;
         let key = (params.session.clone(), op_key);
         loop {
             let admission = self.admission.lock().await;
@@ -298,7 +188,7 @@ impl Engine {
                         drop(admission);
                         #[cfg(test)]
                         self.faults.steer_key_waiting.notify_one();
-                        // The attempt only ever ends, closing the watch;
+                        // The owner only ever ends, closing the watch;
                         // either way the key is looked up again.
                         let _ = first.changed().await;
                         continue;
@@ -309,7 +199,7 @@ impl Engine {
                     return replay(stored, frozen);
                 }
                 None => {
-                    let attempt = self.keyed_steers.begin(key.clone());
+                    let mut owner = Some(self.keyed_steers.begin(key.clone()));
                     let intent = SteerIntent {
                         session_id: key.0.clone(),
                         op_key: key.1.clone(),
@@ -319,7 +209,8 @@ impl Engine {
                         return Err(self.steer_write_failed(&error, Some(&admission)).await);
                     }
                     drop(admission);
-                    let reply = match self.deliver_steer(params, frozen, Some(&key.1)).await {
+                    let handed = Some((key.1.as_str(), &mut owner));
+                    let reply = match self.deliver_steer(params, frozen, handed).await {
                         // Recorded with its `steer.delivered`.
                         Ok(reply) => Ok(reply),
                         Err(error) => match stored_refusal(&error) {
@@ -330,7 +221,7 @@ impl Engine {
                             None => Err(error),
                         },
                     };
-                    drop(attempt);
+                    drop(owner);
                     return reply;
                 }
             }

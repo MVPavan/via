@@ -9273,76 +9273,153 @@ fn a_keyed_steer_retains_a_transient_refusal() {
     });
 }
 
-/// K2 r2 #1 (runtime §2): a keyed steer attempt is the Engine's, not its
-/// caller's. Its caller cancelled, the attempt then panics: final shutdown
-/// collects it as a failed join and is not clean.
-#[test]
-fn a_cancelled_keyed_steers_panicking_attempt_is_a_failed_join() {
-    let Some(root) = child("a_cancelled_keyed_steers_panicking_attempt_is_a_failed_join") else {
-        return;
-    };
-    let scenario = json!({"profile": steer_profile(&json!({})), "scripts": []});
-    run(async {
-        let engine = open_fake(&root, &scenario);
-        let session = new_session(&engine).await;
-        engine
-            .faults
-            .steer_attempt
-            .store(super::steer::ATTEMPT_PANICS, Ordering::Release);
-        let raw = json!({"session":session.as_str(),"handle":HANDLE,"text":"x","op_key":"k-1"});
-        let caller = steer_task(&engine, &raw);
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            engine.faults.steer_attempt_entered.notified(),
+/// The `steer.delivered` events of `session` and the result of its key
+/// `key`, read from the Store file directly.
+#[cfg(feature = "test-failpoints")]
+fn delivered_and_result(root: &Path, session: &SessionId, key: &str) -> (i64, Option<Value>) {
+    let db = rusqlite::Connection::open(root.join("state").join("store.sqlite3")).unwrap();
+    db.busy_timeout(Duration::from_secs(10)).unwrap();
+    let events = db
+        .query_row(
+            "SELECT count(*) FROM events WHERE session_id=?1 AND type='steer.delivered'",
+            [session.as_str()],
+            |row| row.get(0),
         )
-        .await
-        .expect("the attempt starts");
-        caller.abort();
-        assert!(caller.await.unwrap_err().is_cancelled());
-        engine.faults.steer_attempt_release.notify_one();
-        let report = shutdown(&engine).await;
-        assert_eq!(report.failed_tasks, 1, "{report:?}");
-        assert!(!report.is_clean());
-    });
+        .unwrap();
+    let result: Option<String> = db
+        .query_row(
+            "SELECT result FROM operations WHERE session_id=?1 AND op_key=?2",
+            [session.as_str(), key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    (
+        events,
+        result.map(|text| serde_json::from_str(&text).unwrap()),
+    )
 }
 
-/// K2 r2 #1 (runtime §2, §6.2): a keyed steer attempt whose caller was
-/// cancelled stalls past final shutdown's deadline. Shutdown reports it
-/// unjoined, ends by its deadline, and the attempt then holds no Engine,
-/// so its Store can be released.
+/// K2 r3 (blocker; C1 §3.4): a keyed steer's delivery is queued behind lane
+/// work Core holds (`core.observations.pause` on an earlier text item)
+/// when its caller goes away and final shutdown runs past its deadline.
+/// Whatever the lane does after, the delivery and the key's outcome go
+/// together: `steer.delivered` commits with the delivered outcome, or
+/// neither commits and restart recovery gives the open intent the
+/// uncertain outcome.
+#[cfg(feature = "test-failpoints")]
 #[test]
-fn a_cancelled_keyed_steers_stalled_attempt_is_unjoined_at_shutdown() {
-    let Some(root) = child("a_cancelled_keyed_steers_stalled_attempt_is_unjoined_at_shutdown")
+fn a_keyed_delivery_queued_behind_held_lane_work_keeps_its_outcome() {
+    let Some(root) = child("a_keyed_delivery_queued_behind_held_lane_work_keeps_its_outcome")
     else {
         return;
     };
-    let scenario = json!({"profile": steer_profile(&json!({})), "scripts": []});
+    let pause = "core.observations.pause";
+    let points = count_points(&root, &[pause]);
+    let turn = "fake-turn-1";
+    let [expect, report] = takes_steer(turn);
+    let scenario = json!({"profile": steer_profile(&json!({})), "scripts": [turn_script(
+    "p", turn, &[
+        json!({"action":"gate","name":"ready"}),
+        json!({"action":"emit","message":{"type":"text","vendor_turn_id":turn}}),
+        expect, report,
+        json!({"action":"gate","name":"running"}),
+    ])]});
+    let sync = root.join("sync");
+    let session = run(async {
+        let engine = open_fake(&root, &scenario);
+        let session = new_session(&engine).await;
+        let _dispatching = dispatch_task(&engine, &session);
+        until(|| sync.join("ready.entered").exists()).await;
+        let held = arm_next_with(&points, pause, &json!({"action":"pause"}));
+        fs::write(sync.join("ready.release"), b"").unwrap();
+        until(|| acked(&points, pause, held)).await;
+        let raw = json!({"session":session.as_str(),"handle":HANDLE,"text":"also","op_key":"k-1"});
+        let caller = steer_task(&engine, &raw);
+        // The vendor took the input and reported it: the report is queued
+        // behind the held text item.
+        until(|| sync.join("running.entered").exists()).await;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        let by =
+            tokio::time::Instant::now() + super::latch::FINALIZE_RESERVE + Duration::from_secs(2);
+        let _report = engine.shutdown(Deadline::at(by)).await;
+        release_point(&points, pause, held);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let (events, result) = delivered_and_result(&root, &session, "k-1");
+        match events {
+            1 => assert_eq!(
+                result,
+                Some(delivered_on(&session, 1)),
+                "the outcome commits with it"
+            ),
+            0 => assert_eq!(result, None, "nothing committed"),
+            other => panic!("{other} steer.delivered events"),
+        }
+        session
+    });
+    run(async {
+        let engine = open_fake(&root, &scenario);
+        engine.recover().await.unwrap();
+        let (events, result) = delivered_and_result(&root, &session, "k-1");
+        let expected = if events == 1 {
+            delivered_on(&session, 1)
+        } else {
+            super::steer::uncertain()
+        };
+        assert_eq!(result, Some(expected));
+    });
+}
+
+/// K2 r3 (C1 §3.4): a keyed steer's caller goes away after its intent
+/// committed, while the steer waits for its turn's acceptance, before it
+/// was handed to the lane. The intent has no owner: a repeat stores and
+/// answers the uncertain outcome at once, and the driver is never asked.
+#[test]
+fn a_keyed_steer_dropped_before_its_hand_off_is_uncertain() {
+    let Some(root) = child("a_keyed_steer_dropped_before_its_hand_off_is_uncertain") else {
+        return;
+    };
+    let turn = "fake-turn-1";
+    let scenario = json!({"profile": steer_profile(&json!({})), "scripts": [{
+    "expected_request":{"type":"start","prompt":"p"},
+    "steps":[
+        {"action":"gate","name":"starting"},
+        {"action":"emit","message":{"type":"accepted","id":1,"vendor_turn_id":turn}},
+        {"action":"emit","message":{"type":"terminal","vendor_turn_id":turn,
+         "status":"completed","final_text":"done","stop_reason":"end_turn"}},
+    ]}]});
+    let sync = root.join("sync");
     run(async {
         let engine = open_fake(&root, &scenario);
         let session = new_session(&engine).await;
-        engine
-            .faults
-            .steer_attempt
-            .store(super::steer::ATTEMPT_STALLS, Ordering::Release);
-        let raw = json!({"session":session.as_str(),"handle":HANDLE,"text":"x","op_key":"k-1"});
+        let dispatching = dispatch_task(&engine, &session);
+        until(|| sync.join("starting.entered").exists()).await;
+        let raw = json!({"session":session.as_str(),"handle":HANDLE,"text":"also","op_key":"k-1"});
         let caller = steer_task(&engine, &raw);
         tokio::time::timeout(
             Duration::from_secs(10),
-            engine.faults.steer_attempt_entered.notified(),
+            engine.faults.steer_waiting.notified(),
         )
         .await
-        .expect("the attempt starts");
+        .expect("the steer waits for the turn's acceptance");
+        assert_eq!(steer_result(&engine, &session, "k-1").await, Some(None));
         caller.abort();
         assert!(caller.await.unwrap_err().is_cancelled());
-        let budget = super::latch::FINALIZE_RESERVE + Duration::from_secs(2);
-        let by = tokio::time::Instant::now() + budget;
-        let report = engine.shutdown(Deadline::at(by)).await;
-        assert!(
-            tokio::time::Instant::now() <= by + Duration::from_secs(1),
-            "shutdown ended by its deadline"
+        let repeat = tokio::time::timeout(Duration::from_secs(10), steer(&engine, &raw))
+            .await
+            .expect("the repeat waits for no owner")
+            .unwrap_err();
+        assert_eq!(
+            repeat.message,
+            ApiError::steer_unrecorded().message,
+            "{repeat:?}"
         );
-        assert_eq!(report.pending_tasks, 1, "{report:?}");
-        assert!(!report.is_clean());
-        until(|| std::sync::Arc::strong_count(&engine) == 1).await;
+        assert_eq!(
+            steer_result(&engine, &session, "k-1").await,
+            Some(Some(super::steer::uncertain()))
+        );
+        fs::write(sync.join("starting.release"), b"").unwrap();
+        dispatching.await.unwrap();
+        assert_eq!(engine.faults.steer_calls.load(Ordering::Acquire), 0);
     });
 }
