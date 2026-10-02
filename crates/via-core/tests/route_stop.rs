@@ -18,8 +18,8 @@ use std::{
 
 use tokio::sync::watch;
 use via_adapters::{
-    AdapterError, Cleanup, Deadline, Observation, RouteError, RouteFailure, SessionId, StopCause,
-    StopOrder, StoreFailure, TurnEnd, VendorTerminalStatus,
+    AdapterError, Cleanup, Deadline, OBSERVATION_ITEMS, Observation, RouteError, RouteFailure,
+    SessionId, StopCause, StopOrder, StoreFailure, TurnEnd, VendorTerminalStatus,
 };
 use via_store::{SpawnRecord, Store, failpoint};
 
@@ -520,9 +520,14 @@ fn late_act(
     match late {}
 }
 
-/// The acceptance, 1,025 texts and the terminal, then a live vendor. With
-/// `latch` it first waits for `latch`, then writes a 2 MiB line without a
-/// newline and creates `wrote`.
+/// The acceptance and 1,023 texts, then, once `rest` exists, two texts and
+/// the terminal, then a live vendor. With `latch` it next waits for
+/// `latch`, writes a 2 MiB line without a newline and creates `wrote`.
+///
+/// The first batch is 1,024 messages, what Wire's stdout queue holds
+/// (runtime §8): a reader polled only after the whole batch is in the
+/// pipe queues it all before Route takes any. All 1,027 at once overflow
+/// it, so the rest waits until the first batch has left the queue.
 fn held_terminal_script(latch: bool) -> String {
     let latch = if latch {
         "while [ ! -f \"$VIA_FAKE_SYNC_DIR/latch\" ]; do sleep 0.01; done\n\
@@ -531,11 +536,12 @@ fn held_terminal_script(latch: bool) -> String {
     } else {
         ""
     };
+    let text = r#"printf '%s\n' '{"type":"text","vendor_turn_id":"fake-turn-1","text":"x"}'"#;
     format!(
         "read -r start\nprintf '%s\\n' '{ACCEPTED}'\ni=0\n\
-         while [ \"$i\" -lt 1025 ]; do\n\
-         printf '%s\\n' '{{\"type\":\"text\",\"vendor_turn_id\":\"fake-turn-1\",\"text\":\"x\"}}'\n\
-         i=$((i+1))\ndone\n\
+         while [ \"$i\" -lt 1023 ]; do\n{text}\ni=$((i+1))\ndone\n\
+         while [ ! -f \"$VIA_FAKE_SYNC_DIR/rest\" ]; do sleep 0.01; done\n\
+         {text}\n{text}\n\
          printf '%s\\n' '{{\"type\":\"terminal\",\"vendor_turn_id\":\"fake-turn-1\",\"status\":\"completed\",\"final_text\":\"done\",\"stop_reason\":\"end_turn\"}}'\n\
          {latch}exec sleep 60\n"
     )
@@ -559,11 +565,11 @@ struct HeldRun {
 
 /// Runs [`held_terminal_script`] under a 3 s wall deadline and drains
 /// nothing before it: the acceptance and 1,023 texts fill Core's 1,024-item
-/// channel, the Adapter's delivery holds the 1,024th text, the hop of one
-/// the 1,025th, and Route holds the terminal. With `late`, Route pauses at
-/// `routes.late.entered`; once it acknowledged, the test acts, releases it
-/// and then drains, if `drain`. Without, it drains from the deadline, if
-/// `drain`.
+/// channel, which releases the script's rest; the Adapter's delivery holds
+/// the 1,024th text, the hop of one the 1,025th, and Route holds the
+/// terminal. With `late`, Route pauses at `routes.late.entered`; once it
+/// acknowledged, the test acts, releases it and then drains, if `drain`.
+/// Without, it drains from the deadline, if `drain`.
 fn held_terminal(child: &Child, drain: bool, late: Option<Late>) -> HeldRun {
     #[cfg(feature = "test-failpoints")]
     if late.is_some() {
@@ -585,6 +591,7 @@ fn held_terminal(child: &Child, drain: bool, late: Option<Late>) -> HeldRun {
             }
         };
         let mut draining = false;
+        let mut rest = false;
         let mut late_entered = false;
         // Late path: waiting for Route's acknowledgement, then (latch only)
         // for the vendor's write.
@@ -594,6 +601,14 @@ fn held_terminal(child: &Child, drain: bool, late: Option<Late>) -> HeldRun {
             tokio::select! {
                 () = tokio::time::sleep_until(expiry), if drain && late.is_none() && !draining => {
                     draining = true;
+                }
+                // Core's channel is full: the first batch has left Wire's
+                // queue.
+                () = tokio::time::sleep(Duration::from_millis(5)), if !rest => {
+                    if receiver.len() == OBSERVATION_ITEMS {
+                        fs::write(child.sync("rest"), b"").unwrap();
+                        rest = true;
+                    }
                 }
                 () = tokio::time::sleep(Duration::from_millis(5)), if waiting.is_some() => {
                     if !late_entered {
