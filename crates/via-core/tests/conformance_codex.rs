@@ -1301,6 +1301,23 @@ fn check_variant_then(
     expect: &Value,
     then: impl FnOnce(&conformance_drive::Pure) -> Result<(), String>,
 ) -> Result<(), String> {
+    check_variant_with(
+        name,
+        replay,
+        expect,
+        conformance_run::Knobs::default(),
+        then,
+    )
+}
+
+/// [`check_variant_then`] with `knobs`.
+fn check_variant_with(
+    name: &str,
+    replay: &Value,
+    expect: &Value,
+    knobs: conformance_run::Knobs,
+    then: impl FnOnce(&conformance_drive::Pure) -> Result<(), String>,
+) -> Result<(), String> {
     conformance_expect::validate(expect).map_err(|e| format!("{name}: {e}"))?;
     let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
     let path = dir.path().join(format!("{name}.replay.json"));
@@ -1310,7 +1327,7 @@ fn check_variant_then(
     )
     .map_err(|e| e.to_string())?;
     let outcome = conformance_drive::Pure::run("codex", name, expect, &path)?
-        .drive_then(expect, &path, conformance_run::Knobs::default(), then)
+        .drive_then(expect, &path, knobs, then)
         .map_err(|why| format!("{why} ({ADAPTER_BEAD} variant {name})"))?;
     conformance_expect::check(expect, &outcome).map_err(|wrong| format!("{name}:\n{wrong}"))
 }
@@ -2178,9 +2195,10 @@ fn codex_turns_keep_a_decode_fence() {
 
 /// Runtime §8 (x.3.2 X3 fix r2, the stale-fence check): a message the
 /// lane took under turn 1's fence, after turn 1's terminal, is counted in
-/// turn 1's watermark only. Turn 2's normalizer takes it first, as an
-/// earlier turn's, and reports nothing delivered for it: turn 2's
-/// watermark and delivery stay its own ten messages.
+/// turn 1's watermark only. Turn 2 is admitted only once Route read it (a
+/// routing gate, fix r3 #7), so it is never under turn 2's fence; it is
+/// taken as an earlier turn's and reported delivered for no turn: turn
+/// 2's watermark and delivery stay its own eleven messages.
 #[test]
 fn codex_stale_fence_counts_nothing() {
     let name = "codex_stale_fence_counts_nothing";
@@ -2192,7 +2210,11 @@ fn codex_stale_fence_counts_nothing() {
     let completed = step_with(&replay, "\"turn/completed\"").unwrap();
     let stale = replay["steps"][usage].clone();
     steps(&mut replay).unwrap().insert(completed + 1, stale);
-    check_variant_then(name, &replay, &expect, |pure| {
+    let knobs = conformance_run::Knobs {
+        admit_after_routed: Some((1, 0)),
+        ..conformance_run::Knobs::default()
+    };
+    check_variant_with(name, &replay, &expect, knobs, |pure| {
         let fences = pure.fences.borrow();
         match (fences.get(&0), fences.get(&1)) {
             (Some(&(first, through)), Some(&second)) if through <= first && second == (11, 11) => {
@@ -2639,7 +2661,17 @@ fn codex_retired_catalog_is_rediscovered() {
     let source = format!("{name}: a variant of c7_effort_catalog");
     let mut first = full.clone();
     let listed = step_with(&full, "\"result\":{\"data\"").unwrap();
-    cut_after(&mut first, listed, &[json!({"await_eof": {}})]).unwrap();
+    // Its own stderr tells the first lifetime's verdict from the second's
+    // (fix r3 #6: each server is judged by the lifetime its process ran).
+    cut_after(
+        &mut first,
+        listed,
+        &[
+            json!({"await_eof": {}}),
+            json!({"exit": {"code": 0, "stderr": "the first lifetime\n"}}),
+        ],
+    )
+    .unwrap();
     let replay = json!({"source": source, "lifetimes": [first, full]});
     expect["source"] = json!(source);
     expect["launches"] = json!(2);
@@ -2796,4 +2828,51 @@ fn codex_overflow_beside_a_retained_terminal() {
     expect["sessions"]["main"]["close"] = Value::Null;
     expect["sessions"]["main"]["health"] = json!({"state": "failed", "first_cause": "overflow"});
     variant(name, &replay, &expect).unwrap();
+}
+
+/// x.3.2 X3 fix r3 #5: a server whose connection failed is not live for
+/// its catalog, though the registry still lists it `Live` until its
+/// connection task is collected. c7's first turn discovers the catalog;
+/// the connection then fails on an undecodable line and is held in its
+/// owned sequence (a failpoint) while main's resumed `ultra` turn is
+/// checked: no catalog refuses it, so it launches a second server, which
+/// discovers the catalog again and refuses the effort after attach.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn codex_failed_connection_catalog_is_not_live() {
+    let name = "codex_failed_connection_catalog_is_not_live";
+    let _points = armed(
+        "codex.connection.fail_sequence",
+        json!({"occurrence": 1, "action": "delay", "value": 2000}),
+    )
+    .unwrap();
+    let full = replay_of("c7_effort_catalog").unwrap();
+    let mut expect = expect_of("c7_effort_catalog").unwrap();
+    let source = format!("{name}: a variant of c7_effort_catalog");
+    let listed = step_with(&full, "\"result\":{\"data\"").unwrap();
+    let mut failed = full.clone();
+    cut_after(
+        &mut failed,
+        listed,
+        &[
+            json!({"delay": {"ms": 300}}),
+            json!({"emit": {"line": "not json"}}),
+            sigterm(),
+        ],
+    )
+    .unwrap();
+    let mut second = full.clone();
+    cut_after(&mut second, listed, &[json!({"await_eof": {}})]).unwrap();
+    let replay = json!({"source": source, "lifetimes": [failed, second]});
+    expect["source"] = json!(source);
+    expect["launches"] = json!(2);
+    let refused = expect["turns"][0].clone();
+    expect["turns"] = json!([refused.clone(), refused]);
+    expect["launch_checkpoints"] =
+        json!({"after_pure": 0, "after_open": {"main": 0}, "after_turn": [1, 2]});
+    let knobs = conformance_run::Knobs {
+        admit_after: Some((1, std::time::Duration::from_millis(700))),
+        ..conformance_run::Knobs::default()
+    };
+    check_variant(name, &replay, &expect, knobs).unwrap();
 }

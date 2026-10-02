@@ -497,16 +497,21 @@ impl Servers {
         self.registry().ended.iter().cloned().collect()
     }
 
-    /// Whether `server` is live: launched, handshaken and not yet retiring
-    /// or lost.
+    /// Whether `server` is live: launched, handshaken, not yet retiring
+    /// or lost, and its connection neither failed nor ended (the checks
+    /// [`Self::pin`] makes; x.3.2 X3 fix r3 #5).
     pub fn is_live(&self, server: &ServerId) -> bool {
-        matches!(
-            self.registry()
-                .servers
-                .get(server)
-                .map(|instance| &instance.entry),
-            Some(Entry::Live { .. })
-        )
+        match self
+            .registry()
+            .servers
+            .get(server)
+            .map(|instance| &instance.entry)
+        {
+            Some(Entry::Live { connection, .. }) => usable(connection),
+            Some(Entry::Launching { .. } | Entry::Retiring { .. } | Entry::Lost { .. }) | None => {
+                false
+            }
+        }
     }
 
     /// The live servers.
@@ -572,7 +577,7 @@ impl Servers {
                 connection,
                 ..
             } => {
-                if connection.failure().is_none() && connection.ended().is_none() {
+                if usable(connection) {
                     *holders = holders.saturating_add(1);
                     return Some(pin());
                 }
@@ -993,6 +998,12 @@ impl Servers {
             }
         }
     }
+}
+
+/// Whether a live server's connection still serves: it neither failed
+/// nor ended.
+fn usable(connection: &Connection) -> bool {
+    connection.failure().is_none() && connection.ended().is_none()
 }
 
 /// A launch that will not be published: an opened connection retires;

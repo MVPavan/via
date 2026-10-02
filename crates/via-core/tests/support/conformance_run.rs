@@ -123,6 +123,14 @@ pub(crate) struct Knobs {
     /// The case injects this many server-registry task panics: the final
     /// shutdown reports exactly them failed, and nothing else unsettled.
     pub(crate) panicked_tasks: usize,
+    /// The turn at this index is admitted this long after its start
+    /// condition held (x.3.2 X3 fix r3 #5: inside a window the case holds
+    /// open).
+    pub(crate) admit_after: Option<(usize, Duration)>,
+    /// `(admitted, earlier)`: the turn at index `admitted` is admitted only
+    /// once Route read, under turn `earlier`'s decode fence, a message it
+    /// delivered for no turn (x.3.2 X3 fix r3 #7: a routing gate).
+    pub(crate) admit_after_routed: Option<(usize, usize)>,
 }
 
 /// What a running turn has shown so far, for its side actions.
@@ -182,6 +190,8 @@ struct Run<'a> {
     ordinals: RefCell<(Vec<String>, Vec<u64>)>,
     tracker: TaskTracker,
     cancel: CancellationToken,
+    /// Each settled turn's activity, by index.
+    settled: RefCell<BTreeMap<usize, TurnActivity>>,
 }
 
 impl Pure {
@@ -358,6 +368,7 @@ impl<'a> Run<'a> {
             ordinals: RefCell::new((Vec::new(), Vec::new())),
             tracker,
             cancel,
+            settled: RefCell::new(BTreeMap::new()),
         })
     }
 
@@ -441,6 +452,37 @@ impl<'a> Run<'a> {
         } else if index > 0 {
             let mut seen = self.seen[index - 1].subscribe();
             let _ = seen.wait_for(|seen| seen.settled).await;
+        }
+        if let Some((at, after)) = self.knobs.admit_after
+            && at == index
+        {
+            tokio::time::sleep(after).await;
+        }
+        if let Some((at, earlier)) = self.knobs.admit_after_routed
+            && at == index
+        {
+            self.routed_after(earlier).await?;
+        }
+        Ok(())
+    }
+
+    /// Resolves once Route read, under settled turn `earlier`'s decode
+    /// fence, a message it delivered for no turn, within [`FIXTURE_WAIT`].
+    async fn routed_after(&self, earlier: usize) -> Result<(), String> {
+        let activity = self
+            .settled
+            .borrow()
+            .get(&earlier)
+            .cloned()
+            .ok_or_else(|| format!("turn {earlier} has not settled"))?;
+        let started = tokio::time::Instant::now();
+        while activity.decoded() <= activity.delivered() {
+            if started.elapsed() > FIXTURE_WAIT {
+                return Err(format!(
+                    "nothing undelivered was routed under turn {earlier}'s fence"
+                ));
+            }
+            tokio::time::sleep(POLL).await;
         }
         Ok(())
     }
@@ -660,8 +702,7 @@ impl<'a> Run<'a> {
         let forcing = self.timed(&force, &stop, ended.clone());
         let (end, (steer, gates), ()) = tokio::join!(drain, side, forcing);
         *session.receiver.borrow_mut() = Some(receiver);
-        let fence = (activity.decoded(), activity.delivered());
-        self.pure.fences.borrow_mut().insert(index, fence);
+        self.settle_fence(index, &activity);
         let Some(end) = end? else {
             return Ok(abandoned(&observed.borrow(), session, steer, gates?));
         };
@@ -681,6 +722,13 @@ impl<'a> Run<'a> {
             self.judge_launch(launches_before + 1, session, number, &end)?;
         }
         Ok(outcome)
+    }
+
+    /// Records settled turn `index`'s decode fence and keeps its activity.
+    fn settle_fence(&self, index: usize, activity: &TurnActivity) {
+        let fence = (activity.decoded(), activity.delivered());
+        self.pure.fences.borrow_mut().insert(index, fence);
+        self.settled.borrow_mut().insert(index, activity.clone());
     }
 
     /// The turn's stop and force channels: a turn starting at `now` finds
@@ -1221,6 +1269,32 @@ impl<'a> Run<'a> {
         }
     }
 
+    /// Each server's vendor pid, by server ID, from the Store's anchor
+    /// records.
+    async fn server_pids(&self) -> Result<std::collections::HashMap<String, u32>, String> {
+        let (_, journal) = self.pure.store().runtime_resources().into_wire_parts();
+        let mut pids = std::collections::HashMap::new();
+        let mut after = None;
+        loop {
+            let page = journal
+                .list_anchor_records_page(after, via_store::ANCHOR_PAGE_LIMIT)
+                .await
+                .map_err(|e| format!("anchor records: {e:?}"))?;
+            let full = page.len() == via_store::ANCHOR_PAGE_LIMIT as usize;
+            after = page.last().map(|record| record.intent.anchor_id.clone());
+            for record in page {
+                if let (via_store::ProcessOwner::Server { server_id }, Some(pid)) =
+                    (&record.intent.owner, record.vendor_pid)
+                {
+                    pids.insert(server_id.as_str().to_owned(), pid);
+                }
+            }
+            if !full {
+                return Ok(pids);
+            }
+        }
+    }
+
     /// Whether a session of the case runs on a server route.
     fn shared(&self) -> bool {
         self.sessions
@@ -1230,9 +1304,9 @@ impl<'a> Run<'a> {
 
     /// Once every server launch ended (its last lease went, so its idle
     /// retirement closed stdin), each is judged by the replay's own verdict
-    /// ([`replay_exit`]) from its exit and its `stderr.log`: launch `n`
-    /// (the registry's launch ordinal) against lifetime `n` (x.3.2 X3; fix
-    /// r1, ruling 21 and minor 24), in every build.
+    /// ([`replay_exit`]) from its exit and its `stderr.log`, against the
+    /// lifetime its own process ran (x.3.2 X3; fix r1, ruling 21 and minor
+    /// 24; fix r3 #6), in every build.
     async fn judge_servers(&self) -> Result<(), String> {
         let launches = usize::try_from(self.pure.launches()?).map_err(|e| e.to_string())?;
         if !self.shared() || launches == 0 {
@@ -1252,12 +1326,22 @@ impl<'a> Run<'a> {
             }
             tokio::time::sleep(POLL).await;
         };
+        let pids = self.server_pids().await?;
+        let log = self.pure.launch_pids()?;
         for (server, launch, code) in &ended {
-            let index = usize::try_from(launch.saturating_sub(1)).map_err(|e| e.to_string())?;
+            // The lifetime the server's own process ran: its pid's line in
+            // the fake's launch log (x.3.2 X3 fix r3 #6), not the
+            // registry's ordinal, which concurrent starts can reorder.
+            let pid = pids
+                .get(server)
+                .ok_or_else(|| format!("server launch {launch}: no anchor pid"))?;
+            let index = log.iter().position(|logged| logged == pid).ok_or_else(|| {
+                format!("server launch {launch}: pid {pid} not in the launch log")
+            })?;
             let fixture = match self.replay.get("lifetimes").and_then(Value::as_array) {
                 Some(lifetimes) => lifetimes
                     .get(index)
-                    .ok_or_else(|| format!("launch {launch} has no lifetime"))?,
+                    .ok_or_else(|| format!("launch {} has no lifetime", index + 1))?,
                 None => self.replay,
             };
             let stderr = fs::read_to_string(
@@ -1739,11 +1823,7 @@ impl Pure {
     }
 
     /// The Store the adapter set runs on.
-    #[expect(
-        clippy::used_underscore_binding,
-        reason = "the pure half only holds the Store open; the run half commits to it"
-    )]
     fn store(&self) -> &via_store::Store {
-        &self._store
+        &self.store
     }
 }

@@ -952,6 +952,13 @@ impl Connection {
         cause: ConnectionFailure,
         messages: &mut WireMessages,
     ) -> ConnectionLoss {
+        // Test builds: a seam between the latch and the owned sequence,
+        // where a test holds the failed connection's server live in the
+        // registry (x.3.2 X3 fix r3 #5).
+        #[cfg(feature = "test-failpoints")]
+        {
+            let _ = crate::failpoint::hit_async("codex.connection.fail_sequence").await;
+        }
         // Nothing more is written: what is queued answers `NotWritten`.
         for id in self.feeder.close() {
             self.forget(id);

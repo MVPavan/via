@@ -64,8 +64,9 @@ pub(crate) struct Pure {
     pub(crate) set: AdapterSet,
     /// The Store's and the runtime directory's parent.
     pub(crate) state: tempfile::TempDir,
-    /// The Store the adapter set runs on; the run half commits turns to it.
-    pub(crate) _store: Store,
+    /// The Store the adapter set runs on; the run half commits turns to it
+    /// and reads the server anchors' pids from it.
+    pub(crate) store: Store,
     pub(crate) name: String,
     /// Each run turn's decode fence once it settled, by index: Route's
     /// decode watermark and the position the Adapter delivered through
@@ -112,7 +113,7 @@ impl Pure {
             case_dir,
             set,
             state,
-            _store: store,
+            store,
             name: name.to_owned(),
             before: Listing::new(),
             fences: std::cell::RefCell::default(),
@@ -286,6 +287,20 @@ impl Pure {
         match fs::read_to_string(&log) {
             Ok(text) => Ok(text.lines().count() as u64),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(format!("launch log: {error}")),
+        }
+    }
+
+    /// The pids in the launch log, one per start of the fake, in the order
+    /// the fake's starts appended them: launch *n* is line *n*.
+    pub(crate) fn launch_pids(&self) -> Result<Vec<u32>, String> {
+        let log = self.case_dir.path().join(format!("{}.launches", self.name));
+        match fs::read_to_string(&log) {
+            Ok(text) => text
+                .lines()
+                .map(|line| line.trim().parse().map_err(|e| format!("launch log: {e}")))
+                .collect(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(error) => Err(format!("launch log: {error}")),
         }
     }
