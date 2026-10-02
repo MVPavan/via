@@ -137,6 +137,40 @@ impl Compiler {
         self.roots.meta_budget = Some(crate::validator::Budget::new(units, max_depth));
     }
 
+    // VIA patch: a `pattern` or `patternProperties` regular expression at
+    // `url`. Converting its ECMA escapes and building its regular
+    // expression are each charged to the compile budget, when one is set,
+    // by their bytes, before each runs.
+    fn pattern(&self, p: &str, url: String) -> Result<Pattern, CompileError> {
+        let charge = |units| {
+            self.roots
+                .meta_budget
+                .as_ref()
+                .map_or(true, |budget| budget.charge(units))
+        };
+        if !charge(convert_units(p)) {
+            return Err(CompileError::LimitExceeded {
+                what: "pattern bytes",
+            });
+        }
+        let converted = ecma::convert(p).map_err(|src| CompileError::InvalidRegex {
+            url: url.clone(),
+            regex: p.to_owned(),
+            src,
+        })?;
+        self.count_pattern()?;
+        if !charge(regex_units(&converted)) {
+            return Err(CompileError::LimitExceeded {
+                what: "pattern bytes",
+            });
+        }
+        Pattern::new(converted.as_ref()).map_err(|e| CompileError::InvalidRegex {
+            url,
+            regex: converted.into_owned(),
+            src: e.into(),
+        })
+    }
+
     // VIA patch: counts one compiled pattern against the limit.
     fn count_pattern(&self) -> Result<(), CompileError> {
         let n = self.patterns.get() + 1;
@@ -428,19 +462,9 @@ impl ObjCompiler<'_, '_, '_, '_, '_, '_> {
                 let mut v = vec![];
                 if let Some(Value::Object(obj)) = self.value("patternProperties") {
                     for pname in obj.keys() {
-                        let ecma =
-                            ecma::convert(pname).map_err(|src| CompileError::InvalidRegex {
-                                url: self.up.format("patternProperties"),
-                                regex: pname.to_owned(),
-                                src,
-                            })?;
-                        self.c.count_pattern()?;
-                        let regex =
-                            Pattern::new(ecma.as_ref()).map_err(|e| CompileError::InvalidRegex {
-                                url: self.up.format("patternProperties"),
-                                regex: ecma.into_owned(),
-                                src: e.into(),
-                            })?;
+                        let regex = self
+                            .c
+                            .pattern(pname, self.up.format("patternProperties"))?;
                         let ptr = self.up.ptr.append2("patternProperties", pname);
                         let sch = self.enqueue_schema(ptr);
                         v.push((regex, sch));
@@ -524,19 +548,7 @@ impl ObjCompiler<'_, '_, '_, '_, '_, '_> {
             if let Some(Value::String(p)) = self.value("pattern") {
                 // VIA patch: a pattern that does not compile, or exceeds the
                 // regex size limit, is an invalid regex, not a bug.
-                let p = ecma::convert(p).map_err(|src| CompileError::InvalidRegex {
-                    url: self.up.format("pattern"),
-                    regex: p.to_owned(),
-                    src,
-                })?;
-                self.c.count_pattern()?;
-                s.pattern = Some(Pattern::new(p.as_ref()).map_err(|e| {
-                    CompileError::InvalidRegex {
-                        url: self.up.format("pattern"),
-                        regex: p.clone().into_owned(),
-                        src: e.into(),
-                    }
-                })?);
+                s.pattern = Some(self.c.pattern(p, self.up.format("pattern"))?);
             }
 
             s.max_items = self.usize("maxItems");

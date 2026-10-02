@@ -262,6 +262,13 @@ impl<'v, 's> Validator<'v, 's, '_, '_> {
 
         // format --
         if let Some(format) = &s.format {
+            // VIA patch: a format check reads its string once or twice
+            // (`regex` converts it), charged by its bytes before it runs.
+            if let Value::String(text) = v {
+                if !self.budget.charge(convert_units(text)) {
+                    return Err(self.spent_error());
+                }
+            }
             if let Err(e) = (format.func)(v) {
                 self.add_error(kind!(Format, Cow::Borrowed(v), format.name, e));
             }

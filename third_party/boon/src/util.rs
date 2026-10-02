@@ -454,6 +454,19 @@ pub(crate) fn pattern_units(s: &str) -> u64 {
     1 + (s.len() / 64) as u64
 }
 
+// VIA patch: the compile-budget units of converting a pattern's ECMA
+// escapes, which parses it once: one per 2 bytes, at least one.
+pub(crate) fn convert_units(pattern: &str) -> u64 {
+    1 + (pattern.len() / 2) as u64
+}
+
+// VIA patch: the compile-budget units of building a converted pattern's
+// regular expression, which parses it twice and compiles it up to the
+// program limit: two per byte, at least one.
+pub(crate) fn regex_units(converted: &str) -> u64 {
+    (converted.len() as u64).saturating_mul(2).max(1)
+}
+
 // VIA patch: a compiled `pattern` with the weight of matching it, an
 // estimate of how many automaton states can be live at once. Matching
 // costs one budget unit per 16 bytes per unit of weight, at least one:

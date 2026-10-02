@@ -71,6 +71,29 @@ commit that vendored the unchanged copy shows the whole patch.
    than the budget). A `pattern` that does not compile is
    `CompileError::InvalidRegex`, as `patternProperties` already was, instead
    of `CompileError::Bug` (which asserts in debug builds).
+
+   ECMA conversion (`ecma.rs`) is linear in the pattern's length. Upstream
+   translated one `\d`, `\w` or `\s` escape, or fixed one `\c{letter}`
+   escape, per round and reparsed the whole pattern each time (quadratic:
+   a 24 KiB pattern of `\d` took over 8 s). Now every `\c{letter}` escape
+   is fixed in one scan and one parse follows, then every perl class is
+   replaced in one pass over that parse. Only an extended-mode pattern
+   (`(?x)`, whose `#` comments can hide a `\c`) keeps upstream's
+   fix-and-reparse loop, for at most 32 fixes; past them it is refused.
+   The output is upstream's otherwise: `ecma.rs`'s tests compare it with
+   upstream's conversion, kept there verbatim, on the JSON-Schema-Test-Suite
+   patterns (written out, as the suite is not vendored) and on 100,000
+   seeded random patterns. Upstream also stopped converting, keeping a
+   partial result, if a replacement made the pattern fail to parse (a case
+   its own debug assertion calls a bug); the linear conversion returns the
+   whole replacement, which then fails to compile.
+
+   With a compile budget (`set_metaschema_budget`), each `pattern` and
+   `patternProperties` expression charges one unit per 2 bytes before it
+   is converted and two units per converted byte before its regular
+   expression is built (`CompileError::LimitExceeded`, "too many pattern
+   bytes"), and each format check in a metaschema check charges one unit
+   per 2 bytes of its string before it runs (`format: regex` converts it).
 3. **Draft pin** (`compiler.rs`, `roots.rs`, `draft.rs`).
    `Compiler::require_draft(d)` makes compiling fail with
    `CompileError::UnsupportedDraft` when any `$schema`, at a root or in any

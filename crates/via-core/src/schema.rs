@@ -15,7 +15,9 @@
 //! largest peak was 36,864 KiB (27,860 KiB in fix round 1, before the
 //! cases added in round 2); the compiles measured stayed under about
 //! 70 ms; a 256 KiB schema of about 2,000 subschemas needed about 325,000
-//! metaschema units.
+//! metaschema units. Patterns (critical fix round 1): a 24 KiB pattern of
+//! `\d` compiled in about 12 ms (over 8 s before), and the pattern sets
+//! measured at the 256 KiB cap were refused within about 65 ms.
 
 use boon::{Compiler, Draft, SchemaIndex, Schemas, SchemeUrlLoader, Validation};
 use serde_json::Value;
@@ -327,6 +329,36 @@ mod tests {
             ),
             Checked::Limit
         );
+    }
+
+    /// Critical r1 #1: converting a pattern's ECMA escapes is linear. A
+    /// 24 KiB pattern of `\d` took over 8 s to compile before (release);
+    /// it now compiles at once.
+    #[test]
+    fn repeated_pattern_escapes_compile_in_linear_time() {
+        let schema = json!({"pattern": "\\d".repeat(12 * 1024)});
+        let start = std::time::Instant::now();
+        assert!(compiles(&schema));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "took {elapsed:?}"
+        );
+    }
+
+    /// Critical r1 #1: the bytes a pattern converts to are charged to the
+    /// compile budget before its regular expression is built. 64
+    /// `patternProperties` names of `\w` at the 256 KiB cap convert to
+    /// about 1.2 MB, each within the regex program limit: built, they took
+    /// about 150 ms (release); charged, they are refused first.
+    #[test]
+    fn converted_pattern_bytes_are_charged() {
+        let names: serde_json::Map<String, Value> = (0..64)
+            .map(|i| (format!("{i}{}", "\\w".repeat(1360)), json!(true)))
+            .collect();
+        let schema = json!({"patternProperties": names});
+        assert!(schema.to_string().len() <= 256 * 1024);
+        assert!(!compiles(&schema));
     }
 
     /// Fix round 3 #1: a `$dynamicRef` charges its anchor name's bytes,
