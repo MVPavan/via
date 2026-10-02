@@ -603,8 +603,9 @@ fn claude_force_outranks_verdict() {
 /// C2 A1 (review r1 #3): Core stalls past the driver's stall bound (10 s)
 /// while the vendor runs; the driver closes the hop and the private
 /// connection fails `overflow`, which interrupts the vendor before Host
-/// closes it, in AD19's order: the interrupt, its terminal awaited, stdin
-/// EOF, then the graceful close, all bounded by the cleanup allowance. The
+/// closes it, in AD19's order: the stall is an internal stop order (the
+/// interrupt, its terminal awaited, stdin EOF, then the graceful close),
+/// escalated by the cleanup allowance as any stop order is. The
 /// replay requires the interrupt (a force close without it ends the fake
 /// by its SIGTERM) and EOF only after the terminal. The terminal Route
 /// read is kept beside the overflow (AD4); its receipt never reached the
@@ -664,6 +665,85 @@ fn claude_observation_stall_interrupts() {
         ..conformance_run::Knobs::default()
     };
     check_variant("claude_stall_interrupt", &replay, &expect, knobs).unwrap();
+}
+
+/// S1 rule 3 (review r2 #4): a natural terminal decoded before the wall
+/// is protected before it waits for read-ahead room. Core holds its
+/// observations, so the session channel fills and about 3.6 MiB of
+/// assistant messages wait behind the blocked hop when a 0.9 MiB result
+/// is decoded: it needs room it does not have. A cancel ordered during
+/// that wait sends no interrupt (the fake never reads a second line), and
+/// the wall, passing during it, takes the late path: Host force-closes
+/// the group (the fake exits on its SIGTERM) while the held messages, the
+/// result last, are delivered once Core drains, and the turn keeps its
+/// result.
+#[test]
+fn claude_terminal_protected_before_room() {
+    let name = "claude_lazy_init_acceptance";
+    let base = replay_of(name).unwrap();
+    let mut steps = base["steps"].as_array().unwrap()[..3].to_vec();
+    // Past the session channel's 1024 items: the hop blocks.
+    for n in 0..1100 {
+        steps.push(emit(&json!({
+            "type": "assistant",
+            "message": {"id": format!("msg_{n}"), "role": "assistant",
+                "content": [{"type": "text", "text": "."}]},
+            "session_id": "${sid}",
+        })));
+    }
+    // Paced, so Wire's own queue (4 MiB) never holds the burst.
+    let pause = json!({"delay": {"ms": 200}});
+    steps.push(pause.clone());
+    let large = "x".repeat(900 * 1024);
+    for n in 0..4 {
+        steps.push(pause.clone());
+        steps.push(emit(&json!({
+            "type": "assistant",
+            "message": {"id": format!("msg_large_{n}"), "role": "assistant",
+                "content": [{"type": "text", "text": large}]},
+            "session_id": "${sid}",
+        })));
+    }
+    let (at, line) = emit_step(&mut base.clone(), None, "\"type\":\"result\"").unwrap();
+    assert_eq!(at, 6);
+    let mut result: Value = serde_json::from_str(&line).unwrap();
+    result["result"] = json!(large);
+    steps.push(pause);
+    steps.push(emit(&result));
+    steps.push(json!({"await_signal": {"signal": "SIGTERM"}}));
+    steps.push(json!({"exit": {"code": 143, "stderr": ""}}));
+    let mut replay = base;
+    replay["steps"] = json!(steps);
+    let mut expect = conformance_expect::load(&fixtures(), name).unwrap();
+    let turn = &mut expect["turns"][0];
+    turn["gates"] = json!([]);
+    turn["deadlines"] = json!({"wall_ms": 2500, "idle_ms": 60000});
+    let wanted = &mut turn["expect"];
+    wanted["final_text"] = json!([large]);
+    wanted["exit"] = json!({"code": 143, "signal": null});
+    let knobs = conformance_run::Knobs {
+        hold_for: Some(std::time::Duration::from_millis(3000)),
+        stop_after: Some(std::time::Duration::from_millis(1800)),
+        ..conformance_run::Knobs::default()
+    };
+    let variant = "claude_terminal_room";
+    conformance_expect::validate(&expect).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(format!("{variant}.replay.json"));
+    std::fs::write(&path, serde_json::to_vec(&replay).unwrap()).unwrap();
+    let mut progress = String::new();
+    let outcome = conformance_drive::Pure::run("claude", variant, &expect, &path)
+        .unwrap()
+        .drive_then(&expect, &path, knobs, |pure| {
+            progress = std::fs::read_to_string(pure.case_file("progress")).unwrap_or_default();
+            Ok(())
+        })
+        .unwrap();
+    assert!(
+        !progress.lines().any(|line| line == "read 2 launch 1"),
+        "an interrupt followed the decoded result:\n{progress}"
+    );
+    conformance_expect::check(&expect, &outcome).unwrap();
 }
 
 /// Carry-item 1 (Claude ruling C1, packet §5): a session-cumulative cost

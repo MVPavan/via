@@ -91,6 +91,18 @@ pub(crate) enum Interrupt {
     Failed,
 }
 
+/// The Adapter's stall (C2 A1), taken as an internal stop order: the
+/// connection fails `overflow`, the vendor is interrupted through the
+/// protocol's path, and the turn runs on with its observations discarded:
+/// a terminal is still kept (AD4), the daemon force and stop orders are
+/// still served, and at `force_at` without a terminal the group is
+/// force-closed under `close_by`, the cleanup escalation's bounds.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Stall {
+    force_at: Deadline,
+    close_by: Deadline,
+}
+
 /// What [`Serving::next`] read: a message admitted for the hop, with its
 /// encoded bytes.
 pub(crate) enum Next<M> {
@@ -151,6 +163,8 @@ pub(crate) struct Serving<'a, P: PrivateProtocol> {
     pub(crate) pending: Option<PendingWrite>,
     /// Decoded messages waiting for room on the hop.
     held: ReadAhead<P::Message>,
+    /// The Adapter stalled: the hop is closed, and nothing more goes on it.
+    pub(crate) stall: Option<Stall>,
     /// The protocol's state.
     pub(crate) lane: P,
 }
@@ -176,6 +190,7 @@ impl<'a, P: PrivateProtocol> Serving<'a, P> {
             interrupt: Interrupt::NotSent,
             pending: None,
             held: ReadAhead::new(),
+            stall: None,
             lane,
         }
     }
@@ -185,9 +200,12 @@ impl<'a, P: PrivateProtocol> Serving<'a, P> {
         (self.lane, self.interrupt)
     }
 
-    /// Queues a decoded message for the hop, behind those already held.
+    /// Queues a decoded message for the hop, behind those already held;
+    /// after the Adapter's stall it is discarded.
     pub(crate) fn hold(&mut self, (message, bytes): (P::Message, usize)) {
-        self.held.push((message, bytes));
+        if self.stall.is_none() {
+            self.held.push((message, bytes));
+        }
     }
 
     /// Whether a decoded message waits for the hop.
@@ -230,13 +248,14 @@ impl<'a, P: PrivateProtocol> Serving<'a, P> {
     /// protocol's [`PrivateProtocol::READ_AHEAD`] messages; after it, none
     /// may wait, so what the turn's end hands on is on the hop first.
     async fn make_room(&mut self) -> Result<(), Failed> {
-        self.make_room_for(0).await
+        let ahead = if self.terminated { 1 } else { P::READ_AHEAD };
+        self.make_room_for(0, ahead).await
     }
 
-    /// Serves until a message of `bytes` fits the read-ahead (review r1
-    /// #4: the incoming message counts before it is held).
-    async fn make_room_for(&mut self, bytes: usize) -> Result<(), Failed> {
-        let ahead = if self.terminated { 1 } else { P::READ_AHEAD };
+    /// Serves until a message of `bytes` fits a read-ahead of `ahead`
+    /// messages (review r1 #4: the incoming message counts before it is
+    /// held).
+    pub(crate) async fn make_room_for(&mut self, bytes: usize, ahead: usize) -> Result<(), Failed> {
         let mut never = std::pin::pin!(std::future::pending::<()>());
         while !self.held.admits(bytes, ahead) {
             self.serve_once(never.as_mut()).await?;
@@ -248,9 +267,14 @@ impl<'a, P: PrivateProtocol> Serving<'a, P> {
     /// messages go on the hop in order as the reserve arm of
     /// [`Self::serve_once`] sends them. Only room on the hop, a closed hop
     /// or `by` ends the wait; no other control acts on an already decoded
-    /// message. Delivery that cannot finish by `by` is `Overflow`.
-    pub(crate) async fn deliver_held(&mut self, by: Deadline) -> Result<(), RouteError> {
-        while let Some(message) = self.take_held() {
+    /// message. Delivery that cannot finish by `by` is `Overflow`. `last`,
+    /// a decoded terminal still waiting for read-ahead room, goes last.
+    pub(crate) async fn deliver_held(
+        &mut self,
+        by: Deadline,
+        mut last: Option<P::Message>,
+    ) -> Result<(), RouteError> {
+        while let Some(message) = self.take_held().or_else(|| last.take()) {
             let turn = self.turn;
             let hop = self.hop;
             tokio::select! {
@@ -268,14 +292,16 @@ impl<'a, P: PrivateProtocol> Serving<'a, P> {
     }
 
     /// `result`, unless the daemon force is set: then `ForceStopped` with
-    /// the result's exit and close evidence (design §2 rule 4).
+    /// the result's exit and close evidence (design §2 rule 4); or unless
+    /// the Adapter stalled: then `Overflow`, with the same evidence.
     pub(crate) fn unless_forced(
         &self,
         result: P::Result,
         undecoded: Option<String>,
     ) -> Result<P::Result, RouteFailure> {
-        if self.signals.force.borrow().is_some() {
-            let cause = RouteError::ForceStopped { turn: self.turn };
+        if self.signals.force.borrow().is_some() || self.stall.is_some() {
+            // `failure_with` lets the daemon force outrank the stall.
+            let cause = RouteError::Overflow { turn: self.turn };
             return Err(self.failure_with(cause, &result, undecoded));
         }
         Ok(result)
@@ -328,8 +354,9 @@ impl<'a, P: PrivateProtocol> Serving<'a, P> {
                 Err(RouteError::Deadline { turn }.into())
             }
             cause = latched(&mut self.latch) => Err(wire_cause::<P>(turn, &cause.error()).into()),
-            () = hop.closed() => Err(self.hop_closed()),
+            () = hop.closed(), if self.stall.is_none() => self.on_hop_closed().map(|()| None),
             () = woken(&mut self.signals.wake) => self.on_wake().map(|()| None),
+            () = stall_force(self.stall.as_ref(), self.terminated) => Err(self.stall_force()),
             written = pending(self.pending.as_mut()), if self.pending.is_some() => {
                 self.interrupt_written(&written).map(|()| None)
             }
@@ -342,7 +369,7 @@ impl<'a, P: PrivateProtocol> Serving<'a, P> {
                     Ok(None)
                 }
                 (Ok(_), None) => Ok(None),
-                (Err(_), _) => Err(self.hop_closed()),
+                (Err(_), _) => self.on_hop_closed().map(|()| None),
             },
             output = op => Ok(Some(output)),
         }
@@ -373,7 +400,12 @@ impl<'a, P: PrivateProtocol> Serving<'a, P> {
                     let bytes = message.bytes().len();
                     match P::admit(self, payload).await? {
                         Some(admitted) => {
-                            self.make_room_for(bytes).await?;
+                            // S1 rule 3 (review r2 #4): the turn's first
+                            // terminal waits for room only once its reader
+                            // retained it and marked the turn terminated.
+                            if self.terminated || P::terminal(&admitted).is_none() {
+                                self.make_room_for(bytes, P::READ_AHEAD).await?;
+                            }
                             Ok(Next::Message((admitted, bytes)))
                         }
                         // Recorded, not handed over (C2 §2 Reopen).
@@ -400,6 +432,38 @@ impl<'a, P: PrivateProtocol> Serving<'a, P> {
             RouteError::ForceStopped { turn }.into()
         } else {
             RouteError::Overflow { turn }.into()
+        }
+    }
+
+    /// The hop closed: before the terminal of a submitted turn whose
+    /// protocol interrupts on it, the Adapter's stall ([`Stall`]): the
+    /// held messages are discarded and the one interrupt is sent;
+    /// otherwise [`Self::hop_closed`].
+    fn on_hop_closed(&mut self) -> Result<(), Failed> {
+        let stalls = self.submitted
+            && !self.terminated
+            && self.signals.force.borrow().is_none()
+            && self.lane.interrupts_on_stall();
+        if !stalls {
+            return Err(self.hop_closed());
+        }
+        let force_at = cleanup_deadline();
+        self.stall = Some(Stall {
+            force_at,
+            close_by: Deadline::at(force_at.instant() + CLEANUP_ALLOWANCE),
+        });
+        self.held = ReadAhead::new();
+        self.send_interrupt();
+        Ok(())
+    }
+
+    /// The stall's `force_at` passed without a terminal: `Overflow`, the
+    /// group force-closed under the stall's `close_by`.
+    fn stall_force(&self) -> Failed {
+        Failed {
+            cause: RouteError::Overflow { turn: self.turn },
+            exit: None,
+            close_by: self.stall.map(|stall| stall.close_by),
         }
     }
 
@@ -514,9 +578,10 @@ impl<'a, P: PrivateProtocol> Serving<'a, P> {
             .borrow()
             .as_ref()
             .map(|order| order.close_by);
-        Err(match close_by {
-            Some(close_by) => Failed::stopped(self.turn, close_by),
-            None => transport(self.turn).into(),
+        Err(match (close_by, self.stall) {
+            (Some(close_by), _) => Failed::stopped(self.turn, close_by),
+            (None, Some(_)) => self.stall_force(),
+            (None, None) => transport(self.turn).into(),
         })
     }
 
@@ -558,6 +623,14 @@ pub(super) async fn wake_on_order(mut stop: StopWatch, wake: &watch::Sender<u64>
         } else if stop.changed().await.is_err() {
             std::future::pending::<()>().await;
         }
+    }
+}
+
+/// Resolves at the stall's `force_at` before the terminal; never otherwise.
+async fn stall_force(stall: Option<&Stall>, terminated: bool) {
+    match stall {
+        Some(stall) if !terminated => tokio::time::sleep_until(stall.force_at.instant()).await,
+        Some(_) | None => std::future::pending().await,
     }
 }
 

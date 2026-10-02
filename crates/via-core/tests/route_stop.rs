@@ -46,6 +46,11 @@ fn via_binary() -> PathBuf {
 
 /// Runs `name` again in a child process whose fake vendor is `script`.
 fn run_child(name: &str, script: &str) {
+    run_child_with(name, script, &[]);
+}
+
+/// [`run_child`] with `env` added to the child's environment.
+fn run_child_with(name: &str, script: &str, env: &[(&str, &str)]) {
     let root = tempfile::tempdir().unwrap();
     for part in ["state", "runtime", "sync", "points"] {
         fs::DirBuilder::new()
@@ -65,6 +70,7 @@ fn run_child(name: &str, script: &str) {
         .env("VIA_FAKE_AGENT_BINARY", &vendor)
         .env("VIA_FAKE_SCENARIO", &scenario)
         .env("VIA_FAKE_SYNC_DIR", root.path().join("sync"))
+        .envs(env.iter().copied())
         .spawn()
         .unwrap();
     let limit = Instant::now() + CHILD_LIMIT;
@@ -639,6 +645,169 @@ fn held_terminal(child: &Child, drain: bool, late: Option<Late>) -> HeldRun {
             late_entered,
         }
     })
+}
+
+/// What the test does once the stalled turn's interrupt reached the vendor.
+#[cfg(feature = "test-failpoints")]
+#[derive(Clone, Copy)]
+enum StallAct {
+    /// Nothing: the vendor answers with its interrupted terminal.
+    Answer,
+    /// The daemon force.
+    Force,
+    /// The session's `close(Force)`.
+    Close,
+}
+
+/// The acceptance and 1,023 texts, then, once `rest` exists, three texts,
+/// which the stalled Adapter never takes; then the vendor reads the
+/// interrupt, records it in `interrupt` and runs `then`.
+#[cfg(feature = "test-failpoints")]
+fn stall_script(then: &str) -> String {
+    let text = r#"printf '%s\n' '{"type":"text","vendor_turn_id":"fake-turn-1","text":"x"}'"#;
+    format!(
+        "read -r start\nprintf '%s\\n' '{ACCEPTED}'\ni=0\n\
+         while [ \"$i\" -lt 1023 ]; do\n{text}\ni=$((i+1))\ndone\n\
+         while [ ! -f \"$VIA_FAKE_SYNC_DIR/rest\" ]; do sleep 0.01; done\n\
+         {text}\n{text}\n{text}\n\
+         read -r interrupt\n\
+         printf '%s\\n' \"$interrupt\" > \"$VIA_FAKE_SYNC_DIR/interrupt\"\n{then}"
+    )
+}
+
+/// The vendor's answer to the interrupt: its acknowledgement and an
+/// interrupted terminal, then stdout open until stdin's EOF.
+#[cfg(feature = "test-failpoints")]
+const ANSWER: &str = "printf '%s\\n' '{\"type\":\"interrupt_ack\",\"id\":2,\"vendor_turn_id\":\"fake-turn-1\"}'\n\
+     printf '%s\\n' '{\"type\":\"terminal\",\"vendor_turn_id\":\"fake-turn-1\",\"status\":\"interrupted\",\"final_text\":\"\",\"stop_reason\":\"interrupted\"}'\n\
+     while read -r more; do :; done\n";
+
+/// The lowered stall bound of the stall cases.
+#[cfg(feature = "test-failpoints")]
+const STALL_ENV: &[(&str, &str)] = &[("VIA_TEST_EVENT_STALL_MS", "300")];
+
+/// Runs [`stall_script`] under a 20 s wall and never drains Core's
+/// channel: the Adapter's delivery stalls past the lowered bound and
+/// closes the hop (C2 A1). Once the interrupt reached the vendor the test
+/// acts; returns the outcome and how long after that it ended.
+#[cfg(feature = "test-failpoints")]
+fn stalled_turn(child: &Child, act: StallAct) -> (Outcome, Duration) {
+    let (driver, receiver) = child.adapter.session(SESSION, &child.root);
+    let wall = Deadline::at(tokio::time::Instant::now() + Duration::from_secs(20));
+    let (forcing, forced) = watch::channel(None);
+    let (_order, orders) = watch::channel(None);
+    child.runtime.block_on(async {
+        let cx = one_turn::turn_cx(driver.prepare(), wall, forced, orders);
+        let execute = driver.run_turn(one_turn::hello(), cx);
+        tokio::pin!(execute);
+        let mut rest = false;
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_millis(5)) => {
+                    // Core's channel is full: the first batch left Wire's queue.
+                    if !rest && receiver.len() == OBSERVATION_ITEMS {
+                        fs::write(child.sync("rest"), b"").unwrap();
+                        rest = true;
+                    }
+                    if child.sync("interrupt").exists() {
+                        break;
+                    }
+                }
+                outcome = &mut execute => panic!("ended before the interrupt: {:?}", outcome.outcome.map(|_| ())),
+            }
+        }
+        let acted = Instant::now();
+        let outcome = match act {
+            StallAct::Answer => execute.await,
+            StallAct::Force => {
+                forcing.send_replace(Some(tokio::time::Instant::now()));
+                execute.await
+            }
+            StallAct::Close => {
+                let by = Deadline::at(tokio::time::Instant::now() + Duration::from_secs(2));
+                let close = driver.close(via_adapters::CloseMode::Force, by);
+                tokio::join!(execute, close).0
+            }
+        };
+        (outcome, acted.elapsed())
+    })
+}
+
+/// Review r2 #3 (AD4, C2 A1): the stalled turn's interrupt goes through
+/// the protocol's path, and the interrupted terminal the vendor answers
+/// with, decoded while the hop is closed, is kept in the turn's end; the
+/// turn fails `overflow`.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_stalled_turn_keeps_its_interrupted_terminal() {
+    let name = "a_stalled_turn_keeps_its_interrupted_terminal";
+    let Some(root) = child_root() else {
+        return run_child_with(name, &stall_script(ANSWER), STALL_ENV);
+    };
+    let child = Child::open(&root);
+    let (outcome, _) = stalled_turn(&child, StallAct::Answer);
+    let interrupt = fs::read_to_string(child.sync("interrupt")).unwrap();
+    assert_eq!(
+        interrupt,
+        "{\"type\":\"interrupt\",\"id\":2,\"vendor_turn_id\":\"fake-turn-1\"}\n"
+    );
+    assert_eq!(
+        outcome.terminal.as_ref().map(|terminal| terminal.status),
+        Some(VendorTerminalStatus::Interrupted),
+        "the decoded terminal was lost"
+    );
+    let failure = route_failure(outcome);
+    assert!(
+        matches!(failure.cause, RouteError::Overflow { .. }),
+        "{failure:?}"
+    );
+}
+
+/// Review r2 #1 (S1 rule 4): the daemon force, raised while the stalled
+/// turn waits for its interrupt's terminal, governs the outcome:
+/// `ForceStopped`, at once.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_force_during_a_stall_is_force_stopped() {
+    let name = "a_force_during_a_stall_is_force_stopped";
+    let Some(root) = child_root() else {
+        return run_child_with(name, &stall_script("exec sleep 60\n"), STALL_ENV);
+    };
+    let (outcome, elapsed) = stalled_turn(&Child::open(&root), StallAct::Force);
+    let failure = route_failure(outcome);
+    assert!(
+        matches!(failure.cause, RouteError::ForceStopped { .. }),
+        "{failure:?}"
+    );
+    assert!(failure.forced, "{failure:?}");
+    assert!(
+        elapsed < Duration::from_millis(1500),
+        "force took {elapsed:?}"
+    );
+}
+
+/// Review r2 #2: the session's `close(Force)` during a stall is served:
+/// its order's `force_at` (at once) force-closes the group under its
+/// `close_by`, long before the stall's own escalation (3 s); the close
+/// governs the outcome, `Stopped`.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_close_during_a_stall_stops_at_its_force_at() {
+    let name = "a_close_during_a_stall_stops_at_its_force_at";
+    let Some(root) = child_root() else {
+        return run_child_with(name, &stall_script("exec sleep 60\n"), STALL_ENV);
+    };
+    let (outcome, elapsed) = stalled_turn(&Child::open(&root), StallAct::Close);
+    let failure = route_failure(outcome);
+    assert!(
+        matches!(failure.cause, RouteError::Stopped { .. }),
+        "{failure:?}"
+    );
+    assert!(failure.forced, "{failure:?}");
+    assert!(
+        elapsed < Duration::from_millis(1500),
+        "close took {elapsed:?}"
+    );
 }
 
 /// Design §7.2 row 3: an anchor intent that is not committed starts no

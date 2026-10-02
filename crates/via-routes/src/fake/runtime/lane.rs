@@ -573,7 +573,9 @@ impl Serving<'_, LaneState> {
             self.await_tools(messages).await?;
         }
         let cutoff = Deadline::at(self.deadline.instant() + CLEANUP_ALLOWANCE);
-        self.deliver_held(cutoff).await.map_err(Failed::from)?;
+        self.deliver_held(cutoff, None)
+            .await
+            .map_err(Failed::from)?;
         Ok(if !interrupted || self.lane.tools_settled() {
             WireCleanup::Quiescent
         } else {

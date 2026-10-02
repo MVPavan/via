@@ -341,6 +341,12 @@ impl PrivateProtocol for ClaudeLane {
         false
     }
 
+    /// C2 A1: the stall interrupts Claude, whose interrupt reaches tools
+    /// in its parent tree that the group's stop does not.
+    fn interrupts_on_stall(&self) -> bool {
+        true
+    }
+
     /// Per turn: stdin EOF after the result, then S1's close (AD19).
     fn after_terminal<'s>(
         _serving: &'s mut Serving<'_, Self>,

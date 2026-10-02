@@ -108,6 +108,10 @@ pub(crate) trait PrivateProtocol: Sized + Send {
     /// Whether a live process's closed stdout is transport loss bounded
     /// by the cleanup allowance (the fake's persistent profile).
     fn bounded_exit(&self) -> bool;
+    /// Whether the Adapter's stall before the terminal interrupts the
+    /// vendor and runs the turn on as an internal stop order (C2 A1,
+    /// [`serving::Stall`]); otherwise it fails the turn `overflow` at once.
+    fn interrupts_on_stall(&self) -> bool;
     /// After the terminal: finalize the process, or end the logical turn
     /// with the server kept.
     fn after_terminal<'s>(
@@ -198,7 +202,9 @@ fn retirement<P: PrivateProtocol>(result: &Result<P::Result, RouteFailure>) -> R
 /// terminal and late observations after it, is sent on the `hop` in decode
 /// order. While [`PrivateProtocol::READ_AHEAD`] messages wait for room on
 /// the hop Route reads no further message, and a closed hop (the Adapter's
-/// stall, C2 A1) fails the turn as overflow. Every wait keeps the controls
+/// stall, C2 A1) fails the turn as overflow: on a protocol that interrupts
+/// on it, after an internal stop order ([`serving::Stall`]) that the turn
+/// runs on to its terminal or escalation. Every wait keeps the controls
 /// serviced (Task 4 design §9). On any failure the private group is
 /// force-closed and the connection finished under a separate cleanup bound.
 ///
@@ -347,8 +353,8 @@ async fn serve_turn<P: PrivateProtocol>(
             // after its terminal, once the terminal's data was handed on.
             return serving.unless_forced(result, sender.take_undecoded());
         }
-        Ok(Finished::Late(terminal)) => {
-            return late(serving, sender, messages, terminal).await;
+        Ok(Finished::Late(terminal, last)) => {
+            return late(serving, sender, messages, (terminal, last)).await;
         }
         Ok(Finished::Kept(kept)) => {
             return P::kept(serving, sender, messages, kept).await;
@@ -374,34 +380,29 @@ async fn serve_turn<P: PrivateProtocol>(
     if let Some(keep) = P::keeps_server(serving, &failed.cause) {
         return Err(P::keep(serving, (sender, messages), keep, (failed, cleanup)).await);
     }
-    let report = if stalled(serving, &failed.cause) {
-        // C2 A1: the Adapter's stall fails the connection, which
-        // interrupts the vendor first, in AD19's order: the one interrupt,
-        // its terminal awaited, then stdin EOF and the graceful close, all
-        // under the cleanup bound; the vendor's stdout is drained
-        // meanwhile and discarded.
-        interrupt_before_close(serving, &mut messages, cleanup).await;
-        let close = sender.close(CloseRequest {
-            mode: CloseMode::Graceful,
+    let report = sender
+        .close(CloseRequest {
+            mode: CloseMode::Force,
             deadline: cleanup,
-        });
-        let (report, ()) = tokio::join!(close, messages.finish(cleanup));
-        report
+        })
+        .await;
+    // The group is stopping; the reader reads its stdout to EOF and
+    // discards it, so it never blocks. The original failure stays
+    // authoritative.
+    messages.finish(cleanup).await;
+    // After the Adapter's stall the turn's cause is `overflow`, unless the
+    // daemon force or a stop order's own escalation governs (S1 rule 4).
+    let governs = matches!(
+        failed.cause,
+        RouteError::ForceStopped { .. } | RouteError::Stopped { .. }
+    );
+    let cause = if serving.stall.is_some() && !governs {
+        RouteError::Overflow { turn: serving.turn }
     } else {
-        let report = sender
-            .close(CloseRequest {
-                mode: CloseMode::Force,
-                deadline: cleanup,
-            })
-            .await;
-        // The group is stopping; the reader reads its stdout to EOF and
-        // discards it, so it never blocks. The original failure stays
-        // authoritative.
-        messages.finish(cleanup).await;
-        report
+        failed.cause
     };
     Err(RouteFailure {
-        cause: failed.cause,
+        cause,
         // The one message this turn could not decode, if any (design §7.3).
         undecoded: sender.take_undecoded(),
         exit: failed.exit.or(report.vendor_exit),
@@ -412,61 +413,6 @@ async fn serve_turn<P: PrivateProtocol>(
         acknowledged: false,
         shared: false,
     })
-}
-
-/// The Adapter stalled (it closed the hop: `Overflow` without the daemon
-/// force) on a submitted turn whose terminal was not read: the vendor is
-/// still working on it.
-fn stalled<P: PrivateProtocol>(serving: &Serving<'_, P>, cause: &RouteError) -> bool {
-    matches!(cause, RouteError::Overflow { .. })
-        && serving.hop.is_closed()
-        && serving.signals.force.borrow().is_none()
-        && serving.submitted
-        && !serving.terminated
-}
-
-/// Sends the one interrupt through the protocol's path, unless it was
-/// sent, waits for its write, then reads the vendor's messages (admitted
-/// under the phase rules, never delivered: the hop is closed) until its
-/// terminal or the end of stdout; all until `by`. The hop is closed, so
-/// these waits do not go through [`Serving::serve`].
-async fn interrupt_before_close<P: PrivateProtocol>(
-    serving: &mut Serving<'_, P>,
-    messages: &mut WireMessages,
-    by: Deadline,
-) {
-    serving.send_interrupt();
-    if let Some(write) = serving.pending.as_mut() {
-        let written = tokio::time::timeout_at(by.instant(), pending(Some(write))).await;
-        serving.pending = None;
-        serving.interrupt = if matches!(written, Ok(Ok(SendOutcome::Written))) {
-            Interrupt::Written
-        } else {
-            Interrupt::Failed
-        };
-    }
-    if serving.interrupt != Interrupt::Written {
-        return;
-    }
-    let turn = serving.turn;
-    let terminal = async {
-        loop {
-            let message = match messages.next_message().await {
-                Ok(Some(message)) => message,
-                Err(via_wire::WireError::Woken) => continue,
-                Ok(None) | Err(_) => return,
-            };
-            let Ok(payload) = P::decode(message.bytes(), turn) else {
-                return;
-            };
-            match P::admit(serving, payload).await {
-                Ok(Some(admitted)) if P::terminal(&admitted).is_some() => return,
-                Ok(_) => {}
-                Err(_) => return,
-            }
-        }
-    };
-    let _ended = tokio::time::timeout_at(by.instant(), terminal).await;
 }
 
 /// Design §2 rule 3 [r1.23]: a decoded terminal whose finalization
@@ -482,7 +428,7 @@ async fn late<P: PrivateProtocol>(
     serving: &mut Serving<'_, P>,
     sender: &WireSender,
     messages: WireMessages,
-    terminal: P::Terminal,
+    (terminal, last): (P::Terminal, Option<P::Message>),
 ) -> Result<P::Result, RouteFailure> {
     // Test builds: the terminal is decoded and held, the late path
     // entered; nothing is closed or delivered yet.
@@ -494,7 +440,7 @@ async fn late<P: PrivateProtocol>(
         mode: CloseMode::Force,
         deadline: by,
     });
-    let (report, delivered) = tokio::join!(close, serving.deliver_held(by));
+    let (report, delivered) = tokio::join!(close, serving.deliver_held(by, last));
     messages.finish(by).await;
     let result = P::result(
         terminal,
@@ -516,8 +462,9 @@ enum Finished<P: PrivateProtocol> {
     /// The normal path: terminal, exit and graceful close, with the close's
     /// bound for `finish`.
     Result(P::Result, Deadline),
-    /// A decoded terminal whose finalization outlived the wall deadline.
-    Late(P::Terminal),
+    /// A decoded terminal whose finalization, or whose wait for read-ahead
+    /// room (then still to go on the hop, last), outlived the wall deadline.
+    Late(P::Terminal, Option<P::Message>),
     /// The logical turn ended at its terminal with its server kept (C2
     /// §4.1).
     Kept(P::Kept),
@@ -569,14 +516,24 @@ async fn drive<P: PrivateProtocol>(
             // `ProcessExited`.
             end @ (Next::Eof | Next::Unterminated) => return Err(serving.ended(end).await),
         };
-        let terminal = P::terminal(&message.0);
-        serving.hold(message);
-        if let Some(terminal) = terminal {
-            P::retain(serving, &terminal);
-            break terminal;
+        let Some(terminal) = P::terminal(&message.0) else {
+            serving.hold(message);
+            continue;
+        };
+        // S1 rule 3 (review r2 #4): the terminal is kept and the turn
+        // terminated before it waits for read-ahead room, so no stop order
+        // acts on it and the wall takes the late path.
+        P::retain(serving, &terminal);
+        serving.terminated = true;
+        match serving.make_room_for(message.1, P::READ_AHEAD).await {
+            Ok(()) => serving.hold(message),
+            Err(failed) if matches!(failed.cause, RouteError::Deadline { .. }) => {
+                return Ok(Finished::Late(terminal, Some(message.0)));
+            }
+            Err(failed) => return Err(failed),
         }
+        break terminal;
     };
-    serving.terminated = true;
     let terminal = match P::after_terminal(serving, messages, terminal).await? {
         AfterTerminal::Finalize(terminal) => terminal,
         AfterTerminal::Kept(kept) => return Ok(Finished::Kept(kept)),
@@ -602,7 +559,7 @@ async fn drive<P: PrivateProtocol>(
             ))
         }
         Err(failed) if matches!(failed.cause, RouteError::Deadline { .. }) => {
-            Ok(Finished::Late(terminal))
+            Ok(Finished::Late(terminal, None))
         }
         Err(failed) => Err(failed),
     }

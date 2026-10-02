@@ -234,6 +234,12 @@ impl PrivateProtocol for LaneState {
         self.persistent
     }
 
+    /// The persistent profile keeps its emulated server, and its stall
+    /// fails the turn at once; the per-turn profile interrupts (C2 A1).
+    fn interrupts_on_stall(&self) -> bool {
+        !self.persistent
+    }
+
     /// The persistent profile's logical turn ends at its terminal, with
     /// its cleanup (C2 §4.1); the server stays.
     async fn after_terminal(

@@ -71,7 +71,11 @@ const POLL: Duration = Duration::from_millis(10);
 /// A gate's observations are taken once none arrived for this long.
 const QUIET: Duration = Duration::from_millis(200);
 /// How long the real opens' interval stays open after the last one: a
-/// start or write an open spawned asynchronously counts there.
+/// start or write an open spawned asynchronously counts there. A time
+/// window, not a barrier (review r2 #5): `open_session` gives no
+/// completion signal for work it might schedule, so an effect delayed past
+/// this window would land during the turn, outside `pure_writes` and
+/// `after_open`.
 const OPEN_SETTLE: Duration = Duration::from_millis(100);
 
 /// How a case is driven beyond its expectation: a test seam for cases the
@@ -93,6 +97,10 @@ pub(crate) struct Knobs {
     /// The daemon force is set once the fake logs this progress line (for
     /// example `at 5 launch 1`).
     pub(crate) force_on: Option<&'static str>,
+    /// Core takes no observation for this long after the turn starts.
+    pub(crate) hold_for: Option<Duration>,
+    /// A cancel is ordered this long after the turn starts.
+    pub(crate) stop_after: Option<Duration>,
 }
 
 /// What a running turn has shown so far, for its side actions.
@@ -517,7 +525,7 @@ impl<'a> Run<'a> {
             (seen, ended.clone()),
             (&stop, &observed),
         );
-        let forcing = self.daemon_force(&force, ended.clone());
+        let forcing = self.timed(&force, &stop, ended.clone());
         let (end, (steer, gates), ()) = tokio::join!(drain, side, forcing);
         *session.receiver.borrow_mut() = Some(receiver);
         let end = end?;
@@ -532,29 +540,47 @@ impl<'a> Run<'a> {
         Ok(outcome)
     }
 
-    /// Sets the daemon force at [`Knobs::force_on`]'s progress line, unless
-    /// the turn ended first.
-    async fn daemon_force(
+    /// Sets the daemon force at [`Knobs::force_on`]'s progress line, and
+    /// orders a cancel at [`Knobs::stop_after`], unless the turn ended
+    /// first.
+    async fn timed(
         &self,
         force: &watch::Sender<Option<tokio::time::Instant>>,
+        stop: &watch::Sender<Option<StopOrder>>,
         mut ended: watch::Receiver<bool>,
     ) {
-        let Some(line) = self.knobs.force_on else {
-            return;
+        let forcing = async {
+            if let Some(line) = self.knobs.force_on
+                && self.until_progress(line).await.is_ok()
+            {
+                force.send_replace(Some(tokio::time::Instant::now()));
+            }
+        };
+        let stopping = async {
+            if let Some(after) = self.knobs.stop_after {
+                tokio::time::sleep(after).await;
+                let now = tokio::time::Instant::now();
+                stop.send_replace(Some(StopOrder {
+                    cause: StopCause::Cancel,
+                    requested_at: "2026-01-01T00:00:00.000Z".to_owned(),
+                    force_at: Deadline::at(now + STOP_FORCE),
+                    close_by: Deadline::at(now + STOP_FORCE + CLOSE_BY),
+                }));
+            }
         };
         tokio::select! {
-            seen = self.until_progress(line) => {
-                if seen.is_ok() {
-                    force.send_replace(Some(tokio::time::Instant::now()));
-                }
-            }
+            ((), ()) = async { tokio::join!(forcing, stopping) } => {}
             _ = ended.wait_for(|ended| *ended) => {}
         }
     }
 
     /// Resolves once Core may take the turn's observations: at once, or
-    /// with [`Knobs::hold_until_read`] once the fake read that line.
+    /// after [`Knobs::hold_for`], then with [`Knobs::hold_until_read`] once
+    /// the fake read that line.
     async fn consumer_hold(&self) -> Result<(), String> {
+        if let Some(hold) = self.knobs.hold_for {
+            tokio::time::sleep(hold).await;
+        }
         if let Some(read) = self.knobs.hold_until_read {
             self.until_progress(&format!("read {read} launch 1"))
                 .await?;
@@ -1196,7 +1222,7 @@ fn failure_name(failure: &DriverFailure) -> &'static str {
 
 impl Pure {
     /// `<case dir>/<name>.<suffix>`: the fake's launch or progress log.
-    fn case_file(&self, suffix: &str) -> PathBuf {
+    pub(crate) fn case_file(&self, suffix: &str) -> PathBuf {
         self.case_dir.path().join(format!("{}.{suffix}", self.name))
     }
 
