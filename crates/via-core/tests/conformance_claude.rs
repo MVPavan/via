@@ -40,6 +40,8 @@
 mod conformance_drive;
 #[path = "support/conformance_expect.rs"]
 mod conformance_expect;
+#[path = "support/conformance_run.rs"]
+mod conformance_run;
 
 use std::path::{Path, PathBuf};
 
@@ -67,13 +69,22 @@ fn fixtures() -> PathBuf {
 /// (see the checker's module docs for its obligations: `launches` from
 /// `<case>.launches`, the replay's end judged by
 /// [`conformance_expect::replay_exit`] for every launch, and stdin EOF after the
-/// result at an `await_eof` step). The pure half runs; a case with a
-/// planned session needs the driver half (`via-p98.3.2` C2).
+/// result at an `await_eof` step): the shared pure half, then the shared
+/// run half (`support/conformance_run.rs`).
 fn drive(name: &str, expect: &Value) -> Result<Outcome, String> {
+    drive_with(name, expect, conformance_run::Knobs::default())
+}
+
+/// [`drive`] with the run half's test seams.
+fn drive_with(
+    name: &str,
+    expect: &Value,
+    knobs: conformance_run::Knobs,
+) -> Result<Outcome, String> {
     let replay = fixtures().join(format!("{name}.replay.json"));
     conformance_drive::Pure::run("claude", name, expect, &replay)?
-        .planned_only()
-        .map_err(|why| format!("{why}: the driver half is {ADAPTER_BEAD} C2 (case {name})"))
+        .drive(expect, &replay, knobs)
+        .map_err(|why| format!("{why} ({ADAPTER_BEAD} case {name})"))
 }
 
 fn check_expect(name: &str, expect: &Value) -> Result<(), String> {
@@ -102,7 +113,6 @@ macro_rules! cases {
             )*
             $(
                 #[test]
-                #[ignore = "red until via-p98.3.2 C2"]
                 fn $name() {
                     super::check(stringify!($name)).unwrap();
                 }
@@ -171,16 +181,15 @@ fn claude_argv_budget_refused_before_launch() {
         conformance_expect::validate(&expect).unwrap();
         check_expect("c0_bad_effort", &expect).unwrap_or_else(|e| panic!("{member}: {e}"));
     }
-    // At the limit, both plan: the case needs the driver half.
+    // At the limit, both plan: the turn is left to the run half.
     let mut expect = base;
     expect["sessions"]["main"]["instructions"] = json!("i".repeat(ARG_MAX));
     expect["turns"][0]["params"]["effort"] = json!("low");
     expect["turns"][0]["params"]["output_schema"] = schema_of(ARG_MAX);
-    let planned = drive("c0_bad_effort", &expect).err().unwrap_or_default();
-    assert!(
-        planned.contains("plans, and running it needs the route's driver"),
-        "{planned}"
-    );
+    let replay = fixtures().join("c0_bad_effort.replay.json");
+    let pure = conformance_drive::Pure::run("claude", "c0_bad_effort", &expect, &replay).unwrap();
+    assert_eq!(pure.pending, [0]);
+    assert_eq!(pure.outcome.turns[0].plan_refusal, None);
 }
 
 /// Every case, named fixture and vendor record, sorted.

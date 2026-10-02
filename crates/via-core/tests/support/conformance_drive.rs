@@ -59,9 +59,10 @@ pub(crate) struct Pure {
     /// The adapter set under test.
     pub(crate) set: AdapterSet,
     /// The Store's and the runtime directory's parent.
-    state: tempfile::TempDir,
-    _store: Store,
-    name: String,
+    pub(crate) state: tempfile::TempDir,
+    /// The Store the adapter set runs on; the run half commits turns to it.
+    pub(crate) _store: Store,
+    pub(crate) name: String,
 }
 
 impl Pure {
@@ -255,7 +256,7 @@ impl Pure {
     }
 
     /// The launch log's line count: the fake's starts so far.
-    fn launches(&self) -> Result<u64, String> {
+    pub(crate) fn launches(&self) -> Result<u64, String> {
         let log = self.case_dir.path().join(format!("{}.launches", self.name));
         match fs::read_to_string(&log) {
             Ok(text) => Ok(text.lines().count() as u64),
@@ -298,12 +299,17 @@ fn session_of(turn: &Value) -> &str {
 
 /// The built `via-fake-agent`, beside this test's directory.
 fn fake_agent() -> Result<PathBuf, String> {
+    sibling("via-fake-agent")
+}
+
+/// The workspace binary `name`, beside this test's directory.
+fn sibling(name: &str) -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let path = exe
         .parent()
         .and_then(Path::parent)
         .ok_or("no target directory")?
-        .join("via-fake-agent");
+        .join(name);
     if path.is_file() {
         Ok(path)
     } else {
@@ -332,7 +338,8 @@ fn adapter_set(harness: &str, binary: &Path, state: &Path) -> Result<(AdapterSet
     let set = AdapterSet::new(
         config,
         RuntimeConfig {
-            anchor_binary: state.join("anchor"),
+            // The real anchor, when built: the run half launches through it.
+            anchor_binary: sibling("via").unwrap_or_else(|_| state.join("anchor")),
             anchor_dir: state.join("runtime"),
         },
         store.runtime_resources(),
