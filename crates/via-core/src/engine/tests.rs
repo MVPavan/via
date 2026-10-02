@@ -9517,3 +9517,51 @@ fn a_keyed_steer_orphaned_by_its_caller_is_released_when_its_turn_settles() {
         assert!(steers(&engine, &session).await.is_empty());
     });
 }
+
+/// K2 r5 (C1 §3.4): the steer's turn settles while its caller's ticket is
+/// being dropped, after that drop released the ticket book and before the
+/// drop ends. The drop published the request's end under the book's lock,
+/// so the settlement releases the keyed steer: a repeat promptly stores
+/// and replays the uncertain outcome while the turn still runs, the
+/// driver asked once and no ticket left.
+#[test]
+fn a_keyed_steer_whose_turn_settles_while_its_ticket_drops_is_released() {
+    let Some(root) = child("a_keyed_steer_whose_turn_settles_while_its_ticket_drops_is_released")
+    else {
+        return;
+    };
+    let turn_id = "fake-turn-1";
+    let [expect, _report] = takes_steer(turn_id);
+    let scenario = json!({"profile": steer_profile(&json!({})), "scripts": [turn_script(
+        "p", turn_id, &[expect, json!({"action":"gate","name":"delivering"})])]});
+    let sync = root.join("sync");
+    run(async {
+        let engine = open_fake(&root, &scenario);
+        let session = new_session(&engine).await;
+        let dispatching = dispatch_task(&engine, &session);
+        let raw = json!({"session":session.as_str(),"handle":HANDLE,"text":"also","op_key":"k-1"});
+        let caller = steer_task(&engine, &raw);
+        until(|| sync.join("delivering.entered").exists()).await;
+        let lane = engine.kept_lane(&session).expect("the turn's lane");
+        lane.settle_in_next_ticket_drop(turn(1));
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        let repeat = tokio::time::timeout(Duration::from_secs(5), steer(&engine, &raw))
+            .await
+            .expect("the settlement released the key")
+            .unwrap_err();
+        assert_eq!(
+            repeat.message,
+            ApiError::steer_unrecorded().message,
+            "{repeat:?}"
+        );
+        assert_eq!(
+            steer_result(&engine, &session, "k-1").await,
+            Some(Some(super::steer::uncertain()))
+        );
+        assert_eq!(engine.faults.steer_calls.load(Ordering::Acquire), 1);
+        assert_eq!(lane.steer_tickets(), 0);
+        fs::write(sync.join("delivering.release"), b"").unwrap();
+        dispatching.await.unwrap();
+    });
+}

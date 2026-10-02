@@ -316,6 +316,10 @@ struct TicketBook {
     /// The last turn the lane settled, its observations drained: no
     /// delivery resolves a keyed steer of it or an earlier turn (K2 r4).
     settled: Option<TurnNumber>,
+    /// Test builds: the turn the next ticket's drop settles once it
+    /// released the book, before the ticket's fields go (K2 r5).
+    #[cfg(test)]
+    drop_gap: Option<TurnNumber>,
 }
 
 impl TicketBook {
@@ -340,11 +344,11 @@ impl SteerTickets {
     }
 
     /// Turn `turn` settled, its admitted observations drained (K2 r4 #1):
-    /// a keyed steer of it whose request went away is released, its
-    /// ownership with it, since no delivery can resolve it now. One whose
-    /// request still waits stays for that request, which takes it back on
-    /// the driver's refusal or releases it when it goes away
-    /// ([`SteerTicket`]).
+    /// a keyed steer of it whose request went away, which its ticket's drop
+    /// published under the book's lock (K2 r5), is released, its ownership
+    /// with it, since no delivery can resolve it now. One whose request
+    /// still waits stays for that request, which takes it back on the
+    /// driver's refusal or releases it when it goes away ([`SteerTicket`]).
     fn settle(&self, turn: TurnNumber) {
         let released: Vec<_> = {
             let mut book = self.book();
@@ -435,16 +439,27 @@ impl SteerTicket {
 impl Drop for SteerTicket {
     /// Retires an unkeyed ticket, and a keyed one whose turn settled (K2
     /// r4). A keyed one of a turn not yet settled stays: the lane owns it
-    /// until it resolves it (K2 r3).
+    /// until it resolves it (K2 r3). The request's end is published under
+    /// the book's lock (K2 r5): a settlement after this drop decided sees
+    /// the request gone, even before the ticket's receiver itself goes.
     fn drop(&mut self) {
         if let Some(tickets) = self.tickets.upgrade() {
             let mut book = tickets.book();
+            self.resolved.close();
             let retired = book
                 .tickets
                 .get(&self.token)
                 .is_some_and(|(_, key)| key.as_ref().is_none_or(|key| book.settled(key)));
             let released = retired.then(|| book.tickets.remove(&self.token));
+            #[cfg(test)]
+            let gap = book.drop_gap.take();
             drop(book);
+            // Test builds: the turn settles between the book's release and
+            // the end of this drop (K2 r5).
+            #[cfg(test)]
+            if let Some(turn) = gap {
+                tickets.settle(turn);
+            }
             drop(released);
         }
     }
@@ -919,6 +934,13 @@ impl Lane {
     /// released (K2 r4 #1).
     pub(super) fn settle_steers(&self, turn: TurnNumber) {
         self.steers.settle(turn);
+    }
+
+    /// Test builds: the next steer ticket's drop settles `turn` between
+    /// its release of the book and its own end (K2 r5).
+    #[cfg(test)]
+    pub(super) fn settle_in_next_ticket_drop(&self, turn: TurnNumber) {
+        self.steers.book().drop_gap = Some(turn);
     }
 
     /// Records whether the `steer.delivered` observation of `token`
