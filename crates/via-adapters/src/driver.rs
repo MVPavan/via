@@ -247,23 +247,38 @@ impl Drop for Delivering {
 /// observation's emission, by token (C2 `SteerInput.token`; critical r1
 /// #5, r2 #1). The turn's normalizer answers each `true` once the
 /// observation is on the session channel, `false` when it could not put it
-/// there. The turn's end, by any path, closes the registry and answers
-/// every caller left ([`SteerTurn`]); none registers after. A caller holds
-/// only its receiver and retires its own entry when its future is dropped
-/// ([`SteerWait`]), so the registry holds at most the turn's live callers.
+/// there. The turn's end, by any path, closes the registry: every caller
+/// left is answered, a caller still waiting for Route's answer learns the
+/// turn ended (critical r3 #1), and none registers after ([`SteerTurn`]).
+/// A caller holds only its receiver and retires its own entry when its
+/// future is dropped ([`SteerWait`]), so the registry holds at most the
+/// turn's live callers.
 #[derive(Default)]
-pub(crate) struct SteerEmissions(Mutex<SteerRegistry>);
+pub(crate) struct SteerEmissions {
+    registry: Mutex<SteerRegistry>,
+    /// Cancelled when the turn ends.
+    ended: CancellationToken,
+}
 
 #[derive(Default)]
 struct SteerRegistry {
-    waiting: HashMap<u64, oneshot::Sender<bool>>,
+    waiting: HashMap<u64, Waiting>,
     closed: bool,
+}
+
+/// One caller's entry: its answer's sender.
+struct Waiting {
+    sender: oneshot::Sender<bool>,
+    /// Test builds: Route acknowledged the caller's input, so it waits on
+    /// the emission alone (critical r3 #2).
+    #[cfg(any(test, feature = "test-failpoints"))]
+    acknowledged: bool,
 }
 
 impl SteerEmissions {
     /// Never held across an await; a poisoned registry is still consistent.
     fn lock(&self) -> MutexGuard<'_, SteerRegistry> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        self.registry.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Registers the caller of `token`; `None` once the turn ended.
@@ -273,10 +288,18 @@ impl SteerEmissions {
             return None;
         }
         let (sender, receiver) = oneshot::channel();
-        registry.waiting.insert(token, sender);
+        registry.waiting.insert(
+            token,
+            Waiting {
+                sender,
+                #[cfg(any(test, feature = "test-failpoints"))]
+                acknowledged: false,
+            },
+        );
         Some(SteerWait {
             receiver,
             registry: Arc::downgrade(self),
+            ended: self.ended.clone(),
             token,
         })
     }
@@ -287,34 +310,50 @@ impl SteerEmissions {
         let waiting = self.lock().waiting.remove(&token);
         if let Some(waiting) = waiting {
             // The caller went away meanwhile: nobody waits for the answer.
-            let _ = waiting.send(emitted);
+            let _ = waiting.sender.send(emitted);
         }
     }
 
     /// The turn ended: every caller left learns its observation was not
-    /// emitted, and none registers after.
+    /// emitted, one waiting for Route's answer that the turn ended, and
+    /// none registers after.
     fn close(&self) {
         let waiting = {
             let mut registry = self.lock();
             registry.closed = true;
             std::mem::take(&mut registry.waiting)
         };
+        self.ended.cancel();
         for waiting in waiting.into_values() {
-            let _ = waiting.send(false);
+            let _ = waiting.sender.send(false);
         }
     }
 
-    /// How many callers wait.
+    /// Test builds: marks the caller of `token` acknowledged by Route.
     #[cfg(any(test, feature = "test-failpoints"))]
-    fn len(&self) -> usize {
-        self.lock().waiting.len()
+    fn acknowledged(&self, token: u64) {
+        if let Some(waiting) = self.lock().waiting.get_mut(&token) {
+            waiting.acknowledged = true;
+        }
+    }
+
+    /// How many callers wait, and how many of them Route acknowledged.
+    #[cfg(any(test, feature = "test-failpoints"))]
+    fn len(&self) -> (usize, usize) {
+        let registry = self.lock();
+        let acknowledged = registry
+            .waiting
+            .values()
+            .filter(|waiting| waiting.acknowledged)
+            .count();
+        (registry.waiting.len(), acknowledged)
     }
 }
 
 /// Owned by a turn's `run_turn` for its life: dropped when the turn ends
 /// by any path (its return, its future dropped, a forced stop or the
 /// cutoff), it closes the turn's [`SteerEmissions`], so a steer never
-/// outlives its turn (critical r2 #1).
+/// outlives its turn (critical r2 #1, r3 #1).
 pub(crate) struct SteerTurn(pub(crate) Arc<SteerEmissions>);
 
 impl Drop for SteerTurn {
@@ -324,11 +363,13 @@ impl Drop for SteerTurn {
 }
 
 /// One steer caller's wait for its observation's emission. It holds only
-/// its receiver and a weak handle on the registry, so it never keeps its
-/// own completion alive; dropped unanswered, it retires its entry.
+/// its receiver, a weak handle on the registry and the turn's end, so it
+/// never keeps its own completion alive; dropped unanswered, it retires
+/// its entry.
 struct SteerWait {
     receiver: oneshot::Receiver<bool>,
     registry: Weak<SteerEmissions>,
+    ended: CancellationToken,
     token: u64,
 }
 
@@ -478,7 +519,17 @@ impl SessionDriver {
         self.state()
             .active
             .as_ref()
-            .map_or(0, |active| active.emissions.len())
+            .map_or(0, |active| active.emissions.len().0)
+    }
+
+    /// Test builds: how many of those Route acknowledged, so that each
+    /// waits on its observation's emission alone (critical r3 #2).
+    #[cfg(any(test, feature = "test-failpoints"))]
+    pub fn steers_acknowledged(&self) -> usize {
+        self.state()
+            .active
+            .as_ref()
+            .map_or(0, |active| active.emissions.len().1)
     }
 
     /// The ID identity confirmations name for the driver's current
@@ -625,7 +676,10 @@ impl SessionDriver {
     /// session channel before this returns `Ok` (C2 `SteerInput.token`). A
     /// delivery the vendor took whose observation the turn could not put
     /// there (a full queue, or the turn's end first, a forced stop
-    /// included) is `NotRecorded`; the turn's end always answers.
+    /// included) is `NotRecorded`. The turn's end, by any path, always
+    /// answers (critical r3 #1): before Route's answer, an input Route
+    /// never took is `NoActiveTurn` and one it started writing
+    /// `NotDelivered`, since the vendor may have it.
     pub async fn steer(&self, input: SteerInput) -> Result<SteerDelivery, SteerError> {
         let delivery = match self
             .adapter
@@ -669,11 +723,25 @@ impl SessionDriver {
                 .map_err(steer_error)?;
             (wait, answer)
         };
-        match answer.await {
-            Ok(Ok(())) => {}
-            Ok(Err(refused)) => return Err(steer_error(refused)),
-            // The turn ended first.
-            Err(_) => return Err(SteerError::NoActiveTurn),
+        // Critical r3 #1: Route's answer, or the turn's end, whichever
+        // comes first; an answer already there wins.
+        let mut answer = answer;
+        let replied = tokio::select! {
+            biased;
+            replied = &mut answer.reply => replied.ok(),
+            () = wait.ended.cancelled() => answer.reply.try_recv().ok(),
+        };
+        match replied {
+            Some(Ok(())) => {}
+            Some(Err(refused)) => return Err(steer_error(refused)),
+            // The turn ended unanswered: an input Route started writing
+            // may have reached the vendor; one it never took did not.
+            None if answer.write_started() => return Err(SteerError::NotDelivered),
+            None => return Err(SteerError::NoActiveTurn),
+        }
+        #[cfg(any(test, feature = "test-failpoints"))]
+        if let Some(registry) = wait.registry.upgrade() {
+            registry.acknowledged(token);
         }
         if wait.emitted().await {
             Ok(delivery)

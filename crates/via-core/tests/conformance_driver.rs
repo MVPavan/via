@@ -2184,7 +2184,10 @@ fn a_partial_steer_profile_reports_its_semantics() {
 /// outlives its turn): the vendor took the steer, but its report waits
 /// behind a full observation channel when the daemon forces the turn. The
 /// steer is answered at once, `NotRecorded` with its delivery, never left
-/// pending.
+/// pending. The force follows the driver's checkpoint that Route
+/// acknowledged the steer while its emission is still blocked (critical
+/// r3 #2).
+#[cfg(feature = "test-failpoints")]
 #[test]
 fn a_forced_turn_answers_its_acknowledged_steer() {
     let steps = [
@@ -2216,25 +2219,20 @@ fn a_forced_turn_answers_its_acknowledged_steer() {
                 expected_vendor_turn: None,
                 token: SteerToken::new(1),
             }));
-            // The vendor reported the delivery (its gate follows the
-            // report) and Route has taken the report.
+            // Route acknowledged the delivery, and the steer waits on its
+            // observation's emission alone, which the full channel blocks.
             let by = tokio::time::Instant::now() + FIXTURE_WAIT;
-            let mut settled: Option<tokio::time::Instant> = None;
-            loop {
+            while driver.steers_acknowledged() == 0 {
                 if let Some(early) = poll_once(&mut steer).await {
                     return format!("{early:?} before the force");
                 }
-                let now = tokio::time::Instant::now();
-                match settled {
-                    Some(at) if now >= at => break,
-                    Some(_) => {}
-                    None if sync.join("forced.entered").exists() => {
-                        settled = Some(now + Duration::from_millis(500));
-                    }
-                    None => assert!(now < by, "the vendor never reported the steer"),
-                }
+                assert!(
+                    tokio::time::Instant::now() < by,
+                    "Route never acknowledged the steer"
+                );
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
+            assert_eq!(driver.steers_waiting(), 1, "its emission is blocked");
             controls
                 .force
                 .send_replace(Some(tokio::time::Instant::now()));
@@ -2337,6 +2335,137 @@ fn a_cancelled_steer_leaves_no_entry() {
     );
     assert!(end.outcome.is_ok(), "{end:?}");
     assert_eq!(waiting, 0);
+}
+
+/// Critical r3 #1 (C2 `SteerError`: a steer never outlives its turn): on
+/// the persistent profile the helper reads a steer, then ends the turn
+/// with a completed terminal and no steer report, and its process stays
+/// behind a gate while Route retires it. The logical turn's end answers
+/// at once both that steer, which was written with no acknowledgement, so
+/// whether the vendor applied it is unknown (`NotDelivered`), and a second
+/// one still queued behind it, which never left the control lane
+/// (`NoActiveTurn`).
+#[test]
+fn a_persistent_turns_end_answers_its_steers() {
+    let rig = Rig::new(
+        &json!({"persistent": true, "capabilities": native_capabilities()}),
+        &[script(
+            1,
+            &[
+                accepted(1),
+                json!({"action":"expect_request","expected":{"type":"steer","id":3}}),
+                terminal(1, "completed", "end_turn"),
+                gate("held"),
+            ],
+        )],
+    );
+    let (driver, mut receiver) = rig.session();
+    let (cx, _controls) = turn_cx(1, driver.prepare(), WALL);
+    let steer = |token| -> Steer<'_> {
+        Box::pin(driver.steer(SteerInput {
+            turn: TurnNumber::try_from(1).unwrap(),
+            text: "also".to_owned(),
+            expected_vendor_turn: None,
+            token: SteerToken::new(token),
+        }))
+    };
+    let (end, answers) = rig.runtime.block_on(async {
+        let run = driver.run_turn(prompt(), cx);
+        tokio::pin!(run);
+        let mut steers: Option<(Steer<'_>, Steer<'_>)> = None;
+        let end = loop {
+            tokio::select! {
+                Some(admitted) = receiver.recv() => {
+                    if matches!(admitted.item.observation, Observation::Accepted(_)) {
+                        // Admitted in this order: the second queues
+                        // behind the first.
+                        let (mut written, mut queued) = (steer(1), steer(2));
+                        assert!(poll_once(&mut written).await.is_none());
+                        assert!(poll_once(&mut queued).await.is_none());
+                        steers = Some((written, queued));
+                    }
+                }
+                early = async {
+                    let (written, queued) = steers.as_mut().unwrap();
+                    tokio::select! { a = written => a, a = queued => a }
+                }, if steers.is_some() => {
+                    panic!("answered before the turn's end: {early:?}");
+                }
+                end = &mut run => break end,
+            }
+        };
+        // The helper still holds its process behind the gate; Route's
+        // retirement of it takes longer than this.
+        let (written, queued) = steers.expect("the turn was accepted");
+        let within = Duration::from_secs(1);
+        let answers = tokio::join!(
+            tokio::time::timeout(within, written),
+            tokio::time::timeout(within, queued)
+        );
+        (checked(end), format!("{answers:?}"))
+    });
+    release(&rig.sync(), "held");
+    assert!(end.outcome.is_ok(), "{end:?}");
+    assert_eq!(answers, "(Ok(Err(NotDelivered)), Ok(Err(NoActiveTurn)))");
+}
+
+/// Critical r3 #1 (C2 `SteerError`): on the per-turn profile, a turn
+/// whose future is dropped after the helper read its steer, with no
+/// report, answers the steer at once: Route started writing it, so
+/// whether the vendor applied it is unknown (`NotDelivered`).
+#[test]
+fn a_dropped_turn_answers_its_written_steer() {
+    let rig = Rig::new(
+        &json!({"capabilities": native_capabilities()}),
+        &[script(
+            1,
+            &[
+                accepted(1),
+                json!({"action":"expect_request","expected":{"type":"steer","id":3}}),
+                gate("held"),
+                terminal(1, "completed", "end_turn"),
+            ],
+        )],
+    );
+    let (driver, mut receiver) = rig.session();
+    let (cx, _controls) = turn_cx(1, driver.prepare(), WALL);
+    let sync = rig.sync();
+    let answer = rig.runtime.block_on(async {
+        let mut run = Box::pin(driver.run_turn(prompt(), cx));
+        let mut steer: Option<Steer<'_>> = None;
+        let by = tokio::time::Instant::now() + FIXTURE_WAIT;
+        while !sync.join("held.entered").exists() {
+            assert!(
+                tokio::time::Instant::now() < by,
+                "the helper never read the steer"
+            );
+            tokio::select! {
+                Some(admitted) = receiver.recv() => {
+                    if matches!(admitted.item.observation, Observation::Accepted(_)) {
+                        steer = Some(Box::pin(driver.steer(SteerInput {
+                            turn: TurnNumber::try_from(1).unwrap(),
+                            text: "also".to_owned(),
+                            expected_vendor_turn: None,
+                            token: SteerToken::new(1),
+                        })));
+                    }
+                }
+                early = async { steer.as_mut().unwrap().await }, if steer.is_some() => {
+                    panic!("answered before the turn's end: {early:?}");
+                }
+                end = &mut run => panic!("the turn ended: {end:?}"),
+                () = tokio::time::sleep(Duration::from_millis(5)) => {}
+            }
+        }
+        drop(run);
+        let steer = steer.expect("the turn was accepted");
+        format!(
+            "{:?}",
+            tokio::time::timeout(Duration::from_secs(1), steer).await
+        )
+    });
+    release(&sync, "held");
+    assert_eq!(answer, "Ok(Err(NotDelivered))");
 }
 
 /// Polls `steer` once: its answer if it has one at once.

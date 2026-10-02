@@ -5,6 +5,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
@@ -76,6 +77,8 @@ pub struct SteerRequest {
     pub token: u64,
     /// The delivery answer.
     pub reply: oneshot::Sender<Result<(), SteerRefused>>,
+    /// Set once Route starts writing the input ([`SteerAnswer::write_started`]).
+    written: Arc<AtomicBool>,
     /// The request's share of the control budget, returned when it is
     /// dropped.
     permit: ControlPermit,
@@ -135,7 +138,7 @@ impl SteerSender {
         text: String,
         expected_vendor_turn: Option<String>,
         token: u64,
-    ) -> Result<oneshot::Receiver<Result<(), SteerRefused>>, SteerRefused> {
+    ) -> Result<SteerAnswer, SteerRefused> {
         let command = Arc::clone(&self.commands)
             .try_acquire_owned()
             .map_err(|_| SteerRefused::OverCapacity)?;
@@ -150,18 +153,42 @@ impl SteerSender {
             _bytes: bytes,
         };
         let (reply, answer) = oneshot::channel();
+        let written = Arc::new(AtomicBool::new(false));
         let request = SteerRequest {
             text,
             expected_vendor_turn,
             token,
             reply,
+            written: Arc::clone(&written),
             permit,
         };
         match self.sender.try_send(request) {
-            Ok(()) => Ok(answer),
+            Ok(()) => Ok(SteerAnswer {
+                reply: answer,
+                written,
+            }),
             Err(mpsc::error::TrySendError::Full(_)) => Err(SteerRefused::OverCapacity),
             Err(mpsc::error::TrySendError::Closed(_)) => Err(SteerRefused::NotActive),
         }
+    }
+}
+
+/// An admitted steer input's answer, as its caller holds it (critical r3
+/// #1): Route's reply, and whether Route started writing the input, which
+/// tells a caller whose turn ended unanswered whether the input may have
+/// reached the vendor.
+pub struct SteerAnswer {
+    /// Route's reply; dropped unanswered when the turn ended first.
+    pub reply: oneshot::Receiver<Result<(), SteerRefused>>,
+    written: Arc<AtomicBool>,
+}
+
+impl SteerAnswer {
+    /// Whether Route started writing the input: it may have been written,
+    /// in part or whole. False means it never left the control lane.
+    #[must_use]
+    pub fn write_started(&self) -> bool {
+        self.written.load(Ordering::Acquire)
     }
 }
 
@@ -568,6 +595,7 @@ impl Serving<'_> {
             expected_vendor_turn,
             token,
             reply,
+            written,
             permit,
         } = request;
         let refused = if !self.lane.accepted || self.terminated {
@@ -595,6 +623,7 @@ impl Serving<'_> {
             suffix: b"\"}\n".to_vec(),
             escape: escape_json,
         };
+        written.store(true, Ordering::Release);
         self.lane.steer_write = Some(self.sender.write(steer, self.deadline));
         self.lane.steer_reply = Some((reply, permit));
         self.lane.steer_token = Some(token);

@@ -13,7 +13,7 @@ mod runtime;
 
 pub use runtime::{
     CONTROL_BYTES, CONTROL_COMMANDS, FakeRoute, FakeRouteResult, FakeTerminal, FakeTurn, Lane,
-    Retirement, SteerRefused, SteerRequest, SteerSender, steer_lane,
+    Retirement, SteerAnswer, SteerRefused, SteerRequest, SteerSender, steer_lane,
 };
 
 /// The one prompt submission of a private fake connection. Wire streams it
