@@ -345,7 +345,7 @@ impl Engine {
             ..
         } = self.history(session, turn).await?;
         let (cwd, _, plan) = self
-            .frozen(session)
+            .frozen(session, false)
             .await
             .map_err(|error| WriteOutcome::of_read(&error))?;
         Ok(Queueing {
@@ -367,20 +367,28 @@ impl Engine {
     /// The session's frozen `cwd` (design §11.1) and its stored identity
     /// (decision H3), which a rebuilt envelope reports as the live drive
     /// and `logs` would (C1 §5, critical r1 #11).
+    ///
+    /// `strict` (critical r1 #10): the session's frozen parameters or
+    /// capabilities that do not decode are corrupt evidence, never absence,
+    /// for a recovered turn that ran under them. A queued turn failed or
+    /// cancelled because its row is corrupt (design §7.3) reads them
+    /// leniently: that corruption is what its `failed(store)` reports.
     async fn frozen(
         &self,
         session: &SessionId,
+        strict: bool,
     ) -> Result<(Option<String>, Option<Identity>, TurnPlan), StoreError> {
         let Some(snapshot) = self.store.session_snapshot(session).await? else {
             return Ok((None, None, TurnPlan::default()));
         };
-        // Critical r1 #10: the session's frozen parameters or capabilities
-        // that do not decode are corrupt evidence, never absence.
-        let frozen = Frozen::decode(&snapshot.route).ok_or(StoreError::CorruptEvidence)?;
         // The turn's own frozen values are not read back here.
-        let plan = TurnPlan {
-            frozen,
-            effective: None,
+        let plan = if strict {
+            TurnPlan {
+                frozen: Frozen::decode(&snapshot.route).ok_or(StoreError::CorruptEvidence)?,
+                effective: None,
+            }
+        } else {
+            TurnPlan::of(&snapshot.route, None)
         };
         Ok((snapshot.cwd, Identity::stored(&snapshot.route), plan))
     }
@@ -564,7 +572,10 @@ impl Engine {
             .map_err(|_| ApiError::STORE)?;
         #[cfg(test)]
         self.hold(&self.faults.hold_after_history).await;
-        let (cwd, identity, mut plan) = self.frozen(&session).await.map_err(|_| ApiError::STORE)?;
+        let (cwd, identity, mut plan) = self
+            .frozen(&session, true)
+            .await
+            .map_err(|_| ApiError::STORE)?;
         // Sol r1 #12: the envelope reports this turn's own frozen values.
         // Critical r1 #10: values that do not decode are corrupt evidence,
         // which fails recovery, and so startup, as Store's own corrupt
