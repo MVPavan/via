@@ -321,17 +321,35 @@ impl Serialize for Inherit {
 }
 
 /// The `Serialize` form back: every category exactly once, each a state;
-/// anything else is refused, never completed with a default.
+/// anything else, a repeated category included (critical r2 #8), is
+/// refused, never completed with a default.
 impl<'de> Deserialize<'de> for Inherit {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let states = BTreeMap::<Category, InheritState>::deserialize(deserializer)?;
-        if states.len() != Category::ALL.len() {
-            return Err(serde::de::Error::custom(
-                "inherit names every category once",
-            ));
+        deserializer.deserialize_map(InheritVisitor)
+    }
+}
+
+struct InheritVisitor;
+
+impl<'de> serde::de::Visitor<'de> for InheritVisitor {
+    type Value = Inherit;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a state for every category, each named once")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Inherit, A::Error> {
+        let mut states: [Option<InheritState>; 6] = [None; 6];
+        while let Some((category, state)) = map.next_entry::<Category, InheritState>()? {
+            let slot = &mut states[category.index()];
+            if slot.replace(state).is_some() {
+                return Err(serde::de::Error::custom("inherit names a category twice"));
+            }
         }
-        let mut inherit = Self::OD2_DEFAULT;
-        for (category, state) in states {
+        let mut inherit = Inherit::OD2_DEFAULT;
+        for category in Category::ALL {
+            let state = states[category.index()]
+                .ok_or_else(|| serde::de::Error::custom("inherit names every category"))?;
             inherit.set(category, state);
         }
         Ok(inherit)
@@ -661,4 +679,34 @@ fn unavailable(route: Option<&'static str>) -> Refusal {
         route,
         "the harness is not available in this daemon",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::Inherit;
+
+    /// Critical r2 #8: `inherit` names every category exactly once; seven
+    /// members with `hooks` twice are refused, as are five.
+    #[test]
+    fn inherit_refuses_a_repeated_category() {
+        let all = r#""hooks":"off","mcp_servers":"off","plugins":"on","skills":"on","agents":"on","instruction_files":"on""#;
+        let parse = |text: String| serde_json::from_str::<Inherit>(&text);
+        assert_eq!(parse(format!("{{{all}}}")).unwrap(), Inherit::OD2_DEFAULT);
+        assert!(
+            parse(format!(r#"{{{all},"hooks":"on"}}"#)).is_err(),
+            "hooks twice"
+        );
+        assert!(
+            parse(format!(r#"{{"hooks":"on",{all}}}"#)).is_err(),
+            "hooks twice, first"
+        );
+        assert!(
+            serde_json::from_value::<Inherit>(json!({"hooks":"off","mcp_servers":"off",
+                "plugins":"on","skills":"on","agents":"on"}))
+            .is_err(),
+            "five categories"
+        );
+    }
 }
