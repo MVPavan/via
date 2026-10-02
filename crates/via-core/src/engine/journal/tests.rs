@@ -475,10 +475,13 @@ async fn receipt(store: &StoreClient, session: &SessionId, submitted: bool) {
             session_id: session.clone(),
             handle_hash: [7; 32],
             receipt: json!({"state":"queued"}),
-            // Core's frozen parameters: the effective `inherit` is required.
-            params: json!({"harness":"fake","model":"fake","inherit":
-                {"hooks":"off","mcp_servers":"off","plugins":"on","skills":"on",
-                 "agents":"on","instruction_files":"on"}}),
+            // Core's frozen parameters: `inherit`, as requested and
+            // effective, is required.
+            params: json!({"harness":"fake","model":"fake","inherit":{
+                "requested": {"hooks":"off","mcp_servers":"off","plugins":"on","skills":"on",
+                              "agents":"on","instruction_files":"on"},
+                "effective": {"hooks":"off","mcp_servers":"off","plugins":"on","skills":"on",
+                              "agents":"on","instruction_files":"on"}}}),
             label: None,
             prompt: "hello".into(),
             effective: frozen(),

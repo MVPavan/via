@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use via_adapters::{Bound, Capabilities, Inherit, SessionRef, Support, VendorOptions, Verb};
+use via_adapters::{Bound, Capabilities, InheritPlan, SessionRef, Support, VendorOptions, Verb};
 use via_store::SessionRoute;
 
 use super::{Effective, Planned, SessionMembers};
@@ -36,12 +36,11 @@ struct Params {
     cwd: Option<String>,
     #[serde(default)]
     allow_untested: bool,
-    /// The effective inherited-configuration states (AD13), which the
-    /// session's driver opens with (C2 §6.2): required, never defaulted.
-    inherit: Inherit,
-    /// The categories whose effective state is not the requested one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    inherit_unverified: Option<Value>,
+    /// The inherited-configuration settings as requested, and their
+    /// effective states (AD13), which the session's driver opens with
+    /// (C2 §6.2, critical r2 #5): required, never defaulted. The
+    /// `config_switch_unverified` categories derive from them.
+    inherit: InheritPlan,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     instructions: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -54,21 +53,12 @@ pub(crate) fn frozen_params(
     planned: &Planned,
     (params, members, cwd): (&SpawnParams, &SessionMembers, &str),
 ) -> Result<Value, ApiError> {
-    let unverified = planned
-        .plan
-        .warnings
-        .iter()
-        .find(|warning| warning.code == "config_switch_unverified")
-        .and_then(|warning| warning.data.as_ref())
-        .and_then(|data| data.get("categories"))
-        .cloned();
     serde_json::to_value(Params {
         harness: planned.plan.harness.to_owned(),
         model: params.model.clone(),
         cwd: Some(cwd.to_owned()),
         allow_untested: params.allow_untested,
         inherit: planned.plan.inherit,
-        inherit_unverified: unverified,
         instructions: members.instructions.clone(),
         vendor: planned.effective.vendor.clone(),
     })
@@ -88,10 +78,9 @@ pub(crate) struct Frozen {
     pub(crate) instructions: Option<String>,
     pub(crate) vendor: VendorOptions,
     pub(crate) allow_untested: bool,
-    /// The frozen effective `inherit`; `None` only where the row's
-    /// parameters were not read.
-    pub(crate) inherit: Option<Inherit>,
-    unverified: Option<Value>,
+    /// The frozen `inherit`, as requested and effective; `None` only
+    /// where the row's parameters were not read.
+    pub(crate) inherit: Option<InheritPlan>,
     capabilities: Option<Capabilities>,
 }
 
@@ -143,7 +132,6 @@ impl Frozen {
             frozen.vendor = params.vendor;
             frozen.allow_untested = params.allow_untested;
             frozen.inherit = Some(params.inherit);
-            frozen.unverified = params.inherit_unverified;
         }
         frozen
     }
@@ -184,12 +172,14 @@ impl Frozen {
     /// listing every category whose effective state is not the requested
     /// one; none when each is.
     pub(crate) fn config_warning(&self) -> Option<Warning> {
-        self.unverified.as_ref().and_then(|categories| {
-            Warning::adapter(
-                "config_switch_unverified",
-                Some(json!({ "categories": categories })),
-            )
-        })
+        let categories = self.inherit.as_ref()?.unverified();
+        if categories.is_empty() {
+            return None;
+        }
+        Warning::adapter(
+            "config_switch_unverified",
+            Some(json!({ "categories": categories })),
+        )
     }
 }
 
@@ -274,27 +264,60 @@ mod tests {
         }
     }
 
-    /// Critical r1 #2: the frozen `inherit` decodes into the typed C2
-    /// value; one that is absent, misnamed, incomplete or not a state is
-    /// corrupt, never a default.
+    /// Critical r1 #2, r2 #5: the frozen `inherit`, as requested and
+    /// effective, decodes into the typed C2 value; one that is absent,
+    /// lacks either half, or has a half that is misnamed, incomplete or
+    /// not a state is corrupt, never a default. The
+    /// `config_switch_unverified` categories derive from the two halves.
     #[test]
     fn the_frozen_inherit_is_typed_and_required() {
-        let inherit = json!({"hooks":"unknown","mcp_servers":"off","plugins":"on",
-                             "skills":"on","agents":"off","instruction_files":"on"});
+        let effective = json!({"hooks":"unknown","mcp_servers":"off","plugins":"on",
+                               "skills":"on","agents":"off","instruction_files":"on"});
+        let requested = json!({"hooks":"on","mcp_servers":"off","plugins":"on",
+                               "skills":"on","agents":"on","instruction_files":"on"});
+        let inherit = json!({"requested": requested, "effective": effective});
         let params = json!({"harness":"fake","model":"fake","cwd":"/w","inherit":inherit});
         let frozen = Frozen::decode(&route(&params)).unwrap();
         assert_eq!(serde_json::to_value(frozen.inherit).unwrap(), inherit);
+        assert_eq!(
+            serde_json::to_value(frozen.config_warning().unwrap()).unwrap()["data"],
+            (json!({"categories": [
+                {"category":"hooks","requested":"on","effective":"unknown"},
+                {"category":"agents","requested":"on","effective":"off"},
+            ]}))
+        );
         let mut absent = params.clone();
         absent.as_object_mut().unwrap().remove("inherit");
+        let mut effective_only = params.clone();
+        effective_only["inherit"] = effective;
+        let mut no_request = params.clone();
+        no_request["inherit"]
+            .as_object_mut()
+            .unwrap()
+            .remove("requested");
         let mut unknown_state = params.clone();
-        unknown_state["inherit"]["hooks"] = json!("maybe");
+        unknown_state["inherit"]["effective"]["hooks"] = json!("maybe");
         let mut missing = params.clone();
-        missing["inherit"].as_object_mut().unwrap().remove("skills");
+        missing["inherit"]["requested"]
+            .as_object_mut()
+            .unwrap()
+            .remove("skills");
         let mut extra = params.clone();
-        extra["inherit"]["themes"] = json!("on");
+        extra["inherit"]["effective"]["themes"] = json!("on");
+        let mut extra_half = params.clone();
+        extra_half["inherit"]["observed"] = requested;
         let mut shape = params;
         shape["inherit"] = json!(["on"]);
-        for case in [absent, unknown_state, missing, extra, shape] {
+        for case in [
+            absent,
+            effective_only,
+            no_request,
+            unknown_state,
+            missing,
+            extra,
+            extra_half,
+            shape,
+        ] {
             assert!(Frozen::decode(&route(&case)).is_none(), "{case}");
         }
     }

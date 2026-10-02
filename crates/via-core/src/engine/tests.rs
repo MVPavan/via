@@ -3127,13 +3127,16 @@ fn a_lane_opens_from_the_sessions_stored_route_identity() {
 }
 
 /// Critical r1 #2 (C2 §2 `SessionSpec`, §6.2, AD13): the driver opens
-/// with the session's frozen effective `inherit`: a session's first lane,
+/// with the session's frozen `inherit`: a session's first lane,
 /// and the lane a later daemon reopens for a session spawned before the
 /// restart, though that daemon's own plan would differ. (A dispatched
 /// turn here ends `unknown`, since no anchor exists, which would cancel
 /// its successors, so the reopened session's turn 1 ends `failed`.)
 /// The driver's `spec()` is a test seam of the failpoint builds (critical
-/// r2 #11).
+/// r2 #11). Critical r2 #5 (C2 §2, §6.2): the spec carries the frozen
+/// request with the effective states; a session whose Store row froze a
+/// request other than today's default (hooks `on`) reopens with it, its
+/// `unknown` effective state keeping the requested direction.
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn a_lane_opens_with_the_sessions_frozen_inherit() {
@@ -3151,8 +3154,11 @@ fn a_lane_opens_with_the_sessions_frozen_inherit() {
         "plugins": {"on": "none"},
         "agents": {"on": "none", "observed": "off"},
     }}));
-    let frozen = json!({"hooks":"unknown","mcp_servers":"off","plugins":"unknown",
-                        "skills":"on","agents":"off","instruction_files":"on"});
+    let effective = json!({"hooks":"unknown","mcp_servers":"off","plugins":"unknown",
+                           "skills":"on","agents":"off","instruction_files":"on"});
+    let requested = json!({"hooks":"off","mcp_servers":"off","plugins":"on",
+                           "skills":"on","agents":"on","instruction_files":"on"});
+    let frozen = json!({"requested": requested, "effective": effective});
     let spec_inherit = |engine: &Engine, session: &SessionId| {
         let lane = super::lock(&engine.lanes).get(session).cloned();
         serde_json::to_value(lane.expect("the session's lane").driver.spec().inherit).unwrap()
@@ -3167,6 +3173,20 @@ fn a_lane_opens_with_the_sessions_frozen_inherit() {
         shutdown(&engine).await;
         reopened
     });
+    let db = rusqlite::Connection::open(root.join("state").join("store.sqlite3")).unwrap();
+    db.busy_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(
+        db.execute(
+            "UPDATE sessions SET params=json_set(params,'$.inherit.requested.hooks','on') \
+             WHERE id=?1",
+            [reopened.as_str()],
+        )
+        .unwrap(),
+        1
+    );
+    drop(db);
+    let mut frozen = frozen;
+    frozen["requested"]["hooks"] = json!("on");
     // The next daemon's plan would request the OD2 default with every
     // switch verified: its lane still takes the frozen states.
     let both = json!({"on": "verified", "off": "verified"});
@@ -3517,7 +3537,9 @@ async fn open_test_driver(
     via_adapters::SessionRef,
     via_store::SessionRoute,
 ) {
-    use via_adapters::{Inherit, SessionCx, SessionSpec, VendorOptions, observation_channel};
+    use via_adapters::{
+        Inherit, InheritPlan, SessionCx, SessionSpec, VendorOptions, observation_channel,
+    };
     let route = engine
         .store
         .session_snapshot(session)
@@ -3536,7 +3558,10 @@ async fn open_test_driver(
             initial_bound: None,
             cwd: root.to_path_buf(),
             vendor: VendorOptions::new(),
-            inherit: Inherit::OD2_DEFAULT,
+            inherit: InheritPlan {
+                requested: Inherit::OD2_DEFAULT,
+                effective: Inherit::OD2_DEFAULT,
+            },
             confirmed_vendor_session_id: None,
             allow_untested: false,
         },
@@ -3550,7 +3575,7 @@ async fn open_test_driver(
 }
 
 /// The session's frozen `inherit`, read from its stored route.
-fn frozen_inherit(route: &via_store::SessionRoute) -> via_adapters::Inherit {
+fn frozen_inherit(route: &via_store::SessionRoute) -> via_adapters::InheritPlan {
     crate::intake::Frozen::of(route).inherit.unwrap()
 }
 

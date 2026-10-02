@@ -340,7 +340,7 @@ fn conformance_unknown_effort_refused() {
 fn states(plan: &via_adapters::RoutePlan) -> Vec<(Category, InheritState)> {
     Category::ALL
         .iter()
-        .map(|category| (*category, plan.inherit.get(*category)))
+        .map(|category| (*category, plan.inherit.effective.get(*category)))
         .collect()
 }
 
@@ -427,9 +427,9 @@ fn conformance_inherit_effective_states() {
         "skills": {"observed": "on"}}}))
     .plan(&describe(Some("fake"), None))
     .unwrap();
-    assert_eq!(claude.inherit.get(Hooks), Unknown);
-    assert_eq!(claude.inherit.get(McpServers), Off);
-    assert_eq!(claude.inherit.get(Skills), On);
+    assert_eq!(claude.inherit.effective.get(Hooks), Unknown);
+    assert_eq!(claude.inherit.effective.get(McpServers), Off);
+    assert_eq!(claude.inherit.effective.get(Skills), On);
     assert_eq!(
         switch_warning(&claude).unwrap()["data"]["categories"],
         json!([{"category":"hooks","requested":"off","effective":"unknown"}])

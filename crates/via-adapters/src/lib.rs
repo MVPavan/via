@@ -175,7 +175,7 @@ pub use observation::{
     UsageSample, VendorTerminal, observation_channel, observation_channel_in,
 };
 pub use plan::{
-    AdapterSet, Bound, CatalogModel, Category, CategoryDecl, DescribeRequest, Inherit,
+    AdapterSet, Bound, CatalogModel, Category, CategoryDecl, DescribeRequest, Inherit, InheritPlan,
     InheritState, ModelChoice, ModelEntry, ModelSource, Refusal, RefusalKind, RoutePlan, ServerKey,
     SessionRef, Switch, TurnCheck, TurnParams, VendorOptions, VersionStatus, Warning,
     resolve_model,

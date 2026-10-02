@@ -31,11 +31,11 @@ use via_adapters::observation::{
 };
 use via_adapters::{
     AdapterConfig, AdapterSet, AnchorRecovery, BootstrapEnv, CancellationToken, Cleanup, CloseMode,
-    Deadline, DriverFailure, DriverHealth, Inherit, OBSERVATION_ITEMS, Prepared, Recovery,
-    RouteError, RouteFailure, RuntimeConfig, SessionCx, SessionDriver, SessionId, SessionRef,
-    SessionSpec, StartRejected, SteerError, SteerInput, StopCause, StopOrder, TaskTracker,
-    TurnActivity, TurnCx, TurnNumber, TurnSpec, VendorTerminalStatus, VendorTurnId, VersionStatus,
-    WireCleanup,
+    Deadline, DriverFailure, DriverHealth, Inherit, InheritPlan, OBSERVATION_ITEMS, Prepared,
+    Recovery, RouteError, RouteFailure, RuntimeConfig, SessionCx, SessionDriver, SessionId,
+    SessionRef, SessionSpec, StartRejected, SteerError, SteerInput, StopCause, StopOrder,
+    TaskTracker, TurnActivity, TurnCx, TurnNumber, TurnSpec, VendorTerminalStatus, VendorTurnId,
+    VersionStatus, WireCleanup,
 };
 use via_store::{ResumeRecord, SpawnRecord, Store};
 
@@ -425,7 +425,10 @@ impl Rig {
             initial_bound: None,
             cwd: self.dir.path().to_path_buf(),
             vendor: via_adapters::VendorOptions::new(),
-            inherit: Inherit::OD2_DEFAULT,
+            inherit: InheritPlan {
+                requested: Inherit::OD2_DEFAULT,
+                effective: Inherit::OD2_DEFAULT,
+            },
             confirmed_vendor_session_id: None,
             allow_untested: false,
         };

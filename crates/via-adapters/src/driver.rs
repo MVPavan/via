@@ -17,7 +17,7 @@ use crate::fake::FakeAdapter;
 use crate::observation::{
     AdapterError, ObservationSink, SteerDelivery, SteerReceipt, SteerToken, TurnEnd, TurnEvidence,
 };
-use crate::plan::{Bound, Inherit, VendorOptions};
+use crate::plan::{Bound, InheritPlan, VendorOptions};
 use crate::{
     CapacityToken, Cleanup, Deadline, DriverFailure, DriverHealth, SessionId, StopCause, StopOrder,
     StopWatch, TurnActivity, TurnNumber, VendorTurnId,
@@ -53,8 +53,10 @@ pub struct SessionSpec {
     pub cwd: PathBuf,
     /// Vendor options.
     pub vendor: VendorOptions,
-    /// Effective inherited-configuration states (AD13).
-    pub inherit: Inherit,
+    /// The inherited-configuration settings requested at spawn and their
+    /// effective states, both frozen (C2 §6.2): the launch recipe applies
+    /// the requested settings.
+    pub inherit: InheritPlan,
     /// The last confirmed vendor session ID; not verification of a new
     /// connection.
     pub confirmed_vendor_session_id: Option<String>,

@@ -8,7 +8,7 @@ use std::{
 
 use tokio::sync::watch;
 use via_adapters::{
-    AdapterError, Admitted, Decline, Denial, DenialKind, Inherit, Observation, ObservationItem,
+    AdapterError, Admitted, Decline, Denial, DenialKind, InheritPlan, Observation, ObservationItem,
     Prepared, RouteError, SteerDelivery, StopOrder, StopWatch, TurnActivity, TurnCx, TurnEnd,
     TurnEvidence, TurnSpec, VendorTerminal, VersionStatus, WireCleanup, observation::Acceptance,
 };
@@ -61,9 +61,9 @@ pub(super) struct Submission {
     queued: QueuedTurn,
     prompt: String,
     effective: Effective,
-    /// The session's frozen effective `inherit`, which its driver opens
-    /// with (critical r1 #2).
-    inherit: Inherit,
+    /// The session's frozen `inherit`, requested and effective, which its
+    /// driver opens with (critical r1 #2, r2 #5).
+    inherit: InheritPlan,
     submitted: SystemTime,
     clock: Instant,
 }

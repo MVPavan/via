@@ -410,32 +410,62 @@ impl CategoryDecl {
     }
 }
 
-/// The effective states for `requested`, and the one
+/// A session's inherited-configuration settings (C2 §2, §6.2): as
+/// requested at spawn, and their effective states. Both are frozen
+/// session parameters: status shows the effective states, and a reopened
+/// session's launch recipe applies the requested settings, whatever the
+/// configuration says now (critical r2 #5).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InheritPlan {
+    /// The settings requested at spawn.
+    pub requested: Inherit,
+    /// Their effective states (AD13).
+    pub effective: Inherit,
+}
+
+impl InheritPlan {
+    /// The `config_switch_unverified` warning's `data.categories`: every
+    /// category whose effective state is not the requested one, as
+    /// `{category, requested, effective}`, in C1 order; empty when each is.
+    pub fn unverified(&self) -> Vec<Value> {
+        Category::ALL
+            .into_iter()
+            .filter_map(|category| {
+                let (asked, state) = (self.requested.get(category), self.effective.get(category));
+                (state != asked)
+                    .then(|| json!({"category": category, "requested": asked, "effective": state}))
+            })
+            .collect()
+    }
+}
+
+/// The settings `requested` with their effective states, and the one
 /// `config_switch_unverified` warning listing every category whose
 /// effective state is not the requested one (AD13, AC7).
 pub(crate) fn effective_inherit(
     decls: &BTreeMap<Category, CategoryDecl>,
     requested: Inherit,
-) -> (Inherit, Option<Warning>) {
+) -> (InheritPlan, Option<Warning>) {
     let mut effective = requested;
-    let mut unmet = Vec::new();
     for category in Category::ALL {
-        let asked = requested.get(category);
         let state = decls
             .get(&category)
             .unwrap_or(&CategoryDecl::VERIFIED)
-            .effective(asked);
+            .effective(requested.get(category));
         effective.set(category, state);
-        if state != asked {
-            unmet.push(json!({"category": category, "requested": asked, "effective": state}));
-        }
     }
+    let inherit = InheritPlan {
+        requested,
+        effective,
+    };
+    let unmet = inherit.unverified();
     let warning = (!unmet.is_empty()).then(|| Warning {
         code: "config_switch_unverified",
         message: "an inherited-configuration setting could not be applied or verified".to_owned(),
         data: Some(json!({ "categories": unmet })),
     });
-    (effective, warning)
+    (inherit, warning)
 }
 
 /// A route plan (C1 §3.1, C2 §2); serializes to the C1 `describe` result.
@@ -461,10 +491,11 @@ pub struct RoutePlan {
     pub refusals: Vec<Refusal>,
     /// Warnings.
     pub warnings: Vec<Warning>,
-    /// Effective inherited-configuration states, frozen at spawn (AD13);
-    /// reported in status, not in `describe`.
+    /// The inherited-configuration settings as requested, and their
+    /// effective states, frozen at spawn (AD13, C2 §6.2); the effective
+    /// states are reported in status, neither in `describe`.
     #[serde(skip)]
-    pub inherit: Inherit,
+    pub inherit: InheritPlan,
     /// The persistent server this plan's connections share, if any; not
     /// part of `describe`.
     #[serde(skip)]

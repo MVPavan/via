@@ -37,7 +37,7 @@ use std::{
 use serde_json::{Map, Value};
 use tokio::sync::{OwnedSemaphorePermit, mpsc, watch};
 use via_adapters::{
-    Admitted, CancellationToken, CloseMode, CloseReport, DriverFailure, DriverHealth, Inherit,
+    Admitted, CancellationToken, CloseMode, CloseReport, DriverFailure, DriverHealth, InheritPlan,
     OBSERVATION_BYTES, OBSERVATION_ITEMS, Observation, ObservationBudget, SessionCx, SessionDriver,
     SessionRef, SessionSpec, SteerToken, UsageSample, VendorTerminal, observation_channel_in,
 };
@@ -1352,7 +1352,7 @@ impl Engine {
     pub(super) async fn open_lane(
         &self,
         session: &SessionId,
-        ((route, effective, inherit), cwd): ((&SessionRoute, &Effective, Inherit), PathBuf),
+        ((route, effective, inherit), cwd): ((&SessionRoute, &Effective, InheritPlan), PathBuf),
         resident: OwnedSemaphorePermit,
     ) -> LaneClaim {
         let replaced = lock(&self.lanes).get(session).cloned();

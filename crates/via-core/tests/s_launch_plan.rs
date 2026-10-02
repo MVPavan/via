@@ -9,7 +9,8 @@ use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use serde_json::json;
 use serde_json::value::RawValue;
 use via_adapters::{
-    AdapterConfig, AdapterSet, BootstrapEnv, DescribeRequest, Inherit, RefusalKind, RuntimeConfig,
+    AdapterConfig, AdapterSet, BootstrapEnv, DescribeRequest, Inherit, InheritPlan, RefusalKind,
+    RuntimeConfig,
 };
 use via_store::Store;
 
@@ -64,7 +65,13 @@ fn s_launch_plan_inherit_per_harness() {
         ..DescribeRequest::default()
     };
     let fake = set.plan(&describe("fake")).unwrap();
-    assert_eq!(fake.inherit, Inherit::OD2_DEFAULT);
+    assert_eq!(
+        fake.inherit,
+        InheritPlan {
+            requested: Inherit::OD2_DEFAULT,
+            effective: Inherit::OD2_DEFAULT,
+        }
+    );
     // No vendor adapter exists before x.3.2: a configured vendor harness
     // still refuses, starting nothing.
     for harness in ["claude", "codex"] {

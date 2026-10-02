@@ -430,7 +430,7 @@ fn status_value(
         "adapter_version": version.adapter_version,
         "vendor_version": version.vendor_version,
         "version_status": version.version_status,
-        "inherit": frozen.inherit,
+        "inherit": frozen.inherit.map(|inherit| inherit.effective),
         "warnings": warnings,
         "vendor_session_id": status.vendor_session_id,
         "vendor_identity_verified": verified,
