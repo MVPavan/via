@@ -187,11 +187,14 @@ type Fence = std::pin::Pin<Box<dyn Future<Output = OwnedMutexGuard<()>> + Send>>
 /// the fence until its delivery ends, so an idle close and a later
 /// generation follow it too. The acquisition is queued here, before the
 /// turn returns and its idle close may start, behind whatever holds the
-/// barrier now; the turn itself never waits on it.
+/// barrier now; the turn itself never waits on it. That first poll runs
+/// outside the task's cooperative budget, which, spent, would return before
+/// queueing (critical fix r2 #1); the retirement's wait stays cooperative.
 fn hand_fence(barrier: &Arc<tokio::sync::Mutex<()>>, fence: oneshot::Sender<Fence>) {
     let mut taking: Fence = Box::pin(Arc::clone(barrier).lock_owned());
     let mut queued = std::task::Context::from_waker(std::task::Waker::noop());
-    let taking: Fence = match taking.as_mut().poll(&mut queued) {
+    let first = std::pin::pin!(tokio::task::unconstrained(taking.as_mut()));
+    let taking: Fence = match first.poll(&mut queued) {
         std::task::Poll::Ready(guard) => Box::pin(std::future::ready(guard)),
         std::task::Poll::Pending => taking,
     };
@@ -734,6 +737,17 @@ async fn deliver_retired(
     // Held until the delivery ends.
     let mut _fenced = None;
     while let Some(retired) = items.recv().await {
+        // Test builds: the delivery holds each retired item before its send.
+        #[cfg(feature = "test-failpoints")]
+        let _ = via_routes::failpoint::hit_async("adapter.fake.retirement_item").await;
+        if let Some(fence) = fence.take()
+            && let Ok(taking) = fence.await
+        {
+            _fenced = Some(taking.await);
+        }
+        // Normalized and stamped once the fence is taken: `at` never runs
+        // back behind what the turn delivered meanwhile (C2 §4, critical
+        // fix r2 #2).
         let (vendor_turn, observation) = match retired {
             FakeRetiredItem::Durable(message) => match durable(message.payload) {
                 Some(durable) => durable,
@@ -750,14 +764,6 @@ async fn deliver_retired(
             vendor_turn: VendorTurnId::try_from(vendor_turn).ok(),
             observation,
         };
-        // Test builds: the delivery holds each retired item before its send.
-        #[cfg(feature = "test-failpoints")]
-        let _ = via_routes::failpoint::hit_async("adapter.fake.retirement_item").await;
-        if let Some(fence) = fence.take()
-            && let Ok(taking) = fence.await
-        {
-            _fenced = Some(taking.await);
-        }
         match sink.send(item, event_stall()).await {
             Ok(()) => {}
             Err(Undelivered::Stalled) => {
@@ -1515,6 +1521,80 @@ mod tests {
                     first_cause: DriverFailure::Route(cause)
                 }
             );
+        });
+    }
+
+    /// Critical fix r2 #1 (C2 §4 generation barrier): the fence's place in
+    /// the barrier's queue is taken when it is handed over, even with the
+    /// task's cooperative budget spent; once the barrier's holder releases
+    /// it, nothing else takes it before the retirement.
+    #[test]
+    fn a_spent_budget_keeps_the_fences_place() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let barrier = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+            let holder = std::sync::Arc::clone(&barrier).lock_owned().await;
+            let (fence, fence_rx) = tokio::sync::oneshot::channel();
+            // Spends the task's budget on ready receives, without yielding.
+            let (items, mut received) = tokio::sync::mpsc::channel(1);
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            while tokio::task::coop::has_budget_remaining() {
+                items.try_send(()).unwrap();
+                let receive = std::pin::pin!(received.recv());
+                let _ = std::future::Future::poll(receive, &mut cx);
+            }
+            super::hand_fence(&barrier, fence);
+            drop(holder);
+            assert!(barrier.try_lock().is_err(), "the fence was overtaken");
+            let taking = fence_rx.await.unwrap();
+            drop(taking.await);
+            assert!(barrier.try_lock().is_ok());
+        });
+    }
+
+    /// Critical fix r2 #2 (C2 §4: `at` never decreases): a retired item is
+    /// stamped once its fence is taken, never earlier, so it follows what
+    /// the turn delivered meanwhile.
+    #[test]
+    fn a_retired_item_is_stamped_after_its_fence() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let budget = ObservationBudget::new();
+            let (sink, mut receiver) = observation_channel_in(&budget);
+            let (health, _health) = watch::channel(DriverHealth::Open);
+            let (items, items_rx) = tokio::sync::mpsc::channel(1);
+            items
+                .try_send(FakeRetiredItem::Durable(RouteMessage {
+                    payload: FakeMessage::Denial {
+                        vendor_turn_id: "fake-turn-1".to_owned(),
+                        kind: FakeDenialKind::Command,
+                        target: "t".to_owned(),
+                        reason: "r".to_owned(),
+                    },
+                    steer: None,
+                }))
+                .unwrap();
+            drop(items);
+            let (fence, fence_rx) = tokio::sync::oneshot::channel::<super::Fence>();
+            let barrier = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+            let guard = std::sync::Arc::clone(&barrier).lock_owned().await;
+            let delivery = deliver_retired((items_rx, fence_rx), &sink, &health);
+            let turn = async {
+                // The delivery waits on its fence meanwhile.
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let delivered = tokio::time::Instant::now();
+                let _sent = fence.send(Box::pin(std::future::ready(guard)));
+                delivered
+            };
+            let ((), delivered) = tokio::join!(delivery, turn);
+            let retired = receiver.recv().await.unwrap();
+            assert!(retired.item.at >= delivered, "stamped before its fence");
         });
     }
 
