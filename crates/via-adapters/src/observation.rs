@@ -4,7 +4,7 @@
 
 use std::borrow::Cow;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::value::RawValue;
@@ -35,9 +35,7 @@ pub struct ProgressMarks {
 /// One observation, stamped when the driver decoded it (C2 §4).
 #[derive(Debug)]
 pub struct ObservationItem {
-    /// When the driver decoded it; Core records wall time and times the
-    /// turn's progress by it (runtime §8). The channel never changes it:
-    /// [`Admitted::at`] carries the channel's order.
+    /// When the driver decoded it; Core records wall time.
     pub at: Instant,
     /// The vendor turn it belongs to, which Core maps to a turn number.
     pub vendor_turn: Option<VendorTurnId>,
@@ -456,10 +454,6 @@ impl AdapterError {
 /// One observation in the session channel with its share of the session's
 /// 4 MiB budget: Core holds `permit` until it has handled the item.
 pub struct Admitted {
-    /// The item's `at`, raised at admission to the previous admitted
-    /// item's when another producer's later stamp was admitted first: it
-    /// never decreases in the channel's order (C2 §4).
-    pub at: Instant,
     /// The observation.
     pub item: ObservationItem,
     /// The item's bytes of the budget.
@@ -472,9 +466,6 @@ pub struct Admitted {
 pub struct ObservationSink {
     sender: mpsc::Sender<Admitted>,
     budget: Arc<Semaphore>,
-    /// The last admitted [`Admitted::at`], held across stamping and
-    /// enqueueing so the channel's order is the stamps' order (C2 §4).
-    last_at: Arc<Mutex<Option<Instant>>>,
 }
 
 /// One session's observation channel (C2 §2 `SessionCx`).
@@ -530,12 +521,7 @@ pub fn observation_channel_in(
     // `overflow` (C2 §7 item 12).
     let (sender, receiver) = mpsc::channel(OBSERVATION_ITEMS);
     let budget = Arc::clone(&budget.0);
-    let sink = ObservationSink {
-        sender,
-        budget,
-        last_at: Arc::new(Mutex::new(None)),
-    };
-    (sink, receiver)
+    (ObservationSink { sender, budget }, receiver)
 }
 
 /// An item the channel did not take.
@@ -555,8 +541,7 @@ impl ObservationSink {
         self.send(item, stall).await.is_ok()
     }
 
-    /// Sends `item`: acquires its byte cost, then a slot, then enters the
-    /// channel no earlier than the item before it. The item owns one
+    /// Sends `item`: acquires its byte cost, then a slot. The item owns one
     /// stall deadline, set at its first block; at it the send gives up.
     /// Test builds: `adapter.observation.admitted` acknowledges each item
     /// the channel took, `adapter.observation.stalled` a send that gave
@@ -598,37 +583,20 @@ impl ObservationSink {
             }
             Err(TryAcquireError::Closed) => return Err(Undelivered::Closed),
         };
-        let slot = match self.sender.try_reserve() {
-            Ok(slot) => slot,
-            Err(mpsc::error::TrySendError::Full(())) => {
+        let admitted = Admitted { item, permit };
+        match self.sender.try_send(admitted) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(admitted)) => {
                 #[cfg(feature = "test-failpoints")]
                 blocked().await;
                 let at = *stall_at.get_or_insert_with(|| Instant::now() + stall);
-                timeout_at(at, self.sender.reserve())
+                timeout_at(at, self.sender.send(admitted))
                     .await
                     .map_err(|_| Undelivered::Stalled)?
-                    .map_err(|_| Undelivered::Closed)?
+                    .map_err(|_| Undelivered::Closed)
             }
-            Err(mpsc::error::TrySendError::Closed(())) => return Err(Undelivered::Closed),
-        };
-        self.enqueue(slot, (item, permit));
-        Ok(())
-    }
-
-    /// Puts `item` in its reserved `slot`, admitted `at` no earlier than
-    /// the item before it (C2 §4). Producers stamp before they send, so on
-    /// a full channel an earlier stamp can be admitted after a later one;
-    /// the admission instant is raised under the lock that orders the
-    /// channel's items, and the item keeps its decode time (runtime §8).
-    fn enqueue(
-        &self,
-        slot: mpsc::Permit<'_, Admitted>,
-        (item, permit): (ObservationItem, OwnedSemaphorePermit),
-    ) {
-        let mut last_at = self.last_at.lock().unwrap_or_else(PoisonError::into_inner);
-        let at = last_at.map_or(item.at, |last| last.max(item.at));
-        *last_at = Some(at);
-        slot.send(Admitted { at, item, permit });
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(Undelivered::Closed),
+        }
     }
 }
 
@@ -803,67 +771,18 @@ mod tests {
         });
     }
 
-    /// C2 §4 (`at` never earlier than the previous observation's), bead
-    /// via-mnx: producers stamp an item before they send it, so on a full
-    /// channel a later-stamped sender (a pinned next turn) can reach the
-    /// channel before an earlier-stamped one (the last turn's retirement)
-    /// and be admitted first. The channel still delivers `at` in order.
+    /// Bead via-mnx: distinct clones, each on its own thread, send
+    /// together while a reader drains the channel. Each producer's items
+    /// arrive in its own order with their own `at`, none lost or repeated;
+    /// concurrent producers' items may interleave out of `at` order (C2 §4).
     #[test]
-    fn concurrent_senders_on_a_full_channel_never_run_at_back() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .expect("runtime");
-        let (sink, mut receiver) = observation_channel();
-        runtime.block_on(async {
-            let stall = Duration::from_secs(5);
-            for _ in 0..OBSERVATION_ITEMS {
-                assert!(sink.send(tool("n"), stall).await.is_ok());
-            }
-            let stamped = Instant::now();
-            let mut earlier = tool("earlier");
-            earlier.at = stamped;
-            let mut later = tool("later");
-            later.at = stamped + Duration::from_millis(1);
-            // The later-stamped sender reaches the full channel first.
-            let mut later = std::pin::pin!(sink.send(later, stall));
-            let mut earlier = std::pin::pin!(sink.send(earlier, stall));
-            for send in [&mut later, &mut earlier] {
-                tokio::select! {
-                    biased;
-                    _ = send => panic!("admitted into a full channel"),
-                    () = std::future::ready(()) => {}
-                }
-            }
-            let mut previous = None;
-            for _ in 0..OBSERVATION_ITEMS {
-                previous = Some(receiver.try_recv().expect("a filler").at);
-            }
-            assert!(later.await.is_ok());
-            assert!(earlier.await.is_ok());
-            for _ in 0..2 {
-                let at = receiver.try_recv().expect("a sender's item").at;
-                assert!(
-                    previous.is_none_or(|previous| at >= previous),
-                    "`at` ran back"
-                );
-                previous = Some(at);
-            }
-        });
-    }
-
-    /// Bead via-mnx r1: distinct clones, each on its own thread, stamp and
-    /// send together while a reader drains the channel. Their admissions
-    /// overlap, so the order holds only when every clone shares one lock
-    /// and each item enters the channel under it.
-    #[test]
-    fn clones_on_threads_are_admitted_in_order() {
+    fn clones_on_threads_keep_each_producers_order() {
         const SENDERS: usize = 4;
         const ITEMS: usize = 20_000;
         let (sink, mut receiver) = observation_channel();
         let start = std::sync::Arc::new(std::sync::Barrier::new(SENDERS));
         let senders: Vec<_> = (0..SENDERS)
-            .map(|_| {
+            .map(|producer| {
                 let (sink, start) = (sink.clone(), std::sync::Arc::clone(&start));
                 std::thread::spawn(move || {
                     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -872,27 +791,33 @@ mod tests {
                         .expect("runtime");
                     start.wait();
                     runtime.block_on(async {
-                        for _ in 0..ITEMS {
-                            assert!(sink.send(tool("n"), Duration::from_secs(10)).await.is_ok());
+                        for sequence in 0..ITEMS {
+                            let item = tool(&format!("{producer}:{sequence}"));
+                            assert!(sink.send(item, Duration::from_secs(10)).await.is_ok());
                         }
                     });
                 })
             })
             .collect();
         drop(sink);
-        let (mut previous, mut admitted) = (None, 0);
-        while let Some(item) = receiver.blocking_recv() {
-            assert!(
-                previous.is_none_or(|previous| item.at >= previous),
-                "`at` ran back"
-            );
-            previous = Some(item.at);
-            admitted += 1;
+        // Per producer: the next sequence number and the last `at`.
+        let mut next = [(0_usize, None); SENDERS];
+        while let Some(admitted) = receiver.blocking_recv() {
+            let Observation::Progress(marks) = &admitted.item.observation else {
+                panic!("not a sent item");
+            };
+            let (producer, sequence) = marks.tools_started[0].1.split_once(':').unwrap();
+            let (producer, sequence): (usize, usize) =
+                (producer.parse().unwrap(), sequence.parse().unwrap());
+            let (expected, last) = &mut next[producer];
+            assert_eq!(sequence, *expected, "lost, repeated or reordered");
+            assert!(last.is_none_or(|last| admitted.item.at >= last));
+            (*expected, *last) = (sequence + 1, Some(admitted.item.at));
         }
         for sender in senders {
             sender.join().expect("a sender");
         }
-        assert_eq!(admitted, SENDERS * ITEMS);
+        assert!(next.iter().all(|(sent, _)| *sent == ITEMS));
     }
 
     fn cost(observation: Observation) -> usize {

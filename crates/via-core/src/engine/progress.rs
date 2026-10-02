@@ -180,8 +180,10 @@ impl StepTracker {
         let mut delta = ProgressDelta::default();
         let mut row = None;
         if boundary {
-            // A step boundary: the step ends now and the next starts.
-            let now = self.clock.unix_ms(at);
+            // A step boundary: the step ends now and the next starts. Never
+            // before the step started: concurrent producers' items may
+            // arrive out of `at` order (C2 §4).
+            let now = self.clock.unix_ms(at).max(self.started_ms);
             let step = self.step_tokens();
             row = Some(StepRow {
                 step: self.current,
@@ -583,6 +585,28 @@ mod tests {
         assert_eq!(progress.current_step, 3);
         assert_eq!(progress.running_tools, ["nb"]);
         assert_eq!(tracker.terminal_rows().last().unwrap().step, 3);
+    }
+
+    /// Bead via-mnx (C2 §4): concurrent producers' items may arrive out of
+    /// `at` order, so a boundary decoded before the open step started
+    /// ends that step no earlier than its start.
+    #[tokio::test]
+    async fn a_boundary_decoded_before_its_step_started_never_ends_it_early() {
+        let (mut tracker, _progress) = fresh();
+        let (early, late) = (
+            tokio::time::Instant::now(),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+        );
+        let output = marks(true, &[], &[]);
+        let results = marks(false, &[], &["a"]);
+        tracker.fold(&output, early).unwrap();
+        tracker.fold(&results, early).unwrap();
+        // Step 2 starts at `late`; an item decoded at `early` ends it.
+        assert!(tracker.fold(&output, late).unwrap().row.is_some());
+        tracker.fold(&results, late).unwrap();
+        let row = tracker.fold(&output, early).unwrap().row.unwrap();
+        assert_eq!(row.step, 2);
+        assert!(row.ended_ms >= row.started_ms, "{row:?}");
     }
 
     /// Rule 3: a new id beyond 64 sets `tools_overflow`; a boundary clears

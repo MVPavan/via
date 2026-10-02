@@ -1693,7 +1693,7 @@ impl Engine {
     ) where
         E: std::future::Future<Output = TurnEnd> + Unpin,
     {
-        let Admitted { item, permit, .. } = admitted;
+        let Admitted { item, permit } = admitted;
         note_progress(lane, control, &item);
         while_polling(run, || inbox.len(), async {
             // Test builds: Core holds before handling an observation.
@@ -1815,7 +1815,7 @@ impl Engine {
         lane: Option<&Lane>,
         effective: &Effective,
         control: &mut Control<'_>,
-        Admitted { item, permit, .. }: Admitted,
+        Admitted { item, permit }: Admitted,
     ) {
         self.observe(record, lane, effective, control, item).await;
         drop(permit);
@@ -1889,7 +1889,6 @@ impl Engine {
         let queued: Vec<Admitted> = queued
             .into_iter()
             .map(|item| Admitted {
-                at: item.at,
                 item,
                 permit: Arc::clone(&budget)
                     .try_acquire_owned()

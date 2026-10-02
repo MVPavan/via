@@ -902,7 +902,7 @@ impl Lane {
         // Test builds: the lane holds an item it has taken, unhandled.
         #[cfg(feature = "test-failpoints")]
         let _ = via_store::failpoint::hit_async("core.lane.dispose").await;
-        let Admitted { item, permit, .. } = admitted;
+        let Admitted { item, permit } = admitted;
         let at = rfc3339(SystemTime::now());
         match &item.observation {
             // A stale generation's confirmation counts nothing (C2 §2).
