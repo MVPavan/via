@@ -861,6 +861,9 @@ pub(crate) const STEER_ID: u64 = 3;
 pub struct RouteMessage {
     /// Typed fake payload.
     pub payload: FakeMessage,
+    /// For a `SteerDelivered`, the token of the steer request it reports,
+    /// which Route paired it with; never decoded (critical r1 #5).
+    pub steer: Option<u64>,
 }
 
 #[cfg(test)]

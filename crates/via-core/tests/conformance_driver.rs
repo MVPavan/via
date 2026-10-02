@@ -26,8 +26,8 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::sync::{mpsc, watch};
 use via_adapters::observation::{
-    AdapterError, Admitted, Observation, ObservationItem, SteerDelivery, StopReason, TurnEnd,
-    observation_channel,
+    AdapterError, Admitted, Observation, ObservationItem, SteerDelivery, SteerReceipt, StopReason,
+    TurnEnd, observation_channel,
 };
 use via_adapters::{
     AdapterConfig, AdapterSet, AnchorRecovery, BootstrapEnv, CancellationToken, Cleanup, CloseMode,
@@ -557,7 +557,7 @@ fn failure(end: &TurnEnd) -> &RouteFailure {
 }
 
 /// A steer call in flight beside its turn.
-type Steer<'a> = Pin<Box<dyn Future<Output = Result<SteerDelivery, SteerError>> + 'a>>;
+type Steer<'a> = Pin<Box<dyn Future<Output = Result<SteerReceipt, SteerError>> + 'a>>;
 
 fn observations(items: &[ObservationItem]) -> Vec<&Observation> {
     items.iter().map(|item| &item.observation).collect()
@@ -769,6 +769,17 @@ fn conformance_steer_native_delivered_unsupported_refused() {
                     items.push(admitted.item);
                 }
                 result = async { steer.as_mut().unwrap().await }, if steer.is_some() => {
+                    // C2 §2 `SteerReceipt` (critical r1 #5): the observation
+                    // carrying the receipt's token was emitted first.
+                    while let Ok(admitted) = receiver.try_recv() {
+                        items.push(admitted.item);
+                    }
+                    if let Ok(receipt) = &result {
+                        assert!(items.iter().any(|item| matches!(
+                            &item.observation,
+                            Observation::SteerDelivered { token, .. } if *token == receipt.token
+                        )));
+                    }
                     answer = Some(result);
                     steer = None;
                 }
@@ -780,12 +791,13 @@ fn conformance_steer_native_delivered_unsupported_refused() {
         }
         (answer, checked(end), items)
     });
+    let answer = answer.map(|answer| answer.map(|receipt| receipt.delivery));
     assert_eq!(answer, Some(Ok(SteerDelivery::Injected)), "{end:?}");
     assert!(end.outcome.is_ok(), "{end:?}");
     assert!(
         observations(&items)
             .iter()
-            .any(|observation| matches!(observation, Observation::SteerDelivered(_)))
+            .any(|observation| matches!(observation, Observation::SteerDelivered { .. }))
     );
 
     let rig = Rig::new(&json!({}), &[]);
@@ -2060,7 +2072,7 @@ fn session_cancellation_stops_owned_work() {
 fn steer_once(
     profile: &Value,
     input: impl FnOnce() -> SteerInput,
-) -> (Result<SteerDelivery, SteerError>, Vec<ObservationItem>) {
+) -> (Result<SteerReceipt, SteerError>, Vec<ObservationItem>) {
     let rig = Rig::new(
         profile,
         &[script(
@@ -2153,16 +2165,17 @@ fn a_partial_steer_profile_reports_its_semantics() {
     );
     assert!(end.outcome.is_ok(), "{end:?}");
     let partial = SteerDelivery::Partial("after_tool".into());
-    assert_eq!(answer, Ok(partial.clone()));
-    assert!(
-        observations(&items)
-            .iter()
-            .any(|observation| matches!(observation, Observation::SteerDelivered(delivery) if *delivery == partial))
-    );
+    let receipt = answer.unwrap();
+    assert_eq!(receipt.delivery, partial);
+    assert!(observations(&items).iter().any(|observation| matches!(
+        observation,
+        Observation::SteerDelivered { delivery, token }
+            if *delivery == partial && *token == receipt.token
+    )));
 }
 
 /// Polls `steer` once: its answer if it has one at once.
-async fn poll_once(steer: &mut Steer<'_>) -> Option<Result<SteerDelivery, SteerError>> {
+async fn poll_once(steer: &mut Steer<'_>) -> Option<Result<SteerReceipt, SteerError>> {
     tokio::select! {
         biased;
         answer = steer.as_mut() => Some(answer),
@@ -2928,7 +2941,7 @@ fn a_steer_for_an_ended_turn_never_reaches_its_successor() {
     assert!(
         !observations(&items)
             .iter()
-            .any(|observation| matches!(observation, Observation::SteerDelivered(_))),
+            .any(|observation| matches!(observation, Observation::SteerDelivered { .. })),
         "the successor took no steer"
     );
 }

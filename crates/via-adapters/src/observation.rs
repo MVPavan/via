@@ -58,8 +58,14 @@ pub enum Observation {
     ActionDenied(Denial),
     /// `vendor.request_declined`.
     RequestDeclined(Decline),
-    /// `steer.delivered`.
-    SteerDelivered(SteerDelivery),
+    /// `steer.delivered`, carrying the token of the steer it answers
+    /// (C2 §2 `SteerReceipt`).
+    SteerDelivered {
+        /// How the input reached the vendor.
+        delivery: SteerDelivery,
+        /// The token `steer` returned for the same input.
+        token: SteerToken,
+    },
     /// `warning`.
     Warning(Warning),
     /// `session.vendor_closed`, with its reason.
@@ -73,6 +79,18 @@ pub enum Observation {
     },
     /// `turn.late_terminal`: only for a turn whose end carried no terminal.
     LateTerminal(VendorTerminal),
+}
+
+impl Observation {
+    /// The token a `steer.delivered` carries; `None` for any other.
+    #[must_use]
+    pub fn steer_token(&self) -> Option<SteerToken> {
+        if let Self::SteerDelivered { token, .. } = self {
+            Some(*token)
+        } else {
+            None
+        }
+    }
 }
 
 /// Acceptance of one submission, on vendor evidence.
@@ -134,6 +152,38 @@ pub struct Decline {
     pub summary: String,
     /// Whether the vendor was blocked on it.
     pub blocking: bool,
+}
+
+/// A steer's correlation (C2 §2 `SteerReceipt`): `steer` returns it, and
+/// the `steer.delivered` observation the driver emitted for the same
+/// input carries it. Opaque; unique within its driver.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct SteerToken(u64);
+
+impl SteerToken {
+    /// The token numbered `value`, as a driver mints it.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Its number.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// `steer`'s answer once the vendor took the input (C2 §2): the driver
+/// emitted the `steer.delivered` observation carrying `token` before it
+/// returned this, so Core answers its caller after committing that
+/// observation (C1 §3.4).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SteerReceipt {
+    /// How the input reached the vendor.
+    pub delivery: SteerDelivery,
+    /// The token the observation carries.
+    pub token: SteerToken,
 }
 
 /// How steer input reached the vendor.
@@ -581,7 +631,7 @@ fn item_cost(item: &ObservationItem) -> usize {
                 lengths.push(version.len());
             }
         }
-        Observation::SteerDelivered(delivery) => match delivery {
+        Observation::SteerDelivered { delivery, .. } => match delivery {
             SteerDelivery::Injected => {}
             SteerDelivery::Partial(semantics) => lengths.push(semantics.len()),
         },

@@ -71,6 +71,9 @@ pub struct SteerRequest {
     pub text: String,
     /// The vendor turn the caller means, if it names one.
     pub expected_vendor_turn: Option<String>,
+    /// The caller's token for the request, which Route pairs with the
+    /// vendor's delivery report on the hop ([`RouteMessage::steer`]).
+    pub token: u64,
     /// The delivery answer.
     pub reply: oneshot::Sender<Result<(), SteerRefused>>,
     /// The request's share of the control budget, returned when it is
@@ -125,11 +128,13 @@ pub fn steer_lane() -> (SteerSender, mpsc::Receiver<SteerRequest>) {
 }
 
 impl SteerSender {
-    /// Admits one steer input, or refuses it at once.
+    /// Admits one steer input with its caller's `token`, or refuses it
+    /// at once.
     pub fn send(
         &self,
         text: String,
         expected_vendor_turn: Option<String>,
+        token: u64,
     ) -> Result<oneshot::Receiver<Result<(), SteerRefused>>, SteerRefused> {
         let command = Arc::clone(&self.commands)
             .try_acquire_owned()
@@ -148,6 +153,7 @@ impl SteerSender {
         let request = SteerRequest {
             text,
             expected_vendor_turn,
+            token,
             reply,
             permit,
         };
@@ -287,6 +293,9 @@ pub(super) struct LaneState {
     /// The steer awaiting its write and the vendor's delivery report, with
     /// its share of the control budget.
     pub(super) steer_reply: Option<(oneshot::Sender<Result<(), SteerRefused>>, ControlPermit)>,
+    /// The token of the steer written last, which the vendor's delivery
+    /// report is paired with on the hop (critical r1 #5).
+    pub(super) steer_token: Option<u64>,
     /// The vendor reported the steer's delivery before its write answered.
     steer_evidence: bool,
     pub(super) accepted: bool,
@@ -314,6 +323,7 @@ impl LaneState {
             steer: lane.steer,
             steer_write: None,
             steer_reply: None,
+            steer_token: None,
             steer_evidence: false,
             accepted: false,
             facts: Facts {
@@ -556,6 +566,7 @@ impl Serving<'_> {
         let SteerRequest {
             text,
             expected_vendor_turn,
+            token,
             reply,
             permit,
         } = request;
@@ -586,6 +597,7 @@ impl Serving<'_> {
         };
         self.lane.steer_write = Some(self.sender.write(steer, self.deadline));
         self.lane.steer_reply = Some((reply, permit));
+        self.lane.steer_token = Some(token);
     }
 
     /// A finished steer write: one not written whole is answered at once,

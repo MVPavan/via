@@ -17,14 +17,14 @@ use tokio_util::sync::CancellationToken;
 
 use super::{FakeAdapter, FakeProfile};
 use crate::driver::{
-    Active, Delivering, DriverState, ForceWatch, Prepared, Reservation, SessionDriver, TurnCx,
-    TurnSpec, latch, lock, rejected,
+    Active, Delivering, DriverState, ForceWatch, Prepared, Reservation, SessionDriver,
+    SteerEmissions, TurnCx, TurnSpec, emissions, latch, lock, rejected,
 };
 use crate::harness::Harness;
 use crate::observation::{
     Acceptance, AdapterError, ClassHint, CostReport, Decline, Denial, DenialKind, Identity,
     InstanceReport, Observation, ObservationItem, ObservationSink, ProgressMarks, SteerDelivery,
-    StopReason, TurnEnd, TurnEvidence, Undelivered, UsageSample, VendorTerminal,
+    SteerToken, StopReason, TurnEnd, TurnEvidence, Undelivered, UsageSample, VendorTerminal,
 };
 use crate::plan::{Refusal, RefusalKind, TurnParams, VersionStatus};
 use crate::runtime::{cleanup, event_stall};
@@ -129,9 +129,11 @@ pub(crate) async fn run_turn(
     let (steer, steer_lane) = via_routes::steer_lane();
     let (close, close_rx) = watch::channel(None);
     let (done, retiring) = watch::channel(false);
+    let active = Active::new(turn, steer, close);
+    let steers = Arc::clone(&active.emissions);
     let identity = {
         let mut state = driver.state();
-        state.active = Some(Active { turn, steer, close });
+        state.active = Some(active);
         state.retiring = Some(retiring);
         state.identity.clone()
     };
@@ -162,7 +164,7 @@ pub(crate) async fn run_turn(
         reports: (Arc::clone(&driver.health), Arc::clone(&driver.journal)),
         done,
     }));
-    let mut normalizer = Normalizer::new(generation, Arc::clone(&driver.state), profile);
+    let mut normalizer = Normalizer::new(generation, Arc::clone(&driver.state), profile, steers);
     let cutoff = Deadline::at(wall.instant() + CLEANUP_ALLOWANCE);
     let mut abandonment = Abandonment(Some(&driver.health));
     let (result, rest) = deliver_beside(
@@ -784,6 +786,7 @@ async fn deliver_beside(
             biased;
             outcome = poll_delivery(delivery.as_mut()), if delivery.is_some() => {
                 delivery = None;
+                normalizer.emitted(outcome.is_ok());
                 if outcome.is_err() {
                     // Latched at once (C2 §2); Route observes the closed hop
                     // as overflow, or as the force's stop under a force.
@@ -810,17 +813,21 @@ async fn deliver_beside(
         return (result, Rest::Undelivered);
     }
     let rest = async {
-        if let Some(delivery) = delivery
-            && delivery.await.is_err()
-        {
-            return Rest::Undelivered;
+        if let Some(delivery) = delivery {
+            let outcome = delivery.await;
+            normalizer.emitted(outcome.is_ok());
+            if outcome.is_err() {
+                return Rest::Undelivered;
+            }
         }
         if let Some(receiver) = hop_rx.as_mut() {
             while let Ok(message) = receiver.try_recv() {
                 let at = tokio::time::Instant::now();
                 activity.record(at);
                 let items = normalizer.items(message, at);
-                if send_all(items, sink.clone(), stall).await.is_err() {
+                let outcome = send_all(items, sink.clone(), stall).await;
+                normalizer.emitted(outcome.is_ok());
+                if outcome.is_err() {
                     return Rest::Undelivered;
                 }
             }
@@ -1030,11 +1037,20 @@ struct Normalizer {
     /// The instance's handshake, once Route forwarded it (AD7): its
     /// acceptance carries it (C2 §4 `turn.accepted`).
     instance: Option<InstanceReport>,
+    /// The turn's steer callers awaiting their observation's emission.
+    steers: SteerEmissions,
+    /// The tokens of the `steer.delivered` items being delivered.
+    emitting: Vec<u64>,
 }
 
 impl Normalizer {
     /// The normalizer of one turn on connection `generation`.
-    fn new(generation: u64, state: Arc<Mutex<DriverState>>, profile: &FakeProfile) -> Self {
+    fn new(
+        generation: u64,
+        state: Arc<Mutex<DriverState>>,
+        profile: &FakeProfile,
+        steers: SteerEmissions,
+    ) -> Self {
         Self {
             generation,
             state,
@@ -1042,6 +1058,20 @@ impl Normalizer {
             vendor_closed: false,
             checked: checked(profile),
             instance: None,
+            steers,
+            emitting: Vec::new(),
+        }
+    }
+
+    /// The delivery of the last message's items ended, `delivered` or
+    /// not: each steer whose `steer.delivered` it carried learns whether
+    /// that observation is on the session channel (C2 §2 `SteerReceipt`).
+    fn emitted(&mut self, delivered: bool) {
+        for token in self.emitting.drain(..) {
+            if let Some(waiting) = emissions(&self.steers).remove(&token) {
+                // The steer caller went away: nobody waits for the answer.
+                let _ = waiting.send(delivered);
+            }
         }
     }
 
@@ -1059,6 +1089,18 @@ impl Normalizer {
         };
         // The terminal itself is retained in the turn's end (AD4); its
         // final text goes as pieces.
+        // A steer's delivery report carries the token Route paired it with.
+        if let FakeMessage::SteerDelivered { vendor_turn_id } = &message.payload {
+            let Some(token) = message.steer else {
+                return Vec::new();
+            };
+            self.emitting.push(token);
+            let observation = Observation::SteerDelivered {
+                delivery: self.steer.clone(),
+                token: SteerToken::new(token),
+            };
+            return vec![item(Some(vendor_turn_id.clone()), observation)];
+        }
         if let FakeMessage::Terminal {
             vendor_turn_id,
             final_text,
@@ -1163,10 +1205,6 @@ impl Normalizer {
                     blocking,
                 }),
             )),
-            FakeMessage::SteerDelivered { vendor_turn_id } => Some((
-                Some(vendor_turn_id),
-                Observation::SteerDelivered(self.steer.clone()),
-            )),
             FakeMessage::VendorClosed { reason } => {
                 self.vendor_closed = true;
                 Some((None, Observation::VendorClosed(reason)))
@@ -1175,7 +1213,9 @@ impl Normalizer {
                 self.instance = Some(instance_report(&self.checked, handshake));
                 None
             }
-            FakeMessage::Terminal { .. }
+            // A steer's delivery report is taken with its token by `items`.
+            FakeMessage::SteerDelivered { .. }
+            | FakeMessage::Terminal { .. }
             | FakeMessage::InterruptAck { .. }
             | FakeMessage::Unknown { .. } => None,
         }

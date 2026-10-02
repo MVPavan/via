@@ -3,17 +3,20 @@
 //! with `steer`, `close` and `health` serviceable meanwhile.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use serde_json::value::RawValue;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::fake::FakeAdapter;
-use crate::observation::{AdapterError, ObservationSink, SteerDelivery, TurnEnd, TurnEvidence};
+use crate::observation::{
+    AdapterError, ObservationSink, SteerDelivery, SteerReceipt, SteerToken, TurnEnd, TurnEvidence,
+};
 use crate::plan::{Bound, Inherit, VendorOptions};
 use crate::{
     CapacityToken, Cleanup, Deadline, DriverFailure, DriverHealth, SessionId, StopCause, StopOrder,
@@ -208,6 +211,8 @@ pub(crate) struct DriverState {
     /// The generation a turn holds and may still deliver on
     /// ([`Delivering`]).
     pub(crate) delivering: Option<u64>,
+    /// The last [`SteerToken`] minted (critical r1 #5).
+    pub(crate) steer_tokens: u64,
     /// Test builds: the daemon adapter's nth-retirement fault (Sol r3 N10).
     #[cfg(feature = "test-failpoints")]
     pub(crate) retirement_fault: Option<Arc<crate::fake::RetirementFault>>,
@@ -226,14 +231,46 @@ impl Drop for Delivering {
     }
 }
 
+/// The steer callers waiting for their `steer.delivered` observation to be
+/// emitted, by token (C2 §2 `SteerReceipt`, critical r1 #5): the turn's
+/// normalizer answers `true` once the observation is on the session
+/// channel, `false` when it could not put it there; a sender dropped with
+/// the turn answers nothing either.
+pub(crate) type SteerEmissions = Arc<Mutex<HashMap<u64, oneshot::Sender<bool>>>>;
+
+/// Locks a turn's [`SteerEmissions`]; never held across an await.
+pub(crate) fn emissions(
+    emissions: &Mutex<HashMap<u64, oneshot::Sender<bool>>>,
+) -> MutexGuard<'_, HashMap<u64, oneshot::Sender<bool>>> {
+    emissions.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// The running turn's driver-side lanes.
 pub(crate) struct Active {
     /// The turn.
     pub(crate) turn: TurnNumber,
     /// Its steer lane.
     pub(crate) steer: SteerSender,
+    /// Its steer callers awaiting their observation's emission.
+    pub(crate) emissions: SteerEmissions,
     /// Its driver-side stop order: a session close.
     pub(crate) close: watch::Sender<Option<StopOrder>>,
+}
+
+impl Active {
+    /// The lanes of `turn`, with no steer caller waiting yet.
+    pub(crate) fn new(
+        turn: TurnNumber,
+        steer: SteerSender,
+        close: watch::Sender<Option<StopOrder>>,
+    ) -> Self {
+        Self {
+            turn,
+            steer,
+            close,
+            emissions: SteerEmissions::default(),
+        }
+    }
 }
 
 /// Locks the driver's state. No code panics while holding the lock; a
@@ -468,8 +505,13 @@ impl SessionDriver {
     /// once or refused; delivered once written and reported by the vendor.
     /// Admission checks `input.turn` against the turn the driver runs under
     /// the state lock it enqueues under: another turn is `TurnMismatch`,
-    /// none `NoActiveTurn`, so the input never reaches a successor.
-    pub async fn steer(&self, input: SteerInput) -> Result<SteerDelivery, SteerError> {
+    /// none `NoActiveTurn`, so the input never reaches a successor. The
+    /// receipt's token is the one the `steer.delivered` observation
+    /// carries, which the turn emitted before this returns (C2 §2
+    /// `SteerReceipt`). A delivery the turn could not put on the session
+    /// channel (overflow, or the daemon force cutting the delivery) is
+    /// `NotDelivered`: the vendor took it, but VIA holds no record of it.
+    pub async fn steer(&self, input: SteerInput) -> Result<SteerReceipt, SteerError> {
         let delivery = match self
             .adapter
             .as_ref()
@@ -484,8 +526,8 @@ impl SessionDriver {
         let expected = input
             .expected_vendor_turn
             .map(|turn| turn.as_str().to_owned());
-        let answer = {
-            let state = self.state();
+        let (token, emitted, answer, waiting) = {
+            let mut state = self.state();
             let Some(active) = state.active.as_ref() else {
                 return Err(SteerError::NoActiveTurn);
             };
@@ -500,16 +542,43 @@ impl SessionDriver {
             {
                 return Err(refusal.error());
             }
-            active
-                .steer
-                .send(input.text, expected)
-                .map_err(steer_error)?
+            let waiting = Arc::clone(&active.emissions);
+            state.steer_tokens += 1;
+            let token = state.steer_tokens;
+            let (sender, emitted) = oneshot::channel();
+            emissions(&waiting).insert(token, sender);
+            let sent = state
+                .active
+                .as_ref()
+                .map(|active| active.steer.send(input.text, expected, token));
+            match sent {
+                Some(Ok(answer)) => (token, emitted, answer, waiting),
+                Some(Err(refused)) => {
+                    emissions(&waiting).remove(&token);
+                    return Err(steer_error(refused));
+                }
+                None => {
+                    emissions(&waiting).remove(&token);
+                    return Err(SteerError::NoActiveTurn);
+                }
+            }
+        };
+        let refused = |error| {
+            emissions(&waiting).remove(&token);
+            Err(error)
         };
         match answer.await {
-            Ok(Ok(())) => Ok(delivery),
-            Ok(Err(refused)) => Err(steer_error(refused)),
+            Ok(Ok(())) => {}
+            Ok(Err(refused_by)) => return refused(steer_error(refused_by)),
             // The turn ended first.
-            Err(_) => Err(SteerError::NoActiveTurn),
+            Err(_) => return refused(SteerError::NoActiveTurn),
+        }
+        match emitted.await {
+            Ok(true) => Ok(SteerReceipt {
+                delivery,
+                token: SteerToken::new(token),
+            }),
+            Ok(false) | Err(_) => Err(SteerError::NotDelivered),
         }
     }
 

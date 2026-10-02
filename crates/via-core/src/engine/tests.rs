@@ -3814,7 +3814,10 @@ fn a_steer_before_acceptance_waits_and_is_delivered() {
 
 /// A steer report (C2 §4 `steer.delivered`).
 fn steered() -> via_adapters::Observation {
-    via_adapters::Observation::SteerDelivered(via_adapters::observation::SteerDelivery::Injected)
+    via_adapters::Observation::SteerDelivered {
+        delivery: via_adapters::observation::SteerDelivery::Injected,
+        token: via_adapters::SteerToken::new(1),
+    }
 }
 
 /// The session's `steer.delivered` events as `(turn, late)`.

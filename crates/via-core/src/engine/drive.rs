@@ -1940,18 +1940,18 @@ impl Engine {
         match attribution {
             Attribution::Current => {}
             Attribution::Late(turn) => {
-                self.observe_other(record, (Some(turn.get()), true), item.observation)
+                self.observe_other(record, lane, (Some(turn.get()), true), item.observation)
                     .await;
                 return;
             }
             Attribution::Session => {
-                self.observe_other(record, (None, false), item.observation)
+                self.observe_other(record, lane, (None, false), item.observation)
                     .await;
                 return;
             }
             // C2 §2: an expired vendor turn's traffic is dropped; it is
-            // never another turn's or the session's.
-            Attribution::Expired => return,
+            // never another turn's or the session's (nor a steer's commit).
+            Attribution::Expired => return expired(lane, &item.observation),
         }
         match item.observation {
             Observation::Accepted(acceptance) => {
@@ -2023,9 +2023,9 @@ impl Engine {
             }
             Observation::Warning(warning) => self.own_warning(record, warning).await,
             // C1 §3.4, §6.1: steer input the running turn took.
-            Observation::SteerDelivered(delivery) => {
-                let delivery = steer_delivery(&delivery).to_owned();
-                self.commit_event(record, EventBody::SteerDelivered { delivery })
+            Observation::SteerDelivered { delivery, token } => {
+                let own = (Some(record.turn.get()), false);
+                self.commit_steer(record, lane, own, (&delivery, token))
                     .await;
             }
             // C2 §4: a mismatch commits nothing itself; the turn is
@@ -2223,6 +2223,7 @@ impl Engine {
     async fn observe_other(
         &self,
         record: &mut TurnRecord,
+        lane: Option<&Lane>,
         attributed: (Option<u32>, bool),
         observation: Observation,
     ) {
@@ -2237,14 +2238,9 @@ impl Engine {
                 self.commit_warning(record, attributed, warning).await;
             }
             // Sol r1 #9: a steer report is durable whoever's it is.
-            Observation::SteerDelivered(delivery) => {
-                let body = EventBody::SteerDelivered {
-                    delivery: steer_delivery(&delivery).to_owned(),
-                };
-                let at = rfc3339(SystemTime::now());
-                let failed = record.first_failure.is_some();
-                journal::commit_event_as(&self.store, record, body, &at, attributed).await;
-                self.report_first_failure(record, failed).await;
+            Observation::SteerDelivered { delivery, token } => {
+                self.commit_steer(record, lane, attributed, (&delivery, token))
+                    .await;
             }
             Observation::Accepted(_)
             | Observation::IdentityConfirmed(_)
@@ -2255,6 +2251,31 @@ impl Engine {
             // Discarded until via-jm4.35: a late terminal's revision
             // write is not in the Store yet.
             | Observation::LateTerminal(_) => {}
+        }
+    }
+
+    /// Commits `steer.delivered` attributed to `(turn, late)` under the
+    /// running turn's record, and records on the lane whether it committed,
+    /// which answers the steer that is waiting on its token (C1 §3.4,
+    /// critical r1 #5).
+    async fn commit_steer(
+        &self,
+        record: &mut TurnRecord,
+        lane: Option<&Lane>,
+        attributed: (Option<u32>, bool),
+        (delivery, token): (&via_adapters::SteerDelivery, via_adapters::SteerToken),
+    ) {
+        let body = EventBody::SteerDelivered {
+            delivery: steer_delivery(delivery).to_owned(),
+        };
+        let at = rfc3339(SystemTime::now());
+        let failed = record.first_failure.is_some();
+        let committed = journal::commit_event_as(&self.store, record, body, &at, attributed)
+            .await
+            .is_some();
+        self.report_first_failure(record, failed).await;
+        if let Some(lane) = lane {
+            lane.steer_outcome(token, committed);
         }
     }
 
@@ -2808,6 +2829,14 @@ fn note_progress(lane: &Lane, control: &mut Control<'_>, item: &ObservationItem)
     }
 }
 
+/// An expired vendor turn's dropped observation: a steer report among
+/// them commits nothing, which its waiting steer learns (critical r1 #5).
+fn expired(lane: Option<&Lane>, observation: &Observation) {
+    if let Some(lane) = lane {
+        lane.steer_dropped(observation);
+    }
+}
+
 /// Meaningful progress resets the idle deadline (Task 4 design §2.6):
 /// acceptance, and a `progress` item with a `model` mark or a tool start or
 /// end. Usage-only items never do; unknown messages send no item.
@@ -2821,7 +2850,7 @@ fn progress(observation: &Observation) -> bool {
         | Observation::FinalText(_)
         | Observation::ActionDenied(_)
         | Observation::RequestDeclined(_)
-        | Observation::SteerDelivered(_)
+        | Observation::SteerDelivered { .. }
         | Observation::Warning(_)
         | Observation::VendorClosed(_)
         | Observation::ResumeMismatch { .. }
@@ -2921,7 +2950,7 @@ pub(super) fn held_body(observation: &Observation) -> Option<EventBody> {
             warning.data.clone(),
         )),
         // Sol r1 #9: a steer report is durable whoever's it is.
-        Observation::SteerDelivered(delivery) => Some(EventBody::SteerDelivered {
+        Observation::SteerDelivered { delivery, .. } => Some(EventBody::SteerDelivered {
             delivery: steer_delivery(delivery).to_owned(),
         }),
         Observation::Accepted(_)

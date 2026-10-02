@@ -826,11 +826,16 @@ impl<'a> Serving<'a> {
                     self.phase
                         .advance(&payload, turn, interrupted)
                         .map_err(Failed::from)?;
+                    // The written steer a delivery report answers, taken
+                    // before `note` may resolve it.
+                    let steer = matches!(payload, FakeMessage::SteerDelivered { .. })
+                        .then(|| self.lane.steer_token.take())
+                        .flatten();
                     if !self.note(&payload)? {
                         // Recorded, not handed over (C2 §2 Reopen).
                         continue;
                     }
-                    Ok(Next::Message(RouteMessage { payload }))
+                    Ok(Next::Message(RouteMessage { payload, steer }))
                 }
                 Err(cause) => {
                     let what = format!(

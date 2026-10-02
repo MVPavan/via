@@ -683,7 +683,11 @@ impl Engine {
     /// than `expect_turn` is `turn_mismatch`, and one still submitting is
     /// waited for until its acceptance, `no_active_turn` if it ends first.
     /// The input goes through the session's driver (C2 §2), which answers
-    /// once the vendor took it; the turn commits `steer.delivered`.
+    /// once the vendor took it, with the token of the `steer.delivered`
+    /// observation it emitted first. The steer is answered only once that
+    /// observation committed (C1 §3.4, critical r1 #5): a failed commit, or
+    /// one the lane consumed or ended without, is `store_error`, never
+    /// success.
     pub async fn steer(&self, params: SteerParams) -> Result<Value, ApiError> {
         let (_, snapshot) = self
             .authenticate_existing(&params.session, params.handle.as_deref())
@@ -742,7 +746,7 @@ impl Engine {
             text: params.text,
             expected_vendor_turn: vendor_turn.and_then(|id| VendorTurnId::try_from(id).ok()),
         };
-        let delivery = lane
+        let receipt = lane
             .driver
             .steer(input)
             .await
@@ -755,9 +759,12 @@ impl Engine {
                 SteerError::NotSteerable => ApiError::steer_failed("not_steerable", "none"),
                 SteerError::NotDelivered => ApiError::steer_failed("not_delivered", "uncertain"),
             })?;
+        if !lane.steer_committed(receipt.token).await {
+            return Err(ApiError::STORE);
+        }
         Ok(json!({
             "turn": format!("{}/{}", params.session.as_str(), turn.get()),
-            "delivery": steer_delivery(&delivery),
+            "delivery": steer_delivery(&receipt.delivery),
         }))
     }
 }

@@ -38,8 +38,8 @@ use serde_json::{Map, Value};
 use tokio::sync::{OwnedSemaphorePermit, mpsc, watch};
 use via_adapters::{
     Admitted, CancellationToken, CloseMode, CloseReport, DriverFailure, DriverHealth, Inherit,
-    OBSERVATION_BYTES, Observation, ObservationBudget, SessionCx, SessionDriver, SessionRef,
-    SessionSpec, UsageSample, VendorTerminal, observation_channel_in,
+    OBSERVATION_BYTES, OBSERVATION_ITEMS, Observation, ObservationBudget, SessionCx, SessionDriver,
+    SessionRef, SessionSpec, SteerToken, UsageSample, VendorTerminal, observation_channel_in,
 };
 use via_store::{SessionIdentity, SessionRoute};
 
@@ -288,6 +288,19 @@ pub(super) struct Lane {
     /// close asked for that driver close or took it over before it started:
     /// that close takes it ([`Engine::close_lane`]).
     report: StdMutex<Option<CloseReport>>,
+    /// How each `steer.delivered` the lane consumed fared (critical r1 #5).
+    steers: SteerOutcomes,
+}
+
+/// Critical r1 #5 (C1 §3.4, C2 §2 `SteerReceipt`): whether each
+/// `steer.delivered` observation the lane consumed committed, by its
+/// token, until the steer waiting on it takes it. At most
+/// [`OBSERVATION_ITEMS`] are kept, as many as the channel holds: the
+/// oldest, one whose steer caller went away, is dropped first.
+#[derive(Default)]
+struct SteerOutcomes {
+    outcomes: StdMutex<VecDeque<(SteerToken, bool)>>,
+    recorded: tokio::sync::Notify,
 }
 
 /// What the lane learned from the session's observations.
@@ -564,6 +577,7 @@ impl Lane {
             used: AtomicU64::new(use_tick()),
             engine,
             report: StdMutex::new(None),
+            steers: SteerOutcomes::default(),
         }
     }
 
@@ -719,6 +733,55 @@ impl Lane {
         self.life() == Life::Ended
     }
 
+    /// Records that `observation`, consumed without a commit, was a
+    /// `steer.delivered` that did not commit, if it was one.
+    pub(super) fn steer_dropped(&self, observation: &Observation) {
+        if let Some(token) = observation.steer_token() {
+            self.steer_outcome(token, false);
+        }
+    }
+
+    /// Records whether the `steer.delivered` observation of `token`
+    /// committed, once consumed on any of its paths (critical r1 #5).
+    pub(super) fn steer_outcome(&self, token: SteerToken, committed: bool) {
+        {
+            let mut outcomes = lock(&self.steers.outcomes);
+            if outcomes.len() == OBSERVATION_ITEMS {
+                outcomes.pop_front();
+            }
+            outcomes.push_back((token, committed));
+        }
+        self.steers.recorded.notify_waiters();
+    }
+
+    /// Whether the `steer.delivered` observation of `token`, which its
+    /// driver emitted on this lane's channel before answering the steer,
+    /// committed (C1 §3.4, C2 §2 `SteerReceipt`). The wait ends with the
+    /// observation's commit, or its consumption without one; the lane's
+    /// end, its channel drained, without either is no commit.
+    pub(super) async fn steer_committed(&self, token: SteerToken) -> bool {
+        loop {
+            let recorded = self.steers.recorded.notified();
+            tokio::pin!(recorded);
+            recorded.as_mut().enable();
+            {
+                let mut outcomes = lock(&self.steers.outcomes);
+                if let Some(index) = outcomes.iter().position(|(known, _)| *known == token) {
+                    return outcomes
+                        .remove(index)
+                        .is_some_and(|(_, committed)| committed);
+                }
+            }
+            if self.ended() {
+                return false;
+            }
+            tokio::select! {
+                () = &mut recorded => {}
+                () = self.retired() => {}
+            }
+        }
+    }
+
     /// Retires the lane once no turn holds it, and waits for its end.
     async fn retire_now(&self) {
         let mut changes = self.changed.subscribe();
@@ -798,7 +861,8 @@ impl Lane {
             Observation::ActionDenied(_)
             | Observation::RequestDeclined(_)
             | Observation::Warning(_)
-            | Observation::SteerDelivered(_) => {
+            | Observation::SteerDelivered { .. } => {
+                let steer = item.observation.steer_token();
                 let vendor_turn = item
                     .vendor_turn
                     .as_ref()
@@ -806,10 +870,13 @@ impl Lane {
                 let attributed = match self.attribute(vendor_turn, None) {
                     Attribution::Late(turn) => (Some(turn.get()), true),
                     Attribution::Current | Attribution::Session => (None, false),
-                    Attribution::Expired => return,
+                    Attribution::Expired => return self.steer_dropped(&item.observation),
                 };
                 if let Some(body) = super::drive::held_body(&item.observation) {
-                    self.writer.commit((body, &at, attributed), None).await;
+                    let written = self.writer.commit((body, &at, attributed), None).await;
+                    if let Some(token) = steer {
+                        self.steer_outcome(token, matches!(written, SessionWrite::Committed));
+                    }
                 }
             }
             Observation::IdentityConfirmed(_)

@@ -2291,6 +2291,81 @@ fn core_validation_survives_a_terminal_write_failure() {
     });
 }
 
+/// Critical r1 #5 (C1 §3.4, C2 §2 `SteerReceipt`): a steer is answered
+/// only after its `steer.delivered` event committed. The vendor reports
+/// the delivery, and the event's write fails (`store.commit.event`'s
+/// second hit, after the acceptance's): the steer is `store_error`, never
+/// a success, and no `steer.delivered` event exists.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_steer_delivery_commit_failure_is_store_error() {
+    let mut profile = schema_profile();
+    profile["capabilities"]["verbs"]["steer"] = json!({"support":"native"});
+    let steps = [
+        accepted(1),
+        json!({"action":"expect_request","expected":{"type":"steer","id":3}}),
+        emit(&json!({"type":"steer_delivered","id":3,"vendor_turn_id":vendor_turn(1)})),
+        gate("delivered"),
+        terminal(1, "completed", "end_turn"),
+    ];
+    let Some(root) = child(
+        "core_steer_delivery_commit_failure_is_store_error",
+        &scenario(&profile, &[script("p", &steps)]),
+        &[],
+    ) else {
+        return;
+    };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    arm_at(&root, "store.commit.event", 2, "fail_io");
+    run(async {
+        let daemon = Daemon::open(&root);
+        let session = daemon.spawn("p", &json!({})).await;
+        // Accepted: the steer is admitted into the running turn.
+        let accepted = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !events(&daemon, &session)
+            .await
+            .iter()
+            .any(|event| event["type"] == "turn.started")
+        {
+            assert!(tokio::time::Instant::now() < accepted, "never accepted");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let params = serde_json::from_value(json!({"session":session,"handle":HANDLE,
+                                                   "text":"also"}))
+        .unwrap();
+        let steering = tokio::spawn({
+            let engine = Arc::clone(&daemon.engine);
+            async move { engine.steer(params).await }
+        });
+        daemon.entered("delivered").await;
+        let reply = tokio::time::timeout(Duration::from_secs(20), steering)
+            .await
+            .expect("the steer is answered")
+            .unwrap();
+        assert!(
+            root.join("points")
+                .join("store.commit.event.2.ack")
+                .exists()
+        );
+        let error = reply.expect_err("a failed delivery commit is no success");
+        assert_eq!(error.kind, "store_error", "{error:?}");
+        daemon.release("delivered");
+        assert!(
+            !events(&daemon, &session)
+                .await
+                .iter()
+                .any(|event| event["type"] == "steer.delivered")
+        );
+        let engine = Arc::clone(&daemon.engine);
+        let _report = engine
+            .shutdown(Deadline::at(
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            ))
+            .await;
+        daemon.starter.abort();
+    });
+}
+
 /// Idle session lanes the daemon keeps (runtime §8).
 #[cfg(feature = "test-failpoints")]
 const IDLE_LANES: usize = 32;
