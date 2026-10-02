@@ -33,6 +33,7 @@ commit that vendored the unchanged copy shows the whole patch.
    - one unit per 64 bytes of each name the dependency keywords look up and
      of each `required`, `dependencies` or `dependentRequired` name scanned;
    - one unit per 64 bytes counted by `minLength`/`maxLength`;
+   - two units per `multipleOf` check (item 6);
    - one unit per scope a `$recursiveRef` walks, and for a `$dynamicRef`
      one unit per 64 bytes of its anchor name for the comparison with its
      target's `$dynamicAnchor` and again for each scope it walks (each
@@ -119,7 +120,24 @@ commit that vendored the unchanged copy shows the whole patch.
    limit and the compile budget apply to it; the compile reuses the
    expressions built. A pattern that does not compile is therefore refused
    in any schema position, reached or not.
-6. **Lint** (`Cargo.toml`): `mismatched_lifetime_syntaxes` is allowed, so
+6. **Exact numbers** (`util.rs`, `validator.rs`): a behaviour fix
+   against upstream, which computed through `f64`.
+   - `minimum`, `maximum`, `exclusiveMinimum` and `exclusiveMaximum`
+     compare exactly: two integers as integers, an integer and a float
+     without rounding either (upstream took 9007199254740992 as at least
+     9007199254740993).
+   - Numeric equality (`enum`, `const`, `uniqueItems`) is the same exact
+     comparison, and `uniqueItems` hashes a number by a key equal numbers
+     share: an integral value as that integer (so 0, -0.0 and 0.0, or 1
+     and 1.0, hash alike), any other float by its bits. Upstream hashed
+     0 and -0.0 apart, so an array above 20 items could hide a duplicate.
+   - `multipleOf` divides exactly on each number's shortest round-trip
+     decimal, in 128-bit arithmetic of bounded work (upstream tested the
+     fraction of a float division, so 0.3 was not a multiple of 0.1). A
+     divisor whose digits, scaled to the value's exponent, exceed 128
+     bits divides no non-zero value. The test-suite cases (small
+     divisors, the division that overflows a float) keep their results.
+7. **Lint** (`Cargo.toml`): `mismatched_lifetime_syntaxes` is allowed, so
    newer toolchains do not warn on upstream's elided lifetimes.
 
 VIA's limits and the measurements behind them are in

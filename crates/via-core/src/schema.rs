@@ -333,6 +333,171 @@ mod tests {
         );
     }
 
+    /// The cases of `schema` whose answer is not the one wanted, as
+    /// `(value, got)`.
+    fn wrong(schema: &Value, cases: &[(Value, Checked)]) -> Vec<(Value, Checked)> {
+        cases
+            .iter()
+            .filter_map(|(value, want)| {
+                let got = validate(schema, value);
+                (got != *want).then(|| (value.clone(), got))
+            })
+            .collect()
+    }
+
+    /// Critical r1 #6: `multipleOf` divides exactly on each number's
+    /// shortest round-trip decimal: 0.3 is a multiple of 0.1. The
+    /// JSON-Schema-Test-Suite's `multipleOf` cases keep their answers.
+    #[test]
+    fn multiple_of_is_decimal_exact() {
+        use Checked::{Invalid, Valid};
+        let cases: &[(Value, &[(Value, Checked)])] = &[
+            (
+                json!({"multipleOf":0.1}),
+                &[(json!(0.3), Valid), (json!(0.35), Invalid)],
+            ),
+            (
+                json!({"multipleOf":0.01}),
+                &[(json!(19.99), Valid), (json!(-0.07), Valid)],
+            ),
+            (
+                json!({"multipleOf":2}),
+                &[
+                    (json!(10), Valid),
+                    (json!(7), Invalid),
+                    (json!("foo"), Valid),
+                ],
+            ),
+            (
+                json!({"multipleOf":1.5}),
+                &[(json!(0), Valid), (json!(4.5), Valid), (json!(35), Invalid)],
+            ),
+            (
+                json!({"multipleOf":0.0001}),
+                &[(json!(0.0075), Valid), (json!(0.00751), Invalid)],
+            ),
+            (
+                json!({"type":"integer","multipleOf":0.123_456_789}),
+                &[(json!(1e308), Invalid)],
+            ),
+            (
+                json!({"type":"integer","multipleOf":1e-8}),
+                &[(json!(12_391_239_123_u64), Valid)],
+            ),
+            (
+                json!({"multipleOf":1e300}),
+                &[(json!(5), Invalid), (json!(2e300), Valid)],
+            ),
+        ];
+        let wrong: Vec<_> = cases
+            .iter()
+            .flat_map(|(schema, values)| {
+                wrong(schema, values)
+                    .into_iter()
+                    .map(move |w| (schema.clone(), w))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:?}");
+    }
+
+    /// Critical r1 #7: the four bounds compare integers exactly, and an
+    /// integer with a float without rounding: 9007199254740993 and
+    /// 9007199254740992 are distinct.
+    #[test]
+    fn numeric_bounds_compare_exactly() {
+        use Checked::{Invalid, Valid};
+        let (big, below) = (9_007_199_254_740_993_u64, 9_007_199_254_740_992_u64);
+        let cases: &[(Value, &[(Value, Checked)])] = &[
+            (
+                json!({"minimum":big}),
+                &[
+                    (json!(below), Invalid),
+                    (json!(big), Valid),
+                    (json!(9_007_199_254_740_992.0), Invalid),
+                ],
+            ),
+            (
+                json!({"maximum":below}),
+                &[(json!(big), Invalid), (json!(below), Valid)],
+            ),
+            (
+                json!({"exclusiveMinimum":below}),
+                &[
+                    (json!(big), Valid),
+                    (json!(below), Invalid),
+                    (json!(9_007_199_254_740_992.0), Invalid),
+                ],
+            ),
+            (
+                json!({"exclusiveMaximum":big}),
+                &[
+                    (json!(below), Valid),
+                    (json!(big), Invalid),
+                    (json!(9_007_199_254_740_992.0), Valid),
+                ],
+            ),
+            (
+                json!({"minimum":1.1}),
+                &[(json!(1), Invalid), (json!(2), Valid), (json!(1.1), Valid)],
+            ),
+            (
+                json!({"maximum":-2}),
+                &[(json!(-2.0001), Valid), (json!(-1.9999), Invalid)],
+            ),
+        ];
+        let wrong: Vec<_> = cases
+            .iter()
+            .flat_map(|(schema, values)| {
+                wrong(schema, values)
+                    .into_iter()
+                    .map(move |w| (schema.clone(), w))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:?}");
+    }
+
+    /// Critical r1 #8: `uniqueItems` hashes numbers as it compares them,
+    /// on both sides of its 20-item threshold: 0 and -0.0, and 1 and 1.0,
+    /// are duplicates; 9007199254740993 and 9007199254740992.0 are not,
+    /// and `const` agrees.
+    #[test]
+    fn unique_items_hashes_numbers_as_it_compares_them() {
+        use Checked::{Invalid, Valid};
+        let with = |a: Value, b: Value, more: u64| {
+            let mut items = vec![a, b];
+            items.extend((2..2 + more).map(|i| json!(i)));
+            Value::Array(items)
+        };
+        let unique = json!({"uniqueItems":true});
+        let mut cases = Vec::new();
+        for more in [0, 20] {
+            cases.push((with(json!(0), json!(-0.0), more), Invalid));
+            cases.push((with(json!(1), json!(1.0), more), Invalid));
+            cases.push((
+                with(
+                    json!(9_007_199_254_740_993_u64),
+                    json!(9_007_199_254_740_992.0),
+                    more,
+                ),
+                Valid,
+            ));
+        }
+        let mut wrong = wrong(&unique, &cases);
+        wrong.extend(wrong_const());
+        assert!(wrong.is_empty(), "{wrong:?}");
+    }
+
+    /// `const` with an integer against a float of the nearest double.
+    fn wrong_const() -> Vec<(Value, Checked)> {
+        wrong(
+            &json!({"const":9_007_199_254_740_993_u64}),
+            &[
+                (json!(9_007_199_254_740_992.0), Checked::Invalid),
+                (json!(9_007_199_254_740_993_u64), Checked::Valid),
+            ],
+        )
+    }
+
     /// Critical r1 #9 (C1 §4): the subschema and pattern limits and the
     /// regex program limit hold over every schema position, reached or
     /// not: 2,050 unused `$defs` schemas, 65 unused patterns, and one

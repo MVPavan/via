@@ -7,7 +7,7 @@ use std::{
 
 use ahash::{AHashMap, AHasher};
 use percent_encoding::{percent_decode_str, AsciiSet, CONTROLS};
-use serde_json::Value;
+use serde_json::{Number, Value};
 use regex::{Regex, RegexBuilder};
 use url::Url;
 
@@ -346,21 +346,157 @@ pub(crate) fn split(url: &str) -> (&str, &str) {
 }
 
 /// serde_json treats 0 and 0.0 not equal. so we cannot simply use v1==v2
+// VIA patch: a JSON number as an exact integer or a float.
+#[derive(Clone, Copy)]
+enum Num {
+    Int(i128),
+    Float(f64),
+}
+
+impl Num {
+    fn of(n: &Number) -> Option<Self> {
+        if let Some(u) = n.as_u64() {
+            Some(Self::Int(i128::from(u)))
+        } else if let Some(i) = n.as_i64() {
+            Some(Self::Int(i128::from(i)))
+        } else {
+            n.as_f64().map(Self::Float)
+        }
+    }
+}
+
+// 2^127 as a float: every float at or above it exceeds every `i128`.
+const I128_BOUND: f64 = 170_141_183_460_469_231_731_687_303_715_884_105_728.0;
+
+// VIA patch: integer `i` against float `f`, exactly.
+fn cmp_int_float(i: i128, f: f64) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    if f.is_nan() {
+        return None;
+    }
+    if f >= I128_BOUND {
+        return Some(Ordering::Less);
+    }
+    if f < -I128_BOUND {
+        return Some(Ordering::Greater);
+    }
+    let whole = f.trunc();
+    // In range and integral: exact.
+    match i.cmp(&(whole as i128)) {
+        Ordering::Equal => (0.0).partial_cmp(&(f - whole)),
+        unequal => Some(unequal),
+    }
+}
+
+// VIA patch: the exact order of two JSON numbers. Upstream compared
+// bounds through `f64`, so distinct integers above 2^53 compared equal.
+pub(crate) fn num_cmp(n1: &Number, n2: &Number) -> Option<std::cmp::Ordering> {
+    match (Num::of(n1)?, Num::of(n2)?) {
+        (Num::Int(i1), Num::Int(i2)) => Some(i1.cmp(&i2)),
+        (Num::Float(f1), Num::Float(f2)) => f1.partial_cmp(&f2),
+        (Num::Int(i), Num::Float(f)) => cmp_int_float(i, f),
+        (Num::Float(f), Num::Int(i)) => cmp_int_float(i, f).map(std::cmp::Ordering::reverse),
+    }
+}
+
+// VIA patch: a number's hash key, equal for equal numbers: an integral
+// value within `i128` (an integer, or a float such as 1.0, 0.0 or -0.0)
+// as that integer, any other float by its bits.
+fn num_key(n: &Number) -> Option<Num> {
+    match Num::of(n)? {
+        Num::Float(f) if f.trunc() == f && (-I128_BOUND..I128_BOUND).contains(&f) => {
+            Some(Num::Int(f as i128))
+        }
+        num => Some(num),
+    }
+}
+
+// VIA patch: a number as `(digits, exponent)`, its shortest round-trip
+// decimal `digits * 10^exponent` with the sign dropped and no trailing
+// zero in `digits`; `None` for a non-finite float.
+fn decimal(n: &Number) -> Option<(u128, i32)> {
+    let (mut digits, mut exp) = match Num::of(n)? {
+        Num::Int(i) => (i.unsigned_abs(), 0),
+        Num::Float(f) if f.is_finite() => {
+            // `{:e}` writes the shortest round-trip digits: `d.ddde-x`.
+            let text = format!("{:e}", f.abs());
+            let (mantissa, exp) = text.split_once('e')?;
+            let exp: i32 = exp.parse().ok()?;
+            let (whole, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+            let digits: u128 = format!("{whole}{frac}").parse().ok()?;
+            (digits, exp - frac.len() as i32)
+        }
+        Num::Float(_) => return None,
+    };
+    while digits != 0 && digits % 10 == 0 {
+        digits /= 10;
+        exp += 1;
+    }
+    Some((digits, exp))
+}
+
+// `base^exp mod m` for `m < 2^64`.
+fn pow_mod(mut base: u128, mut exp: u32, m: u128) -> u128 {
+    let mut result = 1 % m;
+    base %= m;
+    while exp > 0 {
+        if exp & 1 == 1 {
+            result = result * base % m;
+        }
+        base = base * base % m;
+        exp >>= 1;
+    }
+    result
+}
+
+// VIA patch: the budget units of one `is_multiple`: two numbers of at
+// most 20 digits each written out, and at most 30 128-bit modular
+// steps.
+pub(crate) const MULTIPLE_OF_UNITS: u64 = 2;
+
+// VIA patch: whether `n` is an integer multiple of `of`, exactly, on
+// their shortest round-trip decimals. Upstream tested the fraction of a
+// float division, so 0.3 was not a multiple of 0.1. The work is a few
+// 128-bit operations, whatever the numbers. `None` when either has no
+// decimal or `of` is zero.
+pub(crate) fn is_multiple(n: &Number, of: &Number) -> Option<bool> {
+    let (nd, ne) = decimal(n)?;
+    let (od, oe) = decimal(of)?;
+    if od == 0 {
+        return None;
+    }
+    if nd == 0 {
+        return Some(true);
+    }
+    // Both digit strings are below 10^20, under 2^67, so products of two
+    // residues modulo `od` (below 2^67) fit when `od` is below 2^64; a
+    // float's shortest digits are at most 17, an integer's at most 20.
+    if ne >= oe {
+        // n = nd * 10^k * 10^oe and of = od * 10^oe.
+        let k = u32::try_from(ne - oe).ok()?;
+        if od >= 1 << 64 {
+            return None;
+        }
+        Some((nd % od) * pow_mod(10, k, od) % od == 0)
+    } else {
+        // of = od * 10^k * 10^ne: nd must be a multiple of it.
+        let k = u32::try_from(oe - ne).ok()?;
+        Some(
+            10u128
+                .checked_pow(k)
+                .and_then(|scale| od.checked_mul(scale))
+                .is_some_and(|of| nd % of == 0),
+        )
+    }
+}
+
 pub(crate) fn equals(v1: &Value, v2: &Value) -> bool {
     match (v1, v2) {
         (Value::Null, Value::Null) => true,
         (Value::Bool(b1), Value::Bool(b2)) => b1 == b2,
+        // VIA patch: numbers are equal when their exact values are.
         (Value::Number(n1), Value::Number(n2)) => {
-            if let (Some(n1), Some(n2)) = (n1.as_u64(), n2.as_u64()) {
-                return n1 == n2;
-            }
-            if let (Some(n1), Some(n2)) = (n1.as_i64(), n2.as_i64()) {
-                return n1 == n2;
-            }
-            if let (Some(n1), Some(n2)) = (n1.as_f64(), n2.as_f64()) {
-                return n1 == n2;
-            }
-            false
+            num_cmp(n1, n2) == Some(std::cmp::Ordering::Equal)
         }
         (Value::String(s1), Value::String(s2)) => s1 == s2,
         (Value::Array(arr1), Value::Array(arr2)) => {
@@ -613,15 +749,12 @@ impl Hash for HashedValue<'_> {
         match self.0 {
             Value::Null => state.write_u32(3_221_225_473), // chosen randomly
             Value::Bool(ref b) => b.hash(state),
-            Value::Number(ref num) => {
-                if let Some(num) = num.as_f64() {
-                    num.to_bits().hash(state);
-                } else if let Some(num) = num.as_u64() {
-                    num.hash(state);
-                } else if let Some(num) = num.as_i64() {
-                    num.hash(state);
-                }
-            }
+            // VIA patch: hashed by the key equal numbers share.
+            Value::Number(ref num) => match num_key(num) {
+                Some(Num::Int(i)) => i.hash(state),
+                Some(Num::Float(f)) => f.to_bits().hash(state),
+                None => {}
+            },
             Value::String(ref str) => str.hash(state),
             Value::Array(ref arr) => {
                 for item in arr {

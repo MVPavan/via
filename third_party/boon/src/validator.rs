@@ -717,48 +717,45 @@ impl<'v> Validator<'v, '_, '_, '_> {
     fn num_validate(&mut self, num: &'v Number) {
         let s = self.schema;
 
+        // VIA patch: the bounds compare exactly (`num_cmp`), and
+        // `multipleOf` divides exactly on decimals (`is_multiple`).
+        use std::cmp::Ordering::{Equal, Greater, Less};
+
         // minimum --
         if let Some(min) = &s.minimum {
-            if let (Some(minf), Some(numf)) = (min.as_f64(), num.as_f64()) {
-                if numf < minf {
-                    self.add_error(kind!(Minimum, Cow::Borrowed(num), min));
-                }
+            if num_cmp(num, min) == Some(Less) {
+                self.add_error(kind!(Minimum, Cow::Borrowed(num), min));
             }
         }
 
         // maximum --
         if let Some(max) = &s.maximum {
-            if let (Some(maxf), Some(numf)) = (max.as_f64(), num.as_f64()) {
-                if numf > maxf {
-                    self.add_error(kind!(Maximum, Cow::Borrowed(num), max));
-                }
+            if num_cmp(num, max) == Some(Greater) {
+                self.add_error(kind!(Maximum, Cow::Borrowed(num), max));
             }
         }
 
         // exclusiveMinimum --
         if let Some(ex_min) = &s.exclusive_minimum {
-            if let (Some(ex_minf), Some(numf)) = (ex_min.as_f64(), num.as_f64()) {
-                if numf <= ex_minf {
-                    self.add_error(kind!(ExclusiveMinimum, Cow::Borrowed(num), ex_min));
-                }
+            if matches!(num_cmp(num, ex_min), Some(Less | Equal)) {
+                self.add_error(kind!(ExclusiveMinimum, Cow::Borrowed(num), ex_min));
             }
         }
 
         // exclusiveMaximum --
         if let Some(ex_max) = &s.exclusive_maximum {
-            if let (Some(ex_maxf), Some(numf)) = (ex_max.as_f64(), num.as_f64()) {
-                if numf >= ex_maxf {
-                    self.add_error(kind!(ExclusiveMaximum, Cow::Borrowed(num), ex_max));
-                }
+            if matches!(num_cmp(num, ex_max), Some(Greater | Equal)) {
+                self.add_error(kind!(ExclusiveMaximum, Cow::Borrowed(num), ex_max));
             }
         }
 
         // multipleOf --
         if let Some(mul) = &s.multiple_of {
-            if let (Some(mulf), Some(numf)) = (mul.as_f64(), num.as_f64()) {
-                if (numf / mulf).fract() != 0.0 {
-                    self.add_error(kind!(MultipleOf, Cow::Borrowed(num), mul));
-                }
+            if !self.budget.charge(MULTIPLE_OF_UNITS) {
+                return;
+            }
+            if is_multiple(num, mul) == Some(false) {
+                self.add_error(kind!(MultipleOf, Cow::Borrowed(num), mul));
             }
         }
     }
