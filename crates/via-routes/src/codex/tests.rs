@@ -37,6 +37,11 @@ fn assembled(message: OutboundMessage) -> Vec<u8> {
     }
 }
 
+/// A client ID in range.
+fn cid(id: i64) -> ClientId {
+    ClientId::try_from(id).unwrap()
+}
+
 fn settings(instructions: Option<&str>) -> ThreadSettings<'_> {
     ThreadSettings {
         model: "gpt-6-sol",
@@ -53,7 +58,7 @@ fn settings(instructions: Option<&str>) -> ThreadSettings<'_> {
 #[test]
 fn encoders_write_the_recorded_requests() {
     assert_eq!(
-        parsed(&initialize(1, "0.1.0").unwrap()),
+        parsed(&initialize(cid(1), "0.1.0").unwrap()),
         json!({"id": 1, "method": "initialize",
             "params": {"clientInfo": {"name": "via", "version": "0.1.0"}}})
     );
@@ -62,31 +67,31 @@ fn encoders_write_the_recorded_requests() {
         json!({"method": "initialized"})
     );
     assert_eq!(
-        parsed(&model_list(2, None).unwrap()),
+        parsed(&model_list(cid(2), None).unwrap()),
         json!({"id": 2, "method": "model/list", "params": {}})
     );
     assert_eq!(
-        parsed(&model_list(3, Some("page-2")).unwrap()),
+        parsed(&model_list(cid(3), Some("page-2")).unwrap()),
         json!({"id": 3, "method": "model/list", "params": {"cursor": "page-2"}})
     );
     assert_eq!(
-        parsed(&thread_start(4, &settings(None)).unwrap()),
+        parsed(&thread_start(cid(4), &settings(None)).unwrap()),
         json!({"id": 4, "method": "thread/start", "params": {"model": "gpt-6-sol",
             "cwd": "/work/project", "sandbox": "danger-full-access",
             "approvalPolicy": "never", "approvalsReviewer": "user", "ephemeral": false}})
     );
     assert_eq!(
-        parsed(&thread_start(4, &settings(Some("Be brief.\n"))).unwrap())["params"]["developerInstructions"],
+        parsed(&thread_start(cid(4), &settings(Some("Be brief.\n"))).unwrap())["params"]["developerInstructions"],
         json!("Be brief.\n")
     );
     assert_eq!(
-        parsed(&thread_resume(5, "019a-thread", &settings(Some("Be brief."))).unwrap()),
+        parsed(&thread_resume(cid(5), "019a-thread", &settings(Some("Be brief."))).unwrap()),
         json!({"id": 5, "method": "thread/resume", "params": {"threadId": "019a-thread",
             "model": "gpt-6-sol", "cwd": "/work/project",
             "developerInstructions": "Be brief.", "sandbox": "danger-full-access",
             "approvalPolicy": "never", "approvalsReviewer": "user", "excludeTurns": true}})
     );
-    let resume = parsed(&thread_resume(5, "019a-thread", &settings(None)).unwrap());
+    let resume = parsed(&thread_resume(cid(5), "019a-thread", &settings(None)).unwrap());
     assert!(resume["params"].get("developerInstructions").is_none());
     let start = TurnStart {
         thread_id: "019a-thread",
@@ -98,7 +103,7 @@ fn encoders_write_the_recorded_requests() {
     };
     assert_eq!(
         parsed(&assembled(
-            turn_start(6, &start, "Say \"hi\"\n".to_owned()).unwrap()
+            turn_start(cid(6), &start, "Say \"hi\"\n".to_owned()).unwrap()
         )),
         json!({"id": 6, "method": "turn/start", "params": {"threadId": "019a-thread",
             "input": [{"type": "text", "text": "Say \"hi\"\n"}], "cwd": "/work/project",
@@ -113,22 +118,22 @@ fn encoders_write_the_recorded_requests() {
         ..start
     };
     let line = parsed(&assembled(
-        turn_start(7, &with_schema, "x".to_owned()).unwrap(),
+        turn_start(cid(7), &with_schema, "x".to_owned()).unwrap(),
     ));
     assert_eq!(line["params"]["outputSchema"], json!({"type": "object"}));
     assert_eq!(line["params"]["effort"], Value::Null);
     assert_eq!(
-        parsed(&turn_steer(8, "019a-thread", "019a-turn", "more").unwrap()),
+        parsed(&turn_steer(cid(8), "019a-thread", "019a-turn", "more").unwrap()),
         json!({"id": 8, "method": "turn/steer", "params": {"threadId": "019a-thread",
             "expectedTurnId": "019a-turn", "input": [{"type": "text", "text": "more"}]}})
     );
     assert_eq!(
-        parsed(&turn_interrupt(9, "019a-thread", "019a-turn").unwrap()),
+        parsed(&turn_interrupt(cid(9), "019a-thread", "019a-turn").unwrap()),
         json!({"id": 9, "method": "turn/interrupt",
             "params": {"threadId": "019a-thread", "turnId": "019a-turn"}})
     );
     assert_eq!(
-        parsed(&thread_unsubscribe(10, "019a-thread").unwrap()),
+        parsed(&thread_unsubscribe(cid(10), "019a-thread").unwrap()),
         json!({"id": 10, "method": "thread/unsubscribe",
             "params": {"threadId": "019a-thread"}})
     );
@@ -144,7 +149,7 @@ fn a_non_utf8_cwd_is_not_encoded() {
         cwd,
         ..settings(None)
     };
-    assert!(thread_start(1, &settings).is_err());
+    assert!(thread_start(cid(1), &settings).is_err());
 }
 
 /// The envelope first (coding style §3): an ID with a result or error is
@@ -179,6 +184,7 @@ fn decode_reads_the_envelope_first() {
     assert_eq!(request.method, "item/commandExecution/requestApproval");
     assert_eq!(request.thread_id.as_deref(), Some("t1"));
     assert_eq!(request.turn_id.as_deref(), Some("u1"));
+    assert_eq!(request.item_id.as_deref(), Some("i"));
     let Incoming::Request(request) =
         decode(br#"{"id":9,"method":"attestation/generate"}"#).unwrap()
     else {
@@ -440,4 +446,201 @@ fn the_decline_table_answers_every_request() {
             json!({"id": "srv-9", "error": {"code": -32601, "message": "Method not supported by VIA"}})
         );
     }
+}
+
+/// Review r1 #2: the structure limits (depth 64, 65,536 nodes) hold before
+/// any serde pass, the unknown fallback included.
+#[test]
+fn messages_past_the_structure_limits_are_errors() {
+    let nested = |depth: usize| {
+        format!(
+            r#"{{"method":"x/unknown","params":{{"threadId":"t","deep":{}{}}}}}"#,
+            "[".repeat(depth),
+            "]".repeat(depth)
+        )
+    };
+    // The envelope and params are two levels already.
+    assert!(decode(nested(62).as_bytes()).is_ok());
+    assert!(decode(nested(63).as_bytes()).is_err());
+    let wide = format!(
+        r#"{{"method":"x/unknown","params":{{"threadId":"t","many":[{}]}}}}"#,
+        vec!["0"; 65_536].join(",")
+    );
+    assert!(decode(wide.as_bytes()).is_err());
+    let raw = serde_json::value::to_raw_value(&json!({"turnId": "u"})).unwrap();
+    assert!(result::<TurnSteerResult>(&raw).is_ok());
+    let deep = format!(
+        r#"{{"turnId":"u","extra":{}{}}}"#,
+        "[".repeat(64),
+        "]".repeat(64)
+    );
+    let deep_raw = serde_json::value::RawValue::from_string(deep).unwrap();
+    assert!(result::<TurnSteerResult>(&deep_raw).is_err());
+}
+
+/// Review r1 #3: each known variant's retained fields are checked against
+/// the 0.157.1 schema; unknown extra fields stay tolerated; an explicit
+/// `id: null` is no envelope.
+#[test]
+fn malformed_retained_fields_are_errors() {
+    let item = |item: &str| {
+        format!(
+            r#"{{"method":"item/completed","params":{{"threadId":"t","turnId":"u","item":{item}}}}}"#
+        )
+    };
+    let error = |info: &str| {
+        format!(
+            r#"{{"method":"turn/completed","params":{{"threadId":"t","turn":{{"id":"u","items":[],"status":"failed","error":{{"message":"m","codexErrorInfo":{info}}}}}}}}}"#
+        )
+    };
+    for malformed in [
+        item(
+            r#"{"type":"commandExecution","id":"c","command":"ls","cwd":"/","commandActions":[]}"#,
+        ),
+        item(r#"{"type":"commandExecution","id":"c","command":"ls","status":"paused"}"#),
+        item(r#"{"type":"commandExecution","id":"c","status":"completed"}"#),
+        item(r#"{"type":"fileChange","id":"f","status":"declined"}"#),
+        item(r#"{"type":"fileChange","id":"f","status":"declined","changes":[{"kind":"add"}]}"#),
+        item(r#"{"type":"mcpToolCall","id":"m","status":"declined"}"#),
+        item(r#"{"type":"sleep","id":"s"}"#),
+        item(r#"{"type":"agentMessage","id":"a","text":"x","phase":"aside"}"#),
+        error("42"),
+        error("true"),
+        error(r#"{"httpConnectionFailed":{"httpStatusCode":"401"}}"#),
+        error(r#"{"httpConnectionFailed":{},"other":{}}"#),
+        r#"{"id":null,"result":{}}"#.to_owned(),
+        r#"{"id":null,"method":"item/tool/call","params":{}}"#.to_owned(),
+        r#"{"id":null,"method":"turn/started","params":{}}"#.to_owned(),
+    ] {
+        assert!(decode(malformed.as_bytes()).is_err(), "{malformed}");
+    }
+    let Incoming::Notification(Notification::ItemCompleted(event)) = decode(
+        item(r#"{"type":"commandExecution","id":"c","command":"rm -rf x","cwd":"/","commandActions":[],"status":"declined","extra":{"any":1}}"#)
+            .as_bytes(),
+    )
+    .unwrap() else {
+        panic!("a command item");
+    };
+    assert_eq!(event.item.status.as_deref(), Some("declined"));
+    assert_eq!(event.item.target.as_deref(), Some("rm -rf x"));
+    let Incoming::Notification(Notification::ItemCompleted(event)) = decode(
+        item(r#"{"type":"fileChange","id":"f","status":"declined","changes":[{"path":"/w/a.txt","kind":{"type":"add"},"diff":""}]}"#)
+            .as_bytes(),
+    )
+    .unwrap() else {
+        panic!("a file-change item");
+    };
+    assert_eq!(event.item.target.as_deref(), Some("/w/a.txt"));
+    let Incoming::Notification(Notification::TurnCompleted(event)) =
+        decode(error("null").as_bytes()).unwrap()
+    else {
+        panic!("a null codexErrorInfo is none");
+    };
+    assert_eq!(event.turn.error.unwrap().codex_error_info, None);
+    let raw = |value: Value| serde_json::value::to_raw_value(&value).unwrap();
+    assert!(
+        result::<ModelListResult>(&raw(json!({"data": [{"model": "m", "hidden": false,
+            "defaultReasoningEffort": "low", "isDefault": true}]})))
+        .is_err(),
+        "a catalog entry without its efforts"
+    );
+}
+
+/// Review r1 #4: string request IDs, error codes and the consumed response
+/// IDs and names are short fields: 1,025 bytes is an error.
+#[test]
+fn every_short_field_is_bounded() {
+    let long = "x".repeat(crate::SHORT_FIELD_MAX + 1);
+    let fits = "x".repeat(crate::SHORT_FIELD_MAX);
+    let request = |id: &str| format!(r#"{{"id":"{id}","method":"item/tool/call","params":{{}}}}"#);
+    let response = |id: &str| format!(r#"{{"id":"{id}","result":{{}}}}"#);
+    let code = |code: &str| {
+        format!(
+            r#"{{"method":"turn/completed","params":{{"threadId":"t","turn":{{"id":"u","items":[],"status":"failed","error":{{"message":"m","codexErrorInfo":"{code}"}}}}}}}}"#
+        )
+    };
+    let object_code = |code: &str| {
+        format!(
+            r#"{{"method":"error","params":{{"threadId":"t","turnId":"u","willRetry":false,"error":{{"message":"m","codexErrorInfo":{{"{code}":{{}}}}}}}}}}"#
+        )
+    };
+    for make in [request, response, code, object_code] {
+        assert!(decode(make(&fits).as_bytes()).is_ok());
+        assert!(decode(make(&long).as_bytes()).is_err());
+    }
+    let raw = |value: Value| serde_json::value::to_raw_value(&value).unwrap();
+    let model = |name: &str, effort: &str, cursor: &str| {
+        raw(
+            json!({"data": [{"model": name, "hidden": false, "isDefault": true,
+            "defaultReasoningEffort": "low",
+            "supportedReasoningEfforts": [{"reasoningEffort": effort, "description": "d"}]}],
+            "nextCursor": cursor}),
+        )
+    };
+    assert!(result::<ModelListResult>(&model(&fits, &fits, &fits)).is_ok());
+    assert!(result::<ModelListResult>(&model(&long, "low", "c")).is_err());
+    assert!(result::<ModelListResult>(&model("m", &long, "c")).is_err());
+    assert!(result::<ModelListResult>(&model("m", "low", &long)).is_err());
+    let thread = |id: &str, model: &str| {
+        raw(json!({"thread": {"id": id}, "model": model, "cwd": "/w",
+            "approvalPolicy": "never", "sandbox": {"type": "dangerFullAccess"}}))
+    };
+    assert!(result::<ThreadResult>(&thread(&fits, &fits)).is_ok());
+    assert!(result::<ThreadResult>(&thread(&long, "m")).is_err());
+    assert!(result::<ThreadResult>(&thread("t", &long)).is_err());
+    assert!(
+        result::<TurnStartResult>(&raw(
+            json!({"turn": {"id": long, "items": [], "status": "inProgress"}})
+        ))
+        .is_err()
+    );
+    assert!(result::<TurnSteerResult>(&raw(json!({ "turnId": long }))).is_err());
+    assert!(
+        result::<InitializeResult>(&raw(json!({ "userAgent": long }))).is_err(),
+        "the version source is a short field"
+    );
+}
+
+/// Review r1 #8: the recorded `sleep` item (the interruptible
+/// `clock.sleep` tool) is a tool.
+#[test]
+fn a_sleep_item_is_a_tool() {
+    let Incoming::Notification(Notification::ItemStarted(event)) = decode(
+        br#"{"method":"item/started","params":{"threadId":"t","turnId":"u","item":{"type":"sleep","id":"s1","durationMs":75000}}}"#,
+    )
+    .unwrap() else {
+        panic!("a sleep item");
+    };
+    assert_eq!(event.item.kind, ItemKind::Sleep);
+    assert!(event.item.kind.is_tool());
+    assert_eq!(event.item.kind.as_str(), "sleep");
+}
+
+/// Review r1 #11: client IDs stay in the protocol's signed 64-bit range;
+/// the allocator retires at its end instead of wrapping or overflowing.
+#[test]
+fn client_ids_stay_in_range() {
+    assert!(ClientId::try_from(-1).is_err());
+    let mut ids = ClientIds::default();
+    assert_eq!(ids.next().map(ClientId::get), Some(1));
+    assert_eq!(ids.next().map(ClientId::get), Some(2));
+    let mut last = ClientIds::starting_at(cid(i64::MAX - 1));
+    assert_eq!(last.next().map(ClientId::get), Some(i64::MAX - 1));
+    assert_eq!(last.next().map(ClientId::get), Some(i64::MAX));
+    assert!(last.next().is_none());
+    assert!(last.next().is_none(), "retired for good");
+    assert_eq!(
+        parsed(&initialize(cid(i64::MAX), "0").unwrap())["id"],
+        json!(i64::MAX)
+    );
+}
+
+/// A route's JSON text (a final answer meant as structured output) parses
+/// only within the structure limits.
+#[test]
+fn json_text_keeps_the_limits() {
+    assert_eq!(json_text(r#"{"a":[1]}"#).unwrap().get(), r#"{"a":[1]}"#);
+    assert_eq!(json_text("VIA PLAIN").unwrap_err(), JsonTextError::NotJson);
+    let deep = format!("{}{}", "[".repeat(65), "]".repeat(65));
+    assert_eq!(json_text(&deep).unwrap_err(), JsonTextError::Limits);
 }

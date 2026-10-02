@@ -8,16 +8,19 @@
 )]
 
 use serde_json::json;
+use std::collections::HashSet;
+
 use serde_json::value::RawValue;
 use tokio::time::Instant;
 use via_routes::codex::{
-    CodexErrorInfo, DeclineTable, Item, ItemKind, ModelListResult, Notification, ServerRequest,
-    TokenBreakdown, Turn, TurnError, TurnStatus,
+    CodexErrorInfo, DeclineTable, Item, ItemKind, JsonTextError, ModelListResult, Notification,
+    ServerRequest, TokenBreakdown, Turn, TurnError, TurnStatus, json_text,
 };
 
 use super::plan::CHECKED;
 use crate::observation::{
-    ClassHint, Decline, Observation, ProgressMarks, StopReason, UsageSample, VendorTerminal,
+    ClassHint, Decline, Denial, DenialKind, Observation, ProgressMarks, StopReason, UsageSample,
+    VendorTerminal,
 };
 use crate::plan::VersionStatus;
 use crate::{VendorTerminalStatus, final_text_pieces};
@@ -131,19 +134,22 @@ pub(crate) fn decline(request: &ServerRequest) -> Decline {
 }
 
 /// What a turn's structured output is when the turn ends (packet §3: the
-/// final text is the output). `VendorTerminal.structured_output` holds
-/// JSON only, so text that is not JSON cannot travel there; Core needs
-/// the difference from no text at all.
+/// nonempty final text is the output), as the C2 amendment of review r1
+/// types `VendorTerminal.structured_output`; until that join lands here,
+/// the normalizer returns it beside the terminal.
 #[derive(Debug)]
 pub(crate) enum StructuredOutput {
     /// No schema was requested.
     NotRequested,
-    /// A schema was requested and the turn produced no final text.
+    /// A schema was requested and the final text is absent or empty.
     Missing,
     /// The final text, parsed.
     Json(Box<RawValue>),
     /// A schema was requested and the final text is not JSON.
     NotJson,
+    /// A schema was requested and the final text passed the 4 MiB
+    /// retention bound or the JSON structure limits (`validation_limit`).
+    OverLimit,
 }
 
 impl PartialEq for StructuredOutput {
@@ -152,8 +158,16 @@ impl PartialEq for StructuredOutput {
             (Self::Json(left), Self::Json(right)) => left.get() == right.get(),
             (Self::NotRequested, Self::NotRequested)
             | (Self::Missing, Self::Missing)
-            | (Self::NotJson, Self::NotJson) => true,
-            (Self::NotRequested | Self::Missing | Self::Json(_) | Self::NotJson, _) => false,
+            | (Self::NotJson, Self::NotJson)
+            | (Self::OverLimit, Self::OverLimit) => true,
+            (
+                Self::NotRequested
+                | Self::Missing
+                | Self::Json(_)
+                | Self::NotJson
+                | Self::OverLimit,
+                _,
+            ) => false,
         }
     }
 }
@@ -174,34 +188,98 @@ pub(crate) enum Step {
     Activity,
 }
 
-/// One turn's normalizer: it keeps the final text and the thread's usage
-/// so the terminal can carry them.
+/// The most structured-output text a turn retains (review r1 #1): past
+/// it the turn's output is `OverLimit`. An E2E measurement item, not a
+/// qualified figure.
+const STRUCTURED_MAX: usize = 4 * 1024 * 1024;
+
+/// The most item IDs each per-turn set holds. Past it the open-tool set
+/// reads as open for good (never a false quiescence), and the dedup sets
+/// stop growing (at worst a repeated or unsuppressed denial).
+const TRACKED_ITEMS_MAX: usize = 1024;
+
+/// The reason of every vendor denial (C1 Q9, as the Claude adapter words it).
+const DENIAL_REASON: &str = "denied by the vendor's permission policy";
+
+/// The final-answer text retained for structured output.
+enum Answer {
+    /// Text so far, within [`STRUCTURED_MAX`].
+    Text(String),
+    /// The text passed [`STRUCTURED_MAX`] and was dropped.
+    OverLimit,
+}
+
+/// The turn's cache-write input tokens over its samples (review r1 #9):
+/// unavailable once any sample lacks the count, never reported as 0.
+#[derive(Clone, Copy)]
+enum CacheWrite {
+    /// No sample yet.
+    None,
+    /// Every sample had the count; their sum.
+    Sum(u64),
+    /// A sample lacked it.
+    Unavailable,
+}
+
+/// A set of item IDs bounded at [`TRACKED_ITEMS_MAX`].
+#[derive(Default)]
+struct Ids {
+    ids: HashSet<String>,
+    /// An insert was refused at the bound.
+    overflowed: bool,
+}
+
+impl Ids {
+    fn insert(&mut self, id: &str) {
+        if self.ids.len() < TRACKED_ITEMS_MAX {
+            self.ids.insert(id.to_owned());
+        } else if !self.ids.contains(id) {
+            self.overflowed = true;
+        }
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        self.ids.contains(id)
+    }
+}
+
+/// One turn's normalizer: it keeps the structured-output text, the
+/// thread's usage, the open tools and the denials so far.
 pub(crate) struct TurnNormalizer {
     /// Whether the turn requested an output schema.
     schema: bool,
-    /// The final-answer text so far.
-    final_text: Option<String>,
+    /// The final-answer text, retained only with a schema.
+    answer: Answer,
     /// The thread's latest cumulative usage.
     total: Option<TokenBreakdown>,
-    /// The turn's cache-write input tokens, summed over its samples.
-    cache_write: u64,
+    /// The turn's cache-write input tokens.
+    cache_write: CacheWrite,
     /// The model's context window, as last reported.
     window: Option<u64>,
+    /// Tool items started and not completed.
+    open_tools: Ids,
+    /// Items whose approval request VIA declined.
+    declined_by_via: Ids,
+    /// Items already reported denied.
+    denied: Ids,
 }
 
 impl TurnNormalizer {
     pub(crate) fn new(schema: bool) -> Self {
         Self {
             schema,
-            final_text: None,
+            answer: Answer::Text(String::new()),
             total: None,
-            cache_write: 0,
+            cache_write: CacheWrite::None,
             window: None,
+            open_tools: Ids::default(),
+            declined_by_via: Ids::default(),
+            denied: Ids::default(),
         }
     }
 
     /// The step `notification` is; an error for a known notification that
-    /// contradicts the protocol.
+    /// contradicts the protocol, or counts past their range.
     pub(crate) fn observe(
         &mut self,
         notification: &Notification,
@@ -210,9 +288,9 @@ impl TurnNormalizer {
         let progress =
             |marks: ProgressMarks| Step::Observations(vec![Observation::Progress(marks)]);
         Ok(match notification {
-            Notification::ItemStarted(event) => {
-                item_started(&event.item).map_or(Step::Activity, progress)
-            }
+            Notification::ItemStarted(event) => self
+                .item_started(&event.item)
+                .map_or(Step::Activity, progress),
             Notification::ItemCompleted(event) => self.item_completed(&event.item),
             Notification::AgentMessageDelta(_) | Notification::ReasoningDelta(_) => {
                 progress(ProgressMarks {
@@ -222,8 +300,15 @@ impl TurnNormalizer {
             }
             Notification::TokenUsage(event) => {
                 let last = event.usage.last;
+                self.cache_write = match (self.cache_write, last.cache_write_input_tokens) {
+                    (CacheWrite::Unavailable, _) | (_, None) => CacheWrite::Unavailable,
+                    (CacheWrite::None, Some(count)) => CacheWrite::Sum(count),
+                    (CacheWrite::Sum(sum), Some(count)) => CacheWrite::Sum(
+                        sum.checked_add(count)
+                            .ok_or("cache-write tokens past their range")?,
+                    ),
+                };
                 self.total = Some(event.usage.total);
-                self.cache_write += last.cache_write_input_tokens.unwrap_or_default();
                 self.window = event.usage.model_context_window.or(self.window);
                 progress(ProgressMarks {
                     usage: Some(sample(&last)),
@@ -239,24 +324,111 @@ impl TurnNormalizer {
         })
     }
 
+    /// Bytes of final text retained for structured output.
+    pub(crate) fn retained(&self) -> usize {
+        match &self.answer {
+            Answer::Text(text) => text.len(),
+            Answer::OverLimit => 0,
+        }
+    }
+
+    /// Records a request [`DECLINES`] answered, so the item's declined
+    /// status is not reported again as a vendor denial (C2: VIA's own
+    /// decline is `vendor.request_declined` only).
+    pub(crate) fn note_decline(&mut self, request: &ServerRequest) {
+        if let Some(item) = &request.item_id {
+            self.declined_by_via.insert(item);
+        }
+    }
+
+    /// Whether a tool item started and has not completed; past the
+    /// tracking bound, always.
+    pub(crate) fn tools_open(&self) -> bool {
+        self.open_tools.overflowed || !self.open_tools.ids.is_empty()
+    }
+
+    /// The marks of an item's start: model output, and a tool's ID and type.
+    fn item_started(&mut self, item: &Item) -> Option<ProgressMarks> {
+        let tools_started = if item.kind.is_tool() {
+            self.open_tools.insert(&item.id);
+            vec![(item.id.clone(), item.kind.as_str().to_owned())]
+        } else if matches!(item.kind, ItemKind::AgentMessage | ItemKind::Reasoning) {
+            Vec::new()
+        } else {
+            return None;
+        };
+        Some(ProgressMarks {
+            model: true,
+            tools_started,
+            ..ProgressMarks::default()
+        })
+    }
+
     fn item_completed(&mut self, item: &Item) -> Step {
         if item.kind.is_tool() {
-            return Step::Observations(vec![Observation::Progress(ProgressMarks {
+            self.open_tools.ids.remove(&item.id);
+            let mut observations = vec![Observation::Progress(ProgressMarks {
                 tools_ended: vec![item.id.clone()],
                 ..ProgressMarks::default()
-            })]);
+            })];
+            observations.extend(self.denial(item).map(Observation::ActionDenied));
+            return Step::Observations(observations);
         }
         let (ItemKind::AgentMessage, Some(FINAL_ANSWER), Some(text)) =
             (&item.kind, item.phase.as_deref(), item.text.as_deref())
         else {
             return Step::Activity;
         };
-        self.final_text.get_or_insert_default().push_str(text);
+        if self.schema {
+            self.retain(text);
+        }
         Step::Observations(
             final_text_pieces(text)
                 .map(|piece| Observation::FinalText(piece.to_owned()))
                 .collect(),
         )
+    }
+
+    /// Appends `text` to the structured-output text, within its bound.
+    fn retain(&mut self, text: &str) {
+        if let Answer::Text(answer) = &mut self.answer {
+            if answer.len().saturating_add(text.len()) > STRUCTURED_MAX {
+                self.answer = Answer::OverLimit;
+            } else {
+                answer.push_str(text);
+            }
+        }
+    }
+
+    /// A command or file-change item the vendor declined, once per item,
+    /// unless VIA's own decline caused it.
+    fn denial(&mut self, item: &Item) -> Option<Denial> {
+        let kind = match item.kind {
+            ItemKind::CommandExecution => DenialKind::Command,
+            ItemKind::FileChange => DenialKind::FileWrite,
+            ItemKind::UserMessage
+            | ItemKind::AgentMessage
+            | ItemKind::Reasoning
+            | ItemKind::McpToolCall
+            | ItemKind::DynamicToolCall
+            | ItemKind::CollabAgentToolCall
+            | ItemKind::WebSearch
+            | ItemKind::ImageGeneration
+            | ItemKind::Sleep
+            | ItemKind::Other(_) => return None,
+        };
+        if item.status.as_deref() != Some("declined")
+            || self.declined_by_via.contains(&item.id)
+            || self.denied.contains(&item.id)
+        {
+            return None;
+        }
+        self.denied.insert(&item.id);
+        Some(Denial {
+            kind,
+            target: item.target.clone().unwrap_or_default(),
+            reason: DENIAL_REASON.to_owned(),
+        })
     }
 
     fn terminal(&mut self, turn: &Turn, at: Instant) -> Result<Step, &'static str> {
@@ -301,10 +473,14 @@ impl TurnNormalizer {
         if !self.schema {
             return StructuredOutput::NotRequested;
         }
-        match self.final_text.take() {
-            None => StructuredOutput::Missing,
-            Some(text) => serde_json::from_str::<Box<RawValue>>(&text)
-                .map_or(StructuredOutput::NotJson, StructuredOutput::Json),
+        match std::mem::replace(&mut self.answer, Answer::Text(String::new())) {
+            Answer::OverLimit => StructuredOutput::OverLimit,
+            Answer::Text(text) if text.is_empty() => StructuredOutput::Missing,
+            Answer::Text(text) => match json_text(&text) {
+                Ok(json) => StructuredOutput::Json(json),
+                Err(JsonTextError::NotJson) => StructuredOutput::NotJson,
+                Err(JsonTextError::Limits) => StructuredOutput::OverLimit,
+            },
         }
     }
 
@@ -321,8 +497,10 @@ impl TurnNormalizer {
                 "outputTokens": total.output_tokens,
                 "reasoningOutputTokens": total.reasoning_output_tokens,
             },
-            "cacheWriteInputTokens": self.cache_write,
         });
+        if let CacheWrite::Sum(cache_write) = self.cache_write {
+            vendor["cacheWriteInputTokens"] = cache_write.into();
+        }
         if let Some(cache_write) = total.cache_write_input_tokens {
             vendor["total"]["cacheWriteInputTokens"] = cache_write.into();
         }
@@ -331,22 +509,6 @@ impl TurnNormalizer {
         }
         serde_json::value::to_raw_value(&vendor).ok()
     }
-}
-
-/// The marks of an item's start: model output, and a tool's ID and type.
-fn item_started(item: &Item) -> Option<ProgressMarks> {
-    let tools_started = if item.kind.is_tool() {
-        vec![(item.id.clone(), item.kind.as_str().to_owned())]
-    } else if matches!(item.kind, ItemKind::AgentMessage | ItemKind::Reasoning) {
-        Vec::new()
-    } else {
-        return None;
-    };
-    Some(ProgressMarks {
-        model: true,
-        tools_started,
-        ..ProgressMarks::default()
-    })
 }
 
 /// One model call's usage, keyless: Codex `last` samples add (AD6).

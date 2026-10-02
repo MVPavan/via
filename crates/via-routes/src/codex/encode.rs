@@ -30,6 +30,69 @@ pub const UNSUPPORTED_MESSAGE: &str = "Method not supported by VIA";
 /// decline with a body.
 const METHOD_NOT_FOUND: i64 = -32601;
 
+/// The ID of a request VIA writes: in the protocol's signed 64-bit range
+/// and never negative (review r1 #11).
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ClientId(i64);
+
+impl ClientId {
+    /// The ID's value.
+    pub fn get(self) -> i64 {
+        self.0
+    }
+
+    /// The ID as the server echoes it in its reply.
+    pub fn request_id(self) -> RequestId {
+        RequestId::Int(self.0)
+    }
+}
+
+impl TryFrom<i64> for ClientId {
+    type Error = EncodeError;
+
+    fn try_from(id: i64) -> Result<Self, Self::Error> {
+        if id < 0 {
+            Err(EncodeError("a negative request ID"))
+        } else {
+            Ok(Self(id))
+        }
+    }
+}
+
+/// One connection's request IDs, from 1 up. At the end of the range it
+/// retires for good: the connection can send no further request and fails,
+/// rather than wrap onto an ID a reply may still answer.
+#[derive(Debug)]
+pub struct ClientIds {
+    next: Option<i64>,
+}
+
+impl Default for ClientIds {
+    fn default() -> Self {
+        Self { next: Some(1) }
+    }
+}
+
+impl ClientIds {
+    /// An allocator whose first ID is `first`.
+    pub fn starting_at(first: ClientId) -> Self {
+        Self {
+            next: Some(first.0),
+        }
+    }
+
+    /// The next ID; `None` once the range is spent.
+    #[expect(
+        clippy::should_implement_trait,
+        reason = "an allocator, not an iterator: retirement is permanent"
+    )]
+    pub fn next(&mut self) -> Option<ClientId> {
+        let id = self.next?;
+        self.next = id.checked_add(1);
+        Some(ClientId(id))
+    }
+}
+
 /// A thread's `sandbox` mode at `thread/start` and `thread/resume`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -109,7 +172,7 @@ pub struct TurnStart<'a> {
 
 /// `initialize`: `clientInfo` only, with no experimental capability and
 /// no notification opt-out (packet §1, K17).
-pub fn initialize(id: u64, version: &str) -> Result<Vec<u8>, EncodeError> {
+pub fn initialize(id: ClientId, version: &str) -> Result<Vec<u8>, EncodeError> {
     request(
         id,
         "initialize",
@@ -123,7 +186,7 @@ pub fn initialized() -> Result<Vec<u8>, EncodeError> {
 }
 
 /// `model/list`, one page: the first, or the one `cursor` names.
-pub fn model_list(id: u64, cursor: Option<&str>) -> Result<Vec<u8>, EncodeError> {
+pub fn model_list(id: ClientId, cursor: Option<&str>) -> Result<Vec<u8>, EncodeError> {
     let mut params = Map::new();
     if let Some(cursor) = cursor {
         params.insert("cursor".to_owned(), json!(cursor));
@@ -133,7 +196,7 @@ pub fn model_list(id: u64, cursor: Option<&str>) -> Result<Vec<u8>, EncodeError>
 
 /// `thread/start` with the canonical settings, never ask, and a
 /// persistent thread (packet §3).
-pub fn thread_start(id: u64, settings: &ThreadSettings<'_>) -> Result<Vec<u8>, EncodeError> {
+pub fn thread_start(id: ClientId, settings: &ThreadSettings<'_>) -> Result<Vec<u8>, EncodeError> {
     let mut params = thread_params(settings)?;
     params.insert("ephemeral".to_owned(), json!(false));
     request(id, "thread/start", &Value::Object(params))
@@ -142,7 +205,7 @@ pub fn thread_start(id: u64, settings: &ThreadSettings<'_>) -> Result<Vec<u8>, E
 /// `thread/resume` of the exact stored thread, with the canonical settings
 /// and the current bound's sandbox, never hydrating history (packet §3).
 pub fn thread_resume(
-    id: u64,
+    id: ClientId,
     thread_id: &str,
     settings: &ThreadSettings<'_>,
 ) -> Result<Vec<u8>, EncodeError> {
@@ -155,11 +218,11 @@ pub fn thread_resume(
 /// `turn/start`, streamed by Wire with the prompt escaped slice by slice
 /// between the encoded members, so no second whole copy of it is made.
 pub fn turn_start(
-    id: u64,
+    id: ClientId,
     start: &TurnStart<'_>,
     prompt: String,
 ) -> Result<OutboundMessage, EncodeError> {
-    let head = json!({"id": id, "method": "turn/start"});
+    let head = json!({"id": id.get(), "method": "turn/start"});
     let thread_id = serde_json::to_string(start.thread_id).map_err(|_| EncodeError("thread"))?;
     let policy =
         serde_json::to_value(start.sandbox_policy).map_err(|_| EncodeError("a writable root"))?;
@@ -193,7 +256,7 @@ pub fn turn_start(
 
 /// `turn/steer` into the expected active turn (packet §3).
 pub fn turn_steer(
-    id: u64,
+    id: ClientId,
     thread_id: &str,
     expected_turn_id: &str,
     text: &str,
@@ -207,7 +270,11 @@ pub fn turn_steer(
 }
 
 /// `turn/interrupt` of one turn.
-pub fn turn_interrupt(id: u64, thread_id: &str, turn_id: &str) -> Result<Vec<u8>, EncodeError> {
+pub fn turn_interrupt(
+    id: ClientId,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<Vec<u8>, EncodeError> {
     request(
         id,
         "turn/interrupt",
@@ -216,7 +283,7 @@ pub fn turn_interrupt(id: u64, thread_id: &str, turn_id: &str) -> Result<Vec<u8>
 }
 
 /// `thread/unsubscribe`: one session's detach; never a stdin close.
-pub fn thread_unsubscribe(id: u64, thread_id: &str) -> Result<Vec<u8>, EncodeError> {
+pub fn thread_unsubscribe(id: ClientId, thread_id: &str) -> Result<Vec<u8>, EncodeError> {
     request(id, "thread/unsubscribe", &json!({"threadId": thread_id}))
 }
 
@@ -275,8 +342,8 @@ fn thread_params(settings: &ThreadSettings<'_>) -> Result<Map<String, Value>, En
 }
 
 /// A request line: `{"id", "method", "params"}`.
-fn request(id: u64, method: &str, params: &Value) -> Result<Vec<u8>, EncodeError> {
-    line(&json!({"id": id, "method": method, "params": params}))
+fn request(id: ClientId, method: &str, params: &Value) -> Result<Vec<u8>, EncodeError> {
+    line(&json!({"id": id.get(), "method": method, "params": params}))
 }
 
 /// One JSON line, LF-terminated.

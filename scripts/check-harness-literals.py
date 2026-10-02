@@ -348,14 +348,66 @@ def subwords(word):
     return [part.lower() for part in SUBWORD.findall(word)]
 
 
+SIMPLE_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", "\\": "\\", "0": "\0", "'": "'", '"': '"'}
+HEX_ESCAPE = re.compile(r"x([0-9A-Fa-f]{2})")
+UNICODE_ESCAPE = re.compile(r"u\{([0-9A-Fa-f_]{1,8})\}")
+
+
+def literal_chars(token):
+    """`(start, end, char)` of a string literal's value, in source offsets.
+
+    A non-raw literal's escapes are decoded as Rust reads them, so an
+    escaped name is the name it spells; a raw literal is its text. An
+    escape this does not know stays as its source characters.
+    """
+    text = token.text
+    if RAW_STRING.match(text):
+        return [(token.offset + i, token.offset + i + 1, ch) for i, ch in enumerate(text)]
+    chars = []
+    i = text.index('"') + 1
+    end = len(text) - 1 if len(text) > i and text.endswith('"') else len(text)
+    while i < end:
+        start = i
+        if text[i] != "\\" or i + 1 >= end:
+            chars.append((token.offset + i, token.offset + i + 1, text[i]))
+            i += 1
+            continue
+        escape = text[i + 1]
+        if escape in SIMPLE_ESCAPES:
+            value, i = SIMPLE_ESCAPES[escape], i + 2
+        elif (hexa := HEX_ESCAPE.match(text, i + 1)) is not None:
+            value, i = chr(int(hexa.group(1), 16)), hexa.end()
+        elif (uni := UNICODE_ESCAPE.match(text, i + 1)) is not None:
+            code = int(uni.group(1).replace("_", ""), 16)
+            value, i = (chr(code) if code <= 0x10FFFF else "?"), uni.end()
+        elif escape == "\n":
+            # A line continuation: the newline and the whitespace after it.
+            i += 2
+            while i < end and text[i].isspace():
+                i += 1
+            continue
+        else:
+            chars.append((token.offset + i, token.offset + i + 1, text[i]))
+            i += 1
+            continue
+        chars.append((token.offset + start, token.offset + i, value))
+    return chars
+
+
 def words(token):
-    """Yield `(offset, word)` for each identifier, string or comment word."""
+    """Yield `(start, end, word)` for each identifier, string or comment word."""
     if token.kind == "ident":
         prefix = 2 if token.text.startswith("r#") else 0
-        yield token.offset + prefix, token.text[prefix:]
-    elif token.kind in ("str", "comment"):
+        yield token.offset + prefix, token.offset + len(token.text), token.text[prefix:]
+    elif token.kind == "comment":
         for match in WORD.finditer(token.text):
-            yield token.offset + match.start(), match.group()
+            yield token.offset + match.start(), token.offset + match.end(), match.group()
+    elif token.kind == "str":
+        chars = literal_chars(token)
+        value = "".join(ch for _, _, ch in chars)
+        # Each decoded character is one of `value`'s characters, in order.
+        for match in WORD.finditer(value):
+            yield chars[match.start()][0], chars[match.end() - 1][1], match.group()
 
 
 def matched_names(parts, names):
@@ -604,11 +656,11 @@ def scan(root, path, source, tokens, regions, names, allowed):
     for index, token in enumerate(tokens):
         if in_regions(index, regions):
             continue
-        for offset, word in words(token):
+        for offset, end, word in words(token):
             for name in matched_names(subwords(word), names):
                 line = bisect.bisect_right(line_starts, offset)
                 column = offset - line_starts[line - 1]
-                spans.setdefault((line, name), []).append((column, column + len(word)))
+                spans.setdefault((line, name), []).append((column, column + end - offset))
     entries = [sub for a_path, sub in allowed if a_path == relative]
     findings = []
     for (line, name), found in sorted(spans.items()):
@@ -702,6 +754,28 @@ fn after_raw_openai() {}
             (CORE + "lib.rs", "const B", "claude"),
             (CORE + "lib.rs", "codex_after_quote", "codex"),
             (CORE + "lib.rs", "after_raw_openai", "openai"),
+        ],
+    },
+    {
+        "name": "string escapes",
+        "files": {
+            CORE + "lib.rs": """\
+const A: &str = "co\\u{64}ex";
+const B: &str = "co\\x64ex";
+const C: &[u8] = b"\\x63laude";
+const D: &str = "co\\\\x64ex";
+const E: &str = "open\\
+    ai";
+const F: &str = "fa\\u{6B}e\\n";
+const G: &str = r"co\\x64ex";
+""",
+        },
+        "expect": [
+            (CORE + "lib.rs", "const A", "codex"),
+            (CORE + "lib.rs", "const B", "codex"),
+            (CORE + "lib.rs", "const C", "claude"),
+            (CORE + "lib.rs", "const E", "openai"),
+            (CORE + "lib.rs", "const F", "fake"),
         ],
     },
     {

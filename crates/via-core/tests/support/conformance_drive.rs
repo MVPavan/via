@@ -18,7 +18,7 @@
 //!    of the turn-1 values; a refusal is that turn's `plan_refusal`, in the
 //!    C2 name of its `RefusalKind`;
 //! 3. records `launches`, the checkpoints and `pure_writes` from the case's
-//!    directories.
+//!    directories; `pure_writes` spans steps 1 and 2.
 //!
 //! The turns that plan run in the run half (the route's driver), which
 //! [`Pure::planned_only`] does not have: it finishes only a case whose
@@ -95,9 +95,10 @@ impl Pure {
         let before = pure.listing(&fixtures)?;
         pure.pure_operations(harness, expect)?;
         pure.outcome.checkpoints.after_pure = pure.launches()?;
+        // The spawn plans are pure too: the interval covers them.
+        pure.open_sessions(harness, expect)?;
         let after = pure.listing(&fixtures)?;
         pure.outcome.pure_writes = changed(&before, &after);
-        pure.open_sessions(harness, expect)?;
         Ok(pure)
     }
 

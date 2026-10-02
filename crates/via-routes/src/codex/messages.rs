@@ -77,6 +77,8 @@ pub struct ServerRequest {
     pub thread_id: Option<String>,
     /// `params.turnId`, when present.
     pub turn_id: Option<String>,
+    /// `params.itemId`, when present: the item an approval request is for.
+    pub item_id: Option<String>,
 }
 
 /// A notification, typed by method.
@@ -201,6 +203,9 @@ pub struct Item {
     pub phase: Option<String>,
     /// A tool item's status.
     pub status: Option<String>,
+    /// What a command or file-change item acts on: the command, or the
+    /// first changed path; cut to [`SHORT_FIELD_MAX`] bytes.
+    pub target: Option<String>,
 }
 
 /// A thread item's `type`.
@@ -226,13 +231,15 @@ pub enum ItemKind {
     WebSearch,
     /// `imageGeneration`.
     ImageGeneration,
+    /// `sleep`: the interruptible `clock.sleep` tool.
+    Sleep,
     /// Any other type, by name.
     Other(String),
 }
 
 /// The tool item types: a started one is `tools_started`, a completed one
 /// `tools_ended` (packet §5).
-const TOOL_KINDS: [(&str, ItemKind); 7] = [
+const TOOL_KINDS: [(&str, ItemKind); 8] = [
     ("commandExecution", ItemKind::CommandExecution),
     ("fileChange", ItemKind::FileChange),
     ("mcpToolCall", ItemKind::McpToolCall),
@@ -240,6 +247,7 @@ const TOOL_KINDS: [(&str, ItemKind); 7] = [
     ("collabAgentToolCall", ItemKind::CollabAgentToolCall),
     ("webSearch", ItemKind::WebSearch),
     ("imageGeneration", ItemKind::ImageGeneration),
+    ("sleep", ItemKind::Sleep),
 ];
 
 impl ItemKind {
@@ -268,7 +276,8 @@ impl ItemKind {
             | Self::DynamicToolCall
             | Self::CollabAgentToolCall
             | Self::WebSearch
-            | Self::ImageGeneration => TOOL_KINDS
+            | Self::ImageGeneration
+            | Self::Sleep => TOOL_KINDS
                 .iter()
                 .find(|(_, kind)| kind == self)
                 .map_or("", |(name, _)| name),
@@ -284,7 +293,8 @@ impl ItemKind {
             | Self::DynamicToolCall
             | Self::CollabAgentToolCall
             | Self::WebSearch
-            | Self::ImageGeneration => true,
+            | Self::ImageGeneration
+            | Self::Sleep => true,
             Self::UserMessage | Self::AgentMessage | Self::Reasoning | Self::Other(_) => false,
         }
     }
@@ -389,16 +399,12 @@ pub struct Model {
     /// The model name `thread/start` takes.
     pub model: String,
     /// The efforts it advertises.
-    #[serde(default)]
     pub supported_reasoning_efforts: Vec<EffortOption>,
-    /// Its default effort, when stated.
-    #[serde(default)]
-    pub default_reasoning_effort: Option<String>,
+    /// Its default effort.
+    pub default_reasoning_effort: String,
     /// Whether the catalog hides it.
-    #[serde(default)]
     pub hidden: bool,
     /// Whether it is the catalog's default.
-    #[serde(default)]
     pub is_default: bool,
 }
 
@@ -474,16 +480,89 @@ pub enum UnsubscribeStatus {
     NotLoaded,
 }
 
-/// A paired result, typed once the pairing knows its method.
-pub fn result<T: DeserializeOwned>(raw: &RawValue) -> Result<T, DecodeError> {
-    serde_json::from_str(raw.get()).map_err(|_| DecodeError("a result does not match its method"))
+/// A result's retained fields within their bounds (review r1 #4).
+pub trait Checked {
+    /// An error when a retained short field is past [`SHORT_FIELD_MAX`].
+    fn check(&self) -> Result<(), DecodeError>;
 }
 
-/// The envelope every message shares.
+impl Checked for InitializeResult {
+    fn check(&self) -> Result<(), DecodeError> {
+        fits(&[&self.user_agent])
+    }
+}
+
+impl Checked for ModelListResult {
+    fn check(&self) -> Result<(), DecodeError> {
+        if let Some(cursor) = &self.next_cursor {
+            fits(&[cursor])?;
+        }
+        self.data.iter().try_for_each(|model| {
+            fits(&[&model.model, &model.default_reasoning_effort])?;
+            model
+                .supported_reasoning_efforts
+                .iter()
+                .try_for_each(|effort| fits(&[&effort.reasoning_effort]))
+        })
+    }
+}
+
+impl Checked for ThreadResult {
+    fn check(&self) -> Result<(), DecodeError> {
+        fits(&[&self.thread.id, &self.model])
+    }
+}
+
+impl Checked for TurnStartResult {
+    fn check(&self) -> Result<(), DecodeError> {
+        fits(&[&self.turn.id])
+    }
+}
+
+impl Checked for TurnSteerResult {
+    fn check(&self) -> Result<(), DecodeError> {
+        fits(&[&self.turn_id])
+    }
+}
+
+impl Checked for UnsubscribeResult {
+    fn check(&self) -> Result<(), DecodeError> {
+        Ok(())
+    }
+}
+
+/// A paired result, typed once the pairing knows its method: within the
+/// structure limits, matching its method, its short fields bounded.
+pub fn result<T: DeserializeOwned + Checked>(raw: &RawValue) -> Result<T, DecodeError> {
+    limits(raw.get().as_bytes())?;
+    let typed: T = serde_json::from_str(raw.get())
+        .map_err(|_| DecodeError("a result does not match its method"))?;
+    typed.check()?;
+    Ok(typed)
+}
+
+/// Review r1 #2: the structure limits, before any serde pass.
+fn limits(bytes: &[u8]) -> Result<(), DecodeError> {
+    via_wire::json_limits::scan(bytes)
+        .map(drop)
+        .map_err(|_| DecodeError("a message past the JSON structure limits"))
+}
+
+/// Every field within [`SHORT_FIELD_MAX`].
+fn fits(fields: &[&str]) -> Result<(), DecodeError> {
+    if fields.iter().any(|field| field.len() > SHORT_FIELD_MAX) {
+        Err(DecodeError("a field longer than its bound"))
+    } else {
+        Ok(())
+    }
+}
+
+/// The envelope every message shares. `id` is kept raw so that an
+/// explicit `null` is told from an absent member.
 #[derive(Deserialize)]
-struct Envelope {
-    #[serde(default)]
-    id: Option<RequestId>,
+struct RawEnvelope {
+    #[serde(default, deserialize_with = "present")]
+    id: Option<Box<RawValue>>,
     #[serde(default)]
     method: Option<String>,
     #[serde(default)]
@@ -496,8 +575,16 @@ struct Envelope {
 
 /// Decodes one line the server wrote.
 pub fn decode(line: &[u8]) -> Result<Incoming, DecodeError> {
-    let envelope: Envelope =
+    limits(line)?;
+    let raw: RawEnvelope =
         serde_json::from_slice(line).map_err(|_| DecodeError("not a JSON-RPC message"))?;
+    let envelope = Envelope {
+        id: raw.id.as_deref().map(request_id).transpose()?,
+        method: raw.method,
+        params: raw.params,
+        result: raw.result,
+        error: raw.error,
+    };
     match envelope {
         Envelope {
             id: Some(id),
@@ -530,8 +617,9 @@ pub fn decode(line: &[u8]) -> Result<Incoming, DecodeError> {
             Ok(Incoming::Request(ServerRequest {
                 id,
                 method: short(method)?,
-                thread_id: ids.thread_id.map(short).transpose()?,
-                turn_id: ids.turn_id.map(short).transpose()?,
+                thread_id: ids.thread.map(short).transpose()?,
+                turn_id: ids.turn.map(short).transpose()?,
+                item_id: ids.item.map(short).transpose()?,
             }))
         }
         Envelope {
@@ -545,6 +633,26 @@ pub fn decode(line: &[u8]) -> Result<Incoming, DecodeError> {
             "neither a response, a request nor a notification",
         )),
     }
+}
+
+/// The envelope, its ID typed.
+struct Envelope {
+    id: Option<RequestId>,
+    method: Option<String>,
+    params: Option<Box<RawValue>>,
+    result: Option<Box<RawValue>>,
+    error: Option<RpcError>,
+}
+
+/// A present `id`: an integer or a bounded string; `null` or any other
+/// shape is no envelope.
+fn request_id(raw: &RawValue) -> Result<RequestId, DecodeError> {
+    let id: RequestId =
+        serde_json::from_str(raw.get()).map_err(|_| DecodeError("an ID that is not one"))?;
+    if let RequestId::Str(text) = &id {
+        fits(&[text])?;
+    }
+    Ok(id)
 }
 
 /// Types a notification by method.
@@ -582,7 +690,7 @@ fn notification(method: String, raw: Option<&RawValue>) -> Result<Notification, 
             let mut method = method;
             truncate(&mut method, UNKNOWN_TAG_MAX);
             let thread_id = loose_ids(raw)
-                .thread_id
+                .thread
                 .filter(|id| id.len() <= SHORT_FIELD_MAX);
             return Ok(Notification::Unknown { method, thread_id });
         }
@@ -602,6 +710,7 @@ fn item_event(params: &str) -> Result<ItemEvent, DecodeError> {
         item: RawItem,
     }
     #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
     struct RawItem {
         #[serde(rename = "type")]
         kind: String,
@@ -612,23 +721,102 @@ fn item_event(params: &str) -> Result<ItemEvent, DecodeError> {
         phase: Option<String>,
         #[serde(default)]
         status: Option<String>,
+        #[serde(default)]
+        command: Option<String>,
+        #[serde(default)]
+        changes: Option<Vec<RawChange>>,
+        #[serde(default)]
+        duration_ms: Option<u64>,
+    }
+    #[derive(Deserialize)]
+    struct RawChange {
+        path: String,
     }
     let raw: Raw = serde_json::from_str(params).map_err(|_| DecodeError("an item event"))?;
-    let kind = ItemKind::parse(&short(raw.item.kind)?);
-    if kind == ItemKind::AgentMessage && raw.item.text.is_none() {
-        return Err(DecodeError("an agentMessage item without text"));
+    let item = raw.item;
+    let kind = ItemKind::parse(&short(item.kind)?);
+    let status = item.status.map(short).transpose()?;
+    check_status(&kind, status.as_deref())?;
+    let mut target = match kind {
+        ItemKind::CommandExecution => Some(
+            item.command
+                .ok_or(DecodeError("a commandExecution item without its command"))?,
+        ),
+        ItemKind::FileChange => item
+            .changes
+            .ok_or(DecodeError("a fileChange item without its changes"))?
+            .into_iter()
+            .next()
+            .map(|change| change.path),
+        ItemKind::AgentMessage => {
+            if item.text.is_none() {
+                return Err(DecodeError("an agentMessage item without text"));
+            }
+            if item
+                .phase
+                .as_deref()
+                .is_some_and(|phase| !["commentary", "final_answer"].contains(&phase))
+            {
+                return Err(DecodeError("an agentMessage item with an unknown phase"));
+            }
+            None
+        }
+        ItemKind::Sleep => {
+            item.duration_ms
+                .ok_or(DecodeError("a sleep item without its duration"))?;
+            None
+        }
+        ItemKind::UserMessage
+        | ItemKind::Reasoning
+        | ItemKind::McpToolCall
+        | ItemKind::DynamicToolCall
+        | ItemKind::CollabAgentToolCall
+        | ItemKind::WebSearch
+        | ItemKind::ImageGeneration
+        | ItemKind::Other(_) => None,
+    };
+    if let Some(target) = &mut target {
+        truncate(target, SHORT_FIELD_MAX);
     }
     Ok(ItemEvent {
         thread_id: raw.thread_id,
         turn_id: raw.turn_id,
         item: Item {
-            id: raw.item.id,
+            id: item.id,
             kind,
-            text: raw.item.text,
-            phase: raw.item.phase,
-            status: raw.item.status,
+            text: item.text,
+            phase: item.phase,
+            status,
+            target,
         },
     })
+}
+
+/// A tool item's status against its schema: required, and one of its
+/// type's values where the schema lists them.
+fn check_status(kind: &ItemKind, status: Option<&str>) -> Result<(), DecodeError> {
+    let allowed: &[&str] = match kind {
+        ItemKind::CommandExecution | ItemKind::FileChange => {
+            &["inProgress", "completed", "failed", "declined"]
+        }
+        ItemKind::McpToolCall | ItemKind::DynamicToolCall => &["inProgress", "completed", "failed"],
+        ItemKind::CollabAgentToolCall => &["inProgress", "completed", "failed", "interrupted"],
+        // Any status, but one is required.
+        ItemKind::ImageGeneration => &[],
+        ItemKind::UserMessage
+        | ItemKind::AgentMessage
+        | ItemKind::Reasoning
+        | ItemKind::WebSearch
+        | ItemKind::Sleep
+        | ItemKind::Other(_) => return Ok(()),
+    };
+    match status {
+        None => Err(DecodeError("a tool item without its status")),
+        Some(status) if !allowed.is_empty() && !allowed.contains(&status) => {
+            Err(DecodeError("a tool item with an unknown status"))
+        }
+        Some(_) => Ok(()),
+    }
 }
 
 /// The thread of a notification whose params need only `threadId`.
@@ -669,18 +857,20 @@ fn check_ids(notification: &Notification) -> Result<(), DecodeError> {
 
 /// `threadId` and `turnId` of params of any shape, when they are strings.
 struct LooseIds {
-    thread_id: Option<String>,
-    turn_id: Option<String>,
+    thread: Option<String>,
+    turn: Option<String>,
+    item: Option<String>,
 }
 
 fn loose_ids(params: Option<&RawValue>) -> LooseIds {
     #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
     struct Raw {
-        #[serde(default)]
-        thread_id: Option<Value>,
-        #[serde(default)]
-        turn_id: Option<Value>,
+        #[serde(default, rename = "threadId")]
+        thread: Option<Value>,
+        #[serde(default, rename = "turnId")]
+        turn: Option<Value>,
+        #[serde(default, rename = "itemId")]
+        item: Option<Value>,
     }
     let raw = params.and_then(|params| serde_json::from_str::<Raw>(params.get()).ok());
     let text = |value: Option<Value>| match value {
@@ -689,12 +879,14 @@ fn loose_ids(params: Option<&RawValue>) -> LooseIds {
     };
     match raw {
         Some(raw) => LooseIds {
-            thread_id: text(raw.thread_id),
-            turn_id: text(raw.turn_id),
+            thread: text(raw.thread),
+            turn: text(raw.turn),
+            item: text(raw.item),
         },
         None => LooseIds {
-            thread_id: None,
-            turn_id: None,
+            thread: None,
+            turn: None,
+            item: None,
         },
     }
 }
@@ -719,32 +911,59 @@ fn truncate(text: &mut String, max: usize) {
     }
 }
 
-/// `codexErrorInfo`: a string code or a one-member object; null or any
-/// other shape is none.
+/// `codexErrorInfo`: null, a bounded string code, or a one-member object
+/// whose value is an object with an optional `httpStatusCode` (uint16 or
+/// null). Any other shape is malformed (review r1 #3).
 fn error_info<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<CodexErrorInfo>, D::Error> {
-    Ok(match Value::deserialize(deserializer)? {
-        Value::String(kind) => Some(CodexErrorInfo {
-            kind,
-            http_status: None,
-        }),
+    use serde::de::Error as _;
+    let malformed = || D::Error::custom("malformed codexErrorInfo");
+    let (kind, http_status) = match Value::deserialize(deserializer)? {
+        Value::Null => return Ok(None),
+        Value::String(kind) => (kind, None),
         Value::Object(map) if map.len() == 1 => {
-            map.into_iter().next().map(|(kind, detail)| CodexErrorInfo {
-                kind,
-                http_status: detail
-                    .get("httpStatusCode")
-                    .and_then(Value::as_u64)
-                    .and_then(|code| u16::try_from(code).ok()),
-            })
+            let (kind, detail) = map.into_iter().next().ok_or_else(malformed)?;
+            let Value::Object(detail) = detail else {
+                return Err(malformed());
+            };
+            let http_status = match detail.get("httpStatusCode") {
+                None | Some(Value::Null) => None,
+                Some(code) => Some(
+                    code.as_u64()
+                        .and_then(|code| u16::try_from(code).ok())
+                        .ok_or_else(malformed)?,
+                ),
+            };
+            (kind, http_status)
         }
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::Array(_) | Value::Object(_) => {
-            None
+        Value::Bool(_) | Value::Number(_) | Value::Array(_) | Value::Object(_) => {
+            return Err(malformed());
         }
-    })
+    };
+    if kind.len() > SHORT_FIELD_MAX {
+        return Err(malformed());
+    }
+    Ok(Some(CodexErrorInfo { kind, http_status }))
 }
 
 /// A member that is present, null included, is `Some`.
 fn present<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Box<RawValue>>, D::Error> {
     Box::<RawValue>::deserialize(deserializer).map(Some)
+}
+
+/// Why a route's JSON text is not structured output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JsonTextError {
+    /// Past the structure limits (depth 64, 65,536 nodes).
+    Limits,
+    /// Not one JSON value.
+    NotJson,
+}
+
+/// `text` as one JSON value, checked against the structure limits before
+/// it is parsed.
+pub fn json_text(text: &str) -> Result<Box<RawValue>, JsonTextError> {
+    via_wire::json_limits::scan(text.as_bytes()).map_err(|_| JsonTextError::Limits)?;
+    serde_json::from_str(text).map_err(|_| JsonTextError::NotJson)
 }

@@ -19,7 +19,9 @@ use super::normalize::{
 use crate::VendorTerminalStatus;
 use crate::config::BootstrapEnv;
 use crate::instance::BinaryIdentity;
-use crate::observation::{ClassHint, Observation, ProgressMarks, StopReason, UsageSample};
+use crate::observation::{
+    ClassHint, DenialKind, Observation, ProgressMarks, StopReason, UsageSample,
+};
 use crate::plan::{Inherit, InheritState, VersionStatus};
 
 fn fixtures() -> PathBuf {
@@ -607,6 +609,7 @@ fn a_declined_request_is_reported_by_method() {
         method: "item/fileChange/requestApproval".to_owned(),
         thread_id: Some("t".to_owned()),
         turn_id: Some("u".to_owned()),
+        item_id: Some("i".to_owned()),
     };
     let declined = decline(&request);
     assert_eq!(declined.vendor_method, "item/fileChange/requestApproval");
@@ -667,4 +670,271 @@ fn a_resume_turn_is_checked() {
             .kind,
         RefusalKind::BoundUnsupported
     );
+}
+
+/// One synthetic notification, decoded as the server's would be.
+fn note(line: &Value) -> Notification {
+    match decode(line.to_string().as_bytes()).unwrap() {
+        Incoming::Notification(notification) => notification,
+        Incoming::Response(_) | Incoming::Request(_) => panic!("not a notification"),
+    }
+}
+
+fn final_answer(id: &str, text: &str) -> Notification {
+    note(
+        &json!({"method": "item/completed", "params": {"threadId": "t", "turnId": "u",
+        "item": {"type": "agentMessage", "id": id, "text": text, "phase": "final_answer"}}}),
+    )
+}
+
+fn completed(status: &str) -> Notification {
+    note(
+        &json!({"method": "turn/completed", "params": {"threadId": "t",
+        "turn": {"id": "u", "items": [], "status": status}}}),
+    )
+}
+
+fn usage(cache_write: Option<i64>) -> Notification {
+    let mut breakdown = json!({"totalTokens": 1, "inputTokens": 1, "cachedInputTokens": 0,
+        "outputTokens": 0, "reasoningOutputTokens": 0});
+    if let Some(cache_write) = cache_write {
+        breakdown["cacheWriteInputTokens"] = cache_write.into();
+    }
+    note(
+        &json!({"method": "thread/tokenUsage/updated", "params": {"threadId": "t",
+        "turnId": "u", "tokenUsage": {"total": breakdown, "last": breakdown}}}),
+    )
+}
+
+/// The structured output of a turn whose final answers are `texts`.
+fn structured_of(schema: bool, texts: &[&str]) -> StructuredOutput {
+    let mut normalizer = TurnNormalizer::new(schema);
+    for (n, text) in texts.iter().enumerate() {
+        normalizer
+            .observe(&final_answer(&format!("m{n}"), text), Instant::now())
+            .unwrap();
+    }
+    match normalizer
+        .observe(&completed("completed"), Instant::now())
+        .unwrap()
+    {
+        Step::Terminal { structured, .. } => structured,
+        Step::Observations(_) | Step::Activity => panic!("no terminal"),
+    }
+}
+
+/// Review r1 #1: with no schema nothing of the final text is retained (it
+/// streams as pieces only); with one, up to 4 MiB, then `OverLimit`.
+#[test]
+fn final_text_retention_is_bounded() {
+    let mib = "x".repeat(1024 * 1024);
+    let mut plain = TurnNormalizer::new(false);
+    let mut schema = TurnNormalizer::new(true);
+    for n in 0..3 {
+        let answer = final_answer(&format!("m{n}"), &mib);
+        let Step::Observations(pieces) = plain.observe(&answer, Instant::now()).unwrap() else {
+            panic!("final text pieces");
+        };
+        assert!(!pieces.is_empty());
+        schema.observe(&answer, Instant::now()).unwrap();
+    }
+    assert_eq!(plain.retained(), 0);
+    assert_eq!(schema.retained(), 3 * mib.len());
+    assert_eq!(
+        structured_of(true, &[&mib, &mib, &mib, &mib]),
+        StructuredOutput::NotJson,
+        "4 MiB exactly is kept"
+    );
+    let mut over = TurnNormalizer::new(true);
+    for n in 0..5 {
+        over.observe(&final_answer(&format!("m{n}"), &mib), Instant::now())
+            .unwrap();
+    }
+    assert_eq!(over.retained(), 0, "the accumulation is dropped");
+    assert_eq!(
+        structured_of(true, &[&mib, &mib, &mib, &mib, "x"]),
+        StructuredOutput::OverLimit
+    );
+    let deep = format!("{}{}", "[".repeat(65), "]".repeat(65));
+    assert_eq!(structured_of(true, &[&deep]), StructuredOutput::OverLimit);
+}
+
+/// Review r1 #6: an empty assembled answer is `Missing`, not `NotJson`.
+#[test]
+fn an_empty_final_answer_is_missing() {
+    assert_eq!(structured_of(true, &[""]), StructuredOutput::Missing);
+    assert_eq!(structured_of(true, &["", ""]), StructuredOutput::Missing);
+    assert_eq!(
+        structured_of(true, &["", "{}"]),
+        StructuredOutput::Json(serde_json::value::RawValue::from_string("{}".to_owned()).unwrap())
+    );
+}
+
+/// Review r1 #5: usage accumulation never wraps or panics: an overflow is
+/// a normalizer failure.
+#[test]
+fn usage_overflow_is_an_error() {
+    let mut normalizer = TurnNormalizer::new(false);
+    normalizer
+        .observe(&usage(Some(i64::MAX)), Instant::now())
+        .unwrap();
+    normalizer
+        .observe(&usage(Some(i64::MAX)), Instant::now())
+        .unwrap();
+    assert!(
+        normalizer
+            .observe(&usage(Some(i64::MAX)), Instant::now())
+            .is_err()
+    );
+}
+
+/// Review r1 #9: an unavailable cache-write count is never reported as 0:
+/// the aggregate is omitted when any sample lacks it.
+#[test]
+fn an_unavailable_cache_write_count_is_omitted() {
+    let vendor = |samples: &[Option<i64>]| {
+        let mut normalizer = TurnNormalizer::new(false);
+        for sample in samples {
+            normalizer.observe(&usage(*sample), Instant::now()).unwrap();
+        }
+        let Step::Terminal { terminal, .. } = normalizer
+            .observe(&completed("completed"), Instant::now())
+            .unwrap()
+        else {
+            panic!("a terminal");
+        };
+        serde_json::from_str::<Value>(terminal.vendor.unwrap().get()).unwrap()
+    };
+    assert_eq!(vendor(&[Some(2), Some(3)])["cacheWriteInputTokens"], 5);
+    for samples in [&[Some(2), None][..], &[None, Some(3)], &[None]] {
+        let vendor = vendor(samples);
+        assert!(vendor.get("cacheWriteInputTokens").is_none(), "{vendor}");
+        assert_eq!(
+            vendor["total"]
+                .get("cacheWriteInputTokens")
+                .is_some_and(Value::is_number),
+            samples.last().unwrap().is_some()
+        );
+    }
+}
+
+fn tool_item(kind: &str, id: &str, status: &str) -> Value {
+    match kind {
+        "commandExecution" => json!({"type": kind, "id": id, "command": "rm -rf build",
+            "cwd": "/w", "commandActions": [], "status": status}),
+        "fileChange" => json!({"type": kind, "id": id, "status": status,
+            "changes": [{"path": "/w/a.txt", "kind": {"type": "add"}, "diff": ""}]}),
+        "sleep" => json!({"type": kind, "id": id, "durationMs": 75_000}),
+        _ => panic!("{kind}"),
+    }
+}
+
+fn item(method: &str, item: &Value) -> Notification {
+    note(&json!({"method": method, "params": {"threadId": "t", "turnId": "u", "item": item}}))
+}
+
+fn denials(observations: &[Observation]) -> Vec<(DenialKind, String, String)> {
+    observations
+        .iter()
+        .filter_map(|observation| {
+            if let Observation::ActionDenied(denial) = observation {
+                Some((denial.kind, denial.target.clone(), denial.reason.clone()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn observed(normalizer: &mut TurnNormalizer, notification: &Notification) -> Vec<Observation> {
+    match normalizer.observe(notification, Instant::now()).unwrap() {
+        Step::Observations(observations) => observations,
+        Step::Terminal { .. } | Step::Activity => Vec::new(),
+    }
+}
+
+/// Review r1 #7: a command or file-change item the vendor declined is
+/// `action.denied` (C1 Q9, as the Claude adapter maps it), once per item;
+/// one VIA's own decline caused is not.
+#[test]
+fn a_declined_item_is_a_denial() {
+    let reason = "denied by the vendor's permission policy".to_owned();
+    let mut normalizer = TurnNormalizer::new(false);
+    let command = item(
+        "item/completed",
+        &tool_item("commandExecution", "c1", "declined"),
+    );
+    let observations = observed(&mut normalizer, &command);
+    assert_eq!(
+        denials(&observations),
+        [(
+            DenialKind::Command,
+            "rm -rf build".to_owned(),
+            reason.clone()
+        )]
+    );
+    assert!(observations.iter().any(|o| matches!(
+        o, Observation::Progress(marks) if marks.tools_ended == ["c1".to_owned()]
+    )));
+    assert!(
+        denials(&observed(&mut normalizer, &command)).is_empty(),
+        "once per item"
+    );
+    let file = item("item/completed", &tool_item("fileChange", "f1", "declined"));
+    assert_eq!(
+        denials(&observed(&mut normalizer, &file)),
+        [(DenialKind::FileWrite, "/w/a.txt".to_owned(), reason)]
+    );
+    let failed = item(
+        "item/completed",
+        &tool_item("commandExecution", "c2", "failed"),
+    );
+    assert!(denials(&observed(&mut normalizer, &failed)).is_empty());
+
+    let mut ours = TurnNormalizer::new(false);
+    ours.note_decline(&ServerRequest {
+        id: RequestId::Int(4),
+        method: "item/commandExecution/requestApproval".to_owned(),
+        thread_id: Some("t".to_owned()),
+        turn_id: Some("u".to_owned()),
+        item_id: Some("c1".to_owned()),
+    });
+    assert!(
+        denials(&observed(&mut ours, &command)).is_empty(),
+        "VIA's own decline is reported as vendor.request_declined only"
+    );
+}
+
+/// Review r1 #8: a `sleep` item is a tool: started, it is open, and an
+/// interrupted terminal with it still open is not quiescent.
+#[test]
+fn an_open_sleep_is_an_open_tool() {
+    let mut normalizer = TurnNormalizer::new(false);
+    let started = observed(
+        &mut normalizer,
+        &item("item/started", &tool_item("sleep", "s1", "")),
+    );
+    assert!(started.iter().any(|o| matches!(
+        o,
+        Observation::Progress(marks)
+            if marks.tools_started == [("s1".to_owned(), "sleep".to_owned())]
+    )));
+    let Step::Terminal { terminal, .. } = normalizer
+        .observe(&completed("interrupted"), Instant::now())
+        .unwrap()
+    else {
+        panic!("a terminal");
+    };
+    assert_eq!(terminal.status, VendorTerminalStatus::Interrupted);
+    assert!(normalizer.tools_open(), "the sleep is still open");
+    let mut closed = TurnNormalizer::new(false);
+    observed(
+        &mut closed,
+        &item("item/started", &tool_item("sleep", "s1", "")),
+    );
+    observed(
+        &mut closed,
+        &item("item/completed", &tool_item("sleep", "s1", "")),
+    );
+    assert!(!closed.tools_open());
 }
