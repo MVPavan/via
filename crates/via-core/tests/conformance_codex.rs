@@ -1353,10 +1353,13 @@ fn sigterm() -> Value {
 /// discovered its catalog, `models --harness codex` lists it as
 /// `discovered`, a model-only plan resolves Codex from it, and a plan
 /// naming no model takes its default. Before discovery there is none.
+/// The session stays open until shutdown, so its server is live when the
+/// checks run (fix r2 #11: a retired instance's catalog is gone).
 #[test]
 fn codex_discovery_feeds_models() {
     let name = "codex_discovery_feeds_models";
-    let (replay, expect) = plain(name).unwrap();
+    let (replay, mut expect) = plain(name).unwrap();
+    expect["sessions"]["main"]["close"] = Value::Null;
     let pure = |set: &via_adapters::AdapterSet| -> Result<(), String> {
         let models = serde_json::to_value(set.models(Some("codex"))).map_err(|e| e.to_string())?;
         let want = json!([
@@ -2270,10 +2273,15 @@ fn connection_task_panic_with_staged_terminal() {
     turn["observations_exclude"] = json!(["turn.late_terminal"]);
     expect["sessions"]["main"]["close"] = Value::Null;
     expect["sessions"]["main"]["health"] = json!({"state": "failed", "first_cause": "owned_task"});
-    variant(
+    let knobs = conformance_run::Knobs {
+        panicked_tasks: 1,
+        ..conformance_run::Knobs::default()
+    };
+    check_variant(
         "connection_task_panic_with_staged_terminal",
         &replay,
         &expect,
+        knobs,
     )
     .unwrap();
 }
@@ -2298,6 +2306,7 @@ fn connection_task_panic_idle_driver_reports_loss() {
     expect["sessions"]["main"]["health"] = json!({"state": "failed", "first_cause": "owned_task"});
     let knobs = conformance_run::Knobs {
         await_failure: true,
+        panicked_tasks: 1,
         ..conformance_run::Knobs::default()
     };
     check_variant(
@@ -2603,4 +2612,78 @@ fn codex_acceptance_is_in_the_decode_fence() {
         }
     })
     .unwrap();
+}
+
+/// C2 §5 (x.3.2 X3 fix r2 #11): the catalog belongs to the live server
+/// instance that discovered it. Session `first` runs c7's turn 1 (its
+/// effort refused after its server discovered the catalog) and closes,
+/// which retires the server. Session `main`, on the same server key,
+/// launches a second server, which discovers the catalog again (lifetime
+/// 2 expects its `model/list`); `main`'s resumed `ultra` turn is refused
+/// from that catalog while the server lives. Once `main` closed too, its
+/// server retired and `models` lists nothing: a retired instance's
+/// catalog is gone.
+#[test]
+fn codex_retired_catalog_is_rediscovered() {
+    let name = "codex_retired_catalog_is_rediscovered";
+    let full = replay_of("c7_effort_catalog").unwrap();
+    let mut expect = expect_of("c7_effort_catalog").unwrap();
+    let source = format!("{name}: a variant of c7_effort_catalog");
+    let mut first = full.clone();
+    let listed = step_with(&full, "\"result\":{\"data\"").unwrap();
+    cut_after(&mut first, listed, &[json!({"await_eof": {}})]).unwrap();
+    let replay = json!({"source": source, "lifetimes": [first, full]});
+    expect["source"] = json!(source);
+    expect["launches"] = json!(2);
+    let mut refused = expect["turns"][0].clone();
+    refused["session"] = json!("first");
+    let turns = expect["turns"].as_array_mut().unwrap();
+    turns.insert(0, refused);
+    expect["sessions"]["first"] = expect["sessions"]["main"].clone();
+    expect["launch_checkpoints"] = json!({"after_pure": 0,
+        "after_open": {"first": 0, "main": 0}, "after_turn": [1, 2, 2, 2]});
+    check_variant_then(name, &replay, &expect, |pure| {
+        let models = pure.set.models(Some("codex"));
+        if models.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("a retired server's catalog is listed: {models:?}"))
+        }
+    })
+    .unwrap();
+}
+
+/// x.3.2 X3 fix r2 minor #13: a server's launch ordinal is the order its
+/// process started, which is the fake's launch log. Session `first`'s
+/// launch fails before any process (its evidence folder cannot be made),
+/// so `main`'s launch is the fake's first: the registry names it launch 1
+/// and the harness judges it against lifetime 1, the replay's only one.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn codex_launch_ordinal_counts_processes() {
+    let name = "codex_launch_ordinal_counts_processes";
+    // Occurrence 1 makes `first`'s turn folder, 2 its server's folder.
+    let _points = armed(
+        "blob.step.stall",
+        json!({"occurrence": 2, "action": "fail_io"}),
+    )
+    .unwrap();
+    let (replay, mut expect) = plain(name).unwrap();
+    let replay = json!({"source": replay["source"].clone(), "lifetimes": [replay]});
+    let mut first = expect["turns"][0].clone();
+    first["session"] = json!("first");
+    expect["sessions"]["first"] = expect["sessions"]["main"].clone();
+    expect["sessions"]["first"]["close"] = Value::Null;
+    let turns = expect["turns"].as_array_mut().unwrap();
+    turns.insert(0, first);
+    unaccepted(&mut expect, "transport_lost", Value::Null);
+    let failed = &mut turn_mut(&mut expect, 0)["expect"];
+    if let Some(failed) = failed.as_object_mut() {
+        failed.remove("error");
+    }
+    failed["unasserted"] = json!([{"field": "error", "why":
+        "the failed folder is RouteError::Store, which C2's turn error names do not list"}]);
+    expect["launch_checkpoints"] = json!({"after_pure": 0,
+        "after_open": {"first": 0, "main": 0}, "after_turn": [0, 1]});
+    check_variant(name, &replay, &expect, conformance_run::Knobs::default()).unwrap();
 }

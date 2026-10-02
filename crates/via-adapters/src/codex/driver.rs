@@ -825,7 +825,7 @@ async fn turn(
     let Some((connection, server)) = pin.live() else {
         return facts.failed(RouteError::TransportLost { turn }, None);
     };
-    let catalog = adopt(&mut facts, &server);
+    let catalog = adopt(&mut facts, pin.server(), &server);
     let Some(generation) = session.attach(&pin, &connection, driver) else {
         return facts.failed(RouteError::TransportLost { turn }, None);
     };
@@ -988,8 +988,13 @@ fn admit(
 }
 
 /// Records the live server's facts the turn reports (its instance and
-/// version) and caches its model catalog, which it returns.
-fn adopt(facts: &mut Turn<'_>, server: &via_routes::codex::ServerFacts) -> Arc<[DiscoveredModel]> {
+/// version) and caches its model catalog for instance `id`, which it
+/// returns.
+fn adopt(
+    facts: &mut Turn<'_>,
+    id: &via_routes::codex::ServerId,
+    server: &via_routes::codex::ServerFacts,
+) -> Arc<[DiscoveredModel]> {
     let adapter = &facts.session.adapter;
     facts.instance = Some(instance_report(&server.user_agent));
     if let Some(version) = normalize::instance_version(&server.user_agent) {
@@ -999,7 +1004,7 @@ fn adopt(facts: &mut Turn<'_>, server: &via_routes::codex::ServerFacts) -> Arc<[
     }
     let catalog: Arc<[DiscoveredModel]> = server.models.iter().map(normalize::discovered).collect();
     let key = adapter.server_key(facts.driver.spec.inherit.requested);
-    adapter.discovered(key, Arc::clone(&catalog));
+    adapter.discovered(key, id.clone(), Arc::clone(&catalog));
     catalog
 }
 

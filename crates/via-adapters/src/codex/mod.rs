@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use via_routes::RouteRuntime;
-use via_routes::codex::Servers;
+use via_routes::codex::{ServerId, Servers};
 
 use crate::config::BootstrapEnv;
 use crate::harness::Harness;
@@ -62,9 +62,14 @@ pub(crate) struct CodexAdapter {
     /// `model/list` discovery last returned it (packet §3: cached per
     /// server instance): it resolves a plan with no model to its default
     /// (ruling Q1), lists the route's models and resolves a model-only
-    /// plan (C1 §3.13), and judges a vendor effort.
-    catalogs: Mutex<BTreeMap<String, Arc<[DiscoveredModel]>>>,
+    /// plan (C1 §3.13), and judges a vendor effort. Each is kept with the
+    /// instance that discovered it and counts only while that instance is
+    /// live, so a later instance of the key discovers its own.
+    catalogs: Mutex<BTreeMap<String, Discovered>>,
 }
+
+/// A catalog and the server instance that discovered it.
+type Discovered = (ServerId, Arc<[DiscoveredModel]>);
 
 /// One turn's values the route judges purely.
 struct PerTurn<'a> {
@@ -111,21 +116,25 @@ impl CodexAdapter {
         self.recipe(requested).config_hash(ADAPTER_VERSION).hex()
     }
 
-    /// The catalog server key `key`'s instance discovered, if any.
+    /// The catalog server key `key`'s live instance discovered, if any:
+    /// none once that instance retired or was lost.
     fn catalog(&self, key: &str) -> Option<Arc<[DiscoveredModel]>> {
-        self.catalogs
+        let (server, models) = self
+            .catalogs
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(key)
-            .cloned()
+            .cloned()?;
+        self.servers.is_live(&server).then_some(models)
     }
 
-    /// Keeps the whole catalog server key `key`'s instance discovered.
-    fn discovered(&self, key: String, models: Arc<[DiscoveredModel]>) {
+    /// Keeps the whole catalog instance `server` of server key `key`
+    /// discovered.
+    fn discovered(&self, key: String, server: ServerId, models: Arc<[DiscoveredModel]>) {
         self.catalogs
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(key, models);
+            .insert(key, (server, models));
     }
 
     /// The models `requested`'s server discovered (C1 §3.13 `models`, and

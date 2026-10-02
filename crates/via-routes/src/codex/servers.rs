@@ -183,7 +183,8 @@ impl From<LaunchFailure> for LaunchError {
 pub struct ServerEnd {
     /// The server.
     pub server: ServerId,
-    /// Its launch ordinal in this registry: 1 for the first launch.
+    /// Its launch ordinal in this registry: 1 for the first launch whose
+    /// process started, counted as Wire opened its connection.
     pub launch: u64,
     /// Host's confirmed exit, if any.
     pub exit: Option<ExitReport>,
@@ -245,7 +246,8 @@ enum TaskKind {
 
 struct Instance {
     entry: Entry,
-    /// The launch ordinal ([`ServerEnd::launch`]).
+    /// The launch ordinal ([`ServerEnd::launch`]); 0 until its process
+    /// started.
     launch: u64,
     work: Option<Work>,
     /// Tasks spawned and not yet collected (at most two, R4-11).
@@ -274,7 +276,7 @@ struct Registry {
     failed: usize,
     /// Late callbacks for removed or replaced instances.
     stale: u64,
-    /// Launches so far: the last launch's ordinal.
+    /// Launches whose process started so far: the last one's ordinal.
     launches: u64,
     ended: VecDeque<ServerEnd>,
 }
@@ -495,6 +497,18 @@ impl Servers {
         self.registry().ended.iter().cloned().collect()
     }
 
+    /// Whether `server` is live: launched, handshaken and not yet retiring
+    /// or lost.
+    pub fn is_live(&self, server: &ServerId) -> bool {
+        matches!(
+            self.registry()
+                .servers
+                .get(server)
+                .map(|instance| &instance.entry),
+            Some(Entry::Live { .. })
+        )
+    }
+
     /// The live servers.
     pub fn live(&self) -> Vec<LiveServer> {
         self.registry()
@@ -609,12 +623,10 @@ impl Servers {
                 return Ok(pin);
             }
             registry.by_key.insert(key, server.clone());
-            registry.launches = registry.launches.saturating_add(1);
-            let launch = registry.launches;
             registry.servers.insert(
                 server.clone(),
                 Instance {
-                    launch,
+                    launch: 0,
                     entry: Entry::Launching {
                         key,
                         holders: 1,
@@ -703,14 +715,25 @@ impl Servers {
     /// Installs the launching instance's connection as soon as Wire opened
     /// it (fenced by `server`).
     fn install(&self, server: &ServerId, opened: &Arc<Connection>) {
-        let mut registry = self.registry();
-        match registry
-            .servers
-            .get_mut(server)
-            .map(|instance| &mut instance.entry)
-        {
-            Some(Entry::Launching { connection, .. }) => *connection = Some(Arc::clone(opened)),
-            Some(Entry::Live { .. } | Entry::Retiring { .. } | Entry::Lost { .. }) | None => {
+        let mut guard = self.registry();
+        let registry = &mut *guard;
+        // Its process started: the launch counts now, in the order the
+        // processes started (a stale one's too), never at its reservation.
+        registry.launches = registry.launches.saturating_add(1);
+        match registry.servers.get_mut(server) {
+            Some(Instance {
+                entry: Entry::Launching { connection, .. },
+                launch,
+                ..
+            }) => {
+                *connection = Some(Arc::clone(opened));
+                *launch = registry.launches;
+            }
+            Some(Instance {
+                entry: Entry::Live { .. } | Entry::Retiring { .. } | Entry::Lost { .. },
+                ..
+            })
+            | None => {
                 registry.stale = registry.stale.saturating_add(1);
             }
         }

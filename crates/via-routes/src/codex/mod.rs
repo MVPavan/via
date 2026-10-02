@@ -31,10 +31,10 @@ pub use servers::{
 };
 pub use threads::{CORRELATION_BYTES, CORRELATION_ENTRIES};
 /// The Wire types a shared-route driver handles: its writes' bounds and
-/// answers, a turn's link and evidence folder, and a routed message's raw
-/// form.
+/// answers, a turn's link and evidence folder, a routed message's raw
+/// form, and a server instance's ID.
 pub use via_wire::{
-    BoundedBytes, CommitOutcome, PendingWrite, TurnFolder, VendorMessage, WriteBounds,
+    BoundedBytes, CommitOutcome, PendingWrite, ServerId, TurnFolder, VendorMessage, WriteBounds,
 };
 
 #[cfg(test)]

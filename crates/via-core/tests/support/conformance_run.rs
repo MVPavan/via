@@ -42,12 +42,13 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, watch};
 use via_adapters::{
-    AdapterError, AdapterSet, Admitted, CancellationToken, ClassHint, Cleanup, CloseMode, Deadline,
-    DenialKind, DriverFailure, DriverHealth, InheritPlan, Observation, ObservationItem, ParamSizes,
-    Prepared, RouteError, RoutePlan, SessionCx, SessionDriver, SessionRef, SessionSpec,
-    StartRejected, SteerDelivery, SteerError, SteerInput, SteerToken, StopCause, StopOrder,
-    StopReason, TaskTracker, TurnActivity, TurnCx, TurnEnd, TurnNumber, TurnParams, TurnSpec,
-    UnparsedOutput, VendorTerminal, VendorTerminalStatus, VendorTurnId, observation_channel,
+    AdapterError, AdapterSet, AdapterShutdown, Admitted, CancellationToken, ClassHint, Cleanup,
+    CloseMode, Deadline, DenialKind, DriverFailure, DriverHealth, InheritPlan, Observation,
+    ObservationItem, ParamSizes, Prepared, RouteError, RoutePlan, SessionCx, SessionDriver,
+    SessionRef, SessionSpec, StartRejected, SteerDelivery, SteerError, SteerInput, SteerToken,
+    StopCause, StopOrder, StopReason, TaskTracker, TurnActivity, TurnCx, TurnEnd, TurnNumber,
+    TurnParams, TurnSpec, UnparsedOutput, VendorTerminal, VendorTerminalStatus, VendorTurnId,
+    observation_channel,
 };
 use via_store::{ResumeRecord, SessionId, SpawnRecord, SubmissionRecord, TerminalRecord};
 
@@ -119,6 +120,9 @@ pub(crate) struct Knobs {
     /// with no end of its own. Its outcome is what was observed, its
     /// error, terminal and cleanup null.
     pub(crate) abandon_on_accept: Option<usize>,
+    /// The case injects this many server-registry task panics: the final
+    /// shutdown reports exactly them failed, and nothing else unsettled.
+    pub(crate) panicked_tasks: usize,
 }
 
 /// What a running turn has shown so far, for its side actions.
@@ -192,9 +196,10 @@ impl Pure {
         self.drive_then(expect, replay, knobs, |_| Ok(()))
     }
 
-    /// [`Pure::drive`], then `then` on the adapter set the case ran on,
-    /// once every turn settled: a test's checks of what the run left behind
-    /// (a cached refusal).
+    /// [`Pure::drive`], with `then` on the adapter set the case ran on
+    /// once every turn settled (and every stated close ran), before the
+    /// shutdown closes the rest: a test's checks of what the run left
+    /// behind (a cached refusal, a live server's catalog).
     pub(crate) fn drive_then(
         self,
         expect: &Value,
@@ -228,15 +233,16 @@ impl Pure {
                 run.until_failed().await;
             }
             let health = run.health();
+            let checked = then(&pure);
             let servers = run.shutdown().await;
             let turns = turns?;
             servers?;
+            checked?;
             Ok::<_, String>((turns, health, opened))
         });
         let (turns, health, (opened, writes)) = result?;
         pure.outcome.checkpoints.after_open.extend(opened);
         pure.outcome.pure_writes = writes;
-        then(&pure)?;
         let launches = pure.launches()?;
         for (index, (outcome, after)) in turns.into_iter().enumerate() {
             if pure.pending.contains(&index) {
@@ -1166,7 +1172,10 @@ impl<'a> Run<'a> {
     /// its lease goes and the idle server retires (x.3.2 X3), checking each
     /// report; judges each server launch by the replay's own verdict
     /// ([`Self::judge_servers`]); then ends the sessions' owned work and
-    /// the adapter set's.
+    /// the adapter set's. The case fails when that work outlives
+    /// [`FIXTURE_WAIT`], or the adapter set's shutdown reports a pending,
+    /// unjoined or failed task, a failure, or Host uncertainty (x.3.2 X3
+    /// fix r2 #12).
     async fn shutdown(self) -> Result<(), String> {
         let mut unclean = Vec::new();
         for (label, session) in &self.sessions {
@@ -1194,14 +1203,29 @@ impl<'a> Run<'a> {
         let judged = self.judge_servers().await;
         self.cancel.cancel();
         self.tracker.close();
-        let _ = tokio::time::timeout(FIXTURE_WAIT, self.tracker.wait()).await;
+        if tokio::time::timeout(FIXTURE_WAIT, self.tracker.wait())
+            .await
+            .is_err()
+        {
+            unclean.push(format!(
+                "the sessions' owned tasks still ran {FIXTURE_WAIT:?} after the run ended"
+            ));
+        }
         let deadline = Deadline::at(tokio::time::Instant::now() + FIXTURE_WAIT);
-        self.pure.set.shutdown(deadline, &[]).await;
+        let report = self.pure.set.shutdown(deadline, &[]).await;
+        unclean.extend(shutdown_problem(&report, self.knobs.panicked_tasks));
         judged?;
         match unclean.first() {
             Some(first) => Err(first.clone()),
             None => Ok(()),
         }
+    }
+
+    /// Whether a session of the case runs on a server route.
+    fn shared(&self) -> bool {
+        self.sessions
+            .values()
+            .any(|session| session.plan.server_key.is_some())
     }
 
     /// Once every server launch ended (its last lease went, so its idle
@@ -1211,11 +1235,7 @@ impl<'a> Run<'a> {
     /// r1, ruling 21 and minor 24), in every build.
     async fn judge_servers(&self) -> Result<(), String> {
         let launches = usize::try_from(self.pure.launches()?).map_err(|e| e.to_string())?;
-        let shared = self
-            .sessions
-            .values()
-            .any(|session| session.plan.server_key.is_some());
-        if !shared || launches == 0 {
+        if !self.shared() || launches == 0 {
             return Ok(());
         }
         let started = tokio::time::Instant::now();
@@ -1253,6 +1273,32 @@ impl<'a> Run<'a> {
         }
         Ok(())
     }
+}
+
+/// What the adapter set's final shutdown left unsettled, if anything:
+/// pending or unjoined tasks, failed tasks but the `panicked` registry
+/// tasks the case injected, a failure but theirs, or an anchor or turn
+/// without absence proof.
+fn shutdown_problem(report: &AdapterShutdown, panicked: usize) -> Option<String> {
+    let uncertain = report
+        .recovery
+        .iter()
+        .filter(|turn| turn.cleanup != Cleanup::Quiescent || turn.forced)
+        .count();
+    let injected =
+        (panicked > 0).then(|| format!("server registry: 0 tasks unjoined, {panicked} failed"));
+    let clean = report.pending_tasks == 0
+        && report.failed_tasks == panicked
+        && report.uncertain_anchors == 0
+        && uncertain == 0
+        && report.failure == injected;
+    (!clean).then(|| {
+        format!(
+            "adapter shutdown: {} pending and {} failed tasks, {} uncertain anchors, \
+             {uncertain} uncertain turns, failure {:?}",
+            report.pending_tasks, report.failed_tasks, report.uncertain_anchors, report.failure
+        )
+    })
 }
 
 /// A turn's wall and tool grace: its own, else the defaults.
