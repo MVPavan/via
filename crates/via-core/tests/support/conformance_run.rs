@@ -1242,6 +1242,9 @@ impl<'a> Run<'a> {
         let mut outcome = snapshot(observed, &session.plan);
         outcome.rejected = rejected;
         outcome.error = error;
+        if let Err(AdapterError::Route(failure)) = &end.outcome {
+            outcome.undecoded.clone_from(&failure.undecoded);
+        }
         outcome.terminal = end.terminal.as_ref().map(terminal);
         outcome.usage = end
             .terminal

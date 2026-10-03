@@ -1917,13 +1917,16 @@ async fn run_started(
     let accepted = match reply.outcome {
         Ok(raw) => match result::<TurnStartResult>(&raw) {
             Ok(accepted) => accepted.turn.id,
+            // Packet §3: the start was written, and the vendor may run a
+            // turn VIA cannot name: its cleanup is unproven.
             Err(_) => {
-                return facts.failed(
+                return facts.failure(
                     RouteError::Protocol {
                         turn,
                         detail: "the turn/start reply is malformed",
                     },
                     None,
+                    Some(WireCleanup::Uncertain),
                 );
             }
         },

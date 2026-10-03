@@ -1318,6 +1318,18 @@ fn check_variant_with(
     knobs: conformance_run::Knobs,
     then: impl FnOnce(&conformance_drive::Pure) -> Result<(), String>,
 ) -> Result<(), String> {
+    checked_outcome(name, replay, expect, knobs, then).map(drop)
+}
+
+/// [`check_variant_with`], giving the checked outcome for a test's own
+/// checks.
+fn checked_outcome(
+    name: &str,
+    replay: &Value,
+    expect: &Value,
+    knobs: conformance_run::Knobs,
+    then: impl FnOnce(&conformance_drive::Pure) -> Result<(), String>,
+) -> Result<conformance_expect::Outcome, String> {
     conformance_expect::validate(expect).map_err(|e| format!("{name}: {e}"))?;
     let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
     let path = dir.path().join(format!("{name}.replay.json"));
@@ -1329,7 +1341,8 @@ fn check_variant_with(
     let outcome = conformance_drive::Pure::run("codex", name, expect, &path)?
         .drive_then(expect, &path, knobs, then)
         .map_err(|why| format!("{why} ({ADAPTER_BEAD} variant {name})"))?;
-    conformance_expect::check(expect, &outcome).map_err(|wrong| format!("{name}:\n{wrong}"))
+    conformance_expect::check(expect, &outcome).map_err(|wrong| format!("{name}:\n{wrong}"))?;
+    Ok(outcome)
 }
 
 /// C2 §5 AD7 (x.3.2 X3 fix r1, finding 14): once a handshake check
@@ -1991,7 +2004,8 @@ fn undecoded_under(root: &Path) -> Vec<String> {
 /// whichever turn runs. While turn 2 runs, a malformed `turn/completed`
 /// naming turn 1 is kept in turn 1's folder, and a malformed thread-level
 /// notification in the server folder; either way the generation fails
-/// turn 2 `protocol`.
+/// turn 2 `protocol`, and its reported failure names where the message
+/// went (Sol code r1 #4: through the settled turn's end).
 #[test]
 fn codex_malformed_evidence_owner() {
     let base = turn_mut(&mut expect_of("c1_commentary_usage").unwrap(), 1)["expect"].clone();
@@ -2004,11 +2018,7 @@ fn codex_malformed_evidence_owner() {
         ),
         (
             "codex_malformed_evidence_thread_level",
-            // Past the full decode's nesting bound (64), within the peek's.
-            json!({"method": "thread/status/changed",
-                "params": {"threadId": THREAD, "status": {"type": "idle"},
-                    "nested": serde_json::from_str::<Value>(
-                        &format!("{}{}", "[".repeat(80), "]".repeat(80))).unwrap()}}),
+            nested_status(),
             "evidence/servers/",
         ),
     ] {
@@ -2035,7 +2045,8 @@ fn codex_malformed_evidence_owner() {
         // folds `uncertain` (x.3.2 X3 §6.6, F3).
         expect["sessions"]["main"]["close"]["cleanup"] = json!("uncertain");
         let mut kept = Vec::new();
-        check_variant_then(name, &replay, &expect, |run| {
+        let knobs = conformance_run::Knobs::default();
+        let outcome = checked_outcome(name, &replay, &expect, knobs, |run| {
             kept = undecoded_under(run.state.path());
             kept.extend(undecoded_under(run.case_dir.path()));
             Ok(())
@@ -2045,7 +2056,63 @@ fn codex_malformed_evidence_owner() {
             kept.len() == 1 && kept[0].contains(owner),
             "{name}: evidence kept at {kept:?}, not under {owner}"
         );
+        let bytes = malformed.to_string().len() + 1;
+        let note = outcome.turns[1].undecoded.clone().unwrap_or_default();
+        let named = if owner.starts_with('s') {
+            note.starts_with(&format!("an earlier turn's message; first {bytes} in "))
+                && note.ends_with(&format!("{owner}undecoded.bin"))
+        } else {
+            note == format!("{bytes} bytes kept as the shared connection's evidence")
+        };
+        assert!(named, "{name}: turn 2's failure names {note:?}");
     }
+}
+
+/// A thread-level notification past the full decode's nesting bound (64),
+/// within the peek's.
+fn nested_status() -> Value {
+    let mut nested = json!([]);
+    for _ in 1..80 {
+        nested = json!([nested]);
+    }
+    json!({"method": "thread/status/changed",
+        "params": {"threadId": THREAD, "status": {"type": "idle"}, "nested": nested}})
+}
+
+/// X0 item 5, Sol code r1 #4: a malformed thread-level message while the
+/// turn waits for its `turn/start` reply fails the generation; the turn
+/// ends unanswered, `protocol`, launched with its cleanup uncertain, and
+/// its reported failure names the shared connection's evidence. The
+/// reply never comes.
+#[test]
+fn codex_malformed_message_before_the_reply() {
+    let name = "codex_malformed_message_before_the_reply";
+    let (mut replay, mut expect) = plain(name).unwrap();
+    let start = step_with(&replay, "\"method\":\"turn/start\"").unwrap();
+    let malformed = nested_status();
+    cut_after(
+        &mut replay,
+        start,
+        &[emit(&malformed), json!({"await_eof": {}})],
+    )
+    .unwrap();
+    unaccepted(&mut expect, "protocol", tested());
+    let turn = &mut turn_mut(&mut expect, 0)["expect"];
+    turn["cleanup"] = json!("uncertain");
+    turn["observations_include"] = json!([
+        {"kind": "session.vendor_identity_confirmed", "vendor_session_id": THREAD,
+            "generation": 1},
+    ]);
+    expect["sessions"]["main"]["close"]["cleanup"] = json!("uncertain");
+    let knobs = conformance_run::Knobs::default();
+    let outcome = checked_outcome(name, &replay, &expect, knobs, |_| Ok(())).unwrap();
+    let bytes = malformed.to_string().len() + 1;
+    assert_eq!(
+        outcome.turns[0].undecoded,
+        Some(format!(
+            "{bytes} bytes kept as the shared connection's evidence"
+        ))
+    );
 }
 
 /// X0 items 5 and 11 (x.3.2 X3 fix r1, finding 11; fix r2 #3): a
@@ -3870,6 +3937,29 @@ fn codex_contradicted_refusal_before_the_consumer() {
         (true, true),
         "the consumer was held until the driver failed the generation"
     );
+}
+
+/// Packet §3 ("fail with uncertainty"): a `turn/start` reply whose result
+/// names no readable turn fails the turn `protocol`. Its start was
+/// written and the vendor may have started a turn VIA cannot name, so its
+/// cleanup is uncertain, never quiescent.
+#[test]
+fn codex_malformed_start_reply_is_uncertain() {
+    let name = "codex_malformed_start_reply_is_uncertain";
+    let (mut replay, mut expect) = plain(name).unwrap();
+    let start = step_with(&replay, "\"capture\":{\"turn\"").unwrap();
+    let malformed = json!({"emit": {"line": "{\"id\":${turn},\"result\":{\"turn\":7}}"}});
+    cut_after(&mut replay, start, &[malformed, json!({"await_eof": {}})]).unwrap();
+    unaccepted(&mut expect, "protocol", tested());
+    let turn = &mut turn_mut(&mut expect, 0)["expect"];
+    turn["cleanup"] = json!("uncertain");
+    turn["observations_include"] = json!([
+        {"kind": "session.vendor_identity_confirmed", "vendor_session_id": THREAD,
+            "generation": 1},
+    ]);
+    expect["sessions"]["main"]["close"] = Value::Null;
+    expect["sessions"]["main"]["health"] = json!({"state": "failed", "first_cause": "protocol"});
+    variant(name, &replay, &expect).unwrap();
 }
 
 /// The S13 schedule: an item naming the unmapped turn, then the refusal.

@@ -333,6 +333,10 @@ pub(crate) struct TurnOutcome {
     pub(crate) observations: Vec<Value>,
     /// The outcome so far at each gate, in the turn's `gates` order.
     pub(crate) gates: Vec<TurnOutcome>,
+    /// `RouteFailure.undecoded`: where the message VIA could not decode was
+    /// kept, or why not. Reported for a test's own checks; no expectation
+    /// key states it.
+    pub(crate) undecoded: Option<String>,
 }
 
 const TOP: &[&str] = &[
@@ -1842,6 +1846,7 @@ fn ideal_turn(e: &Value) -> TurnOutcome {
         steer: Vec::new(),
         observations: ideal_observations(e),
         gates: Vec::new(),
+        undecoded: None,
     }
 }
 
