@@ -43,8 +43,9 @@ impl Engine {
         let Some(retained) = retained else {
             return true;
         };
+        // A route's unparsed output is present and keeps its reason.
         let Some(output) = retained.structured_output.as_ref() else {
-            return retained.structured_output_file.is_none();
+            return retained.structured_output_file.is_none() && retained.output_invalid.is_none();
         };
         // Off the executor, as a Store blocking step owned until it ends; a
         // step that could not run is the validation bound reached.

@@ -16,12 +16,12 @@ use super::normalize::{
     DECLINES, NormalizeError, Step, StructuredOutput, TurnNormalizer, catalog_page, decline,
     instance_version, version_status,
 };
-use crate::VendorTerminalStatus;
 use crate::config::BootstrapEnv;
 use crate::observation::{
     ClassHint, DenialKind, Observation, ProgressMarks, StopReason, UsageSample,
 };
 use crate::plan::{Inherit, InheritState, VersionStatus};
+use crate::{TurnNumber, VendorTerminalStatus};
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex")
@@ -628,11 +628,11 @@ fn a_resume_turn_is_checked() {
         bound: Some(full.clone()),
         ..TurnParams::default()
     };
-    let old = CodexAdapter::check_turn("codex-app-server", "0", &turn).unwrap_err();
+    let old = CodexAdapter::judge_turn("codex-app-server", "0", &turn, None).unwrap_err();
     assert_eq!(old.kind, RefusalKind::HarnessUnavailable);
     assert_eq!(old.reason, Some("adapter_version"));
     assert_eq!(
-        CodexAdapter::check_turn("codex-app-server", "1", &turn)
+        CodexAdapter::judge_turn("codex-app-server", "1", &turn, None)
             .unwrap()
             .effective_bound,
         Some(full)
@@ -648,7 +648,7 @@ fn a_resume_turn_is_checked() {
         ..TurnParams::default()
     };
     assert_eq!(
-        CodexAdapter::check_turn("codex-app-server", "1", &refused)
+        CodexAdapter::judge_turn("codex-app-server", "1", &refused, None)
             .unwrap_err()
             .kind,
         RefusalKind::InvalidParam { field: "effort" }
@@ -658,11 +658,79 @@ fn a_resume_turn_is_checked() {
         ..TurnParams::default()
     };
     assert_eq!(
-        CodexAdapter::check_turn("codex-app-server", "1", &bound_only)
+        CodexAdapter::judge_turn("codex-app-server", "1", &bound_only, None)
             .unwrap_err()
             .kind,
         RefusalKind::BoundUnsupported
     );
+}
+
+/// Sol r1 #16, AD18: once the session's server key has a discovered
+/// catalog, a later turn's effort the session's model does not advertise is
+/// refused before any receipt; a listed
+/// effort, a model the catalog does not list, a turn naming no effort or
+/// no model, and no catalog at all each pass to `run_turn`.
+#[test]
+fn a_resume_turn_judges_effort_against_the_cached_catalog() {
+    use super::CodexAdapter;
+    use super::normalize::DiscoveredModel;
+    use crate::plan::{RefusalKind, TurnParams};
+
+    let catalog = [DiscoveredModel {
+        model: "gpt-6-luna".to_owned(),
+        efforts: vec!["low".to_owned(), "medium".to_owned()],
+        hidden: false,
+        default: true,
+    }];
+    let turn = |model: Option<&str>, effort: Option<&str>| TurnParams {
+        model: model.map(str::to_owned),
+        effort: effort.map(str::to_owned),
+        ..TurnParams::default()
+    };
+    let judge = |turn: &TurnParams, catalog: Option<&[DiscoveredModel]>| {
+        CodexAdapter::judge_turn("codex-app-server", "1", turn, catalog)
+    };
+    let refused = judge(&turn(Some("gpt-6-luna"), Some("xhigh")), Some(&catalog)).unwrap_err();
+    assert_eq!(refused.kind, RefusalKind::InvalidParam { field: "effort" });
+    assert_eq!(refused.route, Some("codex-app-server"));
+    for passes in [
+        turn(Some("gpt-6-luna"), Some("low")),
+        turn(Some("other"), Some("xhigh")),
+        turn(Some("gpt-6-luna"), None),
+        turn(None, Some("xhigh")),
+    ] {
+        assert!(judge(&passes, Some(&catalog)).is_ok(), "{passes:?}");
+    }
+    assert!(judge(&turn(Some("gpt-6-luna"), Some("xhigh")), None).is_ok());
+}
+
+/// Sol r1 #15 (C2 §2 `VendorTerminal`): the normalizer's structured
+/// output as the terminal carries it. A value passes through; text that
+/// is not JSON is `NotJson` (`reason: invalid`) and text over the bound is
+/// `OverLimit` (`reason: validation_limit`), each with no value; no
+/// schema, or an empty answer, carries neither.
+#[test]
+fn structured_output_is_carried_unparsed_when_it_is_no_value() {
+    use super::driver::carried;
+    use super::normalize::StructuredOutput;
+    use crate::UnparsedOutput;
+
+    let value = serde_json::value::to_raw_value(&json!({"answer": 1})).unwrap();
+    let (json, unparsed) = carried(StructuredOutput::Json(value));
+    assert_eq!(json.unwrap().get(), r#"{"answer":1}"#);
+    assert_eq!(unparsed, None);
+    for (output, reason) in [
+        (StructuredOutput::NotJson, "invalid"),
+        (StructuredOutput::OverLimit, "validation_limit"),
+    ] {
+        let (json, unparsed) = carried(output);
+        assert!(json.is_none());
+        assert_eq!(unparsed.map(UnparsedOutput::reason), Some(reason));
+    }
+    for output in [StructuredOutput::NotRequested, StructuredOutput::Missing] {
+        let (json, unparsed) = carried(output);
+        assert!(json.is_none() && unparsed.is_none());
+    }
 }
 
 /// One synthetic notification, decoded as the server's would be.
@@ -885,29 +953,38 @@ fn a_declined_item_is_a_denial() {
     assert!(denials(&observed(&mut normalizer, &failed)).is_empty());
 
     let mut ours = TurnNormalizer::new(false);
-    ours.note_decline(&ServerRequest {
-        id: RequestId::Int(4),
-        method: "item/commandExecution/requestApproval".to_owned(),
-        thread_id: Some("t".to_owned()),
-        turn_id: Some("u".to_owned()),
-        item_id: Some("c1".to_owned()),
-    })
-    .unwrap();
+    ours.ledger()
+        .note_decline(
+            first_turn(),
+            &ServerRequest {
+                id: RequestId::Int(4),
+                method: "item/commandExecution/requestApproval".to_owned(),
+                thread_id: Some("t".to_owned()),
+                turn_id: Some("u".to_owned()),
+                item_id: Some("c1".to_owned()),
+            },
+        )
+        .unwrap();
     assert!(
         denials(&observed(&mut ours, &command)).is_empty(),
         "VIA's own decline is reported as vendor.request_declined only"
     );
 }
 
-/// Review r1 #8: a `sleep` item is a tool: started, it is open, and an
-/// interrupted terminal with it still open is not quiescent.
+/// The turn [`TurnNormalizer::new`] normalizes.
+fn first_turn() -> TurnNumber {
+    TurnNumber::try_from(1).unwrap()
+}
+
+/// Review r1 #8: a `sleep` item is a tool: started, it is open (in the
+/// registration's ledger, x.3.2 X3 §6.3), and an interrupted terminal
+/// with it still open is not quiescent.
 #[test]
 fn an_open_sleep_is_an_open_tool() {
     let mut normalizer = TurnNormalizer::new(false);
-    let started = observed(
-        &mut normalizer,
-        &item("item/started", &tool_item("sleep", "s1", "")),
-    );
+    let sleep = item("item/started", &tool_item("sleep", "s1", ""));
+    normalizer.ledger().track(first_turn(), &sleep).unwrap();
+    let started = observed(&mut normalizer, &sleep);
     assert!(started.iter().any(|o| matches!(
         o,
         Observation::Progress(marks)
@@ -920,17 +997,20 @@ fn an_open_sleep_is_an_open_tool() {
         panic!("a terminal");
     };
     assert_eq!(terminal.status, VendorTerminalStatus::Interrupted);
-    assert!(normalizer.tools_open(), "the sleep is still open");
-    let mut closed = TurnNormalizer::new(false);
-    observed(
-        &mut closed,
-        &item("item/started", &tool_item("sleep", "s1", "")),
+    assert!(
+        normalizer.ledger().tools_open(first_turn()),
+        "the sleep is still open"
     );
-    observed(
-        &mut closed,
-        &item("item/completed", &tool_item("sleep", "s1", "")),
-    );
-    assert!(!closed.tools_open());
+    let closed = TurnNormalizer::new(false);
+    closed.ledger().track(first_turn(), &sleep).unwrap();
+    closed
+        .ledger()
+        .track(
+            first_turn(),
+            &item("item/completed", &tool_item("sleep", "s1", "")),
+        )
+        .unwrap();
+    assert!(!closed.ledger().tools_open(first_turn()));
 }
 
 /// Review r2 #2: each ID set admits 1,024 IDs and all share the 256 KiB
@@ -962,7 +1042,7 @@ fn id_tracking_overflows_explicitly() {
         "overflowed for good"
     );
 
-    let mut declines = TurnNormalizer::new(false);
+    let declines = TurnNormalizer::new(false);
     let request = |n: usize| ServerRequest {
         id: RequestId::Int(1),
         method: "item/commandExecution/requestApproval".to_owned(),
@@ -971,30 +1051,644 @@ fn id_tracking_overflows_explicitly() {
         item_id: Some(format!("c{n}")),
     };
     for n in 0..1024 {
-        declines.note_decline(&request(n)).unwrap();
+        declines
+            .ledger()
+            .note_decline(first_turn(), &request(n))
+            .unwrap();
     }
     assert_eq!(
-        declines.note_decline(&request(1024)).unwrap_err(),
+        declines
+            .ledger()
+            .note_decline(first_turn(), &request(1024))
+            .unwrap_err(),
         NormalizeError::Overflow
     );
 
-    let mut bytes = TurnNormalizer::new(false);
+    let bytes = TurnNormalizer::new(false);
     let long_id = |n: usize| format!("{n:0>1024}");
     for n in 0..256 {
         bytes
-            .observe(
+            .ledger()
+            .track(
+                first_turn(),
                 &item("item/started", &tool_item("sleep", &long_id(n), "")),
-                Instant::now(),
             )
             .unwrap();
     }
     assert_eq!(
         bytes
-            .observe(
+            .ledger()
+            .track(
+                first_turn(),
                 &item("item/started", &tool_item("sleep", &long_id(256), "")),
-                Instant::now()
             )
             .unwrap_err(),
         NormalizeError::Overflow
     );
+}
+
+/// Ruling Q1: a named model is taken as given; with none named, the plan
+/// resolves the discovered catalog's default, and before any discovery
+/// (or with a catalog naming no default) nothing, which is
+/// `unknown_model`.
+#[test]
+fn the_plan_model_is_the_named_or_the_discovered_default() {
+    use super::normalize::DiscoveredModel;
+    use super::resolved_model;
+
+    let model = |name: &str, default: bool| DiscoveredModel {
+        model: name.to_owned(),
+        efforts: vec!["low".to_owned()],
+        hidden: false,
+        default,
+    };
+    let catalog = [model("gpt-6.1-sol", false), model("gpt-6-sol", true)];
+    assert_eq!(
+        resolved_model(Some("named"), None).as_deref(),
+        Some("named")
+    );
+    assert_eq!(
+        resolved_model(Some("named"), Some(&catalog)).as_deref(),
+        Some("named")
+    );
+    assert_eq!(resolved_model(None, None), None);
+    assert_eq!(resolved_model(Some(""), None), None);
+    assert_eq!(
+        resolved_model(None, Some(&catalog)).as_deref(),
+        Some("gpt-6-sol")
+    );
+    assert_eq!(resolved_model(None, Some(&catalog[..1])), None);
+}
+
+/// X0 item 13.2: a generation's abnormal-end handler, whether or not a
+/// turn runs, latches the driver's failure at once (an owned task failed)
+/// and, with a registration, installs the loss naming the session's latest
+/// turn, `omitted` unknown; a second signal merges into it. Without a
+/// registration it installs none.
+#[test]
+fn abnormal_handler_latches_and_records_loss() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use via_routes::codex::AbnormalEnd;
+
+    use super::delivery::{Losses, ObservationLoss, UNKNOWN};
+    use super::driver::abnormal_handler;
+    use crate::{DriverFailure, DriverHealth, TurnNumber};
+
+    let turn = TurnNumber::try_from(4).unwrap();
+    let losses = Arc::new(Mutex::new(Losses {
+        record: None,
+        latest: Some(turn),
+    }));
+    let health = Arc::new(tokio::sync::watch::Sender::new(DriverHealth::Open));
+    let registered = Arc::new(AtomicBool::new(true));
+    let handler = abnormal_handler(
+        Arc::clone(&losses),
+        Arc::clone(&health),
+        Arc::clone(&registered),
+        2,
+    );
+    handler(AbnormalEnd { first_unqueued: 9 });
+    assert_eq!(
+        *health.borrow(),
+        DriverHealth::Failed {
+            first_cause: DriverFailure::OwnedTask
+        }
+    );
+    handler(AbnormalEnd { first_unqueued: 12 });
+    assert_eq!(
+        losses.lock().unwrap().record,
+        Some(ObservationLoss {
+            trigger: turn,
+            generation: 2,
+            first_unqueued: 9,
+            omitted: UNKNOWN,
+        })
+    );
+
+    let bare = Arc::new(Mutex::new(Losses {
+        record: None,
+        latest: Some(turn),
+    }));
+    let idle = Arc::new(tokio::sync::watch::Sender::new(DriverHealth::Open));
+    registered.store(false, Ordering::Release);
+    abnormal_handler(Arc::clone(&bare), Arc::clone(&idle), registered, 2)(AbnormalEnd {
+        first_unqueued: 1,
+    });
+    assert!(bare.lock().unwrap().record.is_none());
+    assert!(matches!(*idle.borrow(), DriverHealth::Failed { .. }));
+}
+
+/// x.3.2 X3 fix r2 #1: a generation's lane-overflow handler, called by
+/// the connection task as the overflowed lane drops a message, latches
+/// the driver's failure at once (`overflow`, naming the session's latest
+/// turn), whether or not a turn runs, and records the loss, `omitted`
+/// unknown; a later drop merges into it.
+#[test]
+fn overflow_handler_latches_at_once() {
+    use std::sync::{Arc, Mutex};
+
+    use via_routes::codex::AbnormalEnd;
+
+    use super::delivery::{Losses, ObservationLoss, UNKNOWN};
+    use super::driver::overflow_handler;
+    use crate::{DriverFailure, DriverHealth, RouteError, TurnNumber};
+
+    let turn = TurnNumber::try_from(3).unwrap();
+    let losses = Arc::new(Mutex::new(Losses {
+        record: None,
+        latest: Some(turn),
+    }));
+    let health = Arc::new(tokio::sync::watch::Sender::new(DriverHealth::Open));
+    let handler = overflow_handler(Arc::clone(&losses), Arc::clone(&health), 5);
+    handler(AbnormalEnd { first_unqueued: 17 });
+    handler(AbnormalEnd { first_unqueued: 17 });
+    assert_eq!(
+        *health.borrow(),
+        DriverHealth::Failed {
+            first_cause: DriverFailure::Route(RouteError::Overflow { turn })
+        }
+    );
+    assert_eq!(
+        losses.lock().unwrap().record,
+        Some(ObservationLoss {
+            trigger: turn,
+            generation: 5,
+            first_unqueued: 17,
+            omitted: UNKNOWN,
+        })
+    );
+}
+
+/// X0 §13.2 (x.3.2 X3 fix r2 #5): when a turn's wait resumes with the
+/// daemon force and the delivery's decision both ready, the force wins,
+/// so a retained terminal never replaces its disposition; the decision
+/// wins over the lane's overflow.
+#[test]
+fn force_wins_over_a_ready_decision() {
+    use super::driver::{Cut, ready_cut};
+
+    assert_eq!(ready_cut(true, true, true), Some(Cut::Forced));
+    assert_eq!(ready_cut(true, true, false), Some(Cut::Forced));
+    assert_eq!(ready_cut(false, true, true), Some(Cut::Decided));
+    assert_eq!(ready_cut(false, false, true), Some(Cut::Overflow));
+    assert_eq!(ready_cut(false, false, false), None);
+}
+
+/// x.3.2 X3 S4 (F2, F3): admission waits for its credit beside every
+/// cutoff. With the session's budget full, a turn's credit waits; its
+/// stop, the daemon force, its wall, the driver's failure, its
+/// registration's failure (with the generation's cause) and its
+/// retirement each end the wait at once with nothing reserved (the cap
+/// back at its baseline) and that cause, before any job exists. Once the
+/// budget has room the credit is taken; a full cap is exhaustion, never a
+/// wait.
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one case per cutoff arm, each beside its expected cause"
+)]
+async fn admission_credit_waits_beside_its_cutoffs() {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use tokio::sync::watch;
+    use tokio_util::sync::CancellationToken;
+    use via_routes::codex::Lane;
+
+    use super::delivery::{LossRecord, Losses, Registration};
+    use super::driver::{Orders, Uncredited, credit, unsent_cause};
+    use crate::driver::latch;
+    use crate::observation::{SessionCap, observation_channel};
+    use crate::{
+        Deadline, DriverFailure, DriverHealth, RouteError, StopCause, StopOrder, TurnNumber,
+    };
+
+    #[derive(Clone, Copy, Debug)]
+    enum Arm {
+        Stop,
+        Force,
+        Wall,
+        Health,
+        Failure,
+        Retirement,
+    }
+    let turn = TurnNumber::try_from(2).unwrap();
+    let protocol = DriverFailure::Route(RouteError::Protocol {
+        turn: TurnNumber::try_from(1).unwrap(),
+        detail: "a message of the session's thread did not decode",
+    });
+    let arms = [
+        Arm::Stop,
+        Arm::Force,
+        Arm::Wall,
+        Arm::Health,
+        Arm::Failure,
+        Arm::Retirement,
+    ];
+    for arm in arms {
+        let (sink, _received) = observation_channel();
+        let cap = SessionCap::new(&sink);
+        let registration = Registration::new(4, cap.clone());
+        let lane = Lane::default();
+        let loss = LossRecord {
+            losses: Arc::new(Mutex::new(Losses::default())),
+            generation: 1,
+        };
+        let full = cap.fill_budget().unwrap();
+        let soon = Instant::now() + Duration::from_millis(100);
+        let (stop, stop_watch) = watch::channel(None);
+        let (_close, close) = watch::channel(None);
+        let (force_set, mut force) = watch::channel(None);
+        let health = watch::Sender::new(DriverHealth::Open);
+        let mut orders = Orders {
+            stop: stop_watch,
+            close,
+            wall: Deadline::at(if matches!(arm, Arm::Wall) {
+                soon
+            } else {
+                soon + Duration::from_secs(60)
+            }),
+            cancel: CancellationToken::new(),
+        };
+        let cutoff = async {
+            tokio::time::sleep_until(soon).await;
+            match arm {
+                Arm::Stop => {
+                    stop.send_replace(Some(StopOrder {
+                        cause: StopCause::Close,
+                        requested_at: String::new(),
+                        force_at: Deadline::at(soon),
+                        close_by: Deadline::at(soon + Duration::from_secs(3)),
+                    }));
+                }
+                Arm::Force => {
+                    force_set.send_replace(Some(soon));
+                }
+                Arm::Wall => {}
+                Arm::Health => latch(&health, DriverFailure::TurnAbandoned),
+                Arm::Failure => registration.fail(&protocol, (&health, &lane, &loss)),
+                Arm::Retirement => registration.retire(&loss, || {}),
+            }
+            std::future::pending::<()>().await;
+        };
+        let waited = tokio::select! {
+            waited = tokio::time::timeout(
+                Duration::from_secs(5),
+                credit(&cap, (&mut orders, &mut force, &health), Some(&registration)),
+            ) => waited.unwrap(),
+            () = cutoff => unreachable!(),
+        };
+        let expected = match arm {
+            Arm::Stop | Arm::Wall => Uncredited::Ordered,
+            Arm::Force => Uncredited::Forced,
+            Arm::Health => Uncredited::Failed,
+            Arm::Failure => Uncredited::Gone(Some(protocol.clone())),
+            Arm::Retirement => Uncredited::Gone(None),
+        };
+        assert_eq!(waited.err(), Some(expected), "{arm:?}");
+        assert!(Instant::now() < soon + Duration::from_secs(1), "{arm:?}");
+        assert_eq!(cap.held(), (0, 0), "{arm:?}: nothing reserved");
+        let cause = unsent_cause(&orders, &force, turn);
+        match arm {
+            Arm::Stop => assert_eq!(cause, RouteError::Stopped { turn }),
+            Arm::Force => assert_eq!(cause, RouteError::ForceStopped { turn }),
+            Arm::Wall => assert_eq!(cause, RouteError::Deadline { turn }),
+            Arm::Health | Arm::Failure | Arm::Retirement => {}
+        }
+        drop(full);
+        let taken = credit(&cap, (&mut orders, &mut force, &health), None).await;
+        assert!(taken.is_ok(), "{arm:?}: room is taken at once");
+        assert_eq!(cap.held().0, 1);
+    }
+}
+
+/// x.3.2 X3 §4.2 step 1 (F2): a full cap is exhaustion, never a wait.
+#[tokio::test]
+async fn a_full_cap_is_credit_exhaustion() {
+    use std::time::Duration;
+
+    use tokio::sync::watch;
+    use tokio_util::sync::CancellationToken;
+
+    use super::driver::{Orders, Uncredited, credit};
+    use crate::observation::{SessionCap, observation_channel};
+    use crate::{Deadline, DriverHealth};
+
+    let (sink, _received) = observation_channel();
+    let cap = SessionCap::new(&sink);
+    let held: Vec<_> = std::iter::from_fn(|| cap.slot(0)).collect();
+    assert_eq!(held.len(), 1024);
+    let (_stop, stop) = watch::channel(None);
+    let (_close, close) = watch::channel(None);
+    let (_force, mut force) = watch::channel(None);
+    let mut orders = Orders {
+        stop,
+        close,
+        wall: Deadline::at(Instant::now() + Duration::from_secs(60)),
+        cancel: CancellationToken::new(),
+    };
+    let health = watch::Sender::new(DriverHealth::Open);
+    assert_eq!(
+        credit(&cap, (&mut orders, &mut force, &health), None)
+            .await
+            .err(),
+        Some(Uncredited::Exhausted)
+    );
+}
+
+/// x.3.2 X3 S11 (r10 #2): a successor's admission waits at the start
+/// gate, before any credit, while its predecessor's `Start` holds it.
+/// Its stop, the daemon force, its wall, its registration's failure (with
+/// the generation's cause) and its retirement each end the wait at once
+/// with that cause: nothing reserved, no health latched by the wait. A
+/// lane's end opens the gate, and its `push_start` is then refused.
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one case per cutoff arm, each beside its expected cause"
+)]
+async fn the_start_gate_waits_beside_its_cutoffs() {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use tokio::sync::watch;
+    use tokio_util::sync::CancellationToken;
+    use via_routes::codex::{Lane, LaneEnd};
+
+    use super::delivery::{LossRecord, Losses, Registration};
+    use super::driver::{Orders, Uncredited, credited};
+    use crate::observation::{SessionCap, observation_channel};
+    use crate::{
+        Deadline, DecodeWatermark, DriverFailure, DriverHealth, RouteError, StopCause, StopOrder,
+    };
+
+    #[derive(Clone, Copy, Debug)]
+    enum Arm {
+        Stop,
+        Force,
+        Wall,
+        Failure,
+        Retirement,
+        LaneEnd,
+    }
+    let protocol = DriverFailure::Route(RouteError::Protocol {
+        turn: TurnNumber::try_from(1).unwrap(),
+        detail: "a message of the session's thread did not decode",
+    });
+    let arms = [
+        Arm::Stop,
+        Arm::Force,
+        Arm::Wall,
+        Arm::Failure,
+        Arm::Retirement,
+        Arm::LaneEnd,
+    ];
+    for arm in arms {
+        let (sink, _received) = observation_channel();
+        let cap = SessionCap::new(&sink);
+        let registration = Registration::new(4, cap.clone());
+        let lane = Arc::new(Lane::default());
+        let predecessor = TurnNumber::try_from(1).unwrap();
+        assert!(lane.push_start(predecessor, DecodeWatermark::default(), Box::new(())));
+        let loss = LossRecord {
+            losses: Arc::new(Mutex::new(Losses::default())),
+            generation: 1,
+        };
+        let soon = Instant::now() + Duration::from_millis(100);
+        let (stop, stop_watch) = watch::channel(None);
+        let (_close, close) = watch::channel(None);
+        let (force_set, mut force) = watch::channel(None);
+        let health = watch::Sender::new(DriverHealth::Open);
+        let failing = watch::Sender::new(DriverHealth::Open);
+        let mut orders = Orders {
+            stop: stop_watch,
+            close,
+            wall: Deadline::at(if matches!(arm, Arm::Wall) {
+                soon
+            } else {
+                soon + Duration::from_secs(60)
+            }),
+            cancel: CancellationToken::new(),
+        };
+        let cutoff = async {
+            tokio::time::sleep_until(soon).await;
+            match arm {
+                Arm::Stop => {
+                    stop.send_replace(Some(StopOrder {
+                        cause: StopCause::Close,
+                        requested_at: String::new(),
+                        force_at: Deadline::at(soon),
+                        close_by: Deadline::at(soon + Duration::from_secs(3)),
+                    }));
+                }
+                Arm::Force => {
+                    force_set.send_replace(Some(soon));
+                }
+                Arm::Wall => {}
+                Arm::Failure => registration.fail(&protocol, (&failing, &lane, &loss)),
+                Arm::Retirement => registration.retire(&loss, || {}),
+                Arm::LaneEnd => lane.end(LaneEnd::Retired),
+            }
+            std::future::pending::<()>().await;
+        };
+        let gate = Some((lane.as_ref(), &*registration));
+        let waited = tokio::select! {
+            waited = tokio::time::timeout(
+                Duration::from_secs(5),
+                credited(&cap, (&mut orders, &mut force, &health), gate),
+            ) => waited.unwrap(),
+            () = cutoff => unreachable!(),
+        };
+        let expected = match arm {
+            Arm::Stop | Arm::Wall => Some(Uncredited::Ordered),
+            Arm::Force => Some(Uncredited::Forced),
+            Arm::Failure => Some(Uncredited::Gone(Some(protocol.clone()))),
+            Arm::Retirement => Some(Uncredited::Gone(None)),
+            Arm::LaneEnd => None,
+        };
+        assert_eq!(waited.as_ref().err(), expected.as_ref(), "{arm:?}");
+        assert!(Instant::now() < soon + Duration::from_secs(1), "{arm:?}");
+        assert_eq!(*health.borrow(), DriverHealth::Open, "{arm:?}");
+        if let Arm::LaneEnd = arm {
+            assert_eq!(cap.held().0, 1, "past the gate the credit is taken");
+            let successor = TurnNumber::try_from(2).unwrap();
+            assert!(
+                !lane.push_start(successor, DecodeWatermark::default(), Box::new(())),
+                "an ended lane refuses the start: no launch"
+            );
+        } else {
+            assert_eq!(cap.held(), (0, 0), "{arm:?}: nothing reserved");
+        }
+    }
+}
+
+/// x.3.2 X3 S11, no stall arm (r10 #2): a vendor slow to answer the
+/// predecessor's start is no consumer stall. With the wall far away the
+/// successor still waits at the gate past the observation stall bound
+/// (lowered for the test), the driver's health clear and nothing
+/// reserved; once the predecessor's start is positively unwritten the
+/// gate opens and the credit is taken.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn the_start_gate_has_no_stall_arm() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::sync::watch;
+    use tokio_util::sync::CancellationToken;
+    use via_routes::codex::Lane;
+
+    use super::delivery::Registration;
+    use super::driver::{Orders, credited};
+    use crate::observation::{SessionCap, observation_channel};
+    use crate::runtime::event_stall;
+    use crate::{Deadline, DecodeWatermark, DriverHealth};
+
+    const NAME: &str = "codex::tests::the_start_gate_has_no_stall_arm";
+    if std::env::var_os("VIA_TEST_EVENT_STALL_MS").is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture"])
+            .env("VIA_TEST_EVENT_STALL_MS", "100")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    assert_eq!(event_stall(), Duration::from_millis(100));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (sink, _received) = observation_channel();
+        let cap = SessionCap::new(&sink);
+        let registration = Registration::new(4, cap.clone());
+        let lane = Arc::new(Lane::default());
+        let predecessor = TurnNumber::try_from(1).unwrap();
+        assert!(lane.push_start(predecessor, DecodeWatermark::default(), Box::new(())));
+        let (_stop, stop) = watch::channel(None);
+        let (_close, close) = watch::channel(None);
+        let (_force, mut force) = watch::channel(None);
+        let health = watch::Sender::new(DriverHealth::Open);
+        let mut orders = Orders {
+            stop,
+            close,
+            wall: Deadline::at(Instant::now() + Duration::from_secs(3600)),
+            cancel: CancellationToken::new(),
+        };
+        let gate = Some((lane.as_ref(), &*registration));
+        let waiting = credited(&cap, (&mut orders, &mut force, &health), gate);
+        tokio::pin!(waiting);
+        let past = tokio::time::timeout(event_stall() * 5, &mut waiting).await;
+        assert!(past.is_err(), "still waiting past the stall bound");
+        assert_eq!(*health.borrow(), DriverHealth::Open);
+        assert_eq!(cap.held(), (0, 0));
+        lane.start_unwritten(predecessor);
+        let credit = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .unwrap();
+        assert!(credit.is_ok());
+        assert_eq!(cap.held().0, 1);
+    });
+}
+
+/// Sol code r1 #2, x.3.2 X3 §4.3: 15 thread messages are queued and B's
+/// `Start` fills the 16th slot, so B's reply cannot queue its `Reply`
+/// (the lane overflows), though the response is paired; the consumer
+/// failed the generation before the driver polls. A paired refusal then
+/// ends through the failure, launched (cleanup uncertain), never
+/// `Rejected`; a paired acceptance is recovered, so its cleanup interrupt
+/// names its vendor ID.
+#[tokio::test]
+async fn a_paired_reply_under_a_failed_generation() {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use serde_json::value::RawValue;
+    use tokio::sync::{oneshot, watch};
+    use tokio_util::sync::CancellationToken;
+    use via_routes::SendOutcome;
+    use via_routes::codex::{
+        BoundedBytes, Lane, LaneItem, RequestId, Response, Routed, RpcError, VendorMessage,
+    };
+
+    use super::delivery::{LossRecord, Losses, Registration};
+    use super::driver::{Orders, Unanswered, await_reply};
+    use crate::observation::{SessionCap, observation_channel};
+    use crate::{Deadline, DecodeWatermark, DriverFailure, DriverHealth, RouteError};
+
+    for accepted in [false, true] {
+        let (sink, _received) = observation_channel();
+        let registration = Registration::new(4, SessionCap::new(&sink));
+        let lane = Arc::new(Lane::default());
+        let b = TurnNumber::try_from(2).unwrap();
+        for seq in 0..15 {
+            let status = b"{\"method\":\"thread/status/changed\",\"params\":{}}\n".to_vec();
+            let routed = Routed {
+                staged: VendorMessage::new(BoundedBytes::try_from_message(status).unwrap()),
+                seq,
+                turn: None,
+                owner: None,
+                at: Instant::now(),
+                mark: None,
+            };
+            assert!(lane.push(LaneItem::Message(routed), 64));
+        }
+        assert!(lane.push_start(b, DecodeWatermark::default(), Box::new(())));
+        let (_, pushed) = lane.push_reply(b, Instant::now(), accepted.then(|| "vendor-b".into()));
+        assert!(!pushed && lane.overflowed_now(), "the reply overflows");
+        let health = watch::Sender::new(DriverHealth::Open);
+        let loss = LossRecord {
+            losses: Arc::new(Mutex::new(Losses::default())),
+            generation: 1,
+        };
+        let cause = DriverFailure::Route(RouteError::Overflow { turn: b });
+        registration.fail(&cause, (&health, &lane, &loss));
+        let outcome = if accepted {
+            Ok(RawValue::from_string("{\"turn\":{\"id\":\"vendor-b\"}}".into()).unwrap())
+        } else {
+            Err(RpcError {
+                code: -32600,
+                message: "refused".into(),
+            })
+        };
+        let (written_set, written) = oneshot::channel();
+        written_set.send(SendOutcome::Written).unwrap();
+        let (paired, reply) = oneshot::channel();
+        paired
+            .send(Response {
+                id: RequestId::Int(7),
+                outcome,
+                contradicted: false,
+            })
+            .unwrap();
+        let (_stop, stop) = watch::channel(None);
+        let (_close, close) = watch::channel(None);
+        let (_force, mut force) = watch::channel(None);
+        let mut orders = Orders {
+            stop,
+            close,
+            wall: Deadline::at(Instant::now() + Duration::from_secs(60)),
+            cancel: CancellationToken::new(),
+        };
+        let ended = await_reply(
+            (written, reply),
+            (
+                &mut orders,
+                &mut force,
+                Some((lane.as_ref(), &*registration)),
+            ),
+            &mut |_| {},
+        )
+        .await;
+        let recovered = matches!(&ended, Ok(response) if response.outcome.is_ok());
+        let failed = matches!(&ended, Err(Unanswered::Generation { cause: failed, launched: true })
+            if *failed == cause);
+        assert!(
+            if accepted { recovered } else { failed },
+            "accepted {accepted}: another end"
+        );
+    }
 }

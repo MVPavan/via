@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::claude::ClaudeAdapter;
-use crate::codex::CodexAdapter;
+use crate::codex::CodexSession;
 use crate::fake::FakeAdapter;
 use crate::observation::{
     AdapterError, ObservationSink, SteerDelivery, SteerToken, TurnEnd, TurnEvidence,
@@ -94,6 +94,8 @@ pub struct TurnSpec {
 #[derive(Debug)]
 pub struct ConnectionPin {
     generation: u64,
+    /// A shared route's hold on the pinned server (x.3.2 X0 item 2.2).
+    pub(crate) server: Option<via_routes::codex::ServerPin>,
 }
 
 /// `prepare`'s answer (AD16).
@@ -389,8 +391,8 @@ pub(crate) enum DriverKind {
     Fake(Arc<FakeAdapter>),
     /// Claude Code: one private process per turn.
     Claude(Arc<ClaudeAdapter>),
-    /// Codex: a stub that runs no turn until via-5lr.3.2.
-    Codex(#[expect(dead_code, reason = "its turn reads it (via-5lr.3.2)")] Arc<CodexAdapter>),
+    /// Codex: turns on a shared `codex app-server` the session leases.
+    Codex(Arc<CodexSession>),
 }
 
 impl DriverKind {
@@ -402,12 +404,12 @@ impl DriverKind {
         }
     }
 
-    /// The adapter version its turns record (AD12); none from a stub.
-    fn adapter_version(&self) -> Option<String> {
+    /// The adapter version its turns record (AD12).
+    fn adapter_version(&self) -> String {
         match self {
-            Self::Fake(fake) => Some(fake.profile().adapter_version.clone()),
-            Self::Claude(_) => Some(crate::claude::adapter_version()),
-            Self::Codex(_) => None,
+            Self::Fake(fake) => fake.profile().adapter_version.clone(),
+            Self::Claude(_) => crate::claude::adapter_version(),
+            Self::Codex(_) => crate::codex::adapter_version(),
         }
     }
 
@@ -433,12 +435,11 @@ impl DriverKind {
     }
 
     /// The ID identity confirmations name for connection `generation`.
-    fn connection_id(&self, generation: u64) -> Option<String> {
+    fn connection_id(&self, generation: u64) -> String {
         match self {
-            Self::Fake(_) => Some(crate::fake::connection_id(generation)),
-            Self::Claude(_) => Some(crate::claude::connection_id(generation)),
-            // A stub never connects, so never advances a generation.
-            Self::Codex(_) => None,
+            Self::Fake(_) => crate::fake::connection_id(generation),
+            Self::Claude(_) => crate::claude::connection_id(generation),
+            Self::Codex(_) => crate::codex::connection_id(generation),
         }
     }
 }
@@ -512,7 +513,7 @@ impl SessionDriver {
     /// The running adapter's version (AD12), which each turn the driver
     /// starts records as the session's (C1 §3.3); `None` without one.
     pub fn adapter_version(&self) -> Option<String> {
-        self.kind.as_ref().and_then(DriverKind::adapter_version)
+        self.kind.as_ref().map(DriverKind::adapter_version)
     }
 
     /// The `SessionSpec` the driver was opened with: a test seam, absent
@@ -552,7 +553,7 @@ impl SessionDriver {
         }
         self.kind
             .as_ref()
-            .and_then(|kind| kind.connection_id(generation))
+            .map(|kind| kind.connection_id(generation))
     }
 
     /// AD16: a live persistent connection is pinned; otherwise the turn
@@ -567,11 +568,24 @@ impl SessionDriver {
         {
             return Prepared::Pinned(ConnectionPin {
                 generation: state.generation,
+                server: None,
             });
+        }
+        if let Some(DriverKind::Codex(codex)) = &self.kind {
+            let generation = state.generation;
+            drop(state);
+            return match codex.prepare(self.spec.inherit.requested) {
+                Some(server) => Prepared::Pinned(ConnectionPin {
+                    generation,
+                    server: Some(server),
+                }),
+                None => Prepared::NeedsConnection,
+            };
         }
         if self.persistent() && state.live && !state.closed {
             Prepared::Pinned(ConnectionPin {
                 generation: state.generation,
+                server: None,
             })
         } else {
             Prepared::NeedsConnection
@@ -588,7 +602,10 @@ impl SessionDriver {
         if let Some(stand_in) = &self.stand_in {
             return Some(stand_in.epoch.subscribe());
         }
-        None
+        match &self.kind {
+            Some(DriverKind::Codex(codex)) => Some(codex.readiness()),
+            Some(DriverKind::Fake(_) | DriverKind::Claude(_)) | None => None,
+        }
     }
 
     /// How the driver's connections are owned (C2 §2): `Shared` on the
@@ -619,8 +636,11 @@ impl SessionDriver {
                 let claude = Arc::clone(claude);
                 crate::claude::run_turn(self, &claude, spec, cx).await
             }
-            // The Codex stub runs no turn yet (via-5lr.3.2).
-            Some(DriverKind::Codex(_)) | None => rejected(AdapterError::Unavailable),
+            Some(DriverKind::Codex(codex)) => {
+                let codex = Arc::clone(codex);
+                crate::codex::run_turn(self, &codex, spec, cx).await
+            }
+            None => rejected(AdapterError::Unavailable),
         }
     }
 
@@ -831,6 +851,10 @@ impl SessionDriver {
         let state = Arc::clone(&self.state);
         let health = Arc::clone(&self.health);
         let cancel = self.cancel.clone();
+        let codex = match &self.kind {
+            Some(DriverKind::Codex(codex)) => Some(Arc::clone(codex)),
+            Some(DriverKind::Fake(_) | DriverKind::Claude(_)) | None => None,
+        };
         async move {
             // The session closes and the stop order is posted together.
             let (stop, retiring) = {
@@ -869,6 +893,11 @@ impl SessionDriver {
                 // No turn ever ran: nothing to clean up.
                 None => true,
             };
+            // A shared route's session detaches from its server and
+            // releases its lease (vendors/codex.md §2).
+            if let Some(codex) = codex {
+                codex.detach(deadline).await;
+            }
             // The driver's own idle work ends with the session.
             cancel.cancel();
             let (released, retirement, vendor_closed) = {

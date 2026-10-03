@@ -106,7 +106,23 @@
         ],
         "unasserted": [],
         "notes": "Commentary agentMessage text is never final text; only phase final_answer items are final_text pieces (C2 §6.2 Observations; vendors/codex.md §5). Usage is the keyless sum of the turn's tokenUsage.last samples, 20522 + 20613 = 41135, equal to the change in total; total goes to vendor only (C2 §5 AD6; vendors/codex.md §7). The delta lines are progress only."
-      }
+      },
+      "gates": [
+        {
+          "step": 26,
+          "expect": {
+            "accepted": true,
+            "terminal": null,
+            "error": null,
+            "observations_include": [
+              {
+                "kind": "final_text",
+                "text": "I couldn’t create `note.txt`: the write was rejected."
+              }
+            ]
+          }
+        }
+      ]
     },
     {
       "session": "main",
@@ -177,7 +193,23 @@
         ],
         "unasserted": [],
         "notes": "Two completed final_answer items: an async question item (delivery async, with questions) and the final message. Per C2 §6.2 both are final_text pieces in order, although turn/completed.items (itemsView summary) holds only the last one. Second turn inherits the bound (C1 P5); identity was confirmed by turn 1. Usage 24785 + 24912."
-      }
+      },
+      "gates": [
+        {
+          "step": 40,
+          "expect": {
+            "accepted": true,
+            "terminal": null,
+            "error": null,
+            "observations_include": [
+              {
+                "kind": "final_text",
+                "text": "What would you like me to answer after your clarification: the `note.txt` result or a new request?"
+              }
+            ]
+          }
+        }
+      ]
     }
   ]
 }

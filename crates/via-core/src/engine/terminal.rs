@@ -936,6 +936,7 @@ mod tests {
             class_hint: None,
             detail: Some("quota exhausted".to_owned()),
             structured_output: None,
+            structured_output_unparsed: None,
             steps: None,
             usage: None,
             cost: None,

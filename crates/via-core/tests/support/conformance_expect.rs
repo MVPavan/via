@@ -333,6 +333,14 @@ pub(crate) struct TurnOutcome {
     pub(crate) observations: Vec<Value>,
     /// The outcome so far at each gate, in the turn's `gates` order.
     pub(crate) gates: Vec<TurnOutcome>,
+    /// `RouteFailure.undecoded`: where the message VIA could not decode was
+    /// kept, or why not. Reported for a test's own checks; no expectation
+    /// key states it.
+    pub(crate) undecoded: Option<String>,
+    /// `RouteFailure.cleanup` as Route stated it (`Uncertain`,
+    /// `Quiescent`), before `TurnEvidence` reads `None` as uncertain; for
+    /// a test's own checks.
+    pub(crate) route_cleanup: Option<String>,
 }
 
 const TOP: &[&str] = &[
@@ -436,6 +444,9 @@ const TERMINAL: &[&str] = &[
     "class_hint",
     "detail",
     "structured_output",
+    // C2 `NotJson` / `OverLimit` as C1 §5's `reason` (`invalid`,
+    // `validation_limit`): a route's structured output that is no value.
+    "structured_output_invalid",
     "steps",
     "cost",
     "vendor",
@@ -506,6 +517,7 @@ const DRIVER_FAILURE: &[&str] = &[
     "server_lost",
     "resume_mismatch",
     "retirement_uncertain",
+    "handshake_refused",
 ];
 const CLOSE_MODE: &[&str] = &["graceful", "force"];
 /// C2 §4 observation kinds and the fields an entry may state for each.
@@ -1258,6 +1270,9 @@ const ERROR: &[&str] = &[
     // C2 §2 identity: `AdapterError::ResumeMismatch { evidence }`, for a
     // mismatch before a terminal was retained; never `Rejected`.
     "resume_mismatch",
+    // C2 §5 AD7: `RouteError::HandshakeRefused`, which Core reports as
+    // `submit_failed` with `failure.data.reason: "handshake_refused"`.
+    "handshake_refused",
 ];
 /// C2 `StartRejected`; a name ending in `:` takes a non-empty suffix.
 const REJECTED: &[&str] = &[
@@ -1835,6 +1850,8 @@ fn ideal_turn(e: &Value) -> TurnOutcome {
         steer: Vec::new(),
         observations: ideal_observations(e),
         gates: Vec::new(),
+        undecoded: None,
+        route_cleanup: None,
     }
 }
 

@@ -30,7 +30,7 @@
 //! before it has fired.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -42,16 +42,17 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, watch};
 use via_adapters::{
-    AdapterError, Admitted, CancellationToken, ClassHint, Cleanup, CloseMode, Deadline, DenialKind,
-    DriverFailure, DriverHealth, InheritPlan, Observation, Prepared, RouteError, RoutePlan,
-    SessionCx, SessionDriver, SessionRef, SessionSpec, StartRejected, SteerDelivery, SteerError,
-    SteerInput, SteerToken, StopCause, StopOrder, StopReason, TaskTracker, TurnActivity, TurnCx,
-    TurnEnd, TurnNumber, TurnSpec, VendorTerminal, VendorTerminalStatus, VendorTurnId,
-    observation_channel,
+    AdapterError, AdapterSet, AdapterShutdown, Admitted, CancellationToken, ClassHint, Cleanup,
+    CloseMode, CloseReport, Deadline, DenialKind, DriverFailure, DriverHealth, InheritPlan,
+    Observation, ObservationItem, ParamSizes, Prepared, RouteError, RoutePlan, SessionCx,
+    SessionDriver, SessionRef, SessionSpec, StartRejected, SteerDelivery, SteerError, SteerInput,
+    SteerToken, StopCause, StopOrder, StopReason, TaskTracker, TurnActivity, TurnCx, TurnEnd,
+    TurnNumber, TurnParams, TurnSpec, UnparsedOutput, VendorTerminal, VendorTerminalStatus,
+    VendorTurnId, observation_channel,
 };
-use via_store::{ResumeRecord, SessionId, SpawnRecord};
+use via_store::{ResumeRecord, SessionId, SpawnRecord, SubmissionRecord, TerminalRecord};
 
-use crate::conformance_drive::Pure;
+use crate::conformance_drive::{Pure, refusal_name};
 use crate::conformance_expect::{TurnOutcome, replay_exit};
 
 /// The wall of a turn whose case states no deadline.
@@ -105,11 +106,45 @@ pub(crate) struct Knobs {
     pub(crate) hold_for: Option<Duration>,
     /// A cancel is ordered this long after the turn starts.
     pub(crate) stop_after: Option<Duration>,
+    /// Each session's health is read once it left `open` (within
+    /// [`FIXTURE_WAIT`]): a failure an idle driver latches after its last
+    /// turn settled (x.3.2 X0 item 13.2).
+    pub(crate) await_failure: bool,
     /// A cancel's stop order is already set when the turn starts (x.3.2
     /// Q5: nothing launches).
     pub(crate) stop_before: bool,
     /// The daemon force is already set when the turn starts (x.3.2 Q5).
     pub(crate) force_before: bool,
+    /// The `run_turn` future of the turn at this index is dropped as Core
+    /// takes its acceptance (x.3.2 X3 fix r2 #7): the turn is abandoned,
+    /// with no end of its own. Its outcome is what was observed, its
+    /// error, terminal and cleanup null.
+    pub(crate) abandon_on_accept: Option<usize>,
+    /// The case injects this many server-registry task panics: the final
+    /// shutdown reports exactly them failed, and nothing else unsettled.
+    pub(crate) panicked_tasks: usize,
+    /// `(admitted, point)`: the turn at index `admitted` is admitted only
+    /// once failpoint `point` paused its first occurrence (its `ack`
+    /// marker exists), and the point is released once that turn's run
+    /// ended (x.3.2 X3 fix r4 #7: an observable gate holds the case's
+    /// window open).
+    pub(crate) admit_while_paused: Option<(usize, &'static str)>,
+    /// `(admitted, earlier)`: the turn at index `admitted` is admitted only
+    /// once Route read, under turn `earlier`'s decode fence, a message it
+    /// delivered for no turn (x.3.2 X3 fix r3 #7: a routing gate).
+    pub(crate) admit_after_routed: Option<(usize, usize)>,
+    /// `(admitted, count)`: the turn at index `admitted` is admitted only
+    /// once its session's channel, drained between turns as Core drains
+    /// it, gave `count` late observations (x.3.2 X3 fix r3 #3).
+    pub(crate) admit_after_late: Option<(usize, usize)>,
+    /// The turn at this index is admitted only once its session's health
+    /// failed (x.3.2 X3 fix r4 #5).
+    pub(crate) admit_after_failure: Option<usize>,
+    /// A session's stated close waits until the fake read this input
+    /// line (`read <n> launch 1`): a late request's reply was written, so
+    /// its placeholder is in the lane before the close (x.3.2 X3 fix r3
+    /// #3).
+    pub(crate) close_after_read: Option<usize>,
 }
 
 /// What a running turn has shown so far, for its side actions.
@@ -142,8 +177,14 @@ struct Session {
     driver: SessionDriver,
     receiver: RefCell<Option<mpsc::Receiver<Admitted>>>,
     plan: RoutePlan,
+    /// The frozen `instructions`' and `cwd`'s sizes in bytes, as Core's
+    /// `check_turn` of a later turn carries them; `None` instructions when
+    /// the session has none.
+    sizes: (Option<usize>, usize),
     /// The turns committed so far.
     turns: RefCell<u32>,
+    /// Each vendor turn an accepted turn named, with the turn's index.
+    vendor_turns: RefCell<Vec<(String, usize)>>,
 }
 
 /// The shared state of one case's run.
@@ -163,6 +204,8 @@ struct Run<'a> {
     ordinals: RefCell<(Vec<String>, Vec<u64>)>,
     tracker: TaskTracker,
     cancel: CancellationToken,
+    /// Each settled turn's activity, by index.
+    settled: RefCell<BTreeMap<usize, TurnActivity>>,
 }
 
 impl Pure {
@@ -177,9 +220,10 @@ impl Pure {
         self.drive_then(expect, replay, knobs, |_| Ok(()))
     }
 
-    /// [`Pure::drive`], then `then` on the adapter set the case ran on,
-    /// once every turn settled: a test's checks of what the run left behind
-    /// (a cached refusal).
+    /// [`Pure::drive`], with `then` on the adapter set the case ran on
+    /// once every turn settled (and every stated close ran), before the
+    /// shutdown closes the rest: a test's checks of what the run left
+    /// behind (a cached refusal, a live server's catalog).
     pub(crate) fn drive_then(
         self,
         expect: &Value,
@@ -209,14 +253,20 @@ impl Pure {
             }
             let opened = (std::mem::take(&mut run.opened), pure.writes()?);
             let turns = run.all().await;
+            if knobs.await_failure {
+                run.until_failed().await;
+            }
             let health = run.health();
-            run.shutdown().await;
-            Ok::<_, String>((turns?, health, opened))
+            let checked = then(&pure);
+            let servers = run.shutdown().await;
+            let turns = turns?;
+            servers?;
+            checked?;
+            Ok::<_, String>((turns, health, opened))
         });
         let (turns, health, (opened, writes)) = result?;
         pure.outcome.checkpoints.after_open.extend(opened);
         pure.outcome.pure_writes = writes;
-        then(&pure)?;
         let launches = pure.launches()?;
         for (index, (outcome, after)) in turns.into_iter().enumerate() {
             if pure.pending.contains(&index) {
@@ -262,8 +312,21 @@ impl<'a> Run<'a> {
                 .ok_or_else(|| format!("session {label} has no turn"))?;
             let id = SessionId::try_from(format!("s_{:012}", number + 1).as_str())
                 .map_err(str::to_owned)?;
-            let cwd = pure.case_dir.path().join(format!("work-{label}"));
-            fs::create_dir_all(&cwd).map_err(|e| format!("cwd: {e}"))?;
+            // A server route sends the session's directory to the vendor,
+            // which the fixture pins: the recorded `cwd` itself, never
+            // created (x.3.2 X3). A per-turn route gets one of the case's.
+            let cwd = if let (Some(_), Some(recorded)) = (&plan.server_key, session["cwd"].as_str())
+            {
+                PathBuf::from(recorded)
+            } else {
+                let cwd = pure.case_dir.path().join(format!("work-{label}"));
+                fs::create_dir_all(&cwd).map_err(|e| format!("cwd: {e}"))?;
+                cwd
+            };
+            let sizes = (
+                session["instructions"].as_str().map(str::len),
+                cwd.as_os_str().len(),
+            );
             let spec = SessionSpec {
                 session_id: id.clone(),
                 model: plan.model.resolved.clone(),
@@ -298,7 +361,9 @@ impl<'a> Run<'a> {
                     driver,
                     receiver: RefCell::new(Some(receiver)),
                     plan: plan.clone(),
+                    sizes,
                     turns: RefCell::new(0),
+                    vendor_turns: RefCell::default(),
                 },
             );
         }
@@ -317,6 +382,7 @@ impl<'a> Run<'a> {
             ordinals: RefCell::new((Vec::new(), Vec::new())),
             tracker,
             cancel,
+            settled: RefCell::new(BTreeMap::new()),
         })
     }
 
@@ -340,6 +406,13 @@ impl<'a> Run<'a> {
         self.start_condition(index, turn).await?;
         let label = session_of(turn).to_owned();
         let mut ran = Ran::default();
+        // Dropped once the turn's run ended, or on an early error, so the
+        // paused point never holds the case past it.
+        let release = self
+            .knobs
+            .admit_while_paused
+            .filter(|(at, _)| *at == index)
+            .map(|(_, point)| Release(point));
         if !self.pure.pending.contains(&index) {
             self.dispatch(index, turn).await?;
         }
@@ -348,7 +421,15 @@ impl<'a> Run<'a> {
                 .sessions
                 .get(&label)
                 .ok_or_else(|| format!("turn {index}: session {label} was not opened"))?;
-            ran.turn = self.run_turn(index, turn, session).await?;
+            let spec = self.turn_spec(turn)?;
+            ran.turn = match resume_refusal(&self.pure.set, session, &spec) {
+                Some(refusal) => TurnOutcome {
+                    plan_refusal: Some(refusal),
+                    ..TurnOutcome::default()
+                },
+                None => self.run_turn(index, turn, session).await?,
+            };
+            drop(release);
             let last = self.expect["turns"]
                 .as_array()
                 .and_then(|turns| turns.iter().rposition(|t| session_of(t) == label));
@@ -359,8 +440,12 @@ impl<'a> Run<'a> {
                     Some("force") => CloseMode::Force,
                     _ => CloseMode::Graceful,
                 };
+                if let Some(read) = self.knobs.close_after_read {
+                    self.until_progress(&format!("read {read} launch 1"))
+                        .await?;
+                }
                 let deadline = Deadline::at(tokio::time::Instant::now() + CLOSE_DEADLINE);
-                let report = session.driver.close(mode, deadline).await;
+                let report = self.close_draining(session, mode, deadline).await;
                 ran.close = Some((
                     label.clone(),
                     json!({
@@ -393,6 +478,92 @@ impl<'a> Run<'a> {
         } else if index > 0 {
             let mut seen = self.seen[index - 1].subscribe();
             let _ = seen.wait_for(|seen| seen.settled).await;
+        }
+        if let Some((at, point)) = self.knobs.admit_while_paused
+            && at == index
+        {
+            paused(point).await?;
+        }
+        if let Some((at, earlier)) = self.knobs.admit_after_routed
+            && at == index
+        {
+            self.routed_after(earlier).await?;
+        }
+        if let Some((at, count)) = self.knobs.admit_after_late
+            && at == index
+        {
+            self.late_between_turns(turn, count).await?;
+        }
+        if self.knobs.admit_after_failure == Some(index) {
+            self.health_failed(turn).await?;
+        }
+        Ok(())
+    }
+
+    /// Resolves once the health of the session of `turn` failed, within
+    /// [`FIXTURE_WAIT`].
+    async fn health_failed(&self, turn: &Value) -> Result<(), String> {
+        let label = session_of(turn);
+        let session = self
+            .sessions
+            .get(label)
+            .ok_or_else(|| format!("session {label} was not opened"))?;
+        let mut health = session.driver.health();
+        let failed = health.wait_for(|health| matches!(health, DriverHealth::Failed { .. }));
+        match tokio::time::timeout(FIXTURE_WAIT, failed).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(_)) | Err(_) => Err(format!("session {label}'s health never failed")),
+        }
+    }
+
+    /// Drains the session of `turn` between its turns, as Core does,
+    /// until [`Pure::late`] holds `count` observations, within
+    /// [`FIXTURE_WAIT`].
+    async fn late_between_turns(&self, turn: &Value, count: usize) -> Result<(), String> {
+        let label = session_of(turn);
+        let session = self
+            .sessions
+            .get(label)
+            .ok_or_else(|| format!("session {label} was not opened"))?;
+        let mut receiver = session
+            .receiver
+            .borrow_mut()
+            .take()
+            .ok_or("the session's channel is in use")?;
+        let started = tokio::time::Instant::now();
+        let mut outcome = Ok(());
+        while self.pure.late.borrow().len() < count {
+            let left = FIXTURE_WAIT.saturating_sub(started.elapsed());
+            let Ok(Some(admitted)) = tokio::time::timeout(left, receiver.recv()).await else {
+                outcome = Err(format!(
+                    "{} of {count} late observations between turns",
+                    self.pure.late.borrow().len()
+                ));
+                break;
+            };
+            self.observe_late(session, &admitted.item);
+        }
+        *session.receiver.borrow_mut() = Some(receiver);
+        outcome
+    }
+
+    /// Resolves once Route read, under settled turn `earlier`'s decode
+    /// fence, a message it delivered for no turn, within [`FIXTURE_WAIT`].
+    async fn routed_after(&self, earlier: usize) -> Result<(), String> {
+        let activity = self
+            .settled
+            .borrow()
+            .get(&earlier)
+            .cloned()
+            .ok_or_else(|| format!("turn {earlier} has not settled"))?;
+        let started = tokio::time::Instant::now();
+        while activity.decoded() <= activity.delivered() {
+            if started.elapsed() > FIXTURE_WAIT {
+                return Err(format!(
+                    "nothing undelivered was routed under turn {earlier}'s fence"
+                ));
+            }
+            tokio::time::sleep(POLL).await;
         }
         Ok(())
     }
@@ -437,36 +608,78 @@ impl<'a> Run<'a> {
                 .await
                 .map(drop)
         } else {
+            // A server route's turn stays running until its terminal
+            // commits, as Core commits it; the harness ends it here so the
+            // next submission may run (x.3.2 X3).
+            if session.plan.server_key.is_some() {
+                let previous =
+                    TurnNumber::try_from(number - 1).map_err(|e| format!("turn number: {e:?}"))?;
+                let seq = client
+                    .next_seq(&session.id)
+                    .await
+                    .map_err(|e| format!("next seq: {e}"))?
+                    .ok_or("no next seq")?;
+                client
+                    .commit_terminal(TerminalRecord {
+                        session_id: session.id.clone(),
+                        turn: previous,
+                        envelope: json!({"state": "failed"}),
+                        event: json!({"seq": seq, "type": "turn.ended", "turn": number - 1, "at": at}),
+                        steps: Vec::new(),
+                        link_released: true,
+                    })
+                    .await
+                    .map_err(|e| format!("end turn {}: {e}", number - 1))?;
+            }
+            // A server route's submissions took sequence numbers too.
+            let seq = if session.plan.server_key.is_some() {
+                client
+                    .next_seq(&session.id)
+                    .await
+                    .map_err(|e| format!("next seq: {e}"))?
+                    .ok_or("no next seq")?
+            } else {
+                u64::from(number)
+            };
             client
                 .commit_resume(ResumeRecord {
                     session_id: session.id.clone(),
                     turn,
                     prompt: prompt.into(),
                     effective: json!({"deadlines": {"wall_ms": 1}}),
-                    event: json!({"seq": number, "type": "turn.queued", "turn": number, "at": at}),
+                    event: json!({"seq": seq, "type": "turn.queued", "turn": number, "at": at}),
                     operation: None,
                 })
                 .await
                 .map(drop)
         };
         committed.map_err(|e| format!("commit turn {number}: {e}"))?;
+        // A server route links the turn to its server, which needs the
+        // turn running, as Core's submission makes it (x.3.2 X3).
+        if session.plan.server_key.is_some() {
+            let seq = client
+                .next_seq(&session.id)
+                .await
+                .map_err(|e| format!("next seq: {e}"))?
+                .ok_or("no next seq")?;
+            client
+                .commit_submission(SubmissionRecord {
+                    session_id: session.id.clone(),
+                    turn,
+                    event: json!({"seq": seq, "type": "turn.submitted", "turn": number, "at": at}),
+                })
+                .await
+                .map_err(|e| format!("submit turn {number}: {e}"))?;
+        }
         Ok(turn)
     }
 
-    /// Runs one planned turn beside its side actions and collects its
-    /// outcome.
-    async fn run_turn(
-        &self,
-        index: usize,
-        turn: &Value,
-        session: &Session,
-    ) -> Result<TurnOutcome, String> {
+    /// The turn's spec, from its `params` and its session's vendor
+    /// options.
+    fn turn_spec(&self, turn: &Value) -> Result<TurnSpec, String> {
         let params = &turn["params"];
-        let prompt = params["prompt"].as_str().unwrap_or_default().to_owned();
-        let number = self.commit(session, &prompt).await?;
-        self.dispatch(index, turn).await?;
-        let spec = TurnSpec {
-            prompt,
+        Ok(TurnSpec {
+            prompt: params["prompt"].as_str().unwrap_or_default().to_owned(),
             effort: params["effort"].as_str().map(str::to_owned),
             bound: optional(&params["bound"])?,
             output_schema: if params["output_schema"].is_null() {
@@ -480,23 +693,32 @@ impl<'a> Run<'a> {
             max_steps: params["max_steps"].as_u64(),
             vendor: optional(&self.expect["sessions"][session_of(turn)]["vendor_options"])?
                 .unwrap_or_default(),
-        };
-        let wall = turn["deadlines"]["wall_ms"]
-            .as_u64()
-            .map_or(WALL, Duration::from_millis);
-        let tool_grace = turn["tool_grace_ms"]
-            .as_u64()
-            .map_or(TOOL_GRACE, Duration::from_millis);
+        })
+    }
+
+    /// Runs one planned turn beside its side actions and collects its
+    /// outcome.
+    async fn run_turn(
+        &self,
+        index: usize,
+        turn: &Value,
+        session: &Session,
+    ) -> Result<TurnOutcome, String> {
+        let spec = self.turn_spec(turn)?;
+        let number = self.commit(session, &spec.prompt).await?;
+        self.dispatch(index, turn).await?;
+        let (wall, tool_grace) = bounds(turn);
         let now = tokio::time::Instant::now();
         let ((stop, stop_rx), (force, force_rx)) = self.ordered_before(now);
         let prepared = session.driver.prepare();
         let capacity = matches!(prepared, Prepared::NeedsConnection)
             .then(|| Box::new(()) as via_adapters::CapacityToken);
+        let activity = TurnActivity::new(now);
         let cx = TurnCx {
             turn: number,
             prepared,
             capacity,
-            activity: TurnActivity::new(now),
+            activity: activity.clone(),
             wall: Deadline::at(now + wall),
             tool_grace,
             stop: stop_rx,
@@ -511,6 +733,8 @@ impl<'a> Run<'a> {
             .ok_or("the session's channel is in use")?;
         let seen = &self.seen[index];
         let (ended_tx, ended) = watch::channel(false);
+        let tools = RefCell::new(Tools::default());
+        let settled = std::cell::Cell::new(None);
         let drain = async {
             let waiting = self.consumer_hold();
             tokio::pin!(waiting);
@@ -523,9 +747,18 @@ impl<'a> Run<'a> {
                         result = &mut waiting, if released.is_none() => released = Some(result),
                         Some(admitted) = receiver.recv(),
                             if released.is_some() && !self.knobs.stall_consumer => {
-                            self.observe(&admitted.item.observation, seen, &observed);
+                            tools.borrow_mut().track(&admitted.item);
+                            self.observe(&admitted.item, (session, index), seen, &observed);
+                            if self.knobs.abandon_on_accept == Some(index)
+                                && matches!(admitted.item.observation, Observation::Accepted(_))
+                            {
+                                break None;
+                            }
                         }
-                        end = &mut running => break end,
+                        end = &mut running => {
+                            settled.set(Some(tokio::time::Instant::now()));
+                            break Some(end);
+                        }
                     }
                 }
             };
@@ -535,30 +768,48 @@ impl<'a> Run<'a> {
                 waiting.await
             };
             while let Ok(admitted) = receiver.try_recv() {
-                self.observe(&admitted.item.observation, seen, &observed);
+                tools.borrow_mut().track(&admitted.item);
+                self.observe(&admitted.item, (session, index), seen, &observed);
             }
             ended_tx.send_replace(true);
             released.map(|()| end)
         };
         let side = self.side(
             turn,
-            (session, number),
+            (session, number, &activity),
             (seen, ended.clone()),
             (&stop, &observed),
         );
         let forcing = self.timed(&force, &stop, ended.clone());
         let (end, (steer, gates), ()) = tokio::join!(drain, side, forcing);
         *session.receiver.borrow_mut() = Some(receiver);
-        let end = end?;
+        self.settle_fence(index, &activity);
+        let Some(end) = end? else {
+            return Ok(abandoned(&observed.borrow(), session, steer, gates?));
+        };
         let mut outcome = Self::outcome(&end, session, &observed.borrow());
         outcome.group_absent = self.group_absent(&session.id, number).await?;
         outcome.steer = steer;
         outcome.gates = gates?;
         outcome.stop_facts = stop_facts(turn, &end);
+        // Only a stopped turn on a server route settles its cleanup apart
+        // from its end (C1 P7); elsewhere the field is null.
+        if session.plan.server_key.is_some() && !turn["stop"].is_null() {
+            outcome.cleanup_settles = settled.get().map(|settled| {
+                settles(&end, &tools.borrow(), settled, (now + wall, tool_grace)).to_owned()
+            });
+        }
         if self.pure.launches()? > launches_before && session.plan.server_key.is_none() {
             self.judge_launch(launches_before + 1, session, number, &end)?;
         }
         Ok(outcome)
+    }
+
+    /// Records settled turn `index`'s decode fence and keeps its activity.
+    fn settle_fence(&self, index: usize, activity: &TurnActivity) {
+        let fence = (activity.decoded(), activity.delivered());
+        self.pure.fences.borrow_mut().insert(index, fence);
+        self.settled.borrow_mut().insert(index, activity.clone());
     }
 
     /// The turn's stop and force channels: a turn starting at `now` finds
@@ -640,13 +891,88 @@ impl<'a> Run<'a> {
         Ok(())
     }
 
+    /// Closes `session` as Core does, draining its channel beside the
+    /// close (X0 item 8.2, K1): what its driver delivers once no turn runs
+    /// is an earlier turn's late observation, kept in [`Pure::late`]
+    /// (x.3.2 X3 fix r3 #3).
+    async fn close_draining(
+        &self,
+        session: &Session,
+        mode: CloseMode,
+        deadline: Deadline,
+    ) -> CloseReport {
+        let mut receiver = session.receiver.borrow_mut().take();
+        let closing = session.driver.close(mode, deadline);
+        tokio::pin!(closing);
+        let report = loop {
+            let Some(channel) = receiver.as_mut() else {
+                break closing.await;
+            };
+            tokio::select! {
+                report = &mut closing => break report,
+                Some(admitted) = channel.recv() => self.observe_late(session, &admitted.item),
+            }
+        };
+        if let Some(channel) = receiver.as_mut() {
+            while let Ok(admitted) = channel.try_recv() {
+                self.observe_late(session, &admitted.item);
+            }
+        }
+        *session.receiver.borrow_mut() = receiver;
+        report
+    }
+
+    /// An observation delivered while no turn runs: one naming a vendor
+    /// turn of the session is that turn's late observation.
+    fn observe_late(&self, session: &Session, item: &ObservationItem) {
+        let earlier = item.vendor_turn.as_ref().and_then(|named| {
+            let turns = session.vendor_turns.borrow();
+            turns
+                .iter()
+                .find(|(known, _)| known.as_str() == named.as_str())
+                .map(|(_, at)| *at)
+        });
+        if let Some(earlier) = earlier {
+            let shaped = self.shape(&item.observation);
+            self.pure.late.borrow_mut().push((earlier, shaped));
+        }
+    }
+
     /// Takes one observation: its checker shape, and the turn's events.
+    /// One naming the vendor turn an earlier turn of the session accepted
+    /// is that turn's late observation, as Core attributes it (C1 §6.1
+    /// AD4): kept in [`Pure::late`], not the turn's.
     fn observe(
         &self,
-        observation: &Observation,
+        item: &ObservationItem,
+        (session, index): (&Session, usize),
         seen: &watch::Sender<Seen>,
         observed: &Rc<RefCell<Vec<Value>>>,
     ) {
+        let observation = &item.observation;
+        let named = item
+            .vendor_turn
+            .as_ref()
+            .map(|turn| turn.as_str().to_owned());
+        if let (Observation::Accepted(_), Some(named)) = (observation, &named) {
+            session
+                .vendor_turns
+                .borrow_mut()
+                .push((named.clone(), index));
+        } else if let Some(earlier) = named
+            .and_then(|named| {
+                let turns = session.vendor_turns.borrow();
+                turns
+                    .iter()
+                    .find(|(known, _)| *known == named)
+                    .map(|(_, at)| *at)
+            })
+            .filter(|earlier| *earlier != index)
+        {
+            let shaped = self.shape(observation);
+            self.pure.late.borrow_mut().push((earlier, shaped));
+            return;
+        }
         seen.send_modify(|seen| match observation {
             Observation::Accepted(_) => {
                 seen.accepted = true;
@@ -723,7 +1049,7 @@ impl<'a> Run<'a> {
     async fn side(
         &self,
         turn: &Value,
-        (session, number): (&Session, TurnNumber),
+        (session, number, activity): (&Session, TurnNumber, &TurnActivity),
         (seen, ended): (&watch::Sender<Seen>, watch::Receiver<bool>),
         (stop_order, observed): (&watch::Sender<Option<StopOrder>>, &Rc<RefCell<Vec<Value>>>),
     ) -> (Vec<String>, Result<Vec<TurnOutcome>, String>) {
@@ -805,6 +1131,8 @@ impl<'a> Run<'a> {
                 if let Some(ms) = gate["advance_ms"].as_u64() {
                     tokio::time::sleep(Duration::from_millis(ms)).await;
                 }
+                let sample = (activity.decoded(), activity.delivered());
+                self.pure.gate_fences.borrow_mut().push(sample);
                 snapshots.push(snapshot(&observed.borrow(), &session.plan));
                 self.signal(launch)?;
                 self.until_progress(&format!("signalled {step} launch {launch}"))
@@ -914,6 +1242,10 @@ impl<'a> Run<'a> {
         let mut outcome = snapshot(observed, &session.plan);
         outcome.rejected = rejected;
         outcome.error = error;
+        if let Err(AdapterError::Route(failure)) = &end.outcome {
+            outcome.undecoded.clone_from(&failure.undecoded);
+            outcome.route_cleanup = failure.cleanup.map(|cleanup| format!("{cleanup:?}"));
+        }
         outcome.terminal = end.terminal.as_ref().map(terminal);
         outcome.usage = end
             .terminal
@@ -925,6 +1257,11 @@ impl<'a> Run<'a> {
                 usage["scope"] = json!(session.plan.capabilities.usage.tokens);
                 usage
             });
+        // A server route's terminal carries no usage: Core sums its samples
+        // (x.3.2 X3).
+        if outcome.usage.is_none() && session.plan.server_key.is_some() {
+            outcome.usage = sampled_usage(observed, &session.plan);
+        }
         outcome.cleanup = Some(cleanup.to_owned());
         outcome.instance = end.instance.as_ref().map(|instance| {
             json!({"vendor_version": instance.vendor_version,
@@ -981,6 +1318,19 @@ impl<'a> Run<'a> {
     }
 
     /// Each session's health after the case.
+    /// Waits until no session's driver is `open`, within [`FIXTURE_WAIT`].
+    async fn until_failed(&self) {
+        let started = tokio::time::Instant::now();
+        while started.elapsed() < FIXTURE_WAIT
+            && self
+                .sessions
+                .values()
+                .any(|session| *session.driver.health().borrow() == DriverHealth::Open)
+        {
+            tokio::time::sleep(POLL).await;
+        }
+    }
+
     fn health(&self) -> BTreeMap<String, Value> {
         self.sessions
             .iter()
@@ -998,17 +1348,263 @@ impl<'a> Run<'a> {
             .collect()
     }
 
-    /// Ends the sessions' owned work, then the adapter set's.
-    async fn shutdown(self) {
+    /// Closes every server-route session whose case states no close, so
+    /// its lease goes and the idle server retires (x.3.2 X3), checking each
+    /// report; judges each server launch by the replay's own verdict
+    /// ([`Self::judge_servers`]); then ends the sessions' owned work and
+    /// the adapter set's. The case fails when that work outlives
+    /// [`FIXTURE_WAIT`], or the adapter set's shutdown reports a pending,
+    /// unjoined or failed task, a failure, or Host uncertainty (x.3.2 X3
+    /// fix r2 #12).
+    async fn shutdown(self) -> Result<(), String> {
+        let mut unclean = Vec::new();
+        for (label, session) in &self.sessions {
+            if session.plan.server_key.is_some()
+                && self.expect["sessions"][label]["close"].is_null()
+            {
+                let failed = matches!(
+                    *session.driver.health().borrow(),
+                    DriverHealth::Failed { .. }
+                );
+                let deadline = Deadline::at(tokio::time::Instant::now() + CLOSE_DEADLINE);
+                let report = self
+                    .close_draining(session, CloseMode::Graceful, deadline)
+                    .await;
+                // An unstated close of a healthy session must leave nothing
+                // uncertain; a case whose close does states it, and a failed
+                // session's uncertainty is its health's (x.3.2 X3 fix r1,
+                // ruling 21).
+                if !failed && report.cleanup != Cleanup::Quiescent {
+                    unclean.push(format!(
+                        "session {label}'s shutdown close: cleanup {}",
+                        cleanup_name(report.cleanup)
+                    ));
+                }
+            }
+        }
+        let judged = self.judge_servers().await;
         self.cancel.cancel();
         self.tracker.close();
-        let _ = tokio::time::timeout(FIXTURE_WAIT, self.tracker.wait()).await;
+        if tokio::time::timeout(FIXTURE_WAIT, self.tracker.wait())
+            .await
+            .is_err()
+        {
+            unclean.push(format!(
+                "the sessions' owned tasks still ran {FIXTURE_WAIT:?} after the run ended"
+            ));
+        }
         let deadline = Deadline::at(tokio::time::Instant::now() + FIXTURE_WAIT);
-        self.pure.set.shutdown(deadline, &[]).await;
+        let report = self.pure.set.shutdown(deadline, &[]).await;
+        unclean.extend(shutdown_problem(&report, self.knobs.panicked_tasks));
+        judged?;
+        match unclean.first() {
+            Some(first) => Err(first.clone()),
+            None => Ok(()),
+        }
+    }
+
+    /// Each server's vendor pid, by server ID, from the Store's anchor
+    /// records.
+    async fn server_pids(&self) -> Result<std::collections::HashMap<String, u32>, String> {
+        let (_, journal) = self.pure.store().runtime_resources().into_wire_parts();
+        let mut pids = std::collections::HashMap::new();
+        let mut after = None;
+        loop {
+            let page = journal
+                .list_anchor_records_page(after, via_store::ANCHOR_PAGE_LIMIT)
+                .await
+                .map_err(|e| format!("anchor records: {e:?}"))?;
+            let full = page.len() == via_store::ANCHOR_PAGE_LIMIT as usize;
+            after = page.last().map(|record| record.intent.anchor_id.clone());
+            for record in page {
+                if let (via_store::ProcessOwner::Server { server_id }, Some(pid)) =
+                    (&record.intent.owner, record.vendor_pid)
+                {
+                    pids.insert(server_id.as_str().to_owned(), pid);
+                }
+            }
+            if !full {
+                return Ok(pids);
+            }
+        }
+    }
+
+    /// Whether a session of the case runs on a server route.
+    fn shared(&self) -> bool {
+        self.sessions
+            .values()
+            .any(|session| session.plan.server_key.is_some())
+    }
+
+    /// Once every server launch ended (its last lease went, so its idle
+    /// retirement closed stdin), each is judged by the replay's own verdict
+    /// ([`replay_exit`]) from its exit and its `stderr.log`, against the
+    /// lifetime its own process ran (x.3.2 X3; fix r1, ruling 21 and minor
+    /// 24; fix r3 #6), in every build.
+    async fn judge_servers(&self) -> Result<(), String> {
+        let launches = usize::try_from(self.pure.launches()?).map_err(|e| e.to_string())?;
+        if !self.shared() || launches == 0 {
+            return Ok(());
+        }
+        let started = tokio::time::Instant::now();
+        let ended = loop {
+            let ended = self.pure.set.ended_servers();
+            if ended.len() >= launches {
+                break ended;
+            }
+            if started.elapsed() > FIXTURE_WAIT {
+                return Err(format!(
+                    "{} of {launches} server launches ended",
+                    ended.len()
+                ));
+            }
+            tokio::time::sleep(POLL).await;
+        };
+        let pids = self.server_pids().await?;
+        let log = self.pure.launch_pids()?;
+        for (server, launch, code) in &ended {
+            // The lifetime the server's own process ran: its pid's line in
+            // the fake's launch log (x.3.2 X3 fix r3 #6), not the
+            // registry's ordinal, which concurrent starts can reorder.
+            let pid = pids
+                .get(server)
+                .ok_or_else(|| format!("server launch {launch}: no anchor pid"))?;
+            let index = log.iter().position(|logged| logged == pid).ok_or_else(|| {
+                format!("server launch {launch}: pid {pid} not in the launch log")
+            })?;
+            let fixture = match self.replay.get("lifetimes").and_then(Value::as_array) {
+                Some(lifetimes) => lifetimes
+                    .get(index)
+                    .ok_or_else(|| format!("launch {} has no lifetime", index + 1))?,
+                None => self.replay,
+            };
+            let stderr = fs::read_to_string(
+                self.pure
+                    .evidence_dir()
+                    .join("servers")
+                    .join(server)
+                    .join("stderr.log"),
+            )
+            .unwrap_or_default();
+            replay_exit(fixture, *code, &stderr)
+                .map_err(|why| format!("server launch {launch}: {why}"))?;
+        }
+        Ok(())
     }
 }
 
-/// One turn's future in the run: its result and the launches after it.
+/// What the adapter set's final shutdown left unsettled, if anything:
+/// pending or unjoined tasks, failed tasks but the `panicked` registry
+/// tasks the case injected, a failure but theirs, or an anchor or turn
+/// without absence proof.
+fn shutdown_problem(report: &AdapterShutdown, panicked: usize) -> Option<String> {
+    let uncertain = report
+        .recovery
+        .iter()
+        .filter(|turn| turn.cleanup != Cleanup::Quiescent || turn.forced)
+        .count();
+    let injected =
+        (panicked > 0).then(|| format!("server registry: 0 tasks unjoined, {panicked} failed"));
+    let clean = report.pending_tasks == 0
+        && report.failed_tasks == panicked
+        && report.uncertain_anchors == 0
+        && uncertain == 0
+        && report.failure == injected;
+    (!clean).then(|| {
+        format!(
+            "adapter shutdown: {} pending and {} failed tasks, {} uncertain anchors, \
+             {uncertain} uncertain turns, failure {:?}",
+            report.pending_tasks, report.failed_tasks, report.uncertain_anchors, report.failure
+        )
+    })
+}
+
+/// A turn's wall and tool grace: its own, else the defaults.
+fn bounds(turn: &Value) -> (Duration, Duration) {
+    let wall = turn["deadlines"]["wall_ms"]
+        .as_u64()
+        .map_or(WALL, Duration::from_millis);
+    let tool_grace = turn["tool_grace_ms"]
+        .as_u64()
+        .map_or(TOOL_GRACE, Duration::from_millis);
+    (wall, tool_grace)
+}
+
+/// An abandoned turn's outcome ([`Knobs::abandon_on_accept`]): what was
+/// observed, with no end of its own (its cleanup null).
+fn abandoned(
+    observed: &[Value],
+    session: &Session,
+    steer: Vec<String>,
+    gates: Vec<TurnOutcome>,
+) -> TurnOutcome {
+    let mut outcome = snapshot(observed, &session.plan);
+    outcome.cleanup = None;
+    outcome.steer = steer;
+    outcome.gates = gates;
+    outcome
+}
+
+/// When a turn's reported tools last all ended, from the observations'
+/// decode stamps.
+#[derive(Default)]
+struct Tools {
+    open: BTreeSet<String>,
+    all_ended: Option<tokio::time::Instant>,
+}
+
+impl Tools {
+    fn track(&mut self, item: &ObservationItem) {
+        let Observation::Progress(marks) = &item.observation else {
+            return;
+        };
+        for (id, _) in &marks.tools_started {
+            self.open.insert(id.clone());
+        }
+        let mut ended = false;
+        for id in &marks.tools_ended {
+            ended |= self.open.remove(id);
+        }
+        if ended && self.open.is_empty() {
+            self.all_ended = Some(item.at);
+        }
+    }
+}
+
+/// How close two instants must be to count as one moment.
+const SETTLE_SLACK: Duration = Duration::from_millis(100);
+
+/// `cleanup_settles` (the checker's module docs): `at_terminal` when the
+/// turn settled with its terminal, `when_tools_end` when its last tool
+/// ended first, `at_p7_bound` when it settled at `min(ack + tool_grace,
+/// wall)` (the acknowledgement is the interrupted terminal), else a name
+/// the checker refuses.
+fn settles(
+    end: &TurnEnd,
+    tools: &Tools,
+    settled: tokio::time::Instant,
+    (wall, tool_grace): (tokio::time::Instant, Duration),
+) -> &'static str {
+    let near = |at: tokio::time::Instant| {
+        settled.saturating_duration_since(at) <= SETTLE_SLACK
+            && at.saturating_duration_since(settled) <= SETTLE_SLACK
+    };
+    let ack = end.terminal.as_ref().map(|terminal| terminal.at);
+    if ack.is_some_and(near) {
+        return "at_terminal";
+    }
+    if tools.all_ended.is_some_and(near) {
+        return "when_tools_end";
+    }
+    let bound = ack.map_or(wall, |ack| wall.min(ack + tool_grace));
+    if near(bound) {
+        "at_p7_bound"
+    } else {
+        "unclassified"
+    }
+}
+
+/// One turn's future in the run: its result and the launches after it./// One turn's future in the run: its result and the launches after it.
 type Running<'a> = Pin<Box<dyn Future<Output = Result<(Ran, u64), String>> + 'a>>;
 
 /// Polls every future to completion, in place; outputs in input order.
@@ -1040,6 +1636,43 @@ fn session_of(turn: &Value) -> &str {
 }
 
 /// A typed value, or none when null or absent.
+/// Core's resume intake: a later turn's `check_turn` of its values against
+/// the session's frozen ones, before its receipt (C2 §2, AD18). `Some` is
+/// the refusal's C2 name; a session's first turn was checked at its spawn.
+fn resume_refusal(set: &AdapterSet, session: &Session, spec: &TurnSpec) -> Option<String> {
+    if *session.turns.borrow() == 0 {
+        return None;
+    }
+    let (instructions, cwd) = session.sizes;
+    let params = TurnParams {
+        effort: spec.effort.clone(),
+        bound: spec.bound.clone(),
+        output_schema: spec.output_schema.is_some(),
+        instructions: instructions.is_some(),
+        max_steps: spec.max_steps,
+        vendor: spec.vendor.clone(),
+        sizes: ParamSizes {
+            instructions: instructions.unwrap_or_default(),
+            output_schema: spec
+                .output_schema
+                .as_ref()
+                .map_or(0, |schema| schema.get().len()),
+            cwd,
+            model: session.plan.model.resolved.len(),
+        },
+        inherit: Some(session.plan.inherit.requested),
+        model: Some(session.plan.model.resolved.clone()),
+    };
+    let session_ref = SessionRef {
+        harness: session.plan.harness.to_owned(),
+        route: session.plan.route.to_owned(),
+        adapter_version: session.plan.adapter_version.clone(),
+    };
+    set.check_turn(&session_ref, &params)
+        .err()
+        .map(|refusal| refusal_name(&refusal))
+}
+
 fn optional<T: serde::de::DeserializeOwned>(value: &Value) -> Result<Option<T>, String> {
     if value.is_null() {
         return Ok(None);
@@ -1126,6 +1759,7 @@ fn terminal(terminal: &VendorTerminal) -> Value {
         "class_hint": terminal.class_hint.map(class_hint),
         "detail": terminal.detail,
         "structured_output": raw(terminal.structured_output.as_deref()),
+        "structured_output_invalid": terminal.structured_output_unparsed.map(UnparsedOutput::reason),
         "steps": terminal.steps,
         "cost": match &terminal.cost {
             Some(cost) => json!({"usd": number(cost.usd), "scope": cost.scope,
@@ -1147,6 +1781,37 @@ fn number(value: f64) -> Value {
     #[expect(clippy::float_cmp, reason = "an exact round trip is the test")]
     let exact = whole as f64 == value && value.abs() < 9.0e15;
     if exact { json!(whole) } else { json!(value) }
+}
+
+/// A server route's turn usage when its terminal carries none: the sum
+/// of its keyless progress samples (C2 §5 AD6; Codex's samples are
+/// keyless), as Core figures it (x.3.2 X3). `None` without a sample.
+fn sampled_usage(observed: &[Value], plan: &RoutePlan) -> Option<Value> {
+    const FIELDS: [&str; 5] = [
+        "input_tokens",
+        "cached_input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+        "total_tokens",
+    ];
+    let samples: Vec<&Value> = observed
+        .iter()
+        .filter(|observation| observation["kind"] == "progress")
+        .map(|observation| &observation["usage"])
+        .filter(|usage| !usage.is_null())
+        .collect();
+    if samples.is_empty() {
+        return None;
+    }
+    let mut usage = json!({"from": "samples", "scope": plan.capabilities.usage.tokens});
+    for field in FIELDS {
+        let sum = samples
+            .iter()
+            .map(|sample| sample[field].as_u64())
+            .sum::<Option<u64>>();
+        usage[field] = json!(sum);
+    }
+    Some(usage)
 }
 
 fn usage_sample(sample: &via_adapters::UsageSample) -> Value {
@@ -1252,7 +1917,8 @@ fn error_name(error: &AdapterError) -> Option<String> {
 
 fn route_cause(cause: &RouteError) -> &'static str {
     match cause {
-        RouteError::Protocol { .. } | RouteError::HandshakeRefused { .. } => "protocol",
+        RouteError::Protocol { .. } => "protocol",
+        RouteError::HandshakeRefused { .. } => "handshake_refused",
         RouteError::TransportLost { .. } => "transport_lost",
         RouteError::ProcessExited { .. } => "process_exit",
         RouteError::Overflow { .. } => "overflow",
@@ -1291,11 +1957,40 @@ impl Pure {
     }
 
     /// The Store the adapter set runs on.
-    #[expect(
-        clippy::used_underscore_binding,
-        reason = "the pure half only holds the Store open; the run half commits to it"
-    )]
     fn store(&self) -> &via_store::Store {
-        &self._store
+        &self.store
+    }
+}
+
+/// The marker failpoint `point`'s first occurrence publishes, of `kind`
+/// (`ack` or `release`), in the active controller's folder.
+fn marker(point: &str, kind: &str) -> Result<PathBuf, String> {
+    let (dir, _) = via_store::failpoint::activation()
+        .ok_or_else(|| format!("failpoint {point} is not armed"))?;
+    Ok(dir.join(format!("{point}.1.{kind}")))
+}
+
+/// Resolves once failpoint `point` paused its first occurrence: its
+/// acknowledgement is published before it pauses, within [`FIXTURE_WAIT`].
+async fn paused(point: &str) -> Result<(), String> {
+    let ack = marker(point, "ack")?;
+    let published = async {
+        while fs::symlink_metadata(&ack).is_err() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::time::timeout(FIXTURE_WAIT, published)
+        .await
+        .map_err(|_| format!("failpoint {point} never paused"))
+}
+
+/// Releases failpoint `point`'s first occurrence when dropped.
+struct Release(&'static str);
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        if let Ok(release) = marker(self.0, "release") {
+            let _ = fs::write(release, b"");
+        }
     }
 }

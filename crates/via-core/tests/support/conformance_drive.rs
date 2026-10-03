@@ -64,9 +64,21 @@ pub(crate) struct Pure {
     pub(crate) set: AdapterSet,
     /// The Store's and the runtime directory's parent.
     pub(crate) state: tempfile::TempDir,
-    /// The Store the adapter set runs on; the run half commits turns to it.
-    pub(crate) _store: Store,
+    /// The Store the adapter set runs on; the run half commits turns to it
+    /// and reads the server anchors' pids from it.
+    pub(crate) store: Store,
     pub(crate) name: String,
+    /// Each run turn's decode fence once it settled, by index: Route's
+    /// decode watermark and the position the Adapter delivered through
+    /// (runtime §8; x.3.2 critical r2 #2).
+    pub(crate) fences: std::cell::RefCell<BTreeMap<usize, (u64, u64)>>,
+    /// Each late observation (C1 §6.1 AD4, as Core attributes it): one
+    /// naming the vendor turn an earlier turn of its session accepted,
+    /// with that turn's index, in its checker shape.
+    pub(crate) late: std::cell::RefCell<Vec<(usize, Value)>>,
+    /// At each gate, in the order taken: the turn's decode watermark and
+    /// the position the Adapter delivered through.
+    pub(crate) gate_fences: std::cell::RefCell<Vec<(u64, u64)>>,
     /// The fixture directory, listed with the case and state directories.
     fixtures: PathBuf,
     /// The listing before the pure steps: where `pure_writes` starts.
@@ -101,9 +113,12 @@ impl Pure {
             case_dir,
             set,
             state,
-            _store: store,
+            store,
             name: name.to_owned(),
             before: Listing::new(),
+            fences: std::cell::RefCell::default(),
+            late: std::cell::RefCell::default(),
+            gate_fences: std::cell::RefCell::default(),
             fixtures,
         };
         pure.before = pure.listing()?;
@@ -276,6 +291,20 @@ impl Pure {
         }
     }
 
+    /// The pids in the launch log, one per start of the fake, in the order
+    /// the fake's starts appended them: launch *n* is line *n*.
+    pub(crate) fn launch_pids(&self) -> Result<Vec<u32>, String> {
+        let log = self.case_dir.path().join(format!("{}.launches", self.name));
+        match fs::read_to_string(&log) {
+            Ok(text) => text
+                .lines()
+                .map(|line| line.trim().parse().map_err(|e| format!("launch log: {e}")))
+                .collect(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(error) => Err(format!("launch log: {error}")),
+        }
+    }
+
     /// The files created, changed or removed since the pure steps began.
     pub(crate) fn writes(&self) -> Result<Vec<String>, String> {
         Ok(changed(&self.before, &self.listing()?))
@@ -342,7 +371,8 @@ fn sibling(name: &str) -> Result<PathBuf, String> {
 
 /// An adapter set with `harness` pinned to `binary`, over a fresh Store.
 fn adapter_set(harness: &str, binary: &Path, state: &Path) -> Result<(AdapterSet, Store), String> {
-    for part in ["state", "runtime"] {
+    // `vendor`: the server routes' state, as bootstrap creates it.
+    for part in ["state", "runtime", "vendor"] {
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(state.join(part))

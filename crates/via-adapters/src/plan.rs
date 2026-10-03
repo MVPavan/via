@@ -2,6 +2,7 @@
 //! AD18): `AdapterSet::plan`, `check_turn` and `models` read only bundled
 //! data and configuration; they start nothing and write nothing.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -102,6 +103,10 @@ pub struct TurnParams {
     /// The session's `inherit` as requested at spawn, which a route's
     /// launch recipe may read; `None` where the session's is unknown.
     pub inherit: Option<Inherit>,
+    /// The session's frozen model (`SessionSpec.model`), which Core copies
+    /// in: internal context a route judges a discovered catalog against,
+    /// never a caller value or override; `None` where unknown.
+    pub model: Option<String>,
 }
 
 /// What `check_turn` reports of a resume turn it accepts (C2 §2).
@@ -558,6 +563,11 @@ pub struct ServerReport {
 }
 
 impl ServerKey {
+    /// A key of the opaque text `text`.
+    pub(crate) fn new(text: String) -> Self {
+        Self(text)
+    }
+
     /// The key's opaque text.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -647,12 +657,25 @@ impl<'a> Adapter<'a> {
         }
     }
 
-    /// Its bundled catalog; the Codex stub has none yet.
-    fn catalog(self) -> &'a [CatalogModel] {
+    /// Its catalog: bundled, or for Codex what the live server of the
+    /// harness's configured `inherit` discovered (none before discovery).
+    fn catalog(self, config: &AdapterConfig) -> Cow<'a, [CatalogModel]> {
         match self {
-            Self::Fake(fake) => fake.catalog(),
-            Self::Claude(claude) => claude.catalog(),
-            Self::Codex(_) => &[],
+            Self::Fake(fake) => Cow::Borrowed(fake.catalog()),
+            Self::Claude(claude) => Cow::Borrowed(claude.catalog()),
+            Self::Codex(codex) => Cow::Owned(
+                Harness::parse(codex::HARNESS)
+                    .map(|harness| codex.listed(config.inherit(harness)))
+                    .unwrap_or_default(),
+            ),
+        }
+    }
+
+    /// Where its catalog comes from (C1 §3.13 `source`).
+    fn source(self) -> ModelSource {
+        match self {
+            Self::Fake(_) | Self::Claude(_) => ModelSource::Bundled,
+            Self::Codex(_) => ModelSource::Discovered,
         }
     }
 
@@ -661,7 +684,9 @@ impl<'a> Adapter<'a> {
         match self {
             Self::Fake(fake) => DriverKind::Fake(Arc::clone(fake)),
             Self::Claude(claude) => DriverKind::Claude(Arc::clone(claude)),
-            Self::Codex(codex) => DriverKind::Codex(Arc::clone(codex)),
+            Self::Codex(codex) => {
+                DriverKind::Codex(Arc::new(codex::CodexSession::new(Arc::clone(codex))))
+            }
         }
     }
 }
@@ -697,7 +722,7 @@ impl AdapterSet {
         runtime: RuntimeConfig,
         resources: RuntimeResources,
     ) -> Result<Self, AdapterError> {
-        let runtime = RouteRuntime::new(runtime, resources)?;
+        let runtime = Arc::new(RouteRuntime::new(runtime, resources)?);
         let instances = Arc::new(InstanceCache::default());
         let binary = |name: &str| {
             let row = HARNESSES.iter().find(|row| row.name == name)?;
@@ -714,8 +739,14 @@ impl AdapterSet {
                 config.env(),
             ))
         });
-        let codex = binary(codex::HARNESS)
-            .map(|binary| Arc::new(CodexAdapter::new(binary, Arc::clone(&instances))));
+        let codex = binary(codex::HARNESS).map(|binary| {
+            Arc::new(CodexAdapter::new(
+                binary,
+                Arc::clone(&instances),
+                config.env(),
+                Arc::clone(&runtime),
+            ))
+        });
         Ok(Self {
             fake: config
                 .take_fake()
@@ -723,7 +754,7 @@ impl AdapterSet {
             claude,
             codex,
             config,
-            runtime: Arc::new(runtime),
+            runtime,
             #[cfg(feature = "test-failpoints")]
             sizes_seen: std::sync::Mutex::default(),
             #[cfg(feature = "test-failpoints")]
@@ -762,6 +793,27 @@ impl AdapterSet {
         Vec::new()
     }
 
+    /// Each shared server that ended, oldest first (at most 16), as its
+    /// ID, its launch ordinal (1 for the registry's first launch) and
+    /// Host's confirmed exit code: the replay harness judges a server
+    /// launch by them (x.3.2 X3). A pure in-memory snapshot.
+    pub fn ended_servers(&self) -> Vec<(String, u64, Option<i32>)> {
+        self.codex.as_ref().map_or_else(Vec::new, |codex| {
+            codex
+                .servers()
+                .ended()
+                .into_iter()
+                .map(|end| {
+                    (
+                        end.server.as_str().to_owned(),
+                        end.launch,
+                        end.exit.and_then(|exit| exit.code),
+                    )
+                })
+                .collect()
+        })
+    }
+
     /// Test builds: records the sizes a `plan` or `check_turn` received.
     #[cfg(feature = "test-failpoints")]
     fn saw(&self, sizes: ParamSizes) {
@@ -793,9 +845,11 @@ impl AdapterSet {
         let harness = match (&req.harness, &req.model) {
             (Some(name), _) => Harness::parse(name).ok_or_else(|| unavailable(None))?,
             (None, Some(model)) => {
-                let catalogs = self
+                let catalogs: Vec<_> = self
                     .adapters()
-                    .map(|adapter| (adapter.name(), adapter.catalog()));
+                    .map(|adapter| (adapter.name(), adapter.catalog(&self.config)))
+                    .collect();
+                let catalogs = catalogs.iter().map(|(name, catalog)| (*name, &**catalog));
                 let (name, _) = resolve_model(model, catalogs).map_err(|kind| {
                     Refusal::new(kind, None, "no unique harness catalogs the model")
                 })?;
@@ -870,8 +924,8 @@ impl AdapterSet {
                     }),
                 };
             }
-            Some(Adapter::Codex(_)) => {
-                return CodexAdapter::check_turn(route, &session.adapter_version, turn);
+            Some(Adapter::Codex(codex)) => {
+                return codex.check_turn(route, &session.adapter_version, turn);
             }
             None => {
                 return Err(unavailable(Some(route)));
@@ -889,16 +943,18 @@ impl AdapterSet {
         }
     }
 
-    /// The bundled catalog of each configured harness, or of `harness` only.
+    /// The catalog of each configured harness, or of `harness` only:
+    /// bundled, or discovered by Codex's live server.
     pub fn models(&self, harness: Option<&str>) -> Vec<ModelEntry> {
         self.adapters()
             .filter(|adapter| harness.is_none_or(|harness| harness == adapter.name()))
             .flat_map(|adapter| {
-                adapter.catalog().iter().map(move |entry| ModelEntry {
-                    model: entry.model.clone(),
+                let catalog = adapter.catalog(&self.config).into_owned();
+                catalog.into_iter().map(move |entry| ModelEntry {
+                    model: entry.model,
                     harness: adapter.name(),
-                    aliases: entry.aliases.clone(),
-                    source: ModelSource::Bundled,
+                    aliases: entry.aliases,
+                    source: adapter.source(),
                 })
             })
             .collect()

@@ -15,6 +15,10 @@ use crate::{
     ReprobeReport, SessionId, TurnNumber,
 };
 
+/// Host's finalization reserve before the shutdown deadline, which the
+/// registry's join leaves to it (x.3.2 X0 item 2.7).
+const FINALIZE_RESERVE: std::time::Duration = std::time::Duration::from_secs(1);
+
 impl AdapterSet {
     /// Logical (C2 §2, AD3): no vendor I/O. Attaches the session's
     /// observation channel. A session whose harness no adapter serves gets
@@ -77,13 +81,44 @@ impl AdapterSet {
     }
 
     /// Drains lower process owners before Store shutdown and returns
-    /// passive facts.
+    /// passive facts. A shared-server registry is fenced first, then joined
+    /// beside Host's shutdown (which closes every live server) until the
+    /// deadline's finalization reserve; its unjoined and failed tasks fold
+    /// into the report (x.3.2 X0 item 2.7).
     pub async fn shutdown(
         &self,
         deadline: Deadline,
         turns: &[(SessionId, TurnNumber)],
     ) -> AdapterShutdown {
-        shutdown_report(self.runtime.shutdown(deadline, turns).await)
+        let servers = self.codex.as_ref().map(|codex| Arc::clone(codex.servers()));
+        if let Some(servers) = &servers {
+            servers.fence();
+        }
+        let cutoff = Deadline::at(
+            deadline
+                .instant()
+                .checked_sub(FINALIZE_RESERVE)
+                .unwrap_or_else(|| deadline.instant()),
+        );
+        let joined = async {
+            match &servers {
+                Some(servers) => servers.join(cutoff).await,
+                None => (0, 0),
+            }
+        };
+        let (report, (unjoined, failed)) =
+            tokio::join!(self.runtime.shutdown(deadline, turns), joined);
+        let mut report = shutdown_report(report);
+        report.pending_tasks += unjoined;
+        report.failed_tasks += failed;
+        if unjoined > 0 || failed > 0 {
+            let registry = format!("server registry: {unjoined} tasks unjoined, {failed} failed");
+            report.failure = Some(match report.failure.take() {
+                Some(failure) => format!("{failure}; {registry}"),
+                None => registry,
+            });
+        }
+        report
     }
 
     /// Hands Host capacity for a group it did not launch (design §11).

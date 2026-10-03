@@ -1566,7 +1566,11 @@ impl Retained {
             vendor_stop_reason: terminal.vendor_stop_reason.clone(),
             structured_output: terminal.structured_output.as_deref().and_then(parse),
             structured_output_file: None,
-            output_invalid: None,
+            // A route's output that is no value is invalid as it stands
+            // (C2 §2 `NotJson`, `OverLimit`); a value is checked later.
+            output_invalid: terminal
+                .structured_output_unparsed
+                .map(via_adapters::UnparsedOutput::reason),
             steps: terminal.steps,
             usage: terminal.usage.clone(),
             cost: terminal

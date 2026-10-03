@@ -4,7 +4,7 @@
 
 use std::borrow::Cow;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use serde_json::value::RawValue;
@@ -267,6 +267,10 @@ pub struct VendorTerminal {
     pub detail: Option<String>,
     /// Structured output, validated by Core.
     pub structured_output: Option<Box<RawValue>>,
+    /// Structured output the route assembled from text that is no value
+    /// Core can validate (C2 §2 `NotJson`, `OverLimit`): present and
+    /// invalid, with `structured_output` `None`.
+    pub structured_output_unparsed: Option<UnparsedOutput>,
     /// Steps the vendor counted.
     pub steps: Option<u64>,
     /// The turn aggregate, superseding call samples.
@@ -275,6 +279,28 @@ pub struct VendorTerminal {
     pub cost: Option<CostReport>,
     /// Bounded vendor data (16 KiB) for the envelope's `vendor` member.
     pub vendor: Option<Box<RawValue>>,
+}
+
+/// Why a route's structured output, assembled from text, is no value
+/// (C2 §2 `VendorTerminal`): Core treats it as present and invalid (C1 §5).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnparsedOutput {
+    /// The text does not parse as JSON: `reason: invalid`.
+    NotJson,
+    /// The text passed the route's retention bound or the JSON structure
+    /// limits: `reason: validation_limit`.
+    OverLimit,
+}
+
+impl UnparsedOutput {
+    /// C1 §5's `data.reason` of the invalid output.
+    #[must_use]
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::NotJson => "invalid",
+            Self::OverLimit => "validation_limit",
+        }
+    }
 }
 
 /// The version an instance reported at its own handshake (AD7);
@@ -513,6 +539,146 @@ impl Default for ObservationBudget {
     }
 }
 
+/// The entries a session's metadata cap holds (packet §5: 1,024 per
+/// session): ledger entries and mapped turn ranges, one combined count
+/// (x.3.2 X3 §6.2).
+const CAP_ENTRIES: usize = 1024;
+
+/// The key bytes the cap holds (packet §5: 256 KiB per session).
+const CAP_KEY_BYTES: usize = 256 * 1024;
+
+/// Each entry's fixed share of the observation budget, beside its key's
+/// bytes (x.3.2 X3 §6.2).
+const ENTRY_BYTES: usize = 64;
+
+/// What a session's cap holds.
+#[derive(Default)]
+struct Held {
+    entries: usize,
+    bytes: usize,
+}
+
+/// One session's metadata cap, beside its observation budget (x.3.2 X3
+/// §6.2): an entry takes a slot of the cap at once, then its key's bytes
+/// plus 64 B of the session's budget, so retained metadata is charged
+/// inside the 4 MiB Core's channel shares. A full cap is exhaustion, never
+/// a wait.
+#[derive(Clone)]
+pub(crate) struct SessionCap {
+    held: Arc<Mutex<Held>>,
+    budget: Arc<Semaphore>,
+}
+
+/// One slot of a session's cap, released when dropped: `key` bytes of
+/// the cap, and the budget bytes its charge takes.
+pub(crate) struct CapSlot {
+    held: Arc<Mutex<Held>>,
+    key: usize,
+    budget: usize,
+}
+
+impl Drop for CapSlot {
+    fn drop(&mut self) {
+        let mut held = lock_held(&self.held);
+        held.entries = held.entries.saturating_sub(1);
+        held.bytes = held.bytes.saturating_sub(self.key);
+    }
+}
+
+/// One entry's charge: its cap slot and its budget bytes, released when
+/// dropped.
+pub(crate) struct Charge {
+    _slot: CapSlot,
+    _permit: OwnedSemaphorePermit,
+}
+
+/// Locks a cap's counts; each edit is two assignments.
+fn lock_held(held: &Mutex<Held>) -> MutexGuard<'_, Held> {
+    held.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl SessionCap {
+    /// An empty cap on `sink`'s budget.
+    pub(crate) fn new(sink: &ObservationSink) -> Self {
+        Self {
+            held: Arc::default(),
+            budget: Arc::clone(&sink.budget),
+        }
+    }
+
+    /// A ledger entry's slot for a key of `key` bytes, taken at once:
+    /// `key` bytes of the cap, and of the budget plus 64 B; `None` once
+    /// the cap is full.
+    pub(crate) fn slot(&self, key: usize) -> Option<CapSlot> {
+        self.take(key, key.saturating_add(ENTRY_BYTES))
+    }
+
+    /// A turn's credit slot (x.3.2 X3 §3.4), taken at once: one entry of
+    /// the cap, and the budget bytes of a vendor ID of `id` bytes plus
+    /// 64 B; `None` once the cap is full.
+    pub(crate) fn credit_slot(&self, id: usize) -> Option<CapSlot> {
+        self.take(0, id.saturating_add(ENTRY_BYTES))
+    }
+
+    fn take(&self, key: usize, budget: usize) -> Option<CapSlot> {
+        let mut held = lock_held(&self.held);
+        let bytes = held.bytes.saturating_add(key);
+        if held.entries >= CAP_ENTRIES || bytes > CAP_KEY_BYTES {
+            return None;
+        }
+        held.entries += 1;
+        held.bytes = bytes;
+        Some(CapSlot {
+            held: Arc::clone(&self.held),
+            key,
+            budget,
+        })
+    }
+
+    /// `slot`'s budget bytes, when free now; else the slot back.
+    pub(crate) fn try_charge(&self, slot: CapSlot) -> Result<Charge, CapSlot> {
+        match Arc::clone(&self.budget).try_acquire_many_owned(entry_bytes(&slot)) {
+            Ok(permit) => Ok(Charge {
+                _slot: slot,
+                _permit: permit,
+            }),
+            Err(_) => Err(slot),
+        }
+    }
+
+    /// `slot`'s budget bytes, awaited; dropping the wait releases the
+    /// slot. `None` only if the budget closed.
+    pub(crate) async fn charge(&self, slot: CapSlot) -> Option<Charge> {
+        let permit = Arc::clone(&self.budget)
+            .acquire_many_owned(entry_bytes(&slot))
+            .await
+            .ok()?;
+        Some(Charge {
+            _slot: slot,
+            _permit: permit,
+        })
+    }
+
+    /// Test builds: the entries and key bytes held.
+    #[cfg(test)]
+    pub(crate) fn held(&self) -> (usize, usize) {
+        let held = lock_held(&self.held);
+        (held.entries, held.bytes)
+    }
+
+    /// Test builds: every budget byte free now, held until dropped.
+    #[cfg(test)]
+    pub(crate) fn fill_budget(&self) -> Option<OwnedSemaphorePermit> {
+        let free = u32::try_from(self.budget.available_permits()).ok()?;
+        Arc::clone(&self.budget).try_acquire_many_owned(free).ok()
+    }
+}
+
+/// A slot's budget bytes, within `u32` as the cap bounds a key.
+fn entry_bytes(slot: &CapSlot) -> u32 {
+    u32::try_from(slot.budget).unwrap_or(u32::MAX)
+}
+
 /// A session channel on the session's `budget` (C2 §2 `SessionCx`).
 pub fn observation_channel_in(
     budget: &ObservationBudget,
@@ -597,6 +763,89 @@ impl ObservationSink {
             }
             Err(mpsc::error::TrySendError::Closed(_)) => Err(Undelivered::Closed),
         }
+    }
+
+    /// Reserves what [`Self::send`] would take for `item`: its byte cost,
+    /// then a channel slot, under one stall deadline set at the first
+    /// block (x.3.2 X0 item 13.2). The send itself is then synchronous
+    /// ([`Reserved::send`]), so a caller can make it under its own lock;
+    /// a dropped reservation releases both. Test builds hit the same
+    /// `adapter.observation.blocked` and `.stalled` points as a send.
+    pub(crate) async fn reserve(
+        &self,
+        item: &ObservationItem,
+        stall: Duration,
+    ) -> Result<Reserved<'_>, Undelivered> {
+        let reserved = self.reserve_in(item, stall).await;
+        #[cfg(feature = "test-failpoints")]
+        if matches!(reserved, Err(Undelivered::Stalled)) {
+            let _ = via_routes::failpoint::hit_async("adapter.observation.stalled").await;
+        }
+        reserved
+    }
+
+    async fn reserve_in(
+        &self,
+        item: &ObservationItem,
+        stall: Duration,
+    ) -> Result<Reserved<'_>, Undelivered> {
+        let mut stall_at = None;
+        let wanted = u32::try_from(item_cost(item)).map_err(|_| Undelivered::Stalled)?;
+        let permit = match Arc::clone(&self.budget).try_acquire_many_owned(wanted) {
+            Ok(permit) => permit,
+            Err(TryAcquireError::NoPermits) => {
+                #[cfg(feature = "test-failpoints")]
+                blocked().await;
+                let at = *stall_at.get_or_insert_with(|| Instant::now() + stall);
+                timeout_at(at, Arc::clone(&self.budget).acquire_many_owned(wanted))
+                    .await
+                    .map_err(|_| Undelivered::Stalled)?
+                    .map_err(|_| Undelivered::Closed)?
+            }
+            Err(TryAcquireError::Closed) => return Err(Undelivered::Closed),
+        };
+        let slot = match self.sender.try_reserve() {
+            Ok(slot) => slot,
+            Err(mpsc::error::TrySendError::Full(())) => {
+                #[cfg(feature = "test-failpoints")]
+                blocked().await;
+                let at = *stall_at.get_or_insert_with(|| Instant::now() + stall);
+                timeout_at(at, self.sender.reserve())
+                    .await
+                    .map_err(|_| Undelivered::Stalled)?
+                    .map_err(|_| Undelivered::Closed)?
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => return Err(Undelivered::Closed),
+        };
+        Ok(Reserved { permit, slot })
+    }
+}
+
+/// A send [`ObservationSink::reserve`] made room for.
+pub(crate) struct Reserved<'a> {
+    permit: OwnedSemaphorePermit,
+    slot: mpsc::Permit<'a, Admitted>,
+}
+
+impl Reserved<'_> {
+    /// Sends `item`, synchronously, into the reserved slot with the
+    /// reserved bytes. Test builds acknowledge it at
+    /// `adapter.observation.admitted` through [`admitted`], after the
+    /// caller's own lock.
+    pub(crate) fn send(self, item: ObservationItem) {
+        self.slot.send(Admitted {
+            item,
+            permit: self.permit,
+        });
+    }
+}
+
+/// Test builds: acknowledges a reserved send, as [`ObservationSink::send`]
+/// acknowledges each item the channel took.
+pub(crate) async fn admitted() {
+    #[cfg(feature = "test-failpoints")]
+    {
+        let _ = via_routes::failpoint::hit_async("adapter.observation.admitted").await;
     }
 }
 
@@ -866,6 +1115,7 @@ mod tests {
                 structured_output: Some(
                     serde_json::value::to_raw_value(&serde_json::json!({ "x": big })).unwrap(),
                 ),
+                structured_output_unparsed: None,
                 steps: None,
                 usage: None,
                 cost: None,

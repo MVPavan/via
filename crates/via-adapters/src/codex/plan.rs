@@ -17,10 +17,6 @@ pub(crate) const CHECKED: &[&str] = &["0.159.2"];
 /// The canonical C1 efforts and the Codex `ReasoningEffort` each maps to
 /// (AD18). Any other non-empty value is a vendor value that only a
 /// discovered `model/list` catalog can judge.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "turn/start maps the effort (x.3.2 X3)")
-)]
 const EFFORTS: &[(&str, &str)] = &[
     ("low", "low"),
     ("medium", "medium"),
@@ -125,10 +121,6 @@ pub(crate) fn categories() -> BTreeMap<Category, CategoryDecl> {
 }
 
 /// The Codex value of a canonical C1 effort; `None` for a vendor value.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "turn/start maps the effort (x.3.2 X3)")
-)]
 pub(crate) fn canonical_effort(effort: &str) -> Option<&'static str> {
     EFFORTS
         .iter()

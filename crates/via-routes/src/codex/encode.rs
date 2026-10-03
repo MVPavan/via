@@ -282,6 +282,18 @@ pub fn turn_interrupt(
     )
 }
 
+/// A thread request line on the data lane (x.3.2 X0 item 12.4:
+/// `thread/start` and `thread/resume` are data, written in turn with the
+/// other starts): a start with no prompt.
+pub fn data(line: Vec<u8>) -> OutboundMessage {
+    OutboundMessage::Start {
+        prefix: line,
+        prompt: String::new(),
+        suffix: Vec::new(),
+        escape: escape_json,
+    }
+}
+
 /// `thread/unsubscribe`: one session's detach; never a stdin close.
 pub fn thread_unsubscribe(id: ClientId, thread_id: &str) -> Result<Vec<u8>, EncodeError> {
     request(id, "thread/unsubscribe", &json!({"threadId": thread_id}))
