@@ -271,6 +271,8 @@ struct Range {
 pub(crate) struct Metadata {
     cap: SessionCap,
     exhausted: bool,
+    /// The registration retired (x.3.2 X3 §6.5): nothing commits again.
+    retired: bool,
     suppressed: HashMap<(TurnNumber, String), Entry>,
     mapped: Vec<Range>,
     /// The charge the consumer reserved for the message it handles.
@@ -287,6 +289,7 @@ pub(crate) fn ledger_on(cap: SessionCap) -> Ledger {
     Arc::new(Mutex::new(Metadata {
         cap,
         exhausted: false,
+        retired: false,
         suppressed: HashMap::new(),
         mapped: Vec::new(),
         staged: None,
@@ -407,6 +410,9 @@ impl Metadata {
     /// to Core. An exactly adjacent range extends; otherwise `turn` opens
     /// a range, charged at its close ([`Self::close`]).
     pub(crate) fn map(&mut self, turn: TurnNumber) {
+        if self.retired {
+            return;
+        }
         let adjacent = self
             .mapped
             .iter_mut()
@@ -447,6 +453,20 @@ impl Metadata {
             .any(|((owner, _), entry)| *owner == turn && entry.facts.open)
     }
 
+    /// Whether any tool item of any turn is open.
+    pub(crate) fn has_open(&self) -> bool {
+        self.suppressed.values().any(|entry| entry.facts.open)
+    }
+
+    /// x.3.2 X3 §6.5 step 5: the registration retired. Its entries, its
+    /// ranges and a staged charge are released, and nothing commits again.
+    pub(crate) fn retire(&mut self) {
+        self.retired = true;
+        self.suppressed.clear();
+        self.mapped.clear();
+        self.staged = None;
+    }
+
     /// The entries charged.
     #[cfg(test)]
     pub(crate) fn entries(&self) -> usize {
@@ -456,7 +476,7 @@ impl Metadata {
     /// Item `item` of turn `turn`'s facts, charged once: by the staged
     /// charge, else by one taken now.
     fn entry(&mut self, turn: TurnNumber, item: &str) -> Result<&mut Suppressed, NormalizeError> {
-        if self.exhausted {
+        if self.exhausted || self.retired {
             return Err(NormalizeError::Overflow);
         }
         match self.suppressed.entry((turn, item.to_owned())) {

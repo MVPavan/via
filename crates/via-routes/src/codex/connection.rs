@@ -277,6 +277,24 @@ impl TurnWrites {
             cancel: Arc::new(WriteCancel::new(Arc::clone(&connection.stdio))),
         }
     }
+
+    /// A handle that cancels the turn's writes from outside its run.
+    pub fn canceller(&self) -> WriteCanceller {
+        WriteCanceller(Arc::clone(&self.cancel))
+    }
+}
+
+/// Cancels one turn's writes as its [`TurnWrites`] drop would, from
+/// outside its run: a generation's failure stops an admitted turn's start
+/// this way, before any await (x.3.2 X3 §4.2 step 4).
+#[derive(Clone)]
+pub struct WriteCanceller(Arc<WriteCancel>);
+
+impl WriteCanceller {
+    /// Cancels the turn's writes, synchronously and idempotently.
+    pub fn cancel(&self) {
+        self.0.cancel();
+    }
 }
 
 impl Drop for TurnWrites {

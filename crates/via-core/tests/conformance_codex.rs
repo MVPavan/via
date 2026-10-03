@@ -1614,6 +1614,9 @@ fn codex_start_order() {
         )
         .unwrap();
         failed_after_acceptance(&mut expect, "protocol", "quiescent");
+        // The failed generation's continuity is unproven: its retirement
+        // folds `uncertain` (x.3.2 X3 §6.6, F3).
+        expect["sessions"]["main"]["close"]["cleanup"] = json!("uncertain");
         variant(name, &replay, &expect).unwrap();
     }
 
@@ -1633,6 +1636,9 @@ fn codex_start_order() {
         {"kind": "session.vendor_identity_confirmed", "vendor_session_id": THREAD,
             "generation": 1},
     ]);
+    // The failed generation's retirement folds `uncertain` (x.3.2 X3
+    // §6.6, F3).
+    expect["sessions"]["main"]["close"]["cleanup"] = json!("uncertain");
     variant("codex_start_order_mismatched_id", &replay, &expect).unwrap();
 
     // The start is written once and never answered: the server exits.
@@ -1645,6 +1651,9 @@ fn codex_start_order() {
     )
     .unwrap();
     unaccepted(&mut expect, "server_lost", tested());
+    // The generation's registration retires with no close (x.3.2 X3 §6.5,
+    // F3): its continuity is unproven, so its fold is `uncertain`.
+    expect["sessions"]["main"]["close"]["cleanup"] = json!("uncertain");
     variant("codex_start_order_lost_start", &replay, &expect).unwrap();
 
     // A cancel while the written start is unanswered: the vendor may run
@@ -1709,6 +1718,9 @@ fn codex_start_order() {
         {"kind": "turn.accepted", "vendor_turn_id": TURN}, "final_text",
     ]);
     turn_mut(&mut expect, 0)["expect"]["observations_exclude"] = json!([]);
+    // The failed generation's retirement folds `uncertain` (x.3.2 X3
+    // §6.6, F3).
+    expect["sessions"]["main"]["close"]["cleanup"] = json!("uncertain");
     let malformed = expect.clone();
     variant("codex_start_order_malformed", &replay, &expect).unwrap();
 
@@ -1725,7 +1737,7 @@ fn codex_start_order() {
     let mut expect = malformed;
     expect["source"] = replay["source"].clone();
     expect["sessions"]["main"]["close"] = json!({
-        "mode": "graceful", "vendor_closed": false, "cleanup": "quiescent",
+        "mode": "graceful", "vendor_closed": false, "cleanup": "uncertain",
     });
     variant("codex_start_order_uncorrelated", &replay, &expect).unwrap();
 
@@ -1973,6 +1985,9 @@ fn codex_malformed_evidence_owner() {
         turn["observations_include"] = json!([base["observations_include"][0].clone()]);
         turn["observations_exclude"] = json!(["final_text"]);
         turn["observations_order"] = json!(["turn.accepted"]);
+        // The failed generation's continuity is unproven: its retirement
+        // folds `uncertain` (x.3.2 X3 §6.6, F3).
+        expect["sessions"]["main"]["close"]["cleanup"] = json!("uncertain");
         let mut kept = Vec::new();
         check_variant_then(name, &replay, &expect, |run| {
             kept = undecoded_under(run.state.path());
@@ -2192,6 +2207,70 @@ fn codex_close_barrier_carries_a_held_decline() {
         ..conformance_run::Knobs::default()
     };
     check_variant_with(name, &replay, &expect, knobs, turn1_decline_only).unwrap();
+}
+
+/// x.3.2 X3 r6 #1, r5 #5 (F3): the generation's failure stops an admitted
+/// turn before any await. Turn 2 is admitted and held at the admission
+/// seam; meanwhile a thread message that does not decode arrives while no
+/// turn runs, its evidence write held. The generation fails before that
+/// write: the driver's health latches `protocol` and turn 2's writes are
+/// cancelled, so its `turn/start` is never written and it ends
+/// `protocol`, not launched. The generation's registration is gone, so
+/// the close writes no `thread/unsubscribe`.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn codex_idle_failure_stops_an_admitted_turn() {
+    let name = "codex_idle_failure_stops_an_admitted_turn";
+    let _points = armed_all(&[
+        (
+            "adapter.codex.admitted",
+            json!({"occurrence": 2, "action": "delay", "value": 3000}),
+        ),
+        (
+            "wire.undecoded.before_note",
+            json!({"occurrence": 1, "action": "delay", "value": 6000}),
+        ),
+    ])
+    .unwrap();
+    let mut replay = replay_of("c1_commentary_usage").unwrap();
+    let mut expect = expect_of("c1_commentary_usage").unwrap();
+    replay["source"] = json!(format!("{name}: a variant of c1_commentary_usage"));
+    expect["source"] = replay["source"].clone();
+    let malformed = json!({"method": "thread/status/changed",
+        "params": {"threadId": THREAD, "status": {"type": "idle"},
+            "nested": serde_json::from_str::<Value>(
+                &format!("{}{}", "[".repeat(80), "]".repeat(80))).unwrap()}});
+    let completed = step_with(&replay, "\"turn/completed\"").unwrap();
+    let eof = step_with(&replay, "await_eof").unwrap();
+    // Turn 2 writes nothing, and the close no unsubscribe.
+    steps(&mut replay).unwrap().splice(
+        completed + 1..eof,
+        [json!({"delay": {"ms": 1000}}), emit(&malformed)],
+    );
+    let stopped = &mut turn_mut(&mut expect, 1)["expect"];
+    for (key, value) in [
+        ("accepted", json!(false)),
+        ("error", json!("protocol")),
+        ("terminal", Value::Null),
+        ("usage", Value::Null),
+        ("final_text", Value::Null),
+        ("observations_include", json!([])),
+        (
+            "observations_exclude",
+            json!(["turn.accepted", "final_text"]),
+        ),
+        ("observation_counts", json!({"turn.accepted": 0})),
+        ("observations_order", json!([])),
+    ] {
+        stopped[key] = value;
+    }
+    turn_mut(&mut expect, 1)
+        .as_object_mut()
+        .unwrap()
+        .remove("gates");
+    expect["sessions"]["main"]["close"] = Value::Null;
+    expect["sessions"]["main"]["health"] = json!({"state": "failed", "first_cause": "protocol"});
+    variant(name, &replay, &expect).unwrap();
 }
 
 /// X0 item 13.2 (x.3.2 X3 fix r4 #1): while no turn runs, the
@@ -2542,6 +2621,30 @@ fn codex_late_completion_releases_open_tools() {
     let second = 1024 - TURN1_TOOLS - MAPPED_CHARGES + released;
     let (replay, mut expect) = open_tools_across_turns(name, released, second).unwrap();
     // Turn 1's other open tools leave the session's cleanup unproven.
+    expect["sessions"]["main"]["close"]["cleanup"] = json!("uncertain");
+    variant(name, &replay, &expect).unwrap();
+}
+
+/// x.3.2 X3 S10 (F3): a close with the whole prefix taken and a tool left
+/// open. Turn 1 completes quiescent; a late `item/started` naming it
+/// opens a tool in the registration's ledger, and the session closes: the
+/// close's barrier takes the lane's end after it, so no loss is noted,
+/// and retirement reads the open tool and folds `uncertain` into the
+/// close's cleanup.
+#[test]
+fn codex_close_folds_a_late_open_tool() {
+    let name = "codex_close_folds_a_late_open_tool";
+    let mut replay = replay_of("c1_commentary_usage").unwrap();
+    let mut expect = expect_of("c1_commentary_usage").unwrap();
+    replay["source"] = json!(format!("{name}: a variant of c1_commentary_usage"));
+    expect["source"] = replay["source"].clone();
+    let completed = step_with(&replay, "\"turn/completed\"").unwrap();
+    let unsubscribe = step_with(&replay, "thread/unsubscribe").unwrap();
+    steps(&mut replay)
+        .unwrap()
+        .splice(completed + 1..unsubscribe, tool_items(0, 1, "item/started"));
+    expect["turns"].as_array_mut().unwrap().truncate(1);
+    expect["launch_checkpoints"]["after_turn"] = json!([1]);
     expect["sessions"]["main"]["close"]["cleanup"] = json!("uncertain");
     variant(name, &replay, &expect).unwrap();
 }

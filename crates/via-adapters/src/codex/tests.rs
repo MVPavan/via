@@ -1236,19 +1236,28 @@ fn force_wins_over_a_ready_decision() {
     assert_eq!(ready_cut(false, false, false), None);
 }
 
-/// x.3.2 X3 S4 (F2): admission waits for its credit beside every cutoff.
-/// With the session's budget full, a turn's credit waits; its stop, the
-/// daemon force, its wall and the driver's failure each end the wait at
-/// once with nothing reserved (the cap back at its baseline) and that
-/// cause, before any job exists. Once the budget has room the credit is
-/// taken; a full cap is exhaustion, never a wait.
+/// x.3.2 X3 S4 (F2, F3): admission waits for its credit beside every
+/// cutoff. With the session's budget full, a turn's credit waits; its
+/// stop, the daemon force, its wall, the driver's failure, its
+/// registration's failure (with the generation's cause) and its
+/// retirement each end the wait at once with nothing reserved (the cap
+/// back at its baseline) and that cause, before any job exists. Once the
+/// budget has room the credit is taken; a full cap is exhaustion, never a
+/// wait.
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one case per cutoff arm, each beside its expected cause"
+)]
 async fn admission_credit_waits_beside_its_cutoffs() {
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use tokio::sync::watch;
     use tokio_util::sync::CancellationToken;
+    use via_routes::codex::Lane;
 
+    use super::delivery::{LossRecord, Losses, Registration};
     use super::driver::{Orders, Uncredited, credit, unsent_cause};
     use crate::driver::latch;
     use crate::observation::{SessionCap, observation_channel};
@@ -1262,11 +1271,31 @@ async fn admission_credit_waits_beside_its_cutoffs() {
         Force,
         Wall,
         Health,
+        Failure,
+        Retirement,
     }
     let turn = TurnNumber::try_from(2).unwrap();
-    for arm in [Arm::Stop, Arm::Force, Arm::Wall, Arm::Health] {
+    let protocol = DriverFailure::Route(RouteError::Protocol {
+        turn: TurnNumber::try_from(1).unwrap(),
+        detail: "a message of the session's thread did not decode",
+    });
+    let arms = [
+        Arm::Stop,
+        Arm::Force,
+        Arm::Wall,
+        Arm::Health,
+        Arm::Failure,
+        Arm::Retirement,
+    ];
+    for arm in arms {
         let (sink, _received) = observation_channel();
         let cap = SessionCap::new(&sink);
+        let registration = Registration::new(4, cap.clone());
+        let lane = Lane::default();
+        let loss = LossRecord {
+            losses: Arc::new(Mutex::new(Losses::default())),
+            generation: 1,
+        };
         let full = cap.fill_budget().unwrap();
         let soon = Instant::now() + Duration::from_millis(100);
         let (stop, stop_watch) = watch::channel(None);
@@ -1299,13 +1328,15 @@ async fn admission_credit_waits_beside_its_cutoffs() {
                 }
                 Arm::Wall => {}
                 Arm::Health => latch(&health, DriverFailure::TurnAbandoned),
+                Arm::Failure => registration.fail(&protocol, (&health, &lane, &loss)),
+                Arm::Retirement => registration.retire(&loss, || {}),
             }
             std::future::pending::<()>().await;
         };
         let waited = tokio::select! {
             waited = tokio::time::timeout(
                 Duration::from_secs(5),
-                credit(&cap, (&mut orders, &mut force, &health)),
+                credit(&cap, (&mut orders, &mut force, &health), Some(&registration)),
             ) => waited.unwrap(),
             () = cutoff => unreachable!(),
         };
@@ -1313,6 +1344,8 @@ async fn admission_credit_waits_beside_its_cutoffs() {
             Arm::Stop | Arm::Wall => Uncredited::Ordered,
             Arm::Force => Uncredited::Forced,
             Arm::Health => Uncredited::Failed,
+            Arm::Failure => Uncredited::Gone(Some(protocol.clone())),
+            Arm::Retirement => Uncredited::Gone(None),
         };
         assert_eq!(waited.err(), Some(expected), "{arm:?}");
         assert!(Instant::now() < soon + Duration::from_secs(1), "{arm:?}");
@@ -1322,13 +1355,26 @@ async fn admission_credit_waits_beside_its_cutoffs() {
             Arm::Stop => assert_eq!(cause, RouteError::Stopped { turn }),
             Arm::Force => assert_eq!(cause, RouteError::ForceStopped { turn }),
             Arm::Wall => assert_eq!(cause, RouteError::Deadline { turn }),
-            Arm::Health => {}
+            Arm::Health | Arm::Failure | Arm::Retirement => {}
         }
         drop(full);
-        let taken = credit(&cap, (&mut orders, &mut force, &health)).await;
+        let taken = credit(&cap, (&mut orders, &mut force, &health), None).await;
         assert!(taken.is_ok(), "{arm:?}: room is taken at once");
         assert_eq!(cap.held().0, 1);
     }
+}
+
+/// x.3.2 X3 §4.2 step 1 (F2): a full cap is exhaustion, never a wait.
+#[tokio::test]
+async fn a_full_cap_is_credit_exhaustion() {
+    use std::time::Duration;
+
+    use tokio::sync::watch;
+    use tokio_util::sync::CancellationToken;
+
+    use super::driver::{Orders, Uncredited, credit};
+    use crate::observation::{SessionCap, observation_channel};
+    use crate::{Deadline, DriverHealth};
 
     let (sink, _received) = observation_channel();
     let cap = SessionCap::new(&sink);
@@ -1345,7 +1391,9 @@ async fn admission_credit_waits_beside_its_cutoffs() {
     };
     let health = watch::Sender::new(DriverHealth::Open);
     assert_eq!(
-        credit(&cap, (&mut orders, &mut force, &health)).await.err(),
+        credit(&cap, (&mut orders, &mut force, &health), None)
+            .await
+            .err(),
         Some(Uncredited::Exhausted)
     );
 }

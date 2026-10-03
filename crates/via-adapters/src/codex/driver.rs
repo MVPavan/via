@@ -41,8 +41,8 @@ use via_routes::codex::{
 use via_routes::{Retirement, SendOutcome, StoreFailure, WireCleanup};
 
 use super::delivery::{
-    Current, Delivery, Evidence, Folders, LossRecord, Losses, Normalizing, Registration, Retained,
-    ServerEvidence, Stop, UNKNOWN, losses as lock_losses,
+    Admission, Current, Delivery, Evidence, Folders, LossRecord, Losses, Normalizing, Registration,
+    Retained, ServerEvidence, Stop, TurnFence, UNKNOWN, losses as lock_losses,
 };
 use super::normalize::{self, DiscoveredModel, StructuredOutput};
 use super::plan::{self as codex_plan, Sandbox};
@@ -93,9 +93,12 @@ pub(crate) struct CodexSession {
 }
 
 /// The session's connection generation. The fields drop in order: the
-/// thread's registration closes, then the abnormal-end subscription, and
-/// the server lease is released last.
+/// thread's registration retires, then closes, then the abnormal-end
+/// subscription, and the server lease is released last.
 struct Attached {
+    /// Retires the thread's registration, once it has one (x.3.2 X3 §6.5):
+    /// declared first, so it drops first.
+    retire: Option<RetireGuard>,
     /// The thread this generation opened, once it did.
     thread: Option<Arc<Thread>>,
     /// The connection task's abnormal end reaches the driver through it.
@@ -137,6 +140,13 @@ struct Generation {
     thread: Option<Arc<Thread>>,
     signal: Arc<LeaseSignal>,
     folders: Folders,
+}
+
+impl Generation {
+    /// Its thread's registration, once it has one.
+    fn registration(&self) -> Option<&Registration> {
+        self.thread.as_ref().map(|thread| &*thread.registration)
+    }
 }
 
 impl CodexSession {
@@ -218,12 +228,14 @@ impl CodexSession {
                 &sealed,
                 lane.dropped(),
             );
+            thread.registration.drained_prefix(drained);
             if usable(&attached.connection)
                 && let Some(reply) = attached.connection.unsubscribe(&thread.lease, deadline)
             {
                 let _answered = tokio::time::timeout_at(deadline.instant(), reply).await;
             }
         }
+        // Its guard retires the registration first (x.3.2 X3 §6.5).
         drop(attached);
     }
 
@@ -270,6 +282,7 @@ impl CodexSession {
         let subscription = connection.subscribe(Arc::clone(&signal));
         let folders = Folders::default();
         let replaced = attached.replace(Attached {
+            retire: None,
             thread: None,
             _subscription: subscription,
             signal: Arc::clone(&signal),
@@ -289,11 +302,20 @@ impl CodexSession {
         })
     }
 
-    /// Keeps the thread this generation opened.
-    fn opened(&self, connection: &Arc<Connection>, thread: &Arc<Thread>) {
+    /// Keeps the thread this generation opened, and its registration's
+    /// retirement into `driver`'s cleanup facts.
+    fn opened(&self, connection: &Arc<Connection>, thread: &Arc<Thread>, driver: &SessionDriver) {
         if let Some(attached) = self.attached().as_mut()
             && Arc::ptr_eq(&attached.connection, connection)
         {
+            attached.retire = Some(RetireGuard {
+                registration: Arc::clone(&thread.registration),
+                loss: LossRecord {
+                    losses: Arc::clone(&self.losses),
+                    generation: attached.generation,
+                },
+                state: Arc::clone(&driver.state),
+            });
             attached.thread = Some(Arc::clone(thread));
             attached.registered.store(true, Ordering::Release);
         }
@@ -317,10 +339,15 @@ impl CodexSession {
         drop(attached);
     }
 
-    /// The generation is unfit for the next turn: its registration closes
-    /// (its later traffic is late) and the next turn opens the thread
-    /// again as a new generation.
-    fn quarantine(&self, connection: &Arc<Connection>) {
+    /// The generation is unfit for the next turn: its registration fails
+    /// with `failure`'s cause, when one is latched in its health (x.3.2 X3
+    /// §4.1), then retires and closes (its later traffic is late), and the
+    /// next turn opens the thread again as a new generation.
+    fn quarantine(
+        &self,
+        connection: &Arc<Connection>,
+        failure: Option<(DriverFailure, &watch::Sender<DriverHealth>)>,
+    ) {
         let mut attached = self.attached();
         if attached
             .as_ref()
@@ -328,8 +355,50 @@ impl CodexSession {
         {
             let gone = attached.take();
             drop(attached);
+            if let (Some((cause, health)), Some(gone)) = (failure, gone.as_ref())
+                && let Some(thread) = &gone.thread
+            {
+                let loss = LossRecord {
+                    losses: Arc::clone(&self.losses),
+                    generation: gone.generation,
+                };
+                thread
+                    .registration
+                    .fail(&cause, (health, thread.lease.lane(), &loss));
+            }
             drop(gone);
         }
+    }
+}
+
+/// x.3.2 X3 §6.5: retires a generation's registration synchronously and
+/// once: as the close's detach ends, or as the generation drops without
+/// one (the driver dropped, a quarantine, an abandoned turn, a detach
+/// dropped mid-await). An open tool or unproven continuity folds
+/// `Uncertain` into the session's sticky cleanup facts.
+pub(super) struct RetireGuard {
+    pub(super) registration: Arc<Registration>,
+    pub(super) loss: LossRecord,
+    pub(super) state: Arc<Mutex<DriverState>>,
+}
+
+impl Drop for RetireGuard {
+    fn drop(&mut self) {
+        self.registration.retire(&self.loss, || {
+            let uncertain = Retirement {
+                launched: true,
+                exit: None,
+                cleanup: Some(WireCleanup::Uncertain),
+                forced: false,
+                journal_uncertain: false,
+            };
+            let mut state = lock(&self.state);
+            state.retirement = Some(
+                state
+                    .retirement
+                    .map_or(uncertain, |earlier| sticky(earlier, uncertain)),
+            );
+        });
     }
 }
 
@@ -752,7 +821,8 @@ fn lane_end(
     turn: TurnNumber,
 ) -> (RouteError, Option<ConnectionLoss>) {
     match end {
-        LaneEnd::Overflow => (RouteError::Overflow { turn }, None),
+        // A failed generation's turn reports its cause (`settle_turn`).
+        LaneEnd::Overflow | LaneEnd::Quarantined => (RouteError::Overflow { turn }, None),
         LaneEnd::Lost(loss) => (loss_cause(&loss, turn), Some(loss)),
         LaneEnd::Retired => (RouteError::TransportLost { turn }, None),
         // Only a close cuts a lane off, after it stopped the turn.
@@ -892,7 +962,8 @@ async fn turn(
         return *end;
     }
     let cap = session.cap(driver);
-    let credit = match credit(&cap, (&mut orders, &mut force, &driver.health)).await {
+    let waits = (&mut orders, &mut force, &*driver.health);
+    let credit = match credit(&cap, waits, generation.registration()).await {
         Ok(credit) => credit,
         Err(why) => return uncredited(&facts, &connection, why, (&orders, &force)),
     };
@@ -941,11 +1012,30 @@ async fn turn(
     )
     .await;
     drop(writes);
-    if quarantines(&end) || !usable(&connection) || thread.lease.lane().overflowed_now() {
-        session.quarantine(&connection);
-    }
+    quarantine_unfit((driver, session), &connection, (&thread, turn), &end);
     drop(pin);
     end
+}
+
+/// Quarantines the generation a turn's `end` leaves unfit for the next
+/// turn: a failure latched in the health fails its registration first
+/// (x.3.2 X3 §4.1).
+fn quarantine_unfit(
+    (driver, session): (&SessionDriver, &CodexSession),
+    connection: &Arc<Connection>,
+    (thread, turn): (&Thread, TurnNumber),
+    end: &TurnEnd,
+) {
+    let overflowed = thread.lease.lane().overflowed_now();
+    if !(quarantines(end) || !usable(connection) || overflowed) {
+        return;
+    }
+    let cause = match &end.outcome {
+        Err(AdapterError::Route(failure)) => health_cause(&failure.cause),
+        Ok(_) | Err(_) => None,
+    }
+    .or_else(|| overflowed.then_some(DriverFailure::Route(RouteError::Overflow { turn })));
+    session.quarantine(connection, cause.map(|cause| (cause, &*driver.health)));
 }
 
 /// The bytes of a maximal vendor turn ID (C2 A1): a turn's credit is
@@ -953,7 +1043,7 @@ async fn turn(
 const VENDOR_ID_MAX: usize = 1024;
 
 /// Why a turn's credit was not reserved (x.3.2 X3 §4.2 step 1).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum Uncredited {
     /// The session's cap is full: the connection's overflow (§6.4).
     Exhausted,
@@ -966,15 +1056,21 @@ pub(super) enum Uncredited {
     Failed,
     /// The budget stayed full past the stall bound.
     Stalled,
+    /// The registration's generation failed (with its cause), or the
+    /// registration retired (F3).
+    Gone(Option<DriverFailure>),
 }
 
 /// x.3.2 X3 §4.2 step 1: reserves the turn's credit before any of its jobs
 /// exists. The cap slot is taken at once; the budget bytes are awaited
-/// beside the turn's orders, the daemon force, the driver's failure and
-/// the stall bound, and any of them ends the wait with nothing reserved.
+/// beside the turn's orders, the daemon force, the failure of its
+/// generation's `registration` (once it has one) or its retirement, the
+/// driver's failure and the stall bound, and any of them ends the wait with
+/// nothing reserved.
 pub(super) async fn credit(
     cap: &SessionCap,
     (orders, force, health): (&mut Orders, &mut ForceWatch, &watch::Sender<DriverHealth>),
+    registration: Option<&Registration>,
 ) -> Result<Charge, Uncredited> {
     let slot = cap
         .credit_slot(VENDOR_ID_MAX)
@@ -984,9 +1080,16 @@ pub(super) async fn credit(
         Err(slot) => slot,
     };
     let mut health = health.subscribe();
+    let gone = async {
+        match registration {
+            Some(registration) => registration.gone().await,
+            None => std::future::pending().await,
+        }
+    };
     tokio::select! {
         biased;
         () = forced(force) => Err(Uncredited::Forced),
+        () = gone => Err(Uncredited::Gone(registration.and_then(Registration::failure))),
         _ = health.wait_for(|health| matches!(health, DriverHealth::Failed { .. })) => {
             Err(Uncredited::Failed)
         }
@@ -1015,7 +1118,8 @@ fn uncredited(
             facts.driver.fail(DriverFailure::ObservationOverflow);
             facts.failed(RouteError::Overflow { turn }, None)
         }
-        Uncredited::Failed => facts.rejected(StartRejected::SessionGone),
+        Uncredited::Gone(Some(cause)) => facts.failed(generation_cause(&cause, turn), None),
+        Uncredited::Gone(None) | Uncredited::Failed => facts.rejected(StartRejected::SessionGone),
         Uncredited::Ordered | Uncredited::Forced => {
             facts.failed(unsent_cause(orders, force, turn), None)
         }
@@ -1339,7 +1443,7 @@ async fn open_thread(
         registration: normalize_on_tracker(driver, facts.session, ids, &lease),
         lease,
     });
-    facts.session.opened(ids.connection, &thread);
+    facts.session.opened(ids.connection, &thread, driver);
     driver.state().identity = Some(thread.id.clone());
     let identity = Identity {
         vendor_session_id: thread.id.clone(),
@@ -1482,7 +1586,6 @@ fn request_failed(facts: &Turn<'_>, error: RequestError) -> TurnEnd {
 }
 
 /// Why a reply never came.
-#[derive(Clone, Copy)]
 enum Unanswered {
     /// The connection ended or its record went.
     Lost,
@@ -1494,6 +1597,12 @@ enum Unanswered {
     Ended(EndCause),
     /// The registration's lane overflowed (x.3.2 X3 fix r3 #1).
     Overflow,
+    /// The registration's generation failed with `cause` (x.3.2 X3 §4.3):
+    /// the request was written, or may have been.
+    Generation {
+        cause: DriverFailure,
+        launched: bool,
+    },
 }
 
 /// A turn whose request went unanswered.
@@ -1528,26 +1637,67 @@ fn lost(facts: &Turn<'_>, connection: &Connection, cause: Unanswered) -> TurnEnd
             None,
             Some(WireCleanup::Uncertain),
         ),
+        // x.3.2 X3 §4.3: a withdrawn write is no launch; a written one
+        // leaves the cleanup unproven.
+        Unanswered::Generation { cause, launched } => {
+            let cause = generation_cause(&cause, turn);
+            if launched {
+                facts.failure(cause, None, Some(WireCleanup::Uncertain))
+            } else {
+                Turn {
+                    launched: false,
+                    instance: facts.instance.clone(),
+                    ..*facts
+                }
+                .failed(cause, None)
+            }
+        }
+    }
+}
+
+/// The generation's failure `cause` as an admitted turn `turn` ends with
+/// it (x.3.2 X3 §4.3): a protocol failure is the turn's protocol error;
+/// any other is its overflow, as an idle failure reports it.
+fn generation_cause(cause: &DriverFailure, turn: TurnNumber) -> RouteError {
+    match cause {
+        DriverFailure::Route(RouteError::Protocol { detail, .. }) => {
+            RouteError::Protocol { turn, detail }
+        }
+        DriverFailure::Route(_)
+        | DriverFailure::ObservationOverflow
+        | DriverFailure::OwnedTask
+        | DriverFailure::TurnAbandoned
+        | DriverFailure::ServerLost
+        | DriverFailure::ResumeMismatch
+        | DriverFailure::RetirementUncertain => RouteError::Overflow { turn },
     }
 }
 
 /// Awaits a queued request's paired reply, bounded by the force, the
-/// overflow of `lane` (the turn's registration, once it has one) and the
-/// end of the turn's own order; `on_order` runs once, at the order.
+/// failure of the turn's registration (once it has one) and the overflow
+/// of its `lane`, and the end of the turn's own order; `on_order` runs
+/// once, at the order.
 async fn await_reply(
     (written, reply): (oneshot::Receiver<SendOutcome>, oneshot::Receiver<Response>),
-    (orders, force, lane): (&mut Orders, &mut ForceWatch, Option<&Lane>),
+    (orders, force, thread): (&mut Orders, &mut ForceWatch, Option<(&Lane, &Registration)>),
     on_order: &mut (dyn FnMut(&Ending) + Send),
 ) -> Result<Response, Unanswered> {
     tokio::pin!(written);
     tokio::pin!(reply);
     let overflowed = async {
-        match lane {
-            Some(lane) => lane.overflowed().await,
+        match thread {
+            Some((lane, _)) => lane.overflowed().await,
             None => std::future::pending().await,
         }
     };
     tokio::pin!(overflowed);
+    let failed = async {
+        match thread {
+            Some((_, registration)) => registration.failed().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(failed);
     let mut answered = false;
     let mut ending: Option<Ending> = None;
     loop {
@@ -1555,6 +1705,22 @@ async fn await_reply(
         tokio::select! {
             biased;
             () = forced(force) => return Err(Unanswered::Forced),
+            // x.3.2 X3 §4.2 step 4: the generation failed and cancelled the
+            // turn's writes; whether the request was written decides.
+            () = &mut failed => {
+                let written = if answered {
+                    Ok(SendOutcome::Written)
+                } else {
+                    (&mut written).await
+                };
+                let cause = thread
+                    .and_then(|(_, registration)| registration.failure())
+                    .unwrap_or(DriverFailure::ObservationOverflow);
+                return Err(Unanswered::Generation {
+                    cause,
+                    launched: !matches!(written, Ok(SendOutcome::NotWritten)),
+                });
+            }
             // Vendor §5: a quarantined generation's turns end at once.
             () = &mut overflowed => return Err(Unanswered::Overflow),
             outcome = &mut written, if !answered => match outcome {
@@ -1579,6 +1745,13 @@ async fn sleep_until(at: Option<Instant>) {
     match at {
         Some(at) => tokio::time::sleep_until(at).await,
         None => std::future::pending().await,
+    }
+}
+
+impl Started<'_> {
+    /// The thread's lane and registration.
+    fn registered(&self) -> (&Lane, &Registration) {
+        (self.thread.lease.lane(), &self.thread.registration)
     }
 }
 
@@ -1625,15 +1798,9 @@ async fn run_started(
         start_by: orders.wall,
         finish_by: Deadline::at(Instant::now() + FINISH_BY),
     };
-    // Before the start is written: every message the connection reads for
-    // the thread from now on counts against the turn's decode fence (x.3.2
-    // critical r2 #2, runtime §8).
-    // A turn runs on the registration until this returns, accepted or
-    // not (x.3.2 X3 fix r4 #1).
-    let _fence = start
-        .thread
-        .registration
-        .fence(start.thread.lease.lane(), turn, activity);
+    let Some((admission, _fence)) = admitted(start, turn, (writes, activity)).await else {
+        return facts.rejected(StartRejected::SessionGone);
+    };
     let requested = start.connection.request(
         |id| turn_start(id, &values, prompt),
         bounds,
@@ -1655,7 +1822,7 @@ async fn run_started(
         .unwrap_or(AcceptanceToken::FIRST);
     let reply = await_reply(
         (requested.written, requested.reply),
-        (orders, force, Some(start.thread.lease.lane())),
+        (orders, force, Some(start.registered())),
         &mut |ending: &Ending| {
             // Before acceptance the intent waits on the start's reply.
             start
@@ -1707,6 +1874,7 @@ async fn run_started(
         (&accepted, (acceptance, read, mark), credit),
         activity,
     );
+    admission.deliver(&delivery);
     let accepted_turn = Accepted {
         id: accepted,
         start: start_id,
@@ -1726,7 +1894,10 @@ fn unanswered(
     start_id: ClientId,
     cause: Unanswered,
 ) -> TurnEnd {
-    if matches!(cause, Unanswered::Overflow) {
+    if matches!(
+        cause,
+        Unanswered::Overflow | Unanswered::Generation { launched: true, .. }
+    ) {
         let by = Deadline::at(Instant::now() + CLEANUP_ALLOWANCE);
         start
             .connection
@@ -1792,6 +1963,39 @@ fn hand_over(
         credit,
     });
     delivery
+}
+
+/// x.3.2 X3 §4.2 step 2: the turn is admitted on its registration, or
+/// refused once the generation failed or the registration retired; the
+/// generation's failure cancels its writes. Then, before its start is
+/// written, it fences the lane: every message the connection reads for
+/// the thread from now on counts against the turn's decode fence (x.3.2
+/// critical r2 #2, runtime §8), and the turn runs on the registration
+/// until the fence drops, accepted or not (x.3.2 X3 fix r4 #1).
+async fn admitted(
+    start: &Started<'_>,
+    turn: TurnNumber,
+    (writes, activity): (&TurnWrites, &crate::TurnActivity),
+) -> Option<(Admission, TurnFence)> {
+    let cancel = writes.canceller();
+    let registration = &start.thread.registration;
+    let admission = registration.admit(turn, Arc::new(move || cancel.cancel()))?;
+    admitted_seam().await;
+    let fence = registration.fence(start.thread.lease.lane(), turn, activity);
+    Some((admission, fence))
+}
+
+/// Test builds: a seam between a turn's admission and its `turn/start`
+/// (x.3.2 X3 r6 #1, r5 #5), where a test holds the admitted turn.
+#[cfg_attr(
+    not(feature = "test-failpoints"),
+    expect(clippy::unused_async, reason = "only test builds wait at the seam")
+)]
+async fn admitted_seam() {
+    #[cfg(feature = "test-failpoints")]
+    {
+        let _ = via_routes::failpoint::hit_async("adapter.codex.admitted").await;
+    }
 }
 
 /// Test builds: a seam between an accepted turn's cutoff and its
@@ -1961,6 +2165,18 @@ fn settle_turn(
                 None,
                 Some(WireCleanup::Uncertain),
             )
+        }
+        // x.3.2 X3 §4.3: never the cleanup of what survived.
+        (_, Some(Stop::Generation | Stop::Lane(LaneEnd::Quarantined))) => {
+            let cause = start
+                .thread
+                .registration
+                .failure()
+                .map_or(RouteError::Overflow { turn }, |cause| {
+                    generation_cause(&cause, turn)
+                });
+            cleanup_interrupt();
+            facts.failure(cause, None, Some(WireCleanup::Uncertain))
         }
         (_, Some(Stop::Lane(end))) => {
             let (cause, loss) = lane_end(end, start.connection, turn);

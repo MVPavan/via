@@ -17,6 +17,7 @@ mod threads;
 pub use connection::{
     Connection, ConnectionEnd, ConnectionFailure, Counts, DECLINE_DEADLINE, FINISH_BY,
     LOSS_EVIDENCE, LaneLease, Purpose, RequestError, Requested, Subscription, TurnWrites,
+    WriteCanceller,
 };
 pub use crash::{CrashOnPanic, RegistryGuard, crash_on_panic, lock};
 pub use encode::*;

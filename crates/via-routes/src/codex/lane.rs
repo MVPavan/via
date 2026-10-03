@@ -202,6 +202,9 @@ pub enum LaneEnd {
     /// before is the admitted prefix; later messages are dropped and
     /// counted ([`Lane::dropped`]).
     Closed,
+    /// The registration's generation failed (x.3.2 X3 §4.2 step 3):
+    /// later messages are dropped and counted.
+    Quarantined,
 }
 
 /// What [`Lane::next`] returns.
