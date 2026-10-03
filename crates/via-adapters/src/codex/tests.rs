@@ -16,12 +16,12 @@ use super::normalize::{
     DECLINES, NormalizeError, Step, StructuredOutput, TurnNormalizer, catalog_page, decline,
     instance_version, version_status,
 };
-use crate::VendorTerminalStatus;
 use crate::config::BootstrapEnv;
 use crate::observation::{
     ClassHint, DenialKind, Observation, ProgressMarks, StopReason, UsageSample,
 };
 use crate::plan::{Inherit, InheritState, VersionStatus};
+use crate::{TurnNumber, VendorTerminalStatus};
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex")
@@ -953,29 +953,38 @@ fn a_declined_item_is_a_denial() {
     assert!(denials(&observed(&mut normalizer, &failed)).is_empty());
 
     let mut ours = TurnNormalizer::new(false);
-    ours.note_decline(&ServerRequest {
-        id: RequestId::Int(4),
-        method: "item/commandExecution/requestApproval".to_owned(),
-        thread_id: Some("t".to_owned()),
-        turn_id: Some("u".to_owned()),
-        item_id: Some("c1".to_owned()),
-    })
-    .unwrap();
+    ours.ledger()
+        .note_decline(
+            first_turn(),
+            &ServerRequest {
+                id: RequestId::Int(4),
+                method: "item/commandExecution/requestApproval".to_owned(),
+                thread_id: Some("t".to_owned()),
+                turn_id: Some("u".to_owned()),
+                item_id: Some("c1".to_owned()),
+            },
+        )
+        .unwrap();
     assert!(
         denials(&observed(&mut ours, &command)).is_empty(),
         "VIA's own decline is reported as vendor.request_declined only"
     );
 }
 
-/// Review r1 #8: a `sleep` item is a tool: started, it is open, and an
-/// interrupted terminal with it still open is not quiescent.
+/// The turn [`TurnNormalizer::new`] normalizes.
+fn first_turn() -> TurnNumber {
+    TurnNumber::try_from(1).unwrap()
+}
+
+/// Review r1 #8: a `sleep` item is a tool: started, it is open (in the
+/// registration's ledger, x.3.2 X3 §6.3), and an interrupted terminal
+/// with it still open is not quiescent.
 #[test]
 fn an_open_sleep_is_an_open_tool() {
     let mut normalizer = TurnNormalizer::new(false);
-    let started = observed(
-        &mut normalizer,
-        &item("item/started", &tool_item("sleep", "s1", "")),
-    );
+    let sleep = item("item/started", &tool_item("sleep", "s1", ""));
+    normalizer.ledger().track(first_turn(), &sleep).unwrap();
+    let started = observed(&mut normalizer, &sleep);
     assert!(started.iter().any(|o| matches!(
         o,
         Observation::Progress(marks)
@@ -988,17 +997,20 @@ fn an_open_sleep_is_an_open_tool() {
         panic!("a terminal");
     };
     assert_eq!(terminal.status, VendorTerminalStatus::Interrupted);
-    assert!(normalizer.tools_open(), "the sleep is still open");
-    let mut closed = TurnNormalizer::new(false);
-    observed(
-        &mut closed,
-        &item("item/started", &tool_item("sleep", "s1", "")),
+    assert!(
+        normalizer.ledger().tools_open(first_turn()),
+        "the sleep is still open"
     );
-    observed(
-        &mut closed,
-        &item("item/completed", &tool_item("sleep", "s1", "")),
-    );
-    assert!(!closed.tools_open());
+    let closed = TurnNormalizer::new(false);
+    closed.ledger().track(first_turn(), &sleep).unwrap();
+    closed
+        .ledger()
+        .track(
+            first_turn(),
+            &item("item/completed", &tool_item("sleep", "s1", "")),
+        )
+        .unwrap();
+    assert!(!closed.ledger().tools_open(first_turn()));
 }
 
 /// Review r2 #2: each ID set admits 1,024 IDs and all share the 256 KiB
@@ -1030,7 +1042,7 @@ fn id_tracking_overflows_explicitly() {
         "overflowed for good"
     );
 
-    let mut declines = TurnNormalizer::new(false);
+    let declines = TurnNormalizer::new(false);
     let request = |n: usize| ServerRequest {
         id: RequestId::Int(1),
         method: "item/commandExecution/requestApproval".to_owned(),
@@ -1039,28 +1051,36 @@ fn id_tracking_overflows_explicitly() {
         item_id: Some(format!("c{n}")),
     };
     for n in 0..1024 {
-        declines.note_decline(&request(n)).unwrap();
+        declines
+            .ledger()
+            .note_decline(first_turn(), &request(n))
+            .unwrap();
     }
     assert_eq!(
-        declines.note_decline(&request(1024)).unwrap_err(),
+        declines
+            .ledger()
+            .note_decline(first_turn(), &request(1024))
+            .unwrap_err(),
         NormalizeError::Overflow
     );
 
-    let mut bytes = TurnNormalizer::new(false);
+    let bytes = TurnNormalizer::new(false);
     let long_id = |n: usize| format!("{n:0>1024}");
     for n in 0..256 {
         bytes
-            .observe(
+            .ledger()
+            .track(
+                first_turn(),
                 &item("item/started", &tool_item("sleep", &long_id(n), "")),
-                Instant::now(),
             )
             .unwrap();
     }
     assert_eq!(
         bytes
-            .observe(
+            .ledger()
+            .track(
+                first_turn(),
                 &item("item/started", &tool_item("sleep", &long_id(256), "")),
-                Instant::now()
             )
             .unwrap_err(),
         NormalizeError::Overflow

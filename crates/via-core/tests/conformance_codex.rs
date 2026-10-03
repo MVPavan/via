@@ -2439,6 +2439,131 @@ fn codex_suppression_exhaustion_fails_the_generation() {
     variant(name, &replay, &expect).unwrap();
 }
 
+/// `count` command items of turn `k`, `method` (`item/started` or
+/// `item/completed`), paced so the lane's bound is not the test's.
+fn tool_items(k: usize, count: usize, method: &str) -> Vec<Value> {
+    let status = if method == "item/started" {
+        "inProgress"
+    } else {
+        "completed"
+    };
+    let mut steps = Vec::new();
+    for n in 0..count {
+        steps.push(emit(&json!({"method": method, "params": {
+            "threadId": THREAD, "turnId": turn_id(k),
+            "item": {"type": "commandExecution", "id": format!("tool-{k}-{n}"),
+                "command": "sleep 1", "cwd": "/work/project", "commandActions": [],
+                "status": status}}})));
+        if n % 8 == 7 {
+            steps.push(json!({"delay": {"ms": 30}}));
+        }
+    }
+    if steps.last().is_some_and(|step| step.get("delay").is_some()) {
+        steps.pop();
+    }
+    steps
+}
+
+/// Turn 1 of [`many_turns`] starts this many tools and ends with them
+/// open; the session's metadata holds 1,024 entries (packet §5).
+const TURN1_TOOLS: usize = 600;
+
+/// Two turns: turn 1 ends with [`TURN1_TOOLS`] tools open, then
+/// `released` of them complete late, between the turns (they wait in the
+/// lane, within its 16 messages, while turn 2's acceptance is pending);
+/// turn 2 starts `second` tools, then completes them.
+fn open_tools_across_turns(
+    name: &str,
+    released: usize,
+    second: usize,
+) -> Result<(Value, Value), String> {
+    let (mut replay, mut expect) = many_turns(name, 2, |k| {
+        if k == 0 {
+            return tool_items(0, TURN1_TOOLS, "item/started");
+        }
+        // Turn 2's acceptance is handed over before its tools come.
+        let mut steps = vec![json!({"delay": {"ms": 200}})];
+        steps.extend(tool_items(1, second, "item/started"));
+        steps.extend(tool_items(1, second, "item/completed"));
+        steps
+    })?;
+    if released > 0 {
+        let completed = step_with(&replay, "\"method\":\"turn/completed\"")?;
+        // Turn 1 settles before its late completions come.
+        let mut late = vec![json!({"delay": {"ms": 300}})];
+        late.extend(tool_items(0, released, "item/completed"));
+        let all = steps(&mut replay)?;
+        for (offset, step) in late.into_iter().enumerate() {
+            all.insert(completed + 1 + offset, step);
+        }
+    }
+    // Turn 1's terminal finds its tools open.
+    turn_mut(&mut expect, 0)["expect"]["cleanup"] = json!("uncertain");
+    Ok((replay, expect))
+}
+
+/// x.3.2 X3 r5 #2 (release by completion), C1: an open tool survives its
+/// turn's settlement in registration storage. Turn 1 ends with 600 tools
+/// open; turn 2's 425th tool is the session's 1,025th entry: the
+/// generation fails `overflow`, its cleanup interrupt written.
+#[test]
+fn codex_open_tools_survive_their_turn() {
+    let name = "codex_open_tools_survive_their_turn";
+    let tools = 1024 - TURN1_TOOLS + 1;
+    let (mut replay, mut expect) = open_tools_across_turns(name, 0, tools).unwrap();
+    let second = step_with(
+        &replay,
+        &format!(
+            "\"method\":\"turn/started\",\"params\":{{\"threadId\":\"{THREAD}\",\"turn\":{{\"id\":\"{}\"",
+            turn_id(1)
+        ),
+    )
+    .unwrap();
+    let paced = 1 + tool_items(1, tools, "item/started").len();
+    cut_after(
+        &mut replay,
+        second + paced,
+        &[
+            json!({"expect": {
+                "line": {"method": "turn/interrupt",
+                    "params": {"threadId": THREAD, "turnId": turn_id(1)}},
+                "within_ms": 5000,
+            }}),
+            json!({"await_eof": {}}),
+        ],
+    )
+    .unwrap();
+    let turn = &mut turn_mut(&mut expect, 1)["expect"];
+    turn["terminal"] = Value::Null;
+    turn["usage"] = Value::Null;
+    turn["final_text"] = Value::Null;
+    turn["error"] = json!("overflow");
+    turn["cleanup"] = json!("uncertain");
+    turn["observations_include"] = json!([{"kind": "turn.accepted", "vendor_turn_id": turn_id(1)}]);
+    turn["observations_exclude"] = json!(["final_text"]);
+    turn["observations_order"] = json!(["turn.accepted"]);
+    turn["unasserted"] = json!([]);
+    expect["sessions"]["main"]["close"] = Value::Null;
+    expect["sessions"]["main"]["health"] = json!({"state": "failed", "first_cause": "overflow"});
+    variant(name, &replay, &expect).unwrap();
+}
+
+/// x.3.2 X3 r5 #2 and r6 #3 (release by completion), C1: an earlier
+/// turn's late successful completion releases its open tool's entry.
+/// Ten of turn 1's 600 open tools complete after its terminal: turn 2's
+/// 434 tools then fill the session's 1,024 entries exactly, and both
+/// turns complete.
+#[test]
+fn codex_late_completion_releases_open_tools() {
+    let name = "codex_late_completion_releases_open_tools";
+    let released = 10;
+    let second = 1024 - TURN1_TOOLS + released;
+    let (replay, mut expect) = open_tools_across_turns(name, released, second).unwrap();
+    // Turn 1's other open tools leave the session's cleanup unproven.
+    expect["sessions"]["main"]["close"]["cleanup"] = json!("uncertain");
+    variant(name, &replay, &expect).unwrap();
+}
+
 /// X0 item 8.2 (x.3.2 X3 fix r4 #4): a close cuts the lane off in decode
 /// order. Turn 1's late decline is held at the idle seam as the session
 /// closes; the vendor keeps sending turn 1's denials after the cutoff:

@@ -3,7 +3,8 @@
 //! one turn's notifications.
 
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serde_json::value::RawValue;
 use tokio::time::Instant;
@@ -241,10 +242,12 @@ enum CacheWrite {
     Unavailable,
 }
 
-/// What late judgement needs of one item of one turn (x.3.2 X3 fix r4
-/// #2, #3).
+/// What the session keeps of one item of one turn (x.3.2 X3 fix r4 #2,
+/// #3; X3 §6.1).
 #[derive(Clone, Copy, Default)]
 struct Suppressed {
+    /// A tool item started and not completed.
+    open: bool,
     /// VIA declined its approval request: its `declined` status is no
     /// vendor denial.
     declined_by_via: bool,
@@ -253,17 +256,29 @@ struct Suppressed {
 }
 
 /// One session's item metadata on a registration (packet §5: 1024
-/// entries and 256 KiB per session; x.3.2 X3 fix r4 #2, #3): the running
-/// turn's open tools, and the suppression table, keyed by owning turn and
-/// item ID, that late requests and denials are judged against for as
-/// long as the registration lives. Its exhaustion is an overflow, for
-/// good: the generation fails rather than forgetting a fact.
+/// entries and 256 KiB per session; x.3.2 X3 fix r4 #2, #3): open tools
+/// and the suppression table, keyed by owning turn and item ID, kept for
+/// as long as the registration lives (X3 §6). An open tool's entry
+/// survives its turn's settlement until the tool completes. Its
+/// exhaustion is an overflow, for good: the generation fails rather than
+/// forgetting a fact.
 #[derive(Default)]
 pub(crate) struct Metadata {
     entries: usize,
     bytes: usize,
     exhausted: bool,
     suppressed: HashMap<(TurnNumber, String), Suppressed>,
+}
+
+/// A registration's metadata, in registration storage (x.3.2 X3 §6.1):
+/// its consumer and the running turn's normalizer read and write it
+/// there, never across an await.
+pub(crate) type Ledger = Arc<Mutex<Metadata>>;
+
+/// The ledger's metadata, locked.
+pub(crate) fn ledger(ledger: &Ledger) -> MutexGuard<'_, Metadata> {
+    // Each update is a few assignments: consistent across a panic.
+    ledger.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Metadata {
@@ -284,6 +299,50 @@ impl Metadata {
     fn release(&mut self, id: &str) {
         self.entries = self.entries.saturating_sub(1);
         self.bytes = self.bytes.saturating_sub(id.len());
+    }
+
+    /// x.3.2 X3 §6.3, in every state: turn `turn`'s tool item started is
+    /// open (charged once); completed, it is no longer, and its entry is
+    /// released unless a decline or denial must still be judged.
+    pub(crate) fn track(
+        &mut self,
+        turn: TurnNumber,
+        notification: &Notification,
+    ) -> Result<(), NormalizeError> {
+        let (Notification::ItemStarted(event) | Notification::ItemCompleted(event)) = notification
+        else {
+            return Ok(());
+        };
+        let item = &event.item;
+        if !item.kind.is_tool() {
+            return Ok(());
+        }
+        if matches!(notification, Notification::ItemStarted(_)) {
+            self.entry(turn, &item.id)?.open = true;
+            return Ok(());
+        }
+        let key = (turn, item.id.clone());
+        if let Some(entry) = self.suppressed.get_mut(&key) {
+            entry.open = false;
+            if !entry.declined_by_via && !entry.denied {
+                self.suppressed.remove(&key);
+                self.release(&item.id);
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a tool item of turn `turn` started and has not completed.
+    pub(crate) fn tools_open(&self, turn: TurnNumber) -> bool {
+        self.suppressed
+            .iter()
+            .any(|((owner, _), entry)| *owner == turn && entry.open)
+    }
+
+    /// The entries charged.
+    #[cfg(test)]
+    pub(crate) fn entries(&self) -> usize {
+        self.entries
     }
 
     /// Item `item` of turn `turn`'s facts, charged once.
@@ -369,8 +428,9 @@ impl Metadata {
     }
 }
 
-/// One turn's normalizer: it keeps the structured-output text, the
-/// thread's usage, the open tools and the denials so far.
+/// One turn's normalizer: it keeps the structured-output text and the
+/// thread's usage; the open tools and the denials so far are in its
+/// registration's ledger.
 pub(crate) struct TurnNormalizer {
     /// Whether the turn requested an output schema.
     schema: bool,
@@ -382,55 +442,43 @@ pub(crate) struct TurnNormalizer {
     cache_write: CacheWrite,
     /// The model's context window, as last reported.
     window: Option<u64>,
-    /// Tool items started and not completed, charged to `metadata`.
-    open_tools: HashSet<String>,
     /// The turn the normalizer is for.
     turn: TurnNumber,
-    /// The session's item metadata, held while the turn runs.
-    metadata: Metadata,
+    /// Its registration's metadata.
+    ledger: Ledger,
     /// An ID overflowed: the normalizer takes nothing more.
     overflowed: bool,
 }
 
 impl TurnNormalizer {
-    /// A normalizer of a session's only turn, with its own metadata.
+    /// A normalizer of a session's only turn, with its own ledger.
     #[cfg(test)]
     pub(crate) fn new(schema: bool) -> Self {
         Self::on(
             schema,
             TurnNumber::try_from(1).unwrap_or_else(|_| unreachable!()),
-            Metadata::default(),
+            Ledger::default(),
         )
     }
 
-    /// Turn `turn`'s normalizer, holding the session's `metadata` while
-    /// the turn runs.
-    pub(crate) fn on(schema: bool, turn: TurnNumber, metadata: Metadata) -> Self {
+    /// Turn `turn`'s normalizer over its registration's `ledger`.
+    pub(crate) fn on(schema: bool, turn: TurnNumber, ledger: Ledger) -> Self {
         Self {
             schema,
             answer: Answer::Text(String::new()),
             total: None,
             cache_write: CacheWrite::None,
             window: None,
-            open_tools: HashSet::new(),
             turn,
-            metadata,
+            ledger,
             overflowed: false,
         }
     }
 
-    /// The session's metadata back as the turn ends: its open tools'
-    /// entries are released.
-    pub(crate) fn finish(mut self) -> Metadata {
-        for id in std::mem::take(&mut self.open_tools) {
-            self.metadata.release(&id);
-        }
-        self.metadata
-    }
-
-    /// The session's metadata, as the running turn holds it.
-    pub(crate) fn metadata(&mut self) -> &mut Metadata {
-        &mut self.metadata
+    /// Its registration's metadata, locked.
+    #[cfg(test)]
+    pub(crate) fn ledger(&self) -> MutexGuard<'_, Metadata> {
+        ledger(&self.ledger)
     }
 
     /// The step `notification` is; an error for a known notification that
@@ -453,9 +501,9 @@ impl TurnNormalizer {
         let progress =
             |marks: ProgressMarks| Step::Observations(vec![Observation::Progress(marks)]);
         Ok(match notification {
-            Notification::ItemStarted(event) => self
-                .item_started(&event.item)?
-                .map_or(Step::Activity, progress),
+            Notification::ItemStarted(event) => {
+                Self::item_started(&event.item).map_or(Step::Activity, progress)
+            }
             Notification::ItemCompleted(event) => self.item_completed(&event.item)?,
             Notification::AgentMessageDelta(_) | Notification::ReasoningDelta(_) => {
                 progress(ProgressMarks {
@@ -502,56 +550,30 @@ impl TurnNormalizer {
         }
     }
 
-    /// Records a request [`DECLINES`] answered, so the item's declined
-    /// status is not reported again as a vendor denial (C2: VIA's own
-    /// decline is `vendor.request_declined` only).
-    /// An ID that cannot be admitted is an overflow, as in
-    /// [`Self::observe`].
-    pub(crate) fn note_decline(&mut self, request: &ServerRequest) -> Result<(), NormalizeError> {
-        if self.overflowed {
-            return Err(NormalizeError::Overflow);
-        }
-        let noted = self.metadata.note_decline(self.turn, request);
-        self.overflowed = noted.is_err();
-        noted
-    }
-
-    /// Whether a tool item started and has not completed.
-    pub(crate) fn tools_open(&self) -> bool {
-        !self.open_tools.is_empty()
-    }
-
     /// The marks of an item's start: model output, and a tool's ID and type.
-    fn item_started(&mut self, item: &Item) -> Result<Option<ProgressMarks>, NormalizeError> {
+    fn item_started(item: &Item) -> Option<ProgressMarks> {
         let tools_started = if item.kind.is_tool() {
-            if !self.open_tools.contains(&item.id) {
-                self.metadata.charge(&item.id)?;
-                self.open_tools.insert(item.id.clone());
-            }
             vec![(item.id.clone(), item.kind.as_str().to_owned())]
         } else if matches!(item.kind, ItemKind::AgentMessage | ItemKind::Reasoning) {
             Vec::new()
         } else {
-            return Ok(None);
+            return None;
         };
-        Ok(Some(ProgressMarks {
+        Some(ProgressMarks {
             model: true,
             tools_started,
             ..ProgressMarks::default()
-        }))
+        })
     }
 
     fn item_completed(&mut self, item: &Item) -> Result<Step, NormalizeError> {
         if item.kind.is_tool() {
-            if self.open_tools.remove(&item.id) {
-                self.metadata.release(&item.id);
-            }
             let mut observations = vec![Observation::Progress(ProgressMarks {
                 tools_ended: vec![item.id.clone()],
                 ..ProgressMarks::default()
             })];
             observations.extend(
-                self.metadata
+                ledger(&self.ledger)
                     .denial(self.turn, item)?
                     .map(Observation::ActionDenied),
             );

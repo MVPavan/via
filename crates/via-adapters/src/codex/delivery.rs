@@ -40,7 +40,9 @@ use via_routes::codex::{
     Routed, ServerRequest, TurnFolder, decode,
 };
 
-use super::normalize::{self, Metadata, NormalizeError, Step, StructuredOutput, TurnNormalizer};
+use super::normalize::{
+    self, Ledger, Metadata, NormalizeError, Step, StructuredOutput, TurnNormalizer, ledger,
+};
 use crate::driver::latch;
 use crate::observation::{
     Acceptance, Observation, ObservationItem, ObservationSink, Reserved, VendorTerminal, admitted,
@@ -397,10 +399,13 @@ struct Slot {
 
 /// One registration's state shared by its driver and its normalizer (X0
 /// items 8.2, 13.2; x.3.2 X3 fix r3 #3, #4): the turn that fenced the
-/// lane, the accepted turn handed over, the close's delivery barrier, and
-/// the seal of what goes out while no turn runs.
+/// lane, the accepted turn handed over, the close's delivery barrier, the
+/// seal of what goes out while no turn runs, and the session's metadata
+/// (X3 §6.1).
 pub(crate) struct Registration {
     slot: Mutex<Slot>,
+    /// The session's metadata: open tools and the suppression table.
+    ledger: Ledger,
     /// Wakes the normalizer when the slot changes.
     changed: Notify,
     /// The seal of what goes out while no turn runs: sealed at the close's
@@ -417,6 +422,7 @@ impl Registration {
     pub(crate) fn new(before: u64) -> Arc<Self> {
         Arc::new(Self {
             slot: Mutex::new(Slot::default()),
+            ledger: Ledger::default(),
             changed: Notify::new(),
             idle: Delivery::new(before),
             drained: watch::channel(false).0,
@@ -426,6 +432,11 @@ impl Registration {
     fn slot(&self) -> MutexGuard<'_, Slot> {
         // Each edit is one assignment: consistent across a panic.
         self.slot.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The session's metadata, locked; never held across an await.
+    fn ledger(&self) -> MutexGuard<'_, Metadata> {
+        ledger(&self.ledger)
     }
 
     /// Fences `lane` for turn `turn` (x.3.2 critical r2 #2, runtime §8),
@@ -550,9 +561,6 @@ pub(crate) struct Normalizing {
     health: Arc<watch::Sender<DriverHealth>>,
     loss: LossRecord,
     running: Option<Running>,
-    /// The session's metadata while no turn runs (a running turn holds
-    /// it).
-    metadata: Metadata,
     /// The last turn whose delivery ended: its fence counts nothing more.
     finished: Option<TurnNumber>,
     marks: Option<Marks>,
@@ -576,7 +584,6 @@ impl Normalizing {
             health,
             loss,
             running: None,
-            metadata: Metadata::default(),
             finished: None,
             marks: None,
             failed: None,
@@ -681,8 +688,7 @@ impl Normalizing {
     }
 
     /// Delivers the accepted turn until its terminal, its seal or the
-    /// registration's end; once it is sealed the session's metadata comes
-    /// back. False once the registration's delivery ended.
+    /// registration's end. False once the registration's delivery ended.
     async fn turn(&mut self, current: Current) -> bool {
         let Current {
             delivery,
@@ -694,14 +700,13 @@ impl Normalizing {
             schema,
         } = current;
         let sealed = Arc::clone(&delivery);
-        let metadata = std::mem::take(&mut self.metadata);
         self.running = Some(Running {
             delivery,
             turn,
             accepted,
             folder,
             activity,
-            normalizer: TurnNormalizer::on(schema, turn, metadata),
+            normalizer: TurnNormalizer::on(schema, turn, Arc::clone(&self.registration.ledger)),
         });
         let mut open = self.deliver_turn(acceptance).await;
         if open {
@@ -713,7 +718,6 @@ impl Normalizing {
             };
         }
         if let Some(running) = self.running.take() {
-            self.metadata = running.normalizer.finish();
             self.finished = Some(running.turn);
         }
         open
@@ -766,10 +770,11 @@ impl Normalizing {
             .map_or(&self.registration.idle, |running| &running.delivery)
     }
 
+    /// Whether the running turn has a tool open, in the ledger.
     fn tools_open(&self) -> bool {
         self.running
             .as_ref()
-            .is_some_and(|running| running.normalizer.tools_open())
+            .is_some_and(|running| self.registration.ledger().tools_open(running.turn))
     }
 
     /// The message went out whole with no (further) output.
@@ -784,14 +789,6 @@ impl Normalizing {
             None => {
                 self.failed.get_or_insert(stop);
             }
-        }
-    }
-
-    /// The session's metadata: the running turn holds it.
-    fn metadata(&mut self) -> &mut Metadata {
-        match self.running.as_mut() {
-            Some(running) => running.normalizer.metadata(),
-            None => &mut self.metadata,
         }
     }
 
@@ -864,18 +861,36 @@ impl Normalizing {
     }
 
     /// [`Self::message`]'s handling: the item's observations, at the
-    /// instant the connection read it.
+    /// instant the connection read it. The ledger is updated first, in
+    /// every state, whatever goes out (x.3.2 X3 §6.3).
     async fn handle(&mut self, item: LaneItem) -> Flow {
         let owner = self.owner(item.routed());
+        let decoded = match &item {
+            LaneItem::Message(routed) => Some(decode(routed.staged.bytes())),
+            LaneItem::Declined { .. } => None,
+        };
+        let tracked = match (&item, &decoded) {
+            (LaneItem::Message(_), Some(Ok(Incoming::Notification(notification)))) => {
+                self.track(owner, |ledger, turn| ledger.track(turn, notification))
+            }
+            (LaneItem::Declined { request, .. }, _) => {
+                self.track(owner, |ledger, turn| ledger.note_decline(turn, request))
+            }
+            (LaneItem::Message(_), _) => Ok(()),
+        };
         if !self.delivery().take(item.routed().seq) {
+            return Flow::Done;
+        }
+        if tracked.is_err() {
+            self.stop(Stop::Overflow);
             return Flow::Done;
         }
         let at = item.routed().at;
         match item {
             LaneItem::Message(routed) => {
-                let notification = match decode(routed.staged.bytes()) {
-                    Ok(Incoming::Notification(notification)) => notification,
-                    Ok(Incoming::Request(_) | Incoming::Response(_)) | Err(_) => {
+                let notification = match decoded {
+                    Some(Ok(Incoming::Notification(notification))) => notification,
+                    Some(Ok(Incoming::Request(_) | Incoming::Response(_)) | Err(_)) | None => {
                         return self.malformed(owner, routed.staged.bytes()).await;
                     }
                 };
@@ -897,6 +912,22 @@ impl Normalizing {
                 flow
             }
         }
+    }
+
+    /// Updates the ledger for the turn that owns a message, when known:
+    /// the running turn's, or an earlier turn's by the connection's
+    /// mapping (x.3.2 X3 §6.3).
+    fn track(
+        &self,
+        owner: Owner,
+        update: impl FnOnce(&mut Metadata, TurnNumber) -> Result<(), NormalizeError>,
+    ) -> Result<(), NormalizeError> {
+        let turn = match (owner, &self.running) {
+            (Owner::This, Some(running)) => running.turn,
+            (Owner::Earlier(turn), _) => turn,
+            (Owner::This | Owner::Unknown | Owner::Thread, _) => return Ok(()),
+        };
+        update(&mut self.registration.ledger(), turn)
     }
 
     /// X0 item 5 steps 5 and 6: the evidence goes to the turn the message
@@ -1014,7 +1045,11 @@ impl Normalizing {
         (earlier, turn): (TurnNumber, &str),
         at: Instant,
     ) -> Flow {
-        let Ok(denial) = self.metadata().late_denial(earlier, notification) else {
+        let denial = self
+            .registration
+            .ledger()
+            .late_denial(earlier, notification);
+        let Ok(denial) = denial else {
             self.stop(Stop::Overflow);
             return Flow::Done;
         };
@@ -1030,9 +1065,9 @@ impl Normalizing {
 
     /// X0 item 11: a placeholder of the running turn is reported once its
     /// reply was written whole by `decoded_at + 5 s`; an earlier turn's
-    /// likewise, as that turn's late observation, noted in the session's
-    /// suppression table (x.3.2 X3 fix r2 #3, r4 #2); one naming another
-    /// turn, or none, gives nothing.
+    /// likewise, as that turn's late observation (x.3.2 X3 fix r2 #3, r4
+    /// #2; [`Self::handle`] noted it in the session's suppression table);
+    /// one naming another turn, or none, gives nothing.
     async fn declined(
         &mut self,
         owner: Owner,
@@ -1040,27 +1075,15 @@ impl Normalizing {
         decoded_at: Instant,
         mut written: watch::Receiver<Option<bool>>,
     ) -> Flow {
-        let noted = match (owner, request.turn_id.as_deref(), self.running.as_mut()) {
+        let named = match (owner, request.turn_id.as_deref(), self.running.as_ref()) {
             (Owner::This, _, Some(running)) => {
                 running.activity.record(decoded_at);
-                running
-                    .normalizer
-                    .note_decline(request)
-                    .map(|()| running.accepted.clone())
+                running.accepted.clone()
             }
-            (Owner::Earlier(earlier), Some(turn), _) => {
-                let turn = turn.to_owned();
-                self.metadata()
-                    .note_decline(earlier, request)
-                    .map(|()| turn)
-            }
+            (Owner::Earlier(_), Some(turn), _) => turn.to_owned(),
             (Owner::This | Owner::Earlier(_) | Owner::Unknown | Owner::Thread, _, _) => {
                 return flow(self.complete());
             }
-        };
-        let Ok(named) = noted else {
-            self.stop(Stop::Overflow);
-            return Flow::Done;
         };
         let delivery = Arc::clone(self.delivery());
         let whole = tokio::select! {
@@ -1156,7 +1179,7 @@ mod tests {
 
     use tokio::sync::watch;
     use tokio_util::sync::CancellationToken;
-    use via_routes::codex::{BoundedBytes, Lane, LaneItem, Routed, VendorMessage};
+    use via_routes::codex::{BoundedBytes, Lane, LaneEnd, LaneItem, Routed, VendorMessage};
 
     use super::{
         Delivery, Evidence, Folders, LossRecord, Losses, Normalizing, ObservationLoss,
@@ -1346,6 +1369,131 @@ mod tests {
             at: tokio::time::Instant::now(),
             mark: None,
         })
+    }
+
+    /// Message `seq`: turn `owner`'s command item `tool-1` with `method`
+    /// (`item/started` or `item/completed`, successful), as the lane holds
+    /// it after that turn ended.
+    fn late_tool(seq: u64, owner: TurnNumber, method: &str) -> LaneItem {
+        let status = if method == "item/started" {
+            "inProgress"
+        } else {
+            "completed"
+        };
+        let line = serde_json::json!({"method": method, "params": {
+            "threadId": "thread-1", "turnId": "vendor-1",
+            "item": {"type": "commandExecution", "id": "tool-1", "command": "sleep 1",
+                "cwd": "/w", "commandActions": [], "status": status}}})
+        .to_string()
+            + "\n";
+        LaneItem::Message(Routed {
+            staged: VendorMessage::new(BoundedBytes::try_from_message(line.into_bytes()).unwrap()),
+            seq,
+            turn: Some("vendor-1".to_owned()),
+            owner: Some(owner),
+            at: tokio::time::Instant::now(),
+            mark: None,
+        })
+    }
+
+    /// The normalizer of `registration` over `lane`, its observations
+    /// taken by nobody.
+    fn idle_normalizer(registration: &Arc<Registration>, lane: &Arc<Lane>) -> Normalizing {
+        let (sink, _received) = observation_channel();
+        Normalizing::new(
+            (Arc::clone(registration), Arc::clone(lane)),
+            (
+                sink,
+                Evidence {
+                    server: Arc::new(NoEvidence),
+                    earlier: Folders::default(),
+                },
+            ),
+            (
+                CancellationToken::new(),
+                Arc::new(watch::Sender::new(DriverHealth::Open)),
+            ),
+            LossRecord {
+                losses: Arc::new(Mutex::new(Losses::default())),
+                generation: 1,
+            },
+        )
+    }
+
+    /// x.3.2 X3 r6 #3 and r5 #2 (release by completion), C1: while no
+    /// turn runs, an earlier turn's late tool start opens its entry in the
+    /// registration's ledger, and its late successful completion releases
+    /// it.
+    #[tokio::test]
+    async fn late_tool_items_update_the_ledger() {
+        let registration = Registration::new(4);
+        let lane = Arc::new(Lane::default());
+        assert!(lane.push(late_tool(5, turn(1), "item/started"), 64));
+        lane.end(LaneEnd::Closed);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            idle_normalizer(&registration, &lane).run(),
+        )
+        .await
+        .unwrap();
+        assert!(registration.ledger().tools_open(turn(1)));
+        assert_eq!(registration.ledger().entries(), 1);
+
+        let registration = Registration::new(4);
+        let lane = Arc::new(Lane::default());
+        assert!(lane.push(late_tool(5, turn(1), "item/started"), 64));
+        assert!(lane.push(late_tool(6, turn(1), "item/completed"), 64));
+        lane.end(LaneEnd::Closed);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            idle_normalizer(&registration, &lane).run(),
+        )
+        .await
+        .unwrap();
+        assert!(!registration.ledger().tools_open(turn(1)));
+        assert_eq!(registration.ledger().entries(), 0, "the entry is released");
+    }
+
+    /// x.3.2 X3 r6 #3, C1: the ledger is updated in every state, before
+    /// any output decision. Turn 1's late tool start is held at the idle
+    /// seam, between its pop and its take, while the registration is
+    /// sealed: the take is refused, and the tool is open in the ledger all
+    /// the same.
+    #[cfg(feature = "test-failpoints")]
+    #[tokio::test]
+    async fn a_refused_take_still_opens_the_tool() {
+        use std::os::unix::fs::PermissionsExt;
+        const POINT: &str = "adapter.codex.idle_item";
+        const TOKEN: &str = "codex-delivery-tests";
+        let points = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(points.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let command = serde_json::json!({"token": TOKEN, "occurrence": 1, "action": "pause"});
+        std::fs::write(
+            points.path().join(format!("{POINT}.json")),
+            command.to_string(),
+        )
+        .unwrap();
+        via_routes::failpoint::activate(points.path(), TOKEN).unwrap();
+
+        let registration = Registration::new(4);
+        let lane = Arc::new(Lane::default());
+        assert!(lane.push(late_tool(5, turn(1), "item/started"), 64));
+        let run = tokio::spawn(idle_normalizer(&registration, &lane).run());
+        let ack = points.path().join(format!("{POINT}.1.ack"));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !ack.exists() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        registration.seal();
+        std::fs::write(points.path().join(format!("{POINT}.1.release")), b"").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(registration.ledger().tools_open(turn(1)));
     }
 
     /// x.3.2 X3 fix r4 #5, #6: a late denial the sink refuses while no
