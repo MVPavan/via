@@ -337,6 +337,10 @@ pub(crate) struct TurnOutcome {
     /// kept, or why not. Reported for a test's own checks; no expectation
     /// key states it.
     pub(crate) undecoded: Option<String>,
+    /// `RouteFailure.cleanup` as Route stated it (`Uncertain`,
+    /// `Quiescent`), before `TurnEvidence` reads `None` as uncertain; for
+    /// a test's own checks.
+    pub(crate) route_cleanup: Option<String>,
 }
 
 const TOP: &[&str] = &[
@@ -1847,6 +1851,7 @@ fn ideal_turn(e: &Value) -> TurnOutcome {
         observations: ideal_observations(e),
         gates: Vec::new(),
         undecoded: None,
+        route_cleanup: None,
     }
 }
 

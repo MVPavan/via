@@ -1727,7 +1727,10 @@ fn codex_start_order() {
     expect["source"] = replay["source"].clone();
     turn_mut(&mut expect, 0)["expect"]["observations_exclude"] =
         json!(["turn.accepted", "final_text", "progress"]);
-    variant(name, &replay, &expect).unwrap();
+    let knobs = conformance_run::Knobs::default();
+    let outcome = checked_outcome(name, &replay, &expect, knobs, |_| Ok(())).unwrap();
+    // Route states the turn's cleanup uncertain itself (Sol code r2 #3).
+    assert_eq!(outcome.turns[0].route_cleanup.as_deref(), Some("Uncertain"));
 
     // A malformed turn/completed of the turn, its correlation intact (X0
     // item 5 step 5): the turn fails `protocol`, the connection lives.

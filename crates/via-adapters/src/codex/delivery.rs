@@ -350,6 +350,7 @@ impl Delivery {
     /// Seals delivery: nothing more goes out. The position is fixed by
     /// the first call; the slots are taken once.
     pub(crate) fn seal(&self) -> Sealed {
+        seal_seam();
         let mut seal = self.lock();
         let next = seal.next();
         let position = *seal.sealed.get_or_insert(next);
@@ -389,6 +390,9 @@ enum Handled {
     /// The held turn's seal refused it at its start: nothing of it went
     /// out, and it is handled again with the turn closed (x.3.2 X3 §3.2).
     Refused(LaneItem),
+    /// The registration's seal refused it at its start: nothing of it
+    /// went out, ever.
+    Sealed,
 }
 
 /// The evidence folder of each turn a generation ran, by turn: the
@@ -1137,14 +1141,19 @@ impl Normalizing {
             return;
         }
         let whole = self.deliver(item, None).await;
-        self.handled(mark, whole);
+        self.handled(mark, whole.unwrap_or(false));
     }
 
     /// Handles `item` as its routing names it, or as `bound` binds it (a
-    /// retained item's turn and instant): whether it went out whole. The
-    /// held turn's seal refusing it at its start closes that turn, and it
-    /// is handled again.
-    async fn deliver(&mut self, mut item: LaneItem, bound: Option<(TurnNumber, Instant)>) -> bool {
+    /// retained item's turn and instant): whether it went out whole,
+    /// `None` when the registration's seal refused it. The held turn's
+    /// seal refusing it at its start closes that turn, and it is handled
+    /// again.
+    async fn deliver(
+        &mut self,
+        mut item: LaneItem,
+        bound: Option<(TurnNumber, Instant)>,
+    ) -> Option<bool> {
         loop {
             let owner = match (bound, item.routed()) {
                 (Some((turn, _)), _) => match &self.held {
@@ -1152,10 +1161,11 @@ impl Normalizing {
                     Some(_) | None => Owner::Earlier(turn),
                 },
                 (None, Some(routed)) => self.owner(routed),
-                (None, None) => return true,
+                (None, None) => return Some(true),
             };
             match self.handle(item, owner, bound.map(|(_, at)| at)).await {
-                Handled::Done(whole) => return whole,
+                Handled::Done(whole) => return Some(whole),
+                Handled::Sealed => return None,
                 Handled::Refused(refused) => {
                     self.close();
                     item = refused;
@@ -1214,6 +1224,7 @@ impl Normalizing {
             // is disposed of, whole.
             let Early {
                 item,
+                seq,
                 charge: _charge,
                 bound,
                 ..
@@ -1222,7 +1233,16 @@ impl Normalizing {
                 Some(Bound {
                     owner: Some(turn),
                     at,
-                }) => self.deliver(item, Some((turn, at))).await,
+                }) => {
+                    let whole = self.deliver(item, Some((turn, at))).await;
+                    // Refused by the registration's seal: its loss is
+                    // recorded before it stops being outstanding (§3.2).
+                    if whole.is_none() {
+                        losses(&self.loss.losses).note_turn(turn, self.loss.generation, seq, 1);
+                        self.registration.mark_incomplete();
+                    }
+                    whole.unwrap_or(false)
+                }
                 Some(Bound { owner: None, .. }) | None => true,
             };
             let mark = self.releasing.and_then(|(_, mark)| mark);
@@ -1466,7 +1486,7 @@ impl Normalizing {
         let _unstage = Unstage(Arc::clone(&self.registration));
         let tracked = self.tracked(owner, &parsed);
         if idle && !delivery.take(seq) {
-            return Handled::Done(false);
+            return Handled::Sealed;
         }
         if tracked.is_err() {
             self.overflow();
@@ -1846,7 +1866,8 @@ impl Normalizing {
     /// `delivery`'s seal: its room reserved outside the seal, the send
     /// made under it. `last` (with the open tools) completes the message.
     /// A wait past the message's stall deadline latches the observation
-    /// overflow and fails the generation; false once nothing more goes out.
+    /// overflow and fails the generation, as the lane's overflow does while
+    /// the turn is pending; false once nothing more goes out.
     async fn output(
         &mut self,
         delivery: &Arc<Delivery>,
@@ -1859,10 +1880,20 @@ impl Normalizing {
             vendor_turn: VendorTurnId::try_from(turn.to_owned()).ok(),
             observation,
         };
+        // A pending turn's acceptance in flight fails at the lane's
+        // overflow (§3.2), as a pending turn's next item would.
+        let pending = self
+            .held
+            .as_ref()
+            .is_some_and(|held| held.phase == Phase::Pending);
         let sent = {
             let reserved = tokio::select! {
                 biased;
                 () = delivery.sealed.cancelled() => return false,
+                () = self.lane.overflowed(), if pending => {
+                    self.overflow();
+                    return false;
+                }
                 reserved = tokio::time::timeout_at(
                     self.stall_by,
                     self.sink.reserve(&item, self.stall_by.saturating_duration_since(Instant::now())),
@@ -1923,6 +1954,15 @@ fn report_seam() {
     #[cfg(feature = "test-failpoints")]
     {
         let _ = via_routes::failpoint::hit("adapter.codex.report");
+    }
+}
+
+/// Test builds: a marker as a seal is about to take the seal's lock (Sol
+/// code r2 #4), which a test awaits before releasing a held report.
+fn seal_seam() {
+    #[cfg(feature = "test-failpoints")]
+    {
+        let _ = via_routes::failpoint::hit("adapter.codex.seal");
     }
 }
 

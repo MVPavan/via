@@ -1244,6 +1244,7 @@ impl<'a> Run<'a> {
         outcome.error = error;
         if let Err(AdapterError::Route(failure)) = &end.outcome {
             outcome.undecoded.clone_from(&failure.undecoded);
+            outcome.route_cleanup = failure.cleanup.map(|cleanup| format!("{cleanup:?}"));
         }
         outcome.terminal = end.terminal.as_ref().map(terminal);
         outcome.usage = end

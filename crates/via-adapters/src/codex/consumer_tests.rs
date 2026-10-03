@@ -1203,25 +1203,48 @@ fn r7_7_no_report_follows_a_seal() {
     assert_eq!(activity.delivered(), 2);
 }
 
-/// Sol code r1 #9, design §10: a seal racing a report waits for its
-/// publication. With the report paused between its seal check and its
-/// publication, a seal on another thread blocks until the report is
-/// released; then the report has published.
+/// Sol code r1 #9, r2 #4, design §10: a seal racing a report waits for
+/// its publication. With the report paused between its seal check and its
+/// publication, a seal on another thread, acknowledged as it is about to
+/// take the seal's lock, blocks until the report is released; then the
+/// report has published.
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn r1_9_a_racing_seal_waits_for_the_report() {
-    const POINT: &str = "adapter.codex.report";
-    let points = pause_at_hit(POINT, 1);
+    use std::os::unix::fs::PermissionsExt;
+    const TOKEN: &str = "codex-consumer-tests";
+    const REPORT: &str = "adapter.codex.report";
+    const SEAL: &str = "adapter.codex.seal";
+    let points = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(points.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    for (point, mut command) in [
+        (REPORT, json!({"action": "pause"})),
+        (SEAL, json!({"action": "delay", "value": 0})),
+    ] {
+        command["token"] = json!(TOKEN);
+        command["occurrence"] = json!(1);
+        std::fs::write(
+            points.path().join(format!("{point}.json")),
+            command.to_string(),
+        )
+        .unwrap();
+    }
+    via_routes::failpoint::activate(points.path(), TOKEN).unwrap();
+    let acknowledged = |point: &str| {
+        let ack = points.path().join(format!("{point}.1.ack"));
+        let by = std::time::Instant::now() + Duration::from_secs(5);
+        while !ack.exists() {
+            assert!(std::time::Instant::now() < by, "{point} was never reached");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
     let delivery = Delivery::new(4);
     let activity = TurnActivity::new(Instant::now());
     let reporter = {
         let (delivery, activity) = (Arc::clone(&delivery), activity.clone());
         std::thread::spawn(move || delivery.report(&activity, 2))
     };
-    let ack = points.path().join(format!("{POINT}.1.ack"));
-    while !ack.exists() {
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    acknowledged(REPORT);
     let (done, waited) = std::sync::mpsc::channel();
     let sealer = {
         let delivery = Arc::clone(&delivery);
@@ -1230,11 +1253,12 @@ fn r1_9_a_racing_seal_waits_for_the_report() {
             done.send(()).unwrap();
         })
     };
+    acknowledged(SEAL);
     assert!(
         waited.recv_timeout(Duration::from_millis(200)).is_err(),
         "the seal waits for the paused report"
     );
-    release_hit(&points, POINT, 1);
+    release_hit(&points, REPORT, 1);
     assert!(reporter.join().unwrap(), "the report published");
     sealer.join().unwrap();
     assert_eq!(activity.delivered(), 2);
@@ -1375,6 +1399,106 @@ async fn pump(fixture: &mut Fixture, items: impl IntoIterator<Item = LaneItem>) 
         }
     }
     fixture.settle().await;
+}
+
+/// Sol code r2 #1, x.3.2 X3 §3.2: an overflow preempts B's acceptance
+/// in flight. B's completed terminal is retained while pending; its
+/// `Reply` is taken and `Accepted` waits for sink capacity; the lane then
+/// overflows, and only after does capacity free. The generation fails
+/// `overflow`: nothing is mapped or released, and B retains no terminal.
+#[tokio::test]
+async fn r2_1_an_overflow_preempts_a_pending_acceptance() {
+    let mut fixture = Fixture::new();
+    let b = fixture.start(2);
+    fixture.push(message(&completed(B, "completed"), 5, (Some(B), None)));
+    fixture.settle().await;
+    assert_eq!(
+        fixture.registration.outstanding(),
+        Some(5),
+        "the terminal is retained"
+    );
+    let full = fixture.cap.fill_budget().unwrap();
+    fixture.reply(2, Some(B));
+    fixture.settle().await;
+    assert!(
+        fixture.lane.charged().0 > 0,
+        "the retained terminal keeps its charge"
+    );
+    let mut seq = 7;
+    while fixture
+        .lane
+        .push(message(&delta(B), seq, (Some(B), None)), 64)
+    {
+        seq += 1;
+    }
+    assert!(fixture.lane.overflowed_now());
+    fixture.settle().await;
+    drop(full);
+    fixture.settle().await;
+    assert_eq!(
+        fixture.registration.failure(),
+        Some(DriverFailure::Route(RouteError::Overflow { turn: turn(2) }))
+    );
+    assert!(fixture.observed().is_empty(), "no acceptance");
+    assert!(b.delivery.seal().terminal.is_none(), "no terminal");
+    assert_eq!(b.activity.delivered(), 0);
+}
+
+/// Sol code r2 #2, x.3.2 X3 §3.2: a retained item the registration's seal
+/// refuses is recorded as loss from its own position before it stops
+/// being outstanding. B's terminal (4) and a denial (5) are retained while
+/// pending; turn 1's later message (7) goes out under the registration's
+/// seal; B is accepted, its terminal freezes the tail, and B seals. The
+/// denial, released as B's late observation, then waits for its entry's
+/// bytes (held at its idle seam while the cap is filled); the
+/// registration is sealed past it; once the bytes free, its take is
+/// refused. The loss starts at 5 and continuity is unproven.
+#[cfg(feature = "test-failpoints")]
+#[tokio::test]
+async fn r2_2_a_refused_release_records_its_loss() {
+    const POINT: &str = "adapter.codex.idle_item";
+    let points = pause_at_hit(POINT, 2);
+    let fixture = Fixture::new();
+    fixture.mapped(1);
+    let b = fixture.start(2);
+    fixture.push(message(&completed(B, "completed"), 4, (Some(B), None)));
+    fixture.push(message(&denied(B, "tool-x"), 5, (Some(B), None)));
+    fixture.push(message(&delta(T), 7, (Some(T), Some(1))));
+    fixture.settle().await;
+    assert_eq!(fixture.registration.outstanding(), Some(4));
+    fixture.reply(2, Some(B));
+    fixture.settle().await;
+    assert_eq!(
+        fixture.registration.outstanding(),
+        Some(5),
+        "the tail is frozen"
+    );
+    b.delivery.seal();
+    reached_hit(&points, POINT, 2).await;
+    let full = fixture.cap.fill_budget().unwrap();
+    release_hit(&points, POINT, 2);
+    fixture.settle().await;
+    assert_eq!(
+        fixture.registration.outstanding(),
+        Some(5),
+        "the denial waits"
+    );
+    let sealed = fixture.registration.seal();
+    assert!(
+        sealed.position > 5,
+        "sealed past the denial: {}",
+        sealed.position
+    );
+    drop(full);
+    fixture.settle().await;
+    assert_eq!(fixture.registration.outstanding(), None);
+    let record = fixture.record().expect("the denial's loss");
+    assert!(
+        record.first_unqueued <= 5,
+        "loss from {}",
+        record.first_unqueued
+    );
+    assert!(fixture.registration.incomplete());
 }
 
 /// Sol code r1 #6, x.3.2 X3 §6.2: at a full cap (B's credit and 1,023
