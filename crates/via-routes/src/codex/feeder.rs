@@ -10,8 +10,11 @@
 //!
 //! A turn's input items carry its [`WriteCancel`] (x.3.2 X3 §2.2): once
 //! it is cancelled, the feeder hands none of them to Wire, and the ones it
-//! handed are withdrawn, which wins before their first byte.
+//! handed are withdrawn, which wins before their first byte. A
+//! `turn/start` pushes its turn's `Start` marker into its lane as it is
+//! handed, refused by the lane's start gate.
 
+use std::any::Any;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
@@ -20,9 +23,13 @@ use std::task::Poll;
 
 use tokio::sync::{Notify, oneshot, watch};
 use tokio::time::Instant;
-use via_wire::{DataHold, OutboundMessage, PendingWrite, SendOutcome, WriteBounds, WriteTicket};
+use via_wire::{
+    DataHold, OutboundMessage, PendingWrite, SendOutcome, TurnNumber, WriteBounds, WriteTicket,
+};
 
+use super::lane::Lane;
 use super::stdio::Stdio;
+use crate::DecodeWatermark;
 
 /// Which of the feeder's queues an item joins.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,6 +75,16 @@ pub(super) struct Item {
     pub(super) deadline: Option<Instant>,
     /// The turn's write-cancel token, for turn input.
     pub(super) cancel: Option<Arc<WriteCancel>>,
+    /// A `turn/start`'s marker, pushed as it is handed.
+    pub(super) start: Option<StartMarker>,
+}
+
+/// A `turn/start`'s `Start` marker (x.3.2 X3 §2.1), for its lane.
+pub(super) struct StartMarker {
+    pub(super) lane: Arc<Lane>,
+    pub(super) turn: TurnNumber,
+    pub(super) decoded: DecodeWatermark,
+    pub(super) cx: Box<dyn Any + Send + Sync>,
 }
 
 impl Item {
@@ -236,12 +253,17 @@ impl Feeder {
     }
 
     /// Hands a queued item to Wire, under the queues' lock, then its
-    /// token's: refused if its turn's writes were cancelled, else its
-    /// ticket is installed in the token.
+    /// token's: refused if its turn's writes were cancelled, or a
+    /// `turn/start` whose `Start` its lane refused (x.3.2 X3 §2.2: ended,
+    /// full or gated); else its ticket is installed in the token.
     fn hand(&self, item: Item, reply: bool) -> Result<Flight, Refused> {
         let bytes = item.control_bytes();
         let mut token = item.cancel.as_deref().map(WriteCancel::state);
-        if token.as_ref().is_some_and(|token| token.cancelled) {
+        let refused = token.as_ref().is_some_and(|token| token.cancelled)
+            || item
+                .start
+                .is_some_and(|start| !start.lane.push_start(start.turn, start.decoded, start.cx));
+        if refused {
             return Err(Refused {
                 answer: item.answer,
                 request: item.request,

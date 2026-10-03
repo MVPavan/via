@@ -316,13 +316,27 @@ async fn registered(vendor: &mut Vendor, thread: &str) -> LaneLease {
     lane
 }
 
-/// The routed items of `lane` now, as their raw lines.
-fn taken(lane: &Lane) -> Vec<Value> {
+/// The routed items of `lane` now, as their raw lines; its markers are
+/// taken too (a `Reply` taken opens the start gate).
+fn taken(lane: &Arc<Lane>) -> Vec<Value> {
     let mut items = Vec::new();
-    while let Some(LaneEvent::Item(item)) = lane.try_next() {
-        items.push(serde_json::from_slice(item.routed().staged.bytes()).unwrap());
+    while let Some(LaneEvent::Item(item, _charge)) = lane.try_next() {
+        if let Some(routed) = item.routed() {
+            items.push(serde_json::from_slice(routed.staged.bytes()).unwrap());
+        }
     }
     items
+}
+
+/// A `turn/start`'s purpose on `lane` for VIA turn `number`, with an
+/// empty context and a fresh watermark.
+fn starts(lane: &LaneLease, number: u32) -> Purpose<'_> {
+    Purpose::Starts {
+        lane,
+        turn: turn(number),
+        decoded: crate::DecodeWatermark::default(),
+        cx: Box::new(()),
+    }
 }
 
 /// Item 12.2: dropping a turn's guard with one of its writes handed to
@@ -792,7 +806,7 @@ async fn a_fenced_lane_counts_what_the_connection_reads() {
     vendor.emit(&item_completed("t", "u", "before")).await;
     vendor.settle().await;
     let first = crate::DecodeWatermark::default();
-    let fence = lane.lane().fence(first.clone());
+    assert!(lane.lane().push_start(turn(1), first.clone(), Box::new(())));
     let fenced_at = tokio::time::Instant::now();
     vendor.emit(&item_completed("t", "u", "one")).await;
     vendor.emit(&item_completed("o", "u", "elsewhere")).await;
@@ -800,7 +814,10 @@ async fn a_fenced_lane_counts_what_the_connection_reads() {
     vendor.settle().await;
     let settled_at = tokio::time::Instant::now();
     assert_eq!(first.get(), 2);
-    let routed = marked(lane.lane());
+    let (fences, routed) = marked(lane.lane());
+    let [fence] = fences[..] else {
+        panic!("one start: {fences:?}");
+    };
     let marks: Vec<_> = routed.iter().map(|(mark, _)| *mark).collect();
     assert_eq!(
         marks,
@@ -813,14 +830,23 @@ async fn a_fenced_lane_counts_what_the_connection_reads() {
     for (_, at) in &routed[1..] {
         assert!(fenced_at <= *at && *at <= settled_at);
     }
-    assert_eq!(marked(other.lane()).len(), 1);
+    assert_eq!(marked(other.lane()).1.len(), 1);
+    // Turn 1's start was never written: the gate opens for turn 2's.
+    lane.lane().start_unwritten(turn(1));
     let second = crate::DecodeWatermark::default();
-    let next = lane.lane().fence(second.clone());
-    assert_ne!(next, fence);
+    assert!(
+        lane.lane()
+            .push_start(turn(2), second.clone(), Box::new(()))
+    );
     vendor.emit(&item_completed("t", "u2", "three")).await;
     vendor.settle().await;
     assert_eq!((first.get(), second.get()), (2, 1));
-    let marks: Vec<_> = marked(lane.lane()).iter().map(|(mark, _)| *mark).collect();
+    let (fences, routed) = marked(lane.lane());
+    let [next] = fences[..] else {
+        panic!("one start: {fences:?}");
+    };
+    assert_ne!(next, fence);
+    let marks: Vec<_> = routed.iter().map(|(mark, _)| *mark).collect();
     assert_eq!(
         marks,
         [Some(Mark {
@@ -830,13 +856,22 @@ async fn a_fenced_lane_counts_what_the_connection_reads() {
     );
 }
 
-/// The routed items of `lane` now: each one's fence mark and read instant.
-fn marked(lane: &Lane) -> Vec<(Option<Mark>, tokio::time::Instant)> {
-    let mut items = Vec::new();
-    while let Some(LaneEvent::Item(item)) = lane.try_next() {
-        items.push((item.routed().mark, item.routed().at));
+/// The items of `lane` now: the fence of each `Start`, and each routed
+/// item's fence mark and read instant.
+type Marked = (Vec<u64>, Vec<(Option<Mark>, tokio::time::Instant)>);
+
+fn marked(lane: &Arc<Lane>) -> Marked {
+    let (mut fences, mut items) = (Vec::new(), Vec::new());
+    while let Some(LaneEvent::Item(item, _charge)) = lane.try_next() {
+        match &*item {
+            LaneItem::Start(start) => fences.push(start.fence),
+            LaneItem::Message(routed) | LaneItem::Declined { routed, .. } => {
+                items.push((routed.mark, routed.at));
+            }
+            LaneItem::Reply(_) => {}
+        }
     }
-    items
+    (fences, items)
 }
 
 /// Item 9.1: records, mappings and closed threads share one budget of
@@ -904,10 +939,7 @@ async fn interrupt_waits_for_delayed_acceptance() {
         .request(
             |id| Ok(turn_start_line(id, "t", "go")),
             start_by(),
-            Purpose::Starts {
-                lane: &lane,
-                turn: turn(1),
-            },
+            starts(&lane, 1),
             None,
         )
         .unwrap();
@@ -946,10 +978,7 @@ async fn interrupt_dropped_when_start_withdrawn() {
         .request(
             |id| Ok(turn_start_line(id, "t", "go")),
             start_by(),
-            Purpose::Starts {
-                lane: &lane,
-                turn: turn(1),
-            },
+            starts(&lane, 1),
             Some(&mut writes),
         )
         .unwrap();
@@ -973,10 +1002,7 @@ async fn quarantine_interrupt_survives_settlement() {
         .request(
             |id| Ok(turn_start_line(id, "t", &"y".repeat(64 * 1024))),
             start_by(),
-            Purpose::Starts {
-                lane: &lane,
-                turn: turn(1),
-            },
+            starts(&lane, 1),
             Some(&mut writes),
         )
         .unwrap();
@@ -1003,16 +1029,15 @@ async fn accepted(vendor: &mut Vendor, lane: &LaneLease, number: u32, accepted: 
         .request(
             |id| Ok(turn_start_line(id, "t", "go")),
             start_by(),
-            Purpose::Starts {
-                lane,
-                turn: turn(number),
-            },
+            starts(lane, number),
             None,
         )
         .unwrap();
     assert_eq!(vendor.read().await["method"], "turn/start");
     vendor.emit(&start_reply(start.id.get(), accepted)).await;
     start.reply.await.unwrap();
+    // Its `Reply` taken, the start gate opens for the next turn.
+    taken(lane.lane());
     start.id
 }
 
@@ -1064,10 +1089,7 @@ async fn late_start_reply_keeps_its_turn() {
         .request(
             |id| Ok(turn_start_line(id, "t", "go")),
             start_by(),
-            Purpose::Starts {
-                lane: &lane,
-                turn: turn(1),
-            },
+            starts(&lane, 1),
             None,
         )
         .unwrap();
@@ -1099,10 +1121,7 @@ async fn repeated_turn_id_fails_protocol() {
         .request(
             |id| Ok(turn_start_line(id, "t", "again")),
             start_by(),
-            Purpose::Starts {
-                lane: &lane,
-                turn: turn(2),
-            },
+            starts(&lane, 2),
             None,
         )
         .unwrap();
@@ -1129,10 +1148,7 @@ async fn correlation_bytes_count_turn_ids() {
         let Ok(start) = vendor.connection.request(
             |id| Ok(turn_start_line(id, "t", "go")),
             start_by(),
-            Purpose::Starts {
-                lane: &lane,
-                turn: turn(1),
-            },
+            starts(&lane, 1),
             None,
         ) else {
             break;
@@ -1143,6 +1159,7 @@ async fn correlation_bytes_count_turn_ids() {
         if start.reply.await.is_err() {
             break;
         }
+        taken(lane.lane());
         mapped += 1;
     }
     assert!(mapped < fits, "{mapped} turns of 1,000-byte IDs mapped");
@@ -1152,16 +1169,17 @@ async fn correlation_bytes_count_turn_ids() {
     );
 }
 
-/// Runtime §8 (x.3.2 X3 fix r2 #10): a successful `turn/start` reply is
-/// the turn's acceptance, a message of its decode fence: pairing it
-/// advances the fenced lane's watermark and keeps when the connection
-/// read it and its position, once, for the acceptance's delivery.
+/// Runtime §8 (x.3.2 X3 fix r2 #10, §2.1): a `turn/start` is handed to
+/// Wire behind its `Start` marker, which fences the lane for the turn's
+/// watermark; its successful reply is the turn's acceptance, a message of
+/// that fence: pairing it advances the watermark and pushes the `Reply`
+/// marker at its position, with when the connection read it and the
+/// accepted vendor turn.
 #[tokio::test]
 async fn start_reply_counts_under_the_fence() {
     let mut vendor = Vendor::open(1 << 16);
     let lane = registered(&mut vendor, "t").await;
     let decoded = crate::DecodeWatermark::default();
-    let fence = lane.lane().fence(decoded.clone());
     let start = vendor
         .connection
         .request(
@@ -1170,18 +1188,215 @@ async fn start_reply_counts_under_the_fence() {
             Purpose::Starts {
                 lane: &lane,
                 turn: turn(1),
+                decoded: decoded.clone(),
+                cx: Box::new(()),
             },
             None,
         )
         .unwrap();
     vendor.read().await;
+    assert_eq!(lane.lane().open_start(), Some(turn(1)));
     let before = tokio::time::Instant::now();
     vendor.emit(&start_reply(start.id.get(), "u1")).await;
-    start.reply.await.unwrap();
+    let response = start.reply.await.unwrap();
     let after = tokio::time::Instant::now();
+    assert!(!response.contradicted);
     assert_eq!(decoded.get(), 1);
-    let (at, mark) = lane.lane().take_acceptance().unwrap();
-    assert_eq!(mark, Some(Mark { fence, seq: 1 }));
-    assert!(before <= at && at <= after);
-    assert!(lane.lane().take_acceptance().is_none(), "taken once");
+    let Some(LaneEvent::Item(first, _)) = lane.lane().try_next() else {
+        panic!("the start marker");
+    };
+    let LaneItem::Start(marker) = *first else {
+        panic!("the start marker first");
+    };
+    assert_eq!(marker.turn, turn(1));
+    let Some(LaneEvent::Item(second, _)) = lane.lane().try_next() else {
+        panic!("the reply marker");
+    };
+    let LaneItem::Reply(reply) = *second else {
+        panic!("the reply marker next");
+    };
+    assert_eq!(reply.turn, turn(1));
+    assert_eq!(
+        reply.mark,
+        Some(Mark {
+            fence: marker.fence,
+            seq: 1
+        })
+    );
+    assert!(before <= reply.at && reply.at <= after);
+    assert_eq!(reply.accepted.as_deref(), Some("u1"));
+    assert_eq!(
+        lane.lane().open_start(),
+        None,
+        "taking the reply opens the gate"
+    );
+}
+
+/// x.3.2 X3 §3.2, packet lines 144–145: an item naming a turn the
+/// connection never mapped, read while a start is open, may be that
+/// turn's: the start's error reply is flagged contradicted, and its
+/// `Reply` marker accepts nothing. Without such an item it is not.
+#[tokio::test]
+async fn a_refusal_after_unmapped_traffic_is_contradicted() {
+    let mut vendor = Vendor::open(1 << 16);
+    let lane = registered(&mut vendor, "t").await;
+    for (number, early) in [(1, false), (2, true)] {
+        let start = vendor
+            .connection
+            .request(
+                |id| Ok(turn_start_line(id, "t", "go")),
+                start_by(),
+                starts(&lane, number),
+                None,
+            )
+            .unwrap();
+        vendor.read().await;
+        if early {
+            vendor.emit(&item_completed("t", "unmapped", "early")).await;
+        }
+        vendor
+            .emit(&json!({"id": start.id.get(), "error": {"code": -32600, "message": "no"}}))
+            .await;
+        let response = start.reply.await.unwrap();
+        assert!(response.outcome.is_err());
+        assert_eq!(response.contradicted, early, "turn {number}");
+        let mut replies = Vec::new();
+        while let Some(LaneEvent::Item(item, _)) = lane.lane().try_next() {
+            if let LaneItem::Reply(reply) = *item {
+                replies.push(reply.accepted);
+            }
+        }
+        assert_eq!(replies, [None], "turn {number}");
+    }
+}
+
+/// x.3.2 X3 S11, positive release (r10 #2): turn 1's start is handed (its
+/// `Start` sets the gate) and Wire holds it before its first byte behind
+/// a control; the turn's guard withdraws it. Its positive `NotWritten`
+/// opens the gate with no `Reply`, and turn 2's start is handed and
+/// written.
+#[tokio::test]
+async fn a_withdrawn_start_opens_the_gate() {
+    let mut vendor = Vendor::open(64);
+    let lane = registered(&mut vendor, "t").await;
+    let mut big = br#"{"method":"note","params":{"pad":""#.to_vec();
+    big.extend(vec![b'x'; 16 * 1024]);
+    big.extend(b"\"}}\n");
+    let _control = vendor.connection.notify(big, start_by()).unwrap();
+    vendor.wrote(2, started).await;
+    let mut writes = TurnWrites::new(&vendor.connection);
+    let first = vendor
+        .connection
+        .request(
+            |id| Ok(turn_start_line(id, "t", "withdrawn")),
+            start_by(),
+            starts(&lane, 1),
+            Some(&mut writes),
+        )
+        .unwrap();
+    vendor.wrote(3, unstarted).await;
+    assert_eq!(lane.lane().open_start(), Some(turn(1)));
+    drop(writes);
+    assert_eq!(
+        promptly(first.written).await.unwrap(),
+        SendOutcome::NotWritten
+    );
+    until("the gate opens", || lane.lane().open_start().is_none()).await;
+    let second = vendor
+        .connection
+        .request(
+            |id| Ok(turn_start_line(id, "t", "next")),
+            start_by(),
+            starts(&lane, 2),
+            None,
+        )
+        .unwrap();
+    assert_eq!(vendor.read().await["method"], "note");
+    assert_eq!(vendor.read().await["params"]["input"][0]["text"], "next");
+    assert_eq!(
+        promptly(second.written).await.unwrap(),
+        SendOutcome::Written
+    );
+    assert_eq!(lane.lane().open_start(), Some(turn(2)));
+}
+
+/// x.3.2 X3 S11, the backstop (r10 #2): while turn 1's `Reply` is
+/// unpopped its `Start` holds the gate, and the hand-off refuses turn 2's
+/// start: `NotWritten`, nothing written.
+#[tokio::test]
+async fn the_hand_off_refuses_a_start_behind_an_open_one() {
+    let mut vendor = Vendor::open(1 << 16);
+    let lane = registered(&mut vendor, "t").await;
+    let _first = vendor
+        .connection
+        .request(
+            |id| Ok(turn_start_line(id, "t", "first")),
+            start_by(),
+            starts(&lane, 1),
+            None,
+        )
+        .unwrap();
+    assert_eq!(vendor.read().await["method"], "turn/start");
+    let second = vendor
+        .connection
+        .request(
+            |id| Ok(turn_start_line(id, "t", "second")),
+            start_by(),
+            starts(&lane, 2),
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        promptly(second.written).await.unwrap(),
+        SendOutcome::NotWritten
+    );
+    assert!(vendor.silent(Duration::from_millis(200)).await);
+    assert_eq!(lane.lane().open_start(), Some(turn(1)));
+}
+
+/// x.3.2 X3 S7 (r5 #4, r8 #4): a close is posted while the connection
+/// task is between a request's decline (queued) and its placeholder's
+/// push (a seam that holds the task's thread, so the close comes from
+/// another thread). The close applies between two routing operations:
+/// the placeholder is in the lane's prefix, then the lane ends `Closed`,
+/// and the thread's later traffic is late.
+#[tokio::test]
+async fn a_close_posted_at_a_decline_cuts_after_its_placeholder() {
+    const POINT: &str = "codex.connection.decline";
+    let points = paused_at(POINT);
+    let mut vendor = Vendor::open(1 << 16);
+    let lane = Arc::new(registered(&mut vendor, "t").await);
+    let ack = points.path().join(format!("{POINT}.1.ack"));
+    let release_at = points.path().join(format!("{POINT}.1.release"));
+    let poster = {
+        let (connection, lane) = (Arc::clone(&vendor.connection), Arc::clone(&lane));
+        std::thread::spawn(move || {
+            let by = std::time::Instant::now() + Duration::from_secs(5);
+            while !ack.exists() {
+                assert!(std::time::Instant::now() < by, "the seam's pause");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            connection.post_close(&lane);
+            std::fs::write(release_at, b"").unwrap();
+        })
+    };
+    vendor
+        .emit(
+            &json!({"id": 90, "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "t", "turnId": "u", "itemId": "i"}}),
+        )
+        .await;
+    assert_eq!(vendor.read().await["id"], 90, "the decline is written");
+    poster.join().unwrap();
+    vendor.emit(&item_completed("t", "u", "after")).await;
+    vendor.settle().await;
+    let Some(LaneEvent::Item(item, _)) = lane.lane().try_next() else {
+        panic!("the placeholder");
+    };
+    assert!(matches!(*item, LaneItem::Declined { .. }));
+    assert!(matches!(
+        lane.lane().try_next(),
+        Some(LaneEvent::End(LaneEnd::Closed))
+    ));
+    assert_eq!(vendor.connection.counts().late_after_close, 1);
 }

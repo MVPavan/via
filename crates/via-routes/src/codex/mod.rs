@@ -22,8 +22,8 @@ pub use connection::{
 pub use crash::{CrashOnPanic, RegistryGuard, crash_on_panic, lock};
 pub use encode::*;
 pub use lane::{
-    AbnormalEnd, ConnectionLoss, LANE_BYTES, LANE_MESSAGES, Lane, LaneEnd, LaneEvent, LaneItem,
-    LeaseSignal, LossCause, Mark, Routed,
+    AbnormalEnd, ConnectionLoss, ENTRY_BYTES, LANE_BYTES, LANE_MESSAGES, Lane, LaneCharge, LaneEnd,
+    LaneEvent, LaneItem, LeaseSignal, LossCause, Mark, Reply, Routed, START_BYTES, Start,
 };
 pub use messages::*;
 pub use servers::{

@@ -62,6 +62,19 @@ struct LaneEntry {
     cleanup: bool,
     /// The lane's one unsubscribe intent was posted (item 8.3).
     unsubscribed: bool,
+    /// The driver's close (x.3.2 X3 §5).
+    close: Close,
+}
+
+/// Where a lane's close is (x.3.2 X3 §5).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Close {
+    /// None was posted.
+    Open,
+    /// Posted, for the connection task to apply (§5.1).
+    Posted,
+    /// Applied (§5.2): the thread's traffic and its mapped turns' are late.
+    Cut,
 }
 
 /// An accepted turn, kept until the connection retires.
@@ -112,6 +125,7 @@ impl ThreadTable {
                 interrupted: None,
                 cleanup: false,
                 unsubscribed: false,
+                close: Close::Open,
             },
         );
         id
@@ -159,9 +173,38 @@ impl ThreadTable {
         Ok(())
     }
 
-    /// Lane `id`, while open.
-    pub(super) fn lane(&self, id: u64) -> Option<&Arc<Lane>> {
-        self.lanes.get(&id).map(|entry| &entry.lane)
+    /// Lane `id` and its lease's signal, while open and not cut.
+    pub(super) fn lane(&self, id: u64) -> Option<(Arc<Lane>, Option<Arc<LeaseSignal>>)> {
+        self.lanes
+            .get(&id)
+            .filter(|entry| entry.close != Close::Cut)
+            .map(|entry| (Arc::clone(&entry.lane), entry.signal.clone()))
+    }
+
+    /// x.3.2 X3 §5.1: posts lane `id`'s close, once; a lane gone (its ID
+    /// is never reused) is ignored. Whether it was posted now.
+    pub(super) fn post_close(&mut self, id: u64) -> bool {
+        self.lanes.get_mut(&id).is_some_and(|entry| {
+            let open = entry.close == Close::Open;
+            if open {
+                entry.close = Close::Posted;
+            }
+            open
+        })
+    }
+
+    /// x.3.2 X3 §5.2: applies every posted close: the lane is cut, so its
+    /// thread's and its mapped turns' traffic routes late from now on. The
+    /// lanes cut now, for the caller to end `Closed`.
+    pub(super) fn apply_closes(&mut self) -> Vec<Arc<Lane>> {
+        self.lanes
+            .values_mut()
+            .filter(|entry| entry.close == Close::Posted)
+            .map(|entry| {
+                entry.close = Close::Cut;
+                Arc::clone(&entry.lane)
+            })
+            .collect()
     }
 
     /// The thread lane `id` is registered for, if any.
@@ -251,7 +294,9 @@ impl ThreadTable {
             && let Some(entry) = self.lanes.get(id)
         {
             return match mapped {
-                // An earlier generation's turn: its sink is closed.
+                // A cut registration's (x.3.2 X3 §5.2), or an earlier
+                // generation's turn: its sink is closed.
+                _ if entry.close == Close::Cut => Route::Late,
                 Some(mapping) if mapping.lane != *id => Route::Late,
                 mapped => Route::Lane {
                     lane: Arc::clone(&entry.lane),

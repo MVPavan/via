@@ -1,43 +1,47 @@
 //! One Codex registration's delivery (x.3.2 X0 items 5, 8.2, 10, 11,
-//! 12.5, 13.2): the normalizer task that takes the registration's ingress
-//! lane in decode order across its turns, each turn's `DeliverySeal`, and
-//! the registration's own seal for what goes out while no turn runs.
+//! 12.5, 13.2; X3 §1–§6): the single consumer that takes the
+//! registration's ingress lane in decode order across its turns, each
+//! turn's `DeliverySeal`, and the registration's own seal for what goes
+//! out under no turn.
 //!
-//! The normalizer runs on the session's tracker under `crash_on_panic`: a
+//! The consumer runs on the session's tracker under `crash_on_panic`: a
 //! panic in it is a VIA bug and aborts the daemon. It lives from the
-//! thread's registration until its close's delivery barrier, the
-//! registration's release or the session's cancellation (x.3.2 X3 fix r3
-//! #3). It decodes each raw message as it consumes it, so the message's
-//! staging permit is held until then. While a turn runs, a message of
-//! that turn is normalized and its observations are handed to the C2
-//! sink; the turn's terminal is retained in the seal's slot, never sent.
-//! An earlier turn's denial or decline is that turn's late observation,
-//! named by its vendor turn and judged against that turn's own history
-//! (fix r3 #4), whether or not a turn runs; while none runs, only such
-//! messages are taken, the rest waits for the next turn. A message of no
-//! known turn gives nothing; one that does not decode keeps its evidence
-//! in the folder of the turn its correlation names, else in the server's,
-//! and fails the generation `protocol`. A decline is reported only for the
-//! turn it names, once its reply was written whole.
+//! thread's registration until the lane's end, the generation's failure,
+//! the registration's seal or the session's cancellation. It is the only
+//! reader of the lane and the registration's only sink producer, so its
+//! outputs follow decode order and `at` never decreases (C2 §4).
 //!
-//! The running turn never waits on the normalizer. It waits for the
-//! seal's decision (the retained terminal, or why delivery stopped)
-//! beside its own orders, and seals at whatever cutoff comes first: every
-//! later output finds the seal and is refused, so nothing of the turn
-//! reaches Core after `run_turn` returned. The seal reports the first
-//! message it may have left undelivered, a conservative lower bound.
+//! Every fact that decides whose lane traffic is travels in the lane: a
+//! turn's `Start` marker, pushed as its `turn/start` is handed to Wire,
+//! holds the turn (`Pending`), and the turn's `Reply` marker, at the
+//! reply's decode position, accepts it (`Running`) or refuses it. A
+//! message naming an unmapped turn read while a turn is pending may be
+//! that turn's early traffic: it is retained, under its lane charge, and
+//! released after the acceptance, restamped; it is loss if the turn can
+//! never be mapped. A turn's terminal is retained in its seal's slot,
+//! never sent, and freezes the lane until the turn seals. An earlier
+//! turn's message takes the late path under the registration's seal,
+//! judged by the session's ledger. A message that does not decode, a
+//! protocol error, a stall or an overflow fails the generation (§4).
+//!
+//! The running turn never waits on the consumer. It waits for its seal's
+//! decision beside its own orders, and seals at whatever cutoff comes
+//! first: every later output finds the seal and is refused. The seal
+//! reports the first message it may have left undelivered, a conservative
+//! lower bound, floored by the consumer's outstanding retained position.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use via_routes::codex::{
-    Connection, ConnectionFailure, DECLINE_DEADLINE, Incoming, Lane, LaneEnd, LaneEvent, LaneItem,
-    Mark, Notification, Routed, ServerRequest, TurnFolder, decode,
+    Connection, ConnectionFailure, DECLINE_DEADLINE, ENTRY_BYTES, Incoming, Lane, LaneCharge,
+    LaneEnd, LaneEvent, LaneItem, Mark, Notification, Reply, Routed, ServerRequest, Start,
+    TurnFolder, decode,
 };
 
 use super::normalize::{
@@ -46,15 +50,22 @@ use super::normalize::{
 };
 use crate::driver::latch;
 use crate::observation::{
-    Acceptance, Charge, Observation, ObservationItem, ObservationSink, Reserved, SessionCap,
-    VendorTerminal, admitted,
+    Acceptance, Charge, InstanceReport, Observation, ObservationItem, ObservationSink, Reserved,
+    SessionCap, VendorTerminal, admitted,
 };
 use crate::runtime::event_stall;
-use crate::{DriverFailure, DriverHealth, RouteError, TurnActivity, TurnNumber, VendorTurnId};
+use crate::{
+    AcceptanceToken, DriverFailure, DriverHealth, RouteError, TurnActivity, TurnNumber,
+    VendorTurnId,
+};
 
 /// `omitted` when the count of lost messages is unknown or saturated
 /// (X0 item 10).
 pub(crate) const UNKNOWN: u64 = u64::MAX;
+
+/// The detail of a refusal the lane contradicts (x.3.2 X3 §3.2, packet
+/// lines 144–145).
+pub(crate) const CONTRADICTED: &str = "refusal contradicted by started-turn evidence";
 
 /// The driver's sticky loss record (X0 item 10). C2 has no carrier for it
 /// yet (`TurnEnd.loss`, `CloseReport.loss` and Core's `record_loss` are
@@ -115,26 +126,32 @@ impl Losses {
             omitted,
         });
     }
-}
 
-impl Losses {
-    /// What a close's seal of generation `generation` left (X0 item 8.2;
-    /// x.3.2 X3 fix r4 #4, #6): a prefix the barrier did not finish, or
-    /// a message delivered only in part, is lost from the seal's
-    /// position, its count unknown; the `dropped` messages the cutoff
-    /// refused are lost, counted.
+    /// What a close of generation `generation` leaves lost by its outcome
+    /// `drained` (x.3.2 X3 §5.4; `None`: the barrier timed out), from
+    /// `position`, its seal's position floored by the outstanding one: a
+    /// cut prefix only a message its seal found delivered in part; a
+    /// cancelled or timed-out consumer everything from there, count
+    /// unknown. A lane end, a failure or an unproven end noted its own.
+    /// Whether continuity is unproven.
     pub(crate) fn note_close(
         &mut self,
         generation: u64,
-        drained: bool,
-        sealed: &Sealed,
-        dropped: u64,
-    ) {
-        if !drained || sealed.partial {
-            self.note(generation, sealed.position, UNKNOWN);
-        }
-        if dropped > 0 {
-            self.note(generation, sealed.position, dropped);
+        drained: Option<Drained>,
+        (sealed, position): (&Sealed, u64),
+    ) -> bool {
+        match drained {
+            Some(Drained::Cut) => {
+                if sealed.partial {
+                    self.note(generation, position, UNKNOWN);
+                }
+                false
+            }
+            Some(Drained::LaneEnded(_) | Drained::Unproven(_) | Drained::ConsumerFailed) => false,
+            Some(Drained::ConsumerCancelled) | None => {
+                self.note(generation, position, UNKNOWN);
+                true
+            }
         }
     }
 }
@@ -156,14 +173,6 @@ pub(crate) struct Retained {
 pub(crate) enum Stop {
     /// The lane ended after every message routed before its end.
     Lane(LaneEnd),
-    /// A message of the generation contradicts the protocol or does not
-    /// decode (X0 item 5 steps 5, 6): where its evidence was kept.
-    Protocol {
-        detail: &'static str,
-        undecoded: Option<String>,
-    },
-    /// An ID past the normalizer's bounds, or the C2 sink stalled.
-    Overflow,
     /// The registration's generation failed, with the registration's
     /// cause (x.3.2 X3 §4.2 step 4).
     Generation,
@@ -190,6 +199,17 @@ struct Seal {
     terminal: Option<Retained>,
     tools_open: bool,
     stop: Option<Stop>,
+}
+
+impl Seal {
+    /// The first message a seal now would leave undelivered.
+    fn next(&self) -> u64 {
+        if self.complete {
+            self.current.saturating_add(1)
+        } else {
+            self.current
+        }
+    }
 }
 
 /// One turn's `DeliverySeal` and decision slot (X0 item 13.2).
@@ -283,7 +303,7 @@ impl Delivery {
     }
 
     /// Records why delivery stopped, unless sealed.
-    fn stop(&self, stop: Stop) {
+    pub(crate) fn stop(&self, stop: Stop) {
         let mut seal = self.lock();
         if seal.sealed.is_some() || seal.stop.is_some() {
             return;
@@ -291,6 +311,26 @@ impl Delivery {
         seal.stop = Some(stop);
         drop(seal);
         self.changed.notify_one();
+    }
+
+    /// x.3.2 X3 §3.5: publishes `through` as the position through which
+    /// every message of the turn's fence went out whole, in the seal's
+    /// critical section, so a seal either precedes the check (nothing is
+    /// published) or follows the publication. Whether it was published.
+    fn report(&self, activity: &TurnActivity, through: u64) -> bool {
+        let seal = self.lock();
+        if seal.sealed.is_some() {
+            return false;
+        }
+        activity.delivered_through(through);
+        true
+    }
+
+    /// The first message a seal now would leave undelivered, or the
+    /// sealed position.
+    fn position(&self) -> u64 {
+        let seal = self.lock();
+        seal.sealed.unwrap_or_else(|| seal.next())
     }
 
     /// Whether the turn's delivery reached a decision: its terminal, or
@@ -310,11 +350,7 @@ impl Delivery {
     /// the first call; the slots are taken once.
     pub(crate) fn seal(&self) -> Sealed {
         let mut seal = self.lock();
-        let next = if seal.complete {
-            seal.current.saturating_add(1)
-        } else {
-            seal.current
-        };
+        let next = seal.next();
         let position = *seal.sealed.get_or_insert(next);
         let sealed = Sealed {
             position,
@@ -329,12 +365,12 @@ impl Delivery {
     }
 }
 
-/// Where a malformed message's evidence goes and which turn it names.
+/// Whose a lane message is, in the consumer's state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Owner {
-    /// The running turn.
+    /// The held turn, running.
     This,
-    /// An earlier VIA turn of the session.
+    /// An earlier VIA turn of the session, or the held turn once closed.
     Earlier(TurnNumber),
     /// A vendor turn the connection never mapped here.
     Unknown,
@@ -342,18 +378,17 @@ enum Owner {
     Thread,
 }
 
-/// What the normalizer does after a message.
-enum Flow {
-    Next,
-    Done,
+/// How a message's handling ended.
+enum Handled {
+    /// It was handled; whether it went out whole.
+    Done(bool),
+    /// The held turn's seal refused it at its start: nothing of it went
+    /// out, and it is handled again with the turn closed (x.3.2 X3 §3.2).
+    Refused(LaneItem),
 }
 
-/// [`Flow::Next`] while delivery is open.
-fn flow(open: bool) -> Flow {
-    if open { Flow::Next } else { Flow::Done }
-}
-
-/// The evidence folder of each turn a generation ran, by turn.
+/// The evidence folder of each turn a generation ran, by turn: the
+/// driver files a turn's before its start.
 pub(crate) type Folders = Arc<Mutex<BTreeMap<TurnNumber, Arc<TurnFolder>>>>;
 
 /// Where a malformed message's evidence is kept (X0 item 5): the running
@@ -393,53 +428,63 @@ impl ServerEvidence for Connection {
     }
 }
 
-/// The latest turn that fenced the registration's lane.
-#[derive(Clone)]
-struct Fenced {
-    turn: TurnNumber,
-    fence: u64,
-    activity: TurnActivity,
-    /// The turn's `run_started` returned: nothing more runs under it.
-    finished: bool,
-}
-
-/// An accepted turn, handed to its registration's normalizer.
-pub(crate) struct Current {
+/// What a turn's `Start` marker carries to its registration's consumer
+/// (x.3.2 X3 §2.1): the turn's delivery, what its normalizer and its
+/// acceptance need, and its credit (§3.4). Its evidence folder is in the
+/// generation's folders, by turn.
+pub(crate) struct StartCx {
     pub(crate) delivery: Arc<Delivery>,
-    pub(crate) turn: TurnNumber,
-    pub(crate) accepted: String,
-    /// The acceptance, with when the connection read its reply and the
-    /// reply's position under the turn's fence (x.3.2 X3 fix r2 #10).
-    pub(crate) acceptance: (Acceptance, Instant, Option<Mark>),
-    pub(crate) folder: Arc<TurnFolder>,
     pub(crate) activity: TurnActivity,
     pub(crate) schema: bool,
-    /// The turn's credit (x.3.2 X3 §3.4), reserved at its admission.
+    pub(crate) instance: Option<InstanceReport>,
+    /// The start request's correlation, set as the request is encoded,
+    /// before its `Start` can be pushed.
+    pub(crate) correlation: Arc<OnceLock<AcceptanceToken>>,
     pub(crate) credit: Charge,
+}
+
+/// How the consumer ended (x.3.2 X3 §5.4); the first outcome stays.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Drained {
+    /// The close's cut was taken, with nothing retained or releasing.
+    Cut,
+    /// The lane ended otherwise, with nothing retained or releasing.
+    LaneEnded(LaneEnd),
+    /// The lane ended with a retained or releasing item: its loss noted.
+    Unproven(LaneEnd),
+    /// The generation failed; its loss noted (§4).
+    ConsumerFailed,
+    /// The consumer returned without its lane's end.
+    ConsumerCancelled,
+}
+
+impl Drained {
+    /// Whether the outcome proves the prefix disposed of.
+    fn positive(self) -> bool {
+        matches!(self, Self::Cut | Self::LaneEnded(_))
+    }
 }
 
 #[derive(Default)]
 struct Slot {
-    fenced: Option<Fenced>,
-    accepted: Option<Current>,
     /// The generation's failure, first wins (x.3.2 X3 §4.2).
     failed: Option<DriverFailure>,
     /// Retired (§6.5): no admission, wait or ledger commit follows.
     retired: bool,
     /// Continuity is unproven: retirement folds `Uncertain` (§6.6).
     incomplete: bool,
-    /// The close's barrier took the whole prefix (§12, F3's bridge).
-    disposed: bool,
+    /// The consumer's earliest retained or releasing position (§3.2,
+    /// r11 #1), which every loss snapshot is floored by.
+    outstanding: Option<u64>,
     /// The admitted turns, which the generation's failure stops (§4.2).
     admitted: BTreeMap<TurnNumber, AdmittedTurn>,
 }
 
-/// An admitted turn: what cancels its writes, and its delivery once
-/// accepted.
+/// An admitted turn: what cancels its writes, and its delivery.
 #[derive(Clone)]
 struct AdmittedTurn {
     cancel: Arc<dyn Fn() + Send + Sync>,
-    delivery: Option<Arc<Delivery>>,
+    delivery: Arc<Delivery>,
 }
 
 /// A turn admitted on its registration (x.3.2 X3 §4.2 step 2): it leaves
@@ -449,44 +494,26 @@ pub(crate) struct Admission {
     turn: TurnNumber,
 }
 
-impl Admission {
-    /// The turn's delivery, once accepted: the generation's failure stops
-    /// it, at once if it already failed.
-    pub(crate) fn deliver(&self, delivery: &Arc<Delivery>) {
-        let mut slot = self.registration.slot();
-        if slot.failed.is_some() {
-            drop(slot);
-            delivery.stop(Stop::Generation);
-        } else if let Some(admitted) = slot.admitted.get_mut(&self.turn) {
-            admitted.delivery = Some(Arc::clone(delivery));
-        }
-    }
-}
-
 impl Drop for Admission {
     fn drop(&mut self) {
         self.registration.slot().admitted.remove(&self.turn);
     }
 }
 
-/// One registration's state shared by its driver and its normalizer (X0
-/// items 8.2, 13.2; x.3.2 X3 fix r3 #3, #4): the turn that fenced the
-/// lane, the accepted turn handed over, the close's delivery barrier, the
-/// seal of what goes out while no turn runs, and the session's metadata
-/// (X3 §6.1).
+/// One registration's state shared by its driver and its consumer (X0
+/// items 8.2, 13.2; x.3.2 X3 §3.1): the failure latch, the admitted turns,
+/// the session's metadata (§6.1), the consumer's outcome and outstanding
+/// position, and the seal of what goes out under no turn.
 pub(crate) struct Registration {
     slot: Mutex<Slot>,
-    /// The session's metadata: open tools and the suppression table.
+    /// The session's metadata: open tools, the suppression table and the
+    /// mapped ranges.
     ledger: Ledger,
-    /// Wakes the normalizer when the slot changes.
-    changed: Notify,
-    /// The seal of what goes out while no turn runs: sealed at the close's
-    /// delivery barrier, at an idle failure, or when the registration is
-    /// released.
+    /// The seal of what goes out under no turn: sealed at a close, at the
+    /// generation's failure, or when the registration is released.
     idle: Arc<Delivery>,
-    /// `Some(true)` once the normalizer took everything of an ended lane;
-    /// `Some(false)` once it returned without (x.3.2 X3 r7 #5).
-    drained: watch::Sender<Option<bool>>,
+    /// How the consumer ended, once it did.
+    drained: watch::Sender<Option<Drained>>,
     /// Cancelled at the generation's failure (x.3.2 X3 §4.2).
     failing: CancellationToken,
     /// Cancelled at retirement (§6.5).
@@ -500,7 +527,6 @@ impl Registration {
         Arc::new(Self {
             slot: Mutex::new(Slot::default()),
             ledger: ledger_on(cap),
-            changed: Notify::new(),
             idle: Delivery::new(before),
             drained: watch::channel(None).0,
             failing: CancellationToken::new(),
@@ -518,59 +544,34 @@ impl Registration {
         ledger(&self.ledger)
     }
 
-    /// Fences `lane` for turn `turn` (x.3.2 critical r2 #2, runtime §8),
-    /// under the slot, so the normalizer never reads a fence position the
-    /// slot does not name. From now until the returned guard drops a turn
-    /// runs: the normalizer leaves the lane to it (x.3.2 X3 fix r4 #1).
-    pub(crate) fn fence(
-        self: &Arc<Self>,
-        lane: &Lane,
-        turn: TurnNumber,
-        activity: &TurnActivity,
-    ) -> TurnFence {
-        let mut slot = self.slot();
-        let fence = lane.fence(activity.decode_watermark());
-        slot.fenced = Some(Fenced {
-            turn,
-            fence,
-            activity: activity.clone(),
-            finished: false,
-        });
-        TurnFence {
-            registration: Arc::clone(self),
-            turn,
-        }
-    }
-
-    /// Hands the accepted turn to the normalizer.
-    pub(crate) fn accept(&self, current: Current) {
-        self.slot().accepted = Some(current);
-        self.changed.notify_one();
-    }
-
-    /// The close's delivery barrier (X0 item 8.2), once the caller ended
-    /// the lane at its cutoff: true once the normalizer took the admitted
-    /// prefix, by `by`. The caller seals next.
-    pub(crate) async fn drain(&self, by: Instant) -> bool {
+    /// The close's delivery barrier (X0 item 8.2; x.3.2 X3 §5.4), once the
+    /// close was posted: how the consumer ended, by `by`; `None` when it
+    /// had not. The caller seals next.
+    pub(crate) async fn drain(&self, by: Instant) -> Option<Drained> {
         let mut drained = self.drained.subscribe();
-        tokio::time::timeout_at(by, drained.wait_for(Option::is_some))
-            .await
-            .is_ok_and(|drained| drained.is_ok_and(|drained| *drained == Some(true)))
+        let ended = tokio::time::timeout_at(by, drained.wait_for(Option::is_some)).await;
+        ended
+            .ok()
+            .and_then(|ended| ended.ok().and_then(|drained| *drained))
     }
 
-    /// x.3.2 X3 §12 (F3's bridge): what the close's barrier returned; only
-    /// `true` is positive evidence that the prefix was disposed of.
-    pub(crate) fn drained_prefix(&self, drained: bool) {
-        self.slot().disposed = drained;
+    /// Records the consumer's outcome; the first stays.
+    fn drained(&self, outcome: Drained) {
+        self.drained.send_if_modified(|drained| {
+            let unset = drained.is_none();
+            drained.get_or_insert(outcome);
+            unset
+        });
     }
 
     /// x.3.2 X3 §4.2 step 2: admits turn `turn`, whose writes `cancel`
-    /// cancels; refused once the generation failed or the registration
-    /// retired.
+    /// cancels and whose `delivery` the generation's failure stops;
+    /// refused once the generation failed or the registration retired.
     pub(crate) fn admit(
         self: &Arc<Self>,
         turn: TurnNumber,
         cancel: Arc<dyn Fn() + Send + Sync>,
+        delivery: &Arc<Delivery>,
     ) -> Option<Admission> {
         let mut slot = self.slot();
         if slot.failed.is_some() || slot.retired {
@@ -580,7 +581,7 @@ impl Registration {
             turn,
             AdmittedTurn {
                 cancel,
-                delivery: None,
+                delivery: Arc::clone(delivery),
             },
         );
         Some(Admission {
@@ -608,7 +609,7 @@ impl Registration {
     }
 
     /// Continuity is unproven (x.3.2 X3 §6.6).
-    fn mark_incomplete(&self) {
+    pub(crate) fn mark_incomplete(&self) {
         self.slot().incomplete = true;
     }
 
@@ -624,13 +625,30 @@ impl Registration {
         self.slot().retired
     }
 
+    /// The consumer's outstanding position (x.3.2 X3 §3.2).
+    pub(crate) fn outstanding(&self) -> Option<u64> {
+        self.slot().outstanding
+    }
+
+    /// Publishes the consumer's outstanding position.
+    fn publish(&self, outstanding: Option<u64>) {
+        self.slot().outstanding = outstanding;
+    }
+
+    /// x.3.2 X3 §4.2, loss snapshots (r11 #1): `position`, a seal's,
+    /// floored by the outstanding position while one is published.
+    pub(crate) fn floor(&self, position: u64) -> u64 {
+        self.outstanding()
+            .map_or(position, |outstanding| outstanding.min(position))
+    }
+
     /// x.3.2 X3 §4.1, §4.2: the generation fails with `cause`, first wins
     /// and never after retirement, before any await: `failed` and
     /// `incomplete` are set and the admitted turns taken in one section;
     /// the driver's health latches; the lane ends; each admitted turn's
     /// delivery stops (a retained terminal stays) and its writes are
     /// cancelled; then the registration is sealed and the loss noted from
-    /// its seal, count unknown.
+    /// its seal, floored by the outstanding position, count unknown.
     pub(crate) fn fail(
         &self,
         cause: &DriverFailure,
@@ -648,22 +666,21 @@ impl Registration {
         latch(health, cause.clone());
         lane.end(LaneEnd::Quarantined);
         for turn in admitted {
-            if let Some(delivery) = &turn.delivery {
-                delivery.stop(Stop::Generation);
-            }
+            turn.delivery.stop(Stop::Generation);
             (turn.cancel)();
         }
         self.failing.cancel();
         let sealed = self.seal();
-        losses(&loss.losses).note(loss.generation, sealed.position, UNKNOWN);
+        losses(&loss.losses).note(loss.generation, self.floor(sealed.position), UNKNOWN);
     }
 
     /// x.3.2 X3 §6.5: retires the registration once, in one section (a
-    /// later call does nothing). It is sealed; unless the close's barrier
-    /// took the whole prefix, the loss is noted from its seal, count
-    /// unknown, and continuity is unproven. Then `retired` refuses every
-    /// later admission, wait and commit, and ends the consumer; `fold`
-    /// runs when a tool is open or continuity is unproven, never inferring
+    /// later call does nothing). It is sealed; unless the consumer proved
+    /// the prefix disposed of (`Cut` or `LaneEnded`), the loss is noted
+    /// from its seal, floored by the outstanding position, count unknown,
+    /// and continuity is unproven. Then `retired` refuses every later
+    /// admission, wait and commit, and ends the consumer; `fold` runs when
+    /// a tool is open or continuity is unproven, never inferring
     /// quiescence from what survived; then the ledger and its ranges are
     /// released.
     pub(crate) fn retire(&self, loss: &LossRecord, fold: impl FnOnce()) {
@@ -672,8 +689,12 @@ impl Registration {
             return;
         }
         let sealed = self.seal();
-        if !slot.disposed {
-            losses(&loss.losses).note(loss.generation, sealed.position, UNKNOWN);
+        let positive = self.drained.borrow().is_some_and(Drained::positive);
+        if !positive {
+            let position = slot.outstanding.map_or(sealed.position, |outstanding| {
+                outstanding.min(sealed.position)
+            });
+            losses(&loss.losses).note(loss.generation, position, UNKNOWN);
             slot.incomplete = true;
         }
         slot.retired = true;
@@ -684,72 +705,22 @@ impl Registration {
         self.ledger().retire();
     }
 
-    /// Seals what goes out while no turn runs: the normalizer then
-    /// returns. The first call fixes the position.
+    /// Seals what goes out under no turn: the consumer then returns. The
+    /// first call fixes the position.
     pub(crate) fn seal(&self) -> Sealed {
         self.idle.seal()
     }
 }
 
-/// A turn that fenced its registration's lane; dropped once its
-/// `run_started` returned, accepted or not.
-pub(crate) struct TurnFence {
-    registration: Arc<Registration>,
-    turn: TurnNumber,
-}
-
-impl Drop for TurnFence {
-    fn drop(&mut self) {
-        let mut slot = self.registration.slot();
-        if let Some(fenced) = slot
-            .fenced
-            .as_mut()
-            .filter(|fenced| fenced.turn == self.turn)
-        {
-            fenced.finished = true;
-        }
-        drop(slot);
-        self.registration.changed.notify_one();
-    }
-}
-
-/// Marks a registration's normalizer returned, however: drained only if
-/// it took the lane's end first.
+/// Marks a registration's consumer returned, however: cancelled unless it
+/// recorded how its lane ended first.
 struct Returned(Arc<Registration>);
 
 impl Drop for Returned {
     fn drop(&mut self) {
         // Returning is no evidence the prefix was taken (x.3.2 X3 r7 #5).
-        self.0.drained.send_if_modified(|drained| {
-            let unset = drained.is_none();
-            drained.get_or_insert(false);
-            unset
-        });
+        self.0.drained(Drained::ConsumerCancelled);
     }
-}
-
-/// The running turn's delivery state.
-struct Running {
-    delivery: Arc<Delivery>,
-    turn: TurnNumber,
-    accepted: String,
-    folder: Arc<TurnFolder>,
-    activity: TurnActivity,
-    normalizer: TurnNormalizer,
-    /// Its credit, held while its vendor ID is (x.3.2 X3 §3.4, r8 #6).
-    credit: Charge,
-}
-
-/// Delivered positions under one turn's fence, reported in order.
-struct Marks {
-    fence: u64,
-    /// Delivered positions past the first one not yet delivered: only the
-    /// acceptance's, while messages read before its reply are delivered
-    /// after it.
-    ahead: BTreeSet<u64>,
-    /// The first position read under the fence whose observations were
-    /// lost (x.3.2 X3 §3.5, r10 #1): no report reaches it.
-    gap: Option<u64>,
 }
 
 /// The driver's loss record and the generation it names (x.3.2 X3 fix r4
@@ -759,15 +730,70 @@ pub(crate) struct LossRecord {
     pub(crate) generation: u64,
 }
 
-/// One registration's normalizer task (X0 item 13.2; x.3.2 X3 fix r3 #3,
-/// #4, r4 #1–#6): it lives across the registration's turns until its lane
-/// ends at a close's cutoff, the registration's seal or the session's
-/// cancellation. While a turn runs it delivers the lane under that turn's
-/// seal; while none runs it takes every message in order under the
-/// registration's seal: an earlier turn's request or denial is that
-/// turn's late observation, judged against the session's suppression
-/// table, and the rest gives nothing. A failure while no turn runs
-/// latches the driver's health at once and records the loss.
+/// Where the held turn is (x.3.2 X3 §3.2).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Phase {
+    /// Its `Start` was taken, its `Reply` not yet.
+    Pending,
+    /// Accepted: its `Accepted` went out.
+    Running,
+    /// Its terminal is retained: nothing is taken until it seals.
+    Retained,
+}
+
+/// The turn the consumer holds, from its `Start` until it seals.
+struct Held {
+    turn: TurnNumber,
+    /// Its decode fence.
+    fence: u64,
+    cx: StartCx,
+    phase: Phase,
+    /// Its vendor turn ID, once accepted.
+    accepted: Option<String>,
+    normalizer: Option<TurnNormalizer>,
+    /// The position last published under its fence.
+    reported: u64,
+}
+
+/// A retained item's binding at its turn's acceptance (x.3.2 X3 §3.2, r11
+/// #2): whose it is (`None`: no turn's) and its stamped instant.
+#[derive(Clone, Copy, Debug)]
+struct Bound {
+    owner: Option<TurnNumber>,
+    at: Instant,
+}
+
+/// An item retained while its turn was pending, under its own lane charge
+/// (x.3.2 X3 §2.3, §3.2).
+struct Early {
+    item: LaneItem,
+    /// Its decode sequence.
+    seq: u64,
+    /// Its position under the held turn's fence.
+    mark: Option<Mark>,
+    /// Its decode instant.
+    at: Instant,
+    charge: LaneCharge,
+    bound: Option<Bound>,
+}
+
+/// What woke the consumer.
+enum Wake {
+    /// The session's cancellation, or the registration's seal.
+    Ended,
+    /// The generation failed.
+    Failed,
+    /// The lane overflowed.
+    Overflow,
+    /// The held turn's seal.
+    Sealed,
+    /// The lane's next item, or its end.
+    Lane(LaneEvent),
+}
+
+/// One registration's consumer (X0 item 13.2; x.3.2 X3 §3): the lane's
+/// only reader and the registration's only sink producer, across the
+/// registration's turns.
 pub(crate) struct Normalizing {
     registration: Arc<Registration>,
     lane: Arc<Lane>,
@@ -776,12 +802,17 @@ pub(crate) struct Normalizing {
     cancel: CancellationToken,
     health: Arc<watch::Sender<DriverHealth>>,
     loss: LossRecord,
-    running: Option<Running>,
-    /// The last turn whose delivery ended: its fence counts nothing more.
-    finished: Option<TurnNumber>,
-    marks: Option<Marks>,
-    /// Why delivery stopped while no turn ran.
-    failed: Option<Stop>,
+    held: Option<Held>,
+    /// The turn whose `Start` was taken and whose `Reply` was not.
+    unanswered: Option<TurnNumber>,
+    /// The held turn's retained early items, in decode order.
+    early: VecDeque<Early>,
+    /// The retained item being released: its decode sequence and mark.
+    releasing: Option<(u64, Option<Mark>)>,
+    /// The first position of the live fence whose observations were lost.
+    gap: Option<u64>,
+    /// The highest position of the live fence taken and handled whole.
+    disposed: u64,
 }
 
 impl Normalizing {
@@ -799,127 +830,463 @@ impl Normalizing {
             cancel,
             health,
             loss,
-            running: None,
-            finished: None,
-            marks: None,
-            failed: None,
+            held: None,
+            unanswered: None,
+            early: VecDeque::new(),
+            releasing: None,
+            gap: None,
+            disposed: 0,
         }
     }
 
-    /// Delivers the registration's lane, turn after turn.
+    /// Takes the registration's lane, turn after turn, until it ends.
     pub(crate) async fn run(mut self) {
         let _returned = Returned(Arc::clone(&self.registration));
         loop {
-            let accepted = self.registration.slot().accepted.take();
-            let open = match accepted {
-                Some(current) => self.turn(current).await,
-                None => self.idle().await,
-            };
-            if !open {
-                return;
+            idle_check_seam().await;
+            // A bound tail is handled before the lane is taken again.
+            if self.held.is_none() && !self.early.is_empty() {
+                self.release().await;
+                if !self.early.is_empty() {
+                    // Released only in part: the consumer ends.
+                    return self.ended();
+                }
+            }
+            match self.wake().await {
+                Wake::Ended => return,
+                Wake::Failed => return self.dispose_failed(),
+                Wake::Overflow => {
+                    self.overflow();
+                    return self.dispose_failed();
+                }
+                Wake::Sealed => self.close(),
+                Wake::Lane(LaneEvent::Item(item, charge)) => self.item(*item, charge).await,
+                Wake::Lane(LaneEvent::End(end)) => return self.end(end),
             }
         }
     }
 
-    /// Whether the registration's delivery ended.
-    fn ended(&self) -> bool {
-        self.cancel.is_cancelled() || self.registration.idle.sealed.is_cancelled()
-    }
-
-    /// While no turn runs, takes every message in order (x.3.2 X3 fix r4
-    /// #1); while a turn runs but is not yet accepted, leaves the lane to
-    /// it. Returns true once a turn is accepted, false once the
-    /// registration's delivery ended. A lane that ended is left to the
-    /// next turn, once everything before its end was taken.
-    async fn idle(&mut self) -> bool {
-        loop {
-            if self.ended() {
-                return false;
+    /// Waits on the consumer's cutoffs and the lane: a retained terminal
+    /// freezes the lane. What the lane took before an overflow is taken in
+    /// order up to its end (a terminal among it is retained, x.3.2 X3 fix
+    /// r3 #2); a frozen lane's overflow fails the generation at once.
+    async fn wake(&self) -> Wake {
+        let held = self
+            .held
+            .as_ref()
+            .map(|held| (Arc::clone(&held.cx.delivery), held.phase == Phase::Retained));
+        let frozen = held.as_ref().is_some_and(|(_, frozen)| *frozen);
+        let sealed = async {
+            match &held {
+                Some((delivery, _)) => delivery.sealed.cancelled().await,
+                None => std::future::pending().await,
             }
-            let running = {
-                let slot = self.registration.slot();
-                if slot.accepted.is_some() {
-                    return true;
-                }
-                slot.fenced
-                    .as_ref()
-                    .is_some_and(|fenced| !fenced.finished && self.finished != Some(fenced.turn))
-            };
-            let event = if running {
-                None
-            } else {
-                self.lane.try_next_if(|_| true)
-            };
-            match event {
-                Some(LaneEvent::Item(item)) => {
-                    idle_seam().await;
-                    self.message(*item).await;
-                    if let Some(stop) = self.failed.take() {
-                        self.fail_idle(&stop);
-                        self.dispose_failed();
-                        return false;
-                    }
-                }
-                Some(LaneEvent::End(end)) => {
-                    self.registration.drained.send_replace(Some(true));
-                    if end == LaneEnd::Closed {
-                        return false;
-                    }
-                    self.wait().await;
-                }
-                None => self.wait().await,
-            }
-        }
-    }
-
-    /// Waits for the lane or the slot to change, or the registration's
-    /// delivery to end.
-    async fn wait(&self) {
+        };
         tokio::select! {
             biased;
-            () = self.registration.idle.sealed.cancelled() => {}
-            () = self.cancel.cancelled() => {}
-            () = self.registration.changed.notified() => {}
-            () = self.lane.pushed() => {}
+            () = self.cancel.cancelled() => Wake::Ended,
+            () = self.registration.failing.cancelled() => Wake::Failed,
+            () = self.registration.idle.sealed.cancelled() => Wake::Ended,
+            () = sealed => Wake::Sealed,
+            event = self.lane.next(), if !frozen => Wake::Lane(event),
+            () = self.lane.overflowed() => Wake::Overflow,
         }
     }
 
-    /// X0 item 5 and item 10 while no turn runs (x.3.2 X3 fix r4 #5, #6):
-    /// the generation fails (X3 §4.2): the driver's health latches at
-    /// once, an admitted turn's `turn/start` is cancelled, what goes out
-    /// is sealed and the rest joins the loss record.
-    fn fail_idle(&self, stop: &Stop) {
-        let latest = losses(&self.loss.losses).latest;
-        let cause = match (stop, latest) {
-            (Stop::Protocol { detail, .. }, Some(turn)) => {
-                DriverFailure::Route(RouteError::Protocol { turn, detail })
-            }
-            (Stop::Overflow | Stop::Lane(LaneEnd::Overflow), Some(turn)) => {
-                DriverFailure::Route(RouteError::Overflow { turn })
-            }
-            _ => DriverFailure::ObservationOverflow,
-        };
+    /// The turn a failure names: the held one, else the session's latest.
+    fn latest(&self) -> Option<TurnNumber> {
+        self.held
+            .as_ref()
+            .map(|held| held.turn)
+            .or_else(|| losses(&self.loss.losses).latest)
+    }
+
+    /// x.3.2 X3 §4.1: the generation fails with `cause` (first wins).
+    fn fail(&self, cause: &DriverFailure) {
         self.registration
-            .fail(&cause, (&self.health, &self.lane, &self.loss));
+            .fail(cause, (&self.health, &self.lane, &self.loss));
+    }
+
+    /// The generation fails `overflow`.
+    fn overflow(&self) {
+        let cause = self
+            .latest()
+            .map_or(DriverFailure::ObservationOverflow, |turn| {
+                DriverFailure::Route(RouteError::Overflow { turn })
+            });
+        self.fail(&cause);
+    }
+
+    /// The generation fails `protocol` with `detail`.
+    fn protocol(&self, detail: &'static str) {
+        let cause = self
+            .latest()
+            .map_or(DriverFailure::ObservationOverflow, |turn| {
+                DriverFailure::Route(RouteError::Protocol { turn, detail })
+            });
+        self.fail(&cause);
+    }
+
+    /// The consumer returns with a retained item undelivered: its loss is
+    /// noted from the outstanding position, and continuity is unproven.
+    fn ended(&mut self) {
+        if let Some(first) = self.outstanding() {
+            losses(&self.loss.losses).note(self.loss.generation, first, UNKNOWN);
+            self.registration.mark_incomplete();
+        }
+        self.drop_early();
+    }
+
+    /// One lane item.
+    async fn item(&mut self, item: LaneItem, charge: LaneCharge) {
+        match item {
+            LaneItem::Start(start) => {
+                drop(charge);
+                self.start(start);
+            }
+            LaneItem::Reply(reply) => {
+                drop(charge);
+                self.reply(reply).await;
+            }
+            item @ (LaneItem::Message(_) | LaneItem::Declined { .. }) => {
+                self.data(item, charge).await;
+            }
+        }
+    }
+
+    /// `Start(B)`: B is held, pending; its fence is the live one.
+    fn start(&mut self, Start { turn, fence, cx }: Start) {
+        let Ok(cx) = cx.downcast::<StartCx>() else {
+            // Only the driver pushes a `Start`, with its context.
+            return;
+        };
+        if self.held.is_some() {
+            self.close();
+        }
+        // The start gate leaves an earlier start unanswered only when it
+        // never reached the vendor, or the lane ended.
+        self.unanswered = Some(turn);
+        self.held = Some(Held {
+            turn,
+            fence,
+            cx: *cx,
+            phase: Phase::Pending,
+            accepted: None,
+            normalizer: None,
+            reported: 0,
+        });
+        self.gap = None;
+        self.disposed = 0;
+    }
+
+    /// A `turn/start` reply in decode order (x.3.2 X3 §3.2).
+    async fn reply(&mut self, reply: Reply) {
+        let pending = self
+            .held
+            .as_ref()
+            .is_some_and(|held| held.turn == reply.turn && held.phase == Phase::Pending);
+        if self.unanswered == Some(reply.turn) {
+            self.unanswered = None;
+        }
+        if !pending {
+            // An abandoned or refused start's.
+            return self.handled(reply.mark, true);
+        }
+        match reply.accepted {
+            Some(accepted) => self.accepted(accepted, reply.at, reply.mark).await,
+            // The vendor refused, uncontradicted: B is never mapped.
+            None if self.early.is_empty() => {
+                self.handled(reply.mark, true);
+                self.close();
+            }
+            // Packet lines 144–145: possible started-turn evidence
+            // contradicts the refusal.
+            None => self.fail(&DriverFailure::Route(RouteError::Protocol {
+                turn: reply.turn,
+                detail: CONTRADICTED,
+            })),
+        }
+    }
+
+    /// `Reply(B)` accepted it: `Accepted` goes out under B's seal at the
+    /// reply's read instant, which alone maps B (§3.4); its retained items
+    /// are bound and released.
+    async fn accepted(&mut self, accepted: String, at: Instant, mark: Option<Mark>) {
+        let Some(held) = self.held.as_ref() else {
+            return;
+        };
+        let acceptance = Acceptance {
+            correlation: held
+                .cx
+                .correlation
+                .get()
+                .copied()
+                .unwrap_or(AcceptanceToken::FIRST),
+            vendor_turn_id: VendorTurnId::try_from(accepted.clone()).ok(),
+            instance: held.cx.instance.clone(),
+        };
+        let delivery = Arc::clone(&held.cx.delivery);
+        let sent = self
+            .output(
+                &delivery,
+                &accepted,
+                Observation::Accepted(acceptance),
+                (None, at),
+            )
+            .await;
+        if !sent {
+            // B sealed (its seal disposes of its retained items), or the
+            // generation failed.
+            return;
+        }
+        let ledger = Arc::clone(&self.registration.ledger);
+        let Some(held) = self.held.as_mut() else {
+            return;
+        };
+        self.registration.ledger().map(held.turn);
+        held.normalizer = Some(TurnNormalizer::on(held.cx.schema, held.turn, ledger));
+        held.phase = Phase::Running;
+        let turn = held.turn;
+        for entry in &mut self.early {
+            let named = entry
+                .item
+                .routed()
+                .and_then(|routed| routed.turn.as_deref());
+            entry.bound = Some(Bound {
+                owner: (named == Some(accepted.as_str())).then_some(turn),
+                at: entry.at.max(at),
+            });
+        }
+        held.accepted = Some(accepted);
+        self.handled(mark, true);
+        self.release().await;
+    }
+
+    /// A message or a placeholder.
+    async fn data(&mut self, item: LaneItem, charge: LaneCharge) {
+        let Some(routed) = item.routed() else {
+            return;
+        };
+        let (seq, mark) = (routed.seq, routed.mark);
+        let unmapped = routed.turn.is_some() && routed.owner.is_none();
+        let phase = self.held.as_ref().map(|held| held.phase);
+        if unmapped && phase == Some(Phase::Pending) {
+            return self.retain(item, charge);
+        }
+        drop(charge);
+        if unmapped
+            && phase.is_none()
+            && let Some(turn) = self.unanswered
+        {
+            // Its turn sealed pending: it can never be mapped.
+            losses(&self.loss.losses).note_turn(turn, self.loss.generation, seq, 1);
+            self.registration.mark_incomplete();
+            return;
+        }
+        let mut item = item;
+        loop {
+            let Some(owner) = item.routed().map(|routed| self.owner(routed)) else {
+                return;
+            };
+            match self.handle(item, owner, None).await {
+                Handled::Done(whole) => return self.handled(mark, whole),
+                Handled::Refused(refused) => {
+                    self.close();
+                    item = refused;
+                }
+            }
+        }
+    }
+
+    /// The early rule (x.3.2 X3 §3.2): retained, under its lane charge,
+    /// grown by its entry's 64 B without waiting; a growth that does not
+    /// fit ends the lane `Overflow`, which fails the generation.
+    fn retain(&mut self, item: LaneItem, mut charge: LaneCharge) {
+        let Some(routed) = item.routed() else {
+            return;
+        };
+        let (seq, mark, at) = (routed.seq, routed.mark, routed.at);
+        self.lane.try_grow(&mut charge, ENTRY_BYTES);
+        self.early.push_back(Early {
+            item,
+            seq,
+            mark,
+            at,
+            charge,
+            bound: None,
+        });
+        self.publish();
+    }
+
+    /// Releases the bound retained items in order, by their binding only
+    /// (x.3.2 X3 §3.2): to the running turn, or, once it closed, as its
+    /// late observations; an item of no turn is disposed of. The handoff
+    /// of each is one transition: `releasing` before the entry leaves
+    /// `early`, `outstanding` published after both, and moved on only
+    /// once the entry went out whole or its loss was recorded. A retained
+    /// terminal freezes the rest; a sealed turn leaves it to its close.
+    async fn release(&mut self) {
+        loop {
+            let Some(front) = self.early.front() else {
+                return;
+            };
+            let open = match &self.held {
+                Some(held) => {
+                    held.phase == Phase::Running && !held.cx.delivery.sealed.is_cancelled()
+                }
+                None => true,
+            };
+            if !open || self.registration.idle.sealed.is_cancelled() {
+                return;
+            }
+            self.releasing = Some((front.seq, front.mark));
+            let Some(entry) = self.early.pop_front() else {
+                return;
+            };
+            handoff_seam().await;
+            self.publish();
+            let whole = match self.release_one(entry).await {
+                Ok(whole) => whole,
+                Err(back) => {
+                    self.early.push_front(*back);
+                    return;
+                }
+            };
+            let mark = self.releasing.and_then(|(_, mark)| mark);
+            self.releasing = self.early.front().map(|next| (next.seq, next.mark));
+            self.publish();
+            self.handled(mark, whole);
+        }
+    }
+
+    /// One bound entry: whether it went out whole (an unseen one is
+    /// disposed of, whole); it is given back when the held turn's seal
+    /// refused it at its start.
+    async fn release_one(&mut self, entry: Early) -> Result<bool, Box<Early>> {
+        let Early {
+            item,
+            seq,
+            mark,
+            at,
+            charge,
+            bound,
+        } = entry;
+        let bound = bound.unwrap_or(Bound { owner: None, at });
+        let Some(turn) = bound.owner else {
+            return Ok(true);
+        };
+        let owner = match &self.held {
+            Some(held) if held.turn == turn => Owner::This,
+            Some(_) | None => Owner::Earlier(turn),
+        };
+        match self.handle(item, owner, Some(bound.at)).await {
+            Handled::Done(whole) => Ok(whole),
+            Handled::Refused(item) => Err(Box::new(Early {
+                item,
+                seq,
+                mark,
+                at,
+                charge,
+                bound: Some(bound),
+            })),
+        }
+    }
+
+    /// The held turn sealed (or closes): a pending turn is never mapped,
+    /// so its retained items are loss; a running one's normalizer and
+    /// vendor ID go, and its credit goes to the ledger's ranges (§3.3).
+    fn close(&mut self) {
+        let Some(held) = self.held.take() else {
+            return;
+        };
+        if held.phase == Phase::Pending && !self.early.is_empty() {
+            self.lose_early(held.turn);
+        }
+        self.registration.ledger().close(held.turn, held.cx.credit);
+        self.gap = None;
+        self.disposed = 0;
+    }
+
+    /// x.3.2 X3 §3.2: turn `turn` can never be mapped: its retained items
+    /// are its loss, from the outstanding position, and continuity is
+    /// unproven.
+    fn lose_early(&mut self, turn: TurnNumber) {
+        if let Some(first) = self.outstanding() {
+            let count = u64::try_from(self.early.len()).unwrap_or(UNKNOWN);
+            losses(&self.loss.losses).note_turn(turn, self.loss.generation, first, count);
+            self.registration.mark_incomplete();
+        }
+        self.drop_early();
+    }
+
+    /// Drops the retained items and their charges; nothing is outstanding.
+    fn drop_early(&mut self) {
+        self.early.clear();
+        self.releasing = None;
+        self.publish();
+    }
+
+    /// The earliest retained or releasing position.
+    fn outstanding(&self) -> Option<u64> {
+        let releasing = self.releasing.map(|(seq, _)| seq);
+        let front = self.early.front().map(|entry| entry.seq);
+        match (releasing, front) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Publishes the outstanding position into the registration.
+    fn publish(&self) {
+        self.registration.publish(self.outstanding());
+    }
+
+    /// The lane's end (x.3.2 X3 §3.2, r11 #1): another end first stops the
+    /// held turn. With nothing outstanding the prefix was disposed of
+    /// (`Cut`, `LaneEnded`); otherwise its loss is noted from the
+    /// outstanding position and the end is `Unproven`.
+    fn end(&mut self, end: LaneEnd) {
+        if end == LaneEnd::Overflow {
+            self.overflow();
+        }
+        if matches!(end, LaneEnd::Quarantined | LaneEnd::Overflow) {
+            return self.dispose_failed();
+        }
+        if end != LaneEnd::Closed
+            && let Some(held) = &self.held
+        {
+            held.cx.delivery.stop(Stop::Lane(end));
+        }
+        let drained = match self.outstanding() {
+            None if end == LaneEnd::Closed => Drained::Cut,
+            None => Drained::LaneEnded(end),
+            Some(first) => {
+                let position = first.min(self.registration.idle.position());
+                losses(&self.loss.losses).note(self.loss.generation, position, UNKNOWN);
+                self.registration.mark_incomplete();
+                self.drop_early();
+                Drained::Unproven(end)
+            }
+        };
+        self.registration.drained(drained);
     }
 
     /// x.3.2 X3 §4.4: after the generation's failure, what the lane still
     /// holds up to its end is disposed of without waiting, and nothing
-    /// goes out. A tool item or a decline updates the ledger with a charge
-    /// taken at once; one the ledger cannot retain leaves continuity
-    /// unproven and is lost.
+    /// goes out: markers and retained items are dropped (their loss is
+    /// the failure's), a tool item or a decline updates the ledger with a
+    /// charge taken at once; one the ledger cannot retain leaves
+    /// continuity unproven and is lost.
     fn dispose_failed(&mut self) {
-        while let Some(LaneEvent::Item(item)) = self.lane.try_next() {
-            let owner = self.owner(item.routed());
-            let decoded = match &*item {
-                LaneItem::Message(routed) => Some(decode(routed.staged.bytes())),
-                LaneItem::Declined { .. } => None,
+        self.held = None;
+        self.drop_early();
+        while let Some(LaneEvent::Item(item, _charge)) = self.lane.try_next() {
+            let Some(routed) = item.routed() else {
+                continue;
             };
-            let notification = match &decoded {
-                Some(Ok(Incoming::Notification(notification))) => Some(notification),
-                Some(Ok(Incoming::Request(_) | Incoming::Response(_)) | Err(_)) | None => None,
-            };
-            let charged = match self.wanted(owner, &item, notification) {
+            let (owner, seq) = (self.owner(routed), routed.seq);
+            let parsed = parse(&item);
+            let charged = match self.wanted(owner, &parsed) {
                 None => true,
                 Some(key) => {
                     let cap = self.registration.ledger().cap().clone();
@@ -936,189 +1303,28 @@ impl Normalizing {
                     }
                 }
             };
-            let kept = charged && self.tracked(owner, &item, notification).is_ok();
+            let kept = charged && self.tracked(owner, &parsed).is_ok();
             self.registration.ledger().unstage();
             if !kept {
                 self.registration.mark_incomplete();
-                losses(&self.loss.losses).note(self.loss.generation, item.routed().seq, UNKNOWN);
+                losses(&self.loss.losses).note(self.loss.generation, seq, UNKNOWN);
             }
         }
+        self.registration.drained(Drained::ConsumerFailed);
     }
 
-    /// Delivers the accepted turn until its terminal, its seal or the
-    /// registration's end. False once the registration's delivery ended.
-    async fn turn(&mut self, current: Current) -> bool {
-        let Current {
-            delivery,
-            turn,
-            accepted,
-            acceptance,
-            folder,
-            activity,
-            schema,
-            credit,
-        } = current;
-        let sealed = Arc::clone(&delivery);
-        self.running = Some(Running {
-            delivery,
-            turn,
-            accepted,
-            folder,
-            activity,
-            normalizer: TurnNormalizer::on(schema, turn, Arc::clone(&self.registration.ledger)),
-            credit,
-        });
-        let mut open = self.deliver_turn(acceptance).await;
-        if open {
-            open = tokio::select! {
-                biased;
-                () = self.cancel.cancelled() => false,
-                () = self.registration.idle.sealed.cancelled() => false,
-                () = sealed.sealed.cancelled() => true,
-            };
-        }
-        if let Some(running) = self.running.take() {
-            self.finished = Some(running.turn);
-            self.registration
-                .ledger()
-                .close(running.turn, running.credit);
-        }
-        open
-    }
-
-    /// The running turn's acceptance, then its lane, until its delivery
-    /// stops (true) or the registration's ends (false).
-    async fn deliver_turn(
-        &mut self,
-        (acceptance, at, mark): (Acceptance, Instant, Option<Mark>),
-    ) -> bool {
-        if !self
-            .output(Observation::Accepted(acceptance), None, at)
-            .await
-        {
-            return true;
-        }
-        // Only a successful `Accepted` send maps the turn (x.3.2 X3 §3.4).
-        if let Some(running) = &self.running {
-            self.registration.ledger().map(running.turn);
-        }
-        // Messages of the fence read before the reply go out after it:
-        // its position counts once they did.
-        if let Some(mark) = mark {
-            self.mark_delivered(mark);
-        }
-        let delivery = Arc::clone(self.delivery());
-        loop {
-            let event = tokio::select! {
-                biased;
-                () = delivery.sealed.cancelled() => return true,
-                () = self.cancel.cancelled() => return false,
-                () = self.registration.idle.sealed.cancelled() => return false,
-                event = self.lane.next() => event,
-            };
-            let item = match event {
-                LaneEvent::Item(item) => *item,
-                LaneEvent::End(end) => {
-                    self.stop(Stop::Lane(end));
-                    return true;
-                }
-            };
-            if matches!(self.message(item).await, Flow::Done) {
-                return true;
-            }
-        }
-    }
-
-    /// The seal outputs go under: the running turn's, else the
-    /// registration's.
-    fn delivery(&self) -> &Arc<Delivery> {
-        self.running
-            .as_ref()
-            .map_or(&self.registration.idle, |running| &running.delivery)
-    }
-
-    /// Whether the running turn has a tool open, in the ledger.
-    fn tools_open(&self) -> bool {
-        self.running
-            .as_ref()
-            .is_some_and(|running| self.registration.ledger().tools_open(running.turn))
-    }
-
-    /// The message went out whole with no (further) output.
-    fn complete(&self) -> bool {
-        self.delivery().complete(self.tools_open())
-    }
-
-    /// Delivery stops: the running turn's, else the registration's.
-    fn stop(&mut self, stop: Stop) {
-        match &self.running {
-            Some(running) => running.delivery.stop(stop),
-            None => {
-                self.failed.get_or_insert(stop);
-            }
-        }
-    }
-
-    /// Reports position `mark` delivered under its fence, in order, while
-    /// that fence's turn runs (x.3.2 critical r2 #2, runtime §8): a stale
-    /// message counts for no turn.
-    fn mark_delivered(&mut self, mark: Mark) {
-        let Some(fenced) = self.live(mark) else {
-            return;
-        };
-        let marks = self.marks(mark.fence);
-        if marks.gap.is_some_and(|gap| mark.seq >= gap) {
-            return;
-        }
-        marks.ahead.insert(mark.seq);
-        while let Some(&next) = marks.ahead.first() {
-            if next > fenced.activity.delivered().saturating_add(1) {
-                break;
-            }
-            marks.ahead.pop_first();
-            fenced.activity.delivered_through(next);
-        }
-        // Only the acceptance's position waits ahead: the lane is left to
-        // the running turn until its acceptance went out, and a message
-        // not delivered whole ends the turn's delivery.
-        debug_assert!(
-            marks.ahead.len() <= 1,
-            "fence positions ahead: {:?}",
-            marks.ahead
-        );
-    }
-
-    /// The turn that fenced `mark`, while its fence is live.
-    fn live(&self, mark: Mark) -> Option<Fenced> {
-        let fenced = self.registration.slot().fenced.clone();
-        fenced.filter(|fenced| {
-            fenced.fence == mark.fence && !fenced.finished && self.finished != Some(fenced.turn)
-        })
-    }
-
-    /// The marks of fence `fence`, fresh for a new fence.
-    fn marks(&mut self, fence: u64) -> &mut Marks {
-        let marks = self.marks.get_or_insert_with(|| Marks {
-            fence,
-            ahead: BTreeSet::new(),
-            gap: None,
-        });
-        if marks.fence != fence {
-            *marks = Marks {
-                fence,
-                ahead: BTreeSet::new(),
-                gap: None,
-            };
-        }
-        marks
-    }
-
+    /// Whose `routed` is, in the consumer's state.
     fn owner(&self, routed: &Routed) -> Owner {
-        let running = self.running.as_ref();
+        let running = self
+            .held
+            .as_ref()
+            .filter(|held| held.phase != Phase::Pending);
         match (routed.owner, routed.turn.as_deref()) {
-            (Some(owner), _) if running.is_some_and(|running| running.turn == owner) => Owner::This,
+            (Some(owner), _) if running.is_some_and(|held| held.turn == owner) => Owner::This,
             (Some(owner), _) => Owner::Earlier(owner),
-            (None, Some(turn)) if running.is_some_and(|running| running.accepted == turn) => {
+            (None, Some(turn))
+                if running.is_some_and(|held| held.accepted.as_deref() == Some(turn)) =>
+            {
                 Owner::This
             }
             (None, Some(_)) => Owner::Unknown,
@@ -1126,141 +1332,211 @@ impl Normalizing {
         }
     }
 
-    /// One lane item, decoded now; its staging permit goes with it. Once
-    /// it went out whole, its fence counts it delivered (x.3.2 critical r2
-    /// #2, runtime §8).
-    async fn message(&mut self, item: LaneItem) -> Flow {
-        let (seq, mark) = (item.routed().seq, item.routed().mark);
-        let flow = self.handle(item).await;
-        self.registration.ledger().unstage();
-        if let Some(mark) = mark
-            && self.delivery().whole(seq)
-        {
-            self.mark_delivered(mark);
+    /// The seal a message of `owner` goes out under: the running turn's
+    /// for its own, thread-level or unseen traffic; the registration's for
+    /// the late path and while no turn runs.
+    fn delivery_for(&self, owner: Owner) -> Arc<Delivery> {
+        match (&self.held, owner) {
+            (Some(held), Owner::This | Owner::Thread | Owner::Unknown)
+                if held.phase != Phase::Pending =>
+            {
+                Arc::clone(&held.cx.delivery)
+            }
+            _ => Arc::clone(&self.registration.idle),
         }
-        flow
     }
 
-    /// [`Self::message`]'s handling: the item's observations, at the
-    /// instant the connection read it. The ledger is updated first, in
-    /// every state, whatever goes out (x.3.2 X3 §6.3), once the charge of
-    /// an entry it may insert was reserved (§6.2).
-    async fn handle(&mut self, item: LaneItem) -> Flow {
-        let owner = self.owner(item.routed());
-        let decoded = match &item {
-            LaneItem::Message(routed) => Some(decode(routed.staged.bytes())),
-            LaneItem::Declined { .. } => None,
-        };
-        let notification = match &decoded {
-            Some(Ok(Incoming::Notification(notification))) => Some(notification),
-            Some(Ok(Incoming::Request(_) | Incoming::Response(_)) | Err(_)) | None => None,
-        };
-        if let Some(key) = self.wanted(owner, &item, notification)
-            && !self.stage(key, item.routed().seq).await
-        {
-            return Flow::Done;
+    /// x.3.2 X3 §3.5: the item at `mark` was handled, whole or not. Under
+    /// the live fence a whole one is disposed of; one that is not is loss
+    /// (the gap). Then the frontier is reported.
+    fn handled(&mut self, mark: Option<Mark>, whole: bool) {
+        let live = self.held.as_ref().map(|held| held.fence);
+        if let Some(mark) = mark.filter(|mark| Some(mark.fence) == live) {
+            if whole {
+                self.disposed = self.disposed.max(mark.seq);
+            } else {
+                self.gap = Some(self.gap.map_or(mark.seq, |gap| gap.min(mark.seq)));
+            }
         }
-        let tracked = self.tracked(owner, &item, notification);
-        if !self.delivery().take(item.routed().seq) {
-            return Flow::Done;
+        self.report();
+    }
+
+    /// x.3.2 X3 §3.5: publishes the live fence's frontier, `min(disposed,
+    /// outstanding - 1, gap - 1)`, when it advances, under the held turn's
+    /// seal: never past a retained or releasing item, or a loss.
+    fn report(&mut self) {
+        let outstanding = {
+            let releasing = self.releasing.and_then(|(_, mark)| mark);
+            let front = self.early.front().and_then(|entry| entry.mark);
+            match (releasing, front) {
+                (Some(a), Some(b)) => Some(a.seq.min(b.seq)),
+                (a, b) => a.or(b).map(|mark| mark.seq),
+            }
+        };
+        let Some(held) = self.held.as_mut() else {
+            return;
+        };
+        let mut through = self.disposed;
+        if let Some(outstanding) = outstanding {
+            through = through.min(outstanding.saturating_sub(1));
+        }
+        if let Some(gap) = self.gap {
+            through = through.min(gap.saturating_sub(1));
+        }
+        if through > held.reported && held.cx.delivery.report(&held.cx.activity, through) {
+            held.reported = through;
+        }
+    }
+
+    /// One message or placeholder of `owner`, decoded now; its staging
+    /// permit goes with it. Under the held turn's seal it is taken first
+    /// (x.3.2 X3 §3.2: refused, it is handled again with the turn closed).
+    /// The ledger is updated before any output, in every state, whatever
+    /// goes out (§6.3), once the charge of an entry it may insert was
+    /// reserved (§6.2); its output goes out at its read instant or `at`,
+    /// a retained item's stamp.
+    async fn handle(&mut self, item: LaneItem, owner: Owner, at: Option<Instant>) -> Handled {
+        let Some(routed) = item.routed() else {
+            return Handled::Done(true);
+        };
+        let seq = routed.seq;
+        let at = at.unwrap_or(routed.at);
+        let parsed = parse(&item);
+        let delivery = self.delivery_for(owner);
+        let idle = Arc::ptr_eq(&delivery, &self.registration.idle);
+        if idle {
+            idle_seam().await;
+        } else {
+            // The held turn's seal is checked before the ledger is
+            // touched: a refused item is handled again with the turn
+            // closed.
+            take_seam().await;
+            if !delivery.take(seq) {
+                return Handled::Refused(item);
+            }
+        }
+        if let Some(key) = self.wanted(owner, &parsed)
+            && !self.stage(key, seq).await
+        {
+            return Handled::Done(false);
+        }
+        let tracked = self.tracked(owner, &parsed);
+        self.registration.ledger().unstage();
+        if idle && !delivery.take(seq) {
+            return Handled::Done(false);
         }
         if tracked.is_err() {
-            self.stop(Stop::Overflow);
-            return Flow::Done;
+            self.overflow();
+            return Handled::Done(false);
         }
-        let (at, seq, mark) = (item.routed().at, item.routed().seq, item.routed().mark);
-        match item {
-            LaneItem::Message(routed) => {
-                let notification = match decoded {
-                    Some(Ok(Incoming::Notification(notification))) => notification,
-                    Some(Ok(Incoming::Request(_) | Incoming::Response(_)) | Err(_)) | None => {
-                        return self.malformed(owner, routed.staged.bytes()).await;
-                    }
-                };
+        match (item, parsed) {
+            (item, Parsed::Malformed) => {
+                let bytes = item.routed().map(|routed| routed.staged.bytes().to_vec());
+                self.malformed(owner, &bytes.unwrap_or_default()).await;
+            }
+            (LaneItem::Message(routed), Parsed::Notification(notification)) => {
                 let named = routed.turn;
                 drop(routed.staged);
-                if let (Owner::Earlier(earlier), Some(turn)) = (owner, named) {
-                    return self
-                        .late(&notification, (earlier, &turn), (at, seq, mark))
+                match (owner, named) {
+                    (Owner::Earlier(earlier), Some(turn)) => {
+                        self.late(
+                            &delivery,
+                            &notification,
+                            (earlier, &turn),
+                            (at, seq, routed.mark),
+                        )
                         .await;
+                    }
+                    _ => self.notification(&delivery, owner, &notification, at).await,
                 }
-                self.notification(owner, &notification, at).await
             }
-            LaneItem::Declined {
-                routed,
-                request,
-                decoded_at,
-                written,
-            } => {
-                let flow = self
-                    .declined(owner, &request, (decoded_at, seq, mark), written)
-                    .await;
-                drop(routed);
-                flow
+            (
+                LaneItem::Declined {
+                    routed,
+                    decoded_at,
+                    written,
+                },
+                Parsed::Request(request),
+            ) => {
+                drop(routed.staged);
+                self.declined(
+                    &delivery,
+                    owner,
+                    &request,
+                    (decoded_at, at),
+                    (seq, routed.mark),
+                    written,
+                )
+                .await;
+            }
+            (_, Parsed::Notification(_) | Parsed::Request(_)) => {
+                delivery.complete(self.tools_open());
             }
         }
+        Handled::Done(delivery.whole(seq))
     }
 
-    /// The key bytes of the ledger entry `item` of `owner` may insert
+    /// The key bytes of the ledger entry `parsed` of `owner` may insert
     /// (x.3.2 X3 §6.2).
-    fn wanted(
-        &self,
-        owner: Owner,
-        item: &LaneItem,
-        notification: Option<&Notification>,
-    ) -> Option<usize> {
+    fn wanted(&self, owner: Owner, parsed: &Parsed) -> Option<usize> {
         let turn = self.entry_turn(owner)?;
         let ledger = self.registration.ledger();
-        match (item, notification) {
-            (LaneItem::Declined { request, .. }, _) => ledger.wants_decline(turn, request),
-            (LaneItem::Message(_), Some(notification)) => ledger.wants(turn, notification),
-            (LaneItem::Message(_), None) => None,
+        match parsed {
+            Parsed::Request(request) => ledger.wants_decline(turn, request),
+            Parsed::Notification(notification) => ledger.wants(turn, notification),
+            Parsed::Malformed => None,
         }
     }
 
-    /// The ledger's update for `item` of `owner` (x.3.2 X3 §6.3).
-    fn tracked(
-        &self,
-        owner: Owner,
-        item: &LaneItem,
-        notification: Option<&Notification>,
-    ) -> Result<(), NormalizeError> {
-        match (item, notification) {
-            (LaneItem::Declined { request, .. }, _) => {
-                self.track(owner, |ledger, turn| ledger.note_decline(turn, request))
-            }
-            (LaneItem::Message(_), Some(notification)) => {
-                self.track(owner, |ledger, turn| ledger.track(turn, notification))
-            }
-            (LaneItem::Message(_), None) => Ok(()),
+    /// The ledger's update for `parsed` of `owner` (x.3.2 X3 §6.3).
+    fn tracked(&self, owner: Owner, parsed: &Parsed) -> Result<(), NormalizeError> {
+        let Some(turn) = self.entry_turn(owner) else {
+            return Ok(());
+        };
+        let mut ledger = self.registration.ledger();
+        match parsed {
+            Parsed::Request(request) => ledger.note_decline(turn, request),
+            Parsed::Notification(notification) => ledger.track(turn, notification),
+            Parsed::Malformed => Ok(()),
         }
     }
 
-    /// The turn whose ledger entry a message of `owner` may insert: the
-    /// running turn's (its own or a thread-level message the normalizer
-    /// judges), or an earlier turn's by the connection's mapping.
+    /// The turn whose ledger entry a message of `owner` may update: the
+    /// running turn's (its own or a thread-level message it judges), or
+    /// an earlier turn's by the connection's mapping.
     fn entry_turn(&self, owner: Owner) -> Option<TurnNumber> {
-        match (owner, &self.running) {
-            (Owner::This | Owner::Thread, Some(running)) => Some(running.turn),
+        let running = self
+            .held
+            .as_ref()
+            .filter(|held| held.phase != Phase::Pending);
+        match (owner, running) {
+            (Owner::This | Owner::Thread, Some(held)) => Some(held.turn),
             (Owner::Earlier(turn), _) => Some(turn),
             (Owner::This | Owner::Thread | Owner::Unknown, _) => None,
         }
     }
 
-    /// x.3.2 X3 §6.2 (F2): reserves the charge of the ledger entry the
-    /// message may insert, before the ledger is updated. The cap slot is
-    /// taken at once: a full cap fails the connection `overflow` (§6.4).
-    /// The budget bytes are awaited within the stall bound, or until the
-    /// driver's health or the generation fails (the overflow path), the
-    /// registration retires or the session is cancelled (F3). False once
-    /// delivery stopped: a wait that ended without its charge leaves
-    /// continuity unproven and loses message `seq`.
+    /// Whether the running turn has a tool open, in the ledger.
+    fn tools_open(&self) -> bool {
+        self.held.as_ref().is_some_and(|held| {
+            held.phase != Phase::Pending && self.registration.ledger().tools_open(held.turn)
+        })
+    }
+
+    /// x.3.2 X3 §6.2: reserves the charge of the ledger entry the message
+    /// may insert, before the ledger is updated. The cap slot is taken at
+    /// once: a full cap fails the connection `overflow` (§6.4). The budget
+    /// bytes are awaited within the stall bound (then the generation fails
+    /// `overflow`), or until the generation fails, the registration
+    /// retires or the session is cancelled. False when the wait ended
+    /// without its charge: continuity is unproven and message `seq` is
+    /// lost.
     async fn stage(&mut self, key: usize, seq: u64) -> bool {
         let cap = self.registration.ledger().cap().clone();
         let Some(slot) = cap.slot(key) else {
             self.registration.ledger().exhaust();
             self.evidence.server.overflow();
-            self.stop(Stop::Overflow);
+            self.overflow();
             return false;
         };
         let slot = match cap.try_charge(slot) {
@@ -1272,13 +1548,13 @@ impl Normalizing {
         };
         let mut health = self.health.subscribe();
         let registration = Arc::clone(&self.registration);
-        // Err(true): the overflow path; Err(false): the consumer ends.
+        // Err(true): the generation fails; Err(false): the consumer ends.
         let charged = tokio::select! {
             biased;
             _ = health.wait_for(|health| matches!(health, DriverHealth::Failed { .. })) => {
                 Err(true)
             }
-            () = registration.failed() => Err(true),
+            () = registration.failed() => Err(false),
             () = registration.retiring.cancelled() => Err(false),
             () = self.cancel.cancelled() => Err(false),
             charged = tokio::time::timeout(event_stall(), cap.charge(slot)) => {
@@ -1293,11 +1569,11 @@ impl Normalizing {
                 self.registration.ledger().stage(charge);
                 true
             }
-            Err(overflow) => {
+            Err(failing) => {
                 self.registration.mark_incomplete();
                 losses(&self.loss.losses).note(self.loss.generation, seq, UNKNOWN);
-                if overflow {
-                    self.stop(Stop::Overflow);
+                if failing {
+                    self.overflow();
                 }
                 false
             }
@@ -1308,126 +1584,108 @@ impl Normalizing {
     /// mapped to Core, is lost, not relabeled: the loss is noted for that
     /// turn, and a live fence it was read under reports nothing from its
     /// position on (the gap).
-    fn lose(&mut self, turn: TurnNumber, seq: u64, mark: Option<Mark>) -> Flow {
+    fn lose(&mut self, delivery: &Delivery, turn: TurnNumber, (seq, mark): (u64, Option<Mark>)) {
         losses(&self.loss.losses).note_turn(turn, self.loss.generation, seq, 1);
-        if let Some(mark) = mark.filter(|mark| self.live(*mark).is_some()) {
-            let marks = self.marks(mark.fence);
-            marks.gap = Some(marks.gap.map_or(mark.seq, |gap| gap.min(mark.seq)));
+        let live = self.held.as_ref().map(|held| held.fence);
+        if let Some(mark) = mark.filter(|mark| Some(mark.fence) == live) {
+            self.gap = Some(self.gap.map_or(mark.seq, |gap| gap.min(mark.seq)));
         }
-        flow(self.complete())
+        delivery.complete(self.tools_open());
     }
 
-    /// Updates the ledger for the turn that owns a message, when known:
-    /// the running turn's, or an earlier turn's by the connection's
-    /// mapping (x.3.2 X3 §6.3).
-    fn track(
-        &self,
-        owner: Owner,
-        update: impl FnOnce(&mut Metadata, TurnNumber) -> Result<(), NormalizeError>,
-    ) -> Result<(), NormalizeError> {
-        let turn = match (owner, &self.running) {
-            (Owner::This, Some(running)) => running.turn,
-            (Owner::Earlier(turn), _) => turn,
-            (Owner::This | Owner::Unknown | Owner::Thread, _) => return Ok(()),
-        };
-        update(&mut self.registration.ledger(), turn)
-    }
-
-    /// X0 item 5 steps 5 and 6: the evidence goes to the turn the message
-    /// names, else to the server folder; the generation fails `protocol`.
-    async fn malformed(&mut self, owner: Owner, bytes: &[u8]) -> Flow {
+    /// X0 item 5 steps 5 and 6, x.3.2 X3 §4.1: the generation fails
+    /// `protocol` first, before any await; then the evidence goes to the
+    /// turn the message names, else to the server folder.
+    async fn malformed(&mut self, owner: Owner, bytes: &[u8]) {
         let detail = "a message of the session's thread did not decode";
-        // While no turn runs the generation fails before the evidence is
-        // kept (x.3.2 X3 §4.4, r6 #1, r5 #5).
-        if self.running.is_none() {
-            self.fail_idle(&Stop::Protocol {
-                detail,
-                undecoded: None,
-            });
-        }
-        let folder = match owner {
+        self.protocol(detail);
+        let named = match owner {
             Owner::This => self
-                .running
+                .held
                 .as_ref()
-                .map(|running| (Arc::clone(&running.folder), "the turn's message")),
-            Owner::Earlier(turn) => self
+                .map(|held| (held.turn, "the turn's message")),
+            Owner::Earlier(turn) => Some((turn, "an earlier turn's message")),
+            Owner::Unknown | Owner::Thread => None,
+        };
+        let folder = named.and_then(|(turn, what)| {
+            let folders = self
                 .evidence
                 .earlier
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .get(&turn)
-                .cloned()
-                .map(|folder| (folder, "an earlier turn's message")),
-            Owner::Unknown | Owner::Thread => None,
-        };
-        let undecoded = match (owner, folder) {
+                .unwrap_or_else(PoisonError::into_inner);
+            folders.get(&turn).map(|folder| (Arc::clone(folder), what))
+        });
+        match (owner, folder) {
             (Owner::This | Owner::Earlier(_), Some((folder, what))) => {
                 folder.keep_undecoded(bytes, what).await;
-                folder.take_undecoded()
             }
-            (Owner::This | Owner::Earlier(_), None) => None,
+            (Owner::This | Owner::Earlier(_), None) => {}
             (Owner::Unknown | Owner::Thread, _) => {
                 self.evidence
                     .server
                     .keep(bytes, "the shared connection's message")
                     .await;
-                Some(format!(
-                    "{} bytes kept as the shared connection's evidence",
-                    bytes.len()
-                ))
             }
-        };
-        self.stop(Stop::Protocol { detail, undecoded });
-        Flow::Done
+        }
     }
 
     /// A decoded notification: the running turn's, or thread-level, is
-    /// normalized; another turn's, or one while no turn runs, gives
-    /// nothing.
+    /// normalized under its seal; anything else gives nothing.
     async fn notification(
         &mut self,
+        delivery: &Arc<Delivery>,
         owner: Owner,
         notification: &Notification,
         at: Instant,
-    ) -> Flow {
-        let step = match self.running.as_mut() {
-            Some(running) if matches!(owner, Owner::This | Owner::Thread) => {
-                // Its read instant, not now (C2 §4): time in the lane
-                // moves nothing.
-                running.activity.record(at);
-                running.normalizer.observe(notification, at)
-            }
-            Some(_) | None => return flow(self.complete()),
+    ) {
+        let running = self.held.as_mut().filter(|held| {
+            held.phase == Phase::Running && matches!(owner, Owner::This | Owner::Thread)
+        });
+        let Some(held) = running else {
+            delivery.complete(self.tools_open());
+            return;
+        };
+        // Its read instant, not now (C2 §4): time in the lane moves
+        // nothing.
+        held.cx.activity.record(at);
+        let step = match held.normalizer.as_mut() {
+            Some(normalizer) => normalizer.observe(notification, at),
+            None => Ok(Step::Activity),
         };
         let step = match step {
             Ok(step) => step,
             Err(NormalizeError::Protocol(detail)) => {
-                self.stop(Stop::Protocol {
-                    detail,
-                    undecoded: None,
-                });
-                return Flow::Done;
+                return self.protocol(detail);
             }
             Err(NormalizeError::Overflow) => {
-                self.stop(Stop::Overflow);
-                return Flow::Done;
+                return self.overflow();
             }
         };
         let tools_open = self.tools_open();
+        let accepted = self
+            .held
+            .as_ref()
+            .and_then(|held| held.accepted.clone())
+            .unwrap_or_default();
         match step {
-            Step::Activity => flow(self.complete()),
+            Step::Activity => {
+                delivery.complete(tools_open);
+            }
             Step::Observations(observations) => {
                 let count = observations.len();
                 if count == 0 {
-                    return flow(self.complete());
+                    delivery.complete(tools_open);
+                    return;
                 }
                 for (index, observation) in observations.into_iter().enumerate() {
                     let last = (index + 1 == count).then_some(tools_open);
-                    if !self.output(observation, last, at).await {
-                        return Flow::Done;
+                    if !self
+                        .output(delivery, &accepted, observation, (last, at))
+                        .await
+                    {
+                        return;
                     }
                 }
-                Flow::Next
             }
             Step::Terminal {
                 terminal,
@@ -1437,8 +1695,11 @@ impl Normalizing {
                     terminal: *terminal,
                     structured,
                 };
-                self.delivery().retain(retained, tools_open);
-                Flow::Done
+                if delivery.retain(retained, tools_open)
+                    && let Some(held) = self.held.as_mut()
+                {
+                    held.phase = Phase::Retained;
+                }
             }
         }
     }
@@ -1447,29 +1708,33 @@ impl Normalizing {
     /// denial of one of its items is that turn's late observation, named
     /// by its vendor turn `turn` (Core records it `late`, the turn's
     /// envelope unchanged), judged against the session's suppression
-    /// table; anything else of it gives nothing.
+    /// table, under the registration's seal; anything else of it gives
+    /// nothing.
     async fn late(
         &mut self,
+        delivery: &Arc<Delivery>,
         notification: &Notification,
         (earlier, turn): (TurnNumber, &str),
         (at, seq, mark): (Instant, u64, Option<Mark>),
-    ) -> Flow {
+    ) {
         let denial = self
             .registration
             .ledger()
             .late_denial(earlier, notification);
         let Ok(denial) = denial else {
-            self.stop(Stop::Overflow);
-            return Flow::Done;
+            return self.overflow();
         };
         match denial {
-            Some(_) if !self.registration.ledger().mapped(earlier) => self.lose(earlier, seq, mark),
+            Some(_) if !self.registration.ledger().mapped(earlier) => {
+                self.lose(delivery, earlier, (seq, mark));
+            }
             Some(denial) => {
                 let denied = Observation::ActionDenied(denial);
-                let tools_open = self.tools_open();
-                flow(self.output_as(turn, denied, Some(tools_open), at).await)
+                self.output(delivery, turn, denied, (Some(false), at)).await;
             }
-            None => flow(self.complete()),
+            None => {
+                delivery.complete(false);
+            }
         }
     }
 
@@ -1477,79 +1742,72 @@ impl Normalizing {
     /// reply was written whole by `decoded_at + 5 s`; an earlier turn's
     /// likewise, as that turn's late observation (x.3.2 X3 fix r2 #3, r4
     /// #2; [`Self::handle`] noted it in the session's suppression table);
-    /// one naming another turn, or none, gives nothing.
+    /// one naming another turn, or none, gives nothing. It goes out at
+    /// `at`: its decode instant, or a retained item's stamp.
     async fn declined(
         &mut self,
+        delivery: &Arc<Delivery>,
         owner: Owner,
         request: &ServerRequest,
-        (decoded_at, seq, mark): (Instant, u64, Option<Mark>),
+        (decoded_at, at): (Instant, Instant),
+        (seq, mark): (u64, Option<Mark>),
         mut written: watch::Receiver<Option<bool>>,
-    ) -> Flow {
-        let named = match (owner, request.turn_id.as_deref(), self.running.as_ref()) {
-            (Owner::This, _, Some(running)) => {
-                running.activity.record(decoded_at);
-                running.accepted.clone()
+    ) {
+        let running = self
+            .held
+            .as_ref()
+            .filter(|held| held.phase == Phase::Running);
+        let named = match (owner, request.turn_id.as_deref(), running) {
+            (Owner::This, _, Some(held)) => {
+                held.cx.activity.record(at);
+                held.accepted.clone().unwrap_or_default()
             }
             (Owner::Earlier(_), Some(turn), _) => turn.to_owned(),
             (Owner::This | Owner::Earlier(_) | Owner::Unknown | Owner::Thread, _, _) => {
-                return flow(self.complete());
+                delivery.complete(self.tools_open());
+                return;
             }
         };
-        let delivery = Arc::clone(self.delivery());
         let whole = tokio::select! {
             biased;
-            () = delivery.sealed.cancelled() => return Flow::Done,
+            () = delivery.sealed.cancelled() => return,
             outcome = tokio::time::timeout_at(
                 decoded_at + DECLINE_DEADLINE,
                 written.wait_for(Option::is_some),
             ) => outcome.is_ok_and(|outcome| outcome.is_ok_and(|outcome| *outcome == Some(true))),
         };
         if !whole {
-            return flow(self.complete());
+            delivery.complete(self.tools_open());
+            return;
         }
         if let Owner::Earlier(earlier) = owner
             && !self.registration.ledger().mapped(earlier)
         {
-            return self.lose(earlier, seq, mark);
+            return self.lose(delivery, earlier, (seq, mark));
         }
         let declined = Observation::RequestDeclined(normalize::decline(request));
         let tools_open = self.tools_open();
-        flow(
-            self.output_as(&named, declined, Some(tools_open), decoded_at)
-                .await,
-        )
+        self.output(delivery, &named, declined, (Some(tools_open), at))
+            .await;
     }
 
-    /// Hands one observation of the running turn to the sink: its room
-    /// reserved outside the seal, the send made under it. `last` (with the
-    /// open tools) completes the message. A stall latches the observation
-    /// overflow and stops delivery; false once nothing more goes out.
-    async fn output(&mut self, observation: Observation, last: Option<bool>, at: Instant) -> bool {
-        let Some(accepted) = self
-            .running
-            .as_ref()
-            .map(|running| running.accepted.clone())
-        else {
-            return false;
-        };
-        self.output_as(&accepted, observation, last, at).await
-    }
-
-    /// [`Self::output`] naming vendor turn `turn`: the running turn's, or
-    /// an earlier turn's for its late observation.
-    async fn output_as(
+    /// Hands one observation naming vendor turn `turn` to the sink under
+    /// `delivery`'s seal: its room reserved outside the seal, the send
+    /// made under it. `last` (with the open tools) completes the message.
+    /// A stall latches the observation overflow and fails the generation;
+    /// false once nothing more goes out.
+    async fn output(
         &mut self,
+        delivery: &Arc<Delivery>,
         turn: &str,
         observation: Observation,
-        last: Option<bool>,
-        at: Instant,
+        (last, at): (Option<bool>, Instant),
     ) -> bool {
         let item = ObservationItem {
             at,
             vendor_turn: VendorTurnId::try_from(turn.to_owned()).ok(),
             observation,
         };
-        let delivery = Arc::clone(self.delivery());
         let sent = {
             let reserved = tokio::select! {
                 biased;
@@ -1563,7 +1821,7 @@ impl Normalizing {
             Ok(false) => return false,
             Err(_) => {
                 latch(&self.health, DriverFailure::ObservationOverflow);
-                self.stop(Stop::Overflow);
+                self.overflow();
                 return false;
             }
         }
@@ -1572,9 +1830,45 @@ impl Normalizing {
     }
 }
 
-/// Test builds: a seam where an idle registration's normalizer holds a
-/// message it took (x.3.2 X3 fix r3 #3): a close's delivery barrier must
-/// then carry it, and its cutoff stops what comes after.
+/// A lane item's full decode, at consumption.
+enum Parsed {
+    Notification(Notification),
+    Request(ServerRequest),
+    Malformed,
+}
+
+/// Decodes a message or a placeholder's request (x.3.2 X3 §5.3: a
+/// placeholder is decoded only here, where its failure fails only this
+/// generation).
+fn parse(item: &LaneItem) -> Parsed {
+    let Some(routed) = item.routed() else {
+        return Parsed::Malformed;
+    };
+    match (item, decode(routed.staged.bytes())) {
+        (LaneItem::Message(_), Ok(Incoming::Notification(notification))) => {
+            Parsed::Notification(notification)
+        }
+        (LaneItem::Declined { .. }, Ok(Incoming::Request(request))) => Parsed::Request(request),
+        _ => Parsed::Malformed,
+    }
+}
+
+/// Test builds: a seam at the top of the consumer's loop (x.3.2 X3 r5
+/// #1), where a test holds it while a turn's traffic arrives.
+#[cfg_attr(
+    not(feature = "test-failpoints"),
+    expect(clippy::unused_async, reason = "only test builds wait at the seam")
+)]
+async fn idle_check_seam() {
+    #[cfg(feature = "test-failpoints")]
+    {
+        let _ = via_routes::failpoint::hit_async("adapter.codex.idle_check").await;
+    }
+}
+
+/// Test builds: a seam between an item's pop and its take under the
+/// registration's seal (x.3.2 X3 fix r3 #3, r6 #3), where a test seals the
+/// registration.
 #[cfg_attr(
     not(feature = "test-failpoints"),
     expect(clippy::unused_async, reason = "only test builds wait at the seam")
@@ -1585,6 +1879,36 @@ async fn idle_seam() {
         let _ = via_routes::failpoint::hit_async("adapter.codex.idle_item").await;
     }
 }
+
+/// Test builds: a seam before an item's take under the held turn's seal
+/// (x.3.2 X3 r5 #6), where a test seals the turn.
+#[cfg_attr(
+    not(feature = "test-failpoints"),
+    expect(clippy::unused_async, reason = "only test builds wait at the seam")
+)]
+async fn take_seam() {
+    #[cfg(feature = "test-failpoints")]
+    {
+        let _ = via_routes::failpoint::hit_async("adapter.codex.consumer_take").await;
+    }
+}
+
+/// Test builds: a seam between a retained entry's leaving `early` and the
+/// outstanding position's publication (x.3.2 X3 S14 (e), r12 #1).
+#[cfg_attr(
+    not(feature = "test-failpoints"),
+    expect(clippy::unused_async, reason = "only test builds wait at the seam")
+)]
+async fn handoff_seam() {
+    #[cfg(feature = "test-failpoints")]
+    {
+        let _ = via_routes::failpoint::hit_async("adapter.codex.early_handoff").await;
+    }
+}
+
+#[cfg(test)]
+#[path = "consumer_tests.rs"]
+mod consumer_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1599,7 +1923,7 @@ mod tests {
 
     use super::super::driver::RetireGuard;
     use super::{
-        Delivery, Evidence, Folders, LossRecord, Losses, Normalizing, ObservationLoss,
+        Delivery, Drained, Evidence, Folders, LossRecord, Losses, Normalizing, ObservationLoss,
         Registration, Retained, ServerEvidence, Stop, UNKNOWN,
     };
     use crate::driver::DriverState;
@@ -2327,11 +2651,14 @@ mod tests {
             .admit(
                 turn(2),
                 Arc::new(move || flag.store(true, Ordering::Release)),
+                &Delivery::new(4),
             )
             .unwrap();
-        let third = run.registration.admit(turn(3), Arc::new(|| {})).unwrap();
         let delivery = Delivery::new(4);
-        third.deliver(&delivery);
+        let third = run
+            .registration
+            .admit(turn(3), Arc::new(|| {}), &delivery)
+            .unwrap();
         assert!(run.lane.push(malformed(5), 64));
         let (sink, _received) = observation_channel();
         let normalizing = Normalizing::new(
@@ -2374,7 +2701,9 @@ mod tests {
         assert!(run.registration.incomplete());
         assert_eq!(run.lane.ended(), Some(LaneEnd::Quarantined));
         assert!(
-            run.registration.admit(turn(4), Arc::new(|| {})).is_none(),
+            run.registration
+                .admit(turn(4), Arc::new(|| {}), &Delivery::new(4))
+                .is_none(),
             "nothing is admitted on a failed generation"
         );
         drop((second, third));
@@ -2435,9 +2764,8 @@ mod tests {
             run.lane.end(LaneEnd::Closed);
             let by = tokio::time::Instant::now() + Duration::from_millis(100);
             let drained = run.registration.drain(by).await;
-            assert!(!drained);
+            assert_eq!(drained, None);
             run.registration.seal();
-            run.registration.drained_prefix(drained);
             assert!(!run.registration.ledger().has_open());
             drop(run.guard());
         };
@@ -2466,8 +2794,7 @@ mod tests {
             .registration
             .drain(tokio::time::Instant::now() + Duration::from_millis(100))
             .await;
-        assert!(!drained);
-        run.registration.drained_prefix(drained);
+        assert_eq!(drained, Some(Drained::ConsumerCancelled));
         drop(run.guard());
         assert_eq!(
             run.record()
@@ -2498,9 +2825,8 @@ mod tests {
             .registration
             .drain(tokio::time::Instant::now() + Duration::from_millis(100))
             .await;
-        assert!(drained);
+        assert_eq!(drained, Some(Drained::Cut));
         run.registration.seal();
-        run.registration.drained_prefix(drained);
         drop(run.guard());
         assert_eq!(run.record(), None, "no loss is noted");
         assert!(!run.registration.incomplete());
@@ -2547,10 +2873,12 @@ mod tests {
         assert!(run.registration.ledger().tools_open(turn(1)));
     }
 
-    /// X0 item 8.2 (x.3.2 X3 fix r4 #4, #6): a close whose barrier
-    /// drained the lane still records the loss of a message its seal
-    /// found delivered in part, and counts what the cutoff dropped; a
-    /// whole, drained close records nothing.
+    /// X0 item 8.2 (x.3.2 X3 fix r4 #4, §5.4): a close whose consumer
+    /// took the cut still records the loss of a message its seal found
+    /// delivered in part; a whole cut records nothing, and what the cutoff
+    /// dropped is diagnostics, not loss. A cancelled or timed-out consumer
+    /// loses everything from the position, count unknown, and leaves
+    /// continuity unproven.
     #[tokio::test]
     async fn close_records_a_partial_seal() {
         let (sink, _received) = observation_channel();
@@ -2561,7 +2889,8 @@ mod tests {
             record: None,
             latest: Some(turn(1)),
         };
-        losses.note_close(2, true, &partial.seal(), 0);
+        let sealed = partial.seal();
+        assert!(!losses.note_close(2, Some(Drained::Cut), (&sealed, sealed.position)));
         assert_eq!(
             losses
                 .record
@@ -2574,14 +2903,29 @@ mod tests {
             record: None,
             latest: Some(turn(1)),
         };
-        kept.note_close(2, true, &whole.seal(), 0);
+        let sealed = whole.seal();
+        assert!(!kept.note_close(2, Some(Drained::Cut), (&sealed, 11)));
         assert!(kept.record.is_none());
-        kept.note_close(2, true, &whole.seal(), 3);
-        assert_eq!(
-            kept.record
-                .map(|record| (record.first_unqueued, record.omitted)),
-            Some((11, 3))
-        );
+        for drained in [
+            Some(Drained::LaneEnded(LaneEnd::Retired)),
+            Some(Drained::Unproven(LaneEnd::Closed)),
+            Some(Drained::ConsumerFailed),
+        ] {
+            assert!(!kept.note_close(2, drained, (&sealed, 11)));
+            assert!(kept.record.is_none(), "{drained:?} noted its own");
+        }
+        for drained in [Some(Drained::ConsumerCancelled), None] {
+            let mut lost = Losses {
+                record: None,
+                latest: Some(turn(1)),
+            };
+            assert!(lost.note_close(2, drained, (&sealed, 7)));
+            assert_eq!(
+                lost.record
+                    .map(|record| (record.first_unqueued, record.omitted)),
+                Some((7, UNKNOWN))
+            );
+        }
     }
 
     /// X0 item 10 (R6-8): a later loss keeps the record's trigger and

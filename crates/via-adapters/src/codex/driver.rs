@@ -34,15 +34,15 @@ use tokio::time::Instant;
 use via_routes::codex::{
     AbnormalEnd, ClientId, CommitOutcome, Connection, ConnectionEnd, ConnectionFailure,
     ConnectionLoss, FINISH_BY, LOSS_EVIDENCE, Lane, LaneEnd, LaneLease, LaunchError, LeaseSignal,
-    LossCause, Mark, Purpose, RequestError, Response, RpcError, SandboxMode, ServerKey, ServerPin,
+    LossCause, Purpose, RequestError, Response, RpcError, SandboxMode, ServerKey, ServerPin,
     Subscription, ThreadResult, ThreadSettings, TurnFolder, TurnStart, TurnStartResult, TurnWrites,
     WriteBounds, crash_on_panic, data, result, thread_resume, thread_start, turn_start,
 };
 use via_routes::{Retirement, SendOutcome, StoreFailure, WireCleanup};
 
 use super::delivery::{
-    Admission, Current, Delivery, Evidence, Folders, LossRecord, Losses, Normalizing, Registration,
-    Retained, ServerEvidence, Stop, TurnFence, UNKNOWN, losses as lock_losses,
+    Admission, CONTRADICTED, Delivery, Evidence, Folders, LossRecord, Losses, Normalizing,
+    Registration, Retained, ServerEvidence, StartCx, Stop, UNKNOWN, losses as lock_losses,
 };
 use super::normalize::{self, DiscoveredModel, StructuredOutput};
 use super::plan::{self as codex_plan, Sandbox};
@@ -55,14 +55,14 @@ use crate::driver::{
 use crate::harness::Harness;
 use crate::instance::Incompatibility;
 use crate::observation::{
-    Acceptance, AdapterError, Charge, Identity, InstanceReport, Observation, ObservationItem,
-    SessionCap, TurnEnd, TurnEvidence, UnparsedOutput,
+    AdapterError, Charge, Identity, InstanceReport, Observation, ObservationItem, SessionCap,
+    TurnEnd, TurnEvidence, UnparsedOutput,
 };
 use crate::plan::{Bound, Inherit, RefusalKind};
 use crate::runtime::event_stall;
 use crate::{
     AcceptanceToken, Cleanup, Deadline, DriverFailure, DriverHealth, ProcessOwner, RouteError,
-    RouteFailure, StartRejected, StopOrder, StopWatch, TurnNumber, VendorTurnId,
+    RouteFailure, StartRejected, StopOrder, StopWatch, TurnNumber,
 };
 
 /// How long the link of a turn to its server may take (X0 item 1.5).
@@ -142,13 +142,6 @@ struct Generation {
     folders: Folders,
 }
 
-impl Generation {
-    /// Its thread's registration, once it has one.
-    fn registration(&self) -> Option<&Registration> {
-        self.thread.as_ref().map(|thread| &*thread.registration)
-    }
-}
-
 impl CodexSession {
     pub(crate) fn new(adapter: Arc<CodexAdapter>) -> Self {
         Self {
@@ -199,36 +192,38 @@ impl CodexSession {
         self.adapter.servers().epoch()
     }
 
-    /// The close's detach (packet §2, X0 item 8.2): the cutoff ends the
+    /// The close's detach (packet §2, X0 item 8.2; x.3.2 X3 §5): the close
+    /// is posted to the connection task, whose cutoff ends the
     /// registration's lane after the messages it took (its admitted
-    /// prefix; later ones are dropped and counted), the delivery barrier
-    /// waits for the prefix, bounded by `deadline` less
-    /// [`DELIVERY_MARGIN`], then the seal; what was left undelivered or
-    /// delivered in part, and what the cutoff dropped, joins the loss
-    /// record (x.3.2 X3 fix r4 #4, #6). Then the thread's unsubscribe
-    /// intent (X0 item 8.3), its reply awaited by `deadline`; then the
-    /// registration closes and the lease is released. Never a stdin
-    /// close: the server is shared.
+    /// prefix; later ones go to diagnostics); the delivery barrier waits
+    /// for the consumer's outcome, bounded by `deadline` less
+    /// [`DELIVERY_MARGIN`], then the seal; the outcome decides what joins
+    /// the loss record (§5.4). Then the thread's unsubscribe intent (X0
+    /// item 8.3), its reply awaited by `deadline`; then the registration
+    /// retires and the lease is released. Never a stdin close: the server
+    /// is shared.
     pub(crate) async fn detach(&self, deadline: Deadline) {
         let Some(attached) = self.attached().take() else {
             return;
         };
         if let Some(thread) = &attached.thread {
-            let lane = thread.lease.lane();
-            lane.end(LaneEnd::Closed);
+            attached.connection.post_close(&thread.lease);
             let by = deadline
                 .instant()
                 .checked_sub(DELIVERY_MARGIN)
                 .unwrap_or_else(Instant::now);
-            let drained = thread.registration.drain(by).await;
-            let sealed = thread.registration.seal();
-            lock_losses(&self.losses).note_close(
+            let registration = &thread.registration;
+            let drained = registration.drain(by).await;
+            let sealed = registration.seal();
+            let position = registration.floor(sealed.position);
+            let unproven = lock_losses(&self.losses).note_close(
                 attached.generation,
                 drained,
-                &sealed,
-                lane.dropped(),
+                (&sealed, position),
             );
-            thread.registration.drained_prefix(drained);
+            if unproven {
+                registration.mark_incomplete();
+            }
             if usable(&attached.connection)
                 && let Some(reply) = attached.connection.unsubscribe(&thread.lease, deadline)
             {
@@ -963,7 +958,9 @@ async fn turn(
     }
     let cap = session.cap(driver);
     let waits = (&mut orders, &mut force, &*driver.health);
-    let credit = match credit(&cap, waits, generation.registration()).await {
+    let thread = generation.thread.as_deref();
+    let gate = thread.map(|thread| (thread.lease.lane().as_ref(), &*thread.registration));
+    let credit = match credited(&cap, waits, gate).await {
         Ok(credit) => credit,
         Err(why) => return uncredited(&facts, &connection, why, (&orders, &force)),
     };
@@ -1001,7 +998,6 @@ async fn turn(
         signal: &generation.signal,
         sandbox: &sandbox,
         effort: effort.as_deref(),
-        folder: &folder,
         schema: spec.output_schema.is_some(),
     };
     let end = run_started(
@@ -1059,6 +1055,40 @@ pub(super) enum Uncredited {
     /// The registration's generation failed (with its cause), or the
     /// registration retired (F3).
     Gone(Option<DriverFailure>),
+}
+
+/// x.3.2 X3 §4.2 steps 0 and 1: on a registered thread (its lane and
+/// registration) the start gate is waited for first, then the turn's
+/// credit is reserved.
+pub(super) async fn credited(
+    cap: &SessionCap,
+    (orders, force, health): (&mut Orders, &mut ForceWatch, &watch::Sender<DriverHealth>),
+    thread: Option<(&Lane, &Registration)>,
+) -> Result<Charge, Uncredited> {
+    if let Some(gate) = thread {
+        start_gate((orders, force), gate).await?;
+    }
+    let registration = thread.map(|(_, registration)| registration);
+    credit(cap, (orders, force, health), registration).await
+}
+
+/// x.3.2 X3 §4.2 step 0: waits for the thread's start gate (§2.2) before
+/// any credit is reserved, beside the turn's orders (a stop, the driver's
+/// close, the wall or the session's cancellation), the daemon force, and
+/// the failure or retirement of the registration. No stall arm: a vendor
+/// slow to answer the predecessor's start is no consumer stall. Any arm
+/// but the gate ends the wait with nothing launched.
+pub(super) async fn start_gate(
+    (orders, force): (&mut Orders, &mut ForceWatch),
+    (lane, registration): (&Lane, &Registration),
+) -> Result<(), Uncredited> {
+    tokio::select! {
+        biased;
+        () = forced(force) => Err(Uncredited::Forced),
+        () = registration.gone() => Err(Uncredited::Gone(registration.failure())),
+        _ = orders.ordered() => Err(Uncredited::Ordered),
+        () = lane.start_gate() => Ok(()),
+    }
 }
 
 /// x.3.2 X3 §4.2 step 1: reserves the turn's credit before any of its jobs
@@ -1622,15 +1652,24 @@ fn lost(facts: &Turn<'_>, connection: &Connection, cause: Unanswered) -> TurnEnd
             ended(&unsent)
         }
         Unanswered::Lost | Unanswered::NotWritten(_) => ended(facts),
-        // A stop's cleanup stays unproven: the written request may have
-        // started work the vendor never reported (P7's acknowledgement).
-        Unanswered::Forced => facts.failure(RouteError::ForceStopped { turn }, None, None),
-        Unanswered::Ended(EndCause::Stopped) => {
-            facts.failure(RouteError::Stopped { turn }, None, None)
-        }
-        Unanswered::Ended(EndCause::Wall) => {
-            facts.failure(RouteError::Deadline { turn }, None, None)
-        }
+        // A stop's cleanup is uncertain: the written request may have
+        // started work the vendor never reported, and early traffic of it
+        // is lost (x.3.2 X3 §3.2, S8's proviso).
+        Unanswered::Forced => facts.failure(
+            RouteError::ForceStopped { turn },
+            None,
+            Some(WireCleanup::Uncertain),
+        ),
+        Unanswered::Ended(EndCause::Stopped) => facts.failure(
+            RouteError::Stopped { turn },
+            None,
+            Some(WireCleanup::Uncertain),
+        ),
+        Unanswered::Ended(EndCause::Wall) => facts.failure(
+            RouteError::Deadline { turn },
+            None,
+            Some(WireCleanup::Uncertain),
+        ),
         // What was dropped proves nothing: the cleanup is unproven.
         Unanswered::Overflow => facts.failure(
             RouteError::Overflow { turn },
@@ -1706,8 +1745,14 @@ async fn await_reply(
             biased;
             () = forced(force) => return Err(Unanswered::Forced),
             // x.3.2 X3 §4.2 step 4: the generation failed and cancelled the
-            // turn's writes; whether the request was written decides.
+            // turn's writes; whether the request was written decides. A
+            // reply already paired was answered: its turn ends as answered
+            // (the consumer may have failed the generation after taking
+            // it), so an accepted turn's cleanup interrupt names its ID.
             () = &mut failed => {
+                if let Ok(paired) = reply.as_mut().get_mut().try_recv() {
+                    return Ok(paired);
+                }
                 let written = if answered {
                     Ok(SendOutcome::Written)
                 } else {
@@ -1764,14 +1809,14 @@ struct Started<'a> {
     signal: &'a LeaseSignal,
     sandbox: &'a Sandbox,
     effort: Option<&'a str>,
-    folder: &'a Arc<TurnFolder>,
     schema: bool,
 }
 
 /// Writes `turn/start` with the full frozen policy under the turn's guard;
-/// a stop before its reply posts the delayed interrupt intent. On the
-/// paired reply the turn is handed to the registration's normalizer (its
-/// acceptance first) and waits for its decision beside its orders.
+/// a stop before its reply posts the delayed interrupt intent. Its `Start`
+/// marker carries the turn's delivery and credit to the registration's
+/// consumer (x.3.2 X3 §2.1), which accepts the turn at its `Reply` in
+/// decode order; the turn waits for its decision beside its orders.
 async fn run_started(
     facts: &mut Turn<'_>,
     start: &Started<'_>,
@@ -1798,15 +1843,29 @@ async fn run_started(
         start_by: orders.wall,
         finish_by: Deadline::at(Instant::now() + FINISH_BY),
     };
-    let Some((admission, _fence)) = admitted(start, turn, (writes, activity)).await else {
+    let Some((_admission, delivery)) = admitted(facts, start, writes).await else {
         return facts.rejected(StartRejected::SessionGone);
     };
+    let correlation = Arc::new(OnceLock::new());
+    let cx = StartCx {
+        delivery: Arc::clone(&delivery),
+        activity: activity.clone(),
+        schema: start.schema,
+        instance: facts.instance.clone(),
+        correlation: Arc::clone(&correlation),
+        credit,
+    };
     let requested = start.connection.request(
-        |id| turn_start(id, &values, prompt),
+        |id| {
+            let _set = correlation.set(acceptance_token(id));
+            turn_start(id, &values, prompt)
+        },
         bounds,
         Purpose::Starts {
             lane: &start.thread.lease,
             turn,
+            decoded: activity.decode_watermark(),
+            cx: Box::new(cx),
         },
         Some(writes),
     );
@@ -1816,10 +1875,6 @@ async fn run_started(
     };
     facts.launch();
     let start_id = requested.id;
-    let correlation = u64::try_from(start_id.get())
-        .ok()
-        .and_then(|id| AcceptanceToken::try_from(id).ok())
-        .unwrap_or(AcceptanceToken::FIRST);
     let reply = await_reply(
         (requested.written, requested.reply),
         (orders, force, Some(start.registered())),
@@ -1848,6 +1903,9 @@ async fn run_started(
                 );
             }
         },
+        // Packet lines 144–145: a refusal the lane contradicts fails the
+        // generation; the turn is not rejected (x.3.2 X3 §3.2).
+        Err(_) if reply.contradicted => return contradicted(facts, start, start_id),
         Err(error) => {
             return facts.rejected(StartRejected::VendorError(
                 error.code.to_string(),
@@ -1855,26 +1913,6 @@ async fn run_started(
             ));
         }
     };
-    let acceptance = Acceptance {
-        correlation,
-        vendor_turn_id: VendorTurnId::try_from(accepted.clone()).ok(),
-        instance: facts.instance.clone(),
-    };
-    // When the connection read the reply, and its fence position (x.3.2
-    // X3 fix r2 #10).
-    let (read, mark) = start
-        .thread
-        .lease
-        .lane()
-        .take_acceptance()
-        .unwrap_or_else(|| (Instant::now(), None));
-    let delivery = hand_over(
-        facts,
-        start,
-        (&accepted, (acceptance, read, mark), credit),
-        activity,
-    );
-    admission.deliver(&delivery);
     let accepted_turn = Accepted {
         id: accepted,
         start: start_id,
@@ -1885,9 +1923,46 @@ async fn run_started(
     settle_turn(facts, start, &accepted_turn, cut)
 }
 
+/// The acceptance token of the start request `id`.
+fn acceptance_token(id: ClientId) -> AcceptanceToken {
+    u64::try_from(id.get())
+        .ok()
+        .and_then(|id| AcceptanceToken::try_from(id).ok())
+        .unwrap_or(AcceptanceToken::FIRST)
+}
+
+/// A refused start the lane contradicts (x.3.2 X3 §3.2, §4.1): the
+/// generation fails `protocol` (first wins with the consumer), and the
+/// turn ends with its cause, launched, its cleanup uncertain and the
+/// generation's cleanup interrupt posted.
+fn contradicted(facts: &Turn<'_>, start: &Started<'_>, start_id: ClientId) -> TurnEnd {
+    let turn = facts.number;
+    let cause = DriverFailure::Route(RouteError::Protocol {
+        turn,
+        detail: CONTRADICTED,
+    });
+    let loss = LossRecord {
+        losses: Arc::clone(&facts.session.losses),
+        generation: start.generation,
+    };
+    let (lane, registration) = start.registered();
+    registration.fail(&cause, (&facts.driver.health, lane, &loss));
+    let cause = registration.failure().unwrap_or(cause);
+    unanswered(
+        facts,
+        start,
+        start_id,
+        Unanswered::Generation {
+            cause,
+            launched: true,
+        },
+    )
+}
+
 /// A started turn whose reply never came; at an overflow the
 /// generation's cleanup interrupt is posted, waiting on that reply (x.3.2
-/// X3 fix r3 #1).
+/// X3 fix r3 #1). (A start positively not written opens the start gate
+/// as the connection forgets its record, §2.2.)
 fn unanswered(
     facts: &Turn<'_>,
     start: &Started<'_>,
@@ -1906,9 +1981,9 @@ fn unanswered(
     lost(facts, start.connection, cause)
 }
 
-/// Spawns the registration's normalizer on the session's tracker under
-/// `crash_on_panic` (X0 item 13.2): it delivers the lane of `lease`
-/// across the registration's turns (x.3.2 X3 fix r3 #3).
+/// Spawns the registration's consumer on the session's tracker under
+/// `crash_on_panic` (X0 item 13.2): it takes the lane of `lease` across
+/// the registration's turns (x.3.2 X3 §3).
 fn normalize_on_tracker(
     driver: &SessionDriver,
     session: &CodexSession,
@@ -1937,52 +2012,28 @@ fn normalize_on_tracker(
     registration
 }
 
-/// Hands the accepted turn to the registration's normalizer, which takes
-/// the lane from the first message not yet taken, the turn's acceptance
-/// first. The settlement seals the turn's delivery however the turn ends.
-fn hand_over(
+/// x.3.2 X3 §4.2 step 2: the turn's delivery, whose last delivered
+/// message is the one before the lane's first, is admitted on its
+/// registration with it, or refused once the generation failed or the
+/// registration retired; the generation's failure cancels its writes and
+/// stops its delivery. The settlement seals it however the turn ends.
+async fn admitted(
     facts: &Turn<'_>,
     start: &Started<'_>,
-    (accepted, acceptance, credit): (&str, (Acceptance, Instant, Option<Mark>), Charge),
-    activity: &crate::TurnActivity,
-) -> Arc<Delivery> {
+    writes: &TurnWrites,
+) -> Option<(Admission, Arc<Delivery>)> {
+    let cancel = writes.canceller();
     let lane = start.thread.lease.lane();
     let before = lane
         .front_seq()
         .map_or_else(|| start.signal.enqueued(), |seq| seq.saturating_sub(1));
     let delivery = Delivery::new(before);
-    facts.settle.deliver(&delivery);
-    start.thread.registration.accept(Current {
-        delivery: Arc::clone(&delivery),
-        turn: facts.number,
-        accepted: accepted.to_owned(),
-        acceptance,
-        folder: Arc::clone(start.folder),
-        activity: activity.clone(),
-        schema: start.schema,
-        credit,
-    });
-    delivery
-}
-
-/// x.3.2 X3 §4.2 step 2: the turn is admitted on its registration, or
-/// refused once the generation failed or the registration retired; the
-/// generation's failure cancels its writes. Then, before its start is
-/// written, it fences the lane: every message the connection reads for
-/// the thread from now on counts against the turn's decode fence (x.3.2
-/// critical r2 #2, runtime §8), and the turn runs on the registration
-/// until the fence drops, accepted or not (x.3.2 X3 fix r4 #1).
-async fn admitted(
-    start: &Started<'_>,
-    turn: TurnNumber,
-    (writes, activity): (&TurnWrites, &crate::TurnActivity),
-) -> Option<(Admission, TurnFence)> {
-    let cancel = writes.canceller();
     let registration = &start.thread.registration;
-    let admission = registration.admit(turn, Arc::new(move || cancel.cancel()))?;
+    let admission =
+        registration.admit(facts.number, Arc::new(move || cancel.cancel()), &delivery)?;
+    facts.settle.deliver(&delivery);
     admitted_seam().await;
-    let fence = registration.fence(start.thread.lease.lane(), turn, activity);
-    Some((admission, fence))
+    Some((admission, delivery))
 }
 
 /// Test builds: a seam between a turn's admission and its `turn/start`
@@ -2119,14 +2170,13 @@ fn settle_turn(
     let sealed = accepted.delivery.seal();
     let lane = start.thread.lease.lane();
     let terminal_decided = cut == Cut::Decided && sealed.terminal.is_some();
-    let undelivered = sealed.partial || lane.front_seq().is_some();
+    let registration = &start.thread.registration;
+    let undelivered =
+        sealed.partial || lane.front_seq().is_some() || registration.outstanding().is_some();
     let abnormal = matches!(sealed.stop, Some(Stop::Lane(LaneEnd::Abnormal)));
     let overflowed = cut == Cut::Overflow
         || lane.overflowed_now()
-        || matches!(
-            sealed.stop,
-            Some(Stop::Lane(LaneEnd::Overflow) | Stop::Overflow)
-        );
+        || matches!(sealed.stop, Some(Stop::Lane(LaneEnd::Overflow)));
     let cleanup_interrupt = || {
         let by = Deadline::at(Instant::now() + CLEANUP_ALLOWANCE);
         start.connection.cleanup_interrupt(
@@ -2137,7 +2187,8 @@ fn settle_turn(
         );
     };
     if !terminal_decided && (undelivered || abnormal || overflowed || cut == Cut::LossDeadline) {
-        lock_losses(&facts.session.losses).note(start.generation, sealed.position, UNKNOWN);
+        let position = registration.floor(sealed.position);
+        lock_losses(&facts.session.losses).note(start.generation, position, UNKNOWN);
     }
     let reported = Some(if sealed.tools_open {
         WireCleanup::Uncertain
@@ -2158,7 +2209,7 @@ fn settle_turn(
         return terminal_end(facts, retained, sealed.tools_open || overflowed);
     }
     match (cut, sealed.stop) {
-        (Cut::Overflow, _) | (_, Some(Stop::Lane(LaneEnd::Overflow) | Stop::Overflow)) => {
+        (Cut::Overflow, _) | (_, Some(Stop::Lane(LaneEnd::Overflow))) => {
             cleanup_interrupt();
             facts.failure(
                 RouteError::Overflow { turn },
@@ -2168,9 +2219,7 @@ fn settle_turn(
         }
         // x.3.2 X3 §4.3: never the cleanup of what survived.
         (_, Some(Stop::Generation | Stop::Lane(LaneEnd::Quarantined))) => {
-            let cause = start
-                .thread
-                .registration
+            let cause = registration
                 .failure()
                 .map_or(RouteError::Overflow { turn }, |cause| {
                     generation_cause(&cause, turn)
@@ -2181,13 +2230,6 @@ fn settle_turn(
         (_, Some(Stop::Lane(end))) => {
             let (cause, loss) = lane_end(end, start.connection, turn);
             facts.failure(cause, loss, reported)
-        }
-        (_, Some(Stop::Protocol { detail, undecoded })) => {
-            let mut end = facts.failure(RouteError::Protocol { turn, detail }, None, reported);
-            if let Err(AdapterError::Route(failure)) = &mut end.outcome {
-                failure.undecoded = undecoded;
-            }
-            end
         }
         (Cut::Order(EndCause::Wall), None) => uncertain(RouteError::Deadline { turn }),
         (Cut::LossDeadline, None) => match connection_loss(start.connection) {

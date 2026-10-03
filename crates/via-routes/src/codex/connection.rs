@@ -17,12 +17,13 @@
 //! every lane and waiter (item 13.1). When the task itself fails, the
 //! registry runs [`Connection::abnormal`] instead (item 13.2).
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{Notify, oneshot, watch};
 use tokio::time::Instant;
 use via_wire::{
     Admitted, CloseMode, CloseRequest, CommitOutcome, Deadline, OutboundMessage, SendOutcome,
@@ -30,14 +31,15 @@ use via_wire::{
     WireFailure, WireMessages, WireSender, WriteBounds,
 };
 
-use super::feeder::{Answer, Done, Feeder, Item, PumpEnd, Queue, WriteCancel};
+use super::feeder::{Answer, Done, Feeder, Item, PumpEnd, Queue, StartMarker, WriteCancel};
 use super::lane::{ConnectionLoss, Lane, LaneEnd, LaneItem, LeaseSignal, LossCause, Routed};
 use super::stdio::Stdio;
 use super::threads::{Budget, Route, ThreadTable};
 use super::{
-    ClientId, ClientIds, DeclineTable, EncodeError, Incoming, Response, Routing, ServerRequest,
+    ClientId, ClientIds, DeclineTable, EncodeError, Incoming, RequestId, Response, Routing,
     ThreadResult, TurnStartResult, decode, peek, result, thread_unsubscribe, turn_interrupt,
 };
+use crate::DecodeWatermark;
 
 /// C2 A6: a server request is answered within this of its decode.
 pub const DECLINE_DEADLINE: Duration = Duration::from_secs(5);
@@ -98,7 +100,6 @@ pub enum RequestError {
 }
 
 /// What a request's reply means to the connection when it pairs.
-#[derive(Clone, Copy)]
 pub enum Purpose<'a> {
     /// Nothing beyond its waiter.
     Plain,
@@ -107,12 +108,19 @@ pub enum Purpose<'a> {
     /// (item 9.1); otherwise the thread is kept as closed.
     Opens(&'a LaneLease),
     /// A `turn/start` on `lane`'s thread: its accepted turn is mapped to
-    /// VIA turn `turn` until the connection retires (packet §5).
+    /// VIA turn `turn` until the connection retires (packet §5). As it is
+    /// handed to Wire its `Start` marker, carrying `cx`, fences the lane
+    /// for the turn's watermark `decoded` (x.3.2 X3 §2.1); its reply's
+    /// `Reply` marker follows in decode order.
     Starts {
         /// The registration.
         lane: &'a LaneLease,
         /// The VIA turn.
         turn: TurnNumber,
+        /// The turn's decode watermark.
+        decoded: DecodeWatermark,
+        /// The driver's context for the turn, opaque to the route.
+        cx: Box<dyn Any + Send + Sync>,
     },
 }
 
@@ -209,6 +217,9 @@ pub struct Connection {
     end: watch::Sender<Option<ConnectionEnd>>,
     /// The idle retirement began: the end of stdout is not a failure.
     retiring: AtomicBool,
+    /// A driver posted its close (x.3.2 X3 §5.1): the connection task
+    /// applies it between two routing operations.
+    closes: Notify,
 }
 
 /// A lane a driver opened on the connection: a registration once a
@@ -339,6 +350,7 @@ impl Connection {
             failure: watch::Sender::new(None),
             end: watch::Sender::new(None),
             retiring: AtomicBool::new(false),
+            closes: Notify::new(),
         })
     }
 
@@ -457,7 +469,7 @@ impl Connection {
         purpose: Purpose<'_>,
         writes: Option<&mut TurnWrites>,
     ) -> Result<Requested, RequestError> {
-        let (id, message, reply) = {
+        let (id, message, reply, start) = {
             let mut state = self.state();
             if state.ended || self.failure().is_some() {
                 return Err(RequestError::Closed);
@@ -468,15 +480,28 @@ impl Connection {
                 return Err(RequestError::Exhausted);
             };
             let message = encode(id).map_err(RequestError::Encode)?;
-            let pairing = match purpose {
-                Purpose::Plain => Pairing::Plain,
-                Purpose::Opens(lane) => Pairing::Opens { lane: lane.id },
-                Purpose::Starts { lane, turn } => Pairing::Starts {
-                    lane: lane.id,
-                    thread: state.threads.thread(lane.id).unwrap_or_default().to_owned(),
+            let (pairing, start) = match purpose {
+                Purpose::Plain => (Pairing::Plain, None),
+                Purpose::Opens(lane) => (Pairing::Opens { lane: lane.id }, None),
+                Purpose::Starts {
+                    lane,
                     turn,
-                    interrupt: None,
-                },
+                    decoded,
+                    cx,
+                } => (
+                    Pairing::Starts {
+                        lane: lane.id,
+                        thread: state.threads.thread(lane.id).unwrap_or_default().to_owned(),
+                        turn,
+                        interrupt: None,
+                    },
+                    Some(StartMarker {
+                        lane: Arc::clone(&lane.lane),
+                        turn,
+                        decoded,
+                        cx,
+                    }),
+                ),
             };
             let charge = match &pairing {
                 Pairing::Starts { thread, .. } => thread.len(),
@@ -496,7 +521,7 @@ impl Connection {
                     charge,
                 },
             );
-            (id, message, reply)
+            (id, message, reply, start)
         };
         let queue = match message {
             OutboundMessage::Start { .. } => Queue::Data,
@@ -512,6 +537,7 @@ impl Connection {
                 request: Some(id.get()),
                 deadline: None,
                 cancel: writes.map(|writes| Arc::clone(&writes.cancel)),
+                start,
             },
         );
         if !queued {
@@ -540,6 +566,7 @@ impl Connection {
                 request: None,
                 deadline: None,
                 cancel: None,
+                start: None,
             },
         );
         Ok(written)
@@ -683,13 +710,45 @@ impl Connection {
         .map(|requested| requested.reply)
     }
 
+    /// x.3.2 X3 §5.1: posts `lane`'s close for the connection task, which
+    /// applies it between two routing operations: the lane is cut (its
+    /// thread's later traffic is late) and ends `Closed` after what it
+    /// took. Coalesced, once per lane; a lane gone is ignored.
+    pub fn post_close(&self, lane: &LaneLease) {
+        if self.state().threads.post_close(lane.id) {
+            self.closes.notify_one();
+        }
+    }
+
+    /// Applies every posted close (x.3.2 X3 §5.2), in the connection task.
+    fn apply_closes(&self) {
+        let cut = self.state().threads.apply_closes();
+        for lane in cut {
+            lane.end(LaneEnd::Closed);
+        }
+    }
+
     /// Drops request `id`'s record: its write was never made, so no reply
     /// comes. Its waiter sees the closed channel; a delayed interrupt on
-    /// it is dropped (nothing to interrupt).
+    /// it is dropped (nothing to interrupt). A `turn/start`'s positive
+    /// `NotWritten` opens its lane's start gate if its `Start` holds it
+    /// (x.3.2 X3 §2.2), whether or not its driver still waits.
     fn forget(&self, id: i64) {
-        let mut state = self.state();
-        if let Some(record) = state.requests.remove(&id) {
+        let unwritten = {
+            let mut state = self.state();
+            let Some(record) = state.requests.remove(&id) else {
+                return;
+            };
             state.budget.release(record.charge);
+            match record.pairing {
+                Pairing::Starts { lane, turn, .. } => {
+                    state.threads.lane(lane).map(|(lane, _)| (lane, turn))
+                }
+                Pairing::Plain | Pairing::Opens { .. } => None,
+            }
+        };
+        if let Some((lane, turn)) = unwritten {
+            lane.start_unwritten(turn);
         }
     }
 
@@ -708,11 +767,14 @@ impl Connection {
     /// Pairs one reply with its record (item 9.1): an ID that is not one
     /// of this connection's outstanding requests is an unattributable
     /// failure. A thread open's reply registers its lane only for a waiter
-    /// still waiting; a `turn/start` reply maps its turn, counts its
-    /// acceptance, read at `at`, under the lane's fence and releases a
-    /// delayed interrupt.
-    fn pair(&self, id: i64, response: Response, at: Instant) -> Result<(), ConnectionFailure> {
-        let (waiter, interrupt) = {
+    /// still waiting; a `turn/start` reply maps an accepted turn and
+    /// releases a delayed interrupt, and, whatever it says, pushes the
+    /// turn's `Reply` marker, read at `at`, into its lane (x.3.2 X3 §2.1):
+    /// an error reply tells its waiter whether the lane took an item
+    /// naming an unmapped turn while the start was open (the refusal
+    /// check).
+    fn pair(&self, id: i64, mut response: Response, at: Instant) -> Result<(), ConnectionFailure> {
+        let (waiter, interrupt, marker) = {
             let mut state = self.state();
             let state = &mut *state;
             let Some(record) = state.requests.remove(&id) else {
@@ -724,6 +786,7 @@ impl Connection {
                 .as_ref()
                 .is_some_and(|waiter| !waiter.is_closed());
             let mut interrupt = None;
+            let mut marker = None;
             match (record.pairing, &response.outcome) {
                 (Pairing::Opens { lane }, Ok(raw)) => {
                     if let Ok(opened) = result::<ThreadResult>(raw) {
@@ -748,31 +811,46 @@ impl Connection {
                         turn,
                         interrupt: delayed,
                     },
-                    Ok(raw),
+                    outcome,
                 ) => {
-                    if let Ok(accepted) = result::<TurnStartResult>(raw) {
+                    let accepted = match outcome {
+                        Ok(raw) => result::<TurnStartResult>(raw)
+                            .ok()
+                            .map(|accepted| accepted.turn.id),
+                        Err(_) => None,
+                    };
+                    if let Some(accepted) = &accepted {
                         // Kept whether or not the lane is still open: the
                         // turn's later traffic is late (packet §5).
                         if !thread.is_empty() {
-                            let ids = (thread.as_str(), accepted.turn.id.as_str());
+                            let ids = (thread.as_str(), accepted.as_str());
                             match state.threads.map_turn(lane, ids, turn, &mut state.budget) {
                                 Ok(true) => {}
                                 Ok(false) => return Err(ConnectionFailure::Overflow),
                                 Err(()) => return Err(ConnectionFailure::Protocol),
                             }
                         }
-                        // The acceptance is a message of the turn's fence,
-                        // read now (x.3.2 X3 fix r2 #10).
-                        if let Some(lane) = state.threads.lane(lane) {
-                            lane.read_acceptance(at);
-                        }
-                        interrupt = delayed.map(|by| (thread, accepted.turn.id, by));
+                        interrupt = delayed.map(|by| (thread, accepted.clone(), by));
                     }
+                    marker = state
+                        .threads
+                        .lane(lane)
+                        .map(|(lane, signal)| (lane, signal, turn, accepted));
                 }
-                (Pairing::Plain | Pairing::Opens { .. } | Pairing::Starts { .. }, _) => {}
+                (Pairing::Plain | Pairing::Opens { .. }, _) => {}
             }
-            (record.waiter, interrupt)
+            (record.waiter, interrupt, marker)
         };
+        if let Some((lane, signal, turn, accepted)) = marker {
+            let (contradicted, pushed) = lane.push_reply(turn, at, accepted);
+            response.contradicted = contradicted && response.outcome.is_err();
+            if !pushed
+                && lane.overflowed_now()
+                && let Some(signal) = signal
+            {
+                signal.overflowed();
+            }
+        }
         if let Some((thread, turn, by)) = interrupt {
             self.post_interrupt(&thread, &turn, by);
         }
@@ -844,13 +922,12 @@ impl Connection {
                 }
                 paired
             }
-            Ok(Routing::Request) => match decode(message.bytes()) {
-                Ok(Incoming::Request(request)) => self.decline(request, message, (seq, at)),
-                Ok(Incoming::Response(_) | Incoming::Notification(_)) | Err(_) => {
-                    self.keep_evidence(message.bytes());
-                    Err(ConnectionFailure::Protocol)
-                }
-            },
+            Ok(Routing::Request {
+                id,
+                method,
+                thread,
+                turn,
+            }) => self.decline((&id, &method), (thread, turn), message, (seq, at)),
             Ok(Routing::Notification { thread, turn }) => {
                 if let Route::Lane {
                     lane,
@@ -890,14 +967,18 @@ impl Connection {
     /// control path under its own 5 s bound, and a placeholder in the
     /// thread's lane at this decode position, keeping the request's
     /// message (its staging charge). Past the pending replies' bound the
-    /// connection fails `overflow`.
+    /// connection fails `overflow`. x.3.2 X3 §5.3: the request is routed
+    /// by its peek; only an open registration's lane gets the raw
+    /// placeholder, whose full decode is the consumer's. A cut, late or
+    /// unknown thread's is answered and counted, never decoded.
     fn decline(
         &self,
-        request: ServerRequest,
+        (id, method): (&RequestId, &str),
+        (thread, turn): (Option<String>, Option<String>),
         message: VendorMessage,
         (seq, decoded_at): (u64, Instant),
     ) -> Result<(), ConnectionFailure> {
-        let line = self.declines.reply(&request.id, &request.method);
+        let line = self.declines.reply(id, method);
         let bytes = line.len();
         {
             let mut state = self.state();
@@ -921,6 +1002,7 @@ impl Connection {
                 request: None,
                 deadline: Some(deadline),
                 cancel: None,
+                start: None,
             },
         );
         if !queued {
@@ -930,23 +1012,28 @@ impl Connection {
                 reply: Some(bytes),
             });
         }
+        // x.3.2 X3 S7: between the reply's queueing and the placeholder's
+        // push, where a test posts a close.
+        #[cfg(feature = "test-failpoints")]
+        {
+            let _ = crate::failpoint::hit("codex.connection.decline");
+        }
         if let Route::Lane {
             lane,
             signal,
             owner,
-        } = self.route(request.thread_id.as_deref(), request.turn_id.as_deref())
+        } = self.route(thread.as_deref(), turn.as_deref())
         {
             let size = message.bytes().len();
             let item = LaneItem::Declined {
                 routed: Routed {
                     staged: message,
                     seq,
-                    turn: request.turn_id.clone(),
+                    turn,
                     owner,
                     at: decoded_at,
                     mark: None,
                 },
-                request,
                 decoded_at,
                 written: written_rx,
             };
@@ -1175,6 +1262,8 @@ pub(super) async fn serve(
                     }
                 }
                 _ = latched.changed() => {}
+                // x.3.2 X3 §5.1: a posted close, ahead of the next message.
+                () = connection.closes.notified() => connection.apply_closes(),
                 next = messages.next_message() => match next {
                     Ok(Some(message)) => {
                         #[cfg(feature = "test-failpoints")]

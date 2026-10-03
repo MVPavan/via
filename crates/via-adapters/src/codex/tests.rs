@@ -1397,3 +1397,199 @@ async fn a_full_cap_is_credit_exhaustion() {
         Some(Uncredited::Exhausted)
     );
 }
+
+/// x.3.2 X3 S11 (r10 #2): a successor's admission waits at the start
+/// gate, before any credit, while its predecessor's `Start` holds it.
+/// Its stop, the daemon force, its wall, its registration's failure (with
+/// the generation's cause) and its retirement each end the wait at once
+/// with that cause: nothing reserved, no health latched by the wait. A
+/// lane's end opens the gate, and its `push_start` is then refused.
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one case per cutoff arm, each beside its expected cause"
+)]
+async fn the_start_gate_waits_beside_its_cutoffs() {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use tokio::sync::watch;
+    use tokio_util::sync::CancellationToken;
+    use via_routes::codex::{Lane, LaneEnd};
+
+    use super::delivery::{LossRecord, Losses, Registration};
+    use super::driver::{Orders, Uncredited, credited};
+    use crate::observation::{SessionCap, observation_channel};
+    use crate::{
+        Deadline, DecodeWatermark, DriverFailure, DriverHealth, RouteError, StopCause, StopOrder,
+    };
+
+    #[derive(Clone, Copy, Debug)]
+    enum Arm {
+        Stop,
+        Force,
+        Wall,
+        Failure,
+        Retirement,
+        LaneEnd,
+    }
+    let protocol = DriverFailure::Route(RouteError::Protocol {
+        turn: TurnNumber::try_from(1).unwrap(),
+        detail: "a message of the session's thread did not decode",
+    });
+    let arms = [
+        Arm::Stop,
+        Arm::Force,
+        Arm::Wall,
+        Arm::Failure,
+        Arm::Retirement,
+        Arm::LaneEnd,
+    ];
+    for arm in arms {
+        let (sink, _received) = observation_channel();
+        let cap = SessionCap::new(&sink);
+        let registration = Registration::new(4, cap.clone());
+        let lane = Arc::new(Lane::default());
+        let predecessor = TurnNumber::try_from(1).unwrap();
+        assert!(lane.push_start(predecessor, DecodeWatermark::default(), Box::new(())));
+        let loss = LossRecord {
+            losses: Arc::new(Mutex::new(Losses::default())),
+            generation: 1,
+        };
+        let soon = Instant::now() + Duration::from_millis(100);
+        let (stop, stop_watch) = watch::channel(None);
+        let (_close, close) = watch::channel(None);
+        let (force_set, mut force) = watch::channel(None);
+        let health = watch::Sender::new(DriverHealth::Open);
+        let failing = watch::Sender::new(DriverHealth::Open);
+        let mut orders = Orders {
+            stop: stop_watch,
+            close,
+            wall: Deadline::at(if matches!(arm, Arm::Wall) {
+                soon
+            } else {
+                soon + Duration::from_secs(60)
+            }),
+            cancel: CancellationToken::new(),
+        };
+        let cutoff = async {
+            tokio::time::sleep_until(soon).await;
+            match arm {
+                Arm::Stop => {
+                    stop.send_replace(Some(StopOrder {
+                        cause: StopCause::Close,
+                        requested_at: String::new(),
+                        force_at: Deadline::at(soon),
+                        close_by: Deadline::at(soon + Duration::from_secs(3)),
+                    }));
+                }
+                Arm::Force => {
+                    force_set.send_replace(Some(soon));
+                }
+                Arm::Wall => {}
+                Arm::Failure => registration.fail(&protocol, (&failing, &lane, &loss)),
+                Arm::Retirement => registration.retire(&loss, || {}),
+                Arm::LaneEnd => lane.end(LaneEnd::Retired),
+            }
+            std::future::pending::<()>().await;
+        };
+        let gate = Some((lane.as_ref(), &*registration));
+        let waited = tokio::select! {
+            waited = tokio::time::timeout(
+                Duration::from_secs(5),
+                credited(&cap, (&mut orders, &mut force, &health), gate),
+            ) => waited.unwrap(),
+            () = cutoff => unreachable!(),
+        };
+        let expected = match arm {
+            Arm::Stop | Arm::Wall => Some(Uncredited::Ordered),
+            Arm::Force => Some(Uncredited::Forced),
+            Arm::Failure => Some(Uncredited::Gone(Some(protocol.clone()))),
+            Arm::Retirement => Some(Uncredited::Gone(None)),
+            Arm::LaneEnd => None,
+        };
+        assert_eq!(waited.as_ref().err(), expected.as_ref(), "{arm:?}");
+        assert!(Instant::now() < soon + Duration::from_secs(1), "{arm:?}");
+        assert_eq!(*health.borrow(), DriverHealth::Open, "{arm:?}");
+        if let Arm::LaneEnd = arm {
+            assert_eq!(cap.held().0, 1, "past the gate the credit is taken");
+            let successor = TurnNumber::try_from(2).unwrap();
+            assert!(
+                !lane.push_start(successor, DecodeWatermark::default(), Box::new(())),
+                "an ended lane refuses the start: no launch"
+            );
+        } else {
+            assert_eq!(cap.held(), (0, 0), "{arm:?}: nothing reserved");
+        }
+    }
+}
+
+/// x.3.2 X3 S11, no stall arm (r10 #2): a vendor slow to answer the
+/// predecessor's start is no consumer stall. With the wall far away the
+/// successor still waits at the gate past the observation stall bound
+/// (lowered for the test), the driver's health clear and nothing
+/// reserved; once the predecessor's start is positively unwritten the
+/// gate opens and the credit is taken.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn the_start_gate_has_no_stall_arm() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::sync::watch;
+    use tokio_util::sync::CancellationToken;
+    use via_routes::codex::Lane;
+
+    use super::delivery::Registration;
+    use super::driver::{Orders, credited};
+    use crate::observation::{SessionCap, observation_channel};
+    use crate::runtime::event_stall;
+    use crate::{Deadline, DecodeWatermark, DriverHealth};
+
+    const NAME: &str = "codex::tests::the_start_gate_has_no_stall_arm";
+    if std::env::var_os("VIA_TEST_EVENT_STALL_MS").is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture"])
+            .env("VIA_TEST_EVENT_STALL_MS", "100")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    assert_eq!(event_stall(), Duration::from_millis(100));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (sink, _received) = observation_channel();
+        let cap = SessionCap::new(&sink);
+        let registration = Registration::new(4, cap.clone());
+        let lane = Arc::new(Lane::default());
+        let predecessor = TurnNumber::try_from(1).unwrap();
+        assert!(lane.push_start(predecessor, DecodeWatermark::default(), Box::new(())));
+        let (_stop, stop) = watch::channel(None);
+        let (_close, close) = watch::channel(None);
+        let (_force, mut force) = watch::channel(None);
+        let health = watch::Sender::new(DriverHealth::Open);
+        let mut orders = Orders {
+            stop,
+            close,
+            wall: Deadline::at(Instant::now() + Duration::from_secs(3600)),
+            cancel: CancellationToken::new(),
+        };
+        let gate = Some((lane.as_ref(), &*registration));
+        let waiting = credited(&cap, (&mut orders, &mut force, &health), gate);
+        tokio::pin!(waiting);
+        let past = tokio::time::timeout(event_stall() * 5, &mut waiting).await;
+        assert!(past.is_err(), "still waiting past the stall bound");
+        assert_eq!(*health.borrow(), DriverHealth::Open);
+        assert_eq!(cap.held(), (0, 0));
+        lane.start_unwritten(predecessor);
+        let credit = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .unwrap();
+        assert!(credit.is_ok());
+        assert_eq!(cap.held().0, 1);
+    });
+}

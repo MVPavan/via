@@ -54,6 +54,10 @@ pub struct Response {
     pub id: RequestId,
     /// The result, or the error.
     pub outcome: Result<Box<RawValue>, RpcError>,
+    /// x.3.2 X3 §3.2, the refusal check: an error reply to a `turn/start`
+    /// whose lane took an item naming an unmapped turn while the start was
+    /// open (`Refused { contradicted }`); set by the pairing.
+    pub contradicted: bool,
 }
 
 /// A JSON-RPC error reply.
@@ -157,8 +161,18 @@ impl Notification {
 pub enum Routing {
     /// A reply to one of VIA's requests, by its integer ID.
     Response(i64),
-    /// A request VIA must answer.
-    Request,
+    /// A request VIA must answer (x.3.2 X3 §5.3: classified before its full
+    /// decode): its ID and method, and the thread and turn it names.
+    Request {
+        /// The ID to answer under.
+        id: RequestId,
+        /// The method.
+        method: String,
+        /// `params.threadId`, when a string within its bound.
+        thread: Option<String>,
+        /// `params.turnId`, likewise.
+        turn: Option<String>,
+    },
     /// A notification, with the thread and turn it names.
     Notification {
         /// `params.threadId`.
@@ -211,7 +225,18 @@ pub fn peek(line: &[u8]) -> Result<Routing, DecodeError> {
                 .ok_or(DecodeError("a reply ID that is not one of VIA's")),
             _ => Err(DecodeError("a reply ID that is not one of VIA's")),
         },
-        (Some(_), Some(_)) => Ok(Routing::Request),
+        (Some(id), Some(method)) => {
+            let id = request_id(&id)?;
+            fits(&[&method])?;
+            let ids = loose_ids(head.params.as_deref());
+            let bounded = |text: Option<String>| text.filter(|text| text.len() <= SHORT_FIELD_MAX);
+            Ok(Routing::Request {
+                id,
+                method,
+                thread: bounded(ids.thread),
+                turn: bounded(ids.turn),
+            })
+        }
         (None, Some(method)) => notification_routing(&method, head.params.as_deref()),
         (None, None) => Err(DecodeError(
             "neither a response, a request nor a notification",
@@ -750,6 +775,7 @@ pub fn decode(line: &[u8]) -> Result<Incoming, DecodeError> {
         } => Ok(Incoming::Response(Response {
             id,
             outcome: Ok(result),
+            contradicted: false,
         })),
         Envelope {
             id: Some(id),
@@ -760,6 +786,7 @@ pub fn decode(line: &[u8]) -> Result<Incoming, DecodeError> {
         } => Ok(Incoming::Response(Response {
             id,
             outcome: Err(error),
+            contradicted: false,
         })),
         Envelope {
             id: Some(id),

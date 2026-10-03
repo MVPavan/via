@@ -1708,9 +1708,18 @@ fn codex_start_order() {
         "method": "turn/completed",
         "params": {"threadId": THREAD, "turn": {"id": TURN, "status": 7}},
     }));
-    cut_after(&mut replay, completed, &[json!({"await_eof": {}})]).unwrap();
+    // The failed generation's cleanup interrupt names the turn (x.3.2 X3
+    // §4.3).
+    cut_after(
+        &mut replay,
+        completed,
+        &[cleanup_interrupt(TURN), json!({"await_eof": {}})],
+    )
+    .unwrap();
     let base = turn_mut(&mut expect, 0)["expect"].clone();
-    failed_after_acceptance(&mut expect, "protocol", "quiescent");
+    // The generation fails: the turn's cleanup is never its surviving
+    // tools' (x.3.2 X3 §4.3, C2).
+    failed_after_acceptance(&mut expect, "protocol", "uncertain");
     // What the turn delivered before the malformed message stays.
     turn_mut(&mut expect, 0)["expect"]["usage"] = base["usage"].clone();
     turn_mut(&mut expect, 0)["expect"]["final_text"] = base["final_text"].clone();
@@ -1736,6 +1745,9 @@ fn codex_start_order() {
     cut_after(&mut replay, completed, &[sigterm()]).unwrap();
     let mut expect = malformed;
     expect["source"] = replay["source"].clone();
+    // A connection-wide failure keeps its Route path: the stopped server
+    // proves the turn's cleanup.
+    turn_mut(&mut expect, 0)["expect"]["cleanup"] = json!("quiescent");
     expect["sessions"]["main"]["close"] = json!({
         "mode": "graceful", "vendor_closed": false, "cleanup": "uncertain",
     });
@@ -1894,6 +1906,15 @@ fn codex_never_ask() {
     check_variant("codex_never_ask", &replay, &expect, knobs).unwrap();
 }
 
+/// The generation's cleanup `turn/interrupt` of vendor turn `turn`, due
+/// within 2 s.
+fn cleanup_interrupt(turn: &str) -> Value {
+    json!({"expect": {
+        "line": {"method": "turn/interrupt", "params": {"threadId": THREAD, "turnId": turn}},
+        "within_ms": 2000,
+    }})
+}
+
 /// c1's second vendor turn.
 const TURN2: &str = "019a0000-0000-7000-8000-000000200002";
 
@@ -1975,13 +1996,22 @@ fn codex_malformed_evidence_owner() {
             "evidence/servers/",
         ),
     ] {
-        let (replay, mut expect) =
-            c1_turn2_with(name, &[emit(&malformed)], &[json!({"await_eof": {}})]).unwrap();
+        // The failed generation's cleanup interrupt names turn 2 (x.3.2
+        // X3 §4.3).
+        let (replay, mut expect) = c1_turn2_with(
+            name,
+            &[emit(&malformed)],
+            &[cleanup_interrupt(TURN2), json!({"await_eof": {}})],
+        )
+        .unwrap();
         let turn = &mut turn_mut(&mut expect, 1)["expect"];
         turn["terminal"] = Value::Null;
         turn["usage"] = Value::Null;
         turn["final_text"] = Value::Null;
         turn["error"] = json!("protocol");
+        // The generation fails: the turn's cleanup is never its surviving
+        // tools' (x.3.2 X3 §4.3, C2).
+        turn["cleanup"] = json!("uncertain");
         turn["observations_include"] = json!([base["observations_include"][0].clone()]);
         turn["observations_exclude"] = json!(["final_text"]);
         turn["observations_order"] = json!(["turn.accepted"]);
@@ -3297,7 +3327,16 @@ fn codex_interrupt_settles_at_terminal() {
     variant(name, &replay, &expect).unwrap();
 }
 
+/// `count` deltas naming the turn's vendor ID, as before its start's
+/// reply maps it.
+fn early_burst(count: usize) -> Vec<Value> {
+    let delta = json!({"method": "item/agentMessage/delta",
+        "params": {"threadId": THREAD, "turnId": TURN, "itemId": "early", "delta": "x"}});
+    vec![emit(&delta); count]
+}
+
 /// `count` thread-level status changes of the session's thread.
+#[cfg(feature = "test-failpoints")]
 fn status_burst(count: usize) -> Vec<Value> {
     let status = json!({"method": "thread/status/changed",
         "params": {"threadId": THREAD, "status": {"type": "active", "activeFlags": []}}});
@@ -3609,11 +3648,14 @@ fn codex_launch_ordinal_counts_processes() {
 }
 
 /// x.3.2 X3 fix r3 #1 (vendors/codex.md §5): main's lane overflows after
-/// its `turn/start` was written and before the reply. Its turn ends
-/// `overflow` at once, unaccepted, its cleanup uncertain: the fake answers
-/// only once the next session's `thread/resume` shows main's turn settled
-/// (a keeper session holds the server across main's quarantine), and then
-/// expects main's delayed cleanup interrupt, written on that reply.
+/// its `turn/start` was written and before the reply: the burst names the
+/// turn's vendor ID, not yet mapped, so the consumer retains each item
+/// under its lane charge (x.3.2 X3 S12; thread-level traffic it would
+/// take). Its turn ends `overflow` at once, unaccepted, its cleanup
+/// uncertain: the fake answers only once the next session's
+/// `thread/resume` shows main's turn settled (a keeper session holds the
+/// server across main's quarantine), and then expects main's delayed
+/// cleanup interrupt, written on that reply.
 #[test]
 fn codex_overflow_before_acceptance() {
     let name = "codex_overflow_before_acceptance";
@@ -3626,7 +3668,7 @@ fn codex_overflow_before_acceptance() {
     let answer = replay["steps"][start + 1].clone();
     let mut resumed = missing["steps"][reopen].clone();
     resumed["expect"]["within_ms"] = json!(2000);
-    let mut tail = status_burst(20);
+    let mut tail = early_burst(20);
     tail.push(resumed);
     tail.push(answer);
     tail.push(json!({"expect": {
@@ -3756,4 +3798,63 @@ fn codex_failed_connection_catalog_is_not_live() {
         ..conformance_run::Knobs::default()
     };
     check_variant(name, &replay, &expect, knobs).unwrap();
+}
+
+/// x.3.2 X3 S13 (packet lines 144–145), through the driver: before it
+/// refuses the turn's `turn/start`, the vendor sends an item naming the
+/// turn's vendor ID, which the connection never mapped: possible started
+/// turn evidence. The refusal is contradicted, so the turn is not
+/// rejected: the generation fails `protocol`, and the turn ends launched,
+/// its cleanup uncertain.
+#[test]
+fn codex_contradicted_refusal_fails_the_generation() {
+    let name = "codex_contradicted_refusal_fails_the_generation";
+    let (replay, expect) = contradicted_refusal(name).unwrap();
+    variant(name, &replay, &expect).unwrap();
+}
+
+/// S13 with the consumer held at its loop top until the driver took the
+/// refusal: the driver alone reads the contradiction from the reply, and
+/// the outcome is the same.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn codex_contradicted_refusal_before_the_consumer() {
+    let name = "codex_contradicted_refusal_before_the_consumer";
+    let (replay, expect) = contradicted_refusal(name).unwrap();
+    let _points = armed(
+        "adapter.codex.idle_check",
+        json!({"occurrence": 1, "action": "delay", "value": 1500}),
+    )
+    .unwrap();
+    variant(name, &replay, &expect).unwrap();
+}
+
+/// The S13 schedule: an item naming the unmapped turn, then the refusal.
+fn contradicted_refusal(name: &str) -> Result<(Value, Value), String> {
+    let (mut replay, mut expect) = plain(name)?;
+    let start = step_with(&replay, "\"capture\":{\"turn\"")?;
+    let early = emit(
+        &json!({"method": "item/started", "params": {"threadId": THREAD,
+        "turnId": TURN, "item": {"type": "commandExecution", "id": "tool-early",
+            "command": "sleep 1", "cwd": "/work/project", "commandActions": [],
+            "status": "inProgress"}}}),
+    );
+    let refused = json!({"emit": {
+        "line": "{\"id\":${turn},\"error\":{\"code\":-32600,\"message\":\"refused\"}}",
+    }});
+    cut_after(
+        &mut replay,
+        start,
+        &[early, refused, json!({"await_eof": {}})],
+    )?;
+    unaccepted(&mut expect, "protocol", tested());
+    let turn = &mut turn_mut(&mut expect, 0)["expect"];
+    turn["cleanup"] = json!("uncertain");
+    turn["observations_include"] = json!([
+        {"kind": "session.vendor_identity_confirmed", "vendor_session_id": THREAD,
+            "generation": 1},
+    ]);
+    expect["sessions"]["main"]["close"] = Value::Null;
+    expect["sessions"]["main"]["health"] = json!({"state": "failed", "first_cause": "protocol"});
+    Ok((replay, expect))
 }
