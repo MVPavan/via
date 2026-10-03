@@ -1418,7 +1418,16 @@ async fn r2_1_an_overflow_preempts_a_pending_acceptance() {
         "the terminal is retained"
     );
     let full = fixture.cap.fill_budget().unwrap();
+    assert_eq!(fixture.lane.open_start(), Some(turn(2)));
     fixture.reply(2, Some(B));
+    // Taking B's `Reply` opens the start gate: the acceptance is in flight.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while fixture.lane.open_start().is_some() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the reply is taken");
     fixture.settle().await;
     assert!(
         fixture.lane.charged().0 > 0,
