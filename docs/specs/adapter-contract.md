@@ -216,7 +216,7 @@ pub struct VendorIdentity {
 | `ModelEntry` | a model with `source: bundled \| discovered` |
 | `SessionRef` | `harness`, `route`, `adapter_version`, handed back on resume, reopen and recovery; unknown or incompatible → `harness_unavailable` (rule 2) |
 | `SessionSpec` | `session_id`, `model`, `instructions: Option<Instructions>`, `initial_bound`, `cwd`, `vendor`, `inherit: {requested, effective}` (the inherited-configuration settings and states frozen at spawn, §6.2), `confirmed_vendor_session_id: Option<VendorSessionId>`, immutable `allow_untested`; a confirmed historical ID is not verification of this connection |
-| `TurnParams` | a resume turn's per-turn values (effort, bound, `output_schema`, `max_steps`, vendor keys) and their `sizes: ParamSizes` (the session's frozen instructions, the turn's effective schema, inherited or set), with the session's requested `inherit` (`None` when unknown) and whether the session has `instructions` (`instructions: bool`, empty text included, since an empty value still has its flag), which a route's launch recipe and its handshake-refusal cache key read; the input to `check_turn` |
+| `TurnParams` | a resume turn's per-turn values (effort, bound, `output_schema`, `max_steps`, vendor keys) and their `sizes: ParamSizes` (the session's frozen instructions, the turn's effective schema, inherited or set), with the session's requested `inherit` (`None` when unknown) and whether the session has `instructions` (`instructions: bool`, empty text included, since an empty value still has its flag), which a route's launch recipe and its handshake-refusal cache key read, and `model`: the session's frozen `SessionSpec.model`, which Core copies in (internal context, never a caller value or override); the input to `check_turn` |
 | `ServerReport` | `harness`, `vendor_version: Option<String>` (the server's handshake), `key: ServerKey` (Codex: 16 hex digits of its configuration hash), `sessions: u32` (sessions leasing it); only servers whose handshake succeeded and that are not retiring |
 | `TurnCheck` | `effective_bound`: the turn's bound as the route will apply it, like `RoutePlan.effective_bound` |
 | `TurnSpec` | `turn: TurnNo`, `prompt`, `effort`, `bound`, `output_schema`, `max_steps`, `vendor`, `wall_deadline: Instant`, `idle_deadline: IdleDeadline` |
@@ -227,7 +227,7 @@ pub struct VendorIdentity {
 | `AnchorRecovery` | `anchor_id`, `generation`, `owner: ProcessOwner` (`Turn { session_id, turn }` or `Server { server_id }`), `cleanup`, `forced`: Host's passive facts for one committed anchor. A server anchor's facts reach a turn only through the turn → server-anchor link (runtime §6), and only as cleanup |
 | `ConnectionPin` | `Generation(u64)` (the fake's persistent profile) or `Server(ServerPin)` (a shared-server holder, keeping the server from idle retirement until the turn becomes a lease or the pin drops) |
 | `ObservationLoss` | the driver's sticky loss record for one thread generation: original triggering turn, generation, first unqueued message sequence (a lower bound: no earlier message of the generation was lost), saturating omitted count (`u64::MAX`: unknown or saturated). Recorded even when no turn of the driver is running, and then reported by its close. Core adds the `observations_lost` warning to each affected turn and commits one `late` warning event on a triggering turn already terminal (C1 §5) |
-| `VendorTerminal` | `at`, `status: Completed\|Interrupted\|Failed`, `stop_reason: StopReason`, `vendor_stop_reason`, `vendor_code?`, `class_hint: Option<ClassHint>`, `detail?`, `structured_output: Option<StructuredOutput>` (`Json(raw)`; `NotJson` when the route's structured output is text that does not parse as JSON, which Core treats as present and invalid with `reason: invalid`; `OverLimit` when a route that assembles it from text exceeds its 4 MiB retention bound, which Core treats as present and invalid with `reason: validation_limit`, C1 §5), `steps?`, `usage?` (turn aggregate), `cost?`, `vendor?` (bounded 16 KiB) |
+| `VendorTerminal` | `at`, `status: Completed\|Interrupted\|Failed`, `stop_reason: StopReason`, `vendor_stop_reason`, `vendor_code?`, `class_hint: Option<ClassHint>`, `detail?`, `structured_output: Option<RawValue>` (a JSON value) and `structured_output_unparsed: Option<UnparsedOutput>` (`NotJson` when the route's structured output is text that does not parse as JSON, which Core treats as present and invalid with `reason: invalid`; `OverLimit` when a route that assembles it from text exceeds its 4 MiB retention bound, which Core treats as present and invalid with `reason: validation_limit`, C1 §5; the two are never both set, and both absent means no output), `steps?`, `usage?` (turn aggregate), `cost?`, `vendor?` (bounded 16 KiB) |
 | `InstanceReport` | `vendor_version: Option<String>`, `version_status: Tested\|Untested` |
 | `ClassHint` | `Auth`, `RateLimit`, `ContextExceeded`, `BudgetExceeded`, `VendorError`, `Protocol`, `ResumeMismatch` |
 | `StopReason` | `EndTurn`, `MaxSteps`, `Budget`, `Refusal`, `Interrupted`, `Error`, `Other` |
@@ -484,7 +484,14 @@ records wall time); Core times idle progress and step boundaries by it
 decreases within one producer, while items of concurrent producers of one
 session may be admitted out of `at` order, so Core never moves an idle
 deadline back and never ends a step before it started. None across
-sessions. Decode fence (x.3.2 critical r2 #2): a route that reads ahead
+sessions. One case is retimed: a route that holds a turn's messages read
+before that turn's acceptance (Codex §3: early messages before the paired
+`turn/start` reply) delivers their observations after `turn.accepted`, in
+decode order, each with `at = max(its decode instant, turn.accepted's at)`,
+and this holds equally for any of them delivered later as `late`
+observations after the turn's terminal; its delivery frontier does not pass
+a held message's position until all of that message's observations are
+delivered. Decode fence (x.3.2 critical r2 #2): a route that reads ahead
 of the Adapter advances the turn's `DecodeWatermark` (a count of the
 messages it has read, carried by `TurnActivity`) as it reads, and the
 Adapter reports, beside it, the position through which it delivered every
@@ -719,8 +726,12 @@ fake agent reports no version".
   `prompt_async`). A mismatch ends with `Err(Rejected { reason:
   InvalidParam {field: "effort"}, evidence })` → `failed(submit_failed)` with
   `failure.data.field:"effort"`. No vendor turn starts and nothing is resent.
-- Once the catalog is cached, `check_turn` applies it, so later turns get the
-  pre-receipt `invalid_params`.
+- Once a live instance's catalog is cached, `check_turn` applies it. The route
+  judges `effort` against the advertised efforts of `TurnParams.model` in the
+  catalog discovered by the live instance for the session's server key
+  (derived from `TurnParams.inherit`), so later turns get the pre-receipt
+  `invalid_params`. With no cached catalog for that key, or a model it does
+  not list, the value passes to `run_turn`'s check.
 
 `plan`, `check_turn` and `models` read only bundled data and the in-memory
 catalog cache of live instances; nothing is persisted.
