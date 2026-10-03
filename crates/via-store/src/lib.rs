@@ -246,8 +246,8 @@ pub use runtime::{
     QueuedTurn, ReceiptRecord, ResumeRecord, RevisableTurn, RevisionRecord, RuntimeResources,
     SERVER_LINKS_LIMIT, SESSION_QUEUE_LIMIT, STATUS_ANCHORS, STATUS_QUEUE, STATUS_STEPS,
     STATUS_TURNS, ServerLink, SessionEventRecord, SessionIdentity, SessionRoute, SessionSnapshot,
-    SessionStatus, SessionSummary, SpawnKey, SpawnRecord, StatusTurn, StepRow, StepsRecord, Store,
-    StoreClient, StoreError, StoreLock, StoredEvent, StoredSpawnKey, SubmissionRecord,
-    SubmitFailedRecord, TerminalCancel, TerminalExtras, TerminalFacts, TerminalRecord,
-    UnfinishedTurn, WalLimits, at_ms,
+    SessionStatus, SessionSummary, SpawnKey, SpawnRecord, StatusTurn, SteerIntent, SteerOutcome,
+    StepRow, StepsRecord, Store, StoreClient, StoreError, StoreLock, StoredEvent, StoredSpawnKey,
+    SubmissionRecord, SubmitFailedRecord, TerminalCancel, TerminalExtras, TerminalFacts,
+    TerminalRecord, UnfinishedTurn, WalLimits, at_ms,
 };

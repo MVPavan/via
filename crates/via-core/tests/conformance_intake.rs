@@ -156,8 +156,8 @@ impl Daemon {
         let mut raw = raw.clone();
         raw["session"] = json!(session);
         raw["handle"] = json!(HANDLE);
-        let params: SteerParams = serde_json::from_value(raw).unwrap();
-        self.engine.steer(params).await
+        let params: SteerParams = serde_json::from_value(raw.clone()).unwrap();
+        self.engine.steer(params, &raw.to_string()).await
     }
 
     /// `status` of `session`.
@@ -646,6 +646,93 @@ fn conformance_intake_steer_delivered_and_refused() {
         assert_eq!(error.kind, "no_active_turn", "{error:?}");
         assert_eq!(daemon.wait(&session, 2).await["state"], "failed");
         Arc::into_inner(daemon).unwrap().stop().await;
+    });
+}
+
+/// K2 (via-jm4.36, C1 §3, §3.4): a keyed steer's first answer is its
+/// answer. A repeat with the same key and request replays the stored
+/// delivery without reaching the driver again: it is answered while the
+/// turn still runs, which a resent input could not be (the vendor never
+/// acknowledges a second one), and after the turn ended, where a new steer
+/// would be `no_active_turn`. The key with another request is
+/// `idempotency_conflict`. A keyed refusal is stored too: `no_active_turn`
+/// on an idle session replays as such while a later turn runs, and that
+/// turn receives nothing. One `steer.delivered` is committed in all.
+#[test]
+fn conformance_intake_keyed_steer_replays_its_first_answer() {
+    let root = Root::new();
+    let path = root.scenario(
+        "scenario.json",
+        &scenario(
+            &json!({"capabilities": capabilities(&[("/verbs/steer", native())])}),
+            &[
+                script(
+                    "p",
+                    &[
+                        accepted(1),
+                        json!({"action":"expect_request","expected":{"type":"steer","id":3}}),
+                        emit(&json!({"type":"steer_delivered","id":3,
+                                    "vendor_turn_id":vendor_turn(1)})),
+                        gate("running"),
+                        terminal(1),
+                    ],
+                ),
+                script("q", &[accepted(2), gate("second"), terminal(2)]),
+            ],
+        ),
+    );
+    run(async {
+        let daemon = Daemon::open(&root, &path);
+        let session = daemon
+            .spawn(&json!({"harness":"fake","model":"fake","prompt":"p"}))
+            .await;
+        let keyed = json!({"text":"also","op_key":"k-1"});
+        let delivered = json!({"turn":format!("{session}/1"),"delivery":"injected"});
+        assert_eq!(daemon.try_steer(&session, &keyed).await.unwrap(), delivered);
+        daemon.entered("running").await;
+        let repeat =
+            tokio::time::timeout(Duration::from_secs(10), daemon.try_steer(&session, &keyed))
+                .await
+                .expect("a replay is answered while the turn runs");
+        assert_eq!(repeat.unwrap(), delivered);
+        let conflict = daemon
+            .try_steer(&session, &json!({"text":"other","op_key":"k-1"}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (conflict.kind, conflict.kind2),
+            ("invalid_params", Some("idempotency_conflict")),
+            "{conflict:?}"
+        );
+        daemon.release("running");
+        assert_eq!(daemon.wait(&session, 1).await["state"], "completed");
+        assert_eq!(daemon.try_steer(&session, &keyed).await.unwrap(), delivered);
+
+        let idle = json!({"text":"idle","op_key":"k-idle"});
+        let refused = daemon.try_steer(&session, &idle).await.unwrap_err();
+        assert_eq!(refused.kind, "no_active_turn", "{refused:?}");
+        daemon
+            .try_resume(&session, &json!({"prompt":"q"}))
+            .await
+            .unwrap();
+        daemon.entered("second").await;
+        let replayed =
+            tokio::time::timeout(Duration::from_secs(10), daemon.try_steer(&session, &idle))
+                .await
+                .expect("a stored refusal is answered while the next turn runs")
+                .unwrap_err();
+        assert_eq!(replayed.kind, "no_active_turn", "{replayed:?}");
+        daemon.release("second");
+        assert_eq!(daemon.wait(&session, 2).await["state"], "completed");
+        let reports: Vec<Value> = daemon
+            .events(&session)
+            .await
+            .into_iter()
+            .filter(|event| event["type"] == "steer.delivered")
+            .collect();
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert_eq!(reports[0]["turn"], 1);
+        daemon.stop().await;
     });
 }
 

@@ -23,7 +23,7 @@ use crate::{
     lanes::{Lane, Lanes},
 };
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 /// Largest terminal envelope, encoded (C1 §5): at most one rides outside a
 /// transaction's payload cap (design §6.4).
@@ -396,6 +396,9 @@ pub struct EventRecord {
     pub turn: TurnNumber,
     /// Canonical event with the session's next sequence.
     pub event: Value,
+    /// A keyed steer's outcome, recorded on its intent row in this event's
+    /// transaction: its `steer.delivered` (C1 §3.4).
+    pub steer: Option<SteerOutcome>,
 }
 
 /// A session-level event committed whether or not a turn of the session
@@ -412,6 +415,9 @@ pub struct SessionEventRecord {
     /// A confirmed identity, written into the session's `vendor_session_id`
     /// and `transcript_hint` in the event's transaction (C1 §6.1).
     pub identity: Option<SessionIdentity>,
+    /// A keyed steer's outcome, recorded on its intent row in this event's
+    /// transaction: its `steer.delivered` (C1 §3.4).
+    pub steer: Option<SteerOutcome>,
 }
 
 /// One of the turns `status` lists (Task 4 design §11.3).
@@ -696,15 +702,38 @@ pub enum OperationVerb {
     Resume,
     /// A keyed `close`.
     Close,
+    /// A keyed `steer`.
+    Steer,
 }
 
-/// A keyed operation row: a close's may have no result yet (design §4).
+/// A keyed steer's intent row (C1 §3, §3.4): written before its input goes
+/// to the driver, with no result until its outcome is recorded.
+pub struct SteerIntent {
+    /// Steered session.
+    pub session_id: SessionId,
+    /// Caller key, unique per session.
+    pub op_key: String,
+    /// Retry identity of the params with the handle replaced by its hash.
+    pub identity: Identity,
+}
+
+/// A keyed steer's outcome, recorded once on its intent row: the reply its
+/// repeats replay (C1 §3.4).
+pub struct SteerOutcome {
+    /// The steer's key.
+    pub op_key: String,
+    /// The stored reply.
+    pub result: Value,
+}
+
+/// A keyed operation row: a close's or a steer's may have no result yet
+/// (design §4, C1 §3.4).
 pub struct KeyedOperation {
     /// The keyed mutation.
     pub verb: OperationVerb,
     /// Retry identity recorded with the key.
     pub identity: Identity,
-    /// Committed result; `None` while a close is in progress.
+    /// Committed result; `None` while a close or a steer is in progress.
     pub result: Option<Value>,
 }
 
@@ -1171,6 +1200,13 @@ pub(crate) enum Command {
         String,
         oneshot::Sender<Result<Option<KeyedOperation>, StoreError>>,
     ),
+    SteerIntent(SteerIntent, oneshot::Sender<Result<(), StoreError>>),
+    SteerOutcome(
+        SessionId,
+        SteerOutcome,
+        oneshot::Sender<Result<(), StoreError>>,
+    ),
+    SteerIntentsResolved(Value, oneshot::Sender<Result<u64, StoreError>>),
     SubmitFailed(SubmitFailedRecord, oneshot::Sender<Result<(), StoreError>>),
     FailureResolution(
         FailureResolutionRecord,
@@ -1332,6 +1368,13 @@ impl TerminalRecord {
     }
 }
 
+impl SteerOutcome {
+    /// Payload bytes, as the writer binds them.
+    fn size(&self) -> usize {
+        self.op_key.len() + encoded(&self.result)
+    }
+}
+
 impl AnchorIdentity {
     fn bytes(&self) -> usize {
         self.boot_id.len() + self.pid_namespace.len() + self.marker.len()
@@ -1420,7 +1463,9 @@ impl Command {
                 1,
             ),
             Self::Event(record, _) => (
-                record.session_id.as_str().len() + encoded(&record.event),
+                record.session_id.as_str().len()
+                    + encoded(&record.event)
+                    + record.steer.as_ref().map_or(0, SteerOutcome::size),
                 0,
                 1,
             ),
@@ -1430,10 +1475,18 @@ impl Command {
                     + record.identity.as_ref().map_or(0, |identity| {
                         identity.vendor_session_id.len()
                             + identity.transcript.as_ref().map_or(0, String::len)
-                    }),
+                    })
+                    + record.steer.as_ref().map_or(0, SteerOutcome::size),
                 0,
                 1,
             ),
+            Self::SteerIntent(intent, _) => {
+                (intent.session_id.as_str().len() + intent.op_key.len(), 0, 0)
+            }
+            Self::SteerOutcome(session, outcome, _) => {
+                (session.as_str().len() + outcome.size(), 0, 0)
+            }
+            Self::SteerIntentsResolved(result, _) => (encoded(result), 0, 0),
             Self::Terminal(record, _, _) => {
                 let (payload, envelope) = record.sizes();
                 (payload, envelope, 1)
@@ -2258,8 +2311,9 @@ impl StoreClient {
         receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
-    /// Reads a keyed operation row of either verb, including a close still
-    /// in progress. [`Self::operation`] reports such a row's result as `null`.
+    /// Reads a keyed operation row of any verb, including a close or a steer
+    /// still in progress. [`Self::operation`] reports such a row's result as
+    /// `null`.
     pub async fn keyed_operation(
         &self,
         session_id: &SessionId,
@@ -2271,6 +2325,36 @@ impl StoreClient {
             op_key.to_owned(),
             reply,
         ))?;
+        receive.await.map_err(|_| StoreError::WriterLost)?
+    }
+
+    /// Commits a keyed steer's intent row, with no result (C1 §3.4). A key
+    /// the session already holds is refused ([`StoreError::Constraint`]).
+    pub async fn commit_steer_intent(&self, intent: SteerIntent) -> Result<(), StoreError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::SteerIntent(intent, reply))?;
+        receive.await.map_err(|_| StoreError::WriterLost)?
+    }
+
+    /// Records a keyed steer's outcome alone on its open intent row (C1
+    /// §3.4). A key with no steer intent row, or one already resolved, is
+    /// refused ([`StoreError::Constraint`]) and nothing is written.
+    pub async fn commit_steer_outcome(
+        &self,
+        session_id: &SessionId,
+        outcome: SteerOutcome,
+    ) -> Result<(), StoreError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::SteerOutcome(session_id.clone(), outcome, reply))?;
+        receive.await.map_err(|_| StoreError::WriterLost)?
+    }
+
+    /// Restart (C1 §3.4): records `result` as the outcome of every keyed
+    /// steer intent row without one, in one transaction, and returns how
+    /// many it resolved.
+    pub async fn resolve_steer_intents(&self, result: Value) -> Result<u64, StoreError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::SteerIntentsResolved(result, reply))?;
         receive.await.map_err(|_| StoreError::WriterLost)?
     }
 
@@ -2782,6 +2866,7 @@ impl ProcessJournal {
 mod anchor;
 mod disk;
 mod sql;
+mod steer;
 
 pub use disk::{PAGE_BYTES, WalLimits};
 

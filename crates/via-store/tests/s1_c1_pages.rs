@@ -96,6 +96,7 @@ async fn commit(client: &StoreClient, id: &SessionId, event: Value) {
             session_id: id.clone(),
             turn: turn(1),
             event,
+            steer: None,
         })
         .await
         .unwrap();

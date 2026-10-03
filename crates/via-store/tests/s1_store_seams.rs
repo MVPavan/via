@@ -123,6 +123,7 @@ fn text(seq: u64) -> EventRecord {
         session_id: session(),
         turn: turn(),
         event: event("assistant.text", seq),
+        steer: None,
     }
 }
 

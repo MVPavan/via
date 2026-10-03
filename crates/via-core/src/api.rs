@@ -475,6 +475,9 @@ pub struct SteerParams {
     /// like a wrong one (F15).
     #[serde(default)]
     pub handle: Option<String>,
+    /// Retry key (C1 §3): a repeat replays the first attempt's answer.
+    #[serde(default)]
+    pub op_key: Option<String>,
 }
 
 /// Strict C1 read-address parameter set.
@@ -1254,6 +1257,16 @@ impl ApiError {
             .boxed(),
             reason: Some(reason),
             floor: None,
+        }
+    }
+    /// A keyed steer's stored outcome when its durable intent stayed
+    /// unresolved after its attempt ended (C1 §3.4, K2 r1 #5):
+    /// `steer_failed` `not_delivered`, delivery `uncertain`. Its message
+    /// claims nothing of the vendor: only that no outcome was recorded.
+    pub(crate) fn steer_unrecorded() -> Self {
+        Self {
+            message: "the steer's delivery outcome was not durably recorded; whether its input was applied is unknown",
+            ..Self::steer_failed("not_delivered", Cow::Borrowed("uncertain"))
         }
     }
     /// The turn has not yet ended.

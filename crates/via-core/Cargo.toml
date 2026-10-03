@@ -15,7 +15,7 @@ via-adapters = { path = "../via-adapters" }
 via-store = { path = "../via-store" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["time", "sync"] }
+tokio = { workspace = true, features = ["time", "sync", "rt"] }
 sha2 = { workspace = true }
 boon = { workspace = true }
 

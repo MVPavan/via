@@ -17,6 +17,9 @@ use super::{
     commit_arm_intent, commit_group_absence, commit_server_turn, commit_vendor_facts,
     count_unproven_anchors, fs, oneshot, params, read_anchor_cohort, read_anchor_owners,
     read_anchor_records, read_server_links,
+    steer::{
+        commit_steer_intent, commit_steer_outcome, record_steer_outcome, resolve_steer_intents,
+    },
 };
 use crate::{
     blob::{BlobRef, Blobs},
@@ -157,11 +160,11 @@ pub(super) fn validate_regular(path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// Schema v9 (runtime §6; Task 4 design §6.6 plus the session's persisted
+/// Schema v10 (runtime §6; Task 4 design §6.6 plus the session's persisted
 /// `adapter_version`, the instance each turn's `turn.started` recorded,
-/// server-owned anchors and the turn → server-anchor link), frozen by
-/// `s1_store_v9_schema_is_frozen`.
-const SCHEMA_V9: &str = "CREATE TABLE sessions (
+/// server-owned anchors, the turn → server-anchor link and keyed `steer`
+/// operation rows), frozen by `s1_store_v10_schema_is_frozen`.
+const SCHEMA_V10: &str = "CREATE TABLE sessions (
     id TEXT PRIMARY KEY, handle_hash BLOB NOT NULL CHECK(length(handle_hash)=32),
     receipt TEXT NOT NULL, params TEXT NOT NULL, state TEXT NOT NULL,
     next_seq INTEGER NOT NULL CHECK(next_seq>=2),
@@ -189,11 +192,13 @@ const SCHEMA_V9: &str = "CREATE TABLE sessions (
     identity_sha256 BLOB NOT NULL CHECK(length(identity_sha256)=32), receipt TEXT NOT NULL);
  CREATE TABLE operations (
     session_id TEXT NOT NULL REFERENCES sessions(id), op_key TEXT NOT NULL,
-    verb TEXT NOT NULL CHECK(verb IN ('resume','close')), identity_len INTEGER NOT NULL,
+    verb TEXT NOT NULL CHECK(verb IN ('resume','close','steer')), identity_len INTEGER NOT NULL,
     identity_sha256 BLOB NOT NULL CHECK(length(identity_sha256)=32),
     turn INTEGER, result TEXT, PRIMARY KEY(session_id,op_key),
-    CHECK(verb='close' OR (turn IS NOT NULL AND result IS NOT NULL)),
+    CHECK(verb IN ('close','steer') OR (turn IS NOT NULL AND result IS NOT NULL)),
     FOREIGN KEY(session_id,turn) REFERENCES turns(session_id,number));
+ CREATE INDEX operations_open_steers ON operations(session_id,op_key)
+    WHERE verb='steer' AND result IS NULL;
  CREATE TABLE events (
     session_id TEXT NOT NULL REFERENCES sessions(id), seq INTEGER NOT NULL,
     turn INTEGER, type TEXT NOT NULL, event TEXT NOT NULL,
@@ -230,7 +235,7 @@ const SCHEMA_V9: &str = "CREATE TABLE sessions (
     FOREIGN KEY(session_id, turn) REFERENCES turns(session_id, number)
  ) WITHOUT ROWID;
  CREATE INDEX server_turns_anchor ON server_turns(anchor_id);
- PRAGMA user_version=9;";
+ PRAGMA user_version=10;";
 
 /// Configures the sole writable connection; initializes the schema only in
 /// a database this open `created`. The version is checked again before the
@@ -278,7 +283,7 @@ pub(super) fn configure(
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| StoreError::Open(error.to_string()))?;
-        tx.execute_batch(SCHEMA_V9)
+        tx.execute_batch(SCHEMA_V10)
             .map_err(|error| StoreError::Open(error.to_string()))?;
         commit(tx)?;
     }
@@ -422,6 +427,9 @@ impl Command {
             | Self::Revision(..)
             | Self::Closing(..)
             | Self::Closed(..)
+            | Self::SteerIntent(..)
+            | Self::SteerOutcome(..)
+            | Self::SteerIntentsResolved(..)
             | Self::SubmitFailed(..)
             | Self::FailureResolution(..)
             | Self::ClosingTerminal(..)
@@ -470,6 +478,10 @@ fn read_seams(command: &Command) -> Result<(), StoreError> {
 /// Serves a read command; returns any other command unserved. Every read
 /// reply, a test seam's failure included, passes [`answer`], so SQLite
 /// corruption on any read reaches the observer before the reply.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one exhaustive match over every command"
+)]
 fn serve_read(conn: &Connection, command: Command, corruption: &ReadCorruption) -> Option<Command> {
     if !command.is_read() {
         return Some(command);
@@ -563,6 +575,9 @@ fn serve_read(conn: &Connection, command: Command, corruption: &ReadCorruption) 
         | Command::SessionClosed(..)
         | Command::Closing(..)
         | Command::Closed(..)
+        | Command::SteerIntent(..)
+        | Command::SteerOutcome(..)
+        | Command::SteerIntentsResolved(..)
         | Command::SubmitFailed(..)
         | Command::FailureResolution(..)
         | Command::AnchorIntent(..)
@@ -603,8 +618,9 @@ fn answer<T>(
     let _ = reply.send(result);
 }
 
-/// Serves one mutation command, or a blob check the thread runs before
-/// admission. Every mutation's result passes [`settled`] before its reply.
+/// Serves one mutation command, or a blob check or the steer intents'
+/// recovery the thread runs before admission. Every mutation's result
+/// passes [`settled`] before its reply.
 fn serve_write(conn: &mut Connection, command: Command, blobs: &Blobs) {
     if let Command::VerifyBlobs(reply) = command {
         let _ = reply.send(verify_blobs(conn, blobs));
@@ -612,6 +628,13 @@ fn serve_write(conn: &mut Connection, command: Command, blobs: &Blobs) {
     }
     if let Command::SweepBlobs(reply) = command {
         let _ = reply.send(sweep_blobs(conn, blobs));
+        return;
+    }
+    // Restart recovery's bookkeeping before admission, like the blob
+    // sweep: no per-mutation test seam, so it moves no seam's hit count.
+    if let Command::SteerIntentsResolved(result, reply) = command {
+        let resolved = resolve_steer_intents(conn, &result);
+        let _ = reply.send(settled(conn, resolved));
         return;
     }
     #[cfg(feature = "test-failpoints")]
@@ -680,6 +703,10 @@ fn serve_mutation(conn: &mut Connection, command: Command) {
         }
         Command::Closing(record, reply) => reply!(reply, commit_closing(conn, &record)),
         Command::Closed(record, reply) => reply!(reply, commit_closed(conn, &record)),
+        Command::SteerIntent(intent, reply) => reply!(reply, commit_steer_intent(conn, &intent)),
+        Command::SteerOutcome(session, outcome, reply) => {
+            reply!(reply, commit_steer_outcome(conn, &session, &outcome));
+        }
         Command::SubmitFailed(record, reply) => reply!(reply, commit_submit_failed(conn, &record)),
         Command::FailureResolution(record, reply) => {
             reply!(reply, commit_failure_resolution(conn, &record));
@@ -703,7 +730,8 @@ fn serve_mutation(conn: &mut Connection, command: Command) {
         Command::ServerTurn(anchor_id, session, turn, reply) => {
             journal!(reply, commit_server_turn(conn, &anchor_id, &session, turn));
         }
-        // `writer_loop` serves reads first and `serve_write` the blob checks.
+        // `writer_loop` serves reads first and `serve_write` the blob checks
+        // and the steer intents' recovery.
         Command::SpawnKey(..)
         | Command::Operation(..)
         | Command::KeyedOperation(..)
@@ -731,7 +759,8 @@ fn serve_mutation(conn: &mut Connection, command: Command) {
         | Command::AnchorRecords(..)
         | Command::ServerLinks(..)
         | Command::VerifyBlobs(..)
-        | Command::SweepBlobs(..) => {}
+        | Command::SweepBlobs(..)
+        | Command::SteerIntentsResolved(..) => {}
     }
 }
 
@@ -793,12 +822,12 @@ fn seq(event: &Value) -> Result<u64, StoreError> {
         .ok_or(StoreError::Constraint("event sequence missing"))
 }
 
-fn json(value: &Value) -> Result<String, StoreError> {
+pub(super) fn json(value: &Value) -> Result<String, StoreError> {
     serde_json::to_string(value).map_err(|error| StoreError::Write(error.to_string()))
 }
 
 /// A stored identity length; one past `i64` cannot be stored.
-fn identity_len(identity: &Identity) -> Result<i64, StoreError> {
+pub(super) fn identity_len(identity: &Identity) -> Result<i64, StoreError> {
     i64::try_from(identity.len).map_err(|_| StoreError::Constraint("identity too long"))
 }
 
@@ -1083,6 +1112,7 @@ fn read_keyed_operation(
             verb: match verb.as_str() {
                 "resume" => OperationVerb::Resume,
                 "close" => OperationVerb::Close,
+                "steer" => OperationVerb::Steer,
                 _ => return Err(StoreError::CorruptEvidence),
             },
             identity: stored_identity(len, &sha256)?,
@@ -1499,6 +1529,9 @@ fn commit_event(conn: &mut Connection, record: &EventRecord) -> Result<(), Store
         return Err(StoreError::Constraint("turn is not running"));
     }
     insert_event(&tx, &record.session_id, &record.event)?;
+    if let Some(steer) = &record.steer {
+        record_steer_outcome(&tx, &record.session_id, steer)?;
+    }
     before_commit!("store.commit.event");
     commit(tx)
 }
@@ -1528,6 +1561,9 @@ fn commit_session_event(
     }
     if let Some(event) = &record.event {
         insert_event(&tx, session, event)?;
+    }
+    if let Some(steer) = &record.steer {
+        record_steer_outcome(&tx, session, steer)?;
     }
     if let Some(identity) = &record.identity {
         tx.execute(
