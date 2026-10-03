@@ -42,7 +42,8 @@ use via_routes::{Retirement, SendOutcome, StoreFailure, WireCleanup};
 
 use super::delivery::{
     Admission, CONTRADICTED, Delivery, Evidence, Folders, LossRecord, Losses, Normalizing,
-    Registration, Retained, ServerEvidence, StartCx, Stop, UNKNOWN, losses as lock_losses,
+    Registration, Retained, ServerEvidence, StartCx, Stop, UNDECODED, UNKNOWN,
+    losses as lock_losses,
 };
 use super::normalize::{self, DiscoveredModel, StructuredOutput};
 use super::plan::{self as codex_plan, Sandbox};
@@ -589,7 +590,7 @@ pub(super) struct Orders {
 
 /// Why a turn is ending, and by when it must have ended.
 #[derive(Clone, Copy, Debug)]
-struct Ending {
+pub(super) struct Ending {
     cause: EndCause,
     by: Deadline,
 }
@@ -1010,6 +1011,25 @@ async fn turn(
     drop(writes);
     quarantine_unfit((driver, session), &connection, (&thread, turn), &end);
     drop(pin);
+    end
+}
+
+/// X0 item 5 (x.3.2 X3 fix r1 #4): a turn ending with a malformed
+/// message's protocol failure reports where that message was kept, once
+/// the consumer kept it after failing.
+pub(super) async fn with_undecoded(mut end: TurnEnd, registration: &Registration) -> TurnEnd {
+    if let Err(AdapterError::Route(failure)) = &mut end.outcome
+        && matches!(
+            failure.cause,
+            RouteError::Protocol {
+                detail: UNDECODED,
+                ..
+            }
+        )
+        && failure.undecoded.is_none()
+    {
+        failure.undecoded = registration.undecoded().await;
+    }
     end
 }
 
@@ -1616,7 +1636,7 @@ fn request_failed(facts: &Turn<'_>, error: RequestError) -> TurnEnd {
 }
 
 /// Why a reply never came.
-enum Unanswered {
+pub(super) enum Unanswered {
     /// The connection ended or its record went.
     Lost,
     /// The request was not written whole.
@@ -1716,7 +1736,7 @@ fn generation_cause(cause: &DriverFailure, turn: TurnNumber) -> RouteError {
 /// failure of the turn's registration (once it has one) and the overflow
 /// of its `lane`, and the end of the turn's own order; `on_order` runs
 /// once, at the order.
-async fn await_reply(
+pub(super) async fn await_reply(
     (written, reply): (oneshot::Receiver<SendOutcome>, oneshot::Receiver<Response>),
     (orders, force, thread): (&mut Orders, &mut ForceWatch, Option<(&Lane, &Registration)>),
     on_order: &mut (dyn FnMut(&Ending) + Send),
@@ -1745,15 +1765,16 @@ async fn await_reply(
             biased;
             () = forced(force) => return Err(Unanswered::Forced),
             // x.3.2 X3 §4.2 step 4: the generation failed and cancelled the
-            // turn's writes; whether the request was written decides. A
-            // reply already paired was answered: its turn ends as answered
-            // (the consumer may have failed the generation after taking
-            // it), so an accepted turn's cleanup interrupt names its ID.
+            // turn's writes; whether the request was written decides. An
+            // acceptance already paired goes on, so the turn's cleanup
+            // interrupt names its vendor ID; any other reply ends through
+            // the failure (§4.3: launched, cleanup uncertain).
             () = &mut failed => {
-                if let Ok(paired) = reply.as_mut().get_mut().try_recv() {
-                    return Ok(paired);
-                }
-                let written = if answered {
+                let replied = match reply.as_mut().get_mut().try_recv() {
+                    Ok(paired) if paired.outcome.is_ok() => return Ok(paired),
+                    paired => paired.is_ok(),
+                };
+                let written = if answered || replied {
                     Ok(SendOutcome::Written)
                 } else {
                     (&mut written).await
@@ -1888,7 +1909,10 @@ async fn run_started(
     .await;
     let reply = match reply {
         Ok(reply) => reply,
-        Err(cause) => return unanswered(facts, start, start_id, cause),
+        Err(cause) => {
+            let end = unanswered(facts, start, start_id, cause);
+            return with_undecoded(end, &start.thread.registration).await;
+        }
     };
     let accepted = match reply.outcome {
         Ok(raw) => match result::<TurnStartResult>(&raw) {
@@ -1920,7 +1944,8 @@ async fn run_started(
     };
     let cut = wait(start, &accepted_turn, (orders, force)).await;
     cut_seam().await;
-    settle_turn(facts, start, &accepted_turn, cut)
+    let end = settle_turn(facts, start, &accepted_turn, cut);
+    with_undecoded(end, &start.thread.registration).await
 }
 
 /// The acceptance token of the start request `id`.
@@ -1947,6 +1972,7 @@ fn contradicted(facts: &Turn<'_>, start: &Started<'_>, start_id: ClientId) -> Tu
     };
     let (lane, registration) = start.registered();
     registration.fail(&cause, (&facts.driver.health, lane, &loss));
+    contradicted_seam();
     let cause = registration.failure().unwrap_or(cause);
     unanswered(
         facts,
@@ -2046,6 +2072,16 @@ async fn admitted_seam() {
     #[cfg(feature = "test-failpoints")]
     {
         let _ = via_routes::failpoint::hit_async("adapter.codex.admitted").await;
+    }
+}
+
+/// Test builds: a marker once a contradicted refusal failed the
+/// generation (Sol code r1 #8), which a test awaits before releasing the
+/// consumer it holds.
+fn contradicted_seam() {
+    #[cfg(feature = "test-failpoints")]
+    {
+        let _ = via_routes::failpoint::hit("adapter.codex.contradicted");
     }
 }
 

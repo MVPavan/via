@@ -324,7 +324,8 @@ fn denied_kind(item: &Item) -> Option<DenialKind> {
 impl Metadata {
     /// x.3.2 X3 §6.3, in every state: turn `turn`'s tool item started is
     /// open (charged once); completed, it is no longer, and its entry is
-    /// released unless a decline or denial must still be judged.
+    /// released unless it is marked or its denial is still to be judged in
+    /// it (§6.2: the entry's charge carries the denial).
     pub(crate) fn track(
         &mut self,
         turn: TurnNumber,
@@ -345,7 +346,7 @@ impl Metadata {
         let key = (turn, item.id.clone());
         if let Some(entry) = self.suppressed.get_mut(&key) {
             entry.facts.open = false;
-            if !entry.facts.declined_by_via && !entry.facts.denied {
+            if !entry.facts.declined_by_via && !entry.facts.denied && denied_kind(item).is_none() {
                 self.suppressed.remove(&key);
             }
         }
@@ -368,10 +369,9 @@ impl Metadata {
         let wanted = if matches!(notification, Notification::ItemStarted(_)) {
             item.kind.is_tool() && held.is_none()
         } else {
-            // Its completion releases an entry with neither mark; the
-            // denial then inserts it again.
-            denied_kind(item).is_some()
-                && held.is_none_or(|facts| !facts.declined_by_via && !facts.denied)
+            // A denial is judged in the item's entry, inserted only when
+            // it has none.
+            denied_kind(item).is_some() && held.is_none()
         };
         wanted.then_some(item.id.len())
     }

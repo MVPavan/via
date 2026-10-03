@@ -51,7 +51,7 @@ use super::normalize::{
 use crate::driver::latch;
 use crate::observation::{
     Acceptance, Charge, InstanceReport, Observation, ObservationItem, ObservationSink, Reserved,
-    SessionCap, VendorTerminal, admitted,
+    SessionCap, Undelivered, VendorTerminal, admitted,
 };
 use crate::runtime::event_stall;
 use crate::{
@@ -322,6 +322,7 @@ impl Delivery {
         if seal.sealed.is_some() {
             return false;
         }
+        report_seam();
         activity.delivered_through(through);
         true
     }
@@ -377,6 +378,9 @@ enum Owner {
     /// No turn: thread-level traffic.
     Thread,
 }
+
+/// The protocol failure a malformed message of the thread latches.
+pub(crate) const UNDECODED: &str = "a message of the session's thread did not decode";
 
 /// How a message's handling ended.
 enum Handled {
@@ -473,8 +477,8 @@ struct Slot {
     retired: bool,
     /// Continuity is unproven: retirement folds `Uncertain` (§6.6).
     incomplete: bool,
-    /// The consumer's earliest retained or releasing position (§3.2,
-    /// r11 #1), which every loss snapshot is floored by.
+    /// The consumer's published outstanding position (§3.2; its rule is
+    /// at `Normalizing::outstanding`).
     outstanding: Option<u64>,
     /// The admitted turns, which the generation's failure stops (§4.2).
     admitted: BTreeMap<TurnNumber, AdmittedTurn>,
@@ -518,6 +522,16 @@ pub(crate) struct Registration {
     failing: CancellationToken,
     /// Cancelled at retirement (§6.5).
     retiring: CancellationToken,
+    /// Where the malformed message that failed the generation was kept
+    /// (X0 item 5), noted after the failure so its I/O never delays it.
+    undecoded: watch::Sender<Note>,
+}
+
+/// A malformed message's evidence note (x.3.2 X3 fix r1 #4).
+enum Note {
+    Absent,
+    Keeping,
+    Kept(Option<String>),
 }
 
 impl Registration {
@@ -531,6 +545,7 @@ impl Registration {
             drained: watch::channel(None).0,
             failing: CancellationToken::new(),
             retiring: CancellationToken::new(),
+            undecoded: watch::channel(Note::Absent).0,
         })
     }
 
@@ -590,6 +605,35 @@ impl Registration {
         })
     }
 
+    /// Notes the malformed message's evidence: `Keeping` from `Absent`,
+    /// then `Kept` from `Keeping`; the first message's stays.
+    fn note(&self, note: Note) {
+        self.undecoded.send_if_modified(|current| {
+            let next = matches!(
+                (&*current, &note),
+                (Note::Absent, Note::Keeping) | (Note::Keeping, Note::Kept(_))
+            );
+            if next {
+                *current = note;
+            }
+            next
+        });
+    }
+
+    /// The evidence note of the malformed message that failed the
+    /// generation, once kept: `None` when none was or it was not kept.
+    pub(crate) async fn undecoded(&self) -> Option<String> {
+        let mut note = self.undecoded.subscribe();
+        match note
+            .wait_for(|note| !matches!(note, Note::Keeping))
+            .await
+            .as_deref()
+        {
+            Ok(Note::Kept(note)) => note.clone(),
+            _ => None,
+        }
+    }
+
     /// The generation's failure, once it failed.
     pub(crate) fn failure(&self) -> Option<DriverFailure> {
         self.slot().failed.clone()
@@ -625,18 +669,16 @@ impl Registration {
         self.slot().retired
     }
 
-    /// The consumer's outstanding position (x.3.2 X3 §3.2).
     pub(crate) fn outstanding(&self) -> Option<u64> {
         self.slot().outstanding
     }
 
-    /// Publishes the consumer's outstanding position.
     fn publish(&self, outstanding: Option<u64>) {
         self.slot().outstanding = outstanding;
     }
 
-    /// x.3.2 X3 §4.2, loss snapshots (r11 #1): `position`, a seal's,
-    /// floored by the outstanding position while one is published.
+    /// x.3.2 X3 §4.2: a loss snapshot from a seal's `position`, floored
+    /// by the outstanding position (r11 #1).
     pub(crate) fn floor(&self, position: u64) -> u64 {
         self.outstanding()
             .map_or(position, |outstanding| outstanding.min(position))
@@ -720,6 +762,7 @@ impl Drop for Returned {
     fn drop(&mut self) {
         // Returning is no evidence the prefix was taken (x.3.2 X3 r7 #5).
         self.0.drained(Drained::ConsumerCancelled);
+        self.0.note(Note::Kept(None));
     }
 }
 
@@ -813,6 +856,9 @@ pub(crate) struct Normalizing {
     gap: Option<u64>,
     /// The highest position of the live fence taken and handled whole.
     disposed: u64,
+    /// x.3.2 X3 §6.2: the stall deadline of the message being handled,
+    /// one for its ledger wait and all of its sink waits.
+    stall_by: Instant,
 }
 
 impl Normalizing {
@@ -836,6 +882,7 @@ impl Normalizing {
             releasing: None,
             gap: None,
             disposed: 0,
+            stall_by: Instant::now(),
         }
     }
 
@@ -867,15 +914,22 @@ impl Normalizing {
     }
 
     /// Waits on the consumer's cutoffs and the lane: a retained terminal
-    /// freezes the lane. What the lane took before an overflow is taken in
-    /// order up to its end (a terminal among it is retained, x.3.2 X3 fix
-    /// r3 #2); a frozen lane's overflow fails the generation at once.
+    /// freezes the lane. A pending turn's lane fails at its overflow before
+    /// anything more is taken (§3.2: no `Reply` past it); otherwise what
+    /// the lane took before an overflow is taken in order up to its end (a
+    /// running turn's terminal among it is retained, x.3.2 X3 fix r3 #2),
+    /// and a frozen lane's overflow fails the generation at once.
     async fn wake(&self) -> Wake {
         let held = self
             .held
             .as_ref()
-            .map(|held| (Arc::clone(&held.cx.delivery), held.phase == Phase::Retained));
-        let frozen = held.as_ref().is_some_and(|(_, frozen)| *frozen);
+            .map(|held| (Arc::clone(&held.cx.delivery), held.phase));
+        let frozen = held
+            .as_ref()
+            .is_some_and(|(_, phase)| *phase == Phase::Retained);
+        let pending = held
+            .as_ref()
+            .is_some_and(|(_, phase)| *phase == Phase::Pending);
         let sealed = async {
             match &held {
                 Some((delivery, _)) => delivery.sealed.cancelled().await,
@@ -888,6 +942,7 @@ impl Normalizing {
             () = self.registration.failing.cancelled() => Wake::Failed,
             () = self.registration.idle.sealed.cancelled() => Wake::Ended,
             () = sealed => Wake::Sealed,
+            () = self.lane.overflowed(), if pending => Wake::Overflow,
             event = self.lane.next(), if !frozen => Wake::Lane(event),
             () = self.lane.overflowed() => Wake::Overflow,
         }
@@ -907,7 +962,6 @@ impl Normalizing {
             .fail(cause, (&self.health, &self.lane, &self.loss));
     }
 
-    /// The generation fails `overflow`.
     fn overflow(&self) {
         let cause = self
             .latest()
@@ -917,7 +971,6 @@ impl Normalizing {
         self.fail(&cause);
     }
 
-    /// The generation fails `protocol` with `detail`.
     fn protocol(&self, detail: &'static str) {
         let cause = self
             .latest()
@@ -937,8 +990,8 @@ impl Normalizing {
         self.drop_early();
     }
 
-    /// One lane item.
     async fn item(&mut self, item: LaneItem, charge: LaneCharge) {
+        self.stall_by = Instant::now() + event_stall();
         match item {
             LaneItem::Start(start) => {
                 drop(charge);
@@ -1083,13 +1136,26 @@ impl Normalizing {
             self.registration.mark_incomplete();
             return;
         }
-        let mut item = item;
+        let whole = self.deliver(item, None).await;
+        self.handled(mark, whole);
+    }
+
+    /// Handles `item` as its routing names it, or as `bound` binds it (a
+    /// retained item's turn and instant): whether it went out whole. The
+    /// held turn's seal refusing it at its start closes that turn, and it
+    /// is handled again.
+    async fn deliver(&mut self, mut item: LaneItem, bound: Option<(TurnNumber, Instant)>) -> bool {
         loop {
-            let Some(owner) = item.routed().map(|routed| self.owner(routed)) else {
-                return;
+            let owner = match (bound, item.routed()) {
+                (Some((turn, _)), _) => match &self.held {
+                    Some(held) if held.turn == turn => Owner::This,
+                    Some(_) | None => Owner::Earlier(turn),
+                },
+                (None, Some(routed)) => self.owner(routed),
+                (None, None) => return true,
             };
-            match self.handle(item, owner, None).await {
-                Handled::Done(whole) => return self.handled(mark, whole),
+            match self.handle(item, owner, bound.map(|(_, at)| at)).await {
+                Handled::Done(whole) => return whole,
                 Handled::Refused(refused) => {
                     self.close();
                     item = refused;
@@ -1120,10 +1186,8 @@ impl Normalizing {
 
     /// Releases the bound retained items in order, by their binding only
     /// (x.3.2 X3 §3.2): to the running turn, or, once it closed, as its
-    /// late observations; an item of no turn is disposed of. The handoff
-    /// of each is one transition: `releasing` before the entry leaves
-    /// `early`, `outstanding` published after both, and moved on only
-    /// once the entry went out whole or its loss was recorded. A retained
+    /// late observations; an item of no turn is disposed of. Each handoff
+    /// keeps the outstanding rule ([`Self::outstanding`]). A retained
     /// terminal freezes the rest; a sealed turn leaves it to its close.
     async fn release(&mut self) {
         loop {
@@ -1145,50 +1209,26 @@ impl Normalizing {
             };
             handoff_seam().await;
             self.publish();
-            let whole = match self.release_one(entry).await {
-                Ok(whole) => whole,
-                Err(back) => {
-                    self.early.push_front(*back);
-                    return;
-                }
+            self.stall_by = Instant::now() + event_stall();
+            // Its lane charge is held until it went out; one of no turn
+            // is disposed of, whole.
+            let Early {
+                item,
+                charge: _charge,
+                bound,
+                ..
+            } = entry;
+            let whole = match bound {
+                Some(Bound {
+                    owner: Some(turn),
+                    at,
+                }) => self.deliver(item, Some((turn, at))).await,
+                Some(Bound { owner: None, .. }) | None => true,
             };
             let mark = self.releasing.and_then(|(_, mark)| mark);
             self.releasing = self.early.front().map(|next| (next.seq, next.mark));
             self.publish();
             self.handled(mark, whole);
-        }
-    }
-
-    /// One bound entry: whether it went out whole (an unseen one is
-    /// disposed of, whole); it is given back when the held turn's seal
-    /// refused it at its start.
-    async fn release_one(&mut self, entry: Early) -> Result<bool, Box<Early>> {
-        let Early {
-            item,
-            seq,
-            mark,
-            at,
-            charge,
-            bound,
-        } = entry;
-        let bound = bound.unwrap_or(Bound { owner: None, at });
-        let Some(turn) = bound.owner else {
-            return Ok(true);
-        };
-        let owner = match &self.held {
-            Some(held) if held.turn == turn => Owner::This,
-            Some(_) | None => Owner::Earlier(turn),
-        };
-        match self.handle(item, owner, Some(bound.at)).await {
-            Handled::Done(whole) => Ok(whole),
-            Handled::Refused(item) => Err(Box::new(Early {
-                item,
-                seq,
-                mark,
-                at,
-                charge,
-                bound: Some(bound),
-            })),
         }
     }
 
@@ -1219,14 +1259,19 @@ impl Normalizing {
         self.drop_early();
     }
 
-    /// Drops the retained items and their charges; nothing is outstanding.
     fn drop_early(&mut self) {
         self.early.clear();
         self.releasing = None;
         self.publish();
     }
 
-    /// The earliest retained or releasing position.
+    /// x.3.2 X3 §3.2 (r11 #1, r12 #1): the outstanding position, the
+    /// earliest retained or releasing message; the one bound every loss
+    /// snapshot (a seal's floor, retirement, the consumer's end) is floored
+    /// by, so no loss starts past an item that has not gone out whole. An
+    /// entry is `releasing` before it leaves `early` and stays so until it
+    /// went out whole or its loss was recorded; the registration's copy is
+    /// republished after every change of either.
     fn outstanding(&self) -> Option<u64> {
         let releasing = self.releasing.map(|(seq, _)| seq);
         let front = self.early.front().map(|entry| entry.seq);
@@ -1236,7 +1281,6 @@ impl Normalizing {
         }
     }
 
-    /// Publishes the outstanding position into the registration.
     fn publish(&self) {
         self.registration.publish(self.outstanding());
     }
@@ -1407,9 +1451,6 @@ impl Normalizing {
         if idle {
             idle_seam().await;
         } else {
-            // The held turn's seal is checked before the ledger is
-            // touched: a refused item is handled again with the turn
-            // closed.
             take_seam().await;
             if !delivery.take(seq) {
                 return Handled::Refused(item);
@@ -1420,8 +1461,10 @@ impl Normalizing {
         {
             return Handled::Done(false);
         }
+        // A staged charge is held through the message's whole metadata
+        // update, its denial included (§6.2), then released if unused.
+        let _unstage = Unstage(Arc::clone(&self.registration));
         let tracked = self.tracked(owner, &parsed);
-        self.registration.ledger().unstage();
         if idle && !delivery.take(seq) {
             return Handled::Done(false);
         }
@@ -1526,7 +1569,7 @@ impl Normalizing {
     /// x.3.2 X3 §6.2: reserves the charge of the ledger entry the message
     /// may insert, before the ledger is updated. The cap slot is taken at
     /// once: a full cap fails the connection `overflow` (§6.4). The budget
-    /// bytes are awaited within the stall bound (then the generation fails
+    /// bytes are awaited by the message's stall deadline (then it fails
     /// `overflow`), or until the generation fails, the registration
     /// retires or the session is cancelled. False when the wait ended
     /// without its charge: continuity is unproven and message `seq` is
@@ -1557,7 +1600,7 @@ impl Normalizing {
             () = registration.failed() => Err(false),
             () = registration.retiring.cancelled() => Err(false),
             () = self.cancel.cancelled() => Err(false),
-            charged = tokio::time::timeout(event_stall(), cap.charge(slot)) => {
+            charged = tokio::time::timeout_at(self.stall_by, cap.charge(slot)) => {
                 if charged.is_err() {
                     latch(&self.health, DriverFailure::ObservationOverflow);
                 }
@@ -1582,10 +1625,11 @@ impl Normalizing {
 
     /// x.3.2 X3 §3.4, §3.5: an observation of earlier turn `turn`, never
     /// mapped to Core, is lost, not relabeled: the loss is noted for that
-    /// turn, and a live fence it was read under reports nothing from its
-    /// position on (the gap).
+    /// turn, continuity is unproven (§6.6), and a live fence it was read
+    /// under reports nothing from its position on (the gap).
     fn lose(&mut self, delivery: &Delivery, turn: TurnNumber, (seq, mark): (u64, Option<Mark>)) {
         losses(&self.loss.losses).note_turn(turn, self.loss.generation, seq, 1);
+        self.registration.mark_incomplete();
         let live = self.held.as_ref().map(|held| held.fence);
         if let Some(mark) = mark.filter(|mark| Some(mark.fence) == live) {
             self.gap = Some(self.gap.map_or(mark.seq, |gap| gap.min(mark.seq)));
@@ -1595,10 +1639,11 @@ impl Normalizing {
 
     /// X0 item 5 steps 5 and 6, x.3.2 X3 §4.1: the generation fails
     /// `protocol` first, before any await; then the evidence goes to the
-    /// turn the message names, else to the server folder.
+    /// turn the message names, else to the server folder, and its note to
+    /// the registration for the failure's report (fix r1 #4).
     async fn malformed(&mut self, owner: Owner, bytes: &[u8]) {
-        let detail = "a message of the session's thread did not decode";
-        self.protocol(detail);
+        self.registration.note(Note::Keeping);
+        self.protocol(UNDECODED);
         let named = match owner {
             Owner::This => self
                 .held
@@ -1615,18 +1660,24 @@ impl Normalizing {
                 .unwrap_or_else(PoisonError::into_inner);
             folders.get(&turn).map(|folder| (Arc::clone(folder), what))
         });
-        match (owner, folder) {
+        let undecoded = match (owner, folder) {
             (Owner::This | Owner::Earlier(_), Some((folder, what))) => {
                 folder.keep_undecoded(bytes, what).await;
+                folder.take_undecoded()
             }
-            (Owner::This | Owner::Earlier(_), None) => {}
+            (Owner::This | Owner::Earlier(_), None) => None,
             (Owner::Unknown | Owner::Thread, _) => {
                 self.evidence
                     .server
                     .keep(bytes, "the shared connection's message")
                     .await;
+                Some(format!(
+                    "{} bytes kept as the shared connection's evidence",
+                    bytes.len()
+                ))
             }
-        }
+        };
+        self.registration.note(Note::Kept(undecoded));
     }
 
     /// A decoded notification: the running turn's, or thread-level, is
@@ -1794,8 +1845,8 @@ impl Normalizing {
     /// Hands one observation naming vendor turn `turn` to the sink under
     /// `delivery`'s seal: its room reserved outside the seal, the send
     /// made under it. `last` (with the open tools) completes the message.
-    /// A stall latches the observation overflow and fails the generation;
-    /// false once nothing more goes out.
+    /// A wait past the message's stall deadline latches the observation
+    /// overflow and fails the generation; false once nothing more goes out.
     async fn output(
         &mut self,
         delivery: &Arc<Delivery>,
@@ -1812,7 +1863,10 @@ impl Normalizing {
             let reserved = tokio::select! {
                 biased;
                 () = delivery.sealed.cancelled() => return false,
-                reserved = self.sink.reserve(&item, event_stall()) => reserved,
+                reserved = tokio::time::timeout_at(
+                    self.stall_by,
+                    self.sink.reserve(&item, self.stall_by.saturating_duration_since(Instant::now())),
+                ) => reserved.unwrap_or(Err(Undelivered::Stalled)),
             };
             reserved.map(|reserved| delivery.send(reserved, item, last))
         };
@@ -1827,6 +1881,15 @@ impl Normalizing {
         }
         admitted().await;
         true
+    }
+}
+
+/// Releases a staged charge no entry took, when dropped.
+struct Unstage(Arc<Registration>);
+
+impl Drop for Unstage {
+    fn drop(&mut self) {
+        self.0.ledger().unstage();
     }
 }
 
@@ -1850,6 +1913,16 @@ fn parse(item: &LaneItem) -> Parsed {
         }
         (LaneItem::Declined { .. }, Ok(Incoming::Request(request))) => Parsed::Request(request),
         _ => Parsed::Malformed,
+    }
+}
+
+/// Test builds: a seam between a report's seal check and its
+/// publication (Sol code r1 #9), where a test holds the report while a
+/// seal races it.
+fn report_seam() {
+    #[cfg(feature = "test-failpoints")]
+    {
+        let _ = via_routes::failpoint::hit("adapter.codex.report");
     }
 }
 
@@ -1893,8 +1966,8 @@ async fn take_seam() {
     }
 }
 
-/// Test builds: a seam between a retained entry's leaving `early` and the
-/// outstanding position's publication (x.3.2 X3 S14 (e), r12 #1).
+/// Test builds: a seam between a retained entry's leaving `early` and its
+/// publication (x.3.2 X3 S14 (e)).
 #[cfg_attr(
     not(feature = "test-failpoints"),
     expect(clippy::unused_async, reason = "only test builds wait at the seam")
@@ -2615,7 +2688,7 @@ mod tests {
     fn protocol() -> DriverFailure {
         DriverFailure::Route(RouteError::Protocol {
             turn: turn(2),
-            detail: "a message of the session's thread did not decode",
+            detail: super::UNDECODED,
         })
     }
 
@@ -2706,8 +2779,14 @@ mod tests {
                 .is_none(),
             "nothing is admitted on a failed generation"
         );
+        // Its note waits for the held keep (fix r1 #4) and resolves empty
+        // once the consumer is gone.
+        let note = tokio::time::timeout(Duration::from_millis(50), run.registration.undecoded());
+        assert!(note.await.is_err(), "the note waits for its keep");
         drop((second, third));
         consumer.abort();
+        let _aborted = consumer.await;
+        assert_eq!(run.registration.undecoded().await, None);
     }
 
     /// x.3.2 X3 S5 (F3): a driver dropped without close retires its

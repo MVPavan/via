@@ -18,15 +18,16 @@ use via_routes::codex::{
     VendorMessage,
 };
 
-use super::super::driver::RetireGuard;
+use super::super::driver::{RetireGuard, with_undecoded};
 use super::{
     Admission, CONTRADICTED, Delivery, Drained, Evidence, Folders, LossRecord, Losses, Normalizing,
-    ObservationLoss, Registration, ServerEvidence, StartCx, Stop, UNKNOWN,
+    ObservationLoss, Registration, ServerEvidence, StartCx, Stop, UNDECODED, UNKNOWN,
 };
 use crate::driver::DriverState;
 use crate::observation::{Admitted, Observation, ObservationItem, SessionCap, observation_channel};
 use crate::{
-    DriverFailure, DriverHealth, RouteError, TurnActivity, TurnNumber, VendorTerminalStatus,
+    AdapterError, DriverFailure, DriverHealth, RouteError, RouteFailure, TurnActivity, TurnEnd,
+    TurnNumber, VendorTerminalStatus,
 };
 
 const THREAD: &str = "thread-1";
@@ -267,8 +268,13 @@ fn tool_started(named: &str, id: &str) -> Value {
 
 /// Vendor turn `named`'s command item completed `declined`.
 fn denial(named: &str) -> Value {
+    denied(named, "item-denied")
+}
+
+/// Vendor turn `named`'s command item `id` completed `declined`.
+fn denied(named: &str, id: &str) -> Value {
     json!({"method": "item/completed", "params": {"threadId": THREAD, "turnId": named,
-        "item": {"type": "commandExecution", "id": "item-denied", "command": "rm -rf build",
+        "item": {"type": "commandExecution", "id": id, "command": "rm -rf build",
             "cwd": "/w", "commandActions": [], "status": "declined"}}})
 }
 
@@ -337,11 +343,17 @@ fn monotone(observed: &[ObservationItem]) -> bool {
 #[cfg(feature = "test-failpoints")]
 /// Pauses the consumer at `point`'s first hit; the directory arms it.
 fn pause_at(point: &str) -> tempfile::TempDir {
+    pause_at_hit(point, 1)
+}
+
+#[cfg(feature = "test-failpoints")]
+/// Pauses at `point`'s `hit`th hit; the directory arms it.
+fn pause_at_hit(point: &str, hit: u32) -> tempfile::TempDir {
     use std::os::unix::fs::PermissionsExt;
     const TOKEN: &str = "codex-consumer-tests";
     let points = tempfile::tempdir().unwrap();
     std::fs::set_permissions(points.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let command = json!({"token": TOKEN, "occurrence": 1, "action": "pause"});
+    let command = json!({"token": TOKEN, "occurrence": hit, "action": "pause"});
     std::fs::write(
         points.path().join(format!("{point}.json")),
         command.to_string(),
@@ -354,7 +366,13 @@ fn pause_at(point: &str) -> tempfile::TempDir {
 #[cfg(feature = "test-failpoints")]
 /// Waits until the consumer paused at `point`.
 async fn reached(points: &tempfile::TempDir, point: &str) {
-    let ack = points.path().join(format!("{point}.1.ack"));
+    reached_hit(points, point, 1).await;
+}
+
+#[cfg(feature = "test-failpoints")]
+/// Waits until `point` paused at its `hit`th hit.
+async fn reached_hit(points: &tempfile::TempDir, point: &str, hit: u32) {
+    let ack = points.path().join(format!("{point}.{hit}.ack"));
     tokio::time::timeout(Duration::from_secs(5), async {
         while !ack.exists() {
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -366,7 +384,12 @@ async fn reached(points: &tempfile::TempDir, point: &str) {
 
 #[cfg(feature = "test-failpoints")]
 fn release(points: &tempfile::TempDir, point: &str) {
-    std::fs::write(points.path().join(format!("{point}.1.release")), b"").unwrap();
+    release_hit(points, point, 1);
+}
+
+#[cfg(feature = "test-failpoints")]
+fn release_hit(points: &tempfile::TempDir, point: &str, hit: u32) {
+    std::fs::write(points.path().join(format!("{point}.{hit}.release")), b"").unwrap();
 }
 
 /// x.3.2 X3 S3 (r8 #5): after `Start(B)`, earlier turn A's late decline
@@ -425,6 +448,10 @@ async fn s3b_a_pending_turns_fence_stops_at_a_loss() {
         })
     );
     assert_eq!(b.activity.delivered(), 0, "the frontier stays below n");
+    assert!(
+        fixture.registration.incomplete(),
+        "a message recorded as loss leaves continuity unproven (§6.6)"
+    );
 }
 
 /// x.3.2 X3 S7, the consumer's side: a placeholder routed before the cut
@@ -535,6 +562,11 @@ async fn s8a_a_pending_seal_loses_the_retained_item() {
     let b = fixture.start(2);
     fixture.push(message(&tool_started(B, "tool-b"), 5, (Some(B), None)));
     fixture.settle().await;
+    assert_eq!(
+        fixture.registration.outstanding(),
+        Some(5),
+        "the item is retained"
+    );
     b.delivery.seal();
     fixture.settle().await;
     fixture.reply(2, Some(B));
@@ -1171,6 +1203,43 @@ fn r7_7_no_report_follows_a_seal() {
     assert_eq!(activity.delivered(), 2);
 }
 
+/// Sol code r1 #9, design §10: a seal racing a report waits for its
+/// publication. With the report paused between its seal check and its
+/// publication, a seal on another thread blocks until the report is
+/// released; then the report has published.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn r1_9_a_racing_seal_waits_for_the_report() {
+    const POINT: &str = "adapter.codex.report";
+    let points = pause_at_hit(POINT, 1);
+    let delivery = Delivery::new(4);
+    let activity = TurnActivity::new(Instant::now());
+    let reporter = {
+        let (delivery, activity) = (Arc::clone(&delivery), activity.clone());
+        std::thread::spawn(move || delivery.report(&activity, 2))
+    };
+    let ack = points.path().join(format!("{POINT}.1.ack"));
+    while !ack.exists() {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let (done, waited) = std::sync::mpsc::channel();
+    let sealer = {
+        let delivery = Arc::clone(&delivery);
+        std::thread::spawn(move || {
+            delivery.seal();
+            done.send(()).unwrap();
+        })
+    };
+    assert!(
+        waited.recv_timeout(Duration::from_millis(200)).is_err(),
+        "the seal waits for the paused report"
+    );
+    release_hit(&points, POINT, 1);
+    assert!(reporter.join().unwrap(), "the report published");
+    sealer.join().unwrap();
+    assert_eq!(activity.delivered(), 2);
+}
+
 /// x.3.2 X3 §4.4: a generation failure drops the markers the lane still
 /// holds and their credit with them, and the consumer ends
 /// `ConsumerFailed`.
@@ -1199,4 +1268,234 @@ async fn failed_disposal_drops_markers_and_credit() {
     assert_eq!(drained, Some(Drained::ConsumerFailed));
     assert_eq!(fixture.cap.held().0, held + 1, "B's credit is released");
     assert!(b.delivery.decided(), "the failure stopped admitted B");
+}
+
+/// Sol code r1 #1, x.3.2 X3 §3.2: a lane that overflowed while B is
+/// pending fails the generation before B's queued `Reply` is taken. With
+/// the consumer held after `Start(B)`, B's early item and a fitting
+/// `Reply(B)` are queued, then the lane overflows: no acceptance goes out
+/// and B's frontier stays.
+#[cfg(feature = "test-failpoints")]
+#[tokio::test]
+async fn r1_1_an_overflow_precedes_a_pending_reply() {
+    const POINT: &str = "adapter.codex.idle_check";
+    let points = pause_at_hit(POINT, 2);
+    let mut fixture = Fixture::new();
+    let b = fixture.start(2);
+    reached_hit(&points, POINT, 2).await;
+    fixture.push(message(&tool_started(B, "tool-b"), 5, (Some(B), None)));
+    fixture.reply(2, Some(B));
+    let mut seq = 7;
+    while fixture
+        .lane
+        .push(message(&delta(B), seq, (Some(B), None)), 64)
+    {
+        seq += 1;
+    }
+    assert!(fixture.lane.overflowed_now());
+    release_hit(&points, POINT, 2);
+    fixture.settle().await;
+    assert_eq!(
+        fixture.registration.failure(),
+        Some(DriverFailure::Route(RouteError::Overflow { turn: turn(2) }))
+    );
+    assert!(fixture.observed().is_empty(), "no acceptance");
+    assert_eq!(b.activity.delivered(), 0);
+}
+
+/// Sol code r1 #4, X0 item 5: a malformed thread-level message fails the
+/// generation `protocol`; once its evidence is kept, running B's reported
+/// failure names the shared connection's evidence and its byte count. A
+/// protocol failure of another cause names none.
+#[tokio::test]
+async fn r1_4_a_malformed_message_is_named_by_the_failure() {
+    let fixture = Fixture::new();
+    let _b = fixture.start(2);
+    fixture.reply(2, Some(B));
+    // Past the full decode's nesting bound (64), within the peek's.
+    let line = json!({"method": "thread/status/changed", "params": {"threadId": THREAD,
+        "status": {"type": "idle"},
+        "nested": serde_json::from_str::<Value>(&format!("{}{}", "[".repeat(80), "]".repeat(80))).unwrap()}});
+    let bytes = line.to_string().len() + 1;
+    fixture.push(message(&line, 5, (None, None)));
+    fixture.settle().await;
+    let detail = UNDECODED;
+    assert_eq!(
+        fixture.registration.failure(),
+        Some(DriverFailure::Route(RouteError::Protocol {
+            turn: turn(2),
+            detail
+        }))
+    );
+    let reported = |detail| TurnEnd {
+        terminal: None,
+        instance: None,
+        leftovers: None,
+        outcome: Err(AdapterError::Route(RouteFailure {
+            cause: RouteError::Protocol {
+                turn: turn(2),
+                detail,
+            },
+            undecoded: None,
+            exit: None,
+            launched: true,
+            cleanup: Some(WireCleanup::Uncertain),
+            forced: false,
+            journal_uncertain: false,
+            acknowledged: false,
+            shared: true,
+        })),
+    };
+    let undecoded = |end: TurnEnd| match end.outcome {
+        Err(AdapterError::Route(failure)) => failure.undecoded,
+        _ => panic!("a route failure"),
+    };
+    let end = with_undecoded(reported(detail), &fixture.registration).await;
+    assert_eq!(
+        undecoded(end),
+        Some(format!(
+            "{bytes} bytes kept as the shared connection's evidence"
+        ))
+    );
+    let end = with_undecoded(reported(CONTRADICTED), &fixture.registration).await;
+    assert_eq!(undecoded(end), None);
+}
+
+/// Takes `items` through the consumer in lane-sized batches, draining
+/// what goes out.
+async fn pump(fixture: &mut Fixture, items: impl IntoIterator<Item = LaneItem>) {
+    let mut items = items.into_iter().peekable();
+    while items.peek().is_some() {
+        for item in items.by_ref().take(8) {
+            fixture.push(item);
+        }
+        while fixture.lane.charged().0 > 0 {
+            tokio::task::yield_now().await;
+            fixture.observed();
+        }
+    }
+    fixture.settle().await;
+}
+
+/// Sol code r1 #6, x.3.2 X3 §6.2: at a full cap (B's credit and 1,023
+/// open tools), B's declined completion of an open tool judges its denial
+/// in that tool's entry: no further slot, no overflow, the denial out.
+#[tokio::test]
+async fn r1_6_a_denial_at_a_full_cap_keeps_its_entry() {
+    let mut fixture = Fixture::new();
+    let _b = fixture.start(2);
+    fixture.reply(2, Some(B));
+    fixture.settle().await;
+    let tools = (0..1023u64).map(|n| {
+        message(
+            &tool_started(B, &format!("t{n}")),
+            10 + n,
+            (Some(B), Some(2)),
+        )
+    });
+    pump(&mut fixture, tools).await;
+    assert_eq!(fixture.cap.held().0, 1024, "the cap is full");
+    fixture.push(message(&denied(B, "t0"), 2000, (Some(B), Some(2))));
+    fixture.settle().await;
+    assert_eq!(fixture.registration.failure(), None);
+    let kinds: Vec<_> = kinds(&fixture.observed())
+        .into_iter()
+        .map(|(kind, _, _)| kind)
+        .collect();
+    assert_eq!(
+        kinds,
+        ["progress", "denied"],
+        "its completion, then its denial"
+    );
+    assert_eq!(fixture.cap.held().0, 1024);
+}
+
+/// Sol code r1 #6, x.3.2 X3 §6.2: the charge reserved for a declined
+/// completion's denial entry is held through the whole metadata update:
+/// a competing waiter queued behind it never takes it between the
+/// completion and the denial.
+#[tokio::test]
+async fn r1_6_a_reserved_charge_reaches_its_denial() {
+    let mut fixture = Fixture::new();
+    let _b = fixture.start(2);
+    fixture.reply(2, Some(B));
+    fixture.settle().await;
+    fixture.observed();
+    let mut full = fixture.cap.fill_budget().unwrap();
+    fixture.push(message(&denied(B, "tool-b"), 6, (Some(B), Some(2))));
+    fixture.settle().await;
+    let cap = fixture.cap.clone();
+    let competitor = tokio::spawn(async move {
+        let slot = cap.slot("tool-b".len()).unwrap();
+        cap.charge(slot).await.is_some()
+    });
+    fixture.settle().await;
+    // The entry's bytes: its key and 64 B.
+    drop(full.split("tool-b".len() + 64).unwrap());
+    fixture.settle().await;
+    assert_eq!(fixture.registration.failure(), None);
+    assert!(!competitor.is_finished(), "the competitor still waits");
+    drop(full);
+    fixture.settle().await;
+    let kinds: Vec<_> = kinds(&fixture.observed())
+        .into_iter()
+        .map(|(kind, _, _)| kind)
+        .collect();
+    assert_eq!(
+        kinds,
+        ["progress", "denied"],
+        "its completion, then its denial"
+    );
+    assert!(competitor.await.unwrap());
+}
+
+/// Sol code r1 #5, x.3.2 X3 §6.2: one absolute stall deadline covers a
+/// message's ledger wait and its sink waits. B's tool start waits 300 ms
+/// for its entry's bytes, then for the sink's: the generation fails at
+/// the message's deadline (stall 400 ms), not a fresh one after the
+/// ledger wait.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn r1_5_one_stall_deadline_covers_a_message() {
+    const NAME: &str = "codex::delivery::consumer_tests::r1_5_one_stall_deadline_covers_a_message";
+    if std::env::var_os("VIA_TEST_EVENT_STALL_MS").is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture"])
+            .env("VIA_TEST_EVENT_STALL_MS", "400")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let mut fixture = Fixture::new();
+        let _b = fixture.start(2);
+        fixture.reply(2, Some(B));
+        fixture.settle().await;
+        fixture.observed();
+        let mut full = fixture.cap.fill_budget().unwrap();
+        let started = Instant::now();
+        fixture.push(message(&tool_started(B, "tool-b"), 6, (Some(B), Some(2))));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(fixture.registration.failure(), None, "the ledger waits");
+        drop(full.split("tool-b".len() + 64).unwrap());
+        let failed = tokio::time::timeout(Duration::from_secs(3), async {
+            while fixture.registration.failure().is_none() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Instant::now()
+        })
+        .await
+        .unwrap();
+        let elapsed = failed - started;
+        assert!(
+            elapsed >= Duration::from_millis(390) && elapsed < Duration::from_millis(600),
+            "the message failed {elapsed:?} after its read"
+        );
+        drop(full);
+    });
 }

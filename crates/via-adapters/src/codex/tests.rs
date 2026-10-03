@@ -1593,3 +1593,102 @@ fn the_start_gate_has_no_stall_arm() {
         assert_eq!(cap.held().0, 1);
     });
 }
+
+/// Sol code r1 #2, x.3.2 X3 §4.3: 15 thread messages are queued and B's
+/// `Start` fills the 16th slot, so B's reply cannot queue its `Reply`
+/// (the lane overflows), though the response is paired; the consumer
+/// failed the generation before the driver polls. A paired refusal then
+/// ends through the failure, launched (cleanup uncertain), never
+/// `Rejected`; a paired acceptance is recovered, so its cleanup interrupt
+/// names its vendor ID.
+#[tokio::test]
+async fn a_paired_reply_under_a_failed_generation() {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use serde_json::value::RawValue;
+    use tokio::sync::{oneshot, watch};
+    use tokio_util::sync::CancellationToken;
+    use via_routes::SendOutcome;
+    use via_routes::codex::{
+        BoundedBytes, Lane, LaneItem, RequestId, Response, Routed, RpcError, VendorMessage,
+    };
+
+    use super::delivery::{LossRecord, Losses, Registration};
+    use super::driver::{Orders, Unanswered, await_reply};
+    use crate::observation::{SessionCap, observation_channel};
+    use crate::{Deadline, DecodeWatermark, DriverFailure, DriverHealth, RouteError};
+
+    for accepted in [false, true] {
+        let (sink, _received) = observation_channel();
+        let registration = Registration::new(4, SessionCap::new(&sink));
+        let lane = Arc::new(Lane::default());
+        let b = TurnNumber::try_from(2).unwrap();
+        for seq in 0..15 {
+            let status = b"{\"method\":\"thread/status/changed\",\"params\":{}}\n".to_vec();
+            let routed = Routed {
+                staged: VendorMessage::new(BoundedBytes::try_from_message(status).unwrap()),
+                seq,
+                turn: None,
+                owner: None,
+                at: Instant::now(),
+                mark: None,
+            };
+            assert!(lane.push(LaneItem::Message(routed), 64));
+        }
+        assert!(lane.push_start(b, DecodeWatermark::default(), Box::new(())));
+        let (_, pushed) = lane.push_reply(b, Instant::now(), accepted.then(|| "vendor-b".into()));
+        assert!(!pushed && lane.overflowed_now(), "the reply overflows");
+        let health = watch::Sender::new(DriverHealth::Open);
+        let loss = LossRecord {
+            losses: Arc::new(Mutex::new(Losses::default())),
+            generation: 1,
+        };
+        let cause = DriverFailure::Route(RouteError::Overflow { turn: b });
+        registration.fail(&cause, (&health, &lane, &loss));
+        let outcome = if accepted {
+            Ok(RawValue::from_string("{\"turn\":{\"id\":\"vendor-b\"}}".into()).unwrap())
+        } else {
+            Err(RpcError {
+                code: -32600,
+                message: "refused".into(),
+            })
+        };
+        let (written_set, written) = oneshot::channel();
+        written_set.send(SendOutcome::Written).unwrap();
+        let (paired, reply) = oneshot::channel();
+        paired
+            .send(Response {
+                id: RequestId::Int(7),
+                outcome,
+                contradicted: false,
+            })
+            .unwrap();
+        let (_stop, stop) = watch::channel(None);
+        let (_close, close) = watch::channel(None);
+        let (_force, mut force) = watch::channel(None);
+        let mut orders = Orders {
+            stop,
+            close,
+            wall: Deadline::at(Instant::now() + Duration::from_secs(60)),
+            cancel: CancellationToken::new(),
+        };
+        let ended = await_reply(
+            (written, reply),
+            (
+                &mut orders,
+                &mut force,
+                Some((lane.as_ref(), &*registration)),
+            ),
+            &mut |_| {},
+        )
+        .await;
+        let recovered = matches!(&ended, Ok(response) if response.outcome.is_ok());
+        let failed = matches!(&ended, Err(Unanswered::Generation { cause: failed, launched: true })
+            if *failed == cause);
+        assert!(
+            if accepted { recovered } else { failed },
+            "accepted {accepted}: another end"
+        );
+    }
+}

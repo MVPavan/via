@@ -1700,6 +1700,22 @@ fn codex_start_order() {
     expect["sessions"]["main"]["close"]["cleanup"] = json!("uncertain");
     variant(name, &replay, &expect).unwrap();
 
+    // x.3.2 X3 S8 seal variant (a), Sol code r1 #7: the turn's early item
+    // is retained while its reply is lost; its wall seals it pending. The
+    // item never goes out and the turn's own cleanup is unproven.
+    let name = "codex_start_order_retained_then_wall";
+    let (mut replay, _) = plain(name).unwrap();
+    let mut inserted = vec![emit(&json!({"method": "item/started", "params": {
+        "threadId": THREAD, "turnId": TURN,
+        "item": {"type": "commandExecution", "id": "tool-early", "command": "sleep 1",
+            "cwd": "/work/project", "commandActions": [], "status": "inProgress"}}}))];
+    inserted.extend(tail);
+    cut_after(&mut replay, start, &inserted).unwrap();
+    expect["source"] = replay["source"].clone();
+    turn_mut(&mut expect, 0)["expect"]["observations_exclude"] =
+        json!(["turn.accepted", "final_text", "progress"]);
+    variant(name, &replay, &expect).unwrap();
+
     // A malformed turn/completed of the turn, its correlation intact (X0
     // item 5 step 5): the turn fails `protocol`, the connection lives.
     let (mut replay, mut expect) = plain("codex_start_order_malformed").unwrap();
@@ -3813,20 +3829,47 @@ fn codex_contradicted_refusal_fails_the_generation() {
     variant(name, &replay, &expect).unwrap();
 }
 
-/// S13 with the consumer held at its loop top until the driver took the
-/// refusal: the driver alone reads the contradiction from the reply, and
-/// the outcome is the same.
+/// S13 with the consumer held at its loop top, from the thread's open
+/// until the driver failed the generation at the refusal (Sol code r1
+/// #8): the driver alone reads the contradiction from the reply, and the
+/// outcome is the same.
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn codex_contradicted_refusal_before_the_consumer() {
     let name = "codex_contradicted_refusal_before_the_consumer";
     let (replay, expect) = contradicted_refusal(name).unwrap();
-    let _points = armed(
-        "adapter.codex.idle_check",
-        json!({"occurrence": 1, "action": "delay", "value": 1500}),
-    )
+    let points = armed_all(&[
+        (
+            "adapter.codex.idle_check",
+            json!({"occurrence": 1, "action": "pause"}),
+        ),
+        (
+            "adapter.codex.contradicted",
+            json!({"occurrence": 1, "action": "delay", "value": 0}),
+        ),
+    ])
     .unwrap();
+    let dir = points.path().join("points");
+    let holder = std::thread::spawn(move || {
+        let marker = |name: &str| dir.join(name);
+        let by = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !marker("adapter.codex.contradicted.1.ack").exists() && std::time::Instant::now() < by
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let order = (
+            marker("adapter.codex.idle_check.1.ack").exists(),
+            marker("adapter.codex.contradicted.1.ack").exists(),
+        );
+        std::fs::write(marker("adapter.codex.idle_check.1.release"), b"").unwrap();
+        order
+    });
     variant(name, &replay, &expect).unwrap();
+    assert_eq!(
+        holder.join().unwrap(),
+        (true, true),
+        "the consumer was held until the driver failed the generation"
+    );
 }
 
 /// The S13 schedule: an item naming the unmapped turn, then the refusal.
