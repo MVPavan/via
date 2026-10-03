@@ -14,11 +14,12 @@ Owner-approval issue `via-jm4.10` closed before feature dispatch.
 | S2 | `via-p98` | Claude Code adapter | Verified S1 plus Claude design review | deep |
 | S3 | `via-5lr` | Codex adapter | Verified S1 plus Codex design review | deep |
 | S5 | `via-4sw` | OpenCode adapter | Verified S1 plus OpenCode design review | deep |
-| S4 | `via-gvg` | Cross-adapter control/recovery hardening | Three reviewed adapters | deep |
+| S6 | `via-jt8` | Pi adapter (owner, 2026-10-03), built side by side with S5 | Verified S1 plus Pi evidence, vendor packet and design review | deep |
+| S4 | `via-gvg` | Cross-adapter control/recovery hardening | Four reviewed adapters | deep |
 | P1 | `via-pvj` | Linux platform and packaging; macOS design retained, artifact/native gates deferred under `via-pvj.4` | Platform design review plus S1 for runtime changes | deep |
 | R1 | `via-d9o` | Verified local release candidate | Four adapters, S4, required Linux platform gates, docs and evidence | deep |
 
-These are seven top-level epics, not one four-level release hierarchy. Existing
+These are eight top-level epics, not one four-level release hierarchy. Existing
 foundation records are retained. `via-jm4.3` and `.6` aggregate evidence and
 decision outcomes owned by the new vendor tasks; they do not commission duplicate
 work. `via-jm4.1`, `.2`, `.4` and `.5` retain completed S0 history. `via-jm4.8`
@@ -132,6 +133,21 @@ Governing sources: [goal.md](goal.md), `docs/specs/via-api-v1.md`, `docs/specs/a
 
 Exit (S5): OpenCode implements all supported C1 operations; declared capabilities match fake and live evidence; reviews and required fixes pass. Close only when required descendants and evidence are complete.
 Test focus: pinned OpenAPI/SSE, server/database ownership, bounds and network refusal. Risk: deep.
+
+## [S6] Pi adapter and conformance — `via-jt8`
+
+Goal: Pi implements all supported C1 operations; declared capabilities match fake and live evidence; reviews and required fixes pass. Added by owner, 2026-10-03, and built side by side with S5 so C2 gaps found by either are fixed once.
+
+Governing sources: [goal.md](goal.md), `docs/specs/via-api-v1.md`, `docs/specs/adapter-contract.md`, plus `docs/specs/vendors/pi.md` once reviewed.
+
+| Task / subtask | Work | Owned scope | Verify |
+|---|---|---|---|
+| `via-jt8.1` | Pi: pinned protocol and behavior evidence | isolated scratchpad probes of the installed `pi` | Versioned raw evidence for RPC/JSON modes, sessions, abort/steer, usage, errors, shutdown, trust, tools and isolation; model-dependent probes use a free provider. |
+| `via-jt8.2` | Pi: settle adapter contract decisions | `docs/specs/vendors/pi.md`; shared specs through coordinator | Route, bounds, structured output, resume, controls and cleanup decided and reviewed; C2 gaps reconciled with S5. |
+| `via-jt8.3` | Pi: implement and verify adapter | planned crates/via-adapters/src/pi, crates/via-routes/src/pi, vendor fixtures; shared files coordinator-owned | Real adapter/route passes fake conformance and live supported operations, fixes reviewed; no integration regression. |
+| `via-jt8.3.1`–`.3.4` | fixtures, implementation, review and live verification, free-provider qualification | as `via-4sw.3.1`–`.3.4` | as `via-4sw.3.1`–`.3.4`, with live checks on a free OpenCode Zen model. |
+
+Exit (S6): as S5, for Pi. Risk: deep.
 
 ## [S4] Cross-adapter control and recovery hardening — `via-gvg`
 
