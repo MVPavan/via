@@ -16,8 +16,9 @@ use std::{
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, MutexGuard};
 use via_store::{
-    BlobRef, EventRecord, QueuedTurn, SessionEventRecord, SessionIdentity, StoreClient, StoreError,
-    StoredEvent, SubmissionRecord, TerminalExtras, TerminalFacts, TerminalRecord,
+    BlobRef, EventRecord, QueuedTurn, SessionEventRecord, SessionIdentity, SteerOutcome,
+    StoreClient, StoreError, StoredEvent, SubmissionRecord, TerminalExtras, TerminalFacts,
+    TerminalRecord,
 };
 
 use super::latch::{FailureSite, Signal, WriteOutcome};
@@ -394,7 +395,18 @@ pub(super) async fn commit_event_as(
     record: &mut TurnRecord,
     body: EventBody,
     at: &str,
-    (turn, late): (Option<u32>, bool),
+    attributed: (Option<u32>, bool),
+) -> Option<u64> {
+    commit_event_keyed(journal, record, (body, at, attributed), None).await
+}
+
+/// [`commit_event_as`] with a keyed steer's outcome, recorded in the
+/// event's transaction: its `steer.delivered` (C1 §3.4).
+pub(super) async fn commit_event_keyed(
+    journal: &impl TurnJournal,
+    record: &mut TurnRecord,
+    (body, at, (turn, late)): (EventBody, &str, (Option<u32>, bool)),
+    steer: Option<SteerOutcome>,
 ) -> Option<u64> {
     if record.first_failure.is_some() {
         return None;
@@ -437,6 +449,7 @@ pub(super) async fn commit_event_as(
             session_id: record.session.clone(),
             turn: record.turn,
             event: event.clone(),
+            steer,
         })
         .await;
     if let Err(error) = committed {
@@ -475,8 +488,19 @@ pub(super) enum SessionWrite {
 pub(super) async fn commit_session_event(
     store: &StoreClient,
     (head, session): (&Head, &SessionId),
-    (body, at, (turn, late)): (EventBody, &str, (Option<u32>, bool)),
+    event: (EventBody, &str, (Option<u32>, bool)),
     identity: Option<SessionIdentity>,
+) -> SessionWrite {
+    commit_session_event_with(store, (head, session), event, (identity, None)).await
+}
+
+/// [`commit_session_event`] with a keyed steer's outcome, recorded in the
+/// event's transaction: its `steer.delivered` (C1 §3.4).
+pub(super) async fn commit_session_event_with(
+    store: &StoreClient,
+    (head, session): (&Head, &SessionId),
+    (body, at, (turn, late)): (EventBody, &str, (Option<u32>, bool)),
+    (identity, steer): (Option<SessionIdentity>, Option<SteerOutcome>),
 ) -> SessionWrite {
     let head = match head.lock(store, session).await {
         Ok(head) => head,
@@ -498,6 +522,7 @@ pub(super) async fn commit_session_event(
         session_id: session.clone(),
         event: Some(event),
         identity,
+        steer,
     };
     let committed = if record.identity.is_some() {
         store.commit_identity(record).await
@@ -534,6 +559,7 @@ pub(super) async fn commit_identity_columns(
         session_id: session.clone(),
         event: None,
         identity: Some(identity),
+        steer: None,
     };
     match store.commit_identity(record).await {
         Ok(()) => SessionWrite::Committed,

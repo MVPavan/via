@@ -77,6 +77,12 @@ impl Engine {
         let store_error = |error| format!("store_error: {error}");
         self.store.verify_blobs().await.map_err(store_error)?;
         self.store.sweep_blobs().await.map_err(store_error)?;
+        // K2 (C1 §3.4): a keyed steer a previous daemon left without an
+        // outcome gets the uncertain one; its input is never sent again.
+        self.store
+            .resolve_steer_intents(super::steer::uncertain())
+            .await
+            .map_err(store_error)?;
         let deadline = Deadline::at(tokio::time::Instant::now() + HOST_RECOVERY);
         let reconciled = self.reconcile(deadline).await?;
         let mut recovered = 0;

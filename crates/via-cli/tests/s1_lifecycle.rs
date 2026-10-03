@@ -1035,7 +1035,7 @@ fn s1_f11_newer_store_in_a_wal_without_shm_refused() -> TestResult {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
         )?
         .pragma_query_value(None, "user_version", |row| row.get(0))?;
-        check(main == 9, || format!("the main file says v{main}"))?;
+        check(main == 10, || format!("the main file says v{main}"))?;
         let before = snapshot(&sandbox.state)?;
         let mut command = sandbox.command();
         command.arg("daemon");

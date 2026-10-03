@@ -1,6 +1,6 @@
-//! Task 4 design §6.6, runtime §6: the schema, v9 since server-owned
-//! anchors and the turn → server-anchor link (v8: each turn's recorded
-//! instance), is frozen by a golden DDL.
+//! Task 4 design §6.6, runtime §6: the schema, v10 since keyed `steer`
+//! operation rows and the partial index on the open ones (v9: server-owned
+//! anchors and the turn → server-anchor link), is frozen by a golden DDL.
 #![expect(
     clippy::unwrap_used,
     reason = "test fixtures and assertions fail loudly"
@@ -11,7 +11,7 @@ use std::{fs, os::unix::fs::PermissionsExt};
 use tempfile::TempDir;
 use via_store::Store;
 
-/// The v9 schema: every `sqlite_master` entry as `type name tbl_name sql`,
+/// The v10 schema: every `sqlite_master` entry as `type name tbl_name sql`,
 /// with the SQL's whitespace collapsed. Changing it is a schema change.
 const GOLDEN: &[(&str, &str, &str, &str)] = &[
     (
@@ -31,6 +31,12 @@ const GOLDEN: &[(&str, &str, &str, &str)] = &[
         "events_turn",
         "events",
         "CREATE INDEX events_turn ON events(session_id,turn,seq)",
+    ),
+    (
+        "index",
+        "operations_open_steers",
+        "operations",
+        "CREATE INDEX operations_open_steers ON operations(session_id,op_key) WHERE verb='steer' AND result IS NULL",
     ),
     (
         "index",
@@ -78,11 +84,11 @@ const GOLDEN: &[(&str, &str, &str, &str)] = &[
         "operations",
         "operations",
         "CREATE TABLE operations ( session_id TEXT NOT NULL REFERENCES sessions(id), \
-         op_key TEXT NOT NULL, verb TEXT NOT NULL CHECK(verb IN ('resume','close')), \
+         op_key TEXT NOT NULL, verb TEXT NOT NULL CHECK(verb IN ('resume','close','steer')), \
          identity_len INTEGER NOT NULL, identity_sha256 BLOB NOT NULL \
          CHECK(length(identity_sha256)=32), turn INTEGER, result TEXT, \
          PRIMARY KEY(session_id,op_key), \
-         CHECK(verb='close' OR (turn IS NOT NULL AND result IS NOT NULL)), \
+         CHECK(verb IN ('close','steer') OR (turn IS NOT NULL AND result IS NOT NULL)), \
          FOREIGN KEY(session_id,turn) REFERENCES turns(session_id,number))",
     ),
     (
@@ -156,17 +162,17 @@ fn collapse(sql: &str) -> String {
     sql.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Design §6.6, runtime §6: a fresh Store is v9 exactly as frozen here, with the
+/// Design §6.6, runtime §6: a fresh Store is v10 exactly as frozen here, with the
 /// `session_ord` counter at `(1, 0)` and the evidence root beside it.
 #[test]
-fn s1_store_v9_schema_is_frozen() {
+fn s1_store_v10_schema_is_frozen() {
     let root = private_dir();
     drop(Store::open(root.path()).unwrap());
     let conn = rusqlite::Connection::open(root.path().join("store.sqlite3")).unwrap();
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
     let mut query = conn
         .prepare("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name")
         .unwrap();

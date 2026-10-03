@@ -49,6 +49,8 @@ POINTS = [
     "store.commit.session_closed",
     "store.commit.closing",
     "store.commit.closed",
+    "store.commit.steer_intent",
+    "store.commit.steer_outcome",
     "store.commit.fail_persistent",
     "store.journal.anchor_intent",
     "store.journal.identified",
@@ -79,6 +81,8 @@ POINTS = [
     "core.cancel.settling",
     "core.run.idle_expired",
     "core.cancel.ordered",
+    # x.3.2 K2: a keyed steer's report about to commit with its outcome.
+    "core.steer.before_outcome",
     # Task 3 S3 (design §6, §10): daemon lifecycle seams.
     "daemon.startup.after_lock",
     "daemon.dispatcher.before_start",

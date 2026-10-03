@@ -199,6 +199,27 @@ impl Paths {
         }
     }
 
+    /// Starts the client command `args` with the test handle without
+    /// waiting: its reply may never come.
+    fn client_pending(&self, evidence: &Evidence, name: &str, args: &[&str]) -> PendingClient<'_> {
+        let stdout = evidence.dir.join(format!("{name}.stdout"));
+        let stderr = evidence.dir.join(format!("{name}.stderr"));
+        let mut command = self.command();
+        command
+            .args(args)
+            .env("VIA_HANDLE", HANDLE)
+            .stdin(Stdio::null());
+        let child = File::create(&stdout)
+            .and_then(|out| Ok((out, File::create(&stderr)?)))
+            .and_then(|(out, err)| command.stdout(out).stderr(err).spawn());
+        PendingClient {
+            child: Some(child),
+            stdout,
+            stderr,
+            teardown: &self.teardown,
+        }
+    }
+
     /// A consistent read-only view of the committed rows the scenario asserts.
     fn store(&self) -> Result<rusqlite::Connection, ScenarioError> {
         let store = rusqlite::Connection::open_with_flags(
@@ -2742,4 +2763,154 @@ fn s1_t2d_recovery_deadline_counts_unread_unproven_anchors() -> TestResult {
         let _daemon = Daemon::start(paths, evidence, "final")?;
         completes_normally(paths, evidence).map(drop)
     })
+}
+
+/// The fake profile with native steer (C1 §3.4).
+fn steer_profile() -> Value {
+    json!({"capabilities": {
+        "verbs": {"spawn":{"support":"native"},"resume":{"support":"native"},
+                  "steer":{"support":"native"},"cancel":{"support":"native"},
+                  "close":{"support":"native"}},
+        "params": {"instructions":{"support":"unsupported","reason":"no instructions input"},
+                   "output_schema":{"support":"unsupported","reason":"no schema input"},
+                   "effort":{"support":"unsupported","reason":"no effort setting"},
+                   "max_steps":{"support":"unsupported","reason":"no step limit"}},
+        "bounds": [], "network_control": false,
+        "recover": {"support":"unsupported","reason":"no recovery"},
+        "usage": {"tokens":"turn","cost":"unavailable"}
+    }})
+}
+
+/// Turn 1 (`k2`) takes a steer and reports its delivery.
+fn keyed_steer_fixture() -> Value {
+    let emit = |message: Value| json!({"action":"emit","message":message});
+    let terminal = |turn: &str| {
+        emit(
+            json!({"type":"terminal","vendor_turn_id":turn,"status":"completed",
+                    "final_text":"done","stop_reason":"end_turn"}),
+        )
+    };
+    json!({"profile": steer_profile(), "scripts": [
+        {"expected_request":{"type":"start","prompt":"k2"},"steps":[
+            emit(json!({"type":"accepted","id":1,"vendor_turn_id":"fake-turn-1"})),
+            {"action":"expect_request","expected":{"type":"steer","id":3}},
+            emit(json!({"type":"steer_delivered","id":3,"vendor_turn_id":"fake-turn-1"})),
+            {"action":"gate","name":"delivered"},
+            terminal("fake-turn-1"),
+        ]},
+    ]})
+}
+
+/// The keyed steer's operation row: its verb and stored result, if any.
+fn steer_row(paths: &Paths, session: &str) -> Result<(String, Option<String>), ScenarioError> {
+    paths
+        .store()?
+        .query_row(
+            "SELECT verb,result FROM operations WHERE session_id=?1 AND op_key='k2-key'",
+            [session],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(infra)
+}
+
+/// K2 (via-jm4.36, C1 §3.4): the vendor took a keyed steer's input and
+/// reported it, and the daemon crashes before the report's commit, which
+/// would record the outcome (`core.steer.before_outcome`): the intent row
+/// is durable with no result and no `steer.delivered` exists. Restart
+/// recovery stores the uncertain outcome. A repeat under the key is
+/// answered with it, `steer_failed` with `data.reason: "not_delivered"`
+/// and `data.delivery: "uncertain"`, its message saying the outcome was not
+/// durably recorded (K2 r1 #5), where a new steer is
+/// `no_active_turn` (the turn was recovered `unknown`, and C1 §7.3 cancels
+/// the queue behind it): the input is never sent again, and no
+/// `steer.delivered` exists.
+/// The message of a keyed steer's uncertain outcome (K2 r1 #5).
+const UNRECORDED: &str = "the steer's delivery outcome was not durably recorded; whether its input was applied is unknown";
+
+#[test]
+fn s1_crash_keyed_steer_before_its_outcome_is_never_resent() -> TestResult {
+    scenario(
+        "s1_crash_keyed_steer_before_its_outcome",
+        &keyed_steer_fixture(),
+        |paths, evidence| {
+            let point = "core.steer.before_outcome";
+            arm(paths, point, "crash")?;
+            let mut daemon = Daemon::start(paths, evidence, "crashed")?;
+            let mut args = spawn_args("k2").to_vec();
+            args.extend(["--handle", HANDLE]);
+            let spawn = paths.run(evidence, "spawn", &args)?;
+            check(spawn.status.success(), || {
+                format!("spawn exited {}", spawn.status)
+            })?;
+            let session = json_line(&spawn.stdout)?["session_id"]
+                .as_str()
+                .ok_or_else(|| fail("receipt has no session"))?
+                .to_owned();
+            let steer = [
+                "steer", &session, "--text", "also", "--op-key", "k2-key", "--json",
+            ];
+            let client = paths.client_pending(evidence, "steer-crashed", &steer);
+            acknowledged(paths, evidence, point, "crash", &daemon)?;
+            daemon.wait_crash()?;
+            let (status, stdout, _) = client.finish()?;
+            check(!status.success() && stdout.is_empty(), || {
+                format!("crashed steer client exited {status} with a reply")
+            })?;
+            let (verb, result) = steer_row(paths, &session)?;
+            check(verb == "steer" && result.is_none(), || {
+                format!("the intent row is not open: {verb} {result:?}")
+            })?;
+            let types = paths.event_types(&session)?;
+            check(!types.iter().any(|kind| kind == "steer.delivered"), || {
+                format!("the report committed before the crash: {types:?}")
+            })?;
+            paths.failpoints.disarm(point).map_err(infra)?;
+            daemon.shutdown()?;
+
+            let _daemon = Daemon::start(paths, evidence, "final")?;
+            let uncertain = json!({"refused":"steer_failed","reason":"not_delivered",
+                                   "delivery":"uncertain","recorded":false});
+            let (_, result) = steer_row(paths, &session)?;
+            let stored: Option<Value> = result
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(infra)?;
+            check(stored.as_ref() == Some(&uncertain), || {
+                format!("recovery did not store the uncertain outcome: {result:?}")
+            })?;
+            check(paths.turn(&session)?.state == "unknown", || {
+                "turn 1 was not recovered unknown".to_owned()
+            })?;
+            let mut repeat = steer.to_vec();
+            repeat.extend(["--handle", HANDLE]);
+            let replayed = paths.run(evidence, "steer-repeat", &repeat)?;
+            let error: Value = serde_json::from_slice(&replayed.stderr).map_err(infra)?;
+            check(
+                !replayed.status.success()
+                    && error["data"]["kind"] == "steer_failed"
+                    && error["data"]["reason"] == "not_delivered"
+                    && error["data"]["delivery"] == "uncertain"
+                    && error["message"] == UNRECORDED,
+                || format!("the repeat is not the stored outcome: {error}"),
+            )?;
+            let fresh = [
+                "steer", &session, "--text", "also", "--handle", HANDLE, "--json",
+            ];
+            let fresh = paths.run(evidence, "steer-unkeyed", &fresh)?;
+            check(
+                error_kind(&fresh.stderr).as_deref() == Some("no_active_turn"),
+                || {
+                    format!(
+                        "an unkeyed steer is not no_active_turn: {}",
+                        String::from_utf8_lossy(&fresh.stderr)
+                    )
+                },
+            )?;
+            let types = paths.event_types(&session)?;
+            check(!types.iter().any(|kind| kind == "steer.delivered"), || {
+                format!("input was delivered again: {types:?}")
+            })
+        },
+    )
 }
