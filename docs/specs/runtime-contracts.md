@@ -76,6 +76,31 @@ abandons an owner: unfinished joins stay in the owner's registry until their
 result is collected. Final daemon process exit is a separate boundary with
 its own clean/incomplete policy (§6.2).
 
+A keyed steer runs in its request; no task is spawned for it. The request
+owns the in-flight intent until it hands the steer to the lane; from then
+the lane's ticket book holds the key's association with the steer. The
+request going away does not release it before the steer's turn settles. It
+is released, and the intent's owner with it, on exactly these paths:
+
+- the lane consumes the steer's delivery observation, whether its
+  `steer.delivered` commit, carrying the outcome, succeeded or failed;
+- the driver refuses the input and the request takes the steer back,
+  to record the refusal;
+- the steer's target turn settles: once the lane has drained the
+  turn's admitted observations, it releases every keyed steer of the
+  turn whose request has gone; one whose request still waits is
+  released when that request takes it back or goes away. C2 has the
+  driver emit `steer.delivered` before it answers `Ok`, and answer
+  every steer of a turn by the turn's end, so no delivery can resolve
+  a steer after this point;
+- the lane ends, after draining its channel.
+
+A repeat waits while an owner remains. Shutdown adds no join for keyed
+steers (§6.2). An owner that ends without having submitted an outcome
+leaves the intent for a repeat or restart recovery to resolve as
+uncertain; a transaction already submitted to the Store, an intent or an
+outcome, may still commit.
+
 | Owner | Resources and hidden complexity | Explicit upper-layer surface |
 |---|---|---|
 | Core | Session actors, dispatch slots, monotonic timers, seq/state decisions, progress snapshots | C1 request, envelope and event DTOs |
@@ -830,12 +855,13 @@ refused at open with a named error telling the user to recreate the dev Store
 untouched. `user_version = 0` is initialized only in a database file that
 open itself creates (exclusively); an existing file at version 0, empty or
 not, gets the same refusal before any writable open. Migrations as described
-above start with the first released schema. Schema v9 (v1 was the unreleased
+above start with the first released schema. Schema v10 (v1 was the unreleased
 single-turn format; v2 lacked the unproven-anchor index; v3 lacked frozen
 per-turn values; v4 lacked the close admission state and cancel cause; v5
 lacked step rows, event columns, list order and evidence folders; v6 lacked
 the session's persisted adapter version; v7 lacked the turn's recorded
-instance version; v8 lacked server anchors and the turn → server-anchor link)
+instance version; v8 lacked server anchors and the turn → server-anchor link;
+v9 lacked keyed steer operation rows and the partial index on the open ones)
 is exactly:
 
 | Table | Implemented columns and constraints |
@@ -845,7 +871,7 @@ is exactly:
 | `turns` | PK (`session_id`, `number`), FK session; `prompt` or `prompt_blob`, exactly one non-null; `effective` (the turn's frozen per-turn values: the receipt's public `effective` plus internal frozen values such as the requested bound and vendor options; written once at receipt commit); `state` `queued`, `running`, `completed`, `failed`, `cancelled` or `unknown`; `queued_at`, `queued_seq`; `submitted_at`; `accepted_at`, `correlation` (vendor acceptance evidence, tagged `v:<vendor turn id>` or `t:<acceptance token>`); `envelope` (terminal); `cancel_cause` `cancel` or `close`; `ended_seq`, non-null exactly when the state is terminal; `evidence_dir` (relative to the state directory, written with `turn.submitted`); nullable `vendor_version` and `version_status` `tested` or `untested` (the accepted turn's instance handshake, written in the `turn.started` commit, C2 `turn.accepted`; status reads them until the envelope exists). Partial unique index `turns_one_running` on `session_id` where `state='running'` |
 | `steps` | PK (`session_id`, `turn`, `step`), `WITHOUT ROWID`; FK (`session_id`, `turn`) to turns; `step` ≥ 1; `started_ms`, `ended_ms`; nullable `tokens` ≥ 0; one row per completed model step |
 | `spawn_keys` | PK `key`; FK `session_id`; `identity_len`, `identity_sha256` (32 bytes checked: the exact retry identity's length and SHA-256, never its bytes); `receipt`; kept for the session's lifetime |
-| `operations` | PK (`session_id`, `op_key`); `verb` `resume` or `close`; `identity_len`, `identity_sha256`; `turn` with FK (`session_id`, `turn`); `result`; a `resume` row is committed in the same transaction as the queued turn |
+| `operations` | PK (`session_id`, `op_key`); `verb` `resume`, `close` or `steer`; `identity_len`, `identity_sha256`; `turn` with FK (`session_id`, `turn`); `result`; a `resume` row is committed in the same transaction as the queued turn. A close or steer row may have a null result while in progress. A steer row is committed before the steer is checked or its input goes to the driver. Its result is committed exactly once: in the `steer.delivered` transaction, or alone for a refusal. The update must change exactly that open steer row; a missing key, another verb's key or a resolved intent is refused and rolls the transaction back. Restart recovery gives every open steer row the uncertain outcome before admission. The partial index `operations_open_steers` (verb `steer`, result null) finds these rows |
 | `events` | PK (`session_id`, `seq`), FK session; `turn` (deferred composite FK to `turns`); `type`; `event` (canonical JSON; late and time live inside it); index (`session_id`, `turn`, `seq`); `seq` allocated by Core and checked transactionally |
 | `anchors` | PK `anchor_id`; `generation`, `marker`, `socket_path`; owner: either (`owner_session`, `owner_turn`) FK turn, or `owner_server` (exactly one, checked; unique where present); `uid`, `boot_id`, `pid_namespace`; `phase` `intent`, `identified` or `arm_intent`; `record_version`; nullable identity `pid`, `pgid`, `start_ticks`; `vendor_pid`; `absence_time`. Partial index `anchors_unproven` on `anchor_id` where `absence_time IS NULL` |
 | `server_turns` | PK (`session_id`, `turn`) FK turn; `anchor_id` FK anchor (a server-owned anchor, checked at insert, for a `running` turn); `WITHOUT ROWID`; index on `anchor_id`. Written by Host before the turn's first vendor byte; deleted in the transaction that commits the turn's terminal when the turn's cleanup is `quiescent`, so a remaining link means the turn runs or may have left work on that server; read by restart recovery, final shutdown, and the close and status cleanup predicate |
@@ -859,7 +885,6 @@ Target columns and tables not implemented yet, with their owners:
 | `turns`: separate phase and cancel/cleanup columns (today inside `envelope`) | none yet (deferred) |
 | `turns`: event-bound columns (today the envelope's `events` range) | none yet (deferred) |
 | `operations`: phase intent/done | none yet (deferred) |
-| `operations`: keyed `steer` (C1 §3) | `via-jm4.36` |
 | `processes` as a general table: vendor rows, exit and cleanup evidence beyond `anchors.vendor_pid` and `absence_time` | none yet (deferred) |
 | `metadata` table: retention low-water marks (the schema version is `user_version`) | none in S1, which prunes nothing |
 
@@ -1551,6 +1576,8 @@ No prompt, handle or vendor secret is included in acknowledgements.
 | `host.anchor.final_reply_lost`, `host.group_absence_probe` | Autonomous EOF and verified reconnect cleanup each produce positive same-boot/namespace `ESRCH` proof plus independently observed vendor/grandchild absence; leader-only exit, reused group, probe denial or namespace mismatch remains uncertain with no external numeric signal; lost reply never invents forced/acknowledged outcome |
 | `store.commit.fail_persistent` | F12: named error after receipt, terminal flag false if failure cannot commit, dispatch stopped, group cleanup, bounded memory; restart either fails unwritable or reconciles unknown without resend |
 | `store.commit.reply_lost` | Durable mutation may exist; no duplicate send from timeout; keyed retry sees exact committed result |
+| `core.steer.before_outcome` | The intent is durable with no result and no `steer.delivered`. The restart stores the uncertain outcome, and a repeat replays it, with zero second sends |
+| `store.commit.steer_intent`, `store.commit.steer_outcome` | The commit seams of a keyed steer's intent and lone outcome transactions |
 | `core.observations.pause`, fake flood and stderr flood | F24: 1024/byte bounds and 10 s overflow; independent control service; RSS assertion |
 | `core.progress.publish`, crash after a step commit | F25/F26 (superseded): status answers from memory during a flood; step rows survive a crash up to the last committed step |
 | byte splitter proptest | F27: arbitrary splitting/UTF-8/EOF/size cap, exact messages or explicit failure, no panic/unbounded allocation |

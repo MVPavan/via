@@ -257,9 +257,83 @@ it (C2 `SteerInput.turn`). Errors: `unsupported_verb` (`data.verb:"steer"`),
 nothing was written, C2 §2), and `steer_failed`: `data.reason` `not_steerable`
 with `data.delivery:"none"` (the vendor refused steer in the turn's current
 phase), `not_delivered` with `data.delivery:"uncertain"` (writing the input
-began but the vendor never acknowledged it), or `not_recorded` with
+began but the vendor never acknowledged it; or, for a keyed steer, the
+daemon-generated outcome of an intent whose owner ended without recording
+one, as above), or `not_recorded` with
 `data.delivery` as a success would give it (the vendor took the input, but
 VIA could not record its `steer.delivered` event).
+
+**Keyed steer.** With `op_key` (§3), the key's answer is the stored
+outcome of its durable intent. The key is looked up after the session and
+handle are authenticated, the Store latch is checked (once latched, every
+steer is `store_error`, a repeat included) and the params are validated
+(an invalid `op_key` is `invalid_params`). The look-up comes before the
+capability check (`unsupported_verb`) and every current-turn check:
+
+- the same key with other params, or a key another verb holds, is
+  `invalid_params` with `kind2: idempotency_conflict`;
+- the same key with byte-identical params replays the stored outcome and
+  never writes input again.
+
+The daemon commits the key's intent before the steer is checked or its
+input goes to the vendor. It then commits the outcome exactly once:
+
+- a success, in the same transaction as its `steer.delivered` event;
+- any refusal of this section, `unsupported_verb` and
+  `admission_refused` (`control_lane_full`) included, on its own.
+
+That stored outcome is the key's answer, even when the first caller never
+received it. Some cases:
+
+- **Retry after a failed intent write.** The intent write was refused
+  before it was enqueued, or is known to have rolled back. The reply was
+  `store_error` and no key exists, so a retry is a fresh first attempt.
+  An intent write still in flight may yet commit: a repeat then finds an
+  intent with no owner and gets the uncertain outcome below.
+- **Retry after a lost reply.** The outcome committed but its reply was
+  lost. The caller saw `store_error`, and a repeat replays the committed
+  outcome.
+- **Caller went away.** An intent has one owner at a time: the request
+  until the steer is handed to the session's turn, and the daemon's turn
+  bookkeeping after. A repeat while an owner remains waits for it and
+  gets the outcome it stores.
+  - Gone before the intent write was enqueued, or once it is known to
+    have rolled back: no key exists; a repeat is a fresh first attempt.
+  - Gone while the intent write is in flight: the Store may still commit
+    it. If it commits, the intent has no owner and nothing was sent, as
+    below.
+  - Gone after the intent committed but before the hand-off: the intent
+    has no owner and nothing was sent. A repeat (or restart recovery)
+    stores the uncertain outcome below; the input is never sent.
+  - Gone after the hand-off: a delivery the vendor acknowledged is still
+    recorded, the outcome together with its `steer.delivered` event, and
+    a repeat gets it. A refusal by the driver, or an input the vendor
+    never acknowledged, is recorded by no one: once the steer's turn has
+    settled, no delivery can resolve the intent, and a repeat (or restart
+    recovery) stores the uncertain outcome below. A repeat before then
+    waits.
+- **Uncertain outcome.** This is the outcome the daemon itself stores for
+  an unresolved intent whose owner ended without recording an outcome:
+  `steer_failed` with `data.reason:"not_delivered"`,
+  `data.delivery:"uncertain"`. It is distinct from a `not_delivered`
+  refusal a driver reported and the daemon recorded (§8.1). Cases:
+  - the request ended before the hand-off, or while its intent write was
+    in flight and that write then committed;
+  - the request ended after the hand-off, and the steer's turn settled
+    without a delivery, a refusal the request did not record included;
+  - the steer's delivery was consumed but its `steer.delivered` commit
+    failed;
+  - the steer's session ended without the delivery committing;
+  - its outcome could not be recorded, for example a `control_lane_full`
+    refusal whose own outcome commit rolled back; the turn may still be
+    running and no restart need have happened;
+  - the daemon restarted first.
+
+  The message then says only that the delivery outcome was not durably
+  recorded. Whether the vendor acknowledged the input is unknown, and the
+  input is never sent again.
+
+A stored refusal stays the key's answer; to retry, use a new key.
 
 ### 3.5 `cancel` — stop the active or a queued turn
 
@@ -902,10 +976,10 @@ queued cancellation whose retry commits stays `cancelled`.
 | -32015 | `turn_not_finished` | |
 | -32016 | `wait_timeout` | |
 | -32017 | `daemon_stopping` | |
-| -32018 | `store_error` | Before a receipt: `data.commit_outcome: not_committed\|unknown` and `retry: same_key_only` when uncertain. Before a receipt, `commit_outcome: not_committed` is also used for a request that was never enqueued because the writer's queue was full. A disconnected writer is `unknown` and latches. `commit_outcome` describes receipts only: a steer whose `steer.delivered` commit fails is `store_error` without data (the input was delivered; §3.4). For an affected receipted nonterminal turn that cannot be resolved durably: `data.session`, `data.turn`, last-known `data.durable_state`, `data.terminal_persisted:false`. No terminal envelope is invented. |
+| -32018 | `store_error` | Before a receipt: `data.commit_outcome: not_committed\|unknown` and `retry: same_key_only` when uncertain. Before a receipt, `commit_outcome: not_committed` is also used for a request that was never enqueued because the writer's queue was full. A disconnected writer is `unknown` and latches. `commit_outcome` describes receipts only: a steer whose `steer.delivered` commit fails is `store_error` without data (the input was delivered; §3.4). A keyed steer whose intent or outcome could not be recorded is `store_error` without data. A rolled-back intent leaves no key. A key whose outcome committed but whose reply was lost replays that outcome. For an affected receipted nonterminal turn that cannot be resolved durably: `data.session`, `data.turn`, last-known `data.durable_state`, `data.terminal_persisted:false`. No terminal envelope is invented. |
 | -32019 | `history_pruned` | `data.earliest_seq` |
 | -32020 | `request_too_large` | request line over 1 MiB; `data.max_bytes`; the connection closes |
-| -32021 | `steer_failed` | steer input refused, not acknowledged, or delivered without a record (§3.4): `data.reason` `not_steerable` (nothing was applied, `data.delivery:"none"`), `not_delivered` (writing began, in part or whole, without the vendor's acknowledgement; whether it was applied is unknown, `data.delivery:"uncertain"`) or `not_recorded` (the vendor took it, `data.delivery` as on success, but no `steer.delivered` event records it) |
+| -32021 | `steer_failed` | steer input refused, not acknowledged, or delivered without a record (§3.4): `data.reason` `not_steerable` (nothing was applied, `data.delivery:"none"`), `not_delivered` (writing began, in part or whole, without the vendor's acknowledgement; or, for a keyed steer, the daemon-generated outcome of a durable intent whose owner ended without recording an outcome, so the delivery outcome was not durably recorded, §3.4; whether it was applied is unknown, `data.delivery:"uncertain"`) or `not_recorded` (the vendor took it, `data.delivery` as on success, but no `steer.delivered` event records it) |
 
 A receipt whose commit outcome is `unknown` latches Store failure (runtime
 §7). Restart recovery settles it; a keyed retry after restart learns its
