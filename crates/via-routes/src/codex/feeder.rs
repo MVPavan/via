@@ -8,14 +8,14 @@
 //! from Wire's first-byte bound: one not written whole by it fails the
 //! connection (packet §4).
 //!
-//! The owning guard of item 12.2 calls [`Feeder::withdraw`]: a turn's
-//! items still queued here are removed, and the ones handed to Wire are
-//! withdrawn before their first byte.
+//! A turn's input items carry its [`WriteCancel`] (x.3.2 X3 §2.2): once
+//! it is cancelled, the feeder hands none of them to Wire, and the ones it
+//! handed are withdrawn, which wins before their first byte.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Poll;
 
 use tokio::sync::{Notify, oneshot, watch};
@@ -66,6 +66,8 @@ pub(super) struct Item {
     pub(super) request: Option<i64>,
     /// A reply's own bound: written whole by then, or the connection fails.
     pub(super) deadline: Option<Instant>,
+    /// The turn's write-cancel token, for turn input.
+    pub(super) cancel: Option<Arc<WriteCancel>>,
 }
 
 impl Item {
@@ -93,19 +95,57 @@ pub(super) enum PumpEnd {
     ReplyLate,
 }
 
-struct Queued {
-    key: u64,
-    item: Item,
+/// One turn's write-cancel token (x.3.2 X3 §2.2), created before any of
+/// its input is queued. Lock order: the feeder's queues, then the token,
+/// then Wire.
+pub(super) struct WriteCancel {
+    stdio: Arc<dyn Stdio>,
+    state: Mutex<Cancel>,
+}
+
+#[derive(Default)]
+struct Cancel {
+    cancelled: bool,
+    /// The tickets of the turn's items handed to Wire.
+    tickets: Vec<WriteTicket>,
+}
+
+impl WriteCancel {
+    pub(super) fn new(stdio: Arc<dyn Stdio>) -> Self {
+        Self {
+            stdio,
+            state: Mutex::new(Cancel::default()),
+        }
+    }
+
+    fn state(&self) -> MutexGuard<'_, Cancel> {
+        // A flag and a list, each edited in one step.
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Cancels the turn's writes, synchronously and idempotently: none is
+    /// handed to Wire from now on, and every handed one is withdrawn, which
+    /// wins before its first byte; a started one is finished whole.
+    pub(super) fn cancel(&self) {
+        let mut state = self.state();
+        state.cancelled = true;
+        for ticket in state.tickets.drain(..) {
+            self.stdio.withdraw(ticket);
+        }
+    }
+}
+
+/// An item [`Feeder::hand`] refused: its turn's writes were cancelled.
+struct Refused {
+    answer: Answer,
+    request: Option<i64>,
 }
 
 #[derive(Default)]
 struct Queues {
-    replies: VecDeque<Queued>,
-    controls: VecDeque<Queued>,
-    data: VecDeque<Queued>,
-    /// The tickets of items handed to Wire and not yet answered, by key.
-    handed: HashMap<u64, WriteTicket>,
-    next: u64,
+    replies: VecDeque<Item>,
+    controls: VecDeque<Item>,
+    data: VecDeque<Item>,
     /// The connection ended: nothing more is taken.
     closed: bool,
 }
@@ -117,16 +157,12 @@ impl Queues {
 
     /// The earliest reply deadline still queued.
     fn reply_deadline(&self) -> Option<Instant> {
-        self.replies
-            .iter()
-            .filter_map(|queued| queued.item.deadline)
-            .min()
+        self.replies.iter().filter_map(|item| item.deadline).min()
     }
 }
 
 /// One write handed to Wire.
 struct Flight {
-    key: u64,
     request: Option<i64>,
     answer: Answer,
     deadline: Option<Instant>,
@@ -156,68 +192,23 @@ impl Feeder {
         self.queues.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Queues `item`; its key, for a guard. A closed feeder answers it
+    /// Queues `item`; whether it was queued. A closed feeder answers it
     /// `NotWritten` at once.
-    pub(super) fn push(&self, queue: Queue, item: Item) -> Option<u64> {
+    pub(super) fn push(&self, queue: Queue, item: Item) -> bool {
         let mut queues = self.queues();
         if queues.closed {
             drop(queues);
             item.answer.send(SendOutcome::NotWritten);
-            return None;
+            return false;
         }
-        let key = queues.next;
-        queues.next = key.wrapping_add(1);
-        let entry = Queued { key, item };
         match queue {
-            Queue::Reply => queues.replies.push_back(entry),
-            Queue::Control => queues.controls.push_back(entry),
-            Queue::Data => queues.data.push_back(entry),
+            Queue::Reply => queues.replies.push_back(item),
+            Queue::Control => queues.controls.push_back(item),
+            Queue::Data => queues.data.push_back(item),
         }
         drop(queues);
         self.wake.notify_one();
-        Some(key)
-    }
-
-    /// Item 12.2's withdrawal, synchronous: `keys`' items still queued are
-    /// removed and answered `NotWritten`; the ones handed to Wire are
-    /// withdrawn, which wins before their first byte. Returns the request
-    /// records of the removed items: nothing of them was written.
-    pub(super) fn withdraw(&self, keys: &[u64]) -> Vec<i64> {
-        if keys.is_empty() {
-            return Vec::new();
-        }
-        let (removed, tickets) = {
-            let mut guard = self.queues();
-            let queues = &mut *guard;
-            let mut removed = Vec::new();
-            for queue in [&mut queues.replies, &mut queues.controls, &mut queues.data] {
-                let mut index = 0;
-                while index < queue.len() {
-                    if keys.contains(&queue[index].key) {
-                        if let Some(queued) = queue.remove(index) {
-                            removed.push(queued.item);
-                        }
-                    } else {
-                        index += 1;
-                    }
-                }
-            }
-            let tickets: Vec<WriteTicket> = keys
-                .iter()
-                .filter_map(|key| queues.handed.get(key).cloned())
-                .collect();
-            (removed, tickets)
-        };
-        for ticket in tickets {
-            self.stdio.withdraw(ticket);
-        }
-        removed
-            .into_iter()
-            .filter_map(|item| {
-                item.answer.send(SendOutcome::NotWritten);
-                item.request
-            })
-            .collect()
+        true
     }
 
     /// The connection ended: every queued item is answered `NotWritten`
@@ -233,7 +224,6 @@ impl Feeder {
                 .drain(..)
                 .chain(queues.controls.drain(..))
                 .chain(queues.data.drain(..))
-                .map(|queued| queued.item)
                 .collect()
         };
         removed
@@ -245,26 +235,35 @@ impl Feeder {
             .collect()
     }
 
-    /// Hands a queued item to Wire.
-    fn hand(&self, queues: &mut Queues, entry: Queued, reply: bool) -> Flight {
-        let Queued { key, item } = entry;
+    /// Hands a queued item to Wire, under the queues' lock, then its
+    /// token's: refused if its turn's writes were cancelled, else its
+    /// ticket is installed in the token.
+    fn hand(&self, item: Item, reply: bool) -> Result<Flight, Refused> {
         let bytes = item.control_bytes();
+        let mut token = item.cancel.as_deref().map(WriteCancel::state);
+        if token.as_ref().is_some_and(|token| token.cancelled) {
+            return Err(Refused {
+                answer: item.answer,
+                request: item.request,
+            });
+        }
         let write = self.stdio.write(item.message, item.bounds);
-        queues.handed.insert(key, write.ticket());
-        Flight {
-            key,
+        if let Some(token) = token.as_mut() {
+            token.tickets.push(write.ticket());
+        }
+        drop(token);
+        Ok(Flight {
             request: item.request,
             answer: item.answer,
             deadline: item.deadline,
             reply: reply.then_some(bytes),
             write: Box::pin(write),
-        }
+        })
     }
 
     /// Answers a write that ended and reports it; whether it was a reply
     /// not written whole, which fails the connection.
-    fn land(&self, flight: Flight, outcome: SendOutcome, done: &(dyn Fn(Done) + Sync)) -> bool {
-        self.queues().handed.remove(&flight.key);
+    fn land(flight: Flight, outcome: SendOutcome, done: &(dyn Fn(Done) + Sync)) -> bool {
         let late = flight.deadline.is_some() && outcome != SendOutcome::Written;
         flight.answer.send(outcome);
         done(Done {
@@ -284,6 +283,13 @@ impl Feeder {
         let mut data: Option<Flight> = None;
         let mut hold: Option<DataHold> = None;
         loop {
+            #[cfg(feature = "test-failpoints")]
+            if data.is_none() && !self.queues().data.is_empty() {
+                // x.3.2 X3 S1: between a turn input's queueing and its
+                // hand-off.
+                let _ = crate::failpoint::hit_async("codex.feeder.queued").await;
+            }
+            let mut refused = Vec::new();
             let late_at = {
                 let mut queues = self.queues();
                 // The hold comes before the control's write: Wire never
@@ -291,19 +297,24 @@ impl Feeder {
                 if (control.is_some() || queues.controls_pending()) && hold.is_none() {
                     hold = Some(self.stdio.hold_data());
                 }
-                if control.is_none() {
-                    let next = match queues.replies.pop_front() {
+                while control.is_none()
+                    && let Some((next, reply)) = match queues.replies.pop_front() {
                         Some(reply) => Some((reply, true)),
                         None => queues.controls.pop_front().map(|next| (next, false)),
-                    };
-                    if let Some((next, reply)) = next {
-                        control = Some(self.hand(&mut queues, next, reply));
+                    }
+                {
+                    match self.hand(next, reply) {
+                        Ok(flight) => control = Some(flight),
+                        Err(item) => refused.push(item),
                     }
                 }
-                if data.is_none()
+                while data.is_none()
                     && let Some(next) = queues.data.pop_front()
                 {
-                    data = Some(self.hand(&mut queues, next, false));
+                    match self.hand(next, false) {
+                        Ok(flight) => data = Some(flight),
+                        Err(item) => refused.push(item),
+                    }
                 }
                 if control.is_none() && !queues.controls_pending() {
                     hold = None;
@@ -314,18 +325,27 @@ impl Feeder {
                     (a, b) => a.or(b),
                 }
             };
+            // Nothing of a refused item reached Wire.
+            for item in refused {
+                item.answer.send(SendOutcome::NotWritten);
+                done(Done {
+                    request: item.request,
+                    outcome: SendOutcome::NotWritten,
+                    reply: None,
+                });
+            }
             tokio::select! {
                 biased;
                 outcome = landed(control.as_mut()) => {
                     if let Some(flight) = control.take()
-                        && self.land(flight, outcome, done)
+                        && Self::land(flight, outcome, done)
                     {
                         return PumpEnd::ReplyLate;
                     }
                 }
                 outcome = landed(data.as_mut()) => {
                     if let Some(flight) = data.take() {
-                        self.land(flight, outcome, done);
+                        Self::land(flight, outcome, done);
                     }
                 }
                 () = sleep_until(late_at) => return PumpEnd::ReplyLate,

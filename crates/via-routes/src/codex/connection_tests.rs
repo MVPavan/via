@@ -419,6 +419,106 @@ async fn turn_writes_guard_withdraws_on_panic() {
     assert!(vendor.silent(Duration::from_millis(200)).await);
 }
 
+/// The failpoint token of these tests.
+const POINTS_TOKEN: &str = "codex-connection-tests";
+
+/// Arms `point` to pause at its first hit; this test's process only
+/// (nextest runs each test alone). The folder goes with the guard.
+fn paused_at(point: &str) -> Scratch {
+    use std::os::unix::fs::PermissionsExt;
+    let points = Scratch::new();
+    std::fs::set_permissions(points.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let command = json!({"token": POINTS_TOKEN, "occurrence": 1, "action": "pause"});
+    std::fs::write(
+        points.path().join(format!("{point}.json")),
+        command.to_string(),
+    )
+    .unwrap();
+    crate::failpoint::activate(points.path(), POINTS_TOKEN).unwrap();
+    points
+}
+
+/// Waits until `point` is paused at its first hit.
+async fn reached(points: &Scratch, point: &str) {
+    let ack = points.path().join(format!("{point}.1.ack"));
+    until("the seam's pause", || ack.exists()).await;
+}
+
+/// Releases `point`'s first hit.
+fn release(points: &Scratch, point: &str) {
+    std::fs::write(points.path().join(format!("{point}.1.release")), b"").unwrap();
+}
+
+/// x.3.2 X3 S1 (r7 #1): a turn's input is cancelled between its queueing
+/// and the feeder's hand-off to Wire. The token it carries from its
+/// queueing makes the hand-off refuse it: `NotWritten`, its record gone,
+/// nothing handed to Wire.
+#[tokio::test]
+async fn codex_write_cancelled_before_hand_off_is_refused() {
+    let points = paused_at("codex.feeder.queued");
+    let mut vendor = Vendor::open(1 << 16);
+    let mut writes = TurnWrites::new(&vendor.connection);
+    let start = vendor
+        .connection
+        .request(
+            |id| Ok(turn_start_line(id, "t", "cancelled")),
+            start_by(),
+            Purpose::Plain,
+            Some(&mut writes),
+        )
+        .unwrap();
+    reached(&points, "codex.feeder.queued").await;
+    drop(writes);
+    release(&points, "codex.feeder.queued");
+    assert_eq!(
+        promptly(start.written).await.unwrap(),
+        SendOutcome::NotWritten
+    );
+    assert!(start.reply.await.is_err(), "the record went");
+    assert!(vendor.silent(Duration::from_millis(200)).await);
+    assert!(
+        vendor.stdio.tickets.lock().unwrap().is_empty(),
+        "nothing reached Wire"
+    );
+}
+
+/// x.3.2 X3 S1's variant: the write passed the hand-off, its ticket is
+/// installed in the token, and Wire holds it before its first byte (a
+/// control blocks the pipe). The cancel withdraws it: nothing of it is
+/// written.
+#[tokio::test]
+async fn codex_write_cancelled_after_hand_off_is_withdrawn() {
+    let points = paused_at("codex.feeder.queued");
+    let mut vendor = Vendor::open(64);
+    let mut big = br#"{"method":"note","params":{"pad":""#.to_vec();
+    big.extend(vec![b'x'; 16 * 1024]);
+    big.extend(b"\"}}\n");
+    let control = vendor.connection.notify(big, start_by()).unwrap();
+    vendor.wrote(1, started).await;
+    let mut writes = TurnWrites::new(&vendor.connection);
+    let start = vendor
+        .connection
+        .request(
+            |id| Ok(turn_start_line(id, "t", "withdrawn")),
+            start_by(),
+            Purpose::Plain,
+            Some(&mut writes),
+        )
+        .unwrap();
+    reached(&points, "codex.feeder.queued").await;
+    release(&points, "codex.feeder.queued");
+    vendor.wrote(2, unstarted).await;
+    drop(writes);
+    assert_eq!(
+        promptly(start.written).await.unwrap(),
+        SendOutcome::NotWritten
+    );
+    assert!(start.reply.await.is_err(), "the record went");
+    assert_eq!(vendor.read().await["method"], "note");
+    assert_eq!(control.await.unwrap(), SendOutcome::Written);
+    assert!(vendor.silent(Duration::from_millis(200)).await);
+}
+
 /// Item 12.3 (ruling 20): the feeder is Wire's only producer, so two
 /// thread opens queued at once are both written, in order, never refused
 /// for Wire's one data slot.

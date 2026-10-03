@@ -30,7 +30,7 @@ use via_wire::{
     WireFailure, WireMessages, WireSender, WriteBounds,
 };
 
-use super::feeder::{Answer, Done, Feeder, Item, PumpEnd, Queue};
+use super::feeder::{Answer, Done, Feeder, Item, PumpEnd, Queue, WriteCancel};
 use super::lane::{ConnectionLoss, Lane, LaneEnd, LaneItem, LeaseSignal, LossCause, Routed};
 use super::stdio::Stdio;
 use super::threads::{Budget, Route, ThreadTable};
@@ -260,29 +260,28 @@ impl Drop for Subscription {
 }
 
 /// The owning guard of one turn's input writes (item 12.2), living in its
-/// `run_turn`. Dropped on return, on the future's drop and on unwinding,
-/// it removes the turn's items still queued in the feeder and withdraws
-/// the ones handed to Wire before their first byte; a started one is
-/// finished whole. Cleanup intents are not in it.
+/// `run_turn`: it holds the turn's write-cancel token, which each of its
+/// writes carries from its queueing (x.3.2 X3 §2.2). Dropped on return, on
+/// the future's drop and on unwinding, it cancels: the feeder hands none of
+/// the turn's queued items to Wire, and the ones handed are withdrawn
+/// before their first byte; a started one is finished whole. Cleanup
+/// intents are not in it.
 pub struct TurnWrites {
-    connection: Arc<Connection>,
-    keys: Vec<u64>,
+    cancel: Arc<WriteCancel>,
 }
 
 impl TurnWrites {
-    /// An empty guard on `connection`.
+    /// A guard for one turn's writes on `connection`.
     pub fn new(connection: &Arc<Connection>) -> Self {
         Self {
-            connection: Arc::clone(connection),
-            keys: Vec::new(),
+            cancel: Arc::new(WriteCancel::new(Arc::clone(&connection.stdio))),
         }
     }
 }
 
 impl Drop for TurnWrites {
     fn drop(&mut self) {
-        let keys = std::mem::take(&mut self.keys);
-        self.connection.withdraw(&keys);
+        self.cancel.cancel();
     }
 }
 
@@ -486,7 +485,7 @@ impl Connection {
             OutboundMessage::Control(_) | OutboundMessage::Interrupt(_) => Queue::Control,
         };
         let (answer, written) = oneshot::channel();
-        let key = self.feeder.push(
+        let queued = self.feeder.push(
             queue,
             Item {
                 message,
@@ -494,13 +493,12 @@ impl Connection {
                 answer: Answer::Write(answer),
                 request: Some(id.get()),
                 deadline: None,
+                cancel: writes.map(|writes| Arc::clone(&writes.cancel)),
             },
         );
-        match (key, writes) {
-            (Some(key), Some(writes)) => writes.keys.push(key),
-            (Some(_), None) => {}
+        if !queued {
             // Refused by a closed feeder: no reply can come.
-            (None, _) => self.forget(id.get()),
+            self.forget(id.get());
         }
         Ok(Requested { id, written, reply })
     }
@@ -523,6 +521,7 @@ impl Connection {
                 answer: Answer::Write(answer),
                 request: None,
                 deadline: None,
+                cancel: None,
             },
         );
         Ok(written)
@@ -673,13 +672,6 @@ impl Connection {
         let mut state = self.state();
         if let Some(record) = state.requests.remove(&id) {
             state.budget.release(record.charge);
-        }
-    }
-
-    /// The guard's withdrawal (item 12.2).
-    fn withdraw(&self, keys: &[u64]) {
-        for id in self.feeder.withdraw(keys) {
-            self.forget(id);
         }
     }
 
@@ -910,9 +902,10 @@ impl Connection {
                 answer: Answer::Reply(written),
                 request: None,
                 deadline: Some(deadline),
+                cancel: None,
             },
         );
-        if queued.is_none() {
+        if !queued {
             self.written(&Done {
                 request: None,
                 outcome: SendOutcome::NotWritten,
