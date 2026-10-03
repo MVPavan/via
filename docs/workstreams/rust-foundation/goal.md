@@ -9,7 +9,7 @@ and a local WIP commit only; no push. See [the current handoff](session-handoff.
 
 > Execute `docs/workstreams/rust-foundation/goal.md` using its Beads dependency
 > graph and `docs/workstreams/rust-foundation/roadmap.md`. Deliver a locally
-> verified VIA first-release candidate for Claude Code, Codex and OpenCode,
+> verified VIA first-release candidate for Claude Code, Codex, OpenCode and Pi,
 > with the complete C1 API and truthful adapter capabilities. Continue through
 > design, implementation, integration, verification, review and necessary fixes
 > until every finish criterion below is evidenced. Use the specified models,
@@ -29,7 +29,7 @@ tool's budget, status and continuation rules remain authoritative.
   Reuse those decisions; do not repeatedly seek approval for them.
 - S0 contains seven scaffold crates and `via --version`; no runtime feature
   implementation or runtime tests exist at goal preparation.
-- First-release harnesses are exactly **Claude Code, Codex and OpenCode**.
+- First-release harnesses are exactly **Claude Code, Codex, OpenCode and Pi**.
   ACP, other harnesses, passthrough, thin SDK delivery and foreman integration
   are outside this goal. Extra routes are added only when required for the
   in-scope behavior; there is no separate ACP/Claude-extra-route finish gate.
@@ -59,7 +59,7 @@ release artifact has been qualified there. Linux remains the only required
 release target; macOS artifact, linkage inspection and native qualification are
 deferred together under `via-pvj.4`. OpenCode no-login free-model evidence is
 recorded; its VIA qualification and temporary password-exception controls remain
-open. These dispositions do not reduce the full-C1, three-harness finish criteria.
+open. These dispositions do not reduce the full-C1, four-harness finish criteria.
 The anonymous/private OpenCode profile has no ambient saved-login fallback;
 non-null `max_steps` is truthfully unsupported at the pinned vendor version.
 See the handoff for precise evidence, outstanding review findings and next work
@@ -85,7 +85,7 @@ bound validation obey C1. Usage/cost and cleanup certainty retain their provenan
 | Gate | Evidence required to finish |
 |---|---|
 | Functional API | Automated C1 coverage through CLI/socket/stdio, including receipts, foreground/background, errors, handles, retries, queueing, controls and read APIs; follow/unsubscribe and disconnect release subscriptions without further event delivery; no placeholder paths |
-| Three real adapters | Pinned-version fake conformance and small live sets for Claude Code, Codex and OpenCode; real conversation continuity and supported controls; OpenCode successful result and continuity use a free model, with no paid-model/provider substitution absent a new owner decision; capability matrix matches evidence |
+| Four real adapters | Pinned-version fake conformance and small live sets for Claude Code, Codex, OpenCode and Pi; real conversation continuity and supported controls; OpenCode and Pi successful result and continuity use a free model (Pi through OpenCode Zen), with no paid-model/provider substitution absent a new owner decision; capability matrix matches evidence |
 | Lifecycle correctness | S1 F1–F30 plus vendor-specific failure tests pass; no automatic resend after uncertain submission, no cross-session traffic leak, verified process identity, truthful cleanup/unknown outcomes |
 | Bounded operation | Measured memory/buffer/deadline limits from the reviewed design; noisy vendors and slow consumers do not silently lose data or stall lifecycle control; exact logs or explicit incompleteness |
 | Durable state | Migration, crash, receipt/intent ordering and persistent Store-failure scenarios pass, including the inability to persist a failure result; restart never invents evidence |
@@ -207,7 +207,7 @@ failure or completion rather than continuously polling.
 5. Cross-adapter control/recovery hardening follows completed adapters;
    platform implementation and packaging proceed independently where their
    actual prerequisites allow. Documentation follows stable user behavior.
-6. Final integration joins all three adapters, control hardening, platform
+6. Final integration joins all four adapters, control hardening, platform
    checks, live evidence and docs before the final Astra-high critical review.
 
 This graph replaces the old mandatory serial S2 → S3 → S4 → S5 proposal.
@@ -227,6 +227,7 @@ The full acceptance/ownership map is [roadmap.md](roadmap.md).
 | `via-p98` | Claude Code adapter |
 | `via-5lr` | Codex adapter |
 | `via-4sw` | OpenCode adapter |
+| `via-jt8` | Pi adapter and conformance |
 | `via-gvg` | Cross-adapter controls and recovery |
 | `via-pvj` | Linux/macOS and packaging |
 | `via-d9o` | Integrated release verification and final critique |

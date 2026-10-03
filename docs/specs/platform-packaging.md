@@ -89,7 +89,7 @@ checks before integration.
 Linux 5.15 and macOS 13 are conservative proposed product floors, chosen to
 bound the test matrix; neither floor is evidence of vendor compatibility.
 Each adapter's pinned vendor version must run at that floor or name a higher
-adapter-specific requirement in user documentation. All three adapters must
+adapter-specific requirement in user documentation. All four adapters must
 pass their small live sets on Linux on at least one supported OS version; the
 platform fake-vendor suite must also pass on baseline Linux. The corresponding
 macOS suites remain the deferred qualification inventory, not current-goal gates.
@@ -497,7 +497,7 @@ this platform worker. Keep invariant #7's Linux/macOS family intent and retain
 |---|---|
 | Goal current checkpoint, platform/password sentences | “The owner approved P-OWNER-1 and delegated optional macOS work; the coordinator selected Linux as the only required current-goal release target. macOS artifact production, linkage inspection and native qualification are deferred together. OpenCode's generated-password inheritance has an authorized temporary exception; selected-control tests and successful free-model live qualification remain open. These dispositions are not execution/security passes.” Preserve unrelated S1/live tracking facts. |
 | Goal finish: Platforms and packaging | “Reviewed Linux target/linkage/install contract; produced fully static x86_64-unknown-linux-musl artifact; actual target execution at the 5.15 baseline and current Linux configuration; platform socket/process/install tests and release failpoint exclusion. macOS design/compatibility guidance retained; macOS artifact production, linkage inspection and native qualification deferred to a follow-up, not finish gates.” |
-| Goal finish: Three real adapters | Retain all three adapters and controls; add “OpenCode successful result and conversation continuity must use a free model; no paid-model/provider substitution without a new owner decision.” |
+| Goal finish: Four real adapters | Retain all four adapters and controls; add “OpenCode and Pi successful result and conversation continuity must use a free model (Pi through OpenCode Zen); no paid-model/provider substitution without a new owner decision.” |
 | Goal finish: Verification / Evidence and docs | Qualify target-artifact/native-platform requirements as current-goal Linux requirements; require explicit deferred/unverified macOS reporting. Keep every code, live, evidence and independent-review gate otherwise unchanged. |
 | Goal platform paragraph | Replace its pending-owner language with §1's current-goal wording; retain Linux5.15, exact target, static requirement, macOS allowlist guidance and truthful WSL evidence under §7. |
 | Goal unavailable-runner / blocked paragraph | “Unavailable required Linux runners, fixtures or free-model/provider access leave their corresponding current-goal gates incomplete. Missing macOS artifacts/runners are recorded in the deferred follow-up and do not block this goal. Never count infrastructure failure or deferred work as a pass; all remaining current-goal gates must hold before completion.” |
@@ -512,7 +512,7 @@ Beads changes):
 - `via-pvj.4` (deferred macOS qualification follow-up): own
   ARM64/macOS13 artifact/toolchain production, exact Apple allowlist inspection,
   archive/signature/install evidence, baseline/current native P-S/P-I/P-A and
-  failpoint tests, plus three-adapter live qualification. Record dependencies
+  failpoint tests, plus four-adapter live qualification. Record dependencies
   on the retained design and a suitable runner/toolchain. It is not a blocking
   dependency of current Linux goal completion and may not be closed as passed
   merely because it was deferred.

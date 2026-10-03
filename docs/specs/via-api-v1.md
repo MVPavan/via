@@ -22,9 +22,9 @@ resume advances its recorded adapter version, C2 §1 rule 2) and **turn** (one p
 caller generates the session's handle; the daemon stores only its hash.
 
 **First-release scope (owner, 2026-09-26):** Claude Code, Codex and OpenCode;
-all methods below are in scope. Each route truthfully declares native, partial
-or unsupported vendor behavior. ACP references describe future coverage, not
-a release gate. Language, coding standard, testing policy and S1 scope are
+Pi added by owner, 2026-10-03; all methods below are in scope. Each route
+truthfully declares native, partial or unsupported vendor behavior. ACP
+references describe future coverage, not a release gate. Language, coding standard, testing policy and S1 scope are
 approved; vendor-dependent decisions remain recorded in the tables below.
 
 | Method | CLI | Handle | Retry-safe by | Result |

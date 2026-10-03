@@ -462,7 +462,8 @@ is approved in `.repo-context/coding-style.md` §10.
 
 The owner confirmed that Rust, the foundation decisions, coding standard and
 testing policy are approved, accepted the readiness review's recommendations,
-and restricted the first release to **Claude Code, Codex and OpenCode**.
+and restricted the first release to **Claude Code, Codex and OpenCode**
+(Pi added by owner, 2026-10-03).
 Implement the full C1 method surface; unsupported vendor verbs remain explicit
 named refusals. ACP and additional harnesses are later scope. This supersedes
 the old proposed v0/v1/v2 scope ladder, not the capability-truthfulness rule.

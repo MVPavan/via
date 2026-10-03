@@ -6,7 +6,7 @@ Roles, if used, are caller policy. Sources:
 `docs/workstreams/handoff.md`, `docs/brainstorms/README.md`,
 `docs/brainstorms/access-methods.md`.
 
-First-release harnesses: Claude Code, Codex and OpenCode. ACP and other
+First-release harnesses: Claude Code, Codex, OpenCode and Pi. ACP and other
 harnesses remain extension concepts, not first-release requirements.
 
 ## Harnesses and adapters

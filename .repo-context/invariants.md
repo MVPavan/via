@@ -73,11 +73,12 @@ implementation develops.
     attaches to or stops servers it did not start.
     Source: `docs/brainstorms/README.md` §15 (D8).
 
-12. **First-release scope:** Claude Code, Codex and OpenCode only. Implement
+12. **First-release scope:** Claude Code, Codex, OpenCode and Pi only. Implement
     the full C1 method surface, including background/wait, cancel and steer;
     each adapter declares actual support and returns named refusals where
     unsupported. ACP agents and additional harnesses are later scope, not
-    first-release gates. Source: `docs/brainstorms/README.md` §16.
+    first-release gates. Source: `docs/brainstorms/README.md` §16; Pi added
+    by owner, 2026-10-03.
 13. **Thin wrapper: vendor upgrades are the vendor's.** This applies to every
     harness: Claude Code, Codex, OpenCode and any agent added later. VIA wraps
     the coding agent and nothing more.

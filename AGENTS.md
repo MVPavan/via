@@ -74,7 +74,7 @@ Apply First Principles Thinking to every problem; deliver correct work with the 
 - VIA is an open-source, cross-harness CLI and per-user daemon, written in Rust:
   one static binary that runs a prompt on any coding-agent harness with
   explicit parameters and returns a structured result envelope (roles are
-  caller policy). First release: Claude Code, Codex and OpenCode. Design
+  caller policy). First release: Claude Code, Codex, OpenCode and Pi. Design
   record: `docs/brainstorms/README.md` §15–§16,
   `.repo-context/invariants.md` and `docs/specs/`.
 - Prototypes need owner discussion before they start.

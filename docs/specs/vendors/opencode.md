@@ -7,7 +7,7 @@ refreshed evidence/parameter disposition remains required. The owner delegated
 password handling on 2026-09-26; the coordinator selected the temporary
 OC-SEC-1 exception in §2.1. Its controls still require proof. No implementation or
 release acceptance follows from this document. The first release still
-requires Claude Code, Codex **and OpenCode**, including successful real
+requires Claude Code, Codex, **OpenCode** and Pi, including successful real
 spawn/result, conversation-preserving resume and supported controls.
 
 Authority: [C1](../via-api-v1.md), [C2](../adapter-contract.md),
@@ -477,7 +477,7 @@ This is an ordinary truthful parameter refusal, **not an owner scope waiver**:
 entries with a reason; C1 §4 defines max_steps as an optional nullable per-turn
 parameter. [C2 §6.2](../adapter-contract.md) already records explicit max_steps
 as unsupported for Codex. The [goal's product surface](../../workstreams/rust-foundation/goal.md)
-requires full C1 methods, all three adapters, real spawn/resume/result and every
+requires full C1 methods, all four adapters, real spawn/resume/result and every
 supported control; it does not promise native support for every parameter on
 every route. The earlier automatic owner-disposition release blocker was too
 strong. Required proof is honest describe/receipt capability plus pre-I/O refusal
@@ -639,7 +639,7 @@ Set SSE line and assembled data-event limits to 16 MiB, HTTP headers to
 based on decoded bytes too. At most four OpenCode server instances, one SSE
 stream per server key, and one active prompt per session.
 S1 has no memory pool (T4-A43); the OpenCode task (`via-4sw.3.2`) re-derives these bounds. Reserve control capacity independent of reads/model work. Measure and
-review total resource budgets with all three adapters before integration.
+review total resource budgets with all four adapters before integration.
 
 The daemon's SSE dispatcher must not let one dedicated server/owner's saturated
 queue stall another server/owner. Dispatch with
@@ -785,7 +785,7 @@ free-model conformance in `via-4sw.3.4`, multi-step usage/cache scope, broader
 cleanup/restart/load, B7 config/never-ask and model-specific parameter checks.
 Unsupported max_steps needs the truthful capability/preflight tests in §3;
 no separate owner release waiver is required by the existing C1/C2 contract.
-Linux platform execution and integrated three-adapter gates remain mandatory;
+Linux platform execution and integrated four-adapter gates remain mandatory;
 macOS artifact production, linkage inspection and native qualification are
 coordinator-deferred under the owner's optionalization, not passed. No paid
 model/provider may substitute for the free live gate without a new owner

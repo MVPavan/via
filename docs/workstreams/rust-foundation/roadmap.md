@@ -16,7 +16,7 @@ Owner-approval issue `via-jm4.10` closed before feature dispatch.
 | S5 | `via-4sw` | OpenCode adapter | Verified S1 plus OpenCode design review | deep |
 | S4 | `via-gvg` | Cross-adapter control/recovery hardening | Three reviewed adapters | deep |
 | P1 | `via-pvj` | Linux platform and packaging; macOS design retained, artifact/native gates deferred under `via-pvj.4` | Platform design review plus S1 for runtime changes | deep |
-| R1 | `via-d9o` | Verified local release candidate | Three adapters, S4, required Linux platform gates, docs and evidence | deep |
+| R1 | `via-d9o` | Verified local release candidate | Four adapters, S4, required Linux platform gates, docs and evidence | deep |
 
 These are seven top-level epics, not one four-level release hierarchy. Existing
 foundation records are retained. `via-jm4.3` and `.6` aggregate evidence and
@@ -180,7 +180,7 @@ Governing sources: [goal.md](goal.md), `docs/specs/via-api-v1.md`, `docs/specs/a
 | `via-d9o.1` | Write complete user help and operating guidance | README, usage guide, CLI help; implementation author coordinates source edits | Examples cover login, three harnesses, verbs, handles, retries, bounds, background, cancellation and recovery; examples run successfully. |
 | `via-d9o.2` | Run complete release verification and evidence audit | all gates and private release artifacts | All goal gates pass on final integrated state; live or platform infrastructure failures remain unmet; required artifacts validate. |
 | `via-d9o.2.1` | Verify deterministic full suite and artifact integrity | full prescribed Rust/failpoint/doc/layer checks and evidence validation | Nonempty suite, all F1-F30 and vendor faults, feature-isolation checks and artifact integrity pass on final state. |
-| `via-d9o.2.2` | Verify three-adapter live release matrix | isolated pinned live cases and versions | Each harness passes required live behavior on release artifacts; quota/auth/unavailability never counted as pass. |
+| `via-d9o.2.2` | Verify four-adapter live release matrix | isolated pinned live cases and versions | Each harness passes required live behavior on release artifacts; quota/auth/unavailability never counted as pass. |
 | `via-d9o.3` | Critically review the integrated release candidate | architecture, product guarantees, final evidence | Independent critique recorded and every blocker repaired and verified; no unreviewed material deviation. |
 | `via-d9o.3.1` | Perform final architecture and evidence critique | read-only fresh-context integrated critique | Review addresses all goal guarantees, platform/static claims, unsupported verbs, process containment and evidence quality. |
 | `via-d9o.3.2` | Resolve final findings and close goal evidence | necessary fixes, final checks, Beads and release report | Critical findings dispositioned and fixes rechecked; close all other required leaf work, then this leaf and satisfied ancestors; export tracking and produce the local handoff without unauthorized Git/publication action. |

@@ -21,7 +21,8 @@ vendor documentation cited in the research notes, **probe** = observed
 
 ## Summary for review
 
-First-release harnesses (owner, 2026-09-26): Claude Code, Codex and OpenCode.
+First-release harnesses (owner, 2026-09-26): Claude Code, Codex and OpenCode;
+Pi added by owner, 2026-10-03.
 Implement the C2 operations required by the full C1 surface, with truthful
 per-route capability declarations. ACP mappings and A5/B5 remain future work,
 not first-release gates. Material remaining decisions use Astra-high design
