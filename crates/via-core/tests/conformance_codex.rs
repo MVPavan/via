@@ -2388,9 +2388,9 @@ fn long_denials(k: usize, count: usize) -> Vec<Value> {
 /// x.3.2 X3 fix r4 #3: the suppression table is charged against the
 /// session's metadata bound (packet §5: 256 KiB), across turns. Turn 1
 /// reports 150 vendor denials of 1 KiB IDs, within it; turn 2's denials
-/// pass it at the first that does not fit: the generation fails
-/// `overflow` (its cleanup unproven, its cleanup interrupt written),
-/// never forgetting a fact.
+/// pass it at the first that does not fit, never forgetting a fact. The
+/// exhausted cap fails the connection `overflow` (X3 §6.4, F2): Host
+/// stops the server, and the turn's cleanup is unproven.
 #[test]
 fn codex_suppression_exhaustion_fails_the_generation() {
     let name = "codex_suppression_exhaustion_fails_the_generation";
@@ -2399,7 +2399,8 @@ fn codex_suppression_exhaustion_fails_the_generation() {
     let fit = (256 * 1024 - first * LONG_ID) / LONG_ID;
     let count = |k: usize| if k == 0 { first } else { fit + 1 };
     let (mut replay, mut expect) = many_turns(name, 2, |k| long_denials(k, count(k))).unwrap();
-    // Turn 2 ends at the overflow: its interrupt, then nothing more.
+    // Turn 2 ends at the overflow: the connection fails, and Host stops
+    // the server.
     let second = step_with(
         &replay,
         &format!(
@@ -2409,19 +2410,7 @@ fn codex_suppression_exhaustion_fails_the_generation() {
     )
     .unwrap();
     let paced = long_denials(1, count(1)).len();
-    cut_after(
-        &mut replay,
-        second + paced,
-        &[
-            json!({"expect": {
-                "line": {"method": "turn/interrupt",
-                    "params": {"threadId": THREAD, "turnId": turn_id(1)}},
-                "within_ms": 5000,
-            }}),
-            json!({"await_eof": {}}),
-        ],
-    )
-    .unwrap();
+    cut_after(&mut replay, second + paced, &[sigterm()]).unwrap();
     turn_mut(&mut expect, 0)["expect"]["observation_counts"] =
         json!({"turn.accepted": 1, "action.denied": first});
     let turn = &mut turn_mut(&mut expect, 1)["expect"];
@@ -2465,8 +2454,13 @@ fn tool_items(k: usize, count: usize, method: &str) -> Vec<Value> {
 }
 
 /// Turn 1 of [`many_turns`] starts this many tools and ends with them
-/// open; the session's metadata holds 1,024 entries (packet §5).
+/// open; the session's cap holds 1,024 charges (packet §5): ledger
+/// entries, turn 1's mapped range and turn 2's credit (X3 §6.2, F2).
 const TURN1_TOOLS: usize = 600;
+
+/// The charges of the cap that are no tool of [`open_tools_across_turns`]
+/// while turn 2 runs: turn 1's range and turn 2's credit.
+const MAPPED_CHARGES: usize = 2;
 
 /// Two turns: turn 1 ends with [`TURN1_TOOLS`] tools open, then
 /// `released` of them complete late, between the turns (they wait in the
@@ -2504,12 +2498,12 @@ fn open_tools_across_turns(
 
 /// x.3.2 X3 r5 #2 (release by completion), C1: an open tool survives its
 /// turn's settlement in registration storage. Turn 1 ends with 600 tools
-/// open; turn 2's 425th tool is the session's 1,025th entry: the
-/// generation fails `overflow`, its cleanup interrupt written.
+/// open; turn 2's 423rd tool is the session's 1,025th charge: the
+/// connection fails `overflow` (X3 §6.4, F2), and Host stops the server.
 #[test]
 fn codex_open_tools_survive_their_turn() {
     let name = "codex_open_tools_survive_their_turn";
-    let tools = 1024 - TURN1_TOOLS + 1;
+    let tools = 1024 - TURN1_TOOLS - MAPPED_CHARGES + 1;
     let (mut replay, mut expect) = open_tools_across_turns(name, 0, tools).unwrap();
     let second = step_with(
         &replay,
@@ -2520,19 +2514,7 @@ fn codex_open_tools_survive_their_turn() {
     )
     .unwrap();
     let paced = 1 + tool_items(1, tools, "item/started").len();
-    cut_after(
-        &mut replay,
-        second + paced,
-        &[
-            json!({"expect": {
-                "line": {"method": "turn/interrupt",
-                    "params": {"threadId": THREAD, "turnId": turn_id(1)}},
-                "within_ms": 5000,
-            }}),
-            json!({"await_eof": {}}),
-        ],
-    )
-    .unwrap();
+    cut_after(&mut replay, second + paced, &[sigterm()]).unwrap();
     let turn = &mut turn_mut(&mut expect, 1)["expect"];
     turn["terminal"] = Value::Null;
     turn["usage"] = Value::Null;
@@ -2551,16 +2533,208 @@ fn codex_open_tools_survive_their_turn() {
 /// x.3.2 X3 r5 #2 and r6 #3 (release by completion), C1: an earlier
 /// turn's late successful completion releases its open tool's entry.
 /// Ten of turn 1's 600 open tools complete after its terminal: turn 2's
-/// 434 tools then fill the session's 1,024 entries exactly, and both
+/// 432 tools then fill the session's 1,024 charges exactly, and both
 /// turns complete.
 #[test]
 fn codex_late_completion_releases_open_tools() {
     let name = "codex_late_completion_releases_open_tools";
     let released = 10;
-    let second = 1024 - TURN1_TOOLS + released;
+    let second = 1024 - TURN1_TOOLS - MAPPED_CHARGES + released;
     let (replay, mut expect) = open_tools_across_turns(name, released, second).unwrap();
     // Turn 1's other open tools leave the session's cleanup unproven.
     expect["sessions"]["main"]["close"]["cleanup"] = json!("uncertain");
+    variant(name, &replay, &expect).unwrap();
+}
+
+/// `c1_commentary_usage` with turn 1's `turn/start` reply held past its
+/// wall: turn 1 ends `deadline` unaccepted, its cleanup unproven, and its
+/// delayed reply maps turn 1's vendor turn on the connection while its
+/// `Accepted` never went out (x.3.2 X3 S2: the fenced-but-unaccepted
+/// window). Turn 2 is admitted once that reply was read under turn 1's
+/// fence ([`unmapped_knobs`]). `inserted` is emitted right after turn 2
+/// started; turn 2 then runs as recorded, without its gate.
+fn unmapped_turn1(name: &str, inserted: &[Value]) -> Result<(Value, Value), String> {
+    let mut replay = replay_of("c1_commentary_usage")?;
+    let mut expect = expect_of("c1_commentary_usage")?;
+    replay["source"] = json!(format!("{name}: a variant of c1_commentary_usage"));
+    expect["source"] = replay["source"].clone();
+    replay["deadline_ms"] = json!(30000);
+    let all = replay["steps"].as_array().ok_or("no steps")?.clone();
+    let start1 = step_with(&replay, "\"capture\":{\"turn1\"")?;
+    let start2 = step_with(&replay, "\"capture\":{\"turn2\"")?;
+    let started2 = step_with(
+        &replay,
+        &format!(
+            "\"turn/started\",\"params\":{{\"threadId\":\"{THREAD}\",\"turn\":{{\"id\":\"{TURN2}\""
+        ),
+    )?;
+    let mut steps: Vec<Value> = all[..=start1].to_vec();
+    // Past turn 1's wall and its cleanup allowance.
+    steps.push(json!({"delay": {"ms": 6000}}));
+    steps.push(all[start1 + 1].clone());
+    steps.extend(all[start2..=started2].iter().cloned());
+    steps.extend(inserted.iter().cloned());
+    steps.extend(
+        all[started2 + 1..]
+            .iter()
+            .filter(|step| step.get("await_signal").is_none())
+            .cloned(),
+    );
+    replay["steps"] = json!(steps);
+    unaccepted(&mut expect, "deadline", tested());
+    let turn = turn_mut(&mut expect, 0);
+    turn.as_object_mut().ok_or("turn 1")?.remove("gates");
+    turn["deadlines"] = json!({"wall_ms": 1500, "idle_ms": 600_000});
+    turn["expect"]["cleanup"] = json!("uncertain");
+    turn["expect"]["observations_include"] = json!([
+        {"kind": "session.vendor_identity_confirmed", "vendor_session_id": THREAD,
+            "generation": 1},
+    ]);
+    turn_mut(&mut expect, 1)
+        .as_object_mut()
+        .ok_or("turn 2")?
+        .remove("gates");
+    expect["sessions"]["main"]["close"]["cleanup"] = json!("uncertain");
+    Ok((replay, expect))
+}
+
+/// [`unmapped_turn1`]'s knobs: turn 2 is admitted only once Route read
+/// turn 1's delayed reply, so the reply counts under turn 1's fence.
+fn unmapped_knobs() -> conformance_run::Knobs {
+    conformance_run::Knobs {
+        admit_after_routed: Some((1, 0)),
+        ..conformance_run::Knobs::default()
+    }
+}
+
+/// A decline of an approval request naming turn 1, at ID 90, and VIA's
+/// reply.
+fn turn1_declined() -> [Value; 2] {
+    [
+        emit(
+            &json!({"id": 90, "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": THREAD, "turnId": TURN, "itemId": "item-late"}}),
+        ),
+        json!({"expect": {
+            "line": {"id": 90, "result": {"decision": "decline"}},
+            "absent": ["/error"],
+            "within_ms": 5250,
+        }}),
+    ]
+}
+
+/// x.3.2 X3 S2 (r7 #2) and §3.4, F2: "mapped to Core" is positive
+/// evidence. Turn 1 is written and its wall seals it before its reply;
+/// the delayed reply then maps turn 1 on the connection, and a decline
+/// naming turn 1 comes while turn 2 runs. It gives no event, for turn 1
+/// or turn 2 (Core would take a decline naming an unknown vendor turn as
+/// the running turn's), and nothing session-level: it is turn 1's loss.
+#[test]
+fn codex_unaccepted_turn_gets_no_late_observation() {
+    let name = "codex_unaccepted_turn_gets_no_late_observation";
+    let (replay, mut expect) = unmapped_turn1(name, &turn1_declined()).unwrap();
+    turn_mut(&mut expect, 1)["expect"]["observation_counts"] =
+        json!({"turn.accepted": 1, "vendor.request_declined": 0});
+    check_variant_with(name, &replay, &expect, unmapped_knobs(), |pure| {
+        if pure.late.borrow().is_empty() {
+            Ok(())
+        } else {
+            Err(format!("late observations: {:?}", pure.late.borrow()))
+        }
+    })
+    .unwrap();
+}
+
+/// x.3.2 X3 S3b (ii) (r10 #1), F2: an earlier turn's lost observation
+/// blocks the live fence it was read under. Turn 1 was never mapped (as
+/// in S2); turn 2 is accepted and running when turn 1's decline is read,
+/// then turn 2's own messages. Turn 2's progress and terminal are
+/// delivered, but its published frontier stays below the decline's
+/// position: the watermark counts every message, the delivered position
+/// stops short of the decline.
+#[test]
+fn codex_lost_late_item_blocks_the_live_fence() {
+    let name = "codex_lost_late_item_blocks_the_live_fence";
+    let (replay, expect) = unmapped_turn1(name, &turn1_declined()).unwrap();
+    check_variant_with(name, &replay, &expect, unmapped_knobs(), |pure| {
+        let fences = pure.fences.borrow();
+        match fences.get(&1) {
+            // The decline is the fence's fourth message, after turn 2's
+            // acceptance, its status change and `turn/started`.
+            Some(&(watermark, 3)) if watermark > 4 => Ok(()),
+            _ => Err(format!(
+                "decode fences (watermark, delivered) by turn: {fences:?}"
+            )),
+        }
+    })
+    .unwrap();
+}
+
+/// x.3.2 X3 r6 #8 and §6.4, F2: a session's metadata exhaustion is the
+/// shared connection's overflow (vendors/codex.md §5). In `c4_two_sessions`
+/// A and B run on one server; once both have a tool open, A's thread
+/// starts tools until A's cap is full (its credit, its first tool and
+/// 1,022 more): the next fails the connection `overflow`, Host stops the
+/// server, and B's turn fails `overflow` too, not only A's. (An ordinary
+/// sink stall fails only its own session: the delivery unit test
+/// `idle_sink_failure_records_its_loss`.)
+#[test]
+fn codex_exhaustion_fails_the_shared_connection() {
+    let name = "codex_exhaustion_fails_the_shared_connection";
+    let mut replay = replay_of("c4_two_sessions").unwrap();
+    let mut expect = expect_of("c4_two_sessions").unwrap();
+    replay["source"] = json!(format!("{name}: a variant of c4_two_sessions"));
+    expect["source"] = replay["source"].clone();
+    let a_tool = step_with(&replay, "exec-019a0000-0000-7000-8000-000000400007").unwrap();
+    // A's thread and turn are c1's.
+    let mut burst = Vec::new();
+    for n in 0..1023 {
+        burst.push(emit(&json!({"method": "item/started", "params": {
+            "threadId": THREAD, "turnId": TURN,
+            "item": {"type": "commandExecution", "id": format!("tool-a-{n}"),
+                "command": "sleep 1", "cwd": "/work/project-a", "commandActions": [],
+                "status": "inProgress"}}})));
+        if n % 8 == 7 {
+            burst.push(json!({"delay": {"ms": 30}}));
+        }
+    }
+    burst.push(sigterm());
+    cut_after(&mut replay, a_tool, &burst).unwrap();
+    for index in 0..2 {
+        let turn = turn_mut(&mut expect, index);
+        turn["stop"] = Value::Null;
+        let turn = &mut turn["expect"];
+        turn["terminal"] = Value::Null;
+        turn["usage"] = Value::Null;
+        turn["final_text"] = Value::Null;
+        turn["error"] = json!("overflow");
+        // A's delivery stopped at its overflow: what was dropped proves
+        // nothing. B's end is the connection's loss, whose evidence is
+        // Host's stop of the server.
+        turn["cleanup"] = json!(if index == 0 { "uncertain" } else { "quiescent" });
+        if let Some(turn) = turn.as_object_mut() {
+            turn.remove("cleanup_settles");
+        }
+        let include: Vec<Value> = turn["observations_include"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|kind| {
+                kind["kind"] == json!("session.vendor_identity_confirmed")
+                    || kind["kind"] == json!("turn.accepted")
+            })
+            .cloned()
+            .collect();
+        turn["observations_include"] = json!(include);
+        turn["observations_exclude"] = json!(["final_text"]);
+        turn["observations_order"] = json!(["session.vendor_identity_confirmed", "turn.accepted"]);
+        turn["unasserted"] = json!([]);
+    }
+    for session in ["main", "b"] {
+        expect["sessions"][session]["close"] = Value::Null;
+        expect["sessions"][session]["health"] =
+            json!({"state": "failed", "first_cause": "overflow"});
+    }
     variant(name, &replay, &expect).unwrap();
 }
 

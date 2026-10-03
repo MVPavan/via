@@ -27,16 +27,16 @@
 use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use tokio::sync::{oneshot, watch};
 use tokio::time::Instant;
 use via_routes::codex::{
-    AbnormalEnd, ClientId, CommitOutcome, Connection, ConnectionEnd, ConnectionLoss, FINISH_BY,
-    LOSS_EVIDENCE, Lane, LaneEnd, LaneLease, LaunchError, LeaseSignal, LossCause, Mark, Purpose,
-    RequestError, Response, RpcError, SandboxMode, ServerKey, ServerPin, Subscription,
-    ThreadResult, ThreadSettings, TurnFolder, TurnStart, TurnStartResult, TurnWrites, WriteBounds,
-    crash_on_panic, data, result, thread_resume, thread_start, turn_start,
+    AbnormalEnd, ClientId, CommitOutcome, Connection, ConnectionEnd, ConnectionFailure,
+    ConnectionLoss, FINISH_BY, LOSS_EVIDENCE, Lane, LaneEnd, LaneLease, LaunchError, LeaseSignal,
+    LossCause, Mark, Purpose, RequestError, Response, RpcError, SandboxMode, ServerKey, ServerPin,
+    Subscription, ThreadResult, ThreadSettings, TurnFolder, TurnStart, TurnStartResult, TurnWrites,
+    WriteBounds, crash_on_panic, data, result, thread_resume, thread_start, turn_start,
 };
 use via_routes::{Retirement, SendOutcome, StoreFailure, WireCleanup};
 
@@ -55,8 +55,8 @@ use crate::driver::{
 use crate::harness::Harness;
 use crate::instance::Incompatibility;
 use crate::observation::{
-    Acceptance, AdapterError, Identity, InstanceReport, Observation, ObservationItem, TurnEnd,
-    TurnEvidence, UnparsedOutput,
+    Acceptance, AdapterError, Charge, Identity, InstanceReport, Observation, ObservationItem,
+    SessionCap, TurnEnd, TurnEvidence, UnparsedOutput,
 };
 use crate::plan::{Bound, Inherit, RefusalKind};
 use crate::runtime::event_stall;
@@ -87,6 +87,9 @@ pub(crate) struct CodexSession {
     /// The driver's loss record (X0 item 10), which each generation's
     /// abnormal-end handler writes too.
     losses: Arc<Mutex<Losses>>,
+    /// The session's metadata cap on its observation budget (x.3.2 X3
+    /// §6.2), shared by its registrations and its turns' credits.
+    cap: OnceLock<SessionCap>,
 }
 
 /// The session's connection generation. The fields drop in order: the
@@ -143,7 +146,15 @@ impl CodexSession {
             attached: Mutex::new(None),
             bound: Mutex::new(None),
             losses: Arc::new(Mutex::new(Losses::default())),
+            cap: OnceLock::new(),
         }
+    }
+
+    /// The session's metadata cap, on `driver`'s observation budget.
+    fn cap(&self, driver: &SessionDriver) -> SessionCap {
+        self.cap
+            .get_or_init(|| SessionCap::new(&driver.observations))
+            .clone()
     }
 
     fn attached(&self) -> std::sync::MutexGuard<'_, Option<Attached>> {
@@ -505,11 +516,11 @@ fn sticky(earlier: Retirement, later: Retirement) -> Retirement {
 
 /// The orders that end a turn: Core's stop, the driver's close, the wall,
 /// the daemon force and the session's cancellation.
-struct Orders {
-    stop: StopWatch,
-    close: watch::Receiver<Option<StopOrder>>,
-    wall: Deadline,
-    cancel: tokio_util::sync::CancellationToken,
+pub(super) struct Orders {
+    pub(super) stop: StopWatch,
+    pub(super) close: watch::Receiver<Option<StopOrder>>,
+    pub(super) wall: Deadline,
+    pub(super) cancel: tokio_util::sync::CancellationToken,
 }
 
 /// Why a turn is ending, and by when it must have ended.
@@ -880,6 +891,11 @@ async fn turn(
     if let Err(end) = link(&facts, &connection, wall).await {
         return *end;
     }
+    let cap = session.cap(driver);
+    let credit = match credit(&cap, (&mut orders, &mut force, &driver.health)).await {
+        Ok(credit) => credit,
+        Err(why) => return uncredited(&facts, &connection, why, (&orders, &force)),
+    };
     // The turn's input writes: withdrawn before their first byte however
     // the turn ends (X0 item 12.2).
     let mut writes = TurnWrites::new(&connection);
@@ -920,7 +936,7 @@ async fn turn(
     let end = run_started(
         &mut facts,
         &start,
-        spec,
+        (spec, credit),
         (&activity, &mut orders, &mut force, &mut writes),
     )
     .await;
@@ -930,6 +946,80 @@ async fn turn(
     }
     drop(pin);
     end
+}
+
+/// The bytes of a maximal vendor turn ID (C2 A1): a turn's credit is
+/// sized for it (x.3.2 X3 §3.4).
+const VENDOR_ID_MAX: usize = 1024;
+
+/// Why a turn's credit was not reserved (x.3.2 X3 §4.2 step 1).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Uncredited {
+    /// The session's cap is full: the connection's overflow (§6.4).
+    Exhausted,
+    /// The turn's own order: a stop, the driver's close, the wall or the
+    /// session's cancellation.
+    Ordered,
+    /// The daemon force.
+    Forced,
+    /// The driver's health failed.
+    Failed,
+    /// The budget stayed full past the stall bound.
+    Stalled,
+}
+
+/// x.3.2 X3 §4.2 step 1: reserves the turn's credit before any of its jobs
+/// exists. The cap slot is taken at once; the budget bytes are awaited
+/// beside the turn's orders, the daemon force, the driver's failure and
+/// the stall bound, and any of them ends the wait with nothing reserved.
+pub(super) async fn credit(
+    cap: &SessionCap,
+    (orders, force, health): (&mut Orders, &mut ForceWatch, &watch::Sender<DriverHealth>),
+) -> Result<Charge, Uncredited> {
+    let slot = cap
+        .credit_slot(VENDOR_ID_MAX)
+        .ok_or(Uncredited::Exhausted)?;
+    let slot = match cap.try_charge(slot) {
+        Ok(credit) => return Ok(credit),
+        Err(slot) => slot,
+    };
+    let mut health = health.subscribe();
+    tokio::select! {
+        biased;
+        () = forced(force) => Err(Uncredited::Forced),
+        _ = health.wait_for(|health| matches!(health, DriverHealth::Failed { .. })) => {
+            Err(Uncredited::Failed)
+        }
+        _ = orders.ordered() => Err(Uncredited::Ordered),
+        charged = tokio::time::timeout(event_stall(), cap.charge(slot)) => {
+            charged.ok().flatten().ok_or(Uncredited::Stalled)
+        }
+    }
+}
+
+/// A turn whose credit was not reserved ends before any of its jobs
+/// exists, with nothing launched (x.3.2 X3 §4.2 step 1).
+fn uncredited(
+    facts: &Turn<'_>,
+    connection: &Connection,
+    why: Uncredited,
+    (orders, force): (&Orders, &ForceWatch),
+) -> TurnEnd {
+    let turn = facts.number;
+    match why {
+        Uncredited::Exhausted => {
+            connection.fail(ConnectionFailure::Overflow);
+            facts.failed(RouteError::Overflow { turn }, None)
+        }
+        Uncredited::Stalled => {
+            facts.driver.fail(DriverFailure::ObservationOverflow);
+            facts.failed(RouteError::Overflow { turn }, None)
+        }
+        Uncredited::Failed => facts.rejected(StartRejected::SessionGone),
+        Uncredited::Ordered | Uncredited::Forced => {
+            facts.failed(unsent_cause(orders, force, turn), None)
+        }
+    }
 }
 
 /// The turn's evidence folder, where its undecoded messages go.
@@ -1164,7 +1254,7 @@ fn launch_failed(facts: &mut Turn<'_>, failure: &LaunchError) -> TurnEnd {
 }
 
 /// The cause of a turn its order ended before anything was sent.
-fn unsent_cause(orders: &Orders, force: &ForceWatch, turn: TurnNumber) -> RouteError {
+pub(super) fn unsent_cause(orders: &Orders, force: &ForceWatch, turn: TurnNumber) -> RouteError {
     if force.borrow().is_some() {
         RouteError::ForceStopped { turn }
     } else if Instant::now() >= orders.wall.instant() {
@@ -1512,7 +1602,7 @@ struct Started<'a> {
 async fn run_started(
     facts: &mut Turn<'_>,
     start: &Started<'_>,
-    spec: TurnSpec,
+    (spec, credit): (TurnSpec, Charge),
     (activity, orders, force, writes): (
         &crate::TurnActivity,
         &mut Orders,
@@ -1614,7 +1704,7 @@ async fn run_started(
     let delivery = hand_over(
         facts,
         start,
-        (&accepted, (acceptance, read, mark)),
+        (&accepted, (acceptance, read, mark), credit),
         activity,
     );
     let accepted_turn = Accepted {
@@ -1654,7 +1744,7 @@ fn normalize_on_tracker(
     ids: &Ids<'_>,
     lease: &LaneLease,
 ) -> Arc<Registration> {
-    let registration = Registration::new(ids.generation.signal.enqueued());
+    let registration = Registration::new(ids.generation.signal.enqueued(), session.cap(driver));
     driver.tracker.spawn(crash_on_panic(
         Normalizing::new(
             (Arc::clone(&registration), Arc::clone(lease.lane())),
@@ -1682,7 +1772,7 @@ fn normalize_on_tracker(
 fn hand_over(
     facts: &Turn<'_>,
     start: &Started<'_>,
-    (accepted, acceptance): (&str, (Acceptance, Instant, Option<Mark>)),
+    (accepted, acceptance, credit): (&str, (Acceptance, Instant, Option<Mark>), Charge),
     activity: &crate::TurnActivity,
 ) -> Arc<Delivery> {
     let lane = start.thread.lease.lane();
@@ -1699,6 +1789,7 @@ fn hand_over(
         folder: Arc::clone(start.folder),
         activity: activity.clone(),
         schema: start.schema,
+        credit,
     });
     delivery
 }

@@ -1235,3 +1235,117 @@ fn force_wins_over_a_ready_decision() {
     assert_eq!(ready_cut(false, false, true), Some(Cut::Overflow));
     assert_eq!(ready_cut(false, false, false), None);
 }
+
+/// x.3.2 X3 S4 (F2): admission waits for its credit beside every cutoff.
+/// With the session's budget full, a turn's credit waits; its stop, the
+/// daemon force, its wall and the driver's failure each end the wait at
+/// once with nothing reserved (the cap back at its baseline) and that
+/// cause, before any job exists. Once the budget has room the credit is
+/// taken; a full cap is exhaustion, never a wait.
+#[tokio::test]
+async fn admission_credit_waits_beside_its_cutoffs() {
+    use std::time::Duration;
+
+    use tokio::sync::watch;
+    use tokio_util::sync::CancellationToken;
+
+    use super::driver::{Orders, Uncredited, credit, unsent_cause};
+    use crate::driver::latch;
+    use crate::observation::{SessionCap, observation_channel};
+    use crate::{
+        Deadline, DriverFailure, DriverHealth, RouteError, StopCause, StopOrder, TurnNumber,
+    };
+
+    #[derive(Clone, Copy, Debug)]
+    enum Arm {
+        Stop,
+        Force,
+        Wall,
+        Health,
+    }
+    let turn = TurnNumber::try_from(2).unwrap();
+    for arm in [Arm::Stop, Arm::Force, Arm::Wall, Arm::Health] {
+        let (sink, _received) = observation_channel();
+        let cap = SessionCap::new(&sink);
+        let full = cap.fill_budget().unwrap();
+        let soon = Instant::now() + Duration::from_millis(100);
+        let (stop, stop_watch) = watch::channel(None);
+        let (_close, close) = watch::channel(None);
+        let (force_set, mut force) = watch::channel(None);
+        let health = watch::Sender::new(DriverHealth::Open);
+        let mut orders = Orders {
+            stop: stop_watch,
+            close,
+            wall: Deadline::at(if matches!(arm, Arm::Wall) {
+                soon
+            } else {
+                soon + Duration::from_secs(60)
+            }),
+            cancel: CancellationToken::new(),
+        };
+        let cutoff = async {
+            tokio::time::sleep_until(soon).await;
+            match arm {
+                Arm::Stop => {
+                    stop.send_replace(Some(StopOrder {
+                        cause: StopCause::Close,
+                        requested_at: String::new(),
+                        force_at: Deadline::at(soon),
+                        close_by: Deadline::at(soon + Duration::from_secs(3)),
+                    }));
+                }
+                Arm::Force => {
+                    force_set.send_replace(Some(soon));
+                }
+                Arm::Wall => {}
+                Arm::Health => latch(&health, DriverFailure::TurnAbandoned),
+            }
+            std::future::pending::<()>().await;
+        };
+        let waited = tokio::select! {
+            waited = tokio::time::timeout(
+                Duration::from_secs(5),
+                credit(&cap, (&mut orders, &mut force, &health)),
+            ) => waited.unwrap(),
+            () = cutoff => unreachable!(),
+        };
+        let expected = match arm {
+            Arm::Stop | Arm::Wall => Uncredited::Ordered,
+            Arm::Force => Uncredited::Forced,
+            Arm::Health => Uncredited::Failed,
+        };
+        assert_eq!(waited.err(), Some(expected), "{arm:?}");
+        assert!(Instant::now() < soon + Duration::from_secs(1), "{arm:?}");
+        assert_eq!(cap.held(), (0, 0), "{arm:?}: nothing reserved");
+        let cause = unsent_cause(&orders, &force, turn);
+        match arm {
+            Arm::Stop => assert_eq!(cause, RouteError::Stopped { turn }),
+            Arm::Force => assert_eq!(cause, RouteError::ForceStopped { turn }),
+            Arm::Wall => assert_eq!(cause, RouteError::Deadline { turn }),
+            Arm::Health => {}
+        }
+        drop(full);
+        let taken = credit(&cap, (&mut orders, &mut force, &health)).await;
+        assert!(taken.is_ok(), "{arm:?}: room is taken at once");
+        assert_eq!(cap.held().0, 1);
+    }
+
+    let (sink, _received) = observation_channel();
+    let cap = SessionCap::new(&sink);
+    let held: Vec<_> = std::iter::from_fn(|| cap.slot(0)).collect();
+    assert_eq!(held.len(), 1024);
+    let (_stop, stop) = watch::channel(None);
+    let (_close, close) = watch::channel(None);
+    let (_force, mut force) = watch::channel(None);
+    let mut orders = Orders {
+        stop,
+        close,
+        wall: Deadline::at(Instant::now() + Duration::from_secs(60)),
+        cancel: CancellationToken::new(),
+    };
+    let health = watch::Sender::new(DriverHealth::Open);
+    assert_eq!(
+        credit(&cap, (&mut orders, &mut force, &health)).await.err(),
+        Some(Uncredited::Exhausted)
+    );
+}

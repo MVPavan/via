@@ -36,16 +36,18 @@ use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use via_routes::codex::{
-    Connection, DECLINE_DEADLINE, Incoming, Lane, LaneEnd, LaneEvent, LaneItem, Mark, Notification,
-    Routed, ServerRequest, TurnFolder, decode,
+    Connection, ConnectionFailure, DECLINE_DEADLINE, Incoming, Lane, LaneEnd, LaneEvent, LaneItem,
+    Mark, Notification, Routed, ServerRequest, TurnFolder, decode,
 };
 
 use super::normalize::{
     self, Ledger, Metadata, NormalizeError, Step, StructuredOutput, TurnNormalizer, ledger,
+    ledger_on,
 };
 use crate::driver::latch;
 use crate::observation::{
-    Acceptance, Observation, ObservationItem, ObservationSink, Reserved, VendorTerminal, admitted,
+    Acceptance, Charge, Observation, ObservationItem, ObservationSink, Reserved, SessionCap,
+    VendorTerminal, admitted,
 };
 use crate::runtime::event_stall;
 use crate::{DriverFailure, DriverHealth, RouteError, TurnActivity, TurnNumber, VendorTurnId};
@@ -83,6 +85,20 @@ impl Losses {
     /// earliest position, the counts added or unknown, the trigger and
     /// generation kept).
     pub(crate) fn note(&mut self, generation: u64, first_unqueued: u64, omitted: u64) {
+        if let Some(trigger) = self.latest {
+            self.note_turn(trigger, generation, first_unqueued, omitted);
+        }
+    }
+
+    /// [`Self::note`] for a loss turn `trigger` affected (x.3.2 X3 §3.5):
+    /// a new record names it.
+    pub(crate) fn note_turn(
+        &mut self,
+        trigger: TurnNumber,
+        generation: u64,
+        first_unqueued: u64,
+        omitted: u64,
+    ) {
         if let Some(record) = self.record.as_mut() {
             record.first_unqueued = record.first_unqueued.min(first_unqueued);
             record.omitted = if record.omitted == UNKNOWN || omitted == UNKNOWN {
@@ -92,14 +108,12 @@ impl Losses {
             };
             return;
         }
-        if let Some(trigger) = self.latest {
-            self.record = Some(ObservationLoss {
-                trigger,
-                generation,
-                first_unqueued,
-                omitted,
-            });
-        }
+        self.record = Some(ObservationLoss {
+            trigger,
+            generation,
+            first_unqueued,
+            omitted,
+        });
     }
 }
 
@@ -356,6 +370,10 @@ pub(crate) trait ServerEvidence: Send + Sync {
         bytes: &'a [u8],
         what: &'a str,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+    /// The session's metadata cap is exhausted: the connection fails
+    /// `overflow` (x.3.2 X3 §6.4), which every session on it sees.
+    fn overflow(&self);
 }
 
 impl ServerEvidence for Connection {
@@ -365,6 +383,10 @@ impl ServerEvidence for Connection {
         what: &'a str,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(self.keep_undecoded(bytes, what))
+    }
+
+    fn overflow(&self) {
+        self.fail(ConnectionFailure::Overflow);
     }
 }
 
@@ -389,6 +411,8 @@ pub(crate) struct Current {
     pub(crate) folder: Arc<TurnFolder>,
     pub(crate) activity: TurnActivity,
     pub(crate) schema: bool,
+    /// The turn's credit (x.3.2 X3 §3.4), reserved at its admission.
+    pub(crate) credit: Charge,
 }
 
 #[derive(Default)]
@@ -418,11 +442,12 @@ pub(crate) struct Registration {
 }
 
 impl Registration {
-    /// A registration whose last message before it is `before`.
-    pub(crate) fn new(before: u64) -> Arc<Self> {
+    /// A registration whose last message before it is `before`, its
+    /// metadata charged to the session's `cap`.
+    pub(crate) fn new(before: u64, cap: SessionCap) -> Arc<Self> {
         Arc::new(Self {
             slot: Mutex::new(Slot::default()),
-            ledger: Ledger::default(),
+            ledger: ledger_on(cap),
             changed: Notify::new(),
             idle: Delivery::new(before),
             drained: watch::channel(false).0,
@@ -525,6 +550,8 @@ struct Running {
     folder: Arc<TurnFolder>,
     activity: TurnActivity,
     normalizer: TurnNormalizer,
+    /// Its credit, held while its vendor ID is (x.3.2 X3 §3.4, r8 #6).
+    credit: Charge,
 }
 
 /// Delivered positions under one turn's fence, reported in order.
@@ -534,6 +561,9 @@ struct Marks {
     /// acceptance's, while messages read before its reply are delivered
     /// after it.
     ahead: BTreeSet<u64>,
+    /// The first position read under the fence whose observations were
+    /// lost (x.3.2 X3 §3.5, r10 #1): no report reaches it.
+    gap: Option<u64>,
 }
 
 /// The driver's loss record and the generation it names (x.3.2 X3 fix r4
@@ -698,6 +728,7 @@ impl Normalizing {
             folder,
             activity,
             schema,
+            credit,
         } = current;
         let sealed = Arc::clone(&delivery);
         self.running = Some(Running {
@@ -707,6 +738,7 @@ impl Normalizing {
             folder,
             activity,
             normalizer: TurnNormalizer::on(schema, turn, Arc::clone(&self.registration.ledger)),
+            credit,
         });
         let mut open = self.deliver_turn(acceptance).await;
         if open {
@@ -719,6 +751,9 @@ impl Normalizing {
         }
         if let Some(running) = self.running.take() {
             self.finished = Some(running.turn);
+            self.registration
+                .ledger()
+                .close(running.turn, running.credit);
         }
         open
     }
@@ -734,6 +769,10 @@ impl Normalizing {
             .await
         {
             return true;
+        }
+        // Only a successful `Accepted` send maps the turn (x.3.2 X3 §3.4).
+        if let Some(running) = &self.running {
+            self.registration.ledger().map(running.turn);
         }
         // Messages of the fence read before the reply go out after it:
         // its position counts once they did.
@@ -796,25 +835,13 @@ impl Normalizing {
     /// that fence's turn runs (x.3.2 critical r2 #2, runtime §8): a stale
     /// message counts for no turn.
     fn mark_delivered(&mut self, mark: Mark) {
-        let fenced = self.registration.slot().fenced.clone();
-        let Some(fenced) = fenced.filter(|fenced| {
-            fenced.fence == mark.fence && !fenced.finished && self.finished != Some(fenced.turn)
-        }) else {
+        let Some(fenced) = self.live(mark) else {
             return;
         };
-        if self
-            .marks
-            .as_ref()
-            .is_none_or(|marks| marks.fence != mark.fence)
-        {
-            self.marks = Some(Marks {
-                fence: mark.fence,
-                ahead: BTreeSet::new(),
-            });
+        let marks = self.marks(mark.fence);
+        if marks.gap.is_some_and(|gap| mark.seq >= gap) {
+            return;
         }
-        let Some(marks) = self.marks.as_mut() else {
-            return;
-        };
         marks.ahead.insert(mark.seq);
         while let Some(&next) = marks.ahead.first() {
             if next > fenced.activity.delivered().saturating_add(1) {
@@ -831,6 +858,31 @@ impl Normalizing {
             "fence positions ahead: {:?}",
             marks.ahead
         );
+    }
+
+    /// The turn that fenced `mark`, while its fence is live.
+    fn live(&self, mark: Mark) -> Option<Fenced> {
+        let fenced = self.registration.slot().fenced.clone();
+        fenced.filter(|fenced| {
+            fenced.fence == mark.fence && !fenced.finished && self.finished != Some(fenced.turn)
+        })
+    }
+
+    /// The marks of fence `fence`, fresh for a new fence.
+    fn marks(&mut self, fence: u64) -> &mut Marks {
+        let marks = self.marks.get_or_insert_with(|| Marks {
+            fence,
+            ahead: BTreeSet::new(),
+            gap: None,
+        });
+        if marks.fence != fence {
+            *marks = Marks {
+                fence,
+                ahead: BTreeSet::new(),
+                gap: None,
+            };
+        }
+        marks
     }
 
     fn owner(&self, routed: &Routed) -> Owner {
@@ -852,6 +904,7 @@ impl Normalizing {
     async fn message(&mut self, item: LaneItem) -> Flow {
         let (seq, mark) = (item.routed().seq, item.routed().mark);
         let flow = self.handle(item).await;
+        self.registration.ledger().unstage();
         if let Some(mark) = mark
             && self.delivery().whole(seq)
         {
@@ -862,13 +915,31 @@ impl Normalizing {
 
     /// [`Self::message`]'s handling: the item's observations, at the
     /// instant the connection read it. The ledger is updated first, in
-    /// every state, whatever goes out (x.3.2 X3 §6.3).
+    /// every state, whatever goes out (x.3.2 X3 §6.3), once the charge of
+    /// an entry it may insert was reserved (§6.2).
     async fn handle(&mut self, item: LaneItem) -> Flow {
         let owner = self.owner(item.routed());
         let decoded = match &item {
             LaneItem::Message(routed) => Some(decode(routed.staged.bytes())),
             LaneItem::Declined { .. } => None,
         };
+        let wanted = {
+            let ledger = self.registration.ledger();
+            match (&item, &decoded) {
+                (LaneItem::Message(_), Some(Ok(Incoming::Notification(notification)))) => self
+                    .entry_turn(owner)
+                    .and_then(|turn| ledger.wants(turn, notification)),
+                (LaneItem::Declined { request, .. }, _) => self
+                    .entry_turn(owner)
+                    .and_then(|turn| ledger.wants_decline(turn, request)),
+                (LaneItem::Message(_), _) => None,
+            }
+        };
+        if let Some(key) = wanted
+            && !self.stage(key).await
+        {
+            return Flow::Done;
+        }
         let tracked = match (&item, &decoded) {
             (LaneItem::Message(_), Some(Ok(Incoming::Notification(notification)))) => {
                 self.track(owner, |ledger, turn| ledger.track(turn, notification))
@@ -885,7 +956,7 @@ impl Normalizing {
             self.stop(Stop::Overflow);
             return Flow::Done;
         }
-        let at = item.routed().at;
+        let (at, seq, mark) = (item.routed().at, item.routed().seq, item.routed().mark);
         match item {
             LaneItem::Message(routed) => {
                 let notification = match decoded {
@@ -897,7 +968,9 @@ impl Normalizing {
                 let named = routed.turn;
                 drop(routed.staged);
                 if let (Owner::Earlier(earlier), Some(turn)) = (owner, named) {
-                    return self.late(&notification, (earlier, &turn), at).await;
+                    return self
+                        .late(&notification, (earlier, &turn), (at, seq, mark))
+                        .await;
                 }
                 self.notification(owner, &notification, at).await
             }
@@ -907,11 +980,78 @@ impl Normalizing {
                 decoded_at,
                 written,
             } => {
-                let flow = self.declined(owner, &request, decoded_at, written).await;
+                let flow = self
+                    .declined(owner, &request, (decoded_at, seq, mark), written)
+                    .await;
                 drop(routed);
                 flow
             }
         }
+    }
+
+    /// The turn whose ledger entry a message of `owner` may insert: the
+    /// running turn's (its own or a thread-level message the normalizer
+    /// judges), or an earlier turn's by the connection's mapping.
+    fn entry_turn(&self, owner: Owner) -> Option<TurnNumber> {
+        match (owner, &self.running) {
+            (Owner::This | Owner::Thread, Some(running)) => Some(running.turn),
+            (Owner::Earlier(turn), _) => Some(turn),
+            (Owner::This | Owner::Thread | Owner::Unknown, _) => None,
+        }
+    }
+
+    /// x.3.2 X3 §6.2 (F2): reserves the charge of the ledger entry the
+    /// message may insert, before the ledger is updated. The cap slot is
+    /// taken at once: a full cap fails the connection `overflow` (§6.4).
+    /// The budget bytes are awaited within the stall bound, or until the
+    /// driver's health fails. False once delivery stopped: a wait that
+    /// ended without its charge takes the overflow path (the loss noted,
+    /// the cleanup uncertain).
+    async fn stage(&mut self, key: usize) -> bool {
+        let cap = self.registration.ledger().cap().clone();
+        let Some(slot) = cap.slot(key) else {
+            self.registration.ledger().exhaust();
+            self.evidence.server.overflow();
+            self.stop(Stop::Overflow);
+            return false;
+        };
+        let slot = match cap.try_charge(slot) {
+            Ok(charge) => {
+                self.registration.ledger().stage(charge);
+                return true;
+            }
+            Err(slot) => slot,
+        };
+        let mut health = self.health.subscribe();
+        let charged = tokio::select! {
+            biased;
+            _ = health.wait_for(|health| matches!(health, DriverHealth::Failed { .. })) => None,
+            charged = tokio::time::timeout(event_stall(), cap.charge(slot)) => {
+                if charged.is_err() {
+                    latch(&self.health, DriverFailure::ObservationOverflow);
+                }
+                charged.ok().flatten()
+            }
+        };
+        let Some(charge) = charged else {
+            self.stop(Stop::Overflow);
+            return false;
+        };
+        self.registration.ledger().stage(charge);
+        true
+    }
+
+    /// x.3.2 X3 §3.4, §3.5: an observation of earlier turn `turn`, never
+    /// mapped to Core, is lost, not relabeled: the loss is noted for that
+    /// turn, and a live fence it was read under reports nothing from its
+    /// position on (the gap).
+    fn lose(&mut self, turn: TurnNumber, seq: u64, mark: Option<Mark>) -> Flow {
+        losses(&self.loss.losses).note_turn(turn, self.loss.generation, seq, 1);
+        if let Some(mark) = mark.filter(|mark| self.live(*mark).is_some()) {
+            let marks = self.marks(mark.fence);
+            marks.gap = Some(marks.gap.map_or(mark.seq, |gap| gap.min(mark.seq)));
+        }
+        flow(self.complete())
     }
 
     /// Updates the ledger for the turn that owns a message, when known:
@@ -1043,7 +1183,7 @@ impl Normalizing {
         &mut self,
         notification: &Notification,
         (earlier, turn): (TurnNumber, &str),
-        at: Instant,
+        (at, seq, mark): (Instant, u64, Option<Mark>),
     ) -> Flow {
         let denial = self
             .registration
@@ -1054,6 +1194,7 @@ impl Normalizing {
             return Flow::Done;
         };
         match denial {
+            Some(_) if !self.registration.ledger().mapped(earlier) => self.lose(earlier, seq, mark),
             Some(denial) => {
                 let denied = Observation::ActionDenied(denial);
                 let tools_open = self.tools_open();
@@ -1072,7 +1213,7 @@ impl Normalizing {
         &mut self,
         owner: Owner,
         request: &ServerRequest,
-        decoded_at: Instant,
+        (decoded_at, seq, mark): (Instant, u64, Option<Mark>),
         mut written: watch::Receiver<Option<bool>>,
     ) -> Flow {
         let named = match (owner, request.turn_id.as_deref(), self.running.as_ref()) {
@@ -1096,6 +1237,11 @@ impl Normalizing {
         };
         if !whole {
             return flow(self.complete());
+        }
+        if let Owner::Earlier(earlier) = owner
+            && !self.registration.ledger().mapped(earlier)
+        {
+            return self.lose(earlier, seq, mark);
         }
         let declined = Observation::RequestDeclined(normalize::decline(request));
         let tools_open = self.tools_open();
@@ -1175,6 +1321,7 @@ async fn idle_seam() {
 mod tests {
     use std::time::Duration;
 
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     use tokio::sync::watch;
@@ -1185,13 +1332,12 @@ mod tests {
         Delivery, Evidence, Folders, LossRecord, Losses, Normalizing, ObservationLoss,
         Registration, Retained, ServerEvidence, UNKNOWN,
     };
-    use crate::DriverHealth;
-    use crate::TurnNumber;
-    use crate::VendorTerminalStatus;
     use crate::observation::{
-        Observation, ObservationItem, ObservationSink, StopReason, VendorTerminal,
-        observation_channel,
+        Admitted, Observation, ObservationBudget, ObservationItem, ObservationSink, SessionCap,
+        StopReason, VendorTerminal, observation_channel, observation_channel_in,
     };
+    use crate::runtime::OBSERVATION_BYTES;
+    use crate::{DriverFailure, DriverHealth, TurnNumber, VendorTerminalStatus};
 
     fn item(text: &str) -> ObservationItem {
         ObservationItem {
@@ -1346,6 +1492,49 @@ mod tests {
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
             Box::pin(async {})
         }
+
+        fn overflow(&self) {}
+    }
+
+    /// A unit test's connection: whether its overflow was latched.
+    #[derive(Default)]
+    struct Connection(AtomicBool);
+
+    impl ServerEvidence for Connection {
+        fn keep<'a>(
+            &'a self,
+            _bytes: &'a [u8],
+            _what: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+            Box::pin(async {})
+        }
+
+        fn overflow(&self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    /// A cap on a budget of its own.
+    fn cap() -> SessionCap {
+        SessionCap::new(&observation_channel().0)
+    }
+
+    /// A registration whose last message before it is 4, on its own cap.
+    fn fresh() -> Arc<Registration> {
+        Registration::new(4, cap())
+    }
+
+    /// Maps turn `turn` of `registration` to Core, charged as its close
+    /// charges a new range.
+    fn mapped(registration: &Registration, turn: TurnNumber) {
+        let mut ledger = registration.ledger();
+        let cap = ledger.cap().clone();
+        let credit = cap.credit_slot(1024).map(|slot| cap.try_charge(slot));
+        let Some(Ok(credit)) = credit else {
+            panic!("no credit");
+        };
+        ledger.map(turn);
+        ledger.close(turn, credit);
     }
 
     fn turn(number: u32) -> TurnNumber {
@@ -1426,7 +1615,7 @@ mod tests {
     /// it.
     #[tokio::test]
     async fn late_tool_items_update_the_ledger() {
-        let registration = Registration::new(4);
+        let registration = fresh();
         let lane = Arc::new(Lane::default());
         assert!(lane.push(late_tool(5, turn(1), "item/started"), 64));
         lane.end(LaneEnd::Closed);
@@ -1439,7 +1628,7 @@ mod tests {
         assert!(registration.ledger().tools_open(turn(1)));
         assert_eq!(registration.ledger().entries(), 1);
 
-        let registration = Registration::new(4);
+        let registration = fresh();
         let lane = Arc::new(Lane::default());
         assert!(lane.push(late_tool(5, turn(1), "item/started"), 64));
         assert!(lane.push(late_tool(6, turn(1), "item/completed"), 64));
@@ -1475,7 +1664,7 @@ mod tests {
         .unwrap();
         via_routes::failpoint::activate(points.path(), TOKEN).unwrap();
 
-        let registration = Registration::new(4);
+        let registration = fresh();
         let lane = Arc::new(Lane::default());
         assert!(lane.push(late_tool(5, turn(1), "item/started"), 64));
         let run = tokio::spawn(idle_normalizer(&registration, &lane).run());
@@ -1496,41 +1685,82 @@ mod tests {
         assert!(registration.ledger().tools_open(turn(1)));
     }
 
+    /// A normalizer run's fixture: its parts, and what a test reads after.
+    struct Run {
+        registration: Arc<Registration>,
+        lane: Arc<Lane>,
+        connection: Arc<Connection>,
+        health: Arc<watch::Sender<DriverHealth>>,
+        losses: Arc<Mutex<Losses>>,
+    }
+
+    impl Run {
+        /// Turn 2 the latest, its registration on `cap`.
+        fn new(cap: SessionCap) -> Self {
+            Self {
+                registration: Registration::new(4, cap),
+                lane: Arc::new(Lane::default()),
+                connection: Arc::default(),
+                health: Arc::new(watch::Sender::new(DriverHealth::Open)),
+                losses: Arc::new(Mutex::new(Losses {
+                    record: None,
+                    latest: Some(turn(2)),
+                })),
+            }
+        }
+
+        /// Runs the registration's normalizer on `sink` until it returns.
+        async fn run(&self, sink: ObservationSink) {
+            let normalizing = Normalizing::new(
+                (Arc::clone(&self.registration), Arc::clone(&self.lane)),
+                (
+                    sink,
+                    Evidence {
+                        server: Arc::clone(&self.connection) as Arc<dyn ServerEvidence>,
+                        earlier: Folders::default(),
+                    },
+                ),
+                (CancellationToken::new(), Arc::clone(&self.health)),
+                LossRecord {
+                    losses: Arc::clone(&self.losses),
+                    generation: 3,
+                },
+            );
+            tokio::time::timeout(Duration::from_secs(5), normalizing.run())
+                .await
+                .unwrap();
+        }
+
+        fn record(&self) -> Option<ObservationLoss> {
+            self.losses.lock().unwrap().record
+        }
+
+        fn overflowed(&self) -> bool {
+            self.connection.0.load(Ordering::Acquire)
+        }
+    }
+
     /// x.3.2 X3 fix r4 #5, #6: a late denial the sink refuses while no
     /// turn runs fails the generation at once: the driver's health latches
     /// and the loss is recorded from that message, its count unknown.
+    /// x.3.2 X3 r6 #8 (F2): an ordinary sink stall fails only its own
+    /// session, never the shared connection.
     #[tokio::test]
     async fn idle_sink_failure_records_its_loss() {
         let (sink, received) = observation_channel();
         drop(received);
-        let lane = Arc::new(Lane::default());
-        assert!(lane.push(late_denial(5, turn(1)), 64));
-        let losses = Arc::new(Mutex::new(Losses {
-            record: None,
-            latest: Some(turn(2)),
-        }));
-        let health = Arc::new(watch::Sender::new(DriverHealth::Open));
-        let normalizing = Normalizing::new(
-            (Registration::new(4), Arc::clone(&lane)),
-            (
-                sink,
-                Evidence {
-                    server: Arc::new(NoEvidence),
-                    earlier: Folders::default(),
-                },
-            ),
-            (CancellationToken::new(), Arc::clone(&health)),
-            LossRecord {
-                losses: Arc::clone(&losses),
-                generation: 3,
-            },
-        );
-        tokio::time::timeout(Duration::from_secs(5), normalizing.run())
-            .await
-            .unwrap();
-        assert!(matches!(*health.borrow(), DriverHealth::Failed { .. }));
+        let run = Run::new(cap());
+        mapped(&run.registration, turn(1));
+        assert!(run.lane.push(late_denial(5, turn(1)), 64));
+        run.run(sink).await;
         assert_eq!(
-            losses.lock().unwrap().record,
+            *run.health.borrow(),
+            DriverHealth::Failed {
+                first_cause: DriverFailure::ObservationOverflow
+            }
+        );
+        assert_eq!(
+            run.record(),
             Some(ObservationLoss {
                 trigger: turn(2),
                 generation: 3,
@@ -1538,6 +1768,210 @@ mod tests {
                 omitted: UNKNOWN,
             })
         );
+        assert!(!run.overflowed(), "the connection is not failed");
+    }
+
+    /// x.3.2 X3 S2 and §3.4 (F2): "mapped to Core" is positive evidence. A
+    /// late denial naming turn 1, which the connection maps but whose
+    /// `Accepted` never went out, gives no observation and nothing
+    /// session-level: it is turn 1's loss, counted, and the generation
+    /// lives on.
+    #[tokio::test]
+    async fn an_unmapped_turns_late_denial_is_its_loss() {
+        let (sink, mut received) = observation_channel();
+        let run = Run::new(cap());
+        assert!(run.lane.push(late_denial(5, turn(1)), 64));
+        run.lane.end(LaneEnd::Closed);
+        run.run(sink).await;
+        assert!(received.try_recv().is_err(), "no observation");
+        assert_eq!(*run.health.borrow(), DriverHealth::Open);
+        assert_eq!(
+            run.record(),
+            Some(ObservationLoss {
+                trigger: turn(1),
+                generation: 3,
+                first_unqueued: 5,
+                omitted: 1,
+            })
+        );
+
+        // Mapped, the same denial is turn 1's late observation.
+        let (sink, mut received) = observation_channel();
+        let run = Run::new(cap());
+        mapped(&run.registration, turn(1));
+        assert!(run.lane.push(late_denial(5, turn(1)), 64));
+        run.lane.end(LaneEnd::Closed);
+        run.run(sink).await;
+        let Ok(Admitted { item, .. }) = received.try_recv() else {
+            panic!("no observation");
+        };
+        assert!(matches!(item.observation, Observation::ActionDenied(_)));
+        assert_eq!(run.record(), None);
+    }
+
+    /// x.3.2 X3 S6 (F2): ledger entries and mapped ranges are one count on
+    /// the session's cap. 1,023 entries and one range fit; the next entry
+    /// fails the connection `overflow` (every session on it sees the
+    /// failure), and the session's health with it. Released entries return
+    /// to the shared count.
+    #[tokio::test]
+    async fn the_cap_counts_entries_and_ranges_together() {
+        let cap = cap();
+        let run = Run::new(cap.clone());
+        let decline = |n: usize| super::ServerRequest {
+            id: via_routes::codex::RequestId::Int(1),
+            method: "item/commandExecution/requestApproval".to_owned(),
+            thread_id: None,
+            turn_id: None,
+            item_id: Some(format!("c{n}")),
+        };
+        for n in 0..1023 {
+            run.registration
+                .ledger()
+                .note_decline(turn(1), &decline(n))
+                .unwrap();
+        }
+        mapped(&run.registration, turn(1));
+        assert_eq!(cap.held().0, 1024, "1,023 entries and one range fit");
+        assert!(cap.slot(0).is_none(), "the next range has no slot");
+
+        assert!(run.lane.push(late_tool(5, turn(1), "item/started"), 64));
+        let (sink, _received) = observation_channel();
+        run.run(sink).await;
+        assert!(run.overflowed(), "the next entry fails the connection");
+        assert!(matches!(*run.health.borrow(), DriverHealth::Failed { .. }));
+        assert!(!run.registration.ledger().tools_open(turn(1)));
+        assert_eq!(cap.held().0, 1024);
+
+        drop(run);
+        assert_eq!(cap.held(), (0, 0), "released with the registration");
+        let cap = super::super::normalize::ledger_on(cap);
+        assert_eq!(
+            super::super::normalize::ledger(&cap).note_decline(turn(1), &decline(0)),
+            Ok(()),
+            "a released slot is taken again"
+        );
+    }
+
+    /// x.3.2 X3 §6.2 (F2): a ledger wait ends at the existing failure
+    /// signal. With the session's budget full, turn 1's late tool start
+    /// waits for its entry's bytes; the driver's health fails, and the
+    /// wait ends without a commit: the overflow path, the loss noted from
+    /// that message, the ledger unchanged.
+    #[tokio::test]
+    async fn a_ledger_wait_ends_at_the_drivers_failure() {
+        let budget = ObservationBudget::new();
+        let (sink, _received) = observation_channel_in(&budget);
+        let cap = SessionCap::new(&sink);
+        let full = cap.fill_budget().unwrap();
+        assert_eq!(budget.available(), 0);
+        let run = Run::new(cap.clone());
+        assert!(run.lane.push(late_tool(5, turn(1), "item/started"), 64));
+        let health = Arc::clone(&run.health);
+        let failing = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            crate::driver::latch(&health, DriverFailure::TurnAbandoned);
+        });
+        run.run(sink).await;
+        failing.await.unwrap();
+        assert!(!run.registration.ledger().tools_open(turn(1)));
+        assert_eq!(run.registration.ledger().entries(), 0);
+        assert_eq!(cap.held(), (0, 0), "the wait's slot is released");
+        assert_eq!(
+            run.record().map(|record| record.first_unqueued),
+            Some(5),
+            "the loss is noted from the message"
+        );
+        assert!(!run.overflowed());
+        drop(full);
+        assert_eq!(budget.available(), OBSERVATION_BYTES);
+    }
+
+    /// x.3.2 X3 r7 #3, r8 #6 (F2): a turn's credit outlives compression. A
+    /// turn that extends a range keeps its credit charged while it holds
+    /// its vendor ID, and releases it at its close; a non-adjacent turn's
+    /// credit becomes its new range's charge.
+    #[test]
+    fn a_credit_outlives_compression() {
+        let cap = cap();
+        let registration = Registration::new(4, cap.clone());
+        let credit = || {
+            cap.credit_slot(1024)
+                .map(|slot| cap.try_charge(slot).ok().unwrap())
+        };
+        mapped(&registration, turn(1));
+        assert_eq!(cap.held().0, 1);
+
+        let second = credit().unwrap();
+        registration.ledger().map(turn(2));
+        assert!(registration.ledger().mapped(turn(2)));
+        assert_eq!(cap.held().0, 2, "charged while turn 2 holds its ID");
+        registration.ledger().close(turn(2), second);
+        assert_eq!(cap.held().0, 1, "released at the close: turn 2 extended");
+
+        let fourth = credit().unwrap();
+        registration.ledger().map(turn(4));
+        registration.ledger().close(turn(4), fourth);
+        assert_eq!(cap.held().0, 2, "turn 4's credit charges its range");
+        assert!(!registration.ledger().mapped(turn(3)), "a hole stays");
+        assert!(registration.ledger().mapped(turn(4)));
+    }
+
+    /// x.3.2 X3 r5 #3 (F2): ledger entries are charged inside the
+    /// session's observation budget, their key bytes plus 64 B each, and
+    /// share its cap: 600 open tools of turn 1 and 424 of turn 2 fill it,
+    /// the next one overflows, and completions return their bytes.
+    #[test]
+    fn ledger_entries_hold_budget_permits() {
+        let budget = ObservationBudget::new();
+        let (sink, _received) = observation_channel_in(&budget);
+        let cap = SessionCap::new(&sink);
+        let ledger = super::super::normalize::ledger_on(cap.clone());
+        let tool = |method: &str, id: &str| {
+            let status = if method == "item/started" {
+                "inProgress"
+            } else {
+                "completed"
+            };
+            let line = serde_json::json!({"method": method, "params": {
+                "threadId": "thread-1", "turnId": "vendor-1",
+                "item": {"type": "commandExecution", "id": id, "command": "sleep 1",
+                    "cwd": "/w", "commandActions": [], "status": status}}});
+            match via_routes::codex::decode(line.to_string().as_bytes()) {
+                Ok(via_routes::codex::Incoming::Notification(notification)) => notification,
+                _ => panic!("not a notification"),
+            }
+        };
+        let id = |turn: u32, n: usize| format!("t{turn}-{n:04}");
+        let mut charged = 0;
+        for (number, count) in [(1, 600), (2, 424)] {
+            for n in 0..count {
+                super::super::normalize::ledger(&ledger)
+                    .track(turn(number), &tool("item/started", &id(number, n)))
+                    .unwrap();
+                charged += id(number, n).len() + 64;
+            }
+        }
+        assert_eq!(budget.available(), OBSERVATION_BYTES - charged);
+        assert_eq!(cap.held().0, 1024);
+        assert!(
+            super::super::normalize::ledger(&ledger)
+                .track(turn(2), &tool("item/started", &id(2, 424)))
+                .is_err(),
+            "the 1,025th entry overflows"
+        );
+        for n in 0..600 {
+            super::super::normalize::ledger(&ledger)
+                .track(turn(1), &tool("item/completed", &id(1, n)))
+                .unwrap();
+        }
+        assert_eq!(
+            budget.available(),
+            OBSERVATION_BYTES - 424 * (id(2, 0).len() + 64)
+        );
+        drop(ledger);
+        assert_eq!(budget.available(), OBSERVATION_BYTES);
+        assert_eq!(cap.held(), (0, 0));
     }
 
     /// X0 item 8.2 (x.3.2 X3 fix r4 #4, #6): a close whose barrier

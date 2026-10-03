@@ -4,7 +4,7 @@
 
 use std::borrow::Cow;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use serde_json::value::RawValue;
@@ -537,6 +537,146 @@ impl Default for ObservationBudget {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The entries a session's metadata cap holds (packet §5: 1,024 per
+/// session): ledger entries and mapped turn ranges, one combined count
+/// (x.3.2 X3 §6.2).
+const CAP_ENTRIES: usize = 1024;
+
+/// The key bytes the cap holds (packet §5: 256 KiB per session).
+const CAP_KEY_BYTES: usize = 256 * 1024;
+
+/// Each entry's fixed share of the observation budget, beside its key's
+/// bytes (x.3.2 X3 §6.2).
+const ENTRY_BYTES: usize = 64;
+
+/// What a session's cap holds.
+#[derive(Default)]
+struct Held {
+    entries: usize,
+    bytes: usize,
+}
+
+/// One session's metadata cap, beside its observation budget (x.3.2 X3
+/// §6.2): an entry takes a slot of the cap at once, then its key's bytes
+/// plus 64 B of the session's budget, so retained metadata is charged
+/// inside the 4 MiB Core's channel shares. A full cap is exhaustion, never
+/// a wait.
+#[derive(Clone)]
+pub(crate) struct SessionCap {
+    held: Arc<Mutex<Held>>,
+    budget: Arc<Semaphore>,
+}
+
+/// One slot of a session's cap, released when dropped: `key` bytes of
+/// the cap, and the budget bytes its charge takes.
+pub(crate) struct CapSlot {
+    held: Arc<Mutex<Held>>,
+    key: usize,
+    budget: usize,
+}
+
+impl Drop for CapSlot {
+    fn drop(&mut self) {
+        let mut held = lock_held(&self.held);
+        held.entries = held.entries.saturating_sub(1);
+        held.bytes = held.bytes.saturating_sub(self.key);
+    }
+}
+
+/// One entry's charge: its cap slot and its budget bytes, released when
+/// dropped.
+pub(crate) struct Charge {
+    _slot: CapSlot,
+    _permit: OwnedSemaphorePermit,
+}
+
+/// Locks a cap's counts; each edit is two assignments.
+fn lock_held(held: &Mutex<Held>) -> MutexGuard<'_, Held> {
+    held.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl SessionCap {
+    /// An empty cap on `sink`'s budget.
+    pub(crate) fn new(sink: &ObservationSink) -> Self {
+        Self {
+            held: Arc::default(),
+            budget: Arc::clone(&sink.budget),
+        }
+    }
+
+    /// A ledger entry's slot for a key of `key` bytes, taken at once:
+    /// `key` bytes of the cap, and of the budget plus 64 B; `None` once
+    /// the cap is full.
+    pub(crate) fn slot(&self, key: usize) -> Option<CapSlot> {
+        self.take(key, key.saturating_add(ENTRY_BYTES))
+    }
+
+    /// A turn's credit slot (x.3.2 X3 §3.4), taken at once: one entry of
+    /// the cap, and the budget bytes of a vendor ID of `id` bytes plus
+    /// 64 B; `None` once the cap is full.
+    pub(crate) fn credit_slot(&self, id: usize) -> Option<CapSlot> {
+        self.take(0, id.saturating_add(ENTRY_BYTES))
+    }
+
+    fn take(&self, key: usize, budget: usize) -> Option<CapSlot> {
+        let mut held = lock_held(&self.held);
+        let bytes = held.bytes.saturating_add(key);
+        if held.entries >= CAP_ENTRIES || bytes > CAP_KEY_BYTES {
+            return None;
+        }
+        held.entries += 1;
+        held.bytes = bytes;
+        Some(CapSlot {
+            held: Arc::clone(&self.held),
+            key,
+            budget,
+        })
+    }
+
+    /// `slot`'s budget bytes, when free now; else the slot back.
+    pub(crate) fn try_charge(&self, slot: CapSlot) -> Result<Charge, CapSlot> {
+        match Arc::clone(&self.budget).try_acquire_many_owned(entry_bytes(&slot)) {
+            Ok(permit) => Ok(Charge {
+                _slot: slot,
+                _permit: permit,
+            }),
+            Err(_) => Err(slot),
+        }
+    }
+
+    /// `slot`'s budget bytes, awaited; dropping the wait releases the
+    /// slot. `None` only if the budget closed.
+    pub(crate) async fn charge(&self, slot: CapSlot) -> Option<Charge> {
+        let permit = Arc::clone(&self.budget)
+            .acquire_many_owned(entry_bytes(&slot))
+            .await
+            .ok()?;
+        Some(Charge {
+            _slot: slot,
+            _permit: permit,
+        })
+    }
+
+    /// Test builds: the entries and key bytes held.
+    #[cfg(test)]
+    pub(crate) fn held(&self) -> (usize, usize) {
+        let held = lock_held(&self.held);
+        (held.entries, held.bytes)
+    }
+
+    /// Test builds: every budget byte free now, held until dropped.
+    #[cfg(test)]
+    pub(crate) fn fill_budget(&self) -> Option<OwnedSemaphorePermit> {
+        let free = u32::try_from(self.budget.available_permits()).ok()?;
+        Arc::clone(&self.budget).try_acquire_many_owned(free).ok()
+    }
+}
+
+/// A slot's budget bytes, within `u32` as the cap bounds a key.
+fn entry_bytes(slot: &CapSlot) -> u32 {
+    u32::try_from(slot.budget).unwrap_or(u32::MAX)
 }
 
 /// A session channel on the session's `budget` (C2 §2 `SessionCx`).

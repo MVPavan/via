@@ -3,7 +3,7 @@
 //! one turn's notifications.
 
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serde_json::value::RawValue;
@@ -15,8 +15,8 @@ use via_routes::codex::{
 
 use super::plan::CHECKED;
 use crate::observation::{
-    ClassHint, Decline, Denial, DenialKind, Observation, ProgressMarks, StopReason, UsageSample,
-    VendorTerminal,
+    Charge, ClassHint, Decline, Denial, DenialKind, Observation, ProgressMarks, SessionCap,
+    StopReason, UsageSample, VendorTerminal,
 };
 use crate::plan::VersionStatus;
 use crate::{TurnNumber, VendorTerminalStatus, final_text_pieces};
@@ -197,16 +197,6 @@ pub(crate) enum Step {
 /// qualified figure.
 const STRUCTURED_MAX: usize = 4 * 1024 * 1024;
 
-/// The most item IDs a session's metadata holds (packet §5: 1024
-/// entries per session).
-const TRACKED_ITEMS_MAX: usize = 1024;
-
-/// The ID bytes a session's metadata holds (packet §5: 256 KiB per
-/// session). The first ID past either bound is an explicit overflow
-/// (review r2 #2), for good: nothing continues with inaccurate
-/// correlation, and nothing is forgotten silently (x.3.2 X3 fix r4 #2).
-const TRACKED_BYTES_MAX: usize = 256 * 1024;
-
 /// Why the normalizer cannot take a notification.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NormalizeError {
@@ -255,19 +245,36 @@ struct Suppressed {
     denied: bool,
 }
 
-/// One session's item metadata on a registration (packet §5: 1024
-/// entries and 256 KiB per session; x.3.2 X3 fix r4 #2, #3): open tools
-/// and the suppression table, keyed by owning turn and item ID, kept for
-/// as long as the registration lives (X3 §6). An open tool's entry
-/// survives its turn's settlement until the tool completes. Its
-/// exhaustion is an overflow, for good: the generation fails rather than
-/// forgetting a fact.
-#[derive(Default)]
+/// One ledger entry: its facts and its charge (x.3.2 X3 §6.2).
+struct Entry {
+    facts: Suppressed,
+    _charge: Charge,
+}
+
+/// Turns mapped to Core, adjacent numbers from `first` to `last` (x.3.2
+/// X3 §3.4), with one charge: the credit of the turn that opened it, once
+/// that turn closed.
+struct Range {
+    first: TurnNumber,
+    last: TurnNumber,
+    charge: Option<Charge>,
+}
+
+/// One session's item metadata on a registration (packet §5; x.3.2 X3
+/// fix r4 #2, #3; X3 §6): open tools and the suppression table, keyed by
+/// owning turn and item ID, and the turns mapped to Core, kept for as long
+/// as the registration lives. Each entry and each range is charged to the
+/// session's cap and observation budget (§6.2). An open tool's entry
+/// survives its turn's settlement until the tool completes. A full cap is
+/// an overflow, for good: nothing continues with inaccurate correlation,
+/// and nothing is forgotten silently.
 pub(crate) struct Metadata {
-    entries: usize,
-    bytes: usize,
+    cap: SessionCap,
     exhausted: bool,
-    suppressed: HashMap<(TurnNumber, String), Suppressed>,
+    suppressed: HashMap<(TurnNumber, String), Entry>,
+    mapped: Vec<Range>,
+    /// The charge the consumer reserved for the message it handles.
+    staged: Option<Charge>,
 }
 
 /// A registration's metadata, in registration storage (x.3.2 X3 §6.1):
@@ -275,32 +282,43 @@ pub(crate) struct Metadata {
 /// there, never across an await.
 pub(crate) type Ledger = Arc<Mutex<Metadata>>;
 
+/// An empty ledger charged to `cap`.
+pub(crate) fn ledger_on(cap: SessionCap) -> Ledger {
+    Arc::new(Mutex::new(Metadata {
+        cap,
+        exhausted: false,
+        suppressed: HashMap::new(),
+        mapped: Vec::new(),
+        staged: None,
+    }))
+}
+
 /// The ledger's metadata, locked.
 pub(crate) fn ledger(ledger: &Ledger) -> MutexGuard<'_, Metadata> {
     // Each update is a few assignments: consistent across a panic.
     ledger.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// The denial class of a command or file-change item the vendor declined.
+fn denied_kind(item: &Item) -> Option<DenialKind> {
+    let kind = match item.kind {
+        ItemKind::CommandExecution => DenialKind::Command,
+        ItemKind::FileChange => DenialKind::FileWrite,
+        ItemKind::UserMessage
+        | ItemKind::AgentMessage
+        | ItemKind::Reasoning
+        | ItemKind::McpToolCall
+        | ItemKind::DynamicToolCall
+        | ItemKind::CollabAgentToolCall
+        | ItemKind::WebSearch
+        | ItemKind::ImageGeneration
+        | ItemKind::Sleep
+        | ItemKind::Other(_) => return None,
+    };
+    (item.status.as_deref() == Some("declined")).then_some(kind)
+}
+
 impl Metadata {
-    /// Charges one entry of `id`; past either bound the metadata is
-    /// exhausted for good.
-    fn charge(&mut self, id: &str) -> Result<(), NormalizeError> {
-        let bytes = self.bytes.saturating_add(id.len());
-        if self.exhausted || self.entries >= TRACKED_ITEMS_MAX || bytes > TRACKED_BYTES_MAX {
-            self.exhausted = true;
-            return Err(NormalizeError::Overflow);
-        }
-        self.entries += 1;
-        self.bytes = bytes;
-        Ok(())
-    }
-
-    /// Releases one entry of `id`.
-    fn release(&mut self, id: &str) {
-        self.entries = self.entries.saturating_sub(1);
-        self.bytes = self.bytes.saturating_sub(id.len());
-    }
-
     /// x.3.2 X3 §6.3, in every state: turn `turn`'s tool item started is
     /// open (charged once); completed, it is no longer, and its entry is
     /// released unless a decline or denial must still be judged.
@@ -323,38 +341,146 @@ impl Metadata {
         }
         let key = (turn, item.id.clone());
         if let Some(entry) = self.suppressed.get_mut(&key) {
-            entry.open = false;
-            if !entry.declined_by_via && !entry.denied {
+            entry.facts.open = false;
+            if !entry.facts.declined_by_via && !entry.facts.denied {
                 self.suppressed.remove(&key);
-                self.release(&item.id);
             }
         }
         Ok(())
+    }
+
+    /// x.3.2 X3 §6.2: the key bytes of the entry turn `turn`'s
+    /// `notification` may insert, when it holds none to keep: the consumer
+    /// reserves its charge first ([`Self::stage`]).
+    pub(crate) fn wants(&self, turn: TurnNumber, notification: &Notification) -> Option<usize> {
+        let (Notification::ItemStarted(event) | Notification::ItemCompleted(event)) = notification
+        else {
+            return None;
+        };
+        let item = &event.item;
+        let held = self
+            .suppressed
+            .get(&(turn, item.id.clone()))
+            .map(|entry| entry.facts);
+        let wanted = if matches!(notification, Notification::ItemStarted(_)) {
+            item.kind.is_tool() && held.is_none()
+        } else {
+            // Its completion releases an entry with neither mark; the
+            // denial then inserts it again.
+            denied_kind(item).is_some()
+                && held.is_none_or(|facts| !facts.declined_by_via && !facts.denied)
+        };
+        wanted.then_some(item.id.len())
+    }
+
+    /// [`Self::wants`] for a request [`DECLINES`] answered for turn `turn`.
+    pub(crate) fn wants_decline(&self, turn: TurnNumber, request: &ServerRequest) -> Option<usize> {
+        request
+            .item_id
+            .as_ref()
+            .filter(|item| !self.suppressed.contains_key(&(turn, (*item).clone())))
+            .map(String::len)
+    }
+
+    /// Holds `charge` for the next entry the message being handled
+    /// inserts; [`Self::unstage`] releases it if none did.
+    pub(crate) fn stage(&mut self, charge: Charge) {
+        self.staged = Some(charge);
+    }
+
+    /// Releases a staged charge no entry took.
+    pub(crate) fn unstage(&mut self) {
+        self.staged = None;
+    }
+
+    /// The cap the entries are charged to.
+    pub(crate) fn cap(&self) -> &SessionCap {
+        &self.cap
+    }
+
+    /// Exhausted for good: the cap had no slot.
+    pub(crate) fn exhaust(&mut self) {
+        self.exhausted = true;
+    }
+
+    /// x.3.2 X3 §3.4: turn `turn`'s `Accepted` went out, so it is mapped
+    /// to Core. An exactly adjacent range extends; otherwise `turn` opens
+    /// a range, charged at its close ([`Self::close`]).
+    pub(crate) fn map(&mut self, turn: TurnNumber) {
+        let adjacent = self
+            .mapped
+            .iter_mut()
+            .find(|range| range.last.get().checked_add(1) == Some(turn.get()));
+        match adjacent {
+            Some(range) => range.last = turn,
+            None => self.mapped.push(Range {
+                first: turn,
+                last: turn,
+                charge: None,
+            }),
+        }
+    }
+
+    /// Turn `turn` closed: its `credit` becomes the charge of the range
+    /// it opened, else is released (x.3.2 X3 §3.4, r8 #6).
+    pub(crate) fn close(&mut self, turn: TurnNumber, credit: Charge) {
+        if let Some(range) = self
+            .mapped
+            .iter_mut()
+            .find(|range| range.first == turn && range.charge.is_none())
+        {
+            range.charge = Some(credit);
+        }
+    }
+
+    /// Whether turn `turn` was mapped to Core.
+    pub(crate) fn mapped(&self, turn: TurnNumber) -> bool {
+        self.mapped
+            .iter()
+            .any(|range| range.first <= turn && turn <= range.last)
     }
 
     /// Whether a tool item of turn `turn` started and has not completed.
     pub(crate) fn tools_open(&self, turn: TurnNumber) -> bool {
         self.suppressed
             .iter()
-            .any(|((owner, _), entry)| *owner == turn && entry.open)
+            .any(|((owner, _), entry)| *owner == turn && entry.facts.open)
     }
 
     /// The entries charged.
     #[cfg(test)]
     pub(crate) fn entries(&self) -> usize {
-        self.entries
+        self.suppressed.len()
     }
 
-    /// Item `item` of turn `turn`'s facts, charged once.
+    /// Item `item` of turn `turn`'s facts, charged once: by the staged
+    /// charge, else by one taken now.
     fn entry(&mut self, turn: TurnNumber, item: &str) -> Result<&mut Suppressed, NormalizeError> {
         if self.exhausted {
             return Err(NormalizeError::Overflow);
         }
-        let key = (turn, item.to_owned());
-        if !self.suppressed.contains_key(&key) {
-            self.charge(item)?;
+        match self.suppressed.entry((turn, item.to_owned())) {
+            hash_map::Entry::Occupied(entry) => Ok(&mut entry.into_mut().facts),
+            hash_map::Entry::Vacant(vacant) => {
+                let charge = if let Some(charge) = self.staged.take() {
+                    charge
+                } else {
+                    let Some(slot) = self.cap.slot(item.len()) else {
+                        self.exhausted = true;
+                        return Err(NormalizeError::Overflow);
+                    };
+                    self.cap
+                        .try_charge(slot)
+                        .map_err(|_| NormalizeError::Overflow)?
+                };
+                Ok(&mut vacant
+                    .insert(Entry {
+                        facts: Suppressed::default(),
+                        _charge: charge,
+                    })
+                    .facts)
+            }
         }
-        Ok(self.suppressed.entry(key).or_default())
     }
 
     /// Records a request [`DECLINES`] answered for turn `turn`, so the
@@ -394,27 +520,13 @@ impl Metadata {
     /// A command or file-change item of turn `turn` the vendor declined,
     /// once per item, unless VIA's own decline caused it.
     fn denial(&mut self, turn: TurnNumber, item: &Item) -> Result<Option<Denial>, NormalizeError> {
-        let kind = match item.kind {
-            ItemKind::CommandExecution => DenialKind::Command,
-            ItemKind::FileChange => DenialKind::FileWrite,
-            ItemKind::UserMessage
-            | ItemKind::AgentMessage
-            | ItemKind::Reasoning
-            | ItemKind::McpToolCall
-            | ItemKind::DynamicToolCall
-            | ItemKind::CollabAgentToolCall
-            | ItemKind::WebSearch
-            | ItemKind::ImageGeneration
-            | ItemKind::Sleep
-            | ItemKind::Other(_) => return Ok(None),
-        };
-        if item.status.as_deref() != Some("declined") {
+        let Some(kind) = denied_kind(item) else {
             return Ok(None);
-        }
+        };
         let suppressed = self
             .suppressed
             .get(&(turn, item.id.clone()))
-            .copied()
+            .map(|entry| entry.facts)
             .unwrap_or_default();
         if suppressed.declined_by_via || suppressed.denied {
             return Ok(None);
@@ -457,7 +569,9 @@ impl TurnNormalizer {
         Self::on(
             schema,
             TurnNumber::try_from(1).unwrap_or_else(|_| unreachable!()),
-            Ledger::default(),
+            ledger_on(SessionCap::new(
+                &crate::observation::observation_channel().0,
+            )),
         )
     }
 
