@@ -497,8 +497,8 @@ turn's usage has `scope:"turn"`. `total`, `cacheWriteInputTokens` and
 Cost remains `usd:null, provenance:"unavailable"`; no price estimation.
 
 Target capability after the corresponding fixture/live gates: spawn,
-stored-conversation resume, steer, cancel and detach-close native;
-recover unsupported; instructions, effort and output-schema native;
+stored-conversation resume, cancel and detach-close native; steer
+unsupported in the first release (deferred, Steer row); recover unsupported; instructions, effort and output-schema native;
 max_steps unsupported; tokens turn, cost unavailable. Native
 cancel means protocol cancellation with the cleanup semantics above, not
 all tools stopped. Bounds are separately gated in §3. No declaration may
