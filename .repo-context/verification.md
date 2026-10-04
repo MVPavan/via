@@ -32,6 +32,11 @@ they provide sharper evidence. Small live-vendor end-to-end sets are a separate
 gate before each adapter slice merges; infrastructure failures are not passes.
 S1 has no live-vendor gate.
 
+Live-vendor model rule (owner, 2026-10-04; until the product is ready): every
+live run uses Codex `gpt-6-luna`, Pi `gpt-6-luna` (through the OpenAI login in
+VIA's private Pi agent directory), Claude Haiku and an OpenCode free-tier
+model. Do not substitute another model without an owner decision.
+
 ## S1 runtime acceptance, when tests and failpoints land
 
 The following commands are required from the repository root for the S1

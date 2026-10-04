@@ -142,10 +142,10 @@ Governing sources: [goal.md](goal.md), `docs/specs/via-api-v1.md`, `docs/specs/a
 
 | Task / subtask | Work | Owned scope | Verify |
 |---|---|---|---|
-| `via-jt8.1` | Pi: pinned protocol and behavior evidence | isolated scratchpad probes of the installed `pi` | Versioned raw evidence for RPC/JSON modes, sessions, abort/steer, usage, errors, shutdown, trust, tools and isolation; model-dependent probes use a free provider. |
+| `via-jt8.1` | Pi: pinned protocol and behavior evidence | isolated scratchpad probes of the installed `pi` | Versioned raw evidence for RPC/JSON modes, sessions, abort/steer, usage, errors, shutdown, trust, tools and isolation; model-dependent probes use `gpt-6-luna`. |
 | `via-jt8.2` | Pi: settle adapter contract decisions | `docs/specs/vendors/pi.md`; shared specs through coordinator | Route, bounds, structured output, resume, controls and cleanup decided and reviewed; C2 gaps reconciled with S5. |
 | `via-jt8.3` | Pi: implement and verify adapter | planned crates/via-adapters/src/pi, crates/via-routes/src/pi, vendor fixtures; shared files coordinator-owned | Real adapter/route passes fake conformance and live supported operations, fixes reviewed; no integration regression. |
-| `via-jt8.3.1`–`.3.4` | fixtures, implementation, review and live verification, free-provider qualification | as `via-4sw.3.1`–`.3.4` | as `via-4sw.3.1`–`.3.4`, with live checks on a free OpenCode Zen model. |
+| `via-jt8.3.1`–`.3.4` | fixtures, implementation, review and live verification, `gpt-6-luna` live qualification | as `via-4sw.3.1`–`.3.4` | as `via-4sw.3.1`–`.3.4`, with live checks on `gpt-6-luna` (owner, 2026-10-04). |
 
 Exit (S6): as S5, for Pi. Risk: deep.
 
