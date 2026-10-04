@@ -277,6 +277,58 @@ fn s1_store_writer_death_fails_every_lane_writer_lost() {
     drop(store);
 }
 
+/// Design §4.1 (via-p98.3.5): the commit signal changes after each served
+/// mutation, a failed one included, and not after a read; changes made
+/// before a subscription are not seen by it, and changes coalesce. When the
+/// writer dies (`store.writer.before_serve` `fail_io`), `changed()` ends in
+/// `Err` at once, and a re-read finds the writer already dead.
+#[test]
+fn s1_store_commit_signal_changes_on_mutations_and_closes_with_the_writer() {
+    let seams = Seams::new();
+    let store = Store::open(seams.state()).unwrap();
+    let client = store.client();
+    seams.runtime.block_on(async {
+        let id = session();
+        let mut early = client.subscribe_commits();
+        // Hits 1 and 2.
+        running_turn(&client).await;
+        let mut commits = client.subscribe_commits();
+        assert!(
+            !commits.has_changed().unwrap(),
+            "a new subscriber saw old commits"
+        );
+        assert!(early.has_changed().unwrap(), "two commits made no change");
+        early.mark_unchanged();
+        // Hit 3: a read changes nothing.
+        assert_eq!(client.next_seq(&id).await.unwrap(), Some(3));
+        assert!(!commits.has_changed().unwrap(), "a read changed the signal");
+        // Hits 4 and 5: a commit, then one refused (a stale sequence).
+        client.commit_event(text(3)).await.unwrap();
+        assert!(client.commit_event(text(3)).await.is_err());
+        let changed = tokio::time::timeout(Duration::from_secs(1), commits.changed()).await;
+        assert!(matches!(changed, Ok(Ok(()))), "{changed:?}");
+        assert!(!commits.has_changed().unwrap(), "two changes woke twice");
+        // Hit 6 kills the writer; nothing commits.
+        seams.arm(SERVE, 6, "fail_io");
+        assert!(matches!(
+            client.next_seq(&id).await,
+            Err(StoreError::WriterLost)
+        ));
+        let closed = tokio::time::timeout(Duration::from_secs(1), commits.changed()).await;
+        assert!(matches!(closed, Ok(Err(_))), "{closed:?}");
+        assert!(matches!(
+            client.next_seq(&id).await,
+            Err(StoreError::WriterLost)
+        ));
+        let mut late = client.subscribe_commits();
+        assert!(
+            late.changed().await.is_err(),
+            "a late subscriber waits forever"
+        );
+    });
+    drop(store);
+}
+
 /// Design §6.1, §6.4: a Public read lane holds at most 32 reads. With the
 /// writer held, the 33rd is `NotEnqueued` at once, a known refusal that
 /// reports no corruption, while the Internal and Latch lanes still accept;

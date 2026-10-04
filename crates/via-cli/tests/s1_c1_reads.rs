@@ -319,6 +319,274 @@ fn s1_c1_disconnected_waits_release_their_slots() -> TestResult {
     report.require_pass()
 }
 
+/// A fake turn that is accepted, then held at gate `slow` until released.
+fn held_turn() -> Value {
+    let vendor = "fake-turn-1";
+    json!({"expected_request":{"type":"start","id":1,"turn":1,"prompt":"slow"},"steps":[
+        {"action":"emit","message":{"type":"accepted","id":1,"vendor_turn_id":vendor}},
+        {"action":"gate","name":"slow"},
+        {"action":"emit","message":{"type":"terminal","vendor_turn_id":vendor,
+            "status":"completed","final_text":"done","stop_reason":"end_turn"}},
+    ]})
+}
+
+/// The `type` of each event of `page`.
+fn types(page: &Value) -> Vec<String> {
+    page["events"]
+        .as_array()
+        .map(|events| {
+            events
+                .iter()
+                .filter_map(|event| event["type"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// C1 §3.11 (via-2lp): an `events` long-poll through the real daemon. With
+/// nothing after `after` it waits out `--wait-ms` and returns the empty page
+/// at `after`. 32 long-polls take every socket slot and disconnect: each
+/// releases only its waiter and its slot (a new client is served well
+/// before their 30 s bound). A long-poll for `turn.ended` started before the
+/// held turn ends returns with it, and the turn, never affected, completes.
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one scenario keeps the bound, the disconnects and the end on one daemon"
+)]
+fn s1_c1_events_long_poll_waits_and_a_disconnect_drops_only_its_waiter() -> TestResult {
+    const SLOTS: usize = 32;
+    let sandbox = Sandbox::new(&json!({ "scripts": [held_turn()] }))?;
+    let evidence = Evidence::new("s1_c1_events_long_poll", &sandbox.fake, &sandbox.fixture)?;
+    let report = run_scenario(
+        evidence,
+        |evidence| {
+            let _daemon = Daemon::start(&sandbox, evidence)?;
+            let session = spawn(&sandbox, evidence, "slow", None)?;
+            sandbox.await_gate("slow")?;
+            let head = cli(
+                &sandbox,
+                evidence,
+                "events_head",
+                &["events", &session, "--json"],
+            )?["next_after"]
+                .as_u64()
+                .ok_or_else(|| failure("the page has no next_after"))?;
+            let after = head.to_string();
+            let started = Instant::now();
+            let idle = cli(
+                &sandbox,
+                evidence,
+                "events_idle",
+                &[
+                    "events",
+                    &session,
+                    "--after",
+                    &after,
+                    "--wait-ms",
+                    "1500",
+                    "--json",
+                ],
+            )?;
+            let took = started.elapsed();
+            check(
+                idle == json!({"events":[],"next_after":head,"more":false,"earliest_seq":1})
+                    && took >= Duration::from_millis(1500),
+                || format!("a 1500 ms long-poll took {took:?}: {idle}"),
+            )?;
+
+            let polling = request(
+                1,
+                "events",
+                &json!({"session":session,"after":head,"wait_ms":30_000}),
+            );
+            let clients = (0..SLOTS)
+                .map(|_| Raw::open(&sandbox))
+                .collect::<Result<Vec<_>, _>>()?;
+            for mut client in clients {
+                client.send(&polling)?;
+                drop(client);
+            }
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut attempts = 0_u32;
+            let status = loop {
+                attempts += 1;
+                let served = Raw::open(&sandbox)
+                    .and_then(|mut raw| raw.exchange(&request(2, "daemon/status", &json!({}))));
+                match served {
+                    Ok(reply) => break reply,
+                    Err(error) if Instant::now() >= deadline => {
+                        return Err(failure(format!(
+                            "no slot freed after {SLOTS} disconnected long-polls \
+                             ({attempts} attempts): {error:?}"
+                        )));
+                    }
+                    Err(_) => thread::sleep(Duration::from_millis(20)),
+                }
+            };
+            evidence
+                .write(
+                    "reconnect.json",
+                    json!({"attempts":attempts,"status":status})
+                        .to_string()
+                        .as_bytes(),
+                )
+                .map_err(infra)?;
+            check(status["result"]["pid"].is_u64(), || {
+                format!("daemon/status: {status}")
+            })?;
+
+            let ended = thread::scope(|scope| {
+                let poll = scope.spawn(|| {
+                    cli(
+                        &sandbox,
+                        evidence,
+                        "events_end",
+                        &[
+                            "events",
+                            &session,
+                            "--after",
+                            &after,
+                            "--types",
+                            "turn.ended",
+                            "--wait-ms",
+                            "15000",
+                            "--json",
+                        ],
+                    )
+                });
+                // The long-poll is pending when the turn ends.
+                thread::sleep(Duration::from_millis(300));
+                sandbox.release_gate("slow")?;
+                poll.join()
+                    .map_err(|_| infra("the long-poll thread panicked"))?
+            })?;
+            check(types(&ended) == ["turn.ended"], || {
+                format!("the long-poll for the end: {ended}")
+            })?;
+            let waited = wait(&sandbox, evidence, &format!("{session}/1"))?;
+            check(waited["state"] == "completed", || {
+                format!("the turn after the disconnects: {waited}")
+            })
+        },
+        |evidence| collect(evidence, &sandbox),
+    );
+    report.require_pass()
+}
+
+/// Kills and reaps a CLI child left running by a failed scenario.
+struct Reaped(std::process::Child);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        // Safe to ignore: the child may have exited already.
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// C1 §3.11 (via-2lp): `via events --follow` long-polls from each reply's
+/// `next_after` and writes each page with events as one JSON line, the
+/// format of `via events`; polls that end empty write nothing. The pages
+/// carry every event once, in `seq` order, through the held turn's end.
+/// Ctrl-C ends it with exit 130.
+#[test]
+fn s1_c1_events_follow_writes_each_page_until_interrupted() -> TestResult {
+    let sandbox = Sandbox::new(&json!({ "scripts": [held_turn()] }))?;
+    let evidence = Evidence::new("s1_c1_events_follow", &sandbox.fake, &sandbox.fixture)?;
+    let report = run_scenario(
+        evidence,
+        |evidence| {
+            let _daemon = Daemon::start(&sandbox, evidence)?;
+            let session = spawn(&sandbox, evidence, "slow", None)?;
+            sandbox.await_gate("slow")?;
+            let out = evidence.dir.join("follow.stdout");
+            let mut command = sandbox.command();
+            command
+                .args(["events", &session, "--follow", "--wait-ms", "300", "--json"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::fs::File::create(&out).map_err(infra)?)
+                .stderr(std::fs::File::create(evidence.dir.join("follow.stderr")).map_err(infra)?);
+            let mut follow = Reaped(command.spawn().map_err(infra)?);
+            let pages = || -> Result<Vec<Value>, ScenarioError> {
+                let text = std::fs::read_to_string(&out).map_err(infra)?;
+                text.lines()
+                    .map(|line| serde_json::from_str(line).map_err(infra))
+                    .collect()
+            };
+            let until = |what: &str, done: &dyn Fn(&[Value]) -> bool| {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    // A line may be partly written: read again.
+                    if let Ok(pages) = pages()
+                        && done(&pages)
+                    {
+                        return Ok(pages);
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(ScenarioError::Timeout(format!("follow never wrote {what}")));
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+            };
+            let first = until("its first page", &|pages| !pages.is_empty())?;
+            // Several 300 ms polls end empty and write nothing.
+            thread::sleep(Duration::from_millis(1000));
+            check(pages()? == first, || {
+                format!("polls without events wrote pages: {:?}", pages())
+            })?;
+            sandbox.release_gate("slow")?;
+            let all = until("the turn's end", &|pages| {
+                pages
+                    .iter()
+                    .any(|page| types(page).iter().any(|kind| kind == "turn.ended"))
+            })?;
+            let pid = rustix::process::Pid::from_raw(i32::try_from(follow.0.id()).map_err(infra)?)
+                .ok_or_else(|| infra("the follow CLI has no pid"))?;
+            rustix::process::kill_process(pid, rustix::process::Signal::INT).map_err(infra)?;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let status = loop {
+                if let Some(status) = follow.0.try_wait().map_err(infra)? {
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    return Err(ScenarioError::Timeout(
+                        "follow kept running after Ctrl-C".to_owned(),
+                    ));
+                }
+                thread::sleep(Duration::from_millis(10));
+            };
+            let followed: Vec<u64> = all.iter().flat_map(seqs).collect();
+            let stored = events_head(&sandbox, evidence, &session)?;
+            check(
+                status.code() == Some(130)
+                    && all.iter().all(|page| !seqs(page).is_empty())
+                    && followed == (1..=stored).collect::<Vec<_>>(),
+                || format!("follow ended {status} with pages {all:?}, head {stored}"),
+            )
+        },
+        |evidence| collect(evidence, &sandbox),
+    );
+    report.require_pass()
+}
+
+/// The session's committed head through a plain `via events` page.
+fn events_head(
+    sandbox: &Sandbox,
+    evidence: &Evidence,
+    session: &str,
+) -> Result<u64, ScenarioError> {
+    let page = cli(
+        sandbox,
+        evidence,
+        "events_final",
+        &["events", session, "--limit", "1000", "--json"],
+    )?;
+    page["next_after"]
+        .as_u64()
+        .ok_or_else(|| failure(format!("events: {page}")))
+}
+
 /// Every session a `via list` paging with `args` returns, in order.
 fn list_all(
     sandbox: &Sandbox,

@@ -106,10 +106,10 @@ pub fn run_anchor_from_args(args: &[std::ffi::OsString]) -> i32 {
 
 pub use api::{
     ApiError, CancelParams, CloseMode, CloseParams, DEFAULT_CLOSE_DEADLINE_MS,
-    DEFAULT_FORCE_AFTER_MS, DEFAULT_WAIT_MS, DaemonStatusParams, DaemonStopParams, EventsParams,
-    ListParams, LogsParams, Named, REQUEST_LINE_MAX, ReadParams, ReceiptOutcome, ResumeParams,
-    SpawnParams, StatusParams, SteerParams, Unpersisted, WaitParams, hash_handle, parse_address,
-    retry_identity,
+    DEFAULT_FORCE_AFTER_MS, DEFAULT_WAIT_MS, DaemonStatusParams, DaemonStopParams,
+    EVENTS_WAIT_MAX_MS, EventsParams, ListParams, LogsParams, Named, REQUEST_LINE_MAX, ReadParams,
+    ReceiptOutcome, ResumeParams, SpawnParams, StatusParams, SteerParams, Unpersisted, WaitParams,
+    hash_handle, parse_address, retry_identity,
 };
 pub use api::{DescribeParams, FreeFloor, ModelsParams};
 

@@ -313,7 +313,8 @@ struct StatusArgs {
     json: bool,
 }
 
-/// C1 §3.11 `via events <session|turn> [--after SEQ] [--limit N] [--types T,…]`.
+/// C1 §3.11 `via events <session|turn> [--after SEQ] [--limit N] [--types T,…]
+/// [--wait-ms N] [--follow]`.
 #[derive(Args)]
 struct EventsArgs {
     address: String,
@@ -323,6 +324,10 @@ struct EventsArgs {
     limit: Option<u32>,
     #[arg(long, value_delimiter = ',')]
     types: Option<Vec<String>>,
+    #[arg(long)]
+    wait_ms: Option<u64>,
+    #[arg(long)]
+    follow: bool,
     #[arg(long)]
     json: bool,
 }
@@ -605,7 +610,51 @@ fn events(args: EventsArgs) -> anyhow::Result<i32> {
     if let Some(types) = args.types {
         params["types"] = Value::from(types);
     }
-    client::call("events", &params, true, true)
+    if args.follow {
+        return follow(params, args.wait_ms);
+    }
+    if let Some(wait) = args.wait_ms {
+        params["wait_ms"] = Value::from(wait);
+    }
+    client::call_within("events", &params, true, true, events_read(args.wait_ms))
+}
+
+/// Read bound of an `events` call: the daemon replies by `wait_ms`; allow
+/// 5 s for the reply, and never less than a plain request's 30 s.
+fn events_read(wait_ms: Option<u64>) -> Duration {
+    Duration::from_millis(wait_ms.unwrap_or(0))
+        .saturating_add(Duration::from_secs(5))
+        .max(Duration::from_secs(30))
+}
+
+/// `via events --follow` (C1 §3.11): long-polls from each reply's
+/// `next_after` (`--wait-ms`, else the longest bound, per poll) and writes
+/// each page that has events as `via events` writes a page, until Ctrl-C
+/// (exit 130) or a request error (exit 2).
+fn follow(mut params: Value, wait_ms: Option<u64>) -> anyhow::Result<i32> {
+    let wait = wait_ms
+        .filter(|wait| *wait > 0)
+        .unwrap_or(via_core::EVENTS_WAIT_MAX_MS);
+    params["wait_ms"] = Value::from(wait);
+    let read = events_read(Some(wait));
+    let _interrupt = exit_on_interrupt()?;
+    loop {
+        let response = client::request_within("events", &params, true, read)?;
+        if response.get("error").is_some() {
+            client::emit_response(&response, true)?;
+            return Ok(2);
+        }
+        let page = response
+            .get("result")
+            .ok_or_else(|| anyhow::anyhow!("daemon reply has no result"))?;
+        if page["events"]
+            .as_array()
+            .is_some_and(|events| !events.is_empty())
+        {
+            write_json(io::stdout(), page)?;
+        }
+        params["after"] = page["next_after"].clone();
+    }
 }
 
 /// `via list` (C1 §3.10): one page of session summaries.
@@ -680,14 +729,15 @@ fn close(args: CloseArgs) -> anyhow::Result<i32> {
     client::call_within("close", &params, true, true, read)
 }
 
-/// Exit status of a foreground `spawn` or `wait` the user interrupted.
+/// Exit status of a foreground `spawn`, `wait` or `events --follow` the
+/// user interrupted.
 const INTERRUPTED: i32 = 130;
 
-/// While a foreground `spawn` or `wait` waits (design §6.5): SIGINT writes
-/// nothing and cancels nothing; the CLI exits 130 once stdout is flushed.
-/// The daemon runs in its own process group, so the terminal's SIGINT never
-/// reaches it. The handler is registered before this returns; dropping the
-/// guard stops the task.
+/// While a foreground `spawn`, `wait` or `events --follow` waits (design
+/// §6.5): SIGINT writes nothing and cancels nothing; the CLI exits 130 once
+/// stdout is flushed. The daemon runs in its own process group, so the
+/// terminal's SIGINT never reaches it. The handler is registered before
+/// this returns; dropping the guard stops the task.
 fn exit_on_interrupt() -> io::Result<Interrupt> {
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let task = tokio::spawn(async move {

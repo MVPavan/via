@@ -494,10 +494,11 @@ returns `store_error` with `session`, `turn`, last-known `durable_state` and
 envelope. An already committed, readable terminal result is returned as is.
 A `wait` whose result is still absent once final shutdown has committed its
 last record ends `daemon_stopping`.
-`wait` is the only blocking read; it checks at once, then once per second.
-A caller that wants progress polls `status` (§3.7) on another connection,
-since a connection carries one request at a time. Closing the connection of
-a pending `wait` releases only that waiter.
+`wait` returns as soon as the turn's terminal commits. It and an `events`
+long-poll (§3.11) are the blocking reads. A caller that wants progress polls
+`status` (§3.7) on another connection, since a connection carries one request
+at a time. Closing the connection of a pending `wait` releases only that
+waiter.
 
 ### 3.10 `list`
 
@@ -517,10 +518,11 @@ success.
 
 ### 3.11 `events` — page
 
-`via events <session|turn> [--after SEQ] [--limit N] [--types T,…]`
+`via events <session|turn> [--after SEQ] [--limit N] [--types T,…] [--wait-ms N] [--follow]`
 
 Params: `session` or `turn`, `after?` (default 0), `limit?` (default 200,
-max 1000), `types?`. Result `{events, next_after, more: bool,
+max 1000), `types?`, `wait_ms?` (default 0, max 30,000; above is
+`invalid_params`). Result `{events, next_after, more: bool,
 earliest_seq}`. Semantics:
 
 - The page is a bounded Store scan in `seq` order from `after`, filtered by
@@ -534,8 +536,20 @@ earliest_seq}`. Semantics:
   `earliest_seq` when `after < earliest_seq - 1`. Until retention prunes,
   `earliest_seq` is 1.
 
-There is no follow stream: callers poll `status` (§3.7) for progress and
-`wait` (§3.8) for the end of a turn.
+- Long-poll: with `wait_ms` above 0, a page with no matching events is
+  read again from its `next_after` (which advances past filtered-out
+  events) as events commit, and the call returns as soon as a page has
+  events. At `wait_ms` it returns the last empty page normally, with the
+  latest `next_after`; it is not an error. `wait_ms: 0` returns the first
+  page at once. A session or turn not found is refused at once. Final
+  shutdown ends a long-poll that found nothing `daemon_stopping`, as it ends
+  a `wait`. Closing the connection of a pending long-poll releases only
+  that call.
+
+There is no follow stream: a caller follows a session by long-polling from
+each reply's `next_after` (`via events --follow` does this until Ctrl-C),
+polls `status` (§3.7) for progress and uses `wait` (§3.8) for the end of a
+turn.
 
 ### 3.12 `logs` — evidence locations
 

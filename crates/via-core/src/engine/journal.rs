@@ -14,7 +14,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, MutexGuard};
+use tokio::sync::{Mutex, MutexGuard, watch};
 use via_store::{
     BlobRef, EventRecord, QueuedTurn, SessionEventRecord, SessionIdentity, SteerOutcome,
     StoreClient, StoreError, StoredEvent, SubmissionRecord, TerminalExtras, TerminalFacts,
@@ -264,40 +264,52 @@ enum Entry {
 /// terminal a later read finds durable. Receipts stop at [`UNRESOLVED_LIMIT`]
 /// entries. Final shutdown is clean only when the set is empty.
 #[derive(Default)]
-pub(super) struct Unresolved(StdMutex<HashMap<(SessionId, TurnNumber), Entry>>);
+pub(super) struct Unresolved {
+    entries: StdMutex<HashMap<(SessionId, TurnNumber), Entry>>,
+    /// Changed after each [`Self::fail`]: a turn recorded unpersisted is
+    /// no Store commit, so a waiter re-reads on this too (design §4.1).
+    failures: watch::Sender<u64>,
+}
 
 impl Unresolved {
+    /// Subscribes to [`Self::fail`]'s changes; subscribe before the read.
+    pub(super) fn subscribe(&self) -> watch::Receiver<u64> {
+        self.failures.subscribe()
+    }
+
     /// Tracks a receipted turn until its terminal is known committed.
     pub(super) fn receipt(&self, session: &SessionId, turn: TurnNumber) {
-        lock(&self.0).insert((session.clone(), turn), Entry::Pending);
+        lock(&self.entries).insert((session.clone(), turn), Entry::Pending);
     }
 
     /// Records that the turn's terminal could not be made durable after its last
     /// committed lifecycle state `durable`.
     pub(super) fn fail(&self, session: &SessionId, turn: TurnNumber, durable: TurnState) {
-        lock(&self.0).insert((session.clone(), turn), Entry::Failed(durable));
+        lock(&self.entries).insert((session.clone(), turn), Entry::Failed(durable));
+        self.failures
+            .send_modify(|count| *count = count.wrapping_add(1));
     }
 
     /// Forgets a turn whose terminal is known committed.
     pub(super) fn resolve(&self, session: &SessionId, turn: TurnNumber) {
-        lock(&self.0).remove(&(session.clone(), turn));
+        lock(&self.entries).remove(&(session.clone(), turn));
     }
 
     /// Whether another turn of `session` than `turn` is still unresolved.
     pub(super) fn others(&self, session: &SessionId, turn: TurnNumber) -> bool {
-        lock(&self.0)
+        lock(&self.entries)
             .keys()
             .any(|(unresolved, number)| unresolved == session && *number != turn)
     }
 
     /// Whether another receipt keeps the set within its bound.
     fn admits(&self) -> bool {
-        lock(&self.0).len() < UNRESOLVED_LIMIT
+        lock(&self.entries).len() < UNRESOLVED_LIMIT
     }
 
     /// Failed turns, whose terminals a later read may find durable.
     fn failed_turns(&self) -> Vec<(SessionId, TurnNumber)> {
-        lock(&self.0)
+        lock(&self.entries)
             .iter()
             .filter(|(_, entry)| matches!(entry, Entry::Failed(_)))
             .map(|(key, _)| key.clone())
@@ -306,12 +318,12 @@ impl Unresolved {
 
     /// Every turn not yet known to have a durable terminal.
     pub(super) fn turns(&self) -> Vec<(SessionId, TurnNumber)> {
-        lock(&self.0).keys().cloned().collect()
+        lock(&self.entries).keys().cloned().collect()
     }
 
     /// The last committed state of a turn whose terminal could not be made durable.
     fn failed(&self, session: &SessionId, turn: TurnNumber) -> Option<TurnState> {
-        match lock(&self.0).get(&(session.clone(), turn)) {
+        match lock(&self.entries).get(&(session.clone(), turn)) {
             Some(Entry::Failed(durable)) => Some(*durable),
             Some(Entry::Pending) | None => None,
         }
@@ -319,7 +331,7 @@ impl Unresolved {
 
     /// Forgets a failed turn whose terminal a read found durable after all.
     fn settle(&self, session: &SessionId, turn: TurnNumber) {
-        let mut entries = lock(&self.0);
+        let mut entries = lock(&self.entries);
         let key = (session.clone(), turn);
         if matches!(entries.get(&key), Some(Entry::Failed(_))) {
             entries.remove(&key);

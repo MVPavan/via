@@ -14,7 +14,7 @@ use std::{
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, value::RawValue};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
 use crate::{
     CommitOutcome, EvidenceRoot, Identity, ProcessOwner, SessionId, StoreFailureKind, TurnNumber,
@@ -1133,6 +1133,8 @@ pub struct StoreClient {
     state: Arc<Path>,
     /// Set by the SQLite thread while the WAL is at `wal.max` (§5.4).
     wal_full: Arc<AtomicBool>,
+    /// The writer's commit counter ([`StoreClient::subscribe_commits`]).
+    commits: watch::Receiver<u64>,
 }
 
 /// One request for the SQLite writer.
@@ -1820,9 +1822,23 @@ impl Store {
         let read_corruption = ReadCorruption::default();
         let observer = read_corruption.clone();
         let (writer_lanes, writer_blobs) = (Arc::clone(&lanes), blobs.clone());
+        // The writer thread owns the only sender: its end, unwinding
+        // included, closes the channel and wakes every subscriber. The
+        // sender drops after `writer_loop`'s death guard, so a woken
+        // subscriber re-reads into a writer already marked dead.
+        let (commit_signal, commits) = watch::channel(0_u64);
         let writer_join = thread::Builder::new()
             .name("via-store-sqlite".to_owned())
-            .spawn(move || writer_loop(conn, &writer_lanes, &observer, &writer_blobs, wal))
+            .spawn(move || {
+                writer_loop(
+                    conn,
+                    &writer_lanes,
+                    &observer,
+                    &writer_blobs,
+                    wal,
+                    &commit_signal,
+                );
+            })
             .map_err(|error| StoreError::Open(error.to_string()))?;
         Ok(Self {
             client: StoreClient {
@@ -1832,6 +1848,7 @@ impl Store {
                 blobs,
                 state: Arc::from(state),
                 wal_full,
+                commits,
             },
             writer_join: Some(writer_join),
             open_sessions: u64::try_from(open_sessions).unwrap_or(0),
@@ -1958,6 +1975,19 @@ impl StoreClient {
         work: impl FnOnce() -> std::io::Result<T> + Send + 'static,
     ) -> Result<T, StoreError> {
         self.blobs.tasks.run(work).await
+    }
+
+    /// Subscribes to the writer's commit signal (Task 4 design §4.1): it
+    /// changes after each mutation the writer served, committed or not, and
+    /// closes once the writer has ended, so `changed()` then returns `Err`.
+    /// A change carries no fact: a waiter re-reads what it waits for.
+    /// Subscribe before that read, so a commit after the read is never
+    /// missed. Changes coalesce: a waiter that has not yet looked sees one
+    /// change for any number of commits.
+    pub fn subscribe_commits(&self) -> watch::Receiver<u64> {
+        let mut commits = self.commits.clone();
+        commits.mark_unchanged();
+        commits
     }
 
     /// Whether the WAL is at `wal.max` (Task 4 design §5.4): new work is
@@ -2944,6 +2974,7 @@ mod tests {
             blobs: Blobs::open(root.path()).expect("blobs"),
             state: Arc::from(root.path()),
             wal_full: Arc::default(),
+            commits: tokio::sync::watch::channel(0).1,
         };
         let latch = client.latch();
         let journal = ProcessJournal {

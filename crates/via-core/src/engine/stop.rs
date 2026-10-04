@@ -1,6 +1,6 @@
 //! `daemon/stop` admission, forced-turn settlement and final shutdown.
 
-use std::{collections::HashSet, sync::atomic::Ordering, time::SystemTime};
+use std::{collections::HashSet, time::SystemTime};
 
 use via_adapters::{Cleanup, ConnectionKind, StopCause};
 use via_store::StoreClient;
@@ -574,7 +574,7 @@ impl Engine {
             .values()
             .filter(|slot| slot.starting())
             .count();
-        self.finalized.store(true, Ordering::Release);
+        self.finalized.send_replace(true);
         EngineShutdown {
             anchors: report.anchors,
             uncertain_owners: report.uncertain_anchors,

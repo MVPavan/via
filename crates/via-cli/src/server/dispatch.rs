@@ -206,10 +206,16 @@ pub(super) async fn handle_client(stream: UnixStream, mut client: Client) -> any
                 Ok(_) => failure(id, &error_data(VERSION_MISMATCH.into())),
                 Err(refusal) => failure(id, &error_data(refusal)),
             }
-        } else if method == "wait" {
-            // C1 §3.8: closing the connection of a pending `wait` releases
-            // only that waiter, and this connection's socket slot.
-            match watched(dispatch(&method, params, &client), &mut read).await {
+        } else if method == "wait" || method == "events" {
+            // C1 §3.8, §3.11: closing the connection of a pending `wait` or
+            // `events` long-poll releases only that waiter, and this
+            // connection's socket slot.
+            let served = if method == "wait" {
+                watched(dispatch(&method, params, &client), &mut read).await
+            } else {
+                events(params, &client, &mut read).await
+            };
+            match served {
                 Some(Ok(result)) => success(id, &result),
                 Some(Err(refusal)) => failure(id, &error_data(refusal)),
                 None => break,
@@ -227,13 +233,14 @@ pub(super) async fn handle_client(stream: UnixStream, mut client: Client) -> any
     Ok(())
 }
 
-/// Serves a `wait` while watching its connection (C1 §3.8). End of stream
-/// or a read error drops the `wait` future and ends the connection
-/// (`None`); `wait` is read-only, so the turn's work, owned elsewhere, is
-/// unaffected, and Store keeps ownership of an admitted read, whose reply
-/// is dropped. Bytes that arrive stay buffered for the next request
-/// (pipelining, A48): `fill_buf` is cancel-safe and consumes nothing, and
-/// from then on the `wait` just finishes.
+/// Serves a `wait` (C1 §3.8), or an `events` long-poll (§3.11), while
+/// watching its connection. End of stream or a read error drops the `wait`
+/// future and ends the connection (`None`); both are read-only, so the
+/// turn's work, owned elsewhere, is unaffected, and Store keeps ownership
+/// of an admitted read, whose reply is dropped. Bytes that arrive stay
+/// buffered for the next request (pipelining, A48): `fill_buf` is
+/// cancel-safe and consumes nothing, and from then on the `wait` just
+/// finishes.
 async fn watched<T, R: AsyncRead + Unpin>(
     wait: impl Future<Output = T>,
     read: &mut BufReader<R>,
@@ -248,6 +255,26 @@ async fn watched<T, R: AsyncRead + Unpin>(
         }
     }
     Some(wait.await)
+}
+
+/// Serves C1 §3.11 `events`, the events array as Store wrote it (design
+/// §4.3): a long-poll is [`watched`] as a pending `wait` is (`None` once
+/// its connection ended); a call without `wait_ms` is served as before.
+async fn events<R: AsyncRead + Unpin>(
+    params: &str,
+    client: &Client,
+    read: &mut BufReader<R>,
+) -> Option<Result<Box<RawValue>, Refusal>> {
+    let events = match typed::<EventsParams>(params) {
+        Ok(events) => events,
+        Err(refusal) => return Some(Err(refusal)),
+    };
+    if events.long_polls() {
+        let served = watched(client.engine.events(events), read).await?;
+        Some(served.map_err(Refusal::from))
+    } else {
+        Some(client.engine.events(events).await.map_err(Refusal::from))
+    }
 }
 
 /// Writes one reply within `reply_write` of its being ready (design §4,
@@ -391,8 +418,6 @@ async fn dispatch(method: &str, params: &str, client: &Client) -> Result<Box<Raw
         // Design §4.1: the stored envelope, written as stored.
         "result" => Ok(engine.result(&typed::<ReadParams>(params)?.address).await?),
         "wait" => Ok(engine.wait(typed::<WaitParams>(params)?).await?),
-        // Design §4.3: the events array as Store wrote it.
-        "events" => Ok(engine.events(typed::<EventsParams>(params)?).await?),
         "list" => raw(&engine.list(typed::<ListParams>(params)?).await?),
         "logs" => raw(&engine.logs(typed::<LogsParams>(params)?).await?),
         "status" => raw(&engine.status(typed::<StatusParams>(params)?).await?),

@@ -1371,9 +1371,12 @@ the captured head. Filtering can yield an empty page that still advances.
 Page byte limit is 1 MiB. Keep read transactions short (one bounded page).
 
 There is no follow stream and no subscription. Callers poll `status` for
-the in-memory progress snapshot and step history, and use `wait` for a
-turn's end; `wait` checks the Store at once, then once per second.
-Cancelling a wait request only releases that waiter.
+the in-memory progress snapshot and step history, use `wait` for a turn's
+end, and long-poll `events` with `wait_ms` for new events (C1 §3.11).
+`wait` returns as soon as the turn's terminal commits, and a long-poll as
+soon as a matching event commits: each re-reads the Store after the Store's
+commit signal changes, never on a timer. Cancelling a wait or long-poll
+request only releases that waiter.
 
 A reply is written within 10 s of being ready to write, otherwise the
 socket closes (C1 §1), so a peer that never reads holds its reply buffer

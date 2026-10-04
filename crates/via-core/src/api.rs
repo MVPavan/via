@@ -646,9 +646,32 @@ pub struct EventsParams {
     pub limit: Option<u32>,
     #[serde(default)]
     types: Option<EventTypes>,
+    /// Long-poll bound (C1 §3.11): 0 by default, which never waits; at most
+    /// [`EVENTS_WAIT_MAX_MS`].
+    #[serde(default)]
+    pub wait_ms: Option<u64>,
 }
 
+/// Largest `events` `wait_ms` (C1 §3.11).
+pub const EVENTS_WAIT_MAX_MS: u64 = 30_000;
+
 impl EventsParams {
+    /// Whether the call may wait for a matching event (C1 §3.11): its
+    /// connection is then watched as a pending `wait`'s is.
+    pub fn long_polls(&self) -> bool {
+        self.wait_ms.is_some_and(|wait| wait > 0)
+    }
+
+    /// The long-poll bound: `None` for 0, `invalid_params` past
+    /// [`EVENTS_WAIT_MAX_MS`].
+    pub(crate) fn wait(&self) -> Result<Option<std::time::Duration>, ApiError> {
+        match self.wait_ms.unwrap_or(0) {
+            0 => Ok(None),
+            wait if wait > EVENTS_WAIT_MAX_MS => Err(ApiError::INVALID_PARAMS),
+            wait => Ok(Some(std::time::Duration::from_millis(wait))),
+        }
+    }
+
     /// The Store query the parameters name.
     pub(crate) fn query(self) -> Result<via_store::EventsQuery, ApiError> {
         let (session, turn) = LogsParams {

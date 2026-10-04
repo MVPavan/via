@@ -762,15 +762,17 @@ fn retry_open(sandbox: &Sandbox) -> Result<Conn, ScenarioError> {
     }
 }
 
-/// Design §4, §4.1, §13.2 [t4r16.7.7]: `wait` reads the turn's terminal
-/// facts at once and then once per second (a 3.5 s wait makes four checks
-/// plus the turn-existence read, where a 20 ms poll makes about 175); 31
-/// sockets waiting and one polling `status` all answer; a 33rd socket is
-/// closed without bytes; the end is seen within about a second.
+/// Design §4, §4.1, §13.2 [t4r16.7.7; via-p98.3.5, 2026-10-04]: `wait`
+/// reads the turn's terminal facts at once and again only after a commit
+/// (a 3.5 s wait on a held turn, which commits nothing, makes its first
+/// check and the turn-existence read, where the earlier one-second check
+/// made five reads and a 20 ms poll about 175); 31 sockets waiting and one
+/// polling `status` all answer; a 33rd socket is closed without bytes; the
+/// end is seen promptly.
 #[test]
-fn s1_c1_wait_checks_each_second_and_32_waiters_leave_status_served() -> TestResult {
+fn s1_c1_wait_reads_after_commits_and_32_waiters_leave_status_served() -> TestResult {
     let setup = Setup::new(&any_prompt(&[json!({"action":"gate","name":"hold"})]))?;
-    let evidence = setup.evidence("s1_c1_wait_each_second")?;
+    let evidence = setup.evidence("s1_c1_wait_reads_after_commits")?;
     let report = run_scenario(
         evidence,
         |evidence| {
@@ -815,8 +817,8 @@ fn s1_c1_wait_checks_each_second_and_32_waiters_leave_status_served() -> TestRes
             check(is_error(&reply, -32016, "wait_timeout"), || {
                 format!("bounded wait: {reply}")
             })?;
-            check((4..=6).contains(&used), || {
-                format!("a 3.5 s wait made {used} Store reads, expected 5")
+            check((2..=3).contains(&used), || {
+                format!("a 3.5 s wait without commits made {used} Store reads, expected 2")
             })?;
             drop(waiter);
 
@@ -870,12 +872,11 @@ fn s1_c1_wait_checks_each_second_and_32_waiters_leave_status_served() -> TestRes
 }
 
 /// Design §4.1 (T4-fix; Fable F4): a slow read does not make `wait` catch
-/// up. With every Store read delayed 800 ms (`store.read.delay_ms`), the
-/// next check is a second after the last read ended, so a 5 s wait makes
-/// at most four reads: the turn-existence read and terminal-facts reads at
-/// about 0, 2.6 and 4.4 s. A check scheduled from the loop's start runs
-/// the missed checks back to back and makes seven. Slower reads only make
-/// fewer, so the bound holds under load.
+/// up. With every Store read delayed 800 ms (`store.read.delay_ms`), a 5 s
+/// wait makes at most four reads. Since via-p98.3.5 (2026-10-04) a wait
+/// re-reads only after a commit, so on a held turn it makes its first
+/// check and the turn-existence read; a check scheduled from the loop's
+/// start would run missed checks back to back and make seven.
 #[test]
 fn s1_c1_wait_after_a_slow_read_keeps_its_cadence() -> TestResult {
     let setup = Setup::new(&any_prompt(&[json!({"action":"gate","name":"hold"})]))?;

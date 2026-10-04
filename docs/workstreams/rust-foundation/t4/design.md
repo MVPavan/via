@@ -379,13 +379,21 @@ on `wait` polls `status` or sends `cancel` on another socket.
 
 ### 4.1 `wait` and `result`
 
-`wait` polls the Store with `terminal_facts` (§6.7) until the turn is
+`wait` reads the Store with `terminal_facts` (§6.7) until the turn is
 terminal, `timeout_ms` or final shutdown; only then does it read the
-envelope with `result_text`. It reads at once, then once per second
-[t4r16.7.7]: 32 waiters make 32 reads per second, where today's fixed 20 ms
-(`crates/via-core/src/engine/read.rs:100` [V]) makes 1,600. A turn's end
-is seen at most 1 s late. The Public lane cannot refuse a `wait`: one request per
-socket and 32 sockets give at most 32 Public reads, its slot count (§6.1).
+envelope with `result_text`. It reads at once, then again after each change
+that may settle the turn (via-p98.3.5, owner 2026-10-04; it replaced the
+once-per-second check of [t4r16.7.7]): the Store's commit signal, a
+`tokio::sync::watch` counter the writer thread changes after each served
+mutation and closes when it ends (`StoreClient::subscribe_commits`); a turn
+Core records unpersisted; and final shutdown. A waiter subscribes before it
+reads, so a change between its read and its await is never lost, and a
+closed signal (a dead writer) wakes it into a read that reports the Store's
+error. A turn's end is seen as soon as it commits. Load stays bounded: at
+most 32 sockets make at most 32 waiters, and the watch coalesces, so a
+burst of commits wakes each waiter once at most. The Public lane cannot
+refuse a `wait`: one request per socket and 32 sockets give at most 32
+Public reads, its slot count (§6.1).
 `result` reads `result_text` once. The envelope (at most 1 MiB) is written
 as stored; no `Value` is built.
 
@@ -425,6 +433,14 @@ the `events` array as one JSON text. `next_after` is the last scanned seq;
 nothing is pruned: `history_pruned` is the retention task's [t4r16.5.9].
 An event is far smaller than a page (its payload is at most 256 KiB), so the
 first match always fits: a debug assertion, not a refusal [t4r17.8].
+
+`wait_ms?` (0, max 30,000) makes the call a long-poll (via-2lp, owner
+2026-10-04): a page with no events is read again from its `next_after`, at
+once while `more`, else after the next change of the signals `wait` uses
+(§4.1), until a page has events or `wait_ms` passes; then the last empty
+page is the reply. Final shutdown ends it `daemon_stopping`. Its connection
+is watched as a pending `wait`'s is, so a disconnect drops only that call.
+`via events --follow` loops long-polls from each `next_after`.
 
 ### 4.4 `logs`: where the evidence is [t4r16.1]
 
@@ -1289,7 +1305,7 @@ RT = `docs/specs/runtime-contracts.md`, vendor specs in `docs/specs/vendors/`.
 | C1 §6.2–6.3 (`:553`) | "### 6.2 Ordering": "Per session FIFO in `seq`; no promise across sessions (D4). `turn.ended` is the last non-late event of its turn." |
 | C1 §7.6 last row (`:661`) | "followers whose subscription ended must poll `result`" becomes "a caller that already read the result must read it again" |
 | C1 §10 (`:748`, `:761`) | delete "Q1 session-wide follow; "; Q7 "Outbox and channel sizes (1000 events; C2 A1 limits)" becomes "Channel sizes (C2 A1 limits)" and "as written, config-tunable" becomes "as written, fixed; disk and WAL thresholds are daemon config (runtime §8)" |
-| C1 §3.8 | append "`wait` is the only blocking read; it checks at once, then once per second. A caller that wants progress polls `status` (§3.7) on another connection, since a connection carries one request at a time. Closing the connection of a pending `wait` releases only that waiter." |
+| C1 §3.8 | append "`wait` is the only blocking read; it checks at once, then once per second. A caller that wants progress polls `status` (§3.7) on another connection, since a connection carries one request at a time. Closing the connection of a pending `wait` releases only that waiter." (Superseded 2026-10-04, via-p98.3.5 and via-2lp: `wait` returns as soon as the turn's terminal commits, and `events` gained a `wait_ms` long-poll; see C1 §3.8 and §3.11.) |
 | RT §9 (`:1080-1120`) | the text below |
 | RT §1 (`:28`, `:35-37`) | delete "Live observers consume durable events, never an independent best-effort copy."; limit 2 becomes "2. A blocked peer cannot be guaranteed a reply. The daemon closes the socket after the 10 s reply deadline; the caller retries the read." |
 | RT §2 Core row (`:77`) | "subscribers" becomes "progress snapshots" |
@@ -1314,6 +1330,11 @@ RT = `docs/specs/runtime-contracts.md`, vendor specs in `docs/specs/vendors/`.
 > socket closes (C1 §1), so a peer that never reads holds its reply buffer
 > for at most that long. `logs` returns only the addressed turn's evidence
 > locations (C1 §3.12).
+
+Note (2026-10-04, via-p98.3.5 and via-2lp): the quoted `wait` cadence and
+"no follow" text is superseded; runtime §9 and C1 §3.11 now say `wait`
+returns as soon as the turn's terminal commits and `events` long-polls with
+`wait_ms`.
 
 **T4-A26. `status` returns progress and step history (R3, R4, R5).** C1 §3.7
 (`:274`): after the heading add "`via status <session> [--turn N]
@@ -1786,7 +1807,7 @@ Under `#[cfg(feature = "test-failpoints")]`, added to
 | `s1_store_steps_delete_is_one_keyed_range` | `EXPLAIN QUERY PLAN` uses the primary key; of two interleaved sessions one is deleted, the other intact |
 | `s1_c1_status_every_member_after_eviction_and_restart`; `s1_c1_status_alive_false_after_exit_before_control_drop` | durable members equal before and after; `progress` null after restart; exit observed with the control upgradeable → `alive` false |
 | `s1_c1_events_page_filters_and_bounds`; `s1_c1_follow_and_unsubscribe_are_refused` | window, `types`, `turn`, `next_after` across filtered rows, `more`, the byte bound, no `raw_ref`; `follow: true` is `invalid_params`, `unsubscribe` `method_not_found` |
-| `s1_c1_wait_checks_each_second_and_32_waiters_leave_status_served` [t4r16.7.7] | a waiter's reads on a paused clock are at 0 s, 1 s, 2 s, …; the end is seen within 1 s; 31 sockets waiting and one polling `status` all answer; a 33rd socket is closed without bytes |
+| `s1_c1_wait_reads_after_commits_and_32_waiters_leave_status_served` [t4r16.7.7; via-p98.3.5] | a waiter on a held turn reads at once and then only after a commit (the once-per-second check it replaced read at 0 s, 1 s, 2 s, …); 31 sockets waiting and one polling `status` all answer; a 33rd socket is closed without bytes |
 | `s1_evidence_stderr_is_written_by_the_os_and_listed` [t4r16.1] | the fake writes 1 MiB to stderr: `stderr.log` holds exactly those bytes, idle was not reset; `logs` lists it with its size, `folder` absolute, `transcript` and `vendor_session_id` `null`; the envelope's `evidence` equals it |
 | `s1_evidence_undecoded_message_is_saved_and_named` | a malformed known message of 200 KiB, and a 2 MiB line: `failed(protocol)` and `failed(overflow)`, each `undecoded.bin` holds the first 64 KiB, and `failure.message` names the file (and the length, when known) |
 | `s1_evidence_folder_failure_fails_store_before_launch` | a pre-created `<turn>` folder: `failed(store)`, no anchor intent, no process |

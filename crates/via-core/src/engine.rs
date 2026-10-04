@@ -97,8 +97,9 @@ pub struct Engine {
     /// Receipted turns with no terminal known to have committed; a turn whose
     /// terminal could not be made durable reads as `store_error`.
     unresolved: Unresolved,
-    /// Set once final shutdown committed its last record; nothing commits after.
-    finalized: AtomicBool,
+    /// Set once final shutdown committed its last record; nothing commits
+    /// after. A watch, so a pending `wait` or `events` wakes (design §4.1).
+    finalized: watch::Sender<bool>,
     /// Sessions with dispatch state: queue, dispatcher and event head. A slot
     /// is retired when its dispatcher exits with nothing left (design §2).
     /// Shared with each lane's [`SessionWriter`].
@@ -418,7 +419,7 @@ impl Engine {
             forced: StdMutex::new(Vec::new()),
             affected: StdMutex::new(Vec::new()),
             unresolved: Unresolved::default(),
-            finalized: AtomicBool::new(false),
+            finalized: watch::Sender::new(false),
             sessions: Arc::new(StdMutex::new(HashMap::new())),
             queued: AtomicUsize::new(0),
             store_failed: Arc::new(AtomicBool::new(false)),

@@ -295,13 +295,14 @@ pub(super) fn configure(
 /// [`DeadGuard`], so however it ends, unwinding included, the writer is
 /// marked dead and the request in hand and every queued one fail
 /// `WriterLost`. Every mutation passes `wal`'s policy (Task 4 design
-/// §5.4) before and after it.
+/// §5.4) before and after it, and then changes `commits` (§4.1).
 pub(super) fn writer_loop(
     mut conn: Connection,
     lanes: &Lanes,
     corruption: &ReadCorruption,
     blobs: &Blobs,
     mut wal: Wal,
+    commits: &tokio::sync::watch::Sender<u64>,
 ) {
     let mut guard = DeadGuard::new(lanes);
     while let Some(command) = lanes.pop() {
@@ -338,6 +339,8 @@ pub(super) fn writer_loop(
         };
         serve_write(&mut conn, command, blobs);
         wal.committed(&conn);
+        // Also after a failed write: a waiter only re-reads.
+        commits.send_modify(|count| *count = count.wrapping_add(1));
     }
     let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
     drop(guard);

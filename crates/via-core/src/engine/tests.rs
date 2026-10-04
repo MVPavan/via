@@ -17,6 +17,8 @@ use via_store::{SubmissionRecord, TerminalRecord};
 
 use super::{Engine, Receipted};
 use crate::api::{Event, EventBody, rfc3339};
+
+mod wake;
 use crate::{
     AdapterConfig, ApiError, BootstrapEnv, DaemonStopParams, Deadline, ResumeParams, SessionId,
     SpawnParams, TurnNumber,

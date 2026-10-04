@@ -1,14 +1,12 @@
 //! Reads: address resolution, `result`, `wait`, `events`, `logs` and
 //! `status`.
 
-use std::{
-    sync::{Arc, atomic::Ordering},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
-use via_store::{EventsRead, PAGE_MAX, StoreClient, TerminalFacts};
+use tokio::sync::watch;
+use via_store::{EventsPage, EventsQuery, EventsRead, PAGE_MAX, StoreClient, TerminalFacts};
 
 use super::{Engine, journal};
 use crate::api::{DEFAULT_WAIT_MS, PlanFields, Warning, rfc3339};
@@ -21,9 +19,6 @@ use crate::{
 /// `status` reply bound (Task 4 design §4.2): met by construction, checked
 /// by a debug assertion.
 const STATUS_MAX: usize = 1024 * 1024;
-
-/// How often `wait` checks a turn's terminal facts (design §4.1).
-const WAIT_CHECK: Duration = Duration::from_secs(1);
 
 /// `status` step page size without `limit` (C1 §3.7).
 const STATUS_DEFAULT_LIMIT: u32 = 100;
@@ -113,13 +108,15 @@ impl Engine {
     /// Waits for a durable terminal result independently of client lifetime,
     /// at most `timeout_ms` (C1 §3.8), then `wait_timeout`.
     ///
-    /// Design §4.1 [t4r16.7.7]: it checks the turn's terminal facts on the
-    /// Public lane at once and then a second after each check, and reads the envelope
-    /// with `result_text` only once the turn is terminal: 32 waiters make
-    /// 32 reads per second, and a turn's end is seen at most 1 s late.
-    /// Once final shutdown committed its last record, a result still
-    /// missing can never commit in this daemon: the wait ends
-    /// `daemon_stopping`. The deadline bounds its Store reads too
+    /// Design §4.1: it checks the turn's terminal facts on the Public lane
+    /// at once and again after each change that may settle it ([`Wakes`]),
+    /// and reads the envelope with `result_text` only once the turn is
+    /// terminal. A turn's end is seen as soon as it commits. The load is
+    /// bounded: at most 32 sockets make at most 32 waiters, and a burst of
+    /// commits wakes each waiter once at most, since the signal coalesces
+    /// while a waiter reads. Once final shutdown committed its last record,
+    /// a result still missing can never commit in this daemon: the wait
+    /// ends `daemon_stopping`. The deadline bounds its Store reads too
     /// ([`by_deadline`]): a turn already terminal when the first check
     /// completes within it is returned.
     pub async fn wait(&self, params: WaitParams) -> Result<Box<RawValue>, ApiError> {
@@ -129,11 +126,14 @@ impl Engine {
             .ok_or(ApiError::INVALID_PARAMS)?;
         let (session, turn) = by_deadline(deadline, self.address(&params.address)).await?;
         let public = self.store.public();
+        // Subscribed before the first read: a change after any read wakes
+        // the next await.
+        let mut wakes = self.wakes();
         let mut checked = false;
         let mut registered = false;
         loop {
             // Read before the Store: a result committed before finalization is seen.
-            let finalized = self.finalized.load(Ordering::Acquire);
+            let finalized = *self.finalized.borrow();
             let facts = self.read_facts_on(&public, &session, turn);
             if by_deadline(deadline, facts).await?.is_some()
                 && let Some(result) =
@@ -157,31 +157,42 @@ impl Engine {
                 #[cfg(feature = "test-failpoints")]
                 let _ = via_store::failpoint::hit_async("core.wait.registered").await;
             }
-            // A second after this read ended: a slow read is not caught up
-            // by back-to-back reads (§4.1).
-            let check_at = tokio::time::Instant::now() + WAIT_CHECK;
-            tokio::time::sleep_until(deadline.min(check_at)).await;
+            // Safe to ignore: at the deadline the loop's next read or check
+            // ends the wait `wait_timeout`.
+            let _ = tokio::time::timeout_at(deadline, wakes.changed()).await;
         }
     }
 
     /// Waits, unbounded, for the turn's durable terminal facts (design
     /// §3.3 [r3.4], §6.7): a turn's own deadlines bound it; no envelope is
-    /// read. Once final shutdown finalized, a turn recorded unpersisted is
-    /// `store_error` and any other is `daemon_stopping`.
+    /// read. It re-reads on each [`Wakes`] change. Once final shutdown
+    /// finalized, a turn recorded unpersisted is `store_error` and any other
+    /// is `daemon_stopping`.
     pub(super) async fn await_terminal(
         &self,
         session: &SessionId,
         turn: TurnNumber,
     ) -> Result<TerminalFacts, ApiError> {
+        let mut wakes = self.wakes();
         loop {
-            let finalized = self.finalized.load(Ordering::Acquire);
+            let finalized = *self.finalized.borrow();
             if let Some(facts) = self.read_facts(session, turn).await? {
                 return Ok(facts);
             }
             if finalized {
                 return Err(ApiError::DAEMON_STOPPING);
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            wakes.changed().await;
+        }
+    }
+
+    /// What may settle a pending read, subscribed now: subscribe before
+    /// the read.
+    fn wakes(&self) -> Wakes {
+        Wakes {
+            commits: Some(self.store.subscribe_commits()),
+            failures: self.unresolved.subscribe(),
+            finalized: self.finalized.subscribe(),
         }
     }
 
@@ -189,24 +200,57 @@ impl Engine {
     /// window after `after`, filtered by `turn` and `types`; the events
     /// array Store wrote is placed in the reply as it is, never parsed.
     /// `earliest_seq` is 1: nothing is pruned.
+    ///
+    /// With `wait_ms` (design §4.3), a page with no events is read again
+    /// from its `next_after`, at once while `more`, else after the next
+    /// [`Wakes`] change, until a page has events or the bound passes; then
+    /// the last empty page is the reply. Final shutdown ends a long-poll
+    /// that found nothing `daemon_stopping`.
     pub async fn events(&self, params: EventsParams) -> Result<Box<RawValue>, ApiError> {
+        let wait = params.wait()?;
+        let mut query = params.query()?;
+        let Some(wait) = wait else {
+            return page_reply(&self.events_read(&query).await?);
+        };
+        let deadline = tokio::time::Instant::now()
+            .checked_add(wait)
+            .ok_or(ApiError::INVALID_PARAMS)?;
+        let mut wakes = self.wakes();
+        loop {
+            let finalized = *self.finalized.borrow();
+            let page = self.events_read(&query).await?;
+            if page.events != "[]" || tokio::time::Instant::now() >= deadline {
+                return page_reply(&page);
+            }
+            query.after = page.next_after;
+            if page.more {
+                continue;
+            }
+            if finalized {
+                return Err(ApiError::DAEMON_STOPPING);
+            }
+            if tokio::time::timeout_at(deadline, wakes.changed())
+                .await
+                .is_err()
+            {
+                return page_reply(&page);
+            }
+        }
+    }
+
+    /// One `events` page read on the Public lane.
+    async fn events_read(&self, query: &EventsQuery) -> Result<EventsPage, ApiError> {
         let read = self
             .store
             .public()
-            .events_page(params.query()?)
+            .events_page(query.clone())
             .await
             .map_err(|error| ApiError::read(&error))?;
-        let page = match read {
-            EventsRead::Page(page) => page,
-            EventsRead::SessionNotFound => return Err(ApiError::SESSION_NOT_FOUND),
-            EventsRead::TurnNotFound => return Err(ApiError::TURN_NOT_FOUND),
-        };
-        let reply = format!(
-            r#"{{"events":{},"next_after":{},"more":{},"earliest_seq":1}}"#,
-            page.events, page.next_after, page.more
-        );
-        debug_assert!(reply.len() <= PAGE_MAX, "an events page exceeds PAGE_MAX");
-        RawValue::from_string(reply).map_err(|_| ApiError::STORE)
+        match read {
+            EventsRead::Page(page) => Ok(page),
+            EventsRead::SessionNotFound => Err(ApiError::SESSION_NOT_FOUND),
+            EventsRead::TurnNotFound => Err(ApiError::TURN_NOT_FOUND),
+        }
     }
 
     /// C1 §3.10 `list` (Task 4 design §4.5, §6.8): one Public Store read of
@@ -490,6 +534,52 @@ fn evidence_files(folder: &std::path::Path, named: Option<&str>) -> std::io::Res
         }
     }
     Ok(files)
+}
+
+/// The `events` reply for `page`, built around the events array Store wrote.
+fn page_reply(page: &EventsPage) -> Result<Box<RawValue>, ApiError> {
+    let reply = format!(
+        r#"{{"events":{},"next_after":{},"more":{},"earliest_seq":1}}"#,
+        page.events, page.next_after, page.more
+    );
+    debug_assert!(reply.len() <= PAGE_MAX, "an events page exceeds PAGE_MAX");
+    RawValue::from_string(reply).map_err(|_| ApiError::STORE)
+}
+
+/// What can settle a pending `wait`, `events` long-poll or terminal await
+/// (design §4.1): a Store commit, a turn Core records unpersisted (no
+/// Store commit), or final shutdown. A change carries no fact; the waiter
+/// re-reads.
+struct Wakes {
+    /// `None` once the Store's writer ended: the read that its close woke
+    /// surfaced the Store's error, and a closed channel would wake at once
+    /// forever.
+    commits: Option<watch::Receiver<u64>>,
+    failures: watch::Receiver<u64>,
+    finalized: watch::Receiver<bool>,
+}
+
+impl Wakes {
+    /// Returns at the next change of any source since the last return or
+    /// the subscription. Cancel-safe: dropping it loses no change.
+    async fn changed(&mut self) {
+        let commits = async {
+            match self.commits.as_mut() {
+                Some(commits) => commits.changed().await.is_err(),
+                None => std::future::pending().await,
+            }
+        };
+        // Core owns the other two senders and outlives every waiter, so
+        // their `changed()` never ends in `Err`.
+        let writer_ended = tokio::select! {
+            ended = commits => ended,
+            _ = self.failures.changed() => false,
+            _ = self.finalized.changed() => false,
+        };
+        if writer_ended {
+            self.commits = None;
+        }
+    }
 }
 
 /// Bounds one of `wait`'s Store reads by the wait's absolute deadline
