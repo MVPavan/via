@@ -425,8 +425,8 @@ has an evidence folder, `<state>/evidence/<session_id>/<turn>/`. A shared
 server's connection has its own, `<state>/evidence/servers/<server_id>/`. The
 vendor's stderr is the file `stderr.log` in its owner's folder (the turn's on
 a per-turn route, the server's on a shared one): Host opens it and gives it to
-the anchor as stderr, the vendor inherits it, and the operating system writes
-it; no VIA task reads it. When Route cannot decode a message, and when a
+the anchor as stderr; the anchor gives the vendor a pipe as stderr and drains
+it into the file under a cap (below); no VIA task reads it. When Route cannot decode a message, and when a
 message exceeds 1 MiB or ends unterminated, its first 64 KiB is written to
 `undecoded.bin`: in the folder of the turn its correlation names, when it
 names one; otherwise in the connection's folder. The failures go to the
@@ -436,7 +436,17 @@ when the file is in its own session's turn folder, and only the length when it
 is in the connection's folder (D4). C1 `logs` returns only turn folders. A
 final text too long for the envelope is written there as `final_text.txt`, and
 a structured output too long for it as `structured_output.json` (C1 §5). The
-vendor's stderr is not capped. The vendor's own transcript keeps the
+vendor's stderr is capped (owner, 2026-10-04): a per-turn process keeps its
+first 4 MiB and last 1 MiB, a shared server its first 8 MiB and last 8 MiB.
+The head is written as it arrives; the tail waits in the anchor's bounded
+ring, and the bytes between are discarded. The anchor always drains the
+pipe, discarding past the cap, so the vendor never blocks on stderr. When
+bytes were dropped, one marker line `[via: <n> bytes of vendor stderr
+dropped]`, on its own line, precedes the tail; the tail is written when the
+vendor group ends (the pipe's EOF, or before the anchor's own group KILL),
+and when the anchor returns early on an error. An anchor killed from outside
+loses the tail, and the vendor's later stderr writes then fail (`EPIPE` or
+`SIGPIPE`). The vendor's own transcript keeps the
 conversation; SQLite keeps its path as a hint with the vendor session ID.
 
 ## 5. C5: private process supervision
@@ -585,9 +595,12 @@ to a recycled group after the signalling process has ceased to exist.
 
 The Host anchor starts the vendor, which inherits the anchor's current group;
 no numeric group-join operation races an exiting anchor. Group membership is
-inherited at child creation, before exec. Anchor's standard streams were
+inherited at child creation, before exec. The anchor's stdin and stdout were
 created as pipes by the daemon and are inherited by the vendor using
-`Stdio::inherit`; Wire exclusively reads/writes their daemon ends. Inheritance
+`Stdio::inherit`; Wire exclusively reads/writes their daemon ends. The
+anchor's stderr is the owner's `stderr.log`: the anchor keeps a
+close-on-exec duplicate of it and gives the vendor a new pipe as stderr,
+which a drain thread of the anchor reads into the file under §4's cap. Inheritance
 does not detach the anchor's copies. Before spawning, the anchor opens
 `/dev/null` read/write; immediately after successful spawn, it redirects its
 own fd 0, 1 and 2 to that file using safe `rustix::stdio::dup2_stdin`,
@@ -604,8 +617,8 @@ On any failure, report `PipeDetachFailed` through the separate control socket,
 start bounded own-group cleanup and return no successful acquisition. If
 spawn itself fails, detach the three copies before its failure reply as well;
 failure to detach follows the same cleanup path. While the anchor remains
-alive after vendor exit, stdout/stderr EOF and stdin reader disappearance
-must therefore reflect the vendor and its actual descendants, not the anchor.
+alive after vendor exit, stdout EOF and stdin reader disappearance must
+therefore reflect the vendor and its actual descendants, not the anchor.
 The anchor never reads/writes vendor bytes or logs to those streams. It reports
 diagnostics and vendor exit over its separate Host socket. The anchor owns
 the vendor child handle and reaps it while alive; the daemon owns/reaps the
@@ -944,8 +957,9 @@ Write ordering is explicit:
    outcome causes Store-failed mode, never speculative send.
 3. Host commits anchor intent/generation, starts anchor, commits its
    verified identity, configures, commits `ArmIntent`, then sends ARM once.
-   Anchor spawns vendor in its inherited group with its owner's stderr file
-   and detaches fd 0/1/2 before its acknowledgement; Host records vendor
+   Anchor spawns vendor in its inherited group with a stderr pipe it drains
+   into its owner's stderr file (capped, §4) and detaches fd 0/1/2 before its
+   acknowledgement; Host records vendor
    facts. Wire starts its stdout reader and writes the prompt. Vendor
    acceptance is independent evidence.
    On a shared-server route the turn's `run_turn` instead creates the
@@ -1059,7 +1073,8 @@ socket classes mode 0600 from the start. Initialize daemon umask 0077 before
 threads or file creation, including SQLite sidecars. Store alone opens
 SQLite and blob files, and validates or creates the `evidence/` root; Wire
 creates each turn's folder and each shared server's folder under it; Host
-opens the owner's `stderr.log` (the turn's or the server's) for the child;
+opens the owner's `stderr.log` (the turn's or the server's) for the anchor,
+which writes the vendor's stderr into it (§4);
 daemon bootstrap creates `vendor/`, and each adapter its own subdirectory,
 under the managed-directory rules above; `final_text.txt` and
 `structured_output.json` are written through `StoreClient`. Host owns

@@ -384,7 +384,8 @@ fn fragmented_status_and_stop_survive_anchor_poll_ticks() {
         let socket = fixture.root.join("anchors").join(format!("{anchor_id}.sock"));
         let config = fixture.root.join("anchors").join(format!("{anchor_id}.json"));
         let bootstrap = serde_json::json!({"anchor_id":anchor_id,"generation":generation,
-            "marker":marker,"controller_pid":std::process::id(),"socket_path":socket});
+            "marker":marker,"controller_pid":std::process::id(),"socket_path":socket,
+            "stderr_cap":{"head":4_194_304,"tail":1_048_576}});
         fs::write(&config, serde_json::to_vec(&bootstrap).unwrap()).unwrap();
         fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
         let mut command = tokio::process::Command::new(&fixture.binary);

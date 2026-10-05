@@ -2200,3 +2200,102 @@ fn reconciliation_removes_only_proven_absent_anchor_sockets() {
         drop(live);
     });
 }
+
+const MIB: usize = 1024 * 1024;
+
+/// A vendor that writes `runs` to stderr, each `(byte, length)`, and exits.
+fn stderr_writer(fixture: &Fixture, runs: &[(char, usize)]) -> PrivateProcessSpec {
+    let mut script = String::new();
+    for (byte, length) in runs {
+        use std::fmt::Write as _;
+        write!(script, "head -c {length} /dev/zero | tr '\\0' {byte}; ").unwrap();
+    }
+    fixture.spec("/bin/sh", &["-c", &format!("{{ {script}}} >&2")])
+}
+
+/// Runs `spec` to its exit, which must come within 10 s although nothing
+/// reads its stderr but Host, then closes it and returns its `stderr.log`.
+async fn stderr_of(host: &Host, spec: PrivateProcessSpec) -> Vec<u8> {
+    let path = spec.stderr_path.clone();
+    let mut acquired = host.acquire(spec, within(4)).await.unwrap();
+    let exited = tokio::time::timeout(
+        Duration::from_secs(10),
+        acquired.exits.wait_for(Option::is_some),
+    )
+    .await;
+    assert!(matches!(exited, Ok(Ok(_))), "the stderr writer blocked");
+    let close = acquired
+        .control
+        .close(CloseRequest {
+            mode: CloseMode::Force,
+            deadline: within(3),
+        })
+        .await;
+    assert!(
+        matches!(close.cleanup, CleanupEvidence::GroupAbsent(_)),
+        "{close:?}"
+    );
+    fs::read(path).unwrap()
+}
+
+/// `head` bytes of `a`, the marker for `dropped` bytes, `tail` bytes of `c`.
+fn capped(head: usize, dropped: usize, tail: usize) -> Vec<u8> {
+    let mut expected = vec![b'a'; head];
+    expected.extend_from_slice(
+        format!("\n[via: {dropped} bytes of vendor stderr dropped]\n").as_bytes(),
+    );
+    expected.extend(std::iter::repeat_n(b'c', tail));
+    expected
+}
+
+/// Bead via-c2r: a per-turn vendor's stderr past its cap keeps exactly the
+/// first 4 MiB, one marker line with the dropped count and the last 1 MiB;
+/// the vendor writes all of it without blocking.
+#[test]
+fn a_turn_vendors_stderr_keeps_its_head_marker_and_tail() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        let spec = stderr_writer(&fixture, &[('a', 4 * MIB), ('b', 2 * MIB), ('c', MIB)]);
+        let log = stderr_of(&host, spec).await;
+        assert_eq!(log.len(), capped(4 * MIB, 2 * MIB, MIB).len());
+        assert!(
+            log == capped(4 * MIB, 2 * MIB, MIB),
+            "not head, marker and tail"
+        );
+    });
+}
+
+/// Bead via-c2r: a shared server's stderr keeps the first and the last 8 MiB.
+#[test]
+fn a_servers_stderr_keeps_its_head_marker_and_tail() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        let mut spec = stderr_writer(&fixture, &[('a', 8 * MIB), ('b', 3 * MIB), ('c', 8 * MIB)]);
+        spec.owner = server_spec(&fixture).owner;
+        let log = stderr_of(&host, spec).await;
+        assert_eq!(log.len(), capped(8 * MIB, 3 * MIB, 8 * MIB).len());
+        assert!(
+            log == capped(8 * MIB, 3 * MIB, 8 * MIB),
+            "not head, marker and tail"
+        );
+    });
+}
+
+/// Bead via-c2r: stderr within the cap is kept whole, with no marker: a
+/// short write, and one that passes the head into the tail.
+#[test]
+fn stderr_within_the_cap_is_kept_whole() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        let small = fixture.spec("/bin/sh", &["-c", "printf 'small stderr\\n' >&2"]);
+        assert_eq!(stderr_of(&host, small).await, b"small stderr\n");
+        let spec = stderr_writer(&fixture, &[('a', 4 * MIB), ('c', MIB)]);
+        let log = stderr_of(&host, spec).await;
+        let mut whole = vec![b'a'; 4 * MIB];
+        whole.extend(std::iter::repeat_n(b'c', MIB));
+        assert!(log == whole, "a 5 MiB stderr was not kept whole");
+    });
+}

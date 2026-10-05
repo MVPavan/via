@@ -1068,8 +1068,9 @@ class; `submit_failed` is only before acceptance; HTTP 401/403 → `auth`. `max_
   transiently hold credential values; it is compared in memory and dropped,
   nothing from it is kept except the report, and the marker never authorizes
   a signal or proves ownership or liveness.
-- Prompts and outputs are private local data; retention is daemon config
-  (Proposed 30 days); vendor processes get a per-adapter environment
+- Prompts and outputs are private local data. The first release deletes
+  none of them automatically: there is no retention or pruning (runtime
+  contracts §6). Vendor processes get a per-adapter environment
   allow-list, never the caller's environment.
 - `via serve --stdio` gives its parent full C1 access; local callers only.
 

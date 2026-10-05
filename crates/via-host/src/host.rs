@@ -1365,6 +1365,10 @@ impl Host {
             marker: marker.clone(),
             controller_pid: std::process::id(),
             socket_path: socket_path.clone(),
+            stderr_cap: match owner {
+                ProcessOwner::Turn { .. } => crate::stderr_log::StderrCap::TURN,
+                ProcessOwner::Server { .. } => crate::stderr_log::StderrCap::SERVER,
+            },
             #[cfg(feature = "test-failpoints")]
             failpoints: via_store::failpoint::activation(),
         };
@@ -1437,8 +1441,10 @@ impl Host {
         })
     }
 
-    /// Spawns the anchor with `stderr` as its standard error, which the
-    /// vendor inherits (design §7.2); only stdin and stdout are pipes.
+    /// Spawns the anchor with `stderr` as its standard error: the anchor
+    /// keeps it and drains the vendor's stderr pipe into it under the
+    /// bootstrap's cap (design §7.2, bead via-c2r). Stdin and stdout are the
+    /// vendor's pipes.
     fn spawn_anchor(
         &self,
         config_path: &PathBuf,
@@ -2244,7 +2250,7 @@ async fn configure(
 }
 
 /// Creates the turn's `stderr.log` (design §7.2): new, 0600, never through a
-/// symlink. The operating system writes it; VIA never reads it.
+/// symlink. The anchor writes it, capped (bead via-c2r); VIA never reads it.
 fn open_stderr(path: &std::path::Path) -> io::Result<fs::File> {
     OpenOptions::new()
         .write(true)

@@ -7,6 +7,7 @@ mod anchor;
 mod host;
 mod linux;
 mod protocol;
+mod stderr_log;
 
 pub use anchor::run_anchor_from_args;
 pub(crate) use host::monotonic_remaining;

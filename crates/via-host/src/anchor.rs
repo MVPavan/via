@@ -15,6 +15,7 @@ use tokio::{
 use crate::{
     linux,
     protocol::{self, Bootstrap, Reply, Request, VendorConfig, WireIdentity},
+    stderr_log::{self, CappedLog, SharedLog, StderrCap},
 };
 
 /// Runs the private same-binary anchor entrypoint from one bootstrap path.
@@ -168,7 +169,11 @@ async fn armed(
     vendor: VendorConfig,
     terminate: &mut tokio::signal::unix::Signal,
 ) -> io::Result<()> {
-    let (mut child, vendor_pid) = spawn_vendor(&mut stream, vendor, terminate).await?;
+    let (mut child, vendor_pid, stderr) =
+        spawn_vendor(&mut stream, vendor, bootstrap.stderr_cap, terminate).await?;
+    // Any other return finishes the log too; the group KILL below ends
+    // this process, so it finishes the log first.
+    let _flush = FinishOnDrop(&stderr);
     let mut poll = interval(Duration::from_millis(20));
     let mut exit = None;
     let mut controller = Some(stream);
@@ -254,6 +259,9 @@ async fn armed(
                     None => std::future::pending().await,
                 }
             } => {
+                // The vendor group ends here: its stderr tail is flushed
+                // first (bead via-c2r).
+                stderr_log::finish(&stderr);
                 let _ = process::kill_process_group(process::getpgrp(), Signal::KILL);
                 return Ok(());
             }
@@ -270,11 +278,39 @@ async fn armed(
     }
 }
 
+/// Finishes the vendor's stderr log when the armed anchor returns.
+struct FinishOnDrop<'a>(&'a SharedLog);
+
+impl Drop for FinishOnDrop<'_> {
+    fn drop(&mut self) {
+        stderr_log::finish(self.0);
+    }
+}
+
+/// Opens the vendor's stderr pipe and its drain (bead via-c2r): the drain
+/// thread writes the read end into `stderr.log`, the anchor's inherited
+/// stderr, which it keeps through a close-on-exec duplicate. The thread
+/// always reads, so the vendor never blocks on stderr, and holds at most
+/// the cap's tail in memory. It ends with the anchor's process.
+fn stderr_drain(cap: StderrCap) -> io::Result<(io::PipeWriter, SharedLog)> {
+    use std::os::fd::AsFd;
+    let file = fs::File::from(io::stderr().as_fd().try_clone_to_owned()?);
+    let (reader, writer) = io::pipe()?;
+    let log: SharedLog = std::sync::Arc::new(std::sync::Mutex::new(CappedLog::new(file, cap)));
+    let drained = log.clone();
+    std::thread::Builder::new()
+        .name("stderr-drain".into())
+        .spawn(move || stderr_log::drain(reader, &drained))?;
+    Ok((writer, log))
+}
+
 async fn spawn_vendor(
     stream: &mut UnixStream,
     vendor: VendorConfig,
+    cap: StderrCap,
     terminate: &mut tokio::signal::unix::Signal,
-) -> io::Result<(Child, u32)> {
+) -> io::Result<(Child, u32, SharedLog)> {
+    let drain = stderr_drain(cap);
     let mut command = tokio::process::Command::new(vendor.program());
     command
         .args(vendor.args())
@@ -283,13 +319,22 @@ async fn spawn_vendor(
     for (key, value) in vendor.env() {
         command.env(key, value);
     }
-    command
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    let spawn = command.spawn();
+    command.stdin(Stdio::inherit()).stdout(Stdio::inherit());
+    // A drain that could not start is a spawn failure: no vendor runs
+    // without one, since its stderr would fill and block it.
+    let spawn = drain.and_then(|(writer, log)| {
+        command.stderr(writer);
+        command.spawn().map(|child| (child, log))
+    });
+    // The command holds the anchor's copy of the pipe's write end: dropped
+    // before the spawn reply, so the drain sees EOF when the vendor group
+    // closes its copies.
+    drop(command);
     let detach = detach_standard_streams();
     if detach.is_err() {
+        if let Ok((_, log)) = &spawn {
+            stderr_log::finish(log);
+        }
         let _ = protocol::write_message(
             stream,
             &Reply::Error {
@@ -301,8 +346,8 @@ async fn spawn_vendor(
         stop_own_group(terminate, Duration::from_millis(200)).await;
         return Err(io::Error::other("PipeDetachFailed"));
     }
-    let child = match spawn {
-        Ok(child) => child,
+    let (child, log) = match spawn {
+        Ok(spawned) => spawned,
         Err(error) => {
             let _ = protocol::write_message(
                 stream,
@@ -322,13 +367,15 @@ async fn spawn_vendor(
         .await
         .is_err()
     {
+        // The group KILL ends this process: the log is finished first.
+        stderr_log::finish(&log);
         stop_own_group(terminate, Duration::from_millis(200)).await;
         return Err(io::Error::new(
             io::ErrorKind::BrokenPipe,
             "spawn reply lost",
         ));
     }
-    Ok((child, vendor_pid))
+    Ok((child, vendor_pid, log))
 }
 
 /// Starts own-group cleanup once; a later call only shortens its grace.
