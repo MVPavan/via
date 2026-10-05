@@ -23,7 +23,7 @@ mod support;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -647,6 +647,66 @@ fn s1_config_and_daemon_log_fifo_are_refused_at_once() -> TestResult {
             // The scenario's own deployment runs one turn for its evidence.
             let _daemon = setup.start(evidence)?;
             setup.one_turn(evidence, "fifo")
+        },
+        |evidence| setup.collect(evidence),
+    );
+    report.require_pass()
+}
+
+/// Bead via-dst: a runtime directory whose `via.sock` fits the Unix socket
+/// path limit but whose anchor sockets (`anchors/<32 hex>.sock`) do not is
+/// refused at start with a named error, bounded by 10 s, and leaves no
+/// socket. Before the fix the daemon served, and every turn failed
+/// `unknown` after 5 s with no diagnostic.
+#[test]
+fn s1_config_deep_runtime_dir_is_refused_at_start() -> TestResult {
+    let setup = Setup::new(&script("deep", &[]))?;
+    let evidence = setup.evidence("s1_config_deep_runtime")?;
+    let report = run_scenario(
+        evidence,
+        |evidence| {
+            let fresh = Sandbox::new(&script("deep", &[])).map_err(infra)?;
+            let root = fresh
+                .state
+                .parent()
+                .ok_or_else(|| infra("sandbox state has no parent"))?;
+            // 80 bytes: `via.sock` needs 89 of the 108-byte `sun_path`,
+            // an anchor socket 126.
+            let base = root.join("r");
+            let pad = 80_usize
+                .checked_sub(base.as_os_str().len() + 1)
+                .filter(|pad| *pad > 0)
+                .ok_or_else(|| infra(format!("sandbox root too long: {}", root.display())))?;
+            let deep = base.join("d".repeat(pad));
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&deep)
+                .map_err(infra)?;
+            fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).map_err(infra)?;
+            let mut command = fresh.command();
+            command.env("VIA_RUNTIME_DIR", &deep).arg("daemon");
+            let run =
+                scenario::run_command(&mut command, Duration::from_secs(10)).map_err(infra)?;
+            let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+            evidence
+                .write("deep_start.stderr", &run.stderr)
+                .map_err(infra)?;
+            check(!run.timed_out, || {
+                format!("a {}-byte runtime directory served: {stderr}", 80)
+            })?;
+            check(
+                run.status.code() == Some(4)
+                    && stderr.contains("anchor socket path")
+                    && stderr.contains("Unix socket path limit"),
+                || format!("deep runtime start: {:?} {stderr}", run.status),
+            )?;
+            check(!deep.join("via.sock").exists(), || {
+                "the refused start left via.sock".to_owned()
+            })?;
+            // The scenario's own deployment runs one turn for its evidence.
+            let _daemon = setup.start(evidence)?;
+            setup.one_turn(evidence, "deep")
         },
         |evidence| setup.collect(evidence),
     );

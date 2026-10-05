@@ -471,6 +471,13 @@ pub enum HostError {
     /// its bound (design item 6.3): the requested turns without their own
     /// anchor records stay uncertain. Groups were still stopped.
     LinksUnread,
+    /// The anchor directory is too deep for an anchor socket
+    /// (`<anchor_dir>/<anchor id>.sock`) to fit the Unix socket path limit
+    /// (bead via-dst): Host refuses to start rather than fail every launch.
+    AnchorPathTooLong {
+        /// The longest anchor socket path Host would bind.
+        path: PathBuf,
+    },
 }
 
 impl std::fmt::Display for HostError {
@@ -503,6 +510,13 @@ impl std::fmt::Display for HostError {
             Self::Deadline => formatter.write_str("Host deadline expired"),
             Self::Stopped => formatter.write_str("stopped before ARM"),
             Self::LinksUnread => formatter.write_str("turn links to server anchors unread"),
+            Self::AnchorPathTooLong { path } => write!(
+                formatter,
+                "runtime directory too long: anchor socket path {} is {} bytes, over the Unix \
+                 socket path limit; use a shorter runtime directory",
+                path.display(),
+                path.as_os_str().len()
+            ),
         }
     }
 }
@@ -882,6 +896,7 @@ impl Host {
             return Err(HostError::Invalid("anchor executable must be absolute"));
         }
         linux::secure_directory(&anchor_dir)?;
+        anchor_socket_fits(&anchor_dir)?;
         Ok(Self {
             journal,
             anchor_binary,
@@ -1320,7 +1335,7 @@ impl Host {
         let anchor_id = linux::random_hex()?;
         let generation = linux::random_hex()?;
         let marker = linux::random_hex()?;
-        let socket_path = self.anchor_dir.join(format!("{anchor_id}.sock"));
+        let socket_path = anchor_socket(&self.anchor_dir, &anchor_id);
         let config_path = self.anchor_dir.join(format!("{anchor_id}.json"));
         let intent = AnchorIntent {
             anchor_id: anchor_id.clone(),
@@ -2230,6 +2245,22 @@ fn open_stderr(path: &std::path::Path) -> io::Result<fs::File> {
         .mode(0o600)
         .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
         .open(path)
+}
+
+/// The anchor socket of `anchor_id` (runtime §6.1 `anchors/<anchor-id>.sock`).
+fn anchor_socket(anchor_dir: &std::path::Path, anchor_id: &str) -> PathBuf {
+    anchor_dir.join(format!("{anchor_id}.sock"))
+}
+
+/// Every anchor socket has the same length, its id being
+/// [`linux::RANDOM_HEX_LEN`] hex digits: one that fits the platform's Unix
+/// socket address means all do (bead via-dst).
+fn anchor_socket_fits(anchor_dir: &std::path::Path) -> Result<(), HostError> {
+    let path = anchor_socket(anchor_dir, &"f".repeat(linux::RANDOM_HEX_LEN));
+    match std::os::unix::net::SocketAddr::from_pathname(&path) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(HostError::AnchorPathTooLong { path }),
+    }
 }
 
 /// Writes the anchor's private bootstrap file, synced, never over another.

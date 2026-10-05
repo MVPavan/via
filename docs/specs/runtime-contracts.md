@@ -1016,6 +1016,11 @@ needed. Diagnostics may contain paths but no handles or vendor payloads.
 
 The daemon refuses to start when the state directory's path is over 1 KiB
 encoded, which bounds every evidence path an envelope names (C1 §5).
+Host refuses to start, so the daemon does, when an anchor socket path
+(`<runtime>/anchors/<anchor-id>.sock`, every one the same length) would not
+fit the platform's Unix socket address (108 bytes on Linux, including the
+terminator), naming the path and its length; a deeper runtime directory
+would otherwise fail every launch.
 
 ```text
 <state>/
