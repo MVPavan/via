@@ -36,7 +36,7 @@
 //! decodes each piece of evidence, however late the turn's own wait runs
 //! ([`Cutoffs`]). Steer is not supported.
 
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -1160,19 +1160,36 @@ fn instance_report(user_agent: &str) -> InstanceReport {
     }
 }
 
-/// Codex's thread index in its SQLite home (0.160.0): written by a
-/// server's first launch on that home.
-const STATE_DB: &str = "state_5.sqlite";
+/// VIA's own marker in the vendor home (via-25f): written once a server
+/// on that home answered its first `initialize`, so Codex's backfill of
+/// its thread index is done. Codex's own files are no signal: its SQLite
+/// index exists before the backfill completes.
+const INITIALIZED: &str = ".via-initialized";
 
 /// The handshake bound of a launch on `home` (via-25f): the first launch's
-/// while `home` holds no [`STATE_DB`], else the warm one. Only the name is
-/// checked; nothing is opened. A later Codex that renames its index only
-/// lengthens the bound.
+/// while `home` holds no [`INITIALIZED`] marker, else the warm one. Only
+/// the name is checked.
 pub(super) fn handshake_bound(home: &Path) -> HandshakeBound {
-    match std::fs::symlink_metadata(home.join(STATE_DB)) {
+    match std::fs::symlink_metadata(home.join(INITIALIZED)) {
         Ok(_) => HandshakeBound::Warm,
         Err(_) => HandshakeBound::First,
     }
+}
+
+/// Writes the [`INITIALIZED`] marker (empty, 0600, `create_new`, so no
+/// link is followed) after a server's handshake succeeded on `home`. Best
+/// effort: an existing marker or an error leaves the next launch on the
+/// long bound at worst.
+pub(super) fn mark_initialized(home: &Path) {
+    let marker = home.join(INITIALIZED);
+    if std::fs::symlink_metadata(&marker).is_ok() {
+        return;
+    }
+    let _ = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(marker);
 }
 
 /// Creates `<state>/vendor/codex` (0700) when missing; a non-directory or
@@ -1755,6 +1772,7 @@ async fn join(
     let turn = facts.number;
     let driver = facts.driver;
     let adapter = &facts.session.adapter;
+    let mut launched_on = None;
     let pin = match prepared {
         Prepared::Pinned(ConnectionPin {
             server: Some(pin), ..
@@ -1790,7 +1808,10 @@ async fn join(
                 (recipe.process_spec(owner), handshake_bound(&home)),
                 capacity,
             ) {
-                Ok(pin) => pin,
+                Ok(pin) => {
+                    launched_on = Some(home);
+                    pin
+                }
                 Err(failure) => {
                     return Err(Box::new(launch_failed(facts, &failure.into())));
                 }
@@ -1804,7 +1825,12 @@ async fn join(
         }
     };
     match pin.ready(ordered).await {
-        Ok(()) => Ok(pin),
+        Ok(()) => {
+            if let Some(home) = launched_on {
+                mark_initialized(&home);
+            }
+            Ok(pin)
+        }
         Err(Some(failure)) => Err(Box::new(launch_failed(facts, &failure))),
         // The turn's own order ended its wait: nothing of it was sent.
         Err(None) => Err(Box::new(

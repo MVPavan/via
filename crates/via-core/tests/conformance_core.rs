@@ -4744,6 +4744,10 @@ fn codex_sqlite_home_persists_across_restart() {
         let metadata = fs::symlink_metadata(&home).unwrap();
         assert!(metadata.is_dir(), "{}", home.display());
         assert_eq!(metadata.mode() & 0o777, 0o700);
+        // via-25f: the first successful handshake marks the home warm.
+        let marker = fs::symlink_metadata(home.join(".via-initialized")).unwrap();
+        assert!(marker.is_file());
+        assert_eq!(marker.mode() & 0o777, 0o600);
         fs::write(&kept, b"vendor state").unwrap();
         daemon.stop().await;
         (metadata.dev(), metadata.ino())

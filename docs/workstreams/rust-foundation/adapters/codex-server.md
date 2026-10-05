@@ -562,8 +562,10 @@ most two.
 - **Launch gates.** The handshake (`initialize`, `initialized`, paginated
   `model/list`) runs under `SERVER_HANDSHAKE = 60 s` from spawn, or
   `SERVER_FIRST_HANDSHAKE = 300 s` when the adapter finds no
-  `state_5.sqlite` in the SQLite home (`HandshakeBound`, via-25f: a cold
-  `initialize` took 38 s at the re-probe and 55 s live on 0.160.0), the
+  `.via-initialized` marker in the SQLite home (`HandshakeBound`, via-25f:
+  a cold `initialize` took 38 s at the re-probe and 55 s live on 0.160.0;
+  the adapter writes the marker after a launch's handshake succeeded, as
+  Codex's `state_5.sqlite` exists before its backfill completes), the
   daemon force and the registry fence. A turn's stop or wall ends only that turn's wait.
 - **Launch failure:** item 2.5. Each waiter's turn fails with the cause,
   nothing of it sent. A handshake refusal is cached per C2 §5.

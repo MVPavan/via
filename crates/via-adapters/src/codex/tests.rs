@@ -1856,7 +1856,19 @@ fn the_first_launch_on_a_home_takes_the_long_handshake_bound() {
     assert_eq!(bound, HandshakeBound::First);
     assert_eq!(bound.duration(), SERVER_FIRST_HANDSHAKE);
     assert_eq!(SERVER_FIRST_HANDSHAKE, std::time::Duration::from_secs(300));
+    // Codex's index exists before its backfill completes: still cold.
     std::fs::write(home.path().join("state_5.sqlite"), b"").unwrap();
+    assert_eq!(
+        super::driver::handshake_bound(home.path()),
+        HandshakeBound::First
+    );
+    // VIA's marker, written after a successful handshake: warm.
+    super::driver::mark_initialized(home.path());
+    let marker = std::fs::metadata(home.path().join(".via-initialized")).unwrap();
+    assert_eq!(
+        std::os::unix::fs::PermissionsExt::mode(&marker.permissions()) & 0o777,
+        0o600
+    );
     let bound = super::driver::handshake_bound(home.path());
     assert_eq!(bound, HandshakeBound::Warm);
     assert_eq!(bound.duration(), SERVER_HANDSHAKE);

@@ -96,12 +96,14 @@ and publish the connection only after a successful handshake; concurrent
 equal-key acquisition shares that result. The handshake has its own
 deadline from spawn, independent of any turn; a waiting turn's own wall,
 stop or force ends only its wait. It is 60 s, or 300 s for a launch whose
-SQLite home holds no `state_5.sqlite` yet (via-25f): on a fresh home Codex
-indexes the user's whole `~/.codex/sessions` before it answers
+SQLite home holds no `.via-initialized` marker yet (via-25f): on a fresh
+home Codex indexes the user's whole `~/.codex/sessions` before it answers
 `initialize`. That took 38 s at the 2026-09-30 re-probe and 55 s live on
 0.160.0 (3,973 session files, 4.17 GB read; a warm start answered in
-0.14 s), and it grows with the history. Only the file's name is checked;
-a Codex that renames it only lengthens the bound.
+0.14 s), and it grows with the history. VIA writes the empty marker (0600)
+after a server's first successful handshake on the home. Codex's own
+`state_5.sqlite` is no signal: it exists before the backfill completes, so
+an interrupted first start would otherwise be retried on the short bound.
 
 Each session has one lease and a registered thread ID. One shared server holds
 one of the runtime's harness-process slots (runtime §8) for its life; a turn on a live
