@@ -2553,6 +2553,19 @@ fn s1_f12_uncertain_terminal_latches_before_its_read_back() -> TestResult {
             format!("unexpected store_failure: {failure}")
         })?;
         daemon.latched_exit()?;
+        // Bead via-23b: the latch, visible before the read-back, is logged
+        // once with its own cause, whenever final shutdown began.
+        let log = fs::read_to_string(sandbox.state.join("via.log"))?;
+        let latched: Vec<&str> = log
+            .lines()
+            .filter(|line| line.contains("store failure latched"))
+            .collect();
+        check(
+            latched.len() == 1
+                && latched[0].contains("commit_uncertain")
+                && latched[0].contains(&format!("{session}/1")),
+            || format!("latch lines {latched:?} in {log}"),
+        )?;
         let state: String = sandbox.query(&format!(
             "SELECT state FROM turns WHERE session_id='{session}' AND number=1"
         ))?;

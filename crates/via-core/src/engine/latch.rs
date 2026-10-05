@@ -593,6 +593,26 @@ impl Signal {
         }))
     }
 
+    /// Phase one of the latch for a write whose failure is recorded only
+    /// once its site is settled (a terminal's read-back, runtime §7): the
+    /// latching cause is kept first, so the latch is never visible without
+    /// it (bead via-23b). A latching outcome's kind and scope do not depend
+    /// on the site; the failure itself, and its count, are recorded later.
+    pub(super) fn fail_pending_for(&self, outcome: WriteOutcome, scope: FailureScope<'_>) {
+        {
+            let mut record = lock(&self.failures);
+            if record.latched.is_none() {
+                record.latched = Some(LatestFailure {
+                    kind: failure_kind(FailureSite::Terminal, outcome),
+                    scope: "daemon",
+                    since: rfc3339(SystemTime::now()),
+                    addresses: scope.addresses(),
+                });
+            }
+        }
+        self.fail_pending();
+    }
+
     /// Phase one of the latch: marks the failure pending and sends the force
     /// signal under the `stop` mutex, which the grant takes, so running turns
     /// take the forced path and daemon main starts final shutdown, which then

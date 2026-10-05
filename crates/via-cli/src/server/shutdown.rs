@@ -81,10 +81,7 @@ struct Pipeline {
 /// via-23b): once, at final shutdown's entry, or after its pipeline when
 /// first raised there.
 fn latch_logged(engine: &Engine) {
-    let failure = engine
-        .latched_failure()
-        .or_else(|| engine.store_failure_status())
-        .unwrap_or_default();
+    let failure = engine.latched_failure().unwrap_or_default();
     tracing::error!(%failure, "store failure latched");
 }
 
