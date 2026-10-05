@@ -466,7 +466,7 @@ fn s1_config_is_read_at_start_validated_and_reported() -> TestResult {
                 (
                     r#"{"codex":{"memories":"off"}}"#,
                     "codex.memories",
-                    "must be true or false",
+                    "must be a boolean",
                 ),
                 // The pool's old name (owner, 2026-10-05).
                 (

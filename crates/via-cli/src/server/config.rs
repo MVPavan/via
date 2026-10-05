@@ -2,9 +2,10 @@
 //! once at start, before any Store or socket change; absent means every
 //! default. An invalid file names its key and the rule it broke.
 //!
-//! `harnesses` is parsed here, once, by the adapter layer's own pure parser
-//! (runtime §8), so an invalid section is an invalid file like any other
-//! key; the typed settings are then passed to `AdapterConfig::with_harnesses`.
+//! `harnesses` and the other adapter-owned sections are parsed here, once,
+//! by the adapter layer's own pure parser (runtime §8), so an invalid
+//! section is an invalid file like any other key; the typed settings are
+//! then passed to `AdapterConfig::with_harnesses`.
 
 use std::{
     fmt,
@@ -15,9 +16,12 @@ use std::{
     path::Path,
 };
 
-use serde::Deserialize;
+use serde::{
+    Deserialize,
+    de::{Error as _, MapAccess, Visitor},
+};
 use serde_json::{Value, value::RawValue};
-use via_core::{CodexSettings, ConfigError, HarnessSettings, Limits, PAGE_BYTES};
+use via_core::{ConfigError, HarnessSettings, Limits, PAGE_BYTES};
 
 /// The largest `daemon.json` read (§5.5).
 const MAX_BYTES: u64 = 64 * 1024;
@@ -58,26 +62,58 @@ impl fmt::Display for Invalid {
 // Every member keeps its presence: an explicit `null` is `Some`, refused by
 // its key's rule, never read as absent (§5.5, review r1).
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+/// The file's top-level members: the daemon's own sections, and those the
+/// adapter layer owns ([`HarnessSettings::SECTIONS`]), in file order, which
+/// it parses itself so that no harness is named here.
+#[derive(Default)]
 struct File {
-    #[serde(default, deserialize_with = "present")]
-    codex: Option<Box<RawValue>>,
-    #[serde(default, deserialize_with = "present")]
     harness_processes: Option<Box<RawValue>>,
-    #[serde(default, deserialize_with = "present")]
     disk: Option<Box<RawValue>>,
-    #[serde(default, deserialize_with = "present")]
     harnesses: Option<Box<RawValue>>,
-    #[serde(default, deserialize_with = "present")]
     wal: Option<Box<RawValue>>,
+    adapter: Vec<(String, Box<RawValue>)>,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Codex {
-    #[serde(default, deserialize_with = "present")]
-    memories: Option<Value>,
+impl<'de> Deserialize<'de> for File {
+    /// Refuses an unknown or repeated key with serde's own wording, which
+    /// [`refused`] reads.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visit;
+        impl<'de> Visitor<'de> for Visit {
+            type Value = File;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<File, A::Error> {
+                let mut file = File::default();
+                while let Some(key) = map.next_key::<String>()? {
+                    let slot = match key.as_str() {
+                        "harness_processes" => &mut file.harness_processes,
+                        "disk" => &mut file.disk,
+                        "harnesses" => &mut file.harnesses,
+                        "wal" => &mut file.wal,
+                        name if HarnessSettings::SECTIONS.contains(&name) => {
+                            if file.adapter.iter().any(|(seen, _)| *seen == key) {
+                                return Err(A::Error::custom(format!("duplicate field `{key}`")));
+                            }
+                            let value = map.next_value()?;
+                            file.adapter.push((key, value));
+                            continue;
+                        }
+                        _ => return Err(A::Error::custom(format!("unknown field `{key}`"))),
+                    };
+                    if slot.is_some() {
+                        return Err(A::Error::custom(format!("duplicate field `{key}`")));
+                    }
+                    *slot = Some(map.next_value()?);
+                }
+                Ok(file)
+            }
+        }
+        deserializer.deserialize_map(Visit)
+    }
 }
 
 #[derive(Deserialize)]
@@ -174,23 +210,21 @@ pub(super) fn read(state: &Path) -> Result<Config, Invalid> {
 
 /// Parses and validates the file's text (§5.5).
 fn parse(text: &[u8]) -> Result<Config, Invalid> {
-    let file: File = serde_json::from_slice(text).map_err(|error| refused(None, &error))?;
+    // Syntax first, so text that is not JSON is named so whatever its shape.
+    let whole: Box<RawValue> =
+        serde_json::from_slice(text).map_err(|error| refused(None, &error))?;
+    let file: File = serde_json::from_str(whole.get()).map_err(|error| refused(None, &error))?;
     let harnesses = match &file.harnesses {
         Some(raw) => HarnessSettings::parse(raw)
             .map_err(|error| Invalid::new(error.key, error.rule.to_string()))?,
         None => HarnessSettings::default(),
     };
-    let mut codex = CodexSettings::default();
-    if let Some(raw) = file.codex {
-        let section: Codex =
-            serde_json::from_str(raw.get()).map_err(|error| refused(Some("codex"), &error))?;
-        if let Some(value) = section.memories {
-            codex.memories = value
-                .as_bool()
-                .ok_or_else(|| Invalid::new("codex.memories", "must be true or false"))?;
-        }
+    let mut harnesses = harnesses;
+    for (name, raw) in &file.adapter {
+        harnesses = harnesses
+            .with_section(name, raw)
+            .map_err(|error| Invalid::new(error.key, error.rule.to_string()))?;
     }
-    let harnesses = harnesses.with_codex(codex);
     let mut limits = Limits::default();
     if let Some(raw) = file.harness_processes {
         let processes: HarnessProcesses = serde_json::from_str(raw.get())
@@ -338,8 +372,7 @@ mod tests {
         );
     }
 
-    /// Bead via-oq3 (owner, 2026-10-04; renamed 2026-10-05):
-    /// `codex.memories` (owner 2026-10-05): false by default, so every
+    /// `codex.memories` (owner 2026-10-05), parsed by the adapter layer: false by default, so every
     /// Codex server runs with `--disable memories`; true keeps Codex's own
     /// default. Any other value, and an unknown member, are refused
     /// naming the key.
@@ -356,7 +389,7 @@ mod tests {
         assert!(!memories(r#"{"codex":{}}"#));
         assert!(!memories(r#"{"codex":{"memories":false}}"#));
         assert!(memories(r#"{"codex":{"memories":true}}"#));
-        let rule = "daemon config invalid: codex.memories: must be true or false";
+        let rule = "daemon config invalid: codex.memories: must be a boolean";
         assert_eq!(invalid(r#"{"codex":{"memories":"yes"}}"#), rule);
         assert_eq!(invalid(r#"{"codex":{"memories":1}}"#), rule);
         assert_eq!(invalid(r#"{"codex":{"memories":null}}"#), rule);
@@ -368,8 +401,17 @@ mod tests {
             invalid(r#"{"codex":true}"#),
             "daemon config invalid: codex: must be an object"
         );
+        assert_eq!(
+            invalid(r#"{"codex":{},"codex":{"memories":true}}"#),
+            "daemon config invalid: codex: duplicate key"
+        );
+        assert_eq!(
+            invalid(r#"{"disk":{},"disk":{}}"#),
+            "daemon config invalid: disk: duplicate key"
+        );
     }
 
+    /// Bead via-oq3 (owner, 2026-10-04; renamed 2026-10-05):
     /// `harness_processes.limit` sets the harness-process pool, default 8,
     /// any value from 1; 0, `null`, a fraction, an unknown member and the
     /// old key `connections` are refused naming the key.

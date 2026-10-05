@@ -1051,7 +1051,7 @@ would otherwise fail every launch.
 ```text
 <state>/
   store.lock                 persistent Store-owner lock inode
-  daemon.json                optional daemon config: disk floor and warning, WAL, harness processes, `codex.memories` (§8); adapter-owned `harnesses` (§8)
+  daemon.json                optional daemon config: disk floor and warning, WAL, harness processes (§8); adapter-owned `harnesses` and `codex.memories` (§8)
   via.log                    daemon warnings and errors; via.log.1 after rotation past 10 MiB (§6.2)
   store.sqlite3              SQLite database (user_version schema)
   store.sqlite3-wal          SQLite-owned sidecar when present
@@ -1314,7 +1314,7 @@ Defaults below are S1 acceptance constants, not throughput claims. Tests may
 reduce durations/capacities through explicit test config while separately
 testing default ceilings. Only the `daemon.json` keys (disk free-space floor,
 data-size warning, WAL limit and checkpoint triggers, the harness-process
-limit, the adapter-owned `harnesses` settings and `codex.memories`; see the
+limit, and the adapter-owned `harnesses` and `codex.memories` settings; see the
 end of this section) are configurable; C1, C2 and every other limit here are fixed
 (T4-A37; harness processes: owner, 2026-10-04, renamed 2026-10-05). All
 payload limits count encoded bytes plus separately bounded decoded structure.
@@ -1417,7 +1417,7 @@ instruction_files}` (booleans; default hooks and MCP servers `false`, the rest
 change applies to sessions spawned after the next start, and each session
 freezes its settings at spawn. It holds no credentials and no limits.
 The optional `codex.memories` (a boolean, default `false`; owner,
-2026-10-05) chooses whether the Codex servers VIA starts keep Codex's own
+2026-10-05), parsed by `via-adapters` like `harnesses`, chooses whether the Codex servers VIA starts keep Codex's own
 memories default: `false` launches each with `--disable memories`, `true`
 omits the switch (vendors/codex.md §4). It is read at daemon start like
 the other keys, so a change applies to servers launched after the next

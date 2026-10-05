@@ -116,8 +116,9 @@ pub enum ConfigError {
     Harnesses(#[from] HarnessesError),
 }
 
-/// Why `harnesses` is invalid: the member's full path, such as
-/// `harnesses.claude.binary`, and the rule it broke (runtime §8).
+/// Why `harnesses` or another adapter-owned section is invalid: the
+/// member's full path, such as `harnesses.claude.binary` or
+/// `codex.memories`, and the rule it broke (runtime §8).
 #[derive(Debug, Error, Eq, PartialEq)]
 #[error("{key}: {rule}")]
 pub struct HarnessesError {
@@ -145,7 +146,7 @@ pub enum HarnessesRule {
     /// `binary` is not an absolute path free of `..` (runtime §6.1's rule).
     #[error("must be an absolute path without `..`")]
     Binary,
-    /// An `inherit` switch is not a boolean.
+    /// An `inherit` switch or `codex.memories` is not a boolean.
     #[error("must be a boolean")]
     NotBoolean,
 }
@@ -243,15 +244,23 @@ impl HarnessSettings {
         })
     }
 
+    /// The top-level `daemon.json` sections, besides `harnesses`, that the
+    /// adapter layer owns (runtime §8): the daemon routes each to
+    /// [`Self::with_section`] without naming it.
+    pub const SECTIONS: &'static [&'static str] = &["codex"];
+
+    /// These settings with one of [`Self::SECTIONS`] parsed, purely; any
+    /// other name is an unknown key.
+    pub fn with_section(self, name: &str, raw: &RawValue) -> Result<Self, HarnessesError> {
+        match name {
+            "codex" => parse_codex(raw).map(|codex| Self { codex, ..self }),
+            _ => Err(invalid(name, HarnessesRule::UnknownKey)),
+        }
+    }
+
     /// The `codex` section's settings.
     pub fn codex(&self) -> CodexSettings {
         self.codex
-    }
-
-    /// These settings with the `codex` section's.
-    #[must_use]
-    pub fn with_codex(self, codex: CodexSettings) -> Self {
-        Self { codex, ..self }
     }
 }
 
@@ -382,6 +391,21 @@ fn parse_harnesses(raw: &RawValue) -> Result<Vec<HarnessConfig>, HarnessesError>
         }
     }
     Ok(harnesses)
+}
+
+fn parse_codex(raw: &RawValue) -> Result<CodexSettings, HarnessesError> {
+    let mut codex = CodexSettings::default();
+    for (member, value) in members(raw, "codex")? {
+        let key = format!("codex.{member}");
+        match member.as_str() {
+            "memories" => {
+                codex.memories = serde_json::from_str::<bool>(value.get())
+                    .map_err(|_| invalid(&key, HarnessesRule::NotBoolean))?;
+            }
+            _ => return Err(invalid(&key, HarnessesRule::UnknownKey)),
+        }
+    }
+    Ok(codex)
 }
 
 /// The most bytes of a key a diagnostic shows: the rule after it always
