@@ -414,6 +414,12 @@ bytes, so the vendor never blocks on a full pipe. The splitter retains
 split UTF-8 without interpreting it; only Route decodes UTF-8/JSON. EOF
 with an unfinished message is the in-band end `Unterminated`.
 
+HTTP/SSE extension (OpenCode loopback): Wire opens bounded HTTP/1.1 requests
+on per-server connection pools and splits SSE at event boundaries within
+§8's caps. Request outcomes follow the pipe rule: once any byte may have
+been written, a failure or timeout is `Indeterminate`; a timed-out or failed
+request socket is closed and never reused.
+
 VIA keeps no copy of vendor traffic (T4 requirements R8). Each submitted turn
 has an evidence folder, `<state>/evidence/<session_id>/<turn>/`. A shared
 server's connection has its own, `<state>/evidence/servers/<server_id>/`. The
@@ -1254,8 +1260,8 @@ payload limits count encoded bytes plus separately bounded decoded structure.
 | Resource | Default hard bound | Full/expired behavior |
 |---|---:|---|
 | Active private connections | Four live connections daemon-wide (per-turn process or persistent server, each with its anchor); a slot is reserved only for a new connection (C2 §3, AD16) | Queue eligible work; do not create a child until a slot is reserved |
-| OpenCode owned HTTP servers / loopback listeners / SSE streams | 4 of each daemon-wide, one VIA session per server and private namespace | Fifth owner waits under Core admission or remaining deadline; no active/uncertain owner is evicted; caps consume common process admission, not extra pools. S1 has no memory pool (T4-A43); the OpenCode task (`via-4sw.3.2`) re-derives these bounds. |
-| OpenCode vendor child-session metadata | 32 records per live server; one active top-level turn per owner | Refuse excess child metadata without routing it to another owner; idle namespaces retain durable identity but no listener or server memory |
+| OpenCode owned servers | One per launch key, at most one per namespace (anchor-fenced); each holds one of the four connection slots; one SSE stream and 8 request connections (2 decline, 2 stop, 4 general) | Same as Codex servers; an unknown request effect drains and retires the server (`vendors/opencode.md` §8) |
+| OpenCode SSE and retained state | 1 MiB event; staging 1,024/4 MiB per server; lanes 16/1 MiB per session; per server 1,024 session states, 4,096 tombstoned turns, 4,096 child sessions, 64 pending interactive requests, 64 unanswered requests; 45 s silence | Event, staging or count overflow: server generation `overflow`; full lane: driver overflow as Codex; silence: transport loss |
 | Queued turns | 8/session, 128 daemon-wide | `queue_full` / `admission_refused` before commit |
 | Session lanes (resident actors) | 320 daemon-wide, each counted from its creation until it has ended, whether serving, idle or retiring; at most 32 idle: no turn running or queued and a drained observation channel | Checked whenever a lane becomes idle: past 32, the least recently used idle lanes retire at once, their drivers closed gracefully within 3 s (C2 §3, idle lanes). A dispatch that needs a new lane while 320 exist counts the lanes already ending, retires further least recently used idle lanes (even within 32) when the waiters need more, and waits, its turn still queued, until a lane has ended or the turn is cancelled, closed, forced or failed by the Store; a dispatch to a retiring lane waits for its end, then reopens the session from its stored identity |
 | Unresolved turns (receipted, no terminal known durable: in flight or failed to persist) | 256 daemon-wide | When full, `spawn` first forgets failed turns whose terminal a Store read now finds durable; still full of in-flight turns is `admission_refused` ("too many unresolved turns"), while a retained failed turn keeps refusal and its reads `store_error` |
@@ -1269,7 +1275,7 @@ payload limits count encoded bytes plus separately bounded decoded structure.
 | Route message staging | 1,024 messages and 4 MiB/connection | Fail connection if saturated; health/control bypass |
 | Codex shared Route ingress | 16 messages and 1 MiB/thread within the existing connection staging; fixed per-server buffers (the Codex task) | First full thread lane quarantines that generation immediately, separate from C2's 10 s stall. Reserved-path or global budget failure escalates to connection overflow (C2 §4) |
 | Codex shared connection writes | 8 pending server-request replies, 64 KiB; one control in flight; data held back while any control is pending; per driver, reserved interrupt (12,800 B) and unsubscribe (6,400 B) slots, steer 6 commands and 46,336 B | Past the reply bound, a reply not written within 5 s of decode, or correlation exhaustion: connection overflow, every associated session fails through health, the server retires |
-| OpenCode HTTP/SSE transport metadata | Existing bounded Wire message splitting | Read, count and discard traffic as for pipes (§4: no copy of vendor traffic); only the bounded decode-failure evidence is written, never a Basic `Authorization` header or credential; route by owned server generation and vendor session/message IDs |
+| OpenCode HTTP/SSE transport metadata | Existing bounded Wire splitting; headers 64 KiB, bodies 1 MiB (`/api/model` 4 MiB) | Read, count and discard as for pipes; never an `Authorization` header or request body in evidence |
 | C2 observations | 1024 items and 4 MiB/session | Wait only normalizer; at 10 s without drain, the adapter closes the session's route hop; a private route fails the connection `overflow`, a shared route quarantines the thread generation (A1, C2 §4) |
 | C2 observation payload | 256 KiB encoded; final text sent in pieces; IDs, names, stop reasons and codes 1 KiB | Fail protocol, the message saved to the evidence folder; unknown messages keep no payload |
 | Data commands / control commands | 1 / 8 per driver, 64 KiB controls total | Data waits only until absolute deadline; duplicate interrupt/close coalesces; other control admission refused explicitly |
@@ -1354,13 +1360,13 @@ qualifies at most 32 concurrent active turns on one server. Four loaded
 servers are an extrapolation, and the unresolved-turn maximum is not
 qualified.
 The S1 fake RSS result alone does not qualify this shared-server extension.
-For the OpenCode extension, Adapter owns the frozen server key and vendor
-semantics; Routes owns typed HTTP/SSE correlation; Wire owns sockets, message splitting,
-bounded staging; Host exclusively starts and
-supervises the authenticated loopback server. Core's durable-state and Store
-ownership do not change, and Adapter receives no Store access. Four separate
-vendor processes and their external memory require their own measured gate;
-the S1 private-process fake cannot qualify these resources.
+For the OpenCode extension, Adapter owns the launch key and recipe; Routes
+owns the shared registry, per-session lanes, the server-scoped session state
+and drain; Wire owns HTTP/SSE framing; Host owns the process, its anchor with
+the namespace `owner_server` label, retirement and death evidence. The
+memory measurement includes N sessions on one server with concurrent turns.
+Core's durable-state and Store ownership do not change, and Adapter
+receives no Store access.
 
 ## 9. Paging, polling and slow peers
 

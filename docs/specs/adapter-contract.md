@@ -67,12 +67,12 @@ the agent's responsibility: VIA stops only the agent and reports leftovers
 |---|---|---|
 | A1 | Backpressure: per-session observation channel of 1024 items and 4 MiB; a full channel blocks only that session's normalizer; control and sticky health travel separately and stay serviceable; Core failing to drain for `event_stall_ms` (10 s) fails the turn `overflow`: the adapter closes the session's route hop; a private route fails the connection, which interrupts the vendor, and a shared route quarantines that thread generation as for an ingress overflow (§4) while other threads continue; Wire message-queue overflow fails the connection (coding-style §5). A known observation payload is at most 256 KiB encoded (final text is sent in pieces), else protocol failure; IDs, names, stop reasons and codes are at most 1 KiB each. Unknown and unattributed messages produce no observation. | as written |
 | A2 | Version rule (owner OD1, 2026-09-30, superseding the tested-set gate): every vendor version is supported by default; each adapter compiles in a `checked` set; the running instance reports its version from its own handshake; outside `checked` → `version_status: untested` with warning `vendor_version_untested`; `refused` only when a startup or handshake check fails on something VIA relies on; `allow_untested` is accepted and stored but has no effect (§5, AD7) | as amended by AD7 |
-| A3 | Claude `claude-cli`: interrupt `partial: aborts_tools_then_result`, gated on init capability `interrupt_receipt_v1`, matching nested receipt and abort terminal; steer `unsupported` (busy input merged into one result). OpenCode `opencode-serve` steer is also `unsupported`: a v1 busy prompt merges into the running turn, and v2 `delivery:"steer"` runs a separate conversation (AD10). Unknown-control encoding remains a qualification gate | as reviewed in Claude §10; OpenCode per AD10 |
-| A4 | OpenCode: only `full,network:true`; other levels and `network:false` refused. Nonempty `extra_write_dirs` with `full` is `invalid_params` before namespace allocation or vendor I/O; `allow_untested` does not waive bound validation. External sandbox remains D9 | as reviewed in OpenCode §§2–3 |
+| A3 | Claude `claude-cli`: interrupt `partial: aborts_tools_then_result`, gated on init capability `interrupt_receipt_v1`, matching nested receipt and abort terminal; steer `unsupported` (busy input merged into one result). OpenCode `opencode-serve` steer is `unsupported` in the first release (owner deferral); on 2.0.22 a busy `delivery:"steer"` prompt is injected into the running execution. Unknown-control encoding remains a qualification gate | as reviewed in Claude §10; OpenCode per its vendor packet §6 |
+| A4 | OpenCode: only `full,network:true`; other levels and `network:false` refused. Nonempty `extra_write_dirs` with `full` is `invalid_params` before server acquisition or vendor I/O; `allow_untested` does not waive bound validation. External sandbox remains D9 | as reviewed in OpenCode §§2–3 |
 | A5 | ACP decline: choose a reject-kind option, else `cancelled`; never counted as enforcement | as written; shape unverified |
 | A6 | Auto-decline deadline 5 s, from Core config, served on the control path, one value for every adapter (AD17); fail closed when an unknown request cannot be answered, without fabricating a decline | as reviewed in Claude §10; AD17 withdraws the Codex and OpenCode packets' 1 s |
 | A7 | Codex live recovery is unsupported on owned stdio; `thread/resume` continues a conversation after a resolved turn, not an in-flight turn. `Dead` requires verified death, otherwise `Unknown`; no resend | as reviewed in Codex §9 |
-| A8 | Codex owned stdio server key: `config_hash`, covering VIA-controlled launch settings (resolved program path, arguments, passed environment, server cwd, protocol pin), not credentials or binary contents; the observed binary version is reported, not keyed; bound omitted due per-turn `sandboxPolicy`, mixed-bound use gated on pinned enforcement proof. OpenCode's key includes route revision, program path, cwd, profile identity/epoch, config/environment revisions, full effective bound, owning VIA session ID and durable private namespace; one owner per server, no cross-owner sharing or live-session migration (C1 P11) | as reviewed in Codex §9 and OpenCode §2 |
+| A8 | Codex owned stdio server key: `config_hash`, covering VIA-controlled launch settings (resolved program path, arguments, passed environment, server cwd, protocol pin), not credentials or binary contents; the observed binary version is reported, not keyed; bound omitted due per-turn `sandboxPolicy`, mixed-bound use gated on pinned enforcement proof. OpenCode shares one owned `opencode serve --stdio` per launch key: namespace (anonymous profile identity/epoch, project-configuration switch) plus a hash of VIA-controlled launch settings; no credentials, bound, owner or version; at most one live server per namespace, fenced across restarts by Host's anchor journal (C1 P11) | as reviewed in Codex §9 and OpenCode §3 |
 
 ## 1. Purpose and rules
 
@@ -210,7 +210,7 @@ pub struct VendorIdentity {
 | Type | Fields |
 |---|---|
 | `DescribeRequest` | `harness: Option<String>` (passed unchanged; Core never compares it), `model: Option<String>`, `effort: Option<String>` (spawn's turn-1 effort, validated purely by `plan`, §5; C1 `describe` passes none, so its public parameters are unchanged), `bound: Bound`, `require: Vec<VerbReq>`, `vendor: VendorOptions`, `cwd: Option<PathBuf>`, `allow_untested: bool` (stored, no effect, §5), `sizes: ParamSizes` |
-| `ParamSizes` | the encoded byte sizes of the session's `instructions` text and the turn's `output_schema` (0 when absent), filled by Core from the values it holds, so a route with a lower limit (for example a per-argument limit) refuses purely with `InvalidParam` naming the member, before any receipt; the values themselves never reach `plan`. For `check_turn` Core also fills the byte lengths of the session's `cwd` and resolved model, so a route can bound its whole launch request (Claude: Host's 64 KiB launch request, x.3.2 C3) |
+| `ParamSizes` | the encoded byte sizes of the session's `instructions` text and the turn's `output_schema` (0 when absent), plus `instructions_json`, `prompt_json` and `cwd_json`: the UTF-8 length of each value's JSON string encoding, quotes and escapes included, filled by Core from the values it holds, so a route with a lower limit (for example a per-argument limit) refuses purely with `InvalidParam` naming the member, before any receipt; the values themselves never reach `plan`. For `check_turn` Core also fills the byte lengths of the session's `cwd` and resolved model, so a route can bound its whole launch request (Claude: Host's 64 KiB launch request, x.3.2 C3) |
 | `RoutePlan` | `harness: &'static str` (canonical), `route: RouteId`, `model: {requested, resolved}`, `inherit: {requested, effective}` (§6.2), `adapter_version`, `vendor_version: Option<String>` (last seen for the harness and resolved program path, or null), `version_status: Tested\|Untested\|Refused`, `capabilities: Capabilities` (C1 §4.1), `effective_bound`, `server_key: Option<ServerKey>`, `refusals`, `warnings` |
 | `Capabilities` | the C1 §4.1 DTO with `Support { Native, Partial { semantics }, Unsupported { reason } }` |
 | `ModelEntry` | a model with `source: bundled \| discovered` |
@@ -227,14 +227,14 @@ pub struct VendorIdentity {
 | `AnchorRecovery` | `anchor_id`, `generation`, `owner: ProcessOwner` (`Turn { session_id, turn }` or `Server { server_id }`), `cleanup`, `forced`: Host's passive facts for one committed anchor. A server anchor's facts reach a turn only through the turn → server-anchor link (runtime §6), and only as cleanup |
 | `ConnectionPin` | `Generation(u64)` (the fake's persistent profile) or `Server(ServerPin)` (a shared-server holder, keeping the server from idle retirement until the turn becomes a lease or the pin drops) |
 | `ObservationLoss` | the driver's sticky loss record for one thread generation: original triggering turn, generation, first unqueued message sequence (a lower bound: no earlier message of the generation was lost), saturating omitted count (`u64::MAX`: unknown or saturated). Recorded even when no turn of the driver is running, and then reported by its close. Core adds the `observations_lost` warning to each affected turn and commits one `late` warning event on a triggering turn already terminal (C1 §5) |
-| `VendorTerminal` | `at`, `status: Completed\|Interrupted\|Failed`, `stop_reason: StopReason`, `vendor_stop_reason`, `vendor_code?`, `class_hint: Option<ClassHint>`, `detail?`, `structured_output: Option<RawValue>` (a JSON value) and `structured_output_unparsed: Option<UnparsedOutput>` (`NotJson` when the route's structured output is text that does not parse as JSON, which Core treats as present and invalid with `reason: invalid`; `OverLimit` when a route that assembles it from text exceeds its 4 MiB retention bound, which Core treats as present and invalid with `reason: validation_limit`, C1 §5; the two are never both set, and both absent means no output), `steps?`, `usage?` (turn aggregate), `cost?`, `vendor?` (bounded 16 KiB) |
+| `VendorTerminal` | `at`, `status: Completed\|Interrupted\|Failed`, `stop_reason: StopReason`, `vendor_stop_reason`, `vendor_code?`, `class_hint: Option<ClassHint>`, `detail?`, `structured_output: Option<RawValue>` (a JSON value) and `structured_output_unparsed: Option<UnparsedOutput>` (`NotJson` when the route's structured output is text that does not parse as JSON, which Core treats as present and invalid with `reason: invalid`; `OverLimit` when a route that assembles it from text exceeds its 4 MiB retention bound, which Core treats as present and invalid with `reason: validation_limit`, C1 §5; the two are never both set, and both absent means no output), `steps?`, `usage?` (turn aggregate), `cost?`, `vendor?` (bounded 16 KiB). A route with native input cancellation reports it as `status: Interrupted`, `stop_reason: Other`, `vendor_stop_reason: "input_cancelled"`, no usage, cleanup `Quiescent` (C1 §7.6) |
 | `InstanceReport` | `vendor_version: Option<String>`, `version_status: Tested\|Untested` |
 | `ClassHint` | `Auth`, `RateLimit`, `ContextExceeded`, `BudgetExceeded`, `VendorError`, `Protocol`, `ResumeMismatch` |
 | `StopReason` | `EndTurn`, `MaxSteps`, `Budget`, `Refusal`, `Interrupted`, `Error`, `Other` |
 | `Refusal` | `kind: UnsupportedVerb\|BoundUnsupported\|HarnessUnavailable\|UnknownModel\|VersionRefused\|VendorOptionConflict\|InvalidParam { field }\|MissingCapability { verb }`, `message`, `verb: Option<Verb>`, `route` (every refusal) |
 | `AdapterError` | S1's `Route(RouteFailure)` causes (deadline, force stop, overflow, protocol, process exit, unknown submission), each with Route's exit, cleanup and force facts, plus `Rejected { reason: StartRejected, evidence: TurnEvidence }`, `ResumeMismatch { evidence: TurnEvidence }` (identity below), `ServerLost` (Host-confirmed death of a persistent server) and `TransportLost` (connection lost, server alive or unconfirmed). Every failure carries evidence, decided by the cleanup rules (the §2 cleanup table and §4.1), so the cleanup gate always has facts: a per-turn process's exit and group cleanup; a server route's reported tool items, server loss or close facts. On a server route a turn's `exit` is always `None`: the server's exit belongs to the server (`ServerLost` health), not to any one turn. While the server lives, a failed or rejected turn's cleanup is its reported tool items (`Quiescent` when every one ended, or none was reported; the §2 cleanup table); after a server crash it derives from Host's group evidence for the server's group: `Quiescent` only with positive `GroupAbsent` proof, otherwise `Uncertain`. On either kind of route, only a failure before any vendor launch has the no-launch evidence (on a server route, "launch" for a turn is its first vendor byte handed to Wire, after the turn's link to its server is durable; a turn that failed before it sent nothing to any server, so its cleanup is `Quiescent` unless its own server acquisition failed, when Host's acquisition evidence applies as on a private route): `exit: None`, with `cleanup: Quiescent` only when Host's journal is complete (C1 §7.4), else `Uncertain` |
 | `DriverFailure` | the sticky first cause of `DriverHealth::Failed`, published when detected, independent of observation delivery: protocol, transport loss, overflow (route or observation channel), Store, an owned task's failure, `ServerLost`, `ResumeMismatch`, `RetirementUncertain` (a launched persistent connection's retirement whose group cleanup is not proven quiescent, or whose journal write was uncertain; no turn reports it. An uncertain journal write is also published on the sticky `journal_uncertain()` watch, whatever the first cause, and Core latches Store failure on it, runtime §7), and `TurnAbandoned` (Core dropped a pending `run_turn`). A turn's own uncertain cleanup is reported in its `TurnEnd`, not as health |
-| `StartRejected` | `BoundUnsupported(String)`, `InvalidParam { field }` (§5), `VendorError(VendorCode, String)`, `SessionGone`, `Protocol(String)` |
+| `StartRejected` | `BoundUnsupported(String)`, `InvalidParam { field }` (§5), `VendorError(VendorCode, String)`, `SessionGone`, `Protocol(String)`, `SettingsMismatch { setting: VendorSetting }` (`Model`, `Agent`, `Permissions`, `Instructions`): a reopened vendor session's persisted settings differ from the frozen values and nothing was sent; Core gives `failed(submit_failed)` with `failure.data.reason: "settings_mismatch"` and, for `Model` and `Instructions`, `field` |
 
 Contract points:
 
@@ -253,7 +253,9 @@ Contract points:
 - **Submission boundary.** The driver reports acceptance only on vendor
   evidence (Codex paired `turn/start` response; Claude's post-init result or
   first prompt-associated assistant/tool event after the prompt line;
-  OpenCode's `prompt_async` 204 for the caller `messageID`). Claude init and a
+  OpenCode's `POST /api/session/{id}/prompt` 200 whose `data.id` is the
+  caller input ID and `data.sessionID` the session, or the matching
+  `session.inbox.enqueued`). Claude init and a
   mere `msg_lifecycle_v1` advertisement do not accept a turn. Any ambiguity is
   the unknown-submission failure, and Core resolves the turn `unknown`. A lost
   reply never causes a second prompt send. A vendor-synthetic API-error
@@ -265,7 +267,7 @@ Contract points:
   acceptance (AD5).
 - **Delayed vendor identity.** `open_session` is logical: it performs no
   vendor I/O. Vendor session creation or reopening (Codex
-  `thread/start`/`thread/resume`, OpenCode `POST /session` or readback, Claude
+  `thread/start`/`thread/resume`, OpenCode `POST /api/session` or the `GET /api/session/{id}` readback, Claude
   `--session-id`/`--resume`) happens in the first `run_turn` of a connection
   generation, and identity is confirmed by `session.vendor_identity_confirmed`
   on every route. `VendorIdentity.expected_id` is `Option`: only Claude has an
@@ -355,7 +357,12 @@ Contract points:
   replies and driver controls hold back new data messages, decided under
   Wire's queue lock, so a reply waits for at most the data message already
   started. A shared connection never uses the per-connection coalescing
-  interrupt.
+  interrupt. OpenCode's HTTP requests are not one shared writer: they travel
+  on per-server connection pools (declines, stops, general), one request per
+  connection. Only a successor prompt is held back, by its own session's
+  unanswered requests; stops and declines use their reserved pools and are
+  never held behind the session's pending prompt, so they stay serviceable
+  during a pending submission (`vendors/opencode.md` §7.2, §8).
 - **Close(Graceful)** ends the vendor session politely and detaches with the
   route's close recipe (§6.2); one session's close must not close a shared
   server's stdin. **Close(Force)** asks the verified anchor to stop its private
@@ -434,8 +441,12 @@ atomically. Concurrent equal-key `NeedsConnection` turns launch one
 server; the others release their slots.
 
 Idle retirement releases the slot once Host proves the group absent.
-Codex: the last reservation, pin and lease released. OpenCode:
-the route's idle policy, defined in `via-4sw.3.2` within runtime §8.
+Codex: the last reservation, pin and lease released. OpenCode: same as
+Codex. **Drain:** when an OpenCode request's effect becomes unknown, the
+route publishes a readiness change so `prepare` gives `NeedsConnection`,
+sends no new submission on that server, ends a pinned turn that sent
+nothing under rule 4 (`SessionGone`), lets sent turns finish, then retires
+the server through Host (`vendors/opencode.md` §8).
 
 **Idle lanes.** To bound resident sessions (runtime §8), Core may close an
 idle session's driver gracefully: no turn running or queued, and its
@@ -508,9 +519,10 @@ before generic errors). Control acknowledgement may bypass observations, but
 cannot commit a terminal envelope ahead of earlier data. Sticky health failure
 and cleanup evidence remain deliverable when observations are saturated.
 
-For Codex shared stdio, Route partitions its existing 1,024-message/4 MiB
-message staging into per-thread ingress lanes capped at 16 messages/1 MiB,
-before C2 observations. This adds no extra buffer tier. The first full lane
+For shared-server routes (Codex threads over stdio, OpenCode sessions over
+SSE), Route partitions its existing 1,024-message/4 MiB message staging into
+per-thread or per-session ingress lanes capped at 16 messages/1 MiB, before
+C2 observations. This adds no extra buffer tier. The first full lane
 immediately quarantines that thread generation and latches the driver's sticky
 `ObservationOverflow` health. The lane generation, the original triggering
 turn, the first unqueued message reference and the saturating omitted count
@@ -522,8 +534,8 @@ active after an older turn's late tool flood. The driver ends each such turn
 itself: it posts its interrupt cleanup intent, never awaited or withdrawn, and
 returns at once with the overflow failure and cleanup `Uncertain`; Core
 commits each disposition under C1 precedence with the `observations_lost`
-warning. Older terminal envelopes are preserved, and same-thread dispatch
-closes until the driver is retired and reopened. Unsent queued turns retain C1
+warning. Older terminal envelopes are preserved, and same-thread (OpenCode: same-session)
+dispatch closes until the driver is retired and reopened. Unsent queued turns retain C1
 queue rules.
 Other threads and reserved control continue. Quarantined data is still read
 and counted; normal observations stop. Retained tombstones and bounded
@@ -588,8 +600,9 @@ See [Codex §5](vendors/codex.md) for the full reviewed failure scenarios.
   `forced` and cleanup `quiescent` only with Host's `GroupAbsent` evidence;
   otherwise `requested`/`uncertain` (C1 §7.6 private-process row).
 - Codex: `turn/interrupt`; the shared server is never closed.
-- OpenCode: `POST /session/{id}/abort`, with the packet's acknowledgement
-  step as the acknowledgement.
+- OpenCode: before delivery `DELETE /api/session/{id}/inbox/{inputID}`, after
+  delivery `POST /api/session/{id}/interrupt`, with the packet's
+  acknowledgement rules (`vendors/opencode.md` §7.4).
 
 **One wall cutoff:** S1's cleanup bound (3 s from the wall failure). Vendor
 acknowledgement or cleanup evidence after it is a late observation only.
@@ -636,8 +649,8 @@ the full scan rules.
 
 | Aspect | Rule |
 |---|---|
-| Destinations | Only where an existing surface ends the connection synchronously. (1) Per-turn routes (Claude, fake): the turn envelope; the report completes before the terminal commits. (2) A C1 `close` that stops the server (OpenCode's dispose): that close result and `session.closed`, persisted atomically with the close by Store `commit_closed` (in the event, `close_result` and the operation result), so a keyed replay returns the same report. A Codex C1 close only unsubscribes: `null`. (3) Server lost with turns in flight: one report, completed before the loss reaches any turn; the same snapshot (`scope: server`; on Codex it may list other sessions' processes) goes on every `server_lost` turn. One report per connection generation; a turn spans at most one (§3 connection admission). |
-| Not reported (limitation) | Idle retirement (Codex's normal server end; OpenCode's idle policy); Core's idle-lane close that no C1 close took over (§3); a server crash with no turn in flight; daemon shutdown; daemon-crash recovery (recovered turns carry `leftovers: null`). Codex's normal case has nothing to report: a sandboxed stdin close left no tools. Where no destination exists, nothing is collected or logged. |
+| Destinations | Only where an existing surface ends the connection synchronously. (1) Per-turn routes (Claude, fake): the turn envelope; the report completes before the terminal commits. (2) None in the first release: a Codex or OpenCode C1 close only detaches: `null`. (3) Server lost with turns in flight: one report, completed before the loss reaches any turn; the same snapshot (`scope: server`; on Codex it may list other sessions' processes) goes on every `server_lost` turn. One report per connection generation; a turn spans at most one (§3 connection admission). |
+| Not reported (limitation) | Idle retirement (Codex's normal server end; OpenCode's idle and drain retirement); Core's idle-lane close that no C1 close took over (§3); a server crash with no turn in flight; daemon shutdown; daemon-crash recovery (recovered turns carry `leftovers: null`). Codex's normal case has nothing to report: a sandboxed stdin close left no tools. Where no destination exists, nothing is collected or logged. |
 | Carried by | Host `CloseReport.leftovers` → Wire `WireCloseReport` → Route result (the shared runtime and each server route's close and loss paths) → Adapter `TurnEnd.leftovers` or driver `CloseReport.leftovers` (§2) → Core envelope, close result and `session.closed` (Store `commit_closed`). Recovery carries none. |
 | Trigger | After Host's close of the connection completes, within its existing bound (unchanged); the report is ready before its destination commits. |
 | Detection | Host sets a random `VIA_PROCESS_MARKER` in every vendor environment; children inherit it. The scan lists same-uid processes started at or after the vendor (start bound from the anchor's `Spawned {pid, start_ticks}`) whose environment holds the exact marker entry, reading each through one `/proc/<pid>` descriptor with start-tick, uid and state rechecks and a 256 KiB environment cap. Bound: `min(close_by, scan_started + 1 s)`, one scanner task per report (runtime §5, §8). |
@@ -664,7 +677,7 @@ default.
 - Each adapter compiles in a `checked` set: versions its maintainers' cheap
   live check passed.
 - The instance that runs a turn reports its version from its own handshake
-  (Claude init, Codex `initialize`, OpenCode health). `TurnEnd.instance`
+  (Claude init, Codex `initialize`, OpenCode `/api/info`). `TurnEnd.instance`
   carries it on every outcome, success or failure, once the handshake has
   been read. The envelope reports it with `version_status` `tested` (checked)
   or `untested` (not yet checked, warning `vendor_version_untested`). A turn
@@ -678,8 +691,9 @@ default.
   - After Claude's prompt line, it fails `protocol` with no resend.
 - **Refusal cache.** Only a demonstrated incompatibility is cached: a
   relied-on feature absent from the handshake, or a readback that differs from
-  the value VIA sent. The key is the resolved program path plus the
-  route's recipe digest (launch arguments, category switches, bound and
+  the value VIA sent. The key is the resolved program path and its file
+  identity (device, inode, size, mtime, ctime) plus the route's recipe
+  digest (launch arguments, category switches, bound and
   policy inputs). While an entry is live, plans with the same key refuse
   `harness_unavailable` (`data.reason:"handshake_refused"`). Spawn
   failures, timeouts, transport loss, auth, quota and rate-limit failures
@@ -723,7 +737,9 @@ fake agent reports no version".
 - A value that can be judged only against a discovered catalog (a Codex
   model's advertised efforts, an OpenCode model's `variants`) is checked
   inside `run_turn` after discovery and before vendor submission (`turn/start`,
-  `prompt_async`). A mismatch ends with `Err(Rejected { reason:
+  `POST /api/session/{id}/prompt`); an OpenCode model's catalog is the
+  `variants` of its `GET /api/model` entry; omitted and `"default"` are the
+  same value. A mismatch ends with `Err(Rejected { reason:
   InvalidParam {field: "effort"}, evidence })` → `failed(submit_failed)` with
   `failure.data.field:"effort"`. No vendor turn starts and nothing is resent.
 - Once a live instance's catalog is cached, `check_turn` applies it. The route
@@ -761,7 +777,7 @@ accounting intervals; unverified intervals are `vendor_interval`.
 |---|---|
 | Codex | `sandbox`, `sandboxPolicy`, `approvalPolicy`, `approvalsReviewer`, `cwd`, `model`, `developerInstructions`, `baseInstructions`, `ephemeral`, `threadId`, `outputSchema`, `effort`; config keys `sandbox_mode`, `approval_policy`, `model_reasoning_effort` |
 | Claude | `--permission-mode`, `--dangerously-skip-permissions`, `--permission-prompt-tool`, `--permission-prompts`, `--allowedTools`, `--disallowedTools`, `--tools`, `--add-dir`, `--resume`, `--session-id`, `--continue`, `--fork-session`, `--model`, `--effort`, `--system-prompt*`, `--append-system-prompt*`, `--max-turns`, `--json-schema`, `--input-format`, `--output-format`, `--bare` |
-| OpenCode | Vendor-option allowlist is empty. Reserve auth/listener/storage/home/config, plugin/MCP, permission/tool, agent, cwd, model, variant, system, format, session/message identity, `--auto`, `--continue`, `--session`, `--dir` and all canonical-parameter equivalents (OpenCode §3) |
+| OpenCode | Vendor-option allowlist is empty. Reserve listener, password, home/XDG/config/database, `OPENCODE_*`, credential and integration, plugin/MCP, permission/tool/agent, cwd/location, model/variant, instruction entries, environment, session/message identity, `delivery`, inbox, form, and the `serve` flags `--stdio`, `--port`, `--hostname`, `--service`, `--standalone`. |
 | ACP | `cwd`, `mcpServers`, `sessionId`, mode/model config options that VIA sets |
 
 Claude rejects normalized aliases and spelling variants of its reserved
@@ -778,20 +794,20 @@ for exact validation; canonical never-ask, identity and bound settings win.
 
 | Operation | Claude `claude-cli` | Codex `codex-app-server` | OpenCode `opencode-serve` | Generic ACP |
 |---|---|---|---|---|
-| Process shape | one private `claude -p --input-format stream-json --output-format stream-json --verbose` process per VIA turn, persistent same vendor UUID across launches | owned shared `codex app-server` on stdio, key `config_hash` (VIA-controlled launch settings) excluding credentials and bound (A8); stdin stays open for leases | one owned server/private no-login namespace per VIA session: `opencode serve --pure --hostname 127.0.0.1 --port <explicit-port>`; private HOME/all XDG roots including DATA and absolute private `OPENCODE_DB`; generated password in daemon memory/launch env; authenticated health/version after Host provenance; no cross-owner sharing or foreign attach (§§2–3) | per-session agent process over stdio |
-| `describe` | bundled catalog; last version seen from an init for this program path, else `null`/`untested` (§5); no vendor process/file write or model prompt | bundled effort mapping; last version seen and the `model/list` catalog cached from a live instance (§5); no process/file write during describe | bundled profile; last version seen from a live server's health and its cached `/provider` catalog (§5); no hidden process/file write during describe (§3) | agent version; cached `initialize` capabilities from the last probe |
-| `open_session` (logical) and the first `run_turn` of a connection generation | logical open keeps the expected UUID unverified before input; every per-turn launch applies frozen flags, matching init/non-rejection result confirms identity; pre-init rejection does not | version from `initialize` (§5); initialize without notification opt-outs; `thread/start` with explicit model/cwd/instructions/sandbox, `approvalPolicy:"never"`, `approvalsReviewer:"user"`, `ephemeral:false`; `thread/resume` exact ID/current sandbox/`excludeTurns:true` and verify identity/policy | persist one owner/key/namespace mapping before vendor creation; subscribe SSE, `POST /session?directory=<cwd>`, persist returned vendor ID; resume verifies exact ID and directory in retained namespace (§§2, 4) | `initialize {protocolVersion, clientCapabilities:{fs:{readTextFile:false,writeTextFile:false},terminal:false}}`; `session/new {cwd, mcpServers:[]}`; reopen `session/load` when `loadSession` (docs) |
-| `run_turn` submission | launch one process with frozen effective settings and exact expected UUID, write one `user` line; Core holds queued prompts and never writes busy input; later launch uses `--resume` with same UUID even when settings are unchanged | `turn/start {threadId,input:[{type:"text",text}],cwd,model,effort,outputSchema,approvalPolicy:"never",approvalsReviewer:"user",sandboxPolicy}` → paired `turn.id`; full frozen structured policy on every turn | one caller `messageID`, then one `POST /session/{id}/prompt_async`; HTTP 204 is acceptance only, terminal SSE must correlate; no resend after uncertainty (§4) | `session/prompt {sessionId, prompt:[{type:"text",text}]}` (docs) |
-| Observations | `assistant`, `user`, `result` (probe); `result` fields `subtype` (`success`, `error_during_execution`), `is_error`, `terminal_reason` (`completed`, `aborted_tools`), `stop_reason`, `num_turns`, `permission_denials`, `usage`, `total_cost_usd`, `session_id`, `queued_turn_count` (probe, 2.1.283); `structured_output` (docs); a vendor-synthetic API-error message is never acceptance, progress or final text (§2) | `turn/started`, `item/started`, `item/agentMessage/delta`, `item/completed` (`agentMessage`, `commandExecution{processId, exitCode, status}`, `fileChange`, `reasoning`), `turn/diff/updated`, `thread/tokenUsage/updated`, `turn/completed` (`turn.status` `completed`/`interrupted`/`failed`, `turn.error`), `error {willRetry}`, `thread/status/changed`, `thread/closed` (schema); final text comes only from `agentMessage` items with `phase:"final_answer"` | pinned legacy `message.*`/`session.*` SSE family; correlate session, caller message, assistant parent and part IDs; unknown notifications bounded, malformed known payloads protocol errors (§§4–5); the terminal follows the packet's three steps, acknowledgement, terminal and cleanup (§4) | `session/update` (`agent_message_chunk`, `tool_call`, `tool_call_update`, `usage_update`) (docs) |
-| `Steer` | `unsupported` (A3, Q6) | `turn/steer {threadId, expectedTurnId, input}` → `turnId`; `activeTurnNotSteerable` → `SteerError::NotSteerable` (schema) | `unsupported`: a v1 busy prompt merges into the running turn, and v2 `delivery:"steer"` runs a separate conversation (A3's reasoning) | `unsupported` (docs) |
-| `Interrupt` (soft stop; also the wall's cleanup step for the server routes, §4.1; the private Claude route's wall cleanup is a Host force close with no interrupt) | `control_request {request_id, request:{subtype:"interrupt"}}` → `control_response {subtype:"success", response:{still_queued}}` (probe); then `result` with `error_during_execution`/`aborted_tools` → `Acknowledged`; the interrupt stops what is still in the agent's parent tree; then stdin EOF (EOF alone does not stop an active tool), then S1's close: graceful, then the hard stop at the stop order's bound; private-group `Quiescent` requires runtime §5.2 positive absence proof | `turn/interrupt {threadId, turnId}` → wait `turn/completed` status `interrupted` → `Acknowledged`; `run_turn` returns when every reported `commandExecution` item has completed, or at `min(ack + tool_grace, wall)` with cleanup `Uncertain` (§4.1; P2/P2b: tool ran ≥ 60 s after `interrupted`; `command/exec/terminate` is only for client-started commands, `thread/unsubscribe` does not stop it); background terminals keep running and remain the server's | `POST /session/{id}/abort` (kills only the tool's own group); the 200 is command acknowledgement only. `Acknowledged` once both the session's `MessageAbortedError` and idle have been seen, independent of assistant completion; the adapter keeps that instant. Cleanup reconciliation then runs within `min(ack + tool_grace, wall)` (§4.1), and §2 Interrupt decides cleanup | `session/cancel` notification; `stopReason: cancelled` → `Acknowledged` (docs); cleanup `Uncertain` |
-| `Close` | per turn: stdin EOF after the result, then S1's close (graceful, then Force: request verified anchor own-group cleanup). stdin EOF does not cancel the running turn: with no active tool it completed the turn, and it did not stop an active tool. Interrupt must precede EOF; S1's close bound and hard stop are the fallback | session: detach with `thread/unsubscribe {threadId}`; never delete/archive the thread or close shared stdin for one session. Server (idle retirement, §3): stdin close, which stopped every tool under the sandbox (untested under full access, where grandchildren survived SIGKILL), then S1's hard stop | C1 `close`: cancel active work, then `POST /instance/dispose` of the session's owned server, then S1's hard stop within the close bound (the server has no SIGTERM handler); preserve the private vendor DB and history; the close result carries `leftovers` (§4.2). Idle retirement is a separate Host operation with ownership evidence and reports nothing (§§2, 4) | `session/close` if advertised, else detach; Force requests verified anchor cleanup for a private agent |
-| Auto-decline (D3) | unknown control requests must be answered or fail closed within 5 s on the control path; no fabricated/dropped refusal is success; `none` recipe: denials from `permission_denials`, deduplicated against a live `permission_denied` by `tool_use_id`; a decline-caused entry is suppressed | pinned 0.157.1 no-grant bodies: command/file approval → {"decision":"decline"}, permissions → {"permissions":{}}, tool user input → {"answers":{}}, MCP elicitation → {"action":"decline"}, tool call → {"success":false,"contentItems":[]}; auth/attestation/legacy/unknown → JSON-RPC -32601 with incoming ID, within A6's 5 s; live receipt remains unproved; no denials are reported | modern permission and question requests reject under §5 within A6's 5 s; a decline-caused denial is suppressed by `callID`; unknown effective policy prevents prompt; live receipt/control proof remains open | session/request_permission → reject-kind option else cancelled (A5, unverified) |
-| Bound | `read_only`, `workspace_write` and `network:false` refused pending CLAUDE-BOUND-1; `full,network:true` separately eligible after exact live recipe continuity proof; tool permissions are not all-tool OS containment | `read_only`/`workspace_write` protocol-mapped but refused pending `via-5lr.3.4`; `full,network:true` uses `dangerFullAccess`; `full,network:false` refused; no fallback to full | only `full,network:true`; nonempty `extra_write_dirs` → `invalid_params` before allocation/I/O; changed bound → `bound_unsupported` before vendor I/O (§§2–3) | `full` only (D7) |
-| Usage, cost | turn aggregate: `result.usage` per turn is authoritative (assistant snapshots are partial) → tokens `turn`; `total_cost_usd` → cost `session_cumulative`, `reported`; a terminal whose `total_cost_usd` is below the session driver's last reported value warns `cost_counter_reset`, and the value is reported as given, never as a negative delta; `modelUsage.costBasis` and `fallback_credit` kept in `vendor` | per model call: keyless `tokenUsage.last` samples add (their sum equals the change in `.total`) → scope `turn`; `total`, `cacheWriteInputTokens` and `modelContextWindow` → `vendor`; cost `unavailable` | per model call: assistant samples keyed by message ID, summed → scope `turn`; `input` excludes cache-read; child task sessions are excluded (§7) | `usage_update` context tokens; optional cumulative cost (docs) |
-| Class hints (every route: an HTTP 401 or 403 in a vendor error → `auth`) | classify on `is_error`, `terminal_reason`, `api_error_status` and the synthetic `error` code, never on `subtype`; matching interrupt receipt plus abort terminal → cancel evidence; `authentication_failed` or 401/403 → auth; error_max_turns → failed/budget_exceeded with stop_reason max_steps (not normal completed max_steps); other is_error → vendor_error | codexErrorInfo rateLimitExceeded → rate_limit; unauthorized and `httpConnectionFailed{401\|403}` → auth; contextWindowExceeded → context_exceeded; usageLimitExceeded/sessionBudgetExceeded → budget_exceeded; `tooManyDenials`, `flexUnavailable` and other vendor errors → vendor_error | `ProviderAuthError` and `APIError 401\|403` (including a 403 `FreeTierError`) → auth; `APIError 429` → rate_limit; `ContextOverflowError` → context_exceeded; `UnknownError`/`ProviderModelNotFoundError` and other API errors → vendor_error; `MessageAbortedError` after VIA abort → `Interrupted`; Host alone confirms death (§7) | stopReason refusal → completed/refusal; max_tokens → completed/budget; transport error → protocol |
-| Inherited configuration (owner OD2) | per category (hooks, MCP servers, plugins, skills, agents, instruction files), see below and [the Claude packet](vendors/claude-code.md) | see below and [the Codex packet](vendors/codex.md) | see below and [the OpenCode packet](vendors/opencode.md) | — |
-| `recover` | no live rejoin or replay; verified live anchor → cleanup request forwarded; un-rejoinable survivor → `Unknown`, `Dead` only with confirmed death; absent anchor → uncertain unless runtime §5.2 absence proof | no live rejoin on owned stdio; submitted/accepted turn unknown with no resend; `Dead` only with verified process-death evidence, otherwise `Unknown`; `thread/resume` is later conversation continuation | no uncertain prompt resend; verified anchor cleanup and exclusive namespace ownership before replacement; server death only from Host evidence; otherwise `Unknown` (§6) | `Unknown`; `session/load` replays finished turns only |
+| Process shape | one private `claude -p --input-format stream-json --output-format stream-json --verbose` process per VIA turn, persistent same vendor UUID across launches | owned shared `codex app-server` on stdio, key `config_hash` (VIA-controlled launch settings) excluding credentials and bound (A8); stdin stays open for leases | owned shared `opencode serve --stdio --hostname 127.0.0.1 --port 0` per launch key; URL from the child's stdout line; stdin lifeline; private HOME/XDG per namespace; password in the launch environment only; `/api/info` pid check and the credential check before publication | per-session agent process over stdio |
+| `describe` | bundled catalog; last version seen from an init for this program path, else `null`/`untested` (§5); no vendor process/file write or model prompt | bundled effort mapping; last version seen and the `model/list` catalog cached from a live instance (§5); no process/file write during describe | process-free: bundled profile and effort mapping, last version and cached `GET /api/model` catalog seen for this program path | agent version; cached `initialize` capabilities from the last probe |
+| `open_session` (logical) and the first `run_turn` of a connection generation | logical open keeps the expected UUID unverified before input; every per-turn launch applies frozen flags, matching init/non-rejection result confirms identity; pre-init rejection does not | version from `initialize` (§5); initialize without notification opt-outs; `thread/start` with explicit model/cwd/instructions/sandbox, `approvalPolicy:"never"`, `approvalsReviewer:"user"`, `ephemeral:false`; `thread/resume` exact ID/current sandbox/`excludeTurns:true` and verify identity/policy | new: `POST /api/session` with model, agent `via`, location and the deny rules, then the instruction entry and readback; reopen: `GET /api/session/{id}` identity, then settings readback (`SettingsMismatch`) and one leftover-input cleanup per server generation | `initialize {protocolVersion, clientCapabilities:{fs:{readTextFile:false,writeTextFile:false},terminal:false}}`; `session/new {cwd, mcpServers:[]}`; reopen `session/load` when `loadSession` (docs) |
+| `run_turn` submission | launch one process with frozen effective settings and exact expected UUID, write one `user` line; Core holds queued prompts and never writes busy input; later launch uses `--resume` with same UUID even when settings are unchanged | `turn/start {threadId,input:[{type:"text",text}],cwd,model,effort,outputSchema,approvalPolicy:"never",approvalsReviewer:"user",sandboxPolicy}` → paired `turn.id`; full frozen structured policy on every turn | one `POST /api/session/{id}/prompt {id:<deterministic caller ID>, text}` once every earlier request of the session has a complete response and the predecessor's execution end is on the stream (or it was not accepted); no resend; an unknown request effect drains the server | `session/prompt {sessionId, prompt:[{type:"text",text}]}` (docs) |
+| Observations | `assistant`, `user`, `result` (probe); `result` fields `subtype` (`success`, `error_during_execution`), `is_error`, `terminal_reason` (`completed`, `aborted_tools`), `stop_reason`, `num_turns`, `permission_denials`, `usage`, `total_cost_usd`, `session_id`, `queued_turn_count` (probe, 2.1.283); `structured_output` (docs); a vendor-synthetic API-error message is never acceptance, progress or final text (§2) | `turn/started`, `item/started`, `item/agentMessage/delta`, `item/completed` (`agentMessage`, `commandExecution{processId, exitCode, status}`, `fileChange`, `reasoning`), `turn/diff/updated`, `thread/tokenUsage/updated`, `turn/completed` (`turn.status` `completed`/`interrupted`/`failed`, `turn.error`), `error {willRetry}`, `thread/status/changed`, `thread/closed` (schema); final text comes only from `agentMessage` items with `phase:"final_answer"` | v2 `session.*`, `permission.*`, `form.*` SSE routed by session, input, assistant and call IDs; terminal = the allow-listed `session.execution.*` of the execution that delivered the turn's input | `session/update` (`agent_message_chunk`, `tool_call`, `tool_call_update`, `usage_update`) (docs) |
+| `Steer` | `unsupported` (A3, Q6) | `turn/steer {threadId, expectedTurnId, input}` → `turnId`; `activeTurnNotSteerable` → `SteerError::NotSteerable` (schema) | unsupported in the first release | `unsupported` (docs) |
+| `Interrupt` (soft stop; also the wall's cleanup step for the server routes, §4.1; the private Claude route's wall cleanup is a Host force close with no interrupt) | `control_request {request_id, request:{subtype:"interrupt"}}` → `control_response {subtype:"success", response:{still_queued}}` (probe); then `result` with `error_during_execution`/`aborted_tools` → `Acknowledged`; the interrupt stops what is still in the agent's parent tree; then stdin EOF (EOF alone does not stop an active tool), then S1's close: graceful, then the hard stop at the stop order's bound; private-group `Quiescent` requires runtime §5.2 positive absence proof | `turn/interrupt {threadId, turnId}` → wait `turn/completed` status `interrupted` → `Acknowledged`; `run_turn` returns when every reported `commandExecution` item has completed, or at `min(ack + tool_grace, wall)` with cleanup `Uncertain` (§4.1; P2/P2b: tool ran ≥ 60 s after `interrupted`; `command/exec/terminate` is only for client-started commands, `thread/unsubscribe` does not stop it); background terminals keep running and remain the server's | inbox cancel before delivery (input-cancellation terminal), interrupt after; never kill the shared server | `session/cancel` notification; `stopReason: cancelled` → `Acknowledged` (docs); cleanup `Uncertain` |
+| `Close` | per turn: stdin EOF after the result, then S1's close (graceful, then Force: request verified anchor own-group cleanup). stdin EOF does not cancel the running turn: with no active tool it completed the turn, and it did not stop an active tool. Interrupt must precede EOF; S1's close bound and hard stop are the fallback | session: detach with `thread/unsubscribe {threadId}`; never delete/archive the thread or close shared stdin for one session. Server (idle retirement, §3): stdin close, which stopped every tool under the sandbox (untested under full access, where grandchildren survived SIGKILL), then S1's hard stop | detach; `leftovers:null` | `session/close` if advertised, else detach; Force requests verified anchor cleanup for a private agent |
+| Auto-decline (D3) | unknown control requests must be answered or fail closed within 5 s on the control path; no fabricated/dropped refusal is success; `none` recipe: denials from `permission_denials`, deduplicated against a live `permission_denied` by `tool_use_id`; a decline-caused entry is suppressed | pinned 0.157.1 no-grant bodies: command/file approval → {"decision":"decline"}, permissions → {"permissions":{}}, tool user input → {"answers":{}}, MCP elicitation → {"action":"decline"}, tool call → {"success":false,"contentItems":[]}; auth/attestation/legacy/unknown → JSON-RPC -32601 with incoming ID, within A6's 5 s; live receipt remains unproved; no denials are reported | permission reply `reject`, form `DELETE`, within 5 s on a reserved pool; `Completed/Other` only for a callID-correlated permission decline | session/request_permission → reject-kind option else cancelled (A5, unverified) |
+| Bound | `read_only`, `workspace_write` and `network:false` refused pending CLAUDE-BOUND-1; `full,network:true` separately eligible after exact live recipe continuity proof; tool permissions are not all-tool OS containment | `read_only`/`workspace_write` protocol-mapped but refused pending `via-5lr.3.4`; `full,network:true` uses `dangerFullAccess`; `full,network:false` refused; no fallback to full | `full,network:true` only | `full` only (D7) |
+| Usage, cost | turn aggregate: `result.usage` per turn is authoritative (assistant snapshots are partial) → tokens `turn`; `total_cost_usd` → cost `session_cumulative`, `reported`; a terminal whose `total_cost_usd` is below the session driver's last reported value warns `cost_counter_reset`, and the value is reported as given, never as a negative delta; `modelUsage.costBasis` and `fallback_credit` kept in `vendor` | per model call: keyless `tokenUsage.last` samples add (their sum equals the change in `.total`) → scope `turn`; `total`, `cacheWriteInputTokens` and `modelContextWindow` → `vendor`; cost `unavailable` | step and compaction samples; `vendor_interval` with a compaction sample until qualified | `usage_update` context tokens; optional cumulative cost (docs) |
+| Class hints (every route: an HTTP 401 or 403 in a vendor error → `auth`) | classify on `is_error`, `terminal_reason`, `api_error_status` and the synthetic `error` code, never on `subtype`; matching interrupt receipt plus abort terminal → cancel evidence; `authentication_failed` or 401/403 → auth; error_max_turns → failed/budget_exceeded with stop_reason max_steps (not normal completed max_steps); other is_error → vendor_error | codexErrorInfo rateLimitExceeded → rate_limit; unauthorized and `httpConnectionFailed{401\|403}` → auth; contextWindowExceeded → context_exceeded; usageLimitExceeded/sessionBudgetExceeded → budget_exceeded; `tooManyDenials`, `flexUnavailable` and other vendor errors → vendor_error | `provider.auth` or status 401/403 → `auth`; `provider.rate-limit` or 429 → `rate_limit`; `provider.quota` → `budget_exceeded`; `provider.no-route`, other `provider.*` and unknown → `vendor_error` | stopReason refusal → completed/refusal; max_tokens → completed/budget; transport error → protocol |
+| Inherited configuration (owner OD2) | per category (hooks, MCP servers, plugins, skills, agents, instruction files), see below and [the Claude packet](vendors/claude-code.md) | see below and [the Codex packet](vendors/codex.md) | one server-level project switch following instruction files; states per `vendors/opencode.md` §4.5 (agents, plugins, MCP and hooks `unknown` with the switch on) | — |
+| `recover` | no live rejoin or replay; verified live anchor → cleanup request forwarded; un-rejoinable survivor → `Unknown`, `Dead` only with confirmed death; absent anchor → uncertain unless runtime §5.2 absence proof | no live rejoin on owned stdio; submitted/accepted turn unknown with no resend; `Dead` only with verified process-death evidence, otherwise `Unknown`; `thread/resume` is later conversation continuation | no live rejoin; `unknown`, no resend | `Unknown`; `session/load` replays finished turns only |
 **Inherited configuration (AD13; owner OD2).** Each route declares, per
 category (hooks, MCP servers, plugins, skills, agents, instruction files):
 - whether its vendor loads that category by default;
@@ -825,34 +841,13 @@ research fallback, not an implemented/enabled first-release route.
 Codex tool items carry a `processId` that is not an OS pid; mapping OS
 groups (bwrap `--new-session`) to a thread is unverified (P2b), so per-tool
 kill is not offered.
-OpenCode's exact logical server key is
-`(route_revision, resolved_program_path, canonical_cwd,
-provider_profile_id, provider_profile_epoch, generated_config_digest,
-environment_policy_revision, full_effective_bound,
-owning_via_session_id, private_storage_namespace)` (`vendors/opencode.md`
-§2). The owner/namespace mapping commits before vendor creation and is reused
-on spawn replay, resume and restart. Server generation, port and password are
-instance data, never key material. Freeze the bound and key; neither a changed
-bound nor another owner may migrate or join a live vendor session. OpenCode
-capability claims remain untested until VIA fake and live qualification,
-including free-model result/continuity, controls and usage.
-The selected `provider_profile_id` is `opencode-free-anonymous-v1`, epoch 1.
-Start from an empty environment with fresh owner-private `HOME`, every XDG
-root including `XDG_DATA_HOME`, `TMPDIR`, generated config and absolute
-private `OPENCODE_DB`; reopen/restart retains the same namespace and no-login
-profile. Do not discover/copy/mount caller saved auth or inject a provider API
-key; the pinned vendor owns its `public` fallback. Unexpected auth-state
-metadata in the private profile refuses startup without reading credentials.
-No login-backed profile or paid-model fallback is part of this recipe.
-Synthetic hostile-profile/config and same-profile restart proof remain in
-`via-4sw.3.4`; design and direct vendor probes are not VIA proof. For pinned
-OpenCode, describe declares `params.max_steps` unsupported with reason
-`No qualified per-turn step limit on opencode-serve 1.18.32`;
-Core refuses any non-null effective value before namespace/vendor I/O as
-JSON-RPC `-32602`, `data.kind: "invalid_params"`, naming the field and route.
-Null/omitted values proceed under ordinary C1 inheritance/clearing, and
-`allow_untested` cannot waive refusal. This is an optional parameter
-capability, not a reduction of the full C1 method surface.
+OpenCode's launch key, namespace, environment and credential check are in
+`vendors/opencode.md` §§3–4. Do not discover, copy or mount caller saved
+auth or inject a provider key; no login-backed profile or paid fallback. For
+pinned OpenCode 2.0.22, describe declares `params.max_steps` unsupported
+with reason `No per-turn step limit on opencode-serve 2.0.22`; Core refuses
+any non-null value before server acquisition or vendor I/O. Output schema is
+unsupported.
 
 Claude's exact per-turn launch recipe, frozen instructions/effort/schema and
 never-ask handling are in [the Claude vendor packet](vendors/claude-code.md)
@@ -944,7 +939,7 @@ opt-in live check, never in the default gate):
     `event_stall_ms` closes the session's route hop: a private route fails
     the connection `overflow`; a shared route quarantines the thread
     generation (§4); control commands
-    still complete. Codex per-thread Route ingress can quarantine earlier
+    still complete. Codex per-thread or OpenCode per-session Route ingress can quarantine earlier
     on its separate immediate lane limit (§4), without changing C2's timer.
 13. Bound re-validation: a turn whose bound the route cannot apply is
     `Rejected` with reason `BoundUnsupported` before submission; Codex `full` with
@@ -974,6 +969,6 @@ opt-in live check, never in the default gate):
 | B4 | OpenCode serve endpoints, SSE names, private database | reviewed pinned schema/source mapping in `vendors/opencode.md` §§1–4; live VIA conformance remains open |
 | B5 | ACP reject option kinds, `session/close`, `session/load` safety per agent | per-agent probe |
 | B6 | Codex tool quiescence: is `item/completed` for an interrupted `commandExecution` guaranteed, and can Host map bwrap groups to a thread | probe; until then cleanup ends `uncertain` at the deadline |
-| B7 | Environment allow-list per harness (`HOME`, `PATH`, vendor config dirs, `CODEX_SQLITE_HOME`, `CLAUDE_CONFIG_DIR`) | OpenCode's selected anonymous private HOME/all-XDG/DB recipe is in `vendors/opencode.md` §2; synthetic hostile ambient-auth/config, unexpected private auth-state and same-profile restart plus generated never-ask qualification remain open |
+| B7 | Environment allow-list per harness (`HOME`, `PATH`, vendor config dirs, `CODEX_SQLITE_HOME`, `CLAUDE_CONFIG_DIR`) | OpenCode's anonymous private HOME/XDG recipe and credential check are in `vendors/opencode.md` §4; L4–L5 remain open |
 | B8 | Claude: does a restarted process with `--resume` keep `--json-schema`/`--max-turns` semantics per turn; `queued_turn_count` meaning | probe |
 | D9 | External sandbox for OpenCode | unresolved; owned authenticated loopback HTTP route is selected in `vendors/opencode.md` §2 |

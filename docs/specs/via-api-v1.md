@@ -71,7 +71,7 @@ decided in the slice that needs them, after re-probing.
 | P8 | Error code table §8.1 | as written |
 | P9 | Deprecation: kept for one minor release minimum; removed only in v2 | as written |
 | P10 | Socket `$XDG_RUNTIME_DIR/via/via.sock` else `~/.via/run/via.sock`; 0700/0600; peer uid check both ends | as written |
-| P11 | Codex owned stdio server key is `config_hash` without bound; `config_hash` covers VIA-controlled launch settings (resolved program path, arguments, passed environment, server cwd, protocol pin), not credentials or binary contents; the observed binary version is reported, not keyed. Every turn sets `sandboxPolicy`; mixed-bound sharing waits for pinned enforcement proof. OpenCode keys include the full effective bound, VIA owner session and durable private namespace; no cross-owner server sharing or live-session migration. Bound-keyed routes refuse bound changes on resume | as reviewed in `docs/specs/vendors/codex.md` §9 and `docs/specs/vendors/opencode.md` §2 |
+| P11 | Codex owned stdio server key is `config_hash` without bound; `config_hash` covers VIA-controlled launch settings (resolved program path, arguments, passed environment, server cwd, protocol pin), not credentials or binary contents; the observed binary version is reported, not keyed. Every turn sets `sandboxPolicy`; mixed-bound sharing waits for pinned enforcement proof. OpenCode uses an owned shared `opencode serve --stdio` per launch key: the private namespace (anonymous profile identity and epoch, project-configuration switch) plus a hash of VIA-controlled launch settings, never credentials or binary contents; the observed version is reported, not keyed; the bound is not keyed (only `full` with `network:true` is admitted). At most one live server per namespace, fenced across restarts by Host's anchor journal. Closing a session detaches it. Bound-keyed routes refuse bound changes on resume | as reviewed in `docs/specs/vendors/codex.md` §9 and `docs/specs/vendors/opencode.md` §3 |
 | P12 | Live recovery after daemon restart is `unknown` for every route in v1; `resumed` only when a route's rejoin is probe-verified on the configured transport (Codex stdio server dies with the daemon, P3) | as written |
 | P13 | Version rule: every vendor version is supported; refused only on demonstrated handshake breakage; `untested` warns until the maintainers' check (owner OD1, 2026-09-30, superseding the 2026-09-26 P13 approval) | decided; C2 §5 (adapter design AD7) |
 
@@ -634,8 +634,8 @@ only after positive cleanup, joins and durable records, otherwise 4
 | `allow_untested` | bool, default false | session | immutable after spawn; accepted and stored for compatibility; no effect (P13): every version is supported unless refused for breakage, which it cannot waive |
 | `effort` | `low`…`max` or vendor value | per turn | unknown values refused; a vendor value that can be judged only against a discovered catalog is refused at submission, `failed(submit_failed)` with `failure.data.field:"effort"`; no vendor turn starts (C2 §5) |
 | `instructions` | `{text}` or `{path}` | session | native or `prepended_to_prompt` (partial). `path` is absolute: a regular UTF-8 file of at most 1 MiB that the daemon's user can read, copied when the request is received and frozen as its text; a file that changes during the copy is `invalid_params` naming `instructions`. The path is not stored; the retry identity uses the copy's SHA-256 and length |
-| `prompt` | string | per turn | exactly one of `prompt` and `prompt_file` |
-| `prompt_file` | absolute path | per turn | a regular UTF-8 file of at most 16 MiB that the daemon's user can read; the daemon copies it when the request is received and refuses it (`invalid_params`, kind2 `prompt_file`) if it changes during the copy. The path is not stored; the retry identity uses the copy's SHA-256 and length |
+| `prompt` | string | per turn | exactly one of `prompt` and `prompt_file`. A route may refuse a prompt whose encoded size exceeds its transport limit as `invalid_params` naming `prompt` (`opencode-serve`: the JSON-encoded prompt plus the JSON-encoded cwd above 1,040,384 bytes). |
+| `prompt_file` | absolute path | per turn | a regular UTF-8 file of at most 16 MiB that the daemon's user can read; the daemon copies it when the request is received and refuses it (`invalid_params`, kind2 `prompt_file`) if it changes during the copy. The path is not stored; the retry identity uses the copy's SHA-256 and length. A route may refuse a prompt whose encoded size exceeds its transport limit as `invalid_params` naming `prompt` (`opencode-serve`: the JSON-encoded prompt plus the JSON-encoded cwd above 1,040,384 bytes). |
 | `bound` | `{mode: read_only\|workspace_write\|full, extra_write_dirs: [path], network: bool}` | per turn (D5): inherited unless set on `resume` | always never-ask (D3); combinations per §4.2 |
 | `cwd` | absolute path | session | must exist |
 | `output_schema` | JSON Schema object or `null` | per turn | `null` clears an inherited schema; validated by VIA (Q2, draft 2020-12 only: a `$schema` in any schema position (not inside instance values such as `const`, `enum`, `default` or `examples`) that names another dialect is `invalid_params`; size ≤ 256 KiB; at most 2,048 subschemas and 64 patterns, counted over every schema position whether referenced or not, each pattern within the regular-expression limit, else `invalid_params`; runtime §8). Patterns keep ECMA-262's meaning of class escapes, `.` and `\b`; one VIA cannot compile is `invalid_params` |
@@ -675,16 +675,16 @@ and refusals are governed by §4.2.
 |---|---|---|---|---|
 | `codex-app-server` | protocol-mapped, unverified; refuse pending pinned enforcement gate | protocol-mapped, unverified; refuse pending pinned enforcement gate | native with `network:true` | limited-bound network control only after proof; `full` + `network:false` refused |
 | `claude-cli` | unqualified; refuse pending CLAUDE-BOUND-1 | unqualified; refuse pending CLAUDE-BOUND-1 | `network:true` eligible candidate, qualified only after exact live recipe continuity test | refused, including limited bounds |
-| `opencode-serve` | refused (A4, D9) | refused | only with `network:true` and empty `extra_write_dirs`; nonempty `extra_write_dirs` is `invalid_params` before namespace allocation/I/O | refused |
+| `opencode-serve` | refused (A4, D9) | refused | only with `network:true` and empty `extra_write_dirs`; nonempty `extra_write_dirs` is `invalid_params` before server acquisition or vendor I/O | refused |
 | ACP | refused (D7) | refused | native | refused |
 
-For pinned OpenCode 1.18.32, `describe` declares optional
+For pinned OpenCode 2.0.22, `describe` declares optional
 `params.max_steps` unsupported with a reason. A non-null effective value is
-refused by Core preflight before namespace allocation or vendor I/O as
+refused by Core preflight before server acquisition or vendor I/O as
 JSON-RPC `-32602`, `data.kind: "invalid_params"`, naming the field and route.
 Null/omitted values follow ordinary inheritance and clearing;
 `allow_untested` does not waive this refusal. This does not remove any C1
-method from the first-release surface (`vendors/opencode.md` §3).
+method from the first-release surface (`vendors/opencode.md` §12).
 
 Rules: an unenforceable combination is `bound_unsupported` naming the
 route and the reason. `vendor` options that touch permission, sandbox,
@@ -783,7 +783,7 @@ below 1 MiB, and a conformance test assembles that maximum.
 
 | Field | Meaning |
 |---|---|
-| `state`, `failure` | §7.2; `failure` = `{class, message, vendor_code?, retryable, data?}` (§8.2). `data` is present only for an adapter-side `submit_failed`, where it has `reason` (`"invalid_param"` or `"handshake_refused"`) and, with `invalid_param`, `field` (the C1 parameter name), and for `structured_output_invalid`, where it has `reason` (`"invalid"` or `"validation_limit"`, §5). It is bounded to 256 bytes, never holds vendor text, and follows §8.1's `data.field` naming. `vendor_code` keeps only vendor codes |
+| `state`, `failure` | §7.2; `failure` = `{class, message, vendor_code?, retryable, data?}` (§8.2). `data` is present only for an adapter-side `submit_failed`, where it has `reason` (`"invalid_param"`, `"handshake_refused"` or `"settings_mismatch"`) and, with `invalid_param`, `field` (the C1 parameter name), and, with `settings_mismatch`, optionally `field` (the C1 parameter whose persisted vendor value differs), and for `structured_output_invalid`, where it has `reason` (`"invalid"` or `"validation_limit"`, §5). It is bounded to 256 bytes, never holds vendor text, and follows §8.1's `data.field` naming. `vendor_code` keeps only vendor codes |
 | `stop_reason` | `end_turn`, `max_steps`, `budget`, `refusal`, `interrupted`, `deadline`, `error`, `other`; vendor word in `vendor_stop_reason` |
 | `cancel` | outcome and cleanup certainty (§3.5, §7.4) |
 | `bound` | requested, effective, and whether it was inherited |
@@ -798,7 +798,7 @@ below 1 MiB, and a conformance test assembles that maximum.
 | `cost` | `usd`; `scope` as above; `provenance` `reported`, `estimated`, `unavailable`. Scopes are per field: Claude P5 showed per-result tokens with rising cumulative `total_cost_usd` |
 | `exit` | `{code, signal}` for per-session processes that ended in this turn; `null` for server routes |
 | `evidence` | the turn's evidence folder and the vendor's transcript hint, as `logs` returns them (§3.12) |
-| `warnings` | `instructions_partial`, `vendor_version_untested`, `usage_interval_unverified`, `structured_output_missing`, `structured_output_invalid`, `cancel_cleanup_uncertain`, `predecessor_cleanup_uncertain`, `config_switch_unverified`, `deprecated`, `observations_lost`.  `config_switch_unverified` is one warning per receipt or envelope listing every category whose requested inheritance setting VIA could not apply or could not verify, `data.categories: [{category, requested, effective}]` (C2 §6.2) `observations_lost` (some observations of a shared-server thread were lost: by ingress overflow, an observation stall, a close's deadline or an internal task failure) carries `data: {trigger_turn, generation, first_unqueued, omitted}`, where `omitted` is `null` when the count is unknown or saturated; it is on the envelope of every turn the loss affected, and, when the triggering turn was already terminal, a durable `late` `warning` event on that turn; that envelope is not rewritten. |
+| `warnings` | `instructions_partial`, `vendor_version_untested`, `usage_interval_unverified`, `structured_output_missing`, `structured_output_invalid`, `cancel_cleanup_uncertain`, `predecessor_cleanup_uncertain`, `config_switch_unverified`, `deprecated`, `observations_lost`, `credential_state_unchecked` (a VIA-owned vendor server's credential state could not be checked on this version).  `config_switch_unverified` is one warning per receipt or envelope listing every category whose requested inheritance setting VIA could not apply or could not verify, `data.categories: [{category, requested, effective}]` (C2 §6.2) `observations_lost` (some observations of a shared-server thread were lost: by ingress overflow, an observation stall, a close's deadline or an internal task failure) carries `data: {trigger_turn, generation, first_unqueued, omitted}`, where `omitted` is `null` when the count is unknown or saturated; it is on the envelope of every turn the loss affected, and, when the triggering turn was already terminal, a durable `late` `warning` event on that turn; that envelope is not rewritten. |
 | `leftovers` | processes the coding agent started that were observed after its own process exited; the agent's responsibility, never signalled by VIA (C2 §4.2). `{scope: "turn"\|"server", processes: [{pid, comm, started_at}], total, incomplete, best_effort: true}` or `null`. `processes`: at most 16, oldest first (start ticks, then pid). `total`: the matches found, exact when not `incomplete`, a lower bound otherwise; `total` greater than the list length is the only truncation signal. `started_at`: RFC 3339 UTC, boot time (`/proc/stat` `btime`, whole seconds) plus the process's start ticks, so accurate to about 1 s and emitted with second precision. `comm`: the kernel's process name (at most 15 bytes), lossy UTF-8; it is process-controlled, so a process can name itself anything. Always present; non-null only on per-turn-route envelopes and on `server_lost` envelopes (one shared snapshot per lost server); `null` elsewhere, including recovered turns. Produced best effort by Host's report-only scan for VIA's process marker (C2 §4.2, runtime §5) wherever these destinations apply; `null` when no scan ran. `incomplete: true` means the scan could not settle the full set (C2 §4.2); entries mean "observed during the scan", not "alive" |
 
 ## 6. Durable events
@@ -954,11 +954,12 @@ that does not prove its submitted work had no effect.
 | Process exited without terminal result (Host-confirmed) | running | `failed(process_exited)` |
 | Server death (Host-confirmed) | running | `failed(server_lost)`; every session on it |
 | Transport lost, process alive or unconfirmed | running | `unknown` |
-| Codex per-thread ingress/C2 stall overflow | running on affected thread generation | promptly resolve every nonterminal submitted turn under preceding disposition precedence, interrupt through reserved control, and block same-thread dispatch until clean reopen; preserve prior terminal envelopes and other threads |
+| Codex per-thread or OpenCode per-session ingress/C2 stall overflow | running on affected thread generation | promptly resolve every nonterminal submitted turn under preceding disposition precedence, interrupt through reserved control, and block same-thread (OpenCode: same-session) dispatch until clean reopen; preserve prior terminal envelopes and other threads |
 | Observation or message overflow failed the connection | running | `failed(overflow)` |
 | Submission rejected definitively | submitting | `failed(submit_failed)` |
 | Daemon restart | any | §7.5 |
 | Late vendor terminal for an `unknown` turn | unknown | revise to that state, `revision + 1`, `turn.revised`; a caller that already read the result must read it again. The terminal is attributed through the vendor turn ID recorded at acceptance, never by position, so a turn never accepted is not revised. Only a caller `cancel` or `close` that stopped the turn makes an `interrupted` terminal `cancelled`; otherwise (a Core deadline, a Store or protocol stop) it is classified as a vendor terminal (§8.2). A stored cancel outcome `unknown` or `requested` becomes `acknowledged` for an `interrupted` terminal; for any other terminal `unknown` becomes `requested`; `acknowledged` and `forced` stand |
+| Native input cancellation | running or unknown | OpenCode `session.inbox.cancelled` of the turn's caller input ID, never delivered, is a vendor `interrupted` terminal with no execution: after a caller cancel/close → `cancelled`, `acknowledged`, cleanup `quiescent`; after a Core deadline's cleanup step the deadline failure stands; for an `unknown` turn whose acceptance was recorded it revises like a late terminal (→ `cancelled`). On `opencode-serve` the vendor turn ID is the caller input ID. |
 
 Rows 1–2 cover caller-originated cancels (`cancel`, `close`). A Core-deadline
 stop resolves `failed(deadline_*)` after rows 3–4. A `Deadline` coincident
@@ -1037,25 +1038,24 @@ class; `submit_failed` is only before acceptance; HTTP 401/403 → `auth`. `max_
 - Socket and state directory per coding-style §6; one daemon per user. The
   public C1 API has no network listener in v1: clients use the user-only Unix
   socket or stdio proxy. A VIA-owned vendor server may use a private,
-  authenticated loopback HTTP listener with verified process/listener
-  provenance. VIA never attaches to an unrelated vendor listener.
+  authenticated loopback HTTP listener whose address VIA receives from the
+  child it started and whose identity it verifies before use. VIA never
+  attaches to an unrelated vendor listener.
 - Handle: caller-generated, hashed at rest, never returned or traced.
-- VIA never reads, copies, reuses or logs user/provider credentials. For the
-  full-bound OpenCode route, VIA generates a fresh password per owned server,
-  retains it in daemon memory and injects it only into that server's launch
-  environment; VIA does not persist or emit it in Store, argv, diagnostics or
-  transport captures/metadata. As an owner-authorized temporary exception,
-  vendor tool children may inherit that generated instance password. Each
-  server/password/private namespace belongs to one VIA session; cross-session
-  sharing is prohibited. Loopback Basic Auth and listener provenance are
-  mandatory. Full-bound sessions do not isolate hostile same-user processes;
-  this exception does not authorize access to user/provider credentials.
-  Revisit at the next vendor-pin/security review and before changing sharing,
-  listener exposure, credential reuse or the advertised trust boundary.
-  OC01/OC02/OC12 control tests in `vendors/opencode.md` remain required;
-  complete child-environment scrubbing is deferred to `via-4sw.4`.
-- One narrow, owner-approved exception (2026-10-01), separate from the
-  OpenCode password exception, which does not cover it: a report-only
+- VIA never reads, copies, reuses or logs user/provider credentials. For
+  `opencode-serve`, VIA generates a fresh password per owned server, keeps
+  it in daemon memory and passes it only in that server's launch
+  environment; never in Store, argv, diagnostics or transport captures. The
+  pinned vendor removes it from its own environment before serving, so tool
+  children do not inherit it; the server's initial environment stays
+  readable to same-user processes, so a full-bound tool can recover it and
+  reach every session on that shared server (§2). VIA never requests the
+  vendor's credential listing. A fresh private namespace is credential-free
+  by construction; otherwise a secret-free integration listing of known
+  shape that shows a stored credential refuses startup, and an unknown shape
+  proceeds with `credential_state_unchecked`. Loopback Basic Auth is
+  mandatory. OC01, OC02 and OC12 in `vendors/opencode.md` remain required.
+- One narrow, owner-approved exception (2026-10-01): a report-only
   leftover scan (C2 §4.2) may read the environment of a same-uid process
   started at or after the vendor, through one `/proc/<pid>` descriptor,
   solely to match the exact `VIA_PROCESS_MARKER` entry. Its buffer can
@@ -1080,7 +1080,7 @@ approval.
 | # | Question | Recommendation / alternatives |
 |---|---|---|
 | P7 | Codex pending cleanup | reviewed §3.5/§7.3 rule: settle at `min(acknowledged_at + 60 s, wall_deadline)`; do not add `--after-uncertain` |
-| P11 | server key vs per-turn bound | reviewed §Decisions rule; Codex key excludes bound and mixed-bound operation awaits enforcement proof; OpenCode key includes full bound, owning VIA session and durable private namespace, refusing bound changes or cross-owner sharing |
+| P11 | server key vs per-turn bound | reviewed §Decisions rule; Codex key excludes bound and mixed-bound operation awaits enforcement proof; OpenCode shares one owned server per launch key (namespace plus launch-settings hash) |
 | P12 | live recovery gate | `unknown` everywhere in v1; alternative: enable Codex rejoin after the socket-transport probe (D9) |
 | P13 | version rule | Version rule: every vendor version is supported; refused only on demonstrated handshake breakage; `untested` warns until the maintainers' check (owner OD1, 2026-09-30, superseding the 2026-09-26 P13 approval) |
 | Q6 | Claude steer semantics | resolved `unsupported`; busy input can merge into a running result, so no steer input is written |
