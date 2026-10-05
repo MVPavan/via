@@ -146,26 +146,43 @@ struct PromptArgs {
 }
 
 impl PromptArgs {
-    /// Adds `prompt` or `prompt_file` to `params`.
-    fn apply(self, params: &mut Value) -> anyhow::Result<()> {
+    /// Adds `prompt` or `prompt_file` to `params`. Every failure is a
+    /// local request error (bead via-7c6).
+    fn apply(self, params: &mut Value) -> Result<(), client::RequestError> {
         match (self.prompt, self.prompt_file) {
             (Some(prompt), _) => params["prompt"] = Value::String(prompt),
             (None, Some(path)) if path.as_os_str() == "-" => {
-                params["prompt"] = Value::String(io::read_to_string(io::stdin())?);
+                let prompt = io::read_to_string(io::stdin()).map_err(|error| {
+                    client::RequestError::invalid_params(
+                        "prompt",
+                        format!("reading the prompt from stdin: {error}"),
+                    )
+                })?;
+                params["prompt"] = Value::String(prompt);
             }
-            (None, Some(path)) => params["prompt_file"] = json!(absolute(&path)?),
-            (None, None) => anyhow::bail!("--prompt or --prompt-file is required"),
+            (None, Some(path)) => params["prompt_file"] = json!(absolute(&path, "prompt_file")?),
+            (None, None) => {
+                return Err(client::RequestError::invalid_params(
+                    "prompt",
+                    "--prompt or --prompt-file is required",
+                ));
+            }
         }
         Ok(())
     }
 }
 
-/// `path` made absolute against the current directory.
-fn absolute(path: &std::path::Path) -> anyhow::Result<String> {
-    let path = std::path::absolute(path)?;
-    path.to_str()
-        .map(str::to_owned)
-        .ok_or_else(|| anyhow::anyhow!("path is not UTF-8: {}", path.display()))
+/// `path` made absolute against the current directory; a failure is a
+/// local request error naming `field` (bead via-7c6).
+fn absolute(path: &std::path::Path, field: &'static str) -> Result<String, client::RequestError> {
+    let path = std::path::absolute(path)
+        .map_err(|error| client::RequestError::invalid_params(field, error.to_string()))?;
+    path.to_str().map(str::to_owned).ok_or_else(|| {
+        client::RequestError::invalid_params(
+            field,
+            format!("path is not UTF-8: {}", path.display()),
+        )
+    })
 }
 
 /// C1 §3.2/§3.3 per-turn flags; the daemon validates them against the route.
@@ -195,7 +212,9 @@ struct TurnArgs {
 
 impl TurnArgs {
     /// Adds the given per-turn parameters to `params`; omitted ones inherit.
-    fn apply(self, params: &mut Value) -> anyhow::Result<()> {
+    /// Every failure is a local request error naming its member (bead
+    /// via-7c6): nothing is sent.
+    fn apply(self, params: &mut Value) -> Result<(), client::RequestError> {
         if let Some(mode) = self.bound {
             params["bound"] =
                 json!({"mode":mode,"extra_write_dirs":self.allow_dirs,"network":self.network});
@@ -204,8 +223,15 @@ impl TurnArgs {
             params["effort"] = Value::String(effort);
         }
         if let Some(path) = self.output_schema {
-            let schema = std::fs::read(&path)?;
-            params["output_schema"] = serde_json::from_slice(&schema)?;
+            let invalid = |error: &dyn std::fmt::Display| {
+                client::RequestError::invalid_params(
+                    "output_schema",
+                    format!("--output-schema {}: {error}", path.display()),
+                )
+            };
+            let schema = std::fs::read(&path).map_err(|error| invalid(&error))?;
+            params["output_schema"] =
+                serde_json::from_slice(&schema).map_err(|error| invalid(&error))?;
         }
         if self.wall_ms.is_some() || self.idle_ms.is_some() {
             let mut deadlines = json!({});
@@ -226,6 +252,7 @@ impl TurnArgs {
                 let (name, value) = option
                     .split_once('=')
                     .and_then(|(key, value)| Some((key.split_once('.')?, value)))
+                    .filter(|((harness, key), _)| !harness.is_empty() && !key.is_empty())
                     .ok_or_else(|| {
                         client::RequestError::invalid_params(
                             "vendor",
@@ -501,7 +528,7 @@ fn describe(args: DescribeArgs) -> anyhow::Result<i32> {
         params["require"] = json!(args.require);
     }
     if let Some(cwd) = args.cwd {
-        params["cwd"] = json!(absolute(&cwd)?);
+        params["cwd"] = json!(absolute(&cwd, "cwd")?);
     }
     if args.allow_untested {
         params["allow_untested"] = Value::Bool(true);
@@ -520,10 +547,10 @@ fn spawn(args: SpawnArgs) -> anyhow::Result<i32> {
     let mut params = json!({"harness":args.harness,"model":args.model,"handle":handle});
     args.prompt.apply(&mut params)?;
     if let Some(path) = args.instructions {
-        params["instructions"] = json!({"path":absolute(&path)?});
+        params["instructions"] = json!({"path":absolute(&path, "instructions")?});
     }
     if let Some(cwd) = args.cwd {
-        params["cwd"] = json!(absolute(&cwd)?);
+        params["cwd"] = json!(absolute(&cwd, "cwd")?);
     }
     if !args.require.is_empty() {
         params["require"] = json!(args.require);

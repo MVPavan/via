@@ -90,6 +90,10 @@ pub(crate) struct Recipe<'a> {
 /// are `on` only without `--restricted` and `off` only with it
 /// ([`super::plan::categories`]). A session frozen before the mode
 /// existed (hooks `unknown`) was launched with `--restricted`.
+/// Invariant relied on: every released history before this batch launched
+/// `--restricted` and froze hooks `unknown`; from it on, hooks freeze `on`
+/// or `off` only. A change that freezes hooks otherwise must persist the
+/// mode explicitly instead.
 pub(crate) fn session_mode(effective: Inherit) -> ClaudeMode {
     match effective.get(Category::Hooks) {
         InheritState::On => ClaudeMode::Unrestricted,

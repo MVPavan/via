@@ -354,10 +354,26 @@ const VENDOR_UMASK: u32 = 0o022;
 /// control socket was bound and set to 0600 before, and the stderr drain's
 /// threads only write the turn's file the daemon already opened.
 fn spawn_with_vendor_umask(command: &mut tokio::process::Command) -> io::Result<Child> {
-    let own = rustix::process::umask(rustix::fs::Mode::from_raw_mode(VENDOR_UMASK));
-    let spawned = command.spawn();
-    rustix::process::umask(own);
-    spawned
+    let _lowered = Umask::set(VENDOR_UMASK);
+    command.spawn()
+}
+
+/// A lowered process umask, restored when dropped: after the spawn, and on
+/// unwind should the spawn panic.
+struct Umask(rustix::fs::Mode);
+
+impl Umask {
+    fn set(mask: u32) -> Self {
+        Self(rustix::process::umask(rustix::fs::Mode::from_raw_mode(
+            mask,
+        )))
+    }
+}
+
+impl Drop for Umask {
+    fn drop(&mut self) {
+        rustix::process::umask(self.0);
+    }
 }
 
 async fn spawn_vendor(
@@ -568,4 +584,28 @@ async fn stop_own_group(
     // The anchor is still in this group. No daemon-supplied numeric group is signalled.
     let _ = process::kill_process_group(process::getpgrp(), Signal::TERM);
     kill_own_group(Instant::now() + grace, stderr).await;
+}
+
+#[cfg(test)]
+mod umask_tests {
+    use super::Umask;
+
+    /// Review clfix-1: the anchor's own mask comes back however the scope
+    /// ends, a panic included.
+    #[test]
+    fn umask_is_restored_on_unwind() {
+        let current = || {
+            let mask = rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o077));
+            rustix::process::umask(mask);
+            mask.bits()
+        };
+        rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o077));
+        let unwound = std::panic::catch_unwind(|| {
+            let _lowered = Umask::set(0o022);
+            assert_eq!(current(), 0o022);
+            panic!("spawn panicked");
+        });
+        assert!(unwound.is_err());
+        assert_eq!(current(), 0o077);
+    }
 }

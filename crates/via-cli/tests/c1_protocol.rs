@@ -618,23 +618,42 @@ fn c1_client_refuses_daemon_socket_of_another_uid() -> TestResult {
 /// Bead via-7c6: a request the CLI refuses before sending it is a request
 /// error (C1 §1: exit 2), never `daemon_unreachable` (exit 4). `via cancel`
 /// with no handle anywhere, or a malformed one, is `invalid_params` naming
-/// `handle`, and a malformed `--vendor` names `vendor`. Nothing reaches a daemon: none
+/// `handle`, a malformed `--vendor` names `vendor`, and an unreadable or
+/// non-JSON `--output-schema` file names `output_schema`. Nothing reaches a daemon: none
 /// is started.
 #[test]
 fn c1_cli_refuses_a_missing_or_malformed_parameter_as_invalid_params() -> TestResult {
     let sandbox = Sandbox::new()?;
-    let cases: [(&[&str], &str); 3] = [
-        (&["cancel", SESSION], "handle"),
-        (&["cancel", SESSION, "--handle", "h_short"], "handle"),
+    let missing = sandbox.root.path().join("no-such-schema.json");
+    let missing = missing.to_str().ok_or("temporary path is not UTF-8")?;
+    let resume = ["resume", SESSION, "--handle", HANDLE, "--prompt", "p"];
+    let with = |extra: &[&'static str]| -> Vec<&str> {
+        resume
+            .iter()
+            .copied()
+            .chain(extra.iter().copied())
+            .collect()
+    };
+    let cases: Vec<(Vec<&str>, &str)> = vec![
+        (vec!["cancel", SESSION], "handle"),
+        (vec!["cancel", SESSION, "--handle", "h_short"], "handle"),
+        (with(&["--vendor", "novalue"]), "vendor"),
+        // Review clfix-1: an empty harness or key is malformed too.
+        (with(&["--vendor", ".key=x"]), "vendor"),
+        (with(&["--vendor", "claude.=x"]), "vendor"),
+        // Review clfix-1 #2: a schema file that is not JSON, or unreadable.
+        (with(&["--output-schema", "/dev/null"]), "output_schema"),
         (
-            &[
-                "resume", SESSION, "--handle", HANDLE, "--prompt", "p", "--vendor", "novalue",
-            ],
-            "vendor",
+            resume
+                .iter()
+                .copied()
+                .chain(["--output-schema", missing])
+                .collect(),
+            "output_schema",
         ),
     ];
     for (args, field) in cases {
-        let output = sandbox.command().args(args).output()?;
+        let output = sandbox.command().args(&args).output()?;
         let stderr: Value = serde_json::from_slice(&output.stderr)
             .map_err(|error| format!("{args:?}: stderr is not JSON ({error})"))?;
         assert_eq!(output.status.code(), Some(2), "{args:?}: {stderr}");
