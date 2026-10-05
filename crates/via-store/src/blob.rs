@@ -155,8 +155,9 @@ impl BlobTasks {
     }
 
     /// Admits `work` onto `runtime`'s blocking pool once a slot is free,
-    /// waiting at most until `deadline`: `false` when none freed in time,
-    /// and nothing was started. Cancelled while waiting, it starts nothing.
+    /// waiting at most until `deadline`: `false` when no slot was taken
+    /// before it, and nothing was started. Cancelled while waiting, it
+    /// starts nothing.
     async fn admit(
         &self,
         runtime: &Handle,
@@ -168,6 +169,12 @@ impl BlobTasks {
         let Ok(Ok(slot)) = tokio::time::timeout_at(deadline, slot).await else {
             return false;
         };
+        // `timeout_at` polls the acquisition before it checks the deadline,
+        // so a slot that freed while this task was not polled can arrive
+        // late: past the deadline the work never starts and the slot returns.
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
         self.start(runtime, slot, work);
         true
     }
@@ -817,12 +824,78 @@ impl BlobReader {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::mpsc,
+        pin::{Pin, pin},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            mpsc,
+        },
+        task::Poll,
         time::{Duration, Instant},
     };
 
+    use tokio::runtime::Handle;
+
     use super::{BLOB_TASKS, BlobTasks, utf8_continues};
     use crate::StoreError;
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+    }
+
+    /// Fills every slot with a step that counts itself in `running` (its
+    /// highest in `peak`) and ends when the returned sender sends, one
+    /// step per message, or is dropped, every step.
+    async fn hold_every_slot(
+        tasks: &BlobTasks,
+        (running, peak): (&Arc<AtomicUsize>, &Arc<AtomicUsize>),
+    ) -> mpsc::Sender<()> {
+        let (release, blocked) = mpsc::channel::<()>();
+        let blocked = Arc::new(Mutex::new(blocked));
+        let by = tokio::time::Instant::now() + Duration::from_secs(1);
+        for _ in 0..BLOB_TASKS {
+            let blocked = Arc::clone(&blocked);
+            let (running, peak) = (Arc::clone(running), Arc::clone(peak));
+            let admitted = tasks
+                .admit(&Handle::current(), by, move || {
+                    let now = running.fetch_add(1, Ordering::AcqRel) + 1;
+                    peak.fetch_max(now, Ordering::AcqRel);
+                    let _ = blocked.lock().map(|blocked| blocked.recv());
+                    running.fetch_sub(1, Ordering::AcqRel);
+                })
+                .await;
+            assert!(admitted, "a free slot admits at once");
+        }
+        assert_eq!(tasks.outstanding(), BLOB_TASKS);
+        release
+    }
+
+    /// Polls `future` once: whether it is still pending.
+    async fn pending<F: Future>(mut future: Pin<&mut F>) -> bool {
+        std::future::poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx).is_pending())).await
+    }
+
+    /// Blocks until at most `left` steps are owned, within 10 s.
+    fn ended_down_to(tasks: &BlobTasks, left: usize) {
+        let by = Instant::now() + Duration::from_secs(10);
+        while tasks.outstanding() > left {
+            assert!(
+                Instant::now() < by,
+                "{} steps still owned",
+                tasks.outstanding()
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Every slot is free again: none was leaked.
+    fn every_slot_free(tasks: &BlobTasks) {
+        assert_eq!(tasks.drain(Duration::from_secs(10)), 0);
+        assert_eq!(tasks.slots.available_permits(), BLOB_TASKS);
+    }
 
     /// Review round 1, bead via-s4s: with [`BLOB_TASKS`] steps stalled, a
     /// new step waits for a slot within its bound and is then refused, as
@@ -832,28 +905,14 @@ mod tests {
     /// ends the steps are reaped and a new step runs.
     #[test]
     fn stalled_steps_hold_the_cap_and_a_new_step_is_refused_at_its_bound() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
+        let runtime = runtime();
         let tasks = BlobTasks::default();
-        let (release, blocked) = mpsc::channel::<()>();
-        let blocked = std::sync::Arc::new(std::sync::Mutex::new(blocked));
+        let counts = (&Arc::default(), &Arc::default());
         let root = tempfile::tempdir().expect("dir");
         let kept = root.path().join("kept.blob");
         std::fs::write(&kept, b"x").expect("file");
-        runtime.block_on(async {
-            let by = tokio::time::Instant::now() + Duration::from_secs(1);
-            for _ in 0..BLOB_TASKS {
-                let blocked = std::sync::Arc::clone(&blocked);
-                let admitted = tasks
-                    .admit(&tokio::runtime::Handle::current(), by, move || {
-                        let _ = blocked.lock().map(|blocked| blocked.recv());
-                    })
-                    .await;
-                assert!(admitted, "a free slot admits at once");
-            }
-            assert_eq!(tasks.outstanding(), BLOB_TASKS);
+        let release = runtime.block_on(async {
+            let release = hold_every_slot(&tasks, counts).await;
             let started = Instant::now();
             let refused = tasks.run(|| Ok(())).await;
             let waited = started.elapsed();
@@ -873,61 +932,158 @@ mod tests {
             assert_eq!(tasks.outstanding(), BLOB_TASKS, "a refused step started");
             tasks.unlink_detached(kept.clone());
             assert_eq!(tasks.outstanding(), BLOB_TASKS);
+            release
         });
         assert!(
             kept.exists(),
             "a Drop unlink with no slot is left for the sweep"
         );
         drop(release);
-        assert_eq!(tasks.drain(Duration::from_secs(10)), 0);
+        every_slot_free(&tasks);
         runtime.block_on(async {
             assert!(tasks.run(|| Ok(())).await.is_ok(), "the slots were freed");
         });
     }
 
+    /// Bead via-s4s critical review: a queued step whose deadline passed
+    /// while its executor stalled never starts, even when a slot frees
+    /// before it is polled again: it is refused as an acquisition timeout
+    /// is, and the slot returns.
+    #[test]
+    fn a_queued_step_past_its_deadline_never_starts() {
+        let runtime = runtime();
+        let tasks = BlobTasks::default();
+        let ran = Arc::new(AtomicBool::new(false));
+        runtime.block_on(async {
+            let release = hold_every_slot(&tasks, (&Arc::default(), &Arc::default())).await;
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+            let flag = Arc::clone(&ran);
+            let mut queued = pin!(tasks.run_until(deadline, move || {
+                flag.store(true, Ordering::Release);
+            }));
+            assert!(pending(queued.as_mut()).await, "queued behind the cap");
+            // The executor stalls past the deadline; a slot frees meanwhile.
+            std::thread::sleep(Duration::from_millis(200));
+            release.send(()).expect("a holder waits");
+            ended_down_to(&tasks, BLOB_TASKS - 1);
+            let late = queued.await;
+            drop(release);
+            assert!(matches!(late, Ok(None)), "{late:?}");
+        });
+        every_slot_free(&tasks);
+        assert!(
+            !ran.load(Ordering::Acquire),
+            "work started after its deadline"
+        );
+    }
+
+    /// Bead via-s4s: the wait for a slot and the work share one bound. A
+    /// step that gets its slot near its deadline and then stalls answers
+    /// at the deadline, not a full bound after its slot.
+    #[test]
+    fn a_queued_step_shares_its_bound_with_its_wait() {
+        let runtime = runtime();
+        let tasks = BlobTasks::default();
+        let (stall, stalled) = mpsc::channel::<()>();
+        runtime.block_on(async {
+            let release = hold_every_slot(&tasks, (&Arc::default(), &Arc::default())).await;
+            let started = Instant::now();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            // A slot frees 0.9 s in, 0.1 s before the deadline.
+            let releaser = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(900));
+                release.send(()).expect("a holder waits");
+                release
+            });
+            let late = tasks.run_until(deadline, move || stalled.recv()).await;
+            let answered = started.elapsed();
+            let release = releaser.join().expect("releaser");
+            assert!(matches!(late, Ok(None)), "{late:?}");
+            // A fresh bound after the slot would answer near 1.9 s.
+            assert!(answered < Duration::from_millis(1_500), "{answered:?}");
+            assert_eq!(tasks.outstanding(), BLOB_TASKS, "the stalled step is owned");
+            drop(release);
+        });
+        drop(stall);
+        every_slot_free(&tasks);
+    }
+
+    /// Bead via-s4s: a queued step cancelled by its caller starts nothing
+    /// and leaks no slot.
+    #[test]
+    fn a_cancelled_queued_step_starts_nothing_and_leaks_no_slot() {
+        let runtime = runtime();
+        let tasks = BlobTasks::default();
+        let ran = Arc::new(AtomicBool::new(false));
+        runtime.block_on(async {
+            let release = hold_every_slot(&tasks, (&Arc::default(), &Arc::default())).await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let flag = Arc::clone(&ran);
+            let mut queued = Box::pin(tasks.run_until(deadline, move || {
+                flag.store(true, Ordering::Release);
+            }));
+            assert!(pending(queued.as_mut()).await, "queued behind the cap");
+            drop(queued);
+            drop(release);
+        });
+        every_slot_free(&tasks);
+        assert!(!ran.load(Ordering::Acquire), "a cancelled step started");
+    }
+
+    /// Bead via-s4s: a step that panics returns its slot as it unwinds;
+    /// its caller sees a `Write` failure.
+    #[test]
+    fn a_panicking_step_returns_its_slot() {
+        let runtime = runtime();
+        let tasks = BlobTasks::default();
+        runtime.block_on(async {
+            let failed = tasks
+                .run(|| -> std::io::Result<()> { panic!("a blob step panics") })
+                .await;
+            assert!(
+                matches!(&failed, Err(StoreError::Write(message)) if message.contains("without a result")),
+                "{failed:?}"
+            );
+        });
+        every_slot_free(&tasks);
+    }
+
     /// Bead via-s4s: twice [`BLOB_TASKS`] healthy steps at once all
-    /// succeed. A step past the cap waits for a slot within its bound
-    /// instead of being refused, and no more than the cap run at once.
+    /// succeed. With every slot held, each further step is explicitly
+    /// polled to pending, not refused; once the holders end, each runs,
+    /// and no more than the cap run at once.
     #[test]
     fn healthy_steps_past_the_cap_wait_for_a_slot() {
-        use std::sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        };
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
+        let runtime = runtime();
         let tasks = BlobTasks::default();
         let running = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
         runtime.block_on(async {
-            let mut steps = tokio::task::JoinSet::new();
-            for _ in 0..2 * BLOB_TASKS {
-                let tasks = tasks.clone();
-                let running = Arc::clone(&running);
-                let peak = Arc::clone(&peak);
-                steps.spawn(async move {
-                    tasks
-                        .run(move || {
-                            let now = running.fetch_add(1, Ordering::AcqRel) + 1;
-                            peak.fetch_max(now, Ordering::AcqRel);
-                            // A healthy step: short, well inside 2 s.
-                            std::thread::sleep(Duration::from_millis(50));
-                            running.fetch_sub(1, Ordering::AcqRel);
-                            Ok(())
-                        })
-                        .await
-                });
+            let release = hold_every_slot(&tasks, (&running, &peak)).await;
+            let mut queued = Vec::new();
+            for _ in 0..BLOB_TASKS {
+                let (running, peak) = (Arc::clone(&running), Arc::clone(&peak));
+                let mut step = Box::pin(tasks.run(move || {
+                    let now = running.fetch_add(1, Ordering::AcqRel) + 1;
+                    peak.fetch_max(now, Ordering::AcqRel);
+                    running.fetch_sub(1, Ordering::AcqRel);
+                    Ok(())
+                }));
+                assert!(
+                    pending(step.as_mut()).await,
+                    "a step past the cap was answered"
+                );
+                queued.push(step);
             }
-            while let Some(step) = steps.join_next().await {
-                let step = step.expect("joined");
+            drop(release);
+            for step in queued {
+                let step = step.await;
                 assert!(step.is_ok(), "a healthy step failed: {step:?}");
             }
         });
         let peak = peak.load(Ordering::Acquire);
         assert!(peak <= BLOB_TASKS, "{peak} steps ran at once");
-        assert_eq!(tasks.drain(Duration::from_secs(10)), 0);
+        every_slot_free(&tasks);
     }
 
     /// Design §10.4: a character split across chunks carries over; an
