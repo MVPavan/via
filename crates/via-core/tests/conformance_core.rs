@@ -4184,7 +4184,8 @@ fn core_codex_p7_status() {
 /// wall (`t_o < t_s + W`), the terminal retained before it (`t_ack < t_s +
 /// W`), and `t_c + W < t_s + 60 s`. The turn settles `cancelled`,
 /// acknowledged, `uncertain` with `cancel_cleanup_uncertain`; the
-/// successor is submitted only after that settlement.
+/// successor is submitted only after that settlement and carries
+/// `predecessor_cleanup_uncertain` (C1 §7.3).
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn core_codex_p7_uncertain_successor() {
@@ -4240,8 +4241,10 @@ fn core_codex_p7_uncertain_successor() {
         let second = daemon.wait(&session, 2).await;
         assert_eq!(second["state"], "completed", "{second}");
         dispatched_after(&first, &second);
-        // Core emits no `predecessor_cleanup_uncertain` yet (C1 §3.5 P7
-        // "may"; a pre-existing gap, reported with x.3.2 X4).
+        assert!(
+            warning_codes(&second).contains(&"predecessor_cleanup_uncertain"),
+            "{second}"
+        );
         daemon.close(&session).await;
         daemon.shutdown().await;
     });

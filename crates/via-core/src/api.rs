@@ -1679,6 +1679,13 @@ impl Warning {
         "process group cleanup after cancellation is unconfirmed",
     );
 
+    /// C1 §7.3, §3.5 P7: the turn was dispatched behind a predecessor whose
+    /// cancel cleanup settled `uncertain`.
+    pub(crate) const PREDECESSOR_CLEANUP_UNCERTAIN: Self = Self::new(
+        "predecessor_cleanup_uncertain",
+        "cleanup of the session's previous process group is unconfirmed",
+    );
+
     /// C1 §5: a turn with an `output_schema` ended with no structured output.
     pub(crate) const STRUCTURED_OUTPUT_MISSING: Self = Self::new(
         "structured_output_missing",
@@ -1736,7 +1743,7 @@ impl Warning {
             ),
             "predecessor_cleanup_uncertain" => (
                 "predecessor_cleanup_uncertain",
-                "cleanup of the session's previous process group is unconfirmed",
+                Self::PREDECESSOR_CLEANUP_UNCERTAIN.message,
             ),
             "config_switch_unverified" => (
                 "config_switch_unverified",

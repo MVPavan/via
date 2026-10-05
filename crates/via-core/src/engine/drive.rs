@@ -67,6 +67,9 @@ pub(super) struct Submission {
     inherit: InheritPlan,
     submitted: SystemTime,
     clock: Instant,
+    /// C1 §7.3: dispatched behind a predecessor whose cancel cleanup
+    /// settled `uncertain`; set by the dispatch that decided it.
+    predecessor_uncertain: bool,
 }
 
 /// Why a granted turn's submission did not commit.
@@ -87,7 +90,11 @@ pub(super) enum SubmitFailure {
 
 /// A queued turn's dispatch decision from its predecessors' durable state.
 enum Decision {
-    Run,
+    /// Dispatch; `uncertain`: the latest submitted predecessor's cancel
+    /// cleanup settled `uncertain` (C1 §7.3).
+    Run {
+        uncertain: bool,
+    },
     Cancel,
     /// Not yet: an earlier turn is unresolved or its cleanup pending.
     Wait,
@@ -310,7 +317,9 @@ impl Engine {
                     continue;
                 }
                 Front::Turn(turn, Claim::Waiting) => match self.decide(&session, turn).await {
-                    Decision::Run => self.dispatch(&slot, &session, turn).await,
+                    Decision::Run { uncertain } => {
+                        self.dispatch(&slot, (&session, turn), uncertain).await
+                    }
                     Decision::Cancel if slot.own(turn) => {
                         self.dispatcher_cancel(&slot, &session, turn).await
                     }
@@ -446,8 +455,14 @@ impl Engine {
     /// lane opens one before admission from the head turn's frozen values
     /// (x.3.2 X0 item 0, C2 §3 connection admission: no vendor I/O), so
     /// its driver can answer `prepare()`; a lane so opened for a turn that
-    /// is then not submitted is retired before this returns.
-    async fn dispatch(&self, slot: &Arc<Slot>, session: &SessionId, turn: TurnNumber) -> Step {
+    /// is then not submitted is retired before this returns. `uncertain`:
+    /// the predecessor's cleanup settled `uncertain` ([`Decision::Run`]).
+    async fn dispatch(
+        &self,
+        slot: &Arc<Slot>,
+        (session, turn): (&SessionId, TurnNumber),
+        uncertain: bool,
+    ) -> Step {
         let (claim, read) = if let Some(claim) = self.claim_lane(session).await {
             (Ok(claim), None)
         } else {
@@ -465,7 +480,9 @@ impl Engine {
             (Ok(claim), Some(_)) => Some(Arc::clone(claim.lane())),
             (Ok(_) | Err(_), _) => None,
         };
-        let (step, submitted) = self.admit(slot, (session, turn), claim, read).await;
+        let (step, submitted) = self
+            .admit(slot, (session, turn), (claim, read), uncertain)
+            .await;
         if let Some(lane) = opened
             && !submitted
         {
@@ -515,8 +532,11 @@ impl Engine {
         &self,
         slot: &Arc<Slot>,
         (session, turn): (&SessionId, TurnNumber),
-        claim: Result<LaneClaim, tokio::sync::OwnedSemaphorePermit>,
-        read: Option<QueuedRead>,
+        (claim, read): (
+            Result<LaneClaim, tokio::sync::OwnedSemaphorePermit>,
+            Option<QueuedRead>,
+        ),
+        uncertain: bool,
     ) -> (Step, bool) {
         // AD16: a pinned live connection of the session's driver needs no
         // slot; a session without a usable driver needs one. Otherwise
@@ -576,7 +596,7 @@ impl Engine {
         // happened yet; bounded shutdown reports the turn unresolved, and
         // restart recovery settles it. It is a limit before the actor owns
         // the turn, not a cancellation guarantee.
-        let submission = match self.submit(slot, (session, turn), read).await {
+        let mut submission = match self.submit(slot, (session, turn), read).await {
             Ok(submission) => submission,
             Err(failure) => {
                 let step = self
@@ -585,6 +605,7 @@ impl Engine {
                 return (step, false);
             }
         };
+        submission.predecessor_uncertain = uncertain;
         #[cfg(test)]
         self.hold(&self.faults.hold_after_submit).await;
         // C2 §2: the session's driver, opened before admission, or here
@@ -915,7 +936,11 @@ impl Engine {
             }
             // P6: behind an `unknown` predecessor the queue is cancelled.
             Some(facts) if facts.state == "unknown" => Decision::Cancel,
-            _ => Decision::Run,
+            facts => Decision::Run {
+                uncertain: facts
+                    .and_then(|facts| facts.cancel)
+                    .is_some_and(|cancel| cancel.cleanup == "uncertain"),
+            },
         }
     }
 
@@ -987,6 +1012,7 @@ impl Engine {
             effective,
             submitted,
             clock,
+            predecessor_uncertain: uncertain,
             ..
         } = submission;
         let started = self.started((&session, turn), (queued, &effective), (submitted, clock));
@@ -994,9 +1020,7 @@ impl Engine {
         let origin = tokio::time::Instant::from_std(clock);
         let (deadline, deadline_at) = wall_deadline(&effective, origin, submitted);
         let (mut record, activity, (route_stop, orders)) =
-            start_turn(slot, &session, turn, deadline.instant());
-        // AD12: the adapter that runs the turn, the envelope's version.
-        record.vendor.adapter_version = lane.driver.adapter_version();
+            start_turn(slot, (&session, turn), deadline.instant(), lane, uncertain);
         let mut control = Control {
             slot,
             turn,
@@ -2810,6 +2834,7 @@ impl Engine {
             inherit,
             submitted,
             clock,
+            predecessor_uncertain: false,
         })
     }
 
@@ -3350,18 +3375,30 @@ const fn denial_kind(kind: DenialKind) -> &'static str {
 
 /// A submitted turn's record, its activity clock and its `Running` entry
 /// (Task 4 design §2.4): the published progress and the activity clock
-/// share the step tracker's clock.
+/// share the step tracker's clock. The record's envelope facts known at
+/// dispatch: the version of the adapter that runs the turn on `lane`
+/// (AD12), and, behind a predecessor whose cleanup settled `uncertain`
+/// (`predecessor_uncertain`), `predecessor_cleanup_uncertain` (C1 §7.3),
+/// on whichever path its envelope is assembled.
 fn start_turn(
     slot: &Slot,
-    session: &SessionId,
-    turn: TurnNumber,
+    (session, turn): (&SessionId, TurnNumber),
     wall: tokio::time::Instant,
+    lane: &Lane,
+    predecessor_uncertain: bool,
 ) -> (
     TurnRecord,
     TurnActivity,
     (StopWatch, watch::Receiver<Option<StopOrder>>),
 ) {
-    let record = new_record(slot, session, turn);
+    let mut record = new_record(slot, session, turn);
+    record.vendor.adapter_version = lane.driver.adapter_version();
+    if predecessor_uncertain {
+        record
+            .vendor
+            .warnings
+            .push(Warning::PREDECESSOR_CLEANUP_UNCERTAIN);
+    }
     let clock = record.steps.clock();
     let activity = TurnActivity::new(clock.base());
     let running = slot.start_running(

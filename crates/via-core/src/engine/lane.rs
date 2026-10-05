@@ -1519,7 +1519,8 @@ pub(super) struct VendorRecord {
     /// Declines the turn committed as `vendor.request_declined`.
     pub(super) declined: Kept<AutoDeclined>,
     /// The turn's own committed adapter warnings of C1 §5's closed list,
-    /// one per code, as its envelope's ([`Warning::adapter`]).
+    /// one per code, as its envelope's ([`Warning::adapter`]); and Core's
+    /// `predecessor_cleanup_uncertain`, set at dispatch (C1 §7.3).
     pub(super) warnings: Vec<Warning>,
     /// The handshake version of the instance that ran the turn, and
     /// whether the adapter checked it (AD7).
