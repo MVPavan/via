@@ -442,8 +442,8 @@ The head is written as it arrives; the tail waits in the anchor's bounded
 ring, and the bytes between are discarded. The anchor always drains the
 pipe into memory, discarding past the cap, and a separate thread writes the
 file, so the vendor never blocks on stderr, even when the file's writes
-stall; the log's allocations stay within the head and the tail (and a
-64 KiB read buffer). When
+stall; the log's buffers stay within twice the head plus the tail (9 MiB
+per turn, 24 MiB per server), plus a 64 KiB read buffer. When
 bytes were dropped, one marker line `[via: <n> bytes of vendor stderr
 dropped]`, on its own line, precedes the tail; the tail is written when the
 vendor group ends (the pipe's EOF, or in the last 20 ms of the cleanup

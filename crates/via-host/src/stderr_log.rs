@@ -50,9 +50,12 @@ pub(crate) fn marker(dropped: u64) -> String {
 }
 
 /// One vendor's capped stderr, in memory: the head bytes queued for the
-/// file and the tail's ring. Allocations stay within the head and the
-/// tail: the queue grows at most to the head bytes it can still take, and
-/// the ring, allocated once at the tail's bound, is written in place.
+/// file and the tail's ring. Its buffers stay within twice the head plus
+/// the tail: the queue grows by doubling, to at most twice its length and
+/// never past the head bytes it can still take, so the batch the writer
+/// holds and the queue after it stay within twice the head, a reallocation
+/// included; the ring, allocated once at the tail's bound, is written in
+/// place, never copied.
 struct Capped {
     cap: StderrCap,
     /// Head bytes taken so far, queued or written.
@@ -378,20 +381,31 @@ mod tests {
         );
     }
 
-    /// Fix round 2: past both bounds, with nothing yet written, the log's
-    /// allocations stay within the head, the marker and the tail: the
-    /// queue's growth stops at the head, and the finish copies no tail.
+    /// Fix rounds 2 and 3 (runtime §4): the writer takes a queue just past
+    /// half the head, whose capacity doubled to the whole head, and stalls
+    /// holding it; the drain then fills the rest of the head and the tail.
+    /// The buffers reach past head + tail, the case the bound must cover,
+    /// and stay within twice the head plus the tail.
     #[test]
-    fn allocations_stay_within_head_and_tail() {
+    fn allocations_stay_within_twice_the_head_plus_the_tail() {
         for cap in [StderrCap::TURN, StderrCap::SERVER] {
             let mut capped = Capped::new(cap);
             let chunk = vec![b'x'; 64 * 1024];
-            for _ in 0..(2 * (cap.head + cap.tail) / chunk.len() as u64) {
+            let chunks = |bytes: u64| bytes / chunk.len() as u64;
+            for _ in 0..=chunks(cap.head / 2) {
+                capped.write(&chunk);
+            }
+            let held = capped.take_queued();
+            for _ in 0..chunks(2 * (cap.head + cap.tail)) {
                 capped.write(&chunk);
             }
             capped.finish();
-            let bound = cap.head + cap.tail + marker(u64::MAX).len() as u64;
-            let allocated = capped.allocated();
+            let allocated = held.capacity() as u64 + capped.allocated();
+            let bound = 2 * cap.head + cap.tail;
+            assert!(
+                allocated > cap.head + cap.tail,
+                "{cap:?}: {allocated} bytes allocated, not past head + tail"
+            );
             assert!(
                 allocated <= bound,
                 "{cap:?}: {allocated} bytes allocated, over {bound}"

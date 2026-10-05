@@ -316,7 +316,8 @@ async fn kill_own_group(kill_at: Instant, stderr: Option<&StderrLog>) {
 /// threads drain the read end and write it into `stderr.log`, the anchor's
 /// inherited stderr, which it keeps through a close-on-exec duplicate. The
 /// drain always reads, never waiting on the file, so the vendor never
-/// blocks on stderr; at most the cap's head and tail are held in memory.
+/// blocks on stderr; its buffers stay within twice the cap's head plus its
+/// tail.
 /// The threads end with the anchor's process.
 fn stderr_drain(cap: StderrCap) -> io::Result<(io::PipeWriter, std::sync::Arc<StderrLog>)> {
     use std::os::fd::AsFd;
