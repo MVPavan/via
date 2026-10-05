@@ -174,13 +174,17 @@ impl LeaseSignal {
     pub(super) fn signal(&self) {
         (self.on_abnormal)(AbnormalEnd {
             first_unqueued: self.enqueued().saturating_add(1),
+            owner: None,
         });
     }
 
-    pub(super) fn overflowed(&self) {
+    /// A lane of the lease dropped an item after it overflowed; `owner` is
+    /// the VIA turn the dropped item was routed under, when known.
+    pub(super) fn overflowed(&self, owner: Option<TurnNumber>) {
         if let Some(on_overflow) = &self.on_overflow {
             on_overflow(AbnormalEnd {
                 first_unqueued: self.enqueued().saturating_add(1),
+                owner,
             });
         }
     }
@@ -192,6 +196,11 @@ pub struct AbnormalEnd {
     /// The first decode sequence not queued into the lease's lanes: no
     /// earlier message of the lease was lost with the task.
     pub first_unqueued: u64,
+    /// A lane overflow only: the VIA turn the dropped item was routed
+    /// under (a message's mapped owner at routing, or a `turn/start`
+    /// reply's turn), with no decode; `None` for a message naming no
+    /// mapped turn and for a connection's abnormal end.
+    pub owner: Option<TurnNumber>,
 }
 
 /// Why a whole connection failed, as its sessions report it (item 13.1).

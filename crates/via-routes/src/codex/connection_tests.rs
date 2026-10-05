@@ -544,12 +544,16 @@ async fn abnormal_end_reaches_every_lease() {
     assert_eq!(
         *signalled.lock().unwrap(),
         vec![AbnormalEnd {
-            first_unqueued: enqueued + 1
+            first_unqueued: enqueued + 1,
+            owner: None,
         }]
     );
     assert_eq!(
         *idle.lock().unwrap(),
-        vec![AbnormalEnd { first_unqueued: 1 }]
+        vec![AbnormalEnd {
+            first_unqueued: 1,
+            owner: None,
+        }]
     );
     assert!(matches!(
         vendor.connection.ended(),

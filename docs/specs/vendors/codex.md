@@ -382,7 +382,11 @@ for the 10-second C2 observation-stall timer. Latch the driver's sticky
 turn correlation, first unqueued message's sequence and saturating omitted
 count form the driver's `ObservationLoss`, which goes to connection
 diagnostics and to Core with every affected turn's result. The triggering
-turn identifies lost evidence, not the entire failure target.
+turn identifies lost evidence, not the entire failure target: it is the VIA
+turn the first dropped lane item was routed under (the connection's mapping
+of its `turnId` at routing, no decode), so an old turn's late messages name
+that turn on its successor's warning; thread-level traffic, which names no
+turn, and the other loss sources name the session's latest turn.
 
 The driver ends **every nonterminal turn whose submission belongs to
 that quarantined thread generation**, including a successor A2 when an

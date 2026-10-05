@@ -1151,14 +1151,20 @@ fn abnormal_handler_latches_and_records_loss() {
         Arc::clone(&registered),
         2,
     );
-    handler(AbnormalEnd { first_unqueued: 9 });
+    handler(AbnormalEnd {
+        first_unqueued: 9,
+        owner: None,
+    });
     assert_eq!(
         *health.borrow(),
         DriverHealth::Failed {
             first_cause: DriverFailure::OwnedTask
         }
     );
-    handler(AbnormalEnd { first_unqueued: 12 });
+    handler(AbnormalEnd {
+        first_unqueued: 12,
+        owner: None,
+    });
     assert_eq!(
         losses.lock().unwrap().record,
         Some(ObservationLoss {
@@ -1178,6 +1184,7 @@ fn abnormal_handler_latches_and_records_loss() {
     registered.store(false, Ordering::Release);
     abnormal_handler(Arc::clone(&bare), Arc::clone(&idle), registered, 2)(AbnormalEnd {
         first_unqueued: 1,
+        owner: None,
     });
     assert!(bare.lock().unwrap().record.is_none());
     assert!(matches!(*idle.borrow(), DriverHealth::Failed { .. }));
@@ -1207,8 +1214,14 @@ fn overflow_handler_latches_at_once() {
     }));
     let health = Arc::new(tokio::sync::watch::Sender::new(DriverHealth::Open));
     let handler = overflow_handler(Arc::clone(&losses), Arc::clone(&health), 5);
-    handler(AbnormalEnd { first_unqueued: 17 });
-    handler(AbnormalEnd { first_unqueued: 17 });
+    handler(AbnormalEnd {
+        first_unqueued: 17,
+        owner: None,
+    });
+    handler(AbnormalEnd {
+        first_unqueued: 17,
+        owner: None,
+    });
     assert_eq!(
         *health.borrow(),
         DriverHealth::Failed {
@@ -1221,6 +1234,54 @@ fn overflow_handler_latches_at_once() {
             trigger: turn,
             generation: 5,
             first_unqueued: 17,
+            omitted: UNKNOWN,
+        })
+    );
+}
+
+/// Critical review x5: a dropped item routed under an earlier turn (a
+/// predecessor's late message) names that turn as the record's trigger;
+/// the driver still fails the latest turn `overflow`, and a later drop
+/// keeps the trigger.
+#[test]
+fn overflow_handler_names_the_dropped_items_turn() {
+    use std::sync::{Arc, Mutex};
+
+    use via_routes::codex::AbnormalEnd;
+
+    use super::delivery::{Losses, UNKNOWN};
+    use super::driver::overflow_handler;
+    use crate::ObservationLoss;
+    use crate::{DriverFailure, DriverHealth, RouteError, TurnNumber};
+
+    let earlier = TurnNumber::try_from(1).unwrap();
+    let latest = TurnNumber::try_from(2).unwrap();
+    let losses = Arc::new(Mutex::new(Losses {
+        latest: Some(latest),
+        ..Losses::default()
+    }));
+    let health = Arc::new(tokio::sync::watch::Sender::new(DriverHealth::Open));
+    let handler = overflow_handler(Arc::clone(&losses), Arc::clone(&health), 1);
+    handler(AbnormalEnd {
+        first_unqueued: 44,
+        owner: Some(earlier),
+    });
+    handler(AbnormalEnd {
+        first_unqueued: 45,
+        owner: Some(latest),
+    });
+    assert_eq!(
+        *health.borrow(),
+        DriverHealth::Failed {
+            first_cause: DriverFailure::Route(RouteError::Overflow { turn: latest })
+        }
+    );
+    assert_eq!(
+        losses.lock().unwrap().record,
+        Some(ObservationLoss {
+            trigger: earlier,
+            generation: 1,
+            first_unqueued: 44,
             omitted: UNKNOWN,
         })
     );

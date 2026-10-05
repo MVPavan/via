@@ -1046,7 +1046,7 @@ impl Connection {
                 && lane.overflowed_now()
                 && let Some(signal) = signal
             {
-                signal.overflowed();
+                signal.overflowed(Some(turn));
             }
         }
         if let Some((thread, turn, by)) = interrupt {
@@ -1354,6 +1354,7 @@ impl Connection {
 /// one an overflowed lane dropped reaches the lease's driver at once
 /// (x.3.2 X3 fix r2 #1).
 fn push(lane: &Lane, signal: Option<&Arc<LeaseSignal>>, item: LaneItem, bytes: usize, seq: u64) {
+    let owner = item.routed().and_then(|routed| routed.owner);
     let taken = lane.push(item, bytes);
     let Some(signal) = signal else {
         return;
@@ -1361,7 +1362,7 @@ fn push(lane: &Lane, signal: Option<&Arc<LeaseSignal>>, item: LaneItem, bytes: u
     if taken {
         signal.queued(seq);
     } else if lane.overflowed_now() {
-        signal.overflowed();
+        signal.overflowed(owner);
     }
 }
 

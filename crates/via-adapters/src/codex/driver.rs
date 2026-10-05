@@ -445,7 +445,15 @@ pub(super) fn overflow_handler(
     move |end: AbnormalEnd| {
         let latest = {
             let mut losses = lock_losses(&losses);
-            losses.note(generation, end.first_unqueued, UNKNOWN);
+            // A new record names the turn the dropped item was routed
+            // under, a predecessor's late message included (critical
+            // review x5); else the session's latest turn.
+            match end.owner {
+                Some(owner) => {
+                    losses.note_turn(owner, generation, end.first_unqueued, UNKNOWN);
+                }
+                None => losses.note(generation, end.first_unqueued, UNKNOWN),
+            }
             losses.latest
         };
         latch(

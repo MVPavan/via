@@ -4311,12 +4311,20 @@ const C1_GATE: usize = 26;
 
 /// `c1_commentary_usage`'s copy for `codex_bounds_overflow` (steps
 /// one-based): turn 1 whole, with its gate ([`C1_GATE`]); turn 2 through
-/// its `turn/started` (step 33), then a second gate (step 34), the user
-/// message's `item/started`, twenty thread status messages and the
-/// generation's cleanup interrupt of turn 2, due within 2 s; then the
-/// server's stdin close.
+/// its `turn/started` (step 33), then gate `held`, the user message's
+/// `item/started` (`X`), gate `burst`, twenty copies of `burst_line`,
+/// gate `after`, and the generation's cleanup interrupt of turn 2, due
+/// within 2 s; then the server's stdin close.
 #[cfg(feature = "test-failpoints")]
-fn overflow_copy() -> (Value, usize) {
+struct OverflowCopy {
+    replay: Value,
+    held: usize,
+    burst: usize,
+    after: usize,
+}
+
+#[cfg(feature = "test-failpoints")]
+fn overflow_copy(burst_line: &str) -> OverflowCopy {
     let mut replay = core_codex::replay("c1_commentary_usage");
     let original = replay["steps"].as_array().unwrap().clone();
     assert!(
@@ -4329,15 +4337,17 @@ fn overflow_copy() -> (Value, usize) {
         line.contains("\"turn/started\""),
         "step 33 is turn 2's start: {line}"
     );
-    let gate = steps.len() + 1;
-    steps.push(json!({"await_signal":{"signal":"SIGUSR1"}}));
+    let gate = |steps: &mut Vec<Value>| {
+        steps.push(json!({"await_signal":{"signal":"SIGUSR1"}}));
+        steps.len()
+    };
+    let held = gate(&mut steps);
     steps.push(original[33].clone());
-    let status = json!({"method": "thread/status/changed",
-        "params": {"threadId": "019a0000-0000-7000-8000-000000100001",
-                   "status": {"type": "active", "activeFlags": []}}});
+    let burst = gate(&mut steps);
     for _ in 0..20 {
-        steps.push(json!({"emit":{"line":status.to_string()}}));
+        steps.push(json!({"emit":{"line":burst_line}}));
     }
+    let after = gate(&mut steps);
     steps.push(
         json!({"expect":{"line":{"method":"turn/interrupt","params":{
         "threadId":"019a0000-0000-7000-8000-000000100001",
@@ -4346,17 +4356,99 @@ fn overflow_copy() -> (Value, usize) {
     steps.push(json!({"await_eof":{}}));
     replay["steps"] = Value::Array(steps);
     replay["deadline_ms"] = json!(60_000);
-    (replay, gate)
+    OverflowCopy {
+        replay,
+        held,
+        burst,
+        after,
+    }
 }
 
-/// x.3.2 X5, X0 item 10 as the owner simplified it (2026-10-05;
-/// `codex_bounds_overflow`): turn 1 completes untouched. Once turn 2
-/// started, its consumer is held at every take (`adapter.codex.consumer_take`,
-/// 3 s each) while twenty thread messages arrive, so the thread's lane
-/// overflows and turn 2 fails `overflow`. Turn 2's envelope carries
-/// exactly one `observations_lost` warning naming it as the trigger, in
-/// generation 1, with an unknown count (`omitted: null`); turn 1's, the
-/// unaffected turn, carries none.
+/// Waits until `point`'s counted hits stop changing; returns them.
+#[cfg(feature = "test-failpoints")]
+async fn settled_hits(root: &Path, point: &str) -> u64 {
+    let mut seen = hits(root, point);
+    loop {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let now = hits(root, point);
+        if now == seen {
+            return seen;
+        }
+        seen = now;
+    }
+}
+
+/// `codex_bounds_overflow` (x.3.2 X5, X0 item 10 as the owner simplified
+/// it): turn 1 completes; turn 2 starts; its consumer is paused at its
+/// take of the user message's `item/started` while twenty `burst_line`s
+/// arrive, so the thread's lane drops the seventeenth and turn 2 fails
+/// `overflow`. Turn 2's envelope carries exactly one `observations_lost`
+/// warning, of generation 1, with an unknown count (`omitted: null`) and
+/// `first_unqueued` 1: the record merges by the earliest position (X0
+/// item 10), and the generation's quarantine notes its registration's
+/// seal, whose idle delivery took no message, so position 1 (the lane's
+/// own note is the first dropped line's decode sequence, 44, and the
+/// turn's settlement notes 27). Turn 1's envelope, the unaffected turn's,
+/// carries none and is unchanged. Returns the session and the warning's
+/// data.
+#[cfg(feature = "test-failpoints")]
+async fn lane_overflow(root: &Path, name: &str, burst_line: &str) -> (SessionId, Value) {
+    let copy = overflow_copy(burst_line);
+    let case = codex_case(root, name, copy.replay);
+    count_hits(&root.join("points"), TAKE);
+    let daemon = Daemon::open_with(root, case.config());
+    let session = daemon.spawn(C1_PROMPT, &codex_spawn(&case, 60_000)).await;
+    let launch = case.at(C1_GATE).await;
+    case.signal(launch);
+    let first = daemon.wait(&session, 1).await;
+    assert_eq!(first["state"], "completed", "{first}");
+    assert!(
+        !warning_codes(&first).contains(&"observations_lost"),
+        "{first}"
+    );
+    daemon.resume(&session, SUCCESSOR).await;
+    assert_eq!(case.at(copy.held).await, launch);
+    // Everything before the gate was taken: the next take is `X`'s.
+    let take = settled_hits(root, TAKE).await + 1;
+    arm_at(root, TAKE, take, "pause");
+    case.signal(launch);
+    until_acked(root, TAKE, take).await;
+    assert_eq!(case.at(copy.burst).await, launch);
+    case.signal(launch);
+    assert_eq!(case.at(copy.after).await, launch);
+    // The burst is routed before the consumer goes on.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    release_point(root, TAKE, take);
+    case.signal(launch);
+    let second = daemon.wait(&session, 2).await;
+    assert_eq!(second["state"], "failed", "{second}");
+    assert_eq!(class(&second), "overflow", "{second}");
+    let lost: Vec<&Value> = second["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|warning| warning["code"] == "observations_lost")
+        .collect();
+    assert_eq!(lost.len(), 1, "{second}");
+    let data = lost[0]["data"].clone();
+    assert_eq!(data["generation"], 1, "{second}");
+    assert_eq!(data["first_unqueued"], 1, "{second}");
+    assert_eq!(data["omitted"], Value::Null, "{second}");
+    assert_eq!(
+        data.as_object().map(serde_json::Map::len),
+        Some(4),
+        "{second}"
+    );
+    assert!(lost[0]["message"].is_string(), "{second}");
+    // The first turn's committed envelope is unchanged.
+    assert_eq!(daemon.wait(&session, 1).await, first);
+    daemon.close(&session).await;
+    daemon.shutdown().await;
+    (session, data)
+}
+
+/// The lost lines are turn 2's own thread traffic (thread status lines,
+/// which name no turn): the warning names turn 2.
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn codex_bounds_overflow_warns_the_affected_turn() {
@@ -4365,56 +4457,35 @@ fn codex_bounds_overflow_warns_the_affected_turn() {
         return;
     };
     via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
-    let (replay, gate) = overflow_copy();
-    let case = codex_case(&root, NAME, replay);
-    run(async {
-        let daemon = Daemon::open_with(&root, case.config());
-        let session = daemon.spawn(C1_PROMPT, &codex_spawn(&case, 60_000)).await;
-        let launch = case.at(C1_GATE).await;
-        case.signal(launch);
-        let first = daemon.wait(&session, 1).await;
-        assert_eq!(first["state"], "completed", "{first}");
-        assert!(
-            !warning_codes(&first).contains(&"observations_lost"),
-            "{first}"
-        );
-        daemon.resume(&session, SUCCESSOR).await;
-        assert_eq!(case.at(gate).await, launch);
-        let command = json!({"token":"conformance-core","occurrence":1,
-                             "action":"delay","value":3_000,"persist":true});
-        fs::write(
-            root.join("points").join("adapter.codex.consumer_take.json"),
-            command.to_string(),
-        )
-        .unwrap();
-        case.signal(launch);
-        let second = daemon.wait(&session, 2).await;
-        fs::remove_file(root.join("points").join("adapter.codex.consumer_take.json")).unwrap();
-        assert_eq!(second["state"], "failed", "{second}");
-        assert_eq!(class(&second), "overflow", "{second}");
-        let lost: Vec<&Value> = second["warnings"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|warning| warning["code"] == "observations_lost")
-            .collect();
-        assert_eq!(lost.len(), 1, "{second}");
-        let data = &lost[0]["data"];
-        assert_eq!(data["trigger_turn"], format!("{session}/2"), "{second}");
-        assert_eq!(data["generation"], 1, "{second}");
-        assert!(data["first_unqueued"].is_u64(), "{second}");
-        assert_eq!(data["omitted"], Value::Null, "{second}");
-        assert_eq!(
-            data.as_object().map(serde_json::Map::len),
-            Some(4),
-            "{second}"
-        );
-        assert!(lost[0]["message"].is_string(), "{second}");
-        // The first turn's committed envelope is unchanged.
-        assert_eq!(daemon.wait(&session, 1).await, first);
-        daemon.close(&session).await;
-        daemon.shutdown().await;
-    });
+    let status = json!({"method": "thread/status/changed",
+        "params": {"threadId": "019a0000-0000-7000-8000-000000100001",
+                   "status": {"type": "active", "activeFlags": []}}});
+    let (session, data) = run(lane_overflow(&root, NAME, &status.to_string()));
+    assert_eq!(data["trigger_turn"], format!("{session}/2"), "{data}");
+}
+
+/// Critical review x5 (successor): the lost lines are turn 1's late
+/// messages (its `thread/tokenUsage/updated`, naming turn 1's vendor
+/// turn), arriving while its successor runs. Turn 2 keeps the warning,
+/// whose `trigger_turn` names turn 1: the turn the first dropped line was
+/// mapped to.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn codex_bounds_overflow_names_the_predecessor_whose_lines_were_lost() {
+    const NAME: &str = "codex_bounds_overflow_names_the_predecessor_whose_lines_were_lost";
+    let Some(root) = child(NAME, &no_fake(), &[]) else {
+        return;
+    };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    let original = core_codex::replay("c1_commentary_usage")["steps"][26].clone();
+    let late = original["emit"]["line"].as_str().unwrap().to_owned();
+    assert!(
+        late.contains("\"thread/tokenUsage/updated\"")
+            && late.contains("019a0000-0000-7000-8000-000000200001"),
+        "step 27 is turn 1's usage: {late}"
+    );
+    let (session, data) = run(lane_overflow(&root, NAME, &late));
+    assert_eq!(data["trigger_turn"], format!("{session}/1"), "{data}");
 }
 
 /// x.3.2 X5 (via-5lr.6): Codex's admission cap on the JSON-encoded prompt

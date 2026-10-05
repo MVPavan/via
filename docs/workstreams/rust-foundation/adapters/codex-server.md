@@ -1338,6 +1338,14 @@ built: the driver sets `TurnEnd.loss` on a turn when a loss was noted while
 that turn ran (`Losses::noted`, read as the turn starts), and Core adds the
 `observations_lost` warning to that turn's envelope
 (`Warning::observations_lost`, `crates/via-core/src/engine/drive.rs`).
+The record's trigger (critical review x5) is the turn the first dropped
+lane item was routed under: `AbnormalEnd.owner`, the item's mapped owner
+at routing (or a `turn/start` reply's turn), with no decode. A
+predecessor's late messages lost while its successor runs therefore name
+the predecessor on the successor's warning. Thread-level traffic and the
+other loss sources name the session's latest turn. `first_unqueued` stays
+the merged lower bound: a quarantine notes its registration's seal, which
+can floor it to 1.
 Dropped: the durable `late: true` warning event on an already terminal
 trigger turn, its `reported` dedupe flag, the separate `Engine::record_loss`
 helper, the lane actor's calls on every close outcome, and
