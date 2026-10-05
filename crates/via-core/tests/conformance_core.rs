@@ -4258,10 +4258,10 @@ fn core_codex_p7_uncertain_successor() {
 /// into the cancel's, keeping the cancel's cause (design §2), so the
 /// Codex driver cannot tell the close from the cancel while it drains and
 /// the turn waits out the 60 s grace. W3 covers only a close-caused order.
-/// Closing the gap needs a decision (a C2 close mark on `StopOrder`, or
-/// Core's coalescing rule); see the X4 hand-back.
+/// Accepted until measured (via-5lr.7): the wait is bounded by the grace,
+/// and close already waits for a running turn.
 #[test]
-#[ignore = "x.3.2 X4 K5 finding: a close coalesced into a cancel's order is invisible to the draining Codex turn"]
+#[ignore = "via-5lr.7: a close coalesced into a cancel's order waits out the P7 grace (accepted until measured)"]
 fn codex_control_races_close_vs_p7_window() {
     const NAME: &str = "codex_control_races_close_vs_p7_window";
     let Some(root) = child(NAME, &no_fake(), &[]) else {
