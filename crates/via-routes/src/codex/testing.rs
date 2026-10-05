@@ -228,6 +228,11 @@ impl Stdio for TestStdio {
         Box::pin(async {})
     }
 
+    /// Wire's own note: the route's evidence stays in memory.
+    fn take_undecoded(&self) -> Option<String> {
+        self.input.take_undecoded()
+    }
+
     fn link_turn<'a>(
         &'a self,
         _session: &'a SessionId,

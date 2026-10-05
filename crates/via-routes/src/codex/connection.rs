@@ -1401,6 +1401,21 @@ fn disposition(cause: ConnectionFailure, report: &WireCloseReport) -> Connection
     }
 }
 
+/// The daemon-level `via.log` line for a failed shared connection
+/// (codex-server.md item 5; runtime §6.2): the server ID, the cause and
+/// the note naming the server folder's `undecoded.bin`, or why it was not
+/// saved. Only VIA's own text: never a vendor byte. Read after the reader
+/// finished, so a save it began is noted.
+fn log_failure(connection: &Connection, cause: LossCause) {
+    let undecoded = connection.stdio.take_undecoded();
+    tracing::warn!(
+        server = %connection.server,
+        ?cause,
+        undecoded = undecoded.as_deref().unwrap_or("none"),
+        "shared server connection failed"
+    );
+}
+
 /// The cause a Wire error on the message side latches (item 13.1 table).
 fn wire_failure(error: &WireError) -> ConnectionFailure {
     match error {
@@ -1497,5 +1512,8 @@ pub(super) async fn serve(
     messages
         .finish(Deadline::at(Instant::now() + LOSS_EVIDENCE))
         .await;
+    if let ConnectionEnd::Failed(loss) = end {
+        log_failure(&connection, loss.cause);
+    }
     end
 }

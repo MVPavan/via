@@ -660,6 +660,62 @@ async fn correlation_failure_is_protocol_not_generation_local() {
     assert_eq!(serde_json::from_slice::<Value>(&kept[0]).unwrap(), untied);
 }
 
+/// The formatted tracing events, as `via.log` would receive them.
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Item 5 step 2 and runtime §6.2 (bead via-f1q): a shared connection's
+/// failure is one daemon-level warning naming the server and the server
+/// folder's `undecoded.bin`, never a vendor byte. Here a line over the cap
+/// (live round 1's failure, before the cap was raised).
+#[tokio::test]
+async fn a_failed_connection_logs_its_server_and_evidence_path() {
+    let captured = Captured::default();
+    let sink = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || sink.clone())
+        .with_ansi(false)
+        .finish();
+    let _default = tracing::subscriber::set_default(subscriber);
+    let mut vendor = Vendor::open(1 << 16);
+    let server = vendor.connection.server().to_string();
+    let _lane = registered(&mut vendor, "t").await;
+    let mut line = vec![b'v'; INBOUND.message_bytes + 16];
+    line.push(b'\n');
+    vendor.emit_raw(&line).await;
+    let end = tokio::time::timeout(Duration::from_secs(10), &mut vendor.task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(end, ConnectionEnd::Failed(loss) if loss.cause == LossCause::Protocol));
+    let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines.len(), 1, "{log}");
+    assert!(lines[0].contains("WARN"), "{log}");
+    assert!(
+        lines[0].contains("shared server connection failed"),
+        "{log}"
+    );
+    assert!(lines[0].contains(&format!("server={server}")), "{log}");
+    assert!(lines[0].contains("cause=Protocol"), "{log}");
+    assert!(lines[0].contains("undecoded.bin"), "{log}");
+    assert!(
+        !lines[0].contains("vvvv"),
+        "vendor bytes in the line: {log}"
+    );
+}
+
 /// Item 5 step 3: a well-formed message for an unknown thread and an
 /// untagged one fail nothing; they are counted.
 #[tokio::test]

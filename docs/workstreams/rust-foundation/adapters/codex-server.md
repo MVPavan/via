@@ -924,7 +924,10 @@ Engine on the same State finds `vendor/codex` with the same identity, mode
       session through the owned failure sequence (item 13.1, cause
       `Protocol`); failure messages name the length and "the shared
       connection's evidence", no path (D4); `via.log` records the server
-      ID and path.
+      ID and path. As built (bead via-f1q): every failed connection, of
+      any cause, writes one `WARN` line, `shared server connection
+      failed`, with `server`, `cause` and `undecoded` (Wire's note naming
+      the file, why it was not saved, or `none`); never a vendor byte.
    3. **Diagnostics only** (no failure): a well-formed message for an
       unknown `threadId` (no registration, no tombstone); well-formed
       connection-scoped or untagged traffic (never given fabricated thread
