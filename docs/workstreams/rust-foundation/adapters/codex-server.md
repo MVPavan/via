@@ -1268,8 +1268,9 @@ reply; written once the reply brings the `turnId`);
   glibc `MALLOC_ARENA_MAX=2` as proxy. Report the absolute peak, the counts
   reached and the marginal RSS per active turn.
 - **What it qualifies:** at most 32 concurrent active turns on one
-  server. Four loaded servers is an **extrapolation** from the per-server
-  and per-turn costs, not measured. The 256-turn unresolved bound remains
+  server. Several loaded servers, up to the connection-slot count (runtime
+  §8, default 8 since bead via-oq3), are an **extrapolation** from the
+  per-server and per-turn costs, not measured. The 256-turn unresolved bound remains
   unmeasured for Codex (X0-Q1, ruled: no extra cap).
 - **As built (X5, fix r1).** `codex_rss_leases` (`crates/via-core/tests/conformance_core.rs`,
   `test-failpoints`, run alone by `.config/nextest.toml`, about 19 s) runs
