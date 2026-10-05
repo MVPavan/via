@@ -251,10 +251,14 @@ const AFFECTED_ADDRESSES: usize = 16;
 #[derive(Default)]
 pub(super) struct FailureRecord {
     latest: Option<LatestFailure>,
+    /// The first failure that latched, kept when later ones replace
+    /// `latest` (bead via-23b).
+    latched: Option<LatestFailure>,
     count: u64,
 }
 
-/// The latest failure's `store_failure` fields; no prompt, payload or handle.
+/// One failure's `store_failure` fields; no prompt, payload or handle.
+#[derive(Clone)]
 struct LatestFailure {
     kind: &'static str,
     scope: &'static str,
@@ -366,16 +370,14 @@ impl Engine {
     /// until the first failure, then the latest one with the count since
     /// daemon start. It carries no prompt, payload or handle.
     pub fn store_failure_status(&self) -> Option<Value> {
-        let record = lock(&self.signal.failures);
-        let latest = record.latest.as_ref()?;
-        let listed: Vec<&String> = latest.addresses.iter().take(AFFECTED_ADDRESSES).collect();
-        Some(json!({
-            "kind": latest.kind,
-            "scope": latest.scope,
-            "since": latest.since,
-            "count": record.count,
-            "affected": {"addresses": listed, "count": latest.addresses.len()},
-        }))
+        self.signal.failure_status(false)
+    }
+
+    /// The failure that latched (bead via-23b): the first recorded one
+    /// that latched, in [`Engine::store_failure_status`]'s shape, whatever
+    /// failed after it.
+    pub fn latched_failure(&self) -> Option<Value> {
+        self.signal.failure_status(true)
     }
 
     /// The latching failure's phase-one time (design §7.4 [r3.17]): final
@@ -566,7 +568,29 @@ impl Signal {
         };
         let mut record = lock(&self.failures);
         record.count = record.count.saturating_add(1);
+        if latches && record.latched.is_none() {
+            record.latched = Some(latest.clone());
+        }
         record.latest = Some(latest);
+    }
+
+    /// The latest failure, or the one that latched, with the count since
+    /// daemon start.
+    fn failure_status(&self, latched: bool) -> Option<Value> {
+        let record = lock(&self.failures);
+        let failure = if latched {
+            record.latched.as_ref()
+        } else {
+            record.latest.as_ref()
+        }?;
+        let listed: Vec<&String> = failure.addresses.iter().take(AFFECTED_ADDRESSES).collect();
+        Some(json!({
+            "kind": failure.kind,
+            "scope": failure.scope,
+            "since": failure.since,
+            "count": record.count,
+            "affected": {"addresses": listed, "count": failure.addresses.len()},
+        }))
     }
 
     /// Phase one of the latch: marks the failure pending and sends the force
@@ -603,7 +627,7 @@ impl Signal {
 mod tests {
     use std::time::Duration;
 
-    use super::Signal;
+    use super::{FailureScope, FailureSite, Signal, WriteOutcome};
 
     /// The force is one publication carrying its instant, so no observer can
     /// see "forced" without the instant Host's early stop is bounded by
@@ -629,5 +653,29 @@ mod tests {
         signal.raise_force();
         assert!(!watcher.has_changed().expect("sender alive"));
         assert_eq!(*watcher.borrow(), Some(first));
+    }
+
+    /// Bead via-23b: the latch's own failure is kept when a later one
+    /// replaces the latest, so `via.log` names what latched.
+    #[test]
+    fn the_latching_failure_outlives_later_ones() {
+        let signal = Signal::new();
+        assert!(!signal.report(
+            FailureSite::Receipt,
+            WriteOutcome::NotCommitted,
+            FailureScope::Request
+        ));
+        assert!(signal.failure_status(true).is_none(), "nothing latched yet");
+        assert!(signal.report(
+            FailureSite::Receipt,
+            WriteOutcome::Uncertain,
+            FailureScope::Request
+        ));
+        signal.read_corrupt();
+        let latest = signal.failure_status(false).unwrap();
+        let latched = signal.failure_status(true).unwrap();
+        assert_eq!(latest["kind"], "corrupt_store", "{latest}");
+        assert_eq!(latched["kind"], "commit_uncertain", "{latched}");
+        assert_eq!(latched["count"], 3, "{latched}");
     }
 }

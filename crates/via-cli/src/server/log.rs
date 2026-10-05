@@ -181,8 +181,9 @@ const PANIC_LINE: usize = 1024;
 /// default writes stderr, which can block on an undrained pipe before the
 /// unwind reaches an abort. The hook formats one JSON line, message and
 /// location, truncated to 1 KiB, in a stack buffer and writes it to the
-/// `via.log` file only, under `try_lock`: a held or poisoned log skips the
-/// line and a write error is ignored. It never panics and never waits.
+/// `via.log` file only, under `try_lock`, rotating it first past its limit
+/// as any line does: a held or poisoned log skips the line and a write
+/// error is ignored. It never panics and never waits.
 pub(super) fn panic_hook() {
     std::panic::set_hook(Box::new(|info| {
         let mut line = Bounded::default();
@@ -202,7 +203,8 @@ pub(super) fn panic_hook() {
         if let Ok(mut file) = LOG.file.try_lock()
             && let Some(file) = file.as_mut()
         {
-            let _ = file.file.write_all(line.bytes());
+            // The same length accounting and rotation as any line.
+            file.write(line.bytes());
         }
     }));
 }
@@ -391,6 +393,54 @@ mod tests {
             "child ended {:?}: {}",
             output.status,
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Names the panic rotation scenario's directory in its child.
+    const PANIC_ROTATE_CHILD: &str = "VIA_LOG_PANIC_ROTATE_CHILD";
+
+    /// Bead via-23b critical review: a caught panic's line goes through the
+    /// same length accounting and rotation as any other, so a log 10 bytes
+    /// short of the limit rotates before it. Runs in a child copy, since
+    /// the hook and the log are process-wide.
+    #[test]
+    fn panic_lines_rotate_like_any_other() {
+        if let Ok(dir) = std::env::var(PANIC_ROTATE_CHILD) {
+            let dir = Path::new(&dir);
+            let prefill = vec![b'a'; usize::try_from(super::ROTATE_BYTES).unwrap() - 10];
+            std::fs::write(dir.join("via.log"), &prefill).unwrap();
+            super::open(dir).unwrap();
+            super::serving();
+            super::panic_hook();
+            let _ = std::panic::catch_unwind(|| panic!("a caught panic"));
+            let rotated = std::fs::read(dir.join("via.log.1")).unwrap_or_default();
+            assert!(
+                rotated == prefill,
+                "via.log.1 holds {} bytes",
+                rotated.len()
+            );
+            let log = std::fs::read_to_string(dir.join("via.log")).unwrap();
+            assert!(log.contains("a caught panic"), "{log}");
+            std::process::exit(0);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "server::log::tests::panic_lines_rotate_like_any_other",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PANIC_ROTATE_CHILD, dir.path())
+            .output()
+            .unwrap();
+        // The child's own assertion goes through the hook: to `via.log`.
+        let log = std::fs::read(dir.path().join("via.log")).unwrap_or_default();
+        let tail = String::from_utf8_lossy(&log[log.len().saturating_sub(300)..]).into_owned();
+        assert!(
+            output.status.success(),
+            "child ended {:?}: {tail}",
+            output.status,
         );
     }
 

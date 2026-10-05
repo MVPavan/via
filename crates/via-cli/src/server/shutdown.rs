@@ -76,11 +76,15 @@ struct Pipeline {
     failed_joins: usize,
 }
 
-/// The Store-failed latch, a daemon-level error, in `via.log` with its
-/// kind and scope (bead via-23b): once, at final shutdown's entry, or
-/// after its pipeline when first raised there.
+/// The Store-failed latch, a daemon-level error, in `via.log` with the
+/// kind and scope of the failure that latched, not a later one (bead
+/// via-23b): once, at final shutdown's entry, or after its pipeline when
+/// first raised there.
 fn latch_logged(engine: &Engine) {
-    let failure = engine.store_failure_status().unwrap_or_default();
+    let failure = engine
+        .latched_failure()
+        .or_else(|| engine.store_failure_status())
+        .unwrap_or_default();
     tracing::error!(%failure, "store failure latched");
 }
 

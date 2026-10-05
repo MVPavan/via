@@ -971,11 +971,22 @@ fn s1_f03_unsafe_runtime_dir_refused() -> TestResult {
 /// only `via.log` gains the refusal's cause.
 #[test]
 fn s1_f11_newer_or_corrupt_store_refused_untouched() -> TestResult {
+    // Bead via-23b: neither ever reaches `via.log`.
+    const PROMPT: &str = "seed-prompt-sentinel-5d7e";
+    const OUTPUT: &str = "seed-output-sentinel-a913";
     evidenced(|| {
         for variant in ["newer", "corrupt"] {
-            let sandbox = Sandbox::new(&completes("seed", 1))?;
+            let sandbox = Sandbox::new(&script(
+                PROMPT,
+                1,
+                vec![
+                    accepted(1),
+                    json!({"action":"emit","message":{"type":"terminal","vendor_turn_id":"fake-turn-1",
+                        "status":"completed","final_text":OUTPUT,"stop_reason":"end_turn"}}),
+                ],
+            ))?;
             let daemon = sandbox.start()?;
-            let (session, _) = sandbox.spawn("seed")?;
+            let (session, _) = sandbox.spawn(PROMPT)?;
             sandbox.wait(&format!("{session}/1"))?;
             daemon.shutdown()?;
             let store = sandbox.state.join("store.sqlite3");
@@ -1006,6 +1017,10 @@ fn s1_f11_newer_or_corrupt_store_refused_untouched() -> TestResult {
             let (before, after) = (before, snapshot(&sandbox.state)?);
             let (before, after) = (without_log(&sandbox, before), without_log(&sandbox, after));
             refusal_logged(&sandbox, reasons)?;
+            let log = fs::read_to_string(sandbox.state.join("via.log"))?;
+            check(!log.contains(PROMPT) && !log.contains(OUTPUT), || {
+                format!("{variant}: a prompt or output in via.log: {log}")
+            })?;
             check(after == before, || {
                 let changed: Vec<_> = before
                     .keys()
