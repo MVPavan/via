@@ -958,8 +958,9 @@ pub(crate) struct Normalizing {
     stall_by: Instant,
     /// X4 code review r2 #2 (C2 §4 `turn.late_terminal`): the accepted
     /// turns that sealed with no terminal and have sent no late one: only
-    /// these send their terminal, once. One entry per such turn of the
-    /// registration.
+    /// these send their terminal, once. Bounded indirectly: each entry is
+    /// an accepted turn's retained mapping, of at most
+    /// `CORRELATION_ENTRIES` (1,024) per connection.
     bare: Vec<TurnNumber>,
 }
 

@@ -2427,6 +2427,20 @@ async fn ordered_seam() {
     }
 }
 
+/// Test builds: a seam right after a turn's wait read its cut (X4 code
+/// review r3 #1), where a test publishes an order the read missed. Hit
+/// only once an order is found.
+#[cfg_attr(
+    not(feature = "test-failpoints"),
+    expect(clippy::unused_async, reason = "only test builds wait at the seam")
+)]
+async fn cut_read_seam() {
+    #[cfg(feature = "test-failpoints")]
+    {
+        let _ = via_routes::failpoint::hit_async("adapter.codex.cut_read").await;
+    }
+}
+
 /// An accepted turn's facts.
 struct Accepted<'a> {
     id: String,
@@ -2507,13 +2521,18 @@ async fn wait(
         let grace_at =
             draining.map(|decoded_at| (decoded_at + orders.tool_grace).min(orders.wall.instant()));
         // X4 code review r2 #1: the order's end is the cut, as settlement
-        // reads it, read again at every order change.
+        // reads it, read again at every order change; the watcher is taken
+        // before the read (r3 #1), so an order published after the read
+        // still wakes the wait.
+        let changed = orders.changed();
         let end_at = ending.filter(|_| draining.is_none()).map(|ending| {
             let by = ending.by.instant();
             orders.cut(Instant::now()).map_or(by, |cut| cut.min(by))
         });
+        if ending.is_some() {
+            cut_read_seam().await;
+        }
         let detaching = orders.detaching();
-        let changed = orders.changed();
         tokio::select! {
             biased;
             () = forced(force) => return Cut::Forced,
@@ -2575,7 +2594,8 @@ fn settle_turn(
     let sealed = accepted
         .delivery
         .seal_cut(|decoded| orders.cut(decoded).is_some_and(|cut| decoded > cut));
-    let cut = if sealed.late {
+    // The daemon force keeps its precedence (r3 #2).
+    let cut = if sealed.late && cut != Cut::Forced {
         Cut::Order(orders.provenance())
     } else {
         cut

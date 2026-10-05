@@ -123,7 +123,12 @@ struct Running {
     /// The turn's end and the instant `run_turn` returned.
     task: JoinHandle<(TurnEnd, Instant)>,
     stop: watch::Sender<Option<StopOrder>>,
-    _force: watch::Sender<Option<Instant>>,
+    /// The daemon force.
+    #[cfg_attr(
+        not(feature = "test-failpoints"),
+        expect(dead_code, reason = "only a held-wait case raises the force")
+    )]
+    force: watch::Sender<Option<Instant>>,
     /// Core's view of the turn's stop report (x.3.2 X4 D7).
     acknowledged: watch::Receiver<bool>,
 }
@@ -174,7 +179,7 @@ fn run_timed(
             (end, Instant::now())
         }),
         stop,
-        _force: force,
+        force,
         acknowledged,
     }
 }
@@ -837,31 +842,34 @@ async fn w6c_terminal_decoded_at_the_wall() {
 /// before it first polls its orders: a driver delayed while its consumer
 /// runs on.
 #[cfg(feature = "test-failpoints")]
-struct HeldWait(tempfile::TempDir);
+struct HeldWait(tempfile::TempDir, &'static str);
 
 #[cfg(feature = "test-failpoints")]
 impl HeldWait {
-    const POINT: &str = "adapter.codex.ordered";
-
-    /// Arms the seam's first hit.
+    /// Arms the first hit of `adapter.codex.ordered`.
     fn arm() -> Self {
+        Self::arm_at("adapter.codex.ordered")
+    }
+
+    /// Arms the first hit of the wait's seam `point`.
+    fn arm_at(point: &'static str) -> Self {
         use std::os::unix::fs::PermissionsExt;
         const TOKEN: &str = "codex-driver-tests";
         let points = tempfile::tempdir().unwrap();
         std::fs::set_permissions(points.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let command = json!({"token": TOKEN, "occurrence": 1, "action": "pause"});
         std::fs::write(
-            points.path().join(format!("{}.json", Self::POINT)),
+            points.path().join(format!("{point}.json")),
             command.to_string(),
         )
         .unwrap();
         via_routes::failpoint::activate(points.path(), TOKEN).unwrap();
-        Self(points)
+        Self(points, point)
     }
 
     /// Resolves once the wait is held.
     async fn reached(&self) {
-        let ack = self.0.path().join(format!("{}.1.ack", Self::POINT));
+        let ack = self.0.path().join(format!("{}.1.ack", self.1));
         while !ack.exists() {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
@@ -869,7 +877,7 @@ impl HeldWait {
 
     /// Lets the wait go on.
     fn release(&self) {
-        let release = self.0.path().join(format!("{}.1.release", Self::POINT));
+        let release = self.0.path().join(format!("{}.1.release", self.1));
         std::fs::write(release, b"").unwrap();
     }
 }
@@ -1241,6 +1249,67 @@ async fn session_cancel_admits_no_later_terminal() {
         end.outcome
     );
     assert!(end.terminal.is_none(), "late only");
+}
+
+/// X4 code review r3 #1 (lost wakeup): the close relay closes by `T10`
+/// and the wait reads its cut, `T10`, then is held
+/// (`adapter.codex.cut_read`) while Core's cancel, closing by `T4`, is
+/// published at `T1`. The wait's watcher precedes its read, so it sees
+/// the cancel and the turn ends at `T4`, `Stopped`.
+#[cfg(feature = "test-failpoints")]
+#[tokio::test(start_paused = true)]
+async fn an_order_published_after_the_cut_is_read_is_seen() {
+    let held = HeldWait::arm_at("adapter.codex.cut_read");
+    let rig = Rig::new();
+    let turn = accepted(&rig, FAR, false).await;
+    let t0 = Instant::now();
+    let _close = tokio::spawn(turn.driver.close(
+        crate::CloseMode::Graceful,
+        Deadline::at(t0 + Duration::from_secs(10)),
+    ));
+    held.reached().await;
+    tokio::time::sleep_until(t0 + Duration::from_secs(1)).await;
+    let cancel = order(crate::StopCause::Cancel, t0 + Duration::from_secs(4));
+    turn.running.stop.send_replace(Some(cancel));
+    held.release();
+    let (end, at, _kept) = turn.end().await;
+    assert_eq!(
+        at,
+        t0 + Duration::from_secs(4),
+        "cut at the cancel's close_by"
+    );
+    assert!(
+        matches!(failure_cause(&end), RouteError::Stopped { .. }),
+        "{:?}",
+        end.outcome
+    );
+}
+
+/// X4 code review r3 #2: the daemon force keeps its precedence over a
+/// late terminal. Core's cancel closes by `t + 3 s`; with the wait held,
+/// the interrupted terminal is decoded at `t + 5 s` and the force is
+/// raised at `t + 6 s`; the wait resumes forced: `ForceStopped`.
+#[cfg(feature = "test-failpoints")]
+#[tokio::test(start_paused = true)]
+async fn the_force_stands_over_a_late_terminal() {
+    let held = HeldWait::arm();
+    let rig = Rig::new();
+    let mut turn = accepted(&rig, FAR, false).await;
+    held.reached().await;
+    let t = Instant::now();
+    let cancel = order(crate::StopCause::Cancel, t + Duration::from_secs(3));
+    turn.running.stop.send_replace(Some(cancel));
+    tokio::time::sleep_until(t + Duration::from_secs(5)).await;
+    turn.decode_interrupted().await;
+    tokio::time::sleep_until(t + Duration::from_secs(6)).await;
+    turn.running.force.send_replace(Some(Instant::now()));
+    held.release();
+    let (end, _at, _kept) = turn.end().await;
+    assert!(
+        matches!(failure_cause(&end), RouteError::ForceStopped { .. }),
+        "{:?}",
+        end.outcome
+    );
 }
 
 /// The orders of a turn whose wall is `wall`, and their senders.
