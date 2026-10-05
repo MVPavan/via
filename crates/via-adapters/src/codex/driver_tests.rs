@@ -355,10 +355,24 @@ const TURN_A: &str = "019a0000-0000-7000-8000-000000200001";
 /// Its command item.
 const EXEC: &str = "exec-019a0000-0000-7000-8000-000000400004";
 
+/// The late terminals a session reported: each one's vendor turn and
+/// status.
+type LateSeen = Arc<std::sync::Mutex<Vec<(Option<String>, crate::VendorTerminalStatus)>>>;
+
 /// Reads the session's observations as they come, so its sink never
-/// stalls while time is advanced.
-fn drained(mut receiver: tokio::sync::mpsc::Receiver<Admitted>) -> JoinHandle<()> {
-    tokio::spawn(async move { while receiver.recv().await.is_some() {} })
+/// stalls while time is advanced; keeps its late terminals.
+fn drained(mut receiver: tokio::sync::mpsc::Receiver<Admitted>) -> (JoinHandle<()>, LateSeen) {
+    let late = LateSeen::default();
+    let seen = Arc::clone(&late);
+    let task = tokio::spawn(async move {
+        while let Some(admitted) = receiver.recv().await {
+            if let crate::Observation::LateTerminal(terminal) = admitted.item.observation {
+                let vendor_turn = admitted.item.vendor_turn.map(|id| id.as_str().to_owned());
+                seen.lock().unwrap().push((vendor_turn, terminal.status));
+            }
+        }
+    });
+    (task, late)
 }
 
 /// Turn A's command item `id`, started.
@@ -407,6 +421,8 @@ struct Turn1 {
         expect(dead_code, reason = "only the held-wait cases cancel the session")
     )]
     cancel: CancellationToken,
+    /// The session's late terminals.
+    late: LateSeen,
     _observations: JoinHandle<()>,
 }
 
@@ -416,7 +432,7 @@ struct Turn1 {
 async fn accepted(rig: &Rig, timing: (Duration, Duration), tool: bool) -> Turn1 {
     let mut vendor = rig.script();
     let (driver, observations, cancel) = rig.session();
-    let observations = drained(observations);
+    let (observations, late) = drained(observations);
     let started = Instant::now();
     let running = run_timed(&driver, (1, driver.prepare()), timing);
     vendor.handshake(USER_AGENT, &[model(MODEL)]).await;
@@ -437,6 +453,7 @@ async fn accepted(rig: &Rig, timing: (Duration, Duration), tool: bool) -> Turn1 
         started,
         driver,
         cancel,
+        late,
         _observations: observations,
     }
 }
@@ -499,6 +516,24 @@ impl Turn1 {
             .expect("the turn ended")
             .unwrap();
         (end, at, (self.vendor, self.driver))
+    }
+}
+
+/// The late terminals of turn A the session reported within a second.
+async fn late_reported(late: &LateSeen) -> Vec<crate::VendorTerminalStatus> {
+    let by = Instant::now() + Duration::from_secs(1);
+    loop {
+        let reported: Vec<_> = late
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(turn, _)| turn.as_deref() == Some(TURN_A))
+            .map(|(_, status)| *status)
+            .collect();
+        if !reported.is_empty() || Instant::now() >= by {
+            return reported;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
 
@@ -700,6 +735,28 @@ async fn w3_close_during_draining_detaches() {
     }
 }
 
+/// X4 code review r2 #2, on time: Core's cancel closes by `t + 3 s` and
+/// the turn ends there, `Stopped`, with no terminal; the interrupted
+/// terminal decoded at `t + 5 s` reaches Core as the turn's late terminal
+/// (C2 §4.1 "Late observations").
+#[tokio::test(start_paused = true)]
+async fn late_terminal_after_an_on_time_cut() {
+    let rig = Rig::new();
+    let mut turn = accepted(&rig, FAR, false).await;
+    let t = Instant::now();
+    turn.cancel(Duration::from_secs(3)).await;
+    tokio::time::sleep_until(t + Duration::from_secs(5)).await;
+    turn.vendor.emit(&terminal("interrupted")).await;
+    let late = Arc::clone(&turn.late);
+    let (end, at, _kept) = turn.end().await;
+    assert_eq!(at, t + Duration::from_secs(3));
+    assert!(end.terminal.is_none());
+    assert_eq!(
+        late_reported(&late).await,
+        [crate::VendorTerminalStatus::Interrupted]
+    );
+}
+
 /// The `Deadline` failure of an end, with its acknowledged and shared
 /// facts.
 fn deadline(end: &TurnEnd) -> (bool, bool) {
@@ -725,7 +782,7 @@ async fn w6a_unanswered_start_at_the_wall() {
     let rig = Rig::new();
     let mut vendor = rig.script();
     let (driver, observations) = rig.driver();
-    let _observations = drained(observations);
+    let _observations = drained(observations).0;
     let wall = Instant::now() + Duration::from_secs(5);
     let running = run_timed(
         &driver,
@@ -920,6 +977,7 @@ async fn wall_cutoff_case(decoded: Duration, within: bool) {
     turn.decode_interrupted().await;
     tokio::time::sleep_until(turn.started + wall + Duration::from_secs(5)).await;
     held.release();
+    let late = Arc::clone(&turn.late);
     let (end, _at, _kept) = turn.end().await;
     assert_eq!(deadline(&end), (within, true), "acknowledged");
     assert_eq!(end.terminal.is_some(), within, "terminal kept");
@@ -928,6 +986,11 @@ async fn wall_cutoff_case(decoded: Duration, within: bool) {
             failure_cleanup(&end),
             Some(crate::WireCleanup::Quiescent),
             "an unproven stop"
+        );
+        // X4 code review r2 #2: late evidence, never lost.
+        assert_eq!(
+            late_reported(&late).await,
+            [crate::VendorTerminalStatus::Interrupted]
         );
     }
 }
@@ -978,7 +1041,7 @@ enum Ordered {
 /// closing by `t + 3 s`, and the interrupted terminal (no tool open) is
 /// decoded at `t + decoded`; the wait resumes at `t + 6 s`.
 #[cfg(feature = "test-failpoints")]
-async fn order_cutoff_case(ordered: Ordered, decoded: Duration) -> TurnEnd {
+async fn order_cutoff_case(ordered: Ordered, decoded: Duration) -> (TurnEnd, LateSeen) {
     let held = HeldWait::arm();
     let rig = Rig::new();
     let mut turn = accepted(&rig, FAR, false).await;
@@ -1012,7 +1075,8 @@ async fn order_cutoff_case(ordered: Ordered, decoded: Duration) -> TurnEnd {
     }
     tokio::time::sleep_until(t + Duration::from_secs(6)).await;
     held.release();
-    turn.end().await.0
+    let late = Arc::clone(&turn.late);
+    (turn.end().await.0, late)
 }
 
 /// Concern 1: a terminal decoded at `t + 5 s`, after Core's cancel order's
@@ -1021,7 +1085,7 @@ async fn order_cutoff_case(ordered: Ordered, decoded: Duration) -> TurnEnd {
 #[cfg(feature = "test-failpoints")]
 #[tokio::test(start_paused = true)]
 async fn order_terminal_after_close_by_is_late() {
-    let end = order_cutoff_case(Ordered::Cancel, Duration::from_secs(5)).await;
+    let (end, late) = order_cutoff_case(Ordered::Cancel, Duration::from_secs(5)).await;
     assert!(
         matches!(failure_cause(&end), RouteError::Stopped { .. }),
         "{:?}",
@@ -1029,6 +1093,11 @@ async fn order_terminal_after_close_by_is_late() {
     );
     assert!(end.terminal.is_none(), "late only");
     assert_eq!(failure_cleanup(&end), None, "cleanup unproven");
+    // X4 code review r2 #2: late evidence, never lost.
+    assert_eq!(
+        late_reported(&late).await,
+        [crate::VendorTerminalStatus::Interrupted]
+    );
 }
 
 /// Concern 1: a terminal decoded at `t + 2 s`, within the cancel order's
@@ -1036,7 +1105,7 @@ async fn order_terminal_after_close_by_is_late() {
 #[cfg(feature = "test-failpoints")]
 #[tokio::test(start_paused = true)]
 async fn order_terminal_before_close_by_is_kept() {
-    let end = order_cutoff_case(Ordered::Cancel, Duration::from_secs(2)).await;
+    let (end, late) = order_cutoff_case(Ordered::Cancel, Duration::from_secs(2)).await;
     assert_eq!(
         kept(&end),
         (
@@ -1044,6 +1113,7 @@ async fn order_terminal_before_close_by_is_kept() {
             Some(crate::Cleanup::Quiescent)
         )
     );
+    assert!(late_reported(&late).await.is_empty(), "kept, not late");
 }
 
 /// Concern 1: a terminal decoded at the cancel order's `close_by` itself
@@ -1051,8 +1121,92 @@ async fn order_terminal_before_close_by_is_kept() {
 #[cfg(feature = "test-failpoints")]
 #[tokio::test(start_paused = true)]
 async fn order_terminal_at_close_by_is_kept() {
-    let end = order_cutoff_case(Ordered::Cancel, Duration::from_secs(3)).await;
+    let (end, late) = order_cutoff_case(Ordered::Cancel, Duration::from_secs(3)).await;
     assert_eq!(kept(&end).0, Some(crate::VendorTerminalStatus::Interrupted));
+    assert!(late_reported(&late).await.is_empty(), "kept, not late");
+}
+
+/// X4 code review r2 #1 (Sol's schedule): the driver's close relays an
+/// order at `T0` closing by `T10`; Core's cancel attaches at `T1` closing
+/// by `T4`; the interrupted terminal is decoded at `T5`. The cut is the
+/// earliest `close_by` of the orders attached before the decode, `T4`,
+/// whenever the turn's wait resumes (`resume` after `T0`): `Stopped`, no
+/// terminal. (Whether the late terminal then reaches Core is the close's
+/// own cutoff, C2 §4.1: the closing session detaches once the turn ends.)
+/// Each resume point is its own test: the failpoint controller is armed
+/// once per process.
+#[cfg(feature = "test-failpoints")]
+async fn two_orders_case(resume: Duration) {
+    let held = HeldWait::arm();
+    let rig = Rig::new();
+    let mut turn = accepted(&rig, FAR, false).await;
+    held.reached().await;
+    let t0 = Instant::now();
+    let _close = tokio::spawn(turn.driver.close(
+        crate::CloseMode::Graceful,
+        Deadline::at(t0 + Duration::from_secs(10)),
+    ));
+    let mut released = false;
+    let mut release_by = |at: Duration, held: &HeldWait| {
+        if !released && resume <= at {
+            released = true;
+            held.release();
+        }
+    };
+    for (at, step) in [
+        (Duration::from_secs(1), 1),
+        (Duration::from_secs(5), 5),
+        (Duration::from_secs(6), 6),
+    ] {
+        if resume < at {
+            tokio::time::sleep_until(t0 + resume).await;
+            release_by(resume, &held);
+        }
+        tokio::time::sleep_until(t0 + at).await;
+        match step {
+            1 => {
+                let cancel = order(crate::StopCause::Cancel, t0 + Duration::from_secs(4));
+                turn.running.stop.send_replace(Some(cancel));
+            }
+            5 => turn.vendor.emit(&terminal("interrupted")).await,
+            _ => release_by(at, &held),
+        }
+    }
+    let (end, at, _kept) = turn.end().await;
+    if resume < Duration::from_secs(4) {
+        assert_eq!(
+            at,
+            t0 + Duration::from_secs(4),
+            "a resumed wait cuts at T4, read again at the second order"
+        );
+    }
+    assert!(
+        matches!(failure_cause(&end), RouteError::Stopped { .. }),
+        "resumed at T0 + {resume:?}: {:?}",
+        end.outcome
+    );
+    assert!(end.terminal.is_none(), "resumed at T0 + {resume:?}");
+}
+
+/// r2 #1: resumed between the two orders' attachments.
+#[cfg(feature = "test-failpoints")]
+#[tokio::test(start_paused = true)]
+async fn two_orders_cut_resumed_between_attachments() {
+    two_orders_case(Duration::from_millis(500)).await;
+}
+
+/// r2 #1: resumed after both orders, before the earlier `close_by`.
+#[cfg(feature = "test-failpoints")]
+#[tokio::test(start_paused = true)]
+async fn two_orders_cut_resumed_before_close_by() {
+    two_orders_case(Duration::from_secs(2)).await;
+}
+
+/// r2 #1: resumed after the terminal's decode.
+#[cfg(feature = "test-failpoints")]
+#[tokio::test(start_paused = true)]
+async fn two_orders_cut_resumed_after_the_terminal() {
+    two_orders_case(Duration::from_secs(6)).await;
 }
 
 /// Concern 1: the driver's own close relays an order dated inside its
@@ -1062,7 +1216,7 @@ async fn order_terminal_at_close_by_is_kept() {
 #[cfg(feature = "test-failpoints")]
 #[tokio::test(start_paused = true)]
 async fn close_relay_terminal_after_close_by_is_late() {
-    let end = order_cutoff_case(Ordered::Close, Duration::from_secs(5)).await;
+    let (end, _late) = order_cutoff_case(Ordered::Close, Duration::from_secs(5)).await;
     assert!(
         matches!(failure_cause(&end), RouteError::Stopped { .. }),
         "{:?}",
@@ -1080,7 +1234,7 @@ async fn close_relay_terminal_after_close_by_is_late() {
 #[cfg(feature = "test-failpoints")]
 #[tokio::test(start_paused = true)]
 async fn session_cancel_admits_no_later_terminal() {
-    let end = order_cutoff_case(Ordered::Session, Duration::from_secs(5)).await;
+    let (end, _late) = order_cutoff_case(Ordered::Session, Duration::from_secs(5)).await;
     assert!(
         matches!(failure_cause(&end), RouteError::Stopped { .. }),
         "{:?}",

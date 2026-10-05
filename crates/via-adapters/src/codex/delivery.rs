@@ -21,7 +21,9 @@
 //! never be mapped. A turn's terminal is retained in its seal's slot,
 //! never sent, and freezes the lane until the turn seals. An earlier
 //! turn's message takes the late path under the registration's seal,
-//! judged by the session's ledger. A message that does not decode, a
+//! judged by the session's ledger; the terminal of a turn that sealed
+//! with none, or one its seal judged past the turn's cut, is the turn's
+//! late terminal (C2 §4 `turn.late_terminal`). A message that does not decode, a
 //! protocol error, a stall or an overflow fails the generation (§4).
 //!
 //! The running turn never waits on the consumer. It waits for its seal's
@@ -193,6 +195,10 @@ pub(crate) struct Sealed {
     /// terminal's tools (X4 code review r1 #1): settlement judges it
     /// against the P7 window, whenever the driver ran.
     pub(crate) drained_at: Option<Instant>,
+    /// X4 code review r2 #2: the retained terminal was decoded past the
+    /// turn's cut: it is not the turn's, and goes out as its late
+    /// terminal once the consumer closes the turn.
+    pub(crate) late: bool,
     pub(crate) tools_open: bool,
     pub(crate) stop: Option<Stop>,
 }
@@ -212,6 +218,8 @@ struct Seal {
     /// The decode instant of the message that ended the draining
     /// terminal's tools.
     drained_at: Option<Instant>,
+    /// A terminal the seal judged late: the turn's late terminal.
+    late: Option<Retained>,
     tools_open: bool,
     stop: Option<Stop>,
 }
@@ -248,6 +256,7 @@ impl Delivery {
                 decoded_at: None,
                 draining: false,
                 drained_at: None,
+                late: None,
                 tools_open: false,
                 stop: None,
             }),
@@ -350,6 +359,11 @@ impl Delivery {
             .filter(|_| seal.draining && seal.sealed.is_none())
     }
 
+    /// The terminal the seal judged late, once.
+    fn take_late(&self) -> Option<Retained> {
+        self.lock().late.take()
+    }
+
     /// Records why delivery stopped, unless sealed.
     pub(crate) fn stop(&self, stop: Stop) {
         let mut seal = self.lock();
@@ -398,14 +412,29 @@ impl Delivery {
     /// Seals delivery: nothing more goes out. The position is fixed by
     /// the first call; the slots are taken once.
     pub(crate) fn seal(&self) -> Sealed {
+        self.seal_cut(|_| false)
+    }
+
+    /// [`Self::seal`], judging a retained terminal by its decode instant
+    /// (X4 code review r2 #2): one `late` decides is kept for the
+    /// consumer, which sends it as the turn's late terminal once it closes
+    /// the turn, in its own order ([`Self::take_late`]).
+    pub(crate) fn seal_cut(&self, late: impl FnOnce(Instant) -> bool) -> Sealed {
         seal_seam();
         let mut seal = self.lock();
         let next = seal.next();
         let position = *seal.sealed.get_or_insert(next);
+        let mut terminal = seal.terminal.take();
+        if let (Some(_), Some(decoded_at)) = (&terminal, seal.decoded_at)
+            && late(decoded_at)
+        {
+            seal.late = terminal.take();
+        }
         let sealed = Sealed {
             position,
             partial: !seal.complete,
-            terminal: seal.terminal.take(),
+            late: seal.late.is_some(),
+            terminal,
             decoded_at: seal.decoded_at,
             drained_at: seal.drained_at,
             tools_open: seal.tools_open,
@@ -927,6 +956,11 @@ pub(crate) struct Normalizing {
     /// x.3.2 X3 §6.2: the stall deadline of the message being handled,
     /// one for its ledger wait and all of its sink waits.
     stall_by: Instant,
+    /// X4 code review r2 #2 (C2 §4 `turn.late_terminal`): the accepted
+    /// turns that sealed with no terminal and have sent no late one: only
+    /// these send their terminal, once. One entry per such turn of the
+    /// registration.
+    bare: Vec<TurnNumber>,
 }
 
 impl Normalizing {
@@ -951,6 +985,7 @@ impl Normalizing {
             gap: None,
             disposed: 0,
             stall_by: Instant::now(),
+            bare: Vec::new(),
         }
     }
 
@@ -974,7 +1009,7 @@ impl Normalizing {
                     self.overflow();
                     return self.dispose_failed();
                 }
-                Wake::Sealed => self.close(),
+                Wake::Sealed => self.close_sealed().await,
                 Wake::Lane(LaneEvent::Item(item, charge)) => self.item(*item, charge).await,
                 Wake::Lane(LaneEvent::End(end)) => return self.end(end),
             }
@@ -1311,6 +1346,38 @@ impl Normalizing {
             self.releasing = self.early.front().map(|next| (next.seq, next.mark));
             self.publish();
             self.handled(mark, whole);
+        }
+    }
+
+    /// The held turn sealed: it closes, then a terminal its seal judged
+    /// late goes out as its late terminal (X4 code review r2 #2; C2 §4.1
+    /// "Late observations"), attributed to its vendor turn, at now, after
+    /// everything the consumer sent before.
+    async fn close_sealed(&mut self) {
+        let late = self.held.as_ref().and_then(|held| {
+            let retained = held.cx.delivery.take_late()?;
+            Some((held.accepted.clone().unwrap_or_default(), retained))
+        });
+        if let Some(held) = self.held.as_ref()
+            && late.is_none()
+            && held.phase == Phase::Running
+        {
+            self.bare.push(held.turn);
+        }
+        self.close();
+        if let Some((turn, retained)) = late {
+            let Retained {
+                mut terminal,
+                structured,
+            } = retained;
+            (
+                terminal.structured_output,
+                terminal.structured_output_unparsed,
+            ) = super::driver::carried(structured);
+            let idle = Arc::clone(&self.registration.idle);
+            let late = Observation::LateTerminal(terminal);
+            self.output(&idle, &turn, late, (None, Instant::now()))
+                .await;
         }
     }
 
@@ -1894,6 +1961,18 @@ impl Normalizing {
         (earlier, turn): (TurnNumber, &str),
         (at, seq, mark): (Instant, u64, Option<Mark>),
     ) {
+        // X4 code review r2 #2 (C2 §4.1 "Late observations"): the
+        // terminal of a turn that ended with none is its late terminal,
+        // sent once.
+        if let Notification::TurnCompleted(event) = notification
+            && let Some(index) = self.bare.iter().position(|bare| *bare == earlier)
+            && let Ok(terminal) = normalize::vendor_terminal(&event.turn, at, None)
+        {
+            self.bare.swap_remove(index);
+            let late = Observation::LateTerminal(terminal);
+            self.output(delivery, turn, late, (Some(false), at)).await;
+            return;
+        }
         let denial = self
             .registration
             .ledger()
