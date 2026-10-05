@@ -132,6 +132,24 @@ impl CodexCase {
             .map_or(0, |log| log.lines().count())
     }
 
+    /// Waits until launch `launch` of the fake logged `at <step>`.
+    pub(crate) async fn at_launch(&self, step: usize, launch: u64) {
+        let path = self.dir.join(format!("{}.progress", self.name));
+        let marker = format!("at {step} launch {launch}");
+        let by = tokio::time::Instant::now() + PROGRESS_WAIT;
+        while !fs::read_to_string(&path)
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line == marker)
+        {
+            assert!(
+                tokio::time::Instant::now() < by,
+                "the fake never logged {marker:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     /// Sends launch `launch`'s fake its gate signal.
     pub(crate) fn signal(&self, launch: u64) {
         let log = fs::read_to_string(self.dir.join(format!("{}.launches", self.name))).unwrap();

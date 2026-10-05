@@ -98,12 +98,12 @@ fn child(name: &str, scenario: &Value, env: &[(&str, &str)]) -> Option<PathBuf> 
 }
 
 /// Runs `body` on a current-thread runtime.
-fn run<F: Future<Output = ()>>(body: F) {
+fn run<T, F: Future<Output = T>>(body: F) -> T {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap()
-        .block_on(body);
+        .block_on(body)
 }
 
 /// One daemon's Engine, whose session dispatchers run as daemon main runs
@@ -4302,7 +4302,6 @@ fn codex_control_races_close_vs_p7_window() {
 }
 
 /// The Codex fixtures' first turn's prompt in `c1_commentary_usage`.
-#[cfg(feature = "test-failpoints")]
 const C1_PROMPT: &str =
     "Create a file note.txt in this directory with the text OK. Report the result.";
 
@@ -4545,6 +4544,61 @@ fn codex_prompt_echo_cap() {
         let envelope = daemon.wait(&session, 1).await;
         assert_eq!(envelope["state"], "completed", "{envelope}");
         daemon.close(&session).await;
+        daemon.shutdown().await;
+    });
+}
+
+/// A Codex session on [`echo_copy`]'s replay of `C1_PROMPT`, served by
+/// the fake's launch `launch`: its turn completes, then the session
+/// closes.
+async fn c1_turn(daemon: &Daemon, case: &core_codex::CodexCase, launch: u64) {
+    let session = daemon.spawn(C1_PROMPT, &codex_spawn(case, 60_000)).await;
+    case.at_launch(C1_GATE, launch).await;
+    case.signal(launch);
+    let envelope = daemon.wait(&session, 1).await;
+    assert_eq!(envelope["state"], "completed", "{envelope}");
+    daemon.close(&session).await;
+}
+
+/// x.3.2 X5 (X0 item 4): Codex's `CODEX_SQLITE_HOME`, `<state>/vendor/codex`,
+/// persists across a daemon restart. The first daemon's server creates
+/// it (0700); a file the vendor would keep there is written; after a
+/// clean stop the second daemon finds the same directory, its file
+/// unchanged, and its own server launches over it, leaving both as they
+/// were.
+#[test]
+fn codex_sqlite_home_persists_across_restart() {
+    use std::os::unix::fs::MetadataExt as _;
+    const NAME: &str = "codex_sqlite_home_persists_across_restart";
+    let Some(root) = child(NAME, &no_fake(), &[]) else {
+        return;
+    };
+    let case = codex_case(&root, NAME, echo_copy(C1_PROMPT));
+    let home = root.join("state").join("vendor").join("codex");
+    let kept = home.join("state_5.sqlite");
+    let identity = run(async {
+        let daemon = Daemon::open_with(&root, case.config());
+        c1_turn(&daemon, &case, 1).await;
+        let metadata = fs::symlink_metadata(&home).unwrap();
+        assert!(metadata.is_dir(), "{}", home.display());
+        assert_eq!(metadata.mode() & 0o777, 0o700);
+        fs::write(&kept, b"vendor state").unwrap();
+        daemon.stop().await;
+        (metadata.dev(), metadata.ino())
+    });
+    run(async {
+        let daemon = Daemon::open_with(&root, case.config());
+        let unchanged = || {
+            let metadata = fs::symlink_metadata(&home).unwrap();
+            assert!(metadata.is_dir(), "{}", home.display());
+            assert_eq!((metadata.dev(), metadata.ino()), identity);
+            assert_eq!(metadata.mode() & 0o777, 0o700);
+            assert_eq!(fs::read(&kept).unwrap(), b"vendor state");
+        };
+        unchanged();
+        c1_turn(&daemon, &case, 2).await;
+        assert_eq!(case.launches(), 2, "each daemon launched its own server");
+        unchanged();
         daemon.shutdown().await;
     });
 }

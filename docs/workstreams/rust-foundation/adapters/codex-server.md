@@ -896,6 +896,10 @@ plus `CODEX_SQLITE_HOME`. X2: bootstrap creates `vendor/` 0700, refuses a
 symlink. X3: a symlinked `vendor/codex` refuses the launch with no
 acquisition. X5: the directory persists across a restart. **E2E:**
 concurrent servers on one home; resume across restart (x.3.4).
+X5 as built: `codex_sqlite_home_persists_across_restart`
+(`crates/via-core/tests/conformance_core.rs`): after a clean stop, a second
+Engine on the same State finds `vendor/codex` with the same identity, mode
+0700 and a kept file unchanged, and its own server launches over it.
 
 ### Item 5. Server evidence and decode failures (G6, r1 #24, r2 N15, r3 F11)
 
@@ -1383,6 +1387,14 @@ unaffected turn carries none.
 
 **Tests (X1 bodies, X3 behaviour).** `codex_never_ask` per packet §8, plus
 the placeholder ordering, the closed-thread decline and the reopen case.
+X5 as built: `codex_decline_deadline_with_the_reader_held`
+(`crates/via-core/tests/conformance_codex.rs`): the registration's consumer,
+VIA's reader of the lane, is held 6 s while an approval request arrives;
+the fake reads the decline within 5,250 ms and, once released, the consumer
+reports `vendor.request_declined`. Item 14's replay join (`pause_input`,
+`expect_large`, the polling reader) was never built in X3, so the variant
+with the vendor's own stdin reader paused is not tested; it stays with item
+12's E2E item (decline latency during a large write) as a live-measure item.
 
 ### Item 12. Writes on a shared connection (r1 #2, #16–18; r2 N2, N4, N5)
 
