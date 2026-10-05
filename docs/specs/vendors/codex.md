@@ -261,9 +261,20 @@ the server key. This is a candidate integration policy, not a claim that
 C6 tested tools, authentication refresh, macOS or installed plugins. Never
 silently broaden the allow-list after failure.
 
+Every server VIA starts runs `codex app-server --disable memories`,
+whatever the session requests (via-7r9, checked 2026-10-05 on 0.160.0).
+`--disable <FEATURE>` is `-c features.<name>=false` (`codex app-server
+--help`), so it overrides the user's `config.toml`. Without it, Codex's
+memories feature ran inside VIA-started servers: stage-1 extraction, then
+a "Memory Writing Agent: Phase 2 (Consolidation)" thread with its own
+model, `DangerFullAccess` and approval `never`, which edited the user's
+`~/.codex/memories` outside any VIA turn, bound or accounting. No other
+feature in `codex features list` was seen starting an agent or thread on
+its own in the live runs.
+
 Inherited configuration (C2 §6.2; owner OD2), from the 2026-09-30 re-probe.
 With hooks off, launch with `--disable hooks` (verified). MCP suppression
-through a `-c` override is unverified. Both switches enter `config_hash`.
+through a `-c` override is unverified. Every switch enters `config_hash`.
 
 | Category (default) | Switch and evidence | Effective state with the default |
 |---|---|---|

@@ -130,6 +130,30 @@ fn os(pairs: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
         .collect()
 }
 
+/// via-7r9: every server VIA starts disables Codex's memories feature,
+/// whatever the requested inheritance. Codex 0.160.0 otherwise ran memory
+/// extraction and a consolidation agent thread with full access that
+/// edited the user's `~/.codex/memories`, outside the caller's turn.
+#[test]
+fn every_server_disables_memories() {
+    for state in [InheritState::Off, InheritState::On] {
+        let recipe = ServerRecipe::new(
+            Path::new("/bin/codex"),
+            hooks(state),
+            &env(),
+            Path::new("/state/vendor/codex"),
+        );
+        assert!(
+            recipe
+                .args
+                .windows(2)
+                .any(|pair| pair == ["--disable", "memories"]),
+            "hooks {state:?}: {:?}",
+            recipe.args
+        );
+    }
+}
+
 /// Packet §4, Q6: the server's argv disables hooks when they are off, its
 /// environment is exactly the allow-list plus the supplied
 /// `CODEX_SQLITE_HOME`, and it runs in that directory.
@@ -143,7 +167,10 @@ fn the_server_recipe_is_the_allow_list() {
         home,
     );
     assert_eq!(recipe.program, Path::new("/bin/codex"));
-    assert_eq!(recipe.args, ["app-server", "--disable", "hooks"]);
+    assert_eq!(
+        recipe.args,
+        ["app-server", "--disable", "memories", "--disable", "hooks"]
+    );
     assert_eq!(recipe.cwd, home);
     assert_eq!(
         recipe.env,
@@ -163,7 +190,7 @@ fn the_server_recipe_is_the_allow_list() {
         &BootstrapEnv::from_vars([("PATH", "/usr/bin")]),
         home,
     );
-    assert_eq!(on.args, ["app-server"]);
+    assert_eq!(on.args, ["app-server", "--disable", "memories"]);
     assert_eq!(
         on.env,
         os(&[

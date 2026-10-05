@@ -839,8 +839,9 @@ has no failed outcome to count.
   1. the domain tag `"via codex server key v1"`;
   2. `adapter_version`;
   3. the resolved program path bytes;
-  4. argv after the program (`app-server`, `--disable hooks` when hooks are
-     off, later verified switches);
+  4. argv after the program (`app-server`, `--disable memories` always
+     (via-7r9), `--disable hooks` when hooks are off, later verified
+     switches);
   5. the passed environment, sorted `(name, value)` pairs: the allow-list
      values and `CODEX_SQLITE_HOME`; Host's random `VIA_PROCESS_MARKER`
      excluded;
