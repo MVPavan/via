@@ -4630,16 +4630,23 @@ const STAGED_LINES: usize = 4;
 #[cfg(feature = "test-failpoints")]
 const BATCH: usize = 3;
 
-/// Core's hold on each observation while the holders are measured
-/// (`core.observations.pause`, persistent).
+/// Core's hold before it handles an observation: each session's drain is
+/// paused at its first fill observation, acknowledged, until the test
+/// releases it after the measurement.
 #[cfg(feature = "test-failpoints")]
-const CORE_HOLD_MS: u64 = 5_000;
+const CORE_HOLD: &str = "core.observations.pause";
+
+/// The connection task's hit before it routes each message, counted to
+/// prove the staged lines reached their lanes.
+#[cfg(feature = "test-failpoints")]
+const ROUTED: &str = "codex.connection.message";
 
 /// The consumer's take of a lane item, counted to pace the fake.
 #[cfg(feature = "test-failpoints")]
 const TAKE: &str = "adapter.codex.consumer_take";
 
-/// A blocked channel send, counted for the report.
+/// A blocked channel send, counted: one per session once its channel is
+/// full and its fifth fill line decoded.
 #[cfg(feature = "test-failpoints")]
 const BLOCKED: &str = "adapter.observation.blocked";
 
@@ -4660,10 +4667,16 @@ struct Leases {
     started: Vec<usize>,
     /// The flood's gates, with the flood lines written before each.
     flood: Vec<(usize, usize)>,
-    /// The fill's gates, with the fill lines written before each.
+    /// The gate after each session's first fill line, where Core's drain
+    /// of that session is held.
+    held: Vec<usize>,
+    /// The rest of the fill's gates, with the fill lines written before
+    /// each.
     fill: Vec<(usize, usize)>,
     /// The gate after the staged lines, where the holders are measured.
     measured: usize,
+    /// The gate after each session's `turn/completed`.
+    completed: Vec<usize>,
 }
 
 /// `c1_commentary_usage`'s handshake, then [`LEASES`] sessions, each
@@ -4727,6 +4740,7 @@ fn leases_copy() -> Leases {
             flood.push((gate(&mut steps), line + 1));
         }
     }
+    let mut held = Vec::new();
     let mut fill = Vec::new();
     for line in 0..FILL_LINES * LEASES {
         let (t, u) = lease_ids(line % LEASES);
@@ -4737,7 +4751,9 @@ fn leases_copy() -> Leases {
                 r#"{{"method":"item/completed","params":{{"item":{{"type":"agentMessage","id":"fill_{j}","text":${{p}},"phase":"final_answer","memoryCitation":null,"delivery":null,"questions":null}},"threadId":"{t}","turnId":"{u}","completedAtMs":1790000007591}},"emittedAtMs":1790000007591}}"#
             ),
         );
-        if (line + 1) % BATCH == 0 || line + 1 == FILL_LINES * LEASES {
+        if line < LEASES {
+            held.push(gate(&mut steps));
+        } else if (line + 1 - LEASES).is_multiple_of(BATCH) || line + 1 == FILL_LINES * LEASES {
             fill.push((gate(&mut steps), line + 1));
         }
     }
@@ -4745,8 +4761,10 @@ fn leases_copy() -> Leases {
         emit(&mut steps, status(k));
     }
     let measured = gate(&mut steps);
+    let mut completed = Vec::new();
     for k in 0..LEASES {
         emit(&mut steps, for_lease(&line_of(28), k));
+        completed.push(gate(&mut steps));
     }
     for k in 0..LEASES {
         let (t, _) = lease_ids(k);
@@ -4761,8 +4779,10 @@ fn leases_copy() -> Leases {
         replay,
         started,
         flood,
+        held,
         fill,
         measured,
+        completed,
     }
 }
 
@@ -4875,13 +4895,17 @@ fn leases_sum() -> u64 {
 /// server, [`LEASES`] leased sessions each with an active turn whose
 /// prompt is at the echo cap. A paced flood of about 270 MiB of maximal
 /// thread lines passes through every lane while Core drains (growth
-/// below 32 MiB after its first 64 MiB, peak to peak). Then Core's drain
-/// is held, each session's channel filled to its 4 MiB with the fifth
-/// maximal message decoded and blocked, and the server's 4 MiB staging
-/// filled with lines in blocked lanes: peak RSS less the idle baseline
-/// within [`leases_sum`] plus 25%. Then every turn completes and every
-/// session closes. 10 ms sampling; on glibc `MALLOC_ARENA_MAX=2` as F24's
-/// proxy. Held to its own nextest slot (`.config/nextest.toml`).
+/// below 32 MiB after its first 64 MiB, peak to peak, both windows
+/// sampled). Then each session's Core drain is paused, acknowledged, until
+/// the test releases it; each channel is filled to its 4 MiB with the
+/// fifth maximal message decoded and blocked, and the server's 4 MiB
+/// staging filled with lines in blocked lanes. That occupancy is asserted
+/// from counted failpoint hits before and after the held sample; then
+/// peak RSS less the idle baseline is within [`leases_sum`] plus 25%.
+/// Then each drain is released and each turn completes, one session at a
+/// time, and every session closes. 10 ms sampling; on glibc
+/// `MALLOC_ARENA_MAX=2` as F24's proxy. Held to its own nextest slot
+/// (`.config/nextest.toml`).
 #[cfg(feature = "test-failpoints")]
 #[test]
 #[expect(
@@ -4905,6 +4929,8 @@ fn codex_rss_leases() {
     via_store::failpoint::activate(&points, "conformance-core").unwrap();
     count_hits(&points, TAKE);
     count_hits(&points, BLOCKED);
+    count_hits(&points, ROUTED);
+    count_hits(&points, CORE_HOLD);
     let leases = leases_copy();
     let case = codex_case(&root, NAME, leases.replay.clone());
     let cwd = serde_json::to_string(case.cwd()).unwrap().len();
@@ -4922,8 +4948,7 @@ fn codex_rss_leases() {
     let phase = Arc::new(AtomicU8::new(0));
     let fake = Arc::new(AtomicU32::new(0));
     let stop = Arc::new(AtomicBool::new(false));
-    let core_hold = points.join("core.observations.pause.json");
-    let (baseline, spawned, flood, sampling) = run(async {
+    let (baseline, spawned, flood, sampling, (held_for, blocked)) = run(async {
         let daemon = Daemon::open_with(&root, case.config());
         // Elapsed time only: the Engine settles before its baseline.
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -4962,32 +4987,102 @@ fn codex_rss_leases() {
             }
         }
         let flood = (from, written(case.pid(1)));
-        // Core holds each observation from here on.
-        let base = hits(&root, TAKE);
-        let command = json!({"token":"conformance-core","occurrence":1,"action":"delay",
-                             "value":CORE_HOLD_MS,"persist":true});
-        fs::write(&core_hold, command.to_string()).unwrap();
+        // Core's drain of each session is paused at its first fill
+        // observation, one session at a time: the next occurrence of
+        // Core's hold is armed, the session's first fill line released,
+        // and the pause acknowledged. No other observation reaches Core.
         phase.store(phase::HELD, Ordering::Release);
-        case.signal(1);
-        for (step, lines) in &leases.fill {
+        let base = hits(&root, TAKE);
+        let blocked_from = hits(&root, BLOCKED);
+        let core_from = hits(&root, CORE_HOLD);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(hits(&root, CORE_HOLD), core_from, "Core is not idle");
+        let paused: Vec<u64> = (1..=LEASES as u64).map(|k| core_from + k).collect();
+        for (occurrence, step) in paused.iter().zip(&leases.held) {
+            arm_at(&root, CORE_HOLD, *occurrence, "pause");
+            case.signal(1);
+            until_acked(&root, CORE_HOLD, *occurrence).await;
+            case.at_launch(*step, 1).await;
+        }
+        // Counted again: a later hit of Core's hold would be an
+        // observation handled while Core is held.
+        count_hits(&points, CORE_HOLD);
+        let mut routed_from = 0;
+        for (index, (step, lines)) in leases.fill.iter().enumerate() {
+            if index == 0 {
+                case.signal(1);
+            }
             ready(&case, &root, *step, base + *lines as u64).await;
+            if index + 1 == leases.fill.len() {
+                routed_from = hits(&root, ROUTED);
+            }
             case.signal(1);
         }
         case.at_launch(leases.measured, 1).await;
-        // The staged lines reach their lanes; the holders are sampled.
+        // The simultaneous occupancy, before the held peak is sampled:
+        // the staged lines were routed and none was taken, so they wait in
+        // their lanes; every fill line was taken and exactly one send per
+        // session blocked, so each channel is full with its fifth line
+        // decoded; each session's drain is still paused.
+        let by = tokio::time::Instant::now() + Duration::from_secs(30);
+        while hits(&root, ROUTED) < routed_from + STAGED_LINES as u64 {
+            assert!(
+                tokio::time::Instant::now() < by,
+                "the staged lines were not routed"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let sampled_from = tokio::time::Instant::now();
         tokio::time::sleep(Duration::from_millis(1_500)).await;
-        fs::remove_file(&core_hold).unwrap();
+        assert_eq!(
+            hits(&root, TAKE),
+            base + (FILL_LINES * LEASES) as u64,
+            "a staged line was taken, or a fill line was not"
+        );
+        assert_eq!(
+            hits(&root, BLOCKED) - blocked_from,
+            LEASES as u64,
+            "blocked channel sends during the fill"
+        );
+        assert_eq!(
+            hits(&root, CORE_HOLD),
+            core_from,
+            "Core took an observation while every drain was held"
+        );
+        let held_for = sampled_from.elapsed();
+        let blocked = hits(&root, BLOCKED) - blocked_from;
         phase.store(phase::DRAIN, Ordering::Release);
-        case.signal(1);
-        for session in &sessions {
+        // One session at a time: its drain is released and handles its
+        // other final-text pieces, then its turn completes. Core runs at
+        // most 16 blob steps at once (`BLOB_TASKS`); 32 spilled final
+        // texts settled together exceed it.
+        let pieces = via_adapters::final_text_pieces(&prompt).count() as u64;
+        let mut handled = hits(&root, CORE_HOLD);
+        for occurrence in &paused {
+            release_point(&root, CORE_HOLD, *occurrence);
+            handled += pieces * FILL_LINES as u64 - 1;
+            let by = tokio::time::Instant::now() + Duration::from_secs(60);
+            while hits(&root, CORE_HOLD) < handled {
+                assert!(
+                    tokio::time::Instant::now() < by,
+                    "Core handled {} of {handled} observations",
+                    hits(&root, CORE_HOLD)
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        for (session, step) in sessions.iter().zip(&leases.completed) {
+            case.signal(1);
             let envelope = daemon.wait(session, 1).await;
             assert_eq!(envelope["state"], "completed", "{envelope}");
+            case.at_launch(*step, 1).await;
         }
+        case.signal(1);
         for session in &sessions {
             daemon.close(session).await;
         }
         daemon.shutdown().await;
-        (baseline, spawned, flood, sampling)
+        (baseline, spawned, flood, sampling, (held_for, blocked))
     });
     stop.store(true, Ordering::Release);
     let samples = sampling.join().unwrap();
@@ -5009,16 +5104,10 @@ fn codex_rss_leases() {
     // in the flood phase only.
     let flooded = |sample: &RssSample| sample.written.saturating_sub(flood.0);
     let in_flood = || samples.iter().filter(|sample| sample.phase == phase::FLOOD);
-    let level = in_flood()
-        .filter(|sample| (32 * MIB..64 * MIB).contains(&flooded(sample)))
-        .map(|sample| sample.rss_kib)
-        .max()
-        .unwrap_or(spawned);
-    let after = in_flood()
-        .filter(|sample| flooded(sample) >= 64 * MIB)
-        .map(|sample| sample.rss_kib)
-        .max()
-        .unwrap_or(0);
+    let before_64 = || in_flood().filter(|sample| (32 * MIB..64 * MIB).contains(&flooded(sample)));
+    let after_64 = || in_flood().filter(|sample| flooded(sample) >= 64 * MIB);
+    let level = before_64().map(|sample| sample.rss_kib).max().unwrap_or(0);
+    let after = after_64().map(|sample| sample.rss_kib).max().unwrap_or(0);
     let limit = leases_sum() * 5 / 4 / 1024;
     let metrics = json!({
         "baseline_kib": baseline, "peak_kib": peak, "peak_hwm_kib": hwm,
@@ -5028,19 +5117,24 @@ fn codex_rss_leases() {
         "marginal_per_session_kib": spawned.saturating_sub(baseline) / LEASES as u64,
         "marginal_per_held_session_kib": peak_held.saturating_sub(baseline) / LEASES as u64,
         "flood_bytes": flood.1 - flood.0, "flood_samples": in_flood().count(),
-        "samples_before_64_mib": in_flood()
-            .filter(|sample| (32 * MIB..64 * MIB).contains(&flooded(sample)))
-            .count(),
+        "samples_before_64_mib": before_64().count(),
+        "samples_after_64_mib": after_64().count(),
+        "held_samples": samples.iter().filter(|sample| sample.phase == phase::HELD).count(),
+        "held_sampled_ms": held_for.as_millis(),
         "level_before_64_mib_kib": level,
         "rss_after_64_mib_kib": after,
         "sessions": LEASES, "flood_lines": FLOOD_LINES,
         "fill_lines": FILL_LINES * LEASES, "staged_bytes": maximal * STAGED_LINES as u64,
-        "taken": hits(&root, TAKE), "blocked_sends": hits(&root, BLOCKED),
+        "taken": hits(&root, TAKE), "blocked_sends_held": blocked,
         "maximal_line": maximal, "runtime_ms": started_at.elapsed().as_millis(),
         "malloc_arena_max": env::var("MALLOC_ARENA_MAX").ok(),
     });
     println!("codex_rss_leases {metrics}");
     assert!(flood.1 - flood.0 >= 256 * MIB, "{metrics}");
+    assert!(
+        before_64().count() > 0 && after_64().count() > 0,
+        "an empty growth window: {metrics}"
+    );
     assert!(
         peak.saturating_sub(baseline) <= limit,
         "peak RSS less the baseline is over 1.25 x the computed sum: {metrics}"

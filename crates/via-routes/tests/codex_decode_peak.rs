@@ -7,8 +7,10 @@
 //! an earlier decode to reuse): the line is built, the peak RSS is reset
 //! (`/proc/self/clear_refs`), and the peak (`VmHWM`) less the RSS before
 //! `decode` is its measured peak. The workspace forbids `unsafe`, so no
-//! counting allocator; RSS counts touched pages, so the measure is an
-//! upper bound of the bytes allocated at once, to a page.
+//! counting allocator. RSS is an estimate, not a bound: it counts pages
+//! touched, to the kernel's counter granularity (256 KiB here), and an
+//! allocation that reuses a page already resident is not counted (on
+//! glibc the child fixes the mmap threshold to narrow that).
 #![cfg(target_os = "linux")]
 #![expect(
     clippy::unwrap_used,

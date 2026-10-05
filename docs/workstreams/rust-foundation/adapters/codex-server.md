@@ -1271,34 +1271,60 @@ reply; written once the reply brings the `turnId`);
   server. Four loaded servers is an **extrapolation** from the per-server
   and per-turn costs, not measured. The 256-turn unresolved bound remains
   unmeasured for Codex (X0-Q1, ruled: no extra cap).
-- **As built (X5).** `codex_rss_leases` (`crates/via-core/tests/conformance_core.rs`,
-  `test-failpoints`, run alone by `.config/nextest.toml`, about 21 s) runs
+- **As built (X5, fix r1).** `codex_rss_leases` (`crates/via-core/tests/conformance_core.rs`,
+  `test-failpoints`, run alone by `.config/nextest.toml`, about 19 s) runs
   Core's Engine in its own process over one replay server. Each of the 32
   sessions' prompts is at the Codex echo cap (via-5lr.6), so the
   per-turn row counts 1,040,384 bytes, not 16 MiB, and the computed sum
-  is 327 MiB. A paced flood of 272 maximal thread lines (about 270 MiB)
-  is consumed with Core draining. Then Core's drain is held
-  (`core.observations.pause`, a persistent 5 s delay). Five maximal
-  `final_answer` lines per session fill its channel and leave the fifth
-  decoded and blocked. Four maximal lines in blocked lanes fill the 4 MiB
-  staging. The fake's gates are released by counted consumer takes
-  (`adapter.codex.consumer_take`), so Wire's staging never holds more
-  than three lines. The test raises the C2 stall to 120 s
-  (`VIA_TEST_EVENT_STALL_MS`) so the held channels do not end their
-  turns. Correlation, pending replies and driver controls are not driven
-  to their maxima (384 KiB of the sum together).
+  is 327 MiB.
+  1. A paced flood of 272 maximal thread lines (about 270 MiB) is consumed
+     with Core draining. The growth windows before and after the flood's
+     first 64 MiB must both hold samples.
+  2. Core's drain of each session is then paused at its first fill
+     observation, one session at a time (`core.observations.pause`
+     armed per occurrence, each pause acknowledged). The pauses do not
+     expire; the test releases them after the measurement.
+  3. Five maximal `final_answer` lines per session fill its channel and
+     leave the fifth decoded and blocked. Four maximal lines in blocked
+     lanes fill the 4 MiB staging. The fake's gates are released by
+     counted consumer takes (`adapter.codex.consumer_take`), so Wire's
+     staging never holds more than three lines.
+  4. Before and after the 1.5 s held sample, the test asserts the
+     simultaneous occupancy:
+     - the four staged lines were routed (`codex.connection.message`)
+       and none was taken;
+     - every fill line was taken;
+     - exactly 32 channel sends blocked, one per session
+       (`adapter.observation.blocked`);
+     - Core handled no observation while held.
+
+     A replay fake stopped for 21 s mid-fill still reaches the same
+     occupancy and peak.
+  5. The drains are released one session at a time, then each turn
+     completes in turn. Core runs at most 16 blob steps at once
+     (`BLOB_TASKS`). Settling 32 spilled final texts together failed 16
+     turns `store` ("too many blob steps outstanding").
+
+  The test raises the C2 stall to 120 s (`VIA_TEST_EVENT_STALL_MS`) so the
+  held channels do not end their turns.
+
+  **The qualification is partial.** Correlation (256 KiB), pending
+  replies (64 KiB) and the 32 sessions' driver controls (32 × 64 KiB) are
+  not driven to their maxima, 2,368 KiB of the sum together.
+
   Measured, two runs each:
 
   | Build | Baseline | Peak | Peak less baseline | Growth after 64 MiB |
   |---|---|---|---|---|
-  | musl (authoritative) | 20 MiB | 221 MiB | 202 MiB | under 0.5 MiB |
-  | glibc, `MALLOC_ARENA_MAX=2` | 27 MiB | 229 MiB | 202 MiB | none |
+  | musl (authoritative) | 20 MiB | 221 MiB | 202 MiB | under 0.1 MiB |
+  | glibc, `MALLOC_ARENA_MAX=2` | 27 MiB | 230 MiB | 204 MiB | none |
 
   The limit is 409 MiB. Both builds reach about 6.3 MiB per session at
-  the held peak and about 0.2 MiB per idle active session.
+  the held peak and about 0.17 MiB per idle active session.
 
   One maximal decode peaks at about 3.5 MiB of RSS on glibc and 3.75 MiB
-  on musl, against the 5 MiB `DECODE_ALLOWANCE`. That measure is
+  on musl, against the 5 MiB `DECODE_ALLOWANCE`. RSS is an estimate, to
+  the kernel's 256 KiB counter granularity, not a bound. That measure is
   `codex_decode_peak_within_allowance`
   (`crates/via-routes/tests/codex_decode_peak.rs`). It decodes eight
   shapes, each in a fresh process. The worst is a `final_answer` text or
