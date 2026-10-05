@@ -16,7 +16,11 @@ use std::{
 };
 
 use sha2::{Digest, Sha256};
-use tokio::{runtime::Handle, sync::oneshot, task::JoinSet};
+use tokio::{
+    runtime::Handle,
+    sync::{OwnedSemaphorePermit, Semaphore, oneshot},
+    task::JoinSet,
+};
 
 use crate::{StoreError, evidence::sync_dir};
 
@@ -110,14 +114,13 @@ fn valid_id(id: &str) -> bool {
     })
 }
 
-/// Most blob steps the Store owns at once. `spawn_blocking` work cannot be
-/// aborted (coding-style §5), so a step that overran its caller's bound
-/// stays owned until it ends; the cap bounds how many blocking threads a
-/// stalled filesystem can hold. Four dispatch loads (§5.1) plus a dozen
-/// concurrent receipt or discard steps; each healthy step is one 64 KiB
-/// write or one sync, or a turn folder's short step (its creation, its
-/// `undecoded.bin`, a `logs` `lstat`), so the cap is rarely reached except
-/// by a stall.
+/// Most blob steps running at once. `spawn_blocking` work cannot be aborted
+/// (coding-style §5), so a step that overran its caller's bound stays owned
+/// until it ends; the cap bounds how many blocking threads a stalled
+/// filesystem can hold. A step past the cap waits for a slot within its
+/// own bound (bead via-s4s), so healthy concurrency, such as 32 turns
+/// settling spilled final texts together, only queues; a step is refused
+/// only when no slot frees in time, which is the stall the cap is for.
 const BLOB_TASKS: usize = 16;
 
 /// How long `Store::drop` waits for owned blob steps, within final
@@ -126,12 +129,24 @@ pub(crate) const BLOB_DRAIN: Duration = Duration::from_secs(1);
 
 /// The Store's owned blob steps (coding-style §5 task ownership): every
 /// step runs on the blocking pool inside this `JoinSet`, which keeps it
-/// until it ends. The mutex is never held across an `.await`. Final
-/// shutdown holds a clone to count the steps still running after the
-/// Store's bounded drain.
-#[derive(Clone, Debug, Default)]
+/// until it ends, holding one of [`BLOB_TASKS`] slots that it releases as
+/// it ends. The mutex is never held across an `.await`. Final shutdown
+/// holds a clone to count the steps still running after the Store's
+/// bounded drain.
+#[derive(Clone, Debug)]
 pub struct BlobTasks {
     set: Arc<Mutex<JoinSet<()>>>,
+    /// Never closed; FIFO, so a waiting step is not starved.
+    slots: Arc<Semaphore>,
+}
+
+impl Default for BlobTasks {
+    fn default() -> Self {
+        Self {
+            set: Arc::default(),
+            slots: Arc::new(Semaphore::new(BLOB_TASKS)),
+        }
+    }
 }
 
 impl BlobTasks {
@@ -139,43 +154,79 @@ impl BlobTasks {
         self.set.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Admits `work` onto `runtime`'s blocking pool, after reaping ended
-    /// steps; at the cap it is refused at once.
-    fn admit(
+    /// Admits `work` onto `runtime`'s blocking pool once a slot is free,
+    /// waiting at most until `deadline`: `false` when no slot was taken
+    /// before it, and nothing was started. Cancelled while waiting, it
+    /// starts nothing.
+    async fn admit(
         &self,
         runtime: &Handle,
+        deadline: tokio::time::Instant,
         work: impl FnOnce() + Send + 'static,
-    ) -> Result<(), StoreError> {
-        let mut set = self.lock();
-        while set.try_join_next().is_some() {}
-        if set.len() >= BLOB_TASKS {
-            return Err(StoreError::Write(
-                "blob I/O: too many blob steps outstanding".to_owned(),
-            ));
+    ) -> bool {
+        let slot = Arc::clone(&self.slots).acquire_owned();
+        // `Err` inside is a closed semaphore, which this never closes.
+        let Ok(Ok(slot)) = tokio::time::timeout_at(deadline, slot).await else {
+            return false;
+        };
+        // `timeout_at` polls the acquisition before it checks the deadline,
+        // so a slot that freed while this task was not polled can arrive
+        // late: past the deadline the work never starts and the slot returns.
+        if tokio::time::Instant::now() >= deadline {
+            return false;
         }
-        set.spawn_blocking_on(work, runtime);
-        Ok(())
+        self.start(runtime, slot, work);
+        true
     }
 
-    /// Runs one blob step, owned by this set, and waits for its result at
-    /// most [`BLOB_IO`]. A step that overran keeps running to its end,
-    /// owning what it was given; the caller's request is not committed.
+    /// Starts `work` holding `slot`, after reaping ended steps. The slot
+    /// moves into the blocking closure and is released as it ends, even by
+    /// a panic, so the slots bound the blocking threads held.
+    fn start(
+        &self,
+        runtime: &Handle,
+        slot: OwnedSemaphorePermit,
+        work: impl FnOnce() + Send + 'static,
+    ) {
+        let mut set = self.lock();
+        while set.try_join_next().is_some() {}
+        set.spawn_blocking_on(
+            move || {
+                let _slot = slot;
+                work();
+            },
+            runtime,
+        );
+    }
+
+    /// Runs one blob step, owned by this set, and waits at most
+    /// [`BLOB_IO`] for a slot and its result together. A step that overran
+    /// keeps running to its end, owning what it was given; the caller's
+    /// request is not committed.
     pub async fn run<T: Send + 'static>(
         &self,
         work: impl FnOnce() -> io::Result<T> + Send + 'static,
     ) -> Result<T, StoreError> {
         let runtime = Handle::try_current()
             .map_err(|error| StoreError::Write(format!("blob task: {error}")))?;
+        let deadline = tokio::time::Instant::now() + BLOB_IO;
         let (reply, result) = oneshot::channel();
-        self.admit(&runtime, move || {
-            #[cfg(feature = "test-failpoints")]
-            if let Err(error) = crate::failpoint::hit("blob.step.stall") {
-                let _ = reply.send(Err(error));
-                return;
-            }
-            let _ = reply.send(work());
-        })?;
-        match tokio::time::timeout(BLOB_IO, result).await {
+        let admitted = self
+            .admit(&runtime, deadline, move || {
+                #[cfg(feature = "test-failpoints")]
+                if let Err(error) = crate::failpoint::hit("blob.step.stall") {
+                    let _ = reply.send(Err(error));
+                    return;
+                }
+                let _ = reply.send(work());
+            })
+            .await;
+        if !admitted {
+            return Err(StoreError::Write(
+                "blob I/O: no blob step slot freed within 2 s".to_owned(),
+            ));
+        }
+        match tokio::time::timeout_at(deadline, result).await {
             Ok(Ok(Ok(value))) => Ok(value),
             Ok(Ok(Err(error))) => Err(StoreError::Write(format!("blob I/O: {error}"))),
             Ok(Err(_)) => Err(StoreError::Write(
@@ -186,9 +237,10 @@ impl BlobTasks {
     }
 
     /// Like [`Self::run`] for a step on a caller's file, bounded by the
-    /// caller's `deadline` instead of 2 s: `Ok(None)` when the deadline
-    /// passed first, the step still owned until it ends. The step's own
-    /// outcome, errors included, is its value.
+    /// caller's `deadline` instead of 2 s, the wait for a slot included:
+    /// `Ok(None)` when the deadline passed first, a started step still
+    /// owned until it ends. The step's own outcome, errors included, is
+    /// its value.
     pub(crate) async fn run_until<T: Send + 'static>(
         &self,
         deadline: tokio::time::Instant,
@@ -197,9 +249,14 @@ impl BlobTasks {
         let runtime = Handle::try_current()
             .map_err(|error| StoreError::Write(format!("blob task: {error}")))?;
         let (reply, result) = oneshot::channel();
-        self.admit(&runtime, move || {
-            let _ = reply.send(work());
-        })?;
+        let admitted = self
+            .admit(&runtime, deadline, move || {
+                let _ = reply.send(work());
+            })
+            .await;
+        if !admitted {
+            return Ok(None);
+        }
         match tokio::time::timeout_at(deadline, result).await {
             Ok(Ok(value)) => Ok(Some(value)),
             Ok(Err(_)) => Err(StoreError::Write(
@@ -210,14 +267,18 @@ impl BlobTasks {
     }
 
     /// Unlinks `path` from a synchronous `Drop`: inside a runtime the unlink
-    /// is an owned step (never blocking a Tokio worker); at the cap it is
-    /// left for the start-up sweep; outside any runtime it runs here.
+    /// is an owned step (never blocking a Tokio worker); with no slot free
+    /// it is left for the start-up sweep, as `Drop` cannot wait; outside
+    /// any runtime it runs here.
     fn unlink_detached(&self, path: PathBuf) {
         match Handle::try_current() {
             Ok(runtime) => {
-                let _ = self.admit(&runtime, move || {
-                    let _ = fs::remove_file(path);
-                });
+                // No free slot: the file is left for the start-up sweep.
+                if let Ok(slot) = Arc::clone(&self.slots).try_acquire_owned() {
+                    self.start(&runtime, slot, move || {
+                        let _ = fs::remove_file(path);
+                    });
+                }
             }
             Err(_) => {
                 let _ = fs::remove_file(path);
@@ -762,49 +823,267 @@ impl BlobReader {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::mpsc, time::Duration};
+    use std::{
+        pin::{Pin, pin},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            mpsc,
+        },
+        task::Poll,
+        time::{Duration, Instant},
+    };
+
+    use tokio::runtime::Handle;
 
     use super::{BLOB_TASKS, BlobTasks, utf8_continues};
     use crate::StoreError;
 
-    /// Review round 1: past [`BLOB_TASKS`] owned steps a new step is
-    /// refused at once as `Write` (the request's `not_committed`), and a
-    /// `Drop` unlink is left for the sweep; ended steps are reaped.
-    #[test]
-    fn blob_steps_past_the_cap_are_refused_at_once() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .expect("runtime");
-        let tasks = BlobTasks::default();
+            .expect("runtime")
+    }
+
+    /// Fills every slot with a step that counts itself in `running` (its
+    /// highest in `peak`) and ends when the returned sender sends, one
+    /// step per message, or is dropped, every step.
+    async fn hold_every_slot(
+        tasks: &BlobTasks,
+        (running, peak): (&Arc<AtomicUsize>, &Arc<AtomicUsize>),
+    ) -> mpsc::Sender<()> {
         let (release, blocked) = mpsc::channel::<()>();
-        let blocked = std::sync::Arc::new(std::sync::Mutex::new(blocked));
+        let blocked = Arc::new(Mutex::new(blocked));
+        let by = tokio::time::Instant::now() + Duration::from_secs(1);
+        for _ in 0..BLOB_TASKS {
+            let blocked = Arc::clone(&blocked);
+            let (running, peak) = (Arc::clone(running), Arc::clone(peak));
+            let admitted = tasks
+                .admit(&Handle::current(), by, move || {
+                    let now = running.fetch_add(1, Ordering::AcqRel) + 1;
+                    peak.fetch_max(now, Ordering::AcqRel);
+                    let _ = blocked.lock().map(|blocked| blocked.recv());
+                    running.fetch_sub(1, Ordering::AcqRel);
+                })
+                .await;
+            assert!(admitted, "a free slot admits at once");
+        }
+        assert_eq!(tasks.outstanding(), BLOB_TASKS);
+        release
+    }
+
+    /// Polls `future` once: whether it is still pending.
+    async fn pending<F: Future>(mut future: Pin<&mut F>) -> bool {
+        std::future::poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx).is_pending())).await
+    }
+
+    /// Blocks until at most `left` steps are owned, within 10 s.
+    fn ended_down_to(tasks: &BlobTasks, left: usize) {
+        let by = Instant::now() + Duration::from_secs(10);
+        while tasks.outstanding() > left {
+            assert!(
+                Instant::now() < by,
+                "{} steps still owned",
+                tasks.outstanding()
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Every slot is free again: none was leaked.
+    fn every_slot_free(tasks: &BlobTasks) {
+        assert_eq!(tasks.drain(Duration::from_secs(10)), 0);
+        assert_eq!(tasks.slots.available_permits(), BLOB_TASKS);
+    }
+
+    /// Review round 1, bead via-s4s: with [`BLOB_TASKS`] steps stalled, a
+    /// new step waits for a slot within its bound and is then refused, as
+    /// `Write` (the request's `not_committed`) at 2 s or `None` at its
+    /// deadline, starting nothing: at most the cap's threads are held. A
+    /// `Drop` unlink with no slot is left for the sweep. Once the stall
+    /// ends the steps are reaped and a new step runs.
+    #[test]
+    fn stalled_steps_hold_the_cap_and_a_new_step_is_refused_at_its_bound() {
+        let runtime = runtime();
+        let tasks = BlobTasks::default();
+        let counts = (&Arc::default(), &Arc::default());
         let root = tempfile::tempdir().expect("dir");
         let kept = root.path().join("kept.blob");
         std::fs::write(&kept, b"x").expect("file");
-        runtime.block_on(async {
-            for _ in 0..BLOB_TASKS {
-                let blocked = std::sync::Arc::clone(&blocked);
-                tasks
-                    .admit(&tokio::runtime::Handle::current(), move || {
-                        let _ = blocked.lock().map(|blocked| blocked.recv());
-                    })
-                    .expect("admitted");
-            }
-            assert_eq!(tasks.outstanding(), BLOB_TASKS);
+        let release = runtime.block_on(async {
+            let release = hold_every_slot(&tasks, counts).await;
+            let started = Instant::now();
             let refused = tasks.run(|| Ok(())).await;
+            let waited = started.elapsed();
             assert!(
-                matches!(&refused, Err(StoreError::Write(message)) if message.contains("outstanding")),
+                matches!(&refused, Err(StoreError::Write(message)) if message.contains("slot")),
                 "{refused:?}"
             );
+            assert!(
+                waited >= Duration::from_millis(1_900) && waited < Duration::from_secs(4),
+                "refused after {waited:?}"
+            );
+            let started = Instant::now();
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+            let late = tasks.run_until(deadline, || ()).await;
+            assert!(matches!(late, Ok(None)), "{late:?}");
+            assert!(started.elapsed() < Duration::from_secs(2), "{started:?}");
+            assert_eq!(tasks.outstanding(), BLOB_TASKS, "a refused step started");
             tasks.unlink_detached(kept.clone());
+            assert_eq!(tasks.outstanding(), BLOB_TASKS);
+            release
         });
         assert!(
             kept.exists(),
-            "a Drop unlink at the cap is left for the sweep"
+            "a Drop unlink with no slot is left for the sweep"
         );
         drop(release);
-        assert_eq!(tasks.drain(Duration::from_secs(10)), 0);
+        every_slot_free(&tasks);
+        runtime.block_on(async {
+            assert!(tasks.run(|| Ok(())).await.is_ok(), "the slots were freed");
+        });
+    }
+
+    /// Bead via-s4s critical review: a queued step whose deadline passed
+    /// while its executor stalled never starts, even when a slot frees
+    /// before it is polled again: it is refused as an acquisition timeout
+    /// is, and the slot returns.
+    #[test]
+    fn a_queued_step_past_its_deadline_never_starts() {
+        let runtime = runtime();
+        let tasks = BlobTasks::default();
+        let ran = Arc::new(AtomicBool::new(false));
+        runtime.block_on(async {
+            let release = hold_every_slot(&tasks, (&Arc::default(), &Arc::default())).await;
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+            let flag = Arc::clone(&ran);
+            let mut queued = pin!(tasks.run_until(deadline, move || {
+                flag.store(true, Ordering::Release);
+            }));
+            assert!(pending(queued.as_mut()).await, "queued behind the cap");
+            // The executor stalls past the deadline; a slot frees meanwhile.
+            std::thread::sleep(Duration::from_millis(200));
+            release.send(()).expect("a holder waits");
+            ended_down_to(&tasks, BLOB_TASKS - 1);
+            let late = queued.await;
+            drop(release);
+            assert!(matches!(late, Ok(None)), "{late:?}");
+        });
+        every_slot_free(&tasks);
+        assert!(
+            !ran.load(Ordering::Acquire),
+            "work started after its deadline"
+        );
+    }
+
+    /// Bead via-s4s: the wait for a slot and the work share one bound. A
+    /// step that gets its slot near its deadline and then stalls answers
+    /// at the deadline, not a full bound after its slot.
+    #[test]
+    fn a_queued_step_shares_its_bound_with_its_wait() {
+        let runtime = runtime();
+        let tasks = BlobTasks::default();
+        let (stall, stalled) = mpsc::channel::<()>();
+        runtime.block_on(async {
+            let release = hold_every_slot(&tasks, (&Arc::default(), &Arc::default())).await;
+            let started = Instant::now();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            // A slot frees 0.9 s in, 0.1 s before the deadline.
+            let releaser = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(900));
+                release.send(()).expect("a holder waits");
+                release
+            });
+            let late = tasks.run_until(deadline, move || stalled.recv()).await;
+            let answered = started.elapsed();
+            let release = releaser.join().expect("releaser");
+            assert!(matches!(late, Ok(None)), "{late:?}");
+            // A fresh bound after the slot would answer near 1.9 s.
+            assert!(answered < Duration::from_millis(1_500), "{answered:?}");
+            assert_eq!(tasks.outstanding(), BLOB_TASKS, "the stalled step is owned");
+            drop(release);
+        });
+        drop(stall);
+        every_slot_free(&tasks);
+    }
+
+    /// Bead via-s4s: a queued step cancelled by its caller starts nothing
+    /// and leaks no slot.
+    #[test]
+    fn a_cancelled_queued_step_starts_nothing_and_leaks_no_slot() {
+        let runtime = runtime();
+        let tasks = BlobTasks::default();
+        let ran = Arc::new(AtomicBool::new(false));
+        runtime.block_on(async {
+            let release = hold_every_slot(&tasks, (&Arc::default(), &Arc::default())).await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let flag = Arc::clone(&ran);
+            let mut queued = Box::pin(tasks.run_until(deadline, move || {
+                flag.store(true, Ordering::Release);
+            }));
+            assert!(pending(queued.as_mut()).await, "queued behind the cap");
+            drop(queued);
+            drop(release);
+        });
+        every_slot_free(&tasks);
+        assert!(!ran.load(Ordering::Acquire), "a cancelled step started");
+    }
+
+    /// Bead via-s4s: a step that panics returns its slot as it unwinds;
+    /// its caller sees a `Write` failure.
+    #[test]
+    fn a_panicking_step_returns_its_slot() {
+        let runtime = runtime();
+        let tasks = BlobTasks::default();
+        runtime.block_on(async {
+            let failed = tasks
+                .run(|| -> std::io::Result<()> { panic!("a blob step panics") })
+                .await;
+            assert!(
+                matches!(&failed, Err(StoreError::Write(message)) if message.contains("without a result")),
+                "{failed:?}"
+            );
+        });
+        every_slot_free(&tasks);
+    }
+
+    /// Bead via-s4s: twice [`BLOB_TASKS`] healthy steps at once all
+    /// succeed. With every slot held, each further step is explicitly
+    /// polled to pending, not refused; once the holders end, each runs,
+    /// and no more than the cap run at once.
+    #[test]
+    fn healthy_steps_past_the_cap_wait_for_a_slot() {
+        let runtime = runtime();
+        let tasks = BlobTasks::default();
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        runtime.block_on(async {
+            let release = hold_every_slot(&tasks, (&running, &peak)).await;
+            let mut queued = Vec::new();
+            for _ in 0..BLOB_TASKS {
+                let (running, peak) = (Arc::clone(&running), Arc::clone(&peak));
+                let mut step = Box::pin(tasks.run(move || {
+                    let now = running.fetch_add(1, Ordering::AcqRel) + 1;
+                    peak.fetch_max(now, Ordering::AcqRel);
+                    running.fetch_sub(1, Ordering::AcqRel);
+                    Ok(())
+                }));
+                assert!(
+                    pending(step.as_mut()).await,
+                    "a step past the cap was answered"
+                );
+                queued.push(step);
+            }
+            drop(release);
+            for step in queued {
+                let step = step.await;
+                assert!(step.is_ok(), "a healthy step failed: {step:?}");
+            }
+        });
+        let peak = peak.load(Ordering::Acquire);
+        assert!(peak <= BLOB_TASKS, "{peak} steps ran at once");
+        every_slot_free(&tasks);
     }
 
     /// Design §10.4: a character split across chunks carries over; an

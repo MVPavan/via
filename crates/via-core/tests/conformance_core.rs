@@ -4825,8 +4825,8 @@ struct Leases {
     fill: Vec<(usize, usize)>,
     /// The gate after the staged lines, where the holders are measured.
     measured: usize,
-    /// The gate after each session's `turn/completed`.
-    completed: Vec<usize>,
+    /// The gate after every session's `turn/completed`, written together.
+    completed: usize,
 }
 
 /// `c1_commentary_usage`'s handshake, then [`LEASES`] sessions, each
@@ -4911,11 +4911,10 @@ fn leases_copy() -> Leases {
         emit(&mut steps, status(k));
     }
     let measured = gate(&mut steps);
-    let mut completed = Vec::new();
     for k in 0..LEASES {
         emit(&mut steps, for_lease(&line_of(28), k));
-        completed.push(gate(&mut steps));
     }
+    let completed = gate(&mut steps);
     for k in 0..LEASES {
         let (t, _) = lease_ids(k);
         steps.push(json!({"expect":{"line":{"method":"thread/unsubscribe",
@@ -5052,8 +5051,8 @@ fn leases_sum() -> u64 {
 /// staging filled with lines in blocked lanes. That occupancy is asserted
 /// from counted failpoint hits before and after the held sample; then
 /// peak RSS less the idle baseline is within [`leases_sum`] plus 25%.
-/// Then each drain is released and each turn completes, one session at a
-/// time, and every session closes. 10 ms sampling; on glibc
+/// Then every drain is released together, every turn completes together,
+/// and every session closes. 10 ms sampling; on glibc
 /// `MALLOC_ARENA_MAX=2` as F24's proxy. Held to its own nextest slot
 /// (`.config/nextest.toml`).
 #[cfg(feature = "test-failpoints")]
@@ -5202,31 +5201,30 @@ fn codex_rss_leases() {
         let held_for = sampled_from.elapsed();
         let blocked = hits(&root, BLOCKED) - blocked_from;
         phase.store(phase::DRAIN, Ordering::Release);
-        // One session at a time: its drain is released and handles its
-        // other final-text pieces, then its turn completes. Core runs at
-        // most 16 blob steps at once (`BLOB_TASKS`); 32 spilled final
-        // texts settled together exceed it.
+        // Every drain is released together and handles its other
+        // final-text pieces; then every turn completes together, so 32
+        // spilled final texts settle at once, past the Store's 16
+        // blob-step slots (bead via-s4s).
         let pieces = via_adapters::final_text_pieces(&prompt).count() as u64;
-        let mut handled = hits(&root, CORE_HOLD);
+        let handled = hits(&root, CORE_HOLD) + LEASES as u64 * (pieces * FILL_LINES as u64 - 1);
         for occurrence in &paused {
             release_point(&root, CORE_HOLD, *occurrence);
-            handled += pieces * FILL_LINES as u64 - 1;
-            let by = tokio::time::Instant::now() + Duration::from_secs(60);
-            while hits(&root, CORE_HOLD) < handled {
-                assert!(
-                    tokio::time::Instant::now() < by,
-                    "Core handled {} of {handled} observations",
-                    hits(&root, CORE_HOLD)
-                );
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
         }
-        for (session, step) in sessions.iter().zip(&leases.completed) {
-            case.signal(1);
+        let by = tokio::time::Instant::now() + Duration::from_secs(60);
+        while hits(&root, CORE_HOLD) < handled {
+            assert!(
+                tokio::time::Instant::now() < by,
+                "Core handled {} of {handled} observations",
+                hits(&root, CORE_HOLD)
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        case.signal(1);
+        for session in &sessions {
             let envelope = daemon.wait(session, 1).await;
             assert_eq!(envelope["state"], "completed", "{envelope}");
-            case.at_launch(*step, 1).await;
         }
+        case.at_launch(leases.completed, 1).await;
         case.signal(1);
         for session in &sessions {
             daemon.close(session).await;
