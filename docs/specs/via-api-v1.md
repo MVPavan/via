@@ -126,6 +126,10 @@ decided in the slice that needs them, after re-probing.
   verbs one line. Exit codes: 0 success; 2 request error; 3 turn ended
   `failed`, `cancelled` or `unknown`; 4 daemon unreachable; 130 foreground
   wait interrupted (the session keeps running; the receipt was printed).
+  A request the CLI refuses before sending it (no handle given, a
+  malformed handle or `--vendor`) is a request error: it prints the
+  `invalid_params` error naming the member (`data.field`) and contacts no
+  daemon.
   `via daemon` starts the foreground server; `via daemon status` and
   `via daemon stop` remain client verbs.
 

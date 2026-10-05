@@ -1234,7 +1234,7 @@ Harness given with an uncatalogued model → the vendor decides after acceptance
 
 Credentials never appear in config, the Store or evidence (invariant 1). The
 inherited inventory the route can read (§5.4.1) is written to the turn's
-evidence folder.
+evidence folder (Claude amended 2026-10-05: not recorded; vendor packet §4).
 
 #### 5.4.1 Categories per harness (OD2)
 

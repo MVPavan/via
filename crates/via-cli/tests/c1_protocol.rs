@@ -614,3 +614,38 @@ fn c1_client_refuses_daemon_socket_of_another_uid() -> TestResult {
     assert!(output.stdout.is_empty());
     Ok(())
 }
+
+/// Bead via-7c6: a request the CLI refuses before sending it is a request
+/// error (C1 §1: exit 2), never `daemon_unreachable` (exit 4). `via cancel`
+/// with no handle anywhere, or a malformed one, is `invalid_params` naming
+/// `handle`, and a malformed `--vendor` names `vendor`. Nothing reaches a daemon: none
+/// is started.
+#[test]
+fn c1_cli_refuses_a_missing_or_malformed_parameter_as_invalid_params() -> TestResult {
+    let sandbox = Sandbox::new()?;
+    let cases: [(&[&str], &str); 3] = [
+        (&["cancel", SESSION], "handle"),
+        (&["cancel", SESSION, "--handle", "h_short"], "handle"),
+        (
+            &[
+                "resume", SESSION, "--handle", HANDLE, "--prompt", "p", "--vendor", "novalue",
+            ],
+            "vendor",
+        ),
+    ];
+    for (args, field) in cases {
+        let output = sandbox.command().args(args).output()?;
+        let stderr: Value = serde_json::from_slice(&output.stderr)
+            .map_err(|error| format!("{args:?}: stderr is not JSON ({error})"))?;
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {stderr}");
+        assert_eq!(stderr["code"], -32602, "{args:?}: {stderr}");
+        assert_eq!(
+            stderr["data"]["kind"], "invalid_params",
+            "{args:?}: {stderr}"
+        );
+        assert_eq!(stderr["data"]["field"], field, "{args:?}: {stderr}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+    }
+    assert!(!sandbox.socket().exists(), "a daemon was started");
+    Ok(())
+}

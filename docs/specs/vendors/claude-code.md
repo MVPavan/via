@@ -133,7 +133,8 @@ Version (C2 §5; owner OD1). Every Claude Code version is supported by
 default. Check init `claude_code_version` on every launch, parsing the
 complete version including any prerelease/build qualifier, never guessed from
 an executable filename. A version in the adapter's `checked` set (versions the
-maintainers' cheap live check passed) is `tested`; any other is `untested`,
+maintainers' cheap live check passed: 2.1.285 and, from the live round of
+2026-10-05, 2.1.289) is `tested`; any other is `untested`,
 with warning `vendor_version_untested`, and proceeds. Only a failed handshake
 check on something VIA relies on (`interrupt_receipt_v1`, the permission-mode
 echo, the tool list) refuses the instance. Init follows the prompt line, so
@@ -252,8 +253,15 @@ the mode cannot deliver keeps the effective state above and warns
 `config_switch_unverified` (C1 §3.7, C2 §6.2): for example the restricted
 mode with the default request lists hooks, plugins, skills, agents and
 instruction files. Auto-memory is not a C1 category; it follows instruction
-files. Init lists plugins, skills, agents, slash commands and MCP servers
-(verified); that inventory is recorded in the turn's evidence folder.
+files. Init lists the tools, model, plugins, skills, agents, slash commands,
+MCP servers and permission mode (verified). VIA reads the tools, permission
+mode and MCP servers for the handshake check (§3) but does not record the
+inventory in the turn's evidence folder (amended 2026-10-05, bead via-7c6):
+the Claude route has no evidence-file writer, and adding one means a new evidence
+file through Wire or Store and the C1 `logs` listing, more than that fix.
+The categories above were verified from the probes' own init captures.
+Revisit when per-turn inventory evidence is needed (a qualification run or a
+user question about what loaded).
 
 No free-form vendor options in this first recipe. Reject unknown Claude vendor
 keys with `invalid_params`; recognized reserved keys use

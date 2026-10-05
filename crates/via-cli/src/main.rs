@@ -226,7 +226,12 @@ impl TurnArgs {
                 let (name, value) = option
                     .split_once('=')
                     .and_then(|(key, value)| Some((key.split_once('.')?, value)))
-                    .ok_or_else(|| anyhow::anyhow!("--vendor takes harness.key=value"))?;
+                    .ok_or_else(|| {
+                        client::RequestError::invalid_params(
+                            "vendor",
+                            "--vendor takes harness.key=value",
+                        )
+                    })?;
                 vendor[name.0][name.1] = Value::String(value.to_owned());
             }
             params["vendor"] = vendor;
@@ -396,9 +401,15 @@ fn main() -> ExitCode {
     let code = match runtime.block_on(run(Cli::parse())) {
         Ok(code) => code,
         Err(error) => {
-            let value = json!({"code": 4, "message": error.to_string(), "data": {"kind": "daemon_unreachable"}});
-            let _ = write_json(io::stderr(), &value);
-            4
+            // Refused before sending: C1's request error.
+            if let Some(request) = error.downcast_ref::<client::RequestError>() {
+                let _ = write_json(io::stderr(), &request.to_value());
+                2
+            } else {
+                let value = json!({"code": 4, "message": error.to_string(), "data": {"kind": "daemon_unreachable"}});
+                let _ = write_json(io::stderr(), &value);
+                4
+            }
         }
     };
     // The daemon already bounded its final shutdown; never wait here for a

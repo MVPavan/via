@@ -17,8 +17,8 @@ use crate::plan::{
 };
 
 /// Versions the maintainers' live check passed (C2 §5): the 2026-09-30
-/// re-probe's.
-pub(crate) const CHECKED: &[&str] = &["2.1.285"];
+/// re-probe's and the 2026-10-05 live round's.
+pub(crate) const CHECKED: &[&str] = &["2.1.285", "2.1.289"];
 
 /// The efforts `--effort` accepts (packet §4, help 2.1.285). Claude ignores
 /// any other with only a stderr warning, so VIA refuses it (AD18).
@@ -1144,6 +1144,25 @@ mod tests {
             (plan.vendor_version.as_deref(), plan.version_status),
             (Some("2.1.285"), VersionStatus::Tested)
         );
+    }
+
+    /// Bead via-7c6: the live round of 2026-10-05 passed on 2.1.289, so a
+    /// plan whose last version seen is 2.1.289 is `tested`, as 2.1.285 is;
+    /// another version stays `untested`.
+    #[test]
+    fn checked_versions_are_tested() {
+        let dir = tempfile::tempdir().unwrap();
+        let (adapter, instances, binary) = adapter_in(dir.path());
+        let harness = Harness::Vendor(&crate::harness::HARNESSES[0]);
+        let now = std::time::Instant::now();
+        for (version, status) in [
+            ("2.1.285", VersionStatus::Tested),
+            ("2.1.289", VersionStatus::Tested),
+            ("2.1.290", VersionStatus::Untested),
+        ] {
+            instances.record_version(harness.name(), &binary, version.to_owned());
+            assert_eq!(plan_of(&adapter, now).version_status, status, "{version}");
+        }
     }
 
     /// AD18 and G8: efforts outside the table and values past the argument
