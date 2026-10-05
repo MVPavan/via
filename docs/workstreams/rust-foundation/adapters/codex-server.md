@@ -1342,7 +1342,11 @@ The record's trigger (critical review x5) is the turn the first dropped
 lane item was routed under: `AbnormalEnd.owner`, the item's mapped owner
 at routing (or a `turn/start` reply's turn), with no decode. A
 predecessor's late messages lost while its successor runs therefore name
-the predecessor on the successor's warning. Thread-level traffic and the
+the predecessor on the successor's warning. The push that overflows the lane
+calls the driver's overflow handler before it ends the lane, with the
+lane's lock released (`Lane::push_noting`), so that record is in place
+before any observer of the overflow could install one naming the latest
+turn (critical re-review x5). Thread-level traffic and the
 other loss sources name the session's latest turn. `first_unqueued` stays
 the merged lower bound: a quarantine notes its registration's seal, which
 can floor it to 1.

@@ -4364,19 +4364,61 @@ fn overflow_copy(burst_line: &str) -> OverflowCopy {
     }
 }
 
-/// Waits until `point`'s counted hits stop changing; returns them.
+/// The occurrences of `point`'s hits counted so far (each refusal's
+/// marker), ascending.
 #[cfg(feature = "test-failpoints")]
-async fn settled_hits(root: &Path, point: &str) -> u64 {
-    let mut seen = hits(root, point);
+fn counted(root: &Path, point: &str) -> Vec<u64> {
+    let prefix = format!("{point}.");
+    let mut counted: Vec<u64> = fs::read_dir(root.join("points"))
+        .unwrap()
+        .filter_map(|entry| {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            name.strip_prefix(&prefix)
+                .and_then(|rest| rest.strip_suffix(".refused"))
+                .and_then(|number| number.parse::<u64>().ok())
+        })
+        .collect();
+    counted.sort_unstable();
+    counted
+}
+
+/// Waits until `n` hits of `point` were counted; returns the last one's
+/// occurrence.
+#[cfg(feature = "test-failpoints")]
+async fn until_counted(root: &Path, point: &str, n: usize) -> u64 {
+    let by = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let now = hits(root, point);
-        if now == seen {
-            return seen;
+        let counted = counted(root, point);
+        if counted.len() >= n {
+            assert_eq!(counted.len(), n, "{point} counted {counted:?}");
+            return counted[n - 1];
         }
-        seen = now;
+        assert!(
+            tokio::time::Instant::now() < by,
+            "{point} counted {counted:?} of {n}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
+
+/// The consumer's takes of turn 1's messages before its gate
+/// ([`C1_GATE`]): its status line, `turn/started` and the eleven item and
+/// usage lines (`account/updated` names no thread; the `Start` and
+/// `Reply` markers are no messages, so no take).
+#[cfg(feature = "test-failpoints")]
+const TAKES_AT_C1_GATE: usize = 13;
+
+/// The consumer's takes before `X`'s in [`overflow_copy`]: turn 1's
+/// thirteen, its three after the gate, then turn 2's status line and
+/// `turn/started`.
+#[cfg(feature = "test-failpoints")]
+const TAKES_BEFORE_X: usize = 18;
+
+/// The messages the connection routes in turn 2 of [`overflow_copy`]
+/// through its burst: the `turn/start` reply, the status line,
+/// `turn/started`, `X` and the twenty burst lines.
+#[cfg(feature = "test-failpoints")]
+const ROUTED_THROUGH_BURST: usize = 24;
 
 /// `codex_bounds_overflow` (x.3.2 X5, X0 item 10 as the owner simplified
 /// it): turn 1 completes; turn 2 starts; its consumer is paused at its
@@ -4391,14 +4433,24 @@ async fn settled_hits(root: &Path, point: &str) -> u64 {
 /// turn's settlement notes 27). Turn 1's envelope, the unaffected turn's,
 /// carries none and is unchanged. Returns the session and the warning's
 /// data.
+///
+/// Turn 1's gate is released only once its consumer took every message
+/// before it: turn 1 puts eighteen items in the sixteen-message lane (its
+/// `Start` and `Reply` markers and sixteen messages), so a consumer that
+/// had taken none of its messages by the time the last three arrived
+/// overflowed the lane in turn 1 (the 0.1 s flake, reproduced under CPU
+/// load: the lane held the `Reply` and fifteen messages and dropped
+/// `turn/completed`). Every wait is an exact count, not a quiet period.
 #[cfg(feature = "test-failpoints")]
 async fn lane_overflow(root: &Path, name: &str, burst_line: &str) -> (SessionId, Value) {
     let copy = overflow_copy(burst_line);
     let case = codex_case(root, name, copy.replay);
-    count_hits(&root.join("points"), TAKE);
+    let points = root.join("points");
+    count_hits(&points, TAKE);
     let daemon = Daemon::open_with(root, case.config());
     let session = daemon.spawn(C1_PROMPT, &codex_spawn(&case, 60_000)).await;
     let launch = case.at(C1_GATE).await;
+    until_counted(root, TAKE, TAKES_AT_C1_GATE).await;
     case.signal(launch);
     let first = daemon.wait(&session, 1).await;
     assert_eq!(first["state"], "completed", "{first}");
@@ -4406,18 +4458,21 @@ async fn lane_overflow(root: &Path, name: &str, burst_line: &str) -> (SessionId,
         !warning_codes(&first).contains(&"observations_lost"),
         "{first}"
     );
+    count_hits(&points, ROUTED);
     daemon.resume(&session, SUCCESSOR).await;
     assert_eq!(case.at(copy.held).await, launch);
-    // Everything before the gate was taken: the next take is `X`'s.
-    let take = settled_hits(root, TAKE).await + 1;
+    // Turn 2's takes before the gate were made: the next take is `X`'s.
+    let take = until_counted(root, TAKE, TAKES_BEFORE_X).await + 1;
     arm_at(root, TAKE, take, "pause");
     case.signal(launch);
     until_acked(root, TAKE, take).await;
     assert_eq!(case.at(copy.burst).await, launch);
     case.signal(launch);
     assert_eq!(case.at(copy.after).await, launch);
-    // The burst is routed before the consumer goes on.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The connection reached the last burst line, so it routed the
+    // nineteen before it, the dropped one among them, before the
+    // consumer goes on.
+    until_counted(root, ROUTED, ROUTED_THROUGH_BURST).await;
     release_point(root, TAKE, take);
     case.signal(launch);
     let second = daemon.wait(&session, 2).await;
@@ -4503,13 +4558,37 @@ fn encoded_prompt(bytes: usize) -> String {
     prompt
 }
 
-/// `c1_commentary_usage`'s first turn with prompt `prompt`: its
+/// [`echo_copy`]'s gate (one-based): [`C1_GATE`], one usage line before
+/// it dropped.
+const ECHO_GATE: usize = C1_GATE - 1;
+
+/// `c1_commentary_usage`'s first turn with prompt `prompt`, without its
+/// two `thread/tokenUsage/updated` lines (one-based steps 22 and 27): its
 /// `turn/start` expects it and its two `userMessage` echoes carry it; the
-/// close's unsubscribe and the stdin close follow the turn's end.
+/// close's unsubscribe and the stdin close follow the turn's end. Without
+/// them the turn puts sixteen items in its thread's sixteen-message lane
+/// (its `Start` and `Reply` markers and fourteen messages), so it never
+/// passes the lane's message bound however far its consumer lags; with
+/// them, eighteen did under CPU load. (A maximal prompt's two echoes
+/// together pass the lane's 1 MiB: they fit only while the consumer takes
+/// the first before the second is routed.)
 fn echo_copy(prompt: &str) -> Value {
     let mut replay = core_codex::replay("c1_commentary_usage");
     let original = replay["steps"].as_array().unwrap().clone();
-    let mut steps = original[..29].to_vec();
+    for usage in [22, 27] {
+        let line = original[usage - 1]["emit"]["line"].as_str().unwrap();
+        assert!(
+            line.contains("\"thread/tokenUsage/updated\""),
+            "step {usage} is turn 1's usage: {line}"
+        );
+    }
+    let mut steps: Vec<Value> = original[..29]
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| ![21, 26].contains(index))
+        .map(|(_, step)| step.clone())
+        .collect();
+    assert!(steps[ECHO_GATE - 1].get("await_signal").is_some());
     steps.extend_from_slice(&original[49..]);
     assert_eq!(steps[9]["expect"]["line"]["method"], "turn/start");
     steps[9]["expect"]["line"]["params"]["input"][0]["text"] = json!(prompt);
@@ -4521,9 +4600,9 @@ fn echo_copy(prompt: &str) -> Value {
         steps[at]["emit"]["line"] = json!(line.to_string());
     }
     assert_eq!(
-        steps[29]["expect"]["line"]["method"], "thread/unsubscribe",
+        steps[27]["expect"]["line"]["method"], "thread/unsubscribe",
         "{}",
-        steps[29]
+        steps[27]
     );
     replay["steps"] = Value::Array(steps);
     replay
@@ -4610,7 +4689,7 @@ fn codex_prompt_echo_cap() {
             .enqueued
             .unwrap()
             .0;
-        let launch = case.at(C1_GATE).await;
+        let launch = case.at(ECHO_GATE).await;
         case.signal(launch);
         let envelope = daemon.wait(&session, 1).await;
         assert_eq!(envelope["state"], "completed", "{envelope}");
@@ -4624,7 +4703,7 @@ fn codex_prompt_echo_cap() {
 /// closes.
 async fn c1_turn(daemon: &Daemon, case: &core_codex::CodexCase, launch: u64) {
     let session = daemon.spawn(C1_PROMPT, &codex_spawn(case, 60_000)).await;
-    case.at_launch(C1_GATE, launch).await;
+    case.at_launch(ECHO_GATE, launch).await;
     case.signal(launch);
     let envelope = daemon.wait(&session, 1).await;
     assert_eq!(envelope["state"], "completed", "{envelope}");

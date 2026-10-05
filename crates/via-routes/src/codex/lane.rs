@@ -351,6 +351,18 @@ impl Lane {
         self.ready.notify_one();
     }
 
+    /// A push that does not fit: counts the dropped item, runs `noting`
+    /// with the lane's lock released, then ends the lane `Overflow`, so
+    /// what `noting` records is in place before any observer can see the
+    /// overflow (critical review x5 #2). Only the connection task pushes,
+    /// so no other push comes between.
+    fn refuse(&self, mut queue: std::sync::MutexGuard<'_, Queue>, noting: impl FnOnce()) {
+        queue.dropped = queue.dropped.saturating_add(1);
+        drop(queue);
+        noting();
+        self.overflow(self.queue());
+    }
+
     /// Opens the start gate.
     fn open_gate(gate: &watch::Sender<bool>, queue: &mut Queue) {
         queue.open_start = None;
@@ -363,15 +375,21 @@ impl Lane {
     /// the connection task never waits. A message it takes advances the
     /// current turn's decode watermark, if a `Start` fenced the lane, and
     /// carries its position. Whether the lane took it.
-    pub fn push(&self, mut item: LaneItem, bytes: usize) -> bool {
+    pub fn push(&self, item: LaneItem, bytes: usize) -> bool {
+        self.push_noting(item, bytes, || {})
+    }
+
+    /// [`Lane::push`]; a push that overflows the lane runs `noting` first,
+    /// before the overflow is observable (critical review x5 #2): the
+    /// connection task records the dropped item's loss there.
+    pub fn push_noting(&self, mut item: LaneItem, bytes: usize, noting: impl FnOnce()) -> bool {
         let mut queue = self.queue();
         if queue.end.is_some() {
             queue.dropped = queue.dropped.saturating_add(1);
             return false;
         }
         if !queue.fits(bytes) {
-            queue.dropped = queue.dropped.saturating_add(1);
-            self.overflow(queue);
+            self.refuse(queue, noting);
             return false;
         }
         let mark = queue.mark();
@@ -424,6 +442,18 @@ impl Lane {
         at: Instant,
         accepted: Option<String>,
     ) -> (bool, bool) {
+        self.push_reply_noting(turn, (at, accepted), || {})
+    }
+
+    /// [`Lane::push_reply`] of `(at, accepted)`; a push that overflows the
+    /// lane runs `noting` first, before the overflow is observable
+    /// (critical review x5 #2).
+    pub fn push_reply_noting(
+        &self,
+        turn: TurnNumber,
+        (at, accepted): (Instant, Option<String>),
+        noting: impl FnOnce(),
+    ) -> (bool, bool) {
         let mut queue = self.queue();
         let contradicted = queue.early_seen;
         if queue.end.is_some() {
@@ -432,8 +462,7 @@ impl Lane {
         }
         let bytes = ENTRY_BYTES.saturating_add(accepted.as_ref().map_or(0, String::len));
         if !queue.fits(bytes) {
-            queue.dropped = queue.dropped.saturating_add(1);
-            self.overflow(queue);
+            self.refuse(queue, noting);
             return (contradicted, false);
         }
         let mark = queue.mark();

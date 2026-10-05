@@ -24,6 +24,8 @@ boon = { workspace = true }
 via-store = { path = "../via-store", features = ["test-failpoints"] }
 # Conformance cases corrupt a frozen row directly (Sol r1 #14).
 rusqlite = { workspace = true }
+# A replay fake's gate signal goes through a pidfd (tests/support/fake_signal.rs).
+rustix = { workspace = true, features = ["process"] }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }

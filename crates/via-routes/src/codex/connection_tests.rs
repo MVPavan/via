@@ -5,7 +5,7 @@
 //! reads (or does not read) its stdin.
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -571,6 +571,67 @@ async fn abnormal_end_reaches_every_lease() {
     ));
     vendor.connection.abnormal();
     assert_eq!(signalled.lock().unwrap().len(), 1, "idempotent");
+}
+
+/// Critical review x5 #2: the push that overflows a lane signals the
+/// lease's overflow handler before the overflow is observable, so the
+/// driver's record names the dropped item's owner ahead of any record an
+/// observer of the overflow would install. A message names the VIA turn
+/// its `turnId` was mapped to; a dropped `Reply` marker names its turn.
+#[tokio::test]
+async fn an_overflow_is_signalled_before_it_is_observable() {
+    for reply_overflows in [false, true] {
+        let mut vendor = Vendor::open(1 << 16);
+        let observed: Arc<OnceLock<Arc<Lane>>> = Arc::default();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let signal = {
+            let (observed, seen) = (Arc::clone(&observed), Arc::clone(&seen));
+            Arc::new(LeaseSignal::new(|_| {}).on_overflow(move |end| {
+                let observable = observed.get().is_some_and(|lane| lane.overflowed_now());
+                seen.lock().unwrap().push((end.owner, observable));
+            }))
+        };
+        let lease = vendor.connection.open_lane(Some(&signal));
+        assert!(observed.set(Arc::clone(lease.lane())).is_ok());
+        let requested = open_thread(&vendor.connection, &lease);
+        vendor.read().await;
+        vendor.emit(&thread_reply(requested.id.get(), "t")).await;
+        requested.reply.await.unwrap();
+        let start = vendor
+            .connection
+            .request(
+                |id| Ok(turn_start_line(id, "t", "go")),
+                start_by(),
+                starts(&lease, 1),
+                None,
+            )
+            .unwrap();
+        assert_eq!(vendor.read().await["method"], "turn/start");
+        let status = json!({"method": "thread/status/changed",
+            "params": {"threadId": "t", "status": {"type": "active", "activeFlags": []}}});
+        // The `Start` marker and fifteen status lines fill the lane; the
+        // reply's marker overflows it. Else the reply's marker and
+        // fourteen status lines fill it, and turn 1's message overflows it.
+        let fill = if reply_overflows { 15 } else { 14 };
+        if !reply_overflows {
+            vendor.emit(&start_reply(start.id.get(), "u1")).await;
+        }
+        for _ in 0..fill {
+            vendor.emit(&status).await;
+        }
+        if reply_overflows {
+            vendor.emit(&start_reply(start.id.get(), "u1")).await;
+        } else {
+            vendor.emit(&item_completed("t", "u1", "m")).await;
+        }
+        vendor.settle().await;
+        assert!(lease.lane().overflowed_now());
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(Some(turn(1)), false)],
+            "reply overflows: {reply_overflows}"
+        );
+    }
 }
 
 /// Item 5 step 2 (finding 9): a known notification whose required turn
