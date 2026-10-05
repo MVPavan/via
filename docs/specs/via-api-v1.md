@@ -545,7 +545,9 @@ earliest_seq}`. Semantics:
   error. `wait_ms` bounds its Store reads too: if no read completed by
   then, the reply is the empty page at `after` with `more: true`, so the
   caller reads again. `wait_ms: 0` returns the first
-  page at once. A session or turn not found is refused at once. Final
+  page at once. A session or turn not found is refused as soon as the first
+  read completes; if `wait_ms` cuts that read, the reply is the empty page
+  with `more: true` above, and the next call reports it. Final
   shutdown ends a long-poll that found nothing `daemon_stopping`, as it ends
   a `wait`. Closing the connection of a pending long-poll releases only
   that call.

@@ -1367,7 +1367,9 @@ the S1 private-process fake cannot qualify these resources.
 Store is the sole event source. A page is one bounded read transaction
 that returns the page, the scan cursor and the committed head. `next_after`
 records the last scanned seq, not just the last matched event; `more` uses
-the captured head. Filtering can yield an empty page that still advances.
+the captured head. The one exception is a long-poll whose bound cuts its
+first read: no page or head was captured, so the reply is the empty page at
+`after` with `more: true` (C1 §3.11). Filtering can yield an empty page that still advances.
 Page byte limit is 1 MiB. Keep read transactions short (one bounded page).
 
 There is no follow stream and no subscription. Callers poll `status` for

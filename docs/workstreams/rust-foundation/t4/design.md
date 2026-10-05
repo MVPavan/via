@@ -396,9 +396,12 @@ at most 32 sockets make at most 32 waiters, each with at most one read in
 flight, since the watch coalesces the changes a waiter has not yet
 consumed. Read frequency is not bounded by that: a waiter re-reads after
 each change it consumes, so it follows the commit rate, and each read queues
-on the one writer behind the commits. The Public lane cannot refuse a
-`wait`: one request per socket and 32 sockets give at most 32 Public reads,
-its slot count (§6.1).
+on the one writer behind the commits. The Public lane stays bounded but
+can refuse a `wait` (`admission_refused`): one request per socket and 32
+sockets give at most 32 live waiters, its slot count (§6.1), yet a read
+whose waiter ended at its deadline (or disconnected) stays queued in Store
+and holds its slot until Store serves it, so a new waiter can briefly find
+the lane full.
 `result` reads `result_text` once. The envelope (at most 1 MiB) is written
 as stored; no `Value` is built.
 
