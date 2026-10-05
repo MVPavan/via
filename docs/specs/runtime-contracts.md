@@ -1040,7 +1040,7 @@ would otherwise fail every launch.
 <state>/
   store.lock                 persistent Store-owner lock inode
   daemon.json                optional daemon config: disk floor and warning, WAL (§8); adapter-owned `harnesses` (§8)
-  via.log                    daemon warnings and errors; via.log.1 after rotation at start past 10 MiB
+  via.log                    daemon warnings and errors; via.log.1 after rotation past 10 MiB (§6.2)
   store.sqlite3              SQLite database (user_version schema)
   store.sqlite3-wal          SQLite-owned sidecar when present
   store.sqlite3-shm          SQLite-owned sidecar when present
@@ -1183,6 +1183,17 @@ the line is no durable report. It may be lost on Store failure or abrupt
 death, and the outer harness captures exit status and diagnostics.
 A result that cannot persist keeps F12's named `store_error` and
 `terminal_persisted:false`; no envelope is invented or replaced.
+
+`via.log` holds the daemon's own warnings and errors, chiefly those that
+belong to no turn: a startup failure after the log opened, with its whole
+cause chain (also on stderr, as the daemon's exit report), and the
+Store-failed latch, with its kind and scope, when final shutdown begins
+(owner, 2026-10-04). It never holds a prompt, vendor output or a turn's
+lifecycle, which the Store keeps; a Host or launch failure that ends a turn
+is that turn's durable `launch_failed` warning event (C1 §6.1). The log is
+rotated by size: a line that would take it past 10 MiB first renames it
+`via.log.1`, replacing any earlier one, and goes to a new `via.log`, while
+the daemon runs as at its start; one earlier file is kept.
 
 ## 7. F12: persistent Store failure and crash reconciliation
 

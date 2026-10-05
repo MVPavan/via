@@ -444,6 +444,14 @@ pub enum JournalSite {
 pub enum HostError {
     /// OS or filesystem operation failed.
     Io(io::Error),
+    /// A launch step failed with an operating-system error (bead via-23b):
+    /// the step names where, the error's kind what.
+    Launch {
+        /// The failed step.
+        step: &'static str,
+        /// Its error.
+        error: io::Error,
+    },
     /// A required Store read did not complete.
     Store(&'static str),
     /// A Host journal write lacked a positive commit receipt: not committed,
@@ -484,6 +492,7 @@ impl std::fmt::Display for HostError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "Host I/O: {error}"),
+            Self::Launch { step, error } => write!(formatter, "{step}: {error}"),
             Self::Evidence(error) => write!(formatter, "stderr.log not created: {error}"),
             Self::Store(message) | Self::Invalid(message) | Self::Protocol(message) => {
                 formatter.write_str(message)
@@ -522,6 +531,43 @@ impl std::fmt::Display for HostError {
 }
 
 impl std::error::Error for HostError {}
+
+impl HostError {
+    /// This failure's bounded cause for the turn it ended (bead via-23b),
+    /// or `None` for a deadline or a stop, whose dispositions name them.
+    pub fn cause(&self) -> Option<crate::LaunchCause> {
+        let (step, kind) = match self {
+            Self::Launch { step, error } => (*step, Some(error.kind())),
+            Self::Io(error) => ("Host operation", Some(error.kind())),
+            Self::Evidence(error) => ("create stderr.log", Some(error.kind())),
+            Self::Store(step) | Self::Invalid(step) | Self::Protocol(step) => (*step, None),
+            Self::StoreUnavailable(_) => ("read the process journal", None),
+            Self::Journal { site, .. } => (site.step(), None),
+            Self::AnchorPathTooLong { .. } => ("anchor socket path", None),
+            Self::Deadline | Self::Stopped | Self::LinksUnread => return None,
+        };
+        Some(crate::LaunchCause { step, kind })
+    }
+
+    /// A launch step's failure with its operating-system error.
+    fn launch(step: &'static str) -> impl FnOnce(io::Error) -> Self {
+        move |error| Self::Launch { step, error }
+    }
+}
+
+impl JournalSite {
+    /// The journal write as a launch step.
+    fn step(self) -> &'static str {
+        match self {
+            Self::AnchorIntent => "commit anchor intent",
+            Self::Identified => "commit anchor identity",
+            Self::ArmIntent => "commit ARM intent",
+            Self::VendorFacts => "commit vendor facts",
+            Self::Absence => "commit group absence",
+            Self::Link => "commit turn link",
+        }
+    }
+}
 impl From<io::Error> for HostError {
     fn from(value: io::Error) -> Self {
         Self::Io(value)
@@ -1385,7 +1431,8 @@ impl Host {
         state.spawned = Some(anchor_id.clone());
         let mut stream = connect_anchor(&socket_path).await?;
         let ready = protocol::read_message::<Reply>(&mut stream, 1024)
-            .await?
+            .await
+            .map_err(HostError::launch("read anchor ready"))?
             .ok_or(HostError::Protocol("anchor did not become ready"))?;
         let Reply::Ready {
             identity: wire_identity,
@@ -1465,7 +1512,7 @@ impl Host {
             Ok(child) => child,
             Err(error) => {
                 let _ = fs::remove_file(config_path);
-                return Err(error.into());
+                return Err(HostError::launch("spawn anchor")(error));
             }
         };
         let anchor_process_id = anchor
@@ -1548,12 +1595,9 @@ impl Host {
                 },
                 1024,
             )
-            .await?;
-        let Reply::Spawned { pid: vendor_pid } = reply else {
-            return Err(HostError::Protocol(
-                "anchor did not confirm descriptor detachment",
-            ));
-        };
+            .await
+            .map_err(HostError::launch("send ARM"))?;
+        let vendor_pid = spawned(reply)?;
         // The group's exit watch, which the ledger's `Armed` entry reads.
         let (sender, exits) = watch::channel(None);
         // Design §6.8 [r6.1]: armed right after `Spawned`; an early stop
@@ -2242,7 +2286,8 @@ async fn configure(
         .lock()
         .await
         .transact(&Request::Configure { vendor }, protocol::REQUEST_MAX)
-        .await?
+        .await
+        .map_err(HostError::launch("configure anchor"))?
     else {
         return Err(HostError::Protocol("anchor configuration refused"));
     };
@@ -2316,15 +2361,48 @@ fn anchor_socket_fits(anchor_dir: &std::path::Path) -> Result<(), HostError> {
 
 /// Writes the anchor's private bootstrap file, synced, never over another.
 fn write_bootstrap(path: &PathBuf, bootstrap: &Bootstrap) -> Result<(), HostError> {
-    let bytes = serde_json::to_vec(bootstrap).map_err(io::Error::other)?;
-    let mut config = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    config.write_all(&bytes)?;
-    config.sync_all()?;
-    Ok(())
+    let write = || {
+        let bytes = serde_json::to_vec(bootstrap).map_err(io::Error::other)?;
+        let mut config = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        config.write_all(&bytes)?;
+        config.sync_all()
+    };
+    write().map_err(HostError::launch("write anchor bootstrap"))
+}
+
+/// The vendor's pid from the anchor's reply to ARM, or why there is none.
+fn spawned(reply: Reply) -> Result<u32, HostError> {
+    match reply {
+        Reply::Spawned { pid } => Ok(pid),
+        Reply::Error { code, errno } => Err(anchor_refused(&code, errno)),
+        Reply::Ready { .. }
+        | Reply::Challenge { .. }
+        | Reply::Configured
+        | Reply::Status { .. }
+        | Reply::Stopping { .. } => Err(HostError::Protocol(
+            "anchor did not confirm descriptor detachment",
+        )),
+    }
+}
+
+/// The anchor's refusal of ARM (bead via-23b): the vendor spawn or the
+/// anchor's own stdio detachment failed, with its operating-system error
+/// when it had one. Another code is a protocol failure.
+fn anchor_refused(code: &str, errno: Option<i32>) -> HostError {
+    let step = match code {
+        "VendorSpawnFailed" => "spawn vendor",
+        "PipeDetachFailed" => "detach anchor stdio",
+        _ => return HostError::Protocol("anchor did not confirm descriptor detachment"),
+    };
+    let error = errno.map_or_else(
+        || io::Error::other(code.to_owned()),
+        io::Error::from_raw_os_error,
+    );
+    HostError::Launch { step, error }
 }
 
 async fn connect_anchor(path: &PathBuf) -> Result<UnixStream, HostError> {
@@ -2332,7 +2410,9 @@ async fn connect_anchor(path: &PathBuf) -> Result<UnixStream, HostError> {
     loop {
         match UnixStream::connect(path).await {
             Ok(stream) => return Ok(stream),
-            Err(error) if Instant::now() >= deadline => return Err(error.into()),
+            Err(error) if Instant::now() >= deadline => {
+                return Err(HostError::launch("connect anchor socket")(error));
+            }
             Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
         }
     }

@@ -225,6 +225,25 @@ impl WireRuntime {
 }
 
 impl WireError {
+    /// The bounded cause of an acquisition's Host or launch failure, for the
+    /// turn it ended (bead via-23b); `None` for a deadline, a stop or a wait
+    /// that ended, whose dispositions name them.
+    pub fn launch_cause(&self) -> Option<via_host::LaunchCause> {
+        match self {
+            Self::Host(error) => error.cause(),
+            Self::Evidence(error) => Some(via_host::LaunchCause {
+                step: "create the evidence folder",
+                kind: Some(error.kind()),
+            }),
+            Self::Io(error) => Some(via_host::LaunchCause {
+                step: "vendor pipe",
+                kind: Some(error.kind()),
+            }),
+            Self::Acquire { cause, .. } => cause.launch_cause(),
+            Self::Deadline | Self::Cancelled | Self::Woken | Self::Message(_) => None,
+        }
+    }
+
     /// Durable Store state could not be read or written, as opposed to a
     /// deadline or process evidence that merely stays unproven.
     pub fn is_store_failure(&self) -> bool {

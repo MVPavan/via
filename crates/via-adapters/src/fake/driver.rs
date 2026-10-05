@@ -929,6 +929,7 @@ fn turn_end(
                     journal_uncertain: result.journal_uncertain,
                     acknowledged,
                     shared: persistent,
+                    launch: None,
                 })),
             }
         }

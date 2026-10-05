@@ -1,26 +1,61 @@
 //! The daemon log `via.log` (Task 4 design §7.6, amendment A45): the
 //! daemon's own `tracing` output and its shutdown summary. During startup
 //! a line also goes to stderr, which the auto-starting CLI reads; once the
-//! daemon serves, only `via.log` is written.
+//! daemon serves, only `via.log` is written. It holds daemon warnings and
+//! errors, never a prompt or vendor output, and no per-turn lifecycle,
+//! which the Store keeps (owner, 2026-10-04).
 
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
     os::unix::fs::OpenOptionsExt,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Mutex, PoisonError,
         atomic::{AtomicBool, Ordering},
     },
 };
 
-/// A `via.log` longer than this is renamed `via.log.1` at start (§7.6).
+/// A `via.log` longer than this is renamed `via.log.1` at start, and one a
+/// line would take past it while the daemon runs (§7.6, bead via-23b).
 const ROTATE_BYTES: u64 = 10 * 1024 * 1024;
 
 /// The daemon's one log: its file once open, and whether startup is on.
 struct DaemonLog {
-    file: Mutex<Option<File>>,
+    file: Mutex<Option<OpenLog>>,
     startup: AtomicBool,
+}
+
+/// The open `via.log`, its length and where it is, for rotation.
+struct OpenLog {
+    file: File,
+    len: u64,
+    dir: PathBuf,
+}
+
+impl OpenLog {
+    /// Writes one line, rotating first when it would take the file past
+    /// [`ROTATE_BYTES`]. A failed rotation keeps the current file; a write
+    /// error is ignored.
+    fn write(&mut self, bytes: &[u8]) {
+        let bytes_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if self.len > 0 && self.len.saturating_add(bytes_len) > ROTATE_BYTES {
+            // Safe to ignore: a log that cannot rotate keeps growing past
+            // its limit rather than lose the line.
+            let _ = self.rotate();
+        }
+        if self.file.write_all(bytes).is_ok() {
+            self.len = self.len.saturating_add(bytes_len);
+        }
+    }
+
+    /// Renames `via.log` to `via.log.1`, replacing it, and opens a new one.
+    fn rotate(&mut self) -> io::Result<()> {
+        fs::rename(self.dir.join("via.log"), self.dir.join("via.log.1"))?;
+        self.file = open_file(&self.dir.join("via.log"))?;
+        self.len = 0;
+        Ok(())
+    }
 }
 
 static LOG: DaemonLog = DaemonLog {
@@ -51,7 +86,7 @@ pub(super) fn line(bytes: &[u8]) {
     }
     let mut file = LOG.file.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(file) = file.as_mut() {
-        let _ = file.write_all(bytes);
+        file.write(bytes);
     }
 }
 
@@ -62,7 +97,6 @@ pub(super) fn line(bytes: &[u8]) {
 /// is refused before and after the open, never waited on.
 pub(super) fn open(state: &Path) -> io::Result<()> {
     let path = state.join("via.log");
-    let irregular = || io::Error::other("must be a regular file");
     match fs::symlink_metadata(&path) {
         Ok(metadata) if !metadata.is_file() => return Err(irregular()),
         Ok(metadata) if metadata.len() > ROTATE_BYTES => {
@@ -72,6 +106,23 @@ pub(super) fn open(state: &Path) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
+    let file = open_file(&path)?;
+    let len = file.metadata()?.len();
+    *LOG.file.lock().unwrap_or_else(PoisonError::into_inner) = Some(OpenLog {
+        file,
+        len,
+        dir: state.to_path_buf(),
+    });
+    Ok(())
+}
+
+fn irregular() -> io::Error {
+    io::Error::other("must be a regular file")
+}
+
+/// `via.log` at `path` for append, 0600, following no link and without
+/// blocking; refused unless it is a regular file.
+fn open_file(path: &Path) -> io::Result<File> {
     let file = OpenOptions::new()
         .append(true)
         .create(true)
@@ -81,17 +132,24 @@ pub(super) fn open(state: &Path) -> io::Result<()> {
                 .bits()
                 .cast_signed(),
         )
-        .open(&path)?;
+        .open(path)?;
     if !file.metadata()?.is_file() {
         return Err(irregular());
     }
-    *LOG.file.lock().unwrap_or_else(PoisonError::into_inner) = Some(file);
-    Ok(())
+    Ok(file)
 }
 
 /// Startup is over: from now on only `via.log` is written (§7.6).
 pub(super) fn serving() {
     LOG.startup.store(false, Ordering::Release);
+}
+
+/// A startup failure after `via.log` opened (bead via-23b): one `ERROR`
+/// line with its whole cause chain, in `via.log` only, since the daemon's
+/// exit report already goes to stderr.
+pub(super) fn startup_failed(error: &anyhow::Error) {
+    serving();
+    tracing::error!(cause = %format!("{error:#}"), "daemon startup failed");
 }
 
 /// The most bytes of a panic's `via.log` line.
@@ -123,7 +181,7 @@ pub(super) fn panic_hook() {
         if let Ok(mut file) = LOG.file.try_lock()
             && let Some(file) = file.as_mut()
         {
-            let _ = file.write_all(line.bytes());
+            let _ = file.file.write_all(line.bytes());
         }
     }));
 }

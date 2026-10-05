@@ -126,6 +126,10 @@ pub(crate) enum Reply {
     },
     Error {
         code: String,
+        /// The operating-system error number behind `code`, when it had
+        /// one (bead via-23b).
+        #[serde(default)]
+        errno: Option<i32>,
     },
 }
 

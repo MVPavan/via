@@ -340,6 +340,7 @@ async fn run<P: PrivateProtocol>(
         journal_uncertain: false,
         acknowledged: false,
         shared: false,
+        launch: None,
     };
     if force.borrow().is_some() {
         return (
@@ -498,6 +499,7 @@ async fn serve_turn<P: PrivateProtocol>(
         journal_uncertain: report.journal_uncertain,
         acknowledged: false,
         shared: false,
+        launch: None,
     })
 }
 

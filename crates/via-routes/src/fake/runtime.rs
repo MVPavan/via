@@ -315,6 +315,7 @@ impl PrivateProtocol for LaneState {
             journal_uncertain: report.journal_uncertain,
             acknowledged: false,
             shared: false,
+            launch: None,
         }
     }
 

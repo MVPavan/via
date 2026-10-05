@@ -647,6 +647,7 @@ impl Serving<'_, LaneState> {
             journal_uncertain: false,
             acknowledged,
             shared: true,
+            launch: None,
         }
     }
 
@@ -878,6 +879,7 @@ pub(super) fn turn_result(
                 journal_uncertain: failure.journal_uncertain,
                 acknowledged,
                 shared: persistent,
+                launch: failure.launch,
             })
         }
     };

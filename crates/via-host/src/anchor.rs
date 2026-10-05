@@ -339,6 +339,7 @@ async fn spawn_vendor(
             stream,
             &Reply::Error {
                 code: "PipeDetachFailed".into(),
+                errno: detach.as_ref().err().and_then(io::Error::raw_os_error),
             },
             1024,
         )
@@ -353,6 +354,7 @@ async fn spawn_vendor(
                 stream,
                 &Reply::Error {
                     code: "VendorSpawnFailed".into(),
+                    errno: error.raw_os_error(),
                 },
                 1024,
             )
