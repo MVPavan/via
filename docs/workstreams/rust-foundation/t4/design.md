@@ -368,7 +368,10 @@ envelopes and evidence folders (§7.5).
 ## 4. Caller interface (R5)
 
 With request `id` capped at 256 B (A31), every reply's wrapper is under
-512 B, so each bound applies to the `result` object. A reply not written
+512 B, so each bound applies to the `result` object. The connection task
+checks the encoded line against 1 MiB + 512 B in every build and replies
+`admission_refused` in place of a longer one (bead via-00j;
+`crates/via-cli/src/server/dispatch.rs` `REPLY_MAX`). A reply not written
 within `REPLY_WRITE` = 10 s of being ready to write closes the connection
 (A32) [t4r16.5.5].
 
