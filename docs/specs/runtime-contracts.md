@@ -1434,7 +1434,11 @@ controls and one decode allowance; per active turn, its prompt. The
 Codex task measures one server with 32 leased sessions and 32 concurrent
 active turns under both assertions above, with these holders added to
 the sum, and reports the marginal cost per active turn; that result
-qualifies at most 32 concurrent active turns on one server. Several loaded
+qualifies at most 32 concurrent active turns on one server. Its limit,
+the computed sum plus 25%, is 1,028 MiB, accepted by the owner
+(2026-10-05) as the theoretical bound; the measured peak less baseline
+is about 178 MiB (musl) and 188 MiB (glibc), and 32 simultaneous maximal
+8 MiB decodes are not qualified (`codex-server.md` item 9.2). Several loaded
 servers, up to the harness-process limit, are an extrapolation, and the unresolved-turn maximum is not
 qualified.
 The S1 fake RSS result alone does not qualify this shared-server extension.

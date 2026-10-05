@@ -1341,7 +1341,11 @@ reply; written once the reply brings the `turnId`);
   | musl (authoritative) | 19 MiB | 197 MiB | 178 MiB | under 0.2 MiB |
   | glibc, `MALLOC_ARENA_MAX=2` | 25 MiB | 213 MiB | 188 MiB | none |
 
-  The limit is 1,028 MiB (409 MiB before item 9.3). Both builds reach
+  The limit, the computed sum plus 25%, is 1,028 MiB (409 MiB before
+  item 9.3). The owner accepted it on 2026-10-05 as the theoretical
+  bound: the measured peak less baseline is about 178 MiB (musl) and
+  188 MiB (glibc), and 32 simultaneous maximal 8 MiB decodes are not
+  qualified (below). No mechanism lowers it. Both builds reach
   about 6 MiB per session at the held peak; before the move (normalized
   text and its pieces both held) it was 210 and 211 MiB. The scenario still drives about
   1 MiB lines (its pads are the echo-capped prompt): the 12 MiB staging is

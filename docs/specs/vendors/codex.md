@@ -484,7 +484,10 @@ observation budget. No lease cap bounds active turns on one server below
 the runtime's unresolved-turn bound. The RSS measurement uses one server
 with 32 leased sessions and 32 concurrent active turns, applies runtime
 §8's relative method and growth assertion with these holders added, and
-qualifies only up to 32 concurrent active turns on one server; several
+qualifies only up to 32 concurrent active turns on one server. Its limit,
+1,028 MiB, is the owner-accepted theoretical bound (2026-10-05); the
+measured peak less baseline is about 178 MiB (musl) and 188 MiB (glibc),
+and 32 simultaneous maximal 8 MiB decodes are not qualified; several
 loaded servers, up to the harness-process limit, are an extrapolation. Do not preallocate 4 MiB for every
 idle lease or assume S1's RSS result covers this extension. A failure
 requires design review, not silent ceiling growth.
