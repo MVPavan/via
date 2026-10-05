@@ -233,6 +233,51 @@ fn vendor_pipes_detach_and_verified_anchor_stops_its_group() {
     });
 }
 
+/// Bead via-aew (runtime §6.1): the daemon runs under umask 077, and the
+/// anchor it starts inherits that; the vendor it launches gets 022, so
+/// files the agent creates are 0644 like the user's own, not 0600. The
+/// anchor's control socket stays 0600.
+#[test]
+fn vendor_runs_under_umask_022_whatever_the_anchors() {
+    // This test's process is the daemon here: the anchor inherits its mask.
+    rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o077));
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        let deadline = Deadline::at(tokio::time::Instant::now() + Duration::from_secs(4));
+        let created = fixture.root.join("agent-file");
+        let mut spec = fixture.spec("/bin/sh");
+        spec.args = vec![
+            OsString::from("-c"),
+            OsString::from(format!("umask; : > {}", sh_quote(&created))),
+        ];
+        let acquired = host.acquire(spec, deadline).await.unwrap();
+        let via_host::OwnedPipes { stdin, mut stdout } = acquired.pipes;
+        drop(stdin);
+        let mut output = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), stdout.read_to_end(&mut output))
+            .await
+            .expect("the vendor exits")
+            .unwrap();
+        // The test-binary anchor prints libtest's header first.
+        let output = String::from_utf8_lossy(&output);
+        assert_eq!(output.lines().last(), Some("0022"), "{output}");
+        let mode = fs::metadata(&created).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "{mode:o}");
+        let close = acquired
+            .control
+            .close(CloseRequest {
+                mode: CloseMode::Force,
+                deadline: Deadline::at(tokio::time::Instant::now() + Duration::from_secs(3)),
+            })
+            .await;
+        assert!(
+            matches!(close.cleanup, CleanupEvidence::GroupAbsent(_)),
+            "{close:?}"
+        );
+    });
+}
+
 #[test]
 fn spawn_failure_never_returns_vendor_pipes_and_recovery_proves_absence() {
     runtime().block_on(async {

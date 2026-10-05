@@ -343,6 +343,23 @@ fn stderr_drain(cap: StderrCap) -> io::Result<(io::PipeWriter, std::sync::Arc<St
     Ok((writer, stderr_log::start(reader, file, cap)?))
 }
 
+/// The umask a vendor runs under (bead via-aew, runtime §6.1): the user's
+/// usual 022, so the files an agent creates are 0644, not the 0600 the
+/// daemon's 077 would give them.
+const VENDOR_UMASK: u32 = 0o022;
+
+/// Spawns `command` with [`VENDOR_UMASK`], which the child inherits at
+/// creation, then restores the anchor's own (the daemon's 077). The mask
+/// is process-wide, but no anchor thread creates a file meanwhile: the
+/// control socket was bound and set to 0600 before, and the stderr drain's
+/// threads only write the turn's file the daemon already opened.
+fn spawn_with_vendor_umask(command: &mut tokio::process::Command) -> io::Result<Child> {
+    let own = rustix::process::umask(rustix::fs::Mode::from_raw_mode(VENDOR_UMASK));
+    let spawned = command.spawn();
+    rustix::process::umask(own);
+    spawned
+}
+
 async fn spawn_vendor(
     stream: &mut UnixStream,
     vendor: VendorConfig,
@@ -363,7 +380,7 @@ async fn spawn_vendor(
     // without one, since its stderr would fill and block it.
     let spawn = drain.and_then(|(writer, log)| {
         command.stderr(writer);
-        command.spawn().map(|child| (child, log))
+        spawn_with_vendor_umask(&mut command).map(|child| (child, log))
     });
     // The command holds the anchor's copy of the pipe's write end: dropped
     // before the spawn reply, so the drain sees EOF when the vendor group
