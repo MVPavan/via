@@ -1,15 +1,18 @@
 //! The vendor's capped `stderr.log` (runtime §4, bead via-c2r). The anchor
-//! gives the vendor a pipe as stderr and drains it here: the first `head`
-//! bytes go straight to the file, the last `tail` bytes wait in a ring, and
-//! everything between is counted and discarded. Draining never stops, so a
-//! vendor never blocks on its stderr; the ring is flushed, after one marker
-//! line when bytes were dropped, once the vendor group ends.
+//! gives the vendor a pipe as stderr. One thread drains it into memory: the
+//! first `head` bytes queue for the file, the last `tail` bytes wait in a
+//! ring, and everything between is counted and discarded. A second thread
+//! writes the queue to the file. Draining never waits on the file, so a
+//! vendor never blocks on its stderr. Finishing never waits on it either,
+//! beyond a caller's deadline. Once the vendor group ends, the ring is
+//! queued, after one marker line when bytes were dropped.
 
 use std::{
     collections::VecDeque,
     fs::File,
     io::{self, Read, Write},
-    sync::{Arc, Mutex, PoisonError},
+    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
+    time::Instant,
 };
 
 use serde::{Deserialize, Serialize};
@@ -43,48 +46,45 @@ pub(crate) fn marker(dropped: u64) -> String {
     format!("\n[via: {dropped} bytes of vendor stderr dropped]\n")
 }
 
-/// One vendor's capped log over `out`. Writes to `out` that fail are
-/// abandoned, never retried: the drain goes on discarding, so the vendor
-/// still never blocks.
-pub(crate) struct CappedLog<W: Write> {
-    out: W,
+/// One vendor's capped stderr, in memory: the bytes queued for the file
+/// and the tail's ring. At most the head and the tail are held, the head
+/// only while the file's writes are behind.
+struct Capped {
     cap: StderrCap,
-    /// Head bytes written so far.
-    written: u64,
+    /// Head bytes queued so far.
+    headed: u64,
+    /// Bytes waiting for the file's writer.
+    queued: Vec<u8>,
     /// The latest bytes past the head, at most `cap.tail`; allocated at
     /// that bound once the head is full.
     ring: VecDeque<u8>,
     dropped: u64,
-    /// A write to `out` failed: nothing more is written.
-    failed: bool,
     finished: bool,
 }
 
-impl<W: Write> CappedLog<W> {
-    pub(crate) fn new(out: W, cap: StderrCap) -> Self {
+impl Capped {
+    fn new(cap: StderrCap) -> Self {
         Self {
-            out,
             cap,
-            written: 0,
+            headed: 0,
+            queued: Vec::new(),
             ring: VecDeque::new(),
             dropped: 0,
-            failed: false,
             finished: false,
         }
     }
 
     /// Takes the next drained bytes; after [`Self::finish`] they are
     /// discarded.
-    pub(crate) fn write(&mut self, mut bytes: &[u8]) {
+    fn write(&mut self, mut bytes: &[u8]) {
         if self.finished {
             return;
         }
-        let room =
-            usize::try_from(self.cap.head.saturating_sub(self.written)).unwrap_or(usize::MAX);
+        let room = usize::try_from(self.cap.head.saturating_sub(self.headed)).unwrap_or(usize::MAX);
         if room > 0 {
             let (head, rest) = bytes.split_at(room.min(bytes.len()));
-            self.emit(head);
-            self.written += head.len() as u64;
+            self.queued.extend_from_slice(head);
+            self.headed += head.len() as u64;
             bytes = rest;
         }
         if bytes.is_empty() {
@@ -106,73 +106,164 @@ impl<W: Write> CappedLog<W> {
         self.ring.extend(bytes);
     }
 
-    /// Writes the marker, when bytes were dropped, and the tail, once; the
+    /// Queues the marker, when bytes were dropped, and the tail, once; the
     /// ring's memory is released.
-    pub(crate) fn finish(&mut self) {
+    fn finish(&mut self) {
         if self.finished {
             return;
         }
         self.finished = true;
         if self.dropped > 0 {
-            self.emit(marker(self.dropped).as_bytes());
+            self.queued
+                .extend_from_slice(marker(self.dropped).as_bytes());
         }
         let ring = std::mem::take(&mut self.ring);
         let (front, back) = ring.as_slices();
-        self.emit(front);
-        self.emit(back);
-        if !self.failed && self.out.flush().is_err() {
-            self.failed = true;
+        self.queued.extend_from_slice(front);
+        self.queued.extend_from_slice(back);
+    }
+}
+
+/// The log's shared state: the capped bytes and whether the writer wrote
+/// everything after the finish.
+struct State {
+    capped: Capped,
+    written: bool,
+}
+
+/// One vendor's stderr log, shared by its drain, its writer and the anchor.
+/// The lock is never held across file I/O.
+pub(crate) struct StderrLog {
+    state: Mutex<State>,
+    wake: Condvar,
+}
+
+impl StderrLog {
+    fn new(cap: StderrCap) -> Self {
+        Self {
+            state: Mutex::new(State {
+                capped: Capped::new(cap),
+                written: false,
+            }),
+            wake: Condvar::new(),
         }
     }
 
-    fn emit(&mut self, bytes: &[u8]) {
-        if !self.failed && self.out.write_all(bytes).is_err() {
-            self.failed = true;
+    fn lock(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Ends the log: the marker and the tail are queued for the writer, and
+    /// later bytes are discarded. Idempotent; never waits on the file.
+    pub(crate) fn finish(&self) {
+        self.lock().capped.finish();
+        self.wake.notify_all();
+    }
+
+    /// [`Self::finish`], then waits until the writer wrote the rest or
+    /// `deadline` passed, whichever is first.
+    pub(crate) fn finish_by(&self, deadline: Instant) {
+        self.finish();
+        let mut state = self.lock();
+        while !state.written {
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                return;
+            };
+            state = self
+                .wake
+                .wait_timeout(state, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
         }
     }
 }
 
-/// The anchor's shared handle on its vendor's log: the drain thread writes
-/// it, and the anchor finishes it before its own group KILL.
-pub(crate) type SharedLog = Arc<Mutex<CappedLog<File>>>;
-
-/// Finishes `log` (idempotent).
-pub(crate) fn finish(log: &SharedLog) {
-    log.lock().unwrap_or_else(PoisonError::into_inner).finish();
+/// The vendor's log over `file`, fed from `pipe` under `cap`: starts its
+/// drain and its writer threads.
+pub(crate) fn start(
+    pipe: io::PipeReader,
+    file: File,
+    cap: StderrCap,
+) -> io::Result<Arc<StderrLog>> {
+    let log = Arc::new(StderrLog::new(cap));
+    let writer = log.clone();
+    std::thread::Builder::new()
+        .name("stderr-write".into())
+        .spawn(move || write_out(file, &writer))?;
+    let drained = log.clone();
+    std::thread::Builder::new()
+        .name("stderr-drain".into())
+        .spawn(move || drain(pipe, &drained))?;
+    Ok(log)
 }
 
 /// Drains `pipe` into `log` until every writer closed it (the vendor group
 /// ended), then finishes `log`. A read error other than an interrupt ends
 /// the drain the same way.
-pub(crate) fn drain(mut pipe: impl Read, log: &SharedLog) {
+fn drain(mut pipe: impl Read, log: &StderrLog) {
     let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         match pipe.read(&mut buffer) {
             Ok(0) => break,
-            Ok(read) => log
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .write(&buffer[..read]),
+            Ok(read) => {
+                log.lock().capped.write(&buffer[..read]);
+                log.wake.notify_all();
+            }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(_) => break,
         }
     }
-    finish(log);
+    log.finish();
+}
+
+/// Writes `log`'s queued bytes to `out`, outside the lock, until the log
+/// finished and everything queued was written. A failed write is abandoned,
+/// never retried: later bytes are taken and discarded, so the queue stays
+/// bounded.
+fn write_out(mut out: impl Write, log: &StderrLog) {
+    let mut failed = false;
+    loop {
+        let (bytes, last) = {
+            let mut state = log.lock();
+            while state.capped.queued.is_empty() && !state.capped.finished {
+                state = log.wake.wait(state).unwrap_or_else(PoisonError::into_inner);
+            }
+            (
+                std::mem::take(&mut state.capped.queued),
+                state.capped.finished,
+            )
+        };
+        if !failed && out.write_all(&bytes).is_err() {
+            failed = true;
+        }
+        if last {
+            if !failed {
+                let _ = out.flush();
+            }
+            log.lock().written = true;
+            log.wake.notify_all();
+            return;
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        sync::{Arc, mpsc},
+        time::Duration,
+    };
 
-    fn log(head: u64, tail: u64) -> CappedLog<Vec<u8>> {
-        CappedLog::new(Vec::new(), StderrCap { head, tail })
+    fn log(head: u64, tail: u64) -> Capped {
+        Capped::new(StderrCap { head, tail })
     }
 
-    fn feed(log: &mut CappedLog<Vec<u8>>, bytes: &[u8], chunk: usize) {
+    fn feed(capped: &mut Capped, bytes: &[u8], chunk: usize) {
         for part in bytes.chunks(chunk) {
-            log.write(part);
+            capped.write(part);
         }
-        log.finish();
+        capped.finish();
     }
 
     /// Past both bounds: exactly the head, the marker with the dropped
@@ -186,7 +277,7 @@ mod tests {
             let mut expected = bytes[..10].to_vec();
             expected.extend_from_slice(marker(70).as_bytes());
             expected.extend_from_slice(&bytes[80..]);
-            assert_eq!(capped.out, expected, "chunk {chunk}");
+            assert_eq!(capped.queued, expected, "chunk {chunk}");
             assert!(capped.ring.capacity() == 0, "the ring was not released");
         }
     }
@@ -198,7 +289,7 @@ mod tests {
             let bytes: Vec<u8> = (0..length).collect();
             let mut capped = log(10, 20);
             feed(&mut capped, &bytes, 4);
-            assert_eq!(capped.out, bytes, "length {length}");
+            assert_eq!(capped.queued, bytes, "length {length}");
         }
     }
 
@@ -213,13 +304,14 @@ mod tests {
         }
         assert!(capped.ring.capacity() < 16);
         capped.finish();
-        let finished = capped.out.clone();
+        let finished = capped.queued.clone();
         capped.write(b"late");
         capped.finish();
-        assert_eq!(capped.out, finished);
+        assert_eq!(capped.queued, finished);
     }
 
-    /// A failed file write never stops the drain.
+    /// A failed file write never stops the writer: it takes and discards
+    /// the rest, and reports the log written.
     #[test]
     fn a_failed_write_keeps_draining() {
         struct Full;
@@ -231,11 +323,66 @@ mod tests {
                 Ok(())
             }
         }
-        let mut capped = CappedLog::new(Full, StderrCap { head: 4, tail: 4 });
+        let log = Arc::new(StderrLog::new(StderrCap { head: 4, tail: 4 }));
+        let writer = log.clone();
+        let thread = std::thread::spawn(move || write_out(Full, &writer));
         for _ in 0..10 {
-            capped.write(b"abcdef");
+            log.lock().capped.write(b"abcdef");
+            log.wake.notify_all();
         }
-        capped.finish();
-        assert!(capped.failed && capped.finished);
+        log.finish_by(Instant::now() + Duration::from_secs(5));
+        thread.join().unwrap();
+        let state = log.lock();
+        assert!(state.written && state.capped.queued.is_empty());
+    }
+
+    /// The whole path, drain to file: what the vendor wrote, capped, is in
+    /// the file once the pipe closes and the finish returns.
+    #[test]
+    fn a_drained_log_reaches_its_file() {
+        let (mut file_reader, file_writer) = io::pipe().unwrap();
+        let file = File::from(std::os::fd::OwnedFd::from(file_writer));
+        let (vendor_reader, mut vendor_writer) = io::pipe().unwrap();
+        let log = start(vendor_reader, file, StderrCap { head: 10, tail: 20 }).unwrap();
+        let bytes: Vec<u8> = (0..100_u8).collect();
+        vendor_writer.write_all(&bytes).unwrap();
+        drop(vendor_writer);
+        let mut got = Vec::new();
+        file_reader.read_to_end(&mut got).unwrap();
+        log.finish_by(Instant::now() + Duration::from_secs(5));
+        assert!(log.lock().written);
+        let mut expected = bytes[..10].to_vec();
+        expected.extend_from_slice(marker(70).as_bytes());
+        expected.extend_from_slice(&bytes[80..]);
+        assert_eq!(got, expected);
+    }
+
+    /// A stalled sink (bead via-c2r fix round 1): the drain keeps reading
+    /// the vendor's pipe, and finishing the log returns by its deadline,
+    /// while a file write is blocked. The sink is a pipe nobody reads until
+    /// the end.
+    #[test]
+    fn a_stalled_sink_neither_stops_the_drain_nor_blocks_finish() {
+        let (mut sink_reader, sink_writer) = io::pipe().unwrap();
+        let sink = File::from(std::os::fd::OwnedFd::from(sink_writer));
+        let (vendor_reader, mut vendor_writer) = io::pipe().unwrap();
+        let log = start(vendor_reader, sink, StderrCap::TURN).unwrap();
+        let (wrote, wrote_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let written = vendor_writer.write_all(&vec![b'x'; 1024 * 1024]);
+            let _ = wrote.send(written.is_ok());
+        });
+        let vendor_done = wrote_rx.recv_timeout(Duration::from_secs(2));
+        let (finished, finished_rx) = mpsc::channel();
+        let stalled = log.clone();
+        std::thread::spawn(move || {
+            stalled.finish_by(Instant::now() + Duration::from_millis(20));
+            let _ = finished.send(());
+        });
+        let finish_done = finished_rx.recv_timeout(Duration::from_secs(1));
+        // Unblocks the threads before asserting.
+        std::thread::spawn(move || io::copy(&mut sink_reader, &mut io::sink()));
+        assert_eq!(vendor_done, Ok(true), "the vendor's 1 MiB write blocked");
+        assert!(finish_done.is_ok(), "finishing waited on the stalled write");
     }
 }

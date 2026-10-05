@@ -15,7 +15,7 @@ use tokio::{
 use crate::{
     linux,
     protocol::{self, Bootstrap, Reply, Request, VendorConfig, WireIdentity},
-    stderr_log::{self, CappedLog, SharedLog, StderrCap},
+    stderr_log::{self, StderrCap, StderrLog},
 };
 
 /// Runs the private same-binary anchor entrypoint from one bootstrap path.
@@ -255,14 +255,13 @@ async fn armed(
             }
             () = async {
                 match kill_at {
-                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    Some(deadline) => tokio::time::sleep_until(tail_flush_at(deadline)).await,
                     None => std::future::pending().await,
                 }
             } => {
-                // The vendor group ends here: its stderr tail is flushed
-                // first (bead via-c2r).
-                stderr_log::finish(&stderr);
-                let _ = process::kill_process_group(process::getpgrp(), Signal::KILL);
+                if let Some(deadline) = kill_at {
+                    kill_own_group(deadline, Some(&*stderr)).await;
+                }
                 return Ok(());
             }
             _ = poll.tick(), if exit.is_none() => {
@@ -278,30 +277,52 @@ async fn armed(
     }
 }
 
-/// Finishes the vendor's stderr log when the armed anchor returns.
-struct FinishOnDrop<'a>(&'a SharedLog);
+/// Finishes the vendor's stderr log when the armed anchor returns, waiting
+/// at most [`TAIL_FLUSH`] for its writes.
+struct FinishOnDrop<'a>(&'a StderrLog);
 
 impl Drop for FinishOnDrop<'_> {
     fn drop(&mut self) {
-        stderr_log::finish(self.0);
+        self.0.finish_by(std::time::Instant::now() + TAIL_FLUSH);
     }
 }
 
-/// Opens the vendor's stderr pipe and its drain (bead via-c2r): the drain
-/// thread writes the read end into `stderr.log`, the anchor's inherited
-/// stderr, which it keeps through a close-on-exec duplicate. The thread
-/// always reads, so the vendor never blocks on stderr, and holds at most
-/// the cap's tail in memory. It ends with the anchor's process.
-fn stderr_drain(cap: StderrCap) -> io::Result<(io::PipeWriter, SharedLog)> {
+/// The last part of a cleanup grace, before the group KILL, in which the
+/// vendor's stderr tail is written (bead via-c2r). Stderr written after it
+/// begins is discarded; the KILL is never later than its deadline.
+const TAIL_FLUSH: Duration = Duration::from_millis(20);
+
+/// When the stderr tail's write begins, for a group KILL at `kill_at`.
+fn tail_flush_at(kill_at: Instant) -> Instant {
+    kill_at.checked_sub(TAIL_FLUSH).unwrap_or(kill_at)
+}
+
+/// Ends the anchor's own group at `kill_at`: from [`tail_flush_at`] the
+/// vendor's stderr log is finished and its writes are awaited until
+/// `kill_at` at most, then the group gets `KILL`, this anchor with it. A
+/// stalled log write never delays the KILL.
+async fn kill_own_group(kill_at: Instant, stderr: Option<&StderrLog>) {
+    tokio::time::sleep_until(tail_flush_at(kill_at)).await;
+    if let Some(log) = stderr {
+        // Blocks this thread for at most the flush window: nothing else
+        // runs before the KILL.
+        log.finish_by(kill_at.into_std());
+    }
+    tokio::time::sleep_until(kill_at).await;
+    let _ = process::kill_process_group(process::getpgrp(), Signal::KILL);
+}
+
+/// Opens the vendor's stderr pipe and its log (bead via-c2r): the log's
+/// threads drain the read end and write it into `stderr.log`, the anchor's
+/// inherited stderr, which it keeps through a close-on-exec duplicate. The
+/// drain always reads, never waiting on the file, so the vendor never
+/// blocks on stderr; at most the cap's head and tail are held in memory.
+/// The threads end with the anchor's process.
+fn stderr_drain(cap: StderrCap) -> io::Result<(io::PipeWriter, std::sync::Arc<StderrLog>)> {
     use std::os::fd::AsFd;
     let file = fs::File::from(io::stderr().as_fd().try_clone_to_owned()?);
     let (reader, writer) = io::pipe()?;
-    let log: SharedLog = std::sync::Arc::new(std::sync::Mutex::new(CappedLog::new(file, cap)));
-    let drained = log.clone();
-    std::thread::Builder::new()
-        .name("stderr-drain".into())
-        .spawn(move || stderr_log::drain(reader, &drained))?;
-    Ok((writer, log))
+    Ok((writer, stderr_log::start(reader, file, cap)?))
 }
 
 async fn spawn_vendor(
@@ -309,7 +330,7 @@ async fn spawn_vendor(
     vendor: VendorConfig,
     cap: StderrCap,
     terminate: &mut tokio::signal::unix::Signal,
-) -> io::Result<(Child, u32, SharedLog)> {
+) -> io::Result<(Child, u32, std::sync::Arc<StderrLog>)> {
     let drain = stderr_drain(cap);
     let mut command = tokio::process::Command::new(vendor.program());
     command
@@ -332,9 +353,6 @@ async fn spawn_vendor(
     drop(command);
     let detach = detach_standard_streams();
     if detach.is_err() {
-        if let Ok((_, log)) = &spawn {
-            stderr_log::finish(log);
-        }
         let _ = protocol::write_message(
             stream,
             &Reply::Error {
@@ -344,7 +362,8 @@ async fn spawn_vendor(
             1024,
         )
         .await;
-        stop_own_group(terminate, Duration::from_millis(200)).await;
+        let log = spawn.as_ref().ok().map(|(_, log)| &**log);
+        stop_own_group(terminate, Duration::from_millis(200), log).await;
         return Err(io::Error::other("PipeDetachFailed"));
     }
     let (child, log) = match spawn {
@@ -369,9 +388,7 @@ async fn spawn_vendor(
         .await
         .is_err()
     {
-        // The group KILL ends this process: the log is finished first.
-        stderr_log::finish(&log);
-        stop_own_group(terminate, Duration::from_millis(200)).await;
+        stop_own_group(terminate, Duration::from_millis(200), Some(&*log)).await;
         return Err(io::Error::new(
             io::ErrorKind::BrokenPipe,
             "spawn reply lost",
@@ -506,10 +523,14 @@ fn detach_standard_streams() -> io::Result<()> {
     Ok(())
 }
 
-async fn stop_own_group(_terminate: &mut tokio::signal::unix::Signal, grace: Duration) {
-    let group = process::getpgrp();
+/// TERMs the anchor's own group, then KILLs it after `grace`, finishing
+/// the vendor's stderr log, when there is one, at the grace's end.
+async fn stop_own_group(
+    _terminate: &mut tokio::signal::unix::Signal,
+    grace: Duration,
+    stderr: Option<&StderrLog>,
+) {
     // The anchor is still in this group. No daemon-supplied numeric group is signalled.
-    let _ = process::kill_process_group(group, Signal::TERM);
-    tokio::time::sleep(grace).await;
-    let _ = process::kill_process_group(group, Signal::KILL);
+    let _ = process::kill_process_group(process::getpgrp(), Signal::TERM);
+    kill_own_group(Instant::now() + grace, stderr).await;
 }
