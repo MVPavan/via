@@ -45,10 +45,10 @@ use tokio::sync::{oneshot, watch};
 use tokio::time::Instant;
 use via_routes::codex::{
     AbnormalEnd, ClientId, CommitOutcome, Connection, ConnectionEnd, ConnectionFailure,
-    ConnectionLoss, FINISH_BY, Fenced, LOSS_EVIDENCE, Lane, LaneEnd, LaneLease, LaunchError,
-    LeaseSignal, LossCause, Purpose, RequestError, Reservation, Response, RpcError, SandboxMode,
-    ServerKey, ServerLease, ServerPin, Subscription, ThreadResult, ThreadSettings, TurnFolder,
-    TurnStart, TurnStartResult, TurnWrites, WriteBounds, crash_on_panic, data, result,
+    ConnectionLoss, FINISH_BY, Fenced, HandshakeBound, LOSS_EVIDENCE, Lane, LaneEnd, LaneLease,
+    LaunchError, LeaseSignal, LossCause, Purpose, RequestError, Reservation, Response, RpcError,
+    SandboxMode, ServerKey, ServerLease, ServerPin, Subscription, ThreadResult, ThreadSettings,
+    TurnFolder, TurnStart, TurnStartResult, TurnWrites, WriteBounds, crash_on_panic, data, result,
     thread_resume, thread_start, turn_start,
 };
 use via_routes::{Retirement, SendOutcome, StoreFailure, WireCleanup};
@@ -1160,6 +1160,21 @@ fn instance_report(user_agent: &str) -> InstanceReport {
     }
 }
 
+/// Codex's thread index in its SQLite home (0.160.0): written by a
+/// server's first launch on that home.
+const STATE_DB: &str = "state_5.sqlite";
+
+/// The handshake bound of a launch on `home` (via-25f): the first launch's
+/// while `home` holds no [`STATE_DB`], else the warm one. Only the name is
+/// checked; nothing is opened. A later Codex that renames its index only
+/// lengthens the bound.
+pub(super) fn handshake_bound(home: &Path) -> HandshakeBound {
+    match std::fs::symlink_metadata(home.join(STATE_DB)) {
+        Ok(_) => HandshakeBound::Warm,
+        Err(_) => HandshakeBound::First,
+    }
+}
+
 /// Creates `<state>/vendor/codex` (0700) when missing; a non-directory or
 /// a symlink there is refused.
 fn ensure_home(home: &Path) -> std::io::Result<()> {
@@ -1754,7 +1769,8 @@ async fn join(
                     "a new server needs a harness-process slot".to_owned(),
                 ))));
             };
-            if ensure_home(&adapter.vendor_home()).is_err() {
+            let home = adapter.vendor_home();
+            if ensure_home(&home).is_err() {
                 return Err(Box::new(facts.failed(
                     RouteError::Store {
                         turn,
@@ -1769,10 +1785,11 @@ async fn join(
                 turn,
             };
             let key = ServerKey(recipe.config_hash(ADAPTER_VERSION).bytes());
-            match adapter
-                .servers()
-                .launch_or_join(key, recipe.process_spec(owner), capacity)
-            {
+            match adapter.servers().launch_or_join(
+                key,
+                (recipe.process_spec(owner), handshake_bound(&home)),
+                capacity,
+            ) {
                 Ok(pin) => pin,
                 Err(failure) => {
                     return Err(Box::new(launch_failed(facts, &failure.into())));

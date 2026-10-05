@@ -30,9 +30,9 @@ pub use lane::{
 };
 pub use messages::*;
 pub use servers::{
-    AcquireCause, LaunchError, LaunchFailure, MODEL_BYTES, MODEL_PAGES, SERVER_HANDSHAKE,
-    SERVER_RETIRE, ServerEnd, ServerFacts, ServerKey, ServerLease, ServerPin, ServerReport,
-    Servers,
+    AcquireCause, HandshakeBound, LaunchError, LaunchFailure, MODEL_BYTES, MODEL_PAGES,
+    SERVER_FIRST_HANDSHAKE, SERVER_HANDSHAKE, SERVER_RETIRE, ServerEnd, ServerFacts, ServerKey,
+    ServerLease, ServerPin, ServerReport, Servers,
 };
 pub use threads::{CORRELATION_BYTES, CORRELATION_ENTRIES};
 /// The Wire types a shared-route driver handles: its writes' bounds and

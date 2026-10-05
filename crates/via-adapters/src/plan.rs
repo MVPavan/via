@@ -1018,7 +1018,11 @@ mod tests {
         let mut key = [0_u8; 32];
         key[..8].copy_from_slice(&[0xc0, 0xde, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05]);
         let pin = servers
-            .launch_or_join(via_routes::codex::ServerKey(key), spec, Box::new(()))
+            .launch_or_join(
+                via_routes::codex::ServerKey(key),
+                (spec, via_routes::codex::HandshakeBound::Warm),
+                Box::new(()),
+            )
             .unwrap();
         vendor
             .handshake(

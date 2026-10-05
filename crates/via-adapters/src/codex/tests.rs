@@ -1843,3 +1843,22 @@ async fn a_paired_reply_under_a_failed_generation() {
         );
     }
 }
+
+/// via-25f: a launch on a SQLite home without Codex's `state_5.sqlite`
+/// (its first) takes the 300 s handshake bound, since Codex indexes the
+/// user's whole session history before it answers `initialize` (55 s
+/// live); once the home holds it, the 60 s bound.
+#[test]
+fn the_first_launch_on_a_home_takes_the_long_handshake_bound() {
+    use via_routes::codex::{HandshakeBound, SERVER_FIRST_HANDSHAKE, SERVER_HANDSHAKE};
+    let home = tempfile::tempdir().unwrap();
+    let bound = super::driver::handshake_bound(home.path());
+    assert_eq!(bound, HandshakeBound::First);
+    assert_eq!(bound.duration(), SERVER_FIRST_HANDSHAKE);
+    assert_eq!(SERVER_FIRST_HANDSHAKE, std::time::Duration::from_secs(300));
+    std::fs::write(home.path().join("state_5.sqlite"), b"").unwrap();
+    let bound = super::driver::handshake_bound(home.path());
+    assert_eq!(bound, HandshakeBound::Warm);
+    assert_eq!(bound.duration(), SERVER_HANDSHAKE);
+    assert_eq!(SERVER_HANDSHAKE, std::time::Duration::from_secs(60));
+}

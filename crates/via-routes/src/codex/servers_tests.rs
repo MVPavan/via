@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use via_wire::{EnvAllowList, PrivateProcessSpec, ProcessOwner, ServerId};
 
-use super::{Entry, ServerKey, ServerPin, Servers};
+use super::{Entry, HandshakeBound, ServerKey, ServerPin, Servers};
 use crate::codex::DeclineTable;
 use crate::codex::testing::{TestRuntime, TestStdio, VendorEnds, model};
 
@@ -40,7 +40,9 @@ fn key(first: u8) -> ServerKey {
 /// its launch.
 async fn launched(servers: &Servers, key: ServerKey) -> (ServerPin, VendorEnds, Arc<TestStdio>) {
     let (mut ends, stdio) = servers.script();
-    let pin = servers.launch_or_join(key, spec(), Box::new(())).unwrap();
+    let pin = servers
+        .launch_or_join(key, (spec(), HandshakeBound::Warm), Box::new(()))
+        .unwrap();
     assert!(
         servers
             .reports()
