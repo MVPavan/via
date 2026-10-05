@@ -16,8 +16,9 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 use via_wire::testing::{Store, TestInput};
 use via_wire::{
-    CloseRequest, CommitOutcome, DataHold, Deadline, OutboundMessage, PendingWrite, SessionId,
-    TurnNumber, WireCleanup, WireCloseReport, WireError, WriteBounds, WriteState, WriteTicket,
+    CloseRequest, CommitOutcome, DataHold, Deadline, ExitReport, OutboundMessage, PendingWrite,
+    SessionId, TurnNumber, WireCleanup, WireCloseReport, WireError, WriteBounds, WriteState,
+    WriteTicket,
 };
 
 use super::stdio::{Boxed, Stdio};
@@ -63,8 +64,32 @@ impl Drop for Scratch {
     }
 }
 
+/// What a scripted Host stop reports (x.3.2 X4 item 13): by default a
+/// stop of a live server whose group is quiescent.
+#[derive(Clone, Copy, Debug)]
+pub struct StopFacts {
+    /// The group's cleanup certainty.
+    pub cleanup: WireCleanup,
+    /// The vendor's confirmed exit, if any.
+    pub vendor_exit: Option<ExitReport>,
+    /// Host's reply to the stop: whether the server was live; `None` when
+    /// no reply came.
+    pub stopped_live: Option<bool>,
+}
+
+impl Default for StopFacts {
+    fn default() -> Self {
+        Self {
+            cleanup: WireCleanup::Quiescent,
+            vendor_exit: None,
+            stopped_live: Some(true),
+        }
+    }
+}
+
 /// Wire's test input as the connection's seam; Host's stop is answered
-/// at once, and the server folder's evidence is kept in memory.
+/// at once with [`StopFacts`], and the server folder's evidence is kept
+/// in memory.
 pub struct TestStdio {
     input: TestInput,
     kept: Mutex<Vec<Vec<u8>>>,
@@ -75,6 +100,8 @@ pub struct TestStdio {
     held: Mutex<Option<Box<dyn Send>>>,
     /// Host closes asked so far.
     closes: AtomicUsize,
+    /// What Host's stop reports.
+    stop: Mutex<StopFacts>,
     /// The folder Wire keeps an undecoded message in.
     _scratch: Scratch,
 }
@@ -88,8 +115,14 @@ impl TestStdio {
             tickets: Mutex::new(Vec::new()),
             held: Mutex::new(None),
             closes: AtomicUsize::new(0),
+            stop: Mutex::new(StopFacts::default()),
             _scratch: scratch,
         }
+    }
+
+    /// Host's stop reports `facts` from now on.
+    pub fn report_stop(&self, facts: StopFacts) {
+        *self.stop.lock().unwrap_or_else(PoisonError::into_inner) = facts;
     }
 
     /// Wire's test input.
@@ -171,13 +204,14 @@ impl Stdio for TestStdio {
             .unwrap_or_else(PoisonError::into_inner)
             .take();
         drop(held);
-        Box::pin(async {
+        let facts = *self.stop.lock().unwrap_or_else(PoisonError::into_inner);
+        Box::pin(async move {
             WireCloseReport {
-                cleanup: WireCleanup::Quiescent,
-                vendor_exit: None,
+                cleanup: facts.cleanup,
+                vendor_exit: facts.vendor_exit,
                 forced: false,
                 journal_uncertain: false,
-                stopped_live: Some(true),
+                stopped_live: facts.stopped_live,
             }
         })
     }
@@ -250,6 +284,23 @@ impl VendorEnds {
             .await
             .expect("the vendor's stdout");
         self.emitted += 1;
+    }
+
+    /// Ends the vendor's stdout (item 13: the end of stdout).
+    ///
+    /// # Panics
+    ///
+    /// When the pipe cannot be shut down.
+    #[expect(clippy::expect_used, reason = "a test's stdout end must go out")]
+    pub async fn end_stdout(&mut self) {
+        self.stdout.shutdown().await.expect("the vendor's stdout");
+    }
+
+    /// Stops reading VIA's writes for good: the pipe's read end is
+    /// dropped, so VIA's next write fails `EPIPE` (item 13: a writer
+    /// error). Later reads see the end.
+    pub fn stop_reading(&mut self) {
+        self.stdin = BufReader::new(tokio::io::duplex(1).0);
     }
 
     /// The next line VIA wrote, within 2 s.

@@ -18,7 +18,7 @@ use via_wire::{
 
 use super::connection::serve;
 use super::stdio::Stdio;
-use super::testing::{Scratch, TestStdio, VendorEnds};
+use super::testing::{Scratch, StopFacts, TestStdio, VendorEnds};
 use super::*;
 
 /// The decline table the tests answer with.
@@ -1471,4 +1471,312 @@ async fn reserve_released_when_never_submitted() {
     assert!(matches!(refused, Err(RequestError::Closed)));
     assert_eq!(connection.reservations(), 0, "released, never leaked");
     assert!(matches!(connection.reserve("t"), Err(Fenced::Ended)));
+}
+
+// x.3.2 X4 K5: item 9.1's record lifetime and budget, and item 13's
+// connection-failure dispositions under Host's stop report.
+
+/// Item 9.1 (exhaustion): every record kind shares the one budget with a
+/// registration's mapping: a `turn/start`, thread opens, unsubscribes,
+/// reservations and plain requests (the handshake's kind). With the
+/// budget's 1,024 entries charged, the next charge (a reservation) latches
+/// `overflow` and retires the connection: a retirement, not a refusal of
+/// one request while the connection goes on.
+#[tokio::test]
+async fn request_record_exhaustion_retires() {
+    let mut vendor = Vendor::open(1 << 20);
+    // The registration's mapping and turn 1's start: two entries.
+    let lane = registered(&mut vendor, "t").await;
+    let plain = |connection: &Connection| {
+        connection
+            .request(
+                |id| thread_unsubscribe(id, "p").map(OutboundMessage::Control),
+                start_by(),
+                Purpose::Plain,
+                None,
+            )
+            .unwrap()
+    };
+    let mut held = vec![
+        vendor
+            .connection
+            .request(
+                |id| Ok(turn_start_line(id, "t", "go")),
+                start_by(),
+                starts(&lane, 1),
+                None,
+            )
+            .unwrap(),
+    ];
+    let (mut reservations, mut lanes) = (Vec::new(), Vec::new());
+    for k in 0..255 {
+        let thread = format!("u{k}");
+        held.push(
+            vendor
+                .connection
+                .request(
+                    |id| thread_unsubscribe(id, &thread).map(OutboundMessage::Control),
+                    start_by(),
+                    Purpose::Unsubscribes {
+                        thread: thread.clone(),
+                    },
+                    None,
+                )
+                .unwrap(),
+        );
+        let open = vendor.connection.open_lane(None);
+        held.push(open_thread(&vendor.connection, &open));
+        lanes.push(open);
+        reservations.push(vendor.connection.reserve(&format!("r{k}")).unwrap());
+        held.push(plain(&vendor.connection));
+    }
+    held.push(plain(&vendor.connection));
+    reservations.push(vendor.connection.reserve("last").unwrap());
+    assert_eq!(2 + 4 * 255 + 2, CORRELATION_ENTRIES);
+    assert_eq!(
+        vendor.connection.failure(),
+        None,
+        "the budget is full, not over"
+    );
+    assert!(matches!(
+        vendor.connection.reserve("over"),
+        Err(Fenced::Ended)
+    ));
+    assert_eq!(
+        vendor.connection.failure(),
+        Some(ConnectionFailure::Overflow)
+    );
+    assert_eq!(ended(&vendor).await.cause, LossCause::Overflow);
+    assert!(matches!(
+        vendor.connection.reserve("again"),
+        Err(Fenced::Ended)
+    ));
+}
+
+/// Item 9.1 (abandoned-record pairing): a `turn/start` and an unsubscribe
+/// whose waiters left, on a lane closed before their replies, keep their
+/// records: each reply pairs and is counted `abandoned`, nothing fails,
+/// and the other lane's turn runs on.
+#[tokio::test]
+async fn abandoned_start_and_unsubscribe_pair_their_replies() {
+    let mut vendor = Vendor::open(1 << 16);
+    let gone = registered(&mut vendor, "a").await;
+    let other = registered(&mut vendor, "t").await;
+    let start = vendor
+        .connection
+        .request(
+            |id| Ok(turn_start_line(id, "a", "go")),
+            start_by(),
+            starts(&gone, 1),
+            None,
+        )
+        .unwrap();
+    assert_eq!(vendor.read().await["method"], "turn/start");
+    let unsubscribe = vendor.connection.unsubscribe(&gone, far()).unwrap();
+    let sent = vendor.read().await;
+    assert_eq!(sent["method"], "thread/unsubscribe");
+    let start_id = start.id.get();
+    drop((start, unsubscribe, gone));
+    vendor.emit(&start_reply(start_id, "ua")).await;
+    vendor
+        .emit(&json!({"id": sent["id"], "result": {"status": "unsubscribed"}}))
+        .await;
+    vendor.settle().await;
+    assert_eq!(vendor.connection.counts().abandoned, 2);
+    assert_eq!(vendor.connection.failure(), None);
+    accepted(&mut vendor, &other, 1, "ut").await;
+    vendor.emit(&item_completed("t", "ut", "m")).await;
+    vendor.settle().await;
+    assert_eq!(taken(other.lane()).len(), 1);
+    assert_eq!(vendor.connection.failure(), None);
+}
+
+/// Every item `lane` holds as its raw line, then its end.
+async fn drained_to_end(lane: &Arc<Lane>) -> (Vec<Value>, LaneEnd) {
+    let mut items = Vec::new();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), lane.next())
+            .await
+            .expect("the lane ends");
+        match event {
+            LaneEvent::Item(item, _charge) => {
+                if let Some(routed) = item.routed() {
+                    items.push(serde_json::from_slice(routed.staged.bytes()).unwrap());
+                }
+            }
+            LaneEvent::End(end) => return (items, end),
+        }
+    }
+}
+
+/// The connection's end, within 10 s.
+async fn ended(vendor: &Vendor) -> ConnectionLoss {
+    match tokio::time::timeout(Duration::from_secs(10), vendor.connection.end())
+        .await
+        .expect("the connection ended")
+    {
+        ConnectionEnd::Failed(loss) => loss,
+        ConnectionEnd::Retired => panic!("retired, not failed"),
+    }
+}
+
+/// Two registrations, `a` and `t`, on a connection whose Host stop
+/// reports `facts`.
+async fn two_threads(facts: StopFacts) -> (Vendor, LaneLease, LaneLease) {
+    let mut vendor = Vendor::open(1 << 16);
+    vendor.stdio.report_stop(facts);
+    let a = registered(&mut vendor, "a").await;
+    let b = registered(&mut vendor, "t").await;
+    (vendor, a, b)
+}
+
+/// The server's death as Host's stop reports it: not live, its exit
+/// confirmed, its group gone.
+fn dead() -> StopFacts {
+    StopFacts {
+        cleanup: WireCleanup::Quiescent,
+        vendor_exit: Some(via_wire::ExitReport {
+            code: Some(1),
+            signal: None,
+        }),
+        stopped_live: Some(false),
+    }
+}
+
+/// Item 13 (`codex_server_lost_order`): A's terminal is staged before the
+/// server's death shows (stdout ends; Host's stop finds it dead with its
+/// exit). A's lane takes its terminal first, then the loss; B's lane gets
+/// only the loss: `server_lost` for both, with the exit.
+#[tokio::test]
+async fn codex_server_lost_order() {
+    let (mut vendor, a, b) = two_threads(dead()).await;
+    let completed = json!({"method": "turn/completed", "params": {"threadId": "a",
+        "turn": {"id": "ua", "items": [], "status": "completed"}}});
+    vendor.emit(&completed).await;
+    vendor.ends.end_stdout().await;
+    let loss = ended(&vendor).await;
+    assert_eq!(loss.cause, LossCause::ServerLost);
+    assert_eq!(loss.exit, dead().vendor_exit);
+    let (items, end) = drained_to_end(a.lane()).await;
+    assert_eq!(items, [completed]);
+    assert_eq!(end, LaneEnd::Lost(loss));
+    let (items, end) = drained_to_end(b.lane()).await;
+    assert!(items.is_empty());
+    assert_eq!(end, LaneEnd::Lost(loss));
+}
+
+/// Item 13 (`codex_transport_loss_is_unknown`): a writer error (the
+/// server stopped reading) while Host's stop finds the server alive is a
+/// transport loss (`unknown`), its cleanup `quiescent` from that stop.
+#[tokio::test]
+async fn codex_transport_loss_is_unknown() {
+    let (mut vendor, _a, b) = two_threads(StopFacts::default()).await;
+    vendor.ends.stop_reading();
+    let _written = vendor
+        .connection
+        .request(
+            |id| thread_unsubscribe(id, "p").map(OutboundMessage::Control),
+            start_by(),
+            Purpose::Plain,
+            None,
+        )
+        .unwrap();
+    let loss = ended(&vendor).await;
+    assert_eq!(
+        (loss.cause, loss.cleanup),
+        (LossCause::TransportLost, WireCleanup::Quiescent)
+    );
+    assert_eq!(drained_to_end(b.lane()).await.1, LaneEnd::Lost(loss));
+}
+
+/// Item 13 (`stop_reply_missing_stays_transport`): stdout ends and Host's
+/// stop gets no reply: unconfirmed, so a transport loss (`unknown`),
+/// never `server_lost`.
+#[tokio::test]
+async fn stop_reply_missing_stays_transport() {
+    let (mut vendor, _a, b) = two_threads(StopFacts {
+        cleanup: WireCleanup::Uncertain,
+        vendor_exit: None,
+        stopped_live: None,
+    })
+    .await;
+    vendor.ends.end_stdout().await;
+    let loss = ended(&vendor).await;
+    assert_eq!(
+        (loss.cause, loss.cleanup),
+        (LossCause::TransportLost, WireCleanup::Uncertain)
+    );
+    assert_eq!(drained_to_end(b.lane()).await.1, LaneEnd::Lost(loss));
+}
+
+/// Item 13 (`stdout_end_then_dead_on_stop_is_server_lost`): stdout ends,
+/// and Host's stop finds the server already dead (no exit report): the
+/// end of stdout was the death, `server_lost`.
+#[tokio::test]
+async fn stdout_end_then_dead_on_stop_is_server_lost() {
+    let (mut vendor, _a, b) = two_threads(StopFacts {
+        cleanup: WireCleanup::Quiescent,
+        vendor_exit: None,
+        stopped_live: Some(false),
+    })
+    .await;
+    vendor.ends.end_stdout().await;
+    let loss = ended(&vendor).await;
+    assert_eq!(loss.cause, LossCause::ServerLost);
+    assert_eq!(drained_to_end(b.lane()).await.1, LaneEnd::Lost(loss));
+}
+
+/// Item 13 (`server_loss_cleanup_not_blocked_by_inherited_stdout`): the
+/// server is reported dead while its stdout stays open (a survivor
+/// inherited it): the loss is disposed of, every lane ended and the
+/// connection's end published, without waiting for stdout to end.
+#[tokio::test]
+async fn server_loss_cleanup_not_blocked_by_inherited_stdout() {
+    let (mut vendor, a, b) = two_threads(StopFacts {
+        cleanup: WireCleanup::Uncertain,
+        ..dead()
+    })
+    .await;
+    vendor.ends.stop_reading();
+    let _written = vendor
+        .connection
+        .request(
+            |id| thread_unsubscribe(id, "p").map(OutboundMessage::Control),
+            start_by(),
+            Purpose::Plain,
+            None,
+        )
+        .unwrap();
+    let started = tokio::time::Instant::now();
+    let end = tokio::time::timeout(Duration::from_secs(2), vendor.connection.end())
+        .await
+        .expect("the end is published while stdout stays open");
+    assert!(started.elapsed() < LOSS_EVIDENCE);
+    let ConnectionEnd::Failed(loss) = end else {
+        panic!("failed, not retired: {end:?}");
+    };
+    assert_eq!(
+        (loss.cause, loss.cleanup),
+        (LossCause::ServerLost, WireCleanup::Uncertain)
+    );
+    assert_eq!(drained_to_end(a.lane()).await.1, LaneEnd::Lost(loss));
+    assert_eq!(drained_to_end(b.lane()).await.1, LaneEnd::Lost(loss));
+    // The vendor's stdout is still open.
+    vendor
+        .emit(&json!({"method": "account/updated", "params": {}}))
+        .await;
+}
+
+/// Item 13 (`overflow_failure_keeps_overflow_class`): an overflow latched
+/// first keeps its class though Host's stop then finds the server dead
+/// and stdout ended: `overflow`, never `server_lost`.
+#[tokio::test]
+async fn overflow_failure_keeps_overflow_class() {
+    let (mut vendor, _a, b) = two_threads(dead()).await;
+    vendor.connection.fail(ConnectionFailure::Overflow);
+    vendor.ends.end_stdout().await;
+    let loss = ended(&vendor).await;
+    assert_eq!(loss.cause, LossCause::Overflow);
+    assert_eq!(loss.exit, dead().vendor_exit);
+    assert_eq!(drained_to_end(b.lane()).await.1, LaneEnd::Lost(loss));
 }

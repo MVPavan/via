@@ -66,7 +66,8 @@ fn child(name: &str, scenario: &Value, env: &[(&str, &str)]) -> Option<PathBuf> 
     fs::set_permissions(&scenario_path, fs::Permissions::from_mode(0o600)).unwrap();
     let mut command = Command::new(env::current_exe().unwrap());
     command
-        .args(["--exact", name, "--nocapture"])
+        // An ignored case run on purpose runs in its child too.
+        .args(["--exact", name, "--nocapture", "--include-ignored"])
         .env(CHILD, root.path())
         .env("VIA_FAKE_AGENT_BINARY", binary("via-fake-agent"))
         .env("VIA_FAKE_SCENARIO", &scenario_path)
@@ -4027,9 +4028,9 @@ fn core_codex_cancel_before_wall_noticed_late() {
 /// one-based): a cancel-point gate after original step 22 (copy step
 /// 23); with `completion`, a gate after original step 27 (copy step 29)
 /// and then the open tool's `item/completed`; then a successor turn shaped
-/// like `c1_commentary_usage`'s second; then the original close. The run
-/// deadline is 90 s.
-fn p7_copy(completion: bool) -> Value {
+/// like `c1_commentary_usage`'s second (with `successor`); then the
+/// original close. The run deadline is 90 s.
+fn p7_copy(completion: bool, successor: bool) -> Value {
     let mut replay = core_codex::replay("c3_interrupt_uncertain");
     let original = replay["steps"].as_array().unwrap().clone();
     let shape = core_codex::replay("c1_commentary_usage");
@@ -4052,12 +4053,14 @@ fn p7_copy(completion: bool) -> Value {
         params["item"]["durationMs"] = json!(1_000);
         steps.push(json!({"emit":{"line":item.to_string()}}));
     }
-    let mut start = second[29].clone();
-    assert_eq!(start["expect"]["line"]["method"], "turn/start", "{start}");
-    start["expect"]["line"]["params"]["input"][0]["text"] = json!(SUCCESSOR);
-    steps.push(start);
-    for step in [31, 33, 44, 45, 46, 49] {
-        steps.push(second[step - 1].clone());
+    if successor {
+        let mut start = second[29].clone();
+        assert_eq!(start["expect"]["line"]["method"], "turn/start", "{start}");
+        start["expect"]["line"]["params"]["input"][0]["text"] = json!(SUCCESSOR);
+        steps.push(start);
+        for step in [31, 33, 44, 45, 46, 49] {
+            steps.push(second[step - 1].clone());
+        }
     }
     steps.extend_from_slice(&original[27..]);
     replay["steps"] = Value::Array(steps);
@@ -4125,7 +4128,7 @@ fn core_codex_p7_status() {
     let Some(root) = child(NAME, &no_fake(), &[]) else {
         return;
     };
-    let case = codex_case(&root, NAME, p7_copy(true));
+    let case = codex_case(&root, NAME, p7_copy(true, true));
     run(async {
         let daemon = Daemon::open_with(&root, case.config());
         let session = daemon
@@ -4193,7 +4196,7 @@ fn core_codex_p7_uncertain_successor() {
     via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
     arm(&root, SUBMIT, "pause");
     acknowledge(&root, ORDERED, 1);
-    let case = codex_case(&root, NAME, p7_copy(false));
+    let case = codex_case(&root, NAME, p7_copy(false, true));
     run(async {
         let daemon = Daemon::open_with(&root, case.config());
         let started = tokio::time::Instant::now();
@@ -4240,6 +4243,57 @@ fn core_codex_p7_uncertain_successor() {
         // Core emits no `predecessor_cleanup_uncertain` yet (C1 §3.5 P7
         // "may"; a pre-existing gap, reported with x.3.2 X4).
         daemon.close(&session).await;
+        daemon.shutdown().await;
+    });
+}
+
+/// x.3.2 X4 K5 (`codex_control_races`, F15 without steer: close versus
+/// the P7 window; W3 through Engine): a cancel's interrupted terminal is
+/// retained with the `sleep 75` tool open under the real 60 s grace;
+/// the session's `close` then detaches the draining turn at once. The turn
+/// settles `cancelled`, acknowledged, `uncertain`, and the close returns,
+/// both long before the grace would end the window.
+///
+/// Ignored (x.3.2 X4 K5 finding): Core coalesces the close's stop order
+/// into the cancel's, keeping the cancel's cause (design §2), so the
+/// Codex driver cannot tell the close from the cancel while it drains and
+/// the turn waits out the 60 s grace. W3 covers only a close-caused order.
+/// Closing the gap needs a decision (a C2 close mark on `StopOrder`, or
+/// Core's coalescing rule); see the X4 hand-back.
+#[test]
+#[ignore = "x.3.2 X4 K5 finding: a close coalesced into a cancel's order is invisible to the draining Codex turn"]
+fn codex_control_races_close_vs_p7_window() {
+    const NAME: &str = "codex_control_races_close_vs_p7_window";
+    let Some(root) = child(NAME, &no_fake(), &[]) else {
+        return;
+    };
+    let case = codex_case(&root, NAME, p7_copy(false, false));
+    run(async {
+        let daemon = Daemon::open_with(&root, case.config());
+        let session = daemon
+            .spawn(CODEX_PROMPT, &codex_spawn(&case, 120_000))
+            .await;
+        let launch = case.at(23).await;
+        cancel(&daemon, &session, 1, 60_000).await;
+        case.signal(launch);
+        let shown = until_acknowledged(&daemon, &session).await;
+        assert_eq!(
+            shown["active_turn"]["cancel"]["cleanup"], "pending",
+            "{shown}"
+        );
+        let closing = tokio::time::Instant::now();
+        daemon.close(&session).await;
+        let first = daemon.wait(&session, 1).await;
+        assert!(
+            closing.elapsed() < Duration::from_secs(20),
+            "the close detached the window, not the grace"
+        );
+        assert_eq!(first["state"], "cancelled", "{first}");
+        assert_eq!(
+            stop_pair(&first),
+            (&json!("acknowledged"), &json!("uncertain")),
+            "{first}"
+        );
         daemon.shutdown().await;
     });
 }

@@ -4237,3 +4237,112 @@ fn codex_cleanup_60s() {
             .unwrap_or_else(|why| panic!("{why}"));
     }
 }
+
+/// x.3.2 X4 K5 (`codex_server_close`; items 2, 7): two sessions lease one
+/// server (`c4_two_sessions`); once both closed, `servers()` lists none:
+/// each close released its lease, and the last release retired it.
+#[test]
+fn codex_server_close() {
+    let name = "codex_server_close";
+    let mut replay = replay_of("c4_two_sessions").unwrap();
+    let mut expect = expect_of("c4_two_sessions").unwrap();
+    replay["source"] = json!(format!("{name}: c4_two_sessions"));
+    expect["source"] = replay["source"].clone();
+    check_variant_then(name, &replay, &expect, |pure| {
+        let servers = pure.set.servers();
+        if servers.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("live after both closes: {servers:?}"))
+        }
+    })
+    .unwrap();
+}
+
+/// x.3.2 X4 K5 (`codex_two_threads`; item 8): `c4_two_sessions` with
+/// repeated item IDs across the two threads. B's message reuses A's
+/// message ID, and B's command reuses the ID of A's command, which stays
+/// open; B's command ends right after A's interrupted terminal, while A
+/// drains, and A still settles `uncertain` at its P7 bound: B's item never
+/// reaches A's ledger. After A's unsubscribe reply (A's cutoff), a late
+/// completion of A's command is dropped: B's ledger ends that ID once.
+#[test]
+fn codex_two_threads() {
+    const SHARED: &str = "exec-019a0000-0000-7000-8000-000000400007";
+    const B_TOOL: &str = "exec-019a0000-0000-7000-8000-000000400006";
+    let name = "codex_two_threads";
+    let mut replay = replay_of("c4_two_sessions").unwrap();
+    let mut expect = expect_of("c4_two_sessions").unwrap();
+    replay["source"] = json!(format!("{name}: a variant of c4_two_sessions"));
+    expect["source"] = replay["source"].clone();
+    let b_thread = "019a0000-0000-7000-8000-000000100002";
+    let all = steps(&mut replay).unwrap();
+    for step in all.iter_mut() {
+        let Some(line) = step["emit"]["line"].as_str() else {
+            continue;
+        };
+        if line.contains(b_thread) {
+            let line = line.replace(B_TOOL, SHARED).replace("msg_0005", "msg_0003");
+            step["emit"]["line"] = json!(line);
+        }
+    }
+    let a_terminal = step_with(&replay, "\"status\":\"interrupted\"").unwrap();
+    let b_tool_end = step_with(
+        &replay,
+        &format!(
+            "\"method\":\"item/completed\",\"params\":{{\"item\":\
+             {{\"type\":\"commandExecution\",\"id\":\"{SHARED}\""
+        ),
+    )
+    .unwrap();
+    let all = steps(&mut replay).unwrap();
+    // Steps 35 and 43 (one-based) are A's command start and B's command
+    // end; the end moves to right after A's terminal (step 40).
+    assert_eq!(b_tool_end, 42, "B's command end");
+    assert!(
+        all[b_tool_end]["emit"]["line"]
+            .as_str()
+            .unwrap()
+            .contains("item/completed")
+    );
+    let moved = all.remove(b_tool_end);
+    all.insert(a_terminal + 1, moved);
+    let unsubscribed = a_terminal + 3;
+    assert!(
+        all[unsubscribed]["emit"]["line"]
+            .as_str()
+            .unwrap()
+            .contains("unsubscribed")
+    );
+    all.insert(
+        unsubscribed + 1,
+        emit(
+            &json!({"method": "item/completed", "params": {"threadId": THREAD, "turnId": TURN,
+            "item": {"type": "commandExecution", "id": SHARED, "command": "/bin/bash -lc 'sleep 75'",
+                "cwd": "/work/project-a", "commandActions": [], "status": "completed",
+                "exitCode": 0}}}),
+        ),
+    );
+    let b = turn_mut(&mut expect, 1);
+    *b = serde_json::from_str(&b.to_string().replace(B_TOOL, SHARED)).unwrap();
+    let outcome = checked_outcome(
+        name,
+        &replay,
+        &expect,
+        conformance_run::Knobs::default(),
+        |_| Ok(()),
+    )
+    .unwrap_or_else(|why| panic!("{why}"));
+    let ended = |turn: &conformance_expect::TurnOutcome| {
+        turn.observations
+            .iter()
+            .filter(|observation| {
+                observation["tools_ended"]
+                    .as_array()
+                    .is_some_and(|ended| ended.contains(&json!(SHARED)))
+            })
+            .count()
+    };
+    assert_eq!(ended(&outcome.turns[1]), 1, "B ends its command once");
+    assert_eq!(ended(&outcome.turns[0]), 0, "A's command never ends");
+}

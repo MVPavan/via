@@ -916,3 +916,57 @@ async fn provenance_reads_the_cancel_and_the_close() {
         })
     );
 }
+
+/// x.3.2 X4 K5 (`codex_control_races`, F15 without steer: an interrupt
+/// versus the turn's own terminal): Core's cancel posts the interrupt,
+/// and the vendor finishes the turn, `completed`, before it handles it;
+/// the interrupt's reply comes after. The turn ends with its terminal,
+/// cleanup not at issue and no stop acknowledged (no `interrupted`
+/// terminal); the late reply pairs and fails nothing: the thread's next
+/// turn is accepted and completes.
+#[tokio::test(start_paused = true)]
+async fn codex_control_races_interrupt_vs_terminal() {
+    let rig = Rig::new();
+    let mut turn = accepted(
+        &rig,
+        (Duration::from_secs(600), Duration::from_secs(60)),
+        false,
+    )
+    .await;
+    let now = Instant::now();
+    turn.running.stop.send_replace(Some(order(
+        crate::StopCause::Cancel,
+        now + Duration::from_secs(3),
+    )));
+    let interrupt = read_method(&mut turn.vendor, "turn/interrupt").await;
+    assert_eq!(interrupt["params"]["turnId"], TURN_A);
+    turn.vendor.emit(&terminal("completed")).await;
+    turn.vendor
+        .emit(&json!({"id": interrupt["id"], "result": {}}))
+        .await;
+    let acknowledged = turn.running.acknowledged.clone();
+    let (end, _, (mut vendor, driver)) = turn.end().await;
+    assert_eq!(
+        end.terminal.as_ref().map(|terminal| terminal.status),
+        Some(crate::VendorTerminalStatus::Completed)
+    );
+    assert!(end.outcome.is_ok(), "{:?}", end.outcome);
+    assert!(!*acknowledged.borrow(), "no interrupted terminal");
+    let second = run(&driver, 2, driver.prepare());
+    let start = read_method(&mut vendor, "turn/start").await;
+    vendor
+        .emit(&json!({"id": start["id"], "result": {"turn": {"id": "turn-2", "status": "inProgress"}}}))
+        .await;
+    vendor
+        .emit(
+            &json!({"method": "turn/completed", "params": {"threadId": THREAD,
+            "turn": {"id": "turn-2", "items": [], "status": "completed"}}}),
+        )
+        .await;
+    let end = ended(second).await;
+    assert_eq!(
+        end.terminal.as_ref().map(|terminal| terminal.status),
+        Some(crate::VendorTerminalStatus::Completed)
+    );
+    assert!(end.outcome.is_ok(), "{:?}", end.outcome);
+}
