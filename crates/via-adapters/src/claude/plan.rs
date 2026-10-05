@@ -89,9 +89,9 @@ fn capabilities() -> Capabilities {
 /// files and the user's and project's plugins, skills and agents off
 /// together (built-ins only, verified); without it every one of them
 /// loads (verified). MCP servers without the switch load in the default
-/// mode (verified); under `--restricted` the vendor documents that they
-/// still load, unverified, so they are `unknown`. A request the mode
-/// cannot deliver warns.
+/// mode (verified); under `--restricted` what loads varied between live
+/// launches (none, or the account's claude.ai connectors), so they are
+/// `unknown`. A request the mode cannot deliver warns.
 pub(crate) fn categories(mode: ClaudeMode) -> BTreeMap<Category, CategoryDecl> {
     let loaded = match mode {
         ClaudeMode::Unrestricted => InheritState::On,
@@ -625,8 +625,8 @@ mod tests {
     /// 2026-10-05 live round): restricted loads no hooks, instruction
     /// files, user plugins, skills or agents; unrestricted loads them all,
     /// and its MCP servers too (verified). Restricted MCP servers without
-    /// `--strict-mcp-config` are not verified; the switch turns them off
-    /// in both modes. Claude's default request is what the default mode
+    /// `--strict-mcp-config` varied live, so are `unknown`; the switch
+    /// turns them off in both modes. Claude's default request is what the default mode
     /// delivers, MCP servers on (owner, 2026-10-05), so it never warns; a
     /// request a mode cannot deliver warns, listing each such category.
     #[test]

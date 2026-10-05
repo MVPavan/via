@@ -244,7 +244,7 @@ whatever the configuration says now; a session frozen before modes existed
 | Category | Default request (Claude) | Unrestricted (default mode) | Restricted |
 |---|---|---|---|
 | hooks | on | `on`: the user's SessionStart hooks ran (`hook_started` events, round-2 probe u1); no switch | `off`: no hook events (round 1); settings files are ignored |
-| MCP servers | on | `on`: no switch; init `mcp_servers` listed the user's (plugin-provided) server (round-3 probe m1). `off`: `--strict-mcp-config`, verified (`mcp_servers:0`) | `on` passes no switch and is `unknown`: the help says `--restricted` still loads MCP servers, but the probe's only server came from a user plugin, which the mode drops (init `mcp_servers: []`, round-3 probe m2), so a non-plugin server is unverified. `off`: `--strict-mcp-config`, verified |
+| MCP servers | on | `on`: no switch; init `mcp_servers` listed the user's (plugin-provided) server (round-3 probe m1). `off`: `--strict-mcp-config`, verified (`mcp_servers:0`) | `on` passes no switch and is `unknown`: what loads varied. The user's plugin-provided server is dropped with the plugin; one launch listed no server (init `mcp_servers: []`, round-3 probe m2, Haiku), another listed five claude.ai connector servers (source `claudeai`, status `pending`) that no unrestricted launch listed (probe sB, Sonnet). `off`: `--strict-mcp-config`, verified |
 | plugins | on | `on`: the user's plugins load (init inventory) | `off`: no user or project plugins; init may still list managed or built-in ones |
 | skills | on | `on`: the user's skills load (init inventory) | `off`: built-in skills only (init inventory) |
 | agents | on | `on`: the user's agents load (init inventory) | `off`: built-in agents only (init inventory) |
