@@ -1191,13 +1191,16 @@ A result that cannot persist keeps F12's named `store_error` and
 `via.log` holds the daemon's own warnings and errors, chiefly those that
 belong to no turn: a startup failure after the log opened, with its whole
 cause chain (also on stderr, as the daemon's exit report), and the
-Store-failed latch, with its kind and scope, when final shutdown begins
-(owner, 2026-10-04). It never holds a prompt, vendor output or a turn's
-lifecycle, which the Store keeps; a Host or launch failure that ends a turn
+Store-failed latch, with its kind and scope, once: when final shutdown
+begins, or after its pipeline when first raised there (owner, 2026-10-04).
+Startup's recovery writes only counts. It never holds a prompt, vendor
+output or a turn's lifecycle, which the Store keeps; a Host or launch failure that ends a turn
 is that turn's durable `launch_failed` warning event (C1 §6.1). The log is
 rotated by size: a line that would take it past 10 MiB first renames it
 `via.log.1`, replacing any earlier one, and goes to a new `via.log`, while
-the daemon runs as at its start; one earlier file is kept.
+the daemon runs as at its start; one earlier file is kept. When the new
+`via.log` cannot be opened (no file descriptor left, say), lines go on to
+`via.log.1` and each later line retries the open.
 
 ## 7. F12: persistent Store failure and crash reconciliation
 

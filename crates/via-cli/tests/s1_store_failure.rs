@@ -1091,6 +1091,20 @@ fn s1_f12_forced_terminal_not_committed_in_shutdown() -> TestResult {
                     "uncertain {uncertain}: unexpected exit {status}, session {state}: {summary}"
                 )
             })?;
+            // Bead via-23b fix round 1: a latch first raised in final
+            // shutdown is logged once, with its cause.
+            let trace = daemon.trace();
+            let latched: Vec<&str> = trace
+                .lines()
+                .filter(|line| line.contains("store failure latched"))
+                .collect();
+            check(
+                latched.len() == usize::from(uncertain)
+                    && latched
+                        .iter()
+                        .all(|line| line.contains("ERROR") && line.contains("failure=")),
+                || format!("uncertain {uncertain}: latch lines {latched:?} in {trace}"),
+            )?;
             sandbox.verify_anchors()?;
         }
         Ok(())

@@ -31,18 +31,34 @@ struct OpenLog {
     file: File,
     len: u64,
     dir: PathBuf,
+    /// A rotation renamed the file but could not open the new one: `file`
+    /// is `via.log.1`, and each line retries the open first.
+    reopen: bool,
 }
 
 impl OpenLog {
+    /// `via.log` in `dir`, opened by [`open_file`].
+    fn open(dir: &Path) -> io::Result<Self> {
+        let file = open_file(&dir.join("via.log"))?;
+        let len = file.metadata()?.len();
+        Ok(Self {
+            file,
+            len,
+            dir: dir.to_path_buf(),
+            reopen: false,
+        })
+    }
+
     /// Writes one line, rotating first when it would take the file past
-    /// [`ROTATE_BYTES`]. A failed rotation keeps the current file; a write
-    /// error is ignored.
+    /// [`ROTATE_BYTES`]. A failed rotation keeps the current file, which
+    /// then grows past the limit rather than lose the line; a write error
+    /// is ignored.
     fn write(&mut self, bytes: &[u8]) {
         let bytes_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        if self.len > 0 && self.len.saturating_add(bytes_len) > ROTATE_BYTES {
-            // Safe to ignore: a log that cannot rotate keeps growing past
-            // its limit rather than lose the line.
-            let _ = self.rotate();
+        if self.reopen {
+            self.reopen();
+        } else if self.len > 0 && self.len.saturating_add(bytes_len) > ROTATE_BYTES {
+            self.rotate();
         }
         if self.file.write_all(bytes).is_ok() {
             self.len = self.len.saturating_add(bytes_len);
@@ -50,11 +66,21 @@ impl OpenLog {
     }
 
     /// Renames `via.log` to `via.log.1`, replacing it, and opens a new one.
-    fn rotate(&mut self) -> io::Result<()> {
-        fs::rename(self.dir.join("via.log"), self.dir.join("via.log.1"))?;
-        self.file = open_file(&self.dir.join("via.log"))?;
-        self.len = 0;
-        Ok(())
+    fn rotate(&mut self) {
+        if fs::rename(self.dir.join("via.log"), self.dir.join("via.log.1")).is_ok() {
+            self.reopen = true;
+            self.reopen();
+        }
+    }
+
+    /// Opens the new `via.log` after a rotation's rename; on failure, such
+    /// as no file descriptor left, the next line tries again.
+    fn reopen(&mut self) {
+        if let Ok(file) = open_file(&self.dir.join("via.log")) {
+            self.file = file;
+            self.len = 0;
+            self.reopen = false;
+        }
     }
 }
 
@@ -106,13 +132,8 @@ pub(super) fn open(state: &Path) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    let file = open_file(&path)?;
-    let len = file.metadata()?.len();
-    *LOG.file.lock().unwrap_or_else(PoisonError::into_inner) = Some(OpenLog {
-        file,
-        len,
-        dir: state.to_path_buf(),
-    });
+    let log = OpenLog::open(state)?;
+    *LOG.file.lock().unwrap_or_else(PoisonError::into_inner) = Some(log);
     Ok(())
 }
 
@@ -306,6 +327,71 @@ mod tests {
         let mut digits = super::itoa_buffer();
         assert_eq!(super::itoa(0, &mut digits), b"0");
         assert_eq!(super::itoa(u32::MAX, &mut digits), b"4294967295");
+    }
+
+    /// Names the rotation scenario's directory in its child.
+    const ROTATE_CHILD: &str = "VIA_LOG_ROTATE_CHILD";
+
+    /// Bead via-23b fix round 1: a rotation whose reopen fails (no file
+    /// descriptor left) keeps the line in the renamed file and retries the
+    /// reopen on later lines, so `via.log` comes back once descriptors do.
+    /// Runs in a child copy, since it lowers the process's descriptor limit.
+    #[test]
+    fn rotation_recovers_after_a_failed_reopen() {
+        use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+        if let Ok(dir) = std::env::var(ROTATE_CHILD) {
+            let dir = Path::new(&dir);
+            let prefill = vec![b'a'; usize::try_from(super::ROTATE_BYTES).unwrap() - 2];
+            std::fs::write(dir.join("via.log"), &prefill).unwrap();
+            let mut log = super::OpenLog::open(dir).unwrap();
+            let limit = getrlimit(Resource::Nofile);
+            setrlimit(
+                Resource::Nofile,
+                Rlimit {
+                    current: Some(256),
+                    maximum: limit.maximum,
+                },
+            )
+            .unwrap();
+            let mut held = Vec::new();
+            while let Ok(file) = std::fs::File::open("/dev/null") {
+                held.push(file);
+            }
+            log.write(b"one\n");
+            log.write(b"two\n");
+            drop(held);
+            log.write(b"three\n");
+            setrlimit(Resource::Nofile, limit).unwrap();
+            let mut rotated = prefill;
+            rotated.extend_from_slice(b"one\ntwo\n");
+            assert_eq!(
+                std::fs::read_to_string(dir.join("via.log")).ok().as_deref(),
+                Some("three\n"),
+                "via.log did not come back"
+            );
+            assert!(
+                std::fs::read(dir.join("via.log.1")).unwrap() == rotated,
+                "via.log.1 is not the full log and the lines of the failed reopen"
+            );
+            std::process::exit(0);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "server::log::tests::rotation_recovers_after_a_failed_reopen",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(ROTATE_CHILD, dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child ended {:?}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     /// X0 item 2.7 `panic_hook_aborts_with_full_stderr`: with its stderr a

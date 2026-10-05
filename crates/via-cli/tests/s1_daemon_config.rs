@@ -884,14 +884,17 @@ fn s1_daemon_log_after_startup_and_rotation() -> TestResult {
             evidence
                 .write("via.log.recovered", log.as_bytes())
                 .map_err(infra)?;
-            let recovery = log
+            // Bead via-23b fix round 1: one count line, and no turn's
+            // lifecycle, which the Store keeps (runtime §6.2).
+            let recovery: Vec<&str> = log
                 .lines()
-                .find(|line| line.contains("recovered"))
-                .unwrap_or_default()
-                .to_owned();
+                .filter(|line| line.contains("recovered"))
+                .collect();
             check(
-                recovery.contains(&format!("session={session}")) && recovery.contains("turn=1"),
-                || format!("no recovery warning naming {session}/1 in via.log: {log}"),
+                recovery.len() == 1
+                    && recovery[0].contains("turns=1")
+                    && !log.contains(session.as_str()),
+                || format!("not one recovery count without {session} in via.log: {log}"),
             )?;
             // A later warning: an accepted forced stop, then the summary.
             let before = fs::read(&trace).map_err(infra)?;

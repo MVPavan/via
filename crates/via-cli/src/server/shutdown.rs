@@ -76,6 +76,14 @@ struct Pipeline {
     failed_joins: usize,
 }
 
+/// The Store-failed latch, a daemon-level error, in `via.log` with its
+/// kind and scope (bead via-23b): once, at final shutdown's entry, or
+/// after its pipeline when first raised there.
+fn latch_logged(engine: &Engine) {
+    let failure = engine.store_failure_status().unwrap_or_default();
+    tracing::error!(%failure, "store failure latched");
+}
+
 /// Joins the daemon's owned work under one absolute deadline and decides the
 /// process exit: 0 only for a clean shutdown, otherwise 4 (incomplete).
 ///
@@ -100,6 +108,9 @@ pub(super) async fn final_shutdown(
         expired,
     } = entry;
     let failed_at = engine.failed_at();
+    if failed_at.is_some() {
+        latch_logged(&engine);
+    }
     // Force-path reads stop retrying in time for Host cleanup and terminals.
     engine.begin_final_shutdown(deadline);
     let Joins {
@@ -138,6 +149,10 @@ pub(super) async fn final_shutdown(
     let (pending, failed) = join_clients(&mut clients, clients_by, deadline).await;
     pending_joins += pending;
     failed_joins += failed;
+    if failed_at.is_none() && engine.failed_at().is_some() {
+        // First raised during final shutdown: logged once, here.
+        latch_logged(&engine);
+    }
     // Store Drop blocks on its writer and raw threads: keep it off Tokio workers
     // and bounded; a stalled join is left to process exit, never waited out.
     let blob_tasks = engine.blob_tasks();

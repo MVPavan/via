@@ -293,12 +293,6 @@ async fn serve_bound(
     // Task 4 design §7.6: from here on, only `via.log` is written.
     log::serving();
     let exit = main.serve(&listener, &client).await;
-    if main.engine.failed_at().is_some() {
-        // Bead via-23b: the Store-failed latch is a daemon-level error;
-        // final shutdown follows it.
-        let failure = main.engine.store_failure_status().unwrap_or_default();
-        tracing::error!(%failure, "store failure latched");
-    }
     // Design §7.4: after a latch that preceded final shutdown, the listener
     // keeps serving through the diagnostic window, which final shutdown
     // closes. Otherwise serving ends here.
@@ -384,11 +378,10 @@ async fn open_engine(
 /// Startup's crash recovery, resumed paging bound and queued-turn handoff,
 /// before admission (C1 §7.5, design §8, §10).
 async fn recover(engine: &Engine) -> anyhow::Result<()> {
-    // Task 4 design §7.6: one warning per turn, naming it.
+    // Runtime §6.2 (bead via-23b): one count line; each turn's recovery is
+    // its own lifecycle, which the Store keeps, never `via.log`.
     let recovered = engine
-        .recover_logged(|session, turn| {
-            tracing::warn!(%session, turn = turn.get(), "recovered unfinished turn as unknown");
-        })
+        .recover()
         .await
         .map_err(|error| anyhow::anyhow!("crash recovery failed: {error}"))?;
     if recovered > 0 {
