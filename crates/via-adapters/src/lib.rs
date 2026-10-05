@@ -165,7 +165,7 @@ pub use config::{
 pub use driver::StandIn;
 pub use driver::{
     CloseMode, CloseReport, ConnectionKind, ConnectionPin, ForceWatch, Prepared, Recovery,
-    SessionCx, SessionDriver, SessionSpec, SteerError, SteerInput, TurnCx, TurnSpec,
+    SessionCx, SessionDriver, SessionSpec, SteerError, SteerInput, StopAck, TurnCx, TurnSpec,
 };
 pub use harness::{FAKE, HARNESSES, Harness, HarnessRow, harness_names};
 pub use instance::{

@@ -127,6 +127,7 @@ fn run(driver: &Arc<SessionDriver>, number: u32, prepared: Prepared) -> Running 
         tool_grace: Duration::from_secs(60),
         stop: stop_rx,
         force: force_rx,
+        stop_ack: crate::StopAck::new(),
     };
     let spec = TurnSpec {
         prompt: "hi".to_owned(),

@@ -723,6 +723,7 @@ impl<'a> Run<'a> {
             tool_grace,
             stop: stop_rx,
             force: force_rx,
+            stop_ack: via_adapters::StopAck::new(),
         };
         let launches_before = self.pure.launches()?;
         let observed = Rc::new(RefCell::new(Vec::<Value>::new()));

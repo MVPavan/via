@@ -18,6 +18,9 @@ use via_store::{SubmissionRecord, TerminalRecord};
 use super::{Engine, Receipted};
 use crate::api::{Event, EventBody, rfc3339};
 
+#[cfg(test)]
+#[cfg(feature = "test-failpoints")]
+mod stop_ack;
 #[cfg(feature = "test-failpoints")]
 mod wake;
 use crate::{
@@ -4165,6 +4168,7 @@ fn the_lane_actor_retires_a_driver_whose_turn_was_abandoned() {
             tool_grace: Duration::from_secs(60),
             stop,
             force,
+            stop_ack: via_adapters::StopAck::new(),
         };
         let spec = TurnSpec {
             prompt: "p".to_owned(),
@@ -5891,6 +5895,7 @@ fn health_retirement_commits_the_items_it_finds_first() {
             tool_grace: Duration::from_secs(60),
             stop,
             force,
+            stop_ack: via_adapters::StopAck::new(),
         };
         let spec = TurnSpec {
             prompt: "p".to_owned(),
@@ -5971,6 +5976,7 @@ fn an_identity_drained_before_a_turn_is_the_turns() {
             tool_grace: Duration::from_secs(60),
             stop,
             force,
+            stop_ack: via_adapters::StopAck::new(),
         };
         let spec = TurnSpec {
             prompt: "p".to_owned(),
@@ -6268,6 +6274,7 @@ fn a_pre_turn_drain_services_a_pending_order_within_128_items() {
             tool_grace: Duration::from_secs(60),
             stop,
             force,
+            stop_ack: via_adapters::StopAck::new(),
         };
         let spec = TurnSpec {
             prompt: "p".to_owned(),
@@ -6418,6 +6425,7 @@ fn a_never_empty_channel_holds_neither_the_turn_nor_its_end() {
             tool_grace: Duration::from_secs(60),
             stop,
             force,
+            stop_ack: via_adapters::StopAck::new(),
         };
         let spec = TurnSpec {
             prompt: "p".to_owned(),
@@ -6514,6 +6522,7 @@ fn a_new_connection_generation_starts_with_no_old_ownership() {
             tool_grace: Duration::from_secs(60),
             stop,
             force,
+            stop_ack: via_adapters::StopAck::new(),
         };
         let spec = TurnSpec {
             prompt: "p".to_owned(),
@@ -7052,6 +7061,7 @@ fn turn_2_cx() -> (via_adapters::TurnSpec, via_adapters::TurnCx) {
         tool_grace: Duration::from_secs(60),
         stop,
         force,
+        stop_ack: via_adapters::StopAck::new(),
     };
     let spec = TurnSpec {
         prompt: "p".to_owned(),

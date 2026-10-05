@@ -925,6 +925,7 @@ async fn turn(
         tool_grace: _,
         stop,
         mut force,
+        stop_ack: _,
     } = cx;
     let mut orders = Orders {
         stop,

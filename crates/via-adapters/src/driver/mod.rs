@@ -188,6 +188,45 @@ pub struct TurnCx {
     pub stop: StopWatch,
     /// The daemon force.
     pub force: ForceWatch,
+    /// The vendor's acknowledgement of the turn's stop, reported before
+    /// `run_turn` returns (C2 §2 Interrupt; x.3.2 X4 D7).
+    pub stop_ack: StopAck,
+}
+
+/// C2 §2 Interrupt (x.3.2 X4 D7): a turn's write-once report that vendor
+/// evidence acknowledged its stop, before `run_turn` returns and apart
+/// from its cleanup. It carries no terminal and commits nothing; Core
+/// shows it as `cancel.outcome: acknowledged` with `cleanup: pending`
+/// while the turn still runs. It bypasses the observation queue. A route
+/// that returns at acknowledgement may leave it unused.
+#[derive(Clone, Debug)]
+pub struct StopAck(Arc<watch::Sender<bool>>);
+
+impl StopAck {
+    /// A report not yet made.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Arc::new(watch::Sender::new(false)))
+    }
+
+    /// Reports the acknowledgement; later calls change nothing.
+    pub fn acknowledged(&self) {
+        self.0
+            .send_if_modified(|acknowledged| !std::mem::replace(acknowledged, true));
+    }
+
+    /// Core's receiver: `true` once acknowledged, closed when every
+    /// report handle dropped.
+    #[must_use]
+    pub fn subscribe(&self) -> watch::Receiver<bool> {
+        self.0.subscribe()
+    }
+}
+
+impl Default for StopAck {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Steer input for the active turn (C2 §2 `SteerInput`).

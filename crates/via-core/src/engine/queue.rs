@@ -94,6 +94,10 @@ pub(super) enum Ack {
     Requested(String),
     /// `cancel.requested` could not be recorded.
     Failed,
+    /// Vendor evidence acknowledged the stop of the order committed with
+    /// this `requested_at`, while the turn still runs (x.3.2 X4 D7; C1
+    /// §3.5 P7): its cleanup is pending.
+    Acknowledged(String),
 }
 
 /// A submitted-or-claimed turn's stop channels. Dropping it closes both
@@ -659,6 +663,37 @@ impl Slot {
         {
             running.stop.ack.send_replace(Some(ack));
         }
+    }
+
+    /// x.3.2 X4 D7: the driver reported vendor acknowledgement of the
+    /// running turn's stop. Shown only over a committed order's
+    /// `Requested`; a `Failed` acknowledgement, or none, stands.
+    pub(super) fn acknowledged(&self, turn: TurnNumber) {
+        let state = lock(&self.state);
+        if let Some(running) = state
+            .running
+            .as_ref()
+            .filter(|running| running.turn == turn)
+        {
+            running.stop.ack.send_if_modified(|ack| match ack {
+                Some(Ack::Requested(requested_at)) => {
+                    *ack = Some(Ack::Acknowledged(std::mem::take(requested_at)));
+                    true
+                }
+                Some(Ack::Failed | Ack::Acknowledged(_)) | None => false,
+            });
+        }
+    }
+
+    /// The running turn's acknowledgement as `status` shows it (x.3.2 X4
+    /// D7), if any.
+    pub(super) fn cancel_shown(&self, turn: TurnNumber) -> Option<Ack> {
+        let state = lock(&self.state);
+        state
+            .running
+            .as_ref()
+            .filter(|running| running.turn == turn)
+            .and_then(|running| running.stop.ack.borrow().clone())
     }
 
     /// Marks the running turn `settling` once `execute` returned, and returns

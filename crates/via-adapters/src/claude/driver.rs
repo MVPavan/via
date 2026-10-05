@@ -75,7 +75,11 @@ pub(crate) async fn run_turn(
         tool_grace: _,
         stop,
         force,
+        stop_ack,
     } = cx;
+    // A private route returns at acknowledgement: its report goes unused
+    // (C2 §2 Interrupt).
+    drop(stop_ack);
     let ordered = ordered((stop.clone(), force.clone(), wall), driver.cancel.clone());
     let (generation, capacity, reservation, _delivering) =
         match driver.connect((prepared, capacity), ordered).await {

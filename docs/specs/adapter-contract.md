@@ -190,7 +190,7 @@ pub struct ObservationLoss { pub trigger: (SessionId, TurnNumber), pub generatio
     pub omitted: u64 /* saturating; u64::MAX: unknown or saturated */ }
 pub struct TurnCx { pub turn: TurnNumber, pub prepared: Prepared, pub capacity: Option<CapacityToken>,
     pub activity: TurnActivity, pub wall: Deadline, pub tool_grace: Duration /* C1 P7: 60 s */,
-    pub stop: StopWatch, pub force: ForceWatch }
+    pub stop: StopWatch, pub force: ForceWatch, pub stop_ack: StopAck /* write-once, §2 Interrupt */ }
 pub struct TurnEnd { pub terminal: Option<VendorTerminal>,
     pub instance: Option<InstanceReport> /* once the handshake was read, on every outcome (§5) */,
     pub leftovers: Option<LeftoverReport> /* per-turn routes on every outcome, and `ServerLost` (§4.2) */,
@@ -310,8 +310,18 @@ Contract points:
   A turn waiting on that barrier has not launched: a stop or force order
   ends it there, as before any launch.
 - **Interrupt** is an S1 stop order. The adapter runs the vendor's soft stop
-  (§6.2) and reports `Acknowledged` only on vendor evidence; the turn's
-  `TurnEnd` carries the outcome and `Cleanup` (§4.1). Cleanup keeps its
+  (§6.2) and reports `Acknowledged` only on vendor evidence.
+  `TurnCx.stop_ack: StopAck` is a write-once report. The adapter calls
+  `StopAck::acknowledged()` once, when vendor evidence acknowledges the
+  turn's stop (the Interrupt row's `Acknowledged` evidence), before
+  `run_turn` returns and independently of cleanup settlement. It carries no
+  terminal and commits nothing: the terminal, outcome and `Cleanup` still
+  come only in `TurnEnd`. Core shows it as `cancel.outcome: acknowledged`
+  with `cleanup: pending` while the turn is still running (C1 §3.5, P7). It
+  bypasses the observation queue (§4 "control acknowledgement may bypass
+  observations") and holds one value per turn. Routes that return at
+  acknowledgement may leave it unused. The turn's `TurnEnd` carries the
+  outcome and `Cleanup` (§4.1). Cleanup keeps its
   approved meaning: the agent's own process group, or the vendor's reported
   tool items on a server route (AD9):
 

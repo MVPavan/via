@@ -284,6 +284,7 @@ fn turn_cx_with(
         tool_grace,
         stop: stop_rx,
         force: force_rx,
+        stop_ack: via_adapters::StopAck::new(),
     };
     (
         cx,

@@ -9,9 +9,9 @@ use std::{
 use tokio::sync::watch;
 use via_adapters::{
     AdapterError, Admitted, ConnectionKind, Decline, Denial, DenialKind, InheritPlan, Observation,
-    ObservationItem, Prepared, RouteError, SteerDelivery, StopOrder, StopWatch, TurnActivity,
-    TurnCx, TurnEnd, TurnEvidence, TurnSpec, VendorTerminal, VersionStatus, WireCleanup,
-    observation::Acceptance,
+    ObservationItem, Prepared, RouteError, SteerDelivery, StopAck, StopOrder, StopWatch,
+    TurnActivity, TurnCx, TurnEnd, TurnEvidence, TurnSpec, VendorTerminal, VersionStatus,
+    WireCleanup, observation::Acceptance,
 };
 use via_store::{
     AcceptanceRecord, CancelCause, Prompt, QueuedTurn, StepRow, StepsRecord, StoreError,
@@ -172,6 +172,37 @@ impl Control<'_> {
         if named {
             self.late.get_or_insert(terminal);
         }
+    }
+}
+
+/// Resolves once the driver's stop report changed or its sender went;
+/// never without a receiver.
+async fn ack_changed(
+    ack: Option<&mut watch::Receiver<bool>>,
+) -> Result<(), watch::error::RecvError> {
+    match ack {
+        Some(ack) => ack.changed().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// x.3.2 X4 D7: the driver's stop report after a change: read, never
+/// inferred from the wakeup. A confirmed `true` shows `acknowledged` over
+/// the order's committed `Requested`; a sender gone unconfirmed shows
+/// nothing. Either way the report is done (`None`), so its arm never fires
+/// again; otherwise it may still come.
+fn stop_acknowledged(
+    control: &Control<'_>,
+    mut ack: watch::Receiver<bool>,
+    changed: &Result<(), watch::error::RecvError>,
+) -> Option<watch::Receiver<bool>> {
+    if *ack.borrow_and_update() {
+        control.slot.acknowledged(control.turn);
+        None
+    } else if changed.is_err() {
+        None
+    } else {
+        Some(ack)
     }
 }
 
@@ -1634,6 +1665,9 @@ impl Engine {
         activity: TurnActivity,
         (wall, stop): (Deadline, StopWatch),
     ) -> TurnCx {
+        let stop_ack = StopAck::new();
+        #[cfg(test)]
+        super::lock(&self.faults.stop_ack).replace(stop_ack.clone());
         TurnCx {
             turn,
             prepared,
@@ -1643,6 +1677,7 @@ impl Engine {
             tool_grace: TOOL_GRACE,
             stop,
             force: self.signal.force.subscribe(),
+            stop_ack,
         }
     }
 
@@ -1686,6 +1721,10 @@ impl Engine {
     /// The turn's stop order reaches Route through its `TurnCx`; this loop
     /// observes it once (design §2), and orders the idle deadline itself
     /// when no meaningful progress came within the idle budget (design §5).
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the run loop's arms are one select; x.3.2 X4 D7 adds the stop report's"
+    )]
     async fn execute(
         &self,
         record: &mut TurnRecord,
@@ -1701,6 +1740,9 @@ impl Engine {
             lane.new_generation();
         }
         record.vendor.identity = lane.identity();
+        // x.3.2 X4 D7: the driver's report that vendor evidence
+        // acknowledged the turn's stop, while it may still come.
+        let mut stop_ack = Some(cx.stop_ack.subscribe());
         // The fired idle deadline's frontier (critical r3 #1, r2 #2).
         let mut idle = IdleFrontier::new(&cx.activity);
         let mut run = Box::pin(lane.driver.run_turn(spec, cx));
@@ -1740,6 +1782,11 @@ impl Engine {
                         .await;
                         stop_for_store(record, control);
                     }
+                }
+                // x.3.2 X4 D7: only once the order was observed (its
+                // acknowledgement published).
+                changed = ack_changed(stop_ack.as_mut()), if control.observed && stop_ack.is_some() => {
+                    stop_ack = stop_ack.and_then(|ack| stop_acknowledged(control, ack, &changed));
                 }
                 () = sleep_until_some(idle_at), if idle_at.is_some() && !fenced => {
                     // Design §5, decided at the item frontier (critical r3

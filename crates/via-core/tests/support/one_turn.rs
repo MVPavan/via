@@ -99,6 +99,7 @@ pub(crate) fn turn_cx(
         tool_grace: TOOL_GRACE,
         stop,
         force,
+        stop_ack: via_adapters::StopAck::new(),
     }
 }
 

@@ -64,6 +64,10 @@ pub(crate) fn connection_id(generation: u64) -> String {
 /// terminal (AD4). The persistent connection is committed only once the
 /// whole logical turn was delivered. Dropping this future leaves the task,
 /// which owns the turn's cleanup and its share of the reservation, running.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the fake turn's steps in order; the stop report's drop and its test seam (x.3.2 X4 D7) pass the bound"
+)]
 pub(crate) async fn run_turn(
     driver: &SessionDriver,
     adapter: &FakeAdapter,
@@ -82,7 +86,15 @@ pub(crate) async fn run_turn(
         tool_grace,
         stop,
         force,
+        stop_ack,
     } = cx;
+    // The fake returns at acknowledgement: its stop report goes unused
+    // (C2 §2 Interrupt).
+    drop(stop_ack);
+    // Test builds: the turn's run began, holding nothing of the Store
+    // (x.3.2 X4 D7: Core's view of a pending run).
+    #[cfg(feature = "test-failpoints")]
+    let _ = via_routes::failpoint::hit_async("adapter.fake.turn_started").await;
     let first = matches!(prepared, Prepared::NeedsConnection);
     let ordered = ordered((stop.clone(), force.clone(), wall), driver.cancel.clone());
     let connected = driver.connect((prepared, capacity), ordered).await;
