@@ -84,6 +84,19 @@ pub(crate) struct Recipe<'a> {
     pub(crate) max_steps: Option<u64>,
 }
 
+/// The mode a session was spawned in, read back from its frozen effective
+/// states (C2 §6.2), so its every launch reproduces them whatever the
+/// configuration says now. Neither mode applies a hook switch, so hooks
+/// are `on` only without `--restricted` and `off` only with it
+/// ([`super::plan::categories`]). A session frozen before the mode
+/// existed (hooks `unknown`) was launched with `--restricted`.
+pub(crate) fn session_mode(effective: Inherit) -> ClaudeMode {
+    match effective.get(Category::Hooks) {
+        InheritState::On => ClaudeMode::Unrestricted,
+        InheritState::Off | InheritState::Unknown => ClaudeMode::Restricted,
+    }
+}
+
 /// Why a recipe cannot be built.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RecipeError {

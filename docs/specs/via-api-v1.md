@@ -680,7 +680,7 @@ and refusals are governed by §4.2.
 | Route | `read_only` | `workspace_write` | `full` | `network: false` |
 |---|---|---|---|---|
 | `codex-app-server` | protocol-mapped, unverified; refuse pending pinned enforcement gate | protocol-mapped, unverified; refuse pending pinned enforcement gate | native with `network:true` | limited-bound network control only after proof; `full` + `network:false` refused |
-| `claude-cli` | unqualified; refuse pending CLAUDE-BOUND-1 | unqualified; refuse pending CLAUDE-BOUND-1 | `network:true` eligible candidate, qualified only after exact live recipe continuity test | refused, including limited bounds |
+| `claude-cli` | unqualified; refuse pending CLAUDE-BOUND-1 | unqualified; refuse pending CLAUDE-BOUND-1 | `network:true` eligible candidate, qualified only after exact live recipe continuity test; Bash runs anywhere in both modes; the file tools are confined to the working directories only under `harnesses.claude.restricted` (`vendors/claude-code.md` §4) | refused, including limited bounds |
 | `opencode-serve` | refused (A4, D9) | refused | only with `network:true` and empty `extra_write_dirs`; nonempty `extra_write_dirs` is `invalid_params` before server acquisition or vendor I/O | refused |
 | `pi-rpc` | refused (no sandbox) | refused | only with `network:true` and empty `extra_write_dirs`; nonempty `extra_write_dirs` is `invalid_params` before vendor I/O | refused |
 | ACP | refused (D7) | refused | native | refused |

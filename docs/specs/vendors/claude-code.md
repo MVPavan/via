@@ -172,10 +172,18 @@ inherited-configuration table below). `--strict-mcp-config` and VIA's MCP
 handling are the same in both modes. This is a
 **proposed combination**, not a verbatim qualified probe: probes exercised its
 components with narrower tool lists. Explicit Bash enables general command
-execution in the unrestricted `full` bound. Restricted file tools may impose
-additional vendor restrictions; VIA does not promise every possible action is
-allowed by `full`, only that no narrower containment is advertised. Managed
-policy can deny actions. Denials are reported; restrictions are never bypassed.
+execution in the `full` bound in both modes; Bash wrote outside the
+workspace in both (round 1, restricted; round-2 probe u1, unrestricted).
+The file tools differ by mode:
+- **unrestricted (default):** not confined. Write created a file outside
+  the workspace (round-2 probe u1). The user's own settings files load, so
+  their permission rules apply too.
+- **restricted:** confined to the working directories (`--add-dir`
+  included); an outside path or a symlink escape is denied with a
+  structured denial, reported in `denied_actions` (round 1).
+Neither mode is a containment bound: VIA does not promise every possible
+action is allowed by `full`, only that no narrower containment is
+advertised. Managed policy can deny actions. Denials are reported; restrictions are never bypassed.
 No ambient tool expansion or raw argv passthrough. MCP is not enabled in v1's
 Claude route. Qualification must verify that managed configuration cannot add
 an unexpected execution surface without detection (§8).
@@ -220,21 +228,32 @@ auth/continuity tests and a recorded environment-name list; never copy config or
 credentials into a new HOME to make tests pass. `--bare` is not the default
 because its auth behavior differs from this evidenced login route.
 
-Inherited configuration (C2 §6.2; owner OD2), from the 2026-09-30 re-probe
-("verified" means seen live):
+Inherited configuration (C2 §6.2; owner OD2; via-umz), per mode, from the
+live rounds of 2026-10-05 (2.1.289, Haiku; "verified" means seen live).
+Only MCP servers have a per-category switch; `--restricted` turns every
+other category off together, and without it every one of them loads. A
+session's mode is frozen at spawn with its effective states: a later launch
+reads the mode back from them (hooks are `on` only without `--restricted`),
+whatever the configuration says now; a session frozen before modes existed
+(hooks `unknown`) keeps `--restricted`.
 
-| Category (default) | Switch and evidence | Effective state with the default |
-|---|---|---|
-| hooks (off) | Settings-file hooks are ignored under `--restricted` (help; **unverified**); plugin hooks **unverified**; `--safe-mode` also drops prompt config, so it is not a per-category switch | `unknown`, warns |
-| MCP servers (off) | `--strict-mcp-config`: **verified** (`mcp_servers:0`) | `off` |
-| plugins (on) | Loaded (2) even under `--restricted`; no per-category switch known | `on` (init inventory) |
-| skills (on) | Loaded (18); `--disable-slash-commands` (help; **unverified**) | `on` (init inventory) |
-| agents (on) | Loaded (5); no switch known | `on` (init inventory) |
-| instruction files (on) | CLAUDE.md is not in init; inventory unavailable; no per-category switch | `unknown`, warns |
+| Category | Default request (Claude) | Unrestricted (default mode) | Restricted |
+|---|---|---|---|
+| hooks | on | `on`: the user's SessionStart hooks ran (`hook_started` events, round-2 probe u1); no switch | `off`: no hook events (round 1); settings files are ignored |
+| MCP servers | off | `--strict-mcp-config`: `off` verified (`mcp_servers:0`); `on` passes no switch and is `unknown` | the same |
+| plugins | on | `on`: the user's plugins load (init inventory) | `off`: no user or project plugins; init may still list managed or built-in ones |
+| skills | on | `on`: the user's skills load (init inventory) | `off`: built-in skills only (init inventory) |
+| agents | on | `on`: the user's agents load (init inventory) | `off`: built-in agents only (init inventory) |
+| instruction files | on | `on`: the workspace CLAUDE.md reached the model (probe u1 named its codeword); auto-memory is on too (init `memory_paths`) | `off`: no CLAUDE.md, no auto-memory (round 1) |
 
-Init lists plugins, skills, agents, slash commands and MCP servers (verified);
-that inventory is recorded in the turn's evidence folder. Qualify the hook,
-plugin, skill and agent switches in `via-p98.3.4`.
+Claude's default request is OD2's with hooks on: what the default mode
+delivers, so the default never warns (owner, 2026-10-05). Any other request
+the mode cannot deliver keeps the effective state above and warns
+`config_switch_unverified` (C1 §3.7, C2 §6.2): for example the restricted
+mode with the default request lists hooks, plugins, skills, agents and
+instruction files. Auto-memory is not a C1 category; it follows instruction
+files. Init lists plugins, skills, agents, slash commands and MCP servers
+(verified); that inventory is recorded in the turn's evidence folder.
 
 No free-form vendor options in this first recipe. Reject unknown Claude vendor
 keys with `invalid_params`; recognized reserved keys use

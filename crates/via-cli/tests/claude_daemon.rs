@@ -1666,8 +1666,10 @@ fn claude_recovery_no_submit_survivor() -> TestResult {
 /// `--restricted`. After the restart a new session runs the new binary
 /// with MCP servers on and `--restricted`; a session spawned before it
 /// runs the new binary too (the binary is the daemon's, not frozen) but
-/// keeps its frozen inheritance, so `--strict-mcp-config` stays. Each
-/// replay pins its argv, so the wrong binary or recipe fails its launch.
+/// keeps its frozen inheritance and mode, so `--strict-mcp-config` stays
+/// and `--restricted` stays off (via-umz). Each replay pins its argv, so
+/// the wrong binary or recipe fails its launch. Status reports each
+/// session's frozen effective states.
 #[test]
 fn claude_s_launch_config_applies_after_restart() -> TestResult {
     scenario("claude_s_launch_config_after_restart", |d, evidence| {
@@ -1705,7 +1707,7 @@ fn claude_s_launch_config_applies_after_restart() -> TestResult {
             &next,
             &[
                 restricted_launch(completing(Launch::New, false, "THREE", 0.001)),
-                restricted_launch(completing(Launch::Resume(&uuid), true, "FOUR", 0.002)),
+                completing(Launch::Resume(&uuid), true, "FOUR", 0.002),
             ],
         )?;
         let _daemon = Daemon::start(d, evidence, "final")?;
@@ -1724,15 +1726,22 @@ fn claude_s_launch_config_applies_after_restart() -> TestResult {
             Deployment::log_of(&next, "launches")?.lines().count(),
         );
         let inherit = |session: &str| -> Result<Value, ScenarioError> {
-            Ok(d.status(evidence, &format!("status-{session}"), session)?["inherit"]
-                ["mcp_servers"]
-                .clone())
+            Ok(d.status(evidence, &format!("status-{session}"), session)?["inherit"].clone())
         };
-        // Status reports the effective setting: `off` is verified by
-        // `--strict-mcp-config`; inherited servers cannot be verified.
+        // Status reports the effective settings: MCP `off` is verified by
+        // `--strict-mcp-config`, inherited servers cannot be verified; the
+        // default mode loads the user's configuration, the restricted mode
+        // none of it.
+        let (old, new) = (inherit(&old)?, inherit(&new)?);
         check(
-            counts == (2, 2) && inherit(&old)? == "off" && inherit(&new)? == "unknown",
-            || format!("launches per binary {counts:?}"),
+            counts == (2, 2)
+                && old
+                    == json!({"hooks":"on","mcp_servers":"off","plugins":"on","skills":"on",
+                        "agents":"on","instruction_files":"on"})
+                && new
+                    == json!({"hooks":"off","mcp_servers":"unknown","plugins":"off",
+                        "skills":"off","agents":"off","instruction_files":"off"}),
+            || format!("launches per binary {counts:?}; inherit {old} and {new}"),
         )
     })
 }

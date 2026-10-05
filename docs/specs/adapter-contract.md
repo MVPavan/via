@@ -216,7 +216,9 @@ pub struct VendorIdentity {
 | `ModelEntry` | a model with `source: bundled \| discovered` |
 | `SessionRef` | `harness`, `route`, `adapter_version`, handed back on resume, reopen and recovery; unknown or incompatible → `harness_unavailable` (rule 2) |
 | `SessionSpec` | `session_id`, `model`, `instructions: Option<Instructions>`, `initial_bound`, `cwd`, `vendor`, `inherit: {requested, effective}` (the inherited-configuration settings and states frozen at spawn, §6.2), `confirmed_vendor_session_id: Option<VendorSessionId>`, immutable `allow_untested`; a confirmed historical ID is not verification of this connection |
-| `TurnParams` | a resume turn's per-turn values (effort, bound, `output_schema`, `max_steps`, vendor keys) and their `sizes: ParamSizes` (the session's frozen instructions, the turn's effective schema, inherited or set), with the session's requested `inherit` (`None` when unknown) and whether the session has `instructions` (`instructions: bool`, empty text included, since an empty value still has its flag), which a route's launch recipe and its handshake-refusal cache key read, and `model`: the session's frozen `SessionSpec.model`, which Core copies in (internal context, never a caller value or override); the input to `check_turn` |
+| `TurnParams` | a resume turn's per-turn values (effort, bound, `output_schema`, `max_steps`, vendor keys) and their `sizes: ParamSizes` (the session's frozen instructions, the turn's effective schema, inherited or set), with the session's requested `inherit` and its frozen effective states
+`inherit_effective` (each `None` when unknown; Claude reads its session's
+mode from the latter) and whether the session has `instructions` (`instructions: bool`, empty text included, since an empty value still has its flag), which a route's launch recipe and its handshake-refusal cache key read, and `model`: the session's frozen `SessionSpec.model`, which Core copies in (internal context, never a caller value or override); the input to `check_turn` |
 | `ServerReport` | `harness`, `vendor_version: Option<String>` (the server's handshake), `key: ServerKey` (Codex: 16 hex digits of its configuration hash), `sessions: u32` (sessions leasing it); only servers whose handshake succeeded and that are not retiring |
 | `TurnCheck` | `effective_bound`: the turn's bound as the route will apply it, like `RoutePlan.effective_bound` |
 | `TurnSpec` | `turn: TurnNo`, `prompt`, `effort`, `bound`, `output_schema`, `max_steps`, `vendor`, `wall_deadline: Instant`, `idle_deadline: IdleDeadline` |
@@ -839,7 +841,8 @@ category (hooks, MCP servers, plugins, skills, agents, instruction files):
 - what inventory of the inherited set it can record.
 
 Settings come from `AdapterConfig` (`daemon.json`
-`harnesses.<name>.inherit.*`; default hooks and MCP servers off, the rest on)
+`harnesses.<name>.inherit.*`; default hooks and MCP servers off, the rest on,
+except Claude's hooks on, what its default mode delivers)
 and are frozen per session at spawn. For each category the route records the
 **effective state**: `on` or `off` only when verified (a verified switch, the
 private profile, or an inventory that lists or omits the category), else

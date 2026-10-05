@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
-use super::launch::{Continue, Recipe, expected_session_id, recipe_key};
+use super::launch::{Continue, Recipe, expected_session_id, recipe_key, session_mode};
 use super::normalize::{Batch, End, LaunchFacts, Normalizer};
 use super::{ClaudeAdapter, HARNESS};
 use crate::driver::turn::{
@@ -185,6 +185,8 @@ fn launch(
     let resume = confirmed.is_some();
     let expected = confirmed.unwrap_or_else(|| expected_session_id(&driver.spec.session_id));
     let inherit = driver.spec.inherit.requested;
+    // The session's mode, not the configuration's now (C2 §6.2).
+    let mode = session_mode(driver.spec.inherit.effective);
     let schema = spec.output_schema.is_some();
     let extra_write_dirs = spec
         .bound
@@ -198,7 +200,7 @@ fn launch(
         } else {
             Continue::New(&expected)
         },
-        mode: adapter.mode,
+        mode,
         inherit,
         extra_write_dirs,
         instructions: driver.spec.instructions.as_deref(),
@@ -230,7 +232,7 @@ fn launch(
             schema,
             mcp: inherit.get(Category::McpServers) != InheritState::Off,
         },
-        recipe: recipe_key(adapter.mode, inherit, schema),
+        recipe: recipe_key(mode, inherit, schema),
     })
 }
 

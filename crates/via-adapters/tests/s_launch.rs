@@ -270,7 +270,8 @@ fn s_launch_harnesses_refusals() {
 }
 
 /// A valid section: the configured binary and per-key `inherit`, with the
-/// OD2 default for every missing key and harness; the fake keeps OD2.
+/// harness's default for every missing key and harness (OD2's, Claude's
+/// with hooks on); the fake keeps OD2.
 #[test]
 fn s_launch_harnesses_valid() {
     use InheritState::{Off, On};
@@ -314,12 +315,21 @@ fn s_launch_harnesses_valid() {
         let claude = config.harness(HARNESSES.iter().find(|r| r.name == "claude").unwrap());
         assert_eq!(claude.claude_mode(), mode, "{text}");
     }
-    // No section at all: every harness has the defaults.
+    // No section at all: every harness has the defaults; Claude's request
+    // differs from OD2's only in hooks, on: what its default mode delivers
+    // (owner, 2026-10-05).
     let config = AdapterConfig::load(none(), None).unwrap();
     for row in HARNESSES {
         assert_eq!(config.harness(row).binary(), None);
         assert_eq!(config.harness(row).claude_mode(), ClaudeMode::Unrestricted);
-        assert_eq!(config.inherit(Harness::Vendor(row)), Inherit::OD2_DEFAULT);
+        let inherit = config.inherit(Harness::Vendor(row));
+        for category in Category::ALL {
+            let expected = match (row.name, category) {
+                ("claude", Category::Hooks) => On,
+                _ => Inherit::OD2_DEFAULT.get(category),
+            };
+            assert_eq!(inherit.get(category), expected, "{} {category:?}", row.name);
+        }
     }
 }
 

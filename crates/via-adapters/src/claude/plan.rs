@@ -82,18 +82,25 @@ fn capabilities() -> Capabilities {
     }
 }
 
-/// AD13 per category (packet §4, design §5.4.1). Only the MCP switch is
-/// verified and applied (`--strict-mcp-config`); plugins, skills and agents
-/// load by the init inventory whatever is requested; hooks and instruction
-/// files are unverified either way.
-pub(crate) fn categories() -> BTreeMap<Category, CategoryDecl> {
-    let unswitched = |observed| CategoryDecl {
+/// AD13 per category (packet §4, design §5.4.1), as the configured mode
+/// delivers them (via-umz; live round of 2026-10-05). Only the MCP switch
+/// is applied per category (`--strict-mcp-config`, verified). The others
+/// have no per-category switch: `--restricted` turns hooks, instruction
+/// files and the user's and project's plugins, skills and agents off
+/// together (built-ins only, verified); without it every one of them
+/// loads (verified). A request the mode cannot deliver warns.
+pub(crate) fn categories(mode: ClaudeMode) -> BTreeMap<Category, CategoryDecl> {
+    let loaded = match mode {
+        ClaudeMode::Unrestricted => InheritState::On,
+        ClaudeMode::Restricted => InheritState::Off,
+    };
+    let unswitched = CategoryDecl {
         on: Switch::None,
         off: Switch::None,
-        observed,
+        observed: Some(loaded),
     };
     BTreeMap::from([
-        (Category::Hooks, unswitched(None)),
+        (Category::Hooks, unswitched),
         (
             Category::McpServers,
             CategoryDecl {
@@ -102,10 +109,10 @@ pub(crate) fn categories() -> BTreeMap<Category, CategoryDecl> {
                 observed: None,
             },
         ),
-        (Category::Plugins, unswitched(Some(InheritState::On))),
-        (Category::Skills, unswitched(Some(InheritState::On))),
-        (Category::Agents, unswitched(Some(InheritState::On))),
-        (Category::InstructionFiles, unswitched(None)),
+        (Category::Plugins, unswitched),
+        (Category::Skills, unswitched),
+        (Category::Agents, unswitched),
+        (Category::InstructionFiles, unswitched),
     ])
 }
 
@@ -246,7 +253,7 @@ impl ClaudeAdapter {
                 .iter()
                 .any(|r| r.kind == RefusalKind::BoundUnsupported)
         });
-        let (inherit, switch_warning) = effective_inherit(&categories(), requested);
+        let (inherit, switch_warning) = effective_inherit(&categories(self.mode), requested);
         RoutePlan {
             harness: harness.name(),
             model,
@@ -283,12 +290,17 @@ impl ClaudeAdapter {
     ) -> Vec<Refusal> {
         let mut refusals = Self::check_values(route, turn);
         refusals.extend(self.frame_refusal(route, turn));
+        // The session's mode, read back from its frozen states; the
+        // configured one where they are unknown.
+        let mode = turn
+            .inherit_effective
+            .map_or(self.mode, launch::session_mode);
         if let Some(inherit) = turn.inherit
             && self
                 .instances
                 .refusal(
                     &self.binary,
-                    &launch::recipe_key(self.mode, inherit, turn.output_schema),
+                    &launch::recipe_key(mode, inherit, turn.output_schema),
                     now,
                 )
                 .is_some()
@@ -562,6 +574,111 @@ fn reserved(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every request: each category `on` or `off`, all 64 combinations.
+    fn every_request() -> impl Iterator<Item = Inherit> {
+        (0..64_u8).map(|bits| {
+            let mut inherit = Inherit::OD2_DEFAULT;
+            for (index, category) in Category::ALL.into_iter().enumerate() {
+                let on = bits & (1 << index) != 0;
+                inherit.set(
+                    category,
+                    if on {
+                        InheritState::On
+                    } else {
+                        InheritState::Off
+                    },
+                );
+            }
+            inherit
+        })
+    }
+
+    fn uniform(state: InheritState) -> Inherit {
+        let mut inherit = Inherit::OD2_DEFAULT;
+        for category in Category::ALL {
+            inherit.set(category, state);
+        }
+        inherit
+    }
+
+    /// The categories a `config_switch_unverified` warning lists.
+    fn warned(warning: Option<&crate::plan::Warning>) -> Vec<String> {
+        warning
+            .and_then(|warning| warning.data.as_ref())
+            .and_then(|data| data["categories"].as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .map(|entry| entry["category"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    }
+
+    /// via-umz: the effective states are what each mode delivers (the
+    /// 2026-10-05 live round): restricted loads no hooks, instruction
+    /// files, user plugins, skills or agents; unrestricted loads them all.
+    /// MCP servers follow the verified `--strict-mcp-config` switch in
+    /// both. Claude's default request is what the default mode delivers,
+    /// so it never warns; a request a mode cannot deliver warns, listing
+    /// each such category.
+    #[test]
+    fn categories_report_each_mode_truthfully() {
+        use InheritState::{Off, On, Unknown};
+        let harness = Harness::Vendor(&crate::harness::HARNESSES[0]);
+        let default =
+            crate::config::AdapterConfig::load(crate::config::BootstrapEnv::default(), None)
+                .unwrap()
+                .inherit(harness);
+        let mut expected = uniform(On);
+        expected.set(Category::McpServers, Off);
+        assert_eq!(default, expected, "Claude's default request");
+        let plan = |mode, requested| effective_inherit(&categories(mode), requested);
+
+        let (inherit, warning) = plan(ClaudeMode::Unrestricted, default);
+        assert_eq!(inherit.effective, default);
+        assert!(warning.is_none(), "{warning:?}");
+
+        let (inherit, warning) = plan(ClaudeMode::Restricted, uniform(Off));
+        assert_eq!(inherit.effective, uniform(Off));
+        assert!(warning.is_none(), "{warning:?}");
+
+        let rest = ["hooks", "plugins", "skills", "agents", "instruction_files"];
+        let (inherit, warning) = plan(ClaudeMode::Restricted, default);
+        assert_eq!(inherit.effective, uniform(Off));
+        assert_eq!(warned(warning.as_ref()), rest);
+
+        let (inherit, warning) = plan(ClaudeMode::Unrestricted, uniform(Off));
+        assert_eq!(inherit.effective, expected);
+        assert_eq!(warned(warning.as_ref()), rest);
+
+        // Inherited MCP servers are not verified in either mode.
+        for mode in [ClaudeMode::Unrestricted, ClaudeMode::Restricted] {
+            let (inherit, warning) = plan(mode, uniform(On));
+            assert_eq!(inherit.effective.get(Category::McpServers), Unknown);
+            assert!(warned(warning.as_ref()).contains(&"mcp_servers".to_owned()));
+        }
+    }
+
+    /// A session's mode is frozen by its effective states: for every
+    /// request, the states a mode's plan freezes read back as that mode,
+    /// so a launch reproduces them whatever the configuration says now.
+    /// A session frozen before the mode existed (hooks `unknown`) was
+    /// launched with `--restricted`.
+    #[test]
+    fn frozen_states_name_the_session_mode() {
+        for mode in [ClaudeMode::Unrestricted, ClaudeMode::Restricted] {
+            for requested in every_request() {
+                let (inherit, _) = effective_inherit(&categories(mode), requested);
+                assert_eq!(
+                    launch::session_mode(inherit.effective),
+                    mode,
+                    "{requested:?}"
+                );
+            }
+        }
+        let mut legacy = Inherit::OD2_DEFAULT;
+        legacy.set(Category::Hooks, InheritState::Unknown);
+        assert_eq!(launch::session_mode(legacy), ClaudeMode::Restricted);
+    }
 
     /// Normalized spellings of one owned flag are all reserved; other keys
     /// are not.
@@ -904,6 +1021,30 @@ mod tests {
         assert_eq!(refused.len(), 1, "{refused:?}");
         assert_eq!(refused[0].kind.code(), "harness_unavailable");
         assert_eq!(refused[0].reason, Some("handshake_refused"));
+        // The lookup is the session's mode, read from its frozen states, not
+        // the configured one: a restricted session's recipe is not refused.
+        // (Before the expiry below, whose lookup drops the entry.)
+        let frozen = |mode| TurnParams {
+            inherit_effective: Some(
+                effective_inherit(&categories(mode), Inherit::OD2_DEFAULT)
+                    .0
+                    .effective,
+            ),
+            ..turn(false, Some(Inherit::OD2_DEFAULT))
+        };
+        let restricted = frozen(ClaudeMode::Restricted);
+        assert!(
+            adapter
+                .check_turn_at("claude-cli", &restricted, written)
+                .is_empty()
+        );
+        let unrestricted = frozen(ClaudeMode::Unrestricted);
+        assert_eq!(
+            adapter
+                .check_turn_at("claude-cli", &unrestricted, written)
+                .len(),
+            1
+        );
         let ttl = crate::instance::REFUSAL_TTL;
         for (turn, at) in [
             (turn(true, Some(Inherit::OD2_DEFAULT)), written),

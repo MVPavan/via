@@ -109,6 +109,10 @@ pub struct TurnParams {
     /// The session's `inherit` as requested at spawn, which a route's
     /// launch recipe may read; `None` where the session's is unknown.
     pub inherit: Option<Inherit>,
+    /// The session's effective `inherit` states frozen at spawn, which a
+    /// route's launch recipe may read (Claude's mode); `None` where the
+    /// session's are unknown.
+    pub inherit_effective: Option<Inherit>,
     /// The session's frozen model (`SessionSpec.model`), which Core copies
     /// in: internal context a route judges a discovered catalog against,
     /// never a caller value or override; `None` where unknown.

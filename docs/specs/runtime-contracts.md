@@ -1408,7 +1408,7 @@ error. The optional `harnesses` member is passed unparsed to `via-adapters`'
 path; the default is a `PATH` lookup) and
 `harnesses.<name>.inherit.{hooks, mcp_servers, plugins, skills, agents,
 instruction_files}` (booleans; default hooks and MCP servers `false`, the rest
-`true`; C2 §6.2, AD13), and for Claude alone `harnesses.claude.restricted`
+`true`, except Claude's hooks `true`; C2 §6.2, AD13), and for Claude alone `harnesses.claude.restricted`
 (a boolean, default `false`: launch without `--restricted`; owner,
 2026-10-05; `vendors/claude-code.md` §4). An invalid member exits 78 naming
 it, like every other key. It is read at daemon start like the other keys; a

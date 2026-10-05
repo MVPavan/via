@@ -254,6 +254,7 @@ fn refused_values(adapter: &FakeAdapter, spec: &TurnSpec) -> Option<TurnEnd> {
         // The fake has no size limit: it never reads them.
         sizes: ParamSizes::default(),
         inherit: None,
+        inherit_effective: None,
         instructions: false,
         model: None,
     };
