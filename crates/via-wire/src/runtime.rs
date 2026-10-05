@@ -90,9 +90,9 @@ impl WireRuntime {
     /// Opens one private connection for `spec.owner`. First the owner's
     /// evidence folder is created by an owned blob step (design §7.2): the
     /// turn's, or for a shared server `evidence/servers/<server_id>/`, with
-    /// no turn folder (x.3.2 X0 item 1.3). A failure, an overrun of 2 s or a
-    /// refusal at the cap there is [`WireError::Evidence`] and nothing is
-    /// acquired. Host then creates `stderr.log` in it for the vendor, and
+    /// no turn folder (x.3.2 X0 item 1.3). A failure, or no result within
+    /// the step's 2 s (its wait for a free slot included), is
+    /// [`WireError::Evidence`] and nothing is acquired. Host then creates `stderr.log` in it for the vendor, and
     /// the connection keeps its undecoded message there.
     /// Once `signals.force` is set, waits for vendor input, output or exit
     /// end with [`WireError::Cancelled`]. A failed acquisition is

@@ -1301,10 +1301,12 @@ reply; written once the reply brings the `turnId`);
 
      A replay fake stopped for 21 s mid-fill still reaches the same
      occupancy and peak.
-  5. The drains are released one session at a time, then each turn
-     completes in turn. Core runs at most 16 blob steps at once
-     (`BLOB_TASKS`). Settling 32 spilled final texts together failed 16
-     turns `store` ("too many blob steps outstanding").
+  5. The drains are released together, then every turn completes
+     together, so 32 spilled final texts settle at once. The Store runs at
+     most 16 blob steps at once (`BLOB_TASKS`); a step past the cap waits
+     for a slot within its own bound (bead via-s4s). Before that fix it was
+     refused at once ("too many blob steps outstanding"), and settling the
+     32 together failed 16 turns `store`.
 
   The test raises the C2 stall to 120 s (`VIA_TEST_EVENT_STALL_MS`) so the
   held channels do not end their turns.
