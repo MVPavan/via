@@ -29,7 +29,7 @@ _Avoid_: transport, channel, SDK route (VIA does not use vendor SDKs; see `docs/
 VIA uses the vendor binary in its documented headless mode and reads structured output and exit status. A route may start a fresh process for a later turn while resuming the same vendor session.
 
 **Vendor RPC route**:
-A vendor-specific server started by VIA and spoken to through the vendor's own protocol (Codex `app-server`, Pi `--mode rpc`). VIA never attaches to or stops a server it did not start.
+VIA speaks the vendor's own RPC protocol to a process VIA started. The protocol does not decide process lifetime: Codex `app-server` is a shared server; Pi `--mode rpc` runs one private process per turn. VIA never attaches to or stops a process it did not start.
 _Avoid_: app-server (one instance of it)
 
 **ACP route**:

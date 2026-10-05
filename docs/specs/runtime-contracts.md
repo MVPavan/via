@@ -729,6 +729,15 @@ Permission/namespace failures cannot be turned into absence. Retry only this
 read-only probe, at most every 20 ms until the existing cleanup deadline;
 never retry a mutation. Quiescent is committed only after the absence proof.
 
+**Session-scoped pre-launch absence check** (Pi's uncertain-predecessor
+check, C2 `StartRejected::UncertainPredecessor`). A session-scoped absence
+pass counts every `Turn`-owned anchor record of the session without a
+committed `GroupAbsent` proof as unresolved, including busy groups and
+journal records not yet re-held after a restart. The route asks for it
+through Wire before a launch; it is one pass of this probe within the turn's
+wall deadline, signals nothing and holds nothing. Core's existing close-time
+re-probe keeps its current scope.
+
 A lost final anchor reply initially means uncertain outcome. A later fresh
 `ESRCH` can settle **cleanup** to quiescent, including after autonomous EOF
 self-KILL, but cannot establish protocol acknowledgement, forced-vs-natural

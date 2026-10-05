@@ -464,10 +464,13 @@ is live; `process.cleanup` is `uncertain` under the same rule as `close`'s
 compatible resume (C2 §1 rule 2). `vendor_version` and `version_status` are
 from the handshake of the instance running the described turn (on a
 persistent connection, that connection's handshake, even when read for an
-earlier turn): recorded when the turn is accepted, and in its terminal
-envelope, which also carries it for a turn rejected after the handshake.
-Before either, or when no handshake was read, `vendor_version` is null and
-`version_status` is `untested` (C2 §5).
+earlier turn; on `pi-rpc`, whose protocol carries no version, the Pi package
+metadata read before launch): recorded when the turn is accepted, and in its
+terminal envelope, which also carries it for a turn rejected after the
+handshake or, on `pi-rpc`, after the metadata read. Before either,
+`vendor_version` is null and `version_status` is `untested`. For Pi,
+`vendor_version` is null when package metadata was unread or unavailable;
+for other routes, when no handshake was read (C2 §5).
 `inherit` holds the effective state (`on`, `off` or
 `unknown`) of each inherited-configuration category, frozen at spawn
 (C2 §6.2). `warnings` repeats the standing warnings:
@@ -629,13 +632,13 @@ only after positive cleanup, joins and durable records, otherwise 4
 
 | Parameter | Type | Scope | Notes |
 |---|---|---|---|
-| `harness` | `claude`, `codex`, `opencode`, `acp:<agent>`, `fake` | session | optional if `model` resolves; `fake` is a test double, available only with runtime §11.1's fixture configuration |
+| `harness` | `claude`, `codex`, `opencode`, `pi`, `acp:<agent>`, `fake` | session | optional if `model` resolves; `fake` is a test double, available only with runtime §11.1's fixture configuration |
 | `model` | string | session (P5) | `resolved` reported in the envelope |
 | `allow_untested` | bool, default false | session | immutable after spawn; accepted and stored for compatibility; no effect (P13): every version is supported unless refused for breakage, which it cannot waive |
 | `effort` | `low`…`max` or vendor value | per turn | unknown values refused; a vendor value that can be judged only against a discovered catalog is refused at submission, `failed(submit_failed)` with `failure.data.field:"effort"`; no vendor turn starts (C2 §5) |
-| `instructions` | `{text}` or `{path}` | session | native or `prepended_to_prompt` (partial). `path` is absolute: a regular UTF-8 file of at most 1 MiB that the daemon's user can read, copied when the request is received and frozen as its text; a file that changes during the copy is `invalid_params` naming `instructions`. The path is not stored; the retry identity uses the copy's SHA-256 and length |
-| `prompt` | string | per turn | exactly one of `prompt` and `prompt_file`. A route may refuse a prompt whose encoded size exceeds its transport limit as `invalid_params` naming `prompt` (`opencode-serve`: the JSON-encoded prompt plus the JSON-encoded cwd above 1,040,384 bytes). |
-| `prompt_file` | absolute path | per turn | a regular UTF-8 file of at most 16 MiB that the daemon's user can read; the daemon copies it when the request is received and refuses it (`invalid_params`, kind2 `prompt_file`) if it changes during the copy. The path is not stored; the retry identity uses the copy's SHA-256 and length. A route may refuse a prompt whose encoded size exceeds its transport limit as `invalid_params` naming `prompt` (`opencode-serve`: the JSON-encoded prompt plus the JSON-encoded cwd above 1,040,384 bytes). |
+| `instructions` | `{text}` or `{path}` | session | native or `prepended_to_prompt` (partial). `path` is absolute: a regular UTF-8 file of at most 1 MiB that the daemon's user can read, copied when the request is received and frozen as its text; a file that changes during the copy is `invalid_params` naming `instructions`. The path is not stored; the retry identity uses the copy's SHA-256 and length. A route may refuse instructions whose encoded size exceeds its limit as `invalid_params` naming `instructions` (`opencode-serve` and `pi-rpc`: the JSON-encoded text above 262,144 bytes). |
+| `prompt` | string | per turn | exactly one of `prompt` and `prompt_file`. A route may refuse a prompt whose encoded size exceeds its transport limit as `invalid_params` naming `prompt` (`opencode-serve`: the JSON-encoded prompt plus the JSON-encoded cwd above 1,040,384 bytes; `pi-rpc`: the JSON-encoded prompt above 524,288 bytes). |
+| `prompt_file` | absolute path | per turn | a regular UTF-8 file of at most 16 MiB that the daemon's user can read; the daemon copies it when the request is received and refuses it (`invalid_params`, kind2 `prompt_file`) if it changes during the copy. The path is not stored; the retry identity uses the copy's SHA-256 and length. A route may refuse a prompt whose encoded size exceeds its transport limit as `invalid_params` naming `prompt` (`opencode-serve`: the JSON-encoded prompt plus the JSON-encoded cwd above 1,040,384 bytes; `pi-rpc`: the JSON-encoded prompt above 524,288 bytes). |
 | `bound` | `{mode: read_only\|workspace_write\|full, extra_write_dirs: [path], network: bool}` | per turn (D5): inherited unless set on `resume` | always never-ask (D3); combinations per §4.2 |
 | `cwd` | absolute path | session | must exist |
 | `output_schema` | JSON Schema object or `null` | per turn | `null` clears an inherited schema; validated by VIA (Q2, draft 2020-12 only: a `$schema` in any schema position (not inside instance values such as `const`, `enum`, `default` or `examples`) that names another dialect is `invalid_params`; size ≤ 256 KiB; at most 2,048 subschemas and 64 patterns, counted over every schema position whether referenced or not, each pattern within the regular-expression limit, else `invalid_params`; runtime §8). Patterns keep ECMA-262's meaning of class escapes, `.` and `\b`; one VIA cannot compile is `invalid_params` |
@@ -676,6 +679,7 @@ and refusals are governed by §4.2.
 | `codex-app-server` | protocol-mapped, unverified; refuse pending pinned enforcement gate | protocol-mapped, unverified; refuse pending pinned enforcement gate | native with `network:true` | limited-bound network control only after proof; `full` + `network:false` refused |
 | `claude-cli` | unqualified; refuse pending CLAUDE-BOUND-1 | unqualified; refuse pending CLAUDE-BOUND-1 | `network:true` eligible candidate, qualified only after exact live recipe continuity test | refused, including limited bounds |
 | `opencode-serve` | refused (A4, D9) | refused | only with `network:true` and empty `extra_write_dirs`; nonempty `extra_write_dirs` is `invalid_params` before server acquisition or vendor I/O | refused |
+| `pi-rpc` | refused (no sandbox) | refused | only with `network:true` and empty `extra_write_dirs`; nonempty `extra_write_dirs` is `invalid_params` before vendor I/O | refused |
 | ACP | refused (D7) | refused | native | refused |
 
 For pinned OpenCode 2.0.22, `describe` declares optional
@@ -783,7 +787,7 @@ below 1 MiB, and a conformance test assembles that maximum.
 
 | Field | Meaning |
 |---|---|
-| `state`, `failure` | §7.2; `failure` = `{class, message, vendor_code?, retryable, data?}` (§8.2). `data` is present only for an adapter-side `submit_failed`, where it has `reason` (`"invalid_param"`, `"handshake_refused"` or `"settings_mismatch"`) and, with `invalid_param`, `field` (the C1 parameter name), and, with `settings_mismatch`, optionally `field` (the C1 parameter whose persisted vendor value differs), and for `structured_output_invalid`, where it has `reason` (`"invalid"` or `"validation_limit"`, §5). It is bounded to 256 bytes, never holds vendor text, and follows §8.1's `data.field` naming. `vendor_code` keeps only vendor codes |
+| `state`, `failure` | §7.2; `failure` = `{class, message, vendor_code?, retryable, data?}` (§8.2). `data` is present only for an adapter-side `submit_failed`, where it has `reason` (`"invalid_param"`, `"handshake_refused"`, `"settings_mismatch"` or `"uncertain_predecessor"`) and, with `invalid_param`, `field` (the C1 parameter name), and, with `settings_mismatch`, optionally `field` (the C1 parameter whose persisted vendor value differs), and for `structured_output_invalid`, where it has `reason` (`"invalid"` or `"validation_limit"`, §5). It is bounded to 256 bytes, never holds vendor text, and follows §8.1's `data.field` naming. `vendor_code` keeps only vendor codes |
 | `stop_reason` | `end_turn`, `max_steps`, `budget`, `refusal`, `interrupted`, `deadline`, `error`, `other`; vendor word in `vendor_stop_reason` |
 | `cancel` | outcome and cleanup certainty (§3.5, §7.4) |
 | `bound` | requested, effective, and whether it was inherited |
@@ -901,7 +905,9 @@ journal is complete, since nothing was launched, runtime contract §6.2), `ackno
 `turn/completed` status `interrupted`; ACP `stopReason: cancelled`; Claude
 `control_response success` for `interrupt` followed by a `result` with
 `subtype: error_during_execution` and `terminal_reason: aborted_tools`,
-P5), `forced` (Host killed a private process group after the deadline),
+P5; Pi: the paired successful `abort` reply plus that run's terminal with
+`stopReason:"aborted"`, or `"error"` with `errorMessage` exactly
+`"This operation was aborted"`), `forced` (Host killed a private process group after the deadline),
 `unknown` (no acknowledgement by the control deadline on a shared server,
 or evidence lost). A later wall-budget expiry preserves an already
 acknowledged cancellation under §7.6 precedence. Cleanup
@@ -945,7 +951,7 @@ that does not prove its submitted work had no effect.
 | Evidence | While | Result |
 |---|---|---|
 | Vendor terminal `interrupted`/`cancelled` after a VIA cancel | running | outcome `acknowledged`; with open tools keep turn nonterminal until P7 cleanup settles, then `cancelled` |
-| Vendor terminal error with cancel-specific markers after a VIA cancel (Claude `aborted_tools`) | running | `cancelled`, `acknowledged` |
+| Vendor terminal error with cancel-specific markers after a VIA cancel (Claude `aborted_tools`; Pi's abort marker with its reply) | running | `cancelled`, `acknowledged` |
 | Vendor terminal `completed` | running | `completed`; `stop_reason` from vendor |
 | Vendor terminal `failed` | running | `failed`, class from vendor code (§8.2) |
 | Core deadline | running | Core cancels (§7.4); result `failed`, class `deadline_wall`/`deadline_idle`, `cancel` filled |
@@ -1018,7 +1024,7 @@ receipt. An unkeyed caller must not resend the request.
 | Class | Meaning | Set by |
 |---|---|---|
 | `deadline_wall`, `deadline_idle` | Core deadline | Core |
-| `submit_failed` | the submission was rejected before acceptance, either by the vendor or by the adapter before any vendor submission (a failed handshake check, or a parameter the discovered catalog rejects; C2 §5); `failure.data` names the adapter-side reason | Core (from adapter rejection or observation) |
+| `submit_failed` | the submission was rejected before acceptance, either by the vendor or by the adapter before any vendor submission (a failed handshake check, a parameter the discovered catalog rejects, or an earlier launch of the session not proven gone; C2 §5); `failure.data` names the adapter-side reason | Core (from adapter rejection or observation) |
 | `resume_mismatch` | vendor returned a different or fresh session | Adapter observation |
 | `vendor_error` | vendor turn failure; `vendor_code` keeps the vendor's code | Adapter |
 | `rate_limit`, `auth`, `context_exceeded`, `budget_exceeded` | specific vendor classes | Adapter |
