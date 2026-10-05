@@ -34,7 +34,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::process::Command;
 use std::rc::Rc;
 use std::task::Poll;
 use std::time::Duration;
@@ -53,6 +52,9 @@ use via_adapters::{
 use via_store::{ResumeRecord, SessionId, SpawnRecord, SubmissionRecord, TerminalRecord};
 
 use crate::conformance_drive::{Pure, refusal_name};
+
+#[path = "fake_signal.rs"]
+mod fake_signal;
 use crate::conformance_expect::{TurnOutcome, replay_exit};
 
 /// The wall of a turn whose case states no deadline.
@@ -1277,15 +1279,12 @@ impl<'a> Run<'a> {
             .lines()
             .nth(index.saturating_sub(1))
             .ok_or_else(|| format!("no launch {launch} to signal"))?;
-        let status = Command::new("kill")
-            .args(["-USR1", pid.trim()])
-            .status()
-            .map_err(|e| format!("kill: {e}"))?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(format!("kill -USR1 {pid} failed"))
-        }
+        let pid = pid
+            .trim()
+            .parse()
+            .map_err(|e| format!("launch {launch}'s pid {pid:?}: {e}"))?;
+        // Only while that launch runs (`fake_signal::gate`).
+        fake_signal::gate(pid, &self.pure.fake_link())
     }
 
     /// The replay's own verdict on launch `launch`, which turn `turn` of
@@ -1765,6 +1764,8 @@ fn resume_refusal(set: &AdapterSet, session: &Session, spec: &TurnSpec) -> Optio
                 .map_or(0, |schema| schema.get().len()),
             cwd,
             model: session.plan.model.resolved.len(),
+            prompt_json: serde_json::to_string(&spec.prompt).map_or(0, |text| text.len()),
+            ..ParamSizes::default()
         },
         inherit: Some(session.plan.inherit.requested),
         model: Some(session.plan.model.resolved.clone()),
@@ -2055,6 +2056,11 @@ impl Pure {
     /// `<case dir>/<name>.<suffix>`: the fake's launch or progress log.
     pub(crate) fn case_file(&self, suffix: &str) -> PathBuf {
         self.case_dir.path().join(format!("{}.{suffix}", self.name))
+    }
+
+    /// The fake's link, its launches' first argument.
+    pub(crate) fn fake_link(&self) -> PathBuf {
+        self.case_dir.path().join(&self.name)
     }
 
     /// The Store's evidence folders (runtime §4).

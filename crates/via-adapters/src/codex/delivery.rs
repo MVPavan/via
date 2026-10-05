@@ -53,8 +53,8 @@ use super::normalize::{
 };
 use crate::driver::latch;
 use crate::observation::{
-    Acceptance, Charge, InstanceReport, Observation, ObservationItem, ObservationSink, Reserved,
-    SessionCap, Undelivered, VendorTerminal, admitted,
+    Acceptance, Charge, InstanceReport, Observation, ObservationItem, ObservationLoss,
+    ObservationSink, Reserved, SessionCap, Undelivered, VendorTerminal, admitted,
 };
 use crate::runtime::event_stall;
 use crate::{
@@ -64,55 +64,61 @@ use crate::{
 
 /// `omitted` when the count of lost messages is unknown or saturated
 /// (X0 item 10).
-pub(crate) const UNKNOWN: u64 = u64::MAX;
+pub(crate) const UNKNOWN: u64 = ObservationLoss::UNKNOWN;
 
 /// The detail of a refusal the lane contradicts (x.3.2 X3 §3.2, packet
 /// lines 144–145).
 pub(crate) const CONTRADICTED: &str = "refusal contradicted by started-turn evidence";
 
-/// The driver's sticky loss record (X0 item 10). C2 has no carrier for it
-/// yet (`TurnEnd.loss`, `CloseReport.loss` and Core's `record_loss` are
-/// x.3.2 X5's), so the driver holds it for diagnostics and tests.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ObservationLoss {
-    /// The turn the first loss affected.
-    pub(crate) trigger: TurnNumber,
-    /// Its connection generation.
-    pub(crate) generation: u64,
-    /// No message of the generation before it was lost.
-    pub(crate) first_unqueued: u64,
-    /// How many were lost; [`UNKNOWN`] when not known.
-    pub(crate) omitted: u64,
-}
-
-/// The driver's loss facts, under a leaf lock: the record, and the
-/// session's latest turn, which a new record names.
+/// The driver's loss facts, under a leaf lock: the sticky record (X0 item
+/// 10), the session's latest turn, which a new record names, and how many
+/// losses were noted, so a turn's run can tell whether it noted one
+/// (`TurnEnd.loss`, x.3.2 X5).
 #[derive(Default)]
 pub(crate) struct Losses {
     pub(crate) record: Option<ObservationLoss>,
     pub(crate) latest: Option<TurnNumber>,
+    pub(crate) noted: u64,
 }
 
 impl Losses {
     /// Installs a loss of generation `generation` from `first_unqueued`
     /// on, or merges it into the record held (item 10's rule: the
     /// earliest position, the counts added or unknown, the trigger and
-    /// generation kept).
-    pub(crate) fn note(&mut self, generation: u64, first_unqueued: u64, omitted: u64) {
-        if let Some(trigger) = self.latest {
-            self.note_turn(trigger, generation, first_unqueued, omitted);
-        }
-    }
-
-    /// [`Self::note`] for a loss turn `trigger` affected (x.3.2 X3 §3.5):
-    /// a new record names it.
-    pub(crate) fn note_turn(
+    /// generation kept). A new record names `lane`'s overflow owner, the
+    /// turn the item whose refusal overflowed the generation's lane was
+    /// routed under, else the session's latest turn (critical review x5
+    /// r3): the lane sets the owner with its overflow, so every observer of
+    /// the overflow names the same turn. `lane` is `None` only for a loss
+    /// seen on no lane (a connection's abnormal end) or whose owner was
+    /// read from it.
+    pub(crate) fn note(
         &mut self,
-        trigger: TurnNumber,
+        lane: Option<&Lane>,
         generation: u64,
         first_unqueued: u64,
         omitted: u64,
     ) {
+        if let Some(trigger) = lane.and_then(Lane::overflow_owner).or(self.latest) {
+            self.install(trigger, generation, first_unqueued, omitted);
+        }
+    }
+
+    /// [`Self::note`] for a loss turn `turn` affected (x.3.2 X3 §3.5): a
+    /// new record names `lane`'s overflow owner, else `turn`.
+    pub(crate) fn note_turn(
+        &mut self,
+        lane: Option<&Lane>,
+        turn: TurnNumber,
+        (generation, first_unqueued, omitted): (u64, u64, u64),
+    ) {
+        let trigger = lane.and_then(Lane::overflow_owner).unwrap_or(turn);
+        self.install(trigger, generation, first_unqueued, omitted);
+    }
+
+    /// Installs a record naming `trigger`, or merges into the one held.
+    fn install(&mut self, trigger: TurnNumber, generation: u64, first_unqueued: u64, omitted: u64) {
+        self.noted = self.noted.saturating_add(1);
         if let Some(record) = self.record.as_mut() {
             record.first_unqueued = record.first_unqueued.min(first_unqueued);
             record.omitted = if record.omitted == UNKNOWN || omitted == UNKNOWN {
@@ -130,6 +136,12 @@ impl Losses {
         });
     }
 
+    /// The record, when a loss was noted since the count `since` (a turn's
+    /// run reads the count as it starts): the turn's `TurnEnd.loss`.
+    pub(crate) fn since(&self, since: u64) -> Option<ObservationLoss> {
+        self.record.filter(|_| self.noted != since)
+    }
+
     /// What a close of generation `generation` leaves lost by its outcome
     /// `drained` (x.3.2 X3 §5.4; `None`: the barrier timed out), from
     /// `position`, its seal's position floored by the outstanding one: a
@@ -139,20 +151,20 @@ impl Losses {
     /// Whether continuity is unproven.
     pub(crate) fn note_close(
         &mut self,
-        generation: u64,
+        (lane, generation): (&Lane, u64),
         drained: Option<Drained>,
         (sealed, position): (&Sealed, u64),
     ) -> bool {
         match drained {
             Some(Drained::Cut) => {
                 if sealed.partial {
-                    self.note(generation, position, UNKNOWN);
+                    self.note(Some(lane), generation, position, UNKNOWN);
                 }
                 false
             }
             Some(Drained::LaneEnded(_) | Drained::Unproven(_) | Drained::ConsumerFailed) => false,
             Some(Drained::ConsumerCancelled) | None => {
-                self.note(generation, position, UNKNOWN);
+                self.note(Some(lane), generation, position, UNKNOWN);
                 true
             }
         }
@@ -769,7 +781,12 @@ impl Registration {
         }
         self.failing.cancel();
         let sealed = self.seal();
-        losses(&loss.losses).note(loss.generation, self.floor(sealed.position), UNKNOWN);
+        losses(&loss.losses).note(
+            Some(lane),
+            loss.generation,
+            self.floor(sealed.position),
+            UNKNOWN,
+        );
     }
 
     /// x.3.2 X3 §6.5: retires the registration once, in one section (a
@@ -781,7 +798,7 @@ impl Registration {
     /// a tool is open or continuity is unproven, never inferring
     /// quiescence from what survived; then the ledger and its ranges are
     /// released.
-    pub(crate) fn retire(&self, loss: &LossRecord, fold: impl FnOnce()) {
+    pub(crate) fn retire(&self, (lane, loss): (&Lane, &LossRecord), fold: impl FnOnce()) {
         let mut slot = self.slot();
         if slot.retired {
             return;
@@ -792,7 +809,7 @@ impl Registration {
             let position = slot.outstanding.map_or(sealed.position, |outstanding| {
                 outstanding.min(sealed.position)
             });
-            losses(&loss.losses).note(loss.generation, position, UNKNOWN);
+            losses(&loss.losses).note(Some(lane), loss.generation, position, UNKNOWN);
             slot.incomplete = true;
         }
         slot.retired = true;
@@ -1060,7 +1077,7 @@ impl Normalizing {
     /// noted from the outstanding position, and continuity is unproven.
     fn ended(&mut self) {
         if let Some(first) = self.outstanding() {
-            losses(&self.loss.losses).note(self.loss.generation, first, UNKNOWN);
+            losses(&self.loss.losses).note(Some(&self.lane), self.loss.generation, first, UNKNOWN);
             self.registration.mark_incomplete();
         }
         self.drop_early();
@@ -1209,7 +1226,11 @@ impl Normalizing {
             && let Some(turn) = self.unanswered
         {
             // Its turn sealed pending: it can never be mapped.
-            losses(&self.loss.losses).note_turn(turn, self.loss.generation, seq, 1);
+            losses(&self.loss.losses).note_turn(
+                Some(&self.lane),
+                turn,
+                (self.loss.generation, seq, 1),
+            );
             self.registration.mark_incomplete();
             return;
         }
@@ -1309,7 +1330,11 @@ impl Normalizing {
                     // Refused by the registration's seal: its loss is
                     // recorded before it stops being outstanding (§3.2).
                     if whole.is_none() {
-                        losses(&self.loss.losses).note_turn(turn, self.loss.generation, seq, 1);
+                        losses(&self.loss.losses).note_turn(
+                            Some(&self.lane),
+                            turn,
+                            (self.loss.generation, seq, 1),
+                        );
                         self.registration.mark_incomplete();
                     }
                     whole.unwrap_or(false)
@@ -1350,7 +1375,11 @@ impl Normalizing {
     fn lose_early(&mut self, turn: TurnNumber) {
         if let Some(first) = self.outstanding() {
             let count = u64::try_from(self.early.len()).unwrap_or(UNKNOWN);
-            losses(&self.loss.losses).note_turn(turn, self.loss.generation, first, count);
+            losses(&self.loss.losses).note_turn(
+                Some(&self.lane),
+                turn,
+                (self.loss.generation, first, count),
+            );
             self.registration.mark_incomplete();
         }
         self.drop_early();
@@ -1403,7 +1432,12 @@ impl Normalizing {
             None => Drained::LaneEnded(end),
             Some(first) => {
                 let position = first.min(self.registration.idle.position());
-                losses(&self.loss.losses).note(self.loss.generation, position, UNKNOWN);
+                losses(&self.loss.losses).note(
+                    Some(&self.lane),
+                    self.loss.generation,
+                    position,
+                    UNKNOWN,
+                );
                 self.registration.mark_incomplete();
                 self.drop_early();
                 Drained::Unproven(end)
@@ -1448,7 +1482,12 @@ impl Normalizing {
             self.registration.ledger().unstage();
             if !kept {
                 self.registration.mark_incomplete();
-                losses(&self.loss.losses).note(self.loss.generation, seq, UNKNOWN);
+                losses(&self.loss.losses).note(
+                    Some(&self.lane),
+                    self.loss.generation,
+                    seq,
+                    UNKNOWN,
+                );
             }
         }
         self.registration.drained(Drained::ConsumerFailed);
@@ -1742,7 +1781,12 @@ impl Normalizing {
             }
             Err(failing) => {
                 self.registration.mark_incomplete();
-                losses(&self.loss.losses).note(self.loss.generation, seq, UNKNOWN);
+                losses(&self.loss.losses).note(
+                    Some(&self.lane),
+                    self.loss.generation,
+                    seq,
+                    UNKNOWN,
+                );
                 if failing {
                     self.overflow();
                 }
@@ -1756,7 +1800,7 @@ impl Normalizing {
     /// turn, continuity is unproven (§6.6), and a live fence it was read
     /// under reports nothing from its position on (the gap).
     fn lose(&mut self, delivery: &Delivery, turn: TurnNumber, (seq, mark): (u64, Option<Mark>)) {
-        losses(&self.loss.losses).note_turn(turn, self.loss.generation, seq, 1);
+        losses(&self.loss.losses).note_turn(Some(&self.lane), turn, (self.loss.generation, seq, 1));
         self.registration.mark_incomplete();
         let live = self.held.as_ref().map(|held| held.fence);
         if let Some(mark) = mark.filter(|mark| Some(mark.fence) == live) {
@@ -2603,6 +2647,7 @@ mod tests {
                 losses: Arc::new(Mutex::new(Losses {
                     record: None,
                     latest: Some(turn(2)),
+                    ..Losses::default()
                 })),
                 cancel: CancellationToken::new(),
                 state: Arc::default(),
@@ -2613,6 +2658,7 @@ mod tests {
         fn guard(&self) -> RetireGuard {
             RetireGuard {
                 registration: Arc::clone(&self.registration),
+                lane: Arc::clone(&self.lane),
                 loss: LossRecord {
                     losses: Arc::clone(&self.losses),
                     generation: 3,
@@ -3192,9 +3238,14 @@ mod tests {
         let mut losses = Losses {
             record: None,
             latest: Some(turn(1)),
+            ..Losses::default()
         };
         let sealed = partial.seal();
-        assert!(!losses.note_close(2, Some(Drained::Cut), (&sealed, sealed.position)));
+        assert!(!losses.note_close(
+            (&Lane::default(), 2),
+            Some(Drained::Cut),
+            (&sealed, sealed.position)
+        ));
         assert_eq!(
             losses
                 .record
@@ -3206,24 +3257,26 @@ mod tests {
         let mut kept = Losses {
             record: None,
             latest: Some(turn(1)),
+            ..Losses::default()
         };
         let sealed = whole.seal();
-        assert!(!kept.note_close(2, Some(Drained::Cut), (&sealed, 11)));
+        assert!(!kept.note_close((&Lane::default(), 2), Some(Drained::Cut), (&sealed, 11)));
         assert!(kept.record.is_none());
         for drained in [
             Some(Drained::LaneEnded(LaneEnd::Retired)),
             Some(Drained::Unproven(LaneEnd::Closed)),
             Some(Drained::ConsumerFailed),
         ] {
-            assert!(!kept.note_close(2, drained, (&sealed, 11)));
+            assert!(!kept.note_close((&Lane::default(), 2), drained, (&sealed, 11)));
             assert!(kept.record.is_none(), "{drained:?} noted its own");
         }
         for drained in [Some(Drained::ConsumerCancelled), None] {
             let mut lost = Losses {
                 record: None,
                 latest: Some(turn(1)),
+                ..Losses::default()
             };
-            assert!(lost.note_close(2, drained, (&sealed, 7)));
+            assert!(lost.note_close((&Lane::default(), 2), drained, (&sealed, 7)));
             assert_eq!(
                 lost.record
                     .map(|record| (record.first_unqueued, record.omitted)),
@@ -3239,10 +3292,11 @@ mod tests {
         let mut losses = Losses {
             record: None,
             latest: Some(TurnNumber::try_from(1).unwrap()),
+            ..Losses::default()
         };
-        losses.note(3, 101, UNKNOWN);
+        losses.note(None, 3, 101, UNKNOWN);
         losses.latest = Some(TurnNumber::try_from(2).unwrap());
-        losses.note(3, 50, 4);
+        losses.note(None, 3, 50, 4);
         assert_eq!(
             losses.record,
             Some(ObservationLoss {
@@ -3255,9 +3309,10 @@ mod tests {
         let mut counted = Losses {
             record: None,
             latest: Some(TurnNumber::try_from(1).unwrap()),
+            ..Losses::default()
         };
-        counted.note(1, 7, 2);
-        counted.note(1, 9, 3);
+        counted.note(None, 1, 7, 2);
+        counted.note(None, 1, 9, 3);
         assert_eq!(
             counted
                 .record

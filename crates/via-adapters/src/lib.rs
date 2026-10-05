@@ -174,9 +174,9 @@ pub use instance::{
 };
 pub use observation::{
     AdapterError, Admitted, ClassHint, CostReport, Decline, Denial, DenialKind, InstanceReport,
-    LeftoverReport, Observation, ObservationBudget, ObservationItem, ObservationSink,
-    ProgressMarks, SteerDelivery, SteerToken, StopReason, TurnEnd, TurnEvidence, UnparsedOutput,
-    UsageSample, VendorTerminal, observation_channel, observation_channel_in,
+    LeftoverReport, Observation, ObservationBudget, ObservationItem, ObservationLoss,
+    ObservationSink, ProgressMarks, SteerDelivery, SteerToken, StopReason, TurnEnd, TurnEvidence,
+    UnparsedOutput, UsageSample, VendorTerminal, observation_channel, observation_channel_in,
 };
 pub use plan::{
     AdapterSet, Bound, CatalogModel, Category, CategoryDecl, DescribeRequest, Inherit, InheritPlan,

@@ -1046,7 +1046,7 @@ impl Connection {
                 && lane.overflowed_now()
                 && let Some(signal) = signal
             {
-                signal.overflowed();
+                signal.overflowed(lane.overflow_owner());
             }
         }
         if let Some((thread, turn, by)) = interrupt {
@@ -1352,7 +1352,8 @@ impl Connection {
 
 /// Pushes `item` into `lane`, advancing its lease's sequence when taken;
 /// one an overflowed lane dropped reaches the lease's driver at once
-/// (x.3.2 X3 fix r2 #1).
+/// (x.3.2 X3 fix r2 #1), naming the lane's overflow owner (critical
+/// review x5 r3), whichever item this was.
 fn push(lane: &Lane, signal: Option<&Arc<LeaseSignal>>, item: LaneItem, bytes: usize, seq: u64) {
     let taken = lane.push(item, bytes);
     let Some(signal) = signal else {
@@ -1361,7 +1362,7 @@ fn push(lane: &Lane, signal: Option<&Arc<LeaseSignal>>, item: LaneItem, bytes: u
     if taken {
         signal.queued(seq);
     } else if lane.overflowed_now() {
-        signal.overflowed();
+        signal.overflowed(lane.overflow_owner());
     }
 }
 

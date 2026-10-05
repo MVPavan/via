@@ -76,7 +76,7 @@ Labels: **fact** (read in code or a spec), **decision** (this design),
 | 7 | `daemon/status.servers` | Registry snapshot behind J0's `servers()` | Routes | X4 |
 | 8 | Threads | Per-generation tombstones; lease fencing; connection-owned cleanup intents; a reattach fence until unsubscribe resolves; Core's concurrent drain during driver close is K1's | Routes `codex/threads.rs` | K1 (Core), X4 |
 | 9 | Caps, request records, RSS | No admission cap; request owners `Server` or `Lease`; one correlation budget; RSS qualifies only 32 turns on one server | Routes; X5 | X4, X5 |
-| 10 | Overflow, loss record | Sticky health; a non-withdrawable cleanup interrupt; one Core loss helper fed by `TurnEnd` and every close | Adapters, Routes, Core | X5 |
+| 10 | Overflow, loss record | Sticky health; a non-withdrawable cleanup interrupt; `observations_lost` on the envelope of the turn whose run lost observations (simplified by the owner, X5) | Adapters, Routes, Core | X5 |
 | 11 | Decline hand-off | Static table; ordered placeholder at decode | Adapters, Routes | X1, X3 |
 | 12 | Writes on a shared connection | Built on J0's `ControlQueue`: ticketed data slot; a claimed job stays withdrawable until its first byte, decided under the queue lock; data holds; staging permits; an owning turn-write guard; reserved control sizes from maximum encodings | Wire `connection.rs`; Routes `codex/feeder.rs` | X2 (Wire), X3 |
 | 13 | Connection failure | One owned sequence for exit, transport, protocol and overflow: Route's first-wins failure latch, an idempotent cause-free Wire seal, Host cleanup and the sealed-prefix drain at once; `ServerLost` only with positive prior-death evidence, carried as Host's typed stop reply; an abnormal path when the connection task itself fails, signalled to every lease at once so the driver installs its loss and publishes its failure even when idle; one delivery seal at every delivery cutoff; a crash-only normalizer on the session's tracker | Routes, Wire, Host | X2 (Wire, Host), X3, X4 |
@@ -896,6 +896,10 @@ plus `CODEX_SQLITE_HOME`. X2: bootstrap creates `vendor/` 0700, refuses a
 symlink. X3: a symlinked `vendor/codex` refuses the launch with no
 acquisition. X5: the directory persists across a restart. **E2E:**
 concurrent servers on one home; resume across restart (x.3.4).
+X5 as built: `codex_sqlite_home_persists_across_restart`
+(`crates/via-core/tests/conformance_core.rs`): after a clean stop, a second
+Engine on the same State finds `vendor/codex` with the same identity, mode
+0700 and a kept file unchanged, and its own server launches over it.
 
 ### Item 5. Server evidence and decode failures (G6, r1 #24, r2 N15, r3 F11)
 
@@ -1267,8 +1271,104 @@ reply; written once the reply brings the `turnId`);
   server. Four loaded servers is an **extrapolation** from the per-server
   and per-turn costs, not measured. The 256-turn unresolved bound remains
   unmeasured for Codex (X0-Q1, ruled: no extra cap).
+- **As built (X5, fix r1).** `codex_rss_leases` (`crates/via-core/tests/conformance_core.rs`,
+  `test-failpoints`, run alone by `.config/nextest.toml`, about 19 s) runs
+  Core's Engine in its own process over one replay server. Each of the 32
+  sessions' prompts is at the Codex echo cap (via-5lr.6), so the
+  per-turn row counts 1,040,384 bytes, not 16 MiB, and the computed sum
+  is 327 MiB.
+  1. A paced flood of 272 maximal thread lines (about 270 MiB) is consumed
+     with Core draining. The growth windows before and after the flood's
+     first 64 MiB must both hold samples.
+  2. Core's drain of each session is then paused at its first fill
+     observation, one session at a time (`core.observations.pause`
+     armed per occurrence, each pause acknowledged). The pauses do not
+     expire; the test releases them after the measurement.
+  3. Five maximal `final_answer` lines per session fill its channel and
+     leave the fifth decoded and blocked. Four maximal lines in blocked
+     lanes fill the 4 MiB staging. The fake's gates are released by
+     counted consumer takes (`adapter.codex.consumer_take`), so Wire's
+     staging never holds more than three lines.
+  4. After the 1.5 s held sample, the test asserts the simultaneous
+     occupancy, which proves the final snapshot, not every instant of
+     the sample:
+     - the four staged lines were routed (`codex.connection.message`)
+       and none was taken;
+     - every fill line was taken;
+     - exactly 32 channel sends blocked, one per session
+       (`adapter.observation.blocked`);
+     - Core handled no observation while held.
+
+     A replay fake stopped for 21 s mid-fill still reaches the same
+     occupancy and peak.
+  5. The drains are released one session at a time, then each turn
+     completes in turn. Core runs at most 16 blob steps at once
+     (`BLOB_TASKS`). Settling 32 spilled final texts together failed 16
+     turns `store` ("too many blob steps outstanding").
+
+  The test raises the C2 stall to 120 s (`VIA_TEST_EVENT_STALL_MS`) so the
+  held channels do not end their turns.
+
+  **The qualification is partial.** Correlation (256 KiB), pending
+  replies (64 KiB) and the 32 sessions' driver controls (32 × 64 KiB) are
+  not driven to their maxima, 2,368 KiB of the sum together.
+
+  Measured, two runs each:
+
+  | Build | Baseline | Peak | Peak less baseline | Growth after 64 MiB |
+  |---|---|---|---|---|
+  | musl (authoritative) | 20 MiB | 221 MiB | 202 MiB | under 0.1 MiB |
+  | glibc, `MALLOC_ARENA_MAX=2` | 27 MiB | 230 MiB | 204 MiB | none |
+
+  The limit is 409 MiB. Both builds reach about 6.3 MiB per session at
+  the held peak and about 0.17 MiB per idle active session.
+
+  One maximal decode peaks at about 3.5 MiB of RSS on glibc and 3.75 MiB
+  on musl, against the 5 MiB `DECODE_ALLOWANCE`. RSS is an estimate, to
+  the kernel's 256 KiB counter granularity, not a bound. That measure is
+  `codex_decode_peak_within_allowance`
+  (`crates/via-routes/tests/codex_decode_peak.rs`). It decodes eight
+  shapes, each in a fresh process. The worst is a `final_answer` text or
+  a `fileChange` at the 65,536-node limit.
 
 ### Item 10. Overflow, quarantine and the loss record (G7, r2 N3, N14, r3 F17)
+
+**Simplified by the owner (2026-10-05, X5).** Only the `TurnEnd` path is
+built: the driver sets `TurnEnd.loss` on a turn when a loss was noted while
+that turn ran (`Losses::noted`, read as the turn starts), and Core adds the
+`observations_lost` warning to that turn's envelope
+(`Warning::observations_lost`, `crates/via-core/src/engine/drive.rs`).
+The record's trigger (critical review x5) is the lane's overflow owner
+(`Lane::overflow_owner`): the VIA turn the item whose refusal overflowed
+the lane was routed under, its mapped owner at routing (or a `turn/start`
+reply's turn), with no decode. The lane records it under the lock that
+ends it `Overflow`, so it is visible with the overflow; every loss note
+that can start the record (`Losses::note` and `note_turn`, given the
+generation's lane) names it ahead of its own fallback, and the overflow
+handler's `AbnormalEnd.owner` is read from it (critical re-review x5 r3).
+Whichever observer of the overflow installs the record first therefore
+names the same turn, and a predecessor's late messages lost while its
+successor runs name the predecessor on the successor's warning. With no
+owner (an item naming no mapped turn, or retention growth that overflowed
+the lane before any refusal: the running turn's own loss), and for the
+other loss sources, the record names the lost item's turn where known,
+else the session's latest turn. A connection's abnormal end notes on no
+lane: an overflow before it was already signalled by the connection task,
+which runs the push and its signal with no await between. `first_unqueued` stays
+the merged lower bound: a quarantine notes its registration's seal, which
+can floor it to 1.
+Dropped: the durable `late: true` warning event on an already terminal
+trigger turn, its `reported` dedupe flag, the separate `Engine::record_loss`
+helper, the lane actor's calls on every close outcome, and
+`CloseReport.loss`, which existed only for the late warning and was not
+added. A loss noted after every turn of the driver ended stays in the
+driver's record and reaches no envelope or event; `via-adapters` has no
+diagnostics sink, so it is not logged either. **Live-measure item:** how
+often real Codex use loses observations of an already terminal turn (an
+idle driver's lane overflow or failed connection task, a close's
+undelivered prefix); revisit a late warning only if that is observed. The
+X0 text below is kept for the record; where it conflicts, this paragraph
+wins.
 
 - **Health.** A full thread ingress lane, or the C2 10 s stall, latches the driver's sticky `DriverFailure::ObservationOverflow`.
 - **Loss record.** The driver keeps one sticky
@@ -1334,6 +1434,10 @@ written after A2 returned, behind a large data write; A2 returns before
 its wall with `observations_lost`; A, already terminal, gets exactly one
 `late: true` warning event when the loss arrives through both `TurnEnd`
 and a later idle-eviction close report; A's envelope is unchanged.
+As built after the simplification: `codex_bounds_overflow_warns_the_affected_turn`
+(`crates/via-core/tests/conformance_core.rs`): an overflowed turn carries
+exactly one `observations_lost` warning naming it, and the earlier,
+unaffected turn carries none.
 
 ### Item 11. Decline hand-off
 
@@ -1361,6 +1465,14 @@ and a later idle-eviction close report; A's envelope is unchanged.
 
 **Tests (X1 bodies, X3 behaviour).** `codex_never_ask` per packet §8, plus
 the placeholder ordering, the closed-thread decline and the reopen case.
+X5 as built: `codex_decline_deadline_with_the_reader_held`
+(`crates/via-core/tests/conformance_codex.rs`): the registration's consumer,
+VIA's reader of the lane, is held 6 s while an approval request arrives;
+the fake reads the decline within 5,250 ms and, once released, the consumer
+reports `vendor.request_declined`. Item 14's replay join (`pause_input`,
+`expect_large`, the polling reader) was never built in X3, so the variant
+with the vendor's own stdin reader paused is not tested; it stays with item
+12's E2E item (decline latency during a large write) as a live-measure item.
 
 ### Item 12. Writes on a shared connection (r1 #2, #16–18; r2 N2, N4, N5)
 

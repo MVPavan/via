@@ -402,6 +402,30 @@ pub struct TurnEnd {
     pub leftovers: Option<LeftoverReport>,
     /// Process and cleanup facts, or a typed failure.
     pub outcome: Result<TurnEvidence, AdapterError>,
+    /// Shared-ingress routes: the driver's loss record, when this turn's
+    /// run lost observations (C2 §2 `ObservationLoss`); `None` elsewhere.
+    pub loss: Option<ObservationLoss>,
+}
+
+/// A shared-ingress driver's sticky loss record for one connection
+/// generation (C2 §2 `ObservationLoss`, x.3.2 X0 item 10): the first loss,
+/// with every later loss of the generation merged in.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ObservationLoss {
+    /// The turn of the driver's session the first loss affected.
+    pub trigger: crate::TurnNumber,
+    /// The connection generation.
+    pub generation: u64,
+    /// A lower bound: no message of the generation before it was lost.
+    pub first_unqueued: u64,
+    /// How many messages were lost, saturating; [`Self::UNKNOWN`] when the
+    /// count is unknown or saturated.
+    pub omitted: u64,
+}
+
+impl ObservationLoss {
+    /// `omitted` when the count is unknown or saturated.
+    pub const UNKNOWN: u64 = u64::MAX;
 }
 
 /// A failed turn or adapter construction (C2 §2 `AdapterError`). Every turn

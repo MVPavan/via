@@ -18,14 +18,17 @@ pub const OBSERVATION_BYTES: usize = 4 * 1024 * 1024;
 const EVENT_STALL: Duration = Duration::from_secs(10);
 
 /// The stall bound: 10 s. Test builds only: `VIA_TEST_EVENT_STALL_MS`
-/// lowers it (Task 4 design §13.1).
+/// overrides it, lower (Task 4 design §13.1) or higher (x.3.2 X5
+/// `codex_rss_leases`, whose held channels must not stall). The variable
+/// is read only under `test-failpoints`, which the shipped feature graph
+/// excludes.
 pub(crate) fn event_stall() -> Duration {
     #[cfg(feature = "test-failpoints")]
-    if let Some(lowered) = std::env::var("VIA_TEST_EVENT_STALL_MS")
+    if let Some(overridden) = std::env::var("VIA_TEST_EVENT_STALL_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
     {
-        return Duration::from_millis(lowered);
+        return Duration::from_millis(overridden);
     }
     EVENT_STALL
 }

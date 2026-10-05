@@ -301,6 +301,13 @@ impl CodexAdapter {
         if let Some(refusal) = refusals(route, &per_turn).into_iter().next() {
             return Err(refusal);
         }
+        if turn.sizes.prompt_json.saturating_add(turn.sizes.cwd_json) > plan::PROMPT_ECHO_MAX {
+            return Err(Refusal::new(
+                RefusalKind::InvalidParam { field: "prompt" },
+                Some(route),
+                format!("the prompt is larger than route {route} echoes in one message"),
+            ));
+        }
         if let (Some(model), Some(catalog)) = (turn.model.as_deref(), catalog)
             && driver::vendor_effort(turn.effort.as_deref(), catalog, model).is_err()
         {

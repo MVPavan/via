@@ -360,7 +360,15 @@ session, 256 KiB observation payload, 1 MiB envelope, JSON depth 64 and
 65,536 nodes. Final text is sent as C2 `final_text` pieces of at most
 256 KiB encoded; unknown notifications are activity only.
 No silent dropped lifecycle events. Large prompts are encoded using the
-runtime's bounded streaming outbound path, not capped to inbound 1 MiB.
+runtime's bounded streaming outbound path. Codex echoes the prompt whole in
+the user message's `item/started` and `item/completed` notifications, one
+inbound line each (checked in every 0.159.2 fixture: the line carries the
+prompt once, no cwd, and at most 340 other bytes with its LF), and an
+inbound line over 1 MiB fails the shared connection. So the route refuses,
+before any receipt, a prompt whose JSON encoding plus the cwd's exceeds
+1,040,384 bytes (1 MiB less 8 KiB) as `invalid_params` naming `prompt`
+(C1 §4; via-5lr.6, x.3.2 X5). The cwd is counted, as `opencode-serve`
+counts it, for headroom.
 
 One blocked session normalizer must not stop dispatch to other threads or
 the decline/control paths. Partition the existing Route message staging
@@ -373,9 +381,15 @@ for the 10-second C2 observation-stall timer. Latch the driver's sticky
 `ObservationOverflow` health. The thread/lane generation, triggering original
 turn correlation, first unqueued message's sequence and saturating omitted
 count form the driver's `ObservationLoss`, which goes to connection
-diagnostics and to Core with every affected turn's result and every close of
-the driver. The triggering turn identifies lost evidence, not the entire
-failure target.
+diagnostics and to Core with every affected turn's result. The triggering
+turn identifies lost evidence, not the entire failure target: it is the VIA
+turn the dropped lane item that overflowed the lane was routed under (the
+connection's mapping of its `turnId` at routing, no decode), recorded by the
+lane with its overflow so every observer names it, and an old turn's late
+messages name that turn on its successor's warning; thread-level traffic,
+which names no turn, a retention overflow before any refusal and the other
+loss sources name the lost item's turn where known, else the session's
+latest turn.
 
 The driver ends **every nonterminal turn whose submission belongs to
 that quarantined thread generation**, including a successor A2 when an
@@ -383,8 +397,8 @@ old, already settled A tool triggers overflow: it posts its interrupt
 cleanup intent (written even after A2 settles, once the `turnId` is
 known) and returns at once, without waiting for A2's wall deadline; Core
 commits each disposition under C1 precedence with the `observations_lost`
-warning. Preserve A's immutable envelope; A's late-event loss is one
-`late` `warning` event on A. Close same-thread dispatch until the driver
+warning. Preserve A's immutable envelope; A's late-event loss reaches no
+event on A (owner simplification, 2026-10-05). Close same-thread dispatch until the driver
 is retired and a clean reopen; unsent queued work retains C1
 queue/unknown-predecessor rules and is never treated as submitted merely
 by this failure. Quarantine is tied to the lane generation the driver

@@ -723,6 +723,7 @@ mod tests {
                 output_schema,
                 cwd: cwd.as_os_str().len(),
                 model: model.len(),
+                ..ParamSizes::default()
             },
             inherit: Some(Inherit::OD2_DEFAULT),
             ..TurnParams::default()
@@ -808,6 +809,7 @@ mod tests {
                 output_schema,
                 cwd: cwd.as_os_str().len(),
                 model: model.len(),
+                ..ParamSizes::default()
             },
             inherit: Some(Inherit::OD2_DEFAULT),
             ..TurnParams::default()

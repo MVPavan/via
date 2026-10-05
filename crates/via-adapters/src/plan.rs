@@ -79,6 +79,12 @@ pub struct ParamSizes {
     pub cwd: usize,
     /// The session's resolved model, in UTF-8 bytes; `check_turn` only.
     pub model: usize,
+    /// The turn's prompt, in bytes of its JSON string encoding, quotes
+    /// and escapes included; 0 for `describe`, which has none.
+    pub prompt_json: usize,
+    /// The session's working directory, in bytes of its JSON string
+    /// encoding, quotes and escapes included; 0 for `describe`.
+    pub cwd_json: usize,
 }
 
 /// A resume turn's per-turn values, the input to `check_turn`.

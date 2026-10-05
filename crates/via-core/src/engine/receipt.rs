@@ -86,18 +86,30 @@ impl Engine {
                         PromptFileError::Store(_) => WriteOutcome::NotCommitted.api_error(),
                     })?;
                 let content = content_token(&blob);
+                // x.3.2 X5: a route bounds the prompt's JSON encoding
+                // (C2 `ParamSizes.prompt_json`); the copy is read back once.
+                let encoded = match self.encoded_blob(&blob).await {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        self.store.discard_blob(blob).await;
+                        return Err(not_committed(error));
+                    }
+                };
                 return Ok(Staged {
                     prompt: Prompt::Blob(blob.clone()),
                     pending: Some(blob),
                     content: Some(content),
+                    encoded,
                 });
             }
         };
+        let encoded = json_encoded(text.as_bytes()).saturating_add(2);
         if text.len() <= INLINE_MAX {
             return Ok(Staged {
                 prompt: Prompt::Inline(text),
                 pending: None,
                 content: None,
+                encoded,
             });
         }
         let mut writer = self.store.blob_writer().await.map_err(not_committed)?;
@@ -113,7 +125,19 @@ impl Engine {
             prompt: Prompt::Blob(blob.clone()),
             pending: Some(blob),
             content: None,
+            encoded,
         })
+    }
+
+    /// The JSON string encoding's length, quotes included, of a staged
+    /// prompt blob, read back in chunks.
+    async fn encoded_blob(&self, blob: &BlobRef) -> Result<usize, StoreError> {
+        let mut reader = self.store.blob_reader(blob).await?;
+        let mut encoded = 2_usize;
+        while let Some(chunk) = reader.next_chunk().await? {
+            encoded = encoded.saturating_add(json_encoded(&chunk));
+        }
+        Ok(encoded)
     }
 
     /// Sol r1 #4 (C1 §4 `instructions`): the text of an `instructions
@@ -263,6 +287,7 @@ impl Engine {
             prompt,
             mut pending,
             content,
+            encoded,
         } = self.stage_prompt(source).await?;
         // Task 4 design §5.3: read before `admission`, applied only to new work.
         let free = self.free_space().await;
@@ -281,7 +306,7 @@ impl Engine {
             Ok(key) => {
                 self.spawn_admitted(
                     (params, members),
-                    (prompt, cwd),
+                    (prompt, encoded, cwd),
                     (hash, key, free),
                     &mut pending,
                 )
@@ -323,7 +348,7 @@ impl Engine {
     async fn spawn_admitted(
         &self,
         (params, members): (SpawnParams, SessionMembers),
-        (prompt, cwd): (Prompt, Result<String, ApiError>),
+        (prompt, encoded, cwd): (Prompt, usize, Result<String, ApiError>),
         (hash, key, free): ([u8; 32], Option<SpawnKey>, Option<FreeSpace>),
         pending: &mut Option<BlobRef>,
     ) -> Result<Receipted, ApiError> {
@@ -347,7 +372,7 @@ impl Engine {
         // C2 §2 `plan` (design §5.2): the harness, route and model, and the
         // route's refusal of any member; with its harness named, a model
         // the catalog lacks passes through for the vendor to judge.
-        let planned = intake::plan_spawn(&self.adapter, &params, &members, &cwd)?;
+        let planned = intake::plan_spawn(&self.adapter, &params, &members, (&cwd, encoded))?;
         if is_empty(&prompt) {
             return Err(ApiError::INVALID_PARAMS);
         }
@@ -438,6 +463,7 @@ impl Engine {
             prompt,
             mut pending,
             content,
+            encoded,
         } = self.stage_prompt(source).await?;
         // Task 4 design §5.3: read before `admission`, applied only to new work.
         let free = self.free_space().await;
@@ -449,7 +475,7 @@ impl Engine {
             .transpose()
         {
             Ok(operation) => {
-                self.resume_admitted(params, prompt, (operation, free), &mut pending)
+                self.resume_admitted(params, (prompt, encoded), (operation, free), &mut pending)
                     .await
             }
             Err(error) => Err(error),
@@ -462,7 +488,7 @@ impl Engine {
     async fn resume_admitted(
         &self,
         params: ResumeParams,
-        prompt: Prompt,
+        (prompt, encoded): (Prompt, usize),
         (operation, free): (Option<(String, via_store::Identity)>, Option<FreeSpace>),
         pending: &mut Option<BlobRef>,
     ) -> Result<Receipted, ApiError> {
@@ -541,10 +567,10 @@ impl Engine {
         let cwd = frozen
             .cwd
             .as_deref()
-            .map_or_else(|| self.cwd.as_os_str().len(), str::len);
+            .map_or_else(|| self.cwd.to_string_lossy(), std::borrow::Cow::Borrowed);
         let params = effective.turn_params(
             frozen.instructions.as_deref(),
-            cwd,
+            (&cwd, encoded),
             frozen.inherit.map(|inherit| inherit.requested),
         );
         let checked = self
@@ -888,6 +914,24 @@ struct Staged {
     prompt: Prompt,
     pending: Option<BlobRef>,
     content: Option<String>,
+    /// The prompt's JSON string encoding's length, quotes included (C2
+    /// `ParamSizes.prompt_json`).
+    encoded: usize,
+}
+
+/// The bytes UTF-8 text `bytes` takes inside a JSON string, quotes
+/// excluded, as `serde_json` escapes it: a byte at a time, since only
+/// ASCII is escaped, so a chunk boundary inside a character does not
+/// matter.
+fn json_encoded(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .map(|byte| match byte {
+            b'"' | b'\\' | 0x08 | 0x0c | b'\n' | b'\r' | b'\t' => 2,
+            0..=0x1f => 6,
+            _ => 1,
+        })
+        .sum()
 }
 
 /// A prompt file's content token (design §10.3): `sha256:<64 hex>:<len>`.

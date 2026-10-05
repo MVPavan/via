@@ -2028,6 +2028,51 @@ fn codex_never_ask() {
     check_variant("codex_never_ask", &replay, &expect, knobs).unwrap();
 }
 
+/// x.3.2 X5 (X0 items 11 and 14): a server approval request is declined
+/// within its 5 s deadline while VIA's reader of the thread's lane, the
+/// registration's consumer, is held for longer than that: the consumer
+/// is held 6 s as it delivers the acceptance (its second admitted
+/// observation, `adapter.observation.admitted`), the request arrives
+/// meanwhile, and the fake reads the decline within 5,250 ms of the
+/// request (the replay's allowance for the pipes). The decline is
+/// written at decode by the connection task, never through the consumer;
+/// once released, the consumer reports it `vendor.request_declined` in
+/// decode position, the reply having been written before the deadline.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn codex_decline_deadline_with_the_reader_held() {
+    let name = "codex_decline_deadline_with_the_reader_held";
+    // The identity's send, then the acceptance's.
+    let _points = armed(
+        "adapter.observation.admitted",
+        json!({"occurrence": 2, "action": "delay", "value": 6000}),
+    )
+    .unwrap();
+    let (mut replay, mut expect) = plain(name).unwrap();
+    let started = step_with(&replay, "\"method\":\"turn/started\"").unwrap();
+    let request = emit(
+        &json!({"id": 91, "method": "item/commandExecution/requestApproval",
+        "params": {"threadId": THREAD, "turnId": TURN, "itemId": "item-held"}}),
+    );
+    let declined = json!({"expect": {
+        "line": {"id": 91, "result": {"decision": "decline"}},
+        "absent": ["/error"],
+        "within_ms": 5250,
+    }});
+    for (offset, step) in [request, declined].into_iter().enumerate() {
+        steps(&mut replay)
+            .unwrap()
+            .insert(started + 1 + offset, step);
+    }
+    let turn = &mut turn_mut(&mut expect, 0)["expect"];
+    turn["observation_counts"] = json!({"turn.accepted": 1, "vendor.request_declined": 1});
+    turn["observations_include"] = json!([
+        {"kind": "vendor.request_declined",
+            "vendor_method": "item/commandExecution/requestApproval", "blocking": true},
+    ]);
+    variant(name, &replay, &expect).unwrap();
+}
+
 /// The generation's cleanup `turn/interrupt` of vendor turn `turn`, due
 /// within 2 s.
 fn cleanup_interrupt(turn: &str) -> Value {

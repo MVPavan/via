@@ -98,12 +98,12 @@ fn child(name: &str, scenario: &Value, env: &[(&str, &str)]) -> Option<PathBuf> 
 }
 
 /// Runs `body` on a current-thread runtime.
-fn run<F: Future<Output = ()>>(body: F) {
+fn run<T, F: Future<Output = T>>(body: F) -> T {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap()
-        .block_on(body);
+        .block_on(body)
 }
 
 /// One daemon's Engine, whose session dispatchers run as daemon main runs
@@ -4299,4 +4299,998 @@ fn codex_control_races_close_vs_p7_window() {
         );
         daemon.shutdown().await;
     });
+}
+
+/// The Codex fixtures' first turn's prompt in `c1_commentary_usage`.
+const C1_PROMPT: &str =
+    "Create a file note.txt in this directory with the text OK. Report the result.";
+
+/// Turn 1's gate in `c1_commentary_usage` (one-based): the fixture
+/// holds the turn's last three messages behind it.
+const C1_GATE: usize = 26;
+
+/// `c1_commentary_usage`'s copy for `codex_bounds_overflow` (steps
+/// one-based): turn 1 whole, with its gate ([`C1_GATE`]); turn 2 through
+/// its `turn/started` (step 33), then gate `held`, the user message's
+/// `item/started` (`X`), gate `burst`, twenty copies of `burst_line`,
+/// gate `after`, and the generation's cleanup interrupt of turn 2, due
+/// within 2 s; then the server's stdin close.
+#[cfg(feature = "test-failpoints")]
+struct OverflowCopy {
+    replay: Value,
+    held: usize,
+    burst: usize,
+    after: usize,
+}
+
+#[cfg(feature = "test-failpoints")]
+fn overflow_copy(burst_line: &str) -> OverflowCopy {
+    let mut replay = core_codex::replay("c1_commentary_usage");
+    let original = replay["steps"].as_array().unwrap().clone();
+    assert!(
+        original[C1_GATE - 1].get("await_signal").is_some(),
+        "step {C1_GATE} is turn 1's gate"
+    );
+    let mut steps = original[..33].to_vec();
+    let line = original[32]["emit"]["line"].as_str().unwrap();
+    assert!(
+        line.contains("\"turn/started\""),
+        "step 33 is turn 2's start: {line}"
+    );
+    let gate = |steps: &mut Vec<Value>| {
+        steps.push(json!({"await_signal":{"signal":"SIGUSR1"}}));
+        steps.len()
+    };
+    let held = gate(&mut steps);
+    steps.push(original[33].clone());
+    let burst = gate(&mut steps);
+    for _ in 0..20 {
+        steps.push(json!({"emit":{"line":burst_line}}));
+    }
+    let after = gate(&mut steps);
+    steps.push(
+        json!({"expect":{"line":{"method":"turn/interrupt","params":{
+        "threadId":"019a0000-0000-7000-8000-000000100001",
+        "turnId":"019a0000-0000-7000-8000-000000200002"}},"within_ms":2000}}),
+    );
+    steps.push(json!({"await_eof":{}}));
+    replay["steps"] = Value::Array(steps);
+    replay["deadline_ms"] = json!(60_000);
+    OverflowCopy {
+        replay,
+        held,
+        burst,
+        after,
+    }
+}
+
+/// The occurrences of `point`'s hits counted so far (each refusal's
+/// marker), ascending.
+#[cfg(feature = "test-failpoints")]
+fn counted(root: &Path, point: &str) -> Vec<u64> {
+    let prefix = format!("{point}.");
+    let mut counted: Vec<u64> = fs::read_dir(root.join("points"))
+        .unwrap()
+        .filter_map(|entry| {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            name.strip_prefix(&prefix)
+                .and_then(|rest| rest.strip_suffix(".refused"))
+                .and_then(|number| number.parse::<u64>().ok())
+        })
+        .collect();
+    counted.sort_unstable();
+    counted
+}
+
+/// Waits until `n` hits of `point` were counted; returns the last one's
+/// occurrence.
+#[cfg(feature = "test-failpoints")]
+async fn until_counted(root: &Path, point: &str, n: usize) -> u64 {
+    let by = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let counted = counted(root, point);
+        if counted.len() >= n {
+            assert_eq!(counted.len(), n, "{point} counted {counted:?}");
+            return counted[n - 1];
+        }
+        assert!(
+            tokio::time::Instant::now() < by,
+            "{point} counted {counted:?} of {n}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// The consumer's takes of turn 1's messages before its gate
+/// ([`C1_GATE`]): its status line, `turn/started` and the eleven item and
+/// usage lines (`account/updated` names no thread; the `Start` and
+/// `Reply` markers are no messages, so no take).
+#[cfg(feature = "test-failpoints")]
+const TAKES_AT_C1_GATE: usize = 13;
+
+/// The consumer's takes before `X`'s in [`overflow_copy`]: turn 1's
+/// thirteen, its three after the gate, then turn 2's status line and
+/// `turn/started`.
+#[cfg(feature = "test-failpoints")]
+const TAKES_BEFORE_X: usize = 18;
+
+/// The messages the connection routes in turn 2 of [`overflow_copy`]
+/// through its burst: the `turn/start` reply, the status line,
+/// `turn/started`, `X` and the twenty burst lines.
+#[cfg(feature = "test-failpoints")]
+const ROUTED_THROUGH_BURST: usize = 24;
+
+/// `codex_bounds_overflow` (x.3.2 X5, X0 item 10 as the owner simplified
+/// it): turn 1 completes; turn 2 starts; its consumer is paused at its
+/// take of the user message's `item/started` while twenty `burst_line`s
+/// arrive, so the thread's lane drops the seventeenth and turn 2 fails
+/// `overflow`. Turn 2's envelope carries exactly one `observations_lost`
+/// warning, of generation 1, with an unknown count (`omitted: null`) and
+/// `first_unqueued` 1: the record merges by the earliest position (X0
+/// item 10), and the generation's quarantine notes its registration's
+/// seal, whose idle delivery took no message, so position 1 (the lane's
+/// own note is the first dropped line's decode sequence, 44, and the
+/// turn's settlement notes 27). Turn 1's envelope, the unaffected turn's,
+/// carries none and is unchanged. Returns the session and the warning's
+/// data.
+///
+/// Turn 1's gate is released only once its consumer took every message
+/// before it: turn 1 puts eighteen items in the sixteen-message lane (its
+/// `Start` and `Reply` markers and sixteen messages), so a consumer that
+/// had taken none of its messages by the time the last three arrived
+/// overflowed the lane in turn 1 (the 0.1 s flake, reproduced under CPU
+/// load: the lane held the `Reply` and fifteen messages and dropped
+/// `turn/completed`). Every wait is an exact count, not a quiet period.
+#[cfg(feature = "test-failpoints")]
+async fn lane_overflow(root: &Path, name: &str, burst_line: &str) -> (SessionId, Value) {
+    let copy = overflow_copy(burst_line);
+    let case = codex_case(root, name, copy.replay);
+    let points = root.join("points");
+    count_hits(&points, TAKE);
+    let daemon = Daemon::open_with(root, case.config());
+    let session = daemon.spawn(C1_PROMPT, &codex_spawn(&case, 60_000)).await;
+    let launch = case.at(C1_GATE).await;
+    until_counted(root, TAKE, TAKES_AT_C1_GATE).await;
+    case.signal(launch);
+    let first = daemon.wait(&session, 1).await;
+    assert_eq!(first["state"], "completed", "{first}");
+    assert!(
+        !warning_codes(&first).contains(&"observations_lost"),
+        "{first}"
+    );
+    count_hits(&points, ROUTED);
+    daemon.resume(&session, SUCCESSOR).await;
+    assert_eq!(case.at(copy.held).await, launch);
+    // Turn 2's takes before the gate were made: the next take is `X`'s.
+    let take = until_counted(root, TAKE, TAKES_BEFORE_X).await + 1;
+    arm_at(root, TAKE, take, "pause");
+    case.signal(launch);
+    until_acked(root, TAKE, take).await;
+    assert_eq!(case.at(copy.burst).await, launch);
+    case.signal(launch);
+    assert_eq!(case.at(copy.after).await, launch);
+    // The connection reached the last burst line, so it routed the
+    // nineteen before it, the dropped one among them, before the
+    // consumer goes on.
+    until_counted(root, ROUTED, ROUTED_THROUGH_BURST).await;
+    release_point(root, TAKE, take);
+    case.signal(launch);
+    let second = daemon.wait(&session, 2).await;
+    assert_eq!(second["state"], "failed", "{second}");
+    assert_eq!(class(&second), "overflow", "{second}");
+    let lost: Vec<&Value> = second["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|warning| warning["code"] == "observations_lost")
+        .collect();
+    assert_eq!(lost.len(), 1, "{second}");
+    let data = lost[0]["data"].clone();
+    assert_eq!(data["generation"], 1, "{second}");
+    assert_eq!(data["first_unqueued"], 1, "{second}");
+    assert_eq!(data["omitted"], Value::Null, "{second}");
+    assert_eq!(
+        data.as_object().map(serde_json::Map::len),
+        Some(4),
+        "{second}"
+    );
+    assert!(lost[0]["message"].is_string(), "{second}");
+    // The first turn's committed envelope is unchanged.
+    assert_eq!(daemon.wait(&session, 1).await, first);
+    daemon.close(&session).await;
+    daemon.shutdown().await;
+    (session, data)
+}
+
+/// The lost lines are turn 2's own thread traffic (thread status lines,
+/// which name no turn): the warning names turn 2.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn codex_bounds_overflow_warns_the_affected_turn() {
+    const NAME: &str = "codex_bounds_overflow_warns_the_affected_turn";
+    let Some(root) = child(NAME, &no_fake(), &[]) else {
+        return;
+    };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    let status = json!({"method": "thread/status/changed",
+        "params": {"threadId": "019a0000-0000-7000-8000-000000100001",
+                   "status": {"type": "active", "activeFlags": []}}});
+    let (session, data) = run(lane_overflow(&root, NAME, &status.to_string()));
+    assert_eq!(data["trigger_turn"], format!("{session}/2"), "{data}");
+}
+
+/// Critical review x5 (successor): the lost lines are turn 1's late
+/// messages (its `thread/tokenUsage/updated`, naming turn 1's vendor
+/// turn), arriving while its successor runs. Turn 2 keeps the warning,
+/// whose `trigger_turn` names turn 1: the turn the first dropped line was
+/// mapped to.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn codex_bounds_overflow_names_the_predecessor_whose_lines_were_lost() {
+    const NAME: &str = "codex_bounds_overflow_names_the_predecessor_whose_lines_were_lost";
+    let Some(root) = child(NAME, &no_fake(), &[]) else {
+        return;
+    };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    let original = core_codex::replay("c1_commentary_usage")["steps"][26].clone();
+    let late = original["emit"]["line"].as_str().unwrap().to_owned();
+    assert!(
+        late.contains("\"thread/tokenUsage/updated\"")
+            && late.contains("019a0000-0000-7000-8000-000000200001"),
+        "step 27 is turn 1's usage: {late}"
+    );
+    let (session, data) = run(lane_overflow(&root, NAME, &late));
+    assert_eq!(data["trigger_turn"], format!("{session}/1"), "{data}");
+}
+
+/// x.3.2 X5 (via-5lr.6): Codex's admission cap on the JSON-encoded prompt
+/// plus the JSON-encoded cwd (C1 §4 `prompt`), so the vendor's
+/// `userMessage` echo always fits Wire's 1 MiB message.
+const CODEX_PROMPT_MAX: usize = 1_040_384;
+
+/// A prompt whose JSON string encoding, quotes included, is `bytes` long,
+/// with an escaped newline, quote and control character in front.
+fn encoded_prompt(bytes: usize) -> String {
+    let head = "x\n\"\u{1}";
+    let mut prompt = head.to_owned();
+    prompt.push_str(&"a".repeat(bytes - serde_json::to_string(head).unwrap().len()));
+    assert_eq!(serde_json::to_string(&prompt).unwrap().len(), bytes);
+    prompt
+}
+
+/// [`echo_copy`]'s gate (one-based): [`C1_GATE`], one usage line before
+/// it dropped.
+const ECHO_GATE: usize = C1_GATE - 1;
+
+/// `c1_commentary_usage`'s first turn with prompt `prompt`, without its
+/// two `thread/tokenUsage/updated` lines (one-based steps 22 and 27): its
+/// `turn/start` expects it and its two `userMessage` echoes carry it; the
+/// close's unsubscribe and the stdin close follow the turn's end. Without
+/// them the turn puts sixteen items in its thread's sixteen-message lane
+/// (its `Start` and `Reply` markers and fourteen messages), so it never
+/// passes the lane's message bound however far its consumer lags; with
+/// them, eighteen did under CPU load. (A maximal prompt's two echoes
+/// together pass the lane's 1 MiB: they fit only while the consumer takes
+/// the first before the second is routed.)
+fn echo_copy(prompt: &str) -> Value {
+    let mut replay = core_codex::replay("c1_commentary_usage");
+    let original = replay["steps"].as_array().unwrap().clone();
+    for usage in [22, 27] {
+        let line = original[usage - 1]["emit"]["line"].as_str().unwrap();
+        assert!(
+            line.contains("\"thread/tokenUsage/updated\""),
+            "step {usage} is turn 1's usage: {line}"
+        );
+    }
+    let mut steps: Vec<Value> = original[..29]
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| ![21, 26].contains(index))
+        .map(|(_, step)| step.clone())
+        .collect();
+    assert!(steps[ECHO_GATE - 1].get("await_signal").is_some());
+    steps.extend_from_slice(&original[49..]);
+    assert_eq!(steps[9]["expect"]["line"]["method"], "turn/start");
+    steps[9]["expect"]["line"]["params"]["input"][0]["text"] = json!(prompt);
+    for at in [14, 15] {
+        let mut line: Value =
+            serde_json::from_str(steps[at]["emit"]["line"].as_str().unwrap()).unwrap();
+        assert_eq!(line["params"]["item"]["type"], "userMessage", "{line}");
+        line["params"]["item"]["content"][0]["text"] = json!(prompt);
+        steps[at]["emit"]["line"] = json!(line.to_string());
+    }
+    assert_eq!(
+        steps[27]["expect"]["line"]["method"], "thread/unsubscribe",
+        "{}",
+        steps[27]
+    );
+    replay["steps"] = Value::Array(steps);
+    replay
+}
+
+/// Spawn members for a Codex case on `case`'s cwd with `prompt` given as
+/// `member` (`prompt` or `prompt_file`).
+fn codex_raw(case: &core_codex::CodexCase, member: &str, prompt: &str) -> Value {
+    let mut raw = codex_spawn(case, 60_000);
+    raw["prompt"] = Value::Null;
+    raw.as_object_mut().unwrap().remove("prompt");
+    raw[member] = json!(prompt);
+    raw["handle"] = json!(HANDLE);
+    raw
+}
+
+/// The Store's session rows.
+fn session_rows(root: &Path) -> i64 {
+    let store = rusqlite::Connection::open_with_flags(
+        root.join("state").join("store.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    store
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .unwrap()
+}
+
+/// via-5lr.6 (x.3.2 X5): C1 admits a 16 MiB prompt, but Codex echoes it in
+/// one `item/started` line, and a line over Wire's 1 MiB fails the shared
+/// connection, every session on it. `codex-app-server` refuses a prompt
+/// whose JSON encoding plus the cwd's exceeds [`CODEX_PROMPT_MAX`]:
+/// inline or as a `prompt_file`, one byte over is `invalid_params` naming
+/// `prompt`, before any receipt or vendor I/O. A prompt that just fits is
+/// admitted and completes, its two echoes read whole.
+#[test]
+fn codex_prompt_echo_cap() {
+    const NAME: &str = "codex_prompt_echo_cap";
+    let Some(root) = child(NAME, &no_fake(), &[]) else {
+        return;
+    };
+    // The cap counts the case's cwd, a fixed-length temporary name: a
+    // probe case gives its encoded length before the replay is written.
+    fs::create_dir_all(root.join("probe").join("state")).unwrap();
+    let probe = codex_case(
+        &root.join("probe"),
+        NAME,
+        core_codex::replay("c1_commentary_usage"),
+    );
+    let cwd = serde_json::to_string(probe.cwd()).unwrap().len();
+    drop(probe);
+    let fitting = encoded_prompt(CODEX_PROMPT_MAX - cwd);
+    let over = encoded_prompt(CODEX_PROMPT_MAX - cwd + 1);
+    let file = root.join("over.prompt");
+    fs::write(&file, &over).unwrap();
+    let case = codex_case(&root, NAME, echo_copy(&fitting));
+    assert_eq!(serde_json::to_string(case.cwd()).unwrap().len(), cwd);
+    run(async {
+        let daemon = Daemon::open_with(&root, case.config());
+        for (member, prompt) in [
+            ("prompt", over.as_str()),
+            ("prompt_file", file.to_str().unwrap()),
+        ] {
+            let raw = codex_raw(&case, member, prompt);
+            let params: SpawnParams = serde_json::from_value(raw.clone()).unwrap();
+            let refused = daemon.engine.spawn(params, &raw.to_string()).await;
+            let error = refused
+                .err()
+                .unwrap_or_else(|| panic!("{member}: admitted"));
+            let data = error.data();
+            assert_eq!(data["kind"], "invalid_params", "{member}: {data}");
+            assert_eq!(data["field"], "prompt", "{member}: {data}");
+            assert_eq!(data["route"], "codex-app-server", "{member}: {data}");
+        }
+        assert_eq!(case.launches(), 0, "a refused prompt reached no vendor");
+        assert_eq!(session_rows(&root), 0, "a refused prompt has no receipt");
+        let raw = codex_raw(&case, "prompt", &fitting);
+        let params: SpawnParams = serde_json::from_value(raw.clone()).unwrap();
+        let session = daemon
+            .engine
+            .spawn(params, &raw.to_string())
+            .await
+            .unwrap()
+            .enqueued
+            .unwrap()
+            .0;
+        let launch = case.at(ECHO_GATE).await;
+        case.signal(launch);
+        let envelope = daemon.wait(&session, 1).await;
+        assert_eq!(envelope["state"], "completed", "{envelope}");
+        daemon.close(&session).await;
+        daemon.shutdown().await;
+    });
+}
+
+/// A Codex session on [`echo_copy`]'s replay of `C1_PROMPT`, served by
+/// the fake's launch `launch`: its turn completes, then the session
+/// closes.
+async fn c1_turn(daemon: &Daemon, case: &core_codex::CodexCase, launch: u64) {
+    let session = daemon.spawn(C1_PROMPT, &codex_spawn(case, 60_000)).await;
+    case.at_launch(ECHO_GATE, launch).await;
+    case.signal(launch);
+    let envelope = daemon.wait(&session, 1).await;
+    assert_eq!(envelope["state"], "completed", "{envelope}");
+    daemon.close(&session).await;
+}
+
+/// x.3.2 X5 (X0 item 4): Codex's `CODEX_SQLITE_HOME`, `<state>/vendor/codex`,
+/// persists across a daemon restart. The first daemon's server creates
+/// it (0700); a file the vendor would keep there is written; after a
+/// clean stop the second daemon finds the same directory, its file
+/// unchanged, and its own server launches over it, leaving both as they
+/// were.
+#[test]
+fn codex_sqlite_home_persists_across_restart() {
+    use std::os::unix::fs::MetadataExt as _;
+    const NAME: &str = "codex_sqlite_home_persists_across_restart";
+    let Some(root) = child(NAME, &no_fake(), &[]) else {
+        return;
+    };
+    let case = codex_case(&root, NAME, echo_copy(C1_PROMPT));
+    let home = root.join("state").join("vendor").join("codex");
+    let kept = home.join("state_5.sqlite");
+    let identity = run(async {
+        let daemon = Daemon::open_with(&root, case.config());
+        c1_turn(&daemon, &case, 1).await;
+        let metadata = fs::symlink_metadata(&home).unwrap();
+        assert!(metadata.is_dir(), "{}", home.display());
+        assert_eq!(metadata.mode() & 0o777, 0o700);
+        fs::write(&kept, b"vendor state").unwrap();
+        daemon.stop().await;
+        (metadata.dev(), metadata.ino())
+    });
+    run(async {
+        let daemon = Daemon::open_with(&root, case.config());
+        let unchanged = || {
+            let metadata = fs::symlink_metadata(&home).unwrap();
+            assert!(metadata.is_dir(), "{}", home.display());
+            assert_eq!((metadata.dev(), metadata.ino()), identity);
+            assert_eq!(metadata.mode() & 0o777, 0o700);
+            assert_eq!(fs::read(&kept).unwrap(), b"vendor state");
+        };
+        unchanged();
+        c1_turn(&daemon, &case, 2).await;
+        assert_eq!(case.launches(), 2, "each daemon launched its own server");
+        unchanged();
+        daemon.shutdown().await;
+    });
+}
+
+/// `codex_rss_leases` (x.3.2 X5, X0 item 9.2): the sessions leased on one
+/// server, each with one active turn.
+#[cfg(feature = "test-failpoints")]
+const LEASES: usize = 32;
+
+/// Maximal status lines of the growth flood: about 270 MiB, so the flood
+/// passes 256 MiB.
+#[cfg(feature = "test-failpoints")]
+const FLOOD_LINES: usize = 272;
+
+/// Maximal `final_answer` lines per session while Core's drain is held:
+/// four fill its 4 MiB channel, the fifth is the normalizer's decode in
+/// flight, blocked on the channel.
+#[cfg(feature = "test-failpoints")]
+const FILL_LINES: usize = 5;
+
+/// Maximal lines left in the ingress lanes of blocked consumers: four of
+/// about 1 MiB fill the server's 4 MiB staging.
+#[cfg(feature = "test-failpoints")]
+const STAGED_LINES: usize = 4;
+
+/// Maximal lines between two of the fake's gates: the test releases the
+/// next batch once every line before it was taken, so Wire's staging
+/// holds at most one batch (3 MiB of its 4 MiB).
+#[cfg(feature = "test-failpoints")]
+const BATCH: usize = 3;
+
+/// Core's hold before it handles an observation: each session's drain is
+/// paused at its first fill observation, acknowledged, until the test
+/// releases it after the measurement.
+#[cfg(feature = "test-failpoints")]
+const CORE_HOLD: &str = "core.observations.pause";
+
+/// The connection task's hit before it routes each message, counted to
+/// prove the staged lines reached their lanes.
+#[cfg(feature = "test-failpoints")]
+const ROUTED: &str = "codex.connection.message";
+
+/// The consumer's take of a lane item, counted to pace the fake.
+#[cfg(feature = "test-failpoints")]
+const TAKE: &str = "adapter.codex.consumer_take";
+
+/// A blocked channel send, counted: one per session once its channel is
+/// full and its fifth fill line decoded.
+#[cfg(feature = "test-failpoints")]
+const BLOCKED: &str = "adapter.observation.blocked";
+
+/// Session `k`'s thread and turn IDs; session 0's are the fixture's.
+#[cfg(feature = "test-failpoints")]
+fn lease_ids(k: usize) -> (String, String) {
+    (
+        format!("019a0000-0000-7000-8000-{:012}", 100_001 + k),
+        format!("019a0000-0000-7000-8000-{:012}", 200_001 + k),
+    )
+}
+
+/// `codex_rss_leases`' replay and the one-based steps of its gates.
+#[cfg(feature = "test-failpoints")]
+struct Leases {
+    replay: Value,
+    /// The gate after each session's start and prompt echo.
+    started: Vec<usize>,
+    /// The flood's gates, with the flood lines written before each.
+    flood: Vec<(usize, usize)>,
+    /// The gate after each session's first fill line, where Core's drain
+    /// of that session is held.
+    held: Vec<usize>,
+    /// The rest of the fill's gates, with the fill lines written before
+    /// each.
+    fill: Vec<(usize, usize)>,
+    /// The gate after the staged lines, where the holders are measured.
+    measured: usize,
+    /// The gate after each session's `turn/completed`.
+    completed: Vec<usize>,
+}
+
+/// `c1_commentary_usage`'s handshake, then [`LEASES`] sessions, each
+/// started (`thread/start`, `turn/start`) and its prompt captured as `p`
+/// and echoed in its `userMessage` (about 1 MiB at the echo cap); then the
+/// flood, the fill and the staged lines, every maximal line's text `${p}`;
+/// then each turn completes and each session closes, in order.
+#[cfg(feature = "test-failpoints")]
+fn leases_copy() -> Leases {
+    let mut replay = core_codex::replay("c1_commentary_usage");
+    let original = replay["steps"].as_array().unwrap().clone();
+    let (thread, turn) = lease_ids(0);
+    let line_of = |at: usize| original[at]["emit"]["line"].as_str().unwrap().to_owned();
+    let for_lease = |line: &str, k: usize| {
+        let (t, u) = lease_ids(k);
+        line.replace(&thread, &t).replace(&turn, &u)
+    };
+    assert_eq!(original[6]["expect"]["line"]["method"], "thread/start");
+    assert_eq!(original[9]["expect"]["line"]["method"], "turn/start");
+    assert!(line_of(14).contains("\"userMessage\""));
+    assert!(line_of(28).contains("\"turn/completed\""));
+    assert_eq!(
+        original[49]["expect"]["line"]["method"],
+        "thread/unsubscribe"
+    );
+    let echo = line_of(14).replace(&serde_json::to_string(C1_PROMPT).unwrap(), "${p}");
+    assert!(echo.contains("${p}"), "{echo}");
+    let mut steps = original[..6].to_vec();
+    let gate = |steps: &mut Vec<Value>| {
+        steps.push(json!({"await_signal":{"signal":"SIGUSR1"}}));
+        steps.len()
+    };
+    let emit = |steps: &mut Vec<Value>, line: String| {
+        steps.push(json!({"emit":{"line":line}}));
+    };
+    let mut started = Vec::new();
+    for k in 0..LEASES {
+        let (t, _) = lease_ids(k);
+        steps.push(original[6].clone());
+        emit(&mut steps, for_lease(&line_of(7), k));
+        let answered = steps.len();
+        emit(&mut steps, for_lease(&line_of(8), k));
+        steps.push(json!({"expect":{"line":{"method":"turn/start","params":{
+            "threadId":t,"cwd":original[9]["expect"]["line"]["params"]["cwd"]}},
+            "capture":{"turn1":"/id","p":"/params/input/0/text"},"after_emit":answered}}));
+        emit(&mut steps, for_lease(&line_of(10), k));
+        emit(&mut steps, for_lease(&line_of(12), k));
+        emit(&mut steps, for_lease(&echo, k));
+        started.push(gate(&mut steps));
+    }
+    let status = |k: usize| {
+        let (t, _) = lease_ids(k);
+        format!(
+            r#"{{"method":"thread/status/changed","params":{{"threadId":"{t}","status":{{"type":"active","activeFlags":[]}},"pad":${{p}}}}}}"#
+        )
+    };
+    let mut flood = Vec::new();
+    for line in 0..FLOOD_LINES {
+        emit(&mut steps, status(line % LEASES));
+        if (line + 1) % BATCH == 0 || line + 1 == FLOOD_LINES {
+            flood.push((gate(&mut steps), line + 1));
+        }
+    }
+    let mut held = Vec::new();
+    let mut fill = Vec::new();
+    for line in 0..FILL_LINES * LEASES {
+        let (t, u) = lease_ids(line % LEASES);
+        let j = line / LEASES;
+        emit(
+            &mut steps,
+            format!(
+                r#"{{"method":"item/completed","params":{{"item":{{"type":"agentMessage","id":"fill_{j}","text":${{p}},"phase":"final_answer","memoryCitation":null,"delivery":null,"questions":null}},"threadId":"{t}","turnId":"{u}","completedAtMs":1790000007591}},"emittedAtMs":1790000007591}}"#
+            ),
+        );
+        if line < LEASES {
+            held.push(gate(&mut steps));
+        } else if (line + 1 - LEASES).is_multiple_of(BATCH) || line + 1 == FILL_LINES * LEASES {
+            fill.push((gate(&mut steps), line + 1));
+        }
+    }
+    for k in 0..STAGED_LINES {
+        emit(&mut steps, status(k));
+    }
+    let measured = gate(&mut steps);
+    let mut completed = Vec::new();
+    for k in 0..LEASES {
+        emit(&mut steps, for_lease(&line_of(28), k));
+        completed.push(gate(&mut steps));
+    }
+    for k in 0..LEASES {
+        let (t, _) = lease_ids(k);
+        steps.push(json!({"expect":{"line":{"method":"thread/unsubscribe",
+            "params":{"threadId":t}},"capture":{"close":"/id"}}}));
+        steps.push(original[50].clone());
+    }
+    steps.push(json!({"await_eof":{}}));
+    replay["steps"] = Value::Array(steps);
+    replay["deadline_ms"] = json!(115_000);
+    Leases {
+        replay,
+        started,
+        flood,
+        held,
+        fill,
+        measured,
+        completed,
+    }
+}
+
+/// Counts `point`'s hits without acting on any: a command under another
+/// token is refused at every hit, each refusal leaving its marker.
+#[cfg(feature = "test-failpoints")]
+fn count_hits(points: &Path, point: &str) {
+    let command = json!({"token":"counting","occurrence":1,"action":"pause"});
+    fs::write(points.join(format!("{point}.json")), command.to_string()).unwrap();
+}
+
+/// Waits until the fake is at gate `step` and the consumers took at least
+/// `taken` lane items; the caller releases the gate.
+#[cfg(feature = "test-failpoints")]
+async fn ready(case: &core_codex::CodexCase, root: &Path, step: usize, taken: u64) {
+    case.at_launch(step, 1).await;
+    let by = tokio::time::Instant::now() + Duration::from_secs(60);
+    while hits(root, TAKE) < taken {
+        assert!(
+            tokio::time::Instant::now() < by,
+            "the consumers took {} of {taken} items by gate {step}",
+            hits(root, TAKE)
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+/// A `/proc/<pid>/status` field in KiB.
+#[cfg(feature = "test-failpoints")]
+fn status_kib(pid: &str, field: &str) -> u64 {
+    fs::read_to_string(format!("/proc/{pid}/status"))
+        .unwrap_or_default()
+        .lines()
+        .find_map(|line| line.strip_prefix(field))
+        .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// The bytes process `pid` wrote (`/proc/<pid>/io` `wchar`).
+#[cfg(feature = "test-failpoints")]
+fn written(pid: u32) -> u64 {
+    fs::read_to_string(format!("/proc/{pid}/io"))
+        .unwrap_or_default()
+        .lines()
+        .find_map(|line| line.strip_prefix("wchar:"))
+        .and_then(|rest| rest.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// The phases of `codex_rss_leases`, as the sampler records them.
+#[cfg(feature = "test-failpoints")]
+mod phase {
+    pub(super) const SPAWN: u8 = 1;
+    pub(super) const FLOOD: u8 = 2;
+    pub(super) const HELD: u8 = 3;
+    pub(super) const DRAIN: u8 = 4;
+}
+
+/// One 10 ms sample: the phase, this process's RSS and the fake's written
+/// bytes.
+#[cfg(feature = "test-failpoints")]
+#[derive(Clone, Copy)]
+struct RssSample {
+    phase: u8,
+    rss_kib: u64,
+    written: u64,
+}
+
+/// Samples this process's RSS every 10 ms, with the phase and the fake's
+/// written bytes (once its pid is known), until `stop`.
+#[cfg(feature = "test-failpoints")]
+fn rss_sampler(
+    phase: Arc<std::sync::atomic::AtomicU8>,
+    fake: Arc<std::sync::atomic::AtomicU32>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<Vec<RssSample>> {
+    use std::sync::atomic::Ordering;
+    std::thread::spawn(move || {
+        let mut samples = Vec::new();
+        while !stop.load(Ordering::Acquire) {
+            let pid = fake.load(Ordering::Acquire);
+            samples.push(RssSample {
+                phase: phase.load(Ordering::Acquire),
+                rss_kib: status_kib("self", "VmRSS:"),
+                written: if pid == 0 { 0 } else { written(pid) },
+            });
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        samples
+    })
+}
+
+/// X0 item 9.2's computed sum, in bytes, from the table's constants: per
+/// server, staging 4 MiB, correlation 256 KiB, pending replies 64 KiB,
+/// Wire's read buffer 64 KiB and the demux peek 1 MiB; per session, the
+/// observation channel 4 MiB, driver controls 64 KiB and the decode
+/// allowance (1 MiB of strings + 65,536 nodes × 64 B); per active turn,
+/// the dispatched prompt, which on this route is at most the echo cap
+/// (via-5lr.6), not C1's 16 MiB.
+#[cfg(feature = "test-failpoints")]
+fn leases_sum() -> u64 {
+    const MIB: u64 = 1024 * 1024;
+    let server = 4 * MIB + 256 * 1024 + 64 * 1024 + 64 * 1024 + MIB;
+    let session = 4 * MIB + 64 * 1024 + MIB + 65_536 * 64;
+    let turn = CODEX_PROMPT_MAX as u64;
+    server + LEASES as u64 * (session + turn)
+}
+
+/// x.3.2 X5 `codex_rss_leases` (X0 item 9.2, runtime §8 F24): one replay
+/// server, [`LEASES`] leased sessions each with an active turn whose
+/// prompt is at the echo cap. A paced flood of about 270 MiB of maximal
+/// thread lines passes through every lane while Core drains (growth
+/// below 32 MiB after its first 64 MiB, peak to peak, both windows
+/// sampled). Then each session's Core drain is paused, acknowledged, until
+/// the test releases it; each channel is filled to its 4 MiB with the
+/// fifth maximal message decoded and blocked, and the server's 4 MiB
+/// staging filled with lines in blocked lanes. That occupancy is asserted
+/// from counted failpoint hits before and after the held sample; then
+/// peak RSS less the idle baseline is within [`leases_sum`] plus 25%.
+/// Then each drain is released and each turn completes, one session at a
+/// time, and every session closes. 10 ms sampling; on glibc
+/// `MALLOC_ARENA_MAX=2` as F24's proxy. Held to its own nextest slot
+/// (`.config/nextest.toml`).
+#[cfg(feature = "test-failpoints")]
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "every phase of one measured scenario, in order"
+)]
+#[expect(clippy::print_stdout, reason = "the measured numbers are reported")]
+fn codex_rss_leases() {
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+    const NAME: &str = "codex_rss_leases";
+    const MIB: u64 = 1024 * 1024;
+    let mut env = vec![("VIA_TEST_EVENT_STALL_MS", "120000")];
+    if cfg!(target_env = "gnu") {
+        env.push(("MALLOC_ARENA_MAX", "2"));
+    }
+    let Some(root) = child(NAME, &no_fake(), &env) else {
+        return;
+    };
+    let started_at = Instant::now();
+    let points = root.join("points");
+    via_store::failpoint::activate(&points, "conformance-core").unwrap();
+    count_hits(&points, TAKE);
+    count_hits(&points, BLOCKED);
+    count_hits(&points, ROUTED);
+    count_hits(&points, CORE_HOLD);
+    let leases = leases_copy();
+    let case = codex_case(&root, NAME, leases.replay.clone());
+    let cwd = serde_json::to_string(case.cwd()).unwrap().len();
+    let prompt = encoded_prompt(CODEX_PROMPT_MAX - cwd);
+    // A maximal status line's length, LF included, as the fake writes it.
+    let maximal = format!(
+        r#"{{"method":"thread/status/changed","params":{{"threadId":"{}","status":{{"type":"active","activeFlags":[]}},"pad":{}}}}}"#,
+        lease_ids(0).0,
+        serde_json::to_string(&prompt).unwrap()
+    )
+    .len() as u64
+        + 1;
+    assert!(maximal <= MIB, "{maximal}");
+    assert!(maximal * STAGED_LINES as u64 <= 4 * MIB, "{maximal}");
+    let phase = Arc::new(AtomicU8::new(0));
+    let fake = Arc::new(AtomicU32::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (baseline, spawned, flood, sampling, (held_for, blocked)) = run(async {
+        let daemon = Daemon::open_with(&root, case.config());
+        // Elapsed time only: the Engine settles before its baseline.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let baseline = status_kib("self", "VmRSS:");
+        let sampling = rss_sampler(Arc::clone(&phase), Arc::clone(&fake), Arc::clone(&stop));
+        phase.store(phase::SPAWN, Ordering::Release);
+        let mut sessions = Vec::new();
+        for (k, step) in leases.started.iter().enumerate() {
+            sessions.push(daemon.spawn(&prompt, &codex_spawn(&case, 115_000)).await);
+            case.at_launch(*step, 1).await;
+            if k == 0 {
+                fake.store(case.pid(1), Ordering::Release);
+            }
+            if k + 1 < LEASES {
+                case.signal(1);
+            }
+        }
+        // Every start's traffic is taken before the flood is counted.
+        let mut base = hits(&root, TAKE);
+        loop {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let now = hits(&root, TAKE);
+            if now == base {
+                break;
+            }
+            base = now;
+        }
+        let spawned = status_kib("self", "VmRSS:");
+        let from = written(case.pid(1));
+        phase.store(phase::FLOOD, Ordering::Release);
+        case.signal(1);
+        for (step, lines) in &leases.flood {
+            ready(&case, &root, *step, base + *lines as u64).await;
+            if *lines < FLOOD_LINES {
+                case.signal(1);
+            }
+        }
+        let flood = (from, written(case.pid(1)));
+        // Core's drain of each session is paused at its first fill
+        // observation, one session at a time: the next occurrence of
+        // Core's hold is armed, the session's first fill line released,
+        // and the pause acknowledged. No other observation reaches Core.
+        phase.store(phase::HELD, Ordering::Release);
+        let base = hits(&root, TAKE);
+        let blocked_from = hits(&root, BLOCKED);
+        let core_from = hits(&root, CORE_HOLD);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(hits(&root, CORE_HOLD), core_from, "Core is not idle");
+        let paused: Vec<u64> = (1..=LEASES as u64).map(|k| core_from + k).collect();
+        for (occurrence, step) in paused.iter().zip(&leases.held) {
+            arm_at(&root, CORE_HOLD, *occurrence, "pause");
+            case.signal(1);
+            until_acked(&root, CORE_HOLD, *occurrence).await;
+            case.at_launch(*step, 1).await;
+        }
+        // Counted again: a later hit of Core's hold would be an
+        // observation handled while Core is held.
+        count_hits(&points, CORE_HOLD);
+        let mut routed_from = 0;
+        for (index, (step, lines)) in leases.fill.iter().enumerate() {
+            if index == 0 {
+                case.signal(1);
+            }
+            ready(&case, &root, *step, base + *lines as u64).await;
+            if index + 1 == leases.fill.len() {
+                routed_from = hits(&root, ROUTED);
+            }
+            case.signal(1);
+        }
+        case.at_launch(leases.measured, 1).await;
+        // The simultaneous occupancy, before the held peak is sampled:
+        // the staged lines were routed and none was taken, so they wait in
+        // their lanes; every fill line was taken and exactly one send per
+        // session blocked, so each channel is full with its fifth line
+        // decoded; each session's drain is still paused.
+        let by = tokio::time::Instant::now() + Duration::from_secs(30);
+        while hits(&root, ROUTED) < routed_from + STAGED_LINES as u64 {
+            assert!(
+                tokio::time::Instant::now() < by,
+                "the staged lines were not routed"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let sampled_from = tokio::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert_eq!(
+            hits(&root, TAKE),
+            base + (FILL_LINES * LEASES) as u64,
+            "a staged line was taken, or a fill line was not"
+        );
+        assert_eq!(
+            hits(&root, BLOCKED) - blocked_from,
+            LEASES as u64,
+            "blocked channel sends during the fill"
+        );
+        assert_eq!(
+            hits(&root, CORE_HOLD),
+            core_from,
+            "Core took an observation while every drain was held"
+        );
+        let held_for = sampled_from.elapsed();
+        let blocked = hits(&root, BLOCKED) - blocked_from;
+        phase.store(phase::DRAIN, Ordering::Release);
+        // One session at a time: its drain is released and handles its
+        // other final-text pieces, then its turn completes. Core runs at
+        // most 16 blob steps at once (`BLOB_TASKS`); 32 spilled final
+        // texts settled together exceed it.
+        let pieces = via_adapters::final_text_pieces(&prompt).count() as u64;
+        let mut handled = hits(&root, CORE_HOLD);
+        for occurrence in &paused {
+            release_point(&root, CORE_HOLD, *occurrence);
+            handled += pieces * FILL_LINES as u64 - 1;
+            let by = tokio::time::Instant::now() + Duration::from_secs(60);
+            while hits(&root, CORE_HOLD) < handled {
+                assert!(
+                    tokio::time::Instant::now() < by,
+                    "Core handled {} of {handled} observations",
+                    hits(&root, CORE_HOLD)
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        for (session, step) in sessions.iter().zip(&leases.completed) {
+            case.signal(1);
+            let envelope = daemon.wait(session, 1).await;
+            assert_eq!(envelope["state"], "completed", "{envelope}");
+            case.at_launch(*step, 1).await;
+        }
+        case.signal(1);
+        for session in &sessions {
+            daemon.close(session).await;
+        }
+        daemon.shutdown().await;
+        (baseline, spawned, flood, sampling, (held_for, blocked))
+    });
+    stop.store(true, Ordering::Release);
+    let samples = sampling.join().unwrap();
+    let hwm = status_kib("self", "VmHWM:");
+    let peak_sampled = samples
+        .iter()
+        .map(|sample| sample.rss_kib)
+        .max()
+        .unwrap_or(0);
+    let peak_held = samples
+        .iter()
+        .filter(|sample| sample.phase == phase::HELD)
+        .map(|sample| sample.rss_kib)
+        .max()
+        .unwrap_or(0);
+    let peak = hwm.max(peak_sampled);
+    // Growth, peak to peak as F24 (`s1_f24_memory.rs`): the highest RSS
+    // with 32 MiB <= flooded < 64 MiB against the highest from 64 MiB on,
+    // in the flood phase only.
+    let flooded = |sample: &RssSample| sample.written.saturating_sub(flood.0);
+    let in_flood = || samples.iter().filter(|sample| sample.phase == phase::FLOOD);
+    let before_64 = || in_flood().filter(|sample| (32 * MIB..64 * MIB).contains(&flooded(sample)));
+    let after_64 = || in_flood().filter(|sample| flooded(sample) >= 64 * MIB);
+    let level = before_64().map(|sample| sample.rss_kib).max().unwrap_or(0);
+    let after = after_64().map(|sample| sample.rss_kib).max().unwrap_or(0);
+    let limit = leases_sum() * 5 / 4 / 1024;
+    let metrics = json!({
+        "baseline_kib": baseline, "peak_kib": peak, "peak_hwm_kib": hwm,
+        "peak_sampled_kib": peak_sampled, "peak_held_kib": peak_held,
+        "after_spawn_kib": spawned, "samples": samples.len(),
+        "sum_kib": leases_sum() / 1024, "limit_kib": limit,
+        "marginal_per_session_kib": spawned.saturating_sub(baseline) / LEASES as u64,
+        "marginal_per_held_session_kib": peak_held.saturating_sub(baseline) / LEASES as u64,
+        "flood_bytes": flood.1 - flood.0, "flood_samples": in_flood().count(),
+        "samples_before_64_mib": before_64().count(),
+        "samples_after_64_mib": after_64().count(),
+        "held_samples": samples.iter().filter(|sample| sample.phase == phase::HELD).count(),
+        "held_sampled_ms": held_for.as_millis(),
+        "level_before_64_mib_kib": level,
+        "rss_after_64_mib_kib": after,
+        "sessions": LEASES, "flood_lines": FLOOD_LINES,
+        "fill_lines": FILL_LINES * LEASES, "staged_bytes": maximal * STAGED_LINES as u64,
+        "taken": hits(&root, TAKE), "blocked_sends_held": blocked,
+        "maximal_line": maximal, "runtime_ms": started_at.elapsed().as_millis(),
+        "malloc_arena_max": env::var("MALLOC_ARENA_MAX").ok(),
+    });
+    println!("codex_rss_leases {metrics}");
+    assert!(flood.1 - flood.0 >= 256 * MIB, "{metrics}");
+    assert!(
+        before_64().count() > 0 && after_64().count() > 0,
+        "an empty growth window: {metrics}"
+    );
+    assert!(
+        peak.saturating_sub(baseline) <= limit,
+        "peak RSS less the baseline is over 1.25 x the computed sum: {metrics}"
+    );
+    assert!(
+        after.saturating_sub(level) < 32 * 1024,
+        "RSS grew 32 MiB or more after the flood's first 64 MiB: {metrics}"
+    );
 }

@@ -174,13 +174,17 @@ impl LeaseSignal {
     pub(super) fn signal(&self) {
         (self.on_abnormal)(AbnormalEnd {
             first_unqueued: self.enqueued().saturating_add(1),
+            owner: None,
         });
     }
 
-    pub(super) fn overflowed(&self) {
+    /// A lane of the lease dropped an item after it overflowed; `owner` is
+    /// the VIA turn the dropped item was routed under, when known.
+    pub(super) fn overflowed(&self, owner: Option<TurnNumber>) {
         if let Some(on_overflow) = &self.on_overflow {
             on_overflow(AbnormalEnd {
                 first_unqueued: self.enqueued().saturating_add(1),
+                owner,
             });
         }
     }
@@ -192,6 +196,13 @@ pub struct AbnormalEnd {
     /// The first decode sequence not queued into the lease's lanes: no
     /// earlier message of the lease was lost with the task.
     pub first_unqueued: u64,
+    /// A lane overflow only: the lane's [`Lane::overflow_owner`], the VIA
+    /// turn the item whose refusal overflowed it was routed under (a
+    /// message's mapped owner at routing, or a `turn/start` reply's turn),
+    /// with no decode; `None` when it named no mapped turn or retention
+    /// growth overflowed the lane first, and for a connection's abnormal
+    /// end.
+    pub owner: Option<TurnNumber>,
 }
 
 /// Why a whole connection failed, as its sessions report it (item 13.1).
@@ -287,6 +298,11 @@ struct Queue {
     /// An item naming an unmapped turn was pushed while a start was open
     /// (x.3.2 X3 §3.2, the refusal check); cleared by the next `Start`.
     early_seen: bool,
+    /// The VIA turn the item whose refusal overflowed the lane was routed
+    /// under, set with the overflow under the same lock (critical review
+    /// x5 r3); `None` when that item named no mapped turn, or when
+    /// retention growth overflowed the lane first.
+    overflow_owner: Option<TurnNumber>,
 }
 
 impl Queue {
@@ -342,6 +358,16 @@ impl Lane {
         self.ready.notify_one();
     }
 
+    /// A push of an item routed under `owner` that does not fit: counts
+    /// the drop and records `owner` as the lane's overflow owner, both
+    /// under the lock that ends the lane `Overflow`, so every observer of
+    /// the overflow sees the owner with it (critical review x5 r3).
+    fn refuse(&self, mut queue: std::sync::MutexGuard<'_, Queue>, owner: Option<TurnNumber>) {
+        queue.dropped = queue.dropped.saturating_add(1);
+        queue.overflow_owner = owner;
+        self.overflow(queue);
+    }
+
     /// Opens the start gate.
     fn open_gate(gate: &watch::Sender<bool>, queue: &mut Queue) {
         queue.open_start = None;
@@ -361,8 +387,7 @@ impl Lane {
             return false;
         }
         if !queue.fits(bytes) {
-            queue.dropped = queue.dropped.saturating_add(1);
-            self.overflow(queue);
+            self.refuse(queue, item.routed().and_then(|routed| routed.owner));
             return false;
         }
         let mark = queue.mark();
@@ -423,8 +448,7 @@ impl Lane {
         }
         let bytes = ENTRY_BYTES.saturating_add(accepted.as_ref().map_or(0, String::len));
         if !queue.fits(bytes) {
-            queue.dropped = queue.dropped.saturating_add(1);
-            self.overflow(queue);
+            self.refuse(queue, Some(turn));
             return (contradicted, false);
         }
         let mark = queue.mark();
@@ -495,6 +519,15 @@ impl Lane {
         Self::open_gate(&self.gate, &mut queue);
         drop(queue);
         self.ready.notify_one();
+    }
+
+    /// The VIA turn the item whose refusal overflowed the lane was routed
+    /// under (critical review x5 r3): set with the overflow, so an
+    /// observer of the overflow reads it; `None` before an overflow, for
+    /// an item naming no mapped turn, and when retention growth
+    /// overflowed the lane first (the running turn's own loss).
+    pub fn overflow_owner(&self) -> Option<TurnNumber> {
+        self.queue().overflow_owner
     }
 
     /// Whether the lane overflowed, however much of it was taken since.

@@ -16,12 +16,14 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
     time::Duration,
 };
 
 use serde_json::{Value, json};
 use via_core::{AdapterConfig, BootstrapEnv};
+
+#[path = "fake_signal.rs"]
+mod fake_signal;
 
 /// The session cwd every Codex fixture recorded.
 const RECORDED: &str = "/work/project";
@@ -126,17 +128,46 @@ impl CodexCase {
         }
     }
 
-    /// Sends launch `launch`'s fake its gate signal.
-    pub(crate) fn signal(&self, launch: u64) {
-        let log = fs::read_to_string(self.dir.join(format!("{}.launches", self.name))).unwrap();
-        let pid = log
+    /// How many times the fake launched (its launch log's lines).
+    pub(crate) fn launches(&self) -> usize {
+        fs::read_to_string(self.dir.join(format!("{}.launches", self.name)))
+            .map_or(0, |log| log.lines().count())
+    }
+
+    /// Waits until launch `launch` of the fake logged `at <step>`.
+    pub(crate) async fn at_launch(&self, step: usize, launch: u64) {
+        let path = self.dir.join(format!("{}.progress", self.name));
+        let marker = format!("at {step} launch {launch}");
+        let by = tokio::time::Instant::now() + PROGRESS_WAIT;
+        while !fs::read_to_string(&path)
+            .unwrap_or_default()
             .lines()
+            .any(|line| line == marker)
+        {
+            assert!(
+                tokio::time::Instant::now() < by,
+                "the fake never logged {marker:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Launch `launch`'s pid, from the fake's launch log.
+    pub(crate) fn pid(&self, launch: u64) -> u32 {
+        let log = fs::read_to_string(self.dir.join(format!("{}.launches", self.name))).unwrap();
+        log.lines()
             .nth(usize::try_from(launch).unwrap() - 1)
             .unwrap()
             .trim()
-            .to_owned();
-        let status = Command::new("kill").args(["-USR1", &pid]).status().unwrap();
-        assert!(status.success(), "kill -USR1 {pid}");
+            .parse()
+            .unwrap()
+    }
+
+    /// Sends launch `launch`'s fake its gate signal, only while that
+    /// launch runs ([`fake_signal::gate`]).
+    pub(crate) fn signal(&self, launch: u64) {
+        let sent = fake_signal::gate(self.pid(launch), &self.link);
+        assert!(sent.is_ok(), "launch {launch}'s gate signal: {sent:?}");
     }
 }
 
@@ -336,4 +367,39 @@ fn protection_restores_placeholders_byte_for_byte() {
     assert!(text.contains("${thread}") && text.contains("$${lit}") && text.contains("\"${n}\""));
     assert!(text.contains("\"/tmp/d/a\""), "{text}");
     assert_eq!(rewrite_line("{\"cwd\":\"/work/projects\"}", "/tmp/d").1, 0);
+}
+
+/// The gate signal reaches only a launch of the fake's link: a live
+/// process launched otherwise, and one that ended and was reaped, are
+/// refused and never signalled; a process launched as the link is.
+#[test]
+fn gate_signal_reaches_only_a_launch_of_the_link() {
+    use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+    use std::process::Command;
+
+    let link = Path::new("/nonexistent/via-gate-test/fake");
+    let mut other = Command::new("sleep").arg("30").spawn().unwrap();
+    assert!(fake_signal::gate(other.id(), link).is_err());
+    assert!(other.try_wait().unwrap().is_none(), "it was not signalled");
+    other.kill().unwrap();
+    other.wait().unwrap();
+    assert!(
+        fake_signal::gate(other.id(), link).is_err(),
+        "a reaped launch is refused"
+    );
+    let mut launch = Command::new("sleep").arg0(link).arg("30").spawn().unwrap();
+    let by = std::time::Instant::now() + Duration::from_secs(5);
+    // The child's command line is its own once it has executed `sleep`.
+    while fs::read(format!("/proc/{}/cmdline", launch.id()))
+        .is_ok_and(|cmdline| !cmdline.starts_with(link.as_os_str().as_encoded_bytes()))
+    {
+        assert!(std::time::Instant::now() < by, "the launch never ran");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    fake_signal::gate(launch.id(), link).unwrap();
+    assert_eq!(
+        launch.wait().unwrap().signal(),
+        Some(rustix::process::Signal::USR1.as_raw()),
+        "the gate signal ended it"
+    );
 }
