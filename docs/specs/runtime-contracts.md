@@ -1051,7 +1051,7 @@ would otherwise fail every launch.
 ```text
 <state>/
   store.lock                 persistent Store-owner lock inode
-  daemon.json                optional daemon config: disk floor and warning, WAL, harness processes (§8); adapter-owned `harnesses` and `codex.memories` (§8)
+  daemon.json                optional daemon config: disk floor and warning, WAL, harness processes (§8); adapter-owned `harnesses` (§8)
   via.log                    daemon warnings and errors; via.log.1 after rotation past 10 MiB (§6.2)
   store.sqlite3              SQLite database (user_version schema)
   store.sqlite3-wal          SQLite-owned sidecar when present
@@ -1314,7 +1314,7 @@ Defaults below are S1 acceptance constants, not throughput claims. Tests may
 reduce durations/capacities through explicit test config while separately
 testing default ceilings. Only the `daemon.json` keys (disk free-space floor,
 data-size warning, WAL limit and checkpoint triggers, the harness-process
-limit, and the adapter-owned `harnesses` and `codex.memories` settings; see the
+limit, and the adapter-owned `harnesses` settings; see the
 end of this section) are configurable; C1, C2 and every other limit here are fixed
 (T4-A37; harness processes: owner, 2026-10-04, renamed 2026-10-05). All
 payload limits count encoded bytes plus separately bounded decoded structure.
@@ -1417,14 +1417,14 @@ instruction_files}` (booleans; default hooks and MCP servers `false`, the rest
 disables nothing but memories, owner 2026-10-05; C2 §6.2, AD13). It is read at daemon start like the other keys; a
 change applies to sessions spawned after the next start, and each session
 freezes its settings at spawn. It holds no credentials and no limits.
-The optional `codex.memories` (a boolean, default `false`; owner,
-2026-10-05), parsed by `via-adapters` like `harnesses`, chooses whether the Codex servers VIA starts keep Codex's own
-memories default: `false` launches each with `--disable memories`, `true`
-omits the switch (vendors/codex.md §4). It is read at daemon start like
-the other keys, so a change applies to servers launched after the next
-start; the switch is part of the server key, so servers under the two
-settings are never shared. Any other value refuses the start naming
-`codex.memories`.
+For Codex alone, `harnesses.codex.memories` (a boolean, default `false`;
+owner, 2026-10-05) chooses whether the Codex servers VIA starts keep
+Codex's own memories default: `false` launches each with `--disable
+memories`, `true` omits the switch (vendors/codex.md §4). A change applies
+to servers launched after the next start; the switch is part of the server
+key, so servers under the two settings are never shared. Any other value
+refuses the start naming `harnesses.codex.memories`; the key under another
+harness is an unknown key.
 C1, C2, memory and the other runtime §8 limits are not configurable.
 The Codex shared server has no lease or RPC admission cap beyond these
 bounds. Per server, its staging (shared by Wire's queue and the ingress

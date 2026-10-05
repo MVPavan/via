@@ -844,7 +844,7 @@ has no failed outcome to count.
   2. `adapter_version`;
   3. the resolved program path bytes;
   4. argv after the program (`app-server`, `--disable memories` unless
-     `daemon.json` sets `codex.memories` true (via-7r9; owner 2026-10-05),
+     `daemon.json` sets `harnesses.codex.memories` true (via-7r9; owner 2026-10-05),
      `--disable hooks` when hooks are requested off, later switches; no
      other feature is disabled for the first release, owner 2026-10-05);
   5. the passed environment, sorted `(name, value)` pairs: the allow-list

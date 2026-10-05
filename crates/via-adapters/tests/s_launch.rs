@@ -216,6 +216,60 @@ fn refusal_cases() -> Vec<(&'static str, &'static str, HarnessesRule)> {
     ]
 }
 
+/// Owner 2026-10-05: `harnesses.codex.memories` chooses Codex's memories
+/// default, beside its `binary` and `inherit`: false (the default) keeps
+/// `--disable memories`, true omits it.
+#[test]
+fn s_launch_harnesses_codex_memories() {
+    use HarnessesRule::{DuplicateKey, NotBoolean, UnknownKey};
+    let memories = |text: &str| load(text).unwrap().codex().memories;
+    assert!(!AdapterConfig::load(none(), None).unwrap().codex().memories);
+    assert!(!memories(r#"{"codex":{}}"#));
+    assert!(!memories(r#"{"codex":{"memories":false}}"#));
+    assert!(memories(
+        r#"{"codex":{"binary":"/opt/vendor/codex","memories":true}}"#
+    ));
+    assert!(!memories(r#"{"claude":{}}"#));
+    // `memories` is Codex's alone, and a boolean.
+    for (text, key, rule) in [
+        (
+            r#"{"codex":{"memories":"yes"}}"#,
+            "harnesses.codex.memories",
+            NotBoolean,
+        ),
+        (
+            r#"{"codex":{"memories":null}}"#,
+            "harnesses.codex.memories",
+            NotBoolean,
+        ),
+        (
+            r#"{"claude":{"memories":true}}"#,
+            "harnesses.claude.memories",
+            UnknownKey,
+        ),
+        (
+            r#"{"opencode":{"memories":false}}"#,
+            "harnesses.opencode.memories",
+            UnknownKey,
+        ),
+        (
+            r#"{"codex":{"memories":true,"memories":true}}"#,
+            "harnesses.codex.memories",
+            DuplicateKey,
+        ),
+    ] {
+        let expected = HarnessesError {
+            key: key.to_owned(),
+            rule,
+        };
+        assert_eq!(
+            HarnessSettings::parse(&raw(text)).as_ref(),
+            Err(&expected),
+            "{text}"
+        );
+    }
+}
+
 /// Runtime §8, design §5.4: each invalid `harnesses` refuses with its
 /// named error, from `load` and from the pure `HarnessSettings::parse` alike; a
 /// key repeated at any level is refused.

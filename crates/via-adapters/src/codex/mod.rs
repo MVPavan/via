@@ -58,7 +58,7 @@ pub(crate) struct CodexAdapter {
     instances: Arc<InstanceCache>,
     /// The daemon's bootstrap environment, which the recipe filters.
     env: BootstrapEnv,
-    /// The `codex` section of `daemon.json`.
+    /// Codex's `daemon.json` settings (`harnesses.codex`).
     settings: CodexSettings,
     /// The shared-server registry (x.3.2 X0 item 2).
     servers: Arc<Servers>,

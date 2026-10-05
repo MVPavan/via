@@ -270,7 +270,7 @@ silently broaden the allow-list after failure.
 
 Every server VIA starts runs `codex app-server --disable memories`,
 whatever the session requests (via-7r9, checked 2026-10-05 on 0.160.0),
-unless `daemon.json` sets `{"codex":{"memories":true}}` (runtime §8,
+unless `daemon.json` sets `{"harnesses":{"codex":{"memories":true}}}` (runtime §8,
 owner 2026-10-05; default `false`), which omits the switch so Codex's own
 default and the user's `config.toml` apply. The setting is read at daemon
 start and applies to servers launched after it; the argv is in the

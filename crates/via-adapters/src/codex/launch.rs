@@ -21,7 +21,7 @@ const ENV_ALLOW: &[&str] = &["HOME", "PATH", "USER", "LOGNAME", "LANG", "XDG_RUN
 const SQLITE_HOME: &str = "CODEX_SQLITE_HOME";
 
 /// The Codex feature every server VIA starts disables, whatever the
-/// session requests, unless `daemon.json` sets `codex.memories` true
+/// session requests, unless `daemon.json` sets `harnesses.codex.memories` true
 /// (via-7r9, owner 2026-10-05; `codex app-server --help`: `--disable
 /// <FEATURE>` is `-c features.<name>=false`, which overrides the user's
 /// `config.toml`). `memories` ran stage-1 extraction and then a
@@ -55,8 +55,8 @@ pub(crate) struct ServerRecipe {
 
 impl ServerRecipe {
     /// The recipe for `binary` with the session's requested inherited
-    /// configuration and the daemon's `codex` settings: `--disable
-    /// memories` unless `codex.memories` is true (the argv is in the key,
+    /// configuration and Codex's `daemon.json` settings: `--disable
+    /// memories` unless `harnesses.codex.memories` is true (the argv is in the key,
     /// so the two settings never share a server),
     /// `--disable hooks` when hooks are off (a verified switch), nothing
     /// else disabled (owner 2026-10-05: the user's MCP servers and Codex's

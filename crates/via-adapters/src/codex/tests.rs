@@ -161,7 +161,7 @@ fn every_server_disables_memories() {
     }
 }
 
-/// Owner 2026-10-05: `codex.memories` true omits `--disable memories`, so
+/// Owner 2026-10-05: `harnesses.codex.memories` true omits `--disable memories`, so
 /// Codex's own default applies; the argv is in the server key, so servers
 /// under the two settings never share a key.
 #[test]
