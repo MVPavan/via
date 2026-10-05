@@ -442,13 +442,15 @@ The head is written as it arrives; the tail waits in the anchor's bounded
 ring, and the bytes between are discarded. The anchor always drains the
 pipe into memory, discarding past the cap, and a separate thread writes the
 file, so the vendor never blocks on stderr, even when the file's writes
-stall; the anchor then holds at most the head and the tail. When
+stall; the log's allocations stay within the head and the tail (and a
+64 KiB read buffer). When
 bytes were dropped, one marker line `[via: <n> bytes of vendor stderr
 dropped]`, on its own line, precedes the tail; the tail is written when the
 vendor group ends (the pipe's EOF, or in the last 20 ms of the cleanup
 grace before the anchor's own group KILL, discarding stderr written after
 that), and when the anchor returns early on an error. A tail write still
-blocked at the KILL is lost: the KILL never waits for it. An anchor killed from outside
+blocked at the KILL, or a finish that cannot take the log's lock by then,
+loses the tail: the KILL never waits for either. An anchor killed from outside
 loses the tail, and the vendor's later stderr writes then fail (`EPIPE` or
 `SIGPIPE`). The vendor's own transcript keeps the
 conversation; SQLite keeps its path as a hint with the vendor session ID.
