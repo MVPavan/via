@@ -780,6 +780,9 @@ pub struct ProcessControl {
     stop: Arc<StopFacts>,
     capacity: Capacity,
     uncertain: watch::Sender<bool>,
+    /// Where the anchor's socket is, removed once its group is proved
+    /// absent (bead via-c30).
+    anchor_dir: PathBuf,
 }
 
 /// Process facts and cleanup evidence from a close request.
@@ -1031,7 +1034,7 @@ impl Host {
                         CleanupEvidence::Uncertain(CleanupReason::EvidenceStoreFailure)
                     }
                 };
-                self.capacity.settle(anchor_id, &evidence);
+                settle(&self.capacity, &self.anchor_dir, anchor_id, &evidence);
                 Some(evidence)
             }
             // An intent with no verified identity cannot be proved absent.
@@ -1308,7 +1311,9 @@ impl Host {
         .await
         {
             Ok(CommitOutcome::Committed(())) => {
-                self.capacity.settle(
+                settle(
+                    &self.capacity,
+                    &self.anchor_dir,
                     &record.intent.anchor_id,
                     &CleanupEvidence::GroupAbsent(proof),
                 );
@@ -1592,6 +1597,7 @@ impl Host {
             stop,
             capacity: self.capacity.clone(),
             uncertain: self.uncertain.clone(),
+            anchor_dir: self.anchor_dir.clone(),
         };
         self.track_control(&control, sender);
         Ok(AcquiredProcess {
@@ -1681,6 +1687,7 @@ impl Host {
                     stop: tracked.stop,
                     capacity: self.capacity.clone(),
                     uncertain: self.uncertain.clone(),
+                    anchor_dir: self.anchor_dir.clone(),
                 };
                 let close = control
                     .close(CloseRequest {
@@ -1854,7 +1861,7 @@ impl Host {
             let generation = record.intent.generation.clone();
             let owner = record.intent.owner.clone();
             let cleanup = self.recover_one(record, deadline).await?;
-            self.capacity.settle(&anchor_id, &cleanup);
+            settle(&self.capacity, &self.anchor_dir, &anchor_id, &cleanup);
             let forced = self
                 .tasks
                 .lock()
@@ -2120,7 +2127,7 @@ impl ProcessControl {
                 ),
             ),
         };
-        self.capacity.settle(&self.anchor_id, &cleanup);
+        settle(&self.capacity, &self.anchor_dir, &self.anchor_id, &cleanup);
         // The anchor repeats `stopped_live` on every Stop; an earlier early
         // stop's reply counts too (design §6.8 [r5.4]).
         let forced = forced || self.stop.forced.load(Ordering::Acquire);
@@ -2250,6 +2257,44 @@ fn open_stderr(path: &std::path::Path) -> io::Result<fs::File> {
 /// The anchor socket of `anchor_id` (runtime §6.1 `anchors/<anchor-id>.sock`).
 fn anchor_socket(anchor_dir: &std::path::Path, anchor_id: &str) -> PathBuf {
     anchor_dir.join(format!("{anchor_id}.sock"))
+}
+
+/// Settles `anchor_id`'s group in the ledger ([`Capacity::settle`]) and,
+/// once its absence is committed, removes its socket (bead via-c30): an
+/// armed anchor ends by its own group KILL and never unlinks it. Only a
+/// proved-absent anchor's socket is removed; nothing is swept by name.
+fn settle(
+    capacity: &Capacity,
+    anchor_dir: &std::path::Path,
+    anchor_id: &str,
+    cleanup: &CleanupEvidence,
+) {
+    capacity.settle(anchor_id, cleanup);
+    if matches!(cleanup, CleanupEvidence::GroupAbsent(_)) {
+        remove_anchor_socket(anchor_dir, anchor_id);
+    }
+}
+
+/// Removes a proved-absent anchor's socket, if it is still there. The id
+/// comes from the journal: only one of Host's own fixed-length hex ids
+/// names a path, and only a socket there is removed.
+fn remove_anchor_socket(anchor_dir: &std::path::Path, anchor_id: &str) {
+    if anchor_id.len() != linux::RANDOM_HEX_LEN
+        || !anchor_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return;
+    }
+    let path = anchor_socket(anchor_dir, anchor_id);
+    if fs::symlink_metadata(&path)
+        .is_ok_and(|metadata| std::os::unix::fs::FileTypeExt::is_socket(&metadata.file_type()))
+    {
+        // Best effort: a socket left behind only refuses connections, and
+        // its anchor is gone; the next proof of it (startup reconciliation)
+        // tries again.
+        let _ = fs::remove_file(&path);
+    }
 }
 
 /// Every anchor socket has the same length, its id being

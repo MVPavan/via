@@ -713,6 +713,49 @@ fn s1_config_deep_runtime_dir_is_refused_at_start() -> TestResult {
     report.require_pass()
 }
 
+/// Bead via-c30: after three turns, each on its own anchor, the daemon's
+/// anchor directory holds no socket once their groups are proved absent.
+/// Before the fix every armed anchor left its `*.sock`.
+#[test]
+fn s1_host_turns_leave_no_anchor_sockets() -> TestResult {
+    let prompts = ["first", "second", "third"];
+    let fixture =
+        json!({"scripts": prompts.iter().map(|prompt| script(prompt, &[])).collect::<Vec<_>>()});
+    let setup = Setup::new(&fixture)?;
+    let evidence = setup.evidence("s1_host_anchor_sockets")?;
+    let report = run_scenario(
+        evidence,
+        |evidence| {
+            let _daemon = setup.start(evidence)?;
+            for prompt in prompts {
+                setup.one_turn(evidence, prompt)?;
+            }
+            let anchors = setup.sandbox.runtime.join("anchors");
+            let sockets = || -> Result<Vec<String>, ScenarioError> {
+                let mut names = Vec::new();
+                for entry in fs::read_dir(&anchors).map_err(infra)? {
+                    let name = entry.map_err(infra)?.file_name();
+                    let name = name.to_string_lossy();
+                    if Path::new(&*name).extension() == Some("sock".as_ref()) {
+                        names.push(name.into_owned());
+                    }
+                }
+                Ok(names)
+            };
+            let settled = wait_until("anchor socket removal", Duration::from_secs(5), || {
+                Ok(sockets()?.is_empty())
+            });
+            let left = sockets()?;
+            evidence
+                .write("anchor_sockets.json", json!(left).to_string().as_bytes())
+                .map_err(infra)?;
+            settled.map_err(|_| failure(format!("anchor sockets left after 3 turns: {left:?}")))
+        },
+        |evidence| setup.collect(evidence),
+    );
+    report.require_pass()
+}
+
 // ------------------------------------------------------------- daemon log
 
 /// Design §7.6, §13.2 [t4r16.7.1]: an invalid `daemon.json` is reported by

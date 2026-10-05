@@ -1075,7 +1075,11 @@ contention exits 75; a `store.lock` conflict exits 4. The CLI's
 auto-start retries a 75 exit within a 15 s startup budget and shows the
 daemon's startup stderr for other failures (amendment A3 in the Task 3
 design). Shutdown retains §5/§6 flush/join then lock
-release order. Do not bulk-delete anchor sockets at startup.
+release order. Do not bulk-delete anchor sockets at startup. Host removes
+an anchor's socket once that group's absence is committed (an armed anchor
+ends by its own group KILL and cannot unlink it), and startup reconciliation
+does the same for a socket an earlier daemon left whose anchor's absence is
+committed; a socket with no such proof is never touched.
 
 Default paths still form one per-user daemon. Explicit state/runtime pairs
 provide test isolation or relocate that single ordinary daemon; clients
