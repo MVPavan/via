@@ -198,6 +198,7 @@ fn launch(
         } else {
             Continue::New(&expected)
         },
+        mode: adapter.mode,
         inherit,
         extra_write_dirs,
         instructions: driver.spec.instructions.as_deref(),
@@ -229,7 +230,7 @@ fn launch(
             schema,
             mcp: inherit.get(Category::McpServers) != InheritState::Off,
         },
-        recipe: recipe_key(inherit, schema),
+        recipe: recipe_key(adapter.mode, inherit, schema),
     })
 }
 

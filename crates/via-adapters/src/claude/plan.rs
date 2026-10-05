@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 
 use super::{ClaudeAdapter, launch};
 use crate::capabilities::{BoundMode, Capabilities, ParamSupport, Support, UsageSupport, Verbs};
+use crate::config::ClaudeMode;
 use crate::harness::Harness;
 use crate::plan::{
     Bound, CatalogModel, Category, CategoryDecl, DescribeRequest, Inherit, InheritState,
@@ -180,7 +181,7 @@ impl ClaudeAdapter {
         now: std::time::Instant,
     ) -> (Option<String>, VersionStatus) {
         let version = self.instances.last_version(harness.name(), &self.binary);
-        let recipe = launch::recipe_key(requested, schema);
+        let recipe = launch::recipe_key(self.mode, requested, schema);
         let status = if self.instances.refusal(&self.binary, &recipe, now).is_some() {
             VersionStatus::Refused
         } else if version
@@ -287,7 +288,7 @@ impl ClaudeAdapter {
                 .instances
                 .refusal(
                     &self.binary,
-                    &launch::recipe_key(inherit, turn.output_schema),
+                    &launch::recipe_key(self.mode, inherit, turn.output_schema),
                     now,
                 )
                 .is_some()
@@ -341,6 +342,8 @@ impl ClaudeAdapter {
         let recipe = launch::Recipe {
             model: &model,
             session: launch::Continue::New(&session),
+            // The longer argv, whatever the session's mode.
+            mode: ClaudeMode::Restricted,
             // OD2's default requests MCP servers off: the switch is passed.
             inherit: turn.inherit.unwrap_or(Inherit::OD2_DEFAULT),
             extra_write_dirs,
@@ -653,11 +656,12 @@ mod tests {
             binary.clone(),
             instances.clone(),
             &crate::config::BootstrapEnv::from_vars::<_, &str, &str>([]),
+            ClaudeMode::Unrestricted,
         );
         let requested = Inherit::OD2_DEFAULT;
         instances.record_refusal(
             &binary,
-            launch::recipe_key(requested, true),
+            launch::recipe_key(ClaudeMode::Unrestricted, requested, true),
             crate::instance::Incompatibility::ReadbackDiffers("tools"),
             std::time::Instant::now(),
         );
@@ -688,6 +692,7 @@ mod tests {
             binary.clone(),
             instances.clone(),
             &crate::config::BootstrapEnv::from_vars::<_, &str, &str>([]),
+            ClaudeMode::Unrestricted,
         );
         (adapter, instances, binary)
     }
@@ -712,6 +717,7 @@ mod tests {
                 ("PATH", "/usr/bin:/bin"),
                 ("LANG", "C.UTF-8"),
             ]),
+            ClaudeMode::Unrestricted,
         );
         let cwd = std::path::Path::new("/work/project");
         let model = adapter.resolve(None);
@@ -754,6 +760,8 @@ mod tests {
             let recipe = launch::Recipe {
                 model: &model,
                 session: launch::Continue::New(&session),
+                // The longer argv, as the frame check counts it.
+                mode: ClaudeMode::Restricted,
                 inherit: Inherit::OD2_DEFAULT,
                 extra_write_dirs: &[],
                 instructions: Some(&text),
@@ -798,6 +806,7 @@ mod tests {
             dir.path().join("claude"),
             std::sync::Arc::new(crate::instance::InstanceCache::default()),
             &crate::config::BootstrapEnv::from_vars([("PATH", "/usr/bin:/bin")]),
+            ClaudeMode::Unrestricted,
         );
         let cwd = std::path::Path::new("/work/project");
         let model = adapter.resolve(None);
@@ -841,6 +850,7 @@ mod tests {
         let recipe = launch::Recipe {
             model: &model,
             session: launch::Continue::New(&session),
+            mode: ClaudeMode::Restricted,
             inherit: Inherit::OD2_DEFAULT,
             extra_write_dirs: &[],
             instructions: Some(""),
@@ -877,7 +887,7 @@ mod tests {
         let written = std::time::Instant::now();
         instances.record_refusal(
             &binary,
-            launch::recipe_key(Inherit::OD2_DEFAULT, false),
+            launch::recipe_key(ClaudeMode::Unrestricted, Inherit::OD2_DEFAULT, false),
             crate::instance::Incompatibility::FeatureAbsent("interrupt_receipt_v1"),
             written,
         );
@@ -933,7 +943,7 @@ mod tests {
         let written = std::time::Instant::now();
         instances.record_refusal(
             &binary,
-            launch::recipe_key(Inherit::OD2_DEFAULT, false),
+            launch::recipe_key(ClaudeMode::Unrestricted, Inherit::OD2_DEFAULT, false),
             crate::instance::Incompatibility::FeatureAbsent("interrupt_receipt_v1"),
             written,
         );
@@ -977,7 +987,7 @@ mod tests {
         instances.record_version(harness.name(), &other, "2.1.290".to_owned());
         instances.record_refusal(
             &other,
-            launch::recipe_key(Inherit::OD2_DEFAULT, false),
+            launch::recipe_key(ClaudeMode::Unrestricted, Inherit::OD2_DEFAULT, false),
             crate::instance::Incompatibility::FeatureAbsent("interrupt_receipt_v1"),
             now,
         );

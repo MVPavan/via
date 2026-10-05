@@ -859,7 +859,8 @@ enum Launch<'a> {
     Resume(&'a str),
 }
 
-/// The recipe's argv (packet §4), with `--strict-mcp-config` while MCP
+/// The recipe's argv (packet §4) in the default mode, without
+/// `--restricted` (owner, 2026-10-05), with `--strict-mcp-config` while MCP
 /// servers are requested off (OD2's default).
 fn argv(launch: Launch<'_>, mcp_off: bool) -> Value {
     let mut argv = vec![
@@ -877,7 +878,6 @@ fn argv(launch: Launch<'_>, mcp_off: bool) -> Value {
         Launch::NewAs(id) => [json!("--session-id"), json!(id)],
         Launch::Resume(id) => [json!("--resume"), json!(id)],
     });
-    argv.push(json!("--restricted"));
     if mcp_off {
         argv.push(json!("--strict-mcp-config"));
     }
@@ -894,6 +894,20 @@ fn argv(launch: Launch<'_>, mcp_off: bool) -> Value {
         argv.push(json!(arg));
     }
     json!(argv)
+}
+
+/// `argv` with `--restricted` after the session, as `harnesses.claude.restricted`
+/// launches.
+fn restricted(recipe: &Value) -> Value {
+    let mut flags = recipe.as_array().cloned().unwrap_or_default();
+    flags.insert(10, json!("--restricted"));
+    Value::Array(flags)
+}
+
+/// A lifetime whose argv passes `--restricted`.
+fn restricted_launch(mut lifetime: Value) -> Value {
+    lifetime["argv"] = restricted(&lifetime["argv"]);
+    lifetime
 }
 
 /// The session ID a launch's lines carry: the capture for a new one.
@@ -1646,13 +1660,14 @@ fn claude_recovery_no_submit_survivor() -> TestResult {
 
 /// S-LAUNCH end to end (adapter design §5.4, runtime §8): `daemon.json`'s
 /// `harnesses.claude` is read once, at daemon start. A change written
-/// while the daemon runs (another binary, MCP servers inherited) does not
-/// reach a session spawned on that daemon: it still runs the old binary
-/// with `--strict-mcp-config`. After the restart a new session runs the
-/// new binary with MCP servers on; a session spawned before it runs the
-/// new binary too (the binary is the daemon's, not frozen) but keeps its
-/// frozen inheritance, so `--strict-mcp-config` stays. Each replay pins
-/// its argv, so the wrong binary or recipe fails its launch.
+/// while the daemon runs (another binary, MCP servers inherited, the
+/// restricted mode) does not reach a session spawned on that daemon: it
+/// still runs the old binary with `--strict-mcp-config` and without
+/// `--restricted`. After the restart a new session runs the new binary
+/// with MCP servers on and `--restricted`; a session spawned before it
+/// runs the new binary too (the binary is the daemon's, not frozen) but
+/// keeps its frozen inheritance, so `--strict-mcp-config` stays. Each
+/// replay pins its argv, so the wrong binary or recipe fails its launch.
 #[test]
 fn claude_s_launch_config_applies_after_restart() -> TestResult {
     scenario("claude_s_launch_config_after_restart", |d, evidence| {
@@ -1678,7 +1693,7 @@ fn claude_s_launch_config_applies_after_restart() -> TestResult {
             format!("the old session's first turn: {envelope}")
         })?;
         d.config(&json!({"harnesses":{"claude":{"binary":next,
-            "inherit":{"mcp_servers":true}}}}))
+            "inherit":{"mcp_servers":true},"restricted":true}}}))
             .map_err(infra)?;
         let unchanged = session_of(&d.spawn(evidence, "spawn-unchanged", &ask("TWO"), &[])?)?;
         let envelope = d.wait(evidence, &format!("{unchanged}/1"))?;
@@ -1689,8 +1704,8 @@ fn claude_s_launch_config_applies_after_restart() -> TestResult {
         d.replay_for(
             &next,
             &[
-                completing(Launch::New, false, "THREE", 0.001),
-                completing(Launch::Resume(&uuid), true, "FOUR", 0.002),
+                restricted_launch(completing(Launch::New, false, "THREE", 0.001)),
+                restricted_launch(completing(Launch::Resume(&uuid), true, "FOUR", 0.002)),
             ],
         )?;
         let _daemon = Daemon::start(d, evidence, "final")?;

@@ -145,7 +145,7 @@ pub enum HarnessesRule {
     /// `binary` is not an absolute path free of `..` (runtime §6.1's rule).
     #[error("must be an absolute path without `..`")]
     Binary,
-    /// An `inherit` switch is not a boolean.
+    /// An `inherit` switch or `restricted` is not a boolean.
     #[error("must be a boolean")]
     NotBoolean,
 }
@@ -188,17 +188,32 @@ impl fmt::Debug for FakeFixture {
     }
 }
 
+/// How Claude Code is launched: `harnesses.claude.restricted` (owner,
+/// 2026-10-05; vendor packet §4). The other harnesses have no such key.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ClaudeMode {
+    /// Without `--restricted`, the default: Claude loads the user's own
+    /// configuration (instruction files, hooks, plugins, skills, agents,
+    /// auto-memory) as the user's normal Claude does.
+    #[default]
+    Unrestricted,
+    /// With `--restricted`: none of that, built-ins only.
+    Restricted,
+}
+
 /// One vendor harness's `daemon.json` settings (design §5.4).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HarnessConfig {
     binary: Option<PathBuf>,
     inherit: Inherit,
+    claude_mode: ClaudeMode,
 }
 
 /// A harness with no settings: a `PATH` lookup and the OD2 default.
 static DEFAULT_HARNESS: HarnessConfig = HarnessConfig {
     binary: None,
     inherit: Inherit::OD2_DEFAULT,
+    claude_mode: ClaudeMode::Unrestricted,
 };
 
 impl HarnessConfig {
@@ -210,6 +225,11 @@ impl HarnessConfig {
     /// The requested inherited-configuration states.
     pub fn inherit(&self) -> Inherit {
         self.inherit
+    }
+
+    /// Claude Code's launch mode; the default for every other harness.
+    pub fn claude_mode(&self) -> ClaudeMode {
+        self.claude_mode
     }
 }
 
@@ -327,7 +347,8 @@ impl AdapterConfig {
 /// Parses `harnesses` (runtime §8, design §5.4): keys are [`HARNESSES`]
 /// names; per harness only `binary` (an absolute path without `..`, never
 /// expanded) and `inherit` (the six category booleans, the OD2 default for
-/// each missing one). No key may repeat within its object. Pure: no I/O.
+/// each missing one), and for Claude alone `restricted` (a boolean,
+/// default `false`). No key may repeat within its object. Pure: no I/O.
 fn parse_harnesses(raw: &RawValue) -> Result<Vec<HarnessConfig>, HarnessesError> {
     let mut harnesses = vec![DEFAULT_HARNESS.clone(); HARNESSES.len()];
     for (name, entry) in members(raw, "harnesses")? {
@@ -341,6 +362,13 @@ fn parse_harnesses(raw: &RawValue) -> Result<Vec<HarnessConfig>, HarnessesError>
             match member.as_str() {
                 "binary" => config.binary = Some(binary(&value, &key)?),
                 "inherit" => config.inherit = parse_inherit(&value, &key)?,
+                "restricted" if name == crate::claude::HARNESS => {
+                    config.claude_mode = if boolean(&value, &key)? {
+                        ClaudeMode::Restricted
+                    } else {
+                        ClaudeMode::Unrestricted
+                    };
+                }
                 _ => return Err(invalid(&key, HarnessesRule::UnknownKey)),
             }
         }
@@ -447,9 +475,7 @@ fn parse_inherit(value: &RawValue, key: &str) -> Result<Inherit, HarnessesError>
         let Ok(category) = serde_json::from_value::<Category>(Value::String(name)) else {
             return Err(invalid(&key, HarnessesRule::UnknownKey));
         };
-        let Ok(on) = serde_json::from_str::<bool>(value.get()) else {
-            return Err(invalid(&key, HarnessesRule::NotBoolean));
-        };
+        let on = boolean(&value, &key)?;
         states.set(
             category,
             if on {
@@ -460,6 +486,11 @@ fn parse_inherit(value: &RawValue, key: &str) -> Result<Inherit, HarnessesError>
         );
     }
     Ok(states)
+}
+
+/// A boolean member: `true` or `false`, never `null`.
+fn boolean(value: &RawValue, key: &str) -> Result<bool, HarnessesError> {
+    serde_json::from_str::<bool>(value.get()).map_err(|_| invalid(key, HarnessesRule::NotBoolean))
 }
 
 /// The fixture checks of runtime §11.1.

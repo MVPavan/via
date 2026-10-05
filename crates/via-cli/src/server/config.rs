@@ -460,6 +460,14 @@ mod tests {
                 r#"{"harnesses":{"claude":{"inherit":{"hooks":true,"hooks":false}}}}"#,
                 "harnesses.claude.inherit.hooks: duplicate key",
             ),
+            (
+                r#"{"harnesses":{"claude":{"restricted":1}}}"#,
+                "harnesses.claude.restricted: must be a boolean",
+            ),
+            (
+                r#"{"harnesses":{"codex":{"restricted":true}}}"#,
+                "harnesses.codex.restricted: unknown key",
+            ),
         ];
         for (text, message) in cases {
             assert_eq!(

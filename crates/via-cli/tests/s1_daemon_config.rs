@@ -461,7 +461,18 @@ fn s1_config_is_read_at_start_validated_and_reported() -> TestResult {
 
             let runtime = &setup.sandbox.runtime;
             let state = &setup.sandbox.state;
-            let cases: [(&str, &str, &str); 16] = [
+            let cases: [(&str, &str, &str); 18] = [
+                // Claude's `--restricted` switch (owner, 2026-10-05).
+                (
+                    r#"{"harnesses":{"claude":{"restricted":"yes"}}}"#,
+                    "harnesses.claude.restricted",
+                    "must be a boolean",
+                ),
+                (
+                    r#"{"harnesses":{"codex":{"restricted":true}}}"#,
+                    "harnesses.codex.restricted",
+                    "unknown key",
+                ),
                 // The pool's old name (owner, 2026-10-05).
                 (
                     r#"{"connections":{"limit":4}}"#,

@@ -154,13 +154,22 @@ full-bound baseline is:
 ```text
 claude -p --input-format stream-json --output-format stream-json --verbose
   --model MODEL --session-id UUID
-  --restricted --strict-mcp-config
+  [--restricted] --strict-mcp-config
   --permission-mode dontAsk --permission-prompts none
   --tools Read,Write,Edit,Glob,Grep,Bash
   --allowedTools Read,Write,Edit,Glob,Grep,Bash
 ```
 
-For turn 2 onward replace `--session-id UUID` with `--resume UUID`. This is a
+For turn 2 onward replace `--session-id UUID` with `--resume UUID`.
+`--restricted` is passed only when `daemon.json` sets
+`harnesses.claude.restricted: true` (owner, 2026-10-05; the default is
+`false`). Without it (the default), Claude loads what the user's normal
+Claude loads: user, project and local settings files, instruction files
+(CLAUDE.md and the files they import), the user's hooks, plugins, skills and
+agents, and auto-memory. With it, Claude ignores the user, project and local
+settings files and loads built-ins only (help 2.1.289; states in the
+inherited-configuration table below). `--strict-mcp-config` and VIA's MCP
+handling are the same in both modes. This is a
 **proposed combination**, not a verbatim qualified probe: probes exercised its
 components with narrower tool lists. Explicit Bash enables general command
 execution in the unrestricted `full` bound. Restricted file tools may impose

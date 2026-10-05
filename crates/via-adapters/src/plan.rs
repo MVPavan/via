@@ -738,11 +738,17 @@ impl AdapterSet {
                 config.env().var("PATH"),
             )
         };
+        let claude_mode = HARNESSES
+            .iter()
+            .find(|row| row.name == claude::HARNESS)
+            .map(|row| config.harness(row).claude_mode())
+            .unwrap_or_default();
         let claude = binary(claude::HARNESS).map(|binary| {
             Arc::new(ClaudeAdapter::new(
                 binary,
                 Arc::clone(&instances),
                 config.env(),
+                claude_mode,
             ))
         });
         let codex = binary(codex::HARNESS).map(|binary| {

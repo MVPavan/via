@@ -14,9 +14,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::value::RawValue;
 use via_adapters::{
-    AdapterConfig, BOOTSTRAP_ENV, BootstrapEnv, Category, ConfigError, HARNESSES, Harness,
-    HarnessSettings, HarnessesError, HarnessesRule, Incompatibility, Inherit, InheritState,
-    InstanceCache, VERSIONS_KEPT, resolve_binary,
+    AdapterConfig, BOOTSTRAP_ENV, BootstrapEnv, Category, ClaudeMode, ConfigError, HARNESSES,
+    Harness, HarnessSettings, HarnessesError, HarnessesRule, Incompatibility, Inherit,
+    InheritState, InstanceCache, VERSIONS_KEPT, resolve_binary,
 };
 
 fn raw(text: &str) -> Box<RawValue> {
@@ -216,12 +216,42 @@ fn refusal_cases() -> Vec<(&'static str, &'static str, HarnessesRule)> {
     ]
 }
 
+/// `restricted` is Claude's alone and a boolean (owner, 2026-10-05).
+fn restricted_refusal_cases() -> Vec<(&'static str, &'static str, HarnessesRule)> {
+    use HarnessesRule::{DuplicateKey, NotBoolean, UnknownKey};
+    vec![
+        (
+            r#"{"claude":{"restricted":"yes"}}"#,
+            "harnesses.claude.restricted",
+            NotBoolean,
+        ),
+        (
+            r#"{"claude":{"restricted":null}}"#,
+            "harnesses.claude.restricted",
+            NotBoolean,
+        ),
+        (
+            r#"{"claude":{"restricted":true,"restricted":false}}"#,
+            "harnesses.claude.restricted",
+            DuplicateKey,
+        ),
+        (
+            r#"{"codex":{"restricted":true}}"#,
+            "harnesses.codex.restricted",
+            UnknownKey,
+        ),
+    ]
+}
+
 /// Runtime §8, design §5.4: each invalid `harnesses` refuses with its
 /// named error, from `load` and from the pure `HarnessSettings::parse` alike; a
 /// key repeated at any level is refused.
 #[test]
 fn s_launch_harnesses_refusals() {
-    for (text, key, rule) in refusal_cases() {
+    for (text, key, rule) in refusal_cases()
+        .into_iter()
+        .chain(restricted_refusal_cases())
+    {
         let expected = HarnessesError {
             key: key.to_owned(),
             rule,
@@ -271,10 +301,24 @@ fn s_launch_harnesses_valid() {
         assert_eq!(settings.binary(), None, "{name}");
     }
     assert_eq!(config.inherit(Harness::Fake), Inherit::OD2_DEFAULT);
+    // `restricted` defaults to false (owner, 2026-10-05).
+    assert_eq!(claude.claude_mode(), ClaudeMode::Unrestricted);
+    for (text, mode) in [
+        (r#"{"claude":{"restricted":true}}"#, ClaudeMode::Restricted),
+        (
+            r#"{"claude":{"restricted":false}}"#,
+            ClaudeMode::Unrestricted,
+        ),
+    ] {
+        let config = load(text).unwrap();
+        let claude = config.harness(HARNESSES.iter().find(|r| r.name == "claude").unwrap());
+        assert_eq!(claude.claude_mode(), mode, "{text}");
+    }
     // No section at all: every harness has the defaults.
     let config = AdapterConfig::load(none(), None).unwrap();
     for row in HARNESSES {
         assert_eq!(config.harness(row).binary(), None);
+        assert_eq!(config.harness(row).claude_mode(), ClaudeMode::Unrestricted);
         assert_eq!(config.inherit(Harness::Vendor(row)), Inherit::OD2_DEFAULT);
     }
 }

@@ -11,7 +11,7 @@ use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
 
 use super::ClaudeAdapter;
-use crate::config::BootstrapEnv;
+use crate::config::{BootstrapEnv, ClaudeMode};
 use crate::plan::{Category, Inherit, InheritState};
 use crate::{EnvAllowList, PrivateProcessSpec, ProcessOwner, SessionId};
 
@@ -73,6 +73,8 @@ pub(crate) enum Continue<'a> {
 pub(crate) struct Recipe<'a> {
     pub(crate) model: &'a str,
     pub(crate) session: Continue<'a>,
+    /// Whether the launch passes `--restricted`.
+    pub(crate) mode: ClaudeMode,
     /// The inherited-configuration settings requested at spawn.
     pub(crate) inherit: Inherit,
     pub(crate) extra_write_dirs: &'a [PathBuf],
@@ -90,10 +92,14 @@ pub(crate) enum RecipeError {
 }
 
 /// The fixed flags after the session's identity, through the tool lists:
-/// `--restricted`, the MCP switch when MCP servers are requested off, the
+/// `--restricted` in the restricted mode (owner, 2026-10-05: off by
+/// default), the MCP switch when MCP servers are requested off, the
 /// never-ask pair and the `full` tool set.
-fn fixed(inherit: Inherit) -> Vec<&'static str> {
-    let mut flags = vec!["--restricted"];
+fn fixed(mode: ClaudeMode, inherit: Inherit) -> Vec<&'static str> {
+    let mut flags = Vec::new();
+    if mode == ClaudeMode::Restricted {
+        flags.push("--restricted");
+    }
     if inherit.get(Category::McpServers) == InheritState::Off {
         flags.push("--strict-mcp-config");
     }
@@ -113,10 +119,11 @@ fn fixed(inherit: Inherit) -> Vec<&'static str> {
 /// The handshake-refusal cache's recipe key (C2 §5), for insertion and
 /// lookup alike: every launch input the handshake check reads. That is
 /// the fixed flags (the MCP switch, which decides whether `mcp__` tools
-/// may appear, included) and the schema mode, which adds the
+/// may appear, and `--restricted`, which decides whether the user's
+/// configuration loads, included) and the schema mode, which adds the
 /// `StructuredOutput` tool (review r1 #8).
-pub(crate) fn recipe_key(inherit: Inherit, schema: bool) -> String {
-    let mut key = fixed(inherit).join(" ");
+pub(crate) fn recipe_key(mode: ClaudeMode, inherit: Inherit, schema: bool) -> String {
+    let mut key = fixed(mode, inherit).join(" ");
     if schema {
         key.push_str(" --json-schema");
     }
@@ -146,7 +153,11 @@ pub(crate) fn argv(recipe: &Recipe<'_>) -> Result<Vec<OsString>, RecipeError> {
         Continue::Resume(id) => ("--resume", id),
     };
     args.extend([flag.into(), id.into()]);
-    args.extend(fixed(recipe.inherit).into_iter().map(OsString::from));
+    args.extend(
+        fixed(recipe.mode, recipe.inherit)
+            .into_iter()
+            .map(OsString::from),
+    );
     for dir in recipe.extra_write_dirs {
         args.extend(["--add-dir".into(), dir.as_os_str().to_os_string()]);
     }
@@ -279,9 +290,11 @@ mod tests {
                     .transpose()
                     .unwrap();
                 let captured = "CAPTURED";
+                // The fixtures were recorded with `--restricted`.
                 let recipe = Recipe {
                     model: session["model"].as_str().unwrap(),
                     session: resume.map_or(Continue::New(captured), Continue::Resume),
+                    mode: ClaudeMode::Restricted,
                     inherit: Inherit::OD2_DEFAULT,
                     extra_write_dirs: &[],
                     instructions: session["instructions"].as_str(),
@@ -316,21 +329,23 @@ mod tests {
     /// it; later options follow in their fixed order.
     #[test]
     fn switches_and_options_follow_the_recipe_order() {
+        let restricted = ClaudeMode::Restricted;
         let mut on = Inherit::OD2_DEFAULT;
         on.set(Category::McpServers, InheritState::On);
         assert_ne!(
-            recipe_key(on, false),
-            recipe_key(Inherit::OD2_DEFAULT, false)
+            recipe_key(restricted, on, false),
+            recipe_key(restricted, Inherit::OD2_DEFAULT, false)
         );
         assert_ne!(
-            recipe_key(Inherit::OD2_DEFAULT, true),
-            recipe_key(Inherit::OD2_DEFAULT, false)
+            recipe_key(restricted, Inherit::OD2_DEFAULT, true),
+            recipe_key(restricted, Inherit::OD2_DEFAULT, false)
         );
         let schema = RawValue::from_string(r#"{"type":"object","a":1}"#.to_owned()).unwrap();
         let dirs = [PathBuf::from("/x")];
         let args = argv(&Recipe {
             model: "haiku",
             session: Continue::Resume("u"),
+            mode: restricted,
             inherit: on,
             extra_write_dirs: &dirs,
             instructions: Some("I"),
@@ -366,6 +381,48 @@ mod tests {
         );
     }
 
+    /// Owner, 2026-10-05: `--restricted` only in the restricted mode; the
+    /// default launch passes the MCP switch straight after the session.
+    /// The mode is part of the refusal cache's recipe key.
+    #[test]
+    fn restricted_only_in_the_restricted_mode() {
+        let recipe = |mode| Recipe {
+            model: "haiku",
+            session: Continue::New("u"),
+            mode,
+            inherit: Inherit::OD2_DEFAULT,
+            extra_write_dirs: &[],
+            instructions: None,
+            effort: None,
+            output_schema: None,
+            max_steps: None,
+        };
+        let flags = |mode| -> Vec<String> {
+            argv(&recipe(mode)).unwrap()[10..12]
+                .iter()
+                .map(|arg| arg.to_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(ClaudeMode::default(), ClaudeMode::Unrestricted);
+        assert_eq!(
+            flags(ClaudeMode::Unrestricted),
+            ["--strict-mcp-config", "--permission-mode"]
+        );
+        assert_eq!(
+            flags(ClaudeMode::Restricted),
+            ["--restricted", "--strict-mcp-config"]
+        );
+        assert!(
+            !argv(&recipe(ClaudeMode::Unrestricted))
+                .unwrap()
+                .contains(&OsString::from("--restricted"))
+        );
+        assert_ne!(
+            recipe_key(ClaudeMode::Unrestricted, Inherit::OD2_DEFAULT, false),
+            recipe_key(ClaudeMode::Restricted, Inherit::OD2_DEFAULT, false)
+        );
+    }
+
     /// A launch's process: the configured binary with the recipe's argv in
     /// the session's cwd and the allow-listed environment only.
     #[test]
@@ -375,6 +432,7 @@ mod tests {
             PathBuf::from("/opt/claude"),
             std::sync::Arc::default(),
             &env,
+            ClaudeMode::Unrestricted,
         );
         let owner = ProcessOwner::Turn {
             session_id: SessionId::try_from("s_7f3k9q2mzr4c").unwrap(),
@@ -383,6 +441,7 @@ mod tests {
         let recipe = Recipe {
             model: "haiku",
             session: Continue::New("u"),
+            mode: ClaudeMode::Unrestricted,
             inherit: Inherit::OD2_DEFAULT,
             extra_write_dirs: &[],
             instructions: None,

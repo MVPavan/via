@@ -158,8 +158,8 @@ pub use capabilities::{
     BoundMode, Capabilities, ParamSupport, Support, UsageSupport, Verb, VerbReq, Verbs,
 };
 pub use config::{
-    AdapterConfig, BOOTSTRAP_ENV, BootstrapEnv, ConfigError, FakeFixture, HarnessConfig,
-    HarnessSettings, HarnessesError, HarnessesRule,
+    AdapterConfig, BOOTSTRAP_ENV, BootstrapEnv, ClaudeMode, ConfigError, FakeFixture,
+    HarnessConfig, HarnessSettings, HarnessesError, HarnessesRule,
 };
 #[cfg(feature = "test-failpoints")]
 pub use driver::StandIn;
