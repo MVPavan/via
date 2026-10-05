@@ -259,6 +259,9 @@ pub struct Connection {
     end: watch::Sender<Option<ConnectionEnd>>,
     /// The idle retirement began: the end of stdout is not a failure.
     retiring: AtomicBool,
+    /// The daemon is shutting down: Host's stop ending the transport is
+    /// expected, so it writes no `via.log` line.
+    shutting_down: AtomicBool,
     /// A driver posted its close (x.3.2 X3 §5.1): the connection task
     /// applies it between two routing operations.
     closes: Notify,
@@ -460,6 +463,7 @@ impl Connection {
             failure: watch::Sender::new(None),
             end: watch::Sender::new(None),
             retiring: AtomicBool::new(false),
+            shutting_down: AtomicBool::new(false),
             closes: Notify::new(),
             epoch: watch::Sender::new(0),
         })
@@ -586,6 +590,13 @@ impl Connection {
     /// the connection as retired.
     pub fn retire(&self) {
         self.retiring.store(true, Ordering::Release);
+    }
+
+    /// Marks the daemon's shutdown begun (the registry's fence): a lost
+    /// transport or server from now on is Host's stop, not news for
+    /// `via.log`.
+    pub(super) fn shutting_down(&self) {
+        self.shutting_down.store(true, Ordering::Release);
     }
 
     /// Links a turn to the connection's server (runtime §6).
@@ -1405,8 +1416,14 @@ fn disposition(cause: ConnectionFailure, report: &WireCloseReport) -> Connection
 /// (codex-server.md item 5; runtime §6.2): the server ID, the cause and
 /// the note naming the server folder's `undecoded.bin`, or why it was not
 /// saved. Only VIA's own text: never a vendor byte. Read after the reader
-/// finished, so a save it began is noted.
+/// finished, so a save it began is noted. The transport or server lost
+/// after the daemon's shutdown began is Host's stop: no line.
 fn log_failure(connection: &Connection, cause: LossCause) {
+    if connection.shutting_down.load(Ordering::Acquire)
+        && matches!(cause, LossCause::TransportLost | LossCause::ServerLost)
+    {
+        return;
+    }
     let undecoded = connection.stdio.take_undecoded();
     tracing::warn!(
         server = %connection.server,

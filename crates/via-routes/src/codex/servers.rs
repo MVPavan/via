@@ -882,7 +882,21 @@ impl Servers {
     /// Item 2.7 step 1: no new pin, reservation or launch; launch
     /// handshakes stop; pending work is resolved without spawning.
     pub fn fence(&self) {
-        self.registry().fenced = true;
+        {
+            let mut registry = self.registry();
+            registry.fenced = true;
+            for instance in registry.servers.values() {
+                let connection = match &instance.entry {
+                    Entry::Live { connection, .. } | Entry::Lost { connection } => Some(connection),
+                    Entry::Launching { connection, .. } | Entry::Retiring { connection } => {
+                        connection.as_ref()
+                    }
+                };
+                if let Some(connection) = connection {
+                    connection.shutting_down();
+                }
+            }
+        }
         self.fence.send_replace(true);
         self.bump();
         self.work.notify_one();
@@ -908,6 +922,9 @@ impl Servers {
         // Its process started: the launch counts now, in the order the
         // processes started (a stale one's too), never at its reservation.
         registry.launches = registry.launches.saturating_add(1);
+        if registry.fenced {
+            opened.shutting_down();
+        }
         match registry.servers.get_mut(server) {
             Some(Instance {
                 entry: Entry::Launching { connection, .. },
