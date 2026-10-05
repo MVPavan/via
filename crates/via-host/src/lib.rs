@@ -7,6 +7,7 @@ mod anchor;
 mod host;
 mod linux;
 mod protocol;
+mod stderr_log;
 
 pub use anchor::run_anchor_from_args;
 pub(crate) use host::monotonic_remaining;
@@ -57,6 +58,17 @@ impl EnvAllowList {
     pub fn entries(&self) -> &[(OsString, OsString)] {
         &self.entries
     }
+}
+
+/// The bounded cause of a Host or launch failure, carried to the turn it
+/// ended (bead via-23b): the step that failed and, for an operating-system
+/// error, its kind. It holds no vendor text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LaunchCause {
+    /// The failed step, such as `connect anchor socket`.
+    pub step: &'static str,
+    /// The operating-system error's kind, when the step failed with one.
+    pub kind: Option<std::io::ErrorKind>,
 }
 
 /// Type-erased capacity a caller hands Host with a launch (T2-D, runtime §8):

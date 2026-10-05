@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use via_routes::{
-    Deadline, DecodeWatermark, MAX_OBSERVATION_BYTES, ReprobeReport, RouteError, RouteFailure,
-    StopCause, StopOrder, StopWatch, StoreFailure, TurnNumber,
+    Deadline, DecodeWatermark, LaunchCause, MAX_OBSERVATION_BYTES, ReprobeReport, RouteError,
+    RouteFailure, StopCause, StopOrder, StopWatch, StoreFailure, TurnNumber,
 };
 
 /// Correlates a start reply with its acceptance observation within one turn.

@@ -1044,9 +1044,7 @@ impl Engine {
                 (&mut control, inbox),
             )
             .await;
-        let (cause, journal_uncertain) = driven.store_facts();
-        self.route_failed(slot, &mut record, cause, journal_uncertain)
-            .await;
+        self.route_facts(slot, &mut record, &driven).await;
         // Design §2 [r1.4]: from here cancel and close send no order.
         let order = slot.settle(turn);
         if let Some(order) = &order
@@ -2295,6 +2293,23 @@ impl Engine {
         }
     }
 
+    /// Route's facts of a finished execution: a Host or launch failure's
+    /// cause as the turn's durable `launch_failed` warning, whatever the
+    /// disposition (bead via-23b), then its Store failure or uncertain
+    /// journal write ([`Engine::route_failed`]). The warning goes first: a
+    /// Store failure recorded before it would refuse its write.
+    async fn route_facts(&self, slot: &Slot, record: &mut TurnRecord, driven: &Driven) {
+        if let Driven::Finished(finished) = driven
+            && let Err(AdapterError::Route(failure)) = &finished.1
+            && let Some(cause) = failure.launch.as_deref()
+        {
+            self.own_warning(record, launch_warning(*cause)).await;
+        }
+        let (cause, journal_uncertain) = driven.store_facts();
+        self.route_failed(slot, record, cause, journal_uncertain)
+            .await;
+    }
+
     /// Commits an adapter-reported `warning` event attributed to `(turn,
     /// late)` (C1 §6.1), within C1 §5's caps: `message` cut to 1 KiB
     /// encoded, `data` over 4 KiB encoded left out. Its sequence once it
@@ -3327,6 +3342,31 @@ fn denial_body(denial: &Denial) -> EventBody {
         reason: denial.reason.clone(),
     }
 }
+
+/// The `launch_failed` warning of a turn a Host or launch failure ended
+/// (bead via-23b, C1 §6.1): the failed step and the operating-system
+/// error's kind, never vendor text. Not one of the envelope's codes, it is
+/// a durable event only.
+fn launch_warning(cause: via_adapters::LaunchCause) -> via_adapters::Warning {
+    let (message, data) = match cause.kind {
+        Some(kind) => (
+            format!("{} failed: {kind}", cause.step),
+            serde_json::json!({"step": cause.step, "kind": format!("{kind:?}")}),
+        ),
+        None => (
+            format!("{} failed", cause.step),
+            serde_json::json!({"step": cause.step}),
+        ),
+    };
+    via_adapters::Warning {
+        code: LAUNCH_FAILED,
+        message,
+        data: Some(data),
+    }
+}
+
+/// C1 §6.1 `warning` code of a turn a Host or launch failure ended.
+const LAUNCH_FAILED: &str = "launch_failed";
 
 /// `vendor.request_declined`'s body for `decline` (C1 §6.1).
 fn decline_body(decline: &Decline) -> EventBody {

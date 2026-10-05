@@ -881,6 +881,7 @@ mod tests {
             journal_uncertain: false,
             acknowledged: false,
             shared: false,
+            launch: None,
         })
     }
 

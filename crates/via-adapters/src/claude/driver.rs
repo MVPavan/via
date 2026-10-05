@@ -617,6 +617,7 @@ fn failure_of(
             journal_uncertain: result.journal_uncertain,
             acknowledged,
             shared: false,
+            launch: None,
         },
         Err(failure) => RouteFailure {
             cause,

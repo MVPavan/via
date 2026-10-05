@@ -1386,6 +1386,7 @@ async fn r1_4_a_malformed_message_is_named_by_the_failure() {
             journal_uncertain: false,
             acknowledged: false,
             shared: true,
+            launch: None,
         })),
     };
     let undecoded = |end: TurnEnd| match end.outcome {

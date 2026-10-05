@@ -2109,3 +2109,193 @@ fn shutdown_link_read_failure_still_stops_groups() {
         assert!(matches!(recovery.cleanup, CleanupEvidence::GroupAbsent(_)));
     });
 }
+
+impl Fixture {
+    /// The anchor control sockets left in this fixture's anchor directory.
+    fn sockets(&self) -> Vec<String> {
+        let mut sockets: Vec<String> = fs::read_dir(self.root.join("anchors"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| std::path::Path::new(name).extension() == Some("sock".as_ref()))
+            .collect();
+        sockets.sort();
+        sockets
+    }
+}
+
+/// Bead via-c30: an armed anchor ends by its own group KILL, so it never
+/// unlinks its socket. Host removes the socket once the group's absence is
+/// committed: after three acquisitions and closes none is left, while each
+/// live anchor's socket stays until its close proves it gone.
+#[test]
+fn settled_anchors_leave_no_socket() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        for _ in 0..3 {
+            let acquired = host
+                .acquire(fixture.spec("/bin/cat", &[]), within(4))
+                .await
+                .unwrap();
+            assert_eq!(fixture.sockets().len(), 1, "the live anchor's socket");
+            let close = acquired
+                .control
+                .close(CloseRequest {
+                    mode: CloseMode::Force,
+                    deadline: within(3),
+                })
+                .await;
+            assert!(
+                matches!(close.cleanup, CleanupEvidence::GroupAbsent(_)),
+                "{close:?}"
+            );
+            assert_eq!(fixture.sockets(), Vec::<String>::new());
+        }
+    });
+}
+
+/// Bead via-c30: a socket an earlier daemon left behind is removed at
+/// startup reconciliation once its anchor's absence is proved, and only
+/// then: a socket with no journal record (here a live listener) is never
+/// touched.
+#[test]
+fn reconciliation_removes_only_proven_absent_anchor_sockets() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let earlier = fixture.host();
+        let acquired = earlier
+            .acquire(fixture.spec("/bin/cat", &[]), within(4))
+            .await
+            .unwrap();
+        let close = acquired
+            .control
+            .close(CloseRequest {
+                mode: CloseMode::Force,
+                deadline: within(3),
+            })
+            .await;
+        assert!(matches!(close.cleanup, CleanupEvidence::GroupAbsent(_)));
+        drop(acquired);
+        let anchors = fixture.root.join("anchors");
+        let records = fixture.records().await;
+        let stale = anchors.join(format!("{}.sock", records[0].intent.anchor_id));
+        // A socket left as a daemon before the fix left it: bound, then
+        // closed, so its file stays.
+        if !stale.exists() {
+            drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+        }
+        let unrelated = anchors.join(format!("{}.sock", "0".repeat(32)));
+        let live = std::os::unix::net::UnixListener::bind(&unrelated).unwrap();
+        let restarted = fixture.host();
+        let recovered = restarted
+            .recover_page(None, via_store::ANCHOR_PAGE_LIMIT, within(3))
+            .await
+            .unwrap();
+        assert!(
+            matches!(recovered[0].cleanup, CleanupEvidence::GroupAbsent(_)),
+            "{recovered:?}"
+        );
+        assert!(!stale.exists(), "the proven anchor's socket stayed");
+        assert!(unrelated.exists(), "an unrelated socket was removed");
+        drop(live);
+    });
+}
+
+const MIB: usize = 1024 * 1024;
+
+/// A vendor that writes `runs` to stderr, each `(byte, length)`, and exits.
+fn stderr_writer(fixture: &Fixture, runs: &[(char, usize)]) -> PrivateProcessSpec {
+    let mut script = String::new();
+    for (byte, length) in runs {
+        use std::fmt::Write as _;
+        write!(script, "head -c {length} /dev/zero | tr '\\0' {byte}; ").unwrap();
+    }
+    fixture.spec("/bin/sh", &["-c", &format!("{{ {script}}} >&2")])
+}
+
+/// Runs `spec` to its exit, which must come within 10 s although nothing
+/// reads its stderr but Host, then closes it and returns its `stderr.log`.
+async fn stderr_of(host: &Host, spec: PrivateProcessSpec) -> Vec<u8> {
+    let path = spec.stderr_path.clone();
+    let mut acquired = host.acquire(spec, within(4)).await.unwrap();
+    let exited = tokio::time::timeout(
+        Duration::from_secs(10),
+        acquired.exits.wait_for(Option::is_some),
+    )
+    .await;
+    assert!(matches!(exited, Ok(Ok(_))), "the stderr writer blocked");
+    let close = acquired
+        .control
+        .close(CloseRequest {
+            mode: CloseMode::Force,
+            deadline: within(3),
+        })
+        .await;
+    assert!(
+        matches!(close.cleanup, CleanupEvidence::GroupAbsent(_)),
+        "{close:?}"
+    );
+    fs::read(path).unwrap()
+}
+
+/// `head` bytes of `a`, the marker for `dropped` bytes, `tail` bytes of `c`.
+fn capped(head: usize, dropped: usize, tail: usize) -> Vec<u8> {
+    let mut expected = vec![b'a'; head];
+    expected.extend_from_slice(
+        format!("\n[via: {dropped} bytes of vendor stderr dropped]\n").as_bytes(),
+    );
+    expected.extend(std::iter::repeat_n(b'c', tail));
+    expected
+}
+
+/// Bead via-c2r: a per-turn vendor's stderr past its cap keeps exactly the
+/// first 4 MiB, one marker line with the dropped count and the last 1 MiB;
+/// the vendor writes all of it without blocking.
+#[test]
+fn a_turn_vendors_stderr_keeps_its_head_marker_and_tail() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        let spec = stderr_writer(&fixture, &[('a', 4 * MIB), ('b', 2 * MIB), ('c', MIB)]);
+        let log = stderr_of(&host, spec).await;
+        assert_eq!(log.len(), capped(4 * MIB, 2 * MIB, MIB).len());
+        assert!(
+            log == capped(4 * MIB, 2 * MIB, MIB),
+            "not head, marker and tail"
+        );
+    });
+}
+
+/// Bead via-c2r: a shared server's stderr keeps the first and the last 8 MiB.
+#[test]
+fn a_servers_stderr_keeps_its_head_marker_and_tail() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        let mut spec = stderr_writer(&fixture, &[('a', 8 * MIB), ('b', 3 * MIB), ('c', 8 * MIB)]);
+        spec.owner = server_spec(&fixture).owner;
+        let log = stderr_of(&host, spec).await;
+        assert_eq!(log.len(), capped(8 * MIB, 3 * MIB, 8 * MIB).len());
+        assert!(
+            log == capped(8 * MIB, 3 * MIB, 8 * MIB),
+            "not head, marker and tail"
+        );
+    });
+}
+
+/// Bead via-c2r: stderr within the cap is kept whole, with no marker: a
+/// short write, and one that passes the head into the tail.
+#[test]
+fn stderr_within_the_cap_is_kept_whole() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        let small = fixture.spec("/bin/sh", &["-c", "printf 'small stderr\\n' >&2"]);
+        assert_eq!(stderr_of(&host, small).await, b"small stderr\n");
+        let spec = stderr_writer(&fixture, &[('a', 4 * MIB), ('c', MIB)]);
+        let log = stderr_of(&host, spec).await;
+        let mut whole = vec![b'a'; 4 * MIB];
+        whole.extend(std::iter::repeat_n(b'c', MIB));
+        assert!(log == whole, "a 5 MiB stderr was not kept whole");
+    });
+}

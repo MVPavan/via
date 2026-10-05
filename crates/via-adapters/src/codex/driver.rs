@@ -1008,6 +1008,7 @@ impl Turn<'_> {
                 journal_uncertain,
                 acknowledged: false,
                 shared: true,
+                launch: None,
             })),
         }
     }

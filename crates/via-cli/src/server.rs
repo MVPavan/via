@@ -142,8 +142,15 @@ fn lock(path: &Path) -> Result<File, LockFailure> {
 /// The daemon: startup (design §6.1), serving and final shutdown. Returns
 /// the process exit status: 0 for a clean shutdown, 75 when another daemon
 /// holds `daemon.lock`, 78 for an invalid `daemon.json`; every other
-/// startup failure is an error (exit 4).
+/// startup failure is an error (exit 4), reported with its whole cause
+/// chain (bead via-23b).
 pub(crate) async fn serve() -> anyhow::Result<i32> {
+    serve_daemon()
+        .await
+        .map_err(|error| anyhow::anyhow!("{error:#}"))
+}
+
+async fn serve_daemon() -> anyhow::Result<i32> {
     // Task 4 design §7.6: stderr during startup, then `via.log` only.
     tracing_subscriber::fmt()
         .with_writer(|| log::Line)
@@ -193,6 +200,21 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
     log::open(&paths.state).map_err(|error| anyhow::anyhow!("open via.log: {error}"))?;
     // x.3.2 X0 item 2.5: from here a panic's line goes to `via.log` only.
     log::panic_hook();
+    let served = serve_logged(&paths, (store_lock, limits), harnesses).await;
+    if let Err(error) = &served {
+        // Bead via-23b: a startup failure is a daemon-level error.
+        log::startup_failed(error);
+    }
+    served
+}
+
+/// The daemon once `via.log` is open: the State directory's managed
+/// children, the socket, then serving.
+async fn serve_logged(
+    paths: &super::client::Paths,
+    (store_lock, limits): (StoreLock, Limits),
+    harnesses: HarnessSettings,
+) -> anyhow::Result<i32> {
     // Both locks precede every mutation of the State directory (§6.1).
     ensure_dir(&paths.runtime.join("anchors"))?;
     ensure_vendor_dir(&paths.state)?;
@@ -211,7 +233,7 @@ pub(crate) async fn serve() -> anyhow::Result<i32> {
     let served = Box::pin(serve_bound(
         listener,
         &socket,
-        &paths,
+        paths,
         (store_lock, limits),
         harnesses,
     ))
@@ -356,11 +378,10 @@ async fn open_engine(
 /// Startup's crash recovery, resumed paging bound and queued-turn handoff,
 /// before admission (C1 §7.5, design §8, §10).
 async fn recover(engine: &Engine) -> anyhow::Result<()> {
-    // Task 4 design §7.6: one warning per turn, naming it.
+    // Runtime §6.2 (bead via-23b): one count line; each turn's recovery is
+    // its own lifecycle, which the Store keeps, never `via.log`.
     let recovered = engine
-        .recover_logged(|session, turn| {
-            tracing::warn!(%session, turn = turn.get(), "recovered unfinished turn as unknown");
-        })
+        .recover()
         .await
         .map_err(|error| anyhow::anyhow!("crash recovery failed: {error}"))?;
     if recovered > 0 {

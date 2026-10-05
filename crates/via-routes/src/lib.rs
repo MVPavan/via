@@ -4,7 +4,8 @@
 use thiserror::Error;
 
 pub use via_wire::{
-    AnchorCohort, CloseRequest, Deadline, ExitReport, OutboundMessage, SendOutcome, TurnNumber,
+    AnchorCohort, CloseRequest, Deadline, ExitReport, LaunchCause, OutboundMessage, SendOutcome,
+    TurnNumber,
 };
 
 /// Task 4 design §2.2 rule 1: an ID, tool name, type tag, `stop_reason` or
@@ -217,6 +218,10 @@ pub struct RouteFailure {
     pub acknowledged: bool,
     /// The connection is a persistent server (the persistent profile).
     pub shared: bool,
+    /// The cause of the Host or launch failure that ended the turn (bead
+    /// via-23b), which Core records as the turn's `launch_failed` warning.
+    /// Boxed: it is rare, and keeps the failure small.
+    pub launch: Option<Box<LaunchCause>>,
 }
 
 /// `; <note>` when an undecoded message was kept, else nothing.

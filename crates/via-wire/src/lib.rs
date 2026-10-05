@@ -3,7 +3,7 @@
 
 pub use via_host::{
     CapacityToken, CleanupEvidence, CloseMode, CloseRequest, EnvAllowList, ExitReport, HostError,
-    PrivateProcessSpec, ProcessOwner, TurnNumber,
+    LaunchCause, PrivateProcessSpec, ProcessOwner, TurnNumber,
 };
 pub use via_store::{
     AnchorCohort, CommitOutcome, Deadline, RuntimeResources, ServerId, SessionId, StoreFailureKind,

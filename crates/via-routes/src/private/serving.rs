@@ -341,6 +341,7 @@ impl<'a, P: PrivateProtocol> Serving<'a, P> {
             journal_uncertain,
             acknowledged: false,
             shared: false,
+            launch: None,
         }
     }
 
@@ -710,6 +711,7 @@ pub(super) fn acquire_failure<P: PrivateProtocol>(
     } else {
         (error, false, None, false, false)
     };
+    let launch = cause.launch_cause();
     let cause = if matches!(cause, WireError::Host(HostError::Stopped)) {
         if force.borrow().is_some() {
             RouteError::ForceStopped { turn }
@@ -729,6 +731,7 @@ pub(super) fn acquire_failure<P: PrivateProtocol>(
         journal_uncertain,
         acknowledged: false,
         shared: false,
+        launch: launch.map(Box::new),
     }
 }
 

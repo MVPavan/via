@@ -2608,8 +2608,8 @@ fn alive(pid: u32) -> Result<bool, ScenarioError> {
 
 /// Packet §9 `claude_stream_limits`, control service under a stderr flood:
 /// beside the vendor a writer in its group floods stderr (the turn's
-/// `stderr.log`, which the operating system writes and no VIA task reads,
-/// runtime §4) without end, 256 KiB at a time. It records its pid and a
+/// `stderr.log`, which the anchor drains under its cap and no daemon task
+/// reads, runtime §4) without end, 256 KiB at a time. It records its pid and a
 /// readiness marker, then a heartbeat after every chunk. The caller stops
 /// the turn during its tool only once the writer is ready, alive and its
 /// heartbeat still advancing, so the stop lands mid-flood. The interrupt
@@ -2719,9 +2719,15 @@ fn claude_stream_limits_stderr_flood_keeps_close() -> TestResult {
 /// The sustained flood's size: twice [`RSS_BOUND_KIB`].
 const FLOOD: u64 = 64 * 1024 * 1024;
 
+/// What runtime §4's per-turn cap keeps of a flood besides its marker line:
+/// the first 4 MiB and the last 1 MiB.
+const KEPT: u64 = 5 * 1024 * 1024;
+
 /// Packet §9 `claude_stream_limits`, memory under a sustained stderr
 /// flood: before the vendor runs, its stderr receives the whole 64 MiB
-/// (`stderr.log` holds exactly that when the turn ends), then the turn
+/// (`stderr.log` holds exactly its capped first 4 MiB, the dropped-bytes
+/// marker line and its last 1 MiB when the turn ends, bead via-c2r), then
+/// the turn
 /// completes. The daemon's peak RSS stays within [`RSS_BOUND_KIB`] of its
 /// baseline, half the flood, so a daemon that held the flood in memory
 /// fails. Accepted limitation: Claude's observation-stall path (C2 A1) is
@@ -2749,9 +2755,11 @@ fn claude_stream_limits_stderr_flood_memory() -> TestResult {
         evidence
             .write("measured.json", measured.to_string().as_bytes())
             .map_err(infra)?;
+        let marker = format!("\n[via: {} bytes of vendor stderr dropped]\n", FLOOD - KEPT);
+        let capped = KEPT + marker.len() as u64;
         check(
             completed(&envelope)
-                && written == FLOOD
+                && written == capped
                 && peak.saturating_sub(baseline) < RSS_BOUND_KIB,
             || {
                 format!(

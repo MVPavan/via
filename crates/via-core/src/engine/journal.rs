@@ -711,7 +711,7 @@ pub(super) async fn commit_terminal_with(
         return Err(ApiError::RECEIPT_NOT_COMMITTED.into());
     }
     if let Some(latch) = latch {
-        latch.fail_pending();
+        latch.fail_pending_for(outcome, super::latch::FailureScope::Turn(&session, turn));
     }
     // Test builds: the latch's phase one ran, the read-back not yet.
     #[cfg(feature = "test-failpoints")]

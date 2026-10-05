@@ -1,26 +1,87 @@
 //! The daemon log `via.log` (Task 4 design §7.6, amendment A45): the
 //! daemon's own `tracing` output and its shutdown summary. During startup
 //! a line also goes to stderr, which the auto-starting CLI reads; once the
-//! daemon serves, only `via.log` is written.
+//! daemon serves, only `via.log` is written. It holds daemon warnings and
+//! errors, never a prompt or vendor output, and no per-turn lifecycle,
+//! which the Store keeps (owner, 2026-10-04).
 
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
     os::unix::fs::OpenOptionsExt,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Mutex, PoisonError,
         atomic::{AtomicBool, Ordering},
     },
 };
 
-/// A `via.log` longer than this is renamed `via.log.1` at start (§7.6).
+/// A `via.log` longer than this is renamed `via.log.1` at start, and one a
+/// line would take past it while the daemon runs (§7.6, bead via-23b).
 const ROTATE_BYTES: u64 = 10 * 1024 * 1024;
 
 /// The daemon's one log: its file once open, and whether startup is on.
 struct DaemonLog {
-    file: Mutex<Option<File>>,
+    file: Mutex<Option<OpenLog>>,
     startup: AtomicBool,
+}
+
+/// The open `via.log`, its length and where it is, for rotation.
+struct OpenLog {
+    file: File,
+    len: u64,
+    dir: PathBuf,
+    /// A rotation renamed the file but could not open the new one: `file`
+    /// is `via.log.1`, and each line retries the open first.
+    reopen: bool,
+}
+
+impl OpenLog {
+    /// `via.log` in `dir`, opened by [`open_file`].
+    fn open(dir: &Path) -> io::Result<Self> {
+        let file = open_file(&dir.join("via.log"))?;
+        let len = file.metadata()?.len();
+        Ok(Self {
+            file,
+            len,
+            dir: dir.to_path_buf(),
+            reopen: false,
+        })
+    }
+
+    /// Writes one line, rotating first when it would take the file past
+    /// [`ROTATE_BYTES`]. A failed rotation keeps the current file, which
+    /// then grows past the limit rather than lose the line; a write error
+    /// is ignored.
+    fn write(&mut self, bytes: &[u8]) {
+        let bytes_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if self.reopen {
+            self.reopen();
+        } else if self.len > 0 && self.len.saturating_add(bytes_len) > ROTATE_BYTES {
+            self.rotate();
+        }
+        if self.file.write_all(bytes).is_ok() {
+            self.len = self.len.saturating_add(bytes_len);
+        }
+    }
+
+    /// Renames `via.log` to `via.log.1`, replacing it, and opens a new one.
+    fn rotate(&mut self) {
+        if fs::rename(self.dir.join("via.log"), self.dir.join("via.log.1")).is_ok() {
+            self.reopen = true;
+            self.reopen();
+        }
+    }
+
+    /// Opens the new `via.log` after a rotation's rename; on failure, such
+    /// as no file descriptor left, the next line tries again.
+    fn reopen(&mut self) {
+        if let Ok(file) = open_file(&self.dir.join("via.log")) {
+            self.file = file;
+            self.len = 0;
+            self.reopen = false;
+        }
+    }
 }
 
 static LOG: DaemonLog = DaemonLog {
@@ -51,7 +112,7 @@ pub(super) fn line(bytes: &[u8]) {
     }
     let mut file = LOG.file.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(file) = file.as_mut() {
-        let _ = file.write_all(bytes);
+        file.write(bytes);
     }
 }
 
@@ -62,7 +123,6 @@ pub(super) fn line(bytes: &[u8]) {
 /// is refused before and after the open, never waited on.
 pub(super) fn open(state: &Path) -> io::Result<()> {
     let path = state.join("via.log");
-    let irregular = || io::Error::other("must be a regular file");
     match fs::symlink_metadata(&path) {
         Ok(metadata) if !metadata.is_file() => return Err(irregular()),
         Ok(metadata) if metadata.len() > ROTATE_BYTES => {
@@ -72,6 +132,18 @@ pub(super) fn open(state: &Path) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
+    let log = OpenLog::open(state)?;
+    *LOG.file.lock().unwrap_or_else(PoisonError::into_inner) = Some(log);
+    Ok(())
+}
+
+fn irregular() -> io::Error {
+    io::Error::other("must be a regular file")
+}
+
+/// `via.log` at `path` for append, 0600, following no link and without
+/// blocking; refused unless it is a regular file.
+fn open_file(path: &Path) -> io::Result<File> {
     let file = OpenOptions::new()
         .append(true)
         .create(true)
@@ -81,17 +153,24 @@ pub(super) fn open(state: &Path) -> io::Result<()> {
                 .bits()
                 .cast_signed(),
         )
-        .open(&path)?;
+        .open(path)?;
     if !file.metadata()?.is_file() {
         return Err(irregular());
     }
-    *LOG.file.lock().unwrap_or_else(PoisonError::into_inner) = Some(file);
-    Ok(())
+    Ok(file)
 }
 
 /// Startup is over: from now on only `via.log` is written (§7.6).
 pub(super) fn serving() {
     LOG.startup.store(false, Ordering::Release);
+}
+
+/// A startup failure after `via.log` opened (bead via-23b): one `ERROR`
+/// line with its whole cause chain, in `via.log` only, since the daemon's
+/// exit report already goes to stderr.
+pub(super) fn startup_failed(error: &anyhow::Error) {
+    serving();
+    tracing::error!(cause = %format!("{error:#}"), "daemon startup failed");
 }
 
 /// The most bytes of a panic's `via.log` line.
@@ -102,8 +181,9 @@ const PANIC_LINE: usize = 1024;
 /// default writes stderr, which can block on an undrained pipe before the
 /// unwind reaches an abort. The hook formats one JSON line, message and
 /// location, truncated to 1 KiB, in a stack buffer and writes it to the
-/// `via.log` file only, under `try_lock`: a held or poisoned log skips the
-/// line and a write error is ignored. It never panics and never waits.
+/// `via.log` file only, under `try_lock`, rotating it first past its limit
+/// as any line does: a held or poisoned log skips the line and a write
+/// error is ignored. It never panics and never waits.
 pub(super) fn panic_hook() {
     std::panic::set_hook(Box::new(|info| {
         let mut line = Bounded::default();
@@ -123,7 +203,8 @@ pub(super) fn panic_hook() {
         if let Ok(mut file) = LOG.file.try_lock()
             && let Some(file) = file.as_mut()
         {
-            let _ = file.write_all(line.bytes());
+            // The same length accounting and rotation as any line.
+            file.write(line.bytes());
         }
     }));
 }
@@ -248,6 +329,119 @@ mod tests {
         let mut digits = super::itoa_buffer();
         assert_eq!(super::itoa(0, &mut digits), b"0");
         assert_eq!(super::itoa(u32::MAX, &mut digits), b"4294967295");
+    }
+
+    /// Names the rotation scenario's directory in its child.
+    const ROTATE_CHILD: &str = "VIA_LOG_ROTATE_CHILD";
+
+    /// Bead via-23b fix round 1: a rotation whose reopen fails (no file
+    /// descriptor left) keeps the line in the renamed file and retries the
+    /// reopen on later lines, so `via.log` comes back once descriptors do.
+    /// Runs in a child copy, since it lowers the process's descriptor limit.
+    #[test]
+    fn rotation_recovers_after_a_failed_reopen() {
+        use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+        if let Ok(dir) = std::env::var(ROTATE_CHILD) {
+            let dir = Path::new(&dir);
+            let prefill = vec![b'a'; usize::try_from(super::ROTATE_BYTES).unwrap() - 2];
+            std::fs::write(dir.join("via.log"), &prefill).unwrap();
+            let mut log = super::OpenLog::open(dir).unwrap();
+            let limit = getrlimit(Resource::Nofile);
+            setrlimit(
+                Resource::Nofile,
+                Rlimit {
+                    current: Some(256),
+                    maximum: limit.maximum,
+                },
+            )
+            .unwrap();
+            let mut held = Vec::new();
+            while let Ok(file) = std::fs::File::open("/dev/null") {
+                held.push(file);
+            }
+            log.write(b"one\n");
+            log.write(b"two\n");
+            drop(held);
+            log.write(b"three\n");
+            setrlimit(Resource::Nofile, limit).unwrap();
+            let mut rotated = prefill;
+            rotated.extend_from_slice(b"one\ntwo\n");
+            assert_eq!(
+                std::fs::read_to_string(dir.join("via.log")).ok().as_deref(),
+                Some("three\n"),
+                "via.log did not come back"
+            );
+            assert!(
+                std::fs::read(dir.join("via.log.1")).unwrap() == rotated,
+                "via.log.1 is not the full log and the lines of the failed reopen"
+            );
+            std::process::exit(0);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "server::log::tests::rotation_recovers_after_a_failed_reopen",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(ROTATE_CHILD, dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child ended {:?}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Names the panic rotation scenario's directory in its child.
+    const PANIC_ROTATE_CHILD: &str = "VIA_LOG_PANIC_ROTATE_CHILD";
+
+    /// Bead via-23b critical review: a caught panic's line goes through the
+    /// same length accounting and rotation as any other, so a log 10 bytes
+    /// short of the limit rotates before it. Runs in a child copy, since
+    /// the hook and the log are process-wide.
+    #[test]
+    fn panic_lines_rotate_like_any_other() {
+        if let Ok(dir) = std::env::var(PANIC_ROTATE_CHILD) {
+            let dir = Path::new(&dir);
+            let prefill = vec![b'a'; usize::try_from(super::ROTATE_BYTES).unwrap() - 10];
+            std::fs::write(dir.join("via.log"), &prefill).unwrap();
+            super::open(dir).unwrap();
+            super::serving();
+            super::panic_hook();
+            let _ = std::panic::catch_unwind(|| panic!("a caught panic"));
+            let rotated = std::fs::read(dir.join("via.log.1")).unwrap_or_default();
+            assert!(
+                rotated == prefill,
+                "via.log.1 holds {} bytes",
+                rotated.len()
+            );
+            let log = std::fs::read_to_string(dir.join("via.log")).unwrap();
+            assert!(log.contains("a caught panic"), "{log}");
+            std::process::exit(0);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "server::log::tests::panic_lines_rotate_like_any_other",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PANIC_ROTATE_CHILD, dir.path())
+            .output()
+            .unwrap();
+        // The child's own assertion goes through the hook: to `via.log`.
+        let log = std::fs::read(dir.path().join("via.log")).unwrap_or_default();
+        let tail = String::from_utf8_lossy(&log[log.len().saturating_sub(300)..]).into_owned();
+        assert!(
+            output.status.success(),
+            "child ended {:?}: {tail}",
+            output.status,
+        );
     }
 
     /// X0 item 2.7 `panic_hook_aborts_with_full_stderr`: with its stderr a

@@ -23,7 +23,7 @@ mod support;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -653,6 +653,177 @@ fn s1_config_and_daemon_log_fifo_are_refused_at_once() -> TestResult {
     report.require_pass()
 }
 
+/// Bead via-dst: a runtime directory whose `via.sock` fits the Unix socket
+/// path limit but whose anchor sockets (`anchors/<32 hex>.sock`) do not is
+/// refused at start with a named error, bounded by 10 s, and leaves no
+/// socket. Before the fix the daemon served, and every turn failed
+/// `unknown` after 5 s with no diagnostic.
+#[test]
+fn s1_config_deep_runtime_dir_is_refused_at_start() -> TestResult {
+    let setup = Setup::new(&script("deep", &[]))?;
+    let evidence = setup.evidence("s1_config_deep_runtime")?;
+    let report = run_scenario(
+        evidence,
+        |evidence| {
+            let fresh = Sandbox::new(&script("deep", &[])).map_err(infra)?;
+            let root = fresh
+                .state
+                .parent()
+                .ok_or_else(|| infra("sandbox state has no parent"))?;
+            // 80 bytes: `via.sock` needs 89 of the 108-byte `sun_path`,
+            // an anchor socket 126.
+            let base = root.join("r");
+            let pad = 80_usize
+                .checked_sub(base.as_os_str().len() + 1)
+                .filter(|pad| *pad > 0)
+                .ok_or_else(|| infra(format!("sandbox root too long: {}", root.display())))?;
+            let deep = base.join("d".repeat(pad));
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&deep)
+                .map_err(infra)?;
+            fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).map_err(infra)?;
+            let mut command = fresh.command();
+            command.env("VIA_RUNTIME_DIR", &deep).arg("daemon");
+            let run =
+                scenario::run_command(&mut command, Duration::from_secs(10)).map_err(infra)?;
+            let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+            evidence
+                .write("deep_start.stderr", &run.stderr)
+                .map_err(infra)?;
+            check(!run.timed_out, || {
+                format!("a {}-byte runtime directory served: {stderr}", 80)
+            })?;
+            check(
+                run.status.code() == Some(4)
+                    && stderr.contains("anchor socket path")
+                    && stderr.contains("Unix socket path limit"),
+                || format!("deep runtime start: {:?} {stderr}", run.status),
+            )?;
+            check(!deep.join("via.sock").exists(), || {
+                "the refused start left via.sock".to_owned()
+            })?;
+            // Bead via-23b: the startup failure is in `via.log` too, with
+            // its cause.
+            let log = fs::read_to_string(fresh.state.join("via.log")).unwrap_or_default();
+            check(
+                log.lines().any(|line| {
+                    line.contains("ERROR")
+                        && line.contains("daemon startup failed")
+                        && line.contains("Unix socket path limit")
+                }),
+                || format!("no startup failure in via.log: {log}"),
+            )?;
+            // The scenario's own deployment runs one turn for its evidence.
+            let _daemon = setup.start(evidence)?;
+            setup.one_turn(evidence, "deep")
+        },
+        |evidence| setup.collect(evidence),
+    );
+    report.require_pass()
+}
+
+/// Bead via-c30: after three turns, each on its own anchor, the daemon's
+/// anchor directory holds no socket once their groups are proved absent.
+/// Before the fix every armed anchor left its `*.sock`.
+#[test]
+fn s1_host_turns_leave_no_anchor_sockets() -> TestResult {
+    let prompts = ["first", "second", "third"];
+    let fixture =
+        json!({"scripts": prompts.iter().map(|prompt| script(prompt, &[])).collect::<Vec<_>>()});
+    let setup = Setup::new(&fixture)?;
+    let evidence = setup.evidence("s1_host_anchor_sockets")?;
+    let report = run_scenario(
+        evidence,
+        |evidence| {
+            let _daemon = setup.start(evidence)?;
+            for prompt in prompts {
+                setup.one_turn(evidence, prompt)?;
+            }
+            let anchors = setup.sandbox.runtime.join("anchors");
+            let sockets = || -> Result<Vec<String>, ScenarioError> {
+                let mut names = Vec::new();
+                for entry in fs::read_dir(&anchors).map_err(infra)? {
+                    let name = entry.map_err(infra)?.file_name();
+                    let name = name.to_string_lossy();
+                    if Path::new(&*name).extension() == Some("sock".as_ref()) {
+                        names.push(name.into_owned());
+                    }
+                }
+                Ok(names)
+            };
+            let settled = wait_until("anchor socket removal", Duration::from_secs(5), || {
+                Ok(sockets()?.is_empty())
+            });
+            let left = sockets()?;
+            evidence
+                .write("anchor_sockets.json", json!(left).to_string().as_bytes())
+                .map_err(infra)?;
+            settled.map_err(|_| failure(format!("anchor sockets left after 3 turns: {left:?}")))
+        },
+        |evidence| setup.collect(evidence),
+    );
+    report.require_pass()
+}
+
+/// Bead via-23b: a launch that fails in Host carries its cause to the
+/// turn. The fake agent's binary is removed after the daemon validated it,
+/// so the anchor's vendor spawn fails `NotFound`: the turn's durable events
+/// hold one `launch_failed` warning naming the step and the error's kind.
+/// Before the fix the turn ended with no cause anywhere.
+#[test]
+fn s1_host_launch_failure_cause_reaches_the_turn() -> TestResult {
+    let setup = Setup::new(&script("lost", &[]))?;
+    let evidence = setup.evidence("s1_host_launch_cause")?;
+    let report = run_scenario(
+        evidence,
+        |evidence| {
+            let copy = setup.dir.with_file_name("fake-copy");
+            fs::copy(&setup.sandbox.fake, &copy).map_err(infra)?;
+            fs::set_permissions(&copy, fs::Permissions::from_mode(0o700)).map_err(infra)?;
+            let _daemon = Daemon::start_with(&setup.sandbox, evidence, |command| {
+                setup.failpoints.activate(command);
+                command.env("VIA_FAKE_AGENT_BINARY", &copy);
+            })?;
+            fs::remove_file(&copy).map_err(infra)?;
+            let session = setup.spawn(evidence, "lost")?;
+            let envelope = setup.wait(evidence, "wait_lost", &format!("{session}/1"))?;
+            let store = rusqlite::Connection::open_with_flags(
+                setup.sandbox.state.join("store.sqlite3"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .map_err(infra)?;
+            let mut statement = store
+                .prepare("SELECT event FROM events WHERE session_id = ?1 ORDER BY seq")
+                .map_err(infra)?;
+            let events: Vec<Value> = statement
+                .query_map([&session], |row| row.get::<_, String>(0))
+                .map_err(infra)?
+                .map(|row| {
+                    row.map_err(infra)
+                        .and_then(|text| serde_json::from_str(&text).map_err(infra))
+                })
+                .collect::<Result<_, _>>()?;
+            let causes: Vec<&Value> = events
+                .iter()
+                .filter(|event| event["type"] == "warning" && event["code"] == "launch_failed")
+                .collect();
+            check(
+                causes.len() == 1
+                    && causes[0]["turn"] == 1
+                    && causes[0]["data"] == json!({"step":"spawn vendor","kind":"NotFound"})
+                    && causes[0]["message"]
+                        .as_str()
+                        .is_some_and(|message| message.starts_with("spawn vendor failed")),
+                || format!("no launch cause for {session}/1: {envelope}; events {events:?}"),
+            )
+        },
+        |evidence| setup.collect(evidence),
+    );
+    report.require_pass()
+}
+
 // ------------------------------------------------------------- daemon log
 
 /// Design §7.6, §13.2 [t4r16.7.1]: an invalid `daemon.json` is reported by
@@ -713,14 +884,17 @@ fn s1_daemon_log_after_startup_and_rotation() -> TestResult {
             evidence
                 .write("via.log.recovered", log.as_bytes())
                 .map_err(infra)?;
-            let recovery = log
+            // Bead via-23b fix round 1: one count line, and no turn's
+            // lifecycle, which the Store keeps (runtime §6.2).
+            let recovery: Vec<&str> = log
                 .lines()
-                .find(|line| line.contains("recovered"))
-                .unwrap_or_default()
-                .to_owned();
+                .filter(|line| line.contains("recovered"))
+                .collect();
             check(
-                recovery.contains(&format!("session={session}")) && recovery.contains("turn=1"),
-                || format!("no recovery warning naming {session}/1 in via.log: {log}"),
+                recovery.len() == 1
+                    && recovery[0].contains("turns=1")
+                    && !log.contains(session.as_str()),
+                || format!("not one recovery count without {session} in via.log: {log}"),
             )?;
             // A later warning: an accepted forced stop, then the summary.
             let before = fs::read(&trace).map_err(infra)?;
@@ -768,6 +942,68 @@ fn s1_daemon_log_after_startup_and_rotation() -> TestResult {
                     fresh.len()
                 )
             })?;
+            check(fresh.permissions().mode() & 0o777 == 0o600, || {
+                format!("via.log mode {:o}", fresh.permissions().mode())
+            })
+        },
+        |evidence| setup.collect(evidence),
+    );
+    report.require_pass()
+}
+
+/// Bead via-23b: `via.log` rotates by size while the daemon runs, as at
+/// start: a line that would take it past 10 MiB first renames it
+/// `via.log.1`, replacing any earlier one, and goes to a fresh `via.log`.
+/// Here a log 64 bytes short of the limit, kept at start, rotates on the
+/// warning of an accepted forced stop; the shutdown summary follows it.
+/// Before the fix it rotated only at the next start.
+#[test]
+fn s1_daemon_log_rotates_at_its_size_while_running() -> TestResult {
+    let setup = Setup::new(&script("rotated", &[]))?;
+    let evidence = setup.evidence("s1_daemon_log_running_rotation")?;
+    let report = run_scenario(
+        evidence,
+        |evidence| {
+            let path = setup.sandbox.state.join("via.log");
+            let full = vec![b'x'; usize::try_from(10 * MIB - 64).map_err(infra)?];
+            fs::write(&path, &full).map_err(infra)?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(infra)?;
+            let daemon = setup.start(evidence)?;
+            setup.one_turn(evidence, "rotated")?;
+            check(!setup.sandbox.state.join("via.log.1").exists(), || {
+                "via.log rotated before it reached its limit".to_owned()
+            })?;
+            let stop = cli(
+                &setup.sandbox,
+                evidence,
+                "stop_force",
+                &["daemon", "stop", "--force", "--json"],
+            )?;
+            check(stop["stopping"] == true, || format!("stop: {stop}"))?;
+            wait_until("the summary", Duration::from_secs(15), || {
+                Ok(setup.via_log().contains("daemon_shutdown"))
+            })?;
+            daemon.shutdown()?;
+            // Absent before the fix: no rotation while running.
+            let rotated = fs::read(setup.sandbox.state.join("via.log.1")).unwrap_or_default();
+            let log = setup.via_log();
+            evidence
+                .write("via.log.running", log.as_bytes())
+                .map_err(infra)?;
+            check(rotated == full, || {
+                format!("via.log.1 is not the full log: {} bytes", rotated.len())
+            })?;
+            check(
+                log.lines()
+                    .next()
+                    .is_some_and(|line| line.contains("forced stop"))
+                    && log
+                        .lines()
+                        .last()
+                        .is_some_and(|line| line.contains("daemon_shutdown")),
+                || format!("the fresh via.log: {log}"),
+            )?;
+            let fresh = fs::metadata(&path).map_err(infra)?;
             check(fresh.permissions().mode() & 0o777 == 0o600, || {
                 format!("via.log mode {:o}", fresh.permissions().mode())
             })

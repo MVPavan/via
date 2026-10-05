@@ -20,9 +20,9 @@ use tokio::sync::{Notify, watch};
 use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio::time::{Instant, timeout_at};
 use via_wire::{
-    CapacityToken, CloseMode, CloseRequest, Deadline, ExitReport, HostError, OutboundMessage,
-    PrivateProcessSpec, ProcessOwner, SendOutcome, ServerId, WireCleanup, WireError, WireMessages,
-    WireParts, WireSignals, WriteBounds,
+    CapacityToken, CloseMode, CloseRequest, Deadline, ExitReport, HostError, LaunchCause,
+    OutboundMessage, PrivateProcessSpec, ProcessOwner, SendOutcome, ServerId, WireCleanup,
+    WireError, WireMessages, WireParts, WireSignals, WriteBounds,
 };
 
 use super::connection::{
@@ -88,6 +88,8 @@ pub enum LaunchFailure {
         forced: bool,
         /// A Host journal write had an uncertain outcome.
         journal_uncertain: bool,
+        /// The Host or launch failure's cause (bead via-23b).
+        launch: Option<LaunchCause>,
     },
     /// The handshake broke the protocol: a malformed or refused reply, or
     /// a `model/list` cursor left at a bound (nothing is cached).
@@ -117,10 +119,11 @@ impl LaunchFailure {
     /// The failure of turn `turn`, which waited on this launch: nothing of
     /// the turn was sent, so it never launched on the server route.
     pub fn route_failure(self, turn: TurnNumber) -> RouteFailure {
-        let (cause, journal_uncertain) = match self {
+        let (cause, journal_uncertain, launch) = match self {
             Self::Acquire {
                 cause,
                 journal_uncertain,
+                launch,
                 ..
             } => (
                 match cause {
@@ -129,21 +132,23 @@ impl LaunchFailure {
                     AcquireCause::Transport => RouteError::TransportLost { turn },
                 },
                 journal_uncertain,
+                launch,
             ),
-            Self::Protocol(detail) => (RouteError::Protocol { turn, detail }, false),
+            Self::Protocol(detail) => (RouteError::Protocol { turn, detail }, false, None),
             Self::Lost(LossCause::Protocol) => (
                 RouteError::Protocol {
                     turn,
                     detail: "the shared connection failed its handshake",
                 },
                 false,
+                None,
             ),
-            Self::Lost(LossCause::Overflow) => (RouteError::Overflow { turn }, false),
-            Self::Lost(LossCause::ServerLost) => (RouteError::ServerLost { turn }, false),
+            Self::Lost(LossCause::Overflow) => (RouteError::Overflow { turn }, false, None),
+            Self::Lost(LossCause::ServerLost) => (RouteError::ServerLost { turn }, false, None),
             Self::Lost(LossCause::TransportLost) | Self::Deadline | Self::Internal => {
-                (RouteError::TransportLost { turn }, false)
+                (RouteError::TransportLost { turn }, false, None)
             }
-            Self::Shutdown => (RouteError::Stopped { turn }, false),
+            Self::Shutdown => (RouteError::Stopped { turn }, false, None),
         };
         RouteFailure {
             cause,
@@ -155,6 +160,7 @@ impl LaunchFailure {
             journal_uncertain,
             acknowledged: false,
             shared: true,
+            launch: launch.map(Box::new),
         }
     }
 }
@@ -739,6 +745,10 @@ impl Servers {
             cleanup: None,
             forced: false,
             journal_uncertain: false,
+            launch: Some(LaunchCause {
+                step: "mint a server id",
+                kind: None,
+            }),
         })?;
         spec.owner = ProcessOwner::Server {
             server_id: server.clone(),
@@ -1329,6 +1339,7 @@ fn acquire_failure(error: &WireError) -> LaunchFailure {
         | WireError::Woken
         | WireError::Message(_) => (error, false, None, false, false),
     };
+    let launch = cause.launch_cause();
     let cause = match cause {
         WireError::Evidence(_) | WireError::Host(HostError::Evidence(_)) => {
             AcquireCause::Store(StoreFailure::Evidence)
@@ -1355,6 +1366,7 @@ fn acquire_failure(error: &WireError) -> LaunchFailure {
         cleanup,
         forced,
         journal_uncertain,
+        launch,
     }
 }
 

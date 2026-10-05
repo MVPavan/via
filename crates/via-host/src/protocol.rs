@@ -22,6 +22,8 @@ pub(crate) struct Bootstrap {
     pub marker: String,
     pub controller_pid: u32,
     pub socket_path: PathBuf,
+    /// How much of the vendor's stderr the anchor keeps (bead via-c2r).
+    pub stderr_cap: crate::stderr_log::StderrCap,
     /// Test builds only: the daemon's failpoint directory and token. The
     /// anchor runs without the daemon's environment, so its seams activate
     /// from here (design §10).
@@ -124,6 +126,10 @@ pub(crate) enum Reply {
     },
     Error {
         code: String,
+        /// The operating-system error number behind `code`, when it had
+        /// one (bead via-23b).
+        #[serde(default)]
+        errno: Option<i32>,
     },
 }
 

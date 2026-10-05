@@ -1091,6 +1091,20 @@ fn s1_f12_forced_terminal_not_committed_in_shutdown() -> TestResult {
                     "uncertain {uncertain}: unexpected exit {status}, session {state}: {summary}"
                 )
             })?;
+            // Bead via-23b fix round 1: a latch first raised in final
+            // shutdown is logged once, with its cause.
+            let trace = daemon.trace();
+            let latched: Vec<&str> = trace
+                .lines()
+                .filter(|line| line.contains("store failure latched"))
+                .collect();
+            check(
+                latched.len() == usize::from(uncertain)
+                    && latched
+                        .iter()
+                        .all(|line| line.contains("ERROR") && line.contains("failure=")),
+                || format!("uncertain {uncertain}: latch lines {latched:?} in {trace}"),
+            )?;
             sandbox.verify_anchors()?;
         }
         Ok(())
@@ -1845,6 +1859,15 @@ fn host_journal_failure_stops_group(point: &str) -> TestResult {
             && first["cancel"]["cleanup"] == "quiescent",
         || format!("unexpected turn 1: {first}"),
     )?;
+    // Bead via-23b: the journal write's failure is the turn's Store
+    // failure, never a `launch_failed` warning (C1 §6.1).
+    let events = sandbox.events(&session)?;
+    check(
+        !events
+            .iter()
+            .any(|event| event["type"] == "warning" && event["code"] == "launch_failed"),
+        || format!("a journal write reported as launch_failed: {events:?}"),
+    )?;
     // The vendor, if it ran, is gone.
     let agent = sandbox.sync.join("agent.pid");
     if agent.exists() {
@@ -2530,6 +2553,19 @@ fn s1_f12_uncertain_terminal_latches_before_its_read_back() -> TestResult {
             format!("unexpected store_failure: {failure}")
         })?;
         daemon.latched_exit()?;
+        // Bead via-23b: the latch, visible before the read-back, is logged
+        // once with its own cause, whenever final shutdown began.
+        let log = fs::read_to_string(sandbox.state.join("via.log"))?;
+        let latched: Vec<&str> = log
+            .lines()
+            .filter(|line| line.contains("store failure latched"))
+            .collect();
+        check(
+            latched.len() == 1
+                && latched[0].contains("commit_uncertain")
+                && latched[0].contains(&format!("{session}/1")),
+            || format!("latch lines {latched:?} in {log}"),
+        )?;
         let state: String = sandbox.query(&format!(
             "SELECT state FROM turns WHERE session_id='{session}' AND number=1"
         ))?;

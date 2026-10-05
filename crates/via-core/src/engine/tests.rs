@@ -5561,9 +5561,11 @@ fn closed_list_adapter_warnings_reach_the_envelope_once_per_code() {
         );
         let page = events_page(&engine, &session).await;
         let events = page["events"].as_array().unwrap();
+        // Turn 1's own `launch_failed` (its absent anchor) is not the
+        // adapter's.
         let codes: Vec<&Value> = events
             .iter()
-            .filter(|event| event["type"] == "warning")
+            .filter(|event| event["type"] == "warning" && event["code"] != "launch_failed")
             .map(|event| &event["code"])
             .collect();
         assert_eq!(codes.len(), 5, "every one is an event: {page}");
@@ -5663,7 +5665,9 @@ fn adapter_warnings_commit_warning_events_within_the_caps() {
             .as_array()
             .unwrap()
             .iter()
-            .filter(|event| event["type"] == "warning")
+            // Turn 1's own `launch_failed` (its absent anchor) is not the
+            // adapter's.
+            .filter(|event| event["type"] == "warning" && event["code"] != "launch_failed")
             .collect();
         assert_eq!(warnings.len(), 3, "{page}");
         assert_eq!(

@@ -444,6 +444,14 @@ pub enum JournalSite {
 pub enum HostError {
     /// OS or filesystem operation failed.
     Io(io::Error),
+    /// A launch step failed with an operating-system error (bead via-23b):
+    /// the step names where, the error's kind what.
+    Launch {
+        /// The failed step.
+        step: &'static str,
+        /// Its error.
+        error: io::Error,
+    },
     /// A required Store read did not complete.
     Store(&'static str),
     /// A Host journal write lacked a positive commit receipt: not committed,
@@ -471,12 +479,20 @@ pub enum HostError {
     /// its bound (design item 6.3): the requested turns without their own
     /// anchor records stay uncertain. Groups were still stopped.
     LinksUnread,
+    /// The anchor directory is too deep for an anchor socket
+    /// (`<anchor_dir>/<anchor id>.sock`) to fit the Unix socket path limit
+    /// (bead via-dst): Host refuses to start rather than fail every launch.
+    AnchorPathTooLong {
+        /// The longest anchor socket path Host would bind.
+        path: PathBuf,
+    },
 }
 
 impl std::fmt::Display for HostError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "Host I/O: {error}"),
+            Self::Launch { step, error } => write!(formatter, "{step}: {error}"),
             Self::Evidence(error) => write!(formatter, "stderr.log not created: {error}"),
             Self::Store(message) | Self::Invalid(message) | Self::Protocol(message) => {
                 formatter.write_str(message)
@@ -503,11 +519,47 @@ impl std::fmt::Display for HostError {
             Self::Deadline => formatter.write_str("Host deadline expired"),
             Self::Stopped => formatter.write_str("stopped before ARM"),
             Self::LinksUnread => formatter.write_str("turn links to server anchors unread"),
+            Self::AnchorPathTooLong { path } => write!(
+                formatter,
+                "runtime directory too long: anchor socket path {} is {} bytes, over the Unix \
+                 socket path limit; use a shorter runtime directory",
+                path.display(),
+                path.as_os_str().len()
+            ),
         }
     }
 }
 
 impl std::error::Error for HostError {}
+
+impl HostError {
+    /// This failure's bounded cause for the turn it ended (bead via-23b),
+    /// or `None` for a deadline or a stop, whose dispositions name them,
+    /// and for a Store read or journal write, which the turn's Store
+    /// failure reports (C1 §6.1).
+    pub fn cause(&self) -> Option<crate::LaunchCause> {
+        let (step, kind) = match self {
+            Self::Launch { step, error } => (*step, Some(error.kind())),
+            Self::Io(error) => ("Host operation", Some(error.kind())),
+            Self::Evidence(error) => ("create stderr.log", Some(error.kind())),
+            Self::Invalid(step) | Self::Protocol(step) => (*step, None),
+            Self::AnchorPathTooLong { .. } => ("anchor socket path", None),
+            Self::Store(_)
+            | Self::StoreUnavailable(_)
+            | Self::Journal { .. }
+            | Self::Deadline
+            | Self::Stopped
+            | Self::LinksUnread => return None,
+        };
+        Some(crate::LaunchCause { step, kind })
+    }
+
+    /// A launch step's failure with its operating-system error.
+    fn launch(step: &'static str) -> impl FnOnce(io::Error) -> Self {
+        move |error| Self::Launch { step, error }
+    }
+}
+
 impl From<io::Error> for HostError {
     fn from(value: io::Error) -> Self {
         Self::Io(value)
@@ -766,6 +818,9 @@ pub struct ProcessControl {
     stop: Arc<StopFacts>,
     capacity: Capacity,
     uncertain: watch::Sender<bool>,
+    /// Where the anchor's socket is, removed once its group is proved
+    /// absent (bead via-c30).
+    anchor_dir: PathBuf,
 }
 
 /// Process facts and cleanup evidence from a close request.
@@ -882,6 +937,7 @@ impl Host {
             return Err(HostError::Invalid("anchor executable must be absolute"));
         }
         linux::secure_directory(&anchor_dir)?;
+        anchor_socket_fits(&anchor_dir)?;
         Ok(Self {
             journal,
             anchor_binary,
@@ -1016,7 +1072,7 @@ impl Host {
                         CleanupEvidence::Uncertain(CleanupReason::EvidenceStoreFailure)
                     }
                 };
-                self.capacity.settle(anchor_id, &evidence);
+                settle(&self.capacity, &self.anchor_dir, anchor_id, &evidence);
                 Some(evidence)
             }
             // An intent with no verified identity cannot be proved absent.
@@ -1293,7 +1349,9 @@ impl Host {
         .await
         {
             Ok(CommitOutcome::Committed(())) => {
-                self.capacity.settle(
+                settle(
+                    &self.capacity,
+                    &self.anchor_dir,
                     &record.intent.anchor_id,
                     &CleanupEvidence::GroupAbsent(proof),
                 );
@@ -1320,7 +1378,7 @@ impl Host {
         let anchor_id = linux::random_hex()?;
         let generation = linux::random_hex()?;
         let marker = linux::random_hex()?;
-        let socket_path = self.anchor_dir.join(format!("{anchor_id}.sock"));
+        let socket_path = anchor_socket(&self.anchor_dir, &anchor_id);
         let config_path = self.anchor_dir.join(format!("{anchor_id}.json"));
         let intent = AnchorIntent {
             anchor_id: anchor_id.clone(),
@@ -1345,6 +1403,10 @@ impl Host {
             marker: marker.clone(),
             controller_pid: std::process::id(),
             socket_path: socket_path.clone(),
+            stderr_cap: match owner {
+                ProcessOwner::Turn { .. } => crate::stderr_log::StderrCap::TURN,
+                ProcessOwner::Server { .. } => crate::stderr_log::StderrCap::SERVER,
+            },
             #[cfg(feature = "test-failpoints")]
             failpoints: via_store::failpoint::activation(),
         };
@@ -1361,7 +1423,8 @@ impl Host {
         state.spawned = Some(anchor_id.clone());
         let mut stream = connect_anchor(&socket_path).await?;
         let ready = protocol::read_message::<Reply>(&mut stream, 1024)
-            .await?
+            .await
+            .map_err(HostError::launch("read anchor ready"))?
             .ok_or(HostError::Protocol("anchor did not become ready"))?;
         let Reply::Ready {
             identity: wire_identity,
@@ -1417,8 +1480,10 @@ impl Host {
         })
     }
 
-    /// Spawns the anchor with `stderr` as its standard error, which the
-    /// vendor inherits (design §7.2); only stdin and stdout are pipes.
+    /// Spawns the anchor with `stderr` as its standard error: the anchor
+    /// keeps it and drains the vendor's stderr pipe into it under the
+    /// bootstrap's cap (design §7.2, bead via-c2r). Stdin and stdout are the
+    /// vendor's pipes.
     fn spawn_anchor(
         &self,
         config_path: &PathBuf,
@@ -1439,7 +1504,7 @@ impl Host {
             Ok(child) => child,
             Err(error) => {
                 let _ = fs::remove_file(config_path);
-                return Err(error.into());
+                return Err(HostError::launch("spawn anchor")(error));
             }
         };
         let anchor_process_id = anchor
@@ -1522,12 +1587,9 @@ impl Host {
                 },
                 1024,
             )
-            .await?;
-        let Reply::Spawned { pid: vendor_pid } = reply else {
-            return Err(HostError::Protocol(
-                "anchor did not confirm descriptor detachment",
-            ));
-        };
+            .await
+            .map_err(HostError::launch("send ARM"))?;
+        let vendor_pid = spawned(reply)?;
         // The group's exit watch, which the ledger's `Armed` entry reads.
         let (sender, exits) = watch::channel(None);
         // Design §6.8 [r6.1]: armed right after `Spawned`; an early stop
@@ -1577,6 +1639,7 @@ impl Host {
             stop,
             capacity: self.capacity.clone(),
             uncertain: self.uncertain.clone(),
+            anchor_dir: self.anchor_dir.clone(),
         };
         self.track_control(&control, sender);
         Ok(AcquiredProcess {
@@ -1666,6 +1729,7 @@ impl Host {
                     stop: tracked.stop,
                     capacity: self.capacity.clone(),
                     uncertain: self.uncertain.clone(),
+                    anchor_dir: self.anchor_dir.clone(),
                 };
                 let close = control
                     .close(CloseRequest {
@@ -1839,7 +1903,7 @@ impl Host {
             let generation = record.intent.generation.clone();
             let owner = record.intent.owner.clone();
             let cleanup = self.recover_one(record, deadline).await?;
-            self.capacity.settle(&anchor_id, &cleanup);
+            settle(&self.capacity, &self.anchor_dir, &anchor_id, &cleanup);
             let forced = self
                 .tasks
                 .lock()
@@ -2105,7 +2169,7 @@ impl ProcessControl {
                 ),
             ),
         };
-        self.capacity.settle(&self.anchor_id, &cleanup);
+        settle(&self.capacity, &self.anchor_dir, &self.anchor_id, &cleanup);
         // The anchor repeats `stopped_live` on every Stop; an earlier early
         // stop's reply counts too (design §6.8 [r5.4]).
         let forced = forced || self.stop.forced.load(Ordering::Acquire);
@@ -2214,7 +2278,8 @@ async fn configure(
         .lock()
         .await
         .transact(&Request::Configure { vendor }, protocol::REQUEST_MAX)
-        .await?
+        .await
+        .map_err(HostError::launch("configure anchor"))?
     else {
         return Err(HostError::Protocol("anchor configuration refused"));
     };
@@ -2222,7 +2287,7 @@ async fn configure(
 }
 
 /// Creates the turn's `stderr.log` (design §7.2): new, 0600, never through a
-/// symlink. The operating system writes it; VIA never reads it.
+/// symlink. The anchor writes it, capped (bead via-c2r); VIA never reads it.
 fn open_stderr(path: &std::path::Path) -> io::Result<fs::File> {
     OpenOptions::new()
         .write(true)
@@ -2232,17 +2297,104 @@ fn open_stderr(path: &std::path::Path) -> io::Result<fs::File> {
         .open(path)
 }
 
+/// The anchor socket of `anchor_id` (runtime §6.1 `anchors/<anchor-id>.sock`).
+fn anchor_socket(anchor_dir: &std::path::Path, anchor_id: &str) -> PathBuf {
+    anchor_dir.join(format!("{anchor_id}.sock"))
+}
+
+/// Settles `anchor_id`'s group in the ledger ([`Capacity::settle`]) and,
+/// once its absence is committed, removes its socket (bead via-c30): an
+/// armed anchor ends by its own group KILL and never unlinks it. Only a
+/// proved-absent anchor's socket is removed; nothing is swept by name.
+fn settle(
+    capacity: &Capacity,
+    anchor_dir: &std::path::Path,
+    anchor_id: &str,
+    cleanup: &CleanupEvidence,
+) {
+    capacity.settle(anchor_id, cleanup);
+    if matches!(cleanup, CleanupEvidence::GroupAbsent(_)) {
+        remove_anchor_socket(anchor_dir, anchor_id);
+    }
+}
+
+/// Removes a proved-absent anchor's socket, if it is still there. The id
+/// comes from the journal: only one of Host's own fixed-length hex ids
+/// names a path, and only a socket there is removed.
+fn remove_anchor_socket(anchor_dir: &std::path::Path, anchor_id: &str) {
+    if anchor_id.len() != linux::RANDOM_HEX_LEN
+        || !anchor_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return;
+    }
+    let path = anchor_socket(anchor_dir, anchor_id);
+    if fs::symlink_metadata(&path)
+        .is_ok_and(|metadata| std::os::unix::fs::FileTypeExt::is_socket(&metadata.file_type()))
+    {
+        // Best effort: a socket left behind only refuses connections, and
+        // its anchor is gone; the next proof of it (startup reconciliation)
+        // tries again.
+        let _ = fs::remove_file(&path);
+    }
+}
+
+/// Every anchor socket has the same length, its id being
+/// [`linux::RANDOM_HEX_LEN`] hex digits: one that fits the platform's Unix
+/// socket address means all do (bead via-dst).
+fn anchor_socket_fits(anchor_dir: &std::path::Path) -> Result<(), HostError> {
+    let path = anchor_socket(anchor_dir, &"f".repeat(linux::RANDOM_HEX_LEN));
+    match std::os::unix::net::SocketAddr::from_pathname(&path) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(HostError::AnchorPathTooLong { path }),
+    }
+}
+
 /// Writes the anchor's private bootstrap file, synced, never over another.
 fn write_bootstrap(path: &PathBuf, bootstrap: &Bootstrap) -> Result<(), HostError> {
-    let bytes = serde_json::to_vec(bootstrap).map_err(io::Error::other)?;
-    let mut config = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    config.write_all(&bytes)?;
-    config.sync_all()?;
-    Ok(())
+    let write = || {
+        let bytes = serde_json::to_vec(bootstrap).map_err(io::Error::other)?;
+        let mut config = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        config.write_all(&bytes)?;
+        config.sync_all()
+    };
+    write().map_err(HostError::launch("write anchor bootstrap"))
+}
+
+/// The vendor's pid from the anchor's reply to ARM, or why there is none.
+fn spawned(reply: Reply) -> Result<u32, HostError> {
+    match reply {
+        Reply::Spawned { pid } => Ok(pid),
+        Reply::Error { code, errno } => Err(anchor_refused(&code, errno)),
+        Reply::Ready { .. }
+        | Reply::Challenge { .. }
+        | Reply::Configured
+        | Reply::Status { .. }
+        | Reply::Stopping { .. } => Err(HostError::Protocol(
+            "anchor did not confirm descriptor detachment",
+        )),
+    }
+}
+
+/// The anchor's refusal of ARM (bead via-23b): the vendor spawn or the
+/// anchor's own stdio detachment failed, with its operating-system error
+/// when it had one. Another code is a protocol failure.
+fn anchor_refused(code: &str, errno: Option<i32>) -> HostError {
+    let step = match code {
+        "VendorSpawnFailed" => "spawn vendor",
+        "PipeDetachFailed" => "detach anchor stdio",
+        _ => return HostError::Protocol("anchor did not confirm descriptor detachment"),
+    };
+    let error = errno.map_or_else(
+        || io::Error::other(code.to_owned()),
+        io::Error::from_raw_os_error,
+    );
+    HostError::Launch { step, error }
 }
 
 async fn connect_anchor(path: &PathBuf) -> Result<UnixStream, HostError> {
@@ -2250,7 +2402,9 @@ async fn connect_anchor(path: &PathBuf) -> Result<UnixStream, HostError> {
     loop {
         match UnixStream::connect(path).await {
             Ok(stream) => return Ok(stream),
-            Err(error) if Instant::now() >= deadline => return Err(error.into()),
+            Err(error) if Instant::now() >= deadline => {
+                return Err(HostError::launch("connect anchor socket")(error));
+            }
             Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
         }
     }

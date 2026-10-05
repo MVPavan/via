@@ -425,8 +425,8 @@ has an evidence folder, `<state>/evidence/<session_id>/<turn>/`. A shared
 server's connection has its own, `<state>/evidence/servers/<server_id>/`. The
 vendor's stderr is the file `stderr.log` in its owner's folder (the turn's on
 a per-turn route, the server's on a shared one): Host opens it and gives it to
-the anchor as stderr, the vendor inherits it, and the operating system writes
-it; no VIA task reads it. When Route cannot decode a message, and when a
+the anchor as stderr; the anchor gives the vendor a pipe as stderr and drains
+it into the file under a cap (below); no VIA task reads it. When Route cannot decode a message, and when a
 message exceeds 1 MiB or ends unterminated, its first 64 KiB is written to
 `undecoded.bin`: in the folder of the turn its correlation names, when it
 names one; otherwise in the connection's folder. The failures go to the
@@ -436,7 +436,25 @@ when the file is in its own session's turn folder, and only the length when it
 is in the connection's folder (D4). C1 `logs` returns only turn folders. A
 final text too long for the envelope is written there as `final_text.txt`, and
 a structured output too long for it as `structured_output.json` (C1 §5). The
-vendor's stderr is not capped. The vendor's own transcript keeps the
+vendor's stderr is capped (owner, 2026-10-04): a per-turn process keeps its
+first 4 MiB and last 1 MiB, a shared server its first 8 MiB and last 8 MiB.
+The head is written as it arrives; the tail waits in the anchor's bounded
+ring, and the bytes between are discarded. The anchor always drains the
+pipe into memory, discarding past the cap, and a separate thread writes the
+file, so the vendor never blocks on stderr, even when the file's writes
+stall; the log's buffers stay within twice the head plus the tail (9 MiB
+per turn, 24 MiB per server), plus a 64 KiB read buffer. When
+bytes were dropped, one marker line `[via: <n> bytes of vendor stderr
+dropped]`, on its own line, precedes the tail; the tail is written when the
+vendor group ends (the pipe's EOF, or in the last 20 ms of the cleanup
+grace before the anchor's own group KILL, discarding stderr written after
+that; the anchor still reads its control then, so a later `Stop`'s shorter
+deadline still brings the KILL forward), and when the anchor returns early
+on an error. A tail write still
+blocked at the KILL, or a finish that cannot take the log's lock by then,
+loses the tail: the KILL never waits for either. An anchor killed from outside
+loses the tail, and the vendor's later stderr writes then fail (`EPIPE` or
+`SIGPIPE`). The vendor's own transcript keeps the
 conversation; SQLite keeps its path as a hint with the vendor session ID.
 
 ## 5. C5: private process supervision
@@ -585,9 +603,12 @@ to a recycled group after the signalling process has ceased to exist.
 
 The Host anchor starts the vendor, which inherits the anchor's current group;
 no numeric group-join operation races an exiting anchor. Group membership is
-inherited at child creation, before exec. Anchor's standard streams were
+inherited at child creation, before exec. The anchor's stdin and stdout were
 created as pipes by the daemon and are inherited by the vendor using
-`Stdio::inherit`; Wire exclusively reads/writes their daemon ends. Inheritance
+`Stdio::inherit`; Wire exclusively reads/writes their daemon ends. The
+anchor's stderr is the owner's `stderr.log`: the anchor keeps a
+close-on-exec duplicate of it and gives the vendor a new pipe as stderr,
+which a drain thread of the anchor reads into the file under §4's cap. Inheritance
 does not detach the anchor's copies. Before spawning, the anchor opens
 `/dev/null` read/write; immediately after successful spawn, it redirects its
 own fd 0, 1 and 2 to that file using safe `rustix::stdio::dup2_stdin`,
@@ -604,8 +625,8 @@ On any failure, report `PipeDetachFailed` through the separate control socket,
 start bounded own-group cleanup and return no successful acquisition. If
 spawn itself fails, detach the three copies before its failure reply as well;
 failure to detach follows the same cleanup path. While the anchor remains
-alive after vendor exit, stdout/stderr EOF and stdin reader disappearance
-must therefore reflect the vendor and its actual descendants, not the anchor.
+alive after vendor exit, stdout EOF and stdin reader disappearance must
+therefore reflect the vendor and its actual descendants, not the anchor.
 The anchor never reads/writes vendor bytes or logs to those streams. It reports
 diagnostics and vendor exit over its separate Host socket. The anchor owns
 the vendor child handle and reaps it while alive; the daemon owns/reaps the
@@ -944,8 +965,9 @@ Write ordering is explicit:
    outcome causes Store-failed mode, never speculative send.
 3. Host commits anchor intent/generation, starts anchor, commits its
    verified identity, configures, commits `ArmIntent`, then sends ARM once.
-   Anchor spawns vendor in its inherited group with its owner's stderr file
-   and detaches fd 0/1/2 before its acknowledgement; Host records vendor
+   Anchor spawns vendor in its inherited group with a stderr pipe it drains
+   into its owner's stderr file (capped, §4) and detaches fd 0/1/2 before its
+   acknowledgement; Host records vendor
    facts. Wire starts its stdout reader and writes the prompt. Vendor
    acceptance is independent evidence.
    On a shared-server route the turn's `run_turn` instead creates the
@@ -1016,12 +1038,17 @@ needed. Diagnostics may contain paths but no handles or vendor payloads.
 
 The daemon refuses to start when the state directory's path is over 1 KiB
 encoded, which bounds every evidence path an envelope names (C1 §5).
+Host refuses to start, so the daemon does, when an anchor socket path
+(`<runtime>/anchors/<anchor-id>.sock`, every one the same length) would not
+fit the platform's Unix socket address (108 bytes on Linux, including the
+terminator), naming the path and its length; a deeper runtime directory
+would otherwise fail every launch.
 
 ```text
 <state>/
   store.lock                 persistent Store-owner lock inode
   daemon.json                optional daemon config: disk floor and warning, WAL (§8); adapter-owned `harnesses` (§8)
-  via.log                    daemon warnings and errors; via.log.1 after rotation at start past 10 MiB
+  via.log                    daemon warnings and errors; via.log.1 after rotation past 10 MiB (§6.2)
   store.sqlite3              SQLite database (user_version schema)
   store.sqlite3-wal          SQLite-owned sidecar when present
   store.sqlite3-shm          SQLite-owned sidecar when present
@@ -1054,7 +1081,8 @@ socket classes mode 0600 from the start. Initialize daemon umask 0077 before
 threads or file creation, including SQLite sidecars. Store alone opens
 SQLite and blob files, and validates or creates the `evidence/` root; Wire
 creates each turn's folder and each shared server's folder under it; Host
-opens the owner's `stderr.log` (the turn's or the server's) for the child;
+opens the owner's `stderr.log` (the turn's or the server's) for the anchor,
+which writes the vendor's stderr into it (§4);
 daemon bootstrap creates `vendor/`, and each adapter its own subdirectory,
 under the managed-directory rules above; `final_text.txt` and
 `structured_output.json` are written through `StoreClient`. Host owns
@@ -1070,7 +1098,11 @@ contention exits 75; a `store.lock` conflict exits 4. The CLI's
 auto-start retries a 75 exit within a 15 s startup budget and shows the
 daemon's startup stderr for other failures (amendment A3 in the Task 3
 design). Shutdown retains §5/§6 flush/join then lock
-release order. Do not bulk-delete anchor sockets at startup.
+release order. Do not bulk-delete anchor sockets at startup. Host removes
+an anchor's socket once that group's absence is committed (an armed anchor
+ends by its own group KILL and cannot unlink it), and startup reconciliation
+does the same for a socket an earlier daemon left whose anchor's absence is
+committed; a socket with no such proof is never touched.
 
 Default paths still form one per-user daemon. Explicit state/runtime pairs
 provide test isolation or relocate that single ordinary daemon; clients
@@ -1159,6 +1191,22 @@ the line is no durable report. It may be lost on Store failure or abrupt
 death, and the outer harness captures exit status and diagnostics.
 A result that cannot persist keeps F12's named `store_error` and
 `terminal_persisted:false`; no envelope is invented or replaced.
+
+`via.log` holds the daemon's own warnings and errors, chiefly those that
+belong to no turn: a startup failure after the log opened, with its whole
+cause chain (also on stderr, as the daemon's exit report), and the
+Store-failed latch, with its kind and scope, once: when final shutdown
+begins, or after its pipeline when first raised there (owner, 2026-10-04).
+Startup's recovery writes only counts. It never holds a prompt, vendor
+output or a turn's lifecycle, which the Store keeps; a Host or launch step
+outside the Store that fails and ends a turn is that turn's durable
+`launch_failed` warning event (C1 §6.1), and a Store write's failure is the
+turn's Store failure. The log is
+rotated by size: a line that would take it past 10 MiB first renames it
+`via.log.1`, replacing any earlier one, and goes to a new `via.log`, while
+the daemon runs as at its start; one earlier file is kept. When the new
+`via.log` cannot be opened (no file descriptor left, say), lines go on to
+`via.log.1` and each later line retries the open.
 
 ## 7. F12: persistent Store failure and crash reconciliation
 
