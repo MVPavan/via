@@ -1725,8 +1725,8 @@ async fn read_stdout<R: AsyncRead + Unpin>(
     if let Some(save) = saving {
         save.await;
     }
+    let length = splitter.unfinished_length();
     if !discard && let Some(tail) = splitter.finish() {
-        let length = tail.len();
         shared
             .keep_undecoded(
                 &tail,

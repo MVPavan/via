@@ -17,7 +17,7 @@ use tokio::time::Instant;
 use via_wire::testing::{TestInput, TestPipes, pipes, pipes_within};
 use via_wire::{
     Admitted, Deadline, FailureCause, InboundBounds, MAX_STDOUT_MESSAGE_BYTES, OutboundMessage,
-    SendOutcome, WireFailure, WireMessages, WriteBounds, WriteState, WriteTicket,
+    SendOutcome, WireError, WireFailure, WireMessages, WriteBounds, WriteState, WriteTicket,
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -790,6 +790,49 @@ async fn an_over_cap_line_is_skipped_to_its_lf() -> TestResult {
     }
     drop(vendor);
     end(messages, &input).await;
+    Ok(())
+}
+
+/// Review cfix-2: an over-cap line being skipped when stdout ends is
+/// `Unterminated`, and its note gives the line's whole length, not the
+/// length of the head kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unterminated_skipped_line_reports_its_length() -> TestResult {
+    const CAP: usize = 1024;
+    const SIZE: usize = 200 * 1024;
+    let bounds = InboundBounds {
+        message_bytes: CAP,
+        staging_bytes: 1024 * 1024,
+        skip_oversize: true,
+    };
+    let folder = Scratch::new("skip-eof")?;
+    let (stdout, mut vendor) = tokio::io::duplex(64 * 1024);
+    let (stdin, _vendor_stdin) = tokio::io::duplex(1024);
+    let TestPipes {
+        mut messages,
+        input,
+    } = pipes_within(stdout, stdin, folder.0.clone(), bounds);
+    let writer = tokio::spawn(async move {
+        vendor.write_all(&vec![b'u'; SIZE]).await?;
+        vendor.shutdown().await
+    });
+    let failure = messages.next_message().await.err();
+    assert!(
+        matches!(
+            failure,
+            Some(WireError::Message(WireFailure::UnterminatedMessage))
+        ),
+        "{failure:?}"
+    );
+    writer.await??;
+    messages.finish(after(Duration::from_secs(2))).await;
+    let note = input.take_undecoded();
+    assert!(
+        note.as_deref().is_some_and(
+            |note| note.contains(&format!("unterminated vendor message: {SIZE} bytes"))
+        ),
+        "{note:?}"
+    );
     Ok(())
 }
 

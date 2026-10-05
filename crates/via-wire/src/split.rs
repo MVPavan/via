@@ -195,6 +195,16 @@ impl LineSplitter {
         self.skipping = Some(skip);
     }
 
+    /// The unfinished line's whole length so far, in bytes: a skipped
+    /// line's count, not just the head [`Self::finish`] keeps of it
+    /// (review cfix-2).
+    pub fn unfinished_length(&self) -> u64 {
+        self.skipping.as_ref().map_or_else(
+            || u64::try_from(self.assembly.len()).unwrap_or(u64::MAX),
+            |skipping| skipping.length,
+        )
+    }
+
     /// The unfinished tail at EOF, if any: the in-band end `Unterminated`;
     /// a line being skipped gives its head.
     pub fn finish(self) -> Option<Vec<u8>> {
