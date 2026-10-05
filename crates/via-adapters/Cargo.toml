@@ -25,7 +25,11 @@ sha2 = { workspace = true }
 # The Codex decline bodies validate against the vendor schemas (x.3.2 X1).
 boon = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["rt"] }
+# Paused time (`start_paused`, `advance`) for the Codex driver tests.
+tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
+# The scripted Codex server and its Route runtime, test builds only
+# (x.3.2 X4; resolver 3 keeps the feature out of production builds).
+via-routes = { path = "../via-routes", features = ["test-support"] }
 
 [lints]
 workspace = true

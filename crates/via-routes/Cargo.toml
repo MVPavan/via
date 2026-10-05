@@ -9,6 +9,10 @@ publish.workspace = true
 [features]
 # Test-only failpoint controller (runtime-contracts §11); default off.
 test-failpoints = ["via-wire/test-failpoints"]
+# Test-only: the scripted Codex server (`codex::testing`) for the driver
+# tests of the layers above, over Wire's test pipes (x.3.2 X4); enabled
+# only from `[dev-dependencies]`, so no production build has it.
+test-support = ["via-wire/test-support", "tokio/io-util"]
 
 [dependencies]
 via-wire = { path = "../via-wire" }

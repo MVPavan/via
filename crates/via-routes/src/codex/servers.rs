@@ -21,8 +21,8 @@ use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio::time::{Instant, timeout_at};
 use via_wire::{
     CapacityToken, CloseMode, CloseRequest, Deadline, ExitReport, HostError, OutboundMessage,
-    PrivateProcessSpec, ProcessOwner, SendOutcome, ServerId, WireCleanup, WireError, WireParts,
-    WireSignals, WriteBounds,
+    PrivateProcessSpec, ProcessOwner, SendOutcome, ServerId, WireCleanup, WireError, WireMessages,
+    WireParts, WireSignals, WriteBounds,
 };
 
 use super::connection::{
@@ -30,6 +30,7 @@ use super::connection::{
 };
 use super::crash::{RegistryGuard, crash_on_panic, lock};
 use super::lane::LossCause;
+use super::stdio::Stdio;
 use super::{
     DeclineTable, InitializeResult, Model, ModelListResult, Response, initialize, initialized,
     model_list, result,
@@ -190,15 +191,31 @@ pub struct ServerEnd {
     pub exit: Option<ExitReport>,
 }
 
-/// One live server, as status lists it.
-#[derive(Clone, Debug)]
-pub struct LiveServer {
-    /// Its key.
-    pub key: ServerKey,
-    /// Its handshake facts.
-    pub facts: Arc<ServerFacts>,
-    /// Its holders: pins, reservations and leases.
-    pub holders: u32,
+/// One live server, as `daemon/status` lists it (C1 §3.14; x.3.2 X0 item
+/// 7): only a server whose handshake succeeded and that is not retiring.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServerReport {
+    /// The instance.
+    pub server: ServerId,
+    /// Its key as C1 shows it: the first 16 lower-case hex digits.
+    pub key: String,
+    /// `initialize`'s `userAgent`.
+    pub user_agent: String,
+    /// The sessions leasing it.
+    pub sessions: u32,
+}
+
+impl ServerKey {
+    /// The key as C1 `daemon/status` shows it: 16 lower-case hex digits
+    /// of its first 8 bytes.
+    pub fn short_hex(&self) -> String {
+        use std::fmt::Write as _;
+        self.0[..8].iter().fold(String::new(), |mut hex, byte| {
+            // Writing to a String cannot fail.
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
+    }
 }
 
 /// A launch's published result, sent before any transition out of
@@ -216,7 +233,10 @@ enum Entry {
     },
     Live {
         key: ServerKey,
+        /// Pins and leases: every lease is also a holder.
         holders: u32,
+        /// The attached sessions (x.3.2 X4 D2): `holders >= leases`.
+        leases: u32,
         connection: Arc<Connection>,
         facts: Arc<ServerFacts>,
     },
@@ -234,6 +254,20 @@ enum Work {
     Retire,
     Stop,
 }
+
+/// Which kind of hold a release gives back.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Hold {
+    /// A pin or a reservation.
+    Pin,
+    /// A session's lease, which is also a holder.
+    Lease,
+}
+
+/// The last holder of a live server left: it moved to `Retiring`, so the
+/// supervisor must be woken once the guard is dropped.
+#[must_use]
+struct Retire;
 
 /// Which task a set entry runs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -359,7 +393,15 @@ pub struct Servers {
     /// Never changed: the connection's wake.
     unwoken: watch::Sender<u64>,
     me: Weak<Servers>,
+    /// Test builds: scripted opens the launch job takes before Wire's
+    /// (x.3.2 X4, [`Self::script`]).
+    #[cfg(any(feature = "test-support", all(test, feature = "test-failpoints")))]
+    scripted: Mutex<std::collections::VecDeque<Scripted>>,
 }
+
+/// One scripted open: the connection's test stdio and message half.
+#[cfg(any(feature = "test-support", all(test, feature = "test-failpoints")))]
+type Scripted = (Arc<super::testing::TestStdio>, via_wire::WireMessages);
 
 /// A pin on one server: a reservation while it launches, a hold once it is
 /// live. Dropping it releases the hold; the last release retires the
@@ -410,11 +452,28 @@ impl ServerPin {
     /// The live server's connection and handshake facts; `None` while it
     /// launches or once it left `Live`.
     pub fn live(&self) -> Option<(Arc<Connection>, Arc<ServerFacts>)> {
-        let registry = self.servers.registry();
-        match &registry.servers.get(&self.server)?.entry {
+        self.servers.live_of(&self.server)
+    }
+
+    /// A session's lease on the pinned server (x.3.2 X4 D2): under one
+    /// guard, only while its entry is `Live` (the instance this pin
+    /// holds, as server IDs are never reused), it counts one more holder
+    /// and one more lease. `None` changes nothing: the server launches
+    /// still, or left `Live`.
+    pub fn lease(&self) -> Option<ServerLease> {
+        let mut registry = self.servers.registry();
+        let instance = registry.servers.get_mut(&self.server)?;
+        match &mut instance.entry {
             Entry::Live {
-                connection, facts, ..
-            } => Some((Arc::clone(connection), Arc::clone(facts))),
+                holders, leases, ..
+            } => {
+                *holders = holders.saturating_add(1);
+                *leases = leases.saturating_add(1);
+                Some(ServerLease {
+                    servers: Arc::clone(&self.servers),
+                    server: self.server.clone(),
+                })
+            }
             Entry::Launching { .. } | Entry::Retiring { .. } | Entry::Lost { .. } => None,
         }
     }
@@ -451,6 +510,59 @@ impl ServerPin {
     }
 }
 
+/// A session's lease on one live server, held from its attach until its
+/// generation drops (x.3.2 X4 D2; AD16): a holder too, so the server
+/// retires only once the last pin and lease went. Dropping it releases
+/// both counts under one guard.
+pub struct ServerLease {
+    servers: Arc<Servers>,
+    server: ServerId,
+}
+
+impl std::fmt::Debug for ServerLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServerLease")
+            .field("server", &self.server)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for ServerLease {
+    fn drop(&mut self) {
+        self.servers.release_hold(&self.server, Hold::Lease);
+    }
+}
+
+impl ServerLease {
+    /// The leased server.
+    pub fn server(&self) -> &ServerId {
+        &self.server
+    }
+
+    /// The live server's connection and handshake facts; `None` once it
+    /// left `Live`.
+    pub fn live(&self) -> Option<(Arc<Connection>, Arc<ServerFacts>)> {
+        self.servers.live_of(&self.server)
+    }
+
+    /// A pin on the leased server, unless it is no longer live.
+    pub fn pin(&self) -> Option<ServerPin> {
+        let mut registry = self.servers.registry();
+        let instance = registry.servers.get_mut(&self.server)?;
+        match &mut instance.entry {
+            Entry::Live { holders, .. } => {
+                *holders = holders.saturating_add(1);
+                Some(ServerPin {
+                    servers: Arc::clone(&self.servers),
+                    server: self.server.clone(),
+                })
+            }
+            Entry::Launching { .. } | Entry::Retiring { .. } | Entry::Lost { .. } => None,
+        }
+    }
+}
+
 impl Servers {
     /// An empty registry over the Route runtime; its supervisor starts with
     /// the first launch.
@@ -466,6 +578,8 @@ impl Servers {
             unforced: watch::Sender::new(None),
             unwoken: watch::Sender::new(0),
             me: me.clone(),
+            #[cfg(any(feature = "test-support", all(test, feature = "test-failpoints")))]
+            scripted: Mutex::default(),
         })
     }
 
@@ -514,25 +628,39 @@ impl Servers {
         }
     }
 
-    /// The live servers.
-    pub fn live(&self) -> Vec<LiveServer> {
-        self.registry()
+    /// The live servers as `daemon/status` lists them (x.3.2 X0 item 7):
+    /// one snapshot under the guard, `Live` entries only, each with its
+    /// lease count, by server ID.
+    pub fn reports(&self) -> Vec<ServerReport> {
+        let mut reports: Vec<ServerReport> = self
+            .registry()
             .servers
-            .values()
-            .filter_map(|instance| match &instance.entry {
+            .iter()
+            .filter_map(|(server, instance)| match &instance.entry {
                 Entry::Live {
-                    key,
-                    holders,
-                    facts,
-                    ..
-                } => Some(LiveServer {
-                    key: *key,
-                    facts: Arc::clone(facts),
-                    holders: *holders,
+                    key, leases, facts, ..
+                } => Some(ServerReport {
+                    server: server.clone(),
+                    key: key.short_hex(),
+                    user_agent: facts.user_agent.clone(),
+                    sessions: *leases,
                 }),
                 Entry::Launching { .. } | Entry::Retiring { .. } | Entry::Lost { .. } => None,
             })
-            .collect()
+            .collect();
+        reports.sort_by(|a, b| a.server.cmp(&b.server));
+        reports
+    }
+
+    /// `server`'s connection and handshake facts while it is `Live`.
+    fn live_of(&self, server: &ServerId) -> Option<(Arc<Connection>, Arc<ServerFacts>)> {
+        let registry = self.registry();
+        match &registry.servers.get(server)?.entry {
+            Entry::Live {
+                connection, facts, ..
+            } => Some((Arc::clone(connection), Arc::clone(facts))),
+            Entry::Launching { .. } | Entry::Retiring { .. } | Entry::Lost { .. } => None,
+        }
     }
 
     /// Item 2.2 `prepare`: a pin on the live or launching server of `key`,
@@ -657,13 +785,32 @@ impl Servers {
             .spawn_once(|| tokio::spawn(crash_on_panic(supervise(Arc::clone(servers)))));
     }
 
-    /// Releases one hold on `server`; the last on a live server retires it
-    /// (item 2.4). A release for a removed or replaced instance is a no-op.
+    /// Releases one pin on `server` (item 2.4).
     fn release(&self, server: &ServerId) {
-        let mut registry = self.registry();
+        self.release_hold(server, Hold::Pin);
+    }
+
+    /// Releases one `hold` on `server` under one guard, nothing nested;
+    /// the retirement it made, if any, is signalled after the guard.
+    fn release_hold(&self, server: &ServerId, hold: Hold) {
+        let retired = Self::release_locked(&mut self.registry(), server, hold);
+        if let Some(Retire) = retired {
+            self.bump();
+            self.work.notify_one();
+        }
+    }
+
+    /// Under the caller's guard (x.3.2 X4 D2): gives back one `hold` on
+    /// `server`. A lease counts down `leases` on a live entry; every hold
+    /// counts down `holders` while launching or live. At no holder left
+    /// on a live server it makes the one `Live → Retiring` transition
+    /// (item 2.4): the key unmapped, the retirement pending. Retiring and
+    /// lost entries ignore it; a removed or replaced instance's is a stale
+    /// count.
+    fn release_locked(registry: &mut Registry, server: &ServerId, hold: Hold) -> Option<Retire> {
         let Some(instance) = registry.servers.get_mut(server) else {
             registry.stale = registry.stale.saturating_add(1);
-            return;
+            return None;
         };
         let retire = match &mut instance.entry {
             Entry::Launching { holders, .. } => {
@@ -673,17 +820,19 @@ impl Servers {
             Entry::Live {
                 key,
                 holders,
+                leases,
                 connection,
                 ..
             } => {
+                if hold == Hold::Lease {
+                    *leases = leases.saturating_sub(1);
+                }
                 *holders = holders.saturating_sub(1);
                 (*holders == 0).then(|| (*key, Arc::clone(connection)))
             }
             Entry::Retiring { .. } | Entry::Lost { .. } => None,
         };
-        let Some((key, connection)) = retire else {
-            return;
-        };
+        let (key, connection) = retire?;
         instance.entry = Entry::Retiring {
             connection: Some(connection),
         };
@@ -691,9 +840,7 @@ impl Servers {
             instance.work = Some(Work::Retire);
         }
         registry.unmap(&key, server);
-        drop(registry);
-        self.bump();
-        self.work.notify_one();
+        Some(Retire)
     }
 
     /// Item 2.7 step 1: no new pin, reservation or launch; launch
@@ -975,6 +1122,7 @@ impl Servers {
                 instance.entry = Entry::Live {
                     key,
                     holders,
+                    leases: 0,
                     connection,
                     facts: Arc::new(facts),
                 };
@@ -1047,29 +1195,17 @@ async fn launch(servers: Arc<Servers>, server: ServerId, spec: PrivateProcessSpe
         }
     };
     tokio::pin!(fenced);
-    let gate = {
-        let fence = servers.fence.subscribe();
-        Arc::new(move || *fence.borrow())
-    };
-    let signals = WireSignals {
-        force: servers.unforced.subscribe(),
-        wake: servers.unwoken.subscribe(),
-        gate,
-    };
-    let open = servers
-        .runtime
-        .wire()
-        .open_connection(spec, deadline, signals);
+    // The open stays inside the fence's select, under the same deadline
+    // and signals, its Wire error unchanged (x.3.2 X4, Sol d8).
     let opened = tokio::select! {
-        opened = open => opened,
+        opened = servers.open(spec, deadline) => opened,
         () = &mut fenced => return Outcome::Launch(Err(LaunchFailure::Shutdown.into())),
     };
-    let connection = match opened {
-        Ok(connection) => connection,
+    let (stdio, messages) = match opened {
+        Ok(parts) => parts,
         Err(error) => return Outcome::Launch(Err(acquire_failure(&error).into())),
     };
-    let WireParts { sender, messages } = connection.into_parts();
-    let connection = Connection::new(server.clone(), sender, servers.declines);
+    let connection = Connection::over(server.clone(), stdio, servers.declines);
     servers.install(&server, &connection);
     let mut task: ConnectionTask = Box::pin(serve(Arc::clone(&connection), messages));
     // The version `initialize` read, kept whatever fails after it.
@@ -1098,6 +1234,74 @@ async fn launch(servers: Arc<Servers>, server: ServerId, spec: PrivateProcessSpe
                 user_agent: observed.get().cloned(),
             }),
     )
+}
+
+impl Servers {
+    /// The launch's Wire open (item 2.2): the server's connection under
+    /// `deadline`, its signals the registry's fence, the never-raised
+    /// force and the unchanged wake; as the connection's control half and
+    /// its unique message half. Test builds take a scripted open first,
+    /// when one is queued ([`Self::script`]).
+    async fn open(
+        &self,
+        spec: PrivateProcessSpec,
+        deadline: Deadline,
+    ) -> Result<(Arc<dyn Stdio>, WireMessages), WireError> {
+        #[cfg(any(feature = "test-support", all(test, feature = "test-failpoints")))]
+        if let Some((stdio, messages)) = self.scripted_next() {
+            stdio.hold(Box::new(spec));
+            return Ok((stdio, messages));
+        }
+        let gate = {
+            let fence = self.fence.subscribe();
+            Arc::new(move || *fence.borrow())
+        };
+        let signals = WireSignals {
+            force: self.unforced.subscribe(),
+            wake: self.unwoken.subscribe(),
+            gate,
+        };
+        let connection = self
+            .runtime
+            .wire()
+            .open_connection(spec, deadline, signals)
+            .await?;
+        let WireParts { sender, messages } = connection.into_parts();
+        Ok((Arc::new(sender), messages))
+    }
+}
+
+/// Test builds (x.3.2 X4): scripted servers, launched by the registry's
+/// own launch job over Wire's test pipes.
+#[cfg(any(feature = "test-support", all(test, feature = "test-failpoints")))]
+impl Servers {
+    /// Queues one scripted open: the next launch job takes it instead of
+    /// Wire's, and holds its launch spec (and capacity) until the close,
+    /// as Host would for the process. Everything after the open is the
+    /// production path: `install`, the inline handshake, publication, the
+    /// connection task's ownership and readiness. The test plays the
+    /// vendor on the returned ends, and queues the script before the
+    /// launch it means is reserved.
+    pub fn script(&self) -> (super::testing::VendorEnds, Arc<super::testing::TestStdio>) {
+        let (stdout, vendor_out) = tokio::io::duplex(1 << 20);
+        let (vendor_in, stdin) = tokio::io::duplex(1 << 20);
+        let scratch = super::testing::Scratch::new();
+        let pipes = via_wire::testing::pipes(vendor_out, vendor_in, scratch.path().to_path_buf());
+        let test_stdio = Arc::new(super::testing::TestStdio::new(pipes.input, scratch));
+        self.scripted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push_back((Arc::clone(&test_stdio), pipes.messages));
+        (super::testing::VendorEnds::new(stdout, stdin), test_stdio)
+    }
+
+    /// The next scripted open, if one is queued.
+    fn scripted_next(&self) -> Option<Scripted> {
+        self.scripted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
+    }
 }
 
 /// Host's acquisition failure as a launch failure (as a private route's
@@ -1276,6 +1480,11 @@ async fn stop(connection: Arc<Connection>) -> Outcome {
         .await;
     Outcome::Stopped(report.vendor_exit)
 }
+
+#[cfg(test)]
+#[cfg(feature = "test-failpoints")]
+#[path = "servers_tests.rs"]
+mod tests;
 
 #[cfg(test)]
 mod handle_tests {

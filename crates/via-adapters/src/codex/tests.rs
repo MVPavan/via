@@ -1311,6 +1311,8 @@ async fn admission_credit_waits_beside_its_cutoffs() {
                 soon + Duration::from_secs(60)
             }),
             cancel: CancellationToken::new(),
+            tool_grace: Duration::from_secs(60),
+            first: None,
         };
         let cutoff = async {
             tokio::time::sleep_until(soon).await;
@@ -1319,6 +1321,7 @@ async fn admission_credit_waits_beside_its_cutoffs() {
                     stop.send_replace(Some(StopOrder {
                         cause: StopCause::Close,
                         requested_at: String::new(),
+                        attached: soon,
                         force_at: Deadline::at(soon),
                         close_by: Deadline::at(soon + Duration::from_secs(3)),
                     }));
@@ -1388,6 +1391,8 @@ async fn a_full_cap_is_credit_exhaustion() {
         close,
         wall: Deadline::at(Instant::now() + Duration::from_secs(60)),
         cancel: CancellationToken::new(),
+        tool_grace: Duration::from_secs(60),
+        first: None,
     };
     let health = watch::Sender::new(DriverHealth::Open);
     assert_eq!(
@@ -1471,6 +1476,8 @@ async fn the_start_gate_waits_beside_its_cutoffs() {
                 soon + Duration::from_secs(60)
             }),
             cancel: CancellationToken::new(),
+            tool_grace: Duration::from_secs(60),
+            first: None,
         };
         let cutoff = async {
             tokio::time::sleep_until(soon).await;
@@ -1479,6 +1486,7 @@ async fn the_start_gate_waits_beside_its_cutoffs() {
                     stop.send_replace(Some(StopOrder {
                         cause: StopCause::Close,
                         requested_at: String::new(),
+                        attached: soon,
                         force_at: Deadline::at(soon),
                         close_by: Deadline::at(soon + Duration::from_secs(3)),
                     }));
@@ -1577,6 +1585,8 @@ fn the_start_gate_has_no_stall_arm() {
             close,
             wall: Deadline::at(Instant::now() + Duration::from_secs(3600)),
             cancel: CancellationToken::new(),
+            tool_grace: Duration::from_secs(60),
+            first: None,
         };
         let gate = Some((lane.as_ref(), &*registration));
         let waiting = credited(&cap, (&mut orders, &mut force, &health), gate);
@@ -1672,6 +1682,8 @@ async fn a_paired_reply_under_a_failed_generation() {
             close,
             wall: Deadline::at(Instant::now() + Duration::from_secs(60)),
             cancel: CancellationToken::new(),
+            tool_grace: Duration::from_secs(60),
+            first: None,
         };
         let ended = await_reply(
             (written, reply),

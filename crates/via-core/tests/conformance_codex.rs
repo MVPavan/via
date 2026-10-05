@@ -83,11 +83,15 @@ macro_rules! cases {
 
 cases! {
     green:
+    c0_server_lost,
     c10_read_only_refused,
     c4b_workspace_write_refused,
     codex_bound_gate_refusals,
     c11_failed_command,
     c1_commentary_usage,
+    c3_interrupt_uncertain,
+    c3_wall_interrupt,
+    c4_two_sessions,
     c5_resume,
     c5_resume_missing,
     c6_cold_initialize,
@@ -96,11 +100,7 @@ cases! {
     c8_auth,
     c9_output_schema;
     red:
-    c0_server_lost = "red until via-5lr.3.2 X4 (server loss across sessions)",
-    c2_steer = "red until via-5lr.3.2 X4 (native steer)",
-    c3_interrupt_uncertain = "red until via-5lr.3.2 X4 (interrupt and P7)",
-    c3_wall_interrupt = "red until via-5lr.3.2 X4 (the wall's soft stop)",
-    c4_two_sessions = "red until via-5lr.3.2 X4 (leases across sessions)",
+    c2_steer = "deferred past the first release (via-gaz): Codex steer is unsupported",
 }
 
 /// Green now: every expectation file has a case test and a replay fixture,
@@ -1438,6 +1438,85 @@ fn codex_discovery_feeds_models() {
     conformance_expect::check(&expect, &outcome).unwrap();
 }
 
+/// x.3.2 X4 K0 (O1; owner 2026-10-04: Codex steer is deferred past the
+/// first release, via-gaz): the declared steer capability and the driver
+/// agree. `describe` declares steer unsupported, a plan requiring it is
+/// refused `missing_capability:steer`, and a Codex session's
+/// `SessionDriver::steer` answers `Unsupported` before any vendor I/O.
+#[test]
+fn codex_steer_declaration_matches_the_driver() {
+    let name = "codex_bound_gate_refusals";
+    let dir = fixtures();
+    let expect = conformance_expect::load(&dir, name).unwrap();
+    let pure = conformance_drive::Pure::run(
+        "codex",
+        name,
+        &expect,
+        &dir.join(format!("{name}.replay.json")),
+    )
+    .unwrap();
+    let describe = via_adapters::DescribeRequest {
+        harness: Some("codex".to_owned()),
+        model: Some("gpt-6-sol".to_owned()),
+        ..via_adapters::DescribeRequest::default()
+    };
+    let plan = pure.set.plan(&describe).unwrap();
+    let declared = serde_json::to_value(&plan.capabilities).unwrap();
+    assert_eq!(declared["verbs"]["steer"]["support"], "unsupported");
+    let requiring = via_adapters::DescribeRequest {
+        require: vec![via_adapters::VerbReq::parse("steer").unwrap()],
+        ..describe
+    };
+    let refused = match pure.set.plan(&requiring) {
+        Ok(plan) => plan.refusals.first().map(conformance_drive::refusal_name),
+        Err(refusal) => Some(conformance_drive::refusal_name(&refusal)),
+    };
+    assert_eq!(refused.as_deref(), Some("missing_capability:steer"));
+    let session = via_adapters::SessionRef {
+        harness: plan.harness.to_owned(),
+        route: plan.route.to_owned(),
+        adapter_version: plan.adapter_version.clone(),
+    };
+    let spec = via_adapters::SessionSpec {
+        session_id: via_store::SessionId::try_from("s_000000000001").unwrap(),
+        model: plan.model.resolved.clone(),
+        instructions: None,
+        initial_bound: None,
+        cwd: PathBuf::from("/work/project"),
+        vendor: via_adapters::VendorOptions::new(),
+        inherit: via_adapters::InheritPlan {
+            requested: plan.inherit.requested,
+            effective: plan.inherit.effective,
+        },
+        confirmed_vendor_session_id: None,
+        allow_untested: false,
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let launches = pure.launches().unwrap();
+    let steered = runtime.block_on(async {
+        let (observations, _receiver) = via_adapters::observation_channel();
+        let cx = via_adapters::SessionCx {
+            observations,
+            tracker: via_adapters::TaskTracker::new(),
+            cancel: via_adapters::CancellationToken::new(),
+        };
+        let driver = pure.set.open_session(&session, spec, cx);
+        driver
+            .steer(via_adapters::SteerInput {
+                turn: via_adapters::TurnNumber::try_from(1).unwrap(),
+                token: via_adapters::SteerToken::new(1),
+                text: "steer".to_owned(),
+                expected_vendor_turn: None,
+            })
+            .await
+    });
+    assert_eq!(steered, Err(via_adapters::SteerError::Unsupported));
+    assert_eq!(pure.launches().unwrap(), launches, "no vendor I/O");
+}
+
 /// F13 (packet §8 `codex_pin_handshake`): one initialize/initialized per
 /// connection, with neither an experimental capability nor an opt-out
 /// (every fixture's first step pins their absence); the version comes
@@ -1627,6 +1706,9 @@ fn codex_start_order() {
         )
         .unwrap();
         failed_after_acceptance(&mut expect, "protocol", "quiescent");
+        // Host stopped the failed server before the turn's lane ended: the
+        // turn's linked server anchor has its absence proof (x.3.2 X4 K0).
+        turn_mut(&mut expect, 0)["expect"]["group_absent"] = json!(true);
         // The failed generation's continuity is unproven: its retirement
         // folds `uncertain` (x.3.2 X3 §6.6, F3).
         expect["sessions"]["main"]["close"]["cleanup"] = json!("uncertain");
@@ -1649,6 +1731,9 @@ fn codex_start_order() {
         {"kind": "session.vendor_identity_confirmed", "vendor_session_id": THREAD,
             "generation": 1},
     ]);
+    // Host stopped the failed server before the start's record went: the
+    // turn's linked server anchor has its absence proof (x.3.2 X4 K0).
+    turn_mut(&mut expect, 0)["expect"]["group_absent"] = json!(true);
     // The failed generation's retirement folds `uncertain` (x.3.2 X3
     // §6.6, F3).
     expect["sessions"]["main"]["close"]["cleanup"] = json!("uncertain");
@@ -1664,6 +1749,9 @@ fn codex_start_order() {
     )
     .unwrap();
     unaccepted(&mut expect, "server_lost", tested());
+    // The server's group was proven absent before the start's record went
+    // (x.3.2 X4 K0: the turn's linked server anchor).
+    turn_mut(&mut expect, 0)["expect"]["group_absent"] = json!(true);
     // The generation's registration retires with no close (x.3.2 X3 §6.5,
     // F3): its continuity is unproven, so its fold is `uncertain`.
     expect["sessions"]["main"]["close"]["cleanup"] = json!("uncertain");
@@ -1780,6 +1868,8 @@ fn codex_start_order() {
     // A connection-wide failure keeps its Route path: the stopped server
     // proves the turn's cleanup.
     turn_mut(&mut expect, 0)["expect"]["cleanup"] = json!("quiescent");
+    // Its linked server anchor has that absence proof (x.3.2 X4 K0).
+    turn_mut(&mut expect, 0)["expect"]["group_absent"] = json!(true);
     expect["sessions"]["main"]["close"] = json!({
         "mode": "graceful", "vendor_closed": false, "cleanup": "uncertain",
     });
@@ -2931,6 +3021,19 @@ fn codex_exhaustion_fails_the_shared_connection() {
         // nothing. B's end is the connection's loss, whose evidence is
         // Host's stop of the server.
         turn["cleanup"] = json!(if index == 0 { "uncertain" } else { "quiescent" });
+        // No stop in this variant (c4's turn 0 states the stop's facts).
+        turn["stop_facts"] = Value::Null;
+        // B's end is the loss, after Host's stop: its linked server anchor
+        // has its absence proof (x.3.2 X4 K0). A ends at its overflow,
+        // while Host's stop may still run, so whether the proof was
+        // committed by then is not the turn's fact: it is left unstated.
+        if index == 0 {
+            if let Some(turn) = turn.as_object_mut() {
+                turn.remove("group_absent");
+            }
+        } else {
+            turn["group_absent"] = json!(true);
+        }
         if let Some(turn) = turn.as_object_mut() {
             turn.remove("cleanup_settles");
         }
@@ -3993,4 +4096,253 @@ fn contradicted_refusal(name: &str) -> Result<(Value, Value), String> {
     expect["sessions"]["main"]["close"] = Value::Null;
     expect["sessions"]["main"]["health"] = json!({"state": "failed", "first_cause": "protocol"});
     Ok((replay, expect))
+}
+
+/// x.3.2 X4 D4.2 (`c3_cancel_before_wall_noticed_late`, d2 #1, the
+/// adapter's half): Core's cancel, capped at the turn's wall, is attached
+/// before the wall while the accepted turn's wait is held before it polls
+/// its orders (`adapter.codex.ordered`); the harness releases it once its
+/// own clock reached the wall. The wait notices the order only after the
+/// wall: provenance is the order's (`attached < wall`), so the vendor's
+/// interrupted terminal, decoded after the wall, is the turn's `Ok` (the
+/// order's row), never the wall's `Deadline`. The tool stays open: the
+/// wall caps P7, so the turn settles at its terminal, `uncertain`.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn c3_cancel_before_wall_noticed_late() {
+    let name = "c3_cancel_before_wall_noticed_late";
+    let _points = armed(
+        "adapter.codex.ordered",
+        json!({"occurrence": 1, "action": "pause"}),
+    )
+    .unwrap();
+    let mut replay = replay_of("c3_interrupt_uncertain").unwrap();
+    let mut expect = expect_of("c3_interrupt_uncertain").unwrap();
+    replay["source"] = json!(format!("{name}: a variant of c3_interrupt_uncertain"));
+    expect["source"] = replay["source"].clone();
+    let turn = turn_mut(&mut expect, 0);
+    turn["deadlines"] = json!({"wall_ms": 1500});
+    let turn = &mut turn["expect"];
+    turn["error"] = Value::Null;
+    turn["cleanup_settles"] = json!("at_terminal");
+    turn["stop_facts"] = json!({"acknowledged": true, "forced": false, "shared": false});
+    turn["notes"] = json!(
+        "A cancel attached before the wall, noticed after it: the order's row (Ok with the \
+         interrupted terminal), never the wall's Deadline; the wall caps P7 at once."
+    );
+    let knobs = conformance_run::Knobs {
+        order_noticed_late: true,
+        ..conformance_run::Knobs::default()
+    };
+    check_variant(name, &replay, &expect, knobs).unwrap();
+}
+
+/// x.3.2 X4 D4.2 R1 (`c3_cancel_after_wall`, the adapter's half): the
+/// wall fires, the adapter writes `turn/interrupt` and holds `run_turn`
+/// in its 3 s cleanup; held at a gate after reading it, the fake waits
+/// while Core's cancel, capped at the wall, is attached after the wall.
+/// The vendor's interrupted terminal then comes: provenance stays the
+/// wall's, so the turn is the wall's `Deadline`, acknowledged and shared,
+/// keeping its terminal (`c3_wall_interrupt`'s expectation).
+#[test]
+fn c3_cancel_after_wall() {
+    let name = "c3_cancel_after_wall";
+    let mut replay = replay_of("c3_wall_interrupt").unwrap();
+    let mut expect = expect_of("c3_wall_interrupt").unwrap();
+    replay["source"] = json!(format!("{name}: a variant of c3_wall_interrupt"));
+    expect["source"] = replay["source"].clone();
+    let interrupt = step_with(&replay, "\"turn/interrupt\"").unwrap();
+    steps(&mut replay).unwrap().insert(
+        interrupt + 1,
+        json!({"await_signal": {"signal": "SIGUSR1"}}),
+    );
+    // One-based: the gate is the step after the interrupt's expectation.
+    let gate = "at 24 launch 1";
+    assert_eq!(gate, format!("at {} launch 1", interrupt + 2));
+    let knobs = conformance_run::Knobs {
+        order_after_wall: Some(gate),
+        ..conformance_run::Knobs::default()
+    };
+    check_variant(name, &replay, &expect, knobs).unwrap();
+}
+
+/// F16b (`codex_cleanup_60s`, protocol only, real time): variants of
+/// `c3_interrupt_uncertain` (300 ms grace) after its interrupted terminal.
+/// The open tool's matching completion during the window settles
+/// `quiescent` when it ends; another item's completion ends nothing, so
+/// the window does (`uncertain`); a completion, or a second
+/// `turn/completed`, after settlement changes nothing of the turn. One
+/// launch throughout, and the shared server is never stopped (the replay
+/// ends at VIA's stdin close after its last close).
+#[test]
+fn codex_cleanup_60s() {
+    const EXEC: &str = "exec-019a0000-0000-7000-8000-000000400004";
+    let completion = |item: &str| {
+        json!({"method": "item/completed", "params": {"threadId": THREAD, "turnId": TURN,
+            "item": {"type": "commandExecution", "id": item, "command": "/bin/bash -lc 'sleep 75'",
+                "cwd": "/work/project", "commandActions": [], "status": "completed",
+                "exitCode": 0}}})
+    };
+    let second = json!({"method": "turn/completed", "params": {"threadId": THREAD,
+        "turn": {"id": TURN, "items": [], "status": "completed"}}});
+    for (variant, delay_ms, line, cleanup, settles) in [
+        (
+            "tools_end",
+            150,
+            completion(EXEC),
+            "quiescent",
+            "when_tools_end",
+        ),
+        (
+            "wrong_id",
+            150,
+            completion("exec-other"),
+            "uncertain",
+            "at_p7_bound",
+        ),
+        (
+            "late_completion",
+            600,
+            completion(EXEC),
+            "uncertain",
+            "at_p7_bound",
+        ),
+        ("late_terminal", 600, second, "uncertain", "at_p7_bound"),
+    ] {
+        let name = format!("codex_cleanup_60s_{variant}");
+        let mut replay = replay_of("c3_interrupt_uncertain").unwrap();
+        let mut expect = expect_of("c3_interrupt_uncertain").unwrap();
+        replay["source"] = json!(format!("{name}: a variant of c3_interrupt_uncertain"));
+        expect["source"] = replay["source"].clone();
+        let terminal = step_with(&replay, "\"status\":\"interrupted\"").unwrap();
+        let all = steps(&mut replay).unwrap();
+        all.insert(terminal + 1, json!({"delay": {"ms": delay_ms}}));
+        all.insert(terminal + 2, emit(&line));
+        if delay_ms > 300 {
+            // Settled first: the close's unsubscribe answers the terminal
+            // (one-based), not the later line.
+            all[terminal + 3]["expect"]["after_emit"] = json!(terminal + 1);
+        }
+        let turn = &mut turn_mut(&mut expect, 0)["expect"];
+        turn["cleanup"] = json!(cleanup);
+        turn["cleanup_settles"] = json!(settles);
+        if variant == "tools_end" {
+            turn["observations_include"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"kind": "progress", "tools_ended": [EXEC]}));
+            expect["sessions"]["main"]["close"]["cleanup"] = json!("quiescent");
+        }
+        check_variant(&name, &replay, &expect, conformance_run::Knobs::default())
+            .unwrap_or_else(|why| panic!("{why}"));
+    }
+}
+
+/// x.3.2 X4 K5 (`codex_server_close`; items 2, 7): two sessions lease one
+/// server (`c4_two_sessions`); once both closed, `servers()` lists none:
+/// each close released its lease, and the last release retired it.
+#[test]
+fn codex_server_close() {
+    let name = "codex_server_close";
+    let mut replay = replay_of("c4_two_sessions").unwrap();
+    let mut expect = expect_of("c4_two_sessions").unwrap();
+    replay["source"] = json!(format!("{name}: c4_two_sessions"));
+    expect["source"] = replay["source"].clone();
+    check_variant_then(name, &replay, &expect, |pure| {
+        let servers = pure.set.servers();
+        if servers.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("live after both closes: {servers:?}"))
+        }
+    })
+    .unwrap();
+}
+
+/// x.3.2 X4 K5 (`codex_two_threads`; item 8): `c4_two_sessions` with
+/// repeated item IDs across the two threads. B's message reuses A's
+/// message ID, and B's command reuses the ID of A's command, which stays
+/// open; B's command ends right after A's interrupted terminal, while A
+/// drains, and A still settles `uncertain` at its P7 bound: B's item never
+/// reaches A's ledger. After A's unsubscribe reply (A's cutoff), a late
+/// completion of A's command is dropped: B's ledger ends that ID once.
+#[test]
+fn codex_two_threads() {
+    const SHARED: &str = "exec-019a0000-0000-7000-8000-000000400007";
+    const B_TOOL: &str = "exec-019a0000-0000-7000-8000-000000400006";
+    let name = "codex_two_threads";
+    let mut replay = replay_of("c4_two_sessions").unwrap();
+    let mut expect = expect_of("c4_two_sessions").unwrap();
+    replay["source"] = json!(format!("{name}: a variant of c4_two_sessions"));
+    expect["source"] = replay["source"].clone();
+    let b_thread = "019a0000-0000-7000-8000-000000100002";
+    let all = steps(&mut replay).unwrap();
+    for step in all.iter_mut() {
+        let Some(line) = step["emit"]["line"].as_str() else {
+            continue;
+        };
+        if line.contains(b_thread) {
+            let line = line.replace(B_TOOL, SHARED).replace("msg_0005", "msg_0003");
+            step["emit"]["line"] = json!(line);
+        }
+    }
+    let a_terminal = step_with(&replay, "\"status\":\"interrupted\"").unwrap();
+    let b_tool_end = step_with(
+        &replay,
+        &format!(
+            "\"method\":\"item/completed\",\"params\":{{\"item\":\
+             {{\"type\":\"commandExecution\",\"id\":\"{SHARED}\""
+        ),
+    )
+    .unwrap();
+    let all = steps(&mut replay).unwrap();
+    // Steps 35 and 43 (one-based) are A's command start and B's command
+    // end; the end moves to right after A's terminal (step 40).
+    assert_eq!(b_tool_end, 42, "B's command end");
+    assert!(
+        all[b_tool_end]["emit"]["line"]
+            .as_str()
+            .unwrap()
+            .contains("item/completed")
+    );
+    let moved = all.remove(b_tool_end);
+    all.insert(a_terminal + 1, moved);
+    let unsubscribed = a_terminal + 3;
+    assert!(
+        all[unsubscribed]["emit"]["line"]
+            .as_str()
+            .unwrap()
+            .contains("unsubscribed")
+    );
+    all.insert(
+        unsubscribed + 1,
+        emit(
+            &json!({"method": "item/completed", "params": {"threadId": THREAD, "turnId": TURN,
+            "item": {"type": "commandExecution", "id": SHARED, "command": "/bin/bash -lc 'sleep 75'",
+                "cwd": "/work/project-a", "commandActions": [], "status": "completed",
+                "exitCode": 0}}}),
+        ),
+    );
+    let b = turn_mut(&mut expect, 1);
+    *b = serde_json::from_str(&b.to_string().replace(B_TOOL, SHARED)).unwrap();
+    let outcome = checked_outcome(
+        name,
+        &replay,
+        &expect,
+        conformance_run::Knobs::default(),
+        |_| Ok(()),
+    )
+    .unwrap_or_else(|why| panic!("{why}"));
+    let ended = |turn: &conformance_expect::TurnOutcome| {
+        turn.observations
+            .iter()
+            .filter(|observation| {
+                observation["tools_ended"]
+                    .as_array()
+                    .is_some_and(|ended| ended.contains(&json!(SHARED)))
+            })
+            .count()
+    };
+    assert_eq!(ended(&outcome.turns[1]), 1, "B ends its command once");
+    assert_eq!(ended(&outcome.turns[0]), 0, "A's command never ends");
 }

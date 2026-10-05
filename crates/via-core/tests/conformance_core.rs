@@ -25,6 +25,9 @@ use via_core::{
     SpawnParams, WaitParams,
 };
 
+#[path = "support/core_codex.rs"]
+mod core_codex;
+
 const CHILD: &str = "VIA_CONFORMANCE_CORE_CHILD";
 const HANDLE: &str = "h_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 /// Bound on one child case.
@@ -63,7 +66,8 @@ fn child(name: &str, scenario: &Value, env: &[(&str, &str)]) -> Option<PathBuf> 
     fs::set_permissions(&scenario_path, fs::Permissions::from_mode(0o600)).unwrap();
     let mut command = Command::new(env::current_exe().unwrap());
     command
-        .args(["--exact", name, "--nocapture"])
+        // An ignored case run on purpose runs in its child too.
+        .args(["--exact", name, "--nocapture", "--include-ignored"])
         .env(CHILD, root.path())
         .env("VIA_FAKE_AGENT_BINARY", binary("via-fake-agent"))
         .env("VIA_FAKE_SCENARIO", &scenario_path)
@@ -113,10 +117,18 @@ struct Daemon {
 
 impl Daemon {
     fn open(root: &Path) -> Self {
+        Self::open_with(
+            root,
+            AdapterConfig::load(BootstrapEnv::capture(), None).unwrap(),
+        )
+    }
+
+    /// Opens with the adapter config `adapters`.
+    fn open_with(root: &Path, adapters: AdapterConfig) -> Self {
         let engine = Engine::open(
             &root.join("state"),
             &root.join("runtime"),
-            AdapterConfig::load(BootstrapEnv::capture(), None).unwrap(),
+            adapters,
             binary("via"),
         )
         .unwrap();
@@ -3698,6 +3710,593 @@ fn core_a_revision_not_committed_is_retried_once() {
         assert_eq!(envelope["revision"], 0, "{envelope}");
         assert_eq!(envelope["state"], "unknown", "{envelope}");
         assert!(revisions(&daemon, &session).await.is_empty());
+        daemon.shutdown().await;
+    });
+}
+
+// x.3.2 X4: the order's attach instant (I11), Core's `by_order` guard
+// (R1) and P7 through Engine (design §5 "Ordering evidence", "Codex under
+// Engine"). No ordering claim rests on a time offset: each step waits on
+// an acknowledged seam or a progress line, and an instant is compared with
+// the wall by causal bounds (`t_s + W <= wall <= t_c + W`).
+
+/// Core's cancel, before its order's publication (pause seam).
+#[cfg(feature = "test-failpoints")]
+const PUBLISH: &str = "core.cancel.publish";
+/// Core's cancel, past its order's attach.
+#[cfg(feature = "test-failpoints")]
+const ORDERED: &str = "core.cancel.ordered";
+/// The driver's turn returned, before disposition.
+#[cfg(feature = "test-failpoints")]
+const RETURNED: &str = "core.run.returned";
+/// The submission clock was taken, before the submission's commit.
+#[cfg(feature = "test-failpoints")]
+const SUBMIT: &str = "core.submit.before_commit";
+/// An accepted Codex turn's wait, before it polls its orders.
+#[cfg(feature = "test-failpoints")]
+const CODEX_ORDERED: &str = "adapter.codex.ordered";
+
+/// Arms `point` to acknowledge every hit from `occurrence` on.
+#[cfg(feature = "test-failpoints")]
+fn acknowledge_every(root: &Path, point: &str, occurrence: u64) {
+    let command = json!({"token":"conformance-core","occurrence":occurrence,
+                         "action":"delay","value":0,"persist":true});
+    fs::write(
+        root.join("points").join(format!("{point}.json")),
+        command.to_string(),
+    )
+    .unwrap();
+}
+
+/// The envelope's `cancel` `{outcome, cleanup}`.
+fn stop_pair(envelope: &Value) -> (&Value, &Value) {
+    (
+        &envelope["cancel"]["outcome"],
+        &envelope["cancel"]["cleanup"],
+    )
+}
+
+/// The persistent profile's `answers` script: the wall's interrupt is
+/// answered `interrupted`.
+#[cfg(feature = "test-failpoints")]
+fn answers() -> Value {
+    script(
+        "answers",
+        &[
+            accepted(1),
+            expect_interrupt(1),
+            terminal(1, "interrupted", "interrupted"),
+        ],
+    )
+}
+
+/// The fake-profile wall.
+#[cfg(feature = "test-failpoints")]
+const WALL: Duration = Duration::from_millis(2_000);
+
+/// d3 (I11, delayed publication): a cancel held before the wall at
+/// `core.cancel.publish` publishes after the wall fired and Route returned
+/// `Deadline` with the vendor's acknowledgement; disposition waits for the
+/// publication. The order's `attached` is its publication, after the wall,
+/// so the result is the wall's, `failed(deadline_wall)` acknowledged and
+/// quiescent, never the order's `unknown`.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_cancel_published_after_wall() {
+    let Some(root) = child(
+        "core_cancel_published_after_wall",
+        &scenario(&persistent(), &[answers()]),
+        &[],
+    ) else {
+        return;
+    };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    arm(&root, PUBLISH, "pause");
+    arm(&root, RETURNED, "pause");
+    acknowledge(&root, ORDERED, 1);
+    run(async {
+        let daemon = Daemon::open(&root);
+        let started = tokio::time::Instant::now();
+        let wall = json!({"deadlines":{"wall_ms":WALL.as_millis()}});
+        let session = daemon.spawn("answers", &wall).await;
+        let ((), ()) = tokio::join!(cancel(&daemon, &session, 1, 60_000), async {
+            until_acked(&root, PUBLISH, 1).await;
+            assert!(
+                tokio::time::Instant::now() < started + WALL,
+                "the cancel is held before the wall"
+            );
+            until_acked(&root, RETURNED, 1).await;
+            release_point(&root, PUBLISH, 1);
+            until_acked(&root, ORDERED, 1).await;
+            release_point(&root, RETURNED, 1);
+        });
+        let envelope = daemon.wait(&session, 1).await;
+        assert_eq!(envelope["state"], "failed", "{envelope}");
+        assert_eq!(class(&envelope), "deadline_wall", "{envelope}");
+        assert_eq!(
+            stop_pair(&envelope),
+            (&json!("acknowledged"), &json!("quiescent")),
+            "{envelope}"
+        );
+        daemon.shutdown().await;
+    });
+}
+
+/// d3 (I11, reversed concurrent callers): cancel A is held before the
+/// wall; after the wall's `Deadline`, cancel B publishes, then A merges
+/// into B's order. A's earlier call never re-dates the order: the result
+/// is the wall's, and both replies resolve.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_cancel_reversed_publication() {
+    let Some(root) = child(
+        "core_cancel_reversed_publication",
+        &scenario(&persistent(), &[answers()]),
+        &[],
+    ) else {
+        return;
+    };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    arm(&root, PUBLISH, "pause");
+    arm(&root, RETURNED, "pause");
+    acknowledge_every(&root, ORDERED, 1);
+    run(async {
+        let daemon = Daemon::open(&root);
+        let started = tokio::time::Instant::now();
+        let wall = json!({"deadlines":{"wall_ms":WALL.as_millis()}});
+        let session = daemon.spawn("answers", &wall).await;
+        let ((), ()) = tokio::join!(cancel(&daemon, &session, 1, 60_000), async {
+            until_acked(&root, PUBLISH, 1).await;
+            assert!(
+                tokio::time::Instant::now() < started + WALL,
+                "cancel A is held before the wall"
+            );
+            until_acked(&root, RETURNED, 1).await;
+            let ((), ()) = tokio::join!(cancel(&daemon, &session, 1, 60_000), async {
+                until_acked(&root, ORDERED, 1).await;
+                release_point(&root, PUBLISH, 1);
+                until_acked(&root, ORDERED, 2).await;
+                release_point(&root, RETURNED, 1);
+            });
+        });
+        let envelope = daemon.wait(&session, 1).await;
+        assert_eq!(envelope["state"], "failed", "{envelope}");
+        assert_eq!(class(&envelope), "deadline_wall", "{envelope}");
+        assert_eq!(
+            stop_pair(&envelope),
+            (&json!("acknowledged"), &json!("quiescent")),
+            "{envelope}"
+        );
+        daemon.shutdown().await;
+    });
+}
+
+/// d3 minor (R1 on the private lifecycle Claude shares): an order attached
+/// after the private route's wall force, while the turn is still
+/// `running`, leaves the wall's result, `failed(deadline_wall)`, with the
+/// same `cancel` pair as the same script's wall run without a cancel.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_private_cancel_after_wall() {
+    let hangs = [hello("1.0", &["turns"]), accepted(1), hang()];
+    let Some(root) = child(
+        "core_private_cancel_after_wall",
+        &scenario(
+            &handshake(),
+            &[script("twin", &hangs), script("late", &hangs)],
+        ),
+        &[],
+    ) else {
+        return;
+    };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    arm_at(&root, RETURNED, 2, "pause");
+    acknowledge(&root, ORDERED, 1);
+    run(async {
+        let daemon = Daemon::open(&root);
+        let wall = json!({"deadlines":{"wall_ms":1_500}});
+        let twin = daemon.spawn("twin", &wall).await;
+        let twin = daemon.wait(&twin, 1).await;
+        assert_eq!(class(&twin), "deadline_wall", "{twin}");
+        assert_eq!(twin["cancel"]["outcome"], "forced", "{twin}");
+        let session = daemon.spawn("late", &wall).await;
+        until_acked(&root, RETURNED, 2).await;
+        let ((), ()) = tokio::join!(cancel(&daemon, &session, 1, 60_000), async {
+            until_acked(&root, ORDERED, 1).await;
+            release_point(&root, RETURNED, 2);
+        });
+        let envelope = daemon.wait(&session, 1).await;
+        assert_eq!(envelope["state"], "failed", "{envelope}");
+        assert_eq!(class(&envelope), "deadline_wall", "{envelope}");
+        assert_eq!(stop_pair(&envelope), stop_pair(&twin), "{envelope}");
+        daemon.shutdown().await;
+    });
+}
+
+/// A fake deployment no Codex case runs: Core's config requires one.
+fn no_fake() -> Value {
+    scenario(&json!({}), &[script("unused", &[hang()])])
+}
+
+/// The Codex fixtures' first prompt.
+const CODEX_PROMPT: &str = "Run the shell command sleep 75. Then say done.";
+/// F16c's successor prompt.
+const SUCCESSOR: &str = "Ask me one clarifying question before answering.";
+
+/// Spawn members for a Codex case on `case`'s cwd, with wall `wall_ms`.
+fn codex_spawn(case: &core_codex::CodexCase, wall_ms: u64) -> Value {
+    json!({"harness":"codex","model":"gpt-6-sol","effort":"low",
+           "bound":{"mode":"full","extra_write_dirs":[],"network":true},
+           "cwd":case.cwd(),"deadlines":{"wall_ms":wall_ms}})
+}
+
+/// Sets Codex case `name` up on `replay`.
+fn codex_case(root: &Path, name: &str, replay: Value) -> core_codex::CodexCase {
+    core_codex::CodexCase::new(root, name, replay, &binary("via-fake-agent"))
+}
+
+/// R1, public half (d4 #1, #3): on `c3_wall_interrupt`'s replay the wall
+/// fires and the real Codex route's acknowledgement finishes (held at
+/// `core.run.returned`); then a cancel attaches while the turn is still
+/// `running`. The envelope is the wall's: `failed(deadline_wall)`,
+/// acknowledged, with the fixture's wall-only cleanup; never `unknown`.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_codex_cancel_after_wall() {
+    const NAME: &str = "c3_wall_interrupt";
+    let Some(root) = child("core_codex_cancel_after_wall", &no_fake(), &[]) else {
+        return;
+    };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    arm(&root, RETURNED, "pause");
+    acknowledge(&root, ORDERED, 1);
+    let case = codex_case(&root, NAME, core_codex::replay(NAME));
+    let cleanup = core_codex::expected(NAME)["turns"][0]["expect"]["cleanup"].clone();
+    run(async {
+        let daemon = Daemon::open_with(&root, case.config());
+        let session = daemon.spawn(CODEX_PROMPT, &codex_spawn(&case, 2_000)).await;
+        until_acked(&root, RETURNED, 1).await;
+        let ((), ()) = tokio::join!(cancel(&daemon, &session, 1, 60_000), async {
+            until_acked(&root, ORDERED, 1).await;
+            release_point(&root, RETURNED, 1);
+        });
+        let envelope = daemon.wait(&session, 1).await;
+        assert_eq!(envelope["state"], "failed", "{envelope}");
+        assert_eq!(class(&envelope), "deadline_wall", "{envelope}");
+        assert_eq!(
+            stop_pair(&envelope),
+            (&json!("acknowledged"), &cleanup),
+            "{envelope}"
+        );
+        daemon.close(&session).await;
+        daemon.shutdown().await;
+    });
+}
+
+/// d2 #1, public half (d4 #1, #2): on `c3_interrupt_uncertain`'s replay
+/// the accepted turn's wait is held before it polls its orders; a cancel
+/// publishes before the wall (`t_o < t_s + W`); the wait is released once
+/// the wall has surely passed (`t_c + W`). The order came first, so the
+/// envelope is the order's: `cancelled`, `interrupted`, acknowledged.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_codex_cancel_before_wall_noticed_late() {
+    const NAME: &str = "c3_interrupt_uncertain";
+    const W: Duration = Duration::from_millis(3_000);
+    let Some(root) = child(
+        "core_codex_cancel_before_wall_noticed_late",
+        &no_fake(),
+        &[],
+    ) else {
+        return;
+    };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    arm(&root, SUBMIT, "pause");
+    arm(&root, CODEX_ORDERED, "pause");
+    acknowledge(&root, ORDERED, 1);
+    let case = codex_case(&root, NAME, core_codex::replay(NAME));
+    run(async {
+        let daemon = Daemon::open_with(&root, case.config());
+        let started = tokio::time::Instant::now();
+        let wall_ms = u64::try_from(W.as_millis()).unwrap();
+        let session = daemon
+            .spawn(CODEX_PROMPT, &codex_spawn(&case, wall_ms))
+            .await;
+        until_acked(&root, SUBMIT, 1).await;
+        let committed = tokio::time::Instant::now();
+        release_point(&root, SUBMIT, 1);
+        until_acked(&root, CODEX_ORDERED, 1).await;
+        let ((), ()) = tokio::join!(cancel(&daemon, &session, 1, 60_000), async {
+            until_acked(&root, ORDERED, 1).await;
+            assert!(
+                tokio::time::Instant::now() < started + W,
+                "the order was published before the wall"
+            );
+        });
+        tokio::time::sleep_until(committed + W).await;
+        release_point(&root, CODEX_ORDERED, 1);
+        let envelope = daemon.wait(&session, 1).await;
+        assert_eq!(envelope["state"], "cancelled", "{envelope}");
+        assert_eq!(envelope["stop_reason"], "interrupted", "{envelope}");
+        assert_eq!(envelope["cancel"]["outcome"], "acknowledged", "{envelope}");
+        daemon.close(&session).await;
+        daemon.shutdown().await;
+    });
+}
+
+/// F16c's copy of `c3_interrupt_uncertain` (design §5 F16c row; steps
+/// one-based): a cancel-point gate after original step 22 (copy step
+/// 23); with `completion`, a gate after original step 27 (copy step 29)
+/// and then the open tool's `item/completed`; then a successor turn shaped
+/// like `c1_commentary_usage`'s second (with `successor`); then the
+/// original close. The run deadline is 90 s.
+fn p7_copy(completion: bool, successor: bool) -> Value {
+    let mut replay = core_codex::replay("c3_interrupt_uncertain");
+    let original = replay["steps"].as_array().unwrap().clone();
+    let shape = core_codex::replay("c1_commentary_usage");
+    let second = shape["steps"].as_array().unwrap();
+    let gate = json!({"await_signal":{"signal":"SIGUSR1"}});
+    let mut steps = original[..22].to_vec();
+    steps.push(gate.clone());
+    steps.extend_from_slice(&original[22..27]);
+    if completion {
+        steps.push(gate);
+        let line = original[21]["emit"]["line"].as_str().unwrap();
+        let mut item: Value = serde_json::from_str(line).unwrap();
+        assert_eq!(item["method"], "item/started", "{item}");
+        item["method"] = json!("item/completed");
+        let params = item["params"].as_object_mut().unwrap();
+        let at = params.remove("startedAtMs").unwrap();
+        params.insert("completedAtMs".to_owned(), at);
+        params["item"]["status"] = json!("completed");
+        params["item"]["exitCode"] = json!(0);
+        params["item"]["durationMs"] = json!(1_000);
+        steps.push(json!({"emit":{"line":item.to_string()}}));
+    }
+    if successor {
+        let mut start = second[29].clone();
+        assert_eq!(start["expect"]["line"]["method"], "turn/start", "{start}");
+        start["expect"]["line"]["params"]["input"][0]["text"] = json!(SUCCESSOR);
+        steps.push(start);
+        for step in [31, 33, 44, 45, 46, 49] {
+            steps.push(second[step - 1].clone());
+        }
+    }
+    steps.extend_from_slice(&original[27..]);
+    replay["steps"] = Value::Array(steps);
+    replay["deadline_ms"] = json!(90_000);
+    replay
+}
+
+/// The session's `status`.
+async fn status(daemon: &Daemon, session: &SessionId) -> Value {
+    let params = serde_json::from_value(json!({"session":session})).unwrap();
+    daemon.engine.status(params).await.unwrap()
+}
+
+/// Polls `status` until the running turn's cancel shows `acknowledged`.
+async fn until_acknowledged(daemon: &Daemon, session: &SessionId) -> Value {
+    let by = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let shown = status(daemon, session).await;
+        if shown["active_turn"]["cancel"]["outcome"] == "acknowledged" {
+            return shown;
+        }
+        assert!(
+            tokio::time::Instant::now() < by,
+            "never acknowledged: {shown}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// The codes of `envelope`'s warnings.
+#[cfg(feature = "test-failpoints")]
+fn warning_codes(envelope: &Value) -> Vec<&str> {
+    envelope["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|warning| warning["code"].as_str())
+        .collect()
+}
+
+/// Asserts `second` was submitted only once `first` had ended.
+fn dispatched_after(first: &Value, second: &Value) {
+    let ended = first["timestamps"]["ended_at"].as_str().unwrap();
+    let submitted = second["timestamps"]["submitted_at"].as_str().unwrap();
+    assert!(submitted >= ended, "{first} {second}");
+}
+
+/// Turn 2's state in `status` `turns`.
+fn second_state(status: &Value) -> &Value {
+    status["turns"]
+        .as_array()
+        .and_then(|turns| turns.iter().find(|turn| turn["n"] == 2))
+        .map_or(&Value::Null, |turn| &turn["state"])
+}
+
+/// F16c (D7, C1 §3.5 P7, P6): a cancel of the open `sleep 75` tool's turn,
+/// under Engine's real 60 s grace. Once the interrupted terminal is
+/// retained, `status` shows `{acknowledged, pending, settled_at: null}`
+/// while the turn runs, and a queued successor stays `queued`. The tool's
+/// completion then settles the turn `cancelled`, acknowledged, quiescent
+/// within seconds, and only then does the successor run.
+#[test]
+fn core_codex_p7_status() {
+    const NAME: &str = "core_codex_p7_status";
+    let Some(root) = child(NAME, &no_fake(), &[]) else {
+        return;
+    };
+    let case = codex_case(&root, NAME, p7_copy(true, true));
+    run(async {
+        let daemon = Daemon::open_with(&root, case.config());
+        let session = daemon
+            .spawn(CODEX_PROMPT, &codex_spawn(&case, 120_000))
+            .await;
+        let launch = case.at(23).await;
+        cancel(&daemon, &session, 1, 60_000).await;
+        case.signal(launch);
+        let shown = until_acknowledged(&daemon, &session).await;
+        let requested_at = shown["active_turn"]["cancel"]["requested_at"].clone();
+        assert!(requested_at.is_string(), "{shown}");
+        assert_eq!(shown["active_turn"]["state"], "running", "{shown}");
+        assert_eq!(
+            shown["active_turn"]["cancel"],
+            json!({"outcome":"acknowledged","cleanup":"pending",
+                   "requested_at":requested_at,"settled_at":null}),
+            "{shown}"
+        );
+        daemon.resume(&session, SUCCESSOR).await;
+        for _ in 0..2 {
+            let shown = status(&daemon, &session).await;
+            assert_eq!(second_state(&shown), "queued", "{shown}");
+            assert_eq!(
+                shown["active_turn"]["cancel"]["cleanup"], "pending",
+                "{shown}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert_eq!(case.at(29).await, launch);
+        let signalled = tokio::time::Instant::now();
+        case.signal(launch);
+        let first = daemon.wait(&session, 1).await;
+        assert!(
+            signalled.elapsed() < Duration::from_secs(30),
+            "settled by the completion, not the grace"
+        );
+        assert_eq!(first["state"], "cancelled", "{first}");
+        assert_eq!(
+            stop_pair(&first),
+            (&json!("acknowledged"), &json!("quiescent")),
+            "{first}"
+        );
+        let second = daemon.wait(&session, 2).await;
+        assert_eq!(second["state"], "completed", "{second}");
+        dispatched_after(&first, &second);
+        daemon.close(&session).await;
+        daemon.shutdown().await;
+    });
+}
+
+/// F16c (d6 #2): the tool never ends, so the window ends at a short wall
+/// `W`, proven before the grace's end: the order is published before the
+/// wall (`t_o < t_s + W`), the terminal retained before it (`t_ack < t_s +
+/// W`), and `t_c + W < t_s + 60 s`. The turn settles `cancelled`,
+/// acknowledged, `uncertain` with `cancel_cleanup_uncertain`; the
+/// successor is submitted only after that settlement and carries
+/// `predecessor_cleanup_uncertain` (C1 §7.3).
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn core_codex_p7_uncertain_successor() {
+    const NAME: &str = "core_codex_p7_uncertain_successor";
+    const W: Duration = Duration::from_millis(8_000);
+    let Some(root) = child(NAME, &no_fake(), &[]) else {
+        return;
+    };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    arm(&root, SUBMIT, "pause");
+    acknowledge(&root, ORDERED, 1);
+    let case = codex_case(&root, NAME, p7_copy(false, true));
+    run(async {
+        let daemon = Daemon::open_with(&root, case.config());
+        let started = tokio::time::Instant::now();
+        let wall_ms = u64::try_from(W.as_millis()).unwrap();
+        let session = daemon
+            .spawn(CODEX_PROMPT, &codex_spawn(&case, wall_ms))
+            .await;
+        until_acked(&root, SUBMIT, 1).await;
+        let committed = tokio::time::Instant::now();
+        release_point(&root, SUBMIT, 1);
+        assert!(
+            committed + W < started + Duration::from_secs(60),
+            "the wall comes before the grace's end"
+        );
+        let launch = case.at(23).await;
+        let ((), ()) = tokio::join!(cancel(&daemon, &session, 1, 60_000), async {
+            until_acked(&root, ORDERED, 1).await;
+            assert!(
+                tokio::time::Instant::now() < started + W,
+                "the order was published before the wall"
+            );
+        });
+        case.signal(launch);
+        until_acknowledged(&daemon, &session).await;
+        assert!(
+            tokio::time::Instant::now() < started + W,
+            "the terminal was retained before the wall"
+        );
+        daemon.resume(&session, SUCCESSOR).await;
+        let first = daemon.wait(&session, 1).await;
+        assert_eq!(first["state"], "cancelled", "{first}");
+        assert_eq!(
+            stop_pair(&first),
+            (&json!("acknowledged"), &json!("uncertain")),
+            "{first}"
+        );
+        assert!(
+            warning_codes(&first).contains(&"cancel_cleanup_uncertain"),
+            "{first}"
+        );
+        let second = daemon.wait(&session, 2).await;
+        assert_eq!(second["state"], "completed", "{second}");
+        dispatched_after(&first, &second);
+        assert!(
+            warning_codes(&second).contains(&"predecessor_cleanup_uncertain"),
+            "{second}"
+        );
+        daemon.close(&session).await;
+        daemon.shutdown().await;
+    });
+}
+
+/// x.3.2 X4 K5 (`codex_control_races`, F15 without steer: close versus
+/// the P7 window; W3 through Engine): a cancel's interrupted terminal is
+/// retained with the `sleep 75` tool open under the real 60 s grace;
+/// the session's `close` then detaches the draining turn at once. The turn
+/// settles `cancelled`, acknowledged, `uncertain`, and the close returns,
+/// both long before the grace would end the window.
+///
+/// Ignored (x.3.2 X4 K5 finding): Core coalesces the close's stop order
+/// into the cancel's, keeping the cancel's cause (design §2), so the
+/// Codex driver cannot tell the close from the cancel while it drains and
+/// the turn waits out the 60 s grace. W3 covers only a close-caused order.
+/// Accepted until measured (via-5lr.7): the wait is bounded by the grace,
+/// and close already waits for a running turn.
+#[test]
+#[ignore = "via-5lr.7: a close coalesced into a cancel's order waits out the P7 grace (accepted until measured)"]
+fn codex_control_races_close_vs_p7_window() {
+    const NAME: &str = "codex_control_races_close_vs_p7_window";
+    let Some(root) = child(NAME, &no_fake(), &[]) else {
+        return;
+    };
+    let case = codex_case(&root, NAME, p7_copy(false, false));
+    run(async {
+        let daemon = Daemon::open_with(&root, case.config());
+        let session = daemon
+            .spawn(CODEX_PROMPT, &codex_spawn(&case, 120_000))
+            .await;
+        let launch = case.at(23).await;
+        cancel(&daemon, &session, 1, 60_000).await;
+        case.signal(launch);
+        let shown = until_acknowledged(&daemon, &session).await;
+        assert_eq!(
+            shown["active_turn"]["cancel"]["cleanup"], "pending",
+            "{shown}"
+        );
+        let closing = tokio::time::Instant::now();
+        daemon.close(&session).await;
+        let first = daemon.wait(&session, 1).await;
+        assert!(
+            closing.elapsed() < Duration::from_secs(20),
+            "the close detached the window, not the grace"
+        );
+        assert_eq!(first["state"], "cancelled", "{first}");
+        assert_eq!(
+            stop_pair(&first),
+            (&json!("acknowledged"), &json!("uncertain")),
+            "{first}"
+        );
         daemon.shutdown().await;
     });
 }

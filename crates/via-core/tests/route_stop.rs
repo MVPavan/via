@@ -195,6 +195,7 @@ fn order(force_after: Duration) -> StopOrder {
     StopOrder {
         cause: StopCause::Cancel,
         requested_at: "2026-01-01T00:00:00.000Z".to_owned(),
+        attached: tokio::time::Instant::now(),
         force_at: Deadline::at(force_at),
         close_by: Deadline::at(force_at + Duration::from_secs(3)),
     }

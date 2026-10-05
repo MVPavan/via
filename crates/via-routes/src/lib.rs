@@ -164,6 +164,11 @@ pub struct StopOrder {
     pub cause: StopCause,
     /// Wall time of the request.
     pub requested_at: String,
+    /// The instant the order was published on its watch, sampled inside
+    /// the publishing send (x.3.2 X4 D4.2, I11): a value read that sees the
+    /// order happened at or after it. A merge into an order keeps the
+    /// first publication's instant.
+    pub attached: tokio::time::Instant,
     /// When Route force-closes a turn with no terminal.
     pub force_at: Deadline,
     /// Absolute bound on the force close and drain.

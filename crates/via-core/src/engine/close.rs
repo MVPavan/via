@@ -106,7 +106,7 @@ impl Engine {
         // Step 5: a close in progress; a second forcing close escalates it.
         if let Some(watch) = slot.close_watch() {
             if params.mode == CloseMode::Force {
-                slot.escalate_close(tokio::time::Instant::now());
+                slot.escalate_close();
             }
             return self.await_close(watch, admission).await;
         }
@@ -129,7 +129,7 @@ impl Engine {
         // `admission` [r4.4].
         lock(&self.closing).insert(session.clone());
         let order = CloseOrder::new(params.mode, deadline, operation);
-        let (watch, start) = slot.set_close(order, tokio::time::Instant::now());
+        let (watch, start) = slot.set_close(order);
         if start {
             self.request_start(session.clone());
         }

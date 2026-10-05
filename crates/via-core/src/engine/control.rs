@@ -80,8 +80,12 @@ impl Engine {
         let mut acknowledged = false;
         let mut rechecked = false;
         loop {
+            // Before the order's publication, which dates it (x.3.2 X4
+            // D4.2): a cancel held here publishes later (pause seam).
+            #[cfg(feature = "test-failpoints")]
+            let _ = via_store::failpoint::hit_async("core.cancel.publish").await;
             let step = match self.slot(&session) {
-                Some(slot) => slot.cancel_step(turn, spec, tokio::time::Instant::now()),
+                Some(slot) => slot.cancel_step(turn, spec),
                 None => CancelStep::Absent,
             };
             match step {
@@ -100,7 +104,16 @@ impl Engine {
                         Some(Ack::Requested(requested_at)) => {
                             acknowledged = true;
                             if !params.wait {
-                                return Ok(requested(&address, &requested_at));
+                                return Ok(running(&address, "requested", &requested_at));
+                            }
+                            while ack.changed().await.is_ok() {}
+                        }
+                        // x.3.2 X4 D7: the vendor acknowledged the stop and
+                        // the turn's cleanup is pending (C1 §3.5 P7).
+                        Some(Ack::Acknowledged(requested_at)) => {
+                            acknowledged = true;
+                            if !params.wait {
+                                return Ok(running(&address, "acknowledged", &requested_at));
                             }
                             while ack.changed().await.is_ok() {}
                         }
@@ -208,15 +221,16 @@ fn queued_failure(outcome: Option<QueuedOutcome>) -> Result<(), ApiError> {
     }
 }
 
-/// The C1 §3.5 result for a running turn whose order was acknowledged
-/// (A8): `requested`, cleanup `pending`.
-fn requested(address: &str, requested_at: &str) -> Value {
+/// The C1 §3.5 result for a running turn whose order the run loop
+/// acknowledged (A8): `outcome` `requested`, or `acknowledged` once vendor
+/// evidence acknowledged the stop (x.3.2 X4 D7); cleanup `pending`.
+fn running(address: &str, outcome: &str, requested_at: &str) -> Value {
     json!({
         "turn": address,
         "state": "running",
         "already_terminal": false,
         "cancel": {
-            "outcome": "requested",
+            "outcome": outcome,
             "cleanup": "pending",
             "requested_at": requested_at,
             "settled_at": null,

@@ -4,23 +4,21 @@
 //! vendor's side is two in-memory pipes: the test writes its stdout and
 //! reads (or does not read) its stdin.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 use tokio::task::JoinHandle;
-use via_wire::testing::{TestInput, pipes};
+use via_wire::testing::pipes;
 use via_wire::{
-    CloseRequest, CommitOutcome, DataHold, Deadline, OutboundMessage, PendingWrite, SendOutcome,
-    ServerId, SessionId, TurnNumber, WireCleanup, WireCloseReport, WireError, WriteBounds,
-    WriteState, WriteTicket,
+    Deadline, OutboundMessage, SendOutcome, ServerId, TurnNumber, WireCleanup, WriteBounds,
+    WriteState,
 };
 
 use super::connection::serve;
-use super::stdio::{Boxed, Stdio};
+use super::stdio::Stdio;
+use super::testing::{Scratch, StopFacts, TestStdio, VendorEnds};
 use super::*;
 
 /// The decline table the tests answer with.
@@ -29,101 +27,12 @@ const DECLINES: DeclineTable = DeclineTable::new(&[(
     r#"{"decision":"decline"}"#,
 )]);
 
-/// A private scratch folder, removed on drop.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new() -> Self {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "via-codex-connection-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&path).unwrap();
-        Self(path)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// Wire's test input as the connection's seam; Host's stop is answered
-/// at once, and the server folder's evidence is kept in memory.
-struct TestStdio {
-    input: TestInput,
-    kept: Mutex<Vec<Vec<u8>>>,
-    /// Every write handed to Wire, in order: the tests' write-state gate.
-    tickets: Mutex<Vec<WriteTicket>>,
-}
-
-impl Stdio for TestStdio {
-    fn write(&self, message: OutboundMessage, bounds: WriteBounds) -> PendingWrite {
-        let pending = self.input.write_bounded(message, bounds);
-        self.tickets.lock().unwrap().push(pending.ticket());
-        pending
-    }
-
-    fn withdraw(&self, ticket: WriteTicket) -> WriteState {
-        self.input.withdraw(ticket)
-    }
-
-    fn hold_data(&self) -> DataHold {
-        self.input.hold_data()
-    }
-
-    fn seal(&self) {
-        self.input.seal();
-    }
-
-    fn close(&self, _request: CloseRequest) -> Boxed<'_, WireCloseReport> {
-        Box::pin(async {
-            WireCloseReport {
-                cleanup: WireCleanup::Quiescent,
-                vendor_exit: None,
-                forced: false,
-                journal_uncertain: false,
-                stopped_live: Some(true),
-            }
-        })
-    }
-
-    fn close_input(&self, deadline: Deadline) -> Boxed<'_, Result<(), WireError>> {
-        Box::pin(self.input.close_input(deadline))
-    }
-
-    fn keep_undecoded<'a>(&'a self, bytes: &'a [u8], _what: &'a str) -> Boxed<'a, ()> {
-        self.kept.lock().unwrap().push(bytes.to_vec());
-        Box::pin(async {})
-    }
-
-    fn link_turn<'a>(
-        &'a self,
-        _session: &'a SessionId,
-        _turn: TurnNumber,
-        _deadline: Deadline,
-    ) -> Boxed<'a, CommitOutcome<()>> {
-        Box::pin(async { CommitOutcome::Committed(()) })
-    }
-}
-
 /// One connection and the vendor's ends of its pipes.
 struct Vendor {
     connection: Arc<Connection>,
     stdio: Arc<TestStdio>,
-    stdout: DuplexStream,
-    stdin: BufReader<DuplexStream>,
+    ends: VendorEnds,
     task: JoinHandle<ConnectionEnd>,
-    /// The vendor lines written so far.
-    emitted: u64,
-    _scratch: Scratch,
 }
 
 impl Vendor {
@@ -133,11 +42,7 @@ impl Vendor {
         let (vendor_in, stdin) = tokio::io::duplex(stdin_buffer);
         let scratch = Scratch::new();
         let pipes = pipes(vendor_out, vendor_in, scratch.path().to_path_buf());
-        let wire = Arc::new(TestStdio {
-            input: pipes.input,
-            kept: Mutex::new(Vec::new()),
-            tickets: Mutex::new(Vec::new()),
-        });
+        let wire = Arc::new(TestStdio::new(pipes.input, scratch));
         let connection = Connection::over(
             ServerId::mint().unwrap(),
             Arc::clone(&wire) as Arc<dyn Stdio>,
@@ -147,49 +52,34 @@ impl Vendor {
         Self {
             connection,
             stdio: wire,
-            stdout,
-            stdin: BufReader::new(stdin),
+            ends: VendorEnds::new(stdout, stdin),
             task,
-            emitted: 0,
-            _scratch: scratch,
         }
     }
 
     /// Writes one vendor line.
     async fn emit(&mut self, line: &Value) {
-        let mut bytes = serde_json::to_vec(line).unwrap();
-        bytes.push(b'\n');
-        self.stdout.write_all(&bytes).await.unwrap();
-        self.emitted += 1;
+        self.ends.emit(line).await;
     }
 
     /// Writes one raw vendor line, its newline included.
     async fn emit_raw(&mut self, line: &[u8]) {
-        self.stdout.write_all(line).await.unwrap();
-        self.emitted += 1;
+        self.ends.emit_raw(line).await;
     }
 
     /// The next line VIA wrote, within 2 s.
     async fn read(&mut self) -> Value {
-        let mut line = String::new();
-        tokio::time::timeout(Duration::from_secs(2), self.stdin.read_line(&mut line))
-            .await
-            .expect("a line within 2 s")
-            .unwrap();
-        serde_json::from_str(&line).unwrap()
+        self.ends.read().await
     }
 
     /// Whether VIA wrote nothing more within `wait`.
     async fn silent(&mut self, wait: Duration) -> bool {
-        let mut line = String::new();
-        tokio::time::timeout(wait, self.stdin.read_line(&mut line))
-            .await
-            .is_err()
+        self.ends.silent(wait).await
     }
 
     /// Waits until the connection task has routed every line written.
     async fn settle(&self) {
-        let emitted = self.emitted;
+        let emitted = self.ends.emitted;
         until("every emitted line routed", || {
             self.connection.routed() >= emitted
         })
@@ -199,12 +89,7 @@ impl Vendor {
     /// Waits until Wire holds write `n` (from 1) in a state `state` takes.
     async fn wrote(&self, n: usize, state: fn(WriteState) -> bool) {
         until("the write's state", || {
-            self.stdio
-                .tickets
-                .lock()
-                .unwrap()
-                .get(n - 1)
-                .is_some_and(|ticket| state(ticket.state()))
+            self.stdio.write_state(n).is_some_and(state)
         })
         .await;
     }
@@ -270,7 +155,10 @@ fn open_thread(connection: &Connection, lane: &LaneLease) -> Requested {
         .request(
             |id| thread_start(id, &settings()).map(data),
             start_by(),
-            Purpose::Opens(lane),
+            Purpose::Opens {
+                lane,
+                reservation: None,
+            },
             None,
         )
         .unwrap()
@@ -490,10 +378,7 @@ async fn codex_write_cancelled_before_hand_off_is_refused() {
     );
     assert!(start.reply.await.is_err(), "the record went");
     assert!(vendor.silent(Duration::from_millis(200)).await);
-    assert!(
-        vendor.stdio.tickets.lock().unwrap().is_empty(),
-        "nothing reached Wire"
-    );
+    assert!(vendor.stdio.writes() == 0, "nothing reached Wire");
 }
 
 /// x.3.2 X3 S1's variant: the write passed the hand-off, its ticket is
@@ -701,7 +586,7 @@ async fn correlation_failure_is_protocol_not_generation_local() {
         .unwrap();
     assert!(matches!(end, ConnectionEnd::Failed(loss) if loss.cause == LossCause::Protocol));
     assert!(taken(lane.lane()).is_empty());
-    let kept = vendor.stdio.kept.lock().unwrap().clone();
+    let kept = vendor.stdio.kept();
     assert_eq!(kept.len(), 1);
     assert_eq!(serde_json::from_slice::<Value>(&kept[0]).unwrap(), untied);
 }
@@ -912,7 +797,7 @@ async fn staging_aggregate_includes_ingress() {
     let mut vendor = Vendor::open(1 << 16);
     let lane = registered(&mut vendor, "t").await;
     vendor.settle().await;
-    let before = vendor.stdio.input.queued_bytes();
+    let before = vendor.stdio.input().queued_bytes();
     let note = item_completed("t", "u", "m");
     let request = json!({"id": "srv-9", "method": "item/commandExecution/requestApproval",
         "params": {"threadId": "t", "turnId": "u", "itemId": "i", "pad": "x".repeat(2000)}});
@@ -920,12 +805,12 @@ async fn staging_aggregate_includes_ingress() {
     vendor.emit(&request).await;
     vendor.settle().await;
     vendor.read().await;
-    let held = vendor.stdio.input.queued_bytes() - before;
+    let held = vendor.stdio.input().queued_bytes() - before;
     let lines =
         serde_json::to_vec(&note).unwrap().len() + serde_json::to_vec(&request).unwrap().len() + 2;
     assert_eq!(held, lines);
     assert_eq!(taken(lane.lane()).len(), 2);
-    assert_eq!(vendor.stdio.input.queued_bytes(), before);
+    assert_eq!(vendor.stdio.input().queued_bytes(), before);
 }
 
 /// Item 8.3: an interrupt posted before `turn/start`'s reply waits on its
@@ -1399,4 +1284,499 @@ async fn a_close_posted_at_a_decline_cuts_after_its_placeholder() {
         Some(LaneEvent::End(LaneEnd::Closed))
     ));
     assert_eq!(vendor.connection.counts().late_after_close, 1);
+}
+
+/// Queues a `thread/resume` of `thread` opening `lane`, carrying its
+/// `reservation` (x.3.2 X4 D3).
+fn resume_thread(
+    connection: &Connection,
+    lane: &LaneLease,
+    reservation: Reservation,
+    writes: Option<&mut TurnWrites>,
+) -> Requested {
+    let thread = reservation.thread().to_owned();
+    connection
+        .request(
+            |id| thread_resume(id, &thread, &settings()).map(data),
+            start_by(),
+            Purpose::Opens {
+                lane,
+                reservation: Some(reservation),
+            },
+            writes,
+        )
+        .unwrap()
+}
+
+/// `thread`'s reservation is refused while it is fenced: the epoch to
+/// wait on.
+#[track_caller]
+fn busy(connection: &Arc<Connection>, thread: &str) -> tokio::sync::watch::Receiver<u64> {
+    match connection.reserve(thread) {
+        Err(Fenced::Busy(epoch)) => epoch,
+        other => panic!("{thread} is not fenced: {other:?}"),
+    }
+}
+
+/// Blocks the connection's stdin (a 64-byte pipe) with a large control
+/// written in part: the next writes stay unstarted behind it.
+async fn block_stdin(vendor: &Vendor, n: usize) {
+    let mut big = br#"{"method":"note","params":{"pad":""#.to_vec();
+    big.extend(vec![b'x'; 16 * 1024]);
+    big.extend(b"\"}}\n");
+    let _control = vendor.connection.notify(big, start_by()).unwrap();
+    vendor.wrote(n, started).await;
+}
+
+/// D3 (`reserve_is_exclusive`): two reservations of one thread before
+/// any reply: the second is refused, another thread's is not. The first's
+/// drop wakes the waiter; the next reservation, handed to a resume, keeps
+/// the thread fenced with no gap: by its record until the reply, then by
+/// the registration the reply made, until its lane closes.
+#[tokio::test]
+async fn reserve_is_exclusive() {
+    let mut vendor = Vendor::open(1 << 16);
+    let connection = Arc::clone(&vendor.connection);
+    let first = connection.reserve("t").unwrap();
+    let mut epoch = busy(&connection, "t");
+    let _other = connection.reserve("o").unwrap();
+    assert!(!epoch.has_changed().unwrap());
+    drop(first);
+    promptly(epoch.changed()).await.unwrap();
+    let second = connection.reserve("t").unwrap();
+    let lane = connection.open_lane(None);
+    let requested = resume_thread(&connection, &lane, second, None);
+    assert_eq!(connection.reservations(), 1, "moved into the record");
+    let mut epoch = busy(&connection, "t");
+    let sent = vendor.read().await;
+    assert_eq!(sent["method"], "thread/resume");
+    vendor.emit(&thread_reply(requested.id.get(), "t")).await;
+    requested.reply.await.unwrap();
+    promptly(epoch.changed()).await.unwrap();
+    let mut epoch = busy(&connection, "t");
+    drop(lane);
+    promptly(epoch.changed()).await.unwrap();
+    drop(connection.reserve("t").unwrap());
+}
+
+/// D3 (`reserve_cleared_by_not_written`): a resume withdrawn before its
+/// first byte (a positive `NotWritten`) never reached the vendor: its
+/// record goes and the thread's fence clears at once.
+#[tokio::test]
+async fn reserve_cleared_by_not_written() {
+    let mut vendor = Vendor::open(64);
+    let connection = Arc::clone(&vendor.connection);
+    block_stdin(&vendor, 1).await;
+    let mut writes = TurnWrites::new(&connection);
+    let lane = connection.open_lane(None);
+    let reservation = connection.reserve("t").unwrap();
+    let requested = resume_thread(&connection, &lane, reservation, Some(&mut writes));
+    vendor.wrote(2, unstarted).await;
+    let mut epoch = busy(&connection, "t");
+    drop(writes);
+    assert_eq!(
+        promptly(requested.written).await.unwrap(),
+        SendOutcome::NotWritten
+    );
+    promptly(epoch.changed()).await.unwrap();
+    assert!(requested.reply.await.is_err(), "the record went");
+    drop(connection.reserve("t").unwrap());
+    assert_eq!(vendor.read().await["method"], "note");
+}
+
+/// W5: an unsubscribe not written by its bound (a positive `NotWritten`)
+/// clears its thread's fence; while it waited, it fenced the thread,
+/// though its lane was already closed.
+#[tokio::test]
+async fn w5_unsubscribe_not_written_clears_the_fence() {
+    let mut vendor = Vendor::open(64);
+    let connection = Arc::clone(&vendor.connection);
+    let lane = registered(&mut vendor, "t").await;
+    // A data write started and blocked: the unsubscribe, handed to Wire
+    // behind it, is not started by its bound.
+    let _data = vendor
+        .connection
+        .request(
+            |id| Ok(turn_start_line(id, "o", &"y".repeat(64 * 1024))),
+            start_by(),
+            Purpose::Plain,
+            None,
+        )
+        .unwrap();
+    vendor.wrote(2, started).await;
+    let by = Deadline::at(tokio::time::Instant::now() + Duration::from_millis(100));
+    let reply = connection.unsubscribe(&lane, by).unwrap();
+    drop(lane);
+    let mut epoch = busy(&connection, "t");
+    assert!(
+        promptly(reply).await.is_err(),
+        "never written: no reply comes"
+    );
+    promptly(epoch.changed()).await.unwrap();
+    drop(connection.reserve("t").unwrap());
+}
+
+/// D3 (`tombstone_never_fences`): a thread whose registration closed, or
+/// whose open no waiter wanted, is kept as closed for its late traffic,
+/// and never fences a resume.
+#[tokio::test]
+async fn tombstone_never_fences() {
+    let mut vendor = Vendor::open(1 << 16);
+    let connection = Arc::clone(&vendor.connection);
+    let lane = registered(&mut vendor, "t").await;
+    drop(lane);
+    drop(connection.reserve("t").unwrap());
+    let other = connection.open_lane(None);
+    let requested = open_thread(&connection, &other);
+    vendor.read().await;
+    let id = requested.id.get();
+    drop(requested);
+    vendor.emit(&thread_reply(id, "u")).await;
+    vendor.settle().await;
+    assert_eq!(connection.counts().abandoned, 1);
+    drop(connection.reserve("u").unwrap());
+}
+
+/// D3 (`reserve_released_when_never_submitted`): a resume refused before
+/// its record exists (an encode error; a failed connection's `Closed`)
+/// releases its reservation at once.
+#[tokio::test]
+async fn reserve_released_when_never_submitted() {
+    let vendor = Vendor::open(1 << 16);
+    let connection = Arc::clone(&vendor.connection);
+    let lane = connection.open_lane(None);
+    let reservation = connection.reserve("t").unwrap();
+    let refused = connection.request(
+        |_id| Err(ClientId::try_from(-1_i64).unwrap_err()),
+        start_by(),
+        Purpose::Opens {
+            lane: &lane,
+            reservation: Some(reservation),
+        },
+        None,
+    );
+    assert!(matches!(refused, Err(RequestError::Encode(_))));
+    assert_eq!(connection.reservations(), 0);
+    let reservation = connection.reserve("t").unwrap();
+    connection.fail(ConnectionFailure::Protocol);
+    let refused = connection.request(
+        |id| thread_resume(id, "t", &settings()).map(data),
+        start_by(),
+        Purpose::Opens {
+            lane: &lane,
+            reservation: Some(reservation),
+        },
+        None,
+    );
+    assert!(matches!(refused, Err(RequestError::Closed)));
+    assert_eq!(connection.reservations(), 0, "released, never leaked");
+    assert!(matches!(connection.reserve("t"), Err(Fenced::Ended)));
+}
+
+// x.3.2 X4 K5: item 9.1's record lifetime and budget, and item 13's
+// connection-failure dispositions under Host's stop report.
+
+/// Item 9.1 (exhaustion): every record kind shares the one budget with a
+/// registration's mapping: a `turn/start`, thread opens, unsubscribes,
+/// reservations and plain requests (the handshake's kind). With the
+/// budget's 1,024 entries charged, the next charge (a reservation) latches
+/// `overflow` and retires the connection: a retirement, not a refusal of
+/// one request while the connection goes on.
+#[tokio::test]
+async fn request_record_exhaustion_retires() {
+    let mut vendor = Vendor::open(1 << 20);
+    // The registration's mapping and turn 1's start: two entries.
+    let lane = registered(&mut vendor, "t").await;
+    let plain = |connection: &Connection| {
+        connection
+            .request(
+                |id| thread_unsubscribe(id, "p").map(OutboundMessage::Control),
+                start_by(),
+                Purpose::Plain,
+                None,
+            )
+            .unwrap()
+    };
+    let mut held = vec![
+        vendor
+            .connection
+            .request(
+                |id| Ok(turn_start_line(id, "t", "go")),
+                start_by(),
+                starts(&lane, 1),
+                None,
+            )
+            .unwrap(),
+    ];
+    let (mut reservations, mut lanes) = (Vec::new(), Vec::new());
+    for k in 0..255 {
+        let thread = format!("u{k}");
+        held.push(
+            vendor
+                .connection
+                .request(
+                    |id| thread_unsubscribe(id, &thread).map(OutboundMessage::Control),
+                    start_by(),
+                    Purpose::Unsubscribes {
+                        thread: thread.clone(),
+                    },
+                    None,
+                )
+                .unwrap(),
+        );
+        let open = vendor.connection.open_lane(None);
+        held.push(open_thread(&vendor.connection, &open));
+        lanes.push(open);
+        reservations.push(vendor.connection.reserve(&format!("r{k}")).unwrap());
+        held.push(plain(&vendor.connection));
+    }
+    held.push(plain(&vendor.connection));
+    reservations.push(vendor.connection.reserve("last").unwrap());
+    assert_eq!(2 + 4 * 255 + 2, CORRELATION_ENTRIES);
+    assert_eq!(
+        vendor.connection.failure(),
+        None,
+        "the budget is full, not over"
+    );
+    assert!(matches!(
+        vendor.connection.reserve("over"),
+        Err(Fenced::Ended)
+    ));
+    assert_eq!(
+        vendor.connection.failure(),
+        Some(ConnectionFailure::Overflow)
+    );
+    assert_eq!(ended(&vendor).await.cause, LossCause::Overflow);
+    assert!(matches!(
+        vendor.connection.reserve("again"),
+        Err(Fenced::Ended)
+    ));
+}
+
+/// Item 9.1 (abandoned-record pairing): a `turn/start` and an unsubscribe
+/// whose waiters left, on a lane closed before their replies, keep their
+/// records: each reply pairs and is counted `abandoned`, nothing fails,
+/// and the other lane's turn runs on.
+#[tokio::test]
+async fn abandoned_start_and_unsubscribe_pair_their_replies() {
+    let mut vendor = Vendor::open(1 << 16);
+    let gone = registered(&mut vendor, "a").await;
+    let other = registered(&mut vendor, "t").await;
+    let start = vendor
+        .connection
+        .request(
+            |id| Ok(turn_start_line(id, "a", "go")),
+            start_by(),
+            starts(&gone, 1),
+            None,
+        )
+        .unwrap();
+    assert_eq!(vendor.read().await["method"], "turn/start");
+    let unsubscribe = vendor.connection.unsubscribe(&gone, far()).unwrap();
+    let sent = vendor.read().await;
+    assert_eq!(sent["method"], "thread/unsubscribe");
+    let start_id = start.id.get();
+    drop((start, unsubscribe, gone));
+    vendor.emit(&start_reply(start_id, "ua")).await;
+    vendor
+        .emit(&json!({"id": sent["id"], "result": {"status": "unsubscribed"}}))
+        .await;
+    vendor.settle().await;
+    assert_eq!(vendor.connection.counts().abandoned, 2);
+    assert_eq!(vendor.connection.failure(), None);
+    accepted(&mut vendor, &other, 1, "ut").await;
+    vendor.emit(&item_completed("t", "ut", "m")).await;
+    vendor.settle().await;
+    assert_eq!(taken(other.lane()).len(), 1);
+    assert_eq!(vendor.connection.failure(), None);
+}
+
+/// Every item `lane` holds as its raw line, then its end.
+async fn drained_to_end(lane: &Arc<Lane>) -> (Vec<Value>, LaneEnd) {
+    let mut items = Vec::new();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), lane.next())
+            .await
+            .expect("the lane ends");
+        match event {
+            LaneEvent::Item(item, _charge) => {
+                if let Some(routed) = item.routed() {
+                    items.push(serde_json::from_slice(routed.staged.bytes()).unwrap());
+                }
+            }
+            LaneEvent::End(end) => return (items, end),
+        }
+    }
+}
+
+/// The connection's end, within 10 s.
+async fn ended(vendor: &Vendor) -> ConnectionLoss {
+    match tokio::time::timeout(Duration::from_secs(10), vendor.connection.end())
+        .await
+        .expect("the connection ended")
+    {
+        ConnectionEnd::Failed(loss) => loss,
+        ConnectionEnd::Retired => panic!("retired, not failed"),
+    }
+}
+
+/// Two registrations, `a` and `t`, on a connection whose Host stop
+/// reports `facts`.
+async fn two_threads(facts: StopFacts) -> (Vendor, LaneLease, LaneLease) {
+    let mut vendor = Vendor::open(1 << 16);
+    vendor.stdio.report_stop(facts);
+    let a = registered(&mut vendor, "a").await;
+    let b = registered(&mut vendor, "t").await;
+    (vendor, a, b)
+}
+
+/// The server's death as Host's stop reports it: not live, its exit
+/// confirmed, its group gone.
+fn dead() -> StopFacts {
+    StopFacts {
+        cleanup: WireCleanup::Quiescent,
+        vendor_exit: Some(via_wire::ExitReport {
+            code: Some(1),
+            signal: None,
+        }),
+        stopped_live: Some(false),
+    }
+}
+
+/// Item 13 (`codex_server_lost_order`): A's terminal is staged before the
+/// server's death shows (stdout ends; Host's stop finds it dead with its
+/// exit). A's lane takes its terminal first, then the loss; B's lane gets
+/// only the loss: `server_lost` for both, with the exit.
+#[tokio::test]
+async fn codex_server_lost_order() {
+    let (mut vendor, a, b) = two_threads(dead()).await;
+    let completed = json!({"method": "turn/completed", "params": {"threadId": "a",
+        "turn": {"id": "ua", "items": [], "status": "completed"}}});
+    vendor.emit(&completed).await;
+    vendor.ends.end_stdout().await;
+    let loss = ended(&vendor).await;
+    assert_eq!(loss.cause, LossCause::ServerLost);
+    assert_eq!(loss.exit, dead().vendor_exit);
+    let (items, end) = drained_to_end(a.lane()).await;
+    assert_eq!(items, [completed]);
+    assert_eq!(end, LaneEnd::Lost(loss));
+    let (items, end) = drained_to_end(b.lane()).await;
+    assert!(items.is_empty());
+    assert_eq!(end, LaneEnd::Lost(loss));
+}
+
+/// Item 13 (`codex_transport_loss_is_unknown`): a writer error (the
+/// server stopped reading) while Host's stop finds the server alive is a
+/// transport loss (`unknown`), its cleanup `quiescent` from that stop.
+#[tokio::test]
+async fn codex_transport_loss_is_unknown() {
+    let (mut vendor, _a, b) = two_threads(StopFacts::default()).await;
+    vendor.ends.stop_reading();
+    let _written = vendor
+        .connection
+        .request(
+            |id| thread_unsubscribe(id, "p").map(OutboundMessage::Control),
+            start_by(),
+            Purpose::Plain,
+            None,
+        )
+        .unwrap();
+    let loss = ended(&vendor).await;
+    assert_eq!(
+        (loss.cause, loss.cleanup),
+        (LossCause::TransportLost, WireCleanup::Quiescent)
+    );
+    assert_eq!(drained_to_end(b.lane()).await.1, LaneEnd::Lost(loss));
+}
+
+/// Item 13 (`stop_reply_missing_stays_transport`): stdout ends and Host's
+/// stop gets no reply: unconfirmed, so a transport loss (`unknown`),
+/// never `server_lost`.
+#[tokio::test]
+async fn stop_reply_missing_stays_transport() {
+    let (mut vendor, _a, b) = two_threads(StopFacts {
+        cleanup: WireCleanup::Uncertain,
+        vendor_exit: None,
+        stopped_live: None,
+    })
+    .await;
+    vendor.ends.end_stdout().await;
+    let loss = ended(&vendor).await;
+    assert_eq!(
+        (loss.cause, loss.cleanup),
+        (LossCause::TransportLost, WireCleanup::Uncertain)
+    );
+    assert_eq!(drained_to_end(b.lane()).await.1, LaneEnd::Lost(loss));
+}
+
+/// Item 13 (`stdout_end_then_dead_on_stop_is_server_lost`): stdout ends,
+/// and Host's stop finds the server already dead (no exit report): the
+/// end of stdout was the death, `server_lost`.
+#[tokio::test]
+async fn stdout_end_then_dead_on_stop_is_server_lost() {
+    let (mut vendor, _a, b) = two_threads(StopFacts {
+        cleanup: WireCleanup::Quiescent,
+        vendor_exit: None,
+        stopped_live: Some(false),
+    })
+    .await;
+    vendor.ends.end_stdout().await;
+    let loss = ended(&vendor).await;
+    assert_eq!(loss.cause, LossCause::ServerLost);
+    assert_eq!(drained_to_end(b.lane()).await.1, LaneEnd::Lost(loss));
+}
+
+/// Item 13 (`server_loss_cleanup_not_blocked_by_inherited_stdout`): the
+/// server is reported dead while its stdout stays open (a survivor
+/// inherited it): the loss is disposed of, every lane ended and the
+/// connection's end published, without waiting for stdout to end.
+#[tokio::test]
+async fn server_loss_cleanup_not_blocked_by_inherited_stdout() {
+    let (mut vendor, a, b) = two_threads(StopFacts {
+        cleanup: WireCleanup::Uncertain,
+        ..dead()
+    })
+    .await;
+    vendor.ends.stop_reading();
+    let _written = vendor
+        .connection
+        .request(
+            |id| thread_unsubscribe(id, "p").map(OutboundMessage::Control),
+            start_by(),
+            Purpose::Plain,
+            None,
+        )
+        .unwrap();
+    let started = tokio::time::Instant::now();
+    let end = tokio::time::timeout(Duration::from_secs(2), vendor.connection.end())
+        .await
+        .expect("the end is published while stdout stays open");
+    assert!(started.elapsed() < LOSS_EVIDENCE);
+    let ConnectionEnd::Failed(loss) = end else {
+        panic!("failed, not retired: {end:?}");
+    };
+    assert_eq!(
+        (loss.cause, loss.cleanup),
+        (LossCause::ServerLost, WireCleanup::Uncertain)
+    );
+    assert_eq!(drained_to_end(a.lane()).await.1, LaneEnd::Lost(loss));
+    assert_eq!(drained_to_end(b.lane()).await.1, LaneEnd::Lost(loss));
+    // The vendor's stdout is still open.
+    vendor
+        .emit(&json!({"method": "account/updated", "params": {}}))
+        .await;
+}
+
+/// Item 13 (`overflow_failure_keeps_overflow_class`): an overflow latched
+/// first keeps its class though Host's stop then finds the server dead
+/// and stdout ended: `overflow`, never `server_lost`.
+#[tokio::test]
+async fn overflow_failure_keeps_overflow_class() {
+    let (mut vendor, _a, b) = two_threads(dead()).await;
+    vendor.connection.fail(ConnectionFailure::Overflow);
+    vendor.ends.end_stdout().await;
+    let loss = ended(&vendor).await;
+    assert_eq!(loss.cause, LossCause::Overflow);
+    assert_eq!(loss.exit, dead().vendor_exit);
+    assert_eq!(drained_to_end(b.lane()).await.1, LaneEnd::Lost(loss));
 }

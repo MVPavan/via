@@ -229,6 +229,9 @@ struct Faults {
     >,
     /// The next recovered turn waits for `release` after its history read.
     hold_after_history: AtomicBool,
+    /// The latest turn's stop-acknowledgement report, a clone a test makes
+    /// or drops in the driver's stead (x.3.2 X4 D7).
+    stop_ack: std::sync::Mutex<Option<via_adapters::StopAck>>,
     /// The next submitted turn waits for `release` after its submission
     /// commit, before its lane opens and it runs.
     hold_after_submit: AtomicBool,

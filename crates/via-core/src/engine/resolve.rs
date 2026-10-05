@@ -350,7 +350,7 @@ impl Engine {
         record.first_failure = Some(FailureNote { site, outcome });
         self.report_first_failure(record, false).await;
         if outcome == WriteOutcome::NotCommitted {
-            slot.store_order(record.turn, tokio::time::Instant::now());
+            slot.store_order(record.turn);
         }
     }
 

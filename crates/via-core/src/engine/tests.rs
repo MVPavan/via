@@ -18,6 +18,9 @@ use via_store::{SubmissionRecord, TerminalRecord};
 use super::{Engine, Receipted};
 use crate::api::{Event, EventBody, rfc3339};
 
+#[cfg(test)]
+#[cfg(feature = "test-failpoints")]
+mod stop_ack;
 #[cfg(feature = "test-failpoints")]
 mod wake;
 use crate::{
@@ -280,6 +283,10 @@ async fn end_turn(engine: &Engine, session: &SessionId, n: u32, state: Option<&s
                 turn: turn(n),
                 envelope: match state {
                     "pending" => json!({"state":"cancelled","cancel":{"cleanup":"pending"}}),
+                    // An acknowledged cancel whose cleanup settled.
+                    "uncertain" | "quiescent" => json!({"state":"cancelled",
+                        "cancel":{"outcome":"acknowledged","cleanup":state,
+                            "requested_at":at,"settled_at":at}}),
                     state => json!({"state":state,"cancel":null}),
                 },
                 event: event(
@@ -287,7 +294,7 @@ async fn end_turn(engine: &Engine, session: &SessionId, n: u32, state: Option<&s
                     EventBody::TurnEnded {
                         state: match state {
                             "unknown" => "unknown",
-                            "pending" => "cancelled",
+                            "pending" | "uncertain" | "quiescent" => "cancelled",
                             _ => "failed",
                         },
                         failure: None,
@@ -349,6 +356,37 @@ fn a_turn_behind_a_settled_terminal_runs_however_its_drive_ended() {
         resume(&engine, &session, None).await;
         assert!(submitted(&engine, &session, 2).await, "a later resume runs");
         assert!(!engine.store_failed());
+    });
+}
+
+/// X4 code review r1 #3 (C1 §7.3, §3.5 P7): a turn dispatched behind a
+/// predecessor whose cancel cleanup settled `uncertain` carries
+/// `predecessor_cleanup_uncertain`, whatever its route; behind a
+/// `quiescent` one it does not.
+#[test]
+fn a_successor_carries_its_predecessors_uncertain_cleanup() {
+    let Some(root) = child("a_successor_carries_its_predecessors_uncertain_cleanup") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        for (cleanup, warned) in [("uncertain", true), ("quiescent", false)] {
+            let session = new_session(&engine).await;
+            resume(&engine, &session, None).await;
+            end_turn_one(&engine, &session, Some(cleanup)).await;
+            assert!(submitted(&engine, &session, 2).await, "{cleanup}");
+            let envelope = engine
+                .result(&format!("{}/2", session.as_str()))
+                .await
+                .unwrap();
+            let envelope: Value = serde_json::from_str(envelope.get()).unwrap();
+            let carried = envelope["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning["code"] == "predecessor_cleanup_uncertain");
+            assert_eq!(carried, warned, "behind {cleanup}: {envelope}");
+        }
     });
 }
 
@@ -4165,6 +4203,7 @@ fn the_lane_actor_retires_a_driver_whose_turn_was_abandoned() {
             tool_grace: Duration::from_secs(60),
             stop,
             force,
+            stop_ack: via_adapters::StopAck::new(),
         };
         let spec = TurnSpec {
             prompt: "p".to_owned(),
@@ -5891,6 +5930,7 @@ fn health_retirement_commits_the_items_it_finds_first() {
             tool_grace: Duration::from_secs(60),
             stop,
             force,
+            stop_ack: via_adapters::StopAck::new(),
         };
         let spec = TurnSpec {
             prompt: "p".to_owned(),
@@ -5971,6 +6011,7 @@ fn an_identity_drained_before_a_turn_is_the_turns() {
             tool_grace: Duration::from_secs(60),
             stop,
             force,
+            stop_ack: via_adapters::StopAck::new(),
         };
         let spec = TurnSpec {
             prompt: "p".to_owned(),
@@ -6212,7 +6253,7 @@ fn a_final_drain_services_a_pending_order_within_128_items() {
         let engine = open(&root);
         let (session, slot, lane, mut record, effective, orders) =
             running_turn_2(&engine, &root).await;
-        slot.idle_order(turn(2), tokio::time::Instant::now());
+        slot.idle_order(turn(2));
         engine
             .drain_queued(
                 (&slot, Some(&*lane)),
@@ -6249,7 +6290,7 @@ fn a_pre_turn_drain_services_a_pending_order_within_128_items() {
             .unwrap()
             .lost();
         record.head = std::sync::Arc::clone(&slot.head);
-        slot.idle_order(turn(2), tokio::time::Instant::now());
+        slot.idle_order(turn(2));
         let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(10_000));
         let (sender, receiver) = tokio::sync::mpsc::channel(512);
         for n in 0..300 {
@@ -6268,6 +6309,7 @@ fn a_pre_turn_drain_services_a_pending_order_within_128_items() {
             tool_grace: Duration::from_secs(60),
             stop,
             force,
+            stop_ack: via_adapters::StopAck::new(),
         };
         let spec = TurnSpec {
             prompt: "p".to_owned(),
@@ -6418,6 +6460,7 @@ fn a_never_empty_channel_holds_neither_the_turn_nor_its_end() {
             tool_grace: Duration::from_secs(60),
             stop,
             force,
+            stop_ack: via_adapters::StopAck::new(),
         };
         let spec = TurnSpec {
             prompt: "p".to_owned(),
@@ -6514,6 +6557,7 @@ fn a_new_connection_generation_starts_with_no_old_ownership() {
             tool_grace: Duration::from_secs(60),
             stop,
             force,
+            stop_ack: via_adapters::StopAck::new(),
         };
         let spec = TurnSpec {
             prompt: "p".to_owned(),
@@ -7052,6 +7096,7 @@ fn turn_2_cx() -> (via_adapters::TurnSpec, via_adapters::TurnCx) {
         tool_grace: Duration::from_secs(60),
         stop,
         force,
+        stop_ack: via_adapters::StopAck::new(),
     };
     let spec = TurnSpec {
         prompt: "p".to_owned(),

@@ -26,7 +26,7 @@ via-store = { path = "../via-store", features = ["test-failpoints"] }
 rusqlite = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
 
 [lints]
 workspace = true

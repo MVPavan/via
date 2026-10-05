@@ -401,6 +401,17 @@ impl Engine {
             .filter(|(_, state)| !terminal(state))
             .and_then(|(turn, _)| self.slot(&params.session)?.progress(*turn))
             .map(|progress| progress.to_value(frozen.token_scope()));
+        // x.3.2 X4 D7: the running turn's acknowledgement, kept in memory.
+        let acknowledged = status.active.as_ref().is_some_and(|active| {
+            TurnNumber::try_from(active.turn).is_ok_and(|turn| {
+                self.slot(&params.session).is_some_and(|slot| {
+                    matches!(
+                        slot.cancel_shown(turn),
+                        Some(super::queue::Ack::Acknowledged(_))
+                    )
+                })
+            })
+        });
         let alive = self.adapter.live_armed(&status.unproven_anchors);
         // Decision H3: verified once this daemon committed the open of the
         // lane's current connection generation.
@@ -413,6 +424,7 @@ impl Engine {
             after_step,
             (progress.as_ref(), &frozen),
             (alive, verified),
+            acknowledged,
         );
         debug_assert!(
             serde_json::to_vec(&value).is_ok_and(|bytes| bytes.len() <= STATUS_MAX),
@@ -440,6 +452,7 @@ fn status_value(
     after_step: u32,
     (progress, frozen): (Option<&Value>, &Frozen),
     (alive, verified): (bool, bool),
+    acknowledged: bool,
 ) -> Value {
     let tested = status.version_status.as_deref() == Some("tested");
     let version = PlanFields {
@@ -461,9 +474,14 @@ fn status_value(
             "phase": if active.accepted { "accepted" } else { "submitting" },
             "started_at": active.submitted_at,
             "last_event_seq": active.last_event_seq,
-            "cancel": active
-                .cancel_requested_at
-                .map(|at| json!({"requested_at": at})),
+            // C1 §3.5's object (x.3.2 X4 D7): cleanup pending while the
+            // turn runs; `acknowledged` once the vendor acknowledged.
+            "cancel": active.cancel_requested_at.map(|at| json!({
+                "outcome": if acknowledged { "acknowledged" } else { "requested" },
+                "cleanup": "pending",
+                "requested_at": at,
+                "settled_at": null,
+            })),
         })
     });
     let queue: Vec<Value> = status

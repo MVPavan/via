@@ -40,6 +40,9 @@
         "output_schema": null,
         "max_steps": null
       },
+      "deadlines": {
+        "wall_ms": 2000
+      },
       "tool_grace_ms": 300,
       "stop": {
         "kind": "wall",

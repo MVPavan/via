@@ -740,42 +740,7 @@ impl TurnNormalizer {
     }
 
     fn terminal(&mut self, turn: &Turn, at: Instant) -> Result<Step, NormalizeError> {
-        let (status, stop_reason, vendor_stop_reason) = match turn.status {
-            TurnStatus::Completed => (
-                VendorTerminalStatus::Completed,
-                StopReason::EndTurn,
-                "completed",
-            ),
-            TurnStatus::Interrupted => (
-                VendorTerminalStatus::Interrupted,
-                StopReason::Interrupted,
-                "interrupted",
-            ),
-            TurnStatus::Failed => (VendorTerminalStatus::Failed, StopReason::Error, "failed"),
-            TurnStatus::InProgress => {
-                return Err(NormalizeError::Protocol(
-                    "turn/completed with an inProgress turn",
-                ));
-            }
-        };
-        let failed = status == VendorTerminalStatus::Failed;
-        let error = turn.error.as_ref();
-        let info = error.and_then(|error| error.codex_error_info.as_ref());
-        let terminal = VendorTerminal {
-            at,
-            status,
-            stop_reason,
-            vendor_stop_reason: vendor_stop_reason.to_owned(),
-            vendor_code: info.map(|info| info.kind.clone()),
-            class_hint: failed.then(|| class_hint(info)),
-            detail: error.map(detail),
-            structured_output: None,
-            structured_output_unparsed: None,
-            steps: None,
-            usage: None,
-            cost: None,
-            vendor: self.vendor(),
-        };
+        let terminal = vendor_terminal(turn, at, self.vendor())?;
         Ok(Step::Terminal {
             terminal: Box::new(terminal),
             structured: self.structured(),
@@ -822,6 +787,52 @@ impl TurnNormalizer {
         }
         serde_json::value::to_raw_value(&vendor).ok()
     }
+}
+
+/// The C2 terminal of `turn/completed`'s `turn`, read at `at`, with the
+/// envelope's `vendor` member: a running turn's, or an ended turn's late
+/// one (X4 code review r2 #2), which carries no usage of its own.
+pub(crate) fn vendor_terminal(
+    turn: &Turn,
+    at: Instant,
+    vendor: Option<Box<RawValue>>,
+) -> Result<VendorTerminal, NormalizeError> {
+    let (status, stop_reason, vendor_stop_reason) = match turn.status {
+        TurnStatus::Completed => (
+            VendorTerminalStatus::Completed,
+            StopReason::EndTurn,
+            "completed",
+        ),
+        TurnStatus::Interrupted => (
+            VendorTerminalStatus::Interrupted,
+            StopReason::Interrupted,
+            "interrupted",
+        ),
+        TurnStatus::Failed => (VendorTerminalStatus::Failed, StopReason::Error, "failed"),
+        TurnStatus::InProgress => {
+            return Err(NormalizeError::Protocol(
+                "turn/completed with an inProgress turn",
+            ));
+        }
+    };
+    let failed = status == VendorTerminalStatus::Failed;
+    let error = turn.error.as_ref();
+    let info = error.and_then(|error| error.codex_error_info.as_ref());
+    Ok(VendorTerminal {
+        at,
+        status,
+        stop_reason,
+        vendor_stop_reason: vendor_stop_reason.to_owned(),
+        vendor_code: info.map(|info| info.kind.clone()),
+        class_hint: failed.then(|| class_hint(info)),
+        detail: error.map(detail),
+        structured_output: None,
+        structured_output_unparsed: None,
+        steps: None,
+        usage: None,
+        cost: None,
+        vendor,
+    })
 }
 
 /// One model call's usage, keyless: Codex `last` samples add (AD6).

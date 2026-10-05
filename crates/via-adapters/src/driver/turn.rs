@@ -249,6 +249,9 @@ pub(crate) async fn merge_stops(
                     cause: StopCause::Close,
                     // Route acts only on the times; Core never sees this order.
                     requested_at: String::new(),
+                    // Feeds only this driver's merged watch: no provenance
+                    // reader sees it (x.3.2 X4 D4.2).
+                    attached: now,
                     force_at: Deadline::at(now),
                     close_by: Deadline::at(now + CLEANUP_ALLOWANCE),
                 }),

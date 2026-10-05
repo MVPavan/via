@@ -74,7 +74,9 @@ pub(crate) fn capabilities() -> Capabilities {
         verbs: Verbs {
             spawn: Support::Native,
             resume: Support::Native,
-            steer: Support::Native,
+            // Owner, 2026-10-04: deferred past the first release
+            // (via-gaz); callers stop and resume instead.
+            steer: unsupported("deferred past the first release"),
             cancel: Support::Native,
             close: Support::Native,
         },

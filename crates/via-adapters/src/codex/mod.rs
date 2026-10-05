@@ -8,6 +8,8 @@
 
 mod delivery;
 mod driver;
+#[cfg(test)]
+mod driver_tests;
 mod launch;
 mod normalize;
 mod plan;
@@ -98,6 +100,21 @@ impl CodexAdapter {
     /// The shared-server registry.
     pub(crate) fn servers(&self) -> &Arc<Servers> {
         &self.servers
+    }
+
+    /// The live servers as `daemon/status` lists them (C1 §3.14): each
+    /// one's handshake version and the sessions leasing it.
+    pub(crate) fn server_reports(&self) -> Vec<crate::plan::ServerReport> {
+        self.servers
+            .reports()
+            .into_iter()
+            .map(|report| crate::plan::ServerReport {
+                harness: HARNESS,
+                vendor_version: normalize::instance_version(&report.user_agent).map(str::to_owned),
+                key: ServerKey::new(report.key),
+                sessions: report.sessions,
+            })
+            .collect()
     }
 
     /// The route's vendor home, `<state>/vendor/codex`: the server's SQLite

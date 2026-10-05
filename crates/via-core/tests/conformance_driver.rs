@@ -149,6 +149,7 @@ fn order(after: Duration) -> StopOrder {
     StopOrder {
         cause: StopCause::Cancel,
         requested_at: "2026-01-01T00:00:00.000Z".to_owned(),
+        attached: tokio::time::Instant::now(),
         force_at,
         close_by: Deadline::at(force_at.instant() + Duration::from_secs(3)),
     }
@@ -251,6 +252,7 @@ impl Controls {
         self.stop.send_replace(Some(StopOrder {
             cause: StopCause::Cancel,
             requested_at: "2026-01-01T00:00:00.000Z".to_owned(),
+            attached: tokio::time::Instant::now(),
             force_at: far,
             close_by: far,
         }));
@@ -284,6 +286,7 @@ fn turn_cx_with(
         tool_grace,
         stop: stop_rx,
         force: force_rx,
+        stop_ack: via_adapters::StopAck::new(),
     };
     (
         cx,

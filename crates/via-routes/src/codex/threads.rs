@@ -213,17 +213,26 @@ impl ThreadTable {
     }
 
     /// Closes lane `id`: its thread, if registered, is closed here (its
-    /// charge kept), and its mapped turns become late.
-    pub(super) fn close_lane(&mut self, id: u64) {
+    /// charge kept), and its mapped turns become late. Whether it ended an
+    /// open registration.
+    pub(super) fn close_lane(&mut self, id: u64) -> bool {
         let Some(entry) = self.lanes.remove(&id) else {
-            return;
+            return false;
         };
         if let Some(thread) = entry.thread
             && self.open.get(&thread).is_some_and(|open| *open == id)
         {
             self.open.remove(&thread);
             self.closed.insert(thread);
+            return true;
         }
+        false
+    }
+
+    /// Whether `thread` has an open registration (x.3.2 X4 D3: a term of
+    /// its fence; a closed one's tombstone never is).
+    pub(super) fn is_open(&self, thread: &str) -> bool {
+        self.open.contains_key(thread)
     }
 
     /// Maps the accepted vendor turn `turn` of `thread`, started on lane

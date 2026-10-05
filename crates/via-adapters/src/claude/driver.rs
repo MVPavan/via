@@ -75,7 +75,11 @@ pub(crate) async fn run_turn(
         tool_grace: _,
         stop,
         force,
+        stop_ack,
     } = cx;
+    // A private route returns at acknowledgement: its report goes unused
+    // (C2 §2 Interrupt).
+    drop(stop_ack);
     let ordered = ordered((stop.clone(), force.clone(), wall), driver.cancel.clone());
     let (generation, capacity, reservation, _delivering) =
         match driver.connect((prepared, capacity), ordered).await {
@@ -463,6 +467,9 @@ impl Delivery<'_> {
             cause: StopCause::Protocol,
             // Route acts only on the times; Core never sees this order.
             requested_at: String::new(),
+            // Claude's own abort: no provenance reader sees it (x.3.2 X4
+            // D4.2).
+            attached: now,
             force_at: Deadline::at(force_at),
             close_by: Deadline::at(force_at + CLEANUP_ALLOWANCE),
         }));
