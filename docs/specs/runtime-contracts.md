@@ -406,8 +406,8 @@ readers or fabricate a successful send. The future C4 owner implements it with
 the real WireSender; the frozen contract-only increment needs no unimplemented
 stub.
 One task drains stdout. It never waits for Route, Core or SQLite. It
-splits bytes into vendor messages at LF, at most 1 MiB each including LF,
-and queues each with a nonblocking send; a full queue fails the connection
+splits bytes into vendor messages at LF, at most the connection's cap each
+including LF (1 MiB; a Codex shared server's 8 MiB, §8), and queues each with a nonblocking send; a full queue fails the connection
 `overflow`. At the cap without LF it fails `MessageTooLarge`. After a
 failure it reads to EOF in 64 KiB units and discards them, counting the
 bytes, so the vendor never blocks on a full pipe. The splitter retains
@@ -427,7 +427,7 @@ vendor's stderr is the file `stderr.log` in its owner's folder (the turn's on
 a per-turn route, the server's on a shared one): Host opens it and gives it to
 the anchor as stderr; the anchor gives the vendor a pipe as stderr and drains
 it into the file under a cap (below); no VIA task reads it. When Route cannot decode a message, and when a
-message exceeds 1 MiB or ends unterminated, its first 64 KiB is written to
+message exceeds its cap or ends unterminated, its first 64 KiB is written to
 `undecoded.bin`: in the folder of the turn its correlation names, when it
 names one; otherwise in the connection's folder. The failures go to the
 affected turns, which may differ from the turn holding the evidence (a
@@ -1328,10 +1328,10 @@ payload limits count encoded bytes plus separately bounded decoded structure.
 | Global C1 input buffers | 32 MiB by construction (32 sockets × 1 MiB) | 5 s partial-request deadline prevents monopolization |
 | JSON structure | depth 64, 65,536 nodes per document | Bound during streaming parse, before constructing a `Value`; named invalid params/protocol error |
 | Structured-output validation (C1 Q2) | Compile: 2,048 subschemas, 64 regular expressions, each program at most 1 MiB, counted over every schema position, referenced or not (reference targets included); one 1,000,000-unit budget at depth 512 shared by the schema's own metaschema check, the pattern bytes (one unit per 2 bytes before conversion, two per converted byte) and the metaschema's format checks (one unit per 2 bytes); an extended-mode pattern needing more than 32 control-escape rewrites is refused. Validation of one value: 1,000,000 work units (one per subschema evaluation, plus charges in proportion to the values compared, the names scanned, the string lengths counted and the pattern subjects matched), active evaluation depth 512, nested evaluations included, on a blocking thread with a 16 MiB stack, never an executor thread | Over a compile limit: `invalid_params` naming `output_schema` at receipt. Budget spent: the value counts as invalid with `reason: validation_limit` (C1 §5). A value at C1's JSON maximum against an ordinary schema needs about 381,000 units; the recorded worst cases finish within about 60 ms and 40 MB, including building the value |
-| Vendor stdout message | 1 MiB including LF | Fail connection; the first 64 KiB saved as evidence |
+| Vendor stdout message | 1 MiB including LF; a Codex shared server 8 MiB (`codex-server.md` item 9.3, via-5lr.3.5) | Fail connection; the first 64 KiB saved as evidence |
 | Pipe read buffer | 64 KiB per pipe | Reuse; never grows |
-| Route message staging | 1,024 messages and 4 MiB/connection | Fail connection if saturated; health/control bypass |
-| Codex shared Route ingress | 16 messages and 1 MiB/thread within the existing connection staging; fixed per-server buffers (the Codex task) | First full thread lane quarantines that generation immediately, separate from C2's 10 s stall. Reserved-path or global budget failure escalates to connection overflow (C2 §4) |
+| Route message staging | 1,024 messages and 4 MiB/connection; a Codex shared server 12 MiB (4 MiB plus one maximal message) | Fail connection if saturated; health/control bypass |
+| Codex shared Route ingress | 16 messages and 8 MiB (one maximal message)/thread within the existing connection staging; fixed per-server buffers (the Codex task) | First full thread lane quarantines that generation immediately, separate from C2's 10 s stall. Reserved-path or global budget failure escalates to connection overflow (C2 §4) |
 | Codex shared connection writes | 8 pending server-request replies, 64 KiB; one control in flight; data held back while any control is pending; per driver, reserved interrupt (12,800 B) and unsubscribe (6,400 B) slots, steer 6 commands and 46,336 B | Past the reply bound, a reply not written within 5 s of decode, or correlation exhaustion: connection overflow, every associated session fails through health, the server retires |
 | OpenCode HTTP/SSE transport metadata | Existing bounded Wire splitting; headers 64 KiB, bodies 1 MiB (`/api/model` 4 MiB) | Read, count and discard as for pipes; never an `Authorization` header or request body in evidence |
 | C2 observations | 1024 items and 4 MiB/session | Wait only normalizer; at 10 s without drain, the adapter closes the session's route hop; a private route fails the connection `overflow`, a shared route quarantines the thread generation (A1, C2 §4) |
@@ -1356,7 +1356,8 @@ are harmless. The same mechanism stores large immutable effective params, for in
 files, while keeping Store messages small. Load only the dispatched prompt,
 one per running turn. Outbound fake start may encode beyond 1 MiB; its input
 message ceiling is the 16 MiB prompt plus bounded JSON wrapper expansion, streamed
-without a whole second copy. Inbound vendor message cap remains 1 MiB.
+without a whole second copy. Inbound vendor message cap remains 1 MiB, except
+a Codex shared server's 8 MiB (above).
 
 Every buffer has a fixed maximum and every kind of holder a fixed count;
 nothing is preallocated from an unchecked peer size or item count.

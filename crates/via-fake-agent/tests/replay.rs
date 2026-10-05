@@ -23,7 +23,7 @@ const MIB: usize = 1024 * 1024;
 /// Outer supervision bound for any one fake run.
 const OUTER: Duration = Duration::from_secs(10);
 /// Most stdout bytes a test keeps; the rest is drained and dropped.
-const STDOUT_KEEP: usize = 4 * MIB;
+const STDOUT_KEEP: usize = 16 * MIB;
 /// Most stderr bytes a test keeps; the rest is drained and dropped.
 const STDERR_KEEP: usize = 64 * 1024;
 
@@ -505,10 +505,12 @@ fn replay_bounds_step_count() -> TestResult {
 
 #[test]
 fn replay_bounds_output_lines_after_substitution() -> TestResult {
-    let at_bound = run_closed(&json!([{"emit": {"line": "a".repeat(MIB)}}]), 10_000)?;
+    // An emitted line may cross the 8 MiB Codex inbound cap: 12 MiB.
+    const EMIT: usize = 12 * MIB;
+    let at_bound = run_closed(&json!([{"emit": {"line": "a".repeat(EMIT)}}]), 10_000)?;
     assert_eq!(at_bound.code, Some(0), "{}", at_bound.stderr);
-    assert_eq!(at_bound.stdout, vec![line(&"a".repeat(MIB))]);
-    let over = run_closed(&json!([{"emit": {"line": "a".repeat(MIB + 1)}}]), 10_000)?;
+    assert_eq!(at_bound.stdout, vec![line(&"a".repeat(EMIT))]);
+    let over = run_closed(&json!([{"emit": {"line": "a".repeat(EMIT + 1)}}]), 10_000)?;
     assert_eq!(over.code, Some(FAILED));
     assert!(over.stderr.contains("step 1"), "{}", over.stderr);
 
@@ -521,7 +523,7 @@ fn replay_bounds_output_lines_after_substitution() -> TestResult {
             10_000,
             &json!([
                 {"expect": {"line": {}, "capture": {"pad": "/pad"}}},
-                {"emit": {"line": "${pad}${pad}"}}
+                {"emit": {"line": "${pad}".repeat(21)}}
             ]),
         ),
     )?;

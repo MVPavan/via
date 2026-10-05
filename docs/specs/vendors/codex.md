@@ -306,7 +306,7 @@ Each client response routes by request ID; each known notification routes
 by exact `threadId` and, where present, `turnId`. Server requests additionally
 carry their own request IDs. Install registrations before releasing a
 thread response to its driver. Bound pre-registration buffering by the
-existing 1,024-message/4 MiB connection staging limit. Lookup includes retained
+existing 1,024-message/12 MiB connection staging limit. Lookup includes retained
 correlation tombstones before classifying a thread or turn as unknown.
 Truly unknown thread IDs are connection diagnostics; genuinely unseen turn
 IDs on known threads may become C2 session-level observations. A previously
@@ -374,8 +374,11 @@ other than `never`; under `never` any such request is declined like the
 others (qualify in `via-5lr.3.3`). The `guardianv2.thread_context` removal
 is unused.
 
-Use runtime §8 limits unchanged: 1 MiB inbound vendor message including LF,
-64 KiB pipe buffers, 1,024 messages/4 MiB per connection, C2 1024 observations/4 MiB per
+Use runtime §8 limits, with the Codex inbound bounds (via-5lr.3.5,
+2026-10-05; derivation in the
+[Codex server design](../../workstreams/rust-foundation/adapters/codex-server.md)
+item 9.3): 8 MiB inbound vendor message including LF, 64 KiB pipe buffers,
+1,024 messages/12 MiB per connection, C2 1024 observations/4 MiB per
 session, 256 KiB observation payload, 1 MiB envelope, JSON depth 64 and
 65,536 nodes. Final text is sent as C2 `final_text` pieces of at most
 256 KiB encoded; unknown notifications are activity only.
@@ -384,16 +387,19 @@ runtime's bounded streaming outbound path. Codex echoes the prompt whole in
 the user message's `item/started` and `item/completed` notifications, one
 inbound line each (checked in every 0.159.2 fixture: the line carries the
 prompt once, no cwd, and at most 340 other bytes with its LF), and an
-inbound line over 1 MiB fails the shared connection. So the route refuses,
+inbound line over the cap fails the shared connection. The route refuses,
 before any receipt, a prompt whose JSON encoding plus the cwd's exceeds
 1,040,384 bytes (1 MiB less 8 KiB) as `invalid_params` naming `prompt`
 (C1 §4; via-5lr.6, x.3.2 X5). The cwd is counted, as `opencode-serve`
-counts it, for headroom.
+counts it, for headroom. That limit was set against the earlier 1 MiB
+cap and is kept: raising it is a C1 change. A Codex command's output is
+cut to about 1 MiB raw, and its escaped `item/completed` line can pass
+1 MiB (live: 1,213,365 B), hence the 8 MiB cap.
 
 One blocked session normalizer must not stop dispatch to other threads or
 the decline/control paths. Partition the existing Route message staging
-into per-thread ingress lanes, each capped at 16 messages/1 MiB within the
-unchanged 1,024-message/4 MiB connection aggregate; this adds no buffer tier.
+into per-thread ingress lanes, each capped at 16 messages/8 MiB (one
+maximal message) within the 1,024-message/12 MiB connection aggregate; this adds no buffer tier.
 These ingress lanes precede the existing C2 observation channel. The shared
 receiver uses nonblocking ingress admission: **the first full ingress-lane
 result immediately quarantines that thread's data lane**, without waiting

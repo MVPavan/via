@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
-use via_wire::testing::pipes;
+use via_wire::testing::pipes_within;
 use via_wire::{
     Deadline, OutboundMessage, SendOutcome, ServerId, TurnNumber, WireCleanup, WriteBounds,
     WriteState,
@@ -41,7 +41,7 @@ impl Vendor {
         let (stdout, vendor_out) = tokio::io::duplex(1 << 20);
         let (vendor_in, stdin) = tokio::io::duplex(stdin_buffer);
         let scratch = Scratch::new();
-        let pipes = pipes(vendor_out, vendor_in, scratch.path().to_path_buf());
+        let pipes = pipes_within(vendor_out, vendor_in, scratch.path().to_path_buf(), INBOUND);
         let wire = Arc::new(TestStdio::new(pipes.input, scratch));
         let connection = Connection::over(
             ServerId::mint().unwrap(),

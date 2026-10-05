@@ -1,9 +1,10 @@
 //! x.3.2 X5 (X0 item 9.2): the measured peak of one maximal Codex decode
-//! against the design's `DECODE_ALLOWANCE`, 1 MiB of owned strings plus
-//! 65,536 nodes at 64 B each (5 MiB), which `codex_rss_leases` charges
+//! against the design's `DECODE_ALLOWANCE`, 8 MiB of owned strings plus
+//! 65,536 nodes at 64 B each (12 MiB), which `codex_rss_leases` charges
 //! per session for the normalizer's decode in flight. Each shape a server
-//! line can reach within Wire's 1 MiB message and the 65,536-node
-//! structure limit is decoded in a fresh child process (no freed page of
+//! line can reach within the Codex route's 8 MiB message
+//! ([`MESSAGE_BYTES`], via-5lr.3.5) and the 65,536-node structure limit
+//! is decoded in a fresh child process (no freed page of
 //! an earlier decode to reuse): the line is built, the peak RSS is reset
 //! (`/proc/self/clear_refs`), and the peak (`VmHWM`) less the RSS before
 //! `decode` is its measured peak. The workspace forbids `unsafe`, so no
@@ -19,13 +20,14 @@
 
 use std::{env, fs, process::Command};
 
-use via_routes::codex::decode;
+use via_routes::codex::{MESSAGE_BYTES, decode};
 
-/// The design's allowance (X0 item 9.2 table).
-const DECODE_ALLOWANCE: u64 = 1024 * 1024 + 65_536 * 64;
+/// The design's allowance (X0 item 9.2 table): the owned strings of one
+/// maximal message plus 65,536 nodes at 64 B.
+const DECODE_ALLOWANCE: u64 = MESSAGE_BYTES as u64 + 65_536 * 64;
 
-/// The longest line Wire admits, its LF excluded.
-const LINE: usize = 1024 * 1024 - 1;
+/// The longest line the Codex route admits, its LF excluded.
+const LINE: usize = MESSAGE_BYTES - 1;
 
 /// The child's shape, by index.
 const SHAPE: &str = "VIA_DECODE_PEAK_SHAPE";

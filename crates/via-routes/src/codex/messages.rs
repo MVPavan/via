@@ -204,18 +204,19 @@ const THREAD_METHODS: [&str; 2] = ["thread/status/changed", "thread/closed"];
 /// against their typed schema. An error is an unattributable message (step
 /// 2): not JSON, a reply ID that is not an integer, or a known method whose
 /// thread or turn is missing, not a string, or past [`SHORT_FIELD_MAX`].
-/// Every other field is the full decode's, at consumption.
+/// Every other field is the full decode's, at consumption. `params` is
+/// borrowed from the line, never copied (via-5lr.3.5).
 pub fn peek(line: &[u8]) -> Result<Routing, DecodeError> {
     #[derive(Deserialize)]
-    struct Head {
+    struct Head<'a> {
         #[serde(default, deserialize_with = "present")]
         id: Option<Box<RawValue>>,
         #[serde(default)]
         method: Option<String>,
-        #[serde(default)]
-        params: Option<Box<RawValue>>,
+        #[serde(default, borrow)]
+        params: Option<&'a RawValue>,
     }
-    let head: Head =
+    let head: Head<'_> =
         serde_json::from_slice(line).map_err(|_| DecodeError("not a JSON-RPC message"))?;
     match (head.id, head.method) {
         (Some(id), None) => match serde_json::from_str::<Value>(id.get()) {
@@ -228,7 +229,7 @@ pub fn peek(line: &[u8]) -> Result<Routing, DecodeError> {
         (Some(id), Some(method)) => {
             let id = request_id(&id)?;
             fits(&[&method])?;
-            let ids = loose_ids(head.params.as_deref());
+            let ids = loose_ids(head.params);
             let bounded = |text: Option<String>| text.filter(|text| text.len() <= SHORT_FIELD_MAX);
             Ok(Routing::Request {
                 id,
@@ -237,7 +238,7 @@ pub fn peek(line: &[u8]) -> Result<Routing, DecodeError> {
                 turn: bounded(ids.turn),
             })
         }
-        (None, Some(method)) => notification_routing(&method, head.params.as_deref()),
+        (None, Some(method)) => notification_routing(&method, head.params),
         (None, None) => Err(DecodeError(
             "neither a response, a request nor a notification",
         )),
@@ -247,13 +248,13 @@ pub fn peek(line: &[u8]) -> Result<Routing, DecodeError> {
 /// A notification's correlation, by method.
 fn notification_routing(method: &str, params: Option<&RawValue>) -> Result<Routing, DecodeError> {
     #[derive(Deserialize)]
-    struct Ids {
+    struct Ids<'a> {
         #[serde(default, rename = "threadId")]
         thread: Option<Value>,
         #[serde(default, rename = "turnId")]
         turn_id: Option<Value>,
-        #[serde(default)]
-        turn: Option<Box<RawValue>>,
+        #[serde(default, borrow)]
+        turn: Option<&'a RawValue>,
     }
     #[derive(Deserialize)]
     struct TurnHead {
@@ -261,7 +262,7 @@ fn notification_routing(method: &str, params: Option<&RawValue>) -> Result<Routi
         id: Option<Value>,
     }
     let ids = match params {
-        Some(params) => serde_json::from_str::<Ids>(params.get()).ok(),
+        Some(params) => serde_json::from_str::<Ids<'_>>(params.get()).ok(),
         None => None,
     };
     let text = |value: Option<Value>| match value {
@@ -738,15 +739,17 @@ fn fits(fields: &[&str]) -> Result<(), DecodeError> {
 }
 
 /// The envelope every message shares. `id` is kept raw so that an
-/// explicit `null` is told from an absent member.
+/// explicit `null` is told from an absent member. `params` is borrowed
+/// from the line, never copied: a decode's peak stays near one copy of
+/// its retained text (via-5lr.3.5, codex-server.md item 9.2).
 #[derive(Deserialize)]
-struct RawEnvelope {
+struct RawEnvelope<'a> {
     #[serde(default, deserialize_with = "present")]
     id: Option<Box<RawValue>>,
     #[serde(default)]
     method: Option<String>,
-    #[serde(default)]
-    params: Option<Box<RawValue>>,
+    #[serde(default, borrow)]
+    params: Option<&'a RawValue>,
     #[serde(default, deserialize_with = "present")]
     result: Option<Box<RawValue>>,
     #[serde(default)]
@@ -756,7 +759,7 @@ struct RawEnvelope {
 /// Decodes one line the server wrote.
 pub fn decode(line: &[u8]) -> Result<Incoming, DecodeError> {
     limits(line)?;
-    let raw: RawEnvelope =
+    let raw: RawEnvelope<'_> =
         serde_json::from_slice(line).map_err(|_| DecodeError("not a JSON-RPC message"))?;
     let envelope = Envelope {
         id: raw.id.as_deref().map(request_id).transpose()?,
@@ -795,7 +798,7 @@ pub fn decode(line: &[u8]) -> Result<Incoming, DecodeError> {
             result: None,
             error: None,
         } => {
-            let ids = loose_ids(params.as_deref());
+            let ids = loose_ids(params);
             Ok(Incoming::Request(ServerRequest {
                 id,
                 method: short(method)?,
@@ -810,7 +813,7 @@ pub fn decode(line: &[u8]) -> Result<Incoming, DecodeError> {
             params,
             result: None,
             error: None,
-        } => notification(method, params.as_deref()).map(Incoming::Notification),
+        } => notification(method, params).map(Incoming::Notification),
         Envelope { .. } => Err(DecodeError(
             "neither a response, a request nor a notification",
         )),
@@ -818,10 +821,10 @@ pub fn decode(line: &[u8]) -> Result<Incoming, DecodeError> {
 }
 
 /// The envelope, its ID typed.
-struct Envelope {
+struct Envelope<'a> {
     id: Option<RequestId>,
     method: Option<String>,
-    params: Option<Box<RawValue>>,
+    params: Option<&'a RawValue>,
     result: Option<Box<RawValue>>,
     error: Option<RpcError>,
 }
@@ -887,10 +890,11 @@ fn notification(method: String, raw: Option<&RawValue>) -> Result<Notification, 
 fn item_event(params: &str) -> Result<ItemEvent, DecodeError> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
-    struct Raw {
+    struct Raw<'a> {
         thread_id: String,
         turn_id: String,
-        item: Box<RawValue>,
+        #[serde(borrow)]
+        item: &'a RawValue,
     }
     #[derive(Deserialize)]
     struct Head {
@@ -898,10 +902,10 @@ fn item_event(params: &str) -> Result<ItemEvent, DecodeError> {
         kind: String,
         id: String,
     }
-    let raw: Raw = serde_json::from_str(params).map_err(|_| DecodeError("an item event"))?;
-    let head: Head = fields(&raw.item, "an item without its type or ID")?;
+    let raw: Raw<'_> = serde_json::from_str(params).map_err(|_| DecodeError("an item event"))?;
+    let head: Head = fields(raw.item, "an item without its type or ID")?;
     let kind = ItemKind::parse(&short(head.kind)?);
-    let mut item = item_fields(&kind, &raw.item)?;
+    let mut item = item_fields(&kind, raw.item)?;
     if let Some(status) = item.status.take() {
         item.status = Some(short(status)?);
     }

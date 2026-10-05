@@ -9,8 +9,36 @@ pub use via_store::{
     AnchorCohort, CommitOutcome, Deadline, RuntimeResources, ServerId, SessionId, StoreFailureKind,
 };
 
-/// The maximum complete stdout message, including its trailing LF.
+/// The maximum complete stdout message, including its trailing LF, unless
+/// the connection's [`InboundBounds`] say otherwise.
 pub const MAX_STDOUT_MESSAGE_BYTES: usize = 1024 * 1024;
+
+/// A connection's inbound bounds (runtime §8): the largest complete stdout
+/// message it admits and its staging budget's bytes. A route sets them per
+/// connection; [`InboundBounds::DEFAULT`] is runtime §8's 1 MiB message
+/// and 4 MiB staging.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InboundBounds {
+    /// The largest complete stdout message, LF included.
+    pub message_bytes: usize,
+    /// The bytes of messages read and not yet dropped; at least
+    /// `message_bytes`.
+    pub staging_bytes: usize,
+}
+
+impl InboundBounds {
+    /// Runtime §8's bounds: a 1 MiB message and 4 MiB of staging.
+    pub const DEFAULT: Self = Self {
+        message_bytes: MAX_STDOUT_MESSAGE_BYTES,
+        staging_bytes: 4 * 1024 * 1024,
+    };
+}
+
+impl Default for InboundBounds {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
 
 /// The bytes of one complete, newline-terminated vendor message, bounded but
 /// not yet decoded; Route may still reject them as malformed.
@@ -18,9 +46,15 @@ pub const MAX_STDOUT_MESSAGE_BYTES: usize = 1024 * 1024;
 pub struct BoundedBytes(Vec<u8>);
 
 impl BoundedBytes {
-    /// Checks the complete-message cap before retaining the input.
+    /// Checks the default complete-message cap before retaining the input.
     pub fn try_from_message(bytes: Vec<u8>) -> Result<Self, WireFailure> {
-        if bytes.len() > MAX_STDOUT_MESSAGE_BYTES {
+        Self::try_from_message_within(bytes, MAX_STDOUT_MESSAGE_BYTES)
+    }
+
+    /// Checks a complete-message cap of `max` bytes, LF included, before
+    /// retaining the input.
+    pub fn try_from_message_within(bytes: Vec<u8>, max: usize) -> Result<Self, WireFailure> {
+        if bytes.len() > max {
             return Err(WireFailure::MessageTooLarge);
         }
         if bytes.last() != Some(&b'\n') {

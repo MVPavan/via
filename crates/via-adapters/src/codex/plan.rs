@@ -28,8 +28,9 @@ const EFFORTS: &[(&str, &str)] = &[
 /// Most bytes of a turn's JSON-encoded prompt plus its JSON-encoded cwd
 /// (C1 §4 `prompt`; via-5lr.6, x.3.2 X5). Codex echoes the prompt whole
 /// in the user message's `item/started` and `item/completed`
-/// notifications, one line each, and an inbound line over Wire's 1 MiB
-/// (1,048,576 bytes with its LF) fails the shared connection. The
+/// notifications, one line each. The limit was set against Wire's 1 MiB
+/// line cap (1,048,576 bytes with its LF) and is kept now that the Codex
+/// cap is 8 MiB (via-5lr.3.5): raising it is a C1 change. The
 /// recorded echo lines carry the prompt once, never the cwd, and at most
 /// 340 other bytes, LF included (every 0.159.2 fixture); 1 MiB less 8 KiB
 /// leaves over 7.5 KiB for fields a later version adds. The cwd is

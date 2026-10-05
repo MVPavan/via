@@ -1,6 +1,6 @@
 //! The stdout message splitter (design §8.2): splits bytes on LF into
-//! complete messages of at most [`MAX_STDOUT_MESSAGE_BYTES`] each, LF
-//! included. It keeps bytes exact and never interprets them: split UTF-8,
+//! complete messages of at most its cap each ([`MAX_STDOUT_MESSAGE_BYTES`]
+//! unless the connection's bounds say otherwise), LF included. It keeps bytes exact and never interprets them: split UTF-8,
 //! invalid UTF-8 and JSON are Route's to decode.
 
 use super::MAX_STDOUT_MESSAGE_BYTES;
@@ -8,8 +8,10 @@ use crate::connection::UNDECODED_BYTES;
 
 /// Assembles LF-terminated messages from chunks read in any split.
 pub struct LineSplitter {
-    /// The unfinished message: at most `MAX_STDOUT_MESSAGE_BYTES - 1` bytes.
+    /// The unfinished message: at most `cap - 1` bytes.
     assembly: Vec<u8>,
+    /// The largest complete message, LF included.
+    cap: usize,
 }
 
 /// What one pushed chunk ended with.
@@ -31,10 +33,17 @@ impl Default for LineSplitter {
 }
 
 impl LineSplitter {
-    /// An empty splitter.
+    /// An empty splitter with the default cap.
     pub fn new() -> Self {
+        Self::within(MAX_STDOUT_MESSAGE_BYTES)
+    }
+
+    /// An empty splitter whose messages are at most `cap` bytes, LF
+    /// included.
+    pub fn within(cap: usize) -> Self {
         Self {
             assembly: Vec::new(),
+            cap,
         }
     }
 
@@ -43,7 +52,7 @@ impl LineSplitter {
     pub fn push(&mut self, mut chunk: &[u8], mut accept: impl FnMut(Vec<u8>) -> bool) -> Pushed {
         while let Some(index) = chunk.iter().position(|byte| *byte == b'\n') {
             let (line, rest) = chunk.split_at(index + 1);
-            if self.assembly.len() + line.len() > MAX_STDOUT_MESSAGE_BYTES {
+            if self.assembly.len() + line.len() > self.cap {
                 return Pushed::TooLarge(self.prefix(line));
             }
             let message = if self.assembly.is_empty() {
@@ -60,7 +69,7 @@ impl LineSplitter {
         }
         // An unfinished message that already fills the cap can only end
         // past it.
-        if self.assembly.len() + chunk.len() >= MAX_STDOUT_MESSAGE_BYTES {
+        if self.assembly.len() + chunk.len() >= self.cap {
             return Pushed::TooLarge(self.prefix(chunk));
         }
         self.assembly.extend_from_slice(chunk);

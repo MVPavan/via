@@ -1130,7 +1130,8 @@ struct Registration { lease: LeaseId, generation: u64, lane: IngressLane }
 **Route side.**
 - Driver close posts `Close { lease }` to the connection task, applied in
   decode order: the cutoff. Items decoded before it are the admitted
-  prefix, already in the registration's lane (≤ 16 messages / 1 MiB).
+  prefix, already in the registration's lane (≤ 16 messages / 8 MiB,
+  item 9.3).
 - **Route delivery barrier:** the normalizer hands the prefix to the C2
   observation sink, bounded by `close_deadline − 500 ms`. The C2 10 s
   no-drain timer stays in force during close as everywhere (F14); the
@@ -1247,15 +1248,15 @@ reply; written once the reply brings the `turnId`);
   | Holder | Simultaneous maximum | Count |
   |---|---|---|
   | **Per server** | | |
-  | Staging: Wire's queue and all ingress lanes (one budget, item 12.5) | 1,024 messages / 4 MiB | 1 |
+  | Staging: Wire's queue and all ingress lanes (one budget, item 12.5) | 1,024 messages / 12 MiB (item 9.3) | 1 |
   | Correlation: records, mappings, tombstones | 1,024 entries / 256 KiB | 1 |
   | Pending server-request replies | 8 / 64 KiB | 1 |
   | Wire read buffer | 64 KiB | 1 |
-  | Demux routing peek (one message) | 1 MiB | 1 |
+  | Demux routing peek (one message; its `params` borrowed, item 9.3) | 8 MiB | 1 |
   | **Per session** | | |
   | C2 observation channel, Core drain held (`core.observations.pause`); open-tool metadata is charged inside it | 1,024 items / 4 MiB | 32 |
   | Driver controls | 8 / 64 KiB | 32 |
-  | Normalizer decode in flight: `DECODE_ALLOWANCE` = 1 MiB of owned strings + 65,536 nodes × 64 B = 5 MiB | 5 MiB | 32 |
+  | Normalizer decode in flight: `DECODE_ALLOWANCE` = 8 MiB of owned strings + 65,536 nodes × 64 B = 12 MiB (item 9.3) | 12 MiB | 32 |
   | **Per active turn** | | |
   | Dispatched prompt | 16 MiB | 32 |
 
@@ -1278,7 +1279,7 @@ reply; written once the reply brings the `turnId`);
   Core's Engine in its own process over one replay server. Each of the 32
   sessions' prompts is at the Codex echo cap (via-5lr.6), so the
   per-turn row counts 1,040,384 bytes, not 16 MiB, and the computed sum
-  is 327 MiB.
+  is 566 MiB (327 MiB before item 9.3).
   1. A paced flood of 272 maximal thread lines (about 270 MiB) is consumed
      with Core draining. The growth windows before and after the flood's
      first 64 MiB must both hold samples.
@@ -1288,7 +1289,8 @@ reply; written once the reply brings the `turnId`);
      expire; the test releases them after the measurement.
   3. Five maximal `final_answer` lines per session fill its channel and
      leave the fifth decoded and blocked. Four maximal lines in blocked
-     lanes fill the 4 MiB staging. The fake's gates are released by
+     lanes fill the 4 MiB staging (twelve fill the 12 MiB staging since
+     item 9.3). The fake's gates are released by
      counted consumer takes (`adapter.codex.consumer_take`), so Wire's
      staging never holds more than three lines.
   4. After the 1.5 s held sample, the test asserts the simultaneous
@@ -1317,23 +1319,76 @@ reply; written once the reply brings the `turnId`);
   replies (64 KiB) and the 32 sessions' driver controls (32 × 64 KiB) are
   not driven to their maxima, 2,368 KiB of the sum together.
 
-  Measured, two runs each:
+  Measured, two runs each, with item 9.3's bounds (2026-10-05):
 
   | Build | Baseline | Peak | Peak less baseline | Growth after 64 MiB |
   |---|---|---|---|---|
-  | musl (authoritative) | 20 MiB | 221 MiB | 202 MiB | under 0.1 MiB |
-  | glibc, `MALLOC_ARENA_MAX=2` | 27 MiB | 230 MiB | 204 MiB | none |
+  | musl (authoritative) | 19 MiB | 229 MiB | 210 MiB | under 0.3 MiB |
+  | glibc, `MALLOC_ARENA_MAX=2` | 27 MiB | 238 MiB | 211 MiB | none |
 
-  The limit is 409 MiB. Both builds reach about 6.3 MiB per session at
-  the held peak and about 0.17 MiB per idle active session.
+  The limit is 708 MiB (409 MiB before item 9.3). Both builds reach about
+  6.5 MiB per session at the held peak. The scenario still drives about
+  1 MiB lines (its pads are the echo-capped prompt): the 12 MiB staging is
+  filled, but the 8 MiB peek and decode rows are not driven to their new
+  maxima here; the decode measure below covers them one at a time.
+  Before item 9.3 the measured peak less baseline was 202 MiB (musl) and
+  204 MiB (glibc).
 
-  One maximal decode peaks at about 3.5 MiB of RSS on glibc and 3.75 MiB
-  on musl, against the 5 MiB `DECODE_ALLOWANCE`. RSS is an estimate, to
+  One maximal decode peaks at about 8.25 MiB of RSS (8 MiB lines) on both
+  builds, against the 12 MiB `DECODE_ALLOWANCE`. RSS is an estimate, to
   the kernel's 256 KiB counter granularity, not a bound. That measure is
   `codex_decode_peak_within_allowance`
   (`crates/via-routes/tests/codex_decode_peak.rs`). It decodes eight
-  shapes, each in a fresh process. The worst is a `final_answer` text or
-  a `fileChange` at the 65,536-node limit.
+  shapes, each in a fresh process. The worst is a `final_answer` text, an
+  error message or a response result at the 8 MiB cap.
+
+#### 9.3 The Codex inbound cap (via-5lr.3.5, 2026-10-05)
+
+Live round 1 (codex-cli 0.160.0) saw a `commandExecution`
+`item/completed` line of 1,213,365 B for `seq 1 800000`: Codex cuts a
+command's output to about 1 MiB raw (a 512 KiB head and tail, 1,048,607 B
+checked), and JSON escaping grows it. Over Wire's 1 MiB default the line
+failed the shared connection `protocol`, every session on it.
+
+- **Cap.** The worst escaping is six bytes per raw byte (`\u001f` for a
+  control character), so one such item reaches about 6 MiB plus its other
+  fields (command, cwd, IDs): the Codex route admits stdout messages of up
+  to **8 MiB including LF** (`codex::MESSAGE_BYTES`). Inferred from the
+  output cut and serde's escaping, not from a recorded 6 MiB line. Wire's
+  default stays 1 MiB for every other route; the bounds are per
+  connection (`via_wire::InboundBounds`, set through `WireSignals`).
+- **What the line must also fit through.** Each per-thread lane holds one
+  maximal message (`LANE_BYTES` = 8 MiB, 16 messages); the connection's
+  staging keeps runtime §8's 4 MiB for ordinary traffic plus one maximal
+  message: **12 MiB** (`codex::INBOUND`). The lanes still count against
+  that staging, so the server's memory is bounded by it, not by the sum
+  of the lanes.
+- **Decode.** The decoder borrows `params` and an item's raw value from
+  the line instead of copying them (`RawEnvelope`, `item_event`, `peek`):
+  before that, an 8 MiB `final_answer` decoded at about 24 MiB (three
+  copies); now at about 8.25 MiB, one copy of the retained text.
+  `DECODE_ALLOWANCE` is one maximal message's strings plus the node term:
+  12 MiB.
+- **Over the cap.** A line over 8 MiB still fails the shared connection
+  `protocol` (item 5 step 2). Failing only its own turn would need the
+  thread ID, which Codex writes after the item, past the 64 KiB prefix
+  Wire keeps, so it needs a streaming correlation scan: not done.
+- **Prompt cap unchanged.** The `prompt` limit (1,040,384 bytes with the
+  cwd, C1 §4) was set against the 1 MiB cap. The 8 MiB cap now holds both
+  echoes of a maximal prompt in one lane and the `thread/resume` reply's
+  `thread.preview` echo of a session's first prompt (live round 1 item
+  5b: 1,042,276 B), so via-7g3's two-echo race and the resume echo no
+  longer fail a turn. Raising the prompt limit would be a C1 change, so it
+  is not made.
+- **Tests.** `codex_escaped_output_over_one_mib_is_delivered`
+  (`crates/via-core/tests/conformance_codex.rs`): in `c4_two_sessions`
+  B's tool completion, carrying about 1.2 MB of escaped `seq` output,
+  arrives while A's turn runs; B completes and A reaches its interrupt as
+  recorded (failed with the 1 MiB cap: the connection failed and the
+  server was stopped). `connection_bounds_set_its_cap_and_staging`
+  (`crates/via-wire/tests/shared_connection.rs`): a connection's own
+  bounds admit a message at the cap and stage past the default 4 MiB, and
+  one byte over the cap fails it `MessageTooLarge`.
 
 ### Item 10. Overflow, quarantine and the loss record (G7, r2 N3, N14, r3 F17)
 
@@ -1598,8 +1653,8 @@ server-request replies.
 #### 12.5 Staging permits
 
 - **Wire (X2):** `VendorMessage` carries a `StagingPermit` (one message
-  and its bytes of the 1,024 / 4 MiB staging), released on drop instead of
-  at receive. Private routes drop the message after decoding: no change.
+  and its bytes of the 1,024-message staging, 12 MiB since item 9.3),
+  released on drop instead of at receive. Private routes drop the message after decoding: no change.
 - **Route (X3):** the demux peeks the routing fields, drops that parse,
   and enqueues the raw message with its permit into the ingress lane; the
   normalizer decodes it when it consumes it and drops the permit after.

@@ -1270,6 +1270,7 @@ impl Servers {
             force: self.unforced.subscribe(),
             wake: self.unwoken.subscribe(),
             gate,
+            inbound: super::INBOUND,
         };
         let connection = self
             .runtime
@@ -1296,7 +1297,12 @@ impl Servers {
         let (stdout, vendor_out) = tokio::io::duplex(1 << 20);
         let (vendor_in, stdin) = tokio::io::duplex(1 << 20);
         let scratch = super::testing::Scratch::new();
-        let pipes = via_wire::testing::pipes(vendor_out, vendor_in, scratch.path().to_path_buf());
+        let pipes = via_wire::testing::pipes_within(
+            vendor_out,
+            vendor_in,
+            scratch.path().to_path_buf(),
+            super::INBOUND,
+        );
         let test_stdio = Arc::new(super::testing::TestStdio::new(pipes.input, scratch));
         self.scripted
             .lock()

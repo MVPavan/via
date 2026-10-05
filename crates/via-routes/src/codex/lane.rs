@@ -1,7 +1,7 @@
 //! A thread's ingress lane (x.3.2 X0 items 5, 10, 11, 12.5): the messages
 //! the connection task routed to one registered thread, in decode order,
-//! bounded at 16 messages and 1 MiB inside Wire's 1,024-message / 4 MiB
-//! staging. Each routed message is kept raw with its staging permit until
+//! bounded at 16 messages and [`LANE_BYTES`] inside Wire's 1,024-message
+//! / [`INBOUND`] staging. Each routed message is kept raw with its staging permit until
 //! the driver's normalizer consumes and decodes it, so the lanes count
 //! against the staging; a decline's placeholder keeps the request's own
 //! message, so it is charged one message and its bytes too. A full lane is
@@ -16,15 +16,29 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
-use via_wire::{ExitReport, TurnNumber, VendorMessage, WireCleanup};
+use via_wire::{ExitReport, InboundBounds, TurnNumber, VendorMessage, WireCleanup};
 
 use crate::DecodeWatermark;
 
 /// The most messages a lane holds.
 pub const LANE_MESSAGES: usize = 16;
 
-/// The most message bytes a lane holds.
-pub const LANE_BYTES: usize = 1024 * 1024;
+/// The largest Codex stdout message VIA admits, LF included (via-5lr.3.5;
+/// codex-server.md item 9.3). Codex cuts a command's output to about
+/// 1 MiB raw (a 512 KiB head and tail, 0.160.0), and JSON escaping grows a
+/// byte to at most six (`\u001f`), so a command's `item/completed` can
+/// reach about 6 MiB plus the item's other fields: 8 MiB.
+pub const MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+
+/// A Codex connection's inbound bounds: [`MESSAGE_BYTES`], and staging of
+/// runtime §8's 4 MiB for ordinary traffic plus one maximal message.
+pub const INBOUND: InboundBounds = InboundBounds {
+    message_bytes: MESSAGE_BYTES,
+    staging_bytes: 4 * 1024 * 1024 + MESSAGE_BYTES,
+};
+
+/// The most message bytes a lane holds: one maximal message.
+pub const LANE_BYTES: usize = MESSAGE_BYTES;
 
 /// A `Start` marker's charge against [`LANE_BYTES`] (x.3.2 X3 §2.3).
 pub const START_BYTES: usize = 256;

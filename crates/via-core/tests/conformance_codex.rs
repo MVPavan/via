@@ -3105,6 +3105,64 @@ fn codex_exhaustion_fails_the_shared_connection() {
     variant(name, &replay, &expect).unwrap();
 }
 
+/// via-5lr.3.5: Codex truncates a command's output to about 1 MiB raw,
+/// and JSON escaping grows its `item/completed` line past Wire's default
+/// 1 MiB cap (live: 1,213,365 B for `seq 1 800000`). In `c4_two_sessions`
+/// B's first tool completion moves to while A's turn still runs, its
+/// output that long: the line is delivered within the Codex route's
+/// cap, B's turn completes, and A's runs to its interrupt as recorded.
+/// Before the raised cap the line failed the shared connection, and both
+/// turns, `protocol`.
+#[test]
+fn codex_escaped_output_over_one_mib_is_delivered() {
+    let name = "codex_escaped_output_over_one_mib_is_delivered";
+    let mut replay = replay_of("c4_two_sessions").unwrap();
+    let mut expect = expect_of("c4_two_sessions").unwrap();
+    replay["source"] = json!(format!("{name}: a variant of c4_two_sessions"));
+    expect["source"] = replay["source"].clone();
+    let b_tool = "exec-019a0000-0000-7000-8000-000000400006";
+    let started = step_with(&replay, "exec-019a0000-0000-7000-8000-000000400007").unwrap();
+    let completed = (started + 1..steps(&mut replay).unwrap().len())
+        .find(|at| {
+            line_of(&replay, *at).is_ok_and(|line| {
+                line.contains(b_tool) && line.contains(r#""method":"item/completed""#)
+            })
+        })
+        .unwrap();
+    // `seq 1 N` cut to Codex's 512 KiB head and tail, as JSON text:
+    // every LF escapes to two bytes.
+    let (mut half, mut raw) = (String::new(), 0);
+    for n in 1.. {
+        if raw >= 512 * 1024 {
+            break;
+        }
+        let entry = format!(r"{n}\n");
+        raw += entry.len() - 1;
+        half.push_str(&entry);
+    }
+    let output = format!(r"{half}[… truncated …]\n{half}");
+    let mut line = line_of(&replay, completed).unwrap();
+    line = line.replace(
+        r#""aggregatedOutput":null"#,
+        &format!(r#""aggregatedOutput":"{output}""#),
+    );
+    assert!(
+        (1_150_000..8 * 1024 * 1024).contains(&line.len()),
+        "{}",
+        line.len()
+    );
+    let all = steps(&mut replay).unwrap();
+    all.remove(completed);
+    all.insert(started + 1, json!({"emit": {"line": line}}));
+    // No causal predecessor (`after_emit`) names a step the move shifted.
+    for step in steps(&mut replay).unwrap() {
+        if let Some(after) = step["expect"]["after_emit"].as_u64() {
+            assert!(after <= started as u64, "{step}");
+        }
+    }
+    variant(name, &replay, &expect).unwrap();
+}
+
 /// X0 item 8.2 (x.3.2 X3 fix r4 #4): a close cuts the lane off in decode
 /// order. Turn 1's late decline is held at the idle seam as the session
 /// closes; the vendor keeps sending turn 1's denials after the cutoff:

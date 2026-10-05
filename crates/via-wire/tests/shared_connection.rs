@@ -14,10 +14,10 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::Instant;
-use via_wire::testing::{TestInput, TestPipes, pipes};
+use via_wire::testing::{TestInput, TestPipes, pipes, pipes_within};
 use via_wire::{
-    Admitted, Deadline, MAX_STDOUT_MESSAGE_BYTES, OutboundMessage, SendOutcome, WireMessages,
-    WriteBounds, WriteState, WriteTicket,
+    Admitted, Deadline, FailureCause, InboundBounds, MAX_STDOUT_MESSAGE_BYTES, OutboundMessage,
+    SendOutcome, WireFailure, WireMessages, WriteBounds, WriteState, WriteTicket,
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -680,4 +680,72 @@ async fn next_message_dropped_after_its_dequeue_keeps_its_message() -> TestResul
     drop(vendor);
     end(messages, &input).await;
     Ok(())
+}
+
+/// via-5lr.3.5: a connection's own [`InboundBounds`] set its cap and its
+/// staging. With an 8 MiB cap and 12 MiB of staging, two messages of
+/// about 5 MiB (past the default 1 MiB cap and, together, the default
+/// 4 MiB staging) are admitted whole and staged at once; one byte past the
+/// cap fails the connection `MessageTooLarge`, as the default cap does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connection_bounds_set_its_cap_and_staging() -> TestResult {
+    const CAP: usize = 8 * 1024 * 1024;
+    let bounds = InboundBounds {
+        message_bytes: CAP,
+        staging_bytes: 12 * 1024 * 1024,
+    };
+    let folder = Scratch::new("bounds")?;
+    let (stdout, mut vendor) = tokio::io::duplex(64 * 1024);
+    let (stdin, _vendor_stdin) = tokio::io::duplex(1024);
+    let TestPipes {
+        mut messages,
+        input,
+    } = pipes_within(stdout, stdin, folder.0.clone(), bounds);
+    let mut large = vec![b'l'; 5 * 1024 * 1024];
+    large.push(b'\n');
+    let mut at_cap = vec![b'c'; CAP - 1];
+    at_cap.push(b'\n');
+    let writer = {
+        let large = large.clone();
+        tokio::spawn(async move {
+            vendor.write_all(&large).await?;
+            vendor.write_all(&large).await?;
+            Ok::<_, io::Error>(vendor)
+        })
+    };
+    queued(&input, 2 * large.len()).await;
+    assert_eq!(input.failure(), None);
+    let mut vendor = writer.await??;
+    assert_eq!(drained_next(&mut messages).await, large);
+    assert_eq!(drained_next(&mut messages).await, large);
+    let line = at_cap.clone();
+    let writer = tokio::spawn(async move {
+        vendor.write_all(&line).await?;
+        vendor.write_all(&vec![b'h'; CAP + 1]).await?;
+        Ok::<_, io::Error>(vendor)
+    });
+    assert_eq!(drained_next(&mut messages).await, at_cap);
+    let bound = Instant::now() + Duration::from_secs(5);
+    while input.failure().is_none() {
+        assert!(Instant::now() < bound, "no reader failure");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert_eq!(
+        input.failure(),
+        Some(FailureCause::Reader(WireFailure::MessageTooLarge))
+    );
+    drop(writer.await??);
+    end(messages, &input).await;
+    Ok(())
+}
+
+/// The next message, waited for.
+async fn drained_next(messages: &mut WireMessages) -> Vec<u8> {
+    messages
+        .next_message()
+        .await
+        .ok()
+        .flatten()
+        .map(|message| message.bytes().to_vec())
+        .unwrap_or_default()
 }
