@@ -498,6 +498,13 @@ async fn reply_deadline_bounds_a_started_reply() {
 /// with the first sequence its lanes did not get.
 #[tokio::test]
 async fn abnormal_end_reaches_every_lease() {
+    let captured = Captured::default();
+    let sink = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || sink.clone())
+        .with_ansi(false)
+        .finish();
+    let _default = tracing::subscriber::set_default(subscriber);
     let mut vendor = Vendor::open(1 << 16);
     let signalled = Arc::new(Mutex::new(Vec::new()));
     let signal = {
@@ -533,6 +540,15 @@ async fn abnormal_end_reaches_every_lease() {
     let _ = (&mut vendor.task).await;
     vendor.connection.fail(ConnectionFailure::Internal);
     vendor.connection.abnormal();
+    // Review cfix-1 minor: the abnormal end writes its `via.log` line.
+    let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(log.lines().count(), 1, "{log}");
+    assert!(log.contains("WARN"), "{log}");
+    assert!(log.contains("ended abnormally"), "{log}");
+    assert!(
+        log.contains(&format!("server={}", vendor.connection.server())),
+        "{log}"
+    );
     assert!(waiting.reply.await.is_err(), "the waiter sees the end");
     assert_eq!(taken(lane.lane()).len(), 1, "the prefix stays");
     assert!(matches!(

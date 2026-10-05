@@ -931,7 +931,9 @@ Engine on the same State finds `vendor/codex` with the same identity, mode
       failed`, with `server`, `cause` and `undecoded` (Wire's note naming
       the file, why it was not saved, or `none`); never a vendor byte.
       A transport or server lost after the registry's shutdown fence is
-      Host's stop and writes none.
+      Host's stop and writes none. A connection task that panicked writes
+      `shared server connection task ended abnormally` from the
+      supervisor's `abnormal()` end, fence or not.
    3. **Diagnostics only** (no failure): a well-formed message for an
       unknown `threadId` (no registration, no tombstone); well-formed
       connection-scoped or untagged traffic (never given fabricated thread

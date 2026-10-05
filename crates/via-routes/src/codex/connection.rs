@@ -1358,6 +1358,16 @@ impl Connection {
             .send_replace(Some(ConnectionEnd::Failed(abnormal_loss())));
         drop(records);
         self.bump();
+        // The task that would have written the `via.log` line is gone:
+        // this end writes it, even after the shutdown fence (a panic is
+        // never Host's stop).
+        let undecoded = self.stdio.take_undecoded();
+        tracing::warn!(
+            server = %self.server,
+            cause = ?abnormal_loss().cause,
+            undecoded = undecoded.as_deref().unwrap_or("none"),
+            "shared server connection task ended abnormally"
+        );
     }
 }
 
