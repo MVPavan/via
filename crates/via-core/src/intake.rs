@@ -408,6 +408,7 @@ fn refusal_message(refusal: &Refusal) -> &'static str {
             "instructions" => "instructions is unsupported on this route",
             "harness" => "harness is required: several harnesses catalog the model",
             "model" => "model is required",
+            "prompt" => "the prompt is larger than this route's transport accepts",
             _ => "a parameter is not accepted on this route",
         },
     }
@@ -469,7 +470,7 @@ pub(crate) fn plan_spawn(
     adapter: &AdapterSet,
     params: &SpawnParams,
     members: &SessionMembers,
-    cwd: &str,
+    (cwd, prompt_json): (&str, usize),
 ) -> Result<Planned, ApiError> {
     let overrides = params.per_turn().overrides()?;
     let request = DescribeRequest {
@@ -481,7 +482,11 @@ pub(crate) fn plan_spawn(
         vendor: overrides.vendor.given().cloned().unwrap_or_default(),
         cwd: Some(cwd.into()),
         allow_untested: params.allow_untested,
-        sizes: param_sizes(members.instructions.as_deref(), overrides.schema()),
+        sizes: ParamSizes {
+            prompt_json,
+            cwd_json: via_adapters::encoded_text_len(cwd).saturating_add(2),
+            ..param_sizes(members.instructions.as_deref(), overrides.schema())
+        },
     };
     let plan = adapter
         .plan(&request)
@@ -534,7 +539,7 @@ pub(crate) fn plan_spawn(
             &session,
             &effective.turn_params(
                 members.instructions.as_deref(),
-                cwd.len(),
+                (cwd, prompt_json),
                 Some(plan.inherit.requested),
             ),
         )
@@ -784,13 +789,15 @@ impl Effective {
 
     /// The values `check_turn` validates against the frozen route: the
     /// bound as requested; the sizes of the session's frozen
-    /// `instructions` and `cwd` (`cwd`'s length in bytes), of the turn's
-    /// effective schema and of its model; and the session's requested
-    /// `inherit`, which a route's launch reads (critical r1 #1, #2).
+    /// `instructions` and `cwd` (`cwd`'s length in bytes and its JSON
+    /// string encoding's), of the turn's prompt (`prompt_json`, its JSON
+    /// string encoding's length), of its effective schema and of its
+    /// model; and the session's requested `inherit`, which a route's
+    /// launch reads (critical r1 #1, #2; x.3.2 X5).
     pub(crate) fn turn_params(
         &self,
         instructions: Option<&str>,
-        cwd: usize,
+        (cwd, prompt_json): (&str, usize),
         inherit: Option<Inherit>,
     ) -> TurnParams {
         TurnParams {
@@ -801,7 +808,9 @@ impl Effective {
             max_steps: self.max_steps,
             vendor: self.vendor.clone(),
             sizes: ParamSizes {
-                cwd,
+                cwd: cwd.len(),
+                cwd_json: via_adapters::encoded_text_len(cwd).saturating_add(2),
+                prompt_json,
                 model: self.model.len(),
                 ..param_sizes(instructions, self.output_schema.as_ref())
             },
@@ -932,7 +941,7 @@ mod tests {
         let overrides = params.per_turn().overrides().unwrap();
         let planned = EffectiveBound::of(None, None, "r").unwrap();
         let effective = Effective::first("gpt-6-luna".to_owned(), overrides, planned);
-        let turn = effective.turn_params(None, 0, None);
+        let turn = effective.turn_params(None, ("", 0), None);
         assert_eq!(turn.model.as_deref(), Some("gpt-6-luna"));
         assert_eq!(turn.sizes.model, "gpt-6-luna".len());
     }

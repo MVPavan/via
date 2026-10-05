@@ -360,7 +360,15 @@ session, 256 KiB observation payload, 1 MiB envelope, JSON depth 64 and
 65,536 nodes. Final text is sent as C2 `final_text` pieces of at most
 256 KiB encoded; unknown notifications are activity only.
 No silent dropped lifecycle events. Large prompts are encoded using the
-runtime's bounded streaming outbound path, not capped to inbound 1 MiB.
+runtime's bounded streaming outbound path. Codex echoes the prompt whole in
+the user message's `item/started` and `item/completed` notifications, one
+inbound line each (checked in every 0.159.2 fixture: the line carries the
+prompt once, no cwd, and at most 340 other bytes with its LF), and an
+inbound line over 1 MiB fails the shared connection. So the route refuses,
+before any receipt, a prompt whose JSON encoding plus the cwd's exceeds
+1,040,384 bytes (1 MiB less 8 KiB) as `invalid_params` naming `prompt`
+(C1 §4; via-5lr.6, x.3.2 X5). The cwd is counted, as `opencode-serve`
+counts it, for headroom.
 
 One blocked session normalizer must not stop dispatch to other threads or
 the decline/control paths. Partition the existing Route message staging

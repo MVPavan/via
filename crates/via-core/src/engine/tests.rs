@@ -8165,9 +8165,16 @@ fn plain_effective() -> crate::intake::Effective {
 /// and `check_turn` carry the instructions' UTF-8 bytes and the schema's
 /// compact JSON bytes, and `check_turn` the `cwd` and model; a resume
 /// inherits the frozen instructions and the latest schema, a set schema
-/// replaces it, and a null one clears it.
+/// replaces it, and a null one clears it. x.3.2 X5 (via-5lr.6):
+/// `check_turn` also carries the JSON string encodings' lengths of the
+/// cwd and of the turn's prompt, inline or read back from a prompt
+/// file's copy, escapes included.
 #[cfg(feature = "test-failpoints")]
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one session's spawn and every resume form, checked in order"
+)]
 fn core_fills_param_sizes_on_spawn_and_resume() {
     let Some(root) = child("core_fills_param_sizes_on_spawn_and_resume") else {
         return;
@@ -8196,9 +8203,14 @@ fn core_fills_param_sizes_on_spawn_and_resume() {
             ..via_adapters::ParamSizes::default()
         };
         // Critical r1 #1: `check_turn` also carries the session's `cwd`
-        // (the daemon's here) and resolved model ("fake"), in bytes.
+        // (the daemon's here) and resolved model ("fake"), in bytes; both
+        // carry the prompt's and cwd's JSON encodings (x.3.2 X5).
+        let cwd = engine.cwd.to_str().unwrap();
         let sizes = |instructions, output_schema| via_adapters::ParamSizes {
-            cwd: engine.cwd.as_os_str().len(),
+            cwd: cwd.len(),
+            cwd_json: serde_json::to_string(cwd).unwrap().len(),
+            // "p" and "q" encode as 3 bytes.
+            prompt_json: 3,
             model: 4,
             ..planned(instructions, output_schema)
         };
@@ -8217,9 +8229,14 @@ fn core_fills_param_sizes_on_spawn_and_resume() {
             .enqueued
             .unwrap()
             .0;
+        let spawned = via_adapters::ParamSizes {
+            cwd_json: serde_json::to_string(cwd).unwrap().len(),
+            prompt_json: 3,
+            ..planned(11, 17)
+        };
         assert_eq!(
             engine.adapter.param_sizes_seen(),
-            [planned(11, 17), sizes(11, 17)],
+            [spawned, sizes(11, 17)],
             "spawn's plan and check_turn"
         );
         let resume = |extra: Value| {
@@ -8250,6 +8267,36 @@ fn core_fills_param_sizes_on_spawn_and_resume() {
             // version warning carries neither value.
             let seen = engine.adapter.param_sizes_seen();
             assert_eq!(seen.get(before), Some(&expected), "{extra}: {seen:?}");
+        }
+        // "é\n\u{1}\"" encodes as 2 + 2 + 2 + 6 + 2 bytes, inline or as
+        // a prompt file, and a 300 KiB inline prompt (a blob) as its
+        // bytes and quotes.
+        let text = "é\n\u{1}\"";
+        let file = root.join("prompt.txt");
+        fs::write(&file, text).unwrap();
+        let long = "x".repeat(300 * 1024);
+        for (member, value, expected) in [
+            ("prompt", text, 14),
+            ("prompt_file", file.to_str().unwrap(), 14),
+            ("prompt", long.as_str(), long.len() + 2),
+        ] {
+            let mut raw = resume(json!({}));
+            raw.as_object_mut().unwrap().remove("prompt");
+            raw[member] = json!(value);
+            let before = engine.adapter.param_sizes_seen().len();
+            engine
+                .resume(
+                    serde_json::from_value(raw.clone()).unwrap(),
+                    &raw.to_string(),
+                )
+                .await
+                .unwrap();
+            let seen = engine.adapter.param_sizes_seen();
+            let expected = via_adapters::ParamSizes {
+                prompt_json: expected,
+                ..sizes(11, 0)
+            };
+            assert_eq!(seen.get(before), Some(&expected), "{member}: {seen:?}");
         }
     });
 }

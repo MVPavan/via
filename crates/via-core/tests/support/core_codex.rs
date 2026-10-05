@@ -126,6 +126,12 @@ impl CodexCase {
         }
     }
 
+    /// How many times the fake launched (its launch log's lines).
+    pub(crate) fn launches(&self) -> usize {
+        fs::read_to_string(self.dir.join(format!("{}.launches", self.name)))
+            .map_or(0, |log| log.lines().count())
+    }
+
     /// Sends launch `launch`'s fake its gate signal.
     pub(crate) fn signal(&self, launch: u64) {
         let log = fs::read_to_string(self.dir.join(format!("{}.launches", self.name))).unwrap();

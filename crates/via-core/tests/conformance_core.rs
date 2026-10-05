@@ -4308,7 +4308,6 @@ const C1_PROMPT: &str =
 
 /// Turn 1's gate in `c1_commentary_usage` (one-based): the fixture
 /// holds the turn's last three messages behind it.
-#[cfg(feature = "test-failpoints")]
 const C1_GATE: usize = 26;
 
 /// `c1_commentary_usage`'s copy for `codex_bounds_overflow` (steps
@@ -4414,6 +4413,137 @@ fn codex_bounds_overflow_warns_the_affected_turn() {
         assert!(lost[0]["message"].is_string(), "{second}");
         // The first turn's committed envelope is unchanged.
         assert_eq!(daemon.wait(&session, 1).await, first);
+        daemon.close(&session).await;
+        daemon.shutdown().await;
+    });
+}
+
+/// x.3.2 X5 (via-5lr.6): Codex's admission cap on the JSON-encoded prompt
+/// plus the JSON-encoded cwd (C1 §4 `prompt`), so the vendor's
+/// `userMessage` echo always fits Wire's 1 MiB message.
+const CODEX_PROMPT_MAX: usize = 1_040_384;
+
+/// A prompt whose JSON string encoding, quotes included, is `bytes` long,
+/// with an escaped newline, quote and control character in front.
+fn encoded_prompt(bytes: usize) -> String {
+    let head = "x\n\"\u{1}";
+    let mut prompt = head.to_owned();
+    prompt.push_str(&"a".repeat(bytes - serde_json::to_string(head).unwrap().len()));
+    assert_eq!(serde_json::to_string(&prompt).unwrap().len(), bytes);
+    prompt
+}
+
+/// `c1_commentary_usage`'s first turn with prompt `prompt`: its
+/// `turn/start` expects it and its two `userMessage` echoes carry it; the
+/// close's unsubscribe and the stdin close follow the turn's end.
+fn echo_copy(prompt: &str) -> Value {
+    let mut replay = core_codex::replay("c1_commentary_usage");
+    let original = replay["steps"].as_array().unwrap().clone();
+    let mut steps = original[..29].to_vec();
+    steps.extend_from_slice(&original[49..]);
+    assert_eq!(steps[9]["expect"]["line"]["method"], "turn/start");
+    steps[9]["expect"]["line"]["params"]["input"][0]["text"] = json!(prompt);
+    for at in [14, 15] {
+        let mut line: Value =
+            serde_json::from_str(steps[at]["emit"]["line"].as_str().unwrap()).unwrap();
+        assert_eq!(line["params"]["item"]["type"], "userMessage", "{line}");
+        line["params"]["item"]["content"][0]["text"] = json!(prompt);
+        steps[at]["emit"]["line"] = json!(line.to_string());
+    }
+    assert_eq!(
+        steps[29]["expect"]["line"]["method"], "thread/unsubscribe",
+        "{}",
+        steps[29]
+    );
+    replay["steps"] = Value::Array(steps);
+    replay
+}
+
+/// Spawn members for a Codex case on `case`'s cwd with `prompt` given as
+/// `member` (`prompt` or `prompt_file`).
+fn codex_raw(case: &core_codex::CodexCase, member: &str, prompt: &str) -> Value {
+    let mut raw = codex_spawn(case, 60_000);
+    raw["prompt"] = Value::Null;
+    raw.as_object_mut().unwrap().remove("prompt");
+    raw[member] = json!(prompt);
+    raw["handle"] = json!(HANDLE);
+    raw
+}
+
+/// The Store's session rows.
+fn session_rows(root: &Path) -> i64 {
+    let store = rusqlite::Connection::open_with_flags(
+        root.join("state").join("store.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    store
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .unwrap()
+}
+
+/// via-5lr.6 (x.3.2 X5): C1 admits a 16 MiB prompt, but Codex echoes it in
+/// one `item/started` line, and a line over Wire's 1 MiB fails the shared
+/// connection, every session on it. `codex-app-server` refuses a prompt
+/// whose JSON encoding plus the cwd's exceeds [`CODEX_PROMPT_MAX`]:
+/// inline or as a `prompt_file`, one byte over is `invalid_params` naming
+/// `prompt`, before any receipt or vendor I/O. A prompt that just fits is
+/// admitted and completes, its two echoes read whole.
+#[test]
+fn codex_prompt_echo_cap() {
+    const NAME: &str = "codex_prompt_echo_cap";
+    let Some(root) = child(NAME, &no_fake(), &[]) else {
+        return;
+    };
+    // The cap counts the case's cwd, a fixed-length temporary name: a
+    // probe case gives its encoded length before the replay is written.
+    fs::create_dir_all(root.join("probe").join("state")).unwrap();
+    let probe = codex_case(
+        &root.join("probe"),
+        NAME,
+        core_codex::replay("c1_commentary_usage"),
+    );
+    let cwd = serde_json::to_string(probe.cwd()).unwrap().len();
+    drop(probe);
+    let fitting = encoded_prompt(CODEX_PROMPT_MAX - cwd);
+    let over = encoded_prompt(CODEX_PROMPT_MAX - cwd + 1);
+    let file = root.join("over.prompt");
+    fs::write(&file, &over).unwrap();
+    let case = codex_case(&root, NAME, echo_copy(&fitting));
+    assert_eq!(serde_json::to_string(case.cwd()).unwrap().len(), cwd);
+    run(async {
+        let daemon = Daemon::open_with(&root, case.config());
+        for (member, prompt) in [
+            ("prompt", over.as_str()),
+            ("prompt_file", file.to_str().unwrap()),
+        ] {
+            let raw = codex_raw(&case, member, prompt);
+            let params: SpawnParams = serde_json::from_value(raw.clone()).unwrap();
+            let refused = daemon.engine.spawn(params, &raw.to_string()).await;
+            let error = refused
+                .err()
+                .unwrap_or_else(|| panic!("{member}: admitted"));
+            let data = error.data();
+            assert_eq!(data["kind"], "invalid_params", "{member}: {data}");
+            assert_eq!(data["field"], "prompt", "{member}: {data}");
+            assert_eq!(data["route"], "codex-app-server", "{member}: {data}");
+        }
+        assert_eq!(case.launches(), 0, "a refused prompt reached no vendor");
+        assert_eq!(session_rows(&root), 0, "a refused prompt has no receipt");
+        let raw = codex_raw(&case, "prompt", &fitting);
+        let params: SpawnParams = serde_json::from_value(raw.clone()).unwrap();
+        let session = daemon
+            .engine
+            .spawn(params, &raw.to_string())
+            .await
+            .unwrap()
+            .enqueued
+            .unwrap()
+            .0;
+        let launch = case.at(C1_GATE).await;
+        case.signal(launch);
+        let envelope = daemon.wait(&session, 1).await;
+        assert_eq!(envelope["state"], "completed", "{envelope}");
         daemon.close(&session).await;
         daemon.shutdown().await;
     });

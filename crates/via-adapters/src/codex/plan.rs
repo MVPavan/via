@@ -25,6 +25,17 @@ const EFFORTS: &[(&str, &str)] = &[
     ("max", "max"),
 ];
 
+/// Most bytes of a turn's JSON-encoded prompt plus its JSON-encoded cwd
+/// (C1 §4 `prompt`; via-5lr.6, x.3.2 X5). Codex echoes the prompt whole
+/// in the user message's `item/started` and `item/completed`
+/// notifications, one line each, and an inbound line over Wire's 1 MiB
+/// (1,048,576 bytes with its LF) fails the shared connection. The
+/// recorded echo lines carry the prompt once, never the cwd, and at most
+/// 340 other bytes, LF included (every 0.159.2 fixture); 1 MiB less 8 KiB
+/// leaves over 7.5 KiB for fields a later version adds. The cwd is
+/// counted too, as `opencode-serve` counts it, for headroom.
+pub(crate) const PROMPT_ECHO_MAX: usize = 1_040_384;
+
 /// Whether `via-5lr.3.4` has qualified enforcement of the limited bounds.
 /// Until it has, `read_only` and `workspace_write` are protocol-mapped but
 /// refused (vendors/codex.md §3 Bound mapping and gate).

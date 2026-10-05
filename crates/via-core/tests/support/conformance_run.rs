@@ -1765,6 +1765,8 @@ fn resume_refusal(set: &AdapterSet, session: &Session, spec: &TurnSpec) -> Optio
                 .map_or(0, |schema| schema.get().len()),
             cwd,
             model: session.plan.model.resolved.len(),
+            prompt_json: serde_json::to_string(&spec.prompt).map_or(0, |text| text.len()),
+            ..ParamSizes::default()
         },
         inherit: Some(session.plan.inherit.requested),
         model: Some(session.plan.model.resolved.clone()),
