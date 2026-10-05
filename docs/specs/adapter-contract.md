@@ -839,7 +839,9 @@ category (hooks, MCP servers, plugins, skills, agents, instruction files):
 - what inventory of the inherited set it can record.
 
 Settings come from `AdapterConfig` (`daemon.json`
-`harnesses.<name>.inherit.*`; default hooks and MCP servers off, the rest on)
+`harnesses.<name>.inherit.*`; default hooks and MCP servers off, the rest on,
+except Codex's every category on, what it delivers with no switch; owner
+2026-10-05)
 and are frozen per session at spawn. For each category the route records the
 **effective state**: `on` or `off` only when verified (a verified switch, the
 private profile, or an inventory that lists or omits the category), else

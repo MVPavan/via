@@ -174,10 +174,7 @@ fn codex_memories_true_keeps_the_vendor_default() {
             Path::new("/state/vendor/codex"),
         )
     };
-    assert_eq!(
-        recipe(true).args,
-        ["app-server", "--disable", "hooks", "--disable", "apps"]
-    );
+    assert_eq!(recipe(true).args, ["app-server", "--disable", "hooks"]);
     assert!(
         recipe(false)
             .args
@@ -190,38 +187,78 @@ fn codex_memories_true_keeps_the_vendor_default() {
     );
 }
 
-/// via-4gl: with MCP servers off, the server disables the `apps` feature,
-/// which is what starts Codex's built-in `codex_apps` MCP server for every
-/// thread (checked live on 0.160.0); with them on it does not. The user's
-/// configured servers have no such switch, so the category stays
-/// `unknown` and warns.
+/// Owner 2026-10-05: for the first release Codex disables nothing but
+/// memories, so no request adds `--disable apps`: the user's MCP servers
+/// and Codex's built-in apps server load as configured.
 #[test]
-fn mcp_off_disables_the_apps_server() {
-    let disables_apps = |mcp_servers| {
-        ServerRecipe::new(
+fn no_request_disables_the_apps_server() {
+    use InheritState::{Off, On};
+    for (hooks, mcp_servers) in [(On, On), (On, Off), (Off, On), (Off, Off)] {
+        let recipe = ServerRecipe::new(
             Path::new("/bin/codex"),
-            (
-                inherit(InheritState::On, mcp_servers),
-                CodexSettings::default(),
-            ),
+            (inherit(hooks, mcp_servers), CodexSettings::default()),
             &env(),
             Path::new("/state/vendor/codex"),
-        )
-        .args
-        .windows(2)
-        .any(|pair| pair == ["--disable", "apps"])
+        );
+        assert!(
+            !recipe.args.iter().any(|arg| arg == "apps"),
+            "{hooks:?} {mcp_servers:?}: {:?}",
+            recipe.args
+        );
+    }
+}
+
+/// Owner 2026-10-05: Codex's default request is what it delivers when VIA
+/// disables nothing: hooks and MCP servers on (both seen loading with no
+/// switch), so neither warns; the other categories stay `unknown` (no
+/// verified default) and warn as before. MCP servers off has no switch:
+/// they load, so the request warns with `on`. Hooks off keeps its
+/// verified `--disable hooks`.
+#[test]
+fn codex_categories_report_what_codex_delivers() {
+    use crate::plan::Category;
+    use InheritState::{Off, On, Unknown};
+    let harness = crate::Harness::Vendor(
+        crate::harness::HARNESSES
+            .iter()
+            .find(|row| row.name == super::HARNESS)
+            .unwrap(),
+    );
+    let default = crate::config::AdapterConfig::load(BootstrapEnv::default(), None)
+        .unwrap()
+        .inherit(harness);
+    for category in Category::ALL {
+        assert_eq!(default.get(category), On, "{category:?}");
+    }
+    let warned = |requested| {
+        let (plan, warning) = crate::plan::effective_inherit(&super::plan::categories(), requested);
+        let listed: Vec<String> = warning
+            .and_then(|warning| warning.data)
+            .and_then(|data| data["categories"].as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .map(|entry| entry["category"].as_str().unwrap_or_default().to_owned())
+            .collect();
+        (plan.effective, listed)
     };
-    assert!(disables_apps(InheritState::Off));
-    assert!(!disables_apps(InheritState::On));
-    let (effective, warning) = crate::plan::effective_inherit(
-        &super::plan::categories(),
-        inherit(InheritState::Off, InheritState::Off),
-    );
+    let (effective, listed) = warned(default);
+    assert_eq!(effective.get(Category::Hooks), On);
+    assert_eq!(effective.get(Category::McpServers), On);
+    assert_eq!(effective.get(Category::Plugins), Unknown);
+    assert_eq!(listed, ["plugins", "skills", "agents", "instruction_files"]);
+    let (effective, listed) = warned(inherit(Off, Off));
+    assert_eq!(effective.get(Category::Hooks), Off);
+    assert_eq!(effective.get(Category::McpServers), On);
     assert_eq!(
-        effective.effective.get(crate::plan::Category::McpServers),
-        InheritState::Unknown
+        listed,
+        [
+            "mcp_servers",
+            "plugins",
+            "skills",
+            "agents",
+            "instruction_files"
+        ]
     );
-    assert!(warning.is_some());
 }
 
 /// Packet §4, Q6: the server's argv disables hooks when they are off, its
@@ -239,15 +276,7 @@ fn the_server_recipe_is_the_allow_list() {
     assert_eq!(recipe.program, Path::new("/bin/codex"));
     assert_eq!(
         recipe.args,
-        [
-            "app-server",
-            "--disable",
-            "memories",
-            "--disable",
-            "hooks",
-            "--disable",
-            "apps"
-        ]
+        ["app-server", "--disable", "memories", "--disable", "hooks"]
     );
     assert_eq!(recipe.cwd, home);
     assert_eq!(
@@ -268,10 +297,7 @@ fn the_server_recipe_is_the_allow_list() {
         &BootstrapEnv::from_vars([("PATH", "/usr/bin")]),
         home,
     );
-    assert_eq!(
-        on.args,
-        ["app-server", "--disable", "memories", "--disable", "apps"]
-    );
+    assert_eq!(on.args, ["app-server", "--disable", "memories"]);
     assert_eq!(
         on.env,
         os(&[

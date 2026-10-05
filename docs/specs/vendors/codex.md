@@ -285,20 +285,25 @@ feature in `codex features list` was seen starting an agent or thread on
 its own in the live runs.
 
 Inherited configuration (C2 §6.2; owner OD2), from the 2026-09-30 re-probe.
-With hooks off, launch with `--disable hooks` (verified). With MCP servers
-off, launch with `--disable apps` (via-4gl, checked 2026-10-05 on 0.160.0):
-the `apps` feature starts Codex's built-in `codex_apps` MCP server for every
-thread, and the flag stops it. The user's configured servers (`[mcp_servers.*]`
-in `~/.codex/config.toml`, project layers and plugins) have no argv switch:
-`-c mcp_servers={}` merges into the user's table and removes nothing, and
-`-c mcp_servers.<name>.enabled=false` works but needs each name, which only
-the user's configuration holds. So MCP stays `unknown` and warns. Every
-switch enters `config_hash`.
+For the first release VIA disables nothing in Codex but memories (owner,
+2026-10-05: "use whatever existing harness and don't disable anything"), so
+Codex's default request is every category on, what Codex delivers with no
+switch (runtime §8). With hooks requested off, launch with `--disable hooks`
+(verified). MCP servers have no switch VIA applies: the user's configured
+servers (`[mcp_servers.*]` in `~/.codex/config.toml`, project layers and
+plugins) and Codex's built-in `codex_apps` server (the `apps` feature, every
+thread) load as configured (checked 2026-10-05 on 0.160.0). A request for
+MCP servers off is not applied: its effective state is `on` and it warns.
+(`--disable apps` stops only `codex_apps`, and `-c mcp_servers={}` merges
+into the user's table and removes nothing, so neither turns MCP off; the
+earlier `--disable apps` for MCP off, via-4gl, was removed.) Revisit: a
+later version may add disabling layers (owner, 2026-10-05). Every switch
+enters `config_hash`.
 
 | Category (default) | Switch and evidence | Effective state with the default |
 |---|---|---|
-| hooks (off) | `--disable hooks`: **verified** (the owner's hooks ran without it) | `off` |
-| MCP servers (off) | `--disable apps` stops the built-in `codex_apps` server (**checked**); user-configured servers still start (`mcpServer/startupStatus/updated`); inventory via `mcpServerStatus/list` (schema, **unverified**) | `unknown`, warns |
+| hooks (on) | none needed: the owner's hooks ran with no switch (**verified**); off: `--disable hooks` (**verified**) | `on` |
+| MCP servers (on) | none needed: user-configured servers and `codex_apps` start with no switch (`mcpServer/startupStatus/updated`, **checked**); off: no switch, so `on` and warns; inventory via `mcpServerStatus/list` (schema, **unverified**) | `on` |
 | plugins (on) | plugin support exists (schema); switch **unverified** | `unknown`, no switch applied, warns |
 | skills (on) | **unverified** | `unknown`, no switch applied, warns |
 | agents (on) | **unverified** | `unknown`, no switch applied, warns |
@@ -308,9 +313,9 @@ Inventory sources are `configWarning` and the `thread/start` response's
 `instructionSources`, which reported the loaded AGENTS.md paths in the
 0.159.2 re-probe (completeness unverified). The fixtures qualified no other
 inventory; `mcpServerStatus/list` stays schema-only. Switching off the
-user's configured MCP servers needs an owner decision (via-4gl): read only
-the server names from the configuration layers, or declare the category
-not switchable.
+user's configured MCP servers is deferred past the first release (owner,
+2026-10-05); it would need each server's name from the configuration
+layers (`-c mcp_servers.<name>.enabled=false`).
 
 ## 5. Correlation, events and bounds
 

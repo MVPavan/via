@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use via_routes::codex::{SandboxMode, SandboxPolicy};
 
 use crate::capabilities::{BoundMode, Capabilities, ParamSupport, Support, UsageSupport, Verbs};
-use crate::plan::{Bound, Category, CategoryDecl, Switch, VendorOptions};
+use crate::plan::{Bound, Category, CategoryDecl, InheritState, Switch, VendorOptions};
 
 /// The versions maintainers' live check passed (C2 §5 version rule): the
 /// re-probes of 2026-09-30 (`via-5lr.3.1`).
@@ -110,23 +110,24 @@ pub(crate) fn capabilities() -> Capabilities {
     }
 }
 
-/// The inherited-configuration declarations (packet §4, 2026-09-30
-/// re-probe): only `--disable hooks` is a verified switch. MCP servers off
-/// applies `--disable apps`, which stops only Codex's built-in server, so
-/// it is unverified (via-4gl). Every other category has no switch VIA
-/// applies and no verified vendor default. All but hooks are effectively
-/// `unknown` and warn.
+/// The inherited-configuration declarations (packet §4): only `--disable
+/// hooks` is a switch VIA applies (verified). With no switch, hooks and
+/// MCP servers load (the owner's hooks ran, 2026-09-30; the user's servers
+/// and the built-in `codex_apps` started, 2026-10-05), so they are `on`.
+/// For the first release VIA disables nothing else (owner 2026-10-05): MCP
+/// servers off has no switch, so it stays `on` and warns. Every other
+/// category has no switch and no verified vendor default: `unknown`, warns.
 pub(crate) fn categories() -> BTreeMap<Category, CategoryDecl> {
     let unswitched = CategoryDecl::default();
     let hooks = CategoryDecl {
         on: Switch::None,
         off: Switch::Verified,
-        observed: None,
+        observed: Some(InheritState::On),
     };
     let mcp_servers = CategoryDecl {
         on: Switch::None,
-        off: Switch::Unverified,
-        observed: None,
+        off: Switch::None,
+        observed: Some(InheritState::On),
     };
     Category::ALL
         .into_iter()

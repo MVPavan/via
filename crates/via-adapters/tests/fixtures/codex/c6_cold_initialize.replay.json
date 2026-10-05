@@ -4,11 +4,7 @@
   "argv": [
     "app-server",
     "--disable",
-    "memories",
-    "--disable",
-    "hooks",
-    "--disable",
-    "apps"
+    "memories"
   ],
   "version": "codex-cli 0.159.2",
   "deadline_ms": 60000,

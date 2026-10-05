@@ -240,7 +240,8 @@ fn s_launch_harnesses_refusals() {
 }
 
 /// A valid section: the configured binary and per-key `inherit`, with the
-/// OD2 default for every missing key and harness; the fake keeps OD2.
+/// harness's default for every missing key and harness (OD2's, except
+/// Codex's every category on, owner 2026-10-05); the fake keeps OD2.
 #[test]
 fn s_launch_harnesses_valid() {
     use InheritState::{Off, On};
@@ -265,8 +266,17 @@ fn s_launch_harnesses_valid() {
     for (category, state) in expected {
         assert_eq!(inherit.get(category), state, "{category:?}");
     }
+    let default = |name| {
+        if name == "codex" {
+            serde_json::from_value(serde_json::json!({"hooks": "on", "mcp_servers": "on",
+                "plugins": "on", "skills": "on", "agents": "on", "instruction_files": "on"}))
+            .unwrap()
+        } else {
+            Inherit::OD2_DEFAULT
+        }
+    };
     for name in ["codex", "opencode"] {
-        assert_eq!(config.inherit(row(name)), Inherit::OD2_DEFAULT, "{name}");
+        assert_eq!(config.inherit(row(name)), default(name), "{name}");
         let settings = config.harness(HARNESSES.iter().find(|r| r.name == name).unwrap());
         assert_eq!(settings.binary(), None, "{name}");
     }
@@ -275,7 +285,7 @@ fn s_launch_harnesses_valid() {
     let config = AdapterConfig::load(none(), None).unwrap();
     for row in HARNESSES {
         assert_eq!(config.harness(row).binary(), None);
-        assert_eq!(config.inherit(Harness::Vendor(row)), Inherit::OD2_DEFAULT);
+        assert_eq!(config.inherit(Harness::Vendor(row)), default(row.name));
     }
 }
 

@@ -845,8 +845,8 @@ has no failed outcome to count.
   3. the resolved program path bytes;
   4. argv after the program (`app-server`, `--disable memories` unless
      `daemon.json` sets `codex.memories` true (via-7r9; owner 2026-10-05),
-     `--disable hooks` when hooks are off, `--disable apps` when
-     MCP servers are off (via-4gl), later switches);
+     `--disable hooks` when hooks are requested off, later switches; no
+     other feature is disabled for the first release, owner 2026-10-05);
   5. the passed environment, sorted `(name, value)` pairs: the allow-list
      values and `CODEX_SQLITE_HOME`; Host's random `VIA_PROCESS_MARKER`
      excluded;

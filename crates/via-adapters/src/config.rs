@@ -202,6 +202,28 @@ static DEFAULT_HARNESS: HarnessConfig = HarnessConfig {
     inherit: Inherit::OD2_DEFAULT,
 };
 
+/// The settings of harness `name` with none configured: a `PATH` lookup
+/// and its default request, [`default_inherit`].
+fn default_harness(name: &str) -> HarnessConfig {
+    HarnessConfig {
+        inherit: default_inherit(name),
+        ..DEFAULT_HARNESS.clone()
+    }
+}
+
+/// Harness `name`'s default inherited-configuration request: OD2's (hooks
+/// and MCP servers off, the rest on), except Codex's, every category on:
+/// what Codex delivers when VIA disables nothing but memories (owner,
+/// 2026-10-05; vendor packet §4).
+fn default_inherit(name: &str) -> Inherit {
+    let mut inherit = Inherit::OD2_DEFAULT;
+    if name == crate::codex::HARNESS {
+        inherit.set(Category::Hooks, InheritState::On);
+        inherit.set(Category::McpServers, InheritState::On);
+    }
+    inherit
+}
+
 impl HarnessConfig {
     /// The configured binary; `None` means a `PATH` lookup.
     pub fn binary(&self) -> Option<&Path> {
@@ -227,7 +249,10 @@ pub struct HarnessSettings {
 impl Default for HarnessSettings {
     fn default() -> Self {
         Self {
-            harnesses: vec![DEFAULT_HARNESS.clone(); HARNESSES.len()],
+            harnesses: HARNESSES
+                .iter()
+                .map(|row| default_harness(row.name))
+                .collect(),
             codex: CodexSettings::default(),
         }
     }
@@ -371,10 +396,11 @@ impl AdapterConfig {
 
 /// Parses `harnesses` (runtime §8, design §5.4): keys are [`HARNESSES`]
 /// names; per harness only `binary` (an absolute path without `..`, never
-/// expanded) and `inherit` (the six category booleans, the OD2 default for
-/// each missing one). No key may repeat within its object. Pure: no I/O.
+/// expanded) and `inherit` (the six category booleans, the harness's
+/// [`default_inherit`] for each missing one). No key may repeat within its
+/// object. Pure: no I/O.
 fn parse_harnesses(raw: &RawValue) -> Result<Vec<HarnessConfig>, HarnessesError> {
-    let mut harnesses = vec![DEFAULT_HARNESS.clone(); HARNESSES.len()];
+    let mut harnesses = HarnessSettings::default().harnesses;
     for (name, entry) in members(raw, "harnesses")? {
         let key = format!("harnesses.{name}");
         let Some(index) = HARNESSES.iter().position(|row| row.name == name) else {
@@ -385,7 +411,7 @@ fn parse_harnesses(raw: &RawValue) -> Result<Vec<HarnessConfig>, HarnessesError>
             let key = format!("{key}.{member}");
             match member.as_str() {
                 "binary" => config.binary = Some(binary(&value, &key)?),
-                "inherit" => config.inherit = parse_inherit(&value, &key)?,
+                "inherit" => config.inherit = parse_inherit(&value, &key, default_inherit(&name))?,
                 _ => return Err(invalid(&key, HarnessesRule::UnknownKey)),
             }
         }
@@ -500,8 +526,8 @@ fn binary(value: &RawValue, key: &str) -> Result<PathBuf, HarnessesError> {
     }
 }
 
-fn parse_inherit(value: &RawValue, key: &str) -> Result<Inherit, HarnessesError> {
-    let mut states = Inherit::OD2_DEFAULT;
+fn parse_inherit(value: &RawValue, key: &str, default: Inherit) -> Result<Inherit, HarnessesError> {
+    let mut states = default;
     for (name, value) in members(value, key)? {
         let key = format!("{key}.{name}");
         let Ok(category) = serde_json::from_value::<Category>(Value::String(name)) else {
