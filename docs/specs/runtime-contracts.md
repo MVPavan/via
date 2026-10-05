@@ -448,7 +448,9 @@ bytes were dropped, one marker line `[via: <n> bytes of vendor stderr
 dropped]`, on its own line, precedes the tail; the tail is written when the
 vendor group ends (the pipe's EOF, or in the last 20 ms of the cleanup
 grace before the anchor's own group KILL, discarding stderr written after
-that), and when the anchor returns early on an error. A tail write still
+that; the anchor still reads its control then, so a later `Stop`'s shorter
+deadline still brings the KILL forward), and when the anchor returns early
+on an error. A tail write still
 blocked at the KILL, or a finish that cannot take the log's lock by then,
 loses the tail: the KILL never waits for either. An anchor killed from outside
 loses the tail, and the vendor's later stderr writes then fail (`EPIPE` or

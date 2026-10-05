@@ -199,16 +199,25 @@ impl StderrLog {
         self.wake.notify_all();
     }
 
-    /// Ends the log, then waits until the writer wrote the rest, returning
-    /// by `deadline` whatever holds the lock or the file. A log not ended
-    /// by then loses its tail.
-    pub(crate) fn finish_by(&self, deadline: Instant) {
+    /// Ends the log unless its lock is still held at `deadline`; whether
+    /// it ended. Never waits on the file.
+    pub(crate) fn try_finish(&self, deadline: Instant) -> bool {
         let Some(mut state) = self.lock_by(deadline) else {
-            return;
+            return false;
         };
         state.finish();
         drop(state);
         self.wake.notify_all();
+        true
+    }
+
+    /// Ends the log, then waits until the writer wrote the rest, returning
+    /// by `deadline` whatever holds the lock or the file. A log not ended
+    /// by then loses its tail.
+    pub(crate) fn finish_by(&self, deadline: Instant) {
+        if !self.try_finish(deadline) {
+            return;
+        }
         while !self.written.load(Ordering::Acquire) {
             let Some(left) = deadline.checked_duration_since(Instant::now()) else {
                 return;

@@ -373,41 +373,62 @@ fn controller_eof_triggers_autonomous_group_cleanup_and_recovery_proof() {
     );
 }
 
+/// An anchor started from a raw bootstrap, configured with `/bin/cat` and
+/// armed: the anchor process, its verified control and its generation.
+async fn armed_anchor(
+    fixture: &Fixture,
+) -> (tokio::process::Child, tokio::net::UnixStream, String) {
+    use std::os::unix::ffi::OsStrExt;
+    let anchor_id = format!("{}{}", random_hex(), random_hex());
+    let generation = format!("{}{}", random_hex(), random_hex());
+    let marker = format!("{}{}", random_hex(), random_hex());
+    let socket = fixture
+        .root
+        .join("anchors")
+        .join(format!("{anchor_id}.sock"));
+    let config = fixture
+        .root
+        .join("anchors")
+        .join(format!("{anchor_id}.json"));
+    let bootstrap = serde_json::json!({"anchor_id":anchor_id,"generation":generation,
+        "marker":marker,"controller_pid":std::process::id(),"socket_path":socket,
+        "stderr_cap":{"head":4_194_304,"tail":1_048_576}});
+    fs::write(&config, serde_json::to_vec(&bootstrap).unwrap()).unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut command = tokio::process::Command::new(&fixture.binary);
+    command
+        .arg("__via_host_anchor")
+        .arg(&config)
+        .process_group(0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let anchor = command.spawn().unwrap();
+    let mut control = loop {
+        match tokio::net::UnixStream::connect(&socket).await {
+            Ok(stream) => break stream,
+            Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+        }
+    };
+    assert_eq!(read_control_reply(&mut control).await["kind"], "ready");
+    write_control_request(&mut control, &serde_json::json!({"kind":"configure","vendor":{
+        "program":b"/bin/cat".to_vec(),"args":[],"cwd":fixture.root.as_os_str().as_bytes().to_vec(),"env":[]
+    }})).await;
+    assert_eq!(read_control_reply(&mut control).await["kind"], "configured");
+    write_control_request(
+        &mut control,
+        &serde_json::json!({"kind":"arm","generation":generation}),
+    )
+    .await;
+    assert_eq!(read_control_reply(&mut control).await["kind"], "spawned");
+    (anchor, control, generation)
+}
+
 #[test]
 fn fragmented_status_and_stop_survive_anchor_poll_ticks() {
-    use std::os::unix::ffi::OsStrExt;
     runtime().block_on(async {
         let fixture = Fixture::new().await;
-        let anchor_id = format!("{}{}", random_hex(), random_hex());
-        let generation = format!("{}{}", random_hex(), random_hex());
-        let marker = format!("{}{}", random_hex(), random_hex());
-        let socket = fixture.root.join("anchors").join(format!("{anchor_id}.sock"));
-        let config = fixture.root.join("anchors").join(format!("{anchor_id}.json"));
-        let bootstrap = serde_json::json!({"anchor_id":anchor_id,"generation":generation,
-            "marker":marker,"controller_pid":std::process::id(),"socket_path":socket,
-            "stderr_cap":{"head":4_194_304,"tail":1_048_576}});
-        fs::write(&config, serde_json::to_vec(&bootstrap).unwrap()).unwrap();
-        fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
-        let mut command = tokio::process::Command::new(&fixture.binary);
-        command.arg("__via_host_anchor").arg(&config).process_group(0)
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut anchor = command.spawn().unwrap();
-        let _vendor_stdin = anchor.stdin.take().unwrap();
-        let _vendor_stdout = anchor.stdout.take().unwrap();
-        let _vendor_stderr = anchor.stderr.take().unwrap();
-        let mut control = loop {
-            match tokio::net::UnixStream::connect(&socket).await {
-                Ok(stream) => break stream,
-                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
-            }
-        };
-        assert_eq!(read_control_reply(&mut control).await["kind"], "ready");
-        write_control_request(&mut control, &serde_json::json!({"kind":"configure","vendor":{
-            "program":b"/bin/cat".to_vec(),"args":[],"cwd":fixture.root.as_os_str().as_bytes().to_vec(),"env":[]
-        }})).await;
-        assert_eq!(read_control_reply(&mut control).await["kind"], "configured");
-        write_control_request(&mut control, &serde_json::json!({"kind":"arm","generation":generation})).await;
-        assert_eq!(read_control_reply(&mut control).await["kind"], "spawned");
+        let (mut anchor, mut control, generation) = armed_anchor(&fixture).await;
         write_fragmented_request(&mut control, &serde_json::json!({"kind":"status","generation":generation})).await;
         let status = tokio::time::timeout(Duration::from_secs(1), read_control_reply(&mut control)).await.unwrap();
         assert_eq!(status["kind"], "status");
@@ -415,6 +436,45 @@ fn fragmented_status_and_stop_survive_anchor_poll_ticks() {
         let stopping = tokio::time::timeout(Duration::from_secs(1), read_control_reply(&mut control)).await.unwrap();
         assert_eq!(stopping["kind"], "stopping");
         tokio::time::timeout(Duration::from_secs(2), anchor.wait()).await.unwrap().unwrap();
+    });
+}
+
+/// Host batch B critical review, finding 1: a Stop that arrives in the
+/// cleanup grace's last 20 ms, while the stderr tail is written, is still
+/// read and answered, so its shorter deadline brings the KILL forward.
+/// The first Stop schedules the KILL 200 ms on; the second, at 188 ms, has
+/// a deadline already past.
+#[test]
+fn a_stop_during_the_tail_flush_is_still_read() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let (mut anchor, mut control, generation) = armed_anchor(&fixture).await;
+        let first = tokio::time::Instant::now();
+        write_control_request(&mut control, &serde_json::json!({"kind":"stop","generation":generation,"deadline_monotonic_ns":u64::MAX})).await;
+        let stopping = tokio::time::timeout(Duration::from_secs(1), read_control_reply(&mut control)).await.unwrap();
+        assert_eq!(stopping["kind"], "stopping");
+        tokio::time::sleep_until(first + Duration::from_millis(188)).await;
+        write_control_request(&mut control, &serde_json::json!({"kind":"stop","generation":generation,"deadline_monotonic_ns":0})).await;
+        let mut reply = Vec::new();
+        let answered = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match control.read_u8().await {
+                    Ok(b'\n') => return true,
+                    Ok(byte) => reply.push(byte),
+                    Err(_) => return false,
+                }
+            }
+        })
+        .await;
+        tokio::time::timeout(Duration::from_secs(2), anchor.wait()).await.unwrap().unwrap();
+        assert_eq!(
+            answered,
+            Ok(true),
+            "the Stop sent during the tail flush was never read: {}",
+            String::from_utf8_lossy(&reply)
+        );
+        let reply: serde_json::Value = serde_json::from_slice(&reply).unwrap();
+        assert_eq!(reply["kind"], "stopping");
     });
 }
 

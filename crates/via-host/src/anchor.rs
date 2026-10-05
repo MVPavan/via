@@ -185,6 +185,8 @@ async fn armed(
     // A Host `Stop` began the cleanup, not an EOF or `SIGTERM`: only then is
     // `stopped_live` Host force evidence, repeated on every later `Stop`.
     let mut stopped_by_host = false;
+    // The stderr log was finished: its tail is being written before the KILL.
+    let mut flushing = false;
     loop {
         tokio::select! {
             incoming = async {
@@ -253,15 +255,15 @@ async fn armed(
                     verified_connection = false;
                 }
             }
-            () = async {
-                match kill_at {
-                    Some(deadline) => tokio::time::sleep_until(tail_flush_at(deadline)).await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                if let Some(deadline) = kill_at {
-                    kill_own_group(deadline, Some(&*stderr)).await;
-                }
+            () = until(kill_at.filter(|_| !flushing).map(tail_flush_at)) => {
+                // The tail's write begins (bead via-c2r). Control is still
+                // read meanwhile, so a later `Stop` can bring the KILL
+                // forward; a lock held past 1 ms is retried on the next turn.
+                flushing = stderr.try_finish(std::time::Instant::now() + Duration::from_millis(1));
+            }
+            () = until(kill_at) => {
+                // The vendor group ends here, this anchor with it.
+                let _ = process::kill_process_group(process::getpgrp(), Signal::KILL);
                 return Ok(());
             }
             _ = poll.tick(), if exit.is_none() => {
@@ -291,6 +293,14 @@ impl Drop for FinishOnDrop<'_> {
 /// vendor's stderr tail is written (bead via-c2r). Stderr written after it
 /// begins is discarded; the KILL is never later than its deadline.
 const TAIL_FLUSH: Duration = Duration::from_millis(20);
+
+/// Completes at `at`, or never when there is none.
+async fn until(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
 
 /// When the stderr tail's write begins, for a group KILL at `kill_at`.
 fn tail_flush_at(kill_at: Instant) -> Instant {
