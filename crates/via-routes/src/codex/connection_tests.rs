@@ -732,20 +732,21 @@ async fn a_failed_connection_logs_its_server_and_evidence_path() {
     );
 }
 
-/// Owner 2026-10-05: a line over the cap whose tail closes with its
-/// `threadId` and `turnId` is dropped for that thread: its lane ends
-/// `Overflow`, the connection goes on, another registered thread's lane
-/// still takes its messages, and nothing is kept as server evidence.
+/// Owner 2026-10-05: a line over the cap whose tail provably closes the
+/// envelope's `params` with its `threadId` and `turnId` is dropped for
+/// that thread: its lane ends `Overflow`, the connection goes on, another
+/// registered thread's lane still takes its messages, and nothing is kept
+/// as server evidence.
 #[tokio::test]
 async fn an_over_cap_line_overflows_only_its_threads_lane() {
     let mut vendor = Vendor::open(1 << 16);
     let a = registered(&mut vendor, "a").await;
     let b = registered(&mut vendor, "b").await;
     let text = "x".repeat(INBOUND.message_bytes);
-    let line = json!({"method": "item/completed", "params": {
-        "item": {"type": "agentMessage", "id": "m", "text": text},
-        "threadId": "b", "turnId": "u", "completedAtMs": 1}, "emittedAtMs": 1});
-    vendor.emit(&line).await;
+    let line = format!(
+        r#"{{"method":"item/completed","item":{{"type":"agentMessage","id":"m","text":"{text}"}},"params":{{"threadId":"b","turnId":"u","completedAtMs":1}},"emittedAtMs":1}}"#
+    );
+    vendor.emit_raw(format!("{line}\n").as_bytes()).await;
     vendor.emit(&item_completed("a", "v", "after")).await;
     vendor.settle().await;
     assert_eq!(vendor.connection.failure(), None, "the server goes on");
@@ -754,8 +755,38 @@ async fn an_over_cap_line_overflows_only_its_threads_lane() {
     assert!(vendor.stdio.kept().is_empty(), "no server evidence");
 }
 
-/// Owner 2026-10-05: the closing correlation of a skipped line's tail is
-/// read only where it closes `params` and the envelope.
+/// Review cfix-2: closing IDs that are not provably `params`' own are
+/// never charged to their thread. Here `params` names A, and a later
+/// top-level member names B: the line is unattributable, so B's lane is
+/// untouched, the head is the server's evidence and the connection fails
+/// `protocol`. Codex's own shape, `params` with `item` before its IDs, is
+/// unattributable the same way: the tail cannot show whose object closes.
+#[tokio::test]
+async fn an_over_cap_line_with_unproven_ids_is_unattributable() {
+    let mut vendor = Vendor::open(1 << 16);
+    let _a = registered(&mut vendor, "a").await;
+    let b = registered(&mut vendor, "b").await;
+    let text = "x".repeat(INBOUND.message_bytes);
+    let line = format!(
+        r#"{{"method":"item/completed","params":{{"threadId":"a","turnId":"a1","item":{{"type":"agentMessage","id":"m","phase":"final_answer","text":"{text}"}}}},"extra":{{"threadId":"b","turnId":"b1"}}}}"#
+    );
+    vendor.emit_raw(format!("{line}\n").as_bytes()).await;
+    let end = tokio::time::timeout(Duration::from_secs(10), &mut vendor.task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(end, ConnectionEnd::Failed(loss) if loss.cause == LossCause::Protocol));
+    assert_ne!(
+        b.lane().ended(),
+        Some(LaneEnd::Overflow),
+        "B is not charged"
+    );
+    assert_eq!(vendor.stdio.kept().len(), 1, "the head is server evidence");
+}
+
+/// Review cfix-2: a skipped line's tail attributes only where its
+/// `threadId` and `turnId` open the top-level `params` object, which
+/// closes the envelope but for integer members.
 #[test]
 fn trailing_ids_read_only_the_closing_members() {
     use super::connection::trailing_ids;
@@ -763,30 +794,52 @@ fn trailing_ids_read_only_the_closing_members() {
     let pair = Some(("t-1".to_owned(), "u_2".to_owned()));
     assert_eq!(
         ids(
-            "x\",\"threadId\":\"t-1\",\"turnId\":\"u_2\",\"completedAtMs\":17},\"emittedAtMs\":18}\n"
+            "x\",\"params\":{\"threadId\":\"t-1\",\"turnId\":\"u_2\",\"completedAtMs\":17},\"emittedAtMs\":18}\n"
         ),
         pair
     );
     assert_eq!(
-        ids("x\"},\"threadId\":\"t-1\",\"turnId\":\"u_2\"}}\n"),
+        ids("{\"params\":{\"threadId\":\"t-1\",\"turnId\":\"u_2\"}}\n"),
         pair
     );
-    // Not closing params and the envelope: nested, or not at the end.
-    assert_eq!(ids("{\"threadId\":\"t-1\",\"turnId\":\"u_2\"}}}\n"), None);
+    // Not provably params' own: another member's object (review cfix-2),
+    // or params whose IDs follow other members (Codex's item first).
     assert_eq!(
-        ids("\"threadId\":\"t-1\",\"turnId\":\"u_2\",\"x\":\"y\"}}\n"),
+        ids("x\"}},\"extra\":{\"threadId\":\"t-1\",\"turnId\":\"u_2\"}}\n"),
         None
     );
-    // Escaped inside a string, or an ID of other characters.
-    assert_eq!(ids("\\\"threadId\\\":\\\"t\\\",\"turnId\":\"u\"}}\n"), None);
-    assert_eq!(ids("x,\"threadId\":\"t 1\",\"turnId\":\"u\"}}\n"), None);
+    assert_eq!(
+        ids(
+            "x\"},\"threadId\":\"t-1\",\"turnId\":\"u_2\",\"completedAtMs\":17},\"emittedAtMs\":18}\n"
+        ),
+        None
+    );
+    assert_eq!(
+        ids("\\\"params\":{\"threadId\":\"t-1\",\"turnId\":\"u_2\"}}\n"),
+        None,
+        "an escaped key"
+    );
+    // Not closing params and the envelope: nested, or not at the end.
+    assert_eq!(
+        ids("{\"params\":{\"threadId\":\"t-1\",\"turnId\":\"u_2\"}}}\n"),
+        None
+    );
+    assert_eq!(
+        ids("{\"params\":{\"threadId\":\"t-1\",\"turnId\":\"u_2\",\"x\":\"y\"}}\n"),
+        None
+    );
+    // An ID of other characters.
+    assert_eq!(
+        ids("{\"params\":{\"threadId\":\"t 1\",\"turnId\":\"u\"}}\n"),
+        None
+    );
     // A delta's text closes its params: no attribution.
     assert_eq!(
         ids("\"turnId\":\"u\",\"itemId\":\"m\",\"delta\":\"x\"}}\n"),
         None
     );
     assert_eq!(
-        ids("x,\"threadId\":\"t\",\"turnId\":\"u\"}}"),
+        ids("{\"params\":{\"threadId\":\"t\",\"turnId\":\"u\"}}"),
         None,
         "no LF"
     );

@@ -920,7 +920,7 @@ Engine on the same State finds `vendor/codex` with the same identity, mode
       `params.threadId`, `params.turnId`) against their typed schema.
    2. **Correlation fields fail their typed schema** (invalid UTF-8 or
       JSON; Wire `MessageTooLarge` or `Unterminated`, or a skipped
-      over-cap line whose tail names no thread and turn, item 9.3; a known method whose
+      over-cap line whose tail does not prove its `params` IDs, item 9.3; a known method whose
       required `threadId` or `turnId` is missing or not a string; a
       response `id` not an integer, or neither outstanding nor abandoned,
       item 9.1) → **unattributable**: first 64 KiB to the server's
@@ -1407,18 +1407,27 @@ failed the shared connection `protocol`, every session on it.
   connection's bounds skip an over-cap line (`InboundBounds::
   skip_oversize`): Wire reads it to its LF, keeping the stream in step,
   and delivers a record of its length, first 64 KiB and last 4 KiB,
-  charged to staging. The connection reads the tail's closing
-  `"threadId":"…","turnId":"…"` (Codex writes them after `item` in
-  `item/started`, `item/completed` and `error`; anchored at the line's
-  end, so escaped text or a nested object cannot supply them) and drops
-  the line for that thread as a full lane drops a message: the lane ends
-  `Overflow` for the turn the `turnId` maps to, that turn fails
-  `overflow` with its `observations_lost` loss, and other sessions go on
+  charged to staging. The connection attributes the line only when its
+  tail proves the IDs are `params`' own (review cfix-2): it ends
+  `"params":{"threadId":"…","turnId":"…"` then only integer members and
+  the closes of `params` and the envelope, then LF (anchored at the
+  line's end, so escaped text, a nested object or another top-level
+  member cannot supply them). It then drops the line for that thread as
+  a full lane drops a message: the lane ends `Overflow` for the turn the
+  `turnId` maps to, that turn fails `overflow` with its
+  `observations_lost` loss, and other sessions go on
   (`codex_over_cap_line_fails_only_its_turn`). A thread with no open
-  registration drops it, as any message. A tail with no such close (a
-  delta, a response) is unattributable as before: its head is the
-  server's `undecoded.bin` and the connection fails `protocol` (item 5
-  step 2). Private routes keep failing the connection `MessageTooLarge`.
+  registration drops it, as any message. Any other tail is
+  unattributable as before: its head is the server's `undecoded.bin` and
+  the connection fails `protocol` (item 5 step 2). **Limitation:**
+  Codex writes `threadId`/`turnId` after `item` in `item/started`,
+  `item/completed` and `error` (0.159.2 fixtures), so for an over-cap
+  item the `params` key lies before the 4 KiB tail and cannot be proven;
+  Codex's own over-cap lines still fail the connection `protocol`.
+  Revisit when an over-cap Codex line is observed in use: a streaming
+  scan of the skipped bytes (depth and string state) could prove the
+  enclosing `params` and make this path reach Codex's real order.
+  Private routes keep failing the connection `MessageTooLarge`.
 - **Prompt cap unchanged.** The `prompt` limit (1,040,384 bytes with the
   cwd, C1 §4) was set against the 1 MiB cap. The 8 MiB cap now holds both
   echoes of a maximal prompt in one lane and the `thread/resume` reply's

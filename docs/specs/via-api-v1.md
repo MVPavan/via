@@ -1033,7 +1033,7 @@ receipt. An unkeyed caller must not resend the request.
 | `rate_limit`, `auth`, `context_exceeded`, `budget_exceeded` | specific vendor classes | Adapter |
 | `server_lost`, `process_exited` | Host-confirmed death | Core |
 | `protocol` | malformed known message, or vendor stream contradiction | Adapter |
-| `overflow` | this session's observation channel stalled past its limit, the connection's message queue overflowed, or a vendor message exceeded its route's cap (C2 A1): 1 MiB, or 8 MiB on `codex-app-server`. On `codex-app-server` such a message fails only the turn it names; one that names none fails the shared server's turns `protocol` | Core |
+| `overflow` | this session's observation channel stalled past its limit, the connection's message queue overflowed, or a vendor message exceeded its route's cap (C2 A1): 1 MiB, or 8 MiB on `codex-app-server`. On `codex-app-server` such a message fails only the turn its tail provably names in `params`; any other (Codex's own item-first order included, review cfix-2) fails the shared server's turns `protocol` | Core |
 | `structured_output_invalid` | VIA validation failed (Q2) | Core |
 | `daemon_restart`, `store` | §7.5; Store write failed after dispatch | Core |
 

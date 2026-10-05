@@ -3164,13 +3164,16 @@ fn codex_escaped_output_over_one_mib_is_delivered() {
 }
 
 /// Owner 2026-10-05 (review cfix-1 C): a line over the Codex route's
-/// 8 MiB cap does not fail the shared server. In `c4_two_sessions` B's
-/// first tool completion moves to after A's interrupt, while A's turn
-/// still runs, its output past the cap: Wire skips the line to its LF, the connection reads its
-/// closing `threadId`/`turnId` and drops it for B's turn, so B's lane
-/// overflows and only B's turn fails `overflow`; A's runs to its
-/// interrupt as recorded. Before, the line failed the connection, and
-/// both turns, `protocol`.
+/// 8 MiB cap whose tail proves its `params` IDs does not fail the shared
+/// server. In `c4_two_sessions` B's first tool completion moves to after
+/// A's interrupt, while A's turn still runs, its output past the cap and
+/// its item moved out of `params`, so the tail closes
+/// `"params":{"threadId":…,"turnId":…}` (review cfix-2: Codex's own
+/// order, item first, is unattributable). Wire skips the line to its LF,
+/// the connection reads its closing `threadId`/`turnId` and drops it for
+/// B's turn, so B's lane overflows and only B's turn fails `overflow`;
+/// A's runs to its interrupt as recorded. Before, the line failed the
+/// connection, and both turns, `protocol`.
 #[test]
 fn codex_over_cap_line_fails_only_its_turn() {
     let name = "codex_over_cap_line_fails_only_its_turn";
@@ -3188,9 +3191,15 @@ fn codex_over_cap_line_fails_only_its_turn() {
         })
         .unwrap();
     let output = "x".repeat(8 * 1024 * 1024 + 4096);
-    let line = line_of(&replay, completed).unwrap().replace(
+    let recorded: Value = serde_json::from_str(&line_of(&replay, completed).unwrap()).unwrap();
+    let params = &recorded["params"];
+    let item = params["item"].to_string().replace(
         r#""aggregatedOutput":null"#,
         &format!(r#""aggregatedOutput":"{output}""#),
+    );
+    let line = format!(
+        r#"{{"method":"item/completed","item":{item},"params":{{"threadId":{},"turnId":{}}}}}"#,
+        params["threadId"], params["turnId"]
     );
     assert!(line.len() > 8 * 1024 * 1024, "{}", line.len());
     let all = steps(&mut replay).unwrap();
