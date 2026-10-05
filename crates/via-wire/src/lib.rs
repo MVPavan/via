@@ -122,13 +122,15 @@ mod split;
 
 // Route needs the narrow connection handles returned by WireRuntime; their
 // constructor and Host process control remain private to Wire.
+#[cfg(feature = "test-failpoints")]
+pub use connection::fallback_drops;
+#[cfg(any(feature = "test-failpoints", feature = "test-support"))]
+pub use connection::testing;
 pub use connection::{
     Admitted, DataHold, FailureCause, LatchState, OutboundMessage, PendingWrite, TurnFolder,
     UNDECODED_BYTES, WireConnection, WireMessages, WireParts, WireSender, WriteBounds, WriteState,
     WriteTicket,
 };
-#[cfg(feature = "test-failpoints")]
-pub use connection::{fallback_drops, testing};
 pub use runtime::{
     RuntimeConfig, WireCloseReport, WireError, WireRecovery, WireRuntime, WireShutdown,
     WireSignals, WireTurnRecovery,

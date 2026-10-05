@@ -1,0 +1,200 @@
+//! The registry's leases and its status list (x.3.2 X4 D2; X0 items 2
+//! and 7), over scripted servers the registry's own launch job opens.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use via_wire::{EnvAllowList, PrivateProcessSpec, ProcessOwner, ServerId};
+
+use super::{Entry, ServerKey, ServerPin, Servers};
+use crate::codex::DeclineTable;
+use crate::codex::testing::{TestRuntime, TestStdio, VendorEnds, model};
+
+const DECLINES: DeclineTable = DeclineTable::new(&[]);
+
+const USER_AGENT: &str = "via/0.159.2 (Linux 6.0.0; x86_64) unknown (via; 0.0.0)";
+
+fn spec() -> PrivateProcessSpec {
+    PrivateProcessSpec {
+        program: "/bin/true".into(),
+        args: Vec::new(),
+        cwd: "/".into(),
+        env: EnvAllowList::default(),
+        owner: ProcessOwner::Server {
+            server_id: ServerId::mint().unwrap(),
+        },
+        stderr_path: std::path::PathBuf::new(),
+        capacity: None,
+    }
+}
+
+fn key(first: u8) -> ServerKey {
+    let mut bytes = [0_u8; 32];
+    bytes[0] = first;
+    bytes[1] = 0xab;
+    bytes[8] = 0xff;
+    ServerKey(bytes)
+}
+
+/// A server of `key`, launched over a script and live, with the pin of
+/// its launch.
+async fn launched(servers: &Servers, key: ServerKey) -> (ServerPin, VendorEnds, Arc<TestStdio>) {
+    let (mut ends, stdio) = servers.script();
+    let pin = servers.launch_or_join(key, spec(), Box::new(())).unwrap();
+    assert!(
+        servers
+            .reports()
+            .iter()
+            .all(|report| report.server != *pin.server()),
+        "a launching server is not listed"
+    );
+    ends.handshake(USER_AGENT, &[model("gpt-6-sol")]).await;
+    tokio::time::timeout(Duration::from_secs(5), pin.ready(std::future::pending()))
+        .await
+        .unwrap()
+        .unwrap();
+    (pin, ends, stdio)
+}
+
+/// Waits until `done`, polling, within 5 s.
+async fn until(what: &str, done: impl Fn() -> bool) {
+    let started = tokio::time::Instant::now();
+    while !done() {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "never reached: {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+/// D2: status lists a live server with its lease count, never its
+/// holders: two sessions, then one, then none (its last holder gone, it
+/// retires and is no longer listed). The key is 16 lower-case hex digits.
+#[tokio::test]
+async fn reports_count_leases_not_holders() {
+    let runtime = TestRuntime::new();
+    let servers = Servers::new(runtime.runtime(), DECLINES);
+    let (pin, _ends, stdio) = launched(&servers, key(0x01)).await;
+    let a = pin.lease().unwrap();
+    let b = pin.lease().unwrap();
+    let extra = pin.duplicate().unwrap();
+    let reports = servers.reports();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].server, *pin.server());
+    assert_eq!(reports[0].key, "01ab000000000000");
+    assert_eq!(reports[0].user_agent, USER_AGENT);
+    assert_eq!(reports[0].sessions, 2, "leases, not the four holders");
+    drop(a);
+    assert_eq!(servers.reports()[0].sessions, 1);
+    drop(b);
+    assert_eq!(servers.reports()[0].sessions, 0, "pins hold it, unleased");
+    drop(extra);
+    drop(pin);
+    assert!(servers.reports().is_empty(), "retiring: no longer listed");
+    until("the retirement's close", || stdio.closes() == 1).await;
+}
+
+/// D2: two keys are two servers, each listed with its own key, in server
+/// ID order.
+#[tokio::test]
+async fn two_keys_are_two_servers_sorted() {
+    let runtime = TestRuntime::new();
+    let servers = Servers::new(runtime.runtime(), DECLINES);
+    let (first, _a, _) = launched(&servers, key(0x02)).await;
+    let (second, _b, _) = launched(&servers, key(0x03)).await;
+    assert_ne!(first.server(), second.server());
+    let _lease = second.lease().unwrap();
+    let reports = servers.reports();
+    assert_eq!(reports.len(), 2);
+    assert!(reports[0].server < reports[1].server, "sorted by server ID");
+    for report in &reports {
+        let (want_key, want_sessions) = if report.server == *first.server() {
+            ("02ab000000000000", 0)
+        } else {
+            ("03ab000000000000", 1)
+        };
+        assert_eq!(report.key, want_key);
+        assert_eq!(report.sessions, want_sessions);
+    }
+}
+
+/// D2 (`lease_refused_after_retire`): a pin's lease once its server left
+/// `Live` is refused and changes nothing; while live it is granted.
+#[tokio::test]
+async fn lease_refused_after_retire() {
+    let runtime = TestRuntime::new();
+    let servers = Servers::new(runtime.runtime(), DECLINES);
+    let (pin, ends, _stdio) = launched(&servers, key(0x04)).await;
+    assert!(pin.live().is_some());
+    drop(pin.lease().unwrap());
+    // The server's stdout ends: the connection fails, and the supervisor
+    // moves the server out of `Live`.
+    drop(ends);
+    until("the server left Live", || pin.live().is_none()).await;
+    let state = || {
+        let registry = servers.registry();
+        let entry = registry
+            .servers
+            .get(pin.server())
+            .map(|instance| match &instance.entry {
+                Entry::Launching { .. } => "launching",
+                Entry::Live { .. } => "live",
+                Entry::Retiring { .. } => "retiring",
+                Entry::Lost { .. } => "lost",
+            });
+        (entry, registry.stale)
+    };
+    let before = state();
+    assert!(
+        matches!(before, (Some("lost") | None, 0)),
+        "out of Live: {before:?}"
+    );
+    assert!(pin.lease().is_none(), "no lease off a server not live");
+    assert_eq!(state(), before, "the refusal changed nothing");
+    assert!(servers.reports().is_empty());
+}
+
+/// D2 (`lease_drop_retires_once`): a lease is one holder and one lease,
+/// released together under one guard. Its drop retires nothing while a
+/// pin holds the server; the last two holders, a lease and a pin, dropped
+/// at once on two threads, retire it exactly once, without either thread
+/// waiting on a nested guard.
+#[tokio::test]
+async fn lease_drop_retires_once() {
+    let runtime = TestRuntime::new();
+    let servers = Servers::new(runtime.runtime(), DECLINES);
+    let (pin, _ends, stdio) = launched(&servers, key(0x05)).await;
+    let other = pin.duplicate().unwrap();
+    let early = pin.lease().unwrap();
+    drop(early);
+    drop(other);
+    assert_eq!(servers.reports().len(), 1, "the pin still holds it");
+    let lease = pin.lease().unwrap();
+    assert_eq!(servers.reports()[0].sessions, 1);
+    let start = Arc::new(std::sync::Barrier::new(2));
+    let (done, finished) = std::sync::mpsc::channel();
+    let mut threads = Vec::new();
+    let holds: Vec<Box<dyn Send>> = vec![Box::new(lease), Box::new(pin)];
+    for hold in holds {
+        let (start, done) = (Arc::clone(&start), done.clone());
+        threads.push(std::thread::spawn(move || {
+            start.wait();
+            drop(hold);
+            done.send(()).unwrap();
+        }));
+    }
+    for _ in 0..2 {
+        finished
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a drop never waits on a nested guard");
+    }
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    assert!(servers.reports().is_empty());
+    until("the retirement's close", || stdio.closes() == 1).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(stdio.closes(), 1, "retired once");
+    assert_eq!(servers.registry().stale, 0);
+}

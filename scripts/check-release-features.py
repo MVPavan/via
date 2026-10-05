@@ -5,7 +5,8 @@ Usage: check-release-features.py target/release/via
 
 Runtime-contracts §11 exclusion check, three parts:
 1. Cargo's release feature graph for `via-cli` (no default features) has no
-   `test-failpoints` feature and no `via-fake-agent` package.
+   `test-failpoints` or `test-support` feature and no `via-fake-agent`
+   package.
 2. The release binary is launched with every known activation input: a private
    failpoint directory and token, every Task 2 point armed to pause, and a
    partial configuration a feature build would refuse. It must start, run a
@@ -346,10 +347,14 @@ def main():
         return fail(f"{fake} does not exist; run `cargo build -p via-fake-agent`")
 
     graph = feature_graph()
-    offending = [line for line in graph if "test-failpoints" in line or line.startswith("via-fake-agent ")]
+    offending = [
+        line
+        for line in graph
+        if "test-failpoints" in line or "test-support" in line or line.startswith("via-fake-agent ")
+    ]
     if offending:
         return fail(f"release feature graph includes test-only items: {offending}")
-    print(f"feature graph: {len(graph)} nodes, no test-failpoints, no via-fake-agent")
+    print(f"feature graph: {len(graph)} nodes, no test-failpoints, no test-support, no via-fake-agent")
 
     with tempfile.TemporaryDirectory(prefix="via-release-") as scratch:
         scratch = Path(scratch)

@@ -4,23 +4,21 @@
 //! vendor's side is two in-memory pipes: the test writes its stdout and
 //! reads (or does not read) its stdin.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 use tokio::task::JoinHandle;
-use via_wire::testing::{TestInput, pipes};
+use via_wire::testing::pipes;
 use via_wire::{
-    CloseRequest, CommitOutcome, DataHold, Deadline, OutboundMessage, PendingWrite, SendOutcome,
-    ServerId, SessionId, TurnNumber, WireCleanup, WireCloseReport, WireError, WriteBounds,
-    WriteState, WriteTicket,
+    Deadline, OutboundMessage, SendOutcome, ServerId, TurnNumber, WireCleanup, WriteBounds,
+    WriteState,
 };
 
 use super::connection::serve;
-use super::stdio::{Boxed, Stdio};
+use super::stdio::Stdio;
+use super::testing::{Scratch, TestStdio, VendorEnds};
 use super::*;
 
 /// The decline table the tests answer with.
@@ -29,101 +27,12 @@ const DECLINES: DeclineTable = DeclineTable::new(&[(
     r#"{"decision":"decline"}"#,
 )]);
 
-/// A private scratch folder, removed on drop.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new() -> Self {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "via-codex-connection-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&path).unwrap();
-        Self(path)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// Wire's test input as the connection's seam; Host's stop is answered
-/// at once, and the server folder's evidence is kept in memory.
-struct TestStdio {
-    input: TestInput,
-    kept: Mutex<Vec<Vec<u8>>>,
-    /// Every write handed to Wire, in order: the tests' write-state gate.
-    tickets: Mutex<Vec<WriteTicket>>,
-}
-
-impl Stdio for TestStdio {
-    fn write(&self, message: OutboundMessage, bounds: WriteBounds) -> PendingWrite {
-        let pending = self.input.write_bounded(message, bounds);
-        self.tickets.lock().unwrap().push(pending.ticket());
-        pending
-    }
-
-    fn withdraw(&self, ticket: WriteTicket) -> WriteState {
-        self.input.withdraw(ticket)
-    }
-
-    fn hold_data(&self) -> DataHold {
-        self.input.hold_data()
-    }
-
-    fn seal(&self) {
-        self.input.seal();
-    }
-
-    fn close(&self, _request: CloseRequest) -> Boxed<'_, WireCloseReport> {
-        Box::pin(async {
-            WireCloseReport {
-                cleanup: WireCleanup::Quiescent,
-                vendor_exit: None,
-                forced: false,
-                journal_uncertain: false,
-                stopped_live: Some(true),
-            }
-        })
-    }
-
-    fn close_input(&self, deadline: Deadline) -> Boxed<'_, Result<(), WireError>> {
-        Box::pin(self.input.close_input(deadline))
-    }
-
-    fn keep_undecoded<'a>(&'a self, bytes: &'a [u8], _what: &'a str) -> Boxed<'a, ()> {
-        self.kept.lock().unwrap().push(bytes.to_vec());
-        Box::pin(async {})
-    }
-
-    fn link_turn<'a>(
-        &'a self,
-        _session: &'a SessionId,
-        _turn: TurnNumber,
-        _deadline: Deadline,
-    ) -> Boxed<'a, CommitOutcome<()>> {
-        Box::pin(async { CommitOutcome::Committed(()) })
-    }
-}
-
 /// One connection and the vendor's ends of its pipes.
 struct Vendor {
     connection: Arc<Connection>,
     stdio: Arc<TestStdio>,
-    stdout: DuplexStream,
-    stdin: BufReader<DuplexStream>,
+    ends: VendorEnds,
     task: JoinHandle<ConnectionEnd>,
-    /// The vendor lines written so far.
-    emitted: u64,
-    _scratch: Scratch,
 }
 
 impl Vendor {
@@ -133,11 +42,7 @@ impl Vendor {
         let (vendor_in, stdin) = tokio::io::duplex(stdin_buffer);
         let scratch = Scratch::new();
         let pipes = pipes(vendor_out, vendor_in, scratch.path().to_path_buf());
-        let wire = Arc::new(TestStdio {
-            input: pipes.input,
-            kept: Mutex::new(Vec::new()),
-            tickets: Mutex::new(Vec::new()),
-        });
+        let wire = Arc::new(TestStdio::new(pipes.input, scratch));
         let connection = Connection::over(
             ServerId::mint().unwrap(),
             Arc::clone(&wire) as Arc<dyn Stdio>,
@@ -147,49 +52,34 @@ impl Vendor {
         Self {
             connection,
             stdio: wire,
-            stdout,
-            stdin: BufReader::new(stdin),
+            ends: VendorEnds::new(stdout, stdin),
             task,
-            emitted: 0,
-            _scratch: scratch,
         }
     }
 
     /// Writes one vendor line.
     async fn emit(&mut self, line: &Value) {
-        let mut bytes = serde_json::to_vec(line).unwrap();
-        bytes.push(b'\n');
-        self.stdout.write_all(&bytes).await.unwrap();
-        self.emitted += 1;
+        self.ends.emit(line).await;
     }
 
     /// Writes one raw vendor line, its newline included.
     async fn emit_raw(&mut self, line: &[u8]) {
-        self.stdout.write_all(line).await.unwrap();
-        self.emitted += 1;
+        self.ends.emit_raw(line).await;
     }
 
     /// The next line VIA wrote, within 2 s.
     async fn read(&mut self) -> Value {
-        let mut line = String::new();
-        tokio::time::timeout(Duration::from_secs(2), self.stdin.read_line(&mut line))
-            .await
-            .expect("a line within 2 s")
-            .unwrap();
-        serde_json::from_str(&line).unwrap()
+        self.ends.read().await
     }
 
     /// Whether VIA wrote nothing more within `wait`.
     async fn silent(&mut self, wait: Duration) -> bool {
-        let mut line = String::new();
-        tokio::time::timeout(wait, self.stdin.read_line(&mut line))
-            .await
-            .is_err()
+        self.ends.silent(wait).await
     }
 
     /// Waits until the connection task has routed every line written.
     async fn settle(&self) {
-        let emitted = self.emitted;
+        let emitted = self.ends.emitted;
         until("every emitted line routed", || {
             self.connection.routed() >= emitted
         })
@@ -199,12 +89,7 @@ impl Vendor {
     /// Waits until Wire holds write `n` (from 1) in a state `state` takes.
     async fn wrote(&self, n: usize, state: fn(WriteState) -> bool) {
         until("the write's state", || {
-            self.stdio
-                .tickets
-                .lock()
-                .unwrap()
-                .get(n - 1)
-                .is_some_and(|ticket| state(ticket.state()))
+            self.stdio.write_state(n).is_some_and(state)
         })
         .await;
     }
@@ -490,10 +375,7 @@ async fn codex_write_cancelled_before_hand_off_is_refused() {
     );
     assert!(start.reply.await.is_err(), "the record went");
     assert!(vendor.silent(Duration::from_millis(200)).await);
-    assert!(
-        vendor.stdio.tickets.lock().unwrap().is_empty(),
-        "nothing reached Wire"
-    );
+    assert!(vendor.stdio.writes() == 0, "nothing reached Wire");
 }
 
 /// x.3.2 X3 S1's variant: the write passed the hand-off, its ticket is
@@ -701,7 +583,7 @@ async fn correlation_failure_is_protocol_not_generation_local() {
         .unwrap();
     assert!(matches!(end, ConnectionEnd::Failed(loss) if loss.cause == LossCause::Protocol));
     assert!(taken(lane.lane()).is_empty());
-    let kept = vendor.stdio.kept.lock().unwrap().clone();
+    let kept = vendor.stdio.kept();
     assert_eq!(kept.len(), 1);
     assert_eq!(serde_json::from_slice::<Value>(&kept[0]).unwrap(), untied);
 }
@@ -912,7 +794,7 @@ async fn staging_aggregate_includes_ingress() {
     let mut vendor = Vendor::open(1 << 16);
     let lane = registered(&mut vendor, "t").await;
     vendor.settle().await;
-    let before = vendor.stdio.input.queued_bytes();
+    let before = vendor.stdio.input().queued_bytes();
     let note = item_completed("t", "u", "m");
     let request = json!({"id": "srv-9", "method": "item/commandExecution/requestApproval",
         "params": {"threadId": "t", "turnId": "u", "itemId": "i", "pad": "x".repeat(2000)}});
@@ -920,12 +802,12 @@ async fn staging_aggregate_includes_ingress() {
     vendor.emit(&request).await;
     vendor.settle().await;
     vendor.read().await;
-    let held = vendor.stdio.input.queued_bytes() - before;
+    let held = vendor.stdio.input().queued_bytes() - before;
     let lines =
         serde_json::to_vec(&note).unwrap().len() + serde_json::to_vec(&request).unwrap().len() + 2;
     assert_eq!(held, lines);
     assert_eq!(taken(lane.lane()).len(), 2);
-    assert_eq!(vendor.stdio.input.queued_bytes(), before);
+    assert_eq!(vendor.stdio.input().queued_bytes(), before);
 }
 
 /// Item 8.3: an interrupt posted before `turn/start`'s reply waits on its

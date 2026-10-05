@@ -12,6 +12,8 @@ mod lane;
 mod messages;
 mod servers;
 mod stdio;
+#[cfg(any(feature = "test-support", all(test, feature = "test-failpoints")))]
+pub mod testing;
 mod threads;
 
 pub use connection::{
@@ -27,8 +29,9 @@ pub use lane::{
 };
 pub use messages::*;
 pub use servers::{
-    AcquireCause, LaunchError, LaunchFailure, LiveServer, MODEL_BYTES, MODEL_PAGES,
-    SERVER_HANDSHAKE, SERVER_RETIRE, ServerEnd, ServerFacts, ServerKey, ServerPin, Servers,
+    AcquireCause, LaunchError, LaunchFailure, MODEL_BYTES, MODEL_PAGES, SERVER_HANDSHAKE,
+    SERVER_RETIRE, ServerEnd, ServerFacts, ServerKey, ServerLease, ServerPin, ServerReport,
+    Servers,
 };
 pub use threads::{CORRELATION_BYTES, CORRELATION_ENTRIES};
 /// The Wire types a shared-route driver handles: its writes' bounds and

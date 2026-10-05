@@ -9,6 +9,9 @@ publish.workspace = true
 [features]
 # Test-only failpoint controller (runtime-contracts §11); default off.
 test-failpoints = ["via-host/test-failpoints", "via-store/test-failpoints"]
+# Test-only: `testing`'s test pipes, without the failpoint controller, for
+# the test builds of the layers above (x.3.2 X4); default off.
+test-support = []
 
 [dependencies]
 via-host = { path = "../via-host" }

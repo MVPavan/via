@@ -34,9 +34,9 @@ use tokio::time::Instant;
 use via_routes::codex::{
     AbnormalEnd, ClientId, CommitOutcome, Connection, ConnectionEnd, ConnectionFailure,
     ConnectionLoss, FINISH_BY, LOSS_EVIDENCE, Lane, LaneEnd, LaneLease, LaunchError, LeaseSignal,
-    LossCause, Purpose, RequestError, Response, RpcError, SandboxMode, ServerKey, ServerPin,
-    Subscription, ThreadResult, ThreadSettings, TurnFolder, TurnStart, TurnStartResult, TurnWrites,
-    WriteBounds, crash_on_panic, data, result, thread_resume, thread_start, turn_start,
+    LossCause, Purpose, RequestError, Response, RpcError, SandboxMode, ServerKey, ServerLease,
+    ServerPin, Subscription, ThreadResult, ThreadSettings, TurnFolder, TurnStart, TurnStartResult,
+    TurnWrites, WriteBounds, crash_on_panic, data, result, thread_resume, thread_start, turn_start,
 };
 use via_routes::{Retirement, SendOutcome, StoreFailure, WireCleanup};
 
@@ -113,8 +113,9 @@ struct Attached {
     /// The evidence folder of each turn this generation ran: a malformed
     /// message naming an earlier one is kept there (X0 item 5).
     folders: Folders,
-    /// The session's lease, held from its first join until close (AD16).
-    lease: ServerPin,
+    /// The session's lease, held from its first join until close (AD16):
+    /// `daemon/status` counts it (x.3.2 X4 D2).
+    lease: ServerLease,
 }
 
 /// The close's delivery barrier ends this long before the close's
@@ -184,7 +185,7 @@ impl CodexSession {
             .attached()
             .as_ref()
             .filter(|attached| usable(&attached.connection))
-            .and_then(|attached| attached.lease.duplicate());
+            .and_then(|attached| attached.lease.pin());
         own.or_else(|| self.adapter.servers().pin(&self.key(requested)))
     }
 
@@ -255,7 +256,9 @@ impl CodexSession {
                 folders: Arc::clone(&current.folders),
             });
         }
-        let lease = pin.duplicate()?;
+        // A server that left `Live` meanwhile has no lease: the session is
+        // gone for this turn, as a pin no longer held would be.
+        let lease = pin.lease()?;
         let generation = {
             let mut state = driver.state();
             state.generation += 1;

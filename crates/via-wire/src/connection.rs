@@ -1096,12 +1096,12 @@ impl Io {
         self.shared.take_undecoded()
     }
 
-    #[cfg(feature = "test-failpoints")]
+    #[cfg(any(feature = "test-failpoints", feature = "test-support"))]
     pub(crate) fn discarded(&self) -> u64 {
         self.shared.discarded.load(Ordering::Acquire)
     }
 
-    #[cfg(feature = "test-failpoints")]
+    #[cfg(any(feature = "test-failpoints", feature = "test-support"))]
     pub(crate) fn queued_bytes(&self) -> usize {
         self.shared.staging.bytes.load(Ordering::Acquire)
     }
@@ -2189,7 +2189,7 @@ fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 /// Test builds: a connection over any pipes, without Host (design §13.1).
-#[cfg(feature = "test-failpoints")]
+#[cfg(any(feature = "test-failpoints", feature = "test-support"))]
 pub mod testing {
     use std::path::PathBuf;
 
@@ -2200,6 +2200,13 @@ pub mod testing {
         BlobTasks, DataHold, Deadline, FailureCause, Io, OutboundMessage, PendingWrite, Stragglers,
         Waits, WireError, WireMessages, WriteBounds, WriteState, WriteTicket, connect,
     };
+
+    /// The Store a layer above opens for a test runtime of its own (x.3.2
+    /// X4): only Wire and Host may name the Store in production, so the
+    /// test builds of the layers above reach it here, never through a
+    /// dependency of their own. Its owner keeps it open while the
+    /// runtime's tasks run.
+    pub use via_store::Store;
 
     /// A connection's message half and its input, over test pipes.
     pub struct TestPipes {

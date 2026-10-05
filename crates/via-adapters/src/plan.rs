@@ -787,10 +787,12 @@ impl AdapterSet {
     }
 
     /// The live shared servers (C2 §2 `servers`): a pure in-memory
-    /// snapshot. Every route today runs per-turn processes, so none is
-    /// listed.
+    /// snapshot of the Codex registry, each server with the sessions
+    /// leasing it (x.3.2 X4 D2); the per-turn routes list none.
     pub fn servers(&self) -> Vec<ServerReport> {
-        Vec::new()
+        self.codex
+            .as_ref()
+            .map_or_else(Vec::new, |codex| codex.server_reports())
     }
 
     /// Each shared server that ended, oldest first (at most 16), as its
@@ -976,6 +978,57 @@ mod tests {
 
     use super::Inherit;
     use crate::harness::Harness;
+
+    /// x.3.2 X4 D2 (`adapter_set_reports_codex_servers`): `servers()`
+    /// lists a live Codex server with its harness, its handshake's version,
+    /// its 16-digit key and the sessions leasing it (a live run listed
+    /// `servers: []` beside a running server).
+    #[tokio::test]
+    async fn adapter_set_reports_codex_servers() {
+        let runtime = via_routes::codex::testing::TestRuntime::new();
+        let (config, resources) = runtime.parts();
+        let binary = std::env::current_exe().unwrap();
+        let harnesses = serde_json::value::RawValue::from_string(
+            json!({"codex": {"binary": binary}}).to_string(),
+        )
+        .unwrap();
+        let env = crate::BootstrapEnv::from_vars(std::iter::empty::<(&str, &str)>());
+        let adapters = crate::AdapterConfig::load(env, Some(&harnesses)).unwrap();
+        let set = super::AdapterSet::new(adapters, config, resources).unwrap();
+        assert!(set.servers().is_empty(), "none before a launch");
+        let servers = set.codex.as_ref().unwrap().servers();
+        let (mut vendor, _stdio) = servers.script();
+        let spec = via_routes::PrivateProcessSpec {
+            program: binary.clone(),
+            args: Vec::new(),
+            cwd: "/".into(),
+            env: via_routes::EnvAllowList::default(),
+            owner: via_routes::ProcessOwner::Server {
+                server_id: via_routes::codex::ServerId::mint().unwrap(),
+            },
+            stderr_path: std::path::PathBuf::new(),
+            capacity: None,
+        };
+        let mut key = [0_u8; 32];
+        key[..8].copy_from_slice(&[0xc0, 0xde, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05]);
+        let pin = servers
+            .launch_or_join(via_routes::codex::ServerKey(key), spec, Box::new(()))
+            .unwrap();
+        vendor
+            .handshake(
+                "via/0.159.2 (Linux 6.0.0; x86_64) unknown (via; 0.0.0)",
+                &[via_routes::codex::testing::model("gpt-6-sol")],
+            )
+            .await;
+        pin.ready(std::future::pending()).await.unwrap();
+        let _lease = pin.lease().unwrap();
+        let listed = serde_json::to_value(set.servers()).unwrap();
+        assert_eq!(
+            listed,
+            json!([{"harness": "codex", "vendor_version": "0.159.2",
+                "key": "c0de000102030405", "sessions": 1}])
+        );
+    }
 
     /// Each vendor stub names a row of the harness table, with its route.
     #[test]
