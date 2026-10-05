@@ -6,7 +6,9 @@
     "--disable",
     "memories",
     "--disable",
-    "hooks"
+    "hooks",
+    "--disable",
+    "apps"
   ],
   "version": "codex-cli 0.159.2",
   "deadline_ms": 60000,

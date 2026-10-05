@@ -273,13 +273,20 @@ feature in `codex features list` was seen starting an agent or thread on
 its own in the live runs.
 
 Inherited configuration (C2 §6.2; owner OD2), from the 2026-09-30 re-probe.
-With hooks off, launch with `--disable hooks` (verified). MCP suppression
-through a `-c` override is unverified. Every switch enters `config_hash`.
+With hooks off, launch with `--disable hooks` (verified). With MCP servers
+off, launch with `--disable apps` (via-4gl, checked 2026-10-05 on 0.160.0):
+the `apps` feature starts Codex's built-in `codex_apps` MCP server for every
+thread, and the flag stops it. The user's configured servers (`[mcp_servers.*]`
+in `~/.codex/config.toml`, project layers and plugins) have no argv switch:
+`-c mcp_servers={}` merges into the user's table and removes nothing, and
+`-c mcp_servers.<name>.enabled=false` works but needs each name, which only
+the user's configuration holds. So MCP stays `unknown` and warns. Every
+switch enters `config_hash`.
 
 | Category (default) | Switch and evidence | Effective state with the default |
 |---|---|---|
 | hooks (off) | `--disable hooks`: **verified** (the owner's hooks ran without it) | `off` |
-| MCP servers (off) | `~/.codex` config; a `-c` override is **unverified**; inventory via `mcpServerStatus/list` (schema, **unverified**) | `unknown`, warns |
+| MCP servers (off) | `--disable apps` stops the built-in `codex_apps` server (**checked**); user-configured servers still start (`mcpServer/startupStatus/updated`); inventory via `mcpServerStatus/list` (schema, **unverified**) | `unknown`, warns |
 | plugins (on) | plugin support exists (schema); switch **unverified** | `unknown`, no switch applied, warns |
 | skills (on) | **unverified** | `unknown`, no switch applied, warns |
 | agents (on) | **unverified** | `unknown`, no switch applied, warns |
@@ -288,8 +295,10 @@ through a `-c` override is unverified. Every switch enters `config_hash`.
 Inventory sources are `configWarning` and the `thread/start` response's
 `instructionSources`, which reported the loaded AGENTS.md paths in the
 0.159.2 re-probe (completeness unverified). The fixtures qualified no other
-inventory; `mcpServerStatus/list` stays schema-only. Qualify the MCP switch in `via-5lr.3.4`, or declare it not
-switchable.
+inventory; `mcpServerStatus/list` stays schema-only. Switching off the
+user's configured MCP servers needs an owner decision (via-4gl): read only
+the server names from the configuration layers, or declare the category
+not switchable.
 
 ## 5. Correlation, events and bounds
 

@@ -110,9 +110,11 @@ pub(crate) fn capabilities() -> Capabilities {
 }
 
 /// The inherited-configuration declarations (packet §4, 2026-09-30
-/// re-probe): only `--disable hooks` is a verified switch. Every other
-/// category has no switch VIA applies and no verified vendor default, so
-/// it is effectively `unknown` and warns.
+/// re-probe): only `--disable hooks` is a verified switch. MCP servers off
+/// applies `--disable apps`, which stops only Codex's built-in server, so
+/// it is unverified (via-4gl). Every other category has no switch VIA
+/// applies and no verified vendor default. All but hooks are effectively
+/// `unknown` and warn.
 pub(crate) fn categories() -> BTreeMap<Category, CategoryDecl> {
     let unswitched = CategoryDecl::default();
     let hooks = CategoryDecl {
@@ -120,12 +122,17 @@ pub(crate) fn categories() -> BTreeMap<Category, CategoryDecl> {
         off: Switch::Verified,
         observed: None,
     };
+    let mcp_servers = CategoryDecl {
+        on: Switch::None,
+        off: Switch::Unverified,
+        observed: None,
+    };
     Category::ALL
         .into_iter()
         .map(|category| match category {
             Category::Hooks => (category, hooks),
-            Category::McpServers
-            | Category::Plugins
+            Category::McpServers => (category, mcp_servers),
+            Category::Plugins
             | Category::Skills
             | Category::Agents
             | Category::InstructionFiles => (category, unswitched),

@@ -116,8 +116,12 @@ fn env() -> BootstrapEnv {
 }
 
 fn hooks(state: InheritState) -> Inherit {
+    inherit(state, InheritState::Off)
+}
+
+fn inherit(hooks: InheritState, mcp_servers: InheritState) -> Inherit {
     serde_json::from_value(
-        json!({"hooks": state, "mcp_servers": "off", "plugins": "on",
+        json!({"hooks": hooks, "mcp_servers": mcp_servers, "plugins": "on",
         "skills": "on", "agents": "on", "instruction_files": "on"}),
     )
     .unwrap()
@@ -154,6 +158,37 @@ fn every_server_disables_memories() {
     }
 }
 
+/// via-4gl: with MCP servers off, the server disables the `apps` feature,
+/// which is what starts Codex's built-in `codex_apps` MCP server for every
+/// thread (checked live on 0.160.0); with them on it does not. The user's
+/// configured servers have no such switch, so the category stays
+/// `unknown` and warns.
+#[test]
+fn mcp_off_disables_the_apps_server() {
+    let disables_apps = |mcp_servers| {
+        ServerRecipe::new(
+            Path::new("/bin/codex"),
+            inherit(InheritState::On, mcp_servers),
+            &env(),
+            Path::new("/state/vendor/codex"),
+        )
+        .args
+        .windows(2)
+        .any(|pair| pair == ["--disable", "apps"])
+    };
+    assert!(disables_apps(InheritState::Off));
+    assert!(!disables_apps(InheritState::On));
+    let (effective, warning) = crate::plan::effective_inherit(
+        &super::plan::categories(),
+        inherit(InheritState::Off, InheritState::Off),
+    );
+    assert_eq!(
+        effective.effective.get(crate::plan::Category::McpServers),
+        InheritState::Unknown
+    );
+    assert!(warning.is_some());
+}
+
 /// Packet §4, Q6: the server's argv disables hooks when they are off, its
 /// environment is exactly the allow-list plus the supplied
 /// `CODEX_SQLITE_HOME`, and it runs in that directory.
@@ -169,7 +204,15 @@ fn the_server_recipe_is_the_allow_list() {
     assert_eq!(recipe.program, Path::new("/bin/codex"));
     assert_eq!(
         recipe.args,
-        ["app-server", "--disable", "memories", "--disable", "hooks"]
+        [
+            "app-server",
+            "--disable",
+            "memories",
+            "--disable",
+            "hooks",
+            "--disable",
+            "apps"
+        ]
     );
     assert_eq!(recipe.cwd, home);
     assert_eq!(
@@ -190,7 +233,10 @@ fn the_server_recipe_is_the_allow_list() {
         &BootstrapEnv::from_vars([("PATH", "/usr/bin")]),
         home,
     );
-    assert_eq!(on.args, ["app-server", "--disable", "memories"]);
+    assert_eq!(
+        on.args,
+        ["app-server", "--disable", "memories", "--disable", "apps"]
+    );
     assert_eq!(
         on.env,
         os(&[

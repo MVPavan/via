@@ -55,7 +55,8 @@ pub(crate) struct ServerRecipe {
 impl ServerRecipe {
     /// The recipe for `binary` with the session's requested inherited
     /// configuration: `--disable` for each [`ALWAYS_DISABLED`] feature,
-    /// `--disable hooks` when hooks are off (a verified switch), the
+    /// `--disable hooks` when hooks are off (a verified switch),
+    /// `--disable apps` when MCP servers are off (a partial switch), the
     /// allow-listed environment plus `CODEX_SQLITE_HOME`, and
     /// `vendor_home` as both that directory and the working directory. The
     /// caller creates `vendor_home`.
@@ -71,6 +72,13 @@ impl ServerRecipe {
         }
         if requested.get(Category::Hooks) == InheritState::Off {
             args.extend(["--disable".to_owned(), "hooks".to_owned()]);
+        }
+        // via-4gl: the `apps` feature starts the built-in `codex_apps` MCP
+        // server for every thread. The user's configured MCP servers have
+        // no argv switch (a `-c mcp_servers={}` override merges into
+        // `config.toml` and removes none), so MCP stays `unknown`.
+        if requested.get(Category::McpServers) == InheritState::Off {
+            args.extend(["--disable".to_owned(), "apps".to_owned()]);
         }
         let mut vars: Vec<(OsString, OsString)> = ENV_ALLOW
             .iter()
