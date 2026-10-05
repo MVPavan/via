@@ -1276,15 +1276,24 @@ impl<'a> Run<'a> {
     }
 
     /// Whether Host's journal holds positive group-absence evidence for
-    /// the turn's own process group: every anchor the turn owns has a
+    /// the turn's own process group: every anchor the turn owns, and the
+    /// one server anchor its `server_turns` link names (x.3.2 X4 K0, Q2
+    /// and Q11: that specific server, never every server's), has a
     /// committed absence proof (review r1 #5: never inferred from the
-    /// adapter's cleanup claim). A turn with no anchor of its own (nothing
-    /// launched, or a server route's turn) has none.
+    /// adapter's cleanup claim). A turn with neither (nothing launched, or
+    /// a server-route turn that linked nothing) has none.
     async fn group_absent(&self, session: &SessionId, turn: TurnNumber) -> Result<bool, String> {
+        let (_, journal) = self.pure.store().runtime_resources().into_wire_parts();
+        let linked: Vec<String> = journal
+            .server_links(vec![(session.clone(), turn)])
+            .await
+            .map_err(|e| format!("server links: {e:?}"))?
+            .into_iter()
+            .map(|link| link.anchor_id)
+            .collect();
         let mut owned = Vec::new();
         let mut after = None;
         loop {
-            let (_, journal) = self.pure.store().runtime_resources().into_wire_parts();
             let page = journal
                 .list_anchor_records_page(after.clone(), 256)
                 .await
@@ -1298,8 +1307,11 @@ impl<'a> Run<'a> {
                             session_id,
                             turn: owner_turn,
                         } => session_id == session && owner_turn.get() == turn.get(),
-                        // A shared server's anchor is no turn's own group.
-                        via_store::ProcessOwner::Server { .. } => false,
+                        // A shared server's anchor counts only when the
+                        // turn's own link names it.
+                        via_store::ProcessOwner::Server { .. } => {
+                            linked.contains(&record.intent.anchor_id)
+                        }
                     }),
             );
             if !full {

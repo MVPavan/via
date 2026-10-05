@@ -83,6 +83,7 @@ macro_rules! cases {
 
 cases! {
     green:
+    c0_server_lost,
     c10_read_only_refused,
     c4b_workspace_write_refused,
     codex_bound_gate_refusals,
@@ -96,8 +97,7 @@ cases! {
     c8_auth,
     c9_output_schema;
     red:
-    c0_server_lost = "red until via-5lr.3.2 X4 (server loss across sessions)",
-    c2_steer = "red until via-5lr.3.2 X4 (native steer)",
+    c2_steer = "deferred past the first release (via-gaz): Codex steer is unsupported",
     c3_interrupt_uncertain = "red until via-5lr.3.2 X4 (interrupt and P7)",
     c3_wall_interrupt = "red until via-5lr.3.2 X4 (the wall's soft stop)",
     c4_two_sessions = "red until via-5lr.3.2 X4 (leases across sessions)",
@@ -1438,6 +1438,85 @@ fn codex_discovery_feeds_models() {
     conformance_expect::check(&expect, &outcome).unwrap();
 }
 
+/// x.3.2 X4 K0 (O1; owner 2026-10-04: Codex steer is deferred past the
+/// first release, via-gaz): the declared steer capability and the driver
+/// agree. `describe` declares steer unsupported, a plan requiring it is
+/// refused `missing_capability:steer`, and a Codex session's
+/// `SessionDriver::steer` answers `Unsupported` before any vendor I/O.
+#[test]
+fn codex_steer_declaration_matches_the_driver() {
+    let name = "codex_bound_gate_refusals";
+    let dir = fixtures();
+    let expect = conformance_expect::load(&dir, name).unwrap();
+    let pure = conformance_drive::Pure::run(
+        "codex",
+        name,
+        &expect,
+        &dir.join(format!("{name}.replay.json")),
+    )
+    .unwrap();
+    let describe = via_adapters::DescribeRequest {
+        harness: Some("codex".to_owned()),
+        model: Some("gpt-6-sol".to_owned()),
+        ..via_adapters::DescribeRequest::default()
+    };
+    let plan = pure.set.plan(&describe).unwrap();
+    let declared = serde_json::to_value(&plan.capabilities).unwrap();
+    assert_eq!(declared["verbs"]["steer"]["support"], "unsupported");
+    let requiring = via_adapters::DescribeRequest {
+        require: vec![via_adapters::VerbReq::parse("steer").unwrap()],
+        ..describe
+    };
+    let refused = match pure.set.plan(&requiring) {
+        Ok(plan) => plan.refusals.first().map(conformance_drive::refusal_name),
+        Err(refusal) => Some(conformance_drive::refusal_name(&refusal)),
+    };
+    assert_eq!(refused.as_deref(), Some("missing_capability:steer"));
+    let session = via_adapters::SessionRef {
+        harness: plan.harness.to_owned(),
+        route: plan.route.to_owned(),
+        adapter_version: plan.adapter_version.clone(),
+    };
+    let spec = via_adapters::SessionSpec {
+        session_id: via_store::SessionId::try_from("s_000000000001").unwrap(),
+        model: plan.model.resolved.clone(),
+        instructions: None,
+        initial_bound: None,
+        cwd: PathBuf::from("/work/project"),
+        vendor: via_adapters::VendorOptions::new(),
+        inherit: via_adapters::InheritPlan {
+            requested: plan.inherit.requested,
+            effective: plan.inherit.effective,
+        },
+        confirmed_vendor_session_id: None,
+        allow_untested: false,
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let launches = pure.launches().unwrap();
+    let steered = runtime.block_on(async {
+        let (observations, _receiver) = via_adapters::observation_channel();
+        let cx = via_adapters::SessionCx {
+            observations,
+            tracker: via_adapters::TaskTracker::new(),
+            cancel: via_adapters::CancellationToken::new(),
+        };
+        let driver = pure.set.open_session(&session, spec, cx);
+        driver
+            .steer(via_adapters::SteerInput {
+                turn: via_adapters::TurnNumber::try_from(1).unwrap(),
+                token: via_adapters::SteerToken::new(1),
+                text: "steer".to_owned(),
+                expected_vendor_turn: None,
+            })
+            .await
+    });
+    assert_eq!(steered, Err(via_adapters::SteerError::Unsupported));
+    assert_eq!(pure.launches().unwrap(), launches, "no vendor I/O");
+}
+
 /// F13 (packet §8 `codex_pin_handshake`): one initialize/initialized per
 /// connection, with neither an experimental capability nor an opt-out
 /// (every fixture's first step pins their absence); the version comes
@@ -1627,6 +1706,9 @@ fn codex_start_order() {
         )
         .unwrap();
         failed_after_acceptance(&mut expect, "protocol", "quiescent");
+        // Host stopped the failed server before the turn's lane ended: the
+        // turn's linked server anchor has its absence proof (x.3.2 X4 K0).
+        turn_mut(&mut expect, 0)["expect"]["group_absent"] = json!(true);
         // The failed generation's continuity is unproven: its retirement
         // folds `uncertain` (x.3.2 X3 §6.6, F3).
         expect["sessions"]["main"]["close"]["cleanup"] = json!("uncertain");
@@ -1649,6 +1731,9 @@ fn codex_start_order() {
         {"kind": "session.vendor_identity_confirmed", "vendor_session_id": THREAD,
             "generation": 1},
     ]);
+    // Host stopped the failed server before the start's record went: the
+    // turn's linked server anchor has its absence proof (x.3.2 X4 K0).
+    turn_mut(&mut expect, 0)["expect"]["group_absent"] = json!(true);
     // The failed generation's retirement folds `uncertain` (x.3.2 X3
     // §6.6, F3).
     expect["sessions"]["main"]["close"]["cleanup"] = json!("uncertain");
@@ -1664,6 +1749,9 @@ fn codex_start_order() {
     )
     .unwrap();
     unaccepted(&mut expect, "server_lost", tested());
+    // The server's group was proven absent before the start's record went
+    // (x.3.2 X4 K0: the turn's linked server anchor).
+    turn_mut(&mut expect, 0)["expect"]["group_absent"] = json!(true);
     // The generation's registration retires with no close (x.3.2 X3 §6.5,
     // F3): its continuity is unproven, so its fold is `uncertain`.
     expect["sessions"]["main"]["close"]["cleanup"] = json!("uncertain");
@@ -1780,6 +1868,8 @@ fn codex_start_order() {
     // A connection-wide failure keeps its Route path: the stopped server
     // proves the turn's cleanup.
     turn_mut(&mut expect, 0)["expect"]["cleanup"] = json!("quiescent");
+    // Its linked server anchor has that absence proof (x.3.2 X4 K0).
+    turn_mut(&mut expect, 0)["expect"]["group_absent"] = json!(true);
     expect["sessions"]["main"]["close"] = json!({
         "mode": "graceful", "vendor_closed": false, "cleanup": "uncertain",
     });
@@ -2931,6 +3021,19 @@ fn codex_exhaustion_fails_the_shared_connection() {
         // nothing. B's end is the connection's loss, whose evidence is
         // Host's stop of the server.
         turn["cleanup"] = json!(if index == 0 { "uncertain" } else { "quiescent" });
+        // No stop in this variant (c4's turn 0 states the stop's facts).
+        turn["stop_facts"] = Value::Null;
+        // B's end is the loss, after Host's stop: its linked server anchor
+        // has its absence proof (x.3.2 X4 K0). A ends at its overflow,
+        // while Host's stop may still run, so whether the proof was
+        // committed by then is not the turn's fact: it is left unstated.
+        if index == 0 {
+            if let Some(turn) = turn.as_object_mut() {
+                turn.remove("group_absent");
+            }
+        } else {
+            turn["group_absent"] = json!(true);
+        }
         if let Some(turn) = turn.as_object_mut() {
             turn.remove("cleanup_settles");
         }

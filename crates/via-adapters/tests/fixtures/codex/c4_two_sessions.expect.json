@@ -85,7 +85,11 @@
         "error": null,
         "cleanup": "uncertain",
         "cleanup_settles": "at_p7_bound",
-        "stop_facts": null,
+        "stop_facts": {
+          "acknowledged": true,
+          "forced": false,
+          "shared": false
+        },
         "instance": {
           "vendor_version": "0.159.2",
           "version_status": "tested"
