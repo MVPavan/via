@@ -3163,6 +3163,92 @@ fn codex_escaped_output_over_one_mib_is_delivered() {
     variant(name, &replay, &expect).unwrap();
 }
 
+/// Owner 2026-10-05 (review cfix-1 C): a line over the Codex route's
+/// 8 MiB cap does not fail the shared server. In `c4_two_sessions` B's
+/// first tool completion moves to after A's interrupt, while A's turn
+/// still runs, its output past the cap: Wire skips the line to its LF, the connection reads its
+/// closing `threadId`/`turnId` and drops it for B's turn, so B's lane
+/// overflows and only B's turn fails `overflow`; A's runs to its
+/// interrupt as recorded. Before, the line failed the connection, and
+/// both turns, `protocol`.
+#[test]
+fn codex_over_cap_line_fails_only_its_turn() {
+    let name = "codex_over_cap_line_fails_only_its_turn";
+    let mut replay = replay_of("c4_two_sessions").unwrap();
+    let mut expect = expect_of("c4_two_sessions").unwrap();
+    replay["source"] = json!(format!("{name}: a variant of c4_two_sessions"));
+    expect["source"] = replay["source"].clone();
+    let b_tool = "exec-019a0000-0000-7000-8000-000000400006";
+    let started = step_with(&replay, "exec-019a0000-0000-7000-8000-000000400007").unwrap();
+    let completed = (started + 1..steps(&mut replay).unwrap().len())
+        .find(|at| {
+            line_of(&replay, *at).is_ok_and(|line| {
+                line.contains(b_tool) && line.contains(r#""method":"item/completed""#)
+            })
+        })
+        .unwrap();
+    let output = "x".repeat(8 * 1024 * 1024 + 4096);
+    let line = line_of(&replay, completed).unwrap().replace(
+        r#""aggregatedOutput":null"#,
+        &format!(r#""aggregatedOutput":"{output}""#),
+    );
+    assert!(line.len() > 8 * 1024 * 1024, "{}", line.len());
+    let all = steps(&mut replay).unwrap();
+    all.remove(completed);
+    // After VIA's interrupt of A, which A's tool start prompts: the long
+    // write never races it.
+    all.insert(started + 2, json!({"emit": {"line": line}}));
+    // B's overflow interrupts B's vendor turn at once; the replay holds
+    // A's later traffic until it arrives.
+    all.insert(
+        started + 3,
+        json!({"expect": {"line": {"method": "turn/interrupt", "params": {
+            "threadId": "019a0000-0000-7000-8000-000000100002",
+            "turnId": "019a0000-0000-7000-8000-000000200002"}},
+            "capture": {"interrupt_b": "/id"}}}),
+    );
+    all.insert(
+        started + 4,
+        json!({"emit": {"line": "{\"id\":${interrupt_b},\"result\":{}}"}}),
+    );
+    for step in steps(&mut replay).unwrap() {
+        if let Some(after) = step["expect"]["after_emit"].as_u64() {
+            assert!(after <= started as u64 + 1, "{step}");
+        }
+    }
+    // B's failed generation was retired: nothing unsubscribes it.
+    let close_b = step_with(&replay, "${close_b}").unwrap();
+    steps(&mut replay).unwrap().drain(close_b - 1..=close_b);
+    let turn = &mut turn_mut(&mut expect, 1)["expect"];
+    turn["terminal"] = Value::Null;
+    turn["usage"] = Value::Null;
+    turn["final_text"] = Value::Null;
+    turn["error"] = json!("overflow");
+    turn["cleanup"] = json!("uncertain");
+    if let Some(turn) = turn.as_object_mut() {
+        turn.remove("group_absent");
+        turn.remove("cleanup_settles");
+    }
+    let include: Vec<Value> = turn["observations_include"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|kind| {
+            kind["kind"] == json!("session.vendor_identity_confirmed")
+                || kind["kind"] == json!("turn.accepted")
+        })
+        .cloned()
+        .collect();
+    turn["observations_include"] = json!(include);
+    turn["observations_exclude"] = json!(["final_text"]);
+    turn["observations_order"] = json!(["session.vendor_identity_confirmed", "turn.accepted"]);
+    turn["unasserted"] = json!([]);
+    // B is left failed, not closed, so its health shows the cause.
+    expect["sessions"]["b"]["close"] = Value::Null;
+    expect["sessions"]["b"]["health"] = json!({"state": "failed", "first_cause": "overflow"});
+    variant(name, &replay, &expect).unwrap();
+}
+
 /// X0 item 8.2 (x.3.2 X3 fix r4 #4): a close cuts the lane off in decode
 /// order. Turn 1's late decline is held at the idle seam as the session
 /// closes; the vendor keeps sending turn 1's denials after the cutoff:

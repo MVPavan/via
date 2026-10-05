@@ -693,6 +693,7 @@ async fn connection_bounds_set_its_cap_and_staging() -> TestResult {
     let bounds = InboundBounds {
         message_bytes: CAP,
         staging_bytes: 12 * 1024 * 1024,
+        skip_oversize: false,
     };
     let folder = Scratch::new("bounds")?;
     let (stdout, mut vendor) = tokio::io::duplex(64 * 1024);
@@ -735,6 +736,59 @@ async fn connection_bounds_set_its_cap_and_staging() -> TestResult {
         Some(FailureCause::Reader(WireFailure::MessageTooLarge))
     );
     drop(writer.await??);
+    end(messages, &input).await;
+    Ok(())
+}
+
+/// Owner 2026-10-05: with `skip_oversize`, a line over the cap is skipped
+/// to its LF and delivered as its record (length, first 64 KiB, last
+/// 4 KiB), and the stream stays in step: the next line is whole, and the
+/// connection does not fail. Lines over the cap arrive whole in one read
+/// and across many.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_over_cap_line_is_skipped_to_its_lf() -> TestResult {
+    const CAP: usize = 1024;
+    let bounds = InboundBounds {
+        message_bytes: CAP,
+        staging_bytes: 1024 * 1024,
+        skip_oversize: true,
+    };
+    let folder = Scratch::new("skip")?;
+    let (stdout, mut vendor) = tokio::io::duplex(64 * 1024);
+    let (stdin, _vendor_stdin) = tokio::io::duplex(1024);
+    let TestPipes {
+        mut messages,
+        input,
+    } = pipes_within(stdout, stdin, folder.0.clone(), bounds);
+    for size in [CAP + 1, 200 * 1024] {
+        let mut line: Vec<u8> = b"abcdefghijklmnopqrstuvwxyz"
+            .iter()
+            .copied()
+            .cycle()
+            .take(size - 1)
+            .collect();
+        line.push(b'\n');
+        let writer = {
+            let line = line.clone();
+            tokio::spawn(async move {
+                vendor.write_all(&line).await?;
+                vendor.write_all(b"after\n").await?;
+                Ok::<_, io::Error>(vendor)
+            })
+        };
+        let skipped = messages.next_message().await?.expect("the record");
+        let record = skipped.skipped().expect("skipped");
+        assert_eq!(record.length, size as u64);
+        assert_eq!(record.head, line[..size.min(64 * 1024)]);
+        assert_eq!(
+            skipped.bytes(),
+            &line[size.saturating_sub(via_wire::SKIPPED_TAIL_BYTES)..]
+        );
+        assert_eq!(drained_next(&mut messages).await, b"after\n");
+        assert_eq!(input.failure(), None);
+        vendor = writer.await??;
+    }
+    drop(vendor);
     end(messages, &input).await;
     Ok(())
 }

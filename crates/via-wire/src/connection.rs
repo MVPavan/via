@@ -343,6 +343,9 @@ struct Shared {
     staging: Arc<Staging>,
     /// The largest complete stdout message ([`InboundBounds`]).
     message_bytes: usize,
+    /// An over-cap line is skipped and delivered as its record
+    /// ([`InboundBounds::skip_oversize`]).
+    skip_oversize: bool,
     admission: StdMutex<Admission>,
     /// Stdout ended; set before the reader drops its queue sender.
     eof: AtomicBool,
@@ -1589,6 +1592,7 @@ where
         latch,
         staging: Arc::new(Staging::new(bounds.staging_bytes)),
         message_bytes: bounds.message_bytes,
+        skip_oversize: bounds.skip_oversize,
         admission: StdMutex::default(),
         eof: AtomicBool::new(false),
         unterminated: AtomicBool::new(false),
@@ -1693,9 +1697,15 @@ async fn read_stdout<R: AsyncRead + Unpin>(
         }
         // A refusal or an oversized message switches to discard mode
         // without counting this read: `discarded_bytes` is a lower bound.
-        match splitter.push(&buffer[..count], |message| {
-            enqueue(&shared, &queue, message)
-        }) {
+        let enqueue_message = |message| enqueue(&shared, &queue, message);
+        let pushed = if shared.skip_oversize {
+            splitter.push_skipping(&buffer[..count], enqueue_message, |skipped| {
+                enqueue_skipped(&shared, &queue, skipped)
+            })
+        } else {
+            splitter.push(&buffer[..count], enqueue_message)
+        };
+        match pushed {
             Pushed::Consumed => {}
             Pushed::Refused => discard = true,
             Pushed::TooLarge(prefix) => {
@@ -1762,6 +1772,42 @@ fn enqueue(shared: &Shared, queue: &mpsc::Sender<VendorMessage>, message: Vec<u8
     // `fail` seals, which takes this lock.
     drop(admission);
     shared.fail(FailureCause::Reader(cause));
+    false
+}
+
+/// Queues a skipped over-cap line's record (owner 2026-10-05): its tail as
+/// the message, its head and length beside it, charged to staging like a
+/// message of their bytes; a full queue or staging fails `Overflow`.
+fn enqueue_skipped(
+    shared: &Shared,
+    queue: &mpsc::Sender<VendorMessage>,
+    skipped: crate::split::Skipped,
+) -> bool {
+    let crate::split::Skipped { length, head, tail } = skipped;
+    let charge = head.len().saturating_add(tail.len());
+    let admission = shared
+        .admission
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if admission.sealed {
+        drop(admission);
+        return true;
+    }
+    let sent = StagingPermit::reserve(&shared.staging, charge).is_some_and(|permit| {
+        let line = crate::SkippedLine { length, head };
+        queue
+            .try_send(VendorMessage::skipped_line(
+                BoundedBytes(tail),
+                line,
+                permit,
+            ))
+            .is_ok()
+    });
+    if sent || queue.is_closed() {
+        return sent;
+    }
+    drop(admission);
+    shared.fail(FailureCause::Reader(WireFailure::Overflow));
     false
 }
 
@@ -2322,6 +2368,11 @@ pub mod testing {
         /// See `WireSender::failure`.
         pub fn failure(&self) -> Option<FailureCause> {
             self.io.failure()
+        }
+
+        /// See `WireSender::keep_undecoded`.
+        pub async fn keep_undecoded(&self, bytes: &[u8], what: &str) {
+            self.io.keep_undecoded(bytes, what).await;
         }
 
         /// See `WireSender::take_undecoded`.

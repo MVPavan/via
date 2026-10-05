@@ -732,6 +732,66 @@ async fn a_failed_connection_logs_its_server_and_evidence_path() {
     );
 }
 
+/// Owner 2026-10-05: a line over the cap whose tail closes with its
+/// `threadId` and `turnId` is dropped for that thread: its lane ends
+/// `Overflow`, the connection goes on, another registered thread's lane
+/// still takes its messages, and nothing is kept as server evidence.
+#[tokio::test]
+async fn an_over_cap_line_overflows_only_its_threads_lane() {
+    let mut vendor = Vendor::open(1 << 16);
+    let a = registered(&mut vendor, "a").await;
+    let b = registered(&mut vendor, "b").await;
+    let text = "x".repeat(INBOUND.message_bytes);
+    let line = json!({"method": "item/completed", "params": {
+        "item": {"type": "agentMessage", "id": "m", "text": text},
+        "threadId": "b", "turnId": "u", "completedAtMs": 1}, "emittedAtMs": 1});
+    vendor.emit(&line).await;
+    vendor.emit(&item_completed("a", "v", "after")).await;
+    vendor.settle().await;
+    assert_eq!(vendor.connection.failure(), None, "the server goes on");
+    assert_eq!(b.lane().ended(), Some(LaneEnd::Overflow));
+    assert_eq!(taken(a.lane()).len(), 1, "A's lane takes its message");
+    assert!(vendor.stdio.kept().is_empty(), "no server evidence");
+}
+
+/// Owner 2026-10-05: the closing correlation of a skipped line's tail is
+/// read only where it closes `params` and the envelope.
+#[test]
+fn trailing_ids_read_only_the_closing_members() {
+    use super::connection::trailing_ids;
+    let ids = |line: &str| trailing_ids(line.as_bytes());
+    let pair = Some(("t-1".to_owned(), "u_2".to_owned()));
+    assert_eq!(
+        ids(
+            "x\",\"threadId\":\"t-1\",\"turnId\":\"u_2\",\"completedAtMs\":17},\"emittedAtMs\":18}\n"
+        ),
+        pair
+    );
+    assert_eq!(
+        ids("x\"},\"threadId\":\"t-1\",\"turnId\":\"u_2\"}}\n"),
+        pair
+    );
+    // Not closing params and the envelope: nested, or not at the end.
+    assert_eq!(ids("{\"threadId\":\"t-1\",\"turnId\":\"u_2\"}}}\n"), None);
+    assert_eq!(
+        ids("\"threadId\":\"t-1\",\"turnId\":\"u_2\",\"x\":\"y\"}}\n"),
+        None
+    );
+    // Escaped inside a string, or an ID of other characters.
+    assert_eq!(ids("\\\"threadId\\\":\\\"t\\\",\"turnId\":\"u\"}}\n"), None);
+    assert_eq!(ids("x,\"threadId\":\"t 1\",\"turnId\":\"u\"}}\n"), None);
+    // A delta's text closes its params: no attribution.
+    assert_eq!(
+        ids("\"turnId\":\"u\",\"itemId\":\"m\",\"delta\":\"x\"}}\n"),
+        None
+    );
+    assert_eq!(
+        ids("x,\"threadId\":\"t\",\"turnId\":\"u\"}}"),
+        None,
+        "no LF"
+    );
+}
+
 /// Item 5 step 3: a well-formed message for an unknown thread and an
 /// untagged one fail nothing; they are counted.
 #[tokio::test]

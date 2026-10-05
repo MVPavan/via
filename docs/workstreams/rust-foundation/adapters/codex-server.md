@@ -919,7 +919,8 @@ Engine on the same State finds `vendor/codex` with the same identity, mode
    1. **Routing peek.** Parse only the correlation fields (`id`, `method`,
       `params.threadId`, `params.turnId`) against their typed schema.
    2. **Correlation fields fail their typed schema** (invalid UTF-8 or
-      JSON; Wire `MessageTooLarge` or `Unterminated`; a known method whose
+      JSON; Wire `MessageTooLarge` or `Unterminated`, or a skipped
+      over-cap line whose tail names no thread and turn, item 9.3; a known method whose
       required `threadId` or `turnId` is missing or not a string; a
       response `id` not an integer, or neither outstanding nor abandoned,
       item 9.1) → **unattributable**: first 64 KiB to the server's
@@ -1401,10 +1402,23 @@ failed the shared connection `protocol`, every session on it.
   term: 20 MiB. The normalizer moves a final answer's text into its
   pieces rather than copying it, so the pieces held under back-pressure
   stay within the same allowance (review cfix-1 #2).
-- **Over the cap.** A line over 8 MiB still fails the shared connection
-  `protocol` (item 5 step 2). Failing only its own turn would need the
-  thread ID, which Codex writes after the item, past the 64 KiB prefix
-  Wire keeps, so it needs a streaming correlation scan: not done.
+- **Over the cap (owner 2026-10-05, review cfix-1 C).** One overloaded
+  thread no longer ends every session on the server. The Codex
+  connection's bounds skip an over-cap line (`InboundBounds::
+  skip_oversize`): Wire reads it to its LF, keeping the stream in step,
+  and delivers a record of its length, first 64 KiB and last 4 KiB,
+  charged to staging. The connection reads the tail's closing
+  `"threadId":"…","turnId":"…"` (Codex writes them after `item` in
+  `item/started`, `item/completed` and `error`; anchored at the line's
+  end, so escaped text or a nested object cannot supply them) and drops
+  the line for that thread as a full lane drops a message: the lane ends
+  `Overflow` for the turn the `turnId` maps to, that turn fails
+  `overflow` with its `observations_lost` loss, and other sessions go on
+  (`codex_over_cap_line_fails_only_its_turn`). A thread with no open
+  registration drops it, as any message. A tail with no such close (a
+  delta, a response) is unattributable as before: its head is the
+  server's `undecoded.bin` and the connection fails `protocol` (item 5
+  step 2). Private routes keep failing the connection `MessageTooLarge`.
 - **Prompt cap unchanged.** The `prompt` limit (1,040,384 bytes with the
   cwd, C1 §4) was set against the 1 MiB cap. The 8 MiB cap now holds both
   echoes of a maximal prompt in one lane and the `thread/resume` reply's

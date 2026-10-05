@@ -220,15 +220,17 @@ impl Stdio for TestStdio {
         Box::pin(self.input.close_input(deadline))
     }
 
-    fn keep_undecoded<'a>(&'a self, bytes: &'a [u8], _what: &'a str) -> Boxed<'a, ()> {
+    /// Recorded, then kept by Wire's test input as a server's would be:
+    /// `undecoded.bin` in the scratch folder, and its note.
+    fn keep_undecoded<'a>(&'a self, bytes: &'a [u8], what: &'a str) -> Boxed<'a, ()> {
         self.kept
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(bytes.to_vec());
-        Box::pin(async {})
+        Box::pin(self.input.keep_undecoded(bytes, what))
     }
 
-    /// Wire's own note: the route's evidence stays in memory.
+    /// Wire's note on the kept message.
     fn take_undecoded(&self) -> Option<String> {
         self.input.take_undecoded()
     }
