@@ -64,6 +64,18 @@ impl Rig {
     /// new driver of the same session, as Core opens a failed one's
     /// successor.
     fn driver(&self) -> (Arc<SessionDriver>, tokio::sync::mpsc::Receiver<Admitted>) {
+        let (driver, observations, _cancel) = self.session();
+        (driver, observations)
+    }
+
+    /// [`Self::driver`], with the session's cancellation.
+    fn session(
+        &self,
+    ) -> (
+        Arc<SessionDriver>,
+        tokio::sync::mpsc::Receiver<Admitted>,
+        CancellationToken,
+    ) {
         let spec = SessionSpec {
             session_id: SessionId::try_from("s_000000000001").unwrap(),
             model: MODEL.to_owned(),
@@ -84,14 +96,16 @@ impl Rig {
             adapter_version: super::ADAPTER_VERSION.to_owned(),
         };
         let (observations, receiver) = observation_channel();
+        let cancel = CancellationToken::new();
         let cx = SessionCx {
             observations,
             tracker: TaskTracker::new(),
-            cancel: CancellationToken::new(),
+            cancel: cancel.clone(),
         };
         (
             Arc::new(self.set.open_session(&session, spec, cx)),
             receiver,
+            cancel,
         )
     }
 }
@@ -387,6 +401,12 @@ struct Turn1 {
     /// When the turn started: its wall is measured from here.
     started: Instant,
     driver: Arc<SessionDriver>,
+    /// The session's cancellation.
+    #[cfg_attr(
+        not(feature = "test-failpoints"),
+        expect(dead_code, reason = "only the held-wait cases cancel the session")
+    )]
+    cancel: CancellationToken,
     _observations: JoinHandle<()>,
 }
 
@@ -395,7 +415,7 @@ struct Turn1 {
 /// [`EXEC`] started.
 async fn accepted(rig: &Rig, timing: (Duration, Duration), tool: bool) -> Turn1 {
     let mut vendor = rig.script();
-    let (driver, observations) = rig.driver();
+    let (driver, observations, cancel) = rig.session();
     let observations = drained(observations);
     let started = Instant::now();
     let running = run_timed(&driver, (1, driver.prepare()), timing);
@@ -416,6 +436,7 @@ async fn accepted(rig: &Rig, timing: (Duration, Duration), tool: bool) -> Turn1 
         running,
         started,
         driver,
+        cancel,
         _observations: observations,
     }
 }
@@ -927,6 +948,145 @@ async fn wall_terminal_after_the_cleanup_bound_is_late() {
 #[tokio::test(start_paused = true)]
 async fn wall_terminal_at_the_cleanup_bound_is_kept() {
     wall_cutoff_case(Duration::from_secs(3), true).await;
+}
+
+/// The cause of a route failure.
+#[cfg(feature = "test-failpoints")]
+fn failure_cause(end: &TurnEnd) -> &RouteError {
+    match &end.outcome {
+        Err(AdapterError::Route(failure)) => &failure.cause,
+        other => panic!("not a route failure: {other:?}"),
+    }
+}
+
+/// How the turn's stop is ordered in an order-cutoff case.
+#[cfg(feature = "test-failpoints")]
+#[derive(Clone, Copy)]
+enum Ordered {
+    /// Core's cancel order.
+    Cancel,
+    /// The driver's own close (its relay order, dated inside its send).
+    Close,
+    /// The session's cancellation, with no order: its ending is due
+    /// `CLEANUP_ALLOWANCE` after the wait notices it.
+    Session,
+}
+
+/// X4 code review r1 concern 1 (C2 §4.1 "Two deadlines"): an order's
+/// `close_by` bounds the wait for the terminal, judged on decode
+/// instants. With the turn's wait held, the stop is ordered at `t`,
+/// closing by `t + 3 s`, and the interrupted terminal (no tool open) is
+/// decoded at `t + decoded`; the wait resumes at `t + 6 s`.
+#[cfg(feature = "test-failpoints")]
+async fn order_cutoff_case(ordered: Ordered, decoded: Duration) -> TurnEnd {
+    let held = HeldWait::arm();
+    let rig = Rig::new();
+    let mut turn = accepted(&rig, FAR, false).await;
+    held.reached().await;
+    let t = Instant::now();
+    let close_by = t + Duration::from_secs(3);
+    let _close = match ordered {
+        Ordered::Cancel => {
+            let cancel = order(crate::StopCause::Cancel, close_by);
+            turn.running.stop.send_replace(Some(cancel));
+            None
+        }
+        Ordered::Close => Some(tokio::spawn(
+            turn.driver
+                .close(crate::CloseMode::Graceful, Deadline::at(close_by)),
+        )),
+        Ordered::Session => {
+            turn.cancel.cancel();
+            None
+        }
+    };
+    tokio::time::sleep_until(t + decoded).await;
+    match ordered {
+        Ordered::Cancel => {
+            turn.decode_interrupted().await;
+        }
+        // The close detached the session at its deadline, and the
+        // session's cancellation ended its consumer: the terminal is read
+        // by no turn, and no stop report is left to show it.
+        Ordered::Close | Ordered::Session => turn.vendor.emit(&terminal("interrupted")).await,
+    }
+    tokio::time::sleep_until(t + Duration::from_secs(6)).await;
+    held.release();
+    turn.end().await.0
+}
+
+/// Concern 1: a terminal decoded at `t + 5 s`, after Core's cancel order's
+/// `close_by`, is late only: the end an undelayed wait's cut at `close_by`
+/// gives (`Stopped`, no terminal, unacknowledged, cleanup unproven).
+#[cfg(feature = "test-failpoints")]
+#[tokio::test(start_paused = true)]
+async fn order_terminal_after_close_by_is_late() {
+    let end = order_cutoff_case(Ordered::Cancel, Duration::from_secs(5)).await;
+    assert!(
+        matches!(failure_cause(&end), RouteError::Stopped { .. }),
+        "{:?}",
+        end.outcome
+    );
+    assert!(end.terminal.is_none(), "late only");
+    assert_eq!(failure_cleanup(&end), None, "cleanup unproven");
+}
+
+/// Concern 1: a terminal decoded at `t + 2 s`, within the cancel order's
+/// `close_by`, is kept, however late the wait resumes.
+#[cfg(feature = "test-failpoints")]
+#[tokio::test(start_paused = true)]
+async fn order_terminal_before_close_by_is_kept() {
+    let end = order_cutoff_case(Ordered::Cancel, Duration::from_secs(2)).await;
+    assert_eq!(
+        kept(&end),
+        (
+            Some(crate::VendorTerminalStatus::Interrupted),
+            Some(crate::Cleanup::Quiescent)
+        )
+    );
+}
+
+/// Concern 1: a terminal decoded at the cancel order's `close_by` itself
+/// is within it (as at the wall's cleanup bound): kept.
+#[cfg(feature = "test-failpoints")]
+#[tokio::test(start_paused = true)]
+async fn order_terminal_at_close_by_is_kept() {
+    let end = order_cutoff_case(Ordered::Cancel, Duration::from_secs(3)).await;
+    assert_eq!(kept(&end).0, Some(crate::VendorTerminalStatus::Interrupted));
+}
+
+/// Concern 1: the driver's own close relays an order dated inside its
+/// send (`attached`), closing by the close's deadline, where it also
+/// detaches the session; a terminal decoded after that is late only, as
+/// under Core's order.
+#[cfg(feature = "test-failpoints")]
+#[tokio::test(start_paused = true)]
+async fn close_relay_terminal_after_close_by_is_late() {
+    let end = order_cutoff_case(Ordered::Close, Duration::from_secs(5)).await;
+    assert!(
+        matches!(failure_cause(&end), RouteError::Stopped { .. }),
+        "{:?}",
+        end.outcome
+    );
+    assert!(end.terminal.is_none(), "late only");
+}
+
+/// Concern 1 (the `soon()` ending): the session's cancellation at `t`,
+/// with no order, while the wait is held. Its ending, `CLEANUP_ALLOWANCE`
+/// after the wait notices it, never admits a terminal decoded after the
+/// cancellation: the cancellation ends the registration's consumer, so a
+/// terminal decoded at `t + 5 s` is read by no turn, and the held wait
+/// resumes to `Stopped` with no terminal.
+#[cfg(feature = "test-failpoints")]
+#[tokio::test(start_paused = true)]
+async fn session_cancel_admits_no_later_terminal() {
+    let end = order_cutoff_case(Ordered::Session, Duration::from_secs(5)).await;
+    assert!(
+        matches!(failure_cause(&end), RouteError::Stopped { .. }),
+        "{:?}",
+        end.outcome
+    );
+    assert!(end.terminal.is_none(), "late only");
 }
 
 /// The orders of a turn whose wall is `wall`, and their senders.

@@ -20,7 +20,8 @@
 //!
 //! A stop order posts the turn's one interrupt intent, owned by the
 //! connection (before acceptance it waits on the start's reply). With no
-//! terminal by the order's `close_by` the turn ends there (`uncertain`).
+//! terminal by the order's `close_by` the turn ends there (`uncertain`);
+//! one decoded after it is late only.
 //! An interrupted terminal acknowledges the stop (the turn's `StopAck`);
 //! with a tool still open the turn drains (C1 §3.5 P7): it stays pending
 //! until its tools end, `tool_grace` after the terminal's original decode,
@@ -28,8 +29,9 @@
 //! result follows the earliest positively attested stop it recorded (an
 //! order at its `attached`, or the wall once passed), so a wall that came
 //! first gives `Deadline` with the terminal kept, unless decoded after
-//! the wall's cleanup bound (late only). Both cutoffs are judged on decode
-//! instants, however late the turn's own wait runs. Steer is not
+//! the wall's cleanup bound (late only). Every cutoff (the order's
+//! `close_by`, the wall's cleanup bound and the P7 window) is judged on
+//! decode instants, however late the turn's own wait runs. Steer is not
 //! supported.
 
 use std::os::unix::fs::DirBuilderExt;
@@ -696,6 +698,23 @@ impl Orders {
         {
             self.first = Some(candidate);
         }
+    }
+
+    /// X4 code review r1 concern 1 (C2 §4.1 "Two deadlines"): the instant
+    /// an undelayed wait's order cut falls, the `close_by` of the earliest
+    /// attached visible order (Core's stop, or the driver's close relay);
+    /// `None` with no order.
+    fn order_cut(&self) -> Option<Instant> {
+        let cut = |order: &Option<StopOrder>| {
+            order
+                .as_ref()
+                .map(|order| (order.attached, order.close_by.instant()))
+        };
+        [cut(&self.stop.borrow()), cut(&self.close.borrow())]
+            .into_iter()
+            .flatten()
+            .min()
+            .map(|(_, close_by)| close_by)
     }
 
     /// The recorded provenance's cause; `Stopped` while none is recorded.
@@ -2491,8 +2510,9 @@ async fn wait(
 /// decoded at or after it wins too under an order attached before the
 /// wall (the order's row); under the wall it is kept beside the wall's
 /// `Deadline`, acknowledged when interrupted within the wall's cleanup
-/// bound. The P7 window's end (`Grace`) or a detach keeps the terminal
-/// with its cleanup uncertain.
+/// bound. A terminal decoded after the order's `close_by` is late only.
+/// The P7 window's end (`Grace`) or a detach keeps the terminal with its
+/// cleanup uncertain.
 fn settle_turn(
     facts: &Turn<'_>,
     (start, accepted): (&Started<'_>, &Accepted<'_>),
@@ -2551,6 +2571,12 @@ fn settle_turn(
         let tools_open = sealed.tools_open || overflowed || drained_late;
         if decoded_at >= wall && orders.provenance() == EndCause::Wall {
             return wall_end(facts, retained, decoded_at, (wall, tools_open));
+        }
+        // X4 code review r1 concern 1: a terminal decoded after the
+        // order's `close_by` is late only, whenever this wait ran: the
+        // end an undelayed cut at `close_by` gives.
+        if orders.order_cut().is_some_and(|cut| decoded_at > cut) {
+            return uncertain(RouteError::Stopped { turn });
         }
         return terminal_end(facts, retained, tools_open);
     }
