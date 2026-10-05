@@ -86,6 +86,11 @@ fn started(
         correlation: Arc::new(OnceLock::new()),
         credit,
         stop_ack,
+        // No order, wall or grace ends anything here.
+        cutoffs: crate::codex::driver::Cutoffs::unbounded(
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::from_secs(3600),
+        ),
     };
     assert!(lane.push_start(turn(number), activity.decode_watermark(), Box::new(cx)));
     Started {

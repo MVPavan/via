@@ -982,7 +982,12 @@ async fn wall_cutoff_case(decoded: Duration, within: bool) {
     let mut turn = accepted(&rig, (wall, Duration::from_secs(60)), false).await;
     held.reached().await;
     tokio::time::sleep_until(turn.started + wall + decoded).await;
-    turn.decode_interrupted().await;
+    if within {
+        turn.decode_interrupted().await;
+    } else {
+        // X4 critical review #3: late, it acknowledges nothing.
+        turn.vendor.emit(&terminal("interrupted")).await;
+    }
     tokio::time::sleep_until(turn.started + wall + Duration::from_secs(5)).await;
     held.release();
     let late = Arc::clone(&turn.late);
@@ -1073,13 +1078,16 @@ async fn order_cutoff_case(ordered: Ordered, decoded: Duration) -> (TurnEnd, Lat
     };
     tokio::time::sleep_until(t + decoded).await;
     match ordered {
-        Ordered::Cancel => {
+        Ordered::Cancel if decoded <= Duration::from_secs(3) => {
             turn.decode_interrupted().await;
         }
+        // X4 critical review #3: past `close_by`, it acknowledges nothing.
         // The close detached the session at its deadline, and the
         // session's cancellation ended its consumer: the terminal is read
         // by no turn, and no stop report is left to show it.
-        Ordered::Close | Ordered::Session => turn.vendor.emit(&terminal("interrupted")).await,
+        Ordered::Cancel | Ordered::Close | Ordered::Session => {
+            turn.vendor.emit(&terminal("interrupted")).await;
+        }
     }
     tokio::time::sleep_until(t + Duration::from_secs(6)).await;
     held.release();
@@ -1300,7 +1308,7 @@ async fn the_force_stands_over_a_late_terminal() {
     let cancel = order(crate::StopCause::Cancel, t + Duration::from_secs(3));
     turn.running.stop.send_replace(Some(cancel));
     tokio::time::sleep_until(t + Duration::from_secs(5)).await;
-    turn.decode_interrupted().await;
+    turn.vendor.emit(&terminal("interrupted")).await;
     tokio::time::sleep_until(t + Duration::from_secs(6)).await;
     turn.running.force.send_replace(Some(Instant::now()));
     held.release();
@@ -1310,6 +1318,105 @@ async fn the_force_stands_over_a_late_terminal() {
         "{:?}",
         end.outcome
     );
+}
+
+/// X4 critical review #1: the seal races the consumer's take. Core's
+/// cancel closes by `t + 3 s`; the interrupted terminal, decoded at `t +
+/// 1 s`, is held at the consumer's take (`adapter.codex.consumer_take`)
+/// while the turn's cut seals it at `t + 3 s` with no terminal. Released,
+/// the take is refused and the turn closes, by the one closure path: the
+/// terminal reaches Core as the turn's late terminal.
+#[cfg(feature = "test-failpoints")]
+#[tokio::test(start_paused = true)]
+async fn a_seal_racing_the_take_keeps_the_late_terminal() {
+    let held = HeldWait::arm_at("adapter.codex.consumer_take");
+    let rig = Rig::new();
+    let mut turn = accepted(&rig, FAR, false).await;
+    let t = Instant::now();
+    turn.cancel(Duration::from_secs(3)).await;
+    tokio::time::sleep_until(t + Duration::from_secs(1)).await;
+    turn.vendor.emit(&terminal("interrupted")).await;
+    held.reached().await;
+    let late = Arc::clone(&turn.late);
+    let (end, at, _kept) = turn.end().await;
+    assert_eq!(at, t + Duration::from_secs(3));
+    assert!(end.terminal.is_none(), "sealed before the take");
+    held.release();
+    assert_eq!(
+        late_reported(&late).await,
+        [crate::VendorTerminalStatus::Interrupted]
+    );
+}
+
+/// X4 critical review #2 (rev 9 I3; Codex packet "detach before proof"):
+/// the driver's close is the first order, at `T0`, with a tool open; the
+/// interrupted terminal is decoded at `T1` and the wait detaches, its
+/// settlement held at `adapter.codex.cut`; the tool's completion is
+/// decoded at `T2`, after the detach. It proves nothing: `Uncertain`.
+#[cfg(feature = "test-failpoints")]
+#[tokio::test(start_paused = true)]
+async fn a_tool_ending_after_the_detach_proves_nothing() {
+    let held = HeldWait::arm_at("adapter.codex.cut");
+    let rig = Rig::new();
+    let mut turn = accepted(&rig, FAR, true).await;
+    let t0 = Instant::now();
+    let _close = tokio::spawn(turn.driver.close(
+        crate::CloseMode::Graceful,
+        Deadline::at(t0 + Duration::from_secs(30)),
+    ));
+    turn.interrupt_answered().await;
+    tokio::time::sleep_until(t0 + Duration::from_secs(1)).await;
+    turn.decode_interrupted().await;
+    held.reached().await;
+    tokio::time::sleep_until(t0 + Duration::from_secs(2)).await;
+    turn.vendor.emit(&tool_completed(EXEC)).await;
+    tokio::time::sleep_until(t0 + Duration::from_secs(3)).await;
+    held.release();
+    let (end, _at, _kept) = turn.end().await;
+    assert_eq!(
+        kept(&end),
+        (
+            Some(crate::VendorTerminalStatus::Interrupted),
+            Some(crate::Cleanup::Uncertain)
+        )
+    );
+}
+
+/// X4 critical review #3 (C2 §4.1 "Two deadlines"): Core's cancel closes
+/// by `t + 3 s` and the turn's wait is held; the interrupted terminal
+/// decoded at `t + 5 s` is late only: it never reports the stop
+/// acknowledged (the report Core shows as `acknowledged`), and it reaches
+/// Core as the turn's late terminal before settlement resumes.
+#[cfg(feature = "test-failpoints")]
+#[tokio::test(start_paused = true)]
+async fn a_late_terminal_acknowledges_nothing() {
+    let held = HeldWait::arm();
+    let rig = Rig::new();
+    let mut turn = accepted(&rig, FAR, false).await;
+    held.reached().await;
+    let t = Instant::now();
+    let cancel = order(crate::StopCause::Cancel, t + Duration::from_secs(3));
+    turn.running.stop.send_replace(Some(cancel));
+    tokio::time::sleep_until(t + Duration::from_secs(5)).await;
+    turn.vendor.emit(&terminal("interrupted")).await;
+    tokio::time::sleep_until(t + Duration::from_secs(6)).await;
+    assert!(
+        !*turn.running.acknowledged.borrow(),
+        "a late terminal acknowledges no stop"
+    );
+    assert_eq!(
+        late_reported(&turn.late).await,
+        [crate::VendorTerminalStatus::Interrupted],
+        "late evidence, before settlement"
+    );
+    held.release();
+    let (end, _at, _kept) = turn.end().await;
+    assert!(
+        matches!(failure_cause(&end), RouteError::Stopped { .. }),
+        "{:?}",
+        end.outcome
+    );
+    assert!(end.terminal.is_none());
 }
 
 /// The orders of a turn whose wall is `wall`, and their senders.

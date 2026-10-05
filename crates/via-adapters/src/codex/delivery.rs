@@ -46,6 +46,7 @@ use via_routes::codex::{
     TurnFolder, decode,
 };
 
+use super::driver::Cutoffs;
 use super::normalize::{
     self, Ledger, Metadata, NormalizeError, Step, StructuredOutput, TurnNormalizer, ledger,
     ledger_on,
@@ -191,14 +192,8 @@ pub(crate) struct Sealed {
     /// The retained terminal's original decode instant (x.3.2 X4 D4.1),
     /// not its observation time.
     pub(crate) decoded_at: Option<Instant>,
-    /// The decode instant of the message that ended a draining
-    /// terminal's tools (X4 code review r1 #1): settlement judges it
-    /// against the P7 window, whenever the driver ran.
-    pub(crate) drained_at: Option<Instant>,
-    /// X4 code review r2 #2: the retained terminal was decoded past the
-    /// turn's cut: it is not the turn's, and goes out as its late
-    /// terminal once the consumer closes the turn.
-    pub(crate) late: bool,
+    /// A tool was open, or the P7 window had not closed (X4 critical
+    /// review: no tool ending decoded in it ended the tools).
     pub(crate) tools_open: bool,
     pub(crate) stop: Option<Stop>,
 }
@@ -215,11 +210,6 @@ struct Seal {
     /// x.3.2 X4 D4.1: the terminal is an interrupted one retained with a
     /// tool open; the turn's P7 window is open until the tools end.
     draining: bool,
-    /// The decode instant of the message that ended the draining
-    /// terminal's tools.
-    drained_at: Option<Instant>,
-    /// A terminal the seal judged late: the turn's late terminal.
-    late: Option<Retained>,
     tools_open: bool,
     stop: Option<Stop>,
 }
@@ -255,8 +245,6 @@ impl Delivery {
                 terminal: None,
                 decoded_at: None,
                 draining: false,
-                drained_at: None,
-                late: None,
                 tools_open: false,
                 stop: None,
             }),
@@ -317,15 +305,17 @@ impl Delivery {
     /// Publishes the turn's terminal into the retained slot unless
     /// sealed, with its original decode instant; it completes its message.
     /// A `draining` one opens the turn's P7 window (x.3.2 X4 D4.1).
+    /// Sealed, the terminal is given back.
+    #[must_use]
     fn retain(
         &self,
         retained: Retained,
         (tools_open, draining): (bool, bool),
         decoded_at: Instant,
-    ) -> bool {
+    ) -> Option<Retained> {
         let mut seal = self.lock();
         if seal.sealed.is_some() {
-            return false;
+            return Some(retained);
         }
         seal.terminal = Some(retained);
         seal.decoded_at = Some(decoded_at);
@@ -334,19 +324,17 @@ impl Delivery {
         seal.tools_open = tools_open;
         drop(seal);
         self.changed.notify_one();
-        true
+        None
     }
 
-    /// x.3.2 X4 D4.1: the draining turn's tools all ended, by the message
-    /// decoded at `decoded_at`; its P7 window closes and the retained
-    /// terminal decides.
-    fn drained(&self, decoded_at: Instant) {
+    /// x.3.2 X4 D4.1: the draining turn's tools all ended within its P7
+    /// window; the window closes and the retained terminal decides.
+    fn drained(&self) {
         let mut seal = self.lock();
         if !seal.draining {
             return;
         }
         seal.draining = false;
-        seal.drained_at = Some(decoded_at);
         drop(seal);
         self.changed.notify_one();
     }
@@ -357,11 +345,6 @@ impl Delivery {
         let seal = self.lock();
         seal.decoded_at
             .filter(|_| seal.draining && seal.sealed.is_none())
-    }
-
-    /// The terminal the seal judged late, once.
-    fn take_late(&self) -> Option<Retained> {
-        self.lock().late.take()
     }
 
     /// Records why delivery stopped, unless sealed.
@@ -412,32 +395,16 @@ impl Delivery {
     /// Seals delivery: nothing more goes out. The position is fixed by
     /// the first call; the slots are taken once.
     pub(crate) fn seal(&self) -> Sealed {
-        self.seal_cut(|_| false)
-    }
-
-    /// [`Self::seal`], judging a retained terminal by its decode instant
-    /// (X4 code review r2 #2): one `late` decides is kept for the
-    /// consumer, which sends it as the turn's late terminal once it closes
-    /// the turn, in its own order ([`Self::take_late`]).
-    pub(crate) fn seal_cut(&self, late: impl FnOnce(Instant) -> bool) -> Sealed {
         seal_seam();
         let mut seal = self.lock();
         let next = seal.next();
         let position = *seal.sealed.get_or_insert(next);
-        let mut terminal = seal.terminal.take();
-        if let (Some(_), Some(decoded_at)) = (&terminal, seal.decoded_at)
-            && late(decoded_at)
-        {
-            seal.late = terminal.take();
-        }
         let sealed = Sealed {
             position,
             partial: !seal.complete,
-            late: seal.late.is_some(),
-            terminal,
+            terminal: seal.terminal.take(),
             decoded_at: seal.decoded_at,
-            drained_at: seal.drained_at,
-            tools_open: seal.tools_open,
+            tools_open: seal.tools_open || seal.draining,
             stop: seal.stop.take(),
         };
         drop(seal);
@@ -531,6 +498,9 @@ pub(crate) struct StartCx {
     /// The turn's stop report (x.3.2 X4 D7): written once its interrupted
     /// terminal is retained.
     pub(crate) stop_ack: StopAck,
+    /// What the consumer judges the turn's cleanup evidence by, at its
+    /// decode (X4 critical review).
+    pub(crate) cutoffs: Cutoffs,
 }
 
 /// How the consumer ended (x.3.2 X3 §5.4); the first outcome stays.
@@ -893,6 +863,8 @@ struct Held {
     normalizer: Option<TurnNormalizer>,
     /// The position last published under its fence.
     reported: u64,
+    /// Its terminal went out as its late terminal (X4 critical review).
+    late_sent: bool,
 }
 
 /// A retained item's binding at its turn's acceptance (x.3.2 X3 §3.2, r11
@@ -957,10 +929,10 @@ pub(crate) struct Normalizing {
     /// one for its ledger wait and all of its sink waits.
     stall_by: Instant,
     /// X4 code review r2 #2 (C2 §4 `turn.late_terminal`): the accepted
-    /// turns that sealed with no terminal and have sent no late one: only
-    /// these send their terminal, once. Bounded indirectly: each entry is
-    /// an accepted turn's retained mapping, of at most
-    /// `CORRELATION_ENTRIES` (1,024) per connection.
+    /// turns that closed with no terminal and have sent no late one: only
+    /// these send their terminal, once ([`Self::close`]). Bounded
+    /// indirectly: each entry is an accepted turn's retained mapping, of
+    /// at most `CORRELATION_ENTRIES` (1,024) per connection.
     bare: Vec<TurnNumber>,
 }
 
@@ -1010,7 +982,7 @@ impl Normalizing {
                     self.overflow();
                     return self.dispose_failed();
                 }
-                Wake::Sealed => self.close_sealed().await,
+                Wake::Sealed => self.close(),
                 Wake::Lane(LaneEvent::Item(item, charge)) => self.item(*item, charge).await,
                 Wake::Lane(LaneEvent::End(end)) => return self.end(end),
             }
@@ -1131,6 +1103,7 @@ impl Normalizing {
             accepted: None,
             normalizer: None,
             reported: 0,
+            late_sent: false,
         });
         self.gap = None;
         self.disposed = 0;
@@ -1350,45 +1323,19 @@ impl Normalizing {
         }
     }
 
-    /// The held turn sealed: it closes, then a terminal its seal judged
-    /// late goes out as its late terminal (X4 code review r2 #2; C2 §4.1
-    /// "Late observations"), attributed to its vendor turn, at now, after
-    /// everything the consumer sent before.
-    async fn close_sealed(&mut self) {
-        let late = self.held.as_ref().and_then(|held| {
-            let retained = held.cx.delivery.take_late()?;
-            Some((held.accepted.clone().unwrap_or_default(), retained))
-        });
-        if let Some(held) = self.held.as_ref()
-            && late.is_none()
-            && held.phase == Phase::Running
-        {
-            self.bare.push(held.turn);
-        }
-        self.close();
-        if let Some((turn, retained)) = late {
-            let Retained {
-                mut terminal,
-                structured,
-            } = retained;
-            (
-                terminal.structured_output,
-                terminal.structured_output_unparsed,
-            ) = super::driver::carried(structured);
-            let idle = Arc::clone(&self.registration.idle);
-            let late = Observation::LateTerminal(terminal);
-            self.output(&idle, &turn, late, (None, Instant::now()))
-                .await;
-        }
-    }
-
-    /// The held turn sealed (or closes): a pending turn is never mapped,
-    /// so its retained items are loss; a running one's normalizer and
-    /// vendor ID go, and its credit goes to the ledger's ranges (§3.3).
+    /// The held turn sealed (or closes), however the seal was met: a
+    /// pending turn is never mapped, so its retained items are loss; a
+    /// running one's normalizer and vendor ID go, and its credit goes to
+    /// the ledger's ranges (§3.3). One that took no terminal and sent no
+    /// late one is `bare`: its terminal, if it comes, is its late terminal
+    /// (X4 critical review).
     fn close(&mut self) {
         let Some(held) = self.held.take() else {
             return;
         };
+        if held.phase == Phase::Running && !held.late_sent {
+            self.bare.push(held.turn);
+        }
         if held.phase == Phase::Pending && !self.early.is_empty() {
             self.lose_early(held.turn);
         }
@@ -1676,17 +1623,26 @@ impl Normalizing {
 
     /// x.3.2 X4 D4.1: a draining turn whose tools all ended in the ledger,
     /// by the message decoded at `decoded_at`, leaves its P7 window: its
-    /// terminal decides, and it is `Retained`.
+    /// terminal decides, and it is `Retained`. A message decoded at or
+    /// after the window's end proves nothing (X4 critical review;
+    /// [`Cutoffs::drains`]).
     fn quiesced(&mut self, decoded_at: Instant) {
-        let draining = self
-            .held
-            .as_ref()
-            .is_some_and(|held| held.phase == Phase::Draining);
-        if !draining || self.tools_open() {
+        let draining = self.held.as_ref().and_then(|held| {
+            held.cx
+                .delivery
+                .draining()
+                .filter(|_| held.phase == Phase::Draining)
+        });
+        let Some(terminal) = draining else {
+            return;
+        };
+        if self.tools_open() {
             return;
         }
-        if let Some(held) = self.held.as_mut() {
-            held.cx.delivery.drained(decoded_at);
+        if let Some(held) = self.held.as_mut()
+            && held.cx.cutoffs.drains(terminal, decoded_at)
+        {
+            held.cx.delivery.drained();
             held.phase = Phase::Retained;
         }
     }
@@ -1876,7 +1832,9 @@ impl Normalizing {
         // later one, live or from the early tail, is handled whole with
         // nothing emitted or retained, whatever the normalizer would make
         // of it.
-        if held.phase == Phase::Draining && matches!(notification, Notification::TurnCompleted(_)) {
+        if (held.phase == Phase::Draining || held.late_sent)
+            && matches!(notification, Notification::TurnCompleted(_))
+        {
             delivery.complete(self.tools_open());
             return;
         }
@@ -1931,22 +1889,59 @@ impl Normalizing {
                     terminal: *terminal,
                     structured,
                 };
-                if delivery.retain(retained, (tools_open, draining), decoded_at)
-                    && let Some(held) = self.held.as_mut()
-                {
-                    held.phase = if draining {
-                        Phase::Draining
-                    } else {
-                        Phase::Retained
-                    };
-                    // D7: vendor evidence acknowledged the stop; reported
-                    // outside the Delivery lock.
-                    if interrupted {
-                        held.cx.stop_ack.acknowledged();
+                // X4 critical review (C2 §4.1): one decoded after the
+                // turn's cut, or met by its seal, is late only: never
+                // retained, acknowledging nothing.
+                let late = self
+                    .held
+                    .as_ref()
+                    .is_some_and(|held| held.cx.cutoffs.late(decoded_at));
+                let refused = if late {
+                    delivery.complete(tools_open);
+                    Some(retained)
+                } else {
+                    delivery.retain(retained, (tools_open, draining), decoded_at)
+                };
+                match refused {
+                    None => {
+                        if let Some(held) = self.held.as_mut() {
+                            held.phase = if draining {
+                                Phase::Draining
+                            } else {
+                                Phase::Retained
+                            };
+                            // D7: vendor evidence acknowledged the stop;
+                            // reported outside the Delivery lock.
+                            if interrupted {
+                                held.cx.stop_ack.acknowledged();
+                            }
+                        }
                     }
+                    Some(retained) => self.late_terminal(&accepted, retained, at).await,
                 }
             }
         }
+    }
+
+    /// The held turn's terminal, judged late, goes out once as its late
+    /// terminal (C2 §4.1 "Late observations"), attributed to its vendor
+    /// turn `turn`, under the registration's seal: the turn's own may
+    /// already be sealed.
+    async fn late_terminal(&mut self, turn: &str, retained: Retained, at: Instant) {
+        if let Some(held) = self.held.as_mut() {
+            held.late_sent = true;
+        }
+        let Retained {
+            mut terminal,
+            structured,
+        } = retained;
+        (
+            terminal.structured_output,
+            terminal.structured_output_unparsed,
+        ) = super::driver::carried(structured);
+        let idle = Arc::clone(&self.registration.idle);
+        let late = Observation::LateTerminal(terminal);
+        self.output(&idle, turn, late, (None, at)).await;
     }
 
     /// An earlier turn's notification (x.3.2 X3 fix r2 #3, r4 #2): a
@@ -2306,7 +2301,11 @@ mod tests {
     fn retained_terminal_before_the_seal_only() {
         let delivery = Delivery::new(0);
         assert!(delivery.take(1));
-        assert!(delivery.retain(terminal(), (true, false), tokio::time::Instant::now()));
+        assert!(
+            delivery
+                .retain(terminal(), (true, false), tokio::time::Instant::now())
+                .is_none()
+        );
         assert!(delivery.decided());
         let sealed = delivery.seal();
         assert!(sealed.terminal.is_some());
@@ -2317,7 +2316,10 @@ mod tests {
         assert!(late.take(1));
         let sealed = late.seal();
         assert!(sealed.terminal.is_none());
-        assert!(!late.retain(terminal(), (false, false), tokio::time::Instant::now()));
+        assert!(
+            late.retain(terminal(), (false, false), tokio::time::Instant::now())
+                .is_some()
+        );
         assert!(!late.decided());
         assert!(late.seal().terminal.is_none());
     }

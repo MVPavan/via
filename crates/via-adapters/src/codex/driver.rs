@@ -32,8 +32,9 @@
 //! first gives `Deadline` with the terminal kept, unless decoded after
 //! the wall's cleanup bound (late only). Every cutoff (the earliest
 //! `close_by` of the orders, the wall's cleanup bound and the P7 window)
-//! is judged on attached and decode instants, however late the turn's own
-//! wait runs ([`Orders::cut`]). Steer is not supported.
+//! is judged on attached and decode instants by the consumer, as it
+//! decodes each piece of evidence, however late the turn's own wait runs
+//! ([`Cutoffs`]). Steer is not supported.
 
 use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
@@ -701,33 +702,24 @@ impl Orders {
         }
     }
 
-    /// X4 code review r2 #1 (C2 §4.1 "Two deadlines", "One wall
-    /// cutoff"): the cut of a terminal decoded at `decoded`, from attached
-    /// and decode instants only: the earliest `close_by` of the visible
-    /// orders (Core's stop, the driver's close relay) attached at or
-    /// before it, and the wall's cleanup bound once the wall, recorded
-    /// first, passed at or before it. The wait cuts at `cut(now)`, and
-    /// settlement judges a retained terminal by `cut(decoded_at)`: one
-    /// decoded after its cut is late only, however the wait was
-    /// scheduled.
-    pub(super) fn cut(&self, decoded: Instant) -> Option<Instant> {
-        let close_by = |order: &Option<StopOrder>| {
-            order
-                .as_ref()
-                .filter(|order| order.attached <= decoded)
-                .map(|order| order.close_by.instant())
-        };
-        let wall = self.wall.instant();
-        let walled = (self.provenance() == EndCause::Wall && wall <= decoded)
-            .then_some(wall + CLEANUP_ALLOWANCE);
-        [
-            close_by(&self.stop.borrow()),
-            close_by(&self.close.borrow()),
-            walled,
-        ]
-        .into_iter()
-        .flatten()
-        .min()
+    /// The cut the wait ends a turn at, read at `now` ([`cut_of`]).
+    pub(super) fn cut(&self, now: Instant) -> Option<Instant> {
+        cut_of(
+            (&self.stop.borrow(), &self.close.borrow()),
+            self.wall.instant(),
+            now,
+        )
+    }
+
+    /// The turn's cutoffs, for its consumer.
+    pub(super) fn cutoffs(&self) -> Cutoffs {
+        Cutoffs {
+            stop: self.stop.clone(),
+            close: self.close.clone(),
+            wall: self.wall.instant(),
+            tool_grace: self.tool_grace,
+            cancel: self.cancel.clone(),
+        }
     }
 
     /// Resolves once either order changes (published, merged or
@@ -867,6 +859,91 @@ impl Orders {
             },
             () = cancel.cancelled() => Ending { cause: EndCause::Stopped, by: soon() },
         }
+    }
+}
+
+/// X4 critical review (C2 §4.1 "Two deadlines", "One wall cutoff"): the
+/// cut of evidence decoded at `decoded`, from attached, decode and wall
+/// instants only: the earliest `close_by` of the visible orders (Core's
+/// stop, the driver's close relay) attached at or before it, and the
+/// wall's cleanup bound once the wall passed at or before it with no
+/// order attached earlier. Evidence decoded after its cut is late only.
+fn cut_of(
+    (stop, close): (&Option<StopOrder>, &Option<StopOrder>),
+    wall: Instant,
+    decoded: Instant,
+) -> Option<Instant> {
+    let orders = || [stop, close].into_iter().flatten();
+    let close_by = orders()
+        .filter(|order| order.attached <= decoded)
+        .map(|order| order.close_by.instant())
+        .min();
+    let walled = (wall <= decoded && orders().all(|order| order.attached >= wall))
+        .then_some(wall + CLEANUP_ALLOWANCE);
+    close_by.into_iter().chain(walled).min()
+}
+
+/// One turn's cutoffs, which its consumer judges each piece of its
+/// cleanup evidence by, at the evidence's decode (X4 critical review):
+/// the orders' watches (their `attached` instants are the stops' and the
+/// detach's), the wall, the P7 grace and the session's cancellation.
+pub(crate) struct Cutoffs {
+    stop: StopWatch,
+    close: watch::Receiver<Option<StopOrder>>,
+    wall: Instant,
+    tool_grace: std::time::Duration,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+impl Cutoffs {
+    /// Cutoffs with no order ever, the wall `wall` away and a P7 grace of
+    /// `tool_grace`.
+    #[cfg(test)]
+    pub(crate) fn unbounded(wall: std::time::Duration, tool_grace: std::time::Duration) -> Self {
+        Self {
+            stop: watch::channel(None).1,
+            close: watch::channel(None).1,
+            wall: Instant::now() + wall,
+            tool_grace,
+            cancel: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    /// Whether evidence decoded at `decoded` is past its cut ([`cut_of`]):
+    /// late only; a terminal acknowledges nothing and is the turn's late
+    /// terminal.
+    pub(crate) fn late(&self, decoded: Instant) -> bool {
+        cut_of(
+            (&self.stop.borrow(), &self.close.borrow()),
+            self.wall,
+            decoded,
+        )
+        .is_some_and(|cut| decoded > cut)
+    }
+
+    /// Whether the tools of a terminal decoded at `terminal` ending by a
+    /// message decoded at `decoded` close its P7 window (C1 §3.5; x.3.2 X4
+    /// D4.3, Q8; revision 9 I3): only before the window's end, `tool_grace`
+    /// after the terminal, the wall, or a detach (a close's publication:
+    /// Core's close order or the driver's close relay; or the session's
+    /// cancellation, once seen), whichever is first. A later one proves
+    /// nothing: the cleanup stays uncertain.
+    pub(crate) fn drains(&self, terminal: Instant, decoded: Instant) -> bool {
+        let stop = self.stop.borrow();
+        let close = self.close.borrow();
+        let detached = [
+            stop.as_ref()
+                .filter(|order| order.cause == StopCause::Close),
+            close.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|order| order.attached);
+        let end = detached
+            .chain([terminal + self.tool_grace, self.wall])
+            .min()
+            .unwrap_or(self.wall);
+        decoded < end && !self.cancel.is_cancelled()
     }
 }
 
@@ -2186,6 +2263,7 @@ async fn run_started(
         correlation: Arc::clone(&correlation),
         credit,
         stop_ack,
+        cutoffs: orders.cutoffs(),
     };
     let requested = start.connection.request(
         |id| {
@@ -2576,9 +2654,10 @@ async fn wait(
 /// decoded at or after it wins too under an order attached before the
 /// wall (the order's row); under the wall it is kept beside the wall's
 /// `Deadline`, acknowledged when interrupted within the wall's cleanup
-/// bound. A terminal decoded after the order's `close_by` is late only.
-/// The P7 window's end (`Grace`) or a detach keeps the terminal with its
-/// cleanup uncertain.
+/// bound. The consumer never retained a terminal decoded after its cut
+/// (late only), nor ended a P7 window by a tool ending decoded after it:
+/// the window's end (`Grace`) or a detach keeps the terminal with its
+/// cleanup uncertain ([`Cutoffs`]).
 fn settle_turn(
     facts: &Turn<'_>,
     (start, accepted): (&Started<'_>, &Accepted<'_>),
@@ -2588,18 +2667,10 @@ fn settle_turn(
     orders.note(Instant::now());
     let turn = facts.number;
     let wall = orders.wall.instant();
-    // X4 code review r2 #1, #2: a terminal decoded after its cut is late
-    // only, whenever this wait ran: the consumer sends it as the turn's
-    // late terminal, and the turn ends as the cut gives.
-    let sealed = accepted
-        .delivery
-        .seal_cut(|decoded| orders.cut(decoded).is_some_and(|cut| decoded > cut));
-    // The daemon force keeps its precedence (r3 #2).
-    let cut = if sealed.late && cut != Cut::Forced {
-        Cut::Order(orders.provenance())
-    } else {
-        cut
-    };
+    // The consumer judged each piece of evidence at its decode (X4
+    // critical review): a late terminal was never retained, a late tool
+    // ending never ended the drain; settlement reads what it kept.
+    let sealed = accepted.delivery.seal();
     let lane = start.thread.lease.lane();
     let terminal_decided = cut == Cut::Decided && sealed.terminal.is_some();
     let registration = &start.thread.registration;
@@ -2639,13 +2710,7 @@ fn settle_turn(
             cleanup_interrupt();
         }
         let decoded_at = sealed.decoded_at.unwrap_or(retained.terminal.at);
-        // X4 code review r1 #1: the P7 window is judged on decode
-        // instants, whenever this wait ran: tools that ended only at or
-        // after its end, `min(decoded_at + tool_grace, wall)`, end
-        // nothing.
-        let window_end = (decoded_at + orders.tool_grace).min(wall);
-        let drained_late = sealed.drained_at.is_some_and(|at| at >= window_end);
-        let tools_open = sealed.tools_open || overflowed || drained_late;
+        let tools_open = sealed.tools_open || overflowed;
         if decoded_at >= wall && orders.provenance() == EndCause::Wall {
             return wall_end(facts, retained, tools_open);
         }
@@ -2699,8 +2764,8 @@ fn settle_turn(
 /// terminal, decoded at `decoded_at` at or after it, is kept beside the
 /// wall's `Deadline`; the stop was acknowledged by an interrupted terminal.
 /// P7 is capped at the wall: it settles at once. A terminal decoded
-/// after the wall's cleanup bound never gets here: the seal judged it
-/// late ([`Orders::cut`]).
+/// after the wall's cleanup bound never gets here: the consumer judged it
+/// late ([`Cutoffs::late`]).
 fn wall_end(facts: &Turn<'_>, retained: Retained, tools_open: bool) -> TurnEnd {
     let acknowledged = retained.terminal.status == VendorTerminalStatus::Interrupted;
     let mut end = facts.failure(
