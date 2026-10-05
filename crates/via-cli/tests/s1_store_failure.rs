@@ -1859,6 +1859,15 @@ fn host_journal_failure_stops_group(point: &str) -> TestResult {
             && first["cancel"]["cleanup"] == "quiescent",
         || format!("unexpected turn 1: {first}"),
     )?;
+    // Bead via-23b: the journal write's failure is the turn's Store
+    // failure, never a `launch_failed` warning (C1 §6.1).
+    let events = sandbox.events(&session)?;
+    check(
+        !events
+            .iter()
+            .any(|event| event["type"] == "warning" && event["code"] == "launch_failed"),
+        || format!("a journal write reported as launch_failed: {events:?}"),
+    )?;
     // The vendor, if it ran, is gone.
     let agent = sandbox.sync.join("agent.pid");
     if agent.exists() {

@@ -828,7 +828,7 @@ envelope except through §7.6.
 | `action.denied`, `vendor.request_declined` | as envelope lists; `blocking` on declines | Adapter |
 | `steer.delivered` | `delivery` | Adapter |
 | `cancel.requested` / `cancel.settled` | — / `outcome`, `cleanup` | Core |
-| `warning` | `code`, `message`, `data?` (structured, bounded; `config_switch_unverified` carries `data.categories: [{category, requested, effective}]`, §5). `launch_failed`: a Host or launch failure ended the turn (an anchor or vendor spawn, the anchor's socket, a journal write and so on); `data: {step, kind?}` names the failed step and, for an operating-system error, its kind (Rust `std::io::ErrorKind`, such as `NotFound`); never vendor text. It is an event only, not one of the envelope's `warnings` codes (§5) | either |
+| `warning` | `code`, `message`, `data?` (structured, bounded; `config_switch_unverified` carries `data.categories: [{category, requested, effective}]`, §5). `launch_failed`: a Host or launch step outside the Store failed and ended the turn (an anchor or vendor spawn, the anchor's socket and so on); a Store or journal write failure is reported by the turn's Store failure instead, never as `launch_failed`; `data: {step, kind?}` names the failed step and, for an operating-system error, its kind (Rust `std::io::ErrorKind`, such as `NotFound`); never vendor text. It is an event only, not one of the envelope's `warnings` codes (§5) | either |
 | `process.exited`, `server.lost` | `code`, `signal` / `key` | Core (from Host) |
 
 Events are durable records only: an event exists when crash recovery or the

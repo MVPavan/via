@@ -534,17 +534,22 @@ impl std::error::Error for HostError {}
 
 impl HostError {
     /// This failure's bounded cause for the turn it ended (bead via-23b),
-    /// or `None` for a deadline or a stop, whose dispositions name them.
+    /// or `None` for a deadline or a stop, whose dispositions name them,
+    /// and for a Store read or journal write, which the turn's Store
+    /// failure reports (C1 §6.1).
     pub fn cause(&self) -> Option<crate::LaunchCause> {
         let (step, kind) = match self {
             Self::Launch { step, error } => (*step, Some(error.kind())),
             Self::Io(error) => ("Host operation", Some(error.kind())),
             Self::Evidence(error) => ("create stderr.log", Some(error.kind())),
-            Self::Store(step) | Self::Invalid(step) | Self::Protocol(step) => (*step, None),
-            Self::StoreUnavailable(_) => ("read the process journal", None),
-            Self::Journal { site, .. } => (site.step(), None),
+            Self::Invalid(step) | Self::Protocol(step) => (*step, None),
             Self::AnchorPathTooLong { .. } => ("anchor socket path", None),
-            Self::Deadline | Self::Stopped | Self::LinksUnread => return None,
+            Self::Store(_)
+            | Self::StoreUnavailable(_)
+            | Self::Journal { .. }
+            | Self::Deadline
+            | Self::Stopped
+            | Self::LinksUnread => return None,
         };
         Some(crate::LaunchCause { step, kind })
     }
@@ -555,19 +560,6 @@ impl HostError {
     }
 }
 
-impl JournalSite {
-    /// The journal write as a launch step.
-    fn step(self) -> &'static str {
-        match self {
-            Self::AnchorIntent => "commit anchor intent",
-            Self::Identified => "commit anchor identity",
-            Self::ArmIntent => "commit ARM intent",
-            Self::VendorFacts => "commit vendor facts",
-            Self::Absence => "commit group absence",
-            Self::Link => "commit turn link",
-        }
-    }
-}
 impl From<io::Error> for HostError {
     fn from(value: io::Error) -> Self {
         Self::Io(value)

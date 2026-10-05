@@ -2293,20 +2293,21 @@ impl Engine {
         }
     }
 
-    /// Route's facts of a finished execution: its Store failure or
-    /// uncertain journal write ([`Engine::route_failed`]), then a Host or
-    /// launch failure's cause as the turn's durable `launch_failed` warning,
-    /// whatever the disposition (bead via-23b).
+    /// Route's facts of a finished execution: a Host or launch failure's
+    /// cause as the turn's durable `launch_failed` warning, whatever the
+    /// disposition (bead via-23b), then its Store failure or uncertain
+    /// journal write ([`Engine::route_failed`]). The warning goes first: a
+    /// Store failure recorded before it would refuse its write.
     async fn route_facts(&self, slot: &Slot, record: &mut TurnRecord, driven: &Driven) {
-        let (cause, journal_uncertain) = driven.store_facts();
-        self.route_failed(slot, record, cause, journal_uncertain)
-            .await;
         if let Driven::Finished(finished) = driven
             && let Err(AdapterError::Route(failure)) = &finished.1
             && let Some(cause) = failure.launch.as_deref()
         {
             self.own_warning(record, launch_warning(*cause)).await;
         }
+        let (cause, journal_uncertain) = driven.store_facts();
+        self.route_failed(slot, record, cause, journal_uncertain)
+            .await;
     }
 
     /// Commits an adapter-reported `warning` event attributed to `(turn,
