@@ -17,7 +17,7 @@ use std::{
 
 use serde::Deserialize;
 use serde_json::{Value, value::RawValue};
-use via_core::{ConfigError, HarnessSettings, Limits, PAGE_BYTES};
+use via_core::{CodexSettings, ConfigError, HarnessSettings, Limits, PAGE_BYTES};
 
 /// The largest `daemon.json` read (§5.5).
 const MAX_BYTES: u64 = 64 * 1024;
@@ -62,6 +62,8 @@ impl fmt::Display for Invalid {
 #[serde(deny_unknown_fields)]
 struct File {
     #[serde(default, deserialize_with = "present")]
+    codex: Option<Box<RawValue>>,
+    #[serde(default, deserialize_with = "present")]
     harness_processes: Option<Box<RawValue>>,
     #[serde(default, deserialize_with = "present")]
     disk: Option<Box<RawValue>>,
@@ -69,6 +71,13 @@ struct File {
     harnesses: Option<Box<RawValue>>,
     #[serde(default, deserialize_with = "present")]
     wal: Option<Box<RawValue>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Codex {
+    #[serde(default, deserialize_with = "present")]
+    memories: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -171,6 +180,17 @@ fn parse(text: &[u8]) -> Result<Config, Invalid> {
             .map_err(|error| Invalid::new(error.key, error.rule.to_string()))?,
         None => HarnessSettings::default(),
     };
+    let mut codex = CodexSettings::default();
+    if let Some(raw) = file.codex {
+        let section: Codex =
+            serde_json::from_str(raw.get()).map_err(|error| refused(Some("codex"), &error))?;
+        if let Some(value) = section.memories {
+            codex.memories = value
+                .as_bool()
+                .ok_or_else(|| Invalid::new("codex.memories", "must be true or false"))?;
+        }
+    }
+    let harnesses = harnesses.with_codex(codex);
     let mut limits = Limits::default();
     if let Some(raw) = file.harness_processes {
         let processes: HarnessProcesses = serde_json::from_str(raw.get())
@@ -319,6 +339,37 @@ mod tests {
     }
 
     /// Bead via-oq3 (owner, 2026-10-04; renamed 2026-10-05):
+    /// `codex.memories` (owner 2026-10-05): false by default, so every
+    /// Codex server runs with `--disable memories`; true keeps Codex's own
+    /// default. Any other value, and an unknown member, are refused
+    /// naming the key.
+    #[test]
+    fn codex_memories_is_a_boolean_off_by_default() {
+        let memories = |text: &str| {
+            parse(text.as_bytes())
+                .expect(text)
+                .harnesses
+                .codex()
+                .memories
+        };
+        assert!(!memories("{}"));
+        assert!(!memories(r#"{"codex":{}}"#));
+        assert!(!memories(r#"{"codex":{"memories":false}}"#));
+        assert!(memories(r#"{"codex":{"memories":true}}"#));
+        let rule = "daemon config invalid: codex.memories: must be true or false";
+        assert_eq!(invalid(r#"{"codex":{"memories":"yes"}}"#), rule);
+        assert_eq!(invalid(r#"{"codex":{"memories":1}}"#), rule);
+        assert_eq!(invalid(r#"{"codex":{"memories":null}}"#), rule);
+        assert_eq!(
+            invalid(r#"{"codex":{"memory":true}}"#),
+            "daemon config invalid: codex.memory: unknown key"
+        );
+        assert_eq!(
+            invalid(r#"{"codex":true}"#),
+            "daemon config invalid: codex: must be an object"
+        );
+    }
+
     /// `harness_processes.limit` sets the harness-process pool, default 8,
     /// any value from 1; 0, `null`, a fraction, an unknown member and the
     /// old key `connections` are refused naming the key.

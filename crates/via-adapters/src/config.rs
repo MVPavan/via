@@ -214,14 +214,21 @@ impl HarnessConfig {
 }
 
 /// The validated `harnesses` section of `daemon.json` (runtime §8, design
-/// §5.4): one [`HarnessConfig`] per [`HARNESSES`] row, in table order. The
-/// default is every harness's defaults, an absent section's.
+/// §5.4): one [`HarnessConfig`] per [`HARNESSES`] row, in table order, and
+/// the `codex` section's [`CodexSettings`]. The default is every harness's
+/// defaults, absent sections'.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HarnessSettings(Vec<HarnessConfig>);
+pub struct HarnessSettings {
+    harnesses: Vec<HarnessConfig>,
+    codex: CodexSettings,
+}
 
 impl Default for HarnessSettings {
     fn default() -> Self {
-        Self(vec![DEFAULT_HARNESS.clone(); HARNESSES.len()])
+        Self {
+            harnesses: vec![DEFAULT_HARNESS.clone(); HARNESSES.len()],
+            codex: CodexSettings::default(),
+        }
     }
 }
 
@@ -230,8 +237,32 @@ impl HarnessSettings {
     /// refuses an invalid `daemon.json` before touching anything, and keeps
     /// the result for [`AdapterConfig::with_harnesses`].
     pub fn parse(raw: &RawValue) -> Result<Self, HarnessesError> {
-        parse_harnesses(raw).map(Self)
+        parse_harnesses(raw).map(|harnesses| Self {
+            harnesses,
+            codex: CodexSettings::default(),
+        })
     }
+
+    /// The `codex` section's settings.
+    pub fn codex(&self) -> CodexSettings {
+        self.codex
+    }
+
+    /// These settings with the `codex` section's.
+    #[must_use]
+    pub fn with_codex(self, codex: CodexSettings) -> Self {
+        Self { codex, ..self }
+    }
+}
+
+/// The `codex` section of `daemon.json` (runtime §8): read at daemon
+/// start, so a change applies to servers launched after a restart.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CodexSettings {
+    /// `codex.memories`: whether Codex's memories feature keeps its own
+    /// default. False (the default): every server VIA starts runs with
+    /// `--disable memories`.
+    pub memories: bool,
 }
 
 /// Per-harness settings, the bootstrap environment and the fake fixture,
@@ -305,8 +336,13 @@ impl AdapterConfig {
         HARNESSES
             .iter()
             .position(|known| known == row)
-            .and_then(|index| self.harnesses.0.get(index))
+            .and_then(|index| self.harnesses.harnesses.get(index))
             .unwrap_or(&DEFAULT_HARNESS)
+    }
+
+    /// The `codex` section's settings.
+    pub fn codex(&self) -> CodexSettings {
+        self.harnesses.codex()
     }
 
     /// The `inherit` a plan for `harness` requests: the configured one for a

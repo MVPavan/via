@@ -16,7 +16,7 @@ use super::normalize::{
     DECLINES, NormalizeError, Step, StructuredOutput, TurnNormalizer, catalog_page, decline,
     instance_version, version_status,
 };
-use crate::config::BootstrapEnv;
+use crate::config::{BootstrapEnv, CodexSettings};
 use crate::observation::{
     ClassHint, DenialKind, Observation, ProgressMarks, StopReason, UsageSample,
 };
@@ -146,7 +146,7 @@ fn every_server_disables_memories() {
     for state in [InheritState::Off, InheritState::On] {
         let recipe = ServerRecipe::new(
             Path::new("/bin/codex"),
-            hooks(state),
+            (hooks(state), CodexSettings::default()),
             &env(),
             Path::new("/state/vendor/codex"),
         );
@@ -161,6 +161,35 @@ fn every_server_disables_memories() {
     }
 }
 
+/// Owner 2026-10-05: `codex.memories` true omits `--disable memories`, so
+/// Codex's own default applies; the argv is in the server key, so servers
+/// under the two settings never share a key.
+#[test]
+fn codex_memories_true_keeps_the_vendor_default() {
+    let recipe = |memories| {
+        ServerRecipe::new(
+            Path::new("/bin/codex"),
+            (hooks(InheritState::Off), CodexSettings { memories }),
+            &env(),
+            Path::new("/state/vendor/codex"),
+        )
+    };
+    assert_eq!(
+        recipe(true).args,
+        ["app-server", "--disable", "hooks", "--disable", "apps"]
+    );
+    assert!(
+        recipe(false)
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--disable", "memories"])
+    );
+    assert_ne!(
+        recipe(true).config_hash("0.1.0"),
+        recipe(false).config_hash("0.1.0")
+    );
+}
+
 /// via-4gl: with MCP servers off, the server disables the `apps` feature,
 /// which is what starts Codex's built-in `codex_apps` MCP server for every
 /// thread (checked live on 0.160.0); with them on it does not. The user's
@@ -171,7 +200,10 @@ fn mcp_off_disables_the_apps_server() {
     let disables_apps = |mcp_servers| {
         ServerRecipe::new(
             Path::new("/bin/codex"),
-            inherit(InheritState::On, mcp_servers),
+            (
+                inherit(InheritState::On, mcp_servers),
+                CodexSettings::default(),
+            ),
             &env(),
             Path::new("/state/vendor/codex"),
         )
@@ -200,7 +232,7 @@ fn the_server_recipe_is_the_allow_list() {
     let home = Path::new("/state/vendor/codex");
     let recipe = ServerRecipe::new(
         Path::new("/bin/codex"),
-        hooks(InheritState::Off),
+        (hooks(InheritState::Off), CodexSettings::default()),
         &env(),
         home,
     );
@@ -232,7 +264,7 @@ fn the_server_recipe_is_the_allow_list() {
     );
     let on = ServerRecipe::new(
         Path::new("/bin/codex"),
-        hooks(InheritState::On),
+        (hooks(InheritState::On), CodexSettings::default()),
         &BootstrapEnv::from_vars([("PATH", "/usr/bin")]),
         home,
     );
@@ -255,7 +287,12 @@ fn the_server_recipe_is_the_allow_list() {
 fn the_config_hash_covers_the_recipe() {
     let binary = Path::new("/opt/vendor/codex");
     let recipe = |hooks_state, home: &str| {
-        ServerRecipe::new(binary, hooks(hooks_state), &env(), Path::new(home))
+        ServerRecipe::new(
+            binary,
+            (hooks(hooks_state), CodexSettings::default()),
+            &env(),
+            Path::new(home),
+        )
     };
     let base = recipe(InheritState::Off, "/state/vendor/codex");
     let hash = base.config_hash("0.1.0");

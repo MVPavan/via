@@ -269,7 +269,12 @@ C6 tested tools, authentication refresh, macOS or installed plugins. Never
 silently broaden the allow-list after failure.
 
 Every server VIA starts runs `codex app-server --disable memories`,
-whatever the session requests (via-7r9, checked 2026-10-05 on 0.160.0).
+whatever the session requests (via-7r9, checked 2026-10-05 on 0.160.0),
+unless `daemon.json` sets `{"codex":{"memories":true}}` (runtime §8,
+owner 2026-10-05; default `false`), which omits the switch so Codex's own
+default and the user's `config.toml` apply. The setting is read at daemon
+start and applies to servers launched after it; the argv is in the
+server key, so servers under the two settings are never shared.
 `--disable <FEATURE>` is `-c features.<name>=false` (`codex app-server
 --help`), so it overrides the user's `config.toml`. Without it, Codex's
 memories feature ran inside VIA-started servers: stage-1 extraction, then

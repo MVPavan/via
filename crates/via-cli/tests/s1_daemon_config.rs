@@ -461,7 +461,13 @@ fn s1_config_is_read_at_start_validated_and_reported() -> TestResult {
 
             let runtime = &setup.sandbox.runtime;
             let state = &setup.sandbox.state;
-            let cases: [(&str, &str, &str); 16] = [
+            let cases: [(&str, &str, &str); 17] = [
+                // Codex memories is a boolean (owner, 2026-10-05).
+                (
+                    r#"{"codex":{"memories":"off"}}"#,
+                    "codex.memories",
+                    "must be true or false",
+                ),
                 // The pool's old name (owner, 2026-10-05).
                 (
                     r#"{"connections":{"limit":4}}"#,

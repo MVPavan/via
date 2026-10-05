@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-use crate::config::BootstrapEnv;
+use crate::config::{BootstrapEnv, CodexSettings};
 use crate::plan::{Category, Inherit, InheritState};
 use crate::{EnvAllowList, PrivateProcessSpec, ProcessOwner};
 
@@ -20,14 +20,15 @@ const ENV_ALLOW: &[&str] = &["HOME", "PATH", "USER", "LOGNAME", "LANG", "XDG_RUN
 /// directory, never the user's.
 const SQLITE_HOME: &str = "CODEX_SQLITE_HOME";
 
-/// The Codex features every server VIA starts disables, whatever the
-/// session requests (via-7r9; `codex app-server --help`: `--disable
+/// The Codex feature every server VIA starts disables, whatever the
+/// session requests, unless `daemon.json` sets `codex.memories` true
+/// (via-7r9, owner 2026-10-05; `codex app-server --help`: `--disable
 /// <FEATURE>` is `-c features.<name>=false`, which overrides the user's
 /// `config.toml`). `memories` ran stage-1 extraction and then a
 /// consolidation agent thread with full access and its own model that
 /// edited the user's `~/.codex/memories`, outside any VIA turn, bound or
 /// accounting (codex-cli 0.160.0, 2026-10-05).
-const ALWAYS_DISABLED: &[&str] = &["memories"];
+const MEMORIES: &str = "memories";
 
 /// The protocol a server built from the recipe speaks: part of its key, so
 /// a change of handshake starts a new server.
@@ -54,7 +55,9 @@ pub(crate) struct ServerRecipe {
 
 impl ServerRecipe {
     /// The recipe for `binary` with the session's requested inherited
-    /// configuration: `--disable` for each [`ALWAYS_DISABLED`] feature,
+    /// configuration and the daemon's `codex` settings: `--disable
+    /// memories` unless `codex.memories` is true (the argv is in the key,
+    /// so the two settings never share a server),
     /// `--disable hooks` when hooks are off (a verified switch),
     /// `--disable apps` when MCP servers are off (a partial switch), the
     /// allow-listed environment plus `CODEX_SQLITE_HOME`, and
@@ -62,13 +65,13 @@ impl ServerRecipe {
     /// caller creates `vendor_home`.
     pub(crate) fn new(
         binary: &Path,
-        requested: Inherit,
+        (requested, settings): (Inherit, CodexSettings),
         env: &BootstrapEnv,
         vendor_home: &Path,
     ) -> Self {
         let mut args = vec!["app-server".to_owned()];
-        for feature in ALWAYS_DISABLED {
-            args.extend(["--disable".to_owned(), (*feature).to_owned()]);
+        if !settings.memories {
+            args.extend(["--disable".to_owned(), MEMORIES.to_owned()]);
         }
         if requested.get(Category::Hooks) == InheritState::Off {
             args.extend(["--disable".to_owned(), "hooks".to_owned()]);

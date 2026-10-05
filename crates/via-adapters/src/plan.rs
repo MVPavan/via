@@ -749,7 +749,7 @@ impl AdapterSet {
             Arc::new(CodexAdapter::new(
                 binary,
                 Arc::clone(&instances),
-                config.env(),
+                (config.env(), config.codex()),
                 Arc::clone(&runtime),
             ))
         });
