@@ -33,10 +33,11 @@ use tokio::sync::{oneshot, watch};
 use tokio::time::Instant;
 use via_routes::codex::{
     AbnormalEnd, ClientId, CommitOutcome, Connection, ConnectionEnd, ConnectionFailure,
-    ConnectionLoss, FINISH_BY, LOSS_EVIDENCE, Lane, LaneEnd, LaneLease, LaunchError, LeaseSignal,
-    LossCause, Purpose, RequestError, Response, RpcError, SandboxMode, ServerKey, ServerLease,
-    ServerPin, Subscription, ThreadResult, ThreadSettings, TurnFolder, TurnStart, TurnStartResult,
-    TurnWrites, WriteBounds, crash_on_panic, data, result, thread_resume, thread_start, turn_start,
+    ConnectionLoss, FINISH_BY, Fenced, LOSS_EVIDENCE, Lane, LaneEnd, LaneLease, LaunchError,
+    LeaseSignal, LossCause, Purpose, RequestError, Reservation, Response, RpcError, SandboxMode,
+    ServerKey, ServerLease, ServerPin, Subscription, ThreadResult, ThreadSettings, TurnFolder,
+    TurnStart, TurnStartResult, TurnWrites, WriteBounds, crash_on_panic, data, result,
+    thread_resume, thread_start, turn_start,
 };
 use via_routes::{Retirement, SendOutcome, StoreFailure, WireCleanup};
 
@@ -957,16 +958,15 @@ async fn turn(
     let Ok(effort) = vendor_effort(spec.effort.as_deref(), &catalog, &driver.spec.model) else {
         return facts.rejected(StartRejected::InvalidParam { field: "effort" });
     };
-    if let Err(end) = link(&facts, &connection, wall).await {
-        return *end;
-    }
-    let cap = session.cap(driver);
-    let waits = (&mut orders, &mut force, &*driver.health);
-    let thread = generation.thread.as_deref();
-    let gate = thread.map(|thread| (thread.lease.lane().as_ref(), &*thread.registration));
-    let credit = match credited(&cap, waits, gate).await {
-        Ok(credit) => credit,
-        Err(why) => return uncredited(&facts, &connection, why, (&orders, &force)),
+    let admitted = admit_turn(
+        &facts,
+        (&generation, &connection),
+        (&mut orders, &mut force),
+    )
+    .await;
+    let (reservation, credit) = match admitted {
+        Ok(admitted) => admitted,
+        Err(end) => return *end,
     };
     // The turn's input writes: withdrawn before their first byte however
     // the turn ends (X0 item 12.2).
@@ -980,7 +980,7 @@ async fn turn(
         };
         let opened = open_thread(
             &mut facts,
-            &ids,
+            (&ids, reservation),
             sandbox.mode,
             (&mut orders, &mut force, &mut writes),
         )
@@ -1015,6 +1015,51 @@ async fn turn(
     quarantine_unfit((driver, session), &connection, (&thread, turn), &end);
     drop(pin);
     end
+}
+
+/// Everything before the turn's first write, holding nothing of it
+/// meanwhile: a generation resuming the session's thread reserves it
+/// first, waiting while another generation's resume, unsubscribe or
+/// registration of it is outstanding (x.3.2 X4 D3); the turn is linked to
+/// its server; then the thread's start gate and the turn's credit (x.3.2
+/// X3 §4.2 steps 0 and 1).
+async fn admit_turn(
+    facts: &Turn<'_>,
+    (generation, connection): (&Generation, &Arc<Connection>),
+    (orders, force): (&mut Orders, &mut ForceWatch),
+) -> Result<(Option<Reservation>, Charge), Box<TurnEnd>> {
+    let driver = facts.driver;
+    let identity = driver.state().identity.clone();
+    let reservation = match (&generation.thread, identity) {
+        (None, Some(thread)) => {
+            let waits = (&mut *orders, &mut *force, &*driver.health);
+            match reserved(connection, &thread, waits).await {
+                Ok(reservation) => Some(reservation),
+                Err(why) => {
+                    return Err(Box::new(uncredited(
+                        facts,
+                        connection,
+                        why,
+                        (orders, force),
+                    )));
+                }
+            }
+        }
+        (Some(_) | None, _) => None,
+    };
+    link(facts, connection, orders.wall).await?;
+    let cap = facts.session.cap(driver);
+    let thread = generation.thread.as_deref();
+    let gate = thread.map(|thread| (thread.lease.lane().as_ref(), &*thread.registration));
+    match credited(&cap, (&mut *orders, &mut *force, &*driver.health), gate).await {
+        Ok(credit) => Ok((reservation, credit)),
+        Err(why) => Err(Box::new(uncredited(
+            facts,
+            connection,
+            why,
+            (orders, force),
+        ))),
+    }
 }
 
 /// X0 item 5 (x.3.2 X3 fix r1 #4): a turn ending with a malformed
@@ -1078,6 +1123,48 @@ pub(super) enum Uncredited {
     /// The registration's generation failed (with its cause), or the
     /// registration retired (F3).
     Gone(Option<DriverFailure>),
+    /// The connection ended while the turn waited on its thread's fence
+    /// (x.3.2 X4 D3), with how: its failure keeps its own class.
+    Lost(ConnectionEnd),
+}
+
+/// x.3.2 X4 D3: reserves `thread` on `connection` for the generation's
+/// resume, waiting on the connection's epoch while it is fenced, beside
+/// the daemon force, the connection's end, the driver's failure and the
+/// turn's orders, any of which ends the wait with nothing reserved.
+async fn reserved(
+    connection: &Arc<Connection>,
+    thread: &str,
+    (orders, force, health): (&mut Orders, &mut ForceWatch, &watch::Sender<DriverHealth>),
+) -> Result<Reservation, Uncredited> {
+    let mut health = health.subscribe();
+    loop {
+        let mut epoch = match connection.reserve(thread) {
+            Ok(reservation) => return Ok(reservation),
+            Err(Fenced::Busy(epoch)) => Some(epoch),
+            // The end's cause comes from the arm below.
+            Err(Fenced::Ended) => None,
+        };
+        let cleared = async {
+            let changed = match epoch.as_mut() {
+                Some(epoch) => epoch.changed().await.is_ok(),
+                None => false,
+            };
+            if !changed {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::select! {
+            biased;
+            () = forced(force) => return Err(Uncredited::Forced),
+            end = connection.end() => return Err(Uncredited::Lost(end)),
+            _ = health.wait_for(|health| matches!(health, DriverHealth::Failed { .. })) => {
+                return Err(Uncredited::Failed);
+            }
+            _ = orders.ordered() => return Err(Uncredited::Ordered),
+            () = cleared => {}
+        }
+    }
 }
 
 /// x.3.2 X3 §4.2 steps 0 and 1: on a registered thread (its lane and
@@ -1173,6 +1260,12 @@ fn uncredited(
         }
         Uncredited::Gone(Some(cause)) => facts.failed(generation_cause(&cause, turn), None),
         Uncredited::Gone(None) | Uncredited::Failed => facts.rejected(StartRejected::SessionGone),
+        Uncredited::Lost(ConnectionEnd::Failed(loss)) => {
+            facts.failed(loss_cause(&loss, turn), Some(loss))
+        }
+        Uncredited::Lost(ConnectionEnd::Retired) => {
+            facts.failed(RouteError::TransportLost { turn }, None)
+        }
         Uncredited::Ordered | Uncredited::Forced => {
             facts.failed(unsent_cause(orders, force, turn), None)
         }
@@ -1428,20 +1521,23 @@ struct Ids<'a> {
 }
 
 /// Opens the session's thread on this generation (packet §3): a resume of
-/// the confirmed thread, else a start, written under the turn's guard on
-/// a lane subscribed to the generation's abnormal end; the reply's echoes
-/// checked, its identity confirmed. Any failure drops the lane, which
-/// closes a registration the reply made (X0 item 8.1).
+/// the confirmed thread its `reservation` holds (x.3.2 X4 D3), else a
+/// start, written under the turn's guard on a lane subscribed to the
+/// generation's abnormal end; the reply's echoes checked, its identity
+/// confirmed. Any failure drops the lane, which closes a registration the
+/// reply made (X0 item 8.1).
 async fn open_thread(
     facts: &mut Turn<'_>,
-    ids: &Ids<'_>,
+    (ids, reservation): (&Ids<'_>, Option<Reservation>),
     mode: SandboxMode,
     (orders, force, writes): (&mut Orders, &mut ForceWatch, &mut TurnWrites),
 ) -> Result<Arc<Thread>, Box<TurnEnd>> {
     let driver = facts.driver;
     let turn = facts.number;
     let lease = ids.connection.open_lane(Some(&ids.generation.signal));
-    let resume = driver.state().identity.clone();
+    let resume = reservation
+        .as_ref()
+        .map(|reservation| reservation.thread().to_owned());
     let settings = ThreadSettings {
         model: &driver.spec.model,
         cwd: &driver.spec.cwd,
@@ -1458,7 +1554,10 @@ async fn open_thread(
             None => thread_start(id, &settings).map(data),
         },
         bounds,
-        Purpose::Opens(&lease),
+        Purpose::Opens {
+            lane: &lease,
+            reservation,
+        },
         Some(writes),
     );
     let requested = requested.map_err(|error| Box::new(request_failed(facts, error)))?;

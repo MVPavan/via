@@ -155,7 +155,10 @@ fn open_thread(connection: &Connection, lane: &LaneLease) -> Requested {
         .request(
             |id| thread_start(id, &settings()).map(data),
             start_by(),
-            Purpose::Opens(lane),
+            Purpose::Opens {
+                lane,
+                reservation: None,
+            },
             None,
         )
         .unwrap()
@@ -1281,4 +1284,191 @@ async fn a_close_posted_at_a_decline_cuts_after_its_placeholder() {
         Some(LaneEvent::End(LaneEnd::Closed))
     ));
     assert_eq!(vendor.connection.counts().late_after_close, 1);
+}
+
+/// Queues a `thread/resume` of `thread` opening `lane`, carrying its
+/// `reservation` (x.3.2 X4 D3).
+fn resume_thread(
+    connection: &Connection,
+    lane: &LaneLease,
+    reservation: Reservation,
+    writes: Option<&mut TurnWrites>,
+) -> Requested {
+    let thread = reservation.thread().to_owned();
+    connection
+        .request(
+            |id| thread_resume(id, &thread, &settings()).map(data),
+            start_by(),
+            Purpose::Opens {
+                lane,
+                reservation: Some(reservation),
+            },
+            writes,
+        )
+        .unwrap()
+}
+
+/// `thread`'s reservation is refused while it is fenced: the epoch to
+/// wait on.
+#[track_caller]
+fn busy(connection: &Arc<Connection>, thread: &str) -> tokio::sync::watch::Receiver<u64> {
+    match connection.reserve(thread) {
+        Err(Fenced::Busy(epoch)) => epoch,
+        other => panic!("{thread} is not fenced: {other:?}"),
+    }
+}
+
+/// Blocks the connection's stdin (a 64-byte pipe) with a large control
+/// written in part: the next writes stay unstarted behind it.
+async fn block_stdin(vendor: &Vendor, n: usize) {
+    let mut big = br#"{"method":"note","params":{"pad":""#.to_vec();
+    big.extend(vec![b'x'; 16 * 1024]);
+    big.extend(b"\"}}\n");
+    let _control = vendor.connection.notify(big, start_by()).unwrap();
+    vendor.wrote(n, started).await;
+}
+
+/// D3 (`reserve_is_exclusive`): two reservations of one thread before
+/// any reply: the second is refused, another thread's is not. The first's
+/// drop wakes the waiter; the next reservation, handed to a resume, keeps
+/// the thread fenced with no gap: by its record until the reply, then by
+/// the registration the reply made, until its lane closes.
+#[tokio::test]
+async fn reserve_is_exclusive() {
+    let mut vendor = Vendor::open(1 << 16);
+    let connection = Arc::clone(&vendor.connection);
+    let first = connection.reserve("t").unwrap();
+    let mut epoch = busy(&connection, "t");
+    let _other = connection.reserve("o").unwrap();
+    assert!(!epoch.has_changed().unwrap());
+    drop(first);
+    promptly(epoch.changed()).await.unwrap();
+    let second = connection.reserve("t").unwrap();
+    let lane = connection.open_lane(None);
+    let requested = resume_thread(&connection, &lane, second, None);
+    assert_eq!(connection.reservations(), 1, "moved into the record");
+    let mut epoch = busy(&connection, "t");
+    let sent = vendor.read().await;
+    assert_eq!(sent["method"], "thread/resume");
+    vendor.emit(&thread_reply(requested.id.get(), "t")).await;
+    requested.reply.await.unwrap();
+    promptly(epoch.changed()).await.unwrap();
+    let mut epoch = busy(&connection, "t");
+    drop(lane);
+    promptly(epoch.changed()).await.unwrap();
+    drop(connection.reserve("t").unwrap());
+}
+
+/// D3 (`reserve_cleared_by_not_written`): a resume withdrawn before its
+/// first byte (a positive `NotWritten`) never reached the vendor: its
+/// record goes and the thread's fence clears at once.
+#[tokio::test]
+async fn reserve_cleared_by_not_written() {
+    let mut vendor = Vendor::open(64);
+    let connection = Arc::clone(&vendor.connection);
+    block_stdin(&vendor, 1).await;
+    let mut writes = TurnWrites::new(&connection);
+    let lane = connection.open_lane(None);
+    let reservation = connection.reserve("t").unwrap();
+    let requested = resume_thread(&connection, &lane, reservation, Some(&mut writes));
+    vendor.wrote(2, unstarted).await;
+    let mut epoch = busy(&connection, "t");
+    drop(writes);
+    assert_eq!(
+        promptly(requested.written).await.unwrap(),
+        SendOutcome::NotWritten
+    );
+    promptly(epoch.changed()).await.unwrap();
+    assert!(requested.reply.await.is_err(), "the record went");
+    drop(connection.reserve("t").unwrap());
+    assert_eq!(vendor.read().await["method"], "note");
+}
+
+/// W5: an unsubscribe not written by its bound (a positive `NotWritten`)
+/// clears its thread's fence; while it waited, it fenced the thread,
+/// though its lane was already closed.
+#[tokio::test]
+async fn w5_unsubscribe_not_written_clears_the_fence() {
+    let mut vendor = Vendor::open(64);
+    let connection = Arc::clone(&vendor.connection);
+    let lane = registered(&mut vendor, "t").await;
+    // A data write started and blocked: the unsubscribe, handed to Wire
+    // behind it, is not started by its bound.
+    let _data = vendor
+        .connection
+        .request(
+            |id| Ok(turn_start_line(id, "o", &"y".repeat(64 * 1024))),
+            start_by(),
+            Purpose::Plain,
+            None,
+        )
+        .unwrap();
+    vendor.wrote(2, started).await;
+    let by = Deadline::at(tokio::time::Instant::now() + Duration::from_millis(100));
+    let reply = connection.unsubscribe(&lane, by).unwrap();
+    drop(lane);
+    let mut epoch = busy(&connection, "t");
+    assert!(
+        promptly(reply).await.is_err(),
+        "never written: no reply comes"
+    );
+    promptly(epoch.changed()).await.unwrap();
+    drop(connection.reserve("t").unwrap());
+}
+
+/// D3 (`tombstone_never_fences`): a thread whose registration closed, or
+/// whose open no waiter wanted, is kept as closed for its late traffic,
+/// and never fences a resume.
+#[tokio::test]
+async fn tombstone_never_fences() {
+    let mut vendor = Vendor::open(1 << 16);
+    let connection = Arc::clone(&vendor.connection);
+    let lane = registered(&mut vendor, "t").await;
+    drop(lane);
+    drop(connection.reserve("t").unwrap());
+    let other = connection.open_lane(None);
+    let requested = open_thread(&connection, &other);
+    vendor.read().await;
+    let id = requested.id.get();
+    drop(requested);
+    vendor.emit(&thread_reply(id, "u")).await;
+    vendor.settle().await;
+    assert_eq!(connection.counts().abandoned, 1);
+    drop(connection.reserve("u").unwrap());
+}
+
+/// D3 (`reserve_released_when_never_submitted`): a resume refused before
+/// its record exists (an encode error; a failed connection's `Closed`)
+/// releases its reservation at once.
+#[tokio::test]
+async fn reserve_released_when_never_submitted() {
+    let vendor = Vendor::open(1 << 16);
+    let connection = Arc::clone(&vendor.connection);
+    let lane = connection.open_lane(None);
+    let reservation = connection.reserve("t").unwrap();
+    let refused = connection.request(
+        |_id| Err(ClientId::try_from(-1_i64).unwrap_err()),
+        start_by(),
+        Purpose::Opens {
+            lane: &lane,
+            reservation: Some(reservation),
+        },
+        None,
+    );
+    assert!(matches!(refused, Err(RequestError::Encode(_))));
+    assert_eq!(connection.reservations(), 0);
+    let reservation = connection.reserve("t").unwrap();
+    connection.fail(ConnectionFailure::Protocol);
+    let refused = connection.request(
+        |id| thread_resume(id, "t", &settings()).map(data),
+        start_by(),
+        Purpose::Opens {
+            lane: &lane,
+            reservation: Some(reservation),
+        },
+        None,
+    );
+    assert!(matches!(refused, Err(RequestError::Closed)));
+    assert_eq!(connection.reservations(), 0, "released, never leaked");
+    assert!(matches!(connection.reserve("t"), Err(Fenced::Ended)));
 }

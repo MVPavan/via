@@ -17,9 +17,9 @@ pub mod testing;
 mod threads;
 
 pub use connection::{
-    Connection, ConnectionEnd, ConnectionFailure, Counts, DECLINE_DEADLINE, FINISH_BY,
-    LOSS_EVIDENCE, LaneLease, Purpose, RequestError, Requested, Subscription, TurnWrites,
-    WriteCanceller,
+    Connection, ConnectionEnd, ConnectionFailure, Counts, DECLINE_DEADLINE, FINISH_BY, Fenced,
+    LOSS_EVIDENCE, LaneLease, Purpose, RequestError, Requested, Reservation, Subscription,
+    TurnWrites, WriteCanceller,
 };
 pub use crash::{CrashOnPanic, RegistryGuard, crash_on_panic, lock};
 pub use encode::*;

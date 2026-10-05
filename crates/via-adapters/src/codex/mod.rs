@@ -8,6 +8,8 @@
 
 mod delivery;
 mod driver;
+#[cfg(test)]
+mod driver_tests;
 mod launch;
 mod normalize;
 mod plan;

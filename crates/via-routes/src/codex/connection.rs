@@ -105,8 +105,24 @@ pub enum Purpose<'a> {
     Plain,
     /// A `thread/start` or `thread/resume`: its reply registers `lane`
     /// under the returned thread, but only while its waiter still waits
-    /// (item 9.1); otherwise the thread is kept as closed.
-    Opens(&'a LaneLease),
+    /// (item 9.1); otherwise the thread is kept as closed. A resume
+    /// carries its thread's [`Reservation`], which the record takes over
+    /// as it is queued (x.3.2 X4 D3): the thread stays fenced until the
+    /// reply, a positive `NotWritten` or the connection's end, whether or
+    /// not its waiter still waits.
+    Opens {
+        /// The lane the reply registers.
+        lane: &'a LaneLease,
+        /// A resume's reservation of its thread.
+        reservation: Option<Reservation>,
+    },
+    /// A `thread/unsubscribe` of `thread`: its record fences the thread
+    /// until its reply, a positive `NotWritten` or the connection's end
+    /// (x.3.2 X4 D3).
+    Unsubscribes {
+        /// The thread unsubscribed.
+        thread: String,
+    },
     /// A `turn/start` on `lane`'s thread: its accepted turn is mapped to
     /// VIA turn `turn` until the connection retires (packet §5). As it is
     /// handed to Wire its `Start` marker, carrying `cx`, fences the lane
@@ -143,6 +159,13 @@ enum Pairing {
     Plain,
     Opens {
         lane: u64,
+        /// A resume's thread, fenced while the record lives (x.3.2 X4 D3).
+        reserved: Option<String>,
+    },
+    /// A `thread/unsubscribe` of `thread`, server-owned: it fences the
+    /// thread while it lives, outliving its lane (x.3.2 X4 D3).
+    Unsubscribes {
+        thread: String,
     },
     Starts {
         lane: u64,
@@ -164,6 +187,21 @@ struct Record {
     charge: usize,
 }
 
+impl Pairing {
+    /// The thread the record fences (x.3.2 X4 D3): a resume's or an
+    /// unsubscribe's.
+    fn fences(&self) -> Option<&str> {
+        match self {
+            Self::Opens {
+                reserved: Some(thread),
+                ..
+            }
+            | Self::Unsubscribes { thread } => Some(thread),
+            Self::Plain | Self::Opens { reserved: None, .. } | Self::Starts { .. } => None,
+        }
+    }
+}
+
 /// What the connection keeps, under one std mutex never held across an
 /// await.
 struct State {
@@ -171,6 +209,10 @@ struct State {
     requests: HashMap<i64, Record>,
     threads: ThreadTable,
     budget: Budget,
+    /// Each reserved thread and its reservation's ID (x.3.2 X4 D3),
+    /// charged to the budget.
+    reserved: HashMap<String, u64>,
+    next_reservation: u64,
     /// The connection ended: no request or registration is admitted.
     ended: bool,
     /// The first unattributable message's bytes, for the server folder.
@@ -220,6 +262,69 @@ pub struct Connection {
     /// A driver posted its close (x.3.2 X3 §5.1): the connection task
     /// applies it between two routing operations.
     closes: Notify,
+    /// Bumped after a term of a thread's fence cleared (x.3.2 X4 D3): a
+    /// reservation released, a fencing record gone, a lane closed, the
+    /// connection's end.
+    epoch: watch::Sender<u64>,
+}
+
+/// Why a thread could not be reserved (x.3.2 X4 D3).
+#[derive(Debug)]
+pub enum Fenced {
+    /// A reservation, a resume, an unsubscribe or an open registration of
+    /// the thread is outstanding: reserve again once the epoch changes.
+    Busy(watch::Receiver<u64>),
+    /// The connection failed or ended: nothing is admitted.
+    Ended,
+}
+
+/// One thread reserved on a connection (x.3.2 X4 D3): no other resume of
+/// it is admitted until the reservation drops, or until the resume record
+/// it is handed to resolves. Dropped untransferred, it releases the
+/// thread.
+pub struct Reservation {
+    connection: Arc<Connection>,
+    thread: String,
+    id: u64,
+    /// Taken over by a request record: the drop releases nothing.
+    transferred: bool,
+}
+
+impl std::fmt::Debug for Reservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Reservation")
+            .field("thread", &self.thread)
+            .field("id", &self.id)
+            .field("transferred", &self.transferred)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Reservation {
+    /// The reserved thread.
+    pub fn thread(&self) -> &str {
+        &self.thread
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if self.transferred {
+            return;
+        }
+        let released = {
+            let mut state = self.connection.state();
+            let held = state.reserved.get(&self.thread) == Some(&self.id);
+            if held {
+                state.reserved.remove(&self.thread);
+                state.budget.release(self.thread.len());
+            }
+            held
+        };
+        if released {
+            self.connection.bump();
+        }
+    }
 }
 
 /// A lane a driver opened on the connection: a registration once a
@@ -254,7 +359,10 @@ impl LaneLease {
 
 impl Drop for LaneLease {
     fn drop(&mut self) {
-        self.connection.state().threads.close_lane(self.id);
+        let unregistered = self.connection.state().threads.close_lane(self.id);
+        if unregistered {
+            self.connection.bump();
+        }
     }
 }
 
@@ -337,6 +445,8 @@ impl Connection {
                 requests: HashMap::new(),
                 threads: ThreadTable::default(),
                 budget: Budget::default(),
+                reserved: HashMap::new(),
+                next_reservation: 0,
                 ended: false,
                 evidence: None,
                 counts: Counts::default(),
@@ -351,6 +461,50 @@ impl Connection {
             end: watch::Sender::new(None),
             retiring: AtomicBool::new(false),
             closes: Notify::new(),
+            epoch: watch::Sender::new(0),
+        })
+    }
+
+    /// Wakes every fence waiter: a term cleared (x.3.2 X4 D3). Called
+    /// after the state's lock is released.
+    fn bump(&self) {
+        self.epoch
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+    }
+
+    /// Reserves `thread` for a resume (x.3.2 X4 D3), in one step under the
+    /// connection's lock: refused while a reservation, a resume record, an
+    /// unsubscribe record or an open registration of it is outstanding
+    /// (tombstones never fence), with the epoch subscribed under the same
+    /// lock so no release is missed. The reservation is charged to the
+    /// correlation budget; exhaustion fails the connection `overflow`.
+    pub fn reserve(self: &Arc<Self>, thread: &str) -> Result<Reservation, Fenced> {
+        let mut state = self.state();
+        if state.ended || self.failure().is_some() {
+            return Err(Fenced::Ended);
+        }
+        let fenced = state.reserved.contains_key(thread)
+            || state.threads.is_open(thread)
+            || state
+                .requests
+                .values()
+                .any(|record| record.pairing.fences() == Some(thread));
+        if fenced {
+            return Err(Fenced::Busy(self.epoch.subscribe()));
+        }
+        if !state.budget.charge(thread.len()) {
+            drop(state);
+            self.fail(ConnectionFailure::Overflow);
+            return Err(Fenced::Ended);
+        }
+        state.next_reservation = state.next_reservation.wrapping_add(1);
+        let id = state.next_reservation;
+        state.reserved.insert(thread.to_owned(), id);
+        Ok(Reservation {
+            connection: Arc::clone(self),
+            thread: thread.to_owned(),
+            id,
+            transferred: false,
         })
     }
 
@@ -466,9 +620,15 @@ impl Connection {
         &self,
         encode: impl FnOnce(ClientId) -> Result<OutboundMessage, EncodeError>,
         bounds: WriteBounds,
-        purpose: Purpose<'_>,
+        mut purpose: Purpose<'_>,
         writes: Option<&mut TurnWrites>,
     ) -> Result<Requested, RequestError> {
+        // Bound before the lock, so an untransferred reservation drops
+        // (and takes the lock) only after it is released.
+        let mut reservation = match &mut purpose {
+            Purpose::Opens { reservation, .. } => reservation.take(),
+            Purpose::Plain | Purpose::Unsubscribes { .. } | Purpose::Starts { .. } => None,
+        };
         let (id, message, reply, start) = {
             let mut state = self.state();
             if state.ended || self.failure().is_some() {
@@ -482,7 +642,14 @@ impl Connection {
             let message = encode(id).map_err(RequestError::Encode)?;
             let (pairing, start) = match purpose {
                 Purpose::Plain => (Pairing::Plain, None),
-                Purpose::Opens(lane) => (Pairing::Opens { lane: lane.id }, None),
+                Purpose::Opens { lane, .. } => (
+                    Pairing::Opens {
+                        lane: lane.id,
+                        reserved: reservation.as_ref().map(|held| held.thread.clone()),
+                    },
+                    None,
+                ),
+                Purpose::Unsubscribes { thread } => (Pairing::Unsubscribes { thread }, None),
                 Purpose::Starts {
                     lane,
                     turn,
@@ -504,10 +671,26 @@ impl Connection {
                 ),
             };
             let charge = match &pairing {
-                Pairing::Starts { thread, .. } => thread.len(),
-                Pairing::Plain | Pairing::Opens { .. } => 0,
+                Pairing::Starts { thread, .. }
+                | Pairing::Unsubscribes { thread }
+                | Pairing::Opens {
+                    reserved: Some(thread),
+                    ..
+                } => thread.len(),
+                Pairing::Plain | Pairing::Opens { reserved: None, .. } => 0,
             };
-            if !state.budget.charge(charge) {
+            // x.3.2 X4 D3: a resume's record takes over its reservation's
+            // entry and charge under this lock, so the thread stays fenced
+            // with no gap and the budget is charged once.
+            let carried = reservation.as_mut().is_some_and(|held| {
+                let carried = state.reserved.get(&held.thread) == Some(&held.id);
+                if carried {
+                    state.reserved.remove(&held.thread);
+                    held.transferred = true;
+                }
+                carried
+            });
+            if !carried && !state.budget.charge(charge) {
                 drop(state);
                 self.fail(ConnectionFailure::Overflow);
                 return Err(RequestError::Exhausted);
@@ -703,7 +886,9 @@ impl Connection {
                 start_by: by,
                 finish_by: by,
             },
-            Purpose::Plain,
+            Purpose::Unsubscribes {
+                thread: thread.clone(),
+            },
             None,
         )
         .ok()
@@ -734,19 +919,26 @@ impl Connection {
     /// `NotWritten` opens its lane's start gate if its `Start` holds it
     /// (x.3.2 X3 §2.2), whether or not its driver still waits.
     fn forget(&self, id: i64) {
-        let unwritten = {
+        let (unwritten, fenced) = {
             let mut state = self.state();
             let Some(record) = state.requests.remove(&id) else {
                 return;
             };
             state.budget.release(record.charge);
-            match record.pairing {
+            let fenced = record.pairing.fences().is_some();
+            let unwritten = match record.pairing {
                 Pairing::Starts { lane, turn, .. } => {
                     state.threads.lane(lane).map(|(lane, _)| (lane, turn))
                 }
-                Pairing::Plain | Pairing::Opens { .. } => None,
-            }
+                Pairing::Plain | Pairing::Opens { .. } | Pairing::Unsubscribes { .. } => None,
+            };
+            (unwritten, fenced)
         };
+        // x.3.2 X4 D3: the attempt never reached the vendor, so its
+        // thread's fence clears at once.
+        if fenced {
+            self.bump();
+        }
         if let Some((lane, turn)) = unwritten {
             lane.start_unwritten(turn);
         }
@@ -774,13 +966,14 @@ impl Connection {
     /// naming an unmapped turn while the start was open (the refusal
     /// check).
     fn pair(&self, id: i64, mut response: Response, at: Instant) -> Result<(), ConnectionFailure> {
-        let (waiter, interrupt, marker) = {
+        let (waiter, interrupt, marker, fenced) = {
             let mut state = self.state();
             let state = &mut *state;
             let Some(record) = state.requests.remove(&id) else {
                 return Err(ConnectionFailure::Protocol);
             };
             state.budget.release(record.charge);
+            let fenced = record.pairing.fences().is_some();
             let waiting = record
                 .waiter
                 .as_ref()
@@ -788,7 +981,7 @@ impl Connection {
             let mut interrupt = None;
             let mut marker = None;
             match (record.pairing, &response.outcome) {
-                (Pairing::Opens { lane }, Ok(raw)) => {
+                (Pairing::Opens { lane, .. }, Ok(raw)) => {
                     if let Ok(opened) = result::<ThreadResult>(raw) {
                         let thread = &opened.thread.id;
                         let kept = if waiting {
@@ -837,10 +1030,15 @@ impl Connection {
                         .lane(lane)
                         .map(|(lane, signal)| (lane, signal, turn, accepted));
                 }
-                (Pairing::Plain | Pairing::Opens { .. }, _) => {}
+                (Pairing::Plain | Pairing::Opens { .. } | Pairing::Unsubscribes { .. }, _) => {}
             }
-            (record.waiter, interrupt, marker)
+            (record.waiter, interrupt, marker, fenced)
         };
+        // x.3.2 X4 D3: the vendor answered; a registration the reply made
+        // fences the thread from here on.
+        if fenced {
+            self.bump();
+        }
         if let Some((lane, signal, turn, accepted)) = marker {
             let (contradicted, pushed) = lane.push_reply(turn, at, accepted);
             response.contradicted = contradicted && response.outcome.is_err();
@@ -898,6 +1096,12 @@ impl Connection {
     #[cfg(all(test, feature = "test-failpoints"))]
     pub(super) fn routed(&self) -> u64 {
         self.state().routed
+    }
+
+    /// The threads reserved now (x.3.2 X4 D3).
+    #[cfg(all(test, feature = "test-failpoints"))]
+    pub(super) fn reservations(&self) -> usize {
+        self.state().reserved.len()
     }
 
     /// [`Self::demux`]'s routing.
@@ -1095,6 +1299,7 @@ impl Connection {
         let (lanes, records) = {
             let mut state = self.state();
             state.ended = true;
+            state.reserved.clear();
             let lanes = state.threads.drain();
             let records: Vec<Record> = state.requests.drain().map(|(_, record)| record).collect();
             (lanes, records)
@@ -1107,6 +1312,7 @@ impl Connection {
         // channels, so each reads it at once.
         self.end.send_replace(Some(end));
         drop(records);
+        self.bump();
     }
 
     /// Item 13.2, the abnormal path: the connection task died with its
@@ -1122,6 +1328,7 @@ impl Connection {
                 return;
             }
             state.ended = true;
+            state.reserved.clear();
             let lanes = state.threads.drain();
             let records: Vec<Record> = state.requests.drain().map(|(_, record)| record).collect();
             let signals: Vec<Arc<LeaseSignal>> = state.signals.values().cloned().collect();
@@ -1139,6 +1346,7 @@ impl Connection {
         self.end
             .send_replace(Some(ConnectionEnd::Failed(abnormal_loss())));
         drop(records);
+        self.bump();
     }
 }
 
