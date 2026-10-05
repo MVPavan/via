@@ -1,4 +1,4 @@
-//! The re-probe loop over held connection slots (design §8): a Core task
+//! The re-probe loop over held harness-process slots (design §8): a Core task
 //! daemon main spawns at serve start and joins in final shutdown's first
 //! pipeline step. Only a proof releases a holding (design §11).
 

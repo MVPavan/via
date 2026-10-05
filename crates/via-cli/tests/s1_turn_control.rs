@@ -1535,7 +1535,7 @@ fn s1_cancel_while_waiting_for_slot() -> TestResult {
         ]))?;
         sandbox
             .env
-            .push(("VIA_TEST_CONNECTION_SLOTS", "1".to_owned()));
+            .push(("VIA_TEST_HARNESS_PROCESSES", "1".to_owned()));
         let daemon = sandbox.start()?;
         let (holder, _) = sandbox.spawn("holder", &[])?;
         sandbox.await_file("holder.entered")?;
@@ -1565,7 +1565,7 @@ fn s1_cancel_while_waiting_for_slot() -> TestResult {
     })
 }
 
-/// Design §4, §11 (adapted): a turn waiting for the only connection slot,
+/// Design §4, §11 (adapted): a turn waiting for the only harness-process slot,
 /// held by another session's live turn, is cancelled by `close`; the close
 /// completes and the dispatcher exits while the slot stays held.
 #[cfg(feature = "test-failpoints")]
@@ -1583,7 +1583,7 @@ fn s1_close_cancels_turn_waiting_for_slot() -> TestResult {
         ))?;
         sandbox
             .env
-            .push(("VIA_TEST_CONNECTION_SLOTS", "1".to_owned()));
+            .push(("VIA_TEST_HARNESS_PROCESSES", "1".to_owned()));
         let daemon = sandbox.start()?;
         let (holder, _) = sandbox.spawn("holder", &[])?;
         sandbox.await_file("holder.entered")?;

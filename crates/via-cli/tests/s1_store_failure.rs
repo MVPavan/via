@@ -1315,7 +1315,7 @@ fn s1_f12_submission_not_committed_fails_turn_without_launch() -> TestResult {
         wait_until("the permit is free", Duration::from_secs(20), || {
             sandbox
                 .status()
-                .is_ok_and(|status| status["connections"]["in_use"] == 1)
+                .is_ok_and(|status| status["harness_processes"]["in_use"] == 1)
         })?;
         let failure = store_failure(&sandbox)?;
         check(
@@ -1671,7 +1671,7 @@ fn s1_f12_force_rider_rollback_retries() -> TestResult {
             // One permit: the second session's turn waits for it, queued.
             sandbox
                 .env
-                .push(("VIA_TEST_CONNECTION_SLOTS", "1".to_owned()));
+                .push(("VIA_TEST_HARNESS_PROCESSES", "1".to_owned()));
             sandbox.count("core.dispatch.awaiting_slot")?;
             let mut daemon = sandbox.start()?;
             sandbox.spawn("holder")?;
@@ -1892,7 +1892,7 @@ fn host_journal_failure_stops_group(point: &str) -> TestResult {
 /// Design §7.2 rows 4 and 12 [s1.6]: an anchor identified write that is
 /// not committed, with the anchor held at `host.anchor.before_eof_cleanup`,
 /// leaves absence unproven: the slot stays held
-/// (`connections.held_unproven`). After release, re-probe commits the
+/// (`harness_processes.held_unproven`). After release, re-probe commits the
 /// proof with the identity Host kept in memory and frees the slot. The
 /// proof's own commit: not committed once, it is retried on the next pass
 /// and nothing latches; uncertain (the commit outlives the pass), the
@@ -1927,7 +1927,7 @@ fn unproven_slot_reprobed(proof: &str) -> TestResult {
         || format!("unexpected turn 1: {first}"),
     )?;
     let held = sandbox.status()?;
-    check(held["connections"]["held_unproven"] == 1, || {
+    check(held["harness_processes"]["held_unproven"] == 1, || {
         format!("the slot is not held: {held}")
     })?;
     match proof {
@@ -1962,7 +1962,7 @@ fn unproven_slot_reprobed(proof: &str) -> TestResult {
         || {
             sandbox
                 .status()
-                .is_ok_and(|status| status["connections"]["held_unproven"] == 0)
+                .is_ok_and(|status| status["harness_processes"]["held_unproven"] == 0)
         },
     )?;
     let proved: i64 = sandbox.query(&format!(
@@ -2098,7 +2098,7 @@ fn s1_f12_resumed_paging_unproved_page_is_retried() -> TestResult {
         )?;
         let status = sandbox.status()?;
         check(
-            status["health"] == "healthy" && status["connections"]["held_unproven"] == 0,
+            status["health"] == "healthy" && status["harness_processes"]["held_unproven"] == 0,
             || format!("the retry latched or kept the slot: {status}"),
         )?;
         sandbox.ok(&["daemon", "stop", "--json"])?;

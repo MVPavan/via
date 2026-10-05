@@ -433,38 +433,44 @@ fn s1_config_is_read_at_start_validated_and_reported() -> TestResult {
             let daemon = setup.start(evidence)?;
             let status = setup.daemon_status(evidence, "status_defaults")?;
             check(
-                status["limits"] == defaults() && status["connections"]["limit"] == 8,
+                status["limits"] == defaults() && status["harness_processes"]["limit"] == 8,
                 || format!("no daemon.json: {status}"),
             )?;
             // Read once, at start: a file written now changes nothing yet.
             setup.config(
                 r#"{"disk":{"free_floor":1048576,"warn_size":2048},
                     "wal":{"max":5242880,"checkpoint_bytes":1052000,"checkpoint_commits":7},
-                    "connections":{"limit":3}}"#,
+                    "harness_processes":{"limit":3}}"#,
             )?;
             let status = setup.daemon_status(evidence, "status_unchanged")?;
             check(
-                status["limits"] == defaults() && status["connections"]["limit"] == 8,
+                status["limits"] == defaults() && status["harness_processes"]["limit"] == 8,
                 || format!("a running daemon re-read daemon.json: {status}"),
             )?;
             daemon.shutdown()?;
             let daemon = setup.start(evidence)?;
             let status = setup.daemon_status(evidence, "status_lowered")?;
             // `checkpoint_bytes` applies as whole 4 KiB pages; the
-            // connection-slot pool is `connections.limit` (bead via-oq3).
+            // harness-process pool is `harness_processes.limit` (bead via-oq3).
             check(
                 status["limits"] == limits(MIB, 2048, 5 * MIB, 1_052_000 / 4096 * 4096, 7)
-                    && status["connections"]["limit"] == 3,
+                    && status["harness_processes"]["limit"] == 3,
                 || format!("lowered after a restart: {status}"),
             )?;
             daemon.shutdown()?;
 
             let runtime = &setup.sandbox.runtime;
             let state = &setup.sandbox.state;
-            let cases: [(&str, &str, &str); 15] = [
+            let cases: [(&str, &str, &str); 16] = [
+                // The pool's old name (owner, 2026-10-05).
                 (
-                    r#"{"connections":{"limit":0}}"#,
-                    "connections.limit",
+                    r#"{"connections":{"limit":4}}"#,
+                    "connections",
+                    "unknown key",
+                ),
+                (
+                    r#"{"harness_processes":{"limit":0}}"#,
+                    "harness_processes.limit",
                     "from 1 to 4294967295",
                 ),
                 // An explicit null is neither absent nor a value (review r1).
@@ -584,7 +590,7 @@ fn s1_config_is_read_at_start_validated_and_reported() -> TestResult {
             let _daemon = setup.start(evidence)?;
             let status = setup.daemon_status(evidence, "status_removed")?;
             check(
-                status["limits"] == defaults() && status["connections"]["limit"] == 8,
+                status["limits"] == defaults() && status["harness_processes"]["limit"] == 8,
                 || format!("daemon.json removed: {status}"),
             )?;
             setup.one_turn(evidence, "config")

@@ -62,7 +62,7 @@ impl fmt::Display for Invalid {
 #[serde(deny_unknown_fields)]
 struct File {
     #[serde(default, deserialize_with = "present")]
-    connections: Option<Box<RawValue>>,
+    harness_processes: Option<Box<RawValue>>,
     #[serde(default, deserialize_with = "present")]
     disk: Option<Box<RawValue>>,
     #[serde(default, deserialize_with = "present")]
@@ -73,7 +73,7 @@ struct File {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Connections {
+struct HarnessProcesses {
     #[serde(default, deserialize_with = "present")]
     limit: Option<Value>,
 }
@@ -172,17 +172,17 @@ fn parse(text: &[u8]) -> Result<Config, Invalid> {
         None => HarnessSettings::default(),
     };
     let mut limits = Limits::default();
-    if let Some(raw) = file.connections {
-        let connections: Connections = serde_json::from_str(raw.get())
-            .map_err(|error| refused(Some("connections"), &error))?;
-        if let Some(value) = connections.limit {
-            let slots = bytes("connections.limit", &value)?;
-            limits.connection_slots = u32::try_from(slots)
+    if let Some(raw) = file.harness_processes {
+        let processes: HarnessProcesses = serde_json::from_str(raw.get())
+            .map_err(|error| refused(Some("harness_processes"), &error))?;
+        if let Some(value) = processes.limit {
+            let slots = bytes("harness_processes.limit", &value)?;
+            limits.harness_processes = u32::try_from(slots)
                 .ok()
                 .and_then(NonZeroU32::new)
                 .ok_or_else(|| {
                     Invalid::new(
-                        "connections.limit",
+                        "harness_processes.limit",
                         format!("must be from 1 to {}", u32::MAX),
                     )
                 })?;
@@ -318,35 +318,51 @@ mod tests {
         );
     }
 
-    /// Bead via-oq3 (owner, 2026-10-04): `connections.limit` sets the
-    /// connection-slot pool, default 8, any value from 1; 0, `null`, a
-    /// fraction and an unknown member are refused naming the key.
+    /// Bead via-oq3 (owner, 2026-10-04; renamed 2026-10-05):
+    /// `harness_processes.limit` sets the harness-process pool, default 8,
+    /// any value from 1; 0, `null`, a fraction, an unknown member and the
+    /// old key `connections` are refused naming the key.
     #[test]
-    fn connections_limit_is_configurable_from_one() {
-        let slots = |text: &str| parse(text.as_bytes()).expect(text).limits.connection_slots;
-        assert_eq!(slots("{}").get(), 8);
-        assert_eq!(slots(r#"{"connections":{}}"#).get(), 8);
-        assert_eq!(slots(r#"{"connections":{"limit":1}}"#).get(), 1);
-        assert_eq!(slots(r#"{"connections":{"limit":32}}"#).get(), 32);
+    fn harness_processes_limit_is_configurable_from_one() {
+        let slots = |text: &str| {
+            parse(text.as_bytes())
+                .expect(text)
+                .limits
+                .harness_processes
+                .get()
+        };
+        assert_eq!(slots("{}"), 8);
+        assert_eq!(slots(r#"{"harness_processes":{}}"#), 8);
+        assert_eq!(slots(r#"{"harness_processes":{"limit":1}}"#), 1);
+        assert_eq!(slots(r#"{"harness_processes":{"limit":32}}"#), 32);
         assert_eq!(
-            slots(r#"{"connections":{"limit":4294967295}}"#).get(),
+            slots(r#"{"harness_processes":{"limit":4294967295}}"#),
             u32::MAX
         );
-        let range = "daemon config invalid: connections.limit: must be from 1 to 4294967295";
-        assert_eq!(invalid(r#"{"connections":{"limit":0}}"#), range);
-        assert_eq!(invalid(r#"{"connections":{"limit":4294967296}}"#), range);
+        let range = "daemon config invalid: harness_processes.limit: must be from 1 to 4294967295";
+        assert_eq!(invalid(r#"{"harness_processes":{"limit":0}}"#), range);
         assert_eq!(
-            invalid(r#"{"connections":{"limit":null}}"#),
-            "daemon config invalid: connections.limit: must be a non-negative integer at most 2^62"
-        );
-        assert!(invalid(r#"{"connections":{"limit":2.5}}"#).contains("connections.limit"));
-        assert_eq!(
-            invalid(r#"{"connections":{"slots":8}}"#),
-            "daemon config invalid: connections.slots: unknown key"
+            invalid(r#"{"harness_processes":{"limit":4294967296}}"#),
+            range
         );
         assert_eq!(
-            invalid(r#"{"connections":8}"#),
-            "daemon config invalid: connections: must be an object"
+            invalid(r#"{"harness_processes":{"limit":null}}"#),
+            "daemon config invalid: harness_processes.limit: must be a non-negative integer at most 2^62"
+        );
+        assert!(
+            invalid(r#"{"harness_processes":{"limit":2.5}}"#).contains("harness_processes.limit")
+        );
+        assert_eq!(
+            invalid(r#"{"harness_processes":{"slots":8}}"#),
+            "daemon config invalid: harness_processes.slots: unknown key"
+        );
+        assert_eq!(
+            invalid(r#"{"harness_processes":8}"#),
+            "daemon config invalid: harness_processes: must be an object"
+        );
+        assert_eq!(
+            invalid(r#"{"connections":{"limit":8}}"#),
+            "daemon config invalid: connections: unknown key"
         );
     }
 

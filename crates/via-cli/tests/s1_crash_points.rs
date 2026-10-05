@@ -434,7 +434,7 @@ impl<'a> Daemon<'a> {
         Ok(daemon)
     }
 
-    /// `start` with the connection-slot pool lowered to `slots` (design §11).
+    /// `start` with the harness-process pool lowered to `slots` (design §11).
     /// `fake` replaces the fake vendor binary path when given.
     fn start_slots(
         paths: &'a Paths,
@@ -484,7 +484,7 @@ impl<'a> Daemon<'a> {
         let mut command = paths.command();
         paths.failpoints.activate(&mut command);
         if let Some(slots) = slots {
-            command.env("VIA_TEST_CONNECTION_SLOTS", slots.to_string());
+            command.env("VIA_TEST_HARNESS_PROCESSES", slots.to_string());
         }
         if let Some(fake) = fake {
             command.env("VIA_FAKE_AGENT_BINARY", fake);
@@ -674,7 +674,7 @@ fn wait_hits(paths: &Paths, point: &str, at_least: u64) -> Result<(), ScenarioEr
     Ok(())
 }
 
-/// A turn reached a pending, registered connection-slot reservation (§10).
+/// A turn reached a pending, registered harness-process-slot reservation (§10).
 const AWAITING_SLOT: &str = "core.dispatch.awaiting_slot";
 
 /// Starts counting reservations that wait for a slot; call before the spawns.
@@ -2357,7 +2357,7 @@ fn six_held() -> Value {
     json!({"scripts":scripts})
 }
 
-/// Pins the connection-slot pool at four through `daemon.json` (runtime
+/// Pins the harness-process pool at four through `daemon.json` (runtime
 /// §8, bead via-oq3), the pool the T2-D scenarios hold six turns against;
 /// every later start of the scenario reads it too.
 fn four_slots(paths: &Paths) -> Result<(), ScenarioError> {
@@ -2368,7 +2368,7 @@ fn four_slots(paths: &Paths) -> Result<(), ScenarioError> {
         .open(paths.state.join("daemon.json"))
         .map_err(infra)?;
     config
-        .write_all(br#"{"connections":{"limit":4}}"#)
+        .write_all(br#"{"harness_processes":{"limit":4}}"#)
         .map_err(infra)
 }
 
@@ -2381,7 +2381,7 @@ fn release_six(paths: &Paths) -> Result<(), ScenarioError> {
 }
 
 /// Spawns six sessions and waits until four turns are accepted and holding
-/// and the other two wait, registered, for a connection slot.
+/// and the other two wait, registered, for a harness-process slot.
 fn spawn_six_held(paths: &Paths, evidence: &Evidence) -> Result<Vec<String>, ScenarioError> {
     count_waiters(paths)?;
     let mut sessions = Vec::new();
@@ -2421,7 +2421,7 @@ fn store_count(paths: &Paths, query: &str) -> Result<i64, ScenarioError> {
         .map_err(infra)
 }
 
-/// Four slots in use, two turns waiting for one: exactly four anchors, and
+/// Four slots in use (`harness_processes.limit` 4), two turns waiting for one: exactly four anchors, and
 /// the other two turns `queued` with no `submitted_at` and no anchor.
 fn check_four_running_two_waiting(paths: &Paths) -> Result<(), ScenarioError> {
     let anchors = store_count(paths, "SELECT count(*) FROM anchors")?;
@@ -2435,8 +2435,8 @@ fn check_four_running_two_waiting(paths: &Paths) -> Result<(), ScenarioError> {
     })
 }
 
-/// T2-D 1 (design §11, runtime §8): six held turns and four connection slots
-/// (`connections.limit` 4).
+/// T2-D 1 (design §11, runtime §8): six held turns and four harness-process slots
+/// (`harness_processes.limit` 4).
 /// Exactly four anchors exist at once; the other two turns stay `queued` with
 /// no `submitted_at` and no anchor until a slot frees, and then all six
 /// complete. Before T2-D all six launched at once.
@@ -2573,7 +2573,7 @@ fn spawn_session(
         .to_owned())
 }
 
-/// A turn that waits for a connection slot: its reservation is pending and
+/// A turn that waits for a harness-process slot: its reservation is pending and
 /// registered, and it is still `queued`, never submitted and never
 /// launched. Counting began with [`count_waiters`] before its spawn.
 fn still_waiting(paths: &Paths, session: &str) -> Result<(), ScenarioError> {

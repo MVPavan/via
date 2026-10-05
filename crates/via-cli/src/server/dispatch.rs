@@ -377,15 +377,15 @@ async fn dispatch(method: &str, params: &str, client: &Client) -> Result<Box<Raw
             typed::<DaemonStatusParams>(params)?;
             // Memory only: no Store read (design §6.6, §7.5).
             let counts = engine.counts();
-            let connections = counts.connections;
+            let processes = counts.harness_processes;
             raw(
                 &json!({"daemon_version":crate::client::binary_version(),"pid":std::process::id(),
                 "socket_path":socket_path,"store_path":store_path,"health":engine.health(),
                 "store_failure":engine.store_failure_status(),
                 "started_at":engine.started_at(),
                 "sessions":{"idle":counts.idle,"active":counts.active,"closing":counts.closing},
-                "connections":{"limit":connections.limit,"in_use":connections.in_use,
-                    "held_unproven":connections.held_unproven},
+                "harness_processes":{"limit":processes.limit,"in_use":processes.in_use,
+                    "held_unproven":processes.held_unproven},
                 "servers":engine.servers(),
                 // Task 4 design §5.3, §5.5 (A37).
                 "limits":engine.limits().to_value(),

@@ -1,6 +1,6 @@
 //! Task 4 design §5.1 (A43) through the real `via` binary and daemon: the
 //! F24 memory gate. Every kind of holder is driven towards its maximum at
-//! once: a running turn in each of the configured connection slots (8,
+//! once: a running turn in each of the configured harness-process slots (8,
 //! the default), each with its 16 MiB prompt dispatched, all but one of
 //! them flooding maximal vendor messages, and every other C1 socket
 //! sending maximal request lines (1 MiB with a 65,000-node list) that read
@@ -47,7 +47,7 @@ const HANDLE: &str = "h_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const MIB: u64 = 1024 * 1024;
 /// A dispatched prompt at `PROMPT_MAX` (design §5.2).
 const PROMPT: usize = 16 * 1024 * 1024;
-/// The connection slots the gate runs with, the default (bead via-oq3),
+/// The harness-process slots the gate runs with, the default (bead via-oq3),
 /// written to `daemon.json`: one held turn and the rest flooding fill them.
 const SLOTS: u64 = 8;
 /// Flooding turns: every slot but the held turn's.
@@ -313,7 +313,10 @@ fn s1_f24_flood_fails_overflow_with_bounded_rss_and_prompt_control() -> TestResu
     let evidence = Evidence::new("s1_f24_flood_rss", &sandbox.fake, &sandbox.fixture)?;
     // The gate's slot count, explicit so the sum below follows it.
     let config = sandbox.state.join("daemon.json");
-    fs::write(&config, json!({"connections":{"limit":SLOTS}}).to_string())?;
+    fs::write(
+        &config,
+        json!({"harness_processes":{"limit":SLOTS}}).to_string(),
+    )?;
     fs::set_permissions(&config, fs::Permissions::from_mode(0o600))?;
     let report = run_scenario(
         evidence,
@@ -344,10 +347,10 @@ fn s1_f24_flood_fails_overflow_with_bounded_rss_and_prompt_control() -> TestResu
                 sandbox.await_gate(&format!("f{index}_0"))?;
             }
             // Every slot holds a running turn: each per-slot holder is live.
-            let connections = direct_status(&sandbox.runtime)?["connections"].clone();
+            let processes = direct_status(&sandbox.runtime)?["harness_processes"].clone();
             check(
-                connections["limit"] == SLOTS && connections["in_use"] == SLOTS,
-                || format!("the slots are not all in use: {connections}"),
+                processes["limit"] == SLOTS && processes["in_use"] == SLOTS,
+                || format!("the slots are not all in use: {processes}"),
             )?;
             let mut controls = Controls::open(&sandbox)?;
             controls.round(&held, &held)?;

@@ -572,7 +572,7 @@ decision A, 2026-10-01; adapter design AD20 and AR2).
 
 **Non-turn owners (AR6).** `ProcessOwner` is `Turn {session_id, turn}`
 or `Server {server_id}`. A server is a private group with no turn owner:
-Host starts it, holds its connection slot for its life (C2 §3),
+Host starts it, holds its harness-process slot for its life (C2 §3),
 supervises its exit and stops it only on idle retirement, server loss, a
 failed open or daemon shutdown; Host stays protocol- and key-free.
 `ProcessControl::link_turn` commits a server-route turn's link to its
@@ -1047,7 +1047,7 @@ would otherwise fail every launch.
 ```text
 <state>/
   store.lock                 persistent Store-owner lock inode
-  daemon.json                optional daemon config: disk floor and warning, WAL, connection slots (§8); adapter-owned `harnesses` (§8)
+  daemon.json                optional daemon config: disk floor and warning, WAL, harness processes (§8); adapter-owned `harnesses` (§8)
   via.log                    daemon warnings and errors; via.log.1 after rotation past 10 MiB (§6.2)
   store.sqlite3              SQLite database (user_version schema)
   store.sqlite3-wal          SQLite-owned sidecar when present
@@ -1309,16 +1309,16 @@ Daemon-crash recovery produces no leftover report: recovered turns carry
 Defaults below are S1 acceptance constants, not throughput claims. Tests may
 reduce durations/capacities through explicit test config while separately
 testing default ceilings. Only the `daemon.json` keys (disk free-space floor,
-data-size warning, WAL limit and checkpoint triggers, the connection-slot
-count, and the adapter-owned `harnesses` settings; see the end of this
+data-size warning, WAL limit and checkpoint triggers, the harness-process
+limit, and the adapter-owned `harnesses` settings; see the end of this
 section) are configurable; C1, C2 and every other limit here are fixed
-(T4-A37; connection slots: owner, 2026-10-04). All
+(T4-A37; harness processes: owner, 2026-10-04, renamed 2026-10-05). All
 payload limits count encoded bytes plus separately bounded decoded structure.
 
 | Resource | Default hard bound | Full/expired behavior |
 |---|---:|---|
-| Active private connections | `daemon.json` `connections.limit` live connections daemon-wide, default 8, any value from 1 to 2^32 − 1 (per-turn process or persistent server, each with its anchor; a shared server holds its slot for its whole life); a slot is reserved only for a new connection (C2 §3, AD16) | Queue eligible work; do not create a child until a slot is reserved |
-| OpenCode owned servers | One per launch key, at most one per namespace (anchor-fenced); each holds one connection slot; one SSE stream and 8 request connections (2 decline, 2 stop, 4 general) | Same as Codex servers; an unknown request effect drains and retires the server (`vendors/opencode.md` §8) |
+| Harness processes | `daemon.json` `harness_processes.limit` running harness processes VIA started, daemon-wide, each with its anchor: default 8, any value from 1 to 2^32 − 1. A per-turn process (CLI route, Pi RPC) holds a slot for its turn; a shared server (Codex app-server, OpenCode serve) holds one for its whole life, however many sessions it serves. A slot is reserved only for a new process (C2 §3, AD16) | Queue eligible work; do not create a child until a slot is reserved |
+| OpenCode owned servers | One per launch key, at most one per namespace (anchor-fenced); each holds one harness-process slot; one SSE stream and 8 request connections (2 decline, 2 stop, 4 general) | Same as Codex servers; an unknown request effect drains and retires the server (`vendors/opencode.md` §8) |
 | OpenCode SSE and retained state | 1 MiB event; staging 1,024/4 MiB per server; lanes 16/1 MiB per session; per server 1,024 session states, 4,096 tombstoned turns, 4,096 child sessions, 64 pending interactive requests, 64 unanswered requests; 45 s silence | Event, staging or count overflow: server generation `overflow`; full lane: driver overflow as Codex; silence: transport loss |
 | Queued turns | 8/session, 128 daemon-wide | `queue_full` / `admission_refused` before commit |
 | Session lanes (resident actors) | 320 daemon-wide, each counted from its creation until it has ended, whether serving, idle or retiring; at most 32 idle: no turn running or queued and a drained observation channel | Checked whenever a lane becomes idle: past 32, the least recently used idle lanes retire at once, their drivers closed gracefully within 3 s (C2 §3, idle lanes). A dispatch that needs a new lane while 320 exist counts the lanes already ending, retires further least recently used idle lanes (even within 32) when the waiters need more, and waits, its turn still queued, until a lane has ended or the turn is cancelled, closed, forced or failed by the Store; a dispatch to a retiring lane waits for its end, then reopens the session from its stored identity |
@@ -1368,7 +1368,7 @@ service; a request flood cannot starve commits. At most 128 ready data items
 are processed before checking deadlines/control/health again. F24 must measure
 control response scheduling within 100 ms absent OS scheduling starvation.
 
-Each anchor (at most one per connection slot) is limited to one 64 KiB
+Each anchor (one per harness process) is limited to one 64 KiB
 launch spec and 64 KiB control/diagnostic staging, plus its vendor-stderr
 buffers (§4: 9 MiB per turn, 24 MiB per server); its measured RSS ceiling
 is 32 MiB. Anchor RSS is
@@ -1377,7 +1377,7 @@ session cache and never receive queued prompts.
 There is no memory pool, byte counter or memory setting. The daemon's
 worst case is the sum over holders of each holder's fixed buffers times
 its fixed count (C1 sockets, connections, running turns, the Store): about
-210 MiB, plus 30.4 MiB per connection slot (a Wire connection and a running
+210 MiB, plus 30.4 MiB per harness-process slot (a Wire connection and a running
 turn), estimated; 453 MiB at the default 8 slots. F24 drives every holder to
 its maximum at once, for the slots it configures, and records RSS at 10 ms
 intervals; the daemon's peak RSS less its idle baseline must stay within
@@ -1400,7 +1400,7 @@ the shipped allocator (platform-packaging §1), is the authoritative memory
 gate.
 The disk free-space floor, the data-size warning, the WAL limit and its
 checkpoint triggers are keys of `daemon.json` in the state directory, with
-provisional defaults, as is `connections.limit`, the connection-slot count
+provisional defaults, as is `harness_processes.limit`, the harness-process limit
 (default 8; owner, 2026-10-04). The daemon reads it once at start; a change takes
 effect at the next start, and an invalid file refuses to start with a named
 error. The optional `harnesses` member is passed unparsed to `via-adapters`'
@@ -1421,7 +1421,7 @@ Codex task measures one server with 32 leased sessions and 32 concurrent
 active turns under both assertions above, with these holders added to
 the sum, and reports the marginal cost per active turn; that result
 qualifies at most 32 concurrent active turns on one server. Several loaded
-servers, up to the connection-slot count, are an extrapolation, and the unresolved-turn maximum is not
+servers, up to the harness-process limit, are an extrapolation, and the unresolved-turn maximum is not
 qualified.
 The S1 fake RSS result alone does not qualify this shared-server extension.
 For the OpenCode extension, Adapter owns the launch key and recipe; Routes

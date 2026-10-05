@@ -65,7 +65,7 @@ transactions. Adapter owns canonical mapping, capabilities, normalization
 and cleanup evidence. A concrete `CodexConnection` in Routes owns typed
 methods, request pairing and thread demultiplexing. Wire owns bounded JSONL,
 and transport. Host owns the server process, its verified identity, its
-connection slot and whole-server shutdown. Routes owns the shared-server
+harness-process slot and whole-server shutdown. Routes owns the shared-server
 registry: the server key map, reservations, pins and leases, the
 idle-retirement trigger, and supervised launch, connection and retirement
 tasks, beside the connection's thread table. Follow runtime §2's opaque
@@ -99,7 +99,7 @@ own 60 s deadline from spawn, independent of any turn; a waiting turn's own
 wall, stop or force ends only its wait.
 
 Each session has one lease and a registered thread ID. One shared server holds
-one of the runtime's connection slots (runtime §8) for its life; a turn on a live
+one of the runtime's harness-process slots (runtime §8) for its life; a turn on a live
 server pins it and takes no further slot (C2 §3 connection admission). No
 lease or outstanding-RPC admission cap applies beyond the runtime's bounds:
 resident lanes, eight controls per driver (two reserved for interrupt and
@@ -436,8 +436,8 @@ observation budget. No lease cap bounds active turns on one server below
 the runtime's unresolved-turn bound. The RSS measurement uses one server
 with 32 leased sessions and 32 concurrent active turns, applies runtime
 §8's relative method and growth assertion with these holders added, and
-qualifies only up to 32 concurrent active turns on one server; four
-loaded servers are an extrapolation. Do not preallocate 4 MiB for every
+qualifies only up to 32 concurrent active turns on one server; several
+loaded servers, up to the harness-process limit, are an extrapolation. Do not preallocate 4 MiB for every
 idle lease or assume S1's RSS result covers this extension. A failure
 requires design review, not silent ceiling growth.
 

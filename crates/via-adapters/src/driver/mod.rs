@@ -176,7 +176,7 @@ pub struct TurnCx {
     pub turn: TurnNumber,
     /// What `prepare` answered at dispatch.
     pub prepared: Prepared,
-    /// The connection slot Core reserved, for `NeedsConnection`.
+    /// The harness-process slot Core reserved, for `NeedsConnection`.
     pub capacity: Option<CapacityToken>,
     /// The turn's activity clock.
     pub activity: TurnActivity,

@@ -670,7 +670,7 @@ impl Servers {
     }
 
     /// Item 2.2 `prepare`: a pin on the live or launching server of `key`,
-    /// else `None` (the turn needs a connection slot). A live server whose
+    /// else `None` (the turn needs a harness-process slot). A live server whose
     /// connection failed leaves the key here, so the next turn launches a
     /// new one.
     pub fn pin(&self, key: &ServerKey) -> Option<ServerPin> {

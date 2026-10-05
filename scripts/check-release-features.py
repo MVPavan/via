@@ -192,7 +192,7 @@ OVERRIDES = {
     # Task 4 T4-6 (design §6.4): the final-text file cap.
     "VIA_TEST_FINAL_TEXT_FILE_MAX": "1",
 }
-MARKERS = [*ACTIVATION, *POINTS, *OVERRIDES, "failpoint controller", "VIA_TEST_CONNECTION_SLOTS"]
+MARKERS = [*ACTIVATION, *POINTS, *OVERRIDES, "failpoint controller", "VIA_TEST_HARNESS_PROCESSES"]
 FIXTURE = {
     "expected_request": {"type": "start", "id": 1, "turn": 1, "prompt": "release"},
     "steps": [

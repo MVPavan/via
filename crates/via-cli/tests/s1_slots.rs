@@ -1,5 +1,5 @@
 //! Bead via-oq3 (owner, 2026-10-04) through the real `via` binary and
-//! daemon: the connection-slot pool is `daemon.json`'s `connections.limit`
+//! daemon: the harness-process pool is `daemon.json`'s `harness_processes.limit`
 //! (runtime §8). With 32 slots, 32 turns run their fake agents at once,
 //! end to end; the daemon's RSS stays within the memory gate re-sized for
 //! 32 slots (Task 4 design §5.1), and every turn's cleanup is proved.
@@ -30,7 +30,7 @@ use serde_json::{Value, json};
 use support::evidence::Evidence;
 
 const HANDLE: &str = "h_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-/// The configured connection slots, and the turns run at once.
+/// The configured harness-process slots, and the turns run at once.
 const SLOTS: u64 = 32;
 /// Model steps each turn reports: a tool round ended by model output.
 const STEPS: u64 = 4;
@@ -97,7 +97,7 @@ fn until<T>(
     }
 }
 
-/// Bead via-oq3, owner release requirement: with `connections.limit` 32,
+/// Bead via-oq3, owner release requirement: with `harness_processes.limit` 32,
 /// 32 per-turn agents run at once (every gate entered while `daemon/status`
 /// reports 32 of 32 slots in use); every turn completes; the daemon's peak
 /// RSS less its idle baseline stays within 1.25 × the §5.1 sum for 32
@@ -112,7 +112,10 @@ fn until<T>(
 fn s1_slots_32_parallel_turns_complete_within_rss_and_clean_up() -> TestResult {
     let sandbox = Sandbox::new(&json!({"scripts": (0..SLOTS).map(script).collect::<Vec<_>>()}))?;
     let config = sandbox.state.join("daemon.json");
-    fs::write(&config, json!({"connections":{"limit":SLOTS}}).to_string())?;
+    fs::write(
+        &config,
+        json!({"harness_processes":{"limit":SLOTS}}).to_string(),
+    )?;
     fs::set_permissions(&config, fs::Permissions::from_mode(0o600))?;
     let fake = fs::canonicalize(&sandbox.fake)?;
     let via = fs::canonicalize(&sandbox.via)?;
@@ -162,11 +165,12 @@ fn s1_slots_32_parallel_turns_complete_within_rss_and_clean_up() -> TestResult {
             let all_running = started.elapsed();
             let status = call(&mut raw, next(), "daemon/status", &json!({}))?;
             check(
-                status["connections"]["limit"] == SLOTS && status["connections"]["in_use"] == SLOTS,
+                status["harness_processes"]["limit"] == SLOTS
+                    && status["harness_processes"]["in_use"] == SLOTS,
                 || {
                     format!(
                         "32 agents without 32 slots in use: {}",
-                        status["connections"]
+                        status["harness_processes"]
                     )
                 },
             )?;
@@ -174,6 +178,20 @@ fn s1_slots_32_parallel_turns_complete_within_rss_and_clean_up() -> TestResult {
             check(agents == 32, || {
                 format!("{agents} fake agents alive, not 32")
             })?;
+            // Every agent's anchor is live while the agents wait: counted
+            // here, not left to the sampler's periodic discovery scans.
+            let anchors: Vec<u32> = until("32 live anchors", || {
+                let anchors: Vec<u32> = processes_of(&via)
+                    .into_iter()
+                    .filter(|other| *other != pid && rss::is_anchor(*other))
+                    .collect();
+                Ok((anchors.len() == 32).then_some(anchors))
+            })?;
+            let anchor_hwm = anchors
+                .iter()
+                .filter_map(|anchor| status_kib(*anchor, "VmHWM:"))
+                .max()
+                .unwrap_or(0);
             for index in 0..SLOTS {
                 sandbox.release_gate(&format!("g{index}"))?;
             }
@@ -208,10 +226,10 @@ fn s1_slots_32_parallel_turns_complete_within_rss_and_clean_up() -> TestResult {
             }
             let released = until("every slot released", || {
                 let status = call(&mut raw, next(), "daemon/status", &json!({}))?;
-                let connections = status["connections"].clone();
+                let processes = status["harness_processes"].clone();
                 Ok(
-                    (connections["in_use"] == 0 && connections["held_unproven"] == 0)
-                        .then_some(connections),
+                    (processes["in_use"] == 0 && processes["held_unproven"] == 0)
+                        .then_some(processes),
                 )
             })?;
             let cleaned = started.elapsed();
@@ -234,14 +252,21 @@ fn s1_slots_32_parallel_turns_complete_within_rss_and_clean_up() -> TestResult {
                 .max()
                 .unwrap_or(0);
             let peak = peak_hwm.max(peak_sampled);
-            let anchor_peak = samples.anchors.values().copied().max().unwrap_or(0);
+            let anchor_peak = samples
+                .anchors
+                .values()
+                .copied()
+                .max()
+                .unwrap_or(0)
+                .max(anchor_hwm);
             let metrics = json!({
                 "slots": SLOTS, "baseline_kib": baseline, "peak_kib": peak,
                 "peak_hwm_kib": peak_hwm, "peak_sampled_kib": peak_sampled,
                 "limit_kib": limit_kib(SLOTS), "samples": samples.daemon.len(),
-                "anchors": samples.anchors.len(), "anchor_peak_kib": anchor_peak,
+                "anchors": anchors.len(), "anchors_sampled": samples.anchors.len(),
+                "anchor_peak_kib": anchor_peak,
                 "all_running_ms": all_running.as_millis(), "all_ended_ms": all_ended.as_millis(),
-                "cleaned_ms": cleaned.as_millis(), "connections": released,
+                "cleaned_ms": cleaned.as_millis(), "harness_processes": released,
                 "left": {"anchors": left.0, "agents": left.1},
                 "malloc_arena_max": GLIBC_ARENAS,
             });
@@ -289,10 +314,9 @@ fn s1_slots_32_parallel_turns_complete_within_rss_and_clean_up() -> TestResult {
             check(peak.saturating_sub(baseline) <= limit_kib(SLOTS), || {
                 format!("peak RSS less baseline is over 1.25 × the §5.1 sum: {metrics}")
             })?;
-            check(
-                samples.anchors.len() >= 32 && anchor_peak <= 32 * 1024,
-                || format!("anchor RSS: {metrics}"),
-            )
+            check(anchor_peak <= 32 * 1024, || {
+                format!("anchor RSS: {metrics}")
+            })
         },
         |evidence| collect_available(evidence, &sandbox.state, &sandbox.teardown),
     );

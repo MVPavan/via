@@ -432,12 +432,12 @@ Contract points:
 | Canonical → vendor mapping, reserved keys | — | owns | typed calls | — | — |
 | Request pairing, server-request deadlines | — | answers (control path) | correlates | message splitting | — |
 | Cancel sequence, quiescence evidence | initiates; waits | owns | protocol call | forwards control/health | anchor issues own-group signal on verified request; group absence separately proven |
-| Backpressure | drains; fails `overflow` | bounded observations; independent control/health | bounded data | bounded staging; fails connection | supervises independently; one daemon connection slot per live connection, not per turn |
+| Backpressure | drains; fails `overflow` | bounded observations; independent control/health | bounded data | bounded staging; fails connection | supervises independently; one daemon harness-process slot per live harness process, not per turn |
 | Observation normalization, class hints | commits classes | owns | messages | bytes | exit status, death confirmation |
 
-**Connection admission (AD16).** A daemon connection slot (runtime §8: four)
-is held by each live connection: a per-turn process, a Codex shared server,
-or an OpenCode server. It is not held per turn.
+**Connection admission (AD16).** A daemon harness-process slot (runtime §8:
+`harness_processes.limit`, default 8) is held by each live harness process:
+a per-turn process, a Codex shared server, or an OpenCode server. It is not held per turn.
 At dispatch, before the grant:
 1. Core opens the session's logical driver if it has none (no vendor
    I/O; a lane opened for a turn that is then not submitted is retired

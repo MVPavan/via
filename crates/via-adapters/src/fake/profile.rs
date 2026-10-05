@@ -34,7 +34,7 @@ pub(crate) struct FakeProfile {
     #[serde(default)]
     pub(crate) categories: BTreeMap<Category, CategoryDecl>,
     /// The persistent-connection test profile (decision H1): the driver
-    /// keeps its connection slot between turns and pins it.
+    /// keeps its harness-process slot between turns and pins it.
     #[serde(default)]
     pub(crate) persistent: bool,
     /// The instance's version handshake (AD7), when the profile has one.

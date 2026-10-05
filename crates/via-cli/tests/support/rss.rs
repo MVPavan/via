@@ -1,5 +1,5 @@
 //! The daemon's memory gate (Task 4 design §5.1, runtime §8): the sum over
-//! holders for a connection-slot count, and a 10 ms sampler of the daemon's
+//! holders for a harness-process count, and a 10 ms sampler of the daemon's
 //! RSS, the fakes' written bytes and the anchors' peak RSS from `/proc`.
 
 use std::collections::HashMap;
@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Design §5.1's sum over holders in KiB for `slots` connection slots:
+/// Design §5.1's sum over holders in KiB for `slots` harness-process slots:
 /// 210.3 MiB that do not scale (32 C1 sockets at 6 MiB, the Store at
 /// 18.3 MiB) and 30.4 MiB per slot (a Wire connection at 6.3 MiB and a
 /// running turn at 24.1 MiB).

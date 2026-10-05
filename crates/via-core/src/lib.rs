@@ -88,8 +88,8 @@ mod schema;
 #[cfg(feature = "test-failpoints")]
 pub use engine::envelope_at_maximum;
 pub use engine::{
-    Connections, DaemonCounts, Engine, EngineShutdown, FailureBatches, FinalEntry, Handoff, Limits,
-    Receipted, StopMode,
+    DaemonCounts, Engine, EngineShutdown, FailureBatches, FinalEntry, Handoff, HarnessProcesses,
+    Limits, Receipted, StopMode,
 };
 
 /// Test builds only: the named failpoint controller (runtime-contracts §11),

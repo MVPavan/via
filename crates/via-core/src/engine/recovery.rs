@@ -549,7 +549,7 @@ impl Engine {
     }
 
     /// Design §11: a group an earlier daemon left, whose absence recovery did
-    /// not prove, holds a connection slot until a later Host absence proof
+    /// not prove, holds a harness-process slot until a later Host absence proof
     /// drops its token. Past the pool the groups share the permits held, so
     /// no new child starts until cleanup proves room.
     /// A server-owned group holds one by its server owner, never a

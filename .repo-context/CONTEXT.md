@@ -19,6 +19,10 @@ _Avoid_: agent (ambiguous), provider, backend
 L3's per-harness integration: maps VIA operations and parameters to a chosen route, declares capabilities, turns vendor messages into events, and classifies failures. Pinned and contract-tested against specific vendor versions.
 _Avoid_: profile, driver, plugin
 
+**Harness process**:
+A vendor process VIA started and owns, with its anchor: a per-turn process (CLI route, Pi RPC) or a shared server (Codex app-server, OpenCode serve). Each holds one slot of the daemon's `harness_processes.limit` for its life; a shared server holds one slot however many sessions it serves.
+_Avoid_: connection (Wire's connection is the byte stream to one process), agent instance
+
 ## Routes
 
 **Route**:

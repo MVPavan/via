@@ -225,7 +225,7 @@ fn native_capabilities() -> Value {
     })
 }
 
-/// A connection slot whose release the test can see.
+/// A harness-process slot whose release the test can see.
 struct Slot(Arc<AtomicBool>);
 
 impl Drop for Slot {

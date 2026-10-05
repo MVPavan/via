@@ -49,7 +49,7 @@ use journal::{Head, UncertainEvent, Unresolved};
 use latch::{FailureSite, WriteOutcome};
 use queue::{DAEMON_QUEUE_LIMIT, Slot};
 pub use recovery::Handoff;
-pub use status::{Connections, DaemonCounts, Limits};
+pub use status::{DaemonCounts, HarnessProcesses, Limits};
 pub use stop::{EngineShutdown, FinalEntry, StopMode};
 #[cfg(feature = "test-failpoints")]
 pub use terminal::envelope_at_maximum;
@@ -121,10 +121,10 @@ pub struct Engine {
     start_receiver: StdMutex<Option<mpsc::Receiver<SessionId>>>,
     /// Starts that found `starts` full; daemon main retries them.
     pending_starts: StdMutex<HashSet<SessionId>>,
-    /// Connection slots (design §11): a `Run` turn reserves one before its
+    /// Harness-process slots (design §11): a `Run` turn reserves one before its
     /// grant; at launch Host takes it for the group's life. FIFO waiters.
     slots: Arc<tokio::sync::Semaphore>,
-    /// The pool's size: `connections.limit` (design §6.6).
+    /// The pool's size: `harness_processes.limit` (design §6.6).
     slot_limit: usize,
     /// Resident session lanes (runtime §8, [`lane::RESIDENT_LANES`]): each
     /// lane holds one from its creation until it has ended. FIFO waiters.
@@ -314,10 +314,10 @@ fn lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// Most diagnostic blob steps running at once, overrun ones included.
 const DIAGNOSTIC_STEPS: usize = 2;
 
-/// The daemon-wide connection-slot pool (design §11) of `limit` slots, the
+/// The daemon-wide harness-process pool (design §11) of `limit` slots, the
 /// daemon config's, and its size. Test builds only:
-/// `VIA_TEST_CONNECTION_SLOTS` lowers it.
-fn connection_slots(limit: std::num::NonZeroU32) -> (Arc<tokio::sync::Semaphore>, usize) {
+/// `VIA_TEST_HARNESS_PROCESSES` lowers it.
+fn process_slots(limit: std::num::NonZeroU32) -> (Arc<tokio::sync::Semaphore>, usize) {
     // A `u32` count fits `usize` on every supported (64-bit) target; the
     // clamp keeps `Semaphore::new` from panicking anywhere else.
     let limit = usize::try_from(limit.get())
@@ -325,7 +325,7 @@ fn connection_slots(limit: std::num::NonZeroU32) -> (Arc<tokio::sync::Semaphore>
         .min(tokio::sync::Semaphore::MAX_PERMITS);
     let slots = Arc::new(tokio::sync::Semaphore::new(limit));
     #[cfg(feature = "test-failpoints")]
-    if let Some(lowered) = std::env::var("VIA_TEST_CONNECTION_SLOTS")
+    if let Some(lowered) = std::env::var("VIA_TEST_HARNESS_PROCESSES")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
     {
@@ -412,7 +412,7 @@ impl Engine {
         )
         .map_err(|error| error.to_string())?;
         let (starts, start_receiver) = mpsc::channel(start_capacity);
-        let (slots, slot_limit) = connection_slots(limits.connection_slots);
+        let (slots, slot_limit) = process_slots(limits.harness_processes);
         Ok(Arc::new_cyclic(|me| Self {
             me: me.clone(),
             _store_owner: owner,
