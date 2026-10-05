@@ -711,13 +711,15 @@ stands.
 
 ## 14. Owner questions
 
-| # | Question | Proposal |
-|---|---|---|
-| Q2 | The project switch follows instruction files (OD2 default on), which also loads each location's project agents, plugins, MCP servers and settings into the shared server; spawns then warn `config_switch_unverified` for agents, plugins, MCP and hooks | Accept with L4–L5 before release; the alternative, project config off by default, changes OD2's default |
+None open.
 
-Decided (owner, 2026-10-05): **Q10**, an unknown request effect drains and
-restarts the server generation, stopping any unowned execution after
-unrelated turns finish (§8); **Q11**, relaxed credential check (§4.3).
+Decided (owner, 2026-10-05): **Q2**, the project switch follows instruction
+files (OD2 default on) and loads each location's project agents, plugins,
+MCP servers and settings; spawns warn `config_switch_unverified` for agents,
+plugins, MCP and hooks until L4–L5 qualify them before release; **Q10**, an
+unknown request effect drains and restarts the server generation, stopping
+any unowned execution after unrelated turns finish (§8); **Q11**, relaxed
+credential check (§4.3).
 Earlier questions were accepted as proposed (history file).
 
 ## 15. Contract amendments (record)
