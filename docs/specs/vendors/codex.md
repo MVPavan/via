@@ -99,7 +99,7 @@ own 60 s deadline from spawn, independent of any turn; a waiting turn's own
 wall, stop or force ends only its wait.
 
 Each session has one lease and a registered thread ID. One shared server holds
-one of the runtime's four connection slots for its life; a turn on a live
+one of the runtime's connection slots (runtime §8) for its life; a turn on a live
 server pins it and takes no further slot (C2 §3 connection admission). No
 lease or outstanding-RPC admission cap applies beyond the runtime's bounds:
 resident lanes, eight controls per driver (two reserved for interrupt and

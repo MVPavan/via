@@ -1047,7 +1047,7 @@ would otherwise fail every launch.
 ```text
 <state>/
   store.lock                 persistent Store-owner lock inode
-  daemon.json                optional daemon config: disk floor and warning, WAL (§8); adapter-owned `harnesses` (§8)
+  daemon.json                optional daemon config: disk floor and warning, WAL, connection slots (§8); adapter-owned `harnesses` (§8)
   via.log                    daemon warnings and errors; via.log.1 after rotation past 10 MiB (§6.2)
   store.sqlite3              SQLite database (user_version schema)
   store.sqlite3-wal          SQLite-owned sidecar when present
@@ -1309,15 +1309,16 @@ Daemon-crash recovery produces no leftover report: recovered turns carry
 Defaults below are S1 acceptance constants, not throughput claims. Tests may
 reduce durations/capacities through explicit test config while separately
 testing default ceilings. Only the `daemon.json` keys (disk free-space floor,
-data-size warning, WAL limit and checkpoint triggers, and the adapter-owned
-`harnesses` settings; see the end of this section) are configurable; C1, C2
-and every other limit here are fixed (T4-A37). All
+data-size warning, WAL limit and checkpoint triggers, the connection-slot
+count, and the adapter-owned `harnesses` settings; see the end of this
+section) are configurable; C1, C2 and every other limit here are fixed
+(T4-A37; connection slots: owner, 2026-10-04). All
 payload limits count encoded bytes plus separately bounded decoded structure.
 
 | Resource | Default hard bound | Full/expired behavior |
 |---|---:|---|
-| Active private connections | Four live connections daemon-wide (per-turn process or persistent server, each with its anchor); a slot is reserved only for a new connection (C2 §3, AD16) | Queue eligible work; do not create a child until a slot is reserved |
-| OpenCode owned servers | One per launch key, at most one per namespace (anchor-fenced); each holds one of the four connection slots; one SSE stream and 8 request connections (2 decline, 2 stop, 4 general) | Same as Codex servers; an unknown request effect drains and retires the server (`vendors/opencode.md` §8) |
+| Active private connections | `daemon.json` `connections.limit` live connections daemon-wide, default 8, any value from 1 to 2^32 − 1 (per-turn process or persistent server, each with its anchor; a shared server holds its slot for its whole life); a slot is reserved only for a new connection (C2 §3, AD16) | Queue eligible work; do not create a child until a slot is reserved |
+| OpenCode owned servers | One per launch key, at most one per namespace (anchor-fenced); each holds one connection slot; one SSE stream and 8 request connections (2 decline, 2 stop, 4 general) | Same as Codex servers; an unknown request effect drains and retires the server (`vendors/opencode.md` §8) |
 | OpenCode SSE and retained state | 1 MiB event; staging 1,024/4 MiB per server; lanes 16/1 MiB per session; per server 1,024 session states, 4,096 tombstoned turns, 4,096 child sessions, 64 pending interactive requests, 64 unanswered requests; 45 s silence | Event, staging or count overflow: server generation `overflow`; full lane: driver overflow as Codex; silence: transport loss |
 | Queued turns | 8/session, 128 daemon-wide | `queue_full` / `admission_refused` before commit |
 | Session lanes (resident actors) | 320 daemon-wide, each counted from its creation until it has ended, whether serving, idle or retiring; at most 32 idle: no turn running or queued and a drained observation channel | Checked whenever a lane becomes idle: past 32, the least recently used idle lanes retire at once, their drivers closed gracefully within 3 s (C2 §3, idle lanes). A dispatch that needs a new lane while 320 exist counts the lanes already ending, retires further least recently used idle lanes (even within 32) when the waiters need more, and waits, its turn still queued, until a lane has ended or the turn is cancelled, closed, forced or failed by the Store; a dispatch to a retiring lane waits for its end, then reopens the session from its stored identity |
@@ -1367,18 +1368,23 @@ service; a request flood cannot starve commits. At most 128 ready data items
 are processed before checking deadlines/control/health again. F24 must measure
 control response scheduling within 100 ms absent OS scheduling starvation.
 
-Each of at most four anchors is limited to one 64 KiB launch spec and 64 KiB
-control/diagnostic staging; its measured RSS ceiling is 32 MiB. Anchor RSS is
+Each anchor (at most one per connection slot) is limited to one 64 KiB
+launch spec and 64 KiB control/diagnostic staging, plus its vendor-stderr
+buffers (§4: 9 MiB per turn, 24 MiB per server); its measured RSS ceiling
+is 32 MiB. Anchor RSS is
 reported separately from the daemon and vendor in F24. Anchors load no SQLite or runtime
 session cache and never receive queued prompts.
 There is no memory pool, byte counter or memory setting. The daemon's
 worst case is the sum over holders of each holder's fixed buffers times
-its fixed count (C1 sockets, connections, running turns, the Store), about
-332 MiB estimated. F24 drives every holder to its maximum at once and
-records RSS at 10 ms intervals; the daemon's peak RSS less its idle
-baseline must stay within that sum plus a 25% margin for allocator
-overhead and CI variance, and growth must stay below 32 MiB after the
-first 64 MiB of a 256 MiB flood. RSS is an empirical gate, not a
+its fixed count (C1 sockets, connections, running turns, the Store): about
+210 MiB, plus 30.4 MiB per connection slot (a Wire connection and a running
+turn), estimated; 453 MiB at the default 8 slots. F24 drives every holder to
+its maximum at once, for the slots it configures, and records RSS at 10 ms
+intervals; the daemon's peak RSS less its idle baseline must stay within
+that sum plus a 25% margin for allocator overhead and CI variance, and
+growth must stay below 32 MiB after the first 64 MiB of a 256 MiB flood,
+both sizes per three flooding turns (bead via-oq3: with more turns, each
+turn's holders fill later in a flood of the same total). RSS is an empirical gate, not a
 mathematical bound. Failure of either assertion requires correction or
 explicit design review, not silently enlarging the limit.
 Design review of the growth assertion: with glibc's default per-thread
@@ -1394,7 +1400,8 @@ the shipped allocator (platform-packaging §1), is the authoritative memory
 gate.
 The disk free-space floor, the data-size warning, the WAL limit and its
 checkpoint triggers are keys of `daemon.json` in the state directory, with
-provisional defaults. The daemon reads it once at start; a change takes
+provisional defaults, as is `connections.limit`, the connection-slot count
+(default 8; owner, 2026-10-04). The daemon reads it once at start; a change takes
 effect at the next start, and an invalid file refuses to start with a named
 error. The optional `harnesses` member is passed unparsed to `via-adapters`'
 `AdapterConfig` (adapter design §5.4): `harnesses.<name>.binary` (an absolute
@@ -1413,8 +1420,8 @@ controls and one decode allowance; per active turn, its prompt. The
 Codex task measures one server with 32 leased sessions and 32 concurrent
 active turns under both assertions above, with these holders added to
 the sum, and reports the marginal cost per active turn; that result
-qualifies at most 32 concurrent active turns on one server. Four loaded
-servers are an extrapolation, and the unresolved-turn maximum is not
+qualifies at most 32 concurrent active turns on one server. Several loaded
+servers, up to the connection-slot count, are an extrapolation, and the unresolved-turn maximum is not
 qualified.
 The S1 fake RSS result alone does not qualify this shared-server extension.
 For the OpenCode extension, Adapter owns the launch key and recipe; Routes

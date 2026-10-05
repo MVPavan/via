@@ -5,6 +5,7 @@
 
 use std::{
     collections::HashSet,
+    num::NonZeroU32,
     sync::{Arc, atomic::Ordering},
     time::{Duration, SystemTime},
 };
@@ -13,7 +14,7 @@ use serde_json::{Value, json};
 use via_store::{StoreError, WalLimits};
 
 use super::drive::Step;
-use super::queue::Slot;
+use super::queue::{DEFAULT_CONNECTION_SLOTS, Slot};
 use super::{Engine, lock};
 use crate::api::rfc3339;
 use crate::{ApiError, DescribeParams, ModelsParams, SessionId, TurnNumber};
@@ -54,16 +55,20 @@ pub struct Limits {
     pub warn_size: u64,
     /// The WAL thresholds (§5.4).
     pub wal: WalLimits,
+    /// The connection-slot pool's size (runtime §8; bead via-oq3):
+    /// `daemon/status` reports it as `connections.limit`.
+    pub connection_slots: NonZeroU32,
 }
 
 impl Default for Limits {
-    /// Design §5.5's defaults: a 5 GiB floor, a 2 GiB warning and the
-    /// default WAL thresholds.
+    /// Design §5.5's defaults: a 5 GiB floor, a 2 GiB warning, the
+    /// default WAL thresholds and 8 connection slots.
     fn default() -> Self {
         Self {
             free_floor: 5 * 1024 * 1024 * 1024,
             warn_size: 2 * 1024 * 1024 * 1024,
             wal: WalLimits::default(),
+            connection_slots: DEFAULT_CONNECTION_SLOTS,
         }
     }
 }

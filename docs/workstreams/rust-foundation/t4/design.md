@@ -510,20 +510,38 @@ and `PAGE_MAX`.
 There is no memory pool, counter or memory setting. Every buffer has a fixed
 maximum and every kind of holder a fixed count; this table is the whole
 account. Sizes are estimates **[I]**; the F24 RSS gate (§13.2) measures the
-sum and allows 1.25 × it (Q-R16-1, accepted [t4r16.7.4]).
+sum and allows 1.25 × it (Q-R16-1, accepted [t4r16.7.4]). The per-slot
+holders scale with the connection-slot count `S`, daemon config's
+`connections.limit` (§5.5), default 8 (owner, 2026-10-04, bead via-oq3;
+it was a fixed 4).
 
 | Holder | Count, fixed by | Largest buffers each | Each | Total |
 |---|---|---|---|---|
 | C1 socket | 32: the accept loop's `Semaphore(32)` (§10.1), one request at a time | the line (1 MiB); its decode: serde's scratch (≤ the longest string), decoded strings and `Box<RawValue>` copies (≤ the line), list headers (65,536 nodes × 24 B, doubled for `Vec` growth); the reply, built after those are dropped (≤ 1 MiB + 512 B); one 64 KiB blob chunk while copying a prompt file or comparing a replay | 6 MiB | 192 MiB |
-| Wire connection | 4: `CONNECTION_SLOTS` (`crates/via-core/src/engine/queue.rs:33` [V]) | read buffer 64 KiB; assembly buffer, one message (1 MiB); queue, 1,024 messages and 4 MiB (A47); the message Route holds (1 MiB); stdin piece buffer (96 KiB) and control queue (64 KiB); undecoded-message write (64 KiB) | 6.3 MiB | 25 MiB |
-| Running turn (Route, Adapter, Core drive) | 4: one per connection slot | hop (1 MiB) and decoded struct (≤ 1 MiB); observations 4 MiB (C2 A1); envelope accumulation (inline final text 256 KiB, lists 500 KiB) and its terminal encoding (1 MiB); step tracker, copy and carried rows (270 KiB); the dispatched prompt (≤ 16 MiB, §10.4) until its start is written | 24.1 MiB | 96.3 MiB |
+| Wire connection | `S`: the connection-slot pool (`DEFAULT_CONNECTION_SLOTS`, `crates/via-core/src/engine/queue.rs` [V]) | read buffer 64 KiB; assembly buffer, one message (1 MiB); queue, 1,024 messages and 4 MiB (A47); the message Route holds (1 MiB); stdin piece buffer (96 KiB) and control queue (64 KiB); undecoded-message write (64 KiB) | 6.3 MiB | 6.3 × `S` MiB |
+| Running turn (Route, Adapter, Core drive) | `S`: one per connection slot | hop (1 MiB) and decoded struct (≤ 1 MiB); observations 4 MiB (C2 A1); envelope accumulation (inline final text 256 KiB, lists 500 KiB) and its terminal encoding (1 MiB); step tracker, copy and carried rows (270 KiB); the dispatched prompt (≤ 16 MiB, §10.4) until its start is written | 24.1 MiB | 24.1 × `S` MiB |
 | Store | 1 | lanes 8 MiB (§6.1); the command or page in hand (≤ 2.3 MiB, §6.4); page cache 8 MiB (`cache_size=-8192`, `crates/via-store/src/runtime/sql.rs:140` [V]) | 18.3 MiB | 18.3 MiB |
-| **Sum** | | | | **≈ 332 MiB [I]** |
+| **Sum** | | | | **≈ 210.3 + 30.4 × `S` MiB [I]**: 332 at 4, 453 at the default 8, 1,183 at 32 |
 
 The sum has every holder at its maximum at once: 32 hostile maximal
-requests, four 16 MiB prompts, four flooding turns, full lanes. The gate's
+requests, `S` 16 MiB prompts, `S` flooding turns, full lanes. The gate's
 baseline covers what the table omits: the binary, tokio's and SQLite's other
 allocations, task stacks, fixed-size structs.
+
+**Anchors are outside the sum.** Each connection slot has one Host anchor, a
+separate process (runtime §8): a 64 KiB launch spec, 64 KiB control and
+diagnostic staging, and the vendor-stderr buffers of runtime §4 (head and
+tail, up to 9 MiB per turn or 24 MiB per server, plus a 64 KiB read
+buffer). Its measured RSS ceiling is 32 MiB each, so `S` anchors add up to
+32 × `S` MiB outside the daemon, reported separately by F24.
+
+**Measured** (bead via-oq3, debug build, glibc with `MALLOC_ARENA_MAX=2`):
+F24 at the default 8 slots peaked 103 to 117 MiB with a 22 MiB baseline
+(gate 567 MiB), growth after the warm-up at most 8.5 MiB over five runs;
+the 32-slot release test (`s1_slots_32_parallel_*`) ran 32 fake agents at
+once with a 36 MiB peak and a 23 MiB baseline (gate 1,479 MiB). The
+32-slot run holds no 16 MiB prompts or floods: the gate there is the
+estimate, not a measured worst case.
 
 **The per-message cap** [t4r16.1]. A vendor stdout message is at most
 `MAX_STDOUT_MESSAGE_BYTES` = 1 MiB (`crates/via-wire/src/lib.rs:11` [V];
@@ -631,21 +649,22 @@ it (§16; Q-R9-1 is that measurement item).
   world-writable), at most 64 KiB. Read once, at start, before `Store::open`
   and the socket; a change takes effect at the next start.
 - **Shape.** `{disk: {free_floor, warn_size}, wal: {max, checkpoint_bytes,
-  checkpoint_commits}}`, strict DTOs (`deny_unknown_fields`; serde refuses a
-  duplicate key). Every key is optional; values are non-negative integers
-  in bytes, except the commit count. Defaults: 5 GiB, 2 GiB, 32 MiB, 8 MiB,
-  1000.
+  checkpoint_commits}, connections: {limit}}`, strict DTOs
+  (`deny_unknown_fields`; serde refuses a duplicate key). Every key is
+  optional; values are non-negative integers in bytes, except the commit
+  count and the slot count. Defaults: 5 GiB, 2 GiB, 32 MiB, 8 MiB, 1000,
+  and 8 connection slots (owner, 2026-10-04, bead via-oq3).
 - **Validation**, each failure naming its key and rule: every value at most
   2^62; `wal.max` at least 4 MiB and above `checkpoint_bytes`;
   `checkpoint_bytes` at least one 4 KiB page, applied as whole pages;
-  `checkpoint_commits` from 1 to 2^32 − 1; `disk.free_floor` 0 turns the
-  floor off.
+  `checkpoint_commits` and `connections.limit` from 1 to 2^32 − 1;
+  `disk.free_floor` 0 turns the floor off.
 - **Invalid** (unreadable, not JSON, unknown or duplicate key, failed rule):
   the daemon writes `via: daemon config invalid: <key>: <rule>` to stderr
   and exits 78 (Q-R8-2) before any Store or socket change; the
   auto-starting CLI reports it.
 - **Reported**: `daemon/status` `limits` holds the five effective values
-  (A37, Q-R8-4).
+  (A37, Q-R8-4); `connections.limit` holds the slot count (§11.2).
 - **Fixed, not config:** every C1 limit, C2 A1, runtime §8's queues, the
   per-message cap, the undecoded-message prefix, the envelope bounds and
   final-text file cap (§6.4), the `via.log` rotation size, the Store lanes,
@@ -786,7 +805,8 @@ does its own I/O on the blocking pool (`spawn_blocking`, coding-style §5).
 - **Dispatch load.** The dispatcher loads the prompt blob into an exact
   `String` with a running SHA-256 and UTF-8 check (a mismatch fails the turn
   as corrupt evidence) and moves it into the streamed start (§8.3), which
-  drops it once written. Four slots bound this to four prompts (§5.1).
+  drops it once written. The connection slots bound this to one prompt per
+  slot (§5.1).
 - **Recovery.** `verify_blobs()` checks every referenced blob (regular file,
   length, SHA-256; else `Corrupt("blob")`); `sweep_blobs()` unlinks
   unreferenced files; both run on the SQLite thread before admission.
@@ -1859,7 +1879,7 @@ durable `output_schema` (§0).
 
 | Limitation | Revisit when |
 |---|---|
-| Memory has no enforced ceiling; §5.1's ≈ 332 MiB is an estimate the RSS gate measures, most of it 32 hostile maximal requests | the gate fails, or routes need more sockets or larger messages |
+| Memory has no enforced ceiling; §5.1's ≈ 210 MiB plus 30.4 MiB per connection slot (453 MiB at the default 8) is an estimate the RSS gate measures, most of it 32 hostile maximal requests and the slots' prompts | the gate fails, or routes need more sockets or larger messages |
 | A vendor message over 1 MiB fails its turn; a Claude image or large tool result may be one **[U]** | the Claude probe; raising the cap costs as §5.1 states |
 | Agent stderr is uncapped; a vendor, or a process that escaped its group, can fill the disk, and the floor then stops only new work [t4r16.7.5] | measured stderr sizes (§16) |
 | A final text over 64 MiB is cut in its file; list entries past the first 1,000 are only in the events | measured sizes (§16) |

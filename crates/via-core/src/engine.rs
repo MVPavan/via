@@ -47,7 +47,7 @@ mod tests;
 pub use batch::FailureBatches;
 use journal::{Head, UncertainEvent, Unresolved};
 use latch::{FailureSite, WriteOutcome};
-use queue::{CONNECTION_SLOTS, DAEMON_QUEUE_LIMIT, Slot};
+use queue::{DAEMON_QUEUE_LIMIT, Slot};
 pub use recovery::Handoff;
 pub use status::{Connections, DaemonCounts, Limits};
 pub use stop::{EngineShutdown, FinalEntry, StopMode};
@@ -311,22 +311,28 @@ fn lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The daemon-wide connection-slot pool (design §11) and its size. Test
-/// builds only: `VIA_TEST_CONNECTION_SLOTS` lowers it.
 /// Most diagnostic blob steps running at once, overrun ones included.
 const DIAGNOSTIC_STEPS: usize = 2;
 
-fn connection_slots() -> (Arc<tokio::sync::Semaphore>, usize) {
-    let slots = Arc::new(tokio::sync::Semaphore::new(CONNECTION_SLOTS));
+/// The daemon-wide connection-slot pool (design §11) of `limit` slots, the
+/// daemon config's, and its size. Test builds only:
+/// `VIA_TEST_CONNECTION_SLOTS` lowers it.
+fn connection_slots(limit: std::num::NonZeroU32) -> (Arc<tokio::sync::Semaphore>, usize) {
+    // A `u32` count fits `usize` on every supported (64-bit) target; the
+    // clamp keeps `Semaphore::new` from panicking anywhere else.
+    let limit = usize::try_from(limit.get())
+        .unwrap_or(usize::MAX)
+        .min(tokio::sync::Semaphore::MAX_PERMITS);
+    let slots = Arc::new(tokio::sync::Semaphore::new(limit));
     #[cfg(feature = "test-failpoints")]
     if let Some(lowered) = std::env::var("VIA_TEST_CONNECTION_SLOTS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
     {
-        let forgotten = slots.forget_permits(CONNECTION_SLOTS.saturating_sub(lowered));
-        return (slots, CONNECTION_SLOTS - forgotten);
+        let forgotten = slots.forget_permits(limit.saturating_sub(lowered));
+        return (slots, limit - forgotten);
     }
-    (slots, CONNECTION_SLOTS)
+    (slots, limit)
 }
 
 impl Engine {
@@ -406,7 +412,7 @@ impl Engine {
         )
         .map_err(|error| error.to_string())?;
         let (starts, start_receiver) = mpsc::channel(start_capacity);
-        let (slots, slot_limit) = connection_slots();
+        let (slots, slot_limit) = connection_slots(limits.connection_slots);
         Ok(Arc::new_cyclic(|me| Self {
             me: me.clone(),
             _store_owner: owner,

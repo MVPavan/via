@@ -901,10 +901,10 @@ fn completed(turn: u32) -> Vec<Value> {
     vec![accepted(turn), terminal(turn, "completed", "end_turn")]
 }
 
-/// (9) AD16 (decision H1): four persistent sessions each keep their
-/// connection's slot between turns, so a fifth session waits for one;
-/// their next turns run on the pinned connections; closing one releases
-/// its slot and the fifth runs.
+/// (9) AD16 (decision H1): persistent sessions filling every connection
+/// slot (the default 8) each keep their connection's slot between turns,
+/// so one more session waits for one; their next turns run on the pinned
+/// connections; closing one releases its slot and the waiting one runs.
 #[test]
 fn core_persistent_sessions_hold_slots_until_close() {
     let scripts = [
@@ -920,14 +920,16 @@ fn core_persistent_sessions_hold_slots_until_close() {
     };
     run(async {
         let daemon = Daemon::open(&root);
+        let slots = daemon.engine.connections().limit;
+        assert_eq!(slots, 8, "the default slot count");
         let mut held = Vec::new();
-        for _ in 0..4 {
+        for _ in 0..slots {
             let session = daemon.spawn("first", &json!({})).await;
             let envelope = daemon.wait(&session, 1).await;
             assert_eq!(envelope["state"], "completed", "{envelope}");
             held.push(session);
         }
-        assert_eq!(daemon.engine.connections().in_use, 4);
+        assert_eq!(daemon.engine.connections().in_use, slots);
         let fifth = daemon.spawn("first", &json!({})).await;
         let params = WaitParams {
             address: format!("{fifth}/1"),
@@ -942,7 +944,7 @@ fn core_persistent_sessions_hold_slots_until_close() {
             let envelope = daemon.wait(session, 2).await;
             assert_eq!(envelope["state"], "completed", "{envelope}");
         }
-        assert_eq!(daemon.engine.connections().in_use, 4);
+        assert_eq!(daemon.engine.connections().in_use, slots);
         daemon.close(&held[0]).await;
         let envelope = daemon.wait(&fifth, 1).await;
         assert_eq!(envelope["state"], "completed", "{envelope}");

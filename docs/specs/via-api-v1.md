@@ -605,7 +605,8 @@ exits. `store_failure` is `null`, or reports the latest recorded Store
 failure as `{kind, scope, since, count, affected}`. `scope` is `request`,
 `turn`, `session` or `daemon`, and `affected` lists at most 16 addresses
 plus a count. It carries no prompts, payloads or handles. `connections`
-reports `{limit, in_use, held_unproven}`.
+reports `{limit, in_use, held_unproven}`; `limit` is the connection-slot
+count, `daemon.json`'s `connections.limit` (default 8; runtime §8).
 
 `via daemon stop [--drain|--force]` refuses while any session is active
 or durably `closing`, unless one of these is given:

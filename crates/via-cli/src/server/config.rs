@@ -10,6 +10,7 @@ use std::{
     fmt,
     fs::OpenOptions,
     io::{self, Read},
+    num::NonZeroU32,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::Path,
 };
@@ -61,11 +62,20 @@ impl fmt::Display for Invalid {
 #[serde(deny_unknown_fields)]
 struct File {
     #[serde(default, deserialize_with = "present")]
+    connections: Option<Box<RawValue>>,
+    #[serde(default, deserialize_with = "present")]
     disk: Option<Box<RawValue>>,
     #[serde(default, deserialize_with = "present")]
     harnesses: Option<Box<RawValue>>,
     #[serde(default, deserialize_with = "present")]
     wal: Option<Box<RawValue>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Connections {
+    #[serde(default, deserialize_with = "present")]
+    limit: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -162,6 +172,22 @@ fn parse(text: &[u8]) -> Result<Config, Invalid> {
         None => HarnessSettings::default(),
     };
     let mut limits = Limits::default();
+    if let Some(raw) = file.connections {
+        let connections: Connections = serde_json::from_str(raw.get())
+            .map_err(|error| refused(Some("connections"), &error))?;
+        if let Some(value) = connections.limit {
+            let slots = bytes("connections.limit", &value)?;
+            limits.connection_slots = u32::try_from(slots)
+                .ok()
+                .and_then(NonZeroU32::new)
+                .ok_or_else(|| {
+                    Invalid::new(
+                        "connections.limit",
+                        format!("must be from 1 to {}", u32::MAX),
+                    )
+                })?;
+        }
+    }
     if let Some(raw) = file.disk {
         let disk: Disk =
             serde_json::from_str(raw.get()).map_err(|error| refused(Some("disk"), &error))?;
@@ -289,6 +315,38 @@ mod tests {
         assert_eq!(
             invalid(r#"{"disk":null}"#),
             "daemon config invalid: disk: must be an object"
+        );
+    }
+
+    /// Bead via-oq3 (owner, 2026-10-04): `connections.limit` sets the
+    /// connection-slot pool, default 8, any value from 1; 0, `null`, a
+    /// fraction and an unknown member are refused naming the key.
+    #[test]
+    fn connections_limit_is_configurable_from_one() {
+        let slots = |text: &str| parse(text.as_bytes()).expect(text).limits.connection_slots;
+        assert_eq!(slots("{}").get(), 8);
+        assert_eq!(slots(r#"{"connections":{}}"#).get(), 8);
+        assert_eq!(slots(r#"{"connections":{"limit":1}}"#).get(), 1);
+        assert_eq!(slots(r#"{"connections":{"limit":32}}"#).get(), 32);
+        assert_eq!(
+            slots(r#"{"connections":{"limit":4294967295}}"#).get(),
+            u32::MAX
+        );
+        let range = "daemon config invalid: connections.limit: must be from 1 to 4294967295";
+        assert_eq!(invalid(r#"{"connections":{"limit":0}}"#), range);
+        assert_eq!(invalid(r#"{"connections":{"limit":4294967296}}"#), range);
+        assert_eq!(
+            invalid(r#"{"connections":{"limit":null}}"#),
+            "daemon config invalid: connections.limit: must be a non-negative integer at most 2^62"
+        );
+        assert!(invalid(r#"{"connections":{"limit":2.5}}"#).contains("connections.limit"));
+        assert_eq!(
+            invalid(r#"{"connections":{"slots":8}}"#),
+            "daemon config invalid: connections.slots: unknown key"
+        );
+        assert_eq!(
+            invalid(r#"{"connections":8}"#),
+            "daemon config invalid: connections: must be an object"
         );
     }
 

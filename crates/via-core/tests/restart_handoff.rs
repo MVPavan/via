@@ -175,7 +175,7 @@ fn surviving_queued_turns_past_the_bound_are_counted_refused_and_all_run() {
 /// turn). The handoff's starts overflow the 128-capacity channel into the
 /// pending-start set; daemon main's receive-then-retry loop drains all 130,
 /// and every turn runs to `completed`. All 130 dispatchers start at once, as
-/// daemon main starts them; the Engine's four connection slots (design §11)
+/// daemon main starts them; the Engine's 8 default connection slots (design §11)
 /// queue their turns, so Store's raw and request queues never overflow: no
 /// latch and no `failed(store)`. Before T2-D, about half ended
 /// `failed(store)` or the Store-failed latch was set.

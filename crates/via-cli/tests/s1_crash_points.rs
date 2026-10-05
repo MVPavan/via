@@ -2357,6 +2357,21 @@ fn six_held() -> Value {
     json!({"scripts":scripts})
 }
 
+/// Pins the connection-slot pool at four through `daemon.json` (runtime
+/// §8, bead via-oq3), the pool the T2-D scenarios hold six turns against;
+/// every later start of the scenario reads it too.
+fn four_slots(paths: &Paths) -> Result<(), ScenarioError> {
+    let mut config = File::options()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(paths.state.join("daemon.json"))
+        .map_err(infra)?;
+    config
+        .write_all(br#"{"connections":{"limit":4}}"#)
+        .map_err(infra)
+}
+
 /// Releases every T2-D gate.
 fn release_six(paths: &Paths) -> Result<(), ScenarioError> {
     for index in 0..6 {
@@ -2420,13 +2435,15 @@ fn check_four_running_two_waiting(paths: &Paths) -> Result<(), ScenarioError> {
     })
 }
 
-/// T2-D 1 (design §11, runtime §8): six held turns and four connection slots.
+/// T2-D 1 (design §11, runtime §8): six held turns and four connection slots
+/// (`connections.limit` 4).
 /// Exactly four anchors exist at once; the other two turns stay `queued` with
 /// no `submitted_at` and no anchor until a slot frees, and then all six
 /// complete. Before T2-D all six launched at once.
 #[test]
 fn s1_t2d_six_turns_share_four_connection_slots() -> TestResult {
     scenario("s1_t2d_four_slots", &six_held(), |paths, evidence| {
+        four_slots(paths)?;
         let _daemon = Daemon::start(paths, evidence, "final")?;
         let sessions = spawn_six_held(paths, evidence)?;
         check_four_running_two_waiting(paths)?;
@@ -2448,6 +2465,7 @@ fn s1_t2d_six_turns_share_four_connection_slots() -> TestResult {
 #[test]
 fn s1_t2d_force_while_turns_wait_for_a_slot() -> TestResult {
     scenario("s1_t2d_force_waiting", &six_held(), |paths, evidence| {
+        four_slots(paths)?;
         let mut daemon = Daemon::start(paths, evidence, "forced")?;
         let sessions = spawn_six_held(paths, evidence)?;
         check_four_running_two_waiting(paths)?;
@@ -2496,6 +2514,7 @@ fn s1_t2d_force_while_turns_wait_for_a_slot() -> TestResult {
 #[test]
 fn s1_t2d_latch_while_turns_wait_for_a_slot() -> TestResult {
     scenario("s1_t2d_latch_waiting", &six_held(), |paths, evidence| {
+        four_slots(paths)?;
         let lost = "store.commit.reply_lost";
         paths.failpoints.arm(lost, 15, "fail_io").map_err(infra)?;
         let mut daemon = Daemon::start(paths, evidence, "latched")?;
