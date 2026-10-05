@@ -20,6 +20,11 @@ use crate::{
 /// by a debug assertion.
 const STATUS_MAX: usize = 1024 * 1024;
 
+/// The safety recheck (owner, 2026-10-04): a pending `wait`, `events`
+/// long-poll or terminal await with no wake re-reads after this long, until
+/// its deadline, so a missed wake only delays it and never hangs it.
+const RECHECK: Duration = Duration::from_secs(5);
+
 /// `status` step page size without `limit` (C1 §3.7).
 const STATUS_DEFAULT_LIMIT: u32 = 100;
 
@@ -110,11 +115,14 @@ impl Engine {
     ///
     /// Design §4.1: it checks the turn's terminal facts on the Public lane
     /// at once and again after each change that may settle it ([`Wakes`]),
-    /// and reads the envelope with `result_text` only once the turn is
-    /// terminal. A turn's end is seen as soon as it commits. The load is
-    /// bounded: at most 32 sockets make at most 32 waiters, and a burst of
-    /// commits wakes each waiter once at most, since the signal coalesces
-    /// while a waiter reads. Once final shutdown committed its last record,
+    /// or after [`RECHECK`] without one, and reads the envelope with
+    /// `result_text` only once the turn is terminal. A turn's end is seen as
+    /// soon as it commits. Outstanding reads are bounded: at most 32 sockets
+    /// make at most 32 waiters, each with at most one read in flight, since
+    /// the signal coalesces the changes a waiter has not yet consumed. How
+    /// often a waiter reads follows the commit rate (it re-reads after each
+    /// change it consumes), and every read queues on the one writer behind
+    /// the commits. Once final shutdown committed its last record,
     /// a result still missing can never commit in this daemon: the wait
     /// ends `daemon_stopping`. The deadline bounds its Store reads too
     /// ([`by_deadline`]): a turn already terminal when the first check
@@ -157,17 +165,17 @@ impl Engine {
                 #[cfg(feature = "test-failpoints")]
                 let _ = via_store::failpoint::hit_async("core.wait.registered").await;
             }
-            // Safe to ignore: at the deadline the loop's next read or check
-            // ends the wait `wait_timeout`.
-            let _ = tokio::time::timeout_at(deadline, wakes.changed()).await;
+            // At the deadline the loop's next read or check ends the wait
+            // `wait_timeout`.
+            wakes.next(Some(deadline)).await;
         }
     }
 
     /// Waits, unbounded, for the turn's durable terminal facts (design
     /// §3.3 [r3.4], §6.7): a turn's own deadlines bound it; no envelope is
-    /// read. It re-reads on each [`Wakes`] change. Once final shutdown
-    /// finalized, a turn recorded unpersisted is `store_error` and any other
-    /// is `daemon_stopping`.
+    /// read. It re-reads on each [`Wakes`] change, or after [`RECHECK`]
+    /// without one. Once final shutdown finalized, a turn recorded
+    /// unpersisted is `store_error` and any other is `daemon_stopping`.
     pub(super) async fn await_terminal(
         &self,
         session: &SessionId,
@@ -182,7 +190,7 @@ impl Engine {
             if finalized {
                 return Err(ApiError::DAEMON_STOPPING);
             }
-            wakes.changed().await;
+            wakes.next(None).await;
         }
     }
 
@@ -203,9 +211,11 @@ impl Engine {
     ///
     /// With `wait_ms` (design §4.3), a page with no events is read again
     /// from its `next_after`, at once while `more`, else after the next
-    /// [`Wakes`] change, until a page has events or the bound passes; then
-    /// the last empty page is the reply. Final shutdown ends a long-poll
-    /// that found nothing `daemon_stopping`.
+    /// [`Wakes`] change or [`RECHECK`], until a page has events or the bound
+    /// passes; then the last empty page is the reply. The bound cuts a read
+    /// still pending too; if none completed, the reply is empty at `after`
+    /// with `more: true` (read again). Final shutdown ends a long-poll that
+    /// found nothing `daemon_stopping`.
     pub async fn events(&self, params: EventsParams) -> Result<Box<RawValue>, ApiError> {
         let wait = params.wait()?;
         let mut query = params.query()?;
@@ -216,24 +226,41 @@ impl Engine {
             .checked_add(wait)
             .ok_or(ApiError::INVALID_PARAMS)?;
         let mut wakes = self.wakes();
+        let mut last = EventsPage {
+            events: "[]".to_owned(),
+            next_after: query.after,
+            more: true,
+        };
+        let mut registered = false;
         loop {
             let finalized = *self.finalized.borrow();
-            let page = self.events_read(&query).await?;
+            // Dropping a read at the bound only drops its reply receiver;
+            // Store keeps ownership of a read it admitted.
+            let Ok(read) = tokio::time::timeout_at(deadline, self.events_read(&query)).await else {
+                return page_reply(&last);
+            };
+            let page = read?;
             if page.events != "[]" || tokio::time::Instant::now() >= deadline {
                 return page_reply(&page);
             }
             query.after = page.next_after;
-            if page.more {
+            let more = page.more;
+            last = page;
+            if more {
                 continue;
             }
             if finalized {
                 return Err(ApiError::DAEMON_STOPPING);
             }
-            if tokio::time::timeout_at(deadline, wakes.changed())
-                .await
-                .is_err()
-            {
-                return page_reply(&page);
+            if !registered {
+                registered = true;
+                // The first read found nothing; the long-poll is registered.
+                #[cfg(feature = "test-failpoints")]
+                let _ = via_store::failpoint::hit_async("core.events.registered").await;
+            }
+            wakes.next(Some(deadline)).await;
+            if tokio::time::Instant::now() >= deadline {
+                return page_reply(&last);
             }
         }
     }
@@ -560,6 +587,16 @@ struct Wakes {
 }
 
 impl Wakes {
+    /// Returns at the next change, after [`RECHECK`] without one, or at
+    /// `deadline`, whichever is first: the caller re-reads in each case.
+    async fn next(&mut self, deadline: Option<tokio::time::Instant>) {
+        let recheck = tokio::time::Instant::now() + RECHECK;
+        let until = deadline.map_or(recheck, |deadline| deadline.min(recheck));
+        // Safe to ignore: expiry is a recheck or the caller's deadline, and
+        // the caller re-reads or ends either way.
+        let _ = tokio::time::timeout_at(until, self.changed()).await;
+    }
+
     /// Returns at the next change of any source since the last return or
     /// the subscription. Cancel-safe: dropping it loses no change.
     async fn changed(&mut self) {

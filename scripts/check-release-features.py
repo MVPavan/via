@@ -74,6 +74,8 @@ POINTS = [
     # Task 3 S2 (design §10): turn-control seams.
     "core.dispatch.awaiting_slot",
     "core.wait.registered",
+    # via-2lp: an `events` long-poll after its first empty read.
+    "core.events.registered",
     "core.submit.before_commit",
     "core.run.settling",
     "core.run.before_handoff",

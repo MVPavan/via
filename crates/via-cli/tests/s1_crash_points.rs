@@ -2067,9 +2067,10 @@ fn t2c_resume(
     )
 }
 
-/// Polls `result` every 20 ms until `address` is terminal: `wait` checks
-/// only once per second (C1 §3.8), too late for a test that must look
-/// before the re-probe loop's first pass, one second after the turn ends.
+/// Polls `result` every 20 ms until `address` is terminal, so the test
+/// looks before the re-probe loop's first pass, one second after the turn
+/// ends. (Written when `wait` checked once per second; `wait` now returns as
+/// soon as the terminal commits, C1 §3.8, and the poll is kept as is.)
 fn result_when_done(
     paths: &Paths,
     evidence: &Evidence,

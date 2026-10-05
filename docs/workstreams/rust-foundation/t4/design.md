@@ -389,11 +389,16 @@ mutation and closes when it ends (`StoreClient::subscribe_commits`); a turn
 Core records unpersisted; and final shutdown. A waiter subscribes before it
 reads, so a change between its read and its await is never lost, and a
 closed signal (a dead writer) wakes it into a read that reports the Store's
-error. A turn's end is seen as soon as it commits. Load stays bounded: at
-most 32 sockets make at most 32 waiters, and the watch coalesces, so a
-burst of commits wakes each waiter once at most. The Public lane cannot
-refuse a `wait`: one request per socket and 32 sockets give at most 32
-Public reads, its slot count (§6.1).
+error. Without any wake it re-reads every 5 s until its deadline (`RECHECK`,
+a safety recheck, owner 2026-10-04), so a missed wake only delays it. A
+turn's end is seen as soon as it commits. Outstanding reads stay bounded:
+at most 32 sockets make at most 32 waiters, each with at most one read in
+flight, since the watch coalesces the changes a waiter has not yet
+consumed. Read frequency is not bounded by that: a waiter re-reads after
+each change it consumes, so it follows the commit rate, and each read queues
+on the one writer behind the commits. The Public lane cannot refuse a
+`wait`: one request per socket and 32 sockets give at most 32 Public reads,
+its slot count (§6.1).
 `result` reads `result_text` once. The envelope (at most 1 MiB) is written
 as stored; no `Value` is built.
 
@@ -437,8 +442,10 @@ first match always fits: a debug assertion, not a refusal [t4r17.8].
 `wait_ms?` (0, max 30,000) makes the call a long-poll (via-2lp, owner
 2026-10-04): a page with no events is read again from its `next_after`, at
 once while `more`, else after the next change of the signals `wait` uses
-(§4.1), until a page has events or `wait_ms` passes; then the last empty
-page is the reply. Final shutdown ends it `daemon_stopping`. Its connection
+or the 5 s recheck (§4.1), until a page has events or `wait_ms` passes;
+then the last empty page is the reply. `wait_ms` cuts a read still pending
+too; if none completed, the reply is empty at `after` with `more: true`.
+Final shutdown ends it `daemon_stopping`. Its connection
 is watched as a pending `wait`'s is, so a disconnect drops only that call.
 `via events --follow` loops long-polls from each `next_after`.
 

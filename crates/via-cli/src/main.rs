@@ -651,7 +651,11 @@ fn follow(mut params: Value, wait_ms: Option<u64>) -> anyhow::Result<i32> {
             .as_array()
             .is_some_and(|events| !events.is_empty())
         {
-            write_json(io::stdout(), page)?;
+            // One lock through the page and its newline: the Ctrl-C handler
+            // takes the same lock before it exits, so a page is never cut.
+            let mut stdout = io::stdout().lock();
+            write_json(&mut stdout, page)?;
+            io::Write::flush(&mut stdout)?;
         }
         params["after"] = page["next_after"].clone();
     }

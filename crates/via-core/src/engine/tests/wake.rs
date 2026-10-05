@@ -1,12 +1,21 @@
 //! Design §4.1, §4.3 (beads via-p98.3.5, via-2lp): a pending `wait` or
 //! `events` long-poll re-reads at each change that may settle it, a Store
 //! commit, a turn recorded unpersisted, final shutdown or the writer's end,
-//! instead of on a fixed one-second check. Written before the commit
-//! signal: each case failed against the one-second check (a wake took up to
-//! 1 s) or against the strict `events` parameters (`wait_ms` unknown).
+//! instead of on a fixed one-second check; without a wake it re-reads at
+//! the 5 s safety recheck. Written before the commit signal: each case
+//! failed against the one-second check (a wake took up to 1 s) or against
+//! the strict `events` parameters (`wait_ms` unknown).
+//!
+//! The module runs with `test-failpoints` (the registration seams).
+//! Each latency case starts its change only after the reader acknowledged
+//! its registration (`core.wait.registered`, `core.events.registered`,
+//! counted under another token so they never act): its first read found
+//! nothing and it is about to wait. The prompt-wake bound (250 ms) is far
+//! below the recheck, so the recheck cannot mask a broken wake.
 
 use std::{
     os::unix::fs::DirBuilderExt,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -19,11 +28,16 @@ use crate::api::{Event, EventBody, rfc3339};
 use crate::engine::Engine;
 use crate::{ApiError, EventsParams, SessionId, TurnState, WaitParams};
 
-/// A wake well inside the old one-second check, with room for a loaded host.
+/// A wake well inside the old one-second check and the 5 s recheck, with
+/// room for a loaded host.
 const PROMPTLY: Duration = Duration::from_millis(250);
 
-/// Long enough for a pending read to have read once and be waiting.
-const SETTLE: Duration = Duration::from_millis(100);
+/// A token other than the controller's: a command under it is refused at
+/// every hit, which leaves `<point>.<n>.refused` and acts on nothing.
+const COUNTING: &str = "engine-tests-counting-token";
+
+const WAIT_REGISTERED: &str = "core.wait.registered";
+const EVENTS_REGISTERED: &str = "core.events.registered";
 
 fn wait_params(session: &SessionId) -> WaitParams {
     serde_json::from_value(json!({"address":format!("{}/1", session.as_str()),
@@ -33,6 +47,32 @@ fn wait_params(session: &SessionId) -> WaitParams {
 
 fn events_params(params: &Value) -> EventsParams {
     serde_json::from_value(params.clone()).unwrap()
+}
+
+/// In a child, activates the failpoint controller before the Engine opens,
+/// with `points` counted; returns its directory.
+fn counted(root: &Path, points: &[&str]) -> PathBuf {
+    let dir = root.join("failpoints");
+    std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    for point in points {
+        let command = json!({"token":COUNTING,"occurrence":1,"action":"pause"});
+        std::fs::write(dir.join(format!("{point}.json")), command.to_string()).unwrap();
+    }
+    via_store::failpoint::activate(&dir, FAILPOINT_TOKEN).unwrap();
+    dir
+}
+
+/// Waits until `point` was hit `n` times: the reader acknowledged it.
+async fn hit(dir: &Path, point: &str, n: u64) {
+    let marker = dir.join(format!("{point}.{n}.refused"));
+    let started = Instant::now();
+    while !marker.exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{point} hit {n} never came"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
 }
 
 /// Starts `wait` for the session's turn 1 on its own task.
@@ -124,13 +164,13 @@ fn wait_returns_as_soon_as_the_terminal_commits() {
     let Some(root) = child("wake::wait_returns_as_soon_as_the_terminal_commits") else {
         return;
     };
+    let points = counted(&root, &[WAIT_REGISTERED]);
     run(async {
         let engine = open(&root);
         let session = new_session(&engine).await;
         submit(&engine, &session, 2).await;
         let waiting = waiter(&engine, &session);
-        tokio::time::sleep(SETTLE).await;
-        assert!(!waiting.is_finished(), "the turn is not terminal yet");
+        hit(&points, WAIT_REGISTERED, 1).await;
         end(&engine, &session, 3).await;
         let committed = Instant::now();
         let envelope = waiting.await.unwrap().unwrap();
@@ -148,31 +188,29 @@ fn wait_returns_as_soon_as_the_terminal_commits() {
 /// between its read (which found none) and its await
 /// (`core.wait.registered`). Subscribed before the read, it still sees the
 /// commit at once when released.
-#[cfg(feature = "test-failpoints")]
 #[test]
 fn wait_sees_a_terminal_committed_between_its_read_and_its_await() {
     let Some(root) = child("wake::wait_sees_a_terminal_committed_between_its_read_and_its_await")
     else {
         return;
     };
-    let point = "core.wait.registered";
-    let points = super::pause_first(&root, point);
+    let points = super::pause_first(&root, WAIT_REGISTERED);
     run(async {
         let engine = open(&root);
         let session = new_session(&engine).await;
         submit(&engine, &session, 2).await;
         let waiting = waiter(&engine, &session);
-        let ack = points.join(format!("{point}.1.ack"));
+        let ack = points.join(format!("{WAIT_REGISTERED}.1.ack"));
         let held = Instant::now();
         while !ack.exists() {
             assert!(
                 held.elapsed() < Duration::from_secs(10),
-                "{point} never hit"
+                "{WAIT_REGISTERED} never hit"
             );
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
         end(&engine, &session, 3).await;
-        super::release_point(&points, point, 1);
+        super::release_point(&points, WAIT_REGISTERED, 1);
         let released = Instant::now();
         let envelope = waiting.await.unwrap().unwrap();
         let seen = released.elapsed();
@@ -191,14 +229,14 @@ fn final_shutdown_ends_a_pending_wait_at_once() {
     let Some(root) = child("wake::final_shutdown_ends_a_pending_wait_at_once") else {
         return;
     };
+    let points = counted(&root, &[WAIT_REGISTERED]);
     run(async {
         let engine = open(&root);
         let session = new_session(&engine).await;
         // Running in Store with no owner here: final shutdown settles nothing of it.
         end_turn(&engine, &session, 1, None).await;
         let waiting = waiter(&engine, &session);
-        tokio::time::sleep(SETTLE).await;
-        assert!(!waiting.is_finished(), "the turn is not terminal");
+        hit(&points, WAIT_REGISTERED, 1).await;
         let _report = shutdown(&engine).await;
         let finalized = Instant::now();
         let error = waiting.await.unwrap().unwrap_err();
@@ -216,13 +254,13 @@ fn a_turn_recorded_unpersisted_ends_a_pending_wait_at_once() {
     let Some(root) = child("wake::a_turn_recorded_unpersisted_ends_a_pending_wait_at_once") else {
         return;
     };
+    let points = counted(&root, &[WAIT_REGISTERED]);
     run(async {
         let engine = open(&root);
         let session = new_session(&engine).await;
         submit(&engine, &session, 2).await;
         let waiting = waiter(&engine, &session);
-        tokio::time::sleep(SETTLE).await;
-        assert!(!waiting.is_finished(), "the turn is not terminal");
+        hit(&points, WAIT_REGISTERED, 1).await;
         engine
             .unresolved
             .fail(&session, turn(1), TurnState::Running);
@@ -244,18 +282,12 @@ fn writer_death_ends_a_pending_wait_with_the_store_error() {
     let Some(root) = child("wake::writer_death_ends_a_pending_wait_with_the_store_error") else {
         return;
     };
-    let points = root.join("failpoints");
-    std::fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&points)
-        .unwrap();
-    via_store::failpoint::activate(&points, FAILPOINT_TOKEN).unwrap();
+    let points = counted(&root, &[WAIT_REGISTERED]);
     run(async {
         let engine = open(&root);
         let session = new_session(&engine).await;
         let waiting = waiter(&engine, &session);
-        tokio::time::sleep(SETTLE).await;
-        assert!(!waiting.is_finished(), "the turn is not terminal");
+        hit(&points, WAIT_REGISTERED, 1).await;
         let command =
             json!({"token":FAILPOINT_TOKEN,"occurrence":1,"action":"fail_io","persist":true});
         std::fs::write(
@@ -280,6 +312,7 @@ fn events_long_poll_returns_when_a_matching_event_commits() {
     let Some(root) = child("wake::events_long_poll_returns_when_a_matching_event_commits") else {
         return;
     };
+    let points = counted(&root, &[EVENTS_REGISTERED]);
     run(async {
         let engine = open(&root);
         let session = new_session(&engine).await;
@@ -287,10 +320,11 @@ fn events_long_poll_returns_when_a_matching_event_commits() {
             &engine,
             &json!({"session":session,"after":1,"types":["turn.ended"],"wait_ms":10_000}),
         );
-        tokio::time::sleep(SETTLE).await;
-        assert!(!polling.is_finished(), "nothing matched yet");
+        hit(&points, EVENTS_REGISTERED, 1).await;
         submit(&engine, &session, 2).await;
-        tokio::time::sleep(SETTLE).await;
+        // Time for the woken re-read to find nothing; under load it may
+        // not have run yet, which can only let this check pass.
+        tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
             !polling.is_finished(),
             "a filtered-out commit ended the poll"
@@ -321,6 +355,7 @@ fn events_long_poll_ends_at_its_bound_with_the_last_empty_page() {
     else {
         return;
     };
+    let points = counted(&root, &[EVENTS_REGISTERED]);
     run(async {
         let engine = open(&root);
         let session = new_session(&engine).await;
@@ -329,7 +364,7 @@ fn events_long_poll_ends_at_its_bound_with_the_last_empty_page() {
             &engine,
             &json!({"session":session,"after":1,"types":["session.closed"],"wait_ms":600}),
         );
-        tokio::time::sleep(SETTLE).await;
+        hit(&points, EVENTS_REGISTERED, 1).await;
         submit(&engine, &session, 2).await;
         end(&engine, &session, 3).await;
         let page = polling.await.unwrap().unwrap();
@@ -353,6 +388,99 @@ fn events_long_poll_ends_at_its_bound_with_the_last_empty_page() {
         assert!(
             took >= Duration::from_millis(300) && took < Duration::from_millis(300) + PROMPTLY,
             "a 300 ms long-poll took {took:?}"
+        );
+    });
+}
+
+/// C1 §3.11 (Sol r1 finding 1): `wait_ms` bounds the long-poll's Store
+/// reads too (`store.read.delay_ms` holds each read 800 ms). A re-read
+/// still pending at the bound is cut and the last empty page is the reply;
+/// a first read still pending at the bound gives the empty page at `after`
+/// with `more: true`. Before the fix each waited out its 800 ms read.
+#[test]
+fn events_wait_ms_bounds_its_store_reads() {
+    let Some(root) = child("wake::events_wait_ms_bounds_its_store_reads") else {
+        return;
+    };
+    let points = counted(&root, &[EVENTS_REGISTERED]);
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        let started = Instant::now();
+        let polling = poller(&engine, &json!({"session":session,"after":1,"wait_ms":400}));
+        hit(&points, EVENTS_REGISTERED, 1).await;
+        let delay = json!({"token":FAILPOINT_TOKEN,"occurrence":1,"action":"delay","value":800,"persist":true});
+        std::fs::write(points.join("store.read.delay_ms.json"), delay.to_string()).unwrap();
+        // Wakes the poll into a re-read the delay holds past the bound.
+        submit(&engine, &session, 2).await;
+        let page = polling.await.unwrap().unwrap();
+        let took = started.elapsed();
+        assert_eq!(
+            page,
+            json!({"events":[],"next_after":1,"more":false,"earliest_seq":1})
+        );
+        assert!(
+            took < Duration::from_millis(400) + PROMPTLY,
+            "a 400 ms long-poll took {took:?}"
+        );
+
+        let started = Instant::now();
+        let page = poller(&engine, &json!({"session":session,"after":2,"wait_ms":100}))
+            .await
+            .unwrap()
+            .unwrap();
+        let took = started.elapsed();
+        assert_eq!(
+            page,
+            json!({"events":[],"next_after":2,"more":true,"earliest_seq":1})
+        );
+        assert!(
+            took < Duration::from_millis(100) + PROMPTLY,
+            "a 100 ms long-poll took {took:?}"
+        );
+    });
+}
+
+/// Owner requirement (2026-10-04): a change no wake reports, here an event
+/// written to SQLite behind the Store's writer, is still found at the 5 s
+/// safety recheck, never only at the 20 s bound. Before the recheck the
+/// poll returned its empty page at the bound.
+#[test]
+fn a_missed_wake_only_delays_a_long_poll_to_the_recheck() {
+    let Some(root) = child("wake::a_missed_wake_only_delays_a_long_poll_to_the_recheck") else {
+        return;
+    };
+    let points = counted(&root, &[EVENTS_REGISTERED]);
+    run(async {
+        let engine = open(&root);
+        let session = new_session(&engine).await;
+        let polling = poller(
+            &engine,
+            &json!({"session":session,"after":1,"wait_ms":20_000}),
+        );
+        hit(&points, EVENTS_REGISTERED, 1).await;
+        let registered = Instant::now();
+        let db = rusqlite::Connection::open(root.join("state").join("store.sqlite3")).unwrap();
+        db.busy_timeout(Duration::from_secs(10)).unwrap();
+        let submitted = event(&session, 2, EventBody::TurnSubmitted { attempt: 1 });
+        db.execute_batch("BEGIN").unwrap();
+        db.execute(
+            "INSERT INTO events(session_id,seq,turn,type,event) VALUES(?1,2,1,'turn.submitted',?2)",
+            [session.as_str(), &submitted.to_string()],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE sessions SET next_seq=3 WHERE id=?1",
+            [session.as_str()],
+        )
+        .unwrap();
+        db.execute_batch("COMMIT").unwrap();
+        let page = polling.await.unwrap().unwrap();
+        let took = registered.elapsed();
+        assert_eq!(seqs(&page), [2], "{page}");
+        assert!(
+            took >= Duration::from_secs(4) && took < Duration::from_secs(7),
+            "the unsignalled event was found after {took:?}"
         );
     });
 }
@@ -402,6 +530,7 @@ fn final_shutdown_ends_an_events_long_poll_at_once() {
     let Some(root) = child("wake::final_shutdown_ends_an_events_long_poll_at_once") else {
         return;
     };
+    let points = counted(&root, &[EVENTS_REGISTERED]);
     run(async {
         let engine = open(&root);
         let session = new_session(&engine).await;
@@ -410,8 +539,7 @@ fn final_shutdown_ends_an_events_long_poll_at_once() {
             &engine,
             &json!({"session":session,"after":100,"wait_ms":20_000}),
         );
-        tokio::time::sleep(SETTLE).await;
-        assert!(!polling.is_finished(), "nothing follows the cursor");
+        hit(&points, EVENTS_REGISTERED, 1).await;
         let _report = shutdown(&engine).await;
         let finalized = Instant::now();
         let error = polling.await.unwrap().unwrap_err();

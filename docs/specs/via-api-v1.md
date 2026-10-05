@@ -494,8 +494,9 @@ returns `store_error` with `session`, `turn`, last-known `durable_state` and
 envelope. An already committed, readable terminal result is returned as is.
 A `wait` whose result is still absent once final shutdown has committed its
 last record ends `daemon_stopping`.
-`wait` returns as soon as the turn's terminal commits. It and an `events`
-long-poll (§3.11) are the blocking reads. A caller that wants progress polls
+`wait` returns as soon as the turn's terminal commits; without any change
+it also re-reads every 5 s, a safety recheck, until its bound. It and an
+`events` long-poll (§3.11) are the blocking reads. A caller that wants progress polls
 `status` (§3.7) on another connection, since a connection carries one request
 at a time. Closing the connection of a pending `wait` releases only that
 waiter.
@@ -538,9 +539,12 @@ earliest_seq}`. Semantics:
 
 - Long-poll: with `wait_ms` above 0, a page with no matching events is
   read again from its `next_after` (which advances past filtered-out
-  events) as events commit, and the call returns as soon as a page has
-  events. At `wait_ms` it returns the last empty page normally, with the
-  latest `next_after`; it is not an error. `wait_ms: 0` returns the first
+  events) as events commit, and at least every 5 s (a safety recheck); the
+  call returns as soon as a page has events. At `wait_ms` it returns the
+  last empty page normally, with the latest `next_after`; it is not an
+  error. `wait_ms` bounds its Store reads too: if no read completed by
+  then, the reply is the empty page at `after` with `more: true`, so the
+  caller reads again. `wait_ms: 0` returns the first
   page at once. A session or turn not found is refused at once. Final
   shutdown ends a long-poll that found nothing `daemon_stopping`, as it ends
   a `wait`. Closing the connection of a pending long-poll releases only

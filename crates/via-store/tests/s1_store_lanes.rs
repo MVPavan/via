@@ -278,10 +278,14 @@ fn s1_store_writer_death_fails_every_lane_writer_lost() {
 }
 
 /// Design §4.1 (via-p98.3.5): the commit signal changes after each served
-/// mutation, a failed one included, and not after a read; changes made
-/// before a subscription are not seen by it, and changes coalesce. When the
-/// writer dies (`store.writer.before_serve` `fail_io`), `changed()` ends in
-/// `Err` at once, and a re-read finds the writer already dead.
+/// mutation, a failed one on its own included, and never after a read;
+/// changes made before a subscription are not seen by it, and changes a
+/// subscriber has not consumed coalesce. When the writer dies
+/// (`store.writer.before_serve` `fail_io`), `changed()` ends in `Err`, at
+/// most one unseen final version first, and a re-read finds the writer
+/// already dead. A mutation's reply precedes its signal change, so each
+/// check waits for a read served after the mutation: the writer serves one
+/// request at a time, so that read's reply follows the change.
 #[test]
 fn s1_store_commit_signal_changes_on_mutations_and_closes_with_the_writer() {
     let seams = Seams::new();
@@ -289,37 +293,54 @@ fn s1_store_commit_signal_changes_on_mutations_and_closes_with_the_writer() {
     let client = store.client();
     seams.runtime.block_on(async {
         let id = session();
-        let mut early = client.subscribe_commits();
-        // Hits 1 and 2.
+        let barrier = || client.next_seq(&id);
+        let early = client.subscribe_commits();
+        // Hits 1 and 2, then the barrier read, hit 3.
         running_turn(&client).await;
+        assert_eq!(barrier().await.unwrap(), Some(3));
+        assert!(early.has_changed().unwrap(), "two commits made no change");
         let mut commits = client.subscribe_commits();
         assert!(
             !commits.has_changed().unwrap(),
             "a new subscriber saw old commits"
         );
-        assert!(early.has_changed().unwrap(), "two commits made no change");
-        early.mark_unchanged();
-        // Hit 3: a read changes nothing.
-        assert_eq!(client.next_seq(&id).await.unwrap(), Some(3));
+        // Hits 4 and 5: reads change nothing.
+        barrier().await.unwrap();
+        barrier().await.unwrap();
         assert!(!commits.has_changed().unwrap(), "a read changed the signal");
-        // Hits 4 and 5: a commit, then one refused (a stale sequence).
+        // Hit 6: a refused write (seq 2 is taken) alone; hit 7 the barrier.
+        assert!(client.commit_event(text(2)).await.is_err());
+        assert_eq!(barrier().await.unwrap(), Some(3), "nothing committed");
+        assert!(
+            commits.has_changed().unwrap(),
+            "a failed write made no change"
+        );
+        commits.mark_unchanged();
+        // Hit 8: a commit; hit 9 the barrier.
         client.commit_event(text(3)).await.unwrap();
-        assert!(client.commit_event(text(3)).await.is_err());
+        barrier().await.unwrap();
+        assert!(commits.has_changed().unwrap(), "a commit made no change");
+        commits.mark_unchanged();
+        // Hits 10 and 11: two commits unconsumed coalesce; hit 12 the barrier.
+        client.commit_event(text(4)).await.unwrap();
+        client.commit_event(text(5)).await.unwrap();
+        barrier().await.unwrap();
         let changed = tokio::time::timeout(Duration::from_secs(1), commits.changed()).await;
         assert!(matches!(changed, Ok(Ok(()))), "{changed:?}");
         assert!(!commits.has_changed().unwrap(), "two changes woke twice");
-        // Hit 6 kills the writer; nothing commits.
-        seams.arm(SERVE, 6, "fail_io");
-        assert!(matches!(
-            client.next_seq(&id).await,
-            Err(StoreError::WriterLost)
-        ));
-        let closed = tokio::time::timeout(Duration::from_secs(1), commits.changed()).await;
-        assert!(matches!(closed, Ok(Err(_))), "{closed:?}");
-        assert!(matches!(
-            client.next_seq(&id).await,
-            Err(StoreError::WriterLost)
-        ));
+        // Hit 13 kills the writer; nothing commits.
+        seams.arm(SERVE, 13, "fail_io");
+        assert!(matches!(barrier().await, Err(StoreError::WriterLost)));
+        let closed = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut versions = 0;
+            while commits.changed().await.is_ok() {
+                versions += 1;
+            }
+            versions
+        })
+        .await;
+        assert!(matches!(closed, Ok(0 | 1)), "{closed:?}");
+        assert!(matches!(barrier().await, Err(StoreError::WriterLost)));
         let mut late = client.subscribe_commits();
         assert!(
             late.changed().await.is_err(),

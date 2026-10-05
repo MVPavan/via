@@ -1375,8 +1375,10 @@ the in-memory progress snapshot and step history, use `wait` for a turn's
 end, and long-poll `events` with `wait_ms` for new events (C1 §3.11).
 `wait` returns as soon as the turn's terminal commits, and a long-poll as
 soon as a matching event commits: each re-reads the Store after the Store's
-commit signal changes, never on a timer. Cancelling a wait or long-poll
-request only releases that waiter.
+commit signal changes, and every 5 s without a change (a safety recheck, so
+a missed wake only delays a reader), until its bound, which also bounds its
+Store reads. Cancelling a wait or long-poll request only releases that
+waiter.
 
 A reply is written within 10 s of being ready to write, otherwise the
 socket closes (C1 §1), so a peer that never reads holds its reply buffer

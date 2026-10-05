@@ -2,9 +2,10 @@
 //! A31, A32, A39) through the real `via` binary and daemon: bounded C1
 //! connections (32 sockets, one request at a time, 1 MiB lines with a named
 //! refusal, a partial-line deadline, a reply-write deadline), `prompt_file`
-//! intake with a streamed identity, `wait` checking once per second, spawn
-//! members and `cwd`, and `serve --stdio`. Heavy tests (maximal lines, 32
-//! sockets); every scenario activates the failpoint controller. Written
+//! intake with a streamed identity, `wait` reading again only after a
+//! commit (or its 5 s recheck), spawn members and `cwd`, and `serve
+//! --stdio`. Heavy tests (maximal lines, 32 sockets); every scenario
+//! activates the failpoint controller. Written
 //! before the connection layer and intake changes.
 #![cfg(feature = "test-failpoints")]
 
@@ -764,11 +765,11 @@ fn retry_open(sandbox: &Sandbox) -> Result<Conn, ScenarioError> {
 
 /// Design §4, §4.1, §13.2 [t4r16.7.7; via-p98.3.5, 2026-10-04]: `wait`
 /// reads the turn's terminal facts at once and again only after a commit
-/// (a 3.5 s wait on a held turn, which commits nothing, makes its first
-/// check and the turn-existence read, where the earlier one-second check
-/// made five reads and a 20 ms poll about 175); 31 sockets waiting and one
-/// polling `status` all answer; a 33rd socket is closed without bytes; the
-/// end is seen promptly.
+/// or its 5 s recheck (a 3.5 s wait on a held turn, which commits nothing,
+/// makes its first check and the turn-existence read, where the earlier
+/// one-second check made five reads and a 20 ms poll about 175); 31
+/// sockets waiting and one polling `status` all answer; a 33rd socket is
+/// closed without bytes; the end is seen promptly.
 #[test]
 fn s1_c1_wait_reads_after_commits_and_32_waiters_leave_status_served() -> TestResult {
     let setup = Setup::new(&any_prompt(&[json!({"action":"gate","name":"hold"})]))?;
