@@ -14,8 +14,8 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use via_routes::WireCleanup;
 use via_routes::codex::{
-    BoundedBytes, LANE_BYTES, Lane, LaneEnd, LaneItem, RequestId, Routed, ServerRequest,
-    VendorMessage,
+    BoundedBytes, LANE_BYTES, Lane, LaneEnd, LaneItem, MESSAGE_BYTES, RequestId, Routed,
+    ServerRequest, VendorMessage,
 };
 
 use super::super::driver::{RetireGuard, with_undecoded};
@@ -880,6 +880,32 @@ async fn s12d_retention_growth_meets_the_byte_bound() {
             assert!(fixture.registration.incomplete());
         }
     }
+}
+
+/// Review cfix-1 #1: a maximal message (`MESSAGE_BYTES`) read before its
+/// turn's `turn/start` reply is retained with its 64 B growth, and the
+/// reply marker still fits: the lane's room covers its bookkeeping. The
+/// item is released to the turn; nothing fails.
+#[tokio::test]
+async fn a_maximal_early_message_is_retained_and_released() {
+    let mut fixture = Fixture::new();
+    let b = fixture.start(2);
+    fixture.settle().await;
+    let item = message(&tool_started(B, "tool-b"), 5, (Some(B), None));
+    assert!(fixture.lane.push(item, MESSAGE_BYTES), "the lane admits it");
+    fixture.settle().await;
+    assert!(
+        !fixture.lane.overflowed_now(),
+        "retention grew within the lane"
+    );
+    assert_eq!(fixture.lane.charged(), (1, MESSAGE_BYTES + 64));
+    let (contradicted, _) = fixture.reply(2, Some(B));
+    assert!(contradicted);
+    fixture.settle().await;
+    assert_eq!(b.activity.delivered(), 2, "released through the reply");
+    assert_eq!(fixture.registration.failure(), None);
+    assert_eq!(fixture.record(), None);
+    assert!(!fixture.observed().is_empty());
 }
 
 /// Critical re-review x5 r3: whoever observes a lane overflow first, the

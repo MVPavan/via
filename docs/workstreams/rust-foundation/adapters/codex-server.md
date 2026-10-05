@@ -1369,7 +1369,10 @@ failed the shared connection `protocol`, every session on it.
   default stays 1 MiB for every other route; the bounds are per
   connection (`via_wire::InboundBounds`, set through `WireSignals`).
 - **What the line must also fit through.** Each per-thread lane holds one
-  maximal message (`LANE_BYTES` = 8 MiB, 16 messages); the connection's
+  maximal message and its bookkeeping (`LANE_BYTES` = 8 MiB +
+  `LANE_OVERHEAD`, 16 messages; the 5 KiB is 16 entries at a `Start`
+  marker's 256 B plus a retention's 64 B, so a maximal early message is
+  retained and its turn's markers still fit; review cfix-1 #1); the connection's
   staging keeps runtime §8's 4 MiB for ordinary traffic plus one maximal
   message: **12 MiB** (`codex::INBOUND`). The lanes still count against
   that staging, so the server's memory is bounded by it, not by the sum

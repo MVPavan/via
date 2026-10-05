@@ -405,8 +405,8 @@ cut to about 1 MiB raw, and its escaped `item/completed` line can pass
 
 One blocked session normalizer must not stop dispatch to other threads or
 the decline/control paths. Partition the existing Route message staging
-into per-thread ingress lanes, each capped at 16 messages/8 MiB (one
-maximal message) within the 1,024-message/12 MiB connection aggregate; this adds no buffer tier.
+into per-thread ingress lanes, each capped at 16 messages/8 MiB + 5 KiB (one
+maximal message and its markers) within the 1,024-message/12 MiB connection aggregate; this adds no buffer tier.
 These ingress lanes precede the existing C2 observation channel. The shared
 receiver uses nonblocking ingress admission: **the first full ingress-lane
 result immediately quarantines that thread's data lane**, without waiting

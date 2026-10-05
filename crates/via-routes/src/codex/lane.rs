@@ -37,15 +37,22 @@ pub const INBOUND: InboundBounds = InboundBounds {
     staging_bytes: 4 * 1024 * 1024 + MESSAGE_BYTES,
 };
 
-/// The most message bytes a lane holds: one maximal message.
-pub const LANE_BYTES: usize = MESSAGE_BYTES;
-
 /// A `Start` marker's charge against [`LANE_BYTES`] (x.3.2 X3 §2.3).
 pub const START_BYTES: usize = 256;
 
 /// A `Reply` marker's charge beside its ID's bytes, and the charge a
 /// retained item grows by (x.3.2 X3 §2.3).
 pub const ENTRY_BYTES: usize = 64;
+
+/// The lane's room for its bookkeeping beside one maximal message (review
+/// cfix-1 #1): each of its [`LANE_MESSAGES`] entries at a marker's largest
+/// charge plus a retention's growth, so a maximal early message, retained
+/// with its 64 B and followed by its turn's markers, is never refused for
+/// them. 5 KiB.
+pub const LANE_OVERHEAD: usize = LANE_MESSAGES * (START_BYTES + ENTRY_BYTES);
+
+/// The most bytes a lane holds: one maximal message and its bookkeeping.
+pub const LANE_BYTES: usize = MESSAGE_BYTES + LANE_OVERHEAD;
 
 /// One routed message, raw (item 12.5): decoded at consumption.
 pub struct Routed {
