@@ -125,6 +125,7 @@ impl Fixture {
         let losses = Arc::new(Mutex::new(Losses {
             record: None,
             latest: Some(turn(2)),
+            ..Losses::default()
         }));
         let cancel = CancellationToken::new();
         let consumer = Normalizing::new(
@@ -1370,6 +1371,7 @@ async fn r1_4_a_malformed_message_is_named_by_the_failure() {
         }))
     );
     let reported = |detail| TurnEnd {
+        loss: None,
         terminal: None,
         instance: None,
         leftovers: None,

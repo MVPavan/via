@@ -1015,6 +1015,7 @@ fn session_gone() -> AdapterError {
 /// A turn rejected before anything ran.
 pub(crate) fn rejected(error: AdapterError) -> TurnEnd {
     TurnEnd {
+        loss: None,
         terminal: None,
         instance: None,
         leftovers: None,

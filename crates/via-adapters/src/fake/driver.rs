@@ -934,6 +934,7 @@ fn turn_end(
         }
     };
     TurnEnd {
+        loss: None,
         terminal: terminal.map(vendor_terminal),
         instance,
         leftovers: None,

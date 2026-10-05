@@ -1132,14 +1132,16 @@ fn abnormal_handler_latches_and_records_loss() {
 
     use via_routes::codex::AbnormalEnd;
 
-    use super::delivery::{Losses, ObservationLoss, UNKNOWN};
+    use super::delivery::{Losses, UNKNOWN};
     use super::driver::abnormal_handler;
+    use crate::ObservationLoss;
     use crate::{DriverFailure, DriverHealth, TurnNumber};
 
     let turn = TurnNumber::try_from(4).unwrap();
     let losses = Arc::new(Mutex::new(Losses {
         record: None,
         latest: Some(turn),
+        ..Losses::default()
     }));
     let health = Arc::new(tokio::sync::watch::Sender::new(DriverHealth::Open));
     let registered = Arc::new(AtomicBool::new(true));
@@ -1170,6 +1172,7 @@ fn abnormal_handler_latches_and_records_loss() {
     let bare = Arc::new(Mutex::new(Losses {
         record: None,
         latest: Some(turn),
+        ..Losses::default()
     }));
     let idle = Arc::new(tokio::sync::watch::Sender::new(DriverHealth::Open));
     registered.store(false, Ordering::Release);
@@ -1191,14 +1194,16 @@ fn overflow_handler_latches_at_once() {
 
     use via_routes::codex::AbnormalEnd;
 
-    use super::delivery::{Losses, ObservationLoss, UNKNOWN};
+    use super::delivery::{Losses, UNKNOWN};
     use super::driver::overflow_handler;
+    use crate::ObservationLoss;
     use crate::{DriverFailure, DriverHealth, RouteError, TurnNumber};
 
     let turn = TurnNumber::try_from(3).unwrap();
     let losses = Arc::new(Mutex::new(Losses {
         record: None,
         latest: Some(turn),
+        ..Losses::default()
     }));
     let health = Arc::new(tokio::sync::watch::Sender::new(DriverHealth::Open));
     let handler = overflow_handler(Arc::clone(&losses), Arc::clone(&health), 5);

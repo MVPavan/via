@@ -1703,6 +1703,28 @@ impl Warning {
         }
     }
 
+    /// C1 §5 `observations_lost` (x.3.2 X5): the turn's run lost
+    /// observations of its shared-server thread; `omitted` is `null` when
+    /// the count is unknown or saturated.
+    pub(crate) fn observations_lost(
+        session: &SessionId,
+        loss: &via_adapters::ObservationLoss,
+    ) -> Self {
+        let omitted =
+            (loss.omitted != via_adapters::ObservationLoss::UNKNOWN).then_some(loss.omitted);
+        Self {
+            code: "observations_lost",
+            message: "some observations of this turn's shared-server thread were lost; \
+                      this result may be incomplete",
+            data: Some(serde_json::json!({
+                "trigger_turn": format!("{}/{}", session.as_str(), loss.trigger.get()),
+                "generation": loss.generation,
+                "first_unqueued": loss.first_unqueued,
+                "omitted": omitted,
+            })),
+        }
+    }
+
     /// C1 §5, AD7: no instance reported the vendor's version.
     pub(crate) const VENDOR_VERSION_UNREPORTED: Self =
         Self::new("vendor_version_untested", "the vendor reported no version");

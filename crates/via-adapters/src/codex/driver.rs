@@ -994,6 +994,7 @@ impl Turn<'_> {
         }
         let journal_uncertain = loss.is_some_and(|loss| loss.journal_uncertain);
         TurnEnd {
+            loss: None,
             terminal: None,
             instance: self.instance.clone(),
             leftovers: None,
@@ -1015,6 +1016,7 @@ impl Turn<'_> {
     /// A definite rejection before acceptance.
     fn rejected(&self, reason: StartRejected) -> TurnEnd {
         TurnEnd {
+            loss: None,
             terminal: None,
             instance: self.instance.clone(),
             leftovers: None,
@@ -1189,9 +1191,17 @@ pub(crate) async fn run_turn(
             evidence: TurnEvidence::no_launch(false),
         });
     };
-    lock_losses(&session.losses).latest = Some(cx.turn);
+    let noted = {
+        let mut losses = lock_losses(&session.losses);
+        losses.latest = Some(cx.turn);
+        losses.noted
+    };
     let settle = Settle::new((driver, session), cx.turn, done);
-    let end = turn(driver, session, (spec, sandbox), cx, close_rx, &settle).await;
+    let mut end = turn(driver, session, (spec, sandbox), cx, close_rx, &settle).await;
+    // x.3.2 X5 (X0 item 10, simplified by the owner 2026-10-05): a loss
+    // noted while this turn ran is this turn's; one noted after it ended
+    // reaches only the driver's record.
+    end.loss = lock_losses(&session.losses).since(noted);
     settle.record(&end);
     end
 }
@@ -1781,6 +1791,7 @@ fn launch_failed(facts: &mut Turn<'_>, failure: &LaunchError) -> TurnEnd {
         facts.driver.fail(cause);
     }
     TurnEnd {
+        loss: None,
         terminal: None,
         instance: facts.instance.clone(),
         leftovers: None,
@@ -1950,6 +1961,7 @@ async fn confirm(
         };
         let _undelivered = facts.emit(mismatch, controls).await;
         return Err(Box::new(TurnEnd {
+            loss: None,
             terminal: None,
             instance: facts.instance.clone(),
             leftovers: None,
@@ -2796,6 +2808,7 @@ fn terminal_end(facts: &Turn<'_>, retained: Retained, tools_open: bool) -> TurnE
         terminal.structured_output_unparsed,
     ) = carried(structured);
     TurnEnd {
+        loss: None,
         terminal: Some(terminal),
         instance: facts.instance.clone(),
         leftovers: None,

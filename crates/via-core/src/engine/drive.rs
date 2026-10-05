@@ -1861,7 +1861,17 @@ impl Engine {
             instance,
             leftovers: _,
             outcome,
+            loss,
         } = end;
+        // C1 §5 (x.3.2 X5): a turn whose run lost observations of its
+        // shared-server thread says so on its envelope, whichever C1 §7.6
+        // row wins; a loss after its end reaches no envelope.
+        if let Some(loss) = loss {
+            record
+                .vendor
+                .warnings
+                .push(Warning::observations_lost(&record.session, &loss));
+        }
         // AD7: the version the turn's own instance reported, on every
         // outcome once its handshake was read.
         record.vendor.instance = instance.map(|instance| {

@@ -373,9 +373,8 @@ for the 10-second C2 observation-stall timer. Latch the driver's sticky
 `ObservationOverflow` health. The thread/lane generation, triggering original
 turn correlation, first unqueued message's sequence and saturating omitted
 count form the driver's `ObservationLoss`, which goes to connection
-diagnostics and to Core with every affected turn's result and every close of
-the driver. The triggering turn identifies lost evidence, not the entire
-failure target.
+diagnostics and to Core with every affected turn's result. The triggering
+turn identifies lost evidence, not the entire failure target.
 
 The driver ends **every nonterminal turn whose submission belongs to
 that quarantined thread generation**, including a successor A2 when an
@@ -383,8 +382,8 @@ old, already settled A tool triggers overflow: it posts its interrupt
 cleanup intent (written even after A2 settles, once the `turnId` is
 known) and returns at once, without waiting for A2's wall deadline; Core
 commits each disposition under C1 precedence with the `observations_lost`
-warning. Preserve A's immutable envelope; A's late-event loss is one
-`late` `warning` event on A. Close same-thread dispatch until the driver
+warning. Preserve A's immutable envelope; A's late-event loss reaches no
+event on A (owner simplification, 2026-10-05). Close same-thread dispatch until the driver
 is retired and a clean reopen; unsent queued work retains C1
 queue/unknown-predecessor rules and is never treated as submitted merely
 by this failure. Quarantine is tied to the lane generation the driver

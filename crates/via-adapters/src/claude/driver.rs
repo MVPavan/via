@@ -503,6 +503,7 @@ impl Delivery<'_> {
             || matches!(&outcome, Err(failure) if matches!(failure.cause, RouteError::ForceStopped { .. }));
         if forced && self.verdict.is_some() {
             return TurnEnd {
+                loss: None,
                 terminal: self.terminal.map(|terminal| *terminal),
                 instance,
                 leftovers: None,
@@ -564,6 +565,7 @@ impl Delivery<'_> {
             }
         };
         TurnEnd {
+            loss: None,
             terminal: terminal.map(|terminal| *terminal),
             instance,
             leftovers: None,

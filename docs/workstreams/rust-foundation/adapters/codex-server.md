@@ -76,7 +76,7 @@ Labels: **fact** (read in code or a spec), **decision** (this design),
 | 7 | `daemon/status.servers` | Registry snapshot behind J0's `servers()` | Routes | X4 |
 | 8 | Threads | Per-generation tombstones; lease fencing; connection-owned cleanup intents; a reattach fence until unsubscribe resolves; Core's concurrent drain during driver close is K1's | Routes `codex/threads.rs` | K1 (Core), X4 |
 | 9 | Caps, request records, RSS | No admission cap; request owners `Server` or `Lease`; one correlation budget; RSS qualifies only 32 turns on one server | Routes; X5 | X4, X5 |
-| 10 | Overflow, loss record | Sticky health; a non-withdrawable cleanup interrupt; one Core loss helper fed by `TurnEnd` and every close | Adapters, Routes, Core | X5 |
+| 10 | Overflow, loss record | Sticky health; a non-withdrawable cleanup interrupt; `observations_lost` on the envelope of the turn whose run lost observations (simplified by the owner, X5) | Adapters, Routes, Core | X5 |
 | 11 | Decline hand-off | Static table; ordered placeholder at decode | Adapters, Routes | X1, X3 |
 | 12 | Writes on a shared connection | Built on J0's `ControlQueue`: ticketed data slot; a claimed job stays withdrawable until its first byte, decided under the queue lock; data holds; staging permits; an owning turn-write guard; reserved control sizes from maximum encodings | Wire `connection.rs`; Routes `codex/feeder.rs` | X2 (Wire), X3 |
 | 13 | Connection failure | One owned sequence for exit, transport, protocol and overflow: Route's first-wins failure latch, an idempotent cause-free Wire seal, Host cleanup and the sealed-prefix drain at once; `ServerLost` only with positive prior-death evidence, carried as Host's typed stop reply; an abnormal path when the connection task itself fails, signalled to every lease at once so the driver installs its loss and publishes its failure even when idle; one delivery seal at every delivery cutoff; a crash-only normalizer on the session's tracker | Routes, Wire, Host | X2 (Wire, Host), X3, X4 |
@@ -1270,6 +1270,24 @@ reply; written once the reply brings the `turnId`);
 
 ### Item 10. Overflow, quarantine and the loss record (G7, r2 N3, N14, r3 F17)
 
+**Simplified by the owner (2026-10-05, X5).** Only the `TurnEnd` path is
+built: the driver sets `TurnEnd.loss` on a turn when a loss was noted while
+that turn ran (`Losses::noted`, read as the turn starts), and Core adds the
+`observations_lost` warning to that turn's envelope
+(`Warning::observations_lost`, `crates/via-core/src/engine/drive.rs`).
+Dropped: the durable `late: true` warning event on an already terminal
+trigger turn, its `reported` dedupe flag, the separate `Engine::record_loss`
+helper, the lane actor's calls on every close outcome, and
+`CloseReport.loss`, which existed only for the late warning and was not
+added. A loss noted after every turn of the driver ended stays in the
+driver's record and reaches no envelope or event; `via-adapters` has no
+diagnostics sink, so it is not logged either. **Live-measure item:** how
+often real Codex use loses observations of an already terminal turn (an
+idle driver's lane overflow or failed connection task, a close's
+undelivered prefix); revisit a late warning only if that is observed. The
+X0 text below is kept for the record; where it conflicts, this paragraph
+wins.
+
 - **Health.** A full thread ingress lane, or the C2 10 s stall, latches the driver's sticky `DriverFailure::ObservationOverflow`.
 - **Loss record.** The driver keeps one sticky
   `ObservationLoss { trigger: (SessionId, TurnNumber), generation, first_unqueued: u64, omitted: u64 }`
@@ -1334,6 +1352,10 @@ written after A2 returned, behind a large data write; A2 returns before
 its wall with `observations_lost`; A, already terminal, gets exactly one
 `late: true` warning event when the loss arrives through both `TurnEnd`
 and a later idle-eviction close report; A's envelope is unchanged.
+As built after the simplification: `codex_bounds_overflow_warns_the_affected_turn`
+(`crates/via-core/tests/conformance_core.rs`): an overflowed turn carries
+exactly one `observations_lost` warning naming it, and the earlier,
+unaffected turn carries none.
 
 ### Item 11. Decline hand-off
 

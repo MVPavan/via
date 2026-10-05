@@ -53,8 +53,8 @@ use super::normalize::{
 };
 use crate::driver::latch;
 use crate::observation::{
-    Acceptance, Charge, InstanceReport, Observation, ObservationItem, ObservationSink, Reserved,
-    SessionCap, Undelivered, VendorTerminal, admitted,
+    Acceptance, Charge, InstanceReport, Observation, ObservationItem, ObservationLoss,
+    ObservationSink, Reserved, SessionCap, Undelivered, VendorTerminal, admitted,
 };
 use crate::runtime::event_stall;
 use crate::{
@@ -64,33 +64,21 @@ use crate::{
 
 /// `omitted` when the count of lost messages is unknown or saturated
 /// (X0 item 10).
-pub(crate) const UNKNOWN: u64 = u64::MAX;
+pub(crate) const UNKNOWN: u64 = ObservationLoss::UNKNOWN;
 
 /// The detail of a refusal the lane contradicts (x.3.2 X3 §3.2, packet
 /// lines 144–145).
 pub(crate) const CONTRADICTED: &str = "refusal contradicted by started-turn evidence";
 
-/// The driver's sticky loss record (X0 item 10). C2 has no carrier for it
-/// yet (`TurnEnd.loss`, `CloseReport.loss` and Core's `record_loss` are
-/// x.3.2 X5's), so the driver holds it for diagnostics and tests.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ObservationLoss {
-    /// The turn the first loss affected.
-    pub(crate) trigger: TurnNumber,
-    /// Its connection generation.
-    pub(crate) generation: u64,
-    /// No message of the generation before it was lost.
-    pub(crate) first_unqueued: u64,
-    /// How many were lost; [`UNKNOWN`] when not known.
-    pub(crate) omitted: u64,
-}
-
-/// The driver's loss facts, under a leaf lock: the record, and the
-/// session's latest turn, which a new record names.
+/// The driver's loss facts, under a leaf lock: the sticky record (X0 item
+/// 10), the session's latest turn, which a new record names, and how many
+/// losses were noted, so a turn's run can tell whether it noted one
+/// (`TurnEnd.loss`, x.3.2 X5).
 #[derive(Default)]
 pub(crate) struct Losses {
     pub(crate) record: Option<ObservationLoss>,
     pub(crate) latest: Option<TurnNumber>,
+    pub(crate) noted: u64,
 }
 
 impl Losses {
@@ -113,6 +101,7 @@ impl Losses {
         first_unqueued: u64,
         omitted: u64,
     ) {
+        self.noted = self.noted.saturating_add(1);
         if let Some(record) = self.record.as_mut() {
             record.first_unqueued = record.first_unqueued.min(first_unqueued);
             record.omitted = if record.omitted == UNKNOWN || omitted == UNKNOWN {
@@ -128,6 +117,12 @@ impl Losses {
             first_unqueued,
             omitted,
         });
+    }
+
+    /// The record, when a loss was noted since the count `since` (a turn's
+    /// run reads the count as it starts): the turn's `TurnEnd.loss`.
+    pub(crate) fn since(&self, since: u64) -> Option<ObservationLoss> {
+        self.record.filter(|_| self.noted != since)
     }
 
     /// What a close of generation `generation` leaves lost by its outcome
@@ -2603,6 +2598,7 @@ mod tests {
                 losses: Arc::new(Mutex::new(Losses {
                     record: None,
                     latest: Some(turn(2)),
+                    ..Losses::default()
                 })),
                 cancel: CancellationToken::new(),
                 state: Arc::default(),
@@ -3192,6 +3188,7 @@ mod tests {
         let mut losses = Losses {
             record: None,
             latest: Some(turn(1)),
+            ..Losses::default()
         };
         let sealed = partial.seal();
         assert!(!losses.note_close(2, Some(Drained::Cut), (&sealed, sealed.position)));
@@ -3206,6 +3203,7 @@ mod tests {
         let mut kept = Losses {
             record: None,
             latest: Some(turn(1)),
+            ..Losses::default()
         };
         let sealed = whole.seal();
         assert!(!kept.note_close(2, Some(Drained::Cut), (&sealed, 11)));
@@ -3222,6 +3220,7 @@ mod tests {
             let mut lost = Losses {
                 record: None,
                 latest: Some(turn(1)),
+                ..Losses::default()
             };
             assert!(lost.note_close(2, drained, (&sealed, 7)));
             assert_eq!(
@@ -3239,6 +3238,7 @@ mod tests {
         let mut losses = Losses {
             record: None,
             latest: Some(TurnNumber::try_from(1).unwrap()),
+            ..Losses::default()
         };
         losses.note(3, 101, UNKNOWN);
         losses.latest = Some(TurnNumber::try_from(2).unwrap());
@@ -3255,6 +3255,7 @@ mod tests {
         let mut counted = Losses {
             record: None,
             latest: Some(TurnNumber::try_from(1).unwrap()),
+            ..Losses::default()
         };
         counted.note(1, 7, 2);
         counted.note(1, 9, 3);
