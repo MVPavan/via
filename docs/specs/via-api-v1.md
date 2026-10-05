@@ -550,12 +550,18 @@ earliest_seq}`. Semantics:
   with `more: true` above, and the next call reports it. Final
   shutdown ends a long-poll that found nothing `daemon_stopping`, as it ends
   a `wait`. Closing the connection of a pending long-poll releases only
-  that call.
+  that call. As for a `wait`, the close is seen at once only while no
+  later request bytes are buffered on that connection: a client that
+  pipelines bytes behind a long-poll and then disconnects holds its
+  connection slot until the long-poll ends, within `wait_ms`.
 
 There is no follow stream: a caller follows a session by long-polling from
 each reply's `next_after` (`via events --follow` does this until Ctrl-C),
 polls `status` (§3.7) for progress and uses `wait` (§3.8) for the end of a
-turn.
+turn. `via events --follow` writes each page with events as one whole JSON
+line. Ctrl-C exits 130: a page being written finishes first while the
+reader keeps reading, but if stdout stays blocked for 500 ms (a reader that
+stopped reading) the CLI exits anyway and its last line may be unfinished.
 
 ### 3.12 `logs` — evidence locations
 

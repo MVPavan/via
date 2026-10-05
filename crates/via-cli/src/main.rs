@@ -652,7 +652,9 @@ fn follow(mut params: Value, wait_ms: Option<u64>) -> anyhow::Result<i32> {
             .is_some_and(|events| !events.is_empty())
         {
             // One lock through the page and its newline: the Ctrl-C handler
-            // takes the same lock before it exits, so a page is never cut.
+            // waits up to `INTERRUPT_FLUSH` for the same lock before it
+            // exits, so a page a reader drains is never cut; one a stalled
+            // reader leaves blocked may end unfinished (C1 §3.11).
             let mut stdout = io::stdout().lock();
             write_json(&mut stdout, page)?;
             io::Write::flush(&mut stdout)?;
@@ -737,18 +739,35 @@ fn close(args: CloseArgs) -> anyhow::Result<i32> {
 /// user interrupted.
 const INTERRUPTED: i32 = 130;
 
+/// How long an interrupted CLI waits for stdout before it exits anyway.
+const INTERRUPT_FLUSH: Duration = Duration::from_millis(500);
+
 /// While a foreground `spawn`, `wait` or `events --follow` waits (design
 /// §6.5): SIGINT writes nothing and cancels nothing; the CLI exits 130 once
-/// stdout is flushed. The daemon runs in its own process group, so the
-/// terminal's SIGINT never reaches it. The handler is registered before
-/// this returns; dropping the guard stops the task.
+/// stdout is flushed, or after `INTERRUPT_FLUSH` if stdout is stalled. The
+/// daemon runs in its own process group, so the terminal's SIGINT never
+/// reaches it. The handler is registered before this returns; dropping the
+/// guard stops the task.
 fn exit_on_interrupt() -> io::Result<Interrupt> {
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let task = tokio::spawn(async move {
         if interrupt.recv().await.is_some() {
-            // Waits for a line being written to finish, so none is cut.
-            let mut stdout = io::stdout().lock();
-            let _ = io::Write::flush(&mut stdout);
+            // A helper takes the stdout lock, so a line being written
+            // finishes first and none starts after; it keeps the lock until
+            // the exit. A write blocked on a reader that stopped reading
+            // never releases the lock: the CLI then exits without it, the
+            // last line possibly unfinished. The exit itself never waits
+            // for the lock (std's exit-time stdout cleanup only tries it).
+            let (flushed, done) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || {
+                let mut stdout = io::stdout().lock();
+                let _ = io::Write::flush(&mut stdout);
+                let _ = flushed.send(());
+                loop {
+                    std::thread::park();
+                }
+            });
+            let _ = tokio::time::timeout(INTERRUPT_FLUSH, done).await;
             std::process::exit(INTERRUPTED);
         }
     });

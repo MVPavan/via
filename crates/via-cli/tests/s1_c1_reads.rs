@@ -572,81 +572,24 @@ fn s1_c1_events_follow_writes_each_page_until_interrupted() -> TestResult {
 
 /// C1 §3.11 (via-2lp; Sol r1 finding 2): Ctrl-C while `via events
 /// --follow` is blocked writing a page into a full pipe never cuts the
-/// page. Ten finished turns make a first page of about 8 KiB; stdout is a
-/// 4 KiB pipe the test does not read, so the CLI blocks mid-page. Interrupted
-/// then and drained, it exits 130 and everything it wrote is whole JSON
-/// lines. Before the fix, the handler flushed a prefix and exited.
+/// page when the reader keeps draining. Interrupted mid-page and drained,
+/// it exits 130 and everything it wrote is whole JSON lines. Before the
+/// fix, the handler flushed a prefix and exited.
 #[test]
 fn s1_c1_events_follow_interrupted_mid_page_writes_whole_lines() -> TestResult {
-    const TURNS: u32 = 10;
-    let scripts: Vec<Value> = (1..=TURNS)
-        .map(|n| completes(&format!("p{n}"), n))
-        .collect();
-    let sandbox = Sandbox::new(&json!({ "scripts": scripts }))?;
+    let sandbox = Sandbox::new(&json!({ "scripts": follow_scripts() }))?;
     let evidence = Evidence::new("s1_c1_events_follow_cut", &sandbox.fake, &sandbox.fixture)?;
     let report = run_scenario(
         evidence,
         |evidence| {
             let _daemon = Daemon::start(&sandbox, evidence)?;
-            let session = spawn(&sandbox, evidence, "p1", None)?;
-            wait(&sandbox, evidence, &format!("{session}/1"))?;
-            for n in 2..=TURNS {
-                resume(&sandbox, evidence, &session, &format!("p{n}"))?;
-                wait(&sandbox, evidence, &format!("{session}/{n}"))?;
-            }
-            let (mut reader, writer) = std::io::pipe().map_err(infra)?;
-            let size = rustix::pipe::fcntl_setpipe_size(&writer, 4096).map_err(infra)?;
-            let mut command = sandbox.command();
-            command
-                .args(["events", &session, "--follow", "--json"])
-                .stdin(std::process::Stdio::null())
-                .stdout(writer)
-                .stderr(std::fs::File::create(evidence.dir.join("follow.stderr")).map_err(infra)?);
-            let mut follow = Reaped(command.spawn().map_err(infra)?);
-            // Only the child holds the write end now: EOF follows its exit.
-            drop(command);
-            // The page is larger than the pipe: once more than half of it is
-            // queued and nothing more arrives, the CLI is blocked mid-page
-            // (a pipe write of one stdout buffer waits until it fits whole).
-            let deadline = Instant::now() + Duration::from_secs(10);
-            let (mut last, mut still) = (0, 0);
-            loop {
-                let queued = usize::try_from(rustix::io::ioctl_fionread(&reader).map_err(infra)?)
-                    .map_err(infra)?;
-                still = if queued == last { still + 1 } else { 0 };
-                last = queued;
-                if queued > size / 2 && still >= 5 {
-                    break;
-                }
-                if Instant::now() >= deadline {
-                    return Err(ScenarioError::Timeout(format!(
-                        "follow never blocked on its {size} B pipe ({queued} B queued)"
-                    )));
-                }
-                thread::sleep(Duration::from_millis(20));
-            }
-            check(follow.0.try_wait().map_err(infra)?.is_none(), || {
-                "follow exited before it was interrupted".to_owned()
-            })?;
-            let pid = rustix::process::Pid::from_raw(i32::try_from(follow.0.id()).map_err(infra)?)
-                .ok_or_else(|| infra("the follow CLI has no pid"))?;
-            rustix::process::kill_process(pid, rustix::process::Signal::INT).map_err(infra)?;
+            let (mut follow, mut reader, size) = blocked_follow(&sandbox, evidence)?;
+            interrupt(&follow)?;
             let drained = thread::spawn(move || {
                 let mut out = Vec::new();
                 std::io::Read::read_to_end(&mut reader, &mut out).map(|_| out)
             });
-            let deadline = Instant::now() + Duration::from_secs(10);
-            let status = loop {
-                if let Some(status) = follow.0.try_wait().map_err(infra)? {
-                    break status;
-                }
-                if Instant::now() >= deadline {
-                    return Err(ScenarioError::Timeout(
-                        "follow kept running after Ctrl-C".to_owned(),
-                    ));
-                }
-                thread::sleep(Duration::from_millis(10));
-            };
+            let status = exited(&mut follow, Duration::from_secs(10))?;
             let out = drained
                 .join()
                 .map_err(|_| infra("the drain thread panicked"))?
@@ -664,6 +607,115 @@ fn s1_c1_events_follow_interrupted_mid_page_writes_whole_lines() -> TestResult {
         |evidence| collect(evidence, &sandbox),
     );
     report.require_pass()
+}
+
+/// C1 §3.11 (via-2lp; critical review finding 1): Ctrl-C ends `via events
+/// --follow` at once even when its reader has stopped reading. The CLI is
+/// blocked mid-page on a full pipe nobody drains; interrupted, it exits 130
+/// within about a second, the last line possibly unfinished. Before the
+/// fix, the handler waited forever for the stdout lock the blocked write
+/// holds.
+#[test]
+fn s1_c1_events_follow_interrupted_with_a_stalled_reader_exits_at_once() -> TestResult {
+    let sandbox = Sandbox::new(&json!({ "scripts": follow_scripts() }))?;
+    let evidence = Evidence::new("s1_c1_events_follow_stall", &sandbox.fake, &sandbox.fixture)?;
+    let report = run_scenario(
+        evidence,
+        |evidence| {
+            let _daemon = Daemon::start(&sandbox, evidence)?;
+            let (mut follow, reader, _) = blocked_follow(&sandbox, evidence)?;
+            let interrupted = Instant::now();
+            interrupt(&follow)?;
+            let status = exited(&mut follow, Duration::from_secs(5))?;
+            let took = interrupted.elapsed();
+            // The reader stays open and unread until the CLI has exited.
+            drop(reader);
+            check(
+                status.code() == Some(130) && took < Duration::from_millis(1500),
+                || format!("follow ended {status} {took:?} after Ctrl-C"),
+            )
+        },
+        |evidence| collect(evidence, &sandbox),
+    );
+    report.require_pass()
+}
+
+/// Ten turns, each finished, make a first `events` page of about 8 KiB.
+fn follow_scripts() -> Vec<Value> {
+    (1..=10).map(|n| completes(&format!("p{n}"), n)).collect()
+}
+
+/// Runs the ten turns of [`follow_scripts`], then starts `via events
+/// --follow` with stdout a 4 KiB pipe the test does not read, and returns
+/// once the CLI is blocked mid-page: the page is larger than the pipe, so
+/// once more than half of the pipe is queued and nothing more arrives, the
+/// CLI waits in a write (a pipe write of one stdout buffer waits until it
+/// fits whole). Returns the CLI, the pipe's read end and the pipe's size.
+fn blocked_follow(
+    sandbox: &Sandbox,
+    evidence: &Evidence,
+) -> Result<(Reaped, std::io::PipeReader, usize), ScenarioError> {
+    let session = spawn(sandbox, evidence, "p1", None)?;
+    wait(sandbox, evidence, &format!("{session}/1"))?;
+    for n in 2..=10 {
+        resume(sandbox, evidence, &session, &format!("p{n}"))?;
+        wait(sandbox, evidence, &format!("{session}/{n}"))?;
+    }
+    let (reader, writer) = std::io::pipe().map_err(infra)?;
+    let size = rustix::pipe::fcntl_setpipe_size(&writer, 4096).map_err(infra)?;
+    let mut command = sandbox.command();
+    command
+        .args(["events", &session, "--follow", "--json"])
+        .stdin(std::process::Stdio::null())
+        .stdout(writer)
+        .stderr(std::fs::File::create(evidence.dir.join("follow.stderr")).map_err(infra)?);
+    let mut follow = Reaped(command.spawn().map_err(infra)?);
+    // Only the child holds the write end now: EOF follows its exit.
+    drop(command);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (mut last, mut still) = (0, 0);
+    loop {
+        let queued =
+            usize::try_from(rustix::io::ioctl_fionread(&reader).map_err(infra)?).map_err(infra)?;
+        still = if queued == last { still + 1 } else { 0 };
+        last = queued;
+        if queued > size / 2 && still >= 5 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(ScenarioError::Timeout(format!(
+                "follow never blocked on its {size} B pipe ({queued} B queued)"
+            )));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    check(follow.0.try_wait().map_err(infra)?.is_none(), || {
+        "follow exited before it was interrupted".to_owned()
+    })?;
+    Ok((follow, reader, size))
+}
+
+/// Sends SIGINT (Ctrl-C) to `follow`.
+fn interrupt(follow: &Reaped) -> Result<(), ScenarioError> {
+    let pid = rustix::process::Pid::from_raw(i32::try_from(follow.0.id()).map_err(infra)?)
+        .ok_or_else(|| infra("the follow CLI has no pid"))?;
+    rustix::process::kill_process(pid, rustix::process::Signal::INT).map_err(infra)
+}
+
+/// `follow`'s exit status, once it exits within `bound`.
+fn exited(follow: &mut Reaped, bound: Duration) -> Result<std::process::ExitStatus, ScenarioError> {
+    let deadline = Instant::now() + bound;
+    loop {
+        if let Some(status) = follow.0.try_wait().map_err(infra)? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            return Err(ScenarioError::Timeout(format!(
+                "follow kept running {bound:?} after Ctrl-C"
+            )));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// The session's committed head through a plain `via events` page.

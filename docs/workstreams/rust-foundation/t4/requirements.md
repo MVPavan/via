@@ -86,8 +86,10 @@ progress, and a step whose row commit was in flight, are missing from the
 history; the agent's transcript still has them.
 
 **R5. Caller interface.**
-- `wait` blocks until the turn ends. It checks at once, then once per
-  second.
+- `wait` blocks until the turn ends. It checks at once, then re-reads as
+  soon as the Store's commit signal changes, and every 5 s without a change
+  (a safety recheck), until its deadline **(owner, 2026-10-04; supersedes
+  the earlier "then once per second", owner 2026-09-29)**.
 - `status` returns the progress snapshot and step history (R3, R4) for one
   moment of one turn; callers poll it.
 - `events` pages the durable events. There is no follow stream.
