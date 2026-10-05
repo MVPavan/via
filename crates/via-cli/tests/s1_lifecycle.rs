@@ -1853,7 +1853,7 @@ fn s1_f12_evidence_before_terminal_lost_stop_evidence_is_unknown() -> TestResult
     evidenced(|| evidence_before_terminal(false))
 }
 
-/// Design §8, §6.6: a group whose close was uncertain holds its connection
+/// Design §8, §6.6: a group whose close was uncertain holds its harness-process
 /// slot, which `daemon/status` reports in `harness_processes.held_unproven`; once
 /// the group is gone, the re-probe loop proves it absent and the slot
 /// returns, with no request made.
