@@ -287,7 +287,7 @@ fn s_launch_harnesses_valid() {
     let inherit = config.inherit(row("claude"));
     let expected = [
         (Category::Hooks, On),
-        (Category::McpServers, Off),
+        (Category::McpServers, On),
         (Category::Plugins, On),
         (Category::Skills, Off),
         (Category::Agents, On),
@@ -316,8 +316,8 @@ fn s_launch_harnesses_valid() {
         assert_eq!(claude.claude_mode(), mode, "{text}");
     }
     // No section at all: every harness has the defaults; Claude's request
-    // differs from OD2's only in hooks, on: what its default mode delivers
-    // (owner, 2026-10-05).
+    // differs from OD2's in hooks and MCP servers, on: what its default
+    // mode delivers (owner, 2026-10-05).
     let config = AdapterConfig::load(none(), None).unwrap();
     for row in HARNESSES {
         assert_eq!(config.harness(row).binary(), None);
@@ -325,7 +325,7 @@ fn s_launch_harnesses_valid() {
         let inherit = config.inherit(Harness::Vendor(row));
         for category in Category::ALL {
             let expected = match (row.name, category) {
-                ("claude", Category::Hooks) => On,
+                ("claude", Category::Hooks | Category::McpServers) => On,
                 _ => Inherit::OD2_DEFAULT.get(category),
             };
             assert_eq!(inherit.get(category), expected, "{} {category:?}", row.name);

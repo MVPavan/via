@@ -155,7 +155,7 @@ full-bound baseline is:
 ```text
 claude -p --input-format stream-json --output-format stream-json --verbose
   --model MODEL --session-id UUID
-  [--restricted] --strict-mcp-config
+  [--restricted] [--strict-mcp-config]
   --permission-mode dontAsk --permission-prompts none
   --tools Read,Write,Edit,Glob,Grep,Bash
   --allowedTools Read,Write,Edit,Glob,Grep,Bash
@@ -169,8 +169,9 @@ Claude loads: user, project and local settings files, instruction files
 (CLAUDE.md and the files they import), the user's hooks, plugins, skills and
 agents, and auto-memory. With it, Claude ignores the user, project and local
 settings files and loads built-ins only (help 2.1.289; states in the
-inherited-configuration table below). `--strict-mcp-config` and VIA's MCP
-handling are the same in both modes. This is a
+inherited-configuration table below). `--strict-mcp-config` is passed, in
+either mode, only when MCP servers are requested off; Claude's default
+request loads them (owner, 2026-10-05). This is a
 **proposed combination**, not a verbatim qualified probe: probes exercised its
 components with narrower tool lists. Explicit Bash enables general command
 execution in the `full` bound in both modes; Bash wrote outside the
@@ -185,9 +186,11 @@ The file tools differ by mode:
 Neither mode is a containment bound: VIA does not promise every possible
 action is allowed by `full`, only that no narrower containment is
 advertised. Managed policy can deny actions. Denials are reported; restrictions are never bypassed.
-No ambient tool expansion or raw argv passthrough. MCP is not enabled in v1's
-Claude route. Qualification must verify that managed configuration cannot add
-an unexpected execution surface without detection (§8).
+No ambient tool expansion or raw argv passthrough. VIA adds no MCP server;
+the user's own MCP servers load unless requested off (inherited-configuration
+table below), and their tools are not in VIA's `--allowedTools`.
+Qualification must verify that managed configuration cannot add an
+unexpected execution surface without detection (§8).
 
 | Canonical field | Mapping |
 |---|---|
@@ -241,19 +244,23 @@ whatever the configuration says now; a session frozen before modes existed
 | Category | Default request (Claude) | Unrestricted (default mode) | Restricted |
 |---|---|---|---|
 | hooks | on | `on`: the user's SessionStart hooks ran (`hook_started` events, round-2 probe u1); no switch | `off`: no hook events (round 1); settings files are ignored |
-| MCP servers | off | `--strict-mcp-config`: `off` verified (`mcp_servers:0`); `on` passes no switch and is `unknown` | the same |
+| MCP servers | on | `on`: no switch; init `mcp_servers` listed the user's (plugin-provided) server (round-3 probe m1). `off`: `--strict-mcp-config`, verified (`mcp_servers:0`) | `on` passes no switch and is `unknown`: the help says `--restricted` still loads MCP servers, but the probe's only server came from a user plugin, which the mode drops (init `mcp_servers: []`, round-3 probe m2), so a non-plugin server is unverified. `off`: `--strict-mcp-config`, verified |
 | plugins | on | `on`: the user's plugins load (init inventory) | `off`: no user or project plugins; init may still list managed or built-in ones |
 | skills | on | `on`: the user's skills load (init inventory) | `off`: built-in skills only (init inventory) |
 | agents | on | `on`: the user's agents load (init inventory) | `off`: built-in agents only (init inventory) |
 | instruction files | on | `on`: the workspace CLAUDE.md reached the model (probe u1 named its codeword); auto-memory is on too (init `memory_paths`) | `off`: no CLAUDE.md, no auto-memory (round 1) |
 
-Claude's default request is OD2's with hooks on: what the default mode
-delivers, so the default never warns (owner, 2026-10-05). Any other request
-the mode cannot deliver keeps the effective state above and warns
-`config_switch_unverified` (C1 §3.7, C2 §6.2): for example the restricted
-mode with the default request lists hooks, plugins, skills, agents and
-instruction files. Auto-memory is not a C1 category; it follows instruction
-files. Init lists the tools, model, plugins, skills, agents, slash commands,
+Claude's default request is every category on: what the default mode
+delivers, so the default never warns (owner, 2026-10-05: hooks and MCP
+servers on, unlike OD2's default, to match what the user's normal Claude
+loads). Any other request the mode cannot deliver keeps the effective state
+above and warns `config_switch_unverified` (C1 §3.7, C2 §6.2): for example
+the restricted mode with the default request lists every category, MCP
+servers as `unknown` and the rest `off`. MCP tools are not in VIA's
+`--allowedTools`, so under `dontAsk` a call to one is denied unless the
+user's own permission rules, which the default mode loads, allow it
+(inference from the flags; not probed). Auto-memory is not a C1 category;
+it follows instruction files. Init lists the tools, model, plugins, skills, agents, slash commands,
 MCP servers and permission mode (verified). VIA reads the tools, permission
 mode and MCP servers for the handshake check (§3) but does not record the
 inventory in the turn's evidence folder (amended 2026-10-05, bead via-7c6):

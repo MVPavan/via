@@ -83,12 +83,15 @@ fn capabilities() -> Capabilities {
 }
 
 /// AD13 per category (packet §4, design §5.4.1), as the configured mode
-/// delivers them (via-umz; live round of 2026-10-05). Only the MCP switch
+/// delivers them (via-umz; live rounds of 2026-10-05). Only the MCP switch
 /// is applied per category (`--strict-mcp-config`, verified). The others
 /// have no per-category switch: `--restricted` turns hooks, instruction
 /// files and the user's and project's plugins, skills and agents off
 /// together (built-ins only, verified); without it every one of them
-/// loads (verified). A request the mode cannot deliver warns.
+/// loads (verified). MCP servers without the switch load in the default
+/// mode (verified); under `--restricted` the vendor documents that they
+/// still load, unverified, so they are `unknown`. A request the mode
+/// cannot deliver warns.
 pub(crate) fn categories(mode: ClaudeMode) -> BTreeMap<Category, CategoryDecl> {
     let loaded = match mode {
         ClaudeMode::Unrestricted => InheritState::On,
@@ -99,6 +102,10 @@ pub(crate) fn categories(mode: ClaudeMode) -> BTreeMap<Category, CategoryDecl> {
         off: Switch::None,
         observed: Some(loaded),
     };
+    let mcp_loaded = match mode {
+        ClaudeMode::Unrestricted => Some(InheritState::On),
+        ClaudeMode::Restricted => None,
+    };
     BTreeMap::from([
         (Category::Hooks, unswitched),
         (
@@ -106,7 +113,7 @@ pub(crate) fn categories(mode: ClaudeMode) -> BTreeMap<Category, CategoryDecl> {
             CategoryDecl {
                 on: Switch::None,
                 off: Switch::Verified,
-                observed: None,
+                observed: mcp_loaded,
             },
         ),
         (Category::Plugins, unswitched),
@@ -356,7 +363,8 @@ impl ClaudeAdapter {
             session: launch::Continue::New(&session),
             // The longer argv, whatever the session's mode.
             mode: ClaudeMode::Restricted,
-            // OD2's default requests MCP servers off: the switch is passed.
+            // Unknown: OD2's default, MCP servers off, passes the switch
+            // (the longer argv).
             inherit: turn.inherit.unwrap_or(Inherit::OD2_DEFAULT),
             extra_write_dirs,
             // Present instructions pass the flag, empty ones too (critical r2 #1).
@@ -615,11 +623,12 @@ mod tests {
 
     /// via-umz: the effective states are what each mode delivers (the
     /// 2026-10-05 live round): restricted loads no hooks, instruction
-    /// files, user plugins, skills or agents; unrestricted loads them all.
-    /// MCP servers follow the verified `--strict-mcp-config` switch in
-    /// both. Claude's default request is what the default mode delivers,
-    /// so it never warns; a request a mode cannot deliver warns, listing
-    /// each such category.
+    /// files, user plugins, skills or agents; unrestricted loads them all,
+    /// and its MCP servers too (verified). Restricted MCP servers without
+    /// `--strict-mcp-config` are not verified; the switch turns them off
+    /// in both modes. Claude's default request is what the default mode
+    /// delivers, MCP servers on (owner, 2026-10-05), so it never warns; a
+    /// request a mode cannot deliver warns, listing each such category.
     #[test]
     fn categories_report_each_mode_truthfully() {
         use InheritState::{Off, On, Unknown};
@@ -628,9 +637,7 @@ mod tests {
             crate::config::AdapterConfig::load(crate::config::BootstrapEnv::default(), None)
                 .unwrap()
                 .inherit(harness);
-        let mut expected = uniform(On);
-        expected.set(Category::McpServers, Off);
-        assert_eq!(default, expected, "Claude's default request");
+        assert_eq!(default, uniform(On), "Claude's default request");
         let plan = |mode, requested| effective_inherit(&categories(mode), requested);
 
         let (inherit, warning) = plan(ClaudeMode::Unrestricted, default);
@@ -643,19 +650,26 @@ mod tests {
 
         let rest = ["hooks", "plugins", "skills", "agents", "instruction_files"];
         let (inherit, warning) = plan(ClaudeMode::Restricted, default);
-        assert_eq!(inherit.effective, uniform(Off));
-        assert_eq!(warned(warning.as_ref()), rest);
+        let mut restricted = uniform(Off);
+        restricted.set(Category::McpServers, Unknown);
+        assert_eq!(inherit.effective, restricted);
+        assert_eq!(
+            warned(warning.as_ref()),
+            [
+                "hooks",
+                "mcp_servers",
+                "plugins",
+                "skills",
+                "agents",
+                "instruction_files"
+            ]
+        );
 
         let (inherit, warning) = plan(ClaudeMode::Unrestricted, uniform(Off));
-        assert_eq!(inherit.effective, expected);
+        let mut unrestricted = uniform(On);
+        unrestricted.set(Category::McpServers, Off);
+        assert_eq!(inherit.effective, unrestricted);
         assert_eq!(warned(warning.as_ref()), rest);
-
-        // Inherited MCP servers are not verified in either mode.
-        for mode in [ClaudeMode::Unrestricted, ClaudeMode::Restricted] {
-            let (inherit, warning) = plan(mode, uniform(On));
-            assert_eq!(inherit.effective.get(Category::McpServers), Unknown);
-            assert!(warned(warning.as_ref()).contains(&"mcp_servers".to_owned()));
-        }
     }
 
     /// A session's mode is frozen by its effective states: for every

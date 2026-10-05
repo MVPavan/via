@@ -19,8 +19,9 @@
 //! # Fixture argv
 //!
 //! The argv is the adapter's own recipe (vendor packet §4) in the restricted
-//! mode the fixtures were recorded in (the harness configures
-//! `harnesses.claude.restricted: true`), in this order:
+//! mode, MCP servers off, the fixtures were recorded in (the harness
+//! configures `harnesses.claude.restricted: true` and
+//! `inherit.mcp_servers: false`), in this order:
 //! `-p --input-format stream-json --output-format stream-json --verbose
 //! --model M (--session-id {capture sid} | --resume <ID>)
 //! --restricted --strict-mcp-config --permission-mode dontAsk

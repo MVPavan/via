@@ -75,14 +75,14 @@ fn s_launch_plan_inherit_per_harness() {
     };
     let inherit = |states: serde_json::Value| serde_json::from_value::<Inherit>(states).unwrap();
     // Claude plans (x.3.2 C1) with its configured request, hooks and MCP
-    // servers on. MCP servers have no verified switch to on, so they are
-    // `unknown`; the default mode, without `--restricted`, loads everything
-    // else (via-umz).
+    // servers on. The default mode, without `--restricted` or
+    // `--strict-mcp-config`, loads every category (via-umz; owner,
+    // 2026-10-05).
+    let all_on = inherit(json!({"hooks":"on","mcp_servers":"on","plugins":"on",
+        "skills":"on","agents":"on","instruction_files":"on"}));
     let claude = InheritPlan {
-        requested: inherit(json!({"hooks":"on","mcp_servers":"on","plugins":"on",
-            "skills":"on","agents":"on","instruction_files":"on"})),
-        effective: inherit(json!({"hooks":"on","mcp_servers":"unknown","plugins":"on",
-            "skills":"on","agents":"on","instruction_files":"on"})),
+        requested: all_on,
+        effective: all_on,
     };
     // Codex (x.3.2 X1): `harnesses.codex.inherit` sets skills off, and
     // only its hooks switch is verified (packet §4), so every other

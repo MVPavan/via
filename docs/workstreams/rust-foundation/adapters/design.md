@@ -1227,7 +1227,7 @@ Harness given with an uncatalogued model → the vendor decides after acceptance
 |---|---|---|
 | Environment values (`HOME`, `PATH`, `LANG`, `USER`, `LOGNAME`, `XDG_RUNTIME_DIR`) | the startup environment forwarded by auto-start (AR1) | read once; each adapter copies only its allow-list |
 | `harnesses.<name>.binary` | optional `daemon.json`, absolute path | the default is a `PATH` lookup; also used for vendor replay (§8) and user pinning |
-| `harnesses.<name>.inherit.{hooks, mcp_servers, plugins, skills, agents, instruction_files}` | optional `daemon.json`, booleans | OD2 switches. Default (**owner-approved**): hooks and MCP servers `false`, the rest `true`; Claude's hooks `true` (owner, 2026-10-05: what its default mode delivers). Read at daemon start (the S1 rule). A change applies to sessions spawned after the next daemon start; each session freezes its settings. |
+| `harnesses.<name>.inherit.{hooks, mcp_servers, plugins, skills, agents, instruction_files}` | optional `daemon.json`, booleans | OD2 switches. Default (**owner-approved**): hooks and MCP servers `false`, the rest `true`; Claude's hooks and MCP servers `true` (owner, 2026-10-05: what its default mode delivers). Read at daemon start (the S1 rule). A change applies to sessions spawned after the next daemon start; each session freezes its settings. |
 | `harnesses.claude.restricted` | optional `daemon.json`, boolean | Claude only (owner, 2026-10-05): `true` launches with `--restricted`; the default `false` omits it, so Claude loads the user's own configuration like their normal Claude (vendor packet §4). Read at daemon start like the rest. |
 | `checked` versions, capabilities, reserved keys, recipe | compiled into each adapter | never user config |
 | Fake fixture | `VIA_FAKE_AGENT_BINARY`, `VIA_FAKE_SCENARIO`, `VIA_FAKE_SYNC_DIR` | runtime §11.1, unchanged |
@@ -1242,8 +1242,10 @@ evidence folder (Claude amended 2026-10-05: not recorded; vendor packet §4).
 
 **Claude Code columns superseded** (owner, 2026-10-05; via-umz): Claude
 launches without `--restricted` unless `harnesses.claude.restricted` is set,
-its default request has hooks on, and its effective states per mode, all
-verified live on 2.1.289, are in the vendor packet's §4
+its default request has hooks and MCP servers on (no `--strict-mcp-config`
+unless MCP servers are requested off), and its effective states per mode,
+verified live on 2.1.289 except restricted MCP servers on (`unknown`), are
+in the vendor packet's §4
 (`docs/specs/vendors/claude-code.md`). The Claude cells below record the
 2026-09-30 state.
 

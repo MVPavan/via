@@ -840,7 +840,7 @@ category (hooks, MCP servers, plugins, skills, agents, instruction files):
 
 Settings come from `AdapterConfig` (`daemon.json`
 `harnesses.<name>.inherit.*`; default hooks and MCP servers off, the rest on,
-except Claude's hooks on, what its default mode delivers)
+except Claude's hooks and MCP servers on, what its default mode delivers)
 and are frozen per session at spawn. For each category the route records the
 **effective state**: `on` or `off` only when verified (a verified switch, the
 private profile, or an inventory that lists or omits the category), else

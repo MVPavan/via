@@ -226,13 +226,14 @@ fn default_harness(name: &str) -> HarnessConfig {
 }
 
 /// Harness `name`'s default inherited-configuration request: OD2's (hooks
-/// and MCP servers off, the rest on), except Claude's, whose hooks are on:
-/// what its default mode, without `--restricted`, delivers (owner,
-/// 2026-10-05; vendor packet §4).
+/// and MCP servers off, the rest on), except Claude's, which is every
+/// category on: what its default mode, without `--restricted` or
+/// `--strict-mcp-config`, delivers (owner, 2026-10-05; vendor packet §4).
 fn default_inherit(name: &str) -> Inherit {
     let mut inherit = Inherit::OD2_DEFAULT;
     if name == crate::claude::HARNESS {
         inherit.set(Category::Hooks, InheritState::On);
+        inherit.set(Category::McpServers, InheritState::On);
     }
     inherit
 }

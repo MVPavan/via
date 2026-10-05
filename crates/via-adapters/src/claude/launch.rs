@@ -398,45 +398,65 @@ mod tests {
         );
     }
 
-    /// Owner, 2026-10-05: `--restricted` only in the restricted mode; the
-    /// default launch passes the MCP switch straight after the session.
-    /// The mode is part of the refusal cache's recipe key.
+    /// Owner, 2026-10-05: `--restricted` only in the restricted mode, and
+    /// Claude's default request loads MCP servers, so the default launch
+    /// passes neither flag; a request for MCP servers off passes the
+    /// verified `--strict-mcp-config` in either mode, after `--restricted`
+    /// when that is passed. The mode is part of the refusal cache's recipe
+    /// key.
     #[test]
     fn restricted_only_in_the_restricted_mode() {
-        let recipe = |mode| Recipe {
+        use crate::config::AdapterConfig;
+        use crate::harness::{HARNESSES, Harness};
+        let default = AdapterConfig::load(BootstrapEnv::default(), None)
+            .unwrap()
+            .inherit(Harness::Vendor(&HARNESSES[0]));
+        let mut mcp_off = default;
+        mcp_off.set(Category::McpServers, InheritState::Off);
+        let recipe = |mode, inherit| Recipe {
             model: "haiku",
             session: Continue::New("u"),
             mode,
-            inherit: Inherit::OD2_DEFAULT,
+            inherit,
             extra_write_dirs: &[],
             instructions: None,
             effort: None,
             output_schema: None,
             max_steps: None,
         };
-        let flags = |mode| -> Vec<String> {
-            argv(&recipe(mode)).unwrap()[10..12]
+        let flags = |mode, inherit| -> Vec<String> {
+            argv(&recipe(mode, inherit)).unwrap()[10..12]
                 .iter()
                 .map(|arg| arg.to_str().unwrap().to_owned())
                 .collect()
         };
         assert_eq!(ClaudeMode::default(), ClaudeMode::Unrestricted);
         assert_eq!(
-            flags(ClaudeMode::Unrestricted),
+            flags(ClaudeMode::Unrestricted, default),
+            ["--permission-mode", "dontAsk"]
+        );
+        assert_eq!(
+            flags(ClaudeMode::Restricted, default),
+            ["--restricted", "--permission-mode"]
+        );
+        assert_eq!(
+            flags(ClaudeMode::Unrestricted, mcp_off),
             ["--strict-mcp-config", "--permission-mode"]
         );
         assert_eq!(
-            flags(ClaudeMode::Restricted),
+            flags(ClaudeMode::Restricted, mcp_off),
             ["--restricted", "--strict-mcp-config"]
         );
-        assert!(
-            !argv(&recipe(ClaudeMode::Unrestricted))
-                .unwrap()
-                .contains(&OsString::from("--restricted"))
-        );
+        for inherit in [default, mcp_off] {
+            assert!(
+                !argv(&recipe(ClaudeMode::Unrestricted, inherit))
+                    .unwrap()
+                    .contains(&OsString::from("--restricted"))
+            );
+        }
         assert_ne!(
-            recipe_key(ClaudeMode::Unrestricted, Inherit::OD2_DEFAULT, false),
-            recipe_key(ClaudeMode::Restricted, Inherit::OD2_DEFAULT, false)
+            recipe_key(ClaudeMode::Unrestricted, default, false),
+            recipe_key(ClaudeMode::Restricted, default, false)
         );
     }
 

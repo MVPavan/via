@@ -861,7 +861,7 @@ enum Launch<'a> {
 
 /// The recipe's argv (packet §4) in the default mode, without
 /// `--restricted` (owner, 2026-10-05), with `--strict-mcp-config` while MCP
-/// servers are requested off (OD2's default).
+/// servers are requested off (Claude's default requests them on).
 fn argv(launch: Launch<'_>, mcp_off: bool) -> Value {
     let mut argv = vec![
         json!("-p"),
@@ -1033,7 +1033,7 @@ fn ask(text: &str) -> String {
 #[test]
 fn claude_identity_resume_through_daemon() -> TestResult {
     scenario("claude_identity_resume_through_daemon", |d, evidence| {
-        let mut lives = vec![completing(Launch::New, true, "ONE", 0.001)];
+        let mut lives = vec![completing(Launch::New, false, "ONE", 0.001)];
         d.replay(&lives)?;
         let _daemon = Daemon::start(d, evidence, "final")?;
         let session = session_of(&d.spawn(evidence, "spawn", &ask("ONE"), &[])?)?;
@@ -1054,7 +1054,7 @@ fn claude_identity_resume_through_daemon() -> TestResult {
         )?;
         let resumed = Launch::Resume(&uuid);
         lives.push(lifetime(
-            &argv(resumed, true),
+            &argv(resumed, false),
             vec![
                 prompt(&ask("TWO")),
                 gate(),
@@ -1064,7 +1064,7 @@ fn claude_identity_resume_through_daemon() -> TestResult {
                 await_eof(),
             ],
         ));
-        lives.push(completing(resumed, true, "THREE", 0.003));
+        lives.push(completing(resumed, false, "THREE", 0.003));
         d.replay(&lives)?;
         d.resume(evidence, "resume-2", &session, &ask("TWO"))?;
         d.await_progress("at 3 launch 2")?;
@@ -1152,7 +1152,7 @@ fn mismatch_never_reopens(
         "terminal_reason": "aborted_tools"}),
     ));
     steps.push(await_eof());
-    lives.push(lifetime(&argv(Launch::Resume(uuid), true), steps));
+    lives.push(lifetime(&argv(Launch::Resume(uuid), false), steps));
     d.replay(lives)?;
     let reopened = d.count(session, "session.reopened")?;
     d.resume(evidence, "resume-4", session, &ask("FOUR"))?;
@@ -1180,7 +1180,7 @@ fn mismatch_never_reopens(
 #[test]
 fn claude_identity_missing_session_through_daemon() -> TestResult {
     scenario("claude_identity_missing_session", |d, evidence| {
-        let mut lives = vec![completing(Launch::New, true, "ONE", 0.001)];
+        let mut lives = vec![completing(Launch::New, false, "ONE", 0.001)];
         d.replay(&lives)?;
         let _daemon = Daemon::start(d, evidence, "final")?;
         let session = session_of(&d.spawn(evidence, "spawn", &ask("ONE"), &[])?)?;
@@ -1198,7 +1198,7 @@ fn claude_identity_missing_session_through_daemon() -> TestResult {
             "total_cost_usd": 0, "errors": [format!("No conversation found with session ID: {uuid}")]}),
         );
         lives.push(lifetime(
-            &argv(Launch::Resume(&uuid), true),
+            &argv(Launch::Resume(&uuid), false),
             vec![
                 prompt(&ask("TWO")),
                 gone,
@@ -1206,7 +1206,7 @@ fn claude_identity_missing_session_through_daemon() -> TestResult {
                 json!({"exit": {"code": 1, "stderr": "No conversation found\n"}}),
             ],
         ));
-        lives.push(completing(Launch::Resume(&uuid), true, "THREE", 0.002));
+        lives.push(completing(Launch::Resume(&uuid), false, "THREE", 0.002));
         d.replay(&lives)?;
         d.resume(evidence, "resume-2", &session, &ask("TWO"))?;
         let second = d.wait(evidence, &format!("{session}/2"))?;
@@ -1242,7 +1242,7 @@ fn claude_identity_missing_session_through_daemon() -> TestResult {
 fn claude_identity_lost_input_through_daemon() -> TestResult {
     scenario("claude_identity_lost_input", |d, evidence| {
         let mut lives = vec![lifetime(
-            &argv(Launch::New, true),
+            &argv(Launch::New, false),
             vec![
                 prompt(&ask("ONE")),
                 gate(),
@@ -1262,7 +1262,7 @@ fn claude_identity_lost_input_through_daemon() -> TestResult {
                 && replay_ran(&first, 1),
             || format!("turn 1: {first}"),
         )?;
-        lives.push(completing(Launch::NewAs(&expected), true, "TWO", 0.001));
+        lives.push(completing(Launch::NewAs(&expected), false, "TWO", 0.001));
         d.replay(&lives)?;
         d.resume(evidence, "resume-2", &session, &ask("TWO"))?;
         let second = d.wait(evidence, &format!("{session}/2"))?;
@@ -1300,7 +1300,7 @@ const LATE: &str = "LATE-ONE";
 fn held_past_eof() -> Value {
     let id = "${sid}";
     lifetime(
-        &argv(Launch::New, true),
+        &argv(Launch::New, false),
         vec![
             prompt(&ask("ONE")),
             init(id),
@@ -1331,7 +1331,7 @@ fn contend(d: &Deployment, evidence: &Evidence) -> Result<(String, String), Scen
     d.replay(&[
         held_past_eof(),
         lifetime(
-            &argv(Launch::Resume(&uuid), true),
+            &argv(Launch::Resume(&uuid), false),
             vec![
                 prompt(&ask("TWO")),
                 gate(),
@@ -1555,7 +1555,7 @@ fn claude_recovery_no_submit_before_acceptance() -> TestResult {
     scenario("claude_recovery_before_acceptance", |d, evidence| {
         let [term, exit] = stopped_by_host();
         let lives = vec![lifetime(
-            &argv(Launch::New, true),
+            &argv(Launch::New, false),
             vec![prompt(&ask("ONE")), term, exit],
         )];
         d.replay(&lives)?;
@@ -1584,7 +1584,7 @@ fn claude_recovery_no_submit_after_acceptance() -> TestResult {
     scenario("claude_recovery_after_acceptance", |d, evidence| {
         let [term, exit] = stopped_by_host();
         let lives = vec![lifetime(
-            &argv(Launch::New, true),
+            &argv(Launch::New, false),
             vec![
                 prompt(&ask("ONE")),
                 init("${sid}"),
@@ -1624,7 +1624,7 @@ fn claude_recovery_no_submit_survivor() -> TestResult {
         d.failpoints.arm(point, 1, "fail_io").map_err(infra)?;
         let [term, exit] = stopped_by_host();
         let lives = vec![lifetime(
-            &argv(Launch::New, true),
+            &argv(Launch::New, false),
             vec![
                 prompt(&ask("ONE")),
                 init("${sid}"),
@@ -1660,16 +1660,15 @@ fn claude_recovery_no_submit_survivor() -> TestResult {
 
 /// S-LAUNCH end to end (adapter design §5.4, runtime §8): `daemon.json`'s
 /// `harnesses.claude` is read once, at daemon start. A change written
-/// while the daemon runs (another binary, MCP servers inherited, the
-/// restricted mode) does not reach a session spawned on that daemon: it
-/// still runs the old binary with `--strict-mcp-config` and without
-/// `--restricted`. After the restart a new session runs the new binary
-/// with MCP servers on and `--restricted`; a session spawned before it
-/// runs the new binary too (the binary is the daemon's, not frozen) but
-/// keeps its frozen inheritance and mode, so `--strict-mcp-config` stays
-/// and `--restricted` stays off (via-umz). Each replay pins its argv, so
-/// the wrong binary or recipe fails its launch. Status reports each
-/// session's frozen effective states.
+/// while the daemon runs (another binary, MCP servers off, the restricted
+/// mode) does not reach a session spawned on that daemon: it still runs
+/// the old binary without `--strict-mcp-config` or `--restricted`. After
+/// the restart a new session runs the new binary with both; a session
+/// spawned before it runs the new binary too (the binary is the daemon's,
+/// not frozen) but keeps its frozen inheritance and mode, so neither flag
+/// is passed (via-umz). Each replay pins its argv, so the wrong binary or
+/// recipe fails its launch. Status reports each session's frozen
+/// effective states.
 #[test]
 fn claude_s_launch_config_applies_after_restart() -> TestResult {
     scenario("claude_s_launch_config_after_restart", |d, evidence| {
@@ -1681,8 +1680,8 @@ fn claude_s_launch_config_applies_after_restart() -> TestResult {
         let next = other.join("claude");
         std::os::unix::fs::symlink(&d.fake, &next).map_err(infra)?;
         d.replay(&[
-            completing(Launch::New, true, "ONE", 0.001),
-            completing(Launch::New, true, "TWO", 0.001),
+            completing(Launch::New, false, "ONE", 0.001),
+            completing(Launch::New, false, "TWO", 0.001),
         ])?;
         let daemon = Daemon::start(d, evidence, "before")?;
         let old = session_of(&d.spawn(evidence, "spawn-old", &ask("ONE"), &[])?)?;
@@ -1695,7 +1694,7 @@ fn claude_s_launch_config_applies_after_restart() -> TestResult {
             format!("the old session's first turn: {envelope}")
         })?;
         d.config(&json!({"harnesses":{"claude":{"binary":next,
-            "inherit":{"mcp_servers":true},"restricted":true}}}))
+            "inherit":{"mcp_servers":false},"restricted":true}}}))
             .map_err(infra)?;
         let unchanged = session_of(&d.spawn(evidence, "spawn-unchanged", &ask("TWO"), &[])?)?;
         let envelope = d.wait(evidence, &format!("{unchanged}/1"))?;
@@ -1706,8 +1705,8 @@ fn claude_s_launch_config_applies_after_restart() -> TestResult {
         d.replay_for(
             &next,
             &[
-                restricted_launch(completing(Launch::New, false, "THREE", 0.001)),
-                completing(Launch::Resume(&uuid), true, "FOUR", 0.002),
+                restricted_launch(completing(Launch::New, true, "THREE", 0.001)),
+                completing(Launch::Resume(&uuid), false, "FOUR", 0.002),
             ],
         )?;
         let _daemon = Daemon::start(d, evidence, "final")?;
@@ -1728,18 +1727,18 @@ fn claude_s_launch_config_applies_after_restart() -> TestResult {
         let inherit = |session: &str| -> Result<Value, ScenarioError> {
             Ok(d.status(evidence, &format!("status-{session}"), session)?["inherit"].clone())
         };
-        // Status reports the effective settings: MCP `off` is verified by
-        // `--strict-mcp-config`, inherited servers cannot be verified; the
-        // default mode loads the user's configuration, the restricted mode
-        // none of it.
+        // Status reports the effective settings: the default mode loads
+        // the user's configuration, MCP servers included; the restricted
+        // mode none of it, and MCP `off` is verified by
+        // `--strict-mcp-config`.
         let (old, new) = (inherit(&old)?, inherit(&new)?);
         check(
             counts == (2, 2)
                 && old
-                    == json!({"hooks":"on","mcp_servers":"off","plugins":"on","skills":"on",
+                    == json!({"hooks":"on","mcp_servers":"on","plugins":"on","skills":"on",
                         "agents":"on","instruction_files":"on"})
                 && new
-                    == json!({"hooks":"off","mcp_servers":"unknown","plugins":"off",
+                    == json!({"hooks":"off","mcp_servers":"off","plugins":"off",
                         "skills":"off","agents":"off","instruction_files":"off"}),
             || format!("launches per binary {counts:?}; inherit {old} and {new}"),
         )
@@ -1760,7 +1759,7 @@ fn claude_s_launch_last_version_and_cached_refusal() -> TestResult {
     scenario("claude_s_launch_version_refusal", |d, evidence| {
         let id = "${sid}";
         let untested = lifetime(
-            &argv(Launch::New, true),
+            &argv(Launch::New, false),
             vec![
                 prompt(&ask("ONE")),
                 init_as(id, "2.1.290", &["interrupt_receipt_v1"]),
@@ -1770,7 +1769,7 @@ fn claude_s_launch_last_version_and_cached_refusal() -> TestResult {
             ],
         );
         let no_receipt = refused_handshake("TWO");
-        let after = completing(Launch::New, true, "THREE", 0.001);
+        let after = completing(Launch::New, false, "THREE", 0.001);
         d.replay(&[untested, no_receipt, after])?;
         let describe = [
             "describe",
@@ -1853,7 +1852,7 @@ fn claude_s_launch_last_version_and_cached_refusal() -> TestResult {
 fn refused_handshake(text: &str) -> Value {
     let id = "${sid}";
     lifetime(
-        &argv(Launch::New, true),
+        &argv(Launch::New, false),
         vec![
             prompt(&ask(text)),
             init_as(id, TESTED, &["msg_lifecycle_v1"]),
@@ -1888,7 +1887,7 @@ fn claude_refusal_expires_through_daemon() -> TestResult {
     scenario("claude_refusal_expires", |d, evidence| {
         d.replay(&[
             refused_handshake("ONE"),
-            completing(Launch::New, true, "TWO", 0.001),
+            completing(Launch::New, false, "TWO", 0.001),
         ])?;
         let describe = [
             "describe",
@@ -1964,7 +1963,7 @@ fn claude_refusal_expires_through_daemon() -> TestResult {
 fn claude_s_launch_cached_refusal_refuses_resume() -> TestResult {
     scenario("claude_s_launch_refusal_resume", |d, evidence| {
         d.replay(&[
-            completing(Launch::New, true, "ONE", 0.001),
+            completing(Launch::New, false, "ONE", 0.001),
             refused_handshake("TWO"),
         ])?;
         let _daemon = Daemon::start(d, evidence, "final")?;
@@ -2013,7 +2012,7 @@ fn claude_s_launch_request_past_host_cap_refused() -> TestResult {
             Ok(path.to_string_lossy().into_owned())
         };
         let admitted = "z".repeat(15_000);
-        let mut lifetime_argv = argv(Launch::New, true);
+        let mut lifetime_argv = argv(Launch::New, false);
         if let Some(args) = lifetime_argv.as_array_mut() {
             args.extend([json!("--append-system-prompt"), json!(admitted)]);
         }
@@ -2141,7 +2140,7 @@ fn claude_progress_keeps_its_read_instant_under_backpressure() -> TestResult {
             "parent_tool_use_id": null, "session_id": id}),
         );
         d.replay(&[lifetime(
-            &argv(Launch::New, true),
+            &argv(Launch::New, false),
             vec![
                 prompt(&ask("ONE")),
                 init(id),
@@ -2215,7 +2214,7 @@ fn claude_idle_waits_for_the_decode_fence() -> TestResult {
         let id = "${sid}";
         let noise = |n: u64| emit(&json!({"type": "via_test_noise", "n": n}));
         d.replay(&[lifetime(
-            &argv(Launch::New, true),
+            &argv(Launch::New, false),
             vec![
                 prompt(&ask("ONE")),
                 init(id),
@@ -2298,7 +2297,7 @@ fn claude_fifo_busy_input_through_daemon() -> TestResult {
                 "content": "ok", "is_error": false}]},
             "parent_tool_use_id": null, "session_id": id}));
         let mut lives = vec![lifetime(
-            &argv(Launch::New, true),
+            &argv(Launch::New, false),
             vec![
                 prompt(&ask("FIRST")),
                 init(id),
@@ -2341,7 +2340,7 @@ fn claude_fifo_busy_input_through_daemon() -> TestResult {
                 )
             },
         )?;
-        lives.push(completing(Launch::Resume(&uuid), true, "SECOND", 0.002));
+        lives.push(completing(Launch::Resume(&uuid), false, "SECOND", 0.002));
         d.replay(&lives)?;
         d.release(1)?;
         let first = d.wait(evidence, &format!("{session}/1"))?;
@@ -2358,7 +2357,7 @@ fn claude_fifo_busy_input_through_daemon() -> TestResult {
 /// `output`, or no `structured_output` member at all when `None`.
 fn schema_launch(launch: Launch<'_>, schema: &str, text: &str, output: Option<&Value>) -> Value {
     let id = sid(launch);
-    let mut argv = argv(launch, true);
+    let mut argv = argv(launch, false);
     if let Some(args) = argv.as_array_mut() {
         args.extend([json!("--json-schema"), json!(schema)]);
     }
@@ -2454,7 +2453,7 @@ fn claude_s_launch_env_is_the_allow_list() -> TestResult {
     scenario("claude_s_launch_env", |d, evidence| {
         let id = "${sid}";
         d.replay(&[lifetime(
-            &argv(Launch::New, true),
+            &argv(Launch::New, false),
             vec![
                 prompt(&ask("ONE")),
                 gate(),
@@ -2520,7 +2519,7 @@ fn claude_stream_limits_final_text_file() -> TestResult {
         let id = "${sid}";
         let text = "x".repeat(300 * 1024);
         d.replay(&[lifetime(
-            &argv(Launch::New, true),
+            &argv(Launch::New, false),
             vec![
                 prompt(&ask("LARGE")),
                 init(id),
@@ -2575,7 +2574,7 @@ fn shell_word(path: &Path) -> String {
 fn interrupted_tool() -> Value {
     let id = "${sid}";
     lifetime(
-        &argv(Launch::New, true),
+        &argv(Launch::New, false),
         vec![
             prompt("Run sleep 30 with Bash."),
             init(id),
@@ -2762,7 +2761,7 @@ fn claude_stream_limits_stderr_flood_memory() -> TestResult {
     scenario("claude_stream_limits_stderr_memory", |d, evidence| {
         d.wrap(&format!("head -c {FLOOD} /dev/zero | tr '\\000' e >&2"))
             .map_err(infra)?;
-        d.replay(&[completing(Launch::New, true, "ONE", 0.001)])?;
+        d.replay(&[completing(Launch::New, false, "ONE", 0.001)])?;
         let daemon = Daemon::start_with(d, evidence, "final", MEASURED)?;
         let rss = Rss::watch(daemon.pid())?;
         let session = session_of(&d.spawn(evidence, "spawn", &ask("ONE"), &[])?)?;
@@ -2837,7 +2836,7 @@ fn claude_stream_limits_oversize_stdout() -> TestResult {
         .map_err(infra)?;
         let [term, exit] = stopped_by_host();
         d.replay(&[lifetime(
-            &argv(Launch::New, true),
+            &argv(Launch::New, false),
             vec![prompt(&ask("ONE")), term, exit],
         )])?;
         let daemon = Daemon::start_with(d, evidence, "final", MEASURED)?;
