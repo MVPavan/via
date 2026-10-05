@@ -1289,8 +1289,9 @@ reply; written once the reply brings the `turnId`);
      lanes fill the 4 MiB staging. The fake's gates are released by
      counted consumer takes (`adapter.codex.consumer_take`), so Wire's
      staging never holds more than three lines.
-  4. Before and after the 1.5 s held sample, the test asserts the
-     simultaneous occupancy:
+  4. After the 1.5 s held sample, the test asserts the simultaneous
+     occupancy, which proves the final snapshot, not every instant of
+     the sample:
      - the four staged lines were routed (`codex.connection.message`)
        and none was taken;
      - every fill line was taken;
