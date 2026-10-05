@@ -1398,7 +1398,7 @@ async fn admission_credit_waits_beside_its_cutoffs() {
                 Arm::Wall => {}
                 Arm::Health => latch(&health, DriverFailure::TurnAbandoned),
                 Arm::Failure => registration.fail(&protocol, (&health, &lane, &loss)),
-                Arm::Retirement => registration.retire(&loss, || {}),
+                Arm::Retirement => registration.retire((&lane, &loss), || {}),
             }
             std::future::pending::<()>().await;
         };
@@ -1562,7 +1562,7 @@ async fn the_start_gate_waits_beside_its_cutoffs() {
                 }
                 Arm::Wall => {}
                 Arm::Failure => registration.fail(&protocol, (&failing, &lane, &loss)),
-                Arm::Retirement => registration.retire(&loss, || {}),
+                Arm::Retirement => registration.retire((&lane, &loss), || {}),
                 Arm::LaneEnd => lane.end(LaneEnd::Retired),
             }
             std::future::pending::<()>().await;

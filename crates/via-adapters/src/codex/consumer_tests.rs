@@ -216,6 +216,7 @@ impl Fixture {
     fn guard(&self) -> RetireGuard {
         RetireGuard {
             registration: Arc::clone(&self.registration),
+            lane: Arc::clone(&self.lane),
             loss: LossRecord {
                 losses: Arc::clone(&self.losses),
                 generation: 3,
@@ -244,7 +245,7 @@ impl Fixture {
             .losses
             .lock()
             .unwrap()
-            .note_close(3, drained, (&sealed, position))
+            .note_close((&self.lane, 3), drained, (&sealed, position))
         {
             self.registration.mark_incomplete();
         }
@@ -878,6 +879,51 @@ async fn s12d_retention_growth_meets_the_byte_bound() {
             );
             assert!(fixture.registration.incomplete());
         }
+    }
+}
+
+/// Critical re-review x5 r3: whoever observes a lane overflow first, the
+/// loss record names the lane's overflow owner. The review's
+/// interleaving: B's early item, `LANE_BYTES - 63` bytes, waits untaken;
+/// turn 1's late message (its vendor turn mapped to turn 1) is refused
+/// for its bytes, and the connection's overflow handler has not run (here
+/// it never does). B's consumer then observes the overflow, its item's
+/// retention growth failing too, and fails the generation: the record
+/// names turn 1, though turn 2 is the latest. In the other order,
+/// retention growth overflows the lane first and turn 1's message is
+/// refused after it: the loss is the running turn's own, turn 2.
+#[tokio::test]
+async fn the_overflow_owner_is_the_trigger_whoever_observes_it() {
+    for drop_first in [true, false] {
+        let fixture = Fixture::new();
+        fixture.start(2);
+        fixture.settle().await;
+        let late = || message(&delta(T), 6, (Some(T), Some(1)));
+        let early = message(&tool_started(B, "tool-b"), 5, (Some(B), None));
+        assert!(fixture.lane.push(early, LANE_BYTES - 63));
+        if drop_first {
+            assert!(!fixture.lane.push(late(), 64), "it does not fit");
+        }
+        fixture.settle().await;
+        assert!(fixture.lane.overflowed_now());
+        if !drop_first {
+            assert!(!fixture.lane.push(late(), 64), "the lane ended");
+        }
+        let (trigger, owner) = if drop_first {
+            (turn(1), Some(turn(1)))
+        } else {
+            (turn(2), None)
+        };
+        assert_eq!(
+            fixture.record().map(|record| record.trigger),
+            Some(trigger),
+            "drop first: {drop_first}"
+        );
+        assert_eq!(fixture.lane.overflow_owner(), owner);
+        assert_eq!(
+            fixture.registration.failure(),
+            Some(DriverFailure::Route(RouteError::Overflow { turn: turn(2) }))
+        );
     }
 }
 

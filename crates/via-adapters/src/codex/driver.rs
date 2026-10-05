@@ -232,7 +232,7 @@ impl CodexSession {
             let sealed = registration.seal();
             let position = registration.floor(sealed.position);
             let unproven = lock_losses(&self.losses).note_close(
-                attached.generation,
+                (thread.lease.lane(), attached.generation),
                 drained,
                 (&sealed, position),
             );
@@ -322,6 +322,7 @@ impl CodexSession {
         {
             attached.retire = Some(RetireGuard {
                 registration: Arc::clone(&thread.registration),
+                lane: Arc::clone(thread.lease.lane()),
                 loss: LossRecord {
                     losses: Arc::clone(&self.losses),
                     generation: attached.generation,
@@ -390,13 +391,15 @@ impl CodexSession {
 /// `Uncertain` into the session's sticky cleanup facts.
 pub(super) struct RetireGuard {
     pub(super) registration: Arc<Registration>,
+    /// The registration's lane, whose overflow owner a new loss names.
+    pub(super) lane: Arc<Lane>,
     pub(super) loss: LossRecord,
     pub(super) state: Arc<Mutex<DriverState>>,
 }
 
 impl Drop for RetireGuard {
     fn drop(&mut self) {
-        self.registration.retire(&self.loss, || {
+        self.registration.retire((&self.lane, &self.loss), || {
             let uncertain = Retirement {
                 launched: true,
                 exit: None,
@@ -426,7 +429,11 @@ pub(super) fn abnormal_handler(
 ) -> impl Fn(AbnormalEnd) + Send + Sync + 'static {
     move |end: AbnormalEnd| {
         if registered.load(Ordering::Acquire) {
-            lock_losses(&losses).note(generation, end.first_unqueued, UNKNOWN);
+            // Seen on no lane: an overflow before the abnormal end was
+            // signalled by the connection task itself, its push and the
+            // signal with no await between, so a record already names the
+            // lane's overflow owner.
+            lock_losses(&losses).note(None, generation, end.first_unqueued, UNKNOWN);
         }
         latch(&health, DriverFailure::OwnedTask);
     }
@@ -445,14 +452,15 @@ pub(super) fn overflow_handler(
     move |end: AbnormalEnd| {
         let latest = {
             let mut losses = lock_losses(&losses);
-            // A new record names the turn the dropped item was routed
-            // under, a predecessor's late message included (critical
-            // review x5); else the session's latest turn.
+            // A new record names the lane's overflow owner, a
+            // predecessor's late message included (critical review x5
+            // r3), as every other observer of the overflow does; else the
+            // session's latest turn.
             match end.owner {
                 Some(owner) => {
-                    losses.note_turn(owner, generation, end.first_unqueued, UNKNOWN);
+                    losses.note_turn(None, owner, (generation, end.first_unqueued, UNKNOWN));
                 }
-                None => losses.note(generation, end.first_unqueued, UNKNOWN),
+                None => losses.note(None, generation, end.first_unqueued, UNKNOWN),
             }
             losses.latest
         };
@@ -2711,7 +2719,7 @@ fn settle_turn(
     };
     if !terminal_decided && (undelivered || abnormal || overflowed || cut == Cut::LossDeadline) {
         let position = registration.floor(sealed.position);
-        lock_losses(&facts.session.losses).note(start.generation, position, UNKNOWN);
+        lock_losses(&facts.session.losses).note(Some(lane), start.generation, position, UNKNOWN);
     }
     let reported = Some(if sealed.tools_open {
         WireCleanup::Uncertain

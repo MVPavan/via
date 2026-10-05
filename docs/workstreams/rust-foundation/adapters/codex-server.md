@@ -1338,16 +1338,23 @@ built: the driver sets `TurnEnd.loss` on a turn when a loss was noted while
 that turn ran (`Losses::noted`, read as the turn starts), and Core adds the
 `observations_lost` warning to that turn's envelope
 (`Warning::observations_lost`, `crates/via-core/src/engine/drive.rs`).
-The record's trigger (critical review x5) is the turn the first dropped
-lane item was routed under: `AbnormalEnd.owner`, the item's mapped owner
-at routing (or a `turn/start` reply's turn), with no decode. A
-predecessor's late messages lost while its successor runs therefore name
-the predecessor on the successor's warning. The push that overflows the lane
-calls the driver's overflow handler before it ends the lane, with the
-lane's lock released (`Lane::push_noting`), so that record is in place
-before any observer of the overflow could install one naming the latest
-turn (critical re-review x5). Thread-level traffic and the
-other loss sources name the session's latest turn. `first_unqueued` stays
+The record's trigger (critical review x5) is the lane's overflow owner
+(`Lane::overflow_owner`): the VIA turn the item whose refusal overflowed
+the lane was routed under, its mapped owner at routing (or a `turn/start`
+reply's turn), with no decode. The lane records it under the lock that
+ends it `Overflow`, so it is visible with the overflow; every loss note
+that can start the record (`Losses::note` and `note_turn`, given the
+generation's lane) names it ahead of its own fallback, and the overflow
+handler's `AbnormalEnd.owner` is read from it (critical re-review x5 r3).
+Whichever observer of the overflow installs the record first therefore
+names the same turn, and a predecessor's late messages lost while its
+successor runs name the predecessor on the successor's warning. With no
+owner (an item naming no mapped turn, or retention growth that overflowed
+the lane before any refusal: the running turn's own loss), and for the
+other loss sources, the record names the lost item's turn where known,
+else the session's latest turn. A connection's abnormal end notes on no
+lane: an overflow before it was already signalled by the connection task,
+which runs the push and its signal with no await between. `first_unqueued` stays
 the merged lower bound: a quarantine notes its registration's seal, which
 can floor it to 1.
 Dropped: the durable `late: true` warning event on an already terminal

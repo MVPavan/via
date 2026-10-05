@@ -383,10 +383,13 @@ turn correlation, first unqueued message's sequence and saturating omitted
 count form the driver's `ObservationLoss`, which goes to connection
 diagnostics and to Core with every affected turn's result. The triggering
 turn identifies lost evidence, not the entire failure target: it is the VIA
-turn the first dropped lane item was routed under (the connection's mapping
-of its `turnId` at routing, no decode), so an old turn's late messages name
-that turn on its successor's warning; thread-level traffic, which names no
-turn, and the other loss sources name the session's latest turn.
+turn the dropped lane item that overflowed the lane was routed under (the
+connection's mapping of its `turnId` at routing, no decode), recorded by the
+lane with its overflow so every observer names it, and an old turn's late
+messages name that turn on its successor's warning; thread-level traffic,
+which names no turn, a retention overflow before any refusal and the other
+loss sources name the lost item's turn where known, else the session's
+latest turn.
 
 The driver ends **every nonterminal turn whose submission belongs to
 that quarantined thread generation**, including a successor A2 when an

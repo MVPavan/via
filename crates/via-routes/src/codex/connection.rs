@@ -18,7 +18,6 @@
 //! registry runs [`Connection::abnormal`] instead (item 13.2).
 
 use std::any::Any;
-use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -1041,8 +1040,14 @@ impl Connection {
             self.bump();
         }
         if let Some((lane, signal, turn, accepted)) = marker {
-            let contradicted = push_reply(&lane, signal.as_ref(), turn, (at, accepted));
+            let (contradicted, pushed) = lane.push_reply(turn, at, accepted);
             response.contradicted = contradicted && response.outcome.is_err();
+            if !pushed
+                && lane.overflowed_now()
+                && let Some(signal) = signal
+            {
+                signal.overflowed(lane.overflow_owner());
+            }
         }
         if let Some((thread, turn, by)) = interrupt {
             self.post_interrupt(&thread, &turn, by);
@@ -1347,54 +1352,18 @@ impl Connection {
 
 /// Pushes `item` into `lane`, advancing its lease's sequence when taken;
 /// one an overflowed lane dropped reaches the lease's driver at once
-/// (x.3.2 X3 fix r2 #1). The push that overflows the lane signals before
-/// the overflow is observable, so the driver records the dropped item's
-/// owner ahead of any record an observer of the overflow would install
-/// (critical review x5 #2).
+/// (x.3.2 X3 fix r2 #1), naming the lane's overflow owner (critical
+/// review x5 r3), whichever item this was.
 fn push(lane: &Lane, signal: Option<&Arc<LeaseSignal>>, item: LaneItem, bytes: usize, seq: u64) {
-    let owner = item.routed().and_then(|routed| routed.owner);
-    let noted = Cell::new(false);
-    let taken = lane.push_noting(item, bytes, || {
-        if let Some(signal) = signal {
-            signal.overflowed(owner);
-        }
-        noted.set(true);
-    });
+    let taken = lane.push(item, bytes);
     let Some(signal) = signal else {
         return;
     };
     if taken {
         signal.queued(seq);
-    } else if !noted.get() && lane.overflowed_now() {
-        signal.overflowed(owner);
+    } else if lane.overflowed_now() {
+        signal.overflowed(lane.overflow_owner());
     }
-}
-
-/// Pushes turn `turn`'s `Reply` marker of `(at, accepted)` into `lane`,
-/// as [`push`] does a message: the dropped marker names its turn.
-/// Whether an item naming an unmapped turn was pushed while the start
-/// was open (the refusal check).
-fn push_reply(
-    lane: &Lane,
-    signal: Option<&Arc<LeaseSignal>>,
-    turn: TurnNumber,
-    reply: (Instant, Option<String>),
-) -> bool {
-    let noted = Cell::new(false);
-    let (contradicted, pushed) = lane.push_reply_noting(turn, reply, || {
-        if let Some(signal) = signal {
-            signal.overflowed(Some(turn));
-        }
-        noted.set(true);
-    });
-    if !pushed
-        && !noted.get()
-        && lane.overflowed_now()
-        && let Some(signal) = signal
-    {
-        signal.overflowed(Some(turn));
-    }
-    contradicted
 }
 
 /// The loss a dead connection task leaves (item 13.2, R3-Q3): transport

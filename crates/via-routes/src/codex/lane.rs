@@ -196,10 +196,12 @@ pub struct AbnormalEnd {
     /// The first decode sequence not queued into the lease's lanes: no
     /// earlier message of the lease was lost with the task.
     pub first_unqueued: u64,
-    /// A lane overflow only: the VIA turn the dropped item was routed
-    /// under (a message's mapped owner at routing, or a `turn/start`
-    /// reply's turn), with no decode; `None` for a message naming no
-    /// mapped turn and for a connection's abnormal end.
+    /// A lane overflow only: the lane's [`Lane::overflow_owner`], the VIA
+    /// turn the item whose refusal overflowed it was routed under (a
+    /// message's mapped owner at routing, or a `turn/start` reply's turn),
+    /// with no decode; `None` when it named no mapped turn or retention
+    /// growth overflowed the lane first, and for a connection's abnormal
+    /// end.
     pub owner: Option<TurnNumber>,
 }
 
@@ -296,6 +298,11 @@ struct Queue {
     /// An item naming an unmapped turn was pushed while a start was open
     /// (x.3.2 X3 §3.2, the refusal check); cleared by the next `Start`.
     early_seen: bool,
+    /// The VIA turn the item whose refusal overflowed the lane was routed
+    /// under, set with the overflow under the same lock (critical review
+    /// x5 r3); `None` when that item named no mapped turn, or when
+    /// retention growth overflowed the lane first.
+    overflow_owner: Option<TurnNumber>,
 }
 
 impl Queue {
@@ -351,16 +358,14 @@ impl Lane {
         self.ready.notify_one();
     }
 
-    /// A push that does not fit: counts the dropped item, runs `noting`
-    /// with the lane's lock released, then ends the lane `Overflow`, so
-    /// what `noting` records is in place before any observer can see the
-    /// overflow (critical review x5 #2). Only the connection task pushes,
-    /// so no other push comes between.
-    fn refuse(&self, mut queue: std::sync::MutexGuard<'_, Queue>, noting: impl FnOnce()) {
+    /// A push of an item routed under `owner` that does not fit: counts
+    /// the drop and records `owner` as the lane's overflow owner, both
+    /// under the lock that ends the lane `Overflow`, so every observer of
+    /// the overflow sees the owner with it (critical review x5 r3).
+    fn refuse(&self, mut queue: std::sync::MutexGuard<'_, Queue>, owner: Option<TurnNumber>) {
         queue.dropped = queue.dropped.saturating_add(1);
-        drop(queue);
-        noting();
-        self.overflow(self.queue());
+        queue.overflow_owner = owner;
+        self.overflow(queue);
     }
 
     /// Opens the start gate.
@@ -375,21 +380,14 @@ impl Lane {
     /// the connection task never waits. A message it takes advances the
     /// current turn's decode watermark, if a `Start` fenced the lane, and
     /// carries its position. Whether the lane took it.
-    pub fn push(&self, item: LaneItem, bytes: usize) -> bool {
-        self.push_noting(item, bytes, || {})
-    }
-
-    /// [`Lane::push`]; a push that overflows the lane runs `noting` first,
-    /// before the overflow is observable (critical review x5 #2): the
-    /// connection task records the dropped item's loss there.
-    pub fn push_noting(&self, mut item: LaneItem, bytes: usize, noting: impl FnOnce()) -> bool {
+    pub fn push(&self, mut item: LaneItem, bytes: usize) -> bool {
         let mut queue = self.queue();
         if queue.end.is_some() {
             queue.dropped = queue.dropped.saturating_add(1);
             return false;
         }
         if !queue.fits(bytes) {
-            self.refuse(queue, noting);
+            self.refuse(queue, item.routed().and_then(|routed| routed.owner));
             return false;
         }
         let mark = queue.mark();
@@ -442,18 +440,6 @@ impl Lane {
         at: Instant,
         accepted: Option<String>,
     ) -> (bool, bool) {
-        self.push_reply_noting(turn, (at, accepted), || {})
-    }
-
-    /// [`Lane::push_reply`] of `(at, accepted)`; a push that overflows the
-    /// lane runs `noting` first, before the overflow is observable
-    /// (critical review x5 #2).
-    pub fn push_reply_noting(
-        &self,
-        turn: TurnNumber,
-        (at, accepted): (Instant, Option<String>),
-        noting: impl FnOnce(),
-    ) -> (bool, bool) {
         let mut queue = self.queue();
         let contradicted = queue.early_seen;
         if queue.end.is_some() {
@@ -462,7 +448,7 @@ impl Lane {
         }
         let bytes = ENTRY_BYTES.saturating_add(accepted.as_ref().map_or(0, String::len));
         if !queue.fits(bytes) {
-            self.refuse(queue, noting);
+            self.refuse(queue, Some(turn));
             return (contradicted, false);
         }
         let mark = queue.mark();
@@ -533,6 +519,15 @@ impl Lane {
         Self::open_gate(&self.gate, &mut queue);
         drop(queue);
         self.ready.notify_one();
+    }
+
+    /// The VIA turn the item whose refusal overflowed the lane was routed
+    /// under (critical review x5 r3): set with the overflow, so an
+    /// observer of the overflow reads it; `None` before an overflow, for
+    /// an item naming no mapped turn, and when retention growth
+    /// overflowed the lane first (the running turn's own loss).
+    pub fn overflow_owner(&self) -> Option<TurnNumber> {
+        self.queue().overflow_owner
     }
 
     /// Whether the lane overflowed, however much of it was taken since.

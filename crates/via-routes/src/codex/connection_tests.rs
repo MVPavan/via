@@ -573,13 +573,13 @@ async fn abnormal_end_reaches_every_lease() {
     assert_eq!(signalled.lock().unwrap().len(), 1, "idempotent");
 }
 
-/// Critical review x5 #2: the push that overflows a lane signals the
-/// lease's overflow handler before the overflow is observable, so the
-/// driver's record names the dropped item's owner ahead of any record an
-/// observer of the overflow would install. A message names the VIA turn
-/// its `turnId` was mapped to; a dropped `Reply` marker names its turn.
+/// Critical review x5 r3: the push that overflows a lane records the
+/// dropped item's owner in the lane with the overflow, so whoever observes
+/// the overflow first reads the same owner; the lease's overflow handler
+/// is signalled with it. A message names the VIA turn its `turnId` was
+/// mapped to; a dropped `Reply` marker names its turn.
 #[tokio::test]
-async fn an_overflow_is_signalled_before_it_is_observable() {
+async fn an_overflow_carries_its_dropped_items_owner() {
     for reply_overflows in [false, true] {
         let mut vendor = Vendor::open(1 << 16);
         let observed: Arc<OnceLock<Arc<Lane>>> = Arc::default();
@@ -587,8 +587,12 @@ async fn an_overflow_is_signalled_before_it_is_observable() {
         let signal = {
             let (observed, seen) = (Arc::clone(&observed), Arc::clone(&seen));
             Arc::new(LeaseSignal::new(|_| {}).on_overflow(move |end| {
-                let observable = observed.get().is_some_and(|lane| lane.overflowed_now());
-                seen.lock().unwrap().push((end.owner, observable));
+                let lane = observed.get().unwrap();
+                seen.lock().unwrap().push((
+                    end.owner,
+                    lane.overflow_owner(),
+                    lane.overflowed_now(),
+                ));
             }))
         };
         let lease = vendor.connection.open_lane(Some(&signal));
@@ -628,7 +632,7 @@ async fn an_overflow_is_signalled_before_it_is_observable() {
         assert!(lease.lane().overflowed_now());
         assert_eq!(
             *seen.lock().unwrap(),
-            vec![(Some(turn(1)), false)],
+            vec![(Some(turn(1)), Some(turn(1)), true)],
             "reply overflows: {reply_overflows}"
         );
     }
