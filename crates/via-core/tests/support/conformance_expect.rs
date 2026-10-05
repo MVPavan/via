@@ -38,7 +38,9 @@
 //!   waits for), `params` (`prompt`, `effort`, `bound` in C1's shape `{mode,
 //!   extra_write_dirs, network}` or null to inherit, `output_schema`,
 //!   `max_steps`), `deadlines` (C1 `{wall_ms, idle_ms}`; C1's defaults when
-//!   absent), `tool_grace_ms`, `stop` (`{kind, after}`), `steer`
+//!   absent), `tool_grace_ms`, `stop` (`{kind, after}`; kind `wall` sends
+//!   no order: the turn's own `deadlines.wall_ms` stops it, and `after`
+//!   must be seen before it), `steer`
 //!   (`[{after, text, expected_vendor_turn?, result}]`), `gates` (below) and
 //!   `expect`.
 //!

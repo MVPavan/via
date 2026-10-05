@@ -84,6 +84,11 @@ POINTS = [
     "core.cancel.settling",
     "core.run.idle_expired",
     "core.cancel.ordered",
+    # x.3.2 X4 D4.2: a cancel before its order's publication; the Codex
+    # driver's wait before it polls its orders; the fake run's start (D7).
+    "core.cancel.publish",
+    "adapter.codex.ordered",
+    "adapter.fake.turn_started",
     # x.3.2 K2: a keyed steer's report about to commit with its outcome.
     "core.steer.before_outcome",
     # Task 3 S3 (design §6, §10): daemon lifecycle seams.

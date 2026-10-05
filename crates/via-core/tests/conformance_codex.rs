@@ -89,6 +89,9 @@ cases! {
     codex_bound_gate_refusals,
     c11_failed_command,
     c1_commentary_usage,
+    c3_interrupt_uncertain,
+    c3_wall_interrupt,
+    c4_two_sessions,
     c5_resume,
     c5_resume_missing,
     c6_cold_initialize,
@@ -98,9 +101,6 @@ cases! {
     c9_output_schema;
     red:
     c2_steer = "deferred past the first release (via-gaz): Codex steer is unsupported",
-    c3_interrupt_uncertain = "red until via-5lr.3.2 X4 (interrupt and P7)",
-    c3_wall_interrupt = "red until via-5lr.3.2 X4 (the wall's soft stop)",
-    c4_two_sessions = "red until via-5lr.3.2 X4 (leases across sessions)",
 }
 
 /// Green now: every expectation file has a case test and a replay fixture,
@@ -4096,4 +4096,144 @@ fn contradicted_refusal(name: &str) -> Result<(Value, Value), String> {
     expect["sessions"]["main"]["close"] = Value::Null;
     expect["sessions"]["main"]["health"] = json!({"state": "failed", "first_cause": "protocol"});
     Ok((replay, expect))
+}
+
+/// x.3.2 X4 D4.2 (`c3_cancel_before_wall_noticed_late`, d2 #1, the
+/// adapter's half): Core's cancel, capped at the turn's wall, is attached
+/// before the wall while the accepted turn's wait is held before it polls
+/// its orders (`adapter.codex.ordered`); the harness releases it once its
+/// own clock reached the wall. The wait notices the order only after the
+/// wall: provenance is the order's (`attached < wall`), so the vendor's
+/// interrupted terminal, decoded after the wall, is the turn's `Ok` (the
+/// order's row), never the wall's `Deadline`. The tool stays open: the
+/// wall caps P7, so the turn settles at its terminal, `uncertain`.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn c3_cancel_before_wall_noticed_late() {
+    let name = "c3_cancel_before_wall_noticed_late";
+    let _points = armed(
+        "adapter.codex.ordered",
+        json!({"occurrence": 1, "action": "pause"}),
+    )
+    .unwrap();
+    let mut replay = replay_of("c3_interrupt_uncertain").unwrap();
+    let mut expect = expect_of("c3_interrupt_uncertain").unwrap();
+    replay["source"] = json!(format!("{name}: a variant of c3_interrupt_uncertain"));
+    expect["source"] = replay["source"].clone();
+    let turn = turn_mut(&mut expect, 0);
+    turn["deadlines"] = json!({"wall_ms": 1500});
+    let turn = &mut turn["expect"];
+    turn["error"] = Value::Null;
+    turn["cleanup_settles"] = json!("at_terminal");
+    turn["stop_facts"] = json!({"acknowledged": true, "forced": false, "shared": false});
+    turn["notes"] = json!(
+        "A cancel attached before the wall, noticed after it: the order's row (Ok with the \
+         interrupted terminal), never the wall's Deadline; the wall caps P7 at once."
+    );
+    let knobs = conformance_run::Knobs {
+        order_noticed_late: true,
+        ..conformance_run::Knobs::default()
+    };
+    check_variant(name, &replay, &expect, knobs).unwrap();
+}
+
+/// x.3.2 X4 D4.2 R1 (`c3_cancel_after_wall`, the adapter's half): the
+/// wall fires, the adapter writes `turn/interrupt` and holds `run_turn`
+/// in its 3 s cleanup; held at a gate after reading it, the fake waits
+/// while Core's cancel, capped at the wall, is attached after the wall.
+/// The vendor's interrupted terminal then comes: provenance stays the
+/// wall's, so the turn is the wall's `Deadline`, acknowledged and shared,
+/// keeping its terminal (`c3_wall_interrupt`'s expectation).
+#[test]
+fn c3_cancel_after_wall() {
+    let name = "c3_cancel_after_wall";
+    let mut replay = replay_of("c3_wall_interrupt").unwrap();
+    let mut expect = expect_of("c3_wall_interrupt").unwrap();
+    replay["source"] = json!(format!("{name}: a variant of c3_wall_interrupt"));
+    expect["source"] = replay["source"].clone();
+    let interrupt = step_with(&replay, "\"turn/interrupt\"").unwrap();
+    steps(&mut replay).unwrap().insert(
+        interrupt + 1,
+        json!({"await_signal": {"signal": "SIGUSR1"}}),
+    );
+    // One-based: the gate is the step after the interrupt's expectation.
+    let gate = "at 24 launch 1";
+    assert_eq!(gate, format!("at {} launch 1", interrupt + 2));
+    let knobs = conformance_run::Knobs {
+        order_after_wall: Some(gate),
+        ..conformance_run::Knobs::default()
+    };
+    check_variant(name, &replay, &expect, knobs).unwrap();
+}
+
+/// F16b (`codex_cleanup_60s`, protocol only, real time): variants of
+/// `c3_interrupt_uncertain` (300 ms grace) after its interrupted terminal.
+/// The open tool's matching completion during the window settles
+/// `quiescent` when it ends; another item's completion ends nothing, so
+/// the window does (`uncertain`); a completion, or a second
+/// `turn/completed`, after settlement changes nothing of the turn. One
+/// launch throughout, and the shared server is never stopped (the replay
+/// ends at VIA's stdin close after its last close).
+#[test]
+fn codex_cleanup_60s() {
+    const EXEC: &str = "exec-019a0000-0000-7000-8000-000000400004";
+    let completion = |item: &str| {
+        json!({"method": "item/completed", "params": {"threadId": THREAD, "turnId": TURN,
+            "item": {"type": "commandExecution", "id": item, "command": "/bin/bash -lc 'sleep 75'",
+                "cwd": "/work/project", "commandActions": [], "status": "completed",
+                "exitCode": 0}}})
+    };
+    let second = json!({"method": "turn/completed", "params": {"threadId": THREAD,
+        "turn": {"id": TURN, "items": [], "status": "completed"}}});
+    for (variant, delay_ms, line, cleanup, settles) in [
+        (
+            "tools_end",
+            150,
+            completion(EXEC),
+            "quiescent",
+            "when_tools_end",
+        ),
+        (
+            "wrong_id",
+            150,
+            completion("exec-other"),
+            "uncertain",
+            "at_p7_bound",
+        ),
+        (
+            "late_completion",
+            600,
+            completion(EXEC),
+            "uncertain",
+            "at_p7_bound",
+        ),
+        ("late_terminal", 600, second, "uncertain", "at_p7_bound"),
+    ] {
+        let name = format!("codex_cleanup_60s_{variant}");
+        let mut replay = replay_of("c3_interrupt_uncertain").unwrap();
+        let mut expect = expect_of("c3_interrupt_uncertain").unwrap();
+        replay["source"] = json!(format!("{name}: a variant of c3_interrupt_uncertain"));
+        expect["source"] = replay["source"].clone();
+        let terminal = step_with(&replay, "\"status\":\"interrupted\"").unwrap();
+        let all = steps(&mut replay).unwrap();
+        all.insert(terminal + 1, json!({"delay": {"ms": delay_ms}}));
+        all.insert(terminal + 2, emit(&line));
+        if delay_ms > 300 {
+            // Settled first: the close's unsubscribe answers the terminal
+            // (one-based), not the later line.
+            all[terminal + 3]["expect"]["after_emit"] = json!(terminal + 1);
+        }
+        let turn = &mut turn_mut(&mut expect, 0)["expect"];
+        turn["cleanup"] = json!(cleanup);
+        turn["cleanup_settles"] = json!(settles);
+        if variant == "tools_end" {
+            turn["observations_include"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"kind": "progress", "tools_ended": [EXEC]}));
+            expect["sessions"]["main"]["close"]["cleanup"] = json!("quiescent");
+        }
+        check_variant(&name, &replay, &expect, conformance_run::Knobs::default())
+            .unwrap_or_else(|why| panic!("{why}"));
+    }
 }

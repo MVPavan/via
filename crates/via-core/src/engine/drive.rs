@@ -1935,9 +1935,7 @@ impl Engine {
             // The timer fired; its order is not issued yet (design §10).
             #[cfg(feature = "test-failpoints")]
             let _ = via_store::failpoint::hit_async("core.run.idle_expired").await;
-            control
-                .slot
-                .idle_order(control.turn, tokio::time::Instant::now());
+            control.slot.idle_order(control.turn);
             return;
         };
         *pending -= 1;
@@ -1993,7 +1991,7 @@ impl Engine {
         let now = tokio::time::Instant::now();
         if before && control.idle_at.is_some_and(|idle_at| idle_at <= now) {
             control.idle_at = None;
-            control.slot.idle_order(control.turn, now);
+            control.slot.idle_order(control.turn);
         }
         if !control.observed && control.orders.has_changed().unwrap_or(false) {
             let order = control.orders.borrow_and_update().clone();
@@ -2964,9 +2962,7 @@ fn stop_for_store(record: &TurnRecord, control: &mut Control<'_>) {
     if !control.refused && record.steps.unrepresentable() {
         // Review r1: the vendor reported a token count Store cannot hold.
         control.refused = true;
-        control
-            .slot
-            .protocol_order(control.turn, tokio::time::Instant::now());
+        control.slot.protocol_order(control.turn);
     }
     if !control.stored
         && record
@@ -2974,9 +2970,7 @@ fn stop_for_store(record: &TurnRecord, control: &mut Control<'_>) {
             .is_some_and(|note| note.outcome == WriteOutcome::NotCommitted)
     {
         control.stored = true;
-        control
-            .slot
-            .store_order(control.turn, tokio::time::Instant::now());
+        control.slot.store_order(control.turn);
     }
 }
 
@@ -3236,9 +3230,7 @@ fn map_acceptance(
     };
     if mapped != Mapped::Taken && !control.refused {
         control.refused = true;
-        control
-            .slot
-            .protocol_order(control.turn, tokio::time::Instant::now());
+        control.slot.protocol_order(control.turn);
     }
     record.vendor.overflowed |= mapped == Mapped::Exhausted;
     mapped

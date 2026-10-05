@@ -80,8 +80,12 @@ impl Engine {
         let mut acknowledged = false;
         let mut rechecked = false;
         loop {
+            // Before the order's publication, which dates it (x.3.2 X4
+            // D4.2): a cancel held here publishes later (pause seam).
+            #[cfg(feature = "test-failpoints")]
+            let _ = via_store::failpoint::hit_async("core.cancel.publish").await;
             let step = match self.slot(&session) {
-                Some(slot) => slot.cancel_step(turn, spec, tokio::time::Instant::now()),
+                Some(slot) => slot.cancel_step(turn, spec),
                 None => CancelStep::Absent,
             };
             match step {

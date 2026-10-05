@@ -904,20 +904,26 @@ impl SessionDriver {
             };
             let stopped = stop.is_some();
             if let Some(stop) = stop {
-                let now = tokio::time::Instant::now();
-                let force_at = match mode {
-                    CloseMode::Graceful => {
-                        now + deadline.instant().saturating_duration_since(now) / 2
-                    }
-                    CloseMode::Force => now,
-                };
-                stop.send_replace(Some(StopOrder {
-                    cause: StopCause::Close,
-                    // Route acts only on the times; Core never sees this order.
-                    requested_at: String::new(),
-                    force_at: Deadline::at(force_at),
-                    close_by: deadline,
-                }));
+                // Dated inside its publication, as Core's orders are: the
+                // Codex driver reads this watch for provenance (x.3.2 X4
+                // D4.2, I11).
+                stop.send_modify(|slot| {
+                    let now = tokio::time::Instant::now();
+                    let force_at = match mode {
+                        CloseMode::Graceful => {
+                            now + deadline.instant().saturating_duration_since(now) / 2
+                        }
+                        CloseMode::Force => now,
+                    };
+                    *slot = Some(StopOrder {
+                        cause: StopCause::Close,
+                        // Route acts only on the times; Core never sees this order.
+                        requested_at: String::new(),
+                        attached: now,
+                        force_at: Deadline::at(force_at),
+                        close_by: deadline,
+                    });
+                });
             }
             let mut retiring = retiring;
             let settled = match retiring.as_mut() {

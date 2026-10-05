@@ -6218,7 +6218,7 @@ fn a_final_drain_services_a_pending_order_within_128_items() {
         let engine = open(&root);
         let (session, slot, lane, mut record, effective, orders) =
             running_turn_2(&engine, &root).await;
-        slot.idle_order(turn(2), tokio::time::Instant::now());
+        slot.idle_order(turn(2));
         engine
             .drain_queued(
                 (&slot, Some(&*lane)),
@@ -6255,7 +6255,7 @@ fn a_pre_turn_drain_services_a_pending_order_within_128_items() {
             .unwrap()
             .lost();
         record.head = std::sync::Arc::clone(&slot.head);
-        slot.idle_order(turn(2), tokio::time::Instant::now());
+        slot.idle_order(turn(2));
         let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(10_000));
         let (sender, receiver) = tokio::sync::mpsc::channel(512);
         for n in 0..300 {

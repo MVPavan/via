@@ -440,7 +440,10 @@ fn stopped(
     let (outcome, cleanup) = stop_outcome(quiescent, route.forced, route.acknowledged);
     let by_order = match route.cause {
         RouteError::Stopped { .. } => true,
-        RouteError::Deadline { .. } => order.force_at.instant() == wall,
+        // Core capped the order at the wall, and published it before the
+        // wall (x.3.2 X4 D4.2 R1): an order attached at or after the wall
+        // did not stop the turn, which the wall did.
+        RouteError::Deadline { .. } => order.force_at.instant() == wall && order.attached < wall,
         RouteError::Protocol { .. }
         | RouteError::TransportLost { .. }
         | RouteError::ProcessExited { .. }
@@ -1044,6 +1047,53 @@ mod tests {
             let disposed = super::dispose(true, (None, Err(outcome)), Some(order), now);
             assert_eq!(disposed.terminal.state, "unknown");
             assert_eq!(disposed.cancel_cause, cause, "{:?}", order.cause);
+        }
+    }
+
+    /// x.3.2 X4 D4.2 R1 (`dispose_by_order_attached`): a `Deadline` with
+    /// the order's `force_at` capped at the wall takes the order's row
+    /// only when the order was attached before the wall; one attached at
+    /// or after the wall keeps `failed(deadline_wall)`, its acknowledged
+    /// stop shown `acknowledged`.
+    #[test]
+    fn dispose_by_order_attached() {
+        let turn = TurnNumber::try_from(1).unwrap();
+        let wall = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
+        let spec = crate::engine::queue::StopSpec::Cancel {
+            force_after: std::time::Duration::from_secs(60),
+        };
+        let at = "2026-01-01T00:00:00.000Z".to_owned();
+        let acknowledged = || {
+            AdapterError::Route(RouteFailure {
+                launched: true,
+                shared: true,
+                acknowledged: true,
+                cleanup: Some(via_adapters::WireCleanup::Quiescent),
+                ..route_failure(RouteError::Deadline { turn })
+            })
+        };
+        let before = spec.order(
+            at.clone(),
+            wall - std::time::Duration::from_secs(1),
+            Some(wall),
+        );
+        let at_wall = spec.order(at.clone(), wall, Some(wall));
+        let after = spec.order(at, wall + std::time::Duration::from_secs(1), Some(wall));
+        for order in [&before, &at_wall, &after] {
+            assert_eq!(order.force_at.instant(), wall, "capped at the wall");
+        }
+        let disposed = super::dispose(true, (None, Err(acknowledged())), Some(&before), wall);
+        assert_eq!(disposed.terminal.state, "unknown", "the order's row");
+        assert_eq!(disposed.cancel_cause, Some(CancelCause::Cancel));
+        for order in [&at_wall, &after] {
+            let disposed = super::dispose(true, (None, Err(acknowledged())), Some(order), wall);
+            assert_eq!(disposed.terminal.state, "failed");
+            assert_eq!(
+                disposed.terminal.failure.map(|failure| failure.class),
+                Some(FailureClass::DeadlineWall)
+            );
+            assert_eq!(disposed.stop, Some(("acknowledged", "quiescent")));
+            assert_eq!(disposed.cancel_cause, None);
         }
     }
 

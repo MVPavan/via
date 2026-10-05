@@ -145,6 +145,40 @@ pub(crate) struct Knobs {
     /// its placeholder is in the lane before the close (x.3.2 X3 fix r3
     /// #3).
     pub(crate) close_after_read: Option<usize>,
+    /// x.3.2 X4 D4.2: the turn's stop is a cancel Core would publish
+    /// capped at the turn's wall, before the wall but noticed after it:
+    /// once failpoint `adapter.codex.ordered` paused the accepted turn's
+    /// wait, before it polls its orders, the order is published (its
+    /// `attached` asserted before the wall), the harness waits until its
+    /// own clock reaches the wall, then releases the point. It replaces
+    /// the stated stop's action.
+    pub(crate) order_noticed_late: bool,
+    /// x.3.2 X4 D4.2 R1: the turn's stop is a cancel Core would publish
+    /// capped at the turn's wall, after the wall: once the fake logged
+    /// this progress line (its gate after the wall's interrupt, `at
+    /// <step> launch 1`), the order is published (its `attached` asserted
+    /// at or after the wall), then the gate is signalled. It replaces the
+    /// stated stop's action.
+    pub(crate) order_after_wall: Option<&'static str>,
+}
+
+/// The failpoint at an accepted Codex turn's wait, before it polls its
+/// orders.
+const ORDERED: &str = "adapter.codex.ordered";
+
+/// The stop kind `wall`: the turn's own wall (`deadlines.wall_ms`) is the
+/// stop, so no order is sent, and the event `after`, seen at `now`, must
+/// come before it.
+fn before_wall(
+    now: tokio::time::Instant,
+    wall: tokio::time::Instant,
+    after: &str,
+) -> Result<(), String> {
+    if now < wall {
+        Ok(())
+    } else {
+        Err(format!("the wall passed before {after}"))
+    }
 }
 
 /// What a running turn has shown so far, for its side actions.
@@ -777,7 +811,7 @@ impl<'a> Run<'a> {
         };
         let side = self.side(
             turn,
-            (session, number, &activity),
+            (session, number, &activity, now + wall),
             (seen, ended.clone()),
             (&stop, &observed),
         );
@@ -835,6 +869,7 @@ impl<'a> Run<'a> {
         let stop = self.knobs.stop_before.then(|| StopOrder {
             cause: StopCause::Cancel,
             requested_at: "2026-01-01T00:00:00.000Z".to_owned(),
+            attached: now,
             force_at: Deadline::at(now + STOP_FORCE),
             close_by: Deadline::at(now + STOP_FORCE + CLOSE_BY),
         });
@@ -867,6 +902,7 @@ impl<'a> Run<'a> {
                 stop.send_replace(Some(StopOrder {
                     cause: StopCause::Cancel,
                     requested_at: "2026-01-01T00:00:00.000Z".to_owned(),
+                    attached: now,
                     force_at: Deadline::at(now + STOP_FORCE),
                     close_by: Deadline::at(now + STOP_FORCE + CLOSE_BY),
                 }));
@@ -1050,7 +1086,12 @@ impl<'a> Run<'a> {
     async fn side(
         &self,
         turn: &Value,
-        (session, number, activity): (&Session, TurnNumber, &TurnActivity),
+        (session, number, activity, wall): (
+            &Session,
+            TurnNumber,
+            &TurnActivity,
+            tokio::time::Instant,
+        ),
         (seen, ended): (&watch::Sender<Seen>, watch::Receiver<bool>),
         (stop_order, observed): (&watch::Sender<Option<StopOrder>>, &Rc<RefCell<Vec<Value>>>),
     ) -> (Vec<String>, Result<Vec<TurnOutcome>, String>) {
@@ -1067,14 +1108,20 @@ impl<'a> Run<'a> {
             }
         };
         let stopping = async {
+            if self.knobs.order_noticed_late || self.knobs.order_after_wall.is_some() {
+                return self.late_order(wall, stop_order).await;
+            }
             let Some(order) = turn.get("stop").filter(|stop| !stop.is_null()) else {
-                return;
+                return Ok(());
             };
             let after = order["after"].as_str().unwrap_or_default().to_owned();
-            if !at_event(after).await {
-                return;
+            if !at_event(after.clone()).await {
+                return Ok(());
             }
             let now = tokio::time::Instant::now();
+            if order["kind"].as_str() == Some("wall") {
+                return before_wall(now, wall, &after);
+            }
             if order["kind"].as_str() == Some("close") {
                 let deadline = Deadline::at(now + CLOSE_DEADLINE);
                 let _report = session.driver.close(CloseMode::Graceful, deadline).await;
@@ -1083,6 +1130,7 @@ impl<'a> Run<'a> {
                 let order = |now| StopOrder {
                     cause: StopCause::Cancel,
                     requested_at: "2026-01-01T00:00:00.000Z".to_owned(),
+                    attached: now,
                     force_at: Deadline::at(now + STOP_FORCE),
                     close_by: Deadline::at(now + STOP_FORCE + CLOSE_BY),
                 };
@@ -1092,6 +1140,7 @@ impl<'a> Run<'a> {
                     stop_order.send_replace(Some(order(tokio::time::Instant::now())));
                 }
             }
+            Ok(())
         };
         let steering = async {
             let mut results = Vec::new();
@@ -1141,8 +1190,52 @@ impl<'a> Run<'a> {
             }
             Ok(snapshots)
         };
-        let ((), steer, gates) = tokio::join!(stopping, steering, gating);
-        (steer, gates)
+        let (stopped, steer, gates) = tokio::join!(stopping, steering, gating);
+        (steer, stopped.and(gates))
+    }
+
+    /// [`Knobs::order_noticed_late`] and [`Knobs::order_after_wall`]: a
+    /// cancel capped at `wall`, as Core publishes it, dated inside its
+    /// publication (x.3.2 X4 I11), at the instant the knob orders against
+    /// the wall.
+    async fn late_order(
+        &self,
+        wall: tokio::time::Instant,
+        stop: &watch::Sender<Option<StopOrder>>,
+    ) -> Result<(), String> {
+        let after = self.knobs.order_after_wall;
+        match after {
+            None => paused(ORDERED).await?,
+            Some(line) => self.until_progress(line).await?,
+        }
+        stop.send_modify(|order| {
+            let now = tokio::time::Instant::now();
+            *order = Some(StopOrder {
+                cause: StopCause::Cancel,
+                requested_at: "2026-01-01T00:00:00.000Z".to_owned(),
+                attached: now,
+                force_at: Deadline::at((now + STOP_FORCE).min(wall)),
+                close_by: Deadline::at((now + STOP_FORCE).min(wall) + CLOSE_BY),
+            });
+        });
+        let attached = stop
+            .borrow()
+            .as_ref()
+            .map(|order| order.attached)
+            .ok_or("no order")?;
+        if after.is_none() {
+            if attached >= wall {
+                return Err("the order was not attached before the wall".to_owned());
+            }
+            tokio::time::sleep_until(wall).await;
+            drop(Release(ORDERED));
+            Ok(())
+        } else {
+            if attached < wall {
+                return Err("the order was attached before the wall".to_owned());
+            }
+            self.signal(1)
+        }
     }
 
     /// Waits until no observation arrived for [`QUIET`], within

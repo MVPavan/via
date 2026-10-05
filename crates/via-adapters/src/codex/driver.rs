@@ -19,10 +19,15 @@
 //! lease; the last lease's release retires the server.
 //!
 //! A stop order posts the turn's one interrupt intent, owned by the
-//! connection (before acceptance it waits on the start's reply). Its
-//! acknowledgement, the P7 window and steer are x.3.2 X4's: the turn ends
-//! at the order's `close_by` (`uncertain`) unless its terminal comes
-//! first.
+//! connection (before acceptance it waits on the start's reply). With no
+//! terminal by the order's `close_by` the turn ends there (`uncertain`).
+//! An interrupted terminal acknowledges the stop (the turn's `StopAck`);
+//! with a tool still open the turn drains (C1 §3.5 P7): it stays pending
+//! until its tools end, `tool_grace` after the terminal's original decode,
+//! the wall, or a close, whichever is first (x.3.2 X4 D4). The turn's
+//! result follows the earliest positively attested stop it recorded (an
+//! order at its `attached`, or the wall once passed), so a wall that came
+//! first gives `Deadline` with the terminal kept. Steer is not supported.
 
 use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
@@ -64,7 +69,7 @@ use crate::plan::{Bound, Inherit, RefusalKind};
 use crate::runtime::event_stall;
 use crate::{
     AcceptanceToken, Cleanup, Deadline, DriverFailure, DriverHealth, ProcessOwner, RouteError,
-    RouteFailure, StartRejected, StopOrder, StopWatch, TurnNumber,
+    RouteFailure, StartRejected, StopCause, StopOrder, StopWatch, TurnNumber, VendorTerminalStatus,
 };
 
 /// How long the link of a turn to its server may take (X0 item 1.5).
@@ -584,12 +589,18 @@ fn sticky(earlier: Retirement, later: Retirement) -> Retirement {
 }
 
 /// The orders that end a turn: Core's stop, the driver's close, the wall,
-/// the daemon force and the session's cancellation.
+/// the daemon force and the session's cancellation; and the turn's P7
+/// grace, and what stopped it first.
 pub(super) struct Orders {
     pub(super) stop: StopWatch,
     pub(super) close: watch::Receiver<Option<StopOrder>>,
     pub(super) wall: Deadline,
     pub(super) cancel: tokio_util::sync::CancellationToken,
+    /// C1 P7: how long an interrupted turn's tools may run on.
+    pub(super) tool_grace: std::time::Duration,
+    /// x.3.2 X4 D4.2: the earliest positively attested stop, which alone
+    /// decides settlement's provenance; it only ever moves earlier.
+    pub(super) first: Option<Provenance>,
 }
 
 /// Why a turn is ending, and by when it must have ended.
@@ -605,15 +616,152 @@ pub(super) enum EndCause {
     Wall,
 }
 
+/// x.3.2 X4 D4.2: a positively attested stop and its instant: an order's
+/// publication (`attached`), the wall once passed, or the session's
+/// cancellation when observed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct Provenance {
+    pub(super) cause: EndCause,
+    pub(super) at: Instant,
+}
+
+impl Provenance {
+    /// Its order: earlier first, and at one instant the wall before an
+    /// order (`Stopped` needs `attached < wall`).
+    fn key(self) -> (Instant, bool) {
+        (self.at, self.cause == EndCause::Stopped)
+    }
+}
+
 impl Orders {
-    /// Resolves at the first order (the force excluded), with its cause
-    /// and its own end.
+    /// The orders of a turn under `wall`, with its P7 `tool_grace`.
+    pub(super) fn new(
+        (stop, close): (StopWatch, watch::Receiver<Option<StopOrder>>),
+        (wall, tool_grace): (Deadline, std::time::Duration),
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        Self {
+            stop,
+            close,
+            wall,
+            cancel,
+            tool_grace,
+            first: None,
+        }
+    }
+
+    /// x.3.2 X4 D4.2 (I4, I11): records the earliest positively attested
+    /// stop instant among the visible orders (each at its `attached`), the
+    /// wall once passed by `now` (or proved passed by an order attached at
+    /// or after it), and the session's cancellation (at `now`). The record
+    /// is written once one exists and only ever moves earlier, so whoever
+    /// notes, in whatever order, the final record is the same.
+    pub(super) fn note(&mut self, now: Instant) {
+        let wall = self.wall.instant();
+        let attached = [
+            self.stop.borrow().as_ref().map(|order| order.attached),
+            self.close.borrow().as_ref().map(|order| order.attached),
+        ];
+        let mut candidates = Vec::with_capacity(4);
+        let mut wall_passed = wall <= now;
+        for at in attached.into_iter().flatten() {
+            // A value read at or after `attached` (I11): an order attached
+            // at or after the wall proves the wall passed.
+            wall_passed |= wall <= at;
+            candidates.push(Provenance {
+                cause: EndCause::Stopped,
+                at,
+            });
+        }
+        if wall_passed {
+            candidates.push(Provenance {
+                cause: EndCause::Wall,
+                at: wall,
+            });
+        }
+        if self.cancel.is_cancelled() {
+            candidates.push(Provenance {
+                cause: EndCause::Stopped,
+                at: now,
+            });
+        }
+        let earliest = candidates
+            .into_iter()
+            .min_by_key(|candidate| candidate.key());
+        if let Some(candidate) = earliest
+            && self.first.is_none_or(|first| candidate.key() < first.key())
+        {
+            self.first = Some(candidate);
+        }
+    }
+
+    /// The recorded provenance's cause; `Stopped` while none is recorded.
+    fn provenance(&self) -> EndCause {
+        self.first.map_or(EndCause::Stopped, |first| first.cause)
+    }
+
+    /// x.3.2 X4 D4.3 (Q8): a close (Core's close order or the driver's own)
+    /// or the session's cancellation detaches a draining turn at once.
+    fn detached(&self) -> bool {
+        self.cancel.is_cancelled()
+            || self.close.borrow().is_some()
+            || self
+                .stop
+                .borrow()
+                .as_ref()
+                .is_some_and(|order| order.cause == StopCause::Close)
+    }
+
+    /// Resolves once [`Self::detached`] holds, from clones of the orders'
+    /// receivers.
+    fn detaching(&self) -> impl Future<Output = ()> + use<> {
+        let (mut stop, mut close, cancel) =
+            (self.stop.clone(), self.close.clone(), self.cancel.clone());
+        async move {
+            let closed = async {
+                if close.wait_for(Option::is_some).await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            };
+            let stopped = async {
+                let close = |order: &Option<StopOrder>| {
+                    order
+                        .as_ref()
+                        .is_some_and(|order| order.cause == StopCause::Close)
+                };
+                if stop.wait_for(close).await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            };
+            tokio::select! {
+                () = closed => {}
+                () = stopped => {}
+                () = cancel.cancelled() => {}
+            }
+        }
+    }
+
+    /// Resolves at the first order (the force excluded), with its own end,
+    /// having noted the provenance (x.3.2 X4 D4.2): its cause is the
+    /// record's.
     async fn ordered(&mut self) -> Ending {
+        let ending = self.first_order().await;
+        self.note(Instant::now());
+        Ending {
+            cause: self.provenance(),
+            by: ending.by,
+        }
+    }
+
+    /// The first order (the force excluded), with its cause and its own
+    /// end.
+    async fn first_order(&mut self) -> Ending {
         let Self {
             stop,
             close,
             wall,
             cancel,
+            ..
         } = self;
         let order = |order: &Option<StopOrder>| {
             order.as_ref().map(|order| Ending {
@@ -922,17 +1070,12 @@ async fn turn(
         capacity,
         activity,
         wall,
-        tool_grace: _,
+        tool_grace,
         stop,
         mut force,
-        stop_ack: _,
+        stop_ack,
     } = cx;
-    let mut orders = Orders {
-        stop,
-        close,
-        wall,
-        cancel: driver.cancel.clone(),
-    };
+    let mut orders = Orders::new((stop, close), (wall, tool_grace), driver.cancel.clone());
     let mut facts = Turn {
         driver,
         session,
@@ -1008,7 +1151,7 @@ async fn turn(
     let end = run_started(
         &mut facts,
         &start,
-        (spec, credit),
+        (spec, credit, stop_ack),
         (&activity, &mut orders, &mut force, &mut writes),
     )
     .await;
@@ -1944,7 +2087,7 @@ struct Started<'a> {
 async fn run_started(
     facts: &mut Turn<'_>,
     start: &Started<'_>,
-    (spec, credit): (TurnSpec, Charge),
+    (spec, credit, stop_ack): (TurnSpec, Charge, crate::StopAck),
     (activity, orders, force, writes): (
         &crate::TurnActivity,
         &mut Orders,
@@ -1978,6 +2121,7 @@ async fn run_started(
         instance: facts.instance.clone(),
         correlation: Arc::clone(&correlation),
         credit,
+        stop_ack,
     };
     let requested = start.connection.request(
         |id| {
@@ -2050,7 +2194,7 @@ async fn run_started(
     };
     let cut = wait(start, &accepted_turn, (orders, force)).await;
     cut_seam().await;
-    let end = settle_turn(facts, start, &accepted_turn, cut);
+    let end = settle_turn(facts, (start, &accepted_turn), orders, cut);
     with_undecoded(end, &start.thread.registration).await
 }
 
@@ -2205,6 +2349,20 @@ async fn cut_seam() {
     }
 }
 
+/// Test builds: a seam at an accepted turn's wait, before it first polls
+/// its orders (x.3.2 X4 D4.2), where a test publishes an order the wait
+/// notices only later.
+#[cfg_attr(
+    not(feature = "test-failpoints"),
+    expect(clippy::unused_async, reason = "only test builds wait at the seam")
+)]
+async fn ordered_seam() {
+    #[cfg(feature = "test-failpoints")]
+    {
+        let _ = via_routes::failpoint::hit_async("adapter.codex.ordered").await;
+    }
+}
+
 /// An accepted turn's facts.
 struct Accepted<'a> {
     id: String,
@@ -2227,6 +2385,12 @@ pub(super) enum Cut {
     /// The thread's lane overflowed (x.3.2 X3 fix r2 #1): the turn ends
     /// at once, whatever the normalizer is doing.
     Overflow,
+    /// x.3.2 X4 D4.3: the P7 window ended, at `min(decoded_at +
+    /// tool_grace, wall)`, with a tool still open.
+    Grace,
+    /// x.3.2 X4 D4.3 (Q8): a close or the session's cancellation while
+    /// the P7 window was open.
+    Detach,
 }
 
 /// The cutoff a turn's wait finds already reached as it resumes: the
@@ -2247,12 +2411,17 @@ pub(super) fn ready_cut(forced: bool, decided: bool, overflowed: bool) -> Option
 
 /// Waits for the turn's delivery to decide, beside its orders: never
 /// behind the normalizer, so a blocked sink delays no control. A stop
-/// order posts the turn's interrupt intent at once.
+/// order posts the turn's interrupt intent at once. While its P7 window
+/// is open (x.3.2 X4 D4.3) the order's end no longer applies: the window
+/// ends at `min(decoded_at + tool_grace, wall)` (`Grace`), at once on a
+/// close or the session's cancellation (`Detach`), or when the tools end
+/// (the delivery decides).
 async fn wait(
     start: &Started<'_>,
     accepted: &Accepted<'_>,
     (orders, force): (&mut Orders, &mut ForceWatch),
 ) -> Cut {
+    ordered_seam().await;
     let failing = start.connection.failing();
     tokio::pin!(failing);
     let lane = start.thread.lease.lane();
@@ -2267,12 +2436,22 @@ async fn wait(
         if let Some(cut) = ready {
             return cut;
         }
-        let end_at = ending.map(|ending| ending.by.instant());
+        let draining = accepted.delivery.draining();
+        if draining.is_some() && orders.detached() {
+            return Cut::Detach;
+        }
+        let grace_at =
+            draining.map(|decoded_at| (decoded_at + orders.tool_grace).min(orders.wall.instant()));
+        let end_at = ending
+            .filter(|_| draining.is_none())
+            .map(|ending| ending.by.instant());
+        let detaching = orders.detaching();
         tokio::select! {
             biased;
             () = forced(force) => return Cut::Forced,
             () = accepted.delivery.changed() => {}
             () = lane.overflowed() => {}
+            () = detaching, if draining.is_some() => {}
             found = orders.ordered(), if ending.is_none() => {
                 start.connection.interrupt(
                     &start.thread.lease,
@@ -2285,6 +2464,7 @@ async fn wait(
             () = sleep_until(end_at), if end_at.is_some() => {
                 return Cut::Order(ending.map_or(EndCause::Stopped, |ending| ending.cause));
             }
+            () = sleep_until(grace_at), if grace_at.is_some() => return Cut::Grace,
             () = &mut failing, if loss_at.is_none() => {
                 loss_at = Some(Instant::now() + LOSS_EVIDENCE);
             }
@@ -2302,13 +2482,23 @@ async fn wait(
 /// bounds or a stalled sink) proves nothing of what was dropped: the loss
 /// is recorded, the generation's cleanup interrupt is posted and the
 /// cleanup is uncertain (x.3.2 X3 fix r2 #2).
+///
+/// x.3.2 X4 D4.2: the provenance is noted first, and settlement reads
+/// only that record. A terminal decoded before the wall wins as `Ok`; one
+/// decoded at or after it wins too under an order attached before the
+/// wall (the order's row); under the wall it is kept beside the wall's
+/// `Deadline`, acknowledged when interrupted within the wall's cleanup
+/// bound. The P7 window's end (`Grace`) or a detach keeps the terminal
+/// with its cleanup uncertain.
 fn settle_turn(
     facts: &Turn<'_>,
-    start: &Started<'_>,
-    accepted: &Accepted<'_>,
+    (start, accepted): (&Started<'_>, &Accepted<'_>),
+    orders: &mut Orders,
     cut: Cut,
 ) -> TurnEnd {
+    orders.note(Instant::now());
     let turn = facts.number;
+    let wall = orders.wall.instant();
     let sealed = accepted.delivery.seal();
     let lane = start.thread.lease.lane();
     let terminal_decided = cut == Cut::Decided && sealed.terminal.is_some();
@@ -2348,7 +2538,12 @@ fn settle_turn(
         if overflowed {
             cleanup_interrupt();
         }
-        return terminal_end(facts, retained, sealed.tools_open || overflowed);
+        let tools_open = sealed.tools_open || overflowed;
+        let decoded_at = sealed.decoded_at.unwrap_or(retained.terminal.at);
+        if decoded_at >= wall && orders.provenance() == EndCause::Wall {
+            return wall_end(facts, retained, decoded_at, (wall, tools_open));
+        }
+        return terminal_end(facts, retained, tools_open);
     }
     match (cut, sealed.stop) {
         (Cut::Overflow, _) | (_, Some(Stop::Lane(LaneEnd::Overflow))) => {
@@ -2373,7 +2568,9 @@ fn settle_turn(
             let (cause, loss) = lane_end(end, start.connection, turn);
             facts.failure(cause, loss, reported)
         }
-        (Cut::Order(EndCause::Wall), None) => uncertain(RouteError::Deadline { turn }),
+        (Cut::Order(_), None) if orders.provenance() == EndCause::Wall => {
+            uncertain(RouteError::Deadline { turn })
+        }
         (Cut::LossDeadline, None) => match connection_loss(start.connection) {
             Some(loss) => facts.failure(
                 loss_cause(&loss, turn),
@@ -2385,10 +2582,41 @@ fn settle_turn(
             ),
             None => uncertain(RouteError::TransportLost { turn }),
         },
-        (Cut::Order(EndCause::Stopped) | Cut::Decided | Cut::Forced, None) => {
+        // A P7 cut has a terminal, which the seal took; never reached.
+        (Cut::Order(_) | Cut::Decided | Cut::Forced | Cut::Grace | Cut::Detach, None) => {
             uncertain(RouteError::Stopped { turn })
         }
     }
+}
+
+/// x.3.2 X4 D4.2 rule 3 (C2 §4.1): the wall stopped the turn, whose
+/// terminal, decoded at `decoded_at` at or after it, is kept beside the
+/// wall's `Deadline`; the stop was acknowledged by an interrupted terminal
+/// within the wall's cleanup bound. P7 is capped at the wall: it settles
+/// at once.
+fn wall_end(
+    facts: &Turn<'_>,
+    retained: Retained,
+    decoded_at: Instant,
+    (wall, tools_open): (Instant, bool),
+) -> TurnEnd {
+    let acknowledged = retained.terminal.status == VendorTerminalStatus::Interrupted
+        && decoded_at <= wall + CLEANUP_ALLOWANCE;
+    let mut end = facts.failure(
+        RouteError::Deadline { turn: facts.number },
+        None,
+        Some(if tools_open {
+            WireCleanup::Uncertain
+        } else {
+            WireCleanup::Quiescent
+        }),
+    );
+    if let Err(AdapterError::Route(failure)) = &mut end.outcome {
+        failure.acknowledged = acknowledged;
+    }
+    let kept = terminal_end(facts, retained, tools_open);
+    end.terminal = kept.terminal;
+    end
 }
 
 /// The turn's end with its retained terminal.

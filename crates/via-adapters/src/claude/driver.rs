@@ -467,6 +467,9 @@ impl Delivery<'_> {
             cause: StopCause::Protocol,
             // Route acts only on the times; Core never sees this order.
             requested_at: String::new(),
+            // Claude's own abort: no provenance reader sees it (x.3.2 X4
+            // D4.2).
+            attached: now,
             force_at: Deadline::at(force_at),
             close_by: Deadline::at(force_at + CLEANUP_ALLOWANCE),
         }));

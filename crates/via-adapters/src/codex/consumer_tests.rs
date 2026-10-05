@@ -59,6 +59,8 @@ impl ServerEvidence for NoEvidence {
 struct Started {
     delivery: Arc<Delivery>,
     activity: TurnActivity,
+    /// The turn's stop report, as Core reads it (x.3.2 X4 D7).
+    stop_ack: watch::Receiver<bool>,
     _admission: Admission,
 }
 
@@ -74,6 +76,8 @@ fn started(
     let admission = registration
         .admit(turn(number), Arc::new(|| {}), &delivery)
         .unwrap();
+    let stop_ack = crate::StopAck::new();
+    let acknowledged = stop_ack.subscribe();
     let cx = StartCx {
         delivery: Arc::clone(&delivery),
         activity: activity.clone(),
@@ -81,11 +85,13 @@ fn started(
         instance: None,
         correlation: Arc::new(OnceLock::new()),
         credit,
+        stop_ack,
     };
     assert!(lane.push_start(turn(number), activity.decode_watermark(), Box::new(cx)));
     Started {
         delivery,
         activity,
+        stop_ack: acknowledged,
         _admission: admission,
     }
 }
@@ -264,6 +270,13 @@ fn tool_started(named: &str, id: &str) -> Value {
     json!({"method": "item/started", "params": {"threadId": THREAD, "turnId": named,
         "item": {"type": "commandExecution", "id": id, "command": "sleep 1",
             "cwd": "/w", "commandActions": [], "status": "inProgress"}}})
+}
+
+/// Vendor turn `named`'s command item `id` completed.
+fn tool_completed(named: &str, id: &str) -> Value {
+    json!({"method": "item/completed", "params": {"threadId": THREAD, "turnId": named,
+        "item": {"type": "commandExecution", "id": id, "command": "sleep 1",
+            "cwd": "/w", "commandActions": [], "status": "completed", "exitCode": 0}}})
 }
 
 /// Vendor turn `named`'s command item completed `declined`.
@@ -1631,4 +1644,187 @@ fn r1_5_one_stall_deadline_covers_a_message() {
         );
         drop(full);
     });
+}
+
+/// A message of B's, mapped, read now: the item and its read instant.
+fn of_b(line: &Value, seq: u64, owner: Option<u32>) -> (LaneItem, Instant) {
+    let routed = routed(line, seq, (Some(B), owner));
+    let at = routed.at;
+    (LaneItem::Message(routed), at)
+}
+
+/// x.3.2 X4 D4.1 (W1, live): B's interrupted terminal, read with its tool
+/// open, drains: it is retained with its original decode instant, not
+/// decided, and the stop report is written. A second terminal read while
+/// it drains is handled whole (the frontier passes it) with nothing
+/// emitted or retained: the first stays.
+#[tokio::test]
+async fn w1_a_duplicate_terminal_while_draining_is_suppressed() {
+    let mut fixture = Fixture::new();
+    let b = fixture.start(2);
+    fixture.reply(2, Some(B));
+    fixture.push(message(&tool_started(B, "tool-b"), 5, (Some(B), Some(2))));
+    let (first, t0) = of_b(&completed(B, "interrupted"), 6, Some(2));
+    fixture.push(first);
+    fixture.settle().await;
+    assert!(!b.delivery.decided(), "draining: the window is open");
+    assert_eq!(b.delivery.draining(), Some(t0));
+    assert!(
+        *b.stop_ack.borrow(),
+        "vendor evidence acknowledged the stop"
+    );
+    let before = b.activity.delivered();
+    let seen = fixture.observed().len();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    fixture.push(message(&completed(B, "completed"), 7, (Some(B), Some(2))));
+    fixture.settle().await;
+    assert_eq!(b.activity.delivered(), before + 1, "handled whole");
+    assert_eq!(
+        fixture.observed().len(),
+        0,
+        "nothing emitted ({seen} before)"
+    );
+    assert_eq!(b.delivery.draining(), Some(t0), "still the first's window");
+    let sealed = b.delivery.seal();
+    let terminal = sealed.terminal.map(|retained| retained.terminal).unwrap();
+    assert_eq!(terminal.status, VendorTerminalStatus::Interrupted);
+    assert_eq!(sealed.decoded_at, Some(t0));
+    assert!(sealed.tools_open);
+    assert_eq!(fixture.registration.failure(), None);
+}
+
+/// x.3.2 X4 D4.1 (W1 from the early tail; W7, the consumer's half): B's
+/// tool start, interrupted terminal and a second terminal, read before
+/// its reply, are retained and released at the acceptance: the first
+/// terminal drains, observed at the reply's instant but keeping its
+/// original decode instant for P7; the second is suppressed, and the
+/// release goes on past it.
+#[tokio::test]
+async fn w1_w7_an_early_terminal_drains_from_its_decode() {
+    let mut fixture = Fixture::new();
+    let b = fixture.start(2);
+    fixture.push(message(&tool_started(B, "tool-b"), 5, (Some(B), None)));
+    let (first, t0) = of_b(&completed(B, "interrupted"), 6, None);
+    fixture.push(first);
+    fixture.push(message(&completed(B, "completed"), 7, (Some(B), None)));
+    fixture.settle().await;
+    assert!(!*b.stop_ack.borrow(), "retained: not yet the turn's");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let (_, t_r) = fixture.reply(2, Some(B));
+    fixture.settle().await;
+    assert!(t0 < t_r);
+    assert!(!b.delivery.decided());
+    assert_eq!(
+        b.delivery.draining(),
+        Some(t0),
+        "P7 from the decode, not t_r"
+    );
+    assert!(*b.stop_ack.borrow());
+    assert_eq!(fixture.lane.charged().0, 0, "the whole tail was released");
+    let kinds: Vec<_> = kinds(&fixture.observed())
+        .into_iter()
+        .map(|(kind, _, _)| kind)
+        .collect();
+    assert_eq!(kinds, ["accepted", "progress"]);
+    let sealed = b.delivery.seal();
+    let terminal = sealed.terminal.map(|retained| retained.terminal).unwrap();
+    assert_eq!(terminal.status, VendorTerminalStatus::Interrupted);
+    assert_eq!(terminal.at, t_r, "observed at the acceptance (X3)");
+    assert_eq!(sealed.decoded_at, Some(t0));
+}
+
+/// x.3.2 X4 D4.1: the draining turn's window closes when its tool ends:
+/// a completion of another item does not end it; the matching one does,
+/// and then the terminal decides with no tool open, frozen as `Retained`
+/// (a later message is not taken).
+#[tokio::test]
+async fn a_draining_turn_decides_when_its_tools_end() {
+    let mut fixture = Fixture::new();
+    let b = fixture.start(2);
+    fixture.reply(2, Some(B));
+    fixture.push(message(&tool_started(B, "tool-b"), 5, (Some(B), Some(2))));
+    fixture.push(message(&completed(B, "interrupted"), 6, (Some(B), Some(2))));
+    fixture.settle().await;
+    fixture.push(message(&tool_completed(B, "tool-x"), 7, (Some(B), Some(2))));
+    fixture.settle().await;
+    assert!(!b.delivery.decided(), "a wrong ID ends nothing");
+    fixture.push(message(&tool_completed(B, "tool-b"), 8, (Some(B), Some(2))));
+    fixture.settle().await;
+    assert!(b.delivery.decided(), "the tools ended");
+    assert_eq!(b.delivery.draining(), None);
+    let ended: Vec<_> = fixture
+        .observed()
+        .into_iter()
+        .filter_map(|item| {
+            if let Observation::Progress(marks) = item.observation {
+                Some(marks.tools_ended)
+            } else {
+                None
+            }
+        })
+        .flatten()
+        .collect();
+    assert!(ended.contains(&"tool-b".to_owned()), "{ended:?}");
+    fixture.push(message(&delta(B), 9, (Some(B), Some(2))));
+    fixture.settle().await;
+    assert!(
+        fixture.observed().is_empty(),
+        "retained: the lane is frozen"
+    );
+    let sealed = b.delivery.seal();
+    assert!(!sealed.tools_open);
+    assert_eq!(
+        sealed.terminal.map(|retained| retained.terminal.status),
+        Some(VendorTerminalStatus::Interrupted)
+    );
+}
+
+/// x.3.2 X4 D4.1: a completed or failed terminal never drains, an open
+/// tool or not; an interrupted one with no tool open decides at once.
+/// Each interrupted one writes the stop report; the others do not.
+#[tokio::test]
+async fn only_an_interrupted_terminal_with_a_tool_open_drains() {
+    for (status, tool, drains) in [
+        ("completed", true, false),
+        ("failed", true, false),
+        ("interrupted", false, false),
+        ("interrupted", true, true),
+    ] {
+        let fixture = Fixture::new();
+        let b = fixture.start(2);
+        fixture.reply(2, Some(B));
+        if tool {
+            fixture.push(message(&tool_started(B, "tool-b"), 5, (Some(B), Some(2))));
+        }
+        fixture.push(message(&completed(B, status), 6, (Some(B), Some(2))));
+        fixture.settle().await;
+        assert_eq!(b.delivery.decided(), !drains, "{status} {tool}");
+        assert_eq!(b.delivery.draining().is_some(), drains, "{status} {tool}");
+        assert_eq!(*b.stop_ack.borrow(), status == "interrupted", "{status}");
+    }
+}
+
+/// x.3.2 X4 W8: a driver dropped while its turn drains retires at once:
+/// the registration is retired, the open tool folds `Uncertain`, and the
+/// consumer ends; nothing waits for the P7 window.
+#[tokio::test]
+async fn w8_a_driver_dropped_while_draining_retires_at_once() {
+    let fixture = Fixture::new();
+    let b = fixture.start(2);
+    fixture.reply(2, Some(B));
+    fixture.push(message(&tool_started(B, "tool-b"), 5, (Some(B), Some(2))));
+    fixture.push(message(&completed(B, "interrupted"), 6, (Some(B), Some(2))));
+    fixture.settle().await;
+    assert!(b.delivery.draining().is_some());
+    drop(fixture.guard());
+    assert!(fixture.registration.retired());
+    assert_eq!(fixture.folded(), Some(WireCleanup::Uncertain));
+    let Fixture {
+        _consumer: consumer,
+        ..
+    } = fixture;
+    tokio::time::timeout(Duration::from_secs(1), consumer)
+        .await
+        .expect("the consumer ends at once")
+        .unwrap();
 }

@@ -115,26 +115,34 @@ impl TurnStop {
         }
     }
 
-    /// Attaches `order`, or coalesces it into the one already attached: the
-    /// first `requested_at` and cause stay, a `store` cause overrides, a
-    /// `protocol` cause overrides any but `store`, and
-    /// the earlier `force_at` and `close_by` win (design §2).
-    fn attach(&self, order: StopOrder) {
-        self.order.send_modify(|current| match current {
-            Some(existing) => {
-                if order.cause == StopCause::Store
-                    || (order.cause == StopCause::Protocol && existing.cause != StopCause::Store)
-                {
-                    existing.cause = order.cause;
+    /// Attaches `spec`'s order, or coalesces it into the one already
+    /// attached: the first `requested_at`, `attached` and cause stay, a
+    /// `store` cause overrides, a `protocol` cause overrides any but
+    /// `store`, and the earlier `force_at` and `close_by` win (design §2).
+    /// The order is dated inside its publication, under the watch's write
+    /// lock: `attached` and its times come from one instant no value read
+    /// can fall before (x.3.2 X4 D4.2, I11).
+    fn attach(&self, spec: StopSpec, requested_at: String, wall: Option<tokio::time::Instant>) {
+        self.order.send_modify(|current| {
+            let now = tokio::time::Instant::now();
+            let order = spec.order(requested_at, now, wall);
+            match current {
+                Some(existing) => {
+                    if order.cause == StopCause::Store
+                        || (order.cause == StopCause::Protocol
+                            && existing.cause != StopCause::Store)
+                    {
+                        existing.cause = order.cause;
+                    }
+                    if order.force_at.instant() < existing.force_at.instant() {
+                        existing.force_at = order.force_at;
+                    }
+                    if order.close_by.instant() < existing.close_by.instant() {
+                        existing.close_by = order.close_by;
+                    }
                 }
-                if order.force_at.instant() < existing.force_at.instant() {
-                    existing.force_at = order.force_at;
-                }
-                if order.close_by.instant() < existing.close_by.instant() {
-                    existing.close_by = order.close_by;
-                }
+                None => *current = Some(order),
             }
-            None => *current = Some(order),
         });
     }
 }
@@ -206,6 +214,7 @@ impl StopSpec {
         StopOrder {
             cause,
             requested_at,
+            attached: now,
             force_at: Deadline::at(force_at),
             close_by: Deadline::at(close_by),
         }
@@ -589,7 +598,7 @@ impl Slot {
     /// check and the attach are one transition under the slot state, which
     /// every other order's attach also takes [s2-r1.1]. Wakes: an order
     /// attached.
-    pub(super) fn idle_order(&self, turn: TurnNumber, now: tokio::time::Instant) {
+    pub(super) fn idle_order(&self, turn: TurnNumber) {
         let issued = {
             let state = lock(&self.state);
             match state
@@ -599,11 +608,9 @@ impl Slot {
             {
                 Some(running) if running.stop.order.borrow().is_none() => {
                     let requested_at = rfc3339(std::time::SystemTime::now());
-                    running.stop.attach(StopSpec::Idle.order(
-                        requested_at,
-                        now,
-                        Some(running.wall),
-                    ));
+                    running
+                        .stop
+                        .attach(StopSpec::Idle, requested_at, Some(running.wall));
                     true
                 }
                 _ => false,
@@ -620,17 +627,17 @@ impl Slot {
     /// disposition reads the turn's first failure. One transition under the
     /// slot state, like every other attach [s2-r1.1]. Wakes: an order
     /// attached.
-    pub(super) fn store_order(&self, turn: TurnNumber, now: tokio::time::Instant) {
-        self.failure_order(turn, now, StopSpec::Store);
+    pub(super) fn store_order(&self, turn: TurnNumber) {
+        self.failure_order(turn, StopSpec::Store);
     }
 
     /// As [`Self::store_order`], with cause `protocol`: Core refused the
     /// turn's vendor evidence (review r1).
-    pub(super) fn protocol_order(&self, turn: TurnNumber, now: tokio::time::Instant) {
-        self.failure_order(turn, now, StopSpec::Protocol);
+    pub(super) fn protocol_order(&self, turn: TurnNumber) {
+        self.failure_order(turn, StopSpec::Protocol);
     }
 
-    fn failure_order(&self, turn: TurnNumber, now: tokio::time::Instant, spec: StopSpec) {
+    fn failure_order(&self, turn: TurnNumber, spec: StopSpec) {
         let issued = {
             let state = lock(&self.state);
             match state
@@ -640,9 +647,7 @@ impl Slot {
             {
                 Some(running) => {
                     let requested_at = rfc3339(std::time::SystemTime::now());
-                    running
-                        .stop
-                        .attach(spec.order(requested_at, now, Some(running.wall)));
+                    running.stop.attach(spec, requested_at, Some(running.wall));
                     true
                 }
                 None => false,
@@ -780,12 +785,7 @@ impl Slot {
     /// takes a `Waiting` turn, attaches `spec`'s order to a claimed or running
     /// one, and joins any other cancellation. Wakes: a claim change or an
     /// order attached.
-    pub(super) fn cancel_step(
-        &self,
-        turn: TurnNumber,
-        spec: StopSpec,
-        now: tokio::time::Instant,
-    ) -> CancelStep {
+    pub(super) fn cancel_step(&self, turn: TurnNumber, spec: StopSpec) -> CancelStep {
         let step = {
             let mut state = lock(&self.state);
             if let Some(running) = state
@@ -797,9 +797,7 @@ impl Slot {
                     CancelStep::Settling(running.stop.ack.subscribe())
                 } else {
                     let requested_at = rfc3339(std::time::SystemTime::now());
-                    running
-                        .stop
-                        .attach(spec.order(requested_at, now, Some(running.wall)));
+                    running.stop.attach(spec, requested_at, Some(running.wall));
                     CancelStep::Ordered(running.stop.ack.subscribe())
                 }
             } else {
@@ -814,7 +812,7 @@ impl Slot {
                         Claim::Claimed => match &entry.stop {
                             Some(stop) => {
                                 let requested_at = rfc3339(std::time::SystemTime::now());
-                                stop.attach(spec.order(requested_at, now, None));
+                                stop.attach(spec, requested_at, None);
                                 CancelStep::Ordered(stop.ack.subscribe())
                             }
                             None => CancelStep::Absent,
@@ -975,11 +973,7 @@ impl Slot {
     /// order to a claimed or running turn [r1.1]. Returns the attempt's
     /// watch and whether a dispatcher must be started (amendment A2).
     /// Wakes: a close order set.
-    pub(super) fn set_close(
-        &self,
-        order: CloseOrder,
-        now: tokio::time::Instant,
-    ) -> (CloseWatch, bool) {
+    pub(super) fn set_close(&self, order: CloseOrder) -> (CloseWatch, bool) {
         let result = {
             let mut state = lock(&self.state);
             let spec = order.spec();
@@ -987,11 +981,11 @@ impl Slot {
             if let Some(running) = state.running.as_ref().filter(|running| !running.settling) {
                 running
                     .stop
-                    .attach(spec.order(requested_at.clone(), now, Some(running.wall)));
+                    .attach(spec, requested_at.clone(), Some(running.wall));
             }
             for entry in &state.queue {
                 if let (Claim::Claimed, Some(stop)) = (entry.claim, &entry.stop) {
-                    stop.attach(spec.order(requested_at.clone(), now, None));
+                    stop.attach(spec, requested_at.clone(), None);
                 }
             }
             let watch = order.watch.clone();
@@ -1013,7 +1007,7 @@ impl Slot {
 
     /// A second close with `mode: force` escalates the attempt to force now
     /// (design §4 step 5). Wakes: an order attached.
-    pub(super) fn escalate_close(&self, now: tokio::time::Instant) {
+    pub(super) fn escalate_close(&self) {
         {
             let mut state = lock(&self.state);
             let Some(close) = state.close.as_mut() else {
@@ -1025,11 +1019,11 @@ impl Slot {
             if let Some(running) = state.running.as_ref().filter(|running| !running.settling) {
                 running
                     .stop
-                    .attach(spec.order(requested_at.clone(), now, Some(running.wall)));
+                    .attach(spec, requested_at.clone(), Some(running.wall));
             }
             for entry in &state.queue {
                 if let (Claim::Claimed, Some(stop)) = (entry.claim, &entry.stop) {
-                    stop.attach(spec.order(requested_at.clone(), now, None));
+                    stop.attach(spec, requested_at.clone(), None);
                 }
             }
         }
@@ -1131,5 +1125,175 @@ impl Backoff {
 
     pub(super) fn reset(&mut self) {
         self.0 = RETRY_MIN;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Weak};
+    use std::time::Duration;
+
+    use tokio::time::Instant;
+    use via_adapters::{StopOrder, TurnActivity};
+
+    use super::{CancelStep, CloseOrder, Slot, StopSpec};
+    use crate::TurnNumber;
+    use crate::api::CloseMode;
+    use crate::engine::journal::Head;
+    use crate::engine::lock;
+    use crate::engine::progress::{Clock, Progress};
+
+    const FORCE_AFTER: Duration = Duration::from_secs(60);
+    const CANCEL: StopSpec = StopSpec::Cancel {
+        force_after: FORCE_AFTER,
+    };
+
+    fn turn() -> TurnNumber {
+        TurnNumber::try_from(1).unwrap()
+    }
+
+    /// A slot whose turn 1 is claimed and, when `running`, runs under
+    /// `wall`.
+    fn slot(running: bool, wall: Instant) -> Arc<Slot> {
+        let slot = Slot::new(Head::new(None), Weak::new());
+        slot.enqueue(turn());
+        assert!(slot.claim(turn()));
+        if running {
+            let clock = Clock::now();
+            let progress = Progress::new(1, clock, TurnActivity::new(clock.base()));
+            drop(slot.start_running(turn(), wall, progress));
+        }
+        slot
+    }
+
+    /// The turn's order, running or claimed.
+    fn order(slot: &Slot) -> StopOrder {
+        let state = lock(&slot.state);
+        let stop = match state.running.as_ref() {
+            Some(running) => &running.stop,
+            None => state.queue[0].stop.as_ref().unwrap(),
+        };
+        stop.order.borrow().clone().expect("an order is attached")
+    }
+
+    /// The order is dated at its publication's instant `at`, with its
+    /// times derived from that same instant.
+    fn dated(order: &StopOrder, spec: StopSpec, at: Instant, wall: Option<Instant>) {
+        let expected = spec.order(String::new(), at, wall);
+        assert_eq!(order.attached, at, "{spec:?}");
+        assert_eq!(
+            order.force_at.instant(),
+            expected.force_at.instant(),
+            "{spec:?}"
+        );
+        assert_eq!(
+            order.close_by.instant(),
+            expected.close_by.instant(),
+            "{spec:?}"
+        );
+    }
+
+    /// x.3.2 X4 D4.2 (`stop_order_attached_at_publication`, d3): every
+    /// attach path dates its order at the publication's instant, the
+    /// order's times derived from it; a second publication merged into the
+    /// order keeps the first's `attached`, which is not after its own.
+    #[tokio::test(start_paused = true)]
+    async fn stop_order_attached_at_publication() {
+        type Publish = fn(&Slot);
+        let close = |mode| {
+            move |slot: &Slot| {
+                let order = CloseOrder::new(mode, Instant::now() + Duration::from_secs(30), None);
+                drop(slot.set_close(order));
+            }
+        };
+        let deadline = |slot: &Slot| {
+            let state = lock(&slot.state);
+            state.close.as_ref().map(|close| close.deadline)
+        };
+        let paths: [(&str, bool, Publish); 5] = [
+            ("cancel_step running", true, |slot| {
+                assert!(matches!(
+                    slot.cancel_step(turn(), CANCEL),
+                    CancelStep::Ordered(_)
+                ));
+            }),
+            ("cancel_step claimed", false, |slot| {
+                assert!(matches!(
+                    slot.cancel_step(turn(), CANCEL),
+                    CancelStep::Ordered(_)
+                ));
+            }),
+            ("idle_order", true, |slot| slot.idle_order(turn())),
+            ("store_order", true, |slot| slot.store_order(turn())),
+            ("protocol_order", true, |slot| slot.protocol_order(turn())),
+        ];
+        let start = Instant::now();
+        let wall = start + Duration::from_secs(600);
+        for (path, running, publish) in paths {
+            let slot = slot(running, wall);
+            tokio::time::advance(Duration::from_secs(7)).await;
+            let at = Instant::now();
+            publish(&slot);
+            let spec = match path {
+                "idle_order" => StopSpec::Idle,
+                "store_order" => StopSpec::Store,
+                "protocol_order" => StopSpec::Protocol,
+                _ => CANCEL,
+            };
+            let cap = running.then_some(wall);
+            dated(&order(&slot), spec, at, cap);
+            if spec_is_cancel(spec) {
+                assert_eq!(
+                    order(&slot).force_at.instant(),
+                    (at + FORCE_AFTER).min(wall)
+                );
+            }
+            // A later publication merges: the first instant stays.
+            tokio::time::advance(Duration::from_secs(5)).await;
+            let later = Instant::now();
+            assert!(matches!(
+                slot.cancel_step(turn(), CANCEL),
+                CancelStep::Ordered(_)
+            ));
+            let merged = order(&slot);
+            assert_eq!(merged.attached, at, "{path}: the merge keeps the first");
+            assert!(merged.attached <= later, "{path}");
+        }
+        for (path, running) in [("set_close running", true), ("set_close claimed", false)] {
+            for mode in [CloseMode::Graceful, CloseMode::Force] {
+                let slot = slot(running, wall);
+                tokio::time::advance(Duration::from_secs(3)).await;
+                let at = Instant::now();
+                close(mode)(&slot);
+                let spec = StopSpec::Close {
+                    mode,
+                    deadline: deadline(&slot).unwrap(),
+                };
+                dated(&order(&slot), spec, at, running.then_some(wall));
+                // `escalate_close` merges into it: the first instant stays.
+                tokio::time::advance(Duration::from_secs(2)).await;
+                slot.escalate_close();
+                assert_eq!(order(&slot).attached, at, "{path} {mode:?}");
+            }
+        }
+        // `escalate_close` publishing first: dated at its own instant.
+        let slot = slot(true, wall);
+        let order_deadline = Instant::now() + Duration::from_secs(30);
+        {
+            let mut state = lock(&slot.state);
+            state.close = Some(CloseOrder::new(CloseMode::Graceful, order_deadline, None));
+        }
+        tokio::time::advance(Duration::from_secs(4)).await;
+        let at = Instant::now();
+        slot.escalate_close();
+        let spec = StopSpec::Close {
+            mode: CloseMode::Force,
+            deadline: order_deadline,
+        };
+        dated(&order(&slot), spec, at, Some(wall));
+    }
+
+    fn spec_is_cancel(spec: StopSpec) -> bool {
+        matches!(spec, StopSpec::Cancel { .. })
     }
 }
