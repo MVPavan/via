@@ -4602,3 +4602,451 @@ fn codex_sqlite_home_persists_across_restart() {
         daemon.shutdown().await;
     });
 }
+
+/// `codex_rss_leases` (x.3.2 X5, X0 item 9.2): the sessions leased on one
+/// server, each with one active turn.
+#[cfg(feature = "test-failpoints")]
+const LEASES: usize = 32;
+
+/// Maximal status lines of the growth flood: about 270 MiB, so the flood
+/// passes 256 MiB.
+#[cfg(feature = "test-failpoints")]
+const FLOOD_LINES: usize = 272;
+
+/// Maximal `final_answer` lines per session while Core's drain is held:
+/// four fill its 4 MiB channel, the fifth is the normalizer's decode in
+/// flight, blocked on the channel.
+#[cfg(feature = "test-failpoints")]
+const FILL_LINES: usize = 5;
+
+/// Maximal lines left in the ingress lanes of blocked consumers: four of
+/// about 1 MiB fill the server's 4 MiB staging.
+#[cfg(feature = "test-failpoints")]
+const STAGED_LINES: usize = 4;
+
+/// Maximal lines between two of the fake's gates: the test releases the
+/// next batch once every line before it was taken, so Wire's staging
+/// holds at most one batch (3 MiB of its 4 MiB).
+#[cfg(feature = "test-failpoints")]
+const BATCH: usize = 3;
+
+/// Core's hold on each observation while the holders are measured
+/// (`core.observations.pause`, persistent).
+#[cfg(feature = "test-failpoints")]
+const CORE_HOLD_MS: u64 = 5_000;
+
+/// The consumer's take of a lane item, counted to pace the fake.
+#[cfg(feature = "test-failpoints")]
+const TAKE: &str = "adapter.codex.consumer_take";
+
+/// A blocked channel send, counted for the report.
+#[cfg(feature = "test-failpoints")]
+const BLOCKED: &str = "adapter.observation.blocked";
+
+/// Session `k`'s thread and turn IDs; session 0's are the fixture's.
+#[cfg(feature = "test-failpoints")]
+fn lease_ids(k: usize) -> (String, String) {
+    (
+        format!("019a0000-0000-7000-8000-{:012}", 100_001 + k),
+        format!("019a0000-0000-7000-8000-{:012}", 200_001 + k),
+    )
+}
+
+/// `codex_rss_leases`' replay and the one-based steps of its gates.
+#[cfg(feature = "test-failpoints")]
+struct Leases {
+    replay: Value,
+    /// The gate after each session's start and prompt echo.
+    started: Vec<usize>,
+    /// The flood's gates, with the flood lines written before each.
+    flood: Vec<(usize, usize)>,
+    /// The fill's gates, with the fill lines written before each.
+    fill: Vec<(usize, usize)>,
+    /// The gate after the staged lines, where the holders are measured.
+    measured: usize,
+}
+
+/// `c1_commentary_usage`'s handshake, then [`LEASES`] sessions, each
+/// started (`thread/start`, `turn/start`) and its prompt captured as `p`
+/// and echoed in its `userMessage` (about 1 MiB at the echo cap); then the
+/// flood, the fill and the staged lines, every maximal line's text `${p}`;
+/// then each turn completes and each session closes, in order.
+#[cfg(feature = "test-failpoints")]
+fn leases_copy() -> Leases {
+    let mut replay = core_codex::replay("c1_commentary_usage");
+    let original = replay["steps"].as_array().unwrap().clone();
+    let (thread, turn) = lease_ids(0);
+    let line_of = |at: usize| original[at]["emit"]["line"].as_str().unwrap().to_owned();
+    let for_lease = |line: &str, k: usize| {
+        let (t, u) = lease_ids(k);
+        line.replace(&thread, &t).replace(&turn, &u)
+    };
+    assert_eq!(original[6]["expect"]["line"]["method"], "thread/start");
+    assert_eq!(original[9]["expect"]["line"]["method"], "turn/start");
+    assert!(line_of(14).contains("\"userMessage\""));
+    assert!(line_of(28).contains("\"turn/completed\""));
+    assert_eq!(
+        original[49]["expect"]["line"]["method"],
+        "thread/unsubscribe"
+    );
+    let echo = line_of(14).replace(&serde_json::to_string(C1_PROMPT).unwrap(), "${p}");
+    assert!(echo.contains("${p}"), "{echo}");
+    let mut steps = original[..6].to_vec();
+    let gate = |steps: &mut Vec<Value>| {
+        steps.push(json!({"await_signal":{"signal":"SIGUSR1"}}));
+        steps.len()
+    };
+    let emit = |steps: &mut Vec<Value>, line: String| {
+        steps.push(json!({"emit":{"line":line}}));
+    };
+    let mut started = Vec::new();
+    for k in 0..LEASES {
+        let (t, _) = lease_ids(k);
+        steps.push(original[6].clone());
+        emit(&mut steps, for_lease(&line_of(7), k));
+        let answered = steps.len();
+        emit(&mut steps, for_lease(&line_of(8), k));
+        steps.push(json!({"expect":{"line":{"method":"turn/start","params":{
+            "threadId":t,"cwd":original[9]["expect"]["line"]["params"]["cwd"]}},
+            "capture":{"turn1":"/id","p":"/params/input/0/text"},"after_emit":answered}}));
+        emit(&mut steps, for_lease(&line_of(10), k));
+        emit(&mut steps, for_lease(&line_of(12), k));
+        emit(&mut steps, for_lease(&echo, k));
+        started.push(gate(&mut steps));
+    }
+    let status = |k: usize| {
+        let (t, _) = lease_ids(k);
+        format!(
+            r#"{{"method":"thread/status/changed","params":{{"threadId":"{t}","status":{{"type":"active","activeFlags":[]}},"pad":${{p}}}}}}"#
+        )
+    };
+    let mut flood = Vec::new();
+    for line in 0..FLOOD_LINES {
+        emit(&mut steps, status(line % LEASES));
+        if (line + 1) % BATCH == 0 || line + 1 == FLOOD_LINES {
+            flood.push((gate(&mut steps), line + 1));
+        }
+    }
+    let mut fill = Vec::new();
+    for line in 0..FILL_LINES * LEASES {
+        let (t, u) = lease_ids(line % LEASES);
+        let j = line / LEASES;
+        emit(
+            &mut steps,
+            format!(
+                r#"{{"method":"item/completed","params":{{"item":{{"type":"agentMessage","id":"fill_{j}","text":${{p}},"phase":"final_answer","memoryCitation":null,"delivery":null,"questions":null}},"threadId":"{t}","turnId":"{u}","completedAtMs":1790000007591}},"emittedAtMs":1790000007591}}"#
+            ),
+        );
+        if (line + 1) % BATCH == 0 || line + 1 == FILL_LINES * LEASES {
+            fill.push((gate(&mut steps), line + 1));
+        }
+    }
+    for k in 0..STAGED_LINES {
+        emit(&mut steps, status(k));
+    }
+    let measured = gate(&mut steps);
+    for k in 0..LEASES {
+        emit(&mut steps, for_lease(&line_of(28), k));
+    }
+    for k in 0..LEASES {
+        let (t, _) = lease_ids(k);
+        steps.push(json!({"expect":{"line":{"method":"thread/unsubscribe",
+            "params":{"threadId":t}},"capture":{"close":"/id"}}}));
+        steps.push(original[50].clone());
+    }
+    steps.push(json!({"await_eof":{}}));
+    replay["steps"] = Value::Array(steps);
+    replay["deadline_ms"] = json!(115_000);
+    Leases {
+        replay,
+        started,
+        flood,
+        fill,
+        measured,
+    }
+}
+
+/// Counts `point`'s hits without acting on any: a command under another
+/// token is refused at every hit, each refusal leaving its marker.
+#[cfg(feature = "test-failpoints")]
+fn count_hits(points: &Path, point: &str) {
+    let command = json!({"token":"counting","occurrence":1,"action":"pause"});
+    fs::write(points.join(format!("{point}.json")), command.to_string()).unwrap();
+}
+
+/// Waits until the fake is at gate `step` and the consumers took at least
+/// `taken` lane items; the caller releases the gate.
+#[cfg(feature = "test-failpoints")]
+async fn ready(case: &core_codex::CodexCase, root: &Path, step: usize, taken: u64) {
+    case.at_launch(step, 1).await;
+    let by = tokio::time::Instant::now() + Duration::from_secs(60);
+    while hits(root, TAKE) < taken {
+        assert!(
+            tokio::time::Instant::now() < by,
+            "the consumers took {} of {taken} items by gate {step}",
+            hits(root, TAKE)
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+/// A `/proc/<pid>/status` field in KiB.
+#[cfg(feature = "test-failpoints")]
+fn status_kib(pid: &str, field: &str) -> u64 {
+    fs::read_to_string(format!("/proc/{pid}/status"))
+        .unwrap_or_default()
+        .lines()
+        .find_map(|line| line.strip_prefix(field))
+        .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// The bytes process `pid` wrote (`/proc/<pid>/io` `wchar`).
+#[cfg(feature = "test-failpoints")]
+fn written(pid: u32) -> u64 {
+    fs::read_to_string(format!("/proc/{pid}/io"))
+        .unwrap_or_default()
+        .lines()
+        .find_map(|line| line.strip_prefix("wchar:"))
+        .and_then(|rest| rest.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// The phases of `codex_rss_leases`, as the sampler records them.
+#[cfg(feature = "test-failpoints")]
+mod phase {
+    pub(super) const SPAWN: u8 = 1;
+    pub(super) const FLOOD: u8 = 2;
+    pub(super) const HELD: u8 = 3;
+    pub(super) const DRAIN: u8 = 4;
+}
+
+/// One 10 ms sample: the phase, this process's RSS and the fake's written
+/// bytes.
+#[cfg(feature = "test-failpoints")]
+#[derive(Clone, Copy)]
+struct RssSample {
+    phase: u8,
+    rss_kib: u64,
+    written: u64,
+}
+
+/// Samples this process's RSS every 10 ms, with the phase and the fake's
+/// written bytes (once its pid is known), until `stop`.
+#[cfg(feature = "test-failpoints")]
+fn rss_sampler(
+    phase: Arc<std::sync::atomic::AtomicU8>,
+    fake: Arc<std::sync::atomic::AtomicU32>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<Vec<RssSample>> {
+    use std::sync::atomic::Ordering;
+    std::thread::spawn(move || {
+        let mut samples = Vec::new();
+        while !stop.load(Ordering::Acquire) {
+            let pid = fake.load(Ordering::Acquire);
+            samples.push(RssSample {
+                phase: phase.load(Ordering::Acquire),
+                rss_kib: status_kib("self", "VmRSS:"),
+                written: if pid == 0 { 0 } else { written(pid) },
+            });
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        samples
+    })
+}
+
+/// X0 item 9.2's computed sum, in bytes, from the table's constants: per
+/// server, staging 4 MiB, correlation 256 KiB, pending replies 64 KiB,
+/// Wire's read buffer 64 KiB and the demux peek 1 MiB; per session, the
+/// observation channel 4 MiB, driver controls 64 KiB and the decode
+/// allowance (1 MiB of strings + 65,536 nodes × 64 B); per active turn,
+/// the dispatched prompt, which on this route is at most the echo cap
+/// (via-5lr.6), not C1's 16 MiB.
+#[cfg(feature = "test-failpoints")]
+fn leases_sum() -> u64 {
+    const MIB: u64 = 1024 * 1024;
+    let server = 4 * MIB + 256 * 1024 + 64 * 1024 + 64 * 1024 + MIB;
+    let session = 4 * MIB + 64 * 1024 + MIB + 65_536 * 64;
+    let turn = CODEX_PROMPT_MAX as u64;
+    server + LEASES as u64 * (session + turn)
+}
+
+/// x.3.2 X5 `codex_rss_leases` (X0 item 9.2, runtime §8 F24): one replay
+/// server, [`LEASES`] leased sessions each with an active turn whose
+/// prompt is at the echo cap. A paced flood of about 270 MiB of maximal
+/// thread lines passes through every lane while Core drains (growth
+/// below 32 MiB after its first 64 MiB, peak to peak). Then Core's drain
+/// is held, each session's channel filled to its 4 MiB with the fifth
+/// maximal message decoded and blocked, and the server's 4 MiB staging
+/// filled with lines in blocked lanes: peak RSS less the idle baseline
+/// within [`leases_sum`] plus 25%. Then every turn completes and every
+/// session closes. 10 ms sampling; on glibc `MALLOC_ARENA_MAX=2` as F24's
+/// proxy. Held to its own nextest slot (`.config/nextest.toml`).
+#[cfg(feature = "test-failpoints")]
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "every phase of one measured scenario, in order"
+)]
+#[expect(clippy::print_stdout, reason = "the measured numbers are reported")]
+fn codex_rss_leases() {
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+    const NAME: &str = "codex_rss_leases";
+    const MIB: u64 = 1024 * 1024;
+    let mut env = vec![("VIA_TEST_EVENT_STALL_MS", "120000")];
+    if cfg!(target_env = "gnu") {
+        env.push(("MALLOC_ARENA_MAX", "2"));
+    }
+    let Some(root) = child(NAME, &no_fake(), &env) else {
+        return;
+    };
+    let started_at = Instant::now();
+    let points = root.join("points");
+    via_store::failpoint::activate(&points, "conformance-core").unwrap();
+    count_hits(&points, TAKE);
+    count_hits(&points, BLOCKED);
+    let leases = leases_copy();
+    let case = codex_case(&root, NAME, leases.replay.clone());
+    let cwd = serde_json::to_string(case.cwd()).unwrap().len();
+    let prompt = encoded_prompt(CODEX_PROMPT_MAX - cwd);
+    // A maximal status line's length, LF included, as the fake writes it.
+    let maximal = format!(
+        r#"{{"method":"thread/status/changed","params":{{"threadId":"{}","status":{{"type":"active","activeFlags":[]}},"pad":{}}}}}"#,
+        lease_ids(0).0,
+        serde_json::to_string(&prompt).unwrap()
+    )
+    .len() as u64
+        + 1;
+    assert!(maximal <= MIB, "{maximal}");
+    assert!(maximal * STAGED_LINES as u64 <= 4 * MIB, "{maximal}");
+    let phase = Arc::new(AtomicU8::new(0));
+    let fake = Arc::new(AtomicU32::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let core_hold = points.join("core.observations.pause.json");
+    let (baseline, spawned, flood, sampling) = run(async {
+        let daemon = Daemon::open_with(&root, case.config());
+        // Elapsed time only: the Engine settles before its baseline.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let baseline = status_kib("self", "VmRSS:");
+        let sampling = rss_sampler(Arc::clone(&phase), Arc::clone(&fake), Arc::clone(&stop));
+        phase.store(phase::SPAWN, Ordering::Release);
+        let mut sessions = Vec::new();
+        for (k, step) in leases.started.iter().enumerate() {
+            sessions.push(daemon.spawn(&prompt, &codex_spawn(&case, 115_000)).await);
+            case.at_launch(*step, 1).await;
+            if k == 0 {
+                fake.store(case.pid(1), Ordering::Release);
+            }
+            if k + 1 < LEASES {
+                case.signal(1);
+            }
+        }
+        // Every start's traffic is taken before the flood is counted.
+        let mut base = hits(&root, TAKE);
+        loop {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let now = hits(&root, TAKE);
+            if now == base {
+                break;
+            }
+            base = now;
+        }
+        let spawned = status_kib("self", "VmRSS:");
+        let from = written(case.pid(1));
+        phase.store(phase::FLOOD, Ordering::Release);
+        case.signal(1);
+        for (step, lines) in &leases.flood {
+            ready(&case, &root, *step, base + *lines as u64).await;
+            if *lines < FLOOD_LINES {
+                case.signal(1);
+            }
+        }
+        let flood = (from, written(case.pid(1)));
+        // Core holds each observation from here on.
+        let base = hits(&root, TAKE);
+        let command = json!({"token":"conformance-core","occurrence":1,"action":"delay",
+                             "value":CORE_HOLD_MS,"persist":true});
+        fs::write(&core_hold, command.to_string()).unwrap();
+        phase.store(phase::HELD, Ordering::Release);
+        case.signal(1);
+        for (step, lines) in &leases.fill {
+            ready(&case, &root, *step, base + *lines as u64).await;
+            case.signal(1);
+        }
+        case.at_launch(leases.measured, 1).await;
+        // The staged lines reach their lanes; the holders are sampled.
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        fs::remove_file(&core_hold).unwrap();
+        phase.store(phase::DRAIN, Ordering::Release);
+        case.signal(1);
+        for session in &sessions {
+            let envelope = daemon.wait(session, 1).await;
+            assert_eq!(envelope["state"], "completed", "{envelope}");
+        }
+        for session in &sessions {
+            daemon.close(session).await;
+        }
+        daemon.shutdown().await;
+        (baseline, spawned, flood, sampling)
+    });
+    stop.store(true, Ordering::Release);
+    let samples = sampling.join().unwrap();
+    let hwm = status_kib("self", "VmHWM:");
+    let peak_sampled = samples
+        .iter()
+        .map(|sample| sample.rss_kib)
+        .max()
+        .unwrap_or(0);
+    let peak_held = samples
+        .iter()
+        .filter(|sample| sample.phase == phase::HELD)
+        .map(|sample| sample.rss_kib)
+        .max()
+        .unwrap_or(0);
+    let peak = hwm.max(peak_sampled);
+    // Growth, peak to peak as F24 (`s1_f24_memory.rs`): the highest RSS
+    // with 32 MiB <= flooded < 64 MiB against the highest from 64 MiB on,
+    // in the flood phase only.
+    let flooded = |sample: &RssSample| sample.written.saturating_sub(flood.0);
+    let in_flood = || samples.iter().filter(|sample| sample.phase == phase::FLOOD);
+    let level = in_flood()
+        .filter(|sample| (32 * MIB..64 * MIB).contains(&flooded(sample)))
+        .map(|sample| sample.rss_kib)
+        .max()
+        .unwrap_or(spawned);
+    let after = in_flood()
+        .filter(|sample| flooded(sample) >= 64 * MIB)
+        .map(|sample| sample.rss_kib)
+        .max()
+        .unwrap_or(0);
+    let limit = leases_sum() * 5 / 4 / 1024;
+    let metrics = json!({
+        "baseline_kib": baseline, "peak_kib": peak, "peak_hwm_kib": hwm,
+        "peak_sampled_kib": peak_sampled, "peak_held_kib": peak_held,
+        "after_spawn_kib": spawned, "samples": samples.len(),
+        "sum_kib": leases_sum() / 1024, "limit_kib": limit,
+        "marginal_per_session_kib": spawned.saturating_sub(baseline) / LEASES as u64,
+        "marginal_per_held_session_kib": peak_held.saturating_sub(baseline) / LEASES as u64,
+        "flood_bytes": flood.1 - flood.0, "flood_samples": in_flood().count(),
+        "samples_before_64_mib": in_flood()
+            .filter(|sample| (32 * MIB..64 * MIB).contains(&flooded(sample)))
+            .count(),
+        "level_before_64_mib_kib": level,
+        "rss_after_64_mib_kib": after,
+        "sessions": LEASES, "flood_lines": FLOOD_LINES,
+        "fill_lines": FILL_LINES * LEASES, "staged_bytes": maximal * STAGED_LINES as u64,
+        "taken": hits(&root, TAKE), "blocked_sends": hits(&root, BLOCKED),
+        "maximal_line": maximal, "runtime_ms": started_at.elapsed().as_millis(),
+        "malloc_arena_max": env::var("MALLOC_ARENA_MAX").ok(),
+    });
+    println!("codex_rss_leases {metrics}");
+    assert!(flood.1 - flood.0 >= 256 * MIB, "{metrics}");
+    assert!(
+        peak.saturating_sub(baseline) <= limit,
+        "peak RSS less the baseline is over 1.25 x the computed sum: {metrics}"
+    );
+    assert!(
+        after.saturating_sub(level) < 32 * 1024,
+        "RSS grew 32 MiB or more after the flood's first 64 MiB: {metrics}"
+    );
+}

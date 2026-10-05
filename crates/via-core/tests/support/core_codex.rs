@@ -150,15 +150,20 @@ impl CodexCase {
         }
     }
 
-    /// Sends launch `launch`'s fake its gate signal.
-    pub(crate) fn signal(&self, launch: u64) {
+    /// Launch `launch`'s pid, from the fake's launch log.
+    pub(crate) fn pid(&self, launch: u64) -> u32 {
         let log = fs::read_to_string(self.dir.join(format!("{}.launches", self.name))).unwrap();
-        let pid = log
-            .lines()
+        log.lines()
             .nth(usize::try_from(launch).unwrap() - 1)
             .unwrap()
             .trim()
-            .to_owned();
+            .parse()
+            .unwrap()
+    }
+
+    /// Sends launch `launch`'s fake its gate signal.
+    pub(crate) fn signal(&self, launch: u64) {
+        let pid = self.pid(launch).to_string();
         let status = Command::new("kill").args(["-USR1", &pid]).status().unwrap();
         assert!(status.success(), "kill -USR1 {pid}");
     }

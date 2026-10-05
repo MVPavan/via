@@ -9,3 +9,10 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 [[profile.default.overrides]]
 filter = 'test(/^s1_f24_flood_/)'
 threads-required = "num-test-threads"
+
+# x.3.2 X5 (X0 item 9.2): `codex_rss_leases` drives every holder of one
+# Codex server and its 32 sessions at once and samples its RSS, so it runs
+# alone, as F24 does.
+[[profile.default.overrides]]
+filter = 'test(=codex_rss_leases)'
+threads-required = "num-test-threads"

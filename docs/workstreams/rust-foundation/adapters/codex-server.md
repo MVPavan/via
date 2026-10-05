@@ -1271,6 +1271,38 @@ reply; written once the reply brings the `turnId`);
   server. Four loaded servers is an **extrapolation** from the per-server
   and per-turn costs, not measured. The 256-turn unresolved bound remains
   unmeasured for Codex (X0-Q1, ruled: no extra cap).
+- **As built (X5).** `codex_rss_leases` (`crates/via-core/tests/conformance_core.rs`,
+  `test-failpoints`, run alone by `.config/nextest.toml`, about 21 s) runs
+  Core's Engine in its own process over one replay server. Each of the 32
+  sessions' prompts is at the Codex echo cap (via-5lr.6), so the
+  per-turn row counts 1,040,384 bytes, not 16 MiB, and the computed sum
+  is 327 MiB. A paced flood of 272 maximal thread lines (about 270 MiB)
+  is consumed with Core draining. Then Core's drain is held
+  (`core.observations.pause`, a persistent 5 s delay). Five maximal
+  `final_answer` lines per session fill its channel and leave the fifth
+  decoded and blocked. Four maximal lines in blocked lanes fill the 4 MiB
+  staging. The fake's gates are released by counted consumer takes
+  (`adapter.codex.consumer_take`), so Wire's staging never holds more
+  than three lines. The test raises the C2 stall to 120 s
+  (`VIA_TEST_EVENT_STALL_MS`) so the held channels do not end their
+  turns. Correlation, pending replies and driver controls are not driven
+  to their maxima (384 KiB of the sum together).
+  Measured, two runs each:
+
+  | Build | Baseline | Peak | Peak less baseline | Growth after 64 MiB |
+  |---|---|---|---|---|
+  | musl (authoritative) | 20 MiB | 221 MiB | 202 MiB | under 0.5 MiB |
+  | glibc, `MALLOC_ARENA_MAX=2` | 27 MiB | 229 MiB | 202 MiB | none |
+
+  The limit is 409 MiB. Both builds reach about 6.3 MiB per session at
+  the held peak and about 0.2 MiB per idle active session.
+
+  One maximal decode peaks at about 3.5 MiB of RSS on glibc and 3.75 MiB
+  on musl, against the 5 MiB `DECODE_ALLOWANCE`. That measure is
+  `codex_decode_peak_within_allowance`
+  (`crates/via-routes/tests/codex_decode_peak.rs`). It decodes eight
+  shapes, each in a fresh process. The worst is a `final_answer` text or
+  a `fileChange` at the 65,536-node limit.
 
 ### Item 10. Overflow, quarantine and the loss record (G7, r2 N3, N14, r3 F17)
 
