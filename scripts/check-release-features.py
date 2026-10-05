@@ -79,6 +79,7 @@ POINTS = [
     "core.events.registered",
     "core.submit.before_commit",
     "core.run.settling",
+    "core.run.returned",
     "core.run.before_handoff",
     "core.close.before_subscribe",
     "core.cancel.settling",
@@ -88,6 +89,7 @@ POINTS = [
     # driver's wait before it polls its orders; the fake run's start (D7).
     "core.cancel.publish",
     "adapter.codex.ordered",
+    "adapter.codex.cut_read",
     "adapter.fake.turn_started",
     # x.3.2 K2: a keyed steer's report about to commit with its outcome.
     "core.steer.before_outcome",
