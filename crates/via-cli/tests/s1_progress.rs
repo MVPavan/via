@@ -343,7 +343,7 @@ impl Setup {
                 "daemon_status",
                 &["daemon", "status", "--json"],
             )?;
-            if status["sessions"]["active"] == 0 && status["connections"]["in_use"] == 0 {
+            if status["sessions"]["active"] == 0 && status["harness_processes"]["in_use"] == 0 {
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -1302,7 +1302,7 @@ fn s1_c1_status_every_member_after_eviction_and_restart() -> TestResult {
             setup.wait(evidence, &format!("{session}/1"))?;
             let first = setup.status(evidence, &session, &[])?;
             // The dispatcher exits and retires the slot once nothing is left:
-            // no active turn and no connection slot in use.
+            // no active turn and no harness-process slot in use.
             setup.settled(evidence)?;
             let evicted = setup.status(evidence, &session, &[])?;
             check(evicted == first, || {

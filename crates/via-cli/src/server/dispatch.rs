@@ -377,15 +377,15 @@ async fn dispatch(method: &str, params: &str, client: &Client) -> Result<Box<Raw
             typed::<DaemonStatusParams>(params)?;
             // Memory only: no Store read (design §6.6, §7.5).
             let counts = engine.counts();
-            let connections = counts.connections;
+            let processes = counts.harness_processes;
             raw(
                 &json!({"daemon_version":crate::client::binary_version(),"pid":std::process::id(),
                 "socket_path":socket_path,"store_path":store_path,"health":engine.health(),
                 "store_failure":engine.store_failure_status(),
                 "started_at":engine.started_at(),
                 "sessions":{"idle":counts.idle,"active":counts.active,"closing":counts.closing},
-                "connections":{"limit":connections.limit,"in_use":connections.in_use,
-                    "held_unproven":connections.held_unproven},
+                "harness_processes":{"limit":processes.limit,"in_use":processes.in_use,
+                    "held_unproven":processes.held_unproven},
                 "servers":engine.servers(),
                 // Task 4 design §5.3, §5.5 (A37).
                 "limits":engine.limits().to_value(),
@@ -633,8 +633,29 @@ fn error_data(refusal: Refusal) -> Value {
     json!({"code":error.code,"message":error.message,"data":data})
 }
 
+/// Most bytes of one reply line, LF included (runtime §8): a 1 MiB result
+/// plus its wrapper, under 512 B with the `id` at most 256 B (design §4).
+const REPLY_MAX: usize = 1024 * 1024 + 512;
+
+/// A result too large for one reply (runtime §8, C1 -32012: a result that
+/// cannot fit a bounded response).
+const RESPONSE_TOO_LARGE: ApiError = ApiError {
+    code: -32012,
+    kind: "admission_refused",
+    message: "the result does not fit a bounded response",
+    unpersisted: None,
+    kind2: None,
+    commit_outcome: None,
+    named: None,
+    reason: None,
+    floor: None,
+};
+
 /// A success reply line: a raw `result` is written as given, never
-/// re-encoded.
+/// re-encoded. Every result is bounded by construction (pages, `status`,
+/// the envelope); a line that would still exceed [`REPLY_MAX`] is
+/// replaced by [`RESPONSE_TOO_LARGE`], in release builds too, so no reply
+/// is written over-size (bead via-00j).
 fn success<R: Serialize + ?Sized>(id: &RawValue, result: &R) -> Vec<u8> {
     #[derive(Serialize)]
     struct Success<'a, R: ?Sized> {
@@ -642,11 +663,15 @@ fn success<R: Serialize + ?Sized>(id: &RawValue, result: &R) -> Vec<u8> {
         id: &'a RawValue,
         result: &'a R,
     }
-    line(&Success {
+    let reply = line(&Success {
         jsonrpc: "2.0",
         id,
         result,
-    })
+    });
+    if reply.len() > REPLY_MAX {
+        return failure(id, &error_data(RESPONSE_TOO_LARGE.into()));
+    }
+    reply
 }
 
 /// An error reply line.
@@ -691,6 +716,30 @@ mod tests {
                 "data":{"kind":"store_error","session":"s_0123456789ab","turn":1,
                     "durable_state":"running","terminal_persisted":false}}})
         );
+    }
+
+    /// Runtime §8 (bead via-00j): a reply line is at most 1 MiB + 512 B,
+    /// LF included, in release builds too. A result whose line would be
+    /// longer is never written: the reply is `admission_refused` instead.
+    /// A result at 1 MiB is written as is.
+    #[test]
+    fn an_oversize_reply_is_refused_never_written() {
+        let id = RawValue::from_string("7".to_owned()).unwrap();
+        let result =
+            |bytes: usize| RawValue::from_string(format!("\"{}\"", "x".repeat(bytes - 2))).unwrap();
+        let fits = success(&id, &result(1024 * 1024));
+        assert!(fits.len() <= 1024 * 1024 + 512, "{}", fits.len());
+        let reply: Value = serde_json::from_slice(&fits).unwrap();
+        assert_eq!(
+            reply["result"].as_str().map(str::len),
+            Some(1024 * 1024 - 2)
+        );
+        let over = success(&id, &result(1024 * 1024 + 512));
+        assert!(over.len() < 1024, "{} bytes written", over.len());
+        let reply: Value = serde_json::from_slice(&over).unwrap();
+        assert_eq!(reply["id"], 7);
+        assert_eq!(reply["error"]["code"], -32012);
+        assert_eq!(reply["error"]["data"]["kind"], "admission_refused");
     }
 
     /// Design §10.1: the line cap includes the LF; a longer line is

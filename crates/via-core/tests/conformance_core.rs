@@ -901,10 +901,10 @@ fn completed(turn: u32) -> Vec<Value> {
     vec![accepted(turn), terminal(turn, "completed", "end_turn")]
 }
 
-/// (9) AD16 (decision H1): four persistent sessions each keep their
-/// connection's slot between turns, so a fifth session waits for one;
-/// their next turns run on the pinned connections; closing one releases
-/// its slot and the fifth runs.
+/// (9) AD16 (decision H1): persistent sessions filling every connection
+/// slot (the default 8) each keep their connection's slot between turns,
+/// so one more session waits for one; their next turns run on the pinned
+/// connections; closing one releases its slot and the waiting one runs.
 #[test]
 fn core_persistent_sessions_hold_slots_until_close() {
     let scripts = [
@@ -920,14 +920,16 @@ fn core_persistent_sessions_hold_slots_until_close() {
     };
     run(async {
         let daemon = Daemon::open(&root);
+        let slots = daemon.engine.harness_processes().limit;
+        assert_eq!(slots, 8, "the default slot count");
         let mut held = Vec::new();
-        for _ in 0..4 {
+        for _ in 0..slots {
             let session = daemon.spawn("first", &json!({})).await;
             let envelope = daemon.wait(&session, 1).await;
             assert_eq!(envelope["state"], "completed", "{envelope}");
             held.push(session);
         }
-        assert_eq!(daemon.engine.connections().in_use, 4);
+        assert_eq!(daemon.engine.harness_processes().in_use, slots);
         let fifth = daemon.spawn("first", &json!({})).await;
         let params = WaitParams {
             address: format!("{fifth}/1"),
@@ -942,7 +944,7 @@ fn core_persistent_sessions_hold_slots_until_close() {
             let envelope = daemon.wait(session, 2).await;
             assert_eq!(envelope["state"], "completed", "{envelope}");
         }
-        assert_eq!(daemon.engine.connections().in_use, 4);
+        assert_eq!(daemon.engine.harness_processes().in_use, slots);
         daemon.close(&held[0]).await;
         let envelope = daemon.wait(&fifth, 1).await;
         assert_eq!(envelope["state"], "completed", "{envelope}");
@@ -1592,7 +1594,7 @@ fn core_failed_lane_is_retired_by_its_health_monitor() {
         // The lane's actor closes the failed driver: its slot is released
         // without a dispatch.
         let released = tokio::time::Instant::now() + Duration::from_secs(5);
-        while daemon.engine.connections().in_use != 0 {
+        while daemon.engine.harness_processes().in_use != 0 {
             assert!(
                 tokio::time::Instant::now() < released,
                 "the failed driver keeps its slot"
@@ -1659,7 +1661,7 @@ fn core_uncertain_retirement_journal_latches_store_failure() {
         assert_eq!(envelope["state"], "completed", "{envelope}");
         // The retirement's health failure retires the lane: its slot goes.
         let released = tokio::time::Instant::now() + Duration::from_secs(5);
-        while daemon.engine.connections().in_use != 0 {
+        while daemon.engine.harness_processes().in_use != 0 {
             assert!(
                 tokio::time::Instant::now() < released,
                 "the failed driver keeps its slot"
@@ -1687,7 +1689,9 @@ fn core_uncertain_retirement_journal_latches_store_failure() {
 }
 
 /// Sol r1 F3, Sol r2 #1, #2 (C2 §2 health, AD16): four persistent
-/// sessions hold every connection slot, and one's driver fails between
+/// sessions hold every harness-process slot (the pool pinned at four, bead
+/// via-oq3: with a free slot a successor that reserved its permit before
+/// the retirement would pass), and one's driver fails between
 /// turns while its lane's actor is held between its health read and the
 /// lane's end (`core.lane.retire`). That session's next turn, needing a
 /// fifth slot, is refused the failed lane's claim and asks for its
@@ -1713,7 +1717,10 @@ fn core_failed_lane_with_every_slot_held_retires_at_dispatch() {
     let Some(root) = child(
         "core_failed_lane_with_every_slot_held_retires_at_dispatch",
         &scenario(&persistent(), &scripts),
-        &[("VIA_TEST_FAKE_RETIREMENT_UNCERTAIN", "4")],
+        &[
+            ("VIA_TEST_FAKE_RETIREMENT_UNCERTAIN", "4"),
+            ("VIA_TEST_HARNESS_PROCESSES", "4"),
+        ],
     ) else {
         return;
     };
@@ -1738,7 +1745,12 @@ fn core_failed_lane_with_every_slot_held_retires_at_dispatch() {
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        assert_eq!(daemon.engine.connections().in_use, 4);
+        let processes = daemon.engine.harness_processes();
+        assert_eq!(
+            (processes.limit, processes.in_use),
+            (4, 4),
+            "every slot is held before the resume"
+        );
         daemon.resume(&failed, "again").await;
         let params = WaitParams {
             address: format!("{failed}/2"),
@@ -1752,13 +1764,13 @@ fn core_failed_lane_with_every_slot_held_retires_at_dispatch() {
             .expect("the successor turn ran after the held actor retired the lane");
         let envelope: Value = serde_json::from_str(envelope.get()).unwrap();
         assert_eq!(envelope["state"], "completed", "{envelope}");
-        assert_eq!(daemon.engine.connections().in_use, 4);
+        assert_eq!(daemon.engine.harness_processes().in_use, 4);
         // The dispatch's ask ended the actor's hold (its pause was given
         // up, so this release has no waiter) and the actor retired the
         // lane before turn 2 ran: the successor keeps its slot and serves
         // the session's next turn.
         fs::write(root.join("points").join("core.lane.retire.1.release"), b"").unwrap();
-        assert_eq!(daemon.engine.connections().in_use, 4);
+        assert_eq!(daemon.engine.harness_processes().in_use, 4);
         daemon.resume(&failed, "third").await;
         let envelope = daemon.wait(&failed, 3).await;
         assert_eq!(envelope["state"], "completed", "{envelope}");
@@ -3090,7 +3102,7 @@ fn core_an_undecodable_retired_message_keeps_its_evidence() {
             PathBuf::from(before["evidence"]["folder"].as_str().unwrap()).join("undecoded.bin");
         daemon.release("late");
         let by = tokio::time::Instant::now() + Duration::from_secs(30);
-        while !kept.exists() || daemon.engine.connections().in_use != 0 {
+        while !kept.exists() || daemon.engine.harness_processes().in_use != 0 {
             assert!(
                 tokio::time::Instant::now() < by,
                 "the retirement kept no undecoded.bin, or never ended"
@@ -3498,7 +3510,7 @@ fn core_a_second_retired_terminal_fails_the_connection() {
         daemon.release("late");
         until_revised(&daemon, &session).await;
         let by = tokio::time::Instant::now() + Duration::from_secs(30);
-        while daemon.engine.connections().in_use != 0 {
+        while daemon.engine.harness_processes().in_use != 0 {
             assert!(
                 tokio::time::Instant::now() < by,
                 "the connection outlived its protocol failure"

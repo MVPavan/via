@@ -1853,8 +1853,8 @@ fn s1_f12_evidence_before_terminal_lost_stop_evidence_is_unknown() -> TestResult
     evidenced(|| evidence_before_terminal(false))
 }
 
-/// Design §8, §6.6: a group whose close was uncertain holds its connection
-/// slot, which `daemon/status` reports in `connections.held_unproven`; once
+/// Design §8, §6.6: a group whose close was uncertain holds its harness-process
+/// slot, which `daemon/status` reports in `harness_processes.held_unproven`; once
 /// the group is gone, the re-probe loop proves it absent and the slot
 /// returns, with no request made.
 #[cfg(feature = "test-failpoints")]
@@ -1871,7 +1871,7 @@ fn s1_reprobe_returns_capacity() -> TestResult {
         ]))?;
         sandbox
             .env
-            .push(("VIA_TEST_CONNECTION_SLOTS", "1".to_owned()));
+            .push(("VIA_TEST_HARNESS_PROCESSES", "1".to_owned()));
         let daemon = sandbox.start()?;
         let arm_intent = "host.anchor.after_arm_intent_commit";
         let eof_cleanup = "host.anchor.before_eof_cleanup";
@@ -1890,7 +1890,7 @@ fn s1_reprobe_returns_capacity() -> TestResult {
         })?;
         let held = sandbox.status()?;
         check(
-            held["connections"] == json!({"limit":1,"in_use":1,"held_unproven":1}),
+            held["harness_processes"] == json!({"limit":1,"in_use":1,"held_unproven":1}),
             || format!("held slot: {held}"),
         )?;
         sandbox.process_ack(eof_cleanup, 1, "pause")?;
@@ -1901,7 +1901,7 @@ fn s1_reprobe_returns_capacity() -> TestResult {
             Duration::from_secs(30),
             || {
                 sandbox.status().is_ok_and(|status| {
-                    status["connections"] == json!({"limit":1,"in_use":0,"held_unproven":0})
+                    status["harness_processes"] == json!({"limit":1,"in_use":0,"held_unproven":0})
                 })
             },
         )?;
@@ -2005,7 +2005,7 @@ fn s1_drain_with_recovered_holdings_reprobes() -> TestResult {
         let mut sandbox = Sandbox::new(&scripts(&[completes("seed", 1), completes("later", 1)]))?;
         sandbox
             .env
-            .push(("VIA_TEST_CONNECTION_SLOTS", "1".to_owned()));
+            .push(("VIA_TEST_HARNESS_PROCESSES", "1".to_owned()));
         let daemon = sandbox.start()?;
         let (seed, _) = sandbox.spawn("seed")?;
         sandbox.wait(&format!("{seed}/1"))?;
@@ -2013,7 +2013,7 @@ fn s1_drain_with_recovered_holdings_reprobes() -> TestResult {
         let mut daemon = restart_with_unread(&sandbox, &seed)?;
         let held = sandbox.status()?;
         check(
-            held["connections"] == json!({"limit":1,"in_use":1,"held_unproven":1}),
+            held["harness_processes"] == json!({"limit":1,"in_use":1,"held_unproven":1}),
             || format!("unread holding: {held}"),
         )?;
         let waiting = "core.dispatch.awaiting_slot";
@@ -2061,7 +2061,7 @@ fn s1_resumed_paging_progresses_with_a_live_current_group() -> TestResult {
         ]))?;
         sandbox
             .env
-            .push(("VIA_TEST_CONNECTION_SLOTS", "2".to_owned()));
+            .push(("VIA_TEST_HARNESS_PROCESSES", "2".to_owned()));
         let daemon = sandbox.start()?;
         let (seed, _) = sandbox.spawn("seed")?;
         sandbox.wait(&format!("{seed}/1"))?;
@@ -2069,7 +2069,7 @@ fn s1_resumed_paging_progresses_with_a_live_current_group() -> TestResult {
         let mut daemon = restart_with_unread(&sandbox, &seed)?;
         let held = sandbox.status()?;
         check(
-            held["connections"] == json!({"limit":2,"in_use":1,"held_unproven":1}),
+            held["harness_processes"] == json!({"limit":2,"in_use":1,"held_unproven":1}),
             || format!("unread holding: {held}"),
         )?;
         let (live, _) = sandbox.spawn("live")?;

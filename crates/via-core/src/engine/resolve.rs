@@ -198,7 +198,7 @@ impl Engine {
             }
             SubmitFailure::Corrupt(queueing) => (queueing, FailureSite::CorruptRow, CORRUPT_ROW),
         };
-        // No agent I/O: the connection slot is released first.
+        // No agent I/O: the harness-process slot is released first.
         drop(connection);
         let queueing = if let Some(queueing) = queueing {
             queueing
@@ -356,7 +356,7 @@ impl Engine {
 
     /// Fails the claimed queue head `turn` with row 2's resolution write
     /// (design §7.2, §7.3), without agent I/O; the caller dropped its
-    /// connection slot. On a commit the turn leaves the queue (its stop
+    /// harness-process slot. On a commit the turn leaves the queue (its stop
     /// channels close, so a cancel waiting on them reads the terminal) and
     /// the session's successors dispatch normally. The write is the turn's
     /// one resolution write: any failure of it rolls the claim back and

@@ -792,7 +792,7 @@ impl Lane {
     }
 
     /// Asks for the lane's retirement (C2 §2 health, Sol r2 #2): its actor
-    /// closes the driver, releasing what it holds, its connection slot
+    /// closes the driver, releasing what it holds, its harness-process slot
     /// included, disposes of what the channel still has, and only then
     /// publishes the lane's end. True once the lane is ending or ended;
     /// false while a turn holds its claim.
@@ -1595,7 +1595,7 @@ impl Engine {
 
     /// The session's kept lane claimed for its next turn, before the
     /// driver is prepared (C2 §2 health, Sol r1 F3, Sol r2 #1). A lane
-    /// whose driver failed is retired first, so its connection slot is
+    /// whose driver failed is retired first, so its harness-process slot is
     /// free before the turn reserves one, and the turn opens a successor
     /// ([`Self::open_lane`]). Retirement is shared: whoever asked for it,
     /// this waits for its end.

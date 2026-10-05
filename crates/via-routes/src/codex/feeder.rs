@@ -158,6 +158,18 @@ struct Refused {
     request: Option<i64>,
 }
 
+/// The queues have no cap of their own: each holds items its producers
+/// bounded before the push (bead via-00j), never copies.
+/// - `replies`: at most 8 and 64 KiB, `REPLIES_MAX` and `REPLY_BYTES_MAX`
+///   in `connection.rs`, charged by `Connection::decline` before its push
+///   and released once the reply's write ends.
+/// - `controls` and `data`: each request holds a correlation record
+///   charged before its push, at most `CORRELATION_ENTRIES` (1,024) per
+///   connection (`threads::Budget`), and comes from one driver's bounded
+///   commands (runtime §8: one data command and eight controls of 64 KiB
+///   in total per driver, its steers and reserved interrupt and
+///   unsubscribe among them). The only notification is the handshake's one
+///   `initialized`.
 #[derive(Default)]
 struct Queues {
     replies: VecDeque<Item>,

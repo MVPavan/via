@@ -1131,7 +1131,7 @@ impl Host {
     }
 
     /// Held groups with no live control: the ledger entries only a proof
-    /// can release (design §6.6 `connections.held_unproven`, §8).
+    /// can release (design §6.6 `harness_processes.held_unproven`, §8).
     pub fn held_unproven(&self) -> usize {
         let ledger = self.capacity.lock();
         ledger

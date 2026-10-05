@@ -1,4 +1,4 @@
-//! The re-probe loop over held connection slots (design §8): a Core task
+//! The re-probe loop over held harness-process slots (design §8): a Core task
 //! daemon main spawns at serve start and joins in final shutdown's first
 //! pipeline step. Only a proof releases a holding (design §11).
 
@@ -9,7 +9,6 @@ use via_store::{ANCHOR_PAGE_LIMIT, AnchorCohort, AnchorOwner};
 
 use super::Engine;
 use super::latch::{FailureScope, FailureSite, WriteOutcome};
-use super::queue::CONNECTION_SLOTS;
 use crate::{Cleanup, Deadline};
 
 /// The first pass after a holding appears, and after one is added.
@@ -210,7 +209,7 @@ impl Engine {
             self.recovered.resume(cursor, 0);
             return;
         }
-        let pool = u32::try_from(CONNECTION_SLOTS).unwrap_or(u32::MAX);
+        let pool = u32::try_from(self.slot_limit).unwrap_or(u32::MAX);
         // A failed count keeps the old cursor and count, and the next pass
         // reads the page again: holding an anchor again replaces Host's entry
         // and drops its old token, so the counts stay balanced.

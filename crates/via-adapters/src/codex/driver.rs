@@ -192,7 +192,7 @@ impl CodexSession {
 
     /// AD16 `prepare`: a pin on the session's live server, else on a live
     /// or launching server of an equal key; `None` when the turn needs a
-    /// connection slot.
+    /// harness-process slot.
     pub(crate) fn prepare(&self, requested: Inherit) -> Option<ServerPin> {
         let own = self
             .attached()
@@ -1731,7 +1731,7 @@ async fn link(
 }
 
 /// The pin of the turn's server, live: the session's own or an equal
-/// key's, else a launch or join with the turn's connection slot.
+/// key's, else a launch or join with the turn's harness-process slot.
 async fn join(
     facts: &mut Turn<'_>,
     (prepared, capacity): (Prepared, Option<crate::CapacityToken>),
@@ -1751,7 +1751,7 @@ async fn join(
         Prepared::NeedsConnection => {
             let Some(capacity) = capacity else {
                 return Err(Box::new(facts.rejected(StartRejected::Protocol(
-                    "a new server needs a connection slot".to_owned(),
+                    "a new server needs a harness-process slot".to_owned(),
                 ))));
             };
             if ensure_home(&adapter.vendor_home()).is_err() {

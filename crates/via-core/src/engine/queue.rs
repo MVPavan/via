@@ -9,6 +9,7 @@
 
 use std::{
     collections::VecDeque,
+    num::NonZeroU32,
     sync::{Arc, Mutex as StdMutex, Weak},
     time::Duration,
 };
@@ -30,8 +31,13 @@ pub(super) const SESSION_QUEUE_LIMIT: u32 = via_store::SESSION_QUEUE_LIMIT;
 /// dispatcher-start channel's capacity.
 pub(super) const DAEMON_QUEUE_LIMIT: usize = 128;
 
-/// Active private connections daemon-wide (runtime §8, design §11).
-pub(super) const CONNECTION_SLOTS: usize = 4;
+/// Running harness processes daemon-wide unless daemon config's
+/// `harness_processes.limit` sets another count (runtime §8, design §11; owner,
+/// 2026-10-04, bead via-oq3).
+pub(super) const DEFAULT_HARNESS_PROCESSES: NonZeroU32 = match NonZeroU32::new(8) {
+    Some(slots) => slots,
+    None => NonZeroU32::MIN,
+};
 
 /// First delay after a failed Store read or while waiting on an unowned predecessor.
 const RETRY_MIN: Duration = Duration::from_millis(250);
@@ -68,7 +74,7 @@ pub(super) enum Owner {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Claim {
     Waiting,
-    /// The dispatcher reserved a connection slot and grants and submits it.
+    /// The dispatcher reserved a harness-process slot and grants and submits it.
     Claimed,
     Cancelling(Owner),
 }

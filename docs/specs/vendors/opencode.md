@@ -111,7 +111,7 @@ full-bound sessions.
 
 Same as Codex §2 "Shared ownership" for leases, pins, reservations,
 publication after the handshake, concurrent equal-key acquisition, one
-connection slot per live server, idle retirement when the last lease, pin
+harness-process slot per live server, idle retirement when the last lease, pin
 and reservation are released (stdin close, then S1's hard stop), daemon
 stop, and never attaching to a pre-existing vendor server. Differences:
 

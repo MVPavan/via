@@ -448,7 +448,7 @@ impl Engine {
     ///
     /// The claimed lane, or the resident permit of the lane this dispatch
     /// opens: one that needs a new lane first waits for a resident one
-    /// (runtime §8, critical r3 #3), before any connection slot, its turn
+    /// (runtime §8, critical r3 #3), before any harness-process slot, its turn
     /// still queued. The session's lane is claimed before its driver is
     /// prepared, and a failed driver is retired first, so its own slot is
     /// free for its successor (C2 §2, Sol r2 #1). A dispatch that found no
@@ -540,7 +540,7 @@ impl Engine {
     ) -> (Step, bool) {
         // AD16: a pinned live connection of the session's driver needs no
         // slot; a session without a usable driver needs one. Otherwise
-        // design §11: a connection slot before the grant. It is dropped at
+        // design §11: a harness-process slot before the grant. It is dropped at
         // once if nothing launches; at launch Host takes it for the group's
         // life. Force, the latch or a change of the head gives up the wait:
         // the queued path, never submitted. The claim is given back on
@@ -575,7 +575,7 @@ impl Engine {
         }
         // Task 4 design §5.3, §5.4: below the free-space floor or at
         // `wal.max`, the turn fails `store` before submission; no agent I/O,
-        // so the connection slot is released first.
+        // so the harness-process slot is released first.
         if let Some(message) = self.dispatch_refusal().await {
             drop(connection);
             return (
@@ -721,7 +721,7 @@ impl Engine {
         let _ = ended.await;
     }
 
-    /// Waits for a connection slot, FIFO daemon-wide (design §3.1 capacity
+    /// Waits for a harness-process slot, FIFO daemon-wide (design §3.1 capacity
     /// wait; [`Self::reserve`] at `core.dispatch.awaiting_slot`).
     async fn reserve_connection(
         &self,
@@ -1677,7 +1677,7 @@ impl Engine {
         committed
     }
 
-    /// The turn's context (C2 §2 `TurnCx`): the connection slot Core
+    /// The turn's context (C2 §2 `TurnCx`): the harness-process slot Core
     /// reserved, if any, the activity clock, the wall deadline, the stop
     /// order and the daemon force.
     fn turn_cx(
@@ -3088,7 +3088,7 @@ impl Ready<'_> {
 /// ([`Engine::reserve`]).
 #[derive(Clone, Copy)]
 enum Pool {
-    /// Connection slots (design §11).
+    /// Harness-process slots (design §11).
     Slots,
     /// Resident session lanes (runtime §8).
     Resident,

@@ -66,7 +66,7 @@ Labels: **fact** (read in code or a spec), **decision** (this design),
 
 | # | Item | Decision | Owner (crate, module) | Chunk |
 |---|---|---|---|---|
-| 0 | Dispatch admission | Core opens the logical driver, subscribes to its readiness, then prepares before any connection slot; the subscription is kept through the slot wait | Core `engine/drive.rs`; C2 `SessionDriver::readiness` | X2 |
+| 0 | Dispatch admission | Core opens the logical driver, subscribes to its readiness, then prepares before any harness-process slot; the subscription is kept through the slot wait | Core `engine/drive.rs`; C2 `SessionDriver::readiness` | X2 |
 | 1 | Non-turn server owner | `ProcessOwner { Turn, Server }`; server anchors; a durable turn → server-anchor link before the turn's first vendor byte; server and turn evidence folders | Store, Host, Wire | X2 |
 | 2 | Lease registry | `codex::Servers`; holders = reservations + pins + leases; instance-fenced; coalesced pending work on each entry; one supervisor exclusively owning the task set, receiving each launch's connection task and publishing only after spawning it; a panic in the supervisor or under the registry guard aborts the daemon (crash-only, restart recovery); shutdown awaits the supervisor's handle until the cutoff and reads counts kept under the registry mutex | Routes `codex/servers.rs` | X3 (single), X4 (shared) |
 | 3 | `config_hash` | SHA-256 over VIA-controlled launch settings only; no binary-change detection: a server runs the binary it launched with (owner scope rule) | Adapters `codex/launch.rs` | X1, X3 |
@@ -180,7 +180,7 @@ Labels: **fact** (read in code or a spec), **decision** (this design),
 | R4-7 cache freshness | Superseded by Ruling C (r7) | Item 3 |
 | R4-8 cleanup predicate without a cancel | A turn's link row is the persisted fact: the terminal commit deletes it, in the same transaction, when the committed cleanup is quiescent, and keeps it otherwise, cancel or not. The predicate reads remaining links to unproven anchors. No new column, no new C1 field (X0-R4-Q2) | Item 1, Item 6.5; §9.2, §9.3 |
 | R4-9 idle-driver loss | The registration's normalizer is driver-owned (the adapter normalizes), outside the connection task; when its lane ends without a boundary it installs the sticky loss and latches the driver's failure whether or not a turn runs; the loss reaches Core through `TurnEnd.loss` or the driver's close report and `record_loss` | Item 13.2, Item 10 |
-| R4-10 four-entry claim | Live and unproven server groups are bounded by the four slots; retained registry entries are not, and are bounded by their tasks | Item 2.3 |
+| R4-10 four-entry claim | Live and unproven server groups are bounded by the harness-process slots; retained registry entries are not, and are bounded by their tasks | Item 2.3 |
 | R4-11 per-entry task bound | Publication happens when the launch outcome is collected, so an entry has either its launch task alone, or its connection task plus at most one cleanup task; zero-holder publication spawns no connection task; tested | Item 2.1, 2.2, 2.5 |
 | R4-12 old-identity test | Superseded by Ruling C (r7) | Item 3 |
 | R4-13 paused reader | While paused the reader does not poll stdin; it waits on the mode's condition variable with a 10 ms timeout; a paused, non-empty-pipe test | Item 14 |
@@ -355,7 +355,7 @@ before 4.1 is visible to 4.2. A spurious wake costs one synchronous
 **Why nothing smaller works.** Without a driver before admission there is
 nothing to ask. Without a subscription that precedes the check, an
 equal-key server published between the check and the wait is never seen
-while four slots stay held.
+while every slot stays held.
 
 **Failure behaviour.** The head read fails: as `submit`'s read failure
 today (`SubmitFailure::Unread`, nothing written). A closed readiness
@@ -366,7 +366,7 @@ channel is treated as no wake.
 - `queued_turn_reprepares_on_readiness`.
 - `readiness_insert_between_prepare_and_wait`: a test hook between 4.2
   and the slot wait's registration publishes an equal-key server and bumps
-  the epoch; with all four slots held the turn dispatches `Pinned`.
+  the epoch; with every slot held the turn dispatches `Pinned`.
 - `unsubmitted_lane_is_retired`.
 - The fake suite and conformance stay green.
 
@@ -576,7 +576,7 @@ most two.
   instance launches under the same key with its own slot. At most one
   non-retiring instance per key.
 - **Bounds (r4 R4-10).** Live and unproven server **groups** are bounded
-  by the four slots: Host holds a slot until it proves the group absent.
+  by the harness-process slots: Host holds a slot until it proves the group absent.
   Retained registry **entries** are not: Host can release a slot before
   the entry's tasks are collected, so an entry outlives its slot until
   then. Each retained entry holds at most two tasks (item 2.1), and the
@@ -1268,8 +1268,9 @@ reply; written once the reply brings the `turnId`);
   glibc `MALLOC_ARENA_MAX=2` as proxy. Report the absolute peak, the counts
   reached and the marginal RSS per active turn.
 - **What it qualifies:** at most 32 concurrent active turns on one
-  server. Four loaded servers is an **extrapolation** from the per-server
-  and per-turn costs, not measured. The 256-turn unresolved bound remains
+  server. Several loaded servers, up to the harness-process limit (runtime
+  §8, default 8 since bead via-oq3), are an **extrapolation** from the
+  per-server and per-turn costs, not measured. The 256-turn unresolved bound remains
   unmeasured for Codex (X0-Q1, ruled: no extra cap).
 - **As built (X5, fix r1).** `codex_rss_leases` (`crates/via-core/tests/conformance_core.rs`,
   `test-failpoints`, run alone by `.config/nextest.toml`, about 19 s) runs

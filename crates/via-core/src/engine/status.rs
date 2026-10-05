@@ -1,10 +1,11 @@
 //! `daemon/status` (C1 §3.14; design §6.6, Task 4 design §11.2): the
-//! session counts, the connection slots, the daemon config's `limits` and
+//! session counts, the harness-process slots, the daemon config's `limits` and
 //! `storage`; and the disk floor and WAL limit applied to new work (Task 4
 //! design §5.3, §5.4).
 
 use std::{
     collections::HashSet,
+    num::NonZeroU32,
     sync::{Arc, atomic::Ordering},
     time::{Duration, SystemTime},
 };
@@ -13,15 +14,15 @@ use serde_json::{Value, json};
 use via_store::{StoreError, WalLimits};
 
 use super::drive::Step;
-use super::queue::Slot;
+use super::queue::{DEFAULT_HARNESS_PROCESSES, Slot};
 use super::{Engine, lock};
 use crate::api::rfc3339;
 use crate::{ApiError, DescribeParams, ModelsParams, SessionId, TurnNumber};
 
-/// The `connections` object of `daemon/status` (design §6.6, amendment A9).
+/// The `harness_processes` object of `daemon/status` (design §6.6, amendment A9).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct Connections {
-    /// The connection-slot pool's size.
+pub struct HarnessProcesses {
+    /// The harness-process pool's size.
     pub limit: usize,
     /// Permits out: live groups, reservations and every held permit.
     pub in_use: usize,
@@ -41,8 +42,8 @@ pub struct DaemonCounts {
     pub active: usize,
     /// The durable closing set's size (`sessions.closing` [r3.5]).
     pub closing: usize,
-    /// Connection slots.
-    pub connections: Connections,
+    /// Harness-process slots.
+    pub harness_processes: HarnessProcesses,
 }
 
 /// Daemon config's thresholds (Task 4 design §5.5), read once at start.
@@ -54,16 +55,20 @@ pub struct Limits {
     pub warn_size: u64,
     /// The WAL thresholds (§5.4).
     pub wal: WalLimits,
+    /// The harness-process pool's size (runtime §8; bead via-oq3):
+    /// `daemon/status` reports it as `harness_processes.limit`.
+    pub harness_processes: NonZeroU32,
 }
 
 impl Default for Limits {
-    /// Design §5.5's defaults: a 5 GiB floor, a 2 GiB warning and the
-    /// default WAL thresholds.
+    /// Design §5.5's defaults: a 5 GiB floor, a 2 GiB warning, the
+    /// default WAL thresholds and 8 harness-process slots.
     fn default() -> Self {
         Self {
             free_floor: 5 * 1024 * 1024 * 1024,
             warn_size: 2 * 1024 * 1024 * 1024,
             wal: WalLimits::default(),
+            harness_processes: DEFAULT_HARNESS_PROCESSES,
         }
     }
 }
@@ -120,18 +125,18 @@ impl Engine {
             idle: open.saturating_sub(closing).saturating_sub(active),
             active,
             closing,
-            connections: self.connections(),
+            harness_processes: self.harness_processes(),
         }
     }
 
-    /// `connections` (design §6.6). Host's held entries include the
+    /// `harness_processes` (design §6.6). Host's held entries include the
     /// recovered groups it holds for an earlier daemon; those count once,
     /// through the permits `RecoveredSlots` holds for them.
-    pub fn connections(&self) -> Connections {
+    pub fn harness_processes(&self) -> HarnessProcesses {
         let recovered = self.recovered.held();
         let host = self.adapter.held_unproven();
         let limit = self.slot_limit;
-        Connections {
+        HarnessProcesses {
             limit,
             in_use: limit.saturating_sub(self.slots.available_permits()),
             held_unproven: recovered

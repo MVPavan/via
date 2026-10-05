@@ -80,7 +80,7 @@ impl OneTurn {
     }
 }
 
-/// Turn 1's context: a connection slot when `prepared` needs one, the wall
+/// Turn 1's context: a harness-process slot when `prepared` needs one, the wall
 /// `wall`, the daemon force `force` and the stop order `stop`.
 pub(crate) fn turn_cx(
     prepared: Prepared,

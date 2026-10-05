@@ -23,7 +23,7 @@ use super::drive::{Cancelled, Commit, queued_cancellation};
 use super::journal::Head;
 use super::lane::Identity;
 use super::latch::{FailureScope, FailureSite, WriteOutcome};
-use super::queue::{CLOSE_ALLOWANCE, CONNECTION_SLOTS, Owner};
+use super::queue::{CLOSE_ALLOWANCE, Owner};
 use super::resolve::{self, CORRUPT_ROW, Queueing};
 use super::stop::stop_outcome;
 use super::terminal::terminal_envelope;
@@ -451,7 +451,7 @@ impl Engine {
                 // query saturating at the pool (never released during
                 // admission, so no more are needed); its failure is a Store
                 // failure and fails startup.
-                let pool = u32::try_from(CONNECTION_SLOTS).unwrap_or(u32::MAX);
+                let pool = u32::try_from(self.slot_limit).unwrap_or(u32::MAX);
                 self.recovered.save_cursor(after.clone());
                 let unread = self
                     .store
@@ -549,7 +549,7 @@ impl Engine {
     }
 
     /// Design §11: a group an earlier daemon left, whose absence recovery did
-    /// not prove, holds a connection slot until a later Host absence proof
+    /// not prove, holds a harness-process slot until a later Host absence proof
     /// drops its token. Past the pool the groups share the permits held, so
     /// no new child starts until cleanup proves room.
     /// A server-owned group holds one by its server owner, never a

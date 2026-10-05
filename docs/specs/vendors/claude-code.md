@@ -98,7 +98,7 @@ permit the first `run_turn`; these delayed events do not delay the original VIA 
 The process remains open during the turn so interrupt messages can be sent. After
 its terminal, close stdin, await exit and settle group cleanup before another
 process for this session starts. Core's cleanup gate is unchanged. Do not create
-a child until a runtime connection slot is reserved. Close/restart failures must
+a child until a runtime harness-process slot is reserved. Close/restart failures must
 not cause a new UUID. Invalid resume in C0 returned an error without fresh init;
 map a definite missing-session rejection to `SessionGone`/`submit_failed`, retaining
 the same VIA session. A same-ID terminal rejection before init is allowed only

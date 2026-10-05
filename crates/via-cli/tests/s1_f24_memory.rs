@@ -1,6 +1,7 @@
 //! Task 4 design §5.1 (A43) through the real `via` binary and daemon: the
 //! F24 memory gate. Every kind of holder is driven towards its maximum at
-//! once: four running turns whose 16 MiB prompts are dispatched, three of
+//! once: a running turn in each of the configured harness-process slots (8,
+//! the default), each with its 16 MiB prompt dispatched, all but one of
 //! them flooding maximal vendor messages, and every other C1 socket
 //! sending maximal request lines (1 MiB with a 65,000-node list) that read
 //! event pages. The daemon's RSS is sampled every 10 ms from
@@ -17,21 +18,27 @@ mod failpoints;
 mod hits;
 #[path = "support/outer_cleanup.rs"]
 mod outer_cleanup;
+#[path = "support/rss.rs"]
+mod rss;
 #[path = "support/scenario.rs"]
 mod scenario;
 mod support;
 
-use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use daemon::{Daemon, Raw, Sandbox, TestResult, cli, collect_available, failure, infra, request};
+use daemon::{
+    Daemon, Raw, Sandbox, TestResult, cli, collect_available, direct_status, failure, infra,
+    request,
+};
 use failpoints::Failpoints;
+use rss::{GLIBC_ARENAS, limit_kib, sampler, status_kib};
 use scenario::{ScenarioError, run_scenario};
 use serde_json::{Value, json};
 use support::evidence::Evidence;
@@ -40,14 +47,24 @@ const HANDLE: &str = "h_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const MIB: u64 = 1024 * 1024;
 /// A dispatched prompt at `PROMPT_MAX` (design §5.2).
 const PROMPT: usize = 16 * 1024 * 1024;
-/// Design §5.1's sum over holders, and the gate's 25% margin.
-const SUM_MIB: u64 = 332;
-/// Maximal vendor messages per flooding turn, in chunks: three turns flood
-/// 282 MiB, so the sampled total clears 256 MiB even when the 10 ms sampler
-/// misses each fake's last chunk and overflow line (4 MiB each).
-const CHUNKS: u64 = 47;
+/// The harness-process slots the gate runs with, the default (bead via-oq3),
+/// written to `daemon.json`: one held turn and the rest flooding fill them.
+const SLOTS: u64 = 8;
+/// Flooding turns: every slot but the held turn's.
+const FLOODS: u64 = SLOTS - 1;
 /// Maximal messages per chunk: 2 MiB, within Wire's 4 MiB queue (§8.2).
 const CHUNK: u64 = 2;
+/// The flood in MiB, and its warm-up before the growth check: runtime
+/// §8's 256 MiB and 64 MiB for three flooding turns, scaled per flooding
+/// turn, so each turn's holders fill before the growth check as they did
+/// with three (bead via-oq3).
+const FLOOD_MIB: u64 = 256 * FLOODS / 3;
+const FIRST_MIB: u64 = 64 * FLOODS / 3;
+/// Maximal vendor messages per flooding turn, in chunks: the turns flood
+/// more than [`FLOOD_MIB`] plus 4 MiB each, so the sampled total clears it
+/// even when the 10 ms sampler misses each fake's last chunk and overflow
+/// line (4 MiB each); one chunk more for margin.
+const CHUNKS: u64 = (FLOOD_MIB + 4 * FLOODS).div_ceil(CHUNK * FLOODS) + 1;
 /// Core's hit before it handles each observation, counted to pace the
 /// flood.
 const OBSERVED: &str = "core.observations.pause";
@@ -58,17 +75,6 @@ const WARM_LINES: u64 = 16;
 /// A control's reply bound (design §13.2, A52): a starved control fails it;
 /// each round's slowest reply is recorded against the 100 ms target.
 const CONTROL: Duration = Duration::from_secs(1);
-/// glibc's malloc arenas for the daemon (runtime §8): with the default
-/// per-thread arenas, growth after 64 MiB failed about half of measured
-/// runs, consistent with allocator retention; two arenas are an empirical
-/// development proxy. Unset on musl, whose run is the authoritative memory
-/// gate.
-const GLIBC_ARENAS: Option<&str> = if cfg!(target_env = "gnu") {
-    Some("2")
-} else {
-    None
-};
-
 fn check(condition: bool, detail: impl FnOnce() -> String) -> Result<(), ScenarioError> {
     if condition {
         Ok(())
@@ -165,107 +171,6 @@ fn maximal_events(id: u64, session: &str) -> String {
     let line = request(id, "events", &json!({"session":session,"types":types}));
     assert!(line.len() < 1024 * 1024, "{} bytes", line.len());
     line
-}
-
-/// A `/proc/<pid>/status` field in KiB.
-fn status_kib(pid: u32, field: &str) -> Option<u64> {
-    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    status
-        .lines()
-        .find_map(|line| line.strip_prefix(field))
-        .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse().ok())
-}
-
-/// Bytes a process wrote (`/proc/<pid>/io` `wchar`).
-fn written(pid: u32) -> Option<u64> {
-    let io = fs::read_to_string(format!("/proc/{pid}/io")).ok()?;
-    io.lines()
-        .find_map(|line| line.strip_prefix("wchar:"))
-        .and_then(|rest| rest.trim().parse().ok())
-}
-
-/// The pids whose executable is `exe`.
-fn processes_of(exe: &Path) -> Vec<u32> {
-    let Ok(entries) = fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
-        .filter(|pid| fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|target| target == exe))
-        .collect()
-}
-
-/// Whether `pid` is a `via` anchor process (`via __via_host_anchor …`).
-fn is_anchor(pid: u32) -> bool {
-    fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmdline| {
-        cmdline
-            .split(|byte| *byte == 0)
-            .nth(1)
-            .is_some_and(|arg| arg == b"__via_host_anchor")
-    })
-}
-
-/// One 10 ms sample: the daemon's RSS and the bytes the fakes had written.
-#[derive(Clone, Copy)]
-struct Sample {
-    rss_kib: u64,
-    flooded: u64,
-}
-
-/// What the sampler saw.
-#[derive(Default)]
-struct Samples {
-    daemon: Vec<Sample>,
-    /// Peak RSS (`VmHWM`) per anchor pid.
-    anchors: HashMap<u32, u64>,
-}
-
-/// Samples the daemon's RSS every 10 ms, and the fakes' written bytes and
-/// the anchors' peak RSS, until `stop`.
-fn sampler(
-    daemon: u32,
-    fake: PathBuf,
-    via: PathBuf,
-    stop: Arc<AtomicBool>,
-) -> thread::JoinHandle<Samples> {
-    thread::spawn(move || {
-        let mut samples = Samples::default();
-        let mut fakes: HashMap<u32, u64> = HashMap::new();
-        let mut anchors: Vec<u32> = Vec::new();
-        let mut refreshed: Option<Instant> = None;
-        while !stop.load(Ordering::Acquire) {
-            if refreshed.is_none_or(|at| at.elapsed() >= Duration::from_millis(200)) {
-                refreshed = Some(Instant::now());
-                for pid in processes_of(&fake) {
-                    fakes.entry(pid).or_insert(0);
-                }
-                anchors = processes_of(&via)
-                    .into_iter()
-                    .filter(|pid| *pid != daemon && is_anchor(*pid))
-                    .collect();
-            }
-            for (pid, bytes) in &mut fakes {
-                if let Some(now) = written(*pid) {
-                    *bytes = (*bytes).max(now);
-                }
-            }
-            for pid in &anchors {
-                if let Some(peak) = status_kib(*pid, "VmHWM:") {
-                    let seen = samples.anchors.entry(*pid).or_insert(0);
-                    *seen = (*seen).max(peak);
-                }
-            }
-            if let Some(rss_kib) = status_kib(daemon, "VmRSS:") {
-                samples.daemon.push(Sample {
-                    rss_kib,
-                    flooded: fakes.values().sum(),
-                });
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        samples
-    })
 }
 
 /// Sends maximal `events` lines on one socket until `stop`; the replies
@@ -384,8 +289,9 @@ fn spawn_file(
 
 /// Design §5.1, §13.2 [t4r16.2, t4r16.5.6] (A43): with every holder driven
 /// at once, the daemon's peak RSS less its idle baseline stays within
-/// 1.25 × the §5.1 sum; RSS grows by less than 32 MiB after the first
-/// 64 MiB of the 256 MiB flood; each anchor stays within 32 MiB;
+/// 1.25 × the §5.1 sum for its slots; RSS grows by less than 32 MiB after
+/// the first 64 MiB of a 256 MiB flood, both per three flooding turns;
+/// each anchor stays within 32 MiB;
 /// `daemon/status`, `status` and `cancel` of another turn answer within
 /// 100 ms, also while that turn's stdin is held with its interrupt behind
 /// the start (`hold_stdin`); each flooding turn ends `failed(overflow)`.
@@ -405,6 +311,13 @@ fn s1_f24_flood_fails_overflow_with_bounded_rss_and_prompt_control() -> TestResu
     let fake = fs::canonicalize(&sandbox.fake)?;
     let via = fs::canonicalize(&sandbox.via)?;
     let evidence = Evidence::new("s1_f24_flood_rss", &sandbox.fake, &sandbox.fixture)?;
+    // The gate's slot count, explicit so the sum below follows it.
+    let config = sandbox.state.join("daemon.json");
+    fs::write(
+        &config,
+        json!({"harness_processes":{"limit":SLOTS}}).to_string(),
+    )?;
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600))?;
     let report = run_scenario(
         evidence,
         |evidence| {
@@ -427,12 +340,18 @@ fn s1_f24_flood_fails_overflow_with_bounded_rss_and_prompt_control() -> TestResu
             let held = spawn_file(&sandbox, evidence, "held", &prompt_file)?;
             sandbox.await_gate("held")?;
             let mut flooding = Vec::new();
-            for index in 0..3 {
+            for index in 0..usize::try_from(FLOODS).map_err(infra)? {
                 use_fixture(&sandbox, &flood_fixture(index))?;
                 let name = format!("flood_{index}");
                 flooding.push(spawn_file(&sandbox, evidence, &name, &prompt_file)?);
                 sandbox.await_gate(&format!("f{index}_0"))?;
             }
+            // Every slot holds a running turn: each per-slot holder is live.
+            let processes = direct_status(&sandbox.runtime)?["harness_processes"].clone();
+            check(
+                processes["limit"] == SLOTS && processes["in_use"] == SLOTS,
+                || format!("the slots are not all in use: {processes}"),
+            )?;
             let mut controls = Controls::open(&sandbox)?;
             controls.round(&held, &held)?;
             let held_round = controls.slowest;
@@ -507,10 +426,10 @@ fn s1_f24_flood_fails_overflow_with_bounded_rss_and_prompt_control() -> TestResu
                 .max()
                 .unwrap_or(0);
             let peak = peak_hwm.max(peak_sampled);
-            let first = 64 * MIB;
-            // Recorded only: the sample at 64 MiB flooded sits in a transient
-            // dip (11 to 16 MiB below the level around it), so it is not the
-            // level the flood has reached.
+            let first = FIRST_MIB * MIB;
+            // Recorded only: the sample at the warm-up's end sits in a
+            // transient dip (11 to 16 MiB below the level around it), so it
+            // is not the level the flood has reached.
             let at_first = samples
                 .daemon
                 .iter()
@@ -518,9 +437,9 @@ fn s1_f24_flood_fails_overflow_with_bounded_rss_and_prompt_control() -> TestResu
                 .find(|sample| sample.flooded < first)
                 .map_or(baseline, |sample| sample.rss_kib);
             // Growth is peak to peak, the dip excluded: the highest sampled
-            // RSS with 32 MiB <= flooded < 64 MiB (the idle baseline if that
-            // window has no sample) against the highest sampled RSS from
-            // 64 MiB on. Sampled, not VmHWM; the peak check keeps VmHWM.
+            // RSS in the warm-up's second half (the idle baseline if that
+            // window has no sample) against the highest sampled RSS after
+            // the warm-up. Sampled, not VmHWM; the peak check keeps VmHWM.
             let level = samples
                 .daemon
                 .iter()
@@ -545,8 +464,10 @@ fn s1_f24_flood_fails_overflow_with_bounded_rss_and_prompt_control() -> TestResu
             let metrics = json!({
                 "baseline_kib": baseline, "peak_kib": peak, "peak_hwm_kib": peak_hwm,
                 "peak_sampled_kib": peak_sampled, "samples": samples.daemon.len(),
-                "limit_kib": SUM_MIB * 1024 * 5 / 4, "rss_at_64_mib_kib": at_first,
-                "level_before_64_mib_kib": level, "rss_after_64_mib_kib": after,
+                "limit_kib": limit_kib(SLOTS), "slots": SLOTS,
+                "first_mib": FIRST_MIB, "flood_mib": FLOOD_MIB,
+                "rss_at_first_kib": at_first,
+                "level_before_first_kib": level, "rss_after_first_kib": after,
                 "flooded_bytes": flooded, "anchors": samples.anchors.len(),
                 "anchor_peak_kib": anchor_peak,
                 "maximal_lines": lines, "slowest_control_ms": slowest.as_millis(),
@@ -591,18 +512,19 @@ fn s1_f24_flood_fails_overflow_with_bounded_rss_and_prompt_control() -> TestResu
             check(envelope["state"] == "cancelled", || {
                 format!("held turn: {envelope}")
             })?;
-            check(flooded >= 256 * MIB, || {
+            check(flooded >= FLOOD_MIB * MIB, || {
                 format!("the fakes wrote {flooded} bytes")
             })?;
             check(lines > u64::try_from(FLOOD_SOCKETS).map_err(infra)?, || {
                 format!("only {lines} maximal lines were sent")
             })?;
-            check(
-                peak.saturating_sub(baseline) <= SUM_MIB * 1024 * 5 / 4,
-                || format!("peak RSS less baseline is over 1.25 × the §5.1 sum: {metrics}"),
-            )?;
+            check(peak.saturating_sub(baseline) <= limit_kib(SLOTS), || {
+                format!("peak RSS less baseline is over 1.25 × the §5.1 sum: {metrics}")
+            })?;
             check(after.saturating_sub(level) < 32 * 1024, || {
-                format!("RSS grew 32 MiB or more over its level before 64 MiB flooded: {metrics}")
+                format!(
+                    "RSS grew 32 MiB or more over its level before the warm-up's end: {metrics}"
+                )
             })?;
             check(
                 !samples.anchors.is_empty() && anchor_peak <= 32 * 1024,

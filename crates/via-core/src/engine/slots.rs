@@ -1,9 +1,9 @@
-//! Connection slots held for groups an earlier daemon left unproven, and
+//! Harness-process slots held for groups an earlier daemon left unproven, and
 //! where the interrupted startup reconciliation stopped (design §11).
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-/// Connection slots held for unproven recovered groups (design §11): at most
+/// Harness-process slots held for unproven recovered groups (design §11): at most
 /// one permit per group, never more than the pool. A group's token, dropped
 /// when Host proves it absent, releases a permit only once fewer groups than
 /// permits remain. Groups a recovery deadline left unread are counted apart,

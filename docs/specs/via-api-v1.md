@@ -590,7 +590,7 @@ not read or decode them; the caller reads the files. There is no paging.
 `via models [--harness H]` → `{models: [{model, harness, aliases, source}]}`.
 `via daemon status` → `{daemon_version, pid, started_at, sessions: {idle,
 active, closing}, servers: [{harness, vendor_version, key, sessions}],
-socket_path, store_path, health, store_failure, connections, limits,
+socket_path, store_path, health, store_failure, harness_processes, limits,
 storage}`. `limits` holds the effective disk and WAL thresholds; `storage`
 holds `free_bytes`, `data_bytes`, `data_measured_at`, `below_free_floor`
 and `over_warn_size`.
@@ -604,8 +604,11 @@ a Store failure (runtime §7); it stays `store_failed` until the daemon
 exits. `store_failure` is `null`, or reports the latest recorded Store
 failure as `{kind, scope, since, count, affected}`. `scope` is `request`,
 `turn`, `session` or `daemon`, and `affected` lists at most 16 addresses
-plus a count. It carries no prompts, payloads or handles. `connections`
-reports `{limit, in_use, held_unproven}`.
+plus a count. It carries no prompts, payloads or handles.
+`harness_processes` reports `{limit, in_use, held_unproven}` for the
+running harness processes VIA started (runtime §8): `limit` is
+`daemon.json`'s `harness_processes.limit` (default 8). The member was
+named `connections` before 2026-10-05 (owner).
 
 `via daemon stop [--drain|--force]` refuses while any session is active
 or durably `closing`, unless one of these is given:

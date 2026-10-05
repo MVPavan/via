@@ -8305,7 +8305,7 @@ fn core_fills_param_sizes_on_spawn_and_resume() {
     });
 }
 
-/// x.3.2 X0 item 0: every connection slot, held by the test.
+/// x.3.2 X0 item 0: every harness-process slot, held by the test.
 #[cfg(feature = "test-failpoints")]
 fn hold_slots(engine: &Engine) -> tokio::sync::OwnedSemaphorePermit {
     let available = u32::try_from(engine.slots.available_permits()).unwrap();

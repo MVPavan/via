@@ -16,3 +16,10 @@ threads-required = "num-test-threads"
 [[profile.default.overrides]]
 filter = 'test(=codex_rss_leases)'
 threads-required = "num-test-threads"
+
+# Bead via-oq3: `s1_slots_32_parallel_*` runs 32 turns' agents and anchors
+# at once with 32 harness-process slots and samples the daemon's RSS, so it runs
+# alone, as F24 does.
+[[profile.default.overrides]]
+filter = 'test(/^s1_slots_32_parallel_/)'
+threads-required = "num-test-threads"
