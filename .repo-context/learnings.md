@@ -124,3 +124,8 @@ in the design record (`docs/`), not here.
   reviewer at existing measurement files and tests. If a run is cut off,
   resume the same session with that framing; it finished there (S-CORE
   chunk 5 r2).
+- Stress load generators (busy loops used to reproduce flakes under load)
+  outlive the worker that started them and load the owner's shared machine.
+  Briefs that allow load testing require the worker to stop every
+  generator, confirm none remain with `pgrep`, and say so in its report
+  (X5 flake hunt, 2026-10-05: 48 loops were still running after hand-back).
