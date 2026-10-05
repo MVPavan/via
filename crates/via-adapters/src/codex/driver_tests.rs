@@ -625,7 +625,7 @@ async fn codex_cleanup_window_zero_budget() {
 }
 
 /// W2: the tool ends at the grace instant itself: `run_turn` returns
-/// then, never before, with the terminal.
+/// then, never before, with the terminal, `Uncertain`.
 #[tokio::test(start_paused = true)]
 async fn w2_tool_ends_at_the_grace_instant() {
     let rig = Rig::new();
@@ -636,7 +636,14 @@ async fn w2_tool_ends_at_the_grace_instant() {
     turn.vendor.emit(&tool_completed(EXEC)).await;
     let (end, at, _kept) = turn.end().await;
     assert_eq!(at, t0 + Duration::from_secs(60));
-    assert_eq!(kept(&end).0, Some(crate::VendorTerminalStatus::Interrupted));
+    // The window's end is exclusive (X4 code review r1 #1).
+    assert_eq!(
+        kept(&end),
+        (
+            Some(crate::VendorTerminalStatus::Interrupted),
+            Some(crate::Cleanup::Uncertain)
+        )
+    );
 }
 
 /// W3 (Q8): a close while the turn drains detaches it at once, keeping
@@ -748,6 +755,47 @@ async fn w6c_terminal_decoded_at_the_wall() {
     );
 }
 
+/// Test builds: the next turn's wait held at `adapter.codex.ordered`,
+/// before it first polls its orders: a driver delayed while its consumer
+/// runs on.
+#[cfg(feature = "test-failpoints")]
+struct HeldWait(tempfile::TempDir);
+
+#[cfg(feature = "test-failpoints")]
+impl HeldWait {
+    const POINT: &str = "adapter.codex.ordered";
+
+    /// Arms the seam's first hit.
+    fn arm() -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        const TOKEN: &str = "codex-driver-tests";
+        let points = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(points.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let command = json!({"token": TOKEN, "occurrence": 1, "action": "pause"});
+        std::fs::write(
+            points.path().join(format!("{}.json", Self::POINT)),
+            command.to_string(),
+        )
+        .unwrap();
+        via_routes::failpoint::activate(points.path(), TOKEN).unwrap();
+        Self(points)
+    }
+
+    /// Resolves once the wait is held.
+    async fn reached(&self) {
+        let ack = self.0.path().join(format!("{}.1.ack", Self::POINT));
+        while !ack.exists() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// Lets the wait go on.
+    fn release(&self) {
+        let release = self.0.path().join(format!("{}.1.release", Self::POINT));
+        std::fs::write(release, b"").unwrap();
+    }
+}
+
 /// W6b (Sol d1 (b)): the interrupted terminal is retained after the wall
 /// while the turn's wait has not yet polled its orders (held at
 /// `adapter.codex.ordered`); the wait finds the delivery decided at once,
@@ -755,25 +803,11 @@ async fn w6c_terminal_decoded_at_the_wall() {
 #[cfg(feature = "test-failpoints")]
 #[tokio::test(start_paused = true)]
 async fn w6b_terminal_retained_after_the_wall_before_any_poll() {
-    use std::os::unix::fs::PermissionsExt;
-    const POINT: &str = "adapter.codex.ordered";
-    const TOKEN: &str = "codex-driver-tests";
-    let points = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(points.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let command = json!({"token": TOKEN, "occurrence": 1, "action": "pause"});
-    std::fs::write(
-        points.path().join(format!("{POINT}.json")),
-        command.to_string(),
-    )
-    .unwrap();
-    via_routes::failpoint::activate(points.path(), TOKEN).unwrap();
+    let held = HeldWait::arm();
     let rig = Rig::new();
     let wall = Duration::from_secs(5);
     let mut turn = accepted(&rig, (wall, Duration::from_secs(60)), false).await;
-    let ack = points.path().join(format!("{POINT}.1.ack"));
-    while !ack.exists() {
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
+    held.reached().await;
     tokio::time::sleep_until(turn.started + wall + Duration::from_secs(1)).await;
     turn.vendor.emit(&terminal("interrupted")).await;
     turn.running
@@ -781,13 +815,118 @@ async fn w6b_terminal_retained_after_the_wall_before_any_poll() {
         .wait_for(|acknowledged| *acknowledged)
         .await
         .unwrap();
-    std::fs::write(points.path().join(format!("{POINT}.1.release")), b"").unwrap();
+    held.release();
     let (end, _at, _kept) = turn.end().await;
     assert_eq!(deadline(&end), (true, true));
     assert_eq!(
         end.terminal.map(|terminal| terminal.status),
         Some(crate::VendorTerminalStatus::Interrupted)
     );
+}
+
+/// The cleanup a route failure reports.
+#[cfg(feature = "test-failpoints")]
+fn failure_cleanup(end: &TurnEnd) -> Option<crate::WireCleanup> {
+    match &end.outcome {
+        Err(AdapterError::Route(failure)) => failure.cleanup,
+        other => panic!("not a route failure: {other:?}"),
+    }
+}
+
+/// X4 code review r1 #1: the P7 window is judged on decode instants, not
+/// on when the driver runs. The interrupted terminal is decoded at `T0`
+/// with its tool open while the turn's wait is held (each case is its own
+/// test: the failpoint controller is armed once per process); the tool's
+/// completion is decoded at `T0 + completion`, and the wait resumes at
+/// `T0 + 62 s`, past the window's end at `T0 + 60 s`.
+#[cfg(feature = "test-failpoints")]
+async fn p7_completion_case(completion: Duration, cleanup: crate::Cleanup) {
+    let held = HeldWait::arm();
+    let rig = Rig::new();
+    let mut turn = accepted(&rig, FAR, true).await;
+    held.reached().await;
+    let t0 = turn.decode_interrupted().await;
+    tokio::time::sleep_until(t0 + completion).await;
+    turn.vendor.emit(&tool_completed(EXEC)).await;
+    tokio::time::sleep_until(t0 + Duration::from_secs(62)).await;
+    held.release();
+    let (end, _at, _kept) = turn.end().await;
+    assert_eq!(
+        kept(&end),
+        (
+            Some(crate::VendorTerminalStatus::Interrupted),
+            Some(cleanup)
+        ),
+        "completion at T0 + {completion:?}"
+    );
+}
+
+/// r1 #1: a completion decoded after the window (`T0 + 61 s`) proves
+/// nothing: `Uncertain`, as an undelayed driver's grace cut gives.
+#[cfg(feature = "test-failpoints")]
+#[tokio::test(start_paused = true)]
+async fn p7_completion_after_the_window_is_uncertain() {
+    p7_completion_case(Duration::from_secs(61), crate::Cleanup::Uncertain).await;
+}
+
+/// r1 #1: a completion decoded at the window's end itself is not within
+/// it (the end, like the wall, is exclusive).
+#[cfg(feature = "test-failpoints")]
+#[tokio::test(start_paused = true)]
+async fn p7_completion_at_the_window_end_is_uncertain() {
+    p7_completion_case(Duration::from_secs(60), crate::Cleanup::Uncertain).await;
+}
+
+/// r1 #1: a completion decoded within the window (`T0 + 59 s`) proves
+/// quiescence, however late the wait resumes.
+#[cfg(feature = "test-failpoints")]
+#[tokio::test(start_paused = true)]
+async fn p7_completion_within_the_window_is_quiescent() {
+    p7_completion_case(Duration::from_secs(59), crate::Cleanup::Quiescent).await;
+}
+
+/// X4 code review r1 #2 (C2 §4.1 "One wall cutoff"): with no order, the
+/// wall at `T5` and the turn's wait held until `T10`, an interrupted
+/// terminal is decoded at `T5 + decoded`.
+#[cfg(feature = "test-failpoints")]
+async fn wall_cutoff_case(decoded: Duration, within: bool) {
+    let wall = Duration::from_secs(5);
+    let held = HeldWait::arm();
+    let rig = Rig::new();
+    let mut turn = accepted(&rig, (wall, Duration::from_secs(60)), false).await;
+    held.reached().await;
+    tokio::time::sleep_until(turn.started + wall + decoded).await;
+    turn.decode_interrupted().await;
+    tokio::time::sleep_until(turn.started + wall + Duration::from_secs(5)).await;
+    held.release();
+    let (end, _at, _kept) = turn.end().await;
+    assert_eq!(deadline(&end), (within, true), "acknowledged");
+    assert_eq!(end.terminal.is_some(), within, "terminal kept");
+    if !within {
+        assert_ne!(
+            failure_cleanup(&end),
+            Some(crate::WireCleanup::Quiescent),
+            "an unproven stop"
+        );
+    }
+}
+
+/// r1 #2: decoded at `T9`, past the wall's cleanup bound `T8`, the
+/// terminal is late only: the wall's `Deadline` keeps no terminal,
+/// unacknowledged, its cleanup unproven, as an undelayed driver's cut at
+/// `T8` gives.
+#[cfg(feature = "test-failpoints")]
+#[tokio::test(start_paused = true)]
+async fn wall_terminal_after_the_cleanup_bound_is_late() {
+    wall_cutoff_case(Duration::from_secs(4), false).await;
+}
+
+/// r1 #2: decoded at the bound `T8` itself, the terminal is within it:
+/// kept, acknowledged.
+#[cfg(feature = "test-failpoints")]
+#[tokio::test(start_paused = true)]
+async fn wall_terminal_at_the_cleanup_bound_is_kept() {
+    wall_cutoff_case(Duration::from_secs(3), true).await;
 }
 
 /// The orders of a turn whose wall is `wall`, and their senders.

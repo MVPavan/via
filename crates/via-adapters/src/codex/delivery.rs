@@ -189,6 +189,10 @@ pub(crate) struct Sealed {
     /// The retained terminal's original decode instant (x.3.2 X4 D4.1),
     /// not its observation time.
     pub(crate) decoded_at: Option<Instant>,
+    /// The decode instant of the message that ended a draining
+    /// terminal's tools (X4 code review r1 #1): settlement judges it
+    /// against the P7 window, whenever the driver ran.
+    pub(crate) drained_at: Option<Instant>,
     pub(crate) tools_open: bool,
     pub(crate) stop: Option<Stop>,
 }
@@ -205,6 +209,9 @@ struct Seal {
     /// x.3.2 X4 D4.1: the terminal is an interrupted one retained with a
     /// tool open; the turn's P7 window is open until the tools end.
     draining: bool,
+    /// The decode instant of the message that ended the draining
+    /// terminal's tools.
+    drained_at: Option<Instant>,
     tools_open: bool,
     stop: Option<Stop>,
 }
@@ -240,6 +247,7 @@ impl Delivery {
                 terminal: None,
                 decoded_at: None,
                 draining: false,
+                drained_at: None,
                 tools_open: false,
                 stop: None,
             }),
@@ -320,14 +328,16 @@ impl Delivery {
         true
     }
 
-    /// x.3.2 X4 D4.1: the draining turn's tools all ended; its P7 window
-    /// closes and the retained terminal decides.
-    fn drained(&self) {
+    /// x.3.2 X4 D4.1: the draining turn's tools all ended, by the message
+    /// decoded at `decoded_at`; its P7 window closes and the retained
+    /// terminal decides.
+    fn drained(&self, decoded_at: Instant) {
         let mut seal = self.lock();
         if !seal.draining {
             return;
         }
         seal.draining = false;
+        seal.drained_at = Some(decoded_at);
         drop(seal);
         self.changed.notify_one();
     }
@@ -397,6 +407,7 @@ impl Delivery {
             partial: !seal.complete,
             terminal: seal.terminal.take(),
             decoded_at: seal.decoded_at,
+            drained_at: seal.drained_at,
             tools_open: seal.tools_open,
             stop: seal.stop.take(),
         };
@@ -1591,13 +1602,14 @@ impl Normalizing {
                 delivery.complete(self.tools_open());
             }
         }
-        self.quiesced();
+        self.quiesced(decoded_at);
         Handled::Done(delivery.whole(seq))
     }
 
-    /// x.3.2 X4 D4.1: a draining turn whose tools all ended in the ledger
-    /// leaves its P7 window: its terminal decides, and it is `Retained`.
-    fn quiesced(&mut self) {
+    /// x.3.2 X4 D4.1: a draining turn whose tools all ended in the ledger,
+    /// by the message decoded at `decoded_at`, leaves its P7 window: its
+    /// terminal decides, and it is `Retained`.
+    fn quiesced(&mut self, decoded_at: Instant) {
         let draining = self
             .held
             .as_ref()
@@ -1606,7 +1618,7 @@ impl Normalizing {
             return;
         }
         if let Some(held) = self.held.as_mut() {
-            held.cx.delivery.drained();
+            held.cx.delivery.drained(decoded_at);
             held.phase = Phase::Retained;
         }
     }

@@ -27,7 +27,10 @@
 //! the wall, or a close, whichever is first (x.3.2 X4 D4). The turn's
 //! result follows the earliest positively attested stop it recorded (an
 //! order at its `attached`, or the wall once passed), so a wall that came
-//! first gives `Deadline` with the terminal kept. Steer is not supported.
+//! first gives `Deadline` with the terminal kept, unless decoded after
+//! the wall's cleanup bound (late only). Both cutoffs are judged on decode
+//! instants, however late the turn's own wait runs. Steer is not
+//! supported.
 
 use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
@@ -2538,8 +2541,14 @@ fn settle_turn(
         if overflowed {
             cleanup_interrupt();
         }
-        let tools_open = sealed.tools_open || overflowed;
         let decoded_at = sealed.decoded_at.unwrap_or(retained.terminal.at);
+        // X4 code review r1 #1: the P7 window is judged on decode
+        // instants, whenever this wait ran: tools that ended only at or
+        // after its end, `min(decoded_at + tool_grace, wall)`, end
+        // nothing.
+        let window_end = (decoded_at + orders.tool_grace).min(wall);
+        let drained_late = sealed.drained_at.is_some_and(|at| at >= window_end);
+        let tools_open = sealed.tools_open || overflowed || drained_late;
         if decoded_at >= wall && orders.provenance() == EndCause::Wall {
             return wall_end(facts, retained, decoded_at, (wall, tools_open));
         }
@@ -2591,17 +2600,22 @@ fn settle_turn(
 
 /// x.3.2 X4 D4.2 rule 3 (C2 §4.1): the wall stopped the turn, whose
 /// terminal, decoded at `decoded_at` at or after it, is kept beside the
-/// wall's `Deadline`; the stop was acknowledged by an interrupted terminal
-/// within the wall's cleanup bound. P7 is capped at the wall: it settles
-/// at once.
+/// wall's `Deadline`; the stop was acknowledged by an interrupted terminal.
+/// P7 is capped at the wall: it settles at once. C2 §4.1 "One wall
+/// cutoff" (X4 code review r1 #2): a terminal decoded after the wall's
+/// cleanup bound is late only, whenever this wait ran: the `Deadline`
+/// keeps no terminal and its stop is unproven, as a cut at the bound
+/// gives.
 fn wall_end(
     facts: &Turn<'_>,
     retained: Retained,
     decoded_at: Instant,
     (wall, tools_open): (Instant, bool),
 ) -> TurnEnd {
-    let acknowledged = retained.terminal.status == VendorTerminalStatus::Interrupted
-        && decoded_at <= wall + CLEANUP_ALLOWANCE;
+    if decoded_at > wall + CLEANUP_ALLOWANCE {
+        return facts.failure(RouteError::Deadline { turn: facts.number }, None, None);
+    }
+    let acknowledged = retained.terminal.status == VendorTerminalStatus::Interrupted;
     let mut end = facts.failure(
         RouteError::Deadline { turn: facts.number },
         None,
