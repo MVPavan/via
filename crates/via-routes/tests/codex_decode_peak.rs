@@ -1,6 +1,7 @@
 //! x.3.2 X5 (X0 item 9.2): the measured peak of one maximal Codex decode
-//! against the design's `DECODE_ALLOWANCE`, 8 MiB of owned strings plus
-//! 65,536 nodes at 64 B each (12 MiB), which `codex_rss_leases` charges
+//! against the design's `DECODE_ALLOWANCE`, two maximal messages (an
+//! escaped string's scratch and its owned copy) plus 65,536 nodes at 64 B
+//! each (20 MiB), which `codex_rss_leases` charges
 //! per session for the normalizer's decode in flight. Each shape a server
 //! line can reach within the Codex route's 8 MiB message
 //! ([`MESSAGE_BYTES`], via-5lr.3.5) and the 65,536-node structure limit
@@ -22,9 +23,11 @@ use std::{env, fs, process::Command};
 
 use via_routes::codex::{MESSAGE_BYTES, decode};
 
-/// The design's allowance (X0 item 9.2 table): the owned strings of one
-/// maximal message plus 65,536 nodes at 64 B.
-const DECODE_ALLOWANCE: u64 = MESSAGE_BYTES as u64 + 65_536 * 64;
+/// The design's allowance (X0 item 9.2 table; review cfix-1 #2): two
+/// maximal messages, as a string with an escape is unescaped into serde's
+/// scratch buffer and then copied into the owned string while the scratch
+/// is held, plus 65,536 nodes at 64 B: 20 MiB.
+const DECODE_ALLOWANCE: u64 = 2 * MESSAGE_BYTES as u64 + 65_536 * 64;
 
 /// The longest line the Codex route admits, its LF excluded.
 const LINE: usize = MESSAGE_BYTES - 1;
@@ -76,6 +79,15 @@ fn shapes() -> Vec<(&'static str, String)> {
             "agentMessage final_answer text",
             filled(
                 &item(r#""type":"agentMessage","id":"m","text":"FILL","phase":"final_answer""#),
+                "x",
+            ),
+        ),
+        (
+            // Review cfix-1 #2: one escape makes serde unescape into its
+            // scratch buffer, then copy the text out: both are held.
+            "agentMessage final_answer text, escaped",
+            filled(
+                &item(r#""type":"agentMessage","id":"m","text":"\nFILL","phase":"final_answer""#),
                 "x",
             ),
         ),

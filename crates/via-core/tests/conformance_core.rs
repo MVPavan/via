@@ -5054,14 +5054,15 @@ fn rss_sampler(
 /// server, staging 12 MiB, correlation 256 KiB, pending replies 64 KiB,
 /// Wire's read buffer 64 KiB and the demux peek of one 8 MiB message; per
 /// session, the observation channel 4 MiB, driver controls 64 KiB and the
-/// decode allowance (8 MiB of strings + 65,536 nodes × 64 B); per active
+/// decode allowance (two 8 MiB messages, an escaped string's scratch and
+/// its owned copy, + 65,536 nodes × 64 B; review cfix-1 #2); per active
 /// turn, the dispatched prompt, which on this route is at most the echo
 /// cap (via-5lr.6), not C1's 16 MiB.
 #[cfg(feature = "test-failpoints")]
 fn leases_sum() -> u64 {
     const MIB: u64 = 1024 * 1024;
     let server = CODEX_STAGING_BYTES + 256 * 1024 + 64 * 1024 + 64 * 1024 + CODEX_MESSAGE_BYTES;
-    let session = 4 * MIB + 64 * 1024 + CODEX_MESSAGE_BYTES + 65_536 * 64;
+    let session = 4 * MIB + 64 * 1024 + 2 * CODEX_MESSAGE_BYTES + 65_536 * 64;
     let turn = CODEX_PROMPT_MAX as u64;
     server + LEASES as u64 * (session + turn)
 }

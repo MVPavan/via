@@ -1267,7 +1267,7 @@ reply; written once the reply brings the `turnId`);
   | **Per session** | | |
   | C2 observation channel, Core drain held (`core.observations.pause`); open-tool metadata is charged inside it | 1,024 items / 4 MiB | 32 |
   | Driver controls | 8 / 64 KiB | 32 |
-  | Normalizer decode in flight: `DECODE_ALLOWANCE` = 8 MiB of owned strings + 65,536 nodes × 64 B = 12 MiB (item 9.3) | 12 MiB | 32 |
+  | Normalizer decode in flight, or its final-text pieces held under back-pressure: `DECODE_ALLOWANCE` = two maximal messages (an escaped string's serde scratch and its owned copy) + 65,536 nodes × 64 B = 20 MiB (item 9.3) | 20 MiB | 32 |
   | **Per active turn** | | |
   | Dispatched prompt | 16 MiB | 32 |
 
@@ -1290,7 +1290,8 @@ reply; written once the reply brings the `turnId`);
   Core's Engine in its own process over one replay server. Each of the 32
   sessions' prompts is at the Codex echo cap (via-5lr.6), so the
   per-turn row counts 1,040,384 bytes, not 16 MiB, and the computed sum
-  is 566 MiB (327 MiB before item 9.3).
+  is 822 MiB (327 MiB before item 9.3; 566 MiB with the first, 12 MiB
+  decode allowance, review cfix-1 #2).
   1. A paced flood of 272 maximal thread lines (about 270 MiB) is consumed
      with Core draining. The growth windows before and after the flood's
      first 64 MiB must both hold samples.
@@ -1330,28 +1331,41 @@ reply; written once the reply brings the `turnId`);
   replies (64 KiB) and the 32 sessions' driver controls (32 × 64 KiB) are
   not driven to their maxima, 2,368 KiB of the sum together.
 
-  Measured, two runs each, with item 9.3's bounds (2026-10-05):
+  Measured, two runs each, with item 9.3's bounds and the final text
+  moved into its pieces (2026-10-05):
 
   | Build | Baseline | Peak | Peak less baseline | Growth after 64 MiB |
   |---|---|---|---|---|
-  | musl (authoritative) | 19 MiB | 229 MiB | 210 MiB | under 0.3 MiB |
-  | glibc, `MALLOC_ARENA_MAX=2` | 27 MiB | 238 MiB | 211 MiB | none |
+  | musl (authoritative) | 19 MiB | 197 MiB | 178 MiB | under 0.2 MiB |
+  | glibc, `MALLOC_ARENA_MAX=2` | 25 MiB | 213 MiB | 188 MiB | none |
 
-  The limit is 708 MiB (409 MiB before item 9.3). Both builds reach about
-  6.5 MiB per session at the held peak. The scenario still drives about
+  The limit is 1,028 MiB (409 MiB before item 9.3). Both builds reach
+  about 6 MiB per session at the held peak; before the move (normalized
+  text and its pieces both held) it was 210 and 211 MiB. The scenario still drives about
   1 MiB lines (its pads are the echo-capped prompt): the 12 MiB staging is
   filled, but the 8 MiB peek and decode rows are not driven to their new
   maxima here; the decode measure below covers them one at a time.
   Before item 9.3 the measured peak less baseline was 202 MiB (musl) and
   204 MiB (glibc).
 
-  One maximal decode peaks at about 8.25 MiB of RSS (8 MiB lines) on both
-  builds, against the 12 MiB `DECODE_ALLOWANCE`. RSS is an estimate, to
-  the kernel's 256 KiB counter granularity, not a bound. That measure is
-  `codex_decode_peak_within_allowance`
-  (`crates/via-routes/tests/codex_decode_peak.rs`). It decodes eight
-  shapes, each in a fresh process. The worst is a `final_answer` text, an
-  error message or a response result at the 8 MiB cap.
+  One maximal decode peaks at about 16.25 MiB of RSS (8 MiB lines) on
+  both builds, against the 20 MiB `DECODE_ALLOWANCE`. RSS is an estimate,
+  to the kernel's 256 KiB counter granularity, not a bound. That measure
+  is `codex_decode_peak_within_allowance`
+  (`crates/via-routes/tests/codex_decode_peak.rs`). It decodes nine
+  shapes, each in a fresh process. The worst is a `final_answer` text
+  with one escape (`\n`): serde unescapes it into its scratch buffer and
+  copies it out while the scratch is held (review cfix-1 #2). Unescaped,
+  a maximal text, error message or response result peaks at about
+  8.25 MiB. `codex_normalize_peak_within_allowance`
+  (`crates/via-adapters/src/codex/tests.rs`) decodes and normalizes the
+  escaped maximal `final_answer` in a fresh process, holding the decoded
+  message and its pieces: about 18.5 MiB (glibc) and 18.25 MiB (musl),
+  normalization adding nothing, as the text moves into its pieces
+  (`final_text_pieces_owned`). With the text copied, as before, it was
+  22 MiB. What is not qualified: `codex_rss_leases` drives about 1 MiB
+  lines, so 32 sessions each at a maximal 8 MiB decode at once are an
+  extrapolation from these single measures.
 
 #### 9.3 The Codex inbound cap (via-5lr.3.5, 2026-10-05)
 
@@ -1380,9 +1394,12 @@ failed the shared connection `protocol`, every session on it.
 - **Decode.** The decoder borrows `params` and an item's raw value from
   the line instead of copying them (`RawEnvelope`, `item_event`, `peek`):
   before that, an 8 MiB `final_answer` decoded at about 24 MiB (three
-  copies); now at about 8.25 MiB, one copy of the retained text.
-  `DECODE_ALLOWANCE` is one maximal message's strings plus the node term:
-  12 MiB.
+  copies); now at about 8.25 MiB, one copy of the retained text, or
+  16.25 MiB when the text holds an escape (serde's scratch beside the
+  owned copy). `DECODE_ALLOWANCE` is two maximal messages plus the node
+  term: 20 MiB. The normalizer moves a final answer's text into its
+  pieces rather than copying it, so the pieces held under back-pressure
+  stay within the same allowance (review cfix-1 #2).
 - **Over the cap.** A line over 8 MiB still fails the shared connection
   `protocol` (item 5 step 2). Failing only its own turn would need the
   thread ID, which Codex writes after the item, past the 64 KiB prefix
