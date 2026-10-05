@@ -754,9 +754,9 @@ fn exit_on_interrupt() -> io::Result<Interrupt> {
         if interrupt.recv().await.is_some() {
             // A helper takes the stdout lock, so a line being written
             // finishes first and none starts after; it keeps the lock until
-            // the exit. A write blocked on a reader that stopped reading
-            // never releases the lock: the CLI then exits without it, the
-            // last line possibly unfinished. The exit itself never waits
+            // the exit. A write the reader does not take within
+            // `INTERRUPT_FLUSH` (stopped or slow) keeps the lock: the CLI
+            // then exits without it, the last line possibly unfinished. The exit itself never waits
             // for the lock (std's exit-time stdout cleanup only tries it).
             let (flushed, done) = tokio::sync::oneshot::channel();
             std::thread::spawn(move || {
