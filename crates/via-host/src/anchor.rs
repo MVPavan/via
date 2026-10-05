@@ -258,8 +258,15 @@ async fn armed(
             () = until(kill_at.filter(|_| !flushing).map(tail_flush_at)) => {
                 // The tail's write begins (bead via-c2r). Control is still
                 // read meanwhile, so a later `Stop` can bring the KILL
-                // forward; a lock held past 1 ms is retried on the next turn.
-                flushing = stderr.try_finish(std::time::Instant::now() + Duration::from_millis(1));
+                // forward. A lock held past 1 ms is retried on the next
+                // turn, never past the KILL deadline: once it is due, this
+                // branch KILLs too, so a retry never wins over it.
+                let due = kill_at.and_then(|deadline| stderr.finish_before(deadline.into_std()));
+                let Some(finished) = due else {
+                    let _ = process::kill_process_group(process::getpgrp(), Signal::KILL);
+                    return Ok(());
+                };
+                flushing = finished;
             }
             () = until(kill_at) => {
                 // The vendor group ends here, this anchor with it.

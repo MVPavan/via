@@ -467,6 +467,10 @@ fn a_stop_during_the_tail_flush_is_still_read() {
         })
         .await;
         tokio::time::timeout(Duration::from_secs(2), anchor.wait()).await.unwrap().unwrap();
+        // The group dies by its KILL deadline, 200 ms after the first Stop,
+        // plus a small slack.
+        let died = first.elapsed();
+        assert!(died < Duration::from_millis(300), "the anchor died {died:?} after the first Stop");
         assert_eq!(
             answered,
             Ok(true),

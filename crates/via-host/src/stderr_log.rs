@@ -211,6 +211,18 @@ impl StderrLog {
         true
     }
 
+    /// One attempt, in the anchor's flush window, to end the log before the
+    /// group KILL at `kill_at`: `None` once the KILL is due, which then
+    /// must not wait; otherwise whether the log ended, its lock tried for at
+    /// most 1 ms and never past `kill_at`.
+    pub(crate) fn finish_before(&self, kill_at: Instant) -> Option<bool> {
+        let now = Instant::now();
+        if now >= kill_at {
+            return None;
+        }
+        Some(self.try_finish((now + Duration::from_millis(1)).min(kill_at)))
+    }
+
     /// Ends the log, then waits until the writer wrote the rest, returning
     /// by `deadline` whatever holds the lock or the file. A log not ended
     /// by then loses its tail.
@@ -420,6 +432,38 @@ mod tests {
                 "{cap:?}: {allocated} bytes allocated, over {bound}"
             );
         }
+    }
+
+    /// Critical fix round 2: with the lock held through the flush window,
+    /// the flush attempts give up by the KILL deadline and report the KILL
+    /// due, so the anchor's group dies by it.
+    #[test]
+    fn the_flush_never_outlasts_the_kill_deadline() {
+        let log = Arc::new(StderrLog::new(StderrCap::TURN));
+        let holder = log.clone();
+        let (held, held_rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let _state = holder.lock();
+            held.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+        });
+        held_rx.recv().unwrap();
+        let begun = Instant::now();
+        let kill_at = begun + Duration::from_millis(10);
+        let ended = loop {
+            match log.finish_before(kill_at) {
+                Some(false) => {}
+                Some(true) => break "finished",
+                None => break "kill due",
+            }
+        };
+        let took = begun.elapsed();
+        thread.join().unwrap();
+        assert_eq!(ended, "kill due", "after {took:?}");
+        assert!(
+            took < Duration::from_millis(25),
+            "the KILL came {took:?} after the flush began, for a 10 ms deadline"
+        );
     }
 
     /// A failed file write never stops the writer: it takes and discards
