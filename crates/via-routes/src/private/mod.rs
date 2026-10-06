@@ -452,7 +452,10 @@ async fn serve_turn<P: PrivateProtocol>(
         Err(failed) => failed,
     };
     // One cutoff (AD4): the wall's cleanup bound is 3 s from the wall,
-    // for every step after it; a stop order's is its `close_by`.
+    // for every step after it; a stop order's is its `close_by`, as the
+    // failure took it. Fixed once cleanup begins: a later, shorter order
+    // does not shorten it; the daemon force ends it through Host's early
+    // stop (packet §7.1).
     let cleanup = match failed.cause {
         RouteError::Deadline { .. } => Deadline::at(serving.deadline.instant() + CLEANUP_ALLOWANCE),
         RouteError::Protocol { .. }
@@ -534,7 +537,10 @@ async fn late<P: PrivateProtocol>(
     // Nothing more is read: the terminal's disposition is settled now.
     let unanswered = P::unanswered(serving);
     // The unanswered order's own `close_by`, when earlier (picrit round 2,
-    // B), bounds delivery, close and drain alike.
+    // B), bounds delivery, close and drain alike. It is fixed here, as the
+    // order stands as cleanup begins: a later, shorter order does not
+    // shorten it; the daemon force ends it through Host's early stop
+    // (packet §7.1).
     let by = unanswered
         .as_ref()
         .and_then(|failed| failed.close_by)

@@ -695,15 +695,25 @@ in cwd, escaped descendants stopped, or network isolation by `--offline`.
    decides this on every exit after `agent_settled`, the late path
    (a settlement that waited for read-ahead room past the wall) included;
    other terminals are retained as usual.
-   - **The cutoff is live.** Every wait on this path re-reads the current
-     orders at each wake and takes the earliest bound: a later, shorter
-     order (a forced session close, say) ends the reply wait at its own
-     `force_at`. A marker waiting for read-ahead room ends at the same
-     cutoff rather than the wall, since it will not be retained. Cleanup,
-     the late path's delivery and the driver's delivery of what Route
-     already handed over all end by the order's `close_by`, as it stands
-     or arrives, and never past the wall plus 3 s. What Core has not taken
-     by then is lost: `overflow` latches the session (C2 §2).
+   - **The cutoff is live until cleanup begins.** Each wait before
+     cleanup re-reads the current orders at every wake and takes the
+     earliest bound:
+     - the reply wait: a later, shorter order (a forced session close,
+       say) ends it at its own `force_at`;
+     - a marker waiting for read-ahead room: it ends at the same cutoff
+       rather than the wall, since it will not be retained;
+     - the driver's delivery of what Route already handed over: it ends
+       by the order's `close_by` as it stands or arrives, never past the
+       wall plus 3 s. What Core has not taken by then is lost: `overflow`
+       latches the session (C2 §2).
+
+     Once cleanup begins (Route sends Host's force close, or the late
+     path computes its bound), that bound is fixed at that moment: the
+     order's `close_by` as it stood then, else the cleanup allowance,
+     never past the wall plus 3 s. It bounds the close, the late path's
+     delivery and the drain alike. A later, shorter order does not
+     shorten a cleanup already running; the daemon force still ends it
+     through Host's early stop.
 4. Then S1's close, as Claude.
 
 **Wall cleanup step:** as Claude, a Host force close with no abort (C2
