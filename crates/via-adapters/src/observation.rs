@@ -16,6 +16,7 @@ use crate::plan::{VersionStatus, Warning};
 use crate::runtime::{OBSERVATION_BYTES, OBSERVATION_ITEMS};
 use crate::{
     AcceptanceToken, Cleanup, RouteFailure, StartRejected, VendorTerminalStatus, VendorTurnId,
+    WireCleanup,
 };
 
 /// A vendor message's progress marks (C2 §4 `progress`); the arrival time
@@ -375,10 +376,17 @@ impl TurnEvidence {
 
     /// Route's evidence of a failed turn: a launched one's exit and
     /// cleanup, unproven when Route established none; otherwise the
-    /// no-launch evidence.
+    /// no-launch evidence, unless Host's evidence of the turn's own failed
+    /// process or server acquisition is `Uncertain` (C2 §2; bead via-20s
+    /// review #3). An unlaunched failure carries a cleanup only as that
+    /// acquisition evidence.
     pub fn of_failure(failure: &RouteFailure) -> Self {
         if !failure.launched {
-            return Self::no_launch(failure.journal_uncertain);
+            let mut evidence = Self::no_launch(failure.journal_uncertain);
+            if failure.cleanup == Some(WireCleanup::Uncertain) {
+                evidence.cleanup = Cleanup::Uncertain;
+            }
+            return evidence;
         }
         Self {
             exit: failure.exit,
@@ -1001,6 +1009,39 @@ mod tests {
     use crate::plan::Warning;
     use crate::runtime::{OBSERVATION_BYTES, OBSERVATION_ITEMS};
     use std::time::Duration;
+
+    /// Bead via-20s review #3 (C2 §2): a turn that never launched has the
+    /// no-launch evidence, `Quiescent` with a complete journal, unless
+    /// its own process or server acquisition failed and Host's evidence of
+    /// it is `Uncertain`; that evidence stands. Without acquisition
+    /// evidence, or with a quiescent one, the no-launch row applies.
+    #[test]
+    fn an_unlaunched_failure_keeps_hosts_uncertain_acquisition() {
+        use crate::{Cleanup, RouteError, RouteFailure, TurnEvidence, TurnNumber, WireCleanup};
+        let turn = TurnNumber::try_from(1).unwrap();
+        let failure = |cleanup, journal_uncertain| RouteFailure {
+            cause: RouteError::TransportLost { turn },
+            undecoded: None,
+            exit: None,
+            launched: false,
+            cleanup,
+            forced: false,
+            journal_uncertain,
+            acknowledged: false,
+            shared: true,
+            launch: None,
+        };
+        for (cleanup, journal_uncertain, want) in [
+            (Some(WireCleanup::Uncertain), false, Cleanup::Uncertain),
+            (Some(WireCleanup::Quiescent), false, Cleanup::Quiescent),
+            (None, false, Cleanup::Quiescent),
+            (None, true, Cleanup::Uncertain),
+        ] {
+            let evidence = TurnEvidence::of_failure(&failure(cleanup, journal_uncertain));
+            assert_eq!(evidence.cleanup, want, "{cleanup:?} {journal_uncertain}");
+            assert_eq!(evidence.exit, None);
+        }
+    }
 
     fn tool(name: &str) -> ObservationItem {
         ObservationItem {

@@ -131,6 +131,10 @@ pub enum LaunchFailure {
     Internal,
 }
 
+/// No acquisition cleanup or force facts: the failure came after Host's
+/// acquisition succeeded.
+const NONE: (Option<WireCleanup>, bool) = (None, false);
+
 /// An acquisition failure's own cause.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AcquireCause {
@@ -149,10 +153,16 @@ impl LaunchFailure {
     /// server's exit Host did not confirm, the handshake's deadline, or the
     /// launch task's failure) `failed(submit_failed)`, never `unknown`
     /// (C1 §7.6, bead via-20s).
+    ///
+    /// A failed acquisition keeps Host's cleanup and force facts: the
+    /// turn's own server acquisition failed, so C2 §2 gives it Host's
+    /// acquisition evidence, while it still never launched (review #3).
     pub fn route_failure(self, turn: TurnNumber) -> RouteFailure {
-        let (cause, journal_uncertain, launch) = match self {
+        let (cause, (cleanup, forced), journal_uncertain, launch) = match self {
             Self::Acquire {
                 cause,
+                cleanup,
+                forced,
                 journal_uncertain,
                 launch,
                 ..
@@ -162,32 +172,36 @@ impl LaunchFailure {
                     AcquireCause::Stopped => RouteError::Stopped { turn },
                     AcquireCause::Transport => RouteError::TransportLost { turn },
                 },
+                (cleanup, forced),
                 journal_uncertain,
                 launch,
             ),
-            Self::Protocol(detail) => (RouteError::Protocol { turn, detail }, false, None),
+            Self::Protocol(detail) => (RouteError::Protocol { turn, detail }, NONE, false, None),
             Self::Lost(LossCause::Protocol) => (
                 RouteError::Protocol {
                     turn,
                     detail: "the shared connection failed its handshake",
                 },
+                NONE,
                 false,
                 None,
             ),
-            Self::Lost(LossCause::Overflow) => (RouteError::Overflow { turn }, false, None),
-            Self::Lost(LossCause::ServerLost) => (RouteError::ServerLost { turn }, false, None),
-            Self::Lost(LossCause::TransportLost) | Self::Deadline | Self::Internal => {
-                (RouteError::TransportLost { turn }, false, None)
+            Self::Lost(LossCause::Overflow) => (RouteError::Overflow { turn }, NONE, false, None),
+            Self::Lost(LossCause::ServerLost) => {
+                (RouteError::ServerLost { turn }, NONE, false, None)
             }
-            Self::Shutdown => (RouteError::Stopped { turn }, false, None),
+            Self::Lost(LossCause::TransportLost) | Self::Deadline | Self::Internal => {
+                (RouteError::TransportLost { turn }, NONE, false, None)
+            }
+            Self::Shutdown => (RouteError::Stopped { turn }, NONE, false, None),
         };
         RouteFailure {
             cause,
             undecoded: None,
             exit: None,
             launched: false,
-            cleanup: None,
-            forced: false,
+            cleanup,
+            forced,
             journal_uncertain,
             acknowledged: false,
             shared: true,
@@ -1632,5 +1646,41 @@ mod handle_tests {
         let far = Deadline::at(Instant::now() + Duration::from_secs(5));
         assert!(handle.join(far).await, "the ended supervisor joins");
         assert!(handle.handle().is_none(), "released once it ended");
+    }
+}
+
+#[cfg(test)]
+mod route_failure_tests {
+    use via_wire::WireCleanup;
+
+    use super::{AcquireCause, LaunchFailure};
+    use crate::{RouteError, TurnNumber};
+
+    /// Bead via-20s review #3 (C2 §2: a turn whose own server acquisition
+    /// failed takes Host's acquisition evidence): a failed acquisition's
+    /// cleanup and force facts reach the waiting turn's failure, which
+    /// still never launched.
+    #[test]
+    fn an_acquisition_failure_keeps_hosts_cleanup() {
+        let turn = TurnNumber::try_from(1).unwrap();
+        for (cleanup, forced) in [
+            (Some(WireCleanup::Uncertain), true),
+            (Some(WireCleanup::Quiescent), false),
+            (None, false),
+        ] {
+            let failure = LaunchFailure::Acquire {
+                cause: AcquireCause::Transport,
+                launched: true,
+                cleanup,
+                forced,
+                journal_uncertain: false,
+                launch: None,
+            }
+            .route_failure(turn);
+            assert_eq!(failure.cause, RouteError::TransportLost { turn });
+            assert!(!failure.launched, "nothing of the turn was sent");
+            assert_eq!(failure.cleanup, cleanup);
+            assert_eq!(failure.forced, forced);
+        }
     }
 }

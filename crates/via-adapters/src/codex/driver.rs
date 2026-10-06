@@ -1046,7 +1046,15 @@ impl Turn<'_> {
                 // A server route's turn has no exit of its own (C2 §2).
                 exit: None,
                 launched: self.launched,
-                cleanup: loss.map_or(live, |loss| Some(loss.cleanup)),
+                // A turn that sent nothing has the no-launch evidence (C2
+                // §2): its server's loss cleanup is not its own, and an
+                // unlaunched failure's cleanup is only acquisition evidence
+                // (bead via-20s review #3).
+                cleanup: if self.launched {
+                    loss.map_or(live, |loss| Some(loss.cleanup))
+                } else {
+                    None
+                },
                 forced: false,
                 journal_uncertain,
                 acknowledged: false,
