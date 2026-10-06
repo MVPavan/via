@@ -988,15 +988,31 @@ struct Turn<'a> {
     instance: Option<InstanceReport>,
     /// The turn's first byte was handed to Wire (X0 item 1.6).
     launched: bool,
+    /// An earlier request of the turn (its `thread/start` or
+    /// `thread/resume`) was handed to Wire before the current one, and
+    /// answered: delivery evidence a later request proven unwritten never
+    /// erases (bead via-20s review #1).
+    delivered: bool,
     /// The settlement, which learns the same.
     settle: &'a Settle<'a>,
 }
 
 impl Turn<'_> {
-    /// A byte of the turn was handed to Wire.
+    /// A byte of the turn was handed to Wire: its current request's.
     fn launch(&mut self) {
+        self.delivered = self.launched;
         self.launched = true;
         self.settle.launched();
+    }
+
+    /// The turn's facts when its current request was proven unwritten:
+    /// launched only if an earlier request of it was delivered.
+    fn unsent(&self) -> Self {
+        Turn {
+            launched: self.delivered,
+            instance: self.instance.clone(),
+            ..*self
+        }
     }
 
     /// The turn's end with `cause`, latched in the health lane as C2 §2
@@ -1292,6 +1308,7 @@ async fn turn(
         number: turn,
         instance: None,
         launched: false,
+        delivered: false,
         settle,
     };
     let folder = match folder(&facts).await {
@@ -2139,14 +2156,7 @@ fn lost(facts: &Turn<'_>, connection: &Connection, cause: Unanswered) -> TurnEnd
         None => facts.failed(RouteError::TransportLost { turn }, None),
     };
     match cause {
-        Unanswered::NotWritten(SendOutcome::NotWritten) => {
-            let unsent = Turn {
-                launched: false,
-                instance: facts.instance.clone(),
-                ..*facts
-            };
-            ended(&unsent)
-        }
+        Unanswered::NotWritten(SendOutcome::NotWritten) => ended(&facts.unsent()),
         Unanswered::Lost | Unanswered::NotWritten(_) => ended(facts),
         // A stop's cleanup is uncertain: the written request may have
         // started work the vendor never reported, and early traffic of it
@@ -2179,12 +2189,7 @@ fn lost(facts: &Turn<'_>, connection: &Connection, cause: Unanswered) -> TurnEnd
             if launched {
                 facts.failure(cause, None, Some(WireCleanup::Uncertain))
             } else {
-                Turn {
-                    launched: false,
-                    instance: facts.instance.clone(),
-                    ..*facts
-                }
-                .failed(cause, None)
+                facts.unsent().failed(cause, None)
             }
         }
     }
