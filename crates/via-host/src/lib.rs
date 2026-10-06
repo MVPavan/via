@@ -66,12 +66,16 @@ impl EnvAllowList {
 /// The bounded cause of a Host or launch failure, carried to the turn it
 /// ended (bead via-23b): the step that failed and, for an operating-system
 /// error, its kind. It holds no vendor text.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LaunchCause {
     /// The failed step, such as `connect anchor socket`.
     pub step: &'static str,
     /// The operating-system error's kind, when the step failed with one.
     pub kind: Option<std::io::ErrorKind>,
+    /// VIA-owned text naming what refused the launch, for the turn's
+    /// failure message (a recorded predecessor's pid and start, or the
+    /// integrations holding credentials): never vendor text.
+    pub detail: Option<String>,
 }
 
 /// Type-erased capacity a caller hands Host with a launch (T2-D, runtime §8):

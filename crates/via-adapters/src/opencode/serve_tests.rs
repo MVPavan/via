@@ -651,12 +651,15 @@ async fn oc01_incompatible_handshakes_are_refused() {
     for (name, fixture, refusal) in cases {
         rig.fixture(&fixture);
         let error = rig.refused().await;
+        let detail = Some(refusal.to_string());
         assert_eq!(error.failure, LaunchFailure::Refused(refusal), "{name}");
+        // VIA's text names what the handshake showed (coordinator, chunk B
+        // decision 1).
         assert_eq!(
             cause(&error),
             RouteError::HandshakeRefused {
                 turn: turn(),
-                detail: None
+                detail
             },
             "{name}"
         );
@@ -691,7 +694,7 @@ async fn oc01_unchecked_version_is_refused_before_publication() {
         cause(&error),
         RouteError::HandshakeRefused {
             turn: turn(),
-            detail: None
+            detail: Some(text)
         }
     );
     assert_eq!(rig.targets(), ["/api/info"]);
@@ -888,12 +891,17 @@ async fn oc01_version_check_refuses_before_launch() {
         output: "opencode v2.0.23".to_owned(),
         checked: CHECKED,
     };
+    let detail = refusal.to_string();
+    assert!(
+        detail.contains("opencode v2.0.23") && detail.contains("2.0.22"),
+        "{detail}"
+    );
     assert_eq!(error.failure, LaunchFailure::Refused(refusal));
     assert_eq!(
         cause(&error),
         RouteError::HandshakeRefused {
             turn: turn(),
-            detail: None
+            detail: Some(detail)
         }
     );
     assert!(rig.reports().is_empty(), "nothing launched");

@@ -306,9 +306,7 @@ fn record(entries: &[Entry], settings: &BTreeMap<String, Value>) -> Vec<u8> {
 }
 
 /// The daemon's uid.
-pub(crate) fn daemon_uid() -> u32 {
-    rustix::process::getuid().as_raw()
-}
+pub(crate) use crate::private_dir::daemon_uid;
 
 #[cfg(test)]
 mod tests {

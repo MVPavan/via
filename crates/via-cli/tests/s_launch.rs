@@ -547,14 +547,9 @@ struct LaunchRow {
 /// refuses `describe` with `harness_unavailable` and lists no models. Each
 /// adapter track flips its own row: Claude (x.3.2 C1) plans from its
 /// bundled catalog; Codex (x.3.2 X1) plans a named model, and lists none
-/// before discovery, since it has no bundled catalog.
+/// before discovery, since it has no bundled catalog; so does `OpenCode`
+/// (via-4sw.3.2, packet §6), whose catalog is its live server's.
 fn launch_rows() -> [LaunchRow; 3] {
-    let row = |harness| LaunchRow {
-        harness,
-        model: None,
-        refused: Some("harness_unavailable"),
-        models: json!([]),
-    };
     let bundled = |model| json!({"model":model,"harness":"claude","aliases":[],"source":"bundled"});
     [
         LaunchRow {
@@ -569,7 +564,12 @@ fn launch_rows() -> [LaunchRow; 3] {
             refused: None,
             models: json!([]),
         },
-        row("opencode"),
+        LaunchRow {
+            harness: "opencode",
+            model: Some("opencode/big-pickle"),
+            refused: None,
+            models: json!([]),
+        },
     ]
 }
 

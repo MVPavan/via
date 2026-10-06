@@ -499,7 +499,7 @@ Start from an empty environment:
 
 | Keys | Value |
 |---|---|
-| `PATH` | reviewed explicit value |
+| `PATH` | the daemon's `PATH`, forwarded as Codex's recipe forwards it (coordinator, 2026-10-06); absent when the daemon has none |
 | `LANG` | fixed `C.UTF-8` |
 | `HOME`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`, `XDG_RUNTIME_DIR`, `TMPDIR` | the namespace's private directories (§3.2) |
 | `OPENCODE_CONFIG_CONTENT` | the generated configuration (§4.2) |

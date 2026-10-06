@@ -6,7 +6,7 @@
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -199,21 +199,9 @@ pub(crate) fn argv(recipe: &Recipe<'_>) -> Vec<OsString> {
     args
 }
 
-/// Why VIA's own Pi state is not used (picrit #1, runtime §6.1).
-#[derive(Debug)]
-pub(super) enum Unsafe {
-    /// A managed directory is not private: VIA's text naming it and the
-    /// rule, never a value.
-    Refused(String),
-    /// The state could not be read or written.
-    Io,
-}
-
-impl From<std::io::Error> for Unsafe {
-    fn from(_: std::io::Error) -> Self {
-        Self::Io
-    }
-}
+/// Why VIA's own Pi state is not used (picrit #1, runtime §6.1): the
+/// shared managed-directory refusal.
+pub(super) use crate::private_dir::Unsafe;
 
 /// The managed directory `vendor_state_dir/<parts>` (runtime §6.1, as the
 /// daemon's `vendor/`): every directory from `vendor_state_dir` down is
@@ -221,49 +209,7 @@ impl From<std::io::Error> for Unsafe {
 /// the daemon's user, mode 0700. One that exists is never chmod-ed; any
 /// other is the named refusal, before anything is written under it.
 pub(super) fn managed(vendor_state_dir: &Path, parts: &[&str]) -> Result<PathBuf, Unsafe> {
-    let uid = super::profile::daemon_uid();
-    let mut path = vendor_state_dir.to_path_buf();
-    let mut name = String::from("vendor");
-    private_dir(&path, &name, uid)?;
-    for part in parts {
-        path.push(part);
-        name.push('/');
-        name.push_str(part);
-        private_dir(&path, &name, uid)?;
-    }
-    Ok(path)
-}
-
-/// One managed directory `path`, named `name` in a refusal.
-fn private_dir(path: &Path, name: &str, uid: u32) -> Result<(), Unsafe> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match std::fs::DirBuilder::new().mode(0o700).create(path) {
-                Ok(()) => {}
-                // Created meanwhile: judged as found.
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error.into()),
-            }
-            std::fs::symlink_metadata(path)?
-        }
-        Err(error) => return Err(error.into()),
-    };
-    let why = if metadata.file_type().is_symlink() {
-        "is a symlink".to_owned()
-    } else if !metadata.is_dir() {
-        "is not a directory".to_owned()
-    } else if metadata.uid() != uid {
-        "is not owned by the daemon's user".to_owned()
-    } else if metadata.mode() & 0o777 != 0o700 {
-        format!("has mode {:04o}, not 0700", metadata.mode() & 0o777)
-    } else {
-        return Ok(());
-    };
-    Err(Unsafe::Refused(format!(
-        "VIA's Pi state directory {name} {why}"
-    )))
+    crate::private_dir::managed(vendor_state_dir, parts, "Pi")
 }
 
 /// Packet §4.4: the session's directory (0700), and its frozen

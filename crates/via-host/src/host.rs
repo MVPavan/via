@@ -563,7 +563,11 @@ impl HostError {
             | Self::Stopped
             | Self::LinksUnread => return None,
         };
-        Some(crate::LaunchCause { step, kind })
+        Some(crate::LaunchCause {
+            step,
+            kind,
+            detail: None,
+        })
     }
 
     /// A launch step's failure with its operating-system error.

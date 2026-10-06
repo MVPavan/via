@@ -17,7 +17,8 @@
 //! - Each request is checked against `opencode:<password>` Basic
 //!   authentication (401 otherwise, or always with `"auth": "reject"`),
 //!   logged as one line of `<name>.requests` (pid, method, target, auth
-//!   `ok`, `bad` or `none`; never a credential) before it is answered, and
+//!   `ok`, `bad` or `none`, and its JSON body, else `null`; never a
+//!   credential) before it is answered, and
 //!   answered by the first route whose method and path match: its
 //!   responses in order, the last repeated. JSON bodies have `"$PID"`
 //!   replaced by the process ID. A route with `sse` answers an event
@@ -371,7 +372,8 @@ fn serve(shared: &Shared, stream: TcpStream) -> Result<(), Box<dyn std::error::E
     };
     append(
         &shared.requests,
-        &json!({"pid": process::id(), "method": method, "target": target, "auth": auth}),
+        &json!({"pid": process::id(), "method": method, "target": target, "auth": auth,
+            "body": serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null)}),
     )?;
     let mut stream = stream;
     if auth != "ok" || matches!(shared.fixture.auth, Auth::Reject) {

@@ -2318,7 +2318,7 @@ impl Engine {
             && let Err(AdapterError::Route(failure)) = &finished.1
             && let Some(cause) = failure.launch.as_deref()
         {
-            self.own_warning(record, launch_warning(*cause)).await;
+            self.own_warning(record, launch_warning(cause)).await;
         }
         let (cause, journal_uncertain) = driven.store_facts();
         self.route_failed(slot, record, cause, journal_uncertain)
@@ -3369,7 +3369,7 @@ fn denial_body(denial: &Denial) -> EventBody {
 /// (bead via-23b, C1 §6.1): the failed step and the operating-system
 /// error's kind, never vendor text. Not one of the envelope's codes, it is
 /// a durable event only.
-fn launch_warning(cause: via_adapters::LaunchCause) -> via_adapters::Warning {
+fn launch_warning(cause: &via_adapters::LaunchCause) -> via_adapters::Warning {
     let (message, data) = match cause.kind {
         Some(kind) => (
             format!("{} failed: {kind}", cause.step),

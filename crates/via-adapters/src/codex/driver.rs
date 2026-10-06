@@ -1883,7 +1883,7 @@ fn launch_failed(facts: &mut Turn<'_>, failure: &LaunchError) -> TurnEnd {
     if let Some(user_agent) = &failure.user_agent {
         facts.instance = Some(instance_report(user_agent));
     }
-    let failure = failure.failure.route_failure(facts.number);
+    let failure = failure.failure.clone().route_failure(facts.number);
     if let Some(cause) = health_cause(&failure.cause) {
         facts.driver.fail(cause);
     }

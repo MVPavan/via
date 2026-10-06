@@ -7,6 +7,7 @@ mod handshake;
 mod launch;
 mod server;
 mod servers;
+pub mod session;
 
 pub use handshake::{CatalogModel, Refusal, URL_LINE_BYTES};
 pub use launch::ACQUISITION;

@@ -155,7 +155,13 @@ impl LaunchFailure {
     /// it was sent, so a `TransportLost` here is `submit_failed` with
     /// `launch_failed` (C1 §7.6), a refusal `handshake_refused`.
     pub fn route_failure(self, turn: TurnNumber) -> RouteFailure {
-        let step = |step| Some(LaunchCause { step, kind: None });
+        let step = |step| {
+            Some(LaunchCause {
+                step,
+                kind: None,
+                detail: None,
+            })
+        };
         let (cause, (cleanup, forced), journal_uncertain, launch) = match self {
             Self::Acquire {
                 cause,
@@ -174,9 +180,12 @@ impl LaunchFailure {
                 journal_uncertain,
                 launch,
             ),
-            // Detail text for a refused handshake reaches C1 in chunk B.
-            Self::Refused(_) => (
-                RouteError::HandshakeRefused { turn, detail: None },
+            // VIA's text, naming the version found and the checked set.
+            Self::Refused(refusal) => (
+                RouteError::HandshakeRefused {
+                    turn,
+                    detail: Some(refusal.to_string()),
+                },
                 NONE,
                 false,
                 None,
@@ -193,11 +202,15 @@ impl LaunchFailure {
             Self::Transient { step: name } => {
                 (RouteError::TransportLost { turn }, NONE, false, step(name))
             }
-            Self::Credential { .. } => (
+            Self::Credential { integrations } => (
                 RouteError::TransportLost { turn },
                 NONE,
                 false,
-                step("check credential state"),
+                Some(LaunchCause {
+                    step: "check credential state",
+                    kind: None,
+                    detail: Some(credential_detail(&integrations)),
+                }),
             ),
             Self::Deadline | Self::Internal => {
                 (RouteError::TransportLost { turn }, NONE, false, None)
@@ -663,6 +676,20 @@ impl Servers {
         }
     }
 
+    /// The facts of `key`'s live server, if it is live: a pure read (§6
+    /// `models`), taking no hold.
+    pub fn live_facts(&self, key: &ServerKey) -> Option<Arc<ServerFacts>> {
+        let registry = self.registry();
+        let server = registry.by_key.get(key)?;
+        match &registry.servers.get(server)?.entry {
+            Entry::Live { facts, server, .. } if server.usable() => Some(Arc::clone(facts)),
+            Entry::Live { .. }
+            | Entry::Launching { .. }
+            | Entry::Retiring { .. }
+            | Entry::Lost { .. } => None,
+        }
+    }
+
     /// C2 §3 `prepare`: a pin on the live or launching server of `key`,
     /// else `None` (the turn needs a harness-process slot).
     pub fn pin(&self, key: &ServerKey) -> Option<ServerPin> {
@@ -740,6 +767,7 @@ impl Servers {
             launch: Some(LaunchCause {
                 step: "mint a server id",
                 kind: None,
+                detail: None,
             }),
         })?;
         launch.spec.owner = ProcessOwner::Server {
@@ -1240,6 +1268,57 @@ async fn stop(stdio: WireSender) -> Outcome {
     Outcome::Stopped(report.vendor_exit)
 }
 
+/// The most integration IDs a credential refusal names.
+const NAMED_INTEGRATIONS: usize = 16;
+
+/// §4.3 `unexpected_credential_state`: VIA's text naming only the
+/// integrations that hold a connection, at most [`NAMED_INTEGRATIONS`].
+fn credential_detail(integrations: &[String]) -> String {
+    let named = integrations
+        .iter()
+        .take(NAMED_INTEGRATIONS)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = integrations.len().saturating_sub(NAMED_INTEGRATIONS);
+    let more = if more > 0 {
+        format!(" and {more} more")
+    } else {
+        String::new()
+    };
+    format!(
+        "unexpected_credential_state: VIA's OpenCode data holds connections for \
+         integrations {named}{more}"
+    )
+}
+
+/// §3.2: a predecessor refusal's detail, Host's text (the recorded pid and
+/// its UTC start, or the other namespace) with its manual recovery; none
+/// for any other fence refusal, whose step names it.
+fn predecessor_detail(refusal: &via_wire::FenceRefusal) -> Option<String> {
+    use via_wire::FenceRefusal;
+    match refusal {
+        FenceRefusal::PredecessorAlive { pid, .. } => Some(format!(
+            "{refusal}; before stopping it, check that it is VIA's OpenCode server: \
+             `TZ=UTC ps -o lstart= -p {pid}` shows that start and \
+             `ls -l /proc/{pid}/cwd` VIA's OpenCode namespace"
+        )),
+        FenceRefusal::PredecessorUncertain { .. } => Some(format!(
+            "{refusal}; stop the other VIA that uses this state directory, then, with no \
+             OpenCode server of either VIA running, remove server.lock by hand"
+        )),
+        FenceRefusal::PrivilegedVia
+        | FenceRefusal::ProgramPrivileged
+        | FenceRefusal::ProgramUnchecked { .. }
+        | FenceRefusal::ProbeRefused { .. }
+        | FenceRefusal::ProbeFailed { .. }
+        | FenceRefusal::LockUnavailable { .. }
+        | FenceRefusal::LockHeld
+        | FenceRefusal::RecordUnreadable { .. }
+        | FenceRefusal::FenceRecordFailed => None,
+    }
+}
+
 /// Host's acquisition failure as a launch failure; the version check's
 /// refusal is the one demonstrated incompatibility among them.
 pub(crate) fn acquire_failure(
@@ -1277,7 +1356,10 @@ pub(crate) fn acquire_failure(
             checked,
         });
     }
-    let launch = cause.launch_cause();
+    let mut launch = cause.launch_cause();
+    if let (Some(launch), WireError::Host(HostError::Fence(refusal))) = (launch.as_mut(), cause) {
+        launch.detail = predecessor_detail(refusal);
+    }
     let cause = match cause {
         WireError::Evidence(_) | WireError::Host(HostError::Evidence(_)) => {
             AcquireCause::Store(StoreFailure::Evidence)
@@ -1305,5 +1387,61 @@ pub(crate) fn acquire_failure(
         forced,
         journal_uncertain,
         launch,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LaunchFailure, credential_detail, predecessor_detail};
+    use crate::TurnNumber;
+    use via_wire::FenceRefusal;
+
+    /// §4.3: the detail names integration IDs only, at most sixteen, and
+    /// reaches the failure's text through `RouteFailure`'s display.
+    #[test]
+    fn credential_detail_names_bounded_integration_ids() {
+        let two = vec!["acme-cloud".to_owned(), "other".to_owned()];
+        let detail = credential_detail(&two);
+        assert!(
+            detail.starts_with("unexpected_credential_state: "),
+            "{detail}"
+        );
+        assert!(
+            detail.ends_with("integrations acme-cloud, other"),
+            "{detail}"
+        );
+        let many: Vec<String> = (0..20).map(|index| format!("i{index}")).collect();
+        let detail = credential_detail(&many);
+        assert!(detail.contains("i15 and 4 more"), "{detail}");
+        assert!(!detail.contains("i16"), "{detail}");
+        let turn = TurnNumber::try_from(1).unwrap_or_else(|_| unreachable!());
+        let failure = LaunchFailure::Credential { integrations: two }.route_failure(turn);
+        let text = failure.to_string();
+        assert!(text.contains("acme-cloud, other"), "{text}");
+    }
+
+    /// §3.2: a predecessor refusal carries Host's text and its manual
+    /// recovery; any other fence refusal has none (its step names it).
+    #[test]
+    fn predecessor_detail_gives_the_recovery() {
+        let alive = FenceRefusal::PredecessorAlive {
+            pid: 4242,
+            start_ticks: 100,
+        };
+        let detail = predecessor_detail(&alive).unwrap_or_default();
+        assert!(detail.starts_with(&alive.to_string()), "{detail}");
+        assert!(
+            detail.contains("TZ=UTC ps -o lstart= -p 4242") && detail.contains("/proc/4242/cwd"),
+            "{detail}"
+        );
+        let uncertain = FenceRefusal::PredecessorUncertain {
+            namespace: "pid:[1]".to_owned(),
+        };
+        let detail = predecessor_detail(&uncertain).unwrap_or_default();
+        assert!(
+            detail.contains("pid:[1]") && detail.contains("remove server.lock by hand"),
+            "{detail}"
+        );
+        assert_eq!(predecessor_detail(&FenceRefusal::LockHeld), None);
     }
 }

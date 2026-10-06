@@ -191,18 +191,10 @@ mod fake;
 mod harness;
 mod instance;
 pub mod observation;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into AdapterSet with the driver, chunk B")
-)]
 mod opencode;
 mod passthrough;
 mod pi;
 mod plan;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the OpenCode adapter, wired in chunk B")
-)]
 mod private_dir;
 mod runtime;
 mod set;

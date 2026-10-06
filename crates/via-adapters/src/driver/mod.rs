@@ -18,6 +18,7 @@ use crate::fake::FakeAdapter;
 use crate::observation::{
     AdapterError, ObservationSink, SteerDelivery, SteerToken, TurnEnd, TurnEvidence,
 };
+use crate::opencode::OpenCodeSession;
 use crate::pi::PiAdapter;
 use crate::plan::{Bound, InheritPlan, VendorOptions};
 use crate::{
@@ -100,6 +101,8 @@ pub struct ConnectionPin {
     generation: u64,
     /// A shared route's hold on the pinned server (x.3.2 X0 item 2.2).
     pub(crate) server: Option<via_routes::codex::ServerPin>,
+    /// `opencode-serve`'s hold on its pinned server.
+    pub(crate) opencode: Option<via_routes::opencode::ServerPin>,
 }
 
 /// `prepare`'s answer (AD16).
@@ -438,6 +441,9 @@ pub(crate) enum DriverKind {
     Codex(Arc<CodexSession>),
     /// Pi: one private `pi --mode rpc` process per turn.
     Pi(Arc<PiAdapter>),
+    /// `OpenCode`: turns on the one shared `opencode serve` the session
+    /// leases.
+    OpenCode(Arc<OpenCodeSession>),
 }
 
 impl DriverKind {
@@ -445,7 +451,7 @@ impl DriverKind {
     fn persistent(&self) -> bool {
         match self {
             Self::Fake(fake) => fake.profile().persistent,
-            Self::Claude(_) | Self::Codex(_) | Self::Pi(_) => false,
+            Self::Claude(_) | Self::Codex(_) | Self::Pi(_) | Self::OpenCode(_) => false,
         }
     }
 
@@ -456,6 +462,7 @@ impl DriverKind {
             Self::Claude(_) => crate::claude::adapter_version(),
             Self::Codex(_) => crate::codex::adapter_version(),
             Self::Pi(_) => crate::pi::adapter_version(),
+            Self::OpenCode(_) => crate::opencode::adapter_version(),
         }
     }
 
@@ -464,7 +471,7 @@ impl DriverKind {
     fn steer(&self) -> Option<&Support> {
         match self {
             Self::Fake(fake) => Some(&fake.profile().capabilities.verbs.steer),
-            Self::Claude(_) | Self::Codex(_) | Self::Pi(_) => None,
+            Self::Claude(_) | Self::Codex(_) | Self::Pi(_) | Self::OpenCode(_) => None,
         }
     }
 
@@ -476,7 +483,7 @@ impl DriverKind {
                 .profile()
                 .steer_refusal
                 .map(|refusal| refusal.error(delivery)),
-            Self::Claude(_) | Self::Codex(_) | Self::Pi(_) => None,
+            Self::Claude(_) | Self::Codex(_) | Self::Pi(_) | Self::OpenCode(_) => None,
         }
     }
 
@@ -487,6 +494,7 @@ impl DriverKind {
             Self::Claude(_) => crate::claude::connection_id(generation),
             Self::Codex(_) => crate::codex::connection_id(generation),
             Self::Pi(_) => crate::pi::connection_id(generation),
+            Self::OpenCode(_) => crate::opencode::connection_id(generation),
         }
     }
 }
@@ -529,9 +537,13 @@ impl SessionDriver {
             #[cfg(feature = "test-failpoints")]
             retirement_fault: match &kind {
                 Some(DriverKind::Fake(fake)) => fake.retirement_fault.clone(),
-                Some(DriverKind::Claude(_) | DriverKind::Codex(_) | DriverKind::Pi(_)) | None => {
-                    None
-                }
+                Some(
+                    DriverKind::Claude(_)
+                    | DriverKind::Codex(_)
+                    | DriverKind::Pi(_)
+                    | DriverKind::OpenCode(_),
+                )
+                | None => None,
             },
             ..DriverState::default()
         };
@@ -618,7 +630,20 @@ impl SessionDriver {
             return Prepared::Pinned(ConnectionPin {
                 generation: state.generation,
                 server: None,
+                opencode: None,
             });
+        }
+        if let Some(DriverKind::OpenCode(opencode)) = &self.kind {
+            let generation = state.generation;
+            drop(state);
+            return match opencode.prepare() {
+                Some(server) => Prepared::Pinned(ConnectionPin {
+                    generation,
+                    server: None,
+                    opencode: Some(server),
+                }),
+                None => Prepared::NeedsConnection,
+            };
         }
         if let Some(DriverKind::Codex(codex)) = &self.kind {
             let generation = state.generation;
@@ -627,6 +652,7 @@ impl SessionDriver {
                 Some(server) => Prepared::Pinned(ConnectionPin {
                     generation,
                     server: Some(server),
+                    opencode: None,
                 }),
                 None => Prepared::NeedsConnection,
             };
@@ -635,6 +661,7 @@ impl SessionDriver {
             Prepared::Pinned(ConnectionPin {
                 generation: state.generation,
                 server: None,
+                opencode: None,
             })
         } else {
             Prepared::NeedsConnection
@@ -653,12 +680,13 @@ impl SessionDriver {
         }
         match &self.kind {
             Some(DriverKind::Codex(codex)) => Some(codex.readiness()),
+            Some(DriverKind::OpenCode(opencode)) => Some(opencode.readiness()),
             Some(DriverKind::Fake(_) | DriverKind::Claude(_) | DriverKind::Pi(_)) | None => None,
         }
     }
 
     /// How the driver's connections are owned (C2 §2): `Shared` on the
-    /// Codex route, `PerTurn` on the fake and Claude routes.
+    /// Codex and `OpenCode` routes, `PerTurn` on the others.
     pub fn connection_kind(&self) -> ConnectionKind {
         #[cfg(feature = "test-failpoints")]
         if self
@@ -669,7 +697,7 @@ impl SessionDriver {
             return ConnectionKind::Shared;
         }
         match &self.kind {
-            Some(DriverKind::Codex(_)) => ConnectionKind::Shared,
+            Some(DriverKind::Codex(_) | DriverKind::OpenCode(_)) => ConnectionKind::Shared,
             Some(DriverKind::Fake(_) | DriverKind::Claude(_) | DriverKind::Pi(_)) | None => {
                 ConnectionKind::PerTurn
             }
@@ -694,6 +722,10 @@ impl SessionDriver {
             Some(DriverKind::Pi(pi)) => {
                 let pi = Arc::clone(pi);
                 crate::pi::run_turn(self, &pi, spec, cx).await
+            }
+            Some(DriverKind::OpenCode(opencode)) => {
+                let opencode = Arc::clone(opencode);
+                crate::opencode::run_turn(self, &opencode, spec, cx).await
             }
             None => rejected(AdapterError::Unavailable),
         }
@@ -908,7 +940,23 @@ impl SessionDriver {
         let cancel = self.cancel.clone();
         let codex = match &self.kind {
             Some(DriverKind::Codex(codex)) => Some(Arc::clone(codex)),
-            Some(DriverKind::Fake(_) | DriverKind::Claude(_) | DriverKind::Pi(_)) | None => None,
+            Some(
+                DriverKind::Fake(_)
+                | DriverKind::Claude(_)
+                | DriverKind::Pi(_)
+                | DriverKind::OpenCode(_),
+            )
+            | None => None,
+        };
+        let opencode = match &self.kind {
+            Some(DriverKind::OpenCode(opencode)) => Some(Arc::clone(opencode)),
+            Some(
+                DriverKind::Fake(_)
+                | DriverKind::Claude(_)
+                | DriverKind::Codex(_)
+                | DriverKind::Pi(_),
+            )
+            | None => None,
         };
         async move {
             // The session closes and the stop order is posted together.
@@ -958,6 +1006,10 @@ impl SessionDriver {
             // releases its lease (vendors/codex.md §2).
             if let Some(codex) = codex {
                 codex.detach(deadline).await;
+            }
+            // `opencode-serve`'s close makes no vendor call (packet §6).
+            if let Some(opencode) = opencode {
+                opencode.detach();
             }
             // The driver's own idle work ends with the session.
             cancel.cancel();

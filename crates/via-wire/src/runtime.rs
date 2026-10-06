@@ -276,10 +276,12 @@ impl WireError {
             Self::Evidence(error) => Some(via_host::LaunchCause {
                 step: "create the evidence folder",
                 kind: Some(error.kind()),
+                detail: None,
             }),
             Self::Io(error) => Some(via_host::LaunchCause {
                 step: "vendor pipe",
                 kind: Some(error.kind()),
+                detail: None,
             }),
             Self::Acquire { cause, .. } => cause.launch_cause(),
             Self::Deadline | Self::Cancelled | Self::Woken | Self::Message(_) => None,

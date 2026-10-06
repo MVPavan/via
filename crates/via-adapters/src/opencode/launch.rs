@@ -296,7 +296,7 @@ impl ServerRecipe {
 }
 
 /// SHA-256 over the fields `fill` writes, each length-prefixed.
-fn digest(fill: impl FnOnce(&mut dyn FnMut(&[u8]))) -> [u8; 32] {
+pub(super) fn digest(fill: impl FnOnce(&mut dyn FnMut(&[u8]))) -> [u8; 32] {
     let mut hasher = Sha256::new();
     fill(&mut |bytes: &[u8]| {
         hasher.update((bytes.len() as u64).to_le_bytes());
@@ -306,7 +306,7 @@ fn digest(fill: impl FnOnce(&mut dyn FnMut(&[u8]))) -> [u8; 32] {
 }
 
 /// `bytes` in lowercase hex.
-fn hex(bytes: &[u8]) -> String {
+pub(super) fn hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     bytes
         .iter()

@@ -195,7 +195,11 @@ pub type StopSources = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
 /// after its forced cleanup and bounded drain, and the two facts Core's stop
 /// outcome needs (AD4 Core handoff).
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
-#[error("{cause}{}", undecoded_note(.undecoded.as_deref()))]
+#[error(
+    "{cause}{}{}",
+    launch_note(.launch.as_deref()),
+    undecoded_note(.undecoded.as_deref())
+)]
 #[expect(
     clippy::struct_excessive_bools,
     reason = "each flag is a distinct, independent fact of the evidence"
@@ -229,6 +233,14 @@ pub struct RouteFailure {
     /// via-23b), which Core records as the turn's `launch_failed` warning.
     /// Boxed: it is rare, and keeps the failure small.
     pub launch: Option<Box<LaunchCause>>,
+}
+
+/// `: <detail>` when a launch failure carries VIA's detail, else nothing.
+fn launch_note(launch: Option<&LaunchCause>) -> String {
+    launch
+        .and_then(|launch| launch.detail.as_deref())
+        .map(|detail| format!(": {detail}"))
+        .unwrap_or_default()
 }
 
 /// `; <note>` when an undecoded message was kept, else nothing.
