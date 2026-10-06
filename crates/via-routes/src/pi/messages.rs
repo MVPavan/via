@@ -182,8 +182,8 @@ pub struct Response {
 pub struct StateData {
     /// `sessionId`.
     pub session_id: String,
-    /// `sessionFile`, when Pi names one.
-    pub session_file: Option<String>,
+    /// `sessionFile` (≤ 4 KiB).
+    pub session_file: String,
     /// `model.provider`.
     pub provider: String,
     /// `model.id`.
@@ -451,11 +451,11 @@ fn tool(object: &Map<String, Value>) -> Result<(String, String), DecodeError> {
 #[must_use]
 pub(super) fn state_data(data: &Map<String, Value>) -> Option<StateData> {
     let model = data.get("model")?;
-    let session_file = match data.get("sessionFile") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(file)) if file.len() <= 4096 => Some(file.clone()),
-        Some(_) => return None,
-    };
+    let session_file = data
+        .get("sessionFile")?
+        .as_str()
+        .filter(|file| file.len() <= 4096)?
+        .to_owned();
     Some(StateData {
         session_id: short_member(data, "sessionId")?,
         session_file,
@@ -648,6 +648,27 @@ mod tests {
             ),
             Err(DecodeError::Malformed(_))
         ));
+    }
+
+    /// Packet §5.1: `get_state.data` requires every member VIA checks,
+    /// `sessionFile` included (review r1 minor: an absent one passed).
+    #[test]
+    fn state_data_requires_session_file() {
+        let full = json!({"sessionId": "s", "sessionFile": "f.jsonl",
+            "model": {"provider": "p", "id": "m"}, "thinkingLevel": "off"});
+        let data = |value: &Value| value.as_object().cloned().unwrap();
+        let state = state_data(&data(&full)).unwrap();
+        assert_eq!(state.session_file, "f.jsonl");
+        for member in ["sessionId", "sessionFile", "model", "thinkingLevel"] {
+            let mut missing = full.clone();
+            missing.as_object_mut().unwrap().remove(member);
+            assert!(state_data(&data(&missing)).is_none(), "{member} absent");
+        }
+        for wrong in [Value::Null, json!(1), json!("f".repeat(4097))] {
+            let mut malformed = full.clone();
+            malformed["sessionFile"] = wrong;
+            assert!(state_data(&data(&malformed)).is_none(), "{malformed}");
+        }
     }
 
     /// The prompt line is one JSON object whatever the prompt holds.

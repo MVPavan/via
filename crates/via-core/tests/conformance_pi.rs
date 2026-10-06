@@ -1489,8 +1489,8 @@ fn terminated() -> Vec<Value> {
 }
 
 /// `pi_protocol_typed` (packet §5.1): a reply with another `command` for a
-/// known `id`, a duplicate reply, a reply missing required fields, a
-/// `parse` reply, `handled`/`queued` dispositions, a lifecycle or message
+/// known `id`, a duplicate reply, a reply missing required fields (a
+/// `get_state` without `sessionFile` among them), a `parse` reply, `handled`/`queued` dispositions, a lifecycle or message
 /// record before `started`, an assistant `message_end` without `content`
 /// or `usage` or with a non-numeric usage member, `agent_settled` with no
 /// assistant terminal and a second `agent_settled`: every one is
@@ -1540,6 +1540,16 @@ fn pi_protocol_typed() {
             "get_state",
             &json!({"model": {"provider": "openai", "id": "gpt-6-luna"}, "thinkingLevel": "off"}),
         ))],
+    );
+    // §5.1: `sessionFile` is required (review r1 minor).
+    let mut no_session_file = good_state.clone();
+    no_session_file
+        .as_object_mut()
+        .unwrap()
+        .remove("sessionFile");
+    pre(
+        "pi_protocol_missing_session_file",
+        vec![emit_line(&state_reply("get_state", &no_session_file))],
     );
     pre(
         "pi_protocol_parse_reply",

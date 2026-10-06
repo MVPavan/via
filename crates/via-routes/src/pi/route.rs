@@ -59,7 +59,7 @@ const FIRE_AND_FORGET: [&str; 5] = [
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HandshakeFacts {
     /// `get_state.sessionFile`, unresolved.
-    pub session_file: Option<String>,
+    pub session_file: String,
     /// `get_state.thinkingLevel`.
     pub thinking_level: String,
     /// The `skill:*` names `get_commands` listed.

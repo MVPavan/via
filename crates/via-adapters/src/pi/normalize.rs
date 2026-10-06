@@ -264,7 +264,7 @@ fn bounded(text: &str, max: usize) -> String {
 /// Packet §5.4: `sessionFile`, resolved against the cwd, when it lies
 /// inside this session's directory and within 4 KiB.
 fn transcript(facts: &HandshakeFacts, launch: &LaunchFacts) -> Option<PathBuf> {
-    let file = launch.cwd.join(facts.session_file.as_deref()?);
+    let file = launch.cwd.join(&facts.session_file);
     let plain = file
         .components()
         .all(|part| matches!(part, Component::RootDir | Component::Normal(_)));
