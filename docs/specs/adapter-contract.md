@@ -724,8 +724,8 @@ default.
     vendor codes only.
   - After Claude's prompt line, it fails `protocol` with no resend.
 - **Refusal cache.** Only a demonstrated incompatibility is cached: a
-  relied-on feature absent from the handshake, or a readback that differs from
-  the value VIA sent. The key is the resolved program path and its file
+  relied-on feature absent from the handshake, a readback that differs from
+  the value VIA sent, or (OpenCode) an unchecked version. The key is the resolved program path and its file
   identity (device, inode, size, mtime, ctime) plus the route's recipe
   digest (launch arguments, category switches, bound and
   policy inputs), so a binary replaced at the path does not inherit the
@@ -751,7 +751,15 @@ default.
   hooks and plugins); complete cleanup; bound enforcement semantics, including
   Codex read-only (qualified live by `via-5lr.3.4`, not by the handshake); unchanged usage or terminal
   semantics.
-- Proceeding on unchecked versions is the owner's accepted risk. The warning
+- **Exception: OpenCode runs only checked versions** (owner, 2026-10-06).
+  An `/api/info.version` outside the OpenCode adapter's `checked` set is
+  refused at the handshake before the server is published, even when every
+  other check passes: `handshake_refused`, cached by this refusal cache's
+  key, with a message naming the version and the checked set. The
+  one-server fence depends on the server keeping an inherited lock
+  descriptor, which only per-version qualification shows
+  (`vendors/opencode.md` §3.2, §12, L13).
+- Proceeding on unchecked versions (other routes) is the owner's accepted risk. The warning
   stays visible in every receipt, status and envelope of such a turn.
   `allow_untested` is accepted and stored for C1 compatibility but has no
   effect; it never waives unsupported bounds, protocol/identity checks,
@@ -783,7 +791,8 @@ fake agent reports no version".
 - Once a live instance's catalog is cached, `check_turn` applies it. The route
   judges `effort` against the advertised efforts of `TurnParams.model` in the
   catalog discovered by the live instance for the session's server key
-  (derived from `TurnParams.inherit`), so later turns get the pre-receipt
+  (derived from `TurnParams.inherit`; OpenCode: the session's location
+  catalog, `vendors/opencode.md` §5), so later turns get the pre-receipt
   `invalid_params`. With no cached catalog for that key, or a model it does
   not list, the value passes to `run_turn`'s check.
 
@@ -907,7 +916,9 @@ groups (bwrap `--new-session`) to a thread is unverified (P2b), so per-tool
 kill is not offered.
 OpenCode's launch key, namespace, environment and credential check are in
 `vendors/opencode.md` §§3–4. Do not discover, copy or mount caller saved
-auth or inject a provider key; no login-backed profile or paid fallback. For
+auth or inject a provider key; VIA configures no login-backed profile or
+paid fallback, but a project's own provider configuration applies, and VIA
+never keeps its secrets (owner, 2026-10-06; `vendors/opencode.md` §4.3). For
 pinned OpenCode 2.0.22, describe declares `params.max_steps` unsupported
 with reason `No per-turn step limit on opencode-serve 2.0.22`; Core refuses
 any non-null value before server acquisition or vendor I/O. Output schema is

@@ -74,7 +74,7 @@ decided in the slice that needs them, after re-probing.
 | P10 | Socket `$XDG_RUNTIME_DIR/via/via.sock` else `~/.via/run/via.sock`; 0700/0600; peer uid check both ends | as written |
 | P11 | Codex owned stdio server key is `config_hash` without bound; `config_hash` covers VIA-controlled launch settings (resolved program path, arguments, passed environment, server cwd, protocol pin), not credentials or binary contents; the observed binary version is reported, not keyed. Every turn sets `sandboxPolicy`; mixed-bound sharing is qualified (`via-5lr.3.4`). OpenCode uses one owned shared `opencode serve --stdio` for all of VIA (owner, 2026-10-06): one private namespace in the first release (anonymous profile identity and epoch; project configuration always on, so a request to turn a project-controlled category off is `unknown` with `config_switch_unverified`, never a second server); its launch key is the namespace plus a hash of VIA-controlled launch settings, never credentials or binary contents; the observed version is reported, not keyed; the bound is not keyed (only `full` with `network:true` is admitted). At most one live OpenCode server, fenced across restarts by an exclusive kernel lock on its data root that the server's anchor takes and the server inherits. Closing a session detaches it. Bound-keyed routes refuse bound changes on resume | as reviewed in `docs/specs/vendors/codex.md` §9 and `docs/specs/vendors/opencode.md` §3 |
 | P12 | Live recovery after daemon restart is `unknown` for every route in v1; `resumed` only when a route's rejoin is probe-verified on the configured transport (Codex stdio server dies with the daemon, P3) | as written |
-| P13 | Version rule: every vendor version is supported; refused only on demonstrated handshake breakage; `untested` warns until the maintainers' check (owner OD1, 2026-09-30, superseding the 2026-09-26 P13 approval) | decided; C2 §5 (adapter design AD7) |
+| P13 | Version rule: every vendor version is supported; refused only on demonstrated handshake breakage; `untested` warns until the maintainers' check (owner OD1, 2026-09-30, superseding the 2026-09-26 P13 approval). Exception (owner, 2026-10-06): `opencode-serve` runs only versions in its `checked` set and refuses any other at its handshake (`handshake_refused`), because its one-server fence depends on per-version qualification (`vendors/opencode.md` §12, L13) | decided; C2 §5 (adapter design AD7) |
 | P14 | Raw vendor-argument passthrough: `via spawn … -- ARGS` / `vendor_args` appended unchanged to the vendor's argv; reserved flags refused `vendor_option_conflict`; frozen per session; warning `vendor_passthrough` (owner, 2026-10-06) | decided; §4 `vendor_args`, C2 §6.3 |
 
 ## 1. Scope, transport, versioning
@@ -208,7 +208,8 @@ seen for the harness and resolved program path, or `null`;
 (not yet checked by the maintainers, warning `vendor_version_untested`) or
 `refused` (a cached
 handshake-check failure on something VIA relies on). Every vendor version is
-supported by default (P13, C2 §5). Errors: `unknown_model`,
+supported by default (P13, C2 §5), except on `opencode-serve`, which runs
+only checked versions and refuses any other (P13's exception). Errors: `unknown_model`,
 `harness_unavailable`, `invalid_params`.
 
 ### 3.2 `spawn` — new session and turn 1
@@ -674,7 +675,7 @@ only after positive cleanup, joins and durable records, otherwise 4
 |---|---|---|---|
 | `harness` | `claude`, `codex`, `opencode`, `pi`, `acp:<agent>`, `fake` | session | optional if `model` resolves; `fake` is a test double, available only with runtime §11.1's fixture configuration |
 | `model` | string | session (P5) | `resolved` reported in the envelope |
-| `allow_untested` | bool, default false | session | immutable after spawn; accepted and stored for compatibility; no effect (P13): every version is supported unless refused for breakage, which it cannot waive |
+| `allow_untested` | bool, default false | session | immutable after spawn; accepted and stored for compatibility; no effect (P13): every version is supported unless refused for breakage, which it cannot waive; nor can it waive `opencode-serve`'s refusal of unchecked versions |
 | `effort` | `low`…`max` or vendor value | per turn | unknown values refused; a vendor value that can be judged only against a discovered catalog is refused at submission, `failed(submit_failed)` with `failure.data.field:"effort"`; no vendor turn starts (C2 §5) |
 | `instructions` | `{text}` or `{path}` | session | native or `prepended_to_prompt` (partial). `path` is absolute: a regular UTF-8 file of at most 1 MiB that the daemon's user can read, copied when the request is received and frozen as its text; a file that changes during the copy is `invalid_params` naming `instructions`. The path is not stored; the retry identity uses the copy's SHA-256 and length. A route may refuse instructions whose encoded size exceeds its limit as `invalid_params` naming `instructions` (`opencode-serve` and `pi-rpc`: the JSON-encoded text above 262,144 bytes). |
 | `prompt` | string | per turn | exactly one of `prompt` and `prompt_file`. A route may refuse a prompt whose encoded size exceeds its transport limit as `invalid_params` naming `prompt` (`opencode-serve` and `codex-app-server`: the JSON-encoded prompt plus the JSON-encoded cwd above 1,040,384 bytes; `pi-rpc`: the JSON-encoded prompt above 524,288 bytes). |
@@ -1106,8 +1107,12 @@ class; `submit_failed` is only before acceptance; HTTP 401/403 → `auth`. `max_
   vendor's credential listing. A fresh private namespace is credential-free
   by construction; otherwise a secret-free integration listing of known
   shape that shows a stored credential refuses startup, and an unknown shape
-  proceeds with `credential_state_unchecked`. Loopback Basic Auth is
-  mandatory. OC01, OC02 and OC12 in `vendors/opencode.md` remain required.
+  proceeds with `credential_state_unchecked`. A project's own provider
+  configuration applies (owner, 2026-10-06); VIA never logs, stores,
+  returns or puts in evidence its keys, headers or endpoint secrets, and
+  decodes model listings through an allow-list of identifiers. Loopback
+  Basic Auth is mandatory. OC01, OC02, OC12 and OC12b in
+  `vendors/opencode.md` remain required.
 - One narrow, owner-approved exception (2026-10-01): a report-only
   leftover scan (C2 §4.2) may read the environment of a same-uid process
   started at or after the vendor, through one `/proc/<pid>` descriptor,
@@ -1136,6 +1141,6 @@ approval.
 | P7 | Codex pending cleanup | reviewed §3.5/§7.3 rule: settle at `min(acknowledged_at + 60 s, wall_deadline)`; do not add `--after-uncertain` |
 | P11 | server key vs per-turn bound | reviewed §Decisions rule; Codex key excludes bound and mixed-bound operation is qualified (`via-5lr.3.4`); OpenCode shares one owned server for all of VIA (one namespace; launch key = namespace plus launch-settings hash) |
 | P12 | live recovery gate | `unknown` everywhere in v1; alternative: enable Codex rejoin after the socket-transport probe (D9) |
-| P13 | version rule | Version rule: every vendor version is supported; refused only on demonstrated handshake breakage; `untested` warns until the maintainers' check (owner OD1, 2026-09-30, superseding the 2026-09-26 P13 approval) |
+| P13 | version rule | Version rule: every vendor version is supported; refused only on demonstrated handshake breakage; `untested` warns until the maintainers' check (owner OD1, 2026-09-30, superseding the 2026-09-26 P13 approval). Exception (owner, 2026-10-06): `opencode-serve` runs only versions in its `checked` set and refuses any other at its handshake (`handshake_refused`), because its one-server fence depends on per-version qualification (`vendors/opencode.md` §12, L13) |
 | Q6 | Claude steer semantics | resolved `unsupported`; busy input can merge into a running result, so no steer input is written |
 | Q7 | Channel sizes (C2 A1 limits) | as written, fixed; disk and WAL thresholds are daemon config (runtime §8) |

@@ -477,6 +477,9 @@ pub struct AcquiredProcess {
     pub pipes: OwnedPipes,       // moved once into Wire; Host never reads them
     pub control: ProcessControl,
     pub exits: ExitReceiver,
+    /// The vendor child's pid from the anchor's `Spawned` reply, passive
+    /// data passed through Wire to the route (OpenCode's `/api/info` check).
+    pub vendor_pid: u32,
 }
 pub struct ProcessIdentity {
     pub pid: u32, pub pgid: u32, pub uid: u32,
@@ -1388,7 +1391,7 @@ payload limits count encoded bytes plus separately bounded decoded structure.
 | Codex shared connection writes | 8 pending server-request replies, 64 KiB; one control in flight; data held back while any control is pending; per driver, reserved interrupt (12,800 B) and unsubscribe (6,400 B) slots, steer 6 commands and 46,336 B | Past the reply bound, a reply not written within 5 s of decode, or correlation exhaustion: connection overflow, every associated session fails through health, the server retires |
 | OpenCode HTTP/SSE transport metadata | Existing bounded Wire splitting; headers 64 KiB, bodies 1 MiB (`/api/model` 4 MiB) | Read, count and discard as for pipes; never an `Authorization` header or request body in evidence |
 | C2 observations | 1024 items and 4 MiB/session | Wait only normalizer; at 10 s without drain, the adapter closes the session's route hop; a private route fails the connection `overflow`, a shared route quarantines the thread generation (A1, C2 §4) |
-| C2 observation payload | 256 KiB encoded; final text sent in pieces; IDs, names, stop reasons and codes 1 KiB | Fail protocol, the message saved to the evidence folder; unknown messages keep no payload |
+| C2 observation payload | 256 KiB encoded; final text sent in pieces; IDs, names, stop reasons and codes 1 KiB | Fail protocol, the message saved to the evidence folder (OpenCode: endpoint or event type, status, size and failing path only, never the payload, `vendors/opencode.md` §4.3); unknown messages keep no payload |
 | Data commands / control commands | 1 / 8 per driver, 64 KiB controls total | Data waits only until absolute deadline; duplicate interrupt/close coalesces; other control admission refused explicitly |
 | Health channel | watch latch + at most one exit report/connection | Latest health replaces state; `health: store_failed` is sticky after the latch; `store_failure` reports the latest recorded failure and its scope; no event payloads |
 | Store requests | 64 + 8 reserved lifecycle, 8 MiB total | Request-side overload refusal; Host cleanup never awaits this queue |
