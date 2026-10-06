@@ -674,10 +674,6 @@ fn pi_plan_pure() {
 /// non-object or non-string file gives `null`/`untested`, and the turn
 /// proceeds.
 #[test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "one packet §8 test: its variants side by side"
-)]
 fn pi_version_read() {
     let exited = |name: &str| {
         let replay = single(
