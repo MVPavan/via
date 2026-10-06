@@ -1314,6 +1314,112 @@ fn pi_predecessor_check_forced() {
     predecessor_check_controlled("pi_predecessor_check_forced", knobs, Some("force_stop")).unwrap();
 }
 
+/// Packet §4.3 (picrit #5): a blocked evidence write never extends the
+/// turn's one cutoff. The run streams past the session channel and hangs;
+/// Core takes nothing for 4 s, so after the 1.5 s wall the delivery of
+/// what Route handed over uses most of the 3 s allowance, and the
+/// records' write is held (`adapter.pi.records.write` paused). The turn
+/// returns by the wall plus the allowance, not 3 s after the delivery;
+/// once released, the task skips `pi-profile.json` and names it in
+/// `pi-records-skipped.json`. Before the fix the wait was a fresh 3 s
+/// (about the wall plus 5.5 s) and the late record was written.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn pi_records_blocked() {
+    use std::os::unix::fs::DirBuilderExt;
+    use std::time::{Duration, Instant};
+    const POINT: &str = "adapter.pi.records.write";
+    const TOKEN: &str = "pi-records-blocked-token";
+    own_process("pi_records_blocked");
+    let points = tempfile::tempdir().unwrap();
+    let dir = points.path().join("points");
+    std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    std::fs::write(
+        dir.join(format!("{POINT}.json")),
+        json!({"token": TOKEN, "occurrence": 1, "action": "pause"}).to_string(),
+    )
+    .unwrap();
+    via_store::failpoint::activate(&dir, TOKEN).unwrap();
+    let control = std::thread::spawn({
+        let dir = dir.clone();
+        move || {
+            let ack = dir.join(format!("{POINT}.1.ack"));
+            let until = Instant::now() + Duration::from_secs(15);
+            while !ack.exists() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let held = ack.exists();
+            // Past the turn's cutoff: the task resumes late.
+            std::thread::sleep(Duration::from_secs(6));
+            std::fs::write(dir.join(format!("{POINT}.1.release")), b"").is_ok() && held
+        }
+    });
+    let mut steps = handshake(&State::default());
+    steps.extend(prompt("Count slowly."));
+    steps.extend(echo("Count slowly."));
+    let pending = assistant(json!([]), "pending", &zero_usage(), None);
+    steps.push(emit(&json!({"type": "message_start", "message": pending})));
+    steps.push(update(json!({"type": "text_start", "contentIndex": 0})));
+    for _ in 0..SATURATING {
+        steps.push(update(
+            json!({"type": "text_delta", "contentIndex": 0, "delta": "."}),
+        ));
+    }
+    steps.extend(terminated());
+    let replay = single(
+        "synthetic (picrit #5): a run past its wall; its records' write held",
+        argv(Argv::default()),
+        steps,
+    );
+    let mut wanted = interrupted(false, "aborted");
+    wanted["terminal"] = Value::Null;
+    wanted["error"] = json!("deadline");
+    wanted["stop_facts"] = Value::Null;
+    wanted["exit"] = json!({"code": 143, "signal": null});
+    let mut turn = turn("Count slowly.", wanted);
+    turn["deadlines"] = json!({"wall_ms": 1_500, "idle_ms": 60_000});
+    let expect = case("pi_records_blocked", 1, vec![turn]);
+    let knobs = Knobs {
+        hold_for: Some(Duration::from_secs(4)),
+        ..Knobs::default()
+    };
+    let records = std::cell::RefCell::new((false, String::new()));
+    let outcome = drive_built(
+        "pi_records_blocked",
+        &replay,
+        &expect,
+        knobs,
+        Box::new(|_| Ok(())),
+        Box::new(|pure: &Pure| {
+            let folder = evidence(pure, 1);
+            let note = folder.join("pi-records-skipped.json");
+            let until = Instant::now() + Duration::from_secs(20);
+            while !note.exists() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            *records.borrow_mut() = (
+                folder.join("pi-profile.json").exists(),
+                std::fs::read_to_string(&note).unwrap_or_default(),
+            );
+            Ok(())
+        }),
+    );
+    assert!(
+        control.join().unwrap(),
+        "the records' write never reached the point"
+    );
+    let outcome = outcome.unwrap();
+    conformance_expect::check(&expect, &outcome).unwrap();
+    let returned = outcome.turns[0].returned.unwrap();
+    assert!(
+        returned <= Duration::from_millis(1_500 + 3_000 + 400),
+        "run_turn returned {returned:?} after its start"
+    );
+    let (profile, note) = records.into_inner();
+    assert!(!profile, "pi-profile.json was written after the cutoff");
+    assert!(note.contains("pi-profile.json"), "{note}");
+}
+
 /// Packet §3 (review r2 minor): the version read before VIA's launch
 /// state failed is still this turn's `InstanceReport`: a write that fails
 /// (a folder where the instructions' partial goes) is `store`; a session

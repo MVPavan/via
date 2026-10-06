@@ -887,6 +887,7 @@ impl<'a> Run<'a> {
         outcome.steer = steer;
         outcome.gates = gates?;
         outcome.stop_facts = stop_facts(turn, &end);
+        outcome.returned = settled.get().map(|at| at - now);
         // Only a stopped turn on a server route settles its cleanup apart
         // from its end (C1 P7); elsewhere the field is null.
         if session.plan.server_key.is_some() && !turn["stop"].is_null() {

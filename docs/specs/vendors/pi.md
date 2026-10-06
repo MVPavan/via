@@ -336,7 +336,14 @@ never writes, repairs or deletes anything in the agent directory.
   and `models-store.json` on its first run, E59), and is written only for a
   turn that launched, best effort: the turn's outcome never depends on it.
   Both records are written on a blocking task the session's tracker owns;
-  the turn's end waits for them at most the cleanup allowance.
+  the turn's end waits for them only until the earliest of the cleanup
+  allowance from then, the turn's one cutoff (the wall plus 3 s, C2
+  §4.1), and the `close_by` of a stop or the driver's close order as they
+  stand or arrive, and never past the daemon force. A record the task has
+  not begun by then is skipped, and the task names the skipped records in
+  `pi-records-skipped.json` (`{"skipped":[…],"reason":…}`, 0600) once it
+  can write; a record whose write had begun may still finish after the
+  turn ended.
 - **Profile setting.** The real profile had no `cacheWarming` key (E60);
   `"cacheWarming": "off"` was added to its `settings.json` on 2026-10-05.
   VIA itself never writes it: a profile without it is refused.
@@ -756,7 +763,7 @@ hostile profiles only in scratch agent directories. Selection as Claude's:
 | `pi_plan_pure` | `describe` starts nothing; unchecked or unreadable version → `untested` with the warning; steer refused by name; `max_steps`, `output_schema`, limited bounds, `network:false`, nonempty `extra_write_dirs`, a prompt over 524,288 or instructions over 262,144 JSON-encoded bytes are refused before receipt |
 | `pi_version_read` | The Pi package's `version` from `package.json` through a symlinked entry and the `dist` rule, reported even when Pi exits before the handshake; a missing, oversize, non-object or non-string file → `null`/`untested`, the turn proceeds; no process starts. `pi_version_survives_a_state_failure`: a launch-state failure after the read (a failed write, `store`; a session directory that is not one, `handshake_refused`) still reports the version |
 | `pi_stage_outlived_by_its_task` | A turn ends at its wall while its staging task is held before the instructions sync; the next turn's launch-state write waits for that task, then launches and completes (unserialized, it failed `store`) |
-| `pi_profile_policy` | Accepted: the allowed set, with and without Pi-created files (E59). Refused by name, no launch and no value in the message: `shellCommandPrefix`, `SYSTEM.md`, `APPEND_SYSTEM.md`, `models.json`, `defaultThinkingLevel`, an unknown key, missing or non-`off` `cacheWarming`, a malformed value, a symlink, wrong owner, a group-writable entry, `auth.json` with group bits, an oversize file, 65 entries, and a 0755 agent, `pi` or `vendor` directory (§4.4, named, left 0755). `pi-profile.json` holds no `deviceId` or credential bytes and records the check the launch passed, even when the profile changes while the turn executes (`pi_profile_record_is_pre_launch`); refusals are not cached |
+| `pi_profile_policy` | Accepted: the allowed set, with and without Pi-created files (E59). Refused by name, no launch and no value in the message: `shellCommandPrefix`, `SYSTEM.md`, `APPEND_SYSTEM.md`, `models.json`, `defaultThinkingLevel`, an unknown key, missing or non-`off` `cacheWarming`, a malformed value, a symlink, wrong owner, a group-writable entry, `auth.json` with group bits, an oversize file, 65 entries, and a 0755 agent, `pi` or `vendor` directory (§4.4, named, left 0755). `pi-profile.json` holds no `deviceId` or credential bytes and records the check the launch passed, even when the profile changes while the turn executes (`pi_profile_record_is_pre_launch`); refusals are not cached. `pi_records_blocked`: the records' write held while delivery after the wall uses most of the allowance → the turn returns by the wall plus 3 s, the profile record skipped and named in `pi-records-skipped.json` |
 | `pi_uncertain_predecessor` | A leaves an unproven group; B is refused `uncertain_predecessor` without launching; C is refused too; A proven absent, D launches. The same with A busy, and across a restart with A's record not yet re-held. No resend |
 | `pi_predecessor_check_stopped`, `pi_predecessor_check_forced` | R1's Store read held past the wall; a cancel, then the daemon force, 1 s in ends the turn unlaunched at once (no failure; `force_stop`), not `store` at the wall |
 | `pi_identity_continuation` | `--session-id` until confirmed; confirmation only with `started`; a rejected turn 1 (no file) lets turn 2 create; a lost `started` reply keeps `--session-id`; once confirmed, `--session`; a missing file then exits before RPC → `Rejected{Protocol}`, never a fresh session; derived ID stable across eviction and restart |

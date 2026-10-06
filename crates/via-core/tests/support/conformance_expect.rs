@@ -348,6 +348,9 @@ pub(crate) struct TurnOutcome {
     /// The failure's text, as Core takes it for C1 `failure.message`
     /// (`AdapterError`'s display); for a test's own checks.
     pub(crate) message: Option<String>,
+    /// How long after its start `run_turn` returned; for a test's own
+    /// checks.
+    pub(crate) returned: Option<std::time::Duration>,
 }
 
 const TOP: &[&str] = &[
@@ -1868,6 +1871,7 @@ fn ideal_turn(e: &Value) -> TurnOutcome {
         undecoded: None,
         route_cleanup: None,
         message: None,
+        returned: None,
     }
 }
 

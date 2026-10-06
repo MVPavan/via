@@ -180,6 +180,8 @@ POINTS = [
     "adapter.claude.plan_clock_ms",
     # via-jt8.3.2 review r2: the Pi instructions write, before its sync.
     "adapter.pi.instructions.written",
+    # picrit #5: the Pi evidence records' write, blocked.
+    "adapter.pi.records.write",
 ]
 ACTIVATION = ["VIA_FAILPOINT_DIR", "VIA_FAILPOINT_TOKEN"]
 # Test-build overrides (design §6.2, §6.4) that release must neither parse nor forward.

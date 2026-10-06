@@ -350,8 +350,8 @@ async fn launched(
         process,
         start: PiStart::new(turn, spec.prompt),
         hop,
-        signals: (wall, force.clone(), stop),
-        close: close_rx,
+        signals: (wall, force.clone(), stop.clone()),
+        close: close_rx.clone(),
         cancel: driver.cancel.clone(),
         input: (expect, end),
         reservation,
@@ -380,7 +380,7 @@ async fn launched(
         &mut delivery,
         &driver.observations,
         &activity,
-        (force, cutoff),
+        (force.clone(), cutoff),
         &driver.health,
     )
     .await;
@@ -393,17 +393,18 @@ async fn launched(
     if matches!(rest, Rest::Undelivered) {
         driver.fail(DriverFailure::ObservationOverflow);
     }
+    keep_records(
+        driver,
+        turn,
+        (&routed, staged.profile, delivery.normalizer.patch()),
+        (wall, force, (stop, close_rx)),
+    )
+    .await;
     let ended = Ended {
         turn,
         clamp,
         recipe,
     };
-    keep_records(
-        driver,
-        turn,
-        (&routed, staged.profile, delivery.normalizer.patch()),
-    )
-    .await;
     ended.end(adapter, &delivery.normalizer, routed, &rest)
 }
 
@@ -530,13 +531,17 @@ fn start_rejected(refusal: Refusal) -> StartRejected {
 /// Packet §§4.3, 4.7: the turn's `pi-profile.json` (the record of the
 /// check its launch passed) and, once its handshake passed,
 /// `pi-inventory.json`, in the evidence folder its launch created. Best
-/// effort, on a blocking task the session's tracker owns: a record that
-/// cannot be written, or is not written within [`CLEANUP_ALLOWANCE`], is
-/// left out of the turn's end.
+/// effort, on a blocking task the session's tracker owns, waited for only
+/// within [`records_by`]'s bound (picrit #5: never past the turn's one
+/// cutoff) and until the daemon force. A record the task has not begun by
+/// then is skipped, and the task notes the skipped names in
+/// [`RECORDS_SKIPPED`] once it can write; the turn's end never waits for
+/// that.
 async fn keep_records(
     driver: &SessionDriver,
     turn: crate::TurnNumber,
     (routed, profile, patch): (&PiTurn, Vec<u8>, Option<&via_routes::pi::SystemPatch>),
+    (wall, force, orders): (Deadline, ForceWatch, (StopWatch, CloseWatch)),
 ) {
     let launched = match &routed.outcome {
         Ok(_) => true,
@@ -548,18 +553,92 @@ async fn keep_records(
     let folder = driver
         .runtime
         .turn_evidence_path(&driver.spec.session_id, turn);
-    let inventory = routed
+    let mut records = vec![("pi-profile.json", profile)];
+    if let Some(record) = routed
         .handshake
         .as_ref()
-        .map(|facts| normalize::inventory(patch, &facts.skills, &driver.spec.cwd));
-    let written = driver.tracker.spawn_blocking(move || {
-        write_record(&folder.join("pi-profile.json"), &profile);
-        if let Some(record) = inventory {
-            write_record(&folder.join("pi-inventory.json"), &record);
-        }
+        .map(|facts| normalize::inventory(patch, &facts.skills, &driver.spec.cwd))
+    {
+        records.push(("pi-inventory.json", record));
+    }
+    let late = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let written = driver.tracker.spawn_blocking({
+        let late = Arc::clone(&late);
+        move || write_records(&folder, records, &late)
     });
-    // Best effort: the outcome never waits past the allowance.
-    drop(tokio::time::timeout(CLEANUP_ALLOWANCE, written).await);
+    if !records_by(written, (wall, force, orders)).await {
+        late.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// The driver's close order, as [`TurnTask`] takes it.
+type CloseWatch = watch::Receiver<Option<StopOrder>>;
+
+/// Where the records' task notes the records it skipped.
+const RECORDS_SKIPPED: &str = "pi-records-skipped.json";
+
+/// Whether `written` finished within the records' bound: the earlier of
+/// the cleanup allowance from now and the turn's one cutoff (the wall plus
+/// [`CLEANUP_ALLOWANCE`], C2 §4.1), and the `close_by` of a stop or the
+/// driver's close order, as they stand or arrive; the daemon force ends
+/// the wait at once.
+async fn records_by(
+    written: impl std::future::Future,
+    (wall, mut force, (mut stop, mut close)): (Deadline, ForceWatch, (StopWatch, CloseWatch)),
+) -> bool {
+    let allowance =
+        (tokio::time::Instant::now() + CLEANUP_ALLOWANCE).min(wall.instant() + CLEANUP_ALLOWANCE);
+    let (mut stop_open, mut close_open) = (true, true);
+    let forced = async move {
+        // A force sender gone unset: no force will come.
+        if force.wait_for(Option::is_some).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::pin!(written, forced);
+    loop {
+        let orders = [stop.borrow().clone(), close.borrow().clone()];
+        let bound = orders
+            .iter()
+            .flatten()
+            .map(|order| order.close_by.instant())
+            .fold(allowance, std::cmp::Ord::min);
+        tokio::select! {
+            biased;
+            () = &mut forced => return false,
+            _ = &mut written => return true,
+            () = tokio::time::sleep_until(bound) => return false,
+            changed = stop.changed(), if stop_open => stop_open = changed.is_ok(),
+            changed = close.changed(), if close_open => close_open = changed.is_ok(),
+        }
+    }
+}
+
+/// Writes `records` into `folder` in order; once `late` is set, those not
+/// begun are skipped and named in [`RECORDS_SKIPPED`] instead.
+fn write_records(
+    folder: &Path,
+    records: Vec<(&'static str, Vec<u8>)>,
+    late: &std::sync::atomic::AtomicBool,
+) {
+    // Test builds: a blocked evidence write (picrit #5).
+    #[cfg(feature = "test-failpoints")]
+    drop(via_routes::failpoint::hit("adapter.pi.records.write"));
+    let mut skipped = Vec::new();
+    for (name, bytes) in records {
+        if late.load(std::sync::atomic::Ordering::Acquire) {
+            skipped.push(name);
+        } else {
+            write_record(&folder.join(name), &bytes);
+        }
+    }
+    if !skipped.is_empty() {
+        let note = serde_json::json!({
+            "skipped": skipped,
+            "reason": "not begun by the turn's cleanup cutoff",
+        });
+        write_record(&folder.join(RECORDS_SKIPPED), note.to_string().as_bytes());
+    }
 }
 
 /// Writes one new 0600 evidence record; an error leaves it out (the
