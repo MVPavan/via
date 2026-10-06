@@ -670,8 +670,11 @@ live lock holder ever writes the record, and no child executes the
 vendor before a record naming it exists; a child whose anchor dies before
 the write is never named (a successor's record names the successor's own
 child) and never executes the vendor. A failed record write makes the
-anchor kill and reap its child, which has not executed the vendor, and
-reply `FenceRecordFailed` instead of `Spawned`, a launch failure. The
+anchor kill its child, which has not executed the vendor, and reply
+`FenceRecordFailed` instead of `Spawned`, a launch failure. The reap is
+bounded: a child not reaped within it (stuck in the kernel, its `SIGKILL`
+pending, so it never runs user code again) makes the anchor stop its own
+group, which releases the lock. The
 pidfd proof needs rustix's `event` feature in `via-host`, beside the
 `process` feature it already enables. With `die_with_anchor`, the vendor dies with the
 anchor, so the lock is free only after its holder's vendor has been sent

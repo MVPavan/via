@@ -197,8 +197,9 @@ pub enum FenceRefusal {
         /// The record's PID-namespace identity.
         namespace: String,
     },
-    /// The anchor could not write the server record at ARM; it killed and
-    /// reaped its child, which had not executed the vendor.
+    /// The anchor could not write the server record at ARM; it killed its
+    /// child, which had not executed the vendor, and reaped it, or, if the
+    /// child was not reaped within a bound, stopped its own group.
     FenceRecordFailed,
 }
 

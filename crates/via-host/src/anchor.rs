@@ -556,7 +556,10 @@ async fn spawn_vendor(
                 // user code again; if it is not reaped in time, the group
                 // (this anchor with it) is stopped, releasing the lock.
                 let _ = child.start_kill();
-                let reaped = tokio::time::timeout(REAP_WAIT, child.wait()).await.is_ok();
+                let reaped = matches!(
+                    tokio::time::timeout(REAP_WAIT, child.wait()).await,
+                    Ok(Ok(_))
+                );
                 let refusal = crate::FenceRefusal::FenceRecordFailed;
                 let _ = tokio::time::timeout(
                     REAP_WAIT,
