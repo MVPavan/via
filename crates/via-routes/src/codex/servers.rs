@@ -337,14 +337,27 @@ struct Instance {
     work: Option<Work>,
     /// Tasks spawned and not yet collected (at most two, R4-11).
     tasks: u8,
+    /// A failed first start's permit (bead via-20s review #2), held until
+    /// the instance goes: its retirement collected, or at once with no
+    /// connection to retire (Host's failed acquisition already cleaned
+    /// up). The next first start then cannot overlap a lingering
+    /// initializer.
+    first_start: Option<FirstStart>,
 }
+
+/// The one-first-start permit ([`Servers::first_start`]).
+type FirstStart = tokio::sync::OwnedSemaphorePermit;
 
 /// The connection task, built by the launch and spawned at publication.
 type ConnectionTask = Pin<Box<dyn Future<Output = ConnectionEnd> + Send>>;
 
 /// A task's typed outcome.
 enum Outcome {
-    Launch(Result<(ConnectionTask, ServerFacts), LaunchError>),
+    /// With a failed first start, its permit ([`Instance::first_start`]).
+    Launch(
+        Result<(ConnectionTask, ServerFacts), LaunchError>,
+        Option<FirstStart>,
+    ),
     Connection(ConnectionEnd),
     Retired(Option<ExitReport>),
     Stopped(Option<ExitReport>),
@@ -446,11 +459,13 @@ pub struct Servers {
     me: Weak<Servers>,
     /// One first start at a time (bead via-20s; vendors/codex.md §2): a
     /// launch on the [`HandshakeBound::First`] bound holds this permit
-    /// from before its process starts until its handshake settles. Every
+    /// from before its process starts until its handshake succeeds or,
+    /// when it fails, until its launch is retired ([`Instance::first_start`];
+    /// released even when Host's cleanup is uncertain). Every
     /// server of the registry shares one SQLite home, the adapter's, and
     /// a second server starting on an unmarked home dies after Codex's
     /// own 30 s backfill wait.
-    first_start: tokio::sync::Semaphore,
+    first_start: Arc<tokio::sync::Semaphore>,
     /// Test builds: scripted opens the launch job takes before Wire's
     /// (x.3.2 X4, [`Self::script`]).
     #[cfg(any(feature = "test-support", all(test, feature = "test-failpoints")))]
@@ -636,7 +651,7 @@ impl Servers {
             unforced: watch::Sender::new(None),
             unwoken: watch::Sender::new(0),
             me: me.clone(),
-            first_start: tokio::sync::Semaphore::new(1),
+            first_start: Arc::new(tokio::sync::Semaphore::new(1)),
             #[cfg(any(feature = "test-support", all(test, feature = "test-failpoints")))]
             scripted: Mutex::default(),
         })
@@ -831,6 +846,7 @@ impl Servers {
                     },
                     work: Some(Work::Launch(Box::new(spec), handshake)),
                     tasks: 0,
+                    first_start: None,
                 },
             );
         }
@@ -1095,7 +1111,10 @@ impl Servers {
             return;
         };
         match (kind, outcome) {
-            (TaskKind::Launch, Some(Outcome::Launch(launched))) => {
+            (TaskKind::Launch, Some(Outcome::Launch(launched, first_start))) => {
+                if launched.is_err() {
+                    instance.first_start = first_start;
+                }
                 Self::publish(registry, (server, &mut instance), launched, (set, kinds));
             }
             (TaskKind::Launch, _) => {
@@ -1281,17 +1300,21 @@ async fn launch(
     };
     tokio::pin!(fenced);
     // Bead via-20s: a first start waits, within its own deadline, for the
-    // in-flight first start's handshake to settle before its process
-    // starts. Nothing was started while it waits.
+    // in-flight first start to succeed or for its failed launch to be
+    // retired, before its process starts. Nothing was started while it
+    // waits.
     let first = match bound {
         HandshakeBound::First => tokio::select! {
-            permit = timeout_at(deadline.instant(), servers.first_start.acquire()) => match permit {
+            permit = timeout_at(
+                deadline.instant(),
+                Arc::clone(&servers.first_start).acquire_owned(),
+            ) => match permit {
                 Ok(Ok(permit)) => Some(permit),
                 // The semaphore is never closed.
-                Ok(Err(_)) => return Outcome::Launch(Err(LaunchFailure::Internal.into())),
-                Err(_) => return Outcome::Launch(Err(LaunchFailure::Deadline.into())),
+                Ok(Err(_)) => return Outcome::Launch(Err(LaunchFailure::Internal.into()), None),
+                Err(_) => return Outcome::Launch(Err(LaunchFailure::Deadline.into()), None),
             },
-            () = &mut fenced => return Outcome::Launch(Err(LaunchFailure::Shutdown.into())),
+            () = &mut fenced => return Outcome::Launch(Err(LaunchFailure::Shutdown.into()), None),
         },
         HandshakeBound::Warm => None,
     };
@@ -1299,11 +1322,11 @@ async fn launch(
     // and signals, its Wire error unchanged (x.3.2 X4, Sol d8).
     let opened = tokio::select! {
         opened = servers.open(spec, deadline) => opened,
-        () = &mut fenced => return Outcome::Launch(Err(LaunchFailure::Shutdown.into())),
+        () = &mut fenced => return Outcome::Launch(Err(LaunchFailure::Shutdown.into()), first),
     };
     let (stdio, messages) = match opened {
         Ok(parts) => parts,
-        Err(error) => return Outcome::Launch(Err(acquire_failure(&error).into())),
+        Err(error) => return Outcome::Launch(Err(acquire_failure(&error).into()), first),
     };
     let connection = Connection::over(server.clone(), stdio, servers.declines);
     servers.install(&server, &connection);
@@ -1323,8 +1346,6 @@ async fn launch(
         end = task.as_mut() => (Err(LaunchFailure::Lost(loss_of(end))), true),
         () = &mut fenced => (Err(LaunchFailure::Shutdown), false),
     };
-    // The handshake settled: the next first start may begin.
-    drop(first);
     // Bead via-20s: a handshake request fails `Lost` as the connection
     // fails, before its task has Host's evidence; the task's own end
     // classifies the loss (a confirmed exit is `ServerLost`). Awaited
@@ -1338,6 +1359,14 @@ async fn launch(
         })),
         outcome => outcome,
     };
+    // A successful first start initialized the home: the next may begin
+    // now. A failed one's permit is held until its launch is retired.
+    let first = if outcome.is_ok() {
+        drop(first);
+        None
+    } else {
+        first
+    };
     Outcome::Launch(
         outcome
             .map(|facts| (task, facts))
@@ -1345,6 +1374,7 @@ async fn launch(
                 failure,
                 user_agent: observed.get().cloned(),
             }),
+        first,
     )
 }
 

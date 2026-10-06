@@ -201,11 +201,14 @@ async fn lease_drop_retires_once() {
     assert_eq!(servers.registry().stale, 0);
 }
 
-/// Bead via-20s: a server that dies before it answers its handshake, its
-/// exit confirmed by Host's stop, fails the launch `ServerLost`; one whose
-/// stdout ends while Host finds it live (unconfirmed) fails it
-/// `TransportLost`. Either way the waiting turn never launched: nothing of
-/// it was sent.
+/// Bead via-20s: a server that dies during its handshake, its exit
+/// confirmed by Host's stop, fails the launch `ServerLost`; one Host finds
+/// live (unconfirmed) fails it `TransportLost`. The vendor stops reading,
+/// so VIA's `initialized` write fails at once and the handshake request
+/// fails `Lost` while Host's stop is still held, before the connection
+/// task can end (review minor): the launch waits for the task's own end,
+/// so nothing is published until Host answers. Either way the waiting turn
+/// never launched: nothing of it was sent.
 #[tokio::test]
 async fn a_handshake_loss_takes_the_connections_cause() {
     use super::{LaunchFailure, LossCause};
@@ -234,11 +237,31 @@ async fn a_handshake_loss_takes_the_connections_cause() {
             stopped_live,
             ..StopFacts::default()
         });
+        stdio.hold_closes();
         let pin = servers
             .launch_or_join(key(first), (spec(), HandshakeBound::First), Box::new(()))
             .unwrap();
         let initialize = ends.read().await;
         assert_eq!(initialize["method"], "initialize", "{initialize}");
+        ends.stop_reading();
+        ends.emit(&serde_json::json!({
+            "id": initialize["id"],
+            "result": {"userAgent": USER_AGENT, "codexHome": "/codex",
+                "platformFamily": "unix", "platformOs": "linux"},
+        }))
+        .await;
+        until("the failed connection's Host stop", || stdio.closes() >= 1).await;
+        let early = tokio::time::timeout(
+            Duration::from_millis(300),
+            pin.ready(std::future::pending()),
+        )
+        .await;
+        assert!(
+            early.is_err(),
+            "{stopped_live:?}: published before Host's evidence: {early:?}"
+        );
+        stdio.release_closes();
+        // Host's stop ended the process: its stdout ends.
         ends.end_stdout().await;
         let failed =
             tokio::time::timeout(Duration::from_secs(10), pin.ready(std::future::pending()))
@@ -279,6 +302,11 @@ async fn first_starts_on_an_unmarked_home_are_serialized() {
         b.silent(Duration::from_millis(300)).await,
         "the second first start waits for the first's handshake"
     );
+    assert_eq!(
+        servers.scripted.lock().unwrap().len(),
+        1,
+        "the second first start's open is not taken while it waits"
+    );
     a.answer_handshake(&initialize, USER_AGENT, &[model("gpt-6-sol")])
         .await;
     tokio::time::timeout(Duration::from_secs(5), first.ready(std::future::pending()))
@@ -292,6 +320,55 @@ async fn first_starts_on_an_unmarked_home_are_serialized() {
         .unwrap();
     assert_ne!(first.server(), second.server());
     assert_eq!(servers.reports().len(), 2);
+}
+
+/// Bead via-20s review #2: a failed first start keeps the next first start
+/// waiting until its failed launch is retired: the handshake is refused,
+/// and while Host's stop of the refusing process is held (the initializer
+/// lingers), the second first start's open is not taken. Once Host
+/// answers, it launches and serves.
+#[tokio::test]
+async fn a_failed_first_start_holds_the_next_until_its_retirement() {
+    let runtime = TestRuntime::new();
+    let servers = Servers::new(runtime.runtime(), DECLINES);
+    let (mut a, a_stdio) = servers.script();
+    let (mut b, _b) = servers.script();
+    a_stdio.hold_closes();
+    let first = servers
+        .launch_or_join(key(0x11), (spec(), HandshakeBound::First), Box::new(()))
+        .unwrap();
+    let initialize = a.read().await;
+    let second = servers
+        .launch_or_join(key(0x12), (spec(), HandshakeBound::First), Box::new(()))
+        .unwrap();
+    a.emit(&serde_json::json!({
+        "id": initialize["id"],
+        "error": {"code": -32603, "message": "state db backfill timed out"},
+    }))
+    .await;
+    let refused = tokio::time::timeout(Duration::from_secs(5), first.ready(std::future::pending()))
+        .await
+        .unwrap();
+    assert!(refused.is_err(), "the first start failed");
+    until("the failed launch's retirement close", || {
+        a_stdio.closes() == 1
+    })
+    .await;
+    assert!(
+        b.silent(Duration::from_millis(300)).await,
+        "the second first start waits for the failed one's retirement"
+    );
+    assert_eq!(
+        servers.scripted.lock().unwrap().len(),
+        1,
+        "the second first start's open is not taken before the retirement"
+    );
+    a_stdio.release_closes();
+    b.handshake(USER_AGENT, &[model("gpt-6-sol")]).await;
+    tokio::time::timeout(Duration::from_secs(5), second.ready(std::future::pending()))
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 /// Bead via-20s: on a marked home (the warm bound) launches are not

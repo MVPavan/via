@@ -124,11 +124,16 @@ on an unmarked home. The second logged `state db backfill is running …;
 waiting up to 30s` and exited when Codex's own fixed 30 s wait timed out,
 so VIA's 300 s bound protected only the first. While the home has no
 marker, the registry therefore runs one first start at a time: a later
-first-start launch waits for the in-flight one's handshake to settle,
-whether it succeeded or failed, within its own handshake deadline (counted
-from its launch's start, so the wait spends it), and only then starts its
-process. Launches on a marked home are not serialized, and equal keys still
-share one launch. A server that dies during its handshake fails its
+first-start launch waits until the in-flight one's handshake succeeded or,
+if it failed, until that failed launch was retired through Host (stdin
+closed, then Host's stop), within its own handshake deadline (counted from
+its launch's start, so the wait spends it), and only then starts its
+process. A failed acquisition releases at once, since Host's acquisition
+already cleaned up. Limitation: the release does not wait for proof the
+failed initializer stopped; when Host reports that cleanup `uncertain` the
+next first start proceeds anyway, and may meet the same 30 s wait if the
+old process still indexes (no fence; revisit if observed). Launches on a
+marked home are not serialized, and equal keys still share one launch. A server that dies during its handshake fails its
 waiting turns `server_lost` when Host confirms the exit; a transport loss,
 handshake deadline or launch-task failure before a turn's first byte fails
 it `submit_failed` (`launch_failed`), never `unknown`. A malformed reply,
