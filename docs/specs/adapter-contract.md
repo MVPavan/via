@@ -940,6 +940,14 @@ of VIA's own recipe:
 | `pi-rpc` (adopts this when built) | each per-turn launch's argv ([Pi packet](vendors/pi.md) §4.1) | per process; part of the handshake-refusal recipe key |
 | `fake` | refused: `InvalidParam { field: "vendor_args" }` (not a vendor CLI) | — |
 
+**Trust.** Reserved matching is best-effort against the vendor's known
+option table of each checked version; it is not a security boundary. The
+caller who passes `vendor_args` is trusted with them. VIA refuses each
+spelling, alias and hidden option of the checked version that it knows to
+reach a control it owns. An option VIA does not know (a later version's, or
+one its table missed) is the caller's responsibility, and the
+`vendor_passthrough` warning flags that (owner and coordinator, 2026-10-06).
+
 **Matching.** Each element is read in order; VIA may refuse more than the
 vendor would apply, never less.
 
