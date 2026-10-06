@@ -132,7 +132,11 @@ process. A failed acquisition releases at once, since Host's acquisition
 already cleaned up. Limitation: the release does not wait for proof the
 failed initializer stopped; when Host reports that cleanup `uncertain` the
 next first start proceeds anyway, and may meet the same 30 s wait if the
-old process still indexes (no fence; revisit if observed). Launches on a
+old process still indexes (no fence; revisit if observed). Likewise, a
+panic of the launch task or of the failed launch's retirement task drops
+the permit with the task, before the retirement, so a later first start
+may overlap the old process (an abnormal path; revisit if observed).
+Launches on a
 marked home are not serialized, and equal keys still share one launch. A server that dies during its handshake fails its
 waiting turns `server_lost` when Host confirms the exit; a transport loss,
 handshake deadline or launch-task failure before a turn's first byte fails
