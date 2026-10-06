@@ -131,13 +131,18 @@ decided in the slice that needs them, after re-probing.
   `--output-schema` file; a prompt, `cwd` or instructions path it cannot
   use; an argument its parser rejects: an unknown flag or verb, a value
   that does not parse, a missing value or argument) is a request error: it
-  prints the `invalid_params` error naming the member (`data.field`) and
-  contacts no daemon. A parser error names the argument the parser names,
-  without dashes or value placeholder and with inner dashes as underscores
-  (the C1 member where the flag maps to one: `--max-steps` is
-  `max_steps`), or `command` for an unknown or missing verb; its message
-  is the parser's own, without usage. `--help` and `--version` print the
-  parser's help and version and exit 0.
+  prints the `invalid_params` error naming the field (`data.field`) and
+  contacts no daemon. A refusal after parsing names the C1 member; a
+  parser error names the CLI argument in the CLI's own spelling, not a C1
+  member: a flag as `--name` without its value placeholder
+  (`--force-after`, whose member is `force_after_ms`; an unknown flag as
+  typed), a positional by its lowercase name (`session`), a required group
+  as its member flags joined by `|` (`--prompt|--prompt-file`), and
+  `command` when the parser names no argument (an unknown verb, an
+  unexpected value). Its message is the parser's own, without usage.
+  `--help` and `--version` print the parser's help and version and exit 0;
+  bare `via`, with no arguments, prints the parser's help on stderr and
+  exits 2, with no JSON.
   `via daemon` starts the foreground server; `via daemon status` and
   `via daemon stop` remain client verbs.
 

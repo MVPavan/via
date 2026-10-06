@@ -7,7 +7,7 @@ mod server;
 use std::{io, path::PathBuf, process::ExitCode, time::Duration};
 
 use clap::error::{ContextKind, ContextValue, ErrorKind};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use serde_json::{Value, json};
 
 #[derive(Parser)]
@@ -463,27 +463,16 @@ fn main() -> ExitCode {
 }
 
 /// An argument the parser rejected, as C1's request error (review
-/// clfix-crit): `invalid_params` naming the argument the parser names,
-/// without dashes or value placeholder and with dashes inside as
-/// underscores (`--max-steps <MAX_STEPS>` is `max_steps`, `<SESSION>` is
-/// `session`), else `command` (an unknown or missing verb). The message is
-/// the parser's own, without its usage and tips.
+/// clfix-crit): `invalid_params` naming the CLI argument in the CLI's own
+/// spelling (review clfix-crit2), never a C1 member: see [`cli_field`].
+/// The message is the parser's own, without its usage and tips.
 fn parse_error(error: &clap::Error) -> client::RequestError {
     let named = match error.get(ContextKind::InvalidArg) {
         Some(ContextValue::String(arg)) => Some(arg.as_str()),
         Some(ContextValue::Strings(args)) => args.first().map(String::as_str),
         _ => None,
     };
-    let field = named
-        .and_then(|arg| arg.split([' ', '=']).next())
-        .map(|arg| {
-            arg.trim_start_matches('-')
-                .trim_matches(['<', '>'])
-                .to_ascii_lowercase()
-                .replace('-', "_")
-        })
-        .filter(|field| !field.is_empty())
-        .unwrap_or_else(|| "command".to_owned());
+    let field = named.map_or_else(|| "command".to_owned(), cli_field);
     let text = error.to_string();
     let text = text.strip_prefix("error: ").unwrap_or(&text);
     let message = text
@@ -494,6 +483,61 @@ fn parse_error(error: &clap::Error) -> client::RequestError {
         .collect::<Vec<_>>()
         .join(" ");
     client::RequestError::invalid_params(field, message)
+}
+
+/// The CLI argument the parser shows as `shown`, read from the parser's
+/// own definitions rather than its display text: a flag as `--name`, a
+/// positional by its lowercase name, a required group as its member flags
+/// joined by `|`. An unknown flag the caller typed is named as typed
+/// (before any `=value`); anything else, an unexpected value included, is
+/// `command`.
+fn cli_field(shown: &str) -> String {
+    let field = |arg: &clap::Arg| {
+        arg.get_long().map_or_else(
+            || arg.get_id().as_str().to_ascii_lowercase(),
+            |long| format!("--{long}"),
+        )
+    };
+    // Built, as the parser was: an argument displays only once built.
+    let mut root = Cli::command();
+    root.build();
+    let mut commands = vec![&root];
+    let mut all = Vec::new();
+    while let Some(command) = commands.pop() {
+        all.push(command);
+        commands.extend(command.get_subcommands());
+    }
+    for command in &all {
+        if let Some(arg) = command.get_arguments().find(|arg| arg.to_string() == shown) {
+            return field(arg);
+        }
+    }
+    for command in &all {
+        for group in command.get_groups() {
+            let members: Vec<&clap::Arg> = group
+                .get_args()
+                .filter_map(|id| command.get_arguments().find(|arg| arg.get_id() == id))
+                .collect();
+            if members.len() > 1
+                && group.is_required_set()
+                && members
+                    .iter()
+                    .all(|arg| shown.contains(arg.to_string().as_str()))
+            {
+                return members
+                    .iter()
+                    .map(|arg| field(arg))
+                    .collect::<Vec<_>>()
+                    .join("|");
+            }
+        }
+    }
+    let typed = shown.split('=').next().unwrap_or_default();
+    if typed.starts_with("--") && !typed.contains(char::is_whitespace) {
+        typed.to_owned()
+    } else {
+        "command".to_owned()
+    }
 }
 
 async fn run(cli: Cli) -> anyhow::Result<i32> {
