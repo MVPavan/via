@@ -12,7 +12,7 @@ use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use via_adapters::{
     AdapterSet, Bound, DescribeRequest, Harness, InheritPlan, ParamSizes, Refusal, RefusalKind,
-    RoutePlan, SessionRef, Support, TurnParams, TurnSpec, VendorOptions, Verb, VerbReq,
+    RoutePlan, SessionRef, Support, TurnParams, TurnSpec, VendorArgs, VendorOptions, Verb, VerbReq,
     harness_names,
 };
 use via_store::json_limits::{self, Shape};
@@ -316,7 +316,7 @@ pub(crate) fn refused(refusal: &Refusal) -> ApiError {
             ApiError::HARNESS_UNAVAILABLE
         }
         RefusalKind::UnknownModel => ApiError::UNKNOWN_MODEL,
-        RefusalKind::VendorOptionConflict => ApiError {
+        RefusalKind::VendorOptionConflict { .. } => ApiError {
             kind2: Some("vendor_option_conflict"),
             ..ApiError::INVALID_PARAMS
         },
@@ -392,7 +392,10 @@ fn refusal_message(refusal: &Refusal) -> &'static str {
         RefusalKind::HarnessUnavailable => "harness is unavailable",
         RefusalKind::VersionRefused => "the harness binary's version was refused",
         RefusalKind::UnknownModel => "unknown model",
-        RefusalKind::VendorOptionConflict => "vendor options use a reserved key",
+        RefusalKind::VendorOptionConflict {
+            field: "vendor_args",
+        } => "vendor_args sets what the route owns",
+        RefusalKind::VendorOptionConflict { .. } => "vendor options use a reserved key",
         RefusalKind::MissingCapability { verb } => match verb {
             Verb::Spawn => "a required verb is not met on this route: spawn",
             Verb::Resume => "a required verb is not met on this route: resume",
@@ -405,6 +408,7 @@ fn refusal_message(refusal: &Refusal) -> &'static str {
             "output_schema" => "output_schema is unsupported on this route",
             "max_steps" => "max_steps is unsupported on this route",
             "vendor" => "vendor options are unsupported on this route",
+            "vendor_args" => "vendor_args is not accepted on this route",
             "instructions" => "instructions is unsupported on this route",
             "harness" => "harness is required: several harnesses catalog the model",
             "model" => "model is required",
@@ -421,6 +425,7 @@ pub(crate) struct SessionMembers {
     pub(crate) require: Vec<VerbReq>,
     pub(crate) instructions: Option<String>,
     pub(crate) instructions_path: Option<String>,
+    pub(crate) vendor_args: VendorArgs,
 }
 
 impl SpawnParams {
@@ -436,8 +441,28 @@ impl SpawnParams {
             require: require(self.require.as_deref())?,
             instructions,
             instructions_path,
+            vendor_args: vendor_args(self.vendor_args.as_deref())?,
         })
     }
+}
+
+/// C1 §4 `vendor_args` (owner, 2026-10-06): a list of strings within its
+/// bounds, none holding NUL; omitted, none. Anything else is
+/// `invalid_params` naming it.
+pub(crate) fn vendor_args(raw: Option<&RawValue>) -> Result<VendorArgs, ApiError> {
+    let Some(raw) = raw else {
+        return Ok(VendorArgs::default());
+    };
+    let invalid = |message| {
+        ApiError::naming(
+            ApiError::INVALID_PARAMS,
+            Named::field("vendor_args"),
+            message,
+        )
+    };
+    let list = json_limits::string_list(raw.get())
+        .ok_or_else(|| invalid("vendor_args is a list of strings"))?;
+    VendorArgs::try_from(list).map_err(|error| invalid(error.message()))
 }
 
 /// The encoded sizes C2 §2 `ParamSizes` carries: the instructions' UTF-8
@@ -482,6 +507,7 @@ pub(crate) fn plan_spawn(
         vendor: overrides.vendor.given().cloned().unwrap_or_default(),
         cwd: Some(cwd.into()),
         allow_untested: params.allow_untested,
+        vendor_args: members.vendor_args.clone(),
         sizes: ParamSizes {
             prompt_json,
             cwd_json: via_adapters::encoded_text_len(cwd).saturating_add(2),
@@ -538,7 +564,7 @@ pub(crate) fn plan_spawn(
         .check_turn(
             &session,
             &effective.turn_params(
-                members.instructions.as_deref(),
+                (members.instructions.as_deref(), &members.vendor_args),
                 (cwd, prompt_json),
                 Some(plan.inherit),
             ),
@@ -585,6 +611,7 @@ impl DescribeParams {
             vendor: shapes.vendor.given().cloned().unwrap_or_default(),
             cwd: self.cwd.as_ref().map(Into::into),
             allow_untested: self.allow_untested,
+            vendor_args: VendorArgs::default(),
             // `describe` carries neither instructions nor a schema.
             sizes: ParamSizes::default(),
         };
@@ -792,11 +819,12 @@ impl Effective {
     /// `instructions` and `cwd` (`cwd`'s length in bytes and its JSON
     /// string encoding's), of the turn's prompt (`prompt_json`, its JSON
     /// string encoding's length), of its effective schema and of its
-    /// model; and the session's requested `inherit`, which a route's
-    /// launch reads (critical r1 #1, #2; x.3.2 X5).
+    /// model; the session's requested `inherit`, which a route's launch
+    /// reads (critical r1 #1, #2; x.3.2 X5); and its frozen `vendor_args`
+    /// (owner, 2026-10-06), which the route judges again.
     pub(crate) fn turn_params(
         &self,
-        instructions: Option<&str>,
+        (instructions, vendor_args): (Option<&str>, &VendorArgs),
         (cwd, prompt_json): (&str, usize),
         inherit: Option<InheritPlan>,
     ) -> TurnParams {
@@ -817,6 +845,7 @@ impl Effective {
             inherit: inherit.map(|inherit| inherit.requested),
             inherit_effective: inherit.map(|inherit| inherit.effective),
             model: Some(self.model.clone()),
+            vendor_args: vendor_args.clone(),
         }
     }
 
@@ -942,9 +971,42 @@ mod tests {
         let overrides = params.per_turn().overrides().unwrap();
         let planned = EffectiveBound::of(None, None, "r").unwrap();
         let effective = Effective::first("gpt-6-luna".to_owned(), overrides, planned);
-        let turn = effective.turn_params(None, ("", 0), None);
+        let turn =
+            effective.turn_params((None, &via_adapters::VendorArgs::default()), ("", 0), None);
         assert_eq!(turn.model.as_deref(), Some("gpt-6-luna"));
         assert_eq!(turn.sizes.model, "gpt-6-luna".len());
+    }
+
+    /// Owner, 2026-10-06 (C1 §4 `vendor_args`): omitted is none; a list
+    /// of strings within 64 arguments and 16 KiB with no NUL passes;
+    /// anything else, `null` included, is `invalid_params` naming
+    /// `vendor_args` with no kind2.
+    #[test]
+    fn vendor_args_is_a_bounded_string_list() {
+        let parse = |value: serde_json::Value| {
+            let raw = serde_json::value::to_raw_value(&value).unwrap();
+            super::vendor_args(Some(&raw))
+        };
+        assert!(super::vendor_args(None).unwrap().is_empty());
+        assert_eq!(parse(json!(["--x", "y"])).unwrap().as_slice(), ["--x", "y"]);
+        assert_eq!(parse(json!(vec!["a"; 64])).unwrap().as_slice().len(), 64);
+        for refused in [
+            json!(null),
+            json!("--x"),
+            json!([1]),
+            json!(["a", null]),
+            json!({"a": "b"}),
+            json!(["a\0"]),
+            json!(vec!["a"; 65]),
+            json!(["z".repeat(16 * 1024 + 1)]),
+        ] {
+            let error = parse(refused.clone())
+                .err()
+                .unwrap_or_else(|| panic!("{refused}"));
+            assert_eq!(error.data()["field"], "vendor_args", "{refused}");
+            assert_eq!(error.data()["kind"], "invalid_params", "{refused}");
+            assert!(error.data()["kind2"].is_null(), "{refused}");
+        }
     }
 
     /// Critical r1 #12 (C1 §4 `instructions`): exactly `{text}` or

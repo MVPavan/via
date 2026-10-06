@@ -251,6 +251,8 @@ fn refused_values(adapter: &FakeAdapter, spec: &TurnSpec) -> Option<TurnEnd> {
         output_schema: spec.output_schema.is_some(),
         max_steps: spec.max_steps,
         vendor: spec.vendor.clone(),
+        // The plan refused any: the fake takes no raw arguments.
+        vendor_args: crate::VendorArgs::default(),
         // The fake has no size limit: it never reads them.
         sizes: ParamSizes::default(),
         inherit: None,
@@ -1039,8 +1041,9 @@ fn usage(sample: FakeUsage) -> UsageSample {
 fn start_rejected(refusal: Refusal) -> StartRejected {
     match refusal.kind {
         RefusalKind::BoundUnsupported => StartRejected::BoundUnsupported(refusal.message),
-        RefusalKind::InvalidParam { field } => StartRejected::InvalidParam { field },
-        RefusalKind::VendorOptionConflict => StartRejected::InvalidParam { field: "vendor" },
+        RefusalKind::InvalidParam { field } | RefusalKind::VendorOptionConflict { field } => {
+            StartRejected::InvalidParam { field }
+        }
         RefusalKind::UnsupportedVerb
         | RefusalKind::HarnessUnavailable
         | RefusalKind::UnknownModel

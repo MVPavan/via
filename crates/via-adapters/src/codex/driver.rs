@@ -72,6 +72,7 @@ use crate::observation::{
     AdapterError, Charge, Identity, InstanceReport, Observation, ObservationItem, SessionCap,
     TurnEnd, TurnEvidence, UnparsedOutput,
 };
+use crate::passthrough::VendorArgs;
 use crate::plan::{Bound, Inherit, RefusalKind};
 use crate::runtime::event_stall;
 use crate::{
@@ -180,11 +181,12 @@ impl CodexSession {
         self.attached.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The registry's key for the session's server.
-    fn key(&self, requested: Inherit) -> ServerKey {
+    /// The registry's key for the session's server, its raw arguments
+    /// included (C2 §6.3).
+    fn key(&self, requested: Inherit, vendor_args: &VendorArgs) -> ServerKey {
         ServerKey(
             self.adapter
-                .recipe(requested)
+                .recipe(requested, vendor_args)
                 .config_hash(ADAPTER_VERSION)
                 .bytes(),
         )
@@ -193,13 +195,21 @@ impl CodexSession {
     /// AD16 `prepare`: a pin on the session's live server, else on a live
     /// or launching server of an equal key; `None` when the turn needs a
     /// harness-process slot.
-    pub(crate) fn prepare(&self, requested: Inherit) -> Option<ServerPin> {
+    pub(crate) fn prepare(
+        &self,
+        requested: Inherit,
+        vendor_args: &VendorArgs,
+    ) -> Option<ServerPin> {
         let own = self
             .attached()
             .as_ref()
             .filter(|attached| usable(&attached.connection))
             .and_then(|attached| attached.lease.pin());
-        own.or_else(|| self.adapter.servers().pin(&self.key(requested)))
+        own.or_else(|| {
+            self.adapter
+                .servers()
+                .pin(&self.key(requested, vendor_args))
+        })
     }
 
     /// Changes whenever `prepare`'s answer may change (C2 §3).
@@ -1693,6 +1703,8 @@ fn admit(
         bound: spec.bound.as_ref(),
         max_steps: spec.max_steps.is_some(),
         vendor: &spec.vendor,
+        // C2 §6.3: re-judged before every launch.
+        vendor_args: &driver.spec.vendor_args,
     };
     if let Some(refusal) = refusals(route, &per_turn).into_iter().next() {
         return Err(start_rejected(&refusal.kind, refusal.message));
@@ -1731,7 +1743,8 @@ fn adopt(
             .record_version(HARNESS, &adapter.binary, version.to_owned());
     }
     let catalog: Arc<[DiscoveredModel]> = server.models.iter().map(normalize::discovered).collect();
-    let key = adapter.server_key(facts.driver.spec.inherit.requested);
+    let spec = &facts.driver.spec;
+    let key = adapter.server_key(spec.inherit.requested, &spec.vendor_args);
     adapter.discovered(key, id.clone(), Arc::clone(&catalog));
     catalog
 }
@@ -1796,7 +1809,7 @@ async fn join(
                     None,
                 )));
             }
-            let recipe = adapter.recipe(driver.spec.inherit.requested);
+            let recipe = adapter.recipe(driver.spec.inherit.requested, &driver.spec.vendor_args);
             let owner = ProcessOwner::Turn {
                 session_id: driver.spec.session_id.clone(),
                 turn,
@@ -1993,7 +2006,7 @@ async fn confirm(
     if let Some(field) = echo_differs(opened, mode, &driver.spec) {
         let adapter = &facts.session.adapter;
         // The recipe key the refused handshake is cached under.
-        let hash = adapter.server_key(driver.spec.inherit.requested);
+        let hash = adapter.server_key(driver.spec.inherit.requested, &driver.spec.vendor_args);
         adapter.instances.record_refusal(
             &adapter.binary,
             hash,
@@ -2901,8 +2914,9 @@ pub(super) fn carried(
 fn start_rejected(kind: &RefusalKind, message: String) -> StartRejected {
     match kind {
         RefusalKind::BoundUnsupported => StartRejected::BoundUnsupported(message),
-        RefusalKind::InvalidParam { field } => StartRejected::InvalidParam { field },
-        RefusalKind::VendorOptionConflict => StartRejected::InvalidParam { field: "vendor" },
+        RefusalKind::InvalidParam { field } | RefusalKind::VendorOptionConflict { field } => {
+            StartRejected::InvalidParam { field }
+        }
         RefusalKind::UnsupportedVerb
         | RefusalKind::HarnessUnavailable
         | RefusalKind::UnknownModel

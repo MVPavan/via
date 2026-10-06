@@ -83,6 +83,7 @@ impl Rig {
             initial_bound: Some(full()),
             cwd: CWD.into(),
             vendor: std::collections::BTreeMap::default(),
+            vendor_args: crate::VendorArgs::default(),
             inherit: InheritPlan {
                 requested: Inherit::OD2_DEFAULT,
                 effective: Inherit::OD2_DEFAULT,

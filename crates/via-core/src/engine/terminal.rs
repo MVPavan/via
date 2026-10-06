@@ -131,6 +131,8 @@ fn assemble(
     let mut warnings: Vec<Warning> = version.warning().into_iter().collect();
     // C1 §5, AD13: the session's unverified inheritance, on every envelope.
     warnings.extend(plan.frozen.config_warning());
+    // Owner, 2026-10-06: the session's raw vendor arguments, likewise.
+    warnings.extend(plan.frozen.passthrough_warning());
     warnings.extend(terminal.warnings);
     // C1 §5: the turn's own adapter warnings of the closed list.
     warnings.extend(vendor.warnings);

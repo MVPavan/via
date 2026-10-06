@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use crate::config::{BootstrapEnv, CodexSettings};
+use crate::passthrough::VendorArgs;
 use crate::plan::{Category, Inherit, InheritState};
 use crate::{EnvAllowList, PrivateProcessSpec, ProcessOwner};
 
@@ -94,6 +95,28 @@ impl ServerRecipe {
         }
     }
 
+    /// The recipe with the session's raw arguments appended after VIA's
+    /// switches (C2 §6.3): they are in the argv, so in the key, and
+    /// sessions with different lists never share a server.
+    pub(crate) fn with_vendor_args(mut self, vendor_args: &VendorArgs) -> Self {
+        self.args.extend(vendor_args.as_slice().iter().cloned());
+        self
+    }
+
+    /// Whether Host's launch request for the recipe fits the anchor's cap
+    /// (C2 §6.3): checked before any receipt, so a server is never
+    /// acquired that Host cannot start.
+    pub(crate) fn fits(&self) -> bool {
+        let args: Vec<OsString> = self.args.iter().map(OsString::from).collect();
+        crate::PrivateProcessSpec::configure_fits(&self.program, &args, &self.cwd, &self.env_list())
+    }
+
+    /// The recipe's environment as Host takes it.
+    fn env_list(&self) -> EnvAllowList {
+        // The names are the fixed allow-list plus one: always valid.
+        EnvAllowList::try_from_entries(self.env.clone()).unwrap_or_else(|_| EnvAllowList::default())
+    }
+
     /// The server's process: the recipe as Host runs it. The registry
     /// replaces `owner` with the server it mints and sets the capacity;
     /// Wire names its `stderr.log` in the server's evidence folder.
@@ -102,9 +125,7 @@ impl ServerRecipe {
             program: self.program.clone(),
             args: self.args.iter().map(OsString::from).collect(),
             cwd: self.cwd.clone(),
-            // The names are the fixed allow-list plus one: always valid.
-            env: EnvAllowList::try_from_entries(self.env.clone())
-                .unwrap_or_else(|_| EnvAllowList::default()),
+            env: self.env_list(),
             owner,
             stderr_path: PathBuf::new(),
             capacity: None,

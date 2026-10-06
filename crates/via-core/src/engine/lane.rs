@@ -1655,6 +1655,7 @@ impl Engine {
                 .as_ref()
                 .map(|identity: &Identity| identity.vendor_session_id.clone()),
             allow_untested: frozen.allow_untested,
+            vendor_args: frozen.vendor_args,
         };
         let (sink, receiver) = observation_channel_in(&budget);
         let cx = SessionCx {

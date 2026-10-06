@@ -4345,6 +4345,7 @@ async fn open_test_driver(
             },
             confirmed_vendor_session_id: None,
             allow_untested: false,
+            vendor_args: via_adapters::VendorArgs::default(),
         },
         SessionCx {
             observations: sink,

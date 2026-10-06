@@ -7,7 +7,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use via_adapters::{Bound, Capabilities, InheritPlan, SessionRef, Support, VendorOptions, Verb};
+use via_adapters::{
+    Bound, Capabilities, InheritPlan, SessionRef, Support, VendorArgs, VendorOptions, Verb,
+};
 use via_store::SessionRoute;
 
 use super::{Effective, Planned, SessionMembers};
@@ -45,10 +47,15 @@ struct Params {
     instructions: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     vendor: VendorOptions,
+    /// The raw vendor arguments every launch appends (C1 §4
+    /// `vendor_args`, owner 2026-10-06); omitted when none, so a row
+    /// written before them reads as none.
+    #[serde(default, skip_serializing_if = "VendorArgs::is_empty")]
+    vendor_args: VendorArgs,
 }
 
 /// A spawn's frozen `sessions.params` from its plan: its turn-1 `vendor`
-/// options are the session's.
+/// options and its `vendor_args` are the session's.
 pub(crate) fn frozen_params(
     planned: &Planned,
     (params, members, cwd): (&SpawnParams, &SessionMembers, &str),
@@ -61,6 +68,7 @@ pub(crate) fn frozen_params(
         inherit: planned.plan.inherit,
         instructions: members.instructions.clone(),
         vendor: planned.effective.vendor.clone(),
+        vendor_args: members.vendor_args.clone(),
     })
     .map_err(|_| ApiError::STORE)
 }
@@ -79,6 +87,8 @@ pub(crate) struct Frozen {
     pub(crate) cwd: Option<String>,
     pub(crate) instructions: Option<String>,
     pub(crate) vendor: VendorOptions,
+    /// The session's raw vendor arguments (C1 §4 `vendor_args`).
+    pub(crate) vendor_args: VendorArgs,
     pub(crate) allow_untested: bool,
     /// The frozen `inherit`, as requested and effective; `None` only
     /// where the row's parameters were not read.
@@ -145,6 +155,7 @@ impl Frozen {
             frozen.cwd = params.cwd;
             frozen.instructions = params.instructions;
             frozen.vendor = params.vendor;
+            frozen.vendor_args = params.vendor_args;
             frozen.allow_untested = params.allow_untested;
             frozen.inherit = Some(params.inherit);
         }
@@ -195,6 +206,12 @@ impl Frozen {
             "config_switch_unverified",
             Some(json!({ "categories": categories })),
         )
+    }
+
+    /// The session's `vendor_passthrough` warning (C1 §5, owner
+    /// 2026-10-06): one while it passes `vendor_args`, else none.
+    pub(crate) fn passthrough_warning(&self) -> Option<Warning> {
+        (!self.vendor_args.is_empty()).then_some(Warning::VENDOR_PASSTHROUGH)
     }
 }
 

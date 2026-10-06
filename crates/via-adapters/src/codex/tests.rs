@@ -187,6 +187,52 @@ fn codex_memories_true_keeps_the_vendor_default() {
     );
 }
 
+/// C2 §6.3, packet §4: a session's raw arguments follow VIA's switches on
+/// the server's argv, so they are in the server key: equal lists share a
+/// server, different lists (or none beside some) never do. The launch
+/// request counts them: a list that would not fit Host's cap is refused.
+#[test]
+fn vendor_args_enter_the_server_argv_and_key() {
+    let recipe = |list: &[&str]| {
+        let args = crate::VendorArgs::try_from(
+            list.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        ServerRecipe::new(
+            Path::new("/bin/codex"),
+            (hooks(InheritState::On), CodexSettings::default()),
+            &env(),
+            Path::new("/state/vendor/codex"),
+        )
+        .with_vendor_args(&args)
+    };
+    let with = recipe(&["--strict-config", "-c", "model_verbosity=low"]);
+    assert_eq!(
+        with.args,
+        [
+            "app-server",
+            "--disable",
+            "memories",
+            "--strict-config",
+            "-c",
+            "model_verbosity=low"
+        ]
+    );
+    let key = |list: &[&str]| recipe(list).config_hash("1");
+    assert_eq!(
+        key(&["--strict-config", "-c", "model_verbosity=low"]),
+        with.config_hash("1")
+    );
+    assert_ne!(key(&["--strict-config"]), key(&[]));
+    assert_ne!(
+        key(&["--strict-config"]),
+        key(&["--analytics-default-enabled"])
+    );
+    assert_ne!(key(&["-c", "a=1"]), key(&["-ca=1"]));
+    assert!(with.fits());
+    assert!(!recipe(&[&format!("--code-mode-host={}", "z".repeat(16 * 1024 - 17))]).fits());
+}
+
 /// Owner 2026-10-05: for the first release Codex disables nothing but
 /// memories, so no request adds `--disable apps`: the user's MCP servers
 /// and Codex's built-in apps server load as configured.

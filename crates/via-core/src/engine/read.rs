@@ -467,6 +467,7 @@ fn status_value(
     };
     let mut warnings: Vec<Warning> = version.warning().into_iter().collect();
     warnings.extend(frozen.config_warning());
+    warnings.extend(frozen.passthrough_warning());
     let active_turn = status.active.map(|active| {
         json!({
             "n": active.turn,

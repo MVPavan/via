@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use via_routes::codex::{SandboxMode, SandboxPolicy};
 
 use crate::capabilities::{BoundMode, Capabilities, ParamSupport, Support, UsageSupport, Verbs};
+use crate::passthrough::{Rules, Takes};
 use crate::plan::{Bound, Category, CategoryDecl, InheritState, Switch, VendorOptions};
 
 /// The versions maintainers' live check passed (C2 §5 version rule): the
@@ -221,6 +222,83 @@ pub(crate) fn sandbox(bound: &Bound) -> Result<Sandbox, BoundRefusal> {
     }
 }
 
+/// The raw-argument rules (C2 §6.3, packet §4; `codex app-server --help`,
+/// codex-cli 0.160.0): the transport and listener flags VIA owns, help
+/// and version, `-c`/`--config` keys VIA sets, and the features VIA
+/// switches through `--enable`/`--disable`.
+pub(crate) const ARG_RULES: Rules = Rules {
+    long_reserved: |name| {
+        matches!(name, "listen" | "stdio" | "help" | "version") || name.starts_with("ws")
+    },
+    short_reserved: |letter| matches!(letter.to_ascii_lowercase(), 'h' | 'v'),
+    long_value: |name| {
+        matches!(name, "config" | "enable" | "disable" | "codemodehost").then_some(Takes::One)
+    },
+    short_value: |letter| (letter == 'c').then_some(("config", Takes::One)),
+    value_reserved: |name, value| match name {
+        "config" => config_key_reserved(value),
+        "enable" | "disable" => owned_feature(value),
+        _ => false,
+    },
+};
+
+/// The `-c` key roots VIA sets or that select what it sets, normalized
+/// (lowercased, `_` and `-` removed): the model and its provider and
+/// effort, approvals, the sandbox, permission profiles, configuration
+/// profiles, instructions and the SQLite home (packet §4).
+const CONFIG_RESERVED: [&str; 17] = [
+    "model",
+    "modelprovider",
+    "modelreasoningeffort",
+    "approvalpolicy",
+    "approvalsreviewer",
+    "sandboxmode",
+    "sandboxworkspacewrite",
+    "permissions",
+    "defaultpermissions",
+    "profile",
+    "profiles",
+    "developerinstructions",
+    "instructions",
+    "baseinstructions",
+    "modelinstructionsfile",
+    "experimentalinstructionsfile",
+    "sqlitehome",
+];
+
+/// One dotted-key segment normalized: spaces and quotes dropped,
+/// lowercased, `_` and `-` removed.
+fn config_segment(segment: &str) -> String {
+    segment
+        .chars()
+        .filter(|c| !matches!(c, '_' | '-' | '"' | '\'') && !c.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Whether a `-c` override `key=value` sets what VIA owns: a reserved
+/// root, the whole `features` table, or a feature VIA switches.
+fn config_key_reserved(assignment: &str) -> bool {
+    let key = assignment
+        .split_once('=')
+        .map_or(assignment, |(key, _)| key);
+    let mut segments = key.split('.').map(config_segment);
+    let root = segments.next().unwrap_or_default();
+    if root == "features" {
+        return segments
+            .next()
+            .is_none_or(|feature| owned_feature(&feature));
+    }
+    CONFIG_RESERVED.contains(&root.as_str())
+}
+
+/// Whether `feature` names one VIA switches, `hooks` (`inherit`) or
+/// `memories` (`harnesses.codex.memories`), in any spelling or alias.
+fn owned_feature(feature: &str) -> bool {
+    let feature = config_segment(feature);
+    feature.contains("hook") || feature.contains("memor")
+}
+
 /// How the route judges the caller's Codex vendor options (C2 §6.1).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum VendorRefusal {
@@ -311,6 +389,76 @@ mod tests {
             serde_json::to_value(SandboxMode::WorkspaceWrite).unwrap(),
             json!("workspace-write")
         );
+    }
+
+    /// C2 §6.3, packet §4 (`codex app-server --help`, 0.160.0): the
+    /// transport, listener, help and version flags, `-c` keys VIA sets
+    /// (every spelling and attachment), the features VIA switches, `--`
+    /// and operands (a subcommand such as `proxy`) are refused; anything
+    /// else passes.
+    #[test]
+    fn vendor_args_reserved_flags_are_refused() {
+        let first = |list: &[&str]| {
+            let list: Vec<String> = list.iter().map(|arg| (*arg).to_owned()).collect();
+            crate::passthrough::conflict(&list, &ARG_RULES)
+        };
+        for case in [
+            &["--listen", "unix://"][..],
+            &["--listen=ws://127.0.0.1:1"],
+            &["--stdio"],
+            &["--ws-auth=capability-token"],
+            &["--ws-token-file", "/x"],
+            &["--help"],
+            &["-h"],
+            &["-V"],
+            &["--version"],
+            &["-c", "model=o3"],
+            &["-cmodel=o3"],
+            &["-c=model=o3"],
+            &["--config", "sandbox_mode=danger-full-access"],
+            &["--config=approval_policy=on-request"],
+            &["-c", "approvals_reviewer=auto"],
+            &["-c", "model_reasoning_effort=high"],
+            &["-c", "model_provider=oss"],
+            &["-c", "sandbox_workspace_write.network_access=true"],
+            &["-c", "profile=x"],
+            &["-c", "profiles.x.model=y"],
+            &["-c", "permissions.x={}"],
+            &["-c", "default_permissions=x"],
+            &["-c", "developer_instructions=x"],
+            &["-c", "model_instructions_file=/x"],
+            &["-c", "sqlite_home=/x"],
+            &["-c", " \"Sandbox-Mode\" = x"],
+            &["-c", "features={hooks=true}"],
+            &["-c", "features.hooks=true"],
+            &["-c", "features.memories=true"],
+            &["-c", "features.codex_hooks=true"],
+            &["--enable", "hooks"],
+            &["--enable=memories"],
+            &["--disable", "hooks"],
+            &["--disable", "memory_tool"],
+            &["--"],
+            &["proxy"],
+            &["daemon"],
+            &["--strict-config", "generate-json-schema"],
+            &["--analytics-default-enabled", "help"],
+        ] {
+            assert!(first(case).is_some(), "{case:?}");
+        }
+        for case in [
+            &[][..],
+            &["--strict-config"],
+            &["--analytics-default-enabled"],
+            &["--code-mode-host", "http://h"],
+            &["-c", "model_verbosity=low"],
+            &["-cmcp_servers.x.enabled=false"],
+            &["--config=notify=[]"],
+            &["-c", "features.apps=false"],
+            &["--enable", "apps"],
+            &["--disable=web_search"],
+        ] {
+            assert_eq!(first(case), None, "{case:?}");
+        }
     }
 
     /// C2 §6.1: reserved keys are `vendor_option_conflict` and any other

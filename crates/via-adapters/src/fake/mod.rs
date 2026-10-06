@@ -33,6 +33,7 @@ struct PerTurn<'a> {
     output_schema: bool,
     max_steps: bool,
     vendor: &'a crate::plan::VendorOptions,
+    vendor_args: &'a crate::VendorArgs,
 }
 
 impl FakeAdapter {
@@ -135,6 +136,7 @@ impl FakeAdapter {
                 output_schema: false,
                 max_steps: false,
                 vendor: &req.vendor,
+                vendor_args: &req.vendor_args,
             },
         );
         if let Err(verb) = capabilities.require(&req.require) {
@@ -201,6 +203,7 @@ impl FakeAdapter {
                 output_schema: turn.output_schema,
                 max_steps: turn.max_steps.is_some(),
                 vendor: &turn.vendor,
+                vendor_args: &turn.vendor_args,
             },
         )
     }
@@ -261,6 +264,13 @@ impl FakeAdapter {
             refusals.push(invalid(
                 "vendor",
                 format!("vendor options are unsupported on route {route}"),
+            ));
+        }
+        // C2 §6.3: the fake is no vendor CLI; it takes no raw arguments.
+        if !turn.vendor_args.is_empty() {
+            refusals.push(invalid(
+                "vendor_args",
+                format!("vendor_args are unsupported on route {route}"),
             ));
         }
         refusals

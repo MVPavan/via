@@ -335,7 +335,7 @@ pub(crate) fn refusal_name(refusal: &Refusal) -> String {
         RefusalKind::HarnessUnavailable => "harness_unavailable".to_owned(),
         RefusalKind::UnknownModel => "unknown_model".to_owned(),
         RefusalKind::VersionRefused => "version_refused".to_owned(),
-        RefusalKind::VendorOptionConflict => "vendor_option_conflict".to_owned(),
+        RefusalKind::VendorOptionConflict { .. } => "vendor_option_conflict".to_owned(),
         RefusalKind::InvalidParam { field } => format!("invalid_param:{field}"),
         RefusalKind::MissingCapability { verb } => format!("missing_capability:{}", verb.as_str()),
     }

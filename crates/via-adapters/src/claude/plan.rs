@@ -10,6 +10,7 @@ use super::{ClaudeAdapter, launch};
 use crate::capabilities::{BoundMode, Capabilities, ParamSupport, Support, UsageSupport, Verbs};
 use crate::config::ClaudeMode;
 use crate::harness::Harness;
+use crate::passthrough::{self, Rules, Takes, VendorArgs};
 use crate::plan::{
     Bound, CatalogModel, Category, CategoryDecl, DescribeRequest, Inherit, InheritState,
     ModelChoice, ParamSizes, Refusal, RefusalKind, RoutePlan, Switch, TurnParams, VendorOptions,
@@ -147,6 +148,7 @@ struct PerTurn<'a> {
     effort: Option<&'a str>,
     bound: Option<&'a Bound>,
     vendor: &'a VendorOptions,
+    vendor_args: &'a VendorArgs,
     sizes: ParamSizes,
 }
 
@@ -185,17 +187,17 @@ impl ClaudeAdapter {
     }
 
     /// The last version an init reported for `harness` run from this
-    /// program path, and a handshake refusal for `requested`'s recipe
-    /// cached and live at `now` (C2 §5).
+    /// program path, and a handshake refusal for `requested`'s recipe,
+    /// with the session's raw arguments, cached and live at `now` (C2 §5).
     fn version(
         &self,
         harness: Harness,
-        requested: Inherit,
+        (requested, vendor_args): (Inherit, &VendorArgs),
         schema: bool,
         now: std::time::Instant,
     ) -> (Option<String>, VersionStatus) {
         let version = self.instances.last_version(harness.name(), &self.binary);
-        let recipe = launch::recipe_key(self.mode, requested, schema);
+        let recipe = launch::recipe_key(self.mode, requested, schema, vendor_args);
         let status = if self.instances.refusal(&self.binary, &recipe, now).is_some() {
             VersionStatus::Refused
         } else if version
@@ -237,6 +239,7 @@ impl ClaudeAdapter {
                 effort: req.effort.as_deref(),
                 bound: req.bound.as_ref(),
                 vendor: &req.vendor,
+                vendor_args: &req.vendor_args,
                 sizes: req.sizes,
             },
         );
@@ -250,8 +253,12 @@ impl ClaudeAdapter {
                 ),
             ));
         }
-        let (vendor_version, version_status) =
-            self.version(harness, requested, req.sizes.output_schema > 0, now);
+        let (vendor_version, version_status) = self.version(
+            harness,
+            (requested, &req.vendor_args),
+            req.sizes.output_schema > 0,
+            now,
+        );
         if version_status == VersionStatus::Refused {
             refusals.push(handshake_refused(route));
         }
@@ -307,7 +314,7 @@ impl ClaudeAdapter {
                 .instances
                 .refusal(
                     &self.binary,
-                    &launch::recipe_key(mode, inherit, turn.output_schema),
+                    &launch::recipe_key(mode, inherit, turn.output_schema, &turn.vendor_args),
                     now,
                 )
                 .is_some()
@@ -325,6 +332,7 @@ impl ClaudeAdapter {
                 effort: turn.effort.as_deref(),
                 bound: turn.bound.as_ref(),
                 vendor: &turn.vendor,
+                vendor_args: &turn.vendor_args,
                 sizes: turn.sizes,
             },
         )
@@ -332,9 +340,10 @@ impl ClaudeAdapter {
 
     /// Critical r1 #1: the turn's launch request (Host's `Configure`
     /// frame: binary, argv, `cwd`, environment and Host's marker) past the
-    /// cap the anchor reads under is `invalid_params`, naming the larger of
-    /// `instructions` and `output_schema` (`bound`, its extra directories,
-    /// when neither is set), so nothing is accepted that Host cannot start.
+    /// cap the anchor reads under is `invalid_params`, naming the largest
+    /// of `instructions`, `output_schema` and the session's `vendor_args`
+    /// (C2 §6.3), the first on a tie (`bound`, its extra directories, when
+    /// none is set), so nothing is accepted that Host cannot start.
     ///
     /// Host computes the encoded size ([`crate::PrivateProcessSpec::configure_fits`]).
     /// The values known only by size (C2 §2) stand in at their largest
@@ -372,23 +381,31 @@ impl ClaudeAdapter {
             effort: turn.effort.as_deref(),
             output_schema: turn.output_schema.then_some(&*schema),
             max_steps: turn.max_steps,
+            // Known in full: the session's frozen list, as launched.
+            vendor_args: turn.vendor_args.as_slice(),
         };
         let args = launch::argv(&recipe).ok()?;
         let cwd = std::path::PathBuf::from(widest(turn.sizes.cwd));
         if crate::PrivateProcessSpec::configure_fits(&self.binary, &args, &cwd, &self.env_list()) {
             return None;
         }
-        let field = match (turn.sizes.instructions, turn.sizes.output_schema) {
-            (0, 0) => "bound",
-            (instructions, schema) if schema > instructions => "output_schema",
-            _ => "instructions",
-        };
+        let field = [
+            ("instructions", turn.sizes.instructions),
+            ("output_schema", turn.sizes.output_schema),
+            ("vendor_args", turn.vendor_args.bytes()),
+        ]
+        .into_iter()
+        // The first of equal sizes: `max_by_key` keeps the last.
+        .rev()
+        .max_by_key(|(_, size)| *size)
+        .filter(|(_, size)| *size > 0)
+        .map_or("bound", |(field, _)| field);
         Some(Refusal::new(
             RefusalKind::InvalidParam { field },
             Some(route),
             format!(
-                "the launch's arguments together, instructions and output_schema \
-                 included, exceed route {route}'s 64 KiB launch request limit"
+                "the launch's arguments together, instructions, output_schema and \
+                 vendor_args included, exceed route {route}'s 64 KiB launch request limit"
             ),
         ))
     }
@@ -445,8 +462,43 @@ fn refusals(route: &'static str, turn: &PerTurn<'_>) -> Vec<Refusal> {
         ));
     }
     refusals.extend(vendor_refusal(route, turn.vendor));
+    refusals.extend(args_refusal(route, turn.vendor_args));
     refusals
 }
+
+/// C2 §6.3: the session's raw arguments, judged against [`ARG_RULES`];
+/// the message names the argument's index, never its text.
+fn args_refusal(route: &'static str, vendor_args: &VendorArgs) -> Option<Refusal> {
+    let index = passthrough::conflict(vendor_args.as_slice(), &ARG_RULES)?;
+    Some(Refusal::new(
+        RefusalKind::VendorOptionConflict {
+            field: "vendor_args",
+        },
+        Some(route),
+        format!("vendor_args[{index}] sets what route {route} owns"),
+    ))
+}
+
+/// The raw-argument rules (C2 §6.3, packet §4, `claude --help` 2.1.290):
+/// the names and families `vendor` keys reserve, the reserved letters, and
+/// the unreserved options that take a value. No value is reserved.
+const ARG_RULES: Rules = Rules {
+    long_reserved: reserved,
+    short_reserved: |letter| RESERVED_SHORT.contains(&letter.to_ascii_lowercase()),
+    long_value: |name| match name {
+        "betas" | "file" => Some(Takes::Many),
+        "autocompact" | "debug" | "debugfile" | "maxbudgetusd" | "name" | "promptsuggestions" => {
+            Some(Takes::One)
+        }
+        _ => None,
+    },
+    short_value: |letter| match letter {
+        'd' => Some(("debug", Takes::One)),
+        'n' => Some(("name", Takes::One)),
+        _ => None,
+    },
+    value_reserved: |_, _| false,
+};
 
 /// Packet §4, C2 §6.1: the route takes no free-form vendor option. A key
 /// naming a flag, setting or override the recipe owns, in any normalized
@@ -456,7 +508,7 @@ fn vendor_refusal(route: &'static str, vendor: &VendorOptions) -> Option<Refusal
     let options = vendor.get(super::HARNESS)?;
     if options.keys().any(|key| reserved(key)) {
         return Some(Refusal::new(
-            RefusalKind::VendorOptionConflict,
+            RefusalKind::VendorOptionConflict { field: "vendor" },
             Some(route),
             format!("a vendor option sets a value route {route} owns"),
         ));
@@ -471,10 +523,13 @@ fn vendor_refusal(route: &'static str, vendor: &VendorOptions) -> Option<Refusal
 }
 
 /// Normalized prefixes of the flag, setting and environment-override
-/// families the recipe owns (C2 §6.1, packet §4): each names several
-/// spellings or members (`permissionMode`, `permissionPromptTool`, …;
-/// `ANTHROPIC_*`, `CLAUDE_CODE_*`).
-const RESERVED_PREFIXES: [&str; 19] = [
+/// families the recipe owns (C2 §6.1, §6.3, packet §4): each names
+/// several spellings or members (`permissionMode`, `permissionPromptTool`,
+/// …; `ANTHROPIC_*`, `CLAUDE_CODE_*`; `--resume-session-at`,
+/// `--remote-control-session-name-prefix`).
+const RESERVED_PREFIXES: [&str; 21] = [
+    "resume",
+    "remotecontrol",
     "permission",
     "dangerously",
     "allowdangerously",
@@ -498,13 +553,25 @@ const RESERVED_PREFIXES: [&str; 19] = [
 
 /// Normalized names matched exactly (review r2 #7, r3 #3 and #4): the
 /// recipe's singleton flags, the launch environment's variables (the
-/// known locale variables included), and VIA's canonical parameters.
-const RESERVED_NAMES: [&str; 48] = [
+/// known locale variables included), VIA's canonical parameters, and the
+/// flags that change the process's mode, where its session runs, or the
+/// stream VIA reads (C2 §6.3, `claude --help` 2.1.290).
+const RESERVED_NAMES: [&str; 58] = [
+    "help",
+    "version",
+    "bg",
+    "background",
+    "cloud",
+    "teleport",
+    "desktop",
+    "frompr",
+    "includehookevents",
+    "forwardsubagenttext",
+    "sdkurl",
     "env",
     "environment",
     "tool",
     "tools",
-    "resume",
     "sessionid",
     "continue",
     "forksession",
@@ -550,8 +617,9 @@ const RESERVED_NAMES: [&str; 48] = [
     "allowuntested",
 ];
 
-/// Single-letter flags the recipe owns: `-p`, `-r` and `-c`.
-const RESERVED_SHORT: [&str; 3] = ["p", "r", "c"];
+/// Single-letter flags the recipe owns, or that change the process's
+/// mode or working directory: `-p`, `-r`, `-c`, `-w`, `-h` and `-v`.
+const RESERVED_SHORT: [char; 6] = ['p', 'r', 'c', 'w', 'h', 'v'];
 
 /// A key without leading dashes, lowercased, with `-`, `_` and `.`
 /// removed: `--permission-mode`, `permissionMode` and `PERMISSION_MODE`
@@ -571,8 +639,12 @@ fn reserved(key: &str) -> bool {
         .get(..3)
         .is_some_and(|head| head.eq_ignore_ascii_case("lc_"));
     let key = normalize(key);
+    let mut letters = key.chars();
+    let short = letters
+        .next()
+        .filter(|letter| letters.next().is_none() && RESERVED_SHORT.contains(letter));
     locale
-        || RESERVED_SHORT.contains(&key.as_str())
+        || short.is_some()
         || RESERVED_NAMES.contains(&key.as_str())
         || RESERVED_PREFIXES
             .iter()
@@ -775,6 +847,229 @@ mod tests {
         }
     }
 
+    fn vendor_args(list: &[&str]) -> VendorArgs {
+        VendorArgs::try_from(list.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>()).unwrap()
+    }
+
+    /// C2 §6.3, packet §4 (`claude --help` 2.1.290): a raw argument that
+    /// sets what the recipe owns is `vendor_option_conflict` naming
+    /// `vendor_args`, in its long, short, `=value`, alias and normalized
+    /// spellings, inside a switch cluster, after a value, and as `--` or an
+    /// operand.
+    #[test]
+    fn vendor_args_reserved_flags_are_refused() {
+        let refused = |list: &[&str]| args_refusal("claude-cli", &vendor_args(list));
+        for case in [
+            &["--permission-mode", "bypassPermissions"][..],
+            &["--permission-mode=bypassPermissions"],
+            &["--permissionMode=plan"],
+            &["--PERMISSION_MODE", "plan"],
+            &["--permission-prompt-tool", "x"],
+            &["--dangerously-skip-permissions"],
+            &["--allow-dangerously-skip-permissions"],
+            &["--allowedTools=Bash"],
+            &["--allowed-tools", "Bash"],
+            &["--disallowed-tools=Bash"],
+            &["--tools="],
+            &["--model=opus"],
+            &["--fallback-model", "opus"],
+            &["--settings={}"],
+            &["--setting-sources=user"],
+            &["--mcp-config", "x.json"],
+            &["--strict-mcp-config"],
+            &["--plugin-dir=/x"],
+            &["--agents={}"],
+            &["--agent", "x"],
+            &["--disable-slash-commands"],
+            &["--resume=abc"],
+            &["--resume-session-at", "x"],
+            &["--session-id=x"],
+            &["--continue"],
+            &["--fork-session"],
+            &["--no-session-persistence"],
+            &["--output-format=json"],
+            &["--input-format", "text"],
+            &["--include-partial-messages"],
+            &["--include-hook-events"],
+            &["--forward-subagent-text"],
+            &["--replay-user-messages"],
+            &["--verbose"],
+            &["--print"],
+            &["--append-system-prompt", "x"],
+            &["--system-prompt-file=/x"],
+            &["--system-prompt-snapshot=off"],
+            &["--max-turns=3"],
+            &["--effort=max"],
+            &["--json-schema={}"],
+            &["--add-dir=/"],
+            &["--worktree"],
+            &["--bare"],
+            &["--safe-mode"],
+            &["--restricted"],
+            &["--background"],
+            &["--bg"],
+            &["--cloud"],
+            &["--environment=env"],
+            &["--teleport"],
+            &["--desktop"],
+            &["--from-pr", "1"],
+            &["--remote-control"],
+            &["--remote-control-session-name-prefix=x"],
+            &["--sdk-url=ws://x"],
+            &["--help"],
+            &["--version"],
+            &["-p"],
+            &["-c"],
+            &["-r", "x"],
+            &["-w"],
+            &["-h"],
+            &["-v"],
+            &["-V"],
+            &["-xp"],
+            &["--debug", "api", "-p"],
+            &["--"],
+            &["update"],
+            &["--debug-file", "/x", "extra"],
+            &["--chrome", "prompt text"],
+        ] {
+            let refusal = refused(case);
+            assert!(
+                refusal.as_ref().is_some_and(|refusal| refusal.kind
+                    == RefusalKind::VendorOptionConflict {
+                        field: "vendor_args"
+                    }
+                    && refusal.field() == Some("vendor_args")
+                    && refusal.kind.code() == "invalid_params"),
+                "{case:?}: {refusal:?}"
+            );
+        }
+    }
+
+    /// C2 §6.3: an unreserved flag passes, with its value attached or
+    /// separate, a variadic one with each of its values.
+    #[test]
+    fn vendor_args_unreserved_flags_pass() {
+        let refused = |list: &[&str]| args_refusal("claude-cli", &vendor_args(list));
+        for case in [
+            &[][..],
+            &["--max-budget-usd", "5"],
+            &["--max-budget-usd=5"],
+            &["--debug-file", "/tmp/d.log"],
+            &["-d"],
+            &["-dapi"],
+            &["-d", "api"],
+            &["--debug", "api,hooks"],
+            &["--betas", "a", "b"],
+            &["--file", "f1:a", "f2:b"],
+            &["-n", "name"],
+            &["--name=x"],
+            &["--chrome"],
+            &["--no-chrome"],
+            &["--ide"],
+            &["--brief"],
+            &["--autocompact", "auto"],
+            &["--exclude-dynamic-system-prompt-sections"],
+            &["--prompt-suggestions", "false"],
+            &["--ax-screen-reader", "--tmux"],
+        ] {
+            assert_eq!(refused(case), None, "{case:?}");
+        }
+    }
+
+    /// C2 §6.3: spawn's plan lists the raw-argument refusal, and
+    /// `check_turn` re-judges the session's frozen list; a list it admits
+    /// is part of the handshake-refusal recipe key, so a refusal cached for
+    /// one list never refuses another.
+    #[test]
+    fn plan_and_check_turn_judge_vendor_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let (adapter, instances, binary) = adapter_in(dir.path());
+        let harness = Harness::Vendor(&crate::harness::HARNESSES[0]);
+        let model = || crate::plan::ModelChoice {
+            requested: None,
+            resolved: adapter.resolve(None),
+        };
+        let now = std::time::Instant::now();
+        let request = DescribeRequest {
+            harness: Some("claude".to_owned()),
+            vendor_args: vendor_args(&["--model", "opus"]),
+            ..DescribeRequest::default()
+        };
+        let plan = adapter.plan_at(harness, &request, model(), Inherit::OD2_DEFAULT, now);
+        assert_eq!(
+            plan.refusals.iter().map(Refusal::field).collect::<Vec<_>>(),
+            [Some("vendor_args")]
+        );
+        let turn = |list: &[&str]| TurnParams {
+            vendor_args: vendor_args(list),
+            inherit: Some(Inherit::OD2_DEFAULT),
+            ..TurnParams::default()
+        };
+        assert_eq!(
+            adapter.check_turn_at("claude-cli", &turn(&["-p"]), now)[0].field(),
+            Some("vendor_args")
+        );
+        let passing = vendor_args(&["--max-budget-usd=1"]);
+        instances.record_refusal(
+            &binary,
+            launch::recipe_key(
+                ClaudeMode::Unrestricted,
+                Inherit::OD2_DEFAULT,
+                false,
+                &passing,
+            ),
+            crate::instance::Incompatibility::ReadbackDiffers("tools"),
+            now,
+        );
+        assert!(
+            adapter
+                .check_turn_at("claude-cli", &turn(&[]), now)
+                .is_empty()
+        );
+        assert_eq!(
+            adapter.check_turn_at("claude-cli", &turn(&["--max-budget-usd=1"]), now)[0].kind,
+            RefusalKind::VersionRefused
+        );
+    }
+
+    /// C2 §6.3: the session's raw arguments count toward Host's launch
+    /// request; a list that would not fit is `invalid_params` naming
+    /// `vendor_args` when it is the largest contributor, while a small one
+    /// beside large instructions leaves `instructions` named.
+    #[test]
+    fn launch_request_counts_vendor_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let (adapter, _instances, _binary) = adapter_in(dir.path());
+        let now = std::time::Instant::now();
+        let turn = |args: VendorArgs, instructions: usize| TurnParams {
+            instructions: instructions > 0,
+            vendor_args: args,
+            sizes: ParamSizes {
+                instructions,
+                cwd: 8,
+                model: 6,
+                ..ParamSizes::default()
+            },
+            inherit: Some(Inherit::OD2_DEFAULT),
+            ..TurnParams::default()
+        };
+        let fields = |turn: &TurnParams| {
+            adapter
+                .check_turn_at("claude-cli", turn, now)
+                .iter()
+                .map(Refusal::field)
+                .collect::<Vec<_>>()
+        };
+        let big =
+            VendorArgs::try_from(vec![format!("--name={}", "z".repeat(16 * 1024 - 7))]).unwrap();
+        assert_eq!(fields(&turn(big, 0)), [Some("vendor_args")]);
+        assert!(fields(&turn(vendor_args(&["--name=x"]), 0)).is_empty());
+        assert_eq!(
+            fields(&turn(vendor_args(&["--name=x"]), 16 * 1024)),
+            [Some("instructions")]
+        );
+    }
+
     /// Review r1 #8: a handshake refusal cached for the schema recipe does
     /// not refuse the plain recipe, and the other way round.
     #[test]
@@ -792,18 +1087,27 @@ mod tests {
         let requested = Inherit::OD2_DEFAULT;
         instances.record_refusal(
             &binary,
-            launch::recipe_key(ClaudeMode::Unrestricted, requested, true),
+            launch::recipe_key(
+                ClaudeMode::Unrestricted,
+                requested,
+                true,
+                &VendorArgs::default(),
+            ),
             crate::instance::Incompatibility::ReadbackDiffers("tools"),
             std::time::Instant::now(),
         );
         let harness = Harness::Vendor(&crate::harness::HARNESSES[0]);
         let now = std::time::Instant::now();
         assert_eq!(
-            adapter.version(harness, requested, true, now).1,
+            adapter
+                .version(harness, (requested, &VendorArgs::default()), true, now)
+                .1,
             VersionStatus::Refused
         );
         assert_ne!(
-            adapter.version(harness, requested, false, now).1,
+            adapter
+                .version(harness, (requested, &VendorArgs::default()), false, now)
+                .1,
             VersionStatus::Refused
         );
     }
@@ -899,6 +1203,7 @@ mod tests {
                 effort: None,
                 output_schema: None,
                 max_steps: None,
+                vendor_args: &[],
             };
             let owner = crate::ProcessOwner::Turn {
                 session_id: id.clone(),
@@ -988,6 +1293,7 @@ mod tests {
             effort: None,
             output_schema: Some(&schema),
             max_steps: None,
+            vendor_args: &[],
         };
         let owner = crate::ProcessOwner::Turn {
             session_id: id.clone(),
@@ -1018,7 +1324,12 @@ mod tests {
         let written = std::time::Instant::now();
         instances.record_refusal(
             &binary,
-            launch::recipe_key(ClaudeMode::Unrestricted, Inherit::OD2_DEFAULT, false),
+            launch::recipe_key(
+                ClaudeMode::Unrestricted,
+                Inherit::OD2_DEFAULT,
+                false,
+                &VendorArgs::default(),
+            ),
             crate::instance::Incompatibility::FeatureAbsent("interrupt_receipt_v1"),
             written,
         );
@@ -1098,7 +1409,12 @@ mod tests {
         let written = std::time::Instant::now();
         instances.record_refusal(
             &binary,
-            launch::recipe_key(ClaudeMode::Unrestricted, Inherit::OD2_DEFAULT, false),
+            launch::recipe_key(
+                ClaudeMode::Unrestricted,
+                Inherit::OD2_DEFAULT,
+                false,
+                &VendorArgs::default(),
+            ),
             crate::instance::Incompatibility::FeatureAbsent("interrupt_receipt_v1"),
             written,
         );
@@ -1142,7 +1458,12 @@ mod tests {
         instances.record_version(harness.name(), &other, "2.1.290".to_owned());
         instances.record_refusal(
             &other,
-            launch::recipe_key(ClaudeMode::Unrestricted, Inherit::OD2_DEFAULT, false),
+            launch::recipe_key(
+                ClaudeMode::Unrestricted,
+                Inherit::OD2_DEFAULT,
+                false,
+                &VendorArgs::default(),
+            ),
             crate::instance::Incompatibility::FeatureAbsent("interrupt_receipt_v1"),
             now,
         );
@@ -1191,6 +1512,7 @@ mod tests {
                     effort,
                     bound: None,
                     vendor: &vendor,
+                    vendor_args: &VendorArgs::default(),
                     sizes: ParamSizes {
                         instructions,
                         output_schema,
