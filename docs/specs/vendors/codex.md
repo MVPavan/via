@@ -746,13 +746,15 @@ and no daemon force dropped it; the connection did not fail before the
 cutoff and the lane never overflowed; the turn's delivery was neither cut
 mid-message nor stopped; and, unless delivery decided at the terminal,
 nothing was dropped, left in the lane or outstanding at the cutoff and the
-registration did not fail. Decided or not, nothing before the terminal,
-in the connection's read order, may have been lost: the first message the
-connection's routing rejected (undecodable, uncorrelated or otherwise
-refused) comes after the terminal. A rejection fails the connection, yet
-its drain still routes what Wire admitted behind it, so a terminal can be
-retained after a lost sample: it keeps its status and answer, not its
-sum. Anything else (an uncorrelated or malformed message failing the
+registration did not fail. Decided or not, nothing the turn's accounting
+covered may have been lost in the connection's read order: the first
+message the connection's routing rejected (undecodable, uncorrelated or
+otherwise refused) comes after the last message the turn's delivery took
+before its seal, which is the terminal, or what closed an interrupted
+terminal's P7 window. A rejection fails the connection, yet its drain still
+routes what Wire admitted behind it, so a terminal, or a P7-closing tool
+end, can follow a lost sample: the turn keeps its status and answer, not
+its sum. Anything else (an uncorrelated or malformed message failing the
 connection, a connection loss, a stall while an interrupted terminal
 drains, an overflow) gives the all-`null` aggregate,
 on the retained terminal or on `TurnEnd.aggregate` (C2 §5): a lost
@@ -790,7 +792,7 @@ time; retain raw-span evidence for every scenario.
 | `codex_usage_snapshot` | Keyless `last` samples sum to the turn's usage (20522 + 20613), scope `turn`; `total` and cache-write counts go to `vendor`; wrong-turn usage does not attach; missing cost/counts stay unavailable. |
 | `codex_overflow_before_the_second_sample` | One sample delivered, then the lane overflows before the second: `overflow`, all-`null` tokens, never the first sample's 100. |
 | `codex_uncorrelated_usage_fails_the_connection` | A delivered sample, then a `thread/tokenUsage/updated` with no `turnId` fails the connection: `protocol`, all-`null` tokens, never the delivered 100. The consumer test `a_sample_lost_while_draining_unaccounts_the_turn` covers a sample stalled while an interrupted terminal drains. |
-| `codex_terminal_after_a_rejected_sample` | A delivered sample, then one burst of a sample with no `turnId` and the valid `turn/completed`: the drain routes the terminal, which is retained with its answer, but the tokens are all-`null`. Its control `codex_rejected_sample_after_the_terminal` (the terminal first in the burst) keeps the delivered 100. |
+| `codex_terminal_after_a_rejected_sample` | A delivered sample, then one burst of a sample with no `turnId` and the valid `turn/completed`: the drain routes the terminal, which is retained with its answer, but the tokens are all-`null`. Its control `codex_rejected_sample_after_the_terminal` (the terminal first in the burst) keeps the delivered 100. `codex_p7_end_after_a_rejected_sample`: an interrupted terminal retained with a tool open, then one burst of a sample with no `turnId` and the tool's end, which closes P7 → all-`null` tokens; its control `codex_rejected_sample_after_the_p7_end` (the tool's end first) keeps 100. |
 | `codex_server_close` | Idle retirement closes stdin, then S1's hard stop; a C1 close of one session only unsubscribes and never closes stdin; both give `leftovers: null`. |
 | `codex_server_recovery` | Stdin EOF/server crash affects all live leases; lease release alone does not kill; verified Host group evidence is separate from unknown submission; restart issues no start/resume for uncertain live turns. |
 

@@ -3797,6 +3797,20 @@ fn codex_interrupt_written() {
     }
 }
 
+/// The line ending `c3_interrupt_uncertain`'s command, as its interrupt
+/// left it: `failed`, exit 130.
+fn tool_ended(replay: &Value) -> Result<String, String> {
+    let started = step_with(replay, "\"type\":\"commandExecution\"")?;
+    Ok(line_of(replay, started)?
+        .replace(
+            "\"method\":\"item/started\"",
+            "\"method\":\"item/completed\"",
+        )
+        .replace("\"status\":\"inProgress\"", "\"status\":\"failed\"")
+        .replace("\"exitCode\":null", "\"exitCode\":130")
+        .replace("\"startedAtMs\"", "\"completedAtMs\""))
+}
+
 /// Ruling 21 (x.3.2 X3 fix r1): the harness measures `cleanup_settles`.
 /// A variant of `c3_interrupt_uncertain` whose command ends before the
 /// interrupted terminal: no tool is open at the acknowledgement, so the
@@ -3808,16 +3822,7 @@ fn codex_interrupt_settles_at_terminal() {
     let mut expect = expect_of("c3_interrupt_uncertain").unwrap();
     replay["source"] = json!(format!("{name}: a variant of c3_interrupt_uncertain"));
     expect["source"] = replay["source"].clone();
-    let started = step_with(&replay, "\"type\":\"commandExecution\"").unwrap();
-    let ended = line_of(&replay, started)
-        .unwrap()
-        .replace(
-            "\"method\":\"item/started\"",
-            "\"method\":\"item/completed\"",
-        )
-        .replace("\"status\":\"inProgress\"", "\"status\":\"failed\"")
-        .replace("\"exitCode\":null", "\"exitCode\":130")
-        .replace("\"startedAtMs\"", "\"completedAtMs\"");
+    let ended = tool_ended(&replay).unwrap();
     let acknowledged = step_with(&replay, "\"result\":{}}").unwrap();
     steps(&mut replay)
         .unwrap()
@@ -4084,6 +4089,82 @@ fn codex_rejected_sample_after_the_terminal() {
     expect["sessions"]["main"]["close"] = json!({
         "mode": "graceful", "vendor_closed": false, "cleanup": "uncertain",
     });
+    variant(name, &replay, &expect).unwrap();
+}
+
+/// `c3_interrupt_uncertain` with its sample 100 tokens, cut after its
+/// interrupted terminal, which is retained with the command open and so
+/// opens P7 (x.3.2 X4 D4.1); then, 500 ms on, `tail` with the command's
+/// end. The P7 window is 3 s, so that end closes it: the turn settles
+/// when its tools end, `quiescent`, well after its terminal.
+fn interrupted_then(
+    name: &str,
+    tail: impl FnOnce(String) -> Vec<Value>,
+) -> Result<(Value, Value), String> {
+    let mut replay = replay_of("c3_interrupt_uncertain")?;
+    let mut expect = expect_of("c3_interrupt_uncertain")?;
+    replay["source"] = json!(format!("{name}: a variant of c3_interrupt_uncertain"));
+    expect["source"] = replay["source"].clone();
+    let ended = tool_ended(&replay)?;
+    let sample = step_with(&replay, "thread/tokenUsage/updated")?;
+    steps(&mut replay)?[sample] = token_usage(100);
+    let terminal = step_with(&replay, "\"status\":\"interrupted\"")?;
+    let mut after = vec![json!({"delay": {"ms": 500}})];
+    after.extend(tail(ended));
+    cut_after(&mut replay, terminal, &after)?;
+    let turn = turn_mut(&mut expect, 0);
+    turn["tool_grace_ms"] = json!(3000);
+    let turn = &mut turn["expect"];
+    turn["cleanup"] = json!("quiescent");
+    turn["cleanup_settles"] = json!("when_tools_end");
+    turn["observations_include"]
+        .as_array_mut()
+        .ok_or("no observations_include")?
+        .push(json!({"kind": "progress",
+            "tools_ended": ["exec-019a0000-0000-7000-8000-000000400004"]}));
+    Ok((replay, expect))
+}
+
+/// C2 §5 (picrit round 6): accounting runs on through P7, so the boundary
+/// is the last message the turn's delivery took, not its terminal. The
+/// interrupted terminal is retained at T with the command open; one burst
+/// then holds a 50-token sample naming no turn (T+1), which fails the
+/// connection, and the command's end (T+2), which the drain still routes
+/// and which closes P7. Usage is unavailable. Before the fix only the
+/// terminal's T was compared, and the delivered 100 stood.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn codex_p7_end_after_a_rejected_sample() {
+    let name = "codex_p7_end_after_a_rejected_sample";
+    let _points = admitted_in_bursts();
+    let (replay, mut expect) = interrupted_then(name, |ended| {
+        vec![
+            burst(&[uncorrelated_usage(50).to_string(), ended]),
+            sigterm(),
+        ]
+    })
+    .unwrap();
+    let turn = &mut turn_mut(&mut expect, 0)["expect"];
+    turn["usage"] = unavailable();
+    variant(name, &replay, &expect).unwrap();
+}
+
+/// C2 §5 (picrit round 6), the P7 control: the command's end closes P7
+/// before the rejected sample in the burst, so the delivered sum stands.
+#[test]
+fn codex_rejected_sample_after_the_p7_end() {
+    let name = "codex_rejected_sample_after_the_p7_end";
+    let (replay, mut expect) = interrupted_then(name, |ended| {
+        vec![
+            burst(&[ended, uncorrelated_usage(50).to_string()]),
+            sigterm(),
+        ]
+    })
+    .unwrap();
+    let turn = &mut turn_mut(&mut expect, 0)["expect"];
+    turn["usage"] = json!({"from": "samples", "input_tokens": 100, "cached_input_tokens": 0,
+        "output_tokens": 0, "reasoning_output_tokens": 0, "total_tokens": 100,
+        "scope": "turn"});
     variant(name, &replay, &expect).unwrap();
 }
 

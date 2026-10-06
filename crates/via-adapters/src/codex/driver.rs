@@ -2673,12 +2673,15 @@ pub(super) enum Cut {
 ///   cutoff. A decided delivery took the whole turn in order through its
 ///   terminal, so what the lane holds or loses after it is later traffic;
 ///   a failure before it would have stopped the turn's delivery instead;
-/// - nothing before the terminal, in the connection's read order, was
-///   lost (picrit round 5): the first message the connection's routing
-///   rejected (`rejected`, its decode sequence) comes after the terminal.
-///   A rejection fails the connection, but the drain still routes what
-///   Wire admitted behind it, so a decided terminal can follow a lost
-///   sample; it keeps its status and answer, not its sum.
+/// - nothing the turn's accounting covered was lost in the connection's
+///   read order (picrit rounds 5 and 6): the first message the
+///   connection's routing rejected (`rejected`, its decode sequence) comes
+///   after the last message the turn's delivery took before its seal
+///   (`Sealed::last_seq`): the terminal, or what closed an interrupted
+///   terminal's P7 window. A rejection fails the connection, but the drain
+///   still routes what Wire admitted behind it, so a decided terminal, or
+///   a P7-closing tool end, can follow a lost sample; the turn keeps its
+///   status and answer, not its sum.
 ///
 /// Anything else (an uncorrelated or malformed message failing the
 /// connection, a connection loss, a stall while the terminal drains, an
@@ -2703,11 +2706,7 @@ pub(super) fn accounted(
         && !sealed.partial
         && sealed.stop.is_none()
         && (cut == Cut::Decided || rest_whole())
-        && rejected.is_none_or(|rejected| {
-            sealed
-                .terminal_seq
-                .is_some_and(|terminal| terminal < rejected)
-        })
+        && rejected.is_none_or(|rejected| sealed.last_seq < rejected)
 }
 
 /// The cutoff a turn's wait finds already reached as it resumes: the
