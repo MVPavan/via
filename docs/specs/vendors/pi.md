@@ -623,13 +623,20 @@ predicate.
   a committed `GroupAbsent` proof, whether held, busy, or not yet re-held
   from the journal after a restart.
 - **Bound.** One pass of runtime §5.2's non-signalling probe, within the
-  turn's wall deadline. It signals nothing, waits for nothing and acquires
-  no lock or writer.
-- **Not proven** (a group still present, a probe denial or namespace
-  mismatch, an identity-less record, an unread recovery record, an
-  uncommitted proof): `Err(Rejected{UncertainPredecessor})` with no-launch
-  evidence → `failed(submit_failed)`,
-  `failure.data.reason:"uncertain_predecessor"` (OD-PI-1).
+  turn's wall deadline. It signals nothing, waits for no vendor process,
+  and acquires no vendor or session-file lock or writer; it waits only for
+  its Store replies and may commit an absence proof.
+- **Not proven** (the Store answered and a record is still without a
+  proof: a group still present or busy, a probe denial or namespace
+  mismatch, an identity-less record, a recovery record not yet re-held):
+  `Err(Rejected{UncertainPredecessor})` with no-launch evidence →
+  `failed(submit_failed)`, `failure.data.reason:"uncertain_predecessor"`
+  (OD-PI-1).
+- **Store failure** (decision C-3, orchestrator, 2026-10-06): a Store read
+  that fails or outlives the deadline, or a proof the pass observed but
+  could not commit, is the check's `Err`, the turn's Store failure as for
+  any Host journal failure, never `uncertain_predecessor`. Nothing is
+  launched.
 - **Several turns.** If turn A leaves a survivor, turn B refuses without
   launching, and turn C's check still finds A, because the predicate is A's
   group, not B's clean outcome. Once Host proves A's group absent, turns
@@ -637,10 +644,12 @@ predicate.
 - **Unchanged:** C1 §7.3 dispatch, earlier envelopes,
   `predecessor_cleanup_uncertain` on turns that launch, and the no-resend
   rule.
-- **Existing mechanism.** Host's `reprobe_held(deadline, Some(session))`
-  already proves a session's held groups and Core's close loops it (E66).
-  It skips busy groups and reads only the in-memory ledger, so runtime §5.2's pre-launch check adds
-  those two cases.
+- **Mechanism.** Host's `session_predecessors_resolved(session, deadline)`
+  (runtime §5.2), through Route and Wire. It runs Host's
+  `reprobe_held(deadline, Some(session))`, which proves a session's held
+  groups and which Core's close loops (E66), then reads the Store for the
+  two cases the pass cannot see: busy groups and records outside the
+  in-memory ledger. Not extended to Claude (L10).
 
 ## 8. Required fixture tests (none run by this design)
 

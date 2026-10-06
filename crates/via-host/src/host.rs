@@ -1315,6 +1315,65 @@ impl Host {
         Ok(report)
     }
 
+    /// Runtime §5.2's session-scoped pre-launch absence check (Pi R1): true
+    /// only when every `Turn`-owned anchor record of `session` has a
+    /// committed `GroupAbsent` proof. One [`Self::reprobe_held`] pass over
+    /// the session's held groups first proves any that are gone; then one
+    /// Store read counts every record of the session still without a proof:
+    /// a busy group, a present one, and a record this Host has not re-held
+    /// since a restart. It sends no signal, waits for no group and holds
+    /// nothing; both steps share `deadline`.
+    ///
+    /// `Ok(false)` only when the Store answered and a group is unproven.
+    /// Every Store failure is `Err` (decision C-3): a failed or timed-out
+    /// read, a reply that arrives only after the deadline, and a proof the
+    /// pass observed but did not commit (the token stays held for the next
+    /// pass). A deadline spent before the Store read is
+    /// [`HostError::Deadline`].
+    ///
+    /// The answer is a snapshot of the Store at the read: an acquisition of
+    /// the session committed after it is not seen. Callers serialize a
+    /// session's launches so that none can start between this check and
+    /// the launch it guards (Core runs at most one turn of a session at a
+    /// time).
+    pub async fn session_predecessors_resolved(
+        &self,
+        session: &crate::SessionId,
+        deadline: Deadline,
+    ) -> Result<bool, HostError> {
+        if Instant::now() >= deadline.instant() {
+            return Err(HostError::Deadline);
+        }
+        let pass = self.reprobe_held(deadline, Some(session.clone())).await?;
+        if !pass.not_committed.is_empty() {
+            return Err(HostError::Journal {
+                site: JournalSite::Absence,
+                uncertain: false,
+            });
+        }
+        if Instant::now() >= deadline.instant() {
+            return Err(HostError::Deadline);
+        }
+        let read = timeout_at(
+            deadline.instant(),
+            self.journal.session_anchors_unproven(session.clone()),
+        )
+        .await;
+        match read {
+            // `timeout_at` polls the read before its timer: a reply ready
+            // only once the checker resumed past the deadline is still
+            // returned here, and is refused as a read that did not complete
+            // in time.
+            Ok(Ok(_)) if Instant::now() >= deadline.instant() => Err(HostError::Store(
+                "session anchor read completed after its deadline",
+            )),
+            Ok(Ok(unproven)) => Ok(!unproven),
+            Ok(Err(kind)) => Err(HostError::StoreUnavailable(kind)),
+            // A read that never completed is a Store failure, not unresolved.
+            Err(_) => Err(HostError::Store("session anchor read timed out")),
+        }
+    }
+
     async fn reprobe_one(
         &self,
         record: AnchorRecord,

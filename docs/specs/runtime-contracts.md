@@ -490,6 +490,9 @@ impl Host {
         -> impl Future<Output = Result<AcquiredProcess, HostError>> + Send;
     pub fn recover(&self, intents: Vec<ProcessIntent>, deadline: Deadline)
         -> impl Future<Output = Vec<RecoveryReport>> + Send;
+    /// §5.2 session-scoped pre-launch absence check; sends no signal.
+    pub fn session_predecessors_resolved(&self, session: &SessionId, deadline: Deadline)
+        -> impl Future<Output = Result<bool, HostError>> + Send;
     /// Returned on every path, including an expired deadline or journal failure.
     pub fn shutdown(&self, deadline: Deadline) -> impl Future<Output = ShutdownReport> + Send;
 }
@@ -761,7 +764,23 @@ committed `GroupAbsent` proof as unresolved, including busy groups and
 journal records not yet re-held after a restart. The route asks for it
 through Wire before a launch; it is one pass of this probe within the turn's
 wall deadline, signals nothing and holds nothing. Core's existing close-time
-re-probe keeps its current scope.
+re-probe keeps its current scope. Host's
+`session_predecessors_resolved(session, deadline)`, passed through
+unchanged by Wire and Route, runs one `reprobe_held` pass filtered to the
+session (identity checks and the probe; a gone group's proof commits in the
+same pass), then one Store read of the session's `Turn` anchors with
+`absence_time IS NULL` (the session-owned clause of the close and status
+cleanup predicate, §6 `anchors`, without its `server_turns` clause);
+`Ok(true)` only when none remains. `Ok(false)` means the Store
+answered and a group is unproven. A Store failure is `Err`, never `false`
+(decision C-3, orchestrator, 2026-10-06): a failed or timed-out read, a
+reply that arrives only after the deadline, an uncertain proof commit, and
+a proof the pass observed but did not commit (`Journal {Absence}`; its
+token stays held). A deadline spent before the Store read is
+`HostError::Deadline`. The answer is a Store snapshot at the read; callers
+serialize a session's launches (Core runs one turn of a session at a time),
+so no launch of the session starts between the check and the launch it
+guards.
 
 A lost final anchor reply initially means uncertain outcome. A later fresh
 `ESRCH` can settle **cleanup** to quiescent, including after autonomous EOF
@@ -845,8 +864,10 @@ uses the same writer/sender and has no spawn, turn, handle, result, event or
 log-query method, except two narrow link operations:
 `commit_server_turn(anchor_id, session, turn)`, which inserts a link only for
 a server-owned anchor and a `running` turn, and `server_links(turns)`, a
-bounded read of at most 256 links. Host/ProcessControl hold only that
-restricted journal.
+bounded read of at most 256 links. Its one session-scoped anchor read,
+`session_anchors_unproven(session)`, answers whether any `Turn` anchor of
+the session lacks an absence proof (§5.2 pre-launch check). Host/ProcessControl
+hold only that restricted journal.
 Core's StoreClient has no evidence-root or journal accessor. Inspect production
 call sites: only Store owns `Store::open`, Wire calls `into_wire_parts` and
 creates evidence folders, and Host calls the journal operations. This no-call rule

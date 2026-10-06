@@ -385,6 +385,7 @@ impl Command {
                 | Self::QueuedTurns(..)
                 | Self::AnchorRecords(..)
                 | Self::ServerLinks(..)
+                | Self::SessionAnchorsUnproven(..)
         )
     }
 
@@ -419,6 +420,7 @@ impl Command {
             Self::QueuedTurns(..) => "store.read.corrupt.queued_turns",
             Self::AnchorRecords(..) => "store.read.corrupt.anchor_records",
             Self::ServerLinks(..) => "store.read.corrupt.server_links",
+            Self::SessionAnchorsUnproven(..) => "store.read.corrupt.session_anchors",
             Self::Spawn(..)
             | Self::Resume(..)
             | Self::Submission(..)
@@ -563,6 +565,10 @@ fn serve_read(conn: &Connection, command: Command, corruption: &ReadCorruption) 
         Command::ServerLinks(turns, reply) => {
             let links = seam.and_then(|()| read_server_links(conn, &turns));
             answer_journal(corruption, reply, links);
+        }
+        Command::SessionAnchorsUnproven(session, reply) => {
+            let unproven = seam.and_then(|()| session_anchors_unproven(conn, session.as_str()));
+            answer_journal(corruption, reply, unproven);
         }
         // `is_read` returned every other command above.
         command @ (Command::Spawn(..)
@@ -761,6 +767,7 @@ fn serve_mutation(conn: &mut Connection, command: Command) {
         | Command::QueuedTurns(..)
         | Command::AnchorRecords(..)
         | Command::ServerLinks(..)
+        | Command::SessionAnchorsUnproven(..)
         | Command::VerifyBlobs(..)
         | Command::SweepBlobs(..)
         | Command::SteerIntentsResolved(..) => {}
@@ -2707,6 +2714,18 @@ fn read_session_status(
         steps,
         more,
     }))
+}
+
+/// Some `Turn`-owned anchor of the session has no absence proof (runtime
+/// §5.2 pre-launch check): [`session_cleanup_uncertain`]'s first clause. A
+/// server-owned anchor has no `owner_session`, so it never counts.
+fn session_anchors_unproven(conn: &Connection, session: &str) -> Result<bool, StoreError> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM anchors WHERE owner_session=?1 AND absence_time IS NULL)",
+        [session],
+        |row| row.get(0),
+    )
+    .map_err(sql_error)
 }
 
 /// The close and status cleanup predicate (runtime §6 `server_turns`):

@@ -1305,6 +1305,7 @@ pub(crate) enum Command {
         Vec<(SessionId, TurnNumber)>,
         oneshot::Sender<Result<Vec<ServerLink>, StoreFailureKind>>,
     ),
+    SessionAnchorsUnproven(SessionId, oneshot::Sender<Result<bool, StoreFailureKind>>),
     VerifyBlobs(oneshot::Sender<Result<(), StoreError>>),
     SweepBlobs(oneshot::Sender<Result<u64, StoreError>>),
 }
@@ -1428,7 +1429,8 @@ impl Command {
             | Self::Revisable(session, _, _)
             | Self::Events(session, _, _, _)
             | Self::EvidenceRefs(session, _, _)
-            | Self::Authenticate(session, _, _) => (session.as_str().len(), 0, 0),
+            | Self::Authenticate(session, _, _)
+            | Self::SessionAnchorsUnproven(session, _) => (session.as_str().len(), 0, 0),
             Self::Status(query, _) => (query.session.as_str().len(), 0, 0),
             Self::EventsPage(query, _) => (
                 query.session.as_str().len() + query.types.iter().map(String::len).sum::<usize>(),
@@ -2808,6 +2810,22 @@ impl ProcessJournal {
         owner: Option<SessionId>,
     ) -> Result<Vec<AnchorRecord>, StoreFailureKind> {
         self.records_page(after, limit, true, owner, None).await
+    }
+
+    /// Whether some `Turn`-owned anchor of `session` has no absence proof:
+    /// the first clause of the close and status cleanup predicate, read for
+    /// runtime §5.2's session-scoped pre-launch absence check. Shared-server
+    /// anchors and other sessions' anchors do not count.
+    pub async fn session_anchors_unproven(
+        &self,
+        session: SessionId,
+    ) -> Result<bool, StoreFailureKind> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::SessionAnchorsUnproven(session, reply))
+            .map_err(|error| error.kind())?;
+        receive
+            .await
+            .unwrap_or(Err(StoreFailureKind::UncertainCommit))
     }
 
     /// Commits a server-route turn's link to its server anchor (runtime

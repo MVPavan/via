@@ -665,6 +665,403 @@ fn a_session_filtered_reprobe_counts_only_that_sessions_groups() {
     });
 }
 
+impl Fixture {
+    /// Leaves one held, unproven group of `owner`'s turn 1 (design §7.2 row
+    /// 4): the caller arms `store.journal.identified` to fail and
+    /// `host.anchor.before_eof_cleanup` to pause, so the acquisition's own
+    /// absence check finds the anchor present and Host keeps its token.
+    /// Returns the group's pgid.
+    async fn leave_unproven(&self, host: &Host, owner: SessionId) -> u32 {
+        let before = self.anchor_groups();
+        let mut spec = self.spec("/bin/cat", &[]);
+        spec.owner = ProcessOwner::Turn {
+            session_id: owner,
+            turn: turn(1),
+        };
+        spec.capacity = Some(Box::new(Token(Arc::new(AtomicBool::new(false)))));
+        let failure = host
+            .acquire_retaining(spec, within(4), &LaunchPipes::default(), &never())
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(failure.cleanup, Some(CleanupEvidence::Uncertain(_))),
+            "{failure:?}"
+        );
+        let mut new = self.anchor_groups();
+        new.retain(|pgid| !before.contains(pgid));
+        assert_eq!(new.len(), 1, "{new:?}");
+        new[0]
+    }
+
+    /// The process groups of this fixture's live anchors, found as
+    /// [`Self::anchors_alive`] finds them; the identified commit failed, so
+    /// the Store holds no identity to read them from.
+    fn anchor_groups(&self) -> Vec<u32> {
+        let marker = format!(
+            "VIA_HOST_TEST_CONFIG={}/",
+            self.root.join("anchors").to_string_lossy()
+        );
+        let Ok(processes) = fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        processes
+            .flatten()
+            .filter(|process| {
+                fs::read(process.path().join("environ")).is_ok_and(|environ| {
+                    environ
+                        .split(|byte| *byte == 0)
+                        .any(|entry| entry.starts_with(marker.as_bytes()))
+                })
+            })
+            .filter_map(|process| {
+                let stat = fs::read_to_string(process.path().join("stat")).ok()?;
+                // Field 5, after the parenthesised command name.
+                stat.rsplit_once(')')?
+                    .1
+                    .split_whitespace()
+                    .nth(2)?
+                    .parse()
+                    .ok()
+            })
+            .collect()
+    }
+}
+
+/// Bead via-itc B1 (runtime §5.2 pre-launch check): a busy group, one whose
+/// verified control is still live, is skipped by the re-probe and still
+/// counts as unresolved, so the check is false; it leaves the vendor
+/// running. Once the group's own close proves it absent, the check is true.
+#[test]
+fn a_busy_group_leaves_the_session_unresolved() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        let mut spec = fixture.spec("/bin/cat", &[]);
+        spec.capacity = Some(Box::new(Token(Arc::new(AtomicBool::new(false)))));
+        let acquired = host.acquire(spec, within(4)).await.unwrap();
+        let record = fixture.records().await.remove(0);
+        let pgid = record.identity.as_ref().unwrap().pgid;
+        let resolved = host
+            .session_predecessors_resolved(&session(), within(2))
+            .await
+            .unwrap();
+        assert!(!resolved, "a busy group was taken for resolved");
+        assert!(host.live_armed(std::slice::from_ref(&record.intent.anchor_id)));
+        assert!(!group_gone(pgid));
+        let close = acquired
+            .control
+            .close(CloseRequest {
+                mode: CloseMode::Force,
+                deadline: within(3),
+            })
+            .await;
+        assert!(
+            matches!(close.cleanup, CleanupEvidence::GroupAbsent(_)),
+            "{close:?}"
+        );
+        let resolved = host
+            .session_predecessors_resolved(&session(), within(2))
+            .await
+            .unwrap();
+        assert!(resolved, "a proven group still counted");
+    });
+}
+
+/// Bead via-itc B2: after a restart, a Store record that the new Host has
+/// not re-held counts as unresolved even when its group is in fact gone:
+/// the re-probe reads only the in-memory ledger, and the Store query finds
+/// the record without a proof.
+#[test]
+fn a_record_not_re_held_leaves_the_session_unresolved() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let earlier = fixture.host();
+        fixture.arm("store.journal.identified", "fail_io");
+        fixture.arm("host.anchor.before_eof_cleanup", "pause");
+        let pgid = fixture.leave_unproven(&earlier, session()).await;
+        fixture.release("host.anchor.before_eof_cleanup");
+        assert!(eventually(Duration::from_secs(3), || group_gone(pgid)).await);
+        let restarted = fixture.host();
+        let resolved = restarted
+            .session_predecessors_resolved(&session(), within(2))
+            .await
+            .unwrap();
+        assert!(!resolved, "an unread record was taken for resolved");
+        assert!(fixture.records().await[0].absence.is_none());
+    });
+}
+
+/// Bead via-itc B3: a held group whose anchor has exited is proved absent by
+/// the check's own pass, which commits the proof, so the same call is true.
+#[test]
+fn a_dead_held_group_is_proved_in_the_same_pass() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        fixture.arm("store.journal.identified", "fail_io");
+        fixture.arm("host.anchor.before_eof_cleanup", "pause");
+        let pgid = fixture.leave_unproven(&host, session()).await;
+        fixture.release("host.anchor.before_eof_cleanup");
+        assert!(eventually(Duration::from_secs(3), || group_gone(pgid)).await);
+        assert_eq!(host.held_unproven(), 1);
+        let resolved = host
+            .session_predecessors_resolved(&session(), within(2))
+            .await
+            .unwrap();
+        assert!(resolved, "a dead group was not proved in the pass");
+        assert_eq!(host.held_unproven(), 0);
+        assert!(fixture.records().await[0].absence.is_some());
+    });
+}
+
+/// Bead via-itc B4: a held group that is still present is probed, found
+/// present and kept: the check is false and sends no signal, so the paused
+/// anchor (which escalates its group to KILL on TERM) is still alive.
+#[test]
+fn a_live_held_group_is_unresolved_and_not_signalled() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        fixture.arm("store.journal.identified", "fail_io");
+        fixture.arm("host.anchor.before_eof_cleanup", "pause");
+        let pgid = fixture.leave_unproven(&host, session()).await;
+        let resolved = host
+            .session_predecessors_resolved(&session(), within(2))
+            .await
+            .unwrap();
+        assert!(!resolved, "a present group was taken for resolved");
+        assert!(
+            !eventually(Duration::from_millis(300), || group_gone(pgid)).await,
+            "the check signalled the group"
+        );
+        assert_eq!(host.held_unproven(), 1);
+        assert!(fixture.records().await[0].absence.is_none());
+    });
+}
+
+/// Bead via-itc B5: only the session's own `Turn` anchors count. Another
+/// session's held group, already dead, is neither probed nor proved by this
+/// session's pass: its record stays unproven and its token held. A live
+/// shared server linked to one of this session's turns does not count
+/// either: the check reads the session's `Turn` anchors, not the close and
+/// status predicate's server links. The other session's own check then
+/// proves its group.
+#[test]
+fn other_sessions_and_servers_do_not_count() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        fixture.spawn_session(other_session()).await;
+        let host = fixture.host();
+        fixture.arm("store.journal.identified", "fail_io");
+        fixture.arm("host.anchor.before_eof_cleanup", "pause");
+        let pgid = fixture.leave_unproven(&host, other_session()).await;
+        fixture.release("host.anchor.before_eof_cleanup");
+        assert!(eventually(Duration::from_secs(3), || group_gone(pgid)).await);
+        fixture.disarm("host.anchor.before_eof_cleanup");
+        fixture.run_turn_one(session()).await;
+        let server = host
+            .acquire(server_spec(&fixture), within(4))
+            .await
+            .unwrap();
+        server
+            .control
+            .link_turn(&session(), turn(1), within(2))
+            .await
+            .unwrap();
+        assert_eq!(fixture.links(session()).await.len(), 1);
+        let mine = host
+            .session_predecessors_resolved(&session(), within(2))
+            .await
+            .unwrap();
+        assert!(mine, "another session's group or a linked server counted");
+        let foreign_unproven = |records: &[via_store::AnchorRecord]| {
+            records.iter().any(|record| {
+                matches!(&record.intent.owner,
+                    ProcessOwner::Turn { session_id, .. } if *session_id == other_session())
+                    && record.absence.is_none()
+            })
+        };
+        assert!(
+            foreign_unproven(&fixture.records().await),
+            "this session's check proved another session's group"
+        );
+        assert_eq!(host.held_unproven(), 1, "another session's token released");
+        let theirs = host
+            .session_predecessors_resolved(&other_session(), within(2))
+            .await
+            .unwrap();
+        assert!(theirs, "the owning session's check did not prove its group");
+        assert!(!foreign_unproven(&fixture.records().await));
+        assert_eq!(host.held_unproven(), 0);
+        server
+            .control
+            .close(CloseRequest {
+                mode: CloseMode::Force,
+                deadline: within(3),
+            })
+            .await;
+    });
+}
+
+/// Bead via-itc B6, decision C-3: a failed session read is a Store failure,
+/// `Err`, never an unresolved (`false`) answer.
+#[test]
+fn a_failed_session_read_is_a_store_error() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        fixture.arm("store.read.corrupt.session_anchors", "fail_io");
+        let failure = host
+            .session_predecessors_resolved(&session(), within(2))
+            .await
+            .unwrap_err();
+        assert!(fixture.acked("store.read.corrupt.session_anchors"));
+        assert!(
+            matches!(failure, HostError::StoreUnavailable(_)),
+            "{failure:?}"
+        );
+    });
+}
+
+/// Bead via-itc B6, decision C-3: a failed journal page read in the pass is
+/// a Store failure, `Err`.
+#[test]
+fn a_failed_pass_read_is_a_store_error() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        fixture.arm("store.journal.identified", "fail_io");
+        fixture.arm("host.anchor.before_eof_cleanup", "pause");
+        fixture.leave_unproven(&host, session()).await;
+        fixture.arm("store.read.corrupt.anchor_records", "fail_io");
+        let failure = host
+            .session_predecessors_resolved(&session(), within(2))
+            .await
+            .unwrap_err();
+        assert!(fixture.acked("store.read.corrupt.anchor_records"));
+        assert!(
+            matches!(failure, HostError::StoreUnavailable(_)),
+            "{failure:?}"
+        );
+    });
+}
+
+/// Bead via-itc B6, decision C-3: a proof the pass observed but could not
+/// commit is a Store failure, `Err(Journal)`, and the token stays held.
+#[test]
+fn a_proof_not_committed_is_a_store_error() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        fixture.arm("store.journal.identified", "fail_io");
+        fixture.arm("host.anchor.before_eof_cleanup", "pause");
+        let pgid = fixture.leave_unproven(&host, session()).await;
+        fixture.release("host.anchor.before_eof_cleanup");
+        assert!(eventually(Duration::from_secs(3), || group_gone(pgid)).await);
+        fixture.arm("store.journal.absence", "fail_io");
+        let failure = host
+            .session_predecessors_resolved(&session(), within(2))
+            .await
+            .unwrap_err();
+        assert!(fixture.acked("store.journal.absence"));
+        assert!(
+            matches!(
+                failure,
+                HostError::Journal {
+                    site: JournalSite::Absence,
+                    uncertain: false
+                }
+            ),
+            "{failure:?}"
+        );
+        assert_eq!(host.held_unproven(), 1);
+    });
+}
+
+/// Bead via-itc, runtime §5.2: the check is bounded by the caller's
+/// deadline. A Store read held past it ends at the deadline as a Store
+/// failure, never as resolved. A spent deadline reads nothing (`Deadline`):
+/// the writer then serves only the probe read that follows.
+#[test]
+fn the_check_respects_its_deadline() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        fixture.arm("store.read.stall", "pause");
+        let started = tokio::time::Instant::now();
+        let failure = host
+            .session_predecessors_resolved(&session(), within(1))
+            .await
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        // Released before any assertion, and a read behind the stalled one
+        // answered: the writer has resumed before the fixture's drop removes
+        // the release file and joins it.
+        fixture.release("store.read.stall");
+        assert!(fixture.records().await.is_empty());
+        assert!(fixture.acked("store.read.stall"));
+        assert!(matches!(failure, HostError::Store(_)), "{failure:?}");
+        assert!(elapsed < Duration::from_millis(1_500), "took {elapsed:?}");
+        let spent = Deadline::at(tokio::time::Instant::now());
+        let reads = fixture.store.read_count();
+        let failure = host
+            .session_predecessors_resolved(&session(), spent)
+            .await
+            .unwrap_err();
+        assert!(matches!(failure, HostError::Deadline), "{failure:?}");
+        // The writer serves reads in order: had the check sent one, it would
+        // be counted before this probe read's reply.
+        assert!(fixture.records().await.is_empty());
+        assert_eq!(fixture.store.read_count(), reads + 1, "the check read");
+    });
+}
+
+/// Critical review of via-itc (Important): `timeout_at` polls the read
+/// before its timer, so a reply that is ready when the checker resumes past
+/// its deadline must still be refused as a Store failure, never `Ok(true)`.
+/// The writer holds the check's read; this one-thread runtime is blocked
+/// past the deadline, so the checker cannot run; the read is released and a
+/// read queued behind it answered off the runtime, so the check's reply is
+/// ready before the checker is polled again.
+#[test]
+fn a_reply_ready_only_after_the_deadline_is_a_store_error() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        fixture.arm("store.read.stall", "pause");
+        let deadline = within(1);
+        let check = tokio::spawn({
+            let host = host.clone();
+            async move {
+                host.session_predecessors_resolved(&session(), deadline)
+                    .await
+            }
+        });
+        assert!(eventually(Duration::from_secs(5), || fixture.acked("store.read.stall")).await);
+        std::thread::sleep(
+            deadline
+                .instant()
+                .saturating_duration_since(tokio::time::Instant::now())
+                + Duration::from_millis(50),
+        );
+        fixture.release("store.read.stall");
+        let journal = fixture.journal();
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(journal.list_anchor_records_page(None, via_store::ANCHOR_PAGE_LIMIT))
+        })
+        .join()
+        .unwrap()
+        .unwrap();
+        let result = check.await.unwrap();
+        assert!(matches!(result, Err(HostError::Store(_))), "{result:?}");
+    });
+}
+
 /// Design §2 rule 1: the pre-ARM gate checks the caller's stop as well as
 /// the force signal. Set, no ARM is sent and no vendor launches; the failed
 /// acquisition's own absence verification is the cleanup evidence.
