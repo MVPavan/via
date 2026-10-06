@@ -73,6 +73,28 @@ rejected: tools would inherit the password.
 
 No session mutation or prompt is sent before publication.
 
+**Vendor argument passthrough: refused in the first release (owner,
+2026-10-06; C2 §6.3).** Arguments on the server's argv are per server,
+and §3.2's fence allows one live server per namespace data root, so a
+session with a different list would need a second server on a data root
+that already has one. The route therefore refuses any non-empty `vendor_args` in
+`plan` and `check_turn`, before any receipt or vendor I/O, as
+`InvalidParam { field: "vendor_args" }`: C1 `invalid_params` naming
+`vendor_args`, with no kind2, the same refusal the `fake` harness gives.
+`vendor_option_conflict` is not used, because it means "sets what the
+route owns", and this refuses every list, reserved or not. The session's
+results carry no `vendor_passthrough`, since no session of this route has
+the arguments.
+
+Revisit after the release, if OpenCode passthrough is wanted. The
+arguments must then join the namespace (and with it `recipe_hash` and the
+data-root fence), so that each distinct list gets its own namespace and
+server. Reserved flags would then be extracted from the pinned binary, as
+the Claude and Codex packets do: `serve --stdio --port --hostname`,
+`--service`, `--standalone`, `--cors`, `--mdns*`, help and version, any
+flag that selects configuration, profile, project, data directory or log
+destination, every operand, and `--`.
+
 **Failure classes.**
 
 - **Transient startup failure**: spawn error, exit before the URL line, the

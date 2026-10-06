@@ -22,6 +22,7 @@ use crate::driver::DriverKind;
 use crate::fake::FakeAdapter;
 use crate::harness::{FAKE, HARNESSES, Harness};
 use crate::instance::{InstanceCache, resolve_binary};
+use crate::passthrough::VendorArgs;
 use crate::{AdapterError, RuntimeConfig, RuntimeResources};
 
 /// A C1 §4 `bound`.
@@ -54,6 +55,8 @@ pub struct DescribeRequest {
     pub require: Vec<VerbReq>,
     /// Vendor options.
     pub vendor: VendorOptions,
+    /// Spawn's raw vendor arguments (C2 §6.3); `describe` passes none.
+    pub vendor_args: VendorArgs,
     /// The session's working directory.
     pub cwd: Option<PathBuf>,
     /// Stored for C1 compatibility; no effect (C2 §5).
@@ -103,6 +106,9 @@ pub struct TurnParams {
     pub max_steps: Option<u64>,
     /// Vendor options.
     pub vendor: VendorOptions,
+    /// The session's frozen raw vendor arguments (C2 §6.3): re-judged, and
+    /// part of the launch's size and key.
+    pub vendor_args: VendorArgs,
     /// The encoded sizes of the session's frozen instructions and the
     /// turn's effective schema, inherited or set.
     pub sizes: ParamSizes,
@@ -152,8 +158,12 @@ pub enum RefusalKind {
     UnknownModel,
     /// A cached handshake check refused this binary.
     VersionRefused,
-    /// A vendor option uses a reserved key.
-    VendorOptionConflict,
+    /// A vendor option uses a reserved key, or a vendor argument sets
+    /// what the route reserves (C2 §6.3).
+    VendorOptionConflict {
+        /// The C1 parameter: `vendor` or `vendor_args`.
+        field: &'static str,
+    },
     /// A parameter the route refuses.
     InvalidParam {
         /// The C1 parameter.
@@ -174,7 +184,7 @@ impl RefusalKind {
             Self::BoundUnsupported => "bound_unsupported",
             Self::HarnessUnavailable | Self::VersionRefused => "harness_unavailable",
             Self::UnknownModel => "unknown_model",
-            Self::VendorOptionConflict | Self::InvalidParam { .. } => "invalid_params",
+            Self::VendorOptionConflict { .. } | Self::InvalidParam { .. } => "invalid_params",
             Self::MissingCapability { .. } => "missing_capability",
         }
     }
@@ -214,9 +224,10 @@ impl Refusal {
     /// The C1 parameter this refusal names, if any.
     pub fn field(&self) -> Option<&'static str> {
         match &self.kind {
-            RefusalKind::InvalidParam { field } => Some(field),
+            RefusalKind::InvalidParam { field } | RefusalKind::VendorOptionConflict { field } => {
+                Some(field)
+            }
             RefusalKind::BoundUnsupported => Some("bound"),
-            RefusalKind::VendorOptionConflict => Some("vendor"),
             RefusalKind::MissingCapability { verb } => Some(verb.as_str()),
             RefusalKind::UnsupportedVerb
             | RefusalKind::HarnessUnavailable

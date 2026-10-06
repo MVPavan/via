@@ -1745,6 +1745,225 @@ fn claude_s_launch_config_applies_after_restart() -> TestResult {
     })
 }
 
+/// Raw vendor arguments a passthrough session passes (owner, 2026-10-06):
+/// an option with a separate value, a short option with an attached
+/// value and a long one with `=value` and a space, none reserved.
+const PASSED: [&str; 4] = ["--max-budget-usd", "5", "-dapi", "--name=via passthrough"];
+
+/// A lifetime whose argv ends with [`PASSED`], as a passthrough session
+/// launches (C2 §6.3: appended after VIA's own arguments).
+fn passing(mut lifetime: Value) -> Value {
+    if let Some(argv) = lifetime["argv"].as_array_mut() {
+        argv.extend(PASSED.iter().map(|arg| json!(arg)));
+    }
+    lifetime
+}
+
+/// The number of `vendor_passthrough` warnings a receipt, envelope or
+/// status carries.
+fn passthrough_warnings(value: &Value) -> usize {
+    value["warnings"].as_array().map_or(0, |warnings| {
+        warnings
+            .iter()
+            .filter(|warning| warning["code"] == "vendor_passthrough")
+            .count()
+    })
+}
+
+/// Owner, 2026-10-06 (C1 §3.2, §4 `vendor_args`; C2 §6.3): `via spawn …
+/// -- ARGS` appends ARGS unchanged to every launch of the session (the
+/// fake checks each argv exactly), frozen at spawn and stored with the
+/// session: a resume reuses them, and so does a resume after a daemon
+/// restart. Each receipt, envelope and status of the session carries one
+/// `vendor_passthrough` warning; a plain session's carry none. `--` on
+/// `via resume` is `invalid_params` kind2 `session_scope_on_resume`
+/// naming `vendor_args`, with no launch; a bare `--` sends nothing and the
+/// resume proceeds.
+#[test]
+fn claude_passthrough_args_frozen_across_resume_and_restart() -> TestResult {
+    scenario("claude_passthrough_frozen", |d, evidence| {
+        let mut lives = vec![
+            passing(completing(Launch::New, false, "ONE", 0.001)),
+            completing(Launch::New, false, "PLAIN", 0.001),
+        ];
+        d.replay(&lives)?;
+        let daemon = Daemon::start(d, evidence, "before")?;
+        let mut extra = vec!["--"];
+        extra.extend(PASSED);
+        let receipt = d.spawn(evidence, "spawn-passing", &ask("ONE"), &extra)?;
+        let session = session_of(&receipt)?;
+        let first = d.wait(evidence, &format!("{session}/1"))?;
+        let status = d.status(evidence, "status-passing", &session)?;
+        let uuid = first["vendor_session_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        check(
+            completed(&first)
+                && !uuid.is_empty()
+                && [&receipt, &first, &status]
+                    .iter()
+                    .all(|value| passthrough_warnings(value) == 1),
+            || format!("the passthrough session: {receipt} {first} {status}"),
+        )?;
+        let plain_receipt = d.spawn(evidence, "spawn-plain", &ask("PLAIN"), &[])?;
+        let plain = session_of(&plain_receipt)?;
+        let plain_first = d.wait(evidence, &format!("{plain}/1"))?;
+        let plain_status = d.status(evidence, "status-plain", &plain)?;
+        check(
+            completed(&plain_first)
+                && [&plain_receipt, &plain_first, &plain_status]
+                    .iter()
+                    .all(|value| passthrough_warnings(value) == 0),
+            || format!("the plain session: {plain_receipt} {plain_first} {plain_status}"),
+        )?;
+        let error = d.refused(
+            evidence,
+            "resume-with-args",
+            &[
+                "resume", &session, "--prompt", "p", "--handle", HANDLE, "--json", "--", "--model",
+                "opus",
+            ],
+            "invalid_params",
+        )?;
+        check(
+            error["data"]["kind2"] == "session_scope_on_resume"
+                && error["data"]["field"] == "vendor_args"
+                && d.launches()?.len() == 2,
+            || format!("resume with vendor_args: {error}"),
+        )?;
+        lives.push(passing(completing(
+            Launch::Resume(&uuid),
+            false,
+            "TWO",
+            0.002,
+        )));
+        d.replay(&lives)?;
+        // C1 §1, §3.3: a bare `--` on resume sends nothing and is ignored.
+        let resumed = d.ok(
+            evidence,
+            "resume-2",
+            &[
+                "resume",
+                &session,
+                "--prompt",
+                &ask("TWO"),
+                "--handle",
+                HANDLE,
+                "--json",
+                "--",
+            ],
+        )?;
+        let second = d.wait(evidence, &format!("{session}/2"))?;
+        check(
+            completed(&second)
+                && passthrough_warnings(&resumed) == 1
+                && passthrough_warnings(&second) == 1,
+            || format!("the resumed turn: {resumed} {second}"),
+        )?;
+        daemon.shutdown()?;
+        lives.push(passing(completing(
+            Launch::Resume(&uuid),
+            false,
+            "THREE",
+            0.003,
+        )));
+        d.replay(&lives)?;
+        let _daemon = Daemon::start(d, evidence, "final")?;
+        let resumed = d.resume(evidence, "resume-3", &session, &ask("THREE"))?;
+        let third = d.wait(evidence, &format!("{session}/3"))?;
+        let status = d.status(evidence, "status-after-restart", &session)?;
+        check(
+            completed(&third)
+                && d.launches()?.len() == 4
+                && [&resumed, &third, &status]
+                    .iter()
+                    .all(|value| passthrough_warnings(value) == 1),
+            || format!("after the restart: {resumed} {third} {status}"),
+        )
+    })
+}
+
+/// Owner, 2026-10-06 (C1 §4 `vendor_args`; C2 §6.3; packet §4): a
+/// reserved flag in any long, `=value`, normalized or short form, a short
+/// cluster holding a reserved letter, an operand and `--` itself are
+/// `invalid_params` kind2 `vendor_option_conflict` naming `vendor_args`;
+/// past 64 arguments or 16 KiB `invalid_params` naming `vendor_args`
+/// (NUL cannot cross an argv: C1 protocol tests cover it). None commits a
+/// session or launches; then unreserved arguments pass and launch.
+#[test]
+fn claude_passthrough_reserved_and_bounds_refused() -> TestResult {
+    scenario("claude_passthrough_refused", |d, evidence| {
+        d.replay(&[passing(completing(Launch::New, false, "ONE", 0.001))])?;
+        let _daemon = Daemon::start(d, evidence, "final")?;
+        let work = d.work.to_string_lossy().into_owned();
+        let spawn = |name: &str, passed: &[&str]| {
+            let mut args = vec![
+                "spawn",
+                "--harness",
+                "claude",
+                "--model",
+                "haiku",
+                "--prompt",
+                "p",
+                "--cwd",
+                &work,
+                "--handle",
+                HANDLE,
+                "--background",
+                "--json",
+                "--",
+            ];
+            args.extend_from_slice(passed);
+            d.refused(evidence, name, &args, "invalid_params")
+        };
+        for (name, passed) in [
+            ("long", &["--permission-mode", "bypassPermissions"][..]),
+            ("attached", &["--permission-mode=bypassPermissions"]),
+            ("normalized", &["--Permission_Mode=default"]),
+            ("alias", &["--allowed-tools", "Bash"]),
+            ("short", &["-p"]),
+            ("cluster", &["-xp"]),
+            ("prefix", &["--resume-session-at", "x"]),
+            ("operand", &["hello"]),
+            ("value-then-operand", &["--max-budget-usd", "5", "hello"]),
+            ("double-dash", &["--", "--model"]),
+        ] {
+            let error = spawn(&format!("spawn-{name}"), passed)?;
+            check(
+                error["data"]["kind2"] == "vendor_option_conflict"
+                    && error["data"]["field"] == "vendor_args",
+                || format!("{name}: {error}"),
+            )?;
+        }
+        let many: Vec<String> = (0..65).map(|n| format!("--x{n}")).collect();
+        let long = format!("--name={}", "z".repeat(16 * 1024));
+        for (name, passed) in [
+            (
+                "too-many",
+                many.iter().map(String::as_str).collect::<Vec<_>>(),
+            ),
+            ("too-long", vec![long.as_str()]),
+        ] {
+            let error = spawn(&format!("spawn-{name}"), &passed)?;
+            check(
+                error["data"]["kind2"].is_null() && error["data"]["field"] == "vendor_args",
+                || format!("{name}: {error}"),
+            )?;
+        }
+        check(d.rows("sessions")? == 0 && d.launches()?.is_empty(), || {
+            "a refused spawn committed or launched".to_owned()
+        })?;
+        let mut extra = vec!["--"];
+        extra.extend(PASSED);
+        let session = session_of(&d.spawn(evidence, "spawn-passing", &ask("ONE"), &extra)?)?;
+        let envelope = d.wait(evidence, &format!("{session}/1"))?;
+        check(completed(&envelope) && d.launches()?.len() == 1, || {
+            format!("the unreserved arguments: {envelope}")
+        })
+    })
+}
+
 /// C2 §5 through the daemon: `describe` and receipts report the last
 /// version an init reported for this harness and program path (before
 /// any launch `null`/`untested`, after one its version, here untested and

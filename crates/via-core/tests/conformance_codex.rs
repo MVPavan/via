@@ -1590,6 +1590,7 @@ fn codex_steer_declaration_matches_the_driver() {
         },
         confirmed_vendor_session_id: None,
         allow_untested: false,
+        vendor_args: via_adapters::VendorArgs::default(),
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

@@ -27,6 +27,7 @@ use via_routes::codex::{ServerId, Servers};
 use crate::config::{BootstrapEnv, CodexSettings};
 use crate::harness::Harness;
 use crate::instance::InstanceCache;
+use crate::passthrough::{self, VendorArgs};
 use crate::plan::{
     Bound, CatalogModel, DescribeRequest, Inherit, ModelChoice, Refusal, RefusalKind, RoutePlan,
     ServerKey, TurnCheck, TurnParams, VendorOptions, effective_inherit,
@@ -82,6 +83,7 @@ struct PerTurn<'a> {
     bound: Option<&'a Bound>,
     max_steps: bool,
     vendor: &'a VendorOptions,
+    vendor_args: &'a VendorArgs,
 }
 
 impl CodexAdapter {
@@ -127,19 +129,46 @@ impl CodexAdapter {
         self.servers.vendor_state_dir().join(HARNESS)
     }
 
-    /// The launch recipe of a server for `requested`'s inherited settings.
-    fn recipe(&self, requested: Inherit) -> ServerRecipe {
+    /// The launch recipe of a server for `requested`'s inherited settings
+    /// and a session's raw arguments (C2 §6.3).
+    fn recipe(&self, requested: Inherit, vendor_args: &VendorArgs) -> ServerRecipe {
         ServerRecipe::new(
             &self.binary,
             (requested, self.settings),
             &self.env,
             &self.vendor_home(),
         )
+        .with_vendor_args(vendor_args)
     }
 
-    /// The server key of `requested`'s recipe: what equal sessions share.
-    fn server_key(&self, requested: Inherit) -> String {
-        self.recipe(requested).config_hash(ADAPTER_VERSION).hex()
+    /// The server key of `requested`'s recipe with `vendor_args`: what
+    /// equal sessions share.
+    fn server_key(&self, requested: Inherit, vendor_args: &VendorArgs) -> String {
+        self.recipe(requested, vendor_args)
+            .config_hash(ADAPTER_VERSION)
+            .hex()
+    }
+
+    /// C2 §6.3: a session with raw arguments whose server recipe does not
+    /// fit Host's launch request is refused naming `vendor_args`; with
+    /// none, the recipe is VIA's own and is not judged here.
+    fn launch_refusal(
+        &self,
+        route: &'static str,
+        (requested, vendor_args): (Inherit, &VendorArgs),
+    ) -> Option<Refusal> {
+        (!vendor_args.is_empty() && !self.recipe(requested, vendor_args).fits()).then(|| {
+            Refusal::new(
+                RefusalKind::InvalidParam {
+                    field: "vendor_args",
+                },
+                Some(route),
+                format!(
+                    "the server's launch arguments, vendor_args included, exceed route \
+                     {route}'s 64 KiB launch request limit"
+                ),
+            )
+        })
     }
 
     /// The refusal-cache key (C2 §5; codex-server.md, the refusal cache's
@@ -147,9 +176,14 @@ impl CodexAdapter {
     /// handshake's echo check compares. The server stays shared across
     /// bounds, models and directories, but a refusal under one never
     /// refuses another.
-    fn refusal_key(&self, requested: Inherit, echoed: &plan::Echoed<'_>) -> String {
+    fn refusal_key(
+        &self,
+        requested: Inherit,
+        vendor_args: &VendorArgs,
+        echoed: &plan::Echoed<'_>,
+    ) -> String {
         use std::fmt::Write as _;
-        let mut key = self.server_key(requested);
+        let mut key = self.server_key(requested, vendor_args);
         key.push('/');
         for byte in &Sha256::digest(format!("{echoed:?}"))[..8] {
             // Writing to a `String` cannot fail.
@@ -182,7 +216,7 @@ impl CodexAdapter {
     /// The models `requested`'s server discovered (C1 §3.13 `models`, and
     /// model-only resolution): none before its discovery.
     pub(crate) fn listed(&self, requested: Inherit) -> Vec<CatalogModel> {
-        self.catalog(&self.server_key(requested))
+        self.catalog(&self.server_key(requested, &VendorArgs::default()))
             .iter()
             .flat_map(|catalog| catalog.iter())
             .map(|model| CatalogModel {
@@ -205,7 +239,7 @@ impl CodexAdapter {
         requested: Inherit,
     ) -> Result<RoutePlan, Refusal> {
         let route = harness.route();
-        let key = self.server_key(requested);
+        let key = self.server_key(requested, &req.vendor_args);
         let catalog = self.catalog(&key);
         let model = resolved_model(req.model.as_deref(), catalog.as_deref()).ok_or_else(|| {
             Refusal::new(
@@ -222,8 +256,10 @@ impl CodexAdapter {
                 bound: req.bound.as_ref(),
                 max_steps: false,
                 vendor: &req.vendor,
+                vendor_args: &req.vendor_args,
             },
         );
+        refusals.extend(self.launch_refusal(route, (requested, &req.vendor_args)));
         if let Err(verb) = capabilities.require(&req.require) {
             refusals.push(Refusal::new(
                 RefusalKind::MissingCapability { verb },
@@ -256,7 +292,7 @@ impl CodexAdapter {
                 self.instances
                     .refusal(
                         &self.binary,
-                        &self.refusal_key(requested, &echoed),
+                        &self.refusal_key(requested, &req.vendor_args, &echoed),
                         std::time::Instant::now(),
                     )
                     .is_some()
@@ -313,8 +349,15 @@ impl CodexAdapter {
     ) -> Result<TurnCheck, Refusal> {
         let catalog = turn
             .inherit
-            .and_then(|inherit| self.catalog(&self.server_key(inherit)));
-        Self::judge_turn(route, stored_version, turn, catalog.as_deref())
+            .and_then(|inherit| self.catalog(&self.server_key(inherit, &turn.vendor_args)));
+        let checked = Self::judge_turn(route, stored_version, turn, catalog.as_deref())?;
+        match turn
+            .inherit
+            .and_then(|inherit| self.launch_refusal(route, (inherit, &turn.vendor_args)))
+        {
+            Some(refusal) => Err(refusal),
+            None => Ok(checked),
+        }
     }
 
     /// [`Self::check_turn`] against `catalog`, the session's server key's
@@ -341,6 +384,7 @@ impl CodexAdapter {
             bound: turn.bound.as_ref(),
             max_steps: turn.max_steps.is_some(),
             vendor: &turn.vendor,
+            vendor_args: &turn.vendor_args,
         };
         if let Some(refusal) = refusals(route, &per_turn).into_iter().next() {
             return Err(refusal);
@@ -368,7 +412,8 @@ impl CodexAdapter {
 }
 
 /// Every per-turn refusal, in C1 member order: `effort`, `max_steps`,
-/// `bound`, `vendor`. `output_schema` is native and never refused.
+/// `bound`, `vendor`, then the session's `vendor_args` (C2 §6.3).
+/// `output_schema` is native and never refused.
 fn refusals(route: &'static str, turn: &PerTurn<'_>) -> Vec<Refusal> {
     let invalid = |field, message: String| {
         Refusal::new(RefusalKind::InvalidParam { field }, Some(route), message)
@@ -395,7 +440,7 @@ fn refusals(route: &'static str, turn: &PerTurn<'_>) -> Vec<Refusal> {
     }
     match plan::vendor_refusal(HARNESS, turn.vendor) {
         Some(plan::VendorRefusal::Reserved) => refusals.push(Refusal::new(
-            RefusalKind::VendorOptionConflict,
+            RefusalKind::VendorOptionConflict { field: "vendor" },
             Some(route),
             format!("a vendor option sets what route {route} reserves"),
         )),
@@ -404,6 +449,15 @@ fn refusals(route: &'static str, turn: &PerTurn<'_>) -> Vec<Refusal> {
             format!("route {route} accepts no other vendor options"),
         )),
         None => {}
+    }
+    if let Some(index) = passthrough::conflict(turn.vendor_args.as_slice(), &plan::ARG_RULES) {
+        refusals.push(Refusal::new(
+            RefusalKind::VendorOptionConflict {
+                field: "vendor_args",
+            },
+            Some(route),
+            format!("vendor_args[{index}] sets what route {route} owns"),
+        ));
     }
     refusals
 }

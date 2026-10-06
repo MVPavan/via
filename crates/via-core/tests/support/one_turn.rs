@@ -65,6 +65,7 @@ impl OneTurn {
             },
             confirmed_vendor_session_id: None,
             allow_untested: false,
+            vendor_args: via_adapters::VendorArgs::default(),
         };
         let reference = SessionRef {
             harness: "fake".to_owned(),

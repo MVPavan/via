@@ -131,8 +131,11 @@ One of six library responsibility boundaries, L1 Interface through L6 Host. The 
 A boundary named for its providing layer: C2 Adapter, C3 Route, C4 Wire, C5 Host and S Store. The public C1 contract is named VIA API.
 
 **Passthrough**:
-A proposed later mode that forwards native harness arguments unchanged;
-its results would be marked unstructured. Outside the first release.
+Raw vendor CLI arguments a session passes unchanged (`via spawn … -- ARGS`,
+C1 `vendor_args`), frozen at spawn and appended to every launch; flags the
+route reserves are refused, and every result of the session carries the
+`vendor_passthrough` warning. First-release scope (owner, 2026-10-06).
+_Avoid_: vendor options (the `vendor` parameter's keyed options)
 
 **Cost provenance**:
 A cost label: `reported` (vendor's figure), `estimated` (VIA computed), or `unavailable`.

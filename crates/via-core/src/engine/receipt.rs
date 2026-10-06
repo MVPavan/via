@@ -382,7 +382,11 @@ impl Engine {
         let turn = TurnNumber::try_from(1).map_err(|_| ApiError::STORE)?;
         let session = crate::api::new_session_id()?;
         let version = version_of(&planned.plan);
-        let warnings = plan_warnings(&version, &planned.plan);
+        let mut warnings = plan_warnings(&version, &planned.plan);
+        // Owner, 2026-10-06 (C1 §5): the session's raw vendor arguments.
+        if !members.vendor_args.is_empty() {
+            warnings.push(Warning::VENDOR_PASSTHROUGH);
+        }
         let receipt = Receipt {
             session_id: session.clone(),
             turn: format!("{}/{}", session.as_str(), turn.get()),
@@ -569,7 +573,7 @@ impl Engine {
             .as_deref()
             .map_or_else(|| self.cwd.to_string_lossy(), std::borrow::Cow::Borrowed);
         let params = effective.turn_params(
-            frozen.instructions.as_deref(),
+            (frozen.instructions.as_deref(), &frozen.vendor_args),
             (&cwd, encoded),
             frozen.inherit,
         );
@@ -693,8 +697,9 @@ impl Engine {
     }
 
     /// A turn receipt's warnings (C1 §3.3): the route's version status, as
-    /// a fresh plan of the session's harness and model reports it, and the
-    /// session's frozen `config_switch_unverified`.
+    /// a fresh plan of the session's harness and model reports it, the
+    /// session's frozen `config_switch_unverified`, and its
+    /// `vendor_passthrough` (owner, 2026-10-06).
     fn resume_warnings(&self, frozen: &Frozen) -> Vec<Warning> {
         let request = DescribeRequest {
             harness: Some(frozen.harness.clone()),
@@ -709,6 +714,7 @@ impl Engine {
             .into_iter()
             .collect();
         warnings.extend(frozen.config_warning());
+        warnings.extend(frozen.passthrough_warning());
         warnings
     }
 

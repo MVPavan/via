@@ -108,5 +108,7 @@ The S1 contract set, Rust coding standard, testing policy and S1 scope are
 approved. C1 and C2 supersede older handoff proposals about the envelope,
 background/wait and capabilities. Vendor-dependent decisions remain identified
 in their contract tables and are resolved with evidence in the relevant slice;
-ACP-specific work is outside the first release. Passthrough and thin SDK
-delivery are not part of the first-release acceptance set.
+ACP-specific work is outside the first release. Raw vendor-argument
+passthrough is in the first-release scope (owner, 2026-10-06: `via spawn …
+-- ARGS`, C1 §4 `vendor_args`, C2 §6.3); thin SDK delivery is not part of
+the first-release acceptance set.

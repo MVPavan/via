@@ -187,6 +187,52 @@ fn codex_memories_true_keeps_the_vendor_default() {
     );
 }
 
+/// C2 §6.3, packet §4: a session's raw arguments follow VIA's switches on
+/// the server's argv, so they are in the server key: equal lists share a
+/// server, different lists (or none beside some) never do. The launch
+/// request counts them: a list that would not fit Host's cap is refused.
+#[test]
+fn vendor_args_enter_the_server_argv_and_key() {
+    let recipe = |list: &[&str]| {
+        let args = crate::VendorArgs::try_from(
+            list.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        ServerRecipe::new(
+            Path::new("/bin/codex"),
+            (hooks(InheritState::On), CodexSettings::default()),
+            &env(),
+            Path::new("/state/vendor/codex"),
+        )
+        .with_vendor_args(&args)
+    };
+    let with = recipe(&["--strict-config", "-c", "model_verbosity=low"]);
+    assert_eq!(
+        with.args,
+        [
+            "app-server",
+            "--disable",
+            "memories",
+            "--strict-config",
+            "-c",
+            "model_verbosity=low"
+        ]
+    );
+    let key = |list: &[&str]| recipe(list).config_hash("1");
+    assert_eq!(
+        key(&["--strict-config", "-c", "model_verbosity=low"]),
+        with.config_hash("1")
+    );
+    assert_ne!(key(&["--strict-config"]), key(&[]));
+    assert_ne!(
+        key(&["--strict-config"]),
+        key(&["--analytics-default-enabled"])
+    );
+    assert_ne!(key(&["-c", "a=1"]), key(&["-ca=1"]));
+    assert!(with.fits());
+    assert!(!recipe(&[&format!("--code-mode-host={}", "z".repeat(16 * 1024 - 17))]).fits());
+}
+
 /// Owner 2026-10-05: for the first release Codex disables nothing but
 /// memories, so no request adds `--disable apps`: the user's MCP servers
 /// and Codex's built-in apps server load as configured.
@@ -2059,4 +2105,64 @@ fn codex_normalize_peak_within_allowance() {
         .unwrap();
     println!("decode and normalize peak: {peak} B against {ALLOWANCE} B");
     assert!(peak <= ALLOWANCE, "{peak} B over {ALLOWANCE} B");
+}
+
+/// Critical review (C2 §5, §6.3; packet §4): the handshake-refusal key
+/// is the server key, `vendor_args` included, plus a digest of every
+/// echoed input. Changing the arguments, the model, the directory or the
+/// sandbox, each alone, gives a different key; identical inputs give the
+/// same one.
+#[test]
+fn refusal_key_covers_vendor_args_and_each_echoed_input() {
+    use super::plan::{Echoed, Sandbox};
+    use via_routes::codex::{SandboxMode, SandboxPolicy, testing::TestRuntime};
+    let runtime = TestRuntime::new();
+    let adapter = super::CodexAdapter::new(
+        PathBuf::from("/bin/codex"),
+        std::sync::Arc::default(),
+        (&env(), CodexSettings::default()),
+        runtime.runtime(),
+    );
+    let args = |list: &[&str]| {
+        crate::VendorArgs::try_from(list.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>())
+            .unwrap()
+    };
+    let full = Sandbox {
+        mode: SandboxMode::DangerFullAccess,
+        policy: SandboxPolicy::DangerFullAccess,
+    };
+    let read_only = Sandbox {
+        mode: SandboxMode::ReadOnly,
+        policy: SandboxPolicy::ReadOnly {
+            network_access: false,
+        },
+    };
+    let key = |vendor_args: &[&str], model: &str, cwd: &str, sandbox: &Sandbox| {
+        adapter.refusal_key(
+            Inherit::OD2_DEFAULT,
+            &args(vendor_args),
+            &Echoed {
+                model,
+                cwd: Path::new(cwd),
+                sandbox,
+            },
+        )
+    };
+    let base = key(&[], "gpt-5", "/work", &full);
+    assert_eq!(key(&[], "gpt-5", "/work", &full), base);
+    for (name, other) in [
+        (
+            "vendor_args",
+            key(&["--strict-config"], "gpt-5", "/work", &full),
+        ),
+        ("model", key(&[], "gpt-6", "/work", &full)),
+        ("cwd", key(&[], "gpt-5", "/other", &full)),
+        ("sandbox", key(&[], "gpt-5", "/work", &read_only)),
+    ] {
+        assert_ne!(other, base, "{name}");
+    }
+    assert_eq!(
+        key(&["--strict-config"], "gpt-5", "/work", &full),
+        key(&["--strict-config"], "gpt-5", "/work", &full)
+    );
 }

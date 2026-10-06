@@ -279,6 +279,19 @@ fn unknown_field(name: &'static str, method: &str, params: &Value) -> Case {
     }
 }
 
+/// A fake-harness spawn whose `vendor_args` is `value`: `invalid_params`
+/// with no kind2.
+fn vendor_args(name: &'static str, value: &Value) -> Case {
+    let params = json!({"harness":"fake","model":"fake","prompt":"p","handle":HANDLE,
+        "vendor_args":value});
+    case(
+        name,
+        request_line("spawn", &params),
+        -32602,
+        "invalid_params",
+    )
+}
+
 /// A typed timeout, which `evidenced` records as `timeout`.
 fn timeout(detail: &str) -> Box<dyn Error> {
     Box::new(ScenarioError::Timeout(detail.to_owned()))
@@ -477,6 +490,17 @@ fn c1_request_params_are_typed_and_reject_unknown_fields() -> TestResult {
                 -32602,
                 "invalid_params",
             ),
+            // Owner, 2026-10-06 (C1 §4 `vendor_args`): a typed member,
+            // its bounds and NUL refused naming it, with no kind2.
+            vendor_args("vendor_args null", &json!(null)),
+            vendor_args("vendor_args not an array", &json!("--x")),
+            vendor_args("vendor_args element not a string", &json!([1])),
+            vendor_args("vendor_args NUL", &json!(["--x=a\0b"])),
+            vendor_args("vendor_args over 64", &json!(vec!["--x"; 65])),
+            vendor_args(
+                "vendor_args over 16 KiB",
+                &json!([format!("--x={}", "z".repeat(16 * 1024))]),
+            ),
             // Last: before the fix these stop the daemon.
             unknown_field(
                 "daemon/stop",
@@ -643,6 +667,25 @@ fn c1_cli_parser_errors_are_invalid_params() -> TestResult {
         (vec!["cancel", SESSION, "--", "--private-token"], "command"),
         (vec!["cancel", SESSION, "--", "--json"], "command"),
         (vec!["cancel", SESSION, "--drain"], "command"),
+        // Owner, 2026-10-06: only spawn and resume take values after
+        // `--` (`vendor_args`); elsewhere, and as a stray value before
+        // `--`, they stay unknown arguments.
+        (vec!["status", SESSION, "--", "--model"], "command"),
+        (vec!["wait", SESSION, "--", "x"], "command"),
+        (
+            vec![
+                "spawn",
+                "--harness",
+                "claude",
+                "--model",
+                "haiku",
+                "--prompt",
+                "p",
+                "stray",
+            ],
+            "command",
+        ),
+        (with(&["stray"]), "command"),
         (vec!["cancel", "--json"], "session"),
         (with(&["--max-steps", "nope"]), "--max-steps"),
         (

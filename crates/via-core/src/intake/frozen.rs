@@ -7,7 +7,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use via_adapters::{Bound, Capabilities, InheritPlan, SessionRef, Support, VendorOptions, Verb};
+use via_adapters::{
+    Bound, Capabilities, InheritPlan, SessionRef, Support, VendorArgs, VendorOptions, Verb,
+};
 use via_store::SessionRoute;
 
 use super::{Effective, Planned, SessionMembers};
@@ -45,10 +47,48 @@ struct Params {
     instructions: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     vendor: VendorOptions,
+    /// The raw vendor arguments every launch appends (C1 §4
+    /// `vendor_args`, owner 2026-10-06); omitted when none, so a row
+    /// written before them reads as none.
+    #[serde(default, skip_serializing_if = "VendorArgs::is_empty")]
+    vendor_args: VendorArgs,
+}
+
+/// The `vendor_args` member of a stored `sessions.params`, read alone:
+/// every other member is skipped unread.
+#[derive(Deserialize)]
+struct StoredVendorArgs<'a> {
+    #[serde(default, borrow, deserialize_with = "present")]
+    vendor_args: Option<&'a serde_json::value::RawValue>,
+}
+
+/// A present member's raw text, `null` included.
+fn present<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<&'de serde_json::value::RawValue>, D::Error> {
+    <&serde_json::value::RawValue>::deserialize(deserializer).map(Some)
+}
+
+/// Whether a stored `sessions.params` holds `vendor_args` other than
+/// none: a list that decodes and is non-empty, or a member present that
+/// does not decode (`null` included: corrupt, so warned rather than
+/// dropped). Text that is not a JSON object holds no readable member.
+fn passes_vendor_args(params: &str) -> bool {
+    // serde would also read a struct from an array, by position.
+    if !params.trim_start().starts_with('{') {
+        return false;
+    }
+    let Ok(StoredVendorArgs {
+        vendor_args: Some(raw),
+    }) = serde_json::from_str(params)
+    else {
+        return false;
+    };
+    serde_json::from_str::<VendorArgs>(raw.get()).map_or(true, |args| !args.is_empty())
 }
 
 /// A spawn's frozen `sessions.params` from its plan: its turn-1 `vendor`
-/// options are the session's.
+/// options and its `vendor_args` are the session's.
 pub(crate) fn frozen_params(
     planned: &Planned,
     (params, members, cwd): (&SpawnParams, &SessionMembers, &str),
@@ -61,6 +101,7 @@ pub(crate) fn frozen_params(
         inherit: planned.plan.inherit,
         instructions: members.instructions.clone(),
         vendor: planned.effective.vendor.clone(),
+        vendor_args: members.vendor_args.clone(),
     })
     .map_err(|_| ApiError::STORE)
 }
@@ -79,6 +120,12 @@ pub(crate) struct Frozen {
     pub(crate) cwd: Option<String>,
     pub(crate) instructions: Option<String>,
     pub(crate) vendor: VendorOptions,
+    /// The session's raw vendor arguments (C1 §4 `vendor_args`).
+    pub(crate) vendor_args: VendorArgs,
+    /// Whether the stored row holds `vendor_args` other than none, read
+    /// apart from the other members so a corrupt one cannot hide them
+    /// (critical review, 2026-10-06): the `vendor_passthrough` evidence.
+    passthrough: bool,
     pub(crate) allow_untested: bool,
     /// The frozen `inherit`, as requested and effective; `None` only
     /// where the row's parameters were not read.
@@ -137,6 +184,7 @@ impl Frozen {
             harness: route.harness.clone(),
             route: route.route.clone().unwrap_or_default(),
             adapter_version: route.adapter_version.clone().unwrap_or_default(),
+            passthrough: route.params.as_deref().is_some_and(passes_vendor_args),
             capabilities,
             ..Self::default()
         };
@@ -145,6 +193,7 @@ impl Frozen {
             frozen.cwd = params.cwd;
             frozen.instructions = params.instructions;
             frozen.vendor = params.vendor;
+            frozen.vendor_args = params.vendor_args;
             frozen.allow_untested = params.allow_untested;
             frozen.inherit = Some(params.inherit);
         }
@@ -195,6 +244,13 @@ impl Frozen {
             "config_switch_unverified",
             Some(json!({ "categories": categories })),
         )
+    }
+
+    /// The session's `vendor_passthrough` warning (C1 §5, owner
+    /// 2026-10-06): one while it passes `vendor_args`, else none, even
+    /// where another frozen member is corrupt.
+    pub(crate) fn passthrough_warning(&self) -> Option<Warning> {
+        (self.passthrough || !self.vendor_args.is_empty()).then_some(Warning::VENDOR_PASSTHROUGH)
     }
 }
 
@@ -269,7 +325,37 @@ mod tests {
     use serde_json::json;
     use via_store::SessionRoute;
 
-    use super::Frozen;
+    use super::{Frozen, passes_vendor_args};
+
+    /// Critical review (2026-10-06): `vendor_args` is read alone, so the
+    /// warning's evidence survives any other member's corruption; a
+    /// present member that does not decode is warned, none is not.
+    #[test]
+    fn vendor_args_are_read_apart_from_the_other_members() {
+        for (params, warned) in [
+            (r#"{"vendor_args":["--name=x"],"inherit":null}"#, true),
+            (r#"{"vendor_args":["--name=x"],"model":7}"#, true),
+            (r#"{"vendor_args":[1]}"#, true),
+            (r#"{"vendor_args":null}"#, true),
+            (r#"{"vendor_args":"--x"}"#, true),
+            (r#"{"vendor_args":[]}"#, false),
+            (r#"{"inherit":null}"#, false),
+            ("not json", false),
+            ("[1]", false),
+        ] {
+            assert_eq!(passes_vendor_args(params), warned, "{params}");
+            let route = SessionRoute {
+                harness: "fake".to_owned(),
+                params: Some(params.to_owned()),
+                ..SessionRoute::default()
+            };
+            assert_eq!(
+                Frozen::of(&route).passthrough_warning().is_some(),
+                warned,
+                "{params}"
+            );
+        }
+    }
 
     fn route(params: &serde_json::Value) -> SessionRoute {
         SessionRoute {

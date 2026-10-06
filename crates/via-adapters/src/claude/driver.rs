@@ -207,6 +207,7 @@ fn launch(
         effort: spec.effort.as_deref(),
         output_schema: spec.output_schema.as_deref(),
         max_steps: spec.max_steps,
+        vendor_args: driver.spec.vendor_args.as_slice(),
     };
     let owner = ProcessOwner::Turn {
         session_id: driver.spec.session_id.clone(),
@@ -232,7 +233,7 @@ fn launch(
             schema,
             mcp: inherit.get(Category::McpServers) != InheritState::Off,
         },
-        recipe: recipe_key(mode, inherit, schema),
+        recipe: recipe_key(mode, inherit, schema, &driver.spec.vendor_args),
     })
 }
 
@@ -247,6 +248,8 @@ fn refused_values(driver: &SessionDriver, spec: &TurnSpec) -> Option<TurnEnd> {
         instructions: driver.spec.instructions.is_some(),
         max_steps: spec.max_steps,
         vendor: spec.vendor.clone(),
+        // C2 §6.3: re-judged before every launch.
+        vendor_args: driver.spec.vendor_args.clone(),
         sizes: ParamSizes {
             instructions: driver.spec.instructions.as_deref().map_or(0, str::len),
             output_schema: spec
@@ -275,8 +278,9 @@ fn route() -> &'static str {
 fn start_rejected(refusal: Refusal) -> StartRejected {
     match refusal.kind {
         RefusalKind::BoundUnsupported => StartRejected::BoundUnsupported(refusal.message),
-        RefusalKind::InvalidParam { field } => StartRejected::InvalidParam { field },
-        RefusalKind::VendorOptionConflict => StartRejected::InvalidParam { field: "vendor" },
+        RefusalKind::InvalidParam { field } | RefusalKind::VendorOptionConflict { field } => {
+            StartRejected::InvalidParam { field }
+        }
         RefusalKind::UnsupportedVerb
         | RefusalKind::HarnessUnavailable
         | RefusalKind::UnknownModel

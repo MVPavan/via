@@ -93,7 +93,8 @@ the connection after drain, never reuses an ID.
 A session acquires a lease on a VIA-started server keyed by `config_hash`; the
 observed binary version is reported, not keyed. It does not hash credential
 contents. The hash covers, in order, a domain tag, the adapter version, the
-resolved program path, the exact argv, the passed environment (names and
+resolved program path, the exact argv (the session's `vendor_args`
+included, §4), the passed environment (names and
 values, without Host's process marker), the server's cwd and the protocol pin;
 never file stats or binary contents. A server runs the binary it launched
 with; an upgrade takes effect at the next launch. The bound, model,
@@ -201,8 +202,9 @@ output, including text that does not parse as JSON, fails
 `structured_output_invalid`; a completed turn with a requested schema and no
 final text keeps the terminal status and adds warning `structured_output_missing`
 (C1 §5). A live clear/change fixture remains required.
-Do not expose arbitrary Codex `config` or raw CLI argument forwarding.
-Reserve C2's existing keys plus `config`, `modelProvider`,
+Do not expose arbitrary Codex `config` through `vendor` options; raw CLI
+arguments reach the server only through the session's `vendor_args` (§4,
+owner 2026-10-06). Reserve C2's existing keys plus `config`, `modelProvider`,
 `excludeTurns`, permission-profile selectors, `serviceTierForTurn`,
 `disabledPluginIds`, `toolOutput`, `clientUserMessageId`, `turnTrigger` and
 thread/start source selectors; initial vendor option allow-list is empty.
@@ -397,6 +399,63 @@ inventory; `mcpServerStatus/list` stays schema-only. Switching off the
 user's configured MCP servers is deferred past the first release (owner,
 2026-10-05); it would need each server's name from the configuration
 layers (`-c mcp_servers.<name>.enabled=false`).
+
+**Vendor argument passthrough (owner, 2026-10-06; C2 §6.3).** A session's
+frozen `vendor_args` are appended after VIA's switches on its server's argv
+(`codex app-server [--disable memories] [--disable hooks] ARGS…`). The argv
+is in `config_hash` (§2), so sessions with different lists never share a
+server and equal lists share one. The instance cache and catalog are keyed
+by that hash too. The handshake-refusal key is that server key plus a
+digest of the inputs the handshake's echo check compares (the resolved
+model, the session's working directory and the turn's sandbox mode and
+policy), so a refusal under one list, model, directory or bound never
+refuses another. A spawn or resume whose server recipe,
+with the arguments, would not fit Host's 64 KiB launch request is
+`invalid_params` naming `vendor_args`.
+
+Reserved set for codex-cli 0.160.0 (checked 2026-10-06), matched under
+C2 §6.3. Matching follows this table on a best-effort basis; it is not a
+security boundary (C2 §6.3 **Trust**).
+
+How the table was extracted, to repeat for each CHECKED version (no model
+call and no server start):
+1. Collect candidate long names from the binary's strings: every `--name`
+   literal, clap's kebab-case IDs, and every upper-case value or
+   environment name, lowercased and kebab-cased.
+2. Keep each candidate `NAME` for which `CODEX_HOME=<empty scratch dir>
+   codex app-server --NAME --help` does not fail with clap's "unexpected
+   argument". clap rejects an unknown argument before it reaches
+   `--help`, and stops at `--help` before anything runs.
+3. Probe each short letter the same way.
+
+`app-server` 0.160.0 accepts 18 long names:
+- the 15 its help lists besides `--help` (16 with it);
+- plus the hidden `--remote-control` ("Enable remote control for this
+  app-server process") and `--managed-daemon`;
+- plus `--help`.
+
+It accepts the short letters `-c` and `-h`. It has no long-flag
+abbreviation, no aliases and no `--version`. A unit test lists all 18 and
+asserts that each is reserved except the value options judged by value
+(`-c`/`--config`, `--enable`, `--disable`) and the two switches left to
+the caller (`--strict-config`, `--analytics-default-enabled`).
+
+| Kind | Reserved |
+|---|---|
+| Long names (normalized) | `listen`, `stdio` (the transport VIA owns); the hidden `remote-control` and `managed-daemon`; `code-mode-host` (execution on a remote host); `help`, `version`; prefix `ws` (`--ws-auth`, `--ws-token-file`, `--ws-token-sha256`, `--ws-shared-secret-file`, `--ws-issuer`, `--ws-audience`, `--ws-max-clock-skew-seconds`: listener authentication) |
+| Short letters | `-h`, `-V` (matched case-insensitively) |
+| `-c`/`--config` keys (root segment, normalized: quotes and spaces dropped, lowercased, `_` and `-` removed) | `model`, `model_provider`, `model_reasoning_effort`, `approval_policy`, `approvals_reviewer`, `sandbox_mode`, `sandbox_workspace_write`, `permissions`, `default_permissions`, `profile`, `profiles`, `developer_instructions`, `instructions`, `base_instructions`, `model_instructions_file`, `experimental_instructions_file`, `sqlite_home` (VIA sets `CODEX_SQLITE_HOME`); `features` as a whole table, and `features.<f>` for a feature VIA owns |
+| `--enable`/`--disable` features VIA owns | `hooks` and `memories`, matched as any normalized name containing `hook` or `memor` (aliases included) |
+| Operands | every one (`daemon`, `proxy`, `generate-ts`, `generate-json-schema`, `help`) and `--` |
+
+Value-option table (C2 §6.3 rule 2): `-c`/`--config`, `--enable`,
+`--disable`. Without `=` (or, for `-c`, an attached value), each takes
+exactly the next element, which must not start with `-`. Everything else
+passes unverified with C1's `vendor_passthrough` warning: the switches
+`--strict-config` and `--analytics-default-enabled`, `-c` of any other key
+(`mcp_servers`, `notify`, `model_verbosity`) and `--enable`/`--disable` of
+any other feature. `--disable hooks` stays VIA's (`inherit`), never the
+caller's.
 
 ## 5. Correlation, events and bounds
 

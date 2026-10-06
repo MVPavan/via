@@ -64,6 +64,9 @@ pub struct SpawnParams {
     max_steps: Option<Box<RawValue>>,
     #[serde(default, deserialize_with = "raw")]
     vendor: Option<Box<RawValue>>,
+    /// Raw vendor CLI arguments (C1 §4 `vendor_args`), frozen per session.
+    #[serde(default, deserialize_with = "raw")]
+    pub(crate) vendor_args: Option<Box<RawValue>>,
 }
 
 /// Strict C1 §3.3 `resume` parameters. Session-scope members are accepted
@@ -112,6 +115,8 @@ pub struct ResumeParams {
     require: Option<Box<RawValue>>,
     #[serde(default, deserialize_with = "raw")]
     label: Option<Box<RawValue>>,
+    #[serde(default, deserialize_with = "raw")]
+    vendor_args: Option<Box<RawValue>>,
 }
 
 /// C1 §4 `deadlines` as sent: `{wall_ms?, idle_ms?}`. A present member is
@@ -337,6 +342,11 @@ impl ResumeParams {
                 &self.label,
                 Named::field("label"),
                 "label is session scope; resume cannot set it",
+            ),
+            (
+                &self.vendor_args,
+                Named::field("vendor_args"),
+                "vendor_args is session scope; resume cannot set it",
             ),
         ];
         match members.into_iter().find(|(value, ..)| value.is_some()) {
@@ -1686,6 +1696,13 @@ impl Warning {
         "cleanup of the session's previous process group is unconfirmed",
     );
 
+    /// C1 §5 (owner, 2026-10-06): the session passes `vendor_args` VIA
+    /// did not verify; on every receipt, envelope and status of it.
+    pub(crate) const VENDOR_PASSTHROUGH: Self = Self::new(
+        "vendor_passthrough",
+        "the session passes raw vendor arguments VIA did not verify",
+    );
+
     /// C1 §5: a turn with an `output_schema` ended with no structured output.
     pub(crate) const STRUCTURED_OUTPUT_MISSING: Self = Self::new(
         "structured_output_missing",
@@ -2218,7 +2235,7 @@ pub(crate) mod maxima {
     }
 
     /// C1 §5's closed list of warning codes.
-    pub(crate) const WARNING_CODES: [&str; 8] = [
+    pub(crate) const WARNING_CODES: [&str; 9] = [
         "instructions_partial",
         "vendor_version_untested",
         "usage_interval_unverified",
@@ -2227,6 +2244,7 @@ pub(crate) mod maxima {
         "predecessor_cleanup_uncertain",
         "config_switch_unverified",
         "deprecated",
+        "vendor_passthrough",
     ];
 
     /// A string whose encoding, quotes included, is `bytes` long, made of

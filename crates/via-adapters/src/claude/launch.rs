@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 
 use super::ClaudeAdapter;
 use crate::config::{BootstrapEnv, ClaudeMode};
+use crate::passthrough::VendorArgs;
 use crate::plan::{Category, Inherit, InheritState};
 use crate::{EnvAllowList, PrivateProcessSpec, ProcessOwner, SessionId};
 
@@ -82,6 +83,8 @@ pub(crate) struct Recipe<'a> {
     pub(crate) effort: Option<&'a str>,
     pub(crate) output_schema: Option<&'a RawValue>,
     pub(crate) max_steps: Option<u64>,
+    /// The session's frozen raw arguments (C2 §6.3), last.
+    pub(crate) vendor_args: &'a [String],
 }
 
 /// The mode a session was spawned in, read back from its frozen effective
@@ -137,12 +140,24 @@ fn fixed(mode: ClaudeMode, inherit: Inherit) -> Vec<&'static str> {
 /// lookup alike: every launch input the handshake check reads. That is
 /// the fixed flags (the MCP switch, which decides whether `mcp__` tools
 /// may appear, and `--restricted`, which decides whether the user's
-/// configuration loads, included) and the schema mode, which adds the
-/// `StructuredOutput` tool (review r1 #8).
-pub(crate) fn recipe_key(mode: ClaudeMode, inherit: Inherit, schema: bool) -> String {
+/// configuration loads, included), the schema mode, which adds the
+/// `StructuredOutput` tool (review r1 #8), and the session's raw
+/// arguments (C2 §6.3), which may change what the init reports: a refusal
+/// they cause is cached for sessions with that list only. Each argument
+/// follows a NUL, which no argument holds.
+pub(crate) fn recipe_key(
+    mode: ClaudeMode,
+    inherit: Inherit,
+    schema: bool,
+    vendor_args: &VendorArgs,
+) -> String {
     let mut key = fixed(mode, inherit).join(" ");
     if schema {
         key.push_str(" --json-schema");
+    }
+    for arg in vendor_args.as_slice() {
+        key.push('\0');
+        key.push_str(arg);
     }
     key
 }
@@ -150,7 +165,8 @@ pub(crate) fn recipe_key(mode: ClaudeMode, inherit: Inherit, schema: bool) -> St
 /// The exact argv (packet §4, in the fixtures' order): `-p`, the stream
 /// formats, `--model`, the session, the fixed flags, then `--add-dir` per
 /// extra directory, `--append-system-prompt`, `--effort`, `--json-schema`
-/// (compact, sorted keys) and `--max-turns` when set.
+/// (compact, sorted keys) and `--max-turns` when set, then the session's
+/// raw arguments unchanged (C2 §6.3).
 pub(crate) fn argv(recipe: &Recipe<'_>) -> Result<Vec<OsString>, RecipeError> {
     let mut args: Vec<OsString> = [
         "-p",
@@ -193,6 +209,7 @@ pub(crate) fn argv(recipe: &Recipe<'_>) -> Result<Vec<OsString>, RecipeError> {
     if let Some(steps) = recipe.max_steps {
         args.extend(["--max-turns".into(), steps.to_string().into()]);
     }
+    args.extend(recipe.vendor_args.iter().map(OsString::from));
     Ok(args)
 }
 
@@ -318,6 +335,7 @@ mod tests {
                     effort: turn["params"]["effort"].as_str(),
                     output_schema: schema.as_deref(),
                     max_steps: turn["params"]["max_steps"].as_u64(),
+                    vendor_args: &[],
                 };
                 let built: Vec<Value> = argv(&recipe)
                     .unwrap()
@@ -350,12 +368,27 @@ mod tests {
         let mut on = Inherit::OD2_DEFAULT;
         on.set(Category::McpServers, InheritState::On);
         assert_ne!(
-            recipe_key(restricted, on, false),
-            recipe_key(restricted, Inherit::OD2_DEFAULT, false)
+            recipe_key(restricted, on, false, &VendorArgs::default()),
+            recipe_key(
+                restricted,
+                Inherit::OD2_DEFAULT,
+                false,
+                &VendorArgs::default()
+            )
         );
         assert_ne!(
-            recipe_key(restricted, Inherit::OD2_DEFAULT, true),
-            recipe_key(restricted, Inherit::OD2_DEFAULT, false)
+            recipe_key(
+                restricted,
+                Inherit::OD2_DEFAULT,
+                true,
+                &VendorArgs::default()
+            ),
+            recipe_key(
+                restricted,
+                Inherit::OD2_DEFAULT,
+                false,
+                &VendorArgs::default()
+            )
         );
         let schema = RawValue::from_string(r#"{"type":"object","a":1}"#.to_owned()).unwrap();
         let dirs = [PathBuf::from("/x")];
@@ -369,6 +402,7 @@ mod tests {
             effort: Some("high"),
             output_schema: Some(&schema),
             max_steps: Some(3),
+            vendor_args: &[],
         })
         .unwrap();
         let tail: Vec<_> = args[10..].iter().map(|a| a.to_str().unwrap()).collect();
@@ -398,6 +432,51 @@ mod tests {
         );
     }
 
+    /// C2 §6.3: the session's raw arguments follow the whole recipe,
+    /// unchanged and in order, on every launch; they are part of the
+    /// handshake-refusal recipe key, and two lists never share one.
+    #[test]
+    fn vendor_args_follow_the_recipe() {
+        let passed = ["--max-budget-usd", "5", "-dapi", "--name=a b"].map(str::to_owned);
+        let recipe = Recipe {
+            model: "haiku",
+            session: Continue::Resume("u"),
+            mode: ClaudeMode::Unrestricted,
+            inherit: Inherit::OD2_DEFAULT,
+            extra_write_dirs: &[],
+            instructions: None,
+            effort: None,
+            output_schema: None,
+            max_steps: Some(3),
+            vendor_args: &passed,
+        };
+        let argv = argv(&recipe).unwrap();
+        let tail: Vec<&str> = argv[argv.len() - 6..]
+            .iter()
+            .map(|arg| arg.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            tail,
+            [
+                "--max-turns",
+                "3",
+                "--max-budget-usd",
+                "5",
+                "-dapi",
+                "--name=a b"
+            ]
+        );
+        let key = |list: &[&str]| {
+            let list =
+                VendorArgs::try_from(list.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>())
+                    .unwrap();
+            recipe_key(ClaudeMode::Unrestricted, Inherit::OD2_DEFAULT, false, &list)
+        };
+        assert_eq!(key(&["--a", "b"]), key(&["--a", "b"]));
+        assert_ne!(key(&["--a", "b"]), key(&["--a b"]));
+        assert_ne!(key(&[]), key(&["--a"]));
+    }
+
     /// Owner, 2026-10-05: `--restricted` only in the restricted mode, and
     /// Claude's default request loads MCP servers, so the default launch
     /// passes neither flag; a request for MCP servers off passes the
@@ -423,6 +502,7 @@ mod tests {
             effort: None,
             output_schema: None,
             max_steps: None,
+            vendor_args: &[],
         };
         let flags = |mode, inherit| -> Vec<String> {
             argv(&recipe(mode, inherit)).unwrap()[10..12]
@@ -455,8 +535,18 @@ mod tests {
             );
         }
         assert_ne!(
-            recipe_key(ClaudeMode::Unrestricted, default, false),
-            recipe_key(ClaudeMode::Restricted, default, false)
+            recipe_key(
+                ClaudeMode::Unrestricted,
+                default,
+                false,
+                &VendorArgs::default()
+            ),
+            recipe_key(
+                ClaudeMode::Restricted,
+                default,
+                false,
+                &VendorArgs::default()
+            )
         );
     }
 
@@ -485,6 +575,7 @@ mod tests {
             effort: None,
             output_schema: None,
             max_steps: None,
+            vendor_args: &[],
         };
         let spec = adapter
             .process_spec(owner, Path::new("/work"), &recipe)

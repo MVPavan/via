@@ -1243,6 +1243,8 @@ fn s1_params_unsupported_values_are_refused_by_name() -> TestResult {
                 ("cwd", json!("/")),
                 ("require", json!([])),
                 ("label", json!("l")),
+                // Owner, 2026-10-06: even an empty list.
+                ("vendor_args", json!([])),
             ] {
                 let mut params = resume_base.clone();
                 params[member] = value;

@@ -83,6 +83,9 @@ struct SpawnArgs {
     background: bool,
     #[arg(long)]
     json: bool,
+    /// Raw vendor arguments after `--`, sent as `vendor_args` (C1 §3.2).
+    #[arg(last = true, value_name = "VENDOR_ARG")]
+    vendor_args: Vec<String>,
 }
 
 #[derive(Args)]
@@ -133,6 +136,10 @@ struct ResumeArgs {
     handle_stdin: bool,
     #[arg(long)]
     json: bool,
+    /// Sent as `vendor_args`, which the daemon refuses on resume (C1
+    /// §3.3): session policy is Core's, not the CLI's.
+    #[arg(last = true, hide = true)]
+    vendor_args: Vec<String>,
 }
 
 /// C1 §3.2: exactly one of `--prompt` and `--prompt-file F|-`.
@@ -568,6 +575,9 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
                 params["op_key"] = Value::String(key);
             }
             args.turn.apply(&mut params)?;
+            if !args.vendor_args.is_empty() {
+                params["vendor_args"] = json!(args.vendor_args);
+            }
             client::call("resume", &params, true, true)
         }
         Command::Steer(args) => {
@@ -659,6 +669,9 @@ fn spawn(args: SpawnArgs) -> anyhow::Result<i32> {
         params["idempotency_key"] = Value::String(key);
     }
     args.turn.apply(&mut params)?;
+    if !args.vendor_args.is_empty() {
+        params["vendor_args"] = json!(args.vendor_args);
+    }
     // Foreground: Ctrl-C leaves the turn running (design §6.5).
     let _interrupt = (!args.background).then(exit_on_interrupt).transpose()?;
     let mut receipt = client::request("spawn", &params, true)?;

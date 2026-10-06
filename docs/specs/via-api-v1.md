@@ -4,7 +4,8 @@ Status: draft 3, 2026-09-30; the owner approved the S1 set on 2026-09-26
 (see Decisions below). Draft 3 applies the adapter design's amendments
 AC1–AC10 ([adapter design](../workstreams/rust-foundation/adapters/design.md)
 §3.4, revision 9); leftover detection follows the owner's choice of option A
-on 2026-10-01 (adapter design, conflict 4). Public contract between
+on 2026-10-01 (adapter design, conflict 4); raw vendor-argument passthrough
+(`vendor_args`, §4) follows the owner's decision of 2026-10-06. Public contract between
 callers and VIA; implemented by L1 (`via-cli`, server half) over L2
 (`via-core`). Inputs: `docs/brainstorms/README.md` §15
 (authoritative), review `docs/brainstorms/reviews/contract-specs-astra-r1.md`,
@@ -74,6 +75,7 @@ decided in the slice that needs them, after re-probing.
 | P11 | Codex owned stdio server key is `config_hash` without bound; `config_hash` covers VIA-controlled launch settings (resolved program path, arguments, passed environment, server cwd, protocol pin), not credentials or binary contents; the observed binary version is reported, not keyed. Every turn sets `sandboxPolicy`; mixed-bound sharing is qualified (`via-5lr.3.4`). OpenCode uses an owned shared `opencode serve --stdio` per launch key: the private namespace (anonymous profile identity and epoch, project-configuration switch) plus a hash of VIA-controlled launch settings, never credentials or binary contents; the observed version is reported, not keyed; the bound is not keyed (only `full` with `network:true` is admitted). At most one live server per namespace, fenced across restarts by Host's anchor journal. Closing a session detaches it. Bound-keyed routes refuse bound changes on resume | as reviewed in `docs/specs/vendors/codex.md` §9 and `docs/specs/vendors/opencode.md` §3 |
 | P12 | Live recovery after daemon restart is `unknown` for every route in v1; `resumed` only when a route's rejoin is probe-verified on the configured transport (Codex stdio server dies with the daemon, P3) | as written |
 | P13 | Version rule: every vendor version is supported; refused only on demonstrated handshake breakage; `untested` warns until the maintainers' check (owner OD1, 2026-09-30, superseding the 2026-09-26 P13 approval) | decided; C2 §5 (adapter design AD7) |
+| P14 | Raw vendor-argument passthrough: `via spawn … -- ARGS` / `vendor_args` appended unchanged to the vendor's argv; reserved flags refused `vendor_option_conflict`; frozen per session; warning `vendor_passthrough` (owner, 2026-10-06) | decided; §4 `vendor_args`, C2 §6.3 |
 
 ## 1. Scope, transport, versioning
 
@@ -139,7 +141,12 @@ decided in the slice that needs them, after re-probing.
   lowercase name (`session`), a required group as its member flags joined
   by `|` (`--prompt|--prompt-file`), each read from the CLI's own argument
   definitions; any unknown argument (an unknown long or short flag, a
-  stray value, a value after `--`, an unknown verb) is `command`. Its message is the parser's own, without usage.
+  stray value, a value after `--` on a verb other than `spawn` and
+  `resume`, an unknown verb) is `command`. Its message is the parser's own,
+  without usage. On `spawn` and `resume` every argument after `--` is sent
+  unchanged, in order, as `vendor_args` (§4); `resume` then refuses it
+  (§3.3). A bare `--` with nothing after it sends no `vendor_args` and is
+  ignored, on both verbs.
   `--help` and `--version` print the parser's help and version and exit 0;
   bare `via`, with no arguments, prints the parser's help on stderr and
   exits 2, with no JSON.
@@ -206,12 +213,13 @@ supported by default (P13, C2 §5). Errors: `unknown_model`,
 
 ### 3.2 `spawn` — new session and turn 1
 
-CLI: `via spawn --harness H --model M --prompt "…" [--prompt-file F|-] [--instructions F] [--bound B] [--allow-dir D]… [--network] [--cwd D] [--effort E] [--output-schema F] [--wall-ms N] [--idle-ms N] [--max-steps N] [--require V,…] [--allow-untested] [--vendor h.k=v]… [--label L] [--idempotency-key K] [--handle-file F|--handle-stdin] [--background]`
+CLI: `via spawn --harness H --model M --prompt "…" [--prompt-file F|-] [--instructions F] [--bound B] [--allow-dir D]… [--network] [--cwd D] [--effort E] [--output-schema F] [--wall-ms N] [--idle-ms N] [--max-steps N] [--require V,…] [--allow-untested] [--vendor h.k=v]… [--label L] [--idempotency-key K] [--handle-file F|--handle-stdin] [--background] [-- VENDOR_ARG…]`
 
 `--prompt-file F` sends `prompt_file` with `F` made absolute; `-` reads
-stdin into `prompt`.
+stdin into `prompt`. Every argument after `--` is sent unchanged as
+`vendor_args` (§4).
 
-Params: §4 parameters, `handle` (required), `require?`, `label?`,
+Params: §4 parameters, `vendor_args?`, `handle` (required), `require?`, `label?`,
 `idempotency_key?` (the same bound as `op_key`: 1–64 printable ASCII
 characters, 0x21–0x7E). The daemon validates, resolves the model, runs the
 preflight, commits session + turn 1 (`queued`) + handle hash + key in one
@@ -225,7 +233,9 @@ Store transaction, then returns the receipt; dispatch follows.
  "warnings":[]}
 ```
 
-Errors: `invalid_params` (incl. `vendor_option_conflict`), `unknown_model`,
+`warnings` carries `vendor_passthrough` when `vendor_args` is non-empty
+(§4). Errors: `invalid_params` (incl. `vendor_option_conflict`, naming
+`vendor` or `vendor_args`), `unknown_model`,
 `unsupported_verb` (`data.verb:"spawn"`, with `harness` and `route`),
 `harness_unavailable`, `missing_capability`, `bound_unsupported`,
 `admission_refused`, `store_error`. When the daemon already retains its
@@ -244,7 +254,12 @@ CLI: `via resume <session> --prompt "…" [per-turn flags] [--op-key K]`
 
 Params: `session`, `handle`, `prompt`, per-turn parameters (§4), `op_key?`.
 `allow_untested` is inherited session policy; attempting to change it on
-resume is `invalid_params`.
+resume is `invalid_params`. `vendor_args` is session scope too: arguments
+after `--` on `via resume` are sent as it (a bare `--` sends nothing and is
+ignored, §1), and any `vendor_args` member is `invalid_params`
+kind2 `session_scope_on_resume` naming `vendor_args`; the session's frozen
+list applies to every turn. The receipt's `warnings` carries
+`vendor_passthrough` while the session has one.
 Result: `{turn, state: "queued"|"running", queue_position, effective: {…},
 warnings}`. Effective values are frozen at acceptance (§7.3). A given
 `bound` is re-validated against the route (D7), recorded on this turn, and
@@ -498,7 +513,8 @@ whatever it contains; VIA never claims a suppression it has not verified. `warni
 `vendor_version_untested` while the described turn's `version_status` is
 `untested`, and
 `config_switch_unverified` with `data.categories` while any effective state
-differs from the verified requested state.
+differs from the verified requested state, and `vendor_passthrough` while
+the session has `vendor_args` (§4).
 
 `vendor_session_id` is nullable and contains only the last confirmed vendor
 ID. `vendor_identity_verified` is false until the current connection
@@ -670,6 +686,7 @@ only after positive cleanup, joins and durable records, otherwise 4
 | `max_steps` | integer or `null` | per turn | steps inside one turn (D5) |
 | `require` | `[verb]` / `[verb:partial]` | spawn | preflight |
 | `vendor` | `{"<harness>": {k: v}}` | as the adapter declares | passthrough, non-portable; reserved keys refused (§4.2) |
+| `vendor_args` | `[string]`, default `[]` | session | raw vendor CLI arguments (owner, 2026-10-06): appended unchanged after VIA's own launch arguments on every launch of the session (C2 §6.3); frozen at spawn, stored with the session and reused after a daemon restart; on `resume` `invalid_params` kind2 `session_scope_on_resume`. At most 64 arguments and 16 KiB in total (the sum of their UTF-8 lengths); `null`, a non-string element or a NUL character is `invalid_params` naming `vendor_args`. An argument that could set what the route owns (its reserved flags in any short form, alias, normalized spelling or attached-value form, a reserved value of an option, the vendor's operands, or `--` itself; C2 §6.3) is `invalid_params` kind2 `vendor_option_conflict` naming `vendor_args`; any other passes unverified. This matching is best-effort against the checked vendor version's option table, not a security boundary: the caller is trusted with the arguments it passes, and `vendor_passthrough` says that VIA's guarantees then depend on them (C2 §6.3). A route may refuse a launch request past its limit as `invalid_params` naming `vendor_args` (C2 §6.3). A non-empty list adds the warning `vendor_passthrough` to every spawn and resume receipt, envelope and `status` of the session. `describe` takes none; the `fake` harness, and in the first release `opencode` (one shared server per data root, C2 §6.3), refuse a non-empty list as `invalid_params` naming `vendor_args` |
 | `label` | string ≤ 120 | session | |
 
 Inheritance (P5): a per-turn parameter omitted on `resume`
@@ -720,7 +737,8 @@ Rules: an unenforceable combination is `bound_unsupported` naming the
 route and the reason. `vendor` options that touch permission, sandbox,
 approval, instructions, cwd, model or session identity are refused as
 `invalid_params` kind `vendor_option_conflict` (reserved key list per
-adapter in C2 §6); canonical parameters always win.
+adapter in C2 §6); canonical parameters always win. `vendor_args` that set
+a route's reserved flags are refused the same way (C2 §6.3).
 For Codex, `via-5lr.3.4` verified the limited bounds' enforcement with
 `network:false`, including differing bounds on one shared server
 (`vendors/codex.md` §3). A Codex sandbox denial is not structured: the
@@ -775,7 +793,7 @@ hold the first 1,000 entries each; `denied_actions_total` and
 `auto_declined_requests_total` count all. An entry's strings are cut at a
 character boundary to keep it within 256 bytes; its `event_seq` cites the
 event with the full payload. At receipt a `bound` over 32 KiB, a `vendor`
-over 16 KiB, a `cwd` over 4 KiB, or a `model` (as requested or as resolved)
+over 16 KiB, a `vendor_args` over 64 arguments or 16 KiB in total, a `cwd` over 4 KiB, or a `model` (as requested or as resolved)
 or `effort` over 1 KiB encoded is `invalid_params` naming the member;
 `bound.effective` is at most 32 KiB
 encoded too. `failure.message` is at most 2 KiB,
@@ -830,7 +848,7 @@ below 1 MiB, and a conformance test assembles that maximum.
 | `cost` | `usd`; `scope` as above; `provenance` `reported`, `estimated`, `unavailable`. Scopes are per field: Claude P5 showed per-result tokens with rising cumulative `total_cost_usd` |
 | `exit` | `{code, signal}` for per-session processes that ended in this turn; `null` for server routes |
 | `evidence` | the turn's evidence folder and the vendor's transcript hint, as `logs` returns them (§3.12) |
-| `warnings` | `instructions_partial`, `vendor_version_untested`, `usage_interval_unverified`, `structured_output_missing`, `structured_output_invalid`, `cancel_cleanup_uncertain`, `predecessor_cleanup_uncertain`, `config_switch_unverified`, `deprecated`, `observations_lost`, `credential_state_unchecked` (a VIA-owned vendor server's credential state could not be checked on this version).  `config_switch_unverified` is one warning per receipt or envelope listing every category whose requested inheritance setting VIA could not apply or could not verify, `data.categories: [{category, requested, effective}]` (C2 §6.2) `observations_lost` (some observations of a shared-server thread were lost: by ingress overflow, an observation stall, a close's deadline or an internal task failure) carries `data: {trigger_turn, generation, first_unqueued, omitted}`, where `trigger_turn` is the turn whose observations were first lost (a predecessor whose late messages were lost while a successor ran, or else the turn running when the loss was noted), `first_unqueued` is a lower bound (no earlier message of the generation was lost) and `omitted` is `null` when the count is unknown or saturated; it is on the envelope of every turn whose run the loss affected. A loss noted after the turn's end reaches no envelope or event (owner simplification, 2026-10-05). |
+| `warnings` | `instructions_partial`, `vendor_version_untested`, `usage_interval_unverified`, `structured_output_missing`, `structured_output_invalid`, `cancel_cleanup_uncertain`, `predecessor_cleanup_uncertain`, `config_switch_unverified`, `deprecated`, `observations_lost`, `credential_state_unchecked` (a VIA-owned vendor server's credential state could not be checked on this version), `vendor_passthrough` (the session passes `vendor_args` VIA did not verify: VIA's guarantees then depend on them; on every spawn and resume receipt, envelope and `status` of such a session, never on another).  `config_switch_unverified` is one warning per receipt or envelope listing every category whose requested inheritance setting VIA could not apply or could not verify, `data.categories: [{category, requested, effective}]` (C2 §6.2) `observations_lost` (some observations of a shared-server thread were lost: by ingress overflow, an observation stall, a close's deadline or an internal task failure) carries `data: {trigger_turn, generation, first_unqueued, omitted}`, where `trigger_turn` is the turn whose observations were first lost (a predecessor whose late messages were lost while a successor ran, or else the turn running when the loss was noted), `first_unqueued` is a lower bound (no earlier message of the generation was lost) and `omitted` is `null` when the count is unknown or saturated; it is on the envelope of every turn whose run the loss affected. A loss noted after the turn's end reaches no envelope or event (owner simplification, 2026-10-05). |
 | `leftovers` | processes the coding agent started that were observed after its own process exited; the agent's responsibility, never signalled by VIA (C2 §4.2). `{scope: "turn"\|"server", processes: [{pid, comm, started_at}], total, incomplete, best_effort: true}` or `null`. `processes`: at most 16, oldest first (start ticks, then pid). `total`: the matches found, exact when not `incomplete`, a lower bound otherwise; `total` greater than the list length is the only truncation signal. `started_at`: RFC 3339 UTC, boot time (`/proc/stat` `btime`, whole seconds) plus the process's start ticks, so accurate to about 1 s and emitted with second precision. `comm`: the kernel's process name (at most 15 bytes), lossy UTF-8; it is process-controlled, so a process can name itself anything. Always present; non-null only on per-turn-route envelopes and on `server_lost` envelopes (one shared snapshot per lost server); `null` elsewhere, including recovered turns. Produced best effort by Host's report-only scan for VIA's process marker (C2 §4.2, runtime §5) wherever these destinations apply; `null` when no scan ran. `incomplete: true` means the scan could not settle the full set (C2 §4.2); entries mean "observed during the scan", not "alive" |
 
 ## 6. Durable events
@@ -1019,7 +1037,7 @@ queued cancellation whose retry commits stays `cancelled`.
 
 | Code | `kind` | When |
 |---|---|---|
-| -32700 / -32600 / -32601 / -32602 | `parse_error` / `invalid_request` / `method_not_found` / `invalid_params` | JSON-RPC standard; `invalid_params.data.kind2` ∈ `unknown_field`, `session_scope_on_resume`, `vendor_option_conflict`, `idempotency_conflict` |
+| -32700 / -32600 / -32601 / -32602 | `parse_error` / `invalid_request` / `method_not_found` / `invalid_params` | JSON-RPC standard; `invalid_params.data.kind2` ∈ `unknown_field`, `session_scope_on_resume`, `vendor_option_conflict` (`data.field` `vendor` or `vendor_args`), `idempotency_conflict` |
 | -32000 | `handshake_required` | |
 | -32001 | `version_mismatch` | |
 | -32002 | `invalid_handle` | |

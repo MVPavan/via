@@ -492,7 +492,7 @@ fn s1_bounds_envelope_at_every_member_maximum_fits_1_mib() -> TestResult {
         "no structured_output_file"
     );
     let warnings = envelope["warnings"].as_array().ok_or("no warnings")?;
-    assert_eq!(warnings.len(), 8, "one warning per closed-list code");
+    assert_eq!(warnings.len(), 9, "one warning per closed-list code");
     for warning in warnings {
         assert_eq!(encoded(&warning["message"])?, 1024, "{}", warning["code"]);
         assert_eq!(encoded(&warning["data"])?, 4 * 1024, "{}", warning["code"]);

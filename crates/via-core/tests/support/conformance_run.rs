@@ -376,6 +376,7 @@ impl<'a> Run<'a> {
                 },
                 confirmed_vendor_session_id: session["resume"].as_str().map(str::to_owned),
                 allow_untested: knobs.allow_untested,
+                vendor_args: via_adapters::VendorArgs::default(),
             };
             let session_ref = SessionRef {
                 harness: plan.harness.to_owned(),
@@ -1770,6 +1771,7 @@ fn resume_refusal(set: &AdapterSet, session: &Session, spec: &TurnSpec) -> Optio
         inherit: Some(session.plan.inherit.requested),
         inherit_effective: Some(session.plan.inherit.effective),
         model: Some(session.plan.model.resolved.clone()),
+        vendor_args: via_adapters::VendorArgs::default(),
     };
     let session_ref = SessionRef {
         harness: session.plan.harness.to_owned(),

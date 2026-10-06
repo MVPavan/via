@@ -435,6 +435,7 @@ impl Rig {
             },
             confirmed_vendor_session_id: None,
             allow_untested: false,
+            vendor_args: via_adapters::VendorArgs::default(),
         };
         edit(&mut spec);
         let session = SessionRef {

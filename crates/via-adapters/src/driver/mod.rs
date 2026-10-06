@@ -62,6 +62,9 @@ pub struct SessionSpec {
     pub cwd: PathBuf,
     /// Vendor options.
     pub vendor: VendorOptions,
+    /// The raw vendor arguments frozen at spawn (C2 §6.3), appended to
+    /// every launch.
+    pub vendor_args: crate::VendorArgs,
     /// The inherited-configuration settings requested at spawn and their
     /// effective states, both frozen (C2 §6.2): the launch recipe applies
     /// the requested settings.
@@ -613,7 +616,7 @@ impl SessionDriver {
         if let Some(DriverKind::Codex(codex)) = &self.kind {
             let generation = state.generation;
             drop(state);
-            return match codex.prepare(self.spec.inherit.requested) {
+            return match codex.prepare(self.spec.inherit.requested, &self.spec.vendor_args) {
                 Some(server) => Prepared::Pinned(ConnectionPin {
                     generation,
                     server: Some(server),

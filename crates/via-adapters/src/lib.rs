@@ -150,6 +150,7 @@ mod fake;
 mod harness;
 mod instance;
 pub mod observation;
+mod passthrough;
 mod plan;
 mod runtime;
 mod set;
@@ -178,6 +179,7 @@ pub use observation::{
     ObservationSink, ProgressMarks, SteerDelivery, SteerToken, StopReason, TurnEnd, TurnEvidence,
     UnparsedOutput, UsageSample, VendorTerminal, observation_channel, observation_channel_in,
 };
+pub use passthrough::{VENDOR_ARGS_BYTES_MAX, VENDOR_ARGS_MAX, VendorArgs, VendorArgsError};
 pub use plan::{
     AdapterSet, Bound, CatalogModel, Category, CategoryDecl, DescribeRequest, Inherit, InheritPlan,
     InheritState, ModelChoice, ModelEntry, ModelSource, ParamSizes, Refusal, RefusalKind,
