@@ -1,0 +1,101 @@
+{
+  "source": "CC claude_model_refusal, 2026-10-05 live probe sC, Claude Code 2.1.289, claude-sonnet-5-5. An excerpt: the refusal tail of a turn (the informational notice, the vendor's synthetic user note, model_refusal_no_fallback, the synthetic refusal message and the result), as recorded; the turn's earlier thinking, tool call and denial are omitted and the result's permission_denials emptied with them. Sanitized: session, message, request and uuid ids. argv and init are the adapter recipe's (the probe ran permission mode auto, without --restricted), the init otherwise c0_bad_model's with this version and model; the prompt is a placeholder. Gaps became 100 ms. The probe recorded exit 1 and empty stderr.",
+  "argv": [
+    "-p",
+    "--input-format",
+    "stream-json",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--model",
+    "claude-sonnet-5-5",
+    "--session-id",
+    {
+      "capture": "sid"
+    },
+    "--restricted",
+    "--strict-mcp-config",
+    "--permission-mode",
+    "dontAsk",
+    "--permission-prompts",
+    "none",
+    "--tools",
+    "Read,Write,Edit,Glob,Grep,Bash",
+    "--allowedTools",
+    "Read,Write,Edit,Glob,Grep,Bash"
+  ],
+  "version": "2.1.289 (Claude Code)",
+  "deadline_ms": 15000,
+  "steps": [
+    {
+      "expect": {
+        "line": {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Reply with just READY."
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "delay": {
+        "ms": 100
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"system\",\"subtype\":\"init\",\"cwd\":\"/work/project\",\"session_id\":\"${sid}\",\"tools\":[\"Bash\",\"Edit\",\"Glob\",\"Grep\",\"Read\",\"Write\"],\"mcp_servers\":[],\"model\":\"claude-sonnet-5-5\",\"permissionMode\":\"dontAsk\",\"slash_commands\":[\"clear\",\"compact\",\"config\",\"context\",\"init\",\"model\",\"review\"],\"terminal_slash_commands\":[\"doctor\",\"color\",\"focus\",\"reload-plugins\"],\"apiKeySource\":\"none\",\"claude_code_version\":\"2.1.289\",\"output_style\":\"default\",\"agents\":[\"claude\",\"Explore\",\"general-purpose\",\"Plan\",\"statusline-setup\"],\"skills\":[\"example-skill\"],\"plugins\":[{\"name\":\"cc-plugin-agents-md\",\"path\":\"builtin\",\"source\":\"cc-plugin-agents-md@builtin\"},{\"name\":\"cc-plugin-telemetry\",\"path\":\"builtin\",\"source\":\"cc-plugin-telemetry@builtin\"}],\"capabilities\":[\"interrupt_receipt_v1\",\"interrupt_cancel_queued_v1\",\"msg_lifecycle_v1\",\"mcp_read_resource_v1\",\"mcp_tool_ui_meta_v1\"],\"analytics_disabled\":false,\"product_feedback_disabled\":false,\"uuid\":\"00000000-0000-4000-8000-000000000001\",\"messaging_socket_path\":\"/tmp/cc-socks/4242.sock\",\"fast_mode_state\":\"off\",\"fast_mode_disabled_reason\":\"sdk_opt_in_required\",\"per_turn_effort_active\":false,\"view_mode\":\"default\"}"
+      }
+    },
+    {
+      "delay": {
+        "ms": 100
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"system\",\"subtype\":\"informational\",\"content\":\"Sonnet 5.5's safeguards stopped the response above · continuing once with that noted\",\"level\":\"notice\",\"uuid\":\"00000000-0000-4000-8000-000000000002\",\"session_id\":\"${sid}\"}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Your response above was stopped by a safety classifier — this is not a tool or API error. The rest of it was withheld, and tool calls in it that had not finished did not run. Do not produce that content again, even reworded.\"}]},\"parent_tool_use_id\":null,\"session_id\":\"${sid}\",\"uuid\":\"00000000-0000-4000-8000-000000000003\",\"timestamp\":\"2026-10-05T19:55:03.777Z\",\"isSynthetic\":true}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"system\",\"subtype\":\"model_refusal_no_fallback\",\"uuid\":\"00000000-0000-4000-8000-000000000004\",\"original_model\":\"claude-sonnet-5-5\",\"request_id\":\"req_01SYNTH000001\",\"api_refusal_category\":\"cyber\",\"api_refusal_explanation\":\"This request triggered restrictions on violative cyber content and was blocked under Anthropic's Usage Policy. To learn more, see https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback.\",\"refused_user_message_uuid\":\"00000000-0000-4000-8000-000000000005\",\"content\":\"\",\"session_id\":\"${sid}\"}"
+      }
+    },
+    {
+      "delay": {
+        "ms": 100
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"assistant\",\"message\":{\"diagnostics\":null,\"id\":\"00000000-0000-4000-8000-000000000007\",\"container\":null,\"model\":\"<synthetic>\",\"role\":\"assistant\",\"stop_details\":{\"type\":\"refusal\",\"category\":\"cyber\",\"explanation\":\"This request triggered restrictions on violative cyber content and was blocked under Anthropic's Usage Policy. To learn more, see https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback.\"},\"stop_reason\":\"refusal\",\"stop_sequence\":\"\",\"type\":\"message\",\"usage\":{\"output_tokens_details\":null,\"input_tokens\":0,\"output_tokens\":0,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"server_tool_use\":{\"web_search_requests\":0,\"web_fetch_requests\":0},\"service_tier\":null,\"cache_creation\":{\"ephemeral_1h_input_tokens\":0,\"ephemeral_5m_input_tokens\":0},\"inference_geo\":null,\"iterations\":null,\"speed\":null,\"fallback_credit\":null},\"content\":[{\"type\":\"text\",\"text\":\"API Error: Sonnet 5.5's safeguards flagged this session (https://www.anthropic.com/legal/aup). You may be seeing this for the first time on a Sonnet model: Sonnet 5.5 is more capable and has stronger safeguards as a result, which can sometimes flag non-cybersecurity work. We're improving these safeguards to reduce the amount of incorrectly flagged messages. Claude Code can't respond to your last message with Sonnet 5.5.\\n\\nTry rephrasing the request in a new session or change your model.\\n\\nLearn more: https://support.claude.com/en/articles/8106465\\n\\nDetails: `[cyber]`\\n\\nRequest ID: req_01SYNTH000001\\n\\nMessage ID: msg_01SYNTH000002\"}],\"context_management\":null},\"parent_tool_use_id\":null,\"session_id\":\"${sid}\",\"uuid\":\"00000000-0000-4000-8000-000000000006\",\"timestamp\":\"2026-10-05T19:55:08.231Z\",\"error\":\"invalid_request\",\"request_id\":\"req_01SYNTH000001\",\"is_api_error_message\":true}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"duration_api_ms\":6861,\"stop_reason\":\"refusal\",\"session_id\":\"${sid}\",\"total_cost_usd\":0.0549738,\"usage\":{\"input_tokens\":6,\"cache_creation_input_tokens\":11596,\"cache_read_input_tokens\":24389,\"output_tokens\":370,\"output_tokens_details\":{\"thinking_tokens\":222},\"server_tool_use\":{\"web_search_requests\":0,\"web_fetch_requests\":0},\"service_tier\":\"standard\",\"cache_creation\":{\"ephemeral_1h_input_tokens\":11596,\"ephemeral_5m_input_tokens\":0},\"inference_geo\":\"not_available\",\"iterations\":[{\"input_tokens\":2,\"output_tokens\":0,\"cache_read_input_tokens\":9000,\"cache_creation_input_tokens\":4527,\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":4527},\"type\":\"message\"}],\"speed\":\"standard\",\"fallback_credit\":null},\"modelUsage\":{\"claude-sonnet-5-5\":{\"inputTokens\":6,\"outputTokens\":370,\"cacheReadInputTokens\":24389,\"cacheCreationInputTokens\":11596,\"webSearchRequests\":0,\"costUSD\":0.0549738,\"contextWindow\":1000000,\"maxOutputTokens\":128000,\"thinkingTokens\":222,\"canonicalModel\":\"claude-sonnet-5-5\",\"provider\":\"firstParty\",\"costBasis\":\"list\"}},\"permission_denials\":[],\"terminal_reason\":\"api_error\",\"fast_mode_state\":\"off\",\"fast_mode_disabled_reason\":\"sdk_opt_in_required\",\"subagent_stats\":{\"spawned\":0,\"requested\":{\"background\":0,\"foreground\":0,\"unset\":0},\"started_in_background\":0,\"max_depth\":0,\"spawned_by_subagents\":0,\"completed\":0,\"failed\":0,\"killed\":{\"parent\":0,\"user\":0,\"system\":0},\"refused\":{\"depth_limit\":0,\"concurrency_limit\":0,\"budget\":0},\"by_type\":{}},\"is_error\":true,\"num_turns\":3,\"subtype\":\"success\",\"api_error_status\":null,\"result\":\"API Error: Sonnet 5.5's safeguards flagged this session (https://www.anthropic.com/legal/aup). You may be seeing this for the first time on a Sonnet model: Sonnet 5.5 is more capable and has stronger safeguards as a result, which can sometimes flag non-cybersecurity work. We're improving these safeguards to reduce the amount of incorrectly flagged messages. Claude Code can't respond to your last message with Sonnet 5.5.\\n\\nTry rephrasing the request in a new session or change your model.\\n\\nLearn more: https://support.claude.com/en/articles/8106465\\n\\nDetails: `[cyber]`\\n\\nRequest ID: req_01SYNTH000001\\n\\nMessage ID: msg_01SYNTH000002\",\"type\":\"result\",\"duration_ms\":7243,\"uuid\":\"00000000-0000-4000-8000-000000000008\",\"queued_turn_count\":0,\"result_index\":0}"
+      }
+    },
+    {
+      "await_eof": {}
+    },
+    {
+      "exit": {
+        "code": 1,
+        "stderr": ""
+      }
+    }
+  ]
+}

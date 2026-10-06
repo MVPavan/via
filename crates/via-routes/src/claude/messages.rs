@@ -155,6 +155,10 @@ pub struct AssistantMessage {
     pub session_id: Option<String>,
     /// A synthetic error message's code (`authentication_failed`, …).
     pub error: Option<String>,
+    /// A refusal's category (`message.stop_details` of type `refusal`,
+    /// e.g. `cyber`), when a string of at most [`SHORT_FIELD_MAX`] bytes;
+    /// any other shape is ignored.
+    pub refusal_category: Option<String>,
     /// A vendor-synthetic API-error message (`is_api_error_message`, or
     /// model `<synthetic>`): never acceptance, progress or final text.
     pub synthetic: bool,
@@ -178,6 +182,8 @@ struct RawAssistantBody {
     #[serde(default)]
     model: Option<String>,
     content: Vec<Block>,
+    #[serde(default)]
+    stop_details: Option<Value>,
 }
 
 /// A `user` message's content: plain text or blocks.
@@ -485,12 +491,21 @@ fn typed<T: DeserializeOwned>(line: &[u8], what: &'static str) -> Result<T, Deco
 fn assistant(raw: RawAssistant) -> AssistantMessage {
     let synthetic = raw.is_api_error_message == Some(true)
         || raw.message.model.as_deref() == Some("<synthetic>");
+    let refusal_category = raw
+        .message
+        .stop_details
+        .as_ref()
+        .filter(|details| details["type"] == "refusal")
+        .and_then(|details| details["category"].as_str())
+        .filter(|category| category.len() <= SHORT_FIELD_MAX)
+        .map(str::to_owned);
     AssistantMessage {
         id: raw.message.id,
         model: raw.message.model,
         content: raw.message.content,
         session_id: raw.session_id,
         error: raw.error,
+        refusal_category,
         synthetic,
     }
 }

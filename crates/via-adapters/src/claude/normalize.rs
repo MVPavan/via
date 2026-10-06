@@ -182,6 +182,8 @@ pub(crate) struct Normalizer {
     declined: BTreeSet<String>,
     /// The last synthetic error message's code.
     synthetic_error: Option<String>,
+    /// The last synthetic message's refusal category, for vendor data.
+    refusal_category: Option<String>,
     /// The interrupt VIA sent, by request ID.
     interrupt: Option<String>,
     /// A qualified receipt for it was read before the terminal.
@@ -214,6 +216,7 @@ impl Normalizer {
             denied: BTreeSet::new(),
             declined: BTreeSet::new(),
             synthetic_error: None,
+            refusal_category: None,
             interrupt: None,
             receipt: false,
             acknowledged: false,
@@ -449,6 +452,8 @@ impl Normalizer {
             // Never acceptance, progress or final text; its code classifies
             // the result that follows.
             self.synthetic_error.clone_from(&assistant.error);
+            self.refusal_category
+                .clone_from(&assistant.refusal_category);
             return Batch::default();
         }
         if !self.confirmed {
@@ -623,6 +628,7 @@ impl Normalizer {
         let (status, stop_reason, class_hint, vendor_code) = if !result.is_error {
             let stop = match result.stop_reason.as_deref() {
                 Some("end_turn") => StopReason::EndTurn,
+                Some("refusal") => StopReason::Refusal,
                 _ => StopReason::Other,
             };
             (VendorTerminalStatus::Completed, stop, None, None)
@@ -654,6 +660,15 @@ impl Normalizer {
                 Some(ClassHint::BudgetExceeded),
                 Some(result.subtype.clone()),
             )
+        } else if result.stop_reason.as_deref() == Some("refusal") {
+            // An explicit model refusal (live probe sC): still a failure,
+            // but C1's canonical reason is `refusal`, not `error`.
+            (
+                VendorTerminalStatus::Failed,
+                StopReason::Refusal,
+                Some(ClassHint::VendorError),
+                Some(code),
+            )
         } else {
             (
                 VendorTerminalStatus::Failed,
@@ -678,7 +693,7 @@ impl Normalizer {
                 usd,
                 scope: "session_cumulative".to_owned(),
             }),
-            vendor: vendor_data(result),
+            vendor: vendor_data(result, self.refusal_category.as_deref()),
         };
         if terminal_len(&terminal) > MAX_OBSERVATION_BYTES {
             return Err("a terminal payload past 256 KiB");
@@ -947,13 +962,14 @@ fn usage(usage: &ResultUsage) -> Result<UsageSample, &'static str> {
     })
 }
 
-/// Packet §5 vendor data, within [`VENDOR_MAX`] encoded: the cache-creation
+/// Packet §5 vendor data, within [`VENDOR_MAX`] encoded: a synthetic
+/// refusal's category (`refusal_category`), the cache-creation
 /// count, a non-null `fallback_credit`, each model's `costBasis`, then
 /// the result's unread members under `extra` (the first [`EXTRA_MAX`]).
 /// Each member is kept only if it still fits, so one oversized member
 /// drops alone (review r1 #12). Raw values are copied verbatim, never
 /// parsed (review r2 #3); `None` when nothing is kept.
-fn vendor_data(result: &ResultMessage) -> Option<Box<RawValue>> {
+fn vendor_data(result: &ResultMessage, refusal_category: Option<&str>) -> Option<Box<RawValue>> {
     let key = |name: &str| serde_json::to_string(name).ok();
     let mut known: Vec<(String, String)> = Vec::new();
     let mut extra: Vec<(String, String)> = Vec::new();
@@ -962,6 +978,9 @@ fn vendor_data(result: &ResultMessage) -> Option<Box<RawValue>> {
     };
     let usage = result.usage.as_ref();
     let mut candidates: Vec<(Option<String>, String)> = Vec::new();
+    if let Some(category) = refusal_category.and_then(key) {
+        candidates.push((key("refusal_category"), category));
+    }
     if let Some(created) = usage.and_then(|usage| usage.cache_creation_input_tokens) {
         candidates.push((key("cache_creation_input_tokens"), created.to_string()));
     }

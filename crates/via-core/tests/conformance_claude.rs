@@ -36,8 +36,10 @@
 //!
 //! Every launched case pins `instance` `{vendor_version: "2.1.285",
 //! version_status: "tested"}`: `via-p98.3.2`'s initial `checked` set holds
-//! the fixture version (the live re-probes of 2026-09-30). The synthetic
-//! untested case is `via-p98.3.2`'s `claude_preflight_pure_version`.
+//! the fixture version (the live re-probes of 2026-09-30), except
+//! `claude_model_refusal`, recorded on 2.1.289 (checked since 2026-10-05).
+//! The synthetic untested case is `via-p98.3.2`'s
+//! `claude_preflight_pure_version`.
 
 #[path = "support/conformance_drive.rs"]
 mod conformance_drive;
@@ -129,6 +131,7 @@ cases! {
     driven: [
     c0_isolated,
     c0_bad_model,
+    claude_model_refusal,
     c0_invalid_resume,
     c1a,
     c1b,

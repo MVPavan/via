@@ -257,6 +257,50 @@ fn c0_bad_model_is_a_vendor_error() {
     assert_eq!(run.count("turn.accepted"), 1);
 }
 
+/// `claude_model_refusal` (live probe sC): an explicit model refusal ends
+/// `is_error:true` with `stop_reason:"refusal"`. The turn fails, the
+/// vendor's synthetic code kept, but its canonical stop reason is
+/// `refusal`, and the bounded refusal category reaches vendor data. The
+/// notices around it are no progress; the result accepts the turn.
+#[test]
+fn model_refusal_keeps_its_canonical_reason() {
+    let (_, run) = replay("claude_model_refusal", &facts(NEW_SID, false));
+    assert_eq!(run.count("turn.accepted"), 1);
+    assert_eq!(run.count("progress"), 0);
+    assert_eq!(run.count("final_text"), 0);
+    let terminal = run.terminal();
+    assert_eq!(terminal.status, VendorTerminalStatus::Failed);
+    assert_eq!(terminal.stop_reason, StopReason::Refusal);
+    assert_eq!(terminal.vendor_stop_reason, "refusal");
+    assert_eq!(terminal.class_hint, Some(ClassHint::VendorError));
+    assert_eq!(terminal.vendor_code.as_deref(), Some("invalid_request"));
+    assert!(
+        terminal
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.starts_with("API Error: "))
+    );
+    let vendor: Value = serde_json::from_str(terminal.vendor.as_ref().unwrap().get()).unwrap();
+    assert_eq!(vendor["refusal_category"], "cyber");
+}
+
+/// A successful result whose vendor stop reason is `refusal` is a
+/// completed refusal (C1 §5), not `other`.
+#[test]
+fn completed_refusal_maps_to_refusal() {
+    let facts = facts(NEW_SID, false);
+    let (_, run) = run_lines(
+        &facts,
+        &[
+            init_line(NEW_SID),
+            result_line(&json!({"stop_reason":"refusal"})),
+        ],
+    );
+    let terminal = run.terminal();
+    assert_eq!(terminal.status, VendorTerminalStatus::Completed);
+    assert_eq!(terminal.stop_reason, StopReason::Refusal);
+}
+
 /// `c0_invalid_resume`: a pre-init rejection of a resume naming the session
 /// as missing is `SessionGone`; nothing is confirmed or accepted, though it
 /// echoes the expected UUID. Not a resume, it is a vendor error.

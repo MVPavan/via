@@ -328,7 +328,14 @@ the qualified receipt plus `error_during_execution/aborted_tools` → Interrupte
 Classify on `is_error`, `terminal_reason`, `api_error_status` and the
 synthetic `error` code, never on `subtype` (a `success` subtype can carry
 `is_error:true`): `authentication_failed` or HTTP 401/403 → Failed `auth`;
-`model_not_found` → Failed `vendor_error` with that `vendor_code`. A vendor
+`model_not_found` → Failed `vendor_error` with that `vendor_code`. An
+explicit model refusal (`is_error:true` with `stop_reason:"refusal"`, after
+`system/model_refusal_no_fallback` and a synthetic message with
+`stop_details.type:"refusal"`; live probe sC, 2.1.289) → Failed
+`vendor_error` with the synthetic code (`invalid_request`) as `vendor_code`
+and canonical stop reason `refusal`; the synthetic message's
+`stop_details.category` (at most 1 KiB, e.g. `cyber`) goes to bounded
+`vendor` data as `refusal_category`. A vendor
 failure after acceptance and before model output is a Failed terminal with
 vendor code, class hint and `detail`, never `submit_failed` (C2 §2). On
 `is_error:true` the result text is that bounded `detail`, never final text;
@@ -342,8 +349,9 @@ Canonical stop reason for a successful result with vendor `end_turn` is
 `end_turn`; a successful schema-tool result with vendor `tool_use` is `other`,
 retaining `vendor_stop_reason:tool_use`. Do not label it interrupted or failed.
 Qualified cancellation maps `interrupted`, max-turn failure maps `max_steps`,
-other vendor failure maps `error`; unknown success reasons map `other` with the
-verbatim vendor reason. Core owns deadline override. Raw message tool calls do
+a vendor `refusal` maps `refusal` (a successful result too), other vendor
+failure maps `error`; unknown success reasons map `other` with the verbatim
+vendor reason. Core owns deadline override. Raw message tool calls do
 not override the terminal result's success flag.
 
 `result.usage` is the turn aggregate (C2 §5 usage) and supersedes any
