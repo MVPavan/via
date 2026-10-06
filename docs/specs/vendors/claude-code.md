@@ -408,9 +408,12 @@ VIA state directory, gitignored evidence in
   process-group leader (as in c7, §7). `via cancel --wait` was issued while
   the tool ran. The turn ended `cancelled`, `stop_reason: interrupted`,
   cancel outcome `acknowledged`, cleanup `quiescent`, settled 1.2 s after
-  the request, with no leftovers. Afterwards neither the vendor process nor
-  the sleep was running (checked by name). A resume of the same session
-  then completed. This matches §3's `cancel: partial:
+  the request. `quiescent` proves only Claude's own process group gone;
+  `leftovers` was `null`, which means no scan ran (this route runs none),
+  not that nothing survived. A by-name check after the cancel found
+  neither the vendor process nor the sleep, but no snapshot of it was
+  kept, so the sleep's absence is unretained evidence. A resume of the
+  same session then completed. This matches §3's `cancel: partial:
   aborts_tools_then_result` and §7.
 
 ## 5. Typed stream and normalizer
