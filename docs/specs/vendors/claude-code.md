@@ -688,8 +688,9 @@ turn is distinct from resending the unknown turn and obeys C1 admission.
 
 ## 8. B1 followup gate: qualification, not scope reduction
 
-Open gate **CLAUDE-BOUND-1** must be tracked under Claude bound enforcement before
-declaring that release acceptance complete. Existing C5/C6 findings support
+Open gate **CLAUDE-BOUND-1** is post-release (owner, 2026-10-06; bead
+via-mv5): the first release supports Claude's `full` bound only and refuses
+the limited bounds by name. Existing C5/C6 findings support
 candidate restricted file-tool policies only. They do not establish general
 read-only/workspace confinement, network control, or a sandbox for every tool.
 Claude's documented OS sandbox concerns Bash/children; other surfaces and
