@@ -73,7 +73,7 @@ the agent's responsibility: VIA stops only the agent and reports leftovers
 | A5 | ACP decline: choose a reject-kind option, else `cancelled`; never counted as enforcement | as written; shape unverified |
 | A6 | Auto-decline deadline 5 s, from Core config, served on the control path, one value for every adapter (AD17); fail closed when an unknown request cannot be answered, without fabricating a decline | as reviewed in Claude §10; AD17 withdraws the Codex and OpenCode packets' 1 s |
 | A7 | Codex live recovery is unsupported on owned stdio; `thread/resume` continues a conversation after a resolved turn, not an in-flight turn. `Dead` requires verified death, otherwise `Unknown`; no resend | as reviewed in Codex §9 |
-| A8 | Codex owned stdio server key: `config_hash`, covering VIA-controlled launch settings (resolved program path, arguments, passed environment, server cwd, protocol pin), not credentials or binary contents; the observed binary version is reported, not keyed; bound omitted due per-turn `sandboxPolicy`, mixed-bound use qualified by `via-5lr.3.4`. OpenCode shares one owned `opencode serve --stdio` per launch key: namespace (anonymous profile identity/epoch, project-configuration switch) plus a hash of VIA-controlled launch settings; no credentials, bound, owner or version; at most one live server per namespace, fenced across restarts by Host's anchor journal (C1 P11) | as reviewed in Codex §9 and OpenCode §3 |
+| A8 | Codex owned stdio server key: `config_hash`, covering VIA-controlled launch settings (resolved program path, arguments, passed environment, server cwd, protocol pin), not credentials or binary contents; the observed binary version is reported, not keyed; bound omitted due per-turn `sandboxPolicy`, mixed-bound use qualified by `via-5lr.3.4`. OpenCode shares one owned `opencode serve --stdio` for all of VIA (owner, 2026-10-06): launch key = the one namespace (anonymous profile identity/epoch; project configuration always on) plus a hash of VIA-controlled launch settings; no credentials, bound, owner or version; at most one live server, fenced across restarts by an exclusive kernel lock on its data root that only the server's anchor holds and a server that cannot outlive its anchor, assuming it never executes from a non-leader thread (an upgrade-window exception is still fenced; C1 P11, runtime §5) | as reviewed in Codex §9 and OpenCode §3 |
 
 ## 1. Purpose and rules
 
@@ -724,8 +724,8 @@ default.
     vendor codes only.
   - After Claude's prompt line, it fails `protocol` with no resend.
 - **Refusal cache.** Only a demonstrated incompatibility is cached: a
-  relied-on feature absent from the handshake, or a readback that differs from
-  the value VIA sent. The key is the resolved program path and its file
+  relied-on feature absent from the handshake, a readback that differs from
+  the value VIA sent, or (OpenCode) an unchecked version. The key is the resolved program path and its file
   identity (device, inode, size, mtime, ctime) plus the route's recipe
   digest (launch arguments, category switches, bound and
   policy inputs), so a binary replaced at the path does not inherit the
@@ -751,7 +751,19 @@ default.
   hooks and plugins); complete cleanup; bound enforcement semantics, including
   Codex read-only (qualified live by `via-5lr.3.4`, not by the handshake); unchanged usage or terminal
   semantics.
-- Proceeding on unchecked versions is the owner's accepted risk. The warning
+- **Exception: OpenCode runs only checked versions** (owner, 2026-10-06).
+  An `/api/info.version` outside the OpenCode adapter's `checked` set is
+  refused at the handshake before the server is published, even when every
+  other check passes: `handshake_refused`, cached by this refusal cache's
+  key, with a message naming the version and the checked set; the server
+  is retired through Host. A best-effort `--version` check before launch
+  refuses an unchecked binary the same way before the data root is
+  touched (`vendors/opencode.md` §2.2); the handshake stays
+  authoritative. One server carries every OpenCode session, and
+  an unchecked version's protocol and behaviour are unqualified
+  (`vendors/opencode.md` §12); the one-server fence does not depend on the
+  version (`vendors/opencode.md` §3.2).
+- Proceeding on unchecked versions (other routes) is the owner's accepted risk. The warning
   stays visible in every receipt, status and envelope of such a turn.
   `allow_untested` is accepted and stored for C1 compatibility but has no
   effect; it never waives unsupported bounds, protocol/identity checks,
@@ -785,7 +797,11 @@ fake agent reports no version".
   catalog discovered by the live instance for the session's server key
   (derived from `TurnParams.inherit`), so later turns get the pre-receipt
   `invalid_params`. With no cached catalog for that key, or a model it does
-  not list, the value passes to `run_turn`'s check.
+  not list, the value passes to `run_turn`'s check. OpenCode is the
+  exception: its catalog depends on the session's location, which
+  `check_turn` does not receive, so it makes no location-dependent effort
+  check; `run_turn` fetches the location's catalog fresh before the variant
+  step (`vendors/opencode.md` §5).
 
 `plan`, `check_turn` and `models` read only bundled data and the in-memory
 catalog cache of live instances; nothing is persisted.
@@ -845,7 +861,7 @@ judged by §6.3's matching rules against each route's reserved flags.
 
 | Operation | Claude `claude-cli` | Codex `codex-app-server` | OpenCode `opencode-serve` | Pi `pi-rpc` | Generic ACP |
 |---|---|---|---|---|---|
-| Process shape | one private `claude -p --input-format stream-json --output-format stream-json --verbose` process per VIA turn, persistent same vendor UUID across launches | owned shared `codex app-server` on stdio, key `config_hash` (VIA-controlled launch settings) excluding credentials and bound (A8); stdin stays open for leases | owned shared `opencode serve --stdio --hostname 127.0.0.1 --port 0` per launch key; URL from the child's stdout line; stdin lifeline; private HOME/XDG per namespace; password in the launch environment only; `/api/info` pid check and the credential check before publication | one private `pi --mode rpc` process per VIA turn in a validated private agent directory (`PI_CODING_AGENT_DIR`), persistent derived vendor session ID in a per-session `--session-dir`; profile policy, uncertain-predecessor check and package-metadata version read before each launch | per-session agent process over stdio |
+| Process shape | one private `claude -p --input-format stream-json --output-format stream-json --verbose` process per VIA turn, persistent same vendor UUID across launches | owned shared `codex app-server` on stdio, key `config_hash` (VIA-controlled launch settings) excluding credentials and bound (A8); stdin stays open for leases | one owned shared `opencode serve --stdio --hostname 127.0.0.1 --port 0` for all of VIA (one first-release namespace; at most one live server, fenced by the data-root lock); URL from the child's stdout line; stdin lifeline; private HOME/XDG of that namespace; password in the launch environment only; `/api/info` pid check and the credential check before publication | one private `pi --mode rpc` process per VIA turn in a validated private agent directory (`PI_CODING_AGENT_DIR`), persistent derived vendor session ID in a per-session `--session-dir`; profile policy, uncertain-predecessor check and package-metadata version read before each launch | per-session agent process over stdio |
 | `describe` | bundled catalog; last version seen from an init for this program path, else `null`/`untested` (§5); no vendor process/file write or model prompt | bundled effort mapping; last version seen and the `model/list` catalog cached from a live instance (§5); no process/file write during describe | process-free: bundled profile and effort mapping, last version and cached `GET /api/model` catalog seen for this program path | process-free: bundled catalog; last version read from the Pi package metadata for this program path, else `null`/`untested` (§5) | agent version; cached `initialize` capabilities from the last probe |
 | `open_session` (logical) and the first `run_turn` of a connection generation | logical open keeps the expected UUID unverified before input; every per-turn launch applies frozen flags, matching init/non-rejection result confirms identity; pre-init rejection does not | version from `initialize` (§5); initialize without notification opt-outs; `thread/start` with explicit model/cwd/instructions/sandbox, `approvalPolicy:"never"`, `approvalsReviewer:"user"`, `ephemeral:false`; `thread/resume` exact ID/current sandbox/`excludeTurns:true` and verify identity/policy | new: `POST /api/session` with model, agent `via`, location and the deny rules, then the instruction entry and readback; reopen: `GET /api/session/{id}` identity, then settings readback (`SettingsMismatch`) and one leftover-input cleanup per server generation | logical open keeps the derived expected ID unverified; each launch applies frozen flags and checks `get_state`, `get_available_models` and `get_commands` before the prompt; `--session-id` until identity is confirmed, strict `--session` after; identity is confirmed with the `started` prompt reply | `initialize {protocolVersion, clientCapabilities:{fs:{readTextFile:false,writeTextFile:false},terminal:false}}`; `session/new {cwd, mcpServers:[]}`; reopen `session/load` when `loadSession` (docs) |
 | `run_turn` submission | launch one process with frozen effective settings and exact expected UUID, write one `user` line; Core holds queued prompts and never writes busy input; later launch uses `--resume` with same UUID even when settings are unchanged | `turn/start {threadId,input:[{type:"text",text}],cwd,model,effort,outputSchema,approvalPolicy:"never",approvalsReviewer:"user",sandboxPolicy}` → paired `turn.id`; full frozen structured policy on every turn | one `POST /api/session/{id}/prompt {id:<deterministic caller ID>, text}` once every earlier request of the session has a complete response and the predecessor's execution end is on the stream (or it was not accepted); no resend; an unknown request effect drains the server | launch one process, write one `prompt` line; paired reply `disposition:"started"` → acceptance; `success:false` → `Rejected{VendorError}` with no code; Core holds queued prompts; no resend | `session/prompt {sessionId, prompt:[{type:"text",text}]}` (docs) |
@@ -857,7 +873,7 @@ judged by §6.3's matching rules against each route's reserved flags.
 | Bound | `read_only`, `workspace_write` and `network:false` refused pending CLAUDE-BOUND-1; `full,network:true` separately eligible after exact live recipe continuity proof; tool permissions are not all-tool OS containment | `read_only`/`workspace_write` with `network:false` only (qualified by `via-5lr.3.4`; limited bounds with `network:true` refused); `full,network:true` uses `dangerFullAccess`; `full,network:false` refused; no fallback to full | `full,network:true` only | `full,network:true` only; limited bounds and `network:false` refused; nonempty `extra_write_dirs` `invalid_params`; `--tools` is not containment | `full` only (D7) |
 | Usage, cost | turn aggregate: `result.usage` per turn is authoritative (assistant snapshots are partial) → tokens `turn`; `total_cost_usd` → cost `session_cumulative`, `reported`; a terminal whose `total_cost_usd` is below the session driver's last reported value warns `cost_counter_reset`, and the value is reported as given, never as a negative delta; `modelUsage.costBasis` and `fallback_credit` kept in `vendor` | per model call: keyless `tokenUsage.last` samples add (their sum equals the change in `.total`) → scope `turn`; `total`, `cacheWriteInputTokens` and `modelContextWindow` → `vendor`; cost `unavailable` | step and compaction samples; `vendor_interval` with a compaction sample until qualified | per model call: keyless assistant `message_end` and `compaction_end` samples → tokens `turn`; all-zero usage → `null` components; cost = sum of `usage.cost.total`, `turn`, `estimated`, or `unavailable` when any sample is missing | `usage_update` context tokens; optional cumulative cost (docs) |
 | Class hints (every route: an HTTP 401 or 403 in a vendor error → `auth`) | classify on `is_error`, `terminal_reason`, `api_error_status` and the synthetic `error` code, never on `subtype`; matching interrupt receipt plus abort terminal → cancel evidence; `authentication_failed` or 401/403 → auth; error_max_turns → failed/budget_exceeded with stop_reason max_steps (not normal completed max_steps); is_error with stop_reason `refusal` → failed/vendor_error with stop_reason refusal, the refusal category in vendor data; other is_error → vendor_error | codexErrorInfo rateLimitExceeded → rate_limit; unauthorized and `httpConnectionFailed{401\|403}` → auth; contextWindowExceeded → context_exceeded; usageLimitExceeded/sessionBudgetExceeded → budget_exceeded; `tooManyDenials`, `flexUnavailable` and other vendor errors → vendor_error | `provider.auth` or status 401/403 → `auth`; `provider.rate-limit` or 429 → `rate_limit`; `provider.quota` → `budget_exceeded`; `provider.no-route`, other `provider.*` and unknown → `vendor_error` | HTTP status prefix of `errorMessage` only: 401/403 → `auth`; 429 → `rate_limit`; other → `vendor_error`; no substring inference | stopReason refusal → completed/refusal; max_tokens → completed/budget; transport error → protocol |
-| Inherited configuration (owner OD2) | per category (hooks, MCP servers, plugins, skills, agents, instruction files), see below and [the Claude packet](vendors/claude-code.md) | see below and [the Codex packet](vendors/codex.md) | one server-level project switch following instruction files; states per `vendors/opencode.md` §4.5 (agents, plugins, MCP and hooks `unknown` with the switch on) | hooks, MCP servers, plugins and agents `off` (unconditional `-ne`, warns when `on` is requested); skills `-ns`, instruction files `-nc`; see [the Pi packet](vendors/pi.md) §4.6 | — |
+| Inherited configuration (owner OD2) | per category (hooks, MCP servers, plugins, skills, agents, instruction files), see below and [the Claude packet](vendors/claude-code.md) | see below and [the Codex packet](vendors/codex.md) | project configuration always on (one server for all of VIA); only the project-level part of the user's configuration applies, so every category is `unknown` with `config_switch_unverified` except skills requested `off` (`off` by a session deny rule); states per `vendors/opencode.md` §4.5 | hooks, MCP servers, plugins and agents `off` (unconditional `-ne`, warns when `on` is requested); skills `-ns`, instruction files `-nc`; see [the Pi packet](vendors/pi.md) §4.6 | — |
 | `recover` | no live rejoin or replay; verified live anchor → cleanup request forwarded; un-rejoinable survivor → `Unknown`, `Dead` only with confirmed death; absent anchor → uncertain unless runtime §5.2 absence proof | no live rejoin on owned stdio; submitted/accepted turn unknown with no resend; `Dead` only with verified process-death evidence, otherwise `Unknown`; `thread/resume` is later conversation continuation | no live rejoin; `unknown`, no resend | no live rejoin or replay; `Unknown`, `Dead` only with confirmed death; no resend | `Unknown`; `session/load` replays finished turns only |
 **Inherited configuration (AD13; owner OD2).** Each route declares, per
 category (hooks, MCP servers, plugins, skills, agents, instruction files):
@@ -907,7 +923,9 @@ groups (bwrap `--new-session`) to a thread is unverified (P2b), so per-tool
 kill is not offered.
 OpenCode's launch key, namespace, environment and credential check are in
 `vendors/opencode.md` §§3–4. Do not discover, copy or mount caller saved
-auth or inject a provider key; no login-backed profile or paid fallback. For
+auth or inject a provider key; VIA configures no login-backed profile or
+paid fallback, but a project's own provider configuration applies, and VIA
+never keeps its secrets (owner, 2026-10-06; `vendors/opencode.md` §4.3). For
 pinned OpenCode 2.0.22, describe declares `params.max_steps` unsupported
 with reason `No per-turn step limit on opencode-serve 2.0.22`; Core refuses
 any non-null value before server acquisition or vendor I/O. Output schema is
@@ -961,7 +979,7 @@ of VIA's own recipe:
 |---|---|---|
 | `claude-cli` | each per-turn launch's argv ([Claude packet](vendors/claude-code.md) §4) | per process; part of the handshake-refusal recipe key (§5) |
 | `codex-app-server` | the owned server's argv, after `app-server` and VIA's switches ([Codex packet](vendors/codex.md) §4) | the argv is in `config_hash`, so sessions with different lists get different servers and equal lists share one |
-| `opencode-serve` | refused in the first release: `InvalidParam { field: "vendor_args" }` for any non-empty list, in `plan` and `check_turn` ([OpenCode packet](vendors/opencode.md) §2.2). Server argv is per server and the namespace fence allows one live server per data root, so a different list would need a second server on a data root that already has one (owner, 2026-10-06). Revisit after the release if OpenCode passthrough is wanted: the arguments must then join the namespace | — |
+| `opencode-serve` | refused in the first release: `InvalidParam { field: "vendor_args" }` for any non-empty list, in `plan` and `check_turn` ([OpenCode packet](vendors/opencode.md) §2.2). Server argv is per server and the data-root lock allows one live server on the one data root, so a different list would need a second server on a data root that already has one (owner, 2026-10-06). Revisit after the release if OpenCode passthrough is wanted; how to support it (for example a server and data root per list) is a future architecture choice for the owner | — |
 | `pi-rpc` (adopts this when built) | each per-turn launch's argv ([Pi packet](vendors/pi.md) §4.1) | per process; part of the handshake-refusal recipe key |
 | `fake` | refused: `InvalidParam { field: "vendor_args" }` (not a vendor CLI) | — |
 

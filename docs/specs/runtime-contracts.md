@@ -359,7 +359,9 @@ The clonable sender/control handle and unique message receiver allow reads and
 control writes concurrently without borrowing one object mutably twice.
 `WireRuntime::open_connection` creates the owner's evidence folder (the
 turn's for a turn owner, `evidence/servers/<server_id>/` for a server
-owner) and invokes Host acquisition; `turn_folder` creates a turn's
+owner), takes the connection's payload-capture policy from Route
+(`Capture::On`, the default, or `Capture::Off`, below) and invokes Host
+acquisition; `turn_folder` creates a turn's
 folder on a shared route. Direct `WireConnection::open(&Host, spec,
 deadline)` is private to Wire; `WireConnection::control()` is
 private or removed. No public runtime/connection getter or facade re-export
@@ -437,7 +439,17 @@ names one; otherwise in the connection's folder. The failures go to the
 affected turns, which may differ from the turn holding the evidence (a
 successor of a terminal turn): each names the file and the message's length
 when the file is in its own session's turn folder, and only the length when it
-is in the connection's folder (D4). C1 `logs` returns only turn folders. A
+is in the connection's folder (D4). **Exception (OpenCode, owner
+2026-10-06):** a connection Route opens with `Capture::Off` keeps no
+payload bytes anywhere. Wire's automatic captures (a message over its cap,
+an unterminated message at EOF) and Route's decode-failure capture write
+no `undecoded.bin`; the failure records only the endpoint or event type,
+status, length and failure kind (`vendors/opencode.md` §4.3). By the same
+rule, a process launched with `StderrCapture::CountOnly` (OpenCode's, §5)
+has no `stderr.log`: Host opens none, and the anchor drains the vendor's
+stderr pipe and keeps only its byte count, reported with the exit facts.
+C1 `logs`
+returns only turn folders. A
 final text too long for the envelope is written there as `final_text.txt`, and
 a structured output too long for it as `structured_output.json` (C1 §5). The
 vendor's stderr is capped (owner, 2026-10-04): a per-turn process keeps its
@@ -470,11 +482,31 @@ pub struct PrivateProcessSpec {
     pub cwd: PathBuf,
     pub env: EnvAllowList,
     pub owner: ProcessOwner,
+    /// The vendor cannot outlive its anchor (below): `false` for every
+    /// route but OpenCode's.
+    pub die_with_anchor: bool,
+    /// Exclusive launch lock (below): `None` for every route but OpenCode's;
+    /// requires `die_with_anchor`.
+    pub exclusive_lock: Option<PathBuf>,
+    /// Best-effort version check before the lock (below): `None` for every
+    /// route but OpenCode's; requires `die_with_anchor`.
+    pub version_probe: Option<VersionProbe>,
+    /// `Log` (the owner's `stderr.log`, §4) for every route but OpenCode's,
+    /// which sets `CountOnly`.
+    pub stderr: StderrCapture,
 }
+pub struct VersionProbe {
+    pub args: Vec<OsString>, pub cwd: PathBuf, pub env: EnvAllowList,
+    pub admitted: Vec<String>,           // exact trimmed stdout lines
+}
+pub enum StderrCapture { Log, CountOnly }
 pub struct AcquiredProcess {
     pub pipes: OwnedPipes,       // moved once into Wire; Host never reads them
     pub control: ProcessControl,
     pub exits: ExitReceiver,
+    /// The vendor child's pid from the anchor's `Spawned` reply, passive
+    /// data passed through Wire to the route (OpenCode's `/api/info` check).
+    pub vendor_pid: u32,
 }
 pub struct ProcessIdentity {
     pub pid: u32, pub pgid: u32, pub uid: u32,
@@ -512,6 +544,141 @@ Host starts argv arrays with explicit cwd and an environment from the fake
 allow-list (`PATH` only if required, explicit test variables and vendor VIA
 marker). It never inherits the complete daemon environment. Wire exclusively
 owns vendor pipes. Host control bypasses data and SQLite queues.
+
+**Die with the anchor** (the OpenCode fence, `vendors/opencode.md` §3.2;
+a per-launch option no other route sets). Threat model: the vendor is
+the user's non-hostile software; this bounds crashes, restarts, races and
+VIA's own failures, not a vendor that deliberately escapes supervision.
+When `die_with_anchor` is set, the anchor starts the vendor (and a
+`version_probe`, below) through the same binary's internal exec entry, a
+sibling of the anchor entrypoint (owned by `via-host`, dispatched from
+`via`'s `main` as `__via_host_anchor` is):
+`/proc/self/exe __via_host_exec <anchor pid> <record path or -> <program> <args…>`,
+with the child's cwd, environment, umask and standard streams already in
+place. That process:
+
+1. sets its parent-death signal to `SIGKILL`
+   (`rustix::process::set_parent_process_death_signal`) and reads it back;
+2. checks that `getppid()` is the anchor pid (it is not if the anchor died
+   first);
+3. with a record path (the vendor launch under `exclusive_lock`), reads
+   that file by path (read-only, no lock, no symlink follow, a fresh open
+   and close each time) about every 2 ms, re-checking `getppid()` each
+   time, until it holds a record with a valid checksum naming its own boot
+   ID, `/proc/self/ns/pid` identity, pid and start ticks (from
+   `/proc/self/stat`); a changed parent, a read error or 5 s from its
+   start is a failure. It inherits no descriptor beyond its standard
+   streams;
+4. replaces itself with the program
+   (`std::os::unix::process::CommandExt::exec`, `argv[0]` the program
+   path).
+
+A failure at steps 1–3 exits 125 and an exec failure 126, or 127 when the
+program is not found, without starting the program. The vendor keeps that
+process's pid, start ticks, group and parent-death signal, so
+`Spawned {pid, start_ticks}` and `vendor_pid` keep their meaning, and any
+of these failures is a vendor exit before the route's handshake.
+
+- **Why an exec entry.** The signal must be set in the child after it is
+  created and before the vendor starts. std's hook for that,
+  `CommandExt::pre_exec`, is `unsafe`, which the workspace forbids
+  (`unsafe_code = "forbid"`, coding style); `process-wrap` 10 has no
+  parent-death wrapper, its `pre_spawn` hook runs in the parent, and its
+  own pre-exec wrappers use `unsafe` internally. The exec entry uses only
+  safe rustix and std calls; it adopts no inherited descriptor (turning an
+  inherited fd number into a handle, `BorrowedFd::borrow_raw`, is
+  `unsafe`), which is why it learns of its record by reading the file. An owner exception to `forbid` for one
+  `pre_exec` closure would remove the extra exec; it is not needed.
+- **Spawning thread.** The kernel sends the signal when the thread that
+  created the child exits, not when its process does. The anchor runs a
+  current-thread Tokio runtime, and `tokio::process::Command::spawn` calls
+  std's spawn synchronously on the calling thread, so the vendor's
+  creator is the anchor's main thread, which lives as long as the anchor.
+  The anchor must keep spawning there, never through `spawn_blocking` or
+  another thread (Tokio ends idle blocking threads after 10 s, which would
+  kill the vendor); `vendors/opencode.md` OC02b's idle case catches such a
+  move.
+- **Limits.** The kernel clears the signal when the child's effective or
+  filesystem user or group ID changes, when it executes a set-user-ID,
+  set-group-ID or file-capability program, or under a security-module
+  transition that marks the execution secure. Host changes no
+  credentials, and the anchor refuses such a program at `Configure`
+  (below). A new thread starts without the signal, so an exec from a
+  non-leader thread, which makes that thread the process (same pid and
+  start time), loses it; the fence assumes the vendor never does that
+  (`vendors/opencode.md` §3.2, L14). It covers the child process only,
+  not its descendants. Linux only; macOS is deferred.
+
+**Exclusive launch lock** (the OpenCode one-live-server fence,
+`vendors/opencode.md` §3.2). Host refuses a spec that sets
+`exclusive_lock` without `die_with_anchor`. On `Configure`, the anchor:
+
+1. refuses (`PrivilegedVia`) unless, in `/proc/self/status`, the four
+   `Uid:` values (real, effective, saved, filesystem) are equal and not 0,
+   the four `Gid:` values are equal, and `CapPrm`, `CapEff` and `CapAmb`
+   are zero (without capabilities, every set-ID call can only choose
+   among those equal IDs, so the vendor can make no ID change that clears
+   its parent-death signal; `vendors/opencode.md` §3.2); and it refuses a
+   program file with the set-user-ID or set-group-ID bit or a
+   `security.capability` attribute (`ProgramPrivileged`);
+2. with `version_probe`, runs the program through the exec entry (no
+   record path) with the probe's arguments, cwd and environment, stdin
+   `/dev/null`, stdout kept up to 256 bytes, stderr discarded, killing and
+   waiting for it at 2 s; exit 0 with a trimmed output in `admitted`
+   passes, exit 0 with other output is `ProbeRefused { output }` (printable
+   ASCII only), and anything else is `ProbeFailed { kind }`;
+3. opens the lock path (create 0600, no symlink follow, close-on-exec, a
+   regular file of the daemon's uid) and takes `flock(LOCK_EX | LOCK_NB)`;
+   a held lock is `LockHeld`;
+4. reads the server record and requires its server gone
+   (`vendors/opencode.md` §3.2): a missing or torn record, another boot
+   ID, or, in the same boot and PID namespace, an exact exit proof:
+   `/proc/<pid>/stat` gone or showing other start ticks before any open
+   (the pid is free or was reused, as a process or a thread); or, with
+   matching ticks, `rustix::process::pidfd_open(pid, PidfdFlags::empty())`
+   failing with `ESRCH`; or, after it opens, `/proc/<pid>/stat` gone or
+   showing other start ticks; or, with equal ticks (the pidfd names the
+   recorded process), `rustix::event::poll` on it reporting readable,
+   which Linux's `pidfd_poll` (`kernel/fork.c`) does only when
+   `thread_group_exited` (`kernel/exit.c`) holds, that is, the whole
+   thread group has exited, reaped or not. Identity that cannot be read,
+   any other `pidfd_open` error after a matched identity (`EINVAL`,
+   `ENOSYS`, permission) or a poll that is not readable is present:
+   unavailability fails closed. A present server is waited for by polling
+   the pidfd with a timeout, up to 1 s in all, then the anchor replies
+   `PredecessorAlive { pid, start_ticks }` (the refusal's detail shows the
+   pid and that start as a local time). The same boot in another
+   PID namespace is `PredecessorUncertain { namespace }` at once.
+
+On any of these errors it replies the error and exits: Host commits no
+`ArmIntent` and starts no vendor. `ProbeRefused` fails the acquisition as
+a refusal carrying the output; every other error fails it with the
+no-launch evidence and a `launch_failed` cause naming the step (C2 §2).
+The probe is the only process the anchor starts before ARM; it has exited
+before the anchor replies, and it dies with the anchor. The descriptor
+stays close-on-exec, so neither the exec entry nor the vendor inherits
+it; the anchor never unlocks or closes it, and the kernel releases it
+when the anchor exits.
+
+At ARM, under `exclusive_lock`, the anchor spawns the exec entry with the
+lock path as its record path. While still holding the lock it reads the
+child's start ticks from `/proc/<pid>` (the pid the spawn returned; the
+child is unreaped) and writes the server record through its lock
+descriptor (boot ID, its PID-namespace identity, the child's pid and
+start ticks and a checksum, one fixed-size write at offset 0). Only the
+live lock holder ever writes the record, and no child executes the
+vendor before a record naming it exists; a child whose anchor dies before
+the write is never named (a successor's record names the successor's own
+child) and never executes the vendor. A failed record write makes the
+anchor kill and reap its child, which has not executed the vendor, and
+reply `FenceRecordFailed` instead of `Spawned`, a launch failure. The
+pidfd proof needs rustix's `event` feature in `via-host`, beside the
+`process` feature it already enables. With `die_with_anchor`, the vendor dies with the
+anchor, so the lock is free only after its holder's vendor has been sent
+`SIGKILL`; step 4 covers the moment between the anchor's descriptors
+closing and the vendor's death. Nothing about the lock or the record
+enters the Store, and Host never unlinks the file. It gates only the
+launch; cleanup evidence and harness-process capacity are unchanged.
 
 **Stop reply.** Host's `CloseReport` gains `stopped_live: Option<bool>`:
 the verified anchor's `Stopping { stopped_live }` reply to this close's
@@ -615,7 +782,9 @@ created as pipes by the daemon and are inherited by the vendor using
 `Stdio::inherit`; Wire exclusively reads/writes their daemon ends. The
 anchor's stderr is the owner's `stderr.log`: the anchor keeps a
 close-on-exec duplicate of it and gives the vendor a new pipe as stderr,
-which a drain thread of the anchor reads into the file under §4's cap. Inheritance
+which a drain thread of the anchor reads into the file under §4's cap
+(with `StderrCapture::CountOnly` the anchor's stderr is `/dev/null` and the
+drain only counts, §4). Inheritance
 does not detach the anchor's copies. Before spawning, the anchor opens
 `/dev/null` read/write; immediately after successful spawn, it redirects its
 own fd 0, 1 and 2 to that file using safe `rustix::stdio::dup2_stdin`,
@@ -659,13 +828,15 @@ Startup protocol, on a 0600 Host-only Unix socket in the validated directory:
    `identified` to `arm_intent`. Only its positive commit receipt permits
    exactly one `Arm {generation}` send on the original connection. This is
    the **durable ARM intent**, not a claim that the anchor received ARM.
-   The anchor starts at most one vendor after receiving that command, then
+   The anchor starts at most one vendor after receiving that command
+   (through the exec entry when `die_with_anchor` is set, §5), then
    acknowledges with vendor child facts only after descriptor detachment;
    they include the vendor's start ticks for the leftover scan (§5,
    `Spawned {pid, start_ticks}`), read from non-environment procfs metadata.
    It rejects duplicate/wrong-generation ARM and never spawns again.
    Before receiving ARM, controller EOF or a 5 s bootstrap deadline makes the anchor
-   exit; no vendor was started. After ARM, EOF starts own-group cleanup.
+   exit; no vendor was started (a `version_probe`, §5, has already
+   exited). After ARM, EOF starts own-group cleanup.
 4. Commit vendor child facts before handing pipes to Wire. If that write
    fails or the daemon dies, the already-durable anchor can clean its group;
    no missing vendor-identity row authorizes a numeric signal. The leftover
@@ -689,8 +860,9 @@ to it and proves cleanup by the absence predicate (§5.2) after its EOF exit
 The control protocol is a closed enum of `Challenge`, `Configure`, `Arm`,
 `Stop`, `Status` and replies. Configure is accepted once, before ARM, only
 on the original bootstrap controller connection; its validated argv/env/cwd
-spec is <=64 KiB. Other control messages are <=1 KiB, with at most one outstanding
-request and bounded integer fields. Restart cannot configure or start a
+spec (with the die-with-anchor flag, the optional exclusive-lock path, version probe and stderr capture, §5) is <=64 KiB. Other control
+messages are <=1 KiB, with at most one outstanding request and bounded
+integer fields. Restart cannot configure or start a
 vendor; it connects to the stored private socket and sends a
 fresh random challenge; the anchor returns the challenge plus its own private
 marker and identity, never an expected marker echoed from the request.
@@ -997,7 +1169,8 @@ Write ordering is explicit:
    acceptance is independent evidence.
    On a shared-server route the turn's `run_turn` instead creates the
    turn's evidence folder, pins, joins or launches its server (a launch runs
-   this step for the server, with the server's stderr file, under the
+   this step for the server, with the server's stderr file (none with
+   `StderrCapture::CountOnly`, §4), under the
    route's own handshake deadline), commits the turn's link to the server
    anchor, and only then writes the turn's first message.
 4. Adapter emits an observation; Core commits acceptance, durable events
@@ -1078,7 +1251,7 @@ would otherwise fail every launch.
   store.sqlite3-wal          SQLite-owned sidecar when present
   store.sqlite3-shm          SQLite-owned sidecar when present
   evidence/<session-id>/<turn>/  stderr.log, undecoded.bin, final_text.txt, structured_output.json
-  evidence/servers/<server-id>/  a shared server's stderr.log and undecoded.bin
+  evidence/servers/<server-id>/  a shared server's stderr.log (none for OpenCode, §4) and undecoded.bin
   vendor/<harness>/              adapter-private vendor state (Codex: CODEX_SQLITE_HOME), persistent
   blobs/<blob-id>.blob       bounded immutable request/effective data
 <runtime>/
@@ -1110,7 +1283,8 @@ modes (0644 for a regular file) rather than 0600 (bead via-aew, 2026-10-05). Sto
 SQLite and blob files, and validates or creates the `evidence/` root; Wire
 creates each turn's folder and each shared server's folder under it; Host
 opens the owner's `stderr.log` (the turn's or the server's) for the anchor,
-which writes the vendor's stderr into it (§4);
+which writes the vendor's stderr into it (§4; none with
+`StderrCapture::CountOnly`);
 daemon bootstrap creates `vendor/`, and each adapter its own subdirectory,
 under the managed-directory rules above; `final_text.txt` and
 `structured_output.json` are written through `StoreClient`. Host owns
@@ -1346,7 +1520,7 @@ payload limits count encoded bytes plus separately bounded decoded structure.
 | Resource | Default hard bound | Full/expired behavior |
 |---|---:|---|
 | Harness processes | `daemon.json` `harness_processes.limit` running harness processes VIA started, daemon-wide, each with its anchor: default 8, any value from 1 to 2^32 − 1. A per-turn process (CLI route, Pi RPC) holds a slot for its turn; a shared server (Codex app-server, OpenCode serve) holds one for its whole life, however many sessions it serves. A slot is reserved only for a new process (C2 §3, AD16) | Queue eligible work; do not create a child until a slot is reserved |
-| OpenCode owned servers | One per launch key, at most one per namespace (anchor-fenced); each holds one harness-process slot; one SSE stream and 8 request connections (2 decline, 2 stop, 4 general) | Same as Codex servers; an unknown request effect drains and retires the server (`vendors/opencode.md` §8) |
+| OpenCode owned servers | At most one live for all of VIA: one namespace in the first release (fenced by the server anchor's exclusive launch lock and a server that dies with its anchor, §5); each holds one harness-process slot; one SSE stream and 8 request connections (2 decline, 2 stop, 4 general) | Same as Codex servers; an unknown request effect drains and retires the server (`vendors/opencode.md` §8) |
 | OpenCode SSE and retained state | 1 MiB event; staging 1,024/4 MiB per server; lanes 16/1 MiB per session; per server 1,024 session states, 4,096 tombstoned turns, 4,096 child sessions, 64 pending interactive requests, 64 unanswered requests; 45 s silence | Event, staging or count overflow: server generation `overflow`; full lane: driver overflow as Codex; silence: transport loss |
 | `vendor_args` (C1 §4) | 64 arguments, 16 KiB in total (UTF-8), no NUL | `invalid_params` naming `vendor_args` before any receipt; a launch past Host's 64 KiB request is refused by its route (C2 §6.3) |
 | Queued turns | 8/session, 128 daemon-wide | `queue_full` / `admission_refused` before commit |
@@ -1364,7 +1538,7 @@ payload limits count encoded bytes plus separately bounded decoded structure.
 | Codex shared connection writes | 8 pending server-request replies, 64 KiB; one control in flight; data held back while any control is pending; per driver, reserved interrupt (12,800 B) and unsubscribe (6,400 B) slots, steer 6 commands and 46,336 B | Past the reply bound, a reply not written within 5 s of decode, or correlation exhaustion: connection overflow, every associated session fails through health, the server retires |
 | OpenCode HTTP/SSE transport metadata | Existing bounded Wire splitting; headers 64 KiB, bodies 1 MiB (`/api/model` 4 MiB) | Read, count and discard as for pipes; never an `Authorization` header or request body in evidence |
 | C2 observations | 1024 items and 4 MiB/session | Wait only normalizer; at 10 s without drain, the adapter closes the session's route hop; a private route fails the connection `overflow`, a shared route quarantines the thread generation (A1, C2 §4) |
-| C2 observation payload | 256 KiB encoded; final text sent in pieces; IDs, names, stop reasons and codes 1 KiB | Fail protocol, the message saved to the evidence folder; unknown messages keep no payload |
+| C2 observation payload | 256 KiB encoded; final text sent in pieces; IDs, names, stop reasons and codes 1 KiB | Fail protocol, the message saved to the evidence folder (a `Capture::Off` connection, OpenCode's: length and failure kind only, never the payload, §4); unknown messages keep no payload |
 | Data commands / control commands | 1 / 8 per driver, 64 KiB controls total | Data waits only until absolute deadline; duplicate interrupt/close coalesces; other control admission refused explicitly |
 | Health channel | watch latch + at most one exit report/connection | Latest health replaces state; `health: store_failed` is sticky after the latch; `store_failure` reports the latest recorded failure and its scope; no event payloads |
 | Store requests | 64 + 8 reserved lifecycle, 8 MiB total | Request-side overload refusal; Host cleanup never awaits this queue |
@@ -1474,9 +1648,11 @@ qualified.
 The S1 fake RSS result alone does not qualify this shared-server extension.
 For the OpenCode extension, Adapter owns the launch key and recipe; Routes
 owns the shared registry, per-session lanes, the server-scoped session state
-and drain; Wire owns HTTP/SSE framing; Host owns the process, its anchor with
-the namespace `owner_server` label, retirement and death evidence. The
-memory measurement includes N sessions on one server with concurrent turns.
+and drain; Wire owns HTTP/SSE framing; Host owns the process, its anchor
+(a `Server` owner with a minted `ServerId`, as Codex's; no OpenCode-specific
+label) with its die-with-anchor launch and exclusive launch lock (§5),
+retirement and death evidence.
+The memory measurement includes N sessions on one server with concurrent turns.
 Core's durable-state and Store ownership do not change, and Adapter
 receives no Store access.
 
