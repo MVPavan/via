@@ -133,11 +133,12 @@ Version (C2 §5; owner OD1). Every Claude Code version is supported by
 default. Check init `claude_code_version` on every launch, parsing the
 complete version including any prerelease/build qualifier, never guessed from
 an executable filename. A version in the adapter's `checked` set (versions the
-maintainers' cheap live check passed: 2.1.285, from the live round of
-2026-10-05 2.1.289, and from run 4 of 2026-10-06 2.1.290, its cancel
-case included, §4) is `tested`;
-any other is `untested`,
-with warning `vendor_version_untested`, and proceeds. Only a failed handshake
+maintainers' cheap live check passed: 2.1.285 and, from the live round of
+2026-10-05, 2.1.289) is `tested`; any other is `untested`,
+with warning `vendor_version_untested`, and proceeds. 2.1.290 is not in the
+checked set: run 4 of 2026-10-06 (§4) is partial live evidence, not the
+full qualification of §9, and its promotion waits for the qualification
+runner (bead via-kr9). Only a failed handshake
 check on something VIA relies on (`interrupt_receipt_v1`, the permission-mode
 echo, the tool list) refuses the instance. Init follows the prompt line, so
 the turn fails `protocol` with no resend, and the refusal is cached per C2 §5.
@@ -386,8 +387,10 @@ launch.
 
 Live through VIA on 2.1.290 (run 4, 2026-10-06, Haiku, bead via-jne; fresh
 VIA state directory, gitignored evidence in
-`scratchpad/execution/claude-live/run-4/`). These runs qualified 2.1.290 for
-`checked` (§3):
+`scratchpad/execution/claude-live/run-4/`). This is partial live evidence,
+not qualification: it does not meet §9's bar, and 2.1.290 stays out of the
+checked set (§3) until the qualification runner passes on it (bead
+via-kr9):
 - Default mode: a spawn and its resume both completed, the resume recalled
   turn 1's content, and the files Write created were mode 0644. The
   session's inherited states were all `on`, as the table above gives for
