@@ -592,7 +592,10 @@ See [Codex §5](vendors/codex.md) for the full reviewed failure scenarios.
 - **Persistent-server routes** with no terminal, per C1 §7.6:
   - Host confirms the server died → `Err(ServerLost)` → `failed(server_lost)`;
   - the connection is lost while the server is alive or its state is
-    unconfirmed → `Err(TransportLost)` → `unknown`;
+    unconfirmed → `Err(TransportLost)` → `unknown`, unless the failure
+    carries the no-launch evidence (§2: nothing of the turn was sent),
+    which resolves `failed(submit_failed)` with `data.reason: launch_failed`
+    (C1 §7.6);
   - an ambiguous submission → the typed unknown-submission failure →
     `unknown`;
   - the stop order's `force_at` passes without acknowledgement → the S1
