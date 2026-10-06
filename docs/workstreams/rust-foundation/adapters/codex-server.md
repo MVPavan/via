@@ -1816,7 +1816,14 @@ Steps 2–4 run concurrently:
    { discarded_bytes }`; it never waits for more output. The demux routes
    each message as usual and each registration receives the boundary
    after its prefix, so a terminal decoded before the failure is applied
-   first.
+   first. The server's evidence is taken after the drain, so an
+   unattributable message the drain finds (a queued over-cap line) is
+   kept too. **Stream order (review cfix-crit #2):** when the latched
+   cause is a failure of Wire's stream (`next_message` erred: a full
+   queue's `Overflow`, a read error), every admitted message precedes it,
+   so the first failure the drain finds becomes the disposition instead
+   (the latch is updated); a cause latched anywhere else (a routed
+   message, a write, a driver's request) keeps first-wins.
 4. **Fan-out**, after the prefix reached every lane and Host's report is
    in (or `loss_deadline` passed). Disposition by the latched cause (F9):
    - `Protocol` → `failed(protocol)`; `Overflow` → `failed(overflow)`

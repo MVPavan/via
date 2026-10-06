@@ -784,6 +784,48 @@ async fn an_over_cap_line_fails_the_connection_protocol() {
     }
 }
 
+/// Review cfix-crit #2: routing is held while an over-cap line and then
+/// enough small lines to fill Wire's queue arrive, so Wire latches
+/// `Overflow` with the skipped record still queued. The drain finds the
+/// record, which precedes the overflow in stream order: its head is kept
+/// as the server's evidence and the connection fails `protocol`.
+#[tokio::test]
+async fn a_queued_over_cap_line_keeps_its_evidence_through_an_overflow() {
+    const POINT: &str = "codex.connection.message";
+    let points = paused_at(POINT);
+    let mut vendor = Vendor::open(1 << 16);
+    vendor.emit(&json!({"method": "x/first"})).await;
+    reached(&points, POINT).await;
+    let line = format!(
+        r#"{{"method":"item/completed","params":{{"item":{{"type":"agentMessage","id":"m","text":"{}"}},"threadId":"t","turnId":"u"}}}}"#,
+        "x".repeat(INBOUND.message_bytes)
+    );
+    vendor.emit_raw(format!("{line}\n").as_bytes()).await;
+    for _ in 0..1100 {
+        vendor.emit(&json!({"method": "x/small"})).await;
+    }
+    until("Wire's overflow", || {
+        vendor.stdio.input().failure().is_some()
+    })
+    .await;
+    release(&points, POINT);
+    let end = tokio::time::timeout(Duration::from_secs(10), &mut vendor.task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(&end, ConnectionEnd::Failed(loss) if loss.cause == LossCause::Protocol),
+        "{end:?}"
+    );
+    let kept = vendor.stdio.kept();
+    assert_eq!(kept.len(), 1, "the skipped line's head is kept");
+    assert!(line.as_bytes().starts_with(&kept[0]));
+    assert_eq!(
+        vendor.connection.failure(),
+        Some(ConnectionFailure::Protocol)
+    );
+}
+
 /// Item 5 step 3: a well-formed message for an unknown thread and an
 /// untagged one fail nothing; they are counted.
 #[tokio::test]

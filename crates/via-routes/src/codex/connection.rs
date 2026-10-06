@@ -572,6 +572,11 @@ impl Connection {
     /// Latches `cause` unless a cause is latched already (then it is only
     /// counted), sealing Wire's admission in the same step (item 13.1).
     pub fn fail(&self, cause: ConnectionFailure) {
+        self.latch(cause);
+    }
+
+    /// [`Self::fail`]: whether `cause` latched, as the first.
+    fn latch(&self, cause: ConnectionFailure) -> bool {
         let latched = self.failure.send_if_modified(|failure| {
             if failure.is_some() {
                 return false;
@@ -584,6 +589,7 @@ impl Connection {
             let mut state = self.state();
             state.counts.later_failures = state.counts.later_failures.saturating_add(1);
         }
+        latched
     }
 
     /// Marks the idle retirement begun: from now the end of stdout ends
@@ -1275,7 +1281,7 @@ impl Connection {
     /// lanes, then the disposition to every lane and waiter.
     async fn fail_sequence(
         &self,
-        cause: ConnectionFailure,
+        (cause, at): (ConnectionFailure, FailureAt),
         messages: &mut WireMessages,
     ) -> ConnectionLoss {
         // Test builds: a seam between the latch and the owned sequence,
@@ -1294,24 +1300,36 @@ impl Connection {
             mode: CloseMode::Force,
             deadline: loss_deadline,
         });
-        let drain = async {
+        let mut drained = None;
+        let drain_and_keep = async {
             // Up to the boundary: a later cause is counted by `fail`; the
             // prefix still reaches its lanes.
             while let Admitted::Message(message) = messages.drain_admitted().await {
                 if let Err(later) = self.demux(message) {
+                    drained.get_or_insert(later);
                     self.fail(later);
                 }
             }
-        };
-        let evidence = self.state().evidence.take();
-        let keep = async {
+            // After the drain, so a message it found unattributable is
+            // kept too (review cfix-crit #2).
+            let evidence = self.state().evidence.take();
             if let Some(bytes) = evidence {
                 self.stdio
                     .keep_undecoded(&bytes, "the shared connection's message")
                     .await;
             }
         };
-        let (report, (), ()) = tokio::join!(close, drain, keep);
+        let (report, ()) = tokio::join!(close, drain_and_keep);
+        // A Wire stream failure comes after every admitted message: a
+        // failure the drain found precedes it in stream order, and the
+        // first in stream order is the connection's (review cfix-crit #2).
+        let cause = match (at, drained) {
+            (FailureAt::StreamEnd, Some(earlier)) => {
+                self.failure.send_replace(Some(earlier));
+                earlier
+            }
+            (FailureAt::StreamEnd | FailureAt::Elsewhere, _) => cause,
+        };
         let loss = disposition(cause, &report);
         self.finish(ConnectionEnd::Failed(loss), LaneEnd::Lost(loss));
         loss
@@ -1456,6 +1474,15 @@ fn log_failure(connection: &Connection, cause: LossCause) {
     );
 }
 
+/// Where a connection's first failure stands in its message stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FailureAt {
+    /// Wire's stream failed: after every message it admitted.
+    StreamEnd,
+    /// Anywhere else: a routed message, a write, a driver's request.
+    Elsewhere,
+}
+
 /// The cause a Wire error on the message side latches (item 13.1 table).
 fn wire_failure(error: &WireError) -> ConnectionFailure {
     match error {
@@ -1506,6 +1533,9 @@ pub(super) async fn serve(
     // A cause latched outside this task (exhaustion at a driver's request)
     // wakes it: the seal stops admission, so no message would.
     let mut latched = connection.failure.subscribe();
+    // Where the latched cause stands in the stream: after every admitted
+    // message when Wire's stream failed (review cfix-crit #2).
+    let mut at = FailureAt::Elsewhere;
     let done = |done: Done| connection.written(&done);
     let cause = {
         let pump = connection.feeder.pump(&done);
@@ -1538,13 +1568,17 @@ pub(super) async fn serve(
                     }
                     Ok(None) if connection.retiring.load(Ordering::Acquire) => break None,
                     Ok(None) => connection.fail(ConnectionFailure::Transport { stdio_end: true }),
-                    Err(error) => connection.fail(wire_failure(&error)),
+                    Err(error) => {
+                        if connection.latch(wire_failure(&error)) {
+                            at = FailureAt::StreamEnd;
+                        }
+                    }
                 },
             }
         }
     };
     let end = if let Some(cause) = cause {
-        ConnectionEnd::Failed(connection.fail_sequence(cause, &mut messages).await)
+        ConnectionEnd::Failed(connection.fail_sequence((cause, at), &mut messages).await)
     } else {
         connection.finish(ConnectionEnd::Retired, LaneEnd::Retired);
         ConnectionEnd::Retired
