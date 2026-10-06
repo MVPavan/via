@@ -1981,7 +1981,7 @@ fn claude_s_launch_last_version_and_cached_refusal() -> TestResult {
             &argv(Launch::New, false),
             vec![
                 prompt(&ask("ONE")),
-                init_as(id, "2.1.290", &["interrupt_receipt_v1"]),
+                init_as(id, "2.1.291", &["interrupt_receipt_v1"]),
                 reply(id, "ONE"),
                 result(id, "ONE", 0.001),
                 await_eof(),
@@ -2008,16 +2008,16 @@ fn claude_s_launch_last_version_and_cached_refusal() -> TestResult {
         let envelope = d.wait(evidence, &format!("{session}/1"))?;
         check(
             completed(&envelope)
-                && envelope["vendor_version"] == "2.1.290"
+                && envelope["vendor_version"] == "2.1.291"
                 && envelope["version_status"] == "untested",
             || format!("turn on an untested version: {envelope}"),
         )?;
         let plan = d.ok(evidence, "describe-1", &describe)?;
         let receipt = d.spawn(evidence, "spawn-2", &ask("TWO"), &[])?;
         check(
-            plan["vendor_version"] == "2.1.290"
+            plan["vendor_version"] == "2.1.291"
                 && plan["version_status"] == "untested"
-                && receipt["vendor_version"] == "2.1.290",
+                && receipt["vendor_version"] == "2.1.291",
             || format!("describe {plan}, receipt {receipt}"),
         )?;
         let refused = d.wait(evidence, &format!("{}/1", session_of(&receipt)?))?;

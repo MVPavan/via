@@ -135,7 +135,10 @@ complete version including any prerelease/build qualifier, never guessed from
 an executable filename. A version in the adapter's `checked` set (versions the
 maintainers' cheap live check passed: 2.1.285 and, from the live round of
 2026-10-05, 2.1.289) is `tested`; any other is `untested`,
-with warning `vendor_version_untested`, and proceeds. Only a failed handshake
+with warning `vendor_version_untested`, and proceeds. 2.1.290 is not in the
+checked set: run 4 of 2026-10-06 (§4) is partial live evidence, not the
+full qualification of §9, and its promotion waits for the qualification
+runner (bead via-kr9). Only a failed handshake
 check on something VIA relies on (`interrupt_receipt_v1`, the permission-mode
 echo, the tool list) refuses the instance. Init follows the prompt line, so
 the turn fails `protocol` with no resend, and the refusal is cached per C2 §5.
@@ -381,6 +384,41 @@ The switches `--debug-to-stderr` (`-d2e`), `--ax-screen-reader` and
 unverified, with C1's `vendor_passthrough` warning. An option this table
 does not declare is unknown to 2.1.290's Commander, which then refuses the
 launch.
+
+Live through VIA on 2.1.290 (run 4, 2026-10-06, Haiku, bead via-jne; fresh
+VIA state directory, gitignored evidence in
+`scratchpad/execution/claude-live/run-4/`). This is partial live evidence,
+not qualification: it does not meet §9's bar, and 2.1.290 stays out of the
+checked set (§3) until the qualification runner passes on it (bead
+via-kr9):
+- Default mode: a spawn and its resume both completed, the resume returned
+  `alpha` (also readable from turn 1's file, so continuity is unproved),
+  and the files the turns left were mode 0644. The
+  session's inherited states were all `on`, as the table above gives for
+  the unrestricted mode.
+- Restricted mode: one turn completed, with MCP servers `unknown`, every
+  other category `off`, and one `config_switch_unverified` warning listing
+  all six categories.
+- Passthrough, run in the restricted mode: a spawn with
+  `-- --max-budget-usd=0.05` launched Claude with that argument as the last
+  argv element, after the recipe. Its resume launched with
+  `--resume <uuid>` and the same final argument. Both turns completed, and
+  `vendor_passthrough` was on each receipt and envelope and on `status`.
+- Reserved flag: a spawn with `-- --permission-mode=default` was refused
+  `invalid_params`, kind2 `vendor_option_conflict`, `data.field`
+  `vendor_args`, before any launch. No session was created.
+- Cancel (restricted mode, fresh state directory, evidence in `cancel/`):
+  a turn ran one long foreground Bash tool, a python sleep that was its own
+  process-group leader (as in c7, §7). `via cancel --wait` was issued while
+  the tool ran. The turn ended `cancelled`, `stop_reason: interrupted`,
+  cancel outcome `acknowledged`, cleanup `quiescent`, settled 1.2 s after
+  the request. `quiescent` proves only Claude's own process group gone;
+  `leftovers` was `null`, which means no scan ran (this route runs none),
+  not that nothing survived. A by-name check after the cancel found
+  neither the vendor process nor the sleep, but no snapshot of it was
+  kept, so the sleep's absence is unretained evidence. A resume of the
+  same session then completed. This matches §3's `cancel: partial:
+  aborts_tools_then_result` and §7.
 
 ## 5. Typed stream and normalizer
 
