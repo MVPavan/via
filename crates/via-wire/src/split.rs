@@ -6,8 +6,11 @@
 use super::MAX_STDOUT_MESSAGE_BYTES;
 use crate::connection::UNDECODED_BYTES;
 
-/// The trailing bytes of a skipped line kept for its route (review
-/// cfix-1 C): enough for a notification's closing correlation fields.
+/// The trailing bytes of a skipped line kept in its record (review
+/// cfix-1 C). No production route reads them: Codex fails the shared
+/// connection on any over-cap line and keeps only the head as evidence
+/// (owner 2026-10-05); a post-release streaming tracker that attributes
+/// the line to its turn would replace this tail.
 pub const SKIPPED_TAIL_BYTES: usize = 4096;
 
 /// Assembles LF-terminated messages from chunks read in any split.
