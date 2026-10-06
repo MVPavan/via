@@ -2674,14 +2674,18 @@ pub(super) enum Cut {
 ///   terminal, so what the lane holds or loses after it is later traffic;
 ///   a failure before it would have stopped the turn's delivery instead;
 /// - nothing the turn's accounting covered was lost in the connection's
-///   read order (picrit rounds 5 and 6): the first message the
-///   connection's routing rejected (`rejected`, its decode sequence) comes
-///   after the last message the turn's delivery took before its seal
-///   (`Sealed::last_seq`): the terminal, or what closed an interrupted
-///   terminal's P7 window. A rejection fails the connection, but the drain
-///   still routes what Wire admitted behind it, so a decided terminal, or
-///   a P7-closing tool end, can follow a lost sample; the turn keeps its
-///   status and answer, not its sum.
+///   read order (picrit rounds 5 to 7): if the connection's routing
+///   rejected a message (`rejected`, the first one's decode sequence),
+///   delivery decided and that message comes after the last one the
+///   turn's delivery took before its seal (`Sealed::last_seq`): the
+///   terminal, or what closed an interrupted terminal's P7 window. A
+///   rejection fails the connection, but the drain still routes what Wire
+///   admitted behind it, so a decided terminal, or a P7-closing tool end,
+///   can follow a lost sample; the turn keeps its status and answer, not
+///   its sum. Only `Decided` means delivery took the turn through its
+///   natural end: any other cut (the P7 bound, a detach, an order, the
+///   force) may have left a rejected message of the turn behind
+///   `last_seq`, so with a rejection it is unaccounted.
 ///
 /// Anything else (an uncorrelated or malformed message failing the
 /// connection, a connection loss, a stall while the terminal drains, an
@@ -2706,7 +2710,7 @@ pub(super) fn accounted(
         && !sealed.partial
         && sealed.stop.is_none()
         && (cut == Cut::Decided || rest_whole())
-        && rejected.is_none_or(|rejected| sealed.last_seq < rejected)
+        && rejected.is_none_or(|rejected| cut == Cut::Decided && sealed.last_seq < rejected)
 }
 
 /// The cutoff a turn's wait finds already reached as it resumes: the

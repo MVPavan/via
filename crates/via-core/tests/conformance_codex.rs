@@ -4167,6 +4167,38 @@ fn codex_rejected_sample_after_the_p7_end() {
     variant(name, &replay, &expect).unwrap();
 }
 
+/// C2 §5 (picrit round 7): the read-order exemption holds only for a
+/// delivery that decided. The interrupted terminal is retained at T with
+/// the command open, so P7 opens; a 50-token sample naming no turn at T+1
+/// fails the connection, whose owned sequence is held at its seam, so the
+/// lane stays open and unended. No tool end comes: the wall (1.5 s) caps
+/// P7 and the turn settles at it (`Grace`), keeping its terminal. Usage is
+/// unavailable. Before the fix `T < T+1` stood and the sum was 100.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn codex_p7_bound_after_a_rejected_sample() {
+    let name = "codex_p7_bound_after_a_rejected_sample";
+    let _points = armed(
+        "codex.connection.fail_sequence",
+        json!({"occurrence": 1, "action": "delay", "value": 3000}),
+    )
+    .unwrap();
+    let mut replay = replay_of("c3_interrupt_uncertain").unwrap();
+    let mut expect = expect_of("c3_interrupt_uncertain").unwrap();
+    replay["source"] = json!(format!("{name}: a variant of c3_interrupt_uncertain"));
+    expect["source"] = replay["source"].clone();
+    let sample = step_with(&replay, "thread/tokenUsage/updated").unwrap();
+    steps(&mut replay).unwrap()[sample] = token_usage(100);
+    let terminal = step_with(&replay, "\"status\":\"interrupted\"").unwrap();
+    let tail = [emit(&uncorrelated_usage(50)), sigterm()];
+    cut_after(&mut replay, terminal, &tail).unwrap();
+    let turn = turn_mut(&mut expect, 0);
+    turn["tool_grace_ms"] = json!(3000);
+    turn["deadlines"] = json!({"wall_ms": 1500});
+    turn["expect"]["usage"] = unavailable();
+    variant(name, &replay, &expect).unwrap();
+}
+
 /// C2 §5 (picrit round 3): delivery lost a call's sample, so the turn's
 /// tokens are unavailable, never the delivered prefix. One sample is
 /// delivered; then the normalizer is held on a delta while twenty thread

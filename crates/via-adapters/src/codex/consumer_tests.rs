@@ -1796,6 +1796,38 @@ fn a_sample_lost_while_draining_unaccounts_the_turn() {
     });
 }
 
+/// C2 §5 (picrit round 7): a rejection after the last message the turn's
+/// delivery took is exempt only when delivery decided. B's interrupted
+/// terminal (6) drains with its tool open; the connection then rejected
+/// message 7. Cut at the P7 bound (`Grace`) or by a close (`Detach`), the
+/// delivery never finished, so the sum is unaccounted; with no rejection
+/// the same seal is accounted, and a decided delivery keeps the
+/// exemption. Before the fix `Grace` and `Detach` were accounted too.
+#[tokio::test]
+async fn a_rejection_during_p7_unaccounts_an_undecided_cut() {
+    use super::super::driver::{Cut, accounted};
+    let mut fixture = Fixture::new();
+    let b = fixture.start(2);
+    fixture.reply(2, Some(B));
+    fixture.push(message(&tool_started(B, "tool-b"), 5, (Some(B), Some(2))));
+    fixture.push(message(&completed(B, "interrupted"), 6, (Some(B), Some(2))));
+    fixture.settle().await;
+    assert!(b.delivery.draining().is_some(), "the terminal drains");
+    let sealed = b.delivery.seal();
+    assert!(sealed.terminal.is_some() && !sealed.partial);
+    assert_eq!(sealed.last_seq, 6);
+    let rest = (&*fixture.lane, &*fixture.registration);
+    for cut in [Cut::Grace, Cut::Detach] {
+        assert!(accounted(cut, &sealed, rest, None), "{cut:?}: whole");
+        assert!(
+            !accounted(cut, &sealed, rest, Some(7)),
+            "{cut:?}: a rejection while P7 accounted left the sum standing"
+        );
+    }
+    assert!(accounted(Cut::Decided, &sealed, rest, Some(7)));
+    assert!(!accounted(Cut::Decided, &sealed, rest, Some(6)));
+}
+
 /// A message of B's, mapped, read now: the item and its read instant.
 fn of_b(line: &Value, seq: u64, owner: Option<u32>) -> (LaneItem, Instant) {
     let routed = routed(line, seq, (Some(B), owner));
