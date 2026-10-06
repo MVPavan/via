@@ -6,7 +6,8 @@ adapter design's amendments AD1–AD20
 ([adapter design](../workstreams/rust-foundation/adapters/design.md),
 revision 9, from the live re-probes of 2026-09-30); leftover detection
 follows the owner's choice of option A on 2026-10-01 (adapter design,
-conflict 4). Internal contract between L2
+conflict 4); raw vendor-argument passthrough (§6.3) follows the owner's
+decision of 2026-10-06. Internal contract between L2
 Core (`via-core`) and L3 Adapters (`via-adapters`). Inputs:
 `docs/brainstorms/README.md` §15 (authoritative), review
 `docs/brainstorms/reviews/contract-specs-astra-r1.md`, probes P1–P5 and P2b
@@ -99,7 +100,7 @@ the agent's responsibility: VIA stops only the agent and reports leftovers
    never reported as `acknowledged`.
 4. An adapter picks only routes that provably enforce the requested bound
    combination (C1 §4.2) and refuses `vendor` options on its reserved-key
-   list (§6.1).
+   list (§6.1) and `vendor_args` that set what it reserves (§6.3).
 5. Every vendor request is answered under a deadline on the control path;
    unknown requests are declined (D3, coding-style §3).
 6. Unknown vendor notifications produce no observation: when the route
@@ -209,14 +210,14 @@ pub struct VendorIdentity {
 
 | Type | Fields |
 |---|---|
-| `DescribeRequest` | `harness: Option<String>` (passed unchanged; Core never compares it), `model: Option<String>`, `effort: Option<String>` (spawn's turn-1 effort, validated purely by `plan`, §5; C1 `describe` passes none, so its public parameters are unchanged), `bound: Bound`, `require: Vec<VerbReq>`, `vendor: VendorOptions`, `cwd: Option<PathBuf>`, `allow_untested: bool` (stored, no effect, §5), `sizes: ParamSizes` |
+| `DescribeRequest` | `harness: Option<String>` (passed unchanged; Core never compares it), `model: Option<String>`, `effort: Option<String>` (spawn's turn-1 effort, validated purely by `plan`, §5; C1 `describe` passes none, so its public parameters are unchanged), `bound: Bound`, `require: Vec<VerbReq>`, `vendor: VendorOptions`, `vendor_args: VendorArgs` (spawn's; C1 `describe` passes none, §6.3), `cwd: Option<PathBuf>`, `allow_untested: bool` (stored, no effect, §5), `sizes: ParamSizes` |
 | `ParamSizes` | the encoded byte sizes of the session's `instructions` text and the turn's `output_schema` (0 when absent), plus `instructions_json`, `prompt_json` and `cwd_json`: the UTF-8 length of each value's JSON string encoding, quotes and escapes included, filled by Core from the values it holds, so a route with a lower limit (for example a per-argument limit) refuses purely with `InvalidParam` naming the member, before any receipt; the values themselves never reach `plan`. For `check_turn` Core also fills the byte lengths of the session's `cwd` and resolved model, so a route can bound its whole launch request (Claude: Host's 64 KiB launch request, x.3.2 C3) |
 | `RoutePlan` | `harness: &'static str` (canonical), `route: RouteId`, `model: {requested, resolved}`, `inherit: {requested, effective}` (§6.2), `adapter_version`, `vendor_version: Option<String>` (last seen for the harness and resolved program path, or null), `version_status: Tested\|Untested\|Refused`, `capabilities: Capabilities` (C1 §4.1), `effective_bound`, `server_key: Option<ServerKey>`, `refusals`, `warnings` |
 | `Capabilities` | the C1 §4.1 DTO with `Support { Native, Partial { semantics }, Unsupported { reason } }` |
 | `ModelEntry` | a model with `source: bundled \| discovered` |
 | `SessionRef` | `harness`, `route`, `adapter_version`, handed back on resume, reopen and recovery; unknown or incompatible → `harness_unavailable` (rule 2) |
-| `SessionSpec` | `session_id`, `model`, `instructions: Option<Instructions>`, `initial_bound`, `cwd`, `vendor`, `inherit: {requested, effective}` (the inherited-configuration settings and states frozen at spawn, §6.2), `confirmed_vendor_session_id: Option<VendorSessionId>`, immutable `allow_untested`; a confirmed historical ID is not verification of this connection |
-| `TurnParams` | a resume turn's per-turn values (effort, bound, `output_schema`, `max_steps`, vendor keys) and their `sizes: ParamSizes` (the session's frozen instructions, the turn's effective schema, inherited or set), with the session's requested `inherit` and its frozen effective states `inherit_effective` (each `None` when unknown; Claude reads its session's mode from the latter) and whether the session has `instructions` (`instructions: bool`, empty text included, since an empty value still has its flag), which a route's launch recipe and its handshake-refusal cache key read, and `model`: the session's frozen `SessionSpec.model`, which Core copies in (internal context, never a caller value or override); the input to `check_turn` |
+| `SessionSpec` | `session_id`, `model`, `instructions: Option<Instructions>`, `initial_bound`, `cwd`, `vendor`, `vendor_args: VendorArgs` (frozen at spawn, §6.3), `inherit: {requested, effective}` (the inherited-configuration settings and states frozen at spawn, §6.2), `confirmed_vendor_session_id: Option<VendorSessionId>`, immutable `allow_untested`; a confirmed historical ID is not verification of this connection |
+| `TurnParams` | a resume turn's per-turn values (effort, bound, `output_schema`, `max_steps`, vendor keys), the session's frozen `vendor_args: VendorArgs` (§6.3: re-judged, part of a launch's size and key), and their `sizes: ParamSizes` (the session's frozen instructions, the turn's effective schema, inherited or set), with the session's requested `inherit` and its frozen effective states `inherit_effective` (each `None` when unknown; Claude reads its session's mode from the latter) and whether the session has `instructions` (`instructions: bool`, empty text included, since an empty value still has its flag), which a route's launch recipe and its handshake-refusal cache key read, and `model`: the session's frozen `SessionSpec.model`, which Core copies in (internal context, never a caller value or override); the input to `check_turn` |
 | `ServerReport` | `harness`, `vendor_version: Option<String>` (the server's handshake), `key: ServerKey` (Codex: 16 hex digits of its configuration hash), `sessions: u32` (sessions leasing it); only servers whose handshake succeeded and that are not retiring |
 | `TurnCheck` | `effective_bound`: the turn's bound as the route will apply it, like `RoutePlan.effective_bound` |
 | `TurnSpec` | `turn: TurnNo`, `prompt`, `effort`, `bound`, `output_schema`, `max_steps`, `vendor`, `wall_deadline: Instant`, `idle_deadline: IdleDeadline` |
@@ -231,7 +232,7 @@ pub struct VendorIdentity {
 | `InstanceReport` | `vendor_version: Option<String>`, `version_status: Tested\|Untested` |
 | `ClassHint` | `Auth`, `RateLimit`, `ContextExceeded`, `BudgetExceeded`, `VendorError`, `Protocol`, `ResumeMismatch` |
 | `StopReason` | `EndTurn`, `MaxSteps`, `Budget`, `Refusal`, `Interrupted`, `Error`, `Other` |
-| `Refusal` | `kind: UnsupportedVerb\|BoundUnsupported\|HarnessUnavailable\|UnknownModel\|VersionRefused\|VendorOptionConflict\|InvalidParam { field }\|MissingCapability { verb }`, `message`, `verb: Option<Verb>`, `route` (every refusal) |
+| `Refusal` | `kind: UnsupportedVerb\|BoundUnsupported\|HarnessUnavailable\|UnknownModel\|VersionRefused\|VendorOptionConflict { field }\|InvalidParam { field }\|MissingCapability { verb }` (`VendorOptionConflict` names `vendor` or `vendor_args`), `message`, `verb: Option<Verb>`, `route` (every refusal) |
 | `AdapterError` | S1's `Route(RouteFailure)` causes (deadline, force stop, overflow, protocol, process exit, unknown submission), each with Route's exit, cleanup and force facts and, when a Host or launch step outside the Store failed and ended the turn, its bounded cause (the failed step and the operating-system error's kind, which Core commits as the turn's `launch_failed` warning event, C1 §6.1), plus `Rejected { reason: StartRejected, evidence: TurnEvidence }`, `ResumeMismatch { evidence: TurnEvidence }` (identity below), `ServerLost` (Host-confirmed death of a persistent server) and `TransportLost` (connection lost, server alive or unconfirmed). Every failure carries evidence, decided by the cleanup rules (the §2 cleanup table and §4.1), so the cleanup gate always has facts: a per-turn process's exit and group cleanup; a server route's reported tool items, server loss or close facts. On a server route a turn's `exit` is always `None`: the server's exit belongs to the server (`ServerLost` health), not to any one turn. While the server lives, a failed or rejected turn's cleanup is its reported tool items (`Quiescent` when every one ended, or none was reported; the §2 cleanup table); after a server crash it derives from Host's group evidence for the server's group: `Quiescent` only with positive `GroupAbsent` proof, otherwise `Uncertain`. On either kind of route, only a failure before any vendor launch has the no-launch evidence (on a server route, "launch" for a turn is its first vendor byte handed to Wire, after the turn's link to its server is durable; a turn that failed before it sent nothing to any server, so its cleanup is `Quiescent` unless its own server acquisition failed, when Host's acquisition evidence applies as on a private route): `exit: None`, with `cleanup: Quiescent` only when Host's journal is complete (C1 §7.4), else `Uncertain` |
 | `DriverFailure` | the sticky first cause of `DriverHealth::Failed`, published when detected, independent of observation delivery: protocol, transport loss, overflow (route or observation channel), Store, an owned task's failure, `ServerLost`, `ResumeMismatch`, `RetirementUncertain` (a launched persistent connection's retirement whose group cleanup is not proven quiescent, or whose journal write was uncertain; no turn reports it. An uncertain journal write is also published on the sticky `journal_uncertain()` watch, whatever the first cause, and Core latches Store failure on it, runtime §7), and `TurnAbandoned` (Core dropped a pending `run_turn`). A turn's own uncertain cleanup is reported in its `TurnEnd`, not as health |
 | `StartRejected` | `BoundUnsupported(String)`, `InvalidParam { field }` (§5), `VendorError(Option<VendorCode>, String)` (the code is absent when the vendor's rejection carries none, as Pi's prompt rejections), `SessionGone`, `Protocol(String)`, `UncertainPredecessor`: an earlier launch of this session is not proven gone and nothing was launched; Core gives `failed(submit_failed)` with `failure.data.reason:"uncertain_predecessor"`, `SettingsMismatch { setting: VendorSetting }` (`Model`, `Agent`, `Permissions`, `Instructions`): a reopened vendor session's persisted settings differ from the frozen values and nothing was sent; Core gives `failed(submit_failed)` with `failure.data.reason: "settings_mismatch"` and, for `Model` and `Instructions`, `field` |
@@ -813,6 +814,8 @@ permission-profile selectors, `serviceTierForTurn`, `disabledPluginIds`,
 `toolOutput`, `clientUserMessageId`, `turnTrigger` and thread/start source
 selectors. Its initial vendor option allow-list is empty. See vendor packets
 for exact validation; canonical never-ask, identity and bound settings win.
+These are `vendor` option keys. Raw vendor arguments (`vendor_args`) are
+judged by §6.3's matching rules against each route's reserved flags.
 ### 6.2 Operations
 
 | Operation | Claude `claude-cli` | Codex `codex-app-server` | OpenCode `opencode-serve` | Pi `pi-rpc` | Generic ACP |
@@ -914,6 +917,70 @@ refusal are in [the Pi vendor packet](vendors/pi.md) §§2–7. Only
 `full,network:true` is eligible; `max_steps` and output schema are
 unsupported; steer is unsupported in the first release.
 
+### 6.3 Vendor argument passthrough (owner, 2026-10-06)
+
+C1 `vendor_args` reaches the adapter as `VendorArgs`: at most 64 strings,
+16 KiB in total (the sum of their UTF-8 lengths), none containing NUL. Core
+checks those bounds at receipt and the type keeps them, so a stored list
+that breaks them is corruption. It is frozen at spawn in the session's Store
+row (runtime §6) and carried in `DescribeRequest` (spawn), `TurnParams` and
+`SessionSpec`. The adapter judges the whole list purely in `plan`, again in
+`check_turn` (a resume re-judges the frozen list against the running
+adapter) and again before each launch, always before vendor I/O. A refusal
+is `VendorOptionConflict { field: "vendor_args" }` (C1 kind2
+`vendor_option_conflict`) or `InvalidParam { field: "vendor_args" }`.
+Accepted arguments are appended unchanged, in order, after every argument
+of VIA's own recipe:
+
+| Route | Where the arguments go | Sharing and keys |
+|---|---|---|
+| `claude-cli` | each per-turn launch's argv ([Claude packet](vendors/claude-code.md) §4) | per process; part of the handshake-refusal recipe key (§5) |
+| `codex-app-server` | the owned server's argv, after `app-server` and VIA's switches ([Codex packet](vendors/codex.md) §4) | the argv is in `config_hash`, so sessions with different lists get different servers and equal lists share one |
+| `opencode-serve` (adopts this when built) | the owned server's argv, after VIA's `serve` flags ([OpenCode packet](vendors/opencode.md) §2.2) | the argv is in `recipe_hash`, so in the launch key (§3.1 of the packet) |
+| `pi-rpc` (adopts this when built) | each per-turn launch's argv ([Pi packet](vendors/pi.md) §4.1) | per process; part of the handshake-refusal recipe key |
+| `fake` | refused: `InvalidParam { field: "vendor_args" }` (not a vendor CLI) | — |
+
+**Matching.** Each element is read in order; VIA may refuse more than the
+vendor would apply, never less.
+
+1. `--` alone is reserved: it ends the vendor's options, and VIA owns the
+   operands.
+2. `--name` or `--name=value` is a long option. Its name (without the
+   value) is normalized (leading dashes dropped, lowercased, `-`, `_` and
+   `.` removed) and compared with the route's reserved names (exact) and
+   prefixes. A name in the route's value-option table with no `=value`
+   takes the next element as its value; a variadic one takes each following
+   element that does not start with `-`.
+3. `-xyz` is a short cluster, read letter by letter: a reserved letter is
+   refused; a letter in the value-option table ends the cluster, and the
+   rest (after one optional `=`), else the next element, is its value; any
+   other letter is taken as a switch and reading continues. So `-fvalue`,
+   `-f=value`, `-f value` and combined switches all match.
+4. Any other element (not starting with `-`, or `-` alone) is accepted only
+   as a value under rule 2 or 3. Otherwise it is an operand, and refused
+   as a conflict: Claude reads operands as its prompt or a subcommand,
+   Codex `app-server` as a subcommand (its `proxy` would attach to a server
+   VIA did not start, invariant 11).
+5. Where a route reserves values of an option (Codex `-c`/`--config` keys,
+   `--enable`/`--disable` features), the value is inspected however it is
+   attached.
+
+An element that starts with `-` is always read as an option, even where the
+vendor would take it as the previous option's value. The value-option
+tables list only unreserved options of the checked versions; an option
+outside them (a later vendor's) passes and takes no value, so a separate
+value after it is an operand and refused: the caller attaches it
+(`--name=value`). VIA verifies nothing an unreserved argument does; C1's
+warning `vendor_passthrough` says so on every receipt, envelope and status
+of the session.
+
+**Launch size.** The arguments count toward Host's launch request (the
+64 KiB `Configure` frame, runtime §5). A route checks the whole launch with
+the arguments before any receipt and refuses one that would not fit as
+`InvalidParam` naming its largest variable contributor, `vendor_args`
+when that is the list (Claude: the existing launch-request check, now with
+the arguments; Codex: the server recipe with the session's arguments).
+
 ## 7. Conformance behaviours
 
 Against a fake vendor (default gate) and the real binary (the maintainers'
@@ -921,7 +988,8 @@ opt-in live check, never in the default gate):
 
 1. `describe` starts no process and writes no file.
 2. Refusals name the verb or bound and the route; nothing is emulated;
-   reserved vendor keys are refused before any vendor I/O.
+   reserved vendor keys and `vendor_args` conflicts (§6.3) are refused
+   before any vendor I/O.
 3. Declared capabilities match observed behaviour on each checked version,
    including each `partial` semantics string.
 4. `open_session` is logical and performs no vendor I/O; identity is

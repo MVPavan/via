@@ -190,7 +190,8 @@ The file tools differ by mode:
 Neither mode is a containment bound: VIA does not promise every possible
 action is allowed by `full`, only that no narrower containment is
 advertised. Managed policy can deny actions. Denials are reported; restrictions are never bypassed.
-No ambient tool expansion or raw argv passthrough. VIA adds no MCP server;
+No ambient tool expansion. Raw arguments reach Claude only through the
+session's `vendor_args`, under the rules at the end of this section. VIA adds no MCP server;
 the user's own MCP servers load unless requested off (inherited-configuration
 table below), and their tools are not in VIA's `--allowedTools`.
 Qualification must verify that managed configuration cannot add an
@@ -292,6 +293,32 @@ agents, agent, tools and permission variants, MCP/plugin flags, persistence,
 input/output/stream flags, session fork/continue/resume, effort/schema/limits,
 model/system-prompt variants, cwd/worktree, environment and config-directory
 overrides. This prevents hidden route changes through passthrough.
+
+**Vendor argument passthrough (owner, 2026-10-06; C2 §6.3).** The session's
+frozen `vendor_args` are appended unchanged after the last recipe argument
+above (after `--max-turns` when set) on every launch, turn 1 and every
+resume, after a daemon restart too. They are part of the handshake-refusal
+recipe key (§3), so a refusal they cause (for example an init whose tools
+differ because an argument added one) is cached for sessions with that list
+only. The launch-request check above counts them: a launch that would not
+fit is `invalid_params` naming the largest of `instructions`,
+`output_schema` and `vendor_args`. Reserved set, from `claude --help`
+(2.1.290, checked 2026-10-06), matched under C2 §6.3:
+
+| Kind | Reserved |
+|---|---|
+| Long names, exact (normalized) | the names `vendor` keys reserve (`tool(s)`, `session-id`, `continue`, `fork-session`, `model`, `fallback-model`, `effort`, `json-schema`, `input-format`, `output-format`, `print`, `verbose`, `bare`, `restricted`, `safe-mode`, `strict-mcp-config`, `(no-)session-persistence`, `worktree`, `config-dir`, `environment`, the environment and C1 names), plus `help`, `version`, `bg`, `background`, `cloud`, `teleport`, `desktop`, `from-pr`, `include-hook-events`, `forward-subagent-text`, `sdk-url` (hidden, UNVERIFIED) |
+| Long-name prefixes (normalized) | the families `vendor` keys reserve (`permission*`, `dangerously*`, `allow-dangerously*`, `allowed-tool*`, `disallowed-tool*`, `add-dir*`, `system-prompt*`, `append-system-prompt*`, `max-turn*`, `include-partial*`, `replay-user*`, `setting*`, `agent*`, `mcp*`, `plugin*`, `disable-slash-command*`, `claude-config*`, `anthropic*`, `claude-code*`), plus `resume*` and `remote-control*` |
+| Short letters | `-p`, `-r`, `-c`, `-w`, `-h`, `-v` |
+| Operands | every one (Claude's prompt and subcommands) and `--` |
+
+Value-option table (unreserved options that take a value, C2 §6.3 rule 2):
+`--autocompact`, `--betas` (variadic), `-d`/`--debug` (optional value),
+`--debug-file`, `--file` (variadic), `--max-budget-usd`, `-n`/`--name`,
+`--prompt-suggestions` (optional value). Everything else in the help passes
+unverified with C1's `vendor_passthrough` warning, for example
+`--max-budget-usd`, `--debug-file`, `--betas`, `--chrome`, `--ide`,
+`--brief` and `--exclude-dynamic-system-prompt-sections`.
 
 ## 5. Typed stream and normalizer
 

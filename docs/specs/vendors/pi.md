@@ -390,6 +390,21 @@ files still load; Pi does not trust-gate them.
 `--prompt-template`, `--theme`, `--mode`, `--offline`, `--version`; and
 every `PI_*` environment name.
 
+**Vendor argument passthrough (owner, 2026-10-06; C2 §6.3; adopt when the
+adapter is built).** A session's frozen `vendor_args` are appended after the
+last recipe argument (§4.1, after `--offline`) on every per-turn launch,
+after a daemon restart too; they enter the handshake-refusal recipe key and
+the launch-request check (`invalid_params` naming `vendor_args` past Host's
+64 KiB). Reserved, matched under C2 §6.3: every flag above (the recipe's,
+its short forms and the listed ones), the negations and opposites of VIA's
+switches (`--approve`, extensions, skills, prompt templates, context files
+back on), `--thinking`, `--session-dir`, `--session-id`, `--session`,
+`--tools`, `--model`, `--append-system-prompt`, `--help`/`-h`, every
+operand and `--`. Environment names are not arguments and stay unreachable.
+The exact list, the value-option table and whether Pi's parser takes
+`--name=value` are derived from the pinned `pi --help` when the adapter is
+built (UNVERIFIED until then).
+
 ## 5. Typed protocol and normalizer
 
 ### 5.1 Typed records

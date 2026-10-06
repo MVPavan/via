@@ -73,6 +73,19 @@ rejected: tools would inherit the password.
 
 No session mutation or prompt is sent before publication.
 
+**Vendor argument passthrough (owner, 2026-10-06; C2 §6.3; adopt when the
+adapter is built).** A session's frozen `vendor_args` are appended after
+VIA's `serve` flags (`serve --stdio --hostname 127.0.0.1 --port 0 ARGS…`).
+They are part of `argv` in `recipe_hash` (§3.1), so sessions with different
+lists get different servers. The launch-request check counts them
+(`invalid_params` naming `vendor_args` past Host's 64 KiB). Reserved, matched
+under C2 §6.3: the `serve` flags VIA sets (`--stdio`, `--port`,
+`--hostname`), `--service`, `--standalone`, `--cors`, `--mdns*`, `--help`/
+`-h`, `--version`/`-v`, any flag that selects a configuration, profile,
+project, data directory or log destination VIA owns, every operand and
+`--`. The exact list and the value-option table are derived from the pinned
+`opencode serve --help` when the adapter is built (UNVERIFIED until then).
+
 **Failure classes.**
 
 - **Transient startup failure**: spawn error, exit before the URL line, the
