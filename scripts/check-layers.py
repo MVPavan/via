@@ -87,7 +87,13 @@ def main():
                 failed = True
 
             if name.startswith("via-"):
-                actual.add(name)
+                # A crate's dev-dependency on itself crosses no layer: it is
+                # Cargo's standard way to turn on a test-only feature for the
+                # crate's own integration tests (via-core `test-support`).
+                # check-release-features.py still proves such features stay
+                # out of the release graph. The path check below still applies.
+                if not (dependency["kind"] == "dev" and name == source):
+                    actual.add(name)
                 expected_path = Path(packages[name]["manifest_path"]).parent if name in packages else None
                 if (dependency["source"] is not None or dependency["path"] is None
                         or expected_path is None
