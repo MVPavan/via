@@ -264,6 +264,7 @@ async fn launched(
         session,
         session_dir,
         recipe,
+        clamp,
     } = launch(driver, adapter, &spec, (turn, &staged));
     process.capacity = capacity;
     let (steer, _unused) = via_routes::steer::steer_lane(str::len);
@@ -328,7 +329,7 @@ async fn launched(
     }
     let ended = Ended {
         turn,
-        effort: spec.effort.is_some(),
+        clamp,
         recipe,
     };
     keep_records(
@@ -349,6 +350,8 @@ struct Launch {
     session: String,
     session_dir: PathBuf,
     recipe: String,
+    /// The requested effort's clamp key ([`launch::clamp_key`]).
+    clamp: Option<String>,
 }
 
 /// The launch of turn `turn` (packet §§2.2, 4) on the state [`staged`]
@@ -401,6 +404,10 @@ fn launch(
         session,
         session_dir,
         recipe: recipe_key(inherit, &driver.spec.vendor_args),
+        clamp: spec
+            .effort
+            .as_deref()
+            .map(|effort| launch::clamp_key(&driver.spec.model, effort)),
     }
 }
 
@@ -544,14 +551,45 @@ impl Normalize for Delivery<'_> {
 /// What the turn's end needs beside Route's.
 struct Ended {
     turn: crate::TurnNumber,
-    /// Whether effort was requested: else the applied level goes to
-    /// `vendor` data (packet §4.5).
-    effort: bool,
+    /// The requested effort's clamp key ([`launch::clamp_key`]), cached
+    /// when Pi applied a different level; with none, the applied level
+    /// goes to `vendor` data (packet §4.5).
+    clamp: Option<String>,
     /// The launch's recipe key (C2 §5): a refusal is cached for it alone.
     recipe: String,
 }
 
 impl Ended {
+    /// A launched handshake's refusal, cached (C2 §5) on this binary:
+    /// `-ne`/`-np` not holding for the recipe (packet §3), or Pi clamping
+    /// the requested effort for the model (packet §4.5).
+    fn cache(&self, adapter: &PiAdapter, failure: &RouteFailure) {
+        if !failure.launched {
+            return;
+        }
+        let (key, cause) = if matches!(failure.cause, RouteError::HandshakeRefused { .. }) {
+            (Some(&self.recipe), "get_commands")
+        } else if matches!(
+            failure.cause,
+            RouteError::InvalidParam {
+                field: "effort",
+                ..
+            }
+        ) {
+            (self.clamp.as_ref(), "thinkingLevel")
+        } else {
+            (None, "")
+        };
+        if let Some(key) = key {
+            adapter.instances.record_refusal(
+                &adapter.binary,
+                key.clone(),
+                Incompatibility::ReadbackDiffers(cause),
+                plan::clock(),
+            );
+        }
+    }
+
     /// The turn's one result (C2 §4.1): the terminal Route retained at
     /// `agent_settled`, mapped with the abort's facts (packet §§5.3, 7.1),
     /// and Route's outcome, its handshake causes as C2 rejections.
@@ -573,7 +611,7 @@ impl Ended {
         let turn = self.turn;
         let vendor = handshake
             .as_ref()
-            .filter(|_| !self.effort)
+            .filter(|_| self.clamp.is_none())
             .and_then(|facts| normalize::thinking_data(&facts.thinking_level));
         let terminal = terminal.map(|message| {
             normalize::terminal(
@@ -613,21 +651,12 @@ impl Ended {
                     }),
                 };
             }
+            self.cache(adapter, failure);
             if let RouteError::InvalidParam { field, .. } = failure.cause {
                 return rejection(StartRejected::InvalidParam { field });
             }
             if matches!(failure.cause, RouteError::ProcessExited { .. }) && !submitted {
                 return rejection(StartRejected::Protocol(EXITED_EARLY.to_owned()));
-            }
-            // Packet §3: `-ne`/`-np` did not hold for this binary and
-            // recipe: cached (C2 §5).
-            if matches!(failure.cause, RouteError::HandshakeRefused { .. }) && failure.launched {
-                adapter.instances.record_refusal(
-                    &adapter.binary,
-                    self.recipe.clone(),
-                    Incompatibility::ReadbackDiffers("get_commands"),
-                    plan::clock(),
-                );
             }
         }
         let routed = match (&outcome, rest) {

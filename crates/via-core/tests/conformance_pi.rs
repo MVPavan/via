@@ -1295,7 +1295,57 @@ fn pi_handshake_checks() {
         ),
         "xhigh",
     );
-    check_built("pi_handshake_effort", &replay, &expect, Knobs::default()).unwrap();
+    // The clamp is cached for planning (packet §4.5, review r1 minor):
+    // the same model and effort are refused before any receipt.
+    let refusals = std::cell::RefCell::new(Value::Null);
+    let outcome = drive_built(
+        "pi_handshake_effort",
+        &replay,
+        &expect,
+        Knobs::default(),
+        Box::new(|_| Ok(())),
+        Box::new(|pure: &Pure| {
+            let plan = pure
+                .set
+                .plan(&via_adapters::DescribeRequest {
+                    harness: Some("pi".to_owned()),
+                    model: Some(MODEL.to_owned()),
+                    effort: Some("xhigh".to_owned()),
+                    ..via_adapters::DescribeRequest::default()
+                })
+                .map_err(|refusal| format!("{refusal:?}"))?;
+            *refusals.borrow_mut() =
+                serde_json::to_value(&plan).map_err(|e| e.to_string())?["refusals"].clone();
+            let session = via_adapters::SessionRef {
+                harness: "pi".to_owned(),
+                route: plan.route.to_owned(),
+                adapter_version: plan.adapter_version.clone(),
+            };
+            let turn = via_adapters::TurnParams {
+                model: Some(MODEL.to_owned()),
+                effort: Some("xhigh".to_owned()),
+                ..via_adapters::TurnParams::default()
+            };
+            match pure.set.check_turn(&session, &turn) {
+                Err(refusal)
+                    if refusal.kind
+                        == (via_adapters::RefusalKind::InvalidParam { field: "effort" }) =>
+                {
+                    Ok(())
+                }
+                other => Err(format!("check_turn did not refuse the clamp: {other:?}")),
+            }
+        }),
+    )
+    .unwrap();
+    conformance_expect::check(&expect, &outcome).unwrap();
+    let refusals = refusals.into_inner();
+    assert!(
+        refusals
+            .as_array()
+            .is_some_and(|all| all.iter().any(|r| r.to_string().contains("effort"))),
+        "the clamp was not cached: {refusals}"
+    );
     // The requested effort applied: the turn runs.
     let replay = single(
         "synthetic (via-jt8.3.1): effort low, applied",

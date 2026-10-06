@@ -141,6 +141,23 @@ pub(crate) fn recipe_key(inherit: Inherit, vendor_args: &VendorArgs) -> String {
         hasher.update([0]);
         hasher.update(arg);
     }
+    hex(hasher)
+}
+
+/// The refusal cache's key for a requested effort Pi clamped for a
+/// model (packet §4.5): SHA-256, in hex, over a prefix no recipe digest
+/// input starts with, the model and the effort, each after a NUL.
+pub(crate) fn clamp_key(model: &str, effort: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update("effort");
+    for part in [model, effort] {
+        hasher.update([0]);
+        hasher.update(part);
+    }
+    hex(hasher)
+}
+
+fn hex(hasher: Sha256) -> String {
     hasher
         .finalize()
         .iter()

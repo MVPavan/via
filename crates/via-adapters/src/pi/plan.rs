@@ -189,6 +189,7 @@ impl PiAdapter {
         let mut refusals = model_refusal(route, &model.resolved)
             .into_iter()
             .collect::<Vec<_>>();
+        refusals.extend(self.clamp_refusal(route, &model.resolved, req.effort.as_deref()));
         refusals.extend(refusals_of(
             route,
             &PerTurn {
@@ -241,16 +242,16 @@ impl PiAdapter {
     }
 
     /// Every refusal of a turn the route would launch: its values in C1
-    /// member order ([`Self::check_values`]), the session's model, then a
-    /// launch request past Host's cap, then a handshake refusal cached for
-    /// the session's recipe on this binary (C2 §5).
+    /// member order ([`Self::check_values`]), the session's model, an
+    /// effort Pi clamped for that model, then a launch request past Host's
+    /// cap, then a handshake refusal cached for the session's recipe on
+    /// this binary (C2 §5).
     pub(crate) fn check_turn(&self, route: &'static str, turn: &TurnParams) -> Vec<Refusal> {
         let mut refusals = Self::check_values(route, turn);
-        refusals.extend(
-            turn.model
-                .as_deref()
-                .and_then(|model| model_refusal(route, model)),
-        );
+        if let Some(model) = turn.model.as_deref() {
+            refusals.extend(model_refusal(route, model));
+            refusals.extend(self.clamp_refusal(route, model, turn.effort.as_deref()));
+        }
         refusals.extend(self.frame_refusal(route, turn));
         if let Some(inherit) = turn.inherit
             && self
@@ -281,6 +282,24 @@ impl PiAdapter {
                 sizes: turn.sizes,
             },
         )
+    }
+
+    /// Packet §4.5: Pi clamped `effort` for `model` on this binary at a
+    /// recent handshake (`get_state.thinkingLevel`), so the same request is
+    /// refused before any receipt while the cache holds it.
+    fn clamp_refusal(
+        &self,
+        route: &'static str,
+        model: &str,
+        effort: Option<&str>,
+    ) -> Option<Refusal> {
+        let key = launch::clamp_key(model, effort?);
+        self.instances.refusal(&self.binary, &key, clock())?;
+        Some(Refusal::new(
+            RefusalKind::InvalidParam { field: "effort" },
+            Some(route),
+            format!("route {route} recently applied a different effort for this model"),
+        ))
     }
 
     /// C2 §6.3: the turn's launch request (Host's `Configure` frame:
