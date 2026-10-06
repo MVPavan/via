@@ -799,7 +799,9 @@ impl PrivateProtocol for PiLane {
     /// Packet §7.1 step 3: an abort sent before `agent_settled` keeps
     /// stdin open until its reply, or the stop order's `force_at` (else the
     /// wall); with no reply by then, a marker terminal is not retained and
-    /// the stop order's row applies. Then stdin EOF (packet §7.2).
+    /// the stop order's row applies, however the wait ended (the deadline,
+    /// Pi's exit, or a failure, which stays the turn's cause). An ordinary
+    /// terminal is retained. Then stdin EOF (packet §7.2).
     async fn after_terminal(
         serving: &mut Serving<'_, Self>,
         messages: &mut WireMessages,
@@ -813,21 +815,27 @@ impl PrivateProtocol for PiLane {
             && serving.lane.abort_answered.is_none()
             && matches!(serving.interrupt, Interrupt::Queued | Interrupt::Written)
         {
-            match tokio::time::timeout_at(bound.instant(), serving.next(messages)).await {
-                Ok(next) => match next? {
-                    Next::Message(message) => serving.hold(message),
-                    Next::Eof | Next::Unterminated => break,
-                },
-                Err(_elapsed) if serving.lane.marker() => {
-                    // Not retained: the stop order's row (C1 §7.6).
-                    serving.lane.assistant = None;
-                    return Err(Failed::stopped(
-                        serving.turn,
-                        close_by.unwrap_or_else(cleanup_deadline),
-                    ));
-                }
-                Err(_elapsed) => break,
+            let failed =
+                match tokio::time::timeout_at(bound.instant(), serving.next(messages)).await {
+                    Ok(Ok(Next::Message(message))) => {
+                        serving.hold(message);
+                        continue;
+                    }
+                    Ok(Ok(Next::Eof | Next::Unterminated)) | Err(_) => None,
+                    Ok(Err(failed)) => Some(failed),
+                };
+            // No reply will come.
+            if serving.lane.marker() {
+                // Not retained: the stop order's row (C1 §7.6).
+                serving.lane.assistant = None;
+                return Err(failed.unwrap_or_else(|| {
+                    Failed::stopped(serving.turn, close_by.unwrap_or_else(cleanup_deadline))
+                }));
             }
+            if let Some(failed) = failed {
+                return Err(failed);
+            }
+            break;
         }
         Ok(AfterTerminal::Finalize(terminal))
     }

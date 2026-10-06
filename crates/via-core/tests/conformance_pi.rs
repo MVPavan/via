@@ -2245,6 +2245,37 @@ fn pi_abort() {
         wanted,
     )
     .unwrap();
+    // Pi exits before the reply (review r1 #1): the marker is not
+    // retained either, and the stop order's row applies; nothing is
+    // forced, Pi ended on its own.
+    let mut after = tool_end(true);
+    after.push(message_end(&marker));
+    after.extend(settle(&marker));
+    after.push(json!({"exit": {"code": 0, "stderr": ""}}));
+    let mut wanted = interrupted(false, "error");
+    wanted["terminal"] = Value::Null;
+    wanted["error"] = Value::Null;
+    wanted["stop_facts"] = json!({"acknowledged": false, "forced": false});
+    abort_case(
+        "pi_abort_exit_no_reply",
+        (tool_call(&canonical_usage()), after),
+        "tool_started",
+        wanted,
+    )
+    .unwrap();
+    // An ordinary terminal stands when Pi exits before the reply.
+    let mut after = vec![message_end(&done)];
+    after.extend(settle(&done));
+    after.push(json!({"exit": {"code": 0, "stderr": ""}}));
+    let mut wanted = completed(1, "READY");
+    wanted["stop_facts"] = json!({"acknowledged": false, "forced": false});
+    abort_case(
+        "pi_abort_natural_exit",
+        (Vec::new(), after),
+        "accepted",
+        wanted,
+    )
+    .unwrap();
 }
 
 /// `pi_eof_is_stop` (E31): Pi's stdout ends mid-run with exit 0 and no
