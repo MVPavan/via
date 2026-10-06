@@ -4024,18 +4024,14 @@ fn codex_uncorrelated_usage_fails_the_connection() {
 /// 50-token sample naming no turn and the valid `turn/completed`. The
 /// sample fails the connection `protocol` before routing; the terminal,
 /// admitted behind it, is still routed by the failed connection's drain
-/// (held at its seam until Wire admitted it) and retained, so the turn
-/// completes with its answer, but its usage is unavailable. Before the fix
-/// the decided terminal exempted the turn and the sum stood at 100.
+/// and retained, so the turn completes with its answer, but its usage is
+/// unavailable. Before the fix the decided terminal exempted the turn and
+/// the sum stood at 100.
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn codex_terminal_after_a_rejected_sample() {
     let name = "codex_terminal_after_a_rejected_sample";
-    let _points = armed(
-        "codex.connection.fail_sequence",
-        json!({"occurrence": 1, "action": "delay", "value": 300}),
-    )
-    .unwrap();
+    let _points = admitted_in_bursts();
     let (_, _, completed) = before_the_sample(name, &[]).unwrap();
     let tail = [
         token_usage(100),
@@ -4052,6 +4048,19 @@ fn codex_terminal_after_a_rejected_sample() {
         "mode": "graceful", "vendor_closed": false, "cleanup": "uncertain",
     });
     variant(name, &replay, &expect).unwrap();
+}
+
+/// Every message waits at Route's seam before it is routed, so Wire admits
+/// the rest of a burst while Route holds its first message: a rejection
+/// there seals admission only once the burst's later lines are admitted,
+/// and the failed connection's drain routes them.
+#[cfg(feature = "test-failpoints")]
+fn admitted_in_bursts() -> tempfile::TempDir {
+    armed(
+        "codex.connection.message",
+        json!({"occurrence": 1, "action": "delay", "value": 50, "persist": true}),
+    )
+    .unwrap()
 }
 
 /// C2 §5 (picrit round 5), the control: one burst holds the valid
