@@ -313,8 +313,10 @@ never writes, repairs or deletes anything in the agent directory.
   the policy version, entry names, kinds and modes, the settings key names,
   and one policy digest (SHA-256 over those plus the approved values except
   `deviceId`). A list that would pass 4 KiB is replaced by its count. No
-  credential bytes and no device identifier. It is written only for a turn
-  that launched, best effort: the turn's outcome never depends on it.
+  credential bytes and no device identifier. It records the check the
+  launch passed, not the directory after the turn (Pi creates `auth.json`
+  and `models-store.json` on its first run, E59), and is written only for a
+  turn that launched, best effort: the turn's outcome never depends on it.
 - **Profile setting.** The real profile had no `cacheWarming` key (E60);
   `"cacheWarming": "off"` was added to its `settings.json` on 2026-10-05.
   VIA itself never writes it: a profile without it is refused.

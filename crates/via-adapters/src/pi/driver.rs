@@ -65,16 +65,20 @@ pub(crate) async fn run_turn(
         return refused;
     }
     let turn = cx.turn;
-    // Packet §4.3: never cached; nothing launches.
-    if let Err(detail) = profile::check(
+    // Packet §4.3: never cached; nothing launches. The record is of this
+    // check, the one the launch passed.
+    let profile = match profile::check(
         &launch::agent_dir(&adapter.vendor_state_dir),
         profile::daemon_uid(),
     ) {
-        return unlaunched(RouteError::HandshakeRefused {
-            turn,
-            detail: Some(format!("the Pi profile policy refused: {detail}")),
-        });
-    }
+        Ok(profile) => profile.record,
+        Err(detail) => {
+            return unlaunched(RouteError::HandshakeRefused {
+                turn,
+                detail: Some(format!("the Pi profile policy refused: {detail}")),
+            });
+        }
+    };
     let route = PiRoute::new(Arc::clone(&driver.runtime));
     // Packet §7.4 (R1): one non-signalling pass within the wall.
     match route
@@ -102,7 +106,13 @@ pub(crate) async fn run_turn(
         version_status: plan::version_status(version.as_deref()),
         vendor_version: version,
     };
-    let mut end = launched(driver, adapter, (spec, cx), route, instance.clone()).await;
+    let mut end = launched(
+        driver,
+        adapter,
+        (spec, cx),
+        (route, instance.clone(), profile),
+    )
+    .await;
     end.instance.get_or_insert(instance);
     end
 }
@@ -128,8 +138,7 @@ async fn launched(
     driver: &SessionDriver,
     adapter: &PiAdapter,
     (spec, cx): (TurnSpec, TurnCx),
-    route: PiRoute,
-    instance: InstanceReport,
+    (route, instance, profile): (PiRoute, InstanceReport, Vec<u8>),
 ) -> TurnEnd {
     let TurnCx {
         turn,
@@ -227,7 +236,11 @@ async fn launched(
         effort: spec.effort.is_some(),
         recipe,
     };
-    keep_records(driver, adapter, turn, &routed, delivery.normalizer.patch());
+    keep_records(
+        driver,
+        turn,
+        (&routed, &profile, delivery.normalizer.patch()),
+    );
     ended.end(adapter, &delivery.normalizer, routed, &rest)
 }
 
@@ -357,15 +370,13 @@ fn start_rejected(refusal: Refusal) -> StartRejected {
     }
 }
 
-/// Packet §§4.3, 4.7: the turn's `pi-profile.json` and, once its handshake
-/// passed, `pi-inventory.json`, in the evidence folder its launch
-/// created. Best effort: a record that cannot be written is left out.
+/// Packet §§4.3, 4.7: the turn's `pi-profile.json` (the record of the
+/// check its launch passed) and, once its handshake passed,
+/// `pi-inventory.json`, in the evidence folder its launch created. Best effort: a record that cannot be written is left out.
 fn keep_records(
     driver: &SessionDriver,
-    adapter: &PiAdapter,
     turn: crate::TurnNumber,
-    routed: &PiTurn,
-    patch: Option<&via_routes::pi::SystemPatch>,
+    (routed, profile, patch): (&PiTurn, &[u8], Option<&via_routes::pi::SystemPatch>),
 ) {
     let launched = match &routed.outcome {
         Ok(_) => true,
@@ -377,13 +388,7 @@ fn keep_records(
     let folder = driver
         .runtime
         .turn_evidence_path(&driver.spec.session_id, turn);
-    // The profile as it stands now: the record of what the launch read.
-    if let Ok(profile) = profile::check(
-        &launch::agent_dir(&adapter.vendor_state_dir),
-        profile::daemon_uid(),
-    ) {
-        write_record(&folder.join("pi-profile.json"), &profile.record);
-    }
+    write_record(&folder.join("pi-profile.json"), profile);
     if let Some(facts) = &routed.handshake {
         let record = normalize::inventory(patch, &facts.skills, &driver.spec.cwd);
         write_record(&folder.join("pi-inventory.json"), &record);
