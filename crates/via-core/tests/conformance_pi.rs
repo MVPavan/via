@@ -696,7 +696,10 @@ fn pi_version_read() {
     };
     // A package laid out as npm installs Pi: `<pkg>/package.json`,
     // `<pkg>/dist/package.json` (no version) and the entry
-    // `<pkg>/dist/bundle/cli.js`, the case's link resolving to it.
+    // `<pkg>/dist/bundle/cli.js`, the case's link resolving to it. The
+    // entry is a copy: a hard link would change the shared fake's ctime,
+    // and with it the file identity every concurrent case's refusal cache
+    // is keyed on.
     let layout = |package: Option<&'static [u8]>| -> Prepare<'static> {
         Box::new(move |pure: &Pure| {
             let root = pure.case_dir.path().join("lib").join("pi-coding-agent");
@@ -713,9 +716,7 @@ fn pi_version_read() {
             let link = pure.fake_link();
             let entry = bundle.join("cli.js");
             let target = std::fs::read_link(&link).map_err(|e| e.to_string())?;
-            std::fs::hard_link(&target, &entry)
-                .or_else(|_| std::fs::copy(&target, &entry).map(|_| ()))
-                .map_err(|e| e.to_string())?;
+            std::fs::copy(&target, &entry).map_err(|e| e.to_string())?;
             std::fs::remove_file(&link).map_err(|e| e.to_string())?;
             std::os::unix::fs::symlink(&entry, &link).map_err(|e| e.to_string())
         })
