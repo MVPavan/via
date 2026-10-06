@@ -135,11 +135,11 @@ decided in the slice that needs them, after re-probing.
   contacts no daemon. A refusal after parsing names the C1 member; a
   parser error names the CLI argument in the CLI's own spelling, not a C1
   member: a flag as `--name` without its value placeholder
-  (`--force-after`, whose member is `force_after_ms`; an unknown flag as
-  typed), a positional by its lowercase name (`session`), a required group
-  as its member flags joined by `|` (`--prompt|--prompt-file`), and
-  `command` when the parser names no argument (an unknown verb, an
-  unexpected value). Its message is the parser's own, without usage.
+  (`--force-after`, whose member is `force_after_ms`), a positional by its
+  lowercase name (`session`), a required group as its member flags joined
+  by `|` (`--prompt|--prompt-file`), each read from the CLI's own argument
+  definitions; any unknown argument (an unknown long or short flag, a
+  stray value, a value after `--`, an unknown verb) is `command`. Its message is the parser's own, without usage.
   `--help` and `--version` print the parser's help and version and exit 0;
   bare `via`, with no arguments, prints the parser's help on stderr and
   exits 2, with no JSON.

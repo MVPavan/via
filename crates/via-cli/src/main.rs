@@ -488,9 +488,10 @@ fn parse_error(error: &clap::Error) -> client::RequestError {
 /// The CLI argument the parser shows as `shown`, read from the parser's
 /// own definitions rather than its display text: a flag as `--name`, a
 /// positional by its lowercase name, a required group as its member flags
-/// joined by `|`. An unknown flag the caller typed is named as typed
-/// (before any `=value`); anything else, an unexpected value included, is
-/// `command`.
+/// joined by `|`. Anything the definitions do not name (an unknown flag,
+/// long or short, a stray value, a value after `--`, an unknown verb) is
+/// `command`: a typed token is never echoed as a field (review
+/// clfix-crit3).
 fn cli_field(shown: &str) -> String {
     let field = |arg: &clap::Arg| {
         arg.get_long().map_or_else(
@@ -532,12 +533,7 @@ fn cli_field(shown: &str) -> String {
             }
         }
     }
-    let typed = shown.split('=').next().unwrap_or_default();
-    if typed.starts_with("--") && !typed.contains(char::is_whitespace) {
-        typed.to_owned()
-    } else {
-        "command".to_owned()
-    }
+    "command".to_owned()
 }
 
 async fn run(cli: Cli) -> anyhow::Result<i32> {

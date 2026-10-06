@@ -620,7 +620,8 @@ fn c1_client_refuses_daemon_socket_of_another_uid() -> TestResult {
 /// verb) is C1's request error too, not plain parser text: `invalid_params`
 /// naming the CLI argument in the CLI's own spelling (review clfix-crit2):
 /// a flag as `--name`, a positional by its lowercase name, a required
-/// group as its member flags joined by `|`, else `command`; exit 2, no
+/// group as its member flags joined by `|`; any unknown argument (a flag,
+/// a stray value, a verb) is `command` (review clfix-crit3); exit 2, no
 /// daemon. Help and version keep the parser's own output, and bare `via`
 /// prints the parser's help and exits 2.
 #[test]
@@ -635,7 +636,11 @@ fn c1_cli_parser_errors_are_invalid_params() -> TestResult {
             .collect()
     };
     let cases: Vec<(Vec<&str>, &str)> = vec![
-        (vec!["cancel", SESSION, "--no-such-flag"], "--no-such-flag"),
+        (vec!["cancel", SESSION, "--no-such-flag"], "command"),
+        // Review clfix-crit3: an unknown short flag, and a value after
+        // `--` that looks like a flag, are not CLI arguments either.
+        (vec!["cancel", SESSION, "-x"], "command"),
+        (vec!["cancel", SESSION, "--", "--private-token"], "command"),
         (vec!["cancel", "--json"], "session"),
         (with(&["--max-steps", "nope"]), "--max-steps"),
         (
