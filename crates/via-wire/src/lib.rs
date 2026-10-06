@@ -48,6 +48,19 @@ impl Default for InboundBounds {
     }
 }
 
+/// A connection's payload-capture policy (runtime §4), set by Route when it
+/// opens the connection or a turn's folder.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Capture {
+    /// The first 64 KiB of a message over its cap, unterminated at EOF or
+    /// undecodable is kept in `undecoded.bin`.
+    #[default]
+    On,
+    /// No payload byte is kept anywhere (`OpenCode`, owner 2026-10-06): no
+    /// `undecoded.bin`; the note keeps only the caller's description.
+    Off,
+}
+
 /// The bytes of one complete, newline-terminated vendor message, bounded but
 /// not yet decoded; Route may still reject them as malformed.
 #[derive(Eq, PartialEq)]

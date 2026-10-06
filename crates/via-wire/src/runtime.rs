@@ -23,6 +23,9 @@ pub struct WireSignals {
     pub gate: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
     /// The connection's inbound message and staging bounds (runtime §8).
     pub inbound: InboundBounds,
+    /// The connection's payload-capture policy (runtime §4): `On` for every
+    /// route but `OpenCode`'s.
+    pub capture: crate::Capture,
 }
 
 /// Deployment paths for the sole Host anchor service.
@@ -79,6 +82,18 @@ impl WireRuntime {
         session: &via_store::SessionId,
         turn: via_store::TurnNumber,
     ) -> Result<connection::TurnFolder, WireError> {
+        self.turn_folder_with(session, turn, crate::Capture::On)
+            .await
+    }
+
+    /// [`Self::turn_folder`] under `capture` (runtime §4): with
+    /// [`crate::Capture::Off`] the folder keeps no undecoded message.
+    pub async fn turn_folder_with(
+        &self,
+        session: &via_store::SessionId,
+        turn: via_store::TurnNumber,
+        capture: crate::Capture,
+    ) -> Result<connection::TurnFolder, WireError> {
         let root = self.evidence.clone();
         let tasks = self.evidence.blob_tasks().clone();
         let session = session.clone();
@@ -86,7 +101,7 @@ impl WireRuntime {
             .run(move || root.create_turn(&session, turn))
             .await
             .map_err(|error| WireError::Evidence(std::io::Error::other(error)))?;
-        Ok(connection::TurnFolder::new(folder, tasks))
+        Ok(connection::TurnFolder::new(folder, tasks, capture))
     }
 
     /// Opens one private connection for `spec.owner`. First the owner's
@@ -376,6 +391,7 @@ async fn open(
         wake,
         gate,
         inbound,
+        capture,
     } = signals;
     let launch = LaunchPipes::default();
     // The gate is checked inside Host just before ARM: set by then,
@@ -431,7 +447,7 @@ async fn open(
         pipes,
         control,
         exits,
-        (folder, tasks),
+        (folder, tasks, capture),
         (waits, inbound),
         stragglers,
     ))

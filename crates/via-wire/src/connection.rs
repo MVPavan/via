@@ -273,6 +273,8 @@ struct Undecoded {
     folder: PathBuf,
     /// The Store's owned blob steps, which run the file's write.
     tasks: BlobTasks,
+    /// [`crate::Capture::Off`] keeps no payload byte (runtime §4).
+    capture: crate::Capture,
     claimed: AtomicBool,
     note: StdMutex<Option<String>>,
 }
@@ -890,10 +892,11 @@ impl Shared {
 }
 
 impl Undecoded {
-    fn new(folder: PathBuf, tasks: BlobTasks) -> Self {
+    fn new(folder: PathBuf, tasks: BlobTasks, capture: crate::Capture) -> Self {
         Self {
             folder,
             tasks,
+            capture,
             claimed: AtomicBool::new(false),
             note: StdMutex::new(None),
         }
@@ -907,6 +910,13 @@ impl Undecoded {
     /// here.
     async fn keep(&self, bytes: &[u8], what: &str) {
         if self.claimed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if self.capture == crate::Capture::Off {
+            // Runtime §4: no payload byte is kept; the note has only the
+            // caller's description (type, status, length, failure kind).
+            *self.note.lock().unwrap_or_else(PoisonError::into_inner) =
+                Some(format!("{what}; not kept (capture off)"));
             return;
         }
         let path = self.folder.join("undecoded.bin");
@@ -941,9 +951,9 @@ pub struct TurnFolder {
 }
 
 impl TurnFolder {
-    pub(crate) fn new(folder: PathBuf, tasks: BlobTasks) -> Self {
+    pub(crate) fn new(folder: PathBuf, tasks: BlobTasks, capture: crate::Capture) -> Self {
         Self {
-            undecoded: Undecoded::new(folder, tasks),
+            undecoded: Undecoded::new(folder, tasks, capture),
         }
     }
 
@@ -1554,7 +1564,7 @@ pub(crate) fn open(
     pipes: via_host::OwnedPipes,
     control: ProcessControl,
     exits: ExitReceiver,
-    folder: (PathBuf, BlobTasks),
+    folder: (PathBuf, BlobTasks, crate::Capture),
     (waits, bounds): (Waits, InboundBounds),
     stragglers: &Stragglers,
 ) -> WireConnection {
@@ -1579,7 +1589,7 @@ pub(crate) fn open(
 pub(crate) fn connect<R, W>(
     stdout: R,
     stdin: W,
-    (folder, tasks): (PathBuf, BlobTasks),
+    (folder, tasks, capture): (PathBuf, BlobTasks, crate::Capture),
     (waits, bounds): (Waits, InboundBounds),
     stragglers: &Stragglers,
 ) -> (Io, WireMessages)
@@ -1600,7 +1610,7 @@ where
         interrupt_sent: AtomicBool::new(false),
         close_sent: AtomicBool::new(false),
         control: WriteQueue::default(),
-        undecoded: Undecoded::new(folder, tasks),
+        undecoded: Undecoded::new(folder, tasks, capture),
     });
     let (queue_tx, queue) = mpsc::channel(QUEUE_MESSAGES);
     let (data_tx, data_rx) = mpsc::channel(1);
@@ -2320,7 +2330,7 @@ pub mod testing {
         let (io, messages) = connect(
             stdout,
             stdin,
-            (folder, tasks.clone()),
+            (folder, tasks.clone(), crate::Capture::On),
             (waits, bounds),
             &stragglers,
         );
