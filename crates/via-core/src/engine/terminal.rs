@@ -193,9 +193,10 @@ fn assemble(
         auto_declined_requests_total,
         steps: retained.steps,
         usage,
-        cost: retained.cost.map_or(Cost::UNAVAILABLE, |(usd, scope)| {
-            Cost::reported(usd, &scope)
-        }),
+        cost: retained
+            .cost
+            .as_ref()
+            .map_or(Cost::UNAVAILABLE, Cost::reported),
         timestamps,
         duration_ms,
         exit: terminal.exit,
@@ -830,7 +831,12 @@ pub fn envelope_at_maximum(
             output_invalid: None,
             steps: Some(u64::MAX),
             usage: None,
-            cost: Some((f64::MAX, "session_cumulative".to_owned())),
+            // The longest reported provenance word (C1 §5).
+            cost: Some(via_adapters::CostReport {
+                usd: f64::MAX,
+                scope: "session_cumulative".to_owned(),
+                provenance: via_adapters::CostProvenance::Estimated,
+            }),
             // AD6: the terminal's vendor data, at most 16 KiB encoded.
             vendor: data,
         }),
@@ -997,6 +1003,56 @@ mod tests {
         assert_eq!(failure.class, FailureClass::SubmitFailed);
         assert_eq!(failure.vendor_code.as_deref(), Some("E429"));
         assert_eq!(failure.message, "quota exhausted");
+    }
+
+    /// C2 gap A6 (C1 §5 `cost.provenance`): the turn envelope's cost keeps
+    /// the route's provenance, `reported` or `estimated`.
+    #[test]
+    fn the_envelope_cost_keeps_its_provenance() {
+        use via_adapters::{CostProvenance, CostReport};
+        let session = crate::SessionId::try_from("s_zzzzzzzzzzzz").unwrap();
+        let at = "2026-01-01T00:00:00.000Z".to_owned();
+        for (provenance, word) in [
+            (CostProvenance::Reported, "reported"),
+            (CostProvenance::Estimated, "estimated"),
+        ] {
+            let vendor = super::VendorRecord {
+                retained: Some(super::super::lane::Retained {
+                    cost: Some(CostReport {
+                        usd: 0.5,
+                        scope: "turn".to_owned(),
+                        provenance,
+                    }),
+                    ..super::super::lane::Retained::default()
+                }),
+                ..super::VendorRecord::default()
+            };
+            let envelope = super::turn_envelope(
+                (
+                    &session,
+                    TurnNumber::try_from(1).unwrap(),
+                    &crate::intake::TurnPlan::default(),
+                ),
+                super::blank("completed", "end_turn", None),
+                None,
+                (None, None),
+                (
+                    crate::api::Timestamps {
+                        queued_at: at.clone(),
+                        submitted_at: None,
+                        accepted_at: None,
+                        ended_at: at.clone(),
+                    },
+                    None,
+                ),
+                (1, 1),
+                vendor,
+            );
+            assert_eq!(
+                serde_json::to_value(&envelope).unwrap()["cost"],
+                serde_json::json!({"usd": 0.5, "scope": "turn", "provenance": word}),
+            );
+        }
     }
 
     fn rejected(reason: via_adapters::StartRejected) -> crate::api::Failure {

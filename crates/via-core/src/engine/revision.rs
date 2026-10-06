@@ -349,8 +349,8 @@ fn apply(
             }
         }
     }
-    if let Some((usd, scope)) = &retained.cost
-        && let Ok(cost) = serde_json::to_value(Cost::reported(*usd, scope))
+    if let Some(cost) = &retained.cost
+        && let Ok(cost) = serde_json::to_value(Cost::reported(cost))
     {
         members.insert("cost".into(), cost);
     }

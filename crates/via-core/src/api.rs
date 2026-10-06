@@ -1968,11 +1968,12 @@ impl Cost {
         provenance: "unavailable",
     };
 
-    /// A vendor-reported cost (AD6) under one of C1 §5's scopes; a scope
-    /// C1 does not define, or an amount that is not a finite number, is
-    /// unavailable.
-    pub(crate) fn reported(usd: f64, scope: &str) -> Self {
-        let scope = match scope {
+    /// A vendor's cost (AD6) under one of C1 §5's scopes, with its
+    /// provenance, `reported` or `estimated`; a scope C1 does not define,
+    /// or an amount that is not a finite number, is unavailable.
+    pub(crate) fn reported(cost: &via_adapters::CostReport) -> Self {
+        let usd = cost.usd;
+        let scope = match cost.scope.as_str() {
             "turn" => "turn",
             "session_cumulative" => "session_cumulative",
             "vendor_interval" => "vendor_interval",
@@ -1984,7 +1985,10 @@ impl Cost {
         Self {
             usd: Some(usd),
             scope,
-            provenance: "reported",
+            provenance: match cost.provenance {
+                via_adapters::CostProvenance::Reported => "reported",
+                via_adapters::CostProvenance::Estimated => "estimated",
+            },
         }
     }
 }

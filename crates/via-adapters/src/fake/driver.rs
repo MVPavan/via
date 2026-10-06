@@ -23,9 +23,10 @@ use crate::driver::{
 };
 use crate::harness::Harness;
 use crate::observation::{
-    Acceptance, AdapterError, ClassHint, CostReport, Decline, Denial, DenialKind, Identity,
-    InstanceReport, Observation, ObservationItem, ObservationSink, ProgressMarks, SteerDelivery,
-    SteerToken, StopReason, TurnEnd, TurnEvidence, Undelivered, UsageSample, VendorTerminal,
+    Acceptance, AdapterError, ClassHint, CostProvenance, CostReport, Decline, Denial, DenialKind,
+    Identity, InstanceReport, Observation, ObservationItem, ObservationSink, ProgressMarks,
+    SteerDelivery, SteerToken, StopReason, TurnEnd, TurnEvidence, Undelivered, UsageSample,
+    VendorTerminal,
 };
 use crate::plan::{ParamSizes, Refusal, RefusalKind, TurnParams, VersionStatus};
 use crate::runtime::{cleanup, event_stall};
@@ -996,6 +997,7 @@ fn vendor_terminal(terminal: FakeTerminal) -> VendorTerminal {
         cost: details.cost.map(|cost| CostReport {
             usd: cost.usd,
             scope: cost.scope,
+            provenance: CostProvenance::Reported,
         }),
         vendor: details.vendor,
     }

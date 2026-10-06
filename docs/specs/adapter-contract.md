@@ -791,7 +791,10 @@ up to 1,024 keys per turn; further new keys add as keyless. Once it
 overflows, the envelope reports scope `vendor_interval` with
 `usage_interval_unverified`. A component is `null` if any contributing
 sample lacks it. Step rows keep their existing per-step rule for `status`.
-`VendorTerminal.cost` gives `{usd, scope}`; `VendorTerminal.vendor` is
+`VendorTerminal.cost` gives `{usd, scope, provenance}`, `provenance`
+`Reported` (the vendor's accounted amount) or `Estimated` (computed from
+price tables, as Pi's), which C1 §5 reports as `reported` or `estimated`;
+an unavailable cost is no `cost`. `VendorTerminal.vendor` is
 bounded vendor data for the envelope's `vendor` member.
 `usage.tokens` and `usage.cost` scopes are declared per field from verified
 accounting intervals; unverified intervals are `vendor_interval`.

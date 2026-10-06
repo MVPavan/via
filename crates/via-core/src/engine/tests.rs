@@ -3554,6 +3554,33 @@ fn a_late_usage_aggregate_supersedes_the_interval_warning() {
     });
 }
 
+/// C2 gap A6 (C1 §5 `cost.provenance`): a late terminal's estimated cost
+/// revises the stored envelope's cost as `estimated`.
+#[test]
+fn a_late_estimated_cost_revises_as_estimated() {
+    let Some(root) = child("a_late_estimated_cost_revises_as_estimated") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = unknown_session(&engine, (Value::Null, None), json!({})).await;
+        let mut late = late_terminal(via_adapters::VendorTerminalStatus::Completed, "late");
+        late.cost = Some(via_adapters::CostReport {
+            usd: 0.25,
+            scope: "turn".to_owned(),
+            provenance: via_adapters::CostProvenance::Estimated,
+        });
+        engine.revise(&session, turn(1), &late).await;
+        let envelope = stored_envelope(&engine, &session, 1).await;
+        assert_eq!(envelope["revision"], 1, "{envelope}");
+        assert_eq!(
+            envelope["cost"],
+            json!({"usd":0.25,"scope":"turn","provenance":"estimated"}),
+            "{envelope}"
+        );
+    });
+}
+
 /// Sol r1 #15 (C2 §2 `VendorTerminal`, C1 §5): a route's structured
 /// output that is no value (`NotJson`, `OverLimit`) is present and
 /// invalid. Against a frozen `output_schema`, a completed late terminal

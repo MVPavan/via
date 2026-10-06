@@ -215,10 +215,11 @@ pub use instance::{
     resolve_binary,
 };
 pub use observation::{
-    AdapterError, Admitted, ClassHint, CostReport, Decline, Denial, DenialKind, InstanceReport,
-    LeftoverReport, Observation, ObservationBudget, ObservationItem, ObservationLoss,
-    ObservationSink, ProgressMarks, SteerDelivery, SteerToken, StopReason, TurnEnd, TurnEvidence,
-    UnparsedOutput, UsageSample, VendorTerminal, observation_channel, observation_channel_in,
+    AdapterError, Admitted, ClassHint, CostProvenance, CostReport, Decline, Denial, DenialKind,
+    InstanceReport, LeftoverReport, Observation, ObservationBudget, ObservationItem,
+    ObservationLoss, ObservationSink, ProgressMarks, SteerDelivery, SteerToken, StopReason,
+    TurnEnd, TurnEvidence, UnparsedOutput, UsageSample, VendorTerminal, observation_channel,
+    observation_channel_in,
 };
 pub use passthrough::{VENDOR_ARGS_BYTES_MAX, VENDOR_ARGS_MAX, VendorArgs, VendorArgsError};
 pub use plan::{

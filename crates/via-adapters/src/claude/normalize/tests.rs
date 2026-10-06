@@ -161,7 +161,8 @@ fn c4_one_denial_deduplicated() {
         terminal.cost,
         Some(CostReport {
             usd: 0.023_973_4,
-            scope: "session_cumulative".to_owned()
+            scope: "session_cumulative".to_owned(),
+            provenance: CostProvenance::Reported,
         })
     );
     assert_eq!(run.final_text(), "DENIED");
