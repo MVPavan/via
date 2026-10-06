@@ -201,6 +201,12 @@ pub(crate) struct Sealed {
     /// The message being delivered was delivered only in part.
     pub(crate) partial: bool,
     pub(crate) terminal: Option<Retained>,
+    /// The decode sequence of the last message the turn's delivery took
+    /// before the seal: its place in the connection's read order (picrit
+    /// round 6). The terminal for an ordinary end; a later one, such as the
+    /// tool end closing an interrupted terminal's P7 window, when delivery
+    /// went on past it.
+    pub(crate) last_seq: u64,
     /// The retained terminal's original decode instant (x.3.2 X4 D4.1),
     /// not its observation time.
     pub(crate) decoded_at: Option<Instant>,
@@ -415,6 +421,7 @@ impl Delivery {
             position,
             partial: !seal.complete,
             terminal: seal.terminal.take(),
+            last_seq: seal.current,
             decoded_at: seal.decoded_at,
             tools_open: seal.tools_open || seal.draining,
             stop: seal.stop.take(),

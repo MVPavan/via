@@ -2,8 +2,8 @@
 //! cutoff; x.3.2 ruling Q1): one VIA turn on its own private process, from
 //! the entry checks through the start, the read loop, the terminal's
 //! finalization or late path, and the process's cleanup. One hardened copy
-//! serves the closed set of protocols that run this way, the fake's and
-//! Claude Code's ([`PrivateProtocol`]); each supplies only its encoding,
+//! serves the closed set of protocols that run this way, the fake's,
+//! Claude Code's and Pi's ([`PrivateProtocol`]); each supplies only its encoding,
 //! its decoding and admission rules, its terminal evidence and the fake's
 //! persistent-profile emulation.
 
@@ -24,8 +24,8 @@ use via_wire::{
 mod serving;
 
 pub(crate) use serving::{
-    CLEANUP_ALLOWANCE, Failed, Interrupt, Next, Serving, Signals, cleanup_deadline, pending,
-    protocol, transport, wire_cause,
+    Answer, CLEANUP_ALLOWANCE, Failed, Interrupt, Next, Serving, Signals, cleanup_deadline,
+    pending, protocol, transport, wire_cause,
 };
 use serving::{acquire_failure, wake_on_order};
 
@@ -114,7 +114,7 @@ impl<M> Hop<M> {
 pub(crate) type ForceWatch = watch::Receiver<Option<tokio::time::Instant>>;
 
 /// A protocol that runs one VIA turn per private process. The set is
-/// closed: the fake's lane and Claude Code's, crate-private, so the hop,
+/// closed: the fake's lane, Claude Code's and Pi's, crate-private, so the hop,
 /// terminal and result types stay each protocol's own while the lifecycle
 /// is shared. The implementor is the protocol's per-turn state.
 pub(crate) trait PrivateProtocol: Sized + Send {
@@ -178,6 +178,13 @@ pub(crate) trait PrivateProtocol: Sized + Send {
     fn terminal(message: &Self::Message) -> Option<Self::Terminal>;
     /// Keeps the decoded terminal (AD4).
     fn retain(serving: &mut Serving<'_, Self>, terminal: &Self::Terminal);
+    /// The late path reads no more of the vendor's messages: what the kept
+    /// terminal still needed from them is settled now; `Some` is the
+    /// turn's failure in place of its result (Pi's unanswered abort, packet
+    /// §7.1). None by default: a terminal needs nothing after it.
+    fn unanswered(_serving: &mut Serving<'_, Self>) -> Option<Failed> {
+        None
+    }
     /// Reads what the protocol needs before the start (AD7); nothing on a
     /// protocol whose handshake follows the start.
     fn handshake<'s>(
@@ -446,7 +453,11 @@ async fn serve_turn<P: PrivateProtocol>(
         Err(failed) => failed,
     };
     // One cutoff (AD4): the wall's cleanup bound is 3 s from the wall,
-    // for every step after it; a stop order's is its `close_by`.
+    // for every step after it; a stop order's is its `close_by`, as the
+    // failure took it. Fixed once cleanup begins: a later, shorter order
+    // does not shorten it, nor does the daemon force, which stops the
+    // group at once through Host's early stop; a Store absence proof still
+    // pending may wait until this bound (packet §7.1).
     let cleanup = match failed.cause {
         RouteError::Deadline { .. } => Deadline::at(serving.deadline.instant() + CLEANUP_ALLOWANCE),
         RouteError::Protocol { .. }
@@ -525,7 +536,20 @@ async fn late<P: PrivateProtocol>(
     // A failpoint error only ends the pause.
     #[cfg(feature = "test-failpoints")]
     let _ = via_wire::failpoint::hit_async("routes.late.entered").await;
-    let by = cleanup_deadline();
+    // Nothing more is read: the terminal's disposition is settled now.
+    let unanswered = P::unanswered(serving);
+    // The unanswered order's own `close_by`, when earlier (picrit round 2,
+    // B), bounds delivery, close and drain alike. It is fixed here, as the
+    // order stands as cleanup begins: a later, shorter order does not
+    // shorten it, nor does the daemon force, which stops the group at once
+    // through Host's early stop; this delivery may still wait until the
+    // bound (packet §7.1).
+    let by = unanswered
+        .as_ref()
+        .and_then(|failed| failed.close_by)
+        .map_or_else(cleanup_deadline, |close_by| {
+            Deadline::at(close_by.instant().min(cleanup_deadline().instant()))
+        });
     let close = sender.close(CloseRequest {
         mode: CloseMode::Force,
         deadline: by,
@@ -541,9 +565,13 @@ async fn late<P: PrivateProtocol>(
         &report,
     );
     let undecoded = sender.take_undecoded();
-    match delivered {
-        Ok(()) => serving.unless_forced(result, undecoded),
-        Err(cause) => Err(serving.failure_with(cause, &result, undecoded)),
+    // An unanswered interrupt's disposition governs a delivery that could
+    // not finish (as a stop order's own escalation governs the stall's
+    // `overflow` on the failure path); the daemon force outranks both.
+    match (unanswered, delivered) {
+        (Some(failed), _) => Err(serving.failure_with(failed.cause, &result, undecoded)),
+        (None, Ok(())) => serving.unless_forced(result, undecoded),
+        (None, Err(cause)) => Err(serving.failure_with(cause, &result, undecoded)),
     }
 }
 

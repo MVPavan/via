@@ -72,7 +72,8 @@ impl AdapterSet {
         let recovery = match adapter {
             // Neither the fake nor the vendor stubs resume: the context is
             // not used, and nothing is started.
-            Some(Adapter::Fake(_) | Adapter::Claude(_) | Adapter::Codex(_)) | None => {
+            Some(Adapter::Fake(_) | Adapter::Claude(_) | Adapter::Codex(_) | Adapter::Pi(_))
+            | None => {
                 drop(cx);
                 recovery_by_facts(facts)
             }

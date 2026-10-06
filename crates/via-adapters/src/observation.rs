@@ -431,6 +431,11 @@ pub struct TurnEnd {
     /// Shared-ingress routes: the driver's loss record, when this turn's
     /// run lost observations (C2 §2 `ObservationLoss`); `None` elsewhere.
     pub loss: Option<ObservationLoss>,
+    /// A turn usage aggregate for a turn whose end retained no terminal
+    /// (C2 §5): it supersedes the call samples as a terminal's would. A
+    /// route whose delivery lost samples reports an all-null one (bead
+    /// via-i5g); with a terminal, `VendorTerminal.usage` carries it.
+    pub aggregate: Option<UsageSample>,
 }
 
 /// A shared-ingress driver's sticky loss record for one connection

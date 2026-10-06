@@ -654,7 +654,10 @@ async fn oc01_incompatible_handshakes_are_refused() {
         assert_eq!(error.failure, LaunchFailure::Refused(refusal), "{name}");
         assert_eq!(
             cause(&error),
-            RouteError::HandshakeRefused { turn: turn() },
+            RouteError::HandshakeRefused {
+                turn: turn(),
+                detail: None
+            },
             "{name}"
         );
     }
@@ -684,7 +687,13 @@ async fn oc01_unchecked_version_is_refused_before_publication() {
     assert_eq!(error.version.as_deref(), Some("2.0.23"));
     let text = refusal.to_string();
     assert!(text.contains("2.0.23") && text.contains("2.0.22"), "{text}");
-    assert_eq!(cause(&error), RouteError::HandshakeRefused { turn: turn() });
+    assert_eq!(
+        cause(&error),
+        RouteError::HandshakeRefused {
+            turn: turn(),
+            detail: None
+        }
+    );
     assert_eq!(rig.targets(), ["/api/info"]);
     for (path, bytes) in rig.files() {
         assert!(
@@ -880,7 +889,13 @@ async fn oc01_version_check_refuses_before_launch() {
         checked: CHECKED,
     };
     assert_eq!(error.failure, LaunchFailure::Refused(refusal));
-    assert_eq!(cause(&error), RouteError::HandshakeRefused { turn: turn() });
+    assert_eq!(
+        cause(&error),
+        RouteError::HandshakeRefused {
+            turn: turn(),
+            detail: None
+        }
+    );
     assert!(rig.reports().is_empty(), "nothing launched");
     let namespace = rig.namespace();
     assert!(!namespace.lock().exists(), "the lock was taken");

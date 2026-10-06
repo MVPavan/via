@@ -174,9 +174,22 @@ impl LaunchFailure {
                 journal_uncertain,
                 launch,
             ),
-            Self::Refused(_) | Self::Unsafe { .. } => {
-                (RouteError::HandshakeRefused { turn }, NONE, false, None)
-            }
+            // Detail text for a refused handshake reaches C1 in chunk B.
+            Self::Refused(_) => (
+                RouteError::HandshakeRefused { turn, detail: None },
+                NONE,
+                false,
+                None,
+            ),
+            Self::Unsafe { detail } => (
+                RouteError::HandshakeRefused {
+                    turn,
+                    detail: Some(detail.clone()),
+                },
+                NONE,
+                false,
+                None,
+            ),
             Self::Transient { step: name } => {
                 (RouteError::TransportLost { turn }, NONE, false, step(name))
             }

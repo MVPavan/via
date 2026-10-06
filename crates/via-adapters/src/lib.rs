@@ -197,6 +197,7 @@ pub mod observation;
 )]
 mod opencode;
 mod passthrough;
+mod pi;
 mod plan;
 #[cfg_attr(
     not(test),

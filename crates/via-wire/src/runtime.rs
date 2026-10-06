@@ -67,6 +67,17 @@ impl WireRuntime {
         &self.vendor_state_dir
     }
 
+    /// The evidence folder `<state>/evidence/<session>/<turn>/` a turn's
+    /// launch creates; no I/O (a route keeps its own records there once
+    /// its turn launched, Pi packet §§4.3, 4.7).
+    pub fn turn_evidence_path(
+        &self,
+        session: &via_store::SessionId,
+        turn: via_store::TurnNumber,
+    ) -> std::path::PathBuf {
+        self.evidence.path(session, turn)
+    }
+
     /// Host's sticky journal-uncertain watch (x.3.2 X0 item 2.6): `true`
     /// once any Host journal outcome was uncertain, whatever its owner.
     pub fn journal_uncertain(&self) -> watch::Receiver<bool> {

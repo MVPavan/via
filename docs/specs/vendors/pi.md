@@ -71,8 +71,8 @@ Ownership is as Claude's (Claude §2), with Route owning typed JSONL
 parsing, command correlation and the control lane.
 
 **Why one process per turn.** It reuses the reviewed private lifecycle
-(Host anchor, own-group cleanup, turn-envelope leftovers, decode fence,
-`recover` unsupported). No in-memory vendor state crosses turns: Pi keeps
+(Host anchor, own-group cleanup, turn-envelope leftovers once via-daz
+lands, decode fence, `recover` unsupported). No in-memory vendor state crosses turns: Pi keeps
 steering and follow-up queues in memory only (E11), and an idle queue entry
 leaks into the next run (E22). Model, effort, tools and instructions are
 launch flags, re-applied every turn as in Claude's recipe. RPC runs one
@@ -92,7 +92,7 @@ private per-turn process (glossary fix, §10 G7).
 | C1 surface | Mapping |
 |---|---|
 | `describe` | Pure plan; no process or file write; the last version read for this program path, else `null`/`untested` |
-| `models` | Bundled catalog; the live list is the handshake's `get_available_models` |
+| `models` | Bundled catalog, provider-qualified with no bare-ID alias (a bare ID such as `gpt-6-luna` is Codex's, and model-only routing must stay unique); the live list is the handshake's `get_available_models` |
 | `spawn`, `resume` | Core receipt, then one launch per turn (§2.1) |
 | `steer` | `unsupported_verb` naming `pi-rpc`; nothing written (PI-8) |
 | `cancel` | Queued: Core-local. Running: §7 |
@@ -105,9 +105,17 @@ private per-turn process (glossary fix, §10 G7).
 after Core reserved a slot:
 
 1. **Pre-launch checks**, with no vendor process:
-   1. the profile policy (§4.3);
-   2. R1 predecessor absence (§7.4);
-   3. the version read (§3).
+   1. one filesystem step, on a blocking task off the async workers that
+      the session's tracker owns: the profile policy (§4.3), the version
+      read (§3), then VIA's launch state (§4.4). A stop, the daemon force,
+      the wall or the session's cancellation before it finishes ends the
+      turn unlaunched (`stopped`, `force_stopped`, `deadline`); the task
+      finishes on its own and launches nothing. VIA's launch-state write
+      holds one adapter-wide lock for the task's whole life, so a later
+      attempt's write waits for an earlier task the turn stopped waiting
+      for (that wait is raced against the same orders). A launch-state
+      failure after the version read still reports the version (§3);
+   2. R1 predecessor absence (§7.4).
 2. **Launch** the §4.1 recipe. Nothing is written before step 3.
 3. **Handshake.** Write `get_state`, `get_available_models` and
    `get_commands` at once, each with a VIA `id` (Pi buffers them, E01).
@@ -132,12 +140,15 @@ after Core reserved a slot:
      `Rejected{VendorError}` with no vendor code and VIA-owned text (§5.4).
    - Any other disposition (`handled`, `queued`) is protocol: it cannot occur
      on an idle fresh process under `-ne -np` (E40).
-   - A lost reply is the unknown-submission failure. Nothing is resent.
+   - A lost reply is the unknown-submission failure: Pi exiting after the
+     written prompt with no reply fails the turn `process_exited` with the
+     Host-confirmed exit. Nothing is resent.
 5. **Observe** (§5) until `agent_settled`. `agent_end` is not the end:
    auto-retry and compaction continue after it (E28).
 6. **Close.** After `agent_settled`, and after any admitted abort's reply or
    cutoff (§7), close stdin; Pi exits 0 in ~7 ms (E31). Then S1's close as
-   Claude: wait for exit, group cleanup, leftover scan, `TurnEnd`. **Never
+   Claude: wait for exit, group cleanup, `TurnEnd` (no leftover scan yet,
+   §7.1). **Never
    close stdin before `agent_settled`**: EOF aborts the run with no terminal
    and exit 0 (E31). Unlike Claude, EOF here is an unacknowledged stop.
 
@@ -213,7 +224,8 @@ before each launch, so no extra process runs:
   (a Bun-compiled Pi), gives `vendor_version: null` with `untested`. It is
   never a refusal: VIA relies on nothing the version says.
 - The string goes into this turn's `InstanceReport`, on every outcome after
-  the read, including an exit before the handshake (E12); this is the
+  the read, including an R1 refusal and an exit before the handshake (E12);
+  this is the
   metadata trigger of C2 §5. A package replaced between the read and the
   launch is the accepted race, as for every route.
 
@@ -261,9 +273,18 @@ prefixed every bash call (E37). Pi also loads its `SYSTEM.md`, `models.json`
 and resource directories (E64), and even `pi --version` touches it (E00).
 
 So VIA uses `<vendor_state_dir>/pi/agent` (a managed 0700 directory,
-runtime §6.1). The owner logged Pi in there once
-(`PI_CODING_AGENT_DIR=… pi`, then `/login`); Pi wrote its own `auth.json`
-(OpenAI, OAuth) and reads it on every turn (E49). VIA never reads, copies or
+runtime §6.1). The owner logs Pi in there once. First create the directory
+and its missing ancestors 0700, for example
+`(umask 077 && mkdir -p ~/.via/state/vendor/pi/agent)` for the default
+state (running a `via` command first is not enough: the daemon creates its
+state directory, not `vendor/pi/agent`). Then run
+`PI_CODING_AGENT_DIR=<that directory> pi` and `/login`. The order matters:
+Pi creates missing directories under the default umask, so letting it
+create them leaves them 0755, and VIA then refuses the state (a daemon
+start fails "unsafe VIA managed directory", and §4.4 refuses every turn).
+`mkdir -m 700 -p` alone is not enough: it sets the mode of the last
+directory only. Pi writes its own `auth.json` (OpenAI, OAuth) and reads it
+on every turn (E49). VIA never reads, copies or
 logs credentials; this follows Claude's precedent (the vendor reads its own
 login).
 
@@ -273,10 +294,14 @@ Directory privacy alone is not a configuration boundary (E37). **Before
 every launch** the driver validates the agent directory. A violation is a
 `submit_failed` refusal with `data.reason:"handshake_refused"`, whose
 VIA-owned message names the rule and the entry or key, never a value. It is
-**never cached**: the owner can fix the profile without a binary change. VIA
+**never cached**: the owner can fix the profile without a binary change. The
+message travels as the shared `RouteError::HandshakeRefused`'s optional
+VIA-owned `detail` (Claude and Codex pass none), on a failure that launched
+nothing. VIA
 never writes, repairs or deletes anything in the agent directory.
 
-- **Files.** At most 64 entries. Every entry checked is owned by the
+- **Files.** At most 64 entries, `bin/`'s files counted with the
+  directory's own. Every entry checked is owned by the
   daemon's uid, has the expected type, is opened through the directory's
   descriptor without following symlinks (a symlink is refused), and is
   neither group- nor world-writable. `auth.json` also has no group or other
@@ -306,7 +331,25 @@ never writes, repairs or deletes anything in the agent directory.
 - **Record.** The turn's evidence folder gets `pi-profile.json` (≤ 4 KiB):
   the policy version, entry names, kinds and modes, the settings key names,
   and one policy digest (SHA-256 over those plus the approved values except
-  `deviceId`). No credential bytes and no device identifier.
+  `deviceId`). A list that would pass 4 KiB is replaced by its count. No
+  credential bytes and no device identifier. It records the check the
+  launch passed, not the directory after the turn (Pi creates `auth.json`
+  and `models-store.json` on its first run, E59), and is written only for a
+  turn that launched, best effort: the turn's outcome never depends on it.
+  Both records are written on a blocking task the session's tracker owns;
+  the turn's end waits for them only until the earliest of the cleanup
+  allowance from then, the turn's one cutoff (the wall plus 3 s, C2
+  §4.1), and the `close_by` of a stop or the driver's close order as they
+  stand or arrive, and never past the daemon force. The turn stays active
+  until then, so a direct close in that wait still publishes its deadline.
+  The task itself checks the current bound before each record, a bound
+  set before it starts (already passed when the cutoff has expired or the
+  daemon force is raised), so one it has not begun by then is skipped
+  even if it resumes before the wait wakes; it names the skipped records
+  in
+  `pi-records-skipped.json` (`{"skipped":[…],"reason":…}`, 0600) once it
+  can write; a record whose write had begun may still finish after the
+  turn ended.
 - **Profile setting.** The real profile had no `cacheWarming` key (E60);
   `"cacheWarming": "off"` was added to its `settings.json` on 2026-10-05.
   VIA itself never writes it: a profile without it is refused.
@@ -320,19 +363,34 @@ Outside the agent directory: `pi/sessions/<via_session_id>/` (managed 0700;
 Pi creates its session files inside) and `pi/instructions/<via_session_id>`
 (the frozen instructions, 0600, written atomically before each launch).
 
+**Managed directories.** Before every launch, and before §4.3's check,
+every directory from `<vendor_state_dir>` (`vendor/`) down to
+`pi/agent`, `pi/sessions/<via_session_id>` and `pi/instructions` is
+checked as the daemon checks `vendor/` (runtime §6.1): a directory, not a
+symlink, owned by the daemon's uid, mode exactly 0700. A missing one is
+created 0700 (the agent directory too: empty, §4.3 then refuses it for
+its missing `settings.json`). An existing one is never chmod-ed: one that
+fails is a `submit_failed` refusal, `data.reason:"handshake_refused"`,
+whose VIA-owned message names the directory relative to the state
+directory and the rule (for example "VIA's Pi state directory
+vendor/pi/agent has mode 0755, not 0700"), never cached, launching
+nothing and writing nothing under it. A directory that cannot be read or
+created is §4.3's unreadable-agent refusal before the profile check, and
+the `store` failure of §4.4's writes after it.
+
 ### 4.5 Canonical parameters
 
 | Field | Mapping |
 |---|---|
-| model | `--model provider/id`, exact; checked at the handshake (§2.1) |
+| model | `--model provider/id`, exact; checked at the handshake (§2.1). A model without a non-empty provider and ID is refused by `plan` and `check_turn` (`InvalidParam{model}`) before any receipt: Pi could only fuzzy-match it (E30) |
 | instructions | Frozen text in the VIA-owned file, passed by absolute path to `--append-system-prompt`. Pi reads an argument that names an existing file as that file (E38), so inline text could silently read a file whose path equals the text |
 | prompt, instructions size (PI-15) | `plan`/`check_turn` refuse `ParamSizes.prompt_json` above 524,288 bytes (`InvalidParam{prompt}`) and `instructions_json` above 262,144 bytes (`InvalidParam{instructions}`), before any receipt (C2 §2). Pi repeats the prompt, re-escaped, in its user `message_start`, `message_end` and `agent_end` records, and the creating run's system patch with the instructions in two records (E04, E47, E57). Each record must stay under the 1 MiB vendor-message ceiling (runtime §8); the remaining 256 KiB is headroom for Pi's base prompt (~6 KB, E47), context files and the run's other messages, which PI-15 does not bound. A record over 1 MiB still fails `overflow`, as on Claude (L1) |
-| effort (PI-6) | `low`, `medium`, `high`, `xhigh`, `max` and vendor values `off`, `minimal` pass to `--thinking`. Pi clamps silently and only warns on stderr for invalid values (E41), so a requested effort is checked against `get_state.thinkingLevel` (§2.1) and the check's result is cached for `check_turn`. With no effort, `--thinking` is omitted, Pi's default applies (the policy refuses `defaultThinkingLevel`, E58), and the observed level goes to bounded `vendor` data |
+| effort (PI-6) | `low`, `medium`, `high`, `xhigh`, `max` and vendor values `off`, `minimal` pass to `--thinking`. Pi clamps silently and only warns on stderr for invalid values (E41), so a requested effort is checked against `get_state.thinkingLevel` (§2.1) and a clamp is cached for `plan` and `check_turn`, keyed on the binary's identity and a digest of the model and effort (C2 §5). With no effort, `--thinking` is omitted, Pi's default applies (the policy refuses `defaultThinkingLevel`, E58), and the observed level goes to bounded `vendor` data |
 | output_schema | unsupported |
 | max_steps | unsupported; non-null refused before vendor I/O |
 | bound, extra_write_dirs | §6 |
 | deadlines | Core-owned. Pi has no turn timeout; its provider idle timeout (300 s) and retry backoff (up to 60 s) can lengthen a turn without events (docs `settings.md`) |
-| tools | `--tools read,bash,edit,write`. This is explicit launch configuration, not handshake-proven: the handshake returns no tool list. Where a system patch carries `toolsAdded`/`toolsRemoved` (a creating launch or a changed loadout, E05, E56), the names must match the list, else protocol. Pi accepts unknown names silently (E34), and restores a stored loadout only without `--tools` (E56) |
+| tools | `--tools read,bash,edit,write`. This is explicit launch configuration, not handshake-proven: the handshake returns no tool list. Where a system patch carries `toolsAdded`/`toolsRemoved` (a creating launch or a changed loadout, E05, E56), an added name outside the list, or a removed name in it, is protocol; a patch lists only changes, so the added names need not be the whole list. Pi accepts unknown names silently (E34), and restores a stored loadout only without `--tools` (E56) |
 
 ### 4.6 Inherited configuration (C2 §6.2), both directions
 
@@ -370,11 +428,17 @@ changed (E04, E51).
   paths (`listed`), `none` (`project_context:null`), `not_reported` (no
   `project_context` member, or no patch: Pi reported no change this turn),
   or `unparsed`; plus the `skill:*` names from `get_commands`. At most 32
-  paths of 1 KiB and 256 skill names; beyond that, `unparsed`.
+  paths of 1 KiB and 256 skill names; beyond that, `unparsed`. The record
+  is `{"version":1,"instruction_files":{"state":S[,"paths":[…]]},
+  "skills":{"state":"listed"|"unparsed","names":[…]}}`, written best effort
+  once the handshake passed.
 - The inventory is evidence, not public state: C2 §6.2 asks only what a
   route can record. `not_reported` is never presented as empty or
   unchanged. Instruction contents never enter observations, envelopes or
-  evidence.
+  VIA's own evidence records. The one exception is raw vendor bytes: when
+  evidence is authorized, the first 64 KiB of a record Route cannot decode
+  (malformed, over its cap or unterminated) lands in `undecoded.bin`, and
+  such a record may carry instruction text (runtime C4).
 
 ### 4.8 Trust and reserved keys
 
@@ -382,28 +446,39 @@ changed (E04, E51).
 skills, `SYSTEM.md`/`APPEND_SYSTEM.md` and MCP never load (E33). Context
 files still load; Pi does not trust-gate them.
 
-**Reserved vendor keys.** The vendor-option allow-list is empty. Reserved
-(`vendor_option_conflict`): every recipe flag and its short forms (`-t`,
-`-xt`, `-nt`, `-nbt`, `-e`, `-ne`, `-ns`, `-np`, `-nc`, `-a`, `-na`, `-c`,
-`-r`, `-p`, `-n`); `--provider`, `--api-key`, `--models`, `--system-prompt`,
-`--fork`, `--continue`, `--resume`, `--no-session`, `--export`, `--skill`,
-`--prompt-template`, `--theme`, `--mode`, `--offline`, `--version`; and
-every `PI_*` environment name.
+**Reserved names** (from the pinned `pi --help` of 1.0.2). Long:
+`--provider`, `--model`, `--api-key`, `--system-prompt`,
+`--append-system-prompt`, `--mode`, `--print`, `--continue`, `--resume`,
+`--session`, `--session-id`, `--fork`, `--session-dir`, `--no-session`,
+`--name`, `--models`, `--no-tools`, `--no-builtin-tools`, `--tools`,
+`--exclude-tools`, `--thinking`, `--extension`, `--no-extensions`,
+`--skill`, `--no-skills`, `--prompt-template`, `--no-prompt-templates`,
+`--theme`, `--no-context-files`, `--export`, `--list-models`, `--approve`,
+`--no-approve`, `--offline`, `--help`, `--version`: every recipe flag, its
+negations and opposites, VIA's canonical parameters, and the options that
+change the mode, the session, the model, the tools or the loaded resources,
+or exit at once. Short: `-p`, `-c`, `-r`, `-n`, `-nt`, `-nbt`, `-t`, `-xt`,
+`-e`, `-ne`, `-ns`, `-np`, `-nc`, `-a`, `-na`, `-h`, `-v`.
 
-**Vendor argument passthrough (owner, 2026-10-06; C2 §6.3; adopt when the
-adapter is built).** A session's frozen `vendor_args` are appended after the
-last recipe argument (§4.1, after `--offline`) on every per-turn launch,
-after a daemon restart too; they enter the handshake-refusal recipe key and
-the launch-request check (`invalid_params` naming `vendor_args` past Host's
-64 KiB). Reserved, matched under C2 §6.3: every flag above (the recipe's,
-its short forms and the listed ones), the negations and opposites of VIA's
-switches (`--approve`, extensions, skills, prompt templates, context files
-back on), `--thinking`, `--session-dir`, `--session-id`, `--session`,
-`--tools`, `--model`, `--append-system-prompt`, `--help`/`-h`, every
-operand and `--`. Environment names are not arguments and stay unreachable.
-The exact list, the value-option table and whether Pi's parser takes
-`--name=value` are derived from the pinned `pi --help` when the adapter is
-built (UNVERIFIED until then).
+**Reserved vendor keys.** The vendor-option allow-list is empty. A key
+naming a reserved name or short form in any C2 §6.3 normalized spelling, or
+a `PI_*` environment name, is `vendor_option_conflict`; any other key is
+`invalid_params`.
+
+**Vendor argument passthrough (owner, 2026-10-06; C2 §6.3; adopted).** A
+session's frozen `vendor_args` are appended after the last recipe argument
+(§4.1, after `--offline`) on every per-turn launch, after a daemon restart
+too; they enter the handshake-refusal recipe key and the launch-request
+check (`invalid_params` naming `vendor_args`, or `cwd` when the session has
+none, past Host's 64 KiB). Matched under C2 §6.3: every reserved long name,
+every operand and `--`. Pi matches each option as an exact string, its
+short forms multi-letter, so no single-dash element is a cluster of
+switches: **every** single-dash element is refused. Pi 1.0.2 never matches
+`--name=value` to a known option; it splits the element at its first `=`
+into an unknown (extension) flag's name and value. The match judges it by
+its name all the same, so a reserved name is refused in either spelling. The unreserved options that take a value are `--use-theme` and
+`--tui-mode`, each its next element. Environment names are not arguments
+and stay unreachable.
 
 ## 5. Typed protocol and normalizer
 
@@ -419,12 +494,16 @@ built (UNVERIFIED until then).
 | `message_update` | `assistantMessageEvent.type` | §5.2; its cumulative `usage` is ignored |
 | `tool_execution_start`, `tool_execution_end` | `toolCallId`, `toolName` | Progress marks; no per-tool state (cleanup is group-based, §7) |
 | `extension_ui_request` | `method` | §6 |
-| `compaction_*`, `auto_retry_*`, `entry_appended`, `queue_update`, other known types | `type` | Activity; compaction usage per §5.5 |
+| `compaction_*`, `auto_retry_*`, `summarization_retry_*`, `entry_appended`, `queue_update`, other known types | `type` | Activity; compaction usage, and `summarization_retry_scheduled` as an all-`null` sample, per §5.5 |
 | unknown `type` | — | Activity; no observation |
 
 - Before the `started` reply, a lifecycle or `message_*` record is protocol
   (E04); pre-prompt compaction records may arrive (E63) and are activity,
-  their usage held (§5.5).
+  their usage held (§5.5). More than 64 of them before `started` is
+  protocol: held samples emit nothing, so the hop's bound does not bound
+  them, and Pi compacts at most once before a prompt.
+- A UI request's `method` must leave room for the `extension_ui/` prefix
+  within 1 KiB (C2 A1), else the record is malformed.
 - One `agent_settled` per run. A second one, or one with no assistant
   `message_end` since `started`, is protocol: no terminal exists.
 - IDs, names, stop reasons and codes are bounded to 1 KiB (C2 A1).
@@ -515,6 +594,14 @@ cache reads, E24); `cached_input` = `cacheRead`; `output` = `output`;
   is an all-`null` sample. A sample decoded before the `started` reply is
   held and delivered after `turn.accepted` (C2 §4's early-message retiming,
   as Codex), and dropped on a rejection.
+- **Hidden retries.** Pi retries a failed summarization (compaction, or a
+  branch summary) inside pi-ai's `retryAssistantCall`
+  (`packages/ai/src/utils/retry.ts` in 1.0.2), which returns only the last
+  attempt and reports no earlier attempt's usage; Pi's RPC shows only
+  `summarization_retry_scheduled`. Each one is an all-`null` sample, so the
+  turn's tokens and cost are unavailable rather than an undercount. The
+  agent's own auto-retry (`auto_retry_*`, E28) is not hidden: every attempt
+  ends with its own assistant `message_end`, a sample like any other.
 - `message_update` usage is cumulative and never a sample;
   `get_session_stats` is session-cumulative (E25, E52) and is not used.
 - **Cost.** The sum of `usage.cost.total` over the turn's samples, `scope:
@@ -522,6 +609,26 @@ cache reads, E24); `cached_input` = `cacheRead`; `output` = `output`;
   under OAuth it is not a billed amount (E24, E52). If any sample is
   all-`null`, the cost is `{usd: null, scope: turn, provenance: unavailable}`; a partial
   sum is never the turn's cost.
+- **One accounting rule.** The turn's tokens and cost are known only
+  when every message that could carry usage decoded with usable usage and
+  reached the normalizer. Any of these makes them unavailable:
+  - a call without usage: a null sample (all-zero usage), a compaction
+    without usage, a hidden retry;
+  - a sample still held for an acceptance that never came;
+  - a message Route could not decode (missing usage, a nonnumeric
+    counter, any malformed, oversize or unterminated record), which Route
+    and Wire note as `undecoded.bin` evidence;
+  - delivery loss: the stall bound, Route's `overflow`, or any decoded
+    message that never reached the normalizer, as the daemon force or a
+    cutoff leaves.
+
+  The turn's cost is then `unavailable` and its tokens `null`, with or
+  without a retained terminal: a retained terminal carries cost
+  `unavailable` and an all-`null` turn aggregate; without one, the turn's
+  end carries that aggregate itself (C2 `TurnEnd.aggregate`, §5), and
+  either supersedes the delivered samples. A phase violation among
+  decoded messages, or a stop whose delivered samples are complete, keeps
+  the summed accounting.
 - Cache warming adds model calls on eligible models (E61); the profile
   policy requires it off (§4.3).
 
@@ -580,11 +687,38 @@ in cwd, escaped descendants stopped, or network isolation by `--offline`.
    - `stop`/`length` keeps `Completed`; the cancel is not acknowledged.
 3. **The reply follows settlement (E54).** An abort admitted before
    `agent_settled` keeps the connection open: the driver retains the
-   terminal and keeps reading until the reply arrives or the stop order's
-   `force_at` (or the wall cleanup cutoff) passes. Only then does it close
-   stdin. With no reply, a marker terminal is not retained
-   (`terminal: None`) and S1's stop-order row applies (C1 §7.6
-   private-process row); other terminals are retained as usual.
+   terminal and keeps reading until the reply arrives or the active
+   cutoff passes: the stop order's `force_at`, else the Adapter's stall's
+   (C2 A1: the stall aborts as an internal stop order), else the wall,
+   never past the wall. Only then does it close stdin. With no reply, a
+   marker terminal is not retained (`terminal: None`) and the order that
+   sent the abort decides the turn: S1's stop-order row (C1 §7.6
+   private-process row) for a stop, `overflow` for the stall. One rule
+   decides this on every exit after `agent_settled`, the late path
+   (a settlement that waited for read-ahead room past the wall) included;
+   other terminals are retained as usual.
+   - **The cutoff is live until cleanup begins.** Each wait before
+     cleanup re-reads the current orders at every wake and takes the
+     earliest bound:
+     - the reply wait: a later, shorter order (a forced session close,
+       say) ends it at its own `force_at`;
+     - a marker waiting for read-ahead room: it ends at the same cutoff
+       rather than the wall, since it will not be retained;
+     - the driver's delivery of what Route already handed over: it ends
+       by the order's `close_by` as it stands or arrives, never past the
+       wall plus 3 s. What Core has not taken by then is lost: `overflow`
+       latches the session (C2 §2).
+
+     Once cleanup begins (Route sends Host's force close, or the late
+     path computes its bound), that bound is fixed at that moment: the
+     order's `close_by` as it stood then, else the cleanup allowance,
+     never past the wall plus 3 s. It bounds the close, the late path's
+     delivery and the drain alike. A later, shorter order does not
+     shorten a cleanup already running. The daemon force stops the group
+     at once through Host's early stop, but does not shorten the bound
+     either: a Store absence proof still pending, or the late path's
+     delivery, may still wait until that fixed bound before the turn
+     returns.
 4. Then S1's close, as Claude.
 
 **Wall cleanup step:** as Claude, a Host force close with no abort (C2
@@ -605,8 +739,10 @@ own group. Every bash tool runs in its own detached session and group (E31,
 source `bash.js`), so group absence proves nothing about tools, as with
 Claude's Bash (Claude §7). Pi kills tracked tool groups on abort, EOF,
 SIGTERM and SIGHUP (E31). Tools that escape (`setsid`, or any tool after a
-SIGKILL of Pi) are leftovers (C2 §4.2), found through the inherited marker
-(E32).
+SIGKILL of Pi) are leftovers (C2 §4.2), to be found through the inherited
+marker (E32). **Not implemented yet** (via-daz, shared with Claude): no
+leftover scan runs, so every Pi envelope carries `leftovers: null` and an
+escaped tool is not reported.
 
 **Recover:** unsupported, as Claude: `Unknown`, or `Dead` only with
 Host-confirmed death; no resend.
@@ -625,7 +761,10 @@ predicate.
 - **Bound.** One pass of runtime §5.2's non-signalling probe, within the
   turn's wall deadline. It signals nothing, waits for no vendor process,
   and acquires no vendor or session-file lock or writer; it waits only for
-  its Store replies and may commit an absence proof.
+  its Store replies and may commit an absence proof. A stop, the daemon
+  force or the session's cancellation ends the wait at once, launching
+  nothing: a stop has no failure, the force is `force_stop`. The wall
+  stays the check's own bound (a read that outlives it is `store`, below).
 - **Not proven** (the Store answered and a record is still without a
   proof: a group still present or busy, a probe denial or namespace
   mismatch, an identity-less record, a recovery record not yet re-held):
@@ -636,7 +775,14 @@ predicate.
   that fails or outlives the deadline, or a proof the pass observed but
   could not commit, is the check's `Err`, the turn's Store failure as for
   any Host journal failure, never `uncertain_predecessor`. Nothing is
-  launched.
+  launched. A failed, timed-out or late read is `store`, not committed,
+  whatever kind the Store gave (a dropped read reply reports
+  `UncertainCommit`). An absence proof the pass could not commit is
+  Host's journal failure: not committed, or uncertain only when the proof's
+  own commit outcome is uncertain. A wall spent before the final read is
+  `deadline`, including one reached during the re-probe pass (even by a
+  late page reply); only the final read's late reply is a Store failure
+  (runtime §5.2). Either way nothing launches.
 - **Several turns.** If turn A leaves a survivor, turn B refuses without
   launching, and turn C's check still finds A, because the predicate is A's
   group, not B's clean outcome. Once Host proves A's group absent, turns
@@ -660,23 +806,26 @@ hostile profiles only in scratch agent directories. Selection as Claude's:
 | Test | Decisive assertion |
 |---|---|
 | `pi_plan_pure` | `describe` starts nothing; unchecked or unreadable version → `untested` with the warning; steer refused by name; `max_steps`, `output_schema`, limited bounds, `network:false`, nonempty `extra_write_dirs`, a prompt over 524,288 or instructions over 262,144 JSON-encoded bytes are refused before receipt |
-| `pi_version_read` | The Pi package's `version` from `package.json` through a symlinked entry and the `dist` rule, reported even when Pi exits before the handshake; a missing, oversize, non-object or non-string file → `null`/`untested`, the turn proceeds; no process starts |
-| `pi_profile_policy` | Accepted: the allowed set, with and without Pi-created files (E59). Refused by name, no launch and no value in the message: `shellCommandPrefix`, `SYSTEM.md`, `APPEND_SYSTEM.md`, `models.json`, `defaultThinkingLevel`, an unknown key, missing or non-`off` `cacheWarming`, a malformed value, a symlink, wrong owner, a group-writable entry, `auth.json` with group bits, an oversize file, 65 entries. `pi-profile.json` holds no `deviceId` or credential bytes; refusals are not cached |
+| `pi_version_read` | The Pi package's `version` from `package.json` through a symlinked entry and the `dist` rule, reported even when Pi exits before the handshake; a missing, oversize, non-object or non-string file → `null`/`untested`, the turn proceeds; no process starts. `pi_version_survives_a_state_failure`: a launch-state failure after the read (a failed write, `store`; a session directory that is not one, `handshake_refused`) still reports the version |
+| `pi_stage_outlived_by_its_task` | A turn ends at its wall while its staging task is held before the instructions sync; the next turn's launch-state write waits for that task, then launches and completes (unserialized, it failed `store`) |
+| `pi_profile_policy` | Accepted: the allowed set, with and without Pi-created files (E59). Refused by name, no launch and no value in the message: `shellCommandPrefix`, `SYSTEM.md`, `APPEND_SYSTEM.md`, `models.json`, `defaultThinkingLevel`, an unknown key, missing or non-`off` `cacheWarming`, a malformed value, a symlink, wrong owner, a group-writable entry, `auth.json` with group bits, an oversize file, 65 entries, and a 0755 agent, `pi` or `vendor` directory (§4.4, named, left 0755). `pi-profile.json` holds no `deviceId` or credential bytes and records the check the launch passed, even when the profile changes while the turn executes (`pi_profile_record_is_pre_launch`); refusals are not cached. `pi_records_blocked`: the records' write held while delivery after the wall uses most of the allowance → the turn returns by the wall plus 3 s, the profile record skipped and named in `pi-records-skipped.json`. `pi_records_close`: a graceful close with a 500 ms deadline while the records' write is held ends the wait by its deadline, not the allowance. The writer's bound is set before it starts: an expired cutoff or a daemon force already raised skips every record (unit test `the_writer_skips_records_past_the_cutoff`) |
 | `pi_uncertain_predecessor` | A leaves an unproven group; B is refused `uncertain_predecessor` without launching; C is refused too; A proven absent, D launches. The same with A busy, and across a restart with A's record not yet re-held. No resend |
+| `pi_predecessor_check_stopped`, `pi_predecessor_check_forced` | R1's Store read held past the wall; a cancel, then the daemon force, 1 s in ends the turn unlaunched at once (no failure; `force_stop`), not `store` at the wall |
 | `pi_identity_continuation` | `--session-id` until confirmed; confirmation only with `started`; a rejected turn 1 (no file) lets turn 2 create; a lost `started` reply keeps `--session-id`; once confirmed, `--session`; a missing file then exits before RPC → `Rejected{Protocol}`, never a fresh session; derived ID stable across eviction and restart |
-| `pi_handshake_checks` | Wrong `sessionId` → `resume_mismatch` with no prompt line; model not in the catalog or a clamped requested effort → `InvalidParam` with no prompt; omitted effort skips the check; a non-skill command → refusal, cached; exit before the replies → `Rejected{Protocol}` with stderr unread |
-| `pi_protocol_typed` | Wrong `command` for a known `id`, a duplicate reply, missing required fields, an assistant `message_end` without `content` or `usage` or with a non-numeric usage member (all-zero usage stays `null`, not protocol), a lifecycle or message record before `started`, `agent_settled` without an assistant terminal, a second `agent_settled`, `handled`/`queued`: all protocol, no acceptance or resend |
-| `pi_acceptance` | Only `started` accepts; `success:false` → `Rejected{VendorError}` with VIA-owned text and no code; lost reply → unknown submission; a pre-acceptance compaction sample arrives after `turn.accepted` |
+| `pi_handshake_checks` | Wrong `sessionId` → `resume_mismatch` with no prompt line; model not in the catalog or a clamped requested effort → `InvalidParam` with no prompt, the clamp then cached so `plan` and `check_turn` refuse the same model and effort; omitted effort skips the check; a non-skill command → refusal, cached; exit before the replies → `Rejected{Protocol}` with stderr unread |
+| `pi_protocol_typed` | Wrong `command` for a known `id`, a duplicate reply, missing required fields (`get_state` without `sessionFile` among them), an assistant `message_end` without `content` or `usage` or with a non-numeric usage member (all-zero usage stays `null`, not protocol), a lifecycle or message record before `started`, `agent_settled` without an assistant terminal, a second `agent_settled`, `handled`/`queued`: all protocol, no acceptance or resend |
+| `pi_acceptance` | Only `started` accepts; `success:false` → `Rejected{VendorError}` with VIA-owned text and no code; lost reply → unknown submission; a pre-acceptance compaction sample arrives after `turn.accepted`, up to 64 of them (`pi_acceptance_held_bound`; `pi_protocol_typed`: 65 is protocol) |
 | `pi_settled_not_agent_end` | Auto-retry with several `agent_end` records gives one terminal at `agent_settled`; stdin stays open until then |
 | `pi_terminal_mapping` | Every §5.3 row; only the terminal message is final text; the system message never reaches final text, progress or the envelope |
 | `pi_progress_deltas` | One text block streaming longer than `idle_ms` keeps the turn alive; usage snapshots never become samples; idle expiry waits for the decode fence |
-| `pi_usage_accounting` | Mixed present and all-zero samples → `null` token components and `unavailable` cost; cache and reasoning counters map as §5.5; compaction with and without usage |
-| `pi_abort` | Tool-phase and streaming markers with the paired reply acknowledge; the idle reply alone never does; a 401 racing the abort → `failed(auth)`, `requested`; natural completion keeps `Completed`; a reply after `agent_settled` is awaited; no reply by `force_at` → no acknowledgement |
+| `pi_usage_accounting` | Mixed present and all-zero samples → `null` token components and `unavailable` cost; cache and reasoning counters map as §5.5; compaction with and without usage; a compaction after `summarization_retry_scheduled` → `null` tokens and `unavailable` cost |
+| `pi_accounting_after_loss` | Delivery lost between two priced calls (Core holds past the stall bound): `overflow` with the retained terminal, cost `unavailable`, `null` tokens, never the delivered $0.50. `pi_accounting_after_forced_loss`: the daemon force cuts delivery after one priced sample, the terminal retained → cost `unavailable`, `null` tokens. `pi_accounting_overflow_without_terminal`: overflow before settlement → no terminal, `null` tokens. `pi_accounting_malformed_usage`: a priced call, then a `message_end` with no usage or a nonnumeric counter → `protocol`, `null` tokens |
+| `pi_abort` | Tool-phase and streaming markers with the paired reply acknowledge; the idle reply alone never does; a 401 racing the abort → `failed(auth)`, `requested`; natural completion keeps `Completed`; a reply after `agent_settled` is awaited; no reply by `force_at` → no acknowledgement. `pi_abort_unanswered_late`: no reply while settlement waits for read-ahead room past the wall (late path) → no terminal, the cancel's row. `pi_abort_unanswered_stall`: the stall's abort unanswered → the wait ends at the stall's `force_at`, not the wall: `overflow`, no terminal. `pi_abort_unanswered_shortened`: a 60 s cancel grace, then a forced close with a 1 s deadline → the reply wait ends at the shorter order. `pi_abort_unanswered_held`: wall 5 s, `force_at` 1 s, `close_by` 4 s, delivery held → the turn returns by `close_by`, not about 8 s |
 | `pi_eof_is_stop` | EOF mid-run: exit 0, no terminal, never `Completed` |
-| `pi_signals_cleanup` | Force close via TERM kills tool groups; a `setsid` escapee is a leftover; SIGINT is never sent; a spinning startup is bounded by deadlines and KILL |
+| `pi_signals_cleanup` | Force close via TERM kills tool groups; a `setsid` escapee survives and is not reported (`leftovers: null`; no leftover scan until via-daz); SIGINT is never sent; a spinning startup is bounded by deadlines and KILL |
 | `pi_dialog_decline` | A `-e` test extension's `confirm` and an unknown method with an `id` are cancelled within 5 s while observations are saturated; a dialog without an `id` fails closed |
 | `pi_inventory_patch` | Add, change and remove the last instruction file (`null` → `none`); unchanged resume → `not_reported`; tag-like file contents → `unparsed`; contents never stored |
-| `pi_detail_redaction` | A fixture 401 body with a key-like fragment never reaches `detail`, `vendor_code`, `failure.message`, warnings or evidence notes; an unsafe `code` is dropped; the transcript hint names the session file |
+| `pi_detail_redaction` | A fixture 401 body with a key-like fragment never reaches `detail`, `vendor_code`, `failure.message`, warnings, observations or VIA's own `pi-profile.json`/`pi-inventory.json` (vendor bytes elsewhere in the evidence folder, such as `undecoded.bin`, are not checked); an unsafe `code` is dropped; the transcript hint names the session file |
 | `pi_record_ceiling` | A prompt at the admitted maximum, all control characters, runs to completion; a fixture record over 1 MiB fails `overflow`, never a short result |
 
 ## 9. Live qualification (L-list)

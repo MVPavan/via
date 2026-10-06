@@ -1860,6 +1860,7 @@ impl Engine {
             leftovers: _,
             outcome,
             loss,
+            aggregate,
         } = end;
         // C1 §5 (x.3.2 X5): a turn whose run lost observations of its
         // shared-server thread says so on its envelope, whichever C1 §7.6
@@ -1877,6 +1878,10 @@ impl Engine {
             (instance.vendor_version, tested)
         });
         record.vendor.retained = terminal.as_ref().map(Retained::of);
+        // C2 §5 (bead via-i5g): a turn ending with no terminal may still
+        // carry the turn's aggregate (an all-null one after delivery
+        // loss), which supersedes its call samples as a terminal's would.
+        record.vendor.aggregate = aggregate.filter(|_| terminal.is_none());
         match outcome {
             Err(AdapterError::Route(route))
                 if matches!(route.cause, RouteError::ForceStopped { .. }) =>
@@ -3241,6 +3246,13 @@ fn expired(lane: Option<&Lane>, observation: &Observation) {
     if let Some(lane) = lane {
         lane.steer_dropped(observation);
     }
+}
+
+/// Test builds only (`test-support`): Core's meaningful-progress rule
+/// ([`progress`]), for the conformance runner's idle deadline.
+#[cfg(feature = "test-support")]
+pub fn idle_progress(observation: &Observation) -> bool {
+    progress(observation)
 }
 
 /// Meaningful progress resets the idle deadline (Task 4 design §2.6):

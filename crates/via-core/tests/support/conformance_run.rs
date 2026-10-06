@@ -108,6 +108,8 @@ pub(crate) struct Knobs {
     pub(crate) hold_for: Option<Duration>,
     /// A cancel is ordered this long after the turn starts.
     pub(crate) stop_after: Option<Duration>,
+    /// [`Knobs::stop_after`] sets the daemon force instead of a cancel.
+    pub(crate) force_not_stop: bool,
     /// Each session's health is read once it left `open` (within
     /// [`FIXTURE_WAIT`]): a failure an idle driver latches after its last
     /// turn settled (x.3.2 X0 item 13.2).
@@ -162,7 +164,23 @@ pub(crate) struct Knobs {
     /// at or after the wall), then the gate is signalled. It replaces the
     /// stated stop's action.
     pub(crate) order_after_wall: Option<&'static str>,
+    /// `(admitted, point)`: before the turn at index `admitted` starts,
+    /// failpoint `point`'s first occurrence is released, and the case
+    /// waits [`RELEASE_SETTLE`] (a paused anchor's cleanup runs meanwhile).
+    pub(crate) release_before: Option<(usize, &'static str)>,
+    /// `(before, change)`: `change` runs on the case's state directory
+    /// before the turn at index `before` starts (a profile fixed between
+    /// turns); with `before` `None`, at each gate, after its fences are
+    /// sampled and before the fake is signalled (a profile changed while
+    /// the turn executes).
+    pub(crate) change: Option<(Option<u32>, Change)>,
 }
+
+/// A test's change to the case's state directory, given its path.
+pub(crate) type Change = fn(&Path) -> std::io::Result<()>;
+
+/// How long [`Knobs::release_before`] waits after the release.
+const RELEASE_SETTLE: Duration = Duration::from_secs(2);
 
 /// The failpoint at an accepted Codex turn's wait, before it polls its
 /// orders.
@@ -534,7 +552,28 @@ impl<'a> Run<'a> {
         if self.knobs.admit_after_failure == Some(index) {
             self.health_failed(turn).await?;
         }
+        if let Some((at, point)) = self.knobs.release_before
+            && at == index
+        {
+            drop(Release(point));
+            tokio::time::sleep(RELEASE_SETTLE).await;
+        }
+        if let Some((Some(at), change)) = self.knobs.change
+            && usize::try_from(at).is_ok_and(|at| at == index)
+        {
+            change(self.pure.state.path()).map_err(|e| format!("turn {index}: change: {e}"))?;
+        }
         Ok(())
+    }
+
+    /// [`Knobs::change`] at gate `step`, when it runs at gates.
+    fn change_at_gate(&self, step: u64) -> Result<(), String> {
+        match self.knobs.change {
+            Some((None, change)) => {
+                change(self.pure.state.path()).map_err(|e| format!("gate {step}: change: {e}"))
+            }
+            Some((Some(_), _)) | None => Ok(()),
+        }
     }
 
     /// Resolves once the health of the session of `turn` failed, within
@@ -735,6 +774,10 @@ impl<'a> Run<'a> {
 
     /// Runs one planned turn beside its side actions and collects its
     /// outcome.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one turn's drive: its drain with Core's idle deadline, side actions and outcome"
+    )]
     async fn run_turn(
         &self,
         index: usize,
@@ -777,14 +820,16 @@ impl<'a> Run<'a> {
             let waiting = self.consumer_hold();
             tokio::pin!(waiting);
             let mut released = None;
+            let mut idle = Idle::new(now, idle_budget(turn), &activity);
             let end = {
                 let running = session.driver.run_turn(spec, cx);
                 tokio::pin!(running);
                 loop {
+                    let taking = released.is_some() && !self.knobs.stall_consumer;
                     tokio::select! {
                         result = &mut waiting, if released.is_none() => released = Some(result),
-                        Some(admitted) = receiver.recv(),
-                            if released.is_some() && !self.knobs.stall_consumer => {
+                        Some(admitted) = receiver.recv(), if taking => {
+                            idle.note(&admitted.item);
                             tools.borrow_mut().track(&admitted.item);
                             self.observe(&admitted.item, (session, index), seen, &observed);
                             if self.knobs.abandon_on_accept == Some(index)
@@ -793,10 +838,22 @@ impl<'a> Run<'a> {
                                 break None;
                             }
                         }
+                        () = idle.fired(), if taking => {}
                         end = &mut running => {
                             settled.set(Some(tokio::time::Instant::now()));
                             break Some(end);
                         }
+                    }
+                    // Core's idle decision behind its decode fence: the
+                    // items queued then are handled first; a deadline they
+                    // moved stands.
+                    if taking && idle.reconciled(&stop) {
+                        while let Ok(admitted) = receiver.try_recv() {
+                            idle.note(&admitted.item);
+                            tools.borrow_mut().track(&admitted.item);
+                            self.observe(&admitted.item, (session, index), seen, &observed);
+                        }
+                        idle.expire(&stop);
                     }
                 }
             };
@@ -830,6 +887,7 @@ impl<'a> Run<'a> {
         outcome.steer = steer;
         outcome.gates = gates?;
         outcome.stop_facts = stop_facts(turn, &end);
+        outcome.returned = settled.get().map(|at| at - now);
         // Only a stopped turn on a server route settles its cleanup apart
         // from its end (C1 P7); elsewhere the field is null.
         if session.plan.server_key.is_some() && !turn["stop"].is_null() {
@@ -883,8 +941,8 @@ impl<'a> Run<'a> {
     }
 
     /// Sets the daemon force at [`Knobs::force_on`]'s progress line, and
-    /// orders a cancel at [`Knobs::stop_after`], unless the turn ended
-    /// first.
+    /// orders a cancel (or the force) at [`Knobs::stop_after`], unless the
+    /// turn ended first.
     async fn timed(
         &self,
         force: &watch::Sender<Option<tokio::time::Instant>>,
@@ -902,6 +960,10 @@ impl<'a> Run<'a> {
             if let Some(after) = self.knobs.stop_after {
                 tokio::time::sleep(after).await;
                 let now = tokio::time::Instant::now();
+                if self.knobs.force_not_stop {
+                    force.send_replace(Some(now));
+                    return;
+                }
                 stop.send_replace(Some(StopOrder {
                     cause: StopCause::Cancel,
                     requested_at: "2026-01-01T00:00:00.000Z".to_owned(),
@@ -1041,7 +1103,8 @@ impl<'a> Run<'a> {
                 let ids = &mut ordinals.0;
                 let generation = ordinal(ids, &identity.connection_id);
                 json!({"kind": "session.vendor_identity_confirmed",
-                    "vendor_session_id": identity.vendor_session_id, "generation": generation})
+                    "vendor_session_id": identity.vendor_session_id, "generation": generation,
+                    "transcript": identity.transcript.as_ref().map(|path| path.display().to_string())})
             }
             Observation::Accepted(acceptance) => {
                 let tokens = &mut ordinals.1;
@@ -1083,6 +1146,39 @@ impl<'a> Run<'a> {
         }
     }
 
+    /// A stated cancel (`interrupt`) ordered at `now`, its `force_at`
+    /// `grace_ms` later (else [`STOP_FORCE`]); the wall is the turn's own.
+    /// A `force_close` then closes the session by force, shortening it.
+    async fn cancel(
+        &self,
+        order: &Value,
+        now: tokio::time::Instant,
+        (session, stop_order): (&Session, &watch::Sender<Option<StopOrder>>),
+    ) {
+        let grace = order["grace_ms"]
+            .as_u64()
+            .map_or(STOP_FORCE, Duration::from_millis);
+        let stop = |now| StopOrder {
+            cause: StopCause::Cancel,
+            requested_at: "2026-01-01T00:00:00.000Z".to_owned(),
+            attached: now,
+            force_at: Deadline::at(now + grace),
+            close_by: Deadline::at(now + grace + CLOSE_BY),
+        };
+        stop_order.send_replace(Some(stop(now)));
+        if self.knobs.repeat_stop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            stop_order.send_replace(Some(stop(tokio::time::Instant::now())));
+        }
+        if let Some(close) = order.get("force_close").filter(|close| !close.is_null()) {
+            let after = close["after_ms"].as_u64().unwrap_or_default();
+            tokio::time::sleep(Duration::from_millis(after)).await;
+            let ms = close["deadline_ms"].as_u64().unwrap_or(1);
+            let deadline = Deadline::at(tokio::time::Instant::now() + Duration::from_millis(ms));
+            let _report = session.driver.close(CloseMode::Force, deadline).await;
+        }
+    }
+
     /// The turn's `stop`, `steer` attempts and `gates`, each at its event;
     /// one whose event never comes before the turn ended does nothing (a
     /// steer's result is then `never_attempted`; a gate takes no snapshot).
@@ -1118,7 +1214,10 @@ impl<'a> Run<'a> {
                 return Ok(());
             };
             let after = order["after"].as_str().unwrap_or_default().to_owned();
-            if !at_event(after.clone()).await {
+            if let Some(at_ms) = order["at_ms"].as_u64() {
+                let start = wall.checked_sub(bounds(turn).0).unwrap_or(wall);
+                tokio::time::sleep_until(start + Duration::from_millis(at_ms)).await;
+            } else if !at_event(after.clone()).await {
                 return Ok(());
             }
             let now = tokio::time::Instant::now();
@@ -1126,22 +1225,13 @@ impl<'a> Run<'a> {
                 return before_wall(now, wall, &after);
             }
             if order["kind"].as_str() == Some("close") {
-                let deadline = Deadline::at(now + CLOSE_DEADLINE);
+                let within = order["deadline_ms"]
+                    .as_u64()
+                    .map_or(CLOSE_DEADLINE, Duration::from_millis);
+                let deadline = Deadline::at(now + within);
                 let _report = session.driver.close(CloseMode::Graceful, deadline).await;
             } else {
-                // A cancel (`interrupt`); the wall is the turn's own.
-                let order = |now| StopOrder {
-                    cause: StopCause::Cancel,
-                    requested_at: "2026-01-01T00:00:00.000Z".to_owned(),
-                    attached: now,
-                    force_at: Deadline::at(now + STOP_FORCE),
-                    close_by: Deadline::at(now + STOP_FORCE + CLOSE_BY),
-                };
-                stop_order.send_replace(Some(order(now)));
-                if self.knobs.repeat_stop {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    stop_order.send_replace(Some(order(tokio::time::Instant::now())));
-                }
+                self.cancel(order, now, (session, stop_order)).await;
             }
             Ok(())
         };
@@ -1187,6 +1277,7 @@ impl<'a> Run<'a> {
                 let sample = (activity.decoded(), activity.delivered());
                 self.pure.gate_fences.borrow_mut().push(sample);
                 snapshots.push(snapshot(&observed.borrow(), &session.plan));
+                self.change_at_gate(step)?;
                 self.signal(launch)?;
                 self.until_progress(&format!("signalled {step} launch {launch}"))
                     .await?;
@@ -1336,16 +1427,19 @@ impl<'a> Run<'a> {
         let mut outcome = snapshot(observed, &session.plan);
         outcome.rejected = rejected;
         outcome.error = error;
+        outcome.message = end.outcome.as_ref().err().map(ToString::to_string);
         if let Err(AdapterError::Route(failure)) = &end.outcome {
             outcome.undecoded.clone_from(&failure.undecoded);
             outcome.route_cleanup = failure.cleanup.map(|cleanup| format!("{cleanup:?}"));
         }
         outcome.terminal = end.terminal.as_ref().map(terminal);
+        // As Core: the terminal's aggregate, else the end's own (C2 §5).
         outcome.usage = outcome_usage(
             observed,
             end.terminal
                 .as_ref()
-                .and_then(|terminal| terminal.usage.as_ref()),
+                .and_then(|terminal| terminal.usage.as_ref())
+                .or(end.aggregate.as_ref().filter(|_| end.terminal.is_none())),
             &session.plan.capabilities.usage.tokens,
         );
         outcome.cleanup = Some(cleanup.to_owned());
@@ -1615,6 +1709,97 @@ fn shutdown_problem(report: &AdapterShutdown, panicked: usize) -> Option<String>
             report.pending_tasks, report.failed_tasks, report.uncertain_anchors, report.failure
         )
     })
+}
+
+/// C1 §4 `deadlines.idle_ms` default.
+const IDLE: Duration = Duration::from_secs(600);
+
+/// A turn's idle budget: its own, else C1's default.
+fn idle_budget(turn: &Value) -> Duration {
+    turn["deadlines"]["idle_ms"]
+        .as_u64()
+        .map_or(IDLE, Duration::from_millis)
+}
+
+/// The turn's idle deadline as Core keeps it (Task 4 design §§2.6, 5;
+/// runtime §8; review r1 #5): Core's own progress rule moves it to an
+/// item's decode stamp plus the budget; when it fires, the decision waits
+/// for the Adapter to deliver everything Route had read by then, and the
+/// items queued then are handled first. Still passed, it orders the stop
+/// Core's idle expiry orders. Any other order disarms it.
+struct Idle {
+    at: Option<tokio::time::Instant>,
+    budget: Duration,
+    activity: TurnActivity,
+    delivered: watch::Receiver<u64>,
+    /// The decode watermark when the deadline fired.
+    fence: Option<u64>,
+}
+
+impl Idle {
+    fn new(origin: tokio::time::Instant, budget: Duration, activity: &TurnActivity) -> Self {
+        Self {
+            at: Some(origin + budget),
+            budget,
+            activity: activity.clone(),
+            delivered: activity.watch_delivered(),
+            fence: None,
+        }
+    }
+
+    /// Core's `note_progress`: progress decoded before the deadline moves
+    /// it.
+    fn note(&mut self, item: &ObservationItem) {
+        if let Some(at) = self.at.as_mut()
+            && item.at < *at
+            && via_core::idle_progress(&item.observation)
+        {
+            *at = (*at).max(item.at + self.budget);
+        }
+    }
+
+    /// Resolves when the deadline fires (fencing it at the watermark then),
+    /// or, once fenced, when delivery advances.
+    async fn fired(&mut self) {
+        if self.fence.is_some() {
+            let _ = self.delivered.changed().await;
+            return;
+        }
+        match self.at {
+            Some(at) => {
+                tokio::time::sleep_until(at).await;
+                self.fence = Some(self.activity.decoded());
+            }
+            None => std::future::pending().await,
+        }
+    }
+
+    /// Whether a fired deadline's fence is met; an order disarms it.
+    fn reconciled(&mut self, stop: &watch::Sender<Option<StopOrder>>) -> bool {
+        if stop.borrow().is_some() {
+            self.at = None;
+            self.fence = None;
+            return false;
+        }
+        self.fence
+            .is_some_and(|watermark| self.activity.delivered() >= watermark)
+    }
+
+    /// After the queued items: a deadline still passed orders the stop.
+    fn expire(&mut self, stop: &watch::Sender<Option<StopOrder>>) {
+        self.fence = None;
+        let now = tokio::time::Instant::now();
+        if self.at.is_some_and(|at| at <= now) {
+            self.at = None;
+            stop.send_replace(Some(StopOrder {
+                cause: StopCause::IdleDeadline,
+                requested_at: "2026-01-01T00:00:00.000Z".to_owned(),
+                attached: now,
+                force_at: Deadline::at(now + STOP_FORCE),
+                close_by: Deadline::at(now + STOP_FORCE + CLOSE_BY),
+            }));
+        }
+    }
 }
 
 /// A turn's wall and tool grace: its own, else the defaults.

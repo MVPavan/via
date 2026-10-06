@@ -336,7 +336,10 @@ fn apply(
     }
     if let Some(aggregate) = &retained.usage {
         let figure = UsageLedger::default().figure(Some(aggregate));
-        let unverified = figure.as_ref().is_some_and(|(_, interval)| *interval);
+        // Unavailable usage covers no interval (picrit round 4).
+        let unverified = figure
+            .as_ref()
+            .is_some_and(|(tokens, interval)| *interval && !tokens.unavailable());
         let usage = Usage::reported(
             figure.map(|(tokens, _)| tokens),
             unverified,

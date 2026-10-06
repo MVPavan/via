@@ -18,6 +18,7 @@ use crate::fake::FakeAdapter;
 use crate::observation::{
     AdapterError, ObservationSink, SteerDelivery, SteerToken, TurnEnd, TurnEvidence,
 };
+use crate::pi::PiAdapter;
 use crate::plan::{Bound, InheritPlan, VendorOptions};
 use crate::{
     CapacityToken, Cleanup, Deadline, DriverFailure, DriverHealth, SessionId, StopCause, StopOrder,
@@ -435,6 +436,8 @@ pub(crate) enum DriverKind {
     Claude(Arc<ClaudeAdapter>),
     /// Codex: turns on a shared `codex app-server` the session leases.
     Codex(Arc<CodexSession>),
+    /// Pi: one private `pi --mode rpc` process per turn.
+    Pi(Arc<PiAdapter>),
 }
 
 impl DriverKind {
@@ -442,7 +445,7 @@ impl DriverKind {
     fn persistent(&self) -> bool {
         match self {
             Self::Fake(fake) => fake.profile().persistent,
-            Self::Claude(_) | Self::Codex(_) => false,
+            Self::Claude(_) | Self::Codex(_) | Self::Pi(_) => false,
         }
     }
 
@@ -452,6 +455,7 @@ impl DriverKind {
             Self::Fake(fake) => fake.profile().adapter_version.clone(),
             Self::Claude(_) => crate::claude::adapter_version(),
             Self::Codex(_) => crate::codex::adapter_version(),
+            Self::Pi(_) => crate::pi::adapter_version(),
         }
     }
 
@@ -460,7 +464,7 @@ impl DriverKind {
     fn steer(&self) -> Option<&Support> {
         match self {
             Self::Fake(fake) => Some(&fake.profile().capabilities.verbs.steer),
-            Self::Claude(_) | Self::Codex(_) => None,
+            Self::Claude(_) | Self::Codex(_) | Self::Pi(_) => None,
         }
     }
 
@@ -472,7 +476,7 @@ impl DriverKind {
                 .profile()
                 .steer_refusal
                 .map(|refusal| refusal.error(delivery)),
-            Self::Claude(_) | Self::Codex(_) => None,
+            Self::Claude(_) | Self::Codex(_) | Self::Pi(_) => None,
         }
     }
 
@@ -482,6 +486,7 @@ impl DriverKind {
             Self::Fake(_) => crate::fake::connection_id(generation),
             Self::Claude(_) => crate::claude::connection_id(generation),
             Self::Codex(_) => crate::codex::connection_id(generation),
+            Self::Pi(_) => crate::pi::connection_id(generation),
         }
     }
 }
@@ -524,7 +529,9 @@ impl SessionDriver {
             #[cfg(feature = "test-failpoints")]
             retirement_fault: match &kind {
                 Some(DriverKind::Fake(fake)) => fake.retirement_fault.clone(),
-                Some(DriverKind::Claude(_) | DriverKind::Codex(_)) | None => None,
+                Some(DriverKind::Claude(_) | DriverKind::Codex(_) | DriverKind::Pi(_)) | None => {
+                    None
+                }
             },
             ..DriverState::default()
         };
@@ -646,7 +653,7 @@ impl SessionDriver {
         }
         match &self.kind {
             Some(DriverKind::Codex(codex)) => Some(codex.readiness()),
-            Some(DriverKind::Fake(_) | DriverKind::Claude(_)) | None => None,
+            Some(DriverKind::Fake(_) | DriverKind::Claude(_) | DriverKind::Pi(_)) | None => None,
         }
     }
 
@@ -663,7 +670,9 @@ impl SessionDriver {
         }
         match &self.kind {
             Some(DriverKind::Codex(_)) => ConnectionKind::Shared,
-            Some(DriverKind::Fake(_) | DriverKind::Claude(_)) | None => ConnectionKind::PerTurn,
+            Some(DriverKind::Fake(_) | DriverKind::Claude(_) | DriverKind::Pi(_)) | None => {
+                ConnectionKind::PerTurn
+            }
         }
     }
 
@@ -681,6 +690,10 @@ impl SessionDriver {
             Some(DriverKind::Codex(codex)) => {
                 let codex = Arc::clone(codex);
                 crate::codex::run_turn(self, &codex, spec, cx).await
+            }
+            Some(DriverKind::Pi(pi)) => {
+                let pi = Arc::clone(pi);
+                crate::pi::run_turn(self, &pi, spec, cx).await
             }
             None => rejected(AdapterError::Unavailable),
         }
@@ -895,7 +908,7 @@ impl SessionDriver {
         let cancel = self.cancel.clone();
         let codex = match &self.kind {
             Some(DriverKind::Codex(codex)) => Some(Arc::clone(codex)),
-            Some(DriverKind::Fake(_) | DriverKind::Claude(_)) | None => None,
+            Some(DriverKind::Fake(_) | DriverKind::Claude(_) | DriverKind::Pi(_)) | None => None,
         };
         async move {
             // The session closes and the stop order is posted together.
@@ -1027,6 +1040,7 @@ fn session_gone() -> AdapterError {
 pub(crate) fn rejected(error: AdapterError) -> TurnEnd {
     TurnEnd {
         loss: None,
+        aggregate: None,
         terminal: None,
         instance: None,
         leftovers: None,

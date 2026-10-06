@@ -87,12 +87,19 @@ pub enum RouteError {
         /// Affected turn.
         turn: TurnNumber,
     },
-    /// The handshake lacked a feature VIA relies on; the start was not
-    /// written (AD7 `handshake_refused`).
-    #[error("handshake refused in turn {turn}")]
+    /// The handshake lacked a feature VIA relies on, or a route's own
+    /// pre-launch check refused the instance's configuration (Pi's profile
+    /// policy); the start was not written (AD7 `handshake_refused`).
+    #[error(
+        "handshake refused in turn {turn}{}",
+        .detail.as_deref().map_or_else(String::new, |detail| format!(": {detail}"))
+    )]
     HandshakeRefused {
         /// Affected turn.
         turn: TurnNumber,
+        /// VIA-owned text naming what was refused (a rule and an entry or
+        /// key), never a vendor value; `None` where the cause is generic.
+        detail: Option<String>,
     },
     /// The catalog the instance reported at its handshake lacks the turn's
     /// value; the start was not written (AD18 `invalid_params`).
@@ -233,6 +240,7 @@ pub mod claude;
 pub mod codex;
 mod fake;
 pub mod opencode;
+pub mod pi;
 mod private;
 mod runtime;
 pub mod steer;
@@ -252,6 +260,8 @@ pub use via_wire::StoreError;
 /// Test builds only: the failpoint controller, for the layers above.
 #[cfg(feature = "test-failpoints")]
 pub use via_wire::failpoint;
+/// Runtime §8's JSON structure limits, for a route's own bounded reads.
+pub use via_wire::json_limits;
 pub use via_wire::{
     CapacityToken, EnvAllowList, PrivateProcessSpec, ProcessOwner, ReprobeReport, RuntimeConfig,
     RuntimeResources, SessionId, StderrCapture, VersionProbe, WireCleanup, WireError, WireRecovery,

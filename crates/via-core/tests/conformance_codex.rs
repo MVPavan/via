@@ -1739,7 +1739,8 @@ fn codex_pin_handshake() {
 fn failed_after_acceptance(expect: &mut Value, error: &str, cleanup: &str) {
     let turn = &mut turn_mut(expect, 0)["expect"];
     turn["terminal"] = Value::Null;
-    turn["usage"] = Value::Null;
+    // No terminal: the delivered sum is unverified (C2 §5, picrit round 4).
+    turn["usage"] = unavailable();
     turn["final_text"] = Value::Null;
     turn["error"] = json!(error);
     turn["cleanup"] = json!(cleanup);
@@ -1941,8 +1942,10 @@ fn codex_start_order() {
     // The generation fails: the turn's cleanup is never its surviving
     // tools' (x.3.2 X3 §4.3, C2).
     failed_after_acceptance(&mut expect, "protocol", "uncertain");
-    // What the turn delivered before the malformed message stays.
-    turn_mut(&mut expect, 0)["expect"]["usage"] = base["usage"].clone();
+    // What the turn delivered before the malformed message stays, but its
+    // tokens are unavailable: an undecodable message may carry usage
+    // (C2 §5).
+    turn_mut(&mut expect, 0)["expect"]["usage"] = unavailable();
     turn_mut(&mut expect, 0)["expect"]["final_text"] = base["final_text"].clone();
     turn_mut(&mut expect, 0)["expect"]["observations_include"] = json!([
         {"kind": "turn.accepted", "vendor_turn_id": TURN}, "final_text",
@@ -1966,6 +1969,8 @@ fn codex_start_order() {
     cut_after(&mut replay, completed, &[sigterm()]).unwrap();
     let mut expect = malformed;
     expect["source"] = replay["source"].clone();
+    // The connection failed before the terminal: the delivered sum is
+    // unverified (C2 §5, picrit round 4), as for the malformed variant.
     // A connection-wide failure keeps its Route path: the stopped server
     // proves the turn's cleanup.
     turn_mut(&mut expect, 0)["expect"]["cleanup"] = json!("quiescent");
@@ -2288,7 +2293,8 @@ fn codex_malformed_evidence_owner() {
         .unwrap();
         let turn = &mut turn_mut(&mut expect, 1)["expect"];
         turn["terminal"] = Value::Null;
-        turn["usage"] = Value::Null;
+        // No terminal: the delivered sum is unverified (C2 §5).
+        turn["usage"] = unavailable();
         turn["final_text"] = Value::Null;
         turn["error"] = json!("protocol");
         // The generation fails: the turn's cleanup is never its surviving
@@ -2863,7 +2869,8 @@ fn codex_suppression_exhaustion_fails_the_generation() {
         json!({"turn.accepted": 1, "action.denied": first});
     let turn = &mut turn_mut(&mut expect, 1)["expect"];
     turn["terminal"] = Value::Null;
-    turn["usage"] = Value::Null;
+    // The overflow can have dropped a call sample (C2 §5).
+    turn["usage"] = unavailable();
     turn["final_text"] = Value::Null;
     turn["error"] = json!("overflow");
     turn["cleanup"] = json!("uncertain");
@@ -2965,7 +2972,8 @@ fn codex_open_tools_survive_their_turn() {
     cut_after(&mut replay, second + paced, &[sigterm()]).unwrap();
     let turn = &mut turn_mut(&mut expect, 1)["expect"];
     turn["terminal"] = Value::Null;
-    turn["usage"] = Value::Null;
+    // The overflow can have dropped a call sample (C2 §5).
+    turn["usage"] = unavailable();
     turn["final_text"] = Value::Null;
     turn["error"] = json!("overflow");
     turn["cleanup"] = json!("uncertain");
@@ -3177,7 +3185,9 @@ fn codex_exhaustion_fails_the_shared_connection() {
         turn["stop"] = Value::Null;
         let turn = &mut turn["expect"];
         turn["terminal"] = Value::Null;
-        turn["usage"] = Value::Null;
+        // A's overflow can have dropped a call sample, and B lost its
+        // connection before its terminal: unverified sums (C2 §5).
+        turn["usage"] = unavailable();
         turn["final_text"] = Value::Null;
         turn["error"] = json!("overflow");
         // A's delivery stopped at its overflow: what was dropped proves
@@ -3321,7 +3331,8 @@ fn codex_over_cap_line_fails_the_shared_connection() {
         turn["stop"] = Value::Null;
         let turn = &mut turn["expect"];
         turn["terminal"] = Value::Null;
-        turn["usage"] = Value::Null;
+        // The connection failed before the terminal (C2 §5).
+        turn["usage"] = unavailable();
         turn["final_text"] = Value::Null;
         turn["error"] = json!("protocol");
         // The end is the connection's loss, whose evidence is Host's stop
@@ -3698,7 +3709,9 @@ fn connection_task_panic_with_staged_terminal() {
     let base = turn_mut(&mut expect, 0)["expect"].clone();
     failed_after_acceptance(&mut expect, "transport_lost", "uncertain");
     let turn = &mut turn_mut(&mut expect, 0)["expect"];
-    turn["usage"] = base["usage"].clone();
+    // What the failed task staged is lost, and may have been a call
+    // sample: tokens unavailable (C2 §5).
+    turn["usage"] = unavailable();
     turn["final_text"] = base["final_text"].clone();
     turn["observations_include"] = json!([
         {"kind": "turn.accepted", "vendor_turn_id": TURN}, "final_text",
@@ -3784,6 +3797,20 @@ fn codex_interrupt_written() {
     }
 }
 
+/// The line ending `c3_interrupt_uncertain`'s command, as its interrupt
+/// left it: `failed`, exit 130.
+fn tool_ended(replay: &Value) -> Result<String, String> {
+    let started = step_with(replay, "\"type\":\"commandExecution\"")?;
+    Ok(line_of(replay, started)?
+        .replace(
+            "\"method\":\"item/started\"",
+            "\"method\":\"item/completed\"",
+        )
+        .replace("\"status\":\"inProgress\"", "\"status\":\"failed\"")
+        .replace("\"exitCode\":null", "\"exitCode\":130")
+        .replace("\"startedAtMs\"", "\"completedAtMs\""))
+}
+
 /// Ruling 21 (x.3.2 X3 fix r1): the harness measures `cleanup_settles`.
 /// A variant of `c3_interrupt_uncertain` whose command ends before the
 /// interrupted terminal: no tool is open at the acknowledgement, so the
@@ -3795,16 +3822,7 @@ fn codex_interrupt_settles_at_terminal() {
     let mut expect = expect_of("c3_interrupt_uncertain").unwrap();
     replay["source"] = json!(format!("{name}: a variant of c3_interrupt_uncertain"));
     expect["source"] = replay["source"].clone();
-    let started = step_with(&replay, "\"type\":\"commandExecution\"").unwrap();
-    let ended = line_of(&replay, started)
-        .unwrap()
-        .replace(
-            "\"method\":\"item/started\"",
-            "\"method\":\"item/completed\"",
-        )
-        .replace("\"status\":\"inProgress\"", "\"status\":\"failed\"")
-        .replace("\"exitCode\":null", "\"exitCode\":130")
-        .replace("\"startedAtMs\"", "\"completedAtMs\"");
+    let ended = tool_ended(&replay).unwrap();
     let acknowledged = step_with(&replay, "\"result\":{}}").unwrap();
     steps(&mut replay)
         .unwrap()
@@ -3915,8 +3933,309 @@ fn codex_overflow_interrupts_and_is_uncertain() {
     tail.push(json!({"await_eof": {}}));
     cut_after(&mut replay, started, &tail).unwrap();
     failed_after_acceptance(&mut expect, "overflow", "uncertain");
+    // The overflow can have dropped a call sample (C2 §5).
+    turn_mut(&mut expect, 0)["expect"]["usage"] = unavailable();
     // Steps count from 1: the gate is the step after `turn/started`.
     turn_mut(&mut expect, 0)["gates"] = json!([{"step": started + 2,
+        "expect": {"accepted": true, "terminal": null, "error": null}}]);
+    expect["sessions"]["main"]["close"] = Value::Null;
+    expect["sessions"]["main"]["health"] = json!({"state": "failed", "first_cause": "overflow"});
+    variant(name, &replay, &expect).unwrap();
+}
+
+/// The usage of a turn whose delivery can have lost a call sample: the
+/// all-null aggregate (C2 §5).
+fn unavailable() -> Value {
+    json!({"from": "terminal", "input_tokens": null, "cached_input_tokens": null,
+        "output_tokens": null, "reasoning_output_tokens": null, "total_tokens": null,
+        "scope": "turn"})
+}
+
+/// One `thread/tokenUsage/updated` of the plain turn: `last` is one model
+/// call's sample of `total_tokens`, all of them input.
+fn token_usage(total_tokens: u64) -> Value {
+    let last = json!({"totalTokens": total_tokens, "inputTokens": total_tokens,
+        "cachedInputTokens": 0, "cacheWriteInputTokens": 0, "outputTokens": 0,
+        "reasoningOutputTokens": 0});
+    emit(
+        &json!({"method": "thread/tokenUsage/updated", "params": {"threadId": THREAD,
+        "turnId": TURN, "tokenUsage": {"total": last, "last": last,
+        "modelContextWindow": 258_400}}}),
+    )
+}
+
+/// [`token_usage`]'s message naming no turn: its correlation fails.
+fn uncorrelated_usage(total_tokens: u64) -> Value {
+    let step = token_usage(total_tokens);
+    let mut message: Value =
+        serde_json::from_str(step["emit"]["line"].as_str().unwrap_or("{}")).unwrap_or_default();
+    if let Some(params) = message["params"].as_object_mut() {
+        params.remove("turnId");
+    }
+    message
+}
+
+/// The plain turn up to its answer, then `tail` in place of its sample,
+/// status and terminal; and the plain terminal's line.
+fn before_the_sample(name: &str, tail: &[Value]) -> Result<(Value, Value, String), String> {
+    let (mut replay, expect) = plain(name)?;
+    let sample = step_with(&replay, "thread/tokenUsage/updated")?;
+    let completed = line_of(
+        &replay,
+        step_with(&replay, "\"method\":\"turn/completed\"")?,
+    )?;
+    cut_after(&mut replay, sample - 1, tail)?;
+    Ok((replay, expect, completed))
+}
+
+/// One emit step writing `lines` at once: Wire reads them as one burst.
+fn burst(lines: &[String]) -> Value {
+    json!({"emit": {"line": lines.join("\n")}})
+}
+
+/// C2 §5 (picrit round 4): a delivered 100-token sample, then the next
+/// call's `thread/tokenUsage/updated` names no turn: its correlation
+/// fails, so the whole connection fails `protocol` before routing it and
+/// Host stops the server. The turn retained no terminal, so its usage is
+/// unavailable, never the delivered 100 tokens. Before the fix the sum
+/// stood as the turn's.
+#[test]
+fn codex_uncorrelated_usage_fails_the_connection() {
+    let name = "codex_uncorrelated_usage_fails_the_connection";
+    let (mut replay, mut expect) = plain(name).unwrap();
+    let started = step_with(&replay, "\"method\":\"turn/started\"").unwrap();
+    let tail = vec![
+        token_usage(100),
+        // Delivered before the connection fails.
+        json!({"delay": {"ms": 300}}),
+        emit(&uncorrelated_usage(50)),
+        sigterm(),
+    ];
+    cut_after(&mut replay, started, &tail).unwrap();
+    failed_after_acceptance(&mut expect, "protocol", "quiescent");
+    let turn = &mut turn_mut(&mut expect, 0)["expect"];
+    turn["usage"] = unavailable();
+    // Its linked server anchor has the stop's absence proof (x.3.2 X4 K0).
+    turn["group_absent"] = json!(true);
+    expect["sessions"]["main"]["close"] = json!({
+        "mode": "graceful", "vendor_closed": false, "cleanup": "uncertain",
+    });
+    variant(name, &replay, &expect).unwrap();
+}
+
+/// C2 §5 (picrit round 5): nothing before the turn's terminal, in the
+/// connection's read order, may have been lost for its sum to stand. A
+/// 100-token sample is delivered; then one burst holds the next call's
+/// 50-token sample naming no turn and the valid `turn/completed`. The
+/// sample fails the connection `protocol` before routing; the terminal,
+/// admitted behind it, is still routed by the failed connection's drain
+/// and retained, so the turn completes with its answer, but its usage is
+/// unavailable. Before the fix the decided terminal exempted the turn and
+/// the sum stood at 100.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn codex_terminal_after_a_rejected_sample() {
+    let name = "codex_terminal_after_a_rejected_sample";
+    let _points = admitted_in_bursts().unwrap();
+    let (_, _, completed) = before_the_sample(name, &[]).unwrap();
+    let tail = [
+        token_usage(100),
+        // Delivered before the connection fails.
+        json!({"delay": {"ms": 300}}),
+        burst(&[uncorrelated_usage(50).to_string(), completed]),
+        sigterm(),
+    ];
+    let (replay, mut expect, _) = before_the_sample(name, &tail).unwrap();
+    let turn = &mut turn_mut(&mut expect, 0)["expect"];
+    turn["usage"] = unavailable();
+    // The failed connection leaves the session's cleanup unproven.
+    expect["sessions"]["main"]["close"] = json!({
+        "mode": "graceful", "vendor_closed": false, "cleanup": "uncertain",
+    });
+    variant(name, &replay, &expect).unwrap();
+}
+
+/// Every message waits at Route's seam before it is routed, so Wire admits
+/// the rest of a burst while Route holds its first message: a rejection
+/// there seals admission only once the burst's later lines are admitted,
+/// and the failed connection's drain routes them.
+#[cfg(feature = "test-failpoints")]
+fn admitted_in_bursts() -> Result<tempfile::TempDir, String> {
+    armed(
+        "codex.connection.message",
+        json!({"occurrence": 1, "action": "delay", "value": 50, "persist": true}),
+    )
+}
+
+/// C2 §5 (picrit round 5), the control: one burst holds the valid
+/// `turn/completed` and then a sample naming no turn. The rejection comes
+/// after the terminal in read order, so the delivered sum stands: 100.
+#[test]
+fn codex_rejected_sample_after_the_terminal() {
+    let name = "codex_rejected_sample_after_the_terminal";
+    let (_, _, completed) = before_the_sample(name, &[]).unwrap();
+    let tail = [
+        token_usage(100),
+        json!({"delay": {"ms": 300}}),
+        burst(&[completed, uncorrelated_usage(50).to_string()]),
+        sigterm(),
+    ];
+    let (replay, mut expect, _) = before_the_sample(name, &tail).unwrap();
+    let turn = &mut turn_mut(&mut expect, 0)["expect"];
+    turn["usage"] = json!({"from": "samples", "input_tokens": 100, "cached_input_tokens": 0,
+        "output_tokens": 0, "reasoning_output_tokens": 0, "total_tokens": 100,
+        "scope": "turn"});
+    expect["sessions"]["main"]["close"] = json!({
+        "mode": "graceful", "vendor_closed": false, "cleanup": "uncertain",
+    });
+    variant(name, &replay, &expect).unwrap();
+}
+
+/// `c3_interrupt_uncertain` with its sample 100 tokens, cut after its
+/// interrupted terminal, which is retained with the command open and so
+/// opens P7 (x.3.2 X4 D4.1); then, 500 ms on, `tail` with the command's
+/// end. The P7 window is 3 s, so that end closes it: the turn settles
+/// when its tools end, `quiescent`, well after its terminal.
+fn interrupted_then(
+    name: &str,
+    tail: impl FnOnce(String) -> Vec<Value>,
+) -> Result<(Value, Value), String> {
+    let mut replay = replay_of("c3_interrupt_uncertain")?;
+    let mut expect = expect_of("c3_interrupt_uncertain")?;
+    replay["source"] = json!(format!("{name}: a variant of c3_interrupt_uncertain"));
+    expect["source"] = replay["source"].clone();
+    let ended = tool_ended(&replay)?;
+    let sample = step_with(&replay, "thread/tokenUsage/updated")?;
+    steps(&mut replay)?[sample] = token_usage(100);
+    let terminal = step_with(&replay, "\"status\":\"interrupted\"")?;
+    let mut after = vec![json!({"delay": {"ms": 500}})];
+    after.extend(tail(ended));
+    cut_after(&mut replay, terminal, &after)?;
+    let turn = turn_mut(&mut expect, 0);
+    turn["tool_grace_ms"] = json!(3000);
+    let turn = &mut turn["expect"];
+    turn["cleanup"] = json!("quiescent");
+    turn["cleanup_settles"] = json!("when_tools_end");
+    turn["observations_include"]
+        .as_array_mut()
+        .ok_or("no observations_include")?
+        .push(json!({"kind": "progress",
+            "tools_ended": ["exec-019a0000-0000-7000-8000-000000400004"]}));
+    Ok((replay, expect))
+}
+
+/// C2 §5 (picrit round 6): accounting runs on through P7, so the boundary
+/// is the last message the turn's delivery took, not its terminal. The
+/// interrupted terminal is retained at T with the command open; one burst
+/// then holds a 50-token sample naming no turn (T+1), which fails the
+/// connection, and the command's end (T+2), which the drain still routes
+/// and which closes P7. Usage is unavailable. Before the fix only the
+/// terminal's T was compared, and the delivered 100 stood.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn codex_p7_end_after_a_rejected_sample() {
+    let name = "codex_p7_end_after_a_rejected_sample";
+    let _points = admitted_in_bursts().unwrap();
+    let (replay, mut expect) = interrupted_then(name, |ended| {
+        vec![
+            burst(&[uncorrelated_usage(50).to_string(), ended]),
+            sigterm(),
+        ]
+    })
+    .unwrap();
+    let turn = &mut turn_mut(&mut expect, 0)["expect"];
+    turn["usage"] = unavailable();
+    variant(name, &replay, &expect).unwrap();
+}
+
+/// C2 §5 (picrit round 6), the P7 control: the command's end closes P7
+/// before the rejected sample in the burst, so the delivered sum stands.
+#[test]
+fn codex_rejected_sample_after_the_p7_end() {
+    let name = "codex_rejected_sample_after_the_p7_end";
+    let (replay, mut expect) = interrupted_then(name, |ended| {
+        vec![
+            burst(&[ended, uncorrelated_usage(50).to_string()]),
+            sigterm(),
+        ]
+    })
+    .unwrap();
+    let turn = &mut turn_mut(&mut expect, 0)["expect"];
+    turn["usage"] = json!({"from": "samples", "input_tokens": 100, "cached_input_tokens": 0,
+        "output_tokens": 0, "reasoning_output_tokens": 0, "total_tokens": 100,
+        "scope": "turn"});
+    variant(name, &replay, &expect).unwrap();
+}
+
+/// C2 §5 (picrit round 7): the read-order exemption holds only for a
+/// delivery that decided. The interrupted terminal is retained at T with
+/// the command open, so P7 opens; a 50-token sample naming no turn at T+1
+/// fails the connection, whose owned sequence is held at its seam, so the
+/// lane stays open and unended. No tool end comes: the wall (1.5 s) caps
+/// P7 and the turn settles at it (`Grace`), keeping its terminal. Usage is
+/// unavailable. Before the fix `T < T+1` stood and the sum was 100.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn codex_p7_bound_after_a_rejected_sample() {
+    let name = "codex_p7_bound_after_a_rejected_sample";
+    let _points = armed(
+        "codex.connection.fail_sequence",
+        json!({"occurrence": 1, "action": "delay", "value": 3000}),
+    )
+    .unwrap();
+    let mut replay = replay_of("c3_interrupt_uncertain").unwrap();
+    let mut expect = expect_of("c3_interrupt_uncertain").unwrap();
+    replay["source"] = json!(format!("{name}: a variant of c3_interrupt_uncertain"));
+    expect["source"] = replay["source"].clone();
+    let sample = step_with(&replay, "thread/tokenUsage/updated").unwrap();
+    steps(&mut replay).unwrap()[sample] = token_usage(100);
+    let terminal = step_with(&replay, "\"status\":\"interrupted\"").unwrap();
+    let tail = [emit(&uncorrelated_usage(50)), sigterm()];
+    cut_after(&mut replay, terminal, &tail).unwrap();
+    let turn = turn_mut(&mut expect, 0);
+    turn["tool_grace_ms"] = json!(3000);
+    turn["deadlines"] = json!({"wall_ms": 1500});
+    turn["expect"]["usage"] = unavailable();
+    variant(name, &replay, &expect).unwrap();
+}
+
+/// C2 §5 (picrit round 3): delivery lost a call's sample, so the turn's
+/// tokens are unavailable, never the delivered prefix. One sample is
+/// delivered; then the normalizer is held on a delta while twenty thread
+/// messages overflow the lane, and the second sample is dropped. The
+/// terminal-less `overflow` end carries the all-null aggregate. Before
+/// the fix Core summed the first sample's 100 tokens as the turn's.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn codex_overflow_before_the_second_sample() {
+    let name = "codex_overflow_before_the_second_sample";
+    // The identity's send, the acceptance's, the first sample's, then the
+    // delta's.
+    let _points = armed(
+        "adapter.observation.admitted",
+        json!({"occurrence": 4, "action": "delay", "value": 3000}),
+    )
+    .unwrap();
+    let (mut replay, mut expect) = plain(name).unwrap();
+    let started = step_with(&replay, "\"method\":\"turn/started\"").unwrap();
+    let delta = step_with(&replay, "\"method\":\"item/agentMessage/delta\"").unwrap();
+    let mut tail = vec![
+        token_usage(100),
+        json!({"await_signal": {"signal": "SIGUSR1"}}),
+        replay["steps"][delta].clone(),
+    ];
+    tail.extend(status_burst(20));
+    tail.push(token_usage(50));
+    tail.push(json!({"expect": {
+        "line": {"method": "turn/interrupt", "params": {"threadId": THREAD, "turnId": TURN}},
+        "within_ms": 2000,
+    }}));
+    tail.push(json!({"await_eof": {}}));
+    cut_after(&mut replay, started, &tail).unwrap();
+    failed_after_acceptance(&mut expect, "overflow", "uncertain");
+    turn_mut(&mut expect, 0)["expect"]["usage"] = unavailable();
+    // Steps count from 1: the gate is the step after the first sample.
+    turn_mut(&mut expect, 0)["gates"] = json!([{"step": started + 3,
         "expect": {"accepted": true, "terminal": null, "error": null}}]);
     expect["sessions"]["main"]["close"] = Value::Null;
     expect["sessions"]["main"]["health"] = json!({"state": "failed", "first_cause": "overflow"});
@@ -4239,7 +4558,9 @@ fn codex_overflow_beside_a_retained_terminal() {
     cut_after(&mut replay, started, &tail).unwrap();
     let turn = &mut turn_mut(&mut expect, 0)["expect"];
     turn["cleanup"] = json!("uncertain");
-    turn["usage"] = Value::Null;
+    // The overflow can have dropped a call sample: the retained terminal
+    // carries the all-null aggregate (C2 §5).
+    turn["usage"] = unavailable();
     // The final answer's item was cut: the terminal carries no text.
     turn["final_text"] = Value::Null;
     turn["observations_include"] = json!([{"kind": "turn.accepted", "vendor_turn_id": TURN}]);

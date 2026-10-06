@@ -196,7 +196,8 @@ pub struct TurnEnd { pub terminal: Option<VendorTerminal>,
     pub instance: Option<InstanceReport> /* once the handshake or Pi's package metadata was read, on every outcome (§5) */,
     pub leftovers: Option<LeftoverReport> /* per-turn routes on every outcome, and `ServerLost` (§4.2) */,
     pub outcome: Result<TurnEvidence, AdapterError>,
-    pub loss: Option<ObservationLoss> /* shared-ingress routes: this generation lost observations (§4) */ }
+    pub loss: Option<ObservationLoss> /* shared-ingress routes: this generation lost observations (§4) */,
+    pub aggregate: Option<UsageSample> /* a turn usage aggregate when no terminal is retained (§5) */ }
 pub struct TurnEvidence { pub exit: Option<ExitReport>, pub cleanup: Cleanup, pub journal_uncertain: bool }
 pub enum Cleanup { Quiescent, Uncertain, Pending }
 pub enum Recovery { Resumed(SessionDriver), Unknown { reason: String }, Dead { evidence: String } }
@@ -811,7 +812,12 @@ which it uses:
 - per model call, as `progress.usage: UsageSample` (`key: Option<String>` and the nullable counters `input`, `cached_input`, `output`, `reasoning_output`, `total`, which are C1's usage token fields), where a keyed sample
   supersedes an earlier sample with the same key and a keyless sample adds;
 - as a turn aggregate in `VendorTerminal.usage`, which supersedes every call
-  sample of the turn for the envelope.
+  sample of the turn for the envelope; a turn whose end retains no terminal
+  may carry it in `TurnEnd.aggregate`, with the same effect (ignored when a
+  terminal is retained). A route whose delivery lost call samples, so that
+  their sum would be a prefix, reports an all-`null` aggregate either way:
+  the turn's tokens are then `null`, never the delivered prefix (bead
+  via-i5g).
 
 Core keeps a turn-wide usage ledger separate from step accounting. It holds
 up to 1,024 keys per turn; further new keys add as keyless. Once it
@@ -823,7 +829,10 @@ OpenCode packet §12). Among a turn's call samples, one such sample gives the
 same `vendor_interval` and warning, even when a later sample supersedes its
 key. A turn aggregate supersedes the call samples, their mark included (C1
 §5): the envelope, or a late terminal's revision, then has `vendor_interval`
-and the warning only when the aggregate itself is marked. A component is `null` if any contributing
+and the warning only when the aggregate itself is marked. A figure whose
+every count is `null` is unavailable usage (C1 §5: scope `turn`,
+provenance `unavailable`); it reports no numbers, so it covers no interval
+and raises no `usage_interval_unverified`, whatever its mark. A component is `null` if any contributing
 sample lacks it. Step rows keep their existing per-step rule for `status`.
 `VendorTerminal.cost` gives `{usd, scope, provenance}`, `provenance`
 `Reported` (the vendor's accounted amount) or `Estimated` (computed from
@@ -980,7 +989,7 @@ of VIA's own recipe:
 | `claude-cli` | each per-turn launch's argv ([Claude packet](vendors/claude-code.md) §4) | per process; part of the handshake-refusal recipe key (§5) |
 | `codex-app-server` | the owned server's argv, after `app-server` and VIA's switches ([Codex packet](vendors/codex.md) §4) | the argv is in `config_hash`, so sessions with different lists get different servers and equal lists share one |
 | `opencode-serve` | refused in the first release: `InvalidParam { field: "vendor_args" }` for any non-empty list, in `plan` and `check_turn` ([OpenCode packet](vendors/opencode.md) §2.2). Server argv is per server and the data-root lock allows one live server on the one data root, so a different list would need a second server on a data root that already has one (owner, 2026-10-06). Revisit after the release if OpenCode passthrough is wanted; how to support it (for example a server and data root per list) is a future architecture choice for the owner | — |
-| `pi-rpc` (adopts this when built) | each per-turn launch's argv ([Pi packet](vendors/pi.md) §4.1) | per process; part of the handshake-refusal recipe key |
+| `pi-rpc` | each per-turn launch's argv, after `--offline` ([Pi packet](vendors/pi.md) §4.1, §4.8) | per process; part of the handshake-refusal recipe digest |
 | `fake` | refused: `InvalidParam { field: "vendor_args" }` (not a vendor CLI) | — |
 
 **Trust.** Reserved matching is best-effort against the vendor's known
