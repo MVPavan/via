@@ -840,9 +840,13 @@ fn a_live_held_group_is_unresolved_and_not_signalled() {
     });
 }
 
-/// Bead via-itc B5: only the session's own `Turn` anchors count: another
-/// session's unproven group and a live shared server leave this session
-/// resolved, while the other session stays unresolved.
+/// Bead via-itc B5: only the session's own `Turn` anchors count. Another
+/// session's held group, already dead, is neither probed nor proved by this
+/// session's pass: its record stays unproven and its token held. A live
+/// shared server linked to one of this session's turns does not count
+/// either: the check reads the session's `Turn` anchors, not the close and
+/// status predicate's server links. The other session's own check then
+/// proves its group.
 #[test]
 fn other_sessions_and_servers_do_not_count() {
     runtime().block_on(async {
@@ -851,23 +855,45 @@ fn other_sessions_and_servers_do_not_count() {
         let host = fixture.host();
         fixture.arm("store.journal.identified", "fail_io");
         fixture.arm("host.anchor.before_eof_cleanup", "pause");
-        fixture.leave_unproven(&host, other_session()).await;
-        // The paused anchor has read its command; the server's must not.
+        let pgid = fixture.leave_unproven(&host, other_session()).await;
+        fixture.release("host.anchor.before_eof_cleanup");
+        assert!(eventually(Duration::from_secs(3), || group_gone(pgid)).await);
         fixture.disarm("host.anchor.before_eof_cleanup");
+        fixture.run_turn_one(session()).await;
         let server = host
             .acquire(server_spec(&fixture), within(4))
             .await
             .unwrap();
+        server
+            .control
+            .link_turn(&session(), turn(1), within(2))
+            .await
+            .unwrap();
+        assert_eq!(fixture.links(session()).await.len(), 1);
         let mine = host
             .session_predecessors_resolved(&session(), within(2))
             .await
             .unwrap();
-        assert!(mine, "another session's or a server's group counted");
+        assert!(mine, "another session's group or a linked server counted");
+        let foreign_unproven = |records: &[via_store::AnchorRecord]| {
+            records.iter().any(|record| {
+                matches!(&record.intent.owner,
+                    ProcessOwner::Turn { session_id, .. } if *session_id == other_session())
+                    && record.absence.is_none()
+            })
+        };
+        assert!(
+            foreign_unproven(&fixture.records().await),
+            "this session's check proved another session's group"
+        );
+        assert_eq!(host.held_unproven(), 1, "another session's token released");
         let theirs = host
             .session_predecessors_resolved(&other_session(), within(2))
             .await
             .unwrap();
-        assert!(!theirs, "the owning session was taken for resolved");
+        assert!(theirs, "the owning session's check did not prove its group");
+        assert!(!foreign_unproven(&fixture.records().await));
+        assert_eq!(host.held_unproven(), 0);
         server
             .control
             .close(CloseRequest {
