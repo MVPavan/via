@@ -1136,6 +1136,7 @@ fn pi_stage_outlived_by_its_task() {
     use std::time::{Duration, Instant};
     const POINT: &str = "adapter.pi.instructions.written";
     const TOKEN: &str = "pi-stage-outlived-token";
+    own_process("pi_stage_outlived_by_its_task");
     let points = tempfile::tempdir().unwrap();
     let dir = points.path().join("points");
     std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
@@ -1264,6 +1265,20 @@ fn fixed_profile(state: &Path) -> std::io::Result<()> {
     )
 }
 
+/// The failpoint controller is the process's: it keeps its first
+/// activation, and every anchor the process starts inherits it, so a case
+/// that arms a point needs a process of its own (nextest's
+/// process-per-test mode, the repository's runner). Run in one process
+/// beside other cases, it would pause their anchors too.
+#[cfg(feature = "test-failpoints")]
+fn own_process(test: &str) {
+    assert_eq!(
+        std::env::var("NEXTEST_EXECUTION_MODE").as_deref(),
+        Ok("process-per-test"),
+        "{test} arms a process-global failpoint: run it under cargo nextest"
+    );
+}
+
 /// `pi_uncertain_predecessor` (packet §7.4, R1): turn A leaves its group
 /// unproven (its anchor paused at Host's `Stop`, so the group is still
 /// present when A's close gives up; the anchor is the workspace `via`
@@ -1277,6 +1292,7 @@ fn fixed_profile(state: &Path) -> std::io::Result<()> {
 #[test]
 fn pi_uncertain_predecessor() {
     use std::os::unix::fs::DirBuilderExt;
+    own_process("pi_uncertain_predecessor");
     let points = tempfile::tempdir().unwrap();
     let dir = points.path().join("points");
     std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
