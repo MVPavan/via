@@ -38,8 +38,10 @@ status) is first checked against one strict schema (SCHEMAS, from C1): a
 missing or mistyped field it relies on blocks, and no reply field is ever
 read with a default. Events are read page by page until `more` is false.
 Every loop makes strict progress, checks the deferred-signal flag between
-iterations (except cleanup, which always runs to its proof or deadline) and
-has a hard page or time bound; reaching it is Blocked.
+iterations and has a hard page or time bound; reaching it is Blocked. Two
+loops do not end Blocked on a signal: cleanup always runs to its proof or
+deadline, and a poll inside an accepted turn stops so the turn is
+cancelled, settled and accounted first, and only then ends Blocked.
 
 Threat model. A maintainer runs this on their own machine, on Linux (it
 reads /proc and runs `pgrep`). The Claude that VIA starts runs only the
@@ -545,11 +547,23 @@ def alive(pid, start_ticks):
     return stat is not None and stat["start_ticks"] == start_ticks and stat["state"] != "Z"
 
 
+def ticks_from_uptime(text, hz):
+    """Clock ticks from /proc/uptime's first field, in integer arithmetic
+    rounded up (seconds * hz + ceil(fraction * hz)), so a process that
+    started by then has start ticks at or below it; None if unparsable."""
+    seconds, _, fraction = text.split()[0].partition(".")
+    if not seconds.isdigit() or (fraction and not fraction.isdigit()):
+        return None
+    scale = 10 ** len(fraction)
+    return int(seconds) * hz + -(-int(fraction or 0) * hz // scale)
+
+
 def uptime_ticks():
-    """Clock ticks since boot now (the unit of start ticks), or None."""
+    """Clock ticks since boot now (the unit of start ticks), rounded up, or
+    None."""
     try:
-        return int(float(Path("/proc/uptime").read_text().split()[0])
-                   * os.sysconf("SC_CLK_TCK"))
+        return ticks_from_uptime(Path("/proc/uptime").read_text(),
+                                 os.sysconf("SC_CLK_TCK"))
     except (OSError, ValueError, IndexError):
         return None
 
@@ -664,6 +678,12 @@ def self_test():
         ("localhost:8080" in json.dumps(keyed(parse_mcp_debug(
             'T [DEBUG] MCP server "localhost:8080": Successfully connected'))), False),
         (keyed({"a": "connected", "b": "failed"})["connected"], 1),
+        # /proc/uptime to clock ticks: integer, rounded up.
+        (ticks_from_uptime("10000.05 123.4\n", 100), 1000005),
+        (ticks_from_uptime("10000.051 1\n", 100), 1000006),
+        (ticks_from_uptime("10000.00 1\n", 100), 1000000),
+        (ticks_from_uptime("10000 1\n", 100), 1000000),
+        (ticks_from_uptime("1e4 1\n", 100), None),
     ]
     return [{"got": got, "want": want} for got, want in cases if got != want]
 
@@ -671,13 +691,28 @@ def self_test():
 # --- vendor transcript ------------------------------------------------------------
 
 def is_prompt(entry):
-    """A user entry that opens a turn: the prompt, not a tool result."""
+    """A user entry that opens a turn: not meta, a message object whose
+    content is a string or a list without a tool result. Whether it is a
+    valid prompt is `prompt_problem`'s question."""
     message = entry.get("message")
     if entry.get("type") != "user" or entry.get("isMeta") or not isinstance(message, dict):
         return False
     content = message.get("content")
     return not (isinstance(content, list) and any(
         isinstance(part, dict) and part.get("type") == "tool_result" for part in content))
+
+
+def prompt_problem(entry):
+    """Why a prompt record cannot be interpreted, or None: its content must
+    be a string or a non-empty list of text blocks."""
+    content = entry["message"].get("content")
+    if isinstance(content, str):
+        return None
+    if isinstance(content, list) and content and all(
+            isinstance(part, dict) and part.get("type") == "text"
+            and isinstance(part.get("text"), str) for part in content):
+        return None
+    return "prompt without string content or a list of text blocks"
 
 
 # Transcript record types seen in Claude's session transcripts (run 6) that
@@ -773,7 +808,16 @@ def vendor_turns(path, needle=None):
                 taint("non-object record")
                 continue
             kind = entry.get("type")
+            if not isinstance(kind, str):
+                taint("record without a string type")
+                continue
             if is_prompt(entry) and not entry.get("isSidechain"):
+                problem = prompt_problem(entry)
+                if problem:
+                    # It cannot open a turn: the current one is tainted (and
+                    # the turn count no longer matches).
+                    taint(problem)
+                    continue
                 turns.append({"calls": {}, "tools": {}, "needle_inputs": set(), "texts": {},
                               "last": None, "taint": early if not turns else [],
                               "notes": early_notes if not turns else []})
@@ -1801,9 +1845,10 @@ def case_interrupt(run, case):
         session = receipt["session_id"]
         run.keep_handle(case, receipt)
         tool, running, deadline = None, False, time.monotonic() + 90
-        # Bounded by the deadline; a deferred signal ends the poll Blocked.
-        while time.monotonic() < deadline and not (tool and running):
-            interrupt_guard()
+        # Bounded by the deadline. A deferred signal ends the poll, never the
+        # accepted turn: the case goes on to cancel it, take its envelope and
+        # account it, and `account()` then ends the case Blocked.
+        while time.monotonic() < deadline and not (tool and running) and not INTERRUPTED:
             status = run.status(case, "status-running", session)
             # `progress` is null once the turn is not running (C1 §3.7).
             running = status["progress"] is not None and "Bash" in status["progress"][
