@@ -133,8 +133,9 @@ Version (C2 §5; owner OD1). Every Claude Code version is supported by
 default. Check init `claude_code_version` on every launch, parsing the
 complete version including any prerelease/build qualifier, never guessed from
 an executable filename. A version in the adapter's `checked` set (versions the
-maintainers' cheap live check passed: 2.1.285 and, from the live round of
-2026-10-05, 2.1.289) is `tested`; any other is `untested`,
+maintainers' cheap live check passed: 2.1.285, from the live round of
+2026-10-05 2.1.289, and from run 4 of 2026-10-06 2.1.290) is `tested`;
+any other is `untested`,
 with warning `vendor_version_untested`, and proceeds. Only a failed handshake
 check on something VIA relies on (`interrupt_receipt_v1`, the permission-mode
 echo, the tool list) refuses the instance. Init follows the prompt line, so
@@ -381,6 +382,26 @@ The switches `--debug-to-stderr` (`-d2e`), `--ax-screen-reader` and
 unverified, with C1's `vendor_passthrough` warning. An option this table
 does not declare is unknown to 2.1.290's Commander, which then refuses the
 launch.
+
+Live through VIA on 2.1.290 (run 4, 2026-10-06, Haiku, bead via-jne; fresh
+VIA state directory, gitignored evidence in
+`scratchpad/execution/claude-live/run-4/`). These runs qualified 2.1.290 for
+`checked` (§3):
+- Default mode: a spawn and its resume both completed, the resume recalled
+  turn 1's content, and the files Write created were mode 0644. The
+  session's inherited states were all `on`, as the table above gives for
+  the unrestricted mode.
+- Restricted mode: one turn completed, with MCP servers `unknown`, every
+  other category `off`, and one `config_switch_unverified` warning listing
+  all six categories.
+- Passthrough, run in the restricted mode: a spawn with
+  `-- --max-budget-usd=0.05` launched Claude with that argument as the last
+  argv element, after the recipe. Its resume launched with
+  `--resume <uuid>` and the same final argument. Both turns completed, and
+  `vendor_passthrough` was on each receipt and envelope and on `status`.
+- Reserved flag: a spawn with `-- --permission-mode=default` was refused
+  `invalid_params`, kind2 `vendor_option_conflict`, `data.field`
+  `vendor_args`, before any launch. No session was created.
 
 ## 5. Typed stream and normalizer
 

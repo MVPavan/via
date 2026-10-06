@@ -457,6 +457,22 @@ passes unverified with C1's `vendor_passthrough` warning: the switches
 any other feature. `--disable hooks` stays VIA's (`inherit`), never the
 caller's.
 
+Live through VIA on 0.160.0 (run 6, 2026-10-06, `gpt-6-luna`, bead
+via-jne; evidence in `scratchpad/execution/codex-live/run-6/`, gitignored),
+with a warm home and sessions started concurrently:
+- A session with `-- --strict-config` and one without were started
+  together while an earlier `--strict-config` session's server was still
+  running.
+- `daemon/status` listed two servers with different keys. The new
+  `--strict-config` session joined the earlier session's server (two
+  sessions on it), and the session without arguments got its own.
+- The process command lines matched:
+  `codex app-server --disable memories --strict-config` and
+  `codex app-server --disable memories`.
+- Both new turns completed on 0.160.0, `tested`.
+- Only the `--strict-config` session carried `vendor_passthrough`, on the
+  receipt, the envelope and `status`. The other session had no warning.
+
 ## 5. Correlation, events and bounds
 
 Each client response routes by request ID; each known notification routes
