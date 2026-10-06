@@ -756,7 +756,10 @@ default.
   refused at the handshake before the server is published, even when every
   other check passes: `handshake_refused`, cached by this refusal cache's
   key, with a message naming the version and the checked set; the server
-  is retired through Host. One server carries every OpenCode session, and
+  is retired through Host. A best-effort `--version` check before launch
+  refuses an unchecked binary the same way before the data root is
+  touched (`vendors/opencode.md` §2.2); the handshake stays
+  authoritative. One server carries every OpenCode session, and
   an unchecked version's protocol and behaviour are unqualified
   (`vendors/opencode.md` §12); the one-server fence does not depend on the
   version (`vendors/opencode.md` §3.2).
