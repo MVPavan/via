@@ -51,7 +51,8 @@ Local primary sources live under
 C3 observed the same tool alive **65 seconds** after interrupted terminal
 status, with no matching tool completion. C4/C4b **did not prove read-only
 enforcement**: the re-probe found that the model attempted the write through
-code-mode `exec`, and no item appeared. C5 used a
+code-mode `exec`, and no item appeared (`via-5lr.3.4` later proved it
+through VIA, §3). C5 used a
 persistent thread; an ephemeral resume failed with `no rollout found`.
 C6 proved only one tool-free turn with seven environment variables. These
 are bounded observations, not guarantees for arbitrary tools/platforms.
@@ -104,6 +105,11 @@ home Codex indexes the user's whole `~/.codex/sessions` before it answers
 after a server's first successful handshake on the home. Codex's own
 `state_5.sqlite` is no signal: it exists before the backfill completes, so
 an interrupted first start would otherwise be retried on the short bound.
+Live through VIA on 0.160.0 (2026-10-06, `via-5lr.3.4` runs, fresh state
+directory): spawn to marker written 51.5 s, to turn accepted 51.8 s, to
+the first model output 56.9 s (wall clock); the next daemon start found
+the marker and accepted the turn 0.34 s after spawn, daemon start
+included.
 
 Each session has one lease and a registered thread ID. One shared server holds
 one of the runtime's harness-process slots (runtime §8) for its life; a turn on a live
@@ -208,18 +214,57 @@ matching thread `sandbox` mode at start/resume, then the structured policy:
 | `full`, network true | `{type:"dangerFullAccess"}` |
 | `full`, network false | Refuse `bound_unsupported`; no network field exists for this variant |
 
-The tmp exclusions avoid silently granting extra writable paths. Their exact
-effect, workspace roots, protected paths and network enforcement need live
-coverage before claiming the limited bounds. **Until that coverage passes,
-`describe` must omit `read_only`/`workspace_write` and refuse those requests
-as `bound_unsupported` with the unverified-enforcement reason.** An
-`allow_untested` compatibility parameter has no effect and does not waive
-this known proof gap.
+The tmp exclusions avoid silently granting extra writable paths.
+`read_only` and `workspace_write` are qualified with `network:false`
+(`via-5lr.3.4`, 2026-10-06, live through VIA on 0.160.0, Linux/WSL2; see
+the evidence below): `describe` lists `read_only`, `workspace_write` and
+`full`. A limited bound with `network:true` is refused as
+`bound_unsupported` (no run showed what the sandbox then permits), as is
+`full` with `network:false`. `network_control` stays `false` (owner
+decision pending; the evidence shows `network:false` denied in both
+limited bounds). An `allow_untested` compatibility parameter has no effect.
 `full` grants full access; it is never a fallback for a refused limited
-bound. A8 chooses a bound-free key because policy is per turn; enabling
-mixed-bound sharing remains gated on `via-5lr.3.4`, not on C4's marker
-absence. This keeps the required proof open, rather than weakening the
-release's intended bound support to close the task.
+bound. The server key stays bound-free: differing bounds share one server,
+each `turn/start` carrying its own policy (observed below).
+
+The handshake check compares only the echoed sandbox's `type`: the
+`thread/start` echo of a workspace-write thread has `excludeSlashTmp` and
+`excludeTmpdirEnvVar` false while every `turn/start` applies them true
+(round-1 probe, 0.160.0; the turn context of every workspace-write run
+below recorded them true).
+
+**A denial is unstructured.** Under the sandbox a prohibited write fails
+the command itself: bwrap mounts the filesystem read-only, the shell
+reports `Read-only file system` (EROFS) and the command exits 1. Codex
+sends no approval request and no item with a `declined` status (the
+status the adapter maps to a denial), so VIA records no `action.denied`:
+`denied_actions` stays empty and the turn completes `end_turn`. Proof of enforcement is the failed tool item and the absent
+file together, never the absent file alone. A denied network call fails
+the same way (DNS resolution fails inside the sandbox).
+
+Live evidence (`via-5lr.3.4`, 2026-10-06; codex-cli 0.160.0, `gpt-6-luna`,
+effort `low`; private state under
+`scratchpad/execution/codex-live/run-5/`, gitignored; each prompt named
+the exact command to run). Tool items are from the thread's Codex rollout
+(the `exec` call and its output); tool processes from a `/proc` observer
+(`observe.jsonl`, variable names only):
+
+| Bound | Command | Result |
+|---|---|---|
+| `workspace_write` | write a file in the cwd | exit 0; file present; bwrap `--bind <cwd>` |
+| `workspace_write` (resumed, inherited) | write a file in a sibling directory outside the cwd | `Read-only file system`, exit 1; file absent; no approval request |
+| `workspace_write`, `extra_write_dirs:[<dir>]` | write a file in `<dir>` | exit 0; file present; turn context `writable_roots:[<dir>]` |
+| `read_only` | write a file in the cwd | `Read-only file system`, exit 1; file absent; no approval request; bwrap `--ro-bind / /`, `--unshare-net` |
+| `workspace_write`, `read_only` (`network:false`) | `curl https://example.com` | `Could not resolve host`, curl exit 6 (the host itself got HTTP 200) |
+
+In every row `denied_actions` and `auto_declined_requests` were empty and
+the turn completed. Every sandboxed tool process the observer caught (the
+write commands' `bash -c` or `sleep`, in all four write turns) carried
+`VIA_PROCESS_MARKER`. The resumed `workspace_write` turn reopened its
+thread on a new server after the first had retired, and ran concurrently
+with a `read_only` turn on that server, each with its own policy in its
+turn context. Hooks also ran in these turns, as declared in
+§4.
 
 ## 4. Never-ask and environment
 
@@ -315,6 +360,28 @@ add disabling layers (owner, 2026-10-05). Every switch enters
 Live round 2 checks (Codex): whether a VIA-started server loads the
 user's plugins, skills and agents with no switch, each recorded with its
 evidence so the category can be declared `on`, or stays `unknown`.
+Recorded 2026-10-06 on 0.160.0 (`via-5lr.3.4` runs, §3; the thread's
+Codex rollout, its developer context; cwd inside this repository); the
+declarations above are unchanged pending that decision:
+
+- **Skills: loaded.** The `skills_instructions` block listed the bundled
+  system skills (`~/.codex/skills/.system`, 4), the user's
+  `~/.agents/skills` (4) and the project's `.codex/skills` (23). One
+  user skill under `~/.codex/skills/<name>` was not listed (reason
+  unverified).
+- **Plugins: loaded, after the server starts.** Turns that started 50 s
+  or more after their server's launch also listed 23 skills from 9
+  installed plugins (`~/.codex/plugins/cache/…`); the first
+  turn on a freshly started warm server (accepted 0.3 s after launch)
+  listed none, twice. A `recommended_plugins` block (available, not
+  installed) was present in both. Plugin loading thus races the first
+  turn.
+- **Agents: loaded (model report).** Asked to list the roles its
+  `spawn_agent` tool accepts, the model named the project's four
+  `.codex/agents/*.toml` agents plus `default`, `explorer` and `worker`;
+  those names appear nowhere else in its context, but tool definitions
+  are not in the rollout, so this rests on the model's report. The user
+  has no `~/.codex/agents`.
 
 Inventory sources are `configWarning` and the `thread/start` response's
 `instructionSources`, which reported the loaded AGENTS.md paths in the
@@ -587,7 +654,7 @@ time; retain raw-span evidence for every scenario.
 | `codex_resume_identity` | Persistent thread reopened with exact ID and excludeTurns; fresh/different ID fails resume_mismatch; no fallback start; schema/history-clear fields encode exactly. After a bound change and server retirement, resume the exact stored thread with the current sandbox mode, verify identity/policy and assert the next start carries the current full sandboxPolicy rather than spawn-time defaults. |
 | `codex_steer_precondition` | Active matching ID returns injected; stale/idle/submitting/raced terminal handled; one vendor turn only; mismatched steer reply never succeeds. |
 | `codex_never_ask` | Each six-body reply validates against its pinned schema; legacy/unknown/auth requests get -32601; no grants; 5 s deadline holds while data lane full; failed write never recorded as successful decline. |
-| `codex_bound_gate` | Every admitted start contains never, user reviewer and explicit current bound; inheritance/reset and reserved-key refusal; limited bounds refused until proof flag enabled; full+network:false always refused. Frozen non-null `instructions` are sent byte for byte as `developerInstructions` on `thread/start` and in the canonical thread settings of every `thread/resume`; null instructions send none. |
+| `codex_bound_gate` | Every admitted start contains never, user reviewer and explicit current bound; inheritance/reset and reserved-key refusal; limited bounds admitted with `network:false` only (qualified by `via-5lr.3.4`); full+network:false always refused. Frozen non-null `instructions` are sent byte for byte as `developerInstructions` on `thread/start` and in the canonical thread settings of every `thread/resume`; null instructions send none. |
 | `codex_two_threads` | Interleave A/B IDs and repeated item IDs; each observation stays in its owner; A cancel/unsubscribe leaves B running; unknown thread never leaks; equal-key acquisition launches one owned process. Deliver an A completion after uncertain settlement with A's driver open: it keeps A's original TurnNo and late:true; queue an A durable item when A's driver closes: it is committed late:true before A's lane ends; deliver another A completion after the close cutoff while B is active: it is dropped and counted, never session-level/B; reopen A on the same thread: it waits for the old unsubscribe's reply, and an old-turn item never reaches the new generation; tombstone count/byte exhaustion causes explicit connection overflow, no eviction or reassignment. |
 | `codex_cleanup_60s` | The driver applies the window from Core's `tool_grace`, not the stop order's `close_by`. With fake time and wall budget >60 s, ack plus open tool yields pending/no same-session dispatch at 59.999 s and uncertain terminal/warned successor at 60 s; a tool ending 20 s after acknowledgement settles `quiescent`; final completion settles early. c3 (interrupt only) settles `uncertain` at the window. Repeat with 1 s remaining wall budget: pending at 0.999 s, acknowledged/uncertain cancellation at 1 s, no extra wait. With zero remaining budget settle immediately. Late completion never mutates the terminal; no shared kill. |
 | `codex_control_races` | Interrupt during pending start; terminal-before-interrupt; ack missing; close/detach; all return by deadline with truthful evidence and no resend. |
@@ -600,7 +667,8 @@ Required live work: `via-5lr.3.4` must observe a real attempted prohibited
 write under read-only, and permitted/denied root and network operations
 for every advertised limited-bound combination, including changed and
 concurrent differing bounds on one server. Model noncompliance or marker
-absence is inconclusive. Verify never-ask after explicit reviewer selection,
+absence is inconclusive. Done 2026-10-06 for `network:false` (§3 Bound
+mapping and gate); `network:true` stays refused. Verify never-ask after explicit reviewer selection,
 the six response paths where inducible, persistent resume after actual
 server retirement with `excludeTurns:true`, output-schema set/clear,
 usage interval if upgrading its scope, and tool/auth/platform environment

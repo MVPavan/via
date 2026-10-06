@@ -792,7 +792,7 @@ fn a_resume_turn_is_checked() {
         bound: Some(Bound {
             mode: BoundMode::ReadOnly,
             extra_write_dirs: Vec::new(),
-            network: false,
+            network: true,
         }),
         ..TurnParams::default()
     };
@@ -811,6 +811,21 @@ fn a_resume_turn_is_checked() {
             .unwrap_err()
             .kind,
         RefusalKind::BoundUnsupported
+    );
+    let offline = Bound {
+        mode: BoundMode::ReadOnly,
+        extra_write_dirs: Vec::new(),
+        network: false,
+    };
+    let read_only = TurnParams {
+        bound: Some(offline.clone()),
+        ..TurnParams::default()
+    };
+    assert_eq!(
+        CodexAdapter::judge_turn("codex-app-server", "1", &read_only, None)
+            .unwrap()
+            .effective_bound,
+        Some(offline)
     );
 }
 

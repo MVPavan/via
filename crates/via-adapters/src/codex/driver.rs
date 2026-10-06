@@ -2044,7 +2044,9 @@ async fn confirm(
 
 /// The first echoed field that is not the one requested (packet §3:
 /// never, the user reviewer, the bound's sandbox, the session's model and
-/// directory).
+/// directory). Only the sandbox's type is compared: the 0.160.0 echo of a
+/// workspace-write thread has `excludeSlashTmp` and `excludeTmpdirEnvVar`
+/// false while every `turn/start` applies them true (via-5lr.3.4).
 fn echo_differs(
     opened: &ThreadResult,
     mode: SandboxMode,

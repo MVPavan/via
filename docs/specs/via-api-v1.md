@@ -71,7 +71,7 @@ decided in the slice that needs them, after re-probing.
 | P8 | Error code table §8.1 | as written |
 | P9 | Deprecation: kept for one minor release minimum; removed only in v2 | as written |
 | P10 | Socket `$XDG_RUNTIME_DIR/via/via.sock` else `~/.via/run/via.sock`; 0700/0600; peer uid check both ends | as written |
-| P11 | Codex owned stdio server key is `config_hash` without bound; `config_hash` covers VIA-controlled launch settings (resolved program path, arguments, passed environment, server cwd, protocol pin), not credentials or binary contents; the observed binary version is reported, not keyed. Every turn sets `sandboxPolicy`; mixed-bound sharing waits for pinned enforcement proof. OpenCode uses an owned shared `opencode serve --stdio` per launch key: the private namespace (anonymous profile identity and epoch, project-configuration switch) plus a hash of VIA-controlled launch settings, never credentials or binary contents; the observed version is reported, not keyed; the bound is not keyed (only `full` with `network:true` is admitted). At most one live server per namespace, fenced across restarts by Host's anchor journal. Closing a session detaches it. Bound-keyed routes refuse bound changes on resume | as reviewed in `docs/specs/vendors/codex.md` §9 and `docs/specs/vendors/opencode.md` §3 |
+| P11 | Codex owned stdio server key is `config_hash` without bound; `config_hash` covers VIA-controlled launch settings (resolved program path, arguments, passed environment, server cwd, protocol pin), not credentials or binary contents; the observed binary version is reported, not keyed. Every turn sets `sandboxPolicy`; mixed-bound sharing is qualified (`via-5lr.3.4`). OpenCode uses an owned shared `opencode serve --stdio` per launch key: the private namespace (anonymous profile identity and epoch, project-configuration switch) plus a hash of VIA-controlled launch settings, never credentials or binary contents; the observed version is reported, not keyed; the bound is not keyed (only `full` with `network:true` is admitted). At most one live server per namespace, fenced across restarts by Host's anchor journal. Closing a session detaches it. Bound-keyed routes refuse bound changes on resume | as reviewed in `docs/specs/vendors/codex.md` §9 and `docs/specs/vendors/opencode.md` §3 |
 | P12 | Live recovery after daemon restart is `unknown` for every route in v1; `resumed` only when a route's rejoin is probe-verified on the configured transport (Codex stdio server dies with the daemon, P3) | as written |
 | P13 | Version rule: every vendor version is supported; refused only on demonstrated handshake breakage; `untested` warns until the maintainers' check (owner OD1, 2026-09-30, superseding the 2026-09-26 P13 approval) | decided; C2 §5 (adapter design AD7) |
 
@@ -700,7 +700,7 @@ and refusals are governed by §4.2.
 
 | Route | `read_only` | `workspace_write` | `full` | `network: false` |
 |---|---|---|---|---|
-| `codex-app-server` | protocol-mapped, unverified; refuse pending pinned enforcement gate | protocol-mapped, unverified; refuse pending pinned enforcement gate | native with `network:true` | limited-bound network control only after proof; `full` + `network:false` refused |
+| `codex-app-server` | native with `network:false` (`via-5lr.3.4`); `network:true` refused | native with `network:false`, `extra_write_dirs` as writable roots (`via-5lr.3.4`); `network:true` refused | native with `network:true` | admitted with the limited bounds (network was denied live; `network_control` stays `false` pending an owner decision); `full` + `network:false` refused |
 | `claude-cli` | unqualified; refuse pending CLAUDE-BOUND-1 | unqualified; refuse pending CLAUDE-BOUND-1 | `network:true` eligible candidate, qualified only after exact live recipe continuity test; Bash runs anywhere in both modes; the file tools are confined to the working directories only under `harnesses.claude.restricted` (`vendors/claude-code.md` §4) | refused, including limited bounds |
 | `opencode-serve` | refused (A4, D9) | refused | only with `network:true` and empty `extra_write_dirs`; nonempty `extra_write_dirs` is `invalid_params` before server acquisition or vendor I/O | refused |
 | `pi-rpc` | refused (no sandbox) | refused | only with `network:true` and empty `extra_write_dirs`; nonempty `extra_write_dirs` is `invalid_params` before vendor I/O | refused |
@@ -719,9 +719,11 @@ route and the reason. `vendor` options that touch permission, sandbox,
 approval, instructions, cwd, model or session identity are refused as
 `invalid_params` kind `vendor_option_conflict` (reserved key list per
 adapter in C2 §6); canonical parameters always win.
-For Codex, limited bounds are omitted from `describe.capabilities.bounds`
-until `via-5lr.3.4` verifies their enforcement. Its full-access eligibility
-does not qualify mixed-bound sharing. The grouped `codex-cli` route is not
+For Codex, `via-5lr.3.4` verified the limited bounds' enforcement with
+`network:false`, including differing bounds on one shared server
+(`vendors/codex.md` §3). A Codex sandbox denial is not structured: the
+command fails (a write with `Read-only file system`) and `denied_actions`
+stays empty. The grouped `codex-cli` route is not
 enabled in this first-release table. For Claude, tool permissions differ from
 Bash OS sandboxing and all-tool containment. `describe` distinguishes the
 temporarily refused limited bounds from the separately pending full recipe;
@@ -815,7 +817,7 @@ below 1 MiB, and a conformance test assembles that maximum.
 | `stop_reason` | `end_turn`, `max_steps`, `budget`, `refusal`, `interrupted`, `deadline`, `error`, `other`; vendor word in `vendor_stop_reason` |
 | `cancel` | outcome and cleanup certainty (§3.5, §7.4) |
 | `bound` | requested, effective, and whether it was inherited |
-| `denied_actions` | actions the vendor's own bound denied (D3): `file_write`, `command`, `network`, `other` |
+| `denied_actions` | actions the vendor's own bound denied (D3): `file_write`, `command`, `network`, `other`; only those the vendor reports as denials (a Codex sandbox denial is not one: the command just fails, §4.2) |
 | `auto_declined_requests` | vendor requests VIA declined (D3) |
 | `usage` | `scope` ∈ `turn` (verified per-turn), `session_cumulative`, `vendor_interval` (numbers reported, interval not verified); `provenance` `reported`/`unavailable`. `turn` sums the model calls of the vendor session the turn ran in; delegated sub-agent sessions may be excluded (OpenCode task sessions are) |
 | `steps` | the vendor's own count of model steps in the turn (Claude `num_turns`), or `null` when the vendor reports none; VIA's count is only in `status` `progress` (§3.7) |
@@ -1111,7 +1113,7 @@ approval.
 | # | Question | Recommendation / alternatives |
 |---|---|---|
 | P7 | Codex pending cleanup | reviewed §3.5/§7.3 rule: settle at `min(acknowledged_at + 60 s, wall_deadline)`; do not add `--after-uncertain` |
-| P11 | server key vs per-turn bound | reviewed §Decisions rule; Codex key excludes bound and mixed-bound operation awaits enforcement proof; OpenCode shares one owned server per launch key (namespace plus launch-settings hash) |
+| P11 | server key vs per-turn bound | reviewed §Decisions rule; Codex key excludes bound and mixed-bound operation is qualified (`via-5lr.3.4`); OpenCode shares one owned server per launch key (namespace plus launch-settings hash) |
 | P12 | live recovery gate | `unknown` everywhere in v1; alternative: enable Codex rejoin after the socket-transport probe (D9) |
 | P13 | version rule | Version rule: every vendor version is supported; refused only on demonstrated handshake breakage; `untested` warns until the maintainers' check (owner OD1, 2026-09-30, superseding the 2026-09-26 P13 approval) |
 | Q6 | Claude steer semantics | resolved `unsupported`; busy input can merge into a running result, so no steer input is written |

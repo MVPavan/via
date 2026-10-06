@@ -37,11 +37,6 @@ const EFFORTS: &[(&str, &str)] = &[
 /// counted too, as `opencode-serve` counts it, for headroom.
 pub(crate) const PROMPT_ECHO_MAX: usize = 1_040_384;
 
-/// Whether `via-5lr.3.4` has qualified enforcement of the limited bounds.
-/// Until it has, `read_only` and `workspace_write` are protocol-mapped but
-/// refused (vendors/codex.md §3 Bound mapping and gate).
-const LIMITED_BOUNDS_QUALIFIED: bool = false;
-
 /// Vendor keys refused as `vendor_option_conflict` (C2 §6.1, packet §3):
 /// what VIA sets on every thread and turn, the config keys behind them,
 /// and the selectors that would change identity, policy or tools.
@@ -76,8 +71,8 @@ const RESERVED: &[&str] = &[
 ];
 
 /// The capabilities `codex-app-server` declares (packet §7, C1 §4.2): the
-/// limited bounds are omitted until their enforcement is qualified, and
-/// `full` needs `network: true`.
+/// limited bounds, qualified live by `via-5lr.3.4` with `network: false`
+/// only; `full` needs `network: true`.
 pub(crate) fn capabilities() -> Capabilities {
     let unsupported = |reason: &str| Support::Unsupported {
         reason: reason.to_owned(),
@@ -98,7 +93,11 @@ pub(crate) fn capabilities() -> Capabilities {
             effort: Support::Native,
             max_steps: unsupported("codex-app-server has no per-turn step limit"),
         },
-        bounds: vec![BoundMode::Full],
+        bounds: vec![
+            BoundMode::ReadOnly,
+            BoundMode::WorkspaceWrite,
+            BoundMode::Full,
+        ],
         network_control: false,
         recover: unsupported(
             "an owned stdio server cannot rejoin an in-flight turn after a daemon restart",
@@ -170,8 +169,9 @@ pub(crate) struct Sandbox {
 pub(crate) enum BoundRefusal {
     /// `full` with `network: false`: no policy variant exists.
     FullWithoutNetwork,
-    /// A limited bound whose enforcement is not yet qualified.
-    Unqualified,
+    /// A limited bound with `network: true`: its network access is not
+    /// qualified.
+    LimitedWithNetwork,
 }
 
 impl BoundRefusal {
@@ -181,19 +181,23 @@ impl BoundRefusal {
             Self::FullWithoutNetwork => {
                 format!("route {route} has no full-access policy without network access")
             }
-            Self::Unqualified => format!(
-                "route {route} has not verified enforcement of limited bounds (pending via-5lr.3.4)"
+            Self::LimitedWithNetwork => format!(
+                "route {route} has not verified network access under a limited bound: use network false"
             ),
         }
     }
 }
 
 /// The packet §3 bound mapping, gated: a limited bound maps to its policy
-/// but is refused until [`LIMITED_BOUNDS_QUALIFIED`]; `full` with
-/// `network: false` is always refused; there is no fallback to `full`.
+/// with `network: false` only (`via-5lr.3.4` qualified no network access
+/// under a sandbox); `full` with `network: false` is always refused; there
+/// is no fallback to `full`.
 pub(crate) fn sandbox(bound: &Bound) -> Result<Sandbox, BoundRefusal> {
     let mapped = match bound.mode {
         BoundMode::Full if !bound.network => return Err(BoundRefusal::FullWithoutNetwork),
+        BoundMode::ReadOnly | BoundMode::WorkspaceWrite if bound.network => {
+            return Err(BoundRefusal::LimitedWithNetwork);
+        }
         BoundMode::Full => Sandbox {
             mode: SandboxMode::DangerFullAccess,
             policy: SandboxPolicy::DangerFullAccess,
@@ -214,11 +218,7 @@ pub(crate) fn sandbox(bound: &Bound) -> Result<Sandbox, BoundRefusal> {
             },
         },
     };
-    match bound.mode {
-        BoundMode::Full => Ok(mapped),
-        BoundMode::ReadOnly | BoundMode::WorkspaceWrite if LIMITED_BOUNDS_QUALIFIED => Ok(mapped),
-        BoundMode::ReadOnly | BoundMode::WorkspaceWrite => Err(BoundRefusal::Unqualified),
-    }
+    Ok(mapped)
 }
 
 /// How the route judges the caller's Codex vendor options (C2 §6.1).
@@ -259,8 +259,9 @@ mod tests {
     }
 
     /// Packet §3: `full` + network maps to `danger-full-access` /
-    /// `dangerFullAccess`; `full` without network and the unqualified
-    /// limited bounds are refused, never mapped to `full`.
+    /// `dangerFullAccess`; the qualified limited bounds without network map
+    /// to their own policies; `full` without network and a limited bound
+    /// with network are refused, never mapped to `full`.
     #[test]
     fn bound_mapping_and_gate() {
         assert_eq!(
@@ -274,19 +275,53 @@ mod tests {
             sandbox(&bound(BoundMode::Full, false)),
             Err(BoundRefusal::FullWithoutNetwork)
         );
+        assert_eq!(
+            sandbox(&bound(BoundMode::ReadOnly, false)),
+            Ok(Sandbox {
+                mode: SandboxMode::ReadOnly,
+                policy: SandboxPolicy::ReadOnly {
+                    network_access: false
+                },
+            })
+        );
+        assert_eq!(
+            sandbox(&bound(BoundMode::WorkspaceWrite, false)),
+            Ok(Sandbox {
+                mode: SandboxMode::WorkspaceWrite,
+                policy: SandboxPolicy::WorkspaceWrite {
+                    writable_roots: vec!["/extra".into()],
+                    network_access: false,
+                    exclude_slash_tmp: true,
+                    exclude_tmpdir_env_var: true,
+                },
+            })
+        );
         for mode in [BoundMode::ReadOnly, BoundMode::WorkspaceWrite] {
-            for network in [true, false] {
-                assert_eq!(
-                    sandbox(&bound(mode, network)),
-                    Err(BoundRefusal::Unqualified),
-                    "{mode:?} network {network}"
-                );
-            }
+            assert_eq!(
+                sandbox(&bound(mode, true)),
+                Err(BoundRefusal::LimitedWithNetwork),
+                "{mode:?}"
+            );
         }
     }
 
-    /// The protocol mapping the gate holds back encodes as packet §3's
-    /// table, tmp exclusions included.
+    /// `describe` offers exactly the bounds [`sandbox`] can map for some
+    /// `network` value.
+    #[test]
+    fn declared_bounds_follow_the_gate() {
+        assert_eq!(
+            capabilities().bounds,
+            [
+                BoundMode::ReadOnly,
+                BoundMode::WorkspaceWrite,
+                BoundMode::Full
+            ]
+        );
+        assert!(!capabilities().network_control);
+    }
+
+    /// The limited policies encode as packet §3's table, tmp exclusions
+    /// included.
     #[test]
     fn limited_policies_encode_as_the_packet_table() {
         let policy = SandboxPolicy::WorkspaceWrite {

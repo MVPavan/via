@@ -72,7 +72,7 @@ the agent's responsibility: VIA stops only the agent and reports leftovers
 | A5 | ACP decline: choose a reject-kind option, else `cancelled`; never counted as enforcement | as written; shape unverified |
 | A6 | Auto-decline deadline 5 s, from Core config, served on the control path, one value for every adapter (AD17); fail closed when an unknown request cannot be answered, without fabricating a decline | as reviewed in Claude §10; AD17 withdraws the Codex and OpenCode packets' 1 s |
 | A7 | Codex live recovery is unsupported on owned stdio; `thread/resume` continues a conversation after a resolved turn, not an in-flight turn. `Dead` requires verified death, otherwise `Unknown`; no resend | as reviewed in Codex §9 |
-| A8 | Codex owned stdio server key: `config_hash`, covering VIA-controlled launch settings (resolved program path, arguments, passed environment, server cwd, protocol pin), not credentials or binary contents; the observed binary version is reported, not keyed; bound omitted due per-turn `sandboxPolicy`, mixed-bound use gated on pinned enforcement proof. OpenCode shares one owned `opencode serve --stdio` per launch key: namespace (anonymous profile identity/epoch, project-configuration switch) plus a hash of VIA-controlled launch settings; no credentials, bound, owner or version; at most one live server per namespace, fenced across restarts by Host's anchor journal (C1 P11) | as reviewed in Codex §9 and OpenCode §3 |
+| A8 | Codex owned stdio server key: `config_hash`, covering VIA-controlled launch settings (resolved program path, arguments, passed environment, server cwd, protocol pin), not credentials or binary contents; the observed binary version is reported, not keyed; bound omitted due per-turn `sandboxPolicy`, mixed-bound use qualified by `via-5lr.3.4`. OpenCode shares one owned `opencode serve --stdio` per launch key: namespace (anonymous profile identity/epoch, project-configuration switch) plus a hash of VIA-controlled launch settings; no credentials, bound, owner or version; at most one live server per namespace, fenced across restarts by Host's anchor journal (C1 P11) | as reviewed in Codex §9 and OpenCode §3 |
 
 ## 1. Purpose and rules
 
@@ -733,7 +733,7 @@ default.
   effective effort (Claude ignores unknown effort; OpenCode accepts any
   variant); hidden execution surfaces (Codex code-mode `exec` with no item;
   hooks and plugins); complete cleanup; bound enforcement semantics, including
-  Codex read-only once `via-5lr.3.4` enables it; unchanged usage or terminal
+  Codex read-only (qualified live by `via-5lr.3.4`, not by the handshake); unchanged usage or terminal
   semantics.
 - Proceeding on unchecked versions is the owner's accepted risk. The warning
   stays visible in every receipt, status and envelope of such a turn.
@@ -906,7 +906,7 @@ reported tools remain open, within the driver-applied P7 window (§4.1). No late
 guarantee or thread-to-OS-PID mapping is assumed. Closing one session only
 detaches its thread. The six no-grant response bodies validate against the
 pinned schemas, but live receipt remains a qualification gate. Disable
-notification opt-outs initially; mixed-bound sharing needs `via-5lr.3.4`.
+notification opt-outs initially; mixed-bound sharing is qualified by `via-5lr.3.4`.
 
 Pi's exact per-turn recipe, private-profile policy, identity and
 continuation rule, typed protocol, interrupt evidence and uncertain-predecessor
