@@ -86,14 +86,14 @@ fn s_launch_plan_inherit_per_harness() {
     };
     // Codex (x.3.2 X1): `harnesses.codex.inherit` sets skills off over
     // Codex's default request, every category on (owner 2026-10-05). Hooks,
-    // MCP servers and instruction files are `on` by the packet's recorded
-    // live evidence (owner 2026-10-06); skills, plugins and agents have
-    // none, so they are `unknown`.
+    // MCP servers, instruction files, plugins and agents are `on` by the
+    // packet's recorded live evidence (owner 2026-10-06; via-5lr.3.4);
+    // skills off has no switch, so it is `unknown`.
     let codex = InheritPlan {
         requested: inherit(json!({"hooks": "on", "mcp_servers": "on", "plugins": "on",
             "skills": "off", "agents": "on", "instruction_files": "on"})),
         effective: inherit(json!({"hooks": "on", "mcp_servers": "on",
-            "plugins": "unknown", "skills": "unknown", "agents": "unknown",
+            "plugins": "on", "skills": "unknown", "agents": "on",
             "instruction_files": "on"})),
     };
     // Per harness, with the model the request names: the plan's inherit,

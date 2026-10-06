@@ -3828,7 +3828,7 @@ fn codex_stop_while_identity_blocked() {
     // A stop is no error (C2 §2: `Stopped` reports none).
     turn["error"] = Value::Null;
     turn["cleanup"] = json!("quiescent");
-    turn["warnings"] = json!(["config_switch_unverified"]);
+    turn["warnings"] = json!([]);
     let knobs = conformance_run::Knobs {
         stop_after: Some(std::time::Duration::from_millis(300)),
         ..conformance_run::Knobs::default()
@@ -4063,7 +4063,7 @@ fn codex_overflow_before_acceptance() {
     unaccepted(&mut expect, "overflow", tested());
     let turn = &mut turn_mut(&mut expect, 0)["expect"];
     turn["cleanup"] = json!("uncertain");
-    turn["warnings"] = json!(["config_switch_unverified"]);
+    turn["warnings"] = json!([]);
     let mut keeper = refused_expect["turns"][0].clone();
     keeper["session"] = json!("keeper");
     let mut probe = missing_expect["turns"][0].clone();

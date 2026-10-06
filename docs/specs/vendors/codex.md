@@ -220,9 +220,9 @@ The tmp exclusions avoid silently granting extra writable paths.
 the evidence below): `describe` lists `read_only`, `workspace_write` and
 `full`. A limited bound with `network:true` is refused as
 `bound_unsupported` (no run showed what the sandbox then permits), as is
-`full` with `network:false`. `network_control` stays `false` (owner
-decision pending; the evidence shows `network:false` denied in both
-limited bounds). An `allow_untested` compatibility parameter has no effect.
+`full` with `network:false`. `network_control` is `true`: the route
+honours `network:false` (denied live in both limited bounds), which the
+limited bounds require; `full` still requires `network:true`. An `allow_untested` compatibility parameter has no effect.
 `full` grants full access; it is never a fallback for a refused limited
 bound. The server key stays bound-free: differing bounds share one server,
 each `turn/start` carrying its own policy (observed below).
@@ -341,8 +341,10 @@ shows Codex loads it, else `unknown`. An off VIA cannot apply is `unknown`
 and warns: MCP servers have no switch (`--disable apps` stops only
 `codex_apps`, and `-c mcp_servers={}` merges into the user's table and
 removes nothing; the earlier `--disable apps` for MCP off, via-4gl, was
-removed), nor do instruction files. The evidence was recorded on 0.159.2
-(`checked`) and, for MCP servers, again on 0.160.0; on any version outside
+removed), nor do instruction files, plugins, skills or agents. The
+evidence was recorded on 0.159.2 (`checked`) and, for MCP servers, again
+on 0.160.0; for plugins, skills and agents on 0.160.0 only (`via-5lr.3.4`,
+round 2 below); on any version outside
 `checked` (0.160.0 included) the same states are reported with
 `vendor_version_untested` (C2 §6.2, §5). Revisit: a later version may
 add disabling layers (owner, 2026-10-05). Every switch enters
@@ -352,23 +354,22 @@ add disabling layers (owner, 2026-10-05). Every switch enters
 |---|---|---|
 | hooks (on) | on: no switch; the owner's hooks ran with none (2026-09-30 re-probe, `docs/workstreams/rust-foundation/adapters/reprobe-codex.md` item 5); off: `--disable hooks` (**verified**) | `on` |
 | MCP servers (on) | on: no switch; the user's configured servers and `codex_apps` started with none (2026-09-30 re-probe; checked again 2026-10-05 on 0.160.0, `mcpServer/startupStatus/updated`); off: no switch, `unknown`; inventory via `mcpServerStatus/list` (schema, **unverified**) | `on` |
-| plugins (on) | plugin support exists (schema); no live evidence of loading; switch **unverified** | `unknown`, warns |
-| skills (on) | no live evidence; switch **unverified** | `unknown`, warns |
-| agents (on) | no live evidence; switch **unverified** | `unknown`, warns |
+| plugins (on) | on: no switch; installed plugins' skills were listed (2026-10-06 on 0.160.0, round 2 below), but Codex loads plugins asynchronously after the server starts, so a turn accepted right after a fresh server start may not see them yet (observed twice); off: no switch, `unknown` | `on` |
+| skills (on) | on: no switch; user, project and bundled skills were listed (2026-10-06 on 0.160.0, round 2 below); off: no switch, `unknown` | `on` |
+| agents (on) | on: no switch; the model named the project's agent roles, which appear nowhere else in its context (2026-10-06 on 0.160.0, round 2 below; the evidence is the model's report); off: no switch, `unknown` | `on` |
 | instruction files (on) | on: no switch; `thread/start` `instructionSources` listed the loaded AGENTS.md paths (0.159.2 re-probe; completeness **unverified**); off: no switch, `unknown` | `on` |
 
-Live round 2 checks (Codex): whether a VIA-started server loads the
-user's plugins, skills and agents with no switch, each recorded with its
-evidence so the category can be declared `on`, or stays `unknown`.
-Recorded 2026-10-06 on 0.160.0 (`via-5lr.3.4` runs, §3; the thread's
-Codex rollout, its developer context; cwd inside this repository); the
-declarations above are unchanged pending that decision:
+Live round 2 checks (Codex), **done**: whether a VIA-started server
+loads the user's plugins, skills and agents with no switch. Recorded
+2026-10-06 on 0.160.0 (`via-5lr.3.4` runs, §3; the thread's Codex
+rollout, its developer context; cwd inside this repository); all three
+are declared `on` (owner rule of 2026-10-06, decided by the coordinator):
 
 - **Skills: loaded.** The `skills_instructions` block listed the bundled
   system skills (`~/.codex/skills/.system`, 4), the user's
-  `~/.agents/skills` (4) and the project's `.codex/skills` (23). One
-  user skill under `~/.codex/skills/<name>` was not listed (reason
-  unverified).
+  `~/.agents/skills` (4) and the project's `.codex/skills` (23). Open
+  observation: one user skill under `~/.codex/skills/<name>` was not
+  listed (unexplained).
 - **Plugins: loaded, after the server starts.** Turns that started 50 s
   or more after their server's launch also listed 23 skills from 9
   installed plugins (`~/.codex/plugins/cache/…`); the first

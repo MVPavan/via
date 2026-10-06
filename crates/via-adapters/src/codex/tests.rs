@@ -212,8 +212,8 @@ fn no_request_disables_the_apps_server() {
 /// recorded live evidence shows Codex loads the user's configuration for
 /// it (packet §4): hooks (the owner's hooks ran), MCP servers (the user's
 /// servers and `codex_apps` started) and instruction files
-/// (`instructionSources` listed the loaded AGENTS.md). Plugins, skills and
-/// agents have none: `unknown`, warning. Hooks off is the verified
+/// (`instructionSources` listed the loaded AGENTS.md), and since
+/// `via-5lr.3.4`'s run-5 plugins, skills and agents. Hooks off is the verified
 /// `--disable hooks`; an off VIA cannot apply is `unknown`, never a
 /// claimed suppression.
 #[test]
@@ -247,10 +247,10 @@ fn codex_categories_follow_the_recorded_evidence() {
     let (effective, listed) = planned(default);
     assert_eq!(
         states(effective),
-        [On, On, Unknown, Unknown, Unknown, On],
+        [On; 6],
         "hooks, MCP servers, plugins, skills, agents, instruction files"
     );
-    assert_eq!(listed, ["plugins", "skills", "agents"]);
+    assert!(listed.is_empty(), "{listed:?}");
     let off: Inherit = serde_json::from_value(json!({"hooks": "off", "mcp_servers": "off",
         "plugins": "off", "skills": "off", "agents": "off", "instruction_files": "off"}))
     .unwrap();

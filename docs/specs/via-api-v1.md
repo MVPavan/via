@@ -432,8 +432,8 @@ Params: `session`, `turn?` (default the running turn, else the latest),
 ```json
 {"session_id":"s_7f3k9q2mzr4c","state":"active","admission":"open","harness":"codex","model":"gpt-6-sol",
  "route":"codex-app-server","adapter_version":"0.1.0","vendor_version":"0.159.2","version_status":"tested",
- "inherit":{"hooks":"on","mcp_servers":"on","plugins":"unknown","skills":"unknown","agents":"unknown","instruction_files":"on"},
- "warnings":[{"code":"config_switch_unverified","message":"…","data":{"categories":[…]}}],
+ "inherit":{"hooks":"on","mcp_servers":"on","plugins":"on","skills":"on","agents":"unknown","instruction_files":"on"},
+ "warnings":[{"code":"config_switch_unverified","message":"…","data":{"categories":[{"category":"agents","requested":"off","effective":"unknown"}]}}],
  "vendor_session_id":"019…","vendor_identity_verified":true,"cwd":"/work/repo","process":{"alive":true,"cleanup":"quiescent","idle_since":null},
  "active_turn":{"n":2,"state":"running","phase":"accepted","started_at":"…","last_event_seq":57,"cancel":null},
  "progress":{"turn":2,"current_step":4,"phase":"tools","running_tools":["shell"],"tools_overflow":false,"last_activity_at":"…",
@@ -692,7 +692,9 @@ parameters on `resume` are `invalid_params`.
 ```
 
 `support` ∈ `native`, `partial` (with `semantics`), `unsupported` (with
-`reason`). `require` passes only `native` unless written `verb:partial`.
+`reason`). `network_control: true` means the route honours `network:false`
+for the bound modes it admits it with (§4.2); `false` means it refuses
+`network:false`. `require` passes only `native` unless written `verb:partial`.
 The JSON above illustrates DTO shape; route-specific current qualification
 and refusals are governed by §4.2.
 
@@ -700,7 +702,7 @@ and refusals are governed by §4.2.
 
 | Route | `read_only` | `workspace_write` | `full` | `network: false` |
 |---|---|---|---|---|
-| `codex-app-server` | native with `network:false` (`via-5lr.3.4`); `network:true` refused | native with `network:false`, `extra_write_dirs` as writable roots (`via-5lr.3.4`); `network:true` refused | native with `network:true` | admitted with the limited bounds (network was denied live; `network_control` stays `false` pending an owner decision); `full` + `network:false` refused |
+| `codex-app-server` | native with `network:false` (`via-5lr.3.4`); `network:true` refused | native with `network:false`, `extra_write_dirs` as writable roots (`via-5lr.3.4`); `network:true` refused | native with `network:true` | honoured with the limited bounds (`network_control:true`; denied live in both, `via-5lr.3.4`); limited bounds require it; `full` + `network:false` refused |
 | `claude-cli` | unqualified; refuse pending CLAUDE-BOUND-1 | unqualified; refuse pending CLAUDE-BOUND-1 | `network:true` eligible candidate, qualified only after exact live recipe continuity test; Bash runs anywhere in both modes; the file tools are confined to the working directories only under `harnesses.claude.restricted` (`vendors/claude-code.md` §4) | refused, including limited bounds |
 | `opencode-serve` | refused (A4, D9) | refused | only with `network:true` and empty `extra_write_dirs`; nonempty `extra_write_dirs` is `invalid_params` before server acquisition or vendor I/O | refused |
 | `pi-rpc` | refused (no sandbox) | refused | only with `network:true` and empty `extra_write_dirs`; nonempty `extra_write_dirs` is `invalid_params` before vendor I/O | refused |

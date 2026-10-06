@@ -72,7 +72,8 @@ const RESERVED: &[&str] = &[
 
 /// The capabilities `codex-app-server` declares (packet §7, C1 §4.2): the
 /// limited bounds, qualified live by `via-5lr.3.4` with `network: false`
-/// only; `full` needs `network: true`.
+/// only, which the route honours (`network_control`); `full` needs
+/// `network: true`.
 pub(crate) fn capabilities() -> Capabilities {
     let unsupported = |reason: &str| Support::Unsupported {
         reason: reason.to_owned(),
@@ -98,7 +99,8 @@ pub(crate) fn capabilities() -> Capabilities {
             BoundMode::WorkspaceWrite,
             BoundMode::Full,
         ],
-        network_control: false,
+        // `network: false` is honoured in both limited bounds (via-5lr.3.4).
+        network_control: true,
         recover: unsupported(
             "an owned stdio server cannot rejoin an in-flight turn after a daemon restart",
         ),
@@ -116,12 +118,14 @@ pub(crate) fn capabilities() -> Capabilities {
 /// whatever it contains) where recorded live evidence shows Codex loads
 /// it: hooks (the owner's hooks ran, 2026-09-30), MCP servers (the user's
 /// servers and `codex_apps` started, 2026-10-05) and instruction files
-/// (`instructionSources` listed the loaded AGENTS.md, 0.159.2 re-probe).
-/// Plugins, skills and agents have no such evidence: `unknown`. An off VIA
-/// cannot apply is declared unverified, so it reports `unknown`, never a
-/// suppression.
+/// (`instructionSources` listed the loaded AGENTS.md, 0.159.2 re-probe),
+/// and, from `via-5lr.3.4`'s 0.160.0 runs (2026-10-06), skills (listed
+/// with no switch), agents (the model named the project's agent roles)
+/// and plugins (their skills listed; Codex loads plugins after the server
+/// starts, so a turn accepted right after a fresh start may not see them).
+/// An off VIA cannot apply is declared unverified, so it reports
+/// `unknown`, never a suppression.
 pub(crate) fn categories() -> BTreeMap<Category, CategoryDecl> {
-    let unswitched = CategoryDecl::default();
     let loaded = |off| CategoryDecl {
         on: Switch::None,
         off,
@@ -131,10 +135,11 @@ pub(crate) fn categories() -> BTreeMap<Category, CategoryDecl> {
         .into_iter()
         .map(|category| match category {
             Category::Hooks => (category, loaded(Switch::Verified)),
-            Category::McpServers | Category::InstructionFiles => {
-                (category, loaded(Switch::Unverified))
-            }
-            Category::Plugins | Category::Skills | Category::Agents => (category, unswitched),
+            Category::McpServers
+            | Category::InstructionFiles
+            | Category::Plugins
+            | Category::Skills
+            | Category::Agents => (category, loaded(Switch::Unverified)),
         })
         .collect()
 }
@@ -317,7 +322,7 @@ mod tests {
                 BoundMode::Full
             ]
         );
-        assert!(!capabilities().network_control);
+        assert!(capabilities().network_control);
     }
 
     /// The limited policies encode as packet §3's table, tmp exclusions
