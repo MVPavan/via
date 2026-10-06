@@ -800,9 +800,11 @@ overflows, the envelope reports scope `vendor_interval` with
 `usage_interval_unverified`. A `UsageSample` also carries
 `interval_unverified: bool`, set by a route whose vendor counted that sample
 over an interval VIA has not verified (OpenCode's compaction calls,
-OpenCode packet §12); one such sample in a turn, or such a turn aggregate,
-gives the same `vendor_interval` and warning, even when a later sample
-supersedes its key. A component is `null` if any contributing
+OpenCode packet §12). Among a turn's call samples, one such sample gives the
+same `vendor_interval` and warning, even when a later sample supersedes its
+key. A turn aggregate supersedes the call samples, their mark included (C1
+§5): the envelope, or a late terminal's revision, then has `vendor_interval`
+and the warning only when the aggregate itself is marked. A component is `null` if any contributing
 sample lacks it. Step rows keep their existing per-step rule for `status`.
 `VendorTerminal.cost` gives `{usd, scope, provenance}`, `provenance`
 `Reported` (the vendor's accounted amount) or `Estimated` (computed from

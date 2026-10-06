@@ -771,6 +771,12 @@ mod tests {
         let (tokens, interval) = UsageLedger::default().figure(Some(&aggregate)).unwrap();
         assert_eq!(tokens.total, Some(300));
         assert!(interval, "an unverified aggregate");
+
+        // Slice A critical #2 (C1 §5 aggregate precedence): a verified
+        // aggregate supersedes the samples, their unverified mark included.
+        let (tokens, interval) = ledger.figure(Some(&call(None, 7, None, 9))).unwrap();
+        assert_eq!(tokens.total, Some(9));
+        assert!(!interval, "a verified aggregate over an unverified sample");
     }
 
     /// AD6: a component is `null` if any contributing sample lacks it.
