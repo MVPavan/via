@@ -2005,3 +2005,70 @@ fn conformance_intake_inherited_bound_from_check_turn() {
         daemon.stop().await;
     });
 }
+
+/// Critical review (owner, 2026-10-06; C1 §5 `vendor_passthrough`): the
+/// warning survives an unrelated corruption of the session's frozen
+/// parameters. A session row that holds `vendor_args` (written here, as
+/// the fake harness refuses them at spawn) with a corrupt `inherit`, or
+/// with a list that itself breaks its bounds, fails its queued turn
+/// `failed(store)` on restart, and that envelope and `status` still carry
+/// one `vendor_passthrough`; the strict read still refuses the row.
+#[test]
+fn conformance_intake_corrupt_params_keep_the_passthrough_warning() {
+    for corruption in [
+        "UPDATE sessions SET params=json_set(params,'$.vendor_args',json('[\"--name=x\"]'),\
+         '$.inherit',json('null')) WHERE id=?1",
+        "UPDATE sessions SET params=json_set(params,'$.vendor_args',json('[1]')) WHERE id=?1",
+    ] {
+        let root = Root::new();
+        let path = root.scenario("scenario.json", &scenario(&json!({}), &[]));
+        let open = || {
+            let env = BootstrapEnv::from_vars([
+                ("VIA_FAKE_AGENT_BINARY", binary("via-fake-agent")),
+                ("VIA_FAKE_SCENARIO", path.clone()),
+                ("VIA_FAKE_SYNC_DIR", root.path().join("sync")),
+            ]);
+            Engine::open(
+                &root.path().join("state"),
+                &root.path().join("runtime"),
+                AdapterConfig::load(env, None).unwrap(),
+                binary("via"),
+            )
+            .unwrap()
+        };
+        let warned = |value: &Value| {
+            value["warnings"].as_array().map_or(0, |warnings| {
+                warnings
+                    .iter()
+                    .filter(|warning| warning["code"] == "vendor_passthrough")
+                    .count()
+            })
+        };
+        run(async {
+            let engine = open();
+            let raw = json!({"harness":"fake","model":"fake","prompt":"p","handle":HANDLE});
+            let (session, _) = engine
+                .spawn(
+                    serde_json::from_value(raw.clone()).unwrap(),
+                    &raw.to_string(),
+                )
+                .await
+                .unwrap()
+                .enqueued
+                .unwrap();
+            drop(engine);
+            tamper(root.path(), &session, corruption);
+            let engine = open();
+            assert_eq!(engine.recover().await.unwrap(), 0);
+            let handoff = engine.hand_off_queued().await.unwrap();
+            assert_eq!((handoff.enqueued, handoff.failed), (0, 1), "{corruption}");
+            let envelope = engine.result(&format!("{session}/1")).await.unwrap();
+            let envelope: Value = serde_json::from_str(envelope.get()).unwrap();
+            assert_eq!(envelope["failure"]["class"], "store", "{envelope}");
+            assert_eq!(warned(&envelope), 1, "{corruption}: {envelope}");
+            let params = serde_json::from_value(json!({"session":session})).unwrap();
+            let status = engine.status(params).await.unwrap();
+            assert_eq!(warned(&status), 1, "{corruption}: {status}");
+        });
+    }
+}
