@@ -167,6 +167,20 @@ impl WireRuntime {
             .map_err(WireError::Host)
     }
 
+    /// Host's session-scoped pre-launch absence check (runtime §5.2), passed
+    /// through unchanged: true only when every `Turn` anchor record of
+    /// `session` has a committed absence proof. It signals nothing.
+    pub async fn session_predecessors_resolved(
+        &self,
+        session: &via_store::SessionId,
+        deadline: Deadline,
+    ) -> Result<bool, WireError> {
+        self.host
+            .session_predecessors_resolved(session, deadline)
+            .await
+            .map_err(WireError::Host)
+    }
+
     /// Held groups no live control owns (design §6.6).
     pub fn held_unproven(&self) -> usize {
         self.host.held_unproven()

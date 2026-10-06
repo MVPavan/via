@@ -1315,6 +1315,49 @@ impl Host {
         Ok(report)
     }
 
+    /// Runtime §5.2's session-scoped pre-launch absence check (Pi R1): true
+    /// only when every `Turn`-owned anchor record of `session` has a
+    /// committed `GroupAbsent` proof. One [`Self::reprobe_held`] pass over
+    /// the session's held groups first proves any that are gone; then one
+    /// Store read counts every record of the session still without a proof:
+    /// a busy group, a present one, and a record this Host has not re-held
+    /// since a restart. It sends no signal, waits for no group and holds
+    /// nothing; both steps share `deadline`.
+    ///
+    /// `Ok(false)` only when the Store answered and a group is unproven.
+    /// Every Store failure is `Err` (decision C-3): a failed or timed-out
+    /// read, and a proof the pass observed but did not commit (the token
+    /// stays held for the next pass). A deadline spent before the Store
+    /// read is [`HostError::Deadline`].
+    pub async fn session_predecessors_resolved(
+        &self,
+        session: &crate::SessionId,
+        deadline: Deadline,
+    ) -> Result<bool, HostError> {
+        if Instant::now() >= deadline.instant() {
+            return Err(HostError::Deadline);
+        }
+        let pass = self.reprobe_held(deadline, Some(session.clone())).await?;
+        if !pass.not_committed.is_empty() {
+            return Err(HostError::Journal {
+                site: JournalSite::Absence,
+                uncertain: false,
+            });
+        }
+        if Instant::now() >= deadline.instant() {
+            return Err(HostError::Deadline);
+        }
+        // A read that never completed is a Store failure, not unresolved.
+        let unproven = timeout_at(
+            deadline.instant(),
+            self.journal.session_anchors_unproven(session.clone()),
+        )
+        .await
+        .map_err(|_| HostError::Store("session anchor read timed out"))?
+        .map_err(HostError::StoreUnavailable)?;
+        Ok(!unproven)
+    }
+
     async fn reprobe_one(
         &self,
         record: AnchorRecord,
