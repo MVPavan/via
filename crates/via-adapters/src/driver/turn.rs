@@ -114,15 +114,16 @@ pub(crate) fn end_active(state: &Mutex<DriverState>, turn: crate::TurnNumber) {
 }
 
 /// Polls `route` while delivering what it hands over, then delivers the
-/// rest by the wall's cutoff: data deliverable at once still goes under
-/// the daemon force.
+/// rest until `cut` resolves (the wall's cutoff, or an adapter's earlier
+/// live bound): data deliverable at once still goes under the daemon
+/// force.
 pub(crate) async fn deliver_beside<N: Normalize, R>(
     route: impl Future<Output = Option<R>>,
     hop_rx: mpsc::Receiver<via_routes::Decoded<N::Message>>,
     normalizer: &mut N,
     sink: &ObservationSink,
     activity: &crate::TurnActivity,
-    (mut force, cutoff): (ForceWatch, Deadline),
+    (mut force, cut): (ForceWatch, impl Future<Output = ()>),
     health: &watch::Sender<DriverHealth>,
 ) -> (Option<R>, Rest) {
     tokio::pin!(route);
@@ -193,9 +194,11 @@ pub(crate) async fn deliver_beside<N: Normalize, R>(
         Rest::Delivered
     };
     // One cutoff (C2 §4.1): no delivery outlives the wall plus 3 s.
+    tokio::pin!(rest, cut);
     let rest = tokio::select! {
         biased;
-        rest = tokio::time::timeout_at(cutoff.instant(), rest) => rest.unwrap_or(Rest::Undelivered),
+        rest = &mut rest => rest,
+        () = &mut cut => Rest::Undelivered,
         () = forced(&mut force) => Rest::Forced,
     };
     (result, rest)

@@ -24,8 +24,8 @@ use via_wire::{
 mod serving;
 
 pub(crate) use serving::{
-    CLEANUP_ALLOWANCE, Failed, Interrupt, Next, Serving, Signals, cleanup_deadline, pending,
-    protocol, transport, wire_cause,
+    Answer, CLEANUP_ALLOWANCE, Failed, Interrupt, Next, Serving, Signals, cleanup_deadline,
+    pending, protocol, transport, wire_cause,
 };
 use serving::{acquire_failure, wake_on_order};
 
@@ -533,7 +533,14 @@ async fn late<P: PrivateProtocol>(
     let _ = via_wire::failpoint::hit_async("routes.late.entered").await;
     // Nothing more is read: the terminal's disposition is settled now.
     let unanswered = P::unanswered(serving);
-    let by = cleanup_deadline();
+    // The unanswered order's own `close_by`, when earlier (picrit round 2,
+    // B), bounds delivery, close and drain alike.
+    let by = unanswered
+        .as_ref()
+        .and_then(|failed| failed.close_by)
+        .map_or_else(cleanup_deadline, |close_by| {
+            Deadline::at(close_by.instant().min(cleanup_deadline().instant()))
+        });
     let close = sender.close(CloseRequest {
         mode: CloseMode::Force,
         deadline: by,

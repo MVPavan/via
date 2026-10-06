@@ -1146,6 +1146,39 @@ impl<'a> Run<'a> {
         }
     }
 
+    /// A stated cancel (`interrupt`) ordered at `now`, its `force_at`
+    /// `grace_ms` later (else [`STOP_FORCE`]); the wall is the turn's own.
+    /// A `force_close` then closes the session by force, shortening it.
+    async fn cancel(
+        &self,
+        order: &Value,
+        now: tokio::time::Instant,
+        (session, stop_order): (&Session, &watch::Sender<Option<StopOrder>>),
+    ) {
+        let grace = order["grace_ms"]
+            .as_u64()
+            .map_or(STOP_FORCE, Duration::from_millis);
+        let stop = |now| StopOrder {
+            cause: StopCause::Cancel,
+            requested_at: "2026-01-01T00:00:00.000Z".to_owned(),
+            attached: now,
+            force_at: Deadline::at(now + grace),
+            close_by: Deadline::at(now + grace + CLOSE_BY),
+        };
+        stop_order.send_replace(Some(stop(now)));
+        if self.knobs.repeat_stop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            stop_order.send_replace(Some(stop(tokio::time::Instant::now())));
+        }
+        if let Some(close) = order.get("force_close").filter(|close| !close.is_null()) {
+            let after = close["after_ms"].as_u64().unwrap_or_default();
+            tokio::time::sleep(Duration::from_millis(after)).await;
+            let ms = close["deadline_ms"].as_u64().unwrap_or(1);
+            let deadline = Deadline::at(tokio::time::Instant::now() + Duration::from_millis(ms));
+            let _report = session.driver.close(CloseMode::Force, deadline).await;
+        }
+    }
+
     /// The turn's `stop`, `steer` attempts and `gates`, each at its event;
     /// one whose event never comes before the turn ended does nothing (a
     /// steer's result is then `never_attempted`; a gate takes no snapshot).
@@ -1181,7 +1214,10 @@ impl<'a> Run<'a> {
                 return Ok(());
             };
             let after = order["after"].as_str().unwrap_or_default().to_owned();
-            if !at_event(after.clone()).await {
+            if let Some(at_ms) = order["at_ms"].as_u64() {
+                let start = wall.checked_sub(bounds(turn).0).unwrap_or(wall);
+                tokio::time::sleep_until(start + Duration::from_millis(at_ms)).await;
+            } else if !at_event(after.clone()).await {
                 return Ok(());
             }
             let now = tokio::time::Instant::now();
@@ -1192,19 +1228,7 @@ impl<'a> Run<'a> {
                 let deadline = Deadline::at(now + CLOSE_DEADLINE);
                 let _report = session.driver.close(CloseMode::Graceful, deadline).await;
             } else {
-                // A cancel (`interrupt`); the wall is the turn's own.
-                let order = |now| StopOrder {
-                    cause: StopCause::Cancel,
-                    requested_at: "2026-01-01T00:00:00.000Z".to_owned(),
-                    attached: now,
-                    force_at: Deadline::at(now + STOP_FORCE),
-                    close_by: Deadline::at(now + STOP_FORCE + CLOSE_BY),
-                };
-                stop_order.send_replace(Some(order(now)));
-                if self.knobs.repeat_stop {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    stop_order.send_replace(Some(order(tokio::time::Instant::now())));
-                }
+                self.cancel(order, now, (session, stop_order)).await;
             }
             Ok(())
         };

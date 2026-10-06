@@ -371,7 +371,8 @@ async fn launched(
         state: &driver.state,
         health: &driver.health,
     };
-    let cutoff = Deadline::at(wall.instant() + CLEANUP_ALLOWANCE);
+    // The wall's cutoff, or an earlier `close_by` (packet §7.1).
+    let cut = by_orders(wall, (stop.clone(), close_rx.clone()));
     let mut abandonment = Abandonment(Some(&driver.health));
     let (routed, rest) = deliver_beside(
         // A closed channel is the task ending without its turn.
@@ -380,7 +381,7 @@ async fn launched(
         &mut delivery,
         &driver.observations,
         &activity,
-        (force.clone(), cutoff),
+        (force.clone(), cut),
         &driver.health,
     )
     .await;
@@ -584,30 +585,46 @@ const RECORDS_SKIPPED: &str = "pi-records-skipped.json";
 /// the wait at once.
 async fn records_by(
     written: impl std::future::Future,
-    (wall, mut force, (mut stop, mut close)): (Deadline, ForceWatch, (StopWatch, CloseWatch)),
+    (wall, mut force, orders): (Deadline, ForceWatch, (StopWatch, CloseWatch)),
 ) -> bool {
-    let allowance =
-        (tokio::time::Instant::now() + CLEANUP_ALLOWANCE).min(wall.instant() + CLEANUP_ALLOWANCE);
-    let (mut stop_open, mut close_open) = (true, true);
+    // From now, within the wall's cutoff.
+    let allowance = Deadline::at(tokio::time::Instant::now().min(wall.instant()));
     let forced = async move {
         // A force sender gone unset: no force will come.
         if force.wait_for(Option::is_some).await.is_err() {
             std::future::pending::<()>().await;
         }
     };
-    tokio::pin!(written, forced);
+    tokio::select! {
+        biased;
+        () = forced => false,
+        _ = written => true,
+        () = by_orders(allowance, orders) => false,
+    }
+}
+
+/// Resolves at the turn's one cutoff, [`CLEANUP_ALLOWANCE`] after `from`
+/// (C2 §4.1), or at the earlier `close_by` of a stop or the driver's close
+/// order, re-read as they change (packet §7.1, picrit round 2, B).
+async fn by_orders(from: Deadline, (mut stop, mut close): (StopWatch, CloseWatch)) {
+    let (mut stop_open, mut close_open) = (true, true);
     loop {
-        let orders = [stop.borrow().clone(), close.borrow().clone()];
-        let bound = orders
-            .iter()
-            .flatten()
-            .map(|order| order.close_by.instant())
-            .fold(allowance, std::cmp::Ord::min);
+        let bound = [
+            stop.borrow_and_update()
+                .as_ref()
+                .map(|order| order.close_by),
+            close
+                .borrow_and_update()
+                .as_ref()
+                .map(|order| order.close_by),
+        ]
+        .into_iter()
+        .flatten()
+        .map(Deadline::instant)
+        .fold(from.instant() + CLEANUP_ALLOWANCE, std::cmp::Ord::min);
         tokio::select! {
             biased;
-            () = &mut forced => return false,
-            _ = &mut written => return true,
-            () = tokio::time::sleep_until(bound) => return false,
+            () = tokio::time::sleep_until(bound) => return,
             changed = stop.changed(), if stop_open => stop_open = changed.is_ok(),
             changed = close.changed(), if close_open => close_open = changed.is_ok(),
         }

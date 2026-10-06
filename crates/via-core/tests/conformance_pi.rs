@@ -3174,6 +3174,61 @@ fn pi_abort_unanswered_stall() {
     );
 }
 
+/// Packet §7.1 step 3 (picrit round 2, B): the reply wait's cutoff is
+/// live. A cancel at acceptance grants a 60 s grace; Pi settles on the
+/// marker and never replies; 500 ms later a forced session close with a
+/// 1 s deadline shortens the order. The wait ends at the new bound, not
+/// the 60 s one. Before the fix it held Pi, stdin open, to the original
+/// cutoff.
+#[test]
+fn pi_abort_unanswered_shortened() {
+    let name = "pi_abort_unanswered_shortened";
+    let replay = unanswered_abort(name, (1, 0, 0));
+    let mut wanted = unanswered_wanted(None);
+    wanted["stop_facts"] = json!({"acknowledged": false, "forced": true});
+    let mut shortened = turn("Count slowly.", wanted);
+    shortened["deadlines"] = json!({"wall_ms": 120_000, "idle_ms": 120_000});
+    shortened["stop"] = json!({"kind": "interrupt", "after": "accepted", "grace_ms": 60_000,
+        "force_close": {"after_ms": 500, "deadline_ms": 1_000}});
+    let expect = case(name, 1, vec![shortened]);
+    let outcome = check_built(name, &replay, &expect, Knobs::default()).unwrap();
+    let returned = outcome.turns[0].returned.unwrap();
+    assert!(
+        returned <= std::time::Duration::from_secs(5),
+        "the reply wait kept the original cutoff: {returned:?}"
+    );
+}
+
+/// Packet §7.1 step 3 (picrit round 2, B): an unanswered marker waiting
+/// for read-ahead room honours the order's bounds. Wall 5 s; a cancel at
+/// 500 ms with `force_at` 1 s and `close_by` 4 s; the big deltas and the
+/// 1 MB `agent_settled` hold delivery while Core takes nothing for 6 s.
+/// The turn returns by `close_by`, not the wall plus the cleanup
+/// allowance. Before the fix the late path granted delivery to about 8 s.
+#[test]
+fn pi_abort_unanswered_held() {
+    let name = "pi_abort_unanswered_held";
+    let replay = unanswered_abort(name, (SATURATING, 4, BIG));
+    let mut wanted = unanswered_wanted(None);
+    wanted["stop_facts"] = json!({"acknowledged": false, "forced": true});
+    let mut held = turn("Count slowly.", wanted);
+    held["deadlines"] = json!({"wall_ms": 5_000, "idle_ms": 60_000});
+    held["stop"] = json!({"kind": "interrupt", "at_ms": 500, "grace_ms": 500});
+    let mut expect = case(name, 1, vec![held]);
+    // What Core never took by `close_by` is lost (C2 §2).
+    expect["sessions"]["main"]["health"] = json!({"state": "failed", "first_cause": "overflow"});
+    let knobs = Knobs {
+        hold_for: Some(std::time::Duration::from_secs(6)),
+        ..Knobs::default()
+    };
+    let outcome = check_built(name, &replay, &expect, knobs).unwrap();
+    let returned = outcome.turns[0].returned.unwrap();
+    assert!(
+        returned <= std::time::Duration::from_millis(4_600),
+        "run_turn returned {returned:?} after its start, past close_by"
+    );
+}
+
 /// A run whose $0.50 tool call is delivered, then deltas past the session
 /// channel while Core takes nothing; `settled` adds the answer and its
 /// settlement (else Pi reads the stall's abort). Pi then waits for its

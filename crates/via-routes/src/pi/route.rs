@@ -20,8 +20,8 @@ use super::messages::{
     decode, models_data, prompt_start, state_data, ui_cancel,
 };
 use crate::private::{
-    self, AfterTerminal, Closed, Failed, Hop, Interrupt, Next, PrivateProtocol, Serving, protocol,
-    transport, wire_cause,
+    self, AfterTerminal, Answer, Closed, Failed, Hop, Interrupt, Next, PrivateProtocol, Serving,
+    protocol, transport, wire_cause,
 };
 use crate::{
     Deadline, PrivateProcessSpec, Retirement, RouteError, RouteFailure, RouteRuntime, SendOutcome,
@@ -774,7 +774,14 @@ impl PrivateProtocol for PiLane {
     }
 
     /// Kept at admission, where the record is owned.
-    fn retain(_serving: &mut Serving<'_, Self>, _terminal: &Settled) {}
+    /// A marker whose abort is unanswered waits for read-ahead room only
+    /// within the current cutoff (picrit round 2, B): it is never
+    /// retained, so the natural terminal's wait to the wall does not apply.
+    fn retain(serving: &mut Serving<'_, Self>, _terminal: &Settled) {
+        if serving.lane.unanswered_marker(serving.interrupt) {
+            serving.answer = Answer::Awaited;
+        }
+    }
 
     /// Packet §7.1 step 3 on every path that stops reading after the
     /// terminal: an unanswered marker is dropped, and the order that sent
@@ -855,20 +862,23 @@ impl PrivateProtocol for PiLane {
         messages: &mut WireMessages,
         terminal: Settled,
     ) -> Result<AfterTerminal<Self>, Failed> {
-        let (bound, _) = serving.cutoff();
+        // The cutoff is live: serving re-reads it every round.
+        serving.answer = Answer::Awaited;
         while serving.lane.phase != Phase::Refused
             && serving.lane.abort_answered.is_none()
             && matches!(serving.interrupt, Interrupt::Queued | Interrupt::Written)
         {
-            let failed =
-                match tokio::time::timeout_at(bound.instant(), serving.next(messages)).await {
-                    Ok(Ok(Next::Message(message))) => {
-                        serving.hold(message);
-                        continue;
-                    }
-                    Ok(Ok(Next::Eof | Next::Unterminated)) | Err(_) => None,
-                    Ok(Err(failed)) => Some(failed),
-                };
+            let failed = match serving.next(messages).await {
+                Ok(Next::Message(message)) => {
+                    serving.hold(message);
+                    continue;
+                }
+                Ok(Next::Eof | Next::Unterminated) => None,
+                // The cutoff passed: no reply.
+                Err(_) if serving.answer == Answer::Cut => None,
+                Err(failed) => Some(failed),
+            };
+            serving.answer = Answer::NotAwaited;
             // No reply will come. A marker is not retained: the order's
             // row (C1 §7.6).
             if let Some(stopped) = Self::unanswered(serving) {
@@ -879,6 +889,7 @@ impl PrivateProtocol for PiLane {
             }
             break;
         }
+        serving.answer = Answer::NotAwaited;
         Ok(AfterTerminal::Finalize(terminal))
     }
 

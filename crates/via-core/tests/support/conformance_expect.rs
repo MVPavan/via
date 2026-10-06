@@ -439,7 +439,10 @@ const BOUND: &[&str] = &["mode", "extra_write_dirs", "network"];
 const BOUND_MODE: &[&str] = &["read_only", "workspace_write", "full"];
 /// C1 §4 `deadlines`.
 const DEADLINES: &[&str] = &["wall_ms", "idle_ms"];
-const STOP: &[&str] = &["kind", "after"];
+const STOP: &[&str] = &["kind", "after", "at_ms", "grace_ms", "force_close"];
+/// A stop's later forced session close: `after_ms` after the stop, with a
+/// deadline `deadline_ms` from then.
+const FORCE_CLOSE: &[&str] = &["after_ms", "deadline_ms"];
 const STOP_KIND: &[&str] = &["interrupt", "wall", "close"];
 /// The turn events a stop, steer or later turn can wait for.
 const EVENTS: &[&str] = &["accepted", "tool_started", "handshake"];
@@ -971,7 +974,20 @@ fn validate_inputs(
         known(stop, STOP, &at)?;
         let stop = object(stop, &at)?;
         required(stop, "kind", Ty::Name(STOP_KIND), false, &at)?;
-        required(stop, "after", Ty::Name(EVENTS), false, &at)?;
+        // A time from the turn's start replaces the event.
+        if stop.contains_key("at_ms") {
+            typed(stop, "at_ms", Ty::Count, false, &at)?;
+        } else {
+            required(stop, "after", Ty::Name(EVENTS), false, &at)?;
+        }
+        typed(stop, "grace_ms", Ty::Positive, true, &at)?;
+        if let Some(close) = stop.get("force_close").filter(|close| !close.is_null()) {
+            let at = format!("{at}.force_close");
+            known(close, FORCE_CLOSE, &at)?;
+            let close = object(close, &at)?;
+            required(close, "after_ms", Ty::Count, false, &at)?;
+            required(close, "deadline_ms", Ty::Positive, false, &at)?;
+        }
     }
     for (number, attempt) in entries(map.get("steer"), &format!("{at}.steer"))?
         .iter()

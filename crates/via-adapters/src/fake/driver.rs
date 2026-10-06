@@ -165,7 +165,7 @@ pub(crate) async fn run_turn(
         &mut normalizer,
         &driver.observations,
         &activity,
-        (force, cutoff),
+        (force, tokio::time::sleep_until(cutoff.instant())),
         &driver.health,
     )
     .await;
