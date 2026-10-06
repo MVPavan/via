@@ -453,7 +453,8 @@ fn turn(prompt: &str, expect: Value) -> Value {
     turn
 }
 
-/// The identity confirmation of `SID` on connection `generation`.
+/// The identity confirmation of `SID` on connection `generation`: the
+/// ordinal of its connection among the case's confirming connections.
 fn confirmed(generation: u64) -> Value {
     json!({"kind": "session.vendor_identity_confirmed", "vendor_session_id": SID,
         "generation": generation})
@@ -478,7 +479,8 @@ fn estimated(usd: f64) -> Value {
     json!({"usd": usd, "scope": "turn", "provenance": "estimated"})
 }
 
-/// The expectation of a completed turn on launch `generation`, its final
+/// The expectation of a completed turn confirmed on connection
+/// `generation` (the ordinal [`confirmed`] states), its final
 /// text `text`, one canonical call.
 fn completed(generation: u64, text: &str) -> Value {
     json!({
@@ -1066,8 +1068,10 @@ fn fixed_profile(state: &Path) -> std::io::Result<()> {
 }
 
 /// `pi_uncertain_predecessor` (packet §7.4, R1): turn A leaves its group
-/// unproven (its anchor paused before its EOF cleanup, so the group is
-/// still present when A ends); B is refused `uncertain_predecessor`
+/// unproven (its anchor paused at Host's `Stop`, so the group is still
+/// present when A's close gives up; the anchor is the workspace `via`
+/// binary, built with the failpoints by the workspace's
+/// `--features via-cli/test-failpoints` run); B is refused `uncertain_predecessor`
 /// without launching, and so is C, because the predicate is A's group,
 /// not B's clean outcome. Once A's anchor finishes and Host proves the
 /// group absent, D launches. Nothing is resent: the fake's two lifetimes
@@ -1081,7 +1085,7 @@ fn pi_uncertain_predecessor() {
     std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
     let token = "pi-r1-predecessor-token";
     std::fs::write(
-        dir.join("host.anchor.before_eof_cleanup.json"),
+        dir.join("host.anchor.stop_received.json"),
         json!({"token": token, "occurrence": 1, "action": "pause"}).to_string(),
     )
     .unwrap();
@@ -1105,7 +1109,7 @@ fn pi_uncertain_predecessor() {
     let mut a = completed(1, "A");
     a["cleanup"] = json!("uncertain");
     a["group_absent"] = json!(false);
-    // The paused anchor has not reported the exit when the close gives up.
+    // The exit is the vendor's, reported or not when the close gives up.
     unset(&mut a, "exit");
     let refused = || {
         let mut refused = unaccepted(Some("uncertain_predecessor"), None, None);
@@ -1124,12 +1128,12 @@ fn pi_uncertain_predecessor() {
         ],
     );
     let knobs = Knobs {
-        release_before: Some((3, "host.anchor.before_eof_cleanup")),
+        release_before: Some((3, "host.anchor.stop_received")),
         ..Knobs::default()
     };
     check_built("pi_uncertain_predecessor", &replay, &expect, knobs).unwrap();
     assert!(
-        dir.join("host.anchor.before_eof_cleanup.1.ack").exists(),
+        dir.join("host.anchor.stop_received.1.ack").exists(),
         "A's anchor never paused"
     );
 }
@@ -1166,7 +1170,7 @@ fn pi_identity_continuation() {
         2,
         vec![
             turn("Lost.", unaccepted(None, Some("process_exit"), Some(0))),
-            turn("Again.", completed(2, "READY")),
+            turn("Again.", completed(1, "READY")),
         ],
     );
     check_built(
@@ -1917,7 +1921,8 @@ fn pi_terminal_mapping() {
     );
     let mut wanted = completed(1, "READY");
     wanted["usage"] = canonical_turn_usage(2);
-    wanted["terminal"]["cost"] = estimated(1.0);
+    // The runner states a whole cost as an integer.
+    wanted["terminal"]["cost"] = json!({"usd": 1, "scope": "turn", "provenance": "estimated"});
     let expect = case(
         "pi_terminal_final_text",
         1,
@@ -2388,8 +2393,8 @@ fn pi_dialog_decline() {
     };
     check_built("pi_dialog_decline", &replay, &expect, knobs).unwrap();
     // A dialog with no `id` cannot be answered: protocol.
-    let mut run = prompt("Run a tool.");
-    run.extend(echo("Run a tool."));
+    let mut run = prompt("Say READY.");
+    run.extend(echo("Say READY."));
     run.push(emit(
         &json!({"type": "extension_ui_request", "method": "confirm",
         "title": "Allow tool?"}),

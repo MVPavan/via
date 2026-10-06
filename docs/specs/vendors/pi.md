@@ -92,7 +92,7 @@ private per-turn process (glossary fix, §10 G7).
 | C1 surface | Mapping |
 |---|---|
 | `describe` | Pure plan; no process or file write; the last version read for this program path, else `null`/`untested` |
-| `models` | Bundled catalog; the live list is the handshake's `get_available_models` |
+| `models` | Bundled catalog, provider-qualified with no bare-ID alias (a bare ID such as `gpt-6-luna` is Codex's, and model-only routing must stay unique); the live list is the handshake's `get_available_models` |
 | `spawn`, `resume` | Core receipt, then one launch per turn (§2.1) |
 | `steer` | `unsupported_verb` naming `pi-rpc`; nothing written (PI-8) |
 | `cancel` | Queued: Core-local. Running: §7 |
@@ -132,7 +132,9 @@ after Core reserved a slot:
      `Rejected{VendorError}` with no vendor code and VIA-owned text (§5.4).
    - Any other disposition (`handled`, `queued`) is protocol: it cannot occur
      on an idle fresh process under `-ne -np` (E40).
-   - A lost reply is the unknown-submission failure. Nothing is resent.
+   - A lost reply is the unknown-submission failure: Pi exiting after the
+     written prompt with no reply fails the turn `process_exit` with the
+     Host-confirmed exit. Nothing is resent.
 5. **Observe** (§5) until `agent_settled`. `agent_end` is not the end:
    auto-retry and compaction continue after it (E28).
 6. **Close.** After `agent_settled`, and after any admitted abort's reply or
@@ -273,10 +275,14 @@ Directory privacy alone is not a configuration boundary (E37). **Before
 every launch** the driver validates the agent directory. A violation is a
 `submit_failed` refusal with `data.reason:"handshake_refused"`, whose
 VIA-owned message names the rule and the entry or key, never a value. It is
-**never cached**: the owner can fix the profile without a binary change. VIA
+**never cached**: the owner can fix the profile without a binary change. The
+message travels as the shared `RouteError::HandshakeRefused`'s optional
+VIA-owned `detail` (Claude and Codex pass none), on a failure that launched
+nothing. VIA
 never writes, repairs or deletes anything in the agent directory.
 
-- **Files.** At most 64 entries. Every entry checked is owned by the
+- **Files.** At most 64 entries, `bin/`'s files counted with the
+  directory's own. Every entry checked is owned by the
   daemon's uid, has the expected type, is opened through the directory's
   descriptor without following symlinks (a symlink is refused), and is
   neither group- nor world-writable. `auth.json` also has no group or other
@@ -306,7 +312,9 @@ never writes, repairs or deletes anything in the agent directory.
 - **Record.** The turn's evidence folder gets `pi-profile.json` (≤ 4 KiB):
   the policy version, entry names, kinds and modes, the settings key names,
   and one policy digest (SHA-256 over those plus the approved values except
-  `deviceId`). No credential bytes and no device identifier.
+  `deviceId`). A list that would pass 4 KiB is replaced by its count. No
+  credential bytes and no device identifier. It is written only for a turn
+  that launched, best effort: the turn's outcome never depends on it.
 - **Profile setting.** The real profile had no `cacheWarming` key (E60);
   `"cacheWarming": "off"` was added to its `settings.json` on 2026-10-05.
   VIA itself never writes it: a profile without it is refused.
@@ -324,7 +332,7 @@ Pi creates its session files inside) and `pi/instructions/<via_session_id>`
 
 | Field | Mapping |
 |---|---|
-| model | `--model provider/id`, exact; checked at the handshake (§2.1) |
+| model | `--model provider/id`, exact; checked at the handshake (§2.1). A model without a non-empty provider and ID is refused by `plan` and `check_turn` (`InvalidParam{model}`) before any receipt: Pi could only fuzzy-match it (E30) |
 | instructions | Frozen text in the VIA-owned file, passed by absolute path to `--append-system-prompt`. Pi reads an argument that names an existing file as that file (E38), so inline text could silently read a file whose path equals the text |
 | prompt, instructions size (PI-15) | `plan`/`check_turn` refuse `ParamSizes.prompt_json` above 524,288 bytes (`InvalidParam{prompt}`) and `instructions_json` above 262,144 bytes (`InvalidParam{instructions}`), before any receipt (C2 §2). Pi repeats the prompt, re-escaped, in its user `message_start`, `message_end` and `agent_end` records, and the creating run's system patch with the instructions in two records (E04, E47, E57). Each record must stay under the 1 MiB vendor-message ceiling (runtime §8); the remaining 256 KiB is headroom for Pi's base prompt (~6 KB, E47), context files and the run's other messages, which PI-15 does not bound. A record over 1 MiB still fails `overflow`, as on Claude (L1) |
 | effort (PI-6) | `low`, `medium`, `high`, `xhigh`, `max` and vendor values `off`, `minimal` pass to `--thinking`. Pi clamps silently and only warns on stderr for invalid values (E41), so a requested effort is checked against `get_state.thinkingLevel` (§2.1) and the check's result is cached for `check_turn`. With no effort, `--thinking` is omitted, Pi's default applies (the policy refuses `defaultThinkingLevel`, E58), and the observed level goes to bounded `vendor` data |
@@ -332,7 +340,7 @@ Pi creates its session files inside) and `pi/instructions/<via_session_id>`
 | max_steps | unsupported; non-null refused before vendor I/O |
 | bound, extra_write_dirs | §6 |
 | deadlines | Core-owned. Pi has no turn timeout; its provider idle timeout (300 s) and retry backoff (up to 60 s) can lengthen a turn without events (docs `settings.md`) |
-| tools | `--tools read,bash,edit,write`. This is explicit launch configuration, not handshake-proven: the handshake returns no tool list. Where a system patch carries `toolsAdded`/`toolsRemoved` (a creating launch or a changed loadout, E05, E56), the names must match the list, else protocol. Pi accepts unknown names silently (E34), and restores a stored loadout only without `--tools` (E56) |
+| tools | `--tools read,bash,edit,write`. This is explicit launch configuration, not handshake-proven: the handshake returns no tool list. Where a system patch carries `toolsAdded`/`toolsRemoved` (a creating launch or a changed loadout, E05, E56), an added name outside the list, or a removed name in it, is protocol; a patch lists only changes, so the added names need not be the whole list. Pi accepts unknown names silently (E34), and restores a stored loadout only without `--tools` (E56) |
 
 ### 4.6 Inherited configuration (C2 §6.2), both directions
 
@@ -370,7 +378,10 @@ changed (E04, E51).
   paths (`listed`), `none` (`project_context:null`), `not_reported` (no
   `project_context` member, or no patch: Pi reported no change this turn),
   or `unparsed`; plus the `skill:*` names from `get_commands`. At most 32
-  paths of 1 KiB and 256 skill names; beyond that, `unparsed`.
+  paths of 1 KiB and 256 skill names; beyond that, `unparsed`. The record
+  is `{"version":1,"instruction_files":{"state":S[,"paths":[…]]},
+  "skills":{"state":"listed"|"unparsed","names":[…]}}`, written best effort
+  once the handshake passed.
 - The inventory is evidence, not public state: C2 §6.2 asks only what a
   route can record. `not_reported` is never presented as empty or
   unchanged. Instruction contents never enter observations, envelopes or
@@ -382,28 +393,39 @@ changed (E04, E51).
 skills, `SYSTEM.md`/`APPEND_SYSTEM.md` and MCP never load (E33). Context
 files still load; Pi does not trust-gate them.
 
-**Reserved vendor keys.** The vendor-option allow-list is empty. Reserved
-(`vendor_option_conflict`): every recipe flag and its short forms (`-t`,
-`-xt`, `-nt`, `-nbt`, `-e`, `-ne`, `-ns`, `-np`, `-nc`, `-a`, `-na`, `-c`,
-`-r`, `-p`, `-n`); `--provider`, `--api-key`, `--models`, `--system-prompt`,
-`--fork`, `--continue`, `--resume`, `--no-session`, `--export`, `--skill`,
-`--prompt-template`, `--theme`, `--mode`, `--offline`, `--version`; and
-every `PI_*` environment name.
+**Reserved names** (from the pinned `pi --help` of 1.0.2). Long:
+`--provider`, `--model`, `--api-key`, `--system-prompt`,
+`--append-system-prompt`, `--mode`, `--print`, `--continue`, `--resume`,
+`--session`, `--session-id`, `--fork`, `--session-dir`, `--no-session`,
+`--name`, `--models`, `--no-tools`, `--no-builtin-tools`, `--tools`,
+`--exclude-tools`, `--thinking`, `--extension`, `--no-extensions`,
+`--skill`, `--no-skills`, `--prompt-template`, `--no-prompt-templates`,
+`--theme`, `--no-context-files`, `--export`, `--list-models`, `--approve`,
+`--no-approve`, `--offline`, `--help`, `--version`: every recipe flag, its
+negations and opposites, VIA's canonical parameters, and the options that
+change the mode, the session, the model, the tools or the loaded resources,
+or exit at once. Short: `-p`, `-c`, `-r`, `-n`, `-nt`, `-nbt`, `-t`, `-xt`,
+`-e`, `-ne`, `-ns`, `-np`, `-nc`, `-a`, `-na`, `-h`, `-v`.
 
-**Vendor argument passthrough (owner, 2026-10-06; C2 §6.3; adopt when the
-adapter is built).** A session's frozen `vendor_args` are appended after the
-last recipe argument (§4.1, after `--offline`) on every per-turn launch,
-after a daemon restart too; they enter the handshake-refusal recipe key and
-the launch-request check (`invalid_params` naming `vendor_args` past Host's
-64 KiB). Reserved, matched under C2 §6.3: every flag above (the recipe's,
-its short forms and the listed ones), the negations and opposites of VIA's
-switches (`--approve`, extensions, skills, prompt templates, context files
-back on), `--thinking`, `--session-dir`, `--session-id`, `--session`,
-`--tools`, `--model`, `--append-system-prompt`, `--help`/`-h`, every
-operand and `--`. Environment names are not arguments and stay unreachable.
-The exact list, the value-option table and whether Pi's parser takes
-`--name=value` are derived from the pinned `pi --help` when the adapter is
-built (UNVERIFIED until then).
+**Reserved vendor keys.** The vendor-option allow-list is empty. A key
+naming a reserved name or short form in any C2 §6.3 normalized spelling, or
+a `PI_*` environment name, is `vendor_option_conflict`; any other key is
+`invalid_params`.
+
+**Vendor argument passthrough (owner, 2026-10-06; C2 §6.3; adopted).** A
+session's frozen `vendor_args` are appended after the last recipe argument
+(§4.1, after `--offline`) on every per-turn launch, after a daemon restart
+too; they enter the handshake-refusal recipe key and the launch-request
+check (`invalid_params` naming `vendor_args`, or `cwd` when the session has
+none, past Host's 64 KiB). Matched under C2 §6.3: every reserved long name,
+every operand and `--`. Pi matches each option as an exact string, its
+short forms multi-letter, so no single-dash element is a cluster of
+switches: **every** single-dash element is refused. Pi does not split
+`--name=value` (it keeps the element as an unknown flag); the match judges
+it by its name all the same, so a reserved name is refused in either
+spelling. The unreserved options that take a value are `--use-theme` and
+`--tui-mode`, each its next element. Environment names are not arguments
+and stay unreachable.
 
 ## 5. Typed protocol and normalizer
 
@@ -636,7 +658,10 @@ predicate.
   that fails or outlives the deadline, or a proof the pass observed but
   could not commit, is the check's `Err`, the turn's Store failure as for
   any Host journal failure, never `uncertain_predecessor`. Nothing is
-  launched.
+  launched. The failed, timed-out or late read is `store` (not committed;
+  an uncertain Store commit, uncertain); the uncommitted proof is Host's
+  journal failure, as on every route; a wall spent before the read is
+  `deadline`.
 - **Several turns.** If turn A leaves a survivor, turn B refuses without
   launching, and turn C's check still finds A, because the predicate is A's
   group, not B's clean outcome. Once Host proves A's group absent, turns

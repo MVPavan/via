@@ -192,6 +192,7 @@ mod harness;
 mod instance;
 pub mod observation;
 mod passthrough;
+mod pi;
 mod plan;
 mod runtime;
 mod set;

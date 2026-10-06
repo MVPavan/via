@@ -84,7 +84,7 @@
         },
         "observations_include": [
           {
-            "generation": 2,
+            "generation": 1,
             "kind": "session.vendor_identity_confirmed",
             "vendor_session_id": "187d2602-5d80-45de-a2b2-2080d91eb589"
           },
@@ -153,7 +153,7 @@
         },
         "observations_include": [
           {
-            "generation": 3,
+            "generation": 2,
             "kind": "session.vendor_identity_confirmed",
             "vendor_session_id": "187d2602-5d80-45de-a2b2-2080d91eb589"
           },
@@ -260,7 +260,7 @@
         },
         "observations_include": [
           {
-            "generation": 5,
+            "generation": 3,
             "kind": "session.vendor_identity_confirmed",
             "vendor_session_id": "187d2602-5d80-45de-a2b2-2080d91eb589"
           },

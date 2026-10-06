@@ -31,6 +31,11 @@ pub const HARNESSES: &[HarnessRow] = &[
         route: "opencode-serve",
         default_binary: "opencode",
     },
+    HarnessRow {
+        name: "pi",
+        route: "pi-rpc",
+        default_binary: "pi",
+    },
 ];
 
 /// The fake test double's harness name, which is also its route (design §5.5).
