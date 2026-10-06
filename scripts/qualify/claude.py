@@ -27,14 +27,29 @@ adds that version to the adapter's CHECKED set
 (outside the auth case), quota, budget or runner failure is `blocked`;
 a case nobody gives evidence for is `not_observable`; neither passes.
 
+Threat model. A maintainer runs this on their own machine, on Linux (it
+reads /proc and runs `pgrep`). The Claude that VIA starts runs only the
+runner's own prompts on the chosen model. A hostile vendor or tool
+rewriting files during the run is out of scope, except that the MCP debug
+file is read and purged without following symlinks. The evidence directory
+is private and local (0700, under the gitignored scratchpad/) and is never
+committed; committed docs cite only facts from `summary.json`. Even so,
+bearer handles never touch disk: they are kept in memory, passed to `via`
+on stdin and redacted from saved receipts. The binaries are recorded by
+name and SHA-256, never by path.
+
 Accounting, one rule: every turn, whatever its outcome, must report a finite
 session-cumulative `usd`, at least the session's previous report and, for a
 completed turn, above it. Spending is marked unaccounted before every submit
-and cleared only by such a report; anything else (no envelope, a runner
-error, a cost below the previous report) leaves it set, so nothing more is
-submitted. The cap must be finite and positive; the unrounded total (each
-session's highest report) is checked before every submit and after every
-turn, and reaching it blocks the run.
+and cleared only when every accounting check of that turn passes; anything
+else (no envelope, a runner error, a failed check) leaves it set, so
+nothing more is submitted. The cap must be finite and at least
+TURN_CEILING_USD. The cap is checked between turns, not inside one: a turn
+starts only while the unrounded total (each session's highest report)
+leaves at least TURN_CEILING_USD under the cap, and a turn that adds more
+than that blocks the run, so the overshoot is bounded to one turn. Claude's
+own `--max-budget-usd` is not used: VIA freezes vendor arguments per session
+at spawn, so it cannot carry each resume's remaining budget.
 
 Cases (packet §9 live rows):
   recipe_continuity     claude_live_recipe_continuity
@@ -88,12 +103,36 @@ the inherited-configuration request are daemon configuration:
   unrestricted-mcp-off  mcp_switches' MCP-off launch
   empty-home            private_profile_auth
 A phase's daemon is recorded as owned but unverified, its runtime directory
-kept, from before the start (or stop) request until its pid and start time
-(or its exit) are verified; a failed start is searched for by the run's
-private locks, and every later phase is blocked. SIGINT and SIGTERM are only
-recorded: no submission starts afterwards, and the run ends as `blocked`.
-Every cleanup step runs inside the reporting boundary: a cleanup failure is
-recorded and the summary is still written, as `blocked`.
+kept, from before the start (or stop) request until it is proven: started
+when the pid `daemon status` replies with holds the run's private lock
+files, stopped when no process holds them and no descendant seen before the
+stop is alive. A daemon that holds them is ours, a replacement started by
+the CLI included. A failed start is searched for by those locks, and every
+later phase is blocked. The final cleanup retries the stop until a
+deadline, also after an earlier unverified stop, escalating to `daemon stop
+--force` when a plain stop is refused `sessions_active`; once the stop is
+proven the runtime directory is removed, wherever it lives.
+
+SIGINT and SIGTERM are only recorded. No submission starts afterwards; a
+turn already being submitted runs to its end and is accounted. Cleanup and
+the summary always run, and the run ends `blocked`. The flag is read last,
+just before the result is decided: a signal after that changes neither the
+summary nor the exit code. Every cleanup step and the summary itself run
+inside the reporting boundary: a failure is recorded and a summary is still
+written, as `blocked`.
+
+Limitations:
+- Cost scope: the runner relies on Claude's documented session-cumulative
+  `total_cost_usd`, which VIA reports as `scope: session_cumulative`. Rising
+  turn-local costs would pass the accounting checks and understate the total.
+- Reparented descendants (a tool or MCP process that daemonized or outlived
+  its parent) are outside the tree the stop proof watches; a leftover scan is
+  bead via-daz.
+- Isolation: the runner checks argv and VIA's declared category states, not
+  that Claude honours `--restricted` for each category, nor the child's
+  environment names or HOME.
+- Launches are sampled every 50 ms: the recipe checks prove the launches
+  observed, not that no other launch happened.
 
 Privacy: the runner never prints or records environment values, credential
 contents or MCP configuration. It reads no credential file. It records MCP
@@ -101,10 +140,11 @@ servers only as name digests with statuses, process flags by name (values
 only for an allow-list of recipe flags, digests for instructions, schemas
 and session IDs), and the presence of VIA's process-marker key, never its value. From
 the vendor transcripts of sessions VIA created in this run it reads usage
-numbers and tool-call counts only. It reads other processes' command lines
-only to discover the tagged tool process; it reads environments, sends
-signals or waits on no process VIA did not start, and Claude processes
-alive before the run are excluded by pid.
+numbers and tool-call counts only. It reads the command line and the
+marker key only of the daemon's descendants (ancestry through /proc ppid at
+that moment; a tag match alone is never enough), and command lines once at
+start to exclude Claude processes already alive, by pid. It sends signals
+to, or waits on, no process VIA did not start.
 """
 
 import argparse
@@ -124,6 +164,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from stat import S_ISREG
 
 CATEGORIES = ("agents", "hooks", "instruction_files", "mcp_servers", "plugins", "skills")
 MARKER_KEY = b"VIA_PROCESS_MARKER"
@@ -141,6 +182,11 @@ TERMINAL = {"completed", "failed", "cancelled", "unknown"}
 SOCKET_MAX = 107
 ANCHOR_SOCKET_TAIL = len("/anchors/") + 32 + len(".sock")
 TURN_WAIT_S = 240
+# The most one turn may add to the reported cost. A turn starts only while
+# the cap leaves at least this much, and a turn that adds more blocks the
+# run: the cap is checked between turns, so this bounds the overshoot to one
+# turn. Run 6's dearest Haiku turn added 0.015 USD.
+TURN_CEILING_USD = 0.10
 QUOTA = re.compile(r"quota|credit|usage limit|rate limit|overloaded", re.IGNORECASE)
 EXCLUDED = [{
     "case": "claude_live_bounds",
@@ -499,6 +545,8 @@ class Run:
         self.versions = []
         self.preexisting_claude = set()
         self.budget_hit = False
+        # Bearer handles by session, in memory only: never written to disk.
+        self.handles = {}
 
     def prepare(self):
         self.runtime = self.short_runtime()
@@ -534,20 +582,31 @@ class Run:
         interrupt_guard()
         if self.accounting_failed:
             raise Blocked(f"spending unaccounted ({self.accounting_failed})")
-        if self.spent() >= self.budget:
+        if self.budget_hit or self.budget - self.spent() < TURN_CEILING_USD:
             self.budget_hit = True
-            raise Blocked(f"budget reached: {self.spent()} USD of {self.budget}")
+            raise Blocked(f"budget reached: {self.spent()} USD of {self.budget}, under the "
+                          f"{TURN_CEILING_USD} USD one turn may cost")
 
     # --- via calls ---
 
-    def via_call(self, case_dir, label, *args, timeout=60):
+    def via_call(self, case_dir, label, *args, timeout=60, handle=None):
+        """Runs `via`; a session handle goes on stdin (`--handle-stdin`), and a
+        reply's `handle` is redacted before the reply is saved."""
+        if handle is not None:
+            args = (*args, "--handle-stdin")
         argv = [str(self.via), *args]
         try:
             proc = subprocess.run(argv, env=self.env, capture_output=True, text=True,
-                                  timeout=timeout)
+                                  timeout=timeout,
+                                  input=None if handle is None else handle + "\n")
         except subprocess.TimeoutExpired as error:
             raise Blocked(f"`via {args[0]}` did not return within {timeout} s") from error
-        (case_dir / f"{label}.json").write_text(proc.stdout)
+        reply = self.parse(proc.stdout)
+        if isinstance(reply, dict) and "handle" in reply:
+            (case_dir / f"{label}.json").write_text(
+                json.dumps({**reply, "handle": "<redacted>"}) + "\n")
+        else:
+            (case_dir / f"{label}.json").write_text(proc.stdout)
         if proc.stderr:
             (case_dir / f"{label}.err").write_text(proc.stderr)
         with open(case_dir / "commands.txt", "a") as log:
@@ -556,7 +615,7 @@ class Run:
             log.write(f"{utc_now()} rc={proc.returncode} via {' '.join(shown)}\n")
         if proc.returncode == 4:
             raise Blocked(f"`via {args[0]}`: daemon unreachable (see {label}.err)")
-        return proc.returncode, self.parse(proc.stdout), self.parse(proc.stderr)
+        return proc.returncode, reply, self.parse(proc.stderr)
 
     @staticmethod
     def parse(text):
@@ -568,16 +627,17 @@ class Run:
         except ValueError:
             return None
 
-    def turn(self, case, label, verb, *args, wait_s=TURN_WAIT_S, expect=()):
+    def turn(self, case, label, verb, *args, wait_s=TURN_WAIT_S, expect=(), handle=None):
         """Spawns or resumes one turn and waits for it; returns (receipt,
         envelope, launches). `expect` names the failure classes the case
-        expects; any other auth, quota or step-budget failure blocks."""
+        expects; any other auth, quota or step-budget failure blocks. A
+        resume passes the session's `handle`."""
         self.budget_guard()
         self.latch_pending(case, label)
         with LaunchSampler(self) as sampler:
             # `--json` before the arguments: anything after `--` is vendor_args.
             _, receipt, err = self.via_call(case.dir, f"{label}-receipt", verb, "--json",
-                                            *args, timeout=60)
+                                            *args, timeout=60, handle=handle)
             if receipt is None:
                 write_json(case.dir / f"{label}-launches.json", sampler.launches)
                 return None, err, sampler.launches
@@ -605,9 +665,7 @@ class Run:
         self.accounting_failed = f"{case.name} {label}: submitted, accounting pending"
 
     def keep_handle(self, case, receipt):
-        handle = case.dir / f"{receipt['session_id']}.handle"
-        handle.write_text(receipt["handle"])
-        handle.chmod(0o600)
+        self.handles[receipt["session_id"]] = receipt["handle"]
         case.sessions.append(receipt["session_id"])
 
     def account(self, case, label, envelope):
@@ -616,8 +674,9 @@ class Run:
         report and, for a completed turn, above it. Only a usable value not
         below the previous report clears the submission's latch; anything
         else keeps spending refused. Reaching the cap blocks the run too."""
+        version = envelope.get("vendor_version")
         self.versions.append({"case": case.name, "turn": label,
-                              "vendor_version": envelope.get("vendor_version")})
+                              "vendor_version": version if isinstance(version, str) else None})
         cost = envelope.get("cost") or {}
         session = envelope.get("session_id")
         usd = cost.get("usd")
@@ -628,25 +687,27 @@ class Run:
             self.accounting_failed = f"{case.name} {label}: cost {cost!r}"
             raise Blocked(f"{label}: no usable session-cumulative cost; spending unaccounted")
         previous = self.last_cost.get(session, 0.0)
-        if envelope.get("state") == "completed":
-            case.check(f"{label}: cost above the session's previous report", usd > previous,
-                       {"usd": usd, "previous": previous})
+        state = envelope.get("state")
+        if state == "completed":
+            ok = case.check(f"{label}: cost above the session's previous report",
+                            usd > previous, {"usd": usd, "previous": previous})
         else:
-            case.check(f"{label}: cost not below the session's previous report",
-                       usd >= previous, {"usd": usd, "previous": previous,
-                                         "state": envelope.get("state")})
+            ok = case.check(f"{label}: cost not below the session's previous report",
+                            usd >= previous, {"usd": usd, "previous": previous, "state": state})
         self.last_cost[session] = usd
         self.costs[session] = max(self.costs.get(session, 0.0), usd)
-        if usd < previous:
-            # Not session-cumulative after all: the true total is unknown.
-            self.accounting_failed = f"{case.name} {label}: cost fell from {previous} to {usd}"
-            raise Blocked(f"{label}: cost below the session's previous report; "
+        if not ok:
+            # A failed accounting check: what the turn spent is unknown.
+            self.accounting_failed = (f"{case.name} {label}: {state} turn reported {usd} "
+                                      f"after {previous}")
+            raise Blocked(f"{label}: cost inconsistent with the session's previous report; "
                           "spending unaccounted")
         self.accounting_failed = None
+        if usd - previous > TURN_CEILING_USD:
+            self.budget_hit = True
+            raise Blocked(f"{label}: the turn cost {usd - previous} USD, over the "
+                          f"{TURN_CEILING_USD} USD one turn may cost")
         self.budget_guard()
-
-    def session_file(self, case, session):
-        return f"--handle-file={case.dir / f'{session}.handle'}"
 
     def status(self, case, label, session, *extra):
         _, status, _ = self.via_call(case.dir, label, "status", session, *extra, "--json")
@@ -670,14 +731,16 @@ class Run:
     # --- processes ---
 
     def snapshot(self, case, label, tags=()):
-        """VIA's processes and tagged tool processes; marker key presence only."""
+        """The daemon's descendants, read at this snapshot through /proc
+        ppid, flagged when tagged; marker key presence only. No other
+        process's command line or environment is read."""
         procs = all_procs()
         ours = descendants(self.daemon["pid"], procs) if self.daemon else set()
         rows, unattributed = [], 0
         for pid, stat in sorted(procs.items()):
-            argv = cmdline(pid) if pid in ours or tags else []
-            tagged = any(tag in part for tag in tags for part in argv)
-            if pid in ours or tagged:
+            if pid in ours:
+                argv = cmdline(pid)
+                tagged = any(tag in part for tag in tags for part in argv)
                 rows.append({**stat, "claude": self.is_claude(pid), "tagged": tagged,
                              "argv0": os.path.basename(argv[0]) if argv else None,
                              "via_marker_key": has_marker_key(pid)})
@@ -706,7 +769,8 @@ class Run:
                    {"harnesses": {"claude": {"binary": "<claude>", **claude_config}}})
         self.phase = name
         # `daemon status` may autostart a daemon: it is owned but unverified,
-        # its runtime directory kept, until a pid with start ticks is seen.
+        # its runtime directory kept, until the replied pid is seen holding
+        # this run's private locks.
         record = {"phase": name, "runtime_dir_kept": str(self.runtime)}
         self.daemons.append(record)
         self.daemon_unverified = record
@@ -719,6 +783,8 @@ class Run:
                 status, detail = None, str(error)
             pid = status.get("pid") if isinstance(status, dict) else None
             stat = proc_stat(pid) if isinstance(pid, int) and not isinstance(pid, bool) else None
+            if stat is not None and pid not in {d["pid"] for d in self.find_daemons()}:
+                stat, detail = None, f"pid {pid} does not hold this run's locks"
             if stat is None:
                 record["start_failed"] = str(detail)
                 raise Blocked(f"daemon for phase {name} did not start verifiably ({detail})")
@@ -757,40 +823,60 @@ class Run:
                     break
         return found
 
-    def stop_daemon(self):
-        """Stops the phase's daemon; an unverified stop keeps its identity and
-        runtime directory and blocks the rest of the run."""
-        if self.daemon_unverified:
-            raise Blocked(f"daemon of phase {self.daemon_unverified['phase']} not "
-                          "verified stopped")
-        if self.daemon is None:
+    def stop_daemon(self, final=False):
+        """Stops the run's daemon. The one stop proof: no process holds this
+        run's private locks (`find_daemons()` is empty; a replacement daemon
+        at our socket holds them too, so it is ours) and no descendant seen
+        before the stop is alive. Until then the daemon is owned but
+        unverified, its runtime directory kept. A stop is retried until a
+        deadline, also after an earlier unverified stop; the final cleanup
+        escalates to `--force` when a plain stop is refused `sessions_active`."""
+        if self.daemon is None and self.daemon_unverified is None:
             return
-        phase_dir = self.evidence / "daemon"
-        record = self.daemons[-1]
-        # Unverified from the stop request on; cleared only once verified.
+        record = self.daemon_unverified or self.daemons[-1]
         record["runtime_dir_kept"] = str(self.runtime)
         self.daemon_unverified = record
-        procs = all_procs()
-        ours_before = {(pid, procs[pid]["start_ticks"])
-                       for pid in descendants(self.daemon["pid"], procs)}
-        try:
-            _, reply, err = self.via_call(phase_dir, f"{self.phase}-stop", "daemon", "stop",
-                                          "--json", timeout=60)
-        except Blocked as error:
-            reply, err = None, str(error)
-        record["stop_reply"] = reply if reply is not None else err
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline and alive(self.daemon["pid"], self.daemon["start_ticks"]):
-            time.sleep(0.2)
-        record["stopped"] = not alive(self.daemon["pid"], self.daemon["start_ticks"])
-        record["descendants_left"] = sorted(pid for pid, start in ours_before
-                                            if alive(pid, start))
+        phase_dir = self.evidence / "daemon"
+        phase_dir.mkdir(mode=0o700, exist_ok=True)
+        watched = {tuple(entry) for entry in record.get("descendants_watched", [])}
+        attempts = record.setdefault("stop_attempts", [])
+        deadline = time.monotonic() + (90 if final else 30)
+        force = False
+        while True:
+            holders = self.find_daemons()
+            procs = all_procs()
+            for holder in holders:
+                watched |= {(pid, procs[pid]["start_ticks"])
+                            for pid in descendants(holder["pid"], procs)}
+            record["descendants_watched"] = sorted(watched)
+            left = sorted(pid for pid, start in watched if alive(pid, start))
+            if (not holders and not left) or time.monotonic() >= deadline:
+                break
+            if not holders:
+                time.sleep(0.2)
+                continue
+            try:
+                rc, reply, err = self.via_call(
+                    phase_dir, f"{self.phase}-stop-{len(attempts) + 1}", "daemon", "stop",
+                    "--json", *(["--force"] if force else []), timeout=60)
+            except Blocked as error:
+                rc, reply, err = None, None, str(error)
+            attempts.append({"force": force, "rc": rc,
+                             "reply": reply if reply is not None else err})
+            if final and "sessions_active" in json.dumps([reply, err], default=str):
+                force = True
+            settle = min(deadline, time.monotonic() + 10)
+            while time.monotonic() < settle and self.find_daemons():
+                time.sleep(0.2)
+        record["holders_left"] = holders
+        record["descendants_left"] = left
+        record["stopped"] = not holders and not left
         pgrep = subprocess.run(["pgrep", "-f", str(self.via)], capture_output=True, text=True)
         record["pgrep_via"] = [int(pid) for pid in pgrep.stdout.split()
                                if int(pid) != os.getpid()]
         print(f"phase {self.phase}: daemon stopped={record['stopped']}", flush=True)
-        if not record["stopped"] or record["descendants_left"]:
-            raise Blocked(f"daemon of phase {self.phase} not verified stopped")
+        if not record["stopped"]:
+            raise Blocked(f"daemon of phase {record['phase']} not verified stopped")
         del record["runtime_dir_kept"]
         self.daemon_unverified = None
         self.daemon = None
@@ -874,7 +960,7 @@ def case_recipe_continuity(run, case):
         case.check("t1: spawn accepted", False, t1)
         return
     session = receipt["session_id"]
-    hf = run.session_file(case, session)
+    hf = run.handles[session]
     # The source changes after spawn: VIA must keep passing the frozen text.
     instructions.write_text(frozen.replace(mark, changed_mark))
     case.check("t1: receipt effort low", receipt["effective"].get("effort") == "low",
@@ -891,10 +977,10 @@ def case_recipe_continuity(run, case):
     check_launch(case, "t1", launches, first=True, effort="low", schema=schema_a, **common)
 
     receipt2, t2, launches = run.turn(
-        case, "t2", "resume", session, hf, "--effort", "medium",
+        case, "t2", "resume", session, "--effort", "medium",
         "--output-schema", str(case.dir / "schema-b.json"),
         "--prompt", "Without using any tools, give your structured answer with `count` set "
-                    "to 7.")
+                    "to 7.", handle=hf)
     if receipt2 is None:
         case.check("t2: resume accepted", False, t2)
         return
@@ -904,10 +990,10 @@ def case_recipe_continuity(run, case):
     check_launch(case, "t2", launches, first=False, effort="medium", schema=schema_b, **common)
 
     receipt3, t3, launches = run.turn(
-        case, "t3", "resume", session, hf, "--output-schema", str(case.dir / "schema-null.json"),
+        case, "t3", "resume", session, "--output-schema", str(case.dir / "schema-null.json"),
         "--max-steps", "1", "--prompt",
         "Use the Bash tool to run the command `echo step-limit-check`, then tell me exactly "
-        "what it printed.", expect=("budget_exceeded",))
+        "what it printed.", expect=("budget_exceeded",), handle=hf)
     if receipt3 is None:
         case.check("t3: resume accepted", False, t3)
         return
@@ -921,10 +1007,10 @@ def case_recipe_continuity(run, case):
     check_launch(case, "t3", launches, first=False, effort="medium", max_turns="1", **common)
 
     receipt4, t4, launches = run.turn(
-        case, "t4", "resume", session, hf,
+        case, "t4", "resume", session,
         "--prompt", "Answer from memory only, without using any tools: what is the code I "
                     "asked you to remember in my first message? Reply with the code, plus "
-                    "anything your instructions require.")
+                    "anything your instructions require.", handle=hf)
     if receipt4 is None:
         case.check("t4: resume accepted", False, t4)
         return
@@ -998,7 +1084,11 @@ def case_interrupt(run, case):
         while time.monotonic() < deadline and not (tool and running):
             status = run.status(case, "status-running", session)
             running = "Bash" in ((status.get("progress") or {}).get("running_tools") or [])
-            for pid, stat in all_procs().items():
+            # Only the daemon's descendants: a tag match alone is never
+            # enough to read a process's command line or environment.
+            procs = all_procs()
+            for pid in descendants(run.daemon["pid"], procs) if run.daemon else ():
+                stat = procs[pid]
                 argv = cmdline(pid)
                 if (argv and os.path.basename(argv[0]).startswith("python")
                         and any(tag in part for part in argv)):
@@ -1009,13 +1099,14 @@ def case_interrupt(run, case):
         case.check("tool observed running (status running_tools Bash, process present)",
                    bool(tool and running), {"running_tools_bash": running, "tool": tool})
         run.snapshot(case, "pre-cancel", tags=(tag,))
-        if tool:
+        procs = all_procs()
+        if tool and run.daemon and tool["pid"] in descendants(run.daemon["pid"], procs) and alive(
+                tool["pid"], tool["start_ticks"]):
             marker = has_marker_key(tool["pid"])
             case.check("VIA process marker key reaches the tool", marker is True,
                        {"key_present": marker})
-        _, cancel, _ = run.via_call(case.dir, "cancel", "cancel", session,
-                                    run.session_file(case, session), "--wait", "--json",
-                                    timeout=150)
+        _, cancel, _ = run.via_call(case.dir, "cancel", "cancel", session, "--wait", "--json",
+                                    timeout=150, handle=run.handles[session])
         # The decisive observation point: as `cancel --wait` returns.
         tool_alive = bool(tool) and alive(tool["pid"], tool["start_ticks"])
         after = run.snapshot(case, "post-cancel", tags=(tag,))
@@ -1047,9 +1138,9 @@ def case_interrupt(run, case):
              for t in ("cancel.requested", "cancel.settled", "turn.ended")]
     case.check("events: cancel.requested, then cancel.settled, then turn.ended",
                None not in order and order == sorted(order), types)
-    receipt2, t2, launches = run.turn(case, "t2", "resume", session,
-                                      run.session_file(case, session), "--prompt",
-                                      "Reply with the single word AFTER. Use no tools.")
+    receipt2, t2, launches = run.turn(case, "t2", "resume", session, "--prompt",
+                                      "Reply with the single word AFTER. Use no tools.",
+                                      handle=run.handles[session])
     if receipt2 is None:
         case.check("t2: resume accepted", False, t2)
         return
@@ -1078,8 +1169,9 @@ def case_never_ask(run, case):
         case.check("spawn accepted", False, t1)
         return
     elapsed = round(time.monotonic() - started, 3)
-    case.check("turn settled without hanging", t1.get("state") in ("completed", "failed")
-               and (t1.get("failure") or {}).get("class") not in ("deadline_wall", "deadline_idle"),
+    # The denial ends the turn normally: any failure, even after a correct
+    # denial, is not a pass.
+    case.check("turn settled completed without hanging", t1.get("state") == "completed",
                {"state": t1.get("state"), "failure": t1.get("failure"), "elapsed_s": elapsed})
     check_launch(case, "t1", launches, mode="restricted", session=receipt["session_id"],
                  first=True)
@@ -1114,22 +1206,56 @@ def mcp_debug_args(case, session_label):
     return ["--", "--debug=mcp", f"--debug-file={folder / (session_label + '.live.log')}"]
 
 
+def open_folder(folder):
+    """The debug folder as a directory fd, never through a symlink; or None."""
+    try:
+        return os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None
+
+
 def purge_mcp_debug(case):
-    """Deletes every raw debug file and Claude's link to it."""
-    folder = case.dir / "mcp-debug"
-    if folder.is_dir():
-        for path in folder.iterdir():
-            if path.is_symlink() or path.suffix == ".log":
-                path.unlink()
+    """Deletes every raw debug file and Claude's link to it, following no
+    symlink: the folder is opened no-follow, and a link is removed itself,
+    never its target."""
+    folder = open_folder(case.dir / "mcp-debug")
+    if folder is None:
+        return
+    try:
+        with os.scandir(folder) as entries:
+            names = [entry.name for entry in entries
+                     if entry.is_symlink() or (entry.name.endswith(".log")
+                                               and entry.is_file(follow_symlinks=False))]
+        for name in names:
+            os.unlink(name, dir_fd=folder)
+    finally:
+        os.close(folder)
+
+
+def read_debug_file(case, name):
+    """A debug file's text if it is a regular file (opened no-follow), else None."""
+    folder = open_folder(case.dir / "mcp-debug")
+    if folder is None:
+        return None
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=folder)
+    except OSError:
+        return None
+    finally:
+        os.close(folder)
+    with os.fdopen(fd, "rb") as file:
+        if not S_ISREG(os.fstat(file.fileno()).st_mode):
+            return None
+        return file.read(16 << 20).decode("utf-8", "replace")
 
 
 def take_mcp_debug(case, session_label, label):
     """Reads one launch's debug file, keeps per-server status by key and
     deletes the file; returns the connected servers' keys, or None when
     Claude wrote no file."""
-    live = case.dir / "mcp-debug" / f"{session_label}.live.log"
     try:
-        servers = parse_mcp_debug(live.read_text(errors="replace")) if live.exists() else None
+        text = read_debug_file(case, f"{session_label}.live.log")
+        servers = parse_mcp_debug(text) if text is not None else None
     finally:
         purge_mcp_debug(case)
     write_json(case.dir / f"{label}-mcp.json", {
@@ -1138,17 +1264,17 @@ def take_mcp_debug(case, session_label, label):
         "init_inventory": "not recorded by VIA (via-7c6)",
         **(keyed(servers) if servers is not None else {"servers": None})})
     if servers is None:
-        case.not_observable(f"{label}: MCP debug lines", "Claude wrote no debug file")
+        case.not_observable(f"{label}: MCP debug lines", "Claude wrote no regular debug file")
         return None
     return sorted(server_key(name) for name, state in servers.items() if state == "connected")
 
 
-def mcp_launch(run, case, label, expect_inherit, expect_warning, mode, mcp_off):
+def mcp_launch(run, case, label, expect_inherit, expect_warning, mode, mcp_off,
+               prompt="Reply with the single word READY. Use no tools."):
     receipt, envelope, launches = run.turn(
         case, label, "spawn", "--harness", "claude", "--model", run.model,
         "--cwd", str(case.dir / "ws"), "--wall-ms", "180000", "--background",
-        "--prompt", "Reply with the single word READY. Use no tools.",
-        *mcp_debug_args(case, label))
+        "--prompt", prompt, *mcp_debug_args(case, label))
     if receipt is None:
         case.check(f"{label}: spawn accepted", False, envelope)
         return None
@@ -1193,8 +1319,14 @@ def case_mcp_unrestricted(run, case):
     (case.dir / "ws").mkdir(exist_ok=True)
     run.snapshot(case, "unrestricted-before")
     expect = {c: "on" for c in CATEGORIES}
+    nonce = "QX" + secrets.token_hex(3).upper()
+    write_json(case.dir / "unrestricted-nonce.json", {"nonce": nonce})
     try:
-        session = mcp_launch(run, case, "unrestricted", expect, [], "unrestricted", False)
+        session = mcp_launch(
+            run, case, "unrestricted", expect, [], "unrestricted", False,
+            prompt=f"Remember this code for later in our conversation: {nonce}. It is private: "
+                   "never write it to a file and never pass it to any tool. Reply with the "
+                   "single word READY. Use no tools.")
         if not session:
             return
         first = take_mcp_debug(case, "unrestricted", "unrestricted-t1")
@@ -1204,13 +1336,18 @@ def case_mcp_unrestricted(run, case):
                                 "that drops servers looks the same")
         elif first:
             case.check("unrestricted-t1: MCP servers connected", True, {"count": len(first)})
-        receipt, t2, launches = run.turn(case, "unrestricted-t2", "resume", session,
-                                         run.session_file(case, session), "--prompt",
-                                         "Reply with the single word AGAIN. Use no tools.")
+        receipt, t2, launches = run.turn(
+            case, "unrestricted-t2", "resume", session, "--prompt",
+            "Answer from memory only, without using any tools: what is the code I asked you "
+            "to remember in my first message? Reply with the code only.",
+            handle=run.handles[session])
         if receipt is None:
             case.check("unrestricted-t2: resume accepted", False, t2)
             return
         completed(case, "unrestricted-t2", t2)
+        text = t2.get("final_text") or ""
+        case.check("unrestricted-t2: conversation-only nonce recalled", nonce in text,
+                   {"final_text": text})
         check_launch(case, "unrestricted-t2", launches, mode="unrestricted", session=session,
                      first=False)
         check_status(run, case, "unrestricted-t2", session, expect, [])
@@ -1325,6 +1462,9 @@ def phase(run, name, config, home, steps):
         interrupt_guard()
         if run.budget_hit or run.accounting_failed:
             raise Blocked("budget reached or spending unaccounted")
+        if run.daemon_unverified:
+            raise Blocked(f"daemon of phase {run.daemon_unverified['phase']} not verified "
+                          "stopped")
         run.start_phase(name, config, home)
     except Blocked as error:
         for case, _ in steps:
@@ -1364,6 +1504,9 @@ def execute(run, cases, info):
     info["via_version"] = subprocess.run(
         [str(run.via), "--version"], capture_output=True, text=True, timeout=30).stdout.strip()
     info["via_sha256"] = sha256(run.via)
+    # The binaries by name and digest: no machine-local path is recorded.
+    info["via_binary"] = run.via.name
+    info["claude_binary"] = {"name": os.path.basename(run.claude), "sha256": sha256(run.claude)}
     run.prepare()
     print(f"claude --version: {info['claude_version_cli']}; via: {info['via_version']}; "
           f"model {run.model}; budget {run.budget} USD", flush=True)
@@ -1393,11 +1536,14 @@ def cleanup(run, cases, info):
         except Exception as error:
             info.setdefault("cleanup_errors", []).append(f"{name}: {type(error).__name__}: {error}")
 
-    step("stop daemon", run.stop_daemon)
+    step("stop daemon", lambda: run.stop_daemon(final=True))
+    # The daemon configuration names the Claude binary's path; it was read
+    # at daemon start and is not evidence.
+    step("remove daemon config", lambda: (run.state / "daemon.json").unlink(missing_ok=True))
     for case in cases:
         step(f"purge MCP debug of {case.name}", lambda case=case: purge_mcp_debug(case))
-    if (run.runtime is not None and run.runtime.parent == Path("/tmp")
-            and run.daemon_unverified is None and run.daemon is None):
+    # Only once the stop is proven, wherever the directory lives.
+    if run.runtime is not None and run.daemon_unverified is None and run.daemon is None:
         step("remove runtime dir", lambda: shutil.rmtree(run.runtime))
 
 
@@ -1427,17 +1573,50 @@ def main():
         parser.error("--evidence must not exist yet")
     if not args.claude or not os.path.isabs(args.claude):
         parser.error("--claude must be an absolute path (Claude Code not found on PATH)")
+    if args.budget_usd < TURN_CEILING_USD:
+        parser.error(f"--budget-usd must be at least {TURN_CEILING_USD}, the most one turn "
+                     "may cost")
     args.evidence.mkdir(parents=True, mode=0o700)
 
     info = {"runner": "scripts/qualify/claude.py", "started_at": utc_now()}
-    run = Run(args)
-    cases = [Case(run, name) for name in CASES]
+    run, cases = None, []
     try:
+        run = Run(args)
+        cases = [Case(run, name) for name in CASES]
         execute(run, cases, info)
     except BaseException as error:  # the summary is written on every exit path
         info["runner_error"] = f"{type(error).__name__}: {error}"
     finally:
-        cleanup(run, cases, info)
+        if run is not None:
+            cleanup(run, cases, info)
+    try:
+        summary, records = verdict(run, cases, info, args.evidence)
+    except Exception as error:  # still write a blocked summary
+        records = []
+        summary = {**info, "ended_at": utc_now(), "result": "blocked",
+                   "interrupted": INTERRUPTED[0] if INTERRUPTED else None,
+                   "summary_error": f"{type(error).__name__}: {error}"}
+        (args.evidence / "summary.json").write_text(
+            json.dumps(summary, indent=1, sort_keys=True, default=repr) + "\n")
+    else:
+        write_json(args.evidence / "summary.json", summary)
+    for record in records:
+        failing = [c["check"] for c in record["checks"] if c["result"] != "pass"]
+        print(f"{record['case']}: {record['result']}"
+              + (f" ({record['reason']})" if record["reason"] else "")
+              + (f"; not passed: {failing}" if failing else ""), flush=True)
+    print(f"versions {summary.get('vendor_versions_seen')}; reported cost "
+          f"{summary.get('reported_cost_usd')} USD; daemons stopped "
+          f"{summary.get('daemons_stopped')}; result {summary['result']}", flush=True)
+    # The exit code follows the written summary: a signal after it is read
+    # changes neither.
+    return 0 if summary["result"] == "pass" else 1
+
+
+def verdict(run, cases, info, evidence):
+    """The summary and the case records. The interrupt flag is read last,
+    just before the result is decided; a signal after that point does not
+    change the written summary."""
     records = []
     for case in cases:
         if case.result is None and "runner_error" in info:
@@ -1457,20 +1636,21 @@ def main():
         d.get("stopped") and not d.get("descendants_left") for d in run.daemons)
     within_budget = (not run.budget_hit and run.accounting_failed is None
                      and run.spent() < run.budget)
-    info["interrupted"] = INTERRUPTED[0] if INTERRUPTED else None
-    blocked = ("runner_error" in info or bool(info.get("cleanup_errors")) or bool(INTERRUPTED)
+    interrupted = INTERRUPTED[0] if INTERRUPTED else None
+    blocked = ("runner_error" in info or bool(info.get("cleanup_errors")) or bool(interrupted)
                or run.accounting_failed is not None or run.daemon_unverified is not None)
     passed = (stopped and version_ok and within_budget and not blocked
-              and all(record["result"] == "pass" for record in records))
+              and len(records) == len(CASES) and all(record["result"] == "pass" for record in records))
     summary = {
-        **info, "ended_at": utc_now(),
+        **info, "ended_at": utc_now(), "interrupted": interrupted,
         "vendor_versions_seen": observed, "envelopes_without_version": missing,
         "version_check": "pass" if version_ok else "fail",
         "model": run.model, "budget_usd": run.budget, "budget_reached": run.budget_hit,
+        "turn_ceiling_usd": TURN_CEILING_USD,
         "accounting_failed": run.accounting_failed,
         "reported_cost_usd": run.spent(), "cost_by_session": run.costs,
         "runtime_dir": (None if run.runtime is None else
-                        "rt" if run.runtime.parent == args.evidence else str(run.runtime)),
+                        "rt" if run.runtime.parent == evidence else str(run.runtime)),
         "daemons": run.daemons, "daemons_stopped": stopped,
         "daemon_unverified": run.daemon_unverified, "excluded": EXCLUDED,
         "checked_rule": "pass only when every case passes, every daemon stopped, the cost "
@@ -1481,15 +1661,7 @@ def main():
         "cases": [{"case": r["case"], "result": r["result"], "reason": r["reason"],
                    "evidence": r["evidence"]} for r in records],
     }
-    write_json(args.evidence / "summary.json", summary)
-    for record in records:
-        failing = [c["check"] for c in record["checks"] if c["result"] != "pass"]
-        print(f"{record['case']}: {record['result']}"
-              + (f" ({record['reason']})" if record["reason"] else "")
-              + (f"; not passed: {failing}" if failing else ""), flush=True)
-    print(f"versions {observed} (cli {cli_version}); reported cost {run.spent()} USD; "
-          f"daemons stopped {stopped}; result {summary['result']}", flush=True)
-    return 0 if passed else 1
+    return summary, records
 
 
 if __name__ == "__main__":
