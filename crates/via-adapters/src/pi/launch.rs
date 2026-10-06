@@ -129,16 +129,25 @@ fn fixed(inherit: Inherit) -> Vec<String> {
     flags
 }
 
-/// The handshake-refusal cache's recipe key (C2 §5): every launch input
-/// the handshake's command check reads, the fixed flags and the session's
-/// raw arguments, each argument after a NUL, which no argument holds.
+/// The handshake-refusal cache's recipe digest (C2 §5): SHA-256, in hex,
+/// over every launch input the handshake's command check reads, the fixed
+/// flags and the session's raw arguments, each argument after a NUL,
+/// which no argument holds. A digest keeps any valid argument list within
+/// the cache's key bound.
 pub(crate) fn recipe_key(inherit: Inherit, vendor_args: &VendorArgs) -> String {
-    let mut key = fixed(inherit).join(" ");
+    let mut hasher = Sha256::new();
+    hasher.update(fixed(inherit).join(" "));
     for arg in vendor_args.as_slice() {
-        key.push('\0');
-        key.push_str(arg);
+        hasher.update([0]);
+        hasher.update(arg);
     }
-    key
+    hasher
+        .finalize()
+        .iter()
+        .fold(String::with_capacity(64), |mut key, byte| {
+            let _ = write!(key, "{byte:02x}");
+            key
+        })
 }
 
 /// The exact argv (packet §4.1).
@@ -412,6 +421,22 @@ mod tests {
         assert_ne!(key(off, &[]), key(Inherit::OD2_DEFAULT, &[]));
         assert_ne!(key(off, &["--a", "b"]), key(off, &["--a b"]));
         assert_eq!(key(off, &["--a"]), key(off, &["--a"]));
+        // C2 §5 (review r1 minor): the key is a digest, so a long valid
+        // argument list still has its refusal cached.
+        let long = "x".repeat(1_200);
+        let long = [long.as_str()];
+        assert!(key(off, &long).len() <= crate::instance::RECIPE_KEY_MAX);
+        let cache = crate::instance::InstanceCache::default();
+        let program = std::env::current_exe().unwrap();
+        let now = std::time::Instant::now();
+        cache.record_refusal(
+            &program,
+            key(off, &long),
+            crate::instance::Incompatibility::ReadbackDiffers("get_commands"),
+            now,
+        );
+        assert!(cache.refusal(&program, &key(off, &long), now).is_some());
+        assert!(cache.refusal(&program, &key(off, &[]), now).is_none());
     }
 
     /// The launch environment: the allow-list, Pi's private agent
