@@ -971,8 +971,8 @@ tables list only unreserved options of the checked versions; an option
 outside them (a later vendor's) passes and takes no value, so a separate
 value after it is an operand and refused: the caller attaches it
 (`--name=value`). VIA verifies nothing an unreserved argument does; C1's
-warning `vendor_passthrough` says so on every receipt, envelope and status
-of the session.
+warning `vendor_passthrough` says so on every spawn and resume receipt,
+envelope and status of the session.
 
 **Launch size.** The arguments count toward Host's launch request (the
 64 KiB `Configure` frame, runtime §5). A route checks the whole launch with
