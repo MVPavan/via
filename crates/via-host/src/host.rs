@@ -689,6 +689,10 @@ pub struct AcquiredProcess {
     /// data passed through Wire to the route (runtime §5; `OpenCode`'s
     /// `/api/info` check). It is evidence, never signalling authority.
     pub vendor_pid: u32,
+    /// When Host received the anchor's `Spawned` reply, before the vendor
+    /// facts' journal commit: the vendor's start as the route times it
+    /// (`OpenCode` §2.2's handshake bound runs from it).
+    pub spawned_at: Instant,
 }
 
 struct StartedAnchor {
@@ -1687,18 +1691,7 @@ impl Host {
         }
         // This is the only ARM send for this generation; errors never cause retry.
         launch.put(pipes);
-        let reply = control
-            .lock()
-            .await
-            .transact(
-                &Request::Arm {
-                    generation: generation.clone(),
-                },
-                1024,
-            )
-            .await
-            .map_err(HostError::launch("send ARM"))?;
-        let vendor_pid = spawned(reply)?;
+        let (vendor_pid, spawned_at) = send_arm(&control, &generation).await?;
         // The group's exit watch, which the ledger's `Armed` entry reads.
         let (sender, exits) = watch::channel(None);
         // Design §6.8 [r6.1]: armed right after `Spawned`; an early stop
@@ -1758,6 +1751,7 @@ impl Host {
             control,
             exits,
             vendor_pid,
+            spawned_at,
         })
     }
 
@@ -2581,6 +2575,27 @@ fn write_bootstrap(path: &PathBuf, bootstrap: &Bootstrap) -> Result<(), HostErro
 }
 
 /// The vendor's pid from the anchor's reply to ARM, or why there is none.
+/// Sends the generation's one ARM and reads its `Spawned` reply: the
+/// vendor pid and the instant Host received it.
+async fn send_arm(
+    control: &Mutex<ControlConnection>,
+    generation: &str,
+) -> Result<(u32, Instant), HostError> {
+    let reply = control
+        .lock()
+        .await
+        .transact(
+            &Request::Arm {
+                generation: generation.to_owned(),
+            },
+            1024,
+        )
+        .await
+        .map_err(HostError::launch("send ARM"))?;
+    let vendor_pid = spawned(reply)?;
+    Ok((vendor_pid, Instant::now()))
+}
+
 fn spawned(reply: Reply) -> Result<u32, HostError> {
     match reply {
         Reply::Spawned { pid } => Ok(pid),

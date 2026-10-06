@@ -279,17 +279,20 @@ async fn a_deadline_after_the_request_was_written_is_indeterminate() {
     peer.abort();
 }
 
-/// §8: four general connections; a fifth request waits for one and, at its
-/// deadline, was never sent. Other pools never borrow from it.
-#[tokio::test]
-async fn the_general_pool_holds_four_requests_and_the_stop_pool_is_separate() {
-    let (listener, client) = listener().await;
+/// A peer that answers requests starting with `quick` with `ok` and holds
+/// every other one open, reporting each held request once its head was
+/// read: the barrier a pool test waits on.
+fn holding_peer(
+    listener: TcpListener,
+    quick: &'static str,
+) -> (tokio::task::JoinHandle<()>, tokio::sync::mpsc::Receiver<()>) {
+    let (held_tx, held_rx) = tokio::sync::mpsc::channel(16);
     let peer = tokio::spawn(async move {
         let mut held = Vec::new();
         loop {
             let (mut stream, _) = listener.accept().await.unwrap();
             let (request, _) = read_request(&mut stream).await;
-            if request.starts_with("POST /stop") {
+            if request.starts_with(quick) {
                 stream
                     .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
                     .await
@@ -297,9 +300,35 @@ async fn the_general_pool_holds_four_requests_and_the_stop_pool_is_separate() {
                 stream.shutdown().await.unwrap();
             } else {
                 held.push(stream);
+                held_tx.send(()).await.unwrap();
             }
         }
     });
+    (peer, held_rx)
+}
+
+/// Waits until the peer holds `count` more requests.
+async fn held_by_peer(holding: &mut tokio::sync::mpsc::Receiver<()>, count: usize) {
+    for _ in 0..count {
+        holding.recv().await.unwrap();
+    }
+}
+
+/// Cancels the requests and joins each, so their connections and permits
+/// are dropped when it returns.
+async fn cancel_joined<T>(tasks: Vec<tokio::task::JoinHandle<T>>) {
+    for task in tasks {
+        task.abort();
+        assert!(task.await.err().is_some_and(|error| error.is_cancelled()));
+    }
+}
+
+/// §8: four general connections; a fifth request waits for one and, at its
+/// deadline, was never sent. Other pools never borrow from it.
+#[tokio::test]
+async fn the_general_pool_holds_four_requests_and_the_stop_pool_is_separate() {
+    let (listener, client) = listener().await;
+    let (peer, mut holding) = holding_peer(listener, "POST /stop");
     let client = std::sync::Arc::new(client);
     let mut busy = Vec::new();
     for _ in 0..4 {
@@ -308,7 +337,7 @@ async fn the_general_pool_holds_four_requests_and_the_stop_pool_is_separate() {
             client.request(get("/hold"), within(10)).await
         }));
     }
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    held_by_peer(&mut holding, 4).await;
     let deadline = Deadline::at(Instant::now() + Duration::from_millis(300));
     let fifth = client.request(get("/hold"), deadline).await.unwrap_err();
     assert_eq!(fifth.kind, HttpFailure::Deadline);
@@ -322,9 +351,7 @@ async fn the_general_pool_holds_four_requests_and_the_stop_pool_is_separate() {
     };
     let response = client.request(stop, within(5)).await.unwrap();
     assert_eq!(response.body, b"ok");
-    for task in busy {
-        task.abort();
-    }
+    cancel_joined(busy).await;
     peer.abort();
 }
 
@@ -591,22 +618,7 @@ async fn sse_a_zero_length_stream_ends_at_once() {
 #[tokio::test]
 async fn reserved_pools_hold_two_each_and_are_isolated() {
     let (listener, client) = listener().await;
-    let peer = tokio::spawn(async move {
-        let mut held = Vec::new();
-        loop {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let (request, _) = read_request(&mut stream).await;
-            if request.starts_with("GET /quick") {
-                stream
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-                    .await
-                    .unwrap();
-                stream.shutdown().await.unwrap();
-            } else {
-                held.push(stream);
-            }
-        }
-    });
+    let (peer, mut holding) = holding_peer(listener, "GET /quick");
     let client = std::sync::Arc::new(client);
     let request = |target: &'static str, pool: Pool| HttpRequest {
         method: Method::Get,
@@ -623,7 +635,7 @@ async fn reserved_pools_hold_two_each_and_are_isolated() {
                 client.request(request("/hold", held), within(10)).await
             }));
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        held_by_peer(&mut holding, 2).await;
         let deadline = Deadline::at(Instant::now() + Duration::from_millis(300));
         let third = client
             .request(request("/hold", held), deadline)
@@ -641,11 +653,9 @@ async fn reserved_pools_hold_two_each_and_are_isolated() {
                 .unwrap();
             assert_eq!(response.body, b"ok", "{held:?} then {other:?}");
         }
-        for task in busy {
-            task.abort();
-        }
-        // The aborted requests' connections and permits are released.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Joined: the cancelled requests' connections and permits are
+        // released before the next pool's round.
+        cancel_joined(busy).await;
     }
     peer.abort();
 }

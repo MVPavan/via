@@ -1257,3 +1257,66 @@ async fn oc02_managed_directories_must_be_private() {
     assert_eq!(mode(probe.path()), 0o700);
     rig.finish().await;
 }
+
+/// Review ocrouteA2 #1: §2.2's bound runs from Host's `Spawned`, not from
+/// the acquisition's return: a vendor-facts commit delayed 750 ms past
+/// the spawn leaves a 500 ms bound already spent, so the launch fails at
+/// its deadline although the server is compatible.
+#[cfg(feature = "test-failpoints")]
+#[tokio::test]
+async fn oc01_handshake_bound_runs_from_the_spawn_report() {
+    use std::os::unix::fs::PermissionsExt;
+    let points = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(points.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let token = "oc-spawn-bound-from-spawned";
+    via_routes::failpoint::activate(points.path(), token).unwrap();
+    std::fs::write(
+        points.path().join("store.journal.vendor_facts.json"),
+        json!({"token": token, "occurrence": 1, "action": "delay", "value": 750}).to_string(),
+    )
+    .unwrap();
+    let rig = Rig::bounded(&compatible(), Duration::from_millis(500));
+    let error = rig.refused().await;
+    assert_eq!(error.failure, LaunchFailure::Deadline);
+    assert!(
+        points
+            .path()
+            .join("store.journal.vendor_facts.1.ack")
+            .is_file(),
+        "the delay ran"
+    );
+    rig.finish().await;
+}
+
+/// Review ocrouteA2 #2: the directory step is never abandoned: even with
+/// the caller's deadline already passed, `acquire` returns only after the
+/// blocking job ended (its directories exist), and then reports the
+/// deadline; nothing launched.
+#[tokio::test]
+async fn the_directory_step_is_always_awaited() {
+    let rig = Rig::new(&compatible());
+    let owner = ProcessOwner::Server {
+        server_id: ServerId::try_from("v_000000000000").unwrap(),
+    };
+    let passed = via_routes::Deadline::at(tokio::time::Instant::now());
+    let error = rig
+        .adapter
+        .acquire(owner, Box::new(()), passed)
+        .await
+        .expect_err("the deadline passed");
+    assert_eq!(
+        error,
+        AcquireError::Prepare("check the namespace directory by the deadline")
+    );
+    let namespace = rig.namespace();
+    let probe = PrivateRoot::probe(&rig.vendor_state_dir());
+    for part in ["home", "config", "data", "state", "cache", "runtime", "tmp"] {
+        assert!(
+            namespace.path().join(part).is_dir(),
+            "{part}: job outstanding"
+        );
+        assert!(probe.path().join(part).is_dir(), "{part}: job outstanding");
+    }
+    assert!(rig.reports().is_empty() && rig.lines(".versions").is_empty());
+    rig.finish().await;
+}

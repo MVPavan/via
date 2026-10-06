@@ -37,9 +37,9 @@ const USER: &str = "opencode";
 const PASSWORD_BYTES: usize = 32;
 
 /// The bound on everything before the spawn: the namespace database's
-/// check, the password, the evidence folder and Host's acquisition (whose
-/// version check has its own 2 s). The handshake's bound starts after it,
-/// at the spawn (§2.2).
+/// check and the password (checked once their blocking job returned), the
+/// evidence folder and Host's acquisition (whose version check has its own
+/// 2 s). The handshake's bound runs from Host's `Spawned` instead (§2.2).
 pub const ACQUISITION: Duration = Duration::from_secs(30);
 
 /// The stdout bounds: the URL line's 4 KiB before its LF (Wire's cap
@@ -72,27 +72,28 @@ pub(crate) async fn launch(
         database,
         checked,
     } = launch;
-    // Blocking filesystem reads, off the async workers and bounded; at the
-    // bound the task is left to finish and its result never used.
-    let prepared = tokio::task::spawn_blocking(move || prepare(&database));
-    let (fresh, password) = tokio::select! {
-        prepared = timeout_at(acquisition.instant(), prepared) => match prepared {
-            Ok(Ok(Some(prepared))) => prepared,
-            Ok(Ok(None) | Err(_)) => {
-                return Err(LaunchFailure::Transient {
-                    step: "generate the server password",
-                }
-                .into());
+    // Blocking filesystem reads, off the async workers, awaited to their
+    // end: nothing is detached and every result is collected, the fence
+    // included. Runtime §5 requires VIA's state directory to be local and
+    // responsive, so the job is short; the acquisition bound is checked
+    // once it returns.
+    let prepared = tokio::task::spawn_blocking(move || prepare(&database)).await;
+    let (fresh, password) = match prepared {
+        Ok(Some(prepared)) => prepared,
+        Ok(None) => {
+            return Err(LaunchFailure::Transient {
+                step: "generate the server password",
             }
-            Err(_) => {
-                return Err(LaunchFailure::Transient {
-                    step: "check the namespace database",
-                }
-                .into());
-            }
-        },
-        () = &mut fenced => return Err(LaunchFailure::Shutdown.into()),
+            .into());
+        }
+        Err(_) => return Err(LaunchFailure::Internal.into()),
     };
+    if Instant::now() >= acquisition.instant() {
+        return Err(LaunchFailure::Transient {
+            step: "check the namespace database",
+        }
+        .into());
+    }
     let mut env: Vec<(OsString, OsString)> = spec.env.entries().to_vec();
     env.push(("OPENCODE_PASSWORD".into(), password.clone().into()));
     spec.env = EnvAllowList::try_from_entries(env).map_err(|_| LaunchFailure::Internal)?;
@@ -102,13 +103,13 @@ pub(crate) async fn launch(
         () = &mut fenced => return Err(LaunchFailure::Shutdown.into()),
     };
     let connection = opened.map_err(|error| acquire_failure(&error, checked))?;
-    // §2.2: the handshake's bound runs from the spawn, which Host reported
-    // as the acquisition returned.
-    let deadline = Deadline::at(Instant::now() + bound);
-    let vendor_pid = connection.vendor_pid();
+    let spawn = connection.vendor_pid().zip(connection.spawned_at());
     let WireParts { sender, messages } = connection.into_parts();
     servers.install(&server, &sender);
-    let vendor_pid = vendor_pid.ok_or(LaunchFailure::Internal)?;
+    let (vendor_pid, spawned_at) = spawn.ok_or(LaunchFailure::Internal)?;
+    // §2.2: the handshake's bound runs from the spawn, the instant Host
+    // received the anchor's `Spawned` (before its vendor-facts commit).
+    let deadline = Deadline::at(spawned_at + bound);
     let mut version = None;
     let shaken = tokio::select! {
         shaken = timeout_at(

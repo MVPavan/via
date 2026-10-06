@@ -1541,7 +1541,8 @@ pub struct WireParts {
 pub struct WireConnection {
     sender: WireSender,
     messages: WireMessages,
-    vendor_pid: Option<u32>,
+    /// The fenced launch's vendor pid and Host's `Spawned` instant.
+    spawn: Option<(u32, tokio::time::Instant)>,
 }
 
 impl WireConnection {
@@ -1550,7 +1551,15 @@ impl WireConnection {
     /// for the route's identity check (`OpenCode`'s `/api/info.pid`), never
     /// signalling authority.
     pub fn vendor_pid(&self) -> Option<u32> {
-        self.vendor_pid
+        self.spawn.map(|(pid, _)| pid)
+    }
+
+    /// When Host received the anchor's `Spawned` reply, for a launch with
+    /// `die_with_anchor` (beside [`Self::vendor_pid`]), `None` for any
+    /// other: the start a route times its handshake from (`OpenCode`
+    /// §2.2), passive data.
+    pub fn spawned_at(&self) -> Option<tokio::time::Instant> {
+        self.spawn.map(|(_, at)| at)
     }
 
     /// Splits the connection into its control and message halves.
@@ -1571,7 +1580,11 @@ pub(crate) struct Waits {
 /// Starts the reader and writer tasks over a Host-acquired process.
 pub(crate) fn open(
     pipes: via_host::OwnedPipes,
-    (control, exits, vendor_pid): (ProcessControl, ExitReceiver, Option<u32>),
+    (control, exits, spawn): (
+        ProcessControl,
+        ExitReceiver,
+        Option<(u32, tokio::time::Instant)>,
+    ),
     folder: (PathBuf, BlobTasks, crate::Capture),
     (waits, bounds): (Waits, InboundBounds),
     stragglers: &Stragglers,
@@ -1589,7 +1602,7 @@ pub(crate) fn open(
             process: Arc::new(Process { control, exits }),
         },
         messages,
-        vendor_pid,
+        spawn,
     }
 }
 

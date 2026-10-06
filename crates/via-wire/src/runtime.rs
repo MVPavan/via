@@ -424,6 +424,7 @@ async fn open(
         control,
         exits,
         vendor_pid,
+        spawned_at,
     } = match acquired {
         Ok(acquired) => acquired,
         Err((cause, evidence)) => {
@@ -449,7 +450,7 @@ async fn open(
     };
     Ok(connection::open(
         pipes,
-        (control, exits, fenced.then_some(vendor_pid)),
+        (control, exits, fenced.then_some((vendor_pid, spawned_at))),
         (folder, tasks, capture),
         (waits, inbound),
         stragglers,
