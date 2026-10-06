@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 use via_routes::VersionProbe;
-use via_routes::opencode::{Launch, ServerKey};
+use via_routes::opencode::{Launch, Prepare, ServerKey};
 
 use crate::private_dir::{Unsafe, managed};
 use crate::{EnvAllowList, PrivateProcessSpec, ProcessOwner, StderrCapture};
@@ -165,6 +165,9 @@ impl ServerRecipe {
     /// The managed directories of a launch, the namespace's and the probe
     /// root's, checked and created where missing (runtime §6.1). Blocking.
     pub(crate) fn prepare(&self) -> Result<(), Unsafe> {
+        // Test builds: the job's entry, where a test holds it.
+        #[cfg(feature = "test-failpoints")]
+        via_routes::failpoint::hit("adapters.opencode.prepare")?;
         self.namespace.create()?;
         self.probe.create()
     }
@@ -203,7 +206,12 @@ impl ServerRecipe {
     /// counted only), the database whose absence skips the credential
     /// check, and the checked versions. The registry replaces `owner` with
     /// the server it mints, and sets the capacity and the password.
-    pub(crate) fn launch(&self, owner: ProcessOwner, checked: &'static [&'static str]) -> Launch {
+    pub(crate) fn launch(
+        &self,
+        owner: ProcessOwner,
+        checked: &'static [&'static str],
+        prepare: Prepare,
+    ) -> Launch {
         let list = |entries| {
             // The names are fixed and valid; values are paths and fixed
             // text without NUL.
@@ -234,6 +242,7 @@ impl ServerRecipe {
             spec,
             database: self.namespace.database(),
             checked,
+            prepare,
         }
     }
 

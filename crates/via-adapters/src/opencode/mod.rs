@@ -7,10 +7,10 @@ use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::Arc;
 
-use via_routes::opencode::{LaunchFailure, ServerPin, Servers};
+use via_routes::opencode::{LaunchFailure, Prepare, ServerPin, Servers};
 
 use crate::private_dir::Unsafe;
-use crate::{CapacityToken, Deadline, ProcessOwner};
+use crate::{CapacityToken, ProcessOwner};
 
 mod launch;
 
@@ -23,19 +23,6 @@ pub(crate) const ADAPTER_VERSION: &str = "1";
 
 /// The versions that run (§12).
 pub(crate) const CHECKED: &[&str] = &["2.0.22"];
-
-/// Why an acquisition failed.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum AcquireError {
-    /// The registry's launch failed, or was refused.
-    Launch(LaunchFailure),
-    /// A managed directory is not private (runtime §6.1): VIA's text
-    /// naming it and the rule, never a value. Nothing was launched.
-    Unsafe(String),
-    /// The directory step failed, or ended after the caller's deadline:
-    /// the step. Nothing was launched.
-    Prepare(&'static str),
-}
 
 /// The route's shared server, as the adapter acquires it: its recipe and
 /// the registry.
@@ -59,39 +46,31 @@ impl OpenCodeServers {
     }
 
     /// A pin on the live or launching server, or a new launch holding
-    /// `capacity`. Before a new launch, the managed directories (the
-    /// namespace and the probe root, from VIA's `vendor/` down) are
-    /// checked and created where missing on a blocking task, awaited to
-    /// its end: nothing is detached, every result is collected, and each
-    /// acquisition has at most one job outstanding. Runtime §5 requires
-    /// VIA's state directory to be local and responsive, so the job is
-    /// short, and a fence or retirement waits for it; `deadline` is
-    /// checked once it returned.
-    pub(crate) async fn acquire(
+    /// `capacity`. A new launch first checks and creates the managed
+    /// directories (the namespace and the probe root, from VIA's `vendor/`
+    /// down, runtime §6.1) on the registry's launch task, the job's one
+    /// owner: a refusal is that launch's [`LaunchFailure::Unsafe`], and a
+    /// caller that stops waiting leaves the job to the registry, which
+    /// collects it through its fence and join.
+    pub(crate) fn acquire(
         &self,
         owner: ProcessOwner,
         capacity: CapacityToken,
-        deadline: Deadline,
-    ) -> Result<ServerPin, AcquireError> {
+    ) -> Result<ServerPin, LaunchFailure> {
         let key = self.recipe.server_key(ADAPTER_VERSION);
         if let Some(pin) = self.servers.pin(&key) {
             return Ok(pin);
         }
         let recipe = Arc::clone(&self.recipe);
-        match tokio::task::spawn_blocking(move || recipe.prepare()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(Unsafe::Refused(detail))) => return Err(AcquireError::Unsafe(detail)),
-            Ok(Err(Unsafe::Io)) | Err(_) => {
-                return Err(AcquireError::Prepare("create the namespace directory"));
-            }
-        }
-        if tokio::time::Instant::now() >= deadline.instant() {
-            return Err(AcquireError::Prepare(
-                "check the namespace directory by the deadline",
-            ));
-        }
+        let prepare: Prepare = Box::new(move || {
+            recipe.prepare().map_err(|unsafe_dir| match unsafe_dir {
+                Unsafe::Refused(detail) => LaunchFailure::Unsafe { detail },
+                Unsafe::Io => LaunchFailure::Transient {
+                    step: "create the namespace directory",
+                },
+            })
+        });
         self.servers
-            .launch_or_join(key, self.recipe.launch(owner, CHECKED), capacity)
-            .map_err(AcquireError::Launch)
+            .launch_or_join(key, self.recipe.launch(owner, CHECKED, prepare), capacity)
     }
 }

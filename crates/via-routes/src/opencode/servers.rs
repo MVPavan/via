@@ -78,6 +78,11 @@ pub struct ServerFacts {
     pub credential_unchecked: bool,
 }
 
+/// The adapter's blocking preparation of a launch (its managed
+/// directories, runtime §6.1). The launch task owns and awaits it, so it
+/// has that one owner whatever happens to the turns waiting on the launch.
+pub type Prepare = Box<dyn FnOnce() -> Result<(), LaunchFailure> + Send + 'static>;
+
 /// What a launch needs beside its key (the adapter's recipe).
 pub struct Launch {
     /// The process, without its password: the registry generates one per
@@ -89,6 +94,9 @@ pub struct Launch {
     pub database: std::path::PathBuf,
     /// The versions that run (§12).
     pub checked: &'static [&'static str],
+    /// Run first on the launch task's blocking job, before anything
+    /// launches.
+    pub prepare: Prepare,
 }
 
 /// Why a launch failed, as each of its waiters' turns reports it.
@@ -125,6 +133,12 @@ pub enum LaunchFailure {
     },
     /// The handshake's bound passed.
     Deadline,
+    /// A managed directory is not private (runtime §6.1): VIA's text
+    /// naming it and the rule, never a value. Nothing was launched.
+    Unsafe {
+        /// The named refusal.
+        detail: String,
+    },
     /// The registry is fenced: the daemon is shutting down.
     Shutdown,
     /// The launch task itself failed, or its server went before
@@ -160,7 +174,9 @@ impl LaunchFailure {
                 journal_uncertain,
                 launch,
             ),
-            Self::Refused(_) => (RouteError::HandshakeRefused { turn }, NONE, false, None),
+            Self::Refused(_) | Self::Unsafe { .. } => {
+                (RouteError::HandshakeRefused { turn }, NONE, false, None)
+            }
             Self::Transient { step: name } => {
                 (RouteError::TransportLost { turn }, NONE, false, step(name))
             }

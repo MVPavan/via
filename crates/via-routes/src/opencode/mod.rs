@@ -12,6 +12,6 @@ pub use handshake::{CatalogModel, Refusal, URL_LINE_BYTES};
 pub use launch::ACQUISITION;
 pub use server::{GenerationEnd, LOSS_EXIT, SILENCE, Server};
 pub use servers::{
-    HANDSHAKE, Launch, LaunchError, LaunchFailure, SERVER_RETIRE, ServerEnd, ServerFacts,
+    HANDSHAKE, Launch, LaunchError, LaunchFailure, Prepare, SERVER_RETIRE, ServerEnd, ServerFacts,
     ServerKey, ServerLease, ServerPin, ServerReport, Servers,
 };

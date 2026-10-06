@@ -176,6 +176,8 @@ POINTS = [
     "store.commit.corrupt.terminal",
     "core.terminal.read_back",
     "routes.late.entered",
+    # ocrouteA3 (OpenCode): the launch task's managed-directory job.
+    "adapters.opencode.prepare",
     # x.3.2 C3 (C2 §5): the Claude adapter's refusal-cache clock.
     "adapter.claude.plan_clock_ms",
     # via-4sw.3.1 (runtime §5, OpenCode OC02b): the exec entry's seams and

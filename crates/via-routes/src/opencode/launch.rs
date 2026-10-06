@@ -71,23 +71,24 @@ pub(crate) async fn launch(
         mut spec,
         database,
         checked,
+        prepare: adapter,
     } = launch;
-    // Blocking filesystem reads, off the async workers, awaited to their
-    // end: nothing is detached and every result is collected, the fence
-    // included. Runtime §5 requires VIA's state directory to be local and
-    // responsive, so the job is short; the acquisition bound is checked
-    // once it returns.
-    let prepared = tokio::task::spawn_blocking(move || prepare(&database)).await;
+    // The launch's one blocking job: the adapter's managed directories,
+    // then the database check and the password. This task is its only
+    // owner and awaits it to its end, the fence and a retirement
+    // included; a waiting turn that gives up drops only its wait. Nothing
+    // is detached and every result is collected. Runtime §5 requires
+    // VIA's state directory to be local and responsive, so the job is
+    // short; the acquisition bound is checked once it returns.
+    let prepared = tokio::task::spawn_blocking(move || prepare(adapter, &database)).await;
     let (fresh, password) = match prepared {
-        Ok(Some(prepared)) => prepared,
-        Ok(None) => {
-            return Err(LaunchFailure::Transient {
-                step: "generate the server password",
-            }
-            .into());
-        }
+        Ok(prepared) => prepared?,
         Err(_) => return Err(LaunchFailure::Internal.into()),
     };
+    // Fenced while the job ran: nothing starts.
+    if *servers.fenced().borrow() {
+        return Err(LaunchFailure::Shutdown.into());
+    }
     if Instant::now() >= acquisition.instant() {
         return Err(LaunchFailure::Transient {
             step: "check the namespace database",
@@ -315,15 +316,22 @@ async fn get(
     }
 }
 
-/// The launch's blocking reads: whether the namespace is fresh (§4.3: no
-/// database; any doubt runs the check) and the password; `None` when the
-/// password could not be made.
-fn prepare(database: &std::path::Path) -> Option<(bool, String)> {
+/// The launch's blocking job: the adapter's preparation, then whether the
+/// namespace is fresh (§4.3: no database; any doubt runs the check) and
+/// the password.
+fn prepare(
+    adapter: super::servers::Prepare,
+    database: &std::path::Path,
+) -> Result<(bool, String), LaunchFailure> {
+    adapter()?;
     let fresh = matches!(
         std::fs::symlink_metadata(database),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound
     );
-    Some((fresh, password()?))
+    let password = password().ok_or(LaunchFailure::Transient {
+        step: "generate the server password",
+    })?;
+    Ok((fresh, password))
 }
 
 /// 256 random bits from `/dev/urandom`, as 64 lower-case hex digits.

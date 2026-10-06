@@ -24,7 +24,7 @@ use via_routes::opencode::{
 use via_routes::{RouteError, RouteRuntime, TurnNumber};
 
 use super::launch::{CONFIG_CONTENT, PrivateRoot};
-use super::{AcquireError, CHECKED, OpenCodeServers};
+use super::{CHECKED, OpenCodeServers};
 use crate::ProcessOwner;
 
 /// The bound on one fixture's launch, beyond the registry's own.
@@ -196,24 +196,16 @@ impl Rig {
         PrivateRoot::namespace(&self.vendor_state_dir())
     }
 
-    async fn acquire(
-        &self,
-        capacity: via_routes::CapacityToken,
-    ) -> Result<ServerPin, AcquireError> {
+    fn acquire(&self, capacity: via_routes::CapacityToken) -> Result<ServerPin, LaunchFailure> {
         let owner = ProcessOwner::Server {
             server_id: ServerId::try_from("v_000000000000").unwrap(),
         };
-        let deadline = via_routes::Deadline::at(tokio::time::Instant::now() + GONE);
-        self.adapter.acquire(owner, capacity, deadline).await
+        self.adapter.acquire(owner, capacity)
     }
 
     /// One acquisition awaited to its launch's end.
     async fn launch(&self) -> Result<ServerPin, LaunchError> {
-        let pin = match self.acquire(Box::new(())).await {
-            Ok(pin) => pin,
-            Err(AcquireError::Launch(failure)) => return Err(failure.into()),
-            Err(other) => panic!("not a launch failure: {other:?}"),
-        };
+        let pin = self.acquire(Box::new(())).map_err(LaunchError::from)?;
         let ready = tokio::time::timeout(WAIT, pin.ready(std::future::pending()))
             .await
             .expect("the launch ends within its bound");
@@ -445,14 +437,8 @@ async fn oc02_launch_environment_and_fresh_handshake() {
 async fn oc02_acquisitions_share_one_server_and_one_capacity() {
     let rig = Rig::new(&compatible());
     let (first_token, second_token) = (Arc::new(()), Arc::new(()));
-    let first = rig
-        .acquire(Box::new(Arc::clone(&first_token)))
-        .await
-        .unwrap();
-    let second = rig
-        .acquire(Box::new(Arc::clone(&second_token)))
-        .await
-        .unwrap();
+    let first = rig.acquire(Box::new(Arc::clone(&first_token))).unwrap();
+    let second = rig.acquire(Box::new(Arc::clone(&second_token))).unwrap();
     assert_eq!(first.server(), second.server());
     assert_eq!(
         Arc::strong_count(&second_token),
@@ -466,7 +452,7 @@ async fn oc02_acquisitions_share_one_server_and_one_capacity() {
         2,
         "the launch holds its capacity"
     );
-    let third = rig.acquire(Box::new(())).await.unwrap();
+    let third = rig.acquire(Box::new(())).unwrap();
     assert_eq!(third.server(), first.server());
     assert_eq!(rig.reports().len(), 1);
     let lease = third.lease().unwrap();
@@ -1215,7 +1201,7 @@ async fn oc02_managed_directories_must_be_private() {
     .unwrap();
     std::fs::set_permissions(namespace.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     std::os::unix::fs::symlink(outside.path(), namespace.path().join("data")).unwrap();
-    let Err(AcquireError::Unsafe(detail)) = rig.acquire(Box::new(())).await else {
+    let LaunchFailure::Unsafe { detail } = rig.refused().await.failure else {
         panic!("a symlinked data/ is refused");
     };
     assert!(
@@ -1228,7 +1214,7 @@ async fn oc02_managed_directories_must_be_private() {
 
     // A namespace of mode 0755 is refused and left 0755.
     std::fs::set_permissions(namespace.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-    let Err(AcquireError::Unsafe(detail)) = rig.acquire(Box::new(())).await else {
+    let LaunchFailure::Unsafe { detail } = rig.refused().await.failure else {
         panic!("a 0755 namespace is refused");
     };
     assert!(detail.contains("0755"), "{detail}");
@@ -1239,7 +1225,7 @@ async fn oc02_managed_directories_must_be_private() {
     std::fs::set_permissions(namespace.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let probe = PrivateRoot::probe(&rig.vendor_state_dir());
     std::os::unix::fs::symlink(outside.path(), probe.path()).unwrap();
-    let Err(AcquireError::Unsafe(detail)) = rig.acquire(Box::new(())).await else {
+    let LaunchFailure::Unsafe { detail } = rig.refused().await.failure else {
         panic!("a symlinked probe root is refused");
     };
     assert!(
@@ -1288,35 +1274,70 @@ async fn oc01_handshake_bound_runs_from_the_spawn_report() {
     rig.finish().await;
 }
 
-/// Review ocrouteA2 #2: the directory step is never abandoned: even with
-/// the caller's deadline already passed, `acquire` returns only after the
-/// blocking job ended (its directories exist), and then reports the
-/// deadline; nothing launched.
+/// Review ocrouteA3: the managed-directory job has one owner, the
+/// registry's launch task. A caller that cancels its acquisition while
+/// the job is held only drops its wait: the fenced registry's join waits
+/// for the job and collects it, and nothing is created after the join.
+#[cfg(feature = "test-failpoints")]
 #[tokio::test]
-async fn the_directory_step_is_always_awaited() {
+async fn a_cancelled_acquisition_leaves_its_directory_job_owned() {
+    use std::os::unix::fs::PermissionsExt;
+    let points = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(points.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let token = "oc-directory-job-owned";
+    via_routes::failpoint::activate(points.path(), token).unwrap();
+    std::fs::write(
+        points.path().join("adapters.opencode.prepare.json"),
+        json!({"token": token, "occurrence": 1, "action": "pause"}).to_string(),
+    )
+    .unwrap();
+    let ack = points.path().join("adapters.opencode.prepare.1.ack");
     let rig = Rig::new(&compatible());
-    let owner = ProcessOwner::Server {
-        server_id: ServerId::try_from("v_000000000000").unwrap(),
-    };
-    let passed = via_routes::Deadline::at(tokio::time::Instant::now());
-    let error = rig
-        .adapter
-        .acquire(owner, Box::new(()), passed)
-        .await
-        .expect_err("the deadline passed");
-    assert_eq!(
-        error,
-        AcquireError::Prepare("check the namespace directory by the deadline")
-    );
     let namespace = rig.namespace();
-    let probe = PrivateRoot::probe(&rig.vendor_state_dir());
-    for part in ["home", "config", "data", "state", "cache", "runtime", "tmp"] {
-        assert!(
-            namespace.path().join(part).is_dir(),
-            "{part}: job outstanding"
-        );
-        assert!(probe.path().join(part).is_dir(), "{part}: job outstanding");
+    {
+        // Polled until its directory job is held, then cancelled.
+        let acquisition = rig.launch();
+        tokio::pin!(acquisition);
+        let deadline = tokio::time::Instant::now() + GONE;
+        while !ack.is_file() {
+            assert!(tokio::time::Instant::now() < deadline, "the job never ran");
+            let polled = tokio::time::timeout(Duration::from_millis(20), &mut acquisition).await;
+            assert!(
+                polled.is_err(),
+                "the acquisition ended while its job was held"
+            );
+        }
     }
-    assert!(rig.reports().is_empty() && rig.lines(".versions").is_empty());
+    rig.servers.fence();
+    let short = via_routes::Deadline::at(tokio::time::Instant::now() + Duration::from_millis(300));
+    let (unjoined, _) = rig.servers.join(short).await;
+    assert!(unjoined > 0, "the join waits for the held directory job");
+    assert!(!namespace.path().exists(), "the job is still held");
+    std::fs::write(
+        points.path().join("adapters.opencode.prepare.1.release"),
+        b"",
+    )
+    .unwrap();
+    let full = via_routes::Deadline::at(tokio::time::Instant::now() + GONE);
+    assert_eq!(rig.servers.join(full).await, (0, 0));
+    let tree = || {
+        let mut found = Vec::new();
+        let mut stack = vec![rig.vendor_state_dir()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path.clone());
+                }
+                found.push(path);
+            }
+        }
+        found.sort();
+        found
+    };
+    let at_join = tree();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(tree(), at_join, "created after the join");
+    assert!(rig.reports().is_empty(), "nothing launched after the fence");
     rig.finish().await;
 }
