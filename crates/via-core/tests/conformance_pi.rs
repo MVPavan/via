@@ -875,7 +875,7 @@ fn pi_profile_policy() {
     }
     // Refused, each by name, with no launch and no value; the profile is
     // then fixed and the next turn runs: the refusal was never cached.
-    let hostile: [Hostile; 17] = [
+    let hostile: [Hostile; 20] = [
         (
             "shell_prefix",
             |a| {
@@ -1001,6 +1001,26 @@ fn pi_profile_policy() {
                 std::os::unix::fs::symlink("/bin/sh", a.join("bin/sh"))
             },
             &["bin/sh"],
+        ),
+        // Picrit #1: the managed directories down to the agent directory
+        // are 0700; one that is not is refused, never chmod-ed.
+        (
+            "agent_dir_0755",
+            |a| std::fs::set_permissions(a, std::fs::Permissions::from_mode(0o755)),
+            &["vendor/pi/agent has mode 0755"],
+        ),
+        (
+            "pi_dir_0755",
+            |a| std::fs::set_permissions(pi_of(a), std::fs::Permissions::from_mode(0o755)),
+            &["vendor/pi has mode 0755"],
+        ),
+        (
+            "vendor_dir_0755",
+            |a| {
+                let vendor = pi_of(a).parent().unwrap_or(a);
+                std::fs::set_permissions(vendor, std::fs::Permissions::from_mode(0o755))
+            },
+            &["vendor has mode 0755"],
         ),
     ];
     for (label, harm, names) in hostile {
@@ -1208,47 +1228,77 @@ fn pi_stage_outlived_by_its_task() {
 }
 
 /// Packet §3 (review r2 minor): the version read before VIA's launch
-/// state failed is still this turn's `InstanceReport`.
+/// state failed is still this turn's `InstanceReport`: a write that fails
+/// (a folder where the instructions' partial goes) is `store`; a session
+/// directory that is not one (picrit #1, §4.4) is `handshake_refused`.
 #[test]
 fn pi_version_survives_a_state_failure() {
-    let replay = single(
-        "synthetic (via-jt8.3.2): the session directory is blocked; nothing launches",
-        argv(Argv::default()),
-        completed_steps(&State::default(), "Say READY.", "READY"),
-    );
-    let mut wanted = unaccepted(None, Some("store"), None);
-    wanted["instance"] = json!({"vendor_version": "1.0.2", "version_status": "untested"});
-    let expect = case(
-        "pi_version_survives_a_state_failure",
-        0,
-        vec![turn("Say READY.", wanted)],
-    );
-    let outcome = drive_built(
-        "pi_version_survives_a_state_failure",
-        &replay,
-        &expect,
-        Knobs::default(),
-        Box::new(|pure: &Pure| {
-            let package = pure.case_dir.path().join("package");
-            std::fs::create_dir(&package).map_err(|e| e.to_string())?;
-            std::fs::write(package.join("package.json"), br#"{"version":"1.0.2"}"#)
-                .map_err(|e| e.to_string())?;
-            let link = pure.fake_link();
-            let target = std::fs::read_link(&link).map_err(|e| e.to_string())?;
-            let entry = package.join("cli.js");
-            std::fs::copy(target, &entry).map_err(|e| e.to_string())?;
-            std::fs::remove_file(&link).map_err(|e| e.to_string())?;
-            std::os::unix::fs::symlink(&entry, &link).map_err(|e| e.to_string())?;
-            // A file where the session's directory goes: VIA's launch
-            // state cannot be written.
-            let sessions = pure.state.path().join("vendor").join("pi").join("sessions");
-            std::fs::create_dir_all(&sessions).map_err(|e| e.to_string())?;
-            std::fs::write(sessions.join("s_000000000001"), b"blocked").map_err(|e| e.to_string())
+    type Block = fn(&Path) -> std::io::Result<()>;
+    let variants: [(&str, &str, Block); 2] = [
+        ("store", "the instructions' partial is a folder", |pi| {
+            private_dirs(&pi.join("instructions").join(".s_000000000001.partial"))
         }),
-        Box::new(|_| Ok(())),
-    )
-    .unwrap();
-    conformance_expect::check(&expect, &outcome).unwrap();
+        (
+            "handshake_refused",
+            "a file where the session's directory goes",
+            |pi| {
+                private_dirs(&pi.join("sessions"))?;
+                std::fs::write(pi.join("sessions").join("s_000000000001"), b"blocked")
+            },
+        ),
+    ];
+    for (error, label, block) in variants {
+        let name = format!("pi_version_survives_a_state_failure_{error}");
+        let replay = single(
+            &format!("synthetic (via-jt8.3.2): {label}; nothing launches"),
+            argv(Argv {
+                instructions: true,
+                ..Argv::default()
+            }),
+            completed_steps(&State::default(), "Say READY.", "READY"),
+        );
+        let mut wanted = unaccepted(None, Some(error), None);
+        wanted["instance"] = json!({"vendor_version": "1.0.2", "version_status": "untested"});
+        let mut expect = case(&name, 0, vec![turn("Say READY.", wanted)]);
+        expect["sessions"]["main"]["instructions"] = json!("Always answer carefully.");
+        let outcome = drive_built(
+            &name,
+            &replay,
+            &expect,
+            Knobs::default(),
+            Box::new(move |pure: &Pure| {
+                let package = pure.case_dir.path().join("package");
+                std::fs::create_dir(&package).map_err(|e| e.to_string())?;
+                std::fs::write(package.join("package.json"), br#"{"version":"1.0.2"}"#)
+                    .map_err(|e| e.to_string())?;
+                let link = pure.fake_link();
+                let target = std::fs::read_link(&link).map_err(|e| e.to_string())?;
+                let entry = package.join("cli.js");
+                std::fs::copy(target, &entry).map_err(|e| e.to_string())?;
+                std::fs::remove_file(&link).map_err(|e| e.to_string())?;
+                std::os::unix::fs::symlink(&entry, &link).map_err(|e| e.to_string())?;
+                let pi = pure.state.path().join("vendor").join("pi");
+                block(&pi).map_err(|e| format!("{label}: {e}"))
+            }),
+            Box::new(|_| Ok(())),
+        )
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
+        conformance_expect::check(&expect, &outcome).unwrap_or_else(|e| panic!("{name}:\n{e}"));
+    }
+}
+
+/// `path` and its missing parents, 0700, as VIA makes its managed ones.
+fn private_dirs(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+}
+
+/// The `pi/` directory holding the agent directory `agent`.
+fn pi_of(agent: &Path) -> &Path {
+    agent.parent().unwrap_or(agent)
 }
 
 /// The owner's fix of a hostile profile: the agent directory as it was
@@ -1256,6 +1306,9 @@ fn pi_version_survives_a_state_failure() {
 fn fixed_profile(state: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let agent = state.join("vendor").join("pi").join("agent");
+    for managed in [state.join("vendor"), state.join("vendor").join("pi")] {
+        std::fs::set_permissions(managed, std::fs::Permissions::from_mode(0o700))?;
+    }
     std::fs::remove_dir_all(&agent)?;
     std::fs::DirBuilder::new().mode(0o700).create(&agent)?;
     std::fs::write(agent.join("settings.json"), r#"{"cacheWarming":"off"}"#)?;

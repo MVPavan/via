@@ -111,6 +111,15 @@ struct Staged {
 enum Unstaged {
     /// Packet §4.3: the profile policy's VIA-owned reason.
     Profile(String),
+    /// Packet §4.4: a managed directory down to the agent directory is
+    /// not private (VIA's text naming it), before the version read.
+    Unsafe(String),
+    /// Packet §4.4: a launch-state directory is not private, after the
+    /// version read.
+    UnsafeState {
+        detail: String,
+        version: Option<String>,
+    },
     /// VIA's own launch state could not be written; the version was read
     /// (packet §3).
     State { version: Option<String> },
@@ -131,6 +140,7 @@ fn instance_of(adapter: &PiAdapter, version: Option<&str>) -> InstanceReport {
 }
 
 /// The pre-launch filesystem step (packet §§2.1, 3, 4.3, 4.4): the
+/// managed directories down to the agent directory (never cached), the
 /// profile policy (never cached), the version read and VIA's launch state,
 /// in that order, the last under `staging` ([`PiAdapter`]'s lock) until it
 /// returns. Blocking I/O, run off the async workers.
@@ -140,7 +150,18 @@ fn staged(
     session: &crate::SessionId,
     instructions: Option<&str>,
 ) -> Result<Staged, Unstaged> {
-    let profile = profile::check(&launch::agent_dir(vendor_state_dir), profile::daemon_uid())
+    let agent = match launch::managed(vendor_state_dir, &["pi", "agent"]) {
+        Ok(agent) => agent,
+        Err(launch::Unsafe::Refused(detail)) => {
+            return Err(Unstaged::Unsafe(detail));
+        }
+        Err(launch::Unsafe::Io) => {
+            return Err(Unstaged::Profile(
+                "the agent directory cannot be read".to_owned(),
+            ));
+        }
+    };
+    let profile = profile::check(&agent, profile::daemon_uid())
         .map_err(Unstaged::Profile)?
         .record;
     let version = launch::read_version(binary);
@@ -151,8 +172,12 @@ fn staged(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         launch::prepare(vendor_state_dir, session, instructions)
     };
-    let Ok((session_dir, instructions)) = prepared else {
-        return Err(Unstaged::State { version });
+    let (session_dir, instructions) = match prepared {
+        Ok(prepared) => prepared,
+        Err(launch::Unsafe::Refused(detail)) => {
+            return Err(Unstaged::UnsafeState { detail, version });
+        }
+        Err(launch::Unsafe::Io) => return Err(Unstaged::State { version }),
     };
     Ok(Staged {
         profile,
@@ -205,6 +230,20 @@ async fn stage(
                 turn,
                 detail: Some(format!("the Pi profile policy refused: {detail}")),
             })))
+        }
+        Ok(Err(Unstaged::Unsafe(detail))) => {
+            Err(Box::new(unlaunched(RouteError::HandshakeRefused {
+                turn,
+                detail: Some(detail),
+            })))
+        }
+        Ok(Err(Unstaged::UnsafeState { detail, version })) => {
+            let mut end = unlaunched(RouteError::HandshakeRefused {
+                turn,
+                detail: Some(detail),
+            });
+            end.instance = Some(instance_of(adapter, version.as_deref()));
+            Err(Box::new(end))
         }
         Ok(Err(Unstaged::State { version })) => {
             let mut end = unlaunched(RouteError::Store {

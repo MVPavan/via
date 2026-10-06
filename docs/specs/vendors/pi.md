@@ -280,7 +280,7 @@ state directory, not `vendor/pi/agent`). Then run
 `PI_CODING_AGENT_DIR=<that directory> pi` and `/login`. The order matters:
 Pi creates missing directories under the default umask, so letting it
 create them leaves them 0755, and VIA then refuses the state (a daemon
-start fails "unsafe VIA managed directory", and §4.3 refuses the profile).
+start fails "unsafe VIA managed directory", and §4.4 refuses every turn).
 `mkdir -m 700 -p` alone is not enough: it sets the mode of the last
 directory only. Pi writes its own `auth.json` (OpenAI, OAuth) and reads it
 on every turn (E49). VIA never reads, copies or
@@ -349,6 +349,21 @@ never writes, repairs or deletes anything in the agent directory.
 Outside the agent directory: `pi/sessions/<via_session_id>/` (managed 0700;
 Pi creates its session files inside) and `pi/instructions/<via_session_id>`
 (the frozen instructions, 0600, written atomically before each launch).
+
+**Managed directories.** Before every launch, and before §4.3's check,
+every directory from `<vendor_state_dir>` (`vendor/`) down to
+`pi/agent`, `pi/sessions/<via_session_id>` and `pi/instructions` is
+checked as the daemon checks `vendor/` (runtime §6.1): a directory, not a
+symlink, owned by the daemon's uid, mode exactly 0700. A missing one is
+created 0700 (the agent directory too: empty, §4.3 then refuses it for
+its missing `settings.json`). An existing one is never chmod-ed: one that
+fails is a `submit_failed` refusal, `data.reason:"handshake_refused"`,
+whose VIA-owned message names the directory relative to the state
+directory and the rule (for example "VIA's Pi state directory
+vendor/pi/agent has mode 0755, not 0700"), never cached, launching
+nothing and writing nothing under it. A directory that cannot be read or
+created is §4.3's unreadable-agent refusal before the profile check, and
+the `store` failure of §4.4's writes after it.
 
 ### 4.5 Canonical parameters
 
@@ -731,9 +746,9 @@ hostile profiles only in scratch agent directories. Selection as Claude's:
 | Test | Decisive assertion |
 |---|---|
 | `pi_plan_pure` | `describe` starts nothing; unchecked or unreadable version → `untested` with the warning; steer refused by name; `max_steps`, `output_schema`, limited bounds, `network:false`, nonempty `extra_write_dirs`, a prompt over 524,288 or instructions over 262,144 JSON-encoded bytes are refused before receipt |
-| `pi_version_read` | The Pi package's `version` from `package.json` through a symlinked entry and the `dist` rule, reported even when Pi exits before the handshake; a missing, oversize, non-object or non-string file → `null`/`untested`, the turn proceeds; no process starts. `pi_version_survives_a_state_failure`: a launch-state failure after the read still reports the version |
+| `pi_version_read` | The Pi package's `version` from `package.json` through a symlinked entry and the `dist` rule, reported even when Pi exits before the handshake; a missing, oversize, non-object or non-string file → `null`/`untested`, the turn proceeds; no process starts. `pi_version_survives_a_state_failure`: a launch-state failure after the read (a failed write, `store`; a session directory that is not one, `handshake_refused`) still reports the version |
 | `pi_stage_outlived_by_its_task` | A turn ends at its wall while its staging task is held before the instructions sync; the next turn's launch-state write waits for that task, then launches and completes (unserialized, it failed `store`) |
-| `pi_profile_policy` | Accepted: the allowed set, with and without Pi-created files (E59). Refused by name, no launch and no value in the message: `shellCommandPrefix`, `SYSTEM.md`, `APPEND_SYSTEM.md`, `models.json`, `defaultThinkingLevel`, an unknown key, missing or non-`off` `cacheWarming`, a malformed value, a symlink, wrong owner, a group-writable entry, `auth.json` with group bits, an oversize file, 65 entries. `pi-profile.json` holds no `deviceId` or credential bytes and records the check the launch passed, even when the profile changes while the turn executes (`pi_profile_record_is_pre_launch`); refusals are not cached |
+| `pi_profile_policy` | Accepted: the allowed set, with and without Pi-created files (E59). Refused by name, no launch and no value in the message: `shellCommandPrefix`, `SYSTEM.md`, `APPEND_SYSTEM.md`, `models.json`, `defaultThinkingLevel`, an unknown key, missing or non-`off` `cacheWarming`, a malformed value, a symlink, wrong owner, a group-writable entry, `auth.json` with group bits, an oversize file, 65 entries, and a 0755 agent, `pi` or `vendor` directory (§4.4, named, left 0755). `pi-profile.json` holds no `deviceId` or credential bytes and records the check the launch passed, even when the profile changes while the turn executes (`pi_profile_record_is_pre_launch`); refusals are not cached |
 | `pi_uncertain_predecessor` | A leaves an unproven group; B is refused `uncertain_predecessor` without launching; C is refused too; A proven absent, D launches. The same with A busy, and across a restart with A's record not yet re-held. No resend |
 | `pi_identity_continuation` | `--session-id` until confirmed; confirmation only with `started`; a rejected turn 1 (no file) lets turn 2 create; a lost `started` reply keeps `--session-id`; once confirmed, `--session`; a missing file then exits before RPC → `Rejected{Protocol}`, never a fresh session; derived ID stable across eviction and restart |
 | `pi_handshake_checks` | Wrong `sessionId` → `resume_mismatch` with no prompt line; model not in the catalog or a clamped requested effort → `InvalidParam` with no prompt, the clamp then cached so `plan` and `check_turn` refuse the same model and effort; omitted effort skips the check; a non-skill command → refusal, cached; exit before the replies → `Rejected{Protocol}` with stderr unread |

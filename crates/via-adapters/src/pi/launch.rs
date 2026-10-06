@@ -199,21 +199,71 @@ pub(crate) fn argv(recipe: &Recipe<'_>) -> Vec<OsString> {
     args
 }
 
-/// Creates the managed directory `path` (0700) and its missing parents
-/// under `root`, which exists; a non-directory or a symlink there is
-/// refused.
-fn managed_dir(path: &Path) -> std::io::Result<()> {
-    match std::fs::DirBuilder::new()
-        .mode(0o700)
-        .recursive(true)
-        .create(path)
-    {
-        Ok(()) if std::fs::symlink_metadata(path)?.is_dir() => Ok(()),
-        Ok(()) => Err(std::io::Error::other(
-            "a managed Pi path is not a directory",
-        )),
-        Err(error) => Err(error),
+/// Why VIA's own Pi state is not used (picrit #1, runtime §6.1).
+#[derive(Debug)]
+pub(super) enum Unsafe {
+    /// A managed directory is not private: VIA's text naming it and the
+    /// rule, never a value.
+    Refused(String),
+    /// The state could not be read or written.
+    Io,
+}
+
+impl From<std::io::Error> for Unsafe {
+    fn from(_: std::io::Error) -> Self {
+        Self::Io
     }
+}
+
+/// The managed directory `vendor_state_dir/<parts>` (runtime §6.1, as the
+/// daemon's `vendor/`): every directory from `vendor_state_dir` down is
+/// created 0700 when missing, and must be a directory, not a symlink, of
+/// the daemon's user, mode 0700. One that exists is never chmod-ed; any
+/// other is the named refusal, before anything is written under it.
+pub(super) fn managed(vendor_state_dir: &Path, parts: &[&str]) -> Result<PathBuf, Unsafe> {
+    let uid = super::profile::daemon_uid();
+    let mut path = vendor_state_dir.to_path_buf();
+    let mut name = String::from("vendor");
+    private_dir(&path, &name, uid)?;
+    for part in parts {
+        path.push(part);
+        name.push('/');
+        name.push_str(part);
+        private_dir(&path, &name, uid)?;
+    }
+    Ok(path)
+}
+
+/// One managed directory `path`, named `name` in a refusal.
+fn private_dir(path: &Path, name: &str, uid: u32) -> Result<(), Unsafe> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::DirBuilder::new().mode(0o700).create(path) {
+                Ok(()) => {}
+                // Created meanwhile: judged as found.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+            std::fs::symlink_metadata(path)?
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let why = if metadata.file_type().is_symlink() {
+        "is a symlink".to_owned()
+    } else if !metadata.is_dir() {
+        "is not a directory".to_owned()
+    } else if metadata.uid() != uid {
+        "is not owned by the daemon's user".to_owned()
+    } else if metadata.mode() & 0o777 != 0o700 {
+        format!("has mode {:04o}, not 0700", metadata.mode() & 0o777)
+    } else {
+        return Ok(());
+    };
+    Err(Unsafe::Refused(format!(
+        "VIA's Pi state directory {name} {why}"
+    )))
 }
 
 /// Packet §4.4: the session's directory (0700), and its frozen
@@ -223,23 +273,21 @@ pub(super) fn prepare(
     vendor_state_dir: &Path,
     session: &SessionId,
     instructions: Option<&str>,
-) -> std::io::Result<(PathBuf, Option<PathBuf>)> {
-    let sessions = session_dir(vendor_state_dir, session);
-    managed_dir(&sessions)?;
+) -> Result<(PathBuf, Option<PathBuf>), Unsafe> {
+    let sessions = managed(vendor_state_dir, &["pi", "sessions", session.as_str()])?;
+    debug_assert_eq!(sessions, session_dir(vendor_state_dir, session));
     let Some(text) = instructions else {
         return Ok((sessions, None));
     };
     let file = instructions_file(vendor_state_dir, session);
-    let folder = file
-        .parent()
-        .ok_or_else(|| std::io::Error::other("the instructions file has no folder"))?;
-    managed_dir(folder)?;
+    let folder = managed(vendor_state_dir, &["pi", "instructions"])?;
+    let folder = folder.as_path();
     let partial = folder.join(format!(".{}.partial", session.as_str()));
     // A partial left by an interrupted write is replaced.
     match std::fs::remove_file(&partial) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+        Err(error) => return Err(error.into()),
     }
     let mut out = std::fs::OpenOptions::new()
         .write(true)
@@ -502,12 +550,21 @@ mod tests {
         );
     }
 
+    /// A vendor root as the daemon makes it: 0700 (a temporary folder is
+    /// not, under the default umask).
+    fn private_root() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        root
+    }
+
     /// Packet §4.4: the session directory 0700 and the instructions 0600,
     /// rewritten whole each launch.
     #[test]
     fn prepare_creates_the_session_state() {
         use std::os::unix::fs::PermissionsExt;
-        let state = tempfile::tempdir().unwrap();
+        let state = private_root();
         let session = SessionId::try_from("s_000000000001").unwrap();
         let (dir, file) = prepare(state.path(), &session, Some("first")).unwrap();
         prepare(state.path(), &session, Some("second")).unwrap();
@@ -522,6 +579,78 @@ mod tests {
             0o600
         );
         assert_eq!(prepare(state.path(), &session, None).unwrap().1, None);
+    }
+
+    /// Picrit #1 (runtime §6.1): every managed directory from `vendor/`
+    /// down is a real directory of the daemon's user, mode 0700, else
+    /// nothing is written; an unsafe one is never chmod-ed.
+    #[test]
+    fn prepare_refuses_unsafe_managed_ancestors() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let session = SessionId::try_from("s_000000000001").unwrap();
+        let refused = |state: &Path, instructions: Option<&str>, named: &str| match prepare(
+            state,
+            &session,
+            instructions,
+        ) {
+            Err(Unsafe::Refused(message)) => assert!(message.contains(named), "{message}"),
+            other => panic!("not refused for {named}: {other:?}"),
+        };
+        let mode = |path: &Path| fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777;
+        // An ancestor 0755: refused, left 0755.
+        let state = private_root();
+        let pi = state.path().join("pi");
+        fs::DirBuilder::new().mode(0o755).create(&pi).unwrap();
+        fs::set_permissions(&pi, fs::Permissions::from_mode(0o755)).unwrap();
+        refused(state.path(), Some("i"), "vendor/pi has mode 0755");
+        assert_eq!(mode(&pi), 0o755);
+        assert!(
+            !pi.join("sessions").exists(),
+            "wrote under an unsafe ancestor"
+        );
+        // `pi/sessions` a symlink to a public folder holding a 0755
+        // session directory: refused, nothing written there.
+        let state = private_root();
+        let public = private_root();
+        fs::set_permissions(public.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::DirBuilder::new()
+            .mode(0o755)
+            .create(public.path().join("s_000000000001"))
+            .unwrap();
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(state.path().join("pi"))
+            .unwrap();
+        std::os::unix::fs::symlink(public.path(), state.path().join("pi").join("sessions"))
+            .unwrap();
+        refused(state.path(), Some("i"), "vendor/pi/sessions is a symlink");
+        // The vendor root itself 0755: refused.
+        let state = private_root();
+        fs::set_permissions(state.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        refused(state.path(), None, "vendor has mode 0755");
+        assert_eq!(mode(state.path()), 0o755);
+        // The session directory itself 0755: refused.
+        let state = private_root();
+        let sessions = state.path().join("pi").join("sessions");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(&sessions)
+            .unwrap();
+        fs::DirBuilder::new()
+            .mode(0o755)
+            .create(sessions.join("s_000000000001"))
+            .unwrap();
+        fs::set_permissions(
+            sessions.join("s_000000000001"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        refused(
+            state.path(),
+            None,
+            "vendor/pi/sessions/s_000000000001 has mode 0755",
+        );
     }
 
     /// Packet §3: the package root's version through a symlinked entry and
