@@ -473,10 +473,11 @@ Limits.
   as for every harness.
 - Only one PID namespace and one time namespace per state directory are
   supported; another one's record is refused as uncertain (above).
-- VIA's state directory must be on a local, responsive filesystem
-  (runtime §5, filesystem requirement): the anchor's synchronous spawns
-  change into the namespace directory and the probe root, so a stalled
-  network or FUSE filesystem can hold the anchor and its lock.
+- VIA's state directory and VIA's own executable must be on a local,
+  responsive filesystem (runtime §5, filesystem requirement): the
+  anchor's synchronous spawns change into the namespace directory and the
+  probe root and execute VIA's binary, so a stalled network or FUSE
+  filesystem can hold the anchor and its lock.
 - The lock does not touch harness-process capacity. Core reserves a
   `harness_processes` permit for every recovered anchor row it cannot
   prove gone and releases it once an absence proof commits; but an
@@ -1227,7 +1228,8 @@ offset; a missing `/proc/<pid>/stat` is not proof of exit (`hidepid`), so
 only other start ticks, `pidfd_open` `ESRCH` or a readable pidfd prove
 it; a privilege-gaining exec in the server's chain is an accepted limit,
 fenced by the record like the non-leader exec; VIA's state directory
-must be on a local, responsive filesystem (§3.2; runtime §5).
+and executable must be on a local, responsive filesystem (§3.2; runtime
+§5).
 
 Decided (owner, 2026-10-06, bead via-4sw.3): one OpenCode server for all of
 VIA, one private namespace with project configuration always on; a request

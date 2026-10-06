@@ -703,14 +703,17 @@ descriptors closing and the vendor's death. Nothing about the lock or the
 record enters the Store, and Host never unlinks the file. It gates only
 the launch; cleanup evidence and harness-process capacity are unchanged.
 
-**Filesystem requirement.** VIA's state directory must be on a local,
-responsive filesystem; the launch lock (`flock`) and the fence rely on
-it. The anchor spawns the version check and the vendor synchronously on
-its main thread, and each spawn changes into a directory inside the state
-directory (the probe root, the namespace directory) before the exec entry
-starts. A state directory on a stalled network or FUSE filesystem can
-hold the anchor there, with its lock, beyond its control, `SIGTERM` and
-timers.
+**Filesystem requirement.** VIA's state directory and VIA's own
+executable must be on a local, responsive filesystem; the launch lock
+(`flock`) and the fence rely on it. The anchor spawns the version check
+and the vendor synchronously on its main thread: each spawn changes into
+a directory inside the state directory (the probe root, the namespace
+directory) and executes VIA's own binary (the exec entry), and Host
+spawns the anchor from that binary the same way. A state directory or
+VIA binary on a stalled network or FUSE filesystem can hold the anchor
+there, with its lock, beyond its control, `SIGTERM` and timers. The
+vendor program is executed later, by the exec entry, so it is outside
+this requirement.
 
 **Stop reply.** Host's `CloseReport` gains `stopped_live: Option<bool>`:
 the verified anchor's `Stopping { stopped_live }` reply to this close's

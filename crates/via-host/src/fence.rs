@@ -346,7 +346,8 @@ async fn run_probe(program: &Path, probe: &ProbeConfig) -> Result<(), FenceRefus
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    // Synchronous `chdir` at spawn: runtime §5 needs a local, responsive state directory.
+    // Synchronous `chdir` and exec at spawn: runtime §5 needs a local, responsive
+    // state directory and VIA executable.
     let mut child = crate::anchor::spawn_with_vendor_umask(&mut command).map_err(|error| {
         FenceRefusal::ProbeFailed {
             kind: ProbeFailure::Spawn {
