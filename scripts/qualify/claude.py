@@ -30,6 +30,10 @@ Missing, partial or unverifiable evidence is never a pass: an inspection
 failure is uncertainty, and truncated or lost evidence is `not_observable`
 or a failure. A process is only ever identified by its pid plus start
 ticks, and is read only through a /proc directory fd checked against both.
+A process counts as gone only when its /proc entry is missing (ENOENT or
+ESRCH) or shows another start or a zombie; any other read error, or a
+truncated read, is uncertainty, never absence. A status, events or logs
+reply without its expected fields is never read as empty.
 
 Threat model. A maintainer runs this on their own machine, on Linux (it
 reads /proc and runs `pgrep`). The Claude that VIA starts runs only the
@@ -72,9 +76,12 @@ from the vendor's own session transcript of the session VIA created: per
 prompt, the tool names, the number of calls and whether any tool input held
 the nonce. Only those are kept. The transcript counts as evidence only when
 it shows the calls known to have happened (t1's Write, t3's Bash) with
-valid input records; otherwise the nonce and no-tool predicates are
-`not_observable`. mcp_switches' unrestricted resume recalls a nonce the
-same way: its spawn turn makes one known Bash call, and the recall turn must
+valid input records and the recall turn's record is complete: its last
+assistant text equals that turn's envelope `final_text`. Otherwise the
+nonce and no-tool predicates are `not_observable`. Both are about the
+recall turn: a turn shown to make no tool call cannot read what an earlier
+turn wrote. mcp_switches' unrestricted resume recalls a nonce the same
+way: its spawn turn makes one known Bash call, and the recall turn must
 show no tool call and no tool input holding the nonce.
 
 mcp_switches (owner decision, 2026-10-06): VIA records no init inventory for
@@ -88,7 +95,9 @@ A file over 16 MiB is incomplete evidence: that launch's MCP comparison is
 Connected servers count only on a real success line: at least one on the
 unrestricted spawn and the same on its resume, none with MCP off; under
 `--restricted` any set agrees with the packet's `unknown`. With no server
-connected on the unrestricted spawn the case is `not_observable`. `status`,
+connected on the unrestricted spawn the case is `not_observable`, and so is
+"none with MCP off": an absence of lines is evidence only once this run
+has parsed a connection line. `status`,
 warnings and argv must match the packet in all three modes.
 
 Declined (owner, 2026-10-06):
@@ -114,19 +123,23 @@ A phase's daemon is recorded as owned but unverified, its runtime directory
 kept, from before the start (or stop) request until it is proven. Both
 proofs rest on the daemon's flock locks on the run's private lock files
 (daemon.lock, store.lock; in /proc/locks as "MM:mm:inode", device numbers
-in hex). Started: /proc/locks shows the pid `daemon status` replies with
-as the flock locker of both. Stopped: /proc/locks is readable and has no
-line for them, and each lock can be taken (then released at once): Linux
-drops a lock from /proc/locks when its locker exits even while an inherited
-copy still holds it, and the probe sees that copy. The recorded daemon's
-pid and start ticks must be gone too, and no descendant seen before the
-stop alive. Which pids hold the files through their descriptors is kept
-as evidence only. A daemon that holds the locks is ours, a replacement
-started by the CLI included. A failed start is searched for by those
-locks, and every later phase is blocked. The final cleanup retries the stop until a
-deadline, also after an earlier unverified stop, escalating to `daemon stop
---force` when a plain stop is refused `sessions_active`; once the stop is
-proven the runtime directory is removed, wherever it lives.
+in hex). Started: /proc/locks shows the pid `daemon status` replies with as
+the flock locker of both. Stopped: /proc/locks is readable and has no line
+for them, and each lock can be taken (then released at once): Linux drops a
+lock from /proc/locks when its locker exits even while an inherited copy
+still holds it, and the probe sees that copy. The recorded daemon's pid and
+start ticks must be gone too, and every descendant seen before the stop
+verified gone; an unreadable process is not gone. Which pids hold the files
+through their descriptors is kept as evidence only. A daemon that holds the
+locks is ours, a replacement started by the CLI included. A failed start is
+searched for by those locks, and every later phase is blocked. A failed
+start that identifies no daemon (no replied pid with start ticks, no lock
+holder) leaves ownership uncertain for the rest of the run: it is never
+proven stopped, the runtime directory is kept and the run is blocked. The
+final cleanup retries the stop until a deadline, also after an earlier
+unverified stop, escalating to `daemon stop --force` when a plain stop is
+refused `sessions_active`; once the stop is proven the runtime directory is
+removed, wherever it lives.
 
 SIGINT and SIGTERM are only recorded. No submission starts afterwards; a
 turn already being submitted runs to its end and is accounted. Cleanup and
@@ -165,6 +178,7 @@ to, or waits on, no process VIA did not start.
 
 import argparse
 import datetime
+import errno
 import fcntl
 import glob
 import hashlib
@@ -216,6 +230,15 @@ class Blocked(Exception):
     """Infrastructure, auth, quota or budget: the case cannot pass or fail."""
 
 
+class Unreadable(Exception):
+    """A /proc entry that exists could not be read, or was truncated: that is
+    uncertainty, never absence."""
+
+
+# The read errors that mean the process is gone.
+GONE = (errno.ENOENT, errno.ESRCH)
+
+
 # The first SIGINT or SIGTERM, by name. The handler only records it: no
 # submission starts afterwards, and cleanup and the summary always run.
 INTERRUPTED = []
@@ -259,18 +282,27 @@ def digest_json(value):
 # --- /proc ------------------------------------------------------------------
 
 def proc_stat(pid):
-    """`/proc/<pid>/stat` fields the runner needs, or None once gone."""
+    """`/proc/<pid>/stat` fields the runner needs, or None once gone (ENOENT,
+    ESRCH); any other read or parse error raises Unreadable."""
     try:
         raw = Path(f"/proc/{pid}/stat").read_text()
-    except OSError:
-        return None
-    comm = raw[raw.index("(") + 1:raw.rindex(")")]
-    fields = raw[raw.rindex(")") + 2:].split()
-    return {"pid": pid, "comm": comm, "state": fields[0], "ppid": int(fields[1]),
-            "pgid": int(fields[2]), "sid": int(fields[3]), "start_ticks": int(fields[19])}
+    except OSError as error:
+        if error.errno in GONE:
+            return None
+        raise Unreadable(f"/proc/{pid}/stat: {error.strerror}") from error
+    try:
+        comm = raw[raw.index("(") + 1:raw.rindex(")")]
+        fields = raw[raw.rindex(")") + 2:].split()
+        return {"pid": pid, "comm": comm, "state": fields[0], "ppid": int(fields[1]),
+                "pgid": int(fields[2]), "sid": int(fields[3]),
+                "start_ticks": int(fields[19])}
+    except (ValueError, IndexError) as error:
+        raise Unreadable(f"/proc/{pid}/stat: unparsable") from error
 
 
 def all_procs():
+    """One scan of every process; a process unreadable in it raises
+    Unreadable, so a scan is complete or not used."""
     procs = {}
     for name in os.listdir("/proc"):
         if name.isdigit():
@@ -287,18 +319,27 @@ def all_procs():
 
 def open_proc(pid, start_ticks):
     """A /proc/<pid> directory fd pinned to the process with these start
-    ticks, or None."""
+    ticks, or None when that process is gone (no such pid, or the pid now
+    has other start ticks); any other failure raises Unreadable."""
     try:
         fd = os.open(f"/proc/{pid}", os.O_RDONLY | os.O_DIRECTORY)
-    except OSError:
-        return None
+    except OSError as error:
+        if error.errno in GONE:
+            return None
+        raise Unreadable(f"/proc/{pid}: {error.strerror}") from error
     try:
         stat_fd = os.open("stat", os.O_RDONLY, dir_fd=fd)
         with os.fdopen(stat_fd, "rb") as file:
             raw = file.read().decode("utf-8", "replace")
         ticks = int(raw[raw.rindex(")") + 2:].split()[19])
-    except (OSError, ValueError, IndexError):
-        ticks = None
+    except OSError as error:
+        os.close(fd)
+        if error.errno in GONE:
+            return None
+        raise Unreadable(f"/proc/{pid}/stat: {error.strerror}") from error
+    except (ValueError, IndexError) as error:
+        os.close(fd)
+        raise Unreadable(f"/proc/{pid}/stat: unparsable") from error
     if ticks != start_ticks:
         os.close(fd)
         return None
@@ -307,7 +348,8 @@ def open_proc(pid, start_ticks):
 
 def proc_read(pid, start_ticks, name, limit=256 * 1024):
     """`name` under the process's /proc directory (`exe` as its link
-    target), or None when that process is gone or unreadable."""
+    target), or None when that process is gone. A read error while it lives,
+    or content over `limit` bytes, raises Unreadable."""
     fd = open_proc(pid, start_ticks)
     if fd is None:
         return None
@@ -315,14 +357,20 @@ def proc_read(pid, start_ticks, name, limit=256 * 1024):
         if name == "exe":
             return os.readlink("exe", dir_fd=fd)
         with os.fdopen(os.open(name, os.O_RDONLY, dir_fd=fd), "rb") as file:
-            return file.read(limit)
-    except OSError:
-        return None
+            raw = file.read(limit + 1)
+    except OSError as error:
+        if error.errno in GONE:
+            return None
+        raise Unreadable(f"/proc/{pid}/{name}: {error.strerror}") from error
     finally:
         os.close(fd)
+    if len(raw) > limit:
+        raise Unreadable(f"/proc/{pid}/{name}: over {limit} bytes")
+    return raw
 
 
 def cmdline(pid, start_ticks):
+    """The argv, or [] once the process is gone; Unreadable propagates."""
     raw = proc_read(pid, start_ticks, "cmdline")
     if raw is None:
         return []
@@ -330,9 +378,13 @@ def cmdline(pid, start_ticks):
 
 
 def has_marker_key(pid, start_ticks):
-    """Whether VIA's marker key is in the environment, or None when it
-    cannot be read; the value is never kept."""
-    raw = proc_read(pid, start_ticks, "environ")
+    """Whether VIA's marker key is in the environment, or None when that
+    cannot be decided (gone, unreadable or truncated); the value is never
+    kept."""
+    try:
+        raw = proc_read(pid, start_ticks, "environ")
+    except Unreadable:
+        return None
     if raw is None:
         return None
     return any(entry.split(b"=", 1)[0] == MARKER_KEY for entry in raw.split(b"\0"))
@@ -373,7 +425,12 @@ def lock_free(path):
 
 
 def alive(pid, start_ticks):
-    stat = proc_stat(pid)
+    """True or False for the process with these start ticks, or None when
+    its stat cannot be read: only False is verified absence."""
+    try:
+        stat = proc_stat(pid)
+    except Unreadable:
+        return None
     return stat is not None and stat["start_ticks"] == start_ticks and stat["state"] != "Z"
 
 
@@ -486,7 +543,9 @@ def is_prompt(entry):
 
 def vendor_turns(path, needle=None):
     """Per prompt: usage summed over model calls (one per message id), the
-    number of tool calls and of tool inputs holding `needle`."""
+    number of tool calls and of tool inputs holding `needle`, and the text of
+    the turn's last text-bearing assistant message (`final_text`), which ties
+    the turn's record to the envelope that completed it."""
     keys = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens",
             "output_tokens")
     turns = []
@@ -495,7 +554,7 @@ def vendor_turns(path, needle=None):
             entry = json.loads(line)
             if is_prompt(entry):
                 turns.append({"calls": {}, "tools": {}, "needle_inputs": set(),
-                              "invalid_inputs": set()})
+                              "invalid_inputs": set(), "texts": {}, "last_text": None})
                 continue
             message = entry.get("message")
             if (entry.get("type") != "assistant" or entry.get("isSidechain") or not turns
@@ -503,6 +562,10 @@ def vendor_turns(path, needle=None):
                 continue
             turn = turns[-1]
             for part in message.get("content") or []:
+                if (isinstance(part, dict) and part.get("type") == "text"
+                        and isinstance(part.get("text"), str)):
+                    turn["texts"].setdefault(message.get("id"), []).append(part["text"])
+                    turn["last_text"] = message.get("id")
                 if isinstance(part, dict) and part.get("type") == "tool_use":
                     turn["tools"][part.get("id")] = part.get("name")
                     tool_input = part.get("input")
@@ -519,8 +582,19 @@ def vendor_turns(path, needle=None):
              "calls": sum(1 for call in turn["calls"].values() if any(call.values())),
              "tool_calls": len(turn["tools"]), "tool_names": sorted(set(turn["tools"].values())),
              "invalid_inputs": len(turn["invalid_inputs"]),
-             "needle_inputs": len(turn["needle_inputs"])}
+             "needle_inputs": len(turn["needle_inputs"]),
+             "final_text": "".join(turn["texts"].get(turn["last_text"], []))}
             for turn in turns]
+
+
+def ends_with(turn, envelope):
+    """The transcript holds the record of the envelope's turn through its end:
+    the turn's last assistant text equals the envelope's non-empty
+    `final_text`. A truncated or lost tail fails this, so zero recorded tool
+    calls is evidence only when it holds."""
+    text = envelope.get("final_text")
+    return (isinstance(text, str) and bool(text.strip())
+            and turn["final_text"].strip() == text.strip())
 
 
 def vendor_transcript(run, vendor_id):
@@ -535,12 +609,15 @@ def vendor_transcript(run, vendor_id):
 # --- launch sampling -------------------------------------------------------------
 
 class LaunchSampler:
-    """Polls the daemon's descendants for Claude launches while a turn runs."""
+    """Polls the daemon's descendants for Claude launches while a turn runs.
+    A sample that fails, or a sampler that does not finish, sets `error`:
+    the launches are then incomplete evidence."""
 
     def __init__(self, run):
         self.run = run
         self.launches = []
         self.seen = set()
+        self.error = None
         self.stop_flag = threading.Event()
         self.thread = threading.Thread(target=self.loop, daemon=True)
 
@@ -551,12 +628,20 @@ class LaunchSampler:
     def __exit__(self, *exc):
         self.stop_flag.set()
         self.thread.join(5)
+        if self.thread.is_alive() and self.error is None:
+            self.error = "the sampler did not finish its last sample"
 
     def loop(self):
         while not self.stop_flag.is_set():
-            self.sample()
+            self.guarded_sample()
             time.sleep(0.05)
-        self.sample()
+        self.guarded_sample()
+
+    def guarded_sample(self):
+        try:
+            self.sample()
+        except Exception as error:  # incomplete launch evidence, never "no launch"
+            self.error = self.error or f"{type(error).__name__}: {error}"
 
     def sample(self):
         procs = all_procs()
@@ -663,18 +748,32 @@ class Run:
         return bool(argv) and os.path.basename(argv[0]) == "claude"
 
     def claude_pids(self):
-        """Claude processes alive before the run, as (pid, start ticks)."""
-        return {(pid, stat["start_ticks"]) for pid, stat in all_procs().items()
-                if stat["comm"] == "claude" or self.is_claude(pid, stat["start_ticks"])}
+        """Claude processes alive before the run, as (pid, start ticks). An
+        unreadable process counts as not Claude: it was alive before the
+        run, so it can never be the daemon's descendant this set filters."""
+        found = set()
+        for pid, stat in all_procs().items():
+            try:
+                claude = stat["comm"] == "claude" or self.is_claude(pid, stat["start_ticks"])
+            except Unreadable:
+                claude = False
+            if claude:
+                found.add((pid, stat["start_ticks"]))
+        return found
+
+    def root_valid(self, procs):
+        """Whether the daemon's pid has its recorded start ticks, alive, in
+        the scan `procs`."""
+        root = procs.get(self.daemon["pid"]) if self.daemon else None
+        return (root is not None and root["start_ticks"] == self.daemon["start_ticks"]
+                and root["state"] != "Z")
 
     def owned_descendants(self, procs):
         """The daemon's descendants in the scan `procs`, or none unless the
         daemon's pid has its recorded start ticks in that same scan."""
-        root = procs.get(self.daemon["pid"]) if self.daemon else None
-        if (root is None or root["start_ticks"] != self.daemon["start_ticks"]
-                or root["state"] == "Z"):
+        if not self.root_valid(procs):
             return set()
-        return descendants(root["pid"], procs)
+        return descendants(self.daemon["pid"], procs)
 
     def spent(self):
         """The unrounded total: each session's highest reported cumulative cost."""
@@ -753,6 +852,9 @@ class Run:
         if envelope is None:
             raise Blocked(f"{label}: no envelope within {wait_s} s ({err})")
         self.account(case, label, envelope)
+        if sampler.error:
+            raise Blocked(f"{label}: launch sampling failed ({sampler.error}); the launch "
+                          "evidence is incomplete")
         failure = envelope.get("failure") or {}
         cls = failure.get("class")
         if cls not in expect and (cls in ("rate_limit", "auth", "budget_exceeded") or (
@@ -812,17 +914,24 @@ class Run:
         self.budget_guard()
 
     def status(self, case, label, session, *extra):
-        _, status, _ = self.via_call(case.dir, label, "status", session, *extra, "--json")
-        return status or {}
+        """The session's status; a missing or failed reply is Blocked, never
+        an empty status."""
+        rc, status, _ = self.via_call(case.dir, label, "status", session, *extra, "--json")
+        if rc != 0 or not isinstance(status, dict):
+            raise Blocked(f"{label}: no status (rc {rc})")
+        return status
 
     def events(self, case, label, address):
+        """Every event page; a missing or failed page is Blocked, never the
+        end of the events."""
         events, after = [], 0
         while True:
-            _, page, _ = self.via_call(case.dir, f"{label}-page", "events", address,
-                                       "--after", str(after), "--json")
-            if not page:
-                break
-            events.extend(page.get("events", []))
+            rc, page, _ = self.via_call(case.dir, f"{label}-page", "events", address,
+                                        "--after", str(after), "--json")
+            if rc != 0 or not isinstance(page, dict) or not isinstance(page.get("events"), list):
+                raise Blocked(f"{label}: an events page is missing (rc {rc}); the events "
+                              "are incomplete")
+            events.extend(page["events"])
             if not page.get("more"):
                 break
             after = page["next_after"]
@@ -838,20 +947,28 @@ class Run:
         presence only. No other process's command line or environment is
         read."""
         procs = all_procs()
+        root_valid = self.root_valid(procs)
         ours = self.owned_descendants(procs)
         rows, unattributed = [], 0
         for pid, stat in sorted(procs.items()):
             ticks = stat["start_ticks"]
             if pid in ours:
-                argv = cmdline(pid, ticks)
-                tagged = any(tag in part for tag in tags for part in argv)
-                rows.append({**stat, "claude": self.is_claude(pid, ticks), "tagged": tagged,
-                             "argv0": os.path.basename(argv[0]) if argv else None,
-                             "via_marker_key": has_marker_key(pid, ticks)})
+                row = {**stat}
+                try:
+                    argv = cmdline(pid, ticks)
+                    row.update(claude=self.is_claude(pid, ticks),
+                               tagged=any(tag in part for tag in tags for part in argv),
+                               argv0=os.path.basename(argv[0]) if argv else None)
+                except Unreadable as error:  # the row stays, its fields unknown
+                    row.update(claude=None, tagged=None, argv0=None, unreadable=str(error))
+                row["via_marker_key"] = has_marker_key(pid, ticks)
+                rows.append(row)
             elif stat["comm"] == "claude" and (pid, ticks) not in self.preexisting_claude:
                 unattributed += 1
-        snap = {"at": utc_now(), "daemon": self.daemon, "processes": rows,
-                "unattributed_new_claude": unattributed}
+        # Without a valid root the snapshot shows nothing of ours: that is
+        # not evidence that nothing of ours runs.
+        snap = {"at": utc_now(), "daemon": self.daemon, "root_valid": root_valid,
+                "processes": rows, "unattributed_new_claude": unattributed}
         write_json(case.dir / f"ps-{label}.json", snap)
         return snap
 
@@ -878,6 +995,7 @@ class Run:
         record = {"phase": name, "runtime_dir_kept": str(self.runtime)}
         self.daemons.append(record)
         self.daemon_unverified = record
+        pid, stat = None, None
         try:
             try:
                 rc, status, err = self.via_call(phase_dir, f"{name}-status", "daemon",
@@ -903,12 +1021,27 @@ class Run:
                 raise Blocked(f"daemon for phase {name} did not start verifiably ({detail})")
         except BaseException as error:
             # Any unsuccessful start: find what it left by the private locks.
+            # A daemon identified neither by a replied pid with start ticks
+            # nor by a lock holder (it may be paused before taking the
+            # locks) leaves ownership uncertain for the rest of the run.
             record.setdefault("start_failed", f"{type(error).__name__}: {error}")
+            if isinstance(pid, int) and not isinstance(pid, bool):
+                try:
+                    known = proc_stat(pid)
+                except Unreadable:
+                    known = None
+                if known is not None:
+                    record.update(pid=pid, start_ticks=known["start_ticks"])
             try:
                 record["found"] = self.find_daemons()
                 record["lock_lines"] = self.lock_lines()
             except Exception as find_error:
                 record["found"] = f"search failed: {type(find_error).__name__}"
+            identified = ("pid" in record
+                          or (isinstance(record.get("found"), list) and bool(record["found"]))
+                          or bool(record.get("lock_lines")))
+            if not identified:
+                record["identity_unknown"] = True
             raise
         del record["runtime_dir_kept"]
         record.update(pid=pid, start_ticks=stat["start_ticks"])
@@ -939,10 +1072,12 @@ class Run:
         for line in text.splitlines():
             parts = line.split()
             for index, token in enumerate(parts):
-                if token in self.lock_ids and index >= 4:
-                    pid = parts[index - 1]
+                if token in self.lock_ids:
+                    # A line too short to parse still names the lock: held.
+                    pid = parts[index - 1] if index >= 1 else ""
+                    kind = parts[index - 4] if index >= 4 else None
                     lines.setdefault(token, []).append(
-                        [int(pid) if pid.isdigit() else None, parts[index - 4]])
+                        [int(pid) if pid.isdigit() else None, kind])
         return lines
 
     def find_daemons(self):
@@ -952,7 +1087,10 @@ class Run:
         locks = {str(path) for path in self.lock_paths()}
         holders = []
         for pid, stat in all_procs().items():
-            proc = open_proc(pid, stat["start_ticks"])
+            try:
+                proc = open_proc(pid, stat["start_ticks"])
+            except Unreadable:
+                continue  # evidence only
             if proc is None:
                 continue
             try:
@@ -979,12 +1117,15 @@ class Run:
         has no line for this run's private lock files and each lock can be
         taken (and is released at once), so nobody holds it, inherited
         copies included (a replacement daemon at our socket holds them too,
-        so it is ours); the recorded daemon (pid and start ticks) is gone;
-        and no descendant seen before the stop is alive. Until then the daemon
-        is owned but unverified, its runtime directory kept. A stop is
-        retried until a deadline, also after an earlier unverified stop; the
-        final cleanup escalates to `--force` when a plain stop is refused
-        `sessions_active`. Each request's timeout is clamped to the deadline."""
+        so it is ours); every recorded daemon (pid and start ticks) and
+        every descendant seen before the stop is verified gone (`alive` is
+        False, not unreadable). Any read that cannot decide is uncertainty.
+        A failed start that identified no daemon is never proven stopped.
+        Until proven the daemon is owned but unverified, its runtime
+        directory kept. A stop is retried until a deadline, also after an
+        earlier unverified stop; the final cleanup escalates to `--force`
+        when a plain stop is refused `sessions_active`. Each request's
+        timeout is clamped to the deadline."""
         if self.daemon is None and self.daemon_unverified is None:
             return
         record = self.daemon_unverified or self.daemons[-1]
@@ -993,41 +1134,55 @@ class Run:
         phase_dir = self.evidence / "daemon"
         phase_dir.mkdir(mode=0o700, exist_ok=True)
         recorded = []
+        found = record.get("found") if isinstance(record.get("found"), list) else []
         for ident in (self.daemon, {"pid": record.get("pid"),
-                                    "start_ticks": record.get("start_ticks")}):
+                                    "start_ticks": record.get("start_ticks")}, *found):
             if ident and isinstance(ident.get("pid"), int) and ident not in recorded:
-                recorded.append(dict(ident))
+                recorded.append({"pid": ident["pid"], "start_ticks": ident["start_ticks"]})
         watched = {tuple(entry) for entry in record.get("descendants_watched", [])}
         attempts = record.setdefault("stop_attempts", [])
         deadline = time.monotonic() + (90 if final else 30)
         force = False
 
-        def survivors():
-            """(held locks, or None when /proc/locks or a probe cannot
-            decide; recorded daemons alive)."""
-            lines = self.lock_lines()
-            probes = {path.name: lock_free(path) for path in self.lock_paths()}
-            living = [d for d in recorded if alive(d["pid"], d["start_ticks"])]
-            if lines is None or None in probes.values():
-                return None, living
-            return sorted(lines) + sorted(name for name, free in probes.items()
-                                          if not free), living
+        def survey():
+            """(held locks, recorded daemons alive, watched descendants
+            alive, reasons the proof cannot decide)."""
+            unsure = (["the failed start identified no daemon"]
+                      if record.get("identity_unknown") else [])
+            try:
+                lines = self.lock_lines()
+                probes = {path.name: lock_free(path) for path in self.lock_paths()}
+                if lines is None:
+                    unsure.append("/proc/locks unreadable")
+                held = sorted(lines or {}) + sorted(
+                    name for name, free in probes.items() if free is False)
+                unsure += [f"{name}: lock probe undecided"
+                           for name, free in probes.items() if free is None]
+                procs = all_procs()
+                for root in self.find_daemons() + recorded:
+                    if (procs.get(root["pid"]) or {}).get("start_ticks") == root["start_ticks"]:
+                        watched.update((pid, procs[pid]["start_ticks"])
+                                       for pid in descendants(root["pid"], procs))
+                states = {ident: alive(*ident) for ident in
+                          [(d["pid"], d["start_ticks"]) for d in recorded] + sorted(watched)}
+            except (OSError, Unreadable) as error:
+                return [], [], [], unsure + [f"{type(error).__name__}: {error}"]
+            unsure += [f"pid {pid}: unreadable" for (pid, _), state in states.items()
+                       if state is None]
+            living = [d for d in recorded if states[(d["pid"], d["start_ticks"])] is True]
+            left = sorted(pid for (pid, ticks) in watched if states[(pid, ticks)] is True)
+            return held, living, left, unsure
 
         while True:
-            held, recorded_alive = survivors()
-            holders = self.find_daemons()  # evidence only: which pids
-            procs = all_procs()
-            for root in holders + recorded_alive:
-                if (procs.get(root["pid"]) or {}).get("start_ticks") == root["start_ticks"]:
-                    watched |= {(pid, procs[pid]["start_ticks"])
-                                for pid in descendants(root["pid"], procs)}
+            held, recorded_alive, left, unsure = survey()
             record["descendants_watched"] = sorted(watched)
-            left = sorted(pid for pid, start in watched if alive(pid, start))
-            proven = held == [] and not (recorded_alive or left)
+            proven = not (held or recorded_alive or left or unsure)
             remaining = deadline - time.monotonic()
             if proven or remaining <= 0:
                 break
             if not (held or recorded_alive):
+                if record.get("identity_unknown") and not left:
+                    break  # nothing to stop, and nothing can prove it stopped
                 time.sleep(0.2)
                 continue
             try:
@@ -1042,13 +1197,16 @@ class Run:
             if final and "sessions_active" in json.dumps([reply, err], default=str):
                 force = True
             settle = min(deadline, time.monotonic() + 10)
-            while time.monotonic() < settle and survivors() != ([], []):
+            while time.monotonic() < settle and any(survey()[:3]):
                 time.sleep(0.2)
-        record["locks_held"] = "undecidable: /proc/locks or a lock probe failed" \
-            if held is None else held
-        record["holders_left"] = holders
+        record["locks_held"] = held
+        try:
+            record["holders_left"] = self.find_daemons()  # evidence only: which pids
+        except (OSError, Unreadable) as error:
+            record["holders_left"] = f"unavailable: {type(error).__name__}"
         record["recorded_alive"] = recorded_alive
         record["descendants_left"] = left
+        record["undecided"] = unsure
         record["stopped"] = proven
         pgrep = subprocess.run(["pgrep", "-f", str(self.via)], capture_output=True, text=True)
         record["pgrep_via"] = [int(pid) for pid in pgrep.stdout.split()
@@ -1201,8 +1359,10 @@ def case_recipe_continuity(run, case):
     case.check("t4: one step, max_steps 1 inherited", t4.get("steps") == 1
                and receipt4["effective"].get("max_steps") == 1,
                {"steps": t4.get("steps"), "max_steps": receipt4["effective"].get("max_steps")})
-    case.check("t4: schema cleared", t4.get("structured_output") is None and not any(
-        w.get("code") == "structured_output_missing" for w in t4.get("warnings", [])))
+    warnings = t4.get("warnings")
+    case.check("t4: schema cleared", t4.get("structured_output") is None
+               and isinstance(warnings, list)
+               and not any(w.get("code") == "structured_output_missing" for w in warnings))
     check_launch(case, "t4", launches, first=False, effort="medium", max_turns="1", **common)
     ids = {e.get("vendor_session_id") for e in (t1, t2, t3, t4)}
     case.check("one vendor session across four launches", len(ids) == 1 and None not in ids,
@@ -1223,17 +1383,21 @@ def case_recipe_continuity(run, case):
                      "inputs_with_nonce": t["needle_inputs"]} for n, t in enumerate(turns, 1)])
         # Evidence only if the transcript shows the tool calls known to have
         # happened (t1's Write, t3's Bash) with valid input records.
+        # The recall turn's record must also be complete: its last text is
+        # t4's envelope final_text. A turn verified to make no tool call
+        # cannot read anything an earlier turn wrote, so the nonce predicate
+        # is scoped to t4.
         shows = (len(turns) == 4 and "Write" in turns[0]["tool_names"]
                  and "Bash" in turns[2]["tool_names"]
-                 and all(t["invalid_inputs"] == 0 for t in turns))
+                 and all(t["invalid_inputs"] == 0 for t in turns)
+                 and ends_with(turns[3], t4))
         if not shows:
             reason = ("the vendor transcript does not show t1's Write and t3's Bash with "
-                      "valid inputs")
-            case.not_observable("no tool input held the nonce in any turn", reason)
+                      "valid inputs, or its t4 record does not end with t4's final_text")
+            case.not_observable("t4: no tool input held the nonce", reason)
             case.not_observable("t4: no tool call", reason)
         else:
-            case.check("no tool input held the nonce in any turn",
-                       all(t["needle_inputs"] == 0 for t in turns))
+            case.check("t4: no tool input held the nonce", turns[3]["needle_inputs"] == 0)
             case.check("t4: no tool call", turns[3]["tool_calls"] == 0)
     run.snapshot(case, "after")
     case.usage_inputs = [(session, t) for t in (t1, t2, t3, t4)]
@@ -1296,20 +1460,38 @@ def case_interrupt(run, case):
         _, cancel, _ = run.via_call(case.dir, "cancel", "cancel", session, "--wait", "--json",
                                     timeout=150, handle=run.handles[session])
         # The decisive observation point: as `cancel --wait` returns.
-        tool_alive = bool(tool) and alive(tool["pid"], tool["start_ticks"])
+        tool_alive = alive(tool["pid"], tool["start_ticks"]) if tool else None
         after = run.snapshot(case, "post-cancel", tags=(tag,))
     write_json(case.dir / "t1-launches.json", sampler.launches)
     in_snapshot = bool(tool) and any(
         row["pid"] == tool["pid"] and row["start_ticks"] == tool["start_ticks"]
         for row in after["processes"])
-    case.check("tool pid and start time absent as cancel --wait returns",
-               bool(tool) and not tool_alive and not in_snapshot,
-               {"alive": tool_alive, "in_post_cancel_snapshot": in_snapshot})
-    case.check("Claude launch gone as cancel --wait returns",
-               bool(sampler.launches) and not any(
-                   alive(l["pid"], l["start_ticks"]) for l in sampler.launches),
-               {"launches": len(sampler.launches)})
-    check_launch(case, "t1", sampler.launches, mode="restricted", session=session, first=True)
+    # Absence counts only when verified: `alive` False (not unreadable) and a
+    # snapshot whose root was valid.
+    name = "tool pid and start time absent as cancel --wait returns"
+    detail = {"alive": tool_alive, "in_post_cancel_snapshot": in_snapshot,
+              "snapshot_root_valid": after["root_valid"]}
+    if not tool:
+        case.check(name, False, detail)
+    elif tool_alive is None or not after["root_valid"]:
+        case.not_observable(name, f"absence not verifiable: {detail}")
+    else:
+        case.check(name, tool_alive is False and not in_snapshot, detail)
+    name = "Claude launch gone as cancel --wait returns"
+    states = [alive(l["pid"], l["start_ticks"]) for l in sampler.launches]
+    if sampler.error:
+        case.not_observable(name, f"launch sampling failed: {sampler.error}")
+        case.not_observable("t1: one Claude launch observed",
+                            f"launch sampling failed: {sampler.error}")
+    else:
+        if not states:
+            case.check(name, False, {"launches": 0})
+        elif None in states:
+            case.not_observable(name, f"a launch was unreadable: {states}")
+        else:
+            case.check(name, not any(states), {"launches": len(states)})
+        check_launch(case, "t1", sampler.launches, mode="restricted", session=session,
+                     first=True)
     _, envelope, _ = run.via_call(case.dir, "t1-envelope", "result", receipt["turn"], "--json")
     envelope = envelope or {}
     run.account(case, "t1", envelope)
@@ -1485,7 +1667,8 @@ def mcp_launch(run, case, label, expect_inherit, expect_warning, mode, mcp_off,
 def check_recall_tools(run, case, label, envelope, nonce):
     """The recall turn made no tool call and no tool input held the nonce,
     from the vendor transcript; evidence only when it shows the spawn
-    turn's known Bash call with valid inputs, else `not_observable`."""
+    turn's known Bash call with valid inputs and the recall turn's record
+    ends with the envelope's final_text, else `not_observable`."""
     path = vendor_transcript(run, envelope.get("vendor_session_id"))
     turns = vendor_turns(path, needle=nonce) if path else []
     write_json(case.dir / f"{label}-tool-calls.json",
@@ -1493,15 +1676,16 @@ def check_recall_tools(run, case, label, envelope, nonce):
                  "invalid_inputs": t["invalid_inputs"], "inputs_with_nonce": t["needle_inputs"]}
                 for n, t in enumerate(turns, 1)])
     if not (len(turns) == 2 and "Bash" in turns[0]["tool_names"]
-            and all(t["invalid_inputs"] == 0 for t in turns)):
-        reason = ("the vendor transcript was not found or does not show the spawn turn's Bash "
-                  "call with valid inputs")
+            and all(t["invalid_inputs"] == 0 for t in turns)
+            and ends_with(turns[1], envelope)):
+        reason = ("the vendor transcript was not found, does not show the spawn turn's Bash "
+                  "call with valid inputs, or its recall record does not end with the "
+                  "envelope's final_text")
         case.not_observable(f"{label}: no tool call in the recall turn", reason)
         case.not_observable(f"{label}: no tool input held the nonce", reason)
         return
     case.check(f"{label}: no tool call in the recall turn", turns[1]["tool_calls"] == 0)
-    case.check(f"{label}: no tool input held the nonce",
-               all(t["needle_inputs"] == 0 for t in turns))
+    case.check(f"{label}: no tool input held the nonce", turns[1]["needle_inputs"] == 0)
 
 
 def check_status(run, case, label, session, expect_inherit, expect_warning):
@@ -1509,7 +1693,11 @@ def check_status(run, case, label, session, expect_inherit, expect_warning):
     inherit = status.get("inherit")
     case.check(f"{label}: status inherit matches the packet table", inherit == expect_inherit,
                inherit)
-    warning = [w for w in status.get("warnings", []) if w.get("code") == "config_switch_unverified"]
+    if not isinstance(status.get("warnings"), list):
+        case.not_observable(f"{label}: config_switch_unverified categories",
+                            "status has no warnings list")
+        return
+    warning = [w for w in status["warnings"] if w.get("code") == "config_switch_unverified"]
     categories = sorted(c["category"] for w in warning for c in w.get("data", {}).get(
         "categories", []))
     case.check(f"{label}: config_switch_unverified categories", categories == expect_warning,
@@ -1553,6 +1741,9 @@ def case_mcp_unrestricted(run, case):
         if not session:
             return
         first = take_mcp_debug(case, "unrestricted", "unrestricted-t1")
+        # A parsed connection proves the debug format in this run; only then
+        # is an absence of connection lines (MCP off) evidence.
+        case.mcp_format_seen = bool(first)
         if first is not None and not first:
             case.not_observable("unrestricted-t1: a connected MCP server",
                                 "no MCP server connected: with none configured a resume "
@@ -1594,9 +1785,14 @@ def case_mcp_off(run, case):
         session = mcp_launch(run, case, "mcp-off", expect, [], "unrestricted", True)
         if session:
             connected = take_mcp_debug(case, "mcp-off", "mcp-off")
-            if connected is not None:
-                case.check("mcp-off: no MCP server connected", not connected,
-                           {"count": len(connected)})
+            if connected is not None and connected:
+                case.check("mcp-off: no MCP server connected", False, {"count": len(connected)})
+            elif connected is not None and not getattr(case, "mcp_format_seen", False):
+                case.not_observable("mcp-off: no MCP server connected",
+                                    "no connection line was parsed in this run's unrestricted "
+                                    "spawn, so an absence of lines is not evidence")
+            elif connected is not None:
+                case.check("mcp-off: no MCP server connected", True, {"count": 0})
     finally:
         purge_mcp_debug(case)
     run.snapshot(case, "mcp-off-after")
@@ -1616,7 +1812,8 @@ def case_usage(run, case, inputs):
     session, first = inputs[0]
     _, logs, _ = run.via_call(case.dir, "logs", "logs", f"{session}/1", "--json")
     case.check("VIA keeps no vendor transcript (logs.transcript null)",
-               (logs or {}).get("transcript") is None, logs)
+               isinstance(logs, dict) and "transcript" in logs and logs["transcript"] is None,
+               logs)
     path = vendor_transcript(run, first.get("vendor_session_id"))
     if path is None:
         case.not_observable("vendor per-call usage", "vendor transcript not found")
