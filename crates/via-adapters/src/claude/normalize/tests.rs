@@ -837,6 +837,47 @@ fn retained_payload_is_bounded() {
     assert_eq!(run.count("progress"), 0);
 }
 
+/// A live denial's bounded `decision_reason` reaches the denial's reason
+/// with its type (live probes sB and sC); a non-string one is ignored.
+#[test]
+fn denial_keeps_its_decision_reason() {
+    let facts = facts(NEW_SID, false);
+    let reason = |denied: Value| {
+        let (_, run) = run_lines(
+            &facts,
+            &[
+                init_line(NEW_SID),
+                tool_use("t1", "Bash", &json!({"command":"curl x"})),
+                denied.to_string(),
+            ],
+        );
+        run.observations()
+            .find_map(|o| {
+                if let Observation::ActionDenied(denial) = o {
+                    Some(denial.reason.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| panic!("no denial: {:?}", run.end()))
+    };
+    let line = |decision: Value| {
+        json!({"type":"system","subtype":"permission_denied","tool_name":"Bash",
+            "tool_use_id":"t1","decision_reason_type":"classifier",
+            "decision_reason":decision,"message":"long vendor guidance"})
+    };
+    assert_eq!(
+        reason(line(json!("[Data Exfiltration]"))),
+        "denied by the vendor's permission policy (classifier): [Data Exfiltration]"
+    );
+    assert_eq!(
+        reason(line(json!({"nested":true}))),
+        "denied by the vendor's permission policy (classifier)"
+    );
+    let long = reason(line(json!("x".repeat(5000))));
+    assert!(long.len() <= TARGET_MAX, "{}", long.len());
+}
+
 fn denied_line(id: &str, tool: &str) -> String {
     json!({"type":"system","subtype":"permission_denied","tool_name":tool,
         "tool_use_id":id,"decision_reason_type":"mode"})

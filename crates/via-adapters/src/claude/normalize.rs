@@ -414,10 +414,15 @@ impl Normalizer {
             return Batch::ended(End::Protocol("a denial before init"));
         }
         let target = self.known_target(&denied.tool_use_id);
-        let reason = match &denied.decision_reason_type {
+        let mut reason = match &denied.decision_reason_type {
             Some(kind) => format!("denied by the vendor's permission policy ({kind})"),
             None => "denied by the vendor's permission policy".to_owned(),
         };
+        // C1's `reason` keeps the vendor's own words, cut by `denial`.
+        if let Some(why) = &denied.decision_reason {
+            reason.push_str(": ");
+            reason.push_str(why);
+        }
         let mut batch = Batch::default();
         if let Ok(denial) = self.denial(&denied.tool_name, &denied.tool_use_id, target, &reason) {
             batch.observations.extend(denial);

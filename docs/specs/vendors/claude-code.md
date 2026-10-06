@@ -270,9 +270,10 @@ servers as `unknown` and the rest `off`. MCP tools are not in VIA's
 user's own permission rules, which the default mode loads, allow it
 (inference from the flags; not probed). Auto-memory is not a C1 category;
 it follows instruction files. Init lists the tools, model, plugins, skills,
-agents, slash commands, MCP servers and permission mode (verified). VIA
-reads the tools, permission mode and MCP servers for the handshake check
-(§3) but does not record the inventory in the turn's evidence folder (amended 2026-10-05, bead via-7c6):
+agents, slash commands, MCP servers and permission mode (verified). VIA's
+handshake check (§3) reads the capabilities, the permission mode and the
+tools, not the MCP inventory; VIA does not record the inventory in the
+turn's evidence folder (amended 2026-10-05, bead via-7c6):
 the Claude route has no evidence-file writer, and adding one means a new evidence
 file through Wire or Store and the C1 `logs` listing, more than that fix.
 The categories above were verified from the probes' own init captures.
@@ -316,7 +317,7 @@ vendor-synthetic API-error message (`is_api_error_message:true`,
 | assistant `tool_use` | `progress` with `model` and `tools_started (id, name)`; retain the open-item set |
 | user `tool_result` | `progress` with `tools_ended (tool ID)`; error/refusal remains error; unmatched IDs are protocol evidence |
 | `message.usage` | not reported: assistant snapshots are partial (c9a output 6 vs 177; c1a 3 vs 156); usage comes from the `result.usage` turn aggregate |
-| `system/permission_denied` | `action.denied`; deduplicate matching terminal `permission_denials` by tool-use ID; an entry caused by VIA's decline is suppressed (§6) |
+| `system/permission_denied` | `action.denied`, its `reason` naming the vendor's `decision_reason_type` and, when a string, `decision_reason` (e.g. `classifier`, `[Data Exfiltration]`; live probe sC), cut to 1 KiB; deduplicate matching terminal `permission_denials` by tool-use ID; an entry caused by VIA's decline is suppressed (§6) |
 | `result` | Validate session, normalize terminal only once, report text/denials before the turn ends; the terminal (structured output, usage aggregate, cost, vendor data) is retained in the turn's end result (C2 §4.1) |
 | unknown notification | no observation; moves the turn's activity time; cannot advance lifecycle or the idle timer |
 | malformed known message / contradictory duplicate result | Protocol health failure; never invent a second terminal |
@@ -556,6 +557,7 @@ backup, hashes and report. Missing infrastructure leaves a live case incomplete.
 | `claude_stream_limits` | Oversize stdout, stderr flood, stalled normalizer, large final payload: bounded memory, final text in a file; cancel/close still serviceable; no false successful truncated envelope |
 | `claude_live_recipe_continuity` | Exact §4 recipe, existing login, three launches, nonce recall, schemas replace/clear, instructions/effort/steps and full tool operation; emit versions/env names only |
 | `claude_live_interrupt` | Observe a real long-running tool, receipt, abort terminal, tool completion and verified cleanup; then same-ID next turn; SIGTERM-only is a negative case |
+| `claude_live_mcp_resume` | Unrestricted MCP discovery on resume launches: MCP servers requested on, a `--resume` launch's init lists the user's servers as the session's first launch did (m1 and sA covered new sessions only); status stays `on` |
 | `claude_live_bounds` | CLAUDE-BOUND-1 matrix on Linux/macOS including missing dependency fail-closed and resume-bound changes; infrastructure failure never passes |
 
 Run the repository verification gate when code lands. Focused default test

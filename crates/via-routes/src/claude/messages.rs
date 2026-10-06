@@ -104,6 +104,20 @@ pub struct PermissionDenied {
     /// Why, as the vendor classifies it (`mode`, …).
     #[serde(default)]
     pub decision_reason_type: Option<String>,
+    /// Why, in the vendor's words (`[Data Exfiltration]`, …), when a
+    /// string; any other shape is ignored. Unbounded here: the normalizer
+    /// cuts the reason it builds.
+    #[serde(default, deserialize_with = "string_or_none")]
+    pub decision_reason: Option<String>,
+}
+
+/// A string member, or `None` for any other shape.
+fn string_or_none<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    Ok(Value::deserialize(deserializer)?
+        .as_str()
+        .map(str::to_owned))
 }
 
 /// One content block of an `assistant` or `user` message.
