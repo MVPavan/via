@@ -405,7 +405,7 @@ async fn launched(
         clamp,
         recipe,
     };
-    ended.end(adapter, &delivery.normalizer, routed, &rest)
+    ended.end(adapter, &delivery.normalizer, routed, (&rest, &activity))
 }
 
 /// One launch's process, what Route checks at the handshake, the
@@ -743,7 +743,7 @@ impl Ended {
         adapter: &PiAdapter,
         normalizer: &Normalizer,
         routed: PiTurn,
-        rest: &Rest,
+        (rest, activity): (&Rest, &crate::TurnActivity),
     ) -> TurnEnd {
         let PiTurn {
             outcome,
@@ -758,9 +758,14 @@ impl Ended {
             .as_ref()
             .filter(|_| self.clamp.is_none())
             .and_then(|facts| normalize::thinking_data(&facts.thinking_level));
-        // Packet §5.5: after any delivery loss the normalizer saw a
-        // prefix only, so the turn's accounting is unavailable.
-        let lost = matches!(rest, Rest::Undelivered)
+        // Packet §5.5 (picrit round 2, A): after any delivery loss (an
+        // overflow, or a message Route decoded that never reached the
+        // normalizer, as the force or a cutoff leaves) the normalizer saw
+        // a prefix only, so the turn's accounting is unavailable, with a
+        // terminal or without one.
+        let incomplete = activity.delivered() < activity.decoded();
+        let lost = incomplete
+            || matches!(rest, Rest::Undelivered)
             || matches!(&outcome, Err(failure) if matches!(failure.cause, RouteError::Overflow { .. }));
         let terminal = terminal.map(|message| {
             let cost = normalizer.cost().filter(|_| !lost);
@@ -779,6 +784,7 @@ impl Ended {
             || matches!(&outcome, Err(failure) if matches!(failure.cause, RouteError::ForceStopped { .. }));
         let rejection = |reason| TurnEnd {
             loss: None,
+            aggregate: None,
             terminal: None,
             instance: None,
             leftovers: None,
@@ -794,6 +800,7 @@ impl Ended {
             if matches!(failure.cause, RouteError::ResumeMismatch { .. }) {
                 return TurnEnd {
                     loss: None,
+                    aggregate: None,
                     terminal: None,
                     instance: None,
                     leftovers: None,
@@ -829,6 +836,9 @@ impl Ended {
         };
         TurnEnd {
             loss: None,
+            // Without a terminal the all-null aggregate carries the loss
+            // (C2 §5, bead via-i5g).
+            aggregate: (lost && terminal.is_none()).then(normalize::no_usage),
             terminal,
             instance: None,
             leftovers: None,

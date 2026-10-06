@@ -78,7 +78,8 @@ pub(super) fn turn_envelope(
     let aggregate = vendor
         .retained
         .as_ref()
-        .and_then(|retained| retained.usage.as_ref());
+        .and_then(|retained| retained.usage.as_ref())
+        .or(vendor.aggregate.as_ref());
     let (usage, interval) = ledger_usage(&vendor.ledger, aggregate, plan.frozen.token_scope())
         .unwrap_or((Usage::UNAVAILABLE, false));
     assemble(
@@ -1124,6 +1125,66 @@ mod tests {
                 serde_json::to_value(&envelope).unwrap()["cost"],
                 serde_json::json!({"usd": 0.5, "scope": "turn", "provenance": word}),
             );
+        }
+    }
+
+    /// Bead via-i5g (C2 §5, `TurnEnd.aggregate`): an aggregate a turn's
+    /// end carried without a terminal supersedes its delivered call
+    /// samples, so an all-null one after delivery loss leaves every token
+    /// count `null`, never the delivered prefix as the turn's.
+    #[test]
+    fn a_terminal_less_aggregate_supersedes_the_samples() {
+        use via_adapters::UsageSample;
+        let session = crate::SessionId::try_from("s_zzzzzzzzzzzz").unwrap();
+        let at = "2026-01-01T00:00:00.000Z".to_owned();
+        let sample = |input| UsageSample {
+            key: None,
+            input,
+            cached_input: input,
+            output: input,
+            reasoning_output: input,
+            total: input,
+            interval_unverified: false,
+        };
+        let usage = |aggregate: Option<UsageSample>| {
+            let mut vendor = super::VendorRecord {
+                aggregate,
+                ..super::VendorRecord::default()
+            };
+            vendor.ledger.add(&sample(Some(100)));
+            let envelope = super::turn_envelope(
+                (
+                    &session,
+                    TurnNumber::try_from(1).unwrap(),
+                    &crate::intake::TurnPlan::default(),
+                ),
+                super::blank("failed", "error", None),
+                None,
+                (None, None),
+                (
+                    crate::api::Timestamps {
+                        queued_at: at.clone(),
+                        submitted_at: None,
+                        accepted_at: None,
+                        ended_at: at.clone(),
+                    },
+                    None,
+                ),
+                (1, 1),
+                vendor,
+            );
+            serde_json::to_value(&envelope).unwrap()["usage"].clone()
+        };
+        assert_eq!(usage(None)["input_tokens"], 100);
+        let lost = usage(Some(sample(None)));
+        for field in [
+            "input_tokens",
+            "cached_input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+            "total_tokens",
+        ] {
+            assert!(lost[field].is_null(), "{field}: {lost}");
         }
     }
 

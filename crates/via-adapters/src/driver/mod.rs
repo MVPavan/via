@@ -1040,6 +1040,7 @@ fn session_gone() -> AdapterError {
 pub(crate) fn rejected(error: AdapterError) -> TurnEnd {
     TurnEnd {
         loss: None,
+        aggregate: None,
         terminal: None,
         instance: None,
         leftovers: None,

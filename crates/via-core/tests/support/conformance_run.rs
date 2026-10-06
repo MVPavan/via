@@ -1406,11 +1406,13 @@ impl<'a> Run<'a> {
             outcome.route_cleanup = failure.cleanup.map(|cleanup| format!("{cleanup:?}"));
         }
         outcome.terminal = end.terminal.as_ref().map(terminal);
+        // As Core: the terminal's aggregate, else the end's own (C2 §5).
         outcome.usage = outcome_usage(
             observed,
             end.terminal
                 .as_ref()
-                .and_then(|terminal| terminal.usage.as_ref()),
+                .and_then(|terminal| terminal.usage.as_ref())
+                .or(end.aggregate.as_ref().filter(|_| end.terminal.is_none())),
             &session.plan.capabilities.usage.tokens,
         );
         outcome.cleanup = Some(cleanup.to_owned());

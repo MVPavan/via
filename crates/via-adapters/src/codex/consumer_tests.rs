@@ -1444,6 +1444,7 @@ async fn r1_4_a_malformed_message_is_named_by_the_failure() {
     );
     let reported = |detail| TurnEnd {
         loss: None,
+        aggregate: None,
         terminal: None,
         instance: None,
         leftovers: None,

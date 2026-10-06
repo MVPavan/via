@@ -1038,6 +1038,7 @@ impl Turn<'_> {
         let journal_uncertain = loss.is_some_and(|loss| loss.journal_uncertain);
         TurnEnd {
             loss: None,
+            aggregate: None,
             terminal: None,
             instance: self.instance.clone(),
             leftovers: None,
@@ -1069,6 +1070,7 @@ impl Turn<'_> {
     fn rejected(&self, reason: StartRejected) -> TurnEnd {
         TurnEnd {
             loss: None,
+            aggregate: None,
             terminal: None,
             instance: self.instance.clone(),
             leftovers: None,
@@ -1887,6 +1889,7 @@ fn launch_failed(facts: &mut Turn<'_>, failure: &LaunchError) -> TurnEnd {
     }
     TurnEnd {
         loss: None,
+        aggregate: None,
         terminal: None,
         instance: facts.instance.clone(),
         leftovers: None,
@@ -2067,6 +2070,7 @@ async fn confirm(
         let _undelivered = facts.emit(mismatch, controls).await;
         return Err(Box::new(TurnEnd {
             loss: None,
+            aggregate: None,
             terminal: None,
             instance: facts.instance.clone(),
             leftovers: None,
@@ -2903,6 +2907,7 @@ fn terminal_end(facts: &Turn<'_>, retained: Retained, tools_open: bool) -> TurnE
     ) = carried(structured);
     TurnEnd {
         loss: None,
+        aggregate: None,
         terminal: Some(terminal),
         instance: facts.instance.clone(),
         leftovers: None,

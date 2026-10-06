@@ -196,7 +196,8 @@ pub struct TurnEnd { pub terminal: Option<VendorTerminal>,
     pub instance: Option<InstanceReport> /* once the handshake or Pi's package metadata was read, on every outcome (§5) */,
     pub leftovers: Option<LeftoverReport> /* per-turn routes on every outcome, and `ServerLost` (§4.2) */,
     pub outcome: Result<TurnEvidence, AdapterError>,
-    pub loss: Option<ObservationLoss> /* shared-ingress routes: this generation lost observations (§4) */ }
+    pub loss: Option<ObservationLoss> /* shared-ingress routes: this generation lost observations (§4) */,
+    pub aggregate: Option<UsageSample> /* a turn usage aggregate when no terminal is retained (§5) */ }
 pub struct TurnEvidence { pub exit: Option<ExitReport>, pub cleanup: Cleanup, pub journal_uncertain: bool }
 pub enum Cleanup { Quiescent, Uncertain, Pending }
 pub enum Recovery { Resumed(SessionDriver), Unknown { reason: String }, Dead { evidence: String } }
@@ -795,7 +796,12 @@ which it uses:
 - per model call, as `progress.usage: UsageSample` (`key: Option<String>` and the nullable counters `input`, `cached_input`, `output`, `reasoning_output`, `total`, which are C1's usage token fields), where a keyed sample
   supersedes an earlier sample with the same key and a keyless sample adds;
 - as a turn aggregate in `VendorTerminal.usage`, which supersedes every call
-  sample of the turn for the envelope.
+  sample of the turn for the envelope; a turn whose end retains no terminal
+  may carry it in `TurnEnd.aggregate`, with the same effect (ignored when a
+  terminal is retained). A route whose delivery lost call samples, so that
+  their sum would be a prefix, reports an all-`null` aggregate either way:
+  the turn's tokens are then `null`, never the delivered prefix (bead
+  via-i5g).
 
 Core keeps a turn-wide usage ledger separate from step accounting. It holds
 up to 1,024 keys per turn; further new keys add as keyless. Once it

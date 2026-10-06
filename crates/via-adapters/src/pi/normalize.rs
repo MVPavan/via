@@ -289,7 +289,13 @@ fn transcript(facts: &HandshakeFacts, launch: &LaunchFacts) -> Option<PathBuf> {
 /// all-`null` turn aggregate, which supersedes the delivered prefix's
 /// samples, so the turn's tokens are unavailable.
 pub(super) fn unaccounted(mut terminal: VendorTerminal) -> VendorTerminal {
-    terminal.usage = Some(UsageSample {
+    terminal.usage = Some(no_usage());
+    terminal
+}
+
+/// The all-null turn aggregate of a turn whose accounting is unavailable.
+pub(super) fn no_usage() -> UsageSample {
+    UsageSample {
         key: None,
         input: None,
         cached_input: None,
@@ -297,8 +303,7 @@ pub(super) fn unaccounted(mut terminal: VendorTerminal) -> VendorTerminal {
         reasoning_output: None,
         total: None,
         interval_unverified: false,
-    });
-    terminal
+    }
 }
 
 /// The terminal of `message`, the last assistant message before

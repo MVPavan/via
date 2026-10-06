@@ -3174,6 +3174,109 @@ fn pi_abort_unanswered_stall() {
     );
 }
 
+/// A run whose $0.50 tool call is delivered, then deltas past the session
+/// channel while Core takes nothing; `settled` adds the answer and its
+/// settlement (else Pi reads the stall's abort). Pi then waits for its
+/// group's stop.
+fn priced_then_saturated(settled: bool) -> Vec<Value> {
+    let mut steps = handshake(&State::default());
+    steps.extend(prompt("Run a tool."));
+    steps.extend(echo("Run a tool."));
+    let half = usage(80, 10, 20, 0, 0.5);
+    steps.extend(tool_call(&half));
+    steps.extend(tool_end(false));
+    let pending = assistant(json!([]), "pending", &zero_usage(), None);
+    steps.push(emit(&json!({"type": "message_start", "message": pending})));
+    steps.push(update(json!({"type": "text_start", "contentIndex": 0})));
+    for _ in 0..SATURATING {
+        steps.push(update(
+            json!({"type": "text_delta", "contentIndex": 0, "delta": "."}),
+        ));
+    }
+    if settled {
+        let done = assistant(
+            json!([{"type": "text", "text": "READY"}]),
+            "stop",
+            &half,
+            None,
+        );
+        steps.push(message_end(&done));
+        steps.extend(settle(&done));
+        // Route reads the rest before the force.
+        steps.push(json!({"delay": {"ms": 500}}));
+    } else {
+        // The stall's abort, never answered.
+        steps.push(expect_id(json!({"type": "abort"}), "ab"));
+    }
+    steps.extend(terminated());
+    steps
+}
+
+/// Packet §5.5 (picrit round 2, A): the daemon force cuts delivery after
+/// one priced sample. Route retained the answer and its settlement, but
+/// the second sample was never normalized: the retained terminal's cost
+/// is `unavailable` and its tokens `null`, never the delivered $0.50.
+#[test]
+fn pi_accounting_after_forced_loss() {
+    let steps = priced_then_saturated(true);
+    let gate = steps.len() - 1;
+    let replay = single(
+        "synthetic (picrit round 2): the force cuts delivery after a priced call",
+        argv(Argv::default()),
+        steps,
+    );
+    let mut wanted = completed(1, "READY");
+    wanted["terminal"]["cost"] = json!({"usd": null, "provenance": "unavailable"});
+    wanted["usage"] = null_usage();
+    wanted["usage"]["from"] = json!("terminal");
+    wanted["error"] = json!("force_stop");
+    wanted["final_text"] = Value::Null;
+    wanted["exit"] = json!({"code": 143, "signal": null});
+    let mut forced = turn("Run a tool.", wanted);
+    forced["deadlines"] = json!({"wall_ms": 60_000, "idle_ms": 60_000});
+    let expect = case("pi_accounting_after_forced_loss", 1, vec![forced]);
+    let knobs = Knobs {
+        hold_for: Some(std::time::Duration::from_secs(3)),
+        force_on: Some(Box::leak(format!("at {gate} launch 1").into_boxed_str())),
+        ..Knobs::default()
+    };
+    check_built("pi_accounting_after_forced_loss", &replay, &expect, knobs).unwrap();
+}
+
+/// Packet §5.5, bead via-i5g (picrit round 2, A): overflow before
+/// settlement retains no terminal. The delivered $0.50 call's tokens are
+/// never the turn's: the driver's all-null aggregate supersedes them.
+#[test]
+fn pi_accounting_overflow_without_terminal() {
+    let replay = single(
+        "synthetic (picrit round 2): overflow after a priced call, before settlement",
+        argv(Argv::default()),
+        priced_then_saturated(false),
+    );
+    let mut wanted = completed(1, "");
+    wanted["terminal"] = Value::Null;
+    wanted["usage"] = null_usage();
+    wanted["usage"]["from"] = json!("terminal");
+    wanted["error"] = json!("overflow");
+    wanted["final_text"] = Value::Null;
+    wanted["exit"] = json!({"code": 143, "signal": null});
+    let mut lost = turn("Run a tool.", wanted);
+    lost["deadlines"] = json!({"wall_ms": 60_000, "idle_ms": 60_000});
+    let mut expect = case("pi_accounting_overflow_without_terminal", 1, vec![lost]);
+    expect["sessions"]["main"]["health"] = json!({"state": "failed", "first_cause": "overflow"});
+    let knobs = Knobs {
+        hold_for: Some(std::time::Duration::from_secs(12)),
+        ..Knobs::default()
+    };
+    check_built(
+        "pi_accounting_overflow_without_terminal",
+        &replay,
+        &expect,
+        knobs,
+    )
+    .unwrap();
+}
+
 /// `pi_dialog_decline` (packet §6): a dialog request with an `id` (a `-e`
 /// extension's `confirm`) and an unknown method with an `id` are each
 /// cancelled on the control lane within 5 s while Core takes no
