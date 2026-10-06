@@ -2672,7 +2672,13 @@ pub(super) enum Cut {
 ///   nothing dropped and nothing left in the lane or outstanding at the
 ///   cutoff. A decided delivery took the whole turn in order through its
 ///   terminal, so what the lane holds or loses after it is later traffic;
-///   a failure before it would have stopped the turn's delivery instead.
+///   a failure before it would have stopped the turn's delivery instead;
+/// - nothing before the terminal, in the connection's read order, was
+///   lost (picrit round 5): the first message the connection's routing
+///   rejected (`rejected`, its decode sequence) comes after the terminal.
+///   A rejection fails the connection, but the drain still routes what
+///   Wire admitted behind it, so a decided terminal can follow a lost
+///   sample; it keeps its status and answer, not its sum.
 ///
 /// Anything else (an uncorrelated or malformed message failing the
 /// connection, a connection loss, a stall while the terminal drains, an
@@ -2682,6 +2688,7 @@ pub(super) fn accounted(
     cut: Cut,
     sealed: &Sealed,
     (lane, registration): (&Lane, &Registration),
+    rejected: Option<u64>,
 ) -> bool {
     let rest_whole = || {
         lane.ended().is_none()
@@ -2696,6 +2703,11 @@ pub(super) fn accounted(
         && !sealed.partial
         && sealed.stop.is_none()
         && (cut == Cut::Decided || rest_whole())
+        && rejected.is_none_or(|rejected| {
+            sealed
+                .terminal_seq
+                .is_some_and(|terminal| terminal < rejected)
+        })
 }
 
 /// The cutoff a turn's wait finds already reached as it resumes: the
@@ -2847,7 +2859,12 @@ fn settle_turn(
     } else {
         WireCleanup::Quiescent
     });
-    let whole = accounted(cut, &sealed, (lane, registration));
+    let whole = accounted(
+        cut,
+        &sealed,
+        (lane, registration),
+        start.connection.rejected(),
+    );
     let mut end = 'end: {
         let uncertain = |cause| facts.failure(cause, None, None);
         if cut == Cut::Forced {

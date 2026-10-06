@@ -3959,6 +3959,35 @@ fn token_usage(total_tokens: u64) -> Value {
     )
 }
 
+/// [`token_usage`]'s message naming no turn: its correlation fails.
+fn uncorrelated_usage(total_tokens: u64) -> Value {
+    let step = token_usage(total_tokens);
+    let mut message: Value =
+        serde_json::from_str(step["emit"]["line"].as_str().unwrap_or("{}")).unwrap_or_default();
+    if let Some(params) = message["params"].as_object_mut() {
+        params.remove("turnId");
+    }
+    message
+}
+
+/// The plain turn up to its answer, then `tail` in place of its sample,
+/// status and terminal; and the plain terminal's line.
+fn before_the_sample(name: &str, tail: &[Value]) -> Result<(Value, Value, String), String> {
+    let (mut replay, expect) = plain(name)?;
+    let sample = step_with(&replay, "thread/tokenUsage/updated")?;
+    let completed = line_of(
+        &replay,
+        step_with(&replay, "\"method\":\"turn/completed\"")?,
+    )?;
+    cut_after(&mut replay, sample - 1, tail)?;
+    Ok((replay, expect, completed))
+}
+
+/// One emit step writing `lines` at once: Wire reads them as one burst.
+fn burst(lines: &[String]) -> Value {
+    json!({"emit": {"line": lines.join("\n")}})
+}
+
 /// C2 §5 (picrit round 4): a delivered 100-token sample, then the next
 /// call's `thread/tokenUsage/updated` names no turn: its correlation
 /// fails, so the whole connection fails `protocol` before routing it and
@@ -3970,18 +3999,11 @@ fn codex_uncorrelated_usage_fails_the_connection() {
     let name = "codex_uncorrelated_usage_fails_the_connection";
     let (mut replay, mut expect) = plain(name).unwrap();
     let started = step_with(&replay, "\"method\":\"turn/started\"").unwrap();
-    let mut uncorrelated = token_usage(50);
-    let line = uncorrelated["emit"]["line"].as_str().unwrap().to_owned();
-    let mut parsed: Value = serde_json::from_str(&line).unwrap();
-    if let Some(params) = parsed["params"].as_object_mut() {
-        params.remove("turnId");
-    }
-    uncorrelated = emit(&parsed);
     let tail = vec![
         token_usage(100),
         // Delivered before the connection fails.
         json!({"delay": {"ms": 300}}),
-        uncorrelated,
+        emit(&uncorrelated_usage(50)),
         sigterm(),
     ];
     cut_after(&mut replay, started, &tail).unwrap();
@@ -3990,6 +4012,66 @@ fn codex_uncorrelated_usage_fails_the_connection() {
     turn["usage"] = unavailable();
     // Its linked server anchor has the stop's absence proof (x.3.2 X4 K0).
     turn["group_absent"] = json!(true);
+    expect["sessions"]["main"]["close"] = json!({
+        "mode": "graceful", "vendor_closed": false, "cleanup": "uncertain",
+    });
+    variant(name, &replay, &expect).unwrap();
+}
+
+/// C2 §5 (picrit round 5): nothing before the turn's terminal, in the
+/// connection's read order, may have been lost for its sum to stand. A
+/// 100-token sample is delivered; then one burst holds the next call's
+/// 50-token sample naming no turn and the valid `turn/completed`. The
+/// sample fails the connection `protocol` before routing; the terminal,
+/// admitted behind it, is still routed by the failed connection's drain
+/// (held at its seam until Wire admitted it) and retained, so the turn
+/// completes with its answer, but its usage is unavailable. Before the fix
+/// the decided terminal exempted the turn and the sum stood at 100.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn codex_terminal_after_a_rejected_sample() {
+    let name = "codex_terminal_after_a_rejected_sample";
+    let _points = armed(
+        "codex.connection.fail_sequence",
+        json!({"occurrence": 1, "action": "delay", "value": 300}),
+    )
+    .unwrap();
+    let (_, _, completed) = before_the_sample(name, &[]).unwrap();
+    let tail = [
+        token_usage(100),
+        // Delivered before the connection fails.
+        json!({"delay": {"ms": 300}}),
+        burst(&[uncorrelated_usage(50).to_string(), completed]),
+        sigterm(),
+    ];
+    let (replay, mut expect, _) = before_the_sample(name, &tail).unwrap();
+    let turn = &mut turn_mut(&mut expect, 0)["expect"];
+    turn["usage"] = unavailable();
+    // The failed connection leaves the session's cleanup unproven.
+    expect["sessions"]["main"]["close"] = json!({
+        "mode": "graceful", "vendor_closed": false, "cleanup": "uncertain",
+    });
+    variant(name, &replay, &expect).unwrap();
+}
+
+/// C2 §5 (picrit round 5), the control: one burst holds the valid
+/// `turn/completed` and then a sample naming no turn. The rejection comes
+/// after the terminal in read order, so the delivered sum stands: 100.
+#[test]
+fn codex_rejected_sample_after_the_terminal() {
+    let name = "codex_rejected_sample_after_the_terminal";
+    let (_, _, completed) = before_the_sample(name, &[]).unwrap();
+    let tail = [
+        token_usage(100),
+        json!({"delay": {"ms": 300}}),
+        burst(&[completed, uncorrelated_usage(50).to_string()]),
+        sigterm(),
+    ];
+    let (replay, mut expect, _) = before_the_sample(name, &tail).unwrap();
+    let turn = &mut turn_mut(&mut expect, 0)["expect"];
+    turn["usage"] = json!({"from": "samples", "input_tokens": 100, "cached_input_tokens": 0,
+        "output_tokens": 0, "reasoning_output_tokens": 0, "total_tokens": 100,
+        "scope": "turn"});
     expect["sessions"]["main"]["close"] = json!({
         "mode": "graceful", "vendor_closed": false, "cleanup": "uncertain",
     });

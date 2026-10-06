@@ -1788,6 +1788,7 @@ fn a_sample_lost_while_draining_unaccounts_the_turn() {
                 super::super::driver::Cut::Decided,
                 &sealed,
                 (&fixture.lane, &fixture.registration),
+                None,
             ),
             "a lost sample left the delivered sum standing as the turn's usage"
         );

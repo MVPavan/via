@@ -201,6 +201,9 @@ pub(crate) struct Sealed {
     /// The message being delivered was delivered only in part.
     pub(crate) partial: bool,
     pub(crate) terminal: Option<Retained>,
+    /// The retained terminal's decode sequence: its place in the
+    /// connection's read order (picrit round 5).
+    pub(crate) terminal_seq: Option<u64>,
     /// The retained terminal's original decode instant (x.3.2 X4 D4.1),
     /// not its observation time.
     pub(crate) decoded_at: Option<Instant>,
@@ -217,6 +220,8 @@ struct Seal {
     /// Every output of `current` went out.
     complete: bool,
     terminal: Option<Retained>,
+    /// The terminal's decode sequence.
+    terminal_seq: Option<u64>,
     /// The terminal's original decode instant.
     decoded_at: Option<Instant>,
     /// x.3.2 X4 D4.1: the terminal is an interrupted one retained with a
@@ -255,6 +260,7 @@ impl Delivery {
                 current: before,
                 complete: true,
                 terminal: None,
+                terminal_seq: None,
                 decoded_at: None,
                 draining: false,
                 tools_open: false,
@@ -330,6 +336,8 @@ impl Delivery {
             return Some(retained);
         }
         seal.terminal = Some(retained);
+        // Its message is the one being delivered.
+        seal.terminal_seq = Some(seal.current);
         seal.decoded_at = Some(decoded_at);
         seal.draining = draining;
         seal.complete = true;
@@ -415,6 +423,7 @@ impl Delivery {
             position,
             partial: !seal.complete,
             terminal: seal.terminal.take(),
+            terminal_seq: seal.terminal_seq,
             decoded_at: seal.decoded_at,
             tools_open: seal.tools_open || seal.draining,
             stop: seal.stop.take(),
