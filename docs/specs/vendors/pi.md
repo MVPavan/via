@@ -671,8 +671,10 @@ predicate.
   whatever kind the Store gave (a dropped read reply reports
   `UncertainCommit`). An absence proof the pass could not commit is
   Host's journal failure: not committed, or uncertain only when the proof's
-  own commit outcome is uncertain. A wall spent before the read is
-  `deadline`.
+  own commit outcome is uncertain. A wall spent before the final read is
+  `deadline`, including one reached during the re-probe pass (even by a
+  late page reply); only the final read's late reply is a Store failure
+  (runtime §5.2). Either way nothing launches.
 - **Several turns.** If turn A leaves a survivor, turn B refuses without
   launching, and turn C's check still finds A, because the predicate is A's
   group, not B's clean outcome. Once Host proves A's group absent, turns

@@ -777,7 +777,12 @@ answered and a group is unproven. A Store failure is `Err`, never `false`
 reply that arrives only after the deadline, an uncertain proof commit, and
 a proof the pass observed but did not commit (`Journal {Absence}`; its
 token stays held). A deadline spent before the Store read is
-`HostError::Deadline`. The answer is a Store snapshot at the read; callers
+`HostError::Deadline`: that includes a deadline reached during the
+`reprobe_held` pass, even by a page reply that arrived late (the pass has
+no post-read deadline check, so its late page is not a Store failure); a
+page read that never completes by the deadline is a Store failure. Only the
+final read's late reply is a Store failure by lateness. Either way nothing
+launches. The answer is a Store snapshot at the read; callers
 serialize a session's launches (Core runs one turn of a session at a time),
 so no launch of the session starts between the check and the launch it
 guards.
