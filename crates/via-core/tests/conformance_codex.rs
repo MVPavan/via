@@ -4036,7 +4036,7 @@ fn codex_uncorrelated_usage_fails_the_connection() {
 #[test]
 fn codex_terminal_after_a_rejected_sample() {
     let name = "codex_terminal_after_a_rejected_sample";
-    let _points = admitted_in_bursts();
+    let _points = admitted_in_bursts().unwrap();
     let (_, _, completed) = before_the_sample(name, &[]).unwrap();
     let tail = [
         token_usage(100),
@@ -4060,12 +4060,11 @@ fn codex_terminal_after_a_rejected_sample() {
 /// there seals admission only once the burst's later lines are admitted,
 /// and the failed connection's drain routes them.
 #[cfg(feature = "test-failpoints")]
-fn admitted_in_bursts() -> tempfile::TempDir {
+fn admitted_in_bursts() -> Result<tempfile::TempDir, String> {
     armed(
         "codex.connection.message",
         json!({"occurrence": 1, "action": "delay", "value": 50, "persist": true}),
     )
-    .unwrap()
 }
 
 /// C2 §5 (picrit round 5), the control: one burst holds the valid
@@ -4136,7 +4135,7 @@ fn interrupted_then(
 #[test]
 fn codex_p7_end_after_a_rejected_sample() {
     let name = "codex_p7_end_after_a_rejected_sample";
-    let _points = admitted_in_bursts();
+    let _points = admitted_in_bursts().unwrap();
     let (replay, mut expect) = interrupted_then(name, |ended| {
         vec![
             burst(&[uncorrelated_usage(50).to_string(), ended]),
