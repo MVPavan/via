@@ -146,16 +146,6 @@ impl VendorMessage {
         }
     }
 
-    /// A skipped line's record, test builds: no staging.
-    #[cfg(any(feature = "test-failpoints", feature = "test-support"))]
-    pub fn test_skipped(tail: Vec<u8>, line: SkippedLine) -> Self {
-        Self {
-            bytes: BoundedBytes(tail),
-            _permit: None,
-            skipped: Some(Box::new(line)),
-        }
-    }
-
     /// Returns the exact message bytes, including the trailing LF; for a
     /// skipped line, its last [`SKIPPED_TAIL_BYTES`].
     pub fn bytes(&self) -> &[u8] {
