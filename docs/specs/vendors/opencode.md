@@ -74,11 +74,10 @@ rejected: tools would inherit the password.
 No session mutation or prompt is sent before publication.
 
 **Vendor argument passthrough: refused in the first release (owner,
-2026-10-06; C2 §6.3).** The first-release route runs one server for all of
-VIA, on one private namespace (§3.2), fenced to one live server per data
-root. Arguments on the server's argv are per server, so a session with a
-different list would need a second server on the same data root, which the
-fence forbids. The route therefore refuses any non-empty `vendor_args` in
+2026-10-06; C2 §6.3).** Arguments on the server's argv are per server,
+and §3.2's fence allows one live server per namespace data root, so a
+session with a different list would need a second server on a data root
+that already has one. The route therefore refuses any non-empty `vendor_args` in
 `plan` and `check_turn`, before any receipt or vendor I/O, as
 `InvalidParam { field: "vendor_args" }`: C1 `invalid_params` naming
 `vendor_args`, with no kind2, the same refusal the `fake` harness gives.
