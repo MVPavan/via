@@ -78,14 +78,17 @@ fn encode_handle(bytes: &[u8; 32]) -> String {
 /// never `daemon_unreachable`; no daemon is contacted or started.
 #[derive(Debug)]
 pub(crate) struct RequestError {
-    field: &'static str,
+    field: std::borrow::Cow<'static, str>,
     message: String,
 }
 
 impl RequestError {
-    pub(crate) fn invalid_params(field: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn invalid_params(
+        field: impl Into<std::borrow::Cow<'static, str>>,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
-            field,
+            field: field.into(),
             message: message.into(),
         }
     }

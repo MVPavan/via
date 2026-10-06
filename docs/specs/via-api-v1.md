@@ -129,8 +129,15 @@ decided in the slice that needs them, after re-probing.
   A request the CLI refuses before sending it (no handle given; a
   malformed handle or `--vendor`; an unreadable or non-JSON
   `--output-schema` file; a prompt, `cwd` or instructions path it cannot
-  use) is a request error: it prints the `invalid_params` error naming the
-  member (`data.field`) and contacts no daemon.
+  use; an argument its parser rejects: an unknown flag or verb, a value
+  that does not parse, a missing value or argument) is a request error: it
+  prints the `invalid_params` error naming the member (`data.field`) and
+  contacts no daemon. A parser error names the argument the parser names,
+  without dashes or value placeholder and with inner dashes as underscores
+  (the C1 member where the flag maps to one: `--max-steps` is
+  `max_steps`), or `command` for an unknown or missing verb; its message
+  is the parser's own, without usage. `--help` and `--version` print the
+  parser's help and version and exit 0.
   `via daemon` starts the foreground server; `via daemon status` and
   `via daemon stop` remain client verbs.
 

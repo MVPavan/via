@@ -6,6 +6,7 @@ mod server;
 
 use std::{io, path::PathBuf, process::ExitCode, time::Duration};
 
+use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{Args, Parser, Subcommand};
 use serde_json::{Value, json};
 
@@ -412,6 +413,22 @@ fn main() -> ExitCode {
         let args: Vec<_> = std::env::args_os().skip(2).collect();
         return ExitCode::from(u8::try_from(via_core::run_anchor_from_args(&args)).unwrap_or(1));
     }
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            // Help and version keep the parser's own output and exit code.
+            if matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp
+                    | ErrorKind::DisplayVersion
+                    | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            ) {
+                error.exit();
+            }
+            let _ = write_json(io::stderr(), &parse_error(&error).to_value());
+            return ExitCode::from(2);
+        }
+    };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -425,7 +442,7 @@ fn main() -> ExitCode {
             return ExitCode::from(4);
         }
     };
-    let code = match runtime.block_on(run(Cli::parse())) {
+    let code = match runtime.block_on(run(cli)) {
         Ok(code) => code,
         Err(error) => {
             // Refused before sending: C1's request error.
@@ -443,6 +460,40 @@ fn main() -> ExitCode {
     // blocking task (such as a stalled Store join) it abandoned to process exit.
     runtime.shutdown_background();
     ExitCode::from(u8::try_from(code).unwrap_or(1))
+}
+
+/// An argument the parser rejected, as C1's request error (review
+/// clfix-crit): `invalid_params` naming the argument the parser names,
+/// without dashes or value placeholder and with dashes inside as
+/// underscores (`--max-steps <MAX_STEPS>` is `max_steps`, `<SESSION>` is
+/// `session`), else `command` (an unknown or missing verb). The message is
+/// the parser's own, without its usage and tips.
+fn parse_error(error: &clap::Error) -> client::RequestError {
+    let named = match error.get(ContextKind::InvalidArg) {
+        Some(ContextValue::String(arg)) => Some(arg.as_str()),
+        Some(ContextValue::Strings(args)) => args.first().map(String::as_str),
+        _ => None,
+    };
+    let field = named
+        .and_then(|arg| arg.split([' ', '=']).next())
+        .map(|arg| {
+            arg.trim_start_matches('-')
+                .trim_matches(['<', '>'])
+                .to_ascii_lowercase()
+                .replace('-', "_")
+        })
+        .filter(|field| !field.is_empty())
+        .unwrap_or_else(|| "command".to_owned());
+    let text = error.to_string();
+    let text = text.strip_prefix("error: ").unwrap_or(&text);
+    let message = text
+        .split("\n\n")
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    client::RequestError::invalid_params(field, message)
 }
 
 async fn run(cli: Cli) -> anyhow::Result<i32> {
