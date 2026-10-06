@@ -503,7 +503,9 @@ code; any other code stays an event. Codes Core itself raises
 (`structured_output_invalid`, `observations_lost`, `vendor_passthrough`)
 are not taken from an adapter: such an observation stays an event. A route raises a per-instance fact this
 way on every turn it affects, as OpenCode's `credential_state_unchecked` on
-each turn of an unchecked server generation (OpenCode packet §4.3).
+each turn of an unchecked server generation (OpenCode packet §4.3). Restart
+recovery rebuilds these codes from the turn's committed `warning` events, so
+a recovered envelope carries every one the turn's events hold.
 
 | Observation | Fields | Core commit |
 |---|---|---|

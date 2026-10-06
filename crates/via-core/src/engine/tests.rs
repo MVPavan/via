@@ -6941,6 +6941,101 @@ fn a_recovered_envelope_keeps_the_turns_instance() {
     });
 }
 
+/// Slice A critical review #1 (C2 §4, C1 §5): a turn whose own adapter
+/// warning of C1's closed list committed before the daemon crashed, ahead
+/// of its `turn.ended`, keeps that code on its recovered envelope, once,
+/// with VIA's message and the event's data. Another code, and another
+/// turn's warning, stay events only.
+#[test]
+fn a_recovered_envelope_keeps_the_turns_closed_list_warnings() {
+    let Some(root) = child("a_recovered_envelope_keeps_the_turns_closed_list_warnings") else {
+        return;
+    };
+    run(async {
+        let session = {
+            let earlier = open(&root);
+            let session = new_session(&earlier).await;
+            let at = rfc3339(std::time::SystemTime::now());
+            let submitted = Event {
+                seq: 2,
+                session_id: &session,
+                turn: Some(1),
+                late: false,
+                at: &at,
+                body: EventBody::TurnSubmitted { attempt: 1 },
+            }
+            .to_value()
+            .unwrap();
+            earlier
+                .store
+                .commit_submission(SubmissionRecord {
+                    session_id: session.clone(),
+                    turn: turn(1),
+                    event: submitted,
+                })
+                .await
+                .unwrap();
+            let warnings = [
+                ("credential_state_unchecked", None),
+                ("credential_state_unchecked", Some(json!({"second": true}))),
+                ("vendor_specific", None),
+                ("deprecated", Some(json!({"k": "v"}))),
+            ];
+            for (seq, (code, data)) in (3..).zip(warnings) {
+                let event = Event {
+                    seq,
+                    session_id: &session,
+                    turn: Some(1),
+                    late: false,
+                    at: &at,
+                    body: EventBody::warning(code, "the vendor's own words", data),
+                }
+                .to_value()
+                .unwrap();
+                earlier
+                    .store
+                    .commit_event(via_store::EventRecord {
+                        session_id: session.clone(),
+                        turn: turn(1),
+                        event,
+                        steer: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+            session
+        };
+        let engine = open(&root);
+        assert_eq!(engine.recover().await.unwrap(), 1);
+        let envelope = engine.result(&format!("{session}/1")).await.unwrap();
+        let envelope: Value = serde_json::from_str(envelope.get()).unwrap();
+        assert_eq!(envelope["state"], "unknown", "{envelope}");
+        let adapter: Vec<&Value> = envelope["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|warning| {
+                warning["code"] != "vendor_version_untested"
+                    && warning["code"] != "cancel_cleanup_uncertain"
+            })
+            .collect();
+        let codes: Vec<&Value> = adapter.iter().map(|warning| &warning["code"]).collect();
+        assert_eq!(
+            codes,
+            [&json!("credential_state_unchecked"), &json!("deprecated")],
+            "{envelope}"
+        );
+        assert!(
+            adapter[0].get("data").is_none(),
+            "the first one's: {envelope}"
+        );
+        assert_eq!(adapter[1]["data"], json!({"k": "v"}), "{envelope}");
+        for warning in &adapter {
+            assert_ne!(warning["message"], "the vendor's own words", "{envelope}");
+        }
+    });
+}
+
 /// Critical r1 #2 (runtime §8: one owner of a session's sequence): a
 /// session whose recovery resumes its driver gets its lane only after
 /// recovery committed that session's writes. A durable observation the

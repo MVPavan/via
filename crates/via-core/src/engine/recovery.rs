@@ -28,7 +28,7 @@ use super::resolve::{self, CORRUPT_ROW, Queueing};
 use super::stop::stop_outcome;
 use super::terminal::terminal_envelope;
 use super::{Accepted, Engine, Terminal, TurnRecord, failure, journal};
-use crate::api::{Cancel, Event, EventBody, FailureClass, Timestamps, Usage, rfc3339};
+use crate::api::{Cancel, Event, EventBody, FailureClass, Timestamps, Usage, Warning, rfc3339};
 use crate::intake::{Effective, Frozen, TurnPlan};
 use crate::{ApiError, Cleanup, Deadline, SessionId, TurnNumber};
 
@@ -600,6 +600,7 @@ impl Engine {
             started,
             requested_at,
             settled,
+            warnings,
         } = self
             .history(&session, turn)
             .await
@@ -627,7 +628,8 @@ impl Engine {
             .map_err(|_| ApiError::STORE)?;
         let seq = head.next();
         let ended_at = rfc3339(SystemTime::now());
-        let terminal = recovered_terminal(cancel.clone());
+        let mut terminal = recovered_terminal(cancel.clone());
+        terminal.warnings.extend(warnings);
         let link_released = terminal.quiescent;
         let event = Event {
             seq,
@@ -760,6 +762,7 @@ impl Engine {
         let mut started = None;
         let mut requested_at = None;
         let mut settled = None;
+        let mut warnings: Vec<Warning> = Vec::new();
         loop {
             let page = self
                 .store
@@ -790,6 +793,21 @@ impl Engine {
                                 .map_err(|_| WriteOutcome::NotCommitted)?,
                         );
                     }
+                    // The turn's own warning: committed while it ran, so
+                    // never `late` (C1 §6.1).
+                    Some("warning")
+                        if stored.event.get("late").and_then(Value::as_bool) == Some(false) =>
+                    {
+                        let code = stored.event.get("code").and_then(Value::as_str);
+                        let data = stored.event.get("data").cloned();
+                        if let Some(listed) = code
+                            .and_then(|code| Warning::adapter(code, data))
+                            .map(Warning::capped)
+                            && !warnings.iter().any(|kept| kept.code() == listed.code())
+                        {
+                            warnings.push(listed);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -804,6 +822,7 @@ impl Engine {
             started,
             requested_at,
             settled,
+            warnings,
         })
     }
 }
@@ -898,6 +917,10 @@ struct History {
     requested_at: Option<String>,
     /// The turn's first durable `cancel.settled`.
     settled: Option<DurableSettlement>,
+    /// The turn's own committed adapter warnings of C1 §5's closed list,
+    /// one per code, the first kept (C2 §4), as the live turn's envelope
+    /// would have carried them.
+    warnings: Vec<Warning>,
 }
 
 /// A durable `cancel.settled`: what the recovered terminal's `cancel` cites.
