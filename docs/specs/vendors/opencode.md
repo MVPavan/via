@@ -1,14 +1,30 @@
 # OpenCode serve adapter contract
 
-Status: **design candidate rev6 for 2.x, 2026-10-05, via-4sw.2.4** (an
+Status: **design candidate rev7 for 2.x, 2026-10-06, via-4sw.3** (an
 owner-approved cut-down: no mechanisms for unobserved problems; each
 hypothetical risk is a named live qualification item, §13). Pinned to
 **OpenCode 2.0.22**, SHA-256
 `32cf5aa0a69a650e36277e3315d189835ddc79fb9aa1d0aef5025be5af5ad122`.
-Scope: one VIA-owned, private, shared `opencode serve --stdio` per launch
-key (owner, 2026-10-04), reusing the [Codex packet](codex.md)'s shared-server
-machinery by reference. Design plus evidence only. Revision history is in
-`scratchpad/execution/opencode2/history.md`.
+Scope: one VIA-owned, private, shared `opencode serve --stdio` for all of
+VIA (owner, 2026-10-06), reusing the [Codex packet](codex.md)'s
+shared-server machinery by reference. Design plus evidence only. Revision
+history is in `scratchpad/execution/opencode2/history.md`.
+
+**Revision rev7 (owner decisions, 2026-10-06, bead via-4sw.3).** The first
+release runs **one OpenCode server for all of VIA**: one private namespace,
+whose project configuration is always on ("disable nothing"); a request to
+turn off a category only the project switch could turn off is `unknown`
+with `config_switch_unverified`, never a second server (§4.5). VIA data
+stays private and the provider profile stays the free anonymous one; the
+user's own OpenCode service, configuration and data are never touched. The
+one-live-server fence still holds across daemon restarts (§3.2), but now
+uses only existing anchor data: the `"opencode:<namespace>:<generation>"`
+`owner_server` label is withdrawn (it did not fit `ServerId`; this
+supersedes decision C-1 of `scratchpad/execution/c2-gap/report.md`), and
+no Store schema change is needed.
+`vendor_args` stays refused (§2.2). Changed: §§2.2, 2.3, 3.1, 3.2, 4.1,
+4.2, 4.4, 4.5, 5, 6, 8, 10, 12, 13 (OC02, OC10, L9), 14 and 15. Revisit items
+after the release are in §14.
 
 Authority: [C1](../via-api-v1.md), [C2](../adapter-contract.md),
 [runtime contracts](../runtime-contracts.md),
@@ -75,9 +91,9 @@ No session mutation or prompt is sent before publication.
 
 **Vendor argument passthrough: refused in the first release (owner,
 2026-10-06; C2 §6.3).** Arguments on the server's argv are per server,
-and §3.2's fence allows one live server per namespace data root, so a
-session with a different list would need a second server on a data root
-that already has one. The route therefore refuses any non-empty `vendor_args` in
+and §3.2's fence allows one live server on the one namespace's data root,
+so a session with a different list would need a second server on a data
+root that already has one. The route therefore refuses any non-empty `vendor_args` in
 `plan` and `check_turn`, before any receipt or vendor I/O, as
 `InvalidParam { field: "vendor_args" }`: C1 `invalid_params` naming
 `vendor_args`, with no kind2, the same refusal the `fake` harness gives.
@@ -86,10 +102,11 @@ route owns", and this refuses every list, reserved or not. The session's
 results carry no `vendor_passthrough`, since no session of this route has
 the arguments.
 
-Revisit after the release, if OpenCode passthrough is wanted. The
+Revisit after the release, if OpenCode passthrough is wanted (§14 R3). The
 arguments must then join the namespace (and with it `recipe_hash` and the
 data-root fence), so that each distinct list gets its own namespace and
-server. Reserved flags would then be extracted from the pinned binary, as
+server: that reintroduces more than one namespace, and with it a fence
+that can tell namespaces apart (§3.2). Reserved flags would then be extracted from the pinned binary, as
 the Claude and Codex packets do: `serve --stdio --port --hostname`,
 `--service`, `--standalone`, `--cors`, `--mdns*`, help and version, any
 flag that selects configuration, profile, project, data directory or log
@@ -126,7 +143,8 @@ exception (tool children inherit the password) is **withdrawn** (C1
 §9). This is not isolation: the server's initial environment
 (`/proc/<pid>/environ`) is readable by same-user processes, so a full-bound
 tool can recover the password and reach **every session on that shared
-server**. That sits inside the same-user boundary C1 §2 excludes for
+server**, which in the first release is every OpenCode session VIA runs
+(§3). That sits inside the same-user boundary C1 §2 excludes for
 full-bound sessions.
 
 ## 3. Shared ownership (A8, P11)
@@ -135,12 +153,16 @@ Same as Codex §2 "Shared ownership" for leases, pins, reservations,
 publication after the handshake, concurrent equal-key acquisition, one
 harness-process slot per live server, idle retirement when the last lease, pin
 and reservation are released (stdin close, then S1's hard stop), daemon
-stop, and never attaching to a pre-existing vendor server. Differences:
+stop, and never attaching to a pre-existing vendor server. In the first
+release there is one namespace and so **one OpenCode server for all of
+VIA** (owner, 2026-10-06): every OpenCode session leases it, whatever its
+inherited-configuration request (§4.5), and it holds one harness-process
+slot. Differences:
 
 ### 3.1 Launch key
 
 ```text
-namespace   = (provider_profile_id, provider_profile_epoch, project_config: on|off)
+namespace   = (provider_profile_id, provider_profile_epoch)
 launch_key  = namespace + recipe_hash
 recipe_hash = H(domain "via-opencode-serve-v2", adapter_version,
                 resolved_program_path, argv, passed environment
@@ -150,37 +172,71 @@ recipe_hash = H(domain "via-opencode-serve-v2", adapter_version,
                 protocol pin "opencode-api-v2")
 ```
 
+The first release has exactly one namespace,
+`(opencode-free-anonymous-v1, 1)` (§4.1). Project configuration is always
+on (§4.5), so it is no longer part of the namespace, and no session setting
+selects a namespace. Nothing per session enters `recipe_hash` either
+(`vendor_args` is refused, §2.2), so every OpenCode session of a daemon run
+has the same launch key. A launch key that differs from the live server's,
+should one arise, cannot start a second server: it waits for that server's
+retirement under the fence (§3.2).
+
 Not in the key: credentials, binary contents or stats (they key only the
 refusal cache), the observed version (reported, not keyed; an upgrade takes
 effect at the next launch, Codex parity), the bound, model, effort, agent,
-instructions, permission rules and session cwd (all per session, §5), and
-the password and port. The bound leaves the key because v2 permission rules
+instructions, permission rules and session cwd (all per session, §5),
+the session's inherited-configuration request (§4.5), and the password and
+port. The bound leaves the key because v2 permission rules
 are per session (E7, E15) and the route admits only `full` with
 `network:true` (A4). `ServerReport.key` is 16 hex digits of
 `H(launch_key)`.
 
 ### 3.2 Namespace and its fence
 
-Each namespace has one private directory
+The namespace has one private directory
 `<vendor_state_dir>/opencode/<16 hex of H(namespace)>/` (0700, runtime
 §6.1) holding `home/`, `config/`, `data/`, `state/`, `cache/`, `runtime/`,
 `tmp/`. The vendor database, which also stores any credential (E41), is
-`data/opencode/opencode.db` (E2, E38). At most two namespaces exist in the
-first release (project configuration on or off). A session's namespace
-derives from its frozen `SessionSpec.inherit`, so no per-session namespace
-record is needed. Sessions, messages, settings and pending inbox items
-persist in the database across server restarts (E31, E32, E53).
+`data/opencode/opencode.db` (E2, E38). Every OpenCode session uses it, so
+no per-session namespace record is needed. Sessions, messages, settings
+and pending inbox items persist in the database across server restarts
+(E31, E32, E53). VIA never reads, writes or contacts the user's own
+OpenCode configuration, data or service (§4.1; revisit items R1 and R2,
+§14).
 
-**One live server per namespace, across daemon restarts.** The vendor takes
-no lock: a second server over the same data root served the same sessions
-(E32). The fence is Host's existing anchor journal (runtime §6 `anchors`):
-the server's anchor carries `owner_server =
-"opencode:<16 hex namespace>:<generation>"`, written in the intent phase;
-before launching for namespace N the route requires that no anchor for N is
-unproven (`anchors_unproven`), in this daemon run or a prior one. An
-unproven anchor is resolved only by runtime §5.2's absence proof; until
-then turns needing N wait within their acquisition budget, then fail
-through C2's server-acquisition failure path. No new Store schema.
+**One live server, across daemon restarts.** The vendor takes no lock: a
+second server over the same data root served the same sessions (E32). The
+fence is Host's existing anchor journal (runtime §6 `anchors`), read
+through its existing columns. An OpenCode server's anchor is owned by
+`ProcessOwner::Server` with a freshly minted `ServerId`, as a Codex
+server's is; no OpenCode-specific `owner_server` label is written. Before
+it launches a server generation the route requires, through Host's server
+pre-launch check (runtime §5.2):
+
+1. **This daemon run.** The route's previous server generation, if any,
+   has a committed absence proof. The route runs one generation at a time
+   and keeps the anchor of the last one until Host proves its group absent
+   (idle retirement, drain, server loss or a failed acquisition; §8, §10).
+2. **Earlier daemon runs.** No server-owned anchor committed before this
+   daemon started (the startup anchor cohort Core already reads for
+   recovery) lacks an absence proof.
+
+The anchor rows cannot tell an OpenCode server anchor from a Codex one:
+`owner_server` holds only a random `ServerId`, and a turn's `server_turns`
+link is deleted once its terminal commits with quiescent cleanup. Rule 2
+therefore counts every unproven server anchor of an earlier run, Codex's
+included; this run's Codex servers never count. The over-blocking is
+limited to a degraded case: after an ordinary daemon crash each anchor
+cleans its own group on controller EOF, and startup recovery stops and
+proves what remains (runtime §5.1, §7). A crash that leaves an orphan
+OpenCode server, or any unproven earlier-run server, blocks a new one until
+the group is proven gone. Revisit condition: if an unproven earlier-run
+Codex anchor is seen blocking OpenCode in practice, record the harness on
+server anchors (§14 R4). Until then there is no Store schema change.
+
+An unproven anchor is resolved only by runtime §5.2's absence proof; until
+then turns needing the server wait within their acquisition budget, then
+fail through C2's server-acquisition failure path.
 
 A lease is held while the session's driver is open. Close of one session
 detaches it (§6); only Host's lifecycle stops the server.
@@ -197,14 +253,15 @@ Start from an empty environment:
 | `LANG` | fixed `C.UTF-8` |
 | `HOME`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`, `XDG_RUNTIME_DIR`, `TMPDIR` | the namespace's private directories (§3.2) |
 | `OPENCODE_CONFIG_CONTENT` | the generated configuration (§4.2) |
-| `OPENCODE_DISABLE_PROJECT_CONFIG` | `1` when the namespace's project switch is off; absent when on |
 | `OPENCODE_DISABLE_AUTOUPDATE` | `1` (source flag, E14) |
 | `OPENCODE_PASSWORD` | the generated password (§2.3) |
 | `VIA_PROCESS_MARKER` | set by Host; tools inherit it (E36), so the leftover scan works with scope `server` |
 
 Never forward provider keys, other `OPENCODE_*` (including `_API_KEY`,
 `_AUTH_CONTENT`, `_DB`, `_MODELS_URL|PATH`), proxy credentials or caller
-configuration; the vendor then uses its public free route (E9). The
+configuration; the vendor then uses its public free route (E9). VIA never
+sets `OPENCODE_DISABLE_PROJECT_CONFIG`: project configuration is always on
+(§4.5). The
 per-session environment endpoint is unused: it replaces the tool
 environment wholesale and is lost on restart (E36, E32).
 
@@ -225,7 +282,7 @@ order, E54); a project `default_agent` lost to it live (E54). `tool_output`
 pins the vendor's preview defaults (E55); the largest tool event observed
 was 55,022 bytes (E18), a measurement, not a guarantee. Keys VIA does not
 set (a project's `instructions`, `plugins`, `mcp`, extra agent fields) still
-come from the project when the switch is on (§4.5). No `steps` (§5).
+always come from the project (§4.5). No `steps` (§5).
 
 ### 4.3 Credential check (owner rule, 2026-10-05)
 
@@ -261,34 +318,44 @@ cannot see them.
 | Tool environment | Shared server environment; no password (E35) | Leftovers have scope `server` (Codex parity) |
 | Files and database | Full bound: tools can read the namespace database | Same-user boundary, C1 §2 |
 | Saved approvals | Project-scoped `always` approvals apply to every session (E15) | VIA only ever replies `reject` |
-| Blast radius | A session's tool can crash or stop the server | Every leased session sees `server_lost` (§10), as on Codex |
+| Blast radius | A session's tool can crash or stop the server, which every OpenCode session of VIA shares (§3) | Every leased session sees `server_lost` (§10), as on Codex |
 
 ### 4.5 Inherited configuration (C2 §6.2, owner OD2)
 
-Project configuration is one server-level switch. On, the server reads each
-session location's walk-up `.opencode`, `opencode.json(c)`, `.claude`,
-`.agents` and `AGENTS.md`, per location on one shared server (source E13;
-observed for two locations, E54). With `OPENCODE_DISABLE_PROJECT_CONFIG=1`
-none of them load (E12, E54). User-level sources are private and empty.
-Proposal: the namespace's switch follows the session's requested
-**instruction files** setting (Q2).
+Project configuration is one server-level switch, and in the first release
+it is **always on** (owner, 2026-10-06, following the release rule
+"disable nothing"). The server reads each session location's walk-up
+`.opencode`, `opencode.json(c)`, `.claude`, `.agents` and `AGENTS.md`, per
+location on one shared server (source E13; observed for two locations,
+E54). `OPENCODE_DISABLE_PROJECT_CONFIG=1` would stop all of them loading
+(E12, E54), but it is per server: honouring it for one session would need
+a second server on the one data root (§3.2), so VIA never sets it.
+User-level sources are VIA's private, empty ones; the user's own OpenCode
+configuration is never read (§3.2; revisit R1, §14).
+
+A request to turn off a category that only the switch controls is not
+applied: the session runs on the same server, its effective state is
+`unknown` (C2 §6.2: an `off` VIA cannot apply), and it carries
+`config_switch_unverified`. Skills are the one category a session can turn
+off, by its own permission rule (§5).
 
 C1 freezes effective states at spawn, so the frozen state is what the recipe
 guarantees; later evidence (`/api/mcp`, `/api/plugin`, instruction deltas)
 is a diagnostic only.
 
-| Category (OD2 default) | Switch on (default) | Switch off |
+| Category (OD2 default) | Requested on | Requested off |
 |---|---|---|
-| instruction files (on) | `on`: project `AGENTS.md` per location (E12, E54) | `off` (E12) |
-| skills (on) | `on` (E12); off requested: session rule `{skill,*,deny}` → `off` (E12) | `off` |
-| agents (on) | `unknown`: project agents load (source), no inventory (`/api/agent` returns `[]`, E11); VIA always runs its own `via` agent | `off` |
-| plugins (on) | `unknown`: project plugins load (source) | `off` |
-| MCP servers (off) | `unknown`: project MCP loads (source); the MCP resource helpers are denied (§5) | `off` |
-| hooks (off) | `unknown`: OpenCode hooks are plugin hooks | `off` |
+| instruction files (on) | `on`: project `AGENTS.md` per location (E12, E54) | `unknown`: not applied, project files still load |
+| skills (on) | `on` (E12) | `off`: session rule `{skill,*,deny}` (§5, E12) |
+| agents (on) | `unknown`: project agents load (source), no inventory (`/api/agent` returns `[]`, E11); VIA always runs its own `via` agent | `unknown`: not applied |
+| plugins (on) | `unknown`: project plugins load (source) | `unknown`: not applied |
+| MCP servers (off) | `unknown`: project MCP loads (source) | `unknown`: not applied; the MCP resource helpers are denied (§5) |
+| hooks (off) | `unknown`: OpenCode hooks are plugin hooks | `unknown`: not applied |
 
 Every `unknown` or differing state produces `config_switch_unverified`
-(C1 §5): with the default request a spawn warns for agents, plugins, MCP
-and hooks until G18–G19 qualify them (§13).
+(C1 §5). With the default request a spawn warns for agents, plugins, MCP
+and hooks until L4–L5 (G18–G19) qualify what they can (§13); a request of
+instruction files off adds instruction files.
 
 ## 5. Per-session settings
 
@@ -304,7 +371,7 @@ and hooks until G18–G19 qualify them (§13).
 | Output schema | No structured-output field → **unsupported** | E7 |
 
 Fixed at launch: binary, argv, environment, generated configuration,
-project switch, password and server cwd.
+password and server cwd.
 
 **Readback rules.** A readback that differs from a value VIA has **just
 sent** (creation, instruction entry, variant switch) is demonstrated
@@ -323,7 +390,7 @@ refusal cache).
 | `describe` / `plan` | Process-free: bundled profile, effort mapping, last version and cached catalog for this program path; refusals per §12; `server_key` from §3.1 | — |
 | `models` | Bundled entries plus the cached `GET /api/model` catalog of a live owned server (public fields only) | E9 |
 | `check_turn` | Pure: `full,network:true` only; same refusals as `plan`; the prompt admission bound (§9); effort against the cached catalog's `variants` | E9, E47 |
-| `prepare` / `readiness` | `Pinned(Server)` when the namespace server is live or launching and not draining, else `NeedsConnection`; readiness changes on publication, drain start (§8) and retirement | C2 §3 |
+| `prepare` / `readiness` | `Pinned(Server)` when the OpenCode server is live or launching and not draining, else `NeedsConnection`; readiness changes on publication, drain start (§8) and retirement | C2 §3 |
 | First `run_turn` of a connection generation, new session | `POST /api/session {model, agent:"via", location, permissions}`; persist the returned `ses_…` ID via `session.vendor_identity_confirmed`; then the instruction entry and readback. Never send a caller-chosen session ID: the free tier rejects it (403 FreeTierError, E29) | E7, E16, E29 |
 | First `run_turn` of a connection generation, reopen | `GET /api/session/{id}`: 404, or a different `id` or `location.directory` → `ResumeMismatch`, never create. Then the settings readback (§5). On the session's first attachment in a server generation, the leftover cleanup of §7.2 | E31, E32, E46 |
 | `run_turn` submission | The execution rule (§7.2), the effort step (§5), then one `POST /api/session/{id}/prompt {id:<caller ID>, text}`; outcomes §8 | E17, E30, E50 |
@@ -533,7 +600,7 @@ request's effect. The server generation **drains** (Q10, decided):
 1. The route publishes the drain as a readiness change: `prepare` gives
    `NeedsConnection`, Core reserves a slot (C2 §3 rule 3), and new turns
    wait for the next generation within their acquisition budget (the
-   namespace fence forbids a parallel server).
+   server fence, §3.2, forbids a parallel server).
 2. No new prompt or setup request is sent on the generation. A turn pinned
    to it whose prompt was never sent ends with `StartRejected::SessionGone`
    (C2 §3 rule 4, as the driver already returns for a dead pin) →
@@ -603,8 +670,10 @@ groups can survive a SIGKILL of the server group (E25) and appear in the
 shared leftover report (`scope: server`) without by themselves making
 cleanup `Uncertain`.
 
-**Restart and recovery.** A replacement starts only after the namespace
-fence (§3.2); each session is re-verified on its first `run_turn` (§6),
+**Restart and recovery.** A replacement starts only after the server
+fence (§3.2), in the same daemon run and after a restart: an orphan server
+a daemon crash left behind blocks a new one until Host proves its group
+gone (§3.2 rule 2). Each session is re-verified on its first `run_turn` (§6),
 and its leftover inputs are cancelled (§7.2); the password rotates. After a
 crash the vendor keeps no outcome: no completion, no idle record, nothing
 resumes on its own (E31), queued input stays parked (E53). Daemon-crash
@@ -690,6 +759,8 @@ handshake (§2.2) refuses. `describe` starts no process.
 | Prompt size | encoded prompt plus cwd at most 1 MiB − 8 KiB |
 | Usage / cost | scope `turn`, or `vendor_interval` with a compaction sample until G21; `reported` |
 | Vendor options | allow-list empty; reserved keys C2 §6.1 |
+| Vendor arguments | refused in the first release: any non-empty `vendor_args` is `invalid_params` (§2.2) |
+| Inherited configuration | project configuration always on; per-category states §4.5 |
 
 ## 13. Acceptance fixtures and live qualification
 
@@ -700,7 +771,7 @@ pinned binary and a free model.
 | Fixture | Required observation |
 |---|---|
 | OC01 handshake | URL line malformed, non-loopback, oversized, missing, exit-before-line; `/api/info` HTML, non-JSON, missing fields → incompatible, cached; `pid` mismatch, timeout, empty catalog, 5xx → transient, not cached; binary replaced at the same path clears the cache; wrong password → 401; no proxy or redirect |
-| OC02 namespace and credentials | Equal keys share one process and slot; differing project switch → two servers; an unproven prior anchor blocks a second server (same run and after restart); private roots only; fresh namespace proceeds; known integration shape with a synthetic credential → `unexpected_credential_state`; known shape, none → proceeds; unknown shape → proceeds with `credential_state_unchecked`; Boolean scan: the synthetic value never appears in any byte VIA read; `GET /api/credential` never requested |
+| OC02 namespace, fence and credentials | Sessions with different inherited-configuration requests share one process and slot; instruction files requested off → same server, effective `unknown` and `config_switch_unverified`; skills off → `off` by session rule; the launch environment never has `OPENCODE_DISABLE_PROJECT_CONFIG`; same run: an unproven previous generation blocks a new server, a proven one does not; after restart: an unproven server anchor of the startup cohort (an OpenCode orphan, and a Codex one) blocks a new server, a proven one does not, and a server anchor committed after startup by Codex does not; turn anchors never count; no anchor carries an OpenCode-specific label; private roots only; fresh namespace proceeds; known integration shape with a synthetic credential → `unexpected_credential_state`; known shape, none → proceeds; unknown shape → proceeds with `credential_state_unchecked`; Boolean scan: the synthetic value never appears in any byte VIA read; `GET /api/credential` never requested |
 | OC03 full path | Live spawn/result, background/wait, events/logs on a free model; close never deletes vendor history |
 | OC04 continuity and settings | Two-turn context answer; idle retirement then reopen with one identity read; missing or mismatching ID → `resume_mismatch`, no create; reopen settings mismatch → `SettingsMismatch` → `submit_failed`/`settings_mismatch`, not cached; just-sent readback differing → `handshake_refused`, cached; variant normalization |
 | OC05 execution rule | Interrupt still in flight when the predecessor ends naturally blocks the successor (replays E51); predecessor terminal not yet on the stream blocks it; 400/404 and never-sent predecessors release it; a terminal before own delivery is not `protocol`; a vendor-originated execution racing dispatch is not the turn's; a driver reopened on the same generation (idle close, overflow) dispatches from the server-scoped state; leftover VIA input at reopen is cancelled once and revises nothing; `session_busy` after 30 s |
@@ -708,7 +779,7 @@ pinned binary and a free model.
 | OC07 never-ask and isolation | Create/readback rules; other-session rename/move and self-move unavailable (live); declines within 5 s with the general pool full and observations saturated; a late request naming a settled turn's IDs credited to it; unattributed declined and credited to none; only a callID-correlated permission decline maps `interrupted{shutdown}` to `Completed/Other`; form decline leaves the ordinary rows; `vendor.request_declined` fields; `tools_ended` kept; `permission.rejected` → `action.denied`, deduplicated |
 | OC08 control | Cancel before send withdraws; before delivery → inbox cancel → input-cancellation terminal → `cancelled`/`acknowledged`, quiescent; same after wall cleanup keeps `failed(deadline_wall)`; lost cancel race → interrupt; interrupt during a tool → `interrupted{user}`, quiescent; no acknowledgement by `force_at` → `unknown`, no kill, later terminal or input cancellation revises an accepted turn |
 | OC09 outcomes, drain and overload | Prompt status table; timeout and socket failure after a byte → drain; inconclusive prompt → turn by lane order (terminal, acceptance, else `unknown`); drain publishes readiness; a pinned unsent turn → `SessionGone`; sent turns finish; retirement through Host; next generation fresh. Lane overflow → `failed(overflow)` as Codex, terminal-overflow case, no drain, successor dispatches; oversize event, full staging and each §9 count → generation `overflow`; prompt admission at both sides of the limit with escaping-heavy text; 45 s silence |
-| OC10 recovery | Server death during N sessions' turns → `server_lost` with one shared leftover report; a terminal admitted before the loss kept; EOF with process alive → `unknown`; quiescent with `GroupAbsent` even when tool leftovers are listed; daemon crash → `unknown`, no resend; namespace fence; password rotation |
+| OC10 recovery | Server death during N sessions' turns → `server_lost` with one shared leftover report; a terminal admitted before the loss kept; EOF with process alive → `unknown`; quiescent with `GroupAbsent` even when tool leftovers are listed; daemon crash → `unknown`, no resend; a daemon crash leaving an orphan server, then restart: no second server until its group is proven gone (§3.2); password rotation |
 | OC11 parameters and usage | Variant check and switch; instruction size at 262,144/262,145 encoded bytes; output schema and max steps refusals; step-keyed usage excluding `usage.updated`; a compaction sample → `vendor_interval` plus `usage_interval_unverified`; class hints |
 | OC12 password | Password only in the launch environment; absent from tools (Boolean), argv, Store, keys, diagnostics and captures; synthetic secrets only |
 
@@ -726,23 +797,38 @@ stands.
 | L6 (G20) model-driven forms | A form raised by the model; the execution after `DELETE` | Trigger a form live; record the terminal after decline |
 | L7 (G21) live compaction | Compaction events and their usage | Force automatic compaction; verify keys and totals, then allow scope `turn` |
 | L8 rate-limit, quota, context shapes | Error shapes unobserved | Trigger each on a free or synthetic provider; confirm class hints |
-| L9 long-run memory | Retained state over hours with many sessions | N sessions on one server for a long run, with escaping-heavy and large event fields; measure retained memory and RSS against §9's count bounds |
+| L9 long-run memory | Retained state over hours with many sessions; the one server carries every OpenCode session, so §9's per-server counts are daemon-wide | N sessions on one server for a long run, with escaping-heavy and large event fields; measure retained memory and RSS against §9's count bounds |
 | L10 macOS | Platform deferred | Run OC01–OC12 on macOS under the platform contract |
 | L11 untested-version credential shape | A new version's `/api/integration` may change shape or carry values | At each pin review, rerun E41's synthetic-credential probe and add the version to `checked` |
 | L12 other unobserved | `superseded` and `inactivity` interrupt reasons; agent `steps`; durable replay; `OPENCODE_DISABLE_AUTOUPDATE` behaviour; truncated-body handling (E56) | Probe each at the next pin review |
 
-## 14. Owner questions
+## 14. Owner questions and revisit items
 
 None open.
 
-Decided (owner, 2026-10-05): **Q2**, the project switch follows instruction
-files (OD2 default on) and loads each location's project agents, plugins,
-MCP servers and settings; spawns warn `config_switch_unverified` for agents,
-plugins, MCP and hooks until L4–L5 qualify them before release; **Q10**, an
+Decided (owner, 2026-10-06, bead via-4sw.3): one OpenCode server for all of
+VIA, one private namespace with project configuration always on; a request
+to turn off a category only the project switch controls is `unknown` with
+`config_switch_unverified`, never a second server (§3, §4.5); private VIA
+data and the free anonymous provider profile; the one-live-server fence
+stays across daemon restarts (§3.2); `vendor_args` refused (§2.2). This
+supersedes **Q2** below and decision C-1 of the C2 gap report.
+
+Decided (owner, 2026-10-05): **Q2** (superseded 2026-10-06), the project
+switch follows instruction files; **Q10**, an
 unknown request effect drains and restarts the server generation, stopping
 any unowned execution after unrelated turns finish (§8); **Q11**, relaxed
 credential check (§4.3).
 Earlier questions were accepted as proposed (history file).
+
+**Revisit after the release** (owner, 2026-10-06; not first-release work):
+
+| Item | Revisit |
+|---|---|
+| R1 user configuration | Use the user's own OpenCode configuration and providers instead of VIA's private, empty user-level sources and the free anonymous profile |
+| R2 user service | Attach to the user's own OpenCode service; invariant 11 (own vendor servers) would need the owner first |
+| R3 passthrough | OpenCode `vendor_args` (§2.2): needs one namespace per argument list |
+| R4 server anchor harness | Record the harness on server anchors if an unproven earlier-run Codex anchor is seen blocking OpenCode (§3.2 rule 2), or when R1–R3 bring back more than one namespace; this is the point where a Store schema or `ServerId` change may be needed |
 
 ## 15. Contract amendments (record)
 
@@ -751,3 +837,9 @@ The amendments this packet proposed to C1 (`via-api-v1.md`), C2
 were integrated into those contracts on 2026-10-05; the contracts are now
 authoritative, and the full amendment text is kept in
 `scratchpad/execution/opencode2/history.md`.
+
+Rev7 (2026-10-06) made these edits in place: C1 P11 and its §Decisions
+row, and the §9 password note (one server for all of VIA; reach of a
+recovered password); C2 A8 and the §6.2 inherited-configuration cell;
+runtime §5.2 (the server pre-launch check), §6's journal reads, §8's
+OpenCode server row and ownership note (no OpenCode `owner_server` label).
