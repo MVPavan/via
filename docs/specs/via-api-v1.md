@@ -126,6 +126,23 @@ decided in the slice that needs them, after re-probing.
   verbs one line. Exit codes: 0 success; 2 request error; 3 turn ended
   `failed`, `cancelled` or `unknown`; 4 daemon unreachable; 130 foreground
   wait interrupted (the session keeps running; the receipt was printed).
+  A request the CLI refuses before sending it (no handle given; a
+  malformed handle or `--vendor`; an unreadable or non-JSON
+  `--output-schema` file; a prompt, `cwd` or instructions path it cannot
+  use; an argument its parser rejects: an unknown flag or verb, a value
+  that does not parse, a missing value or argument) is a request error: it
+  prints the `invalid_params` error naming the field (`data.field`) and
+  contacts no daemon. A refusal after parsing names the C1 member; a
+  parser error names the CLI argument in the CLI's own spelling, not a C1
+  member: a flag as `--name` without its value placeholder
+  (`--force-after`, whose member is `force_after_ms`), a positional by its
+  lowercase name (`session`), a required group as its member flags joined
+  by `|` (`--prompt|--prompt-file`), each read from the CLI's own argument
+  definitions; any unknown argument (an unknown long or short flag, a
+  stray value, a value after `--`, an unknown verb) is `command`. Its message is the parser's own, without usage.
+  `--help` and `--version` print the parser's help and version and exit 0;
+  bare `via`, with no arguments, prints the parser's help on stderr and
+  exits 2, with no JSON.
   `via daemon` starts the foreground server; `via daemon status` and
   `via daemon stop` remain client verbs.
 
@@ -684,7 +701,7 @@ and refusals are governed by §4.2.
 | Route | `read_only` | `workspace_write` | `full` | `network: false` |
 |---|---|---|---|---|
 | `codex-app-server` | protocol-mapped, unverified; refuse pending pinned enforcement gate | protocol-mapped, unverified; refuse pending pinned enforcement gate | native with `network:true` | limited-bound network control only after proof; `full` + `network:false` refused |
-| `claude-cli` | unqualified; refuse pending CLAUDE-BOUND-1 | unqualified; refuse pending CLAUDE-BOUND-1 | `network:true` eligible candidate, qualified only after exact live recipe continuity test | refused, including limited bounds |
+| `claude-cli` | unqualified; refuse pending CLAUDE-BOUND-1 | unqualified; refuse pending CLAUDE-BOUND-1 | `network:true` eligible candidate, qualified only after exact live recipe continuity test; Bash runs anywhere in both modes; the file tools are confined to the working directories only under `harnesses.claude.restricted` (`vendors/claude-code.md` §4) | refused, including limited bounds |
 | `opencode-serve` | refused (A4, D9) | refused | only with `network:true` and empty `extra_write_dirs`; nonempty `extra_write_dirs` is `invalid_params` before server acquisition or vendor I/O | refused |
 | `pi-rpc` | refused (no sandbox) | refused | only with `network:true` and empty `extra_write_dirs`; nonempty `extra_write_dirs` is `invalid_params` before vendor I/O | refused |
 | ACP | refused (D7) | refused | native | refused |

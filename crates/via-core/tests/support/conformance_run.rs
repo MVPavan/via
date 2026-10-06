@@ -1768,6 +1768,7 @@ fn resume_refusal(set: &AdapterSet, session: &Session, spec: &TurnSpec) -> Optio
             ..ParamSizes::default()
         },
         inherit: Some(session.plan.inherit.requested),
+        inherit_effective: Some(session.plan.inherit.effective),
         model: Some(session.plan.model.resolved.clone()),
     };
     let session_ref = SessionRef {

@@ -1227,18 +1227,28 @@ Harness given with an uncatalogued model → the vendor decides after acceptance
 |---|---|---|
 | Environment values (`HOME`, `PATH`, `LANG`, `USER`, `LOGNAME`, `XDG_RUNTIME_DIR`) | the startup environment forwarded by auto-start (AR1) | read once; each adapter copies only its allow-list |
 | `harnesses.<name>.binary` | optional `daemon.json`, absolute path | the default is a `PATH` lookup; also used for vendor replay (§8) and user pinning |
-| `harnesses.<name>.inherit.{hooks, mcp_servers, plugins, skills, agents, instruction_files}` | optional `daemon.json`, booleans | OD2 switches. Default (**owner-approved**): hooks and MCP servers `false`, the rest `true`; Codex's every category `true` (owner 2026-10-05: VIA disables nothing in Codex but memories for the first release). Read at daemon start (the S1 rule). A change applies to sessions spawned after the next daemon start; each session freezes its settings. |
+| `harnesses.<name>.inherit.{hooks, mcp_servers, plugins, skills, agents, instruction_files}` | optional `daemon.json`, booleans | OD2 switches. Default (**owner-approved**): hooks and MCP servers `false`, the rest `true`; Codex's and Claude's every category `true` (owner 2026-10-05: VIA disables nothing in Codex but memories, and Claude's default mode delivers every category, for the first release). Read at daemon start (the S1 rule). A change applies to sessions spawned after the next daemon start; each session freezes its settings. |
 | `harnesses.codex.memories` | optional `daemon.json`, boolean | Codex only (owner, 2026-10-05): the default `false` launches every Codex server with `--disable memories`; `true` omits it, so Codex's own memories default applies (vendor packet §4). Part of the server key. Read at daemon start like the rest. |
+| `harnesses.claude.restricted` | optional `daemon.json`, boolean | Claude only (owner, 2026-10-05): `true` launches with `--restricted`; the default `false` omits it, so Claude loads the user's own configuration like their normal Claude (vendor packet §4). Read at daemon start like the rest. |
 | `checked` versions, capabilities, reserved keys, recipe | compiled into each adapter | never user config |
 | Fake fixture | `VIA_FAKE_AGENT_BINARY`, `VIA_FAKE_SCENARIO`, `VIA_FAKE_SYNC_DIR` | runtime §11.1, unchanged |
 
 Credentials never appear in config, the Store or evidence (invariant 1). The
 inherited inventory the route can read (§5.4.1) is written to the turn's
-evidence folder.
+evidence folder (Claude amended 2026-10-05: not recorded; vendor packet §4).
 
 #### 5.4.1 Categories per harness (OD2)
 
 "Verified" means seen live on 2026-09-30. Nothing marked unverified is claimed.
+
+**Claude Code columns superseded** (owner, 2026-10-05; via-umz): Claude
+launches without `--restricted` unless `harnesses.claude.restricted` is set,
+its default request has hooks and MCP servers on (no `--strict-mcp-config`
+unless MCP servers are requested off), and its effective states per mode,
+verified live on 2.1.289 except restricted MCP servers on (`unknown`), are
+in the vendor packet's §4
+(`docs/specs/vendors/claude-code.md`). The Claude cells below record the
+2026-09-30 state.
 
 | Category | Claude Code | Codex | OpenCode |
 |---|---|---|---|

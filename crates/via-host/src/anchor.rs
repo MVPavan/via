@@ -343,6 +343,39 @@ fn stderr_drain(cap: StderrCap) -> io::Result<(io::PipeWriter, std::sync::Arc<St
     Ok((writer, stderr_log::start(reader, file, cap)?))
 }
 
+/// The umask a vendor runs under (bead via-aew, runtime §6.1): the user's
+/// usual 022, so the files an agent creates are 0644, not the 0600 the
+/// daemon's 077 would give them.
+const VENDOR_UMASK: u32 = 0o022;
+
+/// Spawns `command` with [`VENDOR_UMASK`], which the child inherits at
+/// creation, then restores the anchor's own (the daemon's 077). The mask
+/// is process-wide, but no anchor thread creates a file meanwhile: the
+/// control socket was bound and set to 0600 before, and the stderr drain's
+/// threads only write the turn's file the daemon already opened.
+fn spawn_with_vendor_umask(command: &mut tokio::process::Command) -> io::Result<Child> {
+    let _lowered = Umask::set(VENDOR_UMASK);
+    command.spawn()
+}
+
+/// A lowered process umask, restored when dropped: after the spawn, and on
+/// unwind should the spawn panic.
+struct Umask(rustix::fs::Mode);
+
+impl Umask {
+    fn set(mask: u32) -> Self {
+        Self(rustix::process::umask(rustix::fs::Mode::from_raw_mode(
+            mask,
+        )))
+    }
+}
+
+impl Drop for Umask {
+    fn drop(&mut self) {
+        rustix::process::umask(self.0);
+    }
+}
+
 async fn spawn_vendor(
     stream: &mut UnixStream,
     vendor: VendorConfig,
@@ -363,7 +396,7 @@ async fn spawn_vendor(
     // without one, since its stderr would fill and block it.
     let spawn = drain.and_then(|(writer, log)| {
         command.stderr(writer);
-        command.spawn().map(|child| (child, log))
+        spawn_with_vendor_umask(&mut command).map(|child| (child, log))
     });
     // The command holds the anchor's copy of the pipe's write end: dropped
     // before the spawn reply, so the drain sees EOF when the vendor group
@@ -551,4 +584,28 @@ async fn stop_own_group(
     // The anchor is still in this group. No daemon-supplied numeric group is signalled.
     let _ = process::kill_process_group(process::getpgrp(), Signal::TERM);
     kill_own_group(Instant::now() + grace, stderr).await;
+}
+
+#[cfg(test)]
+mod umask_tests {
+    use super::Umask;
+
+    /// Review clfix-1: the anchor's own mask comes back however the scope
+    /// ends, a panic included.
+    #[test]
+    fn umask_is_restored_on_unwind() {
+        let current = || {
+            let mask = rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o077));
+            rustix::process::umask(mask);
+            mask.bits()
+        };
+        rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o077));
+        let unwound = std::panic::catch_unwind(|| {
+            let _lowered = Umask::set(0o022);
+            assert_eq!(current(), 0o022);
+            panic!("spawn panicked");
+        });
+        assert!(unwound.is_err());
+        assert_eq!(current(), 0o077);
+    }
 }

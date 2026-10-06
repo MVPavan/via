@@ -14,9 +14,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::value::RawValue;
 use via_adapters::{
-    AdapterConfig, BOOTSTRAP_ENV, BootstrapEnv, Category, ConfigError, HARNESSES, Harness,
-    HarnessSettings, HarnessesError, HarnessesRule, Incompatibility, Inherit, InheritState,
-    InstanceCache, VERSIONS_KEPT, resolve_binary,
+    AdapterConfig, BOOTSTRAP_ENV, BootstrapEnv, Category, ClaudeMode, ConfigError, HARNESSES,
+    Harness, HarnessSettings, HarnessesError, HarnessesRule, Incompatibility, Inherit,
+    InheritState, InstanceCache, VERSIONS_KEPT, resolve_binary,
 };
 
 fn raw(text: &str) -> Box<RawValue> {
@@ -270,12 +270,42 @@ fn s_launch_harnesses_codex_memories() {
     }
 }
 
+/// `restricted` is Claude's alone and a boolean (owner, 2026-10-05).
+fn restricted_refusal_cases() -> Vec<(&'static str, &'static str, HarnessesRule)> {
+    use HarnessesRule::{DuplicateKey, NotBoolean, UnknownKey};
+    vec![
+        (
+            r#"{"claude":{"restricted":"yes"}}"#,
+            "harnesses.claude.restricted",
+            NotBoolean,
+        ),
+        (
+            r#"{"claude":{"restricted":null}}"#,
+            "harnesses.claude.restricted",
+            NotBoolean,
+        ),
+        (
+            r#"{"claude":{"restricted":true,"restricted":false}}"#,
+            "harnesses.claude.restricted",
+            DuplicateKey,
+        ),
+        (
+            r#"{"codex":{"restricted":true}}"#,
+            "harnesses.codex.restricted",
+            UnknownKey,
+        ),
+    ]
+}
+
 /// Runtime §8, design §5.4: each invalid `harnesses` refuses with its
 /// named error, from `load` and from the pure `HarnessSettings::parse` alike; a
 /// key repeated at any level is refused.
 #[test]
 fn s_launch_harnesses_refusals() {
-    for (text, key, rule) in refusal_cases() {
+    for (text, key, rule) in refusal_cases()
+        .into_iter()
+        .chain(restricted_refusal_cases())
+    {
         let expected = HarnessesError {
             key: key.to_owned(),
             rule,
@@ -295,7 +325,8 @@ fn s_launch_harnesses_refusals() {
 
 /// A valid section: the configured binary and per-key `inherit`, with the
 /// harness's default for every missing key and harness (OD2's, except
-/// Codex's every category on, owner 2026-10-05); the fake keeps OD2.
+/// Codex's and Claude's every category on, owner 2026-10-05); the fake
+/// keeps OD2.
 #[test]
 fn s_launch_harnesses_valid() {
     use InheritState::{Off, On};
@@ -311,7 +342,7 @@ fn s_launch_harnesses_valid() {
     let inherit = config.inherit(row("claude"));
     let expected = [
         (Category::Hooks, On),
-        (Category::McpServers, Off),
+        (Category::McpServers, On),
         (Category::Plugins, On),
         (Category::Skills, Off),
         (Category::Agents, On),
@@ -321,7 +352,7 @@ fn s_launch_harnesses_valid() {
         assert_eq!(inherit.get(category), state, "{category:?}");
     }
     let default = |name| {
-        if name == "codex" {
+        if name == "codex" || name == "claude" {
             serde_json::from_value(serde_json::json!({"hooks": "on", "mcp_servers": "on",
                 "plugins": "on", "skills": "on", "agents": "on", "instruction_files": "on"}))
             .unwrap()
@@ -335,10 +366,26 @@ fn s_launch_harnesses_valid() {
         assert_eq!(settings.binary(), None, "{name}");
     }
     assert_eq!(config.inherit(Harness::Fake), Inherit::OD2_DEFAULT);
-    // No section at all: every harness has the defaults.
+    // `restricted` defaults to false (owner, 2026-10-05).
+    assert_eq!(claude.claude_mode(), ClaudeMode::Unrestricted);
+    for (text, mode) in [
+        (r#"{"claude":{"restricted":true}}"#, ClaudeMode::Restricted),
+        (
+            r#"{"claude":{"restricted":false}}"#,
+            ClaudeMode::Unrestricted,
+        ),
+    ] {
+        let config = load(text).unwrap();
+        let claude = config.harness(HARNESSES.iter().find(|r| r.name == "claude").unwrap());
+        assert_eq!(claude.claude_mode(), mode, "{text}");
+    }
+    // No section at all: every harness has the defaults; Claude's request
+    // differs from OD2's in hooks and MCP servers, on: what its default
+    // mode delivers (owner, 2026-10-05).
     let config = AdapterConfig::load(none(), None).unwrap();
     for row in HARNESSES {
         assert_eq!(config.harness(row).binary(), None);
+        assert_eq!(config.harness(row).claude_mode(), ClaudeMode::Unrestricted);
         assert_eq!(config.inherit(Harness::Vendor(row)), default(row.name));
     }
 }

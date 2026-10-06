@@ -6,7 +6,8 @@ mod server;
 
 use std::{io, path::PathBuf, process::ExitCode, time::Duration};
 
-use clap::{Args, Parser, Subcommand};
+use clap::error::{ContextKind, ContextValue, ErrorKind};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use serde_json::{Value, json};
 
 #[derive(Parser)]
@@ -146,26 +147,43 @@ struct PromptArgs {
 }
 
 impl PromptArgs {
-    /// Adds `prompt` or `prompt_file` to `params`.
-    fn apply(self, params: &mut Value) -> anyhow::Result<()> {
+    /// Adds `prompt` or `prompt_file` to `params`. Every failure is a
+    /// local request error (bead via-7c6).
+    fn apply(self, params: &mut Value) -> Result<(), client::RequestError> {
         match (self.prompt, self.prompt_file) {
             (Some(prompt), _) => params["prompt"] = Value::String(prompt),
             (None, Some(path)) if path.as_os_str() == "-" => {
-                params["prompt"] = Value::String(io::read_to_string(io::stdin())?);
+                let prompt = io::read_to_string(io::stdin()).map_err(|error| {
+                    client::RequestError::invalid_params(
+                        "prompt",
+                        format!("reading the prompt from stdin: {error}"),
+                    )
+                })?;
+                params["prompt"] = Value::String(prompt);
             }
-            (None, Some(path)) => params["prompt_file"] = json!(absolute(&path)?),
-            (None, None) => anyhow::bail!("--prompt or --prompt-file is required"),
+            (None, Some(path)) => params["prompt_file"] = json!(absolute(&path, "prompt_file")?),
+            (None, None) => {
+                return Err(client::RequestError::invalid_params(
+                    "prompt",
+                    "--prompt or --prompt-file is required",
+                ));
+            }
         }
         Ok(())
     }
 }
 
-/// `path` made absolute against the current directory.
-fn absolute(path: &std::path::Path) -> anyhow::Result<String> {
-    let path = std::path::absolute(path)?;
-    path.to_str()
-        .map(str::to_owned)
-        .ok_or_else(|| anyhow::anyhow!("path is not UTF-8: {}", path.display()))
+/// `path` made absolute against the current directory; a failure is a
+/// local request error naming `field` (bead via-7c6).
+fn absolute(path: &std::path::Path, field: &'static str) -> Result<String, client::RequestError> {
+    let path = std::path::absolute(path)
+        .map_err(|error| client::RequestError::invalid_params(field, error.to_string()))?;
+    path.to_str().map(str::to_owned).ok_or_else(|| {
+        client::RequestError::invalid_params(
+            field,
+            format!("path is not UTF-8: {}", path.display()),
+        )
+    })
 }
 
 /// C1 §3.2/§3.3 per-turn flags; the daemon validates them against the route.
@@ -195,7 +213,9 @@ struct TurnArgs {
 
 impl TurnArgs {
     /// Adds the given per-turn parameters to `params`; omitted ones inherit.
-    fn apply(self, params: &mut Value) -> anyhow::Result<()> {
+    /// Every failure is a local request error naming its member (bead
+    /// via-7c6): nothing is sent.
+    fn apply(self, params: &mut Value) -> Result<(), client::RequestError> {
         if let Some(mode) = self.bound {
             params["bound"] =
                 json!({"mode":mode,"extra_write_dirs":self.allow_dirs,"network":self.network});
@@ -204,8 +224,15 @@ impl TurnArgs {
             params["effort"] = Value::String(effort);
         }
         if let Some(path) = self.output_schema {
-            let schema = std::fs::read(&path)?;
-            params["output_schema"] = serde_json::from_slice(&schema)?;
+            let invalid = |error: &dyn std::fmt::Display| {
+                client::RequestError::invalid_params(
+                    "output_schema",
+                    format!("--output-schema {}: {error}", path.display()),
+                )
+            };
+            let schema = std::fs::read(&path).map_err(|error| invalid(&error))?;
+            params["output_schema"] =
+                serde_json::from_slice(&schema).map_err(|error| invalid(&error))?;
         }
         if self.wall_ms.is_some() || self.idle_ms.is_some() {
             let mut deadlines = json!({});
@@ -226,7 +253,13 @@ impl TurnArgs {
                 let (name, value) = option
                     .split_once('=')
                     .and_then(|(key, value)| Some((key.split_once('.')?, value)))
-                    .ok_or_else(|| anyhow::anyhow!("--vendor takes harness.key=value"))?;
+                    .filter(|((harness, key), _)| !harness.is_empty() && !key.is_empty())
+                    .ok_or_else(|| {
+                        client::RequestError::invalid_params(
+                            "vendor",
+                            "--vendor takes harness.key=value",
+                        )
+                    })?;
                 vendor[name.0][name.1] = Value::String(value.to_owned());
             }
             params["vendor"] = vendor;
@@ -380,6 +413,22 @@ fn main() -> ExitCode {
         let args: Vec<_> = std::env::args_os().skip(2).collect();
         return ExitCode::from(u8::try_from(via_core::run_anchor_from_args(&args)).unwrap_or(1));
     }
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            // Help and version keep the parser's own output and exit code.
+            if matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp
+                    | ErrorKind::DisplayVersion
+                    | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            ) {
+                error.exit();
+            }
+            let _ = write_json(io::stderr(), &parse_error(&error).to_value());
+            return ExitCode::from(2);
+        }
+    };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -393,18 +442,101 @@ fn main() -> ExitCode {
             return ExitCode::from(4);
         }
     };
-    let code = match runtime.block_on(run(Cli::parse())) {
+    let code = match runtime.block_on(run(cli)) {
         Ok(code) => code,
         Err(error) => {
-            let value = json!({"code": 4, "message": error.to_string(), "data": {"kind": "daemon_unreachable"}});
-            let _ = write_json(io::stderr(), &value);
-            4
+            // Refused before sending: C1's request error.
+            if let Some(request) = error.downcast_ref::<client::RequestError>() {
+                let _ = write_json(io::stderr(), &request.to_value());
+                2
+            } else {
+                let value = json!({"code": 4, "message": error.to_string(), "data": {"kind": "daemon_unreachable"}});
+                let _ = write_json(io::stderr(), &value);
+                4
+            }
         }
     };
     // The daemon already bounded its final shutdown; never wait here for a
     // blocking task (such as a stalled Store join) it abandoned to process exit.
     runtime.shutdown_background();
     ExitCode::from(u8::try_from(code).unwrap_or(1))
+}
+
+/// An argument the parser rejected, as C1's request error (review
+/// clfix-crit): `invalid_params` naming the CLI argument in the CLI's own
+/// spelling (review clfix-crit2), never a C1 member: see [`cli_field`].
+/// The message is the parser's own, without its usage and tips.
+fn parse_error(error: &clap::Error) -> client::RequestError {
+    // An unknown argument is never looked up: its token may match a flag
+    // another verb defines, or be a value after `--` (review clfix-crit4).
+    let named = match error.get(ContextKind::InvalidArg) {
+        _ if error.kind() == clap::error::ErrorKind::UnknownArgument => None,
+        Some(ContextValue::String(arg)) => Some(arg.as_str()),
+        Some(ContextValue::Strings(args)) => args.first().map(String::as_str),
+        _ => None,
+    };
+    let field = named.map_or_else(|| "command".to_owned(), cli_field);
+    let text = error.to_string();
+    let text = text.strip_prefix("error: ").unwrap_or(&text);
+    let message = text
+        .split("\n\n")
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    client::RequestError::invalid_params(field, message)
+}
+
+/// The CLI argument the parser shows as `shown`, read from the parser's
+/// own definitions rather than its display text: a flag as `--name`, a
+/// positional by its lowercase name, a required group as its member flags
+/// joined by `|`. Anything the definitions do not name (an unknown flag,
+/// long or short, a stray value, a value after `--`, an unknown verb) is
+/// `command`: a typed token is never echoed as a field (review
+/// clfix-crit3).
+fn cli_field(shown: &str) -> String {
+    let field = |arg: &clap::Arg| {
+        arg.get_long().map_or_else(
+            || arg.get_id().as_str().to_ascii_lowercase(),
+            |long| format!("--{long}"),
+        )
+    };
+    // Built, as the parser was: an argument displays only once built.
+    let mut root = Cli::command();
+    root.build();
+    let mut commands = vec![&root];
+    let mut all = Vec::new();
+    while let Some(command) = commands.pop() {
+        all.push(command);
+        commands.extend(command.get_subcommands());
+    }
+    for command in &all {
+        if let Some(arg) = command.get_arguments().find(|arg| arg.to_string() == shown) {
+            return field(arg);
+        }
+    }
+    for command in &all {
+        for group in command.get_groups() {
+            let members: Vec<&clap::Arg> = group
+                .get_args()
+                .filter_map(|id| command.get_arguments().find(|arg| arg.get_id() == id))
+                .collect();
+            if members.len() > 1
+                && group.is_required_set()
+                && members
+                    .iter()
+                    .all(|arg| shown.contains(arg.to_string().as_str()))
+            {
+                return members
+                    .iter()
+                    .map(|arg| field(arg))
+                    .collect::<Vec<_>>()
+                    .join("|");
+            }
+        }
+    }
+    "command".to_owned()
 }
 
 async fn run(cli: Cli) -> anyhow::Result<i32> {
@@ -490,7 +622,7 @@ fn describe(args: DescribeArgs) -> anyhow::Result<i32> {
         params["require"] = json!(args.require);
     }
     if let Some(cwd) = args.cwd {
-        params["cwd"] = json!(absolute(&cwd)?);
+        params["cwd"] = json!(absolute(&cwd, "cwd")?);
     }
     if args.allow_untested {
         params["allow_untested"] = Value::Bool(true);
@@ -509,10 +641,10 @@ fn spawn(args: SpawnArgs) -> anyhow::Result<i32> {
     let mut params = json!({"harness":args.harness,"model":args.model,"handle":handle});
     args.prompt.apply(&mut params)?;
     if let Some(path) = args.instructions {
-        params["instructions"] = json!({"path":absolute(&path)?});
+        params["instructions"] = json!({"path":absolute(&path, "instructions")?});
     }
     if let Some(cwd) = args.cwd {
-        params["cwd"] = json!(absolute(&cwd)?);
+        params["cwd"] = json!(absolute(&cwd, "cwd")?);
     }
     if !args.require.is_empty() {
         params["require"] = json!(args.require);

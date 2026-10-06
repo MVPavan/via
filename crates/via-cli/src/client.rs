@@ -73,7 +73,55 @@ fn encode_handle(bytes: &[u8; 32]) -> String {
     result
 }
 
+/// A request the CLI refuses before sending it (bead via-7c6): C1
+/// `invalid_params` naming the member, exit 2 (C1 §1's request error),
+/// never `daemon_unreachable`; no daemon is contacted or started.
+#[derive(Debug)]
+pub(crate) struct RequestError {
+    field: std::borrow::Cow<'static, str>,
+    message: String,
+}
+
+impl RequestError {
+    pub(crate) fn invalid_params(
+        field: impl Into<std::borrow::Cow<'static, str>>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            field: field.into(),
+            message: message.into(),
+        }
+    }
+
+    /// The C1 error object, as a daemon's reply would carry it.
+    pub(crate) fn to_value(&self) -> Value {
+        json!({"code": -32602, "message": self.message,
+               "data": {"kind": "invalid_params", "field": self.field}})
+    }
+}
+
+impl std::fmt::Display for RequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RequestError {}
+
+/// The caller handle from `--handle-file`, `--handle-stdin`, `VIA_HANDLE`
+/// or `--handle`, in that order, or a generated one; any failure is a
+/// [`RequestError`] naming `handle`.
 pub(crate) fn read_handle(
+    file: Option<&Path>,
+    stdin: bool,
+    explicit: Option<&str>,
+    generate: bool,
+) -> anyhow::Result<String> {
+    read_handle_value(file, stdin, explicit, generate)
+        .map_err(|error| RequestError::invalid_params("handle", error.to_string()).into())
+}
+
+fn read_handle_value(
     file: Option<&Path>,
     stdin: bool,
     explicit: Option<&str>,

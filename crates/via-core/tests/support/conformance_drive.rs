@@ -379,7 +379,14 @@ fn adapter_set(harness: &str, binary: &Path, state: &Path) -> Result<(AdapterSet
             .map_err(|e| format!("{part}: {e}"))?;
     }
     let mut harnesses = Map::new();
-    harnesses.insert(harness.to_owned(), serde_json::json!({ "binary": binary }));
+    let mut settings = serde_json::json!({ "binary": binary });
+    if harness == "claude" {
+        // Every Claude fixture was recorded with `--restricted` and
+        // `--strict-mcp-config`: MCP servers requested off.
+        settings["restricted"] = Value::Bool(true);
+        settings["inherit"] = serde_json::json!({ "mcp_servers": false });
+    }
+    harnesses.insert(harness.to_owned(), settings);
     let raw = serde_json::value::RawValue::from_string(Value::Object(harnesses).to_string())
         .map_err(|e| e.to_string())?;
     let env = BootstrapEnv::from_vars(std::env::var_os("PATH").map(|path| ("PATH", path)));

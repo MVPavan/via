@@ -614,3 +614,145 @@ fn c1_client_refuses_daemon_socket_of_another_uid() -> TestResult {
     assert!(output.stdout.is_empty());
     Ok(())
 }
+
+/// Review clfix-crit: an argument the parser rejects (an unknown flag, a
+/// value that does not parse, a missing value or argument, an unknown
+/// verb) is C1's request error too, not plain parser text: `invalid_params`
+/// naming the CLI argument in the CLI's own spelling (review clfix-crit2):
+/// a flag as `--name`, a positional by its lowercase name, a required
+/// group as its member flags joined by `|`; any unknown argument (a flag,
+/// a stray value, a verb) is `command` (review clfix-crit3); exit 2, no
+/// daemon. Help and version keep the parser's own output, and bare `via`
+/// prints the parser's help and exits 2.
+#[test]
+fn c1_cli_parser_errors_are_invalid_params() -> TestResult {
+    let sandbox = Sandbox::new()?;
+    let resume = ["resume", SESSION, "--handle", HANDLE, "--prompt", "p"];
+    let with = |extra: &[&'static str]| -> Vec<&str> {
+        resume
+            .iter()
+            .copied()
+            .chain(extra.iter().copied())
+            .collect()
+    };
+    let cases: Vec<(Vec<&str>, &str)> = vec![
+        (vec!["cancel", SESSION, "--no-such-flag"], "command"),
+        // Review clfix-crit3: an unknown short flag, and a value after
+        // `--` that looks like a flag, are not CLI arguments either.
+        (vec!["cancel", SESSION, "-x"], "command"),
+        (vec!["cancel", SESSION, "--", "--private-token"], "command"),
+        (vec!["cancel", SESSION, "--", "--json"], "command"),
+        (vec!["cancel", SESSION, "--drain"], "command"),
+        (vec!["cancel", "--json"], "session"),
+        (with(&["--max-steps", "nope"]), "--max-steps"),
+        (
+            vec!["resume", SESSION, "--prompt", "p", "--handle"],
+            "--handle",
+        ),
+        (vec!["resume", "--prompt", "p"], "session"),
+        (vec!["no-such-verb"], "command"),
+        // Review clfix-crit2: a required group, and a flag whose C1
+        // member is spelled otherwise (`force_after_ms`).
+        (
+            vec!["spawn", "--harness", "claude", "--model", "haiku"],
+            "--prompt|--prompt-file",
+        ),
+        (
+            vec!["cancel", SESSION, "--force-after", "nope"],
+            "--force-after",
+        ),
+    ];
+    for (args, field) in cases {
+        let output = sandbox.command().args(&args).output()?;
+        let stderr: Value = serde_json::from_slice(&output.stderr).map_err(|error| {
+            format!(
+                "{args:?}: stderr is not JSON ({error}): {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })?;
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {stderr}");
+        assert_eq!(stderr["code"], -32602, "{args:?}: {stderr}");
+        assert_eq!(
+            stderr["data"]["kind"], "invalid_params",
+            "{args:?}: {stderr}"
+        );
+        assert_eq!(stderr["data"]["field"], field, "{args:?}: {stderr}");
+        let message = stderr["message"].as_str().unwrap_or_default();
+        assert!(
+            !message.is_empty() && !message.contains("Usage:"),
+            "{args:?}: {stderr}"
+        );
+        assert!(output.stdout.is_empty(), "{args:?}");
+    }
+    // Bare `via`: the parser's help on stderr, exit 2, no JSON.
+    let output = sandbox.command().output()?;
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Usage:"), "{stderr}");
+    assert!(serde_json::from_slice::<Value>(&output.stderr).is_err());
+    for args in [vec!["--help"], vec!["cancel", "--help"], vec!["--version"]] {
+        let output = sandbox.command().args(&args).output()?;
+        assert_eq!(output.status.code(), Some(0), "{args:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("Usage:") || stdout.starts_with("via "),
+            "{args:?}: {stdout}"
+        );
+    }
+    assert!(!sandbox.socket().exists(), "a daemon was started");
+    Ok(())
+}
+
+/// Bead via-7c6: a request the CLI refuses before sending it is a request
+/// error (C1 §1: exit 2), never `daemon_unreachable` (exit 4). `via cancel`
+/// with no handle anywhere, or a malformed one, is `invalid_params` naming
+/// `handle`, a malformed `--vendor` names `vendor`, and an unreadable or
+/// non-JSON `--output-schema` file names `output_schema`. Nothing reaches a daemon: none
+/// is started.
+#[test]
+fn c1_cli_refuses_a_missing_or_malformed_parameter_as_invalid_params() -> TestResult {
+    let sandbox = Sandbox::new()?;
+    let missing = sandbox.root.path().join("no-such-schema.json");
+    let missing = missing.to_str().ok_or("temporary path is not UTF-8")?;
+    let resume = ["resume", SESSION, "--handle", HANDLE, "--prompt", "p"];
+    let with = |extra: &[&'static str]| -> Vec<&str> {
+        resume
+            .iter()
+            .copied()
+            .chain(extra.iter().copied())
+            .collect()
+    };
+    let cases: Vec<(Vec<&str>, &str)> = vec![
+        (vec!["cancel", SESSION], "handle"),
+        (vec!["cancel", SESSION, "--handle", "h_short"], "handle"),
+        (with(&["--vendor", "novalue"]), "vendor"),
+        // Review clfix-1: an empty harness or key is malformed too.
+        (with(&["--vendor", ".key=x"]), "vendor"),
+        (with(&["--vendor", "claude.=x"]), "vendor"),
+        // Review clfix-1 #2: a schema file that is not JSON, or unreadable.
+        (with(&["--output-schema", "/dev/null"]), "output_schema"),
+        (
+            resume
+                .iter()
+                .copied()
+                .chain(["--output-schema", missing])
+                .collect(),
+            "output_schema",
+        ),
+    ];
+    for (args, field) in cases {
+        let output = sandbox.command().args(&args).output()?;
+        let stderr: Value = serde_json::from_slice(&output.stderr)
+            .map_err(|error| format!("{args:?}: stderr is not JSON ({error})"))?;
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {stderr}");
+        assert_eq!(stderr["code"], -32602, "{args:?}: {stderr}");
+        assert_eq!(
+            stderr["data"]["kind"], "invalid_params",
+            "{args:?}: {stderr}"
+        );
+        assert_eq!(stderr["data"]["field"], field, "{args:?}: {stderr}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+    }
+    assert!(!sandbox.socket().exists(), "a daemon was started");
+    Ok(())
+}

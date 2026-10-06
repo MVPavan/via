@@ -17,7 +17,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::config::BootstrapEnv;
+use crate::config::{BootstrapEnv, ClaudeMode};
 use crate::instance::InstanceCache;
 use crate::plan::CatalogModel;
 
@@ -35,15 +35,23 @@ pub(crate) struct ClaudeAdapter {
     /// The launch environment: the packet's allow-list, as captured at
     /// daemon start (packet §4, B7).
     env: Vec<(OsString, OsString)>,
+    /// The configured launch mode (`harnesses.claude.restricted`).
+    mode: ClaudeMode,
 }
 
 impl ClaudeAdapter {
-    pub(crate) fn new(binary: PathBuf, instances: Arc<InstanceCache>, env: &BootstrapEnv) -> Self {
+    pub(crate) fn new(
+        binary: PathBuf,
+        instances: Arc<InstanceCache>,
+        env: &BootstrapEnv,
+        mode: ClaudeMode,
+    ) -> Self {
         Self {
             binary,
             instances,
             catalog: plan::catalog(),
             env: launch::allowed_env(env),
+            mode,
         }
     }
 }

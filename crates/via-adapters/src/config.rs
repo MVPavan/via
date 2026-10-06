@@ -145,7 +145,7 @@ pub enum HarnessesRule {
     /// `binary` is not an absolute path free of `..` (runtime §6.1's rule).
     #[error("must be an absolute path without `..`")]
     Binary,
-    /// An `inherit` switch or `memories` is not a boolean.
+    /// An `inherit` switch, `memories` or `restricted` is not a boolean.
     #[error("must be a boolean")]
     NotBoolean,
 }
@@ -199,12 +199,26 @@ pub struct CodexSettings {
     pub memories: bool,
 }
 
+/// How Claude Code is launched: `harnesses.claude.restricted` (owner,
+/// 2026-10-05; vendor packet §4). The other harnesses have no such key.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ClaudeMode {
+    /// Without `--restricted`, the default: Claude loads the user's own
+    /// configuration (instruction files, hooks, plugins, skills, agents,
+    /// auto-memory) as the user's normal Claude does.
+    #[default]
+    Unrestricted,
+    /// With `--restricted`: none of that, built-ins only.
+    Restricted,
+}
+
 /// One vendor harness's `daemon.json` settings (design §5.4).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HarnessConfig {
     binary: Option<PathBuf>,
     inherit: Inherit,
     codex: CodexSettings,
+    claude_mode: ClaudeMode,
 }
 
 /// A harness with no settings: a `PATH` lookup and the OD2 default.
@@ -212,6 +226,7 @@ static DEFAULT_HARNESS: HarnessConfig = HarnessConfig {
     binary: None,
     inherit: Inherit::OD2_DEFAULT,
     codex: CodexSettings { memories: false },
+    claude_mode: ClaudeMode::Unrestricted,
 };
 
 /// The settings of harness `name` with none configured: a `PATH` lookup
@@ -224,12 +239,13 @@ fn default_harness(name: &str) -> HarnessConfig {
 }
 
 /// Harness `name`'s default inherited-configuration request: OD2's (hooks
-/// and MCP servers off, the rest on), except Codex's, every category on:
-/// VIA disables nothing in Codex but memories, so no switch applies (owner,
-/// 2026-10-05; vendor packet §4).
+/// and MCP servers off, the rest on), except Codex's and Claude's, every
+/// category on: VIA disables nothing in Codex but memories, and Claude's
+/// default mode, without `--restricted` or `--strict-mcp-config`, delivers
+/// every category (owner, 2026-10-05; vendor packets §4).
 fn default_inherit(name: &str) -> Inherit {
     let mut inherit = Inherit::OD2_DEFAULT;
-    if name == crate::codex::HARNESS {
+    if name == crate::codex::HARNESS || name == crate::claude::HARNESS {
         inherit.set(Category::Hooks, InheritState::On);
         inherit.set(Category::McpServers, InheritState::On);
     }
@@ -250,6 +266,11 @@ impl HarnessConfig {
     /// Codex's settings; the default for every other harness.
     pub fn codex(&self) -> CodexSettings {
         self.codex
+    }
+
+    /// Claude Code's launch mode; the default for every other harness.
+    pub fn claude_mode(&self) -> ClaudeMode {
+        self.claude_mode
     }
 }
 
@@ -380,8 +401,9 @@ impl AdapterConfig {
 /// Parses `harnesses` (runtime §8, design §5.4): keys are [`HARNESSES`]
 /// names; per harness only `binary` (an absolute path without `..`, never
 /// expanded) and `inherit` (the six category booleans, the harness's
-/// [`default_inherit`] for each missing one), and for Codex alone
-/// `memories` (a boolean, default `false`). No key may repeat within its
+/// [`default_inherit`] for each missing one), for Codex alone `memories`
+/// and for Claude alone `restricted` (booleans, default `false`). No key
+/// may repeat within its
 /// object. Pure: no I/O.
 fn parse_harnesses(raw: &RawValue) -> Result<Vec<HarnessConfig>, HarnessesError> {
     let mut harnesses = HarnessSettings::default().0;
@@ -398,6 +420,13 @@ fn parse_harnesses(raw: &RawValue) -> Result<Vec<HarnessConfig>, HarnessesError>
                 "inherit" => config.inherit = parse_inherit(&value, &key, default_inherit(&name))?,
                 "memories" if name == crate::codex::HARNESS => {
                     config.codex.memories = boolean(&value, &key)?;
+                }
+                "restricted" if name == crate::claude::HARNESS => {
+                    config.claude_mode = if boolean(&value, &key)? {
+                        ClaudeMode::Restricted
+                    } else {
+                        ClaudeMode::Unrestricted
+                    };
                 }
                 _ => return Err(invalid(&key, HarnessesRule::UnknownKey)),
             }

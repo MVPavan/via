@@ -133,7 +133,8 @@ Version (C2 §5; owner OD1). Every Claude Code version is supported by
 default. Check init `claude_code_version` on every launch, parsing the
 complete version including any prerelease/build qualifier, never guessed from
 an executable filename. A version in the adapter's `checked` set (versions the
-maintainers' cheap live check passed) is `tested`; any other is `untested`,
+maintainers' cheap live check passed: 2.1.285 and, from the live round of
+2026-10-05, 2.1.289) is `tested`; any other is `untested`,
 with warning `vendor_version_untested`, and proceeds. Only a failed handshake
 check on something VIA relies on (`interrupt_receipt_v1`, the permission-mode
 echo, the tool list) refuses the instance. Init follows the prompt line, so
@@ -154,22 +155,46 @@ full-bound baseline is:
 ```text
 claude -p --input-format stream-json --output-format stream-json --verbose
   --model MODEL --session-id UUID
-  --restricted --strict-mcp-config
+  [--restricted] [--strict-mcp-config]
   --permission-mode dontAsk --permission-prompts none
   --tools Read,Write,Edit,Glob,Grep,Bash
   --allowedTools Read,Write,Edit,Glob,Grep,Bash
 ```
 
-For turn 2 onward replace `--session-id UUID` with `--resume UUID`. This is a
+For turn 2 onward replace `--session-id UUID` with `--resume UUID`.
+`--restricted` is passed only when `daemon.json` sets
+`harnesses.claude.restricted: true` (owner, 2026-10-05; the default is
+`false`). Without it (the default), Claude loads what the user's normal
+Claude loads: user, project and local settings files, instruction files
+(CLAUDE.md and the files they import), the user's hooks, plugins, skills and
+agents, and auto-memory. With it, Claude ignores the user, project and local
+settings files and loads built-ins only (help 2.1.289; states in the
+inherited-configuration table below). `--strict-mcp-config` is passed, in
+either mode, only when MCP servers are requested off; Claude's default
+request loads them (owner, 2026-10-05). This is a
 **proposed combination**, not a verbatim qualified probe: probes exercised its
 components with narrower tool lists. Explicit Bash enables general command
-execution in the unrestricted `full` bound. Restricted file tools may impose
-additional vendor restrictions; VIA does not promise every possible action is
-allowed by `full`, only that no narrower containment is advertised. Managed
-policy can deny actions. Denials are reported; restrictions are never bypassed.
-No ambient tool expansion or raw argv passthrough. MCP is not enabled in v1's
-Claude route. Qualification must verify that managed configuration cannot add
-an unexpected execution surface without detection (§8).
+execution in the `full` bound in both modes; Bash wrote outside the
+workspace in both (round 1, restricted; round-2 probe u1, unrestricted).
+The file tools differ by mode:
+- **unrestricted (default):** not confined. Write created a file outside
+  the workspace (round-2 probe u1). The user's own settings files load, so
+  their permission rules apply too.
+- **restricted:** Write is confined to the working directory: an outside
+  path or a symlink escape is denied with a structured denial, reported in
+  `denied_actions` (round 1; live probe sB again for an outside Write).
+  Edit, hard links and directories added with `--add-dir` were not tested
+  (round 1), so whether the confinement covers them is unverified (the
+  vendor's denial text says `--restricted` confines the file tools to the
+  working directory).
+Neither mode is a containment bound: VIA does not promise every possible
+action is allowed by `full`, only that no narrower containment is
+advertised. Managed policy can deny actions. Denials are reported; restrictions are never bypassed.
+No ambient tool expansion or raw argv passthrough. VIA adds no MCP server;
+the user's own MCP servers load unless requested off (inherited-configuration
+table below), and their tools are not in VIA's `--allowedTools`.
+Qualification must verify that managed configuration cannot add an
+unexpected execution surface without detection (§8).
 
 | Canonical field | Mapping |
 |---|---|
@@ -211,21 +236,53 @@ auth/continuity tests and a recorded environment-name list; never copy config or
 credentials into a new HOME to make tests pass. `--bare` is not the default
 because its auth behavior differs from this evidenced login route.
 
-Inherited configuration (C2 §6.2; owner OD2), from the 2026-09-30 re-probe
-("verified" means seen live):
+Inherited configuration (C2 §6.2; owner OD2; via-umz), per mode, from the
+live rounds of 2026-10-05 (2.1.289, Haiku unless named; "verified" means
+seen live). An unrestricted `on` means VIA passes no switch and live
+evidence shows this version loads the user's own configuration for that
+category; the user's own configuration turning something off is still that
+configuration applying (owner, 2026-10-06). The evidence: round-2 probe u1
+(direct, the default recipe without `--restricted`, with
+`--strict-mcp-config`), round-2 turn v1 (a VIA turn in the default mode,
+which completed and reported these states), round-3 probes m1 (direct, the
+default recipe without `--strict-mcp-config`) and sA (the same on Sonnet,
+in permission mode `auto`). Only MCP servers have a per-category switch;
+`--restricted` turns every other category off together, and without it
+every one of them loads. A
+session's mode is frozen at spawn with its effective states: a later launch
+reads the mode back from them (hooks are `on` only without `--restricted`),
+whatever the configuration says now; a session frozen before modes existed
+(hooks `unknown`) keeps `--restricted`.
 
-| Category (default) | Switch and evidence | Effective state with the default |
-|---|---|---|
-| hooks (off) | Settings-file hooks are ignored under `--restricted` (help; **unverified**); plugin hooks **unverified**; `--safe-mode` also drops prompt config, so it is not a per-category switch | `unknown`, warns |
-| MCP servers (off) | `--strict-mcp-config`: **verified** (`mcp_servers:0`) | `off` |
-| plugins (on) | Loaded (2) even under `--restricted`; no per-category switch known | `on` (init inventory) |
-| skills (on) | Loaded (18); `--disable-slash-commands` (help; **unverified**) | `on` (init inventory) |
-| agents (on) | Loaded (5); no switch known | `on` (init inventory) |
-| instruction files (on) | CLAUDE.md is not in init; inventory unavailable; no per-category switch | `unknown`, warns |
+| Category | Default request (Claude) | Unrestricted (default mode) | Restricted |
+|---|---|---|---|
+| hooks | on | `on`: no switch; the user's SessionStart hooks ran (`hook_started` events, u1); v1 ran the same flags | `off`: no hook events (round 1); settings files are ignored |
+| MCP servers | on | `on`: no switch; init `mcp_servers` listed the user's (plugin-provided) server (m1, sA; status `needs-auth`: the server was discovered on that launch, not shown connected or its tools callable). `off`: `--strict-mcp-config`, verified (`mcp_servers:0`) | `on` passes no switch and is `unknown`: what loads varied. The user's plugin-provided server is dropped with the plugin; one launch listed no server (init `mcp_servers: []`, round-3 probe m2, Haiku), another listed five claude.ai connector servers (source `claudeai`, status `pending`) that no unrestricted launch listed (probe sB, Sonnet). `off`: `--strict-mcp-config`, verified |
+| plugins | on | `on`: no switch; init listed the user's plugin besides the built-in ones (u1) | `off`: no user or project plugins; init may still list managed or built-in ones |
+| skills | on | `on`: no switch; init listed 81 skills, the user's among them (u1) | `off`: built-in skills only (init inventory) |
+| agents | on | `on`: no switch; init listed the user's agents besides the five built-in ones (u1) | `off`: built-in agents only (init inventory) |
+| instruction files | on | `on`: no switch; the workspace CLAUDE.md reached the model (u1 named its codeword); auto-memory is on too (init `memory_paths`) | `off`: no CLAUDE.md, no auto-memory (round 1) |
 
-Init lists plugins, skills, agents, slash commands and MCP servers (verified);
-that inventory is recorded in the turn's evidence folder. Qualify the hook,
-plugin, skill and agent switches in `via-p98.3.4`.
+Claude's default request is every category on: what the default mode
+delivers, so the default never warns (owner, 2026-10-05: hooks and MCP
+servers on, unlike OD2's default, to match what the user's normal Claude
+loads). Any other request the mode cannot deliver keeps the effective state
+above and warns `config_switch_unverified` (C1 §3.7, C2 §6.2): for example
+the restricted mode with the default request lists every category, MCP
+servers as `unknown` and the rest `off`. MCP tools are not in VIA's
+`--allowedTools`, so under `dontAsk` a call to one is denied unless the
+user's own permission rules, which the default mode loads, allow it
+(inference from the flags; not probed). Auto-memory is not a C1 category;
+it follows instruction files. Init lists the tools, model, plugins, skills,
+agents, slash commands, MCP servers and permission mode (verified). VIA's
+handshake check (§3) reads the capabilities, the permission mode and the
+tools, not the MCP inventory; VIA does not record the inventory in the
+turn's evidence folder (amended 2026-10-05, bead via-7c6):
+the Claude route has no evidence-file writer, and adding one means a new evidence
+file through Wire or Store and the C1 `logs` listing, more than that fix.
+The categories above were verified from the probes' own init captures.
+Revisit when per-turn inventory evidence is needed (a qualification run or a
+user question about what loaded).
 
 No free-form vendor options in this first recipe. Reject unknown Claude vendor
 keys with `invalid_params`; recognized reserved keys use
@@ -264,7 +321,7 @@ vendor-synthetic API-error message (`is_api_error_message:true`,
 | assistant `tool_use` | `progress` with `model` and `tools_started (id, name)`; retain the open-item set |
 | user `tool_result` | `progress` with `tools_ended (tool ID)`; error/refusal remains error; unmatched IDs are protocol evidence |
 | `message.usage` | not reported: assistant snapshots are partial (c9a output 6 vs 177; c1a 3 vs 156); usage comes from the `result.usage` turn aggregate |
-| `system/permission_denied` | `action.denied`; deduplicate matching terminal `permission_denials` by tool-use ID; an entry caused by VIA's decline is suppressed (§6) |
+| `system/permission_denied` | `action.denied`, its `reason` naming the vendor's `decision_reason_type` and, when a string, `decision_reason` (e.g. `classifier`, `[Data Exfiltration]`; live probe sC), cut to 1 KiB; deduplicate matching terminal `permission_denials` by tool-use ID; an entry caused by VIA's decline is suppressed (§6) |
 | `result` | Validate session, normalize terminal only once, report text/denials before the turn ends; the terminal (structured output, usage aggregate, cost, vendor data) is retained in the turn's end result (C2 §4.1) |
 | unknown notification | no observation; moves the turn's activity time; cannot advance lifecycle or the idle timer |
 | malformed known message / contradictory duplicate result | Protocol health failure; never invent a second terminal |
@@ -285,7 +342,14 @@ the qualified receipt plus `error_during_execution/aborted_tools` → Interrupte
 Classify on `is_error`, `terminal_reason`, `api_error_status` and the
 synthetic `error` code, never on `subtype` (a `success` subtype can carry
 `is_error:true`): `authentication_failed` or HTTP 401/403 → Failed `auth`;
-`model_not_found` → Failed `vendor_error` with that `vendor_code`. A vendor
+`model_not_found` → Failed `vendor_error` with that `vendor_code`. An
+explicit model refusal (`is_error:true` with `stop_reason:"refusal"`, after
+`system/model_refusal_no_fallback` and a synthetic message with
+`stop_details.type:"refusal"`; live probe sC, 2.1.289) → Failed
+`vendor_error` with the synthetic code (`invalid_request`) as `vendor_code`
+and canonical stop reason `refusal`; the synthetic message's
+`stop_details.category` (at most 1 KiB, e.g. `cyber`) goes to bounded
+`vendor` data as `refusal_category`. A vendor
 failure after acceptance and before model output is a Failed terminal with
 vendor code, class hint and `detail`, never `submit_failed` (C2 §2). On
 `is_error:true` the result text is that bounded `detail`, never final text;
@@ -299,8 +363,9 @@ Canonical stop reason for a successful result with vendor `end_turn` is
 `end_turn`; a successful schema-tool result with vendor `tool_use` is `other`,
 retaining `vendor_stop_reason:tool_use`. Do not label it interrupted or failed.
 Qualified cancellation maps `interrupted`, max-turn failure maps `max_steps`,
-other vendor failure maps `error`; unknown success reasons map `other` with the
-verbatim vendor reason. Core owns deadline override. Raw message tool calls do
+a vendor `refusal` maps `refusal` (a successful result too), other vendor
+failure maps `error`; unknown success reasons map `other` with the verbatim
+vendor reason. Core owns deadline override. Raw message tool calls do
 not override the terminal result's success flag.
 
 `result.usage` is the turn aggregate (C2 §5 usage) and supersedes any
@@ -496,6 +561,7 @@ backup, hashes and report. Missing infrastructure leaves a live case incomplete.
 | `claude_stream_limits` | Oversize stdout, stderr flood, stalled normalizer, large final payload: bounded memory, final text in a file; cancel/close still serviceable; no false successful truncated envelope |
 | `claude_live_recipe_continuity` | Exact §4 recipe, existing login, three launches, nonce recall, schemas replace/clear, instructions/effort/steps and full tool operation; emit versions/env names only |
 | `claude_live_interrupt` | Observe a real long-running tool, receipt, abort terminal, tool completion and verified cleanup; then same-ID next turn; SIGTERM-only is a negative case |
+| `claude_live_mcp_resume` | Unrestricted MCP discovery on resume launches: MCP servers requested on, a `--resume` launch's init lists the user's servers as the session's first launch did (m1 and sA covered new sessions only); status stays `on` |
 | `claude_live_bounds` | CLAUDE-BOUND-1 matrix on Linux/macOS including missing dependency fail-closed and resume-bound changes; infrastructure failure never passes |
 
 Run the repository verification gate when code lands. Focused default test

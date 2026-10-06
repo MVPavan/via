@@ -605,8 +605,8 @@ group via safe `rustix` process signal APIs. Its membership keeps the numeric
 group alive for the duration of that syscall. A signal cannot be redirected
 to a recycled group after the signalling process has ceased to exist.
 
-The Host anchor starts the vendor, which inherits the anchor's current group;
-no numeric group-join operation races an exiting anchor. Group membership is
+The Host anchor starts the vendor, which inherits the anchor's current group
+and umask 0022 (§6.1); no numeric group-join operation races an exiting anchor. Group membership is
 inherited at child creation, before exec. The anchor's stdin and stdout were
 created as pipes by the daemon and are inherited by the vendor using
 `Stdio::inherit`; Wire exclusively reads/writes their daemon ends. The
@@ -1082,7 +1082,10 @@ identities, and resolve managed children without following symlinks. Reject
 unsafe existing lock/database/log targets before mutation. Native race
 resistance remains a platform gate. Create regular state files and both
 socket classes mode 0600 from the start. Initialize daemon umask 0077 before
-threads or file creation, including SQLite sidecars. Store alone opens
+threads or file creation, including SQLite sidecars. The anchors inherit it;
+every vendor runs under umask 0022 instead, set by its anchor around the
+spawn and restored after, so files an agent creates get the user's usual
+modes (0644 for a regular file) rather than 0600 (bead via-aew, 2026-10-05). Store alone opens
 SQLite and blob files, and validates or creates the `evidence/` root; Wire
 creates each turn's folder and each shared server's folder under it; Host
 opens the owner's `stderr.log` (the turn's or the server's) for the anchor,
@@ -1413,9 +1416,13 @@ error. The optional `harnesses` member is passed unparsed to `via-adapters`'
 path; the default is a `PATH` lookup) and
 `harnesses.<name>.inherit.{hooks, mcp_servers, plugins, skills, agents,
 instruction_files}` (booleans; default hooks and MCP servers `false`, the rest
-`true`, except Codex's every category `true`: VIA disables nothing in
-Codex but memories, owner 2026-10-05; the effective states follow C2 §6.2,
-AD13). It is read at daemon start like the other keys; a
+`true`, except Codex's and Claude's every category `true`: VIA disables
+nothing in Codex but memories, and Claude's default mode delivers every
+category; owner 2026-10-05; the effective states follow C2 §6.2, AD13), and
+for Claude alone `harnesses.claude.restricted` (a boolean, default `false`:
+launch without `--restricted`; owner, 2026-10-05; `vendors/claude-code.md`
+§4). An invalid member exits 78 naming it, like every other key. It is read
+at daemon start like the other keys; a
 change applies to sessions spawned after the next start, and each session
 freezes its settings at spawn. It holds no credentials and no limits.
 For Codex alone, `harnesses.codex.memories` (a boolean, default `false`;

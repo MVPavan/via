@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use via_adapters::{
-    AdapterSet, Bound, DescribeRequest, Harness, Inherit, ParamSizes, Refusal, RefusalKind,
+    AdapterSet, Bound, DescribeRequest, Harness, InheritPlan, ParamSizes, Refusal, RefusalKind,
     RoutePlan, SessionRef, Support, TurnParams, TurnSpec, VendorOptions, Verb, VerbReq,
     harness_names,
 };
@@ -540,7 +540,7 @@ pub(crate) fn plan_spawn(
             &effective.turn_params(
                 members.instructions.as_deref(),
                 (cwd, prompt_json),
-                Some(plan.inherit.requested),
+                Some(plan.inherit),
             ),
         )
         .map_err(|refusal| refused(&refusal))?;
@@ -798,7 +798,7 @@ impl Effective {
         &self,
         instructions: Option<&str>,
         (cwd, prompt_json): (&str, usize),
-        inherit: Option<Inherit>,
+        inherit: Option<InheritPlan>,
     ) -> TurnParams {
         TurnParams {
             effort: self.effort.clone(),
@@ -814,7 +814,8 @@ impl Effective {
                 model: self.model.len(),
                 ..param_sizes(instructions, self.output_schema.as_ref())
             },
-            inherit,
+            inherit: inherit.map(|inherit| inherit.requested),
+            inherit_effective: inherit.map(|inherit| inherit.effective),
             model: Some(self.model.clone()),
         }
     }

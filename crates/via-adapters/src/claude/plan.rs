@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 
 use super::{ClaudeAdapter, launch};
 use crate::capabilities::{BoundMode, Capabilities, ParamSupport, Support, UsageSupport, Verbs};
+use crate::config::ClaudeMode;
 use crate::harness::Harness;
 use crate::plan::{
     Bound, CatalogModel, Category, CategoryDecl, DescribeRequest, Inherit, InheritState,
@@ -16,8 +17,8 @@ use crate::plan::{
 };
 
 /// Versions the maintainers' live check passed (C2 §5): the 2026-09-30
-/// re-probe's.
-pub(crate) const CHECKED: &[&str] = &["2.1.285"];
+/// re-probe's and the 2026-10-05 live round's.
+pub(crate) const CHECKED: &[&str] = &["2.1.285", "2.1.289"];
 
 /// The efforts `--effort` accepts (packet §4, help 2.1.285). Claude ignores
 /// any other with only a stderr warning, so VIA refuses it (AD18).
@@ -81,30 +82,44 @@ fn capabilities() -> Capabilities {
     }
 }
 
-/// AD13 per category (packet §4, design §5.4.1). Only the MCP switch is
-/// verified and applied (`--strict-mcp-config`); plugins, skills and agents
-/// load by the init inventory whatever is requested; hooks and instruction
-/// files are unverified either way.
-pub(crate) fn categories() -> BTreeMap<Category, CategoryDecl> {
-    let unswitched = |observed| CategoryDecl {
+/// AD13 per category (packet §4, design §5.4.1), as the configured mode
+/// delivers them (via-umz; live rounds of 2026-10-05). Only the MCP switch
+/// is applied per category (`--strict-mcp-config`, verified). The others
+/// have no per-category switch: `--restricted` turns hooks, instruction
+/// files and the user's and project's plugins, skills and agents off
+/// together (built-ins only, verified); without it every one of them
+/// loads (verified). MCP servers without the switch load in the default
+/// mode (verified); under `--restricted` what loads varied between live
+/// launches (none, or the account's claude.ai connectors), so they are
+/// `unknown`. A request the mode cannot deliver warns.
+pub(crate) fn categories(mode: ClaudeMode) -> BTreeMap<Category, CategoryDecl> {
+    let loaded = match mode {
+        ClaudeMode::Unrestricted => InheritState::On,
+        ClaudeMode::Restricted => InheritState::Off,
+    };
+    let unswitched = CategoryDecl {
         on: Switch::None,
         off: Switch::None,
-        observed,
+        observed: Some(loaded),
+    };
+    let mcp_loaded = match mode {
+        ClaudeMode::Unrestricted => Some(InheritState::On),
+        ClaudeMode::Restricted => None,
     };
     BTreeMap::from([
-        (Category::Hooks, unswitched(None)),
+        (Category::Hooks, unswitched),
         (
             Category::McpServers,
             CategoryDecl {
                 on: Switch::None,
                 off: Switch::Verified,
-                observed: None,
+                observed: mcp_loaded,
             },
         ),
-        (Category::Plugins, unswitched(Some(InheritState::On))),
-        (Category::Skills, unswitched(Some(InheritState::On))),
-        (Category::Agents, unswitched(Some(InheritState::On))),
-        (Category::InstructionFiles, unswitched(None)),
+        (Category::Plugins, unswitched),
+        (Category::Skills, unswitched),
+        (Category::Agents, unswitched),
+        (Category::InstructionFiles, unswitched),
     ])
 }
 
@@ -180,7 +195,7 @@ impl ClaudeAdapter {
         now: std::time::Instant,
     ) -> (Option<String>, VersionStatus) {
         let version = self.instances.last_version(harness.name(), &self.binary);
-        let recipe = launch::recipe_key(requested, schema);
+        let recipe = launch::recipe_key(self.mode, requested, schema);
         let status = if self.instances.refusal(&self.binary, &recipe, now).is_some() {
             VersionStatus::Refused
         } else if version
@@ -245,7 +260,7 @@ impl ClaudeAdapter {
                 .iter()
                 .any(|r| r.kind == RefusalKind::BoundUnsupported)
         });
-        let (inherit, switch_warning) = effective_inherit(&categories(), requested);
+        let (inherit, switch_warning) = effective_inherit(&categories(self.mode), requested);
         RoutePlan {
             harness: harness.name(),
             model,
@@ -282,12 +297,17 @@ impl ClaudeAdapter {
     ) -> Vec<Refusal> {
         let mut refusals = Self::check_values(route, turn);
         refusals.extend(self.frame_refusal(route, turn));
+        // The session's mode, read back from its frozen states; the
+        // configured one where they are unknown.
+        let mode = turn
+            .inherit_effective
+            .map_or(self.mode, launch::session_mode);
         if let Some(inherit) = turn.inherit
             && self
                 .instances
                 .refusal(
                     &self.binary,
-                    &launch::recipe_key(inherit, turn.output_schema),
+                    &launch::recipe_key(mode, inherit, turn.output_schema),
                     now,
                 )
                 .is_some()
@@ -341,7 +361,10 @@ impl ClaudeAdapter {
         let recipe = launch::Recipe {
             model: &model,
             session: launch::Continue::New(&session),
-            // OD2's default requests MCP servers off: the switch is passed.
+            // The longer argv, whatever the session's mode.
+            mode: ClaudeMode::Restricted,
+            // Unknown: OD2's default, MCP servers off, passes the switch
+            // (the longer argv).
             inherit: turn.inherit.unwrap_or(Inherit::OD2_DEFAULT),
             extra_write_dirs,
             // Present instructions pass the flag, empty ones too (critical r2 #1).
@@ -560,6 +583,117 @@ fn reserved(key: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Every request: each category `on` or `off`, all 64 combinations.
+    fn every_request() -> impl Iterator<Item = Inherit> {
+        (0..64_u8).map(|bits| {
+            let mut inherit = Inherit::OD2_DEFAULT;
+            for (index, category) in Category::ALL.into_iter().enumerate() {
+                let on = bits & (1 << index) != 0;
+                inherit.set(
+                    category,
+                    if on {
+                        InheritState::On
+                    } else {
+                        InheritState::Off
+                    },
+                );
+            }
+            inherit
+        })
+    }
+
+    fn uniform(state: InheritState) -> Inherit {
+        let mut inherit = Inherit::OD2_DEFAULT;
+        for category in Category::ALL {
+            inherit.set(category, state);
+        }
+        inherit
+    }
+
+    /// The categories a `config_switch_unverified` warning lists.
+    fn warned(warning: Option<&crate::plan::Warning>) -> Vec<String> {
+        warning
+            .and_then(|warning| warning.data.as_ref())
+            .and_then(|data| data["categories"].as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .map(|entry| entry["category"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    }
+
+    /// via-umz: the effective states are what each mode delivers (the
+    /// 2026-10-05 live round): restricted loads no hooks, instruction
+    /// files, user plugins, skills or agents; unrestricted loads them all,
+    /// and its MCP servers too (verified). Restricted MCP servers without
+    /// `--strict-mcp-config` varied live, so are `unknown`; the switch
+    /// turns them off in both modes. Claude's default request is what the default mode
+    /// delivers, MCP servers on (owner, 2026-10-05), so it never warns; a
+    /// request a mode cannot deliver warns, listing each such category.
+    #[test]
+    fn categories_report_each_mode_truthfully() {
+        use InheritState::{Off, On, Unknown};
+        let harness = Harness::Vendor(&crate::harness::HARNESSES[0]);
+        let default =
+            crate::config::AdapterConfig::load(crate::config::BootstrapEnv::default(), None)
+                .unwrap()
+                .inherit(harness);
+        assert_eq!(default, uniform(On), "Claude's default request");
+        let plan = |mode, requested| effective_inherit(&categories(mode), requested);
+
+        let (inherit, warning) = plan(ClaudeMode::Unrestricted, default);
+        assert_eq!(inherit.effective, default);
+        assert!(warning.is_none(), "{warning:?}");
+
+        let (inherit, warning) = plan(ClaudeMode::Restricted, uniform(Off));
+        assert_eq!(inherit.effective, uniform(Off));
+        assert!(warning.is_none(), "{warning:?}");
+
+        let rest = ["hooks", "plugins", "skills", "agents", "instruction_files"];
+        let (inherit, warning) = plan(ClaudeMode::Restricted, default);
+        let mut restricted = uniform(Off);
+        restricted.set(Category::McpServers, Unknown);
+        assert_eq!(inherit.effective, restricted);
+        assert_eq!(
+            warned(warning.as_ref()),
+            [
+                "hooks",
+                "mcp_servers",
+                "plugins",
+                "skills",
+                "agents",
+                "instruction_files"
+            ]
+        );
+
+        let (inherit, warning) = plan(ClaudeMode::Unrestricted, uniform(Off));
+        let mut unrestricted = uniform(On);
+        unrestricted.set(Category::McpServers, Off);
+        assert_eq!(inherit.effective, unrestricted);
+        assert_eq!(warned(warning.as_ref()), rest);
+    }
+
+    /// A session's mode is frozen by its effective states: for every
+    /// request, the states a mode's plan freezes read back as that mode,
+    /// so a launch reproduces them whatever the configuration says now.
+    /// A session frozen before the mode existed (hooks `unknown`) was
+    /// launched with `--restricted`.
+    #[test]
+    fn frozen_states_name_the_session_mode() {
+        for mode in [ClaudeMode::Unrestricted, ClaudeMode::Restricted] {
+            for requested in every_request() {
+                let (inherit, _) = effective_inherit(&categories(mode), requested);
+                assert_eq!(
+                    launch::session_mode(inherit.effective),
+                    mode,
+                    "{requested:?}"
+                );
+            }
+        }
+        let mut legacy = Inherit::OD2_DEFAULT;
+        legacy.set(Category::Hooks, InheritState::Unknown);
+        assert_eq!(launch::session_mode(legacy), ClaudeMode::Restricted);
+    }
+
     /// Normalized spellings of one owned flag are all reserved; other keys
     /// are not.
     #[test]
@@ -653,11 +787,12 @@ mod tests {
             binary.clone(),
             instances.clone(),
             &crate::config::BootstrapEnv::from_vars::<_, &str, &str>([]),
+            ClaudeMode::Unrestricted,
         );
         let requested = Inherit::OD2_DEFAULT;
         instances.record_refusal(
             &binary,
-            launch::recipe_key(requested, true),
+            launch::recipe_key(ClaudeMode::Unrestricted, requested, true),
             crate::instance::Incompatibility::ReadbackDiffers("tools"),
             std::time::Instant::now(),
         );
@@ -688,6 +823,7 @@ mod tests {
             binary.clone(),
             instances.clone(),
             &crate::config::BootstrapEnv::from_vars::<_, &str, &str>([]),
+            ClaudeMode::Unrestricted,
         );
         (adapter, instances, binary)
     }
@@ -712,6 +848,7 @@ mod tests {
                 ("PATH", "/usr/bin:/bin"),
                 ("LANG", "C.UTF-8"),
             ]),
+            ClaudeMode::Unrestricted,
         );
         let cwd = std::path::Path::new("/work/project");
         let model = adapter.resolve(None);
@@ -754,6 +891,8 @@ mod tests {
             let recipe = launch::Recipe {
                 model: &model,
                 session: launch::Continue::New(&session),
+                // The longer argv, as the frame check counts it.
+                mode: ClaudeMode::Restricted,
                 inherit: Inherit::OD2_DEFAULT,
                 extra_write_dirs: &[],
                 instructions: Some(&text),
@@ -798,6 +937,7 @@ mod tests {
             dir.path().join("claude"),
             std::sync::Arc::new(crate::instance::InstanceCache::default()),
             &crate::config::BootstrapEnv::from_vars([("PATH", "/usr/bin:/bin")]),
+            ClaudeMode::Unrestricted,
         );
         let cwd = std::path::Path::new("/work/project");
         let model = adapter.resolve(None);
@@ -841,6 +981,7 @@ mod tests {
         let recipe = launch::Recipe {
             model: &model,
             session: launch::Continue::New(&session),
+            mode: ClaudeMode::Restricted,
             inherit: Inherit::OD2_DEFAULT,
             extra_write_dirs: &[],
             instructions: Some(""),
@@ -877,7 +1018,7 @@ mod tests {
         let written = std::time::Instant::now();
         instances.record_refusal(
             &binary,
-            launch::recipe_key(Inherit::OD2_DEFAULT, false),
+            launch::recipe_key(ClaudeMode::Unrestricted, Inherit::OD2_DEFAULT, false),
             crate::instance::Incompatibility::FeatureAbsent("interrupt_receipt_v1"),
             written,
         );
@@ -894,6 +1035,30 @@ mod tests {
         assert_eq!(refused.len(), 1, "{refused:?}");
         assert_eq!(refused[0].kind.code(), "harness_unavailable");
         assert_eq!(refused[0].reason, Some("handshake_refused"));
+        // The lookup is the session's mode, read from its frozen states, not
+        // the configured one: a restricted session's recipe is not refused.
+        // (Before the expiry below, whose lookup drops the entry.)
+        let frozen = |mode| TurnParams {
+            inherit_effective: Some(
+                effective_inherit(&categories(mode), Inherit::OD2_DEFAULT)
+                    .0
+                    .effective,
+            ),
+            ..turn(false, Some(Inherit::OD2_DEFAULT))
+        };
+        let restricted = frozen(ClaudeMode::Restricted);
+        assert!(
+            adapter
+                .check_turn_at("claude-cli", &restricted, written)
+                .is_empty()
+        );
+        let unrestricted = frozen(ClaudeMode::Unrestricted);
+        assert_eq!(
+            adapter
+                .check_turn_at("claude-cli", &unrestricted, written)
+                .len(),
+            1
+        );
         let ttl = crate::instance::REFUSAL_TTL;
         for (turn, at) in [
             (turn(true, Some(Inherit::OD2_DEFAULT)), written),
@@ -933,7 +1098,7 @@ mod tests {
         let written = std::time::Instant::now();
         instances.record_refusal(
             &binary,
-            launch::recipe_key(Inherit::OD2_DEFAULT, false),
+            launch::recipe_key(ClaudeMode::Unrestricted, Inherit::OD2_DEFAULT, false),
             crate::instance::Incompatibility::FeatureAbsent("interrupt_receipt_v1"),
             written,
         );
@@ -977,7 +1142,7 @@ mod tests {
         instances.record_version(harness.name(), &other, "2.1.290".to_owned());
         instances.record_refusal(
             &other,
-            launch::recipe_key(Inherit::OD2_DEFAULT, false),
+            launch::recipe_key(ClaudeMode::Unrestricted, Inherit::OD2_DEFAULT, false),
             crate::instance::Incompatibility::FeatureAbsent("interrupt_receipt_v1"),
             now,
         );
@@ -993,6 +1158,25 @@ mod tests {
             (plan.vendor_version.as_deref(), plan.version_status),
             (Some("2.1.285"), VersionStatus::Tested)
         );
+    }
+
+    /// Bead via-7c6: the live round of 2026-10-05 passed on 2.1.289, so a
+    /// plan whose last version seen is 2.1.289 is `tested`, as 2.1.285 is;
+    /// another version stays `untested`.
+    #[test]
+    fn checked_versions_are_tested() {
+        let dir = tempfile::tempdir().unwrap();
+        let (adapter, instances, binary) = adapter_in(dir.path());
+        let harness = Harness::Vendor(&crate::harness::HARNESSES[0]);
+        let now = std::time::Instant::now();
+        for (version, status) in [
+            ("2.1.285", VersionStatus::Tested),
+            ("2.1.289", VersionStatus::Tested),
+            ("2.1.290", VersionStatus::Untested),
+        ] {
+            instances.record_version(harness.name(), &binary, version.to_owned());
+            assert_eq!(plan_of(&adapter, now).version_status, status, "{version}");
+        }
     }
 
     /// AD18 and G8: efforts outside the table and values past the argument

@@ -571,7 +571,7 @@ impl Engine {
         let params = effective.turn_params(
             frozen.instructions.as_deref(),
             (&cwd, encoded),
-            frozen.inherit.map(|inherit| inherit.requested),
+            frozen.inherit,
         );
         let checked = self
             .adapter
