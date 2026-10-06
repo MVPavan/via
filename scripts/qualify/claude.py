@@ -26,6 +26,10 @@ adds that version to the adapter's CHECKED set
 (crates/via-adapters/src/claude/plan.rs). Infrastructure, authentication
 (outside the auth case), quota, budget or runner failure is `blocked`;
 a case nobody gives evidence for is `not_observable`; neither passes.
+Missing, partial or unverifiable evidence is never a pass: an inspection
+failure is uncertainty, and truncated or lost evidence is `not_observable`
+or a failure. A process is only ever identified by its pid plus start
+ticks, and is read only through a /proc directory fd checked against both.
 
 Threat model. A maintainer runs this on their own machine, on Linux (it
 reads /proc and runs `pgrep`). The Claude that VIA starts runs only the
@@ -69,7 +73,9 @@ prompt, the tool names, the number of calls and whether any tool input held
 the nonce. Only those are kept. The transcript counts as evidence only when
 it shows the calls known to have happened (t1's Write, t3's Bash) with
 valid input records; otherwise the nonce and no-tool predicates are
-`not_observable`. Missing evidence is never a pass.
+`not_observable`. mcp_switches' unrestricted resume recalls a nonce the
+same way: its spawn turn makes one known Bash call, and the recall turn must
+show no tool call and no tool input holding the nonce.
 
 mcp_switches (owner decision, 2026-10-06): VIA records no init inventory for
 Claude (packet §4, via-7c6), so the evidence is Claude's own MCP debug lines,
@@ -77,6 +83,8 @@ written by `--debug=mcp --debug-file=<file>` to a file of the runner's. The
 runner parses each server's connection message apart from its name, keeps
 only per-server status keyed by a SHA-256 prefix of the name, plus counts
 (no server name is stored), and deletes the raw file on every exit path.
+A file over 16 MiB is incomplete evidence: that launch's MCP comparison is
+`not_observable`.
 Connected servers count only on a real success line: at least one on the
 unrestricted spawn and the same on its resume, none with MCP off; under
 `--restricted` any set agrees with the packet's `unknown`. With no server
@@ -105,9 +113,11 @@ the inherited-configuration request are daemon configuration:
 A phase's daemon is recorded as owned but unverified, its runtime directory
 kept, from before the start (or stop) request until it is proven: started
 when the pid `daemon status` replies with holds the run's private lock
-files, stopped when no process holds them and no descendant seen before the
-stop is alive. A daemon that holds them is ours, a replacement started by
-the CLI included. A failed start is searched for by those locks, and every
+files; stopped when no process holds them, none that could be ours (this
+uid, started after the runner) was left uninspected, the recorded daemon's
+pid and start ticks are gone, and no descendant seen before the stop is
+alive. A daemon that holds the locks is ours, a replacement started by the
+CLI included. A failed start is searched for by those locks, and every
 later phase is blocked. The final cleanup retries the stop until a
 deadline, also after an earlier unverified stop, escalating to `daemon stop
 --force` when a plain stop is refused `sessions_active`; once the stop is
@@ -141,9 +151,10 @@ only for an allow-list of recipe flags, digests for instructions, schemas
 and session IDs), and the presence of VIA's process-marker key, never its value. From
 the vendor transcripts of sessions VIA created in this run it reads usage
 numbers and tool-call counts only. It reads the command line and the
-marker key only of the daemon's descendants (ancestry through /proc ppid at
-that moment; a tag match alone is never enough), and command lines once at
-start to exclude Claude processes already alive, by pid. It sends signals
+marker key only of the daemon's descendants: one /proc scan whose root
+has the daemon's recorded pid and start ticks, walked by ppid within that
+scan (a tag match alone is never enough). It reads command lines once at
+start to exclude Claude processes already alive, by pid and start ticks. It sends signals
 to, or waits on, no process VIA did not start.
 """
 
@@ -263,20 +274,60 @@ def all_procs():
     return procs
 
 
-def cmdline(pid):
+# A process is only ever identified by pid plus start ticks. Every read of
+# one goes through a /proc/<pid> directory fd whose stat matched those
+# ticks: reads through it fail once that process is gone, so a reused pid
+# is never read.
+
+def open_proc(pid, start_ticks):
+    """A /proc/<pid> directory fd pinned to the process with these start
+    ticks, or None."""
     try:
-        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        fd = os.open(f"/proc/{pid}", os.O_RDONLY | os.O_DIRECTORY)
     except OSError:
+        return None
+    try:
+        stat_fd = os.open("stat", os.O_RDONLY, dir_fd=fd)
+        with os.fdopen(stat_fd, "rb") as file:
+            raw = file.read().decode("utf-8", "replace")
+        ticks = int(raw[raw.rindex(")") + 2:].split()[19])
+    except (OSError, ValueError, IndexError):
+        ticks = None
+    if ticks != start_ticks:
+        os.close(fd)
+        return None
+    return fd
+
+
+def proc_read(pid, start_ticks, name, limit=256 * 1024):
+    """`name` under the process's /proc directory (`exe` as its link
+    target), or None when that process is gone or unreadable."""
+    fd = open_proc(pid, start_ticks)
+    if fd is None:
+        return None
+    try:
+        if name == "exe":
+            return os.readlink("exe", dir_fd=fd)
+        with os.fdopen(os.open(name, os.O_RDONLY, dir_fd=fd), "rb") as file:
+            return file.read(limit)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def cmdline(pid, start_ticks):
+    raw = proc_read(pid, start_ticks, "cmdline")
+    if raw is None:
         return []
     return [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
 
 
-def has_marker_key(pid):
-    """Whether VIA's marker key is in the environment; the value is never kept."""
-    try:
-        with open(f"/proc/{pid}/environ", "rb") as file:
-            raw = file.read(256 * 1024)
-    except OSError:
+def has_marker_key(pid, start_ticks):
+    """Whether VIA's marker key is in the environment, or None when it
+    cannot be read; the value is never kept."""
+    raw = proc_read(pid, start_ticks, "environ")
+    if raw is None:
         return None
     return any(entry.split(b"=", 1)[0] == MARKER_KEY for entry in raw.split(b"\0"))
 
@@ -287,6 +338,8 @@ def alive(pid, start_ticks):
 
 
 def descendants(root, procs):
+    """`root`'s descendants by ppid, all from the one scan `procs`; the
+    caller validates the root's identity in that same scan."""
     children = {}
     for stat in procs.values():
         children.setdefault(stat["ppid"], []).append(stat["pid"])
@@ -466,19 +519,19 @@ class LaunchSampler:
         self.sample()
 
     def sample(self):
-        if self.run.daemon is None:
-            return
         procs = all_procs()
-        for pid in descendants(self.run.daemon["pid"], procs):
+        for pid in self.run.owned_descendants(procs):
             stat = procs[pid]
             key = (pid, stat["start_ticks"])
-            if key in self.seen or pid in self.run.preexisting_claude:
+            if key in self.seen or key in self.run.preexisting_claude:
                 continue
             # A launch is a Claude process whose parent is not one: Claude
             # runs helpers (ripgrep) from its own executable.
-            if not self.run.is_claude(pid) or self.run.is_claude(stat["ppid"]):
+            parent = procs.get(stat["ppid"])
+            if not self.run.is_claude(pid, stat["start_ticks"]) or (
+                    parent and self.run.is_claude(parent["pid"], parent["start_ticks"])):
                 continue
-            argv = cmdline(pid)
+            argv = cmdline(pid, stat["start_ticks"])
             if not argv:
                 continue
             self.seen.add(key)
@@ -539,6 +592,8 @@ class Run:
         self.daemon_unverified = None
         self.phase = None
         self.daemons = []
+        # The runner's own start: a process started later could be ours.
+        self.run_ticks = proc_stat(os.getpid())["start_ticks"]
         self.costs = {}
         self.last_cost = {}
         self.accounting_failed = None
@@ -561,18 +616,25 @@ class Run:
             return candidate
         return Path(tempfile.mkdtemp(prefix="vq-", dir="/tmp"))
 
-    def is_claude(self, pid):
-        try:
-            if os.path.realpath(f"/proc/{pid}/exe") == self.claude_real:
-                return True
-        except OSError:
-            pass
-        argv = cmdline(pid)
+    def is_claude(self, pid, start_ticks):
+        if proc_read(pid, start_ticks, "exe") == self.claude_real:
+            return True
+        argv = cmdline(pid, start_ticks)
         return bool(argv) and os.path.basename(argv[0]) == "claude"
 
     def claude_pids(self):
-        return {pid for pid, stat in all_procs().items()
-                if stat["comm"] == "claude" or self.is_claude(pid)}
+        """Claude processes alive before the run, as (pid, start ticks)."""
+        return {(pid, stat["start_ticks"]) for pid, stat in all_procs().items()
+                if stat["comm"] == "claude" or self.is_claude(pid, stat["start_ticks"])}
+
+    def owned_descendants(self, procs):
+        """The daemon's descendants in the scan `procs`, or none unless the
+        daemon's pid has its recorded start ticks in that same scan."""
+        root = procs.get(self.daemon["pid"]) if self.daemon else None
+        if (root is None or root["start_ticks"] != self.daemon["start_ticks"]
+                or root["state"] == "Z"):
+            return set()
+        return descendants(root["pid"], procs)
 
     def spent(self):
         """The unrounded total: each session's highest reported cumulative cost."""
@@ -731,20 +793,22 @@ class Run:
     # --- processes ---
 
     def snapshot(self, case, label, tags=()):
-        """The daemon's descendants, read at this snapshot through /proc
-        ppid, flagged when tagged; marker key presence only. No other
-        process's command line or environment is read."""
+        """The daemon's descendants, from one scan whose root has the
+        daemon's recorded start ticks, flagged when tagged; marker key
+        presence only. No other process's command line or environment is
+        read."""
         procs = all_procs()
-        ours = descendants(self.daemon["pid"], procs) if self.daemon else set()
+        ours = self.owned_descendants(procs)
         rows, unattributed = [], 0
         for pid, stat in sorted(procs.items()):
+            ticks = stat["start_ticks"]
             if pid in ours:
-                argv = cmdline(pid)
+                argv = cmdline(pid, ticks)
                 tagged = any(tag in part for tag in tags for part in argv)
-                rows.append({**stat, "claude": self.is_claude(pid), "tagged": tagged,
+                rows.append({**stat, "claude": self.is_claude(pid, ticks), "tagged": tagged,
                              "argv0": os.path.basename(argv[0]) if argv else None,
-                             "via_marker_key": has_marker_key(pid)})
-            elif stat["comm"] == "claude" and pid not in self.preexisting_claude:
+                             "via_marker_key": has_marker_key(pid, ticks)})
+            elif stat["comm"] == "claude" and (pid, ticks) not in self.preexisting_claude:
                 unattributed += 1
         snap = {"at": utc_now(), "daemon": self.daemon, "processes": rows,
                 "unattributed_new_claude": unattributed}
@@ -783,7 +847,8 @@ class Run:
                 status, detail = None, str(error)
             pid = status.get("pid") if isinstance(status, dict) else None
             stat = proc_stat(pid) if isinstance(pid, int) and not isinstance(pid, bool) else None
-            if stat is not None and pid not in {d["pid"] for d in self.find_daemons()}:
+            if stat is not None and {"pid": pid, "start_ticks": stat["start_ticks"]} not in (
+                    self.find_daemons()[0]):
                 stat, detail = None, f"pid {pid} does not hold this run's locks"
             if stat is None:
                 record["start_failed"] = str(detail)
@@ -792,7 +857,7 @@ class Run:
             # Any unsuccessful start: find what it left by the private locks.
             record.setdefault("start_failed", f"{type(error).__name__}: {error}")
             try:
-                record["found"] = self.find_daemons()
+                record["found"], record["uncertain"] = self.find_daemons()
             except Exception as find_error:
                 record["found"] = f"search failed: {type(find_error).__name__}"
             raise
@@ -803,34 +868,60 @@ class Run:
         print(f"phase {name}: daemon started", flush=True)
 
     def find_daemons(self):
-        """Processes holding this run's private locks, whatever their binary's
-        name; processes whose descriptors cannot be listed are skipped, and a
-        descriptor closed while it is read is ignored."""
+        """(holders, uncertain): processes holding this run's private locks,
+        whatever their binary's name, and processes that could be ours (this
+        uid, started after the runner) whose descriptors could not be fully
+        inspected while they lived. Uncertain is never "no holder"."""
         locks = {str(self.runtime / "daemon.lock"), str(self.state / "store.lock")}
-        found = []
+        holders, uncertain = [], []
         for pid, stat in all_procs().items():
+            ident = {"pid": pid, "start_ticks": stat["start_ticks"]}
+            proc = open_proc(pid, stat["start_ticks"])
+            if proc is None:
+                continue  # gone since the scan
             try:
-                fds = os.listdir(f"/proc/{pid}/fd")
-            except OSError:
-                continue
-            for fd in fds:
+                candidate = (os.fstat(proc).st_uid == os.getuid()
+                             and stat["start_ticks"] >= self.run_ticks)
+                held, failed = False, False
                 try:
-                    link = os.readlink(f"/proc/{pid}/fd/{fd}")
+                    fd_dir = os.open("fd", os.O_RDONLY | os.O_DIRECTORY, dir_fd=proc)
                 except OSError:
-                    continue
-                if link in locks:
-                    found.append({"pid": pid, "start_ticks": stat["start_ticks"]})
-                    break
-        return found
+                    failed = True
+                else:
+                    try:
+                        for fd in os.listdir(fd_dir):
+                            try:
+                                link = os.readlink(fd, dir_fd=fd_dir)
+                            except FileNotFoundError:
+                                continue  # closed while read
+                            except OSError:
+                                failed = True
+                                continue
+                            if link in locks:
+                                held = True
+                                break
+                    except OSError:
+                        failed = True
+                    finally:
+                        os.close(fd_dir)
+            finally:
+                os.close(proc)
+            if held:
+                holders.append(ident)
+            elif failed and candidate and alive(pid, stat["start_ticks"]):
+                uncertain.append(ident)
+        return holders, uncertain
 
     def stop_daemon(self, final=False):
-        """Stops the run's daemon. The one stop proof: no process holds this
-        run's private locks (`find_daemons()` is empty; a replacement daemon
-        at our socket holds them too, so it is ours) and no descendant seen
-        before the stop is alive. Until then the daemon is owned but
-        unverified, its runtime directory kept. A stop is retried until a
-        deadline, also after an earlier unverified stop; the final cleanup
-        escalates to `--force` when a plain stop is refused `sessions_active`."""
+        """Stops the run's daemon. The stop proof: no process holds this
+        run's private locks (a replacement daemon at our socket holds them
+        too, so it is ours), no process that could be ours was left
+        uninspected, the recorded daemon (pid and start ticks) is gone, and
+        no descendant seen before the stop is alive. Until then the daemon
+        is owned but unverified, its runtime directory kept. A stop is
+        retried until a deadline, also after an earlier unverified stop; the
+        final cleanup escalates to `--force` when a plain stop is refused
+        `sessions_active`. Each request's timeout is clamped to the deadline."""
         if self.daemon is None and self.daemon_unverified is None:
             return
         record = self.daemon_unverified or self.daemons[-1]
@@ -838,27 +929,42 @@ class Run:
         self.daemon_unverified = record
         phase_dir = self.evidence / "daemon"
         phase_dir.mkdir(mode=0o700, exist_ok=True)
+        recorded = []
+        for ident in (self.daemon, {"pid": record.get("pid"),
+                                    "start_ticks": record.get("start_ticks")}):
+            if ident and isinstance(ident.get("pid"), int) and ident not in recorded:
+                recorded.append(dict(ident))
         watched = {tuple(entry) for entry in record.get("descendants_watched", [])}
         attempts = record.setdefault("stop_attempts", [])
         deadline = time.monotonic() + (90 if final else 30)
         force = False
+
+        def survivors():
+            holders, uncertain = self.find_daemons()
+            living = [d for d in recorded if alive(d["pid"], d["start_ticks"])]
+            return holders, uncertain, living
+
         while True:
-            holders = self.find_daemons()
+            holders, uncertain, recorded_alive = survivors()
             procs = all_procs()
-            for holder in holders:
-                watched |= {(pid, procs[pid]["start_ticks"])
-                            for pid in descendants(holder["pid"], procs)}
+            for root in holders + recorded_alive:
+                if (procs.get(root["pid"]) or {}).get("start_ticks") == root["start_ticks"]:
+                    watched |= {(pid, procs[pid]["start_ticks"])
+                                for pid in descendants(root["pid"], procs)}
             record["descendants_watched"] = sorted(watched)
             left = sorted(pid for pid, start in watched if alive(pid, start))
-            if (not holders and not left) or time.monotonic() >= deadline:
+            proven = not (holders or uncertain or recorded_alive or left)
+            remaining = deadline - time.monotonic()
+            if proven or remaining <= 0:
                 break
-            if not holders:
+            if not (holders or recorded_alive):
                 time.sleep(0.2)
                 continue
             try:
                 rc, reply, err = self.via_call(
                     phase_dir, f"{self.phase}-stop-{len(attempts) + 1}", "daemon", "stop",
-                    "--json", *(["--force"] if force else []), timeout=60)
+                    "--json", *(["--force"] if force else []),
+                    timeout=max(1, min(60, int(remaining))))
             except Blocked as error:
                 rc, reply, err = None, None, str(error)
             attempts.append({"force": force, "rc": rc,
@@ -866,11 +972,13 @@ class Run:
             if final and "sessions_active" in json.dumps([reply, err], default=str):
                 force = True
             settle = min(deadline, time.monotonic() + 10)
-            while time.monotonic() < settle and self.find_daemons():
+            while time.monotonic() < settle and any(survivors()):
                 time.sleep(0.2)
         record["holders_left"] = holders
+        record["uninspected"] = uncertain
+        record["recorded_alive"] = recorded_alive
         record["descendants_left"] = left
-        record["stopped"] = not holders and not left
+        record["stopped"] = proven
         pgrep = subprocess.run(["pgrep", "-f", str(self.via)], capture_output=True, text=True)
         record["pgrep_via"] = [int(pid) for pid in pgrep.stdout.split()
                                if int(pid) != os.getpid()]
@@ -1087,9 +1195,9 @@ def case_interrupt(run, case):
             # Only the daemon's descendants: a tag match alone is never
             # enough to read a process's command line or environment.
             procs = all_procs()
-            for pid in descendants(run.daemon["pid"], procs) if run.daemon else ():
+            for pid in run.owned_descendants(procs):
                 stat = procs[pid]
-                argv = cmdline(pid)
+                argv = cmdline(pid, stat["start_ticks"])
                 if (argv and os.path.basename(argv[0]).startswith("python")
                         and any(tag in part for part in argv)):
                     tool = stat
@@ -1099,10 +1207,19 @@ def case_interrupt(run, case):
         case.check("tool observed running (status running_tools Bash, process present)",
                    bool(tool and running), {"running_tools_bash": running, "tool": tool})
         run.snapshot(case, "pre-cancel", tags=(tag,))
+        # Revalidated in a fresh scan: the same pid and start ticks, still
+        # the daemon's descendant. A lost observation is recorded, never
+        # omitted.
         procs = all_procs()
-        if tool and run.daemon and tool["pid"] in descendants(run.daemon["pid"], procs) and alive(
-                tool["pid"], tool["start_ticks"]):
-            marker = has_marker_key(tool["pid"])
+        marker = None
+        if (tool and tool["pid"] in run.owned_descendants(procs)
+                and procs[tool["pid"]]["start_ticks"] == tool["start_ticks"]):
+            marker = has_marker_key(tool["pid"], tool["start_ticks"])
+        if marker is None:
+            case.not_observable("VIA process marker key reaches the tool",
+                                "the tool was not observed, or was gone or unreadable "
+                                "before its environment was read")
+        else:
             case.check("VIA process marker key reaches the tool", marker is True,
                        {"key_present": marker})
         _, cancel, _ = run.via_call(case.dir, "cancel", "cancel", session, "--wait", "--json",
@@ -1232,29 +1349,37 @@ def purge_mcp_debug(case):
         os.close(folder)
 
 
+DEBUG_LIMIT = 16 << 20
+
+
 def read_debug_file(case, name):
-    """A debug file's text if it is a regular file (opened no-follow), else None."""
+    """(text, reason): a debug file's text if it is a regular file (opened
+    no-follow) of at most DEBUG_LIMIT bytes; otherwise None and why. A
+    longer file is never read as if complete."""
     folder = open_folder(case.dir / "mcp-debug")
     if folder is None:
-        return None
+        return None, "Claude wrote no regular debug file"
     try:
         fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=folder)
     except OSError:
-        return None
+        return None, "Claude wrote no regular debug file"
     finally:
         os.close(folder)
     with os.fdopen(fd, "rb") as file:
         if not S_ISREG(os.fstat(file.fileno()).st_mode):
-            return None
-        return file.read(16 << 20).decode("utf-8", "replace")
+            return None, "Claude wrote no regular debug file"
+        raw = file.read(DEBUG_LIMIT + 1)
+    if len(raw) > DEBUG_LIMIT:
+        return None, f"the debug file is over {DEBUG_LIMIT} bytes; the evidence is incomplete"
+    return raw.decode("utf-8", "replace"), None
 
 
 def take_mcp_debug(case, session_label, label):
     """Reads one launch's debug file, keeps per-server status by key and
-    deletes the file; returns the connected servers' keys, or None when
-    Claude wrote no file."""
+    deletes the file; returns the connected servers' keys, or None (and
+    `not_observable`) when there is no complete regular file."""
     try:
-        text = read_debug_file(case, f"{session_label}.live.log")
+        text, reason = read_debug_file(case, f"{session_label}.live.log")
         servers = parse_mcp_debug(text) if text is not None else None
     finally:
         purge_mcp_debug(case)
@@ -1264,7 +1389,7 @@ def take_mcp_debug(case, session_label, label):
         "init_inventory": "not recorded by VIA (via-7c6)",
         **(keyed(servers) if servers is not None else {"servers": None})})
     if servers is None:
-        case.not_observable(f"{label}: MCP debug lines", "Claude wrote no regular debug file")
+        case.not_observable(f"{label}: MCP debug lines", reason)
         return None
     return sorted(server_key(name) for name, state in servers.items() if state == "connected")
 
@@ -1284,6 +1409,28 @@ def mcp_launch(run, case, label, expect_inherit, expect_warning, mode, mcp_off,
     check_launch(case, label, launches, mode=mode, session=session, first=True,
                  mcp_off=mcp_off)
     return session
+
+
+def check_recall_tools(run, case, label, envelope, nonce):
+    """The recall turn made no tool call and no tool input held the nonce,
+    from the vendor transcript; evidence only when it shows the spawn
+    turn's known Bash call with valid inputs, else `not_observable`."""
+    path = vendor_transcript(run, envelope.get("vendor_session_id"))
+    turns = vendor_turns(path, needle=nonce) if path else []
+    write_json(case.dir / f"{label}-tool-calls.json",
+               [{"turn": n, "tool_calls": t["tool_calls"], "tool_names": t["tool_names"],
+                 "invalid_inputs": t["invalid_inputs"], "inputs_with_nonce": t["needle_inputs"]}
+                for n, t in enumerate(turns, 1)])
+    if not (len(turns) == 2 and "Bash" in turns[0]["tool_names"]
+            and all(t["invalid_inputs"] == 0 for t in turns)):
+        reason = ("the vendor transcript was not found or does not show the spawn turn's Bash "
+                  "call with valid inputs")
+        case.not_observable(f"{label}: no tool call in the recall turn", reason)
+        case.not_observable(f"{label}: no tool input held the nonce", reason)
+        return
+    case.check(f"{label}: no tool call in the recall turn", turns[1]["tool_calls"] == 0)
+    case.check(f"{label}: no tool input held the nonce",
+               all(t["needle_inputs"] == 0 for t in turns))
 
 
 def check_status(run, case, label, session, expect_inherit, expect_warning):
@@ -1319,14 +1466,19 @@ def case_mcp_unrestricted(run, case):
     (case.dir / "ws").mkdir(exist_ok=True)
     run.snapshot(case, "unrestricted-before")
     expect = {c: "on" for c in CATEGORIES}
+    # The runner writes the nonce nowhere until the recall turn ends, but the
+    # spawn prompt still reaches the vendor transcript and VIA's Store, which
+    # an unrestricted session can read: the recall counts only with the
+    # transcript showing no tool call in the recall turn (as in
+    # recipe_continuity, validated by a known Bash call in the spawn turn).
     nonce = "QX" + secrets.token_hex(3).upper()
-    write_json(case.dir / "unrestricted-nonce.json", {"nonce": nonce})
     try:
         session = mcp_launch(
             run, case, "unrestricted", expect, [], "unrestricted", False,
             prompt=f"Remember this code for later in our conversation: {nonce}. It is private: "
-                   "never write it to a file and never pass it to any tool. Reply with the "
-                   "single word READY. Use no tools.")
+                   "never write it to a file and never pass it to any tool. Now use the Bash "
+                   "tool to run the command `echo ready`, then reply with the single word "
+                   "READY.")
         if not session:
             return
         first = take_mcp_debug(case, "unrestricted", "unrestricted-t1")
@@ -1345,9 +1497,11 @@ def case_mcp_unrestricted(run, case):
             case.check("unrestricted-t2: resume accepted", False, t2)
             return
         completed(case, "unrestricted-t2", t2)
+        write_json(case.dir / "unrestricted-nonce.json", {"nonce": nonce})
         text = t2.get("final_text") or ""
         case.check("unrestricted-t2: conversation-only nonce recalled", nonce in text,
                    {"final_text": text})
+        check_recall_tools(run, case, "unrestricted-t2", t2, nonce)
         check_launch(case, "unrestricted-t2", launches, mode="unrestricted", session=session,
                      first=False)
         check_status(run, case, "unrestricted-t2", session, expect, [])
@@ -1640,7 +1794,8 @@ def verdict(run, cases, info, evidence):
     blocked = ("runner_error" in info or bool(info.get("cleanup_errors")) or bool(interrupted)
                or run.accounting_failed is not None or run.daemon_unverified is not None)
     passed = (stopped and version_ok and within_budget and not blocked
-              and len(records) == len(CASES) and all(record["result"] == "pass" for record in records))
+              and len(records) == len(CASES)
+              and all(record["result"] == "pass" for record in records))
     summary = {
         **info, "ended_at": utc_now(), "interrupted": interrupted,
         "vendor_versions_seen": observed, "envelopes_without_version": missing,

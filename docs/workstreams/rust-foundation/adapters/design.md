@@ -1480,7 +1480,8 @@ C1 change, not a routine addition.
      the unrestricted spawn it is `not_observable`.
    - Claude's runner (via-kr9, 2026-10-06) takes `--via`, `--evidence` (a
      new directory under `scratchpad/`), `--model` (default `haiku`),
-     `--budget-usd` (finite, above 0) and `--claude`. It writes
+     `--budget-usd` (finite, at least the 0.10 USD per-turn ceiling) and
+     `--claude`. It writes
      `summary.json` on every exit path and exits non-zero unless the run
      passes (`docs/specs/vendors/claude-code.md` §4 has its result).
    - It runs before each adapter slice merges and when a vendor ships a new
