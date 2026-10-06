@@ -356,6 +356,12 @@ a second server on the one data root (§3.2), so VIA never sets it.
 User-level sources are VIA's private, empty ones; the user's own OpenCode
 configuration is never read (§3.2; revisit R1, §14).
 
+`on` keeps C2 §6.2's meaning for every harness: the user's configuration
+applies. Here only its project-level part can, so a requested `on` is
+`unknown` for every category, instruction files and skills included, with
+`config_switch_unverified` (owner, 2026-10-06). Project loading is still
+observed (E12, E54); it does not make the state `on`.
+
 A request to turn off a category that only the switch controls is not
 applied: the session runs on the same server, its effective state is
 `unknown` (C2 §6.2: an `off` VIA cannot apply), and it carries
@@ -368,17 +374,18 @@ is a diagnostic only.
 
 | Category (OD2 default) | Requested on | Requested off |
 |---|---|---|
-| instruction files (on) | `on`: project `AGENTS.md` per location (E12, E54) | `unknown`: not applied, project files still load |
-| skills (on) | `on` (E12) | `off`: session rule `{skill,*,deny}` (§5, E12) |
+| instruction files (on) | `unknown`: project `AGENTS.md` per location loads (E12, E54); user-level instructions are private and empty | `unknown`: not applied, project files still load |
+| skills (on) | `unknown`: project skills load (E12); user-level skills are private and empty | `off`: session rule `{skill,*,deny}` (§5, E12) |
 | agents (on) | `unknown`: project agents load (source), no inventory (`/api/agent` returns `[]`, E11); VIA always runs its own `via` agent | `unknown`: not applied |
 | plugins (on) | `unknown`: project plugins load (source) | `unknown`: not applied |
 | MCP servers (off) | `unknown`: project MCP loads (source) | `unknown`: not applied; the MCP resource helpers are denied (§5) |
 | hooks (off) | `unknown`: OpenCode hooks are plugin hooks | `unknown`: not applied |
 
 Every `unknown` or differing state produces `config_switch_unverified`
-(C1 §5). With the default request a spawn warns for agents, plugins, MCP
-and hooks until L4–L5 (G18–G19) qualify what they can (§13); a request of
-instruction files off adds instruction files.
+(C1 §5). Every spawn therefore warns: with the default request for all six
+categories; L4–L5 (G18–G19, §13) qualify what loads, but cannot make a
+category `on` while user-level sources stay private. Only skills requested
+`off` is verified and drops out of the warning.
 
 ## 5. Per-session settings
 
@@ -783,7 +790,7 @@ handshake (§2.2) refuses. `describe` starts no process.
 | Usage / cost | scope `turn`, or `vendor_interval` with a compaction sample until G21; `reported` |
 | Vendor options | allow-list empty; reserved keys C2 §6.1 |
 | Vendor arguments | refused in the first release: any non-empty `vendor_args` is `invalid_params` (§2.2) |
-| Inherited configuration | project configuration always on; per-category states §4.5 |
+| Inherited configuration | project configuration always on; every category `unknown` with `config_switch_unverified`, except skills requested `off` (`off`); §4.5 |
 
 ## 13. Acceptance fixtures and live qualification
 
@@ -794,7 +801,7 @@ pinned binary and a free model.
 | Fixture | Required observation |
 |---|---|
 | OC01 handshake | URL line malformed, non-loopback, oversized, missing, exit-before-line; `/api/info` HTML, non-JSON, missing fields → incompatible, cached; `pid` mismatch, timeout, empty catalog, 5xx → transient, not cached; binary replaced at the same path clears the cache; wrong password → 401; no proxy or redirect |
-| OC02 namespace and credentials | Sessions with different inherited-configuration requests share one process and slot; instruction files requested off → same server, effective `unknown` and `config_switch_unverified`; skills off → `off` by session rule; the launch environment never has `OPENCODE_DISABLE_PROJECT_CONFIG`; private roots only; fresh namespace proceeds; known integration shape with a synthetic credential → `unexpected_credential_state`; known shape, none → proceeds; unknown shape → proceeds with `credential_state_unchecked`; Boolean scan: the synthetic value never appears in any byte VIA read; `GET /api/credential` never requested |
+| OC02 namespace and credentials | Sessions with different inherited-configuration requests share one process and slot; the default request → every category `unknown` and one `config_switch_unverified` listing all six; instruction files or skills requested on → `unknown`, never `on`; instruction files requested off → same server, `unknown`; skills off → `off` by session rule and absent from the warning; the launch environment never has `OPENCODE_DISABLE_PROJECT_CONFIG`; private roots only; fresh namespace proceeds; known integration shape with a synthetic credential → `unexpected_credential_state`; known shape, none → proceeds; unknown shape → proceeds with `credential_state_unchecked`; Boolean scan: the synthetic value never appears in any byte VIA read; `GET /api/credential` never requested |
 | OC03 full path | Live spawn/result, background/wait, events/logs on a free model; close never deletes vendor history |
 | OC04 continuity and settings | Two-turn context answer; idle retirement then reopen with one identity read; missing or mismatching ID → `resume_mismatch`, no create; reopen settings mismatch → `SettingsMismatch` → `submit_failed`/`settings_mismatch`, not cached; just-sent readback differing → `handshake_refused`, cached; variant normalization |
 | OC05 execution rule | Interrupt still in flight when the predecessor ends naturally blocks the successor (replays E51); predecessor terminal not yet on the stream blocks it; 400/404 and never-sent predecessors release it; a terminal before own delivery is not `protocol`; a vendor-originated execution racing dispatch is not the turn's; a driver reopened on the same generation (idle close, overflow) dispatches from the server-scoped state; leftover VIA input at reopen is cancelled once and revises nothing; `session_busy` after 30 s |
@@ -838,6 +845,13 @@ to turn off a category only the project switch controls is `unknown` with
 data and the free anonymous provider profile; the one-live-server fence
 stays across daemon restarts (§3.2); `vendor_args` refused (§2.2). This
 supersedes **Q2** below and decision C-1 of the C2 gap report.
+
+Decided (owner, 2026-10-06, review finding 5): `on` keeps C2 §6.2's
+meaning for every harness. Because only the project-level part of the
+user's configuration applies (user-level sources are private and empty),
+instruction files and skills requested `on` are `unknown` with
+`config_switch_unverified`; requested `off` is unchanged (instruction
+files `unknown`, skills `off` by the deny rule) (§4.5).
 
 Decided (owner, 2026-10-05): **Q2** (superseded 2026-10-06), the project
 switch follows instruction files; **Q10**, an
