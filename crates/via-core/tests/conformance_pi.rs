@@ -2412,6 +2412,10 @@ fn pi_signals_cleanup() {
     .unwrap();
 }
 
+/// Progress records that overfill the session channel (1,024 items),
+/// within Route's read-ahead (1,024 records past the hop).
+const SATURATING: usize = 1_200;
+
 /// `pi_dialog_decline` (packet §6): a dialog request with an `id` (a `-e`
 /// extension's `confirm`) and an unknown method with an `id` are each
 /// cancelled on the control lane within 5 s while Core takes no
@@ -2434,6 +2438,19 @@ fn pi_dialog_decline() {
     let mut steps = handshake(&State::default());
     steps.extend(prompt("Run a tool."));
     steps.extend(echo("Run a tool."));
+    // Review r1 #6: more progress than the session channel's 1,024 items
+    // while Core takes none, so the Adapter is blocked delivering when the
+    // dialogs come; Route still reads and declines each within 5 s.
+    let pending = assistant(json!([]), "pending", &zero_usage(), None);
+    steps.push(emit(&json!({"type": "message_start", "message": pending})));
+    steps.push(update(json!({"type": "text_start", "contentIndex": 0})));
+    for _ in 0..SATURATING {
+        steps.push(update(
+            json!({"type": "text_delta", "contentIndex": 0, "delta": "."}),
+        ));
+    }
+    steps.push(json!({"await_signal": {"signal": "SIGUSR1"}}));
+    let gate = steps.len();
     steps.push(request("ui-1", "confirm", "Allow tool?"));
     steps.push(response("ui-1"));
     steps.push(request("ui-2", "frobnicate", "Unknown"));
@@ -2463,14 +2480,40 @@ fn pi_dialog_decline() {
             "summary": "Unknown", "blocking": true},
     ]);
     wanted["observation_counts"]["vendor.request_declined"] = json!(2);
-    let expect = case("pi_dialog_decline", 1, vec![turn("Run a tool.", wanted)]);
-    // The seventh input line is the last decline: the four commands and
-    // the prompt, then three replies.
+    // Nothing lost under saturation: the deltas with their `text_start`,
+    // then the answer's `text_start`, `text_delta` and `message_end`
+    // sample.
+    wanted["observation_counts"]["progress"] = json!(SATURATING + 4);
+    let mut declined = turn("Run a tool.", wanted);
+    // At the gate, before the first dialog: the channel is full.
+    declined["gates"] = json!([{"step": gate, "expect": {"terminal": null}}]);
+    let expect = case("pi_dialog_decline", 1, vec![declined]);
+    // The seventh input line is the last decline: the three handshake
+    // commands and the prompt, then three replies.
     let knobs = Knobs {
         hold_until_read: Some(7),
         ..Knobs::default()
     };
-    check_built("pi_dialog_decline", &replay, &expect, knobs).unwrap();
+    let fences = std::cell::RefCell::new(Vec::new());
+    let outcome = drive_built(
+        "pi_dialog_decline",
+        &replay,
+        &expect,
+        knobs,
+        Box::new(|_| Ok(())),
+        Box::new(|pure: &Pure| {
+            *fences.borrow_mut() = pure.gate_fences.borrow().clone();
+            Ok(())
+        }),
+    )
+    .unwrap();
+    conformance_expect::check(&expect, &outcome).unwrap();
+    // Saturated at the gate: Route read past what the Adapter could
+    // deliver, the channel's 1,024 items taken and none handled.
+    match fences.into_inner().as_slice() {
+        [(decoded, delivered)] if *delivered >= 1_024 && decoded > delivered => {}
+        other => panic!("not saturated at the gate: (decoded, delivered) {other:?}"),
+    }
     // A dialog with no `id` cannot be answered: protocol.
     let mut run = prompt("Say READY.");
     run.extend(echo("Say READY."));
