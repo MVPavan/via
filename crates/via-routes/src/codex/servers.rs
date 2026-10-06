@@ -472,9 +472,10 @@ pub struct Servers {
     scripted: Mutex<std::collections::VecDeque<Scripted>>,
 }
 
-/// One scripted open: the connection's test stdio and message half.
+/// One scripted open: the connection's test stdio and message half, or
+/// Wire's acquisition failure.
 #[cfg(any(feature = "test-support", all(test, feature = "test-failpoints")))]
-type Scripted = (Arc<super::testing::TestStdio>, via_wire::WireMessages);
+type Scripted = Result<(Arc<super::testing::TestStdio>, via_wire::WireMessages), WireError>;
 
 /// A pin on one server: a reservation while it launches, a hold once it is
 /// live. Dropping it releases the hold; the last release retires the
@@ -1398,7 +1399,8 @@ impl Servers {
         deadline: Deadline,
     ) -> Result<(Arc<dyn Stdio>, WireMessages), WireError> {
         #[cfg(any(feature = "test-support", all(test, feature = "test-failpoints")))]
-        if let Some((stdio, messages)) = self.scripted_next() {
+        if let Some(scripted) = self.scripted_next() {
+            let (stdio, messages) = scripted?;
             stdio.hold(Box::new(spec));
             return Ok((stdio, messages));
         }
@@ -1447,8 +1449,24 @@ impl Servers {
         self.scripted
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push_back((Arc::clone(&test_stdio), pipes.messages));
+            .push_back(Ok((Arc::clone(&test_stdio), pipes.messages)));
         (super::testing::VendorEnds::new(stdout, stdin), test_stdio)
+    }
+
+    /// Queues one scripted open that fails as Host's acquisition would when
+    /// Host stops before anything of the turn was sent: nothing launched,
+    /// Host's cleanup `cleanup`.
+    pub fn script_stopped(&self, cleanup: Option<WireCleanup>) {
+        self.scripted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push_back(Err(WireError::Acquire {
+                cause: Box::new(WireError::Host(HostError::Stopped)),
+                launched: false,
+                cleanup,
+                forced: false,
+                journal_uncertain: false,
+            }));
     }
 
     /// The next scripted open, if one is queued.

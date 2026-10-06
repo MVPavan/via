@@ -962,12 +962,7 @@ impl SessionDriver {
                 let _delivered = tokio::time::timeout_at(deadline.instant(), delivered).await;
             }
             health.send_replace(DriverHealth::Closed);
-            let quiescent = match retirement {
-                Some(retirement) => {
-                    !retirement.launched || retirement.cleanup == Some(WireCleanup::Quiescent)
-                }
-                None => true,
-            };
+            let quiescent = retirement.as_ref().is_none_or(quiescent);
             CloseReport {
                 vendor_closed,
                 process_exit: retirement
@@ -1004,6 +999,17 @@ impl SessionDriver {
     #[cfg(feature = "test-failpoints")]
     pub fn report_journal_uncertain(&self) {
         self.journal.send_replace(true);
+    }
+}
+
+/// Whether a retirement's cleanup is proven: Host's explicit `Uncertain`
+/// outranks "nothing launched" (an acquisition's cleanup Host could not
+/// verify; bead via-20s), and an unlaunched one without it is clean.
+pub(crate) fn quiescent(retirement: &Retirement) -> bool {
+    match retirement.cleanup {
+        Some(WireCleanup::Quiescent) => true,
+        Some(WireCleanup::Uncertain) => false,
+        None => !retirement.launched,
     }
 }
 

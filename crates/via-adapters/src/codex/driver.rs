@@ -64,7 +64,7 @@ use super::{ADAPTER_VERSION, CodexAdapter, HARNESS, PerTurn, refusals};
 use crate::driver::turn::{CLEANUP_ALLOWANCE, end_active};
 use crate::driver::{
     Active, ConnectionPin, DriverState, ForceWatch, Prepared, Retiring, SessionDriver, TurnCx,
-    TurnSpec, latch, lock, rejected,
+    TurnSpec, latch, lock, quiescent, rejected,
 };
 use crate::harness::Harness;
 use crate::instance::Incompatibility;
@@ -604,10 +604,10 @@ impl Drop for Settle<'_> {
 }
 
 /// The session's cleanup facts after a later turn: uncertainty a turn
-/// left on the shared server is never erased by a later turn (ruling 6).
+/// left on the shared server is never erased by a later turn (ruling 6),
+/// nor is Host's `Uncertain` for an acquisition that launched nothing.
 fn sticky(earlier: Retirement, later: Retirement) -> Retirement {
-    let open = |facts: &Retirement| facts.launched && facts.cleanup != Some(WireCleanup::Quiescent);
-    let uncertain = open(&earlier) || open(&later);
+    let uncertain = !quiescent(&earlier) || !quiescent(&later);
     Retirement {
         launched: earlier.launched || later.launched,
         exit: None,

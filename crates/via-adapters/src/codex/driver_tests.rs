@@ -59,6 +59,17 @@ impl Rig {
         self.set.codex.as_ref().unwrap().servers().script().0
     }
 
+    /// Queues the next server launch's acquisition failure: Host stopped
+    /// before anything of the turn was sent, its cleanup `cleanup`.
+    fn script_stopped(&self, cleanup: Option<crate::WireCleanup>) {
+        self.set
+            .codex
+            .as_ref()
+            .unwrap()
+            .servers()
+            .script_stopped(cleanup);
+    }
+
     /// A driver of session `s_000000000001` whose identity confirmed
     /// [`THREAD`]: its first open is that thread's resume. Each call is a
     /// new driver of the same session, as Core opens a failed one's
@@ -1599,4 +1610,73 @@ async fn codex_control_races_interrupt_vs_terminal() {
         Some(crate::VendorTerminalStatus::Completed)
     );
     assert!(end.outcome.is_ok(), "{:?}", end.outcome);
+}
+
+/// Turn `number` of `driver` fails its server acquisition: Host stopped,
+/// nothing launched, Host's cleanup `cleanup` kept.
+async fn stopped_acquisition(
+    driver: &Arc<SessionDriver>,
+    number: u32,
+    cleanup: Option<crate::WireCleanup>,
+) {
+    let end = ended(run(driver, number, driver.prepare())).await;
+    match end.outcome {
+        Err(AdapterError::Route(failure)) => {
+            assert!(
+                matches!(failure.cause, RouteError::Stopped { .. }),
+                "{:?}",
+                failure.cause
+            );
+            assert!(!failure.launched, "nothing of the turn was sent");
+            assert_eq!(failure.cleanup, cleanup, "Host's cleanup is kept");
+        }
+        other => panic!("not the acquisition's failure: {other:?}"),
+    }
+}
+
+/// The session's close report, within 5 s.
+async fn closed(driver: &Arc<SessionDriver>) -> crate::CloseReport {
+    let deadline = Deadline::at(Instant::now() + Duration::from_secs(5));
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        driver.close(crate::CloseMode::Graceful, deadline),
+    )
+    .await
+    .expect("the close ended")
+}
+
+/// Bead via-20s (review r2 #1): Host reported an acquisition's cleanup
+/// `Uncertain` before anything of the turn was sent; the session's close
+/// keeps it, as an explicit `Uncertain` outranks "nothing launched".
+#[tokio::test]
+async fn an_uncertain_acquisition_survives_the_close() {
+    let rig = Rig::new();
+    rig.script_stopped(Some(crate::WireCleanup::Uncertain));
+    let (driver, _observations) = rig.driver();
+    stopped_acquisition(&driver, 1, Some(crate::WireCleanup::Uncertain)).await;
+    assert_eq!(closed(&driver).await.cleanup, crate::Cleanup::Uncertain);
+}
+
+/// Bead via-20s (review r2 #1): a later turn's quiescent retirement never
+/// erases an earlier acquisition's `Uncertain` cleanup (the sticky merge).
+#[tokio::test]
+async fn an_uncertain_acquisition_survives_a_later_turn() {
+    let rig = Rig::new();
+    rig.script_stopped(Some(crate::WireCleanup::Uncertain));
+    rig.script_stopped(None);
+    let (driver, _observations) = rig.driver();
+    stopped_acquisition(&driver, 1, Some(crate::WireCleanup::Uncertain)).await;
+    stopped_acquisition(&driver, 2, None).await;
+    assert_eq!(closed(&driver).await.cleanup, crate::Cleanup::Uncertain);
+}
+
+/// The contrast: an acquisition Host proved clean (no group could exist)
+/// still closes quiescent.
+#[tokio::test]
+async fn a_clean_acquisition_closes_quiescent() {
+    let rig = Rig::new();
+    rig.script_stopped(None);
+    let (driver, _observations) = rig.driver();
+    stopped_acquisition(&driver, 1, None).await;
+    assert_eq!(closed(&driver).await.cleanup, crate::Cleanup::Quiescent);
 }
