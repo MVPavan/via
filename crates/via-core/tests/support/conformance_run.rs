@@ -1345,16 +1345,11 @@ impl<'a> Run<'a> {
             .terminal
             .as_ref()
             .and_then(|terminal| terminal.usage.as_ref())
-            .map(|sample| {
-                let mut usage = usage_sample(sample);
-                usage["from"] = json!("terminal");
-                usage["scope"] = json!(session.plan.capabilities.usage.tokens);
-                usage
-            });
+            .map(|sample| terminal_usage(sample, &session.plan.capabilities.usage.tokens));
         // A server route's terminal carries no usage: Core sums its samples
         // (x.3.2 X3).
         if outcome.usage.is_none() && session.plan.server_key.is_some() {
-            outcome.usage = sampled_usage(observed, &session.plan);
+            outcome.usage = sampled_usage(observed, &session.plan.capabilities.usage.tokens);
         }
         outcome.cleanup = Some(cleanup.to_owned());
         outcome.instance = end.instance.as_ref().map(|instance| {
@@ -1873,7 +1868,10 @@ fn terminal(terminal: &VendorTerminal) -> Value {
         "steps": terminal.steps,
         "cost": match &terminal.cost {
             Some(cost) => json!({"usd": number(cost.usd), "scope": cost.scope,
-                "provenance": "reported"}),
+                "provenance": match cost.provenance {
+                    via_adapters::CostProvenance::Reported => "reported",
+                    via_adapters::CostProvenance::Estimated => "estimated",
+                }}),
             None => json!({"usd": null, "provenance": "unavailable"}),
         },
         "vendor": raw(terminal.vendor.as_deref()),
@@ -1893,44 +1891,78 @@ fn number(value: f64) -> Value {
     if exact { json!(whole) } else { json!(value) }
 }
 
-/// A server route's turn usage when its terminal carries none: the sum
-/// of its keyless progress samples (C2 §5 AD6; Codex's samples are
-/// keyless), as Core figures it (x.3.2 X3). `None` without a sample.
-fn sampled_usage(observed: &[Value], plan: &RoutePlan) -> Option<Value> {
-    const FIELDS: [&str; 5] = [
-        "input_tokens",
-        "cached_input_tokens",
-        "output_tokens",
-        "reasoning_output_tokens",
-        "total_tokens",
+/// A server route's turn usage when its terminal carries none, as Core's
+/// ledger figures it (C2 §5 AD6, x.3.2 X3): a keyed progress sample
+/// replaces the key's earlier one, a keyless one adds, a component is
+/// `null` if any counted sample lacks it, and one sample whose interval
+/// was unverified makes the scope `vendor_interval`. `None` without a
+/// sample. Core's 1,024-key overflow is not modelled.
+fn sampled_usage(observed: &[Value], scope: &str) -> Option<Value> {
+    const FIELDS: [(&str, &str); 5] = [
+        ("input", "input_tokens"),
+        ("cached_input", "cached_input_tokens"),
+        ("output", "output_tokens"),
+        ("reasoning_output", "reasoning_output_tokens"),
+        ("total", "total_tokens"),
     ];
-    let samples: Vec<&Value> = observed
+    let mut counted: Vec<&Value> = Vec::new();
+    let mut keys: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut unverified = false;
+    for sample in observed
         .iter()
         .filter(|observation| observation["kind"] == "progress")
         .map(|observation| &observation["usage"])
         .filter(|usage| !usage.is_null())
-        .collect();
-    if samples.is_empty() {
+    {
+        unverified |= sample["interval_unverified"] == true;
+        match sample["key"].as_str() {
+            Some(key) if keys.contains_key(key) => counted[keys[key]] = sample,
+            Some(key) => {
+                keys.insert(key, counted.len());
+                counted.push(sample);
+            }
+            None => counted.push(sample),
+        }
+    }
+    if counted.is_empty() {
         return None;
     }
-    let mut usage = json!({"from": "samples", "scope": plan.capabilities.usage.tokens});
-    for field in FIELDS {
-        let sum = samples
+    let scope = if unverified { "vendor_interval" } else { scope };
+    let mut usage = json!({"from": "samples", "scope": scope});
+    for (field, name) in FIELDS {
+        let sum = counted
             .iter()
             .map(|sample| sample[field].as_u64())
             .sum::<Option<u64>>();
-        usage[field] = json!(sum);
+        usage[name] = json!(sum);
     }
     Some(usage)
 }
 
-fn usage_sample(sample: &via_adapters::UsageSample) -> Value {
+/// A turn aggregate as the route's figure under its declared `scope`, or
+/// `vendor_interval` when its interval was unverified (C2 §5).
+fn terminal_usage(sample: &via_adapters::UsageSample, scope: &str) -> Value {
     json!({
+        "from": "terminal",
+        "scope": if sample.interval_unverified { "vendor_interval" } else { scope },
         "input_tokens": sample.input,
         "cached_input_tokens": sample.cached_input,
         "output_tokens": sample.output,
         "reasoning_output_tokens": sample.reasoning_output,
         "total_tokens": sample.total,
+    })
+}
+
+/// A progress sample in C2 `UsageSample`'s names, as the checker states it.
+fn usage_sample(sample: &via_adapters::UsageSample) -> Value {
+    json!({
+        "key": sample.key,
+        "input": sample.input,
+        "cached_input": sample.cached_input,
+        "output": sample.output,
+        "reasoning_output": sample.reasoning_output,
+        "total": sample.total,
+        "interval_unverified": sample.interval_unverified,
     })
 }
 
@@ -2110,4 +2142,96 @@ impl Drop for Release {
             let _ = fs::write(release, b"");
         }
     }
+}
+
+/// Slice A critical #3 (C1 §5 `cost.provenance`): the runner reports the
+/// adapter's own cost provenance, never a fixed one.
+#[test]
+fn runner_reports_the_adapters_cost_provenance() {
+    for (provenance, word) in [
+        (via_adapters::CostProvenance::Reported, "reported"),
+        (via_adapters::CostProvenance::Estimated, "estimated"),
+    ] {
+        let vendor = VendorTerminal {
+            at: tokio::time::Instant::now(),
+            status: VendorTerminalStatus::Completed,
+            stop_reason: StopReason::EndTurn,
+            vendor_stop_reason: "stop".to_owned(),
+            vendor_code: None,
+            class_hint: None,
+            detail: None,
+            structured_output: None,
+            structured_output_unparsed: None,
+            steps: None,
+            usage: None,
+            cost: Some(via_adapters::CostReport {
+                usd: 0.5,
+                scope: "turn".to_owned(),
+                provenance,
+            }),
+            vendor: None,
+        };
+        assert_eq!(
+            terminal(&vendor)["cost"],
+            json!({"usd": 0.5, "scope": "turn", "provenance": word})
+        );
+    }
+}
+
+/// Slice A critical #4 (C2 §5 AD6, as Core's ledger figures it): a keyed
+/// sample replaces the key's earlier one, a keyless one adds, and one
+/// unverified sample makes the scope `vendor_interval`; so does an
+/// unverified terminal aggregate.
+#[test]
+fn runner_usage_follows_the_ledger_rules() {
+    let sample = |key: Option<&str>, total: u64, interval_unverified: bool| {
+        json!({"kind": "progress", "usage": usage_sample(&via_adapters::UsageSample {
+            key: key.map(str::to_owned),
+            input: Some(total),
+            total: Some(total),
+            interval_unverified,
+            ..via_adapters::UsageSample::default()
+        })})
+    };
+    let mut observed = vec![
+        sample(Some("a"), 10, false),
+        sample(None, 5, false),
+        sample(Some("a"), 20, false),
+        json!({"kind": "final_text", "text": "t"}),
+    ];
+    let usage = sampled_usage(&observed, "turn").unwrap();
+    assert_eq!(
+        (
+            &usage["total_tokens"],
+            &usage["input_tokens"],
+            &usage["scope"]
+        ),
+        (&json!(25), &json!(25), &json!("turn")),
+        "{usage}"
+    );
+    assert!(usage["cached_input_tokens"].is_null(), "{usage}");
+    observed.push(sample(Some("b"), 1, true));
+    observed.push(sample(Some("b"), 2, false));
+    let usage = sampled_usage(&observed, "turn").unwrap();
+    assert_eq!(
+        (&usage["total_tokens"], &usage["scope"]),
+        (&json!(27), &json!("vendor_interval")),
+        "sticky once seen: {usage}"
+    );
+    assert_eq!(sampled_usage(&observed[3..4], "turn"), None);
+
+    let aggregate = |interval_unverified| via_adapters::UsageSample {
+        total: Some(9),
+        interval_unverified,
+        ..via_adapters::UsageSample::default()
+    };
+    let usage = terminal_usage(&aggregate(false), "turn");
+    assert_eq!(
+        (&usage["from"], &usage["scope"], &usage["total_tokens"]),
+        (&json!("terminal"), &json!("turn"), &json!(9))
+    );
+    assert_eq!(
+        terminal_usage(&aggregate(true), "turn")["scope"],
+        "vendor_interval"
+    );
 }
