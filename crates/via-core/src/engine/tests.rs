@@ -6944,8 +6944,9 @@ fn a_recovered_envelope_keeps_the_turns_instance() {
 /// Slice A critical review #1 (C2 §4, C1 §5): a turn whose own adapter
 /// warning of C1's closed list committed before the daemon crashed, ahead
 /// of its `turn.ended`, keeps that code on its recovered envelope, once,
-/// with VIA's message and the event's data. Another code, and another
-/// turn's warning, stay events only.
+/// with VIA's message and the event's data. A code outside the list, a
+/// Core-owned code, a late warning and another turn's warning stay events
+/// only (slice A critical r2, minor).
 #[test]
 fn a_recovered_envelope_keeps_the_turns_closed_list_warnings() {
     let Some(root) = child("a_recovered_envelope_keeps_the_turns_closed_list_warnings") else {
@@ -6955,9 +6956,11 @@ fn a_recovered_envelope_keeps_the_turns_closed_list_warnings() {
         let session = {
             let earlier = open(&root);
             let session = new_session(&earlier).await;
+            // Turn 2, queued behind turn 1: the other turn of a warning.
+            resume(&earlier, &session, None).await;
             let at = rfc3339(std::time::SystemTime::now());
             let submitted = Event {
-                seq: 2,
+                seq: 3,
                 session_id: &session,
                 turn: Some(1),
                 late: false,
@@ -6975,18 +6978,29 @@ fn a_recovered_envelope_keeps_the_turns_closed_list_warnings() {
                 })
                 .await
                 .unwrap();
+            // (code, data, the event's turn, late)
             let warnings = [
-                ("credential_state_unchecked", None),
-                ("credential_state_unchecked", Some(json!({"second": true}))),
-                ("vendor_specific", None),
-                ("deprecated", Some(json!({"k": "v"}))),
+                ("credential_state_unchecked", None, 1, false),
+                (
+                    "credential_state_unchecked",
+                    Some(json!({"second": true})),
+                    1,
+                    false,
+                ),
+                ("vendor_specific", None, 1, false),
+                ("deprecated", Some(json!({"k": "v"})), 1, false),
+                // Core raises this one itself, never from an adapter.
+                ("observations_lost", None, 1, false),
+                // Closed-list codes, but late or another turn's.
+                ("structured_output_missing", None, 1, true),
+                ("instructions_partial", None, 2, false),
             ];
-            for (seq, (code, data)) in (3..).zip(warnings) {
+            for (seq, (code, data, owner, late)) in (4..).zip(warnings) {
                 let event = Event {
                     seq,
                     session_id: &session,
-                    turn: Some(1),
-                    late: false,
+                    turn: Some(owner),
+                    late,
                     at: &at,
                     body: EventBody::warning(code, "the vendor's own words", data),
                 }

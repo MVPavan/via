@@ -99,7 +99,8 @@
 //! launched or no exit was reported), `cleanup`, `journal_uncertain`, and
 //! `group_absent`: whether Host `GroupAbsent` evidence for the connection's
 //! own group backs the cleanup. `terminal.cost` is C1's cost member: a
-//! vendor cost gives `{usd, scope, provenance: "reported"}`; none gives
+//! vendor cost gives `{usd, scope, provenance}` with the adapter's
+//! `CostReport.provenance`, `"reported"` or `"estimated"`; none gives
 //! `{usd: null, provenance: "unavailable"}`. `instance` is
 //! `TurnEnd.instance`: `{vendor_version, version_status}` or null.
 //!
