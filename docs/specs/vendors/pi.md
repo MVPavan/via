@@ -272,9 +272,18 @@ prefixed every bash call (E37). Pi also loads its `SYSTEM.md`, `models.json`
 and resource directories (E64), and even `pi --version` touches it (E00).
 
 So VIA uses `<vendor_state_dir>/pi/agent` (a managed 0700 directory,
-runtime §6.1). The owner logged Pi in there once
-(`PI_CODING_AGENT_DIR=… pi`, then `/login`); Pi wrote its own `auth.json`
-(OpenAI, OAuth) and reads it on every turn (E49). VIA never reads, copies or
+runtime §6.1). The owner logs Pi in there once. First create the directory
+and its missing ancestors 0700, for example
+`(umask 077 && mkdir -p ~/.via/state/vendor/pi/agent)` for the default
+state (running a `via` command first is not enough: the daemon creates its
+state directory, not `vendor/pi/agent`). Then run
+`PI_CODING_AGENT_DIR=<that directory> pi` and `/login`. The order matters:
+Pi creates missing directories under the default umask, so letting it
+create them leaves them 0755, and VIA then refuses the state (a daemon
+start fails "unsafe VIA managed directory", and §4.3 refuses the profile).
+`mkdir -m 700 -p` alone is not enough: it sets the mode of the last
+directory only. Pi writes its own `auth.json` (OpenAI, OAuth) and reads it
+on every turn (E49). VIA never reads, copies or
 logs credentials; this follows Claude's precedent (the vendor reads its own
 login).
 
@@ -640,8 +649,10 @@ own group. Every bash tool runs in its own detached session and group (E31,
 source `bash.js`), so group absence proves nothing about tools, as with
 Claude's Bash (Claude §7). Pi kills tracked tool groups on abort, EOF,
 SIGTERM and SIGHUP (E31). Tools that escape (`setsid`, or any tool after a
-SIGKILL of Pi) are leftovers (C2 §4.2), found through the inherited marker
-(E32).
+SIGKILL of Pi) are leftovers (C2 §4.2), to be found through the inherited
+marker (E32). **Not implemented yet** (via-daz, shared with Claude): no
+leftover scan runs, so every Pi envelope carries `leftovers: null` and an
+escaped tool is not reported.
 
 **Recover:** unsupported, as Claude: `Unknown`, or `Dead` only with
 Host-confirmed death; no resend.

@@ -2626,9 +2626,10 @@ fn pi_eof_is_stop() {
 /// `pi_signals_cleanup` (packet §7.2-7.3): the daemon force stops Pi's
 /// group with `SIGTERM` (the fake takes it and exits 143, as Pi's handler
 /// does; a `SIGINT` would fail the replay); a startup that never answers
-/// is bounded by the turn's deadline and the group stop. The leftover scan
-/// of escaped tools is Core's (C2 §4.2): the launch environment carries
-/// Host's marker, which the launch recipe's unit tests pin.
+/// is bounded by the turn's deadline and the group stop. Escaped tools are
+/// not checked here: no leftover scan is implemented yet (via-daz), so
+/// envelopes carry `leftovers: null`; the launch environment carries Host's
+/// marker such a scan would find, which the launch recipe's unit tests pin.
 #[test]
 fn pi_signals_cleanup() {
     let mut steps = handshake(&State::default());
