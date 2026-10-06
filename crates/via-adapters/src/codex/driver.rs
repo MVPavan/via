@@ -1772,7 +1772,6 @@ async fn join(
     let turn = facts.number;
     let driver = facts.driver;
     let adapter = &facts.session.adapter;
-    let mut launched_on = None;
     let pin = match prepared {
         Prepared::Pinned(ConnectionPin {
             server: Some(pin), ..
@@ -1808,10 +1807,7 @@ async fn join(
                 (recipe.process_spec(owner), handshake_bound(&home)),
                 capacity,
             ) {
-                Ok(pin) => {
-                    launched_on = Some(home);
-                    pin
-                }
+                Ok(pin) => pin,
                 Err(failure) => {
                     return Err(Box::new(launch_failed(facts, &failure.into())));
                 }
@@ -1826,9 +1822,9 @@ async fn join(
     };
     match pin.ready(ordered).await {
         Ok(()) => {
-            if let Some(home) = launched_on {
-                mark_initialized(&home);
-            }
+            // Whichever waiter sees the server ready, launcher, joiner or
+            // pinned, marks its home (review cfix-crit minor).
+            mark_initialized(&adapter.vendor_home());
             Ok(pin)
         }
         Err(Some(failure)) => Err(Box::new(launch_failed(facts, &failure))),
