@@ -20,7 +20,8 @@ use crate::plan::{
 /// Versions the maintainers' live check passed (C2 §5): the 2026-09-30
 /// re-probe's, the 2026-10-05 live round's and 2.1.290's live run 4 of
 /// 2026-10-06 (Haiku: default and restricted spawn/resume, passthrough
-/// spawn/resume; packet §3).
+/// spawn/resume, a cancel during a running Bash tool then a resume;
+/// packet §3, §4).
 pub(crate) const CHECKED: &[&str] = &["2.1.285", "2.1.289", "2.1.290"];
 
 /// The efforts `--effort` accepts (packet §4, help 2.1.285). Claude ignores

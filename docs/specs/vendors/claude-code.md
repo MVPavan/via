@@ -134,7 +134,8 @@ default. Check init `claude_code_version` on every launch, parsing the
 complete version including any prerelease/build qualifier, never guessed from
 an executable filename. A version in the adapter's `checked` set (versions the
 maintainers' cheap live check passed: 2.1.285, from the live round of
-2026-10-05 2.1.289, and from run 4 of 2026-10-06 2.1.290) is `tested`;
+2026-10-05 2.1.289, and from run 4 of 2026-10-06 2.1.290, its cancel
+case included, §4) is `tested`;
 any other is `untested`,
 with warning `vendor_version_untested`, and proceeds. Only a failed handshake
 check on something VIA relies on (`interrupt_receipt_v1`, the permission-mode
@@ -402,6 +403,15 @@ VIA state directory, gitignored evidence in
 - Reserved flag: a spawn with `-- --permission-mode=default` was refused
   `invalid_params`, kind2 `vendor_option_conflict`, `data.field`
   `vendor_args`, before any launch. No session was created.
+- Cancel (restricted mode, fresh state directory, evidence in `cancel/`):
+  a turn ran one long foreground Bash tool, a python sleep that was its own
+  process-group leader (as in c7, §7). `via cancel --wait` was issued while
+  the tool ran. The turn ended `cancelled`, `stop_reason: interrupted`,
+  cancel outcome `acknowledged`, cleanup `quiescent`, settled 1.2 s after
+  the request, with no leftovers. Afterwards neither the vendor process nor
+  the sleep was running (checked by name). A resume of the same session
+  then completed. This matches §3's `cancel: partial:
+  aborts_tools_then_result` and §7.
 
 ## 5. Typed stream and normalizer
 
