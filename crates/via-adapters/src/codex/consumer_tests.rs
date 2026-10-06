@@ -1727,6 +1727,74 @@ fn r1_5_one_stall_deadline_covers_a_message() {
     });
 }
 
+/// Vendor turn `named`'s per-call usage sample of `tokens` input tokens.
+#[cfg(feature = "test-failpoints")]
+fn token_usage(named: &str, tokens: u64) -> Value {
+    let last = json!({"totalTokens": tokens, "inputTokens": tokens, "cachedInputTokens": 0,
+        "outputTokens": 0, "reasoningOutputTokens": 0});
+    json!({"method": "thread/tokenUsage/updated", "params": {"threadId": THREAD,
+        "turnId": named, "tokenUsage": {"total": last, "last": last}}})
+}
+
+/// C2 §5 (picrit round 4): a usage sample lost while an interrupted
+/// terminal drains leaves the turn unaccounted. B delivers a 100-token
+/// sample, then its interrupted terminal is retained with a tool open;
+/// a second sample read while it drains stalls in the full sink (stall
+/// 400 ms), so the registration fails and the seal is partial. The
+/// retained terminal does not make the delivered sum the turn's: the
+/// predicate is false. Before the fix the retained terminal exempted the
+/// partial delivery.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_sample_lost_while_draining_unaccounts_the_turn() {
+    const NAME: &str =
+        "codex::delivery::consumer_tests::a_sample_lost_while_draining_unaccounts_the_turn";
+    if std::env::var_os("VIA_TEST_EVENT_STALL_MS").is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture"])
+            .env("VIA_TEST_EVENT_STALL_MS", "400")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let mut fixture = Fixture::new();
+        let b = fixture.start(2);
+        fixture.reply(2, Some(B));
+        fixture.push(message(&token_usage(B, 100), 5, (Some(B), Some(2))));
+        fixture.push(message(&tool_started(B, "tool-b"), 6, (Some(B), Some(2))));
+        fixture.push(message(&completed(B, "interrupted"), 7, (Some(B), Some(2))));
+        fixture.settle().await;
+        assert!(b.delivery.draining().is_some(), "the terminal drains");
+        fixture.observed();
+        let full = fixture.cap.fill_budget().unwrap();
+        fixture.push(message(&token_usage(B, 50), 8, (Some(B), Some(2))));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while fixture.registration.failure().is_none() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let sealed = b.delivery.seal();
+        assert!(sealed.terminal.is_some(), "the terminal stays retained");
+        assert!(
+            !super::super::driver::accounted(
+                super::super::driver::Cut::Decided,
+                &sealed,
+                (&fixture.lane, &fixture.registration),
+            ),
+            "a lost sample left the delivered sum standing as the turn's usage"
+        );
+        drop(full);
+    });
+}
+
 /// A message of B's, mapped, read now: the item and its read instant.
 fn of_b(line: &Value, seq: u64, owner: Option<u32>) -> (LaneItem, Instant) {
     let routed = routed(line, seq, (Some(B), owner));

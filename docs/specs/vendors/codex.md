@@ -741,13 +741,19 @@ turn's usage has `scope:"turn"`. `total`, `cacheWriteInputTokens` and
 `modelContextWindow` go to `vendor`. Missing data is unavailable, not zero.
 Cost remains `usd:null, provenance:"unavailable"`; no price estimation.
 Codex reports no turn aggregate (`total` is the thread's), so the sum is the
-turn's only while delivery lost none of its samples. Where it can have lost
-one (the lane's overflow, a failed connection task with messages staged,
-messages dropped after the lane was cut off, a message only partly
-delivered, or anything the seal left undelivered at a cutoff but the
-terminal), the turn's end carries the all-`null` aggregate, on its retained
-terminal or on `TurnEnd.aggregate` (C2 §5). A connection loss or a stop
-drops nothing the turn received, so its delivered samples are still summed.
+turn's usage only when it is provably whole: the turn retained its terminal
+and no daemon force dropped it; the connection did not fail before the
+cutoff and the lane never overflowed; the turn's delivery was neither cut
+mid-message nor stopped; and, unless delivery decided at the terminal,
+nothing was dropped, left in the lane or outstanding at the cutoff and the
+registration did not fail. Anything else (an uncorrelated or malformed
+message failing the connection, a connection loss, a stall while an
+interrupted terminal drains, an overflow) gives the all-`null` aggregate,
+on the retained terminal or on `TurnEnd.aggregate` (C2 §5): a lost
+connection can have lost a sample, so its delivered sum is unverified. A
+cancelled or interrupted turn whose terminal was retained and whose
+delivery was whole is still summed; an end before acceptance carries no
+aggregate.
 
 Target capability after the corresponding fixture/live gates: spawn,
 stored-conversation resume, cancel and detach-close native; steer
@@ -777,6 +783,7 @@ time; retain raw-span evidence for every scenario.
 | `codex_bounds_overflow` | Exact boundary/excess messages, JSON depth/nodes and item ledger. Fill A's Route ingress lane then send one extra A event: observe immediate per-thread overflow/quarantine, original correlation and no spill allocation. Before advancing fake time to 10 s, deliver B's terminal and a control response; both must complete. Repeat with old A already immutable/uncertain and successor A2 active: old A's late tool flood triggers sticky loss for A2, A2 resolves before its wall deadline, A stays immutable, same-thread dispatch closes and B/control progress. Race A2 acceptance with quarantine and assert the same outcome. Separately fill only C2 observations with no further ingress: no early Route overflow, C2 stalls at 10 s. Continued A flood is read, counted and discarded within bounds, with the normalized loss explicit and no copy of the discarded traffic. Exhaust reserved metadata/health or global budget separately and assert explicit shared-connection failure; measure memory and blast radius. |
 | `codex_usage_snapshot` | Keyless `last` samples sum to the turn's usage (20522 + 20613), scope `turn`; `total` and cache-write counts go to `vendor`; wrong-turn usage does not attach; missing cost/counts stay unavailable. |
 | `codex_overflow_before_the_second_sample` | One sample delivered, then the lane overflows before the second: `overflow`, all-`null` tokens, never the first sample's 100. |
+| `codex_uncorrelated_usage_fails_the_connection` | A delivered sample, then a `thread/tokenUsage/updated` with no `turnId` fails the connection: `protocol`, all-`null` tokens, never the delivered 100. The consumer test `a_sample_lost_while_draining_unaccounts_the_turn` covers a sample stalled while an interrupted terminal drains. |
 | `codex_server_close` | Idle retirement closes stdin, then S1's hard stop; a C1 close of one session only unsubscribes and never closes stdin; both give `leftovers: null`. |
 | `codex_server_recovery` | Stdin EOF/server crash affects all live leases; lease release alone does not kill; verified Host group evidence is separate from unknown submission; restart issues no start/resume for uncertain live turns. |
 

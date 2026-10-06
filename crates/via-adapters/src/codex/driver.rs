@@ -55,7 +55,7 @@ use via_routes::{Retirement, SendOutcome, StoreFailure, WireCleanup};
 
 use super::delivery::{
     Admission, CONTRADICTED, Delivery, Evidence, Folders, LossRecord, Losses, Normalizing,
-    Registration, Retained, ServerEvidence, StartCx, Stop, UNDECODED, UNKNOWN,
+    Registration, Retained, Sealed, ServerEvidence, StartCx, Stop, UNDECODED, UNKNOWN,
     losses as lock_losses,
 };
 use super::normalize::{self, DiscoveredModel, StructuredOutput};
@@ -2659,6 +2659,45 @@ pub(super) enum Cut {
     Detach,
 }
 
+/// C2 §5, the one accounting rule (picrit round 4): Codex reports no turn
+/// aggregate (`total` is the thread's), so the turn's summed per-call
+/// `last` samples are its usage only when the sum is provably whole:
+/// - the turn retained its terminal, and no daemon force dropped it;
+/// - the connection did not fail before the cutoff (`LossDeadline`) and
+///   the lane never overflowed;
+/// - every observation of the turn was delivered: no partial seal and no
+///   stop of its delivery (a lane end, a failed generation or task);
+/// - unless delivery decided at the terminal, nothing more of the turn
+///   can have been lost either: no lane end, no registration failure,
+///   nothing dropped and nothing left in the lane or outstanding at the
+///   cutoff. A decided delivery took the whole turn in order through its
+///   terminal, so what the lane holds or loses after it is later traffic;
+///   a failure before it would have stopped the turn's delivery instead.
+///
+/// Anything else (an uncorrelated or malformed message failing the
+/// connection, a connection loss, a stall while the terminal drains, an
+/// overflow) leaves the tokens unavailable: the all-null aggregate, with
+/// a terminal or without one.
+pub(super) fn accounted(
+    cut: Cut,
+    sealed: &Sealed,
+    (lane, registration): (&Lane, &Registration),
+) -> bool {
+    let rest_whole = || {
+        lane.ended().is_none()
+            && lane.dropped() == 0
+            && lane.front_seq().is_none()
+            && registration.outstanding().is_none()
+            && registration.failure().is_none()
+    };
+    !matches!(cut, Cut::Forced | Cut::Overflow | Cut::LossDeadline)
+        && !lane.overflowed_now()
+        && sealed.terminal.is_some()
+        && !sealed.partial
+        && sealed.stop.is_none()
+        && (cut == Cut::Decided || rest_whole())
+}
+
 /// The cutoff a turn's wait finds already reached as it resumes: the
 /// daemon force before the delivery's decision (X0 §13.2: the force's
 /// disposition stands even with a retained terminal; x.3.2 X3 fix r2 #5),
@@ -2808,16 +2847,7 @@ fn settle_turn(
     } else {
         WireCleanup::Quiescent
     });
-    // C2 §5 (picrit round 3): delivery can have lost one of the turn's
-    // call samples (Codex `last`; Codex reports no turn aggregate, only
-    // the thread's cumulative `total`): the overflow, a connection task
-    // that failed with messages staged, messages dropped after the lane
-    // was cut off, or anything the seal left undelivered at a cutoff but
-    // the terminal. The turn's tokens are then unavailable, with a
-    // terminal or without one.
-    let samples_lost = overflowed
-        || lane.dropped() > 0
-        || (!terminal_decided && (undelivered || abnormal || cut == Cut::LossDeadline));
+    let whole = accounted(cut, &sealed, (lane, registration));
     let mut end = 'end: {
         let uncertain = |cause| facts.failure(cause, None, None);
         if cut == Cut::Forced {
@@ -2880,7 +2910,7 @@ fn settle_turn(
             }
         }
     };
-    if samples_lost {
+    if !whole {
         unaccounted(&mut end);
     }
     end

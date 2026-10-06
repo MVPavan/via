@@ -1739,7 +1739,8 @@ fn codex_pin_handshake() {
 fn failed_after_acceptance(expect: &mut Value, error: &str, cleanup: &str) {
     let turn = &mut turn_mut(expect, 0)["expect"];
     turn["terminal"] = Value::Null;
-    turn["usage"] = Value::Null;
+    // No terminal: the delivered sum is unverified (C2 §5, picrit round 4).
+    turn["usage"] = unavailable();
     turn["final_text"] = Value::Null;
     turn["error"] = json!(error);
     turn["cleanup"] = json!(cleanup);
@@ -1968,8 +1969,8 @@ fn codex_start_order() {
     cut_after(&mut replay, completed, &[sigterm()]).unwrap();
     let mut expect = malformed;
     expect["source"] = replay["source"].clone();
-    // Delivery lost nothing the turn received: its samples are summed.
-    turn_mut(&mut expect, 0)["expect"]["usage"] = base["usage"].clone();
+    // The connection failed before the terminal: the delivered sum is
+    // unverified (C2 §5, picrit round 4), as for the malformed variant.
     // A connection-wide failure keeps its Route path: the stopped server
     // proves the turn's cleanup.
     turn_mut(&mut expect, 0)["expect"]["cleanup"] = json!("quiescent");
@@ -2292,13 +2293,8 @@ fn codex_malformed_evidence_owner() {
         .unwrap();
         let turn = &mut turn_mut(&mut expect, 1)["expect"];
         turn["terminal"] = Value::Null;
-        turn["usage"] = if owner == "evidence/servers/" {
-            // Delivery stopped mid-message: a call sample can have been
-            // lost, so the tokens are unavailable (C2 §5).
-            unavailable()
-        } else {
-            Value::Null
-        };
+        // No terminal: the delivered sum is unverified (C2 §5).
+        turn["usage"] = unavailable();
         turn["final_text"] = Value::Null;
         turn["error"] = json!("protocol");
         // The generation fails: the turn's cleanup is never its surviving
@@ -3189,13 +3185,9 @@ fn codex_exhaustion_fails_the_shared_connection() {
         turn["stop"] = Value::Null;
         let turn = &mut turn["expect"];
         turn["terminal"] = Value::Null;
-        // A's overflow can have dropped a call sample (C2 §5); B's
-        // connection loss drops nothing it received.
-        turn["usage"] = if index == 0 {
-            unavailable()
-        } else {
-            Value::Null
-        };
+        // A's overflow can have dropped a call sample, and B lost its
+        // connection before its terminal: unverified sums (C2 §5).
+        turn["usage"] = unavailable();
         turn["final_text"] = Value::Null;
         turn["error"] = json!("overflow");
         // A's delivery stopped at its overflow: what was dropped proves
@@ -3339,7 +3331,8 @@ fn codex_over_cap_line_fails_the_shared_connection() {
         turn["stop"] = Value::Null;
         let turn = &mut turn["expect"];
         turn["terminal"] = Value::Null;
-        turn["usage"] = Value::Null;
+        // The connection failed before the terminal (C2 §5).
+        turn["usage"] = unavailable();
         turn["final_text"] = Value::Null;
         turn["error"] = json!("protocol");
         // The end is the connection's loss, whose evidence is Host's stop
@@ -3955,7 +3948,6 @@ fn unavailable() -> Value {
 
 /// One `thread/tokenUsage/updated` of the plain turn: `last` is one model
 /// call's sample of `total_tokens`, all of them input.
-#[cfg(feature = "test-failpoints")]
 fn token_usage(total_tokens: u64) -> Value {
     let last = json!({"totalTokens": total_tokens, "inputTokens": total_tokens,
         "cachedInputTokens": 0, "cacheWriteInputTokens": 0, "outputTokens": 0,
@@ -3965,6 +3957,43 @@ fn token_usage(total_tokens: u64) -> Value {
         "turnId": TURN, "tokenUsage": {"total": last, "last": last,
         "modelContextWindow": 258_400}}}),
     )
+}
+
+/// C2 §5 (picrit round 4): a delivered 100-token sample, then the next
+/// call's `thread/tokenUsage/updated` names no turn: its correlation
+/// fails, so the whole connection fails `protocol` before routing it and
+/// Host stops the server. The turn retained no terminal, so its usage is
+/// unavailable, never the delivered 100 tokens. Before the fix the sum
+/// stood as the turn's.
+#[test]
+fn codex_uncorrelated_usage_fails_the_connection() {
+    let name = "codex_uncorrelated_usage_fails_the_connection";
+    let (mut replay, mut expect) = plain(name).unwrap();
+    let started = step_with(&replay, "\"method\":\"turn/started\"").unwrap();
+    let mut uncorrelated = token_usage(50);
+    let line = uncorrelated["emit"]["line"].as_str().unwrap().to_owned();
+    let mut parsed: Value = serde_json::from_str(&line).unwrap();
+    if let Some(params) = parsed["params"].as_object_mut() {
+        params.remove("turnId");
+    }
+    uncorrelated = emit(&parsed);
+    let tail = vec![
+        token_usage(100),
+        // Delivered before the connection fails.
+        json!({"delay": {"ms": 300}}),
+        uncorrelated,
+        sigterm(),
+    ];
+    cut_after(&mut replay, started, &tail).unwrap();
+    failed_after_acceptance(&mut expect, "protocol", "quiescent");
+    let turn = &mut turn_mut(&mut expect, 0)["expect"];
+    turn["usage"] = unavailable();
+    // Its linked server anchor has the stop's absence proof (x.3.2 X4 K0).
+    turn["group_absent"] = json!(true);
+    expect["sessions"]["main"]["close"] = json!({
+        "mode": "graceful", "vendor_closed": false, "cleanup": "uncertain",
+    });
+    variant(name, &replay, &expect).unwrap();
 }
 
 /// C2 §5 (picrit round 3): delivery lost a call's sample, so the turn's
