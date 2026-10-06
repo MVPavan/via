@@ -31,13 +31,17 @@ Cases (packet §9 live rows):
   mcp_switches          claude_live_mcp_resume and the §4 switch table
   usage                 §3 usage scopes against the vendor's own transcript
   private_profile_auth  §4 private profile: HOME is an empty directory
-VIA records no init inventory for Claude (packet §4, via-7c6), so each
-mcp_switches inventory check is `not_observable` and the case cannot pass
-until VIA records one. Claude's MCP debug lines (`--debug=mcp
---debug-to-stderr`, kept in VIA's `stderr.log`, endpoints redacted) are
-supporting evidence: they can fail the case, never pass the inventory.
+mcp_switches (owner decision, 2026-10-06): VIA records no init inventory for
+Claude (packet §4, via-7c6), so the primary inventory evidence is Claude's own
+MCP debug lines, written by `--debug=mcp --debug-file=<file>` to a file of the
+runner's (endpoints and IDs redacted there; VIA's evidence is never edited).
+Connected servers are counted by name: at least one on the unrestricted
+spawn and the same on its resume, none with MCP off; under `--restricted`
+any set agrees with the packet's `unknown`. With no server connected on the
+unrestricted spawn the case is `not_observable`, never a pass. `status`
+and argv must match the packet in all three modes.
 VIA keeps no raw `result` either, so `usage` compares each envelope with the
-vendor's own session transcript (usage numbers only).
+vendor's own session transcript of the VIA-created session.
 Excluded: claude_live_bounds. Its CLAUDE-BOUND-1 matrix (packet §8) is
 Linux and macOS and its bound matrix is still open (via-p98.3.4); `full` is
 the only bound this runner exercises.
@@ -55,8 +59,11 @@ Privacy: the runner never prints or records environment values, credential
 contents or MCP configuration. It reads no credential file. It records MCP
 server names and counts only, process flags by name (values only for an
 allow-list of recipe flags), and the presence of VIA's process-marker key,
-never its value. It reads, sends signals to and waits on no process VIA did
-not start; Claude processes alive before the run are excluded by pid.
+never its value. It reads usage numbers only, from the vendor transcripts of
+sessions VIA created in this run. It reads other processes' command lines
+only to discover the tagged tool process; it reads environments and sends
+signals or waits on no process VIA did not start, and Claude processes
+alive before the run are excluded by pid.
 """
 
 import argparse
@@ -83,9 +90,6 @@ VALUE_FLAGS = {
     "--model", "--effort", "--max-turns", "--permission-mode", "--permission-prompts",
     "--tools", "--allowedTools", "--input-format", "--output-format",
 }
-# Vendor arguments that copy Claude's MCP debug lines to its stderr, which
-# VIA keeps as the turn's `stderr.log` (C1 §3.12). Unreserved (packet §4).
-MCP_DEBUG_ARGS = ["--", "--debug=mcp", "--debug-to-stderr"]
 CASES = ("recipe_continuity", "interrupt", "never_ask", "mcp_switches", "usage",
          "private_profile_auth")
 TERMINAL = {"completed", "failed", "cancelled", "unknown"}
@@ -510,12 +514,28 @@ def completed(case, label, envelope):
                       {"state": envelope.get("state"), "failure": envelope.get("failure")})
 
 
-def mcp_debug_names(case, session, turn):
-    """MCP server names in Claude's MCP debug lines on the turn's stderr.log."""
-    path = case.run.state / "evidence" / session / str(turn) / "stderr.log"
-    if not path.exists():
+def mcp_debug_args(case, session_label):
+    """Vendor arguments (unreserved, packet §4) that write Claude's MCP debug
+    lines to a file of the runner's own; the session's every launch reuses
+    them, so each turn's file is moved aside once the turn ends."""
+    folder = case.dir / "mcp-debug"
+    folder.mkdir(mode=0o700, exist_ok=True)
+    return ["--", "--debug=mcp", f"--debug-file={folder / (session_label + '.live.log')}"]
+
+
+def collect_mcp_debug(case, session_label, label):
+    """Moves the live debug file to `<label>.log`, redacts it and returns the
+    servers it names with their states, or None when Claude wrote none."""
+    folder = case.dir / "mcp-debug"
+    live = folder / f"{session_label}.live.log"
+    latest = folder / "latest"
+    if latest.is_symlink():
+        latest.unlink()  # Claude's own link to the live file
+    if not live.exists():
         return None
-    text = path.read_text(errors="replace")
+    kept = folder / f"{label}.log"
+    live.rename(kept)
+    text = kept.read_text(errors="replace")
     names = {}
     for line in text.splitlines():
         match = re.search(r'MCP server "([^"]{1,200})"', line) or re.search(
@@ -527,9 +547,10 @@ def mcp_debug_names(case, session, turn):
             names[match.group(1)] = "connected"
         elif "failed" in line.lower() and state != "connected":
             names[match.group(1)] = "failed"
-    # The debug lines name each server's endpoint and ID: configuration the
-    # runner must not keep. Only names and states leave this function.
-    path.write_text(redact_mcp_debug(text))
+    # The lines name each server's endpoint and ID: configuration the runner
+    # must not keep. This file is the runner's own; VIA's evidence is untouched.
+    kept.write_text(redact_mcp_debug(text))
+    kept.chmod(0o600)
     return names
 
 
@@ -807,7 +828,7 @@ def mcp_launch(run, case, label, expect_inherit, expect_warning, present, absent
     receipt, envelope, launches = run.turn(
         case, label, "spawn", "--harness", "claude", "--model", run.model,
         "--cwd", str(case.dir / "ws"), "--wall-ms", "180000", "--background",
-        "--prompt", prompt, *MCP_DEBUG_ARGS)
+        "--prompt", prompt, *mcp_debug_args(case, label))
     if receipt is None:
         case.check(f"{label}: spawn accepted", False, envelope)
         return None, None
@@ -826,20 +847,20 @@ def mcp_launch(run, case, label, expect_inherit, expect_warning, present, absent
     return session, envelope
 
 
-def record_mcp(case, label, session, turn, expect=None, description=None):
-    """Records the MCP evidence of one launch; `expect` judges the supporting
-    debug lines, which can fail the case but never pass the inventory."""
-    names = mcp_debug_names(case, session, turn)
-    inventory = {"source": "Claude MCP debug lines in VIA's stderr.log (supporting only)",
-                 "count": None if names is None else len(names), "servers": names}
-    write_json(case.dir / f"{label}-mcp.json", inventory)
-    case.not_observable(f"{label}: init MCP inventory",
-                        "VIA records no init inventory: the Claude route keeps none in events, "
-                        "status or the evidence folder (packet §4, via-7c6)")
-    if names is not None and expect is not None:
-        case.check(f"{label}: supporting MCP debug lines: {description}", expect(names),
-                   {"count": len(names), "states": sorted(set(names.values()))})
-    return names
+def record_mcp(case, session_label, label):
+    """One launch's MCP evidence (owner decision, 2026-10-06): VIA records no
+    init inventory (via-7c6), so Claude's MCP debug lines are the primary
+    evidence; servers are counted by name, connected ones only. Returns the
+    connected names, or None when Claude wrote no debug file."""
+    names = collect_mcp_debug(case, session_label, label)
+    connected = None if names is None else sorted(n for n, s in names.items() if s == "connected")
+    write_json(case.dir / f"{label}-mcp.json", {
+        "source": "Claude MCP debug lines (--debug=mcp --debug-file), the runner's own file",
+        "init_inventory": "not recorded by VIA (via-7c6)",
+        "servers": names, "connected": connected})
+    if names is None:
+        case.not_observable(f"{label}: MCP debug lines", "Claude wrote no debug file")
+    return connected
 
 
 def case_mcp_restricted(run, case):
@@ -851,7 +872,9 @@ def case_mcp_restricted(run, case):
                             ("--restricted",), ("--strict-mcp-config",),
                             "Reply with the single word READY. Use no tools.")
     if session:
-        record_mcp(case, "restricted", session, 1)
+        # Packet §4: under --restricted what loads varied (none, or claude.ai
+        # connectors), so `unknown`; any server set agrees once recorded.
+        record_mcp(case, "restricted", "restricted")
     run.snapshot(case, "restricted-after")
 
 
@@ -859,13 +882,18 @@ def case_mcp_unrestricted(run, case):
     (case.dir / "ws").mkdir(exist_ok=True)
     run.snapshot(case, "unrestricted-before")
     expect = {c: "on" for c in CATEGORIES}
-    session, _ = mcp_launch(run, case, "unrestricted-t1", expect, [], (),
+    session, _ = mcp_launch(run, case, "unrestricted", expect, [], (),
                             ("--restricted", "--strict-mcp-config"),
                             "Reply with the single word READY. Use no tools.")
     if not session:
         return
-    first = record_mcp(case, "unrestricted-t1", session, 1, bool,
-                       "at least one server")
+    first = record_mcp(case, "unrestricted", "unrestricted-t1")
+    if first is not None and not first:
+        case.not_observable("unrestricted-t1: a connected MCP server",
+                            "no MCP server connected: with none configured a resume that "
+                            "drops servers looks the same")
+    elif first:
+        case.check("unrestricted-t1: MCP servers connected", True, {"count": len(first)})
     receipt, t2, launches = run.turn(case, "unrestricted-t2", "resume", session,
                                      run.session_file(case, session), "--prompt",
                                      "Reply with the single word AGAIN. Use no tools.")
@@ -878,9 +906,11 @@ def case_mcp_unrestricted(run, case):
     status = run.status(case, "unrestricted-t2-status", session)
     case.check("unrestricted-t2: status mcp_servers on after resume",
                (status.get("inherit") or {}).get("mcp_servers") == "on", status.get("inherit"))
-    record_mcp(case, "unrestricted-t2", session, 2,
-               lambda names: bool(first) and set(names) == set(first),
-               "the first launch's servers again")
+    again = record_mcp(case, "unrestricted", "unrestricted-t2")
+    if first and again is not None:
+        case.check("unrestricted-t2: the resume connects the spawn's MCP servers",
+                   again == first, {"spawn": len(first), "resume": len(again),
+                                    "same_names": again == first})
     run.snapshot(case, "unrestricted-after")
 
 
@@ -892,7 +922,10 @@ def case_mcp_off(run, case):
                             ("--restricted",),
                             "Reply with the single word READY. Use no tools.")
     if session:
-        record_mcp(case, "mcp-off", session, 1, lambda names: not names, "no server")
+        connected = record_mcp(case, "mcp-off", "mcp-off")
+        if connected is not None:
+            case.check("mcp-off: no MCP server connected", not connected,
+                       {"count": len(connected)})
     run.snapshot(case, "mcp-off-after")
 
 
