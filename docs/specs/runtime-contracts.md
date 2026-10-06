@@ -553,7 +553,7 @@ When `die_with_anchor` is set, the anchor starts the vendor (and a
 `version_probe`, below) through the same binary's internal exec entry, a
 sibling of the anchor entrypoint (owned by `via-host`, dispatched from
 `via`'s `main` as `__via_host_anchor` is):
-`/proc/self/exe __via_host_exec <anchor pid> <record path or -> <program> <args…>`,
+`/proc/self/exe __via_host_exec <anchor pid> <go fd or -> <program> <args…>`,
 with the child's cwd, environment, umask and standard streams already in
 place. That process:
 
@@ -561,11 +561,9 @@ place. That process:
    (`rustix::process::set_parent_process_death_signal`) and reads it back;
 2. checks that `getppid()` is the anchor pid (it is not if the anchor died
    first);
-3. with a record path (the vendor launch under `exclusive_lock`), writes
-   the server record there: boot ID, `/proc/self/ns/pid` identity, its own
-   pid and start ticks, and a checksum, in one fixed-size write at offset
-   0 of the already existing file (opened write-only, no create, no
-   symlink follow, closed before exec; the anchor holds the `flock`);
+3. with a go fd (the vendor launch under `exclusive_lock`), marks it
+   close-on-exec and blocks reading one byte from it; end of file or a
+   read failure is a failure;
 4. replaces itself with the program
    (`std::os::unix::process::CommandExt::exec`, `argv[0]` the program
    path).
@@ -605,10 +603,12 @@ of these failures is a vendor exit before the route's handshake.
 `vendors/opencode.md` §3.2). Host refuses a spec that sets
 `exclusive_lock` without `die_with_anchor`. On `Configure`, the anchor:
 
-1. refuses a program file with the set-user-ID or set-group-ID bit or a
+1. refuses to run as effective user ID 0 or with a non-zero `CapPrm`,
+   `CapEff` or `CapAmb` in `/proc/self/status` (`PrivilegedVia`), and a
+   program file with the set-user-ID or set-group-ID bit or a
    `security.capability` attribute (`ProgramPrivileged`);
 2. with `version_probe`, runs the program through the exec entry (no
-   record path) with the probe's arguments, cwd and environment, stdin
+   go fd) with the probe's arguments, cwd and environment, stdin
    `/dev/null`, stdout kept up to 256 bytes, stderr discarded, killing and
    waiting for it at 2 s; exit 0 with a trimmed output in `admitted`
    passes, exit 0 with other output is `ProbeRefused { output }` (printable
@@ -619,8 +619,11 @@ of these failures is a vendor exit before the route's handshake.
 4. reads the server record and requires its server gone
    (`vendors/opencode.md` §3.2): a missing or torn record, another boot
    ID, or, in the same boot and PID namespace, `/proc/<pid>` gone, other
-   start ticks, or state `Z` with `Threads: 1`; it re-probes every 20 ms
-   for up to 1 s, then replies `PredecessorAlive`. The same boot in another
+   start ticks, or two zombie observations 20 ms apart, each reading
+   through one `/proc/<pid>` directory descriptor the `stat` state, then
+   `status` `Threads`, then the `stat` state and start ticks again, and
+   passing only on `Z`, 1, `Z` and unchanged ticks; it re-probes every
+   20 ms for up to 1 s, then replies `PredecessorAlive`. The same boot in another
    PID namespace is `PredecessorUncertain { namespace }` at once.
 
 On any of these errors it replies the error and exits: Host commits no
@@ -631,7 +634,23 @@ The probe is the only process the anchor starts before ARM; it has exited
 before the anchor replies, and it dies with the anchor. The descriptor
 stays close-on-exec, so neither the exec entry nor the vendor inherits
 it; the anchor never unlocks or closes it, and the kernel releases it
-when the anchor exits. With `die_with_anchor`, the vendor dies with the
+when the anchor exits.
+
+At ARM, under `exclusive_lock`, the anchor creates a go pipe (both ends
+close-on-exec), clears close-on-exec on the read end for the spawn only
+(the anchor spawns from one thread and starts nothing else meanwhile),
+spawns the exec entry with that fd, and closes its read end. While still
+holding the lock it reads the child's start ticks from `/proc/<pid>` (the
+pid the spawn returned; the child is unreaped), writes the server record
+through its lock descriptor (boot ID, its PID-namespace identity, the
+child's pid and start ticks and a checksum, one fixed-size write at
+offset 0), and only then writes the go byte and closes the write end.
+Only the live lock holder ever writes the record, and no child executes
+the vendor before the record naming it exists; an anchor that dies
+before the record write leaves its child reading end of file. A failed
+record write closes the write end without the byte (the child exits
+125), and the anchor reaps the child and replies `FenceRecordFailed`
+instead of `Spawned`, a launch failure. With `die_with_anchor`, the vendor dies with the
 anchor, so the lock is free only after its holder's vendor has been sent
 `SIGKILL`; step 4 covers the moment between the anchor's descriptors
 closing and the vendor's death. Nothing about the lock or the record
@@ -1127,7 +1146,8 @@ Write ordering is explicit:
    acceptance is independent evidence.
    On a shared-server route the turn's `run_turn` instead creates the
    turn's evidence folder, pins, joins or launches its server (a launch runs
-   this step for the server, with the server's stderr file, under the
+   this step for the server, with the server's stderr file (none with
+   `StderrCapture::CountOnly`, §4), under the
    route's own handshake deadline), commits the turn's link to the server
    anchor, and only then writes the turn's first message.
 4. Adapter emits an observation; Core commits acceptance, durable events
