@@ -111,13 +111,15 @@ pub struct PermissionDenied {
     pub decision_reason: Option<String>,
 }
 
-/// A string member, or `None` for any other shape.
+/// A string member, or `None` for any other shape: optional metadata
+/// never fails its message. Captured raw first, so a value that is valid
+/// JSON but unrepresentable (a number such as `1e400`, at any depth) is
+/// skipped unparsed rather than rejected (review clfix-3).
 fn string_or_none<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<String>, D::Error> {
-    Ok(Value::deserialize(deserializer)?
-        .as_str()
-        .map(str::to_owned))
+    let raw = Box::<RawValue>::deserialize(deserializer)?;
+    Ok(serde_json::from_str(raw.get()).ok())
 }
 
 /// One content block of an `assistant` or `user` message.
@@ -196,8 +198,27 @@ struct RawAssistantBody {
     #[serde(default)]
     model: Option<String>,
     content: Vec<Block>,
-    #[serde(default)]
-    stop_details: Option<Value>,
+    #[serde(default, deserialize_with = "stop_details_or_none")]
+    stop_details: Option<StopDetails>,
+}
+
+/// The members of `message.stop_details` VIA reads, each a string or
+/// absent; every other member is skipped unparsed.
+#[derive(Deserialize)]
+struct StopDetails {
+    #[serde(rename = "type", default, deserialize_with = "string_or_none")]
+    kind: Option<String>,
+    #[serde(default, deserialize_with = "string_or_none")]
+    category: Option<String>,
+}
+
+/// `stop_details` as [`StopDetails`], or `None` for any other shape:
+/// like [`string_or_none`], it never fails its message.
+fn stop_details_or_none<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<StopDetails>, D::Error> {
+    let raw = Option::<Box<RawValue>>::deserialize(deserializer)?;
+    Ok(raw.and_then(|raw| serde_json::from_str(raw.get()).ok()))
 }
 
 /// A `user` message's content: plain text or blocks.
@@ -508,11 +529,9 @@ fn assistant(raw: RawAssistant) -> AssistantMessage {
     let refusal_category = raw
         .message
         .stop_details
-        .as_ref()
-        .filter(|details| details["type"] == "refusal")
-        .and_then(|details| details["category"].as_str())
-        .filter(|category| category.len() <= SHORT_FIELD_MAX)
-        .map(str::to_owned);
+        .filter(|details| details.kind.as_deref() == Some("refusal"))
+        .and_then(|details| details.category)
+        .filter(|category| category.len() <= SHORT_FIELD_MAX);
     AssistantMessage {
         id: raw.message.id,
         model: raw.message.model,
@@ -737,6 +756,48 @@ mod tests {
         let denied = decoded(&json!({"type":"system","subtype":"permission_denied",
             "tool_name":"Edit","tool_use_id":"t2","decision_reason_type":"mode"}));
         assert!(matches!(denied, Message::PermissionDenied(d) if d.tool_use_id == "t2"));
+    }
+
+    /// Optional metadata never fails its message (review clfix-3): a
+    /// `decision_reason` or `stop_details` member that is valid JSON but
+    /// unrepresentable (`1e400`), or not the expected shape, is skipped and
+    /// the metadata is absent; a string category or reason is kept.
+    #[test]
+    fn optional_metadata_never_fails_the_message() {
+        let denied = |reason: &str| {
+            let line = format!(
+                r#"{{"type":"system","subtype":"permission_denied","tool_name":"Bash","tool_use_id":"t1","decision_reason_type":"classifier","decision_reason":{reason}}}"#
+            );
+            match decode(line.as_bytes()) {
+                Ok(Message::PermissionDenied(denied)) => denied.decision_reason,
+                other => panic!("{reason}: {other:?}"),
+            }
+        };
+        assert_eq!(denied("1e400"), None);
+        assert_eq!(denied(r#"{"a":1e400}"#), None);
+        assert_eq!(denied("[1,2]"), None);
+        assert_eq!(
+            denied(r#""[Data Exfiltration]""#).as_deref(),
+            Some("[Data Exfiltration]")
+        );
+        let refusal = |details: &str| {
+            let line = format!(
+                r#"{{"type":"assistant","message":{{"model":"<synthetic>","content":[],"stop_details":{details}}},"is_api_error_message":true}}"#
+            );
+            match decode(line.as_bytes()) {
+                Ok(Message::Assistant(message)) => message.refusal_category,
+                other => panic!("{details}: {other:?}"),
+            }
+        };
+        assert_eq!(
+            refusal(r#"{"type":"refusal","category":"cyber","extra":1e400}"#).as_deref(),
+            Some("cyber")
+        );
+        assert_eq!(refusal(r#"{"type":"refusal","category":7}"#), None);
+        assert_eq!(refusal(r#"{"type":"refusal","category":1e400}"#), None);
+        assert_eq!(refusal(r#"{"type":"other","category":"cyber"}"#), None);
+        assert_eq!(refusal("1e400"), None);
+        assert_eq!(refusal("null"), None);
     }
 
     /// Unknown types and `system` subtypes are activity only, with their
