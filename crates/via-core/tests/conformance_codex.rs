@@ -1348,24 +1348,124 @@ fn checked_outcome(
 /// C2 §5 AD7 (x.3.2 X3 fix r1, finding 14): once a handshake check
 /// refused the recipe, the next identical spawn's plan refuses it,
 /// `harness_unavailable` with `reason: "handshake_refused"`, before any
-/// receipt or launch.
+/// receipt or launch. The refused turns' bound is `full` with network.
 fn refused_from_cache(pure: &conformance_drive::Pure) -> Result<(), String> {
+    match cached_refusal(pure, &PLAN_MODEL_CWD, full())? {
+        Some(()) => Ok(()),
+        None => Err("no cached refusal".to_owned()),
+    }
+}
+
+/// The plain fixture's model and session cwd.
+const PLAN_MODEL_CWD: (&str, &str) = ("gpt-6-sol", "/work/project");
+
+/// The plain fixture's bound.
+fn full() -> Value {
+    json!({"mode": "full", "extra_write_dirs": [], "network": true})
+}
+
+/// Whether the plan of an otherwise identical spawn with `model`, `cwd`
+/// and `bound` is refused from the cache (`Some`), with its
+/// `version_status: "refused"` and `harness_unavailable` /
+/// `handshake_refused` refusal.
+fn cached_refusal(
+    pure: &conformance_drive::Pure,
+    (model, cwd): &(&str, &str),
+    bound: Value,
+) -> Result<Option<()>, String> {
     let request = via_adapters::DescribeRequest {
         harness: Some("codex".to_owned()),
-        model: Some("gpt-6-sol".to_owned()),
-        cwd: Some("/work/project".into()),
+        model: Some((*model).to_owned()),
+        cwd: Some((*cwd).into()),
+        bound: Some(serde_json::from_value(bound).map_err(|e| e.to_string())?),
         ..via_adapters::DescribeRequest::default()
     };
     let plan = pure.set.plan(&request).map_err(|e| format!("{e:?}"))?;
     let plan = serde_json::to_value(&plan).map_err(|e| e.to_string())?;
-    let refusal = &plan["refusals"][0];
-    if plan["version_status"] != "refused"
-        || refusal["kind"] != "harness_unavailable"
-        || refusal["reason"] != "handshake_refused"
-    {
-        return Err(format!("no cached refusal: {plan}"));
+    let refused = plan["refusals"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|refusal| {
+            refusal["kind"] == "harness_unavailable" && refusal["reason"] == "handshake_refused"
+        });
+    match (plan["version_status"] == "refused", refused) {
+        (true, true) => Ok(Some(())),
+        (false, false) => Ok(None),
+        _ => Err(format!("a half-refused plan: {plan}")),
     }
-    Ok(())
+}
+
+/// C2 §5 (codex-server.md, the refusal cache's key): the server key is
+/// bound-free, but a handshake refusal is cached with the turn's bound
+/// and policy inputs, which the echo check depends on. A `read_only`
+/// thread whose reply echoes another sandbox is refused; afterwards the
+/// same `read_only` plan is refused from the cache, while `workspace_write`
+/// and `full` with the same launch settings are not.
+#[test]
+fn codex_handshake_refusal_is_per_bound() {
+    let name = "codex_handshake_refusal_is_per_bound";
+    let (mut replay, mut expect) = plain(name).unwrap();
+    let start = step_with(&replay, "\"method\":\"thread/start\"").unwrap();
+    replay["steps"][start]["expect"]["line"]["params"]["sandbox"] = json!("read-only");
+    let answer = step_with(&replay, "\"result\":{\"thread\"").unwrap();
+    cut_after(&mut replay, answer, &[json!({"await_eof": {}})]).unwrap();
+    let read_only = json!({"mode": "read_only", "extra_write_dirs": [], "network": false});
+    turn_mut(&mut expect, 0)["params"]["bound"] = read_only.clone();
+    unaccepted(&mut expect, "handshake_refused", tested());
+    check_variant_then(name, &replay, &expect, |pure| {
+        let workspace =
+            json!({"mode": "workspace_write", "extra_write_dirs": [], "network": false});
+        let full = json!({"mode": "full", "extra_write_dirs": [], "network": true});
+        match (
+            cached_refusal(pure, &PLAN_MODEL_CWD, read_only)?,
+            cached_refusal(pure, &PLAN_MODEL_CWD, workspace)?,
+            cached_refusal(pure, &PLAN_MODEL_CWD, full)?,
+        ) {
+            (Some(()), None, None) => Ok(()),
+            states => Err(format!("read_only, workspace_write, full: {states:?}")),
+        }
+    })
+    .unwrap();
+}
+
+/// C2 §5: the refusal key covers exactly what the echo check compares,
+/// the resolved model and the session cwd included. A thread whose reply
+/// echoes another model (then another cwd) is refused; afterwards the
+/// same request is refused from the cache, while one naming the echoed
+/// model (or cwd) with the same launch settings and bound is not.
+#[test]
+fn codex_handshake_refusal_is_per_model_and_cwd() {
+    for (name, from, to, other) in [
+        (
+            "codex_handshake_refusal_is_per_model",
+            "\"model\":\"gpt-6-sol\",\"modelProvider\":\"openai\",\"serviceTier\"",
+            "\"model\":\"gpt-6-luna\",\"modelProvider\":\"openai\",\"serviceTier\"",
+            ("gpt-6-luna", PLAN_MODEL_CWD.1),
+        ),
+        (
+            "codex_handshake_refusal_is_per_cwd",
+            "\"disabledPluginIds\":[],\"cwd\":\"/work/project\"",
+            "\"disabledPluginIds\":[],\"cwd\":\"/work/elsewhere\"",
+            (PLAN_MODEL_CWD.0, "/work/elsewhere"),
+        ),
+    ] {
+        let (mut replay, mut expect) = plain(name).unwrap();
+        let answer = step_with(&replay, "\"result\":{\"thread\"").unwrap();
+        edit_emit(&mut replay, answer, from, to).unwrap();
+        cut_after(&mut replay, answer, &[json!({"await_eof": {}})]).unwrap();
+        unaccepted(&mut expect, "handshake_refused", tested());
+        check_variant_then(name, &replay, &expect, |pure| {
+            match (
+                cached_refusal(pure, &PLAN_MODEL_CWD, full())?,
+                cached_refusal(pure, &other, full())?,
+            ) {
+                (Some(()), None) => Ok(()),
+                states => Err(format!("requested, echoed: {states:?}")),
+            }
+        })
+        .unwrap();
+    }
 }
 
 /// [`check_variant`] with the default knobs.
@@ -1538,9 +1638,9 @@ fn codex_pin_handshake() {
 
     // An untested version proceeds, reported as such.
     let (mut replay, mut expect) = plain("codex_pin_handshake_untested").unwrap();
-    edit_emit(&mut replay, 1, "via/0.159.2", "via/0.160.0").unwrap();
+    edit_emit(&mut replay, 1, "via/0.159.2", "via/0.161.0").unwrap();
     turn_mut(&mut expect, 0)["expect"]["instance"] =
-        json!({"vendor_version": "0.160.0", "version_status": "untested"});
+        json!({"vendor_version": "0.161.0", "version_status": "untested"});
     variant("codex_pin_handshake_untested", &replay, &expect).unwrap();
 
     // A malformed initialize reply: no userAgent.
@@ -3828,7 +3928,7 @@ fn codex_stop_while_identity_blocked() {
     // A stop is no error (C2 §2: `Stopped` reports none).
     turn["error"] = Value::Null;
     turn["cleanup"] = json!("quiescent");
-    turn["warnings"] = json!(["config_switch_unverified"]);
+    turn["warnings"] = json!([]);
     let knobs = conformance_run::Knobs {
         stop_after: Some(std::time::Duration::from_millis(300)),
         ..conformance_run::Knobs::default()
@@ -4063,7 +4163,7 @@ fn codex_overflow_before_acceptance() {
     unaccepted(&mut expect, "overflow", tested());
     let turn = &mut turn_mut(&mut expect, 0)["expect"];
     turn["cleanup"] = json!("uncertain");
-    turn["warnings"] = json!(["config_switch_unverified"]);
+    turn["warnings"] = json!([]);
     let mut keeper = refused_expect["turns"][0].clone();
     keeper["session"] = json!("keeper");
     let mut probe = missing_expect["turns"][0].clone();

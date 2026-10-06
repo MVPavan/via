@@ -79,9 +79,11 @@
         }
       },
       "bounds": [
+        "read_only",
+        "workspace_write",
         "full"
       ],
-      "network_control": false,
+      "network_control": true,
       "recover": {
         "support": "unsupported"
       },
