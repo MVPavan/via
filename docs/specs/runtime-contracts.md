@@ -478,18 +478,12 @@ pub struct PrivateProcessSpec {
     pub cwd: PathBuf,
     pub env: EnvAllowList,
     pub owner: ProcessOwner,
-    /// Exclusive launch lock (below): `None` for every route but OpenCode's.
+    /// The vendor cannot outlive its anchor (below): `false` for every
+    /// route but OpenCode's.
+    pub die_with_anchor: bool,
+    /// Exclusive launch lock (below): `None` for every route but OpenCode's;
+    /// requires `die_with_anchor`.
     pub exclusive_lock: Option<PathBuf>,
-    /// Pinned program and version probe (below): `None` but for OpenCode.
-    pub pinned_program: Option<PinnedProgram>,
-}
-pub struct PinnedProgram {
-    pub identity: FileIdentity,          // dev, ino, size, mtime, ctime
-    pub version_probe: Option<VersionProbe>,
-}
-pub struct VersionProbe {
-    pub args: Vec<OsString>, pub cwd: PathBuf, pub env: EnvAllowList,
-    pub admitted: Vec<String>,           // exact trimmed stdout lines
 }
 pub struct AcquiredProcess {
     pub pipes: OwnedPipes,       // moved once into Wire; Host never reads them
@@ -536,44 +530,81 @@ allow-list (`PATH` only if required, explicit test variables and vendor VIA
 marker). It never inherits the complete daemon environment. Wire exclusively
 owns vendor pipes. Host control bypasses data and SQLite queues.
 
-**Exclusive launch lock** (the OpenCode one-live-server fence,
-`vendors/opencode.md` §3.2). When `exclusive_lock` is set, the anchor,
-on `Configure`, opens that path (create 0600, no symlink follow,
-close-on-exec, a regular file of the daemon's uid) and takes
-`flock(LOCK_EX | LOCK_NB)`. If the lock is held it replies the error
-`LockHeld` and exits: Host commits no `ArmIntent`, starts no vendor, and
-the acquisition fails with the no-launch evidence and a `launch_failed`
-cause naming the lock step (C2 §2). On ARM the anchor clears close-on-exec
-on that one descriptor just before spawning, so the vendor inherits it;
-the anchor keeps its copy and never unlocks or closes it until it exits.
-The kernel releases the lock when every descriptor of it is closed, or
-when any holder calls `LOCK_UN`. So **while the vendor keeps its inherited
-descriptor and never unlocks it**, the lock outlives the vendor process on
-every path (daemon crash, anchor killed from outside, failed acquisition),
-and no reboot leaves it behind. A vendor that drops the descriptor while
-its anchor is also gone leaves the lock free while it still runs: that
-retention is the route's qualification gate (`vendors/opencode.md` L13),
-not something Host can enforce. Nothing about the lock enters the Store,
-and Host never unlinks the file. It gates only the launch; cleanup
-evidence and harness-process capacity are unchanged. With a pinned
-program, the lock is taken only after an admitted probe (below).
+**Die with the anchor** (the OpenCode fence, `vendors/opencode.md` §3.2;
+a per-launch option no other route sets). When `die_with_anchor` is set,
+the anchor starts the vendor through the same binary's internal exec
+entry, a sibling of the anchor entrypoint (owned by `via-host`, dispatched
+from `via`'s `main` as `__via_host_anchor` is):
+`/proc/self/exe __via_host_exec <anchor pid> <program> <args…>`, with the
+vendor's cwd, environment, umask and standard streams already in place.
+That process sets its parent-death signal to `SIGKILL`
+(`rustix::process::set_parent_process_death_signal`), reads it back, and
+checks that `getppid()` is the anchor pid; if any step fails, the anchor
+having died first included, it writes one line to its stderr (the vendor's
+stderr log) and exits 125 without starting the vendor. Otherwise it
+replaces itself with the vendor (`std::os::unix::process::CommandExt::exec`,
+`argv[0]` the program path); an exec failure writes one stderr line and
+exits 126, or 127 when the program is not found. The vendor keeps that
+process's pid, start ticks, group and parent-death signal, so
+`Spawned {pid, start_ticks}` and `vendor_pid` keep their meaning, and an
+exec failure is a vendor exit before the route's handshake.
 
-**Pinned program and version probe** (OpenCode's version admission,
-`vendors/opencode.md` §2.2). When `pinned_program` is set, the anchor, on
-`Configure`, opens `program` read-only and close-on-exec and compares the
-open file's identity with `identity`; a difference replies the error
-`ProgramChanged` and exits, before any ARM intent. With `version_probe`,
-it then runs that open file through `/proc/self/fd/<n>` with the probe's
-arguments, cwd and environment, stdin `/dev/null`, stdout kept up to 256
-bytes, stderr discarded, and waits for it, killing it at a 2 s bound. The
-probe is the only process the anchor starts before ARM, and it has exited
-before the anchor replies. Unless the trimmed stdout is one of `admitted`
-and the exit status is zero, the anchor replies `ProbeRefused { output }`
-(the bounded output, printable ASCII only) and exits: Host commits no
-`ArmIntent`, and the acquisition fails as a refusal with that output.
-On ARM the anchor execs the vendor through the same open file
-(`/proc/self/fd/<n>`, `argv[0]` the program path), so a replaced or
-unlinked path cannot change what runs. Linux only; macOS is deferred.
+- **Why an exec entry.** The signal must be set in the child after it is
+  created and before the vendor starts. std's hook for that,
+  `CommandExt::pre_exec`, is `unsafe`, which the workspace forbids
+  (`unsafe_code = "forbid"`, coding style); `process-wrap` 10 has no
+  parent-death wrapper, its `pre_spawn` hook runs in the parent, and its
+  own pre-exec wrappers use `unsafe` internally. The exec entry uses only
+  safe rustix and std calls. An owner exception to `forbid` for one
+  `pre_exec` closure would remove the extra exec; it is not needed.
+- **Spawning thread.** The kernel sends the signal when the thread that
+  created the child exits, not when its process does. The anchor runs a
+  current-thread Tokio runtime, and `tokio::process::Command::spawn` calls
+  std's spawn synchronously on the calling thread, so the vendor's
+  creator is the anchor's main thread, which lives as long as the anchor.
+  The anchor must keep spawning there, never through `spawn_blocking` or
+  another thread (Tokio ends idle blocking threads after 10 s, which would
+  kill the vendor); `vendors/opencode.md` OC02b's idle case catches such a
+  move.
+- **Limits.** The kernel clears the signal when the child executes a
+  set-user-ID, set-group-ID or file-capability program, or under a
+  security-module transition that marks the execution secure; the
+  anchor refuses the first three at `Configure` (below). It covers the
+  vendor process only, not its descendants. Linux only; macOS is
+  deferred.
+
+**Exclusive launch lock** (the OpenCode one-live-server fence,
+`vendors/opencode.md` §3.2). Host refuses a spec that sets
+`exclusive_lock` without `die_with_anchor`. On `Configure`, the anchor:
+
+1. refuses a program file with the set-user-ID or set-group-ID bit or a
+   `security.capability` attribute (`ProgramPrivileged`);
+2. opens the lock path (create 0600, no symlink follow, close-on-exec, a
+   regular file of the daemon's uid) and takes `flock(LOCK_EX | LOCK_NB)`;
+   a held lock is `LockHeld`;
+3. reads the predecessor record kept in that file and requires it proven
+   absent (`vendors/opencode.md` §3.2: a missing or torn anchor slot;
+   another boot or namespace; the vendor named by a server slot bound to
+   that anchor gone or with other start ticks; with no such slot, the
+   recorded anchor's group absent by the §5.2 predicate), re-probing every
+   20 ms for up to 1 s; still present is `PredecessorAlive`;
+4. writes its own anchor slot (boot ID, namespace, its pid, group and
+   start ticks); a failed write is `FenceRecordFailed`.
+
+On any of these errors it replies the error and exits: Host commits no
+`ArmIntent`, starts no vendor, and the acquisition fails with the
+no-launch evidence and a `launch_failed` cause naming the step (C2 §2).
+After the ARM spawn the anchor writes the server slot (its own pid and
+start ticks, then the vendor's) before `Spawned`; a failed write there is
+not fatal (the next check falls back to the anchor's group). The descriptor stays
+close-on-exec, so neither the exec entry nor the vendor inherits it; the
+anchor never unlocks or closes it, and the kernel releases it when the
+anchor exits. With `die_with_anchor`, the vendor dies with the anchor, so
+the lock is free only after its holder's vendor has been sent `SIGKILL`;
+step 3 covers the moment between the anchor's descriptors closing and the
+vendor's death. Nothing about the lock or the record enters the Store,
+and Host never unlinks the file. It gates only the launch; cleanup
+evidence and harness-process capacity are unchanged.
 
 **Stop reply.** Host's `CloseReport` gains `stopped_live: Option<bool>`:
 the verified anchor's `Stopping { stopped_live }` reply to this close's
@@ -721,14 +752,14 @@ Startup protocol, on a 0600 Host-only Unix socket in the validated directory:
    `identified` to `arm_intent`. Only its positive commit receipt permits
    exactly one `Arm {generation}` send on the original connection. This is
    the **durable ARM intent**, not a claim that the anchor received ARM.
-   The anchor starts at most one vendor after receiving that command, then
+   The anchor starts at most one vendor after receiving that command
+   (through the exec entry when `die_with_anchor` is set, §5), then
    acknowledges with vendor child facts only after descriptor detachment;
    they include the vendor's start ticks for the leftover scan (§5,
    `Spawned {pid, start_ticks}`), read from non-environment procfs metadata.
    It rejects duplicate/wrong-generation ARM and never spawns again.
    Before receiving ARM, controller EOF or a 5 s bootstrap deadline makes the anchor
-   exit; no vendor was started (a pinned program's version probe, §5, has
-   already exited). After ARM, EOF starts own-group cleanup.
+   exit; no vendor was started. After ARM, EOF starts own-group cleanup.
 4. Commit vendor child facts before handing pipes to Wire. If that write
    fails or the daemon dies, the already-durable anchor can clean its group;
    no missing vendor-identity row authorizes a numeric signal. The leftover
@@ -752,7 +783,7 @@ to it and proves cleanup by the absence predicate (§5.2) after its EOF exit
 The control protocol is a closed enum of `Challenge`, `Configure`, `Arm`,
 `Stop`, `Status` and replies. Configure is accepted once, before ARM, only
 on the original bootstrap controller connection; its validated argv/env/cwd
-spec (with the optional exclusive-lock path, §5) is <=64 KiB. Other control
+spec (with the die-with-anchor flag and optional exclusive-lock path, §5) is <=64 KiB. Other control
 messages are <=1 KiB, with at most one outstanding request and bounded
 integer fields. Restart cannot configure or start a
 vendor; it connects to the stored private socket and sends a
@@ -1410,7 +1441,7 @@ payload limits count encoded bytes plus separately bounded decoded structure.
 | Resource | Default hard bound | Full/expired behavior |
 |---|---:|---|
 | Harness processes | `daemon.json` `harness_processes.limit` running harness processes VIA started, daemon-wide, each with its anchor: default 8, any value from 1 to 2^32 − 1. A per-turn process (CLI route, Pi RPC) holds a slot for its turn; a shared server (Codex app-server, OpenCode serve) holds one for its whole life, however many sessions it serves. A slot is reserved only for a new process (C2 §3, AD16) | Queue eligible work; do not create a child until a slot is reserved |
-| OpenCode owned servers | At most one live for all of VIA: one namespace in the first release (fenced by the server anchor's exclusive launch lock, §5); each holds one harness-process slot; one SSE stream and 8 request connections (2 decline, 2 stop, 4 general) | Same as Codex servers; an unknown request effect drains and retires the server (`vendors/opencode.md` §8) |
+| OpenCode owned servers | At most one live for all of VIA: one namespace in the first release (fenced by the server anchor's exclusive launch lock and a server that dies with its anchor, §5); each holds one harness-process slot; one SSE stream and 8 request connections (2 decline, 2 stop, 4 general) | Same as Codex servers; an unknown request effect drains and retires the server (`vendors/opencode.md` §8) |
 | OpenCode SSE and retained state | 1 MiB event; staging 1,024/4 MiB per server; lanes 16/1 MiB per session; per server 1,024 session states, 4,096 tombstoned turns, 4,096 child sessions, 64 pending interactive requests, 64 unanswered requests; 45 s silence | Event, staging or count overflow: server generation `overflow`; full lane: driver overflow as Codex; silence: transport loss |
 | `vendor_args` (C1 §4) | 64 arguments, 16 KiB in total (UTF-8), no NUL | `invalid_params` naming `vendor_args` before any receipt; a launch past Host's 64 KiB request is refused by its route (C2 §6.3) |
 | Queued turns | 8/session, 128 daemon-wide | `queue_full` / `admission_refused` before commit |
@@ -1540,7 +1571,8 @@ For the OpenCode extension, Adapter owns the launch key and recipe; Routes
 owns the shared registry, per-session lanes, the server-scoped session state
 and drain; Wire owns HTTP/SSE framing; Host owns the process, its anchor
 (a `Server` owner with a minted `ServerId`, as Codex's; no OpenCode-specific
-label) with its exclusive launch lock (§5), retirement and death evidence.
+label) with its die-with-anchor launch and exclusive launch lock (§5),
+retirement and death evidence.
 The memory measurement includes N sessions on one server with concurrent turns.
 Core's durable-state and Store ownership do not change, and Adapter
 receives no Store access.

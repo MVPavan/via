@@ -73,7 +73,7 @@ the agent's responsibility: VIA stops only the agent and reports leftovers
 | A5 | ACP decline: choose a reject-kind option, else `cancelled`; never counted as enforcement | as written; shape unverified |
 | A6 | Auto-decline deadline 5 s, from Core config, served on the control path, one value for every adapter (AD17); fail closed when an unknown request cannot be answered, without fabricating a decline | as reviewed in Claude §10; AD17 withdraws the Codex and OpenCode packets' 1 s |
 | A7 | Codex live recovery is unsupported on owned stdio; `thread/resume` continues a conversation after a resolved turn, not an in-flight turn. `Dead` requires verified death, otherwise `Unknown`; no resend | as reviewed in Codex §9 |
-| A8 | Codex owned stdio server key: `config_hash`, covering VIA-controlled launch settings (resolved program path, arguments, passed environment, server cwd, protocol pin), not credentials or binary contents; the observed binary version is reported, not keyed; bound omitted due per-turn `sandboxPolicy`, mixed-bound use qualified by `via-5lr.3.4`. OpenCode shares one owned `opencode serve --stdio` for all of VIA (owner, 2026-10-06): launch key = the one namespace (anonymous profile identity/epoch; project configuration always on) plus a hash of VIA-controlled launch settings; no credentials, bound, owner or version; at most one live server, fenced across restarts by an exclusive kernel lock on its data root that the server's anchor takes and the server inherits (C1 P11, runtime §5) | as reviewed in Codex §9 and OpenCode §3 |
+| A8 | Codex owned stdio server key: `config_hash`, covering VIA-controlled launch settings (resolved program path, arguments, passed environment, server cwd, protocol pin), not credentials or binary contents; the observed binary version is reported, not keyed; bound omitted due per-turn `sandboxPolicy`, mixed-bound use qualified by `via-5lr.3.4`. OpenCode shares one owned `opencode serve --stdio` for all of VIA (owner, 2026-10-06): launch key = the one namespace (anonymous profile identity/epoch; project configuration always on) plus a hash of VIA-controlled launch settings; no credentials, bound, owner or version; at most one live server, fenced across restarts by an exclusive kernel lock on its data root that only the server's anchor holds and a server that cannot outlive its anchor (C1 P11, runtime §5) | as reviewed in Codex §9 and OpenCode §3 |
 
 ## 1. Purpose and rules
 
@@ -752,16 +752,14 @@ default.
   Codex read-only (qualified live by `via-5lr.3.4`, not by the handshake); unchanged usage or terminal
   semantics.
 - **Exception: OpenCode runs only checked versions** (owner, 2026-10-06).
-  A version outside the OpenCode adapter's `checked` set is refused before
-  the server starts: the anchor runs the opened program file's own
-  `--version` before ARM and launches that same file only when the version
-  is checked; the handshake's `/api/info.version` must then match
-  (`vendors/opencode.md` §2.2, runtime §5 "Pinned program"). A refusal is
-  `handshake_refused`, cached by this refusal cache's key, with a message
-  naming the version and the checked set. The
-  one-server fence depends on the server keeping an inherited lock
-  descriptor, which only per-version qualification shows
-  (`vendors/opencode.md` §3.2, §12, L13).
+  An `/api/info.version` outside the OpenCode adapter's `checked` set is
+  refused at the handshake before the server is published, even when every
+  other check passes: `handshake_refused`, cached by this refusal cache's
+  key, with a message naming the version and the checked set; the server
+  is retired through Host. One server carries every OpenCode session, and
+  an unchecked version's protocol and behaviour are unqualified
+  (`vendors/opencode.md` §12); the one-server fence does not depend on the
+  version (`vendors/opencode.md` §3.2).
 - Proceeding on unchecked versions (other routes) is the owner's accepted risk. The warning
   stays visible in every receipt, status and envelope of such a turn.
   `allow_untested` is accepted and stored for C1 compatibility but has no
