@@ -14,18 +14,21 @@ history is in `scratchpad/execution/opencode2/history.md`.
 release runs **one OpenCode server for all of VIA**: one private namespace,
 whose project configuration is always on ("disable nothing"); a request to
 turn off a category only the project switch could turn off is `unknown`
-with `config_switch_unverified`, never a second server (§4.5). VIA data
-stays private and the provider profile stays the free anonymous one; the
-user's own OpenCode service, configuration and data are never touched. The
-one-live-server fence still holds across daemon restarts (§3.2). After
-review it is a kernel `flock` on the data root that the server's anchor
-takes and the server inherits, not a Store record: the
+with `config_switch_unverified`, never a second server (§4.5). VIA's data
+stays private and credential-free; the free anonymous provider is the
+default, and a project may configure its own provider, whose secrets VIA
+never keeps (§4.3). The user's own OpenCode service, user configuration and
+data are never touched. The one-live-server fence holds across daemon
+restarts as a kernel `flock` on the data root that the server's anchor
+takes and the server inherits, not a Store record (§3.2): the
 `"opencode:<namespace>:<generation>"` `owner_server` label is withdrawn
 (it did not fit `ServerId`; this supersedes decision C-1 of
 `scratchpad/execution/c2-gap/report.md`), and no Store schema change is
-needed. `vendor_args` stays refused (§2.2). Changed: §§2.2, 2.3, 3.1, 3.2,
-4.1, 4.2, 4.4, 4.5, 5, 6, 8, 10, 12, 13 (OC02, OC02b, OC10, L9, L13), 14
-and 15. Revisit items after the release are in §14.
+needed. Because the fence depends on per-version lock retention, only
+checked versions run (§12). `vendor_args` stays refused (§2.2). Changed:
+§§2.2, 2.3, 3, 4.1–4.5, 5, 6, 7.1, 7.3, 8, 9, 10, 11, 12, 13 (OC01, OC02,
+OC02b, OC04, OC07, OC09, OC10, OC11, OC12b, L4, L5, L9, L11, L13), 14 and
+15. Revisit items after the release are in §14.
 
 Authority: [C1](../via-api-v1.md), [C2](../adapter-contract.md),
 [runtime contracts](../runtime-contracts.md),
@@ -82,9 +85,9 @@ rejected: tools would inherit the password.
 | Launch | Host's anchor starts `<resolved program> serve --stdio --hostname 127.0.0.1 --port 0`, cwd = the namespace directory (§3.2), environment exactly §4.1, stdin a pipe VIA holds open and never writes, stdout a pipe, stderr to the connection evidence folder (runtime §4) | E2, E3 |
 | URL handoff | The first stdout line, at most 4 KiB, must be a JSON object whose `url` is `http://127.0.0.1:<1–65535>` with no path, credentials or query. Later stdout bytes are read, counted and discarded | E4 |
 | Authentication | HTTP Basic `opencode:<password>` to that exact origin only; no proxies, no redirects, no unauthenticated fallback | E5 |
-| Identity and version | `GET /api/info` must be 200 JSON with string `version` and integer `pid`; `pid` must equal the vendor child pid in Host's `Spawned` report (passed up as passive data) | E5 |
+| Identity and version | `GET /api/info` must be 200 JSON with string `version` and integer `pid`; `pid` must equal the vendor child pid in Host's `Spawned` report, which Host passes up as passive data (runtime §5 `AcquiredProcess.vendor_pid`, through Wire to the route); `version` must be in `checked` (§12), else the server is refused before publication (owner, 2026-10-06) | E5 |
 | Credential state | §4.3 | E41 |
-| Catalog | `GET /api/model` repeated 200 ms apart until non-empty; cached per server generation with the version | E10 |
+| Catalog | `GET /api/model` (no location) repeated 200 ms apart until non-empty, decoded through §4.3's allow-list; cached per server generation with the version for `models`; effort uses each session's location catalog instead (§5) | E10 |
 | Events | `GET /api/event` (SSE) opened; `server.connected` received before the server is published | E18 |
 | Deadline | 30 s from spawn for all of the above, independent of any turn; a waiting turn's own deadlines end only its wait (Codex §2) | proposal |
 
@@ -121,14 +124,20 @@ destination, every operand, and `--`.
   turn fails through C2's server-acquisition failure path; nothing is
   cached. A 1.x binary (no `--stdio`) exits before the URL line and lands
   here.
-- **Incompatible handshake**: a URL line that is valid JSON but the wrong
-  shape, `/api/info` 200 with HTML, non-JSON or missing `version` or `pid`,
-  a first SSE event other than `server.connected`, or a required endpoint
-  answering 404. This, and a readback that differs from a value VIA has just
-  sent (§5), are `handshake_refused` (C2 §5): `submit_failed` with
-  `failure.data.reason:"handshake_refused"`, cached under C2 §5: program path and file identity (device, inode, size, mtime,
+- **Incompatible handshake**: a first stdout line that is not JSON, is
+  over 4 KiB, or is JSON of the wrong shape or with a non-loopback URL;
+  `/api/info` 200 with HTML, non-JSON or missing `version` or `pid`; an
+  `/api/info.version` outside `checked` (§12), even when every other check
+  passes; a first SSE event other than `server.connected`; or a required
+  endpoint answering 404. These are server-level `handshake_refused` (C2
+  §5): the server is retired through Host before publication and the
+  acquiring turn is `submit_failed` with
+  `failure.data.reason:"handshake_refused"`. The refusal is cached under C2
+  §5's key: program path and file identity (device, inode, size, mtime,
   ctime) plus the recipe hash, 10 minutes, so a binary replaced at the same
-  path retries at once.
+  path retries at once. An unchecked version's message names the version
+  found and the `checked` set. A readback that differs from a value VIA has
+  just sent is a session-level refusal with its own key (§5).
 
 ### 2.3 Password
 
@@ -202,7 +211,7 @@ The namespace has one private directory
 no per-session namespace record is needed. Sessions, messages, settings
 and pending inbox items persist in the database across server restarts
 (E31, E32, E53). VIA never reads, writes or contacts the user's own
-OpenCode configuration, data or service (§4.1; revisit items R1 and R2,
+user-level OpenCode configuration, data or service (§4.1; revisit items R1 and R2,
 §14).
 
 **One live server, across daemon restarts: the data-root lock.** The
@@ -300,7 +309,9 @@ Start from an empty environment:
 
 Never forward provider keys, other `OPENCODE_*` (including `_API_KEY`,
 `_AUTH_CONTENT`, `_DB`, `_MODELS_URL|PATH`), proxy credentials or caller
-configuration; the vendor then uses its public free route (E9). VIA never
+configuration. With no project provider configuration the vendor then uses
+its public free route (E9); a project may configure its own provider, which
+then applies (§4.3). VIA never
 sets `OPENCODE_DISABLE_PROJECT_CONFIG`: project configuration is always on
 (§4.5). The
 per-session environment endpoint is unused: it replaces the tool
@@ -325,11 +336,14 @@ was 55,022 bytes (E18), a measurement, not a guarantee. Keys VIA does not
 set (a project's `instructions`, `plugins`, `mcp`, extra agent fields) still
 always come from the project (§4.5). No `steps` (§5).
 
-### 4.3 Credential check (owner rule, 2026-10-05)
+### 4.3 Credentials and provider configuration (owner rules, 2026-10-05 and 2026-10-06)
 
-VIA **never** calls `GET /api/credential`: it returns secret values (doc,
-E41). Credentials live in the namespace database (E41), so a file check
-cannot see them.
+VIA's private data is credential-free; a project may configure its own
+provider.
+
+**Private data.** VIA **never** calls `GET /api/credential`: it returns
+secret values (doc, E41). Stored credentials live in the namespace database
+(E41), so a file check cannot see them.
 
 - **Fresh namespace** (no `data/opencode/opencode.db`): clean by
   construction. VIA created it private and empty, never writes a credential
@@ -344,10 +358,41 @@ cannot see them.
     acquiring turn fails through the acquisition path naming only
     integration IDs; not cached.
   - Known shape, no connection: proceed.
-  - Unknown shape (for example an untested version's changed response):
-    skip the check, proceed, and add the warning
+  - Unknown shape: skip the check, proceed, and add the warning
     `credential_state_unchecked` to every turn on that server generation.
-- Never refuse because of the version alone; keep no state file.
+    Only checked versions run (§12), so this needs a checked version's
+    response to differ from its known shape.
+- Keep no state file.
+
+**Project provider configuration (owner, 2026-10-06).** A session
+location's project configuration may define providers and models with
+`settings` (including `apiKey`), `headers`, `body`, `options` and endpoints
+(doc: `Config.ProviderEncoded`, `Config.ModelEncoded`; `Model.Info` and its
+variants carry `settings`, `headers` and `body` in `/api/model`). It is the
+user's own project configuration and applies, following "disable nothing";
+the free anonymous route is only the default where no project sets a
+provider. If the state directory lies inside a project, the server's own
+location (§2.2's catalog) sees that project's providers too. VIA never
+logs, stores, returns or writes into evidence any provider key, header or
+endpoint secret, from any source:
+
+- Every `settings`, `headers`, `body`, `apiKey` and `options` value is
+  treated as secret. VIA decodes `/api/model` and the session model
+  readback through a fixed allow-list (`providerID`, `id`, `name`,
+  `variants[].id`) and skips every other field without keeping it (serde
+  `IgnoredAny`). No response body or event payload of this route is
+  logged or saved, a decode or size failure included (an exception to
+  runtime §8's saved failing message): its evidence records only the
+  endpoint or event type, status, size and failing path.
+- In production VIA calls only the endpoints §§2, 5–8 and 11 name. It
+  never calls `GET /api/config`, `/api/provider*`, `/api/mcp`,
+  `/api/plugin` or `/api/credential`; where §4.5 mentions them they are
+  qualification probes.
+- Vendor error text is never copied into an envelope, log or evidence
+  (§7.3); only `error.type` and the status are kept.
+- The vendor's stderr goes to the server's evidence folder (runtime §4) as
+  on every route; whether pinned OpenCode writes a provider secret there
+  is a gate in L4 (§13).
 
 ### 4.4 Isolation on a shared server
 
@@ -410,7 +455,7 @@ category `on` while user-level sources stay private. Only skills requested
 | Setting | Request and rule | Evidence |
 |---|---|---|
 | Model identity | `POST /api/session` `model:{providerID,id}`; the frozen identity is `(providerID, id)`; readback must match on every reopen | E7, E16, E32 |
-| Effort (variant) | Per-turn state. Effort null ⇔ variant omitted ⇔ readback `"default"` (E46). Before each prompt the requested variant must be in the cached catalog `variants` (unknown variants are stored silently, E46), else `Rejected(InvalidParam{field:"effort"})`; when the readback differs, `POST /api/session/{id}/model {model:{providerID,id,variant?}}` (omitting `variant` clears it), then read back | E9, E33, E46 |
+| Effort (variant) | Per-turn state. Effort null ⇔ variant omitted ⇔ readback `"default"` (E46). Before each prompt the requested variant must be in the `variants` of the session's model in its **location catalog** (unknown variants are stored silently, E46), else `Rejected(InvalidParam{field:"effort"})`. Project configuration applies per location (E54) and `/api/model` takes a location (doc), so when a session is first attached in a server generation (new or reopen, before `POST /api/session` or the readback) VIA fetches `GET /api/model?location[directory]=<canonical cwd>` once, decodes it per §4.3, and keeps only the variant IDs of the session's frozen model in its session state (§7.2; counted in §9's aggregate retained bound); when the readback differs, `POST /api/session/{id}/model {model:{providerID,id,variant?}}` (omitting `variant` clears it), then read back | E9, E33, E46 |
 | Agent | `agent:"via"` at creation; readback `via` (unknown names are accepted silently, E32) | E11 |
 | Instructions | `PUT /api/experimental/session/{id}/instructions/entries/via {value}` after creation; readback must equal; null puts nothing. A context block the model sees (E12), not a system-prompt replacement. Vendor limit: **262,144 UTF-8 bytes of the JSON-encoded value** (E45); `plan` refuses more via `ParamSizes.instructions_json`, `InvalidParam{field:"instructions"}` | E12, E32, E45 |
 | Permission rules | At creation: `{*,*,allow}`, `{question,*,deny}`, `{opencode_session_move,*,deny}`, `{opencode_session_rename,*,deny}`, `{opencode_list_mcp_resources,*,deny}`, `{opencode_read_mcp_resource,*,deny}`, plus `{skill,*,deny}` when skills are off; readback must equal exactly; never patched later. A tool whose last matching rule denies it is removed from the turn's tool snapshot (E42, E43) | E15, E42, E43 |
@@ -423,7 +468,13 @@ password and server cwd.
 
 **Readback rules.** A readback that differs from a value VIA has **just
 sent** (creation, instruction entry, variant switch) is demonstrated
-incompatibility: `handshake_refused`, cached (§2.2). On reopen VIA sent
+incompatibility: `handshake_refused` for that turn only; the server stays
+published. It is cached under a **session refusal digest**: H(recipe hash,
+the values the readbacks compare: model identity, agent, the exact
+permission rule list, canonical cwd, the SHA-256 of the instruction text,
+variant), with C2 §5's program identity. As Codex's `Echoed` inputs do,
+this keeps the refusal off any session whose readback inputs differ: a
+skills-off session's permission refusal never blocks a default session. On reopen VIA sent
 nothing, so a difference is a session-state fault: `Rejected { reason:
 StartRejected::SettingsMismatch { setting } }` with `setting: VendorSetting`
 (`Model`, `Agent`, `Permissions`, `Instructions`) → `failed(submit_failed)`,
@@ -437,10 +488,10 @@ refusal cache).
 |---|---|---|
 | `describe` / `plan` | Process-free: bundled profile, effort mapping, last version and cached catalog for this program path; refusals per §12; `server_key` from §3.1 | — |
 | `models` | Bundled entries plus the cached `GET /api/model` catalog of a live owned server (public fields only) | E9 |
-| `check_turn` | Pure: `full,network:true` only; same refusals as `plan`; the prompt admission bound (§9); effort against the cached catalog's `variants` | E9, E47 |
+| `check_turn` | Pure: `full,network:true` only; same refusals as `plan`; the prompt admission bound (§9); effort against the session's location variants when the live generation holds them (§5), else left to `run_turn` | E9, E47 |
 | `prepare` / `readiness` | `Pinned(Server)` when the OpenCode server is live or launching and not draining, else `NeedsConnection`; readiness changes on publication, drain start (§8) and retirement | C2 §3 |
-| First `run_turn` of a connection generation, new session | `POST /api/session {model, agent:"via", location, permissions}`; persist the returned `ses_…` ID via `session.vendor_identity_confirmed`; then the instruction entry and readback. Never send a caller-chosen session ID: the free tier rejects it (403 FreeTierError, E29) | E7, E16, E29 |
-| First `run_turn` of a connection generation, reopen | `GET /api/session/{id}`: 404, or a different `id` or `location.directory` → `ResumeMismatch`, never create. Then the settings readback (§5). On the session's first attachment in a server generation, the leftover cleanup of §7.2 | E31, E32, E46 |
+| First `run_turn` of a connection generation, new session | The location catalog (§5); `POST /api/session {model, agent:"via", location, permissions}`; persist the returned `ses_…` ID via `session.vendor_identity_confirmed`; then the instruction entry and readback. Never send a caller-chosen session ID: the free tier rejects it (403 FreeTierError, E29) | E7, E16, E29 |
+| First `run_turn` of a connection generation, reopen | `GET /api/session/{id}`: 404, or a different `id` or `location.directory` → `ResumeMismatch`, never create. Then the settings readback (§5). On the session's first attachment in a server generation, the location catalog (§5) and the leftover cleanup of §7.2 | E31, E32, E46 |
 | `run_turn` submission | The execution rule (§7.2), the effort step (§5), then one `POST /api/session/{id}/prompt {id:<caller ID>, text}`; outcomes §8 | E17, E30, E50 |
 | Acceptance | 200 whose `data.id` is the caller ID and `data.sessionID` the session, or `session.inbox.enqueued{sessionID, inboxID:<caller ID>}`, whichever first; deduplicated | E17, E19, E30 |
 | Observations, terminal, final text | §7 | E19, E23 |
@@ -504,8 +555,10 @@ three types above; any other type, including an unknown
 A known type whose required fields do not decode fails that session's
 driver `protocol` and drains the generation (§8), since the session's
 execution state may have missed it; an undecodable envelope or non-JSON
-`data:` fails the server generation `protocol`. A non-increasing per-session
-`seq` is `protocol`; a gap is only a diagnostic (E20).
+`data:` fails the server generation `protocol`. Only events that carry a
+`seq` are checked: a non-increasing per-session `seq` is `protocol` and a
+gap is only a diagnostic (E20); events without one, such as permission
+requests, are not checked.
 
 ### 7.2 The execution rule (E51, E52, E53)
 
@@ -557,7 +610,7 @@ inbox writers are a qualification item (§13).
 | Vendor terminal of the owned execution | `VendorTerminal` | Evidence |
 |---|---|---|
 | `succeeded` | `Completed`; stop reason from the last `step.ended.finish`: `stop` → `EndTurn`, `length` → `Budget`, `content-filter` → `Refusal`, else `Other` | E19, E8 |
-| `failed{error}` | `Failed`; `vendor_code` = `error.type`, class hint §12, bounded `error.message` | E29, E33 |
+| `failed{error}` | `Failed`; `vendor_code` = `error.type`, class hint §12; no vendor message text, which can echo project provider configuration (§4.3) | E29, E33 |
 | `interrupted{reason:"user"}` after VIA's interrupt for this turn | `Interrupted` (acknowledgement, §7.4) | E24 |
 | `interrupted{reason:"shutdown"}` after VIA's successful decline of a **permission** request correlated to this turn by `callID` | `Completed`, `Other`, decline recorded (VO1 b parity; owner Q5) | E27 |
 | any other `interrupted`, including `shutdown` after only a form decline | `Failed`, `vendor_error`, `vendor_code:"interrupted:<reason>"` | E28 |
@@ -677,6 +730,7 @@ request's effect. The server generation **drains** (Q10, decided):
 | HTTP | headers 64 KiB; response bodies 1 MiB (`/api/model` 4 MiB); JSON depth 64, 65,536 nodes | `protocol` |
 | Final-text candidates | 4 MiB per turn | turn `overflow` |
 | Retained per server | session states 1,024; tombstoned turns 4,096; child sessions 4,096; pending interactive requests 64; requests without a complete response 64 | server generation `overflow` |
+| Correlation keys (aggregate) | caller input, assistant message and tool call IDs of every live and tombstoned turn, child-session IDs and each session's model variant IDs (§5), together: 65,536 entries and 8 MiB of retained ID bytes per server | server generation `overflow` |
 | Liveness | heartbeats every 15 s (E18); 45 s without a byte | transport loss (§10) |
 
 **Prompt admission (security).** The prompt is echoed whole in the 200
@@ -688,9 +742,13 @@ valid UTF-8, E45, E47). A prompt that fits can never overflow the shared
 stream through its echo, so one session cannot fail every session's
 stream. Core fills `ParamSizes.prompt_json` and `cwd_json` (C2 §2).
 
-Retained items are IDs and short fields copied from single events, so each
-is below the 1 MiB event cap; memory is bounded by these counts times that
-cap. Long-run memory is a qualification item (§13).
+Retained items are IDs and short fields copied from single events, each
+at most 1 KiB (runtime §8's ID and code bound; longer is `protocol`). One
+long turn can learn many assistant and tool IDs, so these are bounded in
+aggregate, not per turn. Retained memory is therefore at most the 9,344
+counted items above times 1 KiB plus the 8 MiB correlation bound, about
+17 MiB per server before allocator overhead. Long-run memory is a
+qualification item (§13).
 
 **Lane overflow** is exactly Codex's rule (C2 §4): sticky driver overflow
 with `ObservationLoss`; a terminal admitted before the overflow is kept;
@@ -745,9 +803,23 @@ pool; never `once` or `always`.
 `source.messageID`, else `source.id` (callID), live or tombstoned; for a
 form, the turn owning its session's execution. An unattributed request is
 still declined and recorded only as a diagnostic, never credited to the
-current turn. A decline not settled within 5 s fails closed: the attributed
-turn is stopped and fails `protocol`; an unattributed one fails the server
-generation `protocol` (C2 rule 8).
+current turn. A decline not settled within 5 s fails closed:
+
+- attributed to a turn that is still running: that turn is stopped and
+  fails `protocol` (C2 rule 8);
+- attributed to a turn that has already settled (a tombstone): the
+  settled turn's result never changes, and VIA sends **no** interrupt for
+  it, since a session-scoped interrupt would stop the successor (§7.2).
+  The failure is recorded on the settled turn as a late
+  `vendor.request_declined` observation with `summary` saying the decline
+  did not settle (`late:true`, up to the close cutoff, C2 §3; after it, a
+  counted diagnostic). The decline's effect is unknown and a request left
+  pending could wedge the session's execution, so the server generation
+  **drains** (§8): the successor and other sent turns finish or meet their
+  own deadlines, and retirement then ends the pending request. Drain is
+  the existing path for an unknown request effect, keeps unrelated
+  sessions' turns, and needs no new state;
+- unattributed: the server generation fails `protocol` (C2 rule 8).
 
 **Observations.** `vendor.request_declined {vendor_method:
 "permission.asked:<action>" | "form.created", summary, blocking:true}`
@@ -786,9 +858,18 @@ unavailable, not zero.
 A bad model is accepted at creation and fails after acceptance (E33).
 `session.retry.scheduled` is activity, never authority to resubmit.
 
-**Version** (C2 §5, OD1): `/api/info.version` is reported; `checked =
-{"2.0.22"}`; another version is `untested` and warns; only an incompatible
-handshake (§2.2) refuses. `describe` starts no process.
+**Version (owner, 2026-10-06; an exception to C2 §5's OD1 rule).**
+`/api/info.version` is reported, and OpenCode runs **only** versions in
+`checked = {"2.0.22"}`: versions that passed every gate, L13 included. Any
+other version is refused at the handshake before the server is published,
+even when the handshake is otherwise compatible (§2.2: `handshake_refused`,
+cached by binary identity, a message naming the version and the checked
+set). Claude, Codex and Pi run untested versions with a warning; OpenCode
+cannot, because the one-server fence's safety depends on the server keeping
+its inherited lock descriptor (§3.2), which is qualified per version (L13),
+not visible in a handshake. `allow_untested` does not waive it. `describe`
+starts no process and reports the last version seen, `refused` when it is
+outside `checked`.
 
 **Declared capability** after its tests pass:
 
@@ -800,7 +881,8 @@ handshake (§2.2) refuses. `describe` starts no process.
 | Close | native detach; vendor history kept |
 | Recover | unsupported (P12) |
 | Instructions | native session instruction entry, at most 262,144 encoded bytes |
-| Effort | native only for a catalog variant of the model |
+| Effort | native only for a variant of the model in the session's location catalog (§5) |
+| Version | only versions in `checked` run; any other is refused (`handshake_refused`) before publication |
 | Output schema | unsupported |
 | Max steps | `params.max_steps:{support:"unsupported",reason:"No per-turn step limit on opencode-serve 2.0.22"}`; non-null refused by Core preflight before server acquisition or vendor I/O |
 | Bound | `full` with `network:true` only; nonempty `extra_write_dirs` → `invalid_params` |
@@ -818,18 +900,19 @@ pinned binary and a free model.
 
 | Fixture | Required observation |
 |---|---|
-| OC01 handshake | URL line malformed, non-loopback, oversized, missing, exit-before-line; `/api/info` HTML, non-JSON, missing fields → incompatible, cached; `pid` mismatch, timeout, empty catalog, 5xx → transient, not cached; binary replaced at the same path clears the cache; wrong password → 401; no proxy or redirect |
+| OC01 handshake | URL line not JSON, wrong shape, non-loopback or oversized; `/api/info` HTML, non-JSON, missing fields → incompatible, cached; a fake vendor whose handshake is fully compatible but reports `version` `2.0.23` → refused before publication, `submit_failed`/`handshake_refused`, message names `2.0.23` and the checked set, no session request sent, the server retired, cached; the same path replaced by a `2.0.22` binary → admitted; `allow_untested:true` does not waive it; URL line missing or exit before it → transient; `pid` mismatch, timeout, empty catalog, 5xx → transient, not cached; binary replaced at the same path clears the cache; wrong password → 401; no proxy or redirect |
 | OC02 namespace and credentials | Sessions with different inherited-configuration requests share one process and slot; the default request → every category `unknown` and one `config_switch_unverified` listing all six; instruction files or skills requested on → `unknown`, never `on`; instruction files requested off → same server, `unknown`; skills off → `off` by session rule and absent from the warning; the launch environment never has `OPENCODE_DISABLE_PROJECT_CONFIG`; private roots only; fresh namespace proceeds; known integration shape with a synthetic credential → `unexpected_credential_state`; known shape, none → proceeds; unknown shape → proceeds with `credential_state_unchecked`; Boolean scan: the synthetic value never appears in any byte VIA read; `GET /api/credential` never requested |
 | OC03 full path | Live spawn/result, background/wait, events/logs on a free model; close never deletes vendor history |
-| OC04 continuity and settings | Two-turn context answer; idle retirement then reopen with one identity read; missing or mismatching ID → `resume_mismatch`, no create; reopen settings mismatch → `SettingsMismatch` → `submit_failed`/`settings_mismatch`, not cached; just-sent readback differing → `handshake_refused`, cached; variant normalization |
+| OC04 continuity and settings | Two-turn context answer; idle retirement then reopen with one identity read; missing or mismatching ID → `resume_mismatch`, no create; reopen settings mismatch → `SettingsMismatch` → `submit_failed`/`settings_mismatch`, not cached; just-sent readback differing → `handshake_refused`, cached under the session refusal digest: after a skills-off session's permission readback is refused, a default session with otherwise equal inputs and the same binary is admitted and runs, and a second skills-off session is refused from the cache; the server stays published throughout; variant normalization |
 | OC05 execution rule | Interrupt still in flight when the predecessor ends naturally blocks the successor (replays E51); predecessor terminal not yet on the stream blocks it; 400/404 and never-sent predecessors release it; a terminal before own delivery is not `protocol`; a vendor-originated execution racing dispatch is not the turn's; a driver reopened on the same generation (idle close, overflow) dispatches from the server-scoped state; leftover VIA input at reopen is cancelled once and revises nothing; `session_busy` after 30 s |
 | OC06 routing | Interleaved sessions on one stream; `form.created` routed by `form.sessionID`; child requests credited to the originating turn; late events by input, assistant and tool keys to tombstones, never the successor; unknown types, fields and `session.execution.*` suffixes; malformed known payload → driver `protocol` and drain; non-JSON data; non-increasing seq |
-| OC07 never-ask and isolation | Create/readback rules; other-session rename/move and self-move unavailable (live); declines within 5 s with the general pool full and observations saturated; a late request naming a settled turn's IDs credited to it; unattributed declined and credited to none; only a callID-correlated permission decline maps `interrupted{shutdown}` to `Completed/Other`; form decline leaves the ordinary rows; `vendor.request_declined` fields; `tools_ended` kept; `permission.rejected` → `action.denied`, deduplicated |
+| OC07 never-ask and isolation | Create/readback rules; other-session rename/move and self-move unavailable (live); declines within 5 s with the general pool full and observations saturated; a late request naming a settled turn's IDs credited to it; with T1 settled and T2 running, a late permission request naming T1's tool ID whose decline does not settle in 5 s: T1's envelope unchanged, a late `vendor.request_declined` on T1, no interrupt sent, the generation drains, T2 finishes or meets its own deadline, then the server retires; unattributed declined and credited to none; a child (task) session gets the same deny rules (other-session rename/move, self-move, `question`, `skill` when off) and its permission requests are declined (live); only a callID-correlated permission decline maps `interrupted{shutdown}` to `Completed/Other`; form decline leaves the ordinary rows; `vendor.request_declined` fields; `tools_ended` kept; `permission.rejected` → `action.denied`, deduplicated |
 | OC08 control | Cancel before send withdraws; before delivery → inbox cancel → input-cancellation terminal → `cancelled`/`acknowledged`, quiescent; same after wall cleanup keeps `failed(deadline_wall)`; lost cancel race → interrupt; interrupt during a tool → `interrupted{user}`, quiescent; no acknowledgement by `force_at` → `unknown`, no kill, later terminal or input cancellation revises an accepted turn |
-| OC09 outcomes, drain and overload | Prompt status table; timeout and socket failure after a byte → drain; inconclusive prompt → turn by lane order (terminal, acceptance, else `unknown`); drain publishes readiness; a pinned unsent turn → `SessionGone`; sent turns finish; retirement through Host; next generation fresh. Lane overflow → `failed(overflow)` as Codex, terminal-overflow case, no drain, successor dispatches; oversize event, full staging and each §9 count → generation `overflow`; prompt admission at both sides of the limit with escaping-heavy text; 45 s silence |
+| OC09 outcomes, drain and overload | Prompt status table; timeout and socket failure after a byte → drain; inconclusive prompt → turn by lane order (terminal, acceptance, else `unknown`); drain publishes readiness; a pinned unsent turn → `SessionGone`; sent turns finish; retirement through Host; next generation fresh. Lane overflow → `failed(overflow)` as Codex, terminal-overflow case, no drain, successor dispatches; oversize event, full staging and each §9 count → generation `overflow`, including one long turn that learns 65,537 assistant and tool IDs, and the 8 MiB ID-byte bound reached by live and tombstoned turns together; an ID over 1 KiB → `protocol`; prompt admission at both sides of the limit with escaping-heavy text; 45 s silence |
 | OC02b data-root lock | Through real Host anchors and a fake vendor that reports its open descriptors: `server.lock` is created 0600 and never unlinked; the anchor holds it from configuration, the vendor holds the inherited descriptor, the vendor's own children do not. A held lock refuses the configuration: no ARM intent commits, no vendor starts, the turn is `submit_failed`/`launch_failed` with the lock step, nothing cached, and a later acquisition succeeds once the holder exits. Each path, refused while a holder lives and admitted after it exits: (a) a post-ARM failed acquisition (handshake failure) whose anchor is then killed with the vendor kept alive; (b) a pre-ARM failure (configuration accepted, ARM never sent), admitted as soon as the anchor exits; (c) a launch or retirement task failure; (d) a real daemon crash after ARM, then restart: the orphan held by a test barrier refuses a new server, and admits one after its anchor's EOF cleanup; (e) an anchor killed from outside with the vendor alive. The anchor never unlocks: after the fake vendor closes its copy, the lock stays held until the anchor exits. (f) Unsafe boundary: a fake vendor that closes its inherited descriptor and keeps serving, then its anchor killed from outside: the lock is free and a second server's configuration succeeds while the first still serves, which is why L13 gates enablement. (g) The same with a fake vendor that closes the descriptor and reopens the file under the same descriptor number: its `/proc/<pid>/fd` target is unchanged and a fresh-open `LOCK_NB` still fails while the anchor lives, yet the L13 method below rejects it (no lock line in its `fdinfo`; after the anchor-only kill the fresh-open `LOCK_NB` succeeds). Store rows never gate a launch through the lock: with spare `harness_processes` capacity, a Store holding an identity-less pre-ARM server intent, a server anchor with another boot ID, and unproven Codex server anchors from earlier runs admits an OpenCode server at once when no lock holder lives; a live Codex server never blocks it. Such rows exhausting recovered capacity is the separate limitation of §3.2 (bead via-joc), not tested here |
 | OC10 recovery | Server death during N sessions' turns → `server_lost` with one shared leftover report; a terminal admitted before the loss kept; EOF with process alive → `unknown`; quiescent with `GroupAbsent` even when tool leftovers are listed; daemon crash → `unknown`, no resend; a daemon crash leaving an orphan server, then restart: no second server while the orphan lives (OC02b d); password rotation |
-| OC11 parameters and usage | Variant check and switch; instruction size at 262,144/262,145 encoded bytes; output schema and max steps refusals; step-keyed usage excluding `usage.updated`; a compaction sample → `vendor_interval` plus `usage_interval_unverified`; class hints |
+| OC11 parameters and usage | Variant check and switch; two locations on one server whose project configurations give the same model different variants: each session's effort is accepted or refused by its own location's catalog, before any prompt, and the handshake catalog is not used for it; instruction size at 262,144/262,145 encoded bytes; output schema and max steps refusals; step-keyed usage excluding `usage.updated`; a compaction sample → `vendor_interval` plus `usage_interval_unverified`; class hints |
+| OC12b provider secrets | Synthetic project configurations at two locations set `providers.opencode.settings.apiKey`, a provider header, a model and a variant header and `body`, and a custom endpoint URL with a token; the fake vendor echoes them in `/api/model`, the session model readback, an error event's message and its stderr. Boolean scan: none of the synthetic values appears in any envelope, event, status, `models` or `describe` result, log, diagnostic, Store row or evidence file except the vendor's own stderr capture (whose live behaviour is L4's gate); a `/api/model` body that fails to decode leaves only endpoint, status, size and path; `GET /api/config`, `/api/provider*`, `/api/mcp`, `/api/plugin` and `/api/credential` never requested |
 | OC12 password | Password only in the launch environment; absent from tools (Boolean), argv, Store, keys, diagnostics and captures; synthetic secrets only |
 
 **Live qualification items.** Each is a named test in `via-4sw.3.4` (or
@@ -841,14 +924,14 @@ stands. Items that gate route enablement (L4, L5, L13) say so.
 | L1 409 trigger | The doc lists prompt 409 (`PromptConflictError`, `InboxConflictError`, `BusyError` in source); no trigger was found | Drive concurrent prompts, reused IDs and busy sessions; record which yields 409 and confirm drain is the right response |
 | L2 mid-write cancel | A stop while a prompt body is being written or its response is pending | Cancel during a large prompt write, and again while the prompt response is still pending; confirm the stop is served at once on its reserved pool, independent of the prompt, that an indeterminate write drains, and that there is no enqueue or a single enqueue |
 | L3 foreign inbox writers | A non-VIA item in a session's inbox (vendor `synthetic`, `compaction`, `move`, or another writer) delays or joins a turn | Provoke vendor-originated items and an external writer, including foreign input arriving between VIA's execution-state check and its prompt's delivery; confirm delivery-ownership attribution (§7.1) and that the execution rule holds |
-| L4 (G18) hostile project config | Project config overriding `share`, permissions, MCP or plugins despite the generated config | Synthetic project fixtures per key; gates route enablement |
-| L5 (G19) MCP, plugins, hooks | MCP tool permission names; plugin and hook loading | Project MCP server and plugin fixtures; then deny MCP tools when MCP is off and record exact OD2 states; gates enablement |
+| L4 (G18) hostile project config | Project config overriding `share`, permissions, MCP or plugins despite the generated config; project provider configuration with keys, headers and endpoints | Synthetic project fixtures per key; gates route enablement. With the pinned binary, a project provider with a synthetic `apiKey` and headers: the session uses that provider (it applies), and a Boolean scan finds none of the synthetic values in any VIA output, Store row, log or evidence file, the server's stderr capture included; any occurrence fails qualification until resolved |
+| L5 (G19) MCP, plugins, hooks | MCP tool permission names; plugin and hook loading | Project MCP server and plugin fixtures; record the MCP tool permission names and exact OD2 states. Denying MCP tools is a qualification probe only: production adds no MCP tool denial (MCP requested `off` stays `unknown`, §4.5) beyond §5's resource helpers; gates enablement |
 | L6 (G20) model-driven forms | A form raised by the model; the execution after `DELETE` | Trigger a form live; record the terminal after decline |
 | L7 (G21) live compaction | Compaction events and their usage | Force automatic compaction; verify keys and totals, then allow scope `turn` |
 | L8 rate-limit, quota, context shapes | Error shapes unobserved | Trigger each on a free or synthetic provider; confirm class hints |
 | L9 long-run memory | Retained state over hours with many sessions; the one server carries every OpenCode session, so §9's per-server counts are daemon-wide | N sessions on one server for a long run, with escaping-heavy and large event fields; measure retained memory and RSS against §9's count bounds |
 | L10 macOS | Platform deferred | Run OC01–OC12 on macOS under the platform contract |
-| L11 untested-version credential shape | A new version's `/api/integration` may change shape or carry values | At each pin review, rerun E41's synthetic-credential probe and add the version to `checked` |
+| L11 new-version credential shape | A new version's `/api/integration` may change shape or carry values | Before a version joins `checked`, rerun E41's synthetic-credential probe with every other gate (L4, L5, L13) |
 | L12 other unobserved | `superseded` and `inactivity` interrupt reasons; agent `steps`; durable replay; `OPENCODE_DISABLE_AUTOUPDATE` behaviour; truncated-body handling (E56) | Probe each at the next pin review |
 | L13 (gate) lock retention | The data-root lock (§3.2) is sound only while the server keeps its share of the **locked open file description**, never unlocking it; a descriptor number or `/proc/<pid>/fd` target cannot show that (a close and reopen keeps both, OC02b g), and the anchor's copy masks a fresh-open check while it lives; E57 covered fd 3 from a probe script and the location and session shells only | **Gates route enablement and every pin review.** Each sample is one controlled server generation started through the real Host launch (VIA's anchor), driven to a point in its life (just after publication, during and after each spawn path: the model's tool runner, location and session shells, a project MCP stdio server, LSP and a plugin spawn, and after a long run). The direct test: (1) a same-uid scan of `/proc/*/fdinfo` finds the flock line for `server.lock` only on the anchor's and the server's descriptors (another holder, such as a child, would mask the result: the sample is set aside and the holder reported as an availability finding); (2) `SIGKILL` the anchor's pid alone, never its group and never `SIGTERM` (which starts the anchor's own group stop), with a test barrier (a `test-failpoints` build of VIA, the pinned real OpenCode) holding Host and the route from retiring the generation or closing its stdin; (3) confirm the server is the same process (pid and start ticks) and still answers `/api/info`; (4) a `LOCK_NB` attempt from a fresh open must fail; (5) step 3 again. A sample where step 3 or 5 fails, because the server exited or was signalled, is invalid and rerun, never counted. Then stdin close stops the server; confirm it is gone and the lock is free. Supporting evidence: on Linux the server's `/proc/<pid>/fdinfo/<fd>` shows a `lock:` `FLOCK … WRITE` line only while that descriptor belongs to the locked description (checked locally on Linux 6.6: present on the locking descriptor and its duplicates, absent after a close and reopen under the same number). **Pass:** every valid sample's step 4 fails to lock and every `fdinfo` check shows the line. **Fail:** any valid sample in which the fresh open locks, or any loss of the `fdinfo` line or unlock during the server's life; OpenCode qualification then fails and stays failed until that is resolved. A child found holding the descriptor is not a safety failure (it only blocks launches after the server exits) but is reported as an availability finding with its spawn path |
 
@@ -863,6 +946,19 @@ to turn off a category only the project switch controls is `unknown` with
 data and the free anonymous provider profile; the one-live-server fence
 stays across daemon restarts (§3.2); `vendor_args` refused (§2.2). This
 supersedes **Q2** below and decision C-1 of the C2 gap report.
+
+Decided (owner, 2026-10-06, critical review Blocker 1): OpenCode runs only
+versions in `checked`, those that passed every gate including L13; any
+other version is refused at the handshake before publication
+(`handshake_refused`), even with a compatible handshake. This differs from
+C2 §5's warn-and-run rule for the other harnesses because the fence's
+safety depends on per-version lock retention (§3.2, §12).
+
+Decided (owner, 2026-10-06, critical review Blocker 2): project provider
+configuration applies; it is the user's own project configuration
+("disable nothing"), and the free anonymous route is only the default
+where a project sets no provider. VIA never logs, stores, returns or puts
+in evidence any provider key, header or endpoint secret (§4.3).
 
 Decided (owner, 2026-10-06, review finding 5): `on` keeps C2 §6.2's
 meaning for every harness. Because only the project-level part of the
@@ -893,6 +989,10 @@ The amendments this packet proposed to C1 (`via-api-v1.md`), C2
 were integrated into those contracts on 2026-10-05; the contracts are now
 authoritative, and the full amendment text is kept in
 `scratchpad/execution/opencode2/history.md`.
+
+After the critical review (2026-10-06): C1 P13 (both rows),
+`version_status` and `allow_untested`; C2 §5's version rule and effort
+validation.
 
 Rev7 (2026-10-06) made these edits in place: C1 P11 and its §Decisions
 row, and the §9 password note (one server for all of VIA; reach of a
