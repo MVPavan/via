@@ -383,6 +383,10 @@ impl Drop for FinishOnDrop<'_> {
 /// begins is discarded; the KILL is never later than its deadline.
 const TAIL_FLUSH: Duration = Duration::from_millis(20);
 
+/// How long a killed exec child may take to be reaped after a failed record
+/// write before the anchor stops its own group.
+const REAP_WAIT: Duration = Duration::from_secs(1);
+
 /// Completes at `at`, or never when there is none.
 async fn until(at: Option<Instant>) {
     match at {
@@ -546,12 +550,22 @@ async fn spawn_vendor(
             Some(Ok(())) => record_written_seam().await,
             Some(Err(error)) => {
                 // Runtime §5: the child has not executed the vendor (no
-                // record names it); it is killed and reaped, and the launch
-                // fails.
+                // record names it); it is killed, and the launch fails. The
+                // reap is bounded (review ochost2 #2): a child stuck in
+                // the kernel keeps its pending `SIGKILL`, so it never runs
+                // user code again; if it is not reaped in time, the group
+                // (this anchor with it) is stopped, releasing the lock.
                 let _ = child.start_kill();
-                let _ = child.wait().await;
+                let reaped = tokio::time::timeout(REAP_WAIT, child.wait()).await.is_ok();
                 let refusal = crate::FenceRefusal::FenceRecordFailed;
-                let _ = protocol::write_message(stream, &Reply::Fence { refusal }, 1024).await;
+                let _ = tokio::time::timeout(
+                    REAP_WAIT,
+                    protocol::write_message(stream, &Reply::Fence { refusal }, 1024),
+                )
+                .await;
+                if !reaped {
+                    stop_own_group(terminate, Duration::from_millis(200), Some(&*log)).await;
+                }
                 return Err(error);
             }
             None => {

@@ -116,12 +116,16 @@ impl ServerRecord {
             && &record[..8] == MAGIC
             && i32::try_from(pid).is_ok_and(|pid| pid > 0);
         match (well_formed, text(8), text(8 + FIELD)) {
-            (true, Some(boot_id), Some(pid_namespace)) => Decoded::Record(Self {
-                boot_id,
-                pid_namespace,
-                pid,
-                start_ticks,
-            }),
+            (true, Some(boot_id), Some(pid_namespace))
+                if is_boot_id(&boot_id) && is_pid_namespace(&pid_namespace) =>
+            {
+                Decoded::Record(Self {
+                    boot_id,
+                    pid_namespace,
+                    pid,
+                    start_ticks,
+                })
+            }
             _ => Decoded::Malformed,
         }
     }
@@ -453,6 +457,23 @@ fn take_lock(path: &Path) -> Result<LaunchLock, FenceRefusal> {
     }
 }
 
+/// A boot ID as the kernel prints it: a lowercase, hyphenated UUID. Only
+/// such text can be evidence of another boot (review ochost2 #1).
+fn is_boot_id(text: &str) -> bool {
+    text.len() == 36
+        && text.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => matches!(byte, b'0'..=b'9' | b'a'..=b'f'),
+        })
+}
+
+/// A pid namespace as `/proc/self/ns/pid` reads: `pid:[<inode>]`.
+fn is_pid_namespace(text: &str) -> bool {
+    text.strip_prefix("pid:[")
+        .and_then(|rest| rest.strip_suffix(']'))
+        .is_some_and(|inode| !inode.is_empty() && inode.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 /// Runtime §5 step 4: the recorded server is proved gone, or refused. A
 /// malformed record proves nothing: `PredecessorUncertain`.
 async fn check_predecessor(record: Decoded) -> Result<(), FenceRefusal> {
@@ -663,6 +684,30 @@ mod tests {
                 ServerRecord::decode(&named.encode().unwrap()),
                 Decoded::Malformed,
                 "pid {pid}"
+            );
+        }
+        // Review ochost2 #1: identity text not in the kernel's form proves
+        // nothing, so another boot ID cannot be read from it.
+        for (boot_id, pid_namespace) in [
+            ("", "pid:[4026531836]"),
+            ("garbage", "pid:[4026531836]"),
+            ("0D3F5C2E-1111-2222-3333-444455556666", "pid:[4026531836]"),
+            ("0d3f5c2e_1111-2222-3333-444455556666", "pid:[4026531836]"),
+            ("0d3f5c2e-1111-2222-3333-44445555666", "pid:[4026531836]"),
+            ("0d3f5c2e-1111-2222-3333-444455556666", ""),
+            ("0d3f5c2e-1111-2222-3333-444455556666", "pid:[]"),
+            ("0d3f5c2e-1111-2222-3333-444455556666", "pid:[12x]"),
+            ("0d3f5c2e-1111-2222-3333-444455556666", "net:[4026531836]"),
+        ] {
+            let named = ServerRecord {
+                boot_id: boot_id.into(),
+                pid_namespace: pid_namespace.into(),
+                ..sample()
+            };
+            assert_eq!(
+                ServerRecord::decode(&named.encode().unwrap()),
+                Decoded::Malformed,
+                "{boot_id:?} {pid_namespace:?}"
             );
         }
         let long = ServerRecord {
