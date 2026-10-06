@@ -120,10 +120,10 @@ line for them, and each lock can be taken (then released at once): Linux
 drops a lock from /proc/locks when its locker exits even while an inherited
 copy still holds it, and the probe sees that copy. The recorded daemon's
 pid and start ticks must be gone too, and no descendant seen before the
-stop alive. Which pids hold the files through their
-descriptors is kept as evidence only. A daemon that holds the locks is
-ours, a replacement started by the CLI included. A failed start is searched for by those locks, and every
-later phase is blocked. The final cleanup retries the stop until a
+stop alive. Which pids hold the files through their descriptors is kept
+as evidence only. A daemon that holds the locks is ours, a replacement
+started by the CLI included. A failed start is searched for by those
+locks, and every later phase is blocked. The final cleanup retries the stop until a
 deadline, also after an earlier unverified stop, escalating to `daemon stop
 --force` when a plain stop is refused `sessions_active`; once the stop is
 proven the runtime directory is removed, wherever it lives.
