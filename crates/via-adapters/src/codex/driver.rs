@@ -59,12 +59,12 @@ use super::delivery::{
     losses as lock_losses,
 };
 use super::normalize::{self, DiscoveredModel, StructuredOutput};
-use super::plan::{self as codex_plan, Sandbox};
+use super::plan::{self as codex_plan, Echoed, Sandbox};
 use super::{ADAPTER_VERSION, CodexAdapter, HARNESS, PerTurn, refusals};
 use crate::driver::turn::{CLEANUP_ALLOWANCE, end_active};
 use crate::driver::{
-    Active, ConnectionPin, DriverState, ForceWatch, Prepared, Retiring, SessionDriver, SessionSpec,
-    TurnCx, TurnSpec, latch, lock, rejected,
+    Active, ConnectionPin, DriverState, ForceWatch, Prepared, Retiring, SessionDriver, TurnCx,
+    TurnSpec, latch, lock, rejected,
 };
 use crate::harness::Harness;
 use crate::instance::Incompatibility;
@@ -1335,7 +1335,7 @@ async fn turn(
         let opened = open_thread(
             &mut facts,
             (&ids, reservation),
-            sandbox.mode,
+            &sandbox,
             (&mut orders, &mut force, &mut writes),
         )
         .await;
@@ -1894,7 +1894,7 @@ struct Ids<'a> {
 async fn open_thread(
     facts: &mut Turn<'_>,
     (ids, reservation): (&Ids<'_>, Option<Reservation>),
-    mode: SandboxMode,
+    sandbox: &Sandbox,
     (orders, force, writes): (&mut Orders, &mut ForceWatch, &mut TurnWrites),
 ) -> Result<Arc<Thread>, Box<TurnEnd>> {
     let driver = facts.driver;
@@ -1907,7 +1907,7 @@ async fn open_thread(
         model: &driver.spec.model,
         cwd: &driver.spec.cwd,
         developer_instructions: driver.spec.instructions.as_deref(),
-        sandbox: mode,
+        sandbox: sandbox.mode,
     };
     let bounds = WriteBounds::StartBy {
         start_by: orders.wall,
@@ -1954,7 +1954,7 @@ async fn open_thread(
             None,
         )));
     };
-    confirm(facts, (&opened, mode), resume, &lease, (orders, force)).await?;
+    confirm(facts, (&opened, sandbox), resume, &lease, (orders, force)).await?;
     let thread = Arc::new(Thread {
         id: opened.thread.id.clone(),
         registration: normalize_on_tracker(driver, facts.session, ids, &lease),
@@ -1996,17 +1996,27 @@ async fn open_thread(
 /// policy, a resume's thread ID, and its registration on the connection.
 async fn confirm(
     facts: &Turn<'_>,
-    (opened, mode): (&ThreadResult, SandboxMode),
+    (opened, sandbox): (&ThreadResult, &Sandbox),
     resume: Option<String>,
     lease: &LaneLease,
     controls: (&mut Orders, &mut ForceWatch),
 ) -> Result<(), Box<TurnEnd>> {
     let driver = facts.driver;
     let turn = facts.number;
-    if let Some(field) = echo_differs(opened, mode, &driver.spec) {
+    let echoed = Echoed {
+        model: &driver.spec.model,
+        cwd: &driver.spec.cwd,
+        sandbox,
+    };
+    if let Some(field) = echo_differs(opened, &echoed) {
         let adapter = &facts.session.adapter;
-        // The recipe key the refused handshake is cached under.
-        let hash = adapter.server_key(driver.spec.inherit.requested, &driver.spec.vendor_args);
+        // The refused handshake is cached under exactly what was compared,
+        // on the server its vendor args select.
+        let hash = adapter.refusal_key(
+            driver.spec.inherit.requested,
+            &driver.spec.vendor_args,
+            &echoed,
+        );
         adapter.instances.record_refusal(
             &adapter.binary,
             hash,
@@ -2057,20 +2067,18 @@ async fn confirm(
 
 /// The first echoed field that is not the one requested (packet §3:
 /// never, the user reviewer, the bound's sandbox, the session's model and
-/// directory).
-fn echo_differs(
-    opened: &ThreadResult,
-    mode: SandboxMode,
-    spec: &SessionSpec,
-) -> Option<&'static str> {
-    let sandbox = match mode {
+/// directory). Only the sandbox's type is compared: the 0.160.0 echo of a
+/// workspace-write thread has `excludeSlashTmp` and `excludeTmpdirEnvVar`
+/// false while every `turn/start` applies them true (via-5lr.3.4).
+fn echo_differs(opened: &ThreadResult, echoed: &Echoed<'_>) -> Option<&'static str> {
+    let sandbox = match echoed.sandbox.mode {
         SandboxMode::ReadOnly => "readOnly",
         SandboxMode::WorkspaceWrite => "workspaceWrite",
         SandboxMode::DangerFullAccess => "dangerFullAccess",
     };
-    if opened.model != spec.model {
+    if opened.model != echoed.model {
         Some("model")
-    } else if Path::new(&opened.cwd) != spec.cwd {
+    } else if Path::new(&opened.cwd) != echoed.cwd {
         Some("cwd")
     } else if opened.approval_policy.as_str() != Some("never") {
         Some("approvalPolicy")

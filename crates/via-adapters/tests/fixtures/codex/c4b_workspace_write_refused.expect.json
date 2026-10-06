@@ -59,7 +59,7 @@
           "turn.accepted": 0
         },
         "unasserted": [],
-        "notes": "workspace_write is refused as bound_unsupported before any launch until via-5lr.3.4 proves enforcement; no fallback to full (C1 §4.2; vendors/codex.md §3)."
+        "notes": "workspace_write with network:true is refused as bound_unsupported before any launch: via-5lr.3.4 qualified the limited bounds with network:false only; no fallback to full (C1 §4.2; vendors/codex.md §3)."
       }
     }
   ]
