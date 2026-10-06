@@ -33,7 +33,8 @@ fallback; no experimental capability is sent by default. Record observed
 binary and adapter versions. The version rule is C2 §5 (owner OD1): the
 instance version is parsed from `initialize.userAgent`: drop the
 `<clientInfo.name>/` prefix VIA itself sent, then read up to the first space
-(qualified on the 0.159.2 fixtures, `via-5lr.3.1`); a version outside the adapter's `checked` set is
+(qualified on the 0.159.2 fixtures, `via-5lr.3.1`); `checked` is 0.159.2 (fixtures and re-probes) and
+0.160.0 (live rounds 1 and 2 through VIA, 2026-10-05/06); a version outside the adapter's `checked` set is
 `untested` and warns; only a failed handshake check (policy and sandbox echo)
 refuses, as `submit_failed` with `failure.data.reason:"handshake_refused"`,
 cached per C2 §5.
@@ -342,10 +343,10 @@ and warns: MCP servers have no switch (`--disable apps` stops only
 `codex_apps`, and `-c mcp_servers={}` merges into the user's table and
 removes nothing; the earlier `--disable apps` for MCP off, via-4gl, was
 removed), nor do instruction files, plugins, skills or agents. The
-evidence was recorded on 0.159.2 (`checked`) and, for MCP servers, again
-on 0.160.0; for plugins, skills and agents on 0.160.0 only (`via-5lr.3.4`,
-round 2 below); on any version outside
-`checked` (0.160.0 included) the same states are reported with
+evidence was recorded on 0.159.2 and, for MCP servers, again on 0.160.0;
+for plugins, skills and agents on 0.160.0 only (`via-5lr.3.4`, round 2
+below); both are `checked`. On any version outside `checked` the same
+states are reported with
 `vendor_version_untested` (C2 §6.2, §5). Revisit: a later version may
 add disabling layers (owner, 2026-10-05). Every switch enters
 `config_hash`.

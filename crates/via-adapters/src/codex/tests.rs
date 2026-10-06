@@ -389,7 +389,8 @@ fn the_instance_version_comes_from_the_user_agent() {
         assert_eq!(instance_version(malformed), None, "{malformed:?}");
     }
     assert_eq!(version_status("0.159.2"), VersionStatus::Tested);
-    assert_eq!(version_status("0.160.0"), VersionStatus::Untested);
+    assert_eq!(version_status("0.160.0"), VersionStatus::Tested);
+    assert_eq!(version_status("0.161.0"), VersionStatus::Untested);
 }
 
 /// Packet §3: a `model/list` page gives each model's advertised efforts

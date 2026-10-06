@@ -1538,9 +1538,9 @@ fn codex_pin_handshake() {
 
     // An untested version proceeds, reported as such.
     let (mut replay, mut expect) = plain("codex_pin_handshake_untested").unwrap();
-    edit_emit(&mut replay, 1, "via/0.159.2", "via/0.160.0").unwrap();
+    edit_emit(&mut replay, 1, "via/0.159.2", "via/0.161.0").unwrap();
     turn_mut(&mut expect, 0)["expect"]["instance"] =
-        json!({"vendor_version": "0.160.0", "version_status": "untested"});
+        json!({"vendor_version": "0.161.0", "version_status": "untested"});
     variant("codex_pin_handshake_untested", &replay, &expect).unwrap();
 
     // A malformed initialize reply: no userAgent.
