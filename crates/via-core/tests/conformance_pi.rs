@@ -2375,7 +2375,12 @@ fn pi_usage_accounting() {
                 steps.push(emit(
                     &json!({"type": "compaction_start", "reason": "threshold"}),
                 ));
-                steps.push(emit(&compaction));
+                // An array is the compaction's records in order.
+                if let Value::Array(records) = &compaction {
+                    steps.extend(records.iter().map(emit));
+                } else {
+                    steps.push(emit(&compaction));
+                }
             }
             let last = calls.len() - 1;
             for (at, call) in calls.iter().enumerate() {
@@ -2431,6 +2436,24 @@ fn pi_usage_accounting() {
         json!({"from": "samples", "input_tokens": 140, "cached_input_tokens": 20,
             "output_tokens": 18, "total_tokens": 158, "scope": "turn"}),
         estimated(0.75),
+    );
+    // Picrit #7: a summarization retried inside Pi (pi-ai's
+    // retryAssistantCall) reports only its last attempt's usage, so the
+    // turn's tokens and cost are unavailable, never an undercount.
+    run(
+        "pi_usage_compaction_retried",
+        vec![canonical_usage()],
+        Some(json!([
+            {"type": "summarization_retry_scheduled", "attempt": 1, "maxAttempts": 3,
+                "delayMs": 2000, "errorMessage": "terminated"},
+            {"type": "summarization_retry_attempt_start", "source": "compaction",
+                "reason": "threshold"},
+            {"type": "summarization_retry_finished"},
+            {"type": "compaction_end", "aborted": false,
+                "result": {"summary": "s", "usage": usage(40, 8, 0, 0, 0.25)}},
+        ])),
+        null_usage(),
+        json!({"usd": null, "provenance": "unavailable"}),
     );
     run(
         "pi_usage_compaction_failed",

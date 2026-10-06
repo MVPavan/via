@@ -174,6 +174,12 @@ impl Normalizer {
                 let sample = self.sample(usage.as_ref());
                 self.deliver(sample)
             }
+            // Packet §5.5: a retried attempt's usage Pi never reports is
+            // one more model call without usage.
+            Record::UsageHidden => {
+                let sample = self.sample(None);
+                self.deliver(sample)
+            }
             Record::MessageUpdate { model: false }
             | Record::Response(_)
             | Record::Lifecycle

@@ -59,6 +59,10 @@ pub enum Record {
     /// `compaction_end`: a model call (E63), with its usage when it
     /// reported one.
     CompactionEnd(Option<Usage>),
+    /// `summarization_retry_scheduled`: Pi retries a summarization inside
+    /// pi-ai's `retryAssistantCall`, which reports only the last
+    /// attempt's usage (packet §5.5), so a model call's usage is hidden.
+    UsageHidden,
     /// `extension_ui_request` (packet §6).
     UiRequest(UiRequest),
     /// Any other record, known or not: activity, no observation.
@@ -244,6 +248,7 @@ pub fn decode(line: &[u8]) -> Result<Record, DecodeError> {
                 .map(usage)
                 .transpose()?,
         ),
+        "summarization_retry_scheduled" => Record::UsageHidden,
         "extension_ui_request" => Record::UiRequest(UiRequest {
             id: optional_short(object, "id", "an extension_ui_request with a malformed id")?,
             // C2 A1: room for the Adapter's prefix within 1 KiB.

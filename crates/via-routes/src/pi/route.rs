@@ -580,7 +580,8 @@ async fn read_replies(
             | Record::MessageUpdate { .. }
             | Record::ToolStart { .. }
             | Record::ToolEnd { .. }
-            | Record::CompactionEnd(_) => {
+            | Record::CompactionEnd(_)
+            | Record::UsageHidden => {
                 return Err(protocol(turn, "a run record before the prompt").into());
             }
         }
@@ -687,14 +688,18 @@ impl PrivateProtocol for PiLane {
         let item = match record {
             Record::Response(reply) => lane.reply(turn, &reply)?,
             Record::UiRequest(request) => return Self::decline(serving, request).await,
-            Record::CompactionEnd(_) if !matches!(lane.phase, Phase::Started | Phase::Settled) => {
+            Record::CompactionEnd(_) | Record::UsageHidden
+                if !matches!(lane.phase, Phase::Started | Phase::Settled) =>
+            {
                 lane.held += 1;
                 if lane.held > HELD_SAMPLES_MAX {
                     return Err(protocol(turn, "too many compactions before started").into());
                 }
                 PiItem::Record(record)
             }
-            Record::CompactionEnd(_) | Record::Activity => PiItem::Record(record),
+            Record::CompactionEnd(_) | Record::UsageHidden | Record::Activity => {
+                PiItem::Record(record)
+            }
             _ if !matches!(lane.phase, Phase::Started | Phase::Settled) => {
                 return Err(
                     protocol(turn, "a run record before the prompt's started reply").into(),

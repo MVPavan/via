@@ -463,7 +463,7 @@ and stay unreachable.
 | `message_update` | `assistantMessageEvent.type` | §5.2; its cumulative `usage` is ignored |
 | `tool_execution_start`, `tool_execution_end` | `toolCallId`, `toolName` | Progress marks; no per-tool state (cleanup is group-based, §7) |
 | `extension_ui_request` | `method` | §6 |
-| `compaction_*`, `auto_retry_*`, `entry_appended`, `queue_update`, other known types | `type` | Activity; compaction usage per §5.5 |
+| `compaction_*`, `auto_retry_*`, `summarization_retry_*`, `entry_appended`, `queue_update`, other known types | `type` | Activity; compaction usage, and `summarization_retry_scheduled` as an all-`null` sample, per §5.5 |
 | unknown `type` | — | Activity; no observation |
 
 - Before the `started` reply, a lifecycle or `message_*` record is protocol
@@ -563,6 +563,14 @@ cache reads, E24); `cached_input` = `cacheRead`; `output` = `output`;
   is an all-`null` sample. A sample decoded before the `started` reply is
   held and delivered after `turn.accepted` (C2 §4's early-message retiming,
   as Codex), and dropped on a rejection.
+- **Hidden retries.** Pi retries a failed summarization (compaction, or a
+  branch summary) inside pi-ai's `retryAssistantCall`
+  (`packages/ai/src/utils/retry.ts` in 1.0.2), which returns only the last
+  attempt and reports no earlier attempt's usage; Pi's RPC shows only
+  `summarization_retry_scheduled`. Each one is an all-`null` sample, so the
+  turn's tokens and cost are unavailable rather than an undercount. The
+  agent's own auto-retry (`auto_retry_*`, E28) is not hidden: every attempt
+  ends with its own assistant `message_end`, a sample like any other.
 - `message_update` usage is cumulative and never a sample;
   `get_session_stats` is session-cumulative (E25, E52) and is not used.
 - **Cost.** The sum of `usage.cost.total` over the turn's samples, `scope:
@@ -728,7 +736,7 @@ hostile profiles only in scratch agent directories. Selection as Claude's:
 | `pi_settled_not_agent_end` | Auto-retry with several `agent_end` records gives one terminal at `agent_settled`; stdin stays open until then |
 | `pi_terminal_mapping` | Every §5.3 row; only the terminal message is final text; the system message never reaches final text, progress or the envelope |
 | `pi_progress_deltas` | One text block streaming longer than `idle_ms` keeps the turn alive; usage snapshots never become samples; idle expiry waits for the decode fence |
-| `pi_usage_accounting` | Mixed present and all-zero samples → `null` token components and `unavailable` cost; cache and reasoning counters map as §5.5; compaction with and without usage |
+| `pi_usage_accounting` | Mixed present and all-zero samples → `null` token components and `unavailable` cost; cache and reasoning counters map as §5.5; compaction with and without usage; a compaction after `summarization_retry_scheduled` → `null` tokens and `unavailable` cost |
 | `pi_abort` | Tool-phase and streaming markers with the paired reply acknowledge; the idle reply alone never does; a 401 racing the abort → `failed(auth)`, `requested`; natural completion keeps `Completed`; a reply after `agent_settled` is awaited; no reply by `force_at` → no acknowledgement |
 | `pi_eof_is_stop` | EOF mid-run: exit 0, no terminal, never `Completed` |
 | `pi_signals_cleanup` | Force close via TERM kills tool groups; a `setsid` escapee is a leftover; SIGINT is never sent; a spinning startup is bounded by deadlines and KILL |
