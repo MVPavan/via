@@ -603,8 +603,11 @@ of these failures is a vendor exit before the route's handshake.
   set-group-ID or file-capability program, or under a security-module
   transition that marks the execution secure. Host changes no
   credentials, and the anchor refuses such a program at `Configure`
-  (below). It covers the child process only, not its descendants. Linux
-  only; macOS is deferred.
+  (below). A new thread starts without the signal, so an exec from a
+  non-leader thread, which makes that thread the process (same pid and
+  start time), loses it; the fence assumes the vendor never does that
+  (`vendors/opencode.md` §3.2, L14). It covers the child process only,
+  not its descendants. Linux only; macOS is deferred.
 
 **Exclusive launch lock** (the OpenCode one-live-server fence,
 `vendors/opencode.md` §3.2). Host refuses a spec that sets
@@ -630,17 +633,20 @@ of these failures is a vendor exit before the route's handshake.
 4. reads the server record and requires its server gone
    (`vendors/opencode.md` §3.2): a missing or torn record, another boot
    ID, or, in the same boot and PID namespace, an exact exit proof:
-   `rustix::process::pidfd_open(pid, PidfdFlags::empty())` failing with
-   `ESRCH`; or, after it opens, `/proc/<pid>/stat` gone or showing other
-   start ticks (the pid was reused); or, with equal ticks (the pidfd names
-   the recorded process), `rustix::event::poll` on it reporting readable,
+   `/proc/<pid>/stat` gone or showing other start ticks before any open
+   (the pid is free or was reused, as a process or a thread); or, with
+   matching ticks, `rustix::process::pidfd_open(pid, PidfdFlags::empty())`
+   failing with `ESRCH`; or, after it opens, `/proc/<pid>/stat` gone or
+   showing other start ticks; or, with equal ticks (the pidfd names the
+   recorded process), `rustix::event::poll` on it reporting readable,
    which Linux's `pidfd_poll` (`kernel/fork.c`) does only when
    `thread_group_exited` (`kernel/exit.c`) holds, that is, the whole
-   thread group has exited, reaped or not. Any other `pidfd_open` error
-   (`EINVAL`, `ENOSYS`, permission) or a poll that is not readable is
-   present: unavailability fails closed. A present server is waited for by
-   polling the pidfd with a timeout, up to 1 s in all, then the anchor
-   replies `PredecessorAlive`. The same boot in another
+   thread group has exited, reaped or not. Identity that cannot be read,
+   any other `pidfd_open` error after a matched identity (`EINVAL`,
+   `ENOSYS`, permission) or a poll that is not readable is present:
+   unavailability fails closed. A present server is waited for by polling
+   the pidfd with a timeout, up to 1 s in all, then the anchor replies
+   `PredecessorAlive { pid }`. The same boot in another
    PID namespace is `PredecessorUncertain { namespace }` at once.
 
 On any of these errors it replies the error and exits: Host commits no
