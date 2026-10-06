@@ -1,0 +1,183 @@
+{
+  "argv": [
+    "--mode",
+    "rpc",
+    "--model",
+    "openai/gpt-6-luna",
+    "--session-dir",
+    {
+      "capture": "sdir"
+    },
+    "--session-id",
+    "187d2602-5d80-45de-a2b2-2080d91eb589",
+    "--tools",
+    "read,bash,edit,write",
+    "--no-approve",
+    "-ne",
+    "-np",
+    "--offline"
+  ],
+  "deadline_ms": 20000,
+  "source": "synthetic (via-jt8.3.1): VIA's abort during a tool (E15, E54): the marker, settlement, then the reply",
+  "steps": [
+    {
+      "expect": {
+        "capture": {
+          "gs": "/id"
+        },
+        "line": {
+          "type": "get_state"
+        }
+      }
+    },
+    {
+      "expect": {
+        "capture": {
+          "gm": "/id"
+        },
+        "line": {
+          "type": "get_available_models"
+        }
+      }
+    },
+    {
+      "expect": {
+        "capture": {
+          "gc": "/id"
+        },
+        "line": {
+          "type": "get_commands"
+        }
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"command\":\"get_state\",\"data\":{\"isCompacting\":false,\"isStreaming\":false,\"messageCount\":0,\"model\":{\"id\":\"gpt-6-luna\",\"name\":\"GPT-6 Luna\",\"provider\":\"openai\"},\"pendingMessageCount\":0,\"sessionFile\":\"${sdir}/2026-10-06T00-00-00-000Z_187d2602-5d80-45de-a2b2-2080d91eb589.jsonl\",\"sessionId\":\"187d2602-5d80-45de-a2b2-2080d91eb589\",\"thinkingLevel\":\"off\"},\"id\":${gs},\"success\":true,\"type\":\"response\"}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"command\":\"get_available_models\",\"data\":{\"models\":[{\"id\":\"gpt-6-luna\",\"name\":\"GPT-6 Luna\",\"provider\":\"openai\"},{\"id\":\"gpt-6-sol\",\"name\":\"GPT-6 Sol\",\"provider\":\"openai\"}]},\"id\":${gm},\"success\":true,\"type\":\"response\"}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"command\":\"get_commands\",\"data\":{\"commands\":[{\"description\":\"Review a change\",\"name\":\"skill:review\",\"source\":\"skill\"}]},\"id\":${gc},\"success\":true,\"type\":\"response\"}"
+      }
+    },
+    {
+      "expect": {
+        "capture": {
+          "p": "/id"
+        },
+        "line": {
+          "message": "Run sleep 30 with bash.",
+          "type": "prompt"
+        }
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"command\":\"prompt\",\"data\":{\"disposition\":\"started\"},\"id\":${p},\"success\":true,\"type\":\"response\"}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"agent_start\"}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"turn_start\"}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"message\":{\"content\":[{\"text\":\"Run sleep 30 with bash.\",\"type\":\"text\"}],\"role\":\"user\",\"timestamp\":1},\"type\":\"message_start\"}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"message\":{\"content\":[{\"text\":\"Run sleep 30 with bash.\",\"type\":\"text\"}],\"role\":\"user\",\"timestamp\":1},\"type\":\"message_end\"}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"assistantMessageEvent\":{\"contentIndex\":0,\"id\":\"call_1\",\"toolName\":\"bash\",\"type\":\"toolcall_start\"},\"type\":\"message_update\",\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0.25},\"input\":70,\"output\":3,\"reasoning\":0,\"totalTokens\":73}}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"message\":{\"api\":\"openai-responses\",\"content\":[{\"arguments\":{\"command\":\"sleep 30\"},\"id\":\"call_1\",\"name\":\"bash\",\"type\":\"toolCall\"}],\"model\":\"gpt-6-luna\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"toolUse\",\"timestamp\":2,\"usage\":{\"cacheRead\":20,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0.5},\"input\":80,\"output\":10,\"reasoning\":0,\"totalTokens\":110}},\"type\":\"message_end\"}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"args\":{\"command\":\"sleep 30\"},\"toolCallId\":\"call_1\",\"toolName\":\"bash\",\"type\":\"tool_execution_start\"}"
+      }
+    },
+    {
+      "expect": {
+        "capture": {
+          "ab": "/id"
+        },
+        "line": {
+          "type": "abort"
+        }
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"isError\":true,\"result\":{\"content\":[{\"text\":\"Command aborted\",\"type\":\"text\"}]},\"toolCallId\":\"call_1\",\"toolName\":\"bash\",\"type\":\"tool_execution_end\"}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"message\":{\"content\":[{\"text\":\"Command aborted\",\"type\":\"text\"}],\"isError\":true,\"role\":\"toolResult\",\"timestamp\":3,\"toolCallId\":\"call_1\",\"toolName\":\"bash\"},\"type\":\"message_start\"}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"message\":{\"content\":[{\"text\":\"Command aborted\",\"type\":\"text\"}],\"isError\":true,\"role\":\"toolResult\",\"timestamp\":3,\"toolCallId\":\"call_1\",\"toolName\":\"bash\"},\"type\":\"message_end\"}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"message\":{\"role\":\"assistant\"},\"toolResults\":[{\"content\":[{\"text\":\"Command aborted\",\"type\":\"text\"}],\"isError\":true,\"role\":\"toolResult\",\"timestamp\":3,\"toolCallId\":\"call_1\",\"toolName\":\"bash\"}],\"type\":\"turn_end\"}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"turn_start\"}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"message\":{\"api\":\"openai-responses\",\"content\":[],\"errorMessage\":\"This operation was aborted\",\"model\":\"gpt-6-luna\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"error\",\"timestamp\":2,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0.0},\"input\":0,\"output\":0,\"reasoning\":0,\"totalTokens\":0}},\"type\":\"message_end\"}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"message\":{\"api\":\"openai-responses\",\"content\":[],\"errorMessage\":\"This operation was aborted\",\"model\":\"gpt-6-luna\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"error\",\"timestamp\":2,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0.0},\"input\":0,\"output\":0,\"reasoning\":0,\"totalTokens\":0}},\"toolResults\":[],\"type\":\"turn_end\"}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"messages\":[{\"api\":\"openai-responses\",\"content\":[],\"errorMessage\":\"This operation was aborted\",\"model\":\"gpt-6-luna\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"error\",\"timestamp\":2,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0.0},\"input\":0,\"output\":0,\"reasoning\":0,\"totalTokens\":0}}],\"type\":\"agent_end\",\"willRetry\":false}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"type\":\"agent_settled\"}"
+      }
+    },
+    {
+      "emit": {
+        "line": "{\"command\":\"abort\",\"id\":${ab},\"success\":true,\"type\":\"response\"}"
+      }
+    },
+    {
+      "await_eof": {}
+    }
+  ]
+}

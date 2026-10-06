@@ -77,9 +77,10 @@
 //! one observation; `observation_counts` counts by kind. An observation is
 //! `{kind, …}` with the C2 §4 correlation fields of its kind
 //! ([`OBSERVATION_FIELDS`]):
-//! - `session.vendor_identity_confirmed`: `vendor_session_id`, and
-//!   `generation`, the 1-based ordinal of its `connection_id` among the
-//!   distinct connection IDs of the case, in first-seen order;
+//! - `session.vendor_identity_confirmed`: `vendor_session_id`, the
+//!   `transcript` hint (a path, or null), and `generation`, the 1-based
+//!   ordinal of its `connection_id` among the distinct connection IDs of
+//!   the case, in first-seen order;
 //! - `turn.accepted`: `vendor_turn_id`, and `correlation`, the 1-based
 //!   ordinal of its acceptance token among the case's distinct tokens;
 //! - `progress`: `model`, `tools_started` (`[[id, name], …]`),
@@ -344,6 +345,9 @@ pub(crate) struct TurnOutcome {
     /// `Quiescent`), before `TurnEvidence` reads `None` as uncertain; for
     /// a test's own checks.
     pub(crate) route_cleanup: Option<String>,
+    /// The failure's text, as Core takes it for C1 `failure.message`
+    /// (`AdapterError`'s display); for a test's own checks.
+    pub(crate) message: Option<String>,
 }
 
 const TOP: &[&str] = &[
@@ -528,7 +532,7 @@ const CLOSE_MODE: &[&str] = &["graceful", "force"];
 const OBSERVATION_FIELDS: &[(&str, &[&str])] = &[
     (
         "session.vendor_identity_confirmed",
-        &["vendor_session_id", "generation"],
+        &["vendor_session_id", "generation", "transcript"],
     ),
     ("turn.accepted", &["correlation", "vendor_turn_id"]),
     ("turn.late_terminal", &[]),
@@ -1860,6 +1864,7 @@ fn ideal_turn(e: &Value) -> TurnOutcome {
         gates: Vec::new(),
         undecoded: None,
         route_cleanup: None,
+        message: None,
     }
 }
 

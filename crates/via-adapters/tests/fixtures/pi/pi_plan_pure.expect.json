@@ -1,0 +1,485 @@
+{
+  "describe": {
+    "capabilities": {
+      "bounds": [
+        "full"
+      ],
+      "network_control": false,
+      "params": {
+        "effort": {
+          "support": "native"
+        },
+        "instructions": {
+          "support": "native"
+        },
+        "max_steps": {
+          "support": "unsupported"
+        },
+        "output_schema": {
+          "support": "unsupported"
+        }
+      },
+      "recover": {
+        "support": "unsupported"
+      },
+      "usage": {
+        "cost": "turn",
+        "tokens": "turn"
+      },
+      "verbs": {
+        "cancel": {
+          "support": "native"
+        },
+        "close": {
+          "support": "native"
+        },
+        "resume": {
+          "support": "native"
+        },
+        "spawn": {
+          "support": "native"
+        },
+        "steer": {
+          "support": "unsupported"
+        }
+      }
+    },
+    "launches": 0,
+    "params": {
+      "harness": "pi",
+      "model": "openai/gpt-6-luna"
+    },
+    "vendor_version": null,
+    "version_status": "untested"
+  },
+  "harness": "pi",
+  "launch_checkpoints": {
+    "after_open": {
+      "bad_effort": 0,
+      "extra_dirs": 0,
+      "max_steps": 0,
+      "offline": 0,
+      "output_schema": 0,
+      "read_only": 0,
+      "reserved": 0,
+      "unknown_key": 0,
+      "workspace_write": 0
+    },
+    "after_pure": 0,
+    "after_turn": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  },
+  "launches": 0,
+  "plan_checks": [
+    {
+      "refusal": "missing_capability:steer",
+      "require": "steer"
+    },
+    {
+      "refusal": null,
+      "require": "cancel"
+    },
+    {
+      "refusal": null,
+      "require": "close"
+    }
+  ],
+  "pure_writes": [],
+  "sessions": {
+    "bad_effort": {
+      "close": null,
+      "cwd": "/work/project",
+      "instructions": null,
+      "model": "openai/gpt-6-luna",
+      "resume": null
+    },
+    "extra_dirs": {
+      "close": null,
+      "cwd": "/work/project",
+      "instructions": null,
+      "model": "openai/gpt-6-luna",
+      "resume": null
+    },
+    "max_steps": {
+      "close": null,
+      "cwd": "/work/project",
+      "instructions": null,
+      "model": "openai/gpt-6-luna",
+      "resume": null
+    },
+    "offline": {
+      "close": null,
+      "cwd": "/work/project",
+      "instructions": null,
+      "model": "openai/gpt-6-luna",
+      "resume": null
+    },
+    "output_schema": {
+      "close": null,
+      "cwd": "/work/project",
+      "instructions": null,
+      "model": "openai/gpt-6-luna",
+      "resume": null
+    },
+    "read_only": {
+      "close": null,
+      "cwd": "/work/project",
+      "instructions": null,
+      "model": "openai/gpt-6-luna",
+      "resume": null
+    },
+    "reserved": {
+      "close": null,
+      "cwd": "/work/project",
+      "instructions": null,
+      "model": "openai/gpt-6-luna",
+      "resume": null,
+      "vendor_options": {
+        "pi": {
+          "--provider": "openai"
+        }
+      }
+    },
+    "unknown_key": {
+      "close": null,
+      "cwd": "/work/project",
+      "instructions": null,
+      "model": "openai/gpt-6-luna",
+      "resume": null,
+      "vendor_options": {
+        "pi": {
+          "zz-option": "x"
+        }
+      }
+    },
+    "workspace_write": {
+      "close": null,
+      "cwd": "/work/project",
+      "instructions": null,
+      "model": "openai/gpt-6-luna",
+      "resume": null
+    }
+  },
+  "source": "synthetic (via-jt8.3.1): packet §3, §4.5, §4.8, §6; nothing launches",
+  "turns": [
+    {
+      "expect": {
+        "accepted": false,
+        "cleanup": null,
+        "error": null,
+        "notes": "No step limit exists (E43): refused before any receipt.",
+        "observation_counts": {
+          "turn.accepted": 0
+        },
+        "observations_exclude": [
+          "turn.accepted"
+        ],
+        "plan_refusal": "invalid_param:max_steps",
+        "rejected": null,
+        "terminal": null,
+        "warnings": []
+      },
+      "params": {
+        "bound": {
+          "extra_write_dirs": [],
+          "mode": "full",
+          "network": true
+        },
+        "effort": null,
+        "max_steps": 5,
+        "output_schema": null,
+        "prompt": "Say READY."
+      },
+      "session": "max_steps",
+      "start_after": null,
+      "steer": [],
+      "stop": null,
+      "tool_grace_ms": null
+    },
+    {
+      "expect": {
+        "accepted": false,
+        "cleanup": null,
+        "error": null,
+        "notes": "No schema input exists (E42).",
+        "observation_counts": {
+          "turn.accepted": 0
+        },
+        "observations_exclude": [
+          "turn.accepted"
+        ],
+        "plan_refusal": "invalid_param:output_schema",
+        "rejected": null,
+        "terminal": null,
+        "warnings": []
+      },
+      "params": {
+        "bound": {
+          "extra_write_dirs": [],
+          "mode": "full",
+          "network": true
+        },
+        "effort": null,
+        "max_steps": null,
+        "output_schema": {
+          "type": "object"
+        },
+        "prompt": "Say READY."
+      },
+      "session": "output_schema",
+      "start_after": null,
+      "steer": [],
+      "stop": null,
+      "tool_grace_ms": null
+    },
+    {
+      "expect": {
+        "accepted": false,
+        "cleanup": null,
+        "error": null,
+        "notes": "Only full is claimable (packet §6, E35).",
+        "observation_counts": {
+          "turn.accepted": 0
+        },
+        "observations_exclude": [
+          "turn.accepted"
+        ],
+        "plan_refusal": "bound_unsupported",
+        "rejected": null,
+        "terminal": null,
+        "warnings": []
+      },
+      "params": {
+        "bound": {
+          "extra_write_dirs": [],
+          "mode": "read_only",
+          "network": true
+        },
+        "effort": null,
+        "max_steps": null,
+        "output_schema": null,
+        "prompt": "Say READY."
+      },
+      "session": "read_only",
+      "start_after": null,
+      "steer": [],
+      "stop": null,
+      "tool_grace_ms": null
+    },
+    {
+      "expect": {
+        "accepted": false,
+        "cleanup": null,
+        "error": null,
+        "notes": "Only full is claimable (packet §6, E35).",
+        "observation_counts": {
+          "turn.accepted": 0
+        },
+        "observations_exclude": [
+          "turn.accepted"
+        ],
+        "plan_refusal": "bound_unsupported",
+        "rejected": null,
+        "terminal": null,
+        "warnings": []
+      },
+      "params": {
+        "bound": {
+          "extra_write_dirs": [],
+          "mode": "workspace_write",
+          "network": true
+        },
+        "effort": null,
+        "max_steps": null,
+        "output_schema": null,
+        "prompt": "Say READY."
+      },
+      "session": "workspace_write",
+      "start_after": null,
+      "steer": [],
+      "stop": null,
+      "tool_grace_ms": null
+    },
+    {
+      "expect": {
+        "accepted": false,
+        "cleanup": null,
+        "error": null,
+        "notes": "network:false is never claimable: --offline does not isolate (E49).",
+        "observation_counts": {
+          "turn.accepted": 0
+        },
+        "observations_exclude": [
+          "turn.accepted"
+        ],
+        "plan_refusal": "bound_unsupported",
+        "rejected": null,
+        "terminal": null,
+        "warnings": []
+      },
+      "params": {
+        "bound": {
+          "extra_write_dirs": [],
+          "mode": "full",
+          "network": false
+        },
+        "effort": null,
+        "max_steps": null,
+        "output_schema": null,
+        "prompt": "Say READY."
+      },
+      "session": "offline",
+      "start_after": null,
+      "steer": [],
+      "stop": null,
+      "tool_grace_ms": null
+    },
+    {
+      "expect": {
+        "accepted": false,
+        "cleanup": null,
+        "error": null,
+        "notes": "Nonempty extra_write_dirs with full is invalid_params (packet §6).",
+        "observation_counts": {
+          "turn.accepted": 0
+        },
+        "observations_exclude": [
+          "turn.accepted"
+        ],
+        "plan_refusal": "invalid_param:bound",
+        "rejected": null,
+        "terminal": null,
+        "warnings": []
+      },
+      "params": {
+        "bound": {
+          "extra_write_dirs": [
+            "/work/other"
+          ],
+          "mode": "full",
+          "network": true
+        },
+        "effort": null,
+        "max_steps": null,
+        "output_schema": null,
+        "prompt": "Say READY."
+      },
+      "session": "extra_dirs",
+      "start_after": null,
+      "steer": [],
+      "stop": null,
+      "tool_grace_ms": null
+    },
+    {
+      "expect": {
+        "accepted": false,
+        "cleanup": null,
+        "error": null,
+        "notes": "Pi only warns on stderr for an invalid level (E41): refused at planning.",
+        "observation_counts": {
+          "turn.accepted": 0
+        },
+        "observations_exclude": [
+          "turn.accepted"
+        ],
+        "plan_refusal": "invalid_param:effort",
+        "rejected": null,
+        "terminal": null,
+        "warnings": []
+      },
+      "params": {
+        "bound": {
+          "extra_write_dirs": [],
+          "mode": "full",
+          "network": true
+        },
+        "effort": "bogus",
+        "max_steps": null,
+        "output_schema": null,
+        "prompt": "Say READY."
+      },
+      "session": "bad_effort",
+      "start_after": null,
+      "steer": [],
+      "stop": null,
+      "tool_grace_ms": null
+    },
+    {
+      "expect": {
+        "accepted": false,
+        "cleanup": null,
+        "error": null,
+        "notes": "A recipe flag is a reserved vendor key (packet §4.8).",
+        "observation_counts": {
+          "turn.accepted": 0
+        },
+        "observations_exclude": [
+          "turn.accepted"
+        ],
+        "plan_refusal": "vendor_option_conflict",
+        "rejected": null,
+        "terminal": null,
+        "warnings": []
+      },
+      "params": {
+        "bound": {
+          "extra_write_dirs": [],
+          "mode": "full",
+          "network": true
+        },
+        "effort": null,
+        "max_steps": null,
+        "output_schema": null,
+        "prompt": "Say READY."
+      },
+      "session": "reserved",
+      "start_after": null,
+      "steer": [],
+      "stop": null,
+      "tool_grace_ms": null
+    },
+    {
+      "expect": {
+        "accepted": false,
+        "cleanup": null,
+        "error": null,
+        "notes": "The vendor-option allow-list is empty (packet §4.8).",
+        "observation_counts": {
+          "turn.accepted": 0
+        },
+        "observations_exclude": [
+          "turn.accepted"
+        ],
+        "plan_refusal": "invalid_param:vendor",
+        "rejected": null,
+        "terminal": null,
+        "warnings": []
+      },
+      "params": {
+        "bound": {
+          "extra_write_dirs": [],
+          "mode": "full",
+          "network": true
+        },
+        "effort": null,
+        "max_steps": null,
+        "output_schema": null,
+        "prompt": "Say READY."
+      },
+      "session": "unknown_key",
+      "start_after": null,
+      "steer": [],
+      "stop": null,
+      "tool_grace_ms": null
+    }
+  ]
+}

@@ -162,7 +162,21 @@ pub(crate) struct Knobs {
     /// at or after the wall), then the gate is signalled. It replaces the
     /// stated stop's action.
     pub(crate) order_after_wall: Option<&'static str>,
+    /// `(admitted, point)`: before the turn at index `admitted` starts,
+    /// failpoint `point`'s first occurrence is released, and the case
+    /// waits [`RELEASE_SETTLE`] (a paused anchor's cleanup runs meanwhile).
+    pub(crate) release_before: Option<(usize, &'static str)>,
+    /// `(admitted, change)`: before the turn at index `admitted` starts,
+    /// `change` runs on the case's state directory (a profile fixed
+    /// between turns).
+    pub(crate) change_before: Option<(usize, Change)>,
 }
+
+/// A test's change to the case's state directory, given its path.
+pub(crate) type Change = fn(&Path) -> std::io::Result<()>;
+
+/// How long [`Knobs::release_before`] waits after the release.
+const RELEASE_SETTLE: Duration = Duration::from_secs(2);
 
 /// The failpoint at an accepted Codex turn's wait, before it polls its
 /// orders.
@@ -533,6 +547,17 @@ impl<'a> Run<'a> {
         }
         if self.knobs.admit_after_failure == Some(index) {
             self.health_failed(turn).await?;
+        }
+        if let Some((at, point)) = self.knobs.release_before
+            && at == index
+        {
+            drop(Release(point));
+            tokio::time::sleep(RELEASE_SETTLE).await;
+        }
+        if let Some((at, change)) = self.knobs.change_before
+            && at == index
+        {
+            change(self.pure.state.path()).map_err(|e| format!("turn {index}: change: {e}"))?;
         }
         Ok(())
     }
@@ -1041,7 +1066,8 @@ impl<'a> Run<'a> {
                 let ids = &mut ordinals.0;
                 let generation = ordinal(ids, &identity.connection_id);
                 json!({"kind": "session.vendor_identity_confirmed",
-                    "vendor_session_id": identity.vendor_session_id, "generation": generation})
+                    "vendor_session_id": identity.vendor_session_id, "generation": generation,
+                    "transcript": identity.transcript.as_ref().map(|path| path.display().to_string())})
             }
             Observation::Accepted(acceptance) => {
                 let tokens = &mut ordinals.1;
@@ -1336,6 +1362,7 @@ impl<'a> Run<'a> {
         let mut outcome = snapshot(observed, &session.plan);
         outcome.rejected = rejected;
         outcome.error = error;
+        outcome.message = end.outcome.as_ref().err().map(ToString::to_string);
         if let Err(AdapterError::Route(failure)) = &end.outcome {
             outcome.undecoded.clone_from(&failure.undecoded);
             outcome.route_cleanup = failure.cleanup.map(|cleanup| format!("{cleanup:?}"));

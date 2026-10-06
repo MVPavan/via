@@ -235,13 +235,16 @@ impl Pure {
     ) -> Result<Result<RoutePlan, String>, String> {
         let bound = optional_bound(&params["bound"])?;
         let vendor = vendor_options(&session["vendor_options"])?;
+        let json_len = |value: &Value| value.as_str().map_or(0, |_| value.to_string().len());
         let sizes = ParamSizes {
             instructions: session["instructions"].as_str().map_or(0, str::len),
+            instructions_json: json_len(&session["instructions"]),
             output_schema: if params["output_schema"].is_null() {
                 0
             } else {
                 params["output_schema"].to_string().len()
             },
+            prompt_json: json_len(&params["prompt"]),
             ..ParamSizes::default()
         };
         let request = DescribeRequest {
@@ -386,6 +389,17 @@ fn adapter_set(harness: &str, binary: &Path, state: &Path) -> Result<(AdapterSet
         settings["restricted"] = Value::Bool(true);
         settings["inherit"] = serde_json::json!({ "mcp_servers": false });
     }
+    if harness == "pi" {
+        // Pi's private agent directory (packet §4.2-4.3), as the owner
+        // prepares it: the one required setting, nothing else.
+        let agent = state.join("vendor").join("pi").join("agent");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(&agent)
+            .map_err(|e| format!("pi agent dir: {e}"))?;
+        write_private(&agent.join("settings.json"), br#"{"cacheWarming":"off"}"#)?;
+    }
     harnesses.insert(harness.to_owned(), settings);
     let raw = serde_json::value::RawValue::from_string(Value::Object(harnesses).to_string())
         .map_err(|e| e.to_string())?;
@@ -404,6 +418,20 @@ fn adapter_set(harness: &str, binary: &Path, state: &Path) -> Result<(AdapterSet
     )
     .map_err(|e| e.to_string())?;
     Ok((set, store))
+}
+
+/// Writes `bytes` to a new file at `path`, readable by its owner only.
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    file.write_all(bytes)
+        .map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// A `describe` request from C1 §3.1 `params`.
