@@ -19,13 +19,17 @@
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::future::poll_fn;
 use std::net::Ipv4Addr;
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::task::Poll;
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use tokio::time::{Instant, timeout_at};
 
 use crate::Deadline;
@@ -126,6 +130,50 @@ pub enum Sent {
     Maybe,
 }
 
+/// First-byte evidence for cancellable requests (`vendors/opencode.md` §7.4, §8).
+/// The callback must be synchronous and bounded; it runs once after the first write.
+pub struct SentTracker {
+    sent: AtomicBool,
+    changed: Notify,
+    on_sent: Box<dyn Fn() + Send + Sync>,
+}
+
+impl SentTracker {
+    /// Tracks the first byte and updates its route's ownership inline (§8).
+    pub fn new(on_sent: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            sent: AtomicBool::new(false),
+            changed: Notify::new(),
+            on_sent: Box::new(on_sent),
+        }
+    }
+
+    /// Whether this request wrote any byte (§8).
+    pub fn is_sent(&self) -> bool {
+        self.sent.load(Ordering::Acquire)
+    }
+
+    /// Waits for first-byte evidence; cancellation preserves the evidence (§8).
+    pub async fn sent(&self) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.is_sent() {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    fn mark_sent(&self) {
+        if !self.sent.swap(true, Ordering::AcqRel) {
+            (self.on_sent)();
+            self.changed.notify_waiters();
+        }
+    }
+}
+
 /// Why a request produced no complete response.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HttpFailure {
@@ -144,6 +192,8 @@ pub enum HttpFailure {
         /// The declared `Content-Length`.
         length: Option<u64>,
     },
+    /// A JSON response passed runtime §8's structural limits.
+    JsonLimit(crate::json_limits::LimitError),
     /// The peer closed before the head or body was complete.
     Truncated,
     /// The head or the chunked framing was not valid HTTP/1.1.
@@ -159,11 +209,32 @@ pub struct HttpError {
     pub sent: Sent,
     /// Why it failed.
     pub kind: HttpFailure,
+    /// The decoded response status, if available before framing failed (§4).
+    pub response_status: Option<u16>,
 }
 
 impl HttpError {
     fn new(sent: Sent, kind: HttpFailure) -> Self {
-        Self { sent, kind }
+        Self {
+            sent,
+            kind,
+            response_status: None,
+        }
+    }
+
+    /// Whether the peer exceeded an HTTP or JSON response bound (runtime §8).
+    pub fn is_response_limit(&self) -> bool {
+        matches!(
+            self.kind,
+            HttpFailure::HeadersTooLarge
+                | HttpFailure::BodyTooLarge { .. }
+                | HttpFailure::JsonLimit(_)
+        )
+    }
+
+    /// Positive decoded authentication refusal evidence (`OpenCode` §8).
+    pub fn is_unauthorized(&self) -> bool {
+        self.response_status == Some(401) || self.kind == HttpFailure::Status(401)
     }
 }
 
@@ -176,6 +247,7 @@ pub struct HttpClient {
     decline: Arc<Semaphore>,
     stop: Arc<Semaphore>,
     general: Arc<Semaphore>,
+    general_closed: Mutex<bool>,
 }
 
 impl fmt::Debug for HttpClient {
@@ -201,12 +273,24 @@ impl HttpClient {
             decline: Arc::new(Semaphore::new(DECLINE_CONNECTIONS)),
             stop: Arc::new(Semaphore::new(STOP_CONNECTIONS)),
             general: Arc::new(Semaphore::new(GENERAL_CONNECTIONS)),
+            general_closed: Mutex::new(false),
         }
     }
 
     /// The server's port.
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// Fence general first bytes and publish drain under that gate (§8).
+    /// `publish` must be synchronous and bounded; stops/declines remain open.
+    pub fn close_general<T>(&self, publish: impl FnOnce() -> T) -> T {
+        let mut closed = self
+            .general_closed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *closed = true;
+        publish()
     }
 
     fn pool(&self, pool: Pool) -> &Semaphore {
@@ -226,7 +310,22 @@ impl HttpClient {
         deadline: Deadline,
     ) -> Result<HttpResponse, HttpError> {
         let mut sent = Sent::No;
-        let exchange = self.exchange(request, &mut sent);
+        let exchange = self.exchange(request, &mut sent, None);
+        match timeout_at(deadline.instant(), exchange).await {
+            Ok(outcome) => outcome,
+            Err(_) => Err(HttpError::new(sent, HttpFailure::Deadline)),
+        }
+    }
+
+    /// A cancellable request with first-byte evidence (`opencode.md` §8).
+    pub async fn request_tracked(
+        &self,
+        request: HttpRequest<'_>,
+        deadline: Deadline,
+        tracker: &SentTracker,
+    ) -> Result<HttpResponse, HttpError> {
+        let mut sent = Sent::No;
+        let exchange = self.exchange(request, &mut sent, Some(tracker));
         match timeout_at(deadline.instant(), exchange).await {
             Ok(outcome) => outcome,
             Err(_) => Err(HttpError::new(sent, HttpFailure::Deadline)),
@@ -237,6 +336,7 @@ impl HttpClient {
         &self,
         request: HttpRequest<'_>,
         sent: &mut Sent,
+        tracker: Option<&SentTracker>,
     ) -> Result<HttpResponse, HttpError> {
         // The pool is never closed: a closed one is an I/O failure.
         let _permit = self
@@ -244,6 +344,14 @@ impl HttpClient {
             .acquire()
             .await
             .map_err(|_| HttpError::new(Sent::No, HttpFailure::Io))?;
+        if request.pool == Pool::General
+            && *self
+                .general_closed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+        {
+            return Err(HttpError::new(Sent::No, HttpFailure::Io));
+        }
         let mut stream = self.connect().await?;
         let head = self.head(
             request.method,
@@ -251,13 +359,34 @@ impl HttpClient {
             request.body,
             "application/json",
         );
-        write_tracked(&mut stream, head.as_bytes(), sent).await?;
+        let gate = (request.pool == Pool::General).then_some(&self.general_closed);
+        write_tracked(&mut stream, head.as_bytes(), sent, tracker, gate).await?;
         if let Some(body) = request.body {
-            write_tracked(&mut stream, body, sent).await?;
+            write_tracked(&mut stream, body, sent, tracker, gate).await?;
         }
         let mut reader = Reader::new(stream);
         let head = reader.read_final_head().await?;
-        let body = reader.read_body(head.framing, request.body_limit).await?;
+        // A declared length is positive cap evidence even when status forbids
+        // a message body (runtime §8; OpenCode §9). Do not read forbidden bodies.
+        if head
+            .declared_length
+            .is_some_and(|length| length > u64::try_from(request.body_limit).unwrap_or(u64::MAX))
+        {
+            return Err(HttpError {
+                sent: Sent::Maybe,
+                kind: HttpFailure::BodyTooLarge {
+                    length: head.declared_length,
+                },
+                response_status: Some(head.status),
+            });
+        }
+        let body = reader
+            .read_body(head.framing, request.body_limit)
+            .await
+            .map_err(|mut error| {
+                error.response_status = Some(head.status);
+                error
+            })?;
         Ok(HttpResponse {
             status: head.status,
             body,
@@ -276,7 +405,7 @@ impl HttpClient {
         let open = async {
             let mut stream = self.connect().await?;
             let head = self.head(Method::Get, target, None, "text/event-stream");
-            write_tracked(&mut stream, head.as_bytes(), &mut sent).await?;
+            write_tracked(&mut stream, head.as_bytes(), &mut sent, None, None).await?;
             let mut reader = Reader::new(stream);
             let head = reader.read_final_head().await?;
             if head.status != 200 {
@@ -325,13 +454,41 @@ async fn write_tracked(
     stream: &mut TcpStream,
     mut bytes: &[u8],
     sent: &mut Sent,
+    tracker: Option<&SentTracker>,
+    gate: Option<&Mutex<bool>>,
 ) -> Result<(), HttpError> {
     while !bytes.is_empty() {
-        match stream.write(bytes).await {
-            Ok(written) if written > 0 => {
-                *sent = Sent::Maybe;
-                bytes = &bytes[written..];
+        // The gate covers one nonblocking write poll and first-byte ownership only.
+        // It is released on Pending, so drain never holds a lock across an await.
+        let written = poll_fn(|context| {
+            let guard = if *sent == Sent::No {
+                gate.map(|gate| gate.lock().unwrap_or_else(PoisonError::into_inner))
+            } else {
+                None
+            };
+            if guard.as_deref() == Some(&true) {
+                return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
             }
+            // A tracked first write exposes only an incomplete request prefix.
+            // Its callback records ownership before the peer can act on a full
+            // header, while that byte still irrevocably means Sent::Maybe (§8).
+            let first = if *sent == Sent::No && tracker.is_some() {
+                &bytes[..1]
+            } else {
+                bytes
+            };
+            let result = Pin::new(&mut *stream).poll_write(context, first);
+            if matches!(result, Poll::Ready(Ok(written)) if written > 0) {
+                *sent = Sent::Maybe;
+                if let Some(tracker) = tracker {
+                    tracker.mark_sent();
+                }
+            }
+            result
+        })
+        .await;
+        match written {
+            Ok(written) if written > 0 => bytes = &bytes[written..],
             Ok(_) | Err(_) => return Err(HttpError::new(*sent, HttpFailure::Io)),
         }
     }
@@ -355,6 +512,8 @@ enum Framing {
 struct Head {
     status: u16,
     framing: Framing,
+    /// Declared length remains bound evidence even for an empty-body status (§8).
+    declared_length: Option<u64>,
 }
 
 /// A response's socket and the bytes read from it but not yet consumed.
@@ -412,7 +571,7 @@ impl Reader {
             }
             searched = self.buffer.len();
             if searched > cap {
-                return Err(failed(HttpFailure::HeadersTooLarge));
+                return Err(self.header_limit());
             }
             match self.fill().await {
                 Ok(0) => return Err(failed(HttpFailure::Truncated)),
@@ -421,11 +580,24 @@ impl Reader {
             }
         };
         if end > cap {
-            return Err(failed(HttpFailure::HeadersTooLarge));
+            return Err(self.header_limit());
         }
         let head = parse_head(&self.buffer[..end]).ok_or(failed(HttpFailure::Malformed))?;
         self.buffer.drain(..end);
         Ok((head, end))
+    }
+
+    /// A capped head retains only a bounded valid status line (runtime §4, §8).
+    fn header_limit(&self) -> HttpError {
+        let prefix = &self.buffer[..self.buffer.len().min(HEADER_BYTES)];
+        let response_status = find(prefix, b"\r\n")
+            .and_then(|end| std::str::from_utf8(&prefix[..end]).ok())
+            .and_then(parse_status);
+        HttpError {
+            sent: Sent::Maybe,
+            kind: HttpFailure::HeadersTooLarge,
+            response_status,
+        }
     }
 
     /// Reads the whole body under `limit`.
@@ -498,20 +670,7 @@ fn parse_head(head: &[u8]) -> Option<Head> {
     let text = std::str::from_utf8(head).ok()?;
     let mut lines = text.split("\r\n");
     let status_line = lines.next()?;
-    let rest = status_line.strip_prefix("HTTP/1.")?;
-    let mut parts = rest.splitn(3, ' ');
-    let minor = parts.next()?;
-    if minor.len() != 1 || !minor.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    let code = parts.next()?;
-    if code.len() != 3 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    let status: u16 = code.parse().ok()?;
-    if !(100..=599).contains(&status) {
-        return None;
-    }
+    let status = parse_status(status_line)?;
     let mut length: Option<u64> = None;
     let mut chunked = false;
     let mut coded = false;
@@ -548,7 +707,27 @@ fn parse_head(head: &[u8]) -> Option<Head> {
     } else {
         length.map_or(Framing::Close, Framing::Length)
     };
-    Some(Head { status, framing })
+    Some(Head {
+        status,
+        framing,
+        declared_length: length,
+    })
+}
+
+/// Status evidence uses the same grammar for complete and capped heads (§4).
+fn parse_status(status_line: &str) -> Option<u16> {
+    let rest = status_line.strip_prefix("HTTP/1.")?;
+    let mut parts = rest.splitn(3, ' ');
+    let minor = parts.next()?;
+    if minor.len() != 1 || !minor.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let code = parts.next()?;
+    if code.len() != 3 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let status: u16 = code.parse().ok()?;
+    (100..=599).contains(&status).then_some(status)
 }
 
 /// The chunked decoder's state.

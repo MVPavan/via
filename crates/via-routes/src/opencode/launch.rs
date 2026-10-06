@@ -129,7 +129,13 @@ pub(crate) async fn launch(
         version: version.clone(),
     })?;
     facts.vendor_pid = vendor_pid;
-    let live = Arc::new(Server::new(server, http, sender, vendor_pid));
+    let live = Arc::new(Server::new(
+        server,
+        http,
+        sender,
+        vendor_pid,
+        Arc::downgrade(&servers),
+    ));
     let task = Box::pin(run(Arc::clone(&live), stream, messages));
     Ok(Launched {
         server: live,
@@ -269,10 +275,13 @@ enum Got {
 }
 
 impl Got {
-    /// §2.2: a required endpoint's 404 is a refusal; every other status,
-    /// connection failure or bound is transient.
+    /// §2.2's endpoint refusals, with §8's 401 and §9's HTTP limits preserved.
     fn at(self, step: &'static str) -> LaunchFailure {
         match self {
+            Self::Status(401) => LaunchFailure::Protocol { step },
+            Self::Http(error) if error.is_response_limit() || error.is_unauthorized() => {
+                LaunchFailure::Protocol { step }
+            }
             Self::Status(404)
             | Self::Http(HttpError {
                 kind: HttpFailure::Status(404),
@@ -296,8 +305,8 @@ async fn get(
     body_limit: usize,
     deadline: Deadline,
 ) -> Result<Vec<u8>, Got> {
-    let response = http
-        .request(
+    let response = super::response::checked(
+        http.request(
             HttpRequest {
                 method: Method::Get,
                 target,
@@ -307,8 +316,9 @@ async fn get(
             },
             deadline,
         )
-        .await
-        .map_err(Got::Http)?;
+        .await,
+    )
+    .map_err(Got::Http)?;
     if response.status == 200 {
         Ok(response.body)
     } else {
@@ -347,4 +357,55 @@ fn password() -> Option<String> {
         let _ = write!(hex, "{byte:02x}");
         hex
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use via_wire::http::{BODY_BYTES, HttpError, HttpFailure, Sent};
+    use via_wire::json_limits::LimitError;
+
+    use super::{Got, LaunchFailure};
+
+    #[test]
+    fn oc09_handshake_http_limits_and_authentication_are_uncached_protocol() {
+        for kind in [
+            HttpFailure::HeadersTooLarge,
+            HttpFailure::BodyTooLarge {
+                length: Some(u64::try_from(BODY_BYTES + 1).unwrap()),
+            },
+            HttpFailure::JsonLimit(LimitError::Depth),
+            HttpFailure::JsonLimit(LimitError::Nodes),
+            HttpFailure::Status(401),
+        ] {
+            let failure = Got::Http(HttpError {
+                sent: Sent::Maybe,
+                kind,
+                response_status: None,
+            })
+            .at("read /api/model");
+            assert_eq!(
+                failure,
+                LaunchFailure::Protocol {
+                    step: "read /api/model"
+                }
+            );
+        }
+        assert_eq!(
+            Got::Status(401).at("read /api/model"),
+            LaunchFailure::Protocol {
+                step: "read /api/model"
+            }
+        );
+        assert_eq!(
+            Got::Http(HttpError {
+                sent: Sent::Maybe,
+                kind: HttpFailure::Malformed,
+                response_status: Some(200),
+            })
+            .at("read /api/model"),
+            LaunchFailure::Transient {
+                step: "read /api/model"
+            }
+        );
+    }
 }

@@ -1,7 +1,7 @@
 //! `opencode.md` §7.2–§7.3: admission, one submission and the outcome boundary.
 
 use super::driver::{Settings, Turn, effort_offered, switch_variant, tracked};
-use crate::driver::turn::unaccounted;
+use crate::driver::turn::{CLEANUP_ALLOWANCE, unaccounted};
 use crate::opencode::delivery::{Delivery, Registration, Sealed, Stop, generation_route_error};
 use crate::opencode::launch;
 use crate::{
@@ -42,9 +42,15 @@ fn input_id(session: &crate::SessionId, turn: TurnNumber) -> String {
 
 /// Outcome state is held in the delivery lane; server facts gate dispatch only.
 pub(super) struct Running {
-    server: Arc<Server>,
-    session: String,
-    delivery: Arc<Delivery>,
+    pub(super) server: Arc<Server>,
+    pub(super) session: String,
+    pub(super) input: String,
+    pub(super) delivery: Arc<Delivery>,
+    pub(super) sent: Arc<requests::SentTracker>,
+    pub(super) prompt_pending: bool,
+    pub(super) request_loss: Option<GenerationEnd>,
+    pub(super) cleanup: Option<crate::Cleanup>,
+    pub(super) acknowledgement_cutoff: Option<Deadline>,
     health: Arc<watch::Sender<DriverHealth>>,
     turn: TurnNumber,
     finished: bool,
@@ -53,6 +59,15 @@ pub(super) struct Running {
 impl Drop for Running {
     fn drop(&mut self) {
         if !self.finished {
+            if self.prompt_pending {
+                if self.sent.is_sent() {
+                    self.server.drain();
+                } else {
+                    let mut routing = self.server.routing();
+                    routing.request_completed(&self.session);
+                    routing.never_sent(&self.session, &self.input);
+                }
+            }
             self.delivery.seal();
             self.server.routing().settle(&self.session, self.turn);
             crate::driver::latch(&self.health, DriverFailure::TurnAbandoned);
@@ -106,9 +121,15 @@ async fn prepare(
     }
     let admission_by = facts.request_by();
     if !wait_eligible(server, id, admission_by).await {
-        return Err(session_busy(facts));
+        return Err(
+            if server.is_draining() || server.failure().is_some() || server.ended().is_some() {
+                Box::new(facts.rejected(StartRejected::SessionGone))
+            } else {
+                session_busy(facts)
+            },
+        );
     }
-    if server.failure().is_some() || server.ended().is_some() {
+    if server.is_draining() || server.failure().is_some() || server.ended().is_some() {
         return Err(Box::new(facts.rejected(StartRejected::SessionGone)));
     }
     if !opened.variant_checked
@@ -155,11 +176,22 @@ async fn prepare(
         admission_by,
     )
     .await?;
-    facts.submitted = true;
+    let sent = Arc::new(requests::SentTracker::new({
+        let server = Arc::clone(server);
+        let id = id.clone();
+        let input = input.clone();
+        move || server.routing().mark_sent(&id, &input)
+    }));
     facts.running = Some(Running {
         server: Arc::clone(server),
         session: id.clone(),
+        input: input.clone(),
         delivery: Arc::clone(&delivery),
+        sent,
+        prompt_pending: true,
+        request_loss: None,
+        cleanup: None,
+        acknowledgement_cutoff: None,
         health: Arc::clone(&facts.driver.health),
         turn: facts.number,
         finished: false,
@@ -186,7 +218,7 @@ async fn admit_ready(
     loop {
         {
             let mut routing = server.routing();
-            if server.failure().is_some() || server.ended().is_some() {
+            if server.is_draining() || server.failure().is_some() || server.ended().is_some() {
                 return Err(Box::new(facts.rejected(StartRejected::SessionGone)));
             }
             // A foreign execution can begin during the effort/readback or
@@ -199,9 +231,14 @@ async fn admit_ready(
                     activity,
                     facts.instance.clone(),
                 );
-                routing.register_turn(id, input.to_owned(), facts.number);
+                routing.register_turn_with_deadline(id, input.to_owned(), facts.number, facts.wall);
                 routing.request_started(id);
-                routing.mark_sent(id, input);
+                if routing.failure().is_some() {
+                    delivery.seal();
+                    routing.never_sent(id, input);
+                    routing.settle(id, facts.number);
+                    return Err(Box::new(facts.rejected(StartRejected::SessionGone)));
+                }
                 return Ok(delivery);
             }
         }
@@ -209,6 +246,41 @@ async fn admit_ready(
             return Err(session_busy(facts));
         }
     }
+}
+
+/// §8: a dropped socket fixes first-byte evidence before drain withdrawal is reported.
+async fn prompt_response(
+    facts: &mut Turn<'_>,
+    server: &Server,
+    id: &str,
+    input: &str,
+    prompt: &str,
+    sent: &requests::SentTracker,
+) -> Option<Result<Submission, requests::HttpError>> {
+    // Dropping the request closes its socket. The retained first-byte tracker
+    // proves whether cancellation may withdraw it or must preserve its effects.
+    let outcome = {
+        let response =
+            requests::prompt_tracked(server.http(), id, input, prompt, facts.request_by(), sent);
+        tokio::pin!(response);
+        tokio::select! {
+            biased;
+            () = server.wait_draining() => {
+                if sent.is_sent() {
+                    response.await
+                } else {
+                    server.routing().request_completed(id);
+                    server.routing().never_sent(id, input);
+                    if let Some(running) = facts.running.as_mut() {
+                        running.prompt_pending = false;
+                    }
+                    return None;
+                }
+            },
+            outcome = &mut response => outcome,
+        }
+    };
+    Some(outcome)
 }
 
 async fn submit(
@@ -219,74 +291,164 @@ async fn submit(
     delivery: Arc<Delivery>,
     prompt: &str,
 ) -> TurnEnd {
-    // The request is never retried. Its response remains outstanding even
-    // if SSE acceptance/terminal reaches delivery first (§7.2 rule 1).
-    // Cancellation keeps the outstanding request count and seals through Running.
-    let response = requests::prompt(server.http(), id, input, prompt, facts.request_by());
-    tokio::pin!(response);
-    let outcome = tokio::select! {
-        outcome = &mut response => outcome,
-        _decision = delivery.decision() => {
-            // A natural terminal can precede the prompt response. Keep it,
-            // while finishing the response under its original bound.
-            // This future owns a socket borrowed from the local prompt,
-            // so complete it here; the outer turn order can still cut it.
-            let result = response.await;
-            if result.is_ok() {
-                server.routing().request_completed(id);
-            }
-            return ordered_result(facts, None);
-        },
+    let sent = facts
+        .running
+        .as_ref()
+        .map(|running| Arc::clone(&running.sent));
+    let Some(sent) = sent else {
+        return facts.rejected(StartRejected::SessionGone);
     };
+    let Some(outcome) = prompt_response(facts, server, id, input, prompt, &sent).await else {
+        let _sealed = ordered_result(facts, None);
+        return facts.rejected(StartRejected::SessionGone);
+    };
+    facts.submitted = sent.is_sent();
     match outcome {
         Ok(Submission::Accepted) => {
-            let mut routing = server.routing();
-            routing.request_completed(id);
-            routing.accepted(id, input, Instant::now());
+            {
+                let mut routing = server.routing();
+                routing.request_completed(id);
+                routing.accepted(id, input, Instant::now());
+            }
+            if let Some(running) = facts.running.as_mut() {
+                running.prompt_pending = false;
+            }
         }
-        Ok(Submission::Status(status @ (400 | 401 | 404))) => {
-            let mut routing = server.routing();
-            routing.request_completed(id);
-            routing.not_accepted(id, input);
-            drop(routing);
-            let mut end = ordered_result(
-                facts,
-                Some(RouteError::Protocol {
-                    turn: facts.number,
-                    detail: "the prompt was rejected",
-                }),
-            );
+        Ok(Submission::Status(status @ (400 | 404))) => {
+            {
+                let mut routing = server.routing();
+                routing.request_completed(id);
+                routing.not_accepted(id, input);
+            }
+            if let Some(running) = facts.running.as_mut() {
+                running.prompt_pending = false;
+            }
+            let mut end = ordered_result(facts, None);
             if end.terminal.is_none() {
                 end = facts.rejected(if status == 404 {
                     StartRejected::SessionGone
                 } else {
-                    StartRejected::Protocol("invalid_request".to_owned())
+                    StartRejected::Protocol("invalid_request".into())
                 });
             }
             return end;
         }
-        Ok(Submission::Status(_) | Submission::Inconclusive) => {
-            server.routing().request_completed(id);
-            // Drain and detailed response disposition are chunk D. A
-            // complete inconclusive reply cannot authorize a resend.
+        Ok(Submission::Status(401)) => {
+            server.fail_protocol();
+            {
+                let mut routing = server.routing();
+                routing.request_completed(id);
+                routing.not_accepted(id, input);
+            }
+            if let Some(running) = facts.running.as_mut() {
+                running.prompt_pending = false;
+            }
+            facts.submitted = false;
             return ordered_result(
                 facts,
-                Some(RouteError::TransportLost { turn: facts.number }),
+                Some(RouteError::Protocol {
+                    turn: facts.number,
+                    detail: "the server refused VIA's credentials",
+                }),
             );
         }
-        Err(error) => {
-            if error.sent == via_routes::opencode::turn::Sent::No {
-                server.routing().request_completed(id);
-                server.routing().never_sent(id, input);
-                facts.submitted = false;
+        Ok(Submission::Status(_) | Submission::Inconclusive) => {
+            {
+                let mut routing = server.routing();
+                routing.inconclusive(id, input, Instant::now());
             }
-            return ordered_result(
-                facts,
-                Some(RouteError::TransportLost { turn: facts.number }),
-            );
+            if let Some(running) = facts.running.as_mut() {
+                running.prompt_pending = false;
+            }
+            server.drain();
+            server.routing().request_completed(id);
+        }
+        Err(error) => {
+            if let Some(end) = failed_prompt(facts, server, id, input, error).await {
+                return end;
+            }
         }
     }
     delivery.decision().await;
+    complete(facts).await
+}
+
+/// §8, §10: place unknown submission before Host's bounded loss classification wait.
+async fn failed_prompt(
+    facts: &mut Turn<'_>,
+    server: &Server,
+    id: &str,
+    input: &str,
+    error: requests::HttpError,
+) -> Option<TurnEnd> {
+    if error.is_response_limit() {
+        // §8–§9: bounds evidence decides this turn, while other sent turns drain.
+        let detected_at = Instant::now();
+        server.drain();
+        {
+            let mut routing = server.routing();
+            routing.response_limit(id, facts.number, detected_at);
+            routing.request_completed(id);
+        }
+        if let Some(running) = facts.running.as_mut() {
+            running.prompt_pending = false;
+            running.delivery.response_limit();
+        }
+        return Some(ordered_result(facts, None));
+    }
+    if error.sent == requests::Sent::No {
+        {
+            let mut routing = server.routing();
+            routing.request_completed(id);
+            routing.never_sent(id, input);
+        }
+        if let Some(running) = facts.running.as_mut() {
+            running.prompt_pending = false;
+        }
+        facts.submitted = false;
+        let mut end = ordered_result(facts, None);
+        if end.terminal.is_none() && (server.is_draining() || server.failure().is_some()) {
+            end = facts.rejected(StartRejected::SessionGone);
+        }
+        return Some(end);
+    }
+    // The boundary precedes Host's wait: acceptance arriving during that
+    // wait can never turn an unknown submission into an accepted one.
+    server.routing().inconclusive(id, input, Instant::now());
+    server.drain();
+    if let Some(end) = server.request_lost(facts.wall).await {
+        if let Some(running) = facts.running.as_mut() {
+            running.request_loss = Some(end);
+        }
+        return Some(ordered_result(facts, None));
+    }
+    None
+}
+
+/// §7.4: the retained terminal stands while reported tool items finish within grace.
+async fn complete(facts: &mut Turn<'_>) -> TurnEnd {
+    let Some(running) = facts.running.as_ref() else {
+        return ordered_result(facts, None);
+    };
+    let delivery = Arc::clone(&running.delivery);
+    let server = Arc::clone(&running.server);
+    if delivery.terminal_at().is_none() {
+        // §9: a failed nonterminal lane cannot provide tool cleanup evidence.
+        // Queue its native cleanup at the outcome boundary without consuming grace.
+        return ordered_result(facts, None);
+    }
+    let by = Deadline::at(
+        (delivery.terminal_at().unwrap_or_else(Instant::now) + facts.tool_grace)
+            .min(facts.wall.instant()),
+    );
+    // Both waits are read-only; dropping them preserves terminal and tool evidence.
+    let cleanup = tokio::select! {
+        cleanup = delivery.cleanup(by) => cleanup,
+        _end = server.wait_end() => crate::Cleanup::Uncertain,
+    };
+    if let Some(running) = facts.running.as_mut() {
+        running.cleanup = Some(cleanup);
+    }
     ordered_result(facts, None)
 }
 
@@ -296,7 +458,7 @@ async fn wait_eligible(server: &Server, id: &str, by: Deadline) -> bool {
         let notified = changed.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        if server.failure().is_some() || server.ended().is_some() {
+        if server.is_draining() || server.failure().is_some() || server.ended().is_some() {
             return false;
         }
         if server.routing().eligible(id) {
@@ -331,6 +493,10 @@ async fn cleanup_leftovers(
         let input = input_id(&facts.driver.spec.session_id, turn);
         if !inbox.contains(&input) {
             continue;
+        }
+        server.routing().expect_cleanup_cancellation(id, &input);
+        if server.routing().failure().is_some() {
+            return Err(Box::new(facts.rejected(StartRejected::SessionGone)));
         }
         let result = tracked(
             server,
@@ -368,6 +534,49 @@ async fn cleanup_leftovers(
     Ok(())
 }
 
+/// §9: native cleanup is reserved before this turn releases successor admission.
+fn settle_after_cleanup(running: &Running, turn: TurnNumber, wall: Deadline, overflow: bool) {
+    let mut routing = running.server.routing();
+    if overflow {
+        let by = Deadline::at((Instant::now() + CLEANUP_ALLOWANCE).min(wall.instant()));
+        routing.enqueue_cleanup(&running.session, turn, by);
+    }
+    routing.settle(&running.session, turn);
+}
+
+/// §8–§9: positive response/text bounds evidence takes priority over a caller stop.
+fn outcome_error(turn: TurnNumber, stop: Option<Stop>, cause: Option<RouteError>) -> RouteError {
+    if !matches!(stop, Some(Stop::ResponseLimit | Stop::TextOverflow))
+        && let Some(cause) = cause
+    {
+        return cause;
+    }
+    match stop {
+        Some(Stop::ResponseLimit) => RouteError::Protocol {
+            turn,
+            detail: "an HTTP response exceeded the OpenCode route bounds",
+        },
+        Some(Stop::DeclineFailed) => RouteError::Protocol {
+            turn,
+            detail: "a VIA interactive decline did not settle",
+        },
+        Some(Stop::Lane(LaneFailure::Protocol)) => RouteError::Protocol {
+            turn,
+            detail: "a session event did not match the protocol",
+        },
+        Some(Stop::TextOverflow | Stop::Lane(LaneFailure::Overflow)) => {
+            RouteError::Overflow { turn }
+        }
+        Some(Stop::Generation(GenerationEnd::Lost(loss))) => {
+            generation_route_error(loss.cause, turn)
+        }
+        Some(
+            Stop::Generation(GenerationEnd::Retired) | Stop::Detached | Stop::SubmissionUnknown,
+        )
+        | None => RouteError::TransportLost { turn },
+    }
+}
+
 /// Seal exactly once: this is the outcome boundary, independent of route state.
 pub(super) fn ordered_result(facts: &mut Turn<'_>, cause: Option<RouteError>) -> TurnEnd {
     let Some(mut running) = facts.running.take() else {
@@ -375,40 +584,43 @@ pub(super) fn ordered_result(facts: &mut Turn<'_>, cause: Option<RouteError>) ->
     };
     running.finished = true;
     let Sealed {
+        cleanup,
         terminal,
         accepted,
         loss,
         stop,
         accounted,
-    } = running.delivery.seal();
-    running
-        .server
-        .routing()
-        .settle(&running.session, facts.number);
+    } = running.delivery.seal_until(running.acknowledgement_cutoff);
+    let text_overflow = matches!(stop, Some(Stop::TextOverflow));
+    let overflow = text_overflow
+        || (terminal.is_none()
+            && running.request_loss.is_none()
+            && matches!(stop, Some(Stop::Lane(LaneFailure::Overflow))));
+    settle_after_cleanup(&running, facts.number, facts.wall, overflow);
+    let stop = if matches!(stop, Some(Stop::ResponseLimit | Stop::TextOverflow)) {
+        stop
+    } else {
+        running.request_loss.map(Stop::Generation).or(stop)
+    };
+    let cleanup = running.cleanup.unwrap_or(cleanup);
+    let decline_failed = matches!(stop, Some(Stop::DeclineFailed));
+    let response_limit = matches!(stop, Some(Stop::ResponseLimit));
     let terminal_present = terminal.is_some();
-    let mut end = if terminal_present {
+    let mut end = if terminal_present && !decline_failed && !response_limit && !text_overflow {
         TurnEnd {
             terminal,
             instance: facts.instance.clone(),
             leftovers: None,
-            outcome: Ok(TurnEvidence::no_launch(false)),
+            outcome: Ok(TurnEvidence {
+                exit: None,
+                cleanup,
+                journal_uncertain: false,
+            }),
             loss,
             aggregate: None,
         }
     } else {
-        let error = cause.unwrap_or(match stop {
-            Some(Stop::Lane(LaneFailure::Protocol)) => RouteError::Protocol {
-                turn: facts.number,
-                detail: "a session event did not match the protocol",
-            },
-            Some(Stop::Lane(LaneFailure::Overflow)) => RouteError::Overflow { turn: facts.number },
-            Some(Stop::Generation(GenerationEnd::Lost(loss))) => {
-                generation_route_error(loss.cause, facts.number)
-            }
-            Some(Stop::Generation(GenerationEnd::Retired) | Stop::Detached) | None => {
-                RouteError::TransportLost { turn: facts.number }
-            }
-        });
+        let error = outcome_error(facts.number, stop, cause);
         let mut end = facts.failed(error);
         if let Some(Stop::Generation(GenerationEnd::Lost(loss))) = stop {
             if let Err(AdapterError::Route(failure)) = &mut end.outcome {
@@ -419,6 +631,12 @@ pub(super) fn ordered_result(facts: &mut Turn<'_>, cause: Option<RouteError>) ->
             end.leftovers = running.server.leftovers().map(Into::into);
         }
         end.loss = loss;
+        if overflow && let Err(AdapterError::Route(failure)) = &mut end.outcome {
+            failure.cleanup = Some(crate::WireCleanup::Uncertain);
+        }
+        if decline_failed || response_limit || text_overflow {
+            end.terminal = terminal;
+        }
         end
     };
     if accepted && !accounted {

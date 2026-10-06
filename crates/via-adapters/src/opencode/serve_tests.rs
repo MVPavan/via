@@ -825,10 +825,8 @@ fn transient() -> Vec<(&'static str, Value, &'static str)> {
     ]
 }
 
-/// OC01: transient startup failures name their step and are not
-/// refusals: exit before the URL line, a `pid` mismatch, a 5xx, a 401, a
-/// redirect (never followed), an undecodable, over-cap or truncated
-/// catalog, an event stream that ends before its first event.
+/// OC01/OC09: uncached startup failures name their step; HTTP bounds and 401
+/// are protocol failures (§8, §9), and ordinary inconclusive responses are transient.
 #[tokio::test]
 async fn oc01_transient_handshake_failures_name_their_step() {
     let cases = transient();
@@ -836,16 +834,28 @@ async fn oc01_transient_handshake_failures_name_their_step() {
     for (name, fixture, expected) in cases {
         rig.fixture(&fixture);
         let error = rig.refused().await;
-        assert_eq!(
-            error.failure,
-            LaunchFailure::Transient { step: expected },
-            "{name}"
-        );
-        assert_eq!(
-            cause(&error),
-            RouteError::TransportLost { turn: turn() },
-            "{name}"
-        );
+        if matches!(name, "info 401" | "model over cap") {
+            assert_eq!(
+                error.failure,
+                LaunchFailure::Protocol { step: expected },
+                "{name}"
+            );
+            assert!(
+                matches!(cause(&error), RouteError::Protocol { .. }),
+                "{name}"
+            );
+        } else {
+            assert_eq!(
+                error.failure,
+                LaunchFailure::Transient { step: expected },
+                "{name}"
+            );
+            assert_eq!(
+                cause(&error),
+                RouteError::TransportLost { turn: turn() },
+                "{name}"
+            );
+        }
         assert_eq!(step(&error), Some(expected), "{name}");
         // `OC12b`: a failed catalog's payload reaches no file VIA writes
         // and no failure value.

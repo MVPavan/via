@@ -12,15 +12,15 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
-const SES: &str = "ses_via0001";
-const SID: &str = "s_000000000001";
-fn route(method: &str, path: &str, responses: &Value) -> Value {
+pub(super) const SES: &str = "ses_via0001";
+pub(super) const SID: &str = "s_000000000001";
+pub(super) fn route(method: &str, path: &str, responses: &Value) -> Value {
     json!({"method":method,"path":path,"responses":responses})
 }
-fn event(kind: &str, data: &Value) -> Value {
+pub(super) fn event(kind: &str, data: &Value) -> Value {
     json!({"type":kind,"data":data,"id":"evt_fixture","created":1})
 }
-fn fixture(cwd: &str, emit: Vec<Value>) -> Value {
+pub(super) fn fixture(cwd: &str, emit: Vec<Value>) -> Value {
     let rules=vec!["*","question","opencode_session_move","opencode_session_rename","opencode_list_mcp_resources","opencode_read_mcp_resource"].into_iter().map(|action|json!({"action":action,"resource":"*","effect":if action=="*"{"allow"}else{"deny"}})).collect::<Vec<_>>();
     let info = json!({"data":{"id":SES,"agent":"via","model":{"providerID":"opencode","id":"big-pickle","variant":"default"},"permissions":rules,"location":{"directory":cwd}}});
     json!({"routes":[
@@ -34,7 +34,7 @@ fn fixture(cwd: &str, emit: Vec<Value>) -> Value {
        route("POST",&format!("/api/session/{SES}/prompt"),&json!([{"status":200,"json":{"data":{"id":"$INPUT","sessionID":"$SESSION"}},"emit":emit.into_iter().collect::<Value>()}]))
        ]})
 }
-fn success() -> Vec<Value> {
+pub(super) fn success() -> Vec<Value> {
     vec![
         event(
             "session.inbox.enqueued",
@@ -54,14 +54,14 @@ fn success() -> Vec<Value> {
         ),
     ]
 }
-fn replace(fixture: &mut Value, new: Value) {
+pub(super) fn replace(fixture: &mut Value, new: Value) {
     let routes = fixture["routes"].as_array_mut().unwrap();
     routes.retain(|r| r["path"] != new["path"] || r["method"] != new["method"]);
     routes.insert(0, new);
 }
 /// Seed only private fixture rows while no turn is running. Python's SQLite
 /// module avoids an adapter dependency on the Store's implementation crate.
-fn row(rig: &Rig, number: u32, state: &str) {
+pub(super) fn row(rig: &Rig, number: u32, state: &str) {
     let home = rig.root().join("test-home");
     std::fs::create_dir_all(&home).unwrap();
     let script = r#"import sqlite3,sys
@@ -96,13 +96,13 @@ c.commit()
         String::from_utf8_lossy(&result.stderr)
     );
 }
-struct Lane {
-    driver: SessionDriver,
-    receiver: mpsc::Receiver<Admitted>,
+pub(super) struct Lane {
+    pub(super) driver: SessionDriver,
+    pub(super) receiver: mpsc::Receiver<Admitted>,
     tracker: TaskTracker,
 }
 impl Lane {
-    fn open(rig: &Rig, confirmed: bool) -> Self {
+    pub(super) fn open(rig: &Rig, confirmed: bool) -> Self {
         let adapter = Arc::new(OpenCodeAdapter {
             binary: rig.program.clone(),
             instances: Arc::default(),
@@ -147,13 +147,24 @@ impl Lane {
             tracker,
         }
     }
-    async fn turn(
+    pub(super) async fn turn(
         &mut self,
         number: u32,
         effort: Option<&str>,
         wall: Duration,
     ) -> (TurnEnd, Vec<crate::ObservationItem>) {
-        let prepared = self.driver.prepare();
+        self.turn_prepared(number, effort, wall, self.driver.prepare())
+            .await
+    }
+
+    /// C2 §3: run with the actual pin captured before a readiness change.
+    pub(super) async fn turn_prepared(
+        &mut self,
+        number: u32,
+        effort: Option<&str>,
+        wall: Duration,
+        prepared: Prepared,
+    ) -> (TurnEnd, Vec<crate::ObservationItem>) {
         let capacity = matches!(prepared, Prepared::NeedsConnection)
             .then(|| Box::new(()) as crate::CapacityToken);
         let now = tokio::time::Instant::now();
@@ -170,6 +181,17 @@ impl Lane {
             force: force_rx,
             stop_ack: StopAck::new(),
         };
+        let result = self.turn_context(effort, context).await;
+        drop((stop, force));
+        result
+    }
+
+    /// C2 §4.1: exercise Core's stop sources without replacing the driver.
+    pub(super) async fn turn_context(
+        &mut self,
+        effort: Option<&str>,
+        context: TurnCx,
+    ) -> (TurnEnd, Vec<crate::ObservationItem>) {
         let future = self.driver.run_turn(
             TurnSpec {
                 prompt: "fixture".to_owned(),
@@ -195,10 +217,9 @@ impl Lane {
         while let Ok(item) = self.receiver.try_recv() {
             seen.push(item.item);
         }
-        drop((stop, force));
         (result, seen)
     }
-    async fn close(self) {
+    pub(super) async fn close(self) {
         self.driver
             .close(
                 CloseMode::Graceful,
@@ -211,21 +232,21 @@ impl Lane {
             .unwrap();
     }
 }
-fn full() -> Bound {
+pub(super) fn full() -> Bound {
     Bound {
         mode: BoundMode::Full,
         extra_write_dirs: Vec::new(),
         network: true,
     }
 }
-fn run<F: Future>(future: F) -> F::Output {
+pub(super) fn run<F: Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap()
         .block_on(future)
 }
-fn prompts(requests: &[Value]) -> Vec<&Value> {
+pub(super) fn prompts(requests: &[Value]) -> Vec<&Value> {
     requests
         .iter()
         .filter(|r| {
@@ -397,8 +418,27 @@ fn oc05_c2_failed_cleanup_blocks_every_successor_on_that_generation() {
         );
     });
 }
+/// §8 retires a draining fake even while a driver and an old pin remain alive.
+async fn retired_after_setup(rig: &Rig) -> bool {
+    let Some(pid) = rig
+        .requests()
+        .first()
+        .and_then(|request| request["pid"].as_u64())
+    else {
+        return false;
+    };
+    let by = tokio::time::Instant::now() + Duration::from_secs(2);
+    while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+        if tokio::time::Instant::now() >= by {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    true
+}
+
 #[test]
-fn oc05_c2_cancelled_setup_request_blocks_reopened_driver_prompt() {
+fn oc05_c2_cancelled_setup_drains_and_rejects_pinned_reopened_prompt() {
     run(async {
         let rig = Rig::new(&json!({}));
         let cwd = rig.root().to_str().unwrap().to_owned();
@@ -414,32 +454,50 @@ fn oc05_c2_cancelled_setup_request_blocks_reopened_driver_prompt() {
         rig.fixture(&next);
         row(&rig, 1, "running");
         let mut first = Lane::open(&rig, false);
-        let (end, _) = first
-            .turn(1, Some("high"), Duration::from_millis(300))
-            .await;
-        // Keep this generation alive while replacing only the driver.
-        let held = OpenCodeServers::new(
-            &rig.program,
-            Some(std::ffi::OsStr::new("/usr/bin:/bin")),
-            Arc::clone(&rig.servers),
-        )
-        .pin()
-        .expect("the interrupted setup attached a live server");
+        let inspector = Lane::open(&rig, true);
+        let ((end, _), held) = tokio::join!(
+            first.turn(1, Some("high"), Duration::from_millis(300)),
+            async {
+                let by = tokio::time::Instant::now() + Duration::from_secs(1);
+                while !rig.requests().iter().any(|request| {
+                    request["method"] == "POST"
+                        && request["target"] == format!("/api/session/{SES}/model")
+                }) && tokio::time::Instant::now() < by
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                inspector.driver.prepare()
+            }
+        );
+        let was_pinned = matches!(held, Prepared::Pinned(_));
+        let draining = matches!(inspector.driver.prepare(), Prepared::NeedsConnection);
+        let retired = retired_after_setup(&rig).await;
         first.close().await;
         row(&rig, 1, "failed");
         row(&rig, 2, "running");
         let mut reopened = Lane::open(&rig, true);
-        let (next_end, _) = reopened.turn(2, None, Duration::from_secs(2)).await;
+        let (next_end, _) = reopened
+            .turn_prepared(2, None, Duration::from_secs(2), held)
+            .await;
         reopened.close().await;
+        inspector.close().await;
         let requests = rig.requests();
-        drop(held);
         rig.finish().await;
+        assert!(was_pinned, "capture the old pin before the setup timeout");
+        assert!(draining, "§8 withdraws an unanswered setup generation");
+        assert!(retired, "§8 retires despite the old pin and idle driver");
         assert!(end.terminal.is_none());
         assert!(
             next_end.terminal.is_none(),
             "first: {end:?}; next: {next_end:?}; requests: {requests:?}"
         );
-        assert!(next_end.outcome.is_err());
+        assert!(matches!(
+            next_end.outcome,
+            Err(AdapterError::Rejected {
+                reason: crate::StartRejected::SessionGone,
+                ..
+            })
+        ));
         assert_eq!(
             requests
                 .iter()
@@ -466,7 +524,7 @@ fn oc05_c2_cancelled_setup_request_blocks_reopened_driver_prompt() {
     });
 }
 
-/// §7.2's predecessor ends only after its inconclusive prompt reply.
+/// §7.2's first delivery arrives after §7.4's caller force ends the turn.
 fn settled_input_fixture(cwd: &str, cancelled: bool) -> Value {
     let mut next = fixture(cwd, Vec::new());
     let mut predecessor_events = vec![
@@ -474,7 +532,7 @@ fn settled_input_fixture(cwd: &str, cancelled: bool) -> Value {
             "session.inbox.enqueued",
             &json!({"sessionID":"$SESSION","inboxID":"$INPUT"}),
         ),
-        json!({"pause_ms":500}),
+        json!({"pause_ms":1000}),
     ];
     if cancelled {
         predecessor_events.push(event(
@@ -532,14 +590,80 @@ fn settled_input_fixture(cwd: &str, cancelled: bool) -> Value {
             "POST",
             &format!("/api/session/{SES}/prompt"),
             &json!([
-                {"status":200,"json":{"data":{}},"emit_before_response":true,
+                {"status":200,"json":{"data":{"id":"$INPUT","sessionID":"$SESSION"}},
+                    "emit_before_response":true,
                     "sleep_ms":150,"emit":predecessor_events},
                 {"status":200,"json":{"data":{"id":"$INPUT","sessionID":"$SESSION"}},
                     "emit":successor}
             ]),
         ),
     );
+    replace(
+        &mut next,
+        route(
+            "DELETE",
+            &format!("/api/session/{SES}/inbox/*"),
+            &json!([{"status":204}]),
+        ),
+    );
     next
+}
+
+async fn stopped_before_delivery(
+    lane: &mut Lane,
+    rig: &Rig,
+) -> (TurnEnd, Vec<crate::ObservationItem>) {
+    let prepared = lane.driver.prepare();
+    let inspector = Lane::open(rig, true);
+    let capacity =
+        matches!(prepared, Prepared::NeedsConnection).then(|| Box::new(()) as crate::CapacityToken);
+    let now = tokio::time::Instant::now();
+    let (stop, stop_rx) = watch::channel(None);
+    let (force, force_rx) = watch::channel(None);
+    let context = TurnCx {
+        turn: TurnNumber::try_from(1).unwrap(),
+        prepared,
+        capacity,
+        activity: TurnActivity::new(now),
+        wall: Deadline::at(now + Duration::from_secs(5)),
+        tool_grace: Duration::from_secs(1),
+        stop: stop_rx,
+        force: force_rx,
+        stop_ack: StopAck::new(),
+    };
+    let stopping = async {
+        let by = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < by {
+            let completed = if let Prepared::Pinned(pin) = inspector.driver.prepare() {
+                pin.opencode
+                    .and_then(|pin| pin.live())
+                    .is_some_and(|(server, _)| {
+                        server
+                            .routing()
+                            .state(SES)
+                            .is_some_and(|state| state.pending_requests == 0)
+                    })
+            } else {
+                false
+            };
+            if !prompts(&rig.requests()).is_empty() && completed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let attached = tokio::time::Instant::now();
+        stop.send_replace(Some(crate::StopOrder {
+            cause: crate::StopCause::Cancel,
+            requested_at: "2026-10-06T00:00:00Z".into(),
+            attached,
+            force_at: Deadline::at(attached + Duration::from_millis(200)),
+            close_by: Deadline::at(attached + Duration::from_secs(2)),
+        }));
+    };
+    let (result, ()) = tokio::join!(lane.turn_context(None, context), stopping);
+    drop((stop, force));
+    inspector.close().await;
+    result
 }
 
 /// C2 exercises §7.2 after unknown; Core's P6 cannot admit that successor.
@@ -549,7 +673,7 @@ async fn settled_before_first_delivery(cancelled: bool) {
     rig.fixture(&settled_input_fixture(&cwd, cancelled));
     row(&rig, 1, "running");
     let mut lane = Lane::open(&rig, false);
-    let (unknown, first_seen) = lane.turn(1, None, Duration::from_secs(5)).await;
+    let (unknown, first_seen) = stopped_before_delivery(&mut lane, &rig).await;
     row(&rig, 1, "unknown");
     row(&rig, 2, "running");
     // A broken execution rule times out here instead of submitting B. Keeping
@@ -563,12 +687,13 @@ async fn settled_before_first_delivery(cancelled: bool) {
     assert!(unknown.terminal.is_none(), "A: {unknown:?}");
     assert!(matches!(unknown.outcome,
         Err(AdapterError::Route(ref failure))
-            if matches!(failure.cause, crate::RouteError::TransportLost { .. })));
+            if matches!(failure.cause, crate::RouteError::Stopped { .. }
+                | crate::RouteError::ForceStopped { .. })));
     assert!(
         first_seen
             .iter()
             .any(|item| matches!(item.observation, Observation::Accepted(_))),
-        "A must be accepted before its inconclusive reply"
+        "A must be accepted before the caller force"
     );
     assert!(
         matches!(
@@ -582,7 +707,11 @@ async fn settled_before_first_delivery(cancelled: bool) {
         "successor waited: {elapsed:?}"
     );
     let usage = second.terminal.as_ref().unwrap().usage.as_ref().unwrap();
-    assert_eq!(usage.input, Some(11), "B retained its own reported usage");
+    assert_eq!(
+        usage.input,
+        Some(11),
+        "B retained its own reported usage: {second:?}; {second_seen:?}"
+    );
     assert_eq!(usage.output, Some(7));
     let sent = prompts(&requests);
     assert_eq!(sent.len(), 2, "never resend A: {requests:?}");

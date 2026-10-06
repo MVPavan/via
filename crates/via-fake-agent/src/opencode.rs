@@ -117,6 +117,7 @@ enum Auth {
 #[serde(deny_unknown_fields)]
 struct Route {
     method: String,
+    /// Exact target or a trailing `*` prefix for caller-generated inbox IDs.
     path: String,
     #[serde(default)]
     responses: Vec<Response>,
@@ -410,7 +411,12 @@ fn serve(shared: &Shared, stream: TcpStream) -> Result<(), Box<dyn std::error::E
     let path = target.split('?').next().unwrap_or_default();
     let found = shared.fixture.routes.iter().enumerate().find(|(_, route)| {
         route.method == method
-            && (route.path == target || (!route.path.contains('?') && route.path == path))
+            && (route.path == target
+                || (!route.path.contains('?') && route.path == path)
+                || route
+                    .path
+                    .strip_suffix('*')
+                    .is_some_and(|prefix| path.starts_with(prefix)))
     });
     let Some((index, route)) = found else {
         let body = br#"{"_tag":"NotFoundError","message":"Not found"}"#;
@@ -437,7 +443,7 @@ fn serve(shared: &Shared, stream: TcpStream) -> Result<(), Box<dyn std::error::E
         .strip_prefix("/api/session/")
         .and_then(|tail| tail.split('/').next())
         .unwrap_or_default();
-    reply(shared, &mut stream, &response, &body, session)
+    reply(shared, &mut stream, &response, &body, session, path)
 }
 
 fn reply(
@@ -446,8 +452,13 @@ fn reply(
     response: &Response,
     body: &[u8],
     session: &str,
+    path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let input: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+    // Inbox DELETE has no body; its caller ID is the URL's final component.
+    let input: Value = serde_json::from_slice(body).unwrap_or_else(|_| {
+        path.split_once("/inbox/")
+            .map_or(Value::Null, |(_, id)| json!({"id":id}))
+    });
     let expand = |value: &Value| substitute(value, &input, session);
     if response.emit_early {
         shared

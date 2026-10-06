@@ -1,12 +1,12 @@
-//! `OpenCode` packet §7.3/§12: owned events to C2 observations and terminal.
+//! `opencode.md` §7.3–§7.4, §9, §11–§12: owned events and control evidence to C2.
 //! The delivery owner decides whether the samples are complete; these sums
 //! are reported only under its positive delivery predicate.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use tokio::time::Instant;
 use via_routes::opencode::events::{
-    EventData, ExecutionKind, StepKind, TextKind, Tokens, ToolKind, VendorError,
+    EventData, ExecutionKind, InteractiveKind, StepKind, TextKind, Tokens, ToolKind, VendorError,
 };
 
 use crate::{
@@ -14,13 +14,23 @@ use crate::{
     StopReason, UsageSample, VendorTerminal, VendorTerminalStatus, final_text_pieces_owned,
 };
 
+/// `opencode.md` §9: retained candidates for the last owned step, per turn.
+const FINAL_TEXT_CANDIDATE_BYTES: usize = 4 * 1024 * 1024;
+/// §9: a logical charge for each ordinal's key, String and map bookkeeping, even empty text.
+const FINAL_TEXT_ENTRY_BYTES: usize = 64;
+
 /// Only events already attributed to this turn enter its normalizer.
 pub(super) struct Normalizer {
     last_step: Option<String>,
     finish: Option<String>,
     text: BTreeMap<u64, String>,
+    text_bytes: usize,
+    text_overflow: bool,
     samples: BTreeMap<String, Sample>,
     interval_unverified: bool,
+    via_interrupt: bool,
+    declined_calls: BTreeSet<String>,
+    tool_actions: BTreeMap<String, DenialKind>,
 }
 
 struct Sample {
@@ -35,8 +45,33 @@ impl Normalizer {
             last_step: None,
             finish: None,
             text: BTreeMap::new(),
+            text_bytes: 0,
+            text_overflow: false,
             samples: BTreeMap::new(),
             interval_unverified: false,
+            via_interrupt: false,
+            declined_calls: BTreeSet::new(),
+            tool_actions: BTreeMap::new(),
+        }
+    }
+
+    /// `opencode.md` §7.4: caller-owned interrupt evidence, not an HTTP acknowledgement.
+    pub(super) fn note_interrupt_sent(&mut self) {
+        self.via_interrupt = true;
+    }
+
+    /// `opencode.md` §11: successful VIA decline evidence for the correlated call.
+    pub(super) fn note_decline(
+        &mut self,
+        kind: InteractiveKind,
+        call_id: Option<&str>,
+        settled: bool,
+    ) {
+        if kind == InteractiveKind::Permission
+            && settled
+            && let Some(call_id) = call_id
+        {
+            self.declined_calls.insert(call_id.to_owned());
         }
     }
 
@@ -58,22 +93,13 @@ impl Normalizer {
                 finish,
                 tokens,
                 cost,
-            } => match kind {
-                StepKind::Started => {
-                    self.start_step(assistant_message_id);
-                    Vec::new()
-                }
-                StepKind::Ended | StepKind::Failed => {
-                    if *kind == StepKind::Ended {
-                        self.learn_first_step(assistant_message_id);
-                        if self.last_step.as_ref() == Some(assistant_message_id) {
-                            self.finish.clone_from(finish);
-                        }
-                    }
-                    self.sample(assistant_message_id, tokens.as_ref(), *cost, false)
-                }
-                StepKind::Activity => Vec::new(),
-            },
+            } => self.step_items(
+                *kind,
+                assistant_message_id,
+                finish.as_deref(),
+                tokens.as_ref(),
+                *cost,
+            ),
             EventData::Compaction { key, tokens, cost } => {
                 self.interval_unverified = true;
                 self.sample(key, tokens.as_ref(), *cost, true)
@@ -83,64 +109,144 @@ impl Normalizer {
                 assistant_message_id,
                 ordinal,
                 text,
-            } => {
-                // The input can join an execution after this assistant's
-                // start. Owned text identifies its step without replaying
-                // pre-delivery observations or displacing a known step.
-                self.learn_first_step(assistant_message_id);
-                match kind {
-                    TextKind::Delta | TextKind::Reasoning => vec![model_progress()],
-                    TextKind::Ended => {
-                        if self.last_step.as_ref() == Some(assistant_message_id) {
-                            self.text.insert(*ordinal, text.clone());
-                        }
-                        Vec::new()
-                    }
-                    TextKind::Started => Vec::new(),
-                }
-            }
+            } => self.text_items(*kind, assistant_message_id, *ordinal, text),
             EventData::Tool {
                 kind,
                 call_id,
                 tool,
                 error,
                 ..
-            } => match kind {
-                ToolKind::Called => vec![Observation::Progress(ProgressMarks {
-                    model: true,
-                    tools_started: vec![(
-                        call_id.clone(),
-                        bounded(tool.as_deref().unwrap_or("tool")),
-                    )],
-                    ..ProgressMarks::default()
-                })],
-                ToolKind::Success | ToolKind::Failed => {
-                    let mut items = vec![Observation::Progress(ProgressMarks {
-                        tools_ended: vec![call_id.clone()],
-                        ..ProgressMarks::default()
-                    })];
-                    // Chunk D's correlated VIA-decline handling suppresses
-                    // its own denial before invoking this transformation.
-                    if error
-                        .as_ref()
-                        .is_some_and(|error| error.code == "permission.rejected")
-                    {
-                        items.push(Observation::ActionDenied(Denial {
-                            kind: DenialKind::Other,
-                            target: bounded(tool.as_deref().unwrap_or("tool")),
-                            reason: "denied by the vendor's permission policy".into(),
-                        }));
-                    }
-                    items
+            } => {
+                if let Some(action) = tool {
+                    self.tool_actions
+                        .entry(call_id.clone())
+                        .or_insert_with(|| denial_kind(action));
                 }
-                ToolKind::InputStarted | ToolKind::Activity => Vec::new(),
-            },
+                match kind {
+                    ToolKind::Called => vec![Observation::Progress(ProgressMarks {
+                        model: true,
+                        tools_started: vec![(
+                            call_id.clone(),
+                            bounded(tool.as_deref().unwrap_or("tool")),
+                        )],
+                        ..ProgressMarks::default()
+                    })],
+                    ToolKind::Success | ToolKind::Failed => {
+                        let mut items = vec![Observation::Progress(ProgressMarks {
+                            tools_ended: vec![call_id.clone()],
+                            ..ProgressMarks::default()
+                        })];
+                        if error
+                            .as_ref()
+                            .is_some_and(|error| error.code == "permission.rejected")
+                            && !self.declined_calls.contains(call_id)
+                        {
+                            items.push(Observation::ActionDenied(Denial {
+                                kind: tool.as_deref().map_or_else(
+                                    || {
+                                        self.tool_actions
+                                            .get(call_id)
+                                            .copied()
+                                            .unwrap_or(DenialKind::Other)
+                                    },
+                                    denial_kind,
+                                ),
+                                target: bounded(tool.as_deref().unwrap_or("tool")),
+                                reason: "denied by the vendor's permission policy".into(),
+                            }));
+                        }
+                        items
+                    }
+                    ToolKind::InputStarted | ToolKind::Activity => Vec::new(),
+                }
+            }
             EventData::Inbox { .. }
             | EventData::Execution { .. }
             | EventData::Interactive { .. }
+            | EventData::InteractiveSettled { .. }
             | EventData::Created { .. }
             | EventData::Activity { .. } => Vec::new(),
         }
+    }
+
+    fn step_items(
+        &mut self,
+        kind: StepKind,
+        assistant_message_id: &str,
+        finish: Option<&str>,
+        tokens: Option<&Tokens>,
+        cost: Option<f64>,
+    ) -> Vec<Observation> {
+        match kind {
+            StepKind::Started => {
+                self.start_step(assistant_message_id);
+                Vec::new()
+            }
+            StepKind::Ended | StepKind::Failed => {
+                if kind == StepKind::Ended {
+                    self.learn_first_step(assistant_message_id);
+                    if self.last_step.as_deref() == Some(assistant_message_id) {
+                        self.finish = finish.map(str::to_owned);
+                    }
+                }
+                self.sample(assistant_message_id, tokens, cost, false)
+            }
+            StepKind::Activity => Vec::new(),
+        }
+    }
+
+    fn text_items(
+        &mut self,
+        kind: TextKind,
+        assistant_message_id: &str,
+        ordinal: u64,
+        text: &str,
+    ) -> Vec<Observation> {
+        // The input can join an execution after this assistant's start. Owned
+        // text identifies its step without replaying pre-delivery observations
+        // or displacing a known step (§7.3).
+        self.learn_first_step(assistant_message_id);
+        match kind {
+            TextKind::Delta | TextKind::Reasoning => vec![model_progress()],
+            TextKind::Ended => {
+                if self.last_step.as_deref() == Some(assistant_message_id) {
+                    self.retain_text(ordinal, text);
+                }
+                Vec::new()
+            }
+            TextKind::Started => Vec::new(),
+        }
+    }
+
+    /// §9: reject before copying, release replacements, and keep turn overflow sticky.
+    fn retain_text(&mut self, ordinal: u64, text: &str) {
+        if self.text_overflow {
+            return;
+        }
+        let replaced = self
+            .text
+            .get(&ordinal)
+            .map_or(0, |old| old.len() + FINAL_TEXT_ENTRY_BYTES);
+        let retained = self.text_bytes - replaced;
+        let candidate = text
+            .len()
+            .checked_add(FINAL_TEXT_ENTRY_BYTES)
+            .and_then(|added| retained.checked_add(added));
+        if let Some(candidate) = candidate
+            && candidate <= FINAL_TEXT_CANDIDATE_BYTES
+        {
+            self.text.insert(ordinal, text.to_owned());
+            self.text_bytes = candidate;
+        } else {
+            self.text_overflow = true;
+            self.text.clear();
+            self.text_bytes = 0;
+        }
+    }
+
+    /// §9: the delivery owner maps this turn-local retained-state breach to overflow.
+    pub(super) fn text_overflow(&self) -> bool {
+        self.text_overflow
     }
 
     fn start_step(&mut self, assistant_message_id: &str) {
@@ -160,6 +266,7 @@ impl Normalizer {
             self.last_step = Some(assistant_message_id.to_owned());
             self.finish = None;
             self.text.clear();
+            self.text_bytes = 0;
         }
     }
 
@@ -250,9 +357,8 @@ impl Normalizer {
         })
     }
 
-    /// Native interruption acknowledgement and correlated permission
-    /// declines are chunk D's caller-owned seams. Without that evidence,
-    /// interrupted is always the packet's `failed/vendor_error` terminal.
+    /// `opencode.md` §7.3: native acknowledgement and successful correlated
+    /// permission declines use only VIA's own retained control evidence.
     pub(super) fn terminal(&self, data: &EventData, at: Instant) -> Option<VendorTerminal> {
         let EventData::Execution {
             kind,
@@ -290,6 +396,30 @@ impl Normalizer {
                 Some(error.as_ref().map_or(ClassHint::VendorError, class_hint)),
                 Some("OpenCode execution failed".into()),
             ),
+            ExecutionKind::Interrupted
+                if reason.as_deref() == Some("user") && self.via_interrupt =>
+            {
+                (
+                    VendorTerminalStatus::Interrupted,
+                    StopReason::Other,
+                    "user".into(),
+                    None,
+                    None,
+                    None,
+                )
+            }
+            ExecutionKind::Interrupted
+                if reason.as_deref() == Some("shutdown") && !self.declined_calls.is_empty() =>
+            {
+                (
+                    VendorTerminalStatus::Completed,
+                    StopReason::Other,
+                    "shutdown".into(),
+                    None,
+                    None,
+                    None,
+                )
+            }
             ExecutionKind::Interrupted => (
                 VendorTerminalStatus::Failed,
                 StopReason::Other,
@@ -323,6 +453,15 @@ impl Normalizer {
             cost: self.cost(),
             vendor,
         })
+    }
+}
+
+fn denial_kind(action: &str) -> DenialKind {
+    match action {
+        "bash" | "shell" => DenialKind::Command,
+        "edit" | "write" | "patch" => DenialKind::FileWrite,
+        "webfetch" | "websearch" | "browser" => DenialKind::Network,
+        _ => DenialKind::Other,
     }
 }
 

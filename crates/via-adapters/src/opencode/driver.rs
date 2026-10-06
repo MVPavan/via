@@ -30,7 +30,7 @@ use via_routes::opencode::{Server, ServerFacts, ServerLease, ServerPin};
 
 use super::delivery::Registration;
 use super::plan::{self, model_parts};
-use super::{HARNESS, OpenCodeAdapter, execution, launch};
+use super::{HARNESS, OpenCodeAdapter, control, execution, launch};
 use crate::driver::turn::ordered;
 use crate::driver::{ConnectionPin, Prepared, SessionDriver, TurnCx, TurnSpec, rejected};
 use crate::instance::Incompatibility;
@@ -350,6 +350,12 @@ pub(crate) async fn run_turn(
     }
     let (stop, force, wall) = (cx.stop.clone(), cx.force.clone(), cx.wall);
     let mut facts = Turn::new(driver, session, (turn, wall));
+    facts.tool_grace = cx.tool_grace;
+    let controls = control::Controls {
+        stop: stop.clone(),
+        force: force.clone(),
+        stop_ack: cx.stop_ack,
+    };
     let ended = ordered((stop.clone(), force.clone(), wall), driver.cancel.clone());
     let set_up = Box::pin(setup(
         &mut facts,
@@ -361,20 +367,14 @@ pub(crate) async fn run_turn(
     ));
     // Dropping setup retains request accounting; a running guard seals its turn.
     let outcome = tokio::select! {
-        end = set_up => Some(end),
+        biased;
         () = ended => None,
+        end = set_up => Some(end),
     };
     if let Some(end) = outcome {
         return end;
     }
-    let cause = if force.borrow().is_some() {
-        RouteError::ForceStopped { turn }
-    } else if stop.borrow().is_some() || driver.cancel.is_cancelled() {
-        RouteError::Stopped { turn }
-    } else {
-        RouteError::Deadline { turn }
-    };
-    execution::ordered_result(&mut facts, Some(cause))
+    control::finish(&mut facts, &controls).await
 }
 
 /// One turn's facts at the outcome boundary (`opencode.md` §7.3).
@@ -389,6 +389,7 @@ pub(super) struct Turn<'a> {
     pub(super) submitted: bool,
     pub(super) reopened: bool,
     pub(super) running: Option<execution::Running>,
+    pub(super) tool_grace: Duration,
 }
 
 impl<'a> Turn<'a> {
@@ -406,6 +407,7 @@ impl<'a> Turn<'a> {
             submitted: false,
             reopened: driver.state().identity.is_some(),
             running: None,
+            tool_grace: Duration::ZERO,
         }
     }
 
@@ -427,8 +429,7 @@ impl<'a> Turn<'a> {
         });
     }
 
-    /// The turn's end with `cause`; nothing of it was prompted, so no
-    /// cleanup of its own (C2 §2 no-launch evidence).
+    /// C2 §2, §4.1: preserve the prompt's sent evidence on a route failure.
     pub(super) fn failed(&self, cause: RouteError) -> TurnEnd {
         self.end(AdapterError::Route(RouteFailure {
             cause,
@@ -501,6 +502,12 @@ impl<'a> Turn<'a> {
                     format!("{request} answered {status}"),
                 ))
             }
+            SetupError::Http(error) if error.is_response_limit() => {
+                self.failed(RouteError::Protocol {
+                    turn: self.number,
+                    detail: "an HTTP response exceeded the OpenCode route bounds",
+                })
+            }
             SetupError::Http(_) | SetupError::Malformed => {
                 self.rejected(StartRejected::SessionGone)
             }
@@ -556,11 +563,13 @@ async fn set_up(
     joining: (Prepared, Option<crate::CapacityToken>),
     digest: &str,
 ) -> Result<execution::Opened, Box<TurnEnd>> {
-    let turn = facts.number;
     let pin = join(facts, joining).await?;
     let Some((server, server_facts)) = pin.live() else {
-        return Err(Box::new(facts.failed(RouteError::TransportLost { turn })));
+        return Err(Box::new(facts.rejected(StartRejected::SessionGone)));
     };
+    if server.is_draining() || server.failure().is_some() || server.ended().is_some() {
+        return Err(Box::new(facts.rejected(StartRejected::SessionGone)));
+    }
     facts.saw_version(&server_facts.version);
     unchecked_credentials(facts, &server_facts).await?;
     let variant_checked = facts.driver.state().identity.is_none();
@@ -695,25 +704,69 @@ async fn unchecked_credentials(facts: &Turn<'_>, server: &ServerFacts) -> Result
         .await
 }
 
-/// §7.2: request accounting survives cancellation and driver replacement.
+/// §8: a cancelled setup request has no complete effect proof; drain instead of resending.
+struct PendingRequest<'a> {
+    server: &'a Server,
+    completed: bool,
+}
+
+impl Drop for PendingRequest<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.server.drain();
+        }
+    }
+}
+
+/// §7.2, §8: request accounting survives cancellation and driver replacement.
 /// Only a complete response or positive never-sent evidence releases it.
 pub(super) async fn tracked<T>(
     server: &Server,
     id: Option<&str>,
     request: impl std::future::Future<Output = Result<T, SetupError>>,
 ) -> Result<T, SetupError> {
-    if let Some(id) = id {
-        server.routing().request_started(id);
+    if server.is_draining() || server.failure().is_some() || server.ended().is_some() {
+        return Err(unavailable_request());
     }
+    {
+        let mut routing = server.routing();
+        routing.request_started_for(id);
+        if routing.failure().is_some() {
+            return Err(unavailable_request());
+        }
+    }
+    let mut pending = PendingRequest {
+        server,
+        completed: false,
+    };
     let outcome = request.await;
+    pending.completed = true;
     let complete = match &outcome {
         Err(SetupError::Http(error)) => error.sent == via_routes::opencode::turn::Sent::No,
         Ok(_) | Err(SetupError::Status { .. } | SetupError::Malformed) => true,
     };
-    if complete && let Some(id) = id {
-        server.routing().request_completed(id);
+    match &outcome {
+        Err(SetupError::Status { status: 401, .. }) => server.fail_protocol(),
+        Err(SetupError::Malformed) => server.drain(),
+        Err(SetupError::Http(error)) if error.sent == via_routes::opencode::turn::Sent::Maybe => {
+            server.drain();
+        }
+        Ok(_) | Err(SetupError::Status { .. } | SetupError::Http(_)) => {}
+    }
+    // Fence an inconclusive generation before releasing the request admission rule.
+    if complete {
+        server.routing().request_completed_for(id);
     }
     outcome
+}
+
+/// §8: a failed or draining generation cannot admit a new request byte.
+fn unavailable_request() -> SetupError {
+    SetupError::Http(via_routes::opencode::turn::HttpError {
+        sent: via_routes::opencode::turn::Sent::No,
+        kind: via_routes::opencode::turn::HttpFailure::Io,
+        response_status: None,
+    })
 }
 
 /// §5: a non-default effort must be a variant of the session's model in a
@@ -762,9 +815,14 @@ async fn create(
         directory: &settings.cwd,
         permissions: &settings.rules,
     };
-    let info = session::create(server.http(), new, facts.request_by())
-        .await
-        .map_err(|error| Box::new(facts.setup_failed("session creation", error)))?;
+    let info = tracked(
+        server,
+        None,
+        session::create(server.http(), new, facts.request_by()),
+    )
+    .await
+    .map_err(|error| Box::new(facts.setup_failed("session creation", error)))?;
+    server.routing().session_opened(&info.id);
     if let Some(setting) = differs(&info, settings) {
         return Err(Box::new(
             facts.readback_refused(digest, setting_name(setting)),
@@ -807,7 +865,7 @@ async fn reopen(
 ) -> Result<SessionInfo, Box<TurnEnd>> {
     let info = tracked(
         server,
-        Some(id),
+        None,
         session::get(server.http(), id, facts.request_by()),
     )
     .await
@@ -820,6 +878,7 @@ async fn reopen(
             facts.rejected(StartRejected::SettingsMismatch { setting }),
         ));
     }
+    server.routing().session_opened(&info.id);
     let entry = tracked(
         server,
         Some(id),
@@ -886,7 +945,7 @@ fn variant_of(info: &SessionInfo) -> String {
 async fn read_variant(facts: &Turn<'_>, server: &Server, id: &str) -> Result<String, Box<TurnEnd>> {
     match tracked(
         server,
-        Some(id),
+        None,
         session::get(server.http(), id, facts.request_by()),
     )
     .await

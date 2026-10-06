@@ -12,7 +12,7 @@ use tokio::time::Instant;
 
 use super::{
     BODY_BYTES, HEADER_BYTES, HttpClient, HttpFailure, HttpRequest, Method, Pool, SSE_EVENT_BYTES,
-    Sent, StreamFailure,
+    Sent, SentTracker, StreamFailure,
 };
 use crate::Deadline;
 
@@ -71,6 +71,151 @@ fn get(target: &str) -> HttpRequest<'_> {
         body_limit: BODY_BYTES,
         pool: Pool::General,
     }
+}
+
+/// OC08: a held response cannot hide the first byte from cancellation (§8).
+#[tokio::test]
+async fn first_byte_is_observed_before_the_response_and_survives_withdrawal() {
+    let (listener, client) = listener().await;
+    let called = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let callback_calls = std::sync::Arc::clone(&called);
+    let tracker = SentTracker::new(move || {
+        callback_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
+    let (seen, received) = tokio::sync::oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await;
+        seen.send(()).unwrap();
+        let mut byte = [0];
+        assert_eq!(stream.read(&mut byte).await.unwrap(), 0);
+    });
+    {
+        let request = client.request_tracked(get("/prompt"), within(5), &tracker);
+        tokio::pin!(request);
+        // A dropped request closes only its own socket; the peer's proof persists.
+        tokio::select! {
+            result = &mut request => panic!("response was intentionally held: {result:?}"),
+            result = received => result.unwrap(),
+        }
+        assert!(
+            tracker.is_sent(),
+            "the peer read the request before its response"
+        );
+        assert_eq!(called.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+    peer.await.unwrap();
+    assert!(tracker.is_sent());
+}
+
+/// OC08: native acknowledgement cannot precede first-byte ownership (§7.4, §8).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_byte_callback_precedes_a_complete_request_header() {
+    let (listener, client) = listener().await;
+    let (seen, received) = std::sync::mpsc::sync_channel(1);
+    let received = std::sync::Mutex::new(received);
+    let complete = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let callback_complete = std::sync::Arc::clone(&complete);
+    let tracker = SentTracker::new(move || {
+        let observed = received
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .expect("peer must inspect the first write while its callback is held");
+        callback_complete.store(observed, std::sync::atomic::Ordering::SeqCst);
+    });
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0];
+        let observed = tokio::time::timeout(Duration::from_millis(150), async {
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).await.unwrap();
+                head.push(byte[0]);
+            }
+        })
+        .await
+        .is_ok();
+        seen.send(observed).unwrap();
+        while !head.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).await.unwrap();
+            head.push(byte[0]);
+        }
+        stream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+    });
+    assert_eq!(
+        client
+            .request_tracked(get("/interrupt"), within(5), &tracker)
+            .await
+            .unwrap()
+            .status,
+        204
+    );
+    peer.await.unwrap();
+    assert!(tracker.is_sent());
+    assert!(
+        !complete.load(std::sync::atomic::Ordering::SeqCst),
+        "vendor can emit a native interruption before VIA records its first byte"
+    );
+}
+
+/// OC09: drain blocks first bytes only on the general pool (`opencode.md` §8).
+#[tokio::test]
+async fn draining_general_requests_never_write_but_declines_still_do() {
+    let (listener, client) = listener().await;
+    let peer = serve_once(
+        listener,
+        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec(),
+    );
+    let published = client.close_general(|| true);
+    assert!(published);
+    let tracker = SentTracker::new(|| {});
+    let outcome = client
+        .request_tracked(get("/prompt"), within(2), &tracker)
+        .await;
+    assert!(
+        matches!(outcome, Err(error) if error.sent == Sent::No),
+        "{outcome:?}"
+    );
+    assert!(!tracker.is_sent());
+    let mut decline = get("/decline");
+    decline.pool = Pool::Decline;
+    assert_eq!(
+        client.request(decline, within(2)).await.unwrap().status,
+        200
+    );
+    assert!(peer.await.unwrap().0.starts_with("GET /decline HTTP/1.1"));
+}
+
+/// OC09: drain also fences a connection already opening before its first byte (§8).
+#[tokio::test]
+async fn drain_during_connect_prevents_the_first_write() {
+    let (listener, client) = listener().await;
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut byte = [0];
+        assert_eq!(
+            stream.read(&mut byte).await.unwrap(),
+            0,
+            "no request byte after drain"
+        );
+    });
+    let tracker = SentTracker::new(|| {});
+    let request = client.request_tracked(get("/prompt"), within(2), &tracker);
+    tokio::pin!(request);
+    // Poll once without yielding to the current-thread reactor: connect is pending.
+    let first =
+        std::future::poll_fn(|context| std::task::Poll::Ready(request.as_mut().poll(context)))
+            .await;
+    assert!(first.is_pending());
+    assert!(!tracker.is_sent());
+    client.close_general(|| {});
+    assert!(matches!(request.await, Err(error) if error.sent == Sent::No));
+    assert!(!tracker.is_sent());
+    peer.await.unwrap();
 }
 
 #[tokio::test]
@@ -174,6 +319,7 @@ async fn headers_over_their_cap_fail_after_the_request_was_sent() {
         .unwrap_err();
     assert_eq!(error.kind, HttpFailure::HeadersTooLarge);
     assert_eq!(error.sent, Sent::Maybe);
+    assert_eq!(error.response_status, Some(200));
     peer.await.unwrap();
 }
 
@@ -198,6 +344,7 @@ async fn a_declared_length_over_the_cap_fails_without_reading_it() {
             length: Some(u64::try_from(BODY_BYTES + 1).unwrap())
         }
     );
+    assert_eq!(error.response_status, Some(200));
     peer.await.unwrap();
 }
 
@@ -216,7 +363,78 @@ async fn a_chunked_body_over_its_cap_fails() {
     };
     let error = client.request(request, within(5)).await.unwrap_err();
     assert_eq!(error.kind, HttpFailure::BodyTooLarge { length: None });
+    assert_eq!(error.response_status, Some(200));
     peer.await.unwrap();
+}
+
+/// `OpenCode` §8: a decoded 401 remains positive evidence through response caps.
+#[tokio::test]
+async fn capped_responses_retain_authentication_status_without_body_values() {
+    for headers in [false, true] {
+        let (listener, client) = listener().await;
+        let answer = if headers {
+            let mut answer = b"HTTP/1.1 401 Unauthorized\r\nX-Large: ".to_vec();
+            answer.extend(std::iter::repeat_n(b'a', HEADER_BYTES));
+            answer.extend_from_slice(b"\r\n\r\n");
+            answer
+        } else {
+            format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\n\r\n",
+                BODY_BYTES + 1
+            )
+            .into_bytes()
+        };
+        let peer = serve_once(listener, answer);
+        let error = client
+            .request(get("/api/info"), within(5))
+            .await
+            .unwrap_err();
+        peer.await.unwrap();
+        assert!(error.is_response_limit());
+        assert!(error.is_unauthorized());
+        assert_eq!(error.response_status, Some(401));
+    }
+}
+
+/// `OpenCode` §9: empty-body statuses cannot hide a declared length over the cap.
+#[tokio::test]
+async fn empty_body_statuses_still_check_the_declared_response_limit() {
+    for status in [204, 304] {
+        let (listener, client) = listener().await;
+        let peer = serve_once(
+            listener,
+            format!(
+                "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\n\r\n",
+                BODY_BYTES + 1
+            )
+            .into_bytes(),
+        );
+        let error = client
+            .request(get("/api/info"), within(5))
+            .await
+            .unwrap_err();
+        peer.await.unwrap();
+        assert!(error.is_response_limit());
+        assert_eq!(error.response_status, Some(status));
+    }
+}
+
+/// Runtime §4: an overlong or malformed status line supplies no status evidence.
+#[tokio::test]
+async fn a_capped_invalid_status_line_never_supplies_authentication_evidence() {
+    let (listener, client) = listener().await;
+    let mut answer = b"HTTP/1.1 bad401 ".to_vec();
+    answer.extend(std::iter::repeat_n(b'a', HEADER_BYTES));
+    answer.extend_from_slice(b"\r\n\r\n");
+    let peer = serve_once(listener, answer);
+    let error = client
+        .request(get("/api/info"), within(5))
+        .await
+        .unwrap_err();
+    peer.await.unwrap();
+    assert!(error.is_response_limit());
+    assert!(!error.is_unauthorized());
+    assert_eq!(error.response_status, None);
 }
 
 #[tokio::test]

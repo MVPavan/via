@@ -271,17 +271,19 @@ async fn call(
     deadline: Deadline,
 ) -> Result<HttpResponse, SetupError> {
     let body = body.map(serde_json::Value::to_string);
-    http.request(
-        HttpRequest {
-            method,
-            target,
-            body: body.as_deref().map(str::as_bytes),
-            body_limit,
-            pool: Pool::General,
-        },
-        deadline,
+    super::response::checked(
+        http.request(
+            HttpRequest {
+                method,
+                target,
+                body: body.as_deref().map(str::as_bytes),
+                body_limit,
+                pool: Pool::General,
+            },
+            deadline,
+        )
+        .await,
     )
-    .await
     .map_err(SetupError::Http)
 }
 

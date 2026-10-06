@@ -125,6 +125,11 @@ pub enum LaunchFailure {
         /// The handshake step that failed.
         step: &'static str,
     },
+    /// A handshake response breached §9, or returned §8's decisive 401.
+    Protocol {
+        /// The handshake endpoint, expressed only in VIA-owned text.
+        step: &'static str,
+    },
     /// The integration listing shows stored credentials (§4.3,
     /// `unexpected_credential_state`): not cached.
     Credential {
@@ -202,6 +207,15 @@ impl LaunchFailure {
             Self::Transient { step: name } => {
                 (RouteError::TransportLost { turn }, NONE, false, step(name))
             }
+            Self::Protocol { step: name } => (
+                RouteError::Protocol {
+                    turn,
+                    detail: "a handshake response answered outside the HTTP contract",
+                },
+                NONE,
+                false,
+                step(name),
+            ),
             Self::Credential { integrations } => (
                 RouteError::TransportLost { turn },
                 NONE,
@@ -467,8 +481,8 @@ pub struct Servers {
 }
 
 /// A pin on one server: a reservation while it launches, a hold once it is
-/// live. Dropping it releases the hold; the last release retires the
-/// server.
+/// live. Dropping it releases the hold; without holders or running sent
+/// turns, the server retires (§3, §8).
 pub struct ServerPin {
     servers: Arc<Servers>,
     server: ServerId,
@@ -499,20 +513,23 @@ impl ServerPin {
         &self.server
     }
 
-    /// The live generation and its facts; `None` while it launches or once
-    /// it left `Live`.
+    /// The usable generation and its facts; absent during launch, drain,
+    /// retirement or loss (§8).
     pub fn live(&self) -> Option<(Arc<Server>, Arc<ServerFacts>)> {
         self.servers.live_of(&self.server)
     }
 
-    /// A session's lease on the pinned server, only while it is `Live`.
+    /// A session's lease on the pinned server, only while it is usable (§8).
     pub fn lease(&self) -> Option<ServerLease> {
         let mut registry = self.servers.registry();
         let instance = registry.servers.get_mut(&self.server)?;
         match &mut instance.entry {
             Entry::Live {
-                holders, leases, ..
-            } => {
+                holders,
+                leases,
+                server,
+                ..
+            } if server.usable() => {
                 *holders = holders.saturating_add(1);
                 *leases = leases.saturating_add(1);
                 Some(ServerLease {
@@ -520,7 +537,10 @@ impl ServerPin {
                     server: self.server.clone(),
                 })
             }
-            Entry::Launching { .. } | Entry::Retiring { .. } | Entry::Lost { .. } => None,
+            Entry::Live { .. }
+            | Entry::Launching { .. }
+            | Entry::Retiring { .. }
+            | Entry::Lost { .. } => None,
         }
     }
 
@@ -530,6 +550,7 @@ impl ServerPin {
         let Some(mut ready) = self.launch.clone() else {
             return Ok(());
         };
+        // Watch and caller waits are cancellation safe; the launch stays supervised.
         tokio::select! {
             outcome = ready.wait_for(Option::is_some) => match outcome {
                 Ok(outcome) => outcome
@@ -570,7 +591,7 @@ impl ServerLease {
         &self.server
     }
 
-    /// The live generation and its facts; `None` once it left `Live`.
+    /// The usable generation and facts; absent during drain, retirement or loss (§8).
     pub fn live(&self) -> Option<(Arc<Server>, Arc<ServerFacts>)> {
         self.servers.live_of(&self.server)
     }
@@ -671,8 +692,13 @@ impl Servers {
     fn live_of(&self, server: &ServerId) -> Option<(Arc<Server>, Arc<ServerFacts>)> {
         let registry = self.registry();
         match &registry.servers.get(server)?.entry {
-            Entry::Live { server, facts, .. } => Some((Arc::clone(server), Arc::clone(facts))),
-            Entry::Launching { .. } | Entry::Retiring { .. } | Entry::Lost { .. } => None,
+            Entry::Live { server, facts, .. } if server.usable() => {
+                Some((Arc::clone(server), Arc::clone(facts)))
+            }
+            Entry::Live { .. }
+            | Entry::Launching { .. }
+            | Entry::Retiring { .. }
+            | Entry::Lost { .. } => None,
         }
     }
 
@@ -707,8 +733,8 @@ impl Servers {
         pinned
     }
 
-    /// Pins `server` under the guard, moving a live server that no longer
-    /// serves to `Lost`.
+    /// Pins `server` under the guard; a drain retains sent turns (§8),
+    /// while a failed live server moves to `Lost`.
     fn pin_locked(
         registry: &mut Registry,
         servers: &Arc<Self>,
@@ -734,6 +760,10 @@ impl Servers {
                 if live.usable() {
                     *holders = holders.saturating_add(1);
                     return Some(pin(None));
+                }
+                // Drain retains the stream and sent turns (§8); it is not loss.
+                if live.is_draining() {
+                    return None;
                 }
                 let (key, live) = (*key, Arc::clone(live));
                 instance.entry = Entry::Lost { server: live };
@@ -827,15 +857,41 @@ impl Servers {
         }
     }
 
-    /// Gives back one `hold` on `server`. At no holder left on a live
-    /// server it makes the one `Live → Retiring` transition. A deferred
-    /// launch with no holder left is dropped by the supervisor.
+    /// Publish drain readiness while retaining sent-turn destinations (§8).
+    pub(crate) fn draining(&self, server: &ServerId) {
+        {
+            let mut registry = self.registry();
+            if let Some(Instance {
+                entry: Entry::Live { key, .. },
+                ..
+            }) = registry.servers.get(server)
+            {
+                let key = *key;
+                registry.unmap(&key, server);
+            }
+        }
+        self.bump();
+        self.work.notify_one();
+    }
+
+    /// Last sent settlement can retire a drain despite idle leases/pins (§8).
+    pub(crate) fn turns_changed(&self, server: &ServerId) {
+        let retired = Self::retire_if_idle_locked(&mut self.registry(), server);
+        if let Some(Retire) = retired {
+            self.bump();
+            self.work.notify_one();
+        }
+    }
+
+    /// Gives back one `hold`; quiescence permits the `Live → Retiring`
+    /// transition without holders, or despite holders during drain (§8).
+    /// A deferred launch without holders is dropped by the supervisor.
     fn release_locked(registry: &mut Registry, server: &ServerId, hold: Hold) -> Option<Retire> {
         let Some(instance) = registry.servers.get_mut(server) else {
             registry.stale = registry.stale.saturating_add(1);
             return None;
         };
-        let retire = match &mut instance.entry {
+        match &mut instance.entry {
             Entry::Launching { holders, .. } => {
                 *holders = holders.saturating_sub(1);
                 // A launch not yet spawned must be looked at again.
@@ -843,21 +899,36 @@ impl Servers {
                     .then_some(Retire);
             }
             Entry::Live {
-                key,
-                holders,
-                leases,
-                server: live,
-                ..
+                holders, leases, ..
             } => {
                 if hold == Hold::Lease {
                     *leases = leases.saturating_sub(1);
                 }
                 *holders = holders.saturating_sub(1);
-                (*holders == 0).then(|| (*key, Arc::clone(live)))
             }
-            Entry::Retiring { .. } | Entry::Lost { .. } => None,
+            Entry::Retiring { .. } | Entry::Lost { .. } => return None,
+        }
+        Self::retire_if_idle_locked(registry, server)
+    }
+
+    fn retire_if_idle_locked(registry: &mut Registry, server: &ServerId) -> Option<Retire> {
+        let instance = registry.servers.get_mut(server)?;
+        let Entry::Live {
+            key,
+            holders,
+            server: live,
+            ..
+        } = &instance.entry
+        else {
+            return None;
         };
-        let (key, live) = retire?;
+        if (*holders > 0 && !live.is_draining())
+            || live.failure().is_some()
+            || live.routing().has_running_sent_turns()
+        {
+            return None;
+        }
+        let (key, live) = (*key, Arc::clone(live));
         // From here an end of its stream is the retirement, not a loss.
         live.retire();
         let stdio = live.stdio().clone();
@@ -1213,6 +1284,7 @@ async fn supervise(servers: Arc<Servers>) {
         if servers.step(event.take(), &mut set, &mut kinds) {
             return;
         }
+        // Both waits retain state; losing this select never drops an owned task.
         tokio::select! {
             biased;
             joined = set.join_next_with_id(), if !set.is_empty() => event = joined,

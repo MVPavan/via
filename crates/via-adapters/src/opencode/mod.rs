@@ -17,6 +17,7 @@ use crate::plan::CatalogModel;
 use crate::private_dir::Unsafe;
 use crate::{CapacityToken, ProcessOwner};
 
+mod control;
 mod delivery;
 mod driver;
 mod execution;
@@ -29,6 +30,12 @@ mod normalize_tests;
 
 #[cfg(test)]
 mod driver_tests;
+
+#[cfg(test)]
+mod driver_control_tests;
+
+#[cfg(test)]
+mod driver_http_limit_tests;
 
 #[cfg(test)]
 mod plan_tests;

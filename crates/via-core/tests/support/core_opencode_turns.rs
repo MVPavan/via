@@ -394,19 +394,25 @@ fn oc11_session_creation_events_do_not_taint_the_first_turn_usage() {
 fn oc11_unrelated_session_rejection_does_not_taint_successor_usage() {
     let case = Case::new(&json!({}));
     let cwd = case.cwd("a");
-    let response = json!({
-        "status":200,
-        "json":core_opencode::session_info(&cwd,"default",&core_opencode::rules(false)),
-        "emit_before_response":true,
-        "sleep_ms":150,
-        "emit":[event("session.step.ended",json!({
+    let mut second_events = begin_events();
+    second_events.push(event(
+        "session.step.ended",
+        json!({
             "sessionID":"ses_foreign", "assistantMessageID":"msg_foreign", "finish":"stop",
             "tokens":{"input":300,"output":7}, "cost":9
-        }))]
-    });
+        }),
+    ));
+    second_events.extend(success_events("done").into_iter().skip(4));
     case.fixture(&with_route(
         server(&cwd, None),
-        route("GET", &format!("/api/session/{SES}"), json!([response])),
+        route(
+            "POST",
+            &format!("/api/session/{SES}/prompt"),
+            json!([
+                prompt_response(success_events("done")),
+                prompt_response(second_events)
+            ]),
+        ),
     ));
     let (first, second) = run(async {
         let daemon = case.daemon();
@@ -440,23 +446,35 @@ fn oc11_unrelated_session_rejection_does_not_taint_successor_usage() {
 fn oc05_running_execution_ends_before_successor_prompt_is_sent() {
     let case = Case::new(&json!({}));
     let cwd = case.cwd("a");
-    let mut fixture = server(&cwd, None);
-    fixture["routes"]
-        .as_array_mut()
-        .unwrap()
-        .iter_mut()
-        .find(|r| r["path"] == "/api/event")
-        .unwrap()["sse"]["events"] = json!([{"type":"server.connected","properties":{}},event("session.execution.started", json!({"sessionID":SES}))]);
-    // The held execution is server state, independent of any turn's lane.
-    // A setup readback releases it, so the dispatch rule must re-observe state.
-    let mut response = json!({"status":200,"json":core_opencode::session_info(&cwd,"default",&core_opencode::rules(false)),
-        "emit":[{"pause_ms":100},event("session.execution.succeeded",json!({"sessionID":SES}))]});
-    response["emit_before_response"] = json!(true);
-    fixture = with_route(fixture, route("POST", "/api/session", json!([response])));
+    let instructions = "Use the fixture rules.";
+    let mut fixture = server(&cwd, Some(instructions));
+    // The root is VIA-owned after creation. Instruction traffic records a
+    // held execution before attach; foreign startup traffic creates no state.
+    fixture = with_route(
+        fixture,
+        route(
+            "PUT",
+            &format!("/api/experimental/session/{SES}/instructions/entries/via"),
+            json!([{"status":204,"emit_before_response":true,"sleep_ms":100,
+                "emit":[event("session.execution.started",json!({"sessionID":SES}))]}]),
+        ),
+    );
+    fixture = with_route(
+        fixture,
+        route(
+            "GET",
+            &format!("/api/experimental/session/{SES}/instructions/entries"),
+            json!([{"status":200,"json":{"data":[{"key":"via","value":instructions}]},
+                "emit":[{"pause_ms":100},
+                        event("session.execution.succeeded",json!({"sessionID":SES}))]}]),
+        ),
+    );
     case.fixture(&fixture);
     let envelope = run(async {
         let daemon = case.daemon();
-        let (session, _) = daemon.spawn(&cwd, &json!({})).await;
+        let (session, _) = daemon
+            .spawn(&cwd, &json!({"instructions":{"text":instructions}}))
+            .await;
         let result = daemon.wait_result(&session, 1).await;
         daemon.stop().await;
         result
@@ -483,18 +501,23 @@ fn oc05_running_execution_ends_before_successor_prompt_is_sent() {
 fn oc05_running_execution_rejects_after_thirty_seconds_without_prompt() {
     let case = Case::new(&json!({}));
     let cwd = case.cwd("a");
-    let mut fixture = server(&cwd, None);
-    fixture["routes"]
-        .as_array_mut()
-        .unwrap()
-        .iter_mut()
-        .find(|r| r["path"] == "/api/event")
-        .unwrap()["sse"]["events"] = json!([{"type":"server.connected","properties":{}},event("session.execution.started", json!({"sessionID":SES}))]);
+    let instructions = "Use the fixture rules.";
+    let fixture = with_route(
+        server(&cwd, Some(instructions)),
+        route(
+            "PUT",
+            &format!("/api/experimental/session/{SES}/instructions/entries/via"),
+            json!([{"status":204,"emit_before_response":true,"sleep_ms":100,
+                "emit":[event("session.execution.started",json!({"sessionID":SES}))]}]),
+        ),
+    );
     case.fixture(&fixture);
     let (envelope, elapsed) = run(async {
         let daemon = case.daemon();
         let started = tokio::time::Instant::now();
-        let (session, _) = daemon.spawn(&cwd, &json!({})).await;
+        let (session, _) = daemon
+            .spawn(&cwd, &json!({"instructions":{"text":instructions}}))
+            .await;
         let result = daemon.wait_result(&session, 1).await;
         let elapsed = started.elapsed();
         daemon.stop().await;

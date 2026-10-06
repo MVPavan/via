@@ -2,6 +2,8 @@
 
 use serde_json::Value;
 
+use super::bounds::ID_BYTES;
+
 /// The retained, sanitized part of a vendor error.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VendorError {
@@ -88,8 +90,8 @@ pub enum ToolKind {
     /// Other tool activity.
     Activity,
 }
-/// Interactive vendor request kind; responses belong to chunk D.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Interactive vendor request kind (`opencode.md` §11).
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum InteractiveKind {
     /// Permission request.
     Permission,
@@ -135,7 +137,7 @@ pub enum EventData {
         kind: TextKind,
         /// Assistant key.
         assistant_message_id: String,
-        /// Piece order (§7.3); unused starts/reasoning default to zero.
+        /// Final piece order (§7.3); unused progress ordinals default to zero.
         ordinal: u64,
         /// Text only, never prompt echo.
         text: String,
@@ -168,10 +170,19 @@ pub enum EventData {
         kind: InteractiveKind,
         /// Request key.
         id: String,
+        /// Sanitized permission action; no resources or submitted values (§11).
+        action: Option<String>,
         /// Source assistant key.
         message_id: Option<String>,
         /// Source tool key.
         call_id: Option<String>,
+    },
+    /// Stream evidence settling an interactive request (`opencode.md` §11).
+    InteractiveSettled {
+        /// Request category.
+        kind: InteractiveKind,
+        /// Vendor request key.
+        id: String,
     },
     /// Child session birth.
     Created {
@@ -211,6 +222,8 @@ pub enum DecodeError {
 
 /// Decode one `data:` payload; unknown fields/types survive as activity only.
 pub fn decode(bytes: &[u8]) -> Result<Event, DecodeError> {
+    // §9: reject structure beyond depth 64 / 65,536 nodes before serde allocates it.
+    via_wire::json_limits::scan(bytes).map_err(|_| DecodeError::Generation)?;
     let envelope: Value = serde_json::from_slice(bytes).map_err(|_| DecodeError::Generation)?;
     let kind = envelope
         .get("type")
@@ -229,6 +242,7 @@ pub fn decode(bytes: &[u8]) -> Result<Event, DecodeError> {
         .map(|value| {
             value
                 .as_str()
+                .filter(|id| id.len() <= ID_BYTES)
                 .map(str::to_owned)
                 .ok_or(DecodeError::Generation)
         })
@@ -257,13 +271,20 @@ pub fn decode(bytes: &[u8]) -> Result<Event, DecodeError> {
 fn string(data: &Value, key: &str) -> Result<String, ()> {
     data.get(key)
         .and_then(Value::as_str)
+        .filter(|value| value.len() <= ID_BYTES)
         .map(str::to_owned)
         .ok_or(())
 }
 fn optional_string(data: &Value, key: &str) -> Result<Option<String>, ()> {
     data.get(key)
         .filter(|value| !value.is_null())
-        .map(|value| value.as_str().map(str::to_owned).ok_or(()))
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| value.len() <= ID_BYTES)
+                .map(str::to_owned)
+                .ok_or(())
+        })
         .transpose()
 }
 fn counter(data: &Value, key: &str) -> Result<Option<u64>, ()> {
@@ -319,14 +340,18 @@ fn error(data: &Value) -> Result<VendorError, ()> {
         status,
     })
 }
-fn activity(data: &Value) -> EventData {
-    EventData::Activity {
-        message_id: data
-            .get("assistantMessageID")
+fn activity(data: &Value) -> Result<EventData, ()> {
+    // Unknown schemas ignore non-string fields, but retained identities stay bounded (§9).
+    let key = |name| {
+        data.get(name)
             .and_then(Value::as_str)
-            .map(str::to_owned),
-        call_id: data.get("id").and_then(Value::as_str).map(str::to_owned),
-    }
+            .map(|id| (id.len() <= ID_BYTES).then(|| id.to_owned()).ok_or(()))
+            .transpose()
+    };
+    Ok(EventData::Activity {
+        message_id: key("assistantMessageID")?,
+        call_id: key("id")?,
+    })
 }
 fn inbox_payload(kind: InboxKind, data: &Value) -> Result<EventData, ()> {
     Ok(EventData::Inbox {
@@ -370,16 +395,20 @@ fn step_payload(kind: StepKind, data: &Value) -> Result<EventData, ()> {
 }
 fn text_payload(kind: TextKind, field: Option<&str>, data: &Value) -> Result<EventData, ()> {
     let text = field
-        .map(|field| string(data, field))
+        .map(|field| {
+            data.get(field)
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or(())
+        })
         .transpose()?
         .unwrap_or_default();
-    // §7.3 needs final text ordering. E19 observes ordinals on starts and
-    // reasoning too, but §7.1 does not require them for those observations.
+    // §7.3 requires final text ordering; §7.1 progress needs no ordinal.
     let ordinal = counter(data, "ordinal")?;
-    let ordinal = if matches!(kind, TextKind::Started | TextKind::Reasoning) {
-        ordinal.unwrap_or_default()
-    } else {
+    let ordinal = if kind == TextKind::Ended {
         ordinal.ok_or(())?
+    } else {
+        ordinal.unwrap_or_default()
     };
     Ok(EventData::Text {
         kind,
@@ -410,6 +439,7 @@ fn permission_payload(data: &Value) -> Result<EventData, ()> {
     Ok(EventData::Interactive {
         kind: InteractiveKind::Permission,
         id: string(data, "id")?,
+        action: optional_string(data, "action")?,
         message_id: source
             .map(|source| optional_string(source, "messageID"))
             .transpose()?
@@ -461,11 +491,20 @@ fn payload(kind: &str, data: &Value, event_id: Option<&str>) -> Result<EventData
             })
         }
         "permission.asked" => permission_payload(data),
+        "permission.replied" => Ok(EventData::InteractiveSettled {
+            kind: InteractiveKind::Permission,
+            id: string(data, "requestID")?,
+        }),
+        "form.cancelled" | "form.replied" => Ok(EventData::InteractiveSettled {
+            kind: InteractiveKind::Form,
+            id: string(data, "id")?,
+        }),
         "form.created" => {
             let form = data.get("form").ok_or(())?;
             Ok(EventData::Interactive {
                 kind: InteractiveKind::Form,
                 id: string(form, "id")?,
+                action: None,
                 message_id: None,
                 call_id: None,
             })
@@ -473,7 +512,7 @@ fn payload(kind: &str, data: &Value, event_id: Option<&str>) -> Result<EventData
         "session.created" => Ok(EventData::Created {
             parent_id: optional_string(data, "parentID")?,
         }),
-        _ => Ok(activity(data)),
+        _ => activity(data),
     }
 }
 
@@ -507,6 +546,94 @@ mod tests {
     }
 
     #[test]
+    fn oc09_event_json_structure_is_bounded_before_decoding() {
+        let mut nested = json!(null);
+        for _ in 0..65 {
+            nested = json!([nested]);
+        }
+        assert_eq!(
+            decode(&event(
+                "vendor.future",
+                json!({"sessionID":"ses_one","extra":nested})
+            )),
+            Err(DecodeError::Generation)
+        );
+        let wide = vec![json!(0); 65_537];
+        assert_eq!(
+            decode(&event(
+                "vendor.future",
+                json!({"sessionID":"ses_one","extra":wide})
+            )),
+            Err(DecodeError::Generation)
+        );
+    }
+
+    #[test]
+    fn oc07_permission_reply_retains_only_its_settlement_key() {
+        let decoded = decode(&event(
+            "permission.replied",
+            json!({"sessionID":"ses_one","requestID":"req_one","reply":"reject"}),
+        ))
+        .unwrap();
+        assert_eq!(
+            decoded.data,
+            EventData::InteractiveSettled {
+                kind: InteractiveKind::Permission,
+                id: "req_one".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn oc07_form_settlement_retains_only_its_request_key() {
+        for kind in ["form.cancelled", "form.replied"] {
+            let decoded = decode(&event(
+                kind,
+                json!({"sessionID":"ses_one","id":"frm_one","answer":{"private":"ignored"}}),
+            ))
+            .unwrap();
+            assert_eq!(
+                decoded.data,
+                EventData::InteractiveSettled {
+                    kind: InteractiveKind::Form,
+                    id: "frm_one".into(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn oc09_oversized_short_fields_fail_only_the_decodable_session() {
+        let too_long = "x".repeat(1025);
+        assert_eq!(
+            decode(&event(
+                "session.step.started",
+                json!({"sessionID":"ses_one","assistantMessageID":too_long}),
+            )),
+            Err(DecodeError::Session("ses_one".into()))
+        );
+        assert!(
+            decode(&event(
+                "session.text.delta",
+                json!({"sessionID":"ses_one","assistantMessageID":"msg_one","delta":too_long}),
+            ))
+            .is_ok(),
+            "text is governed by the event bound, not the short-field bound"
+        );
+    }
+
+    #[test]
+    fn oc09_oversized_session_identity_cannot_be_attributed() {
+        assert_eq!(
+            decode(&event(
+                "vendor.future",
+                json!({"sessionID":"x".repeat(1025)})
+            )),
+            Err(DecodeError::Generation)
+        );
+    }
+
+    #[test]
     fn oc06_boundary_unknown_terminal_suffix_is_only_activity() {
         let decoded = decode(&event(
             "session.execution.future",
@@ -529,6 +656,7 @@ mod tests {
     fn oc06_boundary_unused_ordinals_are_optional_but_final_text_order_is_required() {
         for kind in [
             "session.text.started",
+            "session.text.delta",
             "session.reasoning.started",
             "session.reasoning.delta",
             "session.reasoning.ended",

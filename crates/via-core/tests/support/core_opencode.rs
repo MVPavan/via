@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use via_core::{
-    AdapterConfig, BootstrapEnv, CloseParams, Deadline, Engine, EventsParams, LogsParams,
-    ResumeParams, SessionId, SpawnParams, StatusParams, WaitParams,
+    AdapterConfig, BootstrapEnv, CancelParams, CloseParams, Deadline, Engine, EventsParams,
+    LogsParams, ResumeParams, SessionId, SpawnParams, StatusParams, WaitParams,
 };
 
 /// Owns exactly one subprocess, including when a fixture unwinds.
@@ -626,6 +626,23 @@ impl Daemon {
         let params: LogsParams =
             serde_json::from_value(json!({"turn": format!("{session}/{turn}")})).unwrap();
         self.engine.logs(params).await.unwrap()
+    }
+
+    /// C1 §3.5 stop order, with a fixture-controlled grace before force.
+    pub(crate) async fn cancel(
+        &self,
+        session: &SessionId,
+        force_after_ms: u64,
+    ) -> Result<Value, via_core::ApiError> {
+        self.engine
+            .cancel(CancelParams {
+                session: session.clone(),
+                handle: Some(HANDLE.to_owned()),
+                turn: Some(1),
+                force_after_ms: Some(force_after_ms),
+                wait: false,
+            })
+            .await
     }
 
     /// Closes `session` gracefully.

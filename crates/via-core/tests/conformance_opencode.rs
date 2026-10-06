@@ -7,7 +7,7 @@
 //! setup: the turn-level handshake refusal and its cache (OC01), the
 //! inherited-configuration states (OC02), the session's creation, reopen
 //! and readbacks (OC04, OC07) and the per-turn refusals and variant step
-//! (OC11). Chunk C adds turn execution fixtures below.
+//! (OC11). Chunk C adds turn execution; chunk D covers controls, drain and bounds.
 #![expect(
     clippy::unwrap_used,
     clippy::panic,
@@ -902,3 +902,6 @@ fn oc02_stored_credentials_refuse_naming_integration_ids() {
 
 #[path = "support/core_opencode_turns.rs"]
 mod core_opencode_turns;
+
+#[path = "support/core_opencode_controls.rs"]
+mod core_opencode_controls;

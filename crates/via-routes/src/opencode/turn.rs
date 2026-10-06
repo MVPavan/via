@@ -1,11 +1,12 @@
 //! Turn submission and reopen inbox cleanup (§6, §7.2). No request is retried.
 
 use serde::Deserialize;
-use via_wire::http::{BODY_BYTES, HttpClient, HttpError, HttpRequest, Method, Pool};
+use via_wire::http::{BODY_BYTES, HttpClient, HttpRequest, HttpResponse, Method, Pool};
 use via_wire::json_limits;
 
 use crate::Deadline;
-pub use via_wire::http::Sent;
+/// Wire-owned request evidence used by adapter cancellation (`opencode.md` §7.4, §8).
+pub use via_wire::http::{HttpError, HttpFailure, Sent, SentTracker};
 
 /// The inbox has the ordinary HTTP response limit (`opencode.md` §9).
 /// The packet grants a larger body only to `/api/model`, not echoed inboxes.
@@ -33,6 +34,151 @@ struct InboxInput {
     id: String,
 }
 
+#[derive(Deserialize)]
+struct PromptRejection {
+    #[serde(rename = "_tag")]
+    kind: PromptRejectionKind,
+}
+
+#[derive(Deserialize)]
+enum PromptRejectionKind {
+    InvalidRequestError,
+    SessionNotFoundError,
+}
+
+#[derive(Deserialize)]
+struct InterruptReply {
+    interrupted: bool,
+}
+
+/// A complete interrupt response (`opencode.md` §7.4, §8); never an acknowledgement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InterruptOutcome {
+    /// The vendor decoded the stop request, with its running-execution snapshot.
+    Settled {
+        /// Whether an execution was running; the stream alone acknowledges it.
+        interrupted: bool,
+    },
+    /// A complete status outside the interrupt contract.
+    Status(u16),
+    /// A 200 body did not decode.
+    Inconclusive,
+}
+
+/// Complete input-cancel status (`opencode.md` §7.4, §8), not cancellation evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CancelOutcome {
+    /// Complete 204; await the matching stream cancellation.
+    Settled,
+    /// A complete status outside the cancellation contract.
+    Status(u16),
+}
+
+/// Stop a delivered input's session on the reserved pool (`opencode.md` §7.4, §8).
+pub async fn interrupt(
+    http: &HttpClient,
+    session: &str,
+    by: Deadline,
+) -> Result<InterruptOutcome, HttpError> {
+    interrupt_with_tracker(http, session, by, None).await
+}
+
+/// Interrupt with actual first-byte evidence (`opencode.md` §7.4, §8).
+pub async fn interrupt_tracked(
+    http: &HttpClient,
+    session: &str,
+    by: Deadline,
+    tracker: &SentTracker,
+) -> Result<InterruptOutcome, HttpError> {
+    interrupt_with_tracker(http, session, by, Some(tracker)).await
+}
+
+async fn interrupt_with_tracker(
+    http: &HttpClient,
+    session: &str,
+    by: Deadline,
+    tracker: Option<&SentTracker>,
+) -> Result<InterruptOutcome, HttpError> {
+    let target = format!("/api/session/{}/interrupt", path_segment(session));
+    let response = request_with_tracker(
+        http,
+        HttpRequest {
+            method: Method::Post,
+            target: &target,
+            body: None,
+            body_limit: BODY_BYTES,
+            pool: Pool::Stop,
+        },
+        by,
+        tracker,
+    )
+    .await?;
+    if response.status != 200 {
+        return Ok(InterruptOutcome::Status(response.status));
+    }
+    Ok(json_limits::scan(&response.body)
+        .ok()
+        .and_then(|_scan| serde_json::from_slice::<InterruptReply>(&response.body).ok())
+        .map_or(InterruptOutcome::Inconclusive, |reply| {
+            InterruptOutcome::Settled {
+                interrupted: reply.interrupted,
+            }
+        }))
+}
+
+/// Cancel a never-delivered caller input (`opencode.md` §7.4, §8), once at most.
+pub async fn cancel_input(
+    http: &HttpClient,
+    session: &str,
+    input: &str,
+    by: Deadline,
+) -> Result<CancelOutcome, HttpError> {
+    cancel_input_with_tracker(http, session, input, by, None).await
+}
+
+/// Input cancellation with actual first-byte evidence (`opencode.md` §7.4, §8).
+pub async fn cancel_input_tracked(
+    http: &HttpClient,
+    session: &str,
+    input: &str,
+    by: Deadline,
+    tracker: &SentTracker,
+) -> Result<CancelOutcome, HttpError> {
+    cancel_input_with_tracker(http, session, input, by, Some(tracker)).await
+}
+
+async fn cancel_input_with_tracker(
+    http: &HttpClient,
+    session: &str,
+    input: &str,
+    by: Deadline,
+    tracker: Option<&SentTracker>,
+) -> Result<CancelOutcome, HttpError> {
+    let target = format!(
+        "/api/session/{}/inbox/{}",
+        path_segment(session),
+        path_segment(input)
+    );
+    let response = request_with_tracker(
+        http,
+        HttpRequest {
+            method: Method::Delete,
+            target: &target,
+            body: None,
+            body_limit: BODY_BYTES,
+            pool: Pool::Stop,
+        },
+        by,
+        tracker,
+    )
+    .await?;
+    Ok(if response.status == 204 {
+        CancelOutcome::Settled
+    } else {
+        CancelOutcome::Status(response.status)
+    })
+}
+
 /// A complete prompt response, or a response that cannot prove acceptance.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Submission {
@@ -52,20 +198,59 @@ pub async fn prompt(
     text: &str,
     by: Deadline,
 ) -> Result<Submission, HttpError> {
-    let target = format!("/api/session/{session}/prompt");
+    prompt_with_tracker(http, session, input, text, by, None).await
+}
+
+/// Submit once with Wire's first-byte evidence (`opencode.md` §6, §8).
+pub async fn prompt_tracked(
+    http: &HttpClient,
+    session: &str,
+    input: &str,
+    text: &str,
+    by: Deadline,
+    tracker: &SentTracker,
+) -> Result<Submission, HttpError> {
+    prompt_with_tracker(http, session, input, text, by, Some(tracker)).await
+}
+
+async fn prompt_with_tracker(
+    http: &HttpClient,
+    session: &str,
+    input: &str,
+    text: &str,
+    by: Deadline,
+    tracker: Option<&SentTracker>,
+) -> Result<Submission, HttpError> {
+    let target = format!("/api/session/{}/prompt", path_segment(session));
     let body = serde_json::json!({"id":input,"text":text}).to_string();
-    let response = http
-        .request(
-            HttpRequest {
-                method: Method::Post,
-                target: &target,
-                body: Some(body.as_bytes()),
-                body_limit: BODY_BYTES,
-                pool: Pool::General,
-            },
-            by,
-        )
-        .await?;
+    let response = request_with_tracker(
+        http,
+        HttpRequest {
+            method: Method::Post,
+            target: &target,
+            body: Some(body.as_bytes()),
+            body_limit: BODY_BYTES,
+            pool: Pool::General,
+        },
+        by,
+        tracker,
+    )
+    .await?;
+    if matches!(response.status, 400 | 404) {
+        let rejection = json_limits::scan(&response.body)
+            .ok()
+            .and_then(|_scan| serde_json::from_slice::<PromptRejection>(&response.body).ok());
+        let definitive = matches!(
+            (response.status, rejection.map(|rejection| rejection.kind)),
+            (400, Some(PromptRejectionKind::InvalidRequestError))
+                | (404, Some(PromptRejectionKind::SessionNotFoundError))
+        );
+        return Ok(if definitive {
+            Submission::Status(response.status)
+        } else {
+            Submission::Inconclusive
+        });
+    }
     if response.status != 200 {
         return Ok(Submission::Status(response.status));
     }
@@ -82,6 +267,20 @@ pub async fn prompt(
     )
 }
 
+async fn request_with_tracker(
+    http: &HttpClient,
+    request: HttpRequest<'_>,
+    by: Deadline,
+    tracker: Option<&SentTracker>,
+) -> Result<HttpResponse, HttpError> {
+    let response = if let Some(tracker) = tracker {
+        http.request_tracked(request, by, tracker).await
+    } else {
+        http.request(request, by).await
+    };
+    super::response::checked(response)
+}
+
 /// Read the reopen inbox exactly once (§7.2). Echoed text and foreign IDs
 /// that cannot be VIA's path-safe caller IDs are discarded.
 pub async fn inbox(
@@ -89,9 +288,9 @@ pub async fn inbox(
     session: &str,
     by: Deadline,
 ) -> Result<Vec<String>, super::session::SetupError> {
-    let target = format!("/api/session/{session}/inbox");
-    let response = http
-        .request(
+    let target = format!("/api/session/{}/inbox", path_segment(session));
+    let response = super::response::checked(
+        http.request(
             HttpRequest {
                 method: Method::Get,
                 target: &target,
@@ -101,8 +300,9 @@ pub async fn inbox(
             },
             by,
         )
-        .await
-        .map_err(super::session::SetupError::Http)?;
+        .await,
+    )
+    .map_err(super::session::SetupError::Http)?;
     if response.status != 200 {
         return Err(super::session::SetupError::Status {
             status: response.status,
@@ -137,28 +337,29 @@ pub async fn cancel_leftover(
     input: &str,
     by: Deadline,
 ) -> Result<(), super::session::SetupError> {
-    let target = format!("/api/session/{session}/inbox/{input}");
-    let response = http
-        .request(
-            HttpRequest {
-                method: Method::Delete,
-                target: &target,
-                body: None,
-                body_limit: BODY_BYTES,
-                pool: Pool::Stop,
-            },
-            by,
-        )
+    let response = cancel_input(http, session, input, by)
         .await
         .map_err(super::session::SetupError::Http)?;
-    if response.status == 204 {
-        Ok(())
-    } else {
-        Err(super::session::SetupError::Status {
-            status: response.status,
-            tag: None,
-        })
+    match response {
+        CancelOutcome::Settled => Ok(()),
+        CancelOutcome::Status(status) => {
+            Err(super::session::SetupError::Status { status, tag: None })
+        }
     }
+}
+
+/// Opaque vendor IDs stay inside one URL path segment (`opencode.md` §11).
+pub(super) fn path_segment(value: &str) -> String {
+    use std::fmt::Write as _;
+    value.bytes().fold(String::new(), |mut encoded, byte| {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+            encoded.push(char::from(byte));
+        } else {
+            // Writing to a String cannot fail.
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+        encoded
+    })
 }
 
 #[cfg(test)]
@@ -171,6 +372,149 @@ mod tests {
     use tokio::time::{Instant, timeout};
 
     use super::*;
+
+    async fn control_reply(
+        status: u16,
+        body: &[u8],
+    ) -> (HttpClient, tokio::task::JoinHandle<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = HttpClient::new(
+            listener.local_addr().unwrap().port(),
+            "opencode",
+            "synthetic",
+        );
+        let body = body.to_vec();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+            }
+            let length = String::from_utf8_lossy(&request)
+                .lines()
+                .find_map(|line| line.strip_prefix("Content-Length: "))
+                .map_or(0, |length| length.parse::<usize>().unwrap());
+            let mut request_body = vec![0; length];
+            stream.read_exact(&mut request_body).await.unwrap();
+            let head = format!(
+                "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+            request
+        });
+        (client, peer)
+    }
+
+    #[test]
+    fn oc07_opaque_control_ids_cannot_change_url_structure() {
+        assert_eq!(
+            path_segment("request/? #雪"),
+            "request%2F%3F%20%23%E9%9B%AA"
+        );
+        assert_eq!(path_segment("ses_one-msg.1~"), "ses_one-msg.1~");
+    }
+
+    #[tokio::test]
+    async fn oc08_interrupt_reply_is_typed_but_never_stream_acknowledgement() {
+        for interrupted in [true, false] {
+            let body =
+                serde_json::to_vec(&json!({"interrupted":interrupted,"extra":"ignored"})).unwrap();
+            let (client, peer) = control_reply(200, &body).await;
+            let result = interrupt(
+                &client,
+                "ses_one",
+                Deadline::at(Instant::now() + Duration::from_secs(2)),
+            )
+            .await;
+            let request = peer.await.unwrap();
+            assert!(request.starts_with(b"POST /api/session/ses_one/interrupt HTTP/1.1\r\n"));
+            assert_eq!(result.unwrap(), InterruptOutcome::Settled { interrupted });
+        }
+        for (status, body, expected) in [
+            (200, b"{}".as_slice(), InterruptOutcome::Inconclusive),
+            (200, b"not-json".as_slice(), InterruptOutcome::Inconclusive),
+            (401, b"".as_slice(), InterruptOutcome::Status(401)),
+            (500, b"".as_slice(), InterruptOutcome::Status(500)),
+        ] {
+            let (client, peer) = control_reply(status, body).await;
+            let result = interrupt(
+                &client,
+                "ses_one",
+                Deadline::at(Instant::now() + Duration::from_secs(2)),
+            )
+            .await;
+            peer.await.unwrap();
+            assert_eq!(result.unwrap(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn oc08_input_cancel_status_is_settlement_without_stream_proof() {
+        for (status, expected) in [
+            (204, CancelOutcome::Settled),
+            (404, CancelOutcome::Status(404)),
+            (401, CancelOutcome::Status(401)),
+        ] {
+            let (client, peer) = control_reply(status, b"").await;
+            let result = cancel_input(
+                &client,
+                "ses_one",
+                "msg_input",
+                Deadline::at(Instant::now() + Duration::from_secs(2)),
+            )
+            .await;
+            let request = peer.await.unwrap();
+            assert!(
+                request.starts_with(b"DELETE /api/session/ses_one/inbox/msg_input HTTP/1.1\r\n")
+            );
+            assert_eq!(result.unwrap(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn oc08_prompt_rejection_requires_the_typed_error_tag() {
+        for (status, body, expected) in [
+            (
+                400,
+                br#"{"_tag":"InvalidRequestError","message":"ignored"}"#.as_slice(),
+                Submission::Status(400),
+            ),
+            (
+                404,
+                br#"{"_tag":"SessionNotFoundError"}"#.as_slice(),
+                Submission::Status(404),
+            ),
+            (
+                400,
+                br#"{"_tag":"OtherError"}"#.as_slice(),
+                Submission::Inconclusive,
+            ),
+            (
+                404,
+                br#"{"_tag":"OtherError"}"#.as_slice(),
+                Submission::Inconclusive,
+            ),
+            (400, b"not-json".as_slice(), Submission::Inconclusive),
+            (404, b"{}".as_slice(), Submission::Inconclusive),
+            (401, b"not-json".as_slice(), Submission::Status(401)),
+        ] {
+            let (client, peer) = control_reply(status, body).await;
+            let result = prompt(
+                &client,
+                "ses_one",
+                "msg_input",
+                "fixture",
+                Deadline::at(Instant::now() + Duration::from_secs(2)),
+            )
+            .await;
+            peer.await.unwrap();
+            assert_eq!(result.unwrap(), expected);
+        }
+    }
 
     /// A fake loopback response; no vendor or child process is started.
     async fn listing_response(
