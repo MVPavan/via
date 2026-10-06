@@ -129,9 +129,10 @@ whether it succeeded or failed, within its own handshake deadline (counted
 from its launch's start, so the wait spends it), and only then starts its
 process. Launches on a marked home are not serialized, and equal keys still
 share one launch. A server that dies during its handshake fails its
-waiting turns `server_lost` when Host confirms the exit; any other launch
-or handshake failure before a turn's first byte fails it `submit_failed`
-(`launch_failed`), never `unknown` (C1 §7.6).
+waiting turns `server_lost` when Host confirms the exit; a transport loss,
+handshake deadline or launch-task failure before a turn's first byte fails
+it `submit_failed` (`launch_failed`), never `unknown`. A malformed reply,
+overflow, Store failure or shutdown keeps its own disposition (C1 §7.6).
 
 Each session has one lease and a registered thread ID. One shared server holds
 one of the runtime's harness-process slots (runtime §8) for its life; a turn on a live
