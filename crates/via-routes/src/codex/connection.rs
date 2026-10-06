@@ -262,6 +262,10 @@ pub struct Connection {
     /// The daemon is shutting down: Host's stop ending the transport is
     /// expected, so it writes no `via.log` line.
     shutting_down: AtomicBool,
+    /// The first failure latched after the shutdown began: taken at the
+    /// latch, so a failure that preceded the fence still warns (review
+    /// cfix-crit #3).
+    failed_in_shutdown: AtomicBool,
     /// A driver posted its close (x.3.2 X3 §5.1): the connection task
     /// applies it between two routing operations.
     closes: Notify,
@@ -464,6 +468,7 @@ impl Connection {
             end: watch::Sender::new(None),
             retiring: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
+            failed_in_shutdown: AtomicBool::new(false),
             closes: Notify::new(),
             epoch: watch::Sender::new(0),
         })
@@ -582,6 +587,10 @@ impl Connection {
                 return false;
             }
             *failure = Some(cause);
+            self.failed_in_shutdown.store(
+                self.shutting_down.load(Ordering::Acquire),
+                Ordering::Release,
+            );
             self.stdio.seal();
             true
         });
@@ -1457,10 +1466,10 @@ fn disposition(cause: ConnectionFailure, report: &WireCloseReport) -> Connection
 /// (codex-server.md item 5; runtime §6.2): the server ID, the cause and
 /// the note naming the server folder's `undecoded.bin`, or why it was not
 /// saved. Only VIA's own text: never a vendor byte. Read after the reader
-/// finished, so a save it began is noted. The transport or server lost
-/// after the daemon's shutdown began is Host's stop: no line.
+/// finished, so a save it began is noted. A transport or server lost that
+/// latched after the daemon's shutdown began is Host's stop: no line.
 fn log_failure(connection: &Connection, cause: LossCause) {
-    if connection.shutting_down.load(Ordering::Acquire)
+    if connection.failed_in_shutdown.load(Ordering::Acquire)
         && matches!(cause, LossCause::TransportLost | LossCause::ServerLost)
     {
         return;

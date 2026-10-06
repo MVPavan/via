@@ -732,6 +732,46 @@ async fn a_failed_connection_logs_its_server_and_evidence_path() {
     );
 }
 
+/// Review cfix-crit #3: a transport lost before the daemon's shutdown
+/// began is news for `via.log`, even when the registry's fence marks the
+/// connection before the failed connection logs: whether the daemon was
+/// shutting down is taken when the failure latches, so exactly one
+/// warning.
+#[tokio::test]
+async fn a_failure_before_the_fence_still_warns() {
+    const POINT: &str = "codex.connection.fail_sequence";
+    let captured = Captured::default();
+    let sink = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || sink.clone())
+        .with_ansi(false)
+        .finish();
+    let _default = tracing::subscriber::set_default(subscriber);
+    let points = paused_at(POINT);
+    let mut vendor = Vendor::open(1 << 16);
+    vendor.ends.end_stdout().await;
+    reached(&points, POINT).await;
+    vendor.connection.shutting_down();
+    release(&points, POINT);
+    let end = tokio::time::timeout(Duration::from_secs(10), &mut vendor.task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(&end, ConnectionEnd::Failed(loss) if loss.cause == LossCause::TransportLost),
+        "{end:?}"
+    );
+    let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines.len(), 1, "{log}");
+    assert!(lines[0].contains("WARN"), "{log}");
+    assert!(
+        lines[0].contains("shared server connection failed"),
+        "{log}"
+    );
+    assert!(lines[0].contains("cause=TransportLost"), "{log}");
+}
+
 /// Owner 2026-10-05 (review cfix-3): every line over the cap is
 /// unattributable, whatever its tail names, so for the first release it
 /// fails the shared connection `protocol`, its head kept as server
