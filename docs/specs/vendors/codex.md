@@ -351,7 +351,7 @@ call and no server start):
 3. Probe each short letter the same way.
 
 `app-server` 0.160.0 accepts 18 long names:
-- the 17 its help lists, minus `--help`;
+- the 15 its help lists besides `--help` (16 with it);
 - plus the hidden `--remote-control` ("Enable remote control for this
   app-server process") and `--managed-daemon`;
 - plus `--help`.

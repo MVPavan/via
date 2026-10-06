@@ -181,14 +181,19 @@ pub(crate) fn conflict(args: &[String], rules: &Rules) -> Option<usize> {
                     // A switch: the cluster goes on.
                     continue;
                 };
-                let rest = &cluster[at + letter.len_utf8()..];
-                let rest = rest.strip_prefix('=').unwrap_or(rest);
-                if rest.is_empty() {
+                // Anything attached, even `=` alone, is the value: Commander
+                // binds `-n=` to "=", so the next element is never this
+                // option's (review pass-2). Both spellings are judged.
+                let attached = &cluster[at + letter.len_utf8()..];
+                let stripped = attached.strip_prefix('=').unwrap_or(attached);
+                if attached.is_empty() {
                     if takes == Takes::Many {
                         return Some(index);
                     }
                     pending = Some(name.to_owned());
-                } else if (rules.value_reserved)(name, rest) {
+                } else if (rules.value_reserved)(name, stripped)
+                    || (rules.value_reserved)(name, attached)
+                {
                     return Some(index);
                 }
                 break;
@@ -325,5 +330,10 @@ mod tests {
         assert_eq!(first(&["--many", "a"]), Some(0));
         assert_eq!(first(&["--many"]), Some(0));
         assert_eq!(first(&["--opt", "v", "INJECTED PROMPT"]), Some(2));
+        // An attached `=` alone is a value (Commander binds "="), never a
+        // pending one: the next element is an operand (review pass-2).
+        assert_eq!(first(&["-o=", "INJECTED PROMPT"]), Some(1));
+        assert_eq!(first(&["-o=v"]), None);
+        assert_eq!(first(&["-ov"]), None);
     }
 }
