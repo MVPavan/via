@@ -1777,7 +1777,8 @@ fn passthrough_warnings(value: &Value) -> usize {
 /// restart. Each receipt, envelope and status of the session carries one
 /// `vendor_passthrough` warning; a plain session's carry none. `--` on
 /// `via resume` is `invalid_params` kind2 `session_scope_on_resume`
-/// naming `vendor_args`, with no launch.
+/// naming `vendor_args`, with no launch; a bare `--` sends nothing and the
+/// resume proceeds.
 #[test]
 fn claude_passthrough_args_frozen_across_resume_and_restart() -> TestResult {
     scenario("claude_passthrough_frozen", |d, evidence| {
@@ -1838,7 +1839,21 @@ fn claude_passthrough_args_frozen_across_resume_and_restart() -> TestResult {
             0.002,
         )));
         d.replay(&lives)?;
-        let resumed = d.resume(evidence, "resume-2", &session, &ask("TWO"))?;
+        // C1 §1, §3.3: a bare `--` on resume sends nothing and is ignored.
+        let resumed = d.ok(
+            evidence,
+            "resume-2",
+            &[
+                "resume",
+                &session,
+                "--prompt",
+                &ask("TWO"),
+                "--handle",
+                HANDLE,
+                "--json",
+                "--",
+            ],
+        )?;
         let second = d.wait(evidence, &format!("{session}/2"))?;
         check(
             completed(&second)

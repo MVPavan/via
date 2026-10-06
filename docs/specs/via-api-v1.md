@@ -145,7 +145,8 @@ decided in the slice that needs them, after re-probing.
   `resume`, an unknown verb) is `command`. Its message is the parser's own,
   without usage. On `spawn` and `resume` every argument after `--` is sent
   unchanged, in order, as `vendor_args` (§4); `resume` then refuses it
-  (§3.3).
+  (§3.3). A bare `--` with nothing after it sends no `vendor_args` and is
+  ignored, on both verbs.
   `--help` and `--version` print the parser's help and version and exit 0;
   bare `via`, with no arguments, prints the parser's help on stderr and
   exits 2, with no JSON.
@@ -253,8 +254,9 @@ CLI: `via resume <session> --prompt "…" [per-turn flags] [--op-key K]`
 
 Params: `session`, `handle`, `prompt`, per-turn parameters (§4), `op_key?`.
 `allow_untested` is inherited session policy; attempting to change it on
-resume is `invalid_params`. `vendor_args` is session scope too: `--` on
-`via resume` sends it, and any `vendor_args` member is `invalid_params`
+resume is `invalid_params`. `vendor_args` is session scope too: arguments
+after `--` on `via resume` are sent as it (a bare `--` sends nothing and is
+ignored, §1), and any `vendor_args` member is `invalid_params`
 kind2 `session_scope_on_resume` naming `vendor_args`; the session's frozen
 list applies to every turn. The receipt's `warnings` carries
 `vendor_passthrough` while the session has one.
