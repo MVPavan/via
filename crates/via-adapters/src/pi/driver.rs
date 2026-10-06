@@ -562,14 +562,29 @@ async fn keep_records(
     {
         records.push(("pi-inventory.json", record));
     }
-    let cut = Cut::default();
+    // From now, within the wall's cutoff; the writer has its bound
+    // before it starts (picrit round 3, 4).
+    let from = Deadline::at(tokio::time::Instant::now().min(wall.instant()));
+    let cut = records_cut(from, (&orders.0, &orders.1));
     let written = driver.tracker.spawn_blocking({
         let cut = cut.clone();
         move || write_records(&folder, records, &cut)
     });
-    if !records_by(written, (wall, force, orders), &cut).await {
+    if !records_by(written, (from, force, orders), &cut).await {
         cut.now();
     }
+}
+
+/// The records' first bound, from the orders as they stand: an already
+/// expired cutoff skips every record.
+fn records_cut(from: Deadline, (stop, close): (&StopWatch, &CloseWatch)) -> Cut {
+    let orders = [
+        stop.borrow().as_ref().map(|order| order.close_by),
+        close.borrow().as_ref().map(|order| order.close_by),
+    ];
+    Cut(Arc::new(Mutex::new(
+        earliest_close(from, orders).into_std(),
+    )))
 }
 
 /// Ends the turn's active state (steer lane and close order) when the
@@ -584,30 +599,31 @@ impl Drop for Ending<'_> {
     }
 }
 
-/// The records' cutoff as the writer checks it before each record: the
-/// current bound [`records_by`] publishes, so a writer resuming past it
-/// begins nothing even before the waiter wakes (picrit round 2, D).
-#[derive(Clone, Default)]
-struct Cut(Arc<Mutex<Option<std::time::Instant>>>);
+/// The records' cutoff as the writer checks it before each record: set
+/// before the writer starts ([`records_cut`]), then the current bound
+/// [`records_by`] publishes, so a writer resuming past it begins nothing
+/// even before the waiter wakes (picrit round 2, D; round 3, 4).
+#[derive(Clone)]
+struct Cut(Arc<Mutex<std::time::Instant>>);
 
 impl Cut {
     /// The bound is `at`.
     fn set(&self, at: tokio::time::Instant) {
-        *self.at() = Some(at.into_std());
+        *self.at() = at.into_std();
     }
 
     /// The bound has passed.
     fn now(&self) {
-        *self.at() = Some(std::time::Instant::now());
+        *self.at() = std::time::Instant::now();
     }
 
     /// Whether the bound has passed.
     fn passed(&self) -> bool {
-        self.at().is_some_and(|at| std::time::Instant::now() >= at)
+        std::time::Instant::now() >= *self.at()
     }
 
     /// The bound, a poisoned lock read through.
-    fn at(&self) -> std::sync::MutexGuard<'_, Option<std::time::Instant>> {
+    fn at(&self) -> std::sync::MutexGuard<'_, std::time::Instant> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -627,11 +643,9 @@ const RECORDS_SKIPPED: &str = "pi-records-skipped.json";
 /// the wait at once.
 async fn records_by(
     written: impl std::future::Future,
-    (wall, mut force, orders): (Deadline, ForceWatch, (StopWatch, CloseWatch)),
+    (from, mut force, orders): (Deadline, ForceWatch, (StopWatch, CloseWatch)),
     cut: &Cut,
 ) -> bool {
-    // From now, within the wall's cutoff.
-    let allowance = Deadline::at(tokio::time::Instant::now().min(wall.instant()));
     let forced = async move {
         // A force sender gone unset: no force will come.
         if force.wait_for(Option::is_some).await.is_err() {
@@ -642,7 +656,7 @@ async fn records_by(
         biased;
         () = forced => false,
         _ = written => true,
-        () = by_orders(allowance, orders, |bound| cut.set(bound)) => false,
+        () = by_orders(from, orders, |bound| cut.set(bound)) => false,
     }
 }
 
@@ -657,7 +671,7 @@ async fn by_orders(
 ) {
     let (mut stop_open, mut close_open) = (true, true);
     loop {
-        let bound = [
+        let orders = [
             stop.borrow_and_update()
                 .as_ref()
                 .map(|order| order.close_by),
@@ -665,11 +679,8 @@ async fn by_orders(
                 .borrow_and_update()
                 .as_ref()
                 .map(|order| order.close_by),
-        ]
-        .into_iter()
-        .flatten()
-        .map(Deadline::instant)
-        .fold(from.instant() + CLEANUP_ALLOWANCE, std::cmp::Ord::min);
+        ];
+        let bound = earliest_close(from, orders);
         publish(bound);
         tokio::select! {
             biased;
@@ -678,6 +689,16 @@ async fn by_orders(
             changed = close.changed(), if close_open => close_open = changed.is_ok(),
         }
     }
+}
+
+/// The turn's one cutoff, [`CLEANUP_ALLOWANCE`] after `from` (C2 §4.1),
+/// or the earlier of `orders`' `close_by`.
+fn earliest_close(from: Deadline, orders: [Option<Deadline>; 2]) -> tokio::time::Instant {
+    orders
+        .into_iter()
+        .flatten()
+        .map(Deadline::instant)
+        .fold(from.instant() + CLEANUP_ALLOWANCE, std::cmp::Ord::min)
 }
 
 /// Writes `records` into `folder` in order; once `cut` has passed, those
@@ -1070,29 +1091,39 @@ async fn turn_task(task: TurnTask) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cut, RECORDS_SKIPPED, write_records};
+    use super::{CLEANUP_ALLOWANCE, RECORDS_SKIPPED, records_cut, write_records};
+    use crate::Deadline;
+    use tokio::sync::watch;
 
-    /// Picrit round 2, D: the writer decides the skip itself. A bound
-    /// already past, before any waiter marks the records late, begins no
-    /// record; a bound still ahead writes them.
+    /// Picrit round 2, D and round 3, 4: the writer decides the skip
+    /// itself, from the bound it is built with before it starts. A cutoff
+    /// already expired then begins no record, before any waiter publishes
+    /// a bound or marks the records late; one still ahead writes them.
     #[tokio::test]
     async fn the_writer_skips_records_past_the_cutoff() {
+        let (_stop_tx, stop) = watch::channel(None);
+        let (_close_tx, close) = watch::channel(None);
+        let records = || vec![("pi-profile.json", b"{}".to_vec())];
+
+        // The turn's cutoff (from + the allowance) has passed.
+        let expired = Deadline::at(
+            tokio::time::Instant::now()
+                .checked_sub(CLEANUP_ALLOWANCE + std::time::Duration::from_secs(1))
+                .unwrap(),
+        );
         let dir = tempfile::tempdir().unwrap();
-        let past = Cut::default();
-        past.set(tokio::time::Instant::now());
-        write_records(dir.path(), vec![("pi-profile.json", b"{}".to_vec())], &past);
+        write_records(
+            dir.path(),
+            records(),
+            &records_cut(expired, (&stop, &close)),
+        );
         assert!(!dir.path().join("pi-profile.json").exists());
         let note = std::fs::read_to_string(dir.path().join(RECORDS_SKIPPED)).unwrap();
         assert!(note.contains("pi-profile.json"), "{note}");
 
         let dir = tempfile::tempdir().unwrap();
-        let ahead = Cut::default();
-        ahead.set(tokio::time::Instant::now() + std::time::Duration::from_secs(60));
-        write_records(
-            dir.path(),
-            vec![("pi-profile.json", b"{}".to_vec())],
-            &ahead,
-        );
+        let now = Deadline::at(tokio::time::Instant::now());
+        write_records(dir.path(), records(), &records_cut(now, (&stop, &close)));
         assert!(dir.path().join("pi-profile.json").exists());
         assert!(!dir.path().join(RECORDS_SKIPPED).exists());
     }
