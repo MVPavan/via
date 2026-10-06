@@ -414,9 +414,9 @@ Params: `session`, `turn?` (default the running turn, else the latest),
 
 ```json
 {"session_id":"s_7f3k9q2mzr4c","state":"active","admission":"open","harness":"codex","model":"gpt-6-sol",
- "route":"codex-app-server","adapter_version":"0.1.0","vendor_version":"0.159.2","version_status":"untested",
+ "route":"codex-app-server","adapter_version":"0.1.0","vendor_version":"0.159.2","version_status":"tested",
  "inherit":{"hooks":"on","mcp_servers":"on","plugins":"unknown","skills":"unknown","agents":"unknown","instruction_files":"on"},
- "warnings":[{"code":"vendor_version_untested","message":"…"},{"code":"config_switch_unverified","message":"…","data":{"categories":[…]}}],
+ "warnings":[{"code":"config_switch_unverified","message":"…","data":{"categories":[…]}}],
  "vendor_session_id":"019…","vendor_identity_verified":true,"cwd":"/work/repo","process":{"alive":true,"cleanup":"quiescent","idle_since":null},
  "active_turn":{"n":2,"state":"running","phase":"accepted","started_at":"…","last_event_seq":57,"cancel":null},
  "progress":{"turn":2,"current_step":4,"phase":"tools","running_tools":["shell"],"tools_overflow":false,"last_activity_at":"…",
