@@ -647,7 +647,7 @@ of these failures is a vendor exit before the route's handshake.
    unavailability fails closed. A present server is waited for by polling
    the pidfd with a timeout, up to 1 s in all, then the anchor replies
    `PredecessorAlive { pid, start_ticks }` (the refusal's detail shows the
-   pid and that start as a local time). The same boot in another
+   pid and that start as a UTC time, like VIA's other timestamps). The same boot in another
    PID namespace is `PredecessorUncertain { namespace }` at once.
 
 On any of these errors it replies the error and exits: Host commits no
