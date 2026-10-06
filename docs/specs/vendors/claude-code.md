@@ -302,26 +302,85 @@ recipe key (§3), so a refusal they cause (for example an init whose tools
 differ because an argument added one) is cached for sessions with that list
 only. The launch-request check above counts them: a launch that would not
 fit is `invalid_params` naming the largest of `instructions`,
-`output_schema` and `vendor_args`. Reserved set, from `claude --help`
-(2.1.290, checked 2026-10-06), matched under C2 §6.3:
+`output_schema` and `vendor_args`.
+
+Reserved set for 2.1.290 (checked 2026-10-06), matched under C2 §6.3.
+Matching follows this table on a best-effort basis; it is not a security
+boundary (C2 §6.3 **Trust**).
+
+How the table was extracted, to repeat for each CHECKED version:
+1. Read the installed binary only, as bytes. Make no model call and run no
+   launch.
+2. Find the root command's Commander chain: it starts at
+   `.name("claude").description("Claude Code - starts…")` and runs to
+   `.action(`. Then find the options the same function adds to the program
+   after `.version(…, "-v, --version")`, up to its first `.command(`.
+3. Collect every `.option("…")` and `new <Option>("…")` flag string,
+   hidden (`.hideHelp()`) ones included. For 2.1.290 that is 124 options
+   plus `-h, --help` and `-v, --version`: 126 options with 129 long names.
+4. Find the entry point's raw-argv checks that run before Commander parses
+   (`argv.includes`/`indexOf`/`some` on flag literals). Only those that
+   look anywhere in argv can see appended arguments; checks on `argv[0]`
+   or on the whole argv cannot.
+
+A unit test lists all 129 long names and asserts that each is reserved
+except the 15 left to the caller:
+- `--debug`, `--debug-to-stderr`, `--debug-file`
+- `--thinking`, `--thinking-display`, `--max-thinking-tokens`
+- `--max-budget-usd`, `--task-budget`, `--workload`, `--autocompact`
+- `--exclude-dynamic-system-prompt-sections`
+- `--betas`, `--name`, `--file`
+- `--ax-screen-reader`
+
+An option is reserved when it reaches a control VIA owns:
+- the working directory (`--deep-link-cwd-b64`, `--worktree`, `--tmux`);
+- configuration and settings sources (`--settings`, `--setting-sources`,
+  `--managed-settings`, `--client-data-url`, `--project-config-root`,
+  `--bare`, `--safe-mode`, plugins, MCP, agents, `--forward-home-settings`);
+- hooks (`--init`, `--init-only`, `--maintenance`);
+- permission and tool policy (permission modes, including
+  `--inherit-permission-mode`, `--enable-auto-mode` and `--plan-mode-*`;
+  tool lists; `--ide`, `--chrome`, `--no-chrome`, `--brief`, `--advisor`,
+  `--channels`);
+- the prompt and instructions (system prompts, including
+  `--append-subagent-system-prompt*`; `--prefill*`; `--watch-artifact*`;
+  `--messaging-socket-path`);
+- session identity and persistence (resume, continue, fork, session ID,
+  `--rewind-files`, `--reply-on-resume`, `--parent-session-id`,
+  `--no-session-persistence`);
+- the I/O format VIA reads (`--print`, input and output formats,
+  `--verbose`, `--include-*`, `--replay-user-messages`, `--session-mirror`,
+  `--await-claim`, `--await-initialize`, `--enable-auth-status`,
+  `--prompt-suggestions`, `--sdk-url`);
+- remote or background execution (`--remote-control` and its hidden alias
+  `--rc`, `--remote` (a hidden alias of `--cloud`), `--cloud`,
+  `--environment` and its hidden alias `--pool`, `--teleport`,
+  `--attach-serve`, `--correlation-id`, `--ref`, `--on-branch`, `--bg`,
+  `--background`, `--desktop`, `--team*`/`--teammate-mode`, `--agent-*`);
+- help and version.
 
 | Kind | Reserved |
 |---|---|
-| Long names, exact (normalized) | the names `vendor` keys reserve (`tool(s)`, `session-id`, `continue`, `fork-session`, `model`, `fallback-model`, `effort`, `json-schema`, `input-format`, `output-format`, `print`, `verbose`, `bare`, `restricted`, `safe-mode`, `strict-mcp-config`, `(no-)session-persistence`, `worktree`, `config-dir`, `environment`, the environment and C1 names), plus `help`, `version`, `bg`, `background`, `cloud`, `teleport`, `desktop`, `from-pr`, `include-hook-events`, `forward-subagent-text`, `sdk-url` (hidden, UNVERIFIED) |
-| Long-name prefixes (normalized) | the families `vendor` keys reserve (`permission*`, `dangerously*`, `allow-dangerously*`, `allowed-tool*`, `disallowed-tool*`, `add-dir*`, `system-prompt*`, `append-system-prompt*`, `max-turn*`, `include-partial*`, `replay-user*`, `setting*`, `agent*`, `mcp*`, `plugin*`, `disable-slash-command*`, `claude-config*`, `anthropic*`, `claude-code*`), plus `resume*` and `remote-control*` |
+| Long names, exact (normalized) | the names `vendor` keys reserve (`tool(s)`, `session-id`, `continue`, `fork-session`, `model`, `fallback-model`, `effort`, `json-schema`, `input-format`, `output-format`, `print`, `verbose`, `bare`, `restricted`, `safe-mode`, `strict-mcp-config`, `(no-)session-persistence`, `worktree`, `config-dir`, `environment`, the environment and C1 names), plus `help`, `version`, `bg`, `background`, `cloud`, `teleport`, `desktop`, `from-pr`, `include-hook-events`, `forward-subagent-text`, `sdk-url`, `maintenance`, `session-mirror`, `await-claim`, `await-initialize`, `enable-auth-status`, `prompt-suggestions`, `inherit-permission-mode`, `reply-on-resume`, `rewind-files`, `client-data-url`, `managed-settings`, `project-config-root`, `ide`, `chrome`, `no-chrome`, `tmux`, `advisor`, `enable-auto-mode`, `proactivity`, `messaging-socket-path`, `brief`, `parent-session-id`, `forward-home-settings`, `attach-serve`, `pool`, `correlation-id`, `ref`, `on-branch`, `rc`, and the entry point's `handle-uri` |
+| Long-name prefixes (normalized) | the families `vendor` keys reserve (`permission*`, `dangerously*`, `allow-dangerously*`, `allowed-tool*`, `disallowed-tool*`, `add-dir*`, `system-prompt*`, `append-system-prompt*`, `max-turn*`, `include-partial*`, `replay-user*`, `setting*`, `agent*`, `mcp*`, `plugin*`, `disable-slash-command*`, `claude-config*`, `anthropic*`, `claude-code*`), plus `resume*`, `remote*`, `deep-link*`, `prefill*`, `watch-artifact*`, `plan-mode*`, `team*`, `channel*`, `init*`, `append-subagent-system-prompt*` and the entry point's `routine*` |
 | Short letters | `-p`, `-r`, `-c`, `-w`, `-h`, `-v` |
 | Operands | every one (Claude's prompt and subcommands) and `--` |
 
 Value-option table (unreserved options that take a value, C2 §6.3 rule 2):
-`--autocompact`, `--betas` (variadic: `--betas=VALUE` only),
-`-d`/`--debug` (optional value), `--debug-file`, `--file` (variadic:
-`--file=VALUE` only), `--max-budget-usd`, `-n`/`--name`,
-`--prompt-suggestions` (optional value). Without `=`, each takes exactly
-the next element, which must not start with `-`; an optional-value option
-given last takes none. Everything else in the help passes
-unverified with C1's `vendor_passthrough` warning, for example
-`--max-budget-usd`, `--debug-file`, `--betas`, `--chrome`, `--ide`,
-`--brief` and `--exclude-dynamic-system-prompt-sections`.
+- `--betas` and `--file` are variadic: only `--betas=VALUE` and
+  `--file=VALUE` are accepted.
+- `-d`/`--debug` takes an optional value.
+- `--debug-file`, `--max-budget-usd`, `-n`/`--name`, `--autocompact`,
+  `--thinking`, `--thinking-display`, `--max-thinking-tokens`,
+  `--task-budget` and `--workload` each take a value.
+
+Given without `=`, each of these takes exactly the next element, which
+must not start with `-`; an optional-value option given last takes none.
+The switches `--debug-to-stderr` (`-d2e`), `--ax-screen-reader` and
+`--exclude-dynamic-system-prompt-sections` pass too. All of these pass
+unverified, with C1's `vendor_passthrough` warning. An option this table
+does not declare is unknown to 2.1.290's Commander, which then refuses the
+launch.
 
 ## 5. Typed stream and normalizer
 

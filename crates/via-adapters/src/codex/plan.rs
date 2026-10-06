@@ -222,18 +222,26 @@ pub(crate) fn sandbox(bound: &Bound) -> Result<Sandbox, BoundRefusal> {
     }
 }
 
-/// The raw-argument rules (C2 §6.3, packet §4; `codex app-server --help`,
-/// codex-cli 0.160.0): the transport and listener flags VIA owns, help
-/// and version, `-c`/`--config` keys VIA sets, and the features VIA
-/// switches through `--enable`/`--disable`.
+/// The raw-argument rules (C2 §6.3, packet §4; the options `codex
+/// app-server` 0.160.0 accepts, hidden ones included): the transport and
+/// listener flags VIA owns, the hidden remote control and managed daemon,
+/// the remote code-mode host, help and version, `-c`/`--config` keys VIA
+/// sets, and the features VIA switches through `--enable`/`--disable`.
 pub(crate) const ARG_RULES: Rules = Rules {
     long_reserved: |name| {
-        matches!(name, "listen" | "stdio" | "help" | "version") || name.starts_with("ws")
+        matches!(
+            name,
+            "listen"
+                | "stdio"
+                | "help"
+                | "version"
+                | "remotecontrol"
+                | "manageddaemon"
+                | "codemodehost"
+        ) || name.starts_with("ws")
     },
     short_reserved: |letter| matches!(letter.to_ascii_lowercase(), 'h' | 'v'),
-    long_value: |name| {
-        matches!(name, "config" | "enable" | "disable" | "codemodehost").then_some(Takes::One)
-    },
+    long_value: |name| matches!(name, "config" | "enable" | "disable").then_some(Takes::One),
     short_value: |letter| (letter == 'c').then_some(("config", Takes::One)),
     value_reserved: |name, value| match name {
         "config" => config_key_reserved(value),
@@ -391,6 +399,66 @@ mod tests {
         );
     }
 
+    /// Every long option `codex app-server` 0.160.0 accepts, hidden ones
+    /// included (packet §4: candidates from the binary's strings, each
+    /// confirmed by clap accepting `--NAME --help`).
+    const DECLARED_0_160_0: [&str; 18] = [
+        "--config",
+        "--enable",
+        "--disable",
+        "--code-mode-host",
+        "--strict-config",
+        "--listen",
+        "--stdio",
+        "--remote-control",
+        "--managed-daemon",
+        "--analytics-default-enabled",
+        "--ws-auth",
+        "--ws-token-file",
+        "--ws-token-sha256",
+        "--ws-shared-secret-file",
+        "--ws-issuer",
+        "--ws-audience",
+        "--ws-max-clock-skew-seconds",
+        "--help",
+    ];
+
+    /// Review pass 1, Important 2 (packet §4): each declared option is
+    /// reserved except the value options VIA judges by value and the two
+    /// switches left to the caller; the hidden `--remote-control` and
+    /// `--managed-daemon`, and `--code-mode-host` (remote execution), are
+    /// refused.
+    #[test]
+    fn every_declared_option_is_classified() {
+        let first = |list: &[&str]| {
+            let list: Vec<String> = list.iter().map(|arg| (*arg).to_owned()).collect();
+            crate::passthrough::conflict(&list, &ARG_RULES)
+        };
+        for option in DECLARED_0_160_0 {
+            let unreserved = matches!(
+                option,
+                "--config"
+                    | "--enable"
+                    | "--disable"
+                    | "--strict-config"
+                    | "--analytics-default-enabled"
+            );
+            assert_eq!(
+                (ARG_RULES.long_reserved)(&crate::passthrough::normalize(option)),
+                !unreserved,
+                "{option}"
+            );
+        }
+        for case in [
+            &["--remote-control"][..],
+            &["--managed-daemon"],
+            &["--code-mode-host=http://h"],
+            &["--code-mode-host", "http://h"],
+        ] {
+            assert_eq!(first(case), Some(0), "{case:?}");
+        }
+    }
+
     /// C2 §6.3, packet §4 (`codex app-server --help`, 0.160.0): the
     /// transport, listener, help and version flags, `-c` keys VIA sets
     /// (every spelling and attachment), the features VIA switches, `--`
@@ -456,7 +524,6 @@ mod tests {
             &[][..],
             &["--strict-config"],
             &["--analytics-default-enabled"],
-            &["--code-mode-host", "http://h"],
             &["-c", "model_verbosity=low"],
             &["-cmcp_servers.x.enabled=false"],
             &["--config=notify=[]"],

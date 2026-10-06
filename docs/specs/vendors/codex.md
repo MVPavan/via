@@ -333,23 +333,48 @@ is in `config_hash` (§2), so sessions with different lists never share a
 server and equal lists share one; the instance cache, catalog and handshake
 refusal are keyed by that hash too. A spawn or resume whose server recipe,
 with the arguments, would not fit Host's 64 KiB launch request is
-`invalid_params` naming `vendor_args`. Reserved set, from `codex app-server
---help` (codex-cli 0.160.0, checked 2026-10-06), matched under C2 §6.3:
+`invalid_params` naming `vendor_args`.
+
+Reserved set for codex-cli 0.160.0 (checked 2026-10-06), matched under
+C2 §6.3. Matching follows this table on a best-effort basis; it is not a
+security boundary (C2 §6.3 **Trust**).
+
+How the table was extracted, to repeat for each CHECKED version (no model
+call and no server start):
+1. Collect candidate long names from the binary's strings: every `--name`
+   literal, clap's kebab-case IDs, and every upper-case value or
+   environment name, lowercased and kebab-cased.
+2. Keep each candidate `NAME` for which `CODEX_HOME=<empty scratch dir>
+   codex app-server --NAME --help` does not fail with clap's "unexpected
+   argument". clap rejects an unknown argument before it reaches
+   `--help`, and stops at `--help` before anything runs.
+3. Probe each short letter the same way.
+
+`app-server` 0.160.0 accepts 18 long names:
+- the 17 its help lists, minus `--help`;
+- plus the hidden `--remote-control` ("Enable remote control for this
+  app-server process") and `--managed-daemon`;
+- plus `--help`.
+
+It accepts the short letters `-c` and `-h`. It has no long-flag
+abbreviation, no aliases and no `--version`. A unit test lists all 18 and
+asserts that each is reserved except the value options judged by value
+(`-c`/`--config`, `--enable`, `--disable`) and the two switches left to
+the caller (`--strict-config`, `--analytics-default-enabled`).
 
 | Kind | Reserved |
 |---|---|
-| Long names (normalized) | `listen`, `stdio` (the transport VIA owns), `help`, `version`; prefix `ws` (`--ws-auth`, `--ws-token-file`, `--ws-token-sha256`, `--ws-shared-secret-file`, `--ws-issuer`, `--ws-audience`, `--ws-max-clock-skew-seconds`: listener authentication) |
+| Long names (normalized) | `listen`, `stdio` (the transport VIA owns); the hidden `remote-control` and `managed-daemon`; `code-mode-host` (execution on a remote host); `help`, `version`; prefix `ws` (`--ws-auth`, `--ws-token-file`, `--ws-token-sha256`, `--ws-shared-secret-file`, `--ws-issuer`, `--ws-audience`, `--ws-max-clock-skew-seconds`: listener authentication) |
 | Short letters | `-h`, `-V` (matched case-insensitively) |
 | `-c`/`--config` keys (root segment, normalized: quotes and spaces dropped, lowercased, `_` and `-` removed) | `model`, `model_provider`, `model_reasoning_effort`, `approval_policy`, `approvals_reviewer`, `sandbox_mode`, `sandbox_workspace_write`, `permissions`, `default_permissions`, `profile`, `profiles`, `developer_instructions`, `instructions`, `base_instructions`, `model_instructions_file`, `experimental_instructions_file`, `sqlite_home` (VIA sets `CODEX_SQLITE_HOME`); `features` as a whole table, and `features.<f>` for a feature VIA owns |
 | `--enable`/`--disable` features VIA owns | `hooks` and `memories`, matched as any normalized name containing `hook` or `memor` (aliases included) |
 | Operands | every one (`daemon`, `proxy`, `generate-ts`, `generate-json-schema`, `help`) and `--` |
 
 Value-option table (C2 §6.3 rule 2): `-c`/`--config`, `--enable`,
-`--disable`, `--code-mode-host`. Without `=` (or, for `-c`, an attached
-value), each takes exactly the next element, which must not start with
-`-`. Everything else passes unverified with
-C1's `vendor_passthrough` warning, for example `--strict-config`,
-`--analytics-default-enabled`, `--code-mode-host`, `-c` of any other key
+`--disable`. Without `=` (or, for `-c`, an attached value), each takes
+exactly the next element, which must not start with `-`. Everything else
+passes unverified with C1's `vendor_passthrough` warning: the switches
+`--strict-config` and `--analytics-default-enabled`, `-c` of any other key
 (`mcp_servers`, `notify`, `model_verbosity`) and `--enable`/`--disable` of
 any other feature. `--disable hooks` stays VIA's (`inherit`), never the
 caller's.

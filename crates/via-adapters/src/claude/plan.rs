@@ -479,17 +479,17 @@ fn args_refusal(route: &'static str, vendor_args: &VendorArgs) -> Option<Refusal
     ))
 }
 
-/// The raw-argument rules (C2 §6.3, packet §4, `claude --help` 2.1.290):
-/// the names and families `vendor` keys reserve, the reserved letters, and
-/// the unreserved options that take a value. No value is reserved.
+/// The raw-argument rules (C2 §6.3, packet §4, the options 2.1.290
+/// declares): the names and families `vendor` keys reserve, the reserved
+/// letters, and the unreserved options that take a value. No value is
+/// reserved.
 const ARG_RULES: Rules = Rules {
     long_reserved: reserved,
     short_reserved: |letter| RESERVED_SHORT.contains(&letter.to_ascii_lowercase()),
     long_value: |name| match name {
         "betas" | "file" => Some(Takes::Many),
-        "autocompact" | "debug" | "debugfile" | "maxbudgetusd" | "name" | "promptsuggestions" => {
-            Some(Takes::One)
-        }
+        "autocompact" | "debug" | "debugfile" | "maxbudgetusd" | "name" | "thinking"
+        | "thinkingdisplay" | "maxthinkingtokens" | "taskbudget" | "workload" => Some(Takes::One),
         _ => None,
     },
     short_value: |letter| match letter {
@@ -525,11 +525,22 @@ fn vendor_refusal(route: &'static str, vendor: &VendorOptions) -> Option<Refusal
 /// Normalized prefixes of the flag, setting and environment-override
 /// families the recipe owns (C2 §6.1, §6.3, packet §4): each names
 /// several spellings or members (`permissionMode`, `permissionPromptTool`,
-/// …; `ANTHROPIC_*`, `CLAUDE_CODE_*`; `--resume-session-at`,
-/// `--remote-control-session-name-prefix`).
-const RESERVED_PREFIXES: [&str; 21] = [
+/// …; `ANTHROPIC_*`, `CLAUDE_CODE_*`; `--resume-session-at`, `--remote`,
+/// `--remote-control-session-name-prefix`; the hidden `--deep-link-*`,
+/// `--prefill*`, `--watch-artifact*`, `--plan-mode-*`, `--team*`,
+/// `--channels`, `--init*`, and the entry point's `--routine`).
+const RESERVED_PREFIXES: [&str; 30] = [
     "resume",
-    "remotecontrol",
+    "remote",
+    "deeplink",
+    "prefill",
+    "watchartifact",
+    "planmode",
+    "team",
+    "channel",
+    "init",
+    "routine",
+    "appendsubagentsystemprompt",
     "permission",
     "dangerously",
     "allowdangerously",
@@ -555,10 +566,41 @@ const RESERVED_PREFIXES: [&str; 21] = [
 /// recipe's singleton flags, the launch environment's variables (the
 /// known locale variables included), VIA's canonical parameters, and the
 /// flags that change the process's mode, where its session runs, or the
-/// stream VIA reads (C2 §6.3, `claude --help` 2.1.290).
-const RESERVED_NAMES: [&str; 58] = [
+/// stream VIA reads (C2 §6.3, packet §4: the options 2.1.290 declares,
+/// hidden ones included, and the entry point's `--handle-uri`).
+const RESERVED_NAMES: [&str; 88] = [
     "help",
     "version",
+    "maintenance",
+    "sessionmirror",
+    "awaitclaim",
+    "awaitinitialize",
+    "enableauthstatus",
+    "promptsuggestions",
+    "inheritpermissionmode",
+    "replyonresume",
+    "rewindfiles",
+    "clientdataurl",
+    "managedsettings",
+    "projectconfigroot",
+    "ide",
+    "chrome",
+    "nochrome",
+    "tmux",
+    "advisor",
+    "enableautomode",
+    "proactivity",
+    "messagingsocketpath",
+    "brief",
+    "parentsessionid",
+    "forwardhomesettings",
+    "attachserve",
+    "pool",
+    "correlationid",
+    "ref",
+    "onbranch",
+    "rc",
+    "handleuri",
     "bg",
     "background",
     "cloud",
@@ -931,6 +973,12 @@ mod tests {
             &["update"],
             &["--debug-file", "/x", "extra"],
             &["--chrome", "prompt text"],
+            &["--chrome"],
+            &["--no-chrome"],
+            &["--ide"],
+            &["--brief"],
+            &["--prompt-suggestions", "false"],
+            &["--tmux"],
             // Review pass 1, Important 1: Commander binds `foo` alone, and
             // `--debug` as the name, leaving the prompt an operand.
             &["--betas=foo", "INJECTED PROMPT"],
@@ -948,6 +996,218 @@ mod tests {
                     && refusal.field() == Some("vendor_args")
                     && refusal.kind.code() == "invalid_params"),
                 "{case:?}: {refusal:?}"
+            );
+        }
+    }
+
+    /// Every long option the root command of the installed Claude
+    /// 2.1.290 declares, hidden ones included (packet §4: extracted from
+    /// the binary's bundled Commander definitions), plus `--help` and
+    /// `--version`.
+    const DECLARED_2_1_290: [&str; 129] = [
+        "--debug",
+        "--debug-to-stderr",
+        "--debug-file",
+        "--verbose",
+        "--print",
+        "--bare",
+        "--safe-mode",
+        "--init",
+        "--init-only",
+        "--maintenance",
+        "--output-format",
+        "--json-schema",
+        "--include-hook-events",
+        "--include-partial-messages",
+        "--forward-subagent-text",
+        "--session-mirror",
+        "--await-claim",
+        "--input-format",
+        "--await-initialize",
+        "--dangerously-skip-permissions",
+        "--allow-dangerously-skip-permissions",
+        "--thinking",
+        "--thinking-display",
+        "--max-thinking-tokens",
+        "--max-turns",
+        "--max-budget-usd",
+        "--task-budget",
+        "--replay-user-messages",
+        "--prompt-suggestions",
+        "--enable-auth-status",
+        "--allowedTools",
+        "--allowed-tools",
+        "--tools",
+        "--restricted",
+        "--disallowedTools",
+        "--disallowed-tools",
+        "--mcp-config",
+        "--permission-prompt-tool",
+        "--permission-prompts",
+        "--system-prompt",
+        "--system-prompt-file",
+        "--append-system-prompt",
+        "--append-system-prompt-file",
+        "--system-prompt-snapshot",
+        "--append-subagent-system-prompt",
+        "--append-subagent-system-prompt-file",
+        "--plan-mode-instructions",
+        "--exclude-dynamic-system-prompt-sections",
+        "--permission-mode",
+        "--inherit-permission-mode",
+        "--continue",
+        "--resume",
+        "--fork-session",
+        "--watch-artifact",
+        "--watch-artifact-no-autoreact",
+        "--prefill",
+        "--deep-link-origin",
+        "--deep-link-repo",
+        "--deep-link-last-fetch",
+        "--prefill-b64",
+        "--deep-link-cwd-b64",
+        "--from-pr",
+        "--no-session-persistence",
+        "--resume-session-at",
+        "--resume-drops-turn",
+        "--reply-on-resume",
+        "--rewind-files",
+        "--model",
+        "--effort",
+        "--agent",
+        "--betas",
+        "--fallback-model",
+        "--workload",
+        "--settings",
+        "--client-data-url",
+        "--managed-settings",
+        "--add-dir",
+        "--project-config-root",
+        "--ide",
+        "--desktop",
+        "--strict-mcp-config",
+        "--session-id",
+        "--name",
+        "--agents",
+        "--setting-sources",
+        "--plugin-dir",
+        "--plugin-dir-no-mcp",
+        "--plugin-url",
+        "--disable-slash-commands",
+        "--chrome",
+        "--no-chrome",
+        "--file",
+        "--worktree",
+        "--tmux",
+        "--advisor",
+        "--autocompact",
+        "--enable-auto-mode",
+        "--proactivity",
+        "--bg",
+        "--background",
+        "--messaging-socket-path",
+        "--brief",
+        "--ax-screen-reader",
+        "--channels",
+        "--dangerously-load-development-channels",
+        "--agent-id",
+        "--agent-name",
+        "--team-name",
+        "--agent-color",
+        "--plan-mode-required",
+        "--parent-session-id",
+        "--teammate-mode",
+        "--agent-type",
+        "--sdk-url",
+        "--teleport",
+        "--cloud",
+        "--forward-home-settings",
+        "--remote",
+        "--attach-serve",
+        "--environment",
+        "--pool",
+        "--correlation-id",
+        "--ref",
+        "--on-branch",
+        "--remote-control",
+        "--rc",
+        "--remote-control-session-name-prefix",
+        "--help",
+        "--version",
+    ];
+
+    /// The declared options VIA leaves to the caller (packet §4): none
+    /// reaches a control VIA owns.
+    const UNRESERVED_2_1_290: [&str; 15] = [
+        "--debug",
+        "--debug-to-stderr",
+        "--debug-file",
+        "--thinking",
+        "--thinking-display",
+        "--max-thinking-tokens",
+        "--max-budget-usd",
+        "--task-budget",
+        "--exclude-dynamic-system-prompt-sections",
+        "--betas",
+        "--workload",
+        "--name",
+        "--file",
+        "--autocompact",
+        "--ax-screen-reader",
+    ];
+
+    /// Review pass 1, Important 2 and 3 (packet §4): every option the
+    /// checked version declares is either reserved or one of the
+    /// unreserved few, so a hidden alias or control of 2.1.290 cannot pass
+    /// unclassified; the entry point's own flags read anywhere in argv are
+    /// reserved too.
+    #[test]
+    fn every_declared_option_is_classified() {
+        for option in DECLARED_2_1_290 {
+            assert_eq!(
+                reserved(option),
+                !UNRESERVED_2_1_290.contains(&option),
+                "{option}"
+            );
+        }
+        for option in UNRESERVED_2_1_290 {
+            assert!(DECLARED_2_1_290.contains(&option), "{option}");
+        }
+        for entry in ["--handle-uri", "--routine", "--routine=x", "--tmux"] {
+            assert!(reserved(entry), "{entry}");
+        }
+    }
+
+    /// Review pass 1, Important 2 and 3, and the minor: the hidden aliases
+    /// and controls the reviewer found are refused in every attached form.
+    #[test]
+    fn hidden_aliases_and_controls_are_refused() {
+        for case in [
+            &["--rc"][..],
+            &["--rc=name"],
+            &["--remote=description"],
+            &["--pool=environment-id"],
+            &["--deep-link-origin", "--deep-link-cwd-b64=L3RtcA"],
+            &["--deep-link-cwd-b64=L3RtcA"],
+            &["--managed-settings={}"],
+            &["--project-config-root=/tmp"],
+            &["--client-data-url=https://x"],
+            &["--inherit-permission-mode=bypassPermissions"],
+            &["--enable-auto-mode"],
+            &["--plan-mode-required"],
+            &["--prefill=x"],
+            &["--watch-artifact=x"],
+            &["--channels=x"],
+            &["--teammate-mode=tmux"],
+            &["--handle-uri=cc://x"],
+        ] {
+            let refusal = args_refusal("claude-cli", &vendor_args(case));
+            assert!(
+                refusal.is_some_and(|refusal| refusal.kind
+                    == RefusalKind::VendorOptionConflict {
+                        field: "vendor_args"
+                    }),
+                "{case:?}"
             );
         }
     }
@@ -972,14 +1232,13 @@ mod tests {
             &["--name", "x", "--debug=api"],
             &["-n", "name"],
             &["--name=x"],
-            &["--chrome"],
-            &["--no-chrome"],
-            &["--ide"],
-            &["--brief"],
             &["--autocompact", "auto"],
             &["--exclude-dynamic-system-prompt-sections"],
-            &["--prompt-suggestions", "false"],
-            &["--ax-screen-reader", "--tmux"],
+            &["--ax-screen-reader", "-d2e"],
+            &["--debug-to-stderr"],
+            &["--thinking", "disabled", "--thinking-display=omitted"],
+            &["--max-thinking-tokens=1000", "--task-budget", "5000"],
+            &["--workload=ci"],
         ] {
             assert_eq!(refused(case), None, "{case:?}");
         }
