@@ -204,38 +204,42 @@ const THREAD_METHODS: [&str; 2] = ["thread/status/changed", "thread/closed"];
 /// against their typed schema. An error is an unattributable message (step
 /// 2): not JSON, a reply ID that is not an integer, or a known method whose
 /// thread or turn is missing, not a string, or past [`SHORT_FIELD_MAX`].
-/// Every other field is the full decode's, at consumption. `params` is
-/// borrowed from the line, never copied (via-5lr.3.5).
+/// Every other field is the full decode's, at consumption. The peek builds
+/// no value of the vendor's choosing (review cfix-crit #1): every member it
+/// reads is borrowed from the line, unread members are skipped, and only a
+/// string within its bound or an integer is ever parsed out, so its cost is
+/// one pass over the line whatever the line holds.
 pub fn peek(line: &[u8]) -> Result<Routing, DecodeError> {
     #[derive(Deserialize)]
     struct Head<'a> {
-        #[serde(default, deserialize_with = "present")]
-        id: Option<Box<RawValue>>,
-        #[serde(default)]
-        method: Option<String>,
+        #[serde(default, borrow, deserialize_with = "present_ref")]
+        id: Option<&'a RawValue>,
+        #[serde(default, borrow)]
+        method: Option<&'a RawValue>,
         #[serde(default, borrow)]
         params: Option<&'a RawValue>,
     }
     let head: Head<'_> =
         serde_json::from_slice(line).map_err(|_| DecodeError("not a JSON-RPC message"))?;
-    match (head.id, head.method) {
-        (Some(id), None) => match serde_json::from_str::<Value>(id.get()) {
-            Ok(Value::Number(number)) => number
-                .as_i64()
-                .map(Routing::Response)
-                .ok_or(DecodeError("a reply ID that is not one of VIA's")),
-            _ => Err(DecodeError("a reply ID that is not one of VIA's")),
-        },
+    let method = head
+        .method
+        .map(|raw| short_text(raw).ok_or(DecodeError("not a JSON-RPC message")))
+        .transpose()?;
+    match (head.id, method) {
+        (Some(id), None) => serde_json::from_str::<i64>(id.get())
+            .map(Routing::Response)
+            .map_err(|_| DecodeError("a reply ID that is not one of VIA's")),
         (Some(id), Some(method)) => {
-            let id = request_id(&id)?;
-            fits(&[&method])?;
-            let ids = loose_ids(head.params);
-            let bounded = |text: Option<String>| text.filter(|text| text.len() <= SHORT_FIELD_MAX);
+            let id = request_id(id)?;
+            let Text::Short(method) = method else {
+                return Err(DecodeError("a field longer than its bound"));
+            };
+            let ids = PeekIds::of(head.params);
             Ok(Routing::Request {
                 id,
                 method,
-                thread: bounded(ids.thread),
-                turn: bounded(ids.turn),
+                thread: ids.thread.and_then(Text::short),
+                turn: ids.turn_id.and_then(Text::short),
             })
         }
         (None, Some(method)) => notification_routing(&method, head.params),
@@ -245,33 +249,92 @@ pub fn peek(line: &[u8]) -> Result<Routing, DecodeError> {
     }
 }
 
+/// A string member as the peek reads it: its text within
+/// [`SHORT_FIELD_MAX`], or only that it is longer.
+enum Text {
+    /// At most [`SHORT_FIELD_MAX`] bytes.
+    Short(String),
+    /// Longer: never parsed out of a member past the bound's longest
+    /// escaped spelling.
+    Long,
+}
+
+impl Text {
+    fn short(self) -> Option<String> {
+        match self {
+            Self::Short(text) => Some(text),
+            Self::Long => None,
+        }
+    }
+}
+
+/// `raw` as a [`Text`]; `None` when it is not a string. A member longer
+/// than the bound's longest spelling (six bytes per byte, `\u0000`, plus
+/// the quotes) is `Long` unparsed.
+fn short_text(raw: &RawValue) -> Option<Text> {
+    let spelled = raw.get();
+    if !spelled.starts_with('"') {
+        return None;
+    }
+    if spelled.len() > SHORT_FIELD_MAX.saturating_mul(6).saturating_add(2) {
+        return Some(Text::Long);
+    }
+    let text: String = serde_json::from_str(spelled).ok()?;
+    Some(if text.len() <= SHORT_FIELD_MAX {
+        Text::Short(text)
+    } else {
+        Text::Long
+    })
+}
+
+/// The correlation members of `params` the peek reads, borrowed.
+#[derive(Default, Deserialize)]
+struct PeekIds<'a> {
+    #[serde(default, borrow, rename = "threadId")]
+    thread: Option<&'a RawValue>,
+    #[serde(default, borrow, rename = "turnId")]
+    turn_id: Option<&'a RawValue>,
+    #[serde(default, borrow)]
+    turn: Option<&'a RawValue>,
+}
+
+/// [`PeekIds`] read as text: a member that is not a string is absent.
+struct PeekTexts<'a> {
+    thread: Option<Text>,
+    turn_id: Option<Text>,
+    turn: Option<&'a RawValue>,
+}
+
+impl<'a> PeekIds<'a> {
+    /// The members of `params` of any shape; none when it is not an object.
+    fn of(params: Option<&'a RawValue>) -> PeekTexts<'a> {
+        let ids = params
+            .and_then(|params| serde_json::from_str::<PeekIds<'_>>(params.get()).ok())
+            .unwrap_or_default();
+        PeekTexts {
+            thread: ids.thread.and_then(short_text),
+            turn_id: ids.turn_id.and_then(short_text),
+            turn: ids.turn,
+        }
+    }
+}
+
 /// A notification's correlation, by method.
-fn notification_routing(method: &str, params: Option<&RawValue>) -> Result<Routing, DecodeError> {
+fn notification_routing(method: &Text, params: Option<&RawValue>) -> Result<Routing, DecodeError> {
     #[derive(Deserialize)]
-    struct Ids<'a> {
-        #[serde(default, rename = "threadId")]
-        thread: Option<Value>,
-        #[serde(default, rename = "turnId")]
-        turn_id: Option<Value>,
+    struct TurnHead<'a> {
         #[serde(default, borrow)]
-        turn: Option<&'a RawValue>,
+        id: Option<&'a RawValue>,
     }
-    #[derive(Deserialize)]
-    struct TurnHead {
-        #[serde(default)]
-        id: Option<Value>,
-    }
-    let ids = match params {
-        Some(params) => serde_json::from_str::<Ids<'_>>(params.get()).ok(),
-        None => None,
-    };
-    let text = |value: Option<Value>| match value {
-        Some(Value::String(text)) if text.len() <= SHORT_FIELD_MAX => Some(text),
-        _ => None,
-    };
-    let (thread, turn_id, turn) = match ids {
-        Some(ids) => (text(ids.thread), text(ids.turn_id), ids.turn),
-        None => (None, None, None),
+    let ids = PeekIds::of(params);
+    let (thread, turn_id) = (
+        ids.thread.and_then(Text::short),
+        ids.turn_id.and_then(Text::short),
+    );
+    let method = match method {
+        Text::Short(method) => method.as_str(),
+        // Longer than any known method: an unknown notification.
+        Text::Long => "",
     };
     let known = TURN_METHODS.contains(&method);
     if !known && !THREAD_METHODS.contains(&method) {
@@ -288,8 +351,11 @@ fn notification_routing(method: &str, params: Option<&RawValue>) -> Result<Routi
         });
     }
     let turn = if method.starts_with("turn/") {
-        turn.and_then(|turn| serde_json::from_str::<TurnHead>(turn.get()).ok())
-            .and_then(|head| text(head.id))
+        ids.turn
+            .and_then(|turn| serde_json::from_str::<TurnHead<'_>>(turn.get()).ok())
+            .and_then(|head| head.id)
+            .and_then(short_text)
+            .and_then(Text::short)
     } else {
         turn_id
     };
@@ -830,14 +896,20 @@ struct Envelope<'a> {
 }
 
 /// A present `id`: an integer or a bounded string; `null` or any other
-/// shape is no envelope.
+/// shape is no envelope. Read by its first byte, never through serde's
+/// untagged buffering, so an ID of another shape is refused unparsed
+/// (review cfix-crit #1).
 fn request_id(raw: &RawValue) -> Result<RequestId, DecodeError> {
-    let id: RequestId =
-        serde_json::from_str(raw.get()).map_err(|_| DecodeError("an ID that is not one"))?;
-    if let RequestId::Str(text) = &id {
-        fits(&[text])?;
+    if raw.get().starts_with('"') {
+        return match short_text(raw) {
+            Some(Text::Short(text)) => Ok(RequestId::Str(text)),
+            Some(Text::Long) => Err(DecodeError("a field longer than its bound")),
+            None => Err(DecodeError("an ID that is not one")),
+        };
     }
-    Ok(id)
+    serde_json::from_str::<i64>(raw.get())
+        .map(RequestId::Int)
+        .map_err(|_| DecodeError("an ID that is not one"))
 }
 
 /// Types a notification by method.
@@ -1183,6 +1255,13 @@ fn error_info<'de, D: Deserializer<'de>>(
 /// A member that is present, null included, is `Some`.
 fn present<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Box<RawValue>>, D::Error> {
     Box::<RawValue>::deserialize(deserializer).map(Some)
+}
+
+/// [`present`], borrowed from the line.
+fn present_ref<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<&'de RawValue>, D::Error> {
+    <&'de RawValue>::deserialize(deserializer).map(Some)
 }
 
 /// Why a route's JSON text is not structured output.

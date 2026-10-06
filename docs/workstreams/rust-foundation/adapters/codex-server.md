@@ -918,6 +918,16 @@ Engine on the same State finds `vendor/codex` with the same identity, mode
    framing:
    1. **Routing peek.** Parse only the correlation fields (`id`, `method`,
       `params.threadId`, `params.turnId`) against their typed schema.
+      The peek builds no value of the vendor's choosing (review
+      cfix-crit #1): each member it reads is borrowed from the line,
+      unread members are skipped, and only an integer or a string within
+      `SHORT_FIELD_MAX` is parsed out; an ID, thread or turn of any other
+      shape is refused or absent unparsed. It does not apply the structure
+      limits: a message past them but within serde's nesting bound is still
+      attributed to its owner, whose full decode applies them at
+      consumption (steps 4 to 6), and one for no open registration is
+      dropped undecoded. Applying them in the peek would make such a
+      message unattributable and fail every session on the server.
    2. **Correlation fields fail their typed schema** (invalid UTF-8 or
       JSON; Wire `MessageTooLarge` or `Unterminated`, or a skipped
       over-cap line, item 9.3; a known method whose
@@ -1372,6 +1382,15 @@ reply; written once the reply brings the `turnId`);
   22 MiB. What is not qualified: `codex_rss_leases` drives about 1 MiB
   lines, so 32 sessions each at a maximal 8 MiB decode at once are an
   extrapolation from these single measures.
+
+  The routing peek's own peak is `codex_peek_peak_within_allowance`
+  (same file): six admitted lines whose correlation member (a reply or
+  request ID, a thread, a `turn.id`) or unknown payload is a
+  4-million-element array, past the structure limits, each in a fresh
+  process. Each peaks at 0.25 to 0.5 MiB, against a 1 MiB test bound
+  (review cfix-crit #1). Before, a reply ID was built as a `Value`:
+  about 136 MiB for one such line. The table's 8 MiB peek row is kept as
+  the allowance, so the 1,028 MiB limit is unchanged.
 
 #### 9.3 The Codex inbound cap (via-5lr.3.5, 2026-10-05)
 
