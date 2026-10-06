@@ -13,8 +13,8 @@
 //! variant when its readback differs, reading the switch back. A readback
 //! that differs from a value just sent refuses the turn
 //! (`handshake_refused`) and is cached under the session refusal digest
-//! (§5). The prompt is not sent yet: the turn ends with a definite
-//! rejection after its setup.
+//! (§5). Turn execution uses a server-owned execution rule and the
+//! registration's ordered delivery lane.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -28,8 +28,11 @@ use via_routes::opencode::session::{
 use via_routes::opencode::{LaunchError, LaunchFailure, Refusal as HandshakeRefusal};
 use via_routes::opencode::{Server, ServerFacts, ServerLease, ServerPin};
 
+use super::delivery::Registration;
 use super::plan::{self, model_parts};
 use super::{HARNESS, OpenCodeAdapter, launch};
+#[path = "execution.rs"]
+mod execution;
 use crate::driver::turn::ordered;
 use crate::driver::{ConnectionPin, Prepared, SessionDriver, TurnCx, TurnSpec, rejected};
 use crate::instance::Incompatibility;
@@ -73,6 +76,13 @@ struct Attached {
     generation: u64,
     /// The vendor session was created or reopened on this generation.
     opened: bool,
+    delivery: Option<AttachedDelivery>,
+}
+
+struct AttachedDelivery {
+    server: Arc<Server>,
+    vendor_session: String,
+    registration: Arc<Registration>,
 }
 
 impl OpenCodeSession {
@@ -103,6 +113,12 @@ impl OpenCodeSession {
     /// vendor history is kept.
     pub(crate) fn detach(&self) {
         let attached = self.attached().take();
+        if let Some(delivery) = attached
+            .as_ref()
+            .and_then(|attached| attached.delivery.as_ref())
+        {
+            delivery.server.routing().detach(&delivery.vendor_session);
+        }
         drop(attached);
     }
 
@@ -129,6 +145,7 @@ impl OpenCodeSession {
             lease,
             generation,
             opened: false,
+            delivery: None,
         });
         drop(attached);
         drop(replaced);
@@ -142,6 +159,41 @@ impl OpenCodeSession {
         {
             attached.opened = true;
         }
+    }
+
+    fn delivery(
+        &self,
+        driver: &SessionDriver,
+        server: &Arc<Server>,
+        id: &str,
+        generation: u64,
+    ) -> Arc<Registration> {
+        let mut attached = self.attached();
+        if let Some(registration) = attached
+            .as_ref()
+            .and_then(|attached| attached.delivery.as_ref())
+            .filter(|delivery| delivery.server.id() == server.id())
+        {
+            return Arc::clone(&registration.registration);
+        }
+        let lane = server.routing().attach(id);
+        let registration = Registration::new(
+            lane,
+            driver.observations.clone(),
+            Arc::clone(&driver.health),
+            generation,
+        );
+        driver
+            .tracker
+            .spawn(Arc::clone(&registration).run(driver.cancel.clone(), Arc::clone(server)));
+        if let Some(attached) = attached.as_mut() {
+            attached.delivery = Some(AttachedDelivery {
+                server: Arc::clone(server),
+                vendor_session: id.to_owned(),
+                registration: Arc::clone(&registration),
+            });
+        }
+        registration
     }
 }
 
@@ -272,6 +324,20 @@ pub(crate) async fn run_turn(
     let digest = settings.refusal_key(&adapter.servers.recipe_hex());
     if adapter
         .instances
+        .refusal(
+            &adapter.binary,
+            &adapter.servers.refusal_key(),
+            std::time::Instant::now(),
+        )
+        .is_some()
+    {
+        return Turn::new(driver, session, (turn, cx.wall)).failed(RouteError::HandshakeRefused {
+            turn,
+            detail: Some("a recent handshake refused this server's protocol".to_owned()),
+        });
+    }
+    if adapter
+        .instances
         .refusal(&adapter.binary, &digest, std::time::Instant::now())
         .is_some()
     {
@@ -286,7 +352,14 @@ pub(crate) async fn run_turn(
     let (stop, force, wall) = (cx.stop.clone(), cx.force.clone(), cx.wall);
     let mut facts = Turn::new(driver, session, (turn, wall));
     let ended = ordered((stop.clone(), force.clone(), wall), driver.cancel.clone());
-    let set_up = setup(&mut facts, &settings, (cx.prepared, cx.capacity), &digest);
+    let set_up = Box::pin(setup(
+        &mut facts,
+        &settings,
+        (cx.prepared, cx.capacity),
+        &digest,
+        cx.activity,
+        &spec.prompt,
+    ));
     let outcome = tokio::select! {
         end = set_up => Some(end),
         () = ended => None,
@@ -301,7 +374,7 @@ pub(crate) async fn run_turn(
     } else {
         RouteError::Deadline { turn }
     };
-    facts.failed(cause)
+    execution::ordered_result(&mut facts, Some(cause))
 }
 
 /// One turn's facts as its ends report them.
@@ -313,6 +386,9 @@ struct Turn<'a> {
     instance: Option<InstanceReport>,
     /// The turn's wall, which bounds every request.
     wall: Deadline,
+    submitted: bool,
+    reopened: bool,
+    running: Option<execution::Running>,
 }
 
 impl<'a> Turn<'a> {
@@ -327,6 +403,9 @@ impl<'a> Turn<'a> {
             number,
             instance: None,
             wall,
+            submitted: false,
+            reopened: driver.state().identity.is_some(),
+            running: None,
         }
     }
 
@@ -355,7 +434,7 @@ impl<'a> Turn<'a> {
             cause,
             undecoded: None,
             exit: None,
-            launched: false,
+            launched: self.submitted,
             cleanup: None,
             forced: false,
             journal_uncertain: false,
@@ -453,18 +532,17 @@ impl<'a> Turn<'a> {
     }
 }
 
-/// The turn's setup on the live server, ending with its definite
-/// rejection: no prompt is sent yet.
+/// Setup followed by one prompt and its ordered delivery outcome.
 async fn setup(
     facts: &mut Turn<'_>,
     settings: &Settings,
     joining: (Prepared, Option<crate::CapacityToken>),
     digest: &str,
+    activity: crate::TurnActivity,
+    prompt: &str,
 ) -> TurnEnd {
     match set_up(facts, settings, joining, digest).await {
-        Ok(()) => facts.rejected(StartRejected::Protocol(
-            "route opencode-serve does not submit prompts yet".to_owned(),
-        )),
+        Ok(opened) => execution::execute(facts, settings, opened, digest, activity, prompt).await,
         Err(end) => *end,
     }
 }
@@ -477,7 +555,7 @@ async fn set_up(
     settings: &Settings,
     joining: (Prepared, Option<crate::CapacityToken>),
     digest: &str,
-) -> Result<(), Box<TurnEnd>> {
+) -> Result<execution::Opened, Box<TurnEnd>> {
     let turn = facts.number;
     let pin = join(facts, joining).await?;
     let Some((server, server_facts)) = pin.live() else {
@@ -485,7 +563,8 @@ async fn set_up(
     };
     facts.saw_version(&server_facts.version);
     unchecked_credentials(facts, &server_facts).await?;
-    if let Some(variant) = &settings.variant {
+    let variant_checked = facts.driver.state().identity.is_none();
+    if variant_checked && let Some(variant) = &settings.variant {
         effort_offered(facts, &server, settings, variant).await?;
     }
     let Some((generation, opened)) = facts.session.attach(&pin, facts.driver) else {
@@ -509,7 +588,15 @@ async fn set_up(
         let current = variant_of(&info);
         (info.id, current)
     };
-    switch_variant(facts, &server, (settings, &id, current), digest).await
+    // The variant mutation belongs after the execution rule; the readback
+    // itself is safe before admission.
+    Ok(execution::Opened {
+        server,
+        id,
+        generation,
+        variant: current,
+        variant_checked,
+    })
 }
 
 /// The pin of the turn's server, live: the one `prepare` pinned, else a
@@ -608,6 +695,27 @@ async fn unchecked_credentials(facts: &Turn<'_>, server: &ServerFacts) -> Result
         .await
 }
 
+/// Setup request accounting survives cancellation and driver replacement.
+/// Only a complete response or positive never-sent evidence releases it.
+async fn tracked<T>(
+    server: &Server,
+    id: Option<&str>,
+    request: impl std::future::Future<Output = Result<T, SetupError>>,
+) -> Result<T, SetupError> {
+    if let Some(id) = id {
+        server.routing().request_started(id);
+    }
+    let outcome = request.await;
+    let complete = match &outcome {
+        Err(SetupError::Http(error)) => error.sent == via_routes::opencode::turn::Sent::No,
+        Ok(_) | Err(SetupError::Status { .. } | SetupError::Malformed) => true,
+    };
+    if complete && let Some(id) = id {
+        server.routing().request_completed(id);
+    }
+    outcome
+}
+
 /// §5: a non-default effort must be a variant of the session's model in a
 /// fresh catalog at the session's location, else the turn is refused
 /// naming `effort`, nothing sent.
@@ -617,9 +725,14 @@ async fn effort_offered(
     settings: &Settings,
     variant: &str,
 ) -> Result<(), Box<TurnEnd>> {
-    let catalog = session::catalog_at(server.http(), &settings.cwd, facts.request_by())
-        .await
-        .map_err(|error| Box::new(facts.setup_failed("the location's model listing", error)))?;
+    let id = facts.driver.state().identity.clone();
+    let catalog = tracked(
+        server,
+        id.as_deref(),
+        session::catalog_at(server.http(), &settings.cwd, facts.request_by()),
+    )
+    .await
+    .map_err(|error| Box::new(facts.setup_failed("the location's model listing", error)))?;
     let offered = catalog.iter().any(|model| {
         model.provider_id == settings.model.provider_id
             && model.id == settings.model.id
@@ -661,12 +774,20 @@ async fn create(
         return Err(Box::new(facts.readback_refused(digest, "location")));
     }
     if let Some(text) = &settings.instructions {
-        session::put_instructions(server.http(), &info.id, text, facts.request_by())
-            .await
-            .map_err(|error| Box::new(facts.setup_failed("the instruction entry", error)))?;
-        let entry = session::instructions(server.http(), &info.id, facts.request_by())
-            .await
-            .map_err(|error| Box::new(facts.setup_failed("the instruction listing", error)))?;
+        tracked(
+            server,
+            Some(&info.id),
+            session::put_instructions(server.http(), &info.id, text, facts.request_by()),
+        )
+        .await
+        .map_err(|error| Box::new(facts.setup_failed("the instruction entry", error)))?;
+        let entry = tracked(
+            server,
+            Some(&info.id),
+            session::instructions(server.http(), &info.id, facts.request_by()),
+        )
+        .await
+        .map_err(|error| Box::new(facts.setup_failed("the instruction listing", error)))?;
         if entry != Entry::Text(text.clone()) {
             return Err(Box::new(facts.readback_refused(digest, "instructions")));
         }
@@ -684,9 +805,13 @@ async fn reopen(
     settings: &Settings,
     id: &str,
 ) -> Result<SessionInfo, Box<TurnEnd>> {
-    let info = session::get(server.http(), id, facts.request_by())
-        .await
-        .map_err(|error| Box::new(facts.setup_failed("the session readback", error)))?;
+    let info = tracked(
+        server,
+        Some(id),
+        session::get(server.http(), id, facts.request_by()),
+    )
+    .await
+    .map_err(|error| Box::new(facts.setup_failed("the session readback", error)))?;
     let Some(info) = info.filter(|info| info.id == id && info.directory == settings.cwd) else {
         return Err(Box::new(resume_mismatch(facts)));
     };
@@ -695,9 +820,13 @@ async fn reopen(
             facts.rejected(StartRejected::SettingsMismatch { setting }),
         ));
     }
-    let entry = session::instructions(server.http(), id, facts.request_by())
-        .await
-        .map_err(|error| Box::new(facts.setup_failed("the instruction listing", error)))?;
+    let entry = tracked(
+        server,
+        Some(id),
+        session::instructions(server.http(), id, facts.request_by()),
+    )
+    .await
+    .map_err(|error| Box::new(facts.setup_failed("the instruction listing", error)))?;
     let expected = settings
         .instructions
         .clone()
@@ -755,7 +884,13 @@ fn variant_of(info: &SessionInfo) -> String {
 
 /// The session's current variant, read back.
 async fn read_variant(facts: &Turn<'_>, server: &Server, id: &str) -> Result<String, Box<TurnEnd>> {
-    match session::get(server.http(), id, facts.request_by()).await {
+    match tracked(
+        server,
+        Some(id),
+        session::get(server.http(), id, facts.request_by()),
+    )
+    .await
+    {
         Ok(Some(info)) => Ok(variant_of(&info)),
         Ok(None) => Err(Box::new(facts.rejected(StartRejected::SessionGone))),
         Err(error) => Err(Box::new(facts.setup_failed("the session readback", error))),
@@ -796,9 +931,13 @@ async fn switch_variant(
         variant: settings.variant.clone(),
         ..settings.model.clone()
     };
-    session::switch_model(server.http(), id, &model, facts.request_by())
-        .await
-        .map_err(|error| Box::new(facts.setup_failed("the model switch", error)))?;
+    tracked(
+        server,
+        Some(id),
+        session::switch_model(server.http(), id, &model, facts.request_by()),
+    )
+    .await
+    .map_err(|error| Box::new(facts.setup_failed("the model switch", error)))?;
     let switched = read_variant(facts, server, id).await?;
     if switched == settings.readback_variant() {
         Ok(())

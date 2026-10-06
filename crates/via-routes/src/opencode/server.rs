@@ -4,8 +4,8 @@
 //! lost. Event routing to sessions arrives with the turn path; until then
 //! the task counts events and keeps the transport's bounds.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use tokio::sync::watch;
@@ -13,6 +13,8 @@ use tokio::time::Instant;
 use via_wire::http::{EventStream, HttpClient, StreamFailure};
 use via_wire::{CloseMode, CloseRequest, Deadline, ServerId, WireMessages, WireSender};
 
+use super::events::{self, DecodeError};
+use super::router::Router;
 use crate::codex::{ConnectionLoss, LossCause};
 
 /// §9: 45 s without a byte on the event stream is transport loss.
@@ -56,6 +58,10 @@ pub struct Server {
     events: AtomicU64,
     /// Stdout messages read after the URL line and discarded (§2.2).
     discarded: AtomicU64,
+    /// The stream and HTTP response markers share one read-order lock.
+    routing: Mutex<Router>,
+    /// One snapshot, completed before server loss reaches any driver.
+    leftovers: Mutex<Option<via_wire::LeftoverReport>>,
 }
 
 impl std::fmt::Debug for Server {
@@ -80,6 +86,8 @@ impl Server {
             end: watch::Sender::new(None),
             events: AtomicU64::new(0),
             discarded: AtomicU64::new(0),
+            routing: Mutex::new(Router::new()),
+            leftovers: Mutex::new(None),
         }
     }
 
@@ -91,6 +99,29 @@ impl Server {
     /// The generation's HTTP client (its pools and credentials).
     pub fn http(&self) -> &HttpClient {
         &self.http
+    }
+
+    /// Server-scoped admission and ownership. Never hold this guard across an await.
+    pub fn routing(&self) -> MutexGuard<'_, Router> {
+        self.routing.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Link the turn before its first prompt byte (runtime `server_turns`).
+    pub async fn link_turn(
+        &self,
+        session: &crate::SessionId,
+        turn: crate::TurnNumber,
+        by: Deadline,
+    ) -> via_wire::CommitOutcome<()> {
+        self.stdio.link_turn(session, turn, by).await
+    }
+
+    /// The shared report of a lost server generation, after Host's close.
+    pub fn leftovers(&self) -> Option<via_wire::LeftoverReport> {
+        self.leftovers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// The pid Host spawned, which `/api/info.pid` matched.
@@ -175,8 +206,21 @@ pub(crate) async fn run(
         tokio::select! {
             biased;
             event = stream.next_event(SILENCE) => match event {
-                Ok(Some(_event)) => {
+                Ok(Some(event)) => {
                     server.events.fetch_add(1, Ordering::Relaxed);
+                    let at=Instant::now();
+                    match events::decode(event.data()) {
+                        Ok(event) => {
+                            if server.routing().dispatch(event,at).is_err() {
+                                break LossCause::Protocol;
+                            }
+                        }
+                        Err(error) => {
+                            let generation=matches!(error,DecodeError::Generation);
+                            let failed=server.routing().malformed(error).is_err();
+                            if generation || failed { break LossCause::Protocol; }
+                        }
+                    }
                 }
                 Err(StreamFailure::Overflow) => break LossCause::Overflow,
                 Ok(None)
@@ -222,11 +266,12 @@ async fn lose(server: &Server, cause: LossCause) -> ConnectionLoss {
         .wait_exit(Deadline::at(Instant::now() + LOSS_EXIT))
         .await
         .ok();
+    let close_by = Deadline::at(Instant::now() + LOSS_STOP);
     let report = server
         .stdio
         .close(CloseRequest {
             mode: CloseMode::Force,
-            deadline: Deadline::at(Instant::now() + LOSS_STOP),
+            deadline: close_by,
         })
         .await;
     let cause = match cause {
@@ -239,6 +284,16 @@ async fn lose(server: &Server, cause: LossCause) -> ConnectionLoss {
             }
         }
     };
+    if cause == LossCause::ServerLost && server.routing().has_loss_destination() {
+        let report = server
+            .stdio
+            .report_leftovers(via_wire::LeftoverScope::Server, close_by)
+            .await;
+        *server
+            .leftovers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(report);
+    }
     ConnectionLoss {
         cause,
         cleanup: report.cleanup,

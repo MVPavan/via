@@ -19,6 +19,8 @@
 
 #[path = "oc02b/harness.rs"]
 mod harness;
+#[path = "oc02b/leftovers.rs"]
+mod leftovers;
 #[path = "oc02b/support.rs"]
 mod support;
 #[path = "oc02b/vendor.rs"]
@@ -66,6 +68,10 @@ const NEEDS_CREDENTIAL_HARNESS: &str =
     "needs a harness that starts VIA with differing GIDs or non-zero capabilities";
 
 const CASES: &[Case] = &[
+    case(
+        "oc10_group_absence_keeps_a_surviving_marked_tool_report",
+        leftovers::surviving_marked_tool,
+    ),
     case(
         "oc02b_lock_is_private_and_held_by_the_anchor_alone",
         lock_is_private,

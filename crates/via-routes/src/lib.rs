@@ -275,9 +275,10 @@ pub use via_wire::failpoint;
 /// Runtime §8's JSON structure limits, for a route's own bounded reads.
 pub use via_wire::json_limits;
 pub use via_wire::{
-    CapacityToken, EnvAllowList, PrivateProcessSpec, ProcessOwner, ReprobeReport, RuntimeConfig,
-    RuntimeResources, SessionId, StderrCapture, VersionProbe, WireCleanup, WireError, WireRecovery,
-    WireShutdown, WireTurnRecovery,
+    CapacityToken, CommitOutcome, EnvAllowList, LeftoverProcess, LeftoverReport, LeftoverScope,
+    PrivateProcessSpec, ProcessOwner, ReprobeReport, RuntimeConfig, RuntimeResources, SessionId,
+    StderrCapture, VersionProbe, WireCleanup, WireError, WireRecovery, WireShutdown,
+    WireTurnRecovery,
 };
 
 /// Internal hidden-anchor entrypoint forwarded through this architecture layer.

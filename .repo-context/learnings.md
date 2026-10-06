@@ -6,6 +6,13 @@ when it is verified and likely to recur; state the pattern, the evidence
 (repo-relative path, command, or version), and the fix. Design decisions belong
 in the design record (`docs/`), not here.
 
+- OpenCode reopen/leftover fixtures cross a Core boundary: P6 in
+  `crates/via-core/src/engine/drive.rs` cancels successors behind an unknown
+  submitted predecessor before adapter dispatch. Chunk C's direct
+  `SessionDriver` fixtures in `crates/via-adapters/src/opencode/driver_tests.rs`
+  exercise cleanup and request fencing without altering P6. The same-generation
+  request fixture retains a `ServerPin` across driver close; its original
+  fixture instead launched a fresh server and could not test retained state.
 - `codex exec -c` silently accepted invalid keys or values on CLI 0.144.1,
   including a bogus effort value. Validate safety-critical overrides before
   dispatch; prefer native `-s` for plain `exec`. `exec resume` and `exec review`

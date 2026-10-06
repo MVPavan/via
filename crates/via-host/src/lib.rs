@@ -7,6 +7,7 @@ mod anchor;
 mod exec;
 mod fence;
 mod host;
+mod leftovers;
 mod linux;
 mod protocol;
 mod stderr_log;
@@ -19,6 +20,7 @@ pub use host::{
     LaunchPipes, OwnedPipes, ProcessControl, RecoveryReport, ReprobeReport, ShutdownReport,
     TurnRecovery,
 };
+pub use leftovers::{LeftoverProcess, LeftoverReport, LeftoverScope};
 
 /// The owner of a private process group (runtime §5 AR6): the turn of a
 /// per-turn route, or a shared server, which no turn owns. Host stays

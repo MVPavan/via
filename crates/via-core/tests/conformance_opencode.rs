@@ -7,8 +7,7 @@
 //! setup: the turn-level handshake refusal and its cache (OC01), the
 //! inherited-configuration states (OC02), the session's creation, reopen
 //! and readbacks (OC04, OC07) and the per-turn refusals and variant step
-//! (OC11). Until chunk C a set-up turn sends no prompt
-//! ([`core_opencode::set_up_only`]).
+//! (OC11). Chunk C adds turn execution fixtures below.
 #![expect(
     clippy::unwrap_used,
     clippy::panic,
@@ -20,7 +19,7 @@ mod core_opencode;
 
 use core_opencode::{
     Case, MODEL, SES, catalog_entry, class, location_target, route, rules, server, session_info,
-    set_up_only, with_route,
+    setup_succeeded, with_route,
 };
 use serde_json::{Value, json};
 
@@ -33,8 +32,8 @@ fn run<T, F: Future<Output = T>>(body: F) -> T {
         .block_on(body)
 }
 
-/// No request of the turn was a prompt.
-fn no_prompt(case: &Case) {
+/// Exactly the admitted turns submit prompts; refusals add none.
+fn prompt_count(case: &Case, expected: usize) {
     let prompts: Vec<Value> = case
         .requests()
         .into_iter()
@@ -44,14 +43,13 @@ fn no_prompt(case: &Case) {
                 .is_some_and(|target| target.ends_with("/prompt"))
         })
         .collect();
-    assert!(prompts.is_empty(), "{prompts:?}");
+    assert_eq!(prompts.len(), expected, "{prompts:?}");
 }
 
 /// OC07 (§5, §6): a new session is created with the model identity, agent
 /// `via`, the canonical cwd as its location and exactly the six default
 /// permission rules; never with a caller-chosen ID; then VIA's instruction
-/// entry is put and read back, and the identity is confirmed. Nothing is
-/// prompted.
+/// entry is put and read back, and the identity is confirmed before submission.
 #[test]
 fn oc07_a_new_session_is_created_and_read_back() {
     let case = Case::new(&json!({}));
@@ -63,7 +61,7 @@ fn oc07_a_new_session_is_created_and_read_back() {
             .spawn(&cwd, &json!({"instructions": {"text": "Be brief."}}))
             .await;
         let envelope = daemon.wait(&session, 1).await;
-        set_up_only(&envelope);
+        setup_succeeded(&envelope);
         let creates = case.creates();
         assert_eq!(creates.len(), 1, "{creates:?}");
         assert_eq!(
@@ -93,7 +91,7 @@ fn oc07_a_new_session_is_created_and_read_back() {
             case.requests_to("POST", &format!("/api/session/{SES}/model"))
                 .is_empty()
         );
-        no_prompt(&case);
+        prompt_count(&case, 1);
         let status = daemon.status(&session).await;
         assert_eq!(status["vendor_session_id"], SES, "{status}");
         // §6 close: no vendor call, the history kept.
@@ -131,7 +129,7 @@ fn oc07_skills_off_adds_the_skill_deny_rule() {
     run(async {
         let daemon = case.daemon_with(&skills_off());
         let (session, _) = daemon.spawn(&cwd, &json!({})).await;
-        set_up_only(&daemon.wait(&session, 1).await);
+        setup_succeeded(&daemon.wait(&session, 1).await);
         let creates = case.creates();
         assert_eq!(creates[0]["body"]["permissions"], rules(true));
         assert!(
@@ -178,11 +176,44 @@ fn oc07_skills_off_adds_the_skill_deny_rule() {
 fn oc02_inherit_states_and_one_shared_server() {
     let case = Case::new(&json!({}));
     let cwd = case.cwd("a");
-    case.fixture(&server(&cwd, None));
+    // Independent VIA sessions receive independent vendor IDs on one server.
+    let second_id = "ses_via0002";
+    let mut second_info = session_info(&cwd, "default", &rules(false));
+    second_info["data"]["id"] = json!(second_id);
+    let mut fixture = with_route(
+        server(&cwd, None),
+        route(
+            "POST",
+            "/api/session",
+            json!([
+                {"status":200,"json":session_info(&cwd,"default",&rules(false))},
+                {"status":200,"json":second_info},
+            ]),
+        ),
+    );
+    fixture = with_route(
+        fixture,
+        route(
+            "GET",
+            &format!("/api/session/{second_id}/inbox"),
+            json!([{"status":200,"json":{"data":[]}}]),
+        ),
+    );
+    fixture = with_route(
+        fixture,
+        route(
+            "POST",
+            &format!("/api/session/{second_id}/prompt"),
+            json!([core_opencode::prompt_response(
+                core_opencode::success_events("done")
+            )]),
+        ),
+    );
+    case.fixture(&fixture);
     run(async {
         let daemon = case.daemon();
         let (first, _) = daemon.spawn(&cwd, &json!({})).await;
-        set_up_only(&daemon.wait(&first, 1).await);
+        setup_succeeded(&daemon.wait(&first, 1).await);
         let status = daemon.status(&first).await;
         for category in [
             "hooks",
@@ -206,16 +237,17 @@ fn oc02_inherit_states_and_one_shared_server() {
             6
         );
         let (second, _) = daemon.spawn(&cwd, &json!({})).await;
-        set_up_only(&daemon.wait(&second, 1).await);
-        assert_eq!(case.starts(), 1, "one server for both sessions");
+        let second_result = daemon.wait_result(&second, 1).await;
         daemon.stop().await;
+        setup_succeeded(&second_result.expect("the second vendor session completes"));
+        assert_eq!(case.starts(), 1, "one server for both sessions");
     });
     run(case.all_gone());
     run(async {
         let daemon = case.daemon_with(&json!({"hooks": false, "mcp_servers": false,
             "plugins": true, "skills": true, "agents": true, "instruction_files": false}));
         let (session, _) = daemon.spawn(&cwd, &json!({})).await;
-        set_up_only(&daemon.wait(&session, 1).await);
+        setup_succeeded(&daemon.wait(&session, 1).await);
         let status = daemon.status(&session).await;
         assert_eq!(
             status["inherit"]["instruction_files"], "unknown",
@@ -239,7 +271,7 @@ fn oc04_reopen_reads_back_and_a_mismatch_is_not_cached() {
     let session = run(async {
         let daemon = case.daemon();
         let (session, _) = daemon.spawn(&cwd, &json!({})).await;
-        set_up_only(&daemon.wait(&session, 1).await);
+        setup_succeeded(&daemon.wait(&session, 1).await);
         daemon.stop().await;
         session
     });
@@ -272,10 +304,10 @@ fn oc04_reopen_reads_back_and_a_mismatch_is_not_cached() {
                 .len(),
             1
         );
-        no_prompt(&case);
+        prompt_count(&case, 1);
         // Not cached: a fresh session's plan passes.
         let (fresh, _) = daemon.spawn(&cwd, &json!({})).await;
-        set_up_only(&daemon.wait(&fresh, 1).await);
+        setup_succeeded(&daemon.wait(&fresh, 1).await);
         daemon.stop().await;
     });
     run(case.all_gone());
@@ -291,7 +323,7 @@ fn oc04_a_missing_session_is_resume_mismatch() {
     let session = run(async {
         let daemon = case.daemon();
         let (session, _) = daemon.spawn(&cwd, &json!({})).await;
-        set_up_only(&daemon.wait(&session, 1).await);
+        setup_succeeded(&daemon.wait(&session, 1).await);
         daemon.stop().await;
         session
     });
@@ -311,7 +343,7 @@ fn oc04_a_missing_session_is_resume_mismatch() {
         assert_eq!(envelope["state"], "failed", "{envelope}");
         assert_eq!(class(&envelope), "resume_mismatch", "{envelope}");
         assert_eq!(case.creates().len(), 1);
-        no_prompt(&case);
+        prompt_count(&case, 1);
         daemon.stop().await;
     });
     run(case.all_gone());
@@ -367,10 +399,10 @@ fn oc04_a_just_sent_readback_is_refused_under_its_digest() {
         let (other, _) = daemon
             .spawn(&cwd, &json!({"instructions": {"text": "Be brief."}}))
             .await;
-        set_up_only(&daemon.wait(&other, 1).await);
+        setup_succeeded(&daemon.wait(&other, 1).await);
         assert_eq!(case.creates().len(), 2);
         assert_eq!(case.starts(), 1, "the server stayed published");
-        no_prompt(&case);
+        prompt_count(&case, 1);
         daemon.stop().await;
     });
     run(case.all_gone());
@@ -380,7 +412,7 @@ fn oc04_a_just_sent_readback_is_refused_under_its_digest() {
 /// catalog at the session's location, then switched and read back as
 /// sent; a later turn with effort `"default"` clears it; a vendor
 /// that ignores a switch is `handshake_refused` for that turn, nothing
-/// prompted.
+/// submitted only after setup.
 #[test]
 fn oc04_the_variant_is_switched_read_back_and_cleared() {
     let case = Case::new(&json!({}));
@@ -414,7 +446,7 @@ fn oc04_the_variant_is_switched_read_back_and_cleared() {
     run(async {
         let daemon = case.daemon();
         let (session, _) = daemon.spawn(&cwd, &json!({"effort": "high"})).await;
-        set_up_only(&daemon.wait(&session, 1).await);
+        setup_succeeded(&daemon.wait(&session, 1).await);
         let switches = case.requests_to("POST", &format!("/api/session/{SES}/model"));
         assert_eq!(
             switches
@@ -433,7 +465,7 @@ fn oc04_the_variant_is_switched_read_back_and_cleared() {
             .try_resume(&session, &json!({"effort": "default"}))
             .await
             .unwrap();
-        set_up_only(&daemon.wait(&session, 2).await);
+        setup_succeeded(&daemon.wait(&session, 2).await);
         let switches = case.requests_to("POST", &format!("/api/session/{SES}/model"));
         assert_eq!(
             switches[1]["body"],
@@ -455,7 +487,7 @@ fn oc04_the_variant_is_switched_read_back_and_cleared() {
             json!({"reason": "handshake_refused"}),
             "an ignored switch: {envelope}"
         );
-        no_prompt(&case);
+        prompt_count(&case, 2);
         daemon.stop().await;
     });
     run(case.all_gone());
@@ -511,7 +543,7 @@ fn oc11_the_variant_is_judged_per_location_in_run_turn() {
     run(async {
         let daemon = case.daemon();
         let (on_a, _) = daemon.spawn(&a, &json!({"effort": "high"})).await;
-        set_up_only(&daemon.wait(&on_a, 1).await);
+        setup_succeeded(&daemon.wait(&on_a, 1).await);
         assert_eq!(case.requests_to("GET", &location_target(&a)).len(), 1);
         let (on_b, _) = daemon
             .try_spawn(&b, &json!({"effort": "high"}))
@@ -534,9 +566,9 @@ fn oc11_the_variant_is_judged_per_location_in_run_turn() {
             .try_resume(&on_b, &json!({"effort": "high"}))
             .await
             .expect("check_turn accepts it");
-        set_up_only(&daemon.wait(&on_b, 2).await);
+        setup_succeeded(&daemon.wait(&on_b, 2).await);
         assert_eq!(case.requests_to("GET", &location_target(&b)).len(), 2);
-        no_prompt(&case);
+        prompt_count(&case, 2);
         daemon.stop().await;
     });
     run(case.all_gone());
@@ -560,7 +592,7 @@ fn oc11_effort_default_is_omitted() {
     run(async {
         let daemon = case.daemon();
         let (session, _) = daemon.spawn(&cwd, &json!({"effort": "default"})).await;
-        set_up_only(&daemon.wait(&session, 1).await);
+        setup_succeeded(&daemon.wait(&session, 1).await);
         assert!(case.requests_to("GET", "/api/model?").is_empty());
         assert!(
             case.requests_to("POST", &format!("/api/session/{SES}/model"))
@@ -586,7 +618,7 @@ fn oc11_instruction_size_is_judged_encoded() {
         let (session, _) = daemon
             .spawn(&cwd, &json!({"instructions": {"text": at_limit}}))
             .await;
-        set_up_only(&daemon.wait(&session, 1).await);
+        setup_succeeded(&daemon.wait(&session, 1).await);
         let puts = case.requests_to("PUT", "/api/experimental/");
         assert_eq!(puts.len(), 1);
         for over in ["\n".repeat(131_072), "€".repeat(87_381)] {
@@ -627,7 +659,7 @@ fn oc11_prompt_admission_on_both_sides() {
     run(async {
         let daemon = case.daemon();
         let (session, _) = daemon.spawn(&cwd, &json!({"prompt": prompt(LIMIT)})).await;
-        set_up_only(&daemon.wait(&session, 1).await);
+        setup_succeeded(&daemon.wait(&session, 1).await);
         let refused = daemon
             .try_spawn(&cwd, &json!({"prompt": prompt(LIMIT + 1)}))
             .await
@@ -693,7 +725,7 @@ fn oc11_refusals_before_any_receipt() {
 /// OC01 (§2.2, §12) at the turn: a fully compatible server reporting
 /// `2.0.23` fails the turn `submit_failed`/`handshake_refused`, its message
 /// naming the version and the checked set; nothing is created or
-/// prompted. The refusal is cached by binary identity: the next spawn,
+/// submitted only after setup. The refusal is cached by binary identity: the next spawn,
 /// `allow_untested` or not, is refused at its plan, before any start; the
 /// same path replaced by a 2.0.22 program is admitted at once.
 #[test]
@@ -737,7 +769,7 @@ fn oc01_an_unchecked_version_is_refused_and_cached_by_binary() {
         case.fixture(&server(&cwd, None));
         case.replace_program();
         let (admitted, _) = daemon.spawn(&cwd, &json!({})).await;
-        set_up_only(&daemon.wait(&admitted, 1).await);
+        setup_succeeded(&daemon.wait(&admitted, 1).await);
         assert_eq!(case.creates().len(), 1);
         daemon.stop().await;
     });
@@ -767,7 +799,7 @@ fn oc01_a_transient_failure_is_not_cached() {
         );
         case.fixture(&server(&cwd, None));
         let (admitted, _) = daemon.spawn(&cwd, &json!({})).await;
-        set_up_only(&daemon.wait(&admitted, 1).await);
+        setup_succeeded(&daemon.wait(&admitted, 1).await);
         daemon.stop().await;
     });
     run(case.all_gone());
@@ -787,7 +819,7 @@ fn oc02_stored_credentials_refuse_naming_integration_ids() {
     run(async {
         let daemon = case.daemon();
         let (first, _) = daemon.spawn(&cwd, &json!({})).await;
-        set_up_only(&daemon.wait(&first, 1).await);
+        setup_succeeded(&daemon.wait(&first, 1).await);
         daemon.stop().await;
     });
     run(case.all_gone());
@@ -842,7 +874,7 @@ fn oc02_stored_credentials_refuse_naming_integration_ids() {
         let daemon = case.daemon();
         let (session, _) = daemon.spawn(&cwd, &json!({})).await;
         let envelope = daemon.wait(&session, 1).await;
-        set_up_only(&envelope);
+        setup_succeeded(&envelope);
         let codes: Vec<&Value> = envelope["warnings"]
             .as_array()
             .unwrap()
@@ -867,3 +899,6 @@ fn oc02_stored_credentials_refuse_naming_integration_ids() {
     }
     let _ = MODEL;
 }
+
+#[path = "support/core_opencode_turns.rs"]
+mod core_opencode_turns;

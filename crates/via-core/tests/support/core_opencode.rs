@@ -17,9 +17,36 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use via_core::{
-    AdapterConfig, BootstrapEnv, CloseParams, Deadline, Engine, ResumeParams, SessionId,
-    SpawnParams, StatusParams, WaitParams,
+    AdapterConfig, BootstrapEnv, CloseParams, Deadline, Engine, EventsParams, LogsParams,
+    ResumeParams, SessionId, SpawnParams, StatusParams, WaitParams,
 };
+
+/// Owns exactly one subprocess, including when a fixture unwinds.
+pub(crate) struct OwnedChild(std::process::Child);
+
+impl std::ops::Deref for OwnedChild {
+    type Target = std::process::Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for OwnedChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        // Only this exact spawned Child handle can be stopped by the guard.
+        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+            let _ = self.0.kill();
+        }
+        let _ = self.0.wait();
+    }
+}
 
 /// The caller handle every request names.
 pub(crate) const HANDLE: &str = "h_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -99,7 +126,7 @@ pub(crate) fn server(cwd: &str, instructions: Option<&str>) -> Value {
         Some(text) => json!({"data": [{"key": "via", "value": text}]}),
         None => json!({"data": []}),
     };
-    json!({"routes": [
+    let fixture = json!({"routes": [
         route("GET", "/api/info", json!([{"status": 200, "json": {"version": "2.0.22", "pid": "$PID"}}])),
         route("GET", "/api/integration", json!([{"status": 200, "json": {"data": []}}])),
         route("GET", "/api/model", json!([{"status": 200, "json": {"data": [catalog_entry(&["high"])]}}])),
@@ -110,7 +137,77 @@ pub(crate) fn server(cwd: &str, instructions: Option<&str>) -> Value {
         route("PUT", &format!("/api/experimental/session/{SES}/instructions/entries/via"), json!([{"status": 204}])),
         route("GET", &format!("/api/experimental/session/{SES}/instructions/entries"), json!([{"status": 200, "json": entries}])),
         route("POST", &format!("/api/session/{SES}/model"), json!([{"status": 204}])),
-    ]})
+    ]});
+    let fixture = with_route(
+        fixture,
+        route(
+            "GET",
+            &format!("/api/session/{SES}/inbox"),
+            json!([{"status": 200, "json": {"data": []}}]),
+        ),
+    );
+    with_route(fixture, prompt_route(success_events("done")))
+}
+
+/// A synthetic event retaining the vendor's observed envelope/data shape.
+pub(crate) fn event(kind: &str, mut data: Value) -> Value {
+    if data.get("sessionID").is_none() {
+        data["sessionID"] = json!("$SESSION");
+    }
+    json!({"type": kind, "data": data, "id": "evt_fixture", "created": 1})
+}
+
+/// Acceptance and owned execution/step, with caller-dependent message keys.
+pub(crate) fn begin_events() -> Vec<Value> {
+    vec![
+        event("session.inbox.enqueued", json!({"inboxID": "$INPUT"})),
+        event("session.execution.started", json!({})),
+        event("session.inbox.delivered", json!({"inboxID": "$INPUT"})),
+        event(
+            "session.step.started",
+            json!({"assistantMessageID": "$INPUT:a", "agent": "via",
+            "model": {"providerID": "opencode", "id": "big-pickle"}, "started": 1}),
+        ),
+    ]
+}
+
+/// One completed model call. Independent values make supersession visible.
+pub(crate) fn step_end(message: &str, input: u64, cost: f64) -> Value {
+    event(
+        "session.step.ended",
+        json!({"assistantMessageID": message, "finish": "stop",
+        "tokens": {"input": input, "output": 7, "reasoning": 2, "cache": {"read": 3, "write": 4}},
+        "cost": cost}),
+    )
+}
+
+pub(crate) fn success_events(text: &str) -> Vec<Value> {
+    let mut events = begin_events();
+    events.extend([
+        event(
+            "session.text.delta",
+            json!({"assistantMessageID": "$INPUT:a", "ordinal": 0, "delta": text}),
+        ),
+        event(
+            "session.text.ended",
+            json!({"assistantMessageID": "$INPUT:a", "ordinal": 0, "text": text}),
+        ),
+        step_end("$INPUT:a", 11, 0.25),
+        event("session.execution.succeeded", json!({})),
+    ]);
+    events
+}
+
+pub(crate) fn prompt_response(events: Vec<Value>) -> Value {
+    json!({"status": 200, "json": {"data": {"id": "$INPUT", "sessionID": "$SESSION"}}, "emit": events.into_iter().collect::<Value>()})
+}
+
+pub(crate) fn prompt_route(events: Vec<Value>) -> Value {
+    route(
+        "POST",
+        &format!("/api/session/{SES}/prompt"),
+        json!([prompt_response(events)]),
+    )
 }
 
 /// `fixture` with the routes of `method` and `path` replaced by `route`,
@@ -218,6 +315,11 @@ impl Case {
         self.lines(".requests")
     }
 
+    /// Sanitized event-type/write-time audit in the fake's stream order.
+    pub(crate) fn frames(&self) -> Vec<Value> {
+        self.lines(".frames")
+    }
+
     /// The requests of `method` whose target starts with `prefix`.
     pub(crate) fn requests_to(&self, method: &str, prefix: &str) -> Vec<Value> {
         self.requests()
@@ -258,6 +360,38 @@ impl Case {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }
+        let pattern = format!("^{}( |$)", self.fake.display());
+        let result = std::process::Command::new("pgrep")
+            .args(["-f", &pattern])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", self.root.path())
+            .env("XDG_CONFIG_HOME", self.root.path())
+            .env("XDG_DATA_HOME", self.root.path())
+            .env("XDG_STATE_HOME", self.root.path())
+            .env("XDG_CACHE_HOME", self.root.path())
+            .env("XDG_RUNTIME_DIR", self.root.path())
+            .env("TMPDIR", self.root.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            result.status.code(),
+            Some(1),
+            "owned fake still found: {}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+    }
+
+    /// Durable Host group-absence proofs after daemon shutdown. This reads
+    /// only the case's private database, after its Store writer has stopped.
+    pub(crate) fn proven_server_groups(&self) -> usize {
+        let db = rusqlite::Connection::open_with_flags(
+            self.root.path().join("state/store.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let count: u32 = db.query_row("SELECT count(*) FROM anchors WHERE owner_server IS NOT NULL AND absence_time IS NOT NULL", [], |row| row.get(0)).unwrap();
+        usize::try_from(count).unwrap()
     }
 
     /// A session cwd `name` under the case, created.
@@ -294,6 +428,41 @@ impl Case {
             walk(&self.root.path().join(part), &mut files);
         }
         files
+    }
+
+    /// An owned subprocess running the same test under the case's private roots.
+    pub(crate) fn crash_child(&self, test: &str) -> OwnedChild {
+        self.owned_child(
+            std::process::Command::new(std::env::current_exe().unwrap()).args([
+                "--exact",
+                test,
+                "--nocapture",
+            ]),
+        )
+    }
+
+    /// Every owned subprocess has the same private roots as the fixture.
+    pub(crate) fn owned_child(&self, command: &mut std::process::Command) -> OwnedChild {
+        OwnedChild(
+            command
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", self.root.path())
+                .env("XDG_CONFIG_HOME", self.root.path())
+                .env("XDG_DATA_HOME", self.root.path())
+                .env("XDG_STATE_HOME", self.root.path())
+                .env("XDG_CACHE_HOME", self.root.path())
+                .env("XDG_RUNTIME_DIR", self.root.path())
+                .env("TMPDIR", self.root.path())
+                .env("VIA_OC_CRASH_ROOT", self.root.path())
+                .current_dir(self.root.path())
+                .spawn()
+                .unwrap(),
+        )
+    }
+
+    pub(crate) fn crash_marker(&self) -> PathBuf {
+        self.root.path().join("crash-accepted.json")
     }
 
     /// Opens a daemon on the case's root.
@@ -333,6 +502,16 @@ pub(crate) struct Daemon {
 }
 
 impl Daemon {
+    /// The owned crash subprocess opens exactly the parent's private fixture.
+    pub(crate) fn crash_fixture(root: &Path) -> Self {
+        let raw = serde_json::value::RawValue::from_string(
+            json!({"opencode":{"binary":root.join("opencode")}}).to_string(),
+        )
+        .unwrap();
+        let adapters = AdapterConfig::load(BootstrapEnv::capture(), Some(&raw)).unwrap();
+        Self::open(root, adapters)
+    }
+
     fn open(root: &Path, adapters: AdapterConfig) -> Self {
         let engine = Engine::open(
             &root.join("state"),
@@ -410,12 +589,22 @@ impl Daemon {
 
     /// The envelope of `session`'s turn `turn` once it is terminal.
     pub(crate) async fn wait(&self, session: &SessionId, turn: u32) -> Value {
+        self.wait_result(session, turn).await.unwrap()
+    }
+
+    /// A fallible wait so a proving fixture shuts down before unwrapping an
+    /// unexpected timeout or Store error.
+    pub(crate) async fn wait_result(
+        &self,
+        session: &SessionId,
+        turn: u32,
+    ) -> Result<Value, via_core::ApiError> {
         let params = WaitParams {
             address: format!("{session}/{turn}"),
             timeout_ms: Some(WAIT_MS),
         };
-        let envelope = self.engine.wait(params).await.unwrap();
-        serde_json::from_str(envelope.get()).unwrap()
+        let envelope = self.engine.wait(params).await?;
+        Ok(serde_json::from_str(envelope.get()).unwrap())
     }
 
     /// `session`'s C1 status.
@@ -424,11 +613,33 @@ impl Daemon {
         self.engine.status(params).await.unwrap()
     }
 
+    /// Public event records for this turn.
+    pub(crate) async fn events(&self, session: &SessionId, turn: u32) -> Value {
+        let params: EventsParams =
+            serde_json::from_value(json!({"turn": format!("{session}/{turn}"), "limit": 1000}))
+                .unwrap();
+        let events = self.engine.events(params).await.unwrap();
+        serde_json::from_str(events.get()).unwrap()
+    }
+
+    pub(crate) async fn logs(&self, session: &SessionId, turn: u32) -> Value {
+        let params: LogsParams =
+            serde_json::from_value(json!({"turn": format!("{session}/{turn}")})).unwrap();
+        self.engine.logs(params).await.unwrap()
+    }
+
     /// Closes `session` gracefully.
     pub(crate) async fn close(&self, session: &SessionId) -> Value {
         let raw = json!({"session": session, "handle": HANDLE});
         let params: CloseParams = serde_json::from_value(raw.clone()).unwrap();
         self.engine.close(params, &raw.to_string()).await.unwrap()
+    }
+
+    /// The daemon's public startup recovery sequence, before new admission.
+    pub(crate) async fn recover(&self) {
+        self.engine.recover().await.unwrap();
+        self.engine.bound_resumed_paging().await.unwrap();
+        self.engine.hand_off_queued().await.unwrap();
     }
 
     /// Clean shutdown, then every task holding the Engine ends, so the
@@ -457,14 +668,9 @@ pub(crate) fn class(envelope: &Value) -> &str {
     envelope["failure"]["class"].as_str().unwrap_or_default()
 }
 
-/// Chunk B's end of a turn whose setup succeeded: the route sends no
-/// prompt yet, and ends the turn with a definite rejection
-/// (`submit_failed`) once the session is set up. Chunk C replaces it.
-pub(crate) fn set_up_only(envelope: &Value) {
-    assert_eq!(envelope["state"], "failed", "{envelope}");
-    assert_eq!(class(envelope), "submit_failed", "{envelope}");
-    assert!(
-        envelope["failure"]["data"].is_null(),
-        "no adapter reason: {envelope}"
-    );
+/// Setup fixtures now require a real successful turn; setup checks remain
+/// independently asserted by each caller.
+pub(crate) fn setup_succeeded(envelope: &Value) {
+    assert_eq!(envelope["state"], "completed", "{envelope}");
+    assert!(envelope["failure"].is_null(), "{envelope}");
 }

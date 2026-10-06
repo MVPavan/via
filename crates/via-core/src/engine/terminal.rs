@@ -94,6 +94,20 @@ pub(super) fn turn_envelope(
     )
 }
 
+/// AD20's report has one public shape, independent of the turn's outcome.
+/// Recovery's default `VendorRecord` carries none and performs no scan.
+fn leftover_report(report: via_adapters::LeftoverReport) -> serde_json::Value {
+    use via_adapters::observation::LeftoverScope;
+    let scope = match report.scope {
+        LeftoverScope::Turn => "turn",
+        LeftoverScope::Server => "server",
+    };
+    let processes: Vec<_> = report.processes.into_iter().map(|process| {
+        serde_json::json!({"pid":process.pid,"comm":process.comm,"started_at":process.started_at})
+    }).collect();
+    serde_json::json!({"scope":scope,"processes":processes,"total":report.total,"incomplete":report.incomplete,"best_effort":true})
+}
+
 /// The envelope's `usage` from the turn's ledger (AD6): the turn aggregate
 /// when there is one, else the folded call samples, under the route's
 /// token `scope` or `vendor_interval`, with whether the interval is
@@ -217,7 +231,7 @@ fn assemble(
         // Validated against the frozen schema before it was kept (#37).
         structured_output: retained.structured_output,
         structured_output_file: retained.structured_output_file,
-        leftovers: None,
+        leftovers: vendor.leftovers.map(leftover_report),
         denied_actions,
         auto_declined_requests,
         denied_actions_total,
@@ -1130,6 +1144,55 @@ mod tests {
                 serde_json::json!({"usd": 0.5, "scope": "turn", "provenance": word}),
             );
         }
+    }
+
+    #[test]
+    fn turn_envelope_keeps_the_shared_leftover_snapshot() {
+        use via_adapters::LeftoverReport;
+        use via_adapters::observation::{LeftoverProcess, LeftoverScope};
+        let session = crate::SessionId::try_from("s_zzzzzzzzzzzz").unwrap();
+        let at = "2026-01-01T00:00:00.000Z".to_owned();
+        let vendor = super::VendorRecord {
+            leftovers: Some(LeftoverReport {
+                scope: LeftoverScope::Server,
+                processes: vec![LeftoverProcess {
+                    pid: 321,
+                    comm: "worker".to_owned(),
+                    started_at: "2026-01-01T00:00:00Z".to_owned(),
+                }],
+                total: 2,
+                incomplete: true,
+            }),
+            ..super::VendorRecord::default()
+        };
+        let envelope = super::turn_envelope(
+            (
+                &session,
+                TurnNumber::try_from(1).unwrap(),
+                &crate::intake::TurnPlan::default(),
+            ),
+            super::blank("unknown", "error", None),
+            None,
+            (None, None),
+            (
+                crate::api::Timestamps {
+                    queued_at: at.clone(),
+                    submitted_at: None,
+                    accepted_at: None,
+                    ended_at: at,
+                },
+                None,
+            ),
+            (1, 1),
+            vendor,
+        );
+        assert_eq!(
+            serde_json::to_value(envelope).unwrap()["leftovers"],
+            serde_json::json!({
+                "scope": "server", "processes": [{"pid":321,"comm":"worker","started_at":"2026-01-01T00:00:00Z"}],
+                "total":2,"incomplete":true,"best_effort":true,
+            })
+        );
     }
 
     /// Bead via-i5g (C2 §5, `TurnEnd.aggregate`): an aggregate a turn's

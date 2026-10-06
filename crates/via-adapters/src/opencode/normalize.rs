@@ -1,0 +1,350 @@
+//! `OpenCode` packet §7.3/§12: owned events to C2 observations and terminal.
+//! The delivery owner decides whether the samples are complete; these sums
+//! are reported only under its positive delivery predicate.
+
+use std::collections::BTreeMap;
+
+use tokio::time::Instant;
+use via_routes::opencode::events::{
+    EventData, ExecutionKind, StepKind, TextKind, Tokens, ToolKind, VendorError,
+};
+
+use crate::{
+    ClassHint, CostProvenance, CostReport, Denial, DenialKind, Observation, ProgressMarks,
+    StopReason, UsageSample, VendorTerminal, VendorTerminalStatus, final_text_pieces_owned,
+};
+
+/// Only events already attributed to this turn enter its normalizer.
+pub(super) struct Normalizer {
+    last_step: Option<String>,
+    finish: Option<String>,
+    text: BTreeMap<u64, String>,
+    samples: BTreeMap<String, Sample>,
+    interval_unverified: bool,
+}
+
+struct Sample {
+    usage: UsageSample,
+    cost: Option<f64>,
+    cache_write: Option<u64>,
+}
+
+impl Normalizer {
+    pub(super) fn new() -> Self {
+        Self {
+            last_step: None,
+            finish: None,
+            text: BTreeMap::new(),
+            samples: BTreeMap::new(),
+            interval_unverified: false,
+        }
+    }
+
+    /// Ordered step identities learned by Route before this turn's input
+    /// joined the execution. This records state, never replays observations.
+    pub(super) fn register_started_steps(&mut self, steps: &[String]) {
+        for assistant_message_id in steps {
+            self.start_step(assistant_message_id);
+        }
+    }
+
+    /// Decode timestamps belong to the delivery's `ObservationItems`. This
+    /// pure transformation leaves their original arrival instant untouched.
+    pub(super) fn items(&mut self, data: &EventData, _at: Instant) -> Vec<Observation> {
+        match data {
+            EventData::Step {
+                kind,
+                assistant_message_id,
+                finish,
+                tokens,
+                cost,
+            } => match kind {
+                StepKind::Started => {
+                    self.start_step(assistant_message_id);
+                    Vec::new()
+                }
+                StepKind::Ended | StepKind::Failed => {
+                    if *kind == StepKind::Ended {
+                        self.learn_first_step(assistant_message_id);
+                        if self.last_step.as_ref() == Some(assistant_message_id) {
+                            self.finish.clone_from(finish);
+                        }
+                    }
+                    self.sample(assistant_message_id, tokens.as_ref(), *cost, false)
+                }
+                StepKind::Activity => Vec::new(),
+            },
+            EventData::Compaction { key, tokens, cost } => {
+                self.interval_unverified = true;
+                self.sample(key, tokens.as_ref(), *cost, true)
+            }
+            EventData::Text {
+                kind,
+                assistant_message_id,
+                ordinal,
+                text,
+            } => {
+                // The input can join an execution after this assistant's
+                // start. Owned text identifies its step without replaying
+                // pre-delivery observations or displacing a known step.
+                self.learn_first_step(assistant_message_id);
+                match kind {
+                    TextKind::Delta | TextKind::Reasoning => vec![model_progress()],
+                    TextKind::Ended => {
+                        if self.last_step.as_ref() == Some(assistant_message_id) {
+                            self.text.insert(*ordinal, text.clone());
+                        }
+                        Vec::new()
+                    }
+                    TextKind::Started => Vec::new(),
+                }
+            }
+            EventData::Tool {
+                kind,
+                call_id,
+                tool,
+                error,
+                ..
+            } => match kind {
+                ToolKind::Called => vec![Observation::Progress(ProgressMarks {
+                    model: true,
+                    tools_started: vec![(
+                        call_id.clone(),
+                        bounded(tool.as_deref().unwrap_or("tool")),
+                    )],
+                    ..ProgressMarks::default()
+                })],
+                ToolKind::Success | ToolKind::Failed => {
+                    let mut items = vec![Observation::Progress(ProgressMarks {
+                        tools_ended: vec![call_id.clone()],
+                        ..ProgressMarks::default()
+                    })];
+                    // Chunk D's correlated VIA-decline handling suppresses
+                    // its own denial before invoking this transformation.
+                    if error
+                        .as_ref()
+                        .is_some_and(|error| error.code == "permission.rejected")
+                    {
+                        items.push(Observation::ActionDenied(Denial {
+                            kind: DenialKind::Other,
+                            target: bounded(tool.as_deref().unwrap_or("tool")),
+                            reason: "denied by the vendor's permission policy".into(),
+                        }));
+                    }
+                    items
+                }
+                ToolKind::InputStarted | ToolKind::Activity => Vec::new(),
+            },
+            EventData::Inbox { .. }
+            | EventData::Execution { .. }
+            | EventData::Interactive { .. }
+            | EventData::Created { .. }
+            | EventData::Activity { .. } => Vec::new(),
+        }
+    }
+
+    fn start_step(&mut self, assistant_message_id: &str) {
+        // Every known call needs an end sample; no end must not leave
+        // the aggregate reporting only the other calls' usage.
+        self.samples
+            .entry(assistant_message_id.to_owned())
+            .or_insert_with(|| Sample {
+                usage: UsageSample {
+                    key: Some(assistant_message_id.to_owned()),
+                    ..UsageSample::default()
+                },
+                cost: None,
+                cache_write: None,
+            });
+        if self.last_step.as_deref() != Some(assistant_message_id) {
+            self.last_step = Some(assistant_message_id.to_owned());
+            self.finish = None;
+            self.text.clear();
+        }
+    }
+
+    fn learn_first_step(&mut self, assistant_message_id: &str) {
+        if self.last_step.is_none() {
+            self.start_step(assistant_message_id);
+        }
+    }
+
+    fn sample(
+        &mut self,
+        key: &str,
+        tokens: Option<&Tokens>,
+        cost: Option<f64>,
+        interval_unverified: bool,
+    ) -> Vec<Observation> {
+        let usage = UsageSample {
+            key: Some(key.to_owned()),
+            input: tokens.and_then(|tokens| tokens.input),
+            cached_input: tokens.and_then(|tokens| tokens.cache_read),
+            output: tokens.and_then(|tokens| tokens.output),
+            reasoning_output: tokens.and_then(|tokens| tokens.reasoning),
+            // The vendor supplies no total or disjointness guarantee for
+            // reasoning/output; no inferred total is reported.
+            total: None,
+            interval_unverified,
+        };
+        self.samples.insert(
+            key.to_owned(),
+            Sample {
+                usage: usage.clone(),
+                cost,
+                cache_write: tokens.and_then(|tokens| tokens.cache_write),
+            },
+        );
+        vec![Observation::Progress(ProgressMarks {
+            usage: Some(usage),
+            ..ProgressMarks::default()
+        })]
+    }
+
+    /// Called only for Completed, after retaining the execution terminal.
+    pub(super) fn final_text(&self) -> Vec<String> {
+        final_text_pieces_owned(self.text.values().map(String::as_str).collect())
+    }
+
+    /// Missing sample components and arithmetic overflow are unavailable.
+    /// The delivery owner supersedes this aggregate with all-null usage
+    /// whenever its observation completeness predicate is false (AD6).
+    pub(super) fn usage(&self) -> UsageSample {
+        UsageSample {
+            key: None,
+            input: self.sum(|sample| sample.usage.input),
+            cached_input: self.sum(|sample| sample.usage.cached_input),
+            output: self.sum(|sample| sample.usage.output),
+            reasoning_output: self.sum(|sample| sample.usage.reasoning_output),
+            total: None,
+            interval_unverified: self.interval_unverified,
+        }
+    }
+
+    fn sum(&self, counter: impl Fn(&Sample) -> Option<u64>) -> Option<u64> {
+        if self.samples.is_empty() {
+            return None;
+        }
+        self.samples
+            .values()
+            .try_fold(0_u64, |sum, sample| sum.checked_add(counter(sample)?))
+    }
+
+    pub(super) fn cost(&self) -> Option<CostReport> {
+        if self.samples.is_empty() {
+            return None;
+        }
+        let usd = self.samples.values().try_fold(0.0, |sum, sample| {
+            let value = sum + sample.cost?;
+            value.is_finite().then_some(value)
+        })?;
+        Some(CostReport {
+            usd,
+            scope: if self.interval_unverified {
+                "vendor_interval"
+            } else {
+                "turn"
+            }
+            .into(),
+            provenance: CostProvenance::Reported,
+        })
+    }
+
+    /// Native interruption acknowledgement and correlated permission
+    /// declines are chunk D's caller-owned seams. Without that evidence,
+    /// interrupted is always the packet's `failed/vendor_error` terminal.
+    pub(super) fn terminal(&self, data: &EventData, at: Instant) -> Option<VendorTerminal> {
+        let EventData::Execution {
+            kind,
+            error,
+            reason,
+        } = data
+        else {
+            return None;
+        };
+        let (status, stop_reason, vendor_stop_reason, vendor_code, class_hint, detail) = match kind
+        {
+            ExecutionKind::Started => return None,
+            ExecutionKind::Succeeded => {
+                let finish = self.finish.as_deref().unwrap_or("other");
+                let stop = match finish {
+                    "stop" => StopReason::EndTurn,
+                    "length" => StopReason::Budget,
+                    "content-filter" => StopReason::Refusal,
+                    _ => StopReason::Other,
+                };
+                (
+                    VendorTerminalStatus::Completed,
+                    stop,
+                    bounded(finish),
+                    None,
+                    None,
+                    None,
+                )
+            }
+            ExecutionKind::Failed => (
+                VendorTerminalStatus::Failed,
+                StopReason::Error,
+                "failed".into(),
+                error.as_ref().map(|error| bounded(&error.code)),
+                Some(error.as_ref().map_or(ClassHint::VendorError, class_hint)),
+                Some("OpenCode execution failed".into()),
+            ),
+            ExecutionKind::Interrupted => (
+                VendorTerminalStatus::Failed,
+                StopReason::Other,
+                bounded(reason.as_deref().unwrap_or("unknown")),
+                Some(format!(
+                    "interrupted:{}",
+                    bounded(reason.as_deref().unwrap_or("unknown"))
+                )),
+                Some(ClassHint::VendorError),
+                Some("OpenCode execution was interrupted".into()),
+            ),
+        };
+        let vendor = self.sum(|sample| sample.cache_write).and_then(|count| {
+            // A fixed tiny JSON object is serializable; if serialization
+            // nevertheless fails, auxiliary vendor data is unavailable.
+            serde_json::value::to_raw_value(&serde_json::json!({"cacheWriteInputTokens":count}))
+                .ok()
+        });
+        Some(VendorTerminal {
+            at,
+            status,
+            stop_reason,
+            vendor_stop_reason,
+            vendor_code,
+            class_hint,
+            detail,
+            structured_output: None,
+            structured_output_unparsed: None,
+            steps: None,
+            usage: Some(self.usage()),
+            cost: self.cost(),
+            vendor,
+        })
+    }
+}
+
+fn model_progress() -> Observation {
+    Observation::Progress(ProgressMarks {
+        model: true,
+        ..ProgressMarks::default()
+    })
+}
+
+fn class_hint(error: &VendorError) -> ClassHint {
+    if matches!(error.status, Some(401 | 403)) || error.code == "provider.auth" {
+        ClassHint::Auth
+    } else if error.status == Some(429) || error.code == "provider.rate-limit" {
+        ClassHint::RateLimit
+    } else if error.code == "provider.quota" {
+        ClassHint::BudgetExceeded
+    } else {
+        ClassHint::VendorError
+    }
+}
+
+fn bounded(text: &str) -> String {
+    text.chars().take(256).collect()
+}

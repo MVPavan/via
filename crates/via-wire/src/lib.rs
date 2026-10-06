@@ -3,8 +3,8 @@
 
 pub use via_host::{
     CapacityToken, CleanupEvidence, CloseMode, CloseRequest, EnvAllowList, ExitReport,
-    FenceRefusal, HostError, LaunchCause, PrivateProcessSpec, ProbeFailure, ProcessOwner,
-    StderrCapture, TurnNumber, VersionProbe,
+    FenceRefusal, HostError, LaunchCause, LeftoverProcess, LeftoverReport, LeftoverScope,
+    PrivateProcessSpec, ProbeFailure, ProcessOwner, StderrCapture, TurnNumber, VersionProbe,
 };
 pub use via_store::{
     AnchorCohort, CommitOutcome, Deadline, RuntimeResources, ServerId, SessionId, StoreFailureKind,

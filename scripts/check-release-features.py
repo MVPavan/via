@@ -257,6 +257,17 @@ def private_dirs(root):
 
 
 def environment(paths, fake, fixture, activation):
+    home = paths["state"].parent / "home"
+    private_env_dirs = {
+        "HOME": home,
+        "XDG_CONFIG_HOME": home / "config",
+        "XDG_DATA_HOME": home / "data",
+        "XDG_STATE_HOME": home / "state",
+        "XDG_CACHE_HOME": home / "cache",
+        "XDG_RUNTIME_DIR": paths["runtime"],
+    }
+    for path in private_env_dirs.values():
+        path.mkdir(mode=0o700, exist_ok=True)
     env = {
         "PATH": os.environ.get("PATH", ""),
         "VIA_STATE_DIR": str(paths["state"]),
@@ -265,6 +276,7 @@ def environment(paths, fake, fixture, activation):
         "VIA_FAKE_SCENARIO": str(fixture),
         "VIA_FAKE_SYNC_DIR": str(paths["sync"]),
     }
+    env.update({name: str(path) for name, path in private_env_dirs.items()})
     env.update(activation)
     return env
 

@@ -103,18 +103,18 @@ fn with(mut fixture: Value, key: &str, value: Value) -> Value {
 
 /// One registry over a real Route runtime whose anchor is the built `via`,
 /// and the fake vendor as `opencode` in a folder of its own.
-struct Rig {
+pub(super) struct Rig {
     store: TestRuntime,
-    runtime: Arc<RouteRuntime>,
-    servers: Arc<Servers>,
+    pub(super) runtime: Arc<RouteRuntime>,
+    pub(super) servers: Arc<Servers>,
     adapter: OpenCodeServers,
     /// The fake's folder, kept for the test's life.
     _fake: tempfile::TempDir,
-    program: PathBuf,
+    pub(super) program: PathBuf,
 }
 
 impl Rig {
-    fn new(fixture: &Value) -> Self {
+    pub(super) fn new(fixture: &Value) -> Self {
         Self::bounded(fixture, HANDSHAKE)
     }
 
@@ -144,7 +144,7 @@ impl Rig {
         rig
     }
 
-    fn fixture(&self, fixture: &Value) {
+    pub(super) fn fixture(&self, fixture: &Value) {
         std::fs::write(
             self.side(".opencode.json"),
             serde_json::to_vec(fixture).unwrap(),
@@ -172,7 +172,7 @@ impl Rig {
     }
 
     /// The requests the fake servers answered, in order.
-    fn requests(&self) -> Vec<Value> {
+    pub(super) fn requests(&self) -> Vec<Value> {
         self.lines(".requests")
     }
 
@@ -184,7 +184,7 @@ impl Rig {
     }
 
     /// The test's own root: `state/`, `runtime/` and `vendor/`.
-    fn root(&self) -> PathBuf {
+    pub(super) fn root(&self) -> PathBuf {
         self.vendor_state_dir().parent().unwrap().to_owned()
     }
 
@@ -235,7 +235,7 @@ impl Rig {
 
     /// Fences the registry, joins it beside the runtime's shutdown, and
     /// proves every fake server gone.
-    async fn finish(self) {
+    pub(super) async fn finish(self) {
         // As `AdapterSet::shutdown`: fenced, then joined beside Host's
         // shutdown, which stops every live server.
         self.servers.fence();
@@ -248,6 +248,27 @@ impl Rig {
         for report in self.reports() {
             gone(pid(&report)).await;
         }
+        let pattern = format!("^{}( |$)", self.program.display());
+        let root = self.root();
+        let found = std::process::Command::new("pgrep")
+            .args(["-f", &pattern])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &root)
+            .env("XDG_CONFIG_HOME", &root)
+            .env("XDG_DATA_HOME", &root)
+            .env("XDG_STATE_HOME", &root)
+            .env("XDG_CACHE_HOME", &root)
+            .env("XDG_RUNTIME_DIR", &root)
+            .env("TMPDIR", &root)
+            .output()
+            .unwrap();
+        assert_eq!(
+            found.status.code(),
+            Some(1),
+            "owned fake remains: {}",
+            String::from_utf8_lossy(&found.stdout)
+        );
         drop(self.store);
     }
 }

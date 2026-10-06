@@ -1532,6 +1532,8 @@ pub(super) struct VendorRecord {
     /// The turn aggregate a turn's end carried without a terminal (C2 §5,
     /// `TurnEnd.aggregate`).
     pub(super) aggregate: Option<via_adapters::UsageSample>,
+    /// The explicit report-only snapshot carried by this turn end (AD20).
+    pub(super) leftovers: Option<via_adapters::LeftoverReport>,
     /// The turn's acceptance found every tombstone taken (C2 §4.1,
     /// critical r1 #6): the lane overflowed, and the turn fails `overflow`.
     pub(super) overflowed: bool,

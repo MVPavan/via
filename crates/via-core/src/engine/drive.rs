@@ -1857,7 +1857,7 @@ impl Engine {
         let TurnEnd {
             terminal,
             instance,
-            leftovers: _,
+            leftovers,
             outcome,
             loss,
             aggregate,
@@ -1878,6 +1878,7 @@ impl Engine {
             (instance.vendor_version, tested)
         });
         record.vendor.retained = terminal.as_ref().map(Retained::of);
+        record.vendor.leftovers = leftovers;
         // C2 §5 (bead via-i5g): a turn ending with no terminal may still
         // carry the turn's aggregate (an all-null one after delivery
         // loss), which supersedes its call samples as a terminal's would.

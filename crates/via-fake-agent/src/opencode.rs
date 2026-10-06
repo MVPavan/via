@@ -18,15 +18,17 @@
 //!   authentication (401 otherwise, or always with `"auth": "reject"`),
 //!   logged as one line of `<name>.requests` (pid, method, target, auth
 //!   `ok`, `bad` or `none`, and its JSON body, else `null`; never a
-//!   credential) before it is answered, and
-//!   answered by the first route whose method and path match: its
-//!   responses in order, the last repeated. JSON bodies have `"$PID"`
-//!   replaced by the process ID. A route with `sse` answers an event
-//!   stream: its raw prefix, its events as `data:` lines, then heartbeat
-//!   comments, closing after `close_after_ms` when set. Anything else is
-//!   404.
+//!   credential) before it is answered by the first matching route:
+//!   responses in order, the last repeated. JSON bodies replace `$PID`
+//!   with the process ID, `$INPUT` with the request's input ID and
+//!   `$SESSION` with the session in the URL. Responses may release an
+//!   ordered `emit` sequence to the single SSE client, before or after
+//!   their answer. Frames are events, or controls `{pause_ms}`, `{exit}`,
+//!   `{close}`, `{raw_data}`. A route with `sse` sends its raw prefix and
+//!   static events, consumes the released frames and sends heartbeats,
+//!   closing after `close_after_ms` when set. Anything else is 404.
 
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{VecDeque, hash_map::DefaultHasher};
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
@@ -141,6 +143,16 @@ struct Response {
     /// Pads a JSON body with spaces to at least this many bytes.
     #[serde(default)]
     pad_to: Option<usize>,
+    /// Ordered SSE frames released by this response. `$INPUT` and
+    /// `$SESSION` refer to the triggering prompt body and URL.
+    #[serde(default)]
+    emit: Vec<Value>,
+    /// Release frames before answering, proving SSE-first acceptance.
+    #[serde(default)]
+    #[serde(rename = "emit_before_response")]
+    emit_early: bool,
+    #[serde(default)]
+    sleep_ms: u64,
 }
 
 #[derive(Clone, Deserialize)]
@@ -259,6 +271,9 @@ fn run(argv0: &Path, fixture_path: &Path) -> Result<i32, Box<dyn std::error::Err
         expected,
         requests: sibling(argv0, ".requests"),
         counters: std::sync::Mutex::default(),
+        frames: std::sync::Mutex::default(),
+        frames_log: sibling(argv0, ".frames"),
+        started: std::time::Instant::now(),
     });
     for stream in listener.incoming() {
         let stream = stream?;
@@ -335,6 +350,10 @@ struct Shared {
     requests: PathBuf,
     /// How many requests each route answered.
     counters: std::sync::Mutex<std::collections::HashMap<usize, usize>>,
+    /// One ordered stream consumed by the server's single SSE client.
+    frames: std::sync::Mutex<VecDeque<Value>>,
+    frames_log: PathBuf,
+    started: std::time::Instant,
 }
 
 fn serve(shared: &Shared, stream: TcpStream) -> Result<(), Box<dyn std::error::Error>> {
@@ -373,7 +392,8 @@ fn serve(shared: &Shared, stream: TcpStream) -> Result<(), Box<dyn std::error::E
     append(
         &shared.requests,
         &json!({"pid": process::id(), "method": method, "target": target, "auth": auth,
-            "body": serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null)}),
+            "body": serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null),
+            "received_ms": shared.started.elapsed().as_millis()}),
     )?;
     let mut stream = stream;
     if auth != "ok" || matches!(shared.fixture.auth, Auth::Reject) {
@@ -397,7 +417,7 @@ fn serve(shared: &Shared, stream: TcpStream) -> Result<(), Box<dyn std::error::E
         return respond(&mut stream, 404, "application/json", &[], body, None);
     };
     if let Some(sse) = &route.sse {
-        return stream_events(&mut stream, sse);
+        return stream_events(shared, &mut stream, sse);
     }
     let answered = {
         let mut counters = shared.counters.lock().map_err(|_| "poisoned")?;
@@ -413,10 +433,34 @@ fn serve(shared: &Shared, stream: TcpStream) -> Result<(), Box<dyn std::error::E
     else {
         return respond(&mut stream, 500, "application/json", &[], b"{}", None);
     };
+    let session = path
+        .strip_prefix("/api/session/")
+        .and_then(|tail| tail.split('/').next())
+        .unwrap_or_default();
+    reply(shared, &mut stream, &response, &body, session)
+}
+
+fn reply(
+    shared: &Shared,
+    stream: &mut TcpStream,
+    response: &Response,
+    body: &[u8],
+    session: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let input: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+    let expand = |value: &Value| substitute(value, &input, session);
+    if response.emit_early {
+        shared
+            .frames
+            .lock()
+            .map_err(|_| "poisoned")?
+            .extend(response.emit.iter().map(expand));
+    }
+    thread::sleep(Duration::from_millis(response.sleep_ms));
     let (content_type, mut bytes) = match (&response.json, &response.raw) {
         (Some(value), _) => (
             "application/json",
-            value
+            expand(value)
                 .to_string()
                 .replace("\"$PID\"", &process::id().to_string())
                 .into_bytes(),
@@ -431,13 +475,43 @@ fn serve(shared: &Shared, stream: TcpStream) -> Result<(), Box<dyn std::error::E
     }
     let content_type = response.content_type.as_deref().unwrap_or(content_type);
     respond(
-        &mut stream,
+        stream,
         response.status,
         content_type,
         &response.headers,
         &bytes,
         response.declared_length,
-    )
+    )?;
+    if !response.emit_early {
+        shared
+            .frames
+            .lock()
+            .map_err(|_| "poisoned")?
+            .extend(response.emit.iter().map(expand));
+    }
+    Ok(())
+}
+
+fn substitute(value: &Value, input: &Value, session: &str) -> Value {
+    match value {
+        Value::String(text) if text.contains("$INPUT") => {
+            Value::String(text.replace("$INPUT", input["id"].as_str().unwrap_or_default()))
+        }
+        Value::String(text) if text == "$SESSION" => Value::String(session.to_owned()),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| substitute(item, input, session))
+                .collect(),
+        ),
+        Value::Object(members) => Value::Object(
+            members
+                .iter()
+                .map(|(key, item)| (key.clone(), substitute(item, input, session)))
+                .collect(),
+        ),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => value.clone(),
+    }
 }
 
 fn respond(
@@ -472,7 +546,11 @@ fn chunk(stream: &mut TcpStream, bytes: &[u8]) -> io::Result<()> {
     stream.flush()
 }
 
-fn stream_events(stream: &mut TcpStream, sse: &Sse) -> Result<(), Box<dyn std::error::Error>> {
+fn stream_events(
+    shared: &Shared,
+    stream: &mut TcpStream,
+    sse: &Sse,
+) -> Result<(), Box<dyn std::error::Error>> {
     if sse.status != 200 {
         return respond(stream, sse.status, "application/json", &[], b"{}", None);
     }
@@ -492,20 +570,42 @@ fn stream_events(stream: &mut TcpStream, sse: &Sse) -> Result<(), Box<dyn std::e
         chunk(stream, &line)?;
     }
     let started = std::time::Instant::now();
+    let mut heartbeat_at = started;
     loop {
-        let step = Duration::from_millis(sse.heartbeat_ms.clamp(1, 50));
-        let mut waited = Duration::ZERO;
-        while waited < Duration::from_millis(sse.heartbeat_ms) {
-            if let Some(ms) = sse.close_after_ms
-                && started.elapsed() >= Duration::from_millis(ms)
-            {
+        let frame = shared.frames.lock().map_err(|_| "poisoned")?.pop_front();
+        if let Some(frame) = frame {
+            if let Some(ms) = frame["pause_ms"].as_u64() {
+                thread::sleep(Duration::from_millis(ms));
+            } else if frame["close"] == true {
                 let _ = stream.shutdown(std::net::Shutdown::Both);
                 return Ok(());
+            } else if frame["exit"] == true {
+                process::exit(CRASHED);
+            } else if let Some(raw) = frame["raw_data"].as_str() {
+                chunk(stream, format!("data: {raw}\n\n").as_bytes())?;
+            } else {
+                // Record the start of the write before making the event
+                // visible: a subsequent request cannot race the audit append.
+                append(
+                    &shared.frames_log,
+                    &json!({"type": frame["type"], "written_ms": shared.started.elapsed().as_millis()}),
+                )?;
+                chunk(stream, format!("data: {frame}\n\n").as_bytes())?;
             }
-            thread::sleep(step);
-            waited += step;
+            continue;
         }
-        chunk(stream, b": heartbeat\n\n")?;
+        if sse
+            .close_after_ms
+            .is_some_and(|ms| started.elapsed() >= Duration::from_millis(ms))
+        {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return Ok(());
+        }
+        if heartbeat_at.elapsed() >= Duration::from_millis(sse.heartbeat_ms) {
+            chunk(stream, b": heartbeat\n\n")?;
+            heartbeat_at = std::time::Instant::now();
+        }
+        thread::sleep(Duration::from_millis(5));
     }
 }
 

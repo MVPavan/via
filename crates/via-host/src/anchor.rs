@@ -537,9 +537,7 @@ async fn spawn_vendor(
             return Err(error);
         }
     };
-    let vendor_pid = child
-        .id()
-        .ok_or_else(|| io::Error::other("missing vendor pid"))?;
+    let (vendor_pid, spawned) = spawned_facts(&child)?;
     if let Some(lock) = lock {
         // The write runs on the blocking pool; Host's EOF and `SIGTERM` are
         // still served meanwhile.
@@ -583,7 +581,7 @@ async fn spawn_vendor(
             }
         }
     }
-    if protocol::write_message(stream, &Reply::Spawned { pid: vendor_pid }, 1024)
+    if protocol::write_message(stream, &spawned, 1024)
         .await
         .is_err()
     {
@@ -594,6 +592,17 @@ async fn spawn_vendor(
         ));
     }
     Ok((child, vendor_pid, log))
+}
+
+/// Read the passive start bound while the unreaped child prevents pid reuse.
+/// Missing metadata suppresses candidate environment reads in a later report.
+fn spawned_facts(child: &Child) -> io::Result<(u32, Reply)> {
+    let pid = child
+        .id()
+        .ok_or_else(|| io::Error::other("missing vendor pid"))?;
+    // An unavailable start bound is reported as incomplete, never authority.
+    let start_ticks = linux::process_stat(pid).map(|(_, ticks)| ticks).ok();
+    Ok((pid, Reply::Spawned { pid, start_ticks }))
 }
 
 /// Writes the server record naming the unreaped child `pid` through the

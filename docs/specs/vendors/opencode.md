@@ -695,8 +695,8 @@ refusal cache).
 
 | C2 operation | OpenCode 2.0.22 mapping | Evidence |
 |---|---|---|
-| `describe` / `plan` | Process-free: bundled profile, effort mapping, last version and cached catalog for this program path; refusals per §12; `server_key` from §3.1 | — |
-| `models` | Bundled entries plus the cached `GET /api/model` catalog of a live owned server (public fields only) | E9 |
+| `describe` / `plan` | Process-free: profile, effort mapping, last version and the live server's catalog only (no bundled entries or per-program catalog cache); refusals per §12; `server_key` from §3.1. The session refusal digest is checked in `run_turn`, not `plan` | — |
+| `models` | The live owned server's `GET /api/model` catalog only (public fields; no bundled entries or per-program catalog cache) | E9 |
 | `check_turn` | Pure: `full,network:true` only; same refusals as `plan`; the prompt admission bound (§9); no location-dependent effort check: a variant is judged in `run_turn` (§5) | E9, E47 |
 | `prepare` / `readiness` | `Pinned(Server)` when the OpenCode server is live or launching and not draining, else `NeedsConnection`; readiness changes on publication, drain start (§8) and retirement | C2 §3 |
 | First `run_turn` of a connection generation, new session | `POST /api/session {model, agent:"via", location, permissions}`; persist the returned `ses_…` ID via `session.vendor_identity_confirmed`; then the instruction entry and readback. Never send a caller-chosen session ID: the free tier rejects it (403 FreeTierError, E29) | E7, E16, E29 |

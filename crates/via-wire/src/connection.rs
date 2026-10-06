@@ -1226,6 +1226,16 @@ impl WireSender {
         }
     }
 
+    /// Takes the explicit report-only snapshot after close for the route's
+    /// existing destination, using its unchanged close deadline.
+    pub async fn report_leftovers(
+        &self,
+        scope: super::LeftoverScope,
+        deadline: Deadline,
+    ) -> super::LeftoverReport {
+        self.process.control.report_leftovers(scope, deadline).await
+    }
+
     /// Observes Host-confirmed vendor exit without treating a terminal
     /// message as exit proof. A recorded exit is returned without
     /// consulting the daemon force: the caller reads the force after it

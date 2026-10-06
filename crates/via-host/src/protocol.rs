@@ -176,6 +176,8 @@ pub(crate) enum Reply {
     Configured,
     Spawned {
         pid: u32,
+        /// Passive vendor start bound for the report-only scan.
+        start_ticks: Option<u64>,
     },
     Status {
         pid: Option<u32>,
