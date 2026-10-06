@@ -760,6 +760,10 @@ impl<'a> Run<'a> {
 
     /// Runs one planned turn beside its side actions and collects its
     /// outcome.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one turn's drive: its drain with Core's idle deadline, side actions and outcome"
+    )]
     async fn run_turn(
         &self,
         index: usize,
@@ -802,14 +806,16 @@ impl<'a> Run<'a> {
             let waiting = self.consumer_hold();
             tokio::pin!(waiting);
             let mut released = None;
+            let mut idle = Idle::new(now, idle_budget(turn), &activity);
             let end = {
                 let running = session.driver.run_turn(spec, cx);
                 tokio::pin!(running);
                 loop {
+                    let taking = released.is_some() && !self.knobs.stall_consumer;
                     tokio::select! {
                         result = &mut waiting, if released.is_none() => released = Some(result),
-                        Some(admitted) = receiver.recv(),
-                            if released.is_some() && !self.knobs.stall_consumer => {
+                        Some(admitted) = receiver.recv(), if taking => {
+                            idle.note(&admitted.item);
                             tools.borrow_mut().track(&admitted.item);
                             self.observe(&admitted.item, (session, index), seen, &observed);
                             if self.knobs.abandon_on_accept == Some(index)
@@ -818,10 +824,22 @@ impl<'a> Run<'a> {
                                 break None;
                             }
                         }
+                        () = idle.fired(), if taking => {}
                         end = &mut running => {
                             settled.set(Some(tokio::time::Instant::now()));
                             break Some(end);
                         }
+                    }
+                    // Core's idle decision behind its decode fence: the
+                    // items queued then are handled first; a deadline they
+                    // moved stands.
+                    if taking && idle.reconciled(&stop) {
+                        while let Ok(admitted) = receiver.try_recv() {
+                            idle.note(&admitted.item);
+                            tools.borrow_mut().track(&admitted.item);
+                            self.observe(&admitted.item, (session, index), seen, &observed);
+                        }
+                        idle.expire(&stop);
                     }
                 }
             };
@@ -1642,6 +1660,97 @@ fn shutdown_problem(report: &AdapterShutdown, panicked: usize) -> Option<String>
             report.pending_tasks, report.failed_tasks, report.uncertain_anchors, report.failure
         )
     })
+}
+
+/// C1 §4 `deadlines.idle_ms` default.
+const IDLE: Duration = Duration::from_secs(600);
+
+/// A turn's idle budget: its own, else C1's default.
+fn idle_budget(turn: &Value) -> Duration {
+    turn["deadlines"]["idle_ms"]
+        .as_u64()
+        .map_or(IDLE, Duration::from_millis)
+}
+
+/// The turn's idle deadline as Core keeps it (Task 4 design §§2.6, 5;
+/// runtime §8; review r1 #5): Core's own progress rule moves it to an
+/// item's decode stamp plus the budget; when it fires, the decision waits
+/// for the Adapter to deliver everything Route had read by then, and the
+/// items queued then are handled first. Still passed, it orders the stop
+/// Core's idle expiry orders. Any other order disarms it.
+struct Idle {
+    at: Option<tokio::time::Instant>,
+    budget: Duration,
+    activity: TurnActivity,
+    delivered: watch::Receiver<u64>,
+    /// The decode watermark when the deadline fired.
+    fence: Option<u64>,
+}
+
+impl Idle {
+    fn new(origin: tokio::time::Instant, budget: Duration, activity: &TurnActivity) -> Self {
+        Self {
+            at: Some(origin + budget),
+            budget,
+            activity: activity.clone(),
+            delivered: activity.watch_delivered(),
+            fence: None,
+        }
+    }
+
+    /// Core's `note_progress`: progress decoded before the deadline moves
+    /// it.
+    fn note(&mut self, item: &ObservationItem) {
+        if let Some(at) = self.at.as_mut()
+            && item.at < *at
+            && via_core::idle_progress(&item.observation)
+        {
+            *at = (*at).max(item.at + self.budget);
+        }
+    }
+
+    /// Resolves when the deadline fires (fencing it at the watermark then),
+    /// or, once fenced, when delivery advances.
+    async fn fired(&mut self) {
+        if self.fence.is_some() {
+            let _ = self.delivered.changed().await;
+            return;
+        }
+        match self.at {
+            Some(at) => {
+                tokio::time::sleep_until(at).await;
+                self.fence = Some(self.activity.decoded());
+            }
+            None => std::future::pending().await,
+        }
+    }
+
+    /// Whether a fired deadline's fence is met; an order disarms it.
+    fn reconciled(&mut self, stop: &watch::Sender<Option<StopOrder>>) -> bool {
+        if stop.borrow().is_some() {
+            self.at = None;
+            self.fence = None;
+            return false;
+        }
+        self.fence
+            .is_some_and(|watermark| self.activity.delivered() >= watermark)
+    }
+
+    /// After the queued items: a deadline still passed orders the stop.
+    fn expire(&mut self, stop: &watch::Sender<Option<StopOrder>>) {
+        self.fence = None;
+        let now = tokio::time::Instant::now();
+        if self.at.is_some_and(|at| at <= now) {
+            self.at = None;
+            stop.send_replace(Some(StopOrder {
+                cause: StopCause::IdleDeadline,
+                requested_at: "2026-01-01T00:00:00.000Z".to_owned(),
+                attached: now,
+                force_at: Deadline::at(now + STOP_FORCE),
+                close_by: Deadline::at(now + STOP_FORCE + CLOSE_BY),
+            }));
+        }
+    }
 }
 
 /// A turn's wall and tool grace: its own, else the defaults.

@@ -1979,9 +1979,9 @@ fn pi_progress_deltas() {
     // `text_start` and the eight deltas, then the `message_end` sample;
     // `text_end` is activity.
     wanted["observation_counts"]["progress"] = json!(10);
-    let mut turn = turn("Count slowly.", wanted);
-    turn["deadlines"] = json!({"wall_ms": 20_000, "idle_ms": 1_000});
-    let expect = case("pi_progress_deltas", 1, vec![turn]);
+    let mut streamed = turn("Count slowly.", wanted);
+    streamed["deadlines"] = json!({"wall_ms": 20_000, "idle_ms": 1_000});
+    let expect = case("pi_progress_deltas", 1, vec![streamed]);
     let fences = std::cell::RefCell::new(None);
     let outcome = drive_built(
         "pi_progress_deltas",
@@ -2007,6 +2007,37 @@ fn pi_progress_deltas() {
         decoded, delivered,
         "the turn settled before its decode fence"
     );
+    // Review r1 #5: the runner keeps the turn's idle deadline as Core
+    // does. A stream silent past `idle_ms` is stopped (Pi gets the
+    // abort; the turn has no stop of its own), so a broken progress mark
+    // or idle reconciliation fails the case above.
+    let mut steps = handshake(&State::default());
+    steps.extend(prompt("Count slowly."));
+    steps.extend(echo("Count slowly."));
+    steps.push(emit(&json!({"type": "message_start", "message": pending})));
+    steps.push(update(json!({"type": "text_start", "contentIndex": 0})));
+    steps.push(json!({"delay": {"ms": 1_500}}));
+    steps.push(expect_id(json!({"type": "abort"}), "ab"));
+    let aborted = assistant(json!([]), "aborted", &zero_usage(), None);
+    steps.push(message_end(&aborted));
+    steps.extend(settle(&aborted));
+    steps.push(emit_line(&reply("ab", "abort", true, &Value::Null)));
+    steps.push(eof());
+    let replay = single(
+        "synthetic (review r1 #5): a stream silent past its idle deadline",
+        argv(Argv::default()),
+        steps,
+    );
+    let mut wanted = completed(1, "");
+    wanted["terminal"] = json!({"status": "interrupted", "stop_reason": "interrupted",
+        "vendor_stop_reason": "aborted", "class_hint": null});
+    wanted["final_text"] = Value::Null;
+    unset(&mut wanted, "usage");
+    wanted["observations_exclude"] = json!(["final_text"]);
+    let mut idle = turn("Count slowly.", wanted);
+    idle["deadlines"] = json!({"wall_ms": 20_000, "idle_ms": 500});
+    let expect = case("pi_progress_idle", 1, vec![idle]);
+    check_built("pi_progress_idle", &replay, &expect, Knobs::default()).unwrap();
 }
 
 /// `pi_usage_accounting` (packet §5.5): cache and reasoning counters map
@@ -2245,9 +2276,20 @@ fn pi_abort() {
         wanted,
     )
     .unwrap();
-    // Pi exits before the reply (review r1 #1): the marker is not
-    // retained either, and the stop order's row applies; nothing is
-    // forced, Pi ended on its own.
+}
+
+/// `pi_abort` (packet §7.1, review r1 #1): Pi exits before the abort's
+/// reply. A marker terminal is not retained either, and the stop order's
+/// row applies (nothing forced: Pi ended on its own); an ordinary
+/// terminal stands.
+#[test]
+fn pi_abort_exit_before_reply() {
+    let marker = assistant(
+        json!([]),
+        "error",
+        &zero_usage(),
+        Some("This operation was aborted"),
+    );
     let mut after = tool_end(true);
     after.push(message_end(&marker));
     after.extend(settle(&marker));
@@ -2264,6 +2306,12 @@ fn pi_abort() {
     )
     .unwrap();
     // An ordinary terminal stands when Pi exits before the reply.
+    let done = assistant(
+        json!([{"type": "text", "text": "READY"}]),
+        "stop",
+        &canonical_usage(),
+        None,
+    );
     let mut after = vec![message_end(&done)];
     after.extend(settle(&done));
     after.push(json!({"exit": {"code": 0, "stderr": ""}}));

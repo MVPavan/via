@@ -45,6 +45,8 @@ mod terminal;
 mod tests;
 
 pub use batch::FailureBatches;
+#[cfg(feature = "test-support")]
+pub use drive::idle_progress;
 use journal::{Head, UncertainEvent, Unresolved};
 use latch::{FailureSite, WriteOutcome};
 use queue::{DAEMON_QUEUE_LIMIT, Slot};

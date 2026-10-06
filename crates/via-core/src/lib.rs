@@ -87,6 +87,10 @@ mod schema;
 /// design §6.4, §13.2).
 #[cfg(feature = "test-failpoints")]
 pub use engine::envelope_at_maximum;
+/// Test builds only: Core's meaningful-progress rule, which moves a
+/// turn's idle deadline (Task 4 design §2.6), for the conformance runner.
+#[cfg(feature = "test-support")]
+pub use engine::idle_progress;
 /// Test builds only: a turn's envelope `usage` through Core's own ledger
 /// (C2 §5 AD6), for the conformance runner.
 #[cfg(feature = "test-support")]

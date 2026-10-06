@@ -3243,6 +3243,13 @@ fn expired(lane: Option<&Lane>, observation: &Observation) {
     }
 }
 
+/// Test builds only (`test-support`): Core's meaningful-progress rule
+/// ([`progress`]), for the conformance runner's idle deadline.
+#[cfg(feature = "test-support")]
+pub fn idle_progress(observation: &Observation) -> bool {
+    progress(observation)
+}
+
 /// Meaningful progress resets the idle deadline (Task 4 design §2.6):
 /// acceptance, and a `progress` item with a `model` mark or a tool start or
 /// end. Usage-only items never do; unknown messages send no item.
