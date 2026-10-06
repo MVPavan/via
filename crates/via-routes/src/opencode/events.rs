@@ -135,7 +135,7 @@ pub enum EventData {
         kind: TextKind,
         /// Assistant key.
         assistant_message_id: String,
-        /// Piece order.
+        /// Piece order (§7.3); unused starts/reasoning default to zero.
         ordinal: u64,
         /// Text only, never prompt echo.
         text: String,
@@ -373,10 +373,18 @@ fn text_payload(kind: TextKind, field: Option<&str>, data: &Value) -> Result<Eve
         .map(|field| string(data, field))
         .transpose()?
         .unwrap_or_default();
+    // §7.3 needs final text ordering. E19 observes ordinals on starts and
+    // reasoning too, but §7.1 does not require them for those observations.
+    let ordinal = counter(data, "ordinal")?;
+    let ordinal = if matches!(kind, TextKind::Started | TextKind::Reasoning) {
+        ordinal.unwrap_or_default()
+    } else {
+        ordinal.ok_or(())?
+    };
     Ok(EventData::Text {
         kind,
         assistant_message_id: string(data, "assistantMessageID")?,
-        ordinal: counter(data, "ordinal")?.ok_or(())?,
+        ordinal,
         text,
     })
 }
@@ -515,6 +523,38 @@ mod tests {
             Err(DecodeError::Session("ses_one".into()))
         );
         assert_eq!(decode(b"<not-json>"), Err(DecodeError::Generation));
+    }
+
+    #[test]
+    fn oc06_boundary_unused_ordinals_are_optional_but_final_text_order_is_required() {
+        for kind in [
+            "session.text.started",
+            "session.reasoning.started",
+            "session.reasoning.delta",
+            "session.reasoning.ended",
+        ] {
+            let decoded = decode(&event(
+                kind,
+                json!({"sessionID":"ses_one","assistantMessageID":"msg_one",
+                    "delta":"thinking","text":"thinking"}),
+            ));
+            assert!(decoded.is_ok(), "{kind}: {decoded:?}");
+        }
+        assert_eq!(
+            decode(&event(
+                "session.text.ended",
+                json!({"sessionID":"ses_one","assistantMessageID":"msg_one","text":"answer"}),
+            )),
+            Err(DecodeError::Session("ses_one".into()))
+        );
+        assert_eq!(
+            decode(&event(
+                "session.reasoning.delta",
+                json!({"sessionID":"ses_one","assistantMessageID":"msg_one",
+                    "delta":"thinking","ordinal":"wrong type"}),
+            )),
+            Err(DecodeError::Session("ses_one".into()))
+        );
     }
 
     #[test]

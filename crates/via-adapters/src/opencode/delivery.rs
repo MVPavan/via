@@ -1,4 +1,4 @@
-//! One ordered consumer per `OpenCode` session, retained across turns.
+//! `opencode.md` §7.1–§7.3: one ordered consumer per session across turns.
 //!
 //! Terminal delivery freezes the lane until its turn seals. A later lane or
 //! generation failure therefore cannot replace a terminal already retained.
@@ -11,7 +11,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use via_routes::codex::LossCause;
 use via_routes::opencode::events::{EventData, InboxKind};
-use via_routes::opencode::router::{Lane, LaneFailure, LaneItem, Routed};
+use via_routes::opencode::router::{LANE_MESSAGES, Lane, LaneFailure, LaneItem, Routed};
 use via_routes::opencode::{GenerationEnd, Server};
 
 use super::normalize::Normalizer;
@@ -114,7 +114,7 @@ impl Delivery {
             state.terminal.is_some(),
             state.complete && state.early.is_empty(),
             state.last_read,
-            self.lane.earliest_unobserved(),
+            self.lane.earliest_unobserved(self.turn),
         );
         self.sealed.cancel();
         state.had_terminal |= state.terminal.is_some();
@@ -125,7 +125,6 @@ impl Delivery {
             stop: state.stop,
             accounted,
         };
-        self.sealed.cancel();
         self.changed.notify_waiters();
         result
     }
@@ -151,7 +150,7 @@ impl Delivery {
         let position = state.early.front().map_or_else(
             || {
                 self.lane
-                    .earliest_unobserved()
+                    .earliest_unobserved(self.turn)
                     .unwrap_or(state.current.saturating_add(1))
             },
             |event| event.read_order,
@@ -247,22 +246,27 @@ impl Registration {
         }
     }
 
-    fn health_failure(&self, failure: LaneFailure) {
-        let turn = self
-            .turns
+    fn live_turn(&self) -> Option<TurnNumber> {
+        self.turns
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .keys()
-            .next_back()
-            .copied();
+            .iter()
+            .rev()
+            .find_map(|(number, delivery)| (!delivery.sealed.is_cancelled()).then_some(*number))
+    }
+
+    fn health_failure(&self, failure: LaneFailure) {
         let cause = match failure {
             LaneFailure::Overflow => DriverFailure::ObservationOverflow,
-            LaneFailure::Protocol => turn.map_or(DriverFailure::ObservationOverflow, |turn| {
-                DriverFailure::Route(RouteError::Protocol {
-                    turn,
-                    detail: "OpenCode session event protocol failure",
-                })
-            }),
+            LaneFailure::Protocol => {
+                self.live_turn()
+                    .map_or(DriverFailure::ObservationOverflow, |turn| {
+                        DriverFailure::Route(RouteError::Protocol {
+                            turn,
+                            detail: "OpenCode session event protocol failure",
+                        })
+                    })
+            }
         };
         latch(&self.health, cause);
     }
@@ -271,26 +275,27 @@ impl Registration {
         let GenerationEnd::Lost(loss) = end else {
             return;
         };
-        let turn = self
-            .turns
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .keys()
-            .next_back()
-            .copied();
-        let cause = match loss.cause {
-            LossCause::ServerLost => DriverFailure::ServerLost,
-            LossCause::Overflow => DriverFailure::ObservationOverflow,
-            LossCause::Protocol => turn.map_or(DriverFailure::ObservationOverflow, |turn| {
-                DriverFailure::Route(RouteError::Protocol {
-                    turn,
-                    detail: "OpenCode server event protocol failure",
-                })
-            }),
-            LossCause::TransportLost => turn.map_or(DriverFailure::OwnedTask, |turn| {
-                DriverFailure::Route(RouteError::TransportLost { turn })
-            }),
-        };
+        let cause = self.live_turn().map_or_else(
+            || match loss.cause {
+                LossCause::ServerLost => DriverFailure::ServerLost,
+                LossCause::Overflow | LossCause::Protocol => DriverFailure::ObservationOverflow,
+                LossCause::TransportLost => DriverFailure::OwnedTask,
+            },
+            |turn| match generation_route_error(loss.cause, turn) {
+                RouteError::ServerLost { .. } => DriverFailure::ServerLost,
+                RouteError::Overflow { .. } => DriverFailure::ObservationOverflow,
+                error @ (RouteError::Protocol { .. }
+                | RouteError::TransportLost { .. }
+                | RouteError::ProcessExited { .. }
+                | RouteError::Store { .. }
+                | RouteError::Stopped { .. }
+                | RouteError::Deadline { .. }
+                | RouteError::ForceStopped { .. }
+                | RouteError::HandshakeRefused { .. }
+                | RouteError::InvalidParam { .. }
+                | RouteError::ResumeMismatch { .. }) => DriverFailure::Route(error),
+            },
+        );
         latch(&self.health, cause);
     }
 
@@ -307,20 +312,26 @@ impl Registration {
                 }
                 continue;
             }
+            // Lane recv removes an item only when ready; end/cancel waits consume no state.
             let next = tokio::select! {
                 biased;
-                item=self.lane.recv()=>item,
-                end=server.wait_end()=>{
+                item = self.lane.recv() => item,
+                end = server.wait_end() => {
                     self.generation_health(end);
                     // The signal follows ingress admission; drain the queue
                     // before publishing it to any nonterminal turn.
-                    while let Some(item)=self.lane.pop() {
-                        if !self.process(item).await { return; }
+                    while let Some(item) = self.lane.pop() {
+                        if !self.process(item).await {
+                            return;
+                        }
                     }
                     self.fail(Stop::Generation(end));
                     return;
                 }
-                ()=cancel.cancelled()=>{self.fail(Stop::Detached);return;}
+                () = cancel.cancelled() => {
+                    self.fail(Stop::Detached);
+                    return;
+                }
             };
             if let Some(item) = next {
                 if !self.process(item).await {
@@ -350,6 +361,9 @@ impl Registration {
             }
         };
         let Some(turn) = self.turn(owner) else {
+            // A replaced driver's tombstone is not this driver's observation.
+            // Count its rejection against its own window, never a successor's.
+            self.lane.reject_unobserved(Some(owner), order);
             return true;
         };
         turn.activity.record(at);
@@ -379,7 +393,7 @@ impl Registration {
             let pending = {
                 let mut state = turn.lock();
                 if !state.accepted && !turn.sealed.is_cancelled() {
-                    if state.early.len() >= 16 {
+                    if state.early.len() >= LANE_MESSAGES {
                         self.loss_stop(&turn, &mut state, event.read_order);
                         return false;
                     }
@@ -552,8 +566,8 @@ impl Registration {
         // Reservation may be cancelled only before enqueue. The synchronous
         // send under the seal lock cannot race the driver's output cutoff.
         let reserved = tokio::select! {
-            reserved=self.sink.reserve(&item,event_stall())=>reserved,
-            ()=turn.sealed.cancelled(),if !late=>return true,
+            reserved = self.sink.reserve(&item, event_stall()) => reserved,
+            () = turn.sealed.cancelled(), if !late => return true,
         };
         if let Ok(reserved) = reserved {
             let _state = turn.lock();
@@ -571,8 +585,21 @@ impl Registration {
     }
 }
 
-/// A positive accounting predicate: a retained terminal, complete delivery,
-/// and no rejected route event preceding the last event delivered by the turn.
+/// `opencode.md` §10: one loss-cause mapping for health and turn outcomes.
+pub(super) fn generation_route_error(cause: LossCause, turn: TurnNumber) -> RouteError {
+    match cause {
+        LossCause::ServerLost => RouteError::ServerLost { turn },
+        LossCause::Protocol => RouteError::Protocol {
+            turn,
+            detail: "the server event envelope did not match the protocol",
+        },
+        LossCause::Overflow => RouteError::Overflow { turn },
+        LossCause::TransportLost => RouteError::TransportLost { turn },
+    }
+}
+
+/// C2 AD6, `opencode.md` §12: a retained terminal, complete delivery, and no rejection
+/// in this turn's live window preceding the last event delivered by the turn.
 fn honest_usage(terminal: bool, delivered: bool, last_read: u64, rejected: Option<u64>) -> bool {
     terminal && delivered && rejected.is_none_or(|order| order > last_read)
 }

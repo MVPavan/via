@@ -1,8 +1,8 @@
 //! One live `OpenCode` server generation (`vendors/opencode.md` §2, §10):
 //! its loopback HTTP client, its process control half, and the task that
 //! consumes its one event stream and its stdout until it retires or is
-//! lost. Event routing to sessions arrives with the turn path; until then
-//! the task counts events and keeps the transport's bounds.
+//! lost, routing decoded events to session lanes under §7.1 and retaining
+//! execution facts under §7.2.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -203,22 +203,21 @@ pub(crate) async fn run(
 ) -> GenerationEnd {
     let mut stdout_open = true;
     let cause = loop {
+        // Both readers retain partial framing when the other select arm wins.
         tokio::select! {
             biased;
             event = stream.next_event(SILENCE) => match event {
                 Ok(Some(event)) => {
                     server.events.fetch_add(1, Ordering::Relaxed);
-                    let at=Instant::now();
+                    let at = Instant::now();
                     match events::decode(event.data()) {
-                        Ok(event) => {
-                            if server.routing().dispatch(event,at).is_err() {
+                        Ok(event) => server.routing().dispatch(event, at),
+                        Err(error) => {
+                            let generation = matches!(error, DecodeError::Generation);
+                            let failed = server.routing().malformed(error).is_err();
+                            if generation || failed {
                                 break LossCause::Protocol;
                             }
-                        }
-                        Err(error) => {
-                            let generation=matches!(error,DecodeError::Generation);
-                            let failed=server.routing().malformed(error).is_err();
-                            if generation || failed { break LossCause::Protocol; }
                         }
                     }
                 }

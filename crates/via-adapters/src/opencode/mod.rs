@@ -19,6 +19,7 @@ use crate::{CapacityToken, ProcessOwner};
 
 mod delivery;
 mod driver;
+mod execution;
 mod launch;
 mod normalize;
 mod plan;

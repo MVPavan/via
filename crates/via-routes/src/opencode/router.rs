@@ -1,7 +1,6 @@
-//! Generation-owned `OpenCode` correlation, execution state and nonblocking lanes.
+//! Generation-owned `OpenCode` routing and admission (`opencode.md` §§7.1–7.2, §9).
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::sync::Notify;
@@ -12,6 +11,89 @@ use crate::DecodeWatermark;
 
 use super::events::{DecodeError, Event, EventData, ExecutionKind, InboxKind, StepKind, ToolKind};
 use super::state::{InputPhase, InputState, SessionState};
+
+/// Per-session ingress item limit (`opencode.md` §9).
+pub const LANE_MESSAGES: usize = 16;
+// Per-session ingress retained-byte limit (`opencode.md` §9).
+const LANE_BYTES: usize = 1024 * 1024;
+
+#[derive(Default)]
+struct RejectionWindow {
+    live: bool,
+    earliest: Option<u64>,
+    count: u64,
+}
+
+/// Session-local delivery accounting; inactive windows remain turn tombstones.
+#[derive(Default)]
+struct Rejections(Mutex<HashMap<TurnNumber, RejectionWindow>>);
+
+impl Rejections {
+    fn register(&self, owner: TurnNumber) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(
+                owner,
+                RejectionWindow {
+                    live: true,
+                    ..RejectionWindow::default()
+                },
+            );
+    }
+
+    fn settle(&self, owner: TurnNumber) {
+        if let Some(window) = self
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(&owner)
+        {
+            window.live = false;
+        }
+    }
+
+    fn record(&self, owner: Option<TurnNumber>, order: u64) {
+        let mut windows = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        for (turn, window) in windows.iter_mut() {
+            if owner.is_some_and(|owner| owner != *turn) || (owner.is_none() && !window.live) {
+                continue;
+            }
+            // Known tombstoned owners still count as rejected late observations,
+            // but only a live owner's observation can taint its usage window.
+            window.count = window.count.saturating_add(1);
+            if window.live {
+                window.earliest = Some(
+                    window
+                        .earliest
+                        .map_or(order, |earliest| earliest.min(order)),
+                );
+            }
+            tracing::trace!(
+                turn = ?turn,
+                read_order = order,
+                rejected_observations = window.count,
+                "OpenCode observation was not delivered"
+            );
+        }
+    }
+
+    fn is_live(&self, owner: TurnNumber) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&owner)
+            .is_some_and(|window| window.live)
+    }
+
+    fn earliest(&self, owner: TurnNumber) -> Option<u64> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&owner)?
+            .earliest
+    }
+}
 
 /// One decoded event attributed before it is put into a lane.
 #[derive(Clone, Debug)]
@@ -83,15 +165,15 @@ struct Queue {
 pub struct Lane {
     queue: Mutex<Queue>,
     ready: Notify,
-    unobserved: Arc<AtomicU64>,
+    rejections: Arc<Rejections>,
 }
 
 impl Lane {
-    fn new(unobserved: Arc<AtomicU64>) -> Self {
+    fn new(rejections: Arc<Rejections>) -> Self {
         Self {
             queue: Mutex::new(Queue::default()),
             ready: Notify::new(),
-            unobserved,
+            rejections,
         }
     }
 
@@ -113,16 +195,20 @@ impl Lane {
     }
 
     fn push(&self, mut item: LaneItem, bytes: usize, order: u64) {
+        let owner = match &item {
+            LaneItem::Event(routed) => routed.owner,
+            LaneItem::Accepted { owner, .. } => Some(*owner),
+        };
         let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
         // Full ingress never blocks the SSE reader. The queue retains any
         // terminal admitted before failure; the refused order taints usage.
         if queue.closed || queue.failure.is_some() {
-            rejected(&self.unobserved, order);
+            self.rejections.record(owner, order);
             return;
         }
-        if queue.items.len() >= 16 || queue.bytes.saturating_add(bytes) > 1024 * 1024 {
+        if queue.items.len() >= LANE_MESSAGES || queue.bytes.saturating_add(bytes) > LANE_BYTES {
             queue.failure = Some(LaneFailure::Overflow);
-            rejected(&self.unobserved, order);
+            self.rejections.record(owner, order);
             drop(queue);
             self.ready.notify_waiters();
             return;
@@ -147,12 +233,12 @@ impl Lane {
         self.ready.notify_one();
     }
 
-    fn fail(&self, failure: LaneFailure, order: u64) {
+    fn fail(&self, failure: LaneFailure, order: u64, owner: Option<TurnNumber>) {
         let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
         if queue.failure.is_none() {
             queue.failure = Some(failure);
         }
-        rejected(&self.unobserved, order);
+        self.rejections.record(owner, order);
         drop(queue);
         self.ready.notify_waiters();
     }
@@ -185,12 +271,15 @@ impl Lane {
             .failure
     }
 
-    /// Earliest read-order position rejected or unrouted anywhere in this generation.
-    pub fn earliest_unobserved(&self) -> Option<u64> {
-        match self.unobserved.load(Ordering::Acquire) {
-            0 => None,
-            order => Some(order),
-        }
+    /// Earliest rejected read order in this turn's live window (`opencode.md` §12; C2 AD6).
+    pub fn earliest_unobserved(&self, owner: TurnNumber) -> Option<u64> {
+        self.rejections.earliest(owner)
+    }
+
+    /// Counts a dropped observation without tainting unrelated or future turns (§7.1, C2 AD6).
+    /// An unknown owner conservatively taints only this session's currently live turns.
+    pub fn reject_unobserved(&self, owner: Option<TurnNumber>, order: u64) {
+        self.rejections.record(owner, order);
     }
 
     /// Ends delivery, retaining items already admitted before the cutoff.
@@ -215,6 +304,8 @@ struct Session {
     unowned_calls: HashSet<String>,
     compactions: HashMap<String, TurnNumber>,
     accepted: HashSet<TurnNumber>,
+    delivered: HashSet<TurnNumber>,
+    rejections: Arc<Rejections>,
     sent: HashSet<TurnNumber>,
     settled: HashSet<TurnNumber>,
 }
@@ -224,7 +315,6 @@ pub struct Router {
     sessions: HashMap<String, Session>,
     children: HashMap<String, (String, TurnNumber)>,
     order: u64,
-    unobserved: Arc<AtomicU64>,
     changed: Arc<Notify>,
 }
 
@@ -241,15 +331,15 @@ impl Router {
             sessions: HashMap::new(),
             children: HashMap::new(),
             order: 0,
-            unobserved: Arc::new(AtomicU64::new(0)),
             changed: Arc::new(Notify::new()),
         }
     }
 
     /// Session lane for a newly opened driver; state and tombstones remain server-owned.
     pub fn attach(&mut self, session: &str) -> Arc<Lane> {
-        let lane = Arc::new(Lane::new(self.unobserved.clone()));
-        self.sessions.entry(session.to_owned()).or_default().lane = Some(lane.clone());
+        let session = self.sessions.entry(session.to_owned()).or_default();
+        let lane = Arc::new(Lane::new(session.rejections.clone()));
+        session.lane = Some(lane.clone());
         lane
     }
 
@@ -267,6 +357,9 @@ impl Router {
     pub fn register_turn(&mut self, session: &str, input_id: String, turn: TurnNumber) {
         let session = self.sessions.entry(session.to_owned()).or_default();
         session.inputs.insert(input_id.clone(), turn);
+        // Router serialization fixes the window before a prompt can be sent;
+        // observations before registration cannot belong to the new turn.
+        session.rejections.register(turn);
         session.state.last = Some(InputState {
             turn,
             input_id,
@@ -377,11 +470,10 @@ impl Router {
         self.order = self.order.saturating_add(1);
         let order = self.order;
         let Some(session) = self.sessions.get_mut(session_id) else {
-            rejected(&self.unobserved, order);
             return;
         };
         let Some(owner) = session.inputs.get(input).copied() else {
-            rejected(&self.unobserved, order);
+            session.rejections.record(None, order);
             return;
         };
         if !session.accepted.insert(owner) {
@@ -401,7 +493,7 @@ impl Router {
                 order,
             );
         } else {
-            rejected(&self.unobserved, order);
+            session.rejections.record(Some(owner), order);
         }
         self.changed.notify_waiters();
     }
@@ -419,6 +511,7 @@ impl Router {
         if let Some(session) = self.sessions.get_mut(session) {
             session.settled.insert(turn);
             session.sent.remove(&turn);
+            session.rejections.settle(turn);
         }
     }
 
@@ -426,59 +519,83 @@ impl Router {
     /// owner drains the generation. An unidentifiable envelope fails globally.
     pub fn malformed(&mut self, error: DecodeError) -> Result<(), RouterFailure> {
         self.order = self.order.saturating_add(1);
-        rejected(&self.unobserved, self.order);
         match error {
-            DecodeError::Generation => Err(RouterFailure::Protocol),
-            DecodeError::Session(session) => {
-                if let Some(lane) = self
-                    .sessions
-                    .get(&session)
-                    .and_then(|session| session.lane.as_ref())
-                {
-                    lane.fail(LaneFailure::Protocol, self.order);
+            DecodeError::Generation => {
+                // Missing routing identity could describe any currently live
+                // turn, but cannot poison windows registered after this read.
+                for session in self.sessions.values() {
+                    session.rejections.record(None, self.order);
                 }
+                Err(RouterFailure::Protocol)
+            }
+            DecodeError::Session(session) => {
+                self.protocol_failure(&session, self.order);
                 self.changed.notify_waiters();
                 Ok(())
             }
         }
     }
 
+    fn protocol_failure(&self, session_id: &str, order: u64) {
+        let (root, owner) = self
+            .children
+            .get(session_id)
+            .map_or((session_id, None), |(root, owner)| {
+                (root.as_str(), Some(*owner))
+            });
+        let Some(session) = self.sessions.get(root) else {
+            return;
+        };
+        if owner.is_some_and(|owner| !session.rejections.is_live(owner)) {
+            // A child's malformed interactive payload could belong to its
+            // root owner only. An old child cannot fail the successor's lane.
+            session.rejections.record(owner, order);
+            return;
+        }
+        if let Some(lane) = &session.lane {
+            lane.fail(LaneFailure::Protocol, order, owner);
+        } else {
+            session.rejections.record(owner, order);
+        }
+    }
+
     /// Dispatches one typed event, applying state before lane admission.
-    pub fn dispatch(&mut self, event: Event, at: Instant) -> Result<(), RouterFailure> {
+    pub fn dispatch(&mut self, event: Event, at: Instant) {
         self.order = self.order.saturating_add(1);
         let order = self.order;
         let Some(session_id) = event.session_id.as_ref() else {
-            return Ok(());
+            return;
         };
         let session = self.sessions.entry(session_id.clone()).or_default();
         if let Some(seq) = event.seq {
             if session.state.last_seq.is_some_and(|last| seq <= last) {
-                rejected(&self.unobserved, order);
-                if let Some(lane) = &session.lane {
-                    lane.fail(LaneFailure::Protocol, order);
-                }
+                self.protocol_failure(session_id, order);
                 self.changed.notify_waiters();
-                return Ok(());
+                return;
             }
             session.state.last_seq = Some(seq);
         }
         if let EventData::Created {
             parent_id: Some(parent),
         } = &event.data
-            && let Some(owner) = self
-                .sessions
-                .get(parent)
-                .and_then(|session| session.state.execution_owner)
+            && let Some((root, owner)) = self.children.get(parent).cloned().or_else(|| {
+                self.sessions
+                    .get(parent)
+                    .and_then(|session| session.state.execution_owner)
+                    .map(|owner| (parent.clone(), owner))
+            })
         {
+            // Descendants keep the original root/turn tombstone (§7.1),
+            // even after an intermediate child's execution has ended.
             self.children
                 .entry(session_id.clone())
-                .or_insert_with(|| (parent.clone(), owner));
+                .or_insert((root, owner));
         }
         if let Some((parent, owner)) = self.children.get(session_id) {
             // Child traffic is excluded from root observations and usage,
             // except interactive requests credited to the originating turn.
             if !matches!(event.data, EventData::Interactive { .. }) {
-                return Ok(());
+                return;
             }
             let session = self.sessions.entry(parent.clone()).or_default();
             let late = session.settled.contains(owner);
@@ -498,10 +615,10 @@ impl Router {
                     order,
                 );
             } else {
-                rejected(&self.unobserved, order);
+                session.rejections.record(Some(*owner), order);
             }
             self.changed.notify_waiters();
-            return Ok(());
+            return;
         }
         let session = self.sessions.entry(session_id.clone()).or_default();
         let joined_steps = take_joined_steps(session, &event.data);
@@ -510,7 +627,7 @@ impl Router {
             // A known observation without correlation might be a lost call
             // or part of an owned turn. Delivering a diagnostic is insufficient
             // evidence for that turn's usage accounting.
-            rejected(&self.unobserved, order);
+            session.rejections.record(None, order);
         }
         let late = owner.is_some_and(|owner| session.settled.contains(&owner));
         // State is already applied even when this insertion fails or no
@@ -537,10 +654,9 @@ impl Router {
                 order,
             );
         } else {
-            rejected(&self.unobserved, order);
+            session.rejections.record(owner, order);
         }
         self.changed.notify_waiters();
-        Ok(())
     }
 
     /// Latest execution admission state; it never decides a driver outcome.
@@ -563,18 +679,6 @@ impl Router {
     }
 }
 
-fn rejected(unobserved: &AtomicU64, order: u64) {
-    // Zero is the sentinel; every real stream/marker order begins at one.
-    let mut current = unobserved.load(Ordering::Acquire);
-    while current == 0 || order < current {
-        match unobserved.compare_exchange_weak(current, order, Ordering::AcqRel, Ordering::Acquire)
-        {
-            Ok(_) => return,
-            Err(found) => current = found,
-        }
-    }
-}
-
 fn accept_state(session: &mut Session, input: &str) {
     if let Some(last) = session.state.last.as_mut()
         && last.input_id == input
@@ -594,9 +698,9 @@ fn apply_inbox(session: &mut Session, kind: InboxKind, id: &str) -> Option<TurnN
     if kind == InboxKind::Cancelled {
         session.state.cancelled(id);
     }
-    if owner.is_some_and(|owner| session.settled.contains(&owner)) {
-        // Tombstoned input keys remain late observations, but never bind
-        // to or change a successor's session-scoped execution facts.
+    if owner.is_some_and(|owner| session.delivered.contains(&owner)) {
+        // A delivered input keeps its execution tombstone forever. A repeated
+        // inbox event cannot claim a later execution or change its admission facts.
         return owner;
     }
     match kind {
@@ -607,6 +711,12 @@ fn apply_inbox(session: &mut Session, kind: InboxKind, id: &str) -> Option<TurnN
             }
         }
         InboxKind::Delivered => {
+            // A first delivery remains an execution fact even after its result
+            // settled unknown. Route subsequent observations late to that owner;
+            // its execution terminal must release the successor rule (§7.2).
+            if let Some(owner) = owner {
+                session.delivered.insert(owner);
+            }
             session.state.running = true;
             if session.state.execution_owner.is_none() {
                 session.state.execution_owner = owner;
@@ -644,7 +754,7 @@ fn take_joined_steps(session: &mut Session, data: &EventData) -> Vec<String> {
     let Some(owner) = session.inputs.get(id) else {
         return Vec::new();
     };
-    if session.state.execution_owner.is_none() && !session.settled.contains(owner) {
+    if session.state.execution_owner.is_none() && !session.delivered.contains(owner) {
         std::mem::take(&mut session.unowned_step_order)
     } else {
         Vec::new()
@@ -864,13 +974,7 @@ mod tests {
     fn turn(number: u32) -> TurnNumber {
         TurnNumber::try_from(number).unwrap()
     }
-    fn apply(
-        router: &mut Router,
-        session: &str,
-        kind: &str,
-        fields: Value,
-        seq: Option<u64>,
-    ) -> Result<(), RouterFailure> {
+    fn apply(router: &mut Router, session: &str, kind: &str, fields: Value, seq: Option<u64>) {
         let mut fields = fields;
         fields["sessionID"] = json!(session);
         let mut envelope = json!({"id":"evt_one","type":kind,"data":fields});
@@ -880,7 +984,7 @@ mod tests {
         router.dispatch(
             decode(&serde_json::to_vec(&envelope).unwrap()).unwrap(),
             Instant::now(),
-        )
+        );
     }
     fn owned(router: &mut Router, session: &str, input: &str, number: u32) {
         router.register_turn(session, input.into(), turn(number));
@@ -890,22 +994,245 @@ mod tests {
             "session.execution.started",
             json!({}),
             None,
-        )
-        .unwrap();
+        );
         apply(
             router,
             session,
             "session.inbox.delivered",
             json!({"inboxID":input}),
             None,
-        )
-        .unwrap();
+        );
     }
     fn routed(item: Option<LaneItem>) -> Routed {
         match item.unwrap() {
             LaneItem::Event(routed) => *routed,
             LaneItem::Accepted { .. } => panic!("unexpected marker"),
         }
+    }
+
+    #[test]
+    fn oc11_rejections_outside_a_live_turn_never_taint_its_window() {
+        let mut router = Router::new();
+        apply(&mut router, "ses_a", "session.created", json!({}), None);
+        apply(
+            &mut router,
+            "ses_a",
+            "session.execution.started",
+            json!({}),
+            None,
+        );
+        let lane = router.attach("ses_a");
+        router.register_turn("ses_a", "input_a".into(), turn(1));
+        assert_eq!(lane.earliest_unobserved(turn(1)), None);
+    }
+
+    #[test]
+    fn oc11_unrelated_session_rejection_never_taints_a_live_turn() {
+        let mut router = Router::new();
+        let lane = router.attach("ses_a");
+        router.register_turn("ses_a", "input_a".into(), turn(1));
+        router
+            .malformed(DecodeError::Session("ses_b".into()))
+            .unwrap();
+        assert_eq!(lane.earliest_unobserved(turn(1)), None);
+    }
+
+    #[test]
+    fn oc11_unknown_session_malformed_taints_only_currently_live_windows() {
+        let mut router = Router::new();
+        let lane = router.attach("ses_a");
+        router.register_turn("ses_a", "input_a".into(), turn(1));
+        assert_eq!(
+            router.malformed(DecodeError::Generation),
+            Err(RouterFailure::Protocol)
+        );
+        assert_eq!(lane.earliest_unobserved(turn(1)), Some(1));
+        router.settle("ses_a", turn(1));
+        router.register_turn("ses_a", "input_b".into(), turn(2));
+        assert_eq!(lane.earliest_unobserved(turn(1)), Some(1));
+        assert_eq!(lane.earliest_unobserved(turn(2)), None);
+    }
+
+    #[test]
+    fn oc11_malformed_mapped_child_taints_only_its_live_root_owner() {
+        let mut router = Router::new();
+        let lane = router.attach("ses_a");
+        owned(&mut router, "ses_a", "input_a", 1);
+        apply(
+            &mut router,
+            "ses_child",
+            "session.created",
+            json!({"parentID":"ses_a"}),
+            None,
+        );
+        router
+            .malformed(DecodeError::Session("ses_child".into()))
+            .unwrap();
+        assert_eq!(lane.failure(), Some(LaneFailure::Protocol));
+        assert!(lane.earliest_unobserved(turn(1)).is_some());
+        router.settle("ses_a", turn(1));
+        router.detach("ses_a");
+        let successor = router.attach("ses_a");
+        router.register_turn("ses_a", "input_b".into(), turn(2));
+        router
+            .malformed(DecodeError::Session("ses_child".into()))
+            .unwrap();
+        assert_eq!(successor.failure(), None);
+        assert_eq!(successor.earliest_unobserved(turn(2)), None);
+    }
+
+    #[test]
+    fn oc11_prior_driver_drops_count_only_their_retained_owner_window() {
+        let mut router = Router::new();
+        let previous = router.attach("ses_a");
+        router.register_turn("ses_a", "input_a".into(), turn(1));
+        router.settle("ses_a", turn(1));
+        router.detach("ses_a");
+        let reopened = router.attach("ses_a");
+        router.register_turn("ses_a", "input_b".into(), turn(2));
+        reopened.reject_unobserved(Some(turn(1)), 7);
+        assert_eq!(reopened.earliest_unobserved(turn(2)), None);
+        assert_eq!(previous.earliest_unobserved(turn(1)), None);
+        assert_eq!(
+            reopened
+                .rejections
+                .0
+                .lock()
+                .unwrap()
+                .get(&turn(1))
+                .unwrap()
+                .count,
+            1
+        );
+        reopened.reject_unobserved(Some(turn(2)), 8);
+        assert_eq!(reopened.earliest_unobserved(turn(2)), Some(8));
+    }
+
+    #[test]
+    fn oc05_settled_never_delivered_input_ends_late_execution_before_successor() {
+        let mut router = Router::new();
+        let lane = router.attach("ses_a");
+        router.register_turn("ses_a", "input_a".into(), turn(1));
+        router.mark_sent("ses_a", "input_a");
+        router.settle("ses_a", turn(1));
+        assert!(!router.eligible("ses_a"));
+        apply(
+            &mut router,
+            "ses_a",
+            "session.execution.started",
+            json!({}),
+            None,
+        );
+        apply(
+            &mut router,
+            "ses_a",
+            "session.inbox.delivered",
+            json!({"inboxID":"input_a"}),
+            None,
+        );
+        apply(
+            &mut router,
+            "ses_a",
+            "session.step.started",
+            json!({"assistantMessageID":"assistant_a"}),
+            None,
+        );
+        apply(
+            &mut router,
+            "ses_a",
+            "session.execution.succeeded",
+            json!({}),
+            None,
+        );
+        assert!(router.eligible("ses_a"));
+        let events: Vec<_> = std::iter::from_fn(|| lane.pop())
+            .map(|item| routed(Some(item)))
+            .collect();
+        for event in &events[1..] {
+            assert_eq!(event.owner, Some(turn(1)));
+            assert!(event.late);
+        }
+        owned(&mut router, "ses_a", "input_b", 2);
+        while lane.pop().is_some() {}
+        apply(
+            &mut router,
+            "ses_a",
+            "session.text.ended",
+            json!({"assistantMessageID":"assistant_a","ordinal":0,"text":"late"}),
+            None,
+        );
+        let old = routed(lane.pop());
+        assert_eq!(old.owner, Some(turn(1)));
+        assert!(old.late);
+        assert_eq!(
+            router.state("ses_a").unwrap().execution_owner,
+            Some(turn(2))
+        );
+    }
+
+    #[test]
+    fn oc05_settled_never_delivered_input_cancellation_admits_successor() {
+        let mut router = Router::new();
+        let lane = router.attach("ses_a");
+        router.register_turn("ses_a", "input_a".into(), turn(1));
+        router.mark_sent("ses_a", "input_a");
+        router.settle("ses_a", turn(1));
+        apply(
+            &mut router,
+            "ses_a",
+            "session.inbox.cancelled",
+            json!({"inboxID":"input_a"}),
+            None,
+        );
+        assert!(router.eligible("ses_a"));
+        let cancelled = routed(lane.pop());
+        assert_eq!(cancelled.owner, Some(turn(1)));
+        assert!(cancelled.late);
+        owned(&mut router, "ses_a", "input_b", 2);
+        assert_eq!(
+            router.state("ses_a").unwrap().execution_owner,
+            Some(turn(2))
+        );
+    }
+
+    #[test]
+    fn oc06_grandchild_interactive_routes_to_root_owning_turn() {
+        let mut router = Router::new();
+        let lane = router.attach("ses_a");
+        owned(&mut router, "ses_a", "input_a", 1);
+        apply(
+            &mut router,
+            "ses_child",
+            "session.created",
+            json!({"parentID":"ses_a"}),
+            None,
+        );
+        apply(
+            &mut router,
+            "ses_grandchild",
+            "session.created",
+            json!({"parentID":"ses_child"}),
+            None,
+        );
+        while lane.pop().is_some() {}
+        let form = decode(
+            &serde_json::to_vec(&json!({
+                "type":"form.created",
+                "data":{"form":{"id":"form_grandchild","sessionID":"ses_grandchild"}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        router.dispatch(form, Instant::now());
+        assert_eq!(routed(lane.pop()).owner, Some(turn(1)));
+        apply(
+            &mut router,
+            "ses_grandchild",
+            "session.text.ended",
+            json!({"assistantMessageID":"grandchild_text","ordinal":0,"text":"excluded"}),
+            None,
+        );
+        assert!(lane.pop().is_none());
     }
 
     #[test]
@@ -920,8 +1247,7 @@ mod tests {
             "session.execution.started",
             json!({}),
             None,
-        )
-        .unwrap();
+        );
         assert_eq!(routed(a.pop()).owner, None);
         apply(
             &mut router,
@@ -929,8 +1255,7 @@ mod tests {
             "session.inbox.delivered",
             json!({"inboxID":"input_a"}),
             None,
-        )
-        .unwrap();
+        );
         owned(&mut router, "ses_b", "input_b", 2);
         assert_eq!(routed(a.pop()).owner, Some(turn(1)));
         assert_eq!(routed(b.pop()).owner, None);
@@ -958,11 +1283,10 @@ mod tests {
             "session.execution.succeeded",
             json!({}),
             None,
-        )
-        .unwrap();
+        );
         let _reopened = router.attach("ses_a");
         assert!(router.eligible("ses_a"));
-        assert!(lane.earliest_unobserved().is_some());
+        assert!(lane.earliest_unobserved(turn(1)).is_some());
     }
 
     #[test]
@@ -976,24 +1300,21 @@ mod tests {
             "session.step.started",
             json!({"assistantMessageID":"assistant_a"}),
             None,
-        )
-        .unwrap();
+        );
         apply(
             &mut router,
             "ses_a",
             "session.tool.called",
             json!({"assistantMessageID":"assistant_a","id":"call_a"}),
             None,
-        )
-        .unwrap();
+        );
         apply(
             &mut router,
             "ses_a",
             "session.execution.succeeded",
             json!({}),
             None,
-        )
-        .unwrap();
+        );
         router.settle("ses_a", turn(1));
         while lane.pop().is_some() {}
         owned(&mut router, "ses_a", "input_b", 2);
@@ -1004,8 +1325,7 @@ mod tests {
             "session.tool.success",
             json!({"id":"call_a"}),
             None,
-        )
-        .unwrap();
+        );
         let tombstone = routed(lane.pop());
         assert_eq!(tombstone.owner, Some(turn(1)));
         assert!(tombstone.late);
@@ -1022,11 +1342,17 @@ mod tests {
             "session.created",
             json!({"parentID":"ses_a"}),
             None,
+        );
+        while lane.pop().is_some() {}
+        let form = decode(
+            &serde_json::to_vec(&json!({
+                "type":"form.created",
+                "data":{"form":{"id":"form_child","sessionID":"ses_child"}}
+            }))
+            .unwrap(),
         )
         .unwrap();
-        while lane.pop().is_some() {}
-        let form=decode(&serde_json::to_vec(&json!({"type":"form.created","data":{"form":{"id":"form_child","sessionID":"ses_child"}}})).unwrap()).unwrap();
-        router.dispatch(form, Instant::now()).unwrap();
+        router.dispatch(form, Instant::now());
         assert_eq!(routed(lane.pop()).owner, Some(turn(1)));
         apply(
             &mut router,
@@ -1034,8 +1360,7 @@ mod tests {
             "session.text.ended",
             json!({"assistantMessageID":"child_text","ordinal":0,"text":"hidden child"}),
             None,
-        )
-        .unwrap();
+        );
         assert!(lane.pop().is_none());
     }
 
@@ -1043,10 +1368,10 @@ mod tests {
     fn oc06_nonincreasing_sequence_fails_session_gaps_do_not() {
         let mut router = Router::new();
         let lane = router.attach("ses_a");
-        apply(&mut router, "ses_a", "session.renamed", json!({}), Some(1)).unwrap();
-        apply(&mut router, "ses_a", "session.renamed", json!({}), Some(4)).unwrap();
+        apply(&mut router, "ses_a", "session.renamed", json!({}), Some(1));
+        apply(&mut router, "ses_a", "session.renamed", json!({}), Some(4));
         assert_eq!(lane.failure(), None);
-        apply(&mut router, "ses_a", "session.renamed", json!({}), Some(4)).unwrap();
+        apply(&mut router, "ses_a", "session.renamed", json!({}), Some(4));
         assert_eq!(lane.failure(), Some(LaneFailure::Protocol));
     }
 
@@ -1056,7 +1381,7 @@ mod tests {
         let lane = router.attach("ses_a");
         owned(&mut router, "ses_a", "input_a", 1);
         for _ in 0..14 {
-            apply(&mut router, "ses_a", "session.future", json!({}), None).unwrap();
+            apply(&mut router, "ses_a", "session.future", json!({}), None);
         }
         apply(
             &mut router,
@@ -1064,11 +1389,10 @@ mod tests {
             "session.execution.succeeded",
             json!({}),
             None,
-        )
-        .unwrap();
+        );
         assert_eq!(lane.failure(), Some(LaneFailure::Overflow));
         assert!(router.eligible("ses_a"));
-        assert_eq!(lane.earliest_unobserved(), Some(17));
+        assert_eq!(lane.earliest_unobserved(turn(1)), Some(17));
     }
     #[test]
     fn oc06_decode_watermark_advances_on_admission_for_exact_owner_only() {
@@ -1089,16 +1413,14 @@ mod tests {
             "session.step.started",
             json!({"assistantMessageID":"assistant_a"}),
             None,
-        )
-        .unwrap();
+        );
         apply(
             &mut router,
             "ses_a",
             "session.execution.succeeded",
             json!({}),
             None,
-        )
-        .unwrap();
+        );
         router.settle("ses_a", turn(1));
         while lane.pop().is_some() {}
         owned(&mut router, "ses_a", "input_b", 2);
@@ -1109,8 +1431,7 @@ mod tests {
             "session.text.ended",
             json!({"assistantMessageID":"assistant_a","ordinal":0,"text":"late"}),
             None,
-        )
-        .unwrap();
+        );
         assert_eq!(first.get(), 4);
         assert_eq!(second.get(), 1);
         assert_eq!(routed(lane.pop()).position, 4);
@@ -1130,24 +1451,21 @@ mod tests {
             "session.execution.started",
             json!({}),
             None,
-        )
-        .unwrap();
+        );
         apply(
             &mut router,
             "ses_a",
             "session.inbox.delivered",
             json!({"inboxID":"input_a"}),
             None,
-        )
-        .unwrap();
+        );
         apply(
             &mut router,
             "ses_a",
             "session.execution.succeeded",
             json!({}),
             None,
-        )
-        .unwrap();
+        );
         assert!(router.eligible("ses_a"));
         assert!(router.has_loss_destination());
         router.settle("ses_a", turn(1));
@@ -1212,24 +1530,21 @@ mod tests {
             "session.execution.started",
             json!({}),
             None,
-        )
-        .unwrap();
+        );
         apply(
             &mut router,
             "ses_a",
             "session.step.started",
             json!({"assistantMessageID":"foreign_step"}),
             None,
-        )
-        .unwrap();
+        );
         apply(
             &mut router,
             "ses_a",
             "session.tool.input.started",
             json!({"assistantMessageID":"foreign_step","id":"foreign_call","name":"shell"}),
             None,
-        )
-        .unwrap();
+        );
         while lane.pop().is_some() {}
         apply(
             &mut router,
@@ -1237,8 +1552,7 @@ mod tests {
             "session.inbox.delivered",
             json!({"inboxID":"input_a"}),
             None,
-        )
-        .unwrap();
+        );
         while lane.pop().is_some() {}
         apply(
             &mut router,
@@ -1246,32 +1560,28 @@ mod tests {
             "session.text.ended",
             json!({"assistantMessageID":"foreign_step","ordinal":0,"text":"joined answer"}),
             None,
-        )
-        .unwrap();
+        );
         apply(
             &mut router,
             "ses_a",
             "session.tool.success",
             json!({"id":"foreign_call"}),
             None,
-        )
-        .unwrap();
+        );
         apply(
             &mut router,
             "ses_a",
             "session.step.ended",
             json!({"assistantMessageID":"foreign_step","finish":"stop","tokens":{"input":7}}),
             None,
-        )
-        .unwrap();
+        );
         apply(
             &mut router,
             "ses_a",
             "session.execution.succeeded",
             json!({}),
             None,
-        )
-        .unwrap();
+        );
         for _ in 0..4 {
             assert_eq!(routed(lane.pop()).owner, Some(turn(1)));
         }
@@ -1289,8 +1599,7 @@ mod tests {
             "session.execution.succeeded",
             json!({}),
             None,
-        )
-        .unwrap();
+        );
         router.settle("ses_a", turn(1));
         router.register_turn("ses_a", "input_b".into(), turn(2));
         apply(
@@ -1299,8 +1608,7 @@ mod tests {
             "session.execution.started",
             json!({}),
             None,
-        )
-        .unwrap();
+        );
         while lane.pop().is_some() {}
         for kind in [
             "session.inbox.enqueued",
@@ -1313,8 +1621,7 @@ mod tests {
                 kind,
                 json!({"inboxID":"input_a"}),
                 None,
-            )
-            .unwrap();
+            );
             let old = routed(lane.pop());
             assert_eq!(old.owner, Some(turn(1)));
             assert!(old.late);
@@ -1326,8 +1633,7 @@ mod tests {
             "session.inbox.delivered",
             json!({"inboxID":"input_b"}),
             None,
-        )
-        .unwrap();
+        );
         assert_eq!(
             router.state("ses_a").unwrap().execution_owner,
             Some(turn(2))
@@ -1338,8 +1644,7 @@ mod tests {
             "session.execution.succeeded",
             json!({}),
             None,
-        )
-        .unwrap();
+        );
         assert_eq!(routed(lane.pop()).owner, Some(turn(2)));
         assert_eq!(routed(lane.pop()).owner, Some(turn(2)));
     }
@@ -1354,8 +1659,7 @@ mod tests {
             "session.execution.started",
             json!({}),
             None,
-        )
-        .unwrap();
+        );
         for id in ["step_a", "step_b"] {
             apply(
                 &mut router,
@@ -1363,8 +1667,7 @@ mod tests {
                 "session.step.started",
                 json!({"assistantMessageID":id}),
                 None,
-            )
-            .unwrap();
+            );
         }
         while let Some(item) = lane.pop() {
             assert!(routed(Some(item)).owner.is_none());
@@ -1375,8 +1678,7 @@ mod tests {
             "session.inbox.delivered",
             json!({"inboxID":"input_a"}),
             None,
-        )
-        .unwrap();
+        );
         let ownership = routed(lane.pop());
         assert_eq!(ownership.owner, Some(turn(1)));
         assert_eq!(ownership.joined_steps, vec!["step_a", "step_b"]);
@@ -1387,8 +1689,7 @@ mod tests {
                 "session.text.ended",
                 json!({"assistantMessageID":id,"ordinal":0,"text":id}),
                 None,
-            )
-            .unwrap();
+            );
             let text = routed(lane.pop());
             assert_eq!(text.owner, Some(turn(1)));
             assert!(text.joined_steps.is_empty());
@@ -1399,8 +1700,7 @@ mod tests {
             "session.inbox.delivered",
             json!({"inboxID":"input_a"}),
             None,
-        )
-        .unwrap();
+        );
         assert!(routed(lane.pop()).joined_steps.is_empty());
     }
 }

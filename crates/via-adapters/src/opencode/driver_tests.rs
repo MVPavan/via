@@ -181,8 +181,16 @@ impl Lane {
         );
         tokio::pin!(future);
         let mut seen = Vec::new();
+        // Losing recv is safe; the pinned turn future remains alive across observations.
         let result = loop {
-            tokio::select! {end=&mut future=>break end,item=self.receiver.recv()=>{if let Some(item)=item {seen.push(item.item);}}}
+            tokio::select! {
+                end = &mut future => break end,
+                item = self.receiver.recv() => {
+                    if let Some(item) = item {
+                        seen.push(item.item);
+                    }
+                }
+            }
         };
         while let Ok(item) = self.receiver.try_recv() {
             seen.push(item.item);
@@ -456,4 +464,175 @@ fn oc05_c2_cancelled_setup_request_blocks_reopened_driver_prompt() {
             "pending setup prevents every later prompt: {requests:?}"
         );
     });
+}
+
+/// §7.2's predecessor ends only after its inconclusive prompt reply.
+fn settled_input_fixture(cwd: &str, cancelled: bool) -> Value {
+    let mut next = fixture(cwd, Vec::new());
+    let mut predecessor_events = vec![
+        event(
+            "session.inbox.enqueued",
+            &json!({"sessionID":"$SESSION","inboxID":"$INPUT"}),
+        ),
+        json!({"pause_ms":500}),
+    ];
+    if cancelled {
+        predecessor_events.push(event(
+            "session.inbox.cancelled",
+            &json!({"sessionID":"$SESSION","inboxID":"$INPUT"}),
+        ));
+    } else {
+        predecessor_events.extend([
+            event(
+                "session.execution.started",
+                &json!({"sessionID":"$SESSION"}),
+            ),
+            event(
+                "session.inbox.delivered",
+                &json!({"sessionID":"$SESSION","inboxID":"$INPUT"}),
+            ),
+            event(
+                "session.step.started",
+                &json!({"sessionID":"$SESSION","assistantMessageID":"$INPUT:a"}),
+            ),
+            event(
+                "session.text.ended",
+                &json!({"sessionID":"$SESSION","assistantMessageID":"$INPUT:a",
+                    "ordinal":0,"text":"late-A"}),
+            ),
+            event(
+                "session.execution.succeeded",
+                &json!({"sessionID":"$SESSION"}),
+            ),
+        ]);
+    }
+    let mut successor = success();
+    let terminal = successor.pop().unwrap();
+    successor.extend([
+        event(
+            "session.step.started",
+            &json!({"sessionID":"$SESSION","assistantMessageID":"$INPUT:b"}),
+        ),
+        event(
+            "session.text.ended",
+            &json!({"sessionID":"$SESSION","assistantMessageID":"$INPUT:b",
+                "ordinal":0,"text":"B"}),
+        ),
+        event(
+            "session.step.ended",
+            &json!({"sessionID":"$SESSION","assistantMessageID":"$INPUT:b",
+                "finish":"stop","tokens":{"input":11,"output":7,"reasoning":0,
+                    "cache":{"read":2,"write":0}},"cost":0.25}),
+        ),
+        terminal,
+    ]);
+    replace(
+        &mut next,
+        route(
+            "POST",
+            &format!("/api/session/{SES}/prompt"),
+            &json!([
+                {"status":200,"json":{"data":{}},"emit_before_response":true,
+                    "sleep_ms":150,"emit":predecessor_events},
+                {"status":200,"json":{"data":{"id":"$INPUT","sessionID":"$SESSION"}},
+                    "emit":successor}
+            ]),
+        ),
+    );
+    next
+}
+
+/// C2 exercises §7.2 after unknown; Core's P6 cannot admit that successor.
+async fn settled_before_first_delivery(cancelled: bool) {
+    let rig = Rig::new(&json!({}));
+    let cwd = rig.root().to_str().unwrap().to_owned();
+    rig.fixture(&settled_input_fixture(&cwd, cancelled));
+    row(&rig, 1, "running");
+    let mut lane = Lane::open(&rig, false);
+    let (unknown, first_seen) = lane.turn(1, None, Duration::from_secs(5)).await;
+    row(&rig, 1, "unknown");
+    row(&rig, 2, "running");
+    // A broken execution rule times out here instead of submitting B. Keeping
+    // the same driver retains the server and avoids reopen cleanup as a repair.
+    let started = tokio::time::Instant::now();
+    let (second, second_seen) = lane.turn(2, None, Duration::from_secs(2)).await;
+    let elapsed = started.elapsed();
+    lane.close().await;
+    let requests = rig.requests();
+    rig.finish().await;
+    assert!(unknown.terminal.is_none(), "A: {unknown:?}");
+    assert!(matches!(unknown.outcome,
+        Err(AdapterError::Route(ref failure))
+            if matches!(failure.cause, crate::RouteError::TransportLost { .. })));
+    assert!(
+        first_seen
+            .iter()
+            .any(|item| matches!(item.observation, Observation::Accepted(_))),
+        "A must be accepted before its inconclusive reply"
+    );
+    assert!(
+        matches!(
+            second.terminal.as_ref().map(|terminal| &terminal.status),
+            Some(VendorTerminalStatus::Completed)
+        ),
+        "B: {second:?}; elapsed: {elapsed:?}; requests: {requests:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "successor waited: {elapsed:?}"
+    );
+    let usage = second.terminal.as_ref().unwrap().usage.as_ref().unwrap();
+    assert_eq!(usage.input, Some(11), "B retained its own reported usage");
+    assert_eq!(usage.output, Some(7));
+    let sent = prompts(&requests);
+    assert_eq!(sent.len(), 2, "never resend A: {requests:?}");
+    assert_ne!(sent[0]["body"]["id"], sent[1]["body"]["id"]);
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request["pid"].as_u64().unwrap())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        1,
+        "both inputs stay on the retained server generation"
+    );
+    let old = sent[0]["body"]["id"].as_str().unwrap();
+    let current = sent[1]["body"]["id"].as_str().unwrap();
+    let mut current_text = String::new();
+    let mut late_text = String::new();
+    let mut late_terminal = false;
+    for item in second_seen {
+        if let Observation::FinalText(text) = &item.observation {
+            match item.vendor_turn.as_ref().map(crate::VendorTurnId::as_str) {
+                Some(id) if id == current => current_text.push_str(text),
+                Some(id) if id == old => late_text.push_str(text),
+                owner => panic!("final text has unexpected owner: {owner:?}"),
+            }
+        }
+        if matches!(item.observation, Observation::LateTerminal(_)) {
+            assert_eq!(
+                item.vendor_turn.as_ref().map(crate::VendorTurnId::as_str),
+                Some(old)
+            );
+            late_terminal = true;
+        }
+    }
+    assert_eq!(
+        current_text, "B",
+        "A's late events must never become B's output"
+    );
+    if !cancelled {
+        assert_eq!(late_text, "late-A");
+        assert!(late_terminal, "A keeps its late terminal attributed to A");
+    }
+}
+
+#[test]
+fn oc05_c2_settled_input_first_late_delivery_admits_successor_without_resend() {
+    run(settled_before_first_delivery(false));
+}
+
+#[test]
+fn oc05_c2_settled_input_late_cancel_admits_successor_without_resend() {
+    run(settled_before_first_delivery(true));
 }

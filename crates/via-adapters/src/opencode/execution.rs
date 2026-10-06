@@ -1,8 +1,8 @@
-//! The prompt admission rule, one submission, and the delivery outcome boundary.
+//! `opencode.md` §7.2–§7.3: admission, one submission and the outcome boundary.
 
-use super::{Settings, Turn, effort_offered, switch_variant};
+use super::driver::{Settings, Turn, effort_offered, switch_variant, tracked};
 use crate::driver::turn::unaccounted;
-use crate::opencode::delivery::{Delivery, Registration, Sealed, Stop};
+use crate::opencode::delivery::{Delivery, Registration, Sealed, Stop, generation_route_error};
 use crate::opencode::launch;
 use crate::{
     AdapterError, Deadline, DriverFailure, DriverHealth, RouteError, StartRejected, TurnEnd,
@@ -13,9 +13,9 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tokio::time::Instant;
 use via_routes::opencode::GenerationEnd;
+use via_routes::opencode::Server;
 use via_routes::opencode::router::LaneFailure;
 use via_routes::opencode::turn::{self as requests, Submission};
-use via_routes::opencode::{Server, session::SetupError};
 use via_routes::{CommitOutcome, StoreFailure};
 
 /// §7.1: deterministic caller IDs. Recomputing old IDs never resends them.
@@ -60,6 +60,7 @@ impl Drop for Running {
     }
 }
 
+/// §6: the identity and checked settings opened for this turn.
 pub(super) struct Opened {
     pub(super) server: Arc<Server>,
     pub(super) id: String,
@@ -68,6 +69,7 @@ pub(super) struct Opened {
     pub(super) variant_checked: bool,
 }
 
+/// §7.2: admit, submit once and resolve by the ordered delivery lane.
 pub(super) async fn execute(
     facts: &mut Turn<'_>,
     settings: &Settings,
@@ -219,18 +221,21 @@ async fn submit(
 ) -> TurnEnd {
     // The request is never retried. Its response remains outstanding even
     // if SSE acceptance/terminal reaches delivery first (§7.2 rule 1).
+    // Cancellation keeps the outstanding request count and seals through Running.
     let response = requests::prompt(server.http(), id, input, prompt, facts.request_by());
     tokio::pin!(response);
     let outcome = tokio::select! {
-        outcome=&mut response=>outcome,
-        _decision=delivery.decision()=> {
+        outcome = &mut response => outcome,
+        _decision = delivery.decision() => {
             // A natural terminal can precede the prompt response. Keep it,
             // while finishing the response under its original bound.
             // This future owns a socket borrowed from the local prompt,
             // so complete it here; the outer turn order can still cut it.
-            let result=response.await;
-            if result.is_ok() { server.routing().request_completed(id); }
-            return ordered_result(facts,None);
+            let result = response.await;
+            if result.is_ok() {
+                server.routing().request_completed(id);
+            }
+            return ordered_result(facts, None);
         },
     };
     match outcome {
@@ -297,10 +302,11 @@ async fn wait_eligible(server: &Server, id: &str, by: Deadline) -> bool {
         if server.routing().eligible(id) {
             return true;
         }
+        // Notify, timer and end waits consume no execution state when cancelled.
         tokio::select! {
-            ()=&mut notified=>{},
-            ()=tokio::time::sleep_until(by.instant())=>return false,
-            _end=server.wait_end()=>return false,
+            () = &mut notified => {},
+            () = tokio::time::sleep_until(by.instant()) => return false,
+            _end = server.wait_end() => return false,
         }
     }
 }
@@ -310,11 +316,12 @@ async fn cleanup_leftovers(
     server: &Server,
     id: &str,
 ) -> Result<(), Box<TurnEnd>> {
-    server.routing().request_started(id);
-    let inbox = requests::inbox(server.http(), id, facts.request_by()).await;
-    if !matches!(&inbox, Err(SetupError::Http(_))) {
-        server.routing().request_completed(id);
-    }
+    let inbox = tracked(
+        server,
+        Some(id),
+        requests::inbox(server.http(), id, facts.request_by()),
+    )
+    .await;
     let inbox =
         inbox.map_err(|error| Box::new(facts.setup_failed("the reopen inbox listing", error)))?;
     for number in 1..facts.number.get() {
@@ -325,11 +332,12 @@ async fn cleanup_leftovers(
         if !inbox.contains(&input) {
             continue;
         }
-        server.routing().request_started(id);
-        let result = requests::cancel_leftover(server.http(), id, &input, facts.request_by()).await;
-        if !matches!(&result, Err(SetupError::Http(_))) {
-            server.routing().request_completed(id);
-        }
+        let result = tracked(
+            server,
+            Some(id),
+            requests::cancel_leftover(server.http(), id, &input, facts.request_by()),
+        )
+        .await;
         result.map_err(|error| {
             Box::new(facts.setup_failed("a leftover inbox cancellation", error))
         })?;
@@ -342,10 +350,18 @@ async fn cleanup_leftovers(
             if server.routing().cleanup_cancelled(id, &input) {
                 break;
             }
+            // These waits consume no cancellation proof or route state on drop.
             tokio::select! {
-                ()=&mut notified=>{},
-                ()=tokio::time::sleep_until(cancelled_by.instant())=>return Err(Box::new(facts.rejected(StartRejected::VendorError(Some(VendorCode::from("session_busy".to_owned())),"a leftover input cancellation was not observed".to_owned())))),
-                _end=server.wait_end()=>return Err(Box::new(facts.rejected(StartRejected::SessionGone))),
+                () = &mut notified => {},
+                () = tokio::time::sleep_until(cancelled_by.instant()) => {
+                    return Err(Box::new(facts.rejected(StartRejected::VendorError(
+                        Some(VendorCode::from("session_busy".to_owned())),
+                        "a leftover input cancellation was not observed".to_owned(),
+                    ))));
+                },
+                _end = server.wait_end() => {
+                    return Err(Box::new(facts.rejected(StartRejected::SessionGone)));
+                },
             }
         }
     }
@@ -386,21 +402,9 @@ pub(super) fn ordered_result(facts: &mut Turn<'_>, cause: Option<RouteError>) ->
                 detail: "a session event did not match the protocol",
             },
             Some(Stop::Lane(LaneFailure::Overflow)) => RouteError::Overflow { turn: facts.number },
-            Some(Stop::Generation(GenerationEnd::Lost(loss))) => match loss.cause {
-                via_routes::codex::LossCause::ServerLost => {
-                    RouteError::ServerLost { turn: facts.number }
-                }
-                via_routes::codex::LossCause::Protocol => RouteError::Protocol {
-                    turn: facts.number,
-                    detail: "the server event envelope did not match the protocol",
-                },
-                via_routes::codex::LossCause::Overflow => {
-                    RouteError::Overflow { turn: facts.number }
-                }
-                via_routes::codex::LossCause::TransportLost => {
-                    RouteError::TransportLost { turn: facts.number }
-                }
-            },
+            Some(Stop::Generation(GenerationEnd::Lost(loss))) => {
+                generation_route_error(loss.cause, facts.number)
+            }
             Some(Stop::Generation(GenerationEnd::Retired) | Stop::Detached) | None => {
                 RouteError::TransportLost { turn: facts.number }
             }
@@ -412,24 +416,7 @@ pub(super) fn ordered_result(facts: &mut Turn<'_>, cause: Option<RouteError>) ->
                 failure.cleanup = Some(loss.cleanup);
                 failure.journal_uncertain = loss.journal_uncertain;
             }
-            end.leftovers =
-                running
-                    .server
-                    .leftovers()
-                    .map(|report| crate::observation::LeftoverReport {
-                        scope: crate::observation::LeftoverScope::Server,
-                        processes: report
-                            .processes
-                            .into_iter()
-                            .map(|process| crate::observation::LeftoverProcess {
-                                pid: process.pid,
-                                comm: process.comm,
-                                started_at: process.started_at,
-                            })
-                            .collect(),
-                        total: report.total,
-                        incomplete: report.incomplete,
-                    });
+            end.leftovers = running.server.leftovers().map(Into::into);
         }
         end.loss = loss;
         end

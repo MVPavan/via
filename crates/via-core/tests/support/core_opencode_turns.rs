@@ -342,6 +342,100 @@ fn oc11_vendor_error_class_hints_never_return_vendor_text() {
     }
 }
 
+/// Setup observations precede this turn's admission window (`OpenCode` §7.2).
+#[test]
+fn oc11_session_creation_events_do_not_taint_the_first_turn_usage() {
+    let case = Case::new(&json!({}));
+    let cwd = case.cwd("a");
+    let response = json!({
+        "status":200,
+        "json":core_opencode::session_info(&cwd,"default",&core_opencode::rules(false)),
+        "emit_before_response":true,
+        "sleep_ms":150,
+        "emit":[
+            event("session.created",json!({"sessionID":SES})),
+            event("session.execution.started",json!({"sessionID":SES})),
+            event("session.execution.succeeded",json!({"sessionID":SES}))
+        ]
+    });
+    case.fixture(&with_route(
+        server(&cwd, None),
+        route("POST", "/api/session", json!([response])),
+    ));
+    let envelope = run(async {
+        let daemon = case.daemon();
+        let (session, _) = daemon.spawn(&cwd, &json!({})).await;
+        let result = daemon.wait_result(&session, 1).await;
+        daemon.stop().await;
+        result
+    });
+    run(case.all_gone());
+    let envelope = envelope.unwrap();
+    assert_eq!(envelope["state"], "completed", "{envelope}");
+    assert_eq!(envelope["usage"]["provenance"], "reported", "{envelope}");
+    assert_eq!(envelope["usage"]["input_tokens"], 11, "{envelope}");
+    let frames = case.frames();
+    assert_eq!(frames[0]["type"], "session.created", "{frames:?}");
+    assert_eq!(frames[1]["type"], "session.execution.started", "{frames:?}");
+    assert_eq!(
+        frames[2]["type"], "session.execution.succeeded",
+        "{frames:?}"
+    );
+    let prompts = case.requests_to("POST", &format!("/api/session/{SES}/prompt"));
+    assert_eq!(prompts.len(), 1);
+    assert!(
+        prompts[0]["received_ms"].as_u64().unwrap() >= frames[2]["written_ms"].as_u64().unwrap(),
+        "setup execution must precede turn submission: {prompts:?}, {frames:?}"
+    );
+}
+
+/// Rejections in another session cannot poison a later turn (`OpenCode` §12).
+#[test]
+fn oc11_unrelated_session_rejection_does_not_taint_successor_usage() {
+    let case = Case::new(&json!({}));
+    let cwd = case.cwd("a");
+    let response = json!({
+        "status":200,
+        "json":core_opencode::session_info(&cwd,"default",&core_opencode::rules(false)),
+        "emit_before_response":true,
+        "sleep_ms":150,
+        "emit":[event("session.step.ended",json!({
+            "sessionID":"ses_foreign", "assistantMessageID":"msg_foreign", "finish":"stop",
+            "tokens":{"input":300,"output":7}, "cost":9
+        }))]
+    });
+    case.fixture(&with_route(
+        server(&cwd, None),
+        route("GET", &format!("/api/session/{SES}"), json!([response])),
+    ));
+    let (first, second) = run(async {
+        let daemon = case.daemon();
+        let (session, _) = daemon.spawn(&cwd, &json!({})).await;
+        let first = daemon.wait_result(&session, 1).await;
+        daemon.try_resume(&session, &json!({})).await.unwrap();
+        let second = daemon.wait_result(&session, 2).await;
+        daemon.stop().await;
+        (first, second)
+    });
+    run(case.all_gone());
+    for envelope in [first, second] {
+        let envelope = envelope.unwrap();
+        assert_eq!(envelope["state"], "completed", "{envelope}");
+        assert_eq!(envelope["usage"]["provenance"], "reported", "{envelope}");
+        assert_eq!(envelope["usage"]["input_tokens"], 11, "{envelope}");
+    }
+    assert_eq!(
+        case.starts(),
+        1,
+        "the rejection stays in the same generation"
+    );
+    assert_eq!(
+        case.requests_to("POST", &format!("/api/session/{SES}/prompt"))
+            .len(),
+        2
+    );
+}
+
 #[test]
 fn oc05_running_execution_ends_before_successor_prompt_is_sent() {
     let case = Case::new(&json!({}));
@@ -370,6 +464,8 @@ fn oc05_running_execution_ends_before_successor_prompt_is_sent() {
     run(case.all_gone());
     let envelope = envelope.unwrap();
     assert_eq!(envelope["state"], "completed", "{envelope}");
+    assert_eq!(envelope["usage"]["provenance"], "reported", "{envelope}");
+    assert_eq!(envelope["usage"]["input_tokens"], 11, "{envelope}");
     let prompts = case.requests_to("POST", &format!("/api/session/{SES}/prompt"));
     assert_eq!(prompts.len(), 1);
     let frames = case.frames();
@@ -474,14 +570,16 @@ fn oc06_interleaved_sessions_keep_text_and_terminals_with_their_owner() {
         ),
     );
     case.fixture(&fixture);
-    let (first, second) = run(async {
+    let (accepted, first, second) = run(async {
         let daemon = case.daemon();
         let (a, _) = daemon.spawn(&cwd, &json!({})).await;
         // Core's acceptance confirms the first input reached the owning
         // delivery before the second releases its interleaved frames.
         let by = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut accepted = true;
         while daemon.status(&a).await["active_turn"]["phase"] != "accepted" {
             if tokio::time::Instant::now() >= by {
+                accepted = false;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -489,9 +587,13 @@ fn oc06_interleaved_sessions_keep_text_and_terminals_with_their_owner() {
         let (b, _) = daemon.spawn(&cwd, &json!({})).await;
         let (first, second) = tokio::join!(daemon.wait_result(&a, 1), daemon.wait_result(&b, 1));
         daemon.stop().await;
-        (first, second)
+        (accepted, first, second)
     });
     run(case.all_gone());
+    assert!(
+        accepted,
+        "the first turn was not accepted within five seconds"
+    );
     assert!(
         first.is_ok() && second.is_ok(),
         "first: {first:?}; second: {second:?}; requests: {:?}",
@@ -543,12 +645,14 @@ fn oc10_two_active_turns_share_one_loss_report_and_group_absence() {
         ),
     );
     case.fixture(&fixture);
-    let (first, second) = run(async {
+    let (accepted, first, second) = run(async {
         let daemon = case.daemon();
         let (a, _) = daemon.spawn(&cwd, &json!({})).await;
         let by = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut accepted = true;
         while daemon.status(&a).await["active_turn"]["phase"] != "accepted" {
             if tokio::time::Instant::now() >= by {
+                accepted = false;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -556,9 +660,13 @@ fn oc10_two_active_turns_share_one_loss_report_and_group_absence() {
         let (b, _) = daemon.spawn(&cwd, &json!({})).await;
         let (first, second) = tokio::join!(daemon.wait_result(&a, 1), daemon.wait_result(&b, 1));
         daemon.stop().await;
-        (first, second)
+        (accepted, first, second)
     });
     run(case.all_gone());
+    assert!(
+        accepted,
+        "the first turn was not accepted within five seconds"
+    );
     assert!(
         first.is_ok() && second.is_ok(),
         "first: {first:?}; second: {second:?}; requests: {:?}",

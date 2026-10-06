@@ -218,20 +218,49 @@ fn oc11_usage_requires_terminal_complete_delivery_and_clean_read_prefix() {
     }
 }
 
+#[test]
+fn protocol_health_does_not_attribute_failure_to_a_settled_turn() {
+    let (registration, delivery, _receiver) = setup();
+    delivery.seal();
+    registration.health_failure(LaneFailure::Protocol);
+    assert!(matches!(
+        *registration.health.borrow(),
+        DriverHealth::Failed {
+            first_cause: DriverFailure::ObservationOverflow
+        }
+    ));
+}
+
+#[test]
+fn generation_health_does_not_attribute_failure_to_a_settled_turn() {
+    let (registration, delivery, _receiver) = setup();
+    delivery.seal();
+    registration.generation_health(GenerationEnd::Lost(via_routes::codex::ConnectionLoss {
+        cause: LossCause::Protocol,
+        cleanup: via_routes::WireCleanup::Quiescent,
+        exit: None,
+        journal_uncertain: false,
+    }));
+    assert!(matches!(
+        *registration.health.borrow(),
+        DriverHealth::Failed {
+            first_cause: DriverFailure::ObservationOverflow
+        }
+    ));
+}
+
 fn joined_execution_events(router: &mut Router) {
     use via_routes::opencode::events::{InboxKind, StepKind, Tokens};
     let mut dispatch = |data| {
-        router
-            .dispatch(
-                Event {
-                    id: None,
-                    session_id: Some("ses_joined".into()),
-                    seq: None,
-                    data,
-                },
-                Instant::now(),
-            )
-            .unwrap();
+        router.dispatch(
+            Event {
+                id: None,
+                session_id: Some("ses_joined".into()),
+                seq: None,
+                data,
+            },
+            Instant::now(),
+        );
     };
     dispatch(EventData::Execution {
         kind: ExecutionKind::Started,

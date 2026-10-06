@@ -172,8 +172,9 @@ pub struct RouteMessage { pub payload: FakeMessage }
 ```
 
 The route result and each server route's close and loss paths carry Host's
-`CloseReport.leftovers` (§5) upward unchanged, to the adapter's `TurnEnd` or
-driver `CloseReport` (C2 §4.2).
+explicit `ProcessControl::report_leftovers` snapshot (§5), forwarded by
+`WireSender::report_leftovers`, to the adapter's `TurnEnd` or driver
+`CloseReport` (C2 §4.2).
 
 `FakeStart` contains synthetic vendor session/turn IDs and prompt; the fake
 fixture validates these and emits an explicit acceptance message before
@@ -352,8 +353,9 @@ pub enum Admitted { Message(VendorMessage), Boundary { discarded_bytes: u64 } }
 impl VendorMessage { /* holds its StagingPermit until dropped */ }
 ```
 
-Wire's close report (`WireCloseReport`) carries Host's `leftovers` and
-`stopped_live` unchanged (§5, C2 §4.2).
+Wire's close report (`WireCloseReport`) carries Host's `stopped_live`
+unchanged; `WireSender::report_leftovers` separately forwards Host's
+explicit report-only snapshot (§5, C2 §4.2).
 
 The clonable sender/control handle and unique message receiver allow reads and
 control writes concurrently without borrowing one object mutably twice.
@@ -725,10 +727,12 @@ vendor had already exited, or the anchor's own cleanup had begun
 before it. Wire forwards it unchanged; only a shared-server route reads
 it, to tell a dead server (`server_lost`) from a lost transport.
 
-**Leftover report (C2 §4.2).** Host's `CloseReport` gains
-`leftovers: Option<LeftoverReport>`, produced after Host's close of the
-connection completes, within its existing bound (unchanged), and ready
-before its destination commits. VIA never signals or manages leftovers.
+**Leftover report (C2 §4.2).** After close, a route with an existing result
+destination explicitly calls Host's `ProcessControl::report_leftovers`
+through `WireSender::report_leftovers`, within the original close deadline.
+The route saves the snapshot before publishing loss or committing its
+destination; ordinary close, retirement, shutdown and recovery do not scan.
+VIA never signals or manages leftovers.
 Host owns detection: a report-only scan for its process marker (owner
 decision A, 2026-10-01; adapter design AD20 and AR2).
 

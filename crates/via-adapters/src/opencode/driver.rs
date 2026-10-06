@@ -30,9 +30,7 @@ use via_routes::opencode::{Server, ServerFacts, ServerLease, ServerPin};
 
 use super::delivery::Registration;
 use super::plan::{self, model_parts};
-use super::{HARNESS, OpenCodeAdapter, launch};
-#[path = "execution.rs"]
-mod execution;
+use super::{HARNESS, OpenCodeAdapter, execution, launch};
 use crate::driver::turn::ordered;
 use crate::driver::{ConnectionPin, Prepared, SessionDriver, TurnCx, TurnSpec, rejected};
 use crate::instance::Incompatibility;
@@ -161,7 +159,8 @@ impl OpenCodeSession {
         }
     }
 
-    fn delivery(
+    /// §7.1: retain one ordered consumer for this session and generation.
+    pub(super) fn delivery(
         &self,
         driver: &SessionDriver,
         server: &Arc<Server>,
@@ -198,7 +197,7 @@ impl OpenCodeSession {
 }
 
 /// What the session's readbacks compare (§5), as this turn requests it.
-struct Settings {
+pub(super) struct Settings {
     /// The model identity, without a variant.
     model: ModelRef,
     /// The canonical cwd.
@@ -208,7 +207,7 @@ struct Settings {
     /// VIA's instruction entry.
     instructions: Option<String>,
     /// The turn's variant: its effort, `"default"` normalized to none.
-    variant: Option<String>,
+    pub(super) variant: Option<String>,
 }
 
 impl Settings {
@@ -360,6 +359,7 @@ pub(crate) async fn run_turn(
         cx.activity,
         &spec.prompt,
     ));
+    // Dropping setup retains request accounting; a running guard seals its turn.
     let outcome = tokio::select! {
         end = set_up => Some(end),
         () = ended => None,
@@ -377,18 +377,18 @@ pub(crate) async fn run_turn(
     execution::ordered_result(&mut facts, Some(cause))
 }
 
-/// One turn's facts as its ends report them.
-struct Turn<'a> {
-    driver: &'a SessionDriver,
-    session: &'a OpenCodeSession,
-    number: TurnNumber,
+/// One turn's facts at the outcome boundary (`opencode.md` §7.3).
+pub(super) struct Turn<'a> {
+    pub(super) driver: &'a SessionDriver,
+    pub(super) session: &'a OpenCodeSession,
+    pub(super) number: TurnNumber,
     /// The server's version, once known.
-    instance: Option<InstanceReport>,
+    pub(super) instance: Option<InstanceReport>,
     /// The turn's wall, which bounds every request.
-    wall: Deadline,
-    submitted: bool,
-    reopened: bool,
-    running: Option<execution::Running>,
+    pub(super) wall: Deadline,
+    pub(super) submitted: bool,
+    pub(super) reopened: bool,
+    pub(super) running: Option<execution::Running>,
 }
 
 impl<'a> Turn<'a> {
@@ -410,7 +410,7 @@ impl<'a> Turn<'a> {
     }
 
     /// One setup request's deadline: `min(remaining wall, 30 s)` (§8).
-    fn request_by(&self) -> Deadline {
+    pub(super) fn request_by(&self) -> Deadline {
         Deadline::at((Instant::now() + SETUP_TIMEOUT).min(self.wall.instant()))
     }
 
@@ -429,7 +429,7 @@ impl<'a> Turn<'a> {
 
     /// The turn's end with `cause`; nothing of it was prompted, so no
     /// cleanup of its own (C2 §2 no-launch evidence).
-    fn failed(&self, cause: RouteError) -> TurnEnd {
+    pub(super) fn failed(&self, cause: RouteError) -> TurnEnd {
         self.end(AdapterError::Route(RouteFailure {
             cause,
             undecoded: None,
@@ -445,7 +445,7 @@ impl<'a> Turn<'a> {
     }
 
     /// A definite rejection before any prompt.
-    fn rejected(&self, reason: StartRejected) -> TurnEnd {
+    pub(super) fn rejected(&self, reason: StartRejected) -> TurnEnd {
         self.end(AdapterError::Rejected {
             reason,
             evidence: TurnEvidence::no_launch(false),
@@ -488,7 +488,7 @@ impl<'a> Turn<'a> {
     /// (the password no longer works); no complete response, or one that
     /// does not decode, leaves the request's effect unknown, and the turn
     /// ends unprompted.
-    fn setup_failed(&self, request: &'static str, error: SetupError) -> TurnEnd {
+    pub(super) fn setup_failed(&self, request: &'static str, error: SetupError) -> TurnEnd {
         match error {
             SetupError::Status { status: 401, .. } => self.failed(RouteError::Protocol {
                 turn: self.number,
@@ -695,9 +695,9 @@ async fn unchecked_credentials(facts: &Turn<'_>, server: &ServerFacts) -> Result
         .await
 }
 
-/// Setup request accounting survives cancellation and driver replacement.
+/// §7.2: request accounting survives cancellation and driver replacement.
 /// Only a complete response or positive never-sent evidence releases it.
-async fn tracked<T>(
+pub(super) async fn tracked<T>(
     server: &Server,
     id: Option<&str>,
     request: impl std::future::Future<Output = Result<T, SetupError>>,
@@ -719,7 +719,7 @@ async fn tracked<T>(
 /// §5: a non-default effort must be a variant of the session's model in a
 /// fresh catalog at the session's location, else the turn is refused
 /// naming `effort`, nothing sent.
-async fn effort_offered(
+pub(super) async fn effort_offered(
     facts: &Turn<'_>,
     server: &Server,
     settings: &Settings,
@@ -918,7 +918,7 @@ async fn confirm(facts: &Turn<'_>, (generation, id): (u64, &str)) -> Result<(), 
 /// §5 variant step: when the session's variant differs from the turn's,
 /// the model is switched (no variant clears it) and read back; a readback
 /// still differing is an ignored switch, refused as just sent.
-async fn switch_variant(
+pub(super) async fn switch_variant(
     facts: &Turn<'_>,
     server: &Server,
     (settings, id, current): (&Settings, &str, String),

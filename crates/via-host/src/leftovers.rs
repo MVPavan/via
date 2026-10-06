@@ -1,4 +1,4 @@
-//! Report-only marker scan. Its results never grant signalling authority.
+//! Report-only marker scan (runtime §5). Results never grant signalling authority.
 
 use rustix::fs::{CWD, Mode, OFlags, openat};
 use std::os::fd::AsFd;
@@ -57,7 +57,14 @@ impl LeftoverReport {
     }
 }
 
+// Runtime §5 mandates the environment cap. Metadata caps keep the same
+// best-effort scan bounded even on large procfs tables; overflow is incomplete.
 const ENV_MAX: usize = 256 * 1024;
+const BOOT_STAT_MAX: usize = 1024 * 1024;
+const MOUNTS_MAX: usize = 1024 * 1024;
+const PROCESS_STAT_MAX: usize = 8192;
+const PROCESS_STATUS_MAX: usize = 64 * 1024;
+const PROCESS_COMM_MAX: usize = 4096;
 
 /// Shared progress retains only public report data. The task belongs to Host,
 /// including after a caller deadline; cancellation stops further procfs reads.
@@ -103,15 +110,17 @@ pub(crate) fn scan(
     if expired(state, deadline) {
         return report;
     }
-    // Both are procfs metadata, never vendor environments or command lines.
-    let boot = fs::read_to_string(root.join("stat")).ok().and_then(|text| {
-        text.lines()
-            .find_map(|line| line.strip_prefix("btime "))?
-            .trim()
-            .parse::<u64>()
-            .ok()
-    });
-    let Some(boot) = boot else { return report };
+    let Ok(root_dir) = openat(
+        CWD,
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    ) else {
+        return report;
+    };
+    let Some(boot) = read_boot(&root_dir, state, deadline) else {
+        return report;
+    };
     let hz = rustix::param::clock_ticks_per_second();
     if hz == 0 {
         return report;
@@ -119,19 +128,7 @@ pub(crate) fn scan(
     if expired(state, deadline) {
         return report;
     }
-    let mounts = fs::read_to_string(root.join("mounts"));
-    report.incomplete = match mounts {
-        Ok(mounts) => mounts.lines().any(|line| {
-            let fields: Vec<_> = line.split_ascii_whitespace().collect();
-            fields.get(1) == Some(&"/proc")
-                && fields.get(3).is_some_and(|options| {
-                    options
-                        .split(',')
-                        .any(|option| matches!(option, "hidepid=4" | "hidepid=ptraceable"))
-                })
-        }),
-        Err(_) => true,
-    };
+    report.incomplete = mounts_incomplete(&root_dir, state, deadline);
     if expired(state, deadline) {
         report.incomplete = true;
         return report;
@@ -151,6 +148,7 @@ pub(crate) fn scan(
             report.incomplete = true;
             continue;
         };
+        // Non-numeric procfs entries are not process candidates.
         let Some(pid) = entry
             .file_name()
             .to_str()
@@ -198,6 +196,41 @@ pub(crate) fn scan(
     report
 }
 
+fn read_boot(dir: &impl AsFd, state: &ScanState, deadline: Instant) -> Option<u64> {
+    // Failed, oversized or malformed boot metadata cannot authorize candidate
+    // reads; the discarded errors leave the initial incomplete report intact.
+    read_at(dir, "stat", BOOT_STAT_MAX, state, deadline)
+        .ok()
+        .flatten()
+        .and_then(|bytes| {
+            let text = std::str::from_utf8(&bytes).ok()?;
+            text.lines()
+                .find_map(|line| line.strip_prefix("btime "))?
+                .trim()
+                .parse::<u64>()
+                .ok()
+        })
+}
+
+fn mounts_incomplete(dir: &impl AsFd, state: &ScanState, deadline: Instant) -> bool {
+    // Both tables are procfs metadata, never environments or command lines.
+    match read_at(dir, "mounts", MOUNTS_MAX, state, deadline) {
+        Ok(Some(bytes)) => match std::str::from_utf8(&bytes) {
+            Ok(mounts) => mounts.lines().any(|line| {
+                let fields: Vec<_> = line.split_ascii_whitespace().collect();
+                fields.get(1) == Some(&"/proc")
+                    && fields.get(3).is_some_and(|options| {
+                        options
+                            .split(',')
+                            .any(|option| matches!(option, "hidepid=4" | "hidepid=ptraceable"))
+                    })
+            }),
+            Err(_) => true,
+        },
+        Ok(None) | Err(_) => true,
+    }
+}
+
 fn expired(state: &ScanState, deadline: Instant) -> bool {
     state.cancelled.load(Ordering::Acquire) || Instant::now() >= deadline
 }
@@ -230,14 +263,15 @@ fn candidate(
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
         Mode::empty(),
     )?;
-    let Some(stat) = read_at(&dir, "stat", 8192, state, deadline)? else {
+    let Some(stat) = read_at(&dir, "stat", PROCESS_STAT_MAX, state, deadline)? else {
         return Ok(None);
     };
-    let (ticks, process_state) = parse_stat(&stat)?;
-    if ticks < bound || matches!(process_state, b'Z' | b'X' | b'x') {
+    let stat = crate::linux::parse_process_stat(&stat)?;
+    let ticks = stat.start_ticks;
+    if ticks < bound || matches!(stat.state, b'Z' | b'X' | b'x') {
         return Ok(None);
     }
-    let Some(status) = read_at(&dir, "status", 64 * 1024, state, deadline)? else {
+    let Some(status) = read_at(&dir, "status", PROCESS_STATUS_MAX, state, deadline)? else {
         return Ok(None);
     };
     if parse_uid(&status)? != uid {
@@ -251,19 +285,19 @@ fn candidate(
     if !matches {
         return Ok(None);
     }
-    let Some(comm) = read_at(&dir, "comm", 4096, state, deadline)? else {
+    let Some(comm) = read_at(&dir, "comm", PROCESS_COMM_MAX, state, deadline)? else {
         return Ok(None);
     };
-    let Some(stat) = read_at(&dir, "stat", 8192, state, deadline)? else {
+    let Some(stat) = read_at(&dir, "stat", PROCESS_STAT_MAX, state, deadline)? else {
         return Ok(None);
     };
-    let (final_ticks, final_state) = parse_stat(&stat)?;
-    let Some(status) = read_at(&dir, "status", 64 * 1024, state, deadline)? else {
+    let final_stat = crate::linux::parse_process_stat(&stat)?;
+    let Some(status) = read_at(&dir, "status", PROCESS_STATUS_MAX, state, deadline)? else {
         return Ok(None);
     };
-    if ticks != final_ticks
+    if ticks != final_stat.start_ticks
         || parse_uid(&status)? != uid
-        || matches!(final_state, b'Z' | b'X' | b'x')
+        || matches!(final_stat.state, b'Z' | b'X' | b'x')
     {
         return Ok(None);
     }
@@ -272,10 +306,7 @@ fn candidate(
     let seconds = boot
         .checked_add(ticks / hz)
         .ok_or_else(|| io::Error::other("start time overflow"))?;
-    // Existing Host UTC calendar arithmetic, transformed to RFC 3339 seconds.
-    let started_at = crate::linux::utc(seconds)
-        .replace(' ', "T")
-        .replace("TUTC", "Z");
+    let started_at = crate::linux::utc_rfc3339(seconds);
     Ok(Some((
         ticks,
         LeftoverProcess {
@@ -318,6 +349,7 @@ fn read_at(
         check_deadline(state, deadline)?;
         let limit = chunk.len().min(cap + 1 - bytes.len());
         let count = file.read(&mut chunk[..limit])?;
+        check_deadline(state, deadline)?;
         if count == 0 {
             return Ok((!bytes.is_empty()).then_some(bytes));
         }
@@ -328,29 +360,6 @@ fn read_at(
     }
 }
 
-fn parse_stat(bytes: &[u8]) -> io::Result<(u64, u8)> {
-    let start = bytes
-        .windows(2)
-        .rposition(|part| part == b") ")
-        .ok_or_else(|| io::Error::other("bad process stat"))?
-        + 2;
-    let fields: Vec<_> = bytes[start..]
-        .split(u8::is_ascii_whitespace)
-        .filter(|part| !part.is_empty())
-        .collect();
-    let state = fields
-        .first()
-        .and_then(|part| part.first())
-        .copied()
-        .ok_or_else(|| io::Error::other("missing state"))?;
-    let ticks = fields
-        .get(19)
-        .and_then(|part| std::str::from_utf8(part).ok())
-        .and_then(|part| part.parse().ok())
-        .ok_or_else(|| io::Error::other("missing start ticks"))?;
-    Ok((ticks, state))
-}
-
 fn parse_uid(bytes: &[u8]) -> io::Result<u32> {
     bytes
         .split(|byte| *byte == b'\n')
@@ -359,6 +368,7 @@ fn parse_uid(bytes: &[u8]) -> io::Result<u32> {
             let word = line
                 .split(u8::is_ascii_whitespace)
                 .find(|word| !word.is_empty())?;
+            // Invalid uid fields yield the error below, never eligibility.
             std::str::from_utf8(word).ok()?.parse().ok()
         })
         .ok_or_else(|| io::Error::other("missing real uid"))
@@ -542,13 +552,18 @@ mod tests {
         let bytes = read_at(
             &dir,
             "stat",
-            8192,
+            PROCESS_STAT_MAX,
             &state,
             Instant::now() + Duration::from_secs(1),
         )
         .unwrap()
         .unwrap();
-        assert_eq!(parse_stat(&bytes).unwrap().0, 100);
+        assert_eq!(
+            crate::linux::parse_process_stat(&bytes)
+                .unwrap()
+                .start_ticks,
+            100
+        );
     }
 
     #[test]
@@ -567,5 +582,41 @@ mod tests {
             &ScanState::new(LeftoverScope::Turn),
         );
         assert_eq!(expired, LeftoverReport::incomplete(LeftoverScope::Turn));
+    }
+
+    #[test]
+    fn leftover_scan_rejects_oversized_boot_metadata() {
+        let proc = ProcFixture::new();
+        proc.entry(
+            41,
+            100,
+            rustix::process::getuid().as_raw(),
+            'S',
+            b"VIA_PROCESS_MARKER=match\0",
+        );
+        let mut stat = "btime 1700000000\n".to_owned();
+        stat.extend(std::iter::repeat_n(' ', 2 * 1024 * 1024));
+        fs::write(proc.0.join("stat"), stat).unwrap();
+        let report = proc.report(Some(100));
+        assert_eq!(report.total, 0);
+        assert!(report.incomplete);
+    }
+
+    #[test]
+    fn leftover_scan_rejects_oversized_mount_metadata() {
+        let proc = ProcFixture::new();
+        proc.entry(
+            41,
+            100,
+            rustix::process::getuid().as_raw(),
+            'S',
+            b"VIA_PROCESS_MARKER=match\0",
+        );
+        let mut mounts = "proc /proc proc rw,hidepid=0 0 0\n".to_owned();
+        mounts.extend(std::iter::repeat_n(' ', 2 * 1024 * 1024));
+        fs::write(proc.0.join("mounts"), mounts).unwrap();
+        let report = proc.report(Some(100));
+        assert_eq!(report.total, 1);
+        assert!(report.incomplete);
     }
 }

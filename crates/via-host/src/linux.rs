@@ -35,12 +35,36 @@ pub(crate) fn time_namespace() -> io::Result<String> {
 }
 
 pub(crate) fn process_stat(process_id: u32) -> io::Result<(u32, u64)> {
-    let text = fs::read_to_string(format!("/proc/{process_id}/stat"))?;
-    let rest = text
-        .rsplit_once(") ")
+    let bytes = fs::read(format!("/proc/{process_id}/stat"))?;
+    let stat = parse_process_stat(&bytes)?;
+    Ok((stat.group_id, stat.start_ticks))
+}
+
+/// Process identity fields shared with the descriptor-bound scan (runtime §5).
+pub(crate) struct ProcessStat {
+    /// Kernel state used to exclude dead candidates (runtime §5).
+    pub(crate) state: u8,
+    /// Process group retained for Host identity checks (runtime §5).
+    pub(crate) group_id: u32,
+    /// Boot-relative identity and eligibility bound (runtime §5).
+    pub(crate) start_ticks: u64,
+}
+
+/// Parse a previously read stat without reopening its PID (runtime §5).
+pub(crate) fn parse_process_stat(bytes: &[u8]) -> io::Result<ProcessStat> {
+    let start = bytes
+        .windows(2)
+        .rposition(|part| part == b") ")
         .ok_or_else(|| io::Error::other("bad process stat"))?
-        .1;
+        + 2;
+    let rest = std::str::from_utf8(&bytes[start..])
+        .map_err(|_| io::Error::other("bad process stat fields"))?;
     let fields: Vec<_> = rest.split_ascii_whitespace().collect();
+    let state = fields
+        .first()
+        .filter(|field| field.len() == 1)
+        .map(|field| field.as_bytes()[0])
+        .ok_or_else(|| io::Error::other("bad process state"))?;
     let group_id = fields
         .get(2)
         .ok_or_else(|| io::Error::other("missing group"))?
@@ -51,7 +75,11 @@ pub(crate) fn process_stat(process_id: u32) -> io::Result<(u32, u64)> {
         .ok_or_else(|| io::Error::other("missing start ticks"))?
         .parse()
         .map_err(|_| io::Error::other("bad start ticks"))?;
-    Ok((group_id, start_ticks))
+    Ok(ProcessStat {
+        state,
+        group_id,
+        start_ticks,
+    })
 }
 
 pub(crate) fn uid_of(pid: u32) -> io::Result<u32> {
@@ -139,6 +167,15 @@ pub(crate) fn boot_ticks_utc(start_ticks: u64) -> Option<String> {
 /// `seconds` after the Unix epoch as `YYYY-MM-DD HH:MM:SS UTC` (civil from
 /// days, H. Hinnant).
 pub(crate) fn utc(seconds: u64) -> String {
+    format_utc(seconds, ' ', " UTC")
+}
+
+/// Second-precision UTC timestamp for leftover reports (runtime §5).
+pub(crate) fn utc_rfc3339(seconds: u64) -> String {
+    format_utc(seconds, 'T', "Z")
+}
+
+fn format_utc(seconds: u64, separator: char, suffix: &str) -> String {
     let (days, rest) = (seconds / 86_400, seconds % 86_400);
     let shifted = days + 719_468;
     let era = shifted / 146_097;
@@ -155,7 +192,7 @@ pub(crate) fn utc(seconds: u64) -> String {
     };
     let year = year_of_era + era * 400 + u64::from(month <= 2);
     format!(
-        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02} UTC",
+        "{year:04}-{month:02}-{day:02}{separator}{:02}:{:02}:{:02}{suffix}",
         rest / 3600,
         rest % 3600 / 60,
         rest % 60

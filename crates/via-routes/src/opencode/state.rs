@@ -1,4 +1,4 @@
-//! Admission facts, distinct from driver outcomes, live for a server generation.
+//! Server-scoped admission facts, independent of outcomes (`opencode.md` §7.2).
 
 use std::collections::HashSet;
 
