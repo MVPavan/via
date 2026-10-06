@@ -553,7 +553,7 @@ When `die_with_anchor` is set, the anchor starts the vendor (and a
 `version_probe`, below) through the same binary's internal exec entry, a
 sibling of the anchor entrypoint (owned by `via-host`, dispatched from
 `via`'s `main` as `__via_host_anchor` is):
-`/proc/self/exe __via_host_exec <anchor pid> <go fd or -> <program> <args…>`,
+`/proc/self/exe __via_host_exec <anchor pid> <record path or -> <program> <args…>`,
 with the child's cwd, environment, umask and standard streams already in
 place. That process:
 
@@ -561,9 +561,14 @@ place. That process:
    (`rustix::process::set_parent_process_death_signal`) and reads it back;
 2. checks that `getppid()` is the anchor pid (it is not if the anchor died
    first);
-3. with a go fd (the vendor launch under `exclusive_lock`), marks it
-   close-on-exec and blocks reading one byte from it; end of file or a
-   read failure is a failure;
+3. with a record path (the vendor launch under `exclusive_lock`), reads
+   that file by path (read-only, no lock, no symlink follow, a fresh open
+   and close each time) about every 2 ms, re-checking `getppid()` each
+   time, until it holds a record with a valid checksum naming its own boot
+   ID, `/proc/self/ns/pid` identity, pid and start ticks (from
+   `/proc/self/stat`); a changed parent, a read error or 5 s from its
+   start is a failure. It inherits no descriptor beyond its standard
+   streams;
 4. replaces itself with the program
    (`std::os::unix::process::CommandExt::exec`, `argv[0]` the program
    path).
@@ -580,7 +585,9 @@ of these failures is a vendor exit before the route's handshake.
   (`unsafe_code = "forbid"`, coding style); `process-wrap` 10 has no
   parent-death wrapper, its `pre_spawn` hook runs in the parent, and its
   own pre-exec wrappers use `unsafe` internally. The exec entry uses only
-  safe rustix and std calls. An owner exception to `forbid` for one
+  safe rustix and std calls; it adopts no inherited descriptor (turning an
+  inherited fd number into a handle, `BorrowedFd::borrow_raw`, is
+  `unsafe`), which is why it learns of its record by reading the file. An owner exception to `forbid` for one
   `pre_exec` closure would remove the extra exec; it is not needed.
 - **Spawning thread.** The kernel sends the signal when the thread that
   created the child exits, not when its process does. The anchor runs a
@@ -603,12 +610,16 @@ of these failures is a vendor exit before the route's handshake.
 `vendors/opencode.md` §3.2). Host refuses a spec that sets
 `exclusive_lock` without `die_with_anchor`. On `Configure`, the anchor:
 
-1. refuses to run as effective user ID 0 or with a non-zero `CapPrm`,
-   `CapEff` or `CapAmb` in `/proc/self/status` (`PrivilegedVia`), and a
+1. refuses (`PrivilegedVia`) unless, in `/proc/self/status`, the four
+   `Uid:` values (real, effective, saved, filesystem) are equal and not 0,
+   the four `Gid:` values are equal, and `CapPrm`, `CapEff` and `CapAmb`
+   are zero (without capabilities, every set-ID call can only choose
+   among those equal IDs, so the vendor can make no ID change that clears
+   its parent-death signal; `vendors/opencode.md` §3.2); and it refuses a
    program file with the set-user-ID or set-group-ID bit or a
    `security.capability` attribute (`ProgramPrivileged`);
 2. with `version_probe`, runs the program through the exec entry (no
-   go fd) with the probe's arguments, cwd and environment, stdin
+   record path) with the probe's arguments, cwd and environment, stdin
    `/dev/null`, stdout kept up to 256 bytes, stderr discarded, killing and
    waiting for it at 2 s; exit 0 with a trimmed output in `admitted`
    passes, exit 0 with other output is `ProbeRefused { output }` (printable
@@ -618,12 +629,18 @@ of these failures is a vendor exit before the route's handshake.
    a held lock is `LockHeld`;
 4. reads the server record and requires its server gone
    (`vendors/opencode.md` §3.2): a missing or torn record, another boot
-   ID, or, in the same boot and PID namespace, `/proc/<pid>` gone, other
-   start ticks, or two zombie observations 20 ms apart, each reading
-   through one `/proc/<pid>` directory descriptor the `stat` state, then
-   `status` `Threads`, then the `stat` state and start ticks again, and
-   passing only on `Z`, 1, `Z` and unchanged ticks; it re-probes every
-   20 ms for up to 1 s, then replies `PredecessorAlive`. The same boot in another
+   ID, or, in the same boot and PID namespace, an exact exit proof:
+   `rustix::process::pidfd_open(pid, PidfdFlags::empty())` failing with
+   `ESRCH`; or, after it opens, `/proc/<pid>/stat` gone or showing other
+   start ticks (the pid was reused); or, with equal ticks (the pidfd names
+   the recorded process), `rustix::event::poll` on it reporting readable,
+   which Linux's `pidfd_poll` (`kernel/fork.c`) does only when
+   `thread_group_exited` (`kernel/exit.c`) holds, that is, the whole
+   thread group has exited, reaped or not. Any other `pidfd_open` error
+   (`EINVAL`, `ENOSYS`, permission) or a poll that is not readable is
+   present: unavailability fails closed. A present server is waited for by
+   polling the pidfd with a timeout, up to 1 s in all, then the anchor
+   replies `PredecessorAlive`. The same boot in another
    PID namespace is `PredecessorUncertain { namespace }` at once.
 
 On any of these errors it replies the error and exits: Host commits no
@@ -636,21 +653,20 @@ stays close-on-exec, so neither the exec entry nor the vendor inherits
 it; the anchor never unlocks or closes it, and the kernel releases it
 when the anchor exits.
 
-At ARM, under `exclusive_lock`, the anchor creates a go pipe (both ends
-close-on-exec), clears close-on-exec on the read end for the spawn only
-(the anchor spawns from one thread and starts nothing else meanwhile),
-spawns the exec entry with that fd, and closes its read end. While still
-holding the lock it reads the child's start ticks from `/proc/<pid>` (the
-pid the spawn returned; the child is unreaped), writes the server record
-through its lock descriptor (boot ID, its PID-namespace identity, the
-child's pid and start ticks and a checksum, one fixed-size write at
-offset 0), and only then writes the go byte and closes the write end.
-Only the live lock holder ever writes the record, and no child executes
-the vendor before the record naming it exists; an anchor that dies
-before the record write leaves its child reading end of file. A failed
-record write closes the write end without the byte (the child exits
-125), and the anchor reaps the child and replies `FenceRecordFailed`
-instead of `Spawned`, a launch failure. With `die_with_anchor`, the vendor dies with the
+At ARM, under `exclusive_lock`, the anchor spawns the exec entry with the
+lock path as its record path. While still holding the lock it reads the
+child's start ticks from `/proc/<pid>` (the pid the spawn returned; the
+child is unreaped) and writes the server record through its lock
+descriptor (boot ID, its PID-namespace identity, the child's pid and
+start ticks and a checksum, one fixed-size write at offset 0). Only the
+live lock holder ever writes the record, and no child executes the
+vendor before a record naming it exists; a child whose anchor dies before
+the write is never named (a successor's record names the successor's own
+child) and never executes the vendor. A failed record write makes the
+anchor kill and reap its child, which has not executed the vendor, and
+reply `FenceRecordFailed` instead of `Spawned`, a launch failure. The
+pidfd proof needs rustix's `event` feature in `via-host`, beside the
+`process` feature it already enables. With `die_with_anchor`, the vendor dies with the
 anchor, so the lock is free only after its holder's vendor has been sent
 `SIGKILL`; step 4 covers the moment between the anchor's descriptors
 closing and the vendor's death. Nothing about the lock or the record
