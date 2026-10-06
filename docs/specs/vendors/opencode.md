@@ -73,18 +73,28 @@ rejected: tools would inherit the password.
 
 No session mutation or prompt is sent before publication.
 
-**Vendor argument passthrough (owner, 2026-10-06; C2 §6.3; adopt when the
-adapter is built).** A session's frozen `vendor_args` are appended after
-VIA's `serve` flags (`serve --stdio --hostname 127.0.0.1 --port 0 ARGS…`).
-They are part of `argv` in `recipe_hash` (§3.1), so sessions with different
-lists get different servers. The launch-request check counts them
-(`invalid_params` naming `vendor_args` past Host's 64 KiB). Reserved, matched
-under C2 §6.3: the `serve` flags VIA sets (`--stdio`, `--port`,
-`--hostname`), `--service`, `--standalone`, `--cors`, `--mdns*`, `--help`/
-`-h`, `--version`/`-v`, any flag that selects a configuration, profile,
-project, data directory or log destination VIA owns, every operand and
-`--`. The exact list and the value-option table are derived from the pinned
-`opencode serve --help` when the adapter is built (UNVERIFIED until then).
+**Vendor argument passthrough: refused in the first release (owner,
+2026-10-06; C2 §6.3).** The first-release route runs one server for all of
+VIA, on one private namespace (§3.2), fenced to one live server per data
+root. Arguments on the server's argv are per server, so a session with a
+different list would need a second server on the same data root, which the
+fence forbids. The route therefore refuses any non-empty `vendor_args` in
+`plan` and `check_turn`, before any receipt or vendor I/O, as
+`InvalidParam { field: "vendor_args" }`: C1 `invalid_params` naming
+`vendor_args`, with no kind2, the same refusal the `fake` harness gives.
+`vendor_option_conflict` is not used, because it means "sets what the
+route owns", and this refuses every list, reserved or not. The session's
+results carry no `vendor_passthrough`, since no session of this route has
+the arguments.
+
+Revisit after the release, if OpenCode passthrough is wanted. The
+arguments must then join the namespace (and with it `recipe_hash` and the
+data-root fence), so that each distinct list gets its own namespace and
+server. Reserved flags would then be extracted from the pinned binary, as
+the Claude and Codex packets do: `serve --stdio --port --hostname`,
+`--service`, `--standalone`, `--cors`, `--mdns*`, help and version, any
+flag that selects configuration, profile, project, data directory or log
+destination, every operand, and `--`.
 
 **Failure classes.**
 

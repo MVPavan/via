@@ -936,7 +936,7 @@ of VIA's own recipe:
 |---|---|---|
 | `claude-cli` | each per-turn launch's argv ([Claude packet](vendors/claude-code.md) §4) | per process; part of the handshake-refusal recipe key (§5) |
 | `codex-app-server` | the owned server's argv, after `app-server` and VIA's switches ([Codex packet](vendors/codex.md) §4) | the argv is in `config_hash`, so sessions with different lists get different servers and equal lists share one |
-| `opencode-serve` (adopts this when built) | the owned server's argv, after VIA's `serve` flags ([OpenCode packet](vendors/opencode.md) §2.2) | the argv is in `recipe_hash`, so in the launch key (§3.1 of the packet) |
+| `opencode-serve` | refused in the first release: `InvalidParam { field: "vendor_args" }` for any non-empty list, in `plan` and `check_turn` ([OpenCode packet](vendors/opencode.md) §2.2). The route runs one server for all of VIA on one private namespace, fenced to one live server per data root, so a different list would need a second server on the same data root (owner, 2026-10-06). Revisit after the release if OpenCode passthrough is wanted: the arguments must then join the namespace | — |
 | `pi-rpc` (adopts this when built) | each per-turn launch's argv ([Pi packet](vendors/pi.md) §4.1) | per process; part of the handshake-refusal recipe key |
 | `fake` | refused: `InvalidParam { field: "vendor_args" }` (not a vendor CLI) | — |
 
