@@ -221,14 +221,18 @@ Store:
    evidence (C1 `submit_failed`, `failure.data.reason: launch_failed`,
    with the `launch_failed` warning naming the lock step).
 3. At ARM the anchor clears close-on-exec on that descriptor and starts
-   the server, which inherits it; the anchor keeps its own copy.
+   the server, which inherits it; the anchor keeps its own copy. The
+   anchor never calls `LOCK_UN` and never closes its copy: it holds the
+   lock until it exits.
 
-An `flock` lock belongs to the open file description, so the kernel
-releases it only when the last process holding that description has
-exited. The holders are the anchor and the server; children the server
+An `flock` lock belongs to the open file description. The kernel releases
+it when every descriptor of that description is closed (each holder exits
+or closes its copy), or earlier when any holder calls `LOCK_UN` on its
+copy. The holders are the anchor and the server; children the server
 spawns did not inherit it (E57: location and session shells, including
-`setsid` escapes). The lock therefore lives at least as long as the server
-process, whatever ends it:
+`setsid` escapes). **While the server keeps its inherited descriptor and
+never unlocks it** (qualification gate L13, §13), the lock lives at least
+as long as the server process, whatever ends it:
 
 | Path | Lock |
 |---|---|
@@ -252,14 +256,27 @@ therefore means a process VIA no longer controls holds it: an orphan of a
 crashed daemon, or a generation whose retirement left it running. Each
 later acquisition tries again; nothing is cached or recorded.
 
-Limits. The lock is advisory and same-user: a process that unlinks or
-replaces `server.lock` defeats it, inside C1 §2's boundary. Its hold
-through the server depends on the server keeping its inherited descriptor
-(E57) and, in the unsafe direction, only matters if the anchor is also
-gone. A server child that inherits the descriptor through a spawn path not
-yet probed would keep the lock after the server exits: that fails closed
-(`launch_failed` until the child exits), never into two servers; L13
-(§13) qualifies the remaining spawn paths.
+Limits.
+
+- The lock is advisory and same-user: a process that unlinks or replaces
+  `server.lock`, or unlocks a descriptor of it, defeats it, inside C1 §2's
+  boundary.
+- Its hold through the server depends on the server keeping its inherited
+  descriptor (E57). Losing it is unsafe only if the anchor is also gone
+  (two holders become none while the server still serves); L13 is a
+  qualification gate for it, and fixture OC02b (f) shows the boundary.
+- A server child that inherits the descriptor through a spawn path not yet
+  probed would keep the lock after the server exits: that fails closed
+  (`launch_failed` until the child exits), never into two servers; L13
+  covers the remaining spawn paths.
+- The lock does not touch harness-process capacity. Core reserves a
+  `harness_processes` permit for every recovered anchor row it cannot
+  prove gone, including identity-less pre-ARM intents and rows from an
+  earlier boot, and never releases those permits (a recovery problem for
+  every harness, bead via-joc). Enough such rows can exhaust
+  `harness_processes.limit`, and a new OpenCode server then waits for
+  capacity before it reaches `Configure`, even with the lock free. Stale
+  rows never block through the lock itself.
 
 A lease is held while the session's driver is open. Close of one session
 detaches it (§6); only Host's lifecycle stops the server.
@@ -809,14 +826,14 @@ pinned binary and a free model.
 | OC07 never-ask and isolation | Create/readback rules; other-session rename/move and self-move unavailable (live); declines within 5 s with the general pool full and observations saturated; a late request naming a settled turn's IDs credited to it; unattributed declined and credited to none; only a callID-correlated permission decline maps `interrupted{shutdown}` to `Completed/Other`; form decline leaves the ordinary rows; `vendor.request_declined` fields; `tools_ended` kept; `permission.rejected` → `action.denied`, deduplicated |
 | OC08 control | Cancel before send withdraws; before delivery → inbox cancel → input-cancellation terminal → `cancelled`/`acknowledged`, quiescent; same after wall cleanup keeps `failed(deadline_wall)`; lost cancel race → interrupt; interrupt during a tool → `interrupted{user}`, quiescent; no acknowledgement by `force_at` → `unknown`, no kill, later terminal or input cancellation revises an accepted turn |
 | OC09 outcomes, drain and overload | Prompt status table; timeout and socket failure after a byte → drain; inconclusive prompt → turn by lane order (terminal, acceptance, else `unknown`); drain publishes readiness; a pinned unsent turn → `SessionGone`; sent turns finish; retirement through Host; next generation fresh. Lane overflow → `failed(overflow)` as Codex, terminal-overflow case, no drain, successor dispatches; oversize event, full staging and each §9 count → generation `overflow`; prompt admission at both sides of the limit with escaping-heavy text; 45 s silence |
-| OC02b data-root lock | Through real Host anchors and a fake vendor that reports its open descriptors: `server.lock` is created 0600 and never unlinked; the anchor holds it from configuration, the vendor holds the inherited descriptor, the vendor's own children do not. A held lock refuses the configuration: no ARM intent commits, no vendor starts, the turn is `submit_failed`/`launch_failed` with the lock step, nothing cached, and a later acquisition succeeds once the holder exits. Each path, refused while a holder lives and admitted after it exits: (a) a post-ARM failed acquisition (handshake failure) whose anchor is then killed with the vendor kept alive; (b) a pre-ARM failure (configuration accepted, ARM never sent), admitted as soon as the anchor exits; (c) a launch or retirement task failure; (d) a real daemon crash after ARM, then restart: the orphan held by a test barrier refuses a new server, and admits one after its anchor's EOF cleanup; (e) an anchor killed from outside with the vendor alive. Store rows never gate a launch: a Store holding an identity-less pre-ARM server intent, a server anchor with another boot ID, and unproven Codex server anchors from earlier runs admits an OpenCode server at once when no lock holder lives; a live Codex server never blocks it |
+| OC02b data-root lock | Through real Host anchors and a fake vendor that reports its open descriptors: `server.lock` is created 0600 and never unlinked; the anchor holds it from configuration, the vendor holds the inherited descriptor, the vendor's own children do not. A held lock refuses the configuration: no ARM intent commits, no vendor starts, the turn is `submit_failed`/`launch_failed` with the lock step, nothing cached, and a later acquisition succeeds once the holder exits. Each path, refused while a holder lives and admitted after it exits: (a) a post-ARM failed acquisition (handshake failure) whose anchor is then killed with the vendor kept alive; (b) a pre-ARM failure (configuration accepted, ARM never sent), admitted as soon as the anchor exits; (c) a launch or retirement task failure; (d) a real daemon crash after ARM, then restart: the orphan held by a test barrier refuses a new server, and admits one after its anchor's EOF cleanup; (e) an anchor killed from outside with the vendor alive. The anchor never unlocks: after the fake vendor closes its copy, the lock stays held until the anchor exits. (f) Unsafe boundary: a fake vendor that closes its inherited descriptor and keeps serving, then its anchor killed from outside: the lock is free and a second server's configuration succeeds while the first still serves, which is why L13 gates enablement. Store rows never gate a launch through the lock: with spare `harness_processes` capacity, a Store holding an identity-less pre-ARM server intent, a server anchor with another boot ID, and unproven Codex server anchors from earlier runs admits an OpenCode server at once when no lock holder lives; a live Codex server never blocks it. Such rows exhausting recovered capacity is the separate limitation of §3.2 (bead via-joc), not tested here |
 | OC10 recovery | Server death during N sessions' turns → `server_lost` with one shared leftover report; a terminal admitted before the loss kept; EOF with process alive → `unknown`; quiescent with `GroupAbsent` even when tool leftovers are listed; daemon crash → `unknown`, no resend; a daemon crash leaving an orphan server, then restart: no second server while the orphan lives (OC02b d); password rotation |
 | OC11 parameters and usage | Variant check and switch; instruction size at 262,144/262,145 encoded bytes; output schema and max steps refusals; step-keyed usage excluding `usage.updated`; a compaction sample → `vendor_interval` plus `usage_interval_unverified`; class hints |
 | OC12 password | Password only in the launch environment; absent from tools (Boolean), argv, Store, keys, diagnostics and captures; synthetic secrets only |
 
 **Live qualification items.** Each is a named test in `via-4sw.3.4` (or
 later where noted), not a mechanism; until it passes, the behaviour above
-stands.
+stands. Items that gate route enablement (L4, L5, L13) say so.
 
 | Item | Risk | Test |
 |---|---|---|
@@ -832,7 +849,7 @@ stands.
 | L10 macOS | Platform deferred | Run OC01–OC12 on macOS under the platform contract |
 | L11 untested-version credential shape | A new version's `/api/integration` may change shape or carry values | At each pin review, rerun E41's synthetic-credential probe and add the version to `checked` |
 | L12 other unobserved | `superseded` and `inactivity` interrupt reasons; agent `steps`; durable replay; `OPENCODE_DISABLE_AUTOUPDATE` behaviour; truncated-body handling (E56) | Probe each at the next pin review |
-| L13 lock inheritance | The data-root lock (§3.2) assumes the server keeps its inherited descriptor and its children do not get it; E57 covered location and session shells only | Rerun E57 at each pin review; add the model's tool runner, a project MCP stdio server, LSP and a plugin spawn, and a long-running server; a child holding it is fail-closed (blocks launches), a server that drops it with its anchor gone is the unsafe case |
+| L13 (gate) lock retention | The data-root lock (§3.2) is sound only while the server keeps, and never unlocks, its inherited descriptor; E57 covered fd 3 from a probe script and the location and session shells only | **Gates route enablement and every pin review.** Through the real Host launch (VIA's anchor), sample the server's `/proc/<pid>/fd` and a `LOCK_NB` attempt from a fresh open from launch to exit, while driving the model's tool runner, a project MCP stdio server, LSP, a plugin spawn, and a long run. **Pass:** the server holds the descriptor and the lock for its whole life. **Fail:** any observed loss or unlock; OpenCode qualification then fails and stays failed until that is resolved. A child found holding the descriptor is not a safety failure (it only blocks launches after the server exits) but is reported as an availability finding with its spawn path |
 
 ## 14. Owner questions and revisit items
 
