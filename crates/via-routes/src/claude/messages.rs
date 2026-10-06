@@ -212,13 +212,16 @@ struct StopDetails {
     category: Option<String>,
 }
 
-/// `stop_details` as [`StopDetails`], or `None` for any other shape:
-/// like [`string_or_none`], it never fails its message.
+/// `stop_details` as [`StopDetails`] when a JSON object, or `None` for
+/// any other shape (an array is never read positionally): like
+/// [`string_or_none`], it never fails its message.
 fn stop_details_or_none<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<StopDetails>, D::Error> {
     let raw = Option::<Box<RawValue>>::deserialize(deserializer)?;
-    Ok(raw.and_then(|raw| serde_json::from_str(raw.get()).ok()))
+    Ok(raw
+        .filter(|raw| raw.get().starts_with('{'))
+        .and_then(|raw| serde_json::from_str(raw.get()).ok()))
 }
 
 /// A `user` message's content: plain text or blocks.
@@ -797,6 +800,13 @@ mod tests {
         assert_eq!(refusal(r#"{"type":"refusal","category":1e400}"#), None);
         assert_eq!(refusal(r#"{"type":"other","category":"cyber"}"#), None);
         assert_eq!(refusal("1e400"), None);
+        // Review clfix-crit: an array is not read positionally.
+        assert_eq!(refusal(r#"["refusal","cyber"]"#), None);
+        assert_eq!(
+            refusal(r#" {"type":"refusal","category":"cyber"}"#).as_deref(),
+            Some("cyber"),
+            "whitespace before the object"
+        );
         assert_eq!(refusal("null"), None);
     }
 

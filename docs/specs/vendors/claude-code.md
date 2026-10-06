@@ -180,9 +180,13 @@ The file tools differ by mode:
 - **unrestricted (default):** not confined. Write created a file outside
   the workspace (round-2 probe u1). The user's own settings files load, so
   their permission rules apply too.
-- **restricted:** confined to the working directories (`--add-dir`
-  included); an outside path or a symlink escape is denied with a
-  structured denial, reported in `denied_actions` (round 1).
+- **restricted:** Write is confined to the working directory: an outside
+  path or a symlink escape is denied with a structured denial, reported in
+  `denied_actions` (round 1; live probe sB again for an outside Write).
+  Edit, hard links and directories added with `--add-dir` were not tested
+  (round 1), so whether the confinement covers them is unverified (the
+  vendor's denial text says `--restricted` confines the file tools to the
+  working directory).
 Neither mode is a containment bound: VIA does not promise every possible
 action is allowed by `full`, only that no narrower containment is
 advertised. Managed policy can deny actions. Denials are reported; restrictions are never bypassed.
