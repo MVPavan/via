@@ -29,10 +29,12 @@ a case nobody gives evidence for is `not_observable`; neither passes.
 
 Accounting, one rule: every turn, whatever its outcome, must report a finite
 session-cumulative `usd`, at least the session's previous report and, for a
-completed turn, above it. A missing or unusable value blocks the run at
-once, so nothing more is submitted. The cap must be finite and positive; the
-unrounded total (each session's highest report) is checked before every
-submit and after every turn, and reaching it blocks the run.
+completed turn, above it. Spending is marked unaccounted before every submit
+and cleared only by such a report; anything else (no envelope, a runner
+error, a cost below the previous report) leaves it set, so nothing more is
+submitted. The cap must be finite and positive; the unrounded total (each
+session's highest report) is checked before every submit and after every
+turn, and reaching it blocks the run.
 
 Cases (packet §9 live rows):
   recipe_continuity     claude_live_recipe_continuity
@@ -85,11 +87,13 @@ the inherited-configuration request are daemon configuration:
                         owner's hooks run; accepted)
   unrestricted-mcp-off  mcp_switches' MCP-off launch
   empty-home            private_profile_auth
-A daemon whose start or stop cannot be verified is recorded as owned but
-unverified (a failed start is searched for by the run's private locks), its
-runtime directory is kept, and every later phase is blocked. Every cleanup
-step runs inside the reporting boundary: a cleanup failure is recorded and
-the summary is still written, as `blocked`.
+A phase's daemon is recorded as owned but unverified, its runtime directory
+kept, from before the start (or stop) request until its pid and start time
+(or its exit) are verified; a failed start is searched for by the run's
+private locks, and every later phase is blocked. SIGINT and SIGTERM are only
+recorded: no submission starts afterwards, and the run ends as `blocked`.
+Every cleanup step runs inside the reporting boundary: a cleanup failure is
+recorded and the summary is still written, as `blocked`.
 
 Privacy: the runner never prints or records environment values, credential
 contents or MCP configuration. It reads no credential file. It records MCP
@@ -113,6 +117,7 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -146,6 +151,21 @@ EXCLUDED = [{
 
 class Blocked(Exception):
     """Infrastructure, auth, quota or budget: the case cannot pass or fail."""
+
+
+# The first SIGINT or SIGTERM, by name. The handler only records it: no
+# submission starts afterwards, and cleanup and the summary always run.
+INTERRUPTED = []
+
+
+def record_signal(signum, _frame):
+    if not INTERRUPTED:
+        INTERRUPTED.append(signal.Signals(signum).name)
+
+
+def interrupt_guard():
+    if INTERRUPTED:
+        raise Blocked(f"interrupted by {INTERRUPTED[0]}")
 
 
 def utc_now():
@@ -511,6 +531,7 @@ class Run:
         return sum(self.costs.values())
 
     def budget_guard(self):
+        interrupt_guard()
         if self.accounting_failed:
             raise Blocked(f"spending unaccounted ({self.accounting_failed})")
         if self.spent() >= self.budget:
@@ -552,6 +573,7 @@ class Run:
         envelope, launches). `expect` names the failure classes the case
         expects; any other auth, quota or step-budget failure blocks."""
         self.budget_guard()
+        self.latch_pending(case, label)
         with LaunchSampler(self) as sampler:
             # `--json` before the arguments: anything after `--` is vendor_args.
             _, receipt, err = self.via_call(case.dir, f"{label}-receipt", verb, "--json",
@@ -576,6 +598,12 @@ class Run:
             raise Blocked(f"{label}: vendor {cls} failure")
         return receipt, envelope, sampler.launches
 
+    def latch_pending(self, case, label):
+        """Set before every submission: the turn may spend from here on, and
+        only `account()` clears it, on a usable and consistent cost. No case
+        expects a refused submission, so a refusal keeps it set too."""
+        self.accounting_failed = f"{case.name} {label}: submitted, accounting pending"
+
     def keep_handle(self, case, receipt):
         handle = case.dir / f"{receipt['session_id']}.handle"
         handle.write_text(receipt["handle"])
@@ -585,8 +613,9 @@ class Run:
     def account(self, case, label, envelope):
         """The one accounting rule: every turn, whatever its outcome, reports
         a finite session-cumulative `usd`, at least the session's previous
-        report and, for a completed turn, above it. A missing or unusable
-        value blocks the run at once; reaching the cap blocks it too."""
+        report and, for a completed turn, above it. Only a usable value not
+        below the previous report clears the submission's latch; anything
+        else keeps spending refused. Reaching the cap blocks the run too."""
         self.versions.append({"case": case.name, "turn": label,
                               "vendor_version": envelope.get("vendor_version")})
         cost = envelope.get("cost") or {}
@@ -608,6 +637,12 @@ class Run:
                                          "state": envelope.get("state")})
         self.last_cost[session] = usd
         self.costs[session] = max(self.costs.get(session, 0.0), usd)
+        if usd < previous:
+            # Not session-cumulative after all: the true total is unknown.
+            self.accounting_failed = f"{case.name} {label}: cost fell from {previous} to {usd}"
+            raise Blocked(f"{label}: cost below the session's previous report; "
+                          "spending unaccounted")
+        self.accounting_failed = None
         self.budget_guard()
 
     def session_file(self, case, session):
@@ -670,39 +705,56 @@ class Run:
         write_json(phase_dir / f"{name}-config.json",
                    {"harnesses": {"claude": {"binary": "<claude>", **claude_config}}})
         self.phase = name
+        # `daemon status` may autostart a daemon: it is owned but unverified,
+        # its runtime directory kept, until a pid with start ticks is seen.
+        record = {"phase": name, "runtime_dir_kept": str(self.runtime)}
+        self.daemons.append(record)
+        self.daemon_unverified = record
         try:
-            _, status, err = self.via_call(phase_dir, f"{name}-status", "daemon", "status",
-                                           "--json", timeout=60)
-        except Blocked as error:
-            status, err = None, str(error)
-        stat = proc_stat(status["pid"]) if status and isinstance(status.get("pid"), int) else None
-        if stat is None:
-            # A start attempt may have left a daemon: find it by its private
-            # locks, keep it as owned but unverified, and stop the run here.
-            record = {"phase": name, "start_failed": str(err), "found": self.find_daemons(),
-                      "runtime_dir_kept": str(self.runtime)}
-            self.daemons.append(record)
-            self.daemon_unverified = record
-            raise Blocked(f"daemon for phase {name} did not start verifiably ({err})")
-        self.daemon = {"pid": status["pid"], "start_ticks": stat["start_ticks"]}
-        self.daemons.append({"phase": name, **self.daemon})
+            try:
+                rc, status, err = self.via_call(phase_dir, f"{name}-status", "daemon",
+                                                "status", "--json", timeout=60)
+                detail = err if err is not None else f"rc {rc}, no live daemon pid in the reply"
+            except Blocked as error:
+                status, detail = None, str(error)
+            pid = status.get("pid") if isinstance(status, dict) else None
+            stat = proc_stat(pid) if isinstance(pid, int) and not isinstance(pid, bool) else None
+            if stat is None:
+                record["start_failed"] = str(detail)
+                raise Blocked(f"daemon for phase {name} did not start verifiably ({detail})")
+        except BaseException as error:
+            # Any unsuccessful start: find what it left by the private locks.
+            record.setdefault("start_failed", f"{type(error).__name__}: {error}")
+            try:
+                record["found"] = self.find_daemons()
+            except Exception as find_error:
+                record["found"] = f"search failed: {type(find_error).__name__}"
+            raise
+        del record["runtime_dir_kept"]
+        record.update(pid=pid, start_ticks=stat["start_ticks"])
+        self.daemon = {"pid": pid, "start_ticks": stat["start_ticks"]}
+        self.daemon_unverified = None
         print(f"phase {name}: daemon started", flush=True)
 
     def find_daemons(self):
-        """`via daemon` processes holding this run's private locks."""
+        """Processes holding this run's private locks, whatever their binary's
+        name; processes whose descriptors cannot be listed are skipped, and a
+        descriptor closed while it is read is ignored."""
         locks = {str(self.runtime / "daemon.lock"), str(self.state / "store.lock")}
         found = []
         for pid, stat in all_procs().items():
-            argv = cmdline(pid)
-            if len(argv) < 2 or os.path.basename(argv[0]) != "via" or argv[1] != "daemon":
-                continue
             try:
-                links = {os.readlink(f"/proc/{pid}/fd/{fd}")
-                         for fd in os.listdir(f"/proc/{pid}/fd")}
+                fds = os.listdir(f"/proc/{pid}/fd")
             except OSError:
                 continue
-            if links & locks:
-                found.append({"pid": pid, "start_ticks": stat["start_ticks"]})
+            for fd in fds:
+                try:
+                    link = os.readlink(f"/proc/{pid}/fd/{fd}")
+                except OSError:
+                    continue
+                if link in locks:
+                    found.append({"pid": pid, "start_ticks": stat["start_ticks"]})
+                    break
         return found
 
     def stop_daemon(self):
@@ -715,6 +767,9 @@ class Run:
             return
         phase_dir = self.evidence / "daemon"
         record = self.daemons[-1]
+        # Unverified from the stop request on; cleared only once verified.
+        record["runtime_dir_kept"] = str(self.runtime)
+        self.daemon_unverified = record
         procs = all_procs()
         ours_before = {(pid, procs[pid]["start_ticks"])
                        for pid in descendants(self.daemon["pid"], procs)}
@@ -735,9 +790,9 @@ class Run:
                                if int(pid) != os.getpid()]
         print(f"phase {self.phase}: daemon stopped={record['stopped']}", flush=True)
         if not record["stopped"] or record["descendants_left"]:
-            record["runtime_dir_kept"] = str(self.runtime)
-            self.daemon_unverified = record
             raise Blocked(f"daemon of phase {self.phase} not verified stopped")
+        del record["runtime_dir_kept"]
+        self.daemon_unverified = None
         self.daemon = None
 
 
@@ -926,6 +981,7 @@ def case_interrupt(run, case):
     tag = "via-qualify-" + secrets.token_hex(4)
     run.snapshot(case, "before", tags=(tag,))
     run.budget_guard()
+    run.latch_pending(case, "t1")
     with LaunchSampler(run) as sampler:
         _, receipt, err = run.via_call(
             case.dir, "t1-receipt", "spawn", "--json", "--harness", "claude", "--model",
@@ -1266,6 +1322,7 @@ def phase(run, name, config, home, steps):
     start, or a run past its budget, blocks them. A settled case is not
     resumed."""
     try:
+        interrupt_guard()
         if run.budget_hit or run.accounting_failed:
             raise Blocked("budget reached or spending unaccounted")
         run.start_phase(name, config, home)
@@ -1281,6 +1338,7 @@ def phase(run, name, config, home, steps):
 
 def run_case(case, body):
     try:
+        interrupt_guard()
         body()
     except Blocked as error:
         case.result, case.reason = "blocked", str(error)
@@ -1344,6 +1402,8 @@ def cleanup(run, cases, info):
 
 
 def main():
+    signal.signal(signal.SIGINT, record_signal)
+    signal.signal(signal.SIGTERM, record_signal)
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     parser.add_argument("--via", help="the via binary to qualify through")
     parser.add_argument("--evidence", type=Path, help="a new directory under scratchpad/")
@@ -1397,7 +1457,8 @@ def main():
         d.get("stopped") and not d.get("descendants_left") for d in run.daemons)
     within_budget = (not run.budget_hit and run.accounting_failed is None
                      and run.spent() < run.budget)
-    blocked = ("runner_error" in info or bool(info.get("cleanup_errors"))
+    info["interrupted"] = INTERRUPTED[0] if INTERRUPTED else None
+    blocked = ("runner_error" in info or bool(info.get("cleanup_errors")) or bool(INTERRUPTED)
                or run.accounting_failed is not None or run.daemon_unverified is not None)
     passed = (stopped and version_ok and within_budget and not blocked
               and all(record["result"] == "pass" for record in records))
