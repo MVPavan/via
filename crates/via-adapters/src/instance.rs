@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -79,9 +80,40 @@ pub enum Incompatibility {
     ReadbackDiffers(&'static str),
 }
 
+/// The file a program path names, as `stat` reports it (C2 §5): a binary
+/// replaced at the same path, in place, by a rename or by a retargeted
+/// symlink, has another identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileIdentity {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl FileIdentity {
+    /// The identity of the file `program` resolves to, following
+    /// symlinks; `None` when it cannot be read.
+    fn of(program: &Path) -> Option<Self> {
+        let meta = fs::metadata(program).ok()?;
+        Some(Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            size: meta.size(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+        })
+    }
+}
+
 /// The instance cache (C2 §5 AD7): the last version seen per harness and
-/// resolved program path, and refusal entries keyed by the program path
-/// plus the route's recipe key (the adapter's canonical recipe string).
+/// resolved program path, and refusal entries keyed by the program path,
+/// the file identity it had when the refusal was written (so a binary
+/// replaced at the path does not inherit it), and the route's recipe key
+/// (the adapter's canonical recipe string). The identity is read when the
+/// refusal is recorded, after the handshake: a binary replaced between the
+/// launch and that read is the accepted race of every route.
 /// Retention is bounded: at most [`VERSIONS_KEPT`] version entries and
 /// [`REFUSALS_KEPT`] refusal entries, the least recently written evicted
 /// first (a lost entry costs one cache miss); every refusal write sweeps
@@ -110,6 +142,7 @@ struct Entries {
 #[derive(Debug)]
 struct Refusal {
     program: PathBuf,
+    identity: FileIdentity,
     recipe: String,
     written: Instant,
     cause: Incompatibility,
@@ -156,10 +189,11 @@ impl InstanceCache {
             .map(|(_, (version, _))| version.clone())
     }
 
-    /// Records a refusal written at `now`; it expires [`REFUSAL_TTL`] later.
-    /// Every refusal expired at `now` is dropped first, and past
-    /// [`REFUSALS_KEPT`] entries the least recently written is evicted. A
-    /// `recipe` longer than [`RECIPE_KEY_MAX`] bytes is not remembered: the
+    /// Records a refusal written at `now` for the file `program` names now;
+    /// it expires [`REFUSAL_TTL`] later. Every refusal expired at `now` is
+    /// dropped first, and past [`REFUSALS_KEPT`] entries the least recently
+    /// written is evicted. A `recipe` longer than [`RECIPE_KEY_MAX`] bytes,
+    /// or a program whose file cannot be read, is not remembered: the
     /// refusal still applies to its request.
     pub fn record_refusal(
         &self,
@@ -171,6 +205,9 @@ impl InstanceCache {
         if recipe.len() > RECIPE_KEY_MAX {
             return;
         }
+        let Some(identity) = FileIdentity::of(program) else {
+            return;
+        };
         let mut entries = self.entries();
         entries.refusals.retain(|refusal| {
             live(refusal.written, now) && !(refusal.program == program && refusal.recipe == recipe)
@@ -180,22 +217,25 @@ impl InstanceCache {
         }
         entries.refusals.push(Refusal {
             program: program.to_path_buf(),
+            identity,
             recipe,
             written: now,
             cause,
         });
     }
 
-    /// The live refusal for `program` and `recipe` at `now`, if any; an
-    /// expired entry is dropped.
+    /// The live refusal for `program` and `recipe` at `now`, if any, while
+    /// `program` still names the file it was recorded for; an expired
+    /// entry is dropped, and so is one whose file was replaced.
     pub fn refusal(&self, program: &Path, recipe: &str, now: Instant) -> Option<Incompatibility> {
+        let identity = FileIdentity::of(program);
         let mut entries = self.entries();
         let index = entries
             .refusals
             .iter()
             .position(|refusal| refusal.program == program && refusal.recipe == recipe)?;
         let refusal = &entries.refusals[index];
-        if live(refusal.written, now) {
+        if live(refusal.written, now) && identity == Some(refusal.identity) {
             return Some(refusal.cause);
         }
         entries.refusals.remove(index);
@@ -206,6 +246,24 @@ impl InstanceCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Programs `vendor-<index>` in one directory, created on first use: a
+    /// refusal is recorded only for a file that exists (C2 §5).
+    struct Programs(tempfile::TempDir);
+
+    impl Programs {
+        fn new() -> Self {
+            Self(tempfile::tempdir().unwrap())
+        }
+
+        fn get(&self, index: u64) -> PathBuf {
+            let path = self.0.path().join(format!("vendor-{index}"));
+            if !path.exists() {
+                fs::write(&path, "vendor").unwrap();
+            }
+            path
+        }
+    }
 
     fn program(index: u64) -> PathBuf {
         PathBuf::from(format!("/bin/vendor-{index}"))
@@ -220,6 +278,8 @@ mod tests {
     /// first; a recipe key over 1 KiB is not remembered.
     #[test]
     fn refusals_are_bounded_within_one_ttl() {
+        let programs = Programs::new();
+        let program = |index| programs.get(index);
         let cache = InstanceCache::default();
         let now = Instant::now();
         let cause = Incompatibility::FeatureAbsent("tool_list");
@@ -252,6 +312,8 @@ mod tests {
     /// Each refusal write sweeps the expired refusals.
     #[test]
     fn refusal_writes_sweep_expired_ones() {
+        let programs = Programs::new();
+        let program = |index| programs.get(index);
         let cache = InstanceCache::default();
         let written = Instant::now();
         let cause = Incompatibility::FeatureAbsent("tool_list");

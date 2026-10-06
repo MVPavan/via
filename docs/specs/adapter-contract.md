@@ -721,7 +721,11 @@ default.
   the value VIA sent. The key is the resolved program path and its file
   identity (device, inode, size, mtime, ctime) plus the route's recipe
   digest (launch arguments, category switches, bound and
-  policy inputs). While an entry is live, plans with the same key refuse
+  policy inputs), so a binary replaced at the path does not inherit the
+  refusal. The identity is read when the refusal is written, after the
+  handshake (a replacement between launch and that read is the accepted
+  race), and again at each lookup; a program that cannot be read then is
+  not cached and matches nothing. While an entry is live, plans with the same key refuse
   `harness_unavailable` (`data.reason:"handshake_refused"`). Spawn
   failures, timeouts, transport loss, auth, quota and rate-limit failures
   are never cached. An entry
