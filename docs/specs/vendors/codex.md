@@ -670,7 +670,9 @@ write under read-only, and permitted/denied root and network operations
 for every advertised limited-bound combination, including changed and
 concurrent differing bounds on one server. Model noncompliance or marker
 absence is inconclusive. Done 2026-10-06 for `network:false` (§3 Bound
-mapping and gate); `network:true` stays refused. Verify never-ask after explicit reviewer selection,
+mapping and gate), including concurrent differing bounds on one server;
+`network:true` stays refused. Still unverified: changing a thread's bound
+between turns (tightening with a surviving terminal). Verify never-ask after explicit reviewer selection,
 the six response paths where inducible, persistent resume after actual
 server retirement with `excludeTurns:true`, output-schema set/clear,
 usage interval if upgrading its scope, and tool/auth/platform environment
