@@ -20,8 +20,8 @@ use super::messages::{
     decode, models_data, prompt_start, state_data, ui_cancel,
 };
 use crate::private::{
-    self, AfterTerminal, Closed, Failed, Hop, Interrupt, Next, PrivateProtocol, Serving,
-    cleanup_deadline, protocol, transport, wire_cause,
+    self, AfterTerminal, Closed, Failed, Hop, Interrupt, Next, PrivateProtocol, Serving, protocol,
+    transport, wire_cause,
 };
 use crate::{
     Deadline, PrivateProcessSpec, Retirement, RouteError, RouteFailure, RouteRuntime, SendOutcome,
@@ -308,7 +308,9 @@ const UNANSWERED: &str = "an extension dialog VIA could not cancel";
 
 impl PiLane {
     fn send(self, interrupt: Interrupt, outcome: Result<PiRouteResult, RouteFailure>) {
-        let terminal = (self.phase == Phase::Settled)
+        // Every exit's one rule (picrit #3): an unanswered marker is never
+        // retained.
+        let terminal = (self.phase == Phase::Settled && !self.unanswered_marker(interrupt))
             .then_some(self.assistant)
             .flatten();
         // The driver's turn was dropped: nobody reads the end.
@@ -494,6 +496,16 @@ impl PiLane {
     /// aborted".
     fn marker(&self) -> bool {
         self.assistant.as_deref().is_some_and(is_marker)
+    }
+
+    /// Packet §7.1 step 3: the settled run's terminal is a marker and the
+    /// abort VIA sent (`interrupt`) got no reply. It is not retained, on
+    /// any exit; the order that sent the abort decides the turn.
+    fn unanswered_marker(&self, interrupt: Interrupt) -> bool {
+        self.phase == Phase::Settled
+            && self.abort_answered.is_none()
+            && matches!(interrupt, Interrupt::Queued | Interrupt::Written)
+            && self.marker()
     }
 }
 
@@ -764,6 +776,17 @@ impl PrivateProtocol for PiLane {
     /// Kept at admission, where the record is owned.
     fn retain(_serving: &mut Serving<'_, Self>, _terminal: &Settled) {}
 
+    /// Packet §7.1 step 3 on every path that stops reading after the
+    /// terminal: an unanswered marker is dropped, and the order that sent
+    /// the abort decides the turn ([`Serving::interrupted`]).
+    fn unanswered(serving: &mut Serving<'_, Self>) -> Option<Failed> {
+        if !serving.lane.unanswered_marker(serving.interrupt) {
+            return None;
+        }
+        serving.lane.assistant = None;
+        Some(serving.interrupted())
+    }
+
     /// Packet §2.1 step 3: the three commands, their replies, and every
     /// check before the prompt. A mismatched session is handed on before
     /// the turn fails.
@@ -820,20 +843,19 @@ impl PrivateProtocol for PiLane {
     }
 
     /// Packet §7.1 step 3: an abort sent before `agent_settled` keeps
-    /// stdin open until its reply, or the stop order's `force_at` (else the
-    /// wall); with no reply by then, a marker terminal is not retained and
-    /// the stop order's row applies, however the wait ended (the deadline,
-    /// Pi's exit, or a failure, which stays the turn's cause). An ordinary
-    /// terminal is retained. Then stdin EOF (packet §7.2).
+    /// stdin open until its reply, or the active cutoff
+    /// ([`Serving::cutoff`]: the stop order's `force_at`, else the
+    /// Adapter's stall's, else the wall); with no reply by then, a marker
+    /// terminal is not retained and the order that sent the abort decides
+    /// the turn ([`Self::unanswered`]), however the wait ended (the
+    /// cutoff, Pi's exit, or a failure, which stays the turn's cause). An
+    /// ordinary terminal is retained. Then stdin EOF (packet §7.2).
     async fn after_terminal(
         serving: &mut Serving<'_, Self>,
         messages: &mut WireMessages,
         terminal: Settled,
     ) -> Result<AfterTerminal<Self>, Failed> {
-        let (bound, close_by) = serving.signals.stop.borrow().as_ref().map_or_else(
-            || (serving.deadline, None),
-            |order| (order.force_at, Some(order.close_by)),
-        );
+        let (bound, _) = serving.cutoff();
         while serving.lane.phase != Phase::Refused
             && serving.lane.abort_answered.is_none()
             && matches!(serving.interrupt, Interrupt::Queued | Interrupt::Written)
@@ -847,13 +869,10 @@ impl PrivateProtocol for PiLane {
                     Ok(Ok(Next::Eof | Next::Unterminated)) | Err(_) => None,
                     Ok(Err(failed)) => Some(failed),
                 };
-            // No reply will come.
-            if serving.lane.marker() {
-                // Not retained: the stop order's row (C1 §7.6).
-                serving.lane.assistant = None;
-                return Err(failed.unwrap_or_else(|| {
-                    Failed::stopped(serving.turn, close_by.unwrap_or_else(cleanup_deadline))
-                }));
+            // No reply will come. A marker is not retained: the order's
+            // row (C1 §7.6).
+            if let Some(stopped) = Self::unanswered(serving) {
+                return Err(failed.unwrap_or(stopped));
             }
             if let Some(failed) = failed {
                 return Err(failed);

@@ -2954,6 +2954,120 @@ fn pi_accounting_after_loss() {
     check_built("pi_accounting_after_loss", &replay, &expect, knobs).unwrap();
 }
 
+/// An unanswered-abort case (picrit #3, #4): the run streams `deltas`
+/// small deltas and then `big` text deltas of `BIG` bytes, VIA's abort is
+/// read, and Pi settles on the streaming marker with a `pad`-byte
+/// `agent_settled`, never replying, until its group is stopped.
+fn unanswered_abort(name: &str, (deltas, big, pad): (usize, usize, usize)) -> Value {
+    let mut steps = handshake(&State::default());
+    steps.extend(prompt("Count slowly."));
+    steps.extend(echo("Count slowly."));
+    let pending = assistant(json!([]), "pending", &zero_usage(), None);
+    steps.push(emit(&json!({"type": "message_start", "message": pending})));
+    steps.push(update(json!({"type": "text_start", "contentIndex": 0})));
+    for _ in 0..deltas {
+        steps.push(update(
+            json!({"type": "text_delta", "contentIndex": 0, "delta": "."}),
+        ));
+    }
+    for _ in 0..big {
+        steps.push(update(
+            json!({"type": "text_delta", "contentIndex": 0, "delta": ".".repeat(BIG)}),
+        ));
+    }
+    steps.push(expect_id(json!({"type": "abort"}), "ab"));
+    let marker = assistant(
+        json!([]),
+        "aborted",
+        &zero_usage(),
+        Some("Request was aborted"),
+    );
+    steps.push(message_end(&marker));
+    let mut settled = settle(&marker);
+    if pad > 0 {
+        settled.pop();
+        settled.push(emit(
+            &json!({"type": "agent_settled", "pad": ".".repeat(pad)}),
+        ));
+    }
+    steps.extend(settled);
+    steps.extend(terminated());
+    single(
+        &format!("synthetic (picrit #3, #4): {name}"),
+        argv(Argv::default()),
+        steps,
+    )
+}
+
+/// The bytes of one big delta: four fit Route's 4 MiB read-ahead beside
+/// the small records; a fifth record of this size does not.
+const BIG: usize = 1_000_000;
+
+/// The expectation of a turn whose abort went unanswered: accepted, no
+/// terminal, the group stopped; `error` is the order's (a cancel's none,
+/// the stall's `overflow`).
+fn unanswered_wanted(error: Option<&str>) -> Value {
+    let mut wanted = interrupted(false, "aborted");
+    wanted["terminal"] = Value::Null;
+    wanted["error"] = json!(error);
+    // Reported for a stated stop only; these stop by the knob or the stall.
+    wanted["stop_facts"] = Value::Null;
+    wanted["exit"] = json!({"code": 143, "signal": null});
+    wanted
+}
+
+/// Packet §7.1 step 3 (picrit #3): the abort's lost reply on the late
+/// path. A cancel 1 s in sends the abort while Core takes nothing for
+/// 5.5 s; the four big deltas fill Route's read-ahead, so the 1 MB
+/// `agent_settled` waits for room past the 4 s wall and the turn takes the
+/// late path, where delivery then finishes. The marker is not retained
+/// and the cancel decides the turn; before the fix the late path kept the
+/// marker (`failed`, `vendor_error`).
+#[test]
+fn pi_abort_unanswered_late() {
+    let name = "pi_abort_unanswered_late";
+    let replay = unanswered_abort(name, (SATURATING, 4, BIG));
+    let mut late = turn("Count slowly.", unanswered_wanted(None));
+    late["deadlines"] = json!({"wall_ms": 4_000, "idle_ms": 60_000});
+    let expect = case(name, 1, vec![late]);
+    let knobs = Knobs {
+        hold_for: Some(std::time::Duration::from_millis(5_500)),
+        stop_after: Some(std::time::Duration::from_secs(1)),
+        ..Knobs::default()
+    };
+    check_built(name, &replay, &expect, knobs).unwrap();
+}
+
+/// Packet §7.1 step 3 (picrit #4): the abort's lost reply after the
+/// Adapter's stall. Core takes nothing past the stall bound, so Route
+/// aborts the run as the stall's internal stop order; Pi settles on the
+/// marker and never replies. The reply wait ends at the stall's
+/// `force_at`, not the 40 s wall: `overflow`, no terminal, the group
+/// stopped well before the wall. Before the fix it waited for the wall
+/// and the turn ended as a stop.
+#[test]
+fn pi_abort_unanswered_stall() {
+    let name = "pi_abort_unanswered_stall";
+    let replay = unanswered_abort(name, (SATURATING, 0, 0));
+    let mut wanted = unanswered_wanted(Some("overflow"));
+    wanted["observations_exclude"] = json!([]);
+    let mut stalled = turn("Count slowly.", wanted);
+    stalled["deadlines"] = json!({"wall_ms": 40_000, "idle_ms": 60_000});
+    let mut expect = case(name, 1, vec![stalled]);
+    expect["sessions"]["main"]["health"] = json!({"state": "failed", "first_cause": "overflow"});
+    let knobs = Knobs {
+        hold_for: Some(std::time::Duration::from_secs(12)),
+        ..Knobs::default()
+    };
+    let started = std::time::Instant::now();
+    check_built(name, &replay, &expect, knobs).unwrap();
+    let took = started.elapsed();
+    assert!(
+        took < std::time::Duration::from_secs(30),
+        "the reply wait ran to the wall: {took:?}"
+    );
+}
+
 /// `pi_dialog_decline` (packet §6): a dialog request with an `id` (a `-e`
 /// extension's `confirm`) and an unknown method with an `id` are each
 /// cancelled on the control lane within 5 s while Core takes no

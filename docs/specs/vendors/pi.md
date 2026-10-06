@@ -657,11 +657,16 @@ in cwd, escaped descendants stopped, or network isolation by `--offline`.
    - `stop`/`length` keeps `Completed`; the cancel is not acknowledged.
 3. **The reply follows settlement (E54).** An abort admitted before
    `agent_settled` keeps the connection open: the driver retains the
-   terminal and keeps reading until the reply arrives or the stop order's
-   `force_at` (or the wall cleanup cutoff) passes. Only then does it close
-   stdin. With no reply, a marker terminal is not retained
-   (`terminal: None`) and S1's stop-order row applies (C1 §7.6
-   private-process row); other terminals are retained as usual.
+   terminal and keeps reading until the reply arrives or the active
+   cutoff passes: the stop order's `force_at`, else the Adapter's stall's
+   (C2 A1: the stall aborts as an internal stop order), else the wall,
+   never past the wall. Only then does it close stdin. With no reply, a
+   marker terminal is not retained (`terminal: None`) and the order that
+   sent the abort decides the turn: S1's stop-order row (C1 §7.6
+   private-process row) for a stop, `overflow` for the stall. One rule
+   decides this on every exit after `agent_settled`, the late path
+   (a settlement that waited for read-ahead room past the wall) included;
+   other terminals are retained as usual.
 4. Then S1's close, as Claude.
 
 **Wall cleanup step:** as Claude, a Host force close with no abort (C2
@@ -763,7 +768,7 @@ hostile profiles only in scratch agent directories. Selection as Claude's:
 | `pi_progress_deltas` | One text block streaming longer than `idle_ms` keeps the turn alive; usage snapshots never become samples; idle expiry waits for the decode fence |
 | `pi_usage_accounting` | Mixed present and all-zero samples → `null` token components and `unavailable` cost; cache and reasoning counters map as §5.5; compaction with and without usage; a compaction after `summarization_retry_scheduled` → `null` tokens and `unavailable` cost |
 | `pi_accounting_after_loss` | Delivery lost between two priced calls (Core holds past the stall bound): `overflow` with the retained terminal, cost `unavailable`, `null` tokens, never the delivered $0.50 |
-| `pi_abort` | Tool-phase and streaming markers with the paired reply acknowledge; the idle reply alone never does; a 401 racing the abort → `failed(auth)`, `requested`; natural completion keeps `Completed`; a reply after `agent_settled` is awaited; no reply by `force_at` → no acknowledgement |
+| `pi_abort` | Tool-phase and streaming markers with the paired reply acknowledge; the idle reply alone never does; a 401 racing the abort → `failed(auth)`, `requested`; natural completion keeps `Completed`; a reply after `agent_settled` is awaited; no reply by `force_at` → no acknowledgement. `pi_abort_unanswered_late`: no reply while settlement waits for read-ahead room past the wall (late path) → no terminal, the cancel's row. `pi_abort_unanswered_stall`: the stall's abort unanswered → the wait ends at the stall's `force_at`, not the wall: `overflow`, no terminal |
 | `pi_eof_is_stop` | EOF mid-run: exit 0, no terminal, never `Completed` |
 | `pi_signals_cleanup` | Force close via TERM kills tool groups; a `setsid` escapee is a leftover; SIGINT is never sent; a spinning startup is bounded by deadlines and KILL |
 | `pi_dialog_decline` | A `-e` test extension's `confirm` and an unknown method with an `id` are cancelled within 5 s while observations are saturated; a dialog without an `id` fails closed |

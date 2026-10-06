@@ -470,6 +470,44 @@ impl<'a, P: PrivateProtocol> Serving<'a, P> {
         Ok(())
     }
 
+    /// The bound on a wait for the vendor's answer to the one interrupt,
+    /// with the close's bound once it passes unanswered: Core's stop
+    /// order's `force_at` and `close_by`, else the Adapter's stall's
+    /// ([`Stall`]), else the wall with none; never past the wall.
+    pub(crate) fn cutoff(&self) -> (Deadline, Option<Deadline>) {
+        let order = self
+            .signals
+            .stop
+            .borrow()
+            .as_ref()
+            .map(|order| (order.force_at, order.close_by));
+        let (force_at, close_by) = match (order, self.stall) {
+            (Some((force_at, close_by)), _) => (force_at, Some(close_by)),
+            (None, Some(stall)) => (stall.force_at, Some(stall.close_by)),
+            (None, None) => (self.deadline, None),
+        };
+        let bound = force_at.instant().min(self.deadline.instant());
+        (Deadline::at(bound), close_by)
+    }
+
+    /// The turn ended by the one interrupt's order without the vendor's
+    /// answer: Core's stop order (`Stopped` under its `close_by`), else the
+    /// Adapter's stall (`Overflow` under its `close_by`), else `Stopped`
+    /// under the cleanup allowance.
+    pub(crate) fn interrupted(&self) -> Failed {
+        let close_by = self
+            .signals
+            .stop
+            .borrow()
+            .as_ref()
+            .map(|order| order.close_by);
+        match (close_by, self.stall) {
+            (Some(close_by), _) => Failed::stopped(self.turn, close_by),
+            (None, Some(_)) => self.stall_force(),
+            (None, None) => Failed::stopped(self.turn, cleanup_deadline()),
+        }
+    }
+
     /// The stall's `force_at` passed without a terminal: `Overflow`, the
     /// group force-closed under the stall's `close_by`.
     fn stall_force(&self) -> Failed {

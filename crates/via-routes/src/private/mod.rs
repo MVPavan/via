@@ -178,6 +178,13 @@ pub(crate) trait PrivateProtocol: Sized + Send {
     fn terminal(message: &Self::Message) -> Option<Self::Terminal>;
     /// Keeps the decoded terminal (AD4).
     fn retain(serving: &mut Serving<'_, Self>, terminal: &Self::Terminal);
+    /// The late path reads no more of the vendor's messages: what the kept
+    /// terminal still needed from them is settled now; `Some` is the
+    /// turn's failure in place of its result (Pi's unanswered abort, packet
+    /// §7.1). None by default: a terminal needs nothing after it.
+    fn unanswered(_serving: &mut Serving<'_, Self>) -> Option<Failed> {
+        None
+    }
     /// Reads what the protocol needs before the start (AD7); nothing on a
     /// protocol whose handshake follows the start.
     fn handshake<'s>(
@@ -524,6 +531,8 @@ async fn late<P: PrivateProtocol>(
     // A failpoint error only ends the pause.
     #[cfg(feature = "test-failpoints")]
     let _ = via_wire::failpoint::hit_async("routes.late.entered").await;
+    // Nothing more is read: the terminal's disposition is settled now.
+    let unanswered = P::unanswered(serving);
     let by = cleanup_deadline();
     let close = sender.close(CloseRequest {
         mode: CloseMode::Force,
@@ -540,9 +549,13 @@ async fn late<P: PrivateProtocol>(
         &report,
     );
     let undecoded = sender.take_undecoded();
-    match delivered {
-        Ok(()) => serving.unless_forced(result, undecoded),
-        Err(cause) => Err(serving.failure_with(cause, &result, undecoded)),
+    // An unanswered interrupt's disposition governs a delivery that could
+    // not finish (as a stop order's own escalation governs the stall's
+    // `overflow` on the failure path); the daemon force outranks both.
+    match (unanswered, delivered) {
+        (Some(failed), _) => Err(serving.failure_with(failed.cause, &result, undecoded)),
+        (None, Ok(())) => serving.unless_forced(result, undecoded),
+        (None, Err(cause)) => Err(serving.failure_with(cause, &result, undecoded)),
     }
 }
 
