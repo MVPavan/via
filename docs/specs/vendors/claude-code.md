@@ -233,9 +233,18 @@ credentials into a new HOME to make tests pass. `--bare` is not the default
 because its auth behavior differs from this evidenced login route.
 
 Inherited configuration (C2 §6.2; owner OD2; via-umz), per mode, from the
-live rounds of 2026-10-05 (2.1.289, Haiku; "verified" means seen live).
-Only MCP servers have a per-category switch; `--restricted` turns every
-other category off together, and without it every one of them loads. A
+live rounds of 2026-10-05 (2.1.289, Haiku unless named; "verified" means
+seen live). An unrestricted `on` means VIA passes no switch and live
+evidence shows this version loads the user's own configuration for that
+category; the user's own configuration turning something off is still that
+configuration applying (owner, 2026-10-06). The evidence: round-2 probe u1
+(direct, the default recipe without `--restricted`, with
+`--strict-mcp-config`), round-2 turn v1 (a VIA turn in the default mode,
+which completed and reported these states), round-3 probes m1 (direct, the
+default recipe without `--strict-mcp-config`) and sA (the same on Sonnet,
+in permission mode `auto`). Only MCP servers have a per-category switch;
+`--restricted` turns every other category off together, and without it
+every one of them loads. A
 session's mode is frozen at spawn with its effective states: a later launch
 reads the mode back from them (hooks are `on` only without `--restricted`),
 whatever the configuration says now; a session frozen before modes existed
@@ -243,12 +252,12 @@ whatever the configuration says now; a session frozen before modes existed
 
 | Category | Default request (Claude) | Unrestricted (default mode) | Restricted |
 |---|---|---|---|
-| hooks | on | `on`: the user's SessionStart hooks ran (`hook_started` events, round-2 probe u1); no switch | `off`: no hook events (round 1); settings files are ignored |
-| MCP servers | on | `on`: no switch; init `mcp_servers` listed the user's (plugin-provided) server (round-3 probe m1). `off`: `--strict-mcp-config`, verified (`mcp_servers:0`) | `on` passes no switch and is `unknown`: what loads varied. The user's plugin-provided server is dropped with the plugin; one launch listed no server (init `mcp_servers: []`, round-3 probe m2, Haiku), another listed five claude.ai connector servers (source `claudeai`, status `pending`) that no unrestricted launch listed (probe sB, Sonnet). `off`: `--strict-mcp-config`, verified |
-| plugins | on | `on`: the user's plugins load (init inventory) | `off`: no user or project plugins; init may still list managed or built-in ones |
-| skills | on | `on`: the user's skills load (init inventory) | `off`: built-in skills only (init inventory) |
-| agents | on | `on`: the user's agents load (init inventory) | `off`: built-in agents only (init inventory) |
-| instruction files | on | `on`: the workspace CLAUDE.md reached the model (probe u1 named its codeword); auto-memory is on too (init `memory_paths`) | `off`: no CLAUDE.md, no auto-memory (round 1) |
+| hooks | on | `on`: no switch; the user's SessionStart hooks ran (`hook_started` events, u1); v1 ran the same flags | `off`: no hook events (round 1); settings files are ignored |
+| MCP servers | on | `on`: no switch; init `mcp_servers` listed the user's (plugin-provided) server (m1, sA; status `needs-auth`: the server was discovered on that launch, not shown connected or its tools callable). `off`: `--strict-mcp-config`, verified (`mcp_servers:0`) | `on` passes no switch and is `unknown`: what loads varied. The user's plugin-provided server is dropped with the plugin; one launch listed no server (init `mcp_servers: []`, round-3 probe m2, Haiku), another listed five claude.ai connector servers (source `claudeai`, status `pending`) that no unrestricted launch listed (probe sB, Sonnet). `off`: `--strict-mcp-config`, verified |
+| plugins | on | `on`: no switch; init listed the user's plugin besides the built-in ones (u1) | `off`: no user or project plugins; init may still list managed or built-in ones |
+| skills | on | `on`: no switch; init listed 81 skills, the user's among them (u1) | `off`: built-in skills only (init inventory) |
+| agents | on | `on`: no switch; init listed the user's agents besides the five built-in ones (u1) | `off`: built-in agents only (init inventory) |
+| instruction files | on | `on`: no switch; the workspace CLAUDE.md reached the model (u1 named its codeword); auto-memory is on too (init `memory_paths`) | `off`: no CLAUDE.md, no auto-memory (round 1) |
 
 Claude's default request is every category on: what the default mode
 delivers, so the default never warns (owner, 2026-10-05: hooks and MCP
@@ -260,10 +269,10 @@ servers as `unknown` and the rest `off`. MCP tools are not in VIA's
 `--allowedTools`, so under `dontAsk` a call to one is denied unless the
 user's own permission rules, which the default mode loads, allow it
 (inference from the flags; not probed). Auto-memory is not a C1 category;
-it follows instruction files. Init lists the tools, model, plugins, skills, agents, slash commands,
-MCP servers and permission mode (verified). VIA reads the tools, permission
-mode and MCP servers for the handshake check (§3) but does not record the
-inventory in the turn's evidence folder (amended 2026-10-05, bead via-7c6):
+it follows instruction files. Init lists the tools, model, plugins, skills,
+agents, slash commands, MCP servers and permission mode (verified). VIA
+reads the tools, permission mode and MCP servers for the handshake check
+(§3) but does not record the inventory in the turn's evidence folder (amended 2026-10-05, bead via-7c6):
 the Claude route has no evidence-file writer, and adding one means a new evidence
 file through Wire or Store and the C1 `logs` listing, more than that fix.
 The categories above were verified from the probes' own init captures.
