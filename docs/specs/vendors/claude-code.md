@@ -134,9 +134,9 @@ default. Check init `claude_code_version` on every launch, parsing the
 complete version including any prerelease/build qualifier, never guessed from
 an executable filename. A version in the adapter's `checked` set (versions the
 maintainers' cheap live check passed: 2.1.285; from the live round of
-2026-10-05, 2.1.289; and 2.1.290, from run 6 of the qualification runner
-`scripts/qualify/claude.py` on 2026-10-06, where every case passed (§4,
-bead via-kr9)) is `tested`; any other is `untested`,
+2026-10-05, 2.1.289; and 2.1.290, pending run 7 with the qualification
+runner `scripts/qualify/claude.py` as hardened after its critical review
+(§4, §9, bead via-kr9)) is `tested`; any other is `untested`,
 with warning `vendor_version_untested`, and proceeds. Only a failed handshake
 check on something VIA relies on (`interrupt_receipt_v1`, the permission-mode
 echo, the tool list) refuses the instance. Init follows the prompt line, so
@@ -173,11 +173,11 @@ agents, and auto-memory. With it, Claude ignores the user, project and local
 settings files and loads built-ins only (help 2.1.289; states in the
 inherited-configuration table below). `--strict-mcp-config` is passed, in
 either mode, only when MCP servers are requested off; Claude's default
-request loads them (owner, 2026-10-05). The qualification runner
-checked this exact recipe on 2.1.290 (run 6, 2026-10-06, below): every
-launch's argv carried it, in both modes, and with `--strict-mcp-config`
-in the unrestricted mode. That qualifies the `full` bound's recipe, not any
-narrower bound (§8). Explicit Bash enables general command
+request loads them (owner, 2026-10-05). The qualification runner's run 6
+(2026-10-06, below) saw this exact recipe on 2.1.290: every launch's argv
+carried it, in both modes, and with `--strict-mcp-config` in the
+unrestricted mode. Qualifying the `full` bound's recipe, not any narrower
+bound (§8), is pending run 7 with the hardened runner. Explicit Bash enables general command
 execution in the `full` bound in both modes; Bash wrote outside the
 workspace in both (round 1, restricted; round-2 probe u1, unrestricted).
 The file tools differ by mode:
@@ -391,8 +391,8 @@ launch.
 Live through VIA on 2.1.290 (run 4, 2026-10-06, Haiku, bead via-jne; fresh
 VIA state directory, gitignored evidence in
 `scratchpad/execution/claude-live/run-4/`). This is partial live evidence,
-not qualification: it does not meet §9's bar. The qualification runner's
-result below qualifies 2.1.290 instead (bead via-kr9):
+not qualification: it does not meet §9's bar. 2.1.290's qualification is
+pending run 7 with the qualification runner (bead via-kr9):
 - Default mode: a spawn and its resume both completed, the resume returned
   `alpha` (also readable from turn 1's file, so continuity is unproved),
   and the files the turns left were mode 0644. The
@@ -423,11 +423,12 @@ result below qualifies 2.1.290 instead (bead via-kr9):
   aborts_tools_then_result` and §7.
 
 Qualification runner on 2.1.290 (run 6, 2026-10-06, Haiku, bead via-kr9;
-checked; `scripts/qualify/claude.py` after the review fixes, gitignored
-evidence in `scratchpad/qualify/claude-2.1.290-run6/`, reported cost
-0.089 USD of a 0.75 USD cap). Every case passed, every envelope reported
-2.1.290 as `claude --version` did, and every daemon stopped, so 2.1.290 is
-in the checked set (§3). Every launch's argv carried the full §4 recipe for
+`scripts/qualify/claude.py` after the review fixes, gitignored evidence,
+reported cost 0.089 USD of a 0.75 USD cap). Run 6 predates the runner's
+critical-review hardening, so it is not what keeps 2.1.290 in the checked
+set (§3): that is pending run 7 with the hardened runner. In run 6 every
+case passed, every envelope reported 2.1.290 as `claude --version` did, and
+every daemon stopped. Every launch's argv carried the full §4 recipe for
 its turn, and every completed turn reported a positive cost above the
 session's previous one:
 - `recipe_continuity` (restricted mode, one session, four launches). Argv
@@ -732,7 +733,14 @@ fixture case emits the coding-standard summary, event references, consistent
 Store backup, hashes and report. The live rows run in the qualification runner
 `scripts/qualify/claude.py`. Its evidence package is `summary.json` plus the
 per-case directories (owner, 2026-10-06). Missing infrastructure leaves a live
-case incomplete.
+case incomplete. Threat model: a maintainer runs the runner on their own
+Linux machine, the Claude VIA starts runs only the runner's prompts, the
+evidence stays private, local and uncommitted (committed docs cite only
+`summary.json` facts), and bearer handles never touch disk. A checked
+version means what the runner checks: argv against the §4 recipe and VIA's
+declared category states (§4 table), not that Claude honours `--restricted`
+for each category, nor the child's environment names or HOME; the cap is
+checked between turns, with the overshoot bounded to one turn.
 
 | Test name | Original failure / decisive assertion |
 |---|---|
@@ -750,7 +758,7 @@ case incomplete.
 | `claude_recovery_no_submit` | Crash after intent/before acceptance, accepted crash and survivor: zero replay messages; verified anchor cleanup only; unverified anchor never signalled; recovered turn unknown |
 | `claude_normalizer_accounting` | Repeated assistant block not doubled; the `result.usage` aggregate supersedes partial assistant snapshots; denial dedup; synthetic API-error message never progress; unknown/malformed/duplicate terminal and cross-generation late traffic; turn token vs session cumulative cost, `fallback_credit` in vendor, absent fields and counter reset |
 | `claude_stream_limits` | Oversize stdout, stderr flood, stalled normalizer, large final payload: bounded memory, final text in a file; cancel/close still serviceable; no false successful truncated envelope |
-| `claude_live_recipe_continuity` | Exact §4 recipe, existing login, three launches, nonce recall, schemas replace/clear, instructions/effort/steps and full tool operation; emit versions/env names only |
+| `claude_live_recipe_continuity` | Exact §4 recipe, existing login, three launches, nonce recall, schemas replace/clear, instructions/effort/steps and Write and Bash tool operation; emit versions/env names only |
 | `claude_live_interrupt` | Observe a real long-running tool, receipt, abort terminal, tool completion and verified cleanup; then same-ID next turn. The SIGTERM-only negative is not a live case (owner, 2026-10-06): that a signal death is never an acknowledged cancel is normalizer behaviour, covered by `claude_cleanup_not_ack` (variant `claude_cleanup_not_ack_forced`) |
 | `claude_live_mcp_resume` | Unrestricted MCP discovery on resume launches: MCP servers requested on, a `--resume` launch loads the user's servers as the session's first launch did (m1 and sA covered new sessions only); status stays `on`. While VIA records no init inventory (via-7c6), Claude's own MCP debug lines are the evidence (owner, 2026-10-06): connected servers by name, at least one on the spawn and the same on the resume, none with MCP off; none connected on the spawn is `not_observable` |
 | `claude_live_bounds` | CLAUDE-BOUND-1 matrix on Linux/macOS including missing dependency fail-closed and resume-bound changes; infrastructure failure never passes |

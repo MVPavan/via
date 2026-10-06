@@ -18,9 +18,9 @@ use crate::plan::{
 };
 
 /// Versions the maintainers' live check passed (C2 §5): the 2026-09-30
-/// re-probe's, the 2026-10-05 live round's and 2.1.290's qualification
-/// runner run 6 of 2026-10-06 (`scripts/qualify/claude.py`, Haiku, every
-/// case passed; packet §3, §4).
+/// re-probe's and the 2026-10-05 live round's; 2.1.290 is pending run 7
+/// with the hardened qualification runner (`scripts/qualify/claude.py`;
+/// packet §3, §4, §9).
 pub(crate) const CHECKED: &[&str] = &["2.1.285", "2.1.289", "2.1.290"];
 
 /// The efforts `--effort` accepts (packet §4, help 2.1.285). Claude ignores
@@ -1751,10 +1751,10 @@ mod tests {
         );
     }
 
-    /// Bead via-7c6: the live round of 2026-10-05 passed on 2.1.289 and the
-    /// qualification runner's run 6 of 2026-10-06 on 2.1.290 (bead via-kr9),
-    /// so a plan whose last version seen is one of them is `tested`, as
-    /// 2.1.285 is; another version stays `untested`.
+    /// Bead via-7c6: the live round of 2026-10-05 passed on 2.1.289, and
+    /// 2.1.290 is listed pending the qualification runner's run 7 (bead
+    /// via-kr9), so a plan whose last version seen is one of them is
+    /// `tested`, as 2.1.285 is; another version stays `untested`.
     #[test]
     fn checked_versions_are_tested() {
         let dir = tempfile::tempdir().unwrap();
