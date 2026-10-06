@@ -32,8 +32,11 @@ or a failure. A process is only ever identified by its pid plus start
 ticks, and is read only through a /proc directory fd checked against both.
 A process counts as gone only when its /proc entry is missing (ENOENT or
 ESRCH) or shows another start or a zombie; any other read error, or a
-truncated read, is uncertainty, never absence. A status, events or logs
-reply without its expected fields is never read as empty.
+truncated read, is uncertainty, never absence. Every VIA reply the runner
+interprets (receipt, envelope, status, events page, cancel, logs, daemon
+status) is first checked against one strict schema (SCHEMAS, from C1): a
+missing or mistyped field it relies on blocks, and no reply field is ever
+read with a default. Events are read page by page until `more` is false.
 
 Threat model. A maintainer runs this on their own machine, on Linux (it
 reads /proc and runs `pgrep`). The Claude that VIA starts runs only the
@@ -71,18 +74,20 @@ flags, never-ask pair, tool lists, mode and MCP switches, identity, frozen
 instructions (by digest, after the source file was changed), effort,
 schema (by digest) and step limit as expected for that turn.
 
-Tool use: VIA records no tool events (C1 §6.1), so tool calls are read
-from the vendor's own session transcript of the session VIA created: per
-prompt, the tool names, the number of calls and whether any tool input held
-the nonce. Only those are kept. The transcript counts as evidence only when
-it shows the calls known to have happened (t1's Write, t3's Bash) with
-valid input records and the recall turn's record is complete: its last
-assistant text equals that turn's envelope `final_text`. Otherwise the
-nonce and no-tool predicates are `not_observable`. Both are about the
-recall turn: a turn shown to make no tool call cannot read what an earlier
-turn wrote. mcp_switches' unrestricted resume recalls a nonce the same
-way: its spawn turn makes one known Bash call, and the recall turn must
-show no tool call and no tool input holding the nonce.
+Tool use: VIA records no tool events (C1 §6.1), so tool calls are read from
+the vendor's own session transcript of the session VIA created: per prompt,
+the tool names, the number of calls and whether any tool input held the
+nonce. Only those are kept. The transcript counts as evidence only when it
+shows the calls known to have happened (t1's Write, t3's Bash) with valid
+input records and the recall turn's record is complete through its end: the
+turn's last record is an assistant message with stop_reason `end_turn`
+(never an intermediate `tool_use` message, and no tool result after it)
+whose text equals that turn's envelope `final_text`. Otherwise the nonce
+and no-tool predicates are `not_observable`. No tool input in any turn of
+the session may hold the nonce (a file written earlier, such as an
+instruction file, could reach the recall turn without a tool call), and the
+recall turn must make no tool call. mcp_switches' unrestricted resume
+recalls a nonce the same way: its spawn turn makes one known Bash call.
 
 mcp_switches (owner decision, 2026-10-06): VIA records no init inventory for
 Claude (packet §4, via-7c6), so the evidence is Claude's own MCP debug lines,
@@ -127,19 +132,23 @@ in hex). Started: /proc/locks shows the pid `daemon status` replies with as
 the flock locker of both. Stopped: /proc/locks is readable and has no line
 for them, and each lock can be taken (then released at once): Linux drops a
 lock from /proc/locks when its locker exits even while an inherited copy
-still holds it, and the probe sees that copy. The recorded daemon's pid and
-start ticks must be gone too, and every descendant seen before the stop
-verified gone; an unreadable process is not gone. Which pids hold the files
-through their descriptors is kept as evidence only. A daemon that holds the
-locks is ours, a replacement started by the CLI included. A failed start is
-searched for by those locks, and every later phase is blocked. A failed
-start that identifies no daemon (no replied pid with start ticks, no lock
-holder) leaves ownership uncertain for the rest of the run: it is never
-proven stopped, the runtime directory is kept and the run is blocked. The
-final cleanup retries the stop until a deadline, also after an earlier
-unverified stop, escalating to `daemon stop --force` when a plain stop is
-refused `sessions_active`; once the stop is proven the runtime directory is
-removed, wherever it lives.
+still holds it, and the probe sees that copy. Every recorded process (the
+daemon, a descriptor holder, or a locker seen in /proc/locks, each by pid
+and start ticks) must be gone too, and every descendant seen before the
+stop verified gone; an unreadable process is not gone. A daemon that holds
+the locks is ours, a replacement started by the CLI included. A failed
+start is searched for by those locks, and every later phase is blocked. A
+failed start identifies a daemon only by a recorded pid with start ticks:
+the replied pid, a descriptor holder, or a /proc/locks locker read with its
+start ticks. With none, or with a locker whose pid cannot be read,
+ownership stays uncertain for the rest of the run: it is never proven
+stopped, the runtime directory is kept and the run is blocked. Uncertainty
+blocks the proof, never the cleanup attempt: a failed read keeps what the
+other reads established, and a held lock or a live recorded daemon still
+gets its stop request. The final cleanup retries the stop until a deadline,
+also after an earlier unverified stop, escalating to `daemon stop --force`
+when a plain stop is refused `sessions_active`; once the stop is proven the
+runtime directory is removed, wherever it lives.
 
 SIGINT and SIGTERM are only recorded. No submission starts afterwards; a
 turn already being submitted runs to its end and is accounted. Cleanup and
@@ -237,6 +246,91 @@ class Unreadable(Exception):
 
 # The read errors that mean the process is gone.
 GONE = (errno.ENOENT, errno.ESRCH)
+
+
+# --- reply schema ------------------------------------------------------------
+# Every VIA reply the runner interprets is checked against one strict schema
+# first: each field a decision reads, with its C1 type
+# (docs/specs/via-api-v1.md). A missing or mistyped field is Blocked; no
+# reply field is ever read with a default. A spec is a tuple of types, the
+# name of a nested schema, ("list", spec) or ("nonempty", spec), or ANY (the
+# key must be present, any JSON value).
+
+ANY = "any"
+STR, INT, BOOL, NULL = (str,), (int,), (bool,), (type(None),)
+NUM = (int, float)
+SCHEMAS = {
+    "daemon status": {"pid": INT},
+    "receipt": {"turn": STR, "effective": "effective"},  # a resume receipt
+    "spawn receipt": {"session_id": STR, "turn": STR, "handle": STR,
+                      "effective": "effective"},
+    "effective": {"effort": STR + NULL, "max_steps": INT + NULL},
+    "envelope": {"session_id": STR, "turn": INT, "state": STR,
+                 "failure": ("nullable", "failure"), "stop_reason": STR + NULL,
+                 "vendor_version": STR + NULL, "vendor_session_id": STR + NULL,
+                 "final_text": STR + NULL, "structured_output": ANY, "steps": INT + NULL,
+                 "cancel": ("nullable", "cancel"), "cost": "cost", "usage": "usage",
+                 "warnings": ("list", "warning"), "denied_actions": ("list", "denied action"),
+                 "denied_actions_total": INT, "auto_declined_requests_total": INT},
+    "failure": {"class": STR, "message": STR},
+    "cancel": {"outcome": STR, "cleanup": STR},
+    "cost": {"usd": NUM + NULL, "scope": STR},
+    "usage": {"scope": STR, "input_tokens": INT + NULL, "cached_input_tokens": INT + NULL,
+              "output_tokens": INT + NULL},
+    "denied action": {"kind": STR, "target": STR, "event_seq": INT},
+    "warning": {"code": STR},
+    "config_switch_unverified": {"code": STR, "data": "switch data"},
+    "switch data": {"categories": ("list", "switch category")},
+    "switch category": {"category": STR, "requested": STR, "effective": STR},
+    "cancel reply": {"state": STR, "cancel": ("nullable", "cancel")},
+    "status": {"inherit": "inherit", "warnings": ("list", "warning"),
+               "vendor_identity_verified": BOOL, "progress": ("nullable", "progress"),
+               "turns": ("nonempty", "status turn")},
+    "inherit": {category: STR for category in (
+        "agents", "hooks", "instruction_files", "mcp_servers", "plugins", "skills")},
+    "progress": {"running_tools": ("list", STR)},
+    "status turn": {"state": STR},
+    "events page": {"events": ("list", "event"), "more": BOOL, "next_after": INT},
+    "event": {"seq": INT, "type": STR},
+    "action.denied": {"seq": INT, "type": STR, "kind": STR, "target": STR},
+    "logs": {"transcript": STR + NULL},
+}
+# A record whose discriminator selects a stricter schema.
+REFINE = {"warning": ("code", {"config_switch_unverified"}),
+          "event": ("type", {"action.denied"})}
+
+
+def conform(value, spec, where):
+    """`value` checked against `spec`; returns it, or raises Blocked naming
+    the first missing or mistyped field."""
+    if spec == ANY:
+        return value
+    if isinstance(spec, str):
+        if not isinstance(value, dict):
+            raise Blocked(f"{where}: expected an object, got {type(value).__name__}")
+        key, refined = REFINE.get(spec, (None, ()))
+        if key is not None and isinstance(value.get(key), str) and value[key] in refined:
+            spec = value[key]
+        for field, inner in SCHEMAS[spec].items():
+            if field not in value:
+                raise Blocked(f"{where}: field `{field}` missing")
+            conform(value[field], inner, f"{where}.{field}")
+        return value
+    if spec[0] in ("list", "nonempty", "nullable"):
+        kind, inner = spec
+        if kind == "nullable":
+            return value if value is None else conform(value, inner, where)
+        if not isinstance(value, list) or (kind == "nonempty" and not value):
+            raise Blocked(f"{where}: expected a{' non-empty' * (kind == 'nonempty')} list")
+        for index, item in enumerate(value):
+            conform(item, inner, f"{where}[{index}]")
+        return value
+    if isinstance(value, bool) and bool not in spec:
+        raise Blocked(f"{where}: unexpected boolean")
+    if not isinstance(value, spec):
+        raise Blocked(f"{where}: expected {'/'.join(t.__name__ for t in spec)}, got "
+                      f"{type(value).__name__}")
+    return value
 
 
 # The first SIGINT or SIGTERM, by name. The handler only records it: no
@@ -544,8 +638,10 @@ def is_prompt(entry):
 def vendor_turns(path, needle=None):
     """Per prompt: usage summed over model calls (one per message id), the
     number of tool calls and of tool inputs holding `needle`, and the text of
-    the turn's last text-bearing assistant message (`final_text`), which ties
-    the turn's record to the envelope that completed it."""
+    the turn's terminal message (`terminal_text`): the text of the turn's
+    last message-bearing record when that is an assistant message with
+    stop_reason `end_turn`, else None. A record lost after an intermediate
+    message (stop_reason `tool_use`) leaves no terminal message."""
     keys = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens",
             "output_tokens")
     turns = []
@@ -554,18 +650,22 @@ def vendor_turns(path, needle=None):
             entry = json.loads(line)
             if is_prompt(entry):
                 turns.append({"calls": {}, "tools": {}, "needle_inputs": set(),
-                              "invalid_inputs": set(), "texts": {}, "last_text": None})
+                              "invalid_inputs": set(), "texts": {}, "last": None})
+                continue
+            if (entry.get("type") == "user" and not entry.get("isSidechain") and turns
+                    and isinstance(entry.get("message"), dict)):
+                turns[-1]["last"] = None  # a tool result: the turn went on
                 continue
             message = entry.get("message")
             if (entry.get("type") != "assistant" or entry.get("isSidechain") or not turns
                     or not isinstance(message, dict)):
                 continue
             turn = turns[-1]
+            turn["last"] = (message.get("id"), message.get("stop_reason"))
             for part in message.get("content") or []:
                 if (isinstance(part, dict) and part.get("type") == "text"
                         and isinstance(part.get("text"), str)):
                     turn["texts"].setdefault(message.get("id"), []).append(part["text"])
-                    turn["last_text"] = message.get("id")
                 if isinstance(part, dict) and part.get("type") == "tool_use":
                     turn["tools"][part.get("id")] = part.get("name")
                     tool_input = part.get("input")
@@ -583,18 +683,26 @@ def vendor_turns(path, needle=None):
              "tool_calls": len(turn["tools"]), "tool_names": sorted(set(turn["tools"].values())),
              "invalid_inputs": len(turn["invalid_inputs"]),
              "needle_inputs": len(turn["needle_inputs"]),
-             "final_text": "".join(turn["texts"].get(turn["last_text"], []))}
+             "terminal_text": terminal_text(turn)}
             for turn in turns]
+
+
+def terminal_text(turn):
+    last = turn["last"]
+    if last is None or last[0] is None or last[1] != "end_turn" or last[0] not in turn["texts"]:
+        return None
+    return "".join(turn["texts"][last[0]])
 
 
 def ends_with(turn, envelope):
     """The transcript holds the record of the envelope's turn through its end:
-    the turn's last assistant text equals the envelope's non-empty
-    `final_text`. A truncated or lost tail fails this, so zero recorded tool
-    calls is evidence only when it holds."""
-    text = envelope.get("final_text")
-    return (isinstance(text, str) and bool(text.strip())
-            and turn["final_text"].strip() == text.strip())
+    the turn's last record is a terminal assistant message (`end_turn`)
+    whose text equals the envelope's non-empty `final_text`. A truncated or
+    lost tail fails this, so zero recorded tool calls is evidence only when
+    it holds."""
+    text = envelope["final_text"]
+    return (isinstance(text, str) and bool(text.strip()) and turn["terminal_text"] is not None
+            and turn["terminal_text"].strip() == text.strip())
 
 
 def vendor_transcript(run, vendor_id):
@@ -842,6 +950,8 @@ class Run:
             if receipt is None:
                 write_json(case.dir / f"{label}-launches.json", sampler.launches)
                 return None, err, sampler.launches
+            conform(receipt, "spawn receipt" if verb == "spawn" else "receipt",
+                    f"{label} receipt")
             if verb == "spawn":
                 self.keep_handle(case, receipt)
             _, envelope, err = self.via_call(case.dir, f"{label}-envelope", "wait",
@@ -851,14 +961,16 @@ class Run:
         write_json(case.dir / f"{label}-launches.json", sampler.launches)
         if envelope is None:
             raise Blocked(f"{label}: no envelope within {wait_s} s ({err})")
+        # A malformed envelope leaves the submission's latch set.
+        conform(envelope, "envelope", f"{label} envelope")
         self.account(case, label, envelope)
         if sampler.error:
             raise Blocked(f"{label}: launch sampling failed ({sampler.error}); the launch "
                           "evidence is incomplete")
-        failure = envelope.get("failure") or {}
-        cls = failure.get("class")
+        failure = envelope["failure"]
+        cls = failure["class"] if failure else None
         if cls not in expect and (cls in ("rate_limit", "auth", "budget_exceeded") or (
-                cls == "vendor_error" and QUOTA.search(failure.get("message") or ""))):
+                cls == "vendor_error" and QUOTA.search(failure["message"]))):
             raise Blocked(f"{label}: vendor {cls} failure")
         return receipt, envelope, sampler.launches
 
@@ -878,20 +990,19 @@ class Run:
         report and, for a completed turn, above it. Only a usable value not
         below the previous report clears the submission's latch; anything
         else keeps spending refused. Reaching the cap blocks the run too."""
-        version = envelope.get("vendor_version")
-        self.versions.append({"case": case.name, "turn": label,
-                              "vendor_version": version if isinstance(version, str) else None})
-        cost = envelope.get("cost") or {}
-        session = envelope.get("session_id")
-        usd = cost.get("usd")
-        usable = (isinstance(usd, (int, float)) and not isinstance(usd, bool)
-                  and math.isfinite(usd) and usd >= 0
-                  and cost.get("scope") == "session_cumulative")
+        conform(envelope, "envelope", f"{label} envelope")
+        version = envelope["vendor_version"]
+        self.versions.append({"case": case.name, "turn": label, "vendor_version": version})
+        cost = envelope["cost"]
+        session = envelope["session_id"]
+        usd = cost["usd"]
+        usable = (isinstance(usd, (int, float)) and math.isfinite(usd) and usd >= 0
+                  and cost["scope"] == "session_cumulative")
         if not usable:
             self.accounting_failed = f"{case.name} {label}: cost {cost!r}"
             raise Blocked(f"{label}: no usable session-cumulative cost; spending unaccounted")
         previous = self.last_cost.get(session, 0.0)
-        state = envelope.get("state")
+        state = envelope["state"]
         if state == "completed":
             ok = case.check(f"{label}: cost above the session's previous report",
                             usd > previous, {"usd": usd, "previous": previous})
@@ -917,9 +1028,9 @@ class Run:
         """The session's status; a missing or failed reply is Blocked, never
         an empty status."""
         rc, status, _ = self.via_call(case.dir, label, "status", session, *extra, "--json")
-        if rc != 0 or not isinstance(status, dict):
+        if rc != 0:
             raise Blocked(f"{label}: no status (rc {rc})")
-        return status
+        return conform(status, "status", label)
 
     def events(self, case, label, address):
         """Every event page; a missing or failed page is Blocked, never the
@@ -928,12 +1039,16 @@ class Run:
         while True:
             rc, page, _ = self.via_call(case.dir, f"{label}-page", "events", address,
                                         "--after", str(after), "--json")
-            if rc != 0 or not isinstance(page, dict) or not isinstance(page.get("events"), list):
+            if rc != 0:
                 raise Blocked(f"{label}: an events page is missing (rc {rc}); the events "
                               "are incomplete")
+            conform(page, "events page", f"{label} page after {after}")
             events.extend(page["events"])
-            if not page.get("more"):
+            if page["more"] is False:
                 break
+            if page["next_after"] <= after and not page["events"]:
+                raise Blocked(f"{label}: an events page made no progress; the events are "
+                              "incomplete")
             after = page["next_after"]
         (case.dir / f"{label}-page.json").unlink(missing_ok=True)
         write_json(case.dir / f"{label}.json", events)
@@ -1003,8 +1118,13 @@ class Run:
                 detail = err if err is not None else f"rc {rc}, no live daemon pid in the reply"
             except Blocked as error:
                 status, detail = None, str(error)
-            pid = status.get("pid") if isinstance(status, dict) else None
-            stat = proc_stat(pid) if isinstance(pid, int) and not isinstance(pid, bool) else None
+            pid = None
+            if status is not None:
+                try:
+                    pid = conform(status, "daemon status", f"{name} daemon status")["pid"]
+                except Blocked as error:
+                    detail = str(error)
+            stat = proc_stat(pid) if pid is not None else None
             if stat is not None:
                 # The daemon itself takes both locks: /proc/locks must show
                 # it as their locker. This also proves the lock ids match.
@@ -1021,9 +1141,11 @@ class Run:
                 raise Blocked(f"daemon for phase {name} did not start verifiably ({detail})")
         except BaseException as error:
             # Any unsuccessful start: find what it left by the private locks.
-            # A daemon identified neither by a replied pid with start ticks
-            # nor by a lock holder (it may be paused before taking the
-            # locks) leaves ownership uncertain for the rest of the run.
+            # Identification is a recorded pid with start ticks: the replied
+            # pid, a descriptor holder, or a /proc/locks locker read with its
+            # start ticks. Anything else (nothing found, or a locker whose
+            # pid cannot be read) leaves ownership uncertain for the rest of
+            # the run.
             record.setdefault("start_failed", f"{type(error).__name__}: {error}")
             if isinstance(pid, int) and not isinstance(pid, bool):
                 try:
@@ -1034,14 +1156,20 @@ class Run:
                     record.update(pid=pid, start_ticks=known["start_ticks"])
             try:
                 record["found"] = self.find_daemons()
-                record["lock_lines"] = self.lock_lines()
             except Exception as find_error:
                 record["found"] = f"search failed: {type(find_error).__name__}"
-            identified = ("pid" in record
-                          or (isinstance(record.get("found"), list) and bool(record["found"]))
-                          or bool(record.get("lock_lines")))
-            if not identified:
+            try:
+                record["lock_lines"] = self.lock_lines()
+            except Exception as lock_error:
+                record["lock_lines"] = f"unreadable: {type(lock_error).__name__}"
+            lockers, unrecorded = self.lockers(record["lock_lines"])
+            record["lockers"] = lockers
+            identified = ("pid" in record or lockers
+                          or (isinstance(record["found"], list) and bool(record["found"])))
+            if not identified or unrecorded:
                 record["identity_unknown"] = True
+                if unrecorded:
+                    record["lockers_unrecorded"] = unrecorded
             raise
         del record["runtime_dir_kept"]
         record.update(pid=pid, start_ticks=stat["start_ticks"])
@@ -1079,6 +1207,24 @@ class Run:
                     lines.setdefault(token, []).append(
                         [int(pid) if pid.isdigit() else None, kind])
         return lines
+
+    @staticmethod
+    def lockers(lines):
+        """The lockers named in `lock_lines`, read with their start ticks:
+        ([{pid, start_ticks}], [lockers that could not be recorded])."""
+        found, unrecorded = [], []
+        for entries in (lines.values() if isinstance(lines, dict) else []):
+            for pid, _kind in entries:
+                try:
+                    stat = proc_stat(pid) if isinstance(pid, int) else None
+                except Unreadable:
+                    stat = None
+                if stat is None:
+                    if pid not in unrecorded:
+                        unrecorded.append(pid)
+                elif {"pid": pid, "start_ticks": stat["start_ticks"]} not in found:
+                    found.append({"pid": pid, "start_ticks": stat["start_ticks"]})
+        return found, unrecorded
 
     def find_daemons(self):
         """Evidence only, never proof: processes seen holding this run's
@@ -1136,7 +1282,8 @@ class Run:
         recorded = []
         found = record.get("found") if isinstance(record.get("found"), list) else []
         for ident in (self.daemon, {"pid": record.get("pid"),
-                                    "start_ticks": record.get("start_ticks")}, *found):
+                                    "start_ticks": record.get("start_ticks")}, *found,
+                      *record.get("lockers", [])):
             if ident and isinstance(ident.get("pid"), int) and ident not in recorded:
                 recorded.append({"pid": ident["pid"], "start_ticks": ident["start_ticks"]})
         watched = {tuple(entry) for entry in record.get("descendants_watched", [])}
@@ -1146,27 +1293,47 @@ class Run:
 
         def survey():
             """(held locks, recorded daemons alive, watched descendants
-            alive, reasons the proof cannot decide)."""
+            alive, reasons the proof cannot decide). Each part is read on
+            its own: a failed read adds a reason and keeps what the other
+            parts established, so a held lock or a live recorded daemon
+            still gets its stop request."""
             unsure = (["the failed start identified no daemon"]
                       if record.get("identity_unknown") else [])
+            held = []
             try:
                 lines = self.lock_lines()
-                probes = {path.name: lock_free(path) for path in self.lock_paths()}
-                if lines is None:
-                    unsure.append("/proc/locks unreadable")
-                held = sorted(lines or {}) + sorted(
-                    name for name, free in probes.items() if free is False)
-                unsure += [f"{name}: lock probe undecided"
-                           for name, free in probes.items() if free is None]
+            except OSError as error:
+                lines = None
+                unsure.append(f"lock files: {type(error).__name__}: {error}")
+            if lines is None:
+                unsure.append("/proc/locks unreadable")
+            else:
+                held += sorted(lines)
+                # A locker seen holding this run's lock is ours: it is
+                # recorded and must be seen gone.
+                lockers, unrecorded = self.lockers(lines)
+                recorded.extend(ident for ident in lockers if ident not in recorded)
+                unsure += [f"locker {pid}: not readable with its start ticks"
+                           for pid in unrecorded]
+            for path in self.lock_paths():
+                free = lock_free(path)
+                if free is False:
+                    held.append(path.name)
+                elif free is None:
+                    unsure.append(f"{path.name}: lock probe undecided")
+            try:
                 procs = all_procs()
-                for root in self.find_daemons() + recorded:
-                    if (procs.get(root["pid"]) or {}).get("start_ticks") == root["start_ticks"]:
+                roots = self.find_daemons() + recorded
+            except (OSError, Unreadable) as error:
+                unsure.append(f"process scan: {type(error).__name__}: {error}")
+            else:
+                for root in roots:
+                    stat = procs.get(root["pid"])
+                    if stat is not None and stat["start_ticks"] == root["start_ticks"]:
                         watched.update((pid, procs[pid]["start_ticks"])
                                        for pid in descendants(root["pid"], procs))
-                states = {ident: alive(*ident) for ident in
-                          [(d["pid"], d["start_ticks"]) for d in recorded] + sorted(watched)}
-            except (OSError, Unreadable) as error:
-                return [], [], [], unsure + [f"{type(error).__name__}: {error}"]
+            states = {ident: alive(*ident) for ident in
+                      [(d["pid"], d["start_ticks"]) for d in recorded] + sorted(watched)}
             unsure += [f"pid {pid}: unreadable" for (pid, _), state in states.items()
                        if state is None]
             living = [d for d in recorded if states[(d["pid"], d["start_ticks"])] is True]
@@ -1204,6 +1371,7 @@ class Run:
             record["holders_left"] = self.find_daemons()  # evidence only: which pids
         except (OSError, Unreadable) as error:
             record["holders_left"] = f"unavailable: {type(error).__name__}"
+        record["recorded"] = recorded
         record["recorded_alive"] = recorded_alive
         record["descendants_left"] = left
         record["undecided"] = unsure
@@ -1258,8 +1426,8 @@ def check_launch(case, label, launches, *, mode, session, first, mcp_off=False,
 
 
 def completed(case, label, envelope):
-    return case.check(f"{label}: completed", envelope.get("state") == "completed",
-                      {"state": envelope.get("state"), "failure": envelope.get("failure")})
+    return case.check(f"{label}: completed", envelope["state"] == "completed",
+                      {"state": envelope["state"], "failure": envelope["failure"]})
 
 
 # --- cases ---------------------------------------------------------------------
@@ -1300,11 +1468,13 @@ def case_recipe_continuity(run, case):
     hf = run.handles[session]
     # The source changes after spawn: VIA must keep passing the frozen text.
     instructions.write_text(frozen.replace(mark, changed_mark))
-    case.check("t1: receipt effort low", receipt["effective"].get("effort") == "low",
+    case.check("t1: receipt effort low", receipt["effective"]["effort"] == "low",
                receipt["effective"])
     completed(case, "t1", t1)
-    case.check("t1: structured output A", (t1.get("structured_output") or {}).get(
-        "written", "").strip() == "hello", t1.get("structured_output"))
+    output = t1["structured_output"]
+    case.check("t1: structured output A", isinstance(output, dict)
+               and isinstance(output.get("written"), str)
+               and output["written"].strip() == "hello", output)
     note = ws / "note.txt"
     mode = note.stat().st_mode & 0o777 if note.exists() else None
     case.check("t1: Write tool created note.txt mode 0644 holding hello",
@@ -1322,8 +1492,8 @@ def case_recipe_continuity(run, case):
         case.check("t2: resume accepted", False, t2)
         return
     completed(case, "t2", t2)
-    case.check("t2: structured output B replaced A", t2.get("structured_output") == {"count": 7},
-               t2.get("structured_output"))
+    case.check("t2: structured output B replaced A", t2["structured_output"] == {"count": 7},
+               t2["structured_output"])
     check_launch(case, "t2", launches, first=False, effort="medium", schema=schema_b, **common)
 
     receipt3, t3, launches = run.turn(
@@ -1334,13 +1504,14 @@ def case_recipe_continuity(run, case):
     if receipt3 is None:
         case.check("t3: resume accepted", False, t3)
         return
-    failure = t3.get("failure") or {}
+    # `vendor_code` is optional in C1 (§5): its absence fails the equality.
+    failure = t3["failure"]
     case.check("t3: step limit gives failed budget_exceeded max_steps error_max_turns",
-               t3.get("state") == "failed" and failure.get("class") == "budget_exceeded"
-               and t3.get("stop_reason") == "max_steps"
+               t3["state"] == "failed" and failure is not None
+               and failure["class"] == "budget_exceeded" and t3["stop_reason"] == "max_steps"
                and failure.get("vendor_code") == "error_max_turns",
-               {"state": t3.get("state"), "failure": failure,
-                "stop_reason": t3.get("stop_reason"), "steps": t3.get("steps")})
+               {"state": t3["state"], "failure": failure, "stop_reason": t3["stop_reason"],
+                "steps": t3["steps"]})
     check_launch(case, "t3", launches, first=False, effort="medium", max_turns="1", **common)
 
     receipt4, t4, launches = run.turn(
@@ -1352,27 +1523,27 @@ def case_recipe_continuity(run, case):
         case.check("t4: resume accepted", False, t4)
         return
     completed(case, "t4", t4)
-    text = t4.get("final_text") or ""
-    case.check("t4: conversation-only nonce recalled", nonce in text, {"final_text": text})
+    text = t4["final_text"]  # null when spilled to a file: then not recalled inline
+    case.check("t4: conversation-only nonce recalled", isinstance(text, str) and nonce in text,
+               {"final_text": text})
     case.check("t4: frozen instructions in effect, not the changed source",
-               mark in text and changed_mark not in text)
-    case.check("t4: one step, max_steps 1 inherited", t4.get("steps") == 1
-               and receipt4["effective"].get("max_steps") == 1,
-               {"steps": t4.get("steps"), "max_steps": receipt4["effective"].get("max_steps")})
-    warnings = t4.get("warnings")
-    case.check("t4: schema cleared", t4.get("structured_output") is None
-               and isinstance(warnings, list)
-               and not any(w.get("code") == "structured_output_missing" for w in warnings))
+               isinstance(text, str) and mark in text and changed_mark not in text)
+    case.check("t4: one step, max_steps 1 inherited", t4["steps"] == 1
+               and receipt4["effective"]["max_steps"] == 1,
+               {"steps": t4["steps"], "max_steps": receipt4["effective"]["max_steps"]})
+    # The schema validated `structured_output` and `warnings` as present.
+    case.check("t4: schema cleared", t4["structured_output"] is None and not any(
+        w["code"] == "structured_output_missing" for w in t4["warnings"]))
     check_launch(case, "t4", launches, first=False, effort="medium", max_turns="1", **common)
-    ids = {e.get("vendor_session_id") for e in (t1, t2, t3, t4)}
+    ids = {e["vendor_session_id"] for e in (t1, t2, t3, t4)}
     case.check("one vendor session across four launches", len(ids) == 1 and None not in ids,
                {"distinct": len(ids)})
     status = run.status(case, "status", session)
-    case.check("vendor identity verified", status.get("vendor_identity_verified") is True)
+    case.check("vendor identity verified", status["vendor_identity_verified"] is True)
     run.events(case, "events", session)
     # VIA records no tool events (C1 §6.1): the vendor transcript of this
     # VIA-created session gives the tool calls, as counts only.
-    path = vendor_transcript(run, t1.get("vendor_session_id"))
+    path = vendor_transcript(run, t1["vendor_session_id"])
     if path is None:
         case.not_observable("tool calls per turn", "vendor transcript not found")
     else:
@@ -1382,22 +1553,23 @@ def case_recipe_continuity(run, case):
                      "invalid_inputs": t["invalid_inputs"],
                      "inputs_with_nonce": t["needle_inputs"]} for n, t in enumerate(turns, 1)])
         # Evidence only if the transcript shows the tool calls known to have
-        # happened (t1's Write, t3's Bash) with valid input records.
-        # The recall turn's record must also be complete: its last text is
-        # t4's envelope final_text. A turn verified to make no tool call
-        # cannot read anything an earlier turn wrote, so the nonce predicate
-        # is scoped to t4.
+        # happened (t1's Write, t3's Bash) with valid input records and t4's
+        # record is complete through its terminal message (`ends_with`).
+        # The nonce must reach no tool input in any turn: a file written
+        # earlier could be loaded into the recall turn without a tool call.
         shows = (len(turns) == 4 and "Write" in turns[0]["tool_names"]
                  and "Bash" in turns[2]["tool_names"]
                  and all(t["invalid_inputs"] == 0 for t in turns)
                  and ends_with(turns[3], t4))
         if not shows:
             reason = ("the vendor transcript does not show t1's Write and t3's Bash with "
-                      "valid inputs, or its t4 record does not end with t4's final_text")
-            case.not_observable("t4: no tool input held the nonce", reason)
+                      "valid inputs, or its t4 record does not end in a terminal message "
+                      "holding t4's final_text")
+            case.not_observable("no tool input held the nonce in any turn", reason)
             case.not_observable("t4: no tool call", reason)
         else:
-            case.check("t4: no tool input held the nonce", turns[3]["needle_inputs"] == 0)
+            case.check("no tool input held the nonce in any turn",
+                       all(t["needle_inputs"] == 0 for t in turns))
             case.check("t4: no tool call", turns[3]["tool_calls"] == 0)
     run.snapshot(case, "after")
     case.usage_inputs = [(session, t) for t in (t1, t2, t3, t4)]
@@ -1421,12 +1593,15 @@ def case_interrupt(run, case):
         if receipt is None:
             case.check("t1: spawn accepted", False, err)
             return
+        conform(receipt, "spawn receipt", "t1 receipt")
         session = receipt["session_id"]
         run.keep_handle(case, receipt)
         tool, running, deadline = None, False, time.monotonic() + 90
         while time.monotonic() < deadline and not (tool and running):
             status = run.status(case, "status-running", session)
-            running = "Bash" in ((status.get("progress") or {}).get("running_tools") or [])
+            # `progress` is null once the turn is not running (C1 §3.7).
+            running = status["progress"] is not None and "Bash" in status["progress"][
+                "running_tools"]
             # Only the daemon's descendants: a tag match alone is never
             # enough to read a process's command line or environment.
             procs = all_procs()
@@ -1436,7 +1611,7 @@ def case_interrupt(run, case):
                 if (argv and os.path.basename(argv[0]).startswith("python")
                         and any(tag in part for part in argv)):
                     tool = stat
-            if (status.get("turns") or [{}])[-1].get("state") in TERMINAL:
+            if status["turns"][-1]["state"] in TERMINAL:
                 break
             time.sleep(0.5)
         case.check("tool observed running (status running_tools Bash, process present)",
@@ -1457,12 +1632,16 @@ def case_interrupt(run, case):
         else:
             case.check("VIA process marker key reaches the tool", marker is True,
                        {"key_present": marker})
-        _, cancel, _ = run.via_call(case.dir, "cancel", "cancel", session, "--wait", "--json",
-                                    timeout=150, handle=run.handles[session])
+        rc, cancel, _ = run.via_call(case.dir, "cancel", "cancel", session, "--wait", "--json",
+                                     timeout=150, handle=run.handles[session])
         # The decisive observation point: as `cancel --wait` returns.
         tool_alive = alive(tool["pid"], tool["start_ticks"]) if tool else None
         after = run.snapshot(case, "post-cancel", tags=(tag,))
     write_json(case.dir / "t1-launches.json", sampler.launches)
+    # The observation point counts only if `cancel --wait` did return.
+    if rc != 0 or cancel is None:
+        raise Blocked(f"cancel --wait failed (rc {rc}); no observation point")
+    conform(cancel, "cancel reply", "cancel reply")
     in_snapshot = bool(tool) and any(
         row["pid"] == tool["pid"] and row["start_ticks"] == tool["start_ticks"]
         for row in after["processes"])
@@ -1492,16 +1671,18 @@ def case_interrupt(run, case):
             case.check(name, not any(states), {"launches": len(states)})
         check_launch(case, "t1", sampler.launches, mode="restricted", session=session,
                      first=True)
-    _, envelope, _ = run.via_call(case.dir, "t1-envelope", "result", receipt["turn"], "--json")
-    envelope = envelope or {}
-    run.account(case, "t1", envelope)
-    cancel_info = envelope.get("cancel") or {}
-    case.check("turn cancelled, interrupted", envelope.get("state") == "cancelled"
-               and envelope.get("stop_reason") == "interrupted",
-               {"state": envelope.get("state"), "stop_reason": envelope.get("stop_reason")})
-    case.check("cancel acknowledged", cancel_info.get("outcome") == "acknowledged",
-               {"cancel_reply": cancel})
-    case.check("cleanup quiescent", cancel_info.get("cleanup") == "quiescent", cancel_info)
+    rc, envelope, _ = run.via_call(case.dir, "t1-envelope", "result", receipt["turn"], "--json")
+    if rc != 0 or envelope is None:
+        raise Blocked(f"t1: no envelope from `result` (rc {rc}); spending unaccounted")
+    run.account(case, "t1", envelope)  # validates the envelope first
+    cancel_info = envelope["cancel"]
+    case.check("turn cancelled, interrupted", envelope["state"] == "cancelled"
+               and envelope["stop_reason"] == "interrupted",
+               {"state": envelope["state"], "stop_reason": envelope["stop_reason"]})
+    case.check("cancel acknowledged", cancel_info is not None
+               and cancel_info["outcome"] == "acknowledged", {"cancel_reply": cancel})
+    case.check("cleanup quiescent", cancel_info is not None
+               and cancel_info["cleanup"] == "quiescent", cancel_info)
     events = run.events(case, "t1-events", receipt["turn"])
     types = [event["type"] for event in events]
     order = [types.index(t) if t in types else None
@@ -1515,8 +1696,9 @@ def case_interrupt(run, case):
         case.check("t2: resume accepted", False, t2)
         return
     completed(case, "t2", t2)
-    case.check("t2: same session continues", "AFTER" in (t2.get("final_text") or "")
-               and t2.get("vendor_session_id") == envelope.get("vendor_session_id"))
+    case.check("t2: same session continues", isinstance(t2["final_text"], str)
+               and "AFTER" in t2["final_text"]
+               and t2["vendor_session_id"] == envelope["vendor_session_id"])
     check_launch(case, "t2", launches, mode="restricted", session=session, first=False)
     run.snapshot(case, "after", tags=(tag,))
 
@@ -1541,28 +1723,27 @@ def case_never_ask(run, case):
     elapsed = round(time.monotonic() - started, 3)
     # The denial ends the turn normally: any failure, even after a correct
     # denial, is not a pass.
-    case.check("turn settled completed without hanging", t1.get("state") == "completed",
-               {"state": t1.get("state"), "failure": t1.get("failure"), "elapsed_s": elapsed})
+    case.check("turn settled completed without hanging", t1["state"] == "completed",
+               {"state": t1["state"], "failure": t1["failure"], "elapsed_s": elapsed})
     check_launch(case, "t1", launches, mode="restricted", session=receipt["session_id"],
                  first=True)
     events = run.events(case, "events", receipt["session_id"])
     denials = [e for e in events if e["type"] == "action.denied"]
-    entries = t1.get("denied_actions", [])
+    entries = t1["denied_actions"]
     # An envelope entry is cut to 256 bytes; its event keeps the full
     # payload (C1 §5).
     case.check("exactly one denial: envelope total, entries and events",
-               t1.get("denied_actions_total") == 1 and len(entries) == 1 and len(denials) == 1,
-               {"total": t1.get("denied_actions_total"), "entries": len(entries),
+               t1["denied_actions_total"] == 1 and len(entries) == 1 and len(denials) == 1,
+               {"total": t1["denied_actions_total"], "entries": len(entries),
                 "events": len(denials)})
     case.check("the denial is a file_write of the outside path",
-               len(denials) == 1 and denials[0].get("kind") == "file_write"
-               and denials[0].get("target") == str(target) and len(entries) == 1
-               and entries[0].get("kind") == "file_write"
-               and entries[0].get("event_seq") == denials[0]["seq"]
-               and str(target).startswith(entries[0].get("target") or "\0"))
+               len(denials) == 1 and denials[0]["kind"] == "file_write"
+               and denials[0]["target"] == str(target) and len(entries) == 1
+               and entries[0]["kind"] == "file_write"
+               and entries[0]["event_seq"] == denials[0]["seq"]
+               and bool(entries[0]["target"]) and str(target).startswith(entries[0]["target"]))
     case.check("no control request declined (permission prompts none)",
-               t1.get("auto_declined_requests_total") == 0,
-               t1.get("auto_declined_requests_total"))
+               t1["auto_declined_requests_total"] == 0, t1["auto_declined_requests_total"])
     case.check("outside file not created", not target.exists())
     run.snapshot(case, "after")
 
@@ -1665,11 +1846,12 @@ def mcp_launch(run, case, label, expect_inherit, expect_warning, mode, mcp_off,
 
 
 def check_recall_tools(run, case, label, envelope, nonce):
-    """The recall turn made no tool call and no tool input held the nonce,
-    from the vendor transcript; evidence only when it shows the spawn
-    turn's known Bash call with valid inputs and the recall turn's record
-    ends with the envelope's final_text, else `not_observable`."""
-    path = vendor_transcript(run, envelope.get("vendor_session_id"))
+    """The recall turn made no tool call and no tool input in any turn held
+    the nonce, from the vendor transcript; evidence only when it shows the
+    spawn turn's known Bash call with valid inputs and the recall turn's
+    record ends in a terminal message holding the envelope's final_text
+    (`ends_with`), else `not_observable`."""
+    path = vendor_transcript(run, envelope["vendor_session_id"])
     turns = vendor_turns(path, needle=nonce) if path else []
     write_json(case.dir / f"{label}-tool-calls.json",
                [{"turn": n, "tool_calls": t["tool_calls"], "tool_names": t["tool_names"],
@@ -1679,27 +1861,26 @@ def check_recall_tools(run, case, label, envelope, nonce):
             and all(t["invalid_inputs"] == 0 for t in turns)
             and ends_with(turns[1], envelope)):
         reason = ("the vendor transcript was not found, does not show the spawn turn's Bash "
-                  "call with valid inputs, or its recall record does not end with the "
-                  "envelope's final_text")
+                  "call with valid inputs, or its recall record does not end in a "
+                  "terminal message holding the envelope's final_text")
         case.not_observable(f"{label}: no tool call in the recall turn", reason)
-        case.not_observable(f"{label}: no tool input held the nonce", reason)
+        case.not_observable(f"{label}: no tool input held the nonce in any turn", reason)
         return
     case.check(f"{label}: no tool call in the recall turn", turns[1]["tool_calls"] == 0)
-    case.check(f"{label}: no tool input held the nonce", turns[1]["needle_inputs"] == 0)
+    case.check(f"{label}: no tool input held the nonce in any turn",
+               all(t["needle_inputs"] == 0 for t in turns))
 
 
 def check_status(run, case, label, session, expect_inherit, expect_warning):
+    # The schema validated `inherit`, `warnings` and, on every
+    # config_switch_unverified warning, its `data.categories`.
     status = run.status(case, f"{label}-status", session)
-    inherit = status.get("inherit")
+    inherit = status["inherit"]
     case.check(f"{label}: status inherit matches the packet table", inherit == expect_inherit,
                inherit)
-    if not isinstance(status.get("warnings"), list):
-        case.not_observable(f"{label}: config_switch_unverified categories",
-                            "status has no warnings list")
-        return
-    warning = [w for w in status["warnings"] if w.get("code") == "config_switch_unverified"]
-    categories = sorted(c["category"] for w in warning for c in w.get("data", {}).get(
-        "categories", []))
+    categories = sorted(c["category"] for w in status["warnings"]
+                        if w["code"] == "config_switch_unverified"
+                        for c in w["data"]["categories"])
     case.check(f"{label}: config_switch_unverified categories", categories == expect_warning,
                categories)
 
@@ -1760,9 +1941,9 @@ def case_mcp_unrestricted(run, case):
             return
         completed(case, "unrestricted-t2", t2)
         write_json(case.dir / "unrestricted-nonce.json", {"nonce": nonce})
-        text = t2.get("final_text") or ""
-        case.check("unrestricted-t2: conversation-only nonce recalled", nonce in text,
-                   {"final_text": text})
+        text = t2["final_text"]
+        case.check("unrestricted-t2: conversation-only nonce recalled",
+                   isinstance(text, str) and nonce in text, {"final_text": text})
         check_recall_tools(run, case, "unrestricted-t2", t2, nonce)
         check_launch(case, "unrestricted-t2", launches, mode="unrestricted", session=session,
                      first=False)
@@ -1810,11 +1991,13 @@ def case_usage(run, case, inputs):
         case.result, case.reason = "blocked", "recipe_continuity produced no turns"
         return
     session, first = inputs[0]
-    _, logs, _ = run.via_call(case.dir, "logs", "logs", f"{session}/1", "--json")
+    rc, logs, _ = run.via_call(case.dir, "logs", "logs", f"{session}/1", "--json")
+    if rc != 0:
+        raise Blocked(f"logs: no reply (rc {rc})")
+    conform(logs, "logs", "logs")
     case.check("VIA keeps no vendor transcript (logs.transcript null)",
-               isinstance(logs, dict) and "transcript" in logs and logs["transcript"] is None,
-               logs)
-    path = vendor_transcript(run, first.get("vendor_session_id"))
+               logs["transcript"] is None, logs)
+    path = vendor_transcript(run, first["vendor_session_id"])
     if path is None:
         case.not_observable("vendor per-call usage", "vendor transcript not found")
         return
@@ -1827,16 +2010,16 @@ def case_usage(run, case, inputs):
         raw = {key: raw[key] for key in ("input_tokens", "cache_creation_input_tokens",
                                          "cache_read_input_tokens", "output_tokens", "calls")}
         cumulative = {key: cumulative.get(key, 0) + value for key, value in raw.items()}
-        usage = envelope.get("usage") or {}
+        usage = envelope["usage"]
         expected = {"input_tokens": raw["input_tokens"] + raw["cache_creation_input_tokens"]
                     + raw["cache_read_input_tokens"],
                     "cached_input_tokens": raw["cache_read_input_tokens"],
                     "output_tokens": raw["output_tokens"]}
-        got = {key: usage.get(key) for key in expected}
-        rows.append({"turn": turn, "state": envelope.get("state"), "vendor_turn": raw,
+        got = {key: usage[key] for key in expected}
+        rows.append({"turn": turn, "state": envelope["state"], "vendor_turn": raw,
                      "vendor_cumulative": cumulative, "envelope": got, "expected": expected,
-                     "scope": usage.get("scope"), "cost": envelope.get("cost")})
-        case.check(f"turn {turn}: usage scope turn", usage.get("scope") == "turn")
+                     "scope": usage["scope"], "cost": envelope["cost"]})
+        case.check(f"turn {turn}: usage scope turn", usage["scope"] == "turn")
         case.check(f"turn {turn}: envelope usage equals the turn's vendor calls",
                    raw["calls"] > 0 and got == expected, {"calls": raw["calls"]})
         if cumulative != raw:
@@ -1863,9 +2046,9 @@ def case_private_profile(run, case):
     if receipt is None:
         case.check("spawn accepted", False, t1)
         return
-    failure = t1.get("failure") or {}
-    case.check("turn failed auth", t1.get("state") == "failed" and failure.get("class") == "auth",
-               {"state": t1.get("state"), "failure": failure})
+    failure = t1["failure"]
+    case.check("turn failed auth", t1["state"] == "failed" and failure is not None
+               and failure["class"] == "auth", {"state": t1["state"], "failure": failure})
     check_launch(case, "t1", launches, mode="restricted", session=receipt["session_id"],
                  first=True)
     case.check("no credential file created in the scratch HOME",
