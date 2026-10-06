@@ -133,9 +133,10 @@ already cleaned up. Limitation: the release does not wait for proof the
 failed initializer stopped; when Host reports that cleanup `uncertain` the
 next first start proceeds anyway, and may meet the same 30 s wait if the
 old process still indexes (no fence; revisit if observed). Likewise, a
-panic of the launch task or of the failed launch's retirement task drops
-the permit with the task, before the retirement, so a later first start
-may overlap the old process (an abnormal path; revisit if observed).
+panic of the launch task drops the permit with the task, and a panic of
+the failed launch's retirement task drops it when the supervisor removes
+the instance after collecting the panic; either way before the retirement
+ended, so a later first start may overlap the old process (an abnormal path; revisit if observed).
 Launches on a
 marked home are not serialized, and equal keys still share one launch. A server that dies during its handshake fails its
 waiting turns `server_lost` when Host confirms the exit; a transport loss,
