@@ -37,9 +37,12 @@ instance version is parsed from `initialize.userAgent`: drop the
 0.160.0 (live rounds 1 and 2 through VIA, 2026-10-05/06); a version outside the adapter's `checked` set is
 `untested` and warns; only a failed handshake check (policy and sandbox echo)
 refuses, as `submit_failed` with `failure.data.reason:"handshake_refused"`,
-cached per C2 §5 under the server key plus the turn's sandbox (mode
-and policy as derived from its bound), so a refusal under one bound never
-refuses another sharing the server.
+cached per C2 §5 under the server key plus exactly what the echo check
+compares (the resolved model, the session cwd and the turn's sandbox,
+mode and policy as derived from its bound; the approval policy and
+reviewer are constants), so a refusal never refuses another bound, model
+or directory sharing the server. A plan naming no bound or cwd matches
+no cached refusal.
 
 Local primary sources live under
 `scratchpad/execution/rust-foundation-release/codex-evidence/`:

@@ -1350,23 +1350,33 @@ fn checked_outcome(
 /// `harness_unavailable` with `reason: "handshake_refused"`, before any
 /// receipt or launch. The refused turns' bound is `full` with network.
 fn refused_from_cache(pure: &conformance_drive::Pure) -> Result<(), String> {
-    match cached_refusal(
-        pure,
-        json!({"mode": "full", "extra_write_dirs": [], "network": true}),
-    )? {
+    match cached_refusal(pure, &PLAN_MODEL_CWD, full())? {
         Some(()) => Ok(()),
         None => Err("no cached refusal".to_owned()),
     }
 }
 
-/// Whether the plan of an otherwise identical spawn with `bound` is
-/// refused from the cache (`Some`), with its `version_status: "refused"`
-/// and `harness_unavailable` / `handshake_refused` refusal.
-fn cached_refusal(pure: &conformance_drive::Pure, bound: Value) -> Result<Option<()>, String> {
+/// The plain fixture's model and session cwd.
+const PLAN_MODEL_CWD: (&str, &str) = ("gpt-6-sol", "/work/project");
+
+/// The plain fixture's bound.
+fn full() -> Value {
+    json!({"mode": "full", "extra_write_dirs": [], "network": true})
+}
+
+/// Whether the plan of an otherwise identical spawn with `model`, `cwd`
+/// and `bound` is refused from the cache (`Some`), with its
+/// `version_status: "refused"` and `harness_unavailable` /
+/// `handshake_refused` refusal.
+fn cached_refusal(
+    pure: &conformance_drive::Pure,
+    (model, cwd): &(&str, &str),
+    bound: Value,
+) -> Result<Option<()>, String> {
     let request = via_adapters::DescribeRequest {
         harness: Some("codex".to_owned()),
-        model: Some("gpt-6-sol".to_owned()),
-        cwd: Some("/work/project".into()),
+        model: Some((*model).to_owned()),
+        cwd: Some((*cwd).into()),
         bound: Some(serde_json::from_value(bound).map_err(|e| e.to_string())?),
         ..via_adapters::DescribeRequest::default()
     };
@@ -1408,15 +1418,54 @@ fn codex_handshake_refusal_is_per_bound() {
             json!({"mode": "workspace_write", "extra_write_dirs": [], "network": false});
         let full = json!({"mode": "full", "extra_write_dirs": [], "network": true});
         match (
-            cached_refusal(pure, read_only)?,
-            cached_refusal(pure, workspace)?,
-            cached_refusal(pure, full)?,
+            cached_refusal(pure, &PLAN_MODEL_CWD, read_only)?,
+            cached_refusal(pure, &PLAN_MODEL_CWD, workspace)?,
+            cached_refusal(pure, &PLAN_MODEL_CWD, full)?,
         ) {
             (Some(()), None, None) => Ok(()),
             states => Err(format!("read_only, workspace_write, full: {states:?}")),
         }
     })
     .unwrap();
+}
+
+/// C2 §5: the refusal key covers exactly what the echo check compares,
+/// the resolved model and the session cwd included. A thread whose reply
+/// echoes another model (then another cwd) is refused; afterwards the
+/// same request is refused from the cache, while one naming the echoed
+/// model (or cwd) with the same launch settings and bound is not.
+#[test]
+fn codex_handshake_refusal_is_per_model_and_cwd() {
+    for (name, from, to, other) in [
+        (
+            "codex_handshake_refusal_is_per_model",
+            "\"model\":\"gpt-6-sol\",\"modelProvider\":\"openai\",\"serviceTier\"",
+            "\"model\":\"gpt-6-luna\",\"modelProvider\":\"openai\",\"serviceTier\"",
+            ("gpt-6-luna", PLAN_MODEL_CWD.1),
+        ),
+        (
+            "codex_handshake_refusal_is_per_cwd",
+            "\"disabledPluginIds\":[],\"cwd\":\"/work/project\"",
+            "\"disabledPluginIds\":[],\"cwd\":\"/work/elsewhere\"",
+            (PLAN_MODEL_CWD.0, "/work/elsewhere"),
+        ),
+    ] {
+        let (mut replay, mut expect) = plain(name).unwrap();
+        let answer = step_with(&replay, "\"result\":{\"thread\"").unwrap();
+        edit_emit(&mut replay, answer, from, to).unwrap();
+        cut_after(&mut replay, answer, &[json!({"await_eof": {}})]).unwrap();
+        unaccepted(&mut expect, "handshake_refused", tested());
+        check_variant_then(name, &replay, &expect, |pure| {
+            match (
+                cached_refusal(pure, &PLAN_MODEL_CWD, full())?,
+                cached_refusal(pure, &other, full())?,
+            ) {
+                (Some(()), None) => Ok(()),
+                states => Err(format!("requested, echoed: {states:?}")),
+            }
+        })
+        .unwrap();
+    }
 }
 
 /// [`check_variant`] with the default knobs.

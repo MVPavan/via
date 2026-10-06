@@ -143,16 +143,15 @@ impl CodexAdapter {
     }
 
     /// The refusal-cache key (C2 §5; codex-server.md, the refusal cache's
-    /// key): the server key plus the turn's sandbox, mode and policy, as
-    /// derived from its bound. The server stays shared across bounds, but
-    /// the handshake's echo check depends on the sandbox, so a refusal
-    /// under one bound never refuses another. `None` (no bound named)
-    /// matches no recorded refusal: every turn applies one.
-    fn refusal_key(&self, requested: Inherit, sandbox: Option<&plan::Sandbox>) -> String {
+    /// key): the server key plus a digest of `echoed`, exactly what the
+    /// handshake's echo check compares. The server stays shared across
+    /// bounds, models and directories, but a refusal under one never
+    /// refuses another.
+    fn refusal_key(&self, requested: Inherit, echoed: &plan::Echoed<'_>) -> String {
         use std::fmt::Write as _;
         let mut key = self.server_key(requested);
         key.push('/');
-        for byte in &Sha256::digest(format!("{sandbox:?}"))[..8] {
+        for byte in &Sha256::digest(format!("{echoed:?}"))[..8] {
             // Writing to a `String` cannot fail.
             let _ = write!(key, "{byte:02x}");
         }
@@ -245,14 +244,25 @@ impl CodexAdapter {
             .bound
             .as_ref()
             .and_then(|bound| plan::sandbox(bound).ok());
-        let refused = self
-            .instances
-            .refusal(
-                &self.binary,
-                &self.refusal_key(requested, sandbox.as_ref()),
-                std::time::Instant::now(),
-            )
-            .is_some();
+        // A plan naming no bound or cwd matches no cached refusal: every
+        // turn has both, and the echo check compares them.
+        let refused = match (sandbox.as_ref(), req.cwd.as_deref()) {
+            (Some(sandbox), Some(cwd)) => {
+                let echoed = plan::Echoed {
+                    model: &model,
+                    cwd,
+                    sandbox,
+                };
+                self.instances
+                    .refusal(
+                        &self.binary,
+                        &self.refusal_key(requested, &echoed),
+                        std::time::Instant::now(),
+                    )
+                    .is_some()
+            }
+            (None, _) | (_, None) => false,
+        };
         let version_status = if refused {
             // C2 §5 AD7: a cached refusal refuses the plan, as Claude's.
             let mut refusal = Refusal::new(

@@ -4,6 +4,7 @@
 //! declarations and the reserved vendor keys.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use via_routes::codex::{SandboxMode, SandboxPolicy};
 
@@ -158,6 +159,22 @@ pub(crate) fn canonical_effort(effort: &str) -> Option<&'static str> {
 /// judged against the discovered catalog in `run_turn`.
 pub(crate) fn effort_refused(effort: &str) -> bool {
     effort.is_empty()
+}
+
+/// What the handshake's echo check compares against a thread reply
+/// (packet §3), less the approval policy and reviewer, which are
+/// constants: the resolved model, the session cwd and the turn's
+/// sandbox. It is also exactly the variable part of the refusal cache's
+/// key (C2 §5), so a refusal never covers a request the check would not
+/// have refused.
+#[derive(Debug)]
+pub(crate) struct Echoed<'a> {
+    /// The resolved model.
+    pub(crate) model: &'a str,
+    /// The session's working directory.
+    pub(crate) cwd: &'a Path,
+    /// The turn's sandbox, mode and policy, as derived from its bound.
+    pub(crate) sandbox: &'a Sandbox,
 }
 
 /// A bound as Codex applies it: the thread `sandbox` mode at start and

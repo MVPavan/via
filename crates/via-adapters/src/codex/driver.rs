@@ -59,12 +59,12 @@ use super::delivery::{
     losses as lock_losses,
 };
 use super::normalize::{self, DiscoveredModel, StructuredOutput};
-use super::plan::{self as codex_plan, Sandbox};
+use super::plan::{self as codex_plan, Echoed, Sandbox};
 use super::{ADAPTER_VERSION, CodexAdapter, HARNESS, PerTurn, refusals};
 use crate::driver::turn::{CLEANUP_ALLOWANCE, end_active};
 use crate::driver::{
-    Active, ConnectionPin, DriverState, ForceWatch, Prepared, Retiring, SessionDriver, SessionSpec,
-    TurnCx, TurnSpec, latch, lock, rejected,
+    Active, ConnectionPin, DriverState, ForceWatch, Prepared, Retiring, SessionDriver, TurnCx,
+    TurnSpec, latch, lock, rejected,
 };
 use crate::harness::Harness;
 use crate::instance::Incompatibility;
@@ -1990,11 +1990,15 @@ async fn confirm(
 ) -> Result<(), Box<TurnEnd>> {
     let driver = facts.driver;
     let turn = facts.number;
-    if let Some(field) = echo_differs(opened, sandbox.mode, &driver.spec) {
+    let echoed = Echoed {
+        model: &driver.spec.model,
+        cwd: &driver.spec.cwd,
+        sandbox,
+    };
+    if let Some(field) = echo_differs(opened, &echoed) {
         let adapter = &facts.session.adapter;
-        // The refusal key the refused handshake is cached under: the
-        // server key and this turn's sandbox (C2 §5).
-        let hash = adapter.refusal_key(driver.spec.inherit.requested, Some(sandbox));
+        // The refused handshake is cached under exactly what was compared.
+        let hash = adapter.refusal_key(driver.spec.inherit.requested, &echoed);
         adapter.instances.record_refusal(
             &adapter.binary,
             hash,
@@ -2048,19 +2052,15 @@ async fn confirm(
 /// directory). Only the sandbox's type is compared: the 0.160.0 echo of a
 /// workspace-write thread has `excludeSlashTmp` and `excludeTmpdirEnvVar`
 /// false while every `turn/start` applies them true (via-5lr.3.4).
-fn echo_differs(
-    opened: &ThreadResult,
-    mode: SandboxMode,
-    spec: &SessionSpec,
-) -> Option<&'static str> {
-    let sandbox = match mode {
+fn echo_differs(opened: &ThreadResult, echoed: &Echoed<'_>) -> Option<&'static str> {
+    let sandbox = match echoed.sandbox.mode {
         SandboxMode::ReadOnly => "readOnly",
         SandboxMode::WorkspaceWrite => "workspaceWrite",
         SandboxMode::DangerFullAccess => "dangerFullAccess",
     };
-    if opened.model != spec.model {
+    if opened.model != echoed.model {
         Some("model")
-    } else if Path::new(&opened.cwd) != spec.cwd {
+    } else if Path::new(&opened.cwd) != echoed.cwd {
         Some("cwd")
     } else if opened.approval_policy.as_str() != Some("never") {
         Some("approvalPolicy")
