@@ -752,10 +752,13 @@ default.
   Codex read-only (qualified live by `via-5lr.3.4`, not by the handshake); unchanged usage or terminal
   semantics.
 - **Exception: OpenCode runs only checked versions** (owner, 2026-10-06).
-  An `/api/info.version` outside the OpenCode adapter's `checked` set is
-  refused at the handshake before the server is published, even when every
-  other check passes: `handshake_refused`, cached by this refusal cache's
-  key, with a message naming the version and the checked set. The
+  A version outside the OpenCode adapter's `checked` set is refused before
+  the server starts: the anchor runs the opened program file's own
+  `--version` before ARM and launches that same file only when the version
+  is checked; the handshake's `/api/info.version` must then match
+  (`vendors/opencode.md` §2.2, runtime §5 "Pinned program"). A refusal is
+  `handshake_refused`, cached by this refusal cache's key, with a message
+  naming the version and the checked set. The
   one-server fence depends on the server keeping an inherited lock
   descriptor, which only per-version qualification shows
   (`vendors/opencode.md` §3.2, §12, L13).
@@ -791,10 +794,13 @@ fake agent reports no version".
 - Once a live instance's catalog is cached, `check_turn` applies it. The route
   judges `effort` against the advertised efforts of `TurnParams.model` in the
   catalog discovered by the live instance for the session's server key
-  (derived from `TurnParams.inherit`; OpenCode: the session's location
-  catalog, `vendors/opencode.md` §5), so later turns get the pre-receipt
+  (derived from `TurnParams.inherit`), so later turns get the pre-receipt
   `invalid_params`. With no cached catalog for that key, or a model it does
-  not list, the value passes to `run_turn`'s check.
+  not list, the value passes to `run_turn`'s check. OpenCode is the
+  exception: its catalog depends on the session's location, which
+  `check_turn` does not receive, so it makes no location-dependent effort
+  check; `run_turn` fetches the location's catalog fresh before the variant
+  step (`vendors/opencode.md` §5).
 
 `plan`, `check_turn` and `models` read only bundled data and the in-memory
 catalog cache of live instances; nothing is persisted.

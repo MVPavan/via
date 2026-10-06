@@ -359,7 +359,9 @@ The clonable sender/control handle and unique message receiver allow reads and
 control writes concurrently without borrowing one object mutably twice.
 `WireRuntime::open_connection` creates the owner's evidence folder (the
 turn's for a turn owner, `evidence/servers/<server_id>/` for a server
-owner) and invokes Host acquisition; `turn_folder` creates a turn's
+owner), takes the connection's payload-capture policy from Route
+(`Capture::On`, the default, or `Capture::Off`, below) and invokes Host
+acquisition; `turn_folder` creates a turn's
 folder on a shared route. Direct `WireConnection::open(&Host, spec,
 deadline)` is private to Wire; `WireConnection::control()` is
 private or removed. No public runtime/connection getter or facade re-export
@@ -437,7 +439,13 @@ names one; otherwise in the connection's folder. The failures go to the
 affected turns, which may differ from the turn holding the evidence (a
 successor of a terminal turn): each names the file and the message's length
 when the file is in its own session's turn folder, and only the length when it
-is in the connection's folder (D4). C1 `logs` returns only turn folders. A
+is in the connection's folder (D4). **Exception (OpenCode, owner
+2026-10-06):** a connection Route opens with `Capture::Off` keeps no
+payload bytes anywhere. Wire's automatic captures (a message over its cap,
+an unterminated message at EOF) and Route's decode-failure capture write
+no `undecoded.bin`; the failure records only the endpoint or event type,
+status, length and failure kind (`vendors/opencode.md` §4.3). C1 `logs`
+returns only turn folders. A
 final text too long for the envelope is written there as `final_text.txt`, and
 a structured output too long for it as `structured_output.json` (C1 §5). The
 vendor's stderr is capped (owner, 2026-10-04): a per-turn process keeps its
@@ -472,6 +480,16 @@ pub struct PrivateProcessSpec {
     pub owner: ProcessOwner,
     /// Exclusive launch lock (below): `None` for every route but OpenCode's.
     pub exclusive_lock: Option<PathBuf>,
+    /// Pinned program and version probe (below): `None` but for OpenCode.
+    pub pinned_program: Option<PinnedProgram>,
+}
+pub struct PinnedProgram {
+    pub identity: FileIdentity,          // dev, ino, size, mtime, ctime
+    pub version_probe: Option<VersionProbe>,
+}
+pub struct VersionProbe {
+    pub args: Vec<OsString>, pub cwd: PathBuf, pub env: EnvAllowList,
+    pub admitted: Vec<String>,           // exact trimmed stdout lines
 }
 pub struct AcquiredProcess {
     pub pipes: OwnedPipes,       // moved once into Wire; Host never reads them
@@ -537,7 +555,25 @@ its anchor is also gone leaves the lock free while it still runs: that
 retention is the route's qualification gate (`vendors/opencode.md` L13),
 not something Host can enforce. Nothing about the lock enters the Store,
 and Host never unlinks the file. It gates only the launch; cleanup
-evidence and harness-process capacity are unchanged.
+evidence and harness-process capacity are unchanged. With a pinned
+program, the lock is taken only after an admitted probe (below).
+
+**Pinned program and version probe** (OpenCode's version admission,
+`vendors/opencode.md` §2.2). When `pinned_program` is set, the anchor, on
+`Configure`, opens `program` read-only and close-on-exec and compares the
+open file's identity with `identity`; a difference replies the error
+`ProgramChanged` and exits, before any ARM intent. With `version_probe`,
+it then runs that open file through `/proc/self/fd/<n>` with the probe's
+arguments, cwd and environment, stdin `/dev/null`, stdout kept up to 256
+bytes, stderr discarded, and waits for it, killing it at a 2 s bound. The
+probe is the only process the anchor starts before ARM, and it has exited
+before the anchor replies. Unless the trimmed stdout is one of `admitted`
+and the exit status is zero, the anchor replies `ProbeRefused { output }`
+(the bounded output, printable ASCII only) and exits: Host commits no
+`ArmIntent`, and the acquisition fails as a refusal with that output.
+On ARM the anchor execs the vendor through the same open file
+(`/proc/self/fd/<n>`, `argv[0]` the program path), so a replaced or
+unlinked path cannot change what runs. Linux only; macOS is deferred.
 
 **Stop reply.** Host's `CloseReport` gains `stopped_live: Option<bool>`:
 the verified anchor's `Stopping { stopped_live }` reply to this close's
@@ -691,7 +727,8 @@ Startup protocol, on a 0600 Host-only Unix socket in the validated directory:
    `Spawned {pid, start_ticks}`), read from non-environment procfs metadata.
    It rejects duplicate/wrong-generation ARM and never spawns again.
    Before receiving ARM, controller EOF or a 5 s bootstrap deadline makes the anchor
-   exit; no vendor was started. After ARM, EOF starts own-group cleanup.
+   exit; no vendor was started (a pinned program's version probe, §5, has
+   already exited). After ARM, EOF starts own-group cleanup.
 4. Commit vendor child facts before handing pipes to Wire. If that write
    fails or the daemon dies, the already-durable anchor can clean its group;
    no missing vendor-identity row authorizes a numeric signal. The leftover
@@ -1391,7 +1428,7 @@ payload limits count encoded bytes plus separately bounded decoded structure.
 | Codex shared connection writes | 8 pending server-request replies, 64 KiB; one control in flight; data held back while any control is pending; per driver, reserved interrupt (12,800 B) and unsubscribe (6,400 B) slots, steer 6 commands and 46,336 B | Past the reply bound, a reply not written within 5 s of decode, or correlation exhaustion: connection overflow, every associated session fails through health, the server retires |
 | OpenCode HTTP/SSE transport metadata | Existing bounded Wire splitting; headers 64 KiB, bodies 1 MiB (`/api/model` 4 MiB) | Read, count and discard as for pipes; never an `Authorization` header or request body in evidence |
 | C2 observations | 1024 items and 4 MiB/session | Wait only normalizer; at 10 s without drain, the adapter closes the session's route hop; a private route fails the connection `overflow`, a shared route quarantines the thread generation (A1, C2 §4) |
-| C2 observation payload | 256 KiB encoded; final text sent in pieces; IDs, names, stop reasons and codes 1 KiB | Fail protocol, the message saved to the evidence folder (OpenCode: endpoint or event type, status, size and failing path only, never the payload, `vendors/opencode.md` §4.3); unknown messages keep no payload |
+| C2 observation payload | 256 KiB encoded; final text sent in pieces; IDs, names, stop reasons and codes 1 KiB | Fail protocol, the message saved to the evidence folder (a `Capture::Off` connection, OpenCode's: length and failure kind only, never the payload, §4); unknown messages keep no payload |
 | Data commands / control commands | 1 / 8 per driver, 64 KiB controls total | Data waits only until absolute deadline; duplicate interrupt/close coalesces; other control admission refused explicitly |
 | Health channel | watch latch + at most one exit report/connection | Latest health replaces state; `health: store_failed` is sticky after the latch; `store_failure` reports the latest recorded failure and its scope; no event payloads |
 | Store requests | 64 + 8 reserved lifecycle, 8 MiB total | Request-side overload refusal; Host cleanup never awaits this queue |
