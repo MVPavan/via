@@ -1186,6 +1186,10 @@ mod tests {
         ] {
             assert!(lost[field].is_null(), "{field}: {lost}");
         }
+        // C1 §5: all-null counts are provenance `unavailable`, never a
+        // `reported` figure.
+        assert_eq!(lost["provenance"], "unavailable", "{lost}");
+        assert_eq!(usage(None)["provenance"], "reported");
     }
 
     fn rejected(reason: via_adapters::StartRejected) -> crate::api::Failure {

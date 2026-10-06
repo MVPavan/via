@@ -1933,9 +1933,11 @@ impl Usage {
 
     /// The turn's reported figure (AD6) under the route's declared `scope`
     /// (C1 §4.1 `usage.tokens`), or `vendor_interval` once its ledger
-    /// overflowed; unavailable without a sample.
+    /// overflowed; unavailable without a sample, and when every count is
+    /// `null` (an all-null aggregate after lost samples, bead via-i5g):
+    /// C1 §5 pairs all-null counts with provenance `unavailable`.
     pub(crate) fn reported(tokens: Option<Tokens>, interval: bool, scope: &str) -> Self {
-        match tokens {
+        match tokens.filter(|tokens| *tokens != Tokens::default()) {
             Some(tokens) => Self {
                 input_tokens: tokens.input,
                 cached_input_tokens: tokens.cached_input,
