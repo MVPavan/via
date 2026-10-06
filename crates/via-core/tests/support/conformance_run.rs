@@ -166,10 +166,12 @@ pub(crate) struct Knobs {
     /// failpoint `point`'s first occurrence is released, and the case
     /// waits [`RELEASE_SETTLE`] (a paused anchor's cleanup runs meanwhile).
     pub(crate) release_before: Option<(usize, &'static str)>,
-    /// `(admitted, change)`: before the turn at index `admitted` starts,
-    /// `change` runs on the case's state directory (a profile fixed
-    /// between turns).
-    pub(crate) change_before: Option<(usize, Change)>,
+    /// `(before, change)`: `change` runs on the case's state directory
+    /// before the turn at index `before` starts (a profile fixed between
+    /// turns); with `before` `None`, at each gate, after its fences are
+    /// sampled and before the fake is signalled (a profile changed while
+    /// the turn executes).
+    pub(crate) change: Option<(Option<u32>, Change)>,
 }
 
 /// A test's change to the case's state directory, given its path.
@@ -554,12 +556,22 @@ impl<'a> Run<'a> {
             drop(Release(point));
             tokio::time::sleep(RELEASE_SETTLE).await;
         }
-        if let Some((at, change)) = self.knobs.change_before
-            && at == index
+        if let Some((Some(at), change)) = self.knobs.change
+            && usize::try_from(at).is_ok_and(|at| at == index)
         {
             change(self.pure.state.path()).map_err(|e| format!("turn {index}: change: {e}"))?;
         }
         Ok(())
+    }
+
+    /// [`Knobs::change`] at gate `step`, when it runs at gates.
+    fn change_at_gate(&self, step: u64) -> Result<(), String> {
+        match self.knobs.change {
+            Some((None, change)) => {
+                change(self.pure.state.path()).map_err(|e| format!("gate {step}: change: {e}"))
+            }
+            Some((Some(_), _)) | None => Ok(()),
+        }
     }
 
     /// Resolves once the health of the session of `turn` failed, within
@@ -1231,6 +1243,7 @@ impl<'a> Run<'a> {
                 let sample = (activity.decoded(), activity.delivered());
                 self.pure.gate_fences.borrow_mut().push(sample);
                 snapshots.push(snapshot(&observed.borrow(), &session.plan));
+                self.change_at_gate(step)?;
                 self.signal(launch)?;
                 self.until_progress(&format!("signalled {step} launch {launch}"))
                     .await?;

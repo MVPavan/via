@@ -1024,7 +1024,7 @@ fn pi_profile_policy() {
             ],
         );
         let knobs = Knobs {
-            change_before: Some((1, fixed_profile)),
+            change: Some((Some(1), fixed_profile)),
             ..Knobs::default()
         };
         let outcome = drive_built(
@@ -1049,6 +1049,76 @@ fn pi_profile_policy() {
         assert!(
             !message.contains("value-not-for-message"),
             "{name}: {message:?}"
+        );
+    }
+}
+
+/// `pi_profile_policy`, record half (review r1 minor): the profile
+/// changes while the turn executes (Pi's own first-run files appear and a
+/// setting is added) and `pi-profile.json` still records the check the
+/// launch passed, not a second check after the turn.
+#[test]
+fn pi_profile_record_is_pre_launch() {
+    let mut steps = handshake(&State::default());
+    steps.extend(prompt("Say READY."));
+    steps.extend(echo("Say READY."));
+    steps.push(json!({"await_signal": {"signal": "SIGUSR1"}}));
+    let gate = steps.len();
+    steps.extend(answer("READY", "stop", &canonical_usage()));
+    steps.extend(settle(&assistant(
+        json!([{"type": "text", "text": "READY"}]),
+        "stop",
+        &canonical_usage(),
+        None,
+    )));
+    steps.push(eof());
+    let replay = single(
+        "synthetic (via-jt8.3.2): the profile changes while the turn executes",
+        argv(Argv::default()),
+        steps,
+    );
+    let mut wanted = turn("Say READY.", completed(1, "READY"));
+    wanted["gates"] = json!([{"step": gate, "expect": {"accepted": true, "terminal": null}}]);
+    let expect = case("pi_profile_record_is_pre_launch", 1, vec![wanted]);
+    let knobs = Knobs {
+        change: Some((None, |state: &Path| {
+            let agent = state.join("vendor").join("pi").join("agent");
+            conformance_drive::write_private(&agent.join("models-store.json"), b"{}")
+                .map_err(std::io::Error::other)?;
+            settings(
+                &agent,
+                &json!({"cacheWarming": "off", "lastChangelogVersion": "1.0.2"}),
+            )
+        })),
+        ..Knobs::default()
+    };
+    let record = std::cell::RefCell::new(String::new());
+    let outcome = drive_built(
+        "pi_profile_record_is_pre_launch",
+        &replay,
+        &expect,
+        knobs,
+        Box::new(|_| Ok(())),
+        Box::new(|pure: &Pure| {
+            let changed = std::fs::read_to_string(agent_dir(pure).join("settings.json"))
+                .map_err(|e| format!("settings.json: {e}"))?;
+            if !changed.contains("lastChangelogVersion") {
+                return Err("the gate's change did not run".to_owned());
+            }
+            *record.borrow_mut() =
+                std::fs::read_to_string(evidence(pure, 1).join("pi-profile.json"))
+                    .map_err(|e| format!("pi-profile.json: {e}"))?;
+            Ok(())
+        }),
+    )
+    .unwrap();
+    conformance_expect::check(&expect, &outcome).unwrap();
+    let record = record.into_inner();
+    assert!(record.contains("settings.json"), "{record}");
+    for later in ["models-store.json", "lastChangelogVersion"] {
+        assert!(
+            !record.contains(later),
+            "pi-profile.json names {later}: {record}"
         );
     }
 }
