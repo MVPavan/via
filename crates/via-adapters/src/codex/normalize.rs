@@ -853,6 +853,7 @@ fn sample(last: &TokenBreakdown) -> UsageSample {
         output: Some(last.output_tokens),
         reasoning_output: Some(last.reasoning_output_tokens),
         total: Some(last.total_tokens),
+        interval_unverified: false,
     }
 }
 

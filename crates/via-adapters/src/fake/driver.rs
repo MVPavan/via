@@ -1036,6 +1036,7 @@ fn usage(sample: FakeUsage) -> UsageSample {
         output: sample.output,
         reasoning_output: sample.reasoning_output,
         total: sample.total,
+        interval_unverified: false,
     }
 }
 

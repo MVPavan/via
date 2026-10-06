@@ -967,6 +967,7 @@ fn usage(usage: &ResultUsage) -> Result<UsageSample, &'static str> {
             .as_ref()
             .and_then(|details| details.thinking_tokens),
         total,
+        interval_unverified: false,
     })
 }
 

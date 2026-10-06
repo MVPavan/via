@@ -378,12 +378,14 @@ impl Sums {
 /// The turn-wide usage ledger (AD6), apart from step accounting: a keyed
 /// sample supersedes the key's earlier one across the whole turn, a
 /// keyless one adds. Past 1,024 keys a new key adds as keyless, and the
-/// ledger has overflowed: the envelope then reports `vendor_interval`.
+/// ledger has overflowed: the envelope then reports `vendor_interval`, as
+/// it does once any sample's interval was unverified (C2 §5).
 #[derive(Clone, Debug, Default)]
 pub(super) struct UsageLedger {
     keyed: HashMap<String, UsageSample>,
     keyless: Sums,
     sampled: bool,
+    /// The keys overflowed, or a sample's interval was unverified.
     overflow: bool,
 }
 
@@ -391,6 +393,8 @@ impl UsageLedger {
     /// Folds one per-call sample.
     pub(super) fn add(&mut self, sample: &UsageSample) {
         self.sampled = true;
+        // Sticky: a later sample with the same key does not verify it.
+        self.overflow |= sample.interval_unverified;
         match &sample.key {
             Some(key) if self.keyed.contains_key(key) || self.keyed.len() < LEDGER_KEYS => {
                 self.keyed.insert(key.clone(), sample.clone());
@@ -409,7 +413,7 @@ impl UsageLedger {
         if let Some(aggregate) = aggregate {
             let mut sums = Sums::default();
             sums.add(aggregate);
-            return Some((sums.tokens(), false));
+            return Some((sums.tokens(), aggregate.interval_unverified));
         }
         if !self.sampled {
             return None;
@@ -698,6 +702,7 @@ mod tests {
             output: Some(1),
             reasoning_output: Some(0),
             total: Some(total),
+            interval_unverified: false,
         }
     }
 
@@ -736,6 +741,36 @@ mod tests {
         // A known key still supersedes after the overflow.
         ledger.add(&call(Some("k0"), 1, Some(0), 5));
         assert_eq!(ledger.figure(None).unwrap().0.total, Some(1030));
+    }
+
+    /// C2 gap A8 (C2 §5 usage, OpenCode §12): a sample whose interval the
+    /// vendor did not verify (a compaction call) makes the turn's interval
+    /// unverified, even after a later sample supersedes it; so does an
+    /// unverified turn aggregate, which still supersedes the samples.
+    #[test]
+    fn an_unverified_sample_makes_the_interval_unverified() {
+        let unverified = |sample: UsageSample| UsageSample {
+            interval_unverified: true,
+            ..sample
+        };
+        let mut ledger = UsageLedger::default();
+        ledger.add(&call(Some("a"), 10, Some(1), 11));
+        assert!(!ledger.figure(None).unwrap().1);
+        ledger.add(&unverified(call(Some("b"), 5, Some(0), 5)));
+        let (tokens, interval) = ledger.figure(None).unwrap();
+        assert!(interval, "a keyed unverified sample");
+        assert_eq!(tokens.total, Some(16));
+        ledger.add(&call(Some("b"), 6, Some(0), 6));
+        assert!(ledger.figure(None).unwrap().1, "sticky once seen");
+
+        let mut keyless = UsageLedger::default();
+        keyless.add(&unverified(call(None, 1, Some(0), 1)));
+        assert!(keyless.figure(None).unwrap().1, "a keyless one");
+
+        let aggregate = unverified(call(None, 156, None, 300));
+        let (tokens, interval) = UsageLedger::default().figure(Some(&aggregate)).unwrap();
+        assert_eq!(tokens.total, Some(300));
+        assert!(interval, "an unverified aggregate");
     }
 
     /// AD6: a component is `null` if any contributing sample lacks it.

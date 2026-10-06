@@ -3538,6 +3538,7 @@ fn a_late_usage_aggregate_supersedes_the_interval_warning() {
             output: Some(4),
             reasoning_output: None,
             total: Some(7),
+            interval_unverified: false,
         });
         engine.revise(&session, turn(1), &late).await;
         let envelope = stored_envelope(&engine, &session, 1).await;
@@ -3551,6 +3552,44 @@ fn a_late_usage_aggregate_supersedes_the_interval_warning() {
             "{envelope}"
         );
         assert_eq!(envelope["warnings"], json!([]), "{envelope}");
+    });
+}
+
+/// C2 gap A8 (C2 §5 usage): a late usage aggregate whose interval the
+/// vendor did not verify revises the stored usage as `vendor_interval`
+/// and keeps `usage_interval_unverified`.
+#[test]
+fn a_late_unverified_aggregate_keeps_the_interval_warning() {
+    let Some(root) = child("a_late_unverified_aggregate_keeps_the_interval_warning") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = unknown_session(&engine, (Value::Null, None), json!({})).await;
+        let mut late = late_terminal(via_adapters::VendorTerminalStatus::Completed, "late");
+        late.usage = Some(via_adapters::UsageSample {
+            total: Some(7),
+            interval_unverified: true,
+            ..via_adapters::UsageSample::default()
+        });
+        engine.revise(&session, turn(1), &late).await;
+        let envelope = stored_envelope(&engine, &session, 1).await;
+        assert_eq!(envelope["revision"], 1, "{envelope}");
+        assert_eq!(
+            (
+                &envelope["usage"]["total_tokens"],
+                &envelope["usage"]["scope"]
+            ),
+            (&json!(7), &json!("vendor_interval")),
+            "{envelope}"
+        );
+        let codes: Vec<&Value> = envelope["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|warning| &warning["code"])
+            .collect();
+        assert_eq!(codes, [&json!("usage_interval_unverified")], "{envelope}");
     });
 }
 
