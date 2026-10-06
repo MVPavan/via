@@ -565,7 +565,7 @@ async fn keep_records(
     // From now, within the wall's cutoff; the writer has its bound
     // before it starts (picrit round 3, 4).
     let from = Deadline::at(tokio::time::Instant::now().min(wall.instant()));
-    let cut = records_cut(from, (&orders.0, &orders.1));
+    let cut = records_cut(from, (&orders.0, &orders.1), &force);
     let written = driver.tracker.spawn_blocking({
         let cut = cut.clone();
         move || write_records(&folder, records, &cut)
@@ -575,16 +575,24 @@ async fn keep_records(
     }
 }
 
-/// The records' first bound, from the orders as they stand: an already
-/// expired cutoff skips every record.
-fn records_cut(from: Deadline, (stop, close): (&StopWatch, &CloseWatch)) -> Cut {
-    let orders = [
-        stop.borrow().as_ref().map(|order| order.close_by),
-        close.borrow().as_ref().map(|order| order.close_by),
-    ];
-    Cut(Arc::new(Mutex::new(
-        earliest_close(from, orders).into_std(),
-    )))
+/// The records' first bound, from the orders and the daemon force as they
+/// stand: an already expired cutoff, or a force already raised, skips
+/// every record (picrit round 3, 4; round 4, 3).
+fn records_cut(
+    from: Deadline,
+    (stop, close): (&StopWatch, &CloseWatch),
+    force: &ForceWatch,
+) -> Cut {
+    let at = if force.borrow().is_some() {
+        tokio::time::Instant::now()
+    } else {
+        let orders = [
+            stop.borrow().as_ref().map(|order| order.close_by),
+            close.borrow().as_ref().map(|order| order.close_by),
+        ];
+        earliest_close(from, orders)
+    };
+    Cut(Arc::new(Mutex::new(at.into_std())))
 }
 
 /// Ends the turn's active state (steer lane and close order) when the
@@ -1095,14 +1103,16 @@ mod tests {
     use crate::Deadline;
     use tokio::sync::watch;
 
-    /// Picrit round 2, D and round 3, 4: the writer decides the skip
-    /// itself, from the bound it is built with before it starts. A cutoff
-    /// already expired then begins no record, before any waiter publishes
-    /// a bound or marks the records late; one still ahead writes them.
+    /// Picrit round 2, D, round 3, 4 and round 4, 3: the writer decides
+    /// the skip itself, from the bound it is built with before it starts.
+    /// A cutoff already expired, or a daemon force already raised, then
+    /// begins no record, before any waiter publishes a bound or marks the
+    /// records late; a cutoff still ahead writes them.
     #[tokio::test]
     async fn the_writer_skips_records_past_the_cutoff() {
         let (_stop_tx, stop) = watch::channel(None);
         let (_close_tx, close) = watch::channel(None);
+        let (force_tx, force) = watch::channel(None);
         let records = || vec![("pi-profile.json", b"{}".to_vec())];
 
         // The turn's cutoff (from + the allowance) has passed.
@@ -1115,7 +1125,7 @@ mod tests {
         write_records(
             dir.path(),
             records(),
-            &records_cut(expired, (&stop, &close)),
+            &records_cut(expired, (&stop, &close), &force),
         );
         assert!(!dir.path().join("pi-profile.json").exists());
         let note = std::fs::read_to_string(dir.path().join(RECORDS_SKIPPED)).unwrap();
@@ -1123,8 +1133,24 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let now = Deadline::at(tokio::time::Instant::now());
-        write_records(dir.path(), records(), &records_cut(now, (&stop, &close)));
+        write_records(
+            dir.path(),
+            records(),
+            &records_cut(now, (&stop, &close), &force),
+        );
         assert!(dir.path().join("pi-profile.json").exists());
         assert!(!dir.path().join(RECORDS_SKIPPED).exists());
+
+        // The force is already raised: the cutoff starts passed.
+        force_tx.send_replace(Some(tokio::time::Instant::now()));
+        let dir = tempfile::tempdir().unwrap();
+        write_records(
+            dir.path(),
+            records(),
+            &records_cut(now, (&stop, &close), &force),
+        );
+        assert!(!dir.path().join("pi-profile.json").exists());
+        let note = std::fs::read_to_string(dir.path().join(RECORDS_SKIPPED)).unwrap();
+        assert!(note.contains("pi-profile.json"), "{note}");
     }
 }
