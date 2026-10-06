@@ -782,6 +782,20 @@ serialize a session's launches (Core runs one turn of a session at a time),
 so no launch of the session starts between the check and the launch it
 guards.
 
+**Server pre-launch absence check** (the OpenCode one-live-server fence,
+`vendors/opencode.md` §3.2). Host's `server_predecessors_resolved(cohort,
+own, deadline)`, passed through unchanged by Wire and Route, runs one
+`reprobe_held` pass over held `Server`-owned groups, then one Store read,
+on the `anchors_unproven` index, of `Server` anchors with `absence_time IS
+NULL` that are in `cohort` (the startup anchor cohort: committed before
+this daemon started) or are `own` (the route's previous server
+generation's anchor, if any); `Ok(true)` only when none remains. It reads
+existing columns only (`owner_server IS NOT NULL` and the cohort's rowid
+bound), so it cannot tell harnesses apart: an earlier run's unproven Codex
+server anchor counts too. Its errors and deadline are the session check's
+(decision C-3). The route runs one server generation at a time, so no
+launch of the route starts between the check and the launch it guards.
+
 A lost final anchor reply initially means uncertain outcome. A later fresh
 `ESRCH` can settle **cleanup** to quiescent, including after autonomous EOF
 self-KILL, but cannot establish protocol acknowledgement, forced-vs-natural
@@ -866,7 +880,10 @@ log-query method, except two narrow link operations:
 a server-owned anchor and a `running` turn, and `server_links(turns)`, a
 bounded read of at most 256 links. Its one session-scoped anchor read,
 `session_anchors_unproven(session)`, answers whether any `Turn` anchor of
-the session lacks an absence proof (§5.2 pre-launch check). Host/ProcessControl
+the session lacks an absence proof (§5.2 pre-launch check); its one
+server-scoped read, `server_anchors_unproven(cohort, own)`, answers the
+same for `Server` anchors of the startup cohort or the named anchor (§5.2
+server pre-launch check). Host/ProcessControl
 hold only that restricted journal.
 Core's StoreClient has no evidence-root or journal accessor. Inspect production
 call sites: only Store owns `Store::open`, Wire calls `into_wire_parts` and
@@ -1346,7 +1363,7 @@ payload limits count encoded bytes plus separately bounded decoded structure.
 | Resource | Default hard bound | Full/expired behavior |
 |---|---:|---|
 | Harness processes | `daemon.json` `harness_processes.limit` running harness processes VIA started, daemon-wide, each with its anchor: default 8, any value from 1 to 2^32 − 1. A per-turn process (CLI route, Pi RPC) holds a slot for its turn; a shared server (Codex app-server, OpenCode serve) holds one for its whole life, however many sessions it serves. A slot is reserved only for a new process (C2 §3, AD16) | Queue eligible work; do not create a child until a slot is reserved |
-| OpenCode owned servers | One per launch key, at most one per namespace (anchor-fenced); each holds one harness-process slot; one SSE stream and 8 request connections (2 decline, 2 stop, 4 general) | Same as Codex servers; an unknown request effect drains and retires the server (`vendors/opencode.md` §8) |
+| OpenCode owned servers | At most one live for all of VIA: one namespace in the first release (anchor-fenced, §5.2 server pre-launch check); each holds one harness-process slot; one SSE stream and 8 request connections (2 decline, 2 stop, 4 general) | Same as Codex servers; an unknown request effect drains and retires the server (`vendors/opencode.md` §8) |
 | OpenCode SSE and retained state | 1 MiB event; staging 1,024/4 MiB per server; lanes 16/1 MiB per session; per server 1,024 session states, 4,096 tombstoned turns, 4,096 child sessions, 64 pending interactive requests, 64 unanswered requests; 45 s silence | Event, staging or count overflow: server generation `overflow`; full lane: driver overflow as Codex; silence: transport loss |
 | `vendor_args` (C1 §4) | 64 arguments, 16 KiB in total (UTF-8), no NUL | `invalid_params` naming `vendor_args` before any receipt; a launch past Host's 64 KiB request is refused by its route (C2 §6.3) |
 | Queued turns | 8/session, 128 daemon-wide | `queue_full` / `admission_refused` before commit |
@@ -1474,9 +1491,10 @@ qualified.
 The S1 fake RSS result alone does not qualify this shared-server extension.
 For the OpenCode extension, Adapter owns the launch key and recipe; Routes
 owns the shared registry, per-session lanes, the server-scoped session state
-and drain; Wire owns HTTP/SSE framing; Host owns the process, its anchor with
-the namespace `owner_server` label, retirement and death evidence. The
-memory measurement includes N sessions on one server with concurrent turns.
+and drain; Wire owns HTTP/SSE framing; Host owns the process, its anchor
+(a `Server` owner with a minted `ServerId`, as Codex's; no OpenCode-specific
+label), the server pre-launch check (§5.2), retirement and death evidence.
+The memory measurement includes N sessions on one server with concurrent turns.
 Core's durable-state and Store ownership do not change, and Adapter
 receives no Store access.
 
