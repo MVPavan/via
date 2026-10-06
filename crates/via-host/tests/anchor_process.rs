@@ -99,6 +99,10 @@ impl Fixture {
             },
             stderr_path: self.root.join(format!("stderr-{}.log", next_stderr())),
             capacity: None,
+            die_with_anchor: false,
+            exclusive_lock: None,
+            version_probe: None,
+            stderr: via_host::StderrCapture::Log,
         }
     }
 }

@@ -2,8 +2,9 @@
 //! folder; it never interprets protocol messages or manages processes.
 
 pub use via_host::{
-    CapacityToken, CleanupEvidence, CloseMode, CloseRequest, EnvAllowList, ExitReport, HostError,
-    LaunchCause, PrivateProcessSpec, ProcessOwner, TurnNumber,
+    CapacityToken, CleanupEvidence, CloseMode, CloseRequest, EnvAllowList, ExitReport,
+    FenceRefusal, HostError, LaunchCause, PrivateProcessSpec, ProbeFailure, ProcessOwner,
+    StderrCapture, TurnNumber, VersionProbe,
 };
 pub use via_store::{
     AnchorCohort, CommitOutcome, Deadline, RuntimeResources, ServerId, SessionId, StoreFailureKind,
@@ -222,4 +223,10 @@ pub use via_store::json_limits;
 /// Internal hidden-anchor entrypoint, forwarded without a public process-control handle.
 pub fn run_anchor_from_args(args: &[std::ffi::OsString]) -> i32 {
     via_host::run_anchor_from_args(args)
+}
+
+/// Internal exec entry (runtime §5 "Die with the anchor"), forwarded
+/// through this architecture layer like the anchor's.
+pub fn run_exec_from_args(args: &[std::ffi::OsString]) -> i32 {
+    via_host::run_exec_from_args(args)
 }

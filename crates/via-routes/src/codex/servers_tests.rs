@@ -25,6 +25,10 @@ fn spec() -> PrivateProcessSpec {
         },
         stderr_path: std::path::PathBuf::new(),
         capacity: None,
+        die_with_anchor: false,
+        exclusive_lock: None,
+        version_probe: None,
+        stderr: via_wire::StderrCapture::Log,
     }
 }
 

@@ -13,6 +13,7 @@ use tokio::{
 };
 
 use crate::{
+    fence::{self, LaunchLock},
     linux,
     protocol::{self, Bootstrap, Reply, Request, VendorConfig, WireIdentity},
     stderr_log::{self, StderrCap, StderrLog},
@@ -103,7 +104,7 @@ async fn serve(
         1024,
     )
     .await?;
-    let mut configured: Option<VendorConfig> = None;
+    let mut configured: Option<Launch> = None;
     loop {
         let request = tokio::select! {
             result = protocol::read_message::<Request>(&mut stream, protocol::REQUEST_MAX) => result?,
@@ -112,20 +113,21 @@ async fn serve(
         };
         match request {
             Some(Request::Configure { vendor }) if configured.is_none() => {
-                if !vendor.program().is_absolute() || !vendor.cwd().is_absolute() {
-                    return Err(io::Error::other("vendor paths must be absolute"));
-                }
-                configured = Some(vendor);
+                let Some(launch) = accept_configuration(&mut stream, vendor).await? else {
+                    // Refused and replied: the anchor exits, nothing launched.
+                    return Ok(());
+                };
+                configured = Some(launch);
                 protocol::write_message(&mut stream, &Reply::Configured, 1024).await?;
             }
             Some(Request::Arm { generation })
                 if generation == bootstrap.generation && configured.is_some() =>
             {
-                let Some(vendor) = configured.take() else {
+                let Some(launch) = configured.take() else {
                     return Err(io::Error::other("missing vendor configuration"));
                 };
                 arm_received_seam().await;
-                return armed(listener, stream, bootstrap, vendor, terminate).await;
+                return armed(listener, stream, bootstrap, launch, terminate).await;
             }
             Some(Request::Challenge { nonce, proof })
                 if nonce.len() <= 64
@@ -148,6 +150,7 @@ async fn serve(
                         pid: None,
                         exit_code: None,
                         exit_signal: None,
+                        stderr_bytes: None,
                     },
                     1024,
                 )
@@ -166,11 +169,12 @@ async fn armed(
     listener: &UnixListener,
     mut stream: UnixStream,
     bootstrap: &Bootstrap,
-    vendor: VendorConfig,
+    launch: Launch,
     terminate: &mut tokio::signal::unix::Signal,
 ) -> io::Result<()> {
+    // `launch` holds the lock to the end of this function, the anchor's.
     let (mut child, vendor_pid, stderr) =
-        spawn_vendor(&mut stream, vendor, bootstrap.stderr_cap, terminate).await?;
+        spawn_vendor(&mut stream, &launch, bootstrap.stderr_cap, terminate).await?;
     // Any other return finishes the log too; the group KILL below ends
     // this process, so it finishes the log first.
     let _flush = FinishOnDrop(&stderr);
@@ -208,7 +212,7 @@ async fn armed(
                     Ok(Some(Request::Status { generation })) if verified_connection && generation == bootstrap.generation => {
                         let (exit_code, exit_signal) = exit.map_or((None, None), |report: crate::ExitReport| (report.code, report.signal));
                         match controller.as_mut() {
-                            Some(active) => protocol::write_message(active, &Reply::Status { pid: Some(vendor_pid), exit_code, exit_signal }, 1024).await.is_err(),
+                            Some(active) => protocol::write_message(active, &Reply::Status { pid: Some(vendor_pid), exit_code, exit_signal, stderr_bytes: launch.vendor.stderr_count_only.then(|| stderr.received()) }, 1024).await.is_err(),
                             None => true,
                         }
                     }
@@ -286,6 +290,42 @@ async fn armed(
     }
 }
 
+/// An accepted configuration: the vendor launch and, under the exclusive
+/// launch lock, the lock, held from `Configure` for the anchor's whole
+/// life (never unlocked or closed; the kernel releases it at exit).
+struct Launch {
+    vendor: VendorConfig,
+    lock: Option<LaunchLock>,
+}
+
+/// Validates `vendor` and, when it dies with the anchor, runs the fence's
+/// `Configure` steps (runtime §5). `None`: refused, the refusal replied;
+/// the anchor then exits with nothing launched (a version check has
+/// already exited).
+async fn accept_configuration(
+    stream: &mut UnixStream,
+    vendor: VendorConfig,
+) -> io::Result<Option<Launch>> {
+    if !vendor.program().is_absolute() || !vendor.cwd().is_absolute() {
+        return Err(io::Error::other("vendor paths must be absolute"));
+    }
+    if !vendor.die_with_anchor
+        && (vendor.exclusive_lock.is_some() || vendor.version_probe.is_some())
+    {
+        return Err(io::Error::other("fence options need die_with_anchor"));
+    }
+    if !vendor.die_with_anchor {
+        return Ok(Some(Launch { vendor, lock: None }));
+    }
+    match fence::configure(&vendor).await {
+        Ok(lock) => Ok(Some(Launch { vendor, lock })),
+        Err(refusal) => {
+            protocol::write_message(stream, &Reply::Fence { refusal }, 1024).await?;
+            Ok(None)
+        }
+    }
+}
+
 /// Finishes the vendor's stderr log when the armed anchor returns, waiting
 /// at most [`TAIL_FLUSH`] for its writes.
 struct FinishOnDrop<'a>(&'a StderrLog);
@@ -336,10 +376,21 @@ async fn kill_own_group(kill_at: Instant, stderr: Option<&StderrLog>) {
 /// blocks on stderr; its buffers stay within twice the cap's head plus its
 /// tail.
 /// The threads end with the anchor's process.
-fn stderr_drain(cap: StderrCap) -> io::Result<(io::PipeWriter, std::sync::Arc<StderrLog>)> {
+/// With `count_only` (runtime §4 `StderrCapture::CountOnly`) there is no
+/// file: the drain keeps nothing and only counts.
+fn stderr_drain(
+    cap: StderrCap,
+    count_only: bool,
+) -> io::Result<(io::PipeWriter, std::sync::Arc<StderrLog>)> {
     use std::os::fd::AsFd;
-    let file = fs::File::from(io::stderr().as_fd().try_clone_to_owned()?);
     let (reader, writer) = io::pipe()?;
+    if count_only {
+        return Ok((
+            writer,
+            stderr_log::start(reader, io::sink(), StderrCap::COUNT_ONLY)?,
+        ));
+    }
+    let file = fs::File::from(io::stderr().as_fd().try_clone_to_owned()?);
     Ok((writer, stderr_log::start(reader, file, cap)?))
 }
 
@@ -353,7 +404,7 @@ const VENDOR_UMASK: u32 = 0o022;
 /// is process-wide, but no anchor thread creates a file meanwhile: the
 /// control socket was bound and set to 0600 before, and the stderr drain's
 /// threads only write the turn's file the daemon already opened.
-fn spawn_with_vendor_umask(command: &mut tokio::process::Command) -> io::Result<Child> {
+pub(crate) fn spawn_with_vendor_umask(command: &mut tokio::process::Command) -> io::Result<Child> {
     let _lowered = Umask::set(VENDOR_UMASK);
     command.spawn()
 }
@@ -378,16 +429,22 @@ impl Drop for Umask {
 
 async fn spawn_vendor(
     stream: &mut UnixStream,
-    vendor: VendorConfig,
+    Launch { vendor, lock }: &Launch,
     cap: StderrCap,
     terminate: &mut tokio::signal::unix::Signal,
 ) -> io::Result<(Child, u32, std::sync::Arc<StderrLog>)> {
-    let drain = stderr_drain(cap);
-    let mut command = tokio::process::Command::new(vendor.program());
-    command
-        .args(vendor.args())
-        .current_dir(vendor.cwd())
-        .env_clear();
+    let lock = lock.as_ref();
+    let drain = stderr_drain(cap, vendor.stderr_count_only);
+    // Die with the anchor (runtime §5): the vendor starts through the exec
+    // entry, spawned here on the anchor's main thread, never another.
+    let mut command = if vendor.die_with_anchor {
+        fence::exec_command(lock.map(LaunchLock::path), &vendor.program(), vendor.args())
+    } else {
+        let mut command = tokio::process::Command::new(vendor.program());
+        command.args(vendor.args());
+        command
+    };
+    command.current_dir(vendor.cwd()).env_clear();
     for (key, value) in vendor.env() {
         command.env(key, value);
     }
@@ -417,7 +474,7 @@ async fn spawn_vendor(
         stop_own_group(terminate, Duration::from_millis(200), log).await;
         return Err(io::Error::other("PipeDetachFailed"));
     }
-    let (child, log) = match spawn {
+    let (mut child, log) = match spawn {
         Ok(spawned) => spawned,
         Err(error) => {
             let _ = protocol::write_message(
@@ -435,6 +492,20 @@ async fn spawn_vendor(
     let vendor_pid = child
         .id()
         .ok_or_else(|| io::Error::other("missing vendor pid"))?;
+    if let Some(lock) = lock
+        && let Err(error) = record_server(lock, vendor_pid).await
+    {
+        // Runtime §5: the child has not executed the vendor (no record names
+        // it); it is killed and reaped, and the launch fails.
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        let refusal = crate::FenceRefusal::FenceRecordFailed;
+        let _ = protocol::write_message(stream, &Reply::Fence { refusal }, 1024).await;
+        return Err(error);
+    }
+    if lock.is_some() {
+        record_written_seam().await;
+    }
     if protocol::write_message(stream, &Reply::Spawned { pid: vendor_pid }, 1024)
         .await
         .is_err()
@@ -447,6 +518,41 @@ async fn spawn_vendor(
     }
     Ok((child, vendor_pid, log))
 }
+
+/// Writes the server record naming the unreaped child `pid` through the
+/// lock's descriptor (runtime §5 ARM), its start ticks read while the
+/// child cannot be reaped.
+async fn record_server(lock: &LaunchLock, pid: u32) -> io::Result<()> {
+    record_write_seam().await?;
+    let (_, start_ticks) = linux::process_stat(pid)?;
+    lock.write_record(pid, start_ticks)
+}
+
+/// Test-only `host.anchor.before_record_write`: a pause holds the anchor
+/// before its record write, a `fail_io` fails the write (`OC02b`).
+#[cfg(feature = "test-failpoints")]
+async fn record_write_seam() -> io::Result<()> {
+    via_store::failpoint::hit_async("host.anchor.before_record_write").await
+}
+
+/// Release builds always write the record.
+#[cfg(not(feature = "test-failpoints"))]
+#[expect(clippy::unused_async, reason = "test builds pause here")]
+async fn record_write_seam() -> io::Result<()> {
+    Ok(())
+}
+
+/// Test-only `host.anchor.after_record_write`: a pause holds the anchor
+/// after its record write, before `Spawned` (`OC02b`).
+#[cfg(feature = "test-failpoints")]
+async fn record_written_seam() {
+    let _ = via_store::failpoint::hit_async("host.anchor.after_record_write").await;
+}
+
+/// Release builds never hold here.
+#[cfg(not(feature = "test-failpoints"))]
+#[expect(clippy::unused_async, reason = "test builds pause here")]
+async fn record_written_seam() {}
 
 /// Starts own-group cleanup once; a later call only shortens its grace.
 /// `stopped_live` records whether the vendor was still live when the anchor

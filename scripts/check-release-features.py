@@ -178,6 +178,12 @@ POINTS = [
     "routes.late.entered",
     # x.3.2 C3 (C2 §5): the Claude adapter's refusal-cache clock.
     "adapter.claude.plan_clock_ms",
+    # via-4sw.3.1 (runtime §5, OpenCode OC02b): the exec entry's seams and
+    # the anchor's server-record write.
+    "host.exec.before_death_signal",
+    "host.exec.after_parent_check",
+    "host.anchor.before_record_write",
+    "host.anchor.after_record_write",
 ]
 ACTIVATION = ["VIA_FAILPOINT_DIR", "VIA_FAILPOINT_TOKEN"]
 # Test-build overrides (design §6.2, §6.4) that release must neither parse nor forward.

@@ -420,6 +420,10 @@ fn main() -> ExitCode {
         let args: Vec<_> = std::env::args_os().skip(2).collect();
         return ExitCode::from(u8::try_from(via_core::run_anchor_from_args(&args)).unwrap_or(1));
     }
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__via_host_exec")) {
+        let args: Vec<_> = std::env::args_os().skip(2).collect();
+        return ExitCode::from(u8::try_from(via_core::run_exec_from_args(&args)).unwrap_or(125));
+    }
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => {

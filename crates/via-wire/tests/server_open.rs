@@ -102,6 +102,10 @@ async fn wire_server_open_has_no_turn_folder() {
         },
         stderr_path: PathBuf::new(),
         capacity: None,
+        die_with_anchor: false,
+        exclusive_lock: None,
+        version_probe: None,
+        stderr: via_wire::StderrCapture::Log,
     };
     let signals = WireSignals {
         force: watch::channel(None).1,
