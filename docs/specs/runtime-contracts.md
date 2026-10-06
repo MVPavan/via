@@ -524,11 +524,17 @@ close-on-exec, a regular file of the daemon's uid) and takes
 the acquisition fails with the no-launch evidence and a `launch_failed`
 cause naming the lock step (C2 §2). On ARM the anchor clears close-on-exec
 on that one descriptor just before spawning, so the vendor inherits it;
-the anchor keeps its copy. The kernel releases the lock when the last
-holder exits, so it outlives the vendor process on every path (daemon
-crash, anchor killed from outside, failed acquisition) and no reboot
-leaves it behind. Nothing about the lock enters the Store, and Host never
-unlinks the file. It gates only the launch; cleanup evidence is unchanged.
+the anchor keeps its copy and never unlocks or closes it until it exits.
+The kernel releases the lock when every descriptor of it is closed, or
+when any holder calls `LOCK_UN`. So **while the vendor keeps its inherited
+descriptor and never unlocks it**, the lock outlives the vendor process on
+every path (daemon crash, anchor killed from outside, failed acquisition),
+and no reboot leaves it behind. A vendor that drops the descriptor while
+its anchor is also gone leaves the lock free while it still runs: that
+retention is the route's qualification gate (`vendors/opencode.md` L13),
+not something Host can enforce. Nothing about the lock enters the Store,
+and Host never unlinks the file. It gates only the launch; cleanup
+evidence and harness-process capacity are unchanged.
 
 **Stop reply.** Host's `CloseReport` gains `stopped_live: Option<bool>`:
 the verified anchor's `Stopping { stopped_live }` reply to this close's
