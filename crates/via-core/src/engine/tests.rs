@@ -3538,6 +3538,7 @@ fn a_late_usage_aggregate_supersedes_the_interval_warning() {
             output: Some(4),
             reasoning_output: None,
             total: Some(7),
+            interval_unverified: false,
         });
         engine.revise(&session, turn(1), &late).await;
         let envelope = stored_envelope(&engine, &session, 1).await;
@@ -3551,6 +3552,71 @@ fn a_late_usage_aggregate_supersedes_the_interval_warning() {
             "{envelope}"
         );
         assert_eq!(envelope["warnings"], json!([]), "{envelope}");
+    });
+}
+
+/// C2 gap A8 (C2 §5 usage): a late usage aggregate whose interval the
+/// vendor did not verify revises the stored usage as `vendor_interval`
+/// and keeps `usage_interval_unverified`.
+#[test]
+fn a_late_unverified_aggregate_keeps_the_interval_warning() {
+    let Some(root) = child("a_late_unverified_aggregate_keeps_the_interval_warning") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = unknown_session(&engine, (Value::Null, None), json!({})).await;
+        let mut late = late_terminal(via_adapters::VendorTerminalStatus::Completed, "late");
+        late.usage = Some(via_adapters::UsageSample {
+            total: Some(7),
+            interval_unverified: true,
+            ..via_adapters::UsageSample::default()
+        });
+        engine.revise(&session, turn(1), &late).await;
+        let envelope = stored_envelope(&engine, &session, 1).await;
+        assert_eq!(envelope["revision"], 1, "{envelope}");
+        assert_eq!(
+            (
+                &envelope["usage"]["total_tokens"],
+                &envelope["usage"]["scope"]
+            ),
+            (&json!(7), &json!("vendor_interval")),
+            "{envelope}"
+        );
+        let codes: Vec<&Value> = envelope["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|warning| &warning["code"])
+            .collect();
+        assert_eq!(codes, [&json!("usage_interval_unverified")], "{envelope}");
+    });
+}
+
+/// C2 gap A6 (C1 §5 `cost.provenance`): a late terminal's estimated cost
+/// revises the stored envelope's cost as `estimated`.
+#[test]
+fn a_late_estimated_cost_revises_as_estimated() {
+    let Some(root) = child("a_late_estimated_cost_revises_as_estimated") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = unknown_session(&engine, (Value::Null, None), json!({})).await;
+        let mut late = late_terminal(via_adapters::VendorTerminalStatus::Completed, "late");
+        late.cost = Some(via_adapters::CostReport {
+            usd: 0.25,
+            scope: "turn".to_owned(),
+            provenance: via_adapters::CostProvenance::Estimated,
+        });
+        engine.revise(&session, turn(1), &late).await;
+        let envelope = stored_envelope(&engine, &session, 1).await;
+        assert_eq!(envelope["revision"], 1, "{envelope}");
+        assert_eq!(
+            envelope["cost"],
+            json!({"usd":0.25,"scope":"turn","provenance":"estimated"}),
+            "{envelope}"
+        );
     });
 }
 
@@ -5540,6 +5606,9 @@ fn closed_list_adapter_warnings_reach_the_envelope_once_per_code() {
                 "deprecated",
                 Some(json!({"big":"d".repeat(5000)})),
             ),
+            // C2 gap A5: a route raises `credential_state_unchecked` the
+            // same way (OpenCode §4.3, every turn of the server generation).
+            warning("fake-turn-2", "credential_state_unchecked", None),
         ];
         engine
             .drain_queued(
@@ -5569,7 +5638,7 @@ fn closed_list_adapter_warnings_reach_the_envelope_once_per_code() {
             .filter(|event| event["type"] == "warning" && event["code"] != "launch_failed")
             .map(|event| &event["code"])
             .collect();
-        assert_eq!(codes.len(), 5, "every one is an event: {page}");
+        assert_eq!(codes.len(), 6, "every one is an event: {page}");
         assert!(codes.contains(&&json!("vendor_specific")), "{page}");
         let at = "2026-01-01T00:00:00.000Z".to_owned();
         let envelope = super::terminal::turn_envelope(
@@ -5599,7 +5668,11 @@ fn closed_list_adapter_warnings_reach_the_envelope_once_per_code() {
         let listed: Vec<&Value> = adapter.iter().map(|warning| &warning["code"]).collect();
         assert_eq!(
             listed,
-            [&json!("config_switch_unverified"), &json!("deprecated")],
+            [
+                &json!("config_switch_unverified"),
+                &json!("deprecated"),
+                &json!("credential_state_unchecked"),
+            ],
             "{envelope}"
         );
         assert_eq!(adapter[0]["data"], categories, "the first one's data");
@@ -6865,6 +6938,115 @@ fn a_recovered_envelope_keeps_the_turns_instance() {
                 .any(|warning| warning["code"] == "vendor_version_untested"),
             "{envelope}"
         );
+    });
+}
+
+/// Slice A critical review #1 (C2 §4, C1 §5): a turn whose own adapter
+/// warning of C1's closed list committed before the daemon crashed, ahead
+/// of its `turn.ended`, keeps that code on its recovered envelope, once,
+/// with VIA's message and the event's data. A code outside the list, a
+/// Core-owned code, a late warning and another turn's warning stay events
+/// only (slice A critical r2, minor).
+#[test]
+fn a_recovered_envelope_keeps_the_turns_closed_list_warnings() {
+    let Some(root) = child("a_recovered_envelope_keeps_the_turns_closed_list_warnings") else {
+        return;
+    };
+    run(async {
+        let session = {
+            let earlier = open(&root);
+            let session = new_session(&earlier).await;
+            // Turn 2, queued behind turn 1: the other turn of a warning.
+            resume(&earlier, &session, None).await;
+            let at = rfc3339(std::time::SystemTime::now());
+            let submitted = Event {
+                seq: 3,
+                session_id: &session,
+                turn: Some(1),
+                late: false,
+                at: &at,
+                body: EventBody::TurnSubmitted { attempt: 1 },
+            }
+            .to_value()
+            .unwrap();
+            earlier
+                .store
+                .commit_submission(SubmissionRecord {
+                    session_id: session.clone(),
+                    turn: turn(1),
+                    event: submitted,
+                })
+                .await
+                .unwrap();
+            // (code, data, the event's turn, late)
+            let warnings = [
+                ("credential_state_unchecked", None, 1, false),
+                (
+                    "credential_state_unchecked",
+                    Some(json!({"second": true})),
+                    1,
+                    false,
+                ),
+                ("vendor_specific", None, 1, false),
+                ("deprecated", Some(json!({"k": "v"})), 1, false),
+                // Core raises this one itself, never from an adapter.
+                ("observations_lost", None, 1, false),
+                // Closed-list codes, but late or another turn's.
+                ("structured_output_missing", None, 1, true),
+                ("instructions_partial", None, 2, false),
+            ];
+            for (seq, (code, data, owner, late)) in (4..).zip(warnings) {
+                let event = Event {
+                    seq,
+                    session_id: &session,
+                    turn: Some(owner),
+                    late,
+                    at: &at,
+                    body: EventBody::warning(code, "the vendor's own words", data),
+                }
+                .to_value()
+                .unwrap();
+                earlier
+                    .store
+                    .commit_event(via_store::EventRecord {
+                        session_id: session.clone(),
+                        turn: turn(1),
+                        event,
+                        steer: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+            session
+        };
+        let engine = open(&root);
+        assert_eq!(engine.recover().await.unwrap(), 1);
+        let envelope = engine.result(&format!("{session}/1")).await.unwrap();
+        let envelope: Value = serde_json::from_str(envelope.get()).unwrap();
+        assert_eq!(envelope["state"], "unknown", "{envelope}");
+        let adapter: Vec<&Value> = envelope["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|warning| {
+                warning["code"] != "vendor_version_untested"
+                    && warning["code"] != "cancel_cleanup_uncertain"
+            })
+            .collect();
+        let codes: Vec<&Value> = adapter.iter().map(|warning| &warning["code"]).collect();
+        assert_eq!(
+            codes,
+            [&json!("credential_state_unchecked"), &json!("deprecated")],
+            "{envelope}"
+        );
+        assert!(
+            adapter[0].get("data").is_none(),
+            "the first one's: {envelope}"
+        );
+        assert_eq!(adapter[1]["data"], json!({"k": "v"}), "{envelope}");
+        for warning in &adapter {
+            assert_ne!(warning["message"], "the vendor's own words", "{envelope}");
+        }
     });
 }
 
@@ -8173,7 +8355,8 @@ fn plain_effective() -> crate::intake::Effective {
 /// replaces it, and a null one clears it. x.3.2 X5 (via-5lr.6):
 /// `check_turn` also carries the JSON string encodings' lengths of the
 /// cwd and of the turn's prompt, inline or read back from a prompt
-/// file's copy, escapes included.
+/// file's copy, escapes included. C2 gap A1: both also carry the
+/// instructions' JSON string encoding's length, quotes included.
 #[cfg(feature = "test-failpoints")]
 #[test]
 #[expect(
@@ -8202,8 +8385,10 @@ fn core_fills_param_sizes_on_spawn_and_resume() {
     .unwrap();
     run(async {
         let engine = open(&root);
+        // "be brief é" is 11 UTF-8 bytes, and 13 as a JSON string (A1).
         let planned = |instructions, output_schema| via_adapters::ParamSizes {
             instructions,
+            instructions_json: 13,
             output_schema,
             ..via_adapters::ParamSizes::default()
         };

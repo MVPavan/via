@@ -457,8 +457,10 @@ fn s_launch_binary_resolution() {
 /// nor to the same recipe at another path.
 #[test]
 fn s_launch_refusal_cache_keys_on_path_and_recipe() {
-    let program = Path::new("/opt/vendor/bin/vendor");
-    let other = Path::new("/usr/local/bin/vendor");
+    let dir = tempfile::tempdir().unwrap();
+    let (program, other) = (&dir.path().join("vendor"), &dir.path().join("other"));
+    executable(program);
+    executable(other);
     let cache = InstanceCache::default();
     let now = Instant::now();
     assert_eq!(cache.refusal(program, "recipe-a", now), None);
@@ -469,32 +471,87 @@ fn s_launch_refusal_cache_keys_on_path_and_recipe() {
     assert_eq!(cache.refusal(other, "recipe-a", now), None);
 }
 
-/// Invariant 13: the keys are paths, not file contents. Replacing the file
-/// at the path (a vendor upgrade) keeps both entries; the handshake on the
-/// next launch is what checks the new binary.
+/// C2 §5 refusal cache (C2 gap A7): a refusal is keyed by the program's
+/// file identity (device, inode, size, mtime, ctime) as well as its path,
+/// so a binary replaced at the same path does not inherit it: rewritten in
+/// place to another size, replaced by a rename with the same size, or
+/// only its times changed. The last version stays keyed by path; the next
+/// launch's handshake reports the new one. A program that cannot be read
+/// matches no refusal and records none.
 #[test]
-fn s_launch_instance_cache_ignores_the_file_behind_the_path() {
+fn s_launch_a_replaced_binary_does_not_inherit_a_refusal() {
     let dir = tempfile::tempdir().unwrap();
     let binary = dir.path().join("vendor");
+    let cause = Incompatibility::ReadbackDiffers("permission_mode");
+    let now = Instant::now();
+    let refused = |cache: &InstanceCache| cache.refusal(&binary, "recipe", now);
+
+    // Rewritten in place, another size.
     executable(&binary);
     let cache = InstanceCache::default();
-    let now = Instant::now();
-    let cause = Incompatibility::ReadbackDiffers("permission_mode");
     cache.record_refusal(&binary, "recipe".to_owned(), cause, now);
     cache.record_version("vendor", &binary, "1.0.0".to_owned());
-
+    assert_eq!(refused(&cache), Some(cause));
     fs::write(&binary, "#!/bin/sh\nexit 0\n# upgraded\n").unwrap();
-    assert_eq!(cache.refusal(&binary, "recipe", now), Some(cause));
+    assert_eq!(refused(&cache), None, "rewritten in place");
     assert_eq!(
         cache.last_version("vendor", &binary).as_deref(),
         Some("1.0.0")
     );
+
+    // Replaced by a rename: same size, another inode.
+    cache.record_refusal(&binary, "recipe".to_owned(), cause, now);
+    assert_eq!(refused(&cache), Some(cause));
+    let staged = dir.path().join("vendor.new");
+    fs::copy(&binary, &staged).unwrap();
+    fs::rename(&staged, &binary).unwrap();
+    assert_eq!(refused(&cache), None, "replaced by a rename");
+
+    // Only the modification time changed (and with it the change time).
+    cache.record_refusal(&binary, "recipe".to_owned(), cause, now);
+    assert_eq!(refused(&cache), Some(cause));
+    let file = fs::File::options().write(true).open(&binary).unwrap();
+    file.set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_hours(24))
+        .unwrap();
+    drop(file);
+    assert_eq!(refused(&cache), None, "times changed");
+
+    // Gone: no match, and nothing recorded for it.
+    cache.record_refusal(&binary, "recipe".to_owned(), cause, now);
+    fs::remove_file(&binary).unwrap();
+    assert_eq!(refused(&cache), None, "gone");
+    cache.record_refusal(&binary, "recipe".to_owned(), cause, now);
+    executable(&binary);
+    assert_eq!(refused(&cache), None, "recorded while gone");
+
+    // Through a symlink (slice A critical, minor): the identity is the
+    // file the link names. The link itself unchanged, its target replaced
+    // by a rename, or the link retargeted, drops the refusal.
+    let link = dir.path().join("vendor-link");
+    let target = dir.path().join("vendor-v1");
+    executable(&target);
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let refused = |cache: &InstanceCache| cache.refusal(&link, "recipe", now);
+    cache.record_refusal(&link, "recipe".to_owned(), cause, now);
+    assert_eq!(refused(&cache), Some(cause));
+    let staged = dir.path().join("vendor-v1.new");
+    fs::copy(&target, &staged).unwrap();
+    fs::rename(&staged, &target).unwrap();
+    assert_eq!(refused(&cache), None, "the link's target replaced");
+    cache.record_refusal(&link, "recipe".to_owned(), cause, now);
+    let other = dir.path().join("vendor-v2");
+    fs::write(&other, "#!/bin/sh\nexit 0\n# v2\n").unwrap();
+    fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&other, &link).unwrap();
+    assert_eq!(refused(&cache), None, "the link retargeted");
 }
 
 /// An entry live at 9:59 after its write is gone at 10:00; time is passed in.
 #[test]
 fn s_launch_refusal_cache_expires_after_ten_minutes() {
-    let program = Path::new("/opt/vendor/bin/vendor");
+    let dir = tempfile::tempdir().unwrap();
+    let program = &dir.path().join("vendor");
+    executable(program);
     let cache = InstanceCache::default();
     let written = Instant::now();
     let cause = Incompatibility::FeatureAbsent("tool_list");

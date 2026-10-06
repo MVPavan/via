@@ -1550,7 +1550,7 @@ pub(super) struct Retained {
     pub(super) output_invalid: Option<&'static str>,
     pub(super) steps: Option<u64>,
     pub(super) usage: Option<UsageSample>,
-    pub(super) cost: Option<(f64, String)>,
+    pub(super) cost: Option<via_adapters::CostReport>,
     /// The members of the terminal's vendor data object.
     pub(super) vendor: Map<String, Value>,
 }
@@ -1574,10 +1574,7 @@ impl Retained {
                 .map(via_adapters::UnparsedOutput::reason),
             steps: terminal.steps,
             usage: terminal.usage.clone(),
-            cost: terminal
-                .cost
-                .as_ref()
-                .map(|cost| (cost.usd, cost.scope.clone())),
+            cost: terminal.cost.clone(),
             vendor,
         }
     }

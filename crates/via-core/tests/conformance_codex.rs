@@ -2238,6 +2238,23 @@ fn undecoded_under(root: &Path) -> Vec<String> {
     found
 }
 
+/// Slice A critical #4 (C2 `UsageSample`): the runner reports a progress
+/// sample in the checker's C2 names, its `key` and `interval_unverified`
+/// included, so an expectation can state them and hold.
+#[test]
+fn codex_progress_usage_states_its_c2_sample() {
+    let name = "codex_progress_usage_states_its_c2_sample";
+    let replay = replay_of("c1_commentary_usage").unwrap();
+    let mut expect = expect_of("c1_commentary_usage").unwrap();
+    turn_mut(&mut expect, 0)["expect"]["observations_include"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"kind": "progress",
+            "usage": {"key": null, "total": 20_522, "interval_unverified": false}}));
+    let knobs = conformance_run::Knobs::default();
+    checked_outcome(name, &replay, &expect, knobs, |_| Ok(())).unwrap();
+}
+
 /// X0 item 5 steps 5 and 6 (x.3.2 X3 fix r1, finding 10): a malformed
 /// message is evidence of the turn it names, else of the server, never of
 /// whichever turn runs. While turn 2 runs, a malformed `turn/completed`

@@ -497,7 +497,15 @@ connection retired.
 `progress` item per vendor message that carries a progress mark,
 `final_text` pieces, plus internal ones Core turns into commits. The vendor
 terminal is not an observation: it is retained in the turn's `TurnEnd`
-(§4.1).
+(§4.1). A running turn's own `warning` whose code is in C1 §5's closed list
+also puts that code, with VIA's own message, on the turn's envelope, once per
+code; any other code stays an event. Codes Core itself raises
+(`structured_output_invalid`, `observations_lost`, `vendor_passthrough`)
+are not taken from an adapter: such an observation stays an event. A route raises a per-instance fact this
+way on every turn it affects, as OpenCode's `credential_state_unchecked` on
+each turn of an unchecked server generation (OpenCode packet §4.3). Restart
+recovery rebuilds these codes from the turn's committed `warning` events, so
+a recovered envelope carries every one the turn's events hold.
 
 | Observation | Fields | Core commit |
 |---|---|---|
@@ -717,7 +725,11 @@ default.
   the value VIA sent. The key is the resolved program path and its file
   identity (device, inode, size, mtime, ctime) plus the route's recipe
   digest (launch arguments, category switches, bound and
-  policy inputs). While an entry is live, plans with the same key refuse
+  policy inputs), so a binary replaced at the path does not inherit the
+  refusal. The identity is read when the refusal is written, after the
+  handshake (a replacement between launch and that read is the accepted
+  race), and again at each lookup; a program that cannot be read then is
+  not cached and matches nothing. While an entry is live, plans with the same key refuse
   `harness_unavailable` (`data.reason:"handshake_refused"`). Spawn
   failures, timeouts, transport loss, auth, quota and rate-limit failures
   are never cached. An entry
@@ -785,9 +797,19 @@ which it uses:
 Core keeps a turn-wide usage ledger separate from step accounting. It holds
 up to 1,024 keys per turn; further new keys add as keyless. Once it
 overflows, the envelope reports scope `vendor_interval` with
-`usage_interval_unverified`. A component is `null` if any contributing
+`usage_interval_unverified`. A `UsageSample` also carries
+`interval_unverified: bool`, set by a route whose vendor counted that sample
+over an interval VIA has not verified (OpenCode's compaction calls,
+OpenCode packet §12). Among a turn's call samples, one such sample gives the
+same `vendor_interval` and warning, even when a later sample supersedes its
+key. A turn aggregate supersedes the call samples, their mark included (C1
+§5): the envelope, or a late terminal's revision, then has `vendor_interval`
+and the warning only when the aggregate itself is marked. A component is `null` if any contributing
 sample lacks it. Step rows keep their existing per-step rule for `status`.
-`VendorTerminal.cost` gives `{usd, scope}`; `VendorTerminal.vendor` is
+`VendorTerminal.cost` gives `{usd, scope, provenance}`, `provenance`
+`Reported` (the vendor's accounted amount) or `Estimated` (computed from
+price tables, as Pi's), which C1 §5 reports as `reported` or `estimated`;
+an unavailable cost is no `cost`. `VendorTerminal.vendor` is
 bounded vendor data for the envelope's `vendor` member.
 `usage.tokens` and `usage.cost` scopes are declared per field from verified
 accounting intervals; unverified intervals are `vendor_interval`.

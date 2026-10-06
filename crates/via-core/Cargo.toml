@@ -9,6 +9,8 @@ publish.workspace = true
 [features]
 # Test-only failpoint controller (runtime-contracts §11); default off.
 test-failpoints = ["via-adapters/test-failpoints", "via-store/test-failpoints"]
+# Test-only: Core's own usage fold for the conformance runner; default off.
+test-support = []
 
 [dependencies]
 via-adapters = { path = "../via-adapters" }
@@ -20,6 +22,8 @@ sha2 = { workspace = true }
 boon = { workspace = true }
 
 [dev-dependencies]
+# The conformance runner folds usage with Core's own ledger.
+via-core = { path = ".", features = ["test-support"] }
 # Tests drive Store's test seams.
 via-store = { path = "../via-store", features = ["test-failpoints"] }
 # Conformance cases corrupt a frozen row directly (Sol r1 #14).

@@ -37,9 +37,9 @@ use crate::instance::Incompatibility;
 use crate::observation::{Acceptance, Identity};
 use crate::plan::VersionStatus;
 use crate::{
-    AcceptanceToken, ClassHint, CostReport, Decline, Denial, DenialKind, InstanceReport,
-    MAX_OBSERVATION_BYTES, Observation, ProgressMarks, StartRejected, StopReason, UsageSample,
-    VendorTerminal, VendorTerminalStatus, final_text_pieces,
+    AcceptanceToken, ClassHint, CostProvenance, CostReport, Decline, Denial, DenialKind,
+    InstanceReport, MAX_OBSERVATION_BYTES, Observation, ProgressMarks, StartRejected, StopReason,
+    UsageSample, VendorCode, VendorTerminal, VendorTerminalStatus, final_text_pieces,
 };
 
 /// The most IDs each per-launch set admits: calls (open and completed
@@ -605,10 +605,12 @@ impl Normalizer {
             return StartRejected::SessionGone;
         }
         StartRejected::VendorError(
-            result
-                .terminal_reason
-                .clone()
-                .unwrap_or_else(|| result.subtype.clone()),
+            Some(VendorCode::from(
+                result
+                    .terminal_reason
+                    .clone()
+                    .unwrap_or_else(|| result.subtype.clone()),
+            )),
             detail(result),
         )
     }
@@ -697,6 +699,7 @@ impl Normalizer {
             cost: result.total_cost_usd.map(|usd| CostReport {
                 usd,
                 scope: "session_cumulative".to_owned(),
+                provenance: CostProvenance::Reported,
             }),
             vendor: vendor_data(result, self.refusal_category.as_deref()),
         };
@@ -964,6 +967,7 @@ fn usage(usage: &ResultUsage) -> Result<UsageSample, &'static str> {
             .as_ref()
             .and_then(|details| details.thinking_tokens),
         total,
+        interval_unverified: false,
     })
 }
 

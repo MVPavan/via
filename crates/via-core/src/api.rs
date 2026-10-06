@@ -1792,6 +1792,10 @@ impl Warning {
                 "deprecated",
                 "the vendor reported a deprecated feature or setting",
             ),
+            "credential_state_unchecked" => (
+                "credential_state_unchecked",
+                "the vendor server's credential state could not be checked on this version",
+            ),
             _ => return None,
         };
         Some(Self {
@@ -1964,11 +1968,12 @@ impl Cost {
         provenance: "unavailable",
     };
 
-    /// A vendor-reported cost (AD6) under one of C1 §5's scopes; a scope
-    /// C1 does not define, or an amount that is not a finite number, is
-    /// unavailable.
-    pub(crate) fn reported(usd: f64, scope: &str) -> Self {
-        let scope = match scope {
+    /// A vendor's cost (AD6) under one of C1 §5's scopes, with its
+    /// provenance, `reported` or `estimated`; a scope C1 does not define,
+    /// or an amount that is not a finite number, is unavailable.
+    pub(crate) fn reported(cost: &via_adapters::CostReport) -> Self {
+        let usd = cost.usd;
+        let scope = match cost.scope.as_str() {
             "turn" => "turn",
             "session_cumulative" => "session_cumulative",
             "vendor_interval" => "vendor_interval",
@@ -1980,7 +1985,10 @@ impl Cost {
         Self {
             usd: Some(usd),
             scope,
-            provenance: "reported",
+            provenance: match cost.provenance {
+                via_adapters::CostProvenance::Reported => "reported",
+                via_adapters::CostProvenance::Estimated => "estimated",
+            },
         }
     }
 }
@@ -2235,7 +2243,7 @@ pub(crate) mod maxima {
     }
 
     /// C1 §5's closed list of warning codes.
-    pub(crate) const WARNING_CODES: [&str; 9] = [
+    pub(crate) const WARNING_CODES: [&str; 10] = [
         "instructions_partial",
         "vendor_version_untested",
         "usage_interval_unverified",
@@ -2245,6 +2253,7 @@ pub(crate) mod maxima {
         "config_switch_unverified",
         "deprecated",
         "vendor_passthrough",
+        "credential_state_unchecked",
     ];
 
     /// A string whose encoding, quotes included, is `bytes` long, made of

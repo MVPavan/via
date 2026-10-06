@@ -87,6 +87,10 @@ mod schema;
 /// design §6.4, §13.2).
 #[cfg(feature = "test-failpoints")]
 pub use engine::envelope_at_maximum;
+/// Test builds only: a turn's envelope `usage` through Core's own ledger
+/// (C2 §5 AD6), for the conformance runner.
+#[cfg(feature = "test-support")]
+pub use engine::turn_usage;
 pub use engine::{
     DaemonCounts, Engine, EngineShutdown, FailureBatches, FinalEntry, Handoff, HarnessProcesses,
     Limits, Receipted, StopMode,

@@ -336,21 +336,30 @@ fn apply(
     }
     if let Some(aggregate) = &retained.usage {
         let figure = UsageLedger::default().figure(Some(aggregate));
+        let unverified = figure.as_ref().is_some_and(|(_, interval)| *interval);
         let usage = Usage::reported(
             figure.map(|(tokens, _)| tokens),
-            false,
+            unverified,
             plan.frozen.token_scope(),
         );
         if let Ok(usage) = serde_json::to_value(usage) {
             members.insert("usage".into(), usage);
             if let Some(Value::Array(warnings)) = members.get_mut("warnings") {
-                let interval = Warning::USAGE_INTERVAL_UNVERIFIED.code();
-                warnings.retain(|kept| kept.get("code").and_then(Value::as_str) != Some(interval));
+                // The aggregate's own interval decides the warning (C2 §5).
+                let code = Warning::USAGE_INTERVAL_UNVERIFIED.code();
+                let warned = |kept: &Value| kept.get("code").and_then(Value::as_str) == Some(code);
+                if !unverified {
+                    warnings.retain(|kept| !warned(kept));
+                } else if !warnings.iter().any(warned)
+                    && let Ok(warning) = serde_json::to_value(Warning::USAGE_INTERVAL_UNVERIFIED)
+                {
+                    warnings.push(warning);
+                }
             }
         }
     }
-    if let Some((usd, scope)) = &retained.cost
-        && let Ok(cost) = serde_json::to_value(Cost::reported(*usd, scope))
+    if let Some(cost) = &retained.cost
+        && let Ok(cost) = serde_json::to_value(Cost::reported(cost))
     {
         members.insert("cost".into(), cost);
     }

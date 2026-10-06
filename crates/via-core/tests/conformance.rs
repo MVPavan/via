@@ -688,6 +688,7 @@ fn conformance_progress_carries_usage_sample() {
         output: Some(3),
         reasoning_output: None,
         total: None,
+        interval_unverified: false,
     };
     let marks = ProgressMarks {
         model: true,

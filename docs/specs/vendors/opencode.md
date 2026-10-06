@@ -409,7 +409,7 @@ hazards. **VIA sends a session's next prompt only when:**
    and no execution of the session is running.
 
 If this does not hold within `min(remaining wall, 30 s)`, the turn is
-`Rejected { reason: VendorError(VendorCode("session_busy"), detail) }` →
+`Rejected { reason: VendorError(Some(VendorCode("session_busy")), detail) }` →
 `failed(submit_failed)`, nothing sent. The rule gates only a successor
 prompt. Interrupts, inbox cancels and declines count as requests of rule 1,
 so a stop still in flight blocks the successor even after the predecessor
@@ -522,7 +522,7 @@ completed had no effect; this is evidence only, not a mechanism.
 | permission reply | 204 / 404 | declined / request gone |
 | form `DELETE` | 204 / 404 / 409 | cancelled / gone / already settled |
 | create, model switch, entry `PUT` | 200 / 204 | settled; the readback decides (§5) |
-| non-prompt setup | other complete status | the turn `Rejected(VendorError(<error _tag or "http_<status>">, detail))`, its prompt never sent |
+| non-prompt setup | other complete status | the turn `Rejected(VendorError(Some(<error _tag or "http_<status>">), detail))`, its prompt never sent |
 
 **Everything else drains.** No complete response before the timeout, a
 socket failure after a byte was sent, or an inconclusive or malformed

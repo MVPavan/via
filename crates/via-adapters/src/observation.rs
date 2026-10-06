@@ -237,6 +237,10 @@ pub struct UsageSample {
     pub reasoning_output: Option<u64>,
     /// Total tokens.
     pub total: Option<u64>,
+    /// The vendor counted this sample over an interval VIA has not verified
+    /// to be the turn's (a compaction call): the turn's usage is
+    /// then `vendor_interval`, with `usage_interval_unverified`.
+    pub interval_unverified: bool,
 }
 
 /// A vendor-reported cost.
@@ -246,6 +250,20 @@ pub struct CostReport {
     pub usd: f64,
     /// The declared cost scope.
     pub scope: String,
+    /// Whether the vendor billed the amount or computed it (C1 §5
+    /// `cost.provenance`).
+    pub provenance: CostProvenance,
+}
+
+/// How a vendor arrived at a cost (C1 §5 `cost.provenance`); an
+/// unavailable cost is no `CostReport`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CostProvenance {
+    /// The vendor reported the amount it accounts.
+    Reported,
+    /// The vendor computed the amount from its price tables (Pi), so it
+    /// need not be a billed amount.
+    Estimated,
 }
 
 /// The one retained vendor terminal of a turn (AD4).

@@ -466,11 +466,15 @@ pub(crate) fn vendor_args(raw: Option<&RawValue>) -> Result<VendorArgs, ApiError
 }
 
 /// The encoded sizes C2 §2 `ParamSizes` carries: the instructions' UTF-8
-/// bytes, and the schema's compact JSON bytes, as the turn's `TurnSpec`
-/// carries it; 0 for an absent one.
+/// bytes and their JSON string encoding's (quotes included), and the
+/// schema's compact JSON bytes, as the turn's `TurnSpec` carries it; 0 for
+/// an absent one.
 pub(crate) fn param_sizes(instructions: Option<&str>, schema: Option<&Value>) -> ParamSizes {
     ParamSizes {
         instructions: instructions.map_or(0, str::len),
+        instructions_json: instructions.map_or(0, |text| {
+            via_adapters::encoded_text_len(text).saturating_add(2)
+        }),
         // A `Value` always encodes: its keys are strings.
         output_schema: schema.map_or(0, |schema| {
             serde_json::to_string(schema).map_or(0, |text| text.len())
@@ -873,6 +877,26 @@ mod tests {
 
     use super::{Effective, EffectiveBound, Member};
     use crate::SpawnParams;
+
+    /// C2 gap A1 (slice A critical, minor): `instructions_json` is the
+    /// instructions' JSON string encoding, escapes and quotes included, as
+    /// `serde_json` writes it: not the UTF-8 length plus quotes. Empty
+    /// text has its two quotes; absent instructions are 0.
+    #[test]
+    fn instructions_json_counts_the_escaped_encoding() {
+        for text in ["a\"\n\\", "\u{1}\t é", ""] {
+            let sizes = super::param_sizes(Some(text), None);
+            let encoded = serde_json::to_string(text).unwrap().len();
+            assert_eq!(sizes.instructions_json, encoded, "{text:?}");
+            assert_eq!(sizes.instructions, text.len(), "{text:?}");
+        }
+        assert_eq!(
+            super::param_sizes(Some("a\"\n\\"), None).instructions_json,
+            9
+        );
+        assert_eq!(super::param_sizes(Some(""), None).instructions_json, 2);
+        assert_eq!(super::param_sizes(None, None).instructions_json, 0);
+    }
 
     /// The per-turn type rules (C1 §4): an empty options object per
     /// harness passes; a null `bound`, `effort`, `vendor` or `deadlines`

@@ -99,7 +99,8 @@
 //! launched or no exit was reported), `cleanup`, `journal_uncertain`, and
 //! `group_absent`: whether Host `GroupAbsent` evidence for the connection's
 //! own group backs the cleanup. `terminal.cost` is C1's cost member: a
-//! vendor cost gives `{usd, scope, provenance: "reported"}`; none gives
+//! vendor cost gives `{usd, scope, provenance}` with the adapter's
+//! `CostReport.provenance`, `"reported"` or `"estimated"`; none gives
 //! `{usd: null, provenance: "unavailable"}`. `instance` is
 //! `TurnEnd.instance`: `{vendor_version, version_status}` or null.
 //!
@@ -460,8 +461,8 @@ const COST: &[&str] = &["usd", "scope", "provenance"];
 const PROVENANCE: &[&str] = &["reported", "estimated", "unavailable"];
 /// C1 §5 usage provenance: only cost may be `estimated`.
 const USAGE_PROVENANCE: &[&str] = &["reported", "unavailable"];
-/// C2 `UsageSample` (`via-adapters`' observation type): `key`, then the
-/// token counters.
+/// C2 `UsageSample` (`via-adapters`' observation type): `key`, the token
+/// counters, then `interval_unverified`.
 const USAGE_SAMPLE: &[&str] = &[
     "key",
     "input",
@@ -469,6 +470,7 @@ const USAGE_SAMPLE: &[&str] = &[
     "output",
     "reasoning_output",
     "total",
+    "interval_unverified",
 ];
 /// C1 §5 usage and cost scope.
 const SCOPE: &[&str] = &["turn", "session_cumulative", "vendor_interval"];
@@ -1083,15 +1085,17 @@ fn observation_field_type(field: &str) -> (Ty, bool) {
     }
 }
 
-/// Checks a C2 `UsageSample` (`progress.usage`): a nullable string `key`
-/// and the named nullable token counters, nothing else.
+/// Checks a C2 `UsageSample` (`progress.usage`): a nullable string `key`,
+/// the named nullable token counters and the `interval_unverified` flag,
+/// nothing else.
 fn usage_sample(sample: &Value, at: &str) -> Result<(), String> {
     known(sample, USAGE_SAMPLE, at)?;
     let sample = object(sample, at)?;
     typed(sample, "key", Ty::Str, true, at)?;
-    for counter in &USAGE_SAMPLE[1..] {
+    for counter in &USAGE_SAMPLE[1..6] {
         typed(sample, counter, Ty::Count, true, at)?;
     }
+    typed(sample, "interval_unverified", Ty::Bool, false, at)?;
     Ok(())
 }
 
@@ -1283,6 +1287,8 @@ const REJECTED: &[&str] = &[
     "vendor_error",
     "session_gone",
     "protocol",
+    "uncertain_predecessor",
+    "settings_mismatch",
 ];
 /// C2 `Refusal` kinds; a name ending in `:` takes a non-empty suffix.
 const REFUSAL: &[&str] = &[
