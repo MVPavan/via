@@ -660,9 +660,11 @@ predicate.
   that fails or outlives the deadline, or a proof the pass observed but
   could not commit, is the check's `Err`, the turn's Store failure as for
   any Host journal failure, never `uncertain_predecessor`. Nothing is
-  launched. The failed, timed-out or late read is `store` (not committed;
-  an uncertain Store commit, uncertain); the uncommitted proof is Host's
-  journal failure, as on every route; a wall spent before the read is
+  launched. A failed, timed-out or late read is `store`, not committed,
+  whatever kind the Store gave (a dropped read reply reports
+  `UncertainCommit`). An absence proof the pass could not commit is
+  Host's journal failure: not committed, or uncertain only when the proof's
+  own commit outcome is uncertain. A wall spent before the read is
   `deadline`.
 - **Several turns.** If turn A leaves a survivor, turn B refuses without
   launching, and turn C's check still finds A, because the predicate is A's

@@ -236,15 +236,16 @@ impl PiRoute {
 
 /// The R1 check's failure cause (packet §7.4).
 fn predecessor_cause(turn: TurnNumber, error: &WireError) -> RouteError {
-    let store = |kind| RouteError::Store { turn, kind };
     match error {
-        WireError::Host(HostError::Store(_)) => store(StoreFailure::NotCommitted),
-        WireError::Host(HostError::StoreUnavailable(kind)) => {
-            store(if *kind == via_wire::StoreFailureKind::UncertainCommit {
-                StoreFailure::Uncertain
-            } else {
-                StoreFailure::NotCommitted
-            })
+        // Every one is a read (a page or the final count), whatever kind
+        // the Store gave: a dropped read reply is `UncertainCommit`. An
+        // absence proof's uncertain commit is Host's journal error, which
+        // `wire_cause` keeps uncertain.
+        WireError::Host(HostError::Store(_) | HostError::StoreUnavailable(_)) => {
+            RouteError::Store {
+                turn,
+                kind: StoreFailure::NotCommitted,
+            }
         }
         error @ (WireError::Host(_)
         | WireError::Evidence(_)
@@ -886,6 +887,56 @@ impl PrivateProtocol for PiLane {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Packet §7.4, decision C-3 (review r1 #2): a failed or late read is
+    /// the turn's Store failure, not committed, whatever kind the Store
+    /// reported (a dropped read reply is `UncertainCommit`); only an
+    /// absence proof whose commit is uncertain is `uncertain`.
+    #[test]
+    fn predecessor_failures_keep_reads_apart_from_uncertain_commits() {
+        let turn = TurnNumber::try_from(3).unwrap();
+        let kind = |error: HostError| {
+            if let RouteError::Store { kind, .. } = predecessor_cause(turn, &WireError::Host(error))
+            {
+                Some(kind)
+            } else {
+                None
+            }
+        };
+        for read in [
+            via_wire::StoreFailureKind::UncertainCommit,
+            via_wire::StoreFailureKind::Write,
+            via_wire::StoreFailureKind::Quota,
+        ] {
+            assert_eq!(
+                kind(HostError::StoreUnavailable(read)),
+                Some(StoreFailure::NotCommitted),
+                "{read:?}"
+            );
+        }
+        assert_eq!(
+            kind(HostError::Store("session anchor read timed out")),
+            Some(StoreFailure::NotCommitted)
+        );
+        assert_eq!(
+            kind(HostError::Journal {
+                site: via_wire::JournalSite::Absence,
+                uncertain: false,
+            }),
+            Some(StoreFailure::NotCommitted)
+        );
+        assert_eq!(
+            kind(HostError::Journal {
+                site: via_wire::JournalSite::Absence,
+                uncertain: true,
+            }),
+            Some(StoreFailure::Uncertain)
+        );
+        assert!(matches!(
+            predecessor_cause(turn, &WireError::Host(HostError::Deadline)),
+            RouteError::Deadline { .. }
+        ));
+    }
 
     fn lane() -> PiLane {
         let (end, _rx) = oneshot::channel();
