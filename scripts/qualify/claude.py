@@ -111,13 +111,18 @@ the inherited-configuration request are daemon configuration:
   unrestricted-mcp-off  mcp_switches' MCP-off launch
   empty-home            private_profile_auth
 A phase's daemon is recorded as owned but unverified, its runtime directory
-kept, from before the start (or stop) request until it is proven: started
-when the pid `daemon status` replies with holds the run's private lock
-files; stopped when no process holds them, none that could be ours (this
-uid, started after the runner) was left uninspected, the recorded daemon's
-pid and start ticks are gone, and no descendant seen before the stop is
-alive. A daemon that holds the locks is ours, a replacement started by the
-CLI included. A failed start is searched for by those locks, and every
+kept, from before the start (or stop) request until it is proven. Both
+proofs rest on the daemon's flock locks on the run's private lock files
+(daemon.lock, store.lock; in /proc/locks as "MM:mm:inode", device numbers
+in hex). Started: /proc/locks shows the pid `daemon status` replies with
+as the flock locker of both. Stopped: /proc/locks is readable and has no
+line for them, and each lock can be taken (then released at once): Linux
+drops a lock from /proc/locks when its locker exits even while an inherited
+copy still holds it, and the probe sees that copy. The recorded daemon's
+pid and start ticks must be gone too, and no descendant seen before the
+stop alive. Which pids hold the files through their
+descriptors is kept as evidence only. A daemon that holds the locks is
+ours, a replacement started by the CLI included. A failed start is searched for by those locks, and every
 later phase is blocked. The final cleanup retries the stop until a
 deadline, also after an earlier unverified stop, escalating to `daemon stop
 --force` when a plain stop is refused `sessions_active`; once the stop is
@@ -160,6 +165,7 @@ to, or waits on, no process VIA did not start.
 
 import argparse
 import datetime
+import fcntl
 import glob
 import hashlib
 import json
@@ -330,6 +336,40 @@ def has_marker_key(pid, start_ticks):
     if raw is None:
         return None
     return any(entry.split(b"=", 1)[0] == MARKER_KEY for entry in raw.split(b"\0"))
+
+
+def lock_id(path):
+    """A file's id as /proc/locks writes it ("MM:mm:inode", device numbers
+    in hex), or None when it does not exist."""
+    try:
+        info = os.stat(path)
+    except FileNotFoundError:
+        return None
+    return f"{os.major(info.st_dev):02x}:{os.minor(info.st_dev):02x}:{info.st_ino}"
+
+
+def lock_free(path):
+    """Whether nobody holds the file's flock lock: True when it can be taken
+    (it is released at once) or the file does not exist, False when held,
+    None when it cannot be decided. Opened read-only, no-follow, never
+    created."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    except OSError:
+        return None
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return True
+    finally:
+        os.close(fd)
 
 
 def alive(pid, start_ticks):
@@ -592,8 +632,8 @@ class Run:
         self.daemon_unverified = None
         self.phase = None
         self.daemons = []
-        # The runner's own start: a process started later could be ours.
-        self.run_ticks = proc_stat(os.getpid())["start_ticks"]
+        # The private lock files' identities as /proc/locks writes them.
+        self.lock_ids = set()
         self.costs = {}
         self.last_cost = {}
         self.accounting_failed = None
@@ -847,9 +887,17 @@ class Run:
                 status, detail = None, str(error)
             pid = status.get("pid") if isinstance(status, dict) else None
             stat = proc_stat(pid) if isinstance(pid, int) and not isinstance(pid, bool) else None
-            if stat is not None and {"pid": pid, "start_ticks": stat["start_ticks"]} not in (
-                    self.find_daemons()[0]):
-                stat, detail = None, f"pid {pid} does not hold this run's locks"
+            if stat is not None:
+                # The daemon itself takes both locks: /proc/locks must show
+                # it as their locker. This also proves the lock ids match.
+                # Its lines must be flock locks, which the stop proof's probe
+                # sees.
+                lines = self.lock_lines()
+                ids = [lock_id(path) for path in self.lock_paths()]
+                if lines is None or None in ids or any(
+                        [pid, "FLOCK"] not in lines.get(key, []) for key in ids):
+                    stat, detail = None, f"/proc/locks does not show pid {pid} holding " \
+                                         "this run's lock files with flock"
             if stat is None:
                 record["start_failed"] = str(detail)
                 raise Blocked(f"daemon for phase {name} did not start verifiably ({detail})")
@@ -857,7 +905,8 @@ class Run:
             # Any unsuccessful start: find what it left by the private locks.
             record.setdefault("start_failed", f"{type(error).__name__}: {error}")
             try:
-                record["found"], record["uncertain"] = self.find_daemons()
+                record["found"] = self.find_daemons()
+                record["lock_lines"] = self.lock_lines()
             except Exception as find_error:
                 record["found"] = f"search failed: {type(find_error).__name__}"
             raise
@@ -867,57 +916,71 @@ class Run:
         self.daemon_unverified = None
         print(f"phase {name}: daemon started", flush=True)
 
+    def lock_paths(self):
+        return (self.runtime / "daemon.lock", self.state / "store.lock")
+
+    def lock_lines(self):
+        """{lock id: [[locker pid, lock kind]]} for this run's private lock
+        files in /proc/locks, or None when it cannot be read. A lock id is
+        "MM:mm:inode" (device numbers in hex), as /proc/locks writes it; each
+        lock file's id is recorded once seen, and every recorded id is
+        checked. A waiter's line counts too. /proc/locks omits a lock whose
+        locker has exited even while an inherited copy still holds it, so
+        the stop proof also probes each lock (`lock_free`)."""
+        for path in self.lock_paths():
+            key = lock_id(path)
+            if key:
+                self.lock_ids.add(key)
+        try:
+            text = Path("/proc/locks").read_text()
+        except OSError:
+            return None
+        lines = {}
+        for line in text.splitlines():
+            parts = line.split()
+            for index, token in enumerate(parts):
+                if token in self.lock_ids and index >= 4:
+                    pid = parts[index - 1]
+                    lines.setdefault(token, []).append(
+                        [int(pid) if pid.isdigit() else None, parts[index - 4]])
+        return lines
+
     def find_daemons(self):
-        """(holders, uncertain): processes holding this run's private locks,
-        whatever their binary's name, and processes that could be ours (this
-        uid, started after the runner) whose descriptors could not be fully
-        inspected while they lived. Uncertain is never "no holder"."""
-        locks = {str(self.runtime / "daemon.lock"), str(self.state / "store.lock")}
-        holders, uncertain = [], []
+        """Evidence only, never proof: processes seen holding this run's
+        private lock files through their descriptors. A process whose
+        descriptors cannot be read is not listed; /proc/locks decides."""
+        locks = {str(path) for path in self.lock_paths()}
+        holders = []
         for pid, stat in all_procs().items():
-            ident = {"pid": pid, "start_ticks": stat["start_ticks"]}
             proc = open_proc(pid, stat["start_ticks"])
             if proc is None:
-                continue  # gone since the scan
+                continue
             try:
-                candidate = (os.fstat(proc).st_uid == os.getuid()
-                             and stat["start_ticks"] >= self.run_ticks)
-                held, failed = False, False
+                fd_dir = os.open("fd", os.O_RDONLY | os.O_DIRECTORY, dir_fd=proc)
                 try:
-                    fd_dir = os.open("fd", os.O_RDONLY | os.O_DIRECTORY, dir_fd=proc)
-                except OSError:
-                    failed = True
-                else:
-                    try:
-                        for fd in os.listdir(fd_dir):
-                            try:
-                                link = os.readlink(fd, dir_fd=fd_dir)
-                            except FileNotFoundError:
-                                continue  # closed while read
-                            except OSError:
-                                failed = True
-                                continue
-                            if link in locks:
-                                held = True
-                                break
-                    except OSError:
-                        failed = True
-                    finally:
-                        os.close(fd_dir)
+                    for fd in os.listdir(fd_dir):
+                        try:
+                            link = os.readlink(fd, dir_fd=fd_dir)
+                        except OSError:
+                            continue
+                        if link in locks:
+                            holders.append({"pid": pid, "start_ticks": stat["start_ticks"]})
+                            break
+                finally:
+                    os.close(fd_dir)
+            except OSError:
+                pass
             finally:
                 os.close(proc)
-            if held:
-                holders.append(ident)
-            elif failed and candidate and alive(pid, stat["start_ticks"]):
-                uncertain.append(ident)
-        return holders, uncertain
+        return holders
 
     def stop_daemon(self, final=False):
-        """Stops the run's daemon. The stop proof: no process holds this
-        run's private locks (a replacement daemon at our socket holds them
-        too, so it is ours), no process that could be ours was left
-        uninspected, the recorded daemon (pid and start ticks) is gone, and
-        no descendant seen before the stop is alive. Until then the daemon
+        """Stops the run's daemon. The stop proof: /proc/locks, readable,
+        has no line for this run's private lock files and each lock can be
+        taken (and is released at once), so nobody holds it, inherited
+        copies included (a replacement daemon at our socket holds them too,
+        so it is ours); the recorded daemon (pid and start ticks) is gone;
+        and no descendant seen before the stop is alive. Until then the daemon
         is owned but unverified, its runtime directory kept. A stop is
         retried until a deadline, also after an earlier unverified stop; the
         final cleanup escalates to `--force` when a plain stop is refused
@@ -940,12 +1003,19 @@ class Run:
         force = False
 
         def survivors():
-            holders, uncertain = self.find_daemons()
+            """(held locks, or None when /proc/locks or a probe cannot
+            decide; recorded daemons alive)."""
+            lines = self.lock_lines()
+            probes = {path.name: lock_free(path) for path in self.lock_paths()}
             living = [d for d in recorded if alive(d["pid"], d["start_ticks"])]
-            return holders, uncertain, living
+            if lines is None or None in probes.values():
+                return None, living
+            return sorted(lines) + sorted(name for name, free in probes.items()
+                                          if not free), living
 
         while True:
-            holders, uncertain, recorded_alive = survivors()
+            held, recorded_alive = survivors()
+            holders = self.find_daemons()  # evidence only: which pids
             procs = all_procs()
             for root in holders + recorded_alive:
                 if (procs.get(root["pid"]) or {}).get("start_ticks") == root["start_ticks"]:
@@ -953,11 +1023,11 @@ class Run:
                                 for pid in descendants(root["pid"], procs)}
             record["descendants_watched"] = sorted(watched)
             left = sorted(pid for pid, start in watched if alive(pid, start))
-            proven = not (holders or uncertain or recorded_alive or left)
+            proven = held == [] and not (recorded_alive or left)
             remaining = deadline - time.monotonic()
             if proven or remaining <= 0:
                 break
-            if not (holders or recorded_alive):
+            if not (held or recorded_alive):
                 time.sleep(0.2)
                 continue
             try:
@@ -972,10 +1042,11 @@ class Run:
             if final and "sessions_active" in json.dumps([reply, err], default=str):
                 force = True
             settle = min(deadline, time.monotonic() + 10)
-            while time.monotonic() < settle and any(survivors()):
+            while time.monotonic() < settle and survivors() != ([], []):
                 time.sleep(0.2)
+        record["locks_held"] = "undecidable: /proc/locks or a lock probe failed" \
+            if held is None else held
         record["holders_left"] = holders
-        record["uninspected"] = uncertain
         record["recorded_alive"] = recorded_alive
         record["descendants_left"] = left
         record["stopped"] = proven
