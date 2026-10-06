@@ -17,7 +17,9 @@ use tokio_util::sync::CancellationToken;
 use super::{DriverState, ForceWatch, latch, lock};
 use crate::observation::{ObservationItem, ObservationSink, Undelivered};
 use crate::runtime::event_stall;
-use crate::{Deadline, DriverFailure, DriverHealth, StopCause, StopOrder, StopWatch};
+use crate::{
+    Deadline, DriverFailure, DriverHealth, StopCause, StopOrder, StopWatch, TurnEnd, UsageSample,
+};
 
 /// A harness's normalizer as the delivery loop drives it (C2 §4): it turns
 /// one of its route's messages into observations, and learns whether their
@@ -97,6 +99,29 @@ pub(crate) async fn controls(
         () = stopped => {}
         () = forced => {}
         () = cancel.cancelled() => {}
+    }
+}
+
+/// C2 §5: delivery can have lost one of the turn's call samples, so its
+/// tokens and cost are unavailable: the all-null turn aggregate, on the
+/// retained terminal (its cost unavailable too) or, without one, on the
+/// turn's end; either supersedes the delivered samples.
+pub(crate) fn unaccounted(end: &mut TurnEnd) {
+    let none = UsageSample {
+        key: None,
+        input: None,
+        cached_input: None,
+        output: None,
+        reasoning_output: None,
+        total: None,
+        interval_unverified: false,
+    };
+    match &mut end.terminal {
+        Some(terminal) => {
+            terminal.usage = Some(none);
+            terminal.cost = None;
+        }
+        None => end.aggregate = Some(none),
     }
 }
 

@@ -17,7 +17,7 @@ use super::normalize::{self, LaunchFacts, Normalizer};
 use super::{HARNESS, PiAdapter, plan, profile};
 use crate::driver::turn::{
     Abandonment, CLEANUP_ALLOWANCE, Normalize, Rest, controls, deliver_beside, earliest,
-    end_active, merge_stops, ordered,
+    end_active, merge_stops, ordered, unaccounted,
 };
 use crate::driver::{
     Active, DriverState, ForceWatch, Reservation, Retiring, SessionDriver, TurnCx, TurnSpec, latch,
@@ -822,14 +822,8 @@ impl Ended {
             .and_then(|facts| normalize::thinking_data(&facts.thinking_level));
         let lost = !accounted(normalizer, (rest, activity), &outcome);
         let terminal = terminal.map(|message| {
-            let cost = normalizer.cost().filter(|_| !lost);
             let at = tokio::time::Instant::now();
-            let terminal = normalize::terminal(&message, abort, (cost, vendor), at);
-            if lost {
-                normalize::unaccounted(terminal)
-            } else {
-                terminal
-            }
+            normalize::terminal(&message, abort, (normalizer.cost(), vendor), at)
         });
         let acknowledged = terminal
             .as_ref()
@@ -888,16 +882,20 @@ impl Ended {
                 acknowledged,
             ))),
         };
-        TurnEnd {
+        let mut end = TurnEnd {
             loss: None,
-            // Without a terminal the all-null aggregate carries the loss
-            // (C2 §5, bead via-i5g).
-            aggregate: (lost && terminal.is_none()).then(normalize::no_usage),
+            aggregate: None,
             terminal,
             instance: None,
             leftovers: None,
             outcome: routed,
+        };
+        // The all-null aggregate on the terminal, else on the end (C2 §5,
+        // bead via-i5g).
+        if lost {
+            unaccounted(&mut end);
         }
+        end
     }
 }
 

@@ -61,7 +61,7 @@ use super::delivery::{
 use super::normalize::{self, DiscoveredModel, StructuredOutput};
 use super::plan::{self as codex_plan, Echoed, Sandbox};
 use super::{ADAPTER_VERSION, CodexAdapter, HARNESS, PerTurn, refusals};
-use crate::driver::turn::{CLEANUP_ALLOWANCE, end_active};
+use crate::driver::turn::{CLEANUP_ALLOWANCE, end_active, unaccounted};
 use crate::driver::{
     Active, ConnectionPin, DriverState, ForceWatch, Prepared, Retiring, SessionDriver, TurnCx,
     TurnSpec, latch, lock, quiescent, rejected,
@@ -2808,66 +2808,82 @@ fn settle_turn(
     } else {
         WireCleanup::Quiescent
     });
-    let uncertain = |cause| facts.failure(cause, None, None);
-    if cut == Cut::Forced {
-        return uncertain(RouteError::ForceStopped { turn });
+    // C2 §5 (picrit round 3): delivery can have lost one of the turn's
+    // call samples (Codex `last`; Codex reports no turn aggregate, only
+    // the thread's cumulative `total`): the overflow, a connection task
+    // that failed with messages staged, messages dropped after the lane
+    // was cut off, or anything the seal left undelivered at a cutoff but
+    // the terminal. The turn's tokens are then unavailable, with a
+    // terminal or without one.
+    let samples_lost = overflowed
+        || lane.dropped() > 0
+        || (!terminal_decided && (undelivered || abnormal || cut == Cut::LossDeadline));
+    let mut end = 'end: {
+        let uncertain = |cause| facts.failure(cause, None, None);
+        if cut == Cut::Forced {
+            break 'end uncertain(RouteError::ForceStopped { turn });
+        }
+        if let Some(retained) = sealed.terminal {
+            // The terminal stands, but an overflow beside it, however the two
+            // were ready, still leaves the cleanup unproven (x.3.2 X3 fix r3
+            // #2).
+            if overflowed {
+                cleanup_interrupt();
+            }
+            let decoded_at = sealed.decoded_at.unwrap_or(retained.terminal.at);
+            let tools_open = sealed.tools_open || overflowed;
+            if decoded_at >= wall && orders.provenance() == EndCause::Wall {
+                break 'end wall_end(facts, retained, tools_open);
+            }
+            break 'end terminal_end(facts, retained, tools_open);
+        }
+        match (cut, sealed.stop) {
+            (Cut::Overflow, _) | (_, Some(Stop::Lane(LaneEnd::Overflow))) => {
+                cleanup_interrupt();
+                facts.failure(
+                    RouteError::Overflow { turn },
+                    None,
+                    Some(WireCleanup::Uncertain),
+                )
+            }
+            // x.3.2 X3 §4.3: never the cleanup of what survived.
+            (_, Some(Stop::Generation | Stop::Lane(LaneEnd::Quarantined))) => {
+                let cause = registration
+                    .failure()
+                    .map_or(RouteError::Overflow { turn }, |cause| {
+                        generation_cause(&cause, turn)
+                    });
+                cleanup_interrupt();
+                facts.failure(cause, None, Some(WireCleanup::Uncertain))
+            }
+            (_, Some(Stop::Lane(end))) => {
+                let (cause, loss) = lane_end(end, start.connection, turn);
+                facts.failure(cause, loss, reported)
+            }
+            (Cut::Order(_), None) if orders.provenance() == EndCause::Wall => {
+                uncertain(RouteError::Deadline { turn })
+            }
+            (Cut::LossDeadline, None) => match connection_loss(start.connection) {
+                Some(loss) => facts.failure(
+                    loss_cause(&loss, turn),
+                    Some(ConnectionLoss {
+                        cleanup: WireCleanup::Uncertain,
+                        ..loss
+                    }),
+                    None,
+                ),
+                None => uncertain(RouteError::TransportLost { turn }),
+            },
+            // A P7 cut has a terminal, which the seal took; never reached.
+            (Cut::Order(_) | Cut::Decided | Cut::Forced | Cut::Grace | Cut::Detach, None) => {
+                uncertain(RouteError::Stopped { turn })
+            }
+        }
+    };
+    if samples_lost {
+        unaccounted(&mut end);
     }
-    if let Some(retained) = sealed.terminal {
-        // The terminal stands, but an overflow beside it, however the two
-        // were ready, still leaves the cleanup unproven (x.3.2 X3 fix r3
-        // #2).
-        if overflowed {
-            cleanup_interrupt();
-        }
-        let decoded_at = sealed.decoded_at.unwrap_or(retained.terminal.at);
-        let tools_open = sealed.tools_open || overflowed;
-        if decoded_at >= wall && orders.provenance() == EndCause::Wall {
-            return wall_end(facts, retained, tools_open);
-        }
-        return terminal_end(facts, retained, tools_open);
-    }
-    match (cut, sealed.stop) {
-        (Cut::Overflow, _) | (_, Some(Stop::Lane(LaneEnd::Overflow))) => {
-            cleanup_interrupt();
-            facts.failure(
-                RouteError::Overflow { turn },
-                None,
-                Some(WireCleanup::Uncertain),
-            )
-        }
-        // x.3.2 X3 §4.3: never the cleanup of what survived.
-        (_, Some(Stop::Generation | Stop::Lane(LaneEnd::Quarantined))) => {
-            let cause = registration
-                .failure()
-                .map_or(RouteError::Overflow { turn }, |cause| {
-                    generation_cause(&cause, turn)
-                });
-            cleanup_interrupt();
-            facts.failure(cause, None, Some(WireCleanup::Uncertain))
-        }
-        (_, Some(Stop::Lane(end))) => {
-            let (cause, loss) = lane_end(end, start.connection, turn);
-            facts.failure(cause, loss, reported)
-        }
-        (Cut::Order(_), None) if orders.provenance() == EndCause::Wall => {
-            uncertain(RouteError::Deadline { turn })
-        }
-        (Cut::LossDeadline, None) => match connection_loss(start.connection) {
-            Some(loss) => facts.failure(
-                loss_cause(&loss, turn),
-                Some(ConnectionLoss {
-                    cleanup: WireCleanup::Uncertain,
-                    ..loss
-                }),
-                None,
-            ),
-            None => uncertain(RouteError::TransportLost { turn }),
-        },
-        // A P7 cut has a terminal, which the seal took; never reached.
-        (Cut::Order(_) | Cut::Decided | Cut::Forced | Cut::Grace | Cut::Detach, None) => {
-            uncertain(RouteError::Stopped { turn })
-        }
-    }
+    end
 }
 
 /// x.3.2 X4 D4.2 rule 3 (C2 §4.1): the wall stopped the turn, whose

@@ -1941,8 +1941,10 @@ fn codex_start_order() {
     // The generation fails: the turn's cleanup is never its surviving
     // tools' (x.3.2 X3 §4.3, C2).
     failed_after_acceptance(&mut expect, "protocol", "uncertain");
-    // What the turn delivered before the malformed message stays.
-    turn_mut(&mut expect, 0)["expect"]["usage"] = base["usage"].clone();
+    // What the turn delivered before the malformed message stays, but its
+    // tokens are unavailable: an undecodable message may carry usage
+    // (C2 §5).
+    turn_mut(&mut expect, 0)["expect"]["usage"] = unavailable();
     turn_mut(&mut expect, 0)["expect"]["final_text"] = base["final_text"].clone();
     turn_mut(&mut expect, 0)["expect"]["observations_include"] = json!([
         {"kind": "turn.accepted", "vendor_turn_id": TURN}, "final_text",
@@ -1966,6 +1968,8 @@ fn codex_start_order() {
     cut_after(&mut replay, completed, &[sigterm()]).unwrap();
     let mut expect = malformed;
     expect["source"] = replay["source"].clone();
+    // Delivery lost nothing the turn received: its samples are summed.
+    turn_mut(&mut expect, 0)["expect"]["usage"] = base["usage"].clone();
     // A connection-wide failure keeps its Route path: the stopped server
     // proves the turn's cleanup.
     turn_mut(&mut expect, 0)["expect"]["cleanup"] = json!("quiescent");
@@ -2288,7 +2292,13 @@ fn codex_malformed_evidence_owner() {
         .unwrap();
         let turn = &mut turn_mut(&mut expect, 1)["expect"];
         turn["terminal"] = Value::Null;
-        turn["usage"] = Value::Null;
+        turn["usage"] = if owner == "evidence/servers/" {
+            // Delivery stopped mid-message: a call sample can have been
+            // lost, so the tokens are unavailable (C2 §5).
+            unavailable()
+        } else {
+            Value::Null
+        };
         turn["final_text"] = Value::Null;
         turn["error"] = json!("protocol");
         // The generation fails: the turn's cleanup is never its surviving
@@ -2863,7 +2873,8 @@ fn codex_suppression_exhaustion_fails_the_generation() {
         json!({"turn.accepted": 1, "action.denied": first});
     let turn = &mut turn_mut(&mut expect, 1)["expect"];
     turn["terminal"] = Value::Null;
-    turn["usage"] = Value::Null;
+    // The overflow can have dropped a call sample (C2 §5).
+    turn["usage"] = unavailable();
     turn["final_text"] = Value::Null;
     turn["error"] = json!("overflow");
     turn["cleanup"] = json!("uncertain");
@@ -2965,7 +2976,8 @@ fn codex_open_tools_survive_their_turn() {
     cut_after(&mut replay, second + paced, &[sigterm()]).unwrap();
     let turn = &mut turn_mut(&mut expect, 1)["expect"];
     turn["terminal"] = Value::Null;
-    turn["usage"] = Value::Null;
+    // The overflow can have dropped a call sample (C2 §5).
+    turn["usage"] = unavailable();
     turn["final_text"] = Value::Null;
     turn["error"] = json!("overflow");
     turn["cleanup"] = json!("uncertain");
@@ -3177,7 +3189,13 @@ fn codex_exhaustion_fails_the_shared_connection() {
         turn["stop"] = Value::Null;
         let turn = &mut turn["expect"];
         turn["terminal"] = Value::Null;
-        turn["usage"] = Value::Null;
+        // A's overflow can have dropped a call sample (C2 §5); B's
+        // connection loss drops nothing it received.
+        turn["usage"] = if index == 0 {
+            unavailable()
+        } else {
+            Value::Null
+        };
         turn["final_text"] = Value::Null;
         turn["error"] = json!("overflow");
         // A's delivery stopped at its overflow: what was dropped proves
@@ -3698,7 +3716,9 @@ fn connection_task_panic_with_staged_terminal() {
     let base = turn_mut(&mut expect, 0)["expect"].clone();
     failed_after_acceptance(&mut expect, "transport_lost", "uncertain");
     let turn = &mut turn_mut(&mut expect, 0)["expect"];
-    turn["usage"] = base["usage"].clone();
+    // What the failed task staged is lost, and may have been a call
+    // sample: tokens unavailable (C2 §5).
+    turn["usage"] = unavailable();
     turn["final_text"] = base["final_text"].clone();
     turn["observations_include"] = json!([
         {"kind": "turn.accepted", "vendor_turn_id": TURN}, "final_text",
@@ -3915,8 +3935,75 @@ fn codex_overflow_interrupts_and_is_uncertain() {
     tail.push(json!({"await_eof": {}}));
     cut_after(&mut replay, started, &tail).unwrap();
     failed_after_acceptance(&mut expect, "overflow", "uncertain");
+    // The overflow can have dropped a call sample (C2 §5).
+    turn_mut(&mut expect, 0)["expect"]["usage"] = unavailable();
     // Steps count from 1: the gate is the step after `turn/started`.
     turn_mut(&mut expect, 0)["gates"] = json!([{"step": started + 2,
+        "expect": {"accepted": true, "terminal": null, "error": null}}]);
+    expect["sessions"]["main"]["close"] = Value::Null;
+    expect["sessions"]["main"]["health"] = json!({"state": "failed", "first_cause": "overflow"});
+    variant(name, &replay, &expect).unwrap();
+}
+
+/// The usage of a turn whose delivery can have lost a call sample: the
+/// all-null aggregate (C2 §5).
+fn unavailable() -> Value {
+    json!({"from": "terminal", "input_tokens": null, "cached_input_tokens": null,
+        "output_tokens": null, "reasoning_output_tokens": null, "total_tokens": null,
+        "scope": "turn"})
+}
+
+/// One `thread/tokenUsage/updated` of the plain turn: `last` is one model
+/// call's sample of `total_tokens`, all of them input.
+#[cfg(feature = "test-failpoints")]
+fn token_usage(total_tokens: u64) -> Value {
+    let last = json!({"totalTokens": total_tokens, "inputTokens": total_tokens,
+        "cachedInputTokens": 0, "cacheWriteInputTokens": 0, "outputTokens": 0,
+        "reasoningOutputTokens": 0});
+    emit(
+        &json!({"method": "thread/tokenUsage/updated", "params": {"threadId": THREAD,
+        "turnId": TURN, "tokenUsage": {"total": last, "last": last,
+        "modelContextWindow": 258_400}}}),
+    )
+}
+
+/// C2 §5 (picrit round 3): delivery lost a call's sample, so the turn's
+/// tokens are unavailable, never the delivered prefix. One sample is
+/// delivered; then the normalizer is held on a delta while twenty thread
+/// messages overflow the lane, and the second sample is dropped. The
+/// terminal-less `overflow` end carries the all-null aggregate. Before
+/// the fix Core summed the first sample's 100 tokens as the turn's.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn codex_overflow_before_the_second_sample() {
+    let name = "codex_overflow_before_the_second_sample";
+    // The identity's send, the acceptance's, the first sample's, then the
+    // delta's.
+    let _points = armed(
+        "adapter.observation.admitted",
+        json!({"occurrence": 4, "action": "delay", "value": 3000}),
+    )
+    .unwrap();
+    let (mut replay, mut expect) = plain(name).unwrap();
+    let started = step_with(&replay, "\"method\":\"turn/started\"").unwrap();
+    let delta = step_with(&replay, "\"method\":\"item/agentMessage/delta\"").unwrap();
+    let mut tail = vec![
+        token_usage(100),
+        json!({"await_signal": {"signal": "SIGUSR1"}}),
+        replay["steps"][delta].clone(),
+    ];
+    tail.extend(status_burst(20));
+    tail.push(token_usage(50));
+    tail.push(json!({"expect": {
+        "line": {"method": "turn/interrupt", "params": {"threadId": THREAD, "turnId": TURN}},
+        "within_ms": 2000,
+    }}));
+    tail.push(json!({"await_eof": {}}));
+    cut_after(&mut replay, started, &tail).unwrap();
+    failed_after_acceptance(&mut expect, "overflow", "uncertain");
+    turn_mut(&mut expect, 0)["expect"]["usage"] = unavailable();
+    // Steps count from 1: the gate is the step after the first sample.
+    turn_mut(&mut expect, 0)["gates"] = json!([{"step": started + 3,
         "expect": {"accepted": true, "terminal": null, "error": null}}]);
     expect["sessions"]["main"]["close"] = Value::Null;
     expect["sessions"]["main"]["health"] = json!({"state": "failed", "first_cause": "overflow"});
@@ -4239,7 +4326,9 @@ fn codex_overflow_beside_a_retained_terminal() {
     cut_after(&mut replay, started, &tail).unwrap();
     let turn = &mut turn_mut(&mut expect, 0)["expect"];
     turn["cleanup"] = json!("uncertain");
-    turn["usage"] = Value::Null;
+    // The overflow can have dropped a call sample: the retained terminal
+    // carries the all-null aggregate (C2 §5).
+    turn["usage"] = unavailable();
     // The final answer's item was cut: the terminal carries no text.
     turn["final_text"] = Value::Null;
     turn["observations_include"] = json!([{"kind": "turn.accepted", "vendor_turn_id": TURN}]);

@@ -740,6 +740,14 @@ of `last` values equalled the change in `total` (c1: 20522 + 20613), so the
 turn's usage has `scope:"turn"`. `total`, `cacheWriteInputTokens` and
 `modelContextWindow` go to `vendor`. Missing data is unavailable, not zero.
 Cost remains `usd:null, provenance:"unavailable"`; no price estimation.
+Codex reports no turn aggregate (`total` is the thread's), so the sum is the
+turn's only while delivery lost none of its samples. Where it can have lost
+one (the lane's overflow, a failed connection task with messages staged,
+messages dropped after the lane was cut off, a message only partly
+delivered, or anything the seal left undelivered at a cutoff but the
+terminal), the turn's end carries the all-`null` aggregate, on its retained
+terminal or on `TurnEnd.aggregate` (C2 §5). A connection loss or a stop
+drops nothing the turn received, so its delivered samples are still summed.
 
 Target capability after the corresponding fixture/live gates: spawn,
 stored-conversation resume, cancel and detach-close native; steer
@@ -768,6 +776,7 @@ time; retain raw-span evidence for every scenario.
 | `codex_control_races` | Interrupt during pending start; terminal-before-interrupt; ack missing; close/detach; all return by deadline with truthful evidence and no resend. |
 | `codex_bounds_overflow` | Exact boundary/excess messages, JSON depth/nodes and item ledger. Fill A's Route ingress lane then send one extra A event: observe immediate per-thread overflow/quarantine, original correlation and no spill allocation. Before advancing fake time to 10 s, deliver B's terminal and a control response; both must complete. Repeat with old A already immutable/uncertain and successor A2 active: old A's late tool flood triggers sticky loss for A2, A2 resolves before its wall deadline, A stays immutable, same-thread dispatch closes and B/control progress. Race A2 acceptance with quarantine and assert the same outcome. Separately fill only C2 observations with no further ingress: no early Route overflow, C2 stalls at 10 s. Continued A flood is read, counted and discarded within bounds, with the normalized loss explicit and no copy of the discarded traffic. Exhaust reserved metadata/health or global budget separately and assert explicit shared-connection failure; measure memory and blast radius. |
 | `codex_usage_snapshot` | Keyless `last` samples sum to the turn's usage (20522 + 20613), scope `turn`; `total` and cache-write counts go to `vendor`; wrong-turn usage does not attach; missing cost/counts stay unavailable. |
+| `codex_overflow_before_the_second_sample` | One sample delivered, then the lane overflows before the second: `overflow`, all-`null` tokens, never the first sample's 100. |
 | `codex_server_close` | Idle retirement closes stdin, then S1's hard stop; a C1 close of one session only unsubscribes and never closes stdin; both give `leftovers: null`. |
 | `codex_server_recovery` | Stdin EOF/server crash affects all live leases; lease release alone does not kill; verified Host group evidence is separate from unknown submission; restart issues no start/resume for uncertain live turns. |
 
