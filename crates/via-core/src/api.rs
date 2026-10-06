@@ -1920,6 +1920,14 @@ pub(crate) struct Tokens {
     pub(crate) total: Option<u64>,
 }
 
+impl Tokens {
+    /// Every count is `null`: unavailable usage (C1 §5), which reports no
+    /// figure and so covers no interval, verified or not.
+    pub(crate) fn unavailable(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 impl Usage {
     pub(crate) const UNAVAILABLE: Self = Self {
         input_tokens: None,
@@ -1937,7 +1945,7 @@ impl Usage {
     /// `null` (an all-null aggregate after lost samples, bead via-i5g):
     /// C1 §5 pairs all-null counts with provenance `unavailable`.
     pub(crate) fn reported(tokens: Option<Tokens>, interval: bool, scope: &str) -> Self {
-        match tokens.filter(|tokens| *tokens != Tokens::default()) {
+        match tokens.filter(|tokens| !tokens.unavailable()) {
             Some(tokens) => Self {
                 input_tokens: tokens.input,
                 cached_input_tokens: tokens.cached_input,

@@ -97,13 +97,17 @@ pub(super) fn turn_envelope(
 /// The envelope's `usage` from the turn's ledger (AD6): the turn aggregate
 /// when there is one, else the folded call samples, under the route's
 /// token `scope` or `vendor_interval`, with whether the interval is
-/// unverified; `None` without a sample or an aggregate.
+/// unverified; `None` without a sample or an aggregate. Unavailable
+/// usage (every count `null`) covers no interval: no
+/// `usage_interval_unverified`, whatever the aggregate's mark (picrit
+/// round 4).
 fn ledger_usage(
     ledger: &super::progress::UsageLedger,
     aggregate: Option<&via_adapters::UsageSample>,
     scope: &str,
 ) -> Option<(Usage, bool)> {
     let (tokens, interval) = ledger.figure(aggregate)?;
+    let interval = interval && !tokens.unavailable();
     Some((Usage::reported(Some(tokens), interval, scope), interval))
 }
 
@@ -1146,7 +1150,7 @@ mod tests {
             total: input,
             interval_unverified: false,
         };
-        let usage = |aggregate: Option<UsageSample>| {
+        let envelope = |aggregate: Option<UsageSample>| {
             let mut vendor = super::VendorRecord {
                 aggregate,
                 ..super::VendorRecord::default()
@@ -1173,8 +1177,9 @@ mod tests {
                 (1, 1),
                 vendor,
             );
-            serde_json::to_value(&envelope).unwrap()["usage"].clone()
+            serde_json::to_value(&envelope).unwrap()
         };
+        let usage = |aggregate: Option<UsageSample>| envelope(aggregate)["usage"].clone();
         assert_eq!(usage(None)["input_tokens"], 100);
         let lost = usage(Some(sample(None)));
         for field in [
@@ -1190,6 +1195,27 @@ mod tests {
         // `reported` figure.
         assert_eq!(lost["provenance"], "unavailable", "{lost}");
         assert_eq!(usage(None)["provenance"], "reported");
+        // Picrit round 4: unavailable usage covers no interval. A marked
+        // all-null aggregate is scope `turn` with no
+        // `usage_interval_unverified`; a marked figure keeps both.
+        let interval_warned = |envelope: &serde_json::Value| {
+            envelope["warnings"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|warning| warning["code"] == "usage_interval_unverified")
+        };
+        let marked = |input| UsageSample {
+            interval_unverified: true,
+            ..sample(input)
+        };
+        let unavailable = envelope(Some(marked(None)));
+        assert_eq!(unavailable["usage"]["scope"], "turn", "{unavailable}");
+        assert_eq!(unavailable["usage"]["provenance"], "unavailable");
+        assert!(!interval_warned(&unavailable), "{unavailable}");
+        let figure = envelope(Some(marked(Some(7))));
+        assert_eq!(figure["usage"]["scope"], "vendor_interval", "{figure}");
+        assert!(interval_warned(&figure), "{figure}");
     }
 
     fn rejected(reason: via_adapters::StartRejected) -> crate::api::Failure {

@@ -813,7 +813,10 @@ OpenCode packet §12). Among a turn's call samples, one such sample gives the
 same `vendor_interval` and warning, even when a later sample supersedes its
 key. A turn aggregate supersedes the call samples, their mark included (C1
 §5): the envelope, or a late terminal's revision, then has `vendor_interval`
-and the warning only when the aggregate itself is marked. A component is `null` if any contributing
+and the warning only when the aggregate itself is marked. A figure whose
+every count is `null` is unavailable usage (C1 §5: scope `turn`,
+provenance `unavailable`); it reports no numbers, so it covers no interval
+and raises no `usage_interval_unverified`, whatever its mark. A component is `null` if any contributing
 sample lacks it. Step rows keep their existing per-step rule for `status`.
 `VendorTerminal.cost` gives `{usd, scope, provenance}`, `provenance`
 `Reported` (the vendor's accounted amount) or `Estimated` (computed from
