@@ -105,9 +105,13 @@ private per-turn process (glossary fix, §10 G7).
 after Core reserved a slot:
 
 1. **Pre-launch checks**, with no vendor process:
-   1. the profile policy (§4.3);
-   2. R1 predecessor absence (§7.4);
-   3. the version read (§3).
+   1. one filesystem step, on a blocking task off the async workers that
+      the session's tracker owns: the profile policy (§4.3), the version
+      read (§3), then VIA's launch state (§4.4). A stop, the daemon force,
+      the wall or the session's cancellation before it finishes ends the
+      turn unlaunched (`stopped`, `force_stopped`, `deadline`); the task
+      finishes on its own and launches nothing;
+   2. R1 predecessor absence (§7.4).
 2. **Launch** the §4.1 recipe. Nothing is written before step 3.
 3. **Handshake.** Write `get_state`, `get_available_models` and
    `get_commands` at once, each with a VIA `id` (Pi buffers them, E01).
@@ -215,7 +219,8 @@ before each launch, so no extra process runs:
   (a Bun-compiled Pi), gives `vendor_version: null` with `untested`. It is
   never a refusal: VIA relies on nothing the version says.
 - The string goes into this turn's `InstanceReport`, on every outcome after
-  the read, including an exit before the handshake (E12); this is the
+  the read, including an R1 refusal and an exit before the handshake (E12);
+  this is the
   metadata trigger of C2 §5. A package replaced between the read and the
   launch is the accepted race, as for every route.
 
@@ -317,6 +322,8 @@ never writes, repairs or deletes anything in the agent directory.
   launch passed, not the directory after the turn (Pi creates `auth.json`
   and `models-store.json` on its first run, E59), and is written only for a
   turn that launched, best effort: the turn's outcome never depends on it.
+  Both records are written on a blocking task the session's tracker owns;
+  the turn's end waits for them at most the cleanup allowance.
 - **Profile setting.** The real profile had no `cacheWarming` key (E60);
   `"cacheWarming": "off"` was added to its `settings.json` on 2026-10-05.
   VIA itself never writes it: a profile without it is refused.

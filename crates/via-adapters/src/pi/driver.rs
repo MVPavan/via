@@ -6,7 +6,7 @@
 //! normalized in decode order; Route decides every handshake check, and
 //! the turn's end maps its cause.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::{mpsc, oneshot, watch};
@@ -65,56 +65,154 @@ pub(crate) async fn run_turn(
         return refused;
     }
     let turn = cx.turn;
-    // Packet §4.3: never cached; nothing launches. The record is of this
-    // check, the one the launch passed.
-    let profile = match profile::check(
-        &launch::agent_dir(&adapter.vendor_state_dir),
-        profile::daemon_uid(),
-    ) {
-        Ok(profile) => profile.record,
-        Err(detail) => {
-            return unlaunched(RouteError::HandshakeRefused {
-                turn,
-                detail: Some(format!("the Pi profile policy refused: {detail}")),
-            });
-        }
+    let signals = (cx.stop.clone(), cx.force.clone(), cx.wall);
+    let staged = match stage(driver, adapter, (turn, signals)).await {
+        Ok(staged) => staged,
+        Err(end) => return *end,
     };
-    let route = PiRoute::new(Arc::clone(&driver.runtime));
-    // Packet §7.4 (R1): one non-signalling pass within the wall.
-    match route
-        .predecessors_resolved(&driver.spec.session_id, turn, cx.wall)
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => {
-            return rejected(AdapterError::Rejected {
-                reason: StartRejected::UncertainPredecessor,
-                evidence: TurnEvidence::no_launch(false),
-            });
-        }
-        Err(cause) => return unlaunched(cause),
-    }
-    // Packet §3: before each launch, no process; reported on every
-    // outcome from here.
-    let version = launch::read_version(&adapter.binary);
-    if let Some(version) = &version {
+    // Packet §3: reported on every outcome from here.
+    if let Some(version) = &staged.version {
         adapter
             .instances
             .record_version(HARNESS, &adapter.binary, version.clone());
     }
     let instance = InstanceReport {
-        version_status: plan::version_status(version.as_deref()),
-        vendor_version: version,
+        version_status: plan::version_status(staged.version.as_deref()),
+        vendor_version: staged.version.clone(),
     };
-    let mut end = launched(
-        driver,
-        adapter,
-        (spec, cx),
-        (route, instance.clone(), profile),
-    )
-    .await;
+    let route = PiRoute::new(Arc::clone(&driver.runtime));
+    // Packet §7.4 (R1): one non-signalling pass within the wall.
+    let mut end = match route
+        .predecessors_resolved(&driver.spec.session_id, turn, cx.wall)
+        .await
+    {
+        Ok(true) => {
+            launched(
+                driver,
+                adapter,
+                (spec, cx),
+                (route, instance.clone(), staged),
+            )
+            .await
+        }
+        Ok(false) => rejected(AdapterError::Rejected {
+            reason: StartRejected::UncertainPredecessor,
+            evidence: TurnEvidence::no_launch(false),
+        }),
+        Err(cause) => unlaunched(cause),
+    };
     end.instance.get_or_insert(instance);
     end
+}
+
+/// What the pre-launch filesystem step read and wrote (packet §2.1 step
+/// 1): the profile check's record, the version, and VIA's own launch
+/// state (§4.4).
+struct Staged {
+    /// `pi-profile.json`: the record of the check the launch passed.
+    profile: Vec<u8>,
+    version: Option<String>,
+    session_dir: PathBuf,
+    instructions: Option<PathBuf>,
+}
+
+/// Why the pre-launch filesystem step launches nothing.
+enum Unstaged {
+    /// Packet §4.3: the profile policy's VIA-owned reason.
+    Profile(String),
+    /// VIA's own launch state could not be written.
+    State,
+}
+
+/// The pre-launch filesystem step (packet §§2.1, 3, 4.3, 4.4): the
+/// profile policy (never cached), the version read and VIA's launch state,
+/// in that order. Blocking I/O, run off the async workers.
+fn staged(
+    vendor_state_dir: &Path,
+    binary: &Path,
+    session: &crate::SessionId,
+    instructions: Option<&str>,
+) -> Result<Staged, Unstaged> {
+    let profile = profile::check(&launch::agent_dir(vendor_state_dir), profile::daemon_uid())
+        .map_err(Unstaged::Profile)?
+        .record;
+    let version = launch::read_version(binary);
+    let (session_dir, instructions) =
+        launch::prepare(vendor_state_dir, session, instructions).map_err(|_| Unstaged::State)?;
+    Ok(Staged {
+        profile,
+        version,
+        session_dir,
+        instructions,
+    })
+}
+
+/// Runs [`staged`] on one blocking task the session's tracker owns, and
+/// ends the turn unlaunched if its stop, force, wall or the session's
+/// cancellation comes first (the task finishes on its own; nothing it
+/// wrote launches anything).
+async fn stage(
+    driver: &SessionDriver,
+    adapter: &PiAdapter,
+    (turn, signals): (crate::TurnNumber, (StopWatch, ForceWatch, Deadline)),
+) -> Result<Staged, Box<TurnEnd>> {
+    let task = {
+        let vendor_state_dir = adapter.vendor_state_dir.clone();
+        let binary = adapter.binary.clone();
+        let session = driver.spec.session_id.clone();
+        let instructions = driver.spec.instructions.clone();
+        driver.tracker.spawn_blocking(move || {
+            staged(
+                &vendor_state_dir,
+                &binary,
+                &session,
+                instructions.as_deref(),
+            )
+        })
+    };
+    let cause = {
+        let (stop, force, _) = &signals;
+        let (stop, force, cancel) = (stop.clone(), force.clone(), driver.cancel.clone());
+        move || ordered_cause(turn, (&stop, &force, &cancel))
+    };
+    let joined = tokio::select! {
+        joined = task => joined,
+        () = ordered(signals, driver.cancel.clone()) => {
+            return Err(Box::new(unlaunched(cause())));
+        }
+    };
+    match joined {
+        Ok(Ok(staged)) => Ok(staged),
+        Ok(Err(Unstaged::Profile(detail))) => {
+            Err(Box::new(unlaunched(RouteError::HandshakeRefused {
+                turn,
+                detail: Some(format!("the Pi profile policy refused: {detail}")),
+            })))
+        }
+        Ok(Err(Unstaged::State)) => Err(Box::new(unlaunched(RouteError::Store {
+            turn,
+            kind: StoreFailure::Evidence,
+        }))),
+        Err(_panicked) => {
+            driver.fail(DriverFailure::OwnedTask);
+            Err(Box::new(rejected(AdapterError::TaskFailed)))
+        }
+    }
+}
+
+/// The cause of a turn ordered to end before its launch: the daemon
+/// force, a stop (Core's, or the session's cancellation), else its wall.
+fn ordered_cause(
+    turn: crate::TurnNumber,
+    (stop, force, cancel): (&StopWatch, &ForceWatch, &CancellationToken),
+) -> RouteError {
+    if force.borrow().is_some() {
+        RouteError::ForceStopped { turn }
+    } else if stop.borrow().is_some() || cancel.is_cancelled() {
+        RouteError::Stopped { turn }
+    } else {
+        RouteError::Deadline { turn }
+    }
 }
 
 /// A failure before any launch, with no-launch evidence.
@@ -138,7 +236,7 @@ async fn launched(
     driver: &SessionDriver,
     adapter: &PiAdapter,
     (spec, cx): (TurnSpec, TurnCx),
-    (route, instance, profile): (PiRoute, InstanceReport, Vec<u8>),
+    (route, instance, staged): (PiRoute, InstanceReport, Staged),
 ) -> TurnEnd {
     let TurnCx {
         turn,
@@ -166,10 +264,7 @@ async fn launched(
         session,
         session_dir,
         recipe,
-    } = match launch(driver, adapter, &spec, turn) {
-        Ok(launch) => launch,
-        Err(end) => return *end,
-    };
+    } = launch(driver, adapter, &spec, (turn, &staged));
     process.capacity = capacity;
     let (steer, _unused) = via_routes::steer::steer_lane(str::len);
     let (close, close_rx) = watch::channel(None);
@@ -239,8 +334,9 @@ async fn launched(
     keep_records(
         driver,
         turn,
-        (&routed, &profile, delivery.normalizer.patch()),
-    );
+        (&routed, staged.profile, delivery.normalizer.patch()),
+    )
+    .await;
     ended.end(adapter, &delivery.normalizer, routed, &rest)
 }
 
@@ -251,32 +347,20 @@ struct Launch {
     expect: PiExpect,
     /// The Pi session ID launched with.
     session: String,
-    session_dir: std::path::PathBuf,
+    session_dir: PathBuf,
     recipe: String,
 }
 
-/// The launch of turn `turn` (packet §§2.2, 4): VIA's session directory
-/// and frozen instructions written first; `--session` the confirmed
-/// vendor ID, else `--session-id` the ID derived from the VIA session,
-/// never a new one after a failure.
+/// The launch of turn `turn` (packet §§2.2, 4) on the state [`staged`]
+/// wrote: `--session` the confirmed vendor ID, else `--session-id` the ID
+/// derived from the VIA session, never a new one after a failure.
 fn launch(
     driver: &SessionDriver,
     adapter: &PiAdapter,
     spec: &TurnSpec,
-    turn: crate::TurnNumber,
-) -> Result<Launch, Box<TurnEnd>> {
-    let Ok((session_dir, instructions)) = launch::prepare(
-        &adapter.vendor_state_dir,
-        &driver.spec.session_id,
-        driver.spec.instructions.as_deref(),
-    ) else {
-        // VIA's own state for the launch could not be written: nothing
-        // launches.
-        return Err(Box::new(unlaunched(RouteError::Store {
-            turn,
-            kind: StoreFailure::Evidence,
-        })));
-    };
+    (turn, staged): (crate::TurnNumber, &Staged),
+) -> Launch {
+    let session_dir = staged.session_dir.clone();
     let confirmed = driver.state().identity.clone();
     let resume = confirmed.is_some();
     let session = confirmed.unwrap_or_else(|| expected_session_id(&driver.spec.session_id));
@@ -291,7 +375,7 @@ fn launch(
             Continue::New(&session)
         },
         inherit,
-        instructions: instructions.as_deref(),
+        instructions: staged.instructions.as_deref(),
         vendor_args: driver.spec.vendor_args.as_slice(),
     };
     let owner = ProcessOwner::Turn {
@@ -311,13 +395,13 @@ fn launch(
         thinking: spec.effort.clone(),
         tools: TOOLS.iter().map(|tool| (*tool).to_owned()).collect(),
     };
-    Ok(Launch {
+    Launch {
         process,
         expect,
         session,
         session_dir,
         recipe: recipe_key(inherit, &driver.spec.vendor_args),
-    })
+    }
 }
 
 /// Q3, AD18: a value the route refuses rejects the turn before anything
@@ -372,11 +456,14 @@ fn start_rejected(refusal: Refusal) -> StartRejected {
 
 /// Packet §§4.3, 4.7: the turn's `pi-profile.json` (the record of the
 /// check its launch passed) and, once its handshake passed,
-/// `pi-inventory.json`, in the evidence folder its launch created. Best effort: a record that cannot be written is left out.
-fn keep_records(
+/// `pi-inventory.json`, in the evidence folder its launch created. Best
+/// effort, on a blocking task the session's tracker owns: a record that
+/// cannot be written, or is not written within [`CLEANUP_ALLOWANCE`], is
+/// left out of the turn's end.
+async fn keep_records(
     driver: &SessionDriver,
     turn: crate::TurnNumber,
-    (routed, profile, patch): (&PiTurn, &[u8], Option<&via_routes::pi::SystemPatch>),
+    (routed, profile, patch): (&PiTurn, Vec<u8>, Option<&via_routes::pi::SystemPatch>),
 ) {
     let launched = match &routed.outcome {
         Ok(_) => true,
@@ -388,11 +475,18 @@ fn keep_records(
     let folder = driver
         .runtime
         .turn_evidence_path(&driver.spec.session_id, turn);
-    write_record(&folder.join("pi-profile.json"), profile);
-    if let Some(facts) = &routed.handshake {
-        let record = normalize::inventory(patch, &facts.skills, &driver.spec.cwd);
-        write_record(&folder.join("pi-inventory.json"), &record);
-    }
+    let inventory = routed
+        .handshake
+        .as_ref()
+        .map(|facts| normalize::inventory(patch, &facts.skills, &driver.spec.cwd));
+    let written = driver.tracker.spawn_blocking(move || {
+        write_record(&folder.join("pi-profile.json"), &profile);
+        if let Some(record) = inventory {
+            write_record(&folder.join("pi-inventory.json"), &record);
+        }
+    });
+    // Best effort: the outcome never waits past the allowance.
+    drop(tokio::time::timeout(CLEANUP_ALLOWANCE, written).await);
 }
 
 /// Writes one new 0600 evidence record; an error leaves it out (the
