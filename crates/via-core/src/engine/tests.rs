@@ -8173,7 +8173,8 @@ fn plain_effective() -> crate::intake::Effective {
 /// replaces it, and a null one clears it. x.3.2 X5 (via-5lr.6):
 /// `check_turn` also carries the JSON string encodings' lengths of the
 /// cwd and of the turn's prompt, inline or read back from a prompt
-/// file's copy, escapes included.
+/// file's copy, escapes included. C2 gap A1: both also carry the
+/// instructions' JSON string encoding's length, quotes included.
 #[cfg(feature = "test-failpoints")]
 #[test]
 #[expect(
@@ -8202,8 +8203,10 @@ fn core_fills_param_sizes_on_spawn_and_resume() {
     .unwrap();
     run(async {
         let engine = open(&root);
+        // "be brief é" is 11 UTF-8 bytes, and 13 as a JSON string (A1).
         let planned = |instructions, output_schema| via_adapters::ParamSizes {
             instructions,
+            instructions_json: 13,
             output_schema,
             ..via_adapters::ParamSizes::default()
         };

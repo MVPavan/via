@@ -74,6 +74,9 @@ pub struct DescribeRequest {
 pub struct ParamSizes {
     /// The session's `instructions` text, in UTF-8 bytes.
     pub instructions: usize,
+    /// The session's `instructions` text, in bytes of its JSON string
+    /// encoding, quotes and escapes included; 0 when absent.
+    pub instructions_json: usize,
     /// The turn's `output_schema`, in bytes of its compact JSON encoding,
     /// as the turn's `TurnSpec` carries it.
     pub output_schema: usize,

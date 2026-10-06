@@ -466,11 +466,15 @@ pub(crate) fn vendor_args(raw: Option<&RawValue>) -> Result<VendorArgs, ApiError
 }
 
 /// The encoded sizes C2 §2 `ParamSizes` carries: the instructions' UTF-8
-/// bytes, and the schema's compact JSON bytes, as the turn's `TurnSpec`
-/// carries it; 0 for an absent one.
+/// bytes and their JSON string encoding's (quotes included), and the
+/// schema's compact JSON bytes, as the turn's `TurnSpec` carries it; 0 for
+/// an absent one.
 pub(crate) fn param_sizes(instructions: Option<&str>, schema: Option<&Value>) -> ParamSizes {
     ParamSizes {
         instructions: instructions.map_or(0, str::len),
+        instructions_json: instructions.map_or(0, |text| {
+            via_adapters::encoded_text_len(text).saturating_add(2)
+        }),
         // A `Value` always encodes: its keys are strings.
         output_schema: schema.map_or(0, |schema| {
             serde_json::to_string(schema).map_or(0, |text| text.len())
