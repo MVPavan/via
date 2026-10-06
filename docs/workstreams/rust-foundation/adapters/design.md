@@ -1465,20 +1465,23 @@ C1 change, not a routine addition.
      release. Infrastructure, auth or quota failure is a blocker, never a pass.
    - Each case ends `pass`, `fail`, `blocked` or `not_observable`, and only
      `pass` counts. `not_observable` means neither VIA nor the vendor gives
-     evidence for the case. The run passes when every case passes and every
-     daemon it started has stopped.
+     evidence for the case. The run passes when every case passes, every
+     daemon it started has stopped, the reported cost stayed under the cap
+     and every envelope reports the one vendor version being qualified.
    - MCP switches (owner, 2026-10-06): where VIA records no init inventory
      (Claude, via-7c6), the vendor's own MCP debug lines are the primary
-     evidence, written to a file of the runner's and counted by connected
-     server name. The case passes when `status`, warnings and argv match
-     the packet in all three modes and the debug lines agree: at least one
-     server on the unrestricted spawn and the same on its resume, none
-     with MCP off, and the restricted mode per the packet table. With no
-     server connected on the unrestricted spawn it is `not_observable`. Claude's runner
-     (via-kr9, 2026-10-06) takes `--via`, `--evidence` (a new directory
-     under `scratchpad/`), `--model` (default `haiku`), `--budget-usd` and
-     `--claude`. It writes `summary.json` and exits non-zero unless the run
-     passes (`docs/specs/vendors/claude-code.md` §4 has its first result).
+     evidence. The runner writes them to a file of its own, keeps only
+     server names and statuses, and deletes the raw file. The case passes
+     when `status`, warnings and argv match the packet in all three modes
+     and the connected servers agree by name: at least one on the
+     unrestricted spawn and the same on its resume, none with MCP off, and
+     the restricted mode per the packet table. With no server connected on
+     the unrestricted spawn it is `not_observable`.
+   - Claude's runner (via-kr9, 2026-10-06) takes `--via`, `--evidence` (a
+     new directory under `scratchpad/`), `--model` (default `haiku`),
+     `--budget-usd` (finite, above 0) and `--claude`. It writes
+     `summary.json` on every exit path and exits non-zero unless the run
+     passes (`docs/specs/vendors/claude-code.md` §4 has its result).
    - It runs before each adapter slice merges and when a vendor ships a new
      version.
 5. **Limits.** The gate proves:
