@@ -980,19 +980,14 @@ fn a_proof_not_committed_is_a_store_error() {
 }
 
 /// Bead via-itc, runtime §5.2: the check is bounded by the caller's
-/// deadline. A spent deadline reads nothing (`Deadline`); a Store read held
-/// past it ends at the deadline as a Store failure, never as resolved.
+/// deadline. A Store read held past it ends at the deadline as a Store
+/// failure, never as resolved. A spent deadline reads nothing (`Deadline`):
+/// the writer then serves only the probe read that follows.
 #[test]
 fn the_check_respects_its_deadline() {
     runtime().block_on(async {
         let fixture = Fixture::new().await;
         let host = fixture.host();
-        let spent = Deadline::at(tokio::time::Instant::now());
-        let failure = host
-            .session_predecessors_resolved(&session(), spent)
-            .await
-            .unwrap_err();
-        assert!(matches!(failure, HostError::Deadline), "{failure:?}");
         fixture.arm("store.read.stall", "pause");
         let started = tokio::time::Instant::now();
         let failure = host
@@ -1008,6 +1003,62 @@ fn the_check_respects_its_deadline() {
         assert!(fixture.acked("store.read.stall"));
         assert!(matches!(failure, HostError::Store(_)), "{failure:?}");
         assert!(elapsed < Duration::from_millis(1_500), "took {elapsed:?}");
+        let spent = Deadline::at(tokio::time::Instant::now());
+        let reads = fixture.store.read_count();
+        let failure = host
+            .session_predecessors_resolved(&session(), spent)
+            .await
+            .unwrap_err();
+        assert!(matches!(failure, HostError::Deadline), "{failure:?}");
+        // The writer serves reads in order: had the check sent one, it would
+        // be counted before this probe read's reply.
+        assert!(fixture.records().await.is_empty());
+        assert_eq!(fixture.store.read_count(), reads + 1, "the check read");
+    });
+}
+
+/// Critical review of via-itc (Important): `timeout_at` polls the read
+/// before its timer, so a reply that is ready when the checker resumes past
+/// its deadline must still be refused as a Store failure, never `Ok(true)`.
+/// The writer holds the check's read; this one-thread runtime is blocked
+/// past the deadline, so the checker cannot run; the read is released and a
+/// read queued behind it answered off the runtime, so the check's reply is
+/// ready before the checker is polled again.
+#[test]
+fn a_reply_ready_only_after_the_deadline_is_a_store_error() {
+    runtime().block_on(async {
+        let fixture = Fixture::new().await;
+        let host = fixture.host();
+        fixture.arm("store.read.stall", "pause");
+        let deadline = within(1);
+        let check = tokio::spawn({
+            let host = host.clone();
+            async move {
+                host.session_predecessors_resolved(&session(), deadline)
+                    .await
+            }
+        });
+        assert!(eventually(Duration::from_secs(5), || fixture.acked("store.read.stall")).await);
+        std::thread::sleep(
+            deadline
+                .instant()
+                .saturating_duration_since(tokio::time::Instant::now())
+                + Duration::from_millis(50),
+        );
+        fixture.release("store.read.stall");
+        let journal = fixture.journal();
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(journal.list_anchor_records_page(None, via_store::ANCHOR_PAGE_LIMIT))
+        })
+        .join()
+        .unwrap()
+        .unwrap();
+        let result = check.await.unwrap();
+        assert!(matches!(result, Err(HostError::Store(_))), "{result:?}");
     });
 }
 
