@@ -129,3 +129,9 @@ in the design record (`docs/`), not here.
   Briefs that allow load testing require the worker to stop every
   generator, confirm none remain with `pgrep`, and say so in its report
   (X5 flake hunt, 2026-10-05: 48 loops were still running after hand-back).
+- A merge commit and its push belong in one `&&` chain, after staging every
+  resolved conflict explicitly. In a script where commands follow one
+  another on separate lines, a failed `git commit` (files still unmerged)
+  does not stop the `git push` after it, which then publishes the previous
+  head (Codex and Claude fix merges, 2026-10-06: the Codex merge went out
+  ahead of the Claude merge's commit).
