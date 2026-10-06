@@ -232,6 +232,7 @@ fn undecoded_note(note: Option<&str>) -> String {
 pub mod claude;
 pub mod codex;
 mod fake;
+pub mod opencode;
 mod private;
 mod runtime;
 pub mod steer;
@@ -253,8 +254,8 @@ pub use via_wire::StoreError;
 pub use via_wire::failpoint;
 pub use via_wire::{
     CapacityToken, EnvAllowList, PrivateProcessSpec, ProcessOwner, ReprobeReport, RuntimeConfig,
-    RuntimeResources, SessionId, StderrCapture, WireCleanup, WireError, WireRecovery, WireShutdown,
-    WireTurnRecovery,
+    RuntimeResources, SessionId, StderrCapture, VersionProbe, WireCleanup, WireError, WireRecovery,
+    WireShutdown, WireTurnRecovery,
 };
 
 /// Internal hidden-anchor entrypoint forwarded through this architecture layer.

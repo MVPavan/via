@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use serde_json::Value;
 
+mod opencode;
 mod replay;
 
 const SCRIPT_ENV: &str = "VIA_FAKE_SCENARIO";
@@ -178,6 +179,7 @@ enum InputEvent {
 }
 
 fn main() {
+    opencode::run_if_selected();
     replay::run_if_selected();
     if env::args().nth(1).as_deref() == Some("--grandchild") {
         if let Err(error) = grandchild_main() {

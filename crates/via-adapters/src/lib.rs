@@ -191,6 +191,11 @@ mod fake;
 mod harness;
 mod instance;
 pub mod observation;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired into AdapterSet with the driver, chunk B")
+)]
+mod opencode;
 mod passthrough;
 mod plan;
 mod runtime;

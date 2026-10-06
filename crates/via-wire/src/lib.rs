@@ -207,6 +207,7 @@ pub enum WireCleanup {
 }
 
 mod connection;
+pub mod http;
 mod runtime;
 mod split;
 

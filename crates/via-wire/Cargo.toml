@@ -16,11 +16,12 @@ test-support = []
 [dependencies]
 via-host = { path = "../via-host" }
 via-store = { path = "../via-store" }
-tokio = { workspace = true, features = ["io-util", "sync", "time", "rt"] }
+# "net": the OpenCode loopback HTTP/SSE client (runtime §4).
+tokio = { workspace = true, features = ["io-util", "net", "sync", "time", "rt"] }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 
 [lints]
 workspace = true
