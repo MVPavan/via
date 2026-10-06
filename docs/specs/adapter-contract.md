@@ -499,7 +499,9 @@ connection retired.
 terminal is not an observation: it is retained in the turn's `TurnEnd`
 (§4.1). A running turn's own `warning` whose code is in C1 §5's closed list
 also puts that code, with VIA's own message, on the turn's envelope, once per
-code; any other code stays an event. A route raises a per-instance fact this
+code; any other code stays an event. Codes Core itself raises
+(`structured_output_invalid`, `observations_lost`, `vendor_passthrough`)
+are not taken from an adapter: such an observation stays an event. A route raises a per-instance fact this
 way on every turn it affects, as OpenCode's `credential_state_unchecked` on
 each turn of an unchecked server generation (OpenCode packet §4.3).
 
