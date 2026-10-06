@@ -163,6 +163,9 @@ pub(crate) struct Serving<'a, P: PrivateProtocol> {
     pub(crate) terminated: bool,
     /// The one interrupt's write.
     pub(crate) interrupt: Interrupt,
+    /// The wait, after the terminal, for the vendor's answer to the one
+    /// interrupt (picrit round 2, B).
+    pub(crate) answer: Answer,
     /// The pending interrupt write, kept pinned while other waits run.
     pub(crate) pending: Option<PendingWrite>,
     /// Decoded messages waiting for room on the hop.
@@ -193,6 +196,7 @@ impl<'a, P: PrivateProtocol> Serving<'a, P> {
             written: false,
             terminated: false,
             interrupt: Interrupt::NotSent,
+            answer: Answer::NotAwaited,
             pending: None,
             held: ReadAhead::new(),
             stall: None,
@@ -224,7 +228,10 @@ impl<'a, P: PrivateProtocol> Serving<'a, P> {
     }
 
     /// Awaits `op` while servicing every control, biased (design §9):
-    /// (1) daemon force; (2) turn deadline; (3) the connection latch;
+    /// (1) daemon force; (1a) while the turn awaits the interrupt's answer,
+    /// the current cutoff ([`Self::cutoff`], re-read every round, so a
+    /// shortened order applies at its next wake); (2) turn deadline; (3)
+    /// the connection latch;
     /// (4) the hop closed → `Overflow`; (5) Route's wake → [`Self::on_wake`];
     /// (6) the pending interrupt completing; (7) the protocol's own control
     /// events; (8) room on the hop, which sends the oldest held message;
@@ -353,9 +360,14 @@ impl<'a, P: PrivateProtocol> Serving<'a, P> {
         let turn = self.turn;
         let hop = self.hop.items();
         let has_event = self.lane.has_event();
+        let cutoff = (self.answer == Answer::Awaited).then(|| self.cutoff().0.instant());
         tokio::select! {
             biased;
             () = forced(&mut self.signals.force) => Err(RouteError::ForceStopped { turn }.into()),
+            () = until(cutoff), if cutoff.is_some() => {
+                self.answer = Answer::Cut;
+                Err(self.interrupted())
+            }
             () = tokio::time::sleep_until(self.deadline.instant()) => {
                 Err(RouteError::Deadline { turn }.into())
             }
@@ -470,6 +482,50 @@ impl<'a, P: PrivateProtocol> Serving<'a, P> {
         Ok(())
     }
 
+    /// The bound on a wait for the vendor's answer to the one interrupt,
+    /// with the close's bound once it passes unanswered: Core's stop
+    /// order's `force_at` and `close_by`, else the Adapter's stall's
+    /// ([`Stall`]), else the wall with none; never past the wall.
+    pub(crate) fn cutoff(&self) -> (Deadline, Option<Deadline>) {
+        let order = self
+            .signals
+            .stop
+            .borrow()
+            .as_ref()
+            .map(|order| (order.force_at, order.close_by));
+        let (force_at, close_by) = match (order, self.stall) {
+            (Some((force_at, close_by)), _) => (force_at, Some(close_by)),
+            (None, Some(stall)) => (stall.force_at, Some(stall.close_by)),
+            (None, None) => (self.deadline, None),
+        };
+        let bound = force_at.instant().min(self.deadline.instant());
+        (Deadline::at(bound), close_by)
+    }
+
+    /// The turn ended by the one interrupt's order without the vendor's
+    /// answer: the current stop order (`Stopped` under its `close_by`),
+    /// else the Adapter's stall (`Overflow` under its `close_by`), else
+    /// `Stopped` under the cleanup allowance; never past the turn's one
+    /// cutoff, the wall plus the allowance.
+    pub(crate) fn interrupted(&self) -> Failed {
+        let close_by = self
+            .signals
+            .stop
+            .borrow()
+            .as_ref()
+            .map(|order| order.close_by);
+        let mut failed = match (close_by, self.stall) {
+            (Some(close_by), _) => Failed::stopped(self.turn, close_by),
+            (None, Some(_)) => self.stall_force(),
+            (None, None) => Failed::stopped(self.turn, cleanup_deadline()),
+        };
+        let cap = self.deadline.instant() + CLEANUP_ALLOWANCE;
+        failed.close_by = failed
+            .close_by
+            .map(|close_by| Deadline::at(close_by.instant().min(cap)));
+        failed
+    }
+
     /// The stall's `force_at` passed without a terminal: `Overflow`, the
     /// group force-closed under the stall's `close_by`.
     fn stall_force(&self) -> Failed {
@@ -481,7 +537,9 @@ impl<'a, P: PrivateProtocol> Serving<'a, P> {
     }
 
     /// Acts on a wake (design §2 rules 2 to 4): the daemon force wins;
-    /// after the terminal nothing else acts; before submission, or at
+    /// after the terminal nothing else acts here (a wait for the
+    /// interrupt's answer re-reads the orders in [`Self::serve_once`]'s
+    /// cutoff arm, the wake having ended its round); before submission, or at
     /// `force_at`, the group is force-closed under `close_by`; otherwise the
     /// first order enqueues the one interrupt. It never waits.
     fn on_wake(&mut self) -> Result<(), Failed> {
@@ -639,6 +697,27 @@ pub(super) async fn wake_on_order(mut stop: StopWatch, wake: &watch::Sender<u64>
         } else if stop.changed().await.is_err() {
             std::future::pending::<()>().await;
         }
+    }
+}
+
+/// The wait for the vendor's answer to the one interrupt after the
+/// terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Answer {
+    /// No such wait.
+    NotAwaited,
+    /// Waiting: [`Serving::cutoff`], read afresh each round of
+    /// [`Serving::serve_once`], ends it.
+    Awaited,
+    /// The cutoff ended it unanswered.
+    Cut,
+}
+
+/// Resolves at `at`; never without one.
+async fn until(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
     }
 }
 

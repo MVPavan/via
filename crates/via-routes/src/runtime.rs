@@ -22,6 +22,21 @@ impl RouteRuntime {
         Ok(Self { wire })
     }
 
+    /// `<state>/vendor/` (x.3.2 X0 item 4): the managed vendor state a
+    /// per-turn route keeps beside its sessions (Pi packet §4.4).
+    pub fn vendor_state_dir(&self) -> &std::path::Path {
+        self.wire.vendor_state_dir()
+    }
+
+    /// The evidence folder a turn's launch creates; no I/O.
+    pub fn turn_evidence_path(
+        &self,
+        session: &crate::SessionId,
+        turn: crate::TurnNumber,
+    ) -> std::path::PathBuf {
+        self.wire.turn_evidence_path(session, turn)
+    }
+
     /// Wire's runtime, which opens each route's connections.
     pub(crate) fn wire(&self) -> &WireRuntime {
         &self.wire

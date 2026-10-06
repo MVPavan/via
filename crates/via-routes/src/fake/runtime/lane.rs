@@ -439,7 +439,7 @@ impl Serving<'_, LaneState> {
         };
         self.lane.facts.handshake = Some(handshake.clone());
         if missing {
-            self.lane.facts.cause = Some(RouteError::HandshakeRefused { turn });
+            self.lane.facts.cause = Some(RouteError::HandshakeRefused { turn, detail: None });
             return Err(protocol(turn, "fake handshake refused").into());
         }
         if uncatalogued {

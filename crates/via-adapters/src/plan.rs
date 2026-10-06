@@ -23,6 +23,7 @@ use crate::fake::FakeAdapter;
 use crate::harness::{FAKE, HARNESSES, Harness};
 use crate::instance::{InstanceCache, resolve_binary};
 use crate::passthrough::VendorArgs;
+use crate::pi::{self, PiAdapter};
 use crate::{AdapterError, RuntimeConfig, RuntimeResources};
 
 /// A C1 §4 `bound`.
@@ -669,6 +670,8 @@ pub(crate) enum Adapter<'a> {
     Claude(&'a Arc<ClaudeAdapter>),
     /// Codex (`codex-app-server`).
     Codex(&'a Arc<CodexAdapter>),
+    /// Pi (`pi-rpc`).
+    Pi(&'a Arc<PiAdapter>),
 }
 
 impl<'a> Adapter<'a> {
@@ -678,6 +681,7 @@ impl<'a> Adapter<'a> {
             Self::Fake(_) => FAKE,
             Self::Claude(_) => claude::HARNESS,
             Self::Codex(_) => codex::HARNESS,
+            Self::Pi(_) => pi::HARNESS,
         }
     }
 
@@ -687,6 +691,7 @@ impl<'a> Adapter<'a> {
         match self {
             Self::Fake(fake) => Cow::Borrowed(fake.catalog()),
             Self::Claude(claude) => Cow::Borrowed(claude.catalog()),
+            Self::Pi(pi) => Cow::Borrowed(pi.catalog()),
             Self::Codex(codex) => Cow::Owned(
                 Harness::parse(codex::HARNESS)
                     .map(|harness| codex.listed(config.inherit(harness)))
@@ -698,7 +703,7 @@ impl<'a> Adapter<'a> {
     /// Where its catalog comes from (C1 §3.13 `source`).
     fn source(self) -> ModelSource {
         match self {
-            Self::Fake(_) | Self::Claude(_) => ModelSource::Bundled,
+            Self::Fake(_) | Self::Claude(_) | Self::Pi(_) => ModelSource::Bundled,
             Self::Codex(_) => ModelSource::Discovered,
         }
     }
@@ -708,6 +713,7 @@ impl<'a> Adapter<'a> {
         match self {
             Self::Fake(fake) => DriverKind::Fake(Arc::clone(fake)),
             Self::Claude(claude) => DriverKind::Claude(Arc::clone(claude)),
+            Self::Pi(pi) => DriverKind::Pi(Arc::clone(pi)),
             Self::Codex(codex) => {
                 DriverKind::Codex(Arc::new(codex::CodexSession::new(Arc::clone(codex))))
             }
@@ -722,6 +728,7 @@ pub struct AdapterSet {
     pub(crate) fake: Option<Arc<FakeAdapter>>,
     pub(crate) claude: Option<Arc<ClaudeAdapter>>,
     pub(crate) codex: Option<Arc<CodexAdapter>>,
+    pub(crate) pi: Option<Arc<PiAdapter>>,
     /// The rest of the start-time configuration (design §5.4).
     config: AdapterConfig,
     /// The Route runtime: Wire and Host, which own every connection.
@@ -777,12 +784,21 @@ impl AdapterSet {
                 Arc::clone(&runtime),
             ))
         });
+        let pi = binary(pi::HARNESS).map(|binary| {
+            Arc::new(PiAdapter::new(
+                binary,
+                Arc::clone(&instances),
+                config.env(),
+                runtime.vendor_state_dir().to_path_buf(),
+            ))
+        });
         Ok(Self {
             fake: config
                 .take_fake()
                 .map(|fixture| Arc::new(FakeAdapter::new(fixture))),
             claude,
             codex,
+            pi,
             config,
             runtime,
             #[cfg(feature = "test-failpoints")]
@@ -799,6 +815,7 @@ impl AdapterSet {
             Harness::Vendor(row) => match row.name {
                 claude::HARNESS => self.claude.as_ref().map(Adapter::Claude),
                 codex::HARNESS => self.codex.as_ref().map(Adapter::Codex),
+                pi::HARNESS => self.pi.as_ref().map(Adapter::Pi),
                 // No adapter serves this harness in this build.
                 _ => None,
             },
@@ -810,6 +827,7 @@ impl AdapterSet {
         [
             self.claude.as_ref().map(Adapter::Claude),
             self.codex.as_ref().map(Adapter::Codex),
+            self.pi.as_ref().map(Adapter::Pi),
             self.fake.as_ref().map(Adapter::Fake),
         ]
         .into_iter()
@@ -908,6 +926,13 @@ impl AdapterSet {
             Some(Adapter::Codex(codex)) => {
                 return codex.plan(harness, req, self.config.inherit(harness));
             }
+            Some(Adapter::Pi(pi)) => {
+                let model = ModelChoice {
+                    requested: req.model.clone(),
+                    resolved: pi.resolve(req.model.as_deref()),
+                };
+                return Ok(pi.plan(harness, req, model, self.config.inherit(harness)));
+            }
             None => {
                 return Err(unavailable(Some(route)));
             }
@@ -958,6 +983,17 @@ impl AdapterSet {
             }
             Some(Adapter::Codex(codex)) => {
                 return codex.check_turn(route, &session.adapter_version, turn);
+            }
+            Some(Adapter::Pi(pi)) => {
+                PiAdapter::check_version(route, &session.adapter_version)?;
+                return match pi.check_turn(route, turn).into_iter().next() {
+                    Some(refusal) => Err(refusal),
+                    // The route applies no bound (packet §6): a bound is
+                    // refused above.
+                    None => Ok(TurnCheck {
+                        effective_bound: turn.bound.clone(),
+                    }),
+                };
             }
             None => {
                 return Err(unavailable(Some(route)));
@@ -1074,6 +1110,7 @@ mod tests {
         for (name, route) in [
             (crate::claude::HARNESS, "claude-cli"),
             (crate::codex::HARNESS, "codex-app-server"),
+            (crate::pi::HARNESS, "pi-rpc"),
         ] {
             assert_eq!(Harness::parse(name).map(Harness::route), Some(route));
         }

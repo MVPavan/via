@@ -147,7 +147,7 @@ pub(crate) async fn run_turn(
         &mut delivery,
         &driver.observations,
         &activity,
-        (force, cutoff),
+        (force, tokio::time::sleep_until(cutoff.instant())),
         &driver.health,
     )
     .await;
@@ -511,6 +511,7 @@ impl Delivery<'_> {
         if forced && self.verdict.is_some() {
             return TurnEnd {
                 loss: None,
+                aggregate: None,
                 terminal: self.terminal.map(|terminal| *terminal),
                 instance,
                 leftovers: None,
@@ -573,6 +574,7 @@ impl Delivery<'_> {
         };
         TurnEnd {
             loss: None,
+            aggregate: None,
             terminal: terminal.map(|terminal| *terminal),
             instance,
             leftovers: None,

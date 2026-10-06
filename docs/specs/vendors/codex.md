@@ -740,6 +740,30 @@ of `last` values equalled the change in `total` (c1: 20522 + 20613), so the
 turn's usage has `scope:"turn"`. `total`, `cacheWriteInputTokens` and
 `modelContextWindow` go to `vendor`. Missing data is unavailable, not zero.
 Cost remains `usd:null, provenance:"unavailable"`; no price estimation.
+Codex reports no turn aggregate (`total` is the thread's), so the sum is the
+turn's usage only when it is provably whole: the turn retained its terminal
+and no daemon force dropped it; the connection did not fail before the
+cutoff and the lane never overflowed; the turn's delivery was neither cut
+mid-message nor stopped; and, unless delivery decided at the terminal,
+nothing was dropped, left in the lane or outstanding at the cutoff and the
+registration did not fail. Nothing the turn's accounting covered may
+have been lost in the connection's read order: if the connection's
+routing rejected a message (undecodable, uncorrelated or otherwise
+refused), delivery decided and the first rejected message comes after the
+last message the turn's delivery took before its seal, which is the
+terminal, or what closed an interrupted terminal's P7 window. A rejection
+fails the connection, yet its drain still routes what Wire admitted
+behind it, so a terminal, or a P7-closing tool end, can follow a lost
+sample: the turn keeps its status and answer, not its sum. Any cut but a
+decided delivery (the P7 bound, a detach, an order, the force) after a
+rejection is unaccounted too: delivery never reached the turn's natural
+end. Anything else (an uncorrelated or malformed message failing the
+connection, a connection loss, a stall while an interrupted terminal
+drains, an overflow) gives the all-`null` aggregate, on the retained terminal or on `TurnEnd.aggregate` (C2 §5): a lost
+connection can have lost a sample, so its delivered sum is unverified. A
+cancelled or interrupted turn whose terminal was retained and whose
+delivery was whole is still summed; an end before acceptance carries no
+aggregate.
 
 Target capability after the corresponding fixture/live gates: spawn,
 stored-conversation resume, cancel and detach-close native; steer
@@ -768,6 +792,9 @@ time; retain raw-span evidence for every scenario.
 | `codex_control_races` | Interrupt during pending start; terminal-before-interrupt; ack missing; close/detach; all return by deadline with truthful evidence and no resend. |
 | `codex_bounds_overflow` | Exact boundary/excess messages, JSON depth/nodes and item ledger. Fill A's Route ingress lane then send one extra A event: observe immediate per-thread overflow/quarantine, original correlation and no spill allocation. Before advancing fake time to 10 s, deliver B's terminal and a control response; both must complete. Repeat with old A already immutable/uncertain and successor A2 active: old A's late tool flood triggers sticky loss for A2, A2 resolves before its wall deadline, A stays immutable, same-thread dispatch closes and B/control progress. Race A2 acceptance with quarantine and assert the same outcome. Separately fill only C2 observations with no further ingress: no early Route overflow, C2 stalls at 10 s. Continued A flood is read, counted and discarded within bounds, with the normalized loss explicit and no copy of the discarded traffic. Exhaust reserved metadata/health or global budget separately and assert explicit shared-connection failure; measure memory and blast radius. |
 | `codex_usage_snapshot` | Keyless `last` samples sum to the turn's usage (20522 + 20613), scope `turn`; `total` and cache-write counts go to `vendor`; wrong-turn usage does not attach; missing cost/counts stay unavailable. |
+| `codex_overflow_before_the_second_sample` | One sample delivered, then the lane overflows before the second: `overflow`, all-`null` tokens, never the first sample's 100. |
+| `codex_uncorrelated_usage_fails_the_connection` | A delivered sample, then a `thread/tokenUsage/updated` with no `turnId` fails the connection: `protocol`, all-`null` tokens, never the delivered 100. The consumer test `a_sample_lost_while_draining_unaccounts_the_turn` covers a sample stalled while an interrupted terminal drains. |
+| `codex_terminal_after_a_rejected_sample` | A delivered sample, then one burst of a sample with no `turnId` and the valid `turn/completed`: the drain routes the terminal, which is retained with its answer, but the tokens are all-`null`. Its control `codex_rejected_sample_after_the_terminal` (the terminal first in the burst) keeps the delivered 100. `codex_p7_end_after_a_rejected_sample`: an interrupted terminal retained with a tool open, then one burst of a sample with no `turnId` and the tool's end, which closes P7 → all-`null` tokens; its control `codex_rejected_sample_after_the_p7_end` (the tool's end first) keeps 100. `codex_p7_bound_after_a_rejected_sample`: the same interrupted terminal, then a rejected sample and no tool end; the wall caps P7 (`Grace`) with the lane still open → all-`null` tokens (the consumer test `a_rejection_during_p7_unaccounts_an_undecided_cut` covers `Grace` and `Detach`). |
 | `codex_server_close` | Idle retirement closes stdin, then S1's hard stop; a C1 close of one session only unsubscribes and never closes stdin; both give `leftovers: null`. |
 | `codex_server_recovery` | Stdin EOF/server crash affects all live leases; lease release alone does not kill; verified Host group evidence is separate from unknown submission; restart issues no start/resume for uncertain live turns. |
 

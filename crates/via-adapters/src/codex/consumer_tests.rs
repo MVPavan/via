@@ -1444,6 +1444,7 @@ async fn r1_4_a_malformed_message_is_named_by_the_failure() {
     );
     let reported = |detail| TurnEnd {
         loss: None,
+        aggregate: None,
         terminal: None,
         instance: None,
         leftovers: None,
@@ -1724,6 +1725,107 @@ fn r1_5_one_stall_deadline_covers_a_message() {
         );
         drop(full);
     });
+}
+
+/// Vendor turn `named`'s per-call usage sample of `tokens` input tokens.
+#[cfg(feature = "test-failpoints")]
+fn token_usage(named: &str, tokens: u64) -> Value {
+    let last = json!({"totalTokens": tokens, "inputTokens": tokens, "cachedInputTokens": 0,
+        "outputTokens": 0, "reasoningOutputTokens": 0});
+    json!({"method": "thread/tokenUsage/updated", "params": {"threadId": THREAD,
+        "turnId": named, "tokenUsage": {"total": last, "last": last}}})
+}
+
+/// C2 §5 (picrit round 4): a usage sample lost while an interrupted
+/// terminal drains leaves the turn unaccounted. B delivers a 100-token
+/// sample, then its interrupted terminal is retained with a tool open;
+/// a second sample read while it drains stalls in the full sink (stall
+/// 400 ms), so the registration fails and the seal is partial. The
+/// retained terminal does not make the delivered sum the turn's: the
+/// predicate is false. Before the fix the retained terminal exempted the
+/// partial delivery.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_sample_lost_while_draining_unaccounts_the_turn() {
+    const NAME: &str =
+        "codex::delivery::consumer_tests::a_sample_lost_while_draining_unaccounts_the_turn";
+    if std::env::var_os("VIA_TEST_EVENT_STALL_MS").is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture"])
+            .env("VIA_TEST_EVENT_STALL_MS", "400")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let mut fixture = Fixture::new();
+        let b = fixture.start(2);
+        fixture.reply(2, Some(B));
+        fixture.push(message(&token_usage(B, 100), 5, (Some(B), Some(2))));
+        fixture.push(message(&tool_started(B, "tool-b"), 6, (Some(B), Some(2))));
+        fixture.push(message(&completed(B, "interrupted"), 7, (Some(B), Some(2))));
+        fixture.settle().await;
+        assert!(b.delivery.draining().is_some(), "the terminal drains");
+        fixture.observed();
+        let full = fixture.cap.fill_budget().unwrap();
+        fixture.push(message(&token_usage(B, 50), 8, (Some(B), Some(2))));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while fixture.registration.failure().is_none() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let sealed = b.delivery.seal();
+        assert!(sealed.terminal.is_some(), "the terminal stays retained");
+        assert!(
+            !super::super::driver::accounted(
+                super::super::driver::Cut::Decided,
+                &sealed,
+                (&fixture.lane, &fixture.registration),
+                None,
+            ),
+            "a lost sample left the delivered sum standing as the turn's usage"
+        );
+        drop(full);
+    });
+}
+
+/// C2 §5 (picrit round 7): a rejection after the last message the turn's
+/// delivery took is exempt only when delivery decided. B's interrupted
+/// terminal (6) drains with its tool open; the connection then rejected
+/// message 7. Cut at the P7 bound (`Grace`) or by a close (`Detach`), the
+/// delivery never finished, so the sum is unaccounted; with no rejection
+/// the same seal is accounted, and a decided delivery keeps the
+/// exemption. Before the fix `Grace` and `Detach` were accounted too.
+#[tokio::test]
+async fn a_rejection_during_p7_unaccounts_an_undecided_cut() {
+    use super::super::driver::{Cut, accounted};
+    let fixture = Fixture::new();
+    let b = fixture.start(2);
+    fixture.reply(2, Some(B));
+    fixture.push(message(&tool_started(B, "tool-b"), 5, (Some(B), Some(2))));
+    fixture.push(message(&completed(B, "interrupted"), 6, (Some(B), Some(2))));
+    fixture.settle().await;
+    assert!(b.delivery.draining().is_some(), "the terminal drains");
+    let sealed = b.delivery.seal();
+    assert!(sealed.terminal.is_some() && !sealed.partial);
+    assert_eq!(sealed.last_seq, 6);
+    let rest = (&*fixture.lane, &*fixture.registration);
+    for cut in [Cut::Grace, Cut::Detach] {
+        assert!(accounted(cut, &sealed, rest, None), "{cut:?}: whole");
+        assert!(
+            !accounted(cut, &sealed, rest, Some(7)),
+            "{cut:?}: a rejection while P7 accounted left the sum standing"
+        );
+    }
+    assert!(accounted(Cut::Decided, &sealed, rest, Some(7)));
+    assert!(!accounted(Cut::Decided, &sealed, rest, Some(6)));
 }
 
 /// A message of B's, mapped, read now: the item and its read instant.

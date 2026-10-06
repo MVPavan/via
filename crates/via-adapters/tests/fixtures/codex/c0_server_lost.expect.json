@@ -48,7 +48,15 @@
         "rejected": null,
         "accepted": true,
         "terminal": null,
-        "usage": null,
+        "usage": {
+          "from": "terminal",
+          "input_tokens": null,
+          "cached_input_tokens": null,
+          "output_tokens": null,
+          "reasoning_output_tokens": null,
+          "total_tokens": null,
+          "scope": "turn"
+        },
         "final_text": null,
         "error": "server_lost",
         "cleanup": "quiescent",
@@ -98,7 +106,7 @@
             "why": "S-LEFTOVER (via-jm4.28) owns every leftover-report assertion (C2 §4.2)"
           }
         ],
-        "notes": "The server process exits after the tool started, with no terminal: Host confirms the death, so Err(ServerLost) -> failed(server_lost), never resent (C2 §4.1 Persistent-server routes with no terminal). Cleanup follows the Server close or crash row: GroupAbsent for the server's own group (C2 §2 Interrupt table). The leftover report belongs to S-LEFTOVER and is not asserted here (C2 §4.2). Server-route evidence (C2 §2 AdapterError row): exit is null and cleanup is the turn's reported tool items, quiescent when none was reported; after a server crash cleanup is GroupAbsent for the server's group."
+        "notes": "The server process exits after the tool started, with no terminal: Host confirms the death, so Err(ServerLost) -> failed(server_lost), never resent (C2 §4.1 Persistent-server routes with no terminal). Cleanup follows the Server close or crash row: GroupAbsent for the server's own group (C2 §2 Interrupt table). The leftover report belongs to S-LEFTOVER and is not asserted here (C2 §4.2). Server-route evidence (C2 §2 AdapterError row): exit is null and cleanup is the turn's reported tool items, quiescent when none was reported; after a server crash cleanup is GroupAbsent for the server's group. Usage: the connection was lost before any terminal, so a sum of delivered samples would be unverified: the all-null aggregate (C2 §5)."
       }
     }
   ]

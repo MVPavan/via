@@ -1,0 +1,313 @@
+{
+  "harness": "pi",
+  "launch_checkpoints": {
+    "after_open": {
+      "main": 0
+    },
+    "after_pure": 0,
+    "after_turn": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ]
+  },
+  "launches": 5,
+  "pure_writes": [],
+  "sessions": {
+    "main": {
+      "close": null,
+      "cwd": "/work/project",
+      "instructions": null,
+      "model": "openai/gpt-6-luna",
+      "resume": null
+    }
+  },
+  "source": "synthetic (via-jt8.3.1): packet §2.2",
+  "turns": [
+    {
+      "expect": {
+        "accepted": false,
+        "cleanup": "quiescent",
+        "error": null,
+        "exit": {
+          "code": 0,
+          "signal": null
+        },
+        "final_text": null,
+        "group_absent": true,
+        "journal_uncertain": false,
+        "notes": "A definite rejection leaves no session file (E29): never confirmed, so turn 2 still creates with --session-id.",
+        "observation_counts": {
+          "turn.accepted": 0
+        },
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "final_text"
+        ],
+        "plan_refusal": null,
+        "rejected": "vendor_error",
+        "terminal": null
+      },
+      "params": {
+        "bound": null,
+        "effort": null,
+        "max_steps": null,
+        "output_schema": null,
+        "prompt": "One."
+      },
+      "session": "main",
+      "start_after": null,
+      "steer": [],
+      "stop": null,
+      "tool_grace_ms": null
+    },
+    {
+      "expect": {
+        "accepted": true,
+        "cleanup": "quiescent",
+        "error": null,
+        "exit": {
+          "code": 0,
+          "signal": null
+        },
+        "final_text": [
+          "TWO"
+        ],
+        "group_absent": true,
+        "journal_uncertain": false,
+        "observation_counts": {
+          "session.vendor_identity_confirmed": 1,
+          "turn.accepted": 1
+        },
+        "observations_include": [
+          {
+            "generation": 1,
+            "kind": "session.vendor_identity_confirmed",
+            "vendor_session_id": "187d2602-5d80-45de-a2b2-2080d91eb589"
+          },
+          "turn.accepted"
+        ],
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
+        ],
+        "plan_refusal": null,
+        "rejected": null,
+        "terminal": {
+          "class_hint": null,
+          "cost": {
+            "provenance": "estimated",
+            "scope": "turn",
+            "usd": 0.5
+          },
+          "status": "completed",
+          "stop_reason": "end_turn",
+          "vendor_stop_reason": "stop"
+        },
+        "usage": {
+          "cached_input_tokens": 20,
+          "from": "samples",
+          "input_tokens": 100,
+          "output_tokens": 10,
+          "reasoning_output_tokens": 0,
+          "scope": "turn",
+          "total_tokens": 110
+        },
+        "warnings": [
+          "config_switch_unverified"
+        ]
+      },
+      "params": {
+        "bound": null,
+        "effort": null,
+        "max_steps": null,
+        "output_schema": null,
+        "prompt": "Two."
+      },
+      "session": "main",
+      "start_after": null,
+      "steer": [],
+      "stop": null,
+      "tool_grace_ms": null
+    },
+    {
+      "expect": {
+        "accepted": true,
+        "cleanup": "quiescent",
+        "error": null,
+        "exit": {
+          "code": 0,
+          "signal": null
+        },
+        "final_text": [
+          "THREE"
+        ],
+        "group_absent": true,
+        "journal_uncertain": false,
+        "observation_counts": {
+          "session.vendor_identity_confirmed": 1,
+          "turn.accepted": 1
+        },
+        "observations_include": [
+          {
+            "generation": 2,
+            "kind": "session.vendor_identity_confirmed",
+            "vendor_session_id": "187d2602-5d80-45de-a2b2-2080d91eb589"
+          },
+          "turn.accepted"
+        ],
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
+        ],
+        "plan_refusal": null,
+        "rejected": null,
+        "terminal": {
+          "class_hint": null,
+          "cost": {
+            "provenance": "estimated",
+            "scope": "turn",
+            "usd": 0.5
+          },
+          "status": "completed",
+          "stop_reason": "end_turn",
+          "vendor_stop_reason": "stop"
+        },
+        "usage": {
+          "cached_input_tokens": 20,
+          "from": "samples",
+          "input_tokens": 100,
+          "output_tokens": 10,
+          "reasoning_output_tokens": 0,
+          "scope": "turn",
+          "total_tokens": 110
+        },
+        "warnings": [
+          "config_switch_unverified"
+        ]
+      },
+      "params": {
+        "bound": null,
+        "effort": null,
+        "max_steps": null,
+        "output_schema": null,
+        "prompt": "Three."
+      },
+      "session": "main",
+      "start_after": null,
+      "steer": [],
+      "stop": null,
+      "tool_grace_ms": null
+    },
+    {
+      "expect": {
+        "accepted": false,
+        "cleanup": "quiescent",
+        "error": null,
+        "exit": {
+          "code": 1,
+          "signal": null
+        },
+        "final_text": null,
+        "group_absent": true,
+        "journal_uncertain": false,
+        "notes": "Once confirmed, --session never creates: a missing file exits before RPC (E12), the startup rejection; turn 5 still continues.",
+        "observation_counts": {
+          "turn.accepted": 0
+        },
+        "observations_exclude": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted",
+          "final_text"
+        ],
+        "plan_refusal": null,
+        "rejected": "protocol",
+        "terminal": null
+      },
+      "params": {
+        "bound": null,
+        "effort": null,
+        "max_steps": null,
+        "output_schema": null,
+        "prompt": "Four."
+      },
+      "session": "main",
+      "start_after": null,
+      "steer": [],
+      "stop": null,
+      "tool_grace_ms": null
+    },
+    {
+      "expect": {
+        "accepted": true,
+        "cleanup": "quiescent",
+        "error": null,
+        "exit": {
+          "code": 0,
+          "signal": null
+        },
+        "final_text": [
+          "FIVE"
+        ],
+        "group_absent": true,
+        "journal_uncertain": false,
+        "observation_counts": {
+          "session.vendor_identity_confirmed": 1,
+          "turn.accepted": 1
+        },
+        "observations_include": [
+          {
+            "generation": 3,
+            "kind": "session.vendor_identity_confirmed",
+            "vendor_session_id": "187d2602-5d80-45de-a2b2-2080d91eb589"
+          },
+          "turn.accepted"
+        ],
+        "observations_order": [
+          "session.vendor_identity_confirmed",
+          "turn.accepted"
+        ],
+        "plan_refusal": null,
+        "rejected": null,
+        "terminal": {
+          "class_hint": null,
+          "cost": {
+            "provenance": "estimated",
+            "scope": "turn",
+            "usd": 0.5
+          },
+          "status": "completed",
+          "stop_reason": "end_turn",
+          "vendor_stop_reason": "stop"
+        },
+        "usage": {
+          "cached_input_tokens": 20,
+          "from": "samples",
+          "input_tokens": 100,
+          "output_tokens": 10,
+          "reasoning_output_tokens": 0,
+          "scope": "turn",
+          "total_tokens": 110
+        },
+        "warnings": [
+          "config_switch_unverified"
+        ]
+      },
+      "params": {
+        "bound": null,
+        "effort": null,
+        "max_steps": null,
+        "output_schema": null,
+        "prompt": "Five."
+      },
+      "session": "main",
+      "start_after": null,
+      "steer": [],
+      "stop": null,
+      "tool_grace_ms": null
+    }
+  ]
+}

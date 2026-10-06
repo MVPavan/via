@@ -17,7 +17,9 @@ use tokio_util::sync::CancellationToken;
 use super::{DriverState, ForceWatch, latch, lock};
 use crate::observation::{ObservationItem, ObservationSink, Undelivered};
 use crate::runtime::event_stall;
-use crate::{Deadline, DriverFailure, DriverHealth, StopCause, StopOrder, StopWatch};
+use crate::{
+    Deadline, DriverFailure, DriverHealth, StopCause, StopOrder, StopWatch, TurnEnd, UsageSample,
+};
 
 /// A harness's normalizer as the delivery loop drives it (C2 §4): it turns
 /// one of its route's messages into observations, and learns whether their
@@ -68,7 +70,19 @@ impl Drop for Abandonment<'_> {
 /// daemon force, its wall, or the session's cancellation, which a driver
 /// close includes.
 pub(crate) async fn ordered(
-    (mut stop, mut force, wall): (StopWatch, ForceWatch, Deadline),
+    (stop, force, wall): (StopWatch, ForceWatch, Deadline),
+    cancel: CancellationToken,
+) {
+    tokio::select! {
+        () = controls((stop, force), cancel) => {}
+        () = tokio::time::sleep_until(wall.instant()) => {}
+    }
+}
+
+/// [`ordered`] without the wall: a stop, the daemon force or the session's
+/// cancellation.
+pub(crate) async fn controls(
+    (mut stop, mut force): (StopWatch, ForceWatch),
     cancel: CancellationToken,
 ) {
     let stopped = async {
@@ -84,8 +98,30 @@ pub(crate) async fn ordered(
     tokio::select! {
         () = stopped => {}
         () = forced => {}
-        () = tokio::time::sleep_until(wall.instant()) => {}
         () = cancel.cancelled() => {}
+    }
+}
+
+/// C2 §5: delivery can have lost one of the turn's call samples, so its
+/// tokens and cost are unavailable: the all-null turn aggregate, on the
+/// retained terminal (its cost unavailable too) or, without one, on the
+/// turn's end; either supersedes the delivered samples.
+pub(crate) fn unaccounted(end: &mut TurnEnd) {
+    let none = UsageSample {
+        key: None,
+        input: None,
+        cached_input: None,
+        output: None,
+        reasoning_output: None,
+        total: None,
+        interval_unverified: false,
+    };
+    match &mut end.terminal {
+        Some(terminal) => {
+            terminal.usage = Some(none);
+            terminal.cost = None;
+        }
+        None => end.aggregate = Some(none),
     }
 }
 
@@ -103,15 +139,16 @@ pub(crate) fn end_active(state: &Mutex<DriverState>, turn: crate::TurnNumber) {
 }
 
 /// Polls `route` while delivering what it hands over, then delivers the
-/// rest by the wall's cutoff: data deliverable at once still goes under
-/// the daemon force.
+/// rest until `cut` resolves (the wall's cutoff, or an adapter's earlier
+/// live bound): data deliverable at once still goes under the daemon
+/// force.
 pub(crate) async fn deliver_beside<N: Normalize, R>(
     route: impl Future<Output = Option<R>>,
     hop_rx: mpsc::Receiver<via_routes::Decoded<N::Message>>,
     normalizer: &mut N,
     sink: &ObservationSink,
     activity: &crate::TurnActivity,
-    (mut force, cutoff): (ForceWatch, Deadline),
+    (mut force, cut): (ForceWatch, impl Future<Output = ()>),
     health: &watch::Sender<DriverHealth>,
 ) -> (Option<R>, Rest) {
     tokio::pin!(route);
@@ -182,9 +219,11 @@ pub(crate) async fn deliver_beside<N: Normalize, R>(
         Rest::Delivered
     };
     // One cutoff (C2 §4.1): no delivery outlives the wall plus 3 s.
+    tokio::pin!(rest, cut);
     let rest = tokio::select! {
         biased;
-        rest = tokio::time::timeout_at(cutoff.instant(), rest) => rest.unwrap_or(Rest::Undelivered),
+        rest = &mut rest => rest,
+        () = &mut cut => Rest::Undelivered,
         () = forced(&mut force) => Rest::Forced,
     };
     (result, rest)

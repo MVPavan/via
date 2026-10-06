@@ -220,6 +220,9 @@ struct State {
     counts: Counts,
     /// The decode sequence of the last admitted message.
     seq: u64,
+    /// The decode sequence of the first message routing rejected
+    /// (picrit round 5): what is read after it follows a loss.
+    rejected: Option<u64>,
     /// Every lease's abnormal-end signal (item 13.2).
     signals: HashMap<u64, Arc<LeaseSignal>>,
     next_signal: u64,
@@ -458,6 +461,7 @@ impl Connection {
                 evidence: None,
                 counts: Counts::default(),
                 seq: 0,
+                rejected: None,
                 signals: HashMap::new(),
                 next_signal: 0,
                 replies: (0, 0),
@@ -536,6 +540,14 @@ impl Connection {
     /// The first failure latched, if any.
     pub fn failure(&self) -> Option<ConnectionFailure> {
         *self.failure.borrow()
+    }
+
+    /// The decode sequence of the first message routing rejected, if any
+    /// (picrit round 5): a message routed after it, at a higher sequence,
+    /// follows a loss in the connection's read order. Sequences are the
+    /// routed messages' own.
+    pub fn rejected(&self) -> Option<u64> {
+        self.state().rejected
     }
 
     /// How the connection ended, once it did.
@@ -1130,7 +1142,9 @@ impl Connection {
         self.state().reserved.len()
     }
 
-    /// [`Self::demux`]'s routing.
+    /// [`Self::demux`]'s routing. A message it rejects (undecodable,
+    /// uncorrelated, skipped, or any other protocol rejection) is lost: the
+    /// first one's decode sequence is kept (picrit round 5).
     fn route_message(&self, message: VendorMessage) -> Result<(), ConnectionFailure> {
         // The read instant (C2 §4): the routed message's, whatever it waits.
         let at = Instant::now();
@@ -1139,6 +1153,19 @@ impl Connection {
             state.seq = state.seq.saturating_add(1);
             state.seq
         };
+        let routed = self.route_seq(message, (seq, at));
+        if routed.is_err() {
+            self.state().rejected.get_or_insert(seq);
+        }
+        routed
+    }
+
+    /// [`Self::route_message`] of message `seq`, read at `at`.
+    fn route_seq(
+        &self,
+        message: VendorMessage,
+        (seq, at): (u64, Instant),
+    ) -> Result<(), ConnectionFailure> {
         if let Some(skipped) = message.skipped() {
             return Err(self.skipped(&skipped.head));
         }

@@ -23,7 +23,7 @@ fn route_errors_name_the_turn_by_its_number() {
         RouteError::Deadline { turn },
         RouteError::ForceStopped { turn },
         RouteError::ServerLost { turn },
-        RouteError::HandshakeRefused { turn },
+        RouteError::HandshakeRefused { turn, detail: None },
         RouteError::InvalidParam {
             turn,
             field: "model",
@@ -41,5 +41,18 @@ fn route_errors_name_the_turn_by_its_number() {
         }
         .to_string(),
         "protocol error in turn 2: the shared connection failed to decode a message"
+    );
+    // Pi's profile refusal (packet §4.3) carries VIA's own detail.
+    assert_eq!(
+        RouteError::HandshakeRefused {
+            turn,
+            detail: Some("settings key retry is not allowed".to_owned()),
+        }
+        .to_string(),
+        "handshake refused in turn 2: settings key retry is not allowed"
+    );
+    assert_eq!(
+        RouteError::HandshakeRefused { turn, detail: None }.to_string(),
+        "handshake refused in turn 2"
     );
 }

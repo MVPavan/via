@@ -3593,6 +3593,45 @@ fn a_late_unverified_aggregate_keeps_the_interval_warning() {
     });
 }
 
+/// Picrit round 4: a late all-null aggregate is unavailable usage, which
+/// covers no interval: marked unverified, it revises the stored usage to
+/// scope `turn`, provenance `unavailable`, with no
+/// `usage_interval_unverified`.
+#[test]
+fn a_late_unavailable_aggregate_raises_no_interval_warning() {
+    let Some(root) = child("a_late_unavailable_aggregate_raises_no_interval_warning") else {
+        return;
+    };
+    run(async {
+        let engine = open(&root);
+        let session = unknown_session(&engine, (Value::Null, None), json!({})).await;
+        let mut late = late_terminal(via_adapters::VendorTerminalStatus::Completed, "late");
+        late.usage = Some(via_adapters::UsageSample {
+            interval_unverified: true,
+            ..via_adapters::UsageSample::default()
+        });
+        engine.revise(&session, turn(1), &late).await;
+        let envelope = stored_envelope(&engine, &session, 1).await;
+        assert_eq!(envelope["revision"], 1, "{envelope}");
+        assert_eq!(
+            (
+                &envelope["usage"]["scope"],
+                &envelope["usage"]["provenance"]
+            ),
+            (&json!("turn"), &json!("unavailable")),
+            "{envelope}"
+        );
+        assert!(
+            !envelope["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning["code"] == "usage_interval_unverified"),
+            "{envelope}"
+        );
+    });
+}
+
 /// C2 gap A6 (C1 §5 `cost.provenance`): a late terminal's estimated cost
 /// revises the stored envelope's cost as `estimated`.
 #[test]

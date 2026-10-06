@@ -724,7 +724,7 @@ fn conformance_config_load() {
         ]
     );
     let names: Vec<_> = harness_names().collect();
-    assert_eq!(names, ["claude", "codex", "opencode", "fake"]);
+    assert_eq!(names, ["claude", "codex", "opencode", "pi", "fake"]);
 
     let object = serde_json::value::RawValue::from_string(r#"{"codex":{}}"#.to_owned()).unwrap();
     let array = serde_json::value::RawValue::from_string("[]".to_owned()).unwrap();
