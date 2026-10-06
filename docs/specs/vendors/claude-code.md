@@ -133,11 +133,11 @@ Version (C2 §5; owner OD1). Every Claude Code version is supported by
 default. Check init `claude_code_version` on every launch, parsing the
 complete version including any prerelease/build qualifier, never guessed from
 an executable filename. A version in the adapter's `checked` set (versions the
-maintainers' cheap live check passed: 2.1.285; from the live round of
-2026-10-05, 2.1.289; and 2.1.290, pending run 7 with the qualification
-runner `scripts/qualify/claude.py` as hardened after its critical review
-(§4, §9, bead via-kr9)) is `tested`; any other is `untested`,
-with warning `vendor_version_untested`, and proceeds. Only a failed handshake
+maintainers' cheap live check passed: 2.1.285; and from the live round of
+2026-10-05, 2.1.289) is `tested`. 2.1.290 qualification pending run 7
+of `scripts/qualify/claude.py` as hardened after its critical review
+(§4, §9, bead via-kr9); until then it is `untested`. Any version outside
+the set is `untested`, with warning `vendor_version_untested`, and proceeds. Only a failed handshake
 check on something VIA relies on (`interrupt_receipt_v1`, the permission-mode
 echo, the tool list) refuses the instance. Init follows the prompt line, so
 the turn fails `protocol` with no resend, and the refusal is cached per C2 §5.
@@ -425,8 +425,8 @@ pending run 7 with the qualification runner (bead via-kr9):
 Qualification runner on 2.1.290 (run 6, 2026-10-06, Haiku, bead via-kr9;
 `scripts/qualify/claude.py` after the review fixes, gitignored evidence,
 reported cost 0.089 USD of a 0.75 USD cap). Run 6 predates the runner's
-critical-review hardening, so it is not what keeps 2.1.290 in the checked
-set (§3): that is pending run 7 with the hardened runner. In run 6 every
+critical-review hardening, so it does not put 2.1.290 in the checked set
+(§3): 2.1.290 qualification pending run 7. In run 6 every
 case passed, every envelope reported 2.1.290 as `claude --version` did, and
 every daemon stopped. Every launch's argv carried the full §4 recipe for
 its turn, and every completed turn reported a positive cost above the
