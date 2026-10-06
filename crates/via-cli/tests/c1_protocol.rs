@@ -641,6 +641,8 @@ fn c1_cli_parser_errors_are_invalid_params() -> TestResult {
         // `--` that looks like a flag, are not CLI arguments either.
         (vec!["cancel", SESSION, "-x"], "command"),
         (vec!["cancel", SESSION, "--", "--private-token"], "command"),
+        (vec!["cancel", SESSION, "--", "--json"], "command"),
+        (vec!["cancel", SESSION, "--drain"], "command"),
         (vec!["cancel", "--json"], "session"),
         (with(&["--max-steps", "nope"]), "--max-steps"),
         (

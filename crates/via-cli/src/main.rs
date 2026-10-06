@@ -467,7 +467,10 @@ fn main() -> ExitCode {
 /// spelling (review clfix-crit2), never a C1 member: see [`cli_field`].
 /// The message is the parser's own, without its usage and tips.
 fn parse_error(error: &clap::Error) -> client::RequestError {
+    // An unknown argument is never looked up: its token may match a flag
+    // another verb defines, or be a value after `--` (review clfix-crit4).
     let named = match error.get(ContextKind::InvalidArg) {
+        _ if error.kind() == clap::error::ErrorKind::UnknownArgument => None,
         Some(ContextValue::String(arg)) => Some(arg.as_str()),
         Some(ContextValue::Strings(args)) => args.first().map(String::as_str),
         _ => None,
