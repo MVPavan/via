@@ -1341,16 +1341,13 @@ impl<'a> Run<'a> {
             outcome.route_cleanup = failure.cleanup.map(|cleanup| format!("{cleanup:?}"));
         }
         outcome.terminal = end.terminal.as_ref().map(terminal);
-        outcome.usage = end
-            .terminal
-            .as_ref()
-            .and_then(|terminal| terminal.usage.as_ref())
-            .map(|sample| terminal_usage(sample, &session.plan.capabilities.usage.tokens));
-        // A server route's terminal carries no usage: Core sums its samples
-        // (x.3.2 X3).
-        if outcome.usage.is_none() && session.plan.server_key.is_some() {
-            outcome.usage = sampled_usage(observed, &session.plan.capabilities.usage.tokens);
-        }
+        outcome.usage = outcome_usage(
+            observed,
+            end.terminal
+                .as_ref()
+                .and_then(|terminal| terminal.usage.as_ref()),
+            &session.plan.capabilities.usage.tokens,
+        );
         outcome.cleanup = Some(cleanup.to_owned());
         outcome.instance = end.instance.as_ref().map(|instance| {
             json!({"vendor_version": instance.vendor_version,
@@ -1891,66 +1888,43 @@ fn number(value: f64) -> Value {
     if exact { json!(whole) } else { json!(value) }
 }
 
-/// A server route's turn usage when its terminal carries none, as Core's
-/// ledger figures it (C2 §5 AD6, x.3.2 X3): a keyed progress sample
-/// replaces the key's earlier one, a keyless one adds, a component is
-/// `null` if any counted sample lacks it, and one sample whose interval
-/// was unverified makes the scope `vendor_interval`. `None` without a
-/// sample. Core's 1,024-key overflow is not modelled.
-fn sampled_usage(observed: &[Value], scope: &str) -> Option<Value> {
-    const FIELDS: [(&str, &str); 5] = [
-        ("input", "input_tokens"),
-        ("cached_input", "cached_input_tokens"),
-        ("output", "output_tokens"),
-        ("reasoning_output", "reasoning_output_tokens"),
-        ("total", "total_tokens"),
-    ];
-    let mut counted: Vec<&Value> = Vec::new();
-    let mut keys: BTreeMap<&str, usize> = BTreeMap::new();
-    let mut unverified = false;
-    for sample in observed
+/// The turn's usage as Core's envelope reports it, through Core's own
+/// ledger (`via_core::turn_usage`, C2 §5 AD6) on every route: the terminal
+/// aggregate when there is one, else the progress samples in order; `from`
+/// says which. `None` with neither.
+fn outcome_usage(
+    observed: &[Value],
+    aggregate: Option<&via_adapters::UsageSample>,
+    scope: &str,
+) -> Option<Value> {
+    let samples: Vec<via_adapters::UsageSample> = observed
         .iter()
         .filter(|observation| observation["kind"] == "progress")
         .map(|observation| &observation["usage"])
         .filter(|usage| !usage.is_null())
-    {
-        unverified |= sample["interval_unverified"] == true;
-        match sample["key"].as_str() {
-            Some(key) if keys.contains_key(key) => counted[keys[key]] = sample,
-            Some(key) => {
-                keys.insert(key, counted.len());
-                counted.push(sample);
-            }
-            None => counted.push(sample),
-        }
-    }
-    if counted.is_empty() {
-        return None;
-    }
-    let scope = if unverified { "vendor_interval" } else { scope };
-    let mut usage = json!({"from": "samples", "scope": scope});
-    for (field, name) in FIELDS {
-        let sum = counted
-            .iter()
-            .map(|sample| sample[field].as_u64())
-            .sum::<Option<u64>>();
-        usage[name] = json!(sum);
-    }
+        .map(sample_of)
+        .collect();
+    let mut usage = via_core::turn_usage(&samples, aggregate, scope)?;
+    usage["from"] = json!(if aggregate.is_some() {
+        "terminal"
+    } else {
+        "samples"
+    });
     Some(usage)
 }
 
-/// A turn aggregate as the route's figure under its declared `scope`, or
-/// `vendor_interval` when its interval was unverified (C2 §5).
-fn terminal_usage(sample: &via_adapters::UsageSample, scope: &str) -> Value {
-    json!({
-        "from": "terminal",
-        "scope": if sample.interval_unverified { "vendor_interval" } else { scope },
-        "input_tokens": sample.input,
-        "cached_input_tokens": sample.cached_input,
-        "output_tokens": sample.output,
-        "reasoning_output_tokens": sample.reasoning_output,
-        "total_tokens": sample.total,
-    })
+/// The C2 `UsageSample` a progress observation reported, read back from
+/// [`usage_sample`]'s form.
+fn sample_of(usage: &Value) -> via_adapters::UsageSample {
+    via_adapters::UsageSample {
+        key: usage["key"].as_str().map(str::to_owned),
+        input: usage["input"].as_u64(),
+        cached_input: usage["cached_input"].as_u64(),
+        output: usage["output"].as_u64(),
+        reasoning_output: usage["reasoning_output"].as_u64(),
+        total: usage["total"].as_u64(),
+        interval_unverified: usage["interval_unverified"] == true,
+    }
 }
 
 /// A progress sample in C2 `UsageSample`'s names, as the checker states it.
@@ -2199,7 +2173,7 @@ fn runner_usage_follows_the_ledger_rules() {
         sample(Some("a"), 20, false),
         json!({"kind": "final_text", "text": "t"}),
     ];
-    let usage = sampled_usage(&observed, "turn").unwrap();
+    let usage = outcome_usage(&observed, None, "turn").unwrap();
     assert_eq!(
         (
             &usage["total_tokens"],
@@ -2212,26 +2186,73 @@ fn runner_usage_follows_the_ledger_rules() {
     assert!(usage["cached_input_tokens"].is_null(), "{usage}");
     observed.push(sample(Some("b"), 1, true));
     observed.push(sample(Some("b"), 2, false));
-    let usage = sampled_usage(&observed, "turn").unwrap();
+    let usage = outcome_usage(&observed, None, "turn").unwrap();
     assert_eq!(
         (&usage["total_tokens"], &usage["scope"]),
         (&json!(27), &json!("vendor_interval")),
         "sticky once seen: {usage}"
     );
-    assert_eq!(sampled_usage(&observed[3..4], "turn"), None);
+    assert_eq!(outcome_usage(&observed[3..4], None, "turn"), None);
 
     let aggregate = |interval_unverified| via_adapters::UsageSample {
         total: Some(9),
         interval_unverified,
         ..via_adapters::UsageSample::default()
     };
-    let usage = terminal_usage(&aggregate(false), "turn");
+    let usage = outcome_usage(&[], Some(&aggregate(false)), "turn").unwrap();
     assert_eq!(
         (&usage["from"], &usage["scope"], &usage["total_tokens"]),
         (&json!("terminal"), &json!("turn"), &json!(9))
     );
     assert_eq!(
-        terminal_usage(&aggregate(true), "turn")["scope"],
+        outcome_usage(&[], Some(&aggregate(true)), "turn").unwrap()["scope"],
         "vendor_interval"
     );
+}
+
+/// Slice A critical r2 #4a (C2 §5 AD6): a process route's turn with
+/// keyless samples and no terminal usage has the samples' folded usage, as
+/// Core's envelope does, whatever the route.
+#[test]
+fn runner_folds_a_process_routes_samples() {
+    let progress = |total: u64| {
+        json!({"kind": "progress", "usage": usage_sample(&via_adapters::UsageSample {
+            input: Some(total),
+            total: Some(total),
+            ..via_adapters::UsageSample::default()
+        })})
+    };
+    let observed = [progress(3), progress(4)];
+    let usage = outcome_usage(&observed, None, "turn").expect("folded usage");
+    assert_eq!(
+        (
+            &usage["from"],
+            &usage["scope"],
+            &usage["total_tokens"],
+            &usage["input_tokens"]
+        ),
+        (&json!("samples"), &json!("turn"), &json!(7), &json!(7)),
+        "{usage}"
+    );
+}
+
+/// Slice A critical r2 #4b (C2 §5 AD6): a component whose sum does not fit
+/// `u64` is `null`, as Core's checked ledger gives it, never a panic or a
+/// wrapped count; the other components keep their sums.
+#[test]
+fn runner_gives_null_for_an_overflowing_component() {
+    let progress = || {
+        json!({"kind": "progress", "usage": usage_sample(&via_adapters::UsageSample {
+            input: Some(8_000_000_000_000_000_000),
+            output: Some(1),
+            ..via_adapters::UsageSample::default()
+        })})
+    };
+    let observed = [progress(), progress(), progress()];
+    let usage = std::panic::catch_unwind(|| outcome_usage(&observed, None, "turn"))
+        .expect("no panic")
+        .expect("folded usage");
+    assert!(usage["input_tokens"].is_null(), "{usage}");
+    assert_eq!(usage["output_tokens"], 3, "{usage}");
+    assert!(usage["total_tokens"].is_null(), "{usage}");
 }

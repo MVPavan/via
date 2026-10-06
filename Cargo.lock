@@ -1270,6 +1270,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "via-adapters",
+ "via-core",
  "via-store",
 ]
 

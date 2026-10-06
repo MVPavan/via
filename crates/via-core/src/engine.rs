@@ -53,6 +53,8 @@ pub use status::{DaemonCounts, HarnessProcesses, Limits};
 pub use stop::{EngineShutdown, FinalEntry, StopMode};
 #[cfg(feature = "test-failpoints")]
 pub use terminal::envelope_at_maximum;
+#[cfg(feature = "test-support")]
+pub use terminal::turn_usage;
 
 /// A committed receipt and, when this request created or adopted the turn,
 /// that turn, now queued with its session's dispatcher. A replayed retry

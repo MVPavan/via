@@ -79,13 +79,8 @@ pub(super) fn turn_envelope(
         .retained
         .as_ref()
         .and_then(|retained| retained.usage.as_ref());
-    let figure = vendor.ledger.figure(aggregate);
-    let interval = figure.as_ref().is_some_and(|(_, interval)| *interval);
-    let usage = Usage::reported(
-        figure.map(|(tokens, _)| tokens),
-        interval,
-        plan.frozen.token_scope(),
-    );
+    let (usage, interval) = ledger_usage(&vendor.ledger, aggregate, plan.frozen.token_scope())
+        .unwrap_or((Usage::UNAVAILABLE, false));
     assemble(
         (session, turn, plan),
         terminal,
@@ -96,6 +91,37 @@ pub(super) fn turn_envelope(
         (usage, interval),
         vendor,
     )
+}
+
+/// The envelope's `usage` from the turn's ledger (AD6): the turn aggregate
+/// when there is one, else the folded call samples, under the route's
+/// token `scope` or `vendor_interval`, with whether the interval is
+/// unverified; `None` without a sample or an aggregate.
+fn ledger_usage(
+    ledger: &super::progress::UsageLedger,
+    aggregate: Option<&via_adapters::UsageSample>,
+    scope: &str,
+) -> Option<(Usage, bool)> {
+    let (tokens, interval) = ledger.figure(aggregate)?;
+    Some((Usage::reported(Some(tokens), interval, scope), interval))
+}
+
+/// Test builds only (`test-support`): a turn's envelope `usage` as Core
+/// figures it, through the same ledger and [`ledger_usage`] a live turn
+/// uses, from its per-call `samples` in order and its terminal
+/// `aggregate`; `None` when there is neither.
+#[cfg(feature = "test-support")]
+pub fn turn_usage(
+    samples: &[via_adapters::UsageSample],
+    aggregate: Option<&via_adapters::UsageSample>,
+    scope: &str,
+) -> Option<serde_json::Value> {
+    let mut ledger = super::progress::UsageLedger::default();
+    for sample in samples {
+        ledger.add(sample);
+    }
+    let (usage, _) = ledger_usage(&ledger, aggregate, scope)?;
+    serde_json::to_value(usage).ok()
 }
 
 #[expect(
