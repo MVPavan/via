@@ -37,6 +37,9 @@ interprets (receipt, envelope, status, events page, cancel, logs, daemon
 status) is first checked against one strict schema (SCHEMAS, from C1): a
 missing or mistyped field it relies on blocks, and no reply field is ever
 read with a default. Events are read page by page until `more` is false.
+Every loop makes strict progress, checks the deferred-signal flag between
+iterations (except cleanup, which always runs to its proof or deadline) and
+has a hard page or time bound; reaching it is Blocked.
 
 Threat model. A maintainer runs this on their own machine, on Linux (it
 reads /proc and runs `pgrep`). The Claude that VIA starts runs only the
@@ -78,16 +81,20 @@ Tool use: VIA records no tool events (C1 §6.1), so tool calls are read from
 the vendor's own session transcript of the session VIA created: per prompt,
 the tool names, the number of calls and whether any tool input held the
 nonce. Only those are kept. The transcript counts as evidence only when it
-shows the calls known to have happened (t1's Write, t3's Bash) with valid
-input records and the recall turn's record is complete through its end: the
-turn's last record is an assistant message with stop_reason `end_turn`
-(never an intermediate `tool_use` message, and no tool result after it)
-whose text equals that turn's envelope `final_text`. Otherwise the nonce
-and no-tool predicates are `not_observable`. No tool input in any turn of
-the session may hold the nonce (a file written earlier, such as an
-instruction file, could reach the recall turn without a tool call), and the
-recall turn must make no tool call. mcp_switches' unrestricted resume
-recalls a nonce the same way: its spawn turn makes one known Bash call.
+shows the calls known to have happened (t1's Write, t3's Bash), every
+record of every turn is fully interpretable (an unparsable line, an unknown
+record type, a missing message, an unrecognised content block, a sidechain
+or a usage without every integer token key taints its turn's tool and usage
+evidence; no record is skipped) and the recall turn's record is complete
+through its end: the turn's last record is an assistant message with
+stop_reason `end_turn` (never an intermediate `tool_use` message, and no
+tool result after it) whose text equals that turn's envelope `final_text`.
+Otherwise the nonce and no-tool predicates are `not_observable`. No tool
+input in any turn of the session may hold the nonce (a file written
+earlier, such as an instruction file, could reach the recall turn without a
+tool call), and the recall turn must make no tool call. mcp_switches'
+unrestricted resume recalls a nonce the same way: its spawn turn makes one
+known Bash call.
 
 mcp_switches (owner decision, 2026-10-06): VIA records no init inventory for
 Claude (packet §4, via-7c6), so the evidence is Claude's own MCP debug lines,
@@ -143,12 +150,19 @@ the replied pid, a descriptor holder, or a /proc/locks locker read with its
 start ticks. With none, or with a locker whose pid cannot be read,
 ownership stays uncertain for the rest of the run: it is never proven
 stopped, the runtime directory is kept and the run is blocked. Uncertainty
-blocks the proof, never the cleanup attempt: a failed read keeps what the
-other reads established, and a held lock or a live recorded daemon still
-gets its stop request. The final cleanup retries the stop until a deadline,
-also after an earlier unverified stop, escalating to `daemon stop --force`
-when a plain stop is refused `sessions_active`; once the stop is proven the
-runtime directory is removed, wherever it lives.
+is sticky: every process identity ever uncertain (an unreadable locker or
+watched process) stays in a run-level set until that same identity is
+verified absent (with start ticks, `alive` is False; without them, the pid
+is empty, a zombie, or holds a process started after it was seen), never
+because a later survey stops seeing it, and the stop proof needs the set
+empty. A locker without start ticks whose pid later reads with ticks from
+before it was seen is that process: it is recorded and gets the stop
+request. Uncertainty blocks the proof, never the cleanup attempt: a failed
+read keeps what the other reads established, and a held lock or a live
+recorded daemon still gets its stop request. The final cleanup retries the
+stop until a deadline, also after an earlier unverified stop, escalating to
+`daemon stop --force` when a plain stop is refused `sessions_active`; once
+the stop is proven the runtime directory is removed, wherever it lives.
 
 SIGINT and SIGTERM are only recorded. No submission starts afterwards; a
 turn already being submitted runs to its end and is accounted. Cleanup and
@@ -227,6 +241,8 @@ TURN_WAIT_S = 240
 # run: the cap is checked between turns, so this bounds the overshoot to one
 # turn. Run 6's dearest Haiku turn added 0.015 USD.
 TURN_CEILING_USD = 0.10
+# The most events pages one read follows (C1 pages hold up to 1000 events).
+EVENT_PAGES = 1000
 QUOTA = re.compile(r"quota|credit|usage limit|rate limit|overloaded", re.IGNORECASE)
 EXCLUDED = [{
     "case": "claude_live_bounds",
@@ -528,6 +544,34 @@ def alive(pid, start_ticks):
     return stat is not None and stat["start_ticks"] == start_ticks and stat["state"] != "Z"
 
 
+def uptime_ticks():
+    """Clock ticks since boot now (the unit of start ticks), or None."""
+    try:
+        return int(float(Path("/proc/uptime").read_text().split()[0])
+                   * os.sysconf("SC_CLK_TCK"))
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def verified_gone(entry):
+    """Whether the uncertain identity `entry` is verified absent. With start
+    ticks: `alive` is False. Without them, the pid holds no process, a
+    zombie, or a process started after the identity was seen (a pid holds
+    one process at a time). An unreadable pid, or one without a pid, is
+    never gone."""
+    pid, ticks = entry["pid"], entry["start_ticks"]
+    if not isinstance(pid, int):
+        return False
+    if ticks is not None:
+        return alive(pid, ticks) is False
+    try:
+        stat = proc_stat(pid)
+    except Unreadable:
+        return False
+    return (stat is None or stat["state"] == "Z"
+            or (entry["seen_by"] is not None and stat["start_ticks"] > entry["seen_by"]))
+
+
 def descendants(root, procs):
     """`root`'s descendants by ppid, all from the one scan `procs`; the
     caller validates the root's identity in that same scan."""
@@ -635,69 +679,136 @@ def is_prompt(entry):
         isinstance(part, dict) and part.get("type") == "tool_result" for part in content))
 
 
+# Transcript record types seen in Claude's session transcripts (run 6) that
+# carry no message: interpreted as holding no tool or usage evidence. Any
+# other type taints the turn it falls in.
+NON_MESSAGE_TYPES = {"queue-operation", "attachment", "atis-latch", "last-prompt",
+                     "cost-state", "mode", "system"}
+USAGE_KEYS = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens",
+              "output_tokens")
+
+
+def assistant_problem(message):
+    """Why an assistant message cannot be fully interpreted, or None."""
+    if not isinstance(message, dict):
+        return "assistant record without a message object"
+    if not isinstance(message.get("id"), str) or not isinstance(message.get("content"), list):
+        return "assistant message without an id or a content list"
+    if not isinstance(message.get("stop_reason"), (str, type(None))):
+        return "assistant message with a non-string stop_reason"
+    usage = message.get("usage")
+    if not isinstance(usage, dict) or not all(
+            isinstance(usage.get(key), int) and not isinstance(usage.get(key), bool)
+            for key in USAGE_KEYS):
+        return "assistant usage missing or mistyping a token key"
+    for part in message["content"]:
+        kind = part.get("type") if isinstance(part, dict) else None
+        if kind == "text" and isinstance(part.get("text"), str):
+            continue
+        if kind == "thinking" and isinstance(part.get("thinking"), str):
+            continue
+        if (kind == "tool_use" and isinstance(part.get("id"), str) and part["id"]
+                and isinstance(part.get("name"), str) and isinstance(part.get("input"), dict)
+                and part["input"]):
+            continue
+        return f"unrecognised assistant content block ({kind!r})"
+    return None
+
+
+def user_problem(entry):
+    """Why a user record that is not a prompt cannot be interpreted, or None."""
+    message = entry.get("message")
+    if not isinstance(message, dict):
+        return "user record without a message object"
+    content = message.get("content")
+    if entry.get("isMeta") and isinstance(content, str):
+        return None
+    if not isinstance(content, list):
+        return "user message without a content list"
+    for part in content:
+        kind = part.get("type") if isinstance(part, dict) else None
+        if kind == "tool_result" and isinstance(part.get("tool_use_id"), str):
+            continue
+        if kind == "text" and isinstance(part.get("text"), str):
+            continue
+        return f"unrecognised user content block ({kind!r})"
+    return None
+
+
 def vendor_turns(path, needle=None):
     """Per prompt: usage summed over model calls (one per message id), the
     number of tool calls and of tool inputs holding `needle`, and the text of
     the turn's terminal message (`terminal_text`): the text of the turn's
     last message-bearing record when that is an assistant message with
     stop_reason `end_turn`, else None. A record lost after an intermediate
-    message (stop_reason `tool_use`) leaves no terminal message. Nothing is
-    defaulted: an assistant record whose usage lacks a token key or holds a
-    non-integer counts in `usage_invalid` (that turn's usage is not
-    evidence), and one whose content is not a list counts in
-    `invalid_inputs` (its tool calls are unknown)."""
-    keys = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens",
-            "output_tokens")
-    turns = []
+    message (stop_reason `tool_use`) leaves no terminal message.
+
+    No record is skipped and nothing is defaulted: a record the parser
+    cannot fully interpret (an unparsable line, a missing or non-object
+    message, an unrecognised content block or record type, a sidechain, a
+    usage without every integer token key) taints the turn it falls in
+    (`tainted`; one before the first prompt taints the first turn). A
+    tainted turn's tool and usage evidence is not evidence."""
+    turns, early = [], []
+
+    def taint(reason):
+        (turns[-1]["taint"] if turns else early).append(reason)
+
     with open(path) as file:
         for line in file:
-            entry = json.loads(line)
-            if is_prompt(entry):
-                turns.append({"calls": {}, "tools": {}, "needle_inputs": set(),
-                              "invalid_inputs": set(), "texts": {}, "last": None,
-                              "usage_invalid": 0})
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                taint("unparsable line")
                 continue
-            if (entry.get("type") == "user" and not entry.get("isSidechain") and turns
-                    and isinstance(entry.get("message"), dict)):
-                turns[-1]["last"] = None  # a tool result: the turn went on
+            if not isinstance(entry, dict):
+                taint("non-object record")
+                continue
+            kind = entry.get("type")
+            if is_prompt(entry) and not entry.get("isSidechain"):
+                turns.append({"calls": {}, "tools": {}, "needle_inputs": set(), "texts": {},
+                              "last": None, "taint": early if not turns else []})
+                continue
+            if entry.get("isSidechain"):
+                taint(f"sidechain {kind} record")
+                continue
+            if kind in NON_MESSAGE_TYPES and "message" not in entry:
+                continue
+            if kind == "user":
+                problem = user_problem(entry)
+                if problem:
+                    taint(problem)
+                elif turns:
+                    turns[-1]["last"] = None  # a tool result: the turn went on
+                else:
+                    taint("user record before the first prompt")
+                continue
+            if kind != "assistant":
+                taint(f"unrecognised record type {kind!r}")
                 continue
             message = entry.get("message")
-            if (entry.get("type") != "assistant" or entry.get("isSidechain") or not turns
-                    or not isinstance(message, dict)):
+            problem = assistant_problem(message)
+            if problem or not turns:
+                taint(problem or "assistant record before the first prompt")
                 continue
             turn = turns[-1]
-            turn["last"] = (message.get("id"), message.get("stop_reason"))
-            content = message.get("content")
-            if not isinstance(content, list):
-                turn["invalid_inputs"].add(f"content of {message.get('id')}")
-                content = []
-            for part in content:
-                if (isinstance(part, dict) and part.get("type") == "text"
-                        and isinstance(part.get("text"), str)):
-                    turn["texts"].setdefault(message.get("id"), []).append(part["text"])
-                if isinstance(part, dict) and part.get("type") == "tool_use":
-                    turn["tools"][part.get("id")] = part.get("name")
-                    tool_input = part.get("input")
-                    if not part.get("id") or not isinstance(tool_input, dict) or not tool_input:
-                        turn["invalid_inputs"].add(part.get("id"))
-                    elif needle and needle in json.dumps(tool_input):
-                        turn["needle_inputs"].add(part.get("id"))
-            usage = message.get("usage")
-            if not isinstance(usage, dict) or not all(
-                    isinstance(usage.get(key), int) and not isinstance(usage.get(key), bool)
-                    for key in keys):
-                turn["usage_invalid"] += 1
-            else:
-                usage = {key: usage[key] for key in keys}
-                prior = turn["calls"].get(message.get("id"))
-                if prior is None or usage["output_tokens"] >= prior["output_tokens"]:
-                    turn["calls"][message.get("id")] = usage
-    return [{**{key: sum(call[key] for call in turn["calls"].values()) for key in keys},
+            turn["last"] = (message["id"], message["stop_reason"])
+            for part in message["content"]:
+                if part["type"] == "text":
+                    turn["texts"].setdefault(message["id"], []).append(part["text"])
+                elif part["type"] == "tool_use":
+                    turn["tools"][part["id"]] = part["name"]
+                    if needle and needle in json.dumps(part["input"]):
+                        turn["needle_inputs"].add(part["id"])
+            usage = {key: message["usage"][key] for key in USAGE_KEYS}
+            prior = turn["calls"].get(message["id"])
+            if prior is None or usage["output_tokens"] >= prior["output_tokens"]:
+                turn["calls"][message["id"]] = usage
+    return [{**{key: sum(call[key] for call in turn["calls"].values()) for key in USAGE_KEYS},
              "calls": sum(1 for call in turn["calls"].values() if any(call.values())),
              "tool_calls": len(turn["tools"]), "tool_names": sorted(set(turn["tools"].values())),
-             "invalid_inputs": len(turn["invalid_inputs"]),
-             "needle_inputs": len(turn["needle_inputs"]),
-             "usage_invalid": turn["usage_invalid"], "terminal_text": terminal_text(turn)}
+             "needle_inputs": len(turn["needle_inputs"]), "tainted": len(turn["taint"]),
+             "taint_reasons": sorted(set(turn["taint"])), "terminal_text": terminal_text(turn)}
             for turn in turns]
 
 
@@ -841,6 +952,9 @@ class Run:
         self.daemons = []
         # The private lock files' identities as /proc/locks writes them.
         self.lock_ids = set()
+        # Run-level, sticky: every process identity that was ever uncertain
+        # (`mark_uncertain`); it leaves only on verified absence.
+        self.uncertain = []
         self.costs = {}
         self.last_cost = {}
         self.accounting_failed = None
@@ -1048,22 +1162,35 @@ class Run:
 
     def events(self, case, label, address):
         """Every event page; a missing or failed page is Blocked, never the
-        end of the events."""
+        end of the events. Each page must progress: its events' seq strictly
+        ascending above the cursor and, with more to come, a `next_after`
+        above the cursor, whatever the page holds. The flag of a deferred
+        signal is checked between pages, and at most EVENT_PAGES pages are
+        read; either ends the read Blocked."""
         events, after = [], 0
-        while True:
+        for number in range(EVENT_PAGES):
+            if number:
+                interrupt_guard()
             rc, page, _ = self.via_call(case.dir, f"{label}-page", "events", address,
                                         "--after", str(after), "--json")
             if rc != 0:
                 raise Blocked(f"{label}: an events page is missing (rc {rc}); the events "
                               "are incomplete")
             conform(page, "events page", f"{label} page after {after}")
+            seqs = [event["seq"] for event in page["events"]]
+            if any(seq <= previous for seq, previous in zip(seqs, [after] + seqs)):
+                raise Blocked(f"{label}: an events page after {after} repeats or reorders "
+                              "events; the events are unreliable")
             events.extend(page["events"])
             if page["more"] is False:
                 break
-            if page["next_after"] <= after and not page["events"]:
-                raise Blocked(f"{label}: an events page made no progress; the events are "
-                              "incomplete")
+            if page["next_after"] <= after or (seqs and page["next_after"] < seqs[-1]):
+                raise Blocked(f"{label}: an events page after {after} made no cursor "
+                              "progress; the events are incomplete")
             after = page["next_after"]
+        else:
+            raise Blocked(f"{label}: more than {EVENT_PAGES} events pages; the events are "
+                          "incomplete")
         (case.dir / f"{label}-page.json").unlink(missing_ok=True)
         write_json(case.dir / f"{label}.json", events)
         return events
@@ -1184,6 +1311,9 @@ class Run:
                 record["identity_unknown"] = True
                 if unrecorded:
                     record["lockers_unrecorded"] = unrecorded
+            for locker in unrecorded:
+                self.mark_uncertain(locker, None, "a lock holder not readable with its "
+                                                  "start ticks")
             raise
         del record["runtime_dir_kept"]
         record.update(pid=pid, start_ticks=stat["start_ticks"])
@@ -1221,6 +1351,32 @@ class Run:
                     lines.setdefault(token, []).append(
                         [int(pid) if pid.isdigit() else None, kind])
         return lines
+
+    def mark_uncertain(self, pid, start_ticks, reason):
+        """Adds a process identity (start ticks None when unknown) to the
+        run's sticky uncertain set, with the clock ticks it was seen by."""
+        if not any(e["pid"] == pid and e["start_ticks"] == start_ticks
+                   for e in self.uncertain):
+            self.uncertain.append({"pid": pid, "start_ticks": start_ticks, "reason": reason,
+                                   "seen_by": uptime_ticks()})
+
+    def still_uncertain(self):
+        """The uncertain identities not yet verified absent; a verified one
+        leaves the set for good. An entry without start ticks whose pid now
+        reads with start ticks at or before the moment it was seen is that
+        same process (a pid holds one process at a time): it gets those
+        ticks and stays until `alive` is False."""
+        for entry in self.uncertain:
+            if entry["start_ticks"] is None and isinstance(entry["pid"], int) \
+                    and entry["seen_by"] is not None:
+                try:
+                    stat = proc_stat(entry["pid"])
+                except Unreadable:
+                    continue
+                if stat and stat["state"] != "Z" and stat["start_ticks"] <= entry["seen_by"]:
+                    entry["start_ticks"] = stat["start_ticks"]
+        self.uncertain = [e for e in self.uncertain if not verified_gone(e)]
+        return self.uncertain
 
     @staticmethod
     def lockers(lines):
@@ -1326,9 +1482,13 @@ class Run:
                 # A locker seen holding this run's lock is ours: it is
                 # recorded and must be seen gone.
                 lockers, unrecorded = self.lockers(lines)
-                recorded.extend(ident for ident in lockers if ident not in recorded)
-                unsure += [f"locker {pid}: not readable with its start ticks"
-                           for pid in unrecorded]
+                for ident in lockers:
+                    if ident not in recorded:
+                        recorded.append(ident)
+                        record.setdefault("lockers", []).append(ident)
+                for pid in unrecorded:
+                    self.mark_uncertain(pid, None, "a lock holder not readable with its "
+                                                   "start ticks")
             for path in self.lock_paths():
                 free = lock_free(path)
                 if free is False:
@@ -1346,14 +1506,31 @@ class Run:
                     if stat is not None and stat["start_ticks"] == root["start_ticks"]:
                         watched.update((pid, procs[pid]["start_ticks"])
                                        for pid in descendants(root["pid"], procs))
+            # Sticky: an identity once uncertain keeps the proof open until
+            # it is verified absent, whether or not this survey still sees it.
+            for entry in self.still_uncertain():
+                unsure.append(f"pid {entry['pid']} (start ticks {entry['start_ticks']}): "
+                              f"{entry['reason']}")
+                ident = {"pid": entry["pid"], "start_ticks": entry["start_ticks"]}
+                if (entry["start_ticks"] is not None and ident not in recorded
+                        and entry["reason"].startswith("a lock holder")):
+                    # Now identified: recorded, so a live one gets the stop
+                    # request.
+                    recorded.append(ident)
+                    record.setdefault("lockers", []).append(ident)
             states = {ident: alive(*ident) for ident in
                       [(d["pid"], d["start_ticks"]) for d in recorded] + sorted(watched)}
-            unsure += [f"pid {pid}: unreadable" for (pid, _), state in states.items()
-                       if state is None]
+            for (pid, ticks), state in states.items():
+                if state is None:
+                    self.mark_uncertain(pid, ticks, "unreadable while watched")
+                    unsure.append(f"pid {pid} (start ticks {ticks}): unreadable while "
+                                  "watched")
             living = [d for d in recorded if states[(d["pid"], d["start_ticks"])] is True]
             left = sorted(pid for (pid, ticks) in watched if states[(pid, ticks)] is True)
-            return held, living, left, unsure
+            return held, living, left, list(dict.fromkeys(unsure))
 
+        # Bounded by `deadline`. A deferred signal does not end it: cleanup
+        # always runs to its proof or its deadline.
         while True:
             held, recorded_alive, left, unsure = survey()
             record["descendants_watched"] = sorted(watched)
@@ -1386,6 +1563,7 @@ class Run:
         except (OSError, Unreadable) as error:
             record["holders_left"] = f"unavailable: {type(error).__name__}"
         record["recorded"] = recorded
+        record["uncertain"] = [dict(e) for e in self.uncertain]
         record["recorded_alive"] = recorded_alive
         record["descendants_left"] = left
         record["undecided"] = unsure
@@ -1564,20 +1742,21 @@ def case_recipe_continuity(run, case):
         turns = vendor_turns(path, needle=nonce)
         write_json(case.dir / "tool-calls.json",
                    [{"turn": n, "tool_calls": t["tool_calls"], "tool_names": t["tool_names"],
-                     "invalid_inputs": t["invalid_inputs"],
+                     "tainted": t["taint_reasons"],
                      "inputs_with_nonce": t["needle_inputs"]} for n, t in enumerate(turns, 1)])
         # Evidence only if the transcript shows the tool calls known to have
-        # happened (t1's Write, t3's Bash) with valid input records and t4's
+        # happened (t1's Write, t3's Bash), no turn is tainted and t4's
         # record is complete through its terminal message (`ends_with`).
         # The nonce must reach no tool input in any turn: a file written
         # earlier could be loaded into the recall turn without a tool call.
         shows = (len(turns) == 4 and "Write" in turns[0]["tool_names"]
                  and "Bash" in turns[2]["tool_names"]
-                 and all(t["invalid_inputs"] == 0 for t in turns)
+                 and all(t["tainted"] == 0 for t in turns)
                  and ends_with(turns[3], t4))
         if not shows:
             reason = ("the vendor transcript does not show t1's Write and t3's Bash with "
-                      "valid inputs, or its t4 record does not end in a terminal message "
+                      "every record interpretable, or its t4 record does not end in a "
+                      "terminal message "
                       "holding t4's final_text")
             case.not_observable("no tool input held the nonce in any turn", reason)
             case.not_observable("t4: no tool call", reason)
@@ -1611,7 +1790,9 @@ def case_interrupt(run, case):
         session = receipt["session_id"]
         run.keep_handle(case, receipt)
         tool, running, deadline = None, False, time.monotonic() + 90
+        # Bounded by the deadline; a deferred signal ends the poll Blocked.
         while time.monotonic() < deadline and not (tool and running):
+            interrupt_guard()
             status = run.status(case, "status-running", session)
             # `progress` is null once the turn is not running (C1 §3.7).
             running = status["progress"] is not None and "Bash" in status["progress"][
@@ -1862,20 +2043,21 @@ def mcp_launch(run, case, label, expect_inherit, expect_warning, mode, mcp_off,
 def check_recall_tools(run, case, label, envelope, nonce):
     """The recall turn made no tool call and no tool input in any turn held
     the nonce, from the vendor transcript; evidence only when it shows the
-    spawn turn's known Bash call with valid inputs and the recall turn's
+    spawn turn's known Bash call, no turn tainted and the recall turn's
     record ends in a terminal message holding the envelope's final_text
     (`ends_with`), else `not_observable`."""
     path = vendor_transcript(run, envelope["vendor_session_id"])
     turns = vendor_turns(path, needle=nonce) if path else []
     write_json(case.dir / f"{label}-tool-calls.json",
                [{"turn": n, "tool_calls": t["tool_calls"], "tool_names": t["tool_names"],
-                 "invalid_inputs": t["invalid_inputs"], "inputs_with_nonce": t["needle_inputs"]}
+                 "tainted": t["taint_reasons"], "inputs_with_nonce": t["needle_inputs"]}
                 for n, t in enumerate(turns, 1)])
     if not (len(turns) == 2 and "Bash" in turns[0]["tool_names"]
-            and all(t["invalid_inputs"] == 0 for t in turns)
+            and all(t["tainted"] == 0 for t in turns)
             and ends_with(turns[1], envelope)):
         reason = ("the vendor transcript was not found, does not show the spawn turn's Bash "
-                  "call with valid inputs, or its recall record does not end in a "
+                  "call with every record interpretable, or its recall record does not "
+                  "end in a "
                   "terminal message holding the envelope's final_text")
         case.not_observable(f"{label}: no tool call in the recall turn", reason)
         case.not_observable(f"{label}: no tool input held the nonce in any turn", reason)
@@ -2023,7 +2205,7 @@ def case_usage(run, case, inputs):
         turn = envelope["turn"]
         # A usage record missing a token key is no evidence for its turn,
         # nor for the session totals from then on.
-        invalid = raw["usage_invalid"]
+        invalid = raw["tainted"]
         tainted = tainted or bool(invalid)
         raw = {key: raw[key] for key in ("input_tokens", "cache_creation_input_tokens",
                                          "cache_read_input_tokens", "output_tokens", "calls")}
@@ -2040,8 +2222,8 @@ def case_usage(run, case, inputs):
         case.check(f"turn {turn}: usage scope turn", usage["scope"] == "turn")
         if invalid:
             case.not_observable(f"turn {turn}: envelope usage equals the turn's vendor calls",
-                                f"{invalid} vendor usage record(s) missing or mistyping a "
-                                "token key")
+                                f"{invalid} vendor transcript record(s) not interpretable "
+                                "in this turn")
         else:
             case.check(f"turn {turn}: envelope usage equals the turn's vendor calls",
                        raw["calls"] > 0 and got == expected, {"calls": raw["calls"]})
