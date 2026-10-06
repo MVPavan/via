@@ -468,7 +468,11 @@ and stay unreachable.
 
 - Before the `started` reply, a lifecycle or `message_*` record is protocol
   (E04); pre-prompt compaction records may arrive (E63) and are activity,
-  their usage held (§5.5).
+  their usage held (§5.5). More than 64 of them before `started` is
+  protocol: held samples emit nothing, so the hop's bound does not bound
+  them, and Pi compacts at most once before a prompt.
+- A UI request's `method` must leave room for the `extension_ui/` prefix
+  within 1 KiB (C2 A1), else the record is malformed.
 - One `agent_settled` per run. A second one, or one with no assistant
   `message_end` since `started`, is protocol: no terminal exists.
 - IDs, names, stop reasons and codes are bounded to 1 KiB (C2 A1).
@@ -720,7 +724,7 @@ hostile profiles only in scratch agent directories. Selection as Claude's:
 | `pi_identity_continuation` | `--session-id` until confirmed; confirmation only with `started`; a rejected turn 1 (no file) lets turn 2 create; a lost `started` reply keeps `--session-id`; once confirmed, `--session`; a missing file then exits before RPC → `Rejected{Protocol}`, never a fresh session; derived ID stable across eviction and restart |
 | `pi_handshake_checks` | Wrong `sessionId` → `resume_mismatch` with no prompt line; model not in the catalog or a clamped requested effort → `InvalidParam` with no prompt, the clamp then cached so `plan` and `check_turn` refuse the same model and effort; omitted effort skips the check; a non-skill command → refusal, cached; exit before the replies → `Rejected{Protocol}` with stderr unread |
 | `pi_protocol_typed` | Wrong `command` for a known `id`, a duplicate reply, missing required fields (`get_state` without `sessionFile` among them), an assistant `message_end` without `content` or `usage` or with a non-numeric usage member (all-zero usage stays `null`, not protocol), a lifecycle or message record before `started`, `agent_settled` without an assistant terminal, a second `agent_settled`, `handled`/`queued`: all protocol, no acceptance or resend |
-| `pi_acceptance` | Only `started` accepts; `success:false` → `Rejected{VendorError}` with VIA-owned text and no code; lost reply → unknown submission; a pre-acceptance compaction sample arrives after `turn.accepted` |
+| `pi_acceptance` | Only `started` accepts; `success:false` → `Rejected{VendorError}` with VIA-owned text and no code; lost reply → unknown submission; a pre-acceptance compaction sample arrives after `turn.accepted`, up to 64 of them (`pi_protocol_typed`: 65 is protocol) |
 | `pi_settled_not_agent_end` | Auto-retry with several `agent_end` records gives one terminal at `agent_settled`; stdin stays open until then |
 | `pi_terminal_mapping` | Every §5.3 row; only the terminal message is final text; the system message never reaches final text, progress or the envelope |
 | `pi_progress_deltas` | One text block streaming longer than `idle_ms` keeps the turn alive; usage snapshots never become samples; idle expiry waits for the decode fence |

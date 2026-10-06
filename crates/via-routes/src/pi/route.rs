@@ -42,6 +42,13 @@ const DECLINE_WITHIN: Duration = Duration::from_secs(5);
 /// blocked (packet §6).
 const READ_AHEAD: usize = 1024;
 
+/// The most compactions Route admits before the prompt's `started` reply
+/// (picrit #8). Their samples wait in the Adapter until acceptance and
+/// emit nothing meanwhile, so the hop's bound does not bound them. Pi
+/// compacts at most once before a prompt (E63); 64 leaves room for any
+/// retry while keeping the held samples a few KiB.
+pub const HELD_SAMPLES_MAX: usize = 64;
+
 /// The fire-and-forget methods (packet §6): activity. Every other
 /// method, a dialog (`select`, `confirm`, `input`, `editor`) or one VIA
 /// does not know, is reported once cancelled, and fails closed without an
@@ -291,6 +298,8 @@ pub(crate) struct PiLane {
     /// The last assistant message since `started`.
     assistant: Option<Box<AssistantEnd>>,
     abort_answered: Option<bool>,
+    /// Compactions admitted before `started` ([`HELD_SAMPLES_MAX`]).
+    held: usize,
 }
 
 /// A dialog VIA could not cancel, or cannot be answered: the turn fails
@@ -606,6 +615,7 @@ impl PrivateProtocol for PiLane {
             phase: Phase::Handshake,
             assistant: None,
             abort_answered: None,
+            held: 0,
         }
     }
 
@@ -665,7 +675,7 @@ impl PrivateProtocol for PiLane {
 
     /// The phase rules Route keeps (packet §5.1): replies paired; before
     /// `started`, a lifecycle, message or tool record is protocol and
-    /// compaction is activity; one `agent_settled`, only after an
+    /// compaction is admitted, at most [`HELD_SAMPLES_MAX`] times; one `agent_settled`, only after an
     /// assistant message that is not a tool request; every dialog with an
     /// ID cancelled at once, one without an ID protocol.
     async fn admit(
@@ -677,6 +687,13 @@ impl PrivateProtocol for PiLane {
         let item = match record {
             Record::Response(reply) => lane.reply(turn, &reply)?,
             Record::UiRequest(request) => return Self::decline(serving, request).await,
+            Record::CompactionEnd(_) if !matches!(lane.phase, Phase::Started | Phase::Settled) => {
+                lane.held += 1;
+                if lane.held > HELD_SAMPLES_MAX {
+                    return Err(protocol(turn, "too many compactions before started").into());
+                }
+                PiItem::Record(record)
+            }
             Record::CompactionEnd(_) | Record::Activity => PiItem::Record(record),
             _ if !matches!(lane.phase, Phase::Started | Phase::Settled) => {
                 return Err(

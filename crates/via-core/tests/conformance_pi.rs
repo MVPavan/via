@@ -1704,7 +1704,8 @@ fn terminated() -> Vec<Value> {
 /// `pi_protocol_typed` (packet §5.1): a reply with another `command` for a
 /// known `id`, a duplicate reply, a reply missing required fields (a
 /// `get_state` without `sessionFile` among them), a `parse` reply, `handled`/`queued` dispositions, a lifecycle or message
-/// record before `started`, an assistant `message_end` without `content`
+/// record before `started`, more than 64 compactions before `started`, an
+/// assistant `message_end` without `content`
 /// or `usage` or with a non-numeric usage member, `agent_settled` with no
 /// assistant terminal and a second `agent_settled`: every one is
 /// `protocol`, and nothing is accepted or resent before `started`.
@@ -1824,6 +1825,15 @@ fn pi_protocol_typed() {
         run.push(message_end(&message));
         cases.push((name, run, true));
     }
+    // Picrit #8: samples held for acceptance are bounded; past 64
+    // compactions before `started`, the turn fails protocol.
+    let mut compactions = vec![expect_prompt("Say READY.")];
+    for _ in 0..65 {
+        compactions.push(emit(&json!({"type": "compaction_end", "aborted": false,
+            "result": {"summary": "s", "usage": usage(40, 8, 0, 0, 0.25)}})));
+    }
+    compactions.push(started());
+    cases.push(("pi_protocol_held_samples", compactions, false));
     let mut settled_alone = prompt("Say READY.");
     settled_alone.extend(echo("Say READY."));
     settled_alone.push(emit(&json!({"type": "agent_settled"})));
@@ -1965,6 +1975,36 @@ fn pi_acceptance() {
         Knobs::default(),
     )
     .unwrap();
+    // Picrit #8: the bound's last admitted compaction, 64, still accepts,
+    // every held sample delivered.
+    let mut steps = handshake(&State::default());
+    steps.push(expect_prompt("Say READY."));
+    for _ in 0..64 {
+        steps.push(emit(&json!({"type": "compaction_end", "aborted": false,
+            "result": {"summary": "summary", "usage": compacted}})));
+    }
+    steps.push(started());
+    steps.extend(echo("Say READY."));
+    steps.extend(answer("READY", "stop", &canonical_usage()));
+    steps.extend(settle(&assistant(
+        json!([{"type": "text", "text": "READY"}]),
+        "stop",
+        &canonical_usage(),
+        None,
+    )));
+    steps.push(eof());
+    let replay = single(
+        "synthetic (via-jt8.3.2): 64 compactions before started",
+        argv(Argv::default()),
+        steps,
+    );
+    let mut wanted = completed(1, "READY");
+    wanted["usage"] = json!({"from": "samples", "input_tokens": 64 * 40 + 100,
+        "cached_input_tokens": 20, "output_tokens": 64 * 8 + 10,
+        "total_tokens": 64 * 48 + 110, "scope": "turn"});
+    wanted["terminal"]["cost"] = estimated(64.0 * 0.25 + 0.5);
+    let expect = case("pi_acceptance_held_64", 1, vec![turn("Say READY.", wanted)]);
+    check_built("pi_acceptance_held_64", &replay, &expect, Knobs::default()).unwrap();
 }
 
 /// `pi_settled_not_agent_end` (E28): an auto-retried error gives
