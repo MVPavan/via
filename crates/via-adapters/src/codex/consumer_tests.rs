@@ -1806,7 +1806,7 @@ fn a_sample_lost_while_draining_unaccounts_the_turn() {
 #[tokio::test]
 async fn a_rejection_during_p7_unaccounts_an_undecided_cut() {
     use super::super::driver::{Cut, accounted};
-    let mut fixture = Fixture::new();
+    let fixture = Fixture::new();
     let b = fixture.start(2);
     fixture.reply(2, Some(B));
     fixture.push(message(&tool_started(B, "tool-b"), 5, (Some(B), Some(2))));
