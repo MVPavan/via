@@ -134,9 +134,9 @@ default. Check init `claude_code_version` on every launch, parsing the
 complete version including any prerelease/build qualifier, never guessed from
 an executable filename. A version in the adapter's `checked` set (versions the
 maintainers' cheap live check passed: 2.1.285; and from the live round of
-2026-10-05, 2.1.289) is `tested`. 2.1.290 qualification pending run 7
-of `scripts/qualify/claude.py` as hardened after its critical review
-(§4, §9, bead via-kr9); until then it is `untested`. Any version outside
+2026-10-05, 2.1.289; and from qualification run 7 of
+`scripts/qualify/claude.py` as hardened after its critical review, 2.1.290;
+§4, §9, bead via-kr9) is `tested`. Any version outside
 the set is `untested`, with warning `vendor_version_untested`, and proceeds. Only a failed handshake
 check on something VIA relies on (`interrupt_receipt_v1`, the permission-mode
 echo, the tool list) refuses the instance. Init follows the prompt line, so
@@ -174,10 +174,10 @@ settings files and loads built-ins only (help 2.1.289; states in the
 inherited-configuration table below). `--strict-mcp-config` is passed, in
 either mode, only when MCP servers are requested off; Claude's default
 request loads them (owner, 2026-10-05). The qualification runner's run 6
-(2026-10-06, below) saw this exact recipe on 2.1.290: every launch's argv
-carried it, in both modes, and with `--strict-mcp-config` in the
-unrestricted mode. Qualifying the `full` bound's recipe, not any narrower
-bound (§8), is pending run 7 with the hardened runner. Explicit Bash enables general command
+and run 7 (2026-10-06, below) saw this exact recipe on 2.1.290: every
+launch's argv carried it, in both modes, and with `--strict-mcp-config` in
+the unrestricted mode. Run 7 qualifies the `full` bound's recipe, not any
+narrower bound (§8). Explicit Bash enables general command
 execution in the `full` bound in both modes; Bash wrote outside the
 workspace in both (round 1, restricted; round-2 probe u1, unrestricted).
 The file tools differ by mode:
@@ -391,8 +391,8 @@ launch.
 Live through VIA on 2.1.290 (run 4, 2026-10-06, Haiku, bead via-jne; fresh
 VIA state directory, gitignored evidence in
 `scratchpad/execution/claude-live/run-4/`). This is partial live evidence,
-not qualification: it does not meet §9's bar. 2.1.290's qualification is
-pending run 7 with the qualification runner (bead via-kr9):
+not qualification: it does not meet §9's bar. 2.1.290 was qualified by
+run 7 of the qualification runner (below; bead via-kr9):
 - Default mode: a spawn and its resume both completed, the resume returned
   `alpha` (also readable from turn 1's file, so continuity is unproved),
   and the files the turns left were mode 0644. The
@@ -422,12 +422,16 @@ pending run 7 with the qualification runner (bead via-kr9):
   same session then completed. This matches §3's `cancel: partial:
   aborts_tools_then_result` and §7.
 
-Qualification runner on 2.1.290 (run 6, 2026-10-06, Haiku, bead via-kr9;
-`scripts/qualify/claude.py` after the review fixes, gitignored evidence,
-reported cost 0.089 USD of a 0.75 USD cap). Run 6 predates the runner's
-critical-review hardening, so it does not put 2.1.290 in the checked set
-(§3): 2.1.290 qualification pending run 7. In run 6 every
-case passed, every envelope reported 2.1.290 as `claude --version` did, and
+Qualification runner on 2.1.290 (run 7, 2026-10-06, Haiku, bead via-kr9;
+`scripts/qualify/claude.py` as merged after its critical review, gitignored
+evidence, reported cost 0.199 USD of a 0.75 USD cap). Run 7 puts 2.1.290 in
+the checked set (§3): its `summary.json` result is `pass`, with every case
+`pass`, version check `pass` (every envelope reported 2.1.290, as `claude
+--version` did), every daemon verified stopped, no accounting failure and
+no interruption. The detail below was recorded from run 6 (2026-10-06,
+0.089 USD), which predates the runner's hardening and so did not qualify
+on its own; run 7 checked the same cases under the stricter rules. In run
+6 every case passed, every envelope reported 2.1.290 as `claude --version` did, and
 every daemon stopped. Every launch's argv carried the full §4 recipe for
 its turn, and every completed turn reported a positive cost above the
 session's previous one:
