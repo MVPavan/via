@@ -3,8 +3,8 @@
 use serde_json::json;
 use via_adapters::{
     AdapterError, ClassHint, Cleanup, RouteError, RouteFailure, StartRejected, StopCause,
-    StopOrder, StopReason, TurnEvidence, VendorTerminal, VendorTerminalStatus, VersionStatus,
-    WireCleanup,
+    StopOrder, StopReason, TurnEvidence, VendorSetting, VendorTerminal, VendorTerminalStatus,
+    VersionStatus, WireCleanup,
 };
 use via_store::{CancelCause, InstanceRecord};
 
@@ -667,7 +667,7 @@ fn failed_terminal(error: &AdapterError, vendor: Option<&VendorTerminal>) -> Ter
             (state, class, stop_reason, submit_data(&route.cause))
         }
         // C1 §8.2: a definite rejection before acceptance; only the
-        // adapter-side parameter rejection names its reason.
+        // adapter-side rejections name their reason (C1 §5 `failure.data`).
         AdapterError::Rejected { reason, .. } => {
             let data = match reason {
                 StartRejected::InvalidParam { field } => {
@@ -675,10 +675,14 @@ fn failed_terminal(error: &AdapterError, vendor: Option<&VendorTerminal>) -> Ter
                 }
                 // The vendor's own code and bounded detail (AD5, C1 §5).
                 StartRejected::VendorError(code, detail) => {
-                    vendor_code = Some(code.clone());
+                    vendor_code = code.as_ref().map(|code| code.as_str().to_owned());
                     message.clone_from(detail);
                     None
                 }
+                StartRejected::UncertainPredecessor => {
+                    Some(json!({"reason": "uncertain_predecessor"}))
+                }
+                StartRejected::SettingsMismatch { setting } => Some(settings_mismatch(*setting)),
                 StartRejected::BoundUnsupported(_)
                 | StartRejected::SessionGone
                 | StartRejected::Protocol(_) => None,
@@ -704,6 +708,21 @@ fn failed_terminal(error: &AdapterError, vendor: Option<&VendorTerminal>) -> Ter
     });
     terminal.vendor_stop_reason = vendor.map(|vendor| vendor.vendor_stop_reason.clone());
     terminal
+}
+
+/// C1 §5 `failure.data` of a reopened session's settings mismatch: the C1
+/// parameter whose persisted vendor value differs, where there is one.
+fn settings_mismatch(setting: VendorSetting) -> serde_json::Value {
+    let field = match setting {
+        VendorSetting::Model => Some("model"),
+        VendorSetting::Instructions => Some("instructions"),
+        // No C1 parameter: VIA fixes the agent and the permission rules.
+        VendorSetting::Agent | VendorSetting::Permissions => None,
+    };
+    match field {
+        Some(field) => json!({"reason": "settings_mismatch", "field": field}),
+        None => json!({"reason": "settings_mismatch"}),
+    }
 }
 
 /// Test builds only (Task 4 design §6.4, §13.2; C1 §5): the encoded
@@ -962,7 +981,7 @@ mod tests {
         };
         let rejected = failed_terminal(AdapterError::Rejected {
             reason: via_adapters::StartRejected::VendorError(
-                "E429".to_owned(),
+                Some(via_adapters::VendorCode::from("E429".to_owned())),
                 "quota exhausted".to_owned(),
             ),
             evidence: evidence.clone(),
@@ -978,6 +997,76 @@ mod tests {
         assert_eq!(failure.class, FailureClass::SubmitFailed);
         assert_eq!(failure.vendor_code.as_deref(), Some("E429"));
         assert_eq!(failure.message, "quota exhausted");
+    }
+
+    fn rejected(reason: via_adapters::StartRejected) -> crate::api::Failure {
+        failed_terminal(AdapterError::Rejected {
+            reason,
+            evidence: via_adapters::TurnEvidence::no_launch(false),
+        })
+        .failure
+        .expect("a rejection fails")
+    }
+
+    /// C2 gap A4 (C2 §2 `StartRejected::VendorError`): a vendor rejection
+    /// with no code (Pi's prompt rejections) keeps its detail and reports
+    /// no `vendor_code`.
+    #[test]
+    fn a_codeless_vendor_rejection_has_no_vendor_code() {
+        let failure = rejected(via_adapters::StartRejected::VendorError(
+            None,
+            "prompt rejected".to_owned(),
+        ));
+        assert_eq!(failure.class, FailureClass::SubmitFailed);
+        assert_eq!(failure.vendor_code, None);
+        assert_eq!(failure.message, "prompt rejected");
+        assert_eq!(failure.data, None);
+    }
+
+    /// C2 gap A3 (C2 §2 `StartRejected`, C1 §5 `failure.data`): an
+    /// unproven predecessor launch is `submit_failed` with
+    /// `data.reason:"uncertain_predecessor"` and no field.
+    #[test]
+    fn an_uncertain_predecessor_is_submit_failed_with_its_reason() {
+        let failure = rejected(via_adapters::StartRejected::UncertainPredecessor);
+        assert_eq!(failure.class, FailureClass::SubmitFailed);
+        assert_eq!(failure.vendor_code, None);
+        assert_eq!(
+            failure.data,
+            Some(serde_json::json!({"reason": "uncertain_predecessor"}))
+        );
+    }
+
+    /// C2 gap A2 (C2 §2 `StartRejected`, C1 §5 `failure.data`): a reopened
+    /// session's settings mismatch is `submit_failed` with
+    /// `data.reason:"settings_mismatch"`, naming the C1 parameter only for
+    /// the model and the instructions.
+    #[test]
+    fn a_settings_mismatch_is_submit_failed_naming_its_c1_field() {
+        use via_adapters::VendorSetting;
+        for (setting, data) in [
+            (
+                VendorSetting::Model,
+                serde_json::json!({"reason": "settings_mismatch", "field": "model"}),
+            ),
+            (
+                VendorSetting::Instructions,
+                serde_json::json!({"reason": "settings_mismatch", "field": "instructions"}),
+            ),
+            (
+                VendorSetting::Agent,
+                serde_json::json!({"reason": "settings_mismatch"}),
+            ),
+            (
+                VendorSetting::Permissions,
+                serde_json::json!({"reason": "settings_mismatch"}),
+            ),
+        ] {
+            let failure = rejected(via_adapters::StartRejected::SettingsMismatch { setting });
+            assert_eq!(failure.class, FailureClass::SubmitFailed, "{setting:?}");
+            assert_eq!(failure.vendor_code, None, "{setting:?}");
+            assert_eq!(failure.data, Some(data), "{setting:?}");
+        }
     }
 
     /// Sol r4 R6: a turn stopped by a `protocol` order, as an acceptance

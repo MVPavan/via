@@ -2002,6 +2002,8 @@ fn rejected_name(reason: &StartRejected) -> String {
         StartRejected::VendorError(..) => "vendor_error".to_owned(),
         StartRejected::SessionGone => "session_gone".to_owned(),
         StartRejected::Protocol(_) => "protocol".to_owned(),
+        StartRejected::UncertainPredecessor => "uncertain_predecessor".to_owned(),
+        StartRejected::SettingsMismatch { .. } => "settings_mismatch".to_owned(),
     }
 }
 

@@ -1283,6 +1283,8 @@ const REJECTED: &[&str] = &[
     "vendor_error",
     "session_gone",
     "protocol",
+    "uncertain_predecessor",
+    "settings_mismatch",
 ];
 /// C2 `Refusal` kinds; a name ending in `:` takes a non-empty suffix.
 const REFUSAL: &[&str] = &[

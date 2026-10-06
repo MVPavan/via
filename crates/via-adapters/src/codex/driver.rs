@@ -77,7 +77,8 @@ use crate::plan::{Bound, Inherit, RefusalKind};
 use crate::runtime::event_stall;
 use crate::{
     AcceptanceToken, Cleanup, Deadline, DriverFailure, DriverHealth, ProcessOwner, RouteError,
-    RouteFailure, StartRejected, StopCause, StopOrder, StopWatch, TurnNumber, VendorTerminalStatus,
+    RouteFailure, StartRejected, StopCause, StopOrder, StopWatch, TurnNumber, VendorCode,
+    VendorTerminalStatus,
 };
 
 /// How long the link of a turn to its server may take (X0 item 1.5).
@@ -2097,7 +2098,10 @@ fn thread_refused(error: &RpcError, resume: bool) -> StartRejected {
     if resume && error.message.contains(NO_ROLLOUT) {
         StartRejected::SessionGone
     } else {
-        StartRejected::VendorError(error.code.to_string(), error.message.clone())
+        StartRejected::VendorError(
+            Some(VendorCode::from(error.code.to_string())),
+            error.message.clone(),
+        )
     }
 }
 
@@ -2413,7 +2417,7 @@ async fn run_started(
         Err(_) if reply.contradicted => return contradicted(facts, start, start_id),
         Err(error) => {
             return facts.rejected(StartRejected::VendorError(
-                error.code.to_string(),
+                Some(VendorCode::from(error.code.to_string())),
                 error.message,
             ));
         }

@@ -39,7 +39,7 @@ use crate::plan::VersionStatus;
 use crate::{
     AcceptanceToken, ClassHint, CostReport, Decline, Denial, DenialKind, InstanceReport,
     MAX_OBSERVATION_BYTES, Observation, ProgressMarks, StartRejected, StopReason, UsageSample,
-    VendorTerminal, VendorTerminalStatus, final_text_pieces,
+    VendorCode, VendorTerminal, VendorTerminalStatus, final_text_pieces,
 };
 
 /// The most IDs each per-launch set admits: calls (open and completed
@@ -605,10 +605,12 @@ impl Normalizer {
             return StartRejected::SessionGone;
         }
         StartRejected::VendorError(
-            result
-                .terminal_reason
-                .clone()
-                .unwrap_or_else(|| result.subtype.clone()),
+            Some(VendorCode::from(
+                result
+                    .terminal_reason
+                    .clone()
+                    .unwrap_or_else(|| result.subtype.clone()),
+            )),
             detail(result),
         )
     }

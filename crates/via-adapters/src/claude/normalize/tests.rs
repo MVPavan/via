@@ -317,7 +317,8 @@ fn c0_pre_init_rejection_confirms_nothing() {
     let (_, run) = replay("c0_invalid_resume", &facts(sid, false));
     assert!(matches!(
         run.end(),
-        Some(End::Rejected(StartRejected::VendorError(code, _))) if code == "error_during_execution"
+        Some(End::Rejected(StartRejected::VendorError(Some(code), _)))
+            if code.as_str() == "error_during_execution"
     ));
 }
 

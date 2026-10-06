@@ -66,12 +66,53 @@ pub enum StartRejected {
         /// The C1 parameter.
         field: &'static str,
     },
-    /// Vendor returned a definite error code and description.
-    VendorError(String, String),
+    /// Vendor returned a definite rejection: its code, absent when the
+    /// rejection carries none (Pi's prompt rejections), and description.
+    VendorError(Option<VendorCode>, String),
     /// The vendor session no longer exists.
     SessionGone,
     /// A known vendor response was malformed or contradictory.
     Protocol(String),
+    /// An earlier launch of this session is not proven gone; nothing was
+    /// launched (runtime §5.2).
+    UncertainPredecessor,
+    /// A reopened vendor session's persisted settings differ from the
+    /// session's frozen values; nothing was sent.
+    SettingsMismatch {
+        /// The first setting found to differ.
+        setting: VendorSetting,
+    },
+}
+
+/// A vendor's own failure code, kept apart from its free-text detail.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VendorCode(String);
+
+impl From<String> for VendorCode {
+    fn from(code: String) -> Self {
+        Self(code)
+    }
+}
+
+impl VendorCode {
+    /// Returns the vendor's code.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A persisted vendor-session setting VIA reads back on reopen (C2 §2
+/// `StartRejected::SettingsMismatch`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VendorSetting {
+    /// The session's model.
+    Model,
+    /// The vendor agent the session runs as.
+    Agent,
+    /// The session's permission rules.
+    Permissions,
+    /// The session's instructions.
+    Instructions,
 }
 
 /// Whether the turn's side effects are known to have stopped.
