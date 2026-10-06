@@ -773,10 +773,14 @@ same pass), then one Store read of the session's `Turn` anchors with
 cleanup predicate, §6 `anchors`, without its `server_turns` clause);
 `Ok(true)` only when none remains. `Ok(false)` means the Store
 answered and a group is unproven. A Store failure is `Err`, never `false`
-(decision C-3, orchestrator, 2026-10-06): a failed or timed-out read, an
-uncertain proof commit, and a proof the pass observed but did not commit
-(`Journal {Absence}`; its token stays held). A deadline spent before the
-Store read is `HostError::Deadline`.
+(decision C-3, orchestrator, 2026-10-06): a failed or timed-out read, a
+reply that arrives only after the deadline, an uncertain proof commit, and
+a proof the pass observed but did not commit (`Journal {Absence}`; its
+token stays held). A deadline spent before the Store read is
+`HostError::Deadline`. The answer is a Store snapshot at the read; callers
+serialize a session's launches (Core runs one turn of a session at a time),
+so no launch of the session starts between the check and the launch it
+guards.
 
 A lost final anchor reply initially means uncertain outcome. A later fresh
 `ESRCH` can settle **cleanup** to quiescent, including after autonomous EOF

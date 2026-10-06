@@ -623,8 +623,9 @@ predicate.
   a committed `GroupAbsent` proof, whether held, busy, or not yet re-held
   from the journal after a restart.
 - **Bound.** One pass of runtime §5.2's non-signalling probe, within the
-  turn's wall deadline. It signals nothing, waits for nothing and acquires
-  no lock or writer.
+  turn's wall deadline. It signals nothing, waits for no vendor process,
+  and acquires no vendor or session-file lock or writer; it waits only for
+  its Store replies and may commit an absence proof.
 - **Not proven** (the Store answered and a record is still without a
   proof: a group still present or busy, a probe denial or namespace
   mismatch, an identity-less record, a recovery record not yet re-held):
