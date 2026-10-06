@@ -490,6 +490,7 @@ async fn spawn_vendor(
         command.args(vendor.args());
         command
     };
+    // Synchronous `chdir` at spawn: runtime §5 needs a local, responsive state directory.
     command.current_dir(vendor.cwd()).env_clear();
     for (key, value) in vendor.env() {
         command.env(key, value);

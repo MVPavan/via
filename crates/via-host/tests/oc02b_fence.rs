@@ -100,6 +100,7 @@ const CASES: &[Case] = &[
         "oc02b_leader_exited_predecessor_is_present",
         leader_exited_predecessor,
     ),
+    #[cfg(feature = "test-failpoints")]
     case(
         "oc02b_de_thread_interleaving_is_present_throughout",
         de_thread_interleaving,
@@ -256,6 +257,9 @@ fn fence(error: HostError) -> FenceRefusal {
 /// The lock file is created 0600 and never unlinked; only the anchor
 /// holds it: the vendor and its leftover child have no descriptor of it
 /// and no `lock:` line, and the vendor has exactly its standard streams.
+/// The acquisition carries the vendor's pid (runtime §5
+/// `AcquiredProcess.vendor_pid`, review ochostcrit #5): the pid the
+/// exec entry kept through exec, which the record names.
 fn lock_is_private() {
     runtime().block_on(async {
         let fixture = Fixture::new();
@@ -296,6 +300,7 @@ fn lock_is_private() {
         assert_eq!(vendor["ppid"], anchor);
         assert_eq!(vendor["death_signal"], 9, "SIGKILL parent-death signal");
         let pid = pid_of(&vendor);
+        assert_eq!(acquired.vendor_pid, pid);
         assert_eq!(recorded(&fixture.lock()), Some((pid, stat(pid).unwrap().1)));
         close(acquired).await;
         assert!(fixture.lock().is_file(), "server.lock unlinked");
@@ -453,32 +458,45 @@ fn gone_records_admit() {
     });
 }
 
-/// A record from this boot but another PID namespace is uncertain:
-/// `PredecessorUncertain` naming that namespace, nothing launched.
+/// A record from this boot but another PID namespace, or another time
+/// namespace (whose start ticks carry another offset), is uncertain:
+/// `PredecessorUncertain` naming that namespace, nothing launched. It names
+/// this process with other start ticks, which this namespace would read as
+/// another process.
 fn other_namespace() {
     runtime().block_on(async {
         let fixture = Fixture::new();
         let host = fixture.host();
-        fs::write(
-            fixture.lock(),
-            record(&boot_id(), "pid:[1]", std::process::id(), 1),
-        )
-        .unwrap();
-        let refused = host
-            .acquire(
-                fixture.spec(&["report", arg(&fixture.report("vendor"))]),
-                within(10),
-            )
-            .await
-            .err()
-            .expect("refused");
-        assert_eq!(refused.cause().unwrap().step, "predecessor check");
-        assert_eq!(
-            fence(refused),
-            FenceRefusal::PredecessorUncertain {
-                namespace: "pid:[1]".into()
-            }
-        );
+        let (boot, own) = (boot_id(), std::process::id());
+        let other_time = if support::time_namespace() == "time:[1]" {
+            "time:[2]"
+        } else {
+            "time:[1]"
+        };
+        for (bytes, namespace) in [
+            (record(&boot, "pid:[1]", own, 1), "pid:[1]"),
+            (
+                support::record_in(&boot, &pid_namespace(), other_time, own, 1),
+                other_time,
+            ),
+        ] {
+            fs::write(fixture.lock(), bytes).unwrap();
+            let refused = host
+                .acquire(
+                    fixture.spec(&["report", arg(&fixture.report("vendor"))]),
+                    within(10),
+                )
+                .await
+                .err()
+                .expect("refused");
+            assert_eq!(refused.cause().unwrap().step, "predecessor check");
+            assert_eq!(
+                fence(refused),
+                FenceRefusal::PredecessorUncertain {
+                    namespace: namespace.into()
+                }
+            );
+        }
         assert_eq!(fixture.arm_intents().await, 0);
     });
 }
@@ -790,11 +808,18 @@ fn leader_exited_predecessor() {
     });
 }
 
-/// The review's interleaving: a leader-exited process whose worker threads
-/// exec again one after another, each replacing the leader through
-/// `de_thread`, is present before, between and after each release, and
-/// admitted only after it exits.
+/// The review's interleaving, forced at one boundary of the predecessor
+/// proof: a leader-exited process whose worker threads exec again one after
+/// another, each replacing the leader through `de_thread`. For each exec,
+/// the proof is held at `host.anchor.predecessor_after_identity` (its first
+/// identity read done, `pidfd_open` not yet called) while the worker's exec
+/// is released and completes; then the proof goes on and finds it present.
+/// Unforced checks before and after each exec are present too, and it is
+/// admitted only after the process exits. Other boundaries (between the
+/// open, the second read and the poll) are not forced.
+#[cfg(feature = "test-failpoints")]
 fn de_thread_interleaving() {
+    const POINT: &str = "host.anchor.predecessor_after_identity";
     runtime().block_on(async {
         let fixture = Fixture::new();
         let mut helper = python_threads(&fixture, 2);
@@ -807,12 +832,19 @@ fn de_thread_interleaving() {
         });
         assert_eq!(check(&fixture, pid, ticks, "before").await, present);
         for stage in [2_u32, 1] {
-            fs::write(fixture.report(&format!("release-{stage}")), b"").unwrap();
-            assert_eq!(
-                check(&fixture, pid, ticks, &format!("during-{stage}")).await,
-                present
-            );
-            ready(&fixture, stage - 1).await;
+            fixture.arm(POINT, "pause");
+            let exec = async {
+                fixture.acked(POINT).await;
+                let next = fixture.report(&format!("ready-{}", stage - 1));
+                assert!(!next.exists(), "the exec ran before the proof was held");
+                fs::write(fixture.report(&format!("release-{stage}")), b"").unwrap();
+                ready(&fixture, stage - 1).await;
+                fixture.release(POINT);
+            };
+            let name = format!("during-{stage}");
+            let (during, ()) = tokio::join!(check(&fixture, pid, ticks, &name), exec);
+            assert_eq!(during, present, "exec {stage} between identity and open");
+            fixture.reset(POINT);
             assert_eq!(stat(pid).unwrap().1, ticks, "exec changed the start ticks");
             assert_eq!(
                 check(&fixture, pid, ticks, &format!("after-{stage}")).await,
@@ -1116,10 +1148,13 @@ fn stderr_counted_only() {
         .unwrap()
         .unwrap();
         assert_eq!(exit.code, Some(0));
-        assert_eq!(
-            acquired.control.stderr_bytes(),
-            Some(SECRET.len() as u64 + 1)
-        );
+        // The drain's EOF is independent of the exit notification: the
+        // final count is waited for, never assumed present at exit.
+        let count = support::wait_for(Duration::from_secs(5), || async {
+            acquired.control.stderr_bytes()
+        })
+        .await;
+        assert_eq!(count, Some(SECRET.len() as u64 + 1));
         assert!(!stderr_path.exists(), "a stderr.log under CountOnly");
         close(acquired).await;
         for file in support::files(&fixture.root) {

@@ -685,6 +685,10 @@ pub struct AcquiredProcess {
     pub control: ProcessControl,
     /// Confirmed vendor exit, independent of protocol result.
     pub exits: ExitReceiver,
+    /// The vendor child's pid from the anchor's `Spawned` reply, passive
+    /// data passed through Wire to the route (runtime §5; `OpenCode`'s
+    /// `/api/info` check). It is evidence, never signalling authority.
+    pub vendor_pid: u32,
 }
 
 struct StartedAnchor {
@@ -1753,6 +1757,7 @@ impl Host {
             pipes,
             control,
             exits,
+            vendor_pid,
         })
     }
 

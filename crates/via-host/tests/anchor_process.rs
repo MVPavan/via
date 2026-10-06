@@ -793,6 +793,7 @@ async fn vendor_exited_unobserved(
         pipes,
         control,
         exits,
+        ..
     } = acquired;
     drop(pipes.stdin);
     let started = std::time::Instant::now();

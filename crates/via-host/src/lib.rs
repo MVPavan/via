@@ -192,9 +192,11 @@ pub enum FenceRefusal {
         /// Its recorded start, in clock ticks after boot.
         start_ticks: u64,
     },
-    /// The record comes from this boot but another PID namespace.
+    /// The record comes from this boot but another PID or time namespace,
+    /// or is malformed.
     PredecessorUncertain {
-        /// The record's PID-namespace identity.
+        /// The record's other PID- or time-namespace identity, or the
+        /// malformed-record text.
         namespace: String,
     },
     /// The anchor could not write the server record at ARM; it killed its

@@ -18,6 +18,22 @@ pub(crate) fn pid_namespace() -> io::Result<String> {
         .into_owned())
 }
 
+/// The time namespace on a kernel without time namespaces, where
+/// `/proc/self/ns/time` does not exist and no clock offset can apply.
+pub(crate) const NO_TIME_NAMESPACE: &str = "time:none";
+
+/// This process's time-namespace identity, `/proc/self/ns/time`
+/// (`time:[<inode>]`), or [`NO_TIME_NAMESPACE`] when the kernel has none.
+/// `/proc/<pid>/stat` start ticks are shifted by the reader's time-namespace
+/// offset, so ticks compare only within one time namespace.
+pub(crate) fn time_namespace() -> io::Result<String> {
+    match fs::read_link("/proc/self/ns/time") {
+        Ok(link) => Ok(link.to_string_lossy().into_owned()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(NO_TIME_NAMESPACE.to_owned()),
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) fn process_stat(process_id: u32) -> io::Result<(u32, u64)> {
     let text = fs::read_to_string(format!("/proc/{process_id}/stat"))?;
     let rest = text

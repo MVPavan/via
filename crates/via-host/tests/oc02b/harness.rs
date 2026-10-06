@@ -1,6 +1,7 @@
 //! A minimal libtest-compatible runner for a `harness = false` test binary:
 //! `--list` (with `--ignored`) prints `name: test` lines, and a run selects
-//! cases by name (`--exact` or substring), skipping ignored ones unless
+//! cases by name (`--exact` or substring), less those a `--skip` names
+//! (matched the same way), skipping ignored ones unless
 //! `--ignored` or `--include-ignored` is given. Nextest runs one case per
 //! process; a run of several cases re-executes this binary once per case,
 //! so every case gets a fresh process (failpoint activation and the
@@ -25,11 +26,13 @@ pub(crate) fn main(args: &[OsString], cases: &[Case]) -> ExitCode {
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
     let mut filters = Vec::new();
+    let mut skips = Vec::new();
     let mut flags = Vec::new();
     let mut values = args.iter();
     while let Some(arg) = values.next() {
         match arg.as_str() {
-            "--format" | "--test-threads" | "--color" | "--skip" | "--logfile" | "-Z" => {
+            "--skip" => skips.extend(values.next().cloned()),
+            "--format" | "--test-threads" | "--color" | "--logfile" | "-Z" => {
                 values.next();
             }
             flag if flag.starts_with('-') => flags.push(flag.to_owned()),
@@ -40,15 +43,16 @@ pub(crate) fn main(args: &[OsString], cases: &[Case]) -> ExitCode {
     let exact = has("--exact");
     let only_ignored = has("--ignored");
     let include_ignored = has("--include-ignored");
+    let matches = |name: &str, filter: &String| {
+        if exact {
+            name == filter
+        } else {
+            name.contains(filter.as_str())
+        }
+    };
     let named = |case: &&Case| {
-        filters.is_empty()
-            || filters.iter().any(|filter| {
-                if exact {
-                    case.name == filter
-                } else {
-                    case.name.contains(filter.as_str())
-                }
-            })
+        (filters.is_empty() || filters.iter().any(|filter| matches(case.name, filter)))
+            && !skips.iter().any(|skip| matches(case.name, skip))
     };
     if has("--list") {
         for case in cases.iter().filter(named) {

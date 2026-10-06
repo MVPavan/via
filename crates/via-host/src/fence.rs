@@ -30,11 +30,14 @@ use crate::{
     protocol::{ProbeConfig, VendorConfig},
 };
 
-/// The server record's fixed length: magic, boot ID and PID namespace (each
-/// [`FIELD`] bytes, NUL-padded), pid, start ticks and a SHA-256 of the rest.
-pub(crate) const RECORD_LEN: usize = 8 + 2 * FIELD + 4 + 8 + 32;
+/// The server record's fixed length: magic, boot ID, PID namespace and time
+/// namespace (each [`FIELD`] bytes, NUL-padded), pid, start ticks and a
+/// SHA-256 of the rest.
+pub(crate) const RECORD_LEN: usize = 8 + TEXT_FIELDS * FIELD + 4 + 8 + 32;
 const MAGIC: &[u8; 8] = b"VIASRV\0\x01";
 const FIELD: usize = 64;
+/// The record's text fields: boot ID, PID namespace, time namespace.
+const TEXT_FIELDS: usize = 3;
 /// How long a present predecessor is waited for (runtime §5 step 4).
 const PREDECESSOR_WAIT: Duration = Duration::from_secs(1);
 /// The predecessor poll's interval: the pidfd is polled without blocking
@@ -51,17 +54,21 @@ const MALFORMED: &str = "malformed server record";
 pub(crate) struct ServerRecord {
     pub boot_id: String,
     pub pid_namespace: String,
+    /// The writer's time namespace: start ticks are shifted by the reader's
+    /// time-namespace offset, so they compare only within one.
+    pub time_namespace: String,
     pub pid: u32,
     pub start_ticks: u64,
 }
 
 impl ServerRecord {
-    /// The record naming `pid` with `start_ticks` in this boot and PID
-    /// namespace.
+    /// The record naming `pid` with `start_ticks` in this boot, PID
+    /// namespace and time namespace.
     pub(crate) fn current(pid: u32, start_ticks: u64) -> io::Result<Self> {
         Ok(Self {
             boot_id: linux::boot_id()?,
             pid_namespace: linux::pid_namespace()?,
+            time_namespace: linux::time_namespace()?,
             pid,
             start_ticks,
         })
@@ -71,14 +78,15 @@ impl ServerRecord {
     pub(crate) fn encode(&self) -> Option<[u8; RECORD_LEN]> {
         let mut bytes = [0_u8; RECORD_LEN];
         bytes[..8].copy_from_slice(MAGIC);
-        for (index, text) in [&self.boot_id, &self.pid_namespace].into_iter().enumerate() {
+        let texts = [&self.boot_id, &self.pid_namespace, &self.time_namespace];
+        for (index, text) in texts.into_iter().enumerate() {
             let start = 8 + index * FIELD;
             bytes
                 .get_mut(start..start + text.len())
                 .filter(|_| text.len() <= FIELD && !text.contains('\0'))?
                 .copy_from_slice(text.as_bytes());
         }
-        let numbers = 8 + 2 * FIELD;
+        let numbers = 8 + TEXT_FIELDS * FIELD;
         bytes[numbers..numbers + 4].copy_from_slice(&self.pid.to_le_bytes());
         bytes[numbers + 4..numbers + 12].copy_from_slice(&self.start_ticks.to_le_bytes());
         let digest = Sha256::digest(&bytes[..RECORD_LEN - 32]);
@@ -105,7 +113,7 @@ impl ServerRecord {
             (padding.iter().all(|byte| *byte == 0) && text.iter().all(u8::is_ascii_graphic))
                 .then(|| String::from_utf8_lossy(text).into_owned())
         };
-        let numbers = 8 + 2 * FIELD;
+        let numbers = 8 + TEXT_FIELDS * FIELD;
         let mut pid = [0_u8; 4];
         pid.copy_from_slice(&record[numbers..numbers + 4]);
         let pid = u32::from_le_bytes(pid);
@@ -115,13 +123,16 @@ impl ServerRecord {
         let well_formed = bytes.len() == RECORD_LEN
             && &record[..8] == MAGIC
             && i32::try_from(pid).is_ok_and(|pid| pid > 0);
-        match (well_formed, text(8), text(8 + FIELD)) {
-            (true, Some(boot_id), Some(pid_namespace))
-                if is_boot_id(&boot_id) && is_pid_namespace(&pid_namespace) =>
+        match (well_formed, text(8), text(8 + FIELD), text(8 + 2 * FIELD)) {
+            (true, Some(boot_id), Some(pid_namespace), Some(time_namespace))
+                if is_boot_id(&boot_id)
+                    && is_namespace(&pid_namespace, "pid")
+                    && is_time_namespace(&time_namespace) =>
             {
                 Decoded::Record(Self {
                     boot_id,
                     pid_namespace,
+                    time_namespace,
                     pid,
                     start_ticks,
                 })
@@ -335,6 +346,7 @@ async fn run_probe(program: &Path, probe: &ProbeConfig) -> Result<(), FenceRefus
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
+    // Synchronous `chdir` at spawn: runtime §5 needs a local, responsive state directory.
     let mut child = crate::anchor::spawn_with_vendor_umask(&mut command).map_err(|error| {
         FenceRefusal::ProbeFailed {
             kind: ProbeFailure::Spawn {
@@ -467,11 +479,18 @@ fn is_boot_id(text: &str) -> bool {
         })
 }
 
-/// A pid namespace as `/proc/self/ns/pid` reads: `pid:[<inode>]`.
-fn is_pid_namespace(text: &str) -> bool {
-    text.strip_prefix("pid:[")
+/// A namespace of `kind` as `/proc/self/ns/<kind>` reads: `<kind>:[<inode>]`.
+fn is_namespace(text: &str, kind: &str) -> bool {
+    text.strip_prefix(kind)
+        .and_then(|rest| rest.strip_prefix(":["))
         .and_then(|rest| rest.strip_suffix(']'))
         .is_some_and(|inode| !inode.is_empty() && inode.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// A time namespace as [`linux::time_namespace`] gives it: `time:[<inode>]`,
+/// or the one token of a kernel without time namespaces.
+fn is_time_namespace(text: &str) -> bool {
+    text == linux::NO_TIME_NAMESPACE || is_namespace(text, "time")
 }
 
 /// Runtime §5 step 4: the recorded server is proved gone, or refused. A
@@ -497,9 +516,16 @@ async fn check_predecessor(record: Decoded) -> Result<(), FenceRefusal> {
             namespace: record.pid_namespace,
         });
     }
+    // Start ticks are shifted by the reader's time-namespace offset (review
+    // ochostcrit #1): another time namespace's ticks prove nothing here.
+    if record.time_namespace != linux::time_namespace().map_err(unreadable)? {
+        return Err(FenceRefusal::PredecessorUncertain {
+            namespace: record.time_namespace,
+        });
+    }
     let deadline = Instant::now() + PREDECESSOR_WAIT;
     loop {
-        if exited(record.pid, record.start_ticks) {
+        if exited(record.pid, record.start_ticks).await {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -515,10 +541,14 @@ async fn check_predecessor(record: Decoded) -> Result<(), FenceRefusal> {
 /// What `/proc/<pid>/stat` says about the recorded process.
 #[derive(Debug, Eq, PartialEq)]
 enum Identity {
-    /// No such entry, or other start ticks: the pid is free or reused.
+    /// Other start ticks: the pid names another process (reused).
     Gone,
     /// The recorded start ticks.
     Matches,
+    /// No such entry (`ENOENT` or `ESRCH`): exited, or hidden by `hidepid`
+    /// (a live same-uid non-dumpable process), so it proves nothing alone
+    /// (review ochostcrit #2); the pidfd decides.
+    Unseen,
     /// It could not be read: fails closed.
     Unreadable,
 }
@@ -535,7 +565,7 @@ fn identity(read: io::Result<String>, ticks: u64) -> Identity {
             if error.kind() == io::ErrorKind::NotFound
                 || error.raw_os_error() == Some(Errno::SRCH.raw_os_error()) =>
         {
-            Identity::Gone
+            Identity::Unseen
         }
         Err(_) => Identity::Unreadable,
     }
@@ -556,14 +586,19 @@ fn read_identity(pid: u32, ticks: u64) -> Identity {
 
 /// One exact exit proof of the recorded process (runtime §5 step 4):
 /// identity first, then `pidfd_open`, identity again, then a pidfd poll
-/// that is readable only once the whole thread group has exited. Anything
-/// else is present.
-fn exited(pid: u32, ticks: u64) -> bool {
+/// that is readable only once the whole thread group has exited. Only a
+/// readable entry with other start ticks is gone at an identity read; an
+/// unseen entry goes on to the pidfd, whose `ESRCH` or readable poll
+/// proves exit. A pid reused after the recorded process left procfs
+/// (unseen, then reused by a live process) is present: that fails
+/// closed, costing liveness only. Anything else is present.
+async fn exited(pid: u32, ticks: u64) -> bool {
     match read_identity(pid, ticks) {
         Identity::Gone => return true,
         Identity::Unreadable => return false,
-        Identity::Matches => {}
+        Identity::Matches | Identity::Unseen => {}
     }
+    proof_seam().await;
     let Some(raw) = i32::try_from(pid).ok().and_then(Pid::from_raw) else {
         return false;
     };
@@ -575,7 +610,7 @@ fn exited(pid: u32, ticks: u64) -> bool {
     match read_identity(pid, ticks) {
         Identity::Gone => return true,
         Identity::Unreadable => return false,
-        Identity::Matches => {}
+        Identity::Matches | Identity::Unseen => {}
     }
     let mut fds = [PollFd::new(&pidfd, PollFlags::IN)];
     let zero = Timespec {
@@ -590,6 +625,21 @@ fn exited(pid: u32, ticks: u64) -> bool {
         }
     }
 }
+
+/// Test-only `host.anchor.predecessor_after_identity`: a pause holds the
+/// predecessor proof between its first identity read and `pidfd_open`, so a
+/// test can force an exec there (`OC02b`).
+#[cfg(feature = "test-failpoints")]
+async fn proof_seam() {
+    // A pause point only: an acknowledgement that cannot be written skips
+    // the pause, and the proof goes on unchanged.
+    let _ = via_store::failpoint::hit_async("host.anchor.predecessor_after_identity").await;
+}
+
+/// Release builds never hold here.
+#[cfg(not(feature = "test-failpoints"))]
+#[expect(clippy::unused_async, reason = "test builds pause here")]
+async fn proof_seam() {}
 
 #[cfg(test)]
 mod tests {
@@ -634,6 +684,7 @@ mod tests {
         ServerRecord {
             boot_id: "0d3f5c2e-1111-2222-3333-444455556666".into(),
             pid_namespace: "pid:[4026531836]".into(),
+            time_namespace: "time:[4026531834]".into(),
             pid: 4242,
             start_ticks: 987_654,
         }
@@ -710,11 +761,74 @@ mod tests {
                 "{boot_id:?} {pid_namespace:?}"
             );
         }
+        // Review ochostcrit #1: the time namespace is in the kernel's form,
+        // or the one token of a kernel without time namespaces.
+        let none = ServerRecord {
+            time_namespace: linux::NO_TIME_NAMESPACE.into(),
+            ..sample()
+        };
+        assert_eq!(
+            ServerRecord::decode(&none.encode().unwrap()),
+            Decoded::Record(none)
+        );
+        for time_namespace in [
+            "",
+            "time:[]",
+            "time:[12x]",
+            "time:None",
+            "time:none ",
+            "pid:[4026531834]",
+            "time_for_children:[4026531834]",
+        ] {
+            let named = ServerRecord {
+                time_namespace: time_namespace.into(),
+                ..sample()
+            };
+            assert_eq!(
+                ServerRecord::decode(&named.encode().unwrap()),
+                Decoded::Malformed,
+                "{time_namespace:?}"
+            );
+        }
         let long = ServerRecord {
             boot_id: "x".repeat(FIELD + 1),
             ..sample()
         };
         assert_eq!(long.encode(), None);
+    }
+
+    fn check(record: ServerRecord) -> Result<(), FenceRefusal> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(check_predecessor(Decoded::Record(record)))
+    }
+
+    /// Review ochostcrit #1: start ticks are shifted by the reader's
+    /// time-namespace offset, so a record from another time namespace on
+    /// this boot and PID namespace proves nothing, even with other ticks:
+    /// `PredecessorUncertain` naming that namespace. The same record from
+    /// this time namespace is admitted (other ticks: another process).
+    #[test]
+    fn a_record_from_another_time_namespace_is_uncertain() {
+        let own = std::process::id();
+        let current = ServerRecord::current(own, linux::process_stat(own).unwrap().1 + 1).unwrap();
+        assert_eq!(check(current.clone()), Ok(()));
+        let other = if current.time_namespace == "time:[1]" {
+            "time:[2]"
+        } else {
+            "time:[1]"
+        };
+        assert_eq!(
+            check(ServerRecord {
+                time_namespace: other.into(),
+                ..current
+            }),
+            Err(FenceRefusal::PredecessorUncertain {
+                namespace: other.into()
+            })
+        );
     }
 
     /// The writer truncates before it writes: over a longer file, only the
@@ -744,25 +858,31 @@ mod tests {
         fs::remove_file(&path).unwrap();
     }
 
-    /// Identity before any open: a missing entry, `ESRCH` and other start
-    /// ticks are gone (a pid reused as a process or a thread); a read
-    /// error other than those, or an unparsable entry, fails closed.
+    /// Identity before any open: only other start ticks are gone (a pid
+    /// reused as a process or a thread). A missing entry and `ESRCH` are
+    /// not (review ochostcrit #2: `hidepid` hides a live same-uid
+    /// non-dumpable process); a read error other than those, or an
+    /// unparsable entry, fails closed.
     #[test]
     fn identity_reads_fail_closed() {
         let stat =
             |ticks: u64| format!("42 (od d) S 1 42 42 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 {ticks} 0 0");
         assert_eq!(identity(Ok(stat(77)), 77), Identity::Matches);
         assert_eq!(identity(Ok(stat(78)), 77), Identity::Gone);
-        assert_eq!(
+        assert_ne!(
             identity(Err(io::ErrorKind::NotFound.into()), 77),
             Identity::Gone
+        );
+        assert_eq!(
+            identity(Err(io::ErrorKind::NotFound.into()), 77),
+            Identity::Unseen
         );
         assert_eq!(
             identity(
                 Err(io::Error::from_raw_os_error(Errno::SRCH.raw_os_error())),
                 77
             ),
-            Identity::Gone
+            Identity::Unseen
         );
         assert_eq!(
             identity(Err(io::ErrorKind::PermissionDenied.into()), 77),
@@ -771,11 +891,19 @@ mod tests {
         assert_eq!(identity(Ok("garbage".into()), 77), Identity::Unreadable);
     }
 
-    /// An exit proof of this live process is never given; a free pid is.
+    /// An exit proof of this live process is never given; a free pid is
+    /// (unseen, then `pidfd_open` answers `ESRCH`).
     #[test]
     fn a_live_process_is_present_and_a_free_pid_gone() {
         let own = std::process::id();
         let ticks = linux::process_stat(own).unwrap().1;
+        let exited = |pid, ticks| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap()
+                .block_on(exited(pid, ticks))
+        };
         assert!(!exited(own, ticks));
         assert!(exited(own, ticks + 1));
         assert!(exited(i32::MAX as u32, 1));

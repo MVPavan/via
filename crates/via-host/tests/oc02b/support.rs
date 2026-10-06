@@ -175,6 +175,20 @@ impl Fixture {
         .unwrap_or_else(|| panic!("{point} not acknowledged"))
     }
 
+    /// Disarms `point` and removes its first hit's acknowledgement and
+    /// release, so the next process's first hit can pause again.
+    #[cfg(feature = "test-failpoints")]
+    pub(crate) fn reset(&self, point: &str) {
+        let points = self.root.join("points");
+        for name in [
+            format!("{point}.json"),
+            format!("{point}.1.ack"),
+            format!("{point}.1.release"),
+        ] {
+            fs::remove_file(points.join(name)).unwrap();
+        }
+    }
+
     /// Releases `point`'s paused first hit.
     #[cfg(feature = "test-failpoints")]
     pub(crate) fn release(&self, point: &str) {
@@ -204,7 +218,38 @@ impl Drop for Fixture {
             }
         }
         std::thread::sleep(Duration::from_millis(100));
+        self.kill_started();
         let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+impl Fixture {
+    /// Kills what the fixture's vendors and helpers may leave running
+    /// (escaped vendors, leftovers in their own groups, Python helpers),
+    /// even when a test fails before its own cleanup: each pid a file under
+    /// `reports/` names (a vendor report's `pid`, a ready or pid file),
+    /// only while its command line still names this fixture's unique root,
+    /// so a reused pid is never signalled.
+    fn kill_started(&self) {
+        use std::os::unix::ffi::OsStrExt;
+        let root = self.root.as_os_str().as_bytes();
+        for file in files(&self.root.join("reports")) {
+            let Ok(text) = fs::read_to_string(&file) else {
+                continue;
+            };
+            let pid = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|value| value["pid"].as_u64())
+                .or_else(|| text.trim().parse().ok())
+                .and_then(|pid| u32::try_from(pid).ok());
+            let ours = |pid: u32| {
+                fs::read(format!("/proc/{pid}/cmdline"))
+                    .is_ok_and(|line| line.windows(root.len()).any(|window| window == root))
+            };
+            if let Some(pid) = pid.filter(|pid| ours(*pid)) {
+                kill(pid);
+            }
+        }
     }
 }
 
@@ -369,16 +414,39 @@ pub(crate) fn pid_namespace() -> String {
         .into_owned()
 }
 
-/// The server record's fixed length (runtime §5): magic, boot ID and
-/// PID namespace (64 bytes each, NUL-padded), pid, start ticks, SHA-256.
-pub(crate) const RECORD_LEN: usize = 180;
+/// This process's time-namespace identity, or `time:none` on a kernel
+/// without time namespaces.
+pub(crate) fn time_namespace() -> String {
+    match fs::read_link("/proc/self/ns/time") {
+        Ok(link) => link.to_string_lossy().into_owned(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "time:none".into(),
+        Err(error) => panic!("cannot read the time namespace: {error}"),
+    }
+}
 
-/// A server record naming `pid` with `ticks`, as the anchor writes it.
+/// The server record's fixed length (runtime §5): magic, boot ID, PID
+/// namespace and time namespace (64 bytes each, NUL-padded), pid, start
+/// ticks, SHA-256.
+pub(crate) const RECORD_LEN: usize = 244;
+
+/// A server record naming `pid` with `ticks` in this time namespace, as
+/// the anchor writes it.
 pub(crate) fn record(boot: &str, namespace: &str, pid: u32, ticks: u64) -> Vec<u8> {
+    record_in(boot, namespace, &time_namespace(), pid, ticks)
+}
+
+/// [`record`] with an explicit time namespace.
+pub(crate) fn record_in(
+    boot: &str,
+    namespace: &str,
+    time_namespace: &str,
+    pid: u32,
+    ticks: u64,
+) -> Vec<u8> {
     use sha2::{Digest, Sha256};
     let mut bytes = Vec::with_capacity(RECORD_LEN);
     bytes.extend_from_slice(b"VIASRV\0\x01");
-    for text in [boot, namespace] {
+    for text in [boot, namespace, time_namespace] {
         let mut field = [0_u8; 64];
         field[..text.len()].copy_from_slice(text.as_bytes());
         bytes.extend_from_slice(&field);
@@ -402,19 +470,14 @@ pub(crate) fn reseal(bytes: &mut [u8]) {
 pub(crate) fn recorded(path: &Path) -> Option<(u32, u64)> {
     let bytes = fs::read(path).ok()?;
     let bytes = bytes.get(..RECORD_LEN)?;
-    let pid = u32::from_le_bytes(bytes[136..140].try_into().ok()?);
-    let ticks = u64::from_le_bytes(bytes[140..148].try_into().ok()?);
-    (record(
-        std::str::from_utf8(&bytes[8..72])
-            .ok()?
-            .trim_end_matches('\0'),
-        std::str::from_utf8(&bytes[72..136])
-            .ok()?
-            .trim_end_matches('\0'),
-        pid,
-        ticks,
-    ) == bytes)
-        .then_some((pid, ticks))
+    let pid = u32::from_le_bytes(bytes[200..204].try_into().ok()?);
+    let ticks = u64::from_le_bytes(bytes[204..212].try_into().ok()?);
+    let text = |start: usize| {
+        std::str::from_utf8(&bytes[start..start + 64])
+            .ok()
+            .map(|text| text.trim_end_matches('\0'))
+    };
+    (record_in(text(8)?, text(72)?, text(136)?, pid, ticks) == bytes).then_some((pid, ticks))
 }
 
 /// Every regular file under `dir`, recursively.

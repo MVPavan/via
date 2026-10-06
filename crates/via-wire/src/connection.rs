@@ -1541,9 +1541,18 @@ pub struct WireParts {
 pub struct WireConnection {
     sender: WireSender,
     messages: WireMessages,
+    vendor_pid: Option<u32>,
 }
 
 impl WireConnection {
+    /// Host's `AcquiredProcess.vendor_pid` for a launch with
+    /// `die_with_anchor`, `None` for any other (runtime §5): passive data
+    /// for the route's identity check (`OpenCode`'s `/api/info.pid`), never
+    /// signalling authority.
+    pub fn vendor_pid(&self) -> Option<u32> {
+        self.vendor_pid
+    }
+
     /// Splits the connection into its control and message halves.
     pub fn into_parts(self) -> WireParts {
         WireParts {
@@ -1562,8 +1571,7 @@ pub(crate) struct Waits {
 /// Starts the reader and writer tasks over a Host-acquired process.
 pub(crate) fn open(
     pipes: via_host::OwnedPipes,
-    control: ProcessControl,
-    exits: ExitReceiver,
+    (control, exits, vendor_pid): (ProcessControl, ExitReceiver, Option<u32>),
     folder: (PathBuf, BlobTasks, crate::Capture),
     (waits, bounds): (Waits, InboundBounds),
     stragglers: &Stragglers,
@@ -1581,6 +1589,7 @@ pub(crate) fn open(
             process: Arc::new(Process { control, exits }),
         },
         messages,
+        vendor_pid,
     }
 }
 

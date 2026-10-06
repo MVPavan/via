@@ -394,6 +394,9 @@ async fn open(
         capture,
     } = signals;
     let launch = LaunchPipes::default();
+    // Runtime §5: the vendor pid goes up only for a launch through the
+    // exec entry (the fence), whose vendor keeps the spawned pid.
+    let fenced = spec.die_with_anchor;
     // The gate is checked inside Host just before ARM: set by then,
     // nothing launches.
     let mut acquire = Box::pin(host.acquire_retaining(spec, deadline, &launch, &*gate));
@@ -420,6 +423,7 @@ async fn open(
         pipes,
         control,
         exits,
+        vendor_pid,
     } = match acquired {
         Ok(acquired) => acquired,
         Err((cause, evidence)) => {
@@ -445,8 +449,7 @@ async fn open(
     };
     Ok(connection::open(
         pipes,
-        control,
-        exits,
+        (control, exits, fenced.then_some(vendor_pid)),
         (folder, tasks, capture),
         (waits, inbound),
         stragglers,

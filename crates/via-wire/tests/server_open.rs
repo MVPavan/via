@@ -114,11 +114,14 @@ async fn wire_server_open_has_no_turn_folder() {
         inbound: via_wire::InboundBounds::DEFAULT,
         capture: via_wire::Capture::On,
     };
-    let WireParts { sender, messages } = wire
+    let connection = wire
         .open_connection(spec, within(5), signals)
         .await
-        .unwrap()
-        .into_parts();
+        .unwrap();
+    // Review ochostcrit #5: a launch without the fence passes no vendor
+    // pid up.
+    assert_eq!(connection.vendor_pid(), None);
+    let WireParts { sender, messages } = connection.into_parts();
     let evidence = state.join("evidence");
     let server_folder = evidence.join("servers").join(server.as_str());
     assert!(server_folder.join("stderr.log").is_file());
