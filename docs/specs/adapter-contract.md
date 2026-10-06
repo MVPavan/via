@@ -965,11 +965,13 @@ vendor would apply, never less.
    following bare element as a further value, so VIA refuses a separate
    value, and a bare element after `--name=value` is an operand (rule 4).
 3. `-xyz` is a short cluster, read letter by letter: a reserved letter is
-   refused; a letter in the value-option table ends the cluster, and the
-   rest (after one optional `=`), else exactly the next element under rule
-   2, is its value; any other letter is taken as a switch and reading
-   continues. So `-fvalue`, `-f=value`, `-f value` and combined switches
-   all match.
+   refused; a letter in the value-option table ends the cluster. Anything
+   attached after it, `=` alone included (`-n=` binds `=`, as Commander
+   does), is its value, and the next element is never that option's; the
+   value is judged both as attached and with one leading `=` removed. With
+   nothing attached, exactly the next element is its value under rule 2.
+   Any other letter is taken as a switch and reading continues. So
+   `-fvalue`, `-f=value`, `-f value` and combined switches all match.
 4. Any other element (not starting with `-`, or `-` alone) is accepted only
    as a value under rule 2 or 3. Otherwise it is an operand, and refused
    as a conflict: Claude reads operands as its prompt or a subcommand,

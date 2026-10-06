@@ -2106,3 +2106,63 @@ fn codex_normalize_peak_within_allowance() {
     println!("decode and normalize peak: {peak} B against {ALLOWANCE} B");
     assert!(peak <= ALLOWANCE, "{peak} B over {ALLOWANCE} B");
 }
+
+/// Critical review (C2 §5, §6.3; packet §4): the handshake-refusal key
+/// is the server key, `vendor_args` included, plus a digest of every
+/// echoed input. Changing the arguments, the model, the directory or the
+/// sandbox, each alone, gives a different key; identical inputs give the
+/// same one.
+#[test]
+fn refusal_key_covers_vendor_args_and_each_echoed_input() {
+    use super::plan::{Echoed, Sandbox};
+    use via_routes::codex::{SandboxMode, SandboxPolicy, testing::TestRuntime};
+    let runtime = TestRuntime::new();
+    let adapter = super::CodexAdapter::new(
+        PathBuf::from("/bin/codex"),
+        std::sync::Arc::default(),
+        (&env(), CodexSettings::default()),
+        runtime.runtime(),
+    );
+    let args = |list: &[&str]| {
+        crate::VendorArgs::try_from(list.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>())
+            .unwrap()
+    };
+    let full = Sandbox {
+        mode: SandboxMode::DangerFullAccess,
+        policy: SandboxPolicy::DangerFullAccess,
+    };
+    let read_only = Sandbox {
+        mode: SandboxMode::ReadOnly,
+        policy: SandboxPolicy::ReadOnly {
+            network_access: false,
+        },
+    };
+    let key = |vendor_args: &[&str], model: &str, cwd: &str, sandbox: &Sandbox| {
+        adapter.refusal_key(
+            Inherit::OD2_DEFAULT,
+            &args(vendor_args),
+            &Echoed {
+                model,
+                cwd: Path::new(cwd),
+                sandbox,
+            },
+        )
+    };
+    let base = key(&[], "gpt-5", "/work", &full);
+    assert_eq!(key(&[], "gpt-5", "/work", &full), base);
+    for (name, other) in [
+        (
+            "vendor_args",
+            key(&["--strict-config"], "gpt-5", "/work", &full),
+        ),
+        ("model", key(&[], "gpt-6", "/work", &full)),
+        ("cwd", key(&[], "gpt-5", "/other", &full)),
+        ("sandbox", key(&[], "gpt-5", "/work", &read_only)),
+    ] {
+        assert_ne!(other, base, "{name}");
+    }
+    assert_eq!(
+        key(&["--strict-config"], "gpt-5", "/work", &full),
+        key(&["--strict-config"], "gpt-5", "/work", &full)
+    );
+}

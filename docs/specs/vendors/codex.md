@@ -404,8 +404,12 @@ layers (`-c mcp_servers.<name>.enabled=false`).
 frozen `vendor_args` are appended after VIA's switches on its server's argv
 (`codex app-server [--disable memories] [--disable hooks] ARGS…`). The argv
 is in `config_hash` (§2), so sessions with different lists never share a
-server and equal lists share one; the instance cache, catalog and handshake
-refusal are keyed by that hash too. A spawn or resume whose server recipe,
+server and equal lists share one. The instance cache and catalog are keyed
+by that hash too. The handshake-refusal key is that server key plus a
+digest of the inputs the handshake's echo check compares (the resolved
+model, the session's working directory and the turn's sandbox mode and
+policy), so a refusal under one list, model, directory or bound never
+refuses another. A spawn or resume whose server recipe,
 with the arguments, would not fit Host's 64 KiB launch request is
 `invalid_params` naming `vendor_args`.
 
