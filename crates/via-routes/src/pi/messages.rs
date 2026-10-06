@@ -10,6 +10,9 @@ use via_wire::OutboundMessage;
 /// bytes is malformed (packet §5.1).
 pub const SHORT_MAX: usize = 1024;
 
+/// The prefix of a declined dialog's C2 `vendor_method` (packet §6).
+pub const UI_METHOD_PREFIX: &str = "extension_ui/";
+
 /// Why a line is not a record VIA can read.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DecodeError {
@@ -243,9 +246,12 @@ pub fn decode(line: &[u8]) -> Result<Record, DecodeError> {
         ),
         "extension_ui_request" => Record::UiRequest(UiRequest {
             id: optional_short(object, "id", "an extension_ui_request with a malformed id")?,
-            method: short_member(object, "method").ok_or(DecodeError::Malformed(
-                "an extension_ui_request without its method",
-            ))?,
+            // C2 A1: room for the Adapter's prefix within 1 KiB.
+            method: short_member(object, "method")
+                .filter(|method| UI_METHOD_PREFIX.len() + method.len() <= SHORT_MAX)
+                .ok_or(DecodeError::Malformed(
+                    "an extension_ui_request without its method, or with one past 1 KiB prefixed",
+                ))?,
             title: object
                 .get("title")
                 .and_then(Value::as_str)
@@ -669,6 +675,25 @@ mod tests {
             malformed["sessionFile"] = wrong;
             assert!(state_data(&data(&malformed)).is_none(), "{malformed}");
         }
+    }
+
+    /// C2 A1 (picrit minor): the Adapter names a declined dialog
+    /// `extension_ui/<method>`, so a method that would push that name past
+    /// 1 KiB is malformed.
+    #[test]
+    fn ui_method_leaves_room_for_its_prefix() {
+        let request = |method: String| {
+            decoded(&json!({"type": "extension_ui_request", "id": "u", "method": method}))
+        };
+        let longest = SHORT_MAX - UI_METHOD_PREFIX.len();
+        let Ok(Record::UiRequest(fits)) = request("m".repeat(longest)) else {
+            panic!("a {longest}-byte method was refused")
+        };
+        assert_eq!(UI_METHOD_PREFIX.len() + fits.method.len(), SHORT_MAX);
+        assert!(matches!(
+            request("m".repeat(longest + 1)),
+            Err(DecodeError::Malformed(_))
+        ));
     }
 
     /// The prompt line is one JSON object whatever the prompt holds.

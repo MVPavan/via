@@ -2952,7 +2952,10 @@ fn pi_inventory_patch() {
 /// key-like fragment gives VIA-owned `detail` built from the status and
 /// the body's safe `type`, and `vendor_code` from its safe `code`; the
 /// fragment never reaches `detail`, `vendor_code`, the failure message,
-/// warnings, any observation or the turn's evidence records. An unsafe
+/// warnings, any observation or VIA's own records `pi-profile.json` and
+/// `pi-inventory.json`. Nothing else in the evidence folder is checked:
+/// Pi's transcript and a malformed message's raw prefix in
+/// `undecoded.bin` are vendor bytes the contracts let it hold. An unsafe
 /// `code` is dropped. The transcript hint names the session file.
 #[test]
 fn pi_detail_redaction() {

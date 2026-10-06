@@ -11,7 +11,7 @@ use tokio::time::Instant;
 use serde_json::{Value, json};
 use via_routes::pi::{
     AbortFacts, AssistantEnd, HandshakeFacts, MessageEnd, PiItem, Record, Section, SystemPatch,
-    Usage, is_marker,
+    UI_METHOD_PREFIX, Usage, is_marker,
 };
 
 use crate::observation::{
@@ -110,7 +110,7 @@ impl Normalizer {
             PiItem::Record(record) => self.record(record),
             PiItem::Declined { method, title } => {
                 vec![Observation::RequestDeclined(Decline {
-                    vendor_method: format!("extension_ui/{method}"),
+                    vendor_method: format!("{UI_METHOD_PREFIX}{method}"),
                     summary: bounded(title.as_deref().unwrap_or_default(), SUMMARY_MAX),
                     blocking: true,
                 })]
@@ -204,12 +204,7 @@ impl Normalizer {
         self.cost = self.cost.map(|sum| sum + usage.cost);
         UsageSample {
             key: None,
-            input: Some(
-                usage
-                    .input
-                    .saturating_add(usage.cache_read)
-                    .saturating_add(usage.cache_write),
-            ),
+            input: c1_input(usage),
             cached_input: Some(usage.cache_read),
             output: Some(usage.output),
             reasoning_output: usage.reasoning,
@@ -243,6 +238,15 @@ impl Normalizer {
             .map(Observation::FinalText)
             .collect()
     }
+}
+
+/// C1 `input`: Pi's `input + cacheRead + cacheWrite` (packet §5.5);
+/// unavailable when the sum does not fit.
+fn c1_input(usage: &Usage) -> Option<u64> {
+    usage
+        .input
+        .checked_add(usage.cache_read)?
+        .checked_add(usage.cache_write)
 }
 
 fn sampled(sample: UsageSample) -> Observation {
@@ -538,6 +542,24 @@ mod tests {
         }
         assert_eq!(class_of(403), ClassHint::Auth);
         assert_eq!(class_of(500), ClassHint::VendorError);
+    }
+
+    /// Packet §5.5 (picrit minor): C1 `input` past `u64` is unavailable,
+    /// never a saturated count reported as exact.
+    #[test]
+    fn input_overflow_is_unavailable() {
+        let usage = |input, cache_read, cache_write| Usage {
+            input,
+            output: 1,
+            cache_read,
+            cache_write,
+            reasoning: None,
+            total: 1,
+            cost: 0.0,
+        };
+        assert_eq!(c1_input(&usage(80, 20, 5)), Some(105));
+        assert_eq!(c1_input(&usage(u64::MAX, 1, 0)), None);
+        assert_eq!(c1_input(&usage(1, u64::MAX - 1, 1)), None);
     }
 
     /// Packet §4.7: a listing is accepted only as the rule says.

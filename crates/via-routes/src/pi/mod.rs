@@ -7,7 +7,7 @@ mod route;
 
 pub use messages::{
     AssistantEnd, DecodeError, MessageEnd, Record, Response, Role, SHORT_MAX, Section, StateData,
-    SystemPatch, UiRequest, Usage, decode,
+    SystemPatch, UI_METHOD_PREFIX, UiRequest, Usage, decode,
 };
 pub use route::{
     AbortFacts, HandshakeFacts, PiExpect, PiItem, PiRoute, PiRouteResult, PiStart, PiTurn,

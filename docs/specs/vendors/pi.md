@@ -730,7 +730,7 @@ hostile profiles only in scratch agent directories. Selection as Claude's:
 | `pi_signals_cleanup` | Force close via TERM kills tool groups; a `setsid` escapee is a leftover; SIGINT is never sent; a spinning startup is bounded by deadlines and KILL |
 | `pi_dialog_decline` | A `-e` test extension's `confirm` and an unknown method with an `id` are cancelled within 5 s while observations are saturated; a dialog without an `id` fails closed |
 | `pi_inventory_patch` | Add, change and remove the last instruction file (`null` → `none`); unchanged resume → `not_reported`; tag-like file contents → `unparsed`; contents never stored |
-| `pi_detail_redaction` | A fixture 401 body with a key-like fragment never reaches `detail`, `vendor_code`, `failure.message`, warnings or evidence notes; an unsafe `code` is dropped; the transcript hint names the session file |
+| `pi_detail_redaction` | A fixture 401 body with a key-like fragment never reaches `detail`, `vendor_code`, `failure.message`, warnings, observations or VIA's own `pi-profile.json`/`pi-inventory.json` (vendor bytes elsewhere in the evidence folder, such as `undecoded.bin`, are not checked); an unsafe `code` is dropped; the transcript hint names the session file |
 | `pi_record_ceiling` | A prompt at the admitted maximum, all control characters, runs to completion; a fixture record over 1 MiB fails `overflow`, never a short result |
 
 ## 9. Live qualification (L-list)
