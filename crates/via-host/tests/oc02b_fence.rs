@@ -38,6 +38,8 @@ use support::{
     Fixture, alive, boot_id, gone_within, holders, kill, pid_namespace, pid_of, record, recorded,
     report, runtime, stat, within,
 };
+#[cfg(feature = "test-failpoints")]
+use via_host::LaunchPipes;
 use via_host::{
     AcquiredProcess, CleanupEvidence, CloseMode, CloseRequest, FenceRefusal, HostError,
     ProbeFailure, run_anchor_from_args, run_exec_from_args,
@@ -62,9 +64,6 @@ const NEEDS_ROOT: &str = "needs uid 0 (run as root)";
 const NEEDS_SETFCAP: &str = "needs CAP_SETFCAP to give a file security.capability";
 const NEEDS_CREDENTIAL_HARNESS: &str =
     "needs a harness that starts VIA with differing GIDs or non-zero capabilities";
-const NEEDS_PID_NAMESPACE: &str = "needs a private PID namespace whose ns_last_pid this test may \
-     write (CAP_SYS_ADMIN over it); oc02b_record_naming_a_thread_id covers the identity check \
-     without one";
 
 const CASES: &[Case] = &[
     case(
@@ -134,6 +133,15 @@ const CASES: &[Case] = &[
         version_dies_with_anchor,
     ),
     case("oc01_stderr_is_counted_only", stderr_counted_only),
+    case(
+        "oc01_stderr_count_is_reported_only_when_final",
+        stderr_count_only_when_final,
+    ),
+    case("oc02b_malformed_record_is_uncertain", malformed_record),
+    case(
+        "oc02b_predecessor_exiting_within_the_wait_is_admitted_after_it",
+        predecessor_exiting_within_the_wait,
+    ),
     #[cfg(feature = "test-failpoints")]
     case(
         "oc02b_lingering_anchor_after_daemon_crash",
@@ -162,11 +170,31 @@ const CASES: &[Case] = &[
         failed_record_write,
     ),
     #[cfg(feature = "test-failpoints")]
-    case("oc02b_handover_never_lets_an_old_child_run", handover),
+    case("oc02b_handover_old_child_dies_with_its_anchor", handover),
     #[cfg(feature = "test-failpoints")]
     case(
-        "oc02b_anchor_dies_after_its_record_write",
+        "oc02b_anchor_dies_after_its_record_write_and_its_child_with_it",
         anchor_dies_after_record,
+    ),
+    #[cfg(feature = "test-failpoints")]
+    case(
+        "oc02b_short_record_write_leaves_no_record",
+        short_record_write,
+    ),
+    #[cfg(feature = "test-failpoints")]
+    case(
+        "oc02b_stalled_lock_open_still_serves_eof",
+        stalled_lock_open,
+    ),
+    #[cfg(feature = "test-failpoints")]
+    case(
+        "oc02b_stalled_record_write_still_serves_eof",
+        stalled_record_write,
+    ),
+    #[cfg(feature = "test-failpoints")]
+    case(
+        "oc02b_record_written_after_the_child_bound_never_releases",
+        record_after_the_bound,
     ),
     ignored(
         "oc02b_file_capability_program_is_refused",
@@ -178,11 +206,6 @@ const CASES: &[Case] = &[
         "oc02b_privileged_via_with_differing_gids_or_capabilities",
         privileged_credentials,
         NEEDS_CREDENTIAL_HARNESS,
-    ),
-    ignored(
-        "oc02b_ns_last_pid_thread_reuse",
-        ns_last_pid_thread_reuse,
-        NEEDS_PID_NAMESPACE,
     ),
 ];
 
@@ -457,6 +480,84 @@ fn other_namespace() {
             }
         );
         assert_eq!(fixture.arm_intents().await, 0);
+    });
+}
+
+/// A record whose checksum holds but whose fields are malformed (bytes
+/// after the namespace's terminating NUL), or a valid record followed by
+/// more bytes, is neither missing nor torn: `PredecessorUncertain`,
+/// nothing launched, even though the pid and start ticks it names (this
+/// test process) are live.
+fn malformed_record() {
+    runtime().block_on(async {
+        let fixture = Fixture::new();
+        let host = fixture.host();
+        let (boot, namespace) = (boot_id(), pid_namespace());
+        let own = std::process::id();
+        let ticks = stat(own).unwrap().1;
+        let mut padded = record(&boot, &namespace, own, ticks);
+        padded[8 + 64 + namespace.len() + 1] = b'x';
+        support::reseal(&mut padded);
+        let mut longer = record(&boot, &namespace, own, ticks);
+        longer.push(0);
+        for (name, bytes) in [("padding", padded), ("longer", longer)] {
+            fs::write(fixture.lock(), bytes).unwrap();
+            let refused = host
+                .acquire(
+                    fixture.spec(&["report", arg(&fixture.report(name))]),
+                    within(10),
+                )
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{name}: admitted"));
+            assert_eq!(refused.cause().unwrap().step, "predecessor check");
+            let refusal = fence(refused);
+            assert!(
+                matches!(refusal, FenceRefusal::PredecessorUncertain { .. }),
+                "{name}: {refusal:?}"
+            );
+        }
+        assert_eq!(fixture.arm_intents().await, 0);
+    });
+}
+
+/// A recorded predecessor that exits within the 1 s wait is admitted, and
+/// only after it exited: the configuration waited on its pidfd (a
+/// test-started process stands in for the predecessor, killed 400 ms in).
+fn predecessor_exiting_within_the_wait() {
+    runtime().block_on(async {
+        let fixture = Fixture::new();
+        let host = fixture.host();
+        let mut sleeper = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let pid = sleeper.id();
+        let ticks = stat(pid).unwrap().1;
+        fs::write(
+            fixture.lock(),
+            record(&boot_id(), &pid_namespace(), pid, ticks),
+        )
+        .unwrap();
+        let main = fixture.report("vendor");
+        let started = Instant::now();
+        let ((admitted, admitted_at), killed_at) = tokio::join!(
+            async {
+                let admitted = host
+                    .acquire(fixture.spec(&["report", arg(&main)]), within(10))
+                    .await;
+                (admitted, started.elapsed())
+            },
+            async {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                assert!(alive(pid, ticks), "the predecessor ended early");
+                let killed_at = started.elapsed();
+                sleeper.kill().unwrap();
+                sleeper.wait().unwrap();
+                killed_at
+            }
+        );
+        let admitted = admitted.unwrap();
+        assert!(admitted_at >= killed_at, "admitted before the exit");
+        report(&main, Duration::from_secs(5)).await.expect("ran");
+        close(admitted).await;
     });
 }
 
@@ -918,7 +1019,7 @@ fn version_failures() {
         let fixture = Fixture::new();
         let host = fixture.host();
         let hang = fixture.report("hang-pid");
-        let cases: [(&[&str], ProbeFailure); 3] = [
+        let cases: [(&[&str], ProbeFailure); 4] = [
             (&["version-hang", arg(&hang)], ProbeFailure::Timeout),
             (
                 &["version-exit", "3"],
@@ -928,6 +1029,9 @@ fn version_failures() {
                 },
             ),
             (&["version-flood"], ProbeFailure::Overflow),
+            // Over the cap and then hanging: found while reading, not at
+            // the 2 s bound.
+            (&["version-flood-hang"], ProbeFailure::Overflow),
         ];
         for (version_args, expected) in cases {
             let started = Instant::now();
@@ -941,8 +1045,11 @@ fn version_failures() {
                 .expect("refused");
             assert_eq!(refused.cause().unwrap().step, "version check");
             assert_eq!(fence(refused), FenceRefusal::ProbeFailed { kind: expected });
+            let elapsed = started.elapsed();
+            if expected == ProbeFailure::Overflow {
+                assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+            }
             if expected == ProbeFailure::Timeout {
-                let elapsed = started.elapsed();
                 assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
                 let probe: u32 = fs::read_to_string(&hang).unwrap().parse().unwrap();
                 assert!(stat(probe).is_none_or(|(state, _, _)| state == 'Z'));
@@ -1025,6 +1132,172 @@ fn stderr_counted_only() {
                 file.display()
             );
         }
+    });
+}
+
+/// The count is final only once the drain reached EOF: a vendor that
+/// exits while a child that inherited its stderr writes later gives no
+/// count until that child's bytes are in, never the count at its exit.
+fn stderr_count_only_when_final() {
+    runtime().block_on(async {
+        let fixture = Fixture::new();
+        let host = fixture.host();
+        let mut acquired = host
+            .acquire(fixture.spec(&["stderr-late"]), within(10))
+            .await
+            .unwrap();
+        let exit = tokio::time::timeout(
+            Duration::from_secs(5),
+            acquired.exits.wait_for(Option::is_some),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(exit.code, Some(0));
+        let total = Some(("early".len() + "0123456789".len()) as u64);
+        let settled = support::wait_for(Duration::from_secs(5), || async {
+            let count = acquired.control.stderr_bytes();
+            assert!(count.is_none() || count == total, "a non-final {count:?}");
+            count
+        })
+        .await;
+        assert_eq!(settled, total);
+        close(acquired).await;
+    });
+}
+
+/// A short record write over a valid earlier record (a failpoint writes
+/// all but the last byte and fails): the anchor invalidated the old record
+/// first, so no byte of it survives and no valid record remains; the
+/// child is killed without executing the vendor and the launch fails.
+#[cfg(feature = "test-failpoints")]
+fn short_record_write() {
+    runtime().block_on(async {
+        let fixture = Fixture::new();
+        let exited = {
+            let mut child = Command::new("/bin/true").spawn().unwrap();
+            let pid = child.id();
+            child.wait().unwrap();
+            pid
+        };
+        fs::write(
+            fixture.lock(),
+            record(&boot_id(), &pid_namespace(), exited, 1),
+        )
+        .unwrap();
+        fixture.arm("host.anchor.short_record_write", "fail_io");
+        let host = fixture.host();
+        let main = fixture.report("vendor");
+        let failed = host
+            .acquire(fixture.spec(&["report", arg(&main)]), within(10))
+            .await
+            .err()
+            .expect("failed");
+        assert_eq!(fence(failed), FenceRefusal::FenceRecordFailed);
+        let anchor = fixture.acked("host.anchor.short_record_write").await;
+        let left = fs::read(fixture.lock()).unwrap();
+        assert!(
+            left.len() < support::RECORD_LEN,
+            "{} bytes: a byte of the old record survived",
+            left.len()
+        );
+        assert_eq!(recorded(&fixture.lock()), None);
+        assert!(support::children(anchor).is_empty());
+        assert!(report(&main, Duration::from_millis(500)).await.is_none());
+    });
+}
+
+/// A failed acquisition whose anchor is stalled at `point` (a paused
+/// failpoint): Host's deadline drops the control, and the anchor still
+/// serves that EOF, stops its group and exits, so Host proves the group
+/// absent; no vendor runs.
+#[cfg(feature = "test-failpoints")]
+fn stalled_fence_io_serves_eof(point: &'static str) {
+    runtime().block_on(async {
+        let fixture = Fixture::new();
+        fixture.arm(point, "pause");
+        let host = fixture.host();
+        let main = fixture.report("vendor");
+        let failed = host
+            .acquire_retaining(
+                fixture.spec(&["report", arg(&main)]),
+                within(3),
+                &LaunchPipes::default(),
+                &|| false,
+            )
+            .await
+            .err()
+            .expect("failed");
+        assert!(
+            matches!(failed.error, HostError::Deadline),
+            "{:?}",
+            failed.error
+        );
+        assert!(
+            matches!(failed.cleanup, Some(CleanupEvidence::GroupAbsent(_))),
+            "{:?}",
+            failed.cleanup
+        );
+        let anchor = fixture.acked(point).await;
+        assert!(stat(anchor).is_none(), "the anchor lives on");
+        assert!(report(&main, Duration::from_millis(300)).await.is_none());
+    });
+}
+
+/// The lock's open stalled (configuration): EOF is still served.
+#[cfg(feature = "test-failpoints")]
+fn stalled_lock_open() {
+    stalled_fence_io_serves_eof("host.anchor.before_lock");
+}
+
+/// The record write stalled (ARM, the child waiting for its record): EOF
+/// is still served.
+#[cfg(feature = "test-failpoints")]
+fn stalled_record_write() {
+    stalled_fence_io_serves_eof("host.anchor.before_record_write");
+}
+
+/// A child suspended past its 5 s bound while it polls, its record then
+/// written, then resumed: it exits 125 without executing the vendor.
+#[cfg(feature = "test-failpoints")]
+fn record_after_the_bound() {
+    use rustix::process::Signal;
+    runtime().block_on(async {
+        let fixture = Fixture::new();
+        fixture.arm("host.anchor.before_record_write", "pause");
+        let host = fixture.host();
+        let main = fixture.report("vendor");
+        let (acquired, ()) = tokio::join!(
+            host.acquire(fixture.spec(&["report", arg(&main)]), within(20)),
+            async {
+                let anchor = fixture.acked("host.anchor.before_record_write").await;
+                let child = exec_child(anchor).await;
+                let ticks = stat(child).unwrap().1;
+                support::signal(child, Signal::STOP);
+                tokio::time::sleep(Duration::from_millis(5300)).await;
+                fixture.release("host.anchor.before_record_write");
+                support::wait_for(Duration::from_secs(5), || async {
+                    (recorded(&fixture.lock()) == Some((child, ticks))).then_some(())
+                })
+                .await
+                .expect("record written");
+                support::signal(child, Signal::CONT);
+                assert!(gone_within(child, ticks, Duration::from_secs(2)).await);
+            }
+        );
+        let mut acquired = acquired.unwrap();
+        let exit = tokio::time::timeout(
+            Duration::from_secs(5),
+            acquired.exits.wait_for(Option::is_some),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(exit.code, Some(125));
+        assert!(report(&main, Duration::from_millis(300)).await.is_none());
+        close(acquired).await;
     });
 }
 
@@ -1218,9 +1491,12 @@ fn failed_record_write() {
 }
 
 /// Handover: anchor A's child is paused after its parent check, A is
-/// killed alone before writing its record, B is configured and launched as
-/// soon as A's lock is free; A's child never executes the vendor, only B's
-/// server runs and B's record is intact.
+/// killed alone before writing its record. The child's parent-death signal
+/// is already armed, so it dies with A: the record poll's changed-parent
+/// exit cannot be reached from outside while that signal holds (the exec
+/// entry's unit test covers it). B is configured and launched as soon as
+/// A's lock is free; A's child never executes the vendor, only B's server
+/// runs and B's record is intact.
 #[cfg(feature = "test-failpoints")]
 fn handover() {
     runtime().block_on(async {
@@ -1260,7 +1536,10 @@ fn handover() {
 }
 
 /// The anchor dies after its record write: the record names its child,
-/// which dies with it; B's configuration waits on its pidfd, then admits.
+/// which dies with it; B is admitted and A's child is gone by then. This
+/// does not force B's check into the moment A's child is still pending;
+/// `oc02b_predecessor_exiting_within_the_wait_is_admitted_after_it` forces
+/// that wait.
 #[cfg(feature = "test-failpoints")]
 fn anchor_dies_after_record() {
     runtime().block_on(async {
@@ -1363,10 +1642,4 @@ fn privileged_refused() {
         assert_eq!(fence(refused), FenceRefusal::PrivilegedVia);
         assert_eq!(fixture.arm_intents().await, 0);
     });
-}
-
-/// Ignored: a recorded pid reused as a non-leader thread ID in a private
-/// PID namespace through `ns_last_pid`.
-fn ns_last_pid_thread_reuse() {
-    panic!("{NEEDS_PID_NAMESPACE}");
 }

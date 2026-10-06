@@ -181,7 +181,9 @@ pub(crate) enum Reply {
         pid: Option<u32>,
         exit_code: Option<i32>,
         exit_signal: Option<i32>,
-        /// The vendor's stderr bytes counted, under `CountOnly` only.
+        /// The vendor's stderr byte count under `CountOnly`, only once it is
+        /// final (the drain read the pipe's end); `None` before that, or
+        /// with a `stderr.log`.
         #[serde(default)]
         stderr_bytes: Option<u64>,
     },

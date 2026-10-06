@@ -2,7 +2,10 @@
 //! "Exclusive launch lock"; `vendors/opencode.md` §3.2): the credential and
 //! program checks, the best-effort version check, the exclusive lock, the
 //! server record and the predecessor's exit proof. Everything here runs in
-//! the anchor, on its main thread, before ARM, except the record write.
+//! the anchor before ARM, except the record write. Processes are spawned
+//! on the anchor's main thread only; filesystem work runs on Tokio's
+//! blocking pool, which owns what it opens until it hands it back, so the
+//! anchor keeps serving its control, `SIGTERM` and its timers meanwhile.
 
 use std::{
     ffi::OsString,
@@ -40,6 +43,8 @@ const PREDECESSOR_POLL: Duration = Duration::from_millis(5);
 /// The version check's bound and output cap (runtime §5 step 2).
 const PROBE_BOUND: Duration = Duration::from_secs(2);
 const PROBE_OUTPUT: usize = 256;
+/// `PredecessorUncertain`'s namespace for a malformed record.
+const MALFORMED: &str = "malformed server record";
 
 /// One server record: the process a lock holder launched.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -81,34 +86,95 @@ impl ServerRecord {
         Some(bytes)
     }
 
-    /// The record at the start of `bytes`, or `None` when it is missing,
-    /// short, torn (its checksum fails) or not a record of this format.
-    pub(crate) fn decode(bytes: &[u8]) -> Option<Self> {
-        let bytes = bytes.get(..RECORD_LEN)?;
-        if &bytes[..8] != MAGIC
-            || Sha256::digest(&bytes[..RECORD_LEN - 32]).as_slice() != &bytes[RECORD_LEN - 32..]
-        {
-            return None;
+    /// What a server-record file's whole contents hold (runtime §5 step
+    /// 4). Missing, short or torn (the checksum fails) is no record; a
+    /// checksum that holds over anything but exactly one well-formed record
+    /// (another magic, a malformed field, a pid out of range, more bytes
+    /// after it) is malformed, never taken for absence.
+    pub(crate) fn decode(bytes: &[u8]) -> Decoded {
+        let Some(record) = bytes.get(..RECORD_LEN) else {
+            return Decoded::Absent;
+        };
+        if Sha256::digest(&record[..RECORD_LEN - 32]).as_slice() != &record[RECORD_LEN - 32..] {
+            return Decoded::Absent;
         }
         let text = |start: usize| {
-            let field = &bytes[start..start + FIELD];
+            let field = &record[start..start + FIELD];
             let end = field.iter().position(|byte| *byte == 0).unwrap_or(FIELD);
             let (text, padding) = field.split_at(end);
             (padding.iter().all(|byte| *byte == 0) && text.iter().all(u8::is_ascii_graphic))
                 .then(|| String::from_utf8_lossy(text).into_owned())
         };
         let numbers = 8 + 2 * FIELD;
-        let pid = u32::from_le_bytes(bytes[numbers..numbers + 4].try_into().ok()?);
-        let start_ticks = u64::from_le_bytes(bytes[numbers + 4..numbers + 12].try_into().ok()?);
-        let positive = i32::try_from(pid).is_ok_and(|pid| pid > 0);
-        positive.then_some(())?;
-        Some(Self {
-            boot_id: text(8)?,
-            pid_namespace: text(8 + FIELD)?,
-            pid,
-            start_ticks,
-        })
+        let mut pid = [0_u8; 4];
+        pid.copy_from_slice(&record[numbers..numbers + 4]);
+        let pid = u32::from_le_bytes(pid);
+        let mut start_ticks = [0_u8; 8];
+        start_ticks.copy_from_slice(&record[numbers + 4..numbers + 12]);
+        let start_ticks = u64::from_le_bytes(start_ticks);
+        let well_formed = bytes.len() == RECORD_LEN
+            && &record[..8] == MAGIC
+            && i32::try_from(pid).is_ok_and(|pid| pid > 0);
+        match (well_formed, text(8), text(8 + FIELD)) {
+            (true, Some(boot_id), Some(pid_namespace)) => Decoded::Record(Self {
+                boot_id,
+                pid_namespace,
+                pid,
+                start_ticks,
+            }),
+            _ => Decoded::Malformed,
+        }
     }
+}
+
+/// A server-record file's contents (see [`ServerRecord::decode`]).
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum Decoded {
+    /// Missing, short or torn: no record.
+    Absent,
+    /// The checksum holds but the contents are not one well-formed record.
+    Malformed,
+    /// One well-formed record.
+    Record(ServerRecord),
+}
+
+/// Reads a server-record file's first `RECORD_LEN + 1` bytes from `file`,
+/// enough to tell a record of exactly the fixed length from a longer file.
+pub(crate) fn read_record_bytes(file: &File) -> io::Result<Vec<u8>> {
+    let mut bytes = vec![0_u8; RECORD_LEN + 1];
+    let mut filled = 0;
+    while filled < bytes.len() {
+        match file.read_at(&mut bytes[filled..], filled as u64) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    bytes.truncate(filled);
+    Ok(bytes)
+}
+
+/// Writes the record naming `pid` with `start_ticks` through the lock's
+/// descriptor `file`: it first truncates the file, so no byte of an earlier
+/// record survives, then writes the whole fixed-length record in one
+/// positioned write at offset 0. Any error or short write fails, and leaves
+/// at most a prefix shorter than a record, which decodes as no record.
+pub(crate) fn write_record(file: &File, pid: u32, start_ticks: u64) -> io::Result<()> {
+    let bytes = ServerRecord::current(pid, start_ticks)?
+        .encode()
+        .ok_or_else(|| io::Error::other("server record field too long"))?;
+    file.set_len(0)?;
+    // Test builds: a short write of all but the last byte (`OC02b`).
+    #[cfg(feature = "test-failpoints")]
+    if via_store::failpoint::hit("host.anchor.short_record_write").is_err() {
+        let _ = file.write_at(&bytes[..RECORD_LEN - 1], 0);
+        return Err(io::Error::other("short server record write"));
+    }
+    if file.write_at(&bytes, 0)? != RECORD_LEN {
+        return Err(io::Error::other("short server record write"));
+    }
+    Ok(())
 }
 
 /// The exclusive launch lock: an open, `flock`ed descriptor the anchor
@@ -125,52 +191,60 @@ impl LaunchLock {
         &self.path
     }
 
-    /// The record at the file's start, `None` when missing or torn.
-    fn read_record(&self) -> io::Result<Option<ServerRecord>> {
-        let mut bytes = [0_u8; RECORD_LEN];
-        let mut filled = 0;
-        while filled < RECORD_LEN {
-            match self.file.read_at(&mut bytes[filled..], filled as u64) {
-                Ok(0) => break,
-                Ok(read) => filled += read,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(ServerRecord::decode(&bytes[..filled]))
-    }
-
-    /// Writes the record naming the child `pid` with `start_ticks`, in one
-    /// fixed-size write at offset 0 through the lock's descriptor.
-    pub(crate) fn write_record(&self, pid: u32, start_ticks: u64) -> io::Result<()> {
-        let bytes = ServerRecord::current(pid, start_ticks)?
-            .encode()
-            .ok_or_else(|| io::Error::other("server record field too long"))?;
-        if self.file.write_at(&bytes, 0)? != RECORD_LEN {
-            return Err(io::Error::other("short server record write"));
-        }
-        Ok(())
+    /// A second descriptor of the lock's open file, for the record write on
+    /// the blocking pool. It shares the lock (one open file description);
+    /// closing it never releases the lock while the anchor keeps its own.
+    pub(crate) fn writer(&self) -> io::Result<File> {
+        self.file.try_clone()
     }
 }
 
 /// The checks a fenced configuration passes before it is accepted
 /// (runtime §5, `Configure` steps 1 to 4), in order. The lock, when one is
 /// configured, is held on success.
+///
+/// The credential and program checks, and the lock's open, `flock` and
+/// record read, run on the blocking pool; the version check is spawned
+/// here, on the anchor's main thread. When this future is dropped (the
+/// anchor stops serving the configuration), a blocking step still running
+/// keeps what it opened until it returns and then drops it: the lock is
+/// released then, or when the anchor exits, whichever comes first.
 pub(crate) async fn configure(vendor: &VendorConfig) -> Result<Option<LaunchLock>, FenceRefusal> {
-    let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
-    if !unprivileged(&status) {
-        return Err(FenceRefusal::PrivilegedVia);
-    }
-    check_program(&vendor.program())?;
+    let program = vendor.program();
+    blocking(FenceRefusal::ProgramUnchecked { errno: None }, move || {
+        let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
+        if !unprivileged(&status) {
+            return Err(FenceRefusal::PrivilegedVia);
+        }
+        check_program(&program)
+    })
+    .await?;
     if let Some(probe) = &vendor.version_probe {
         run_probe(&vendor.program(), probe).await?;
     }
     let Some(path) = vendor.exclusive_lock() else {
         return Ok(None);
     };
-    let lock = take_lock(&path)?;
-    check_predecessor(&lock).await?;
+    let (lock, record) = blocking(FenceRefusal::LockUnavailable { errno: None }, move || {
+        let lock = take_lock(&path)?;
+        let bytes =
+            read_record_bytes(&lock.file).map_err(|error| FenceRefusal::RecordUnreadable {
+                errno: error.raw_os_error(),
+            })?;
+        Ok((lock, ServerRecord::decode(&bytes)))
+    })
+    .await?;
+    check_predecessor(record).await?;
     Ok(Some(lock))
+}
+
+/// Runs `work` on the blocking pool, which owns everything it opens until
+/// it returns; a task that panicked is `lost`.
+async fn blocking<T: Send + 'static>(
+    lost: FenceRefusal,
+    work: impl FnOnce() -> Result<T, FenceRefusal> + Send + 'static,
+) -> Result<T, FenceRefusal> {
+    tokio::task::spawn_blocking(work).await.unwrap_or(Err(lost))
 }
 
 /// Runtime §5 step 1: in `/proc/self/status`, the four `Uid:` values are
@@ -266,20 +340,25 @@ async fn run_probe(program: &Path, probe: &ProbeConfig) -> Result<(), FenceRefus
     })?;
     drop(command);
     let failed = |kind| FenceRefusal::ProbeFailed { kind };
+    // The output is read up to one byte past the cap, so an overflow is
+    // found as soon as it is read, not at the probe's exit.
+    let stdout = child.stdout.take();
     let read = async {
         let mut output = Vec::with_capacity(PROBE_OUTPUT + 1);
-        if let Some(stdout) = child.stdout.take() {
+        if let Some(stdout) = stdout {
             stdout
                 .take(PROBE_OUTPUT as u64 + 1)
                 .read_to_end(&mut output)
                 .await?;
         }
-        let status = child.wait().await?;
-        Ok::<_, io::Error>((output, status))
+        Ok::<_, io::Error>(output)
     };
-    let outcome = tokio::time::timeout_at(deadline, read).await;
-    let (output, status) = match outcome {
-        Ok(Ok(finished)) => finished,
+    let output = match tokio::time::timeout_at(deadline, read).await {
+        Ok(Ok(output)) if output.len() <= PROBE_OUTPUT => output,
+        Ok(Ok(_)) => {
+            stop(&mut child).await;
+            return Err(failed(ProbeFailure::Overflow));
+        }
         Ok(Err(_)) => {
             stop(&mut child).await;
             return Err(failed(ProbeFailure::Read));
@@ -289,10 +368,17 @@ async fn run_probe(program: &Path, probe: &ProbeConfig) -> Result<(), FenceRefus
             return Err(failed(ProbeFailure::Timeout));
         }
     };
-    if output.len() > PROBE_OUTPUT {
-        stop(&mut child).await;
-        return Err(failed(ProbeFailure::Overflow));
-    }
+    let status = match tokio::time::timeout_at(deadline, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(_)) => {
+            stop(&mut child).await;
+            return Err(failed(ProbeFailure::Read));
+        }
+        Err(_) => {
+            stop(&mut child).await;
+            return Err(failed(ProbeFailure::Timeout));
+        }
+    };
     if !status.success() {
         use std::os::unix::process::ExitStatusExt;
         return Err(failed(ProbeFailure::Exit {
@@ -340,6 +426,8 @@ fn printable(bytes: &[u8]) -> String {
 /// `flock(LOCK_EX | LOCK_NB)`.
 fn take_lock(path: &Path) -> Result<LaunchLock, FenceRefusal> {
     let unavailable = |errno: Option<i32>| FenceRefusal::LockUnavailable { errno };
+    crate::exec::seam("host.anchor.before_lock")
+        .map_err(|error| unavailable(error.raw_os_error()))?;
     // std opens every file close-on-exec.
     let file = OpenOptions::new()
         .read(true)
@@ -365,13 +453,20 @@ fn take_lock(path: &Path) -> Result<LaunchLock, FenceRefusal> {
     }
 }
 
-/// Runtime §5 step 4: the recorded server is proved gone, or refused.
-async fn check_predecessor(lock: &LaunchLock) -> Result<(), FenceRefusal> {
+/// Runtime §5 step 4: the recorded server is proved gone, or refused. A
+/// malformed record proves nothing: `PredecessorUncertain`.
+async fn check_predecessor(record: Decoded) -> Result<(), FenceRefusal> {
     let unreadable = |error: io::Error| FenceRefusal::RecordUnreadable {
         errno: error.raw_os_error(),
     };
-    let Some(record) = lock.read_record().map_err(unreadable)? else {
-        return Ok(());
+    let record = match record {
+        Decoded::Absent => return Ok(()),
+        Decoded::Malformed => {
+            return Err(FenceRefusal::PredecessorUncertain {
+                namespace: MALFORMED.into(),
+            });
+        }
+        Decoded::Record(record) => record,
     };
     if record.boot_id != linux::boot_id().map_err(unreadable)? {
         return Ok(());
@@ -523,29 +618,85 @@ mod tests {
         }
     }
 
-    /// The record round-trips; a torn byte anywhere, a short read, another
-    /// magic and a zero pid decode as no record.
+    /// Re-seals `bytes` after an edit: its checksum holds again.
+    fn resealed(mut bytes: [u8; RECORD_LEN]) -> [u8; RECORD_LEN] {
+        let digest = Sha256::digest(&bytes[..RECORD_LEN - 32]);
+        bytes[RECORD_LEN - 32..].copy_from_slice(&digest);
+        bytes
+    }
+
+    /// The record round-trips. Missing, short and torn (any byte flipped)
+    /// contents are no record; contents whose checksum holds but that are
+    /// not exactly one well-formed record are malformed, never absent:
+    /// trailing bytes, another magic, bytes after a field's NUL, a field
+    /// with a non-graphic byte, a zero or out-of-range pid.
     #[test]
-    fn record_round_trips_and_torn_records_decode_as_none() {
+    fn records_decode_as_absent_only_when_missing_short_or_torn() {
         let bytes = sample().encode().unwrap();
-        assert_eq!(ServerRecord::decode(&bytes), Some(sample()));
-        let mut longer = bytes.to_vec();
-        longer.extend_from_slice(b"trailing");
-        assert_eq!(ServerRecord::decode(&longer), Some(sample()));
+        assert_eq!(ServerRecord::decode(&bytes), Decoded::Record(sample()));
         for index in [0, 9, 100, 140, RECORD_LEN - 1] {
             let mut torn = bytes;
             torn[index] ^= 0x40;
-            assert_eq!(ServerRecord::decode(&torn), None, "byte {index}");
+            assert_eq!(ServerRecord::decode(&torn), Decoded::Absent, "byte {index}");
         }
-        assert_eq!(ServerRecord::decode(&bytes[..RECORD_LEN - 1]), None);
-        assert_eq!(ServerRecord::decode(&[]), None);
-        let zero = ServerRecord { pid: 0, ..sample() };
-        assert_eq!(ServerRecord::decode(&zero.encode().unwrap()), None);
+        assert_eq!(
+            ServerRecord::decode(&bytes[..RECORD_LEN - 1]),
+            Decoded::Absent
+        );
+        assert_eq!(ServerRecord::decode(&[]), Decoded::Absent);
+        let mut longer = bytes.to_vec();
+        longer.push(0);
+        assert_eq!(ServerRecord::decode(&longer), Decoded::Malformed);
+        let namespace_end = 8 + FIELD + sample().pid_namespace.len();
+        for (index, value) in [(0, b'X'), (namespace_end + 1, b'x'), (8, b'\t')] {
+            let mut edited = bytes;
+            edited[index] = value;
+            assert_eq!(
+                ServerRecord::decode(&resealed(edited)),
+                Decoded::Malformed,
+                "byte {index}"
+            );
+        }
+        for pid in [0, u32::MAX] {
+            let named = ServerRecord { pid, ..sample() };
+            assert_eq!(
+                ServerRecord::decode(&named.encode().unwrap()),
+                Decoded::Malformed,
+                "pid {pid}"
+            );
+        }
         let long = ServerRecord {
             boot_id: "x".repeat(FIELD + 1),
             ..sample()
         };
         assert_eq!(long.encode(), None);
+    }
+
+    /// The writer truncates before it writes: over a longer file, only the
+    /// record remains, and it decodes.
+    #[test]
+    fn the_writer_leaves_exactly_one_record() {
+        let path = std::env::temp_dir().join(format!(
+            "via-fence-record-{}-{}",
+            std::process::id(),
+            linux::random_hex().unwrap()
+        ));
+        fs::write(&path, vec![0xa5_u8; 4 * RECORD_LEN]).unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let own = std::process::id();
+        let ticks = linux::process_stat(own).unwrap().1;
+        write_record(&file, own, ticks).unwrap();
+        let bytes = read_record_bytes(&file).unwrap();
+        assert_eq!(bytes.len(), RECORD_LEN);
+        assert!(matches!(
+            ServerRecord::decode(&bytes),
+            Decoded::Record(ServerRecord { pid, start_ticks, .. }) if pid == own && start_ticks == ticks
+        ));
+        fs::remove_file(&path).unwrap();
     }
 
     /// Identity before any open: a missing entry, `ESRCH` and other start

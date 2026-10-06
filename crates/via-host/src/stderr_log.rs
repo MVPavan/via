@@ -169,6 +169,9 @@ pub(crate) struct StderrLog {
     written: AtomicBool,
     /// Every byte the drain read from the pipe.
     received: AtomicU64,
+    /// The drain read the pipe's end: every writer closed it, so
+    /// `received` is final.
+    drained: AtomicBool,
 }
 
 impl StderrLog {
@@ -178,6 +181,7 @@ impl StderrLog {
             wake: Condvar::new(),
             written: AtomicBool::new(false),
             received: AtomicU64::new(0),
+            drained: AtomicBool::new(false),
         }
     }
 
@@ -228,9 +232,14 @@ impl StderrLog {
         Some(self.try_finish((now + Duration::from_millis(1)).min(kill_at)))
     }
 
-    /// Every byte the drain has read from the vendor's stderr pipe so far.
-    pub(crate) fn received(&self) -> u64 {
-        self.received.load(Ordering::Acquire)
+    /// Every byte the drain read from the vendor's stderr pipe, once the
+    /// drain reached its end (every writer, the vendor's children included,
+    /// closed it); `None` before that, or when a read error ended the drain
+    /// (the count is then incomplete for good).
+    pub(crate) fn final_received(&self) -> Option<u64> {
+        self.drained
+            .load(Ordering::Acquire)
+            .then(|| self.received.load(Ordering::Acquire))
     }
 
     /// Ends the log, then waits until the writer wrote the rest, returning
@@ -275,7 +284,10 @@ fn drain(mut pipe: impl Read, log: &StderrLog) {
     let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         match pipe.read(&mut buffer) {
-            Ok(0) => break,
+            Ok(0) => {
+                log.drained.store(true, Ordering::Release);
+                break;
+            }
             Ok(read) => {
                 log.received.fetch_add(read as u64, Ordering::AcqRel);
                 log.lock().write(&buffer[..read]);

@@ -1747,7 +1747,8 @@ impl Host {
             anchor_dir: self.anchor_dir.clone(),
             stderr_bytes: StderrCount::default(),
         };
-        self.track_control(&control, sender);
+        let count_only = spec.stderr == crate::StderrCapture::CountOnly;
+        self.track_control(&control, sender, count_only);
         Ok(AcquiredProcess {
             pipes,
             control,
@@ -1755,12 +1756,17 @@ impl Host {
         })
     }
 
-    fn track_control(&self, control: &ProcessControl, sender: watch::Sender<Option<ExitReport>>) {
+    fn track_control(
+        &self,
+        control: &ProcessControl,
+        sender: watch::Sender<Option<ExitReport>>,
+        count_only: bool,
+    ) {
         let task = tokio::spawn(supervise_exit(
             Arc::downgrade(&control.stream),
             control.generation.clone(),
             sender,
-            control.stderr_bytes.clone(),
+            count_only.then(|| control.stderr_bytes.clone()),
         ));
         let mut tasks = self
             .tasks
@@ -2138,8 +2144,9 @@ async fn supervise_exit(
     poll_stream: Weak<Mutex<ControlConnection>>,
     poll_generation: String,
     sender: watch::Sender<Option<ExitReport>>,
-    stderr: StderrCount,
+    stderr: Option<StderrCount>,
 ) -> TaskResult {
+    let mut exited = false;
     loop {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let Some(stream) = poll_stream.upgrade() else {
@@ -2166,19 +2173,29 @@ async fn supervise_exit(
             control.retire().await;
             break;
         };
-        if stderr_bytes.is_some() {
-            *stderr
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = stderr_bytes;
-        }
-        let report = (exit_code.is_some() || exit_signal.is_some()).then_some(ExitReport {
-            code: exit_code,
-            signal: exit_signal,
-        });
         drop(control);
         drop(stream);
-        if let Some(report) = report {
-            sender.send_replace(Some(report));
+        // Runtime §4 `CountOnly`: the anchor reports the count only once it
+        // is final, which may be after the vendor's exit (a child that
+        // inherited its stderr still writing).
+        let counted = match (&stderr, stderr_bytes) {
+            (Some(count), Some(bytes)) => {
+                *count
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(bytes);
+                true
+            }
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
+        if !exited && (exit_code.is_some() || exit_signal.is_some()) {
+            exited = true;
+            sender.send_replace(Some(ExitReport {
+                code: exit_code,
+                signal: exit_signal,
+            }));
+        }
+        if exited && counted {
             break;
         }
     }
@@ -2241,9 +2258,11 @@ async fn join_owned_tasks(tasks: &Arc<StdMutex<HostTasks>>, deadline: Deadline) 
 
 impl ProcessControl {
     /// The vendor's stderr bytes the anchor counted under
-    /// [`crate::StderrCapture::CountOnly`] (runtime §4), as of its latest
-    /// exit-facts report (`Status`): final once the vendor's exit is
-    /// reported. `None` with a `stderr.log`, or before any report.
+    /// [`crate::StderrCapture::CountOnly`] (runtime §4), only once the count
+    /// is final: the anchor's drain read the pipe's end, after the vendor
+    /// and every child that inherited its stderr closed it, which may be
+    /// after the vendor's exit is reported. `None` until then, for good
+    /// when the group is stopped first, and with a `stderr.log`.
     pub fn stderr_bytes(&self) -> Option<u64> {
         *self
             .stderr_bytes
@@ -2378,11 +2397,12 @@ fn fence_options_valid(spec: &PrivateProcessSpec) -> Result<(), &'static str> {
 /// `VIA_PROCESS_MARKER` added to the allow-listed environment (design §9),
 /// and the spec's fence and stderr options (runtime §5).
 fn vendor_config(spec: &PrivateProcessSpec) -> Result<VendorConfig, HostError> {
-    let mut vendor = vendor_config_with(
-        (&spec.program, &spec.args, &spec.cwd),
-        &spec.env,
-        linux::random_hex()?,
-    );
+    Ok(vendor_config_marked(spec, linux::random_hex()?))
+}
+
+/// [`vendor_config`] with `marker` as `VIA_PROCESS_MARKER`.
+fn vendor_config_marked(spec: &PrivateProcessSpec, marker: String) -> VendorConfig {
+    let mut vendor = vendor_config_with((&spec.program, &spec.args, &spec.cwd), &spec.env, marker);
     vendor.die_with_anchor = spec.die_with_anchor;
     vendor.exclusive_lock = spec
         .exclusive_lock
@@ -2393,7 +2413,7 @@ fn vendor_config(spec: &PrivateProcessSpec) -> Result<VendorConfig, HostError> {
         .as_ref()
         .map(protocol::ProbeConfig::from_probe);
     vendor.stderr_count_only = spec.stderr == crate::StderrCapture::CountOnly;
-    Ok(vendor)
+    vendor
 }
 
 /// The vendor launch configuration with `marker` as `VIA_PROCESS_MARKER`.
@@ -2408,6 +2428,18 @@ fn vendor_config_with(
 }
 
 impl PrivateProcessSpec {
+    /// Whether this spec's `Configure` request, its fence and stderr
+    /// options included, fits the anchor's control request cap, as
+    /// [`Self::configure_fits`] measures it. A fenced launch (`OpenCode`)
+    /// checks with this; `configure_fits` counts those options only at
+    /// their defaults.
+    pub fn fits_configure(&self) -> bool {
+        let marker = "f".repeat(linux::RANDOM_HEX_LEN);
+        let vendor = vendor_config_marked(self, marker);
+        serde_json::to_vec(&Request::Configure { vendor })
+            .is_ok_and(|bytes| bytes.len() <= protocol::REQUEST_MAX)
+    }
+
     /// Whether a launch of `program` with `args` in `cwd` under `env`
     /// fits the anchor's control request cap: its encoded `Configure`
     /// request, with Host's process marker at the marker's fixed length
@@ -3357,7 +3389,7 @@ mod tests {
             Arc::downgrade(&control),
             "g1".to_owned(),
             sender,
-            StderrCount::default(),
+            None,
         ));
         // Three ticks met the held lock: supervision outlived a lock busy
         // for longer than one poll's wait.
@@ -3397,7 +3429,7 @@ mod tests {
             Arc::downgrade(&control),
             "g1".to_owned(),
             sender,
-            StderrCount::default(),
+            None,
         ));
         assert!(matches!(
             next_request(&mut peer).await,
@@ -3829,5 +3861,44 @@ mod configure_size {
         assert!(encoded(n, random) <= protocol::REQUEST_MAX);
         assert!(encoded(n, largest()) <= protocol::REQUEST_MAX);
         assert!(encoded(n + 1, largest()) > protocol::REQUEST_MAX);
+    }
+
+    /// Review r1 (minor): a spec's own check counts its fence fields. At
+    /// the largest argument that fits without them, the same launch with
+    /// a lock path and a version check does not fit; without them it
+    /// agrees with `configure_fits`.
+    #[test]
+    fn a_spec_fits_with_its_fence_fields() {
+        let env = EnvAllowList::try_from_entries(vec![("PATH".into(), "/usr/bin".into())])
+            .expect("valid env");
+        let n = largest_fitting(&env);
+        let spec = |n: usize| PrivateProcessSpec {
+            program: "/bin/claude".into(),
+            args: vec![OsString::from("-p"), OsString::from("z".repeat(n))],
+            cwd: "/work".into(),
+            env: env.clone(),
+            owner: ProcessOwner::Server {
+                server_id: crate::ServerId::try_from("v_000000000001").expect("server id"),
+            },
+            stderr_path: std::path::PathBuf::new(),
+            capacity: None,
+            die_with_anchor: false,
+            exclusive_lock: None,
+            version_probe: None,
+            stderr: crate::StderrCapture::Log,
+        };
+        assert!(spec(n).fits_configure());
+        assert!(!spec(n + 1).fits_configure());
+        let mut fenced = spec(n);
+        fenced.die_with_anchor = true;
+        fenced.stderr = crate::StderrCapture::CountOnly;
+        fenced.exclusive_lock = Some("/state/opencode/ns/server.lock".into());
+        fenced.version_probe = Some(crate::VersionProbe {
+            args: vec![OsString::from("--version")],
+            cwd: "/state/opencode/probe".into(),
+            env: env.clone(),
+            admitted: vec!["opencode v2.0.22".into()],
+        });
+        assert!(!fenced.fits_configure());
     }
 }

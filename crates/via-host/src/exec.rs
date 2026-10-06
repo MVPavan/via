@@ -9,7 +9,7 @@
 
 use std::{
     ffi::OsString,
-    io::{self, Read},
+    io,
     os::unix::{fs::OpenOptionsExt, process::CommandExt},
     path::Path,
     process::Command,
@@ -19,7 +19,7 @@ use std::{
 use rustix::process::{Pid, Signal};
 
 use crate::{
-    fence::{RECORD_LEN, ServerRecord},
+    fence::{self, Decoded, ServerRecord},
     linux,
 };
 
@@ -107,8 +107,10 @@ fn own_record() -> io::Result<ServerRecord> {
 
 /// Reads `path` by path about every 2 ms (read-only, no lock, no symlink
 /// followed, a fresh open and close each time), re-checking the parent
-/// each time, until it holds a valid record equal to `own`. A changed
-/// parent, a read error or `bound` is a failure.
+/// each time, until it holds exactly one valid record equal to `own`. A
+/// changed parent, a read error or reaching `bound` is a failure, checked
+/// before a record is accepted: a child suspended past its bound never
+/// executes, whatever record it then finds.
 fn wait_for_record(
     path: &Path,
     own: &ServerRecord,
@@ -120,11 +122,11 @@ fn wait_for_record(
         if !parent_is_anchor() {
             return Err(io::Error::other("parent changed"));
         }
-        if ServerRecord::decode(&bytes).as_ref() == Some(own) {
-            return Ok(());
-        }
         if Instant::now() >= bound {
             return Err(io::Error::from(io::ErrorKind::TimedOut));
+        }
+        if matches!(ServerRecord::decode(&bytes), Decoded::Record(record) if record == *own) {
+            return Ok(());
         }
         std::thread::sleep(RECORD_POLL);
     }
@@ -135,21 +137,19 @@ fn read_record_bytes(path: &Path) -> io::Result<Vec<u8>> {
         .read(true)
         .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
         .open(path)?;
-    let mut bytes = Vec::with_capacity(RECORD_LEN);
-    file.take(RECORD_LEN as u64).read_to_end(&mut bytes)?;
-    Ok(bytes)
+    fence::read_record_bytes(&file)
 }
 
 /// Test builds: the named seam; a `fail_io` fails the setup.
 #[cfg(feature = "test-failpoints")]
-fn seam(point: &'static str) -> io::Result<()> {
+pub(crate) fn seam(point: &'static str) -> io::Result<()> {
     via_store::failpoint::hit(point)
 }
 
 /// Release builds have no seam.
 #[cfg(not(feature = "test-failpoints"))]
 #[expect(clippy::unnecessary_wraps, reason = "test builds can fail here")]
-fn seam(_point: &'static str) -> io::Result<()> {
+pub(crate) fn seam(_point: &'static str) -> io::Result<()> {
     Ok(())
 }
 
@@ -176,7 +176,15 @@ mod tests {
         let path = folder.join("server.lock");
         let own = own_record().unwrap();
         std::fs::write(&path, own.encode().unwrap()).unwrap();
-        assert!(wait_for_record(&path, &own, || true, Instant::now()).is_ok());
+        let soon = Instant::now() + Duration::from_secs(1);
+        assert!(wait_for_record(&path, &own, || true, soon).is_ok());
+        // Past the bound (a child suspended while it polled), even the
+        // record naming it never releases it.
+        let past = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        let error = wait_for_record(&path, &own, || true, past).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
 
         for other in [
             ServerRecord {

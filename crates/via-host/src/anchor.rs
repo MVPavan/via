@@ -31,10 +31,14 @@ pub fn run_anchor_from_args(args: &[OsString]) -> i32 {
     else {
         return 1;
     };
-    match runtime.block_on(run(path)) {
+    let code = match runtime.block_on(run(path)) {
         Ok(()) => 0,
         Err(_) => 1,
-    }
+    };
+    // A fence step still running on the blocking pool (a stalled lock open
+    // or record write) never holds the anchor's exit.
+    runtime.shutdown_background();
+    code
 }
 
 async fn run(path: &Path) -> io::Result<()> {
@@ -113,8 +117,9 @@ async fn serve(
         };
         match request {
             Some(Request::Configure { vendor }) if configured.is_none() => {
-                let Some(launch) = accept_configuration(&mut stream, vendor).await? else {
-                    // Refused and replied: the anchor exits, nothing launched.
+                let Some(launch) =
+                    serve_configuration(&mut stream, vendor, bootstrap_deadline, terminate).await?
+                else {
                     return Ok(());
                 };
                 configured = Some(launch);
@@ -212,7 +217,7 @@ async fn armed(
                     Ok(Some(Request::Status { generation })) if verified_connection && generation == bootstrap.generation => {
                         let (exit_code, exit_signal) = exit.map_or((None, None), |report: crate::ExitReport| (report.code, report.signal));
                         match controller.as_mut() {
-                            Some(active) => protocol::write_message(active, &Reply::Status { pid: Some(vendor_pid), exit_code, exit_signal, stderr_bytes: launch.vendor.stderr_count_only.then(|| stderr.received()) }, 1024).await.is_err(),
+                            Some(active) => protocol::write_message(active, &Reply::Status { pid: Some(vendor_pid), exit_code, exit_signal, stderr_bytes: launch.vendor.stderr_count_only.then(|| stderr.final_received()).flatten() }, 1024).await.is_err(),
                             None => true,
                         }
                     }
@@ -298,14 +303,39 @@ struct Launch {
     lock: Option<LaunchLock>,
 }
 
-/// Validates `vendor` and, when it dies with the anchor, runs the fence's
-/// `Configure` steps (runtime §5). `None`: refused, the refusal replied;
-/// the anchor then exits with nothing launched (a version check has
-/// already exited).
-async fn accept_configuration(
+/// Accepts `vendor` for this anchor's launch, or `None` when the anchor
+/// must exit with nothing launched: refused (the refusal replied), or
+/// Host's EOF, `SIGTERM` or the bootstrap deadline came first. The fence's
+/// checks may wait (a version check, the predecessor, a stalled
+/// filesystem); those are served meanwhile.
+async fn serve_configuration(
     stream: &mut UnixStream,
     vendor: VendorConfig,
+    deadline: Instant,
+    terminate: &mut tokio::signal::unix::Signal,
 ) -> io::Result<Option<Launch>> {
+    let accepted = tokio::select! {
+        accepted = accept_configuration(vendor) => accepted?,
+        () = peer_closed(stream) => return Ok(None),
+        () = tokio::time::sleep_until(deadline) => return Ok(None),
+        _ = terminate.recv() => return Ok(None),
+    };
+    match accepted {
+        Ok(launch) => Ok(Some(launch)),
+        Err(refusal) => {
+            protocol::write_message(stream, &Reply::Fence { refusal }, 1024).await?;
+            Ok(None)
+        }
+    }
+}
+
+/// Validates `vendor` and, when it dies with the anchor, runs the fence's
+/// `Configure` steps (runtime §5). An inner `Err` is the fence's refusal,
+/// which the caller replies before the anchor exits with nothing launched
+/// (a version check has already exited).
+async fn accept_configuration(
+    vendor: VendorConfig,
+) -> io::Result<Result<Launch, crate::FenceRefusal>> {
     if !vendor.program().is_absolute() || !vendor.cwd().is_absolute() {
         return Err(io::Error::other("vendor paths must be absolute"));
     }
@@ -315,13 +345,25 @@ async fn accept_configuration(
         return Err(io::Error::other("fence options need die_with_anchor"));
     }
     if !vendor.die_with_anchor {
-        return Ok(Some(Launch { vendor, lock: None }));
+        return Ok(Ok(Launch { vendor, lock: None }));
     }
-    match fence::configure(&vendor).await {
-        Ok(lock) => Ok(Some(Launch { vendor, lock })),
-        Err(refusal) => {
-            protocol::write_message(stream, &Reply::Fence { refusal }, 1024).await?;
-            Ok(None)
+    Ok(fence::configure(&vendor)
+        .await
+        .map(|lock| Launch { vendor, lock }))
+}
+
+/// Completes once the controller's side of `stream` closed, or sent
+/// anything while it must be waiting for a reply (a protocol violation),
+/// or the stream failed. It reads at most one byte.
+async fn peer_closed(stream: &UnixStream) {
+    let mut byte = [0_u8; 1];
+    loop {
+        if stream.readable().await.is_err() {
+            return;
+        }
+        match stream.try_read(&mut byte) {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            _ => return,
         }
     }
 }
@@ -492,19 +534,35 @@ async fn spawn_vendor(
     let vendor_pid = child
         .id()
         .ok_or_else(|| io::Error::other("missing vendor pid"))?;
-    if let Some(lock) = lock
-        && let Err(error) = record_server(lock, vendor_pid).await
-    {
-        // Runtime §5: the child has not executed the vendor (no record names
-        // it); it is killed and reaped, and the launch fails.
-        let _ = child.start_kill();
-        let _ = child.wait().await;
-        let refusal = crate::FenceRefusal::FenceRecordFailed;
-        let _ = protocol::write_message(stream, &Reply::Fence { refusal }, 1024).await;
-        return Err(error);
-    }
-    if lock.is_some() {
-        record_written_seam().await;
+    if let Some(lock) = lock {
+        // The write runs on the blocking pool; Host's EOF and `SIGTERM` are
+        // still served meanwhile.
+        let written = tokio::select! {
+            written = record_server(lock, vendor_pid) => Some(written),
+            () = peer_closed(stream) => None,
+            _ = terminate.recv() => None,
+        };
+        match written {
+            Some(Ok(())) => record_written_seam().await,
+            Some(Err(error)) => {
+                // Runtime §5: the child has not executed the vendor (no
+                // record names it); it is killed and reaped, and the launch
+                // fails.
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                let refusal = crate::FenceRefusal::FenceRecordFailed;
+                let _ = protocol::write_message(stream, &Reply::Fence { refusal }, 1024).await;
+                return Err(error);
+            }
+            None => {
+                // Host gave up on the launch, or the anchor is told to stop:
+                // the child is killed, and the group (this anchor with it)
+                // is stopped. A write still running ends with the process.
+                let _ = child.start_kill();
+                stop_own_group(terminate, Duration::from_millis(200), Some(&*log)).await;
+                return Err(io::Error::other("launch abandoned at the record write"));
+            }
+        }
     }
     if protocol::write_message(stream, &Reply::Spawned { pid: vendor_pid }, 1024)
         .await
@@ -521,25 +579,19 @@ async fn spawn_vendor(
 
 /// Writes the server record naming the unreaped child `pid` through the
 /// lock's descriptor (runtime §5 ARM), its start ticks read while the
-/// child cannot be reaped.
+/// child cannot be reaped. The write runs on the blocking pool with its
+/// own descriptor of the lock's file, which it closes when it returns;
+/// the anchor keeps its own, and the lock with it. Test builds hold or fail
+/// it at `host.anchor.before_record_write` (`OC02b`).
 async fn record_server(lock: &LaunchLock, pid: u32) -> io::Result<()> {
-    record_write_seam().await?;
     let (_, start_ticks) = linux::process_stat(pid)?;
-    lock.write_record(pid, start_ticks)
-}
-
-/// Test-only `host.anchor.before_record_write`: a pause holds the anchor
-/// before its record write, a `fail_io` fails the write (`OC02b`).
-#[cfg(feature = "test-failpoints")]
-async fn record_write_seam() -> io::Result<()> {
-    via_store::failpoint::hit_async("host.anchor.before_record_write").await
-}
-
-/// Release builds always write the record.
-#[cfg(not(feature = "test-failpoints"))]
-#[expect(clippy::unused_async, reason = "test builds pause here")]
-async fn record_write_seam() -> io::Result<()> {
-    Ok(())
+    let file = lock.writer()?;
+    tokio::task::spawn_blocking(move || {
+        crate::exec::seam("host.anchor.before_record_write")?;
+        fence::write_record(&file, pid, start_ticks)
+    })
+    .await
+    .unwrap_or_else(|_| Err(io::Error::other("server record write task failed")))
 }
 
 /// Test-only `host.anchor.after_record_write`: a pause holds the anchor

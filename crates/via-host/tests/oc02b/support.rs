@@ -257,21 +257,43 @@ pub(crate) async fn report(path: &Path, limit: Duration) -> Option<serde_json::V
     .await
 }
 
-/// `(state, start ticks, parent)` of `pid` from `/proc/<pid>/stat`.
+/// `(state, start ticks, parent)` of `pid` from `/proc/<pid>/stat`, `None`
+/// only when there is no such process. Any other read or parse failure
+/// panics: an observation error is never taken for absence.
 pub(crate) fn stat(pid: u32) -> Option<(char, u64, u32)> {
-    let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let rest = text.rsplit_once(") ")?.1;
-    let fields: Vec<_> = rest.split_ascii_whitespace().collect();
-    Some((
-        fields.first()?.chars().next()?,
-        fields.get(19)?.parse().ok()?,
-        fields.get(1)?.parse().ok()?,
-    ))
+    let text = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(text) => text,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error()) =>
+        {
+            return None;
+        }
+        Err(error) => panic!("cannot observe pid {pid}: {error}"),
+    };
+    let parsed = (|| {
+        let rest = text.rsplit_once(") ")?.1;
+        let fields: Vec<_> = rest.split_ascii_whitespace().collect();
+        Some((
+            fields.first()?.chars().next()?,
+            fields.get(19)?.parse().ok()?,
+            fields.get(1)?.parse().ok()?,
+        ))
+    })();
+    Some(parsed.unwrap_or_else(|| panic!("unparsable /proc/{pid}/stat: {text:?}")))
 }
 
-/// Whether `pid` with `ticks` is still a live (not zombie) process.
+/// Whether `pid` with `ticks` is still a live (not zombie) process; absent
+/// only on proof (no such process, or another start).
 pub(crate) fn alive(pid: u32, ticks: u64) -> bool {
     stat(pid).is_some_and(|(state, start, _)| start == ticks && !matches!(state, 'Z' | 'X'))
+}
+
+/// Sends `signal` to one process this test started (never a group).
+#[cfg(feature = "test-failpoints")]
+pub(crate) fn signal(pid: u32, signal: rustix::process::Signal) {
+    let pid = rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();
+    rustix::process::kill_process(pid, signal).unwrap();
 }
 
 /// Waits up to `limit` for `pid` with `ticks` to be gone.
@@ -366,6 +388,14 @@ pub(crate) fn record(boot: &str, namespace: &str, pid: u32, ticks: u64) -> Vec<u
     let digest = Sha256::digest(&bytes);
     bytes.extend_from_slice(&digest);
     bytes
+}
+
+/// Recomputes the checksum of a record's first `RECORD_LEN` bytes after an
+/// edit, so it is checksum-valid whatever its fields hold.
+pub(crate) fn reseal(bytes: &mut [u8]) {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(&bytes[..RECORD_LEN - 32]);
+    bytes[RECORD_LEN - 32..RECORD_LEN].copy_from_slice(&digest);
 }
 
 /// The `(pid, ticks)` the record in `path` names, if it is valid.

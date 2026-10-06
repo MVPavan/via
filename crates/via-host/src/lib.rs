@@ -246,14 +246,23 @@ impl fmt::Display for FenceRefusal {
             Self::RecordUnreadable { errno } => {
                 write!(formatter, "server record unreadable (errno {errno:?})")
             }
-            Self::PredecessorAlive { pid, start_ticks } => write!(
-                formatter,
-                "previous server pid {pid} (start {start_ticks} ticks after boot) still present"
-            ),
-            Self::PredecessorUncertain { namespace } => write!(
-                formatter,
-                "server record from another PID namespace {namespace}"
-            ),
+            // Runtime §5: the pid and its start as a wall-clock time (UTC;
+            // VIA has no time-zone database).
+            Self::PredecessorAlive { pid, start_ticks } => {
+                match crate::linux::boot_ticks_utc(*start_ticks) {
+                    Some(start) => write!(
+                        formatter,
+                        "previous server pid {pid} (started {start}) still present"
+                    ),
+                    None => write!(
+                        formatter,
+                        "previous server pid {pid} (start {start_ticks} ticks after boot) still present"
+                    ),
+                }
+            }
+            Self::PredecessorUncertain { namespace } => {
+                write!(formatter, "previous server not provably gone: {namespace}")
+            }
             Self::FenceRecordFailed => formatter.write_str("server record not written"),
         }
     }
@@ -405,4 +414,20 @@ pub struct ExitReport {
     pub code: Option<i32>,
     /// Signal number, when terminated by a signal.
     pub signal: Option<i32>,
+}
+
+#[cfg(test)]
+mod fence_display_tests {
+    use super::FenceRefusal;
+
+    /// Runtime §5: `PredecessorAlive`'s detail shows the pid and its start
+    /// as a wall-clock time, not as boot ticks.
+    #[test]
+    fn predecessor_alive_shows_its_start_as_a_time() {
+        let pid = std::process::id();
+        let start_ticks = crate::linux::process_stat(pid).unwrap().1;
+        let text = FenceRefusal::PredecessorAlive { pid, start_ticks }.to_string();
+        assert!(text.contains(&format!("pid {pid}")), "{text}");
+        assert!(text.contains(" UTC") && !text.contains("ticks"), "{text}");
+    }
 }

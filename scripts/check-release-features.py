@@ -184,6 +184,9 @@ POINTS = [
     "host.exec.after_parent_check",
     "host.anchor.before_record_write",
     "host.anchor.after_record_write",
+    # via-4sw.3.1 review r1: a short record write and a stalled lock open.
+    "host.anchor.short_record_write",
+    "host.anchor.before_lock",
 ]
 ACTIVATION = ["VIA_FAILPOINT_DIR", "VIA_FAILPOINT_TOKEN"]
 # Test-build overrides (design §6.2, §6.4) that release must neither parse nor forward.

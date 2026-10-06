@@ -33,7 +33,34 @@ pub(crate) fn run(args: &[OsString]) -> ExitCode {
             let _ = out.flush();
             ExitCode::SUCCESS
         }
+        ["version-flood-hang"] => {
+            // Over the 256-byte cap at once, then never exits.
+            let mut out = std::io::stdout();
+            let _ = out.write_all(&[b'x'; 300]);
+            let _ = out.flush();
+            sleep_forever()
+        }
         ["version-exit", code] => ExitCode::from(code.parse::<u8>().unwrap_or(1)),
+        ["stderr-late"] => {
+            // Five bytes now; a child that inherits stderr writes ten more
+            // after this vendor exited.
+            let mut err = std::io::stderr();
+            let _ = err.write_all(b"early");
+            let _ = err.flush();
+            let _ = Command::new(std::env::current_exe().unwrap_or_default())
+                .args(["__oc02b_vendor", "stderr-late-child"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .spawn();
+            ExitCode::SUCCESS
+        }
+        ["stderr-late-child"] => {
+            std::thread::sleep(Duration::from_millis(700));
+            let mut err = std::io::stderr();
+            let _ = err.write_all(b"0123456789");
+            let _ = err.flush();
+            ExitCode::SUCCESS
+        }
         ["version-hang", pid_file] => {
             write_atomic(pid_file, std::process::id().to_string().as_bytes());
             sleep_forever()
