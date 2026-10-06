@@ -493,3 +493,159 @@ async fn sse_silence_past_its_bound_is_reported() {
     assert!(elapsed >= Duration::from_millis(850), "{elapsed:?}");
     peer.abort();
 }
+
+/// Review ocrouteA #1: a read cancelled while idle (the generation task's
+/// `select!` picking stdout) leaves no byte behind; the next event read
+/// afterwards decodes.
+#[tokio::test]
+async fn sse_a_cancelled_idle_read_leaves_nothing_behind() {
+    let (listener, client) = listener().await;
+    let (send, wait) = tokio::sync::oneshot::channel::<()>();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _request = read_request(&mut stream).await;
+        stream.write_all(SSE_HEAD).await.unwrap();
+        stream.flush().await.unwrap();
+        wait.await.unwrap();
+        stream
+            .write_all(&chunk(b"data: {\"type\":\"server.connected\"}\n\n"))
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+    let mut stream = client.open_stream("/api/event", within(5)).await.unwrap();
+    let silence = Duration::from_secs(5);
+    for _ in 0..3 {
+        let idle =
+            tokio::time::timeout(Duration::from_millis(50), stream.next_event(silence)).await;
+        assert!(idle.is_err(), "no event yet");
+    }
+    send.send(()).unwrap();
+    let event = stream.next_event(silence).await.unwrap().unwrap();
+    assert_eq!(event.data(), b"{\"type\":\"server.connected\"}");
+    peer.abort();
+}
+
+/// Review ocrouteA minor: informational responses are skipped until the
+/// final one.
+#[tokio::test]
+async fn informational_responses_are_skipped_until_the_final_one() {
+    let (listener, client) = listener().await;
+    let peer = serve_once(
+        listener,
+        b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+            .to_vec(),
+    );
+    let response = client.request(get("/api/info"), within(5)).await.unwrap();
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"ok");
+    peer.await.unwrap();
+}
+
+/// Informational heads count against one header cap together.
+#[tokio::test]
+async fn informational_heads_share_the_header_cap() {
+    let (listener, client) = listener().await;
+    let mut answer = Vec::new();
+    let filler = "x".repeat(1000);
+    while answer.len() <= HEADER_BYTES {
+        answer.extend_from_slice(
+            format!("HTTP/1.1 103 Early Hints\r\nLink: <{filler}>\r\n\r\n").as_bytes(),
+        );
+    }
+    answer.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let peer = serve_once(listener, answer);
+    let error = client
+        .request(get("/api/info"), within(5))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, HttpFailure::HeadersTooLarge);
+    peer.abort();
+}
+
+/// Review ocrouteA minor: a stream with `Content-Length: 0` has ended.
+#[tokio::test]
+async fn sse_a_zero_length_stream_ends_at_once() {
+    let (listener, client) = listener().await;
+    let peer = serve_stream(
+        listener,
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\n\r\n",
+        Vec::new(),
+        Duration::from_secs(5),
+    );
+    let mut stream = client.open_stream("/api/event", within(5)).await.unwrap();
+    let next = tokio::time::timeout(
+        Duration::from_secs(1),
+        stream.next_event(Duration::from_secs(3)),
+    )
+    .await
+    .expect("ends without waiting for the peer");
+    assert!(matches!(next, Ok(None)), "{next:?}");
+    peer.abort();
+}
+
+/// Review ocrouteA minor: each reserved pool (decline, stop) holds two
+/// connections, a third waits and is never sent, and neither borrows from
+/// the other or from the general pool.
+#[tokio::test]
+async fn reserved_pools_hold_two_each_and_are_isolated() {
+    let (listener, client) = listener().await;
+    let peer = tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (request, _) = read_request(&mut stream).await;
+            if request.starts_with("GET /quick") {
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await
+                    .unwrap();
+                stream.shutdown().await.unwrap();
+            } else {
+                held.push(stream);
+            }
+        }
+    });
+    let client = std::sync::Arc::new(client);
+    let request = |target: &'static str, pool: Pool| HttpRequest {
+        method: Method::Get,
+        target,
+        body: None,
+        body_limit: BODY_BYTES,
+        pool,
+    };
+    for held in [Pool::Decline, Pool::Stop] {
+        let mut busy = Vec::new();
+        for _ in 0..2 {
+            let client = std::sync::Arc::clone(&client);
+            busy.push(tokio::spawn(async move {
+                client.request(request("/hold", held), within(10)).await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let deadline = Deadline::at(Instant::now() + Duration::from_millis(300));
+        let third = client
+            .request(request("/hold", held), deadline)
+            .await
+            .unwrap_err();
+        assert_eq!(third.kind, HttpFailure::Deadline, "{held:?}");
+        assert_eq!(third.sent, Sent::No, "{held:?}");
+        for other in [Pool::Decline, Pool::Stop, Pool::General] {
+            if other == held {
+                continue;
+            }
+            let response = client
+                .request(request("/quick", other), within(5))
+                .await
+                .unwrap();
+            assert_eq!(response.body, b"ok", "{held:?} then {other:?}");
+        }
+        for task in busy {
+            task.abort();
+        }
+        // The aborted requests' connections and permits are released.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    peer.abort();
+}

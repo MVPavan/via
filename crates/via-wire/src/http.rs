@@ -256,7 +256,7 @@ impl HttpClient {
             write_tracked(&mut stream, body, sent).await?;
         }
         let mut reader = Reader::new(stream);
-        let head = reader.read_head().await?;
+        let head = reader.read_final_head().await?;
         let body = reader.read_body(head.framing, request.body_limit).await?;
         Ok(HttpResponse {
             status: head.status,
@@ -278,7 +278,7 @@ impl HttpClient {
             let head = self.head(Method::Get, target, None, "text/event-stream");
             write_tracked(&mut stream, head.as_bytes(), &mut sent).await?;
             let mut reader = Reader::new(stream);
-            let head = reader.read_head().await?;
+            let head = reader.read_final_head().await?;
             if head.status != 200 {
                 return Err(HttpError::new(
                     Sent::Maybe,
@@ -360,7 +360,11 @@ struct Head {
 /// A response's socket and the bytes read from it but not yet consumed.
 struct Reader {
     stream: TcpStream,
+    /// Committed bytes only: every byte in it was read from the socket.
     buffer: Vec<u8>,
+    /// Read capacity, apart from `buffer`: a read lands here and only the
+    /// bytes it returned are appended, so a cancelled read leaves nothing.
+    spare: Box<[u8]>,
 }
 
 impl Reader {
@@ -368,21 +372,38 @@ impl Reader {
         Self {
             stream,
             buffer: Vec::new(),
+            spare: vec![0_u8; READ_BYTES].into_boxed_slice(),
         }
     }
 
     /// Reads more bytes into the buffer: their count, 0 at the end.
+    /// Cancel-safe by construction: the socket read is (tokio), and the
+    /// buffer changes only after it returned.
     async fn fill(&mut self) -> std::io::Result<usize> {
-        let start = self.buffer.len();
-        self.buffer.resize(start + READ_BYTES, 0);
-        let read = self.stream.read(&mut self.buffer[start..]).await;
-        let count = *read.as_ref().unwrap_or(&0);
-        self.buffer.truncate(start + count);
-        read
+        let count = self.stream.read(&mut self.spare).await?;
+        self.buffer.extend_from_slice(&self.spare[..count]);
+        Ok(count)
     }
 
-    /// Reads and parses the head, leaving the bytes after it buffered.
-    async fn read_head(&mut self) -> Result<Head, HttpError> {
+    /// Reads and parses the final head, skipping informational (1xx)
+    /// responses; all the heads read count against one
+    /// [`HEADER_BYTES`]. A 101 is malformed: no request asks to switch.
+    async fn read_final_head(&mut self) -> Result<Head, HttpError> {
+        let mut used: usize = 0;
+        loop {
+            let (head, length) = self.read_head(HEADER_BYTES.saturating_sub(used)).await?;
+            used = used.saturating_add(length);
+            match head.status {
+                101 => return Err(HttpError::new(Sent::Maybe, HttpFailure::Malformed)),
+                100..=199 => {}
+                _ => return Ok(head),
+            }
+        }
+    }
+
+    /// Reads and parses one head of at most `cap` bytes, leaving the
+    /// bytes after it buffered: the head and its length.
+    async fn read_head(&mut self, cap: usize) -> Result<(Head, usize), HttpError> {
         let failed = |kind| HttpError::new(Sent::Maybe, kind);
         let mut searched: usize = 0;
         let end = loop {
@@ -390,7 +411,7 @@ impl Reader {
                 break searched.saturating_sub(3) + at + 4;
             }
             searched = self.buffer.len();
-            if searched > HEADER_BYTES {
+            if searched > cap {
                 return Err(failed(HttpFailure::HeadersTooLarge));
             }
             match self.fill().await {
@@ -399,12 +420,12 @@ impl Reader {
                 Err(_) => return Err(failed(HttpFailure::Io)),
             }
         };
-        if end > HEADER_BYTES {
+        if end > cap {
             return Err(failed(HttpFailure::HeadersTooLarge));
         }
         let head = parse_head(&self.buffer[..end]).ok_or(failed(HttpFailure::Malformed))?;
         self.buffer.drain(..end);
-        Ok(head)
+        Ok((head, end))
     }
 
     /// Reads the whole body under `limit`.
@@ -754,7 +775,8 @@ impl EventStream {
             chunked: Chunked::default(),
             splitter: Splitter::default(),
             events: VecDeque::new(),
-            ended: framing == Framing::Empty,
+            // No body, or `Content-Length: 0`: ended at once.
+            ended: matches!(framing, Framing::Empty | Framing::Length(0)),
             last_byte: Instant::now(),
         }
     }

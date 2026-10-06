@@ -5,13 +5,13 @@
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 use via_routes::VersionProbe;
 use via_routes::opencode::{Launch, ServerKey};
 
+use crate::private_dir::{Unsafe, managed};
 use crate::{EnvAllowList, PrivateProcessSpec, ProcessOwner, StderrCapture};
 
 /// The first release's one namespace (§3.1, §4.1).
@@ -57,17 +57,33 @@ const PRIVATE: [(&str, &str); 7] = [
     ("TMPDIR", "tmp"),
 ];
 
-/// `<vendor_state_dir>/opencode/`.
-fn route_dir(vendor_state_dir: &Path) -> PathBuf {
-    vendor_state_dir.join("opencode")
-}
+/// The route's directory under `<vendor_state_dir>`.
+const ROUTE_DIR: &str = "opencode";
+
+/// The state a managed-directory refusal names.
+const OWNER: &str = "OpenCode";
 
 /// A private directory with its seven private subdirectories: the
-/// namespace's (§3.2) or the probe root's (§2.2).
+/// namespace's (§3.2) or the probe root's (§2.2), under
+/// `<vendor_state_dir>/opencode/`.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PrivateRoot(PathBuf);
+pub(crate) struct PrivateRoot {
+    vendor_state_dir: PathBuf,
+    /// Its name under `opencode/`.
+    name: String,
+    /// `<vendor_state_dir>/opencode/<name>`.
+    path: PathBuf,
+}
 
 impl PrivateRoot {
+    fn under(vendor_state_dir: &Path, name: String) -> Self {
+        Self {
+            vendor_state_dir: vendor_state_dir.to_owned(),
+            path: vendor_state_dir.join(ROUTE_DIR).join(&name),
+            name,
+        }
+    }
+
     /// The namespace directory, `<vendor_state_dir>/opencode/<16 hex of
     /// H(namespace)>/`.
     pub(crate) fn namespace(vendor_state_dir: &Path) -> Self {
@@ -76,38 +92,41 @@ impl PrivateRoot {
             field(NAMESPACE.0.as_bytes());
             field(&NAMESPACE.1.to_le_bytes());
         });
-        Self(route_dir(vendor_state_dir).join(hex(&digest[..8])))
+        Self::under(vendor_state_dir, hex(&digest[..8]))
     }
 
     /// The version check's root, `<vendor_state_dir>/opencode/probe/`.
     pub(crate) fn probe(vendor_state_dir: &Path) -> Self {
-        Self(route_dir(vendor_state_dir).join("probe"))
+        Self::under(vendor_state_dir, "probe".to_owned())
     }
 
     /// The directory.
     pub(crate) fn path(&self) -> &Path {
-        &self.0
+        &self.path
     }
 
     /// The vendor database (§3.2), whose absence makes the namespace fresh
     /// (§4.3).
     pub(crate) fn database(&self) -> PathBuf {
-        self.0.join("data").join("opencode").join("opencode.db")
+        self.path.join("data").join("opencode").join("opencode.db")
     }
 
     /// The anchor's exclusive lock (§3.2).
     pub(crate) fn lock(&self) -> PathBuf {
-        self.0.join("server.lock")
+        self.path.join("server.lock")
     }
 
-    /// Creates the directory and its subdirectories 0700 where missing;
-    /// existing ones are left as they are.
-    pub(crate) fn create(&self) -> std::io::Result<()> {
-        let mut builder = std::fs::DirBuilder::new();
-        builder.mode(0o700).recursive(true);
-        builder.create(&self.0)?;
+    /// Checks the directory and its subdirectories as managed directories
+    /// from VIA's `vendor/` down (runtime §6.1), creating missing ones
+    /// 0700; an existing one is never chmod-ed or followed. Blocking.
+    pub(crate) fn create(&self) -> Result<(), Unsafe> {
+        managed(&self.vendor_state_dir, &[ROUTE_DIR, &self.name], OWNER)?;
         for (_, part) in PRIVATE {
-            builder.create(self.0.join(part))?;
+            managed(
+                &self.vendor_state_dir,
+                &[ROUTE_DIR, &self.name, part],
+                OWNER,
+            )?;
         }
         Ok(())
     }
@@ -116,7 +135,7 @@ impl PrivateRoot {
     fn env(&self) -> impl Iterator<Item = (OsString, OsString)> + '_ {
         PRIVATE
             .iter()
-            .map(|(name, part)| ((*name).into(), self.0.join(part).into_os_string()))
+            .map(|(name, part)| ((*name).into(), self.path.join(part).into_os_string()))
     }
 }
 
@@ -143,14 +162,11 @@ impl ServerRecipe {
         }
     }
 
-    /// The namespace.
-    pub(crate) fn namespace(&self) -> &PrivateRoot {
-        &self.namespace
-    }
-
-    /// The probe root.
-    pub(crate) fn probe(&self) -> &PrivateRoot {
-        &self.probe
+    /// The managed directories of a launch, the namespace's and the probe
+    /// root's, checked and created where missing (runtime §6.1). Blocking.
+    pub(crate) fn prepare(&self) -> Result<(), Unsafe> {
+        self.namespace.create()?;
+        self.probe.create()
     }
 
     /// `PATH` and `LANG`, shared by the server and its version check.

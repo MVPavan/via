@@ -198,6 +198,11 @@ pub mod observation;
 mod opencode;
 mod passthrough;
 mod plan;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by the OpenCode adapter, wired in chunk B")
+)]
+mod private_dir;
 mod runtime;
 mod set;
 

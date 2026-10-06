@@ -11,7 +11,8 @@
 //!   Booleans; and a fixed-key fingerprint of the password, so a test can
 //!   tell two generations' passwords apart without seeing either), writes
 //!   the fixture's `stderr`, binds `127.0.0.1:0` and prints the URL line
-//!   (or the fixture's raw line, or nothing and exits 3), then serves until
+//!   (or the fixture's raw line, the URL line padded to a length, or
+//!   nothing and exits 3), then serves until
 //!   stdin ends (exit 0) or `exit_after_ms` passes (exit 9).
 //! - Each request is checked against `opencode:<password>` Basic
 //!   authentication (401 otherwise, or always with `"auth": "reject"`),
@@ -96,6 +97,9 @@ enum Url {
     None,
     /// This line instead (a newline is added).
     Raw(String),
+    /// The real URL line with a `pad` member, exactly this many bytes
+    /// before its newline.
+    Padded(usize),
 }
 
 #[derive(Default, Deserialize)]
@@ -218,6 +222,13 @@ fn run(argv0: &Path, fixture_path: &Path) -> Result<i32, Box<dyn std::error::Err
         Url::Real => json!({"url": format!("http://127.0.0.1:{port}")}).to_string(),
         Url::None => return Ok(NO_URL),
         Url::Raw(line) => line.clone(),
+        Url::Padded(length) => {
+            let mut line = format!("{{\"url\":\"http://127.0.0.1:{port}\",\"pad\":\"");
+            let pad = length.saturating_sub(line.len() + 2);
+            line.push_str(&"x".repeat(pad));
+            line.push_str("\"}");
+            line
+        }
     };
     let mut out = io::stdout().lock();
     out.write_all(line.as_bytes())?;

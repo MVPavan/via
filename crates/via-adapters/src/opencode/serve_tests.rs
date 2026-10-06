@@ -24,7 +24,7 @@ use via_routes::opencode::{
 use via_routes::{RouteError, RouteRuntime, TurnNumber};
 
 use super::launch::{CONFIG_CONTENT, PrivateRoot};
-use super::{CHECKED, OpenCodeServers};
+use super::{AcquireError, CHECKED, OpenCodeServers};
 use crate::ProcessOwner;
 
 /// The bound on one fixture's launch, beyond the registry's own.
@@ -196,16 +196,24 @@ impl Rig {
         PrivateRoot::namespace(&self.vendor_state_dir())
     }
 
-    fn acquire(&self, capacity: via_routes::CapacityToken) -> Result<ServerPin, LaunchFailure> {
+    async fn acquire(
+        &self,
+        capacity: via_routes::CapacityToken,
+    ) -> Result<ServerPin, AcquireError> {
         let owner = ProcessOwner::Server {
             server_id: ServerId::try_from("v_000000000000").unwrap(),
         };
-        self.adapter.acquire(owner, capacity)
+        let deadline = via_routes::Deadline::at(tokio::time::Instant::now() + GONE);
+        self.adapter.acquire(owner, capacity, deadline).await
     }
 
     /// One acquisition awaited to its launch's end.
     async fn launch(&self) -> Result<ServerPin, LaunchError> {
-        let pin = self.acquire(Box::new(())).map_err(LaunchError::from)?;
+        let pin = match self.acquire(Box::new(())).await {
+            Ok(pin) => pin,
+            Err(AcquireError::Launch(failure)) => return Err(failure.into()),
+            Err(other) => panic!("not a launch failure: {other:?}"),
+        };
         let ready = tokio::time::timeout(WAIT, pin.ready(std::future::pending()))
             .await
             .expect("the launch ends within its bound");
@@ -437,8 +445,14 @@ async fn oc02_launch_environment_and_fresh_handshake() {
 async fn oc02_acquisitions_share_one_server_and_one_capacity() {
     let rig = Rig::new(&compatible());
     let (first_token, second_token) = (Arc::new(()), Arc::new(()));
-    let first = rig.acquire(Box::new(Arc::clone(&first_token))).unwrap();
-    let second = rig.acquire(Box::new(Arc::clone(&second_token))).unwrap();
+    let first = rig
+        .acquire(Box::new(Arc::clone(&first_token)))
+        .await
+        .unwrap();
+    let second = rig
+        .acquire(Box::new(Arc::clone(&second_token)))
+        .await
+        .unwrap();
     assert_eq!(first.server(), second.server());
     assert_eq!(
         Arc::strong_count(&second_token),
@@ -452,7 +466,7 @@ async fn oc02_acquisitions_share_one_server_and_one_capacity() {
         2,
         "the launch holds its capacity"
     );
-    let third = rig.acquire(Box::new(())).unwrap();
+    let third = rig.acquire(Box::new(())).await.unwrap();
     assert_eq!(third.server(), first.server());
     assert_eq!(rig.reports().len(), 1);
     let lease = third.lease().unwrap();
@@ -756,7 +770,8 @@ fn transient() -> Vec<(&'static str, Value, &'static str)> {
                 compatible(),
                 get(
                     "/api/model",
-                    &json!([{"status": 200, "raw": "{\"data\": [", "content_type": "application/json"}]),
+                    &json!([{"status": 200, "content_type": "application/json",
+                             "raw": format!("{{\"data\": [{{\"apiKey\": \"{CATALOG_SECRET}\"")}]),
                 ),
             ),
             "decode /api/model",
@@ -767,7 +782,7 @@ fn transient() -> Vec<(&'static str, Value, &'static str)> {
                 compatible(),
                 get(
                     "/api/model",
-                    &json!([{"status": 200, "json": {"data": []}, "pad_to": 4 * 1024 * 1024 + 1}]),
+                    &json!([{"status": 200, "json": {"data": [model()]}, "pad_to": 4 * 1024 * 1024 + 1}]),
                 ),
             ),
             "read /api/model",
@@ -778,7 +793,7 @@ fn transient() -> Vec<(&'static str, Value, &'static str)> {
                 compatible(),
                 get(
                     "/api/model",
-                    &json!([{"status": 200, "json": {"data": []}, "declared_length": 4096}]),
+                    &json!([{"status": 200, "json": {"data": [model()]}, "declared_length": 4096}]),
                 ),
             ),
             "read /api/model",
@@ -813,6 +828,16 @@ async fn oc01_transient_handshake_failures_name_their_step() {
             "{name}"
         );
         assert_eq!(step(&error), Some(expected), "{name}");
+        // `OC12b`: a failed catalog's payload reaches no file VIA writes
+        // and no failure value.
+        assert!(!format!("{error:?}").contains(CATALOG_SECRET), "{name}");
+        for (path, bytes) in rig.files() {
+            assert!(
+                !contains(&bytes, CATALOG_SECRET.as_bytes()),
+                "{name}: {}",
+                path.display()
+            );
+        }
     }
     assert!(
         !rig.targets()
@@ -1115,4 +1140,120 @@ fn bounds_are_the_packets() {
     assert_eq!(SILENCE, Duration::from_secs(45));
     assert_eq!(HANDSHAKE, Duration::from_secs(30));
     assert_eq!(via_routes::opencode::LOSS_EXIT, Duration::from_secs(3));
+}
+
+/// Review ocrouteA minor: the URL line's 4 KiB excludes its LF, in Wire's
+/// cap and the decoder's alike: 4096 bytes and an LF are admitted, 4097
+/// refused.
+#[tokio::test]
+async fn oc01_url_line_cap_is_4_kib_before_its_lf() {
+    let rig = Rig::new(&with(compatible(), "url", json!({"padded": 4096})));
+    drop(rig.launch().await.expect("a 4096-byte URL line admits"));
+    rig.fixture(&with(compatible(), "url", json!({"padded": 4097})));
+    let error = rig.refused().await;
+    assert_eq!(
+        error.failure,
+        LaunchFailure::Refused(Refusal::UrlLine("is longer than 4 KiB"))
+    );
+    rig.finish().await;
+}
+
+/// Review ocrouteA #3: §2.2's bound runs from spawn: a version check
+/// taking most of it before the spawn leaves the handshake its whole
+/// bound (here 1.5 s, the catalog ready at its fourth poll, 600 ms after
+/// the first).
+#[tokio::test]
+async fn oc01_handshake_bound_starts_at_spawn() {
+    let empty = json!({"status": 200, "json": {"data": []}});
+    let fixture = with(
+        with_route(
+            compatible(),
+            get(
+                "/api/model",
+                &json!([empty, empty, empty, {"status": 200, "json": {"data": [model()]}}]),
+            ),
+        ),
+        "version",
+        json!({"output": "opencode v2.0.22", "sleep_ms": 1200}),
+    );
+    let rig = Rig::bounded(&fixture, Duration::from_millis(1500));
+    drop(
+        rig.launch()
+            .await
+            .expect("the handshake has its bound from spawn"),
+    );
+    rig.finish().await;
+}
+
+/// Review ocrouteA #2 (runtime §6.1): every managed directory from VIA's
+/// `vendor/` down to the namespace's subdirectories must be a directory
+/// of the daemon's user, mode 0700, never a symlink; one that is not is a
+/// named refusal before anything launches, and it is never chmod-ed or
+/// followed.
+#[tokio::test]
+async fn oc02_managed_directories_must_be_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let rig = Rig::new(&compatible());
+    let namespace = rig.namespace();
+    let mode = |path: &Path| {
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    // A symlinked `data/`, pointing outside VIA's state.
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .create(namespace.path())
+        .unwrap();
+    std::fs::set_permissions(
+        namespace.path().parent().unwrap(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    std::fs::set_permissions(namespace.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::os::unix::fs::symlink(outside.path(), namespace.path().join("data")).unwrap();
+    let Err(AcquireError::Unsafe(detail)) = rig.acquire(Box::new(())).await else {
+        panic!("a symlinked data/ is refused");
+    };
+    assert!(
+        detail.contains("/data") && detail.contains("symlink"),
+        "{detail}"
+    );
+    assert!(rig.reports().is_empty() && rig.lines(".versions").is_empty());
+    assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    std::fs::remove_file(namespace.path().join("data")).unwrap();
+
+    // A namespace of mode 0755 is refused and left 0755.
+    std::fs::set_permissions(namespace.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let Err(AcquireError::Unsafe(detail)) = rig.acquire(Box::new(())).await else {
+        panic!("a 0755 namespace is refused");
+    };
+    assert!(detail.contains("0755"), "{detail}");
+    assert_eq!(mode(namespace.path()), 0o755, "never chmod-ed");
+    assert!(rig.reports().is_empty() && rig.lines(".versions").is_empty());
+
+    // A symlinked probe root is refused too.
+    std::fs::set_permissions(namespace.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let probe = PrivateRoot::probe(&rig.vendor_state_dir());
+    std::os::unix::fs::symlink(outside.path(), probe.path()).unwrap();
+    let Err(AcquireError::Unsafe(detail)) = rig.acquire(Box::new(())).await else {
+        panic!("a symlinked probe root is refused");
+    };
+    assert!(
+        detail.contains("probe") && detail.contains("symlink"),
+        "{detail}"
+    );
+    std::fs::remove_file(probe.path()).unwrap();
+
+    // Repaired: admitted, and the missing ones were created 0700.
+    drop(rig.launch().await.expect("private directories admit"));
+    for part in ["home", "config", "data", "state", "cache", "runtime", "tmp"] {
+        assert_eq!(mode(&namespace.path().join(part)), 0o700, "{part}");
+        assert_eq!(mode(&probe.path().join(part)), 0o700, "{part}");
+    }
+    assert_eq!(mode(probe.path()), 0o700);
+    rig.finish().await;
 }

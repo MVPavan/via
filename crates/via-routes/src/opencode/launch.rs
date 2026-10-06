@@ -1,8 +1,8 @@
 //! The launch task (`vendors/opencode.md` §2.2): the password, Host's
-//! fenced acquisition through Wire, then the handshake (URL line, identity
-//! and version, credential state, catalog, event stream) under one bound
-//! from spawn and the registry fence. Nothing mutates a session or
-//! prompts before publication.
+//! fenced acquisition through Wire under its own bound, then the
+//! handshake (URL line, identity and version, credential state, catalog,
+//! event stream) under §2.2's bound from spawn, all under the registry
+//! fence. Nothing mutates a session or prompts before publication.
 
 use std::ffi::OsString;
 use std::sync::Arc;
@@ -36,11 +36,17 @@ const USER: &str = "opencode";
 /// The password's random bytes: 256 bits (§2.3).
 const PASSWORD_BYTES: usize = 32;
 
-/// The stdout bounds: the URL line's 4 KiB; any longer line, there or
-/// later, is skipped to its LF rather than failing the connection (later
-/// stdout is discarded, §2.2).
+/// The bound on everything before the spawn: the namespace database's
+/// check, the password, the evidence folder and Host's acquisition (whose
+/// version check has its own 2 s). The handshake's bound starts after it,
+/// at the spawn (§2.2).
+pub const ACQUISITION: Duration = Duration::from_secs(30);
+
+/// The stdout bounds: the URL line's 4 KiB before its LF (Wire's cap
+/// counts the LF); any longer line, there or later, is skipped to its LF
+/// rather than failing the connection (later stdout is discarded, §2.2).
 const INBOUND: InboundBounds = InboundBounds {
-    message_bytes: handshake::URL_LINE_BYTES,
+    message_bytes: handshake::URL_LINE_BYTES + 1,
     staging_bytes: 256 * 1024,
     skip_oversize: true,
 };
@@ -53,7 +59,7 @@ pub(crate) async fn launch(
     launch: Launch,
     bound: Duration,
 ) -> Result<Launched, LaunchError> {
-    let deadline = Deadline::at(Instant::now() + bound);
+    let acquisition = Deadline::at(Instant::now() + ACQUISITION);
     let mut fence = servers.fenced();
     let fenced = async move {
         if fence.wait_for(|fenced| *fenced).await.is_err() {
@@ -66,24 +72,39 @@ pub(crate) async fn launch(
         database,
         checked,
     } = launch;
-    // §4.3: a namespace without its database is fresh, clean by
-    // construction. Any doubt runs the check.
-    let fresh = matches!(
-        std::fs::symlink_metadata(&database),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound
-    );
-    let password = password().ok_or(LaunchFailure::Transient {
-        step: "generate the server password",
-    })?;
+    // Blocking filesystem reads, off the async workers and bounded; at the
+    // bound the task is left to finish and its result never used.
+    let prepared = tokio::task::spawn_blocking(move || prepare(&database));
+    let (fresh, password) = tokio::select! {
+        prepared = timeout_at(acquisition.instant(), prepared) => match prepared {
+            Ok(Ok(Some(prepared))) => prepared,
+            Ok(Ok(None) | Err(_)) => {
+                return Err(LaunchFailure::Transient {
+                    step: "generate the server password",
+                }
+                .into());
+            }
+            Err(_) => {
+                return Err(LaunchFailure::Transient {
+                    step: "check the namespace database",
+                }
+                .into());
+            }
+        },
+        () = &mut fenced => return Err(LaunchFailure::Shutdown.into()),
+    };
     let mut env: Vec<(OsString, OsString)> = spec.env.entries().to_vec();
     env.push(("OPENCODE_PASSWORD".into(), password.clone().into()));
     spec.env = EnvAllowList::try_from_entries(env).map_err(|_| LaunchFailure::Internal)?;
     let signals = signals(&servers);
     let opened = tokio::select! {
-        opened = servers.runtime().wire().open_connection(spec, deadline, signals) => opened,
+        opened = servers.runtime().wire().open_connection(spec, acquisition, signals) => opened,
         () = &mut fenced => return Err(LaunchFailure::Shutdown.into()),
     };
     let connection = opened.map_err(|error| acquire_failure(&error, checked))?;
+    // §2.2: the handshake's bound runs from the spawn, which Host reported
+    // as the acquisition returned.
+    let deadline = Deadline::at(Instant::now() + bound);
     let vendor_pid = connection.vendor_pid();
     let WireParts { sender, messages } = connection.into_parts();
     servers.install(&server, &sender);
@@ -291,6 +312,17 @@ async fn get(
     } else {
         Err(Got::Status(response.status))
     }
+}
+
+/// The launch's blocking reads: whether the namespace is fresh (§4.3: no
+/// database; any doubt runs the check) and the password; `None` when the
+/// password could not be made.
+fn prepare(database: &std::path::Path) -> Option<(bool, String)> {
+    let fresh = matches!(
+        std::fs::symlink_metadata(database),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    );
+    Some((fresh, password()?))
 }
 
 /// 256 random bits from `/dev/urandom`, as 64 lower-case hex digits.
