@@ -253,11 +253,17 @@ pub use via_wire::StoreError;
 pub use via_wire::failpoint;
 pub use via_wire::{
     CapacityToken, EnvAllowList, PrivateProcessSpec, ProcessOwner, ReprobeReport, RuntimeConfig,
-    RuntimeResources, SessionId, WireCleanup, WireError, WireRecovery, WireShutdown,
+    RuntimeResources, SessionId, StderrCapture, WireCleanup, WireError, WireRecovery, WireShutdown,
     WireTurnRecovery,
 };
 
 /// Internal hidden-anchor entrypoint forwarded through this architecture layer.
 pub fn run_anchor_from_args(args: &[std::ffi::OsString]) -> i32 {
     via_wire::run_anchor_from_args(args)
+}
+
+/// Internal exec entry (runtime §5 "Die with the anchor"), forwarded
+/// through this architecture layer like the anchor's.
+pub fn run_exec_from_args(args: &[std::ffi::OsString]) -> i32 {
+    via_wire::run_exec_from_args(args)
 }

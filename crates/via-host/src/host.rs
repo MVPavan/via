@@ -475,6 +475,9 @@ pub enum HostError {
     Evidence(io::Error),
     /// The caller's stop signal was set at the pre-ARM gate: nothing launched.
     Stopped,
+    /// The anchor refused a fenced launch (runtime §5): nothing launched,
+    /// and its group is proved absent as for any failed acquisition.
+    Fence(Box<crate::FenceRefusal>),
     /// Final shutdown could not read the turn → server-anchor links within
     /// its bound (design item 6.3): the requested turns without their own
     /// anchor records stay uncertain. Groups were still stopped.
@@ -518,6 +521,7 @@ impl std::fmt::Display for HostError {
             }
             Self::Deadline => formatter.write_str("Host deadline expired"),
             Self::Stopped => formatter.write_str("stopped before ARM"),
+            Self::Fence(refusal) => write!(formatter, "{}: {refusal}", refusal.step()),
             Self::LinksUnread => formatter.write_str("turn links to server anchors unread"),
             Self::AnchorPathTooLong { path } => write!(
                 formatter,
@@ -536,15 +540,23 @@ impl HostError {
     /// This failure's bounded cause for the turn it ended (bead via-23b),
     /// or `None` for a deadline or a stop, whose dispositions name them,
     /// and for a Store read or journal write, which the turn's Store
-    /// failure reports (C1 §6.1).
+    /// failure reports (C1 §6.1). A version check's
+    /// [`crate::FenceRefusal::ProbeRefused`] is a refusal carrying its
+    /// output, not a launch failure: `None` too.
     pub fn cause(&self) -> Option<crate::LaunchCause> {
         let (step, kind) = match self {
+            Self::Fence(refusal)
+                if !matches!(**refusal, crate::FenceRefusal::ProbeRefused { .. }) =>
+            {
+                (refusal.step(), fence_kind(refusal))
+            }
             Self::Launch { step, error } => (*step, Some(error.kind())),
             Self::Io(error) => ("Host operation", Some(error.kind())),
             Self::Evidence(error) => ("create stderr.log", Some(error.kind())),
             Self::Invalid(step) | Self::Protocol(step) => (*step, None),
             Self::AnchorPathTooLong { .. } => ("anchor socket path", None),
-            Self::Store(_)
+            Self::Fence(_)
+            | Self::Store(_)
             | Self::StoreUnavailable(_)
             | Self::Journal { .. }
             | Self::Deadline
@@ -558,6 +570,31 @@ impl HostError {
     fn launch(step: &'static str) -> impl FnOnce(io::Error) -> Self {
         move |error| Self::Launch { step, error }
     }
+}
+
+/// The operating-system error kind behind a fence refusal, when it has one.
+fn fence_kind(refusal: &crate::FenceRefusal) -> Option<io::ErrorKind> {
+    use crate::{FenceRefusal, ProbeFailure};
+    let errno = match refusal {
+        FenceRefusal::LockHeld => return Some(io::ErrorKind::WouldBlock),
+        FenceRefusal::ProbeFailed {
+            kind: ProbeFailure::Timeout,
+        } => return Some(io::ErrorKind::TimedOut),
+        FenceRefusal::ProbeFailed {
+            kind: ProbeFailure::Spawn { errno },
+        }
+        | FenceRefusal::ProgramUnchecked { errno }
+        | FenceRefusal::LockUnavailable { errno }
+        | FenceRefusal::RecordUnreadable { errno } => *errno,
+        FenceRefusal::PrivilegedVia
+        | FenceRefusal::ProgramPrivileged
+        | FenceRefusal::ProbeRefused { .. }
+        | FenceRefusal::ProbeFailed { .. }
+        | FenceRefusal::PredecessorAlive { .. }
+        | FenceRefusal::PredecessorUncertain { .. }
+        | FenceRefusal::FenceRecordFailed => None,
+    };
+    errno.map(|errno| io::Error::from_raw_os_error(errno).kind())
 }
 
 impl From<io::Error> for HostError {
@@ -648,6 +685,10 @@ pub struct AcquiredProcess {
     pub control: ProcessControl,
     /// Confirmed vendor exit, independent of protocol result.
     pub exits: ExitReceiver,
+    /// The vendor child's pid from the anchor's `Spawned` reply, passive
+    /// data passed through Wire to the route (runtime §5; `OpenCode`'s
+    /// `/api/info` check). It is evidence, never signalling authority.
+    pub vendor_pid: u32,
 }
 
 struct StartedAnchor {
@@ -821,7 +862,13 @@ pub struct ProcessControl {
     /// Where the anchor's socket is, removed once its group is proved
     /// absent (bead via-c30).
     anchor_dir: PathBuf,
+    /// The vendor's stderr bytes under `CountOnly` (runtime §4).
+    stderr_bytes: StderrCount,
 }
+
+/// The latest count of the vendor's stderr bytes the anchor reported with
+/// its exit facts (`Status`), under `StderrCapture::CountOnly` only.
+type StderrCount = Arc<StdMutex<Option<u64>>>;
 
 /// Process facts and cleanup evidence from a close request.
 #[derive(Debug)]
@@ -1007,6 +1054,9 @@ impl Host {
             return Err(refused(HostError::Invalid(
                 "reserved vendor marker environment key",
             )));
+        }
+        if let Err(invalid) = fence_options_valid(&spec) {
+            return Err(refused(HostError::Invalid(invalid)));
         }
         let mut state = Acquisition::default();
         let acquired = timeout_at(
@@ -1431,7 +1481,7 @@ impl Host {
         &self,
         owner: ProcessOwner,
         capacity: Option<crate::CapacityToken>,
-        stderr: fs::File,
+        stderr: Stdio,
         state: &mut Acquisition,
     ) -> Result<StartedAnchor, HostError> {
         let anchor_id = linux::random_hex()?;
@@ -1546,7 +1596,7 @@ impl Host {
     fn spawn_anchor(
         &self,
         config_path: &PathBuf,
-        stderr: fs::File,
+        stderr: Stdio,
     ) -> Result<(OwnedPipes, u32), HostError> {
         let mut command = CommandWrap::with_new(&self.anchor_binary, |command| {
             command
@@ -1598,7 +1648,7 @@ impl Host {
     ) -> Result<AcquiredProcess, HostError> {
         // Before the anchor intent: a file that cannot be created leaves
         // nothing committed and nothing launched (design §7.2).
-        let stderr = open_stderr(&spec.stderr_path).map_err(HostError::Evidence)?;
+        let stderr = anchor_stderr(&spec)?;
         let StartedAnchor {
             anchor_id,
             generation,
@@ -1699,20 +1749,29 @@ impl Host {
             capacity: self.capacity.clone(),
             uncertain: self.uncertain.clone(),
             anchor_dir: self.anchor_dir.clone(),
+            stderr_bytes: StderrCount::default(),
         };
-        self.track_control(&control, sender);
+        let count_only = spec.stderr == crate::StderrCapture::CountOnly;
+        self.track_control(&control, sender, count_only);
         Ok(AcquiredProcess {
             pipes,
             control,
             exits,
+            vendor_pid,
         })
     }
 
-    fn track_control(&self, control: &ProcessControl, sender: watch::Sender<Option<ExitReport>>) {
+    fn track_control(
+        &self,
+        control: &ProcessControl,
+        sender: watch::Sender<Option<ExitReport>>,
+        count_only: bool,
+    ) {
         let task = tokio::spawn(supervise_exit(
             Arc::downgrade(&control.stream),
             control.generation.clone(),
             sender,
+            count_only.then(|| control.stderr_bytes.clone()),
         ));
         let mut tasks = self
             .tasks
@@ -1789,6 +1848,7 @@ impl Host {
                     capacity: self.capacity.clone(),
                     uncertain: self.uncertain.clone(),
                     anchor_dir: self.anchor_dir.clone(),
+                    stderr_bytes: StderrCount::default(),
                 };
                 let close = control
                     .close(CloseRequest {
@@ -2089,7 +2149,9 @@ async fn supervise_exit(
     poll_stream: Weak<Mutex<ControlConnection>>,
     poll_generation: String,
     sender: watch::Sender<Option<ExitReport>>,
+    stderr: Option<StderrCount>,
 ) -> TaskResult {
+    let mut exited = false;
     loop {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let Some(stream) = poll_stream.upgrade() else {
@@ -2109,20 +2171,36 @@ async fn supervise_exit(
         let Ok(Ok(Reply::Status {
             exit_code,
             exit_signal,
+            stderr_bytes,
             ..
         })) = reply
         else {
             control.retire().await;
             break;
         };
-        let report = (exit_code.is_some() || exit_signal.is_some()).then_some(ExitReport {
-            code: exit_code,
-            signal: exit_signal,
-        });
         drop(control);
         drop(stream);
-        if let Some(report) = report {
-            sender.send_replace(Some(report));
+        // Runtime §4 `CountOnly`: the anchor reports the count only once it
+        // is final, which may be after the vendor's exit (a child that
+        // inherited its stderr still writing).
+        let counted = match (&stderr, stderr_bytes) {
+            (Some(count), Some(bytes)) => {
+                *count
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(bytes);
+                true
+            }
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
+        if !exited && (exit_code.is_some() || exit_signal.is_some()) {
+            exited = true;
+            sender.send_replace(Some(ExitReport {
+                code: exit_code,
+                signal: exit_signal,
+            }));
+        }
+        if exited && counted {
             break;
         }
     }
@@ -2184,6 +2262,19 @@ async fn join_owned_tasks(tasks: &Arc<StdMutex<HostTasks>>, deadline: Deadline) 
 }
 
 impl ProcessControl {
+    /// The vendor's stderr bytes the anchor counted under
+    /// [`crate::StderrCapture::CountOnly`] (runtime §4), only once the count
+    /// is final: the anchor's drain read the pipe's end, after the vendor
+    /// and every child that inherited its stderr closed it, which may be
+    /// after the vendor's exit is reported. `None` until then, for good
+    /// when the group is stopped first, and with a `stderr.log`.
+    pub fn stderr_bytes(&self) -> Option<u64> {
+        *self
+            .stderr_bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Returns the verified live anchor identity.
     pub fn identity(&self) -> &ProcessIdentity {
         &self.identity
@@ -2287,14 +2378,47 @@ async fn wait_graceful_exit(exit: &mut ExitReceiver, force_at: Instant) {
     }
 }
 
+/// Runtime §5: the exclusive lock and the version check need
+/// `die_with_anchor`, and their paths are absolute.
+fn fence_options_valid(spec: &PrivateProcessSpec) -> Result<(), &'static str> {
+    if !spec.die_with_anchor && (spec.exclusive_lock.is_some() || spec.version_probe.is_some()) {
+        return Err("exclusive lock and version probe require die_with_anchor");
+    }
+    if spec
+        .exclusive_lock
+        .as_ref()
+        .is_some_and(|path| !path.is_absolute())
+        || spec
+            .version_probe
+            .as_ref()
+            .is_some_and(|probe| !probe.cwd.is_absolute())
+    {
+        return Err("exclusive lock and version probe paths must be absolute");
+    }
+    Ok(())
+}
+
 /// The vendor launch configuration, with Host's own random
-/// `VIA_PROCESS_MARKER` added to the allow-listed environment (design §9).
+/// `VIA_PROCESS_MARKER` added to the allow-listed environment (design §9),
+/// and the spec's fence and stderr options (runtime §5).
 fn vendor_config(spec: &PrivateProcessSpec) -> Result<VendorConfig, HostError> {
-    Ok(vendor_config_with(
-        (&spec.program, &spec.args, &spec.cwd),
-        &spec.env,
-        linux::random_hex()?,
-    ))
+    Ok(vendor_config_marked(spec, linux::random_hex()?))
+}
+
+/// [`vendor_config`] with `marker` as `VIA_PROCESS_MARKER`.
+fn vendor_config_marked(spec: &PrivateProcessSpec, marker: String) -> VendorConfig {
+    let mut vendor = vendor_config_with((&spec.program, &spec.args, &spec.cwd), &spec.env, marker);
+    vendor.die_with_anchor = spec.die_with_anchor;
+    vendor.exclusive_lock = spec
+        .exclusive_lock
+        .as_ref()
+        .map(|path| std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str()).to_vec());
+    vendor.version_probe = spec
+        .version_probe
+        .as_ref()
+        .map(protocol::ProbeConfig::from_probe);
+    vendor.stderr_count_only = spec.stderr == crate::StderrCapture::CountOnly;
+    vendor
 }
 
 /// The vendor launch configuration with `marker` as `VIA_PROCESS_MARKER`.
@@ -2309,6 +2433,18 @@ fn vendor_config_with(
 }
 
 impl PrivateProcessSpec {
+    /// Whether this spec's `Configure` request, its fence and stderr
+    /// options included, fits the anchor's control request cap, as
+    /// [`Self::configure_fits`] measures it. A fenced launch (`OpenCode`)
+    /// checks with this; `configure_fits` counts those options only at
+    /// their defaults.
+    pub fn fits_configure(&self) -> bool {
+        let marker = "f".repeat(linux::RANDOM_HEX_LEN);
+        let vendor = vendor_config_marked(self, marker);
+        serde_json::to_vec(&Request::Configure { vendor })
+            .is_ok_and(|bytes| bytes.len() <= protocol::REQUEST_MAX)
+    }
+
     /// Whether a launch of `program` with `args` in `cwd` under `env`
     /// fits the anchor's control request cap: its encoded `Configure`
     /// request, with Host's process marker at the marker's fixed length
@@ -2333,16 +2469,35 @@ async fn configure(
     control: &Mutex<ControlConnection>,
     vendor: VendorConfig,
 ) -> Result<(), HostError> {
-    let Reply::Configured = control
+    match control
         .lock()
         .await
         .transact(&Request::Configure { vendor }, protocol::REQUEST_MAX)
         .await
         .map_err(HostError::launch("configure anchor"))?
-    else {
-        return Err(HostError::Protocol("anchor configuration refused"));
-    };
-    Ok(())
+    {
+        Reply::Configured => Ok(()),
+        // Runtime §5: the anchor refused and exits; nothing launched.
+        Reply::Fence { refusal } => Err(HostError::Fence(Box::new(refusal))),
+        Reply::Ready { .. }
+        | Reply::Challenge { .. }
+        | Reply::Spawned { .. }
+        | Reply::Status { .. }
+        | Reply::Stopping { .. }
+        | Reply::Error { .. } => Err(HostError::Protocol("anchor configuration refused")),
+    }
+}
+
+/// The anchor's standard error: the owner's new `stderr.log`, or under
+/// `CountOnly` (runtime §4) `/dev/null`, the anchor then only counting the
+/// vendor's stderr.
+fn anchor_stderr(spec: &PrivateProcessSpec) -> Result<Stdio, HostError> {
+    match spec.stderr {
+        crate::StderrCapture::Log => Ok(Stdio::from(
+            open_stderr(&spec.stderr_path).map_err(HostError::Evidence)?,
+        )),
+        crate::StderrCapture::CountOnly => Ok(Stdio::null()),
+    }
 }
 
 /// Creates the turn's `stderr.log` (design §7.2): new, 0600, never through a
@@ -2430,6 +2585,8 @@ fn spawned(reply: Reply) -> Result<u32, HostError> {
     match reply {
         Reply::Spawned { pid } => Ok(pid),
         Reply::Error { code, errno } => Err(anchor_refused(&code, errno)),
+        // Runtime §5: the record write failed; the child was killed.
+        Reply::Fence { refusal } => Err(HostError::Fence(Box::new(refusal))),
         Reply::Ready { .. }
         | Reply::Challenge { .. }
         | Reply::Configured
@@ -3220,6 +3377,7 @@ mod tests {
             pid: Some(1),
             exit_code: Some(0),
             exit_signal: None,
+            stderr_bytes: None,
         }
     }
 
@@ -3236,6 +3394,7 @@ mod tests {
             Arc::downgrade(&control),
             "g1".to_owned(),
             sender,
+            None,
         ));
         // Three ticks met the held lock: supervision outlived a lock busy
         // for longer than one poll's wait.
@@ -3275,6 +3434,7 @@ mod tests {
             Arc::downgrade(&control),
             "g1".to_owned(),
             sender,
+            None,
         ));
         assert!(matches!(
             next_request(&mut peer).await,
@@ -3706,5 +3866,44 @@ mod configure_size {
         assert!(encoded(n, random) <= protocol::REQUEST_MAX);
         assert!(encoded(n, largest()) <= protocol::REQUEST_MAX);
         assert!(encoded(n + 1, largest()) > protocol::REQUEST_MAX);
+    }
+
+    /// Review r1 (minor): a spec's own check counts its fence fields. At
+    /// the largest argument that fits without them, the same launch with
+    /// a lock path and a version check does not fit; without them it
+    /// agrees with `configure_fits`.
+    #[test]
+    fn a_spec_fits_with_its_fence_fields() {
+        let env = EnvAllowList::try_from_entries(vec![("PATH".into(), "/usr/bin".into())])
+            .expect("valid env");
+        let n = largest_fitting(&env);
+        let spec = |n: usize| PrivateProcessSpec {
+            program: "/bin/claude".into(),
+            args: vec![OsString::from("-p"), OsString::from("z".repeat(n))],
+            cwd: "/work".into(),
+            env: env.clone(),
+            owner: ProcessOwner::Server {
+                server_id: crate::ServerId::try_from("v_000000000001").expect("server id"),
+            },
+            stderr_path: std::path::PathBuf::new(),
+            capacity: None,
+            die_with_anchor: false,
+            exclusive_lock: None,
+            version_probe: None,
+            stderr: crate::StderrCapture::Log,
+        };
+        assert!(spec(n).fits_configure());
+        assert!(!spec(n + 1).fits_configure());
+        let mut fenced = spec(n);
+        fenced.die_with_anchor = true;
+        fenced.stderr = crate::StderrCapture::CountOnly;
+        fenced.exclusive_lock = Some("/state/opencode/ns/server.lock".into());
+        fenced.version_probe = Some(crate::VersionProbe {
+            args: vec![OsString::from("--version")],
+            cwd: "/state/opencode/probe".into(),
+            env: env.clone(),
+            admitted: vec!["opencode v2.0.22".into()],
+        });
+        assert!(!fenced.fits_configure());
     }
 }

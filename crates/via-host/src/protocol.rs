@@ -42,9 +42,68 @@ pub(crate) struct VendorConfig {
     pub args: Vec<Vec<u8>>,
     pub cwd: Vec<u8>,
     pub env: Vec<(Vec<u8>, Vec<u8>)>,
+    /// The vendor starts through the exec entry and dies with the anchor
+    /// (runtime §5).
+    #[serde(default)]
+    pub die_with_anchor: bool,
+    /// The exclusive launch lock's path (runtime §5).
+    #[serde(default)]
+    pub exclusive_lock: Option<Vec<u8>>,
+    /// The best-effort version check (runtime §5).
+    #[serde(default)]
+    pub version_probe: Option<ProbeConfig>,
+    /// `StderrCapture::CountOnly`: no `stderr.log`, only a byte count.
+    #[serde(default)]
+    pub stderr_count_only: bool,
+}
+
+/// The version check's launch (runtime §5 `VersionProbe`).
+#[derive(Serialize, Deserialize)]
+pub(crate) struct ProbeConfig {
+    pub args: Vec<Vec<u8>>,
+    pub cwd: Vec<u8>,
+    pub env: Vec<(Vec<u8>, Vec<u8>)>,
+    pub admitted: Vec<String>,
+}
+
+impl ProbeConfig {
+    pub(crate) fn from_probe(probe: &crate::VersionProbe) -> Self {
+        Self {
+            args: probe
+                .args
+                .iter()
+                .map(|arg| arg.as_bytes().to_vec())
+                .collect(),
+            cwd: probe.cwd.as_os_str().as_bytes().to_vec(),
+            env: probe
+                .env
+                .entries()
+                .iter()
+                .map(|(key, value)| (key.as_bytes().to_vec(), value.as_bytes().to_vec()))
+                .collect(),
+            admitted: probe.admitted.clone(),
+        }
+    }
+    pub(crate) fn cwd(&self) -> PathBuf {
+        PathBuf::from(OsString::from_vec(self.cwd.clone()))
+    }
+    pub(crate) fn args(&self) -> impl Iterator<Item = OsString> + '_ {
+        self.args.iter().cloned().map(OsString::from_vec)
+    }
+    pub(crate) fn env(&self) -> impl Iterator<Item = (OsString, OsString)> + '_ {
+        self.env
+            .iter()
+            .cloned()
+            .map(|(key, value)| (OsString::from_vec(key), OsString::from_vec(value)))
+    }
 }
 
 impl VendorConfig {
+    pub(crate) fn exclusive_lock(&self) -> Option<PathBuf> {
+        self.exclusive_lock
+            .clone()
+            .map(|path| PathBuf::from(OsString::from_vec(path)))
+    }
     pub(crate) fn program(&self) -> PathBuf {
         PathBuf::from(OsString::from_vec(self.program.clone()))
     }
@@ -74,6 +133,10 @@ impl VendorConfig {
                 .iter()
                 .map(|(key, value)| (key.as_bytes().to_vec(), value.as_bytes().to_vec()))
                 .collect(),
+            die_with_anchor: false,
+            exclusive_lock: None,
+            version_probe: None,
+            stderr_count_only: false,
         }
     }
 }
@@ -118,11 +181,21 @@ pub(crate) enum Reply {
         pid: Option<u32>,
         exit_code: Option<i32>,
         exit_signal: Option<i32>,
+        /// The vendor's stderr byte count under `CountOnly`, only once it is
+        /// final (the drain read the pipe's end); `None` before that, or
+        /// with a `stderr.log`.
+        #[serde(default)]
+        stderr_bytes: Option<u64>,
     },
     Stopping {
         /// The anchor's own-group cleanup began while its vendor had not
         /// exited, so its signal stopped a live vendor (Host force evidence).
         stopped_live: bool,
+    },
+    /// The anchor refused a fenced launch (runtime §5): at `Configure`, or
+    /// `FenceRecordFailed` in place of `Spawned`.
+    Fence {
+        refusal: crate::FenceRefusal,
     },
     Error {
         code: String,

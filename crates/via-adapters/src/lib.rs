@@ -234,7 +234,7 @@ pub use runtime::{
 pub use tokio_util::{sync::CancellationToken, task::TaskTracker};
 pub use via_routes::{
     AnchorCohort, CapacityToken, EnvAllowList, ExitReport, PrivateProcessSpec, ProcessOwner,
-    RuntimeConfig, RuntimeResources, SessionId, WireCleanup,
+    RuntimeConfig, RuntimeResources, SessionId, StderrCapture, WireCleanup,
 };
 
 /// A vendor terminal's status as evidence; Core chooses the C1 disposition.
@@ -392,4 +392,10 @@ impl TurnActivity {
 /// Internal hidden-anchor entrypoint forwarded through this architecture layer.
 pub fn run_anchor_from_args(args: &[std::ffi::OsString]) -> i32 {
     via_routes::run_anchor_from_args(args)
+}
+
+/// Internal exec entry (runtime §5 "Die with the anchor"), forwarded
+/// through this architecture layer like the anchor's.
+pub fn run_exec_from_args(args: &[std::ffi::OsString]) -> i32 {
+    via_routes::run_exec_from_args(args)
 }

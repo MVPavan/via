@@ -9,11 +9,10 @@
 
 use std::{
     collections::VecDeque,
-    fs::File,
     io::{self, Read, Write},
     sync::{
         Arc, Condvar, Mutex, MutexGuard, PoisonError, TryLockError,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -41,6 +40,9 @@ impl StderrCap {
         head: 8 * MIB,
         tail: 8 * MIB,
     };
+    /// `StderrCapture::CountOnly` (runtime §4): nothing is kept, every byte
+    /// is counted and discarded.
+    pub(crate) const COUNT_ONLY: Self = Self { head: 0, tail: 0 };
 }
 
 /// The marker line written between the head and the tail when `dropped`
@@ -165,6 +167,11 @@ pub(crate) struct StderrLog {
     wake: Condvar,
     /// The writer wrote everything after the finish.
     written: AtomicBool,
+    /// Every byte the drain read from the pipe.
+    received: AtomicU64,
+    /// The drain read the pipe's end: every writer closed it, so
+    /// `received` is final.
+    drained: AtomicBool,
 }
 
 impl StderrLog {
@@ -173,6 +180,8 @@ impl StderrLog {
             state: Mutex::new(Capped::new(cap)),
             wake: Condvar::new(),
             written: AtomicBool::new(false),
+            received: AtomicU64::new(0),
+            drained: AtomicBool::new(false),
         }
     }
 
@@ -223,6 +232,16 @@ impl StderrLog {
         Some(self.try_finish((now + Duration::from_millis(1)).min(kill_at)))
     }
 
+    /// Every byte the drain read from the vendor's stderr pipe, once the
+    /// drain reached its end (every writer, the vendor's children included,
+    /// closed it); `None` before that, or when a read error ended the drain
+    /// (the count is then incomplete for good).
+    pub(crate) fn final_received(&self) -> Option<u64> {
+        self.drained
+            .load(Ordering::Acquire)
+            .then(|| self.received.load(Ordering::Acquire))
+    }
+
     /// Ends the log, then waits until the writer wrote the rest, returning
     /// by `deadline` whatever holds the lock or the file. A log not ended
     /// by then loses its tail.
@@ -243,7 +262,7 @@ impl StderrLog {
 /// drain and its writer threads.
 pub(crate) fn start(
     pipe: io::PipeReader,
-    file: File,
+    file: impl Write + Send + 'static,
     cap: StderrCap,
 ) -> io::Result<Arc<StderrLog>> {
     let log = Arc::new(StderrLog::new(cap));
@@ -265,8 +284,12 @@ fn drain(mut pipe: impl Read, log: &StderrLog) {
     let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         match pipe.read(&mut buffer) {
-            Ok(0) => break,
+            Ok(0) => {
+                log.drained.store(true, Ordering::Release);
+                break;
+            }
             Ok(read) => {
+                log.received.fetch_add(read as u64, Ordering::AcqRel);
                 log.lock().write(&buffer[..read]);
                 log.wake.notify_all();
             }
@@ -319,6 +342,7 @@ fn write_out(mut out: impl Write, log: &StderrLog) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
     use std::{
         sync::{Arc, mpsc},
         time::Duration,

@@ -237,6 +237,10 @@ impl ClaudeAdapter {
             // Wire creates the turn's evidence folder and names the file in it.
             stderr_path: PathBuf::new(),
             capacity: None,
+            die_with_anchor: false,
+            exclusive_lock: None,
+            version_probe: None,
+            stderr: crate::StderrCapture::Log,
         })
     }
 }

@@ -482,8 +482,8 @@ pub struct PrivateProcessSpec {
     pub cwd: PathBuf,
     pub env: EnvAllowList,
     pub owner: ProcessOwner,
-    /// The vendor cannot outlive its anchor (below): `false` for every
-    /// route but OpenCode's.
+    /// The vendor dies with its anchor (below, within its limits): `false`
+    /// for every route but OpenCode's.
     pub die_with_anchor: bool,
     /// Exclusive launch lock (below): `None` for every route but OpenCode's;
     /// requires `die_with_anchor`.
@@ -505,7 +505,9 @@ pub struct AcquiredProcess {
     pub control: ProcessControl,
     pub exits: ExitReceiver,
     /// The vendor child's pid from the anchor's `Spawned` reply, passive
-    /// data passed through Wire to the route (OpenCode's `/api/info` check).
+    /// data passed through Wire to the route (OpenCode's `/api/info` check)
+    /// as `WireConnection::vendor_pid() -> Option<u32>`: `Some` with
+    /// `die_with_anchor`, `None` otherwise.
     pub vendor_pid: u32,
 }
 pub struct ProcessIdentity {
@@ -565,8 +567,8 @@ place. That process:
    that file by path (read-only, no lock, no symlink follow, a fresh open
    and close each time) about every 2 ms, re-checking `getppid()` each
    time, until it holds a record with a valid checksum naming its own boot
-   ID, `/proc/self/ns/pid` identity, pid and start ticks (from
-   `/proc/self/stat`); a changed parent, a read error or 5 s from its
+   ID, `/proc/self/ns/pid` and `/proc/self/ns/time` identities, pid and
+   start ticks (from `/proc/self/stat`); a changed parent, a read error or 5 s from its
    start is a failure. It inherits no descriptor beyond its standard
    streams;
 4. replaces itself with the program
@@ -606,8 +608,15 @@ of these failures is a vendor exit before the route's handshake.
   (below). A new thread starts without the signal, so an exec from a
   non-leader thread, which makes that thread the process (same pid and
   start time), loses it; the fence assumes the vendor never does that
-  (`vendors/opencode.md` §3.2, L14). It covers the child process only,
-  not its descendants. Linux only; macOS is deferred.
+  (`vendors/opencode.md` §3.2, L14). An exec in the vendor's chain that
+  gains privilege clears it too, an accepted limit: for example a `#!`
+  interpreter, or an `env` `PATH` lookup, that reaches a set-user-ID,
+  set-group-ID or file-capability binary (the anchor checks the program
+  path only). In both cases the vendor can outlive its anchor, but the
+  server record still names it, so the next launch fails closed with
+  `PredecessorAlive` and its recovery text: the one-server guarantee
+  holds, and only dying with the anchor is lost. It covers the child
+  process only, not its descendants. Linux only; macOS is deferred.
 
 **Exclusive launch lock** (the OpenCode one-live-server fence,
 `vendors/opencode.md` §3.2). Host refuses a spec that sets
@@ -632,30 +641,40 @@ of these failures is a vendor exit before the route's handshake.
    a held lock is `LockHeld`;
 4. reads the server record and requires its server gone
    (`vendors/opencode.md` §3.2): a missing or torn record, another boot
-   ID, or, in the same boot and PID namespace, an exact exit proof:
-   `/proc/<pid>/stat` gone or showing other start ticks before any open
-   (the pid is free or was reused, as a process or a thread); or, with
-   matching ticks, `rustix::process::pidfd_open(pid, PidfdFlags::empty())`
-   failing with `ESRCH`; or, after it opens, `/proc/<pid>/stat` gone or
-   showing other start ticks; or, with equal ticks (the pidfd names the
-   recorded process), `rustix::event::poll` on it reporting readable,
-   which Linux's `pidfd_poll` (`kernel/fork.c`) does only when
+   ID, or, in the same boot, PID namespace and time namespace, an exact
+   exit proof: `/proc/<pid>/stat` readable and showing other start ticks
+   before any open (the pid was reused, as a process or a thread); or
+   `rustix::process::pidfd_open(pid, PidfdFlags::empty())` failing with
+   `ESRCH`; or, after it opens, `/proc/<pid>/stat` readable and showing
+   other start ticks; or `rustix::event::poll` on the pidfd reporting
+   readable, which Linux's `pidfd_poll` (`kernel/fork.c`) does only when
    `thread_group_exited` (`kernel/exit.c`) holds, that is, the whole
-   thread group has exited, reaped or not. Identity that cannot be read,
-   any other `pidfd_open` error after a matched identity (`EINVAL`,
+   thread group has exited, reaped or not (with equal ticks the pidfd
+   names the recorded process; if it names a later process with that
+   pid, the recorded one had exited before that process started). A
+   missing `/proc/<pid>/stat` (`ENOENT` or `ESRCH`) proves nothing alone,
+   since `hidepid` hides a live same-uid non-dumpable process: the proof
+   goes on to `pidfd_open` and the poll, and a pid reused meanwhile is
+   present, which costs liveness only.
+   Identity that cannot be read, any other `pidfd_open` error (`EINVAL`,
    `ENOSYS`, permission) or a poll that is not readable is present:
    unavailability fails closed. A present server is waited for by polling
    the pidfd with a timeout, up to 1 s in all, then the anchor replies
    `PredecessorAlive { pid, start_ticks }` (the refusal's detail shows the
-   pid and that start as a local time). The same boot in another
-   PID namespace is `PredecessorUncertain { namespace }` at once.
+   pid and that start as a UTC time, like VIA's other timestamps). The same boot in another
+   PID namespace is `PredecessorUncertain { namespace }` at once; so is,
+   checked next, the same boot and PID namespace in another time
+   namespace, whose start ticks carry another offset (`/proc/<pid>/stat`
+   shifts them by the reader's; the record holds `/proc/self/ns/time`, or
+   `time:none` on a kernel without time namespaces).
 
 On any of these errors it replies the error and exits: Host commits no
 `ArmIntent` and starts no vendor. `ProbeRefused` fails the acquisition as
 a refusal carrying the output; every other error fails it with the
 no-launch evidence and a `launch_failed` cause naming the step (C2 §2).
 The probe is the only process the anchor starts before ARM; it has exited
-before the anchor replies, and it dies with the anchor. The descriptor
+before the anchor replies, and it dies with the anchor (within the limits
+above). The descriptor
 stays close-on-exec, so neither the exec entry nor the vendor inherits
 it; the anchor never unlocks or closes it, and the kernel releases it
 when the anchor exits.
@@ -664,21 +683,37 @@ At ARM, under `exclusive_lock`, the anchor spawns the exec entry with the
 lock path as its record path. While still holding the lock it reads the
 child's start ticks from `/proc/<pid>` (the pid the spawn returned; the
 child is unreaped) and writes the server record through its lock
-descriptor (boot ID, its PID-namespace identity, the child's pid and
-start ticks and a checksum, one fixed-size write at offset 0). Only the
+descriptor (boot ID, its PID- and time-namespace identities, the child's
+pid and start ticks and a checksum, one fixed-size write at offset 0). Only the
 live lock holder ever writes the record, and no child executes the
 vendor before a record naming it exists; a child whose anchor dies before
 the write is never named (a successor's record names the successor's own
 child) and never executes the vendor. A failed record write makes the
-anchor kill and reap its child, which has not executed the vendor, and
-reply `FenceRecordFailed` instead of `Spawned`, a launch failure. The
+anchor kill its child, which has not executed the vendor, and reply
+`FenceRecordFailed` instead of `Spawned`, a launch failure. The reap is
+bounded: a child not reaped within it (stuck in the kernel, its `SIGKILL`
+pending, so it never runs user code again) makes the anchor stop its own
+group, which releases the lock. The
 pidfd proof needs rustix's `event` feature in `via-host`, beside the
 `process` feature it already enables. With `die_with_anchor`, the vendor dies with the
 anchor, so the lock is free only after its holder's vendor has been sent
-`SIGKILL`; step 4 covers the moment between the anchor's descriptors
-closing and the vendor's death. Nothing about the lock or the record
-enters the Store, and Host never unlinks the file. It gates only the
-launch; cleanup evidence and harness-process capacity are unchanged.
+`SIGKILL` (unless it lost its parent-death signal, a limit above, when
+step 4 refuses it); step 4 covers the moment between the anchor's
+descriptors closing and the vendor's death. Nothing about the lock or the
+record enters the Store, and Host never unlinks the file. It gates only
+the launch; cleanup evidence and harness-process capacity are unchanged.
+
+**Filesystem requirement.** VIA's state directory and VIA's own
+executable must be on a local, responsive filesystem; the launch lock
+(`flock`) and the fence rely on it. The anchor spawns the version check
+and the vendor synchronously on its main thread: each spawn changes into
+a directory inside the state directory (the probe root, the namespace
+directory) and executes VIA's own binary (the exec entry), and Host
+spawns the anchor from that binary the same way. A state directory or
+VIA binary on a stalled network or FUSE filesystem can hold the anchor
+there, with its lock, beyond its control, `SIGTERM` and timers. The
+vendor program is executed later, by the exec entry, so it is outside
+this requirement.
 
 **Stop reply.** Host's `CloseReport` gains `stopped_live: Option<bool>`:
 the verified anchor's `Stopping { stopped_live }` reply to this close's

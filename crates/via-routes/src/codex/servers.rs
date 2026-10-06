@@ -1413,6 +1413,7 @@ impl Servers {
             wake: self.unwoken.subscribe(),
             gate,
             inbound: super::INBOUND,
+            capture: via_wire::Capture::On,
         };
         let connection = self
             .runtime

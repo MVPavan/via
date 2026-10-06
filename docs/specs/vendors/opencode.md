@@ -19,8 +19,9 @@ stays private and credential-free; the free anonymous provider is the
 default, and a project may configure its own provider, whose secrets VIA
 never keeps (§4.3). The user's own OpenCode service, user configuration and
 data are never touched. The one-live-server fence holds across daemon
-restarts, not as a Store record (§3.2): the server cannot outlive its
-anchor (a parent-death signal), the anchor alone holds a kernel `flock`
+restarts, not as a Store record (§3.2): the server dies with its anchor
+(a parent-death signal; one that loses it, a §3.2 limit, is still named
+by the server record and fenced), the anchor alone holds a kernel `flock`
 on the data root, and a new generation proves its predecessor's server
 gone before ARM. The
 `"opencode:<namespace>:<generation>"` `owner_server` label is withdrawn
@@ -104,7 +105,8 @@ round 4; runtime §5 `version_probe`). It protects the private data's
 compatibility, not the fence (§3.2), which does not depend on it. While
 Host configures the launch, before the lock is taken or the data root is
 touched, the anchor runs `<program> --version` through the same exec
-entry as the server, so the check cannot outlive its anchor. It runs in a
+entry as the server, so the check dies with its anchor (within §3.2's
+limits). It runs in a
 separate probe root, `<vendor_state_dir>/opencode/probe/`, with its own
 private `HOME`, XDG directories and `TMPDIR`,
 `OPENCODE_DISABLE_AUTOUPDATE=1` and no password (`--version` writes a log
@@ -277,17 +279,19 @@ boundary.
    record from `server.lock` and requires the server it names proven gone
    before it accepts the configuration (below).
 4. At ARM the anchor starts the server through Host's exec entry, as a
-   process that cannot outlive it (runtime §5, `die_with_anchor`). The
+   process that dies with it (runtime §5, `die_with_anchor`; limits
+   below). The
    child sets the parent-death signal `SIGKILL` and checks that its parent
    is still the anchor. The anchor, still holding the lock, reads the
    child's start ticks from `/proc/<pid>` (the pid its spawn returned; the
    child is unreaped) and writes the server record (boot ID, PID
-   namespace, that pid and start ticks) into `server.lock` itself. The
+   namespace, time namespace, that pid and start ticks) into
+   `server.lock` itself. The
    child meanwhile reads `server.lock` by path, read-only and without the
    lock, about every 2 ms, checking its parent again each time, and
    executes OpenCode only once it reads a record with a valid checksum
-   that names its own boot ID, PID namespace, pid and start ticks (read
-   from `/proc/self`). A changed parent, a read error or its 5 s bound
+   that names its own boot ID, PID namespace, time namespace, pid and
+   start ticks (read from `/proc/self`). A changed parent, a read error or its 5 s bound
    exits without executing OpenCode. The pid and start ticks carry over
    through exec, so the record names the server. A failed record write
    fails the launch: the anchor kills its unreaped child, and the
@@ -329,15 +333,18 @@ gone when:
   gone;
 - its boot ID differs from the current one (no process survives a
   reboot);
-- with the same boot and PID namespace, an exact exit proof holds. The
-  anchor first reads `/proc/<pid>/stat`: a missing entry (or `ESRCH`) or
-  start ticks other than the record's mean the pid is free or was reused,
-  as a process or as a thread of another process, so the recorded process
-  is gone. With matching ticks it calls `pidfd_open(pid)`: `ESRCH` means
-  gone. After the open it reads `/proc/<pid>/stat` again: missing or other
-  start ticks mean gone; equal ticks mean the pidfd names the recorded
-  process. It then polls the pidfd; readable means the whole thread group
-  has exited (Linux `pidfd_poll` in `kernel/fork.c` reports readable only
+- with the same boot, PID namespace and time namespace, an exact exit
+  proof holds. The anchor first reads `/proc/<pid>/stat`: start ticks
+  other than the record's mean the pid was reused, as a process or as a
+  thread of another process, so the recorded process is gone. A missing
+  entry (or `ESRCH`) proves nothing alone: `hidepid` can hide a live
+  same-user process that is not dumpable, so the check goes on. It calls
+  `pidfd_open(pid)`: `ESRCH` means gone. After the open it reads
+  `/proc/<pid>/stat` again: other start ticks mean gone; equal ticks mean
+  the pidfd names the recorded process (a missing entry again goes on;
+  a pid reused meanwhile then reads as present, which costs only
+  availability). It then polls the pidfd; readable means the whole
+  thread group has exited (Linux `pidfd_poll` in `kernel/fork.c` reports readable only
   when `thread_group_exited` in `kernel/exit.c` holds: the task has an
   exit state and its thread group is empty). That holds for an exited
   process nobody has reaped yet (for example under a container init that
@@ -350,8 +357,10 @@ gone when:
   closed.
 
 A record from the same boot but another PID namespace cannot be checked
-from here (processes of another namespace may be invisible): it is
-uncertain, and the anchor refuses the configuration as
+from here (processes of another namespace may be invisible), nor can one
+from another time namespace (`/proc/<pid>/stat` shifts start ticks by the
+reader's time-namespace offset; a kernel without time namespaces records
+`time:none`): it is uncertain, and the anchor refuses the configuration as
 `PredecessorUncertain`, a `launch_failed` whose detail names the other
 namespace, not cached. Manual recovery: stop the other VIA that uses this
 state directory, then, with no OpenCode server of either VIA running,
@@ -361,12 +370,13 @@ A server still present is waited for by polling its pidfd with a timeout,
 for up to 1 s in all (the remaining window is microseconds); still
 present, the anchor refuses the
 configuration as `PredecessorAlive`, a `launch_failed` whose detail names
-the recorded pid and its start time (nothing launched, not cached; a later acquisition
+the recorded pid and its start time in UTC (nothing launched, not cached; a later acquisition
 checks again). Recovery for a server left running (for example one that
 lost its parent-death signal, below): before stopping the named process,
 the user checks that it is VIA's OpenCode server, because a command line
-alone does not show that: its start time matches the refusal's detail
-(`ps -o lstart= -p <pid>`), and its working directory is VIA's private
+alone does not show that: its start time, read in UTC
+(`TZ=UTC ps -o lstart= -p <pid>`), matches the UTC start the refusal's
+detail shows, and its working directory is VIA's private
 OpenCode namespace (`ls -l /proc/<pid>/cwd`). Then the user stops it, and
 the next acquisition admits. A server still present
 after that may be finishing uninterruptible kernel work (for example
@@ -383,7 +393,7 @@ withdrawn), and the server's start ticks are kept in Host memory only
 | Idle retirement, drain or server loss | the anchor's own-group stop ends the server, then the anchor; the lock is free and the recorded server gone |
 | Failed acquisition, before or after ARM | the anchor holds the lock until it exits; its server, if any, dies with it |
 | Daemon crash before ARM | only the anchor existed; it exits on controller EOF or its 5 s bootstrap bound; no server |
-| Daemon crash after ARM | each anchor stops its group on controller EOF (runtime §5.1); an anchor that lingers keeps the lock, and its server cannot outlive it |
+| Daemon crash after ARM | each anchor stops its group on controller EOF (runtime §5.1); an anchor that lingers keeps the lock, and its server dies with it (one that lost its parent-death signal, a limit below, stays named by the record and fenced) |
 | Anchor killed from outside | the kernel kills the server; the next anchor's predecessor check waits out the window, and an unreaped zombie counts as gone |
 | Anchor died before the child set its parent-death signal | the child sees another parent and exits without executing OpenCode |
 | Anchor died after the child's signal setup, before exec | before writing the record: no record ever names the child, which exits or is killed without executing OpenCode; after writing it: the record names the child, and the next anchor waits on its pidfd until it is gone |
@@ -449,12 +459,25 @@ Limits.
   surviving server, so it is fenced (`PredecessorAlive` naming its pid)
   and no second server starts, at the cost of availability until the user
   stops it (recovery above).
+- Accepted limit (coordinator, 2026-10-06, Host critical review): an
+  exec in the server's chain that gains privilege also clears the
+  parent-death signal, so the server can outlive its anchor. Examples: a
+  `#!` interpreter, or an `env` `PATH` lookup, that reaches a set-user-ID,
+  set-group-ID or file-capability binary; the anchor checks only the
+  program path. The record still names the server, so the next launch
+  fails closed with `PredecessorAlive` and its recovery text: the
+  one-server guarantee holds, and only dying with the anchor is lost.
 - It covers the server process only. The server's own descendants (tool
   shells, MCP and LSP servers, plugins) are not killed with it; they never
   hold the lock (it is close-on-exec) and are left to the leftover report,
   as for every harness.
-- Only one PID namespace per state directory is supported; another one's
-  record is refused as uncertain (above).
+- Only one PID namespace and one time namespace per state directory are
+  supported; another one's record is refused as uncertain (above).
+- VIA's state directory and VIA's own executable must be on a local,
+  responsive filesystem (runtime §5, filesystem requirement): the
+  anchor's synchronous spawns change into the namespace directory and the
+  probe root and execute VIA's binary, so a stalled network or FUSE
+  filesystem can hold the anchor and its lock.
 - The lock does not touch harness-process capacity. Core reserves a
   `harness_processes` permit for every recovered anchor row it cannot
   prove gone and releases it once an absence proof commits; but an
@@ -965,8 +988,9 @@ cleanup `Uncertain`.
 **Restart and recovery.** A replacement starts only when its anchor gets
 the data-root lock and its predecessor is proven gone (§3.2), in the
 same daemon run and after a restart: an anchor a daemon crash left behind
-holds the lock until it exits, and its server cannot outlive it, so no
-second server starts meanwhile. Each session is re-verified on its first `run_turn` (§6),
+holds the lock until it exits, and its server dies with it (or, past
+§3.2's limits, is named by the record and fenced), so no second server
+starts meanwhile. Each session is re-verified on its first `run_turn` (§6),
 and its leftover inputs are cancelled (§7.2); the password rotates. After a
 crash the vendor keeps no outcome: no completion, no idle record, nothing
 resumes on its own (E31), queued input stays parked (E53). Daemon-crash
@@ -1069,7 +1093,8 @@ race), or a binary whose
 `--version` disagrees with its server, after which the unchecked server
 runs until its handshake refusal. That residue is accepted (coordinator,
 critical review round 4). The fence holds throughout (the lock is the
-anchor's, and the server dies with it).
+anchor's, and the server dies with it or, past §3.2's limits, is fenced
+by the record).
 
 **Declared capability** after its tests pass:
 
@@ -1109,8 +1134,8 @@ pinned binary and a free model.
 | OC07 never-ask and isolation | Create/readback rules; other-session rename/move and self-move unavailable (live); declines within 5 s with the general pool full and observations saturated; a late request naming a settled turn's IDs credited to it; with T1 settled and T2 running, a late permission request naming T1's tool ID whose decline does not settle in 5 s: T1's envelope unchanged, a late `vendor.request_declined` on T1, no interrupt sent, the generation drains, T2 finishes or meets its own deadline, then the server retires; unattributed declined and credited to none; a child (task) session gets the same deny rules (other-session rename/move, self-move, `question`, `skill` when off) and its permission requests are declined (live); only a callID-correlated permission decline maps `interrupted{shutdown}` to `Completed/Other`; form decline leaves the ordinary rows; `vendor.request_declined` fields; `tools_ended` kept; `permission.rejected` → `action.denied`, deduplicated |
 | OC08 control | Cancel before send withdraws; before delivery → inbox cancel → input-cancellation terminal → `cancelled`/`acknowledged`, quiescent; same after wall cleanup keeps `failed(deadline_wall)`; lost cancel race → interrupt; interrupt during a tool → `interrupted{user}`, quiescent; no acknowledgement by `force_at` → `unknown`, no kill, later terminal or input cancellation revises an accepted turn |
 | OC09 outcomes, drain and overload | Prompt status table; timeout and socket failure after a byte → drain; inconclusive prompt → turn by lane order (terminal, acceptance, else `unknown`); drain publishes readiness; a pinned unsent turn → `SessionGone`; sent turns finish; retirement through Host; next generation fresh. Lane overflow → `failed(overflow)` as Codex, terminal-overflow case, no drain, successor dispatches; oversize event, full staging and each §9 count → generation `overflow`, including one long turn that learns 65,537 assistant and tool IDs, and the 8 MiB ID-byte bound reached by live and tombstoned turns together; an ID over 1 KiB → `protocol`; prompt admission at both sides of the limit with escaping-heavy text; 45 s silence |
-| OC02b fence | Through real Host anchors (a `test-failpoints` build) and a fake vendor that reports its pid, parent, open descriptors and `fdinfo`: `server.lock` is created 0600 and never unlinked; the anchor holds it from configuration and the vendor and its children never hold it (no descriptor of it and no `lock:` line in any of their `fdinfo` entries). A held lock refuses the configuration: no ARM intent commits, no vendor starts, the turn is `submit_failed`/`launch_failed` with the lock step, nothing cached, and a later acquisition succeeds once the holder exits. Dies with its anchor: `SIGKILL` of the anchor's pid alone (never its group) with a barrier holding Host's retirement → the vendor is gone within 1 s, its leftover children in their own groups survive and hold no lock; the same after a daemon crash after ARM, and with a fake vendor still alive more than 12 s after an idle anchor (the spawning thread outlives any blocking-pool thread). Parent death before the parent-death signal: a failpoint holds the child after it starts and before its signal setup, the anchor is killed, the child resumes → it exits without executing the vendor, and no vendor process appears. Server record: a failpoint holding the anchor before its record write shows the child polling and not executing the vendor; once the record is written the child executes; a record naming another pid or other start ticks never releases it; a failed record write → the anchor kills its child, which never executed the vendor, and the launch fails before any handshake; the child's 5 s bound and a changed parent each exit without executing the vendor; no descriptor of `server.lock` or any other extra descriptor is open in the vendor after exec (`/proc/<pid>/fd`). Handover: anchor A's child paused by a failpoint after its parent check, A killed alone before writing its record, anchor B configured and launched as soon as A's lock is free, then A's child released → it finds B's record (not naming it) and a changed parent, and never executes the vendor; only B's server runs, and B's record is intact afterwards (no late overwrite). Anchor dies after the record write and before the child's next poll → the record names the child, which may execute the vendor until the signal lands; B's configuration waits on its pidfd until it has exited, then admits. Predecessor check: a fake vendor that clears its own parent-death signal and calls `setsid` (out of the threat model, used here only to keep a predecessor alive), then its anchor killed alone: the vendor survives in its new group, and the next configuration re-probes for 1 s, then refuses `PredecessorAlive` (`launch_failed`, no ARM intent, not cached) and admits after the vendor exits; a missing or torn (checksum) record, another boot ID, or a record naming a gone vendor or a pid with other start ticks → admitted at once; an unreaped predecessor (the anchor and vendor killed under a test subreaper that does not reap: the vendor is a zombie) → admitted (pidfd readable); a recorded pid that no longer exists → admitted (`ESRCH`); a recorded pid reused by another process → admitted by the start-tick check; a recorded pid reused as a non-leader thread ID of a long-lived unrelated process (set up inside a private PID namespace through `ns_last_pid`, where the environment allows; `pidfd_open` would answer `EINVAL`) → admitted by the identity check before any open, while an unreadable identity → refused; a predecessor whose leader thread has exited while another thread still runs → refused; the review's interleaving forced with barriers: a fake vendor whose leader thread has exited and whose worker threads, each held at a barrier, execute the vendor again one after another (each exec replacing the leader through `de_thread`), with the predecessor check run before, between and after each release → present every time, admitted only after the process exits; a forced exec from a worker thread (the fake vendor re-executes itself from a non-leader thread), then the anchor killed alone → the vendor survives (the worker had no parent-death signal), the next configuration refuses `PredecessorAlive` naming its pid, no second server starts, and once the test stops that process the next acquisition admits; a record from the same boot but another PID namespace (written by a VIA in a child PID namespace) → `PredecessorUncertain`, `launch_failed` naming that namespace, not cached. A program file with set-user-ID, set-group-ID or a `security.capability` attribute → refused at configuration, nothing launched; an anchor whose effective and saved GID differ from its real GID, or whose `CapPrm`, `CapEff` or `CapAmb` is non-zero, or whose user IDs are 0 (each set up by a test harness where the environment allows) → `PrivilegedVia`, nothing launched. Store rows never gate a launch through the lock: with spare `harness_processes` capacity, a Store holding an identity-less pre-ARM server intent, a server anchor with another boot ID, and unproven Codex server anchors from earlier runs admits an OpenCode server at once when no lock holder lives; a live Codex server never blocks it. Such rows exhausting recovered capacity is the separate limitation of §3.2 (bead via-joc), not tested here |
-| OC10 recovery | Server death during N sessions' turns → `server_lost` with one shared leftover report; a terminal admitted before the loss kept; EOF with process alive → `unknown`; quiescent with `GroupAbsent` even when tool leftovers are listed; daemon crash → `unknown`, no resend; a daemon crash after ARM, then restart: a lingering anchor's lock refuses a new server until the anchor exits, and its server never outlives it, assuming no exec from a non-leader thread (a survivor of the upgrade-window exception is fenced and named for the user to stop, §3.2) (OC02b); password rotation |
+| OC02b fence | Through real Host anchors (a `test-failpoints` build) and a fake vendor that reports its pid, parent, open descriptors and `fdinfo`: `server.lock` is created 0600 and never unlinked; the anchor holds it from configuration and the vendor and its children never hold it (no descriptor of it and no `lock:` line in any of their `fdinfo` entries). A held lock refuses the configuration: no ARM intent commits, no vendor starts, the turn is `submit_failed`/`launch_failed` with the lock step, nothing cached, and a later acquisition succeeds once the holder exits. Dies with its anchor: `SIGKILL` of the anchor's pid alone (never its group) with a barrier holding Host's retirement → the vendor is gone within 1 s, its leftover children in their own groups survive and hold no lock; the same after a daemon crash after ARM, and with a fake vendor still alive more than 12 s after an idle anchor (the spawning thread outlives any blocking-pool thread). Parent death before the parent-death signal: a failpoint holds the child after it starts and before its signal setup, the anchor is killed, the child resumes → it exits without executing the vendor, and no vendor process appears. Server record: a failpoint holding the anchor before its record write shows the child polling and not executing the vendor; once the record is written the child executes; a record naming another pid or other start ticks never releases it; a failed record write → the anchor kills its child, which never executed the vendor, and the launch fails before any handshake; the child's 5 s bound and a changed parent each exit without executing the vendor; no descriptor of `server.lock` or any other extra descriptor is open in the vendor after exec (`/proc/<pid>/fd`). Handover: anchor A's child paused by a failpoint after its parent check, A killed alone before writing its record, anchor B configured and launched as soon as A's lock is free → A's child, whose parent-death signal is already set, dies with A, so it never reads B's record and never executes the vendor; only B's server runs, and B's record is intact afterwards (no late overwrite). The record poll's changed-parent re-check is defence in depth that cannot be reached while the signal holds; the exec entry's unit test covers it. Anchor dies after the record write and before the child's next poll → the record names the child, which may execute the vendor until the signal lands; B's configuration waits on its pidfd until it has exited, then admits. Predecessor check: a fake vendor that clears its own parent-death signal and calls `setsid` (out of the threat model, used here only to keep a predecessor alive), then its anchor killed alone: the vendor survives in its new group, and the next configuration re-probes for 1 s, then refuses `PredecessorAlive` (`launch_failed`, no ARM intent, not cached) and admits after the vendor exits; a missing or torn (checksum) record, another boot ID, or a record naming a gone vendor or a pid with other start ticks → admitted at once; an unreaped predecessor (the anchor and vendor killed under a test subreaper that does not reap: the vendor is a zombie) → admitted (pidfd readable); a recorded pid that no longer exists → admitted (`pidfd_open` `ESRCH`; a missing `/proc/<pid>/stat` alone never admits, since `hidepid` can hide a live process: unit-tested, as the fixture's procfs is not mounted with `hidepid`); a recorded pid reused by another process → admitted by the start-tick check; a recorded pid reused as a non-leader thread ID of a long-lived unrelated process (set up inside a private PID namespace through `ns_last_pid`, where the environment allows; `pidfd_open` would answer `EINVAL`; a privileged gate, not yet implemented: the Host slice's `oc02b_record_naming_a_thread_id` covers the identity check with a record naming a live thread ID instead) → admitted by the identity check before any open, while an unreadable identity → refused; a predecessor whose leader thread has exited while another thread still runs → refused; the review's interleaving, forced at one boundary: a fake vendor whose leader thread has exited and whose worker threads execute the vendor again one after another (each exec replacing the leader through `de_thread`); for each exec, a failpoint holds the predecessor proof after its first identity read and before `pidfd_open`, the worker's exec is released and completes, then the proof goes on → present; unforced checks before and after each exec → present; admitted only after the process exits (the boundaries between the open, the second identity read and the poll are not forced); a forced exec from a worker thread (the fake vendor re-executes itself from a non-leader thread), then the anchor killed alone → the vendor survives (the worker had no parent-death signal), the next configuration refuses `PredecessorAlive` naming its pid, no second server starts, and once the test stops that process the next acquisition admits; a record from the same boot but another PID namespace (written by a VIA in a child PID namespace) → `PredecessorUncertain`, `launch_failed` naming that namespace, not cached; the same for a record from another time namespace (the fixture writes one naming this process with other start ticks, which this namespace would otherwise read as another process). The acquisition carries the vendor's pid (`AcquiredProcess.vendor_pid`, equal to the pid the vendor reports and the record names); a launch without the fence passes `None` through Wire. A program file with set-user-ID, set-group-ID or a `security.capability` attribute → refused at configuration, nothing launched; an anchor whose effective and saved GID differ from its real GID, or whose `CapPrm`, `CapEff` or `CapAmb` is non-zero, or whose user IDs are 0 (each set up by a test harness where the environment allows) → `PrivilegedVia`, nothing launched. Store rows never gate a launch through the lock: with spare `harness_processes` capacity, a Store holding an identity-less pre-ARM server intent, a server anchor with another boot ID, and unproven Codex server anchors from earlier runs admits an OpenCode server at once when no lock holder lives; a live Codex server never blocks it. Such rows exhausting recovered capacity is the separate limitation of §3.2 (bead via-joc), not tested here |
+| OC10 recovery | Server death during N sessions' turns → `server_lost` with one shared leftover report; a terminal admitted before the loss kept; EOF with process alive → `unknown`; quiescent with `GroupAbsent` even when tool leftovers are listed; daemon crash → `unknown`, no resend; a daemon crash after ARM, then restart: a lingering anchor's lock refuses a new server until the anchor exits, and its server never outlives it, assuming no exec from a non-leader thread and no privilege-gaining exec in its chain (a survivor of either limit is fenced and named for the user to stop, §3.2) (OC02b); password rotation |
 | OC11 parameters and usage | Variant check and switch: two locations on one server whose project configurations give the same model different variants: on every turn, including later turns of each session, each session's effort is accepted or refused in `run_turn` by a fresh fetch of its own location's catalog, before any prompt, and `check_turn` accepts both (no location-dependent preflight); a location whose variant appears only after its first catalog response: the first turn is refused `submit_failed` naming `effort`, a retried turn is accepted; non-default readback, clearing to default and an ignored switch as OC04; `effort:"default"` is equivalent to omitting effort (no catalog fetch, the variant cleared or left clear, readback `"default"`), including on a location whose catalog lists no `default` variant; instruction size at 262,144/262,145 encoded bytes; output schema and max steps refusals; step-keyed usage excluding `usage.updated`; a compaction sample → `vendor_interval` plus `usage_interval_unverified`; class hints |
 | OC12b provider secrets | Synthetic project configurations at two locations set `providers.opencode.settings.apiKey`, a provider header, a model and a variant header and `body`, and a custom endpoint URL with a token; the fake vendor echoes them in `/api/model`, the session model readback, an error event's message and its stderr. Boolean scan: none of the synthetic values appears in any envelope, event, status, `models` or `describe` result, log, diagnostic, Store row or evidence file, and no `stderr.log` exists for the server (its stderr is counted only); a `/api/model` body that fails to decode, an HTTP body over its cap, a body truncated before its declared length, an SSE event over 1 MiB and an SSE stream ending mid-event, each carrying the synthetic values in their first bytes: no `undecoded.bin` or other payload copy anywhere, only endpoint or event type, status, length and failure kind; `GET /api/config`, `/api/provider*`, `/api/mcp`, `/api/plugin` and `/api/credential` never requested |
 | OC12 password | Password only in the launch environment; absent from tools (Boolean), argv, Store, keys, diagnostics and captures; synthetic secrets only |
@@ -1196,6 +1221,16 @@ assumes the server never executes from a non-leader thread (qualified by
 L14), and a server that does is fenced by the record and named in the
 refusal for the user to stop (§3.2).
 
+Decided (coordinator, 2026-10-06, Host critical review): the server
+record holds the writer's time namespace, and a record from another one
+is uncertain, because start ticks carry the reader's time-namespace
+offset; a missing `/proc/<pid>/stat` is not proof of exit (`hidepid`), so
+only other start ticks, `pidfd_open` `ESRCH` or a readable pidfd prove
+it; a privilege-gaining exec in the server's chain is an accepted limit,
+fenced by the record like the non-leader exec; VIA's state directory
+and executable must be on a local, responsive filesystem (§3.2; runtime
+§5).
+
 Decided (owner, 2026-10-06, bead via-4sw.3): one OpenCode server for all of
 VIA, one private namespace with project configuration always on; a request
 to turn off a category only the project switch controls is `unknown` with
@@ -1276,6 +1311,11 @@ full credential check).
 
 Critical review round 7 (2026-10-06): runtime §5 (identity before
 `pidfd_open`; `PredecessorAlive { pid }`; the non-leader exec limit).
+
+Host critical review (2026-10-06): runtime §5 (the record's time
+namespace; a missing `/proc/<pid>/stat` goes on to the pidfd; the
+privilege-gaining exec limit; the filesystem requirement;
+`AcquiredProcess.vendor_pid` through Wire as an `Option`).
 
 Rev7 (2026-10-06) made these edits in place: C1 P11 and its §Decisions
 row, and the §9 password note (one server for all of VIA; reach of a

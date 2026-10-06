@@ -367,6 +367,7 @@ async fn run<P: PrivateProtocol>(
         wake: woken.clone(),
         gate,
         inbound: via_wire::InboundBounds::DEFAULT,
+        capture: via_wire::Capture::On,
     };
     let turn_run = run_turn::<P>(
         runtime,

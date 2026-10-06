@@ -108,6 +108,12 @@ pub fn run_anchor_from_args(args: &[std::ffi::OsString]) -> i32 {
     via_adapters::run_anchor_from_args(args)
 }
 
+/// Internal exec entry (runtime §5 "Die with the anchor"), forwarded
+/// through this architecture layer like the anchor's.
+pub fn run_exec_from_args(args: &[std::ffi::OsString]) -> i32 {
+    via_adapters::run_exec_from_args(args)
+}
+
 pub use api::{
     ApiError, CancelParams, CloseMode, CloseParams, DEFAULT_CLOSE_DEADLINE_MS,
     DEFAULT_FORCE_AFTER_MS, DEFAULT_WAIT_MS, DaemonStatusParams, DaemonStopParams,
