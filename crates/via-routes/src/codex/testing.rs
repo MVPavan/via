@@ -357,6 +357,21 @@ impl VendorEnds {
     /// When VIA's handshake differs.
     pub async fn handshake(&mut self, user_agent: &str, models: &[Value]) {
         let initialize = self.read().await;
+        self.answer_handshake(&initialize, user_agent, models).await;
+    }
+
+    /// [`Self::handshake`] after its `initialize` was read: the reply,
+    /// then `initialized` and one `model/list` page listing `models`.
+    ///
+    /// # Panics
+    ///
+    /// When VIA's handshake differs.
+    pub async fn answer_handshake(
+        &mut self,
+        initialize: &Value,
+        user_agent: &str,
+        models: &[Value],
+    ) {
         assert_eq!(initialize["method"], "initialize", "{initialize}");
         self.emit(&serde_json::json!({
             "id": initialize["id"],

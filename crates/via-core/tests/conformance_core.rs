@@ -4769,6 +4769,51 @@ fn codex_sqlite_home_persists_across_restart() {
     });
 }
 
+/// Bead via-20s (live 2026-10-06, Codex 0.160.0): a Codex server that
+/// dies during its handshake, before any of the waiting turn was sent,
+/// fails that turn definitively: `server_lost` on Host's confirmed exit,
+/// never `unknown`. So the turn queued behind it is not cancelled (C1 P6)
+/// and runs on the next server.
+#[test]
+fn codex_handshake_death_fails_and_keeps_the_queue() {
+    const NAME: &str = "codex_handshake_death_fails_and_keeps_the_queue";
+    let Some(root) = child(NAME, &no_fake(), &[]) else {
+        return;
+    };
+    let full = echo_copy(C1_PROMPT);
+    let initialize = full["steps"][0].clone();
+    assert_eq!(initialize["expect"]["line"]["method"], "initialize");
+    let mut dying = full.clone();
+    // As live: the second server's backfill wait timed out and it exited.
+    dying["steps"] = json!([
+        initialize,
+        {"await_signal": {"signal": "SIGUSR1"}},
+        {"exit": {"code": 1, "stderr": "Error: failed to initialize sqlite state runtime\n"}},
+    ]);
+    let replay = json!({
+        "source": format!("{NAME}: c1_commentary_usage, its first server dying at its handshake"),
+        "lifetimes": [dying, full],
+    });
+    let case = codex_case(&root, NAME, replay);
+    run(async {
+        let daemon = Daemon::open_with(&root, case.config());
+        let session = daemon.spawn(C1_PROMPT, &codex_spawn(&case, 60_000)).await;
+        assert_eq!(case.at(2).await, 1, "the first server holds its handshake");
+        daemon.resume(&session, C1_PROMPT).await;
+        case.signal(1);
+        let failed = daemon.wait(&session, 1).await;
+        assert_eq!(failed["state"], "failed", "{failed}");
+        assert_eq!(class(&failed), "server_lost", "{failed}");
+        assert_eq!(failed["timestamps"]["accepted_at"], Value::Null, "{failed}");
+        case.at_launch(ECHO_GATE, 2).await;
+        case.signal(2);
+        let next = daemon.wait(&session, 2).await;
+        assert_eq!(next["state"], "completed", "{next}");
+        daemon.close(&session).await;
+        daemon.shutdown().await;
+    });
+}
+
 /// `codex_rss_leases` (x.3.2 X5, X0 item 9.2): the sessions leased on one
 /// server, each with one active turn.
 #[cfg(feature = "test-failpoints")]

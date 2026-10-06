@@ -122,7 +122,8 @@ pub enum LaunchFailure {
     Protocol(&'static str),
     /// The connection failed during the handshake.
     Lost(LossCause),
-    /// The handshake's 60 s bound passed.
+    /// The launch's handshake bound passed: 60 s, or 300 s for a first
+    /// start, whose wait for an earlier first start spends it.
     Deadline,
     /// The registry is fenced: the daemon is shutting down.
     Shutdown,
@@ -143,7 +144,11 @@ pub enum AcquireCause {
 
 impl LaunchFailure {
     /// The failure of turn `turn`, which waited on this launch: nothing of
-    /// the turn was sent, so it never launched on the server route.
+    /// the turn was sent, so it never launched on the server route. Core
+    /// therefore resolves a `TransportLost` here (a lost connection whose
+    /// server's exit Host did not confirm, the handshake's deadline, or the
+    /// launch task's failure) `failed(submit_failed)`, never `unknown`
+    /// (C1 §7.6, bead via-20s).
     pub fn route_failure(self, turn: TurnNumber) -> RouteFailure {
         let (cause, journal_uncertain, launch) = match self {
             Self::Acquire {
@@ -425,6 +430,13 @@ pub struct Servers {
     /// Never changed: the connection's wake.
     unwoken: watch::Sender<u64>,
     me: Weak<Servers>,
+    /// One first start at a time (bead via-20s; vendors/codex.md §2): a
+    /// launch on the [`HandshakeBound::First`] bound holds this permit
+    /// from before its process starts until its handshake settles. Every
+    /// server of the registry shares one SQLite home, the adapter's, and
+    /// a second server starting on an unmarked home dies after Codex's
+    /// own 30 s backfill wait.
+    first_start: tokio::sync::Semaphore,
     /// Test builds: scripted opens the launch job takes before Wire's
     /// (x.3.2 X4, [`Self::script`]).
     #[cfg(any(feature = "test-support", all(test, feature = "test-failpoints")))]
@@ -610,6 +622,7 @@ impl Servers {
             unforced: watch::Sender::new(None),
             unwoken: watch::Sender::new(0),
             me: me.clone(),
+            first_start: tokio::sync::Semaphore::new(1),
             #[cfg(any(feature = "test-support", all(test, feature = "test-failpoints")))]
             scripted: Mutex::default(),
         })
@@ -1253,6 +1266,21 @@ async fn launch(
         }
     };
     tokio::pin!(fenced);
+    // Bead via-20s: a first start waits, within its own deadline, for the
+    // in-flight first start's handshake to settle before its process
+    // starts. Nothing was started while it waits.
+    let first = match bound {
+        HandshakeBound::First => tokio::select! {
+            permit = timeout_at(deadline.instant(), servers.first_start.acquire()) => match permit {
+                Ok(Ok(permit)) => Some(permit),
+                // The semaphore is never closed.
+                Ok(Err(_)) => return Outcome::Launch(Err(LaunchFailure::Internal.into())),
+                Err(_) => return Outcome::Launch(Err(LaunchFailure::Deadline.into())),
+            },
+            () = &mut fenced => return Outcome::Launch(Err(LaunchFailure::Shutdown.into())),
+        },
+        HandshakeBound::Warm => None,
+    };
     // The open stays inside the fence's select, under the same deadline
     // and signals, its Wire error unchanged (x.3.2 X4, Sol d8).
     let opened = tokio::select! {
@@ -1272,17 +1300,29 @@ async fn launch(
         deadline.instant(),
         handshake(&connection, deadline, &observed),
     );
-    let outcome = tokio::select! {
-        facts = handshake => match facts {
+    let (outcome, ended) = tokio::select! {
+        facts = handshake => (match facts {
             Ok(Ok(facts)) => Ok(facts),
             Ok(Err(failure)) => Err(failure),
             Err(_) => Err(LaunchFailure::Deadline),
-        },
-        end = task.as_mut() => Err(match end {
-            ConnectionEnd::Failed(loss) => LaunchFailure::Lost(loss.cause),
-            ConnectionEnd::Retired => LaunchFailure::Lost(LossCause::TransportLost),
-        }),
-        () = &mut fenced => Err(LaunchFailure::Shutdown),
+        }, false),
+        end = task.as_mut() => (Err(LaunchFailure::Lost(loss_of(end))), true),
+        () = &mut fenced => (Err(LaunchFailure::Shutdown), false),
+    };
+    // The handshake settled: the next first start may begin.
+    drop(first);
+    // Bead via-20s: a handshake request fails `Lost` as the connection
+    // fails, before its task has Host's evidence; the task's own end
+    // classifies the loss (a confirmed exit is `ServerLost`). Awaited
+    // within the handshake's deadline; at it, or at the fence, the
+    // request's cause stands and the unfinished task is dropped, as any
+    // failed launch's is: its retirement closes the connection.
+    let outcome = match outcome {
+        Err(LaunchFailure::Lost(cause)) if !ended => Err(LaunchFailure::Lost(tokio::select! {
+            end = timeout_at(deadline.instant(), task.as_mut()) => end.map_or(cause, loss_of),
+            () = &mut fenced => cause,
+        })),
+        outcome => outcome,
     };
     Outcome::Launch(
         outcome
@@ -1292,6 +1332,14 @@ async fn launch(
                 user_agent: observed.get().cloned(),
             }),
     )
+}
+
+/// The loss a connection task's end reports to its launch.
+fn loss_of(end: ConnectionEnd) -> LossCause {
+    match end {
+        ConnectionEnd::Failed(loss) => loss.cause,
+        ConnectionEnd::Retired => LossCause::TransportLost,
+    }
 }
 
 impl Servers {
