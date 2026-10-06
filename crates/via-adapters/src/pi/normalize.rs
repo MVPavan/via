@@ -96,6 +96,13 @@ impl Normalizer {
         })
     }
 
+    /// Whether every sample normalized was usable and delivered or
+    /// deliverable: none without usage (which also makes [`Self::cost`]
+    /// unknown) and none still held for acceptance (packet §5.5).
+    pub(super) fn complete(&self) -> bool {
+        self.cost.is_some() && self.held.is_empty()
+    }
+
     /// One item's observations, in order.
     pub(super) fn item(&mut self, item: PiItem) -> Vec<Observation> {
         match item {

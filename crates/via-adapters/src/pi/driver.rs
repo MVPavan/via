@@ -820,15 +820,7 @@ impl Ended {
             .as_ref()
             .filter(|_| self.clamp.is_none())
             .and_then(|facts| normalize::thinking_data(&facts.thinking_level));
-        // Packet §5.5 (picrit round 2, A): after any delivery loss (an
-        // overflow, or a message Route decoded that never reached the
-        // normalizer, as the force or a cutoff leaves) the normalizer saw
-        // a prefix only, so the turn's accounting is unavailable, with a
-        // terminal or without one.
-        let incomplete = activity.delivered() < activity.decoded();
-        let lost = incomplete
-            || matches!(rest, Rest::Undelivered)
-            || matches!(&outcome, Err(failure) if matches!(failure.cause, RouteError::Overflow { .. }));
+        let lost = !accounted(normalizer, (rest, activity), &outcome);
         let terminal = terminal.map(|message| {
             let cost = normalizer.cost().filter(|_| !lost);
             let at = tokio::time::Instant::now();
@@ -907,6 +899,39 @@ impl Ended {
             outcome: routed,
         }
     }
+}
+
+/// Packet §5.5, the one accounting rule: the turn's tokens and cost are
+/// known only when every message that could carry usage decoded with
+/// usable usage and reached the normalizer. Otherwise they are
+/// unavailable, with a terminal (its all-null usage) or without one (the
+/// all-null [`TurnEnd::aggregate`]), whatever the delivered samples sum to.
+fn accounted(
+    normalizer: &Normalizer,
+    (rest, activity): (&Rest, &crate::TurnActivity),
+    outcome: &Result<PiRouteResult, RouteFailure>,
+) -> bool {
+    // Every sample normalized was usable: no call without usage (a null
+    // sample, a compaction without usage, a hidden retry) and none held
+    // for an acceptance that never came.
+    normalizer.complete()
+        // Every message Route decoded reached the normalizer: no overflow,
+        // force or cutoff cut delivery.
+        && activity.delivered() >= activity.decoded()
+        && !matches!(rest, Rest::Undelivered)
+        && match outcome {
+            Ok(_) => true,
+            // Overflow lost delivery. A message Route could not decode
+            // (missing usage, a nonnumeric counter, any malformed, oversize
+            // or unterminated record) may have carried usage: Route and
+            // Wire note every such message (`undecoded.bin`, runtime C4),
+            // whatever the failure's cause. A phase violation among
+            // decoded messages loses nothing.
+            Err(failure) => {
+                failure.undecoded.is_none()
+                    && !matches!(failure.cause, RouteError::Overflow { .. })
+            }
+        }
 }
 
 /// The exit Host confirmed, if any.

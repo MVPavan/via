@@ -607,14 +607,26 @@ cache reads, E24); `cached_input` = `cacheRead`; `output` = `output`;
   under OAuth it is not a billed amount (E24, E52). If any sample is
   all-`null`, the cost is `{usd: null, scope: turn, provenance: unavailable}`; a partial
   sum is never the turn's cost.
-- **Delivery loss.** Once observation delivery is lost (the stall bound,
-  Route's `overflow`, or any message Route decoded that never reached the
-  normalizer, as the daemon force or a cutoff leaves), the normalizer saw
-  a prefix only. The turn's cost is then `unavailable` and its tokens
-  `null`, with or without a retained terminal: a retained terminal
-  carries cost `unavailable` and an all-`null` turn aggregate; without
-  one, the turn's end carries that aggregate itself (C2 `TurnEnd.aggregate`,
-  §5), and either supersedes the delivered samples.
+- **One accounting rule.** The turn's tokens and cost are known only
+  when every message that could carry usage decoded with usable usage and
+  reached the normalizer. Any of these makes them unavailable:
+  - a call without usage: a null sample (all-zero usage), a compaction
+    without usage, a hidden retry;
+  - a sample still held for an acceptance that never came;
+  - a message Route could not decode (missing usage, a nonnumeric
+    counter, any malformed, oversize or unterminated record), which Route
+    and Wire note as `undecoded.bin` evidence;
+  - delivery loss: the stall bound, Route's `overflow`, or any decoded
+    message that never reached the normalizer, as the daemon force or a
+    cutoff leaves.
+
+  The turn's cost is then `unavailable` and its tokens `null`, with or
+  without a retained terminal: a retained terminal carries cost
+  `unavailable` and an all-`null` turn aggregate; without one, the turn's
+  end carries that aggregate itself (C2 `TurnEnd.aggregate`, §5), and
+  either supersedes the delivered samples. A phase violation among
+  decoded messages, or a stop whose delivered samples are complete, keeps
+  the summed accounting.
 - Cache warming adds model calls on eligible models (E61); the profile
   policy requires it off (§4.3).
 
@@ -792,7 +804,7 @@ hostile profiles only in scratch agent directories. Selection as Claude's:
 | `pi_terminal_mapping` | Every §5.3 row; only the terminal message is final text; the system message never reaches final text, progress or the envelope |
 | `pi_progress_deltas` | One text block streaming longer than `idle_ms` keeps the turn alive; usage snapshots never become samples; idle expiry waits for the decode fence |
 | `pi_usage_accounting` | Mixed present and all-zero samples → `null` token components and `unavailable` cost; cache and reasoning counters map as §5.5; compaction with and without usage; a compaction after `summarization_retry_scheduled` → `null` tokens and `unavailable` cost |
-| `pi_accounting_after_loss` | Delivery lost between two priced calls (Core holds past the stall bound): `overflow` with the retained terminal, cost `unavailable`, `null` tokens, never the delivered $0.50. `pi_accounting_after_forced_loss`: the daemon force cuts delivery after one priced sample, the terminal retained → cost `unavailable`, `null` tokens. `pi_accounting_overflow_without_terminal`: overflow before settlement → no terminal, `null` tokens |
+| `pi_accounting_after_loss` | Delivery lost between two priced calls (Core holds past the stall bound): `overflow` with the retained terminal, cost `unavailable`, `null` tokens, never the delivered $0.50. `pi_accounting_after_forced_loss`: the daemon force cuts delivery after one priced sample, the terminal retained → cost `unavailable`, `null` tokens. `pi_accounting_overflow_without_terminal`: overflow before settlement → no terminal, `null` tokens. `pi_accounting_malformed_usage`: a priced call, then a `message_end` with no usage or a nonnumeric counter → `protocol`, `null` tokens |
 | `pi_abort` | Tool-phase and streaming markers with the paired reply acknowledge; the idle reply alone never does; a 401 racing the abort → `failed(auth)`, `requested`; natural completion keeps `Completed`; a reply after `agent_settled` is awaited; no reply by `force_at` → no acknowledgement. `pi_abort_unanswered_late`: no reply while settlement waits for read-ahead room past the wall (late path) → no terminal, the cancel's row. `pi_abort_unanswered_stall`: the stall's abort unanswered → the wait ends at the stall's `force_at`, not the wall: `overflow`, no terminal. `pi_abort_unanswered_shortened`: a 60 s cancel grace, then a forced close with a 1 s deadline → the reply wait ends at the shorter order. `pi_abort_unanswered_held`: wall 5 s, `force_at` 1 s, `close_by` 4 s, delivery held → the turn returns by `close_by`, not about 8 s |
 | `pi_eof_is_stop` | EOF mid-run: exit 0, no terminal, never `Completed` |
 | `pi_signals_cleanup` | Force close via TERM kills tool groups; a `setsid` escapee survives and is not reported (`leftovers: null`; no leftover scan until via-daz); SIGINT is never sent; a spinning startup is bounded by deadlines and KILL |

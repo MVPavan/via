@@ -467,9 +467,10 @@ fn canonical_turn_usage(samples: u64) -> Value {
         "reasoning_output_tokens": 0, "total_tokens": 110 * samples, "scope": "turn"})
 }
 
-/// A turn usage whose every component is unknown (packet §5.5).
+/// A turn usage whose every component is unknown (packet §5.5): the
+/// all-null aggregate of a turn whose accounting is unavailable.
 fn null_usage() -> Value {
-    json!({"from": "samples", "input_tokens": null, "cached_input_tokens": null,
+    json!({"from": "terminal", "input_tokens": null, "cached_input_tokens": null,
         "output_tokens": null, "reasoning_output_tokens": null, "total_tokens": null,
         "scope": "turn"})
 }
@@ -3143,7 +3144,6 @@ fn pi_accounting_after_loss() {
     wanted["terminal"]["cost"] = json!({"usd": null, "provenance": "unavailable"});
     // The all-null turn aggregate supersedes the delivered prefix.
     wanted["usage"] = null_usage();
-    wanted["usage"]["from"] = json!("terminal");
     wanted["error"] = json!("overflow");
     wanted["final_text"] = Value::Null;
     let mut lost = turn("Run a tool.", wanted);
@@ -3380,7 +3380,6 @@ fn pi_accounting_after_forced_loss() {
     let mut wanted = completed(1, "READY");
     wanted["terminal"]["cost"] = json!({"usd": null, "provenance": "unavailable"});
     wanted["usage"] = null_usage();
-    wanted["usage"]["from"] = json!("terminal");
     wanted["error"] = json!("force_stop");
     wanted["final_text"] = Value::Null;
     wanted["exit"] = json!({"code": 143, "signal": null});
@@ -3393,6 +3392,60 @@ fn pi_accounting_after_forced_loss() {
         ..Knobs::default()
     };
     check_built("pi_accounting_after_forced_loss", &replay, &expect, knobs).unwrap();
+}
+
+/// Packet §5.5, the one accounting rule (picrit round 3): a valid $0.50
+/// tool-call sample is delivered, then the next assistant `message_end`
+/// has no usage, or a nonnumeric counter. Route cannot decode it and the
+/// turn fails `protocol`; that call's usage is unknown, so the all-null
+/// aggregate supersedes the delivered prefix. Before the fix Core
+/// reported the first call's tokens as the turn's.
+#[test]
+fn pi_accounting_malformed_usage() {
+    let mut nonnumeric = canonical_usage();
+    nonnumeric["output"] = json!("10");
+    let variants = [
+        ("pi_accounting_usage_missing", None),
+        ("pi_accounting_usage_nonnumeric", Some(nonnumeric)),
+    ];
+    let mut failures = Vec::new();
+    for (name, bad) in variants {
+        let mut steps = handshake(&State::default());
+        steps.extend(prompt("Run a tool."));
+        steps.extend(echo("Run a tool."));
+        steps.extend(tool_call(&canonical_usage()));
+        steps.extend(tool_end(false));
+        let mut done = assistant(
+            json!([{"type": "text", "text": "READY"}]),
+            "stop",
+            &Value::Null,
+            None,
+        );
+        match bad {
+            Some(usage) => done["usage"] = usage,
+            None => unset(&mut done, "usage"),
+        }
+        // Everything before it is delivered first: no delivery loss.
+        steps.push(json!({"delay": {"ms": 300}}));
+        steps.push(message_end(&done));
+        steps.extend(terminated());
+        let replay = single(
+            "synthetic (picrit round 3): a priced call, then a message_end with unusable usage",
+            argv(Argv::default()),
+            steps,
+        );
+        let usage = null_usage();
+        let wanted = json!({
+            "plan_refusal": null, "rejected": null, "accepted": true,
+            "terminal": null, "error": "protocol", "usage": usage, "cleanup": "quiescent",
+            "observation_counts": {"turn.accepted": 1},
+        });
+        let expect = case(name, 1, vec![turn("Run a tool.", wanted)]);
+        if let Err(failure) = check_built(name, &replay, &expect, Knobs::default()) {
+            failures.push(failure);
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// Packet §5.5, bead via-i5g (picrit round 2, A): overflow before
@@ -3408,7 +3461,6 @@ fn pi_accounting_overflow_without_terminal() {
     let mut wanted = completed(1, "");
     wanted["terminal"] = Value::Null;
     wanted["usage"] = null_usage();
-    wanted["usage"]["from"] = json!("terminal");
     wanted["error"] = json!("overflow");
     wanted["final_text"] = Value::Null;
     wanted["exit"] = json!({"code": 143, "signal": null});
