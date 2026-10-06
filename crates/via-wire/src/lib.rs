@@ -25,8 +25,9 @@ pub struct InboundBounds {
     /// `message_bytes`.
     pub staging_bytes: usize,
     /// A line over `message_bytes` is skipped to its LF and delivered as a
-    /// [`VendorMessage::skipped`] record, its route to attribute (owner
-    /// 2026-10-05), instead of failing the connection `MessageTooLarge`.
+    /// [`VendorMessage::skipped`] record (its length, head and tail) for
+    /// its route's evidence (owner 2026-10-05), instead of failing the
+    /// connection `MessageTooLarge`.
     pub skip_oversize: bool,
 }
 

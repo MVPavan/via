@@ -1125,7 +1125,7 @@ impl Connection {
             state.seq
         };
         if let Some(skipped) = message.skipped() {
-            return self.skipped(&message, &skipped.head);
+            return Err(self.skipped(&skipped.head));
         }
         match peek(message.bytes()) {
             Ok(Routing::Response(id)) => {
@@ -1173,29 +1173,14 @@ impl Connection {
         }
     }
 
-    /// A line over the cap, skipped by Wire (owner 2026-10-05): attributed
-    /// by its tail's closing `params` IDs ([`trailing_ids`]), it is a message
-    /// dropped for its owner, so that thread's lane ends `Overflow` and its
-    /// turn fails `overflow` with its loss, as a full lane's would; other
-    /// sessions go on. A thread with no open registration drops it, as any
-    /// message. With no such proven tail it is unattributable: its head is
-    /// the server's evidence and the connection fails `protocol`, as before.
-    fn skipped(&self, message: &VendorMessage, head: &[u8]) -> Result<(), ConnectionFailure> {
-        let Some((thread, turn)) = trailing_ids(message.bytes()) else {
-            self.keep_evidence(head);
-            return Err(ConnectionFailure::Protocol);
-        };
-        if let Route::Lane {
-            lane,
-            signal,
-            owner,
-        } = self.route(Some(&thread), Some(&turn))
-            && lane.drop_skipped(owner)
-            && let Some(signal) = signal
-        {
-            signal.overflowed(lane.overflow_owner());
-        }
-        Ok(())
+    /// A line over the cap, skipped by Wire to its LF: unattributable
+    /// whatever its bytes name (owner 2026-10-05, review cfix-3), so its
+    /// head is the server's evidence and the connection fails `protocol`.
+    /// Post-release, a streaming JSON depth and string tracker in Wire can
+    /// attribute it to its turn.
+    fn skipped(&self, head: &[u8]) -> ConnectionFailure {
+        self.keep_evidence(head);
+        ConnectionFailure::Protocol
     }
 
     /// Keeps the first unattributable message for the server folder.
@@ -1448,82 +1433,6 @@ fn disposition(cause: ConnectionFailure, report: &WireCloseReport) -> Connection
         exit: report.vendor_exit,
         journal_uncertain: report.journal_uncertain,
     }
-}
-
-/// The closing correlation of a skipped line from its last bytes (owner
-/// 2026-10-05; review cfix-2): `"params":{"threadId":"…","turnId":"…"`,
-/// the IDs as the first members of a `params` that is a member of the
-/// envelope, then only integer members (`completedAtMs`), the close of
-/// `params`, the envelope's integer members (`emittedAtMs`) and its
-/// close, then LF. Read backward from the line's end, every token is
-/// outside a string: an ID is only of `[0-9A-Za-z_-]` and each quote is
-/// preceded by `:`, `,` or `{`, never an escape. The closes show that the
-/// IDs sit directly in the envelope's last object member; the key shows
-/// that member is `params`. Anything else is unproven, so unattributable:
-/// Codex's own `item/started`, `item/completed` and `error` write their
-/// IDs after `item` (0.159.2 fixtures), past the 4 KiB tail for an
-/// over-cap item, so the key is out of reach and those lines stay
-/// unattributable until a streaming scan proves their `params`.
-pub(super) fn trailing_ids(tail: &[u8]) -> Option<(String, String)> {
-    let rest = tail.strip_suffix(b"\n")?.strip_suffix(b"}")?;
-    let rest = strip_integer_members(rest).strip_suffix(b"}")?;
-    let rest = strip_integer_members(rest);
-    let (rest, turn) = strip_id_member(rest, b"turnId")?;
-    let (rest, thread) = strip_id_member(rest.strip_suffix(b",")?, b"threadId")?;
-    let rest = rest.strip_suffix(b"\"params\":{")?;
-    matches!(rest.last(), Some(b',' | b'{')).then_some((thread, turn))
-}
-
-/// `rest` without its trailing `,"<letters>":<integer>` members.
-fn strip_integer_members(mut rest: &[u8]) -> &[u8] {
-    loop {
-        let digits = rest
-            .iter()
-            .rev()
-            .take_while(|byte| byte.is_ascii_digit())
-            .count();
-        if digits == 0 {
-            return rest;
-        }
-        let mut before = &rest[..rest.len() - digits];
-        before = before.strip_suffix(b"-").unwrap_or(before);
-        let Some(key) = before.strip_suffix(b"\":") else {
-            return rest;
-        };
-        let letters = key
-            .iter()
-            .rev()
-            .take_while(|byte| byte.is_ascii_alphabetic())
-            .count();
-        let Some(member) = key[..key.len() - letters]
-            .strip_suffix(b"\"")
-            .and_then(|start| start.strip_suffix(b","))
-        else {
-            return rest;
-        };
-        if letters == 0 {
-            return rest;
-        }
-        rest = member;
-    }
-}
-
-/// `rest` without its trailing `"<key>":"<id>"` member, and the ID.
-fn strip_id_member<'a>(rest: &'a [u8], key: &[u8]) -> Option<(&'a [u8], String)> {
-    let rest = rest.strip_suffix(b"\"")?;
-    let length = rest
-        .iter()
-        .rev()
-        .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-        .count();
-    if length == 0 {
-        return None;
-    }
-    let id = String::from_utf8(rest[rest.len() - length..].to_vec()).ok()?;
-    let rest = rest[..rest.len() - length].strip_suffix(b"\"")?;
-    let rest = rest.strip_suffix(b":")?.strip_suffix(b"\"")?;
-    let rest = rest.strip_suffix(key)?.strip_suffix(b"\"")?;
-    Some((rest, id))
 }
 
 /// The daemon-level `via.log` line for a failed shared connection

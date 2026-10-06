@@ -3163,27 +3163,23 @@ fn codex_escaped_output_over_one_mib_is_delivered() {
     variant(name, &replay, &expect).unwrap();
 }
 
-/// Owner 2026-10-05 (review cfix-1 C): a line over the Codex route's
-/// 8 MiB cap whose tail proves its `params` IDs does not fail the shared
-/// server. In `c4_two_sessions` B's first tool completion moves to after
-/// A's interrupt, while A's turn still runs, its output past the cap and
-/// its item moved out of `params`, so the tail closes
-/// `"params":{"threadId":…,"turnId":…}` (review cfix-2: Codex's own
-/// order, item first, is unattributable). Wire skips the line to its LF,
-/// the connection reads its closing `threadId`/`turnId` and drops it for
-/// B's turn, so B's lane overflows and only B's turn fails `overflow`;
-/// A's runs to its interrupt as recorded. Before, the line failed the
-/// connection, and both turns, `protocol`.
+/// Owner 2026-10-05 (review cfix-3): for the first release a line over
+/// the Codex route's 8 MiB cap is unattributable, whatever it names, and
+/// fails the shared connection `protocol`. In `c4_two_sessions`, after A's
+/// tool starts, B's tool completion arrives with its output past the cap,
+/// in Codex's own order: Wire skips it to its LF, its head is the server's
+/// evidence, Host stops the server, and both turns fail `protocol` with
+/// nothing of the line delivered.
 #[test]
-fn codex_over_cap_line_fails_only_its_turn() {
-    let name = "codex_over_cap_line_fails_only_its_turn";
+fn codex_over_cap_line_fails_the_shared_connection() {
+    let name = "codex_over_cap_line_fails_the_shared_connection";
     let mut replay = replay_of("c4_two_sessions").unwrap();
     let mut expect = expect_of("c4_two_sessions").unwrap();
     replay["source"] = json!(format!("{name}: a variant of c4_two_sessions"));
     expect["source"] = replay["source"].clone();
     let b_tool = "exec-019a0000-0000-7000-8000-000000400006";
-    let started = step_with(&replay, "exec-019a0000-0000-7000-8000-000000400007").unwrap();
-    let completed = (started + 1..steps(&mut replay).unwrap().len())
+    let a_tool = step_with(&replay, "exec-019a0000-0000-7000-8000-000000400007").unwrap();
+    let completed = (a_tool + 1..steps(&mut replay).unwrap().len())
         .find(|at| {
             line_of(&replay, *at).is_ok_and(|line| {
                 line.contains(b_tool) && line.contains(r#""method":"item/completed""#)
@@ -3191,71 +3187,70 @@ fn codex_over_cap_line_fails_only_its_turn() {
         })
         .unwrap();
     let output = "x".repeat(8 * 1024 * 1024 + 4096);
-    let recorded: Value = serde_json::from_str(&line_of(&replay, completed).unwrap()).unwrap();
-    let params = &recorded["params"];
-    let item = params["item"].to_string().replace(
+    let line = line_of(&replay, completed).unwrap().replace(
         r#""aggregatedOutput":null"#,
         &format!(r#""aggregatedOutput":"{output}""#),
     );
-    let line = format!(
-        r#"{{"method":"item/completed","item":{item},"params":{{"threadId":{},"turnId":{}}}}}"#,
-        params["threadId"], params["turnId"]
-    );
     assert!(line.len() > 8 * 1024 * 1024, "{}", line.len());
-    let all = steps(&mut replay).unwrap();
-    all.remove(completed);
-    // After VIA's interrupt of A, which A's tool start prompts: the long
-    // write never races it.
-    all.insert(started + 2, json!({"emit": {"line": line}}));
-    // B's overflow interrupts B's vendor turn at once; the replay holds
-    // A's later traffic until it arrives.
-    all.insert(
-        started + 3,
-        json!({"expect": {"line": {"method": "turn/interrupt", "params": {
-            "threadId": "019a0000-0000-7000-8000-000000100002",
-            "turnId": "019a0000-0000-7000-8000-000000200002"}},
-            "capture": {"interrupt_b": "/id"}}}),
-    );
-    all.insert(
-        started + 4,
-        json!({"emit": {"line": "{\"id\":${interrupt_b},\"result\":{}}"}}),
-    );
-    for step in steps(&mut replay).unwrap() {
-        if let Some(after) = step["expect"]["after_emit"].as_u64() {
-            assert!(after <= started as u64 + 1, "{step}");
+    cut_after(
+        &mut replay,
+        a_tool,
+        &[json!({"emit": {"line": line}}), sigterm()],
+    )
+    .unwrap();
+    for index in 0..2 {
+        let turn = turn_mut(&mut expect, index);
+        turn["stop"] = Value::Null;
+        let turn = &mut turn["expect"];
+        turn["terminal"] = Value::Null;
+        turn["usage"] = Value::Null;
+        turn["final_text"] = Value::Null;
+        turn["error"] = json!("protocol");
+        // The end is the connection's loss, whose evidence is Host's stop
+        // of the server.
+        turn["cleanup"] = json!("quiescent");
+        turn["stop_facts"] = Value::Null;
+        turn["group_absent"] = json!(true);
+        if let Some(turn) = turn.as_object_mut() {
+            turn.remove("cleanup_settles");
         }
+        let include: Vec<Value> = turn["observations_include"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|kind| {
+                kind["kind"] == json!("session.vendor_identity_confirmed")
+                    || kind["kind"] == json!("turn.accepted")
+            })
+            .cloned()
+            .collect();
+        turn["observations_include"] = json!(include);
+        turn["observations_exclude"] = json!(["final_text"]);
+        turn["observations_order"] = json!(["session.vendor_identity_confirmed", "turn.accepted"]);
+        turn["unasserted"] = json!([]);
     }
-    // B's failed generation was retired: nothing unsubscribes it.
-    let close_b = step_with(&replay, "${close_b}").unwrap();
-    steps(&mut replay).unwrap().drain(close_b - 1..=close_b);
-    let turn = &mut turn_mut(&mut expect, 1)["expect"];
-    turn["terminal"] = Value::Null;
-    turn["usage"] = Value::Null;
-    turn["final_text"] = Value::Null;
-    turn["error"] = json!("overflow");
-    turn["cleanup"] = json!("uncertain");
-    if let Some(turn) = turn.as_object_mut() {
-        turn.remove("group_absent");
-        turn.remove("cleanup_settles");
+    for session in ["main", "b"] {
+        expect["sessions"][session]["close"] = Value::Null;
+        expect["sessions"][session]["health"] =
+            json!({"state": "failed", "first_cause": "protocol"});
     }
-    let include: Vec<Value> = turn["observations_include"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|kind| {
-            kind["kind"] == json!("session.vendor_identity_confirmed")
-                || kind["kind"] == json!("turn.accepted")
-        })
-        .cloned()
-        .collect();
-    turn["observations_include"] = json!(include);
-    turn["observations_exclude"] = json!(["final_text"]);
-    turn["observations_order"] = json!(["session.vendor_identity_confirmed", "turn.accepted"]);
-    turn["unasserted"] = json!([]);
-    // B is left failed, not closed, so its health shows the cause.
-    expect["sessions"]["b"]["close"] = Value::Null;
-    expect["sessions"]["b"]["health"] = json!({"state": "failed", "first_cause": "overflow"});
-    variant(name, &replay, &expect).unwrap();
+    let mut kept = Vec::new();
+    checked_outcome(
+        name,
+        &replay,
+        &expect,
+        conformance_run::Knobs::default(),
+        |run| {
+            kept = undecoded_under(run.state.path());
+            kept.extend(undecoded_under(run.case_dir.path()));
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(
+        kept.len() == 1 && kept[0].contains("evidence/servers/"),
+        "evidence kept at {kept:?}"
+    );
 }
 
 /// X0 item 8.2 (x.3.2 X3 fix r4 #4): a close cuts the lane off in decode

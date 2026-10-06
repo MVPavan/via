@@ -32,9 +32,9 @@ pub const MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 
 /// A Codex connection's inbound bounds: [`MESSAGE_BYTES`], staging of
 /// runtime §8's 4 MiB for ordinary traffic plus one maximal message, and
-/// a line over the cap skipped to its LF for the connection to attribute
-/// (owner 2026-10-05): it fails its owner's turn `overflow`, not the
-/// shared server.
+/// a line over the cap skipped to its LF, so its bounded head and tail
+/// and its whole length are kept; the connection treats it as
+/// unattributable and fails `protocol` (owner 2026-10-05).
 pub const INBOUND: InboundBounds = InboundBounds {
     message_bytes: MESSAGE_BYTES,
     staging_bytes: 4 * 1024 * 1024 + MESSAGE_BYTES,
@@ -391,20 +391,6 @@ impl Lane {
         queue.dropped = queue.dropped.saturating_add(1);
         queue.overflow_owner = owner;
         self.overflow(queue);
-    }
-
-    /// A line of this thread skipped over the connection's cap (owner
-    /// 2026-10-05): dropped for `owner` as a refused message is, ending the
-    /// lane `Overflow`. Whether this drop ended it (a lane already ended
-    /// only counts it).
-    pub fn drop_skipped(&self, owner: Option<TurnNumber>) -> bool {
-        let mut queue = self.queue();
-        if queue.end.is_some() {
-            queue.dropped = queue.dropped.saturating_add(1);
-            return false;
-        }
-        self.refuse(queue, owner);
-        true
     }
 
     /// Opens the start gate.
