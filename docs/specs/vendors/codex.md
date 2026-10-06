@@ -37,7 +37,9 @@ instance version is parsed from `initialize.userAgent`: drop the
 0.160.0 (live rounds 1 and 2 through VIA, 2026-10-05/06); a version outside the adapter's `checked` set is
 `untested` and warns; only a failed handshake check (policy and sandbox echo)
 refuses, as `submit_failed` with `failure.data.reason:"handshake_refused"`,
-cached per C2 §5.
+cached per C2 §5 under the server key plus the turn's sandbox (mode
+and policy as derived from its bound), so a refusal under one bound never
+refuses another sharing the server.
 
 Local primary sources live under
 `scratchpad/execution/rust-foundation-release/codex-evidence/`:

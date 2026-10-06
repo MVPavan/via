@@ -16,6 +16,7 @@ mod plan;
 #[cfg(test)]
 mod tests;
 
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -141,6 +142,23 @@ impl CodexAdapter {
         self.recipe(requested).config_hash(ADAPTER_VERSION).hex()
     }
 
+    /// The refusal-cache key (C2 §5; codex-server.md, the refusal cache's
+    /// key): the server key plus the turn's sandbox, mode and policy, as
+    /// derived from its bound. The server stays shared across bounds, but
+    /// the handshake's echo check depends on the sandbox, so a refusal
+    /// under one bound never refuses another. `None` (no bound named)
+    /// matches no recorded refusal: every turn applies one.
+    fn refusal_key(&self, requested: Inherit, sandbox: Option<&plan::Sandbox>) -> String {
+        use std::fmt::Write as _;
+        let mut key = self.server_key(requested);
+        key.push('/');
+        for byte in &Sha256::digest(format!("{sandbox:?}"))[..8] {
+            // Writing to a `String` cannot fail.
+            let _ = write!(key, "{byte:02x}");
+        }
+        key
+    }
+
     /// The catalog server key `key`'s live instance discovered, if any:
     /// none once that instance retired or was lost.
     fn catalog(&self, key: &str) -> Option<Arc<[DiscoveredModel]>> {
@@ -223,9 +241,17 @@ impl CodexAdapter {
             .filter(|bound| plan::sandbox(bound).is_ok());
         let (inherit, switch_warning) = effective_inherit(&plan::categories(), requested);
         let vendor_version = self.instances.last_version(harness.name(), &self.binary);
+        let sandbox = req
+            .bound
+            .as_ref()
+            .and_then(|bound| plan::sandbox(bound).ok());
         let refused = self
             .instances
-            .refusal(&self.binary, &key, std::time::Instant::now())
+            .refusal(
+                &self.binary,
+                &self.refusal_key(requested, sandbox.as_ref()),
+                std::time::Instant::now(),
+            )
             .is_some();
         let version_status = if refused {
             // C2 §5 AD7: a cached refusal refuses the plan, as Claude's.

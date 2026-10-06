@@ -1325,7 +1325,7 @@ async fn turn(
         let opened = open_thread(
             &mut facts,
             (&ids, reservation),
-            sandbox.mode,
+            &sandbox,
             (&mut orders, &mut force, &mut writes),
         )
         .await;
@@ -1881,7 +1881,7 @@ struct Ids<'a> {
 async fn open_thread(
     facts: &mut Turn<'_>,
     (ids, reservation): (&Ids<'_>, Option<Reservation>),
-    mode: SandboxMode,
+    sandbox: &Sandbox,
     (orders, force, writes): (&mut Orders, &mut ForceWatch, &mut TurnWrites),
 ) -> Result<Arc<Thread>, Box<TurnEnd>> {
     let driver = facts.driver;
@@ -1894,7 +1894,7 @@ async fn open_thread(
         model: &driver.spec.model,
         cwd: &driver.spec.cwd,
         developer_instructions: driver.spec.instructions.as_deref(),
-        sandbox: mode,
+        sandbox: sandbox.mode,
     };
     let bounds = WriteBounds::StartBy {
         start_by: orders.wall,
@@ -1941,7 +1941,7 @@ async fn open_thread(
             None,
         )));
     };
-    confirm(facts, (&opened, mode), resume, &lease, (orders, force)).await?;
+    confirm(facts, (&opened, sandbox), resume, &lease, (orders, force)).await?;
     let thread = Arc::new(Thread {
         id: opened.thread.id.clone(),
         registration: normalize_on_tracker(driver, facts.session, ids, &lease),
@@ -1983,17 +1983,18 @@ async fn open_thread(
 /// policy, a resume's thread ID, and its registration on the connection.
 async fn confirm(
     facts: &Turn<'_>,
-    (opened, mode): (&ThreadResult, SandboxMode),
+    (opened, sandbox): (&ThreadResult, &Sandbox),
     resume: Option<String>,
     lease: &LaneLease,
     controls: (&mut Orders, &mut ForceWatch),
 ) -> Result<(), Box<TurnEnd>> {
     let driver = facts.driver;
     let turn = facts.number;
-    if let Some(field) = echo_differs(opened, mode, &driver.spec) {
+    if let Some(field) = echo_differs(opened, sandbox.mode, &driver.spec) {
         let adapter = &facts.session.adapter;
-        // The recipe key the refused handshake is cached under.
-        let hash = adapter.server_key(driver.spec.inherit.requested);
+        // The refusal key the refused handshake is cached under: the
+        // server key and this turn's sandbox (C2 §5).
+        let hash = adapter.refusal_key(driver.spec.inherit.requested, Some(sandbox));
         adapter.instances.record_refusal(
             &adapter.binary,
             hash,
