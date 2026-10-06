@@ -82,19 +82,20 @@ the vendor's own session transcript of the session VIA created: per prompt,
 the tool names, the number of calls and whether any tool input held the
 nonce. Only those are kept. The transcript counts as evidence only when it
 shows the calls known to have happened (t1's Write, t3's Bash), every
-record of every turn is fully interpretable (an unparsable line, an unknown
-record type, a missing message, an unrecognised content block, a sidechain
-or a usage without every integer token key taints its turn's tool and usage
-evidence; no record is skipped) and the recall turn's record is complete
-through its end: the turn's last record is an assistant message with
-stop_reason `end_turn` (never an intermediate `tool_use` message, and no
-tool result after it) whose text equals that turn's envelope `final_text`.
-Otherwise the nonce and no-tool predicates are `not_observable`. No tool
-input in any turn of the session may hold the nonce (a file written
-earlier, such as an instruction file, could reach the recall turn without a
-tool call), and the recall turn must make no tool call. mcp_switches'
-unrestricted resume recalls a nonce the same way: its spawn turn makes one
-known Bash call.
+record of every turn is fully interpretable (an unparsable line, a missing
+message, an unrecognised content block, a non-assistant/user record
+carrying a message, a sidechain or a usage without every integer token key
+taints its turn's tool and usage evidence; no record is skipped, and a
+record of an unknown type without a message, which cannot carry tool calls
+or usage, is only noted) and the recall turn's record is complete through
+its end: the turn's last record is an assistant message with stop_reason
+`end_turn` (never an intermediate `tool_use` message, and no tool result
+after it) whose text equals that turn's envelope `final_text`. Otherwise
+the nonce and no-tool predicates are `not_observable`. No tool input in any
+turn of the session may hold the nonce (a file written earlier, such as an
+instruction file, could reach the recall turn without a tool call), and the
+recall turn must make no tool call. mcp_switches' unrestricted resume
+recalls a nonce the same way: its spawn turn makes one known Bash call.
 
 mcp_switches (owner decision, 2026-10-06): VIA records no init inventory for
 Claude (packet §4, via-7c6), so the evidence is Claude's own MCP debug lines,
@@ -680,8 +681,10 @@ def is_prompt(entry):
 
 
 # Transcript record types seen in Claude's session transcripts (run 6) that
-# carry no message: interpreted as holding no tool or usage evidence. Any
-# other type taints the turn it falls in.
+# carry no message. Only assistant and user records carry tool calls or
+# usage, so any other type without a `message` is metadata: an unknown one
+# is noted (`notes`), never a taint. Any record of another type that does
+# carry a `message` taints its turn.
 NON_MESSAGE_TYPES = {"queue-operation", "attachment", "atis-latch", "last-prompt",
                      "cost-state", "mode", "system"}
 USAGE_KEYS = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens",
@@ -745,14 +748,19 @@ def vendor_turns(path, needle=None):
 
     No record is skipped and nothing is defaulted: a record the parser
     cannot fully interpret (an unparsable line, a missing or non-object
-    message, an unrecognised content block or record type, a sidechain, a
-    usage without every integer token key) taints the turn it falls in
-    (`tainted`; one before the first prompt taints the first turn). A
-    tainted turn's tool and usage evidence is not evidence."""
-    turns, early = [], []
+    message, an unrecognised content block, a non-assistant/user record
+    carrying a `message`, a sidechain, a usage without every integer token
+    key) taints the turn it falls in (`tainted`; one before the first prompt
+    taints the first turn). A tainted turn's tool and usage evidence is not
+    evidence. A record of an unknown type without a `message` cannot carry
+    tool calls or usage: it is listed in the turn's `notes`."""
+    turns, early, early_notes = [], [], []
 
     def taint(reason):
         (turns[-1]["taint"] if turns else early).append(reason)
+
+    def note(text):
+        (turns[-1]["notes"] if turns else early_notes).append(text)
 
     with open(path) as file:
         for line in file:
@@ -767,12 +775,17 @@ def vendor_turns(path, needle=None):
             kind = entry.get("type")
             if is_prompt(entry) and not entry.get("isSidechain"):
                 turns.append({"calls": {}, "tools": {}, "needle_inputs": set(), "texts": {},
-                              "last": None, "taint": early if not turns else []})
+                              "last": None, "taint": early if not turns else [],
+                              "notes": early_notes if not turns else []})
                 continue
             if entry.get("isSidechain"):
                 taint(f"sidechain {kind} record")
                 continue
-            if kind in NON_MESSAGE_TYPES and "message" not in entry:
+            if kind not in ("user", "assistant"):
+                if "message" in entry:
+                    taint(f"{kind!r} record carrying a message")
+                elif kind not in NON_MESSAGE_TYPES:
+                    note(f"record type {kind!r} without a message")
                 continue
             if kind == "user":
                 problem = user_problem(entry)
@@ -782,9 +795,6 @@ def vendor_turns(path, needle=None):
                     turns[-1]["last"] = None  # a tool result: the turn went on
                 else:
                     taint("user record before the first prompt")
-                continue
-            if kind != "assistant":
-                taint(f"unrecognised record type {kind!r}")
                 continue
             message = entry.get("message")
             problem = assistant_problem(message)
@@ -808,7 +818,8 @@ def vendor_turns(path, needle=None):
              "calls": sum(1 for call in turn["calls"].values() if any(call.values())),
              "tool_calls": len(turn["tools"]), "tool_names": sorted(set(turn["tools"].values())),
              "needle_inputs": len(turn["needle_inputs"]), "tainted": len(turn["taint"]),
-             "taint_reasons": sorted(set(turn["taint"])), "terminal_text": terminal_text(turn)}
+             "taint_reasons": sorted(set(turn["taint"])), "notes": sorted(set(turn["notes"])),
+             "terminal_text": terminal_text(turn)}
             for turn in turns]
 
 
@@ -1742,7 +1753,7 @@ def case_recipe_continuity(run, case):
         turns = vendor_turns(path, needle=nonce)
         write_json(case.dir / "tool-calls.json",
                    [{"turn": n, "tool_calls": t["tool_calls"], "tool_names": t["tool_names"],
-                     "tainted": t["taint_reasons"],
+                     "tainted": t["taint_reasons"], "notes": t["notes"],
                      "inputs_with_nonce": t["needle_inputs"]} for n, t in enumerate(turns, 1)])
         # Evidence only if the transcript shows the tool calls known to have
         # happened (t1's Write, t3's Bash), no turn is tainted and t4's
@@ -2050,7 +2061,8 @@ def check_recall_tools(run, case, label, envelope, nonce):
     turns = vendor_turns(path, needle=nonce) if path else []
     write_json(case.dir / f"{label}-tool-calls.json",
                [{"turn": n, "tool_calls": t["tool_calls"], "tool_names": t["tool_names"],
-                 "tainted": t["taint_reasons"], "inputs_with_nonce": t["needle_inputs"]}
+                 "tainted": t["taint_reasons"], "notes": t["notes"],
+                 "inputs_with_nonce": t["needle_inputs"]}
                 for n, t in enumerate(turns, 1)])
     if not (len(turns) == 2 and "Bash" in turns[0]["tool_names"]
             and all(t["tainted"] == 0 for t in turns)
