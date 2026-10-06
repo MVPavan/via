@@ -71,8 +71,8 @@ Ownership is as Claude's (Claude §2), with Route owning typed JSONL
 parsing, command correlation and the control lane.
 
 **Why one process per turn.** It reuses the reviewed private lifecycle
-(Host anchor, own-group cleanup, turn-envelope leftovers, decode fence,
-`recover` unsupported). No in-memory vendor state crosses turns: Pi keeps
+(Host anchor, own-group cleanup, turn-envelope leftovers once via-daz
+lands, decode fence, `recover` unsupported). No in-memory vendor state crosses turns: Pi keeps
 steering and follow-up queues in memory only (E11), and an idle queue entry
 leaks into the next run (E22). Model, effort, tools and instructions are
 launch flags, re-applied every turn as in Claude's recipe. RPC runs one
@@ -147,7 +147,8 @@ after Core reserved a slot:
    auto-retry and compaction continue after it (E28).
 6. **Close.** After `agent_settled`, and after any admitted abort's reply or
    cutoff (§7), close stdin; Pi exits 0 in ~7 ms (E31). Then S1's close as
-   Claude: wait for exit, group cleanup, leftover scan, `TurnEnd`. **Never
+   Claude: wait for exit, group cleanup, `TurnEnd` (no leftover scan yet,
+   §7.1). **Never
    close stdin before `agent_settled`**: EOF aborts the run with no terminal
    and exit 0 (E31). Unlike Claude, EOF here is an unacknowledged stop.
 
@@ -429,7 +430,10 @@ changed (E04, E51).
 - The inventory is evidence, not public state: C2 §6.2 asks only what a
   route can record. `not_reported` is never presented as empty or
   unchanged. Instruction contents never enter observations, envelopes or
-  evidence.
+  VIA's own evidence records. The one exception is raw vendor bytes: when
+  evidence is authorized, the first 64 KiB of a record Route cannot decode
+  (malformed, over its cap or unterminated) lands in `undecoded.bin`, and
+  such a record may carry instruction text (runtime C4).
 
 ### 4.8 Trust and reserved keys
 
@@ -788,7 +792,7 @@ hostile profiles only in scratch agent directories. Selection as Claude's:
 | `pi_accounting_after_loss` | Delivery lost between two priced calls (Core holds past the stall bound): `overflow` with the retained terminal, cost `unavailable`, `null` tokens, never the delivered $0.50. `pi_accounting_after_forced_loss`: the daemon force cuts delivery after one priced sample, the terminal retained → cost `unavailable`, `null` tokens. `pi_accounting_overflow_without_terminal`: overflow before settlement → no terminal, `null` tokens |
 | `pi_abort` | Tool-phase and streaming markers with the paired reply acknowledge; the idle reply alone never does; a 401 racing the abort → `failed(auth)`, `requested`; natural completion keeps `Completed`; a reply after `agent_settled` is awaited; no reply by `force_at` → no acknowledgement. `pi_abort_unanswered_late`: no reply while settlement waits for read-ahead room past the wall (late path) → no terminal, the cancel's row. `pi_abort_unanswered_stall`: the stall's abort unanswered → the wait ends at the stall's `force_at`, not the wall: `overflow`, no terminal. `pi_abort_unanswered_shortened`: a 60 s cancel grace, then a forced close with a 1 s deadline → the reply wait ends at the shorter order. `pi_abort_unanswered_held`: wall 5 s, `force_at` 1 s, `close_by` 4 s, delivery held → the turn returns by `close_by`, not about 8 s |
 | `pi_eof_is_stop` | EOF mid-run: exit 0, no terminal, never `Completed` |
-| `pi_signals_cleanup` | Force close via TERM kills tool groups; a `setsid` escapee is a leftover; SIGINT is never sent; a spinning startup is bounded by deadlines and KILL |
+| `pi_signals_cleanup` | Force close via TERM kills tool groups; a `setsid` escapee survives and is not reported (`leftovers: null`; no leftover scan until via-daz); SIGINT is never sent; a spinning startup is bounded by deadlines and KILL |
 | `pi_dialog_decline` | A `-e` test extension's `confirm` and an unknown method with an `id` are cancelled within 5 s while observations are saturated; a dialog without an `id` fails closed |
 | `pi_inventory_patch` | Add, change and remove the last instruction file (`null` → `none`); unchanged resume → `not_reported`; tag-like file contents → `unparsed`; contents never stored |
 | `pi_detail_redaction` | A fixture 401 body with a key-like fragment never reaches `detail`, `vendor_code`, `failure.message`, warnings, observations or VIA's own `pi-profile.json`/`pi-inventory.json` (vendor bytes elsewhere in the evidence folder, such as `undecoded.bin`, are not checked); an unsafe `code` is dropped; the transcript hint names the session file |
