@@ -1120,6 +1120,136 @@ fn pi_profile_record_is_pre_launch() {
     }
 }
 
+/// Packet §2.1 step 1 (review r2 Important): a staging task that
+/// outlives its turn never breaks the next one. Turn A's instructions
+/// write pauses before its sync (failpoint
+/// `adapter.pi.instructions.written`, occurrence 1) and A ends at its
+/// wall while the task stays paused; turn B then stages. Unserialized, B
+/// replaced A's partial file and paused at the same point (occurrence 2),
+/// A resumed and published B's partial, and B's rename failed: `store`.
+/// Serialized, B's staging waits for A's task, so the point's second
+/// occurrence comes only once A's task finished, and B runs.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn pi_stage_outlived_by_its_task() {
+    use std::os::unix::fs::DirBuilderExt;
+    use std::time::{Duration, Instant};
+    const POINT: &str = "adapter.pi.instructions.written";
+    const TOKEN: &str = "pi-stage-outlived-token";
+    let points = tempfile::tempdir().unwrap();
+    let dir = points.path().join("points");
+    std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    let arm = |dir: &Path, occurrence: u64| {
+        std::fs::write(
+            dir.join(format!("{POINT}.json")),
+            json!({"token": TOKEN, "occurrence": occurrence, "action": "pause"}).to_string(),
+        )
+        .unwrap();
+    };
+    arm(&dir, 1);
+    via_store::failpoint::activate(&dir, TOKEN).unwrap();
+    let control = std::thread::spawn({
+        let dir = dir.clone();
+        move || {
+            let marker =
+                |occurrence: u64, kind: &str| dir.join(format!("{POINT}.{occurrence}.{kind}"));
+            let within = |path: &Path, wait: Duration| {
+                let until = Instant::now() + wait;
+                while !path.exists() && Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                path.exists()
+            };
+            assert!(
+                within(&marker(1, "ack"), Duration::from_secs(10)),
+                "turn A's staging never reached the point"
+            );
+            // B's staging pauses there too, if it gets there while A's
+            // task is still paused.
+            arm(&dir, 2);
+            let raced = within(&marker(2, "ack"), Duration::from_secs(2));
+            std::fs::write(marker(1, "release"), b"").unwrap();
+            assert!(
+                within(&marker(2, "ack"), Duration::from_secs(10)),
+                "turn B's staging never reached the point"
+            );
+            // A's task finishes (publishing B's partial, if raced).
+            std::thread::sleep(Duration::from_millis(300));
+            std::fs::write(marker(2, "release"), b"").unwrap();
+            raced
+        }
+    });
+    let mut first = turn("Turn A.", unaccepted(None, Some("deadline"), None));
+    first["deadlines"] = json!({"wall_ms": 300, "idle_ms": 20_000});
+    let second = turn("Say READY.", completed(1, "READY"));
+    let mut expect = case("pi_stage_outlived_by_its_task", 1, vec![first, second]);
+    expect["sessions"]["main"]["instructions"] = json!("Always answer carefully.");
+    let replay = single(
+        "synthetic (via-jt8.3.2): turn A's staging outlives A; turn B launches",
+        argv(Argv {
+            instructions: true,
+            ..Argv::default()
+        }),
+        completed_steps(&State::default(), "Say READY.", "READY"),
+    );
+    let outcome = drive_built(
+        "pi_stage_outlived_by_its_task",
+        &replay,
+        &expect,
+        Knobs::default(),
+        Box::new(|_| Ok(())),
+        Box::new(|_| Ok(())),
+    );
+    let raced = control.join().unwrap();
+    let outcome = outcome.unwrap();
+    conformance_expect::check(&expect, &outcome).unwrap();
+    assert!(!raced, "turn B staged while turn A's task was still paused");
+}
+
+/// Packet §3 (review r2 minor): the version read before VIA's launch
+/// state failed is still this turn's `InstanceReport`.
+#[test]
+fn pi_version_survives_a_state_failure() {
+    let replay = single(
+        "synthetic (via-jt8.3.2): the session directory is blocked; nothing launches",
+        argv(Argv::default()),
+        completed_steps(&State::default(), "Say READY.", "READY"),
+    );
+    let mut wanted = unaccepted(None, Some("store"), None);
+    wanted["instance"] = json!({"vendor_version": "1.0.2", "version_status": "untested"});
+    let expect = case(
+        "pi_version_survives_a_state_failure",
+        0,
+        vec![turn("Say READY.", wanted)],
+    );
+    let outcome = drive_built(
+        "pi_version_survives_a_state_failure",
+        &replay,
+        &expect,
+        Knobs::default(),
+        Box::new(|pure: &Pure| {
+            let package = pure.case_dir.path().join("package");
+            std::fs::create_dir(&package).map_err(|e| e.to_string())?;
+            std::fs::write(package.join("package.json"), br#"{"version":"1.0.2"}"#)
+                .map_err(|e| e.to_string())?;
+            let link = pure.fake_link();
+            let target = std::fs::read_link(&link).map_err(|e| e.to_string())?;
+            let entry = package.join("cli.js");
+            std::fs::copy(target, &entry).map_err(|e| e.to_string())?;
+            std::fs::remove_file(&link).map_err(|e| e.to_string())?;
+            std::os::unix::fs::symlink(&entry, &link).map_err(|e| e.to_string())?;
+            // A file where the session's directory goes: VIA's launch
+            // state cannot be written.
+            let sessions = pure.state.path().join("vendor").join("pi").join("sessions");
+            std::fs::create_dir_all(&sessions).map_err(|e| e.to_string())?;
+            std::fs::write(sessions.join("s_000000000001"), b"blocked").map_err(|e| e.to_string())
+        }),
+        Box::new(|_| Ok(())),
+    )
+    .unwrap();
+    conformance_expect::check(&expect, &outcome).unwrap();
+}
+
 /// The owner's fix of a hostile profile: the agent directory as it was
 /// prepared, the one required setting and nothing else.
 fn fixed_profile(state: &Path) -> std::io::Result<()> {

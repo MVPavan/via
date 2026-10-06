@@ -110,7 +110,11 @@ after Core reserved a slot:
       read (§3), then VIA's launch state (§4.4). A stop, the daemon force,
       the wall or the session's cancellation before it finishes ends the
       turn unlaunched (`stopped`, `force_stopped`, `deadline`); the task
-      finishes on its own and launches nothing;
+      finishes on its own and launches nothing. VIA's launch-state write
+      holds one adapter-wide lock for the task's whole life, so a later
+      attempt's write waits for an earlier task the turn stopped waiting
+      for (that wait is raced against the same orders). A launch-state
+      failure after the version read still reports the version (§3);
    2. R1 predecessor absence (§7.4).
 2. **Launch** the §4.1 recipe. Nothing is written before step 3.
 3. **Handshake.** Write `get_state`, `get_available_models` and
@@ -698,7 +702,8 @@ hostile profiles only in scratch agent directories. Selection as Claude's:
 | Test | Decisive assertion |
 |---|---|
 | `pi_plan_pure` | `describe` starts nothing; unchecked or unreadable version → `untested` with the warning; steer refused by name; `max_steps`, `output_schema`, limited bounds, `network:false`, nonempty `extra_write_dirs`, a prompt over 524,288 or instructions over 262,144 JSON-encoded bytes are refused before receipt |
-| `pi_version_read` | The Pi package's `version` from `package.json` through a symlinked entry and the `dist` rule, reported even when Pi exits before the handshake; a missing, oversize, non-object or non-string file → `null`/`untested`, the turn proceeds; no process starts |
+| `pi_version_read` | The Pi package's `version` from `package.json` through a symlinked entry and the `dist` rule, reported even when Pi exits before the handshake; a missing, oversize, non-object or non-string file → `null`/`untested`, the turn proceeds; no process starts. `pi_version_survives_a_state_failure`: a launch-state failure after the read still reports the version |
+| `pi_stage_outlived_by_its_task` | A turn ends at its wall while its staging task is held before the instructions sync; the next turn's launch-state write waits for that task, then launches and completes (unserialized, it failed `store`) |
 | `pi_profile_policy` | Accepted: the allowed set, with and without Pi-created files (E59). Refused by name, no launch and no value in the message: `shellCommandPrefix`, `SYSTEM.md`, `APPEND_SYSTEM.md`, `models.json`, `defaultThinkingLevel`, an unknown key, missing or non-`off` `cacheWarming`, a malformed value, a symlink, wrong owner, a group-writable entry, `auth.json` with group bits, an oversize file, 65 entries. `pi-profile.json` holds no `deviceId` or credential bytes and records the check the launch passed, even when the profile changes while the turn executes (`pi_profile_record_is_pre_launch`); refusals are not cached |
 | `pi_uncertain_predecessor` | A leaves an unproven group; B is refused `uncertain_predecessor` without launching; C is refused too; A proven absent, D launches. The same with A busy, and across a restart with A's record not yet re-held. No resend |
 | `pi_identity_continuation` | `--session-id` until confirmed; confirmation only with `started`; a rejected turn 1 (no file) lets turn 2 create; a lost `started` reply keeps `--session-id`; once confirmed, `--session`; a missing file then exits before RPC → `Rejected{Protocol}`, never a fresh session; derived ID stable across eviction and restart |

@@ -178,6 +178,8 @@ POINTS = [
     "routes.late.entered",
     # x.3.2 C3 (C2 §5): the Claude adapter's refusal-cache clock.
     "adapter.claude.plan_clock_ms",
+    # via-jt8.3.2 review r2: the Pi instructions write, before its sync.
+    "adapter.pi.instructions.written",
 ]
 ACTIVATION = ["VIA_FAILPOINT_DIR", "VIA_FAILPOINT_TOKEN"]
 # Test-build overrides (design §6.2, §6.4) that release must neither parse nor forward.

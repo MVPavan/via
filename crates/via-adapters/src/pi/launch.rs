@@ -247,6 +247,8 @@ pub(super) fn prepare(
         .mode(0o600)
         .open(&partial)?;
     out.write_all(text.as_bytes())?;
+    #[cfg(feature = "test-failpoints")]
+    via_routes::failpoint::hit("adapter.pi.instructions.written")?;
     out.sync_all()?;
     std::fs::rename(&partial, &file)?;
     std::fs::File::open(folder)?.sync_all()?;

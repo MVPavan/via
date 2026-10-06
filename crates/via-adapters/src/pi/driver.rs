@@ -70,16 +70,7 @@ pub(crate) async fn run_turn(
         Ok(staged) => staged,
         Err(end) => return *end,
     };
-    // Packet §3: reported on every outcome from here.
-    if let Some(version) = &staged.version {
-        adapter
-            .instances
-            .record_version(HARNESS, &adapter.binary, version.clone());
-    }
-    let instance = InstanceReport {
-        version_status: plan::version_status(staged.version.as_deref()),
-        vendor_version: staged.version.clone(),
-    };
+    let instance = instance_of(adapter, staged.version.as_deref());
     let route = PiRoute::new(Arc::clone(&driver.runtime));
     // Packet §7.4 (R1): one non-signalling pass within the wall.
     let mut end = match route
@@ -120,15 +111,31 @@ struct Staged {
 enum Unstaged {
     /// Packet §4.3: the profile policy's VIA-owned reason.
     Profile(String),
-    /// VIA's own launch state could not be written.
-    State,
+    /// VIA's own launch state could not be written; the version was read
+    /// (packet §3).
+    State { version: Option<String> },
+}
+
+/// Packet §3: the version read, recorded for planning and reported in
+/// this turn's `InstanceReport` on every outcome after the read.
+fn instance_of(adapter: &PiAdapter, version: Option<&str>) -> InstanceReport {
+    if let Some(version) = version {
+        adapter
+            .instances
+            .record_version(HARNESS, &adapter.binary, version.to_owned());
+    }
+    InstanceReport {
+        version_status: plan::version_status(version),
+        vendor_version: version.map(str::to_owned),
+    }
 }
 
 /// The pre-launch filesystem step (packet §§2.1, 3, 4.3, 4.4): the
 /// profile policy (never cached), the version read and VIA's launch state,
-/// in that order. Blocking I/O, run off the async workers.
+/// in that order, the last under `staging` ([`PiAdapter`]'s lock) until it
+/// returns. Blocking I/O, run off the async workers.
 fn staged(
-    vendor_state_dir: &Path,
+    (vendor_state_dir, staging): (&Path, &std::sync::Mutex<()>),
     binary: &Path,
     session: &crate::SessionId,
     instructions: Option<&str>,
@@ -137,8 +144,16 @@ fn staged(
         .map_err(Unstaged::Profile)?
         .record;
     let version = launch::read_version(binary);
-    let (session_dir, instructions) =
-        launch::prepare(vendor_state_dir, session, instructions).map_err(|_| Unstaged::State)?;
+    // A panicked holder left no state a later write does not replace.
+    let prepared = {
+        let _serialized = staging
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        launch::prepare(vendor_state_dir, session, instructions)
+    };
+    let Ok((session_dir, instructions)) = prepared else {
+        return Err(Unstaged::State { version });
+    };
     Ok(Staged {
         profile,
         version,
@@ -149,8 +164,9 @@ fn staged(
 
 /// Runs [`staged`] on one blocking task the session's tracker owns, and
 /// ends the turn unlaunched if its stop, force, wall or the session's
-/// cancellation comes first (the task finishes on its own; nothing it
-/// wrote launches anything).
+/// cancellation comes first, while the task waits for an earlier one's
+/// write too (the task finishes on its own, under the staging lock;
+/// nothing it wrote launches anything).
 async fn stage(
     driver: &SessionDriver,
     adapter: &PiAdapter,
@@ -158,12 +174,13 @@ async fn stage(
 ) -> Result<Staged, Box<TurnEnd>> {
     let task = {
         let vendor_state_dir = adapter.vendor_state_dir.clone();
+        let staging = Arc::clone(&adapter.staging);
         let binary = adapter.binary.clone();
         let session = driver.spec.session_id.clone();
         let instructions = driver.spec.instructions.clone();
         driver.tracker.spawn_blocking(move || {
             staged(
-                &vendor_state_dir,
+                (&vendor_state_dir, &staging),
                 &binary,
                 &session,
                 instructions.as_deref(),
@@ -189,10 +206,14 @@ async fn stage(
                 detail: Some(format!("the Pi profile policy refused: {detail}")),
             })))
         }
-        Ok(Err(Unstaged::State)) => Err(Box::new(unlaunched(RouteError::Store {
-            turn,
-            kind: StoreFailure::Evidence,
-        }))),
+        Ok(Err(Unstaged::State { version })) => {
+            let mut end = unlaunched(RouteError::Store {
+                turn,
+                kind: StoreFailure::Evidence,
+            });
+            end.instance = Some(instance_of(adapter, version.as_deref()));
+            Err(Box::new(end))
+        }
         Err(_panicked) => {
             driver.fail(DriverFailure::OwnedTask);
             Err(Box::new(rejected(AdapterError::TaskFailed)))

@@ -40,6 +40,12 @@ pub(crate) struct PiAdapter {
     /// The daemon's vendor state directory: VIA's private Pi profile and
     /// session files live under it (packet §4.3).
     vendor_state_dir: PathBuf,
+    /// Serializes writes of VIA's launch state (packet §4.4) over each
+    /// blocking task's whole lifetime: a task its turn stopped waiting for
+    /// still runs, and the next attempt's write must not interleave with
+    /// it. One per adapter, so it spans every driver of the set, a
+    /// session reopened while an earlier driver's task runs included.
+    staging: Arc<std::sync::Mutex<()>>,
 }
 
 impl PiAdapter {
@@ -55,6 +61,7 @@ impl PiAdapter {
             catalog: plan::catalog(),
             env: launch::allowed_env(env),
             vendor_state_dir,
+            staging: Arc::default(),
         }
     }
 }

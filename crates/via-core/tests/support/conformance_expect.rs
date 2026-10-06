@@ -1283,6 +1283,9 @@ const ERROR: &[&str] = &[
     // C2 §5 AD7: `RouteError::HandshakeRefused`, which Core reports as
     // `submit_failed` with `failure.data.reason: "handshake_refused"`.
     "handshake_refused",
+    // C2 §3 C-3: `RouteError::Store`, such as VIA's own launch state not
+    // written before a launch.
+    "store",
 ];
 /// C2 `StartRejected`; a name ending in `:` takes a non-empty suffix.
 const REJECTED: &[&str] = &[
