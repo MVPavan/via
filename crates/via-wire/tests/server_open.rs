@@ -107,6 +107,7 @@ async fn wire_server_open_has_no_turn_folder() {
         force: watch::channel(None).1,
         wake: watch::channel(0).1,
         gate: Arc::new(|| false),
+        inbound: via_wire::InboundBounds::DEFAULT,
     };
     let WireParts { sender, messages } = wire
         .open_connection(spec, within(5), signals)

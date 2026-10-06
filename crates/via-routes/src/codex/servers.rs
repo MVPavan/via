@@ -37,9 +37,35 @@ use super::{
 };
 use crate::{RouteError, RouteFailure, RouteRuntime, StoreFailure, TurnNumber};
 
-/// A launch's handshake bound, from spawn (packet §2: the first
-/// `initialize` took 38 s on a fresh SQLite home).
+/// A launch's handshake bound on a warm SQLite home, from spawn (packet
+/// §2).
 pub const SERVER_HANDSHAKE: Duration = Duration::from_secs(60);
+
+/// A first launch's handshake bound, from spawn (via-25f): on a fresh
+/// SQLite home Codex indexes the user's whole `~/.codex/sessions` before
+/// it answers `initialize` (38 s at the 2026-09-30 re-probe, 55 s live on
+/// 0.160.0 with 3,973 session files), and that grows with the history.
+pub const SERVER_FIRST_HANDSHAKE: Duration = Duration::from_secs(300);
+
+/// Which handshake bound a launch takes (via-25f): the adapter decides
+/// from the server's SQLite home.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HandshakeBound {
+    /// The home already holds the vendor's state: [`SERVER_HANDSHAKE`].
+    Warm,
+    /// The home's first launch: [`SERVER_FIRST_HANDSHAKE`].
+    First,
+}
+
+impl HandshakeBound {
+    /// The bound, from spawn.
+    pub fn duration(self) -> Duration {
+        match self {
+            Self::Warm => SERVER_HANDSHAKE,
+            Self::First => SERVER_FIRST_HANDSHAKE,
+        }
+    }
+}
 
 /// An idle server's retirement bound (item 2.4).
 pub const SERVER_RETIRE: Duration = Duration::from_secs(5);
@@ -256,7 +282,7 @@ enum Entry {
 
 /// An instance's pending task request, coalesced.
 enum Work {
-    Launch(Box<PrivateProcessSpec>),
+    Launch(Box<PrivateProcessSpec>, HandshakeBound),
     Retire,
     Stop,
 }
@@ -727,11 +753,11 @@ impl Servers {
     /// Item 2.2 `launch_or_join`: pins the live or launching server of
     /// `key`, dropping `capacity`, or reserves a new instance holding it
     /// and has the supervisor launch `spec` (its owner and capacity are
-    /// set here).
+    /// set here) under `handshake`.
     pub fn launch_or_join(
         &self,
         key: ServerKey,
-        mut spec: PrivateProcessSpec,
+        (mut spec, handshake): (PrivateProcessSpec, HandshakeBound),
         capacity: CapacityToken,
     ) -> Result<ServerPin, LaunchFailure> {
         let servers = self.me().ok_or(LaunchFailure::Shutdown)?;
@@ -776,7 +802,7 @@ impl Servers {
                         ready: watch::Sender::new(None),
                         connection: None,
                     },
-                    work: Some(Work::Launch(Box::new(spec))),
+                    work: Some(Work::Launch(Box::new(spec), handshake)),
                     tasks: 0,
                 },
             );
@@ -856,7 +882,21 @@ impl Servers {
     /// Item 2.7 step 1: no new pin, reservation or launch; launch
     /// handshakes stop; pending work is resolved without spawning.
     pub fn fence(&self) {
-        self.registry().fenced = true;
+        {
+            let mut registry = self.registry();
+            registry.fenced = true;
+            for instance in registry.servers.values() {
+                let connection = match &instance.entry {
+                    Entry::Live { connection, .. } | Entry::Lost { connection } => Some(connection),
+                    Entry::Launching { connection, .. } | Entry::Retiring { connection } => {
+                        connection.as_ref()
+                    }
+                };
+                if let Some(connection) = connection {
+                    connection.shutting_down();
+                }
+            }
+        }
         self.fence.send_replace(true);
         self.bump();
         self.work.notify_one();
@@ -882,6 +922,9 @@ impl Servers {
         // Its process started: the launch counts now, in the order the
         // processes started (a stale one's too), never at its reservation.
         registry.launches = registry.launches.saturating_add(1);
+        if registry.fenced {
+            opened.shutting_down();
+        }
         match registry.servers.get_mut(server) {
             Some(Instance {
                 entry: Entry::Launching { connection, .. },
@@ -948,9 +991,10 @@ impl Servers {
                 continue;
             }
             let spawned = match (work, &instance.entry) {
-                (Work::Launch(spec), _) => self.me().map(|servers| {
+                (Work::Launch(spec, handshake), _) => self.me().map(|servers| {
                     (
-                        set.spawn(launch(servers, server.clone(), *spec)).id(),
+                        set.spawn(launch(servers, server.clone(), (*spec, handshake)))
+                            .id(),
                         TaskKind::Launch,
                     )
                 }),
@@ -994,7 +1038,7 @@ impl Servers {
     /// Host's shutdown.
     fn resolve_fenced(registry: &mut Registry, server: &ServerId, work: Work) {
         match work {
-            Work::Launch(spec) => {
+            Work::Launch(spec, _) => {
                 drop(spec);
                 if let Some(instance) = registry.servers.remove(server)
                     && let Entry::Launching { key, ready, .. } = instance.entry
@@ -1194,10 +1238,14 @@ async fn supervise(servers: Arc<Servers>) {
 
 /// The launch task (item 2.2): opens the server's Wire connection, installs
 /// it, then runs the handshake while it drives the connection task, which
-/// pairs the handshake's replies. All under the 60 s bound from spawn and
-/// the registry fence.
-async fn launch(servers: Arc<Servers>, server: ServerId, spec: PrivateProcessSpec) -> Outcome {
-    let deadline = Deadline::at(Instant::now() + SERVER_HANDSHAKE);
+/// pairs the handshake's replies. All under the handshake's bound from
+/// spawn and the registry fence.
+async fn launch(
+    servers: Arc<Servers>,
+    server: ServerId,
+    (spec, bound): (PrivateProcessSpec, HandshakeBound),
+) -> Outcome {
+    let deadline = Deadline::at(Instant::now() + bound.duration());
     let mut fence = servers.fence.subscribe();
     let fenced = async move {
         if fence.wait_for(|fenced| *fenced).await.is_err() {
@@ -1270,6 +1318,7 @@ impl Servers {
             force: self.unforced.subscribe(),
             wake: self.unwoken.subscribe(),
             gate,
+            inbound: super::INBOUND,
         };
         let connection = self
             .runtime
@@ -1296,7 +1345,12 @@ impl Servers {
         let (stdout, vendor_out) = tokio::io::duplex(1 << 20);
         let (vendor_in, stdin) = tokio::io::duplex(1 << 20);
         let scratch = super::testing::Scratch::new();
-        let pipes = via_wire::testing::pipes(vendor_out, vendor_in, scratch.path().to_path_buf());
+        let pipes = via_wire::testing::pipes_within(
+            vendor_out,
+            vendor_in,
+            scratch.path().to_path_buf(),
+            super::INBOUND,
+        );
         let test_stdio = Arc::new(super::testing::TestStdio::new(pipes.input, scratch));
         self.scripted
             .lock()

@@ -414,9 +414,9 @@ Params: `session`, `turn?` (default the running turn, else the latest),
 
 ```json
 {"session_id":"s_7f3k9q2mzr4c","state":"active","admission":"open","harness":"codex","model":"gpt-6-sol",
- "route":"codex-app-server","adapter_version":"0.1.0","vendor_version":"0.159.2","version_status":"untested",
- "inherit":{"hooks":"off","mcp_servers":"unknown","plugins":"unknown","skills":"unknown","agents":"unknown","instruction_files":"unknown"},
- "warnings":[{"code":"vendor_version_untested","message":"…"},{"code":"config_switch_unverified","message":"…","data":{"categories":[…]}}],
+ "route":"codex-app-server","adapter_version":"0.1.0","vendor_version":"0.159.2","version_status":"tested",
+ "inherit":{"hooks":"on","mcp_servers":"on","plugins":"unknown","skills":"unknown","agents":"unknown","instruction_files":"on"},
+ "warnings":[{"code":"config_switch_unverified","message":"…","data":{"categories":[…]}}],
  "vendor_session_id":"019…","vendor_identity_verified":true,"cwd":"/work/repo","process":{"alive":true,"cleanup":"quiescent","idle_since":null},
  "active_turn":{"n":2,"state":"running","phase":"accepted","started_at":"…","last_event_seq":57,"cancel":null},
  "progress":{"turn":2,"current_step":4,"phase":"tools","running_tools":["shell"],"tools_overflow":false,"last_activity_at":"…",
@@ -473,7 +473,11 @@ handshake or, on `pi-rpc`, after the metadata read. Before either,
 for other routes, when no handshake was read (C2 §5).
 `inherit` holds the effective state (`on`, `off` or
 `unknown`) of each inherited-configuration category, frozen at spawn
-(C2 §6.2). `warnings` repeats the standing warnings:
+(C2 §6.2): `on` or `off` only when verified (by a switch, a private
+profile, an inventory, or, for `on` with no switch, the vendor packet's
+recorded live evidence that the vendor loads the user's configuration for
+it), else `unknown`. `on` means the user's own configuration applies,
+whatever it contains; VIA never claims a suppression it has not verified. `warnings` repeats the standing warnings:
 `vendor_version_untested` while the described turn's `version_status` is
 `untested`, and
 `config_switch_unverified` with `data.categories` while any effective state
@@ -1033,7 +1037,7 @@ receipt. An unkeyed caller must not resend the request.
 | `rate_limit`, `auth`, `context_exceeded`, `budget_exceeded` | specific vendor classes | Adapter |
 | `server_lost`, `process_exited` | Host-confirmed death | Core |
 | `protocol` | malformed known message, or vendor stream contradiction | Adapter |
-| `overflow` | this session's observation channel stalled past its limit, the connection's message queue overflowed, or a vendor message exceeded 1 MiB (C2 A1) | Core |
+| `overflow` | this session's observation channel stalled past its limit, the connection's message queue overflowed, or a vendor message exceeded its route's cap (C2 A1): 1 MiB, or 8 MiB on `codex-app-server`. On `codex-app-server` such a message is never attributed to a turn: it fails every turn on the shared server `protocol` (owner 2026-10-05; revisit post-release, a streaming JSON depth/string tracker in Wire can attribute the line to its turn (owner 2026-10-05)) | Core |
 | `structured_output_invalid` | VIA validation failed (Q2) | Core |
 | `daemon_restart`, `store` | §7.5; Store write failed after dispatch | Core |
 

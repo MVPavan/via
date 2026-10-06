@@ -136,6 +136,14 @@ impl TurnNumber {
     }
 }
 
+/// The number alone, as C1 names a turn within its session (`2`; the
+/// session's address adds `s_…/`): never the `Debug` form in a message.
+impl std::fmt::Display for TurnNumber {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
 impl TryFrom<u32> for TurnNumber {
     type Error = &'static str;
 

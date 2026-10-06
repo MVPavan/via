@@ -3105,6 +3105,154 @@ fn codex_exhaustion_fails_the_shared_connection() {
     variant(name, &replay, &expect).unwrap();
 }
 
+/// via-5lr.3.5: Codex truncates a command's output to about 1 MiB raw,
+/// and JSON escaping grows its `item/completed` line past Wire's default
+/// 1 MiB cap (live: 1,213,365 B for `seq 1 800000`). In `c4_two_sessions`
+/// B's first tool completion moves to while A's turn still runs, its
+/// output that long: the line is delivered within the Codex route's
+/// cap, B's turn completes, and A's runs to its interrupt as recorded.
+/// Before the raised cap the line failed the shared connection, and both
+/// turns, `protocol`.
+#[test]
+fn codex_escaped_output_over_one_mib_is_delivered() {
+    let name = "codex_escaped_output_over_one_mib_is_delivered";
+    let mut replay = replay_of("c4_two_sessions").unwrap();
+    let mut expect = expect_of("c4_two_sessions").unwrap();
+    replay["source"] = json!(format!("{name}: a variant of c4_two_sessions"));
+    expect["source"] = replay["source"].clone();
+    let b_tool = "exec-019a0000-0000-7000-8000-000000400006";
+    let started = step_with(&replay, "exec-019a0000-0000-7000-8000-000000400007").unwrap();
+    let completed = (started + 1..steps(&mut replay).unwrap().len())
+        .find(|at| {
+            line_of(&replay, *at).is_ok_and(|line| {
+                line.contains(b_tool) && line.contains(r#""method":"item/completed""#)
+            })
+        })
+        .unwrap();
+    // `seq 1 N` cut to Codex's 512 KiB head and tail, as JSON text:
+    // every LF escapes to two bytes.
+    let (mut half, mut raw) = (String::new(), 0);
+    for n in 1.. {
+        if raw >= 512 * 1024 {
+            break;
+        }
+        let entry = format!(r"{n}\n");
+        raw += entry.len() - 1;
+        half.push_str(&entry);
+    }
+    let output = format!(r"{half}[… truncated …]\n{half}");
+    let mut line = line_of(&replay, completed).unwrap();
+    line = line.replace(
+        r#""aggregatedOutput":null"#,
+        &format!(r#""aggregatedOutput":"{output}""#),
+    );
+    assert!(
+        (1_150_000..8 * 1024 * 1024).contains(&line.len()),
+        "{}",
+        line.len()
+    );
+    let all = steps(&mut replay).unwrap();
+    all.remove(completed);
+    all.insert(started + 1, json!({"emit": {"line": line}}));
+    // No causal predecessor (`after_emit`) names a step the move shifted.
+    for step in steps(&mut replay).unwrap() {
+        if let Some(after) = step["expect"]["after_emit"].as_u64() {
+            assert!(after <= started as u64, "{step}");
+        }
+    }
+    variant(name, &replay, &expect).unwrap();
+}
+
+/// Owner 2026-10-05 (review cfix-3): for the first release a line over
+/// the Codex route's 8 MiB cap is unattributable, whatever it names, and
+/// fails the shared connection `protocol`. In `c4_two_sessions`, after A's
+/// tool starts, B's tool completion arrives with its output past the cap,
+/// in Codex's own order: Wire skips it to its LF, its head is the server's
+/// evidence, Host stops the server, and both turns fail `protocol` with
+/// nothing of the line delivered.
+#[test]
+fn codex_over_cap_line_fails_the_shared_connection() {
+    let name = "codex_over_cap_line_fails_the_shared_connection";
+    let mut replay = replay_of("c4_two_sessions").unwrap();
+    let mut expect = expect_of("c4_two_sessions").unwrap();
+    replay["source"] = json!(format!("{name}: a variant of c4_two_sessions"));
+    expect["source"] = replay["source"].clone();
+    let b_tool = "exec-019a0000-0000-7000-8000-000000400006";
+    let a_tool = step_with(&replay, "exec-019a0000-0000-7000-8000-000000400007").unwrap();
+    let completed = (a_tool + 1..steps(&mut replay).unwrap().len())
+        .find(|at| {
+            line_of(&replay, *at).is_ok_and(|line| {
+                line.contains(b_tool) && line.contains(r#""method":"item/completed""#)
+            })
+        })
+        .unwrap();
+    let output = "x".repeat(8 * 1024 * 1024 + 4096);
+    let line = line_of(&replay, completed).unwrap().replace(
+        r#""aggregatedOutput":null"#,
+        &format!(r#""aggregatedOutput":"{output}""#),
+    );
+    assert!(line.len() > 8 * 1024 * 1024, "{}", line.len());
+    cut_after(
+        &mut replay,
+        a_tool,
+        &[json!({"emit": {"line": line}}), sigterm()],
+    )
+    .unwrap();
+    for index in 0..2 {
+        let turn = turn_mut(&mut expect, index);
+        turn["stop"] = Value::Null;
+        let turn = &mut turn["expect"];
+        turn["terminal"] = Value::Null;
+        turn["usage"] = Value::Null;
+        turn["final_text"] = Value::Null;
+        turn["error"] = json!("protocol");
+        // The end is the connection's loss, whose evidence is Host's stop
+        // of the server.
+        turn["cleanup"] = json!("quiescent");
+        turn["stop_facts"] = Value::Null;
+        turn["group_absent"] = json!(true);
+        if let Some(turn) = turn.as_object_mut() {
+            turn.remove("cleanup_settles");
+        }
+        let include: Vec<Value> = turn["observations_include"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|kind| {
+                kind["kind"] == json!("session.vendor_identity_confirmed")
+                    || kind["kind"] == json!("turn.accepted")
+            })
+            .cloned()
+            .collect();
+        turn["observations_include"] = json!(include);
+        turn["observations_exclude"] = json!(["final_text"]);
+        turn["observations_order"] = json!(["session.vendor_identity_confirmed", "turn.accepted"]);
+        turn["unasserted"] = json!([]);
+    }
+    for session in ["main", "b"] {
+        expect["sessions"][session]["close"] = Value::Null;
+        expect["sessions"][session]["health"] =
+            json!({"state": "failed", "first_cause": "protocol"});
+    }
+    let mut kept = Vec::new();
+    checked_outcome(
+        name,
+        &replay,
+        &expect,
+        conformance_run::Knobs::default(),
+        |run| {
+            kept = undecoded_under(run.state.path());
+            kept.extend(undecoded_under(run.case_dir.path()));
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(
+        kept.len() == 1 && kept[0].contains("evidence/servers/"),
+        "evidence kept at {kept:?}"
+    );
+}
+
 /// X0 item 8.2 (x.3.2 X3 fix r4 #4): a close cuts the lane off in decode
 /// order. Turn 1's late decline is held at the idle seam as the session
 /// closes; the vendor keeps sending turn 1's denials after the cutoff:

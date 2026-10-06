@@ -318,6 +318,51 @@ mod tests {
         );
     }
 
+    /// `harnesses.codex.memories` (owner 2026-10-05), parsed by the adapter
+    /// layer with the rest of `harnesses`: false by default, so every Codex
+    /// server runs with `--disable memories`; true keeps Codex's own
+    /// default. Any other value is refused naming the key; it is Codex's
+    /// alone, and there is no top-level `codex` section.
+    #[test]
+    fn codex_memories_is_a_harness_boolean_off_by_default() {
+        let memories = |text: &str| {
+            let config = parse(text.as_bytes()).expect(text);
+            via_core::AdapterConfig::with_harnesses(
+                via_core::BootstrapEnv::default(),
+                config.harnesses,
+            )
+            .expect(text)
+            .codex()
+            .memories
+        };
+        assert!(!memories("{}"));
+        assert!(!memories(r#"{"harnesses":{"codex":{}}}"#));
+        assert!(!memories(r#"{"harnesses":{"codex":{"memories":false}}}"#));
+        assert!(memories(r#"{"harnesses":{"codex":{"memories":true}}}"#));
+        let rule = "daemon config invalid: harnesses.codex.memories: must be a boolean";
+        assert_eq!(
+            invalid(r#"{"harnesses":{"codex":{"memories":"yes"}}}"#),
+            rule
+        );
+        assert_eq!(invalid(r#"{"harnesses":{"codex":{"memories":1}}}"#), rule);
+        assert_eq!(
+            invalid(r#"{"harnesses":{"codex":{"memories":null}}}"#),
+            rule
+        );
+        assert_eq!(
+            invalid(r#"{"harnesses":{"claude":{"memories":true}}}"#),
+            "daemon config invalid: harnesses.claude.memories: unknown key"
+        );
+        assert_eq!(
+            invalid(r#"{"codex":{"memories":true}}"#),
+            "daemon config invalid: codex: unknown key"
+        );
+        assert_eq!(
+            invalid(r#"{"disk":{},"disk":{}}"#),
+            "daemon config invalid: disk: duplicate key"
+        );
+    }
+
     /// Bead via-oq3 (owner, 2026-10-04; renamed 2026-10-05):
     /// `harness_processes.limit` sets the harness-process pool, default 8,
     /// any value from 1; 0, `null`, a fraction, an unknown member and the

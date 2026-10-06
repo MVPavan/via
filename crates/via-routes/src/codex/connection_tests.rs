@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
-use via_wire::testing::pipes;
+use via_wire::testing::pipes_within;
 use via_wire::{
     Deadline, OutboundMessage, SendOutcome, ServerId, TurnNumber, WireCleanup, WriteBounds,
     WriteState,
@@ -41,7 +41,7 @@ impl Vendor {
         let (stdout, vendor_out) = tokio::io::duplex(1 << 20);
         let (vendor_in, stdin) = tokio::io::duplex(stdin_buffer);
         let scratch = Scratch::new();
-        let pipes = pipes(vendor_out, vendor_in, scratch.path().to_path_buf());
+        let pipes = pipes_within(vendor_out, vendor_in, scratch.path().to_path_buf(), INBOUND);
         let wire = Arc::new(TestStdio::new(pipes.input, scratch));
         let connection = Connection::over(
             ServerId::mint().unwrap(),
@@ -498,6 +498,13 @@ async fn reply_deadline_bounds_a_started_reply() {
 /// with the first sequence its lanes did not get.
 #[tokio::test]
 async fn abnormal_end_reaches_every_lease() {
+    let captured = Captured::default();
+    let sink = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || sink.clone())
+        .with_ansi(false)
+        .finish();
+    let _default = tracing::subscriber::set_default(subscriber);
     let mut vendor = Vendor::open(1 << 16);
     let signalled = Arc::new(Mutex::new(Vec::new()));
     let signal = {
@@ -533,6 +540,15 @@ async fn abnormal_end_reaches_every_lease() {
     let _ = (&mut vendor.task).await;
     vendor.connection.fail(ConnectionFailure::Internal);
     vendor.connection.abnormal();
+    // Review cfix-1 minor: the abnormal end writes its `via.log` line.
+    let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(log.lines().count(), 1, "{log}");
+    assert!(log.contains("WARN"), "{log}");
+    assert!(log.contains("ended abnormally"), "{log}");
+    assert!(
+        log.contains(&format!("server={}", vendor.connection.server())),
+        "{log}"
+    );
     assert!(waiting.reply.await.is_err(), "the waiter sees the end");
     assert_eq!(taken(lane.lane()).len(), 1, "the prefix stays");
     assert!(matches!(
@@ -658,6 +674,231 @@ async fn correlation_failure_is_protocol_not_generation_local() {
     let kept = vendor.stdio.kept();
     assert_eq!(kept.len(), 1);
     assert_eq!(serde_json::from_slice::<Value>(&kept[0]).unwrap(), untied);
+}
+
+/// The formatted tracing events, as `via.log` would receive them.
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Item 5 step 2 and runtime §6.2 (bead via-f1q): a shared connection's
+/// failure is one daemon-level warning naming the server and the server
+/// folder's `undecoded.bin`, never a vendor byte. Here a line over the cap
+/// (live round 1's failure, before the cap was raised).
+#[tokio::test]
+async fn a_failed_connection_logs_its_server_and_evidence_path() {
+    let captured = Captured::default();
+    let sink = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || sink.clone())
+        .with_ansi(false)
+        .finish();
+    let _default = tracing::subscriber::set_default(subscriber);
+    let mut vendor = Vendor::open(1 << 16);
+    let server = vendor.connection.server().to_string();
+    let _lane = registered(&mut vendor, "t").await;
+    let mut line = vec![b'v'; INBOUND.message_bytes + 16];
+    line.push(b'\n');
+    vendor.emit_raw(&line).await;
+    let end = tokio::time::timeout(Duration::from_secs(10), &mut vendor.task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(end, ConnectionEnd::Failed(loss) if loss.cause == LossCause::Protocol));
+    let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines.len(), 1, "{log}");
+    assert!(lines[0].contains("WARN"), "{log}");
+    assert!(
+        lines[0].contains("shared server connection failed"),
+        "{log}"
+    );
+    assert!(lines[0].contains(&format!("server={server}")), "{log}");
+    assert!(lines[0].contains("cause=Protocol"), "{log}");
+    assert!(lines[0].contains("undecoded.bin"), "{log}");
+    assert!(
+        !lines[0].contains("vvvv"),
+        "vendor bytes in the line: {log}"
+    );
+}
+
+/// Review cfix-crit #3: a transport lost before the daemon's shutdown
+/// began is news for `via.log`, even when the registry's fence marks the
+/// connection before the failed connection logs: whether the daemon was
+/// shutting down is taken when the failure latches, so exactly one
+/// warning.
+#[tokio::test]
+async fn a_failure_before_the_fence_still_warns() {
+    const POINT: &str = "codex.connection.fail_sequence";
+    let captured = Captured::default();
+    let sink = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || sink.clone())
+        .with_ansi(false)
+        .finish();
+    let _default = tracing::subscriber::set_default(subscriber);
+    let points = paused_at(POINT);
+    let mut vendor = Vendor::open(1 << 16);
+    vendor.ends.end_stdout().await;
+    reached(&points, POINT).await;
+    vendor.connection.shutting_down();
+    release(&points, POINT);
+    let end = tokio::time::timeout(Duration::from_secs(10), &mut vendor.task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(&end, ConnectionEnd::Failed(loss) if loss.cause == LossCause::TransportLost),
+        "{end:?}"
+    );
+    let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines.len(), 1, "{log}");
+    assert!(lines[0].contains("WARN"), "{log}");
+    assert!(
+        lines[0].contains("shared server connection failed"),
+        "{log}"
+    );
+    assert!(lines[0].contains("cause=TransportLost"), "{log}");
+}
+
+/// Owner 2026-10-05 (review cfix-3): every line over the cap is
+/// unattributable, whatever its tail names, so for the first release it
+/// fails the shared connection `protocol`, its head kept as server
+/// evidence. Neither lane takes anything, and both end with the
+/// connection's loss, so every turn on the server fails. The lines: Codex's
+/// own order (`params` closing with B's IDs after its item), a tail that
+/// closes a top-level `params` naming B, and a response with such a tail.
+#[tokio::test]
+async fn an_over_cap_line_fails_the_connection_protocol() {
+    let text = "x".repeat(INBOUND.message_bytes);
+    let item =
+        format!(r#"{{"type":"agentMessage","id":"m","phase":"final_answer","text":"{text}"}}"#);
+    let lines = [
+        format!(
+            r#"{{"method":"item/completed","params":{{"item":{item},"threadId":"b","turnId":"u","completedAtMs":1}},"emittedAtMs":1}}"#
+        ),
+        format!(
+            r#"{{"method":"item/completed","item":{item},"params":{{"threadId":"b","turnId":"u"}}}}"#
+        ),
+        format!(r#"{{"id":1,"result":"{text}","params":{{"threadId":"b","turnId":"u"}}}}"#),
+    ];
+    for line in lines {
+        let mut vendor = Vendor::open(1 << 16);
+        let a = registered(&mut vendor, "a").await;
+        let b = registered(&mut vendor, "b").await;
+        vendor.emit_raw(format!("{line}\n").as_bytes()).await;
+        let end = tokio::time::timeout(Duration::from_secs(10), &mut vendor.task)
+            .await
+            .unwrap()
+            .unwrap();
+        let head = &line[..64];
+        assert!(
+            matches!(&end, ConnectionEnd::Failed(loss) if loss.cause == LossCause::Protocol),
+            "{head}"
+        );
+        let kept = vendor.stdio.kept();
+        assert_eq!(kept.len(), 1, "the head is server evidence: {head}");
+        assert!(line.as_bytes().starts_with(&kept[0]), "{head}");
+        for lane in [&a, &b] {
+            assert!(
+                taken(lane.lane()).is_empty(),
+                "nothing is delivered: {head}"
+            );
+            assert!(
+                matches!(lane.lane().ended(), Some(LaneEnd::Lost(loss)) if loss.cause == LossCause::Protocol),
+                "{head}: {:?}",
+                lane.lane().ended()
+            );
+        }
+    }
+}
+
+/// Review cfix-crit #2: routing is held while an over-cap line and then
+/// enough small lines to fill Wire's queue arrive, so Wire latches
+/// `Overflow` with the skipped record still queued. The drain finds the
+/// record, which precedes the overflow in stream order: its head is kept
+/// as the server's evidence and the connection fails `protocol`.
+#[tokio::test]
+async fn a_queued_over_cap_line_keeps_its_evidence_through_an_overflow() {
+    const POINT: &str = "codex.connection.message";
+    let points = paused_at(POINT);
+    let mut vendor = Vendor::open(1 << 16);
+    vendor.emit(&json!({"method": "x/first"})).await;
+    reached(&points, POINT).await;
+    let line = format!(
+        r#"{{"method":"item/completed","params":{{"item":{{"type":"agentMessage","id":"m","text":"{}"}},"threadId":"t","turnId":"u"}}}}"#,
+        "x".repeat(INBOUND.message_bytes)
+    );
+    vendor.emit_raw(format!("{line}\n").as_bytes()).await;
+    for _ in 0..1100 {
+        vendor.emit(&json!({"method": "x/small"})).await;
+    }
+    until("Wire's overflow", || {
+        vendor.stdio.input().failure().is_some()
+    })
+    .await;
+    release(&points, POINT);
+    let end = tokio::time::timeout(Duration::from_secs(10), &mut vendor.task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(&end, ConnectionEnd::Failed(loss) if loss.cause == LossCause::Protocol),
+        "{end:?}"
+    );
+    let kept = vendor.stdio.kept();
+    assert_eq!(kept.len(), 1, "the skipped line's head is kept");
+    assert!(line.as_bytes().starts_with(&kept[0]));
+    assert_eq!(
+        vendor.connection.failure(),
+        Some(ConnectionFailure::Protocol)
+    );
+}
+
+/// Review cfix-crit2: a writer failure has no place in stdout's order, so
+/// a malformed line the drain finds after it does not replace it. Routing
+/// is held while a write is in flight and a malformed line is queued; the
+/// vendor stops reading VIA's writes, the write fails, Wire latches its
+/// writer failure,
+/// and the connection fails `TransportLost`, first-wins.
+#[tokio::test]
+async fn a_writer_failure_is_not_replaced_by_a_drained_one() {
+    const POINT: &str = "codex.connection.message";
+    let points = paused_at(POINT);
+    let mut vendor = Vendor::open(1024);
+    block_stdin(&vendor, 1).await;
+    vendor.emit(&json!({"method": "x/first"})).await;
+    reached(&points, POINT).await;
+    vendor.emit_raw(b"not json\n").await;
+    vendor.ends.stop_reading();
+    until("Wire's writer failure", || {
+        vendor.stdio.input().failure().is_some()
+    })
+    .await;
+    release(&points, POINT);
+    let end = tokio::time::timeout(Duration::from_secs(10), &mut vendor.task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(&end, ConnectionEnd::Failed(loss) if loss.cause == LossCause::TransportLost),
+        "{end:?}"
+    );
+    assert!(matches!(
+        vendor.connection.failure(),
+        Some(ConnectionFailure::Transport { .. })
+    ));
 }
 
 /// Item 5 step 3: a well-formed message for an unknown thread and an

@@ -3,7 +3,7 @@
   "argv": [
     "app-server",
     "--disable",
-    "hooks"
+    "memories"
   ],
   "version": "codex-cli 0.159.2",
   "deadline_ms": 20000,

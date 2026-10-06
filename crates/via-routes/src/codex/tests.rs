@@ -448,6 +448,69 @@ fn the_decline_table_answers_every_request() {
     }
 }
 
+/// Review cfix-crit #1: the routing peek reads only bounded scalars. A
+/// reply ID is an integer; a request ID an integer or a string within
+/// [`crate::SHORT_FIELD_MAX`]; a thread or turn of another shape or
+/// length is absent, so a known method lacks it. A method past the bound
+/// is an unknown notification's, or refuses a request.
+#[test]
+fn the_peek_reads_only_bounded_scalars() {
+    let long = "x".repeat(crate::SHORT_FIELD_MAX + 1);
+    let peeked = |line: String| peek(line.as_bytes());
+    assert_eq!(
+        peeked(r#"{"id":7,"result":{}}"#.to_owned()),
+        Ok(Routing::Response(7))
+    );
+    for id in ["7.5", r#""7""#, "[7]", "null", "18446744073709551615"] {
+        assert!(
+            peeked(format!(r#"{{"id":{id},"result":{{}}}}"#)).is_err(),
+            "{id}"
+        );
+    }
+    assert_eq!(
+        peeked(
+            r#"{"id":"srv-1","method":"x/y","params":{"threadId":"t","turnId":[1]}}"#.to_owned()
+        ),
+        Ok(Routing::Request {
+            id: RequestId::Str("srv-1".to_owned()),
+            method: "x/y".to_owned(),
+            thread: Some("t".to_owned()),
+            turn: None,
+        })
+    );
+    assert!(peeked(format!(r#"{{"id":"{long}","method":"x/y"}}"#)).is_err());
+    assert!(peeked(r#"{"id":[1],"method":"x/y"}"#.to_owned()).is_err());
+    assert!(peeked(format!(r#"{{"id":1,"method":"{long}"}}"#)).is_err());
+    assert_eq!(
+        peeked(format!(
+            r#"{{"method":"{long}","params":{{"threadId":"t"}}}}"#
+        )),
+        Ok(Routing::Notification {
+            thread: Some("t".to_owned()),
+            turn: None,
+        })
+    );
+    assert!(
+        peeked(format!(
+            r#"{{"method":"item/completed","params":{{"threadId":"{long}","turnId":"u"}}}}"#
+        ))
+        .is_err()
+    );
+    assert!(
+        peeked(r#"{"method":"turn/started","params":{"threadId":"t","turn":{"id":7}}}"#.to_owned())
+            .is_err()
+    );
+    assert_eq!(
+        peeked(
+            r#"{"method":"turn/started","params":{"threadId":"t","turn":{"id":"u"}}}"#.to_owned()
+        ),
+        Ok(Routing::Notification {
+            thread: Some("t".to_owned()),
+            turn: Some("u".to_owned()),
+        })
+    );
+}
+
 /// Review r1 #2: the structure limits (depth 64, 65,536 nodes) hold before
 /// any serde pass, the unknown fallback included.
 #[test]

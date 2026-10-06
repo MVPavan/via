@@ -560,9 +560,14 @@ most two.
   entry becomes `Retiring` with `work = Retire`. After the fence, see
   item 2.5.
 - **Launch gates.** The handshake (`initialize`, `initialized`, paginated
-  `model/list`) runs under `SERVER_HANDSHAKE = 60 s` from spawn
-  (packet: cold `initialize` took 38 s), the daemon force and the registry
-  fence. A turn's stop or wall ends only that turn's wait.
+  `model/list`) runs under `SERVER_HANDSHAKE = 60 s` from spawn, or
+  `SERVER_FIRST_HANDSHAKE = 300 s` when the adapter finds no
+  `.via-initialized` marker in the SQLite home (`HandshakeBound`, via-25f:
+  a cold `initialize` took 38 s at the re-probe and 55 s live on 0.160.0;
+  the adapter writes the marker when any waiting turn, launcher, joiner
+  or pinned, finds the server's handshake succeeded, as
+  Codex's `state_5.sqlite` exists before its backfill completes), the
+  daemon force and the registry fence. A turn's stop or wall ends only that turn's wait.
 - **Launch failure:** item 2.5. Each waiter's turn fails with the cause,
   nothing of it sent. A handshake refusal is cached per C2 §5.
 
@@ -839,8 +844,10 @@ has no failed outcome to count.
   1. the domain tag `"via codex server key v1"`;
   2. `adapter_version`;
   3. the resolved program path bytes;
-  4. argv after the program (`app-server`, `--disable hooks` when hooks are
-     off, later verified switches);
+  4. argv after the program (`app-server`, `--disable memories` unless
+     `daemon.json` sets `harnesses.codex.memories` true (via-7r9; owner 2026-10-05),
+     `--disable hooks` when hooks are requested off, later switches; no
+     other feature is disabled for the first release, owner 2026-10-05);
   5. the passed environment, sorted `(name, value)` pairs: the allow-list
      values and `CODEX_SQLITE_HOME`; Host's random `VIA_PROCESS_MARKER`
      excluded;
@@ -912,8 +919,19 @@ Engine on the same State finds `vendor/codex` with the same identity, mode
    framing:
    1. **Routing peek.** Parse only the correlation fields (`id`, `method`,
       `params.threadId`, `params.turnId`) against their typed schema.
+      The peek builds no value of the vendor's choosing (review
+      cfix-crit #1): each member it reads is borrowed from the line,
+      unread members are skipped, and only an integer or a string within
+      `SHORT_FIELD_MAX` is parsed out; an ID, thread or turn of any other
+      shape is refused or absent unparsed. It does not apply the structure
+      limits: a message past them but within serde's nesting bound is still
+      attributed to its owner, whose full decode applies them at
+      consumption (steps 4 to 6), and one for no open registration is
+      dropped undecoded. Applying them in the peek would make such a
+      message unattributable and fail every session on the server.
    2. **Correlation fields fail their typed schema** (invalid UTF-8 or
-      JSON; Wire `MessageTooLarge` or `Unterminated`; a known method whose
+      JSON; Wire `MessageTooLarge` or `Unterminated`, or a skipped
+      over-cap line, item 9.3; a known method whose
       required `threadId` or `turnId` is missing or not a string; a
       response `id` not an integer, or neither outstanding nor abandoned,
       item 9.1) → **unattributable**: first 64 KiB to the server's
@@ -921,7 +939,16 @@ Engine on the same State finds `vendor/codex` with the same identity, mode
       session through the owned failure sequence (item 13.1, cause
       `Protocol`); failure messages name the length and "the shared
       connection's evidence", no path (D4); `via.log` records the server
-      ID and path.
+      ID and path. As built (bead via-f1q): every failed connection, of
+      any cause, writes one `WARN` line, `shared server connection
+      failed`, with `server`, `cause` and `undecoded` (Wire's note naming
+      the file, why it was not saved, or `none`); never a vendor byte.
+      A transport or server lost whose failure latched after the
+      registry's shutdown fence is Host's stop and writes none; the
+      disposition is taken at the latch, so a failure that preceded the
+      fence still warns (review cfix-crit #3). A connection task that panicked writes
+      `shared server connection task ended abnormally` from the
+      supervisor's `abnormal()` end, fence or not.
    3. **Diagnostics only** (no failure): a well-formed message for an
       unknown `threadId` (no registration, no tombstone); well-formed
       connection-scoped or untagged traffic (never given fabricated thread
@@ -1129,7 +1156,8 @@ struct Registration { lease: LeaseId, generation: u64, lane: IngressLane }
 **Route side.**
 - Driver close posts `Close { lease }` to the connection task, applied in
   decode order: the cutoff. Items decoded before it are the admitted
-  prefix, already in the registration's lane (≤ 16 messages / 1 MiB).
+  prefix, already in the registration's lane (≤ 16 messages / 8 MiB,
+  item 9.3).
 - **Route delivery barrier:** the normalizer hands the prefix to the C2
   observation sink, bounded by `close_deadline − 500 ms`. The C2 10 s
   no-drain timer stays in force during close as everywhere (F14); the
@@ -1246,15 +1274,15 @@ reply; written once the reply brings the `turnId`);
   | Holder | Simultaneous maximum | Count |
   |---|---|---|
   | **Per server** | | |
-  | Staging: Wire's queue and all ingress lanes (one budget, item 12.5) | 1,024 messages / 4 MiB | 1 |
+  | Staging: Wire's queue and all ingress lanes (one budget, item 12.5) | 1,024 messages / 12 MiB (item 9.3) | 1 |
   | Correlation: records, mappings, tombstones | 1,024 entries / 256 KiB | 1 |
   | Pending server-request replies | 8 / 64 KiB | 1 |
   | Wire read buffer | 64 KiB | 1 |
-  | Demux routing peek (one message) | 1 MiB | 1 |
+  | Demux routing peek (one message; its `params` borrowed, item 9.3) | 8 MiB | 1 |
   | **Per session** | | |
   | C2 observation channel, Core drain held (`core.observations.pause`); open-tool metadata is charged inside it | 1,024 items / 4 MiB | 32 |
   | Driver controls | 8 / 64 KiB | 32 |
-  | Normalizer decode in flight: `DECODE_ALLOWANCE` = 1 MiB of owned strings + 65,536 nodes × 64 B = 5 MiB | 5 MiB | 32 |
+  | Normalizer decode in flight, or its final-text pieces held under back-pressure: `DECODE_ALLOWANCE` = two maximal messages (an escaped string's serde scratch and its owned copy) + 65,536 nodes × 64 B = 20 MiB (item 9.3) | 20 MiB | 32 |
   | **Per active turn** | | |
   | Dispatched prompt | 16 MiB | 32 |
 
@@ -1277,7 +1305,8 @@ reply; written once the reply brings the `turnId`);
   Core's Engine in its own process over one replay server. Each of the 32
   sessions' prompts is at the Codex echo cap (via-5lr.6), so the
   per-turn row counts 1,040,384 bytes, not 16 MiB, and the computed sum
-  is 327 MiB.
+  is 822 MiB (327 MiB before item 9.3; 566 MiB with the first, 12 MiB
+  decode allowance, review cfix-1 #2).
   1. A paced flood of 272 maximal thread lines (about 270 MiB) is consumed
      with Core draining. The growth windows before and after the flood's
      first 64 MiB must both hold samples.
@@ -1287,7 +1316,8 @@ reply; written once the reply brings the `turnId`);
      expire; the test releases them after the measurement.
   3. Five maximal `final_answer` lines per session fill its channel and
      leave the fifth decoded and blocked. Four maximal lines in blocked
-     lanes fill the 4 MiB staging. The fake's gates are released by
+     lanes fill the 4 MiB staging (twelve fill the 12 MiB staging since
+     item 9.3). The fake's gates are released by
      counted consumer takes (`adapter.codex.consumer_take`), so Wire's
      staging never holds more than three lines.
   4. After the 1.5 s held sample, the test asserts the simultaneous
@@ -1316,23 +1346,119 @@ reply; written once the reply brings the `turnId`);
   replies (64 KiB) and the 32 sessions' driver controls (32 × 64 KiB) are
   not driven to their maxima, 2,368 KiB of the sum together.
 
-  Measured, two runs each:
+  Measured, two runs each, with item 9.3's bounds and the final text
+  moved into its pieces (2026-10-05):
 
   | Build | Baseline | Peak | Peak less baseline | Growth after 64 MiB |
   |---|---|---|---|---|
-  | musl (authoritative) | 20 MiB | 221 MiB | 202 MiB | under 0.1 MiB |
-  | glibc, `MALLOC_ARENA_MAX=2` | 27 MiB | 230 MiB | 204 MiB | none |
+  | musl (authoritative) | 19 MiB | 197 MiB | 178 MiB | under 0.2 MiB |
+  | glibc, `MALLOC_ARENA_MAX=2` | 25 MiB | 213 MiB | 188 MiB | none |
 
-  The limit is 409 MiB. Both builds reach about 6.3 MiB per session at
-  the held peak and about 0.17 MiB per idle active session.
+  The limit, the computed sum plus 25%, is 1,028 MiB (409 MiB before
+  item 9.3). The owner accepted it on 2026-10-05 as the theoretical
+  bound: the measured peak less baseline is about 178 MiB (musl) and
+  188 MiB (glibc), and 32 simultaneous maximal 8 MiB decodes are not
+  qualified (below). No mechanism lowers it. Both builds reach
+  about 6 MiB per session at the held peak; before the move (normalized
+  text and its pieces both held) it was 210 and 211 MiB. The scenario still drives about
+  1 MiB lines (its pads are the echo-capped prompt): the 12 MiB staging is
+  filled, but the 8 MiB peek and decode rows are not driven to their new
+  maxima here; the decode measure below covers them one at a time.
+  Before item 9.3 the measured peak less baseline was 202 MiB (musl) and
+  204 MiB (glibc).
 
-  One maximal decode peaks at about 3.5 MiB of RSS on glibc and 3.75 MiB
-  on musl, against the 5 MiB `DECODE_ALLOWANCE`. RSS is an estimate, to
-  the kernel's 256 KiB counter granularity, not a bound. That measure is
-  `codex_decode_peak_within_allowance`
-  (`crates/via-routes/tests/codex_decode_peak.rs`). It decodes eight
-  shapes, each in a fresh process. The worst is a `final_answer` text or
-  a `fileChange` at the 65,536-node limit.
+  One maximal decode peaks at about 16.25 MiB of RSS (8 MiB lines) on
+  both builds, against the 20 MiB `DECODE_ALLOWANCE`. RSS is an estimate,
+  to the kernel's 256 KiB counter granularity, not a bound. That measure
+  is `codex_decode_peak_within_allowance`
+  (`crates/via-routes/tests/codex_decode_peak.rs`). It decodes nine
+  shapes, each in a fresh process. The worst is a `final_answer` text
+  with one escape (`\n`): serde unescapes it into its scratch buffer and
+  copies it out while the scratch is held (review cfix-1 #2). Unescaped,
+  a maximal text, error message or response result peaks at about
+  8.25 MiB. `codex_normalize_peak_within_allowance`
+  (`crates/via-adapters/src/codex/tests.rs`) decodes and normalizes the
+  escaped maximal `final_answer` in a fresh process, holding the decoded
+  message and its pieces: about 18.5 MiB (glibc) and 18.25 MiB (musl),
+  normalization adding nothing, as the text moves into its pieces
+  (`final_text_pieces_owned`). With the text copied, as before, it was
+  22 MiB. What is not qualified: `codex_rss_leases` drives about 1 MiB
+  lines, so 32 sessions each at a maximal 8 MiB decode at once are an
+  extrapolation from these single measures.
+
+  The routing peek's own peak is `codex_peek_peak_within_allowance`
+  (same file): six admitted lines whose correlation member (a reply or
+  request ID, a thread, a `turn.id`) or unknown payload is a
+  4-million-element array, past the structure limits, each in a fresh
+  process. Each peaks at 0.25 to 0.5 MiB, against a 1 MiB test bound
+  (review cfix-crit #1). Before, a reply ID was built as a `Value`:
+  about 136 MiB for one such line. The table's 8 MiB peek row is kept as
+  the allowance, so the 1,028 MiB limit is unchanged.
+
+#### 9.3 The Codex inbound cap (via-5lr.3.5, 2026-10-05)
+
+Live round 1 (codex-cli 0.160.0) saw a `commandExecution`
+`item/completed` line of 1,213,365 B for `seq 1 800000`: Codex cuts a
+command's output to about 1 MiB raw (a 512 KiB head and tail, 1,048,607 B
+checked), and JSON escaping grows it. Over Wire's 1 MiB default the line
+failed the shared connection `protocol`, every session on it.
+
+- **Cap.** The worst escaping is six bytes per raw byte (`\u001f` for a
+  control character), so one such item reaches about 6 MiB plus its other
+  fields (command, cwd, IDs): the Codex route admits stdout messages of up
+  to **8 MiB including LF** (`codex::MESSAGE_BYTES`). Inferred from the
+  output cut and serde's escaping, not from a recorded 6 MiB line. Wire's
+  default stays 1 MiB for every other route; the bounds are per
+  connection (`via_wire::InboundBounds`, set through `WireSignals`).
+- **What the line must also fit through.** Each per-thread lane holds one
+  maximal message and its bookkeeping (`LANE_BYTES` = 8 MiB +
+  `LANE_OVERHEAD`, 16 messages; the 5 KiB is 16 entries at a `Start`
+  marker's 256 B plus a retention's 64 B, so a maximal early message is
+  retained and its turn's markers still fit; review cfix-1 #1); the connection's
+  staging keeps runtime §8's 4 MiB for ordinary traffic plus one maximal
+  message: **12 MiB** (`codex::INBOUND`). The lanes still count against
+  that staging, so the server's memory is bounded by it, not by the sum
+  of the lanes.
+- **Decode.** The decoder borrows `params` and an item's raw value from
+  the line instead of copying them (`RawEnvelope`, `item_event`, `peek`):
+  before that, an 8 MiB `final_answer` decoded at about 24 MiB (three
+  copies); now at about 8.25 MiB, one copy of the retained text, or
+  16.25 MiB when the text holds an escape (serde's scratch beside the
+  owned copy). `DECODE_ALLOWANCE` is two maximal messages plus the node
+  term: 20 MiB. The normalizer moves a final answer's text into its
+  pieces rather than copying it, so the pieces held under back-pressure
+  stay within the same allowance (review cfix-1 #2).
+- **Over the cap (owner 2026-10-05, review cfix-3).** A line over 8 MiB
+  fails the shared connection `protocol`, every session on it, for the
+  first release. The Codex connection's bounds skip it (`InboundBounds::
+  skip_oversize`): Wire reads it to its LF, keeping the stream in step,
+  and delivers a record of its length, first 64 KiB and last 4 KiB,
+  charged to staging and released with it; an unterminated one is noted
+  with its whole length. The connection treats every such line as
+  unattributable (item 5 step 2): its head is the server's
+  `undecoded.bin` and nothing of it reaches a lane
+  (`codex_over_cap_line_fails_the_shared_connection`). Attributing it by
+  its bytes was tried and removed: Codex writes `threadId`/`turnId` after
+  the item, past the retained tail, and no suffix match proves the
+  envelope type or unique correlation fields (reviews cfix-2 and
+  cfix-3). Revisit post-release, a streaming JSON depth/string tracker in Wire can attribute the line to its turn (owner 2026-10-05). Private routes keep failing the
+  connection `MessageTooLarge`.
+- **Prompt cap unchanged.** The `prompt` limit (1,040,384 bytes with the
+  cwd, C1 §4) was set against the 1 MiB cap. The 8 MiB cap now holds both
+  echoes of a maximal prompt in one lane and the `thread/resume` reply's
+  `thread.preview` echo of a session's first prompt (live round 1 item
+  5b: 1,042,276 B), so via-7g3's two-echo race and the resume echo no
+  longer fail a turn. Raising the prompt limit would be a C1 change, so it
+  is not made.
+- **Tests.** `codex_escaped_output_over_one_mib_is_delivered`
+  (`crates/via-core/tests/conformance_codex.rs`): in `c4_two_sessions`
+  B's tool completion, carrying about 1.2 MB of escaped `seq` output,
+  arrives while A's turn runs; B completes and A reaches its interrupt as
+  recorded (failed with the 1 MiB cap: the connection failed and the
+  server was stopped). `connection_bounds_set_its_cap_and_staging`
+  (`crates/via-wire/tests/shared_connection.rs`): a connection's own
+  bounds admit a message at the cap and stage past the default 4 MiB, and
+  one byte over the cap fails it `MessageTooLarge`.
 
 ### Item 10. Overflow, quarantine and the loss record (G7, r2 N3, N14, r3 F17)
 
@@ -1597,8 +1723,8 @@ server-request replies.
 #### 12.5 Staging permits
 
 - **Wire (X2):** `VendorMessage` carries a `StagingPermit` (one message
-  and its bytes of the 1,024 / 4 MiB staging), released on drop instead of
-  at receive. Private routes drop the message after decoding: no change.
+  and its bytes of the 1,024-message staging, 12 MiB since item 9.3),
+  released on drop instead of at receive. Private routes drop the message after decoding: no change.
 - **Route (X3):** the demux peeks the routing fields, drops that parse,
   and enqueues the raw message with its permit into the ingress lane; the
   normalizer decodes it when it consumes it and drops the permit after.
@@ -1693,7 +1819,17 @@ Steps 2–4 run concurrently:
    { discarded_bytes }`; it never waits for more output. The demux routes
    each message as usual and each registration receives the boundary
    after its prefix, so a terminal decoded before the failure is applied
-   first.
+   first. The server's evidence is taken after the drain, so an
+   unattributable message the drain finds (a queued over-cap line) is
+   kept too. **Stream order (review cfix-crit #2):** when the latched
+   cause is a failure of Wire's stdout reader (`next_message` erred with
+   `WireError::Message`: a full queue's `Overflow`, an over-cap line, a
+   read error), every admitted message precedes it in stdout's order, so
+   the first failure the drain finds becomes the disposition instead
+   (the latch is updated). A cause latched anywhere else keeps
+   first-wins: Wire's stdin writer failing (`WireError::Io`, e.g. a
+   broken pipe), a routed message, a driver's request (review
+   cfix-crit2).
 4. **Fan-out**, after the prefix reached every lane and Host's report is
    in (or `loss_deadline` passed). Disposition by the latched cause (F9):
    - `Protocol` → `failed(protocol)`; `Overflow` → `failed(overflow)`

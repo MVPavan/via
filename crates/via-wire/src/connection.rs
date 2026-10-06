@@ -20,7 +20,7 @@ use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tokio::time::{sleep_until, timeout_at};
 
-use super::{BoundedBytes, Deadline, SendOutcome, VendorMessage, WireFailure};
+use super::{BoundedBytes, Deadline, InboundBounds, SendOutcome, VendorMessage, WireFailure};
 use crate::runtime::{WireCloseReport, WireError, wire_cleanup};
 use crate::split::{LineSplitter, Pushed};
 use via_host::{ExitReceiver, ProcessControl};
@@ -32,9 +32,9 @@ pub const UNDECODED_BYTES: usize = 64 * 1024;
 /// One stdout read (design §8.2).
 const READ_BYTES: usize = 64 * 1024;
 
-/// The message queue: at most 1,024 messages and 4 MiB (design §8.2, A47).
+/// The message queue: at most 1,024 messages (design §8.2, A47) and the
+/// connection's staging bytes ([`InboundBounds`]).
 const QUEUE_MESSAGES: usize = 1024;
-const QUEUE_BYTES: usize = 4 * 1024 * 1024;
 
 /// A streamed start writes its prompt in slices of at most 16 KiB, each
 /// escaped into one reused buffer (design §8.3).
@@ -56,8 +56,8 @@ const FINISH_JOIN: Duration = Duration::from_millis(250);
 /// A connection's first failure (design §8.4).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FailureCause {
-    /// The stdout reader: a full queue is `Overflow`, a message over 1 MiB
-    /// `MessageTooLarge`, a pipe read error `Transport`.
+    /// The stdout reader: a full queue is `Overflow`, a message over the
+    /// connection's cap `MessageTooLarge`, a pipe read error `Transport`.
     Reader(WireFailure),
     /// A stdin write error; a group kill surfaces as `BrokenPipe`.
     Writer(std::io::ErrorKind),
@@ -278,11 +278,23 @@ struct Undecoded {
 }
 
 /// The staging budget of messages read and not yet dropped (runtime §4,
-/// design §8.2): 1,024 messages and 4 MiB.
-#[derive(Default)]
+/// design §8.2): 1,024 messages and the connection's staging bytes.
 struct Staging {
     messages: AtomicUsize,
     bytes: AtomicUsize,
+    /// [`InboundBounds::staging_bytes`].
+    limit: usize,
+}
+
+impl Staging {
+    /// An empty budget of `limit` bytes.
+    fn new(limit: usize) -> Self {
+        Self {
+            messages: AtomicUsize::new(0),
+            bytes: AtomicUsize::new(0),
+            limit,
+        }
+    }
 }
 
 /// One staged message's share of [`Staging`], returned when the message is
@@ -303,7 +315,7 @@ impl StagingPermit {
             bytes,
         };
         // Past a bound the permit is dropped at once, returning its share.
-        (messages <= QUEUE_MESSAGES && total <= QUEUE_BYTES).then_some(permit)
+        (messages <= QUEUE_MESSAGES && total <= staging.limit).then_some(permit)
     }
 }
 
@@ -329,6 +341,11 @@ struct Shared {
     latch: watch::Sender<LatchState>,
     /// Messages read and not yet dropped, with their bytes.
     staging: Arc<Staging>,
+    /// The largest complete stdout message ([`InboundBounds`]).
+    message_bytes: usize,
+    /// An over-cap line is skipped and delivered as its record
+    /// ([`InboundBounds::skip_oversize`]).
+    skip_oversize: bool,
     admission: StdMutex<Admission>,
     /// Stdout ended; set before the reader drops its queue sender.
     eof: AtomicBool,
@@ -1538,10 +1555,16 @@ pub(crate) fn open(
     control: ProcessControl,
     exits: ExitReceiver,
     folder: (PathBuf, BlobTasks),
-    waits: Waits,
+    (waits, bounds): (Waits, InboundBounds),
     stragglers: &Stragglers,
 ) -> WireConnection {
-    let (io, messages) = connect(pipes.stdout, pipes.stdin, folder, waits, stragglers);
+    let (io, messages) = connect(
+        pipes.stdout,
+        pipes.stdin,
+        folder,
+        (waits, bounds),
+        stragglers,
+    );
     WireConnection {
         sender: WireSender {
             io,
@@ -1551,12 +1574,13 @@ pub(crate) fn open(
     }
 }
 
-/// Starts the reader over `stdout` and the writer over `stdin`.
+/// Starts the reader over `stdout` and the writer over `stdin`, within
+/// `bounds`.
 pub(crate) fn connect<R, W>(
     stdout: R,
     stdin: W,
     (folder, tasks): (PathBuf, BlobTasks),
-    waits: Waits,
+    (waits, bounds): (Waits, InboundBounds),
     stragglers: &Stragglers,
 ) -> (Io, WireMessages)
 where
@@ -1566,7 +1590,9 @@ where
     let (latch, latch_rx) = watch::channel(LatchState::default());
     let shared = Arc::new(Shared {
         latch,
-        staging: Arc::default(),
+        staging: Arc::new(Staging::new(bounds.staging_bytes)),
+        message_bytes: bounds.message_bytes,
+        skip_oversize: bounds.skip_oversize,
         admission: StdMutex::default(),
         eof: AtomicBool::new(false),
         unterminated: AtomicBool::new(false),
@@ -1619,7 +1645,7 @@ where
 /// The stdout reader (design §8.2): reads up to 64 KiB into its fixed
 /// buffer, splits on LF and queues each complete message with `try_send`,
 /// never awaiting a consumer or the Store. A full queue or a message over
-/// 1 MiB latches the failure and switches to discard mode: read to EOF,
+/// the connection's cap latches the failure and switches to discard mode: read to EOF,
 /// count the bytes, keep nothing, so the vendor never blocks on its pipe.
 /// An oversized message's prefix save runs beside those reads, owned by
 /// this loop, and is awaited before EOF is recorded.
@@ -1630,7 +1656,7 @@ async fn read_stdout<R: AsyncRead + Unpin>(
     mut stop: watch::Receiver<bool>,
 ) {
     let mut buffer = vec![0_u8; READ_BYTES];
-    let mut splitter = LineSplitter::new();
+    let mut splitter = LineSplitter::within(shared.message_bytes);
     let mut discard = false;
     // The oversized prefix's save, bounded by its blob step's 2 s. It is
     // polled with the reads, so discard reads go on while it waits. A stop
@@ -1671,19 +1697,22 @@ async fn read_stdout<R: AsyncRead + Unpin>(
         }
         // A refusal or an oversized message switches to discard mode
         // without counting this read: `discarded_bytes` is a lower bound.
-        match splitter.push(&buffer[..count], |message| {
-            enqueue(&shared, &queue, message)
-        }) {
+        let enqueue_message = |message| enqueue(&shared, &queue, message);
+        let pushed = if shared.skip_oversize {
+            splitter.push_skipping(&buffer[..count], enqueue_message, |skipped| {
+                enqueue_skipped(&shared, &queue, skipped)
+            })
+        } else {
+            splitter.push(&buffer[..count], enqueue_message)
+        };
+        match pushed {
             Pushed::Consumed => {}
             Pushed::Refused => discard = true,
             Pushed::TooLarge(prefix) => {
                 discard = true;
                 let cause = FailureCause::Reader(WireFailure::MessageTooLarge);
                 if shared.fail(cause) {
-                    let what = format!(
-                        "vendor message over the {} byte cap",
-                        super::MAX_STDOUT_MESSAGE_BYTES
-                    );
+                    let what = format!("vendor message over the {} byte cap", shared.message_bytes);
                     let shared = Arc::clone(&shared);
                     saving = Some(Box::pin(async move {
                         shared.keep_undecoded(&prefix, &what).await;
@@ -1696,8 +1725,8 @@ async fn read_stdout<R: AsyncRead + Unpin>(
     if let Some(save) = saving {
         save.await;
     }
+    let length = splitter.unfinished_length();
     if !discard && let Some(tail) = splitter.finish() {
-        let length = tail.len();
         shared
             .keep_undecoded(
                 &tail,
@@ -1725,7 +1754,7 @@ fn enqueue(shared: &Shared, queue: &mpsc::Sender<VendorMessage>, message: Vec<u8
             .saturating_add(u64::try_from(length).unwrap_or(u64::MAX));
         return true;
     }
-    let cause = match BoundedBytes::try_from_message(message) {
+    let cause = match BoundedBytes::try_from_message_within(message, shared.message_bytes) {
         Ok(bounded) => {
             let sent = StagingPermit::reserve(&shared.staging, length).is_some_and(|permit| {
                 queue
@@ -1743,6 +1772,42 @@ fn enqueue(shared: &Shared, queue: &mpsc::Sender<VendorMessage>, message: Vec<u8
     // `fail` seals, which takes this lock.
     drop(admission);
     shared.fail(FailureCause::Reader(cause));
+    false
+}
+
+/// Queues a skipped over-cap line's record (owner 2026-10-05): its tail as
+/// the message, its head and length beside it, charged to staging like a
+/// message of their bytes; a full queue or staging fails `Overflow`.
+fn enqueue_skipped(
+    shared: &Shared,
+    queue: &mpsc::Sender<VendorMessage>,
+    skipped: crate::split::Skipped,
+) -> bool {
+    let crate::split::Skipped { length, head, tail } = skipped;
+    let charge = head.len().saturating_add(tail.len());
+    let admission = shared
+        .admission
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if admission.sealed {
+        drop(admission);
+        return true;
+    }
+    let sent = StagingPermit::reserve(&shared.staging, charge).is_some_and(|permit| {
+        let line = crate::SkippedLine { length, head };
+        queue
+            .try_send(VendorMessage::skipped_line(
+                BoundedBytes(tail),
+                line,
+                permit,
+            ))
+            .is_ok()
+    });
+    if sent || queue.is_closed() {
+        return sent;
+    }
+    drop(admission);
+    shared.fail(FailureCause::Reader(WireFailure::Overflow));
     false
 }
 
@@ -2197,8 +2262,9 @@ pub mod testing {
     use tokio::sync::watch;
 
     use super::{
-        BlobTasks, DataHold, Deadline, FailureCause, Io, OutboundMessage, PendingWrite, Stragglers,
-        Waits, WireError, WireMessages, WriteBounds, WriteState, WriteTicket, connect,
+        BlobTasks, DataHold, Deadline, FailureCause, InboundBounds, Io, OutboundMessage,
+        PendingWrite, Stragglers, Waits, WireError, WireMessages, WriteBounds, WriteState,
+        WriteTicket, connect,
     };
 
     /// The Store a layer above opens for a test runtime of its own (x.3.2
@@ -2224,8 +2290,22 @@ pub mod testing {
     }
 
     /// Starts a connection's tasks over `stdout` and `stdin`, keeping any
-    /// undecoded message in `folder`.
+    /// undecoded message in `folder`, within the default bounds.
     pub fn pipes<R, W>(stdout: R, stdin: W, folder: PathBuf) -> TestPipes
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        pipes_within(stdout, stdin, folder, InboundBounds::DEFAULT)
+    }
+
+    /// [`pipes`] within `bounds`.
+    pub fn pipes_within<R, W>(
+        stdout: R,
+        stdin: W,
+        folder: PathBuf,
+        bounds: InboundBounds,
+    ) -> TestPipes
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
@@ -2237,7 +2317,13 @@ pub mod testing {
             wake: watch::channel(0).1,
         };
         let tasks = BlobTasks::default();
-        let (io, messages) = connect(stdout, stdin, (folder, tasks.clone()), waits, &stragglers);
+        let (io, messages) = connect(
+            stdout,
+            stdin,
+            (folder, tasks.clone()),
+            (waits, bounds),
+            &stragglers,
+        );
         TestPipes {
             messages,
             input: TestInput {
@@ -2282,6 +2368,11 @@ pub mod testing {
         /// See `WireSender::failure`.
         pub fn failure(&self) -> Option<FailureCause> {
             self.io.failure()
+        }
+
+        /// See `WireSender::keep_undecoded`.
+        pub async fn keep_undecoded(&self, bytes: &[u8], what: &str) {
+            self.io.keep_undecoded(bytes, what).await;
         }
 
         /// See `WireSender::take_undecoded`.

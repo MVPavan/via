@@ -86,17 +86,17 @@ fn s_launch_plan_inherit_per_harness() {
             "skills":"on","agents":"on","instruction_files":"unknown"}),
         ),
     };
-    // Codex (x.3.2 X1): `harnesses.codex.inherit` sets skills off, and
-    // only its hooks switch is verified (packet §4), so every other
-    // category is effectively `unknown`.
+    // Codex (x.3.2 X1): `harnesses.codex.inherit` sets skills off over
+    // Codex's default request, every category on (owner 2026-10-05). Hooks,
+    // MCP servers and instruction files are `on` by the packet's recorded
+    // live evidence (owner 2026-10-06); skills, plugins and agents have
+    // none, so they are `unknown`.
     let codex = InheritPlan {
-        requested: inherit(
-            json!({"hooks": "off", "mcp_servers": "off", "plugins": "on",
-            "skills": "off", "agents": "on", "instruction_files": "on"}),
-        ),
-        effective: inherit(json!({"hooks": "off", "mcp_servers": "unknown",
+        requested: inherit(json!({"hooks": "on", "mcp_servers": "on", "plugins": "on",
+            "skills": "off", "agents": "on", "instruction_files": "on"})),
+        effective: inherit(json!({"hooks": "on", "mcp_servers": "on",
             "plugins": "unknown", "skills": "unknown", "agents": "unknown",
-            "instruction_files": "unknown"})),
+            "instruction_files": "on"})),
     };
     // Per harness, with the model the request names: the plan's inherit,
     // or the refusal. Nothing here runs a binary. Each adapter track flips

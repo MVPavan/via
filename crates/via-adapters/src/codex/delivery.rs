@@ -1614,7 +1614,7 @@ impl Normalizing {
                 let bytes = item.routed().map(|routed| routed.staged.bytes().to_vec());
                 self.malformed(owner, &bytes.unwrap_or_default()).await;
             }
-            (LaneItem::Message(routed), Parsed::Notification(notification)) => {
+            (LaneItem::Message(routed), Parsed::Notification(mut notification)) => {
                 let named = routed.turn;
                 drop(routed.staged);
                 match (owner, named) {
@@ -1628,7 +1628,7 @@ impl Normalizing {
                         .await;
                     }
                     _ => {
-                        self.notification(&delivery, owner, &notification, (at, decoded_at))
+                        self.notification(&delivery, owner, &mut notification, (at, decoded_at))
                             .await;
                     }
                 }
@@ -1858,7 +1858,7 @@ impl Normalizing {
         &mut self,
         delivery: &Arc<Delivery>,
         owner: Owner,
-        notification: &Notification,
+        notification: &mut Notification,
         (at, decoded_at): (Instant, Instant),
     ) {
         let running = self

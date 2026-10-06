@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use via_routes::codex::{SandboxMode, SandboxPolicy};
 
 use crate::capabilities::{BoundMode, Capabilities, ParamSupport, Support, UsageSupport, Verbs};
-use crate::plan::{Bound, Category, CategoryDecl, Switch, VendorOptions};
+use crate::plan::{Bound, Category, CategoryDecl, InheritState, Switch, VendorOptions};
 
 /// The versions maintainers' live check passed (C2 §5 version rule): the
 /// re-probes of 2026-09-30 (`via-5lr.3.1`).
@@ -28,8 +28,9 @@ const EFFORTS: &[(&str, &str)] = &[
 /// Most bytes of a turn's JSON-encoded prompt plus its JSON-encoded cwd
 /// (C1 §4 `prompt`; via-5lr.6, x.3.2 X5). Codex echoes the prompt whole
 /// in the user message's `item/started` and `item/completed`
-/// notifications, one line each, and an inbound line over Wire's 1 MiB
-/// (1,048,576 bytes with its LF) fails the shared connection. The
+/// notifications, one line each. The limit was set against Wire's 1 MiB
+/// line cap (1,048,576 bytes with its LF) and is kept now that the Codex
+/// cap is 8 MiB (via-5lr.3.5): raising it is a C1 change. The
 /// recorded echo lines carry the prompt once, never the cwd, and at most
 /// 340 other bytes, LF included (every 0.159.2 fixture); 1 MiB less 8 KiB
 /// leaves over 7.5 KiB for fields a later version adds. The cwd is
@@ -109,26 +110,32 @@ pub(crate) fn capabilities() -> Capabilities {
     }
 }
 
-/// The inherited-configuration declarations (packet §4, 2026-09-30
-/// re-probe): only `--disable hooks` is a verified switch. Every other
-/// category has no switch VIA applies and no verified vendor default, so
-/// it is effectively `unknown` and warns.
+/// The inherited-configuration declarations (packet §4, C2 §6.2; owner
+/// 2026-10-06). Only `--disable hooks` is a switch VIA applies (verified);
+/// for the first release VIA disables nothing else (owner 2026-10-05).
+/// With no switch, a category is `on` (the user's configuration applies,
+/// whatever it contains) where recorded live evidence shows Codex loads
+/// it: hooks (the owner's hooks ran, 2026-09-30), MCP servers (the user's
+/// servers and `codex_apps` started, 2026-10-05) and instruction files
+/// (`instructionSources` listed the loaded AGENTS.md, 0.159.2 re-probe).
+/// Plugins, skills and agents have no such evidence: `unknown`. An off VIA
+/// cannot apply is declared unverified, so it reports `unknown`, never a
+/// suppression.
 pub(crate) fn categories() -> BTreeMap<Category, CategoryDecl> {
     let unswitched = CategoryDecl::default();
-    let hooks = CategoryDecl {
+    let loaded = |off| CategoryDecl {
         on: Switch::None,
-        off: Switch::Verified,
-        observed: None,
+        off,
+        observed: Some(InheritState::On),
     };
     Category::ALL
         .into_iter()
         .map(|category| match category {
-            Category::Hooks => (category, hooks),
-            Category::McpServers
-            | Category::Plugins
-            | Category::Skills
-            | Category::Agents
-            | Category::InstructionFiles => (category, unswitched),
+            Category::Hooks => (category, loaded(Switch::Verified)),
+            Category::McpServers | Category::InstructionFiles => {
+                (category, loaded(Switch::Unverified))
+            }
+            Category::Plugins | Category::Skills | Category::Agents => (category, unswitched),
         })
         .collect()
 }

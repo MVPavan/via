@@ -30,6 +30,8 @@ pub(crate) trait Stdio: Send + Sync + 'static {
     fn close_input(&self, deadline: Deadline) -> Boxed<'_, Result<(), WireError>>;
     /// See [`WireSender::keep_undecoded`].
     fn keep_undecoded<'a>(&'a self, bytes: &'a [u8], what: &'a str) -> Boxed<'a, ()>;
+    /// See [`WireSender::take_undecoded`].
+    fn take_undecoded(&self) -> Option<String>;
     /// See [`WireSender::link_turn`].
     fn link_turn<'a>(
         &'a self,
@@ -66,6 +68,10 @@ impl Stdio for WireSender {
 
     fn keep_undecoded<'a>(&'a self, bytes: &'a [u8], what: &'a str) -> Boxed<'a, ()> {
         Box::pin(WireSender::keep_undecoded(self, bytes, what))
+    }
+
+    fn take_undecoded(&self) -> Option<String> {
+        WireSender::take_undecoded(self)
     }
 
     fn link_turn<'a>(

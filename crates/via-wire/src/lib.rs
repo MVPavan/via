@@ -9,8 +9,43 @@ pub use via_store::{
     AnchorCohort, CommitOutcome, Deadline, RuntimeResources, ServerId, SessionId, StoreFailureKind,
 };
 
-/// The maximum complete stdout message, including its trailing LF.
+/// The maximum complete stdout message, including its trailing LF, unless
+/// the connection's [`InboundBounds`] say otherwise.
 pub const MAX_STDOUT_MESSAGE_BYTES: usize = 1024 * 1024;
+
+/// A connection's inbound bounds (runtime §8): the largest complete stdout
+/// message it admits and its staging budget's bytes. A route sets them per
+/// connection; [`InboundBounds::DEFAULT`] is runtime §8's 1 MiB message
+/// and 4 MiB staging.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InboundBounds {
+    /// The largest complete stdout message, LF included.
+    pub message_bytes: usize,
+    /// The bytes of messages read and not yet dropped; at least
+    /// `message_bytes`.
+    pub staging_bytes: usize,
+    /// A line over `message_bytes` is skipped to its LF and delivered as a
+    /// [`VendorMessage::skipped`] record (its length, head and tail) for
+    /// its route's evidence (owner 2026-10-05), instead of failing the
+    /// connection `MessageTooLarge`.
+    pub skip_oversize: bool,
+}
+
+impl InboundBounds {
+    /// Runtime §8's bounds: a 1 MiB message and 4 MiB of staging; an
+    /// over-cap line fails the connection.
+    pub const DEFAULT: Self = Self {
+        message_bytes: MAX_STDOUT_MESSAGE_BYTES,
+        staging_bytes: 4 * 1024 * 1024,
+        skip_oversize: false,
+    };
+}
+
+impl Default for InboundBounds {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
 
 /// The bytes of one complete, newline-terminated vendor message, bounded but
 /// not yet decoded; Route may still reject them as malformed.
@@ -18,9 +53,15 @@ pub const MAX_STDOUT_MESSAGE_BYTES: usize = 1024 * 1024;
 pub struct BoundedBytes(Vec<u8>);
 
 impl BoundedBytes {
-    /// Checks the complete-message cap before retaining the input.
+    /// Checks the default complete-message cap before retaining the input.
     pub fn try_from_message(bytes: Vec<u8>) -> Result<Self, WireFailure> {
-        if bytes.len() > MAX_STDOUT_MESSAGE_BYTES {
+        Self::try_from_message_within(bytes, MAX_STDOUT_MESSAGE_BYTES)
+    }
+
+    /// Checks a complete-message cap of `max` bytes, LF included, before
+    /// retaining the input.
+    pub fn try_from_message_within(bytes: Vec<u8>, max: usize) -> Result<Self, WireFailure> {
+        if bytes.len() > max {
             return Err(WireFailure::MessageTooLarge);
         }
         if bytes.last() != Some(&b'\n') {
@@ -49,6 +90,18 @@ pub struct VendorMessage {
     /// Its share of the connection's staging, held until the message is
     /// dropped (x.3.2 X0 item 12.5); none for a message not read by Wire.
     _permit: Option<connection::StagingPermit>,
+    /// An over-cap line's record: `bytes` are then its tail, not a whole
+    /// message.
+    skipped: Option<Box<SkippedLine>>,
+}
+
+/// What a [`VendorMessage`] of a skipped line keeps beside its tail.
+#[derive(Debug, Eq, PartialEq)]
+pub struct SkippedLine {
+    /// The whole line's bytes, LF included.
+    pub length: u64,
+    /// Its first 64 KiB, for evidence.
+    pub head: Vec<u8>,
 }
 
 impl PartialEq for VendorMessage {
@@ -66,6 +119,7 @@ impl VendorMessage {
         Self {
             bytes,
             _permit: None,
+            skipped: None,
         }
     }
 
@@ -74,12 +128,34 @@ impl VendorMessage {
         Self {
             bytes,
             _permit: Some(permit),
+            skipped: None,
         }
     }
 
-    /// Returns the exact message bytes, including the trailing LF.
+    /// A skipped over-cap line Wire read: its tail as the bytes, its head
+    /// and length beside them, holding their staging share.
+    pub(crate) fn skipped_line(
+        tail: BoundedBytes,
+        line: SkippedLine,
+        permit: connection::StagingPermit,
+    ) -> Self {
+        Self {
+            bytes: tail,
+            _permit: Some(permit),
+            skipped: Some(Box::new(line)),
+        }
+    }
+
+    /// Returns the exact message bytes, including the trailing LF; for a
+    /// skipped line, its last [`SKIPPED_TAIL_BYTES`].
     pub fn bytes(&self) -> &[u8] {
         self.bytes.as_bytes()
+    }
+
+    /// The record of a line over the connection's cap, skipped to its LF
+    /// (owner 2026-10-05): only on a connection whose bounds skip.
+    pub fn skipped(&self) -> Option<&SkippedLine> {
+        self.skipped.as_deref()
     }
 }
 
@@ -135,7 +211,7 @@ pub use runtime::{
     RuntimeConfig, WireCloseReport, WireError, WireRecovery, WireRuntime, WireShutdown,
     WireSignals, WireTurnRecovery,
 };
-pub use split::{LineSplitter, Pushed};
+pub use split::{LineSplitter, Pushed, SKIPPED_TAIL_BYTES, Skipped};
 pub use via_host::{JournalSite, ReprobeReport};
 pub use via_store::StoreError;
 /// Test builds only: the named failpoint controller, for the layers above.

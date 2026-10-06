@@ -158,8 +158,8 @@ pub use capabilities::{
     BoundMode, Capabilities, ParamSupport, Support, UsageSupport, Verb, VerbReq, Verbs,
 };
 pub use config::{
-    AdapterConfig, BOOTSTRAP_ENV, BootstrapEnv, ConfigError, FakeFixture, HarnessConfig,
-    HarnessSettings, HarnessesError, HarnessesRule,
+    AdapterConfig, BOOTSTRAP_ENV, BootstrapEnv, CodexSettings, ConfigError, FakeFixture,
+    HarnessConfig, HarnessSettings, HarnessesError, HarnessesRule,
 };
 #[cfg(feature = "test-failpoints")]
 pub use driver::StandIn;
@@ -246,6 +246,29 @@ pub fn final_text_pieces(text: &str) -> impl Iterator<Item = &str> {
         rest = tail;
         Some(piece)
     })
+}
+
+/// [`final_text_pieces`] of an owned `text`, moved rather than copied
+/// (review cfix-1 #2): one piece is the text itself; a longer text is cut
+/// from its end, its head shrunk after each cut, so the text and its
+/// pieces together stay near one text and one piece, not two texts.
+pub fn final_text_pieces_owned(mut text: String) -> Vec<String> {
+    let mut starts = Vec::new();
+    let mut at = 0;
+    for piece in final_text_pieces(&text) {
+        starts.push(at);
+        at += piece.len();
+    }
+    let mut pieces = Vec::with_capacity(starts.len());
+    for &start in starts.iter().skip(1).rev() {
+        pieces.push(text.split_off(start));
+        text.shrink_to_fit();
+    }
+    if !text.is_empty() {
+        pieces.push(text);
+    }
+    pieces.reverse();
+    pieces
 }
 
 /// The turn's activity clock (design §2.4): the arrival of the last vendor

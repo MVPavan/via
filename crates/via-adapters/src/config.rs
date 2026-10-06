@@ -116,8 +116,8 @@ pub enum ConfigError {
     Harnesses(#[from] HarnessesError),
 }
 
-/// Why `harnesses` is invalid: the member's full path, such as
-/// `harnesses.claude.binary`, and the rule it broke (runtime §8).
+/// Why `harnesses` is invalid: the member's full path from `harnesses`,
+/// such as `harnesses.claude.binary`, and the rule it broke (runtime §8).
 #[derive(Debug, Error, Eq, PartialEq)]
 #[error("{key}: {rule}")]
 pub struct HarnessesError {
@@ -145,7 +145,7 @@ pub enum HarnessesRule {
     /// `binary` is not an absolute path free of `..` (runtime §6.1's rule).
     #[error("must be an absolute path without `..`")]
     Binary,
-    /// An `inherit` switch is not a boolean.
+    /// An `inherit` switch or `memories` is not a boolean.
     #[error("must be a boolean")]
     NotBoolean,
 }
@@ -188,18 +188,53 @@ impl fmt::Debug for FakeFixture {
     }
 }
 
+/// Codex's `daemon.json` settings beside its `binary` and `inherit`
+/// (runtime §8): read at daemon start, so a change applies to servers
+/// launched after a restart. The other harnesses have no such keys.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CodexSettings {
+    /// `harnesses.codex.memories`: whether Codex's memories feature keeps
+    /// its own default. False (the default): every server VIA starts runs
+    /// with `--disable memories`.
+    pub memories: bool,
+}
+
 /// One vendor harness's `daemon.json` settings (design §5.4).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HarnessConfig {
     binary: Option<PathBuf>,
     inherit: Inherit,
+    codex: CodexSettings,
 }
 
 /// A harness with no settings: a `PATH` lookup and the OD2 default.
 static DEFAULT_HARNESS: HarnessConfig = HarnessConfig {
     binary: None,
     inherit: Inherit::OD2_DEFAULT,
+    codex: CodexSettings { memories: false },
 };
+
+/// The settings of harness `name` with none configured: a `PATH` lookup
+/// and its default request, [`default_inherit`].
+fn default_harness(name: &str) -> HarnessConfig {
+    HarnessConfig {
+        inherit: default_inherit(name),
+        ..DEFAULT_HARNESS.clone()
+    }
+}
+
+/// Harness `name`'s default inherited-configuration request: OD2's (hooks
+/// and MCP servers off, the rest on), except Codex's, every category on:
+/// VIA disables nothing in Codex but memories, so no switch applies (owner,
+/// 2026-10-05; vendor packet §4).
+fn default_inherit(name: &str) -> Inherit {
+    let mut inherit = Inherit::OD2_DEFAULT;
+    if name == crate::codex::HARNESS {
+        inherit.set(Category::Hooks, InheritState::On);
+        inherit.set(Category::McpServers, InheritState::On);
+    }
+    inherit
+}
 
 impl HarnessConfig {
     /// The configured binary; `None` means a `PATH` lookup.
@@ -211,6 +246,11 @@ impl HarnessConfig {
     pub fn inherit(&self) -> Inherit {
         self.inherit
     }
+
+    /// Codex's settings; the default for every other harness.
+    pub fn codex(&self) -> CodexSettings {
+        self.codex
+    }
 }
 
 /// The validated `harnesses` section of `daemon.json` (runtime §8, design
@@ -221,7 +261,12 @@ pub struct HarnessSettings(Vec<HarnessConfig>);
 
 impl Default for HarnessSettings {
     fn default() -> Self {
-        Self(vec![DEFAULT_HARNESS.clone(); HARNESSES.len()])
+        Self(
+            HARNESSES
+                .iter()
+                .map(|row| default_harness(row.name))
+                .collect(),
+        )
     }
 }
 
@@ -309,6 +354,14 @@ impl AdapterConfig {
             .unwrap_or(&DEFAULT_HARNESS)
     }
 
+    /// Codex's settings, `harnesses.codex` beside its `binary`.
+    pub fn codex(&self) -> CodexSettings {
+        HARNESSES
+            .iter()
+            .find(|row| row.name == crate::codex::HARNESS)
+            .map_or_else(CodexSettings::default, |row| self.harness(row).codex())
+    }
+
     /// The `inherit` a plan for `harness` requests: the configured one for a
     /// vendor harness; the fake keeps the OD2 default (design §5.5).
     pub fn inherit(&self, harness: Harness) -> Inherit {
@@ -326,10 +379,12 @@ impl AdapterConfig {
 
 /// Parses `harnesses` (runtime §8, design §5.4): keys are [`HARNESSES`]
 /// names; per harness only `binary` (an absolute path without `..`, never
-/// expanded) and `inherit` (the six category booleans, the OD2 default for
-/// each missing one). No key may repeat within its object. Pure: no I/O.
+/// expanded) and `inherit` (the six category booleans, the harness's
+/// [`default_inherit`] for each missing one), and for Codex alone
+/// `memories` (a boolean, default `false`). No key may repeat within its
+/// object. Pure: no I/O.
 fn parse_harnesses(raw: &RawValue) -> Result<Vec<HarnessConfig>, HarnessesError> {
-    let mut harnesses = vec![DEFAULT_HARNESS.clone(); HARNESSES.len()];
+    let mut harnesses = HarnessSettings::default().0;
     for (name, entry) in members(raw, "harnesses")? {
         let key = format!("harnesses.{name}");
         let Some(index) = HARNESSES.iter().position(|row| row.name == name) else {
@@ -340,7 +395,10 @@ fn parse_harnesses(raw: &RawValue) -> Result<Vec<HarnessConfig>, HarnessesError>
             let key = format!("{key}.{member}");
             match member.as_str() {
                 "binary" => config.binary = Some(binary(&value, &key)?),
-                "inherit" => config.inherit = parse_inherit(&value, &key)?,
+                "inherit" => config.inherit = parse_inherit(&value, &key, default_inherit(&name))?,
+                "memories" if name == crate::codex::HARNESS => {
+                    config.codex.memories = boolean(&value, &key)?;
+                }
                 _ => return Err(invalid(&key, HarnessesRule::UnknownKey)),
             }
         }
@@ -440,16 +498,14 @@ fn binary(value: &RawValue, key: &str) -> Result<PathBuf, HarnessesError> {
     }
 }
 
-fn parse_inherit(value: &RawValue, key: &str) -> Result<Inherit, HarnessesError> {
-    let mut states = Inherit::OD2_DEFAULT;
+fn parse_inherit(value: &RawValue, key: &str, default: Inherit) -> Result<Inherit, HarnessesError> {
+    let mut states = default;
     for (name, value) in members(value, key)? {
         let key = format!("{key}.{name}");
         let Ok(category) = serde_json::from_value::<Category>(Value::String(name)) else {
             return Err(invalid(&key, HarnessesRule::UnknownKey));
         };
-        let Ok(on) = serde_json::from_str::<bool>(value.get()) else {
-            return Err(invalid(&key, HarnessesRule::NotBoolean));
-        };
+        let on = boolean(&value, &key)?;
         states.set(
             category,
             if on {
@@ -460,6 +516,11 @@ fn parse_inherit(value: &RawValue, key: &str) -> Result<Inherit, HarnessesError>
         );
     }
     Ok(states)
+}
+
+/// A boolean member: `true` or `false`, never `null`.
+fn boolean(value: &RawValue, key: &str) -> Result<bool, HarnessesError> {
+    serde_json::from_str::<bool>(value.get()).map_err(|_| invalid(key, HarnessesRule::NotBoolean))
 }
 
 /// The fixture checks of runtime §11.1.

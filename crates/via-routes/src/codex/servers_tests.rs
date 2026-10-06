@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use via_wire::{EnvAllowList, PrivateProcessSpec, ProcessOwner, ServerId};
 
-use super::{Entry, ServerKey, ServerPin, Servers};
+use super::{Entry, HandshakeBound, ServerKey, ServerPin, Servers};
 use crate::codex::DeclineTable;
 use crate::codex::testing::{TestRuntime, TestStdio, VendorEnds, model};
 
@@ -40,7 +40,9 @@ fn key(first: u8) -> ServerKey {
 /// its launch.
 async fn launched(servers: &Servers, key: ServerKey) -> (ServerPin, VendorEnds, Arc<TestStdio>) {
     let (mut ends, stdio) = servers.script();
-    let pin = servers.launch_or_join(key, spec(), Box::new(())).unwrap();
+    let pin = servers
+        .launch_or_join(key, (spec(), HandshakeBound::Warm), Box::new(()))
+        .unwrap();
     assert!(
         servers
             .reports()
@@ -197,4 +199,59 @@ async fn lease_drop_retires_once() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(stdio.closes(), 1, "retired once");
     assert_eq!(servers.registry().stale, 0);
+}
+
+/// The formatted tracing events, as `via.log` would receive them.
+#[derive(Clone, Default)]
+struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Captured {
+    fn text(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+
+/// Bead via-f1q (live run 3): a server lost while the daemon runs is one
+/// `via.log` warning naming it; once the registry is fenced for the
+/// daemon's shutdown, Host's stop ending a transport writes none.
+#[tokio::test]
+async fn a_shutdown_stop_logs_no_connection_failure() {
+    let captured = Captured::default();
+    let sink = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || sink.clone())
+        .with_ansi(false)
+        .finish();
+    let _default = tracing::subscriber::set_default(subscriber);
+    let runtime = TestRuntime::new();
+    let servers = Servers::new(runtime.runtime(), DECLINES);
+    let (lost, lost_ends, _) = launched(&servers, key(0x07)).await;
+    let (stopped, stopped_ends, _) = launched(&servers, key(0x08)).await;
+    let ended = |pin: &ServerPin| {
+        let server = pin.server().clone();
+        let servers = &servers;
+        move || servers.ended().iter().any(|end| end.server == server)
+    };
+    drop(lost_ends);
+    until("the lost server's end", ended(&lost)).await;
+    let log = captured.text();
+    assert_eq!(log.lines().count(), 1, "{log}");
+    assert!(log.contains(&format!("server={}", lost.server())), "{log}");
+    assert!(log.contains("cause=TransportLost"), "{log}");
+    servers.fence();
+    drop(stopped_ends);
+    until("the stopped server's end", ended(&stopped)).await;
+    let log = captured.text();
+    assert_eq!(log.lines().count(), 1, "no line for a shutdown stop: {log}");
 }

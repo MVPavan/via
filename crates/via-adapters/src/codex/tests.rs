@@ -16,7 +16,7 @@ use super::normalize::{
     DECLINES, NormalizeError, Step, StructuredOutput, TurnNormalizer, catalog_page, decline,
     instance_version, version_status,
 };
-use crate::config::BootstrapEnv;
+use crate::config::{BootstrapEnv, CodexSettings};
 use crate::observation::{
     ClassHint, DenialKind, Observation, ProgressMarks, StopReason, UsageSample,
 };
@@ -90,8 +90,11 @@ fn normalized(case: &str, turn_id: &str, schema: bool) -> (Vec<Observation>, Opt
     let mut normalizer = TurnNormalizer::new(schema);
     let mut observations = Vec::new();
     let mut terminal = None;
-    for notification in turn_notifications(case, turn_id) {
-        match normalizer.observe(&notification, Instant::now()).unwrap() {
+    for mut notification in turn_notifications(case, turn_id) {
+        match normalizer
+            .observe(&mut notification, Instant::now())
+            .unwrap()
+        {
             Step::Observations(more) => observations.extend(more),
             Step::Activity => {}
             step @ Step::Terminal { .. } => {
@@ -116,8 +119,12 @@ fn env() -> BootstrapEnv {
 }
 
 fn hooks(state: InheritState) -> Inherit {
+    inherit(state, InheritState::Off)
+}
+
+fn inherit(hooks: InheritState, mcp_servers: InheritState) -> Inherit {
     serde_json::from_value(
-        json!({"hooks": state, "mcp_servers": "off", "plugins": "on",
+        json!({"hooks": hooks, "mcp_servers": mcp_servers, "plugins": "on",
         "skills": "on", "agents": "on", "instruction_files": "on"}),
     )
     .unwrap()
@@ -130,6 +137,140 @@ fn os(pairs: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
         .collect()
 }
 
+/// via-7r9: every server VIA starts disables Codex's memories feature,
+/// whatever the requested inheritance. Codex 0.160.0 otherwise ran memory
+/// extraction and a consolidation agent thread with full access that
+/// edited the user's `~/.codex/memories`, outside the caller's turn.
+#[test]
+fn every_server_disables_memories() {
+    for state in [InheritState::Off, InheritState::On] {
+        let recipe = ServerRecipe::new(
+            Path::new("/bin/codex"),
+            (hooks(state), CodexSettings::default()),
+            &env(),
+            Path::new("/state/vendor/codex"),
+        );
+        assert!(
+            recipe
+                .args
+                .windows(2)
+                .any(|pair| pair == ["--disable", "memories"]),
+            "hooks {state:?}: {:?}",
+            recipe.args
+        );
+    }
+}
+
+/// Owner 2026-10-05: `harnesses.codex.memories` true omits `--disable memories`, so
+/// Codex's own default applies; the argv is in the server key, so servers
+/// under the two settings never share a key.
+#[test]
+fn codex_memories_true_keeps_the_vendor_default() {
+    let recipe = |memories| {
+        ServerRecipe::new(
+            Path::new("/bin/codex"),
+            (hooks(InheritState::Off), CodexSettings { memories }),
+            &env(),
+            Path::new("/state/vendor/codex"),
+        )
+    };
+    assert_eq!(recipe(true).args, ["app-server", "--disable", "hooks"]);
+    assert!(
+        recipe(false)
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--disable", "memories"])
+    );
+    assert_ne!(
+        recipe(true).config_hash("0.1.0"),
+        recipe(false).config_hash("0.1.0")
+    );
+}
+
+/// Owner 2026-10-05: for the first release Codex disables nothing but
+/// memories, so no request adds `--disable apps`: the user's MCP servers
+/// and Codex's built-in apps server load as configured.
+#[test]
+fn no_request_disables_the_apps_server() {
+    use InheritState::{Off, On};
+    for (hooks, mcp_servers) in [(On, On), (On, Off), (Off, On), (Off, Off)] {
+        let recipe = ServerRecipe::new(
+            Path::new("/bin/codex"),
+            (inherit(hooks, mcp_servers), CodexSettings::default()),
+            &env(),
+            Path::new("/state/vendor/codex"),
+        );
+        assert!(
+            !recipe.args.iter().any(|arg| arg == "apps"),
+            "{hooks:?} {mcp_servers:?}: {:?}",
+            recipe.args
+        );
+    }
+}
+
+/// Owner 2026-10-06 (C2 §6.2): with no switch, a category is `on` where
+/// recorded live evidence shows Codex loads the user's configuration for
+/// it (packet §4): hooks (the owner's hooks ran), MCP servers (the user's
+/// servers and `codex_apps` started) and instruction files
+/// (`instructionSources` listed the loaded AGENTS.md). Plugins, skills and
+/// agents have none: `unknown`, warning. Hooks off is the verified
+/// `--disable hooks`; an off VIA cannot apply is `unknown`, never a
+/// claimed suppression.
+#[test]
+fn codex_categories_follow_the_recorded_evidence() {
+    use crate::plan::Category;
+    use InheritState::{Off, On, Unknown};
+    let harness = crate::Harness::Vendor(
+        crate::harness::HARNESSES
+            .iter()
+            .find(|row| row.name == super::HARNESS)
+            .unwrap(),
+    );
+    let default = crate::config::AdapterConfig::load(BootstrapEnv::default(), None)
+        .unwrap()
+        .inherit(harness);
+    for category in Category::ALL {
+        assert_eq!(default.get(category), On, "{category:?}");
+    }
+    let planned = |requested| {
+        let (plan, warning) = crate::plan::effective_inherit(&super::plan::categories(), requested);
+        let listed: Vec<String> = warning
+            .and_then(|warning| warning.data)
+            .and_then(|data| data["categories"].as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .map(|entry| entry["category"].as_str().unwrap_or_default().to_owned())
+            .collect();
+        (plan.effective, listed)
+    };
+    let states = |effective: Inherit| Category::ALL.map(|category| effective.get(category));
+    let (effective, listed) = planned(default);
+    assert_eq!(
+        states(effective),
+        [On, On, Unknown, Unknown, Unknown, On],
+        "hooks, MCP servers, plugins, skills, agents, instruction files"
+    );
+    assert_eq!(listed, ["plugins", "skills", "agents"]);
+    let off: Inherit = serde_json::from_value(json!({"hooks": "off", "mcp_servers": "off",
+        "plugins": "off", "skills": "off", "agents": "off", "instruction_files": "off"}))
+    .unwrap();
+    let (effective, listed) = planned(off);
+    assert_eq!(
+        states(effective),
+        [Off, Unknown, Unknown, Unknown, Unknown, Unknown]
+    );
+    assert_eq!(
+        listed,
+        [
+            "mcp_servers",
+            "plugins",
+            "skills",
+            "agents",
+            "instruction_files"
+        ]
+    );
+}
+
 /// Packet §4, Q6: the server's argv disables hooks when they are off, its
 /// environment is exactly the allow-list plus the supplied
 /// `CODEX_SQLITE_HOME`, and it runs in that directory.
@@ -138,12 +279,15 @@ fn the_server_recipe_is_the_allow_list() {
     let home = Path::new("/state/vendor/codex");
     let recipe = ServerRecipe::new(
         Path::new("/bin/codex"),
-        hooks(InheritState::Off),
+        (hooks(InheritState::Off), CodexSettings::default()),
         &env(),
         home,
     );
     assert_eq!(recipe.program, Path::new("/bin/codex"));
-    assert_eq!(recipe.args, ["app-server", "--disable", "hooks"]);
+    assert_eq!(
+        recipe.args,
+        ["app-server", "--disable", "memories", "--disable", "hooks"]
+    );
     assert_eq!(recipe.cwd, home);
     assert_eq!(
         recipe.env,
@@ -159,11 +303,11 @@ fn the_server_recipe_is_the_allow_list() {
     );
     let on = ServerRecipe::new(
         Path::new("/bin/codex"),
-        hooks(InheritState::On),
+        (hooks(InheritState::On), CodexSettings::default()),
         &BootstrapEnv::from_vars([("PATH", "/usr/bin")]),
         home,
     );
-    assert_eq!(on.args, ["app-server"]);
+    assert_eq!(on.args, ["app-server", "--disable", "memories"]);
     assert_eq!(
         on.env,
         os(&[
@@ -179,7 +323,12 @@ fn the_server_recipe_is_the_allow_list() {
 fn the_config_hash_covers_the_recipe() {
     let binary = Path::new("/opt/vendor/codex");
     let recipe = |hooks_state, home: &str| {
-        ServerRecipe::new(binary, hooks(hooks_state), &env(), Path::new(home))
+        ServerRecipe::new(
+            binary,
+            (hooks(hooks_state), CodexSettings::default()),
+            &env(),
+            Path::new(home),
+        )
     };
     let base = recipe(InheritState::Off, "/state/vendor/codex");
     let hash = base.config_hash("0.1.0");
@@ -410,12 +559,12 @@ fn each_error_code_has_its_class() {
         let line = json!({"method": "turn/completed", "params": {"threadId": "t",
             "turn": {"id": "u", "status": "failed",
                 "error": {"message": "m", "codexErrorInfo": info}}}});
-        let Incoming::Notification(notification) = decode(line.to_string().as_bytes()).unwrap()
+        let Incoming::Notification(mut notification) = decode(line.to_string().as_bytes()).unwrap()
         else {
             panic!("a notification");
         };
         match TurnNormalizer::new(false)
-            .observe(&notification, Instant::now())
+            .observe(&mut notification, Instant::now())
             .unwrap()
         {
             Step::Terminal { terminal, .. } => terminal.class_hint,
@@ -500,12 +649,12 @@ fn structured_output_comes_from_the_final_text() {
 #[test]
 fn an_in_progress_terminal_is_a_protocol_error() {
     let line = r#"{"method":"turn/completed","params":{"threadId":"t","turn":{"id":"u","status":"inProgress"}}}"#;
-    let Incoming::Notification(notification) = decode(line.as_bytes()).unwrap() else {
+    let Incoming::Notification(mut notification) = decode(line.as_bytes()).unwrap() else {
         panic!("a notification");
     };
     assert!(
         TurnNormalizer::new(false)
-            .observe(&notification, Instant::now())
+            .observe(&mut notification, Instant::now())
             .is_err()
     );
 }
@@ -772,11 +921,11 @@ fn structured_of(schema: bool, texts: &[&str]) -> StructuredOutput {
     let mut normalizer = TurnNormalizer::new(schema);
     for (n, text) in texts.iter().enumerate() {
         normalizer
-            .observe(&final_answer(&format!("m{n}"), text), Instant::now())
+            .observe(&mut final_answer(&format!("m{n}"), text), Instant::now())
             .unwrap();
     }
     match normalizer
-        .observe(&completed("completed"), Instant::now())
+        .observe(&mut completed("completed"), Instant::now())
         .unwrap()
     {
         Step::Terminal { structured, .. } => structured,
@@ -792,12 +941,13 @@ fn final_text_retention_is_bounded() {
     let mut plain = TurnNormalizer::new(false);
     let mut schema = TurnNormalizer::new(true);
     for n in 0..3 {
-        let answer = final_answer(&format!("m{n}"), &mib);
-        let Step::Observations(pieces) = plain.observe(&answer, Instant::now()).unwrap() else {
+        let answer = || final_answer(&format!("m{n}"), &mib);
+        let Step::Observations(pieces) = plain.observe(&mut answer(), Instant::now()).unwrap()
+        else {
             panic!("final text pieces");
         };
         assert!(!pieces.is_empty());
-        schema.observe(&answer, Instant::now()).unwrap();
+        schema.observe(&mut answer(), Instant::now()).unwrap();
     }
     assert_eq!(plain.retained(), 0);
     assert_eq!(schema.retained(), 3 * mib.len());
@@ -808,7 +958,7 @@ fn final_text_retention_is_bounded() {
     );
     let mut over = TurnNormalizer::new(true);
     for n in 0..5 {
-        over.observe(&final_answer(&format!("m{n}"), &mib), Instant::now())
+        over.observe(&mut final_answer(&format!("m{n}"), &mib), Instant::now())
             .unwrap();
     }
     assert_eq!(over.retained(), 0, "the accumulation is dropped");
@@ -837,14 +987,14 @@ fn an_empty_final_answer_is_missing() {
 fn usage_overflow_is_an_error() {
     let mut normalizer = TurnNormalizer::new(false);
     normalizer
-        .observe(&usage(Some(i64::MAX)), Instant::now())
+        .observe(&mut usage(Some(i64::MAX)), Instant::now())
         .unwrap();
     normalizer
-        .observe(&usage(Some(i64::MAX)), Instant::now())
+        .observe(&mut usage(Some(i64::MAX)), Instant::now())
         .unwrap();
     assert!(
         normalizer
-            .observe(&usage(Some(i64::MAX)), Instant::now())
+            .observe(&mut usage(Some(i64::MAX)), Instant::now())
             .is_err()
     );
 }
@@ -856,10 +1006,12 @@ fn an_unavailable_cache_write_count_is_omitted() {
     let vendor = |samples: &[Option<i64>]| {
         let mut normalizer = TurnNormalizer::new(false);
         for sample in samples {
-            normalizer.observe(&usage(*sample), Instant::now()).unwrap();
+            normalizer
+                .observe(&mut usage(*sample), Instant::now())
+                .unwrap();
         }
         let Step::Terminal { terminal, .. } = normalizer
-            .observe(&completed("completed"), Instant::now())
+            .observe(&mut completed("completed"), Instant::now())
             .unwrap()
         else {
             panic!("a terminal");
@@ -907,7 +1059,7 @@ fn denials(observations: &[Observation]) -> Vec<(DenialKind, String, String)> {
         .collect()
 }
 
-fn observed(normalizer: &mut TurnNormalizer, notification: &Notification) -> Vec<Observation> {
+fn observed(normalizer: &mut TurnNormalizer, notification: &mut Notification) -> Vec<Observation> {
     match normalizer.observe(notification, Instant::now()).unwrap() {
         Step::Observations(observations) => observations,
         Step::Terminal { .. } | Step::Activity => Vec::new(),
@@ -921,11 +1073,11 @@ fn observed(normalizer: &mut TurnNormalizer, notification: &Notification) -> Vec
 fn a_declined_item_is_a_denial() {
     let reason = "denied by the vendor's permission policy".to_owned();
     let mut normalizer = TurnNormalizer::new(false);
-    let command = item(
+    let mut command = item(
         "item/completed",
         &tool_item("commandExecution", "c1", "declined"),
     );
-    let observations = observed(&mut normalizer, &command);
+    let observations = observed(&mut normalizer, &mut command);
     assert_eq!(
         denials(&observations),
         [(
@@ -938,19 +1090,19 @@ fn a_declined_item_is_a_denial() {
         o, Observation::Progress(marks) if marks.tools_ended == ["c1".to_owned()]
     )));
     assert!(
-        denials(&observed(&mut normalizer, &command)).is_empty(),
+        denials(&observed(&mut normalizer, &mut command)).is_empty(),
         "once per item"
     );
-    let file = item("item/completed", &tool_item("fileChange", "f1", "declined"));
+    let mut file = item("item/completed", &tool_item("fileChange", "f1", "declined"));
     assert_eq!(
-        denials(&observed(&mut normalizer, &file)),
+        denials(&observed(&mut normalizer, &mut file)),
         [(DenialKind::FileWrite, "/w/a.txt".to_owned(), reason)]
     );
-    let failed = item(
+    let mut failed = item(
         "item/completed",
         &tool_item("commandExecution", "c2", "failed"),
     );
-    assert!(denials(&observed(&mut normalizer, &failed)).is_empty());
+    assert!(denials(&observed(&mut normalizer, &mut failed)).is_empty());
 
     let mut ours = TurnNormalizer::new(false);
     ours.ledger()
@@ -966,7 +1118,7 @@ fn a_declined_item_is_a_denial() {
         )
         .unwrap();
     assert!(
-        denials(&observed(&mut ours, &command)).is_empty(),
+        denials(&observed(&mut ours, &mut command)).is_empty(),
         "VIA's own decline is reported as vendor.request_declined only"
     );
 }
@@ -982,16 +1134,16 @@ fn first_turn() -> TurnNumber {
 #[test]
 fn an_open_sleep_is_an_open_tool() {
     let mut normalizer = TurnNormalizer::new(false);
-    let sleep = item("item/started", &tool_item("sleep", "s1", ""));
+    let mut sleep = item("item/started", &tool_item("sleep", "s1", ""));
     normalizer.ledger().track(first_turn(), &sleep).unwrap();
-    let started = observed(&mut normalizer, &sleep);
+    let started = observed(&mut normalizer, &mut sleep);
     assert!(started.iter().any(|o| matches!(
         o,
         Observation::Progress(marks)
             if marks.tools_started == [("s1".to_owned(), "sleep".to_owned())]
     )));
     let Step::Terminal { terminal, .. } = normalizer
-        .observe(&completed("interrupted"), Instant::now())
+        .observe(&mut completed("interrupted"), Instant::now())
         .unwrap()
     else {
         panic!("a terminal");
@@ -1020,23 +1172,23 @@ fn an_open_sleep_is_an_open_tool() {
 fn id_tracking_overflows_explicitly() {
     let mut denied = TurnNormalizer::new(false);
     for n in 0..1024 {
-        let declined = item(
+        let mut declined = item(
             "item/completed",
             &tool_item("commandExecution", &format!("c{n}"), "declined"),
         );
-        assert_eq!(denials(&observed(&mut denied, &declined)).len(), 1);
+        assert_eq!(denials(&observed(&mut denied, &mut declined)).len(), 1);
     }
-    let next = item(
+    let mut next = item(
         "item/completed",
         &tool_item("commandExecution", "c1024", "declined"),
     );
     assert_eq!(
-        denied.observe(&next, Instant::now()).unwrap_err(),
+        denied.observe(&mut next, Instant::now()).unwrap_err(),
         NormalizeError::Overflow
     );
     assert_eq!(
         denied
-            .observe(&completed("completed"), Instant::now())
+            .observe(&mut completed("completed"), Instant::now())
             .unwrap_err(),
         NormalizeError::Overflow,
         "overflowed for good"
@@ -1769,4 +1921,126 @@ async fn a_paired_reply_under_a_failed_generation() {
             "accepted {accepted}: another end"
         );
     }
+}
+
+/// via-25f: a launch on a SQLite home without Codex's `state_5.sqlite`
+/// (its first) takes the 300 s handshake bound, since Codex indexes the
+/// user's whole session history before it answers `initialize` (55 s
+/// live); once the home holds it, the 60 s bound.
+#[test]
+fn the_first_launch_on_a_home_takes_the_long_handshake_bound() {
+    use via_routes::codex::{HandshakeBound, SERVER_FIRST_HANDSHAKE, SERVER_HANDSHAKE};
+    let home = tempfile::tempdir().unwrap();
+    let bound = super::driver::handshake_bound(home.path());
+    assert_eq!(bound, HandshakeBound::First);
+    assert_eq!(bound.duration(), SERVER_FIRST_HANDSHAKE);
+    assert_eq!(SERVER_FIRST_HANDSHAKE, std::time::Duration::from_secs(300));
+    // Codex's index exists before its backfill completes: still cold.
+    std::fs::write(home.path().join("state_5.sqlite"), b"").unwrap();
+    assert_eq!(
+        super::driver::handshake_bound(home.path()),
+        HandshakeBound::First
+    );
+    // VIA's marker, written after a successful handshake: warm.
+    super::driver::mark_initialized(home.path());
+    let marker = std::fs::metadata(home.path().join(".via-initialized")).unwrap();
+    assert_eq!(
+        std::os::unix::fs::PermissionsExt::mode(&marker.permissions()) & 0o777,
+        0o600
+    );
+    let bound = super::driver::handshake_bound(home.path());
+    assert_eq!(bound, HandshakeBound::Warm);
+    assert_eq!(bound.duration(), SERVER_HANDSHAKE);
+    assert_eq!(SERVER_HANDSHAKE, std::time::Duration::from_secs(60));
+}
+
+/// The child's selector for [`codex_normalize_peak_within_allowance`].
+#[cfg(target_os = "linux")]
+const NORMALIZE_PEAK: &str = "VIA_NORMALIZE_PEAK_CHILD";
+
+/// A `/proc/self/status` field in bytes.
+#[cfg(target_os = "linux")]
+fn proc_status(field: &str) -> u64 {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    let kib: u64 = status
+        .lines()
+        .find_map(|line| line.strip_prefix(field))
+        .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse().ok())
+        .unwrap();
+    kib * 1024
+}
+
+/// Review cfix-1 #2 (X0 item 9.2): a maximal escaped `final_answer`
+/// (8 MiB line, one `\n` escape) decoded and normalized in a fresh child,
+/// its pieces and decoded message held as the consumer holds them under
+/// back-pressure. The peak RSS above the RSS before the decode is within
+/// `DECODE_ALLOWANCE`, two maximal messages (serde's unescape scratch and
+/// the owned text) plus 65,536 nodes at 64 B: the text moves into its
+/// pieces, so normalization adds no second copy. RSS is an estimate (256
+/// KiB counter granularity), as in `codex_decode_peak_within_allowance`.
+#[cfg(target_os = "linux")]
+#[test]
+#[expect(
+    clippy::print_stdout,
+    reason = "the child reports its measure; the parent records it"
+)]
+fn codex_normalize_peak_within_allowance() {
+    use via_routes::codex::MESSAGE_BYTES;
+    const ALLOWANCE: u64 = 2 * MESSAGE_BYTES as u64 + 65_536 * 64;
+    if std::env::var_os(NORMALIZE_PEAK).is_some() {
+        let template = r#"{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"m","text":"\nFILL","phase":"final_answer"},"threadId":"t","turnId":"u","completedAtMs":1}}"#;
+        let room = MESSAGE_BYTES - 1 - (template.len() - "FILL".len());
+        let line = template.replace("FILL", &"x".repeat(room));
+        std::fs::write("/proc/self/clear_refs", "5").unwrap();
+        let before = proc_status("VmRSS:");
+        let Incoming::Notification(mut notification) = decode(line.as_bytes()).unwrap() else {
+            panic!("a notification");
+        };
+        // The decode's own peak, then the normalization's on top of it.
+        let decoded = proc_status("VmHWM:").saturating_sub(before);
+        let mut normalizer = TurnNormalizer::new(false);
+        let step = normalizer
+            .observe(&mut notification, Instant::now())
+            .unwrap();
+        let peak = proc_status("VmHWM:").saturating_sub(before);
+        let Step::Observations(pieces) = &step else {
+            panic!("final text pieces");
+        };
+        let text: usize = pieces.iter().filter_map(final_text).map(str::len).sum();
+        assert_eq!(text, room + 1, "the whole text, its newline included");
+        drop((notification, step));
+        println!("decoded {decoded}");
+        println!("measured {peak}");
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "codex::tests::codex_normalize_peak_within_allowance",
+            "--nocapture",
+        ])
+        .env(NORMALIZE_PEAK, "1")
+        // glibc: a fixed mmap threshold, as the decode measure sets it.
+        .env("MALLOC_MMAP_THRESHOLD_", "131072")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let decoded = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("decoded "))
+        .unwrap_or_else(|| panic!("{stdout}"));
+    println!("decode peak, escaped maximal final_answer: {decoded} B");
+    let peak: u64 = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("measured "))
+        .unwrap_or_else(|| panic!("{stdout}"))
+        .parse()
+        .unwrap();
+    println!("decode and normalize peak: {peak} B against {ALLOWANCE} B");
+    assert!(peak <= ALLOWANCE, "{peak} B over {ALLOWANCE} B");
 }

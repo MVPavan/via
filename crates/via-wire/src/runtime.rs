@@ -1,7 +1,7 @@
 use thiserror::Error;
 use tokio::sync::watch;
 
-use super::{Deadline, PrivateProcessSpec, WireCleanup, WireFailure};
+use super::{Deadline, InboundBounds, PrivateProcessSpec, WireCleanup, WireFailure};
 use crate::connection::{self, Stragglers, Waits, WireConnection, cancelled};
 use via_host::{AcquireFailure, AcquiredProcess, CleanupEvidence, Host, LaunchPipes};
 use via_store::{BlobTasks, EvidenceRoot, RuntimeResources};
@@ -21,6 +21,8 @@ pub struct WireSignals {
     pub wake: watch::Receiver<u64>,
     /// Host's pre-ARM gate (design §2 rule 1): true stops the launch.
     pub gate: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    /// The connection's inbound message and staging bounds (runtime §8).
+    pub inbound: InboundBounds,
 }
 
 /// Deployment paths for the sole Host anchor service.
@@ -359,6 +361,7 @@ async fn open(
         force: mut cancel,
         wake,
         gate,
+        inbound,
     } = signals;
     let launch = LaunchPipes::default();
     // The gate is checked inside Host just before ARM: set by then,
@@ -415,7 +418,7 @@ async fn open(
         control,
         exits,
         (folder, tasks),
-        waits,
+        (waits, inbound),
         stragglers,
     ))
 }

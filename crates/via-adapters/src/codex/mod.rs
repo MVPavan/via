@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use via_routes::RouteRuntime;
 use via_routes::codex::{ServerId, Servers};
 
-use crate::config::BootstrapEnv;
+use crate::config::{BootstrapEnv, CodexSettings};
 use crate::harness::Harness;
 use crate::instance::InstanceCache;
 use crate::plan::{
@@ -58,6 +58,8 @@ pub(crate) struct CodexAdapter {
     instances: Arc<InstanceCache>,
     /// The daemon's bootstrap environment, which the recipe filters.
     env: BootstrapEnv,
+    /// Codex's `daemon.json` settings (`harnesses.codex`).
+    settings: CodexSettings,
     /// The shared-server registry (x.3.2 X0 item 2).
     servers: Arc<Servers>,
     /// Each server key's catalog, whole, as its live instance's
@@ -85,13 +87,14 @@ impl CodexAdapter {
     pub(crate) fn new(
         binary: PathBuf,
         instances: Arc<InstanceCache>,
-        env: &BootstrapEnv,
+        (env, settings): (&BootstrapEnv, CodexSettings),
         runtime: Arc<RouteRuntime>,
     ) -> Self {
         Self {
             binary,
             instances,
             env: env.clone(),
+            settings,
             servers: Servers::new(runtime, normalize::DECLINES),
             catalogs: Mutex::default(),
         }
@@ -125,7 +128,12 @@ impl CodexAdapter {
 
     /// The launch recipe of a server for `requested`'s inherited settings.
     fn recipe(&self, requested: Inherit) -> ServerRecipe {
-        ServerRecipe::new(&self.binary, requested, &self.env, &self.vendor_home())
+        ServerRecipe::new(
+            &self.binary,
+            (requested, self.settings),
+            &self.env,
+            &self.vendor_home(),
+        )
     }
 
     /// The server key of `requested`'s recipe: what equal sessions share.

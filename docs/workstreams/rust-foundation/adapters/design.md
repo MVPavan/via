@@ -1227,7 +1227,8 @@ Harness given with an uncatalogued model → the vendor decides after acceptance
 |---|---|---|
 | Environment values (`HOME`, `PATH`, `LANG`, `USER`, `LOGNAME`, `XDG_RUNTIME_DIR`) | the startup environment forwarded by auto-start (AR1) | read once; each adapter copies only its allow-list |
 | `harnesses.<name>.binary` | optional `daemon.json`, absolute path | the default is a `PATH` lookup; also used for vendor replay (§8) and user pinning |
-| `harnesses.<name>.inherit.{hooks, mcp_servers, plugins, skills, agents, instruction_files}` | optional `daemon.json`, booleans | OD2 switches. Default (**owner-approved**): hooks and MCP servers `false`, the rest `true`. Read at daemon start (the S1 rule). A change applies to sessions spawned after the next daemon start; each session freezes its settings. |
+| `harnesses.<name>.inherit.{hooks, mcp_servers, plugins, skills, agents, instruction_files}` | optional `daemon.json`, booleans | OD2 switches. Default (**owner-approved**): hooks and MCP servers `false`, the rest `true`; Codex's every category `true` (owner 2026-10-05: VIA disables nothing in Codex but memories for the first release). Read at daemon start (the S1 rule). A change applies to sessions spawned after the next daemon start; each session freezes its settings. |
+| `harnesses.codex.memories` | optional `daemon.json`, boolean | Codex only (owner, 2026-10-05): the default `false` launches every Codex server with `--disable memories`; `true` omits it, so Codex's own memories default applies (vendor packet §4). Part of the server key. Read at daemon start like the rest. |
 | `checked` versions, capabilities, reserved keys, recipe | compiled into each adapter | never user config |
 | Fake fixture | `VIA_FAKE_AGENT_BINARY`, `VIA_FAKE_SCENARIO`, `VIA_FAKE_SYNC_DIR` | runtime §11.1, unchanged |
 

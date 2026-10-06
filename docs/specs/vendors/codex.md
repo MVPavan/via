@@ -93,10 +93,17 @@ with; an upgrade takes effect at the next launch. The bound, model,
 instructions and session cwd are thread/turn settings, not key components.
 Never attach to a pre-existing vendor server. Reserve ownership before launch
 and publish the connection only after a successful handshake; concurrent
-equal-key acquisition shares that result. The first `initialize` took 38 s on
-a fresh SQLite home (single re-probe observation), so the handshake has its
-own 60 s deadline from spawn, independent of any turn; a waiting turn's own
-wall, stop or force ends only its wait.
+equal-key acquisition shares that result. The handshake has its own
+deadline from spawn, independent of any turn; a waiting turn's own wall,
+stop or force ends only its wait. It is 60 s, or 300 s for a launch whose
+SQLite home holds no `.via-initialized` marker yet (via-25f): on a fresh
+home Codex indexes the user's whole `~/.codex/sessions` before it answers
+`initialize`. That took 38 s at the 2026-09-30 re-probe and 55 s live on
+0.160.0 (3,973 session files, 4.17 GB read; a warm start answered in
+0.14 s), and it grows with the history. VIA writes the empty marker (0600)
+after a server's first successful handshake on the home. Codex's own
+`state_5.sqlite` is no signal: it exists before the backfill completes, so
+an interrupted first start would otherwise be retried on the short bound.
 
 Each session has one lease and a registered thread ID. One shared server holds
 one of the runtime's harness-process slots (runtime §8) for its life; a turn on a live
@@ -261,24 +268,61 @@ the server key. This is a candidate integration policy, not a claim that
 C6 tested tools, authentication refresh, macOS or installed plugins. Never
 silently broaden the allow-list after failure.
 
+Every server VIA starts runs `codex app-server --disable memories`,
+whatever the session requests (via-7r9, checked 2026-10-05 on 0.160.0),
+unless `daemon.json` sets `{"harnesses":{"codex":{"memories":true}}}` (runtime §8,
+owner 2026-10-05; default `false`), which omits the switch so Codex's own
+default and the user's `config.toml` apply. The setting is read at daemon
+start and applies to servers launched after it; the argv is in the
+server key, so servers under the two settings are never shared.
+`--disable <FEATURE>` is `-c features.<name>=false` (`codex app-server
+--help`), so it overrides the user's `config.toml`. Without it, Codex's
+memories feature ran inside VIA-started servers: stage-1 extraction, then
+a "Memory Writing Agent: Phase 2 (Consolidation)" thread with its own
+model, `DangerFullAccess` and approval `never`, which edited the user's
+`~/.codex/memories` outside any VIA turn, bound or accounting. No other
+feature in `codex features list` was seen starting an agent or thread on
+its own in the live runs.
+
 Inherited configuration (C2 §6.2; owner OD2), from the 2026-09-30 re-probe.
-With hooks off, launch with `--disable hooks` (verified). MCP suppression
-through a `-c` override is unverified. Both switches enter `config_hash`.
+For the first release VIA disables nothing in Codex but memories (owner,
+2026-10-05: "use whatever existing harness and don't disable anything"), so
+Codex's default request is every category on and no switch is applied for
+it (runtime §8). With hooks requested off, launch with `--disable hooks`
+(verified). Effective states follow C2 §6.2 (owner, 2026-10-06): with no
+switch, a category is `on` (the user's configuration applies, whatever it
+contains, `[features] hooks=false` included) where the live evidence below
+shows Codex loads it, else `unknown`. An off VIA cannot apply is `unknown`
+and warns: MCP servers have no switch (`--disable apps` stops only
+`codex_apps`, and `-c mcp_servers={}` merges into the user's table and
+removes nothing; the earlier `--disable apps` for MCP off, via-4gl, was
+removed), nor do instruction files. The evidence was recorded on 0.159.2
+(`checked`) and, for MCP servers, again on 0.160.0; on any version outside
+`checked` (0.160.0 included) the same states are reported with
+`vendor_version_untested` (C2 §6.2, §5). Revisit: a later version may
+add disabling layers (owner, 2026-10-05). Every switch enters
+`config_hash`.
 
 | Category (default) | Switch and evidence | Effective state with the default |
 |---|---|---|
-| hooks (off) | `--disable hooks`: **verified** (the owner's hooks ran without it) | `off` |
-| MCP servers (off) | `~/.codex` config; a `-c` override is **unverified**; inventory via `mcpServerStatus/list` (schema, **unverified**) | `unknown`, warns |
-| plugins (on) | plugin support exists (schema); switch **unverified** | `unknown`, no switch applied, warns |
-| skills (on) | **unverified** | `unknown`, no switch applied, warns |
-| agents (on) | **unverified** | `unknown`, no switch applied, warns |
-| instruction files (on) | AGENTS.md; switch **unverified**; `thread/start` `instructionSources` reported the loaded AGENTS.md paths (0.159.2), completeness **unverified** | `unknown`, no switch applied, warns |
+| hooks (on) | on: no switch; the owner's hooks ran with none (2026-09-30 re-probe, `docs/workstreams/rust-foundation/adapters/reprobe-codex.md` item 5); off: `--disable hooks` (**verified**) | `on` |
+| MCP servers (on) | on: no switch; the user's configured servers and `codex_apps` started with none (2026-09-30 re-probe; checked again 2026-10-05 on 0.160.0, `mcpServer/startupStatus/updated`); off: no switch, `unknown`; inventory via `mcpServerStatus/list` (schema, **unverified**) | `on` |
+| plugins (on) | plugin support exists (schema); no live evidence of loading; switch **unverified** | `unknown`, warns |
+| skills (on) | no live evidence; switch **unverified** | `unknown`, warns |
+| agents (on) | no live evidence; switch **unverified** | `unknown`, warns |
+| instruction files (on) | on: no switch; `thread/start` `instructionSources` listed the loaded AGENTS.md paths (0.159.2 re-probe; completeness **unverified**); off: no switch, `unknown` | `on` |
+
+Live round 2 checks (Codex): whether a VIA-started server loads the
+user's plugins, skills and agents with no switch, each recorded with its
+evidence so the category can be declared `on`, or stays `unknown`.
 
 Inventory sources are `configWarning` and the `thread/start` response's
 `instructionSources`, which reported the loaded AGENTS.md paths in the
 0.159.2 re-probe (completeness unverified). The fixtures qualified no other
-inventory; `mcpServerStatus/list` stays schema-only. Qualify the MCP switch in `via-5lr.3.4`, or declare it not
-switchable.
+inventory; `mcpServerStatus/list` stays schema-only. Switching off the
+user's configured MCP servers is deferred past the first release (owner,
+2026-10-05); it would need each server's name from the configuration
+layers (`-c mcp_servers.<name>.enabled=false`).
 
 ## 5. Correlation, events and bounds
 
@@ -286,7 +330,7 @@ Each client response routes by request ID; each known notification routes
 by exact `threadId` and, where present, `turnId`. Server requests additionally
 carry their own request IDs. Install registrations before releasing a
 thread response to its driver. Bound pre-registration buffering by the
-existing 1,024-message/4 MiB connection staging limit. Lookup includes retained
+existing 1,024-message/12 MiB connection staging limit. Lookup includes retained
 correlation tombstones before classifying a thread or turn as unknown.
 Truly unknown thread IDs are connection diagnostics; genuinely unseen turn
 IDs on known threads may become C2 session-level observations. A previously
@@ -354,8 +398,11 @@ other than `never`; under `never` any such request is declined like the
 others (qualify in `via-5lr.3.3`). The `guardianv2.thread_context` removal
 is unused.
 
-Use runtime §8 limits unchanged: 1 MiB inbound vendor message including LF,
-64 KiB pipe buffers, 1,024 messages/4 MiB per connection, C2 1024 observations/4 MiB per
+Use runtime §8 limits, with the Codex inbound bounds (via-5lr.3.5,
+2026-10-05; derivation in the
+[Codex server design](../../workstreams/rust-foundation/adapters/codex-server.md)
+item 9.3): 8 MiB inbound vendor message including LF, 64 KiB pipe buffers,
+1,024 messages/12 MiB per connection, C2 1024 observations/4 MiB per
 session, 256 KiB observation payload, 1 MiB envelope, JSON depth 64 and
 65,536 nodes. Final text is sent as C2 `final_text` pieces of at most
 256 KiB encoded; unknown notifications are activity only.
@@ -363,17 +410,23 @@ No silent dropped lifecycle events. Large prompts are encoded using the
 runtime's bounded streaming outbound path. Codex echoes the prompt whole in
 the user message's `item/started` and `item/completed` notifications, one
 inbound line each (checked in every 0.159.2 fixture: the line carries the
-prompt once, no cwd, and at most 340 other bytes with its LF), and an
-inbound line over 1 MiB fails the shared connection. So the route refuses,
+prompt once, no cwd, and at most 340 other bytes with its LF). An inbound
+line over the cap is skipped to its LF, its head kept as the server's
+evidence, and fails the shared connection, every turn on it, `protocol`:
+for the first release it is never attributed to a turn (owner
+2026-10-05; `codex-server.md` item 9.3). Revisit post-release, a streaming JSON depth/string tracker in Wire can attribute the line to its turn (owner 2026-10-05). The route refuses,
 before any receipt, a prompt whose JSON encoding plus the cwd's exceeds
 1,040,384 bytes (1 MiB less 8 KiB) as `invalid_params` naming `prompt`
 (C1 §4; via-5lr.6, x.3.2 X5). The cwd is counted, as `opencode-serve`
-counts it, for headroom.
+counts it, for headroom. That limit was set against the earlier 1 MiB
+cap and is kept: raising it is a C1 change. A Codex command's output is
+cut to about 1 MiB raw, and its escaped `item/completed` line can pass
+1 MiB (live: 1,213,365 B), hence the 8 MiB cap.
 
 One blocked session normalizer must not stop dispatch to other threads or
 the decline/control paths. Partition the existing Route message staging
-into per-thread ingress lanes, each capped at 16 messages/1 MiB within the
-unchanged 1,024-message/4 MiB connection aggregate; this adds no buffer tier.
+into per-thread ingress lanes, each capped at 16 messages/8 MiB + 5 KiB (one
+maximal message and its markers) within the 1,024-message/12 MiB connection aggregate; this adds no buffer tier.
 These ingress lanes precede the existing C2 observation channel. The shared
 receiver uses nonblocking ingress admission: **the first full ingress-lane
 result immediately quarantines that thread's data lane**, without waiting
@@ -436,7 +489,10 @@ observation budget. No lease cap bounds active turns on one server below
 the runtime's unresolved-turn bound. The RSS measurement uses one server
 with 32 leased sessions and 32 concurrent active turns, applies runtime
 §8's relative method and growth assertion with these holders added, and
-qualifies only up to 32 concurrent active turns on one server; several
+qualifies only up to 32 concurrent active turns on one server. Its limit,
+1,028 MiB, is the owner-accepted theoretical bound (2026-10-05); the
+measured peak less baseline is about 178 MiB (musl) and 188 MiB (glibc),
+and 32 simultaneous maximal 8 MiB decodes are not qualified; several
 loaded servers, up to the harness-process limit, are an extrapolation. Do not preallocate 4 MiB for every
 idle lease or assume S1's RSS result covers this extension. A failure
 requires design review, not silent ceiling growth.

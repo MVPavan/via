@@ -112,8 +112,13 @@ use signals::Signals;
 mod input;
 mod signals;
 
-/// Longest line, read or written, in bytes (newline excluded).
+/// Longest line read, longest expected value and longest `--version`
+/// output, in bytes (newline excluded).
 const MAX_LINE: usize = 1024 * 1024;
+/// Longest emitted line, in bytes (newline excluded): past any route's
+/// inbound cap (Codex's is 8 MiB), so a fixture can cross it, and within
+/// [`MAX_FIXTURE`], so a fixture can hold one.
+const MAX_EMIT: usize = 12 * 1024 * 1024;
 const MAX_STEPS: usize = 10_000;
 /// Largest fixture file, checked before it is read.
 const MAX_FIXTURE: u64 = 16 * 1024 * 1024;
@@ -392,7 +397,7 @@ fn replay(
         let version = fixture
             .version
             .ok_or("fixture has no version for --version")?;
-        return write_line(&version).map(|()| 0);
+        return write_line(&version, MAX_LINE).map(|()| 0);
     }
     // Handlers are installed before the first step so an early signal is held
     // for its step instead of killing the process.
@@ -727,10 +732,10 @@ fn run_step(
             Ok(arrived)
         }
         Step::Emit { line } => {
-            let mut budget = MAX_LINE;
+            let mut budget = MAX_EMIT;
             let line = substitute(&line, captures, &mut budget)?;
             let completed = Instant::now();
-            write_line(&line)?;
+            write_line(&line, MAX_EMIT)?;
             Ok(completed)
         }
         Step::Delay { ms } => {
@@ -785,7 +790,7 @@ fn substitute(text: &str, captures: &Captures, budget: &mut usize) -> Result<Str
     let mut push = |piece: &str| {
         *budget = budget
             .checked_sub(piece.len())
-            .ok_or_else(|| format!("substitution exceeds {MAX_LINE} bytes"))?;
+            .ok_or_else(|| "substitution exceeds its byte budget".to_owned())?;
         out.push_str(piece);
         Ok::<(), String>(())
     };
@@ -848,10 +853,10 @@ fn substitute_value(
     })
 }
 
-/// Writes one line of at most [`MAX_LINE`] bytes; a failed write fails the run.
-fn write_line(line: &str) -> Result<(), String> {
-    if line.len() > MAX_LINE {
-        return Err(format!("output line exceeds {MAX_LINE} bytes"));
+/// Writes one line of at most `max` bytes; a failed write fails the run.
+fn write_line(line: &str, max: usize) -> Result<(), String> {
+    if line.len() > max {
+        return Err(format!("output line exceeds {max} bytes"));
     }
     let mut out = io::stdout().lock();
     out.write_all(line.as_bytes())

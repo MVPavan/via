@@ -259,6 +259,13 @@ pub struct Connection {
     end: watch::Sender<Option<ConnectionEnd>>,
     /// The idle retirement began: the end of stdout is not a failure.
     retiring: AtomicBool,
+    /// The daemon is shutting down: Host's stop ending the transport is
+    /// expected, so it writes no `via.log` line.
+    shutting_down: AtomicBool,
+    /// The first failure latched after the shutdown began: taken at the
+    /// latch, so a failure that preceded the fence still warns (review
+    /// cfix-crit #3).
+    failed_in_shutdown: AtomicBool,
     /// A driver posted its close (x.3.2 X3 §5.1): the connection task
     /// applies it between two routing operations.
     closes: Notify,
@@ -460,6 +467,8 @@ impl Connection {
             failure: watch::Sender::new(None),
             end: watch::Sender::new(None),
             retiring: AtomicBool::new(false),
+            shutting_down: AtomicBool::new(false),
+            failed_in_shutdown: AtomicBool::new(false),
             closes: Notify::new(),
             epoch: watch::Sender::new(0),
         })
@@ -568,11 +577,20 @@ impl Connection {
     /// Latches `cause` unless a cause is latched already (then it is only
     /// counted), sealing Wire's admission in the same step (item 13.1).
     pub fn fail(&self, cause: ConnectionFailure) {
+        self.latch(cause);
+    }
+
+    /// [`Self::fail`]: whether `cause` latched, as the first.
+    fn latch(&self, cause: ConnectionFailure) -> bool {
         let latched = self.failure.send_if_modified(|failure| {
             if failure.is_some() {
                 return false;
             }
             *failure = Some(cause);
+            self.failed_in_shutdown.store(
+                self.shutting_down.load(Ordering::Acquire),
+                Ordering::Release,
+            );
             self.stdio.seal();
             true
         });
@@ -580,12 +598,20 @@ impl Connection {
             let mut state = self.state();
             state.counts.later_failures = state.counts.later_failures.saturating_add(1);
         }
+        latched
     }
 
     /// Marks the idle retirement begun: from now the end of stdout ends
     /// the connection as retired.
     pub fn retire(&self) {
         self.retiring.store(true, Ordering::Release);
+    }
+
+    /// Marks the daemon's shutdown begun (the registry's fence): a lost
+    /// transport or server from now on is Host's stop, not news for
+    /// `via.log`.
+    pub(super) fn shutting_down(&self) {
+        self.shutting_down.store(true, Ordering::Release);
     }
 
     /// Links a turn to the connection's server (runtime §6).
@@ -1113,6 +1139,9 @@ impl Connection {
             state.seq = state.seq.saturating_add(1);
             state.seq
         };
+        if let Some(skipped) = message.skipped() {
+            return Err(self.skipped(&skipped.head));
+        }
         match peek(message.bytes()) {
             Ok(Routing::Response(id)) => {
                 let paired = match decode(message.bytes()) {
@@ -1157,6 +1186,16 @@ impl Connection {
                 Err(ConnectionFailure::Protocol)
             }
         }
+    }
+
+    /// A line over the cap, skipped by Wire to its LF: unattributable
+    /// whatever its bytes name (owner 2026-10-05, review cfix-3), so its
+    /// head is the server's evidence and the connection fails `protocol`.
+    /// Post-release, a streaming JSON depth and string tracker in Wire can
+    /// attribute it to its turn.
+    fn skipped(&self, head: &[u8]) -> ConnectionFailure {
+        self.keep_evidence(head);
+        ConnectionFailure::Protocol
     }
 
     /// Keeps the first unattributable message for the server folder.
@@ -1251,7 +1290,7 @@ impl Connection {
     /// lanes, then the disposition to every lane and waiter.
     async fn fail_sequence(
         &self,
-        cause: ConnectionFailure,
+        (cause, at): (ConnectionFailure, FailureAt),
         messages: &mut WireMessages,
     ) -> ConnectionLoss {
         // Test builds: a seam between the latch and the owned sequence,
@@ -1270,24 +1309,37 @@ impl Connection {
             mode: CloseMode::Force,
             deadline: loss_deadline,
         });
-        let drain = async {
+        let mut drained = None;
+        let drain_and_keep = async {
             // Up to the boundary: a later cause is counted by `fail`; the
             // prefix still reaches its lanes.
             while let Admitted::Message(message) = messages.drain_admitted().await {
                 if let Err(later) = self.demux(message) {
+                    drained.get_or_insert(later);
                     self.fail(later);
                 }
             }
-        };
-        let evidence = self.state().evidence.take();
-        let keep = async {
+            // After the drain, so a message it found unattributable is
+            // kept too (review cfix-crit #2).
+            let evidence = self.state().evidence.take();
             if let Some(bytes) = evidence {
                 self.stdio
                     .keep_undecoded(&bytes, "the shared connection's message")
                     .await;
             }
         };
-        let (report, (), ()) = tokio::join!(close, drain, keep);
+        let (report, ()) = tokio::join!(close, drain_and_keep);
+        // Wire's stdout reader failing comes after every admitted message:
+        // a failure the drain found precedes it in stdout's order, and the
+        // first in that order is the connection's (review cfix-crit #2). A
+        // writer failure has no place in that order: first-wins.
+        let cause = match (at, drained) {
+            (FailureAt::StdoutEnd, Some(earlier)) => {
+                self.failure.send_replace(Some(earlier));
+                earlier
+            }
+            (FailureAt::StdoutEnd | FailureAt::Elsewhere, _) => cause,
+        };
         let loss = disposition(cause, &report);
         self.finish(ConnectionEnd::Failed(loss), LaneEnd::Lost(loss));
         loss
@@ -1347,6 +1399,16 @@ impl Connection {
             .send_replace(Some(ConnectionEnd::Failed(abnormal_loss())));
         drop(records);
         self.bump();
+        // The task that would have written the `via.log` line is gone:
+        // this end writes it, even after the shutdown fence (a panic is
+        // never Host's stop).
+        let undecoded = self.stdio.take_undecoded();
+        tracing::warn!(
+            server = %self.server,
+            cause = ?abnormal_loss().cause,
+            undecoded = undecoded.as_deref().unwrap_or("none"),
+            "shared server connection task ended abnormally"
+        );
     }
 }
 
@@ -1401,6 +1463,38 @@ fn disposition(cause: ConnectionFailure, report: &WireCloseReport) -> Connection
     }
 }
 
+/// The daemon-level `via.log` line for a failed shared connection
+/// (codex-server.md item 5; runtime §6.2): the server ID, the cause and
+/// the note naming the server folder's `undecoded.bin`, or why it was not
+/// saved. Only VIA's own text: never a vendor byte. Read after the reader
+/// finished, so a save it began is noted. A transport or server lost that
+/// latched after the daemon's shutdown began is Host's stop: no line.
+fn log_failure(connection: &Connection, cause: LossCause) {
+    if connection.failed_in_shutdown.load(Ordering::Acquire)
+        && matches!(cause, LossCause::TransportLost | LossCause::ServerLost)
+    {
+        return;
+    }
+    let undecoded = connection.stdio.take_undecoded();
+    tracing::warn!(
+        server = %connection.server,
+        ?cause,
+        undecoded = undecoded.as_deref().unwrap_or("none"),
+        "shared server connection failed"
+    );
+}
+
+/// Where a connection's first failure stands in stdout's message order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FailureAt {
+    /// Wire's stdout reader failed (overflow, over-cap, read error):
+    /// after every message it admitted.
+    StdoutEnd,
+    /// Anywhere else: Wire's stdin writer, a routed message, a driver's
+    /// request.
+    Elsewhere,
+}
+
 /// The cause a Wire error on the message side latches (item 13.1 table).
 fn wire_failure(error: &WireError) -> ConnectionFailure {
     match error {
@@ -1451,6 +1545,10 @@ pub(super) async fn serve(
     // A cause latched outside this task (exhaustion at a driver's request)
     // wakes it: the seal stops admission, so no message would.
     let mut latched = connection.failure.subscribe();
+    // Where the latched cause stands in stdout's order: after every
+    // admitted message when Wire's reader failed (review cfix-crit #2);
+    // a writer failure (`WireError::Io`) is not in that order (crit2).
+    let mut at = FailureAt::Elsewhere;
     let done = |done: Done| connection.written(&done);
     let cause = {
         let pump = connection.feeder.pump(&done);
@@ -1483,13 +1581,19 @@ pub(super) async fn serve(
                     }
                     Ok(None) if connection.retiring.load(Ordering::Acquire) => break None,
                     Ok(None) => connection.fail(ConnectionFailure::Transport { stdio_end: true }),
-                    Err(error) => connection.fail(wire_failure(&error)),
+                    Err(error) => {
+                        if connection.latch(wire_failure(&error))
+                            && matches!(error, WireError::Message(_))
+                        {
+                            at = FailureAt::StdoutEnd;
+                        }
+                    }
                 },
             }
         }
     };
     let end = if let Some(cause) = cause {
-        ConnectionEnd::Failed(connection.fail_sequence(cause, &mut messages).await)
+        ConnectionEnd::Failed(connection.fail_sequence((cause, at), &mut messages).await)
     } else {
         connection.finish(ConnectionEnd::Retired, LaneEnd::Retired);
         ConnectionEnd::Retired
@@ -1497,5 +1601,8 @@ pub(super) async fn serve(
     messages
         .finish(Deadline::at(Instant::now() + LOSS_EVIDENCE))
         .await;
+    if let ConnectionEnd::Failed(loss) = end {
+        log_failure(&connection, loss.cause);
+    }
     end
 }

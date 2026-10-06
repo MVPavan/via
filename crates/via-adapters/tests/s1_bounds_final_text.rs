@@ -8,7 +8,9 @@
 )]
 
 use serde_json::json;
-use via_adapters::{MAX_OBSERVATION_BYTES, encoded_text_len, final_text_pieces};
+use via_adapters::{
+    MAX_OBSERVATION_BYTES, encoded_text_len, final_text_pieces, final_text_pieces_owned,
+};
 
 /// The observation as encoded on the wire of C2 (`{"type":"final_text",…}`).
 fn encoded_piece(piece: &str) -> usize {
@@ -72,4 +74,23 @@ fn s1_bounds_final_text_piece_fits_256_kib() {
             "{code:#x}"
         );
     }
+}
+
+/// Review cfix-1 #2: the owned cut moves the text into the same pieces the
+/// borrowed cut makes; one piece is the text itself, an empty text none.
+#[test]
+fn s1_bounds_final_text_owned_pieces_match() {
+    let mut text = String::new();
+    while text.len() < 1024 * 1024 + 17 {
+        text.push_str("\u{1}é\"😀a");
+    }
+    let borrowed: Vec<String> = final_text_pieces(&text).map(str::to_owned).collect();
+    assert!(borrowed.len() > 4);
+    assert_eq!(final_text_pieces_owned(text), borrowed);
+    let exact = "a".repeat(MAX_OBSERVATION_BYTES - 31);
+    let address = exact.as_ptr();
+    let pieces = final_text_pieces_owned(exact);
+    assert_eq!(pieces.len(), 1);
+    assert_eq!(pieces[0].as_ptr(), address, "moved, not copied");
+    assert!(final_text_pieces_owned(String::new()).is_empty());
 }

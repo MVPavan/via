@@ -19,7 +19,7 @@ use crate::observation::{
     StopReason, UsageSample, VendorTerminal,
 };
 use crate::plan::VersionStatus;
-use crate::{TurnNumber, VendorTerminalStatus, final_text_pieces};
+use crate::{TurnNumber, VendorTerminalStatus, final_text_pieces_owned};
 
 /// The prefix VIA's own `clientInfo.name` puts on `userAgent`.
 const USER_AGENT_PREFIX: &str = "via/";
@@ -620,7 +620,7 @@ impl TurnNormalizer {
     /// its bounds (then for good).
     pub(crate) fn observe(
         &mut self,
-        notification: &Notification,
+        notification: &mut Notification,
         at: Instant,
     ) -> Result<Step, NormalizeError> {
         if self.overflowed {
@@ -631,14 +631,18 @@ impl TurnNormalizer {
         step
     }
 
-    fn step(&mut self, notification: &Notification, at: Instant) -> Result<Step, NormalizeError> {
+    fn step(
+        &mut self,
+        notification: &mut Notification,
+        at: Instant,
+    ) -> Result<Step, NormalizeError> {
         let progress =
             |marks: ProgressMarks| Step::Observations(vec![Observation::Progress(marks)]);
         Ok(match notification {
             Notification::ItemStarted(event) => {
                 Self::item_started(&event.item).map_or(Step::Activity, progress)
             }
-            Notification::ItemCompleted(event) => self.item_completed(&event.item)?,
+            Notification::ItemCompleted(event) => self.item_completed(&mut event.item)?,
             Notification::AgentMessageDelta(_) | Notification::ReasoningDelta(_) => {
                 progress(ProgressMarks {
                     model: true,
@@ -700,7 +704,10 @@ impl TurnNormalizer {
         })
     }
 
-    fn item_completed(&mut self, item: &Item) -> Result<Step, NormalizeError> {
+    /// A final answer's text is moved out of `item` into its pieces
+    /// (review cfix-1 #2), so the decoded message and its pieces never
+    /// hold the text twice.
+    fn item_completed(&mut self, item: &mut Item) -> Result<Step, NormalizeError> {
         if item.kind.is_tool() {
             let mut observations = vec![Observation::Progress(ProgressMarks {
                 tools_ended: vec![item.id.clone()],
@@ -713,17 +720,19 @@ impl TurnNormalizer {
             );
             return Ok(Step::Observations(observations));
         }
-        let (ItemKind::AgentMessage, Some(FINAL_ANSWER), Some(text)) =
-            (&item.kind, item.phase.as_deref(), item.text.as_deref())
+        let (ItemKind::AgentMessage, Some(FINAL_ANSWER), Some(_)) =
+            (&item.kind, item.phase.as_deref(), item.text.as_ref())
         else {
             return Ok(Step::Activity);
         };
+        let text = item.text.take().unwrap_or_default();
         if self.schema {
-            self.retain(text);
+            self.retain(&text);
         }
         Ok(Step::Observations(
-            final_text_pieces(text)
-                .map(|piece| Observation::FinalText(piece.to_owned()))
+            final_text_pieces_owned(text)
+                .into_iter()
+                .map(Observation::FinalText)
                 .collect(),
         ))
     }

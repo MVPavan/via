@@ -21,10 +21,15 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 # "rt": the Codex server registry's supervisor owns its task set (x.3.2 X3).
 tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+# A shared server's connection failure is one daemon-level `via.log` line
+# (codex-server.md item 5; runtime §6.2).
+tracing = { workspace = true }
 
 [dev-dependencies]
 # The connection's unit tests run over Wire's test pipes (x.3.2 X3).
 tokio = { workspace = true, features = ["io-util", "macros", "rt", "sync", "test-util", "time"] }
+# The connection-failure line's test captures the formatted event.
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

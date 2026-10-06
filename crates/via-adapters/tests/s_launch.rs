@@ -216,6 +216,60 @@ fn refusal_cases() -> Vec<(&'static str, &'static str, HarnessesRule)> {
     ]
 }
 
+/// Owner 2026-10-05: `harnesses.codex.memories` chooses Codex's memories
+/// default, beside its `binary` and `inherit`: false (the default) keeps
+/// `--disable memories`, true omits it.
+#[test]
+fn s_launch_harnesses_codex_memories() {
+    use HarnessesRule::{DuplicateKey, NotBoolean, UnknownKey};
+    let memories = |text: &str| load(text).unwrap().codex().memories;
+    assert!(!AdapterConfig::load(none(), None).unwrap().codex().memories);
+    assert!(!memories(r#"{"codex":{}}"#));
+    assert!(!memories(r#"{"codex":{"memories":false}}"#));
+    assert!(memories(
+        r#"{"codex":{"binary":"/opt/vendor/codex","memories":true}}"#
+    ));
+    assert!(!memories(r#"{"claude":{}}"#));
+    // `memories` is Codex's alone, and a boolean.
+    for (text, key, rule) in [
+        (
+            r#"{"codex":{"memories":"yes"}}"#,
+            "harnesses.codex.memories",
+            NotBoolean,
+        ),
+        (
+            r#"{"codex":{"memories":null}}"#,
+            "harnesses.codex.memories",
+            NotBoolean,
+        ),
+        (
+            r#"{"claude":{"memories":true}}"#,
+            "harnesses.claude.memories",
+            UnknownKey,
+        ),
+        (
+            r#"{"opencode":{"memories":false}}"#,
+            "harnesses.opencode.memories",
+            UnknownKey,
+        ),
+        (
+            r#"{"codex":{"memories":true,"memories":true}}"#,
+            "harnesses.codex.memories",
+            DuplicateKey,
+        ),
+    ] {
+        let expected = HarnessesError {
+            key: key.to_owned(),
+            rule,
+        };
+        assert_eq!(
+            HarnessSettings::parse(&raw(text)).as_ref(),
+            Err(&expected),
+            "{text}"
+        );
+    }
+}
+
 /// Runtime §8, design §5.4: each invalid `harnesses` refuses with its
 /// named error, from `load` and from the pure `HarnessSettings::parse` alike; a
 /// key repeated at any level is refused.
@@ -240,7 +294,8 @@ fn s_launch_harnesses_refusals() {
 }
 
 /// A valid section: the configured binary and per-key `inherit`, with the
-/// OD2 default for every missing key and harness; the fake keeps OD2.
+/// harness's default for every missing key and harness (OD2's, except
+/// Codex's every category on, owner 2026-10-05); the fake keeps OD2.
 #[test]
 fn s_launch_harnesses_valid() {
     use InheritState::{Off, On};
@@ -265,8 +320,17 @@ fn s_launch_harnesses_valid() {
     for (category, state) in expected {
         assert_eq!(inherit.get(category), state, "{category:?}");
     }
+    let default = |name| {
+        if name == "codex" {
+            serde_json::from_value(serde_json::json!({"hooks": "on", "mcp_servers": "on",
+                "plugins": "on", "skills": "on", "agents": "on", "instruction_files": "on"}))
+            .unwrap()
+        } else {
+            Inherit::OD2_DEFAULT
+        }
+    };
     for name in ["codex", "opencode"] {
-        assert_eq!(config.inherit(row(name)), Inherit::OD2_DEFAULT, "{name}");
+        assert_eq!(config.inherit(row(name)), default(name), "{name}");
         let settings = config.harness(HARNESSES.iter().find(|r| r.name == name).unwrap());
         assert_eq!(settings.binary(), None, "{name}");
     }
@@ -275,7 +339,7 @@ fn s_launch_harnesses_valid() {
     let config = AdapterConfig::load(none(), None).unwrap();
     for row in HARNESSES {
         assert_eq!(config.harness(row).binary(), None);
-        assert_eq!(config.inherit(Harness::Vendor(row)), Inherit::OD2_DEFAULT);
+        assert_eq!(config.inherit(Harness::Vendor(row)), default(row.name));
     }
 }
 

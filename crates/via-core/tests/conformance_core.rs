@@ -4744,6 +4744,10 @@ fn codex_sqlite_home_persists_across_restart() {
         let metadata = fs::symlink_metadata(&home).unwrap();
         assert!(metadata.is_dir(), "{}", home.display());
         assert_eq!(metadata.mode() & 0o777, 0o700);
+        // via-25f: the first successful handshake marks the home warm.
+        let marker = fs::symlink_metadata(home.join(".via-initialized")).unwrap();
+        assert!(marker.is_file());
+        assert_eq!(marker.mode() & 0o777, 0o600);
         fs::write(&kept, b"vendor state").unwrap();
         daemon.stop().await;
         (metadata.dev(), metadata.ino())
@@ -4781,14 +4785,24 @@ const FLOOD_LINES: usize = 272;
 #[cfg(feature = "test-failpoints")]
 const FILL_LINES: usize = 5;
 
-/// Maximal lines left in the ingress lanes of blocked consumers: four of
-/// about 1 MiB fill the server's 4 MiB staging.
+/// The Codex route's message cap, LF included (via-5lr.3.5,
+/// `via_routes::codex::MESSAGE_BYTES`).
 #[cfg(feature = "test-failpoints")]
-const STAGED_LINES: usize = 4;
+const CODEX_MESSAGE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The Codex server's staging: 4 MiB plus one maximal message
+/// (`via_routes::codex::INBOUND`).
+#[cfg(feature = "test-failpoints")]
+const CODEX_STAGING_BYTES: u64 = 4 * 1024 * 1024 + CODEX_MESSAGE_BYTES;
+
+/// Maximal lines left in the ingress lanes of blocked consumers: twelve
+/// of about 1 MiB fill the server's 12 MiB staging.
+#[cfg(feature = "test-failpoints")]
+const STAGED_LINES: usize = 12;
 
 /// Maximal lines between two of the fake's gates: the test releases the
 /// next batch once every line before it was taken, so Wire's staging
-/// holds at most one batch (3 MiB of its 4 MiB).
+/// holds at most one batch (3 MiB of its 12 MiB).
 #[cfg(feature = "test-failpoints")]
 const BATCH: usize = 3;
 
@@ -5037,17 +5051,18 @@ fn rss_sampler(
 }
 
 /// X0 item 9.2's computed sum, in bytes, from the table's constants: per
-/// server, staging 4 MiB, correlation 256 KiB, pending replies 64 KiB,
-/// Wire's read buffer 64 KiB and the demux peek 1 MiB; per session, the
-/// observation channel 4 MiB, driver controls 64 KiB and the decode
-/// allowance (1 MiB of strings + 65,536 nodes × 64 B); per active turn,
-/// the dispatched prompt, which on this route is at most the echo cap
-/// (via-5lr.6), not C1's 16 MiB.
+/// server, staging 12 MiB, correlation 256 KiB, pending replies 64 KiB,
+/// Wire's read buffer 64 KiB and the demux peek of one 8 MiB message; per
+/// session, the observation channel 4 MiB, driver controls 64 KiB and the
+/// decode allowance (two 8 MiB messages, an escaped string's scratch and
+/// its owned copy, + 65,536 nodes × 64 B; review cfix-1 #2); per active
+/// turn, the dispatched prompt, which on this route is at most the echo
+/// cap (via-5lr.6), not C1's 16 MiB.
 #[cfg(feature = "test-failpoints")]
 fn leases_sum() -> u64 {
     const MIB: u64 = 1024 * 1024;
-    let server = 4 * MIB + 256 * 1024 + 64 * 1024 + 64 * 1024 + MIB;
-    let session = 4 * MIB + 64 * 1024 + MIB + 65_536 * 64;
+    let server = CODEX_STAGING_BYTES + 256 * 1024 + 64 * 1024 + 64 * 1024 + CODEX_MESSAGE_BYTES;
+    let session = 4 * MIB + 64 * 1024 + 2 * CODEX_MESSAGE_BYTES + 65_536 * 64;
     let turn = CODEX_PROMPT_MAX as u64;
     server + LEASES as u64 * (session + turn)
 }
@@ -5059,7 +5074,7 @@ fn leases_sum() -> u64 {
 /// below 32 MiB after its first 64 MiB, peak to peak, both windows
 /// sampled). Then each session's Core drain is paused, acknowledged, until
 /// the test releases it; each channel is filled to its 4 MiB with the
-/// fifth maximal message decoded and blocked, and the server's 4 MiB
+/// fifth maximal message decoded and blocked, and the server's 12 MiB
 /// staging filled with lines in blocked lanes. That occupancy is asserted
 /// from counted failpoint hits before and after the held sample; then
 /// peak RSS less the idle baseline is within [`leases_sum`] plus 25%.
@@ -5105,7 +5120,10 @@ fn codex_rss_leases() {
     .len() as u64
         + 1;
     assert!(maximal <= MIB, "{maximal}");
-    assert!(maximal * STAGED_LINES as u64 <= 4 * MIB, "{maximal}");
+    assert!(
+        maximal * STAGED_LINES as u64 <= CODEX_STAGING_BYTES,
+        "{maximal}"
+    );
     let phase = Arc::new(AtomicU8::new(0));
     let fake = Arc::new(AtomicU32::new(0));
     let stop = Arc::new(AtomicBool::new(false));
