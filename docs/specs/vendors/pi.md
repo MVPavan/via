@@ -137,7 +137,7 @@ after Core reserved a slot:
    - Any other disposition (`handled`, `queued`) is protocol: it cannot occur
      on an idle fresh process under `-ne -np` (E40).
    - A lost reply is the unknown-submission failure: Pi exiting after the
-     written prompt with no reply fails the turn `process_exit` with the
+     written prompt with no reply fails the turn `process_exited` with the
      Host-confirmed exit. Nothing is resent.
 5. **Observe** (§5) until `agent_settled`. `agent_end` is not the end:
    auto-retry and compaction continue after it (E28).
@@ -429,10 +429,10 @@ check (`invalid_params` naming `vendor_args`, or `cwd` when the session has
 none, past Host's 64 KiB). Matched under C2 §6.3: every reserved long name,
 every operand and `--`. Pi matches each option as an exact string, its
 short forms multi-letter, so no single-dash element is a cluster of
-switches: **every** single-dash element is refused. Pi does not split
-`--name=value` (it keeps the element as an unknown flag); the match judges
-it by its name all the same, so a reserved name is refused in either
-spelling. The unreserved options that take a value are `--use-theme` and
+switches: **every** single-dash element is refused. Pi 1.0.2 never matches
+`--name=value` to a known option; it splits the element at its first `=`
+into an unknown (extension) flag's name and value. The match judges it by
+its name all the same, so a reserved name is refused in either spelling. The unreserved options that take a value are `--use-theme` and
 `--tui-mode`, each its next element. Environment names are not arguments
 and stay unreachable.
 

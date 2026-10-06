@@ -461,8 +461,9 @@ fn args_refusal(route: &'static str, vendor_args: &VendorArgs) -> Option<Refusal
 /// The raw-argument rules (C2 §6.3, packet §4.8, the pinned `pi --help`
 /// of 1.0.2). Pi's parser matches each option as an exact string, its
 /// short forms multi-letter (`-ne`, `-nbt`), so no single-dash element is
-/// a cluster of switches: every one is refused. Pi does not split
-/// `--name=value` (it keeps it as an unknown flag); the matching judges it
+/// a cluster of switches: every one is refused. Pi never matches
+/// `--name=value` to a known option; it splits it at the first `=` into
+/// an unknown (extension) flag's name and value. The matching judges it
 /// by its name all the same, so a reserved name is refused in either
 /// spelling. The unreserved options taking a value are `--use-theme` and
 /// `--tui-mode`.
