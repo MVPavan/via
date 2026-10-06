@@ -2,8 +2,8 @@
 //! cutoff; x.3.2 ruling Q1): one VIA turn on its own private process, from
 //! the entry checks through the start, the read loop, the terminal's
 //! finalization or late path, and the process's cleanup. One hardened copy
-//! serves the closed set of protocols that run this way, the fake's and
-//! Claude Code's ([`PrivateProtocol`]); each supplies only its encoding,
+//! serves the closed set of protocols that run this way, the fake's,
+//! Claude Code's and Pi's ([`PrivateProtocol`]); each supplies only its encoding,
 //! its decoding and admission rules, its terminal evidence and the fake's
 //! persistent-profile emulation.
 
@@ -114,7 +114,7 @@ impl<M> Hop<M> {
 pub(crate) type ForceWatch = watch::Receiver<Option<tokio::time::Instant>>;
 
 /// A protocol that runs one VIA turn per private process. The set is
-/// closed: the fake's lane and Claude Code's, crate-private, so the hop,
+/// closed: the fake's lane, Claude Code's and Pi's, crate-private, so the hop,
 /// terminal and result types stay each protocol's own while the lifecycle
 /// is shared. The implementor is the protocol's per-turn state.
 pub(crate) trait PrivateProtocol: Sized + Send {

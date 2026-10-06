@@ -2050,7 +2050,7 @@ async fn confirm(
             std::time::Instant::now(),
         );
         return Err(Box::new(
-            facts.failed(RouteError::HandshakeRefused { turn }, None),
+            facts.failed(RouteError::HandshakeRefused { turn, detail: None }, None),
         ));
     }
     let returned = &opened.thread.id;
