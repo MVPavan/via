@@ -442,6 +442,13 @@ mod tests {
             &["daemon"],
             &["--strict-config", "generate-json-schema"],
             &["--analytics-default-enabled", "help"],
+            // Review pass 1, Important 1: a separate value starting with
+            // `-` is ambiguous, and nothing after a value is a value.
+            &["-c", "--listen=unix://"],
+            &["--enable", "--stdio"],
+            &["--config", "model_verbosity=low", "proxy"],
+            &["-c", "--strict-config"],
+            &["--enable", "--analytics-default-enabled"],
         ] {
             assert!(first(case).is_some(), "{case:?}");
         }
@@ -456,6 +463,7 @@ mod tests {
             &["-c", "features.apps=false"],
             &["--enable", "apps"],
             &["--disable=web_search"],
+            &["--enable", "apps", "--enable=web_search", "-c", "a=1"],
         ] {
             assert_eq!(first(case), None, "{case:?}");
         }

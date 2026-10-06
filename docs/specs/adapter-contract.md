@@ -957,13 +957,19 @@ vendor would apply, never less.
    value) is normalized (leading dashes dropped, lowercased, `-`, `_` and
    `.` removed) and compared with the route's reserved names (exact) and
    prefixes. A name in the route's value-option table with no `=value`
-   takes the next element as its value; a variadic one takes each following
-   element that does not start with `-`.
+   takes exactly the next element as its value, whatever it is, as
+   Commander and clap take a required value. A next element that starts
+   with `-` is ambiguous (the vendor may bind it as the value or read it as
+   an option) and refused. A variadic option is accepted only as
+   `--name=value`, one value per occurrence: the vendor would take each
+   following bare element as a further value, so VIA refuses a separate
+   value, and a bare element after `--name=value` is an operand (rule 4).
 3. `-xyz` is a short cluster, read letter by letter: a reserved letter is
    refused; a letter in the value-option table ends the cluster, and the
-   rest (after one optional `=`), else the next element, is its value; any
-   other letter is taken as a switch and reading continues. So `-fvalue`,
-   `-f=value`, `-f value` and combined switches all match.
+   rest (after one optional `=`), else exactly the next element under rule
+   2, is its value; any other letter is taken as a switch and reading
+   continues. So `-fvalue`, `-f=value`, `-f value` and combined switches
+   all match.
 4. Any other element (not starting with `-`, or `-` alone) is accepted only
    as a value under rule 2 or 3. Otherwise it is an operand, and refused
    as a conflict: Claude reads operands as its prompt or a subcommand,
@@ -973,8 +979,8 @@ vendor would apply, never less.
    `--enable`/`--disable` features), the value is inspected however it is
    attached.
 
-An element that starts with `-` is always read as an option, even where the
-vendor would take it as the previous option's value. The value-option
+Each element is thus unambiguously an option, the value of the option
+before it, or refused (review pass 1, 2026-10-06). The value-option
 tables list only unreserved options of the checked versions; an option
 outside them (a later vendor's) passes and takes no value, so a separate
 value after it is an operand and refused: the caller attaches it

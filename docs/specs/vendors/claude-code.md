@@ -313,9 +313,12 @@ fit is `invalid_params` naming the largest of `instructions`,
 | Operands | every one (Claude's prompt and subcommands) and `--` |
 
 Value-option table (unreserved options that take a value, C2 §6.3 rule 2):
-`--autocompact`, `--betas` (variadic), `-d`/`--debug` (optional value),
-`--debug-file`, `--file` (variadic), `--max-budget-usd`, `-n`/`--name`,
-`--prompt-suggestions` (optional value). Everything else in the help passes
+`--autocompact`, `--betas` (variadic: `--betas=VALUE` only),
+`-d`/`--debug` (optional value), `--debug-file`, `--file` (variadic:
+`--file=VALUE` only), `--max-budget-usd`, `-n`/`--name`,
+`--prompt-suggestions` (optional value). Without `=`, each takes exactly
+the next element, which must not start with `-`; an optional-value option
+given last takes none. Everything else in the help passes
 unverified with C1's `vendor_passthrough` warning, for example
 `--max-budget-usd`, `--debug-file`, `--betas`, `--chrome`, `--ide`,
 `--brief` and `--exclude-dynamic-system-prompt-sections`.

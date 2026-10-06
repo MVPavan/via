@@ -931,6 +931,13 @@ mod tests {
             &["update"],
             &["--debug-file", "/x", "extra"],
             &["--chrome", "prompt text"],
+            // Review pass 1, Important 1: Commander binds `foo` alone, and
+            // `--debug` as the name, leaving the prompt an operand.
+            &["--betas=foo", "INJECTED PROMPT"],
+            &["--name", "--debug", "INJECTED PROMPT"],
+            &["--betas", "a"],
+            &["--file", "f1:a"],
+            &["-n", "-d"],
         ] {
             let refusal = refused(case);
             assert!(
@@ -959,8 +966,10 @@ mod tests {
             &["-dapi"],
             &["-d", "api"],
             &["--debug", "api,hooks"],
-            &["--betas", "a", "b"],
-            &["--file", "f1:a", "f2:b"],
+            &["--betas=a", "--betas=b"],
+            &["--file=f1:a", "--file=f2:b"],
+            &["--debug"],
+            &["--name", "x", "--debug=api"],
             &["-n", "name"],
             &["--name=x"],
             &["--chrome"],

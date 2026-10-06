@@ -88,14 +88,18 @@ impl VendorArgs {
     }
 }
 
-/// How many separate values an option of a route's value-option table
-/// takes (C2 §6.3 rule 2).
+/// How an option of a route's value-option table takes its value (C2
+/// §6.3 rule 2).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Takes {
-    /// One: the next element, when no value is attached (an optional
-    /// value is read the same way: a next element not starting with `-`).
+    /// One value: attached (`--opt=value`, `-ovalue`), else exactly the
+    /// next element, as Commander and clap take a required value. A next
+    /// element starting with `-` is ambiguous (the vendor may bind it as
+    /// the value or read it as an option) and refused.
     One,
-    /// Variadic: every following element that does not start with `-`.
+    /// Variadic: accepted only as `--opt=value`, one value per occurrence,
+    /// since the vendor would take each following bare element as a
+    /// further value and VIA cannot tell where the list ends.
     Many,
 }
 
@@ -128,22 +132,26 @@ pub(crate) fn normalize(name: &str) -> String {
 }
 
 /// The index of the first argument that could set what `rules` reserve
-/// (C2 §6.3), or `None` when every argument passes. An element starting
-/// with `-` is always read as an option, so VIA may refuse more than the
-/// vendor would apply, never less.
+/// (C2 §6.3), or `None` when every argument passes. The reading is
+/// conservative: an element is either unambiguously an option, the value
+/// of the option before it, or refused.
 pub(crate) fn conflict(args: &[String], rules: &Rules) -> Option<usize> {
-    // The option awaiting a separate value, and the variadic option whose
-    // further values may follow.
-    let mut pending: Option<(String, Takes)> = None;
-    let mut variadic: Option<String> = None;
+    // The option whose value is the next element.
+    let mut pending: Option<String> = None;
     for (index, arg) in args.iter().enumerate() {
+        if let Some(name) = pending.take() {
+            // Rule 2: exactly the next element; one starting with `-`
+            // (`--` included) is ambiguous.
+            if arg.starts_with('-') || (rules.value_reserved)(&name, arg) {
+                return Some(index);
+            }
+            continue;
+        }
         // Rule 1: `--` ends the vendor's options; VIA owns the operands.
         if arg == "--" {
             return Some(index);
         }
         if let Some(long) = arg.strip_prefix("--") {
-            pending = None;
-            variadic = None;
             let (name, value) = match long.split_once('=') {
                 Some((name, value)) => (name, Some(value)),
                 None => (long, None),
@@ -152,20 +160,19 @@ pub(crate) fn conflict(args: &[String], rules: &Rules) -> Option<usize> {
             if (rules.long_reserved)(&name) {
                 return Some(index);
             }
-            if let Some(takes) = (rules.long_value)(&name) {
-                match value {
-                    Some(value) if (rules.value_reserved)(&name, value) => return Some(index),
-                    Some(_) => variadic = (takes == Takes::Many).then_some(name),
-                    None => pending = Some((name, takes)),
+            match ((rules.long_value)(&name), value) {
+                (Some(_), Some(value)) if (rules.value_reserved)(&name, value) => {
+                    return Some(index);
                 }
+                (Some(Takes::One), None) => pending = Some(name),
+                (Some(Takes::Many), None) => return Some(index),
+                _ => {}
             }
             continue;
         }
         if let Some(cluster) = arg.strip_prefix('-')
             && !cluster.is_empty()
         {
-            pending = None;
-            variadic = None;
             for (at, letter) in cluster.char_indices() {
                 if (rules.short_reserved)(letter) {
                     return Some(index);
@@ -177,32 +184,19 @@ pub(crate) fn conflict(args: &[String], rules: &Rules) -> Option<usize> {
                 let rest = &cluster[at + letter.len_utf8()..];
                 let rest = rest.strip_prefix('=').unwrap_or(rest);
                 if rest.is_empty() {
-                    pending = Some((name.to_owned(), takes));
+                    if takes == Takes::Many {
+                        return Some(index);
+                    }
+                    pending = Some(name.to_owned());
                 } else if (rules.value_reserved)(name, rest) {
                     return Some(index);
-                } else if takes == Takes::Many {
-                    variadic = Some(name.to_owned());
                 }
                 break;
             }
             continue;
         }
-        // Rule 4: a value of the option before it, else an operand.
-        let name = match pending.take() {
-            Some((name, takes)) => {
-                if takes == Takes::Many {
-                    variadic = Some(name.clone());
-                }
-                name
-            }
-            None => match &variadic {
-                Some(name) => name.clone(),
-                None => return Some(index),
-            },
-        };
-        if (rules.value_reserved)(&name, arg) {
-            return Some(index);
-        }
+        // Rule 4: an operand.
+        return Some(index);
     }
     None
 }
@@ -289,7 +283,6 @@ mod tests {
             &["-obad"],
             &["-o=bad"],
             &["-o", "bad"],
-            &["--many", "a", "bad-not", "--opt", "bad"],
         ] {
             assert!(first(refused).is_some(), "{refused:?}");
         }
@@ -299,20 +292,38 @@ mod tests {
             &["--switch"],
             &["--opt", "v"],
             &["--opt=v"],
-            &["--opt", "-p-is-read-as-a-flag-so-refused"][..1],
+            &["--opt"],
             &["-o", "v"],
             &["-ov"],
             &["-o=v"],
             &["-xov"],
             &["-opvalue"],
-            &["--many", "a", "b", "c"],
-            &["--many=a", "b"],
-            &["--opt", "--switch"],
+            &["--many=a"],
+            &["--many=a", "--many=b", "--opt", "v"],
+            &["--unknown=v", "--switch"],
         ] {
             assert_eq!(first(passed), None, "{passed:?}");
         }
-        // A dash element after a value option is an option, never a value.
-        assert_eq!(first(&["--opt", "-p"]), Some(1));
         assert_eq!(normalize("--Allowed_Tools.x"), "allowedtoolsx");
+    }
+
+    /// Review pass 1, Important 1: a value option given without `=` takes
+    /// exactly the next element, so a dash element there is ambiguous and
+    /// refused, and the element after it is never read as an option; a
+    /// variadic option takes one attached value per occurrence, so a bare
+    /// element after it is an operand and a separate value is refused.
+    #[test]
+    fn value_options_are_read_conservatively() {
+        let rules = rules();
+        let first = |list: &[&str]| conflict(&args(list), &rules);
+        assert_eq!(first(&["--opt", "--switch", "INJECTED PROMPT"]), Some(1));
+        assert_eq!(first(&["--opt", "-p"]), Some(1));
+        assert_eq!(first(&["--opt", "--"]), Some(1));
+        assert_eq!(first(&["--opt", "-"]), Some(1));
+        assert_eq!(first(&["-o", "--switch"]), Some(1));
+        assert_eq!(first(&["--many=a", "INJECTED PROMPT"]), Some(1));
+        assert_eq!(first(&["--many", "a"]), Some(0));
+        assert_eq!(first(&["--many"]), Some(0));
+        assert_eq!(first(&["--opt", "v", "INJECTED PROMPT"]), Some(2));
     }
 }

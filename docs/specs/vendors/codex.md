@@ -345,7 +345,9 @@ with the arguments, would not fit Host's 64 KiB launch request is
 | Operands | every one (`daemon`, `proxy`, `generate-ts`, `generate-json-schema`, `help`) and `--` |
 
 Value-option table (C2 §6.3 rule 2): `-c`/`--config`, `--enable`,
-`--disable`, `--code-mode-host`. Everything else passes unverified with
+`--disable`, `--code-mode-host`. Without `=` (or, for `-c`, an attached
+value), each takes exactly the next element, which must not start with
+`-`. Everything else passes unverified with
 C1's `vendor_passthrough` warning, for example `--strict-config`,
 `--analytics-default-enabled`, `--code-mode-host`, `-c` of any other key
 (`mcp_servers`, `notify`, `model_verbosity`) and `--enable`/`--disable` of
