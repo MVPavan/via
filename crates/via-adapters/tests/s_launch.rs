@@ -523,6 +523,27 @@ fn s_launch_a_replaced_binary_does_not_inherit_a_refusal() {
     cache.record_refusal(&binary, "recipe".to_owned(), cause, now);
     executable(&binary);
     assert_eq!(refused(&cache), None, "recorded while gone");
+
+    // Through a symlink (slice A critical, minor): the identity is the
+    // file the link names. The link itself unchanged, its target replaced
+    // by a rename, or the link retargeted, drops the refusal.
+    let link = dir.path().join("vendor-link");
+    let target = dir.path().join("vendor-v1");
+    executable(&target);
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let refused = |cache: &InstanceCache| cache.refusal(&link, "recipe", now);
+    cache.record_refusal(&link, "recipe".to_owned(), cause, now);
+    assert_eq!(refused(&cache), Some(cause));
+    let staged = dir.path().join("vendor-v1.new");
+    fs::copy(&target, &staged).unwrap();
+    fs::rename(&staged, &target).unwrap();
+    assert_eq!(refused(&cache), None, "the link's target replaced");
+    cache.record_refusal(&link, "recipe".to_owned(), cause, now);
+    let other = dir.path().join("vendor-v2");
+    fs::write(&other, "#!/bin/sh\nexit 0\n# v2\n").unwrap();
+    fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&other, &link).unwrap();
+    assert_eq!(refused(&cache), None, "the link retargeted");
 }
 
 /// An entry live at 9:59 after its write is gone at 10:00; time is passed in.
