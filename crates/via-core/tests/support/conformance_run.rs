@@ -108,6 +108,8 @@ pub(crate) struct Knobs {
     pub(crate) hold_for: Option<Duration>,
     /// A cancel is ordered this long after the turn starts.
     pub(crate) stop_after: Option<Duration>,
+    /// [`Knobs::stop_after`] sets the daemon force instead of a cancel.
+    pub(crate) force_not_stop: bool,
     /// Each session's health is read once it left `open` (within
     /// [`FIXTURE_WAIT`]): a failure an idle driver latches after its last
     /// turn settled (x.3.2 X0 item 13.2).
@@ -938,8 +940,8 @@ impl<'a> Run<'a> {
     }
 
     /// Sets the daemon force at [`Knobs::force_on`]'s progress line, and
-    /// orders a cancel at [`Knobs::stop_after`], unless the turn ended
-    /// first.
+    /// orders a cancel (or the force) at [`Knobs::stop_after`], unless the
+    /// turn ended first.
     async fn timed(
         &self,
         force: &watch::Sender<Option<tokio::time::Instant>>,
@@ -957,6 +959,10 @@ impl<'a> Run<'a> {
             if let Some(after) = self.knobs.stop_after {
                 tokio::time::sleep(after).await;
                 let now = tokio::time::Instant::now();
+                if self.knobs.force_not_stop {
+                    force.send_replace(Some(now));
+                    return;
+                }
                 stop.send_replace(Some(StopOrder {
                     cause: StopCause::Cancel,
                     requested_at: "2026-01-01T00:00:00.000Z".to_owned(),

@@ -16,8 +16,8 @@ use super::launch::{self, Continue, Recipe, TOOLS, expected_session_id, recipe_k
 use super::normalize::{self, LaunchFacts, Normalizer};
 use super::{HARNESS, PiAdapter, plan, profile};
 use crate::driver::turn::{
-    Abandonment, CLEANUP_ALLOWANCE, Normalize, Rest, deliver_beside, earliest, end_active,
-    merge_stops, ordered,
+    Abandonment, CLEANUP_ALLOWANCE, Normalize, Rest, controls, deliver_beside, earliest,
+    end_active, merge_stops, ordered,
 };
 use crate::driver::{
     Active, DriverState, ForceWatch, Reservation, Retiring, SessionDriver, TurnCx, TurnSpec, latch,
@@ -72,11 +72,17 @@ pub(crate) async fn run_turn(
     };
     let instance = instance_of(adapter, staged.version.as_deref());
     let route = PiRoute::new(Arc::clone(&driver.runtime));
-    // Packet §7.4 (R1): one non-signalling pass within the wall.
-    let mut end = match route
-        .predecessors_resolved(&driver.spec.session_id, turn, cx.wall)
-        .await
-    {
+    // Packet §7.4 (R1): one non-signalling pass within the wall, ended
+    // unlaunched by a stop, the force or the session's cancellation first
+    // (picrit #2: a stalled Store reply never holds the controls). The
+    // wall stays the check's own: a read that outlives it is `store`.
+    let resolved = tokio::select! {
+        resolved = route.predecessors_resolved(&driver.spec.session_id, turn, cx.wall) => resolved,
+        () = controls((cx.stop.clone(), cx.force.clone()), driver.cancel.clone()) => {
+            Err(ordered_cause(turn, (&cx.stop, &cx.force, &driver.cancel)))
+        }
+    };
+    let mut end = match resolved {
         Ok(true) => {
             launched(
                 driver,

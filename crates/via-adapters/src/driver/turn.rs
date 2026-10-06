@@ -68,7 +68,19 @@ impl Drop for Abandonment<'_> {
 /// daemon force, its wall, or the session's cancellation, which a driver
 /// close includes.
 pub(crate) async fn ordered(
-    (mut stop, mut force, wall): (StopWatch, ForceWatch, Deadline),
+    (stop, force, wall): (StopWatch, ForceWatch, Deadline),
+    cancel: CancellationToken,
+) {
+    tokio::select! {
+        () = controls((stop, force), cancel) => {}
+        () = tokio::time::sleep_until(wall.instant()) => {}
+    }
+}
+
+/// [`ordered`] without the wall: a stop, the daemon force or the session's
+/// cancellation.
+pub(crate) async fn controls(
+    (mut stop, mut force): (StopWatch, ForceWatch),
     cancel: CancellationToken,
 ) {
     let stopped = async {
@@ -84,7 +96,6 @@ pub(crate) async fn ordered(
     tokio::select! {
         () = stopped => {}
         () = forced => {}
-        () = tokio::time::sleep_until(wall.instant()) => {}
         () = cancel.cancelled() => {}
     }
 }

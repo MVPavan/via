@@ -1227,6 +1227,93 @@ fn pi_stage_outlived_by_its_task() {
     assert!(!raced, "turn B staged while turn A's task was still paused");
 }
 
+/// Packet §7.4 (picrit #2): R1's check never holds the turn's controls.
+/// Its Store read is held (failpoint `store.read.corrupt.session_anchors`
+/// paused) past the turn's 4 s wall; a cancel, else the daemon force, 1 s
+/// in ends the turn unlaunched at once. Before the fix the check ignored
+/// them and the read outliving the wall was `store`. The read is released
+/// at 6 s, so the Store serves the case's close.
+#[cfg(feature = "test-failpoints")]
+fn predecessor_check_controlled(
+    name: &str,
+    knobs: Knobs,
+    error: Option<&str>,
+) -> Result<(), String> {
+    use std::os::unix::fs::DirBuilderExt;
+    use std::time::{Duration, Instant};
+    const POINT: &str = "store.read.corrupt.session_anchors";
+    own_process(name);
+    let points = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let dir = points.path().join("points");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&dir)
+        .map_err(|e| e.to_string())?;
+    let token = format!("{name}-token");
+    std::fs::write(
+        dir.join(format!("{POINT}.json")),
+        json!({"token": token, "occurrence": 1, "action": "pause"}).to_string(),
+    )
+    .map_err(|e| e.to_string())?;
+    via_store::failpoint::activate(&dir, &token)?;
+    let control = std::thread::spawn({
+        let dir = dir.clone();
+        move || {
+            let ack = dir.join(format!("{POINT}.1.ack"));
+            let until = Instant::now() + Duration::from_secs(10);
+            while !ack.exists() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let held = ack.exists();
+            std::thread::sleep(Duration::from_secs(6));
+            std::fs::write(dir.join(format!("{POINT}.1.release")), b"").is_ok() && held
+        }
+    });
+    let mut first = turn("Say READY.", unaccepted(None, error, None));
+    first["deadlines"] = json!({"wall_ms": 4000, "idle_ms": 20_000});
+    let expect = case(name, 0, vec![first]);
+    let replay = single(
+        "synthetic (picrit #2): R1's read held; the turn's control ends it unlaunched",
+        argv(Argv::default()),
+        completed_steps(&State::default(), "Say READY.", "READY"),
+    );
+    let outcome = drive_built(
+        name,
+        &replay,
+        &expect,
+        knobs,
+        Box::new(|_| Ok(())),
+        Box::new(|_| Ok(())),
+    );
+    if !control.join().map_err(|_| "the control thread panicked")? {
+        return Err("R1's read never reached the point, or was not released".to_owned());
+    }
+    conformance_expect::check(&expect, &outcome?)
+}
+
+/// [`predecessor_check_controlled`] by a cancel: no failure.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn pi_predecessor_check_stopped() {
+    let knobs = Knobs {
+        stop_after: Some(std::time::Duration::from_secs(1)),
+        ..Knobs::default()
+    };
+    predecessor_check_controlled("pi_predecessor_check_stopped", knobs, None).unwrap();
+}
+
+/// [`predecessor_check_controlled`] by the daemon force: `force_stop`.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn pi_predecessor_check_forced() {
+    let knobs = Knobs {
+        stop_after: Some(std::time::Duration::from_secs(1)),
+        force_not_stop: true,
+        ..Knobs::default()
+    };
+    predecessor_check_controlled("pi_predecessor_check_forced", knobs, Some("force_stop")).unwrap();
+}
+
 /// Packet §3 (review r2 minor): the version read before VIA's launch
 /// state failed is still this turn's `InstanceReport`: a write that fails
 /// (a folder where the instructions' partial goes) is `store`; a session

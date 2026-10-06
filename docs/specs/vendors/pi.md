@@ -704,7 +704,10 @@ predicate.
 - **Bound.** One pass of runtime §5.2's non-signalling probe, within the
   turn's wall deadline. It signals nothing, waits for no vendor process,
   and acquires no vendor or session-file lock or writer; it waits only for
-  its Store replies and may commit an absence proof.
+  its Store replies and may commit an absence proof. A stop, the daemon
+  force or the session's cancellation ends the wait at once, launching
+  nothing: a stop has no failure, the force is `force_stop`. The wall
+  stays the check's own bound (a read that outlives it is `store`, below).
 - **Not proven** (the Store answered and a record is still without a
   proof: a group still present or busy, a probe denial or namespace
   mismatch, an identity-less record, a recovery record not yet re-held):
@@ -750,6 +753,7 @@ hostile profiles only in scratch agent directories. Selection as Claude's:
 | `pi_stage_outlived_by_its_task` | A turn ends at its wall while its staging task is held before the instructions sync; the next turn's launch-state write waits for that task, then launches and completes (unserialized, it failed `store`) |
 | `pi_profile_policy` | Accepted: the allowed set, with and without Pi-created files (E59). Refused by name, no launch and no value in the message: `shellCommandPrefix`, `SYSTEM.md`, `APPEND_SYSTEM.md`, `models.json`, `defaultThinkingLevel`, an unknown key, missing or non-`off` `cacheWarming`, a malformed value, a symlink, wrong owner, a group-writable entry, `auth.json` with group bits, an oversize file, 65 entries, and a 0755 agent, `pi` or `vendor` directory (§4.4, named, left 0755). `pi-profile.json` holds no `deviceId` or credential bytes and records the check the launch passed, even when the profile changes while the turn executes (`pi_profile_record_is_pre_launch`); refusals are not cached |
 | `pi_uncertain_predecessor` | A leaves an unproven group; B is refused `uncertain_predecessor` without launching; C is refused too; A proven absent, D launches. The same with A busy, and across a restart with A's record not yet re-held. No resend |
+| `pi_predecessor_check_stopped`, `pi_predecessor_check_forced` | R1's Store read held past the wall; a cancel, then the daemon force, 1 s in ends the turn unlaunched at once (no failure; `force_stop`), not `store` at the wall |
 | `pi_identity_continuation` | `--session-id` until confirmed; confirmation only with `started`; a rejected turn 1 (no file) lets turn 2 create; a lost `started` reply keeps `--session-id`; once confirmed, `--session`; a missing file then exits before RPC → `Rejected{Protocol}`, never a fresh session; derived ID stable across eviction and restart |
 | `pi_handshake_checks` | Wrong `sessionId` → `resume_mismatch` with no prompt line; model not in the catalog or a clamped requested effort → `InvalidParam` with no prompt, the clamp then cached so `plan` and `check_turn` refuse the same model and effort; omitted effort skips the check; a non-skill command → refusal, cached; exit before the replies → `Rejected{Protocol}` with stderr unread |
 | `pi_protocol_typed` | Wrong `command` for a known `id`, a duplicate reply, missing required fields (`get_state` without `sessionFile` among them), an assistant `message_end` without `content` or `usage` or with a non-numeric usage member (all-zero usage stays `null`, not protocol), a lifecycle or message record before `started`, `agent_settled` without an assistant terminal, a second `agent_settled`, `handled`/`queued`: all protocol, no acceptance or resend |
