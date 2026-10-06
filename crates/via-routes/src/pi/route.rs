@@ -47,7 +47,7 @@ const READ_AHEAD: usize = 1024;
 /// emit nothing meanwhile, so the hop's bound does not bound them. Pi
 /// compacts at most once before a prompt (E63); 64 leaves room for any
 /// retry while keeping the held samples a few KiB.
-pub const HELD_SAMPLES_MAX: usize = 64;
+const HELD_SAMPLES_MAX: usize = 64;
 
 /// The fire-and-forget methods (packet §6): activity. Every other
 /// method, a dialog (`select`, `confirm`, `input`, `editor`) or one VIA

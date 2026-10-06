@@ -1975,8 +1975,14 @@ fn pi_acceptance() {
         Knobs::default(),
     )
     .unwrap();
-    // Picrit #8: the bound's last admitted compaction, 64, still accepts,
-    // every held sample delivered.
+}
+
+/// `pi_acceptance`, bound half (picrit #8): the last admitted compaction
+/// before `started`, the 64th, still accepts, every held sample
+/// delivered (`pi_protocol_typed` fails the 65th).
+#[test]
+fn pi_acceptance_held_bound() {
+    let compacted = usage(40, 8, 0, 0, 0.25);
     let mut steps = handshake(&State::default());
     steps.push(expect_prompt("Say READY."));
     for _ in 0..64 {
