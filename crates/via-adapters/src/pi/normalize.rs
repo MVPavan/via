@@ -285,6 +285,22 @@ fn transcript(facts: &HandshakeFacts, launch: &LaunchFacts) -> Option<PathBuf> {
         .then_some(file)
 }
 
+/// `terminal` of a turn that lost observation delivery (packet §5.5): an
+/// all-`null` turn aggregate, which supersedes the delivered prefix's
+/// samples, so the turn's tokens are unavailable.
+pub(super) fn unaccounted(mut terminal: VendorTerminal) -> VendorTerminal {
+    terminal.usage = Some(UsageSample {
+        key: None,
+        input: None,
+        cached_input: None,
+        output: None,
+        reasoning_output: None,
+        total: None,
+        interval_unverified: false,
+    });
+    terminal
+}
+
 /// The terminal of `message`, the last assistant message before
 /// `agent_settled` (packet §5.3, §7.1), with the turn's `cost` and the
 /// bounded `vendor` data.

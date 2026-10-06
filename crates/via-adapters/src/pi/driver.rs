@@ -634,13 +634,19 @@ impl Ended {
             .as_ref()
             .filter(|_| self.clamp.is_none())
             .and_then(|facts| normalize::thinking_data(&facts.thinking_level));
+        // Packet §5.5: after any delivery loss the normalizer saw a
+        // prefix only, so the turn's accounting is unavailable.
+        let lost = matches!(rest, Rest::Undelivered)
+            || matches!(&outcome, Err(failure) if matches!(failure.cause, RouteError::Overflow { .. }));
         let terminal = terminal.map(|message| {
-            normalize::terminal(
-                &message,
-                abort,
-                (normalizer.cost(), vendor),
-                tokio::time::Instant::now(),
-            )
+            let cost = normalizer.cost().filter(|_| !lost);
+            let at = tokio::time::Instant::now();
+            let terminal = normalize::terminal(&message, abort, (cost, vendor), at);
+            if lost {
+                normalize::unaccounted(terminal)
+            } else {
+                terminal
+            }
         });
         let acknowledged = terminal
             .as_ref()

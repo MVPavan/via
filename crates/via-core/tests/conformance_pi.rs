@@ -2759,6 +2759,61 @@ fn pi_signals_cleanup() {
 /// within Route's read-ahead (1,024 records past the hop).
 const SATURATING: usize = 1_200;
 
+/// Packet §5.5 (picrit #6): observation delivery lost mid-turn leaves the
+/// turn's accounting unavailable, never the delivered prefix as a `turn`
+/// total. A $0.50 tool call is delivered; then Core takes nothing past
+/// the stall bound while deltas overfill the session channel, and the
+/// second $0.50 call and `agent_settled` are decoded but never delivered.
+/// The turn fails `overflow` with its retained terminal, whose cost is
+/// `unavailable`, and its tokens are `null`.
+#[test]
+fn pi_accounting_after_loss() {
+    let mut steps = handshake(&State::default());
+    steps.extend(prompt("Run a tool."));
+    steps.extend(echo("Run a tool."));
+    let half = usage(80, 10, 20, 0, 0.5);
+    steps.extend(tool_call(&half));
+    steps.extend(tool_end(false));
+    let pending = assistant(json!([]), "pending", &zero_usage(), None);
+    steps.push(emit(&json!({"type": "message_start", "message": pending})));
+    steps.push(update(json!({"type": "text_start", "contentIndex": 0})));
+    for _ in 0..SATURATING {
+        steps.push(update(
+            json!({"type": "text_delta", "contentIndex": 0, "delta": "."}),
+        ));
+    }
+    let done = assistant(
+        json!([{"type": "text", "text": "READY"}]),
+        "stop",
+        &half,
+        None,
+    );
+    steps.push(message_end(&done));
+    steps.extend(settle(&done));
+    steps.push(eof());
+    let replay = single(
+        "synthetic (via-jt8.3.2): delivery lost between two priced calls",
+        argv(Argv::default()),
+        steps,
+    );
+    let mut wanted = completed(1, "READY");
+    wanted["terminal"]["cost"] = json!({"usd": null, "provenance": "unavailable"});
+    // The all-null turn aggregate supersedes the delivered prefix.
+    wanted["usage"] = null_usage();
+    wanted["usage"]["from"] = json!("terminal");
+    wanted["error"] = json!("overflow");
+    wanted["final_text"] = Value::Null;
+    let mut lost = turn("Run a tool.", wanted);
+    lost["deadlines"] = json!({"wall_ms": 60_000, "idle_ms": 60_000});
+    let mut expect = case("pi_accounting_after_loss", 1, vec![lost]);
+    expect["sessions"]["main"]["health"] = json!({"state": "failed", "first_cause": "overflow"});
+    let knobs = Knobs {
+        hold_for: Some(std::time::Duration::from_secs(12)),
+        ..Knobs::default()
+    };
+    check_built("pi_accounting_after_loss", &replay, &expect, knobs).unwrap();
+}
+
 /// `pi_dialog_decline` (packet §6): a dialog request with an `id` (a `-e`
 /// extension's `confirm`) and an unknown method with an `id` are each
 /// cancelled on the control lane within 5 s while Core takes no

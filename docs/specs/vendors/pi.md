@@ -578,6 +578,12 @@ cache reads, E24); `cached_input` = `cacheRead`; `output` = `output`;
   under OAuth it is not a billed amount (E24, E52). If any sample is
   all-`null`, the cost is `{usd: null, scope: turn, provenance: unavailable}`; a partial
   sum is never the turn's cost.
+- **Delivery loss.** Once observation delivery is lost (the stall bound,
+  or Route's `overflow`), the normalizer saw a prefix only. The retained
+  terminal then carries cost `unavailable` and an all-`null` turn
+  aggregate, which supersedes the delivered samples, so the turn's tokens
+  are `null` too. Without a retained terminal, Core's ledger still folds
+  the delivered samples (a shared Core rule, not Pi's).
 - Cache warming adds model calls on eligible models (E61); the profile
   policy requires it off (§4.3).
 
@@ -737,6 +743,7 @@ hostile profiles only in scratch agent directories. Selection as Claude's:
 | `pi_terminal_mapping` | Every §5.3 row; only the terminal message is final text; the system message never reaches final text, progress or the envelope |
 | `pi_progress_deltas` | One text block streaming longer than `idle_ms` keeps the turn alive; usage snapshots never become samples; idle expiry waits for the decode fence |
 | `pi_usage_accounting` | Mixed present and all-zero samples → `null` token components and `unavailable` cost; cache and reasoning counters map as §5.5; compaction with and without usage; a compaction after `summarization_retry_scheduled` → `null` tokens and `unavailable` cost |
+| `pi_accounting_after_loss` | Delivery lost between two priced calls (Core holds past the stall bound): `overflow` with the retained terminal, cost `unavailable`, `null` tokens, never the delivered $0.50 |
 | `pi_abort` | Tool-phase and streaming markers with the paired reply acknowledge; the idle reply alone never does; a 401 racing the abort → `failed(auth)`, `requested`; natural completion keeps `Completed`; a reply after `agent_settled` is awaited; no reply by `force_at` → no acknowledgement |
 | `pi_eof_is_stop` | EOF mid-run: exit 0, no terminal, never `Completed` |
 | `pi_signals_cleanup` | Force close via TERM kills tool groups; a `setsid` escapee is a leftover; SIGINT is never sent; a spinning startup is bounded by deadlines and KILL |
