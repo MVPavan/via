@@ -743,7 +743,7 @@ mod tests {
         assert_eq!(ledger.figure(None).unwrap().0.total, Some(1030));
     }
 
-    /// C2 gap A8 (C2 §5 usage, OpenCode §12): a sample whose interval the
+    /// C2 gap A8 (C2 §5 usage): a sample whose interval the
     /// vendor did not verify (a compaction call) makes the turn's interval
     /// unverified, even after a later sample supersedes it; so does an
     /// unverified turn aggregate, which still supersedes the samples.

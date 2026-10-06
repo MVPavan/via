@@ -511,7 +511,7 @@ fn s_launch_a_replaced_binary_does_not_inherit_a_refusal() {
     cache.record_refusal(&binary, "recipe".to_owned(), cause, now);
     assert_eq!(refused(&cache), Some(cause));
     let file = fs::File::options().write(true).open(&binary).unwrap();
-    file.set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(86_400))
+    file.set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_hours(24))
         .unwrap();
     drop(file);
     assert_eq!(refused(&cache), None, "times changed");

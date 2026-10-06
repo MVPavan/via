@@ -238,7 +238,7 @@ pub struct UsageSample {
     /// Total tokens.
     pub total: Option<u64>,
     /// The vendor counted this sample over an interval VIA has not verified
-    /// to be the turn's (OpenCode's compaction calls): the turn's usage is
+    /// to be the turn's (a compaction call): the turn's usage is
     /// then `vendor_interval`, with `usage_interval_unverified`.
     pub interval_unverified: bool,
 }
