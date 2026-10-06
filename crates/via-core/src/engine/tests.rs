@@ -5540,6 +5540,9 @@ fn closed_list_adapter_warnings_reach_the_envelope_once_per_code() {
                 "deprecated",
                 Some(json!({"big":"d".repeat(5000)})),
             ),
+            // C2 gap A5: a route raises `credential_state_unchecked` the
+            // same way (OpenCode §4.3, every turn of the server generation).
+            warning("fake-turn-2", "credential_state_unchecked", None),
         ];
         engine
             .drain_queued(
@@ -5569,7 +5572,7 @@ fn closed_list_adapter_warnings_reach_the_envelope_once_per_code() {
             .filter(|event| event["type"] == "warning" && event["code"] != "launch_failed")
             .map(|event| &event["code"])
             .collect();
-        assert_eq!(codes.len(), 5, "every one is an event: {page}");
+        assert_eq!(codes.len(), 6, "every one is an event: {page}");
         assert!(codes.contains(&&json!("vendor_specific")), "{page}");
         let at = "2026-01-01T00:00:00.000Z".to_owned();
         let envelope = super::terminal::turn_envelope(
@@ -5599,7 +5602,11 @@ fn closed_list_adapter_warnings_reach_the_envelope_once_per_code() {
         let listed: Vec<&Value> = adapter.iter().map(|warning| &warning["code"]).collect();
         assert_eq!(
             listed,
-            [&json!("config_switch_unverified"), &json!("deprecated")],
+            [
+                &json!("config_switch_unverified"),
+                &json!("deprecated"),
+                &json!("credential_state_unchecked"),
+            ],
             "{envelope}"
         );
         assert_eq!(adapter[0]["data"], categories, "the first one's data");

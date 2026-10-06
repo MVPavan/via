@@ -497,7 +497,11 @@ connection retired.
 `progress` item per vendor message that carries a progress mark,
 `final_text` pieces, plus internal ones Core turns into commits. The vendor
 terminal is not an observation: it is retained in the turn's `TurnEnd`
-(§4.1).
+(§4.1). A running turn's own `warning` whose code is in C1 §5's closed list
+also puts that code, with VIA's own message, on the turn's envelope, once per
+code; any other code stays an event. A route raises a per-instance fact this
+way on every turn it affects, as OpenCode's `credential_state_unchecked` on
+each turn of an unchecked server generation (OpenCode packet §4.3).
 
 | Observation | Fields | Core commit |
 |---|---|---|

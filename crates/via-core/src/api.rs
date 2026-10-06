@@ -1792,6 +1792,10 @@ impl Warning {
                 "deprecated",
                 "the vendor reported a deprecated feature or setting",
             ),
+            "credential_state_unchecked" => (
+                "credential_state_unchecked",
+                "the vendor server's credential state could not be checked on this version",
+            ),
             _ => return None,
         };
         Some(Self {
@@ -2235,7 +2239,7 @@ pub(crate) mod maxima {
     }
 
     /// C1 §5's closed list of warning codes.
-    pub(crate) const WARNING_CODES: [&str; 9] = [
+    pub(crate) const WARNING_CODES: [&str; 10] = [
         "instructions_partial",
         "vendor_version_untested",
         "usage_interval_unverified",
@@ -2245,6 +2249,7 @@ pub(crate) mod maxima {
         "config_switch_unverified",
         "deprecated",
         "vendor_passthrough",
+        "credential_state_unchecked",
     ];
 
     /// A string whose encoding, quotes included, is `bytes` long, made of
