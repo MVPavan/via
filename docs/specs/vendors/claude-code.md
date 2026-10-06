@@ -134,7 +134,7 @@ default. Check init `claude_code_version` on every launch, parsing the
 complete version including any prerelease/build qualifier, never guessed from
 an executable filename. A version in the adapter's `checked` set (versions the
 maintainers' cheap live check passed: 2.1.285; from the live round of
-2026-10-05, 2.1.289; and 2.1.290, from run 5 of the qualification runner
+2026-10-05, 2.1.289; and 2.1.290, from run 6 of the qualification runner
 `scripts/qualify/claude.py` on 2026-10-06, where every case passed (§4,
 bead via-kr9)) is `tested`; any other is `untested`,
 with warning `vendor_version_untested`, and proceeds. Only a failed handshake
@@ -173,9 +173,11 @@ agents, and auto-memory. With it, Claude ignores the user, project and local
 settings files and loads built-ins only (help 2.1.289; states in the
 inherited-configuration table below). `--strict-mcp-config` is passed, in
 either mode, only when MCP servers are requested off; Claude's default
-request loads them (owner, 2026-10-05). This is a
-**proposed combination**, not a verbatim qualified probe: probes exercised its
-components with narrower tool lists. Explicit Bash enables general command
+request loads them (owner, 2026-10-05). The qualification runner
+checked this exact recipe on 2.1.290 (run 6, 2026-10-06, below): every
+launch's argv carried it, in both modes, and with `--strict-mcp-config`
+in the unrestricted mode. That qualifies the `full` bound's recipe, not any
+narrower bound (§8). Explicit Bash enables general command
 execution in the `full` bound in both modes; Bash wrote outside the
 workspace in both (round 1, restricted; round-2 probe u1, unrestricted).
 The file tools differ by mode:
@@ -420,32 +422,41 @@ result below qualifies 2.1.290 instead (bead via-kr9):
   same session then completed. This matches §3's `cancel: partial:
   aborts_tools_then_result` and §7.
 
-Qualification runner on 2.1.290 (run 5, 2026-10-06, Haiku, bead via-kr9;
-checked; `scripts/qualify/claude.py`, gitignored evidence in
-`scratchpad/qualify/claude-2.1.290-run5/`, reported cost 0.070 USD). Every
-case passed, so 2.1.290 is in the checked set (§3):
-- `recipe_continuity` (restricted mode, one session, four launches). The
-  launches' argv carried `--session-id`, then `--resume`, with frozen
-  instructions, `--effort low` then `medium`, schema A, then B, then
-  cleared. The Write tool made a 0644 file, and the structured outputs
-  matched A and B. `--max-steps 1` ended `failed`, `budget_exceeded`,
-  `max_steps`, vendor code `error_max_turns`. The last turn recalled a
-  nonce given only in turn 1's prompt, in one step with `--max-turns 1`, so
-  no tool ran, and its text carried the instruction marker.
+Qualification runner on 2.1.290 (run 6, 2026-10-06, Haiku, bead via-kr9;
+checked; `scripts/qualify/claude.py` after the review fixes, gitignored
+evidence in `scratchpad/qualify/claude-2.1.290-run6/`, reported cost
+0.089 USD of a 0.75 USD cap). Every case passed, every envelope reported
+2.1.290 as `claude --version` did, and every daemon stopped, so 2.1.290 is
+in the checked set (§3). Every launch's argv carried the full §4 recipe for
+its turn, and every completed turn reported a positive cost above the
+session's previous one:
+- `recipe_continuity` (restricted mode, one session, four launches). Argv
+  went from `--session-id` to `--resume` with the same identity. The
+  instruction file was changed after spawn, and every launch still carried
+  the frozen text (by digest). Effort was `low`, then `medium`, then
+  `medium` inherited twice. Schema A, then B (by digest), then none. The
+  Write tool made a 0644 file, and the structured outputs matched A and B.
+  `--max-steps 1` ended `failed`, `budget_exceeded`, `max_steps`, vendor
+  code `error_max_turns`. The last turn recalled a nonce given only in turn
+  1's prompt, in one step with `--max-turns 1`, with the frozen
+  instructions' marker and not the changed one. VIA records no tool events
+  (C1 §6.1), so tool calls come from the vendor transcript of the session:
+  no tool input held the nonce in any turn, and the last turn made none.
 - `interrupt`. A foreground Bash tool (a python sleep in its own process
   group) was seen in `status` `running_tools` and in `/proc`, with VIA's
   process-marker key in its environment. `via cancel --wait` gave
-  `cancelled`, `interrupted`, `acknowledged` and `quiescent`. The tool's
-  pid and start time were absent from the snapshot taken as the cancel
-  returned. The same session's next turn completed.
+  `cancelled`, `interrupted`, `acknowledged` and `quiescent`, with
+  `cancel.requested`, `cancel.settled` and `turn.ended` in that order. As
+  the cancel returned, the tool's pid and start time were gone. The same
+  session's next turn completed.
 - `never_ask`. A Write outside the workspace under `--restricted` settled
-  in seconds, `completed`, with one `file_write` `action.denied` for that
-  path and no declined request, and no file was written.
+  in seconds, `completed`, with exactly one denial: envelope total, entry
+  and `action.denied` event, a `file_write` of that path. No request was
+  declined and no file was written.
 - `usage`. Each envelope's tokens (`scope: turn`) equal the sum of the
   vendor transcript's model calls after that turn's prompt, not the
-  session's cumulative sum, and the cost (`session_cumulative`) never
-  decreases. VIA keeps no raw `result`, so the vendor's own session
-  transcript is the reference (usage numbers only).
+  session's cumulative sum. VIA keeps no raw `result`, so the vendor's own
+  session transcript is the reference (usage numbers only).
 - `private_profile_auth`. With the daemon's `HOME` an empty directory, so
   no credentials were copied and the login was left alone, the turn failed
   `auth`, vendor code `authentication_failed`.
@@ -454,19 +465,19 @@ case passed, so 2.1.290 is in the checked set (§3):
   off. Argv carried `--restricted` and `--strict-mcp-config` exactly where
   expected. VIA records no init inventory (see the notes above), so the
   evidence is Claude's own MCP debug lines (owner, 2026-10-06), written by
-  `--debug=mcp --debug-file=<file>` to a file of the runner's, counting
-  connected servers by name. The same one server (a claude.ai connector)
-  connected on the unrestricted spawn and on its resume, none with MCP
-  off, and that server under `--restricted` too, which agrees with
-  `unknown` there. With no server connected on the unrestricted spawn the
-  case is `not_observable`, never a pass.
+  `--debug=mcp --debug-file=<file>` to a file of the runner's. The runner
+  parses each server's connection message apart from its name, keeps only
+  names and statuses and deletes the raw file. The same one server (a
+  claude.ai connector) connected on the unrestricted spawn and on its
+  resume, none with MCP off, and that server under `--restricted` too,
+  which agrees with `unknown` there. With no server connected on the
+  unrestricted spawn the case is `not_observable`, never a pass.
 - `claude_live_bounds` is excluded: CLAUDE-BOUND-1 (§8) is open
   (via-p98.3.4).
 
-The runner's run 4 the same day (`scratchpad/qualify/claude-2.1.290-run4/`)
-passed every other case but recorded `mcp_switches` as `not_observable`,
-because it still required the init inventory; the owner's decision above
-settled that.
+Earlier runs the same day are superseded. Run 4 recorded `mcp_switches`
+as `not_observable` because it still required the init inventory; run 5
+passed before the review hardened the runner.
 
 ## 5. Typed stream and normalizer
 
@@ -715,8 +726,11 @@ must appear in user-facing describe/help and the release report.
 These are **required future tests**, none run by this documentation task. Build
 sanitized minimal fixtures from protocol structure, not copied private sessions.
 Use the real daemon and Store where lifecycle assertions require them. Every
-case emits the coding-standard summary, event references, consistent Store
-backup, hashes and report. Missing infrastructure leaves a live case incomplete.
+fixture case emits the coding-standard summary, event references, consistent
+Store backup, hashes and report. The live rows run in the qualification runner
+`scripts/qualify/claude.py`. Its evidence package is `summary.json` plus the
+per-case directories (owner, 2026-10-06). Missing infrastructure leaves a live
+case incomplete.
 
 | Test name | Original failure / decisive assertion |
 |---|---|
@@ -735,8 +749,8 @@ backup, hashes and report. Missing infrastructure leaves a live case incomplete.
 | `claude_normalizer_accounting` | Repeated assistant block not doubled; the `result.usage` aggregate supersedes partial assistant snapshots; denial dedup; synthetic API-error message never progress; unknown/malformed/duplicate terminal and cross-generation late traffic; turn token vs session cumulative cost, `fallback_credit` in vendor, absent fields and counter reset |
 | `claude_stream_limits` | Oversize stdout, stderr flood, stalled normalizer, large final payload: bounded memory, final text in a file; cancel/close still serviceable; no false successful truncated envelope |
 | `claude_live_recipe_continuity` | Exact §4 recipe, existing login, three launches, nonce recall, schemas replace/clear, instructions/effort/steps and full tool operation; emit versions/env names only |
-| `claude_live_interrupt` | Observe a real long-running tool, receipt, abort terminal, tool completion and verified cleanup; then same-ID next turn; SIGTERM-only is a negative case |
-| `claude_live_mcp_resume` | Unrestricted MCP discovery on resume launches: MCP servers requested on, a `--resume` launch's init lists the user's servers as the session's first launch did (m1 and sA covered new sessions only); status stays `on` |
+| `claude_live_interrupt` | Observe a real long-running tool, receipt, abort terminal, tool completion and verified cleanup; then same-ID next turn. The SIGTERM-only negative is not a live case (owner, 2026-10-06): that a signal death is never an acknowledged cancel is normalizer behaviour, covered by `claude_cleanup_not_ack` (variant `claude_cleanup_not_ack_forced`) |
+| `claude_live_mcp_resume` | Unrestricted MCP discovery on resume launches: MCP servers requested on, a `--resume` launch loads the user's servers as the session's first launch did (m1 and sA covered new sessions only); status stays `on`. While VIA records no init inventory (via-7c6), Claude's own MCP debug lines are the evidence (owner, 2026-10-06): connected servers by name, at least one on the spawn and the same on the resume, none with MCP off; none connected on the spawn is `not_observable` |
 | `claude_live_bounds` | CLAUDE-BOUND-1 matrix on Linux/macOS including missing dependency fail-closed and resume-bound changes; infrastructure failure never passes |
 
 Run the repository verification gate when code lands. Focused default test
