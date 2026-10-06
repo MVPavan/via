@@ -641,7 +641,11 @@ def vendor_turns(path, needle=None):
     the turn's terminal message (`terminal_text`): the text of the turn's
     last message-bearing record when that is an assistant message with
     stop_reason `end_turn`, else None. A record lost after an intermediate
-    message (stop_reason `tool_use`) leaves no terminal message."""
+    message (stop_reason `tool_use`) leaves no terminal message. Nothing is
+    defaulted: an assistant record whose usage lacks a token key or holds a
+    non-integer counts in `usage_invalid` (that turn's usage is not
+    evidence), and one whose content is not a list counts in
+    `invalid_inputs` (its tool calls are unknown)."""
     keys = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens",
             "output_tokens")
     turns = []
@@ -650,7 +654,8 @@ def vendor_turns(path, needle=None):
             entry = json.loads(line)
             if is_prompt(entry):
                 turns.append({"calls": {}, "tools": {}, "needle_inputs": set(),
-                              "invalid_inputs": set(), "texts": {}, "last": None})
+                              "invalid_inputs": set(), "texts": {}, "last": None,
+                              "usage_invalid": 0})
                 continue
             if (entry.get("type") == "user" and not entry.get("isSidechain") and turns
                     and isinstance(entry.get("message"), dict)):
@@ -662,7 +667,11 @@ def vendor_turns(path, needle=None):
                 continue
             turn = turns[-1]
             turn["last"] = (message.get("id"), message.get("stop_reason"))
-            for part in message.get("content") or []:
+            content = message.get("content")
+            if not isinstance(content, list):
+                turn["invalid_inputs"].add(f"content of {message.get('id')}")
+                content = []
+            for part in content:
                 if (isinstance(part, dict) and part.get("type") == "text"
                         and isinstance(part.get("text"), str)):
                     turn["texts"].setdefault(message.get("id"), []).append(part["text"])
@@ -673,8 +682,13 @@ def vendor_turns(path, needle=None):
                         turn["invalid_inputs"].add(part.get("id"))
                     elif needle and needle in json.dumps(tool_input):
                         turn["needle_inputs"].add(part.get("id"))
-            if isinstance(message.get("usage"), dict):
-                usage = {key: message["usage"].get(key) or 0 for key in keys}
+            usage = message.get("usage")
+            if not isinstance(usage, dict) or not all(
+                    isinstance(usage.get(key), int) and not isinstance(usage.get(key), bool)
+                    for key in keys):
+                turn["usage_invalid"] += 1
+            else:
+                usage = {key: usage[key] for key in keys}
                 prior = turn["calls"].get(message.get("id"))
                 if prior is None or usage["output_tokens"] >= prior["output_tokens"]:
                     turn["calls"][message.get("id")] = usage
@@ -683,7 +697,7 @@ def vendor_turns(path, needle=None):
              "tool_calls": len(turn["tools"]), "tool_names": sorted(set(turn["tools"].values())),
              "invalid_inputs": len(turn["invalid_inputs"]),
              "needle_inputs": len(turn["needle_inputs"]),
-             "terminal_text": terminal_text(turn)}
+             "usage_invalid": turn["usage_invalid"], "terminal_text": terminal_text(turn)}
             for turn in turns]
 
 
@@ -2004,9 +2018,13 @@ def case_usage(run, case, inputs):
     vendor = vendor_turns(path)
     case.check("one vendor prompt per VIA turn", len(vendor) == len(inputs),
                {"vendor_prompts": len(vendor), "via_turns": len(inputs)})
-    rows, cumulative = [], {}
+    rows, cumulative, tainted = [], {}, False
     for (_, envelope), raw in zip(inputs, vendor):
         turn = envelope["turn"]
+        # A usage record missing a token key is no evidence for its turn,
+        # nor for the session totals from then on.
+        invalid = raw["usage_invalid"]
+        tainted = tainted or bool(invalid)
         raw = {key: raw[key] for key in ("input_tokens", "cache_creation_input_tokens",
                                          "cache_read_input_tokens", "output_tokens", "calls")}
         cumulative = {key: cumulative.get(key, 0) + value for key, value in raw.items()}
@@ -2020,9 +2038,17 @@ def case_usage(run, case, inputs):
                      "vendor_cumulative": cumulative, "envelope": got, "expected": expected,
                      "scope": usage["scope"], "cost": envelope["cost"]})
         case.check(f"turn {turn}: usage scope turn", usage["scope"] == "turn")
-        case.check(f"turn {turn}: envelope usage equals the turn's vendor calls",
-                   raw["calls"] > 0 and got == expected, {"calls": raw["calls"]})
-        if cumulative != raw:
+        if invalid:
+            case.not_observable(f"turn {turn}: envelope usage equals the turn's vendor calls",
+                                f"{invalid} vendor usage record(s) missing or mistyping a "
+                                "token key")
+        else:
+            case.check(f"turn {turn}: envelope usage equals the turn's vendor calls",
+                       raw["calls"] > 0 and got == expected, {"calls": raw["calls"]})
+        if tainted and cumulative != raw:
+            case.not_observable(f"turn {turn}: envelope usage is not session-cumulative",
+                                "an earlier or this turn's vendor usage is incomplete")
+        elif cumulative != raw:
             case.check(f"turn {turn}: envelope usage is not session-cumulative",
                        got["output_tokens"] != cumulative["output_tokens"])
     write_json(case.dir / "usage-compare.json",
