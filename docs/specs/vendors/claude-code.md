@@ -391,8 +391,9 @@ VIA state directory, gitignored evidence in
 not qualification: it does not meet §9's bar, and 2.1.290 stays out of the
 checked set (§3) until the qualification runner passes on it (bead
 via-kr9):
-- Default mode: a spawn and its resume both completed, the resume recalled
-  turn 1's content, and the files Write created were mode 0644. The
+- Default mode: a spawn and its resume both completed, the resume returned
+  `alpha` (also readable from turn 1's file, so continuity is unproved),
+  and the files the turns left were mode 0644. The
   session's inherited states were all `on`, as the table above gives for
   the unrestricted mode.
 - Restricted mode: one turn completed, with MCP servers `unknown`, every
