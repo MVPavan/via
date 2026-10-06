@@ -136,9 +136,10 @@ an executable filename. A version in the adapter's `checked` set (versions the
 maintainers' cheap live check passed: 2.1.285 and, from the live round of
 2026-10-05, 2.1.289) is `tested`; any other is `untested`,
 with warning `vendor_version_untested`, and proceeds. 2.1.290 is not in the
-checked set: run 4 of 2026-10-06 (§4) is partial live evidence, not the
-full qualification of §9, and its promotion waits for the qualification
-runner (bead via-kr9). Only a failed handshake
+checked set: the qualification runner `scripts/qualify/claude.py` (bead
+via-kr9) did not pass on it on 2026-10-06 (§4). Every case passed except
+`mcp_switches`, which is `not_observable` because VIA records no init MCP
+inventory, and promotion waits for that evidence. Only a failed handshake
 check on something VIA relies on (`interrupt_receipt_v1`, the permission-mode
 echo, the tool list) refuses the instance. Init follows the prompt line, so
 the turn fails `protocol` with no resend, and the refusal is cached per C2 §5.
@@ -286,7 +287,9 @@ the Claude route has no evidence-file writer, and adding one means a new evidenc
 file through Wire or Store and the C1 `logs` listing, more than that fix.
 The categories above were verified from the probes' own init captures.
 Revisit when per-turn inventory evidence is needed (a qualification run or a
-user question about what loaded).
+user question about what loaded). That trigger has come: without it the
+qualification runner's `mcp_switches` case is `not_observable` (via-kr9,
+2026-10-06).
 
 No free-form vendor options in this first recipe. Reject unknown Claude vendor
 keys with `invalid_params`; recognized reserved keys use
@@ -419,6 +422,47 @@ via-kr9):
   kept, so the sleep's absence is unretained evidence. A resume of the
   same session then completed. This matches §3's `cancel: partial:
   aborts_tools_then_result` and §7.
+
+Qualification runner on 2.1.290 (2026-10-06, Haiku, bead via-kr9; checked;
+`scripts/qualify/claude.py`, gitignored evidence in
+`scratchpad/qualify/claude-2.1.290-run4/`, reported cost 0.093 USD). Result
+`not_passed`, so 2.1.290 stays out of the checked set (§3):
+- `recipe_continuity` passed (restricted mode, one session, four launches).
+  The launches' argv carried `--session-id`, then `--resume`, with frozen
+  instructions, `--effort low` then `medium`, schema A, then B, then
+  cleared. The Write tool made a 0644 file, and the structured outputs
+  matched A and B. `--max-steps 1` ended `failed`, `budget_exceeded`,
+  `max_steps`, vendor code `error_max_turns`. The last turn recalled a
+  nonce given only in turn 1's prompt, in one step with `--max-turns 1`, so
+  no tool ran, and its text carried the instruction marker.
+- `interrupt` passed. A foreground Bash tool (a python sleep in its own
+  process group) was seen in `status` `running_tools` and in `/proc`, with
+  VIA's process-marker key in its environment. `via cancel --wait` gave
+  `cancelled`, `interrupted`, `acknowledged` and `quiescent`. The tool's
+  pid and start time were absent from the snapshot taken as the cancel
+  returned. The same session's next turn completed.
+- `never_ask` passed. A Write outside the workspace under `--restricted`
+  settled in seconds, `completed`, with one `file_write` `action.denied`
+  for that path and no declined request, and no file was written.
+- `usage` passed. Each envelope's tokens (`scope: turn`) equal the sum of
+  the vendor transcript's model calls after that turn's prompt, not the
+  session's cumulative sum, and the cost (`session_cumulative`) never
+  decreases. VIA keeps no raw `result`, so the vendor's own session
+  transcript is the reference.
+- `private_profile_auth` passed. With the daemon's `HOME` an empty
+  directory, so no credentials were copied and the login was left alone,
+  the turn failed `auth`, vendor code `authentication_failed`.
+- `mcp_switches`: `not_observable`. `status` matched the table above in
+  every mode: restricted, unrestricted on a spawn and its `--resume`, and
+  MCP off with `--strict-mcp-config` on argv. VIA records no init
+  inventory, though (see the inherited-configuration notes above).
+  Supporting evidence, which cannot pass the case: Claude's MCP debug
+  lines, passed through `--debug=mcp --debug-to-stderr`, showed the same
+  claude.ai connector connected on the unrestricted spawn and on its
+  resume, and in the restricted mode too. They showed no server with MCP
+  off.
+- `claude_live_bounds` is excluded: CLAUDE-BOUND-1 (§8) is open
+  (via-p98.3.4).
 
 ## 5. Typed stream and normalizer
 

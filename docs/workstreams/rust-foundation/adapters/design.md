@@ -1463,6 +1463,14 @@ C1 change, not a routine addition.
      without copying credentials, §5.4.1 switches, usage).
    - A pass adds the vendor version to the adapter's `checked` set in the next
      release. Infrastructure, auth or quota failure is a blocker, never a pass.
+   - Each case ends `pass`, `fail`, `blocked` or `not_observable`, and only
+     `pass` counts. `not_observable` means VIA records no evidence for the
+     case, such as Claude's init MCP inventory. The run passes when every
+     case passes and every daemon it started has stopped. Claude's runner
+     (via-kr9, 2026-10-06) takes `--via`, `--evidence` (a new directory
+     under `scratchpad/`), `--model` (default `haiku`), `--budget-usd` and
+     `--claude`. It writes `summary.json` and exits non-zero unless the run
+     passes (`docs/specs/vendors/claude-code.md` §4 has its first result).
    - It runs before each adapter slice merges and when a vendor ships a new
      version.
 5. **Limits.** The gate proves:
