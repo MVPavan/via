@@ -1329,15 +1329,16 @@ impl Connection {
             }
         };
         let (report, ()) = tokio::join!(close, drain_and_keep);
-        // A Wire stream failure comes after every admitted message: a
-        // failure the drain found precedes it in stream order, and the
-        // first in stream order is the connection's (review cfix-crit #2).
+        // Wire's stdout reader failing comes after every admitted message:
+        // a failure the drain found precedes it in stdout's order, and the
+        // first in that order is the connection's (review cfix-crit #2). A
+        // writer failure has no place in that order: first-wins.
         let cause = match (at, drained) {
-            (FailureAt::StreamEnd, Some(earlier)) => {
+            (FailureAt::StdoutEnd, Some(earlier)) => {
                 self.failure.send_replace(Some(earlier));
                 earlier
             }
-            (FailureAt::StreamEnd | FailureAt::Elsewhere, _) => cause,
+            (FailureAt::StdoutEnd | FailureAt::Elsewhere, _) => cause,
         };
         let loss = disposition(cause, &report);
         self.finish(ConnectionEnd::Failed(loss), LaneEnd::Lost(loss));
@@ -1483,12 +1484,14 @@ fn log_failure(connection: &Connection, cause: LossCause) {
     );
 }
 
-/// Where a connection's first failure stands in its message stream.
+/// Where a connection's first failure stands in stdout's message order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FailureAt {
-    /// Wire's stream failed: after every message it admitted.
-    StreamEnd,
-    /// Anywhere else: a routed message, a write, a driver's request.
+    /// Wire's stdout reader failed (overflow, over-cap, read error):
+    /// after every message it admitted.
+    StdoutEnd,
+    /// Anywhere else: Wire's stdin writer, a routed message, a driver's
+    /// request.
     Elsewhere,
 }
 
@@ -1542,8 +1545,9 @@ pub(super) async fn serve(
     // A cause latched outside this task (exhaustion at a driver's request)
     // wakes it: the seal stops admission, so no message would.
     let mut latched = connection.failure.subscribe();
-    // Where the latched cause stands in the stream: after every admitted
-    // message when Wire's stream failed (review cfix-crit #2).
+    // Where the latched cause stands in stdout's order: after every
+    // admitted message when Wire's reader failed (review cfix-crit #2);
+    // a writer failure (`WireError::Io`) is not in that order (crit2).
     let mut at = FailureAt::Elsewhere;
     let done = |done: Done| connection.written(&done);
     let cause = {
@@ -1578,8 +1582,10 @@ pub(super) async fn serve(
                     Ok(None) if connection.retiring.load(Ordering::Acquire) => break None,
                     Ok(None) => connection.fail(ConnectionFailure::Transport { stdio_end: true }),
                     Err(error) => {
-                        if connection.latch(wire_failure(&error)) {
-                            at = FailureAt::StreamEnd;
+                        if connection.latch(wire_failure(&error))
+                            && matches!(error, WireError::Message(_))
+                        {
+                            at = FailureAt::StdoutEnd;
                         }
                     }
                 },

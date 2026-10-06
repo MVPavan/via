@@ -866,6 +866,41 @@ async fn a_queued_over_cap_line_keeps_its_evidence_through_an_overflow() {
     );
 }
 
+/// Review cfix-crit2: a writer failure has no place in stdout's order, so
+/// a malformed line the drain finds after it does not replace it. Routing
+/// is held while a write is in flight and a malformed line is queued; the
+/// vendor stops reading VIA's writes, the write fails, Wire latches its
+/// writer failure,
+/// and the connection fails `TransportLost`, first-wins.
+#[tokio::test]
+async fn a_writer_failure_is_not_replaced_by_a_drained_one() {
+    const POINT: &str = "codex.connection.message";
+    let points = paused_at(POINT);
+    let mut vendor = Vendor::open(1024);
+    block_stdin(&vendor, 1).await;
+    vendor.emit(&json!({"method": "x/first"})).await;
+    reached(&points, POINT).await;
+    vendor.emit_raw(b"not json\n").await;
+    vendor.ends.stop_reading();
+    until("Wire's writer failure", || {
+        vendor.stdio.input().failure().is_some()
+    })
+    .await;
+    release(&points, POINT);
+    let end = tokio::time::timeout(Duration::from_secs(10), &mut vendor.task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(&end, ConnectionEnd::Failed(loss) if loss.cause == LossCause::TransportLost),
+        "{end:?}"
+    );
+    assert!(matches!(
+        vendor.connection.failure(),
+        Some(ConnectionFailure::Transport { .. })
+    ));
+}
+
 /// Item 5 step 3: a well-formed message for an unknown thread and an
 /// untagged one fail nothing; they are counted.
 #[tokio::test]

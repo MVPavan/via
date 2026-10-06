@@ -1822,11 +1822,14 @@ Steps 2–4 run concurrently:
    first. The server's evidence is taken after the drain, so an
    unattributable message the drain finds (a queued over-cap line) is
    kept too. **Stream order (review cfix-crit #2):** when the latched
-   cause is a failure of Wire's stream (`next_message` erred: a full
-   queue's `Overflow`, a read error), every admitted message precedes it,
-   so the first failure the drain finds becomes the disposition instead
-   (the latch is updated); a cause latched anywhere else (a routed
-   message, a write, a driver's request) keeps first-wins.
+   cause is a failure of Wire's stdout reader (`next_message` erred with
+   `WireError::Message`: a full queue's `Overflow`, an over-cap line, a
+   read error), every admitted message precedes it in stdout's order, so
+   the first failure the drain finds becomes the disposition instead
+   (the latch is updated). A cause latched anywhere else keeps
+   first-wins: Wire's stdin writer failing (`WireError::Io`, e.g. a
+   broken pipe), a routed message, a driver's request (review
+   cfix-crit2).
 4. **Fan-out**, after the prefix reached every lane and Host's report is
    in (or `loss_deadline` passed). Disposition by the latched cause (F9):
    - `Protocol` → `failed(protocol)`; `Overflow` → `failed(overflow)`
