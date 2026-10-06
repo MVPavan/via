@@ -122,13 +122,18 @@ pub enum LaunchFailure {
     Protocol(&'static str),
     /// The connection failed during the handshake.
     Lost(LossCause),
-    /// The handshake's 60 s bound passed.
+    /// The launch's handshake bound passed: 60 s, or 300 s for a first
+    /// start, whose wait for an earlier first start spends it.
     Deadline,
     /// The registry is fenced: the daemon is shutting down.
     Shutdown,
     /// The launch task itself failed.
     Internal,
 }
+
+/// No acquisition cleanup or force facts: the failure came after Host's
+/// acquisition succeeded.
+const NONE: (Option<WireCleanup>, bool) = (None, false);
 
 /// An acquisition failure's own cause.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -143,11 +148,21 @@ pub enum AcquireCause {
 
 impl LaunchFailure {
     /// The failure of turn `turn`, which waited on this launch: nothing of
-    /// the turn was sent, so it never launched on the server route.
+    /// the turn was sent, so it never launched on the server route. Core
+    /// therefore resolves a `TransportLost` here (a lost connection whose
+    /// server's exit Host did not confirm, the handshake's deadline, or the
+    /// launch task's failure) `failed(submit_failed)`, never `unknown`
+    /// (C1 §7.6, bead via-20s).
+    ///
+    /// A failed acquisition keeps Host's cleanup and force facts: the
+    /// turn's own server acquisition failed, so C2 §2 gives it Host's
+    /// acquisition evidence, while it still never launched (review #3).
     pub fn route_failure(self, turn: TurnNumber) -> RouteFailure {
-        let (cause, journal_uncertain, launch) = match self {
+        let (cause, (cleanup, forced), journal_uncertain, launch) = match self {
             Self::Acquire {
                 cause,
+                cleanup,
+                forced,
                 journal_uncertain,
                 launch,
                 ..
@@ -157,32 +172,36 @@ impl LaunchFailure {
                     AcquireCause::Stopped => RouteError::Stopped { turn },
                     AcquireCause::Transport => RouteError::TransportLost { turn },
                 },
+                (cleanup, forced),
                 journal_uncertain,
                 launch,
             ),
-            Self::Protocol(detail) => (RouteError::Protocol { turn, detail }, false, None),
+            Self::Protocol(detail) => (RouteError::Protocol { turn, detail }, NONE, false, None),
             Self::Lost(LossCause::Protocol) => (
                 RouteError::Protocol {
                     turn,
                     detail: "the shared connection failed its handshake",
                 },
+                NONE,
                 false,
                 None,
             ),
-            Self::Lost(LossCause::Overflow) => (RouteError::Overflow { turn }, false, None),
-            Self::Lost(LossCause::ServerLost) => (RouteError::ServerLost { turn }, false, None),
-            Self::Lost(LossCause::TransportLost) | Self::Deadline | Self::Internal => {
-                (RouteError::TransportLost { turn }, false, None)
+            Self::Lost(LossCause::Overflow) => (RouteError::Overflow { turn }, NONE, false, None),
+            Self::Lost(LossCause::ServerLost) => {
+                (RouteError::ServerLost { turn }, NONE, false, None)
             }
-            Self::Shutdown => (RouteError::Stopped { turn }, false, None),
+            Self::Lost(LossCause::TransportLost) | Self::Deadline | Self::Internal => {
+                (RouteError::TransportLost { turn }, NONE, false, None)
+            }
+            Self::Shutdown => (RouteError::Stopped { turn }, NONE, false, None),
         };
         RouteFailure {
             cause,
             undecoded: None,
             exit: None,
             launched: false,
-            cleanup: None,
-            forced: false,
+            cleanup,
+            forced,
             journal_uncertain,
             acknowledged: false,
             shared: true,
@@ -318,14 +337,27 @@ struct Instance {
     work: Option<Work>,
     /// Tasks spawned and not yet collected (at most two, R4-11).
     tasks: u8,
+    /// A failed first start's permit (bead via-20s review #2), held until
+    /// the instance goes: its retirement collected, or at once with no
+    /// connection to retire (Host's failed acquisition already cleaned
+    /// up). The next first start then cannot overlap a lingering
+    /// initializer.
+    first_start: Option<FirstStart>,
 }
+
+/// The one-first-start permit ([`Servers::first_start`]).
+type FirstStart = tokio::sync::OwnedSemaphorePermit;
 
 /// The connection task, built by the launch and spawned at publication.
 type ConnectionTask = Pin<Box<dyn Future<Output = ConnectionEnd> + Send>>;
 
 /// A task's typed outcome.
 enum Outcome {
-    Launch(Result<(ConnectionTask, ServerFacts), LaunchError>),
+    /// With a failed first start, its permit ([`Instance::first_start`]).
+    Launch(
+        Result<(ConnectionTask, ServerFacts), LaunchError>,
+        Option<FirstStart>,
+    ),
     Connection(ConnectionEnd),
     Retired(Option<ExitReport>),
     Stopped(Option<ExitReport>),
@@ -425,15 +457,25 @@ pub struct Servers {
     /// Never changed: the connection's wake.
     unwoken: watch::Sender<u64>,
     me: Weak<Servers>,
+    /// One first start at a time (bead via-20s; vendors/codex.md §2): a
+    /// launch on the [`HandshakeBound::First`] bound holds this permit
+    /// from before its process starts until its handshake succeeds or,
+    /// when it fails, until its launch is retired ([`Instance::first_start`];
+    /// released even when Host's cleanup is uncertain). Every
+    /// server of the registry shares one SQLite home, the adapter's, and
+    /// a second server starting on an unmarked home dies after Codex's
+    /// own 30 s backfill wait.
+    first_start: Arc<tokio::sync::Semaphore>,
     /// Test builds: scripted opens the launch job takes before Wire's
     /// (x.3.2 X4, [`Self::script`]).
     #[cfg(any(feature = "test-support", all(test, feature = "test-failpoints")))]
     scripted: Mutex<std::collections::VecDeque<Scripted>>,
 }
 
-/// One scripted open: the connection's test stdio and message half.
+/// One scripted open: the connection's test stdio and message half, or
+/// Wire's acquisition failure.
 #[cfg(any(feature = "test-support", all(test, feature = "test-failpoints")))]
-type Scripted = (Arc<super::testing::TestStdio>, via_wire::WireMessages);
+type Scripted = Result<(Arc<super::testing::TestStdio>, via_wire::WireMessages), WireError>;
 
 /// A pin on one server: a reservation while it launches, a hold once it is
 /// live. Dropping it releases the hold; the last release retires the
@@ -610,6 +652,7 @@ impl Servers {
             unforced: watch::Sender::new(None),
             unwoken: watch::Sender::new(0),
             me: me.clone(),
+            first_start: Arc::new(tokio::sync::Semaphore::new(1)),
             #[cfg(any(feature = "test-support", all(test, feature = "test-failpoints")))]
             scripted: Mutex::default(),
         })
@@ -804,6 +847,7 @@ impl Servers {
                     },
                     work: Some(Work::Launch(Box::new(spec), handshake)),
                     tasks: 0,
+                    first_start: None,
                 },
             );
         }
@@ -1068,7 +1112,10 @@ impl Servers {
             return;
         };
         match (kind, outcome) {
-            (TaskKind::Launch, Some(Outcome::Launch(launched))) => {
+            (TaskKind::Launch, Some(Outcome::Launch(launched, first_start))) => {
+                if launched.is_err() {
+                    instance.first_start = first_start;
+                }
                 Self::publish(registry, (server, &mut instance), launched, (set, kinds));
             }
             (TaskKind::Launch, _) => {
@@ -1253,15 +1300,34 @@ async fn launch(
         }
     };
     tokio::pin!(fenced);
+    // Bead via-20s: a first start waits, within its own deadline, for the
+    // in-flight first start to succeed or for its failed launch to be
+    // retired, before its process starts. Nothing was started while it
+    // waits.
+    let first = match bound {
+        HandshakeBound::First => tokio::select! {
+            permit = timeout_at(
+                deadline.instant(),
+                Arc::clone(&servers.first_start).acquire_owned(),
+            ) => match permit {
+                Ok(Ok(permit)) => Some(permit),
+                // The semaphore is never closed.
+                Ok(Err(_)) => return Outcome::Launch(Err(LaunchFailure::Internal.into()), None),
+                Err(_) => return Outcome::Launch(Err(LaunchFailure::Deadline.into()), None),
+            },
+            () = &mut fenced => return Outcome::Launch(Err(LaunchFailure::Shutdown.into()), None),
+        },
+        HandshakeBound::Warm => None,
+    };
     // The open stays inside the fence's select, under the same deadline
     // and signals, its Wire error unchanged (x.3.2 X4, Sol d8).
     let opened = tokio::select! {
         opened = servers.open(spec, deadline) => opened,
-        () = &mut fenced => return Outcome::Launch(Err(LaunchFailure::Shutdown.into())),
+        () = &mut fenced => return Outcome::Launch(Err(LaunchFailure::Shutdown.into()), first),
     };
     let (stdio, messages) = match opened {
         Ok(parts) => parts,
-        Err(error) => return Outcome::Launch(Err(acquire_failure(&error).into())),
+        Err(error) => return Outcome::Launch(Err(acquire_failure(&error).into()), first),
     };
     let connection = Connection::over(server.clone(), stdio, servers.declines);
     servers.install(&server, &connection);
@@ -1272,17 +1338,35 @@ async fn launch(
         deadline.instant(),
         handshake(&connection, deadline, &observed),
     );
-    let outcome = tokio::select! {
-        facts = handshake => match facts {
+    let (outcome, ended) = tokio::select! {
+        facts = handshake => (match facts {
             Ok(Ok(facts)) => Ok(facts),
             Ok(Err(failure)) => Err(failure),
             Err(_) => Err(LaunchFailure::Deadline),
-        },
-        end = task.as_mut() => Err(match end {
-            ConnectionEnd::Failed(loss) => LaunchFailure::Lost(loss.cause),
-            ConnectionEnd::Retired => LaunchFailure::Lost(LossCause::TransportLost),
-        }),
-        () = &mut fenced => Err(LaunchFailure::Shutdown),
+        }, false),
+        end = task.as_mut() => (Err(LaunchFailure::Lost(loss_of(end))), true),
+        () = &mut fenced => (Err(LaunchFailure::Shutdown), false),
+    };
+    // Bead via-20s: a handshake request fails `Lost` as the connection
+    // fails, before its task has Host's evidence; the task's own end
+    // classifies the loss (a confirmed exit is `ServerLost`). Awaited
+    // within the handshake's deadline; at it, or at the fence, the
+    // request's cause stands and the unfinished task is dropped, as any
+    // failed launch's is: its retirement closes the connection.
+    let outcome = match outcome {
+        Err(LaunchFailure::Lost(cause)) if !ended => Err(LaunchFailure::Lost(tokio::select! {
+            end = timeout_at(deadline.instant(), task.as_mut()) => end.map_or(cause, loss_of),
+            () = &mut fenced => cause,
+        })),
+        outcome => outcome,
+    };
+    // A successful first start initialized the home: the next may begin
+    // now. A failed one's permit is held until its launch is retired.
+    let first = if outcome.is_ok() {
+        drop(first);
+        None
+    } else {
+        first
     };
     Outcome::Launch(
         outcome
@@ -1291,7 +1375,16 @@ async fn launch(
                 failure,
                 user_agent: observed.get().cloned(),
             }),
+        first,
     )
+}
+
+/// The loss a connection task's end reports to its launch.
+fn loss_of(end: ConnectionEnd) -> LossCause {
+    match end {
+        ConnectionEnd::Failed(loss) => loss.cause,
+        ConnectionEnd::Retired => LossCause::TransportLost,
+    }
 }
 
 impl Servers {
@@ -1306,7 +1399,8 @@ impl Servers {
         deadline: Deadline,
     ) -> Result<(Arc<dyn Stdio>, WireMessages), WireError> {
         #[cfg(any(feature = "test-support", all(test, feature = "test-failpoints")))]
-        if let Some((stdio, messages)) = self.scripted_next() {
+        if let Some(scripted) = self.scripted_next() {
+            let (stdio, messages) = scripted?;
             stdio.hold(Box::new(spec));
             return Ok((stdio, messages));
         }
@@ -1355,8 +1449,24 @@ impl Servers {
         self.scripted
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push_back((Arc::clone(&test_stdio), pipes.messages));
+            .push_back(Ok((Arc::clone(&test_stdio), pipes.messages)));
         (super::testing::VendorEnds::new(stdout, stdin), test_stdio)
+    }
+
+    /// Queues one scripted open that fails as Host's acquisition would when
+    /// Host stops before anything of the turn was sent: nothing launched,
+    /// Host's cleanup `cleanup`.
+    pub fn script_stopped(&self, cleanup: Option<WireCleanup>) {
+        self.scripted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push_back(Err(WireError::Acquire {
+                cause: Box::new(WireError::Host(HostError::Stopped)),
+                launched: false,
+                cleanup,
+                forced: false,
+                journal_uncertain: false,
+            }));
     }
 
     /// The next scripted open, if one is queued.
@@ -1584,5 +1694,41 @@ mod handle_tests {
         let far = Deadline::at(Instant::now() + Duration::from_secs(5));
         assert!(handle.join(far).await, "the ended supervisor joins");
         assert!(handle.handle().is_none(), "released once it ended");
+    }
+}
+
+#[cfg(test)]
+mod route_failure_tests {
+    use via_wire::WireCleanup;
+
+    use super::{AcquireCause, LaunchFailure};
+    use crate::{RouteError, TurnNumber};
+
+    /// Bead via-20s review #3 (C2 §2: a turn whose own server acquisition
+    /// failed takes Host's acquisition evidence): a failed acquisition's
+    /// cleanup and force facts reach the waiting turn's failure, which
+    /// still never launched.
+    #[test]
+    fn an_acquisition_failure_keeps_hosts_cleanup() {
+        let turn = TurnNumber::try_from(1).unwrap();
+        for (cleanup, forced) in [
+            (Some(WireCleanup::Uncertain), true),
+            (Some(WireCleanup::Quiescent), false),
+            (None, false),
+        ] {
+            let failure = LaunchFailure::Acquire {
+                cause: AcquireCause::Transport,
+                launched: true,
+                cleanup,
+                forced,
+                journal_uncertain: false,
+                launch: None,
+            }
+            .route_failure(turn);
+            assert_eq!(failure.cause, RouteError::TransportLost { turn });
+            assert!(!failure.launched, "nothing of the turn was sent");
+            assert_eq!(failure.cleanup, cleanup);
+            assert_eq!(failure.forced, forced);
+        }
     }
 }

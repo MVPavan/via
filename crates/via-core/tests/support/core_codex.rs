@@ -171,10 +171,35 @@ impl CodexCase {
     }
 }
 
-/// Rewrites the recorded cwd to `cwd` throughout `replay`, checking that
-/// each of the `thread/start` and `turn/start` expectations and the thread
-/// reply's echo had one, and that none is left.
+/// Rewrites the recorded cwd to `cwd` throughout `replay`, each of a
+/// lifetimes fixture's lifetimes too, checking that the `thread/start`
+/// and `turn/start` expectations and the thread reply's echo had one, and
+/// that none is left.
 fn rewrite(replay: &mut Value, cwd: &str) {
+    let (thread_start, turn_start, echo) =
+        match replay.get_mut("lifetimes").and_then(Value::as_array_mut) {
+            Some(lifetimes) => lifetimes
+                .iter_mut()
+                .map(|fixture| rewrite_steps(fixture, cwd))
+                .fold((0, 0, 0), |sum, counts| {
+                    (sum.0 + counts.0, sum.1 + counts.1, sum.2 + counts.2)
+                }),
+            None => rewrite_steps(replay, cwd),
+        };
+    assert!(
+        thread_start > 0 && turn_start > 0 && echo > 0,
+        "the fixture changed: rewrites thread/start {thread_start}, \
+         turn/start {turn_start}, thread echo {echo}"
+    );
+    assert!(
+        !replay.to_string().contains(RECORDED),
+        "the recorded cwd is left in the copy"
+    );
+}
+
+/// [`rewrite`] of one fixture's steps: how many `thread/start` and
+/// `turn/start` leaves and thread reply echoes moved.
+fn rewrite_steps(replay: &mut Value, cwd: &str) -> (usize, usize, usize) {
     let (mut thread_start, mut turn_start, mut echo) = (0, 0, 0);
     for step in replay["steps"].as_array_mut().unwrap() {
         if let Some(expect) = step.get_mut("expect") {
@@ -193,15 +218,7 @@ fn rewrite(replay: &mut Value, cwd: &str) {
             emit["line"] = Value::String(line);
         }
     }
-    assert!(
-        thread_start > 0 && turn_start > 0 && echo > 0,
-        "the fixture changed: rewrites thread/start {thread_start}, \
-         turn/start {turn_start}, thread echo {echo}"
-    );
-    assert!(
-        !replay.to_string().contains(RECORDED),
-        "the recorded cwd is left in the copy"
-    );
+    (thread_start, turn_start, echo)
 }
 
 /// Rewrites the recorded cwd at `value`'s string leaves; returns how many.

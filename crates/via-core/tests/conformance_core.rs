@@ -4769,6 +4769,133 @@ fn codex_sqlite_home_persists_across_restart() {
     });
 }
 
+/// Bead via-20s (live 2026-10-06, Codex 0.160.0): a Codex server that
+/// dies during its handshake, before any of the waiting turn was sent,
+/// fails that turn definitively: `server_lost` on Host's confirmed exit,
+/// never `unknown`. So the turn queued behind it is not cancelled (C1 P6)
+/// and runs on the next server.
+#[test]
+fn codex_handshake_death_fails_and_keeps_the_queue() {
+    const NAME: &str = "codex_handshake_death_fails_and_keeps_the_queue";
+    let Some(root) = child(NAME, &no_fake(), &[]) else {
+        return;
+    };
+    let full = echo_copy(C1_PROMPT);
+    let initialize = full["steps"][0].clone();
+    assert_eq!(initialize["expect"]["line"]["method"], "initialize");
+    let mut dying = full.clone();
+    // As live: the second server's backfill wait timed out and it exited.
+    dying["steps"] = json!([
+        initialize,
+        {"await_signal": {"signal": "SIGUSR1"}},
+        {"exit": {"code": 1, "stderr": "Error: failed to initialize sqlite state runtime\n"}},
+    ]);
+    let replay = json!({
+        "source": format!("{NAME}: c1_commentary_usage, its first server dying at its handshake"),
+        "lifetimes": [dying, full],
+    });
+    let case = codex_case(&root, NAME, replay);
+    run(async {
+        let daemon = Daemon::open_with(&root, case.config());
+        let session = daemon.spawn(C1_PROMPT, &codex_spawn(&case, 60_000)).await;
+        assert_eq!(case.at(2).await, 1, "the first server holds its handshake");
+        daemon.resume(&session, C1_PROMPT).await;
+        case.signal(1);
+        let failed = daemon.wait(&session, 1).await;
+        assert_eq!(failed["state"], "failed", "{failed}");
+        assert_eq!(class(&failed), "server_lost", "{failed}");
+        assert_eq!(failed["timestamps"]["accepted_at"], Value::Null, "{failed}");
+        case.at_launch(ECHO_GATE, 2).await;
+        case.signal(2);
+        let next = daemon.wait(&session, 2).await;
+        assert_eq!(next["state"], "completed", "{next}");
+        daemon.close(&session).await;
+        daemon.shutdown().await;
+    });
+}
+
+/// Bead via-20s review #1: once any byte of a turn reached Wire, its
+/// later request proven unwritten does not erase that. The first turn's
+/// `thread/start` (with its settings) is answered; its `turn/start` is
+/// queued and held before its hand-off to Wire (`codex.feeder.queued`
+/// paused at the second data input); then the connection task fails
+/// (`codex.connection.message` at the next vendor line), the server
+/// unconfirmed, so the queued `turn/start` answers `NotWritten`. The turn
+/// ends `unknown`, never `failed(submit_failed)`: the vendor already had
+/// the turn's thread request.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn codex_unwritten_turn_start_after_thread_start_is_unknown() {
+    const NAME: &str = "codex_unwritten_turn_start_after_thread_start_is_unknown";
+    const QUEUED: &str = "codex.feeder.queued";
+    const MESSAGE: &str = "codex.connection.message";
+    let Some(root) = child(NAME, &no_fake(), &[]) else {
+        return;
+    };
+    via_store::failpoint::activate(&root.join("points"), "conformance-core").unwrap();
+    let full = echo_copy(C1_PROMPT);
+    let steps = full["steps"].as_array().unwrap();
+    assert_eq!(steps[6]["expect"]["line"]["method"], "thread/start");
+    assert_eq!(steps[9]["expect"]["line"]["method"], "turn/start");
+    assert!(
+        steps[8]["emit"]["line"]
+            .as_str()
+            .unwrap()
+            .contains("\"thread/started\""),
+        "step 9 is the thread's start notification"
+    );
+    assert!(
+        steps[4]["emit"]["line"]
+            .as_str()
+            .unwrap()
+            .contains("\"remoteControl/status/changed\""),
+        "step 5 is an unrelated notification"
+    );
+    let mut cut = full.clone();
+    let mut held: Vec<Value> = steps[..9].to_vec();
+    held.push(json!({"await_signal": {"signal": "SIGUSR1"}}));
+    let gate = held.len();
+    held.push(steps[4].clone());
+    // Never met: the connection fails first, and the server is stopped.
+    held.push(steps[9].clone());
+    held.push(json!({"await_eof": {}}));
+    let line = held
+        .iter()
+        .filter(|step| step.get("emit").is_some())
+        .count();
+    cut["steps"] = Value::Array(held);
+    // The thread/start is data input 1, the turn/start 2.
+    arm_at(&root, QUEUED, 2, "pause");
+    arm_at(&root, MESSAGE, u64::try_from(line).unwrap(), "fail_io");
+    let case = codex_case(&root, NAME, cut);
+    run(async {
+        let daemon = Daemon::open_with(&root, case.config());
+        let session = daemon.spawn(C1_PROMPT, &codex_spawn(&case, 60_000)).await;
+        until_acked(&root, QUEUED, 2).await;
+        case.at_launch(gate, 1).await;
+        case.signal(1);
+        let lost = daemon.wait(&session, 1).await;
+        assert_eq!(lost["state"], "unknown", "{lost}");
+        assert_eq!(lost["failure"], Value::Null, "{lost}");
+        release_point(&root, QUEUED, 2);
+        daemon.close(&session).await;
+        let report = daemon
+            .engine
+            .shutdown(Deadline::at(
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            ))
+            .await;
+        daemon.starter.abort();
+        // The one failed task is the connection task this case failed.
+        assert_eq!(
+            (report.failed_tasks, report.pending_tasks),
+            (1, 0),
+            "{report:?}"
+        );
+        assert_eq!(report.unresolved_turns, 0, "{report:?}");
+    });
+}
+
 /// `codex_rss_leases` (x.3.2 X5, X0 item 9.2): the sessions leased on one
 /// server, each with one active turn.
 #[cfg(feature = "test-failpoints")]

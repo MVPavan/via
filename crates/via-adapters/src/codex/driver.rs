@@ -64,7 +64,7 @@ use super::{ADAPTER_VERSION, CodexAdapter, HARNESS, PerTurn, refusals};
 use crate::driver::turn::{CLEANUP_ALLOWANCE, end_active};
 use crate::driver::{
     Active, ConnectionPin, DriverState, ForceWatch, Prepared, Retiring, SessionDriver, TurnCx,
-    TurnSpec, latch, lock, rejected,
+    TurnSpec, latch, lock, quiescent, rejected,
 };
 use crate::harness::Harness;
 use crate::instance::Incompatibility;
@@ -605,10 +605,10 @@ impl Drop for Settle<'_> {
 }
 
 /// The session's cleanup facts after a later turn: uncertainty a turn
-/// left on the shared server is never erased by a later turn (ruling 6).
+/// left on the shared server is never erased by a later turn (ruling 6),
+/// nor is Host's `Uncertain` for an acquisition that launched nothing.
 fn sticky(earlier: Retirement, later: Retirement) -> Retirement {
-    let open = |facts: &Retirement| facts.launched && facts.cleanup != Some(WireCleanup::Quiescent);
-    let uncertain = open(&earlier) || open(&later);
+    let uncertain = !quiescent(&earlier) || !quiescent(&later);
     Retirement {
         launched: earlier.launched || later.launched,
         exit: None,
@@ -989,15 +989,31 @@ struct Turn<'a> {
     instance: Option<InstanceReport>,
     /// The turn's first byte was handed to Wire (X0 item 1.6).
     launched: bool,
+    /// An earlier request of the turn (its `thread/start` or
+    /// `thread/resume`) was handed to Wire before the current one, and
+    /// answered: delivery evidence a later request proven unwritten never
+    /// erases (bead via-20s review #1).
+    delivered: bool,
     /// The settlement, which learns the same.
     settle: &'a Settle<'a>,
 }
 
 impl Turn<'_> {
-    /// A byte of the turn was handed to Wire.
+    /// A byte of the turn was handed to Wire: its current request's.
     fn launch(&mut self) {
+        self.delivered = self.launched;
         self.launched = true;
         self.settle.launched();
+    }
+
+    /// The turn's facts when its current request was proven unwritten:
+    /// launched only if an earlier request of it was delivered.
+    fn unsent(&self) -> Self {
+        Turn {
+            launched: self.delivered,
+            instance: self.instance.clone(),
+            ..*self
+        }
     }
 
     /// The turn's end with `cause`, latched in the health lane as C2 §2
@@ -1031,7 +1047,15 @@ impl Turn<'_> {
                 // A server route's turn has no exit of its own (C2 §2).
                 exit: None,
                 launched: self.launched,
-                cleanup: loss.map_or(live, |loss| Some(loss.cleanup)),
+                // A turn that sent nothing has the no-launch evidence (C2
+                // §2): its server's loss cleanup is not its own, and an
+                // unlaunched failure's cleanup is only acquisition evidence
+                // (bead via-20s review #3).
+                cleanup: if self.launched {
+                    loss.map_or(live, |loss| Some(loss.cleanup))
+                } else {
+                    None
+                },
                 forced: false,
                 journal_uncertain,
                 acknowledged: false,
@@ -1293,6 +1317,7 @@ async fn turn(
         number: turn,
         instance: None,
         launched: false,
+        delivered: false,
         settle,
     };
     let folder = match folder(&facts).await {
@@ -2143,14 +2168,7 @@ fn lost(facts: &Turn<'_>, connection: &Connection, cause: Unanswered) -> TurnEnd
         None => facts.failed(RouteError::TransportLost { turn }, None),
     };
     match cause {
-        Unanswered::NotWritten(SendOutcome::NotWritten) => {
-            let unsent = Turn {
-                launched: false,
-                instance: facts.instance.clone(),
-                ..*facts
-            };
-            ended(&unsent)
-        }
+        Unanswered::NotWritten(SendOutcome::NotWritten) => ended(&facts.unsent()),
         Unanswered::Lost | Unanswered::NotWritten(_) => ended(facts),
         // A stop's cleanup is uncertain: the written request may have
         // started work the vendor never reported, and early traffic of it
@@ -2183,12 +2201,7 @@ fn lost(facts: &Turn<'_>, connection: &Connection, cause: Unanswered) -> TurnEnd
             if launched {
                 facts.failure(cause, None, Some(WireCleanup::Uncertain))
             } else {
-                Turn {
-                    launched: false,
-                    instance: facts.instance.clone(),
-                    ..*facts
-                }
-                .failed(cause, None)
+                facts.unsent().failed(cause, None)
             }
         }
     }

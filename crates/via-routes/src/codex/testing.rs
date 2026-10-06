@@ -102,6 +102,9 @@ pub struct TestStdio {
     closes: AtomicUsize,
     /// What Host's stop reports.
     stop: Mutex<StopFacts>,
+    /// While set, every Host close is held unanswered: the process
+    /// lingers ([`Self::hold_closes`]).
+    close_held: tokio::sync::watch::Sender<bool>,
     /// The folder Wire keeps an undecoded message in.
     _scratch: Scratch,
 }
@@ -116,6 +119,7 @@ impl TestStdio {
             held: Mutex::new(None),
             closes: AtomicUsize::new(0),
             stop: Mutex::new(StopFacts::default()),
+            close_held: tokio::sync::watch::Sender::new(false),
             _scratch: scratch,
         }
     }
@@ -123,6 +127,18 @@ impl TestStdio {
     /// Host's stop reports `facts` from now on.
     pub fn report_stop(&self, facts: StopFacts) {
         *self.stop.lock().unwrap_or_else(PoisonError::into_inner) = facts;
+    }
+
+    /// Holds every Host close (asked now or later) unanswered until
+    /// [`Self::release_closes`]: the process lingers. A held close is
+    /// counted by [`Self::closes`] when it is asked.
+    pub fn hold_closes(&self) {
+        self.close_held.send_replace(true);
+    }
+
+    /// Answers the held closes, and every later one at once.
+    pub fn release_closes(&self) {
+        self.close_held.send_replace(false);
     }
 
     /// Wire's test input.
@@ -205,7 +221,11 @@ impl Stdio for TestStdio {
             .take();
         drop(held);
         let facts = *self.stop.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut held = self.close_held.subscribe();
         Box::pin(async move {
+            // The sender lives as long as this stdio: an error cannot occur
+            // while the close is polled.
+            let _released = held.wait_for(|held| !*held).await;
             WireCloseReport {
                 cleanup: facts.cleanup,
                 vendor_exit: facts.vendor_exit,
@@ -357,6 +377,21 @@ impl VendorEnds {
     /// When VIA's handshake differs.
     pub async fn handshake(&mut self, user_agent: &str, models: &[Value]) {
         let initialize = self.read().await;
+        self.answer_handshake(&initialize, user_agent, models).await;
+    }
+
+    /// [`Self::handshake`] after its `initialize` was read: the reply,
+    /// then `initialized` and one `model/list` page listing `models`.
+    ///
+    /// # Panics
+    ///
+    /// When VIA's handshake differs.
+    pub async fn answer_handshake(
+        &mut self,
+        initialize: &Value,
+        user_agent: &str,
+        models: &[Value],
+    ) {
         assert_eq!(initialize["method"], "initialize", "{initialize}");
         self.emit(&serde_json::json!({
             "id": initialize["id"],

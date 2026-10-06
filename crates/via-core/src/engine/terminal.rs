@@ -247,9 +247,10 @@ fn assemble(
     envelope
 }
 
-/// Maps a typed route cause onto C1 §7.6 state, §8.2 class and stop reason.
-fn route_disposition(cause: &RouteError) -> (&'static str, Option<FailureClass>, &'static str) {
-    match cause {
+/// Maps a typed route failure onto C1 §7.6 state, §8.2 class and stop
+/// reason.
+fn route_disposition(route: &RouteFailure) -> (&'static str, Option<FailureClass>, &'static str) {
+    match &route.cause {
         RouteError::Protocol { .. } => ("failed", Some(FailureClass::Protocol), "error"),
         RouteError::ProcessExited { .. } => ("failed", Some(FailureClass::ProcessExited), "error"),
         RouteError::Overflow { .. } => ("failed", Some(FailureClass::Overflow), "error"),
@@ -269,6 +270,13 @@ fn route_disposition(cause: &RouteError) -> (&'static str, Option<FailureClass>,
         RouteError::ForceStopped { .. } | RouteError::Stopped { .. } => {
             ("cancelled", None, "interrupted")
         }
+        // C1 §7.6 (bead via-20s): nothing of the turn reached a vendor (C2
+        // §2 no-launch evidence: a server's launch or handshake failed, or
+        // a private process was never armed), so its submission failed
+        // definitively.
+        RouteError::TransportLost { .. } if !route.launched => {
+            ("failed", Some(FailureClass::SubmitFailed), "error")
+        }
         // Input may have reached the vendor and no exit is confirmed (§7.6).
         RouteError::TransportLost { .. } => ("unknown", None, "error"),
     }
@@ -276,9 +284,12 @@ fn route_disposition(cause: &RouteError) -> (&'static str, Option<FailureClass>,
 
 /// C1 §5 `failure.data` of an adapter-side `submit_failed`: the reason,
 /// and with `invalid_param` the C1 parameter; never vendor text.
-fn submit_data(cause: &RouteError) -> Option<serde_json::Value> {
-    match cause {
+fn submit_data(route: &RouteFailure) -> Option<serde_json::Value> {
+    match &route.cause {
         RouteError::HandshakeRefused { .. } => Some(json!({"reason": "handshake_refused"})),
+        RouteError::TransportLost { .. } if !route.launched => {
+            Some(json!({"reason": "launch_failed"}))
+        }
         RouteError::InvalidParam { field, .. } => {
             Some(json!({"reason": "invalid_param", "field": field}))
         }
@@ -690,8 +701,8 @@ fn failed_terminal(error: &AdapterError, vendor: Option<&VendorTerminal>) -> Ter
     let exit = exit_of(&error.evidence());
     let (state, class, stop_reason, data) = match error {
         AdapterError::Route(route) => {
-            let (state, class, stop_reason) = route_disposition(&route.cause);
-            (state, class, stop_reason, submit_data(&route.cause))
+            let (state, class, stop_reason) = route_disposition(route);
+            (state, class, stop_reason, submit_data(route))
         }
         // C1 §8.2: a definite rejection before acceptance; only the
         // adapter-side rejections name their reason (C1 §5 `failure.data`).
@@ -978,9 +989,44 @@ mod tests {
             "{}",
             failure.message
         );
-        let lost = failed_terminal(route(RouteError::TransportLost { turn }, None));
+        let lost = failed_terminal(AdapterError::Route(RouteFailure {
+            launched: true,
+            ..route_failure(RouteError::TransportLost { turn })
+        }));
         assert_eq!(lost.state, "unknown");
         assert!(lost.failure.is_none());
+    }
+
+    /// Bead via-20s (C1 §7.6, C2 §2 no-launch evidence): a transport loss
+    /// before any of the turn reached a vendor (a server's launch or
+    /// handshake failing, a private process never armed) fails the turn
+    /// `submit_failed` with reason `launch_failed`, on a shared server or
+    /// a private one; never `unknown`. Once a byte of it was sent, the
+    /// loss stays `unknown`.
+    #[test]
+    fn a_transport_loss_before_launch_fails_submit() {
+        let turn = TurnNumber::try_from(1).unwrap();
+        for shared in [true, false] {
+            let unsent = failed_terminal(AdapterError::Route(RouteFailure {
+                shared,
+                ..route_failure(RouteError::TransportLost { turn })
+            }));
+            assert_eq!(unsent.state, "failed");
+            assert_eq!(unsent.stop_reason, "error");
+            let failure = unsent.failure.expect("a definitive failure");
+            assert_eq!(failure.class, FailureClass::SubmitFailed);
+            assert_eq!(
+                failure.data,
+                Some(serde_json::json!({"reason": "launch_failed"}))
+            );
+            let sent = failed_terminal(AdapterError::Route(RouteFailure {
+                shared,
+                launched: true,
+                ..route_failure(RouteError::TransportLost { turn })
+            }));
+            assert_eq!(sent.state, "unknown");
+            assert!(sent.failure.is_none());
+        }
     }
 
     fn vendor_terminal(status: via_adapters::VendorTerminalStatus) -> via_adapters::VendorTerminal {

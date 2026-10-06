@@ -833,7 +833,7 @@ below 1 MiB, and a conformance test assembles that maximum.
 
 | Field | Meaning |
 |---|---|
-| `state`, `failure` | §7.2; `failure` = `{class, message, vendor_code?, retryable, data?}` (§8.2). `data` is present only for an adapter-side `submit_failed`, where it has `reason` (`"invalid_param"`, `"handshake_refused"`, `"settings_mismatch"` or `"uncertain_predecessor"`) and, with `invalid_param`, `field` (the C1 parameter name), and, with `settings_mismatch`, optionally `field` (the C1 parameter whose persisted vendor value differs), and for `structured_output_invalid`, where it has `reason` (`"invalid"` or `"validation_limit"`, §5). It is bounded to 256 bytes, never holds vendor text, and follows §8.1's `data.field` naming. `vendor_code` keeps only vendor codes |
+| `state`, `failure` | §7.2; `failure` = `{class, message, vendor_code?, retryable, data?}` (§8.2). `data` is present only for an adapter-side `submit_failed`, where it has `reason` (`"invalid_param"`, `"handshake_refused"`, `"settings_mismatch"`, `"uncertain_predecessor"` or `"launch_failed"`: the vendor launch, server handshake or transport failed before any of the turn was sent, §7.6) and, with `invalid_param`, `field` (the C1 parameter name), and, with `settings_mismatch`, optionally `field` (the C1 parameter whose persisted vendor value differs), and for `structured_output_invalid`, where it has `reason` (`"invalid"` or `"validation_limit"`, §5). It is bounded to 256 bytes, never holds vendor text, and follows §8.1's `data.field` naming. `vendor_code` keeps only vendor codes |
 | `stop_reason` | `end_turn`, `max_steps`, `budget`, `refusal`, `interrupted`, `deadline`, `error`, `other`; vendor word in `vendor_stop_reason` |
 | `cancel` | outcome and cleanup certainty (§3.5, §7.4) |
 | `bound` | requested, effective, and whether it was inherited |
@@ -1005,10 +1005,10 @@ that does not prove its submitted work had no effect.
 | Force deadline, shared server | running | `unknown`, outcome `unknown` |
 | Process exited without terminal result (Host-confirmed) | running | `failed(process_exited)` |
 | Server death (Host-confirmed) | running | `failed(server_lost)`; every session on it |
-| Transport lost, process alive or unconfirmed | running | `unknown` |
+| Transport lost after any of the turn was sent, process alive or unconfirmed | running | `unknown` |
 | Codex per-thread or OpenCode per-session ingress/C2 stall overflow | running on affected thread generation | promptly resolve every nonterminal submitted turn under preceding disposition precedence, interrupt through reserved control, and block same-thread (OpenCode: same-session) dispatch until clean reopen; preserve prior terminal envelopes and other threads |
 | Observation or message overflow failed the connection | running | `failed(overflow)` |
-| Submission rejected definitively | submitting | `failed(submit_failed)` |
+| Submission rejected definitively; or a transport loss, launch or handshake deadline, or launch-task failure before any of the turn was sent (C2 §2 no-launch evidence; `failure.data.reason: launch_failed`; protocol, overflow, Store and stop failures keep their own rows) | submitting | `failed(submit_failed)` |
 | Daemon restart | any | §7.5 |
 | Late vendor terminal for an `unknown` turn | unknown | revise to that state, `revision + 1`, `turn.revised`; a caller that already read the result must read it again. The terminal is attributed through the vendor turn ID recorded at acceptance, never by position, so a turn never accepted is not revised. Only a caller `cancel` or `close` that stopped the turn makes an `interrupted` terminal `cancelled`; otherwise (a Core deadline, a Store or protocol stop) it is classified as a vendor terminal (§8.2). A stored cancel outcome `unknown` or `requested` becomes `acknowledged` for an `interrupted` terminal; for any other terminal `unknown` becomes `requested`; `acknowledged` and `forced` stand |
 | Native input cancellation | running or unknown | OpenCode `session.inbox.cancelled` of the turn's caller input ID, never delivered, is a vendor `interrupted` terminal with no execution: after a caller cancel/close → `cancelled`, `acknowledged`, cleanup `quiescent`; after a Core deadline's cleanup step the deadline failure stands; for an `unknown` turn whose acceptance was recorded it revises like a late terminal (→ `cancelled`). On `opencode-serve` the vendor turn ID is the caller input ID. |
@@ -1070,7 +1070,7 @@ receipt. An unkeyed caller must not resend the request.
 | Class | Meaning | Set by |
 |---|---|---|
 | `deadline_wall`, `deadline_idle` | Core deadline | Core |
-| `submit_failed` | the submission was rejected before acceptance, either by the vendor or by the adapter before any vendor submission (a failed handshake check, a parameter the discovered catalog rejects, or an earlier launch of the session not proven gone; C2 §5); `failure.data` names the adapter-side reason | Core (from adapter rejection or observation) |
+| `submit_failed` | the submission was rejected before acceptance, either by the vendor or by the adapter before any vendor submission (a failed handshake check, a parameter the discovered catalog rejects, an earlier launch of the session not proven gone, C2 §5; or a launch, handshake or transport failure before any of the turn was sent, §7.6); `failure.data` names the adapter-side reason | Core (from adapter rejection or observation) |
 | `resume_mismatch` | vendor returned a different or fresh session | Adapter observation |
 | `vendor_error` | vendor turn failure; `vendor_code` keeps the vendor's code | Adapter |
 | `rate_limit`, `auth`, `context_exceeded`, `budget_exceeded` | specific vendor classes | Adapter |

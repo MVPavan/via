@@ -962,12 +962,7 @@ impl SessionDriver {
                 let _delivered = tokio::time::timeout_at(deadline.instant(), delivered).await;
             }
             health.send_replace(DriverHealth::Closed);
-            let quiescent = match retirement {
-                Some(retirement) => {
-                    !retirement.launched || retirement.cleanup == Some(WireCleanup::Quiescent)
-                }
-                None => true,
-            };
+            let quiescent = retirement.as_ref().is_none_or(quiescent);
             CloseReport {
                 vendor_closed,
                 process_exit: retirement
@@ -1007,6 +1002,19 @@ impl SessionDriver {
     }
 }
 
+/// Whether a retirement's cleanup is proven: Host's explicit `Uncertain`
+/// outranks "nothing launched" (an acquisition's cleanup Host could not
+/// verify; bead via-20s), and an unlaunched one without it is clean unless
+/// a Host journal write was uncertain, as its turn reported
+/// (`TurnEvidence::no_launch`).
+pub(crate) fn quiescent(retirement: &Retirement) -> bool {
+    match retirement.cleanup {
+        Some(WireCleanup::Quiescent) => true,
+        Some(WireCleanup::Uncertain) => false,
+        None => !retirement.launched && !retirement.journal_uncertain,
+    }
+}
+
 /// The session or its pinned connection is gone: nothing launched.
 fn session_gone() -> AdapterError {
     AdapterError::Rejected {
@@ -1023,5 +1031,41 @@ pub(crate) fn rejected(error: AdapterError) -> TurnEnd {
         instance: None,
         leftovers: None,
         outcome: Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Retirement, WireCleanup, quiescent};
+
+    fn retirement(
+        launched: bool,
+        cleanup: Option<WireCleanup>,
+        journal_uncertain: bool,
+    ) -> Retirement {
+        Retirement {
+            launched,
+            exit: None,
+            cleanup,
+            forced: false,
+            journal_uncertain,
+        }
+    }
+
+    #[test]
+    fn an_unlaunched_retirement_is_quiescent_only_with_a_certain_journal() {
+        assert!(quiescent(&retirement(false, None, false)));
+        assert!(!quiescent(&retirement(false, None, true)));
+        assert!(!quiescent(&retirement(true, None, false)));
+        assert!(!quiescent(&retirement(
+            false,
+            Some(WireCleanup::Uncertain),
+            false
+        )));
+        assert!(quiescent(&retirement(
+            true,
+            Some(WireCleanup::Quiescent),
+            false
+        )));
     }
 }

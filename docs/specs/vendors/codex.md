@@ -118,6 +118,32 @@ the first model output 56.9 s (wall clock); the next daemon start found
 the marker and accepted the turn 0.34 s after spawn, daemon start
 included.
 
+Concurrent first starts (via-20s; live 2026-10-06 on 0.160.0, checked):
+two servers of different keys (different `vendor_args`) launched together
+on an unmarked home. The second logged `state db backfill is running …;
+waiting up to 30s` and exited when Codex's own fixed 30 s wait timed out,
+so VIA's 300 s bound protected only the first. While the home has no
+marker, the registry therefore runs one first start at a time: a later
+first-start launch waits until the in-flight one's handshake succeeded or,
+if it failed, until that failed launch was retired through Host (stdin
+closed, then Host's stop), within its own handshake deadline (counted from
+its launch's start, so the wait spends it), and only then starts its
+process. A failed acquisition releases at once, since Host's acquisition
+already cleaned up. Limitation: the release does not wait for proof the
+failed initializer stopped; when Host reports that cleanup `uncertain` the
+next first start proceeds anyway, and may meet the same 30 s wait if the
+old process still indexes (no fence; revisit if observed). Likewise, a
+panic of the launch task drops the permit with the task, and a panic of
+the failed launch's retirement task drops it when the supervisor removes
+the instance after collecting the panic; either way before the retirement
+ended, so a later first start may overlap the old process (an abnormal path; revisit if observed).
+Launches on a
+marked home are not serialized, and equal keys still share one launch. A server that dies during its handshake fails its
+waiting turns `server_lost` when Host confirms the exit; a transport loss,
+handshake deadline or launch-task failure before a turn's first byte fails
+it `submit_failed` (`launch_failed`), never `unknown`. A malformed reply,
+overflow, Store failure or shutdown keeps its own disposition (C1 §7.6).
+
 Each session has one lease and a registered thread ID. One shared server holds
 one of the runtime's harness-process slots (runtime §8) for its life; a turn on a live
 server pins it and takes no further slot (C2 §3 connection admission). No
