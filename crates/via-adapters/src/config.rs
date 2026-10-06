@@ -225,7 +225,7 @@ fn default_harness(name: &str) -> HarnessConfig {
 
 /// Harness `name`'s default inherited-configuration request: OD2's (hooks
 /// and MCP servers off, the rest on), except Codex's, every category on:
-/// what Codex delivers when VIA disables nothing but memories (owner,
+/// VIA disables nothing in Codex but memories, so no switch applies (owner,
 /// 2026-10-05; vendor packet §4).
 fn default_inherit(name: &str) -> Inherit {
     let mut inherit = Inherit::OD2_DEFAULT;

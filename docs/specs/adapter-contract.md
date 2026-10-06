@@ -840,12 +840,23 @@ category (hooks, MCP servers, plugins, skills, agents, instruction files):
 
 Settings come from `AdapterConfig` (`daemon.json`
 `harnesses.<name>.inherit.*`; default hooks and MCP servers off, the rest on,
-except Codex's every category on, what it delivers with no switch; owner
+except Codex's every category on, so no switch is applied by default; owner
 2026-10-05)
 and are frozen per session at spawn. For each category the route records the
-**effective state**: `on` or `off` only when verified (a verified switch, the
-private profile, or an inventory that lists or omits the category), else
-`unknown`. Whenever the effective state is not the verified requested state,
+**effective state** (owner, 2026-10-06): `on`/`off` when verified by a
+switch, the private profile, an inventory, or, for `on` with no switch,
+recorded live evidence in the vendor packet that the vendor version loads
+the user's configuration for that category; `on` means the user's
+configuration applies, whatever it contains (a category the user's own
+configuration turns off is still `on`). Anything else is `unknown`, including
+an `off` VIA cannot apply. The evidence requirement: the evidence is recorded
+against the packet's checked versions. Today the declarations are compiled
+per adapter, not per version, and are frozen at spawn before the instance's
+version is read, so a session on a version outside `checked` reports the same
+states, with `vendor_version_untested` (§5) marking that the evidence was
+recorded on another version; a packet declares `on` only where its evidence
+supports it. No per-version mechanism exists. Whenever the effective state is
+not the verified requested state,
 for any reason (the request cannot be applied, the switch is unverified, or
 no switch is applied and the vendor default is unverified), the spawn
 receipt and every turn envelope carry one warning `config_switch_unverified`

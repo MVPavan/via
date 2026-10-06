@@ -208,14 +208,16 @@ fn no_request_disables_the_apps_server() {
     }
 }
 
-/// Owner 2026-10-05: Codex's default request is what it delivers when VIA
-/// disables nothing: hooks and MCP servers on (both seen loading with no
-/// switch), so neither warns; the other categories stay `unknown` (no
-/// verified default) and warn as before. MCP servers off has no switch:
-/// they load, so the request warns with `on`. Hooks off keeps its
-/// verified `--disable hooks`.
+/// Owner 2026-10-06 (C2 §6.2): with no switch, a category is `on` where
+/// recorded live evidence shows Codex loads the user's configuration for
+/// it (packet §4): hooks (the owner's hooks ran), MCP servers (the user's
+/// servers and `codex_apps` started) and instruction files
+/// (`instructionSources` listed the loaded AGENTS.md). Plugins, skills and
+/// agents have none: `unknown`, warning. Hooks off is the verified
+/// `--disable hooks`; an off VIA cannot apply is `unknown`, never a
+/// claimed suppression.
 #[test]
-fn codex_categories_report_what_codex_delivers() {
+fn codex_categories_follow_the_recorded_evidence() {
     use crate::plan::Category;
     use InheritState::{Off, On, Unknown};
     let harness = crate::Harness::Vendor(
@@ -230,7 +232,7 @@ fn codex_categories_report_what_codex_delivers() {
     for category in Category::ALL {
         assert_eq!(default.get(category), On, "{category:?}");
     }
-    let warned = |requested| {
+    let planned = |requested| {
         let (plan, warning) = crate::plan::effective_inherit(&super::plan::categories(), requested);
         let listed: Vec<String> = warning
             .and_then(|warning| warning.data)
@@ -241,14 +243,22 @@ fn codex_categories_report_what_codex_delivers() {
             .collect();
         (plan.effective, listed)
     };
-    let (effective, listed) = warned(default);
-    assert_eq!(effective.get(Category::Hooks), On);
-    assert_eq!(effective.get(Category::McpServers), On);
-    assert_eq!(effective.get(Category::Plugins), Unknown);
-    assert_eq!(listed, ["plugins", "skills", "agents", "instruction_files"]);
-    let (effective, listed) = warned(inherit(Off, Off));
-    assert_eq!(effective.get(Category::Hooks), Off);
-    assert_eq!(effective.get(Category::McpServers), On);
+    let states = |effective: Inherit| Category::ALL.map(|category| effective.get(category));
+    let (effective, listed) = planned(default);
+    assert_eq!(
+        states(effective),
+        [On, On, Unknown, Unknown, Unknown, On],
+        "hooks, MCP servers, plugins, skills, agents, instruction files"
+    );
+    assert_eq!(listed, ["plugins", "skills", "agents"]);
+    let off: Inherit = serde_json::from_value(json!({"hooks": "off", "mcp_servers": "off",
+        "plugins": "off", "skills": "off", "agents": "off", "instruction_files": "off"}))
+    .unwrap();
+    let (effective, listed) = planned(off);
+    assert_eq!(
+        states(effective),
+        [Off, Unknown, Unknown, Unknown, Unknown, Unknown]
+    );
     assert_eq!(
         listed,
         [

@@ -1413,8 +1413,9 @@ error. The optional `harnesses` member is passed unparsed to `via-adapters`'
 path; the default is a `PATH` lookup) and
 `harnesses.<name>.inherit.{hooks, mcp_servers, plugins, skills, agents,
 instruction_files}` (booleans; default hooks and MCP servers `false`, the rest
-`true`, except Codex's every category `true`, what Codex delivers when VIA
-disables nothing but memories, owner 2026-10-05; C2 §6.2, AD13). It is read at daemon start like the other keys; a
+`true`, except Codex's every category `true`: VIA disables nothing in
+Codex but memories, owner 2026-10-05; the effective states follow C2 §6.2,
+AD13). It is read at daemon start like the other keys; a
 change applies to sessions spawned after the next start, and each session
 freezes its settings at spawn. It holds no credentials and no limits.
 For Codex alone, `harnesses.codex.memories` (a boolean, default `false`;

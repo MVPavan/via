@@ -473,7 +473,11 @@ handshake or, on `pi-rpc`, after the metadata read. Before either,
 for other routes, when no handshake was read (C2 §5).
 `inherit` holds the effective state (`on`, `off` or
 `unknown`) of each inherited-configuration category, frozen at spawn
-(C2 §6.2). `warnings` repeats the standing warnings:
+(C2 §6.2): `on` or `off` only when verified (by a switch, a private
+profile, an inventory, or, for `on` with no switch, the vendor packet's
+recorded live evidence that the vendor loads the user's configuration for
+it), else `unknown`. `on` means the user's own configuration applies,
+whatever it contains; VIA never claims a suppression it has not verified. `warnings` repeats the standing warnings:
 `vendor_version_untested` while the described turn's `version_status` is
 `untested`, and
 `config_switch_unverified` with `data.categories` while any effective state

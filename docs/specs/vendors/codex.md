@@ -287,27 +287,34 @@ its own in the live runs.
 Inherited configuration (C2 §6.2; owner OD2), from the 2026-09-30 re-probe.
 For the first release VIA disables nothing in Codex but memories (owner,
 2026-10-05: "use whatever existing harness and don't disable anything"), so
-Codex's default request is every category on, what Codex delivers with no
-switch (runtime §8). With hooks requested off, launch with `--disable hooks`
-(verified). MCP servers have no switch VIA applies: the user's configured
-servers (`[mcp_servers.*]` in `~/.codex/config.toml`, project layers and
-plugins) and Codex's built-in `codex_apps` server (the `apps` feature, every
-thread) load as configured (checked 2026-10-05 on 0.160.0). A request for
-MCP servers off is not applied: its effective state is `on` and it warns.
-(`--disable apps` stops only `codex_apps`, and `-c mcp_servers={}` merges
-into the user's table and removes nothing, so neither turns MCP off; the
-earlier `--disable apps` for MCP off, via-4gl, was removed.) Revisit: a
-later version may add disabling layers (owner, 2026-10-05). Every switch
-enters `config_hash`.
+Codex's default request is every category on and no switch is applied for
+it (runtime §8). With hooks requested off, launch with `--disable hooks`
+(verified). Effective states follow C2 §6.2 (owner, 2026-10-06): with no
+switch, a category is `on` (the user's configuration applies, whatever it
+contains, `[features] hooks=false` included) where the live evidence below
+shows Codex loads it, else `unknown`. An off VIA cannot apply is `unknown`
+and warns: MCP servers have no switch (`--disable apps` stops only
+`codex_apps`, and `-c mcp_servers={}` merges into the user's table and
+removes nothing; the earlier `--disable apps` for MCP off, via-4gl, was
+removed), nor do instruction files. The evidence was recorded on 0.159.2
+(`checked`) and, for MCP servers, again on 0.160.0; on any version outside
+`checked` (0.160.0 included) the same states are reported with
+`vendor_version_untested` (C2 §6.2, §5). Revisit: a later version may
+add disabling layers (owner, 2026-10-05). Every switch enters
+`config_hash`.
 
 | Category (default) | Switch and evidence | Effective state with the default |
 |---|---|---|
-| hooks (on) | none needed: the owner's hooks ran with no switch (**verified**); off: `--disable hooks` (**verified**) | `on` |
-| MCP servers (on) | none needed: user-configured servers and `codex_apps` start with no switch (`mcpServer/startupStatus/updated`, **checked**); off: no switch, so `on` and warns; inventory via `mcpServerStatus/list` (schema, **unverified**) | `on` |
-| plugins (on) | plugin support exists (schema); switch **unverified** | `unknown`, no switch applied, warns |
-| skills (on) | **unverified** | `unknown`, no switch applied, warns |
-| agents (on) | **unverified** | `unknown`, no switch applied, warns |
-| instruction files (on) | AGENTS.md; switch **unverified**; `thread/start` `instructionSources` reported the loaded AGENTS.md paths (0.159.2), completeness **unverified** | `unknown`, no switch applied, warns |
+| hooks (on) | on: no switch; the owner's hooks ran with none (2026-09-30 re-probe, `docs/workstreams/rust-foundation/adapters/reprobe-codex.md` item 5); off: `--disable hooks` (**verified**) | `on` |
+| MCP servers (on) | on: no switch; the user's configured servers and `codex_apps` started with none (2026-09-30 re-probe; checked again 2026-10-05 on 0.160.0, `mcpServer/startupStatus/updated`); off: no switch, `unknown`; inventory via `mcpServerStatus/list` (schema, **unverified**) | `on` |
+| plugins (on) | plugin support exists (schema); no live evidence of loading; switch **unverified** | `unknown`, warns |
+| skills (on) | no live evidence; switch **unverified** | `unknown`, warns |
+| agents (on) | no live evidence; switch **unverified** | `unknown`, warns |
+| instruction files (on) | on: no switch; `thread/start` `instructionSources` listed the loaded AGENTS.md paths (0.159.2 re-probe; completeness **unverified**); off: no switch, `unknown` | `on` |
+
+Live round 2 checks (Codex): whether a VIA-started server loads the
+user's plugins, skills and agents with no switch, each recorded with its
+evidence so the category can be declared `on`, or stays `unknown`.
 
 Inventory sources are `configWarning` and the `thread/start` response's
 `instructionSources`, which reported the loaded AGENTS.md paths in the

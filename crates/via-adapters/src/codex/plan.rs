@@ -110,34 +110,32 @@ pub(crate) fn capabilities() -> Capabilities {
     }
 }
 
-/// The inherited-configuration declarations (packet §4): only `--disable
-/// hooks` is a switch VIA applies (verified). With no switch, hooks and
-/// MCP servers load (the owner's hooks ran, 2026-09-30; the user's servers
-/// and the built-in `codex_apps` started, 2026-10-05), so they are `on`.
-/// For the first release VIA disables nothing else (owner 2026-10-05): MCP
-/// servers off has no switch, so it stays `on` and warns. Every other
-/// category has no switch and no verified vendor default: `unknown`, warns.
+/// The inherited-configuration declarations (packet §4, C2 §6.2; owner
+/// 2026-10-06). Only `--disable hooks` is a switch VIA applies (verified);
+/// for the first release VIA disables nothing else (owner 2026-10-05).
+/// With no switch, a category is `on` (the user's configuration applies,
+/// whatever it contains) where recorded live evidence shows Codex loads
+/// it: hooks (the owner's hooks ran, 2026-09-30), MCP servers (the user's
+/// servers and `codex_apps` started, 2026-10-05) and instruction files
+/// (`instructionSources` listed the loaded AGENTS.md, 0.159.2 re-probe).
+/// Plugins, skills and agents have no such evidence: `unknown`. An off VIA
+/// cannot apply is declared unverified, so it reports `unknown`, never a
+/// suppression.
 pub(crate) fn categories() -> BTreeMap<Category, CategoryDecl> {
     let unswitched = CategoryDecl::default();
-    let hooks = CategoryDecl {
+    let loaded = |off| CategoryDecl {
         on: Switch::None,
-        off: Switch::Verified,
-        observed: Some(InheritState::On),
-    };
-    let mcp_servers = CategoryDecl {
-        on: Switch::None,
-        off: Switch::None,
+        off,
         observed: Some(InheritState::On),
     };
     Category::ALL
         .into_iter()
         .map(|category| match category {
-            Category::Hooks => (category, hooks),
-            Category::McpServers => (category, mcp_servers),
-            Category::Plugins
-            | Category::Skills
-            | Category::Agents
-            | Category::InstructionFiles => (category, unswitched),
+            Category::Hooks => (category, loaded(Switch::Verified)),
+            Category::McpServers | Category::InstructionFiles => {
+                (category, loaded(Switch::Unverified))
+            }
+            Category::Plugins | Category::Skills | Category::Agents => (category, unswitched),
         })
         .collect()
 }
