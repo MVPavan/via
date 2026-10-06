@@ -467,7 +467,9 @@ session's previous one:
   evidence is Claude's own MCP debug lines (owner, 2026-10-06), written by
   `--debug=mcp --debug-file=<file>` to a file of the runner's. The runner
   parses each server's connection message apart from its name, keeps only
-  names and statuses and deletes the raw file. The same one server (a
+  names and statuses and deletes the raw file; since review round 2 it
+  stores no names, only per-server status keyed by a SHA-256 name prefix,
+  plus counts. The same one server (a
   claude.ai connector) connected on the unrestricted spawn and on its
   resume, none with MCP off, and that server under `--restricted` too,
   which agrees with `unknown` there. With no server connected on the

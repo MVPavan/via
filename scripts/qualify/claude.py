@@ -27,11 +27,12 @@ adds that version to the adapter's CHECKED set
 (outside the auth case), quota, budget or runner failure is `blocked`;
 a case nobody gives evidence for is `not_observable`; neither passes.
 
-Budget: the cap must be finite and positive. The total reported cost (each
-session's latest session-cumulative `usd`) is checked before every submit
-and after every turn; reaching it blocks the case and the rest of the run.
-Every completed turn must report a positive cost, strictly above the
-session's previous completed turn.
+Accounting, one rule: every turn, whatever its outcome, must report a finite
+session-cumulative `usd`, at least the session's previous report and, for a
+completed turn, above it. A missing or unusable value blocks the run at
+once, so nothing more is submitted. The cap must be finite and positive; the
+unrounded total (each session's highest report) is checked before every
+submit and after every turn, and reaching it blocks the run.
 
 Cases (packet §9 live rows):
   recipe_continuity     claude_live_recipe_continuity
@@ -47,20 +48,23 @@ schema (by digest) and step limit as expected for that turn.
 
 Tool use: VIA records no tool events (C1 §6.1), so tool calls are read
 from the vendor's own session transcript of the session VIA created: per
-prompt, the number of tool calls and whether any tool input held the
-nonce. Only those counts are kept, as for usage numbers.
+prompt, the tool names, the number of calls and whether any tool input held
+the nonce. Only those are kept. The transcript counts as evidence only when
+it shows the calls known to have happened (t1's Write, t3's Bash) with
+valid input records; otherwise the nonce and no-tool predicates are
+`not_observable`. Missing evidence is never a pass.
 
 mcp_switches (owner decision, 2026-10-06): VIA records no init inventory for
 Claude (packet §4, via-7c6), so the evidence is Claude's own MCP debug lines,
 written by `--debug=mcp --debug-file=<file>` to a file of the runner's. The
 runner parses each server's connection message apart from its name, keeps
-only `{name: status}` (a name that looks like a URL or host is redacted),
-and deletes the raw file on every exit path. Connected servers count only on
-a real success line: at least one on the unrestricted spawn and the same on
-its resume, none with MCP off; under `--restricted` any set agrees with the
-packet's `unknown`. With no server connected on the unrestricted spawn the
-case is `not_observable`. `status`, warnings and argv must match the packet
-in all three modes.
+only per-server status keyed by a SHA-256 prefix of the name, plus counts
+(no server name is stored), and deletes the raw file on every exit path.
+Connected servers count only on a real success line: at least one on the
+unrestricted spawn and the same on its resume, none with MCP off; under
+`--restricted` any set agrees with the packet's `unknown`. With no server
+connected on the unrestricted spawn the case is `not_observable`. `status`,
+warnings and argv must match the packet in all three modes.
 
 Declined (owner, 2026-10-06):
 - A live SIGTERM-only negative for the interrupt. That a signal death is
@@ -81,14 +85,17 @@ the inherited-configuration request are daemon configuration:
                         owner's hooks run; accepted)
   unrestricted-mcp-off  mcp_switches' MCP-off launch
   empty-home            private_profile_auth
-A daemon whose stop cannot be verified keeps its identity and runtime
-directory in the summary, and every later phase is blocked.
+A daemon whose start or stop cannot be verified is recorded as owned but
+unverified (a failed start is searched for by the run's private locks), its
+runtime directory is kept, and every later phase is blocked. Every cleanup
+step runs inside the reporting boundary: a cleanup failure is recorded and
+the summary is still written, as `blocked`.
 
 Privacy: the runner never prints or records environment values, credential
 contents or MCP configuration. It reads no credential file. It records MCP
-server names and statuses only, process flags by name (values only for an
-allow-list of recipe flags, digests for instructions, schemas and session
-IDs), and the presence of VIA's process-marker key, never its value. From
+servers only as name digests with statuses, process flags by name (values
+only for an allow-list of recipe flags, digests for instructions, schemas
+and session IDs), and the presence of VIA's process-marker key, never its value. From
 the vendor transcripts of sessions VIA created in this run it reads usage
 numbers and tool-call counts only. It reads other processes' command lines
 only to discover the tagged tool process; it reads environments, sends
@@ -253,7 +260,6 @@ def recipe_flags(argv):
 # Claude's per-server debug message: `MCP server "<name>": <message>`. The
 # name holds no quote, and the message is parsed apart from it.
 MCP_LINE = re.compile(r'MCP server "(?P<name>[^"\n]*)": (?P<message>.*)$')
-HOSTLIKE = re.compile(r"(?:[\w-]+\.)+[A-Za-z]{2,}(?::\d+)?(?:/\S*)?|\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?")
 
 
 def parse_mcp_debug(text):
@@ -274,20 +280,20 @@ def parse_mcp_debug(text):
     return servers
 
 
-def safe_names(servers):
-    """Statuses by name; a name that looks like a URL, host or path is redacted."""
-    shown, hidden = {}, 0
-    for name in sorted(servers):
-        if "://" in name or "@" in name or "/" in name or HOSTLIKE.fullmatch(name):
-            hidden += 1
-            shown[f"<redacted-name-{hidden}>"] = servers[name]
-        else:
-            shown[name] = servers[name]
-    return shown
+def server_key(name):
+    """A server's stored key: a SHA-256 prefix of its name, never the name."""
+    return digest_text(name)[:12]
+
+
+def keyed(servers):
+    """`{key: status}` and counts; no server name leaves memory."""
+    return {"servers": {server_key(name): state for name, state in sorted(servers.items())},
+            "count": len(servers),
+            "connected": sum(1 for state in servers.values() if state == "connected")}
 
 
 def self_test():
-    """The MCP parser's and redactor's known cases; returns the failures."""
+    """The MCP parser's and keying's known cases; returns the failures."""
     failing = 'T [DEBUG] MCP server "Successfully connected" failed to connect: unavailable'
     cases = [
         (parse_mcp_debug(failing), {}),
@@ -300,10 +306,9 @@ def self_test():
         (parse_mcp_debug('T [DEBUG] MCP server "e": Successfully connected\n'
                          'T [DEBUG] MCP server "e": connection closed after 3s (cleanly)'),
          {"e": "connected"}),
-        (safe_names({"mcp.example.com": "seen", "https://h/x": "seen", "10.0.0.1:80": "seen",
-                     "claude.ai Claude Docs": "connected"}),
-         {"<redacted-name-1>": "seen", "<redacted-name-2>": "seen",
-          "<redacted-name-3>": "seen", "claude.ai Claude Docs": "connected"}),
+        ("localhost:8080" in json.dumps(keyed(parse_mcp_debug(
+            'T [DEBUG] MCP server "localhost:8080": Successfully connected'))), False),
+        (keyed({"a": "connected", "b": "failed"})["connected"], 1),
     ]
     return [{"got": got, "want": want} for got, want in cases if got != want]
 
@@ -330,7 +335,8 @@ def vendor_turns(path, needle=None):
         for line in file:
             entry = json.loads(line)
             if is_prompt(entry):
-                turns.append({"calls": {}, "tools": set(), "needle_inputs": set()})
+                turns.append({"calls": {}, "tools": {}, "needle_inputs": set(),
+                              "invalid_inputs": set()})
                 continue
             message = entry.get("message")
             if (entry.get("type") != "assistant" or entry.get("isSidechain") or not turns
@@ -339,8 +345,11 @@ def vendor_turns(path, needle=None):
             turn = turns[-1]
             for part in message.get("content") or []:
                 if isinstance(part, dict) and part.get("type") == "tool_use":
-                    turn["tools"].add(part.get("id"))
-                    if needle and needle in json.dumps(part.get("input")):
+                    turn["tools"][part.get("id")] = part.get("name")
+                    tool_input = part.get("input")
+                    if not part.get("id") or not isinstance(tool_input, dict) or not tool_input:
+                        turn["invalid_inputs"].add(part.get("id"))
+                    elif needle and needle in json.dumps(tool_input):
                         turn["needle_inputs"].add(part.get("id"))
             if isinstance(message.get("usage"), dict):
                 usage = {key: message["usage"].get(key) or 0 for key in keys}
@@ -349,7 +358,9 @@ def vendor_turns(path, needle=None):
                     turn["calls"][message.get("id")] = usage
     return [{**{key: sum(call[key] for call in turn["calls"].values()) for key in keys},
              "calls": sum(1 for call in turn["calls"].values() if any(call.values())),
-             "tool_calls": len(turn["tools"]), "needle_inputs": len(turn["needle_inputs"])}
+             "tool_calls": len(turn["tools"]), "tool_names": sorted(set(turn["tools"].values())),
+             "invalid_inputs": len(turn["invalid_inputs"]),
+             "needle_inputs": len(turn["needle_inputs"])}
             for turn in turns]
 
 
@@ -463,7 +474,8 @@ class Run:
         self.phase = None
         self.daemons = []
         self.costs = {}
-        self.completed_cost = {}
+        self.last_cost = {}
+        self.accounting_failed = None
         self.versions = []
         self.preexisting_claude = set()
         self.budget_hit = False
@@ -495,9 +507,12 @@ class Run:
                 if stat["comm"] == "claude" or self.is_claude(pid)}
 
     def spent(self):
-        return round(sum(self.costs.values()), 6)
+        """The unrounded total: each session's highest reported cumulative cost."""
+        return sum(self.costs.values())
 
     def budget_guard(self):
+        if self.accounting_failed:
+            raise Blocked(f"spending unaccounted ({self.accounting_failed})")
         if self.spent() >= self.budget:
             self.budget_hit = True
             raise Blocked(f"budget reached: {self.spent()} USD of {self.budget}")
@@ -568,27 +583,32 @@ class Run:
         case.sessions.append(receipt["session_id"])
 
     def account(self, case, label, envelope):
-        """Records the turn's version and cost; checks a completed turn's
-        cost; blocks once the total reaches the cap."""
+        """The one accounting rule: every turn, whatever its outcome, reports
+        a finite session-cumulative `usd`, at least the session's previous
+        report and, for a completed turn, above it. A missing or unusable
+        value blocks the run at once; reaching the cap blocks it too."""
         self.versions.append({"case": case.name, "turn": label,
                               "vendor_version": envelope.get("vendor_version")})
         cost = envelope.get("cost") or {}
         session = envelope.get("session_id")
         usd = cost.get("usd")
-        cumulative = cost.get("scope") == "session_cumulative"
-        finite = isinstance(usd, (int, float)) and math.isfinite(usd)
-        if finite and cumulative:
-            self.costs[session] = max(self.costs.get(session, 0.0), usd)
+        usable = (isinstance(usd, (int, float)) and not isinstance(usd, bool)
+                  and math.isfinite(usd) and usd >= 0
+                  and cost.get("scope") == "session_cumulative")
+        if not usable:
+            self.accounting_failed = f"{case.name} {label}: cost {cost!r}"
+            raise Blocked(f"{label}: no usable session-cumulative cost; spending unaccounted")
+        previous = self.last_cost.get(session, 0.0)
         if envelope.get("state") == "completed":
-            previous = self.completed_cost.get(session, 0.0)
-            case.check(f"{label}: cost reported, positive, above the previous turn's",
-                       finite and cumulative and usd > 0 and usd > previous,
-                       {"usd": usd, "scope": cost.get("scope"), "previous": previous})
-            if finite:
-                self.completed_cost[session] = usd
-        if self.spent() >= self.budget:
-            self.budget_hit = True
-            raise Blocked(f"budget reached after {label}: {self.spent()} USD of {self.budget}")
+            case.check(f"{label}: cost above the session's previous report", usd > previous,
+                       {"usd": usd, "previous": previous})
+        else:
+            case.check(f"{label}: cost not below the session's previous report",
+                       usd >= previous, {"usd": usd, "previous": previous,
+                                         "state": envelope.get("state")})
+        self.last_cost[session] = usd
+        self.costs[session] = max(self.costs.get(session, 0.0), usd)
+        self.budget_guard()
 
     def session_file(self, case, session):
         return f"--handle-file={case.dir / f'{session}.handle'}"
@@ -650,14 +670,40 @@ class Run:
         write_json(phase_dir / f"{name}-config.json",
                    {"harnesses": {"claude": {"binary": "<claude>", **claude_config}}})
         self.phase = name
-        _, status, err = self.via_call(phase_dir, f"{name}-status", "daemon", "status",
-                                       "--json", timeout=60)
-        if not status or "pid" not in status:
-            raise Blocked(f"daemon for phase {name} did not start ({err})")
-        stat = proc_stat(status["pid"])
-        self.daemon = {"pid": status["pid"], "start_ticks": stat["start_ticks"] if stat else None}
+        try:
+            _, status, err = self.via_call(phase_dir, f"{name}-status", "daemon", "status",
+                                           "--json", timeout=60)
+        except Blocked as error:
+            status, err = None, str(error)
+        stat = proc_stat(status["pid"]) if status and isinstance(status.get("pid"), int) else None
+        if stat is None:
+            # A start attempt may have left a daemon: find it by its private
+            # locks, keep it as owned but unverified, and stop the run here.
+            record = {"phase": name, "start_failed": str(err), "found": self.find_daemons(),
+                      "runtime_dir_kept": str(self.runtime)}
+            self.daemons.append(record)
+            self.daemon_unverified = record
+            raise Blocked(f"daemon for phase {name} did not start verifiably ({err})")
+        self.daemon = {"pid": status["pid"], "start_ticks": stat["start_ticks"]}
         self.daemons.append({"phase": name, **self.daemon})
         print(f"phase {name}: daemon started", flush=True)
+
+    def find_daemons(self):
+        """`via daemon` processes holding this run's private locks."""
+        locks = {str(self.runtime / "daemon.lock"), str(self.state / "store.lock")}
+        found = []
+        for pid, stat in all_procs().items():
+            argv = cmdline(pid)
+            if len(argv) < 2 or os.path.basename(argv[0]) != "via" or argv[1] != "daemon":
+                continue
+            try:
+                links = {os.readlink(f"/proc/{pid}/fd/{fd}")
+                         for fd in os.listdir(f"/proc/{pid}/fd")}
+            except OSError:
+                continue
+            if links & locks:
+                found.append({"pid": pid, "start_ticks": stat["start_ticks"]})
+        return found
 
     def stop_daemon(self):
         """Stops the phase's daemon; an unverified stop keeps its identity and
@@ -852,12 +898,23 @@ def case_recipe_continuity(run, case):
     else:
         turns = vendor_turns(path, needle=nonce)
         write_json(case.dir / "tool-calls.json",
-                   [{"turn": n, "tool_calls": t["tool_calls"],
+                   [{"turn": n, "tool_calls": t["tool_calls"], "tool_names": t["tool_names"],
+                     "invalid_inputs": t["invalid_inputs"],
                      "inputs_with_nonce": t["needle_inputs"]} for n, t in enumerate(turns, 1)])
-        case.check("one vendor prompt per VIA turn", len(turns) == 4, {"prompts": len(turns)})
-        case.check("no tool input held the nonce in any turn",
-                   all(t["needle_inputs"] == 0 for t in turns))
-        case.check("t4: no tool call", len(turns) == 4 and turns[3]["tool_calls"] == 0)
+        # Evidence only if the transcript shows the tool calls known to have
+        # happened (t1's Write, t3's Bash) with valid input records.
+        shows = (len(turns) == 4 and "Write" in turns[0]["tool_names"]
+                 and "Bash" in turns[2]["tool_names"]
+                 and all(t["invalid_inputs"] == 0 for t in turns))
+        if not shows:
+            reason = ("the vendor transcript does not show t1's Write and t3's Bash with "
+                      "valid inputs")
+            case.not_observable("no tool input held the nonce in any turn", reason)
+            case.not_observable("t4: no tool call", reason)
+        else:
+            case.check("no tool input held the nonce in any turn",
+                       all(t["needle_inputs"] == 0 for t in turns))
+            case.check("t4: no tool call", turns[3]["tool_calls"] == 0)
     run.snapshot(case, "after")
     case.usage_inputs = [(session, t) for t in (t1, t2, t3, t4)]
 
@@ -982,6 +1039,7 @@ def case_never_ask(run, case):
     case.check("the denial is a file_write of the outside path",
                len(denials) == 1 and denials[0].get("kind") == "file_write"
                and denials[0].get("target") == str(target) and len(entries) == 1
+               and entries[0].get("kind") == "file_write"
                and entries[0].get("event_seq") == denials[0]["seq"]
                and str(target).startswith(entries[0].get("target") or "\0"))
     case.check("no control request declined (permission prompts none)",
@@ -1010,25 +1068,23 @@ def purge_mcp_debug(case):
 
 
 def take_mcp_debug(case, session_label, label):
-    """Reads one launch's debug file, keeps `{name: status}` and deletes the
-    file; returns the connected names (raw, in memory), or None when Claude
-    wrote no file."""
+    """Reads one launch's debug file, keeps per-server status by key and
+    deletes the file; returns the connected servers' keys, or None when
+    Claude wrote no file."""
     live = case.dir / "mcp-debug" / f"{session_label}.live.log"
     try:
-        if not live.exists():
-            servers = None
-        else:
-            servers = parse_mcp_debug(live.read_text(errors="replace"))
+        servers = parse_mcp_debug(live.read_text(errors="replace")) if live.exists() else None
     finally:
         purge_mcp_debug(case)
     write_json(case.dir / f"{label}-mcp.json", {
-        "source": "Claude MCP debug lines (--debug=mcp --debug-file); raw file deleted",
+        "source": "Claude MCP debug lines (--debug=mcp --debug-file); raw file deleted; "
+                  "servers keyed by a SHA-256 prefix of the name",
         "init_inventory": "not recorded by VIA (via-7c6)",
-        "servers": None if servers is None else safe_names(servers)})
+        **(keyed(servers) if servers is not None else {"servers": None})})
     if servers is None:
         case.not_observable(f"{label}: MCP debug lines", "Claude wrote no debug file")
         return None
-    return sorted(name for name, state in servers.items() if state == "connected")
+    return sorted(server_key(name) for name, state in servers.items() if state == "connected")
 
 
 def mcp_launch(run, case, label, expect_inherit, expect_warning, mode, mcp_off):
@@ -1210,8 +1266,8 @@ def phase(run, name, config, home, steps):
     start, or a run past its budget, blocks them. A settled case is not
     resumed."""
     try:
-        if run.budget_hit:
-            raise Blocked("budget reached")
+        if run.budget_hit or run.accounting_failed:
+            raise Blocked("budget reached or spending unaccounted")
         run.start_phase(name, config, home)
     except Blocked as error:
         for case, _ in steps:
@@ -1270,6 +1326,23 @@ def execute(run, cases, info):
           [(auth, lambda: case_private_profile(run, auth))])
 
 
+def cleanup(run, cases, info):
+    """Every cleanup step; a failure is recorded and blocks the result, and
+    the summary is still written."""
+    def step(name, action):
+        try:
+            action()
+        except Exception as error:
+            info.setdefault("cleanup_errors", []).append(f"{name}: {type(error).__name__}: {error}")
+
+    step("stop daemon", run.stop_daemon)
+    for case in cases:
+        step(f"purge MCP debug of {case.name}", lambda case=case: purge_mcp_debug(case))
+    if (run.runtime is not None and run.runtime.parent == Path("/tmp")
+            and run.daemon_unverified is None and run.daemon is None):
+        step("remove runtime dir", lambda: shutil.rmtree(run.runtime))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     parser.add_argument("--via", help="the via binary to qualify through")
@@ -1304,35 +1377,36 @@ def main():
     except BaseException as error:  # the summary is written on every exit path
         info["runner_error"] = f"{type(error).__name__}: {error}"
     finally:
+        cleanup(run, cases, info)
+    records = []
+    for case in cases:
+        if case.result is None and "runner_error" in info:
+            case.result, case.reason = "blocked", info["runner_error"]
         try:
-            run.stop_daemon()
-        except Blocked as error:
-            info["final_stop"] = str(error)
+            records.append(case.settle())
         except Exception as error:  # still write the summary
-            info["final_stop"] = f"{type(error).__name__}: {error}"
-        for case in cases:
-            purge_mcp_debug(case)
-            if case.result is None and "runner_error" in info:
-                case.result, case.reason = "blocked", info["runner_error"]
-        if (run.runtime is not None and run.runtime.parent == Path("/tmp")
-                and run.daemon_unverified is None and run.daemon is None):
-            shutil.rmtree(run.runtime, ignore_errors=True)
-
-    records = [case.settle() for case in cases]
+            info.setdefault("cleanup_errors", []).append(
+                f"settle {case.name}: {type(error).__name__}: {error}")
+            records.append({"case": case.name, "result": "blocked", "reason": str(error),
+                            "evidence": case.name, "checks": []})
     cli_version = (info.get("claude_version_cli") or "").split(" ")[0] or None
     observed = sorted({v["vendor_version"] for v in run.versions if v["vendor_version"]})
     missing = [v for v in run.versions if not v["vendor_version"]]
     version_ok = bool(cli_version) and observed == [cli_version] and not missing
     stopped = run.daemon_unverified is None and run.daemon is None and all(
         d.get("stopped") and not d.get("descendants_left") for d in run.daemons)
-    within_budget = not run.budget_hit and run.spent() < run.budget
-    passed = (stopped and version_ok and within_budget and "runner_error" not in info
+    within_budget = (not run.budget_hit and run.accounting_failed is None
+                     and run.spent() < run.budget)
+    blocked = ("runner_error" in info or bool(info.get("cleanup_errors"))
+               or run.accounting_failed is not None or run.daemon_unverified is not None)
+    passed = (stopped and version_ok and within_budget and not blocked
               and all(record["result"] == "pass" for record in records))
     summary = {
         **info, "ended_at": utc_now(),
         "vendor_versions_seen": observed, "envelopes_without_version": missing,
         "version_check": "pass" if version_ok else "fail",
         "model": run.model, "budget_usd": run.budget, "budget_reached": run.budget_hit,
+        "accounting_failed": run.accounting_failed,
         "reported_cost_usd": run.spent(), "cost_by_session": run.costs,
         "runtime_dir": (None if run.runtime is None else
                         "rt" if run.runtime.parent == args.evidence else str(run.runtime)),
@@ -1342,7 +1416,7 @@ def main():
                         "stayed under the cap and every envelope reports the one version "
                         "`claude --version` gives; fail, blocked and not_observable never "
                         "pass",
-        "result": "pass" if passed else "not_passed",
+        "result": "pass" if passed else "blocked" if blocked else "not_passed",
         "cases": [{"case": r["case"], "result": r["result"], "reason": r["reason"],
                    "evidence": r["evidence"]} for r in records],
     }

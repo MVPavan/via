@@ -1471,9 +1471,10 @@ C1 change, not a routine addition.
    - MCP switches (owner, 2026-10-06): where VIA records no init inventory
      (Claude, via-7c6), the vendor's own MCP debug lines are the primary
      evidence. The runner writes them to a file of its own, keeps only
-     server names and statuses, and deletes the raw file. The case passes
-     when `status`, warnings and argv match the packet in all three modes
-     and the connected servers agree by name: at least one on the
+     per-server status keyed by a SHA-256 prefix of the name, plus counts
+     (no server name), and deletes the raw file. The case passes when
+     `status`, warnings and argv match the packet in all three modes and
+     the connected servers agree by name digest: at least one on the
      unrestricted spawn and the same on its resume, none with MCP off, and
      the restricted mode per the packet table. With no server connected on
      the unrestricted spawn it is `not_observable`.
