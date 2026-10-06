@@ -372,7 +372,7 @@ async fn launched(
         health: &driver.health,
     };
     // The wall's cutoff, or an earlier `close_by` (packet §7.1).
-    let cut = by_orders(wall, (stop.clone(), close_rx.clone()));
+    let cut = by_orders(wall, (stop.clone(), close_rx.clone()), |_| {});
     let mut abandonment = Abandonment(Some(&driver.health));
     let (routed, rest) = deliver_beside(
         // A closed channel is the task ending without its turn.
@@ -386,7 +386,7 @@ async fn launched(
     )
     .await;
     abandonment.0 = None;
-    end_active(&driver.state, turn);
+    let _active = Ending(&driver.state, turn);
     let Some(routed) = routed else {
         driver.fail(DriverFailure::OwnedTask);
         return rejected(AdapterError::TaskFailed);
@@ -537,7 +537,7 @@ fn start_rejected(refusal: Refusal) -> StartRejected {
 /// cutoff) and until the daemon force. A record the task has not begun by
 /// then is skipped, and the task notes the skipped names in
 /// [`RECORDS_SKIPPED`] once it can write; the turn's end never waits for
-/// that.
+/// that. The turn stays active meanwhile ([`Ending`]).
 async fn keep_records(
     driver: &SessionDriver,
     turn: crate::TurnNumber,
@@ -562,13 +562,55 @@ async fn keep_records(
     {
         records.push(("pi-inventory.json", record));
     }
-    let late = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cut = Cut::default();
     let written = driver.tracker.spawn_blocking({
-        let late = Arc::clone(&late);
-        move || write_records(&folder, records, &late)
+        let cut = cut.clone();
+        move || write_records(&folder, records, &cut)
     });
-    if !records_by(written, (wall, force, orders)).await {
-        late.store(true, std::sync::atomic::Ordering::Release);
+    if !records_by(written, (wall, force, orders), &cut).await {
+        cut.now();
+    }
+}
+
+/// Ends the turn's active state (steer lane and close order) when the
+/// turn's end is decided, after its records: until then a direct close
+/// still publishes its deadline to the delivery and records waits (picrit
+/// round 2, D).
+struct Ending<'a>(&'a Mutex<DriverState>, crate::TurnNumber);
+
+impl Drop for Ending<'_> {
+    fn drop(&mut self) {
+        end_active(self.0, self.1);
+    }
+}
+
+/// The records' cutoff as the writer checks it before each record: the
+/// current bound [`records_by`] publishes, so a writer resuming past it
+/// begins nothing even before the waiter wakes (picrit round 2, D).
+#[derive(Clone, Default)]
+struct Cut(Arc<Mutex<Option<std::time::Instant>>>);
+
+impl Cut {
+    /// The bound is `at`.
+    fn set(&self, at: tokio::time::Instant) {
+        *self.at() = Some(at.into_std());
+    }
+
+    /// The bound has passed.
+    fn now(&self) {
+        *self.at() = Some(std::time::Instant::now());
+    }
+
+    /// Whether the bound has passed.
+    fn passed(&self) -> bool {
+        self.at().is_some_and(|at| std::time::Instant::now() >= at)
+    }
+
+    /// The bound, a poisoned lock read through.
+    fn at(&self) -> std::sync::MutexGuard<'_, Option<std::time::Instant>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -586,6 +628,7 @@ const RECORDS_SKIPPED: &str = "pi-records-skipped.json";
 async fn records_by(
     written: impl std::future::Future,
     (wall, mut force, orders): (Deadline, ForceWatch, (StopWatch, CloseWatch)),
+    cut: &Cut,
 ) -> bool {
     // From now, within the wall's cutoff.
     let allowance = Deadline::at(tokio::time::Instant::now().min(wall.instant()));
@@ -599,14 +642,19 @@ async fn records_by(
         biased;
         () = forced => false,
         _ = written => true,
-        () = by_orders(allowance, orders) => false,
+        () = by_orders(allowance, orders, |bound| cut.set(bound)) => false,
     }
 }
 
 /// Resolves at the turn's one cutoff, [`CLEANUP_ALLOWANCE`] after `from`
 /// (C2 §4.1), or at the earlier `close_by` of a stop or the driver's close
 /// order, re-read as they change (packet §7.1, picrit round 2, B).
-async fn by_orders(from: Deadline, (mut stop, mut close): (StopWatch, CloseWatch)) {
+/// `publish` hears each bound as it is taken.
+async fn by_orders(
+    from: Deadline,
+    (mut stop, mut close): (StopWatch, CloseWatch),
+    mut publish: impl FnMut(tokio::time::Instant),
+) {
     let (mut stop_open, mut close_open) = (true, true);
     loop {
         let bound = [
@@ -622,6 +670,7 @@ async fn by_orders(from: Deadline, (mut stop, mut close): (StopWatch, CloseWatch
         .flatten()
         .map(Deadline::instant)
         .fold(from.instant() + CLEANUP_ALLOWANCE, std::cmp::Ord::min);
+        publish(bound);
         tokio::select! {
             biased;
             () = tokio::time::sleep_until(bound) => return,
@@ -631,19 +680,15 @@ async fn by_orders(from: Deadline, (mut stop, mut close): (StopWatch, CloseWatch
     }
 }
 
-/// Writes `records` into `folder` in order; once `late` is set, those not
-/// begun are skipped and named in [`RECORDS_SKIPPED`] instead.
-fn write_records(
-    folder: &Path,
-    records: Vec<(&'static str, Vec<u8>)>,
-    late: &std::sync::atomic::AtomicBool,
-) {
+/// Writes `records` into `folder` in order; once `cut` has passed, those
+/// not begun are skipped and named in [`RECORDS_SKIPPED`] instead.
+fn write_records(folder: &Path, records: Vec<(&'static str, Vec<u8>)>, cut: &Cut) {
     // Test builds: a blocked evidence write (picrit #5).
     #[cfg(feature = "test-failpoints")]
     drop(via_routes::failpoint::hit("adapter.pi.records.write"));
     let mut skipped = Vec::new();
     for (name, bytes) in records {
-        if late.load(std::sync::atomic::Ordering::Acquire) {
+        if cut.passed() {
             skipped.push(name);
         } else {
             write_record(&folder.join(name), &bytes);
@@ -984,9 +1029,11 @@ async fn turn_task(task: TurnTask) {
         if let Some(cause) = route_failure(&turn_result) {
             latch(&health, cause);
         }
-        end_active(&state, turn);
-        // `run_turn` was dropped: the retirement below is still owned here.
-        let _unread = end.send(turn_result);
+        // `run_turn` ends the active state after its records; dropped, it
+        // never will: the retirement below is still owned here.
+        if end.send(turn_result).is_err() {
+            end_active(&state, turn);
+        }
     };
     let retirement = tokio::select! {
         (retirement, ()) = async { tokio::join!(route_turn, relay) } => retirement,
@@ -996,4 +1043,34 @@ async fn turn_task(task: TurnTask) {
     drop(reservation);
     done.send_replace(Retiring::CleanedUp);
     done.send_replace(Retiring::Delivered);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cut, RECORDS_SKIPPED, write_records};
+
+    /// Picrit round 2, D: the writer decides the skip itself. A bound
+    /// already past, before any waiter marks the records late, begins no
+    /// record; a bound still ahead writes them.
+    #[tokio::test]
+    async fn the_writer_skips_records_past_the_cutoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let past = Cut::default();
+        past.set(tokio::time::Instant::now());
+        write_records(dir.path(), vec![("pi-profile.json", b"{}".to_vec())], &past);
+        assert!(!dir.path().join("pi-profile.json").exists());
+        let note = std::fs::read_to_string(dir.path().join(RECORDS_SKIPPED)).unwrap();
+        assert!(note.contains("pi-profile.json"), "{note}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let ahead = Cut::default();
+        ahead.set(tokio::time::Instant::now() + std::time::Duration::from_secs(60));
+        write_records(
+            dir.path(),
+            vec![("pi-profile.json", b"{}".to_vec())],
+            &ahead,
+        );
+        assert!(dir.path().join("pi-profile.json").exists());
+        assert!(!dir.path().join(RECORDS_SKIPPED).exists());
+    }
 }

@@ -1225,7 +1225,10 @@ impl<'a> Run<'a> {
                 return before_wall(now, wall, &after);
             }
             if order["kind"].as_str() == Some("close") {
-                let deadline = Deadline::at(now + CLOSE_DEADLINE);
+                let within = order["deadline_ms"]
+                    .as_u64()
+                    .map_or(CLOSE_DEADLINE, Duration::from_millis);
+                let deadline = Deadline::at(now + within);
                 let _report = session.driver.close(CloseMode::Graceful, deadline).await;
             } else {
                 self.cancel(order, now, (session, stop_order)).await;

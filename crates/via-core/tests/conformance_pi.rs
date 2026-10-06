@@ -1420,6 +1420,103 @@ fn pi_records_blocked() {
     assert!(note.contains("pi-profile.json"), "{note}");
 }
 
+/// Packet §4.3 (picrit round 2, D): the turn stays active while its
+/// records are written, so a direct session close in that wait publishes
+/// its deadline to it. The turn completes at once; the records' write is
+/// held; a graceful close at 1.5 s with a 500 ms deadline ends the wait by
+/// about 2 s, not at the 3 s allowance, and the held record is skipped.
+/// Before the fix the turn was no longer active, so the close published
+/// nothing and the wait ran to the allowance.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn pi_records_close() {
+    use std::os::unix::fs::DirBuilderExt;
+    use std::time::{Duration, Instant};
+    const POINT: &str = "adapter.pi.records.write";
+    const TOKEN: &str = "pi-records-close-token";
+    own_process("pi_records_close");
+    let points = tempfile::tempdir().unwrap();
+    let dir = points.path().join("points");
+    std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    std::fs::write(
+        dir.join(format!("{POINT}.json")),
+        json!({"token": TOKEN, "occurrence": 1, "action": "pause"}).to_string(),
+    )
+    .unwrap();
+    via_store::failpoint::activate(&dir, TOKEN).unwrap();
+    let control = std::thread::spawn({
+        let dir = dir.clone();
+        move || {
+            let ack = dir.join(format!("{POINT}.1.ack"));
+            let until = Instant::now() + Duration::from_secs(15);
+            while !ack.exists() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let held = ack.exists();
+            // Past the close's deadline: the task resumes late.
+            std::thread::sleep(Duration::from_secs(4));
+            std::fs::write(dir.join(format!("{POINT}.1.release")), b"").is_ok() && held
+        }
+    });
+    let mut steps = handshake(&State::default());
+    steps.extend(prompt("Say READY."));
+    steps.extend(echo("Say READY."));
+    steps.extend(answer("READY", "stop", &canonical_usage()));
+    steps.extend(settle(&assistant(
+        json!([{"type": "text", "text": "READY"}]),
+        "stop",
+        &canonical_usage(),
+        None,
+    )));
+    steps.push(eof());
+    let replay = single(
+        "synthetic (picrit round 2): a close while the records' write is held",
+        argv(Argv::default()),
+        steps,
+    );
+    let mut turn = turn("Say READY.", completed(1, "READY"));
+    turn["stop"] = json!({"kind": "close", "at_ms": 1_500, "deadline_ms": 500});
+    let expect = case("pi_records_close", 1, vec![turn]);
+    let records = std::cell::RefCell::new((false, String::new()));
+    let outcome = drive_built(
+        "pi_records_close",
+        &replay,
+        &expect,
+        Knobs::default(),
+        Box::new(|_| Ok(())),
+        Box::new(|pure: &Pure| {
+            let folder = evidence(pure, 1);
+            let note = folder.join("pi-records-skipped.json");
+            let until = Instant::now() + Duration::from_secs(20);
+            while !note.exists() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            *records.borrow_mut() = (
+                folder.join("pi-profile.json").exists(),
+                std::fs::read_to_string(&note).unwrap_or_default(),
+            );
+            Ok(())
+        }),
+    );
+    assert!(
+        control.join().unwrap(),
+        "the records' write never reached the point"
+    );
+    let outcome = outcome.unwrap();
+    conformance_expect::check(&expect, &outcome).unwrap();
+    let returned = outcome.turns[0].returned.unwrap();
+    assert!(
+        returned <= Duration::from_millis(2_600),
+        "run_turn returned {returned:?} after its start"
+    );
+    let (profile, note) = records.into_inner();
+    assert!(
+        !profile,
+        "pi-profile.json was written after the close's deadline"
+    );
+    assert!(note.contains("pi-profile.json"), "{note}");
+}
+
 /// Packet §3 (review r2 minor): the version read before VIA's launch
 /// state failed is still this turn's `InstanceReport`: a write that fails
 /// (a folder where the instructions' partial goes) is `store`; a session

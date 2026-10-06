@@ -439,7 +439,14 @@ const BOUND: &[&str] = &["mode", "extra_write_dirs", "network"];
 const BOUND_MODE: &[&str] = &["read_only", "workspace_write", "full"];
 /// C1 §4 `deadlines`.
 const DEADLINES: &[&str] = &["wall_ms", "idle_ms"];
-const STOP: &[&str] = &["kind", "after", "at_ms", "grace_ms", "force_close"];
+const STOP: &[&str] = &[
+    "kind",
+    "after",
+    "at_ms",
+    "grace_ms",
+    "force_close",
+    "deadline_ms",
+];
 /// A stop's later forced session close: `after_ms` after the stop, with a
 /// deadline `deadline_ms` from then.
 const FORCE_CLOSE: &[&str] = &["after_ms", "deadline_ms"];
@@ -981,6 +988,7 @@ fn validate_inputs(
             required(stop, "after", Ty::Name(EVENTS), false, &at)?;
         }
         typed(stop, "grace_ms", Ty::Positive, true, &at)?;
+        typed(stop, "deadline_ms", Ty::Positive, true, &at)?;
         if let Some(close) = stop.get("force_close").filter(|close| !close.is_null()) {
             let at = format!("{at}.force_close");
             known(close, FORCE_CLOSE, &at)?;
