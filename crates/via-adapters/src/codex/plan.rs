@@ -14,8 +14,9 @@ use crate::plan::{Bound, Category, CategoryDecl, InheritState, Switch, VendorOpt
 
 /// The versions maintainers' live check passed (C2 §5 version rule): the
 /// re-probes of 2026-09-30 (`via-5lr.3.1`) and live rounds 1 and 2 through
-/// VIA on 0.160.0 (2026-10-05/06, `via-5lr.3.4`).
-pub(crate) const CHECKED: &[&str] = &["0.159.2", "0.160.0"];
+/// VIA on 0.160.0 (2026-10-05/06, `via-5lr.3.4`), and qualification run 15
+/// of `scripts/qualify/codex.py` on 0.160.1 (packet §1, §5).
+pub(crate) const CHECKED: &[&str] = &["0.159.2", "0.160.0", "0.160.1"];
 
 /// The canonical C1 efforts and the Codex `ReasoningEffort` each maps to
 /// (AD18). Any other non-empty value is a vendor value that only a

@@ -33,8 +33,11 @@ fallback; no experimental capability is sent by default. Record observed
 binary and adapter versions. The version rule is C2 §5 (owner OD1): the
 instance version is parsed from `initialize.userAgent`: drop the
 `<clientInfo.name>/` prefix VIA itself sent, then read up to the first space
-(qualified on the 0.159.2 fixtures, `via-5lr.3.1`); `checked` is 0.159.2 (fixtures and re-probes) and
-0.160.0 (live rounds 1 and 2 through VIA, 2026-10-05/06); a version outside the adapter's `checked` set is
+(qualified on the 0.159.2 fixtures, `via-5lr.3.1`); `checked` is 0.159.2
+(fixtures and re-probes), 0.160.0 (live rounds 1 and 2 through VIA,
+2026-10-05/06), and 0.160.1 (qualification run 15 of
+`scripts/qualify/codex.py`, after critical-review hardening); each is
+`tested`. A version outside the adapter's `checked` set is
 `untested` and warns; only a failed handshake check (policy and sandbox echo)
 refuses, as `submit_failed` with `failure.data.reason:"handshake_refused"`,
 cached per C2 §5 under the server key plus exactly what the echo check
@@ -43,6 +46,25 @@ mode and policy as derived from its bound; the approval policy and
 reviewer are constants), so a refusal never refuses another bound, model
 or directory sharing the server. A plan naming no bound or cwd matches
 no cached refusal.
+
+Qualification run 15 on 0.160.1 (2026-10-07, `gpt-6-luna`;
+`scripts/qualify/codex.py`, gitignored evidence in
+`scratchpad/qualify/codex-run15/`) puts this version in the checked set.
+Its `summary.json` result is `pass`: 230/230 checks passed, seven turns
+reserved, zero re-asks, spending accounting certain, no run interruption or
+cleanup errors, every daemon proven stopped and the private run directory
+removed. Spending certainty refers to the structural turn/time/concurrency
+control, not a dollar cap; Codex cost remains unavailable (§7).
+
+The qualified scope excludes the owner's enabled MCP servers and plugins:
+the runner disabled both, and disabled `shell_snapshot` on its own server
+argv for test isolation. The snapshot exec path is not qualified; VIA's
+production argv is unchanged. No-tool observations and command-exclusivity
+claims are record-only, not proof of unaided recall or absence of additional
+executions. Automatic re-asks were disabled. Stored resume rests on matched
+stored thread identity and a real resume with `excludeTurns:true` (§5).
+Earlier live runs described below are pre-hardening detail for their stated
+versions and cases; they do not substitute for run 15's 0.160.1 qualification.
 
 Local primary sources live under
 `scratchpad/execution/rust-foundation-release/codex-evidence/`:
@@ -514,8 +536,9 @@ passes unverified with C1's `vendor_passthrough` warning: the switches
 any other feature. `--disable hooks` stays VIA's (`inherit`), never the
 caller's.
 
-Live through VIA on 0.160.0 (run 6, 2026-10-06, `gpt-6-luna`, bead
-via-jne; evidence in `scratchpad/execution/codex-live/run-6/`, gitignored),
+Pre-hardening live detail through VIA on 0.160.0 (run 6, 2026-10-06,
+`gpt-6-luna`, bead via-jne; evidence in
+`scratchpad/execution/codex-live/run-6/`, gitignored),
 with a warm home and sessions started concurrently:
 - A session with `-- --strict-config` and one without were started
   together while an earlier `--strict-config` session's server was still
@@ -604,17 +627,18 @@ records the limit: "shell_snapshot disabled for test isolation; the snapshot
 exec path is not qualified". Its empty-home feature preflight and owner-home
 `config/read` barrier must both confirm the snapshot switch is off before
 turns are accepted. These limits apply to the checked-set scope; enabled
-MCP/plugins and the snapshot exec path are excluded. The runner's 0.160.1
-candidate checks prove positive execution of an admitted command through
+MCP/plugins and the snapshot exec path are excluded. Qualification run 15's
+0.160.1 checks prove positive execution of an admitted command through
 matched protocol and owned-process evidence; they do not prove that it was
 the only command executed in the turn. No native
-per-turn tool-disable has been verified offline for this candidate. "No reported
+per-turn tool-disable has been verified offline for 0.160.1. "No reported
 tool items" is therefore record-only, including the stored c3 reply. A matching
 reply does not prove unaided recall: stored-resume qualification rests on the
 stored thread identity after daemon retirement and the real `thread/resume`
 request with `excludeTurns:true`. Sampling plus missing command items cannot
-prove the runner's programs never executed, so the runner disables automatic
-zero-command re-asks unless a complete execution-absence mechanism is verified.
+prove the runner's programs never executed, so automatic zero-command re-asks
+were disabled in run 15. Enabling them requires a verified complete
+execution-absence mechanism.
 Observed command deviations and unpaired refusal suffixes remain sticky blockers
 through admission and final accounting. This does not change the adapter's
 request or result contract.
