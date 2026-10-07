@@ -46,6 +46,7 @@ WAIT_REPLY_MARGIN_SECONDS = 10  # §13: allow the CLI to return its bounded wait
 HELPER_STOP_SECONDS = 30  # §13 L14 bounded cooperative cleanup before a successor.
 ANCHOR_SOCKET_TAIL = 64
 METADATA_EFFORT = 'via-qualification-metadata-only-unoffered'  # Packet §5; C1 §4.
+OWNED_READINESS_SECONDS = 30  # §13: bounded delayed facts within the enclosing phase.
 BOOTSTRAP_SECONDS = 30  # §13: owned acquisition and all served-fact checks.
 BOOTSTRAP_WAIT_MS = 30000  # §13: mock completion after the response is released.
 
@@ -280,6 +281,7 @@ class Driver:
         self._bootstrap_config=None
         self._bootstrap_cleanup=False; self._bootstrap_count=0
         self._bootstrap_deadline=None
+        self._observation_deadline=None
         self._namespace_bootstraps={}
         self._publication_entered=threading.Event(); self._publication_release=threading.Event()
         if initialize:
@@ -540,6 +542,11 @@ class Driver:
             remaining=self._bootstrap_deadline-time.monotonic()
             if remaining<=0: raise Blocked('bootstrap CLI deadline')
             timeout=min(timeout,remaining)
+        observation_deadline=getattr(self,'_observation_deadline',None)
+        if observation_deadline is not None and not cleanup:
+            remaining=observation_deadline-time.monotonic()
+            if remaining<=0: raise Blocked('owned observation CLI deadline')
+            timeout=min(timeout,remaining)
         try:
             command_started=time.monotonic()
             rc,out,err=self.execute([str(self._binary),*args],env=self.env,cwd=self.project,
@@ -619,9 +626,15 @@ class Driver:
                                         'AND absence_time IS NULL').fetchall()
         except (sqlite3.Error,OSError) as error:
             raise Blocked('owned Host launch record unavailable') from error
-        rows=[row for row in rows if row[1] and row[2] is not None and row[3]]
-        if allow_absent and not rows: return None
-        if len(rows)!=1: raise Blocked('owned Host generation ambiguous')
+        if len(rows)>1: raise Blocked('owned Host generation ambiguous')
+        if not rows:
+            if allow_absent: return None
+            raise Blocked('owned Host generation absent')
+        # One not-yet-armed intent is pending; never filter it out of an
+        # ambiguity check or retry an unreadable/invalid Store.
+        if any(value is None for value in rows[0][1:4]):
+            if allow_absent: return None
+            raise Blocked('owned Host child identity not yet recorded')
         generation,pid,ticks,vendor_pid,phase,server_id=rows[0]
         return {'generation':generation,'anchor':safety.Identity(pid,ticks),
                 'vendor_pid':vendor_pid,'phase':phase,'server_id':server_id}
@@ -629,13 +642,22 @@ class Driver:
     def ensure_vendor(self):
         """Acquire through one held mock turn, then authenticate the Host child (§13)."""
         if not self.daemon: raise Blocked('owned daemon required')
-        if self._http and self.vendor_identity and self.proc.alive(self.vendor_identity) is True:
-            return
+        self.proc.verify(self.daemon)
+        if self._http and self.vendor_identity:
+            alive=self.proc.alive(self.vendor_identity)
+            if alive is None: raise Blocked('owned vendor identity unverifiable')
+            if alive is True:
+                self._owned_observation_guard()()
+                return
         if self._bootstrap_active: raise Blocked('recursive bootstrap acquisition')
         record=self._host_record(allow_absent=True)
         if record is not None:
             row=self.proc.stat(record['vendor_pid'])
-            if row is not None and self.proc.alive(safety.Identity(row['pid'],row['start_ticks'])) is True:
+            if row is None: raise Blocked('owned vendor identity unverifiable')
+            identity=safety.Identity(row['pid'],row['start_ticks'])
+            alive=self.proc.alive(identity)
+            if alive is None: raise Blocked('owned vendor identity unverifiable')
+            if alive is True:
                 self._observe_vendor()
                 return
         self._bootstrap_vendor()
@@ -669,6 +691,103 @@ class Driver:
             self._record('vendor-listener',{'owned_pid':identity.pid,'checks':checks,'ready':ready,
                 'elapsed_ms':int((time.monotonic()-started)*1000)})
 
+    def _owned_observation_guard(self):
+        """§13: retain the original generation and PID/ticks across every readiness poll."""
+        identities=tuple(getattr(self,key,None) for key in ('daemon','anchor','vendor_identity'))
+        binding=None
+        def verify():
+            nonlocal binding
+            current=tuple(getattr(self,key,None) for key in ('daemon','anchor','vendor_identity'))
+            if current!=identities: raise Blocked('owned observation generation changed')
+            for identity in identities:
+                if identity is not None: self.proc.verify(identity)
+            if identities[1] is not None and identities[2] is not None:
+                record=self._host_record()
+                value=tuple(record[key] for key in ('generation','anchor','vendor_pid','server_id'))
+                if record['anchor']!=identities[1] or record['vendor_pid']!=identities[2].pid:
+                    raise Blocked('owned observation generation changed')
+                if binding is not None and value!=binding:
+                    raise Blocked('owned observation generation changed')
+                binding=value
+        return verify
+
+    def _await_owned(self,read,reason,*,seconds=OWNED_READINESS_SECONDS,deadline=None):
+        """§13: only explicit None is pending; every poll retains identity and its bound."""
+        end=min(time.monotonic()+seconds,deadline if deadline is not None else float('inf'),
+                self.phase_deadline if self.phase_deadline is not None else float('inf'),
+                self._bootstrap_deadline if self._bootstrap_active and self._bootstrap_deadline is not None
+                else float('inf'))
+        verify=self._owned_observation_guard()
+        saved=getattr(self,'_observation_deadline',None)
+        if saved is not None: end=min(end,saved)
+        self._observation_deadline=end
+        try:
+            while True:
+                if self.signals: self.signals.guard()
+                if time.monotonic()>=end: raise Blocked(reason)
+                verify()
+                value=read()
+                verify()
+                if time.monotonic()>=end: raise Blocked(reason)
+                if value is not None: return value
+                time.sleep(min(.01,max(0,end-time.monotonic())))
+        finally:
+            self._observation_deadline=saved
+
+    def _await_native(self,sid,ready,reason):
+        """§13: await a correlated native fact; SSE snapshots alone imply no synchronization."""
+        def read():
+            rows=self.observe('native_events',sid)['events']
+            return rows if ready(rows) else None
+        return self._await_owned(read,reason)
+
+    def _await_gone(self,identities,reason,*,seconds=OWNED_READINESS_SECONDS):
+        """§13: live with verified ticks is pending; unverifiable absence is never retried."""
+        end=time.monotonic()+seconds
+        if self.phase_deadline is not None: end=min(end,self.phase_deadline)
+        while True:
+            states=[self.proc.alive(identity) for identity in identities]
+            if any(state is None for state in states): raise Blocked('owned disappearance identity unverifiable')
+            if all(state is False for state in states): return
+            if self.signals: self.signals.guard()
+            if time.monotonic()>=end: raise Blocked(reason)
+            time.sleep(min(.01,max(0,end-time.monotonic())))
+
+    def _live_pin(self,session):
+        """§13 L14/marker: a tool spawn can precede VIA's acceptance commit."""
+        def read():
+            value=self.via(['status',session]); active=value.get('active_turn')
+            if value.get('state')!='running' or value.get('admission')!='open' or type(active) is not dict:
+                raise Blocked('live turn pin ended or admission changed')
+            phase=active.get('phase')
+            if phase not in {'submitting','accepted'} and not (phase is None and active.get('state')=='queued'):
+                raise Blocked('live turn phase unrecognized')
+            if phase=='accepted' and value.get('vendor_identity_verified') is True: return value
+            return None
+        return self._await_owned(read,'live turn pin acceptance deadline')
+
+    def _await_helper_point(self,helper,point):
+        """§13 L14: wait for an atomic update of the already captured helper identity."""
+        path=self._helper_folder(self.project)/(helper+'.json')
+        expected=[identity for identity,row in self.helper_ledger.items()
+                  if row.get('kind')==helper and self.helper_generations.get(identity)==self.vendor_identity]
+        if len(expected)!=1: raise Blocked('helper after-point identity ambiguous')
+        identity=expected[0]
+        def read():
+            try: raw=path.read_bytes()
+            except FileNotFoundError: return None
+            if len(raw)>OBSERVATION_BYTES: raise Blocked('helper observation bound')
+            value=self._json(raw)
+            _typed(value,{'pid':I,'start_ticks':I,'point':S},'helper after-point')
+            if safety.Identity(value['pid'],value['start_ticks'])!=identity:
+                raise Blocked('helper after-point identity changed')
+            alive=self.proc.alive(identity)
+            if alive is None: raise Blocked('helper after-point identity unverifiable')
+            if value['point']==point: return value
+            if alive is False: raise Blocked('helper ended before after-point publication')
+            return None
+        return self._await_owned(read,'L14 helper after-spawn point not reached')
+
     def _observe_vendor(self):
         """Authenticate pid/start ticks, owned listener and §2 handshake before use."""
         record=self._host_record(); self.proc.verify(record['anchor'])
@@ -680,7 +799,7 @@ class Driver:
         password=self.vault.read_once(self.proc,identity)
         origin=self._listener_origin(record,identity)
         self._http=safety.OwnedHTTP(origin,identity,self.proc,password,
-                                    deadline=self._bootstrap_deadline if self._bootstrap_active else None)
+                                    deadline=self._bootstrap_deadline if self._bootstrap_active else self.phase_deadline)
         status,raw=self._http.request('GET','/api/info')
         value=self._json(raw)
         _typed(value,{'pid':I,'version':S},'vendor info')
@@ -784,19 +903,14 @@ class Driver:
             while True:
                 if self.signals: self.signals.guard()
                 if time.monotonic()>=deadline: raise Blocked('bootstrap owned-server deadline')
-                try: self._host_record(); break
-                except Blocked: time.sleep(.02)
+                self.proc.verify(self.daemon)
+                if self._host_record(allow_absent=True) is not None: break
+                time.sleep(min(.02,max(0,deadline-time.monotonic())))
             self._observe_vendor()
             self.spending_check(args=command)
             # The session's frozen identity is served evidence too; the request
             # alone is insufficient. Status is bounded and carries no raw text.
-            while True:
-                if self.signals: self.signals.guard()
-                if time.monotonic()>=deadline: raise Blocked('bootstrap session readiness deadline')
-                status=self.via(['status',receipt['session_id']])
-                sid=status.get('vendor_session_id')
-                if status.get('vendor_identity_verified') is True and type(sid) is str: break
-                time.sleep(.02)
+            sid=self._vendor_sid(receipt['session_id'])
             self.spending_check(path='/api/session/'+urllib.parse.quote(sid,safe='')+'/prompt')
             if self.last_model!=safety.MOCK_IDENTITY: raise Blocked('bootstrap served model is not mock')
             if provider.admission_blocked or self.guard.stopped: raise Blocked('bootstrap mock admission failed')
@@ -804,7 +918,7 @@ class Driver:
             try: hold.release()
             except EvidenceUnavailable as error:
                 raise Blocked('bootstrap response hold expired or aborted') from error
-            self._bootstrap_deadline=None; self._http.deadline=None
+            self._bootstrap_deadline=None; self._http.deadline=self.phase_deadline
             envelope=self.via(['wait',receipt['turn'],'--timeout-ms',str(BOOTSTRAP_WAIT_MS)])
             if envelope.get('state')!='completed': raise Blocked('bootstrap mock turn did not complete')
             if provider.requests<=requests_before or not provider.model_matches:
@@ -824,7 +938,7 @@ class Driver:
         finally:
             self._bootstrap_command=None; self._bootstrap_active=False
             self._bootstrap_deadline=None
-            if self._http is not None: self._http.deadline=None
+            if self._http is not None: self._http.deadline=self.phase_deadline
             self._bootstrap_config=None
             self.project,self.provider_endpoints,self.last_model,self.last_request=saved
             self._record('bootstrap',{'label':'qualification-bootstrap-mock-only','charged':'mock-only',
@@ -844,6 +958,7 @@ class Driver:
         if urllib.parse.urlsplit(path).path=='/api/credential':
             raise Blocked('credential read/write requires isolated direct seeding')
         self.ensure_vendor()
+        self._http.deadline=self.phase_deadline
         if method.upper() in {'POST','PUT','PATCH'} and any(
                 word in urllib.parse.urlsplit(path).path for word in ('/prompt','/compact','/fork')):
             self.spending_check(body=body,path=path)
@@ -1034,7 +1149,16 @@ class Driver:
         for reply in reversed(self.owned_replies):
             if reply.get('session_id')==session and type(reply.get('vendor_session_id')) is str:
                 return reply['vendor_session_id']
-        raise Blocked('confirmed vendor session ID missing')
+        if session not in self.handles: raise Blocked('confirmed vendor session ID missing')
+        def read():
+            value=self.via(['status',session])
+            sid=value.get('vendor_session_id')
+            if type(sid) is str and value.get('vendor_identity_verified') is True: return sid
+            if sid is not None and type(sid) is not str:
+                raise Blocked('native session identity malformed')
+            if value.get('state')!='running': raise Blocked('session ended before native creation')
+            return None
+        return self._await_owned(read,'confirmed vendor session ID missing')
 
     def start_event_capture(self):
         """Capture bounded owned SSE in memory for real request/action attribution."""
@@ -1199,30 +1323,21 @@ class Driver:
             events=read_pages(lambda after:self.via(['events',target,'--after',str(after)]))
             return {'complete':True,'events':events,'native_events':native,'child_rules':rules}
         if kind=='helper_observations':
-            folder=self._helper_folder(self.project)
-            if not folder.is_dir(): raise Blocked('helper observation absent')
-            values=[]
-            for path in sorted(folder.glob('*.json')):
-                if path.stat().st_size>OBSERVATION_BYTES: raise Blocked('helper observation bound')
-                raw=path.read_bytes()
-                if self.vault.leaks(raw): raise Blocked('helper wrote password')
-                value=self._json(raw)
-                _typed(value,{'pid':I,'start_ticks':I,'password_key_absent':B},'helper')
-                identity=safety.Identity(value['pid'],value['start_ticks'])
-                if self.proc.alive(identity) is True:
-                    self.proc.verify(identity)
-                    if identity not in self.helper_ledger and not self._descends_from(identity,self.vendor_identity):
-                        raise Blocked('helper readiness did not come from owned generation')
-                    self.helper_ledger[identity]=dict(value); self.helper_generations[identity]=self.vendor_identity
-                    self.helper_origins[identity]=folder
-                elif identity not in self.helper_ledger:
-                    continue
-                # Historical after-spawn state belongs only to an identity captured alive before.
-                if identity in self.helper_ledger and self.proc.gone(identity) and value.get('point','').endswith('_after'):
-                    self.helper_ledger[identity]=dict(value)
-                values.append(self.helper_ledger[identity])
-            if not values: raise Blocked('helper observations missing')
-            return {'complete':True,'helpers':values}
+            expected={name for name in ('mcp','plugin','hook')
+                      if (self.project/'.opencode'/(name+'-helper.py')).is_file()}
+            if (self.project/'.opencode'/'lsp-helper.py').is_file() \
+                    and getattr(self,'_lsp_result',{}).get('spawned') is True: expected.add('lsp')
+            def read():
+                values=self._helper_snapshot()
+                return {'complete':True,'helpers':values} if values and expected<=set(
+                    value.get('kind') for value in values) else None
+            # Marker loss inspects the captured helper ledger after vendor death;
+            # it cannot use a readiness wait requiring that dead generation alive.
+            if self.vendor_identity is not None and self.proc.alive(self.vendor_identity) is False:
+                result=read()
+                if result is None: raise Blocked('helper observations missing')
+                return result
+            return self._await_owned(read,'helper observations missing')
         if kind=='marker_helper':
             # Host's marker-matched leftover report is public outcome evidence, not /proc search authority.
             helpers=self.observe('helper_observations')['helpers']
@@ -1248,6 +1363,34 @@ class Driver:
         if kind=='inventory': return {'complete':True,'unchanged':self.inventory.check()}
         if kind=='lifecycle': return self.lifecycle(target)
         return self._operation(kind,target)
+
+    def _helper_snapshot(self):
+        """§13: one metadata/identity checked helper snapshot, no invented spawn facts."""
+        folder=self._helper_folder(self.project)
+        if not folder.is_dir(): raise Blocked('helper observation absent')
+        values=[]
+        for path in sorted(folder.glob('*.json')):
+            if path.stat().st_size>OBSERVATION_BYTES: raise Blocked('helper observation bound')
+            raw=path.read_bytes()
+            if self.vault.leaks(raw): raise Blocked('helper wrote password')
+            value=self._json(raw)
+            _typed(value,{'pid':I,'start_ticks':I,'password_key_absent':B},'helper')
+            identity=safety.Identity(value['pid'],value['start_ticks'])
+            if self.proc.alive(identity) is True:
+                self.proc.verify(identity)
+                if identity in self.helper_ledger and self.helper_generations.get(identity)!=self.vendor_identity:
+                    raise Blocked('helper readiness generation changed')
+                if identity not in self.helper_ledger and not self._descends_from(identity,self.vendor_identity):
+                    raise Blocked('helper readiness did not come from owned generation')
+                self.helper_ledger[identity]=dict(value); self.helper_generations[identity]=self.vendor_identity
+                self.helper_origins[identity]=folder
+            elif identity not in self.helper_ledger:
+                continue
+            # Historical after-spawn state belongs only to an identity captured alive before.
+            if identity in self.helper_ledger and self.proc.gone(identity) and value.get('point','').endswith('_after'):
+                self.helper_ledger[identity]=dict(value)
+            values.append(self.helper_ledger[identity])
+        return values
 
     @staticmethod
     def _event_session(event):
@@ -1447,23 +1590,21 @@ class Driver:
         if name not in self._armed: raise Blocked('seam was not armed')
         occurrence=self._armed[name]
         path=Path(self.env['VIA_FAILPOINT_DIR'])/f'{name}.{occurrence}.ack'
-        deadline=time.monotonic()+timeout
-        while time.monotonic()<deadline:
-            if path.exists():
-                raw=path.read_bytes()
-                if len(raw)>4096: raise Blocked('seam acknowledgement bound')
-                row=self._json(raw)
-                _typed(row,{'point':S,'occurrence':I,'action':S,'pid':I},'seam acknowledgement')
-                if row['point']!=name or row['occurrence']!=occurrence or not self.daemon \
-                        or row['pid']!=self.daemon.pid:
-                    raise Blocked('foreign seam acknowledgement')
-                result={'complete':True,'owned':True,**row}
-                if name.startswith('wire.'):
-                    _typed(row.get('facts'),{'written':I,'body_length':I},'Wire byte facts')
-                    result.update(row['facts'])
-                return result
-            time.sleep(0.01)
-        raise Blocked('seam entry unobserved')
+        def read():
+            try: raw=path.read_bytes()
+            except FileNotFoundError: return None
+            if len(raw)>4096: raise Blocked('seam acknowledgement bound')
+            row=self._json(raw)
+            _typed(row,{'point':S,'occurrence':I,'action':S,'pid':I},'seam acknowledgement')
+            if row['point']!=name or row['occurrence']!=occurrence or not self.daemon \
+                    or row['pid']!=self.daemon.pid:
+                raise Blocked('foreign seam acknowledgement')
+            result={'complete':True,'owned':True,**row}
+            if name.startswith('wire.'):
+                _typed(row.get('facts'),{'written':I,'body_length':I},'Wire byte facts')
+                result.update(row['facts'])
+            return result
+        return self._await_owned(read,'seam entry unobserved',seconds=timeout)
 
     def seam_release(self,name,occurrence=None):
         if name not in self._armed: raise Blocked('seam was not armed')
@@ -1530,7 +1671,7 @@ class Driver:
         if not self.last_request or 'session_id' not in self.last_request['receipt']:
             raise Blocked('L14 requires an active Host-backed VIA turn pin')
         active_session=self.last_request['receipt']['session_id']
-        status_reply=self.via(['status',active_session])
+        status_reply=self._live_pin(active_session)
         active=status_reply.get('active_turn')
         live_pin=type(active) is dict and active.get('phase')=='accepted' \
             and status_reply.get('state')=='running' \
@@ -1597,6 +1738,7 @@ class Driver:
                 self._mock_request_admit(model); self._publication_entered.set()
                 deadline=min(self.phase_deadline or float('inf'),time.monotonic()+180)
                 while not self._publication_release.wait(.01):
+                    self.proc.verify(self.vendor_identity)
                     if self.signals: self.signals.guard()
                     if time.monotonic()>=deadline: raise Blocked('publication response barrier deadline')
             provider.admit_request=publication_request
@@ -1606,7 +1748,8 @@ class Driver:
         if 'cli_error' in receipt: raise Blocked('fresh L14 turn refused')
         self.ensure_vendor()
         if point=='publication':
-            if not self._publication_entered.wait(30): raise Blocked('publication model request unobserved')
+            self._await_owned(lambda:True if self._publication_entered.is_set() else None,
+                              'publication model request unobserved')
             return
         tool=self._operation('helper_barrier',{'helper':'tool'})
         if tool.get('started') is not True or tool.get('owned') is not True:
@@ -1621,9 +1764,7 @@ class Driver:
             self._operation('helper_release',{'helper':'tool'})
             second=self._operation('helper_barrier',{'helper':'completed'})
             if second.get('owned') is not True: raise Blocked('post-tool live pin unobservable')
-            path=self._helper_folder(project)/'tool.json'
-            value=self._json(path.read_bytes())
-            if value.get('point')!='tool_after': raise Blocked('tool completion barrier absent')
+            self._await_helper_point('tool','tool_after')
             return
         if point.startswith(('location_shell_','session_shell_')):
             helperkind='location_shell' if point.startswith('location_') else 'session_shell'
@@ -1653,12 +1794,8 @@ class Driver:
             if helper.get('owned') is not True: raise Blocked('L14 configured helper ancestry unobservable')
             if point.endswith('_after'):
                 self._operation('helper_release',{'helper':kind})
-                deadline=time.monotonic()+30
-                while time.monotonic()<deadline:
-                    value=self._json((self._helper_folder(project)/(kind+'.json')).read_bytes())
-                    if value.get('point')==point: return
-                    time.sleep(.01)
-                raise Blocked('L14 helper after-spawn point not reached')
+                self._await_helper_point(kind,point)
+                return
             return
         if point=='reload':
             row=offered['paths'].get('/api/location/reload',{}).get('post')
@@ -1739,13 +1876,15 @@ class Driver:
             if row is None: raise Blocked('L11 direct vendor identity unavailable')
             identity=safety.Identity(process.pid,row['start_ticks']); self.identities.add(identity)
             password=self.vault.read_once(self.proc,identity)
-            deadline=time.monotonic()+30
+            deadline=min(time.monotonic()+30,self.phase_deadline or float('inf'))
             while True:
+                if self.signals: self.signals.guard()
+                self.proc.verify(identity)
+                if time.monotonic()>=deadline: raise Blocked('L11 direct listener startup deadline')
                 try: origin=self.proc.listener(identity); break
-                except Blocked:
-                    if time.monotonic()>=deadline or process.poll() is not None: raise
-                    time.sleep(.01)
-            http=safety.OwnedHTTP(origin,identity,self.proc,password,seeding_mode=True)
+                except safety.ListenerNotReady:
+                    time.sleep(min(.01,max(0,deadline-time.monotonic())))
+            http=safety.OwnedHTTP(origin,identity,self.proc,password,seeding_mode=True,deadline=deadline)
             status,raw=http.request('GET','/api/info')
             info=self._json(raw)
             if status!=200 or info['pid']!=identity.pid or info['version']!='2.0.22':
@@ -1901,6 +2040,8 @@ class Driver:
         while time.monotonic()<deadline:
             states=[self.proc.alive(identity) for identity in self.identities]
             locks=[self._lock_free(path) for path in self._lock_paths()]
+            if any(state is None for state in states) or any(lock is None for lock in locks):
+                raise Blocked('owned stop identity or lock unverifiable')
             if all(state is False for state in states) and locks==[True,True]: break
             time.sleep(0.02)
         pgrep=self._pgrep_clear()
@@ -2172,6 +2313,7 @@ print('VIA HELPER DONE')
             deadline=sample['deadline']
             if deadline>self._sigkill_at+1.000001: raise Blocked('death window exceeds one second')
             while time.monotonic()<=deadline:
+                self.proc.verify(self.daemon)
                 row=self.proc.stat(self.daemon.pid)
                 if not row or row['start_ticks']!=self.daemon.start_ticks or row['state'] not in {'T','t'}:
                     raise Blocked('daemon resumed during death proof')
@@ -2218,19 +2360,14 @@ print('VIA HELPER DONE')
             return {'requested':dict(settings),'daemon_restart_required':True}
         if kind=='server_loss_for_marker':
             if not self.daemon or not self.anchor: raise Blocked('marker server-loss identities absent')
-            status=self.via(['status',session])
-            active=status.get('active_turn')
-            if type(active) is not dict or active.get('phase')!='accepted' or status.get('state')!='running':
-                raise Blocked('marker loss requires an active accepted VIA turn')
+            self._live_pin(session)
             self.proc.verify(self.anchor); self.journal._signal(self.anchor,signal.SIGKILL)
             return {'anchor_pid_only':True}
         if kind=='helper_stop_proof':
             helper=args['helper']
             rows=[(identity,row) for identity,row in self.helper_ledger.items() if row.get('kind')==helper]
             if not rows: raise Blocked('helper identity was never captured')
-            deadline=time.monotonic()+30
-            while time.monotonic()<deadline and any(self.proc.alive(identity) is not False for identity,_ in rows):
-                time.sleep(.01)
+            self._await_gone([identity for identity,_ in rows],'helper stop/pgrep absence unverified')
             gone=all(self.proc.gone(identity) for identity,_ in rows)
             path=str(self.project/'.opencode'/f'{helper}-helper.py')
             rc,out,_=self.execute(['/usr/bin/pgrep','-f','--',path],env=self.env,timeout=5)
@@ -2269,9 +2406,7 @@ print('VIA HELPER DONE')
                 if identity is None: raise Blocked('idle predecessor identity absent')
                 self.close_event_capture()
                 # Idle retirement is a vendor route policy; do not manufacture it by signalling.
-                deadline=time.monotonic()+90
-                while time.monotonic()<deadline and self.proc.alive(identity) is not False:
-                    time.sleep(.05)
+                self._await_gone([identity],'idle retirement not reached in bound',seconds=90)
                 if not self.proc.gone(identity): raise Blocked('idle retirement not reached in bound')
                 self._http=None; self._event_generation=None; self._idle_retired=True
             return {'stop_proven':True,'vendor_session_id':sid}
@@ -2283,7 +2418,18 @@ print('VIA HELPER DONE')
             return {'complete':True,'events':events,'terminal_revision':terminal[-1]['revision']}
         if kind=='turn_identity':
             envelope=args['envelope']; sid=envelope['vendor_session_id']
-            native=self.observe('native_events',sid)['events']
+            inputid=input_id(session,envelope['turn'])
+            def ready(rows):
+                delivered=[row for row in rows if row['type']=='session.inbox.delivered'
+                           and row.get('data',row).get('inboxID',row.get('data',row).get('id'))==inputid]
+                if len(delivered)>1: raise Blocked('exact current owned input delivery ambiguous')
+                if not delivered: return False
+                later=[row['seq'] for row in rows if row['type']=='session.inbox.delivered'
+                       and row['seq']>delivered[0]['seq']]
+                boundary=min(later,default=float('inf'))
+                return any(delivered[0]['seq']<row['seq']<boundary and row['type'] in {
+                    'session.execution.succeeded','session.execution.failed','session.execution.interrupted'} for row in rows)
+            native=self._await_native(sid,ready,'owned native delivery/terminal unobservable')
             delivered=[row for row in native if row['type']=='session.inbox.delivered']
             terminals=[row for row in native if row['type'] in {'session.execution.succeeded','session.execution.failed','session.execution.interrupted'}]
             inputid=input_id(session,envelope['turn'])
@@ -2305,9 +2451,24 @@ print('VIA HELPER DONE')
                     'automatic_compaction':any(row['type'].startswith('session.compaction.') for row in native)}
         if kind=='native_terminal':
             sid=self._vendor_sid(session)
-            rows=self.observe('native_events',sid)['events']
-            terminal=[row for row in rows if row['type'].startswith('session.execution.') and row['type']!='session.execution.started']
-            if not terminal: raise Blocked('native terminal absent')
+            request=self.last_request
+            if not request or request['receipt'].get('session_id')!=session:
+                raise Blocked('native terminal current turn identity unavailable')
+            try: number=int(request['receipt']['turn'].rsplit('/',1)[1])
+            except (ValueError,KeyError,IndexError) as error:
+                raise Blocked('native terminal current turn identity malformed') from error
+            expected=input_id(session,number)
+            def ready(rows):
+                delivery=[event for event in rows if event['type']=='session.inbox.delivered'
+                          and event.get('data',event).get('inboxID',event.get('data',event).get('id'))==expected]
+                if len(delivery)>1: raise Blocked('native terminal delivery ambiguous')
+                return bool(delivery) and any(event['seq']>delivery[0]['seq'] and event['type'] in {
+                    'session.execution.succeeded','session.execution.failed','session.execution.interrupted'} for event in rows)
+            rows=self._await_native(sid,ready,'native terminal absent')
+            delivery=next(event for event in rows if event['type']=='session.inbox.delivered'
+                          and event.get('data',event).get('inboxID',event.get('data',event).get('id'))==expected)
+            terminal=[event for event in rows if event['seq']>delivery['seq'] and event['type'] in {
+                'session.execution.succeeded','session.execution.failed','session.execution.interrupted'}]
             row=terminal[-1]; data=row.get('data',row)
             return {'type':row['type'],'reason':data.get('reason'),'owned':any(event['type']=='session.inbox.delivered' and event['seq']<row['seq']
                                 and str(event.get('data',event).get('inboxID','')).startswith('msg_via') for event in rows)}
@@ -2321,18 +2482,21 @@ print('VIA HELPER DONE')
             return receipt
         if kind=='helper_barrier':
             helper=args['helper']; path=self._helper_folder(self.project)/(helper+'.json')
-            deadline=time.monotonic()+30
-            while time.monotonic()<deadline:
-                if path.exists():
-                    if path.stat().st_size>OBSERVATION_BYTES: raise Blocked('helper observation bound')
-                    row=self._json(path.read_bytes()); identity=safety.Identity(row['pid'],row['start_ticks'])
-                    self.proc.verify(identity)
-                    if row.get('ready') is True:
-                        self.identities.add(identity); self.helper_ledger[identity]=dict(row); self.helper_generations[identity]=self.vendor_identity
-                        self.helper_origins[identity]=path.parent
-                        return {'started':True,'owned':self._descends_from(identity,self.vendor_identity),**row}
-                time.sleep(.01)
-            raise Blocked('helper barrier not reached')
+            def read():
+                try: raw=path.read_bytes()
+                except FileNotFoundError: return None
+                if len(raw)>OBSERVATION_BYTES: raise Blocked('helper observation bound')
+                row=self._json(raw)
+                _typed(row,{'pid':I,'start_ticks':I,'ready':B,'kind':S},'helper readiness')
+                identity=safety.Identity(row['pid'],row['start_ticks'])
+                self.proc.verify(identity)
+                if row['kind']!=helper or not self._descends_from(identity,self.vendor_identity):
+                    raise Blocked('helper readiness did not come from owned generation')
+                if row['ready'] is not True: return None
+                self.identities.add(identity); self.helper_ledger[identity]=dict(row)
+                self.helper_generations[identity]=self.vendor_identity; self.helper_origins[identity]=path.parent
+                return {'started':True,'owned':True,**row}
+            return self._await_owned(read,'helper barrier not reached')
         if kind=='helper_release':
             path=self._helper_folder(self.project)/(args['helper']+'.release')
             fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600); os.close(fd)
@@ -2346,7 +2510,24 @@ print('VIA HELPER DONE')
             for name,occurrence in self.last_cancel['held'].items():
                 directory=Path(self.env['VIA_FAILPOINT_DIR'])
                 if (directory/f'{name}.{occurrence}.ack').exists() and not (directory/f'{name}.{occurrence}.release').exists(): held.append(name)
-            native=self.observe('native_events',self._vendor_sid(session))['events']
+            sid=self._vendor_sid(session)
+            native=self.observe('native_events',sid)['events']
+            if 'wire.http.before_response' in held:
+                request=self.last_request
+                if not request or request['receipt'].get('session_id')!=session:
+                    raise Blocked('cancel timing current turn identity unavailable')
+                try: number=int(request['receipt']['turn'].rsplit('/',1)[1])
+                except (KeyError,ValueError,IndexError) as error:
+                    raise Blocked('cancel timing current turn identity malformed') from error
+                expected=input_id(session,number)
+                def interrupted(rows):
+                    delivery=[row['seq'] for row in rows if row['type']=='session.inbox.delivered'
+                        and row.get('data',row).get('inboxID',row.get('data',row).get('id'))==expected]
+                    if len(delivery)>1: raise Blocked('cancel timing delivery ambiguous')
+                    return bool(delivery) and any(row['seq']>delivery[0]
+                        and row['type']=='session.execution.interrupted'
+                        and row.get('data',row).get('reason')=='user' for row in rows)
+                native=self._await_native(sid,interrupted,'held response native interruption unobservable')
             interrupts=[row for row in native if row['type']=='session.execution.interrupted' and row.get('data',row).get('reason')=='user']
             proof=self._fake_control('qualification_body_prefix_cancel_preserves_offset_and_stop_pool')
             return {'cancel_returned':type(self.last_cancel['reply'].get('state')) is str,
@@ -2415,12 +2596,8 @@ print('VIA HELPER DONE')
                     path=folder/(channel+'.release')
                     if not path.exists():
                         fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600); os.close(fd)
-            deadline=time.monotonic()+HELPER_STOP_SECONDS
-            while not all(self.proc.gone(identity) for identity in helpers):
-                if self.signals: self.signals.guard()
-                if time.monotonic()>=deadline:
-                    raise Blocked('predecessor helper survives cooperative release')
-                time.sleep(.01)
+            self._await_gone(helpers,'predecessor helper survives cooperative release',
+                             seconds=HELPER_STOP_SECONDS)
             self.close_event_capture(); self._http=None; self.ensure_vendor()
             record=self._host_record()
             predecessors=[identity for identity in self.server_identities if identity!=self.vendor_identity]
@@ -2610,17 +2787,15 @@ print('VIA HELPER DONE')
 
     def _foreign_observation(self,session,args,held=False):
         if not hasattr(self,'_foreign'): raise Blocked('foreign input not injected')
-        sid=self._vendor_sid(session); events=self.observe('native_events',sid)['events']
-        if not held:
-            deadline=time.monotonic()+30
-            while True:
-                delivery=[row['seq'] for row in events if row['type']=='session.inbox.delivered'
-                          and row.get('data',row).get('inboxID',row.get('data',row).get('id'))==self._foreign['id']]
-                finished=[row for row in events if delivery and row['seq']>delivery[0]
-                          and row['type'] in {'session.execution.succeeded','session.execution.failed','session.execution.interrupted'}]
-                if finished: break
-                if time.monotonic()>=deadline: raise Blocked('foreign execution terminal unobservable')
-                time.sleep(.01); events=self.observe('native_events',sid)['events']
+        sid=self._vendor_sid(session)
+        def ready(events):
+            delivery=[row['seq'] for row in events if row['type']=='session.inbox.delivered'
+                      and row.get('data',row).get('inboxID',row.get('data',row).get('id'))==self._foreign['id']]
+            if len(delivery)>1: raise Blocked('foreign delivery identity ambiguous')
+            if not delivery: return False
+            return held or any(row['seq']>delivery[0] and row['type'] in {
+                'session.execution.succeeded','session.execution.failed','session.execution.interrupted'} for row in events)
+        events=self._await_native(sid,ready,'foreign execution delivery/terminal unobservable')
         delivered=[row.get('data',row) for row in events if row['type']=='session.inbox.delivered']
         foreign=[row for row in delivered if row.get('inboxID',row.get('id'))==self._foreign['id']]
         if not self.last_request: raise Blocked('owned foreign-control receipt absent')
@@ -2721,19 +2896,20 @@ print('VIA HELPER DONE')
             if type(calls) is not list or not calls or any(row.get('schema_checked') is not True for row in calls):
                 raise Blocked('actual offered read schema unavailable for LSP probe')
             sid=self._vendor_sid(receipt['session_id'])
-            events=self.observe('native_events',sid)['events']
-            called={row.get('data',{}).get('id') for row in events
-                    if row.get('type')=='session.tool.called' and row.get('data',{}).get('name')=='read'}
-            succeeded={row.get('data',{}).get('id') for row in events if row.get('type')=='session.tool.success'}
-            if not any(row.get('id') in called & succeeded for row in calls):
-                raise Blocked('configured fixture file read was not actually completed')
+            def read_completed(events):
+                called={row.get('data',{}).get('id') for row in events
+                        if row.get('type')=='session.tool.called' and row.get('data',{}).get('name')=='read'}
+                succeeded={row.get('data',{}).get('id') for row in events if row.get('type')=='session.tool.success'}
+                return any(row.get('id') in called & succeeded for row in calls)
+            self._await_native(sid,read_completed,'configured fixture file read was not actually completed')
             beginning=time.monotonic(); deadline=beginning+5
             if self.phase_deadline is not None and deadline>self.phase_deadline:
                 raise Blocked('phase has insufficient LSP readiness budget')
             spawned=False; marker=self._helper_folder(project)/'lsp.json'
+            verify=self._owned_observation_guard()
             while True:
                 if self.signals: self.signals.guard()
-                self.proc.verify(self.vendor_identity)
+                verify()
                 if marker.exists():
                     helpers=self.observe('helper_observations')['helpers']
                     spawned=any(row.get('kind')=='lsp' and row.get('ready') is True for row in helpers)
@@ -2922,8 +3098,7 @@ print('VIA HELPER DONE')
                      'owned_claim_verified':True,'count':len(data),'prompt_bytes':actual_prompt_bytes,
                      'cwd_json_bytes':cwd_bytes})
         crashed=self.daemon; self.proc.verify(crashed); self.journal._signal(crashed,signal.SIGKILL)
-        deadline=time.monotonic()+30
-        while time.monotonic()<deadline and not self.proc.gone(crashed): time.sleep(.01)
+        self._await_gone([crashed],'owned VIA crash absence unverifiable')
         if not self.proc.gone(crashed): raise Blocked('owned VIA crash absence unverifiable')
         self.daemon=None; self._armed={}; self._armed_history=set(); self._seam_targets={}
         # No graceful cancel may delete the queued claim before reopen cleanup.
@@ -2936,7 +3111,9 @@ print('VIA HELPER DONE')
         if recovered['state']!='unknown': raise Blocked('crashed owned turn not recovered unknown')
         successor=self.via(['resume',session,'--prompt','VIA SUCCESSOR'])
         envelope=self.via(['wait',successor['turn'],'--timeout-ms','180000'])
-        events=self.observe('native_events',sid)['events']
+        events=self._await_native(sid,lambda rows:any(row['type']=='session.inbox.cancelled'
+            and row.get('data',row).get('inboxID',row.get('data',row).get('id'))==expected for row in rows),
+            'owned near-limit cancellation event unobservable')
         cancelled=[row.get('data',row).get('inboxID',row.get('data',row).get('id'))
                    for row in events if row['type']=='session.inbox.cancelled']
         return {'successor_completed':envelope['state']=='completed',
@@ -2953,7 +3130,8 @@ print('VIA HELPER DONE')
         elif reply['status']!=204: raise Blocked('controlled prompt refused')
 
     def _observe_accepted_input(self,sid):
-        events=self.observe('native_events',sid)['events']
+        events=self._await_native(sid,lambda rows:any(row['type']=='session.inbox.enqueued'
+                                  for row in rows),'VIA owned accepted input not observed')
         accepted=[row for row in events if row['type']=='session.inbox.enqueued']
         if not accepted: raise Blocked('VIA owned accepted input not observed')
         data=accepted[-1].get('data',accepted[-1]); value=data.get('inboxID',data.get('id'))

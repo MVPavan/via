@@ -514,6 +514,7 @@ class DriverTests(unittest.TestCase):
             root=Path(root); project=root/'project'; project.mkdir(); calls=[]; inbox=[]; crashed=False
             d=Driver('release','fp','pin',root/'evidence',initialize=False)
             d.daemon=Identity(7,9); d.proc=mock.Mock(); d.proc.gone.return_value=True
+            d.proc.alive.return_value=False
             expected=input_id('s_fixture',2)
             schema={'paths':{'/api/session/{sessionID}/prompt':{'post':{'requestBody':{'content':{'application/json':{'schema':
                     {'type':'object','properties':{'id':{'type':'string'},'text':{'type':'string'},'delivery':{'type':'string','enum':['queue']}},

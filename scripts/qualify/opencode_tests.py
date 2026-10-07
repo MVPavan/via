@@ -29,6 +29,30 @@ class EntryTests(unittest.TestCase):
         self.assertEqual(opencode.self_test.skipped,[{'test':optional.id(),
             'reason':'optional real-VIA audit: binaries absent'}])
 
+    def test_failed_self_test_identity_and_cleanup_proofs_reach_summary_and_phase(self):
+        with tempfile.TemporaryDirectory(prefix='oc-entry-',dir=opencode.SCRATCHPAD) as directory:
+            root=Path(directory)
+            args=SimpleNamespace(self_test=False,phase=['preflight'],evidence=root/'run',
+                acquire=False,opencode=root/'pin',via_release=root/'release',via_failpoints=root/'fp',
+                fake_gate_manifest=root/'gates')
+            identity='opencode_readiness_tests.ReadinessTests.test_cached_vendor_origin_rechecks_host_binding'
+            proof={'build':'release','owned_processes':1,'identities_gone':True,
+                   'pgrep_clear':True,'private_root_removed':True,'short_runtime_removed':True}
+            with patch.object(opencode,'arguments',return_value=args), \
+                 patch.object(opencode,'self_test',return_value=([identity],1)) as tests, \
+                 patch.object(opencode,'verify_fake_gates') as gates, \
+                 patch.object(opencode.safety,'verify_binary') as pin, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                tests.skipped=[]; tests.real_via_cleanup=[proof]
+                self.assertEqual(opencode.main([]),1)
+            summary=json.loads((args.evidence/'summary.json').read_text())
+            phase=json.loads((args.evidence/'setup.json').read_text())
+            self.assertEqual(summary['self_test_admission']['failed'],[identity])
+            self.assertEqual(summary['self_test_admission']['real_via_cleanup'],[proof])
+            self.assertEqual(phase[-1]['self_test_admission'],summary['self_test_admission'])
+            self.assertEqual(summary['blocks'][0]['reason'],'offline self-tests failed')
+            gates.assert_not_called(); pin.assert_not_called()
+
     def test_preflight_schema_block_reason_reaches_summary_and_phase(self):
         import opencode_driver
         with tempfile.TemporaryDirectory(prefix="oc-entry-", dir=opencode.SCRATCHPAD) as directory:

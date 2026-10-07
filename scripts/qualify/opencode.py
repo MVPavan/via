@@ -13,6 +13,7 @@ import hashlib
 import importlib
 import json
 import os
+import re
 import stat
 import shutil
 import secrets
@@ -46,9 +47,17 @@ FAKE_GATES = ("fmt", "clippy", "clippy-failpoints", "nextest-default", "nextest-
               "diff-check")
 VERSION = "2.0.22"
 E7_SHA256 = "540fdf565da27de9df69b6c3864582344e74ac4ffa225c283b289481d215d241"
-TEST_MODULES = ("opencode_safety_tests", "opencode_cases_tests", "opencode_driver_tests",
+TEST_MODULES = ("opencode_safety_tests", "opencode_cases_tests", "opencode_driver_tests", "opencode_readiness_tests",
                 "opencode_barrier_tests", "opencode_runtime_tests", "opencode_tests", "opencode_ownership_tests", "opencode_via_tests")
 _ACQUISITION_ROOT = None
+
+
+def test_identity(value):
+    """§13: keep only static test names, never dynamic subtest values or tracebacks."""
+    name=value.split(' (',1)[0]
+    match=re.fullmatch(r'(opencode_[a-z_]+)\.([A-Za-z_][A-Za-z_0-9]*)\.(test_[A-Za-z_0-9]+)',name)
+    if match and match[1] in TEST_MODULES: return name
+    return 'unrecognized-test-'+hashlib.sha256(value.encode()).hexdigest()
 
 
 def self_test():
@@ -62,7 +71,7 @@ def self_test():
     # leave this collector, following packet §2.3's memory-only password rule.
     result = unittest.TestResult()
     suite.run(result)
-    failed = [test.id() for test, _trace in result.failures + result.errors]
+    failed = [test_identity(test.id()) for test, _trace in result.failures + result.errors]
     self_test.skipped = [{'test': test.id(), 'reason': reason}
                          for test, reason in result.skipped
                          if test.id().startswith('opencode_via_tests.RealViaTests.')]
@@ -361,6 +370,8 @@ def main(argv=None):
         rows = list(phase_rows) if name == current_phase else []
         rows.append({'case': block['case'], 'phase': name, 'result': 'blocked',
                      'reason': block['reason'], 'blocking': block})
+        if name=='setup' and 'self_test_admission' in info:
+            rows[-1]['self_test_admission']=info['self_test_admission']
         try:
             persist_phase(args.evidence, name, rows, vault,
                           getattr(driver, 'secret_forms', ()), ownership)
@@ -378,6 +389,14 @@ def main(argv=None):
             protected_write(vault, args.evidence / 'runner-manifest.json', info['runner_source'])
             failures, count = self_test()
             info["self_tests"] = count
+            skipped=getattr(self_test,'skipped',[])
+            cleanup_proofs=getattr(self_test,'real_via_cleanup',[])
+            admission={'count':count,'failed':[test_identity(value) for value in failures],
+                'skipped_count':len(skipped) if type(skipped) is list else 0,
+                'real_via_cleanup':cleanup_proofs if type(cleanup_proofs) is list else []}
+            info['self_test_admission']=admission
+            path=ownership.register(args.evidence/'self-test-admission.json','runner-evidence',directory=False)
+            protected_write(vault,path,admission)
             if failures:
                 raise safety.Blocked("offline self-tests failed")
             fake_gates = verify_fake_gates(args.fake_gate_manifest, args.via_release,

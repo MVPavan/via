@@ -963,6 +963,8 @@ class ConfiguredLspDriverTests(unittest.TestCase):
             "received": True, "model_matches": True,
             "read_calls": [{"id": "read-1", "schema_checked": True}]})}
         driver.phase_deadline = None
+        driver.daemon = None; driver.anchor = None
+        driver._bootstrap_active = False; driver._bootstrap_deadline = None
         driver.signals = None
         driver.proc = SimpleNamespace(verify=mock.Mock())
         driver.vendor_identity = object()
@@ -1018,7 +1020,10 @@ class ConfiguredLspDriverTests(unittest.TestCase):
     def test_missing_actual_read_blocks_without_negative_or_retry(self):
         with tempfile.TemporaryDirectory() as temporary:
             driver = self.fixture_driver(Path(temporary), actual_read=False)
-            with self.assertRaisesRegex(transport.Blocked, "not actually completed"):
+            clock = [0.0]
+            with mock.patch.object(transport.time, 'monotonic', side_effect=lambda: clock[0]), \
+                 mock.patch.object(transport.time, 'sleep', side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)), \
+                 self.assertRaisesRegex(transport.Blocked, "not actually completed"):
                 driver._lsp_probe()
             self.assertFalse(hasattr(driver, "_lsp_result"))
             with self.assertRaisesRegex(transport.Blocked, "single LSP configured-read probe was incomplete"):
