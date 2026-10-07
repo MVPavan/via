@@ -2315,7 +2315,7 @@ def interrupt(run):
         run.check("not induced: " + name + " tool live before interrupt",
                   fd is not None and live is not None and live["state"] != "Z")
     b_before = run.verify_tool_running(b1, b_tool)
-    save(run.evidence / "interrupt-isolation.json", {"before_request": b_before, "outcome": "pending"})
+    save(run.evidence / "interrupt-isolation-pending.json", {"before_request": b_before, "outcome": "pending"})
     rc, cancel, _ = run.via_call(run.evidence, "cancel-a", "cancel", a, "--json",
                                 timeout=WALL_S + 65, handle=run.handles[a])
     run.check("cancel through VIA", rc == 0 and cancel["cancel"] is not None)
@@ -2485,9 +2485,9 @@ def cleanup(run):
                 stopped = False
         except BaseException:
             stopped = False
+    protocol = None
     try:
         facts = run.facts(final=True)
-        save(run.evidence / "protocol.json", facts)
         counts = {method: 0 for method in NO_GRANT_METHODS}
         unknown = {}
         for fact in facts:
@@ -2501,15 +2501,23 @@ def cleanup(run):
                     counts[known] += 1
         run.record_only.append({"observation": "no-grant paths", "per_method_counts": counts,
                                 "unknown_method_digest_counts": unknown})
+        protocol = facts
     except BaseException:
         errors.append("complete protocol evidence unavailable")
         try:
             partial = run.facts()
             run.blocked_reasons.extend(row["blocked_reason"] for row in partial
                                        if row.get("blocked_reason") is not None)
-            save(run.evidence / "protocol.json", {"complete": False, "facts": partial})
+            protocol = {"complete": False, "facts": partial}
         except BaseException:
             errors.append("partial protocol evidence unavailable")
+    if protocol is not None:
+        try:
+            # Select full/partial evidence before creation; never retry a file
+            # that a failed write might already have created.
+            save(run.evidence / "protocol.json", protocol)
+        except BaseException:
+            errors.append("protocol evidence write unavailable")
     try:
         save(run.evidence / "lifecycle.json", [{"phase": record["phase"],
              "pid": record.get("pid"), "start_ticks": record.get("start_ticks"),
@@ -2670,10 +2678,14 @@ def main(argv=None):
         if shared.INTERRUPTED and not summary["interrupted"]:
             observe_interruption()
             pending_summary.unlink()
+            pending_summary = args.evidence / "summary.interrupted.pending.json"
             save(pending_summary, summary)
         os.replace(pending_summary, args.evidence / "summary.json")
         if shared.INTERRUPTED and not summary["interrupted"]:
             observe_interruption()
+            # This branch and the pre-rename correction are mutually exclusive:
+            # observe_interruption makes the summary's interrupted flag sticky.
+            pending_summary = args.evidence / "summary.interrupted.pending.json"
             save(pending_summary, summary)
             os.replace(pending_summary, args.evidence / "summary.json")
     except BaseException:
@@ -3765,6 +3777,7 @@ class SafetyTests(unittest.TestCase):
                     evidence = self.root / "scratchpad" / "result"
                     original_remove, original_scan, original_save = shutil.rmtree, package_secret_free, save
                     original_replace = os.replace
+                    saved_names = []
                     def remove(*args, **kwargs):
                         result = original_remove(*args, **kwargs)
                         if boundary == "removal":
@@ -3776,6 +3789,7 @@ class SafetyTests(unittest.TestCase):
                             shared.record_signal(signal.SIGHUP, None)
                         return result
                     def saved(path, value):
+                        saved_names.append(path.name)
                         result = original_save(path, value)
                         if boundary == "publication" and path.name == "summary.pending.json":
                             shared.record_signal(signal.SIGINT, None)
@@ -3798,6 +3812,7 @@ class SafetyTests(unittest.TestCase):
                                        "--via-sha256", run.args.via_sha256, "--codex-sha256", run.args.codex_sha256,
                                        "--evidence", str(evidence)])
                     self.assertEqual(result, 2)
+                    self.assertEqual(len(saved_names), len(set(saved_names)), "each summary staging name is saved once")
                     summary = json.loads((evidence / "summary.json").read_text())
                     self.assertEqual(summary["result"], "blocked")
                     self.assertTrue(summary["interrupted"])
@@ -3821,7 +3836,8 @@ class SafetyTests(unittest.TestCase):
         for same, timing in ((True, "overlap"), (False, "overlap"),
                              (True, "completed_early"), (True, "started_late"), (True, "a_gone"),
                              (True, "tool_ended_early"), (True, "b_tool_ended_early"),
-                             (True, "b_tool_ended_before_terminal"), (True, "b_gone"), (True, "run8")):
+                             (True, "b_tool_ended_before_terminal"), (True, "b_gone"),
+                             (True, "run8"), (True, "real_save")):
             with self.subTest(same=same, timing=timing), tempfile.TemporaryDirectory() as root:
                 previous, self.root = self.root, Path(root)
                 try:
@@ -3872,21 +3888,27 @@ class SafetyTests(unittest.TestCase):
                             self.assertNotEqual(admitted["a1"], admitted["b1"], "concurrent native claims need distinct cwd")
                         return "b" if label == "b1" else "a"
 
+                    real_observer = run.observe_tool_through_interrupt
+
                     def observed(label, *args):
                         if timing == "run8" and label == "a1":
                             self.assertIn("submit-b1", order,
                                           "Run 8: waiting 10.1s for A before starting B adds B's 6s latency")
                         order.append("observe-" + label)
-                        return {"pid": 3, "start_ticks": 30} if label == "b1" else {"pid": 2, "start_ticks": 20}
+                        scoped = b_start if label == "b1" else a_start
+                        identity = {"pid": 3, "start_ticks": 30} if label == "b1" else {"pid": 2, "start_ticks": 20}
+                        return {**identity, **{key: scoped[key] for key in ("thread", "turn", "trace")}}
 
                     def observe_terminal(*args):
                         self.assertFalse(run.command_specs["b1"]["release"].exists())
                         self.assertFalse(run.command_specs["a1"]["release"].exists())
                         order.append("B-after-native-terminal")
+                        if timing == "real_save":
+                            return real_observer(*args)  # Real observer and exclusive save, including its finally.
                         return {"at_ms": a_end["seq"] * 100 + 1}
 
                     def finish(label):
-                        if same and timing in ("overlap", "run8") and label == "a1":
+                        if same and timing in ("overlap", "run8", "real_save") and label == "a1":
                             self.assertIn("B-after-native-terminal", order,
                                           "B must be reverified at the native A terminal, before envelope cleanup")
                             self.assertTrue(run.command_specs["b1"]["release"].is_file())
@@ -3907,7 +3929,8 @@ class SafetyTests(unittest.TestCase):
                          mock.patch.object(run, "via_call", side_effect=via_call), \
                          mock.patch.object(run, "finish", side_effect=finish), \
                          mock.patch.object(run, "observe_tool_through_interrupt", side_effect=observe_terminal), \
-                         mock.patch.object(run, "verify_tool_running", return_value={"at_ms": b_tool["seq"] * 100}), \
+                         mock.patch.object(run, "verify_tool_running", side_effect=lambda label, proof, rows=None:
+                             {**proof, "at_ms": (a_end if rows is not None else b_tool)["seq"] * 100 + 1}), \
                          mock.patch.object(run, "facts", return_value=facts), \
                          mock.patch.object(run, "events", return_value=[{"type": t} for t in
                              ("cancel.requested", "cancel.settled", "turn.ended")]), \
@@ -3915,10 +3938,17 @@ class SafetyTests(unittest.TestCase):
                              (None, None) if timing == "a_gone" else (123, {"state": "S"}),
                              (None, None) if timing == "b_gone" else (124, {"state": "S"}), (None, None)]), \
                          mock.patch.object(os, "close"):
-                        if same and timing in ("overlap", "run8"):
+                        if same and timing in ("overlap", "run8", "real_save"):
                             interrupt(run)
                             self.assertLess(order.index("observe-b1"), order.index("cancel-a"))
                             self.assertEqual(order[order.index("observe-b1") + 1], "cancel-a")
+                            if timing == "real_save":
+                                saved = json.loads((run.evidence / "interrupt-isolation.json").read_text())
+                                self.assertEqual(saved["outcome"], "proven")
+                                self.assertEqual(saved["terminal"], a_end)
+                                pending = json.loads((run.evidence / "interrupt-isolation-pending.json").read_text())
+                                self.assertEqual(pending["outcome"], "pending")
+                                self.assertTrue(secret_free(saved) and secret_free(pending))
                         else:
                             reason = {"a_gone": "not induced: A tool live before interrupt",
                                       "b_gone": "not induced: B tool live before interrupt",
@@ -3933,6 +3963,34 @@ class SafetyTests(unittest.TestCase):
                                                  ["submit-a1", "submit-b1"])  # No executed-pair re-ask authority.
                 finally:
                     self.root = previous
+
+    def test_cleanup_does_not_retry_an_already_created_protocol_evidence_file(self):
+        run = self.run_object()
+        real_save, names = save, []
+
+        def saved(path, value):
+            names.append(path.name)
+            real_save(path, value)
+            if path.name == "protocol.json":
+                raise OSError("synthetic error after creating protocol evidence")
+
+        with mock.patch.object(run, "facts", return_value=[]), \
+             mock.patch.object(run, "stop_daemon"), mock.patch(__name__ + ".save", side_effect=saved):
+            _, errors = cleanup(run)
+        self.assertEqual(names.count("protocol.json"), 1)
+        self.assertIn("protocol evidence write unavailable", errors)
+        self.assertNotIn("partial protocol evidence unavailable", errors)
+        self.assertEqual(json.loads((run.evidence / "protocol.json").read_text()), [])
+
+    def test_cleanup_collects_partial_protocol_before_its_single_real_save(self):
+        run = self.run_object()
+        partial = [{"kind": "notification", "blocked_reason": "synthetic correlation unavailable"}]
+        with mock.patch.object(run, "facts", side_effect=[[], Blocked("synthetic incomplete trace"), partial]), \
+             mock.patch.object(run, "stop_daemon"):
+            _, errors = cleanup(run)
+        self.assertEqual(json.loads((run.evidence / "protocol.json").read_text()), {"complete": False, "facts": partial})
+        self.assertEqual(run.blocked_reasons, ["synthetic correlation unavailable"])
+        self.assertEqual(errors, ["complete protocol evidence unavailable"])
 
     def test_cleanup_counts_declines_explicitly(self):
         run = self.run_object()
