@@ -20,12 +20,14 @@ and commands are used. Unknown protocol shapes, unreadable/reused identities,
 incomplete traces and failed cleanup block qualification. The runner never
 composes executable code from model text: each tool prompt is one short verbatim
 argv invoking a runner-written, hashed private script outside tool workspaces.
-Missing, substituted, repeated or failing commands block. Protocol command argv
-and item IDs must agree with the expected single command, and /proc must prove
+Missing, substituted, repeated or failing reported commands block. Protocol argv
+and item IDs must agree with the admitted command, and /proc must prove
 the same pinned interpreter/script/cwd beneath that turn's owned server. These
-command checks run again over final traces; no-tool turns reject commands too.
-CommandExecution omissions cannot qualify effects. A completed pure no-command
-turn may be re-asked once under the separate bounded exception below.
+command checks run again over final traces. Positive proof of an admitted
+command does not prove absence of additional executions. "No reported tool
+items" is record-only: code-mode may execute without items. Stored c3 proves
+stored thread identity and real resume with excluded turns, not unaided recall.
+CommandExecution omissions cannot qualify effects or a zero-execution re-ask.
 The runner writes each action and a fresh public random seed only into that
 turn's private pinned script. The tool derives its nonce from the seed and fresh
 runtime entropy, so even the same script on a re-ask has a fresh unpredictable
@@ -54,7 +56,8 @@ its interruption in run 8 was failure cleanup, not the successful isolation phas
 The 10 s observed minimum yield therefore still binds B, and the seven-second
 watchdog/eight-second qualification cap stays for both. Expired overlap is "not
 induced", never a VIA failure or a qualification pass. The existing ledger permits
-only pure zero-command re-asks, not rerunning an already executing pair.
+only verified zero-command re-asks; live re-asks are disabled because execution
+absence cannot be established, and an executing pair cannot be rerun.
 Run 8's native B terminal preceded its exact command end by 5.749 s. This survival
 is record-only; no check requires OS-process exit at native interruption. A's
 quiescent cleanup claim, when present, still requires independent process absence.
@@ -78,15 +81,16 @@ and qualification remains blocked.
 
 Spending: packet §7 says usd:null/unavailable, so a dollar latch would either
 invent cost or block every successful turn. Structural control instead permits
-seven primary submissions and at most two additional labelled re-asks, at most
-two concurrently, each with a 120 s VIA wall,
-short fixed prompts, low effort, and a 1200 s run deadline. Reservations happen
-BEFORE the CLI call. Only zero command executions with a completed paired native
-turn, no errors/other activity and no target-file effect may authorize a re-ask.
-It must use the same thread, argv and prompt; each case gets one, two for the run.
-A second miss, a command deviation or attempted-but-unproven execution blocks.
-Both envelopes/native starts remain accounted for, including their usage, and
-final traces recheck every miss; late activity under a sealed miss blocks.
+seven primary submissions; the ledger also bounds a conditional allowance of
+two labelled same-thread/same-prompt re-asks, but the live runner cannot grant it.
+Missing items plus a process survey cannot positively prove no execution of the
+runner's programs. No complete invocation channel or native per-turn tool-disable
+is verified for 0.160.1. Such misses therefore block with execution absence
+unverifiable. Sticky command deviations and unpaired refusal suffixes constrain
+both admission and final accounting. Unit tests use an explicit fake complete
+execution oracle only to exercise the ledger's conditional mechanics. At most
+two turns run concurrently, each with a 120 s VIA wall, short fixed prompts, low
+effort, and a 1200 s run deadline. Reservations happen BEFORE the CLI call.
 Other retries/extra turns are forbidden. A missing/unknown envelope makes
 uncertainty sticky and forbids further submissions. All proxy generations share
 a private locked ledger: every native thread/turn start consumes a single-use
@@ -182,7 +186,9 @@ Live-item plan (via-1ok, packet §8; via-5lr.3.3 supplied scope):
   conversation    GATE spawn/result; output-schema set, replacement and clear;
                   GATE c1 exact command/protocol/process and allowed.txt bytes.
                   The tool prints the random recall code for stored c3 history;
-                  c3 may not use a tool. Marker failures record only status/errno
+                  c3 requests no tools; item absence is RECORD ONLY and does
+                  not prove unaided recall. Stored identity and excluded-turn
+                  resume remain gates. Marker failures record only status/errno
                   and a path hash, never bytes or paths.
                   GATE tightened-bound enforcement: observe a fixed write-attempt
                   argv and its EROFS-only exec transition on the same pid/start
@@ -1456,7 +1462,7 @@ class Run(shared.Run):
             self.trace_dir.mkdir(mode=0o700)
             self.reservations = reservation_control.Reservations(self.work / "reservations.json", self.spend.deadline)
             self.tool_program, self.tool_program_hash = bound_probe.write_program(self.work)
-            self.command_specs = {}
+            self.command_specs, self.command_observations = {}, {}
             self.codex = Path(args.codex).resolve()
             self.launcher = self.work / "codex-proxy"
             self.base_env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(self.home),
@@ -1666,9 +1672,22 @@ class Run(shared.Run):
         return ends[0]["nonce_hash"]
 
     def start_tool(self, label, verb, *args, target, bound, refusal, session=None):
-        """Packet §§7/8: one same-prompt re-ask only after a proven zero-command completion."""
+        """Packet §§7/8: submit once; unverifiable execution absence blocks live re-asks."""
         session = self.submit(label, verb, *args, session=session)
         return self.await_tool(label, verb, *args, target=target, bound=bound, refusal=refusal, session=session)
+
+    def check_execution_observations(self):
+        """Packet §§3/7: sticky process observations also constrain final accounting."""
+        for label, observation in self.command_observations.items():
+            self.check("execution observations admissible " + label, not observation["blockers"])
+
+    def require_execution_absence(self, label):
+        """Packet §7: missing items and samples cannot prove a program never ran."""
+        shared.interrupt_guard()
+        self.check_execution_observations()
+        # No verified complete invocation channel or native tool-disable exists
+        # for this runner. Retain the ledger's bounds, but grant no live re-asks.
+        raise Blocked("execution absence unverifiable; zero-command re-ask disabled")
 
     def await_tool(self, label, verb, *args, target, bound, refusal, session):
         """Packet §§7/8: observe an admitted tool; preserve the same bounded miss-only re-ask."""
@@ -1689,6 +1708,7 @@ class Run(shared.Run):
             else:
                 raise Blocked("tool miss had a filesystem effect")
             require(attempt < CASE_REASK_LIMIT, "second tool miss")
+            self.require_execution_absence(label)
             self.reservations.mark_miss(digest(label))
             new_label = primary + "-reask"
             self.command_specs[new_label] = dict(self.command_specs[primary])
@@ -1711,10 +1731,12 @@ class Run(shared.Run):
         raise Blocked("tool re-ask bound")
 
     def command_protocol(self, label, envelope, finished=True, facts=None):
-        """Packet §8: exact single command, owned turn; structured model replies prove no effects."""
+        """Packet §8: reported command identity plus positive execution; no absence claim."""
         tools = [fact for fact in turn_facts(self, envelope, facts) if fact["kind"] == "tool"]
         if label not in self.command_specs:
-            self.check("no tool command " + label, not tools)
+            self.record_only.append({"observation": "no reported tool items", "label": label,
+                                     "absent": not tools, "reported_items": len(tools),
+                                     "execution_absence_proven": False})
             return
         expected = digest(self.command_specs[label]["argv"])
         starts = [fact for fact in tools if fact["finished"] is False]
@@ -1822,6 +1844,7 @@ class Run(shared.Run):
                             continue  # No foreign argv/cwd/executable reads.
                         self.owned.add((identity["pid"], identity["start_ticks"]))
                         observed = probe.observe(proc, identity, root, survey)
+                        probe.require_no_blockers()
                         if observed is not None:
                             if spec and spec["require_started"]:
                                 matched = [fact for fact in facts if all(fact.get(field) == context[field]
@@ -1847,15 +1870,19 @@ class Run(shared.Run):
                            and fact.get("turn") == start["turn"] and fact["trace"] == start["trace"] for fact in facts):
                         matched = [fact for fact in facts if all(fact.get(field) == context[field]
                                    for field in ("thread", "turn", "trace"))]
-                        if not probe.seen and pure_tool_miss(matched):
-                            outcome = "zero_commands"
-                            return None
+                        probe.require_no_blockers()
+                        if not probe.execution_observed and pure_tool_miss(matched):
+                            # A process can live entirely between samples, and
+                            # code-mode can omit native command items (§6).
+                            raise Blocked("execution absence unverifiable; zero-command re-ask disabled")
                         break
                 time.sleep(0.1)
             if spec and spec.get("release") is not None:
                 raise Blocked("not induced: exact interrupt tool readiness unavailable within watchdog")
             raise Blocked("prohibited execution not observed")
         finally:
+            self.command_observations[label] = {"execution_observed": probe.execution_observed,
+                                                "blockers": sorted(probe.blockers)}
             tools = [{field: fact.get(field) for field in ("item_type", "item_hash", "at_ms", "finished",
                       "command_hash", "argv_hash", "fixed_attempt_argv", "exit_code", "read_only_error", "error_flags")}
                      for fact in facts if fact["kind"] == "tool" and "turn" in context
@@ -2103,6 +2130,7 @@ def native_disposition(run, envelope, facts=None):
 
 def reservation_accounting(run, facts):
     """Packet §7: reservations, receipts, envelopes and native starts are a bijection."""
+    run.check_execution_observations()
     snapshot = run.reservations.snapshot()
     rows = snapshot["rows"]
     envelopes = [envelope_identity(envelope) for envelope in run.envelopes]
@@ -2141,6 +2169,7 @@ def reservation_accounting(run, facts):
                       row["tool"]["argv"] == (digest(spec["argv"]) if spec else None))
             if row.get("miss"):
                 run.check("final pure tool miss " + label, pure_tool_miss(tool_miss_facts(run, envelope, facts)))
+                run.require_execution_absence(label)
             else:
                 run.command_protocol(label, envelope, finished=envelope["state"] != "cancelled", facts=facts)
                 if label in run.command_specs and envelope["state"] != "cancelled":
@@ -2268,7 +2297,7 @@ def conversation(run):
     third = run.finish("c3")
     completed(run, third, "c3")
     run.check("schema cleared", third["structured_output"] is None and digest(third["final_text"]) == nonce_hash)
-    run.check("recall used no tools", not any(fact["kind"] == "tool" for fact in turn_facts(run, third)))
+    run.command_protocol("c3", third)  # Record item absence; never prove unaided recall.
     run.check("stored thread identity", first["vendor_session_id"] == third["vendor_session_id"]
               and isinstance(first["vendor_session_id"], str))
     facts = run.facts()
@@ -2645,8 +2674,10 @@ def main(argv=None):
                        - set(run.owner_before["session_digests"]))
                        if run and run.owner_before is not None and run.owner_after is not None else None},
                "qualification_limits": {"owner_mcp_servers_disabled": True, "plugins_disabled": True,
+                   "unaided_recall_proven": False, "command_exclusivity_proven": False,
+                   "live_reasks_enabled": False,
                    "checked_set_scope": "test isolation; owner MCP/plugin configuration excluded"},
-               "record_only_scope": ["completed pure tool misses before a labelled re-ask",
+               "record_only_scope": ["no reported tool items; execution absence unproven",
                                      "never-ask denied-write command visibility",
                                      "six independent inducible no-grant paths"],
                "record_only": run.record_only if run else [],
@@ -4065,6 +4096,14 @@ class SafetyTests(unittest.TestCase):
         self.assertTrue(all(check["pass"] for check in run.checks))
         self.assertTrue(any(row["observation"] == "denied write" for row in run.record_only))
 
+    def test_stored_reply_does_not_claim_unaided_recall_or_no_execution(self):
+        run = self.conversation_fixture()
+        self.assertFalse(any(check["check"] == "recall used no tools" for check in run.checks))
+        record = next(row for row in run.record_only if row.get("label") == "c3")
+        self.assertEqual(record["observation"], "no reported tool items")
+        self.assertFalse(record["execution_absence_proven"])
+        self.assertTrue(any(check["check"] == "real stored resume with excluded turns" and check["pass"] for check in run.checks))
+
     def test_changed_bound_without_execution_never_passes(self):
         with self.assertRaisesRegex(Blocked, "prohibited execution"):
             self.conversation_fixture(observed_execution=False)
@@ -4554,6 +4593,9 @@ class SafetyTests(unittest.TestCase):
         self.probe_argv(probe.denied)
         self.assertIsNone(probe.observe(proc, tool, server))  # Direct sentinel is not proof.
         self.probe_argv(probe.attempt)
+        with self.assertRaisesRegex(Blocked, "unpaired refusal"):
+            probe.observe(proc, tool, server)
+        probe = bound_probe.DeniedExecution(probe.python, probe.python_hash, probe.target)
         self.assertIsNone(probe.observe(proc, tool, server))
         self.probe_argv(probe.denied)
         fact = probe.observe(proc, tool, server)
@@ -4801,6 +4843,10 @@ class SafetyTests(unittest.TestCase):
         self.probe_argv(denied)
         self.assertIsNone(probe.observe(proc, tool, server))
         self.probe_argv(attempt)
+        with self.assertRaisesRegex(Blocked, "unpaired refusal"):
+            probe.observe(proc, tool, server)
+        probe = bound_probe.DeniedExecution(legacy.python, legacy.python_hash, legacy.target,
+                   attempt, denied, program, pinned)
         self.assertIsNone(probe.observe(proc, tool, server))
         self.probe_argv(denied)
         fact = probe.observe(proc, tool, server)
@@ -4820,10 +4866,69 @@ class SafetyTests(unittest.TestCase):
         self.probe_argv([*attempt, "unexpected argument"])
         self.assertIsNone(probe.observe(proc, tool, server))
         self.probe_argv(attempt)
+        with self.assertRaisesRegex(Blocked, "command deviation"):
+            probe.observe(proc, tool, server)
+        probe = bound_probe.DeniedExecution(legacy.python, legacy.python_hash, legacy.target,
+                   attempt=attempt, program=program, program_hash=pinned, require_refusal=False)
         self.assertEqual(probe.observe(proc, tool, server)["program_hash"], pinned)
         program.chmod(0o644)
         with self.assertRaisesRegex(Blocked, "program unsafe"):
             probe.observe(proc, tool, server)
+
+    def test_completed_turn_without_native_items_cannot_hide_program_execution_or_authorize_reask(self):
+        for observed in ("deviation", "unpaired_refusal", "none"):
+            with self.subTest(observed=observed), tempfile.TemporaryDirectory() as root:
+                previous, self.root = self.root, Path(root)
+                try:
+                    legacy, proc, server, tool = self.probe_fixture()
+                    run = self.run_object()
+                    trace, thread, turn = digest("server"), digest("thread"), digest("turn")
+                    facts = [{"kind": "reply", "method": "turn/start", "reservation": digest("c2"),
+                              "trace": trace, "thread": thread, "turn": turn},
+                             {"kind": "request", "method": "turn/start", "reservation": digest("c2"), "bound": "readOnly"},
+                             {"kind": "process", "trace": trace, **server}]
+                    terminal = {"kind": "terminal", "trace": trace, "thread": thread, "turn": turn, "status": "completed"}
+                    with mock.patch.object(sys, "executable", legacy.python):
+                        run.fixed_command("c2", "denied")
+                        spec = run.command_specs["c2"]
+                        self.probe_argv([spec["argv"][0], "-I", spec["argv"][1]] if observed == "deviation" else spec["denied"])
+                        if observed != "deviation":
+                            facts.append(terminal)
+
+                        def complete(_):
+                            self.probe_argv(spec["denied"])
+                            facts.append(terminal)
+
+                        with mock.patch(__name__ + ".Proc", return_value=proc), \
+                             mock.patch.object(run, "facts", return_value=facts), \
+                             mock.patch.object(os, "listdir", return_value=[] if observed == "none" else ["2"]), \
+                             mock.patch.object(time, "sleep", side_effect=complete), \
+                             self.assertRaisesRegex(Blocked, "command deviation|unpaired refusal|execution absence"):
+                            run.observe_denied_execution("c2", legacy.target)
+                    survey = json.loads((run.evidence / "changed-bound-survey.json").read_text())
+                    self.assertNotEqual(survey["outcome"], "zero_commands")
+                    self.assertTrue(secret_free(survey))
+                finally:
+                    self.root = previous
+
+    def test_observed_deviation_and_unpaired_suffix_stay_blockers_after_an_exact_attempt(self):
+        for deviation in ("argv", "suffix"):
+            with self.subTest(deviation=deviation), tempfile.TemporaryDirectory() as root:
+                previous, self.root = self.root, Path(root)
+                try:
+                    probe, proc, server, tool = self.probe_fixture()
+                    probe.require_refusal = False
+                    self.probe_argv([*probe.attempt, "unexpected"] if deviation == "argv" else probe.denied)
+                    probe.observe(proc, tool, server)
+                    self.probe_argv(probe.attempt)
+                    with self.assertRaisesRegex(Blocked, "command deviation|unpaired refusal"):
+                        probe.observe(proc, tool, server)
+                finally:
+                    self.root = previous
+
+    def test_unverifiable_mocked_miss_does_not_launch_a_reask(self):
+        with self.assertRaisesRegex(Blocked, "execution absence"):
+            self.reask_fixture()
 
     def test_run_observer_uses_short_script_argv_and_saves_pinned_evidence(self):
         legacy, proc, server, tool = self.probe_fixture()
@@ -4883,8 +4988,8 @@ class SafetyTests(unittest.TestCase):
                 self.assertNotIn("written", prompt)
                 self.assertNotIn("blocked", prompt)
 
-    def reask_fixture(self, misses=1, deviation=None, effect=False, interrupt=False):
-        """Actual submission/settlement/ledger with fake C1 and native wire peers."""
+    def reask_fixture(self, misses=1, deviation=None, effect=False, interrupt=False, certified_fake=False):
+        """Fake peers; optional complete execution oracle exercises ledger mechanics only."""
         run = self.run_object()
         run.vendor_args = []
         ws = run.work / "case"
@@ -4958,7 +5063,9 @@ class SafetyTests(unittest.TestCase):
             return {"pid": 2, "start_ticks": 20, "program_hash": run.command_specs[label]["program_hash"]}
         with mock.patch.object(run, "via_call", side_effect=cli), \
              mock.patch.object(run, "facts", side_effect=facts), \
-             mock.patch.object(run, "observe_denied_execution", side_effect=observe):
+             mock.patch.object(run, "observe_denied_execution", side_effect=observe), \
+             mock.patch.object(run, "require_execution_absence", side_effect=
+                 (lambda label: None) if certified_fake else run.require_execution_absence):
             label, session, observed = run.start_tool("c1", "spawn", *spawn_args(run, ws, prompt),
                 target=ws / "allowed.txt", bound="workspaceWrite", refusal=False)
             envelope = run.finish(label)
@@ -4968,7 +5075,7 @@ class SafetyTests(unittest.TestCase):
         return run, wire, launched, facts(), envelopes
 
     def test_one_zero_command_reask_preserves_prompt_thread_and_full_accounting(self):
-        run, wire, launched, facts, envelopes = self.reask_fixture()
+        run, wire, launched, facts, envelopes = self.reask_fixture(certified_fake=True)
         self.assertEqual([(label, method) for label, method, _ in launched], [("c1", "spawn"), ("c1-reask", "resume")])
         prompts = [args[args.index("--prompt") + 1] for _, _, args in launched]
         self.assertEqual(prompts[0], prompts[1])
@@ -4999,7 +5106,7 @@ class SafetyTests(unittest.TestCase):
                 previous, self.root = self.root, Path(root)
                 try:
                     with self.assertRaisesRegex(Blocked, reason):
-                        self.reask_fixture(misses, deviation, effect)
+                        self.reask_fixture(misses, deviation, effect, certified_fake=True)
                 finally:
                     self.root = previous
 
@@ -5008,7 +5115,7 @@ class SafetyTests(unittest.TestCase):
             self.reask_fixture(interrupt=True)
 
     def test_late_command_cannot_retroactively_authorize_a_zero_command_reask(self):
-        run, wire, launched, facts, envelopes = self.reask_fixture()
+        run, wire, launched, facts, envelopes = self.reask_fixture(certified_fake=True)
         old = next(fact for fact in facts if fact["kind"] == "reply" and fact.get("turn") == digest("u1"))
         facts.append({"kind": "tool", "thread": old["thread"], "turn": old["turn"], "trace": old["trace"]})
         with self.assertRaisesRegex(Blocked, "final pure tool miss"):
@@ -5087,11 +5194,21 @@ class SafetyTests(unittest.TestCase):
             with self.subTest(tools=tools), mock.patch(__name__ + ".turn_facts", return_value=tools), \
                  self.assertRaisesRegex(Blocked, "fixed command"):
                 run.command_protocol("c1", fake_envelope())
-        with mock.patch(__name__ + ".turn_facts", return_value=[started]), \
-             self.assertRaisesRegex(Blocked, "no tool command"):
+        with mock.patch(__name__ + ".turn_facts", return_value=[started]):
             run.command_protocol("c3", fake_envelope())
+        self.assertFalse(run.record_only[-1]["absent"])
+        self.assertFalse(run.record_only[-1]["execution_absence_proven"])
         with mock.patch(__name__ + ".turn_facts", return_value=[started]):
             run.command_protocol("c1", fake_envelope(), finished=False)
+
+    def test_no_tool_items_are_record_only_and_do_not_claim_no_execution(self):
+        run = self.run_object()
+        with mock.patch(__name__ + ".turn_facts", return_value=[]):
+            run.command_protocol("c3", fake_envelope())
+        self.assertFalse(any(check["check"] == "no tool command c3" for check in run.checks))
+        self.assertEqual(run.record_only[-1]["observation"], "no reported tool items")
+        self.assertEqual(run.record_only[-1]["label"], "c3")
+        self.assertFalse(run.record_only[-1]["execution_absence_proven"])
 
     def test_workspace_marker_records_mismatch_unsafe_and_verified(self):
         marker, evidence = self.root / "marker", self.root / "marker-proof.json"
@@ -5143,7 +5260,7 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(recorded["tools"][-1]["exit_code"], 2)
         self.assertIs(recorded["tools"][-1]["read_only_error"], False)
 
-    def test_zero_command_completed_turn_is_distinguished_for_bounded_reask(self):
+    def test_completed_turn_with_no_reported_items_cannot_prove_execution_absence(self):
         run = self.run_object()
         generation, thread, turn = digest("generation"), digest("thread"), digest("turn")
         facts = [{"kind": "reply", "method": "turn/start", "reservation": digest("c2"),
@@ -5155,7 +5272,8 @@ class SafetyTests(unittest.TestCase):
                  {"kind": "terminal", "trace": generation, "thread": thread, "turn": turn, "status": "completed"}]
         with mock.patch.object(run, "facts", return_value=facts), \
              mock.patch.object(os, "listdir", return_value=[]):
-            self.assertIsNone(run.observe_denied_execution("c2", self.root / "denied.txt"))
+            with self.assertRaisesRegex(Blocked, "execution absence"):
+                run.observe_denied_execution("c2", self.root / "denied.txt")
 
     def test_scoped_error_is_retained_so_zero_commands_cannot_hide_a_deviation(self):
         wire = self.owned_wire()
@@ -5240,7 +5358,7 @@ class SafetyTests(unittest.TestCase):
         with mock.patch.object(sys, "executable", probe.python), mock.patch(__name__ + ".Proc", return_value=proc), \
              mock.patch.object(run, "facts", return_value=facts), mock.patch.object(os, "listdir", return_value=["2", "3"]), \
              mock.patch.object(proc, "content", wraps=proc.content) as content, \
-             self.assertRaisesRegex(Blocked, "not observed"):
+             self.assertRaisesRegex(Blocked, "command deviation"):
             run.observe_denied_execution("c2", probe.target)
         path = run.evidence / "changed-bound-survey.json"
         self.assertTrue(path.exists())
@@ -5336,6 +5454,17 @@ class SafetyTests(unittest.TestCase):
                 rows[keys[0]][field], rows[keys[1]][field] = rows[keys[1]][field], rows[keys[0]][field]
         run.receipts["fixture-0"], run.receipts["fixture-1"] = run.receipts["fixture-1"], run.receipts["fixture-0"]
         with self.assertRaisesRegex(Blocked, "receipt native turn exact"):
+            reservation_accounting(run, facts)
+
+    def test_final_accounting_rejects_sticky_process_blockers_without_native_tool_items(self):
+        run = self.run_object()
+        envelope = fake_envelope()
+        facts = [{"kind": "reply", "method": "turn/start", "thread": digest(envelope["vendor_session_id"]),
+                  "turn": digest("native turn")}]
+        run.envelopes = [envelope]
+        self.seed_accounting(run, run.envelopes, facts)
+        run.command_observations = {"fixture-0": {"blockers": ["command deviation"], "execution_observed": True}}
+        with self.assertRaisesRegex(Blocked, "execution observations"):
             reservation_accounting(run, facts)
 
     def test_final_accounting_rechecks_tool_commands_after_settlement(self):

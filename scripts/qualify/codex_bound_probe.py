@@ -219,7 +219,9 @@ class Survey:
                 "expected_denied_argv_hash": digest(self.probe.denied),
                 "expected_python_hash": self.probe.python_hash, "file_absent": absent,
                 "expected_program_hash": self.probe.program_hash,
-                "observations": list(self.records.values()), "tools": tools}
+                "observations": list(self.records.values()), "tools": tools,
+                "execution_observed": self.probe.execution_observed, "blockers": sorted(self.probe.blockers),
+                "execution_absence_proven": False}
 
 
 class DeniedExecution:
@@ -230,7 +232,12 @@ class DeniedExecution:
         self.attempt = attempt or [self.python, "-c", ATTEMPT_CODE, self.target.name]
         self.denied = denied or [self.python, "-c", DENIED_CODE, DENIED_TAG]
         self.program, self.program_hash, self.require_refusal = program, program_hash, require_refusal
-        self.seen = set()
+        self.seen, self.blockers, self.execution_observed = set(), set(), False
+
+    def require_no_blockers(self):
+        """Packet §§3/7: later exact observations cannot erase an earlier deviation."""
+        if self.blockers:
+            raise Blocked("prohibited execution: " + ", ".join(sorted(self.blockers)))
 
     def observe(self, proc, identity, server, survey=None):
         """Packet §3/runtime §5.2: ancestry first, then descriptor-pinned executable/argv/cwd."""
@@ -242,8 +249,14 @@ class DeniedExecution:
             raise Blocked("prohibited execution argv unverifiable") from None
         if survey is not None:
             survey.observe(proc, identity, argv)
+        related = (str(self.program) in "\0".join(argv) if self.program is not None
+                   else any(ATTEMPT_CODE in value for value in argv))
         if argv not in (self.attempt, self.denied):
+            if related:
+                self.execution_observed = True
+                self.blockers.add("command deviation")
             return None
+        self.execution_observed = True
         if proc.executable_hash(identity) != self.python_hash or proc.cwd(identity) != str(self.target.parent):
             raise Blocked("prohibited execution identity/cwd mismatch")
         if self.program is not None:
@@ -251,13 +264,16 @@ class DeniedExecution:
         token = identity["pid"], identity["start_ticks"]
         if argv == self.attempt:
             self.seen.add(token)
+            self.require_no_blockers()
             if self.require_refusal:
                 return None
             return {"pid": identity["pid"], "start_ticks": identity["start_ticks"],
                     "attempt_argv_hash": digest(self.attempt), "python_hash": self.python_hash,
                     "program_hash": self.program_hash}
         if token not in self.seen:
-            return None  # A model directly running the sentinel is not proof.
+            self.blockers.add("unpaired refusal suffix")
+            return None  # Never proof; also forbids a later miss or exact observation passing.
+        self.require_no_blockers()
         try:
             self.target.lstat()
         except FileNotFoundError:

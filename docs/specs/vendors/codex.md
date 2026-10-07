@@ -60,8 +60,9 @@ enforcement**: the re-probe found that the model attempted the write through
 code-mode `exec`, and no item appeared (`via-5lr.3.4` later proved it
 through VIA, §3). C5 used a
 persistent thread; an ephemeral resume failed with `no rollout found`.
-C6 proved only one tool-free turn with seven environment variables. These
-are bounded observations, not guarantees for arbitrary tools/platforms.
+C6 observed one turn reporting no tool items with seven environment variables.
+That item absence does not prove no execution. These are bounded observations,
+not guarantees for arbitrary tools/platforms.
 Raw probe artifacts remain private; public fixtures must be sanitized.
 
 ## 2. Responsibilities and minimal interface
@@ -597,6 +598,21 @@ retries; `tooManyDenials` and `flexUnavailable` → `vendor_error`. Denials are
 best-effort (C2 §7 item 9): a slow denial is a failed item, but a fast denial
 emits no item, and code-mode `exec` can act with no item at all, so no item
 history proves complete denial reporting or complete tool tracking.
+
+The qualification runner's 0.160.1 candidate checks prove positive execution of
+an admitted command through matched protocol and owned-process evidence; they
+do not prove that it was the only command executed in the turn. No native
+per-turn tool-disable has been verified offline for this candidate. "No reported
+tool items" is therefore record-only, including the stored c3 reply. A matching
+reply does not prove unaided recall: stored-resume qualification rests on the
+stored thread identity after daemon retirement and the real `thread/resume`
+request with `excludeTurns:true`. Sampling plus missing command items cannot
+prove the runner's programs never executed, so the runner disables automatic
+zero-command re-asks unless a complete execution-absence mechanism is verified.
+Observed command deviations and unpaired refusal suffixes remain sticky blockers
+through admission and final accounting. This does not change the adapter's
+request or result contract.
+
 `instant_interrupt` is a watch item for P7. `write_stdin_approval` (now
 stable and on) produces approval requests only under an approval policy
 other than `never`; under `never` any such request is declined like the
