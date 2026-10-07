@@ -15,6 +15,111 @@ from opencode_driver import Driver, strict_reply, read_pages, bounded_command, i
 
 
 class DriverTests(unittest.TestCase):
+    def catalog_driver(self,root,body,status=200):
+        """FAKE per-location API replies; the real spending guard remains active."""
+        import opencode_safety as safety
+        d=Driver('release','fp','pin',Path(root)/'evidence',initialize=False)
+        d.project=d.evidence/'project-boundary'; d.project.mkdir()
+        endpoint='http://127.0.0.1:1234'
+        d.provider_endpoints={'oclive-mock':endpoint}
+        d.guard.mock_origins=frozenset({endpoint})
+        d.fixtures={'test':{'path':d.project,'config':{}}}
+        d.ensure_vendor=mock.Mock(); d._validate_provider_config=mock.Mock(return_value=d.provider_endpoints)
+        d._auxiliary_bindings=mock.Mock(return_value={'model':safety.MOCK_IDENTITY})
+        d.vault.names=mock.Mock(return_value=safety.VENDOR_ENVIRONMENT)
+        d._http=mock.Mock()
+        raw=body if isinstance(body,bytes) else json.dumps(body).encode()
+        def request(_method,path):
+            return (200,b'{"data":[]}') if path=='/api/integration' else (status,raw)
+        d._http.request.side_effect=request
+        return d
+
+    def test_blocked_catalog_retains_checked_mock_location_and_price_evidence(self):
+        for cost in (None,[],[{'input':1,'output':0,'cache':{'read':0,'write':0}}]):
+            with self.subTest(cost=cost), tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
+                models=[] if cost is None else [{'providerID':'oclive-mock','id':'fixture-free','cost':cost}]
+                d=self.catalog_driver(root,{'data':models})
+                with self.assertRaisesRegex(Blocked,'frozen free model absent from catalog'):
+                    d.spending_check(args=['spawn','--model','oclive-mock/fixture-free'])
+                paths=list(d.evidence.glob('*catalog-block.json'))
+                self.assertEqual(len(paths),1,'blocked catalogue evidence was lost')
+                observed=json.loads(paths[0].read_text())
+                self.assertEqual(observed['checked_model'],{'providerID':'oclive-mock','id':'fixture-free',
+                    'status':'absent' if cost is None else 'not-explicit-zero'})
+                self.assertEqual(observed['location'],'project-boundary')
+                self.assertEqual((observed['route'],observed['http_status']),('/api/model',200))
+                self.assertEqual(observed['models'][0]['cost'] if models else None,cost)
+                self.assertTrue(d.guard.stopped)
+                self.assertTrue(all(call.args[0]=='GET' for call in d._http.request.call_args_list))
+
+    def test_invalid_catalog_retains_only_allowed_fields_and_redacts_identifiers(self):
+        secret='FAKE-catalog-protected-password'
+        body={'data':[{'providerID':'oclive-mock','id':'fixture-free',
+            'cost':[{'input':0,'output':0,'cache':{'read':0,'write':secret},'headers':{'secret':secret}}],
+            'status':'deprecated','settings':{'apiKey':secret},'headers':{'token':secret},
+            'url':'http://user:'+secret+'@example.invalid/'},
+            {'providerID':secret,'id':'http://user:'+secret+'@example.invalid/','cost':[],
+             'status':secret}]}
+        with tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
+            d=self.catalog_driver(root,body); d.secret_forms=[secret.encode()]
+            with self.assertRaisesRegex(Blocked,'catalog cost.cache.write: wrong field type'):
+                d.spending_check(args=['spawn','--model','oclive-mock/fixture-free'])
+            paths=list(d.evidence.glob('*catalog-block.json'))
+            self.assertEqual(len(paths),1,'schema block lost its sanitized catalogue')
+            raw=paths[0].read_bytes();self.assertNotIn(secret.encode(),raw)
+            for forbidden in (b'http://',b'headers',b'apiKey',b'settings',b'url'):
+                self.assertNotIn(forbidden,raw)
+            observed=json.loads(raw)
+            self.assertEqual(observed['models'][0]['status'],'deprecated')
+            self.assertEqual(observed['models'][0]['cost'][0]['cache']['write'],None)
+            self.assertIsNone(observed['models'][1]['providerID'])
+            self.assertIsNone(observed['models'][1]['id'])
+            self.assertEqual(observed['models'][1]['status'],'unrecognized')
+
+    def test_unavailable_catalog_retains_status_without_vendor_error_text(self):
+        for status,body,reason in ((503,{'error':'FAKE-PRIVATE-vendor-text'},'location catalog unavailable'),
+                                   (200,b'FAKE-PRIVATE-not-json','vendor JSON shape unavailable')):
+            with self.subTest(status=status), tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
+                d=self.catalog_driver(root,body,status=status)
+                with self.assertRaisesRegex(Blocked,reason):
+                    d.spending_check(args=['spawn','--model','oclive-mock/fixture-free'])
+                paths=list(d.evidence.glob('*catalog-block.json'))
+                self.assertEqual(len(paths),1,'unavailable catalogue status was lost')
+                raw=paths[0].read_bytes();self.assertNotIn(b'FAKE-PRIVATE',raw)
+                observed=json.loads(raw);self.assertEqual(observed['http_status'],status)
+                self.assertEqual(observed['checked_model']['status'],'unverifiable')
+                self.assertEqual(observed['models'],[])
+
+    def test_explicit_zero_prices_need_no_vendor_free_key_but_missing_price_blocks(self):
+        for cache in ({'read':0,'write':0},{'read':0}):
+            with self.subTest(cache=cache), tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
+                body={'data':[{'providerID':'oclive-mock','id':'fixture-free',
+                               'cost':[{'input':0,'output':0,'cache':cache}]}]}
+                d=self.catalog_driver(root,body)
+                if 'write' not in cache:
+                    with self.assertRaisesRegex(Blocked,'catalog cost.cache: required field missing'):
+                        d.spending_check(args=['spawn','--model','oclive-mock/fixture-free'])
+                else:
+                    result=d.spending_check(args=['spawn','--model','oclive-mock/fixture-free'])
+                    self.assertTrue(result['structural_spending_controls'])
+                    self.assertFalse(list(d.evidence.glob('*catalog-block.json')))
+
+    def test_catalog_identifier_projection_excludes_password_handle_and_synthetic_forms(self):
+        secrets=('FAKE-private-password','h_FAKE-private-handle','FAKE-private-synthetic')
+        with tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
+            body={'data':[{'providerID':value,'id':value,'cost':[]} for value in secrets]}
+            d=self.catalog_driver(root,body)
+            d.vault._values[Identity(71,123)]=secrets[0].encode()
+            d.bearer_forms.add(secrets[1].encode()); d.secret_forms.append(secrets[2].encode())
+            with self.assertRaisesRegex(Blocked,'frozen free model absent from catalog'):
+                d.spending_check(args=['spawn','--model','oclive-mock/fixture-free'])
+            paths=list(d.evidence.glob('*catalog-block.json'))
+            self.assertEqual(len(paths),1,'protected IDs must be redacted, not lose the record')
+            raw=paths[0].read_bytes()
+            for value in secrets: self.assertNotIn(value.encode(),raw)
+            rows=json.loads(raw)['models']
+            self.assertTrue(all(row['providerID'] is None and row['id'] is None for row in rows))
+
     def test_marker_server_loss_records_only_successfully_killed_anchor(self):
         with tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
             d=Driver('release','fp','pin',Path(root)/'evidence',initialize=False)

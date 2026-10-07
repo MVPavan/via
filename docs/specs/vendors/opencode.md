@@ -1412,6 +1412,16 @@ failure, with the same password/bearer checks as the final evidence sink. SSE
 handshakes use a bounded timeout; accepted streams clear that socket timeout
 and retain the absolute phase watchdog.
 
+On a qualification catalogue decoding block, or a spending-guard refusal
+after a catalogue read, retain a `catalog-block` record projected from the same
+`GET /api/model` reply used by the check. It names the checked provider/model and evidence-relative location,
+HTTP status, allow-listed provider/model IDs, numeric cost fields and fixed model
+statuses. It distinguishes an absent model, unverified prices and explicit zero
+prices. Missing prices remain unavailable and never imply free. URLs, headers,
+settings, tokens and vendor error text are discarded; known password, bearer and
+synthetic forms are redacted even in identifier fields. This record diagnoses a
+refusal and never admits spending or counts as a passed gate.
+
 ## 14. Owner questions and revisit items
 
 Decided (owner, 2026-10-06): transient receipt of project provider

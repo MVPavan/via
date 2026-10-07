@@ -32,6 +32,7 @@ import urllib.parse
 
 import opencode_safety as safety
 from opencode_ownership import OwnershipRegistry
+from opencode_catalog import catalog_record
 
 Blocked = safety.Blocked
 # Packet §9 and the reviewed qualification plan's observation/pagination bounds.
@@ -254,6 +255,7 @@ class Driver:
         self.counter=0; self.owned_replies=[]; self.secret_forms=[]; self._armed={}
         self.project=None; self.fixtures={}; self.provider_endpoints={}; self.catalog_cache={}
         self.automatic_models_proven=False
+        self._catalog_evidence=None
         self.phase_deadline=None; self.phase_kind=None; self.stop_result=None
         self.state=self.evidence/'state'; self.runtime=self.evidence/'runtime'
         self.helpers=self.evidence/'helpers'; self.home=self.evidence/'home'
@@ -1106,23 +1108,42 @@ class Driver:
             raise Blocked('native history shape unavailable')
         return value['body']['data']
 
-    def _catalog(self):
-        query=urllib.parse.urlencode({'location[directory]':str(self.project)})
-        status,raw=self._http.request('GET','/api/model?'+query)
-        body=self._json(raw)
-        if status!=200 or type(body) is not dict or type(body.get('data')) is not list:
-            raise Blocked('location catalog unavailable')
-        result={}
-        for row in body['data']:
-            _typed(row,{'providerID':S,'id':S,'cost':list},'catalog')
-            identity=row['providerID']+'/'+row['id']
-            free=bool(row['cost'])
-            for tier in row['cost']:
-                _typed(tier,{'input':(int,float),'output':(int,float),
-                             'cache':{'read':(int,float),'write':(int,float)}},'catalog cost')
-                free=free and all(type(value) in {int,float} and math.isfinite(value) and value==0
-                                 for value in (tier['input'],tier['output'],tier['cache']['read'],tier['cache']['write']))
-            result[identity]={'free':free}
+    def _catalog(self,checked_identity=None):
+        """Decode prices unchanged; retain an allow-listed view if proof fails (§13)."""
+        self._catalog_evidence=None
+        project=Path(self.project)
+        location=project.relative_to(self.evidence).as_posix() if project.is_relative_to(self.evidence) \
+                 else 'unregistered'
+        def protected(raw):
+            return self.vault.leaks(raw) or any(form and form in raw
+                for form in (*self.secret_forms,*self.bearer_forms))
+        observation=catalog_record(None,None,location,checked_identity,protected)
+        query=urllib.parse.urlencode({'location[directory]':str(project)})
+        try:
+            status,raw=self._http.request('GET','/api/model?'+query)
+            observation=catalog_record(status,None,location,checked_identity,protected)
+            body=self._json(raw)
+            observation=catalog_record(status,body,location,checked_identity,protected)
+            if status!=200 or type(body) is not dict or type(body.get('data')) is not list:
+                raise Blocked('location catalog unavailable')
+            result={}
+            for row in body['data']:
+                _typed(row,{'providerID':S,'id':S,'cost':list},'catalog')
+                identity=row['providerID']+'/'+row['id']
+                free=bool(row['cost'])
+                for tier in row['cost']:
+                    _typed(tier,{'input':(int,float),'output':(int,float),
+                                 'cache':{'read':(int,float),'write':(int,float)}},'catalog cost')
+                    free=free and all(type(value) in {int,float} and math.isfinite(value) and value==0
+                                     for value in (tier['input'],tier['output'],tier['cache']['read'],tier['cache']['write']))
+                result[identity]={'free':free}
+        except Blocked:
+            self._record('catalog-block',observation)
+            raise
+        observed=result.get(checked_identity)
+        observation['checked_model']['status']='absent' if observed is None else \
+            'explicit-zero' if observed['free'] else 'not-explicit-zero'
+        self._catalog_evidence=observation
         self.catalog_cache=result
         return result
 
@@ -1168,7 +1189,7 @@ class Driver:
         if not sep: raise Blocked('model identity incomplete')
         names=self.vault.names(self.vendor_identity)
         if self.inventory: self.inventory.check()
-        catalog=self._catalog()
+        catalog=self._catalog(identity)
         # Effective project config is constructed before start and immutable during turns.
         row=next((row for row in self.fixtures.values() if row['path']==self.project),None)
         config=None if row is None else row['config']
@@ -1182,8 +1203,13 @@ class Driver:
         if provider in endpoints:
             self._last_auxiliary_bindings=bindings
         self.last_model=identity
-        return self.guard.check(integration=integration,environment_names=names,catalog=catalog,
-                                provider=provider,model=model,project_providers=endpoints,cost=cost)
+        try:
+            return self.guard.check(integration=integration,environment_names=names,catalog=catalog,
+                                    provider=provider,model=model,project_providers=endpoints,cost=cost)
+        except Blocked:
+            if self._catalog_evidence is not None:
+                self._record('catalog-block',self._catalog_evidence)
+            raise
 
     def _auxiliary_bindings(self,identity):
         schema=self._served_schema()
