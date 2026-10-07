@@ -757,9 +757,12 @@ class Wire:
         return self.fact(**fact)
 
     def scope(self, method, params):
-        """Packet §3: scope every explicit identity, including errors and server requests."""
-        if not method.startswith(("thread/", "turn/", "item/")) \
-                and "threadId" not in params and "turnId" not in params:
+        """Packet §3: scope string identities; protocol prefixes and errors stay strict."""
+        prefixed = method.startswith(("thread/", "turn/", "item/"))
+        strict_ids = prefixed or method == "error"
+        has_ids = any(key in params for key in ("threadId", "turnId")) if strict_ids else \
+            any(type(params.get(key)) is str for key in ("threadId", "turnId"))
+        if not prefixed and not has_ids:
             return None
         thread = params.get("threadId")
         if method == "thread/started":
@@ -772,7 +775,8 @@ class Wire:
             nested = params.get("turn")
             turn = nested.get("id", turn) if type(nested) is dict else turn
         has_turn = (method.startswith(("turn/", "item/"))
-                    or method == "thread/tokenUsage/updated" or "turnId" in params)
+                    or method == "thread/tokenUsage/updated"
+                    or ("turnId" in params if strict_ids else type(turn) is str))
         if has_turn and type(turn) is not str:
             self.reject_ownership(method, params,
                                   "unowned turn notification; correlation unavailable: missing identity")
@@ -2890,9 +2894,25 @@ class SafetyTests(unittest.TestCase):
         wire = self.owned_wire()
         wire.incoming({"method": "error", "params": {"threadId": "t", "error": {}}})
         wire.incoming({"method": "error", "params": {"error": {}}})
-        for params in ({"threadId": "foreign"}, {"threadId": None}, {"threadId": "t", "turnId": "foreign"}):
+        for params in ({"threadId": "foreign"}, {"threadId": None},
+                       {"threadId": "t", "turnId": None}, {"turnId": None},
+                       {"threadId": "t", "turnId": "foreign"}):
             with self.subTest(params=params), self.assertRaisesRegex(Blocked, "unowned"):
                 wire.incoming({"method": "error", "params": params})
+
+    def test_global_warning_null_ids_are_unscoped(self):
+        wire = self.owned_wire()
+        for params in ({"threadId": None}, {"turnId": None},
+                       {"threadId": None, "turnId": None}, {"threadId": "t", "turnId": None}):
+            with self.subTest(params=params):
+                fact = wire.incoming({"method": "warning", "params": params})
+                self.assertEqual(fact["kind"], "notification")
+        for params in ({"threadId": "foreign"}, {"threadId": "foreign", "turnId": None},
+                       {"threadId": "t", "turnId": "foreign"}):
+            with self.subTest(params=params), self.assertRaisesRegex(Blocked, "unowned"):
+                wire.incoming({"method": "warning", "params": params})
+            self.assertEqual(wire.facts[-1]["kind"], "ownership_rejection")
+            self.assertEqual(wire.facts[-1]["method"], "warning")
 
     def test_active_profile_mcp_blocks_without_root_override(self):
         config = self.root / "config.toml"
