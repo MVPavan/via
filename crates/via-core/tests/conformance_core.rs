@@ -5449,3 +5449,5 @@ fn codex_rss_leases() {
         "RSS grew 32 MiB or more after the flood's first 64 MiB: {metrics}"
     );
 }
+
+mod codex_gaps;

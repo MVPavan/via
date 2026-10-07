@@ -211,8 +211,27 @@ version. `model/list` is paginated (`nextCursor`); the driver follows it to
 the end within a bounded page count and byte budget. If a non-null
 `nextCursor` remains at either bound, discovery fails as a protocol
 failure and nothing is cached: a partial catalog is never used or published
-as complete. Model-only resolution fails `unknown_model` before discovery, and an
-explicit model passes to the vendor. A bad model or failed auth fails after
+as complete. VIA also retains the last complete discovery, its vendor
+version and opaque recipe digest in `<state>/vendor/codex/.via-catalog.json`
+(via-3fc, owner request 2026-10-07). This bounded private file contains only
+normalized public model names, advertised efforts, hidden/default flags and
+the version; never raw replies or environment values. The snapshot is replaced
+by a synced temporary file and atomic rename, within discovery's 1 MiB byte
+budget plus 4 KiB of snapshot header. Bootstrap reads it without following
+symlinks; absent, unsafe, oversized or corrupt files are cache misses.
+`models` and model resolution use a matching recipe's saved complete catalog
+after retirement or daemon restart. Live discovery always replaces it; failed
+or partial discovery never does. Effort validation still uses only the live
+instance's discovery. Writing the snapshot is best effort on a driver-owned
+blocking task: the turn waits at most 1 s, capped by its wall deadline and stop
+signals; the tracker retains any unfinished writer through shutdown. An I/O
+failure before rename leaves the preceding complete snapshot; a failed
+directory sync after rename leaves the new complete file visible, with its
+durability uncertain. Neither changes a turn's public outcome. Delayed writers serialize and write the current snapshot,
+never overwrite it with an older discovery. Only one recipe's last complete
+snapshot is persisted; another recipe must discover its own catalog.
+Model-only resolution fails `unknown_model` before any matching discovery, and
+an explicit model passes to the vendor. A bad model or failed auth fails after
 acceptance as a Failed terminal (C2 §2). Effort (C2 §5): canonical efforts
 are checked in `plan` against the compiled mapping; model-advertised efforts
 are checked against `model/list` inside `run_turn` before `thread/start` or
