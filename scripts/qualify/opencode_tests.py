@@ -72,6 +72,47 @@ class EntryTests(unittest.TestCase):
             self.assertEqual(summary['result'],'blocked')
             self.assertEqual(len(summary['runner_source']['sha256']),64)
 
+    def test_record_only_block_stops_every_later_phase_and_keeps_reason(self):
+        import opencode_driver
+        with tempfile.TemporaryDirectory(prefix='oc-entry-',dir=opencode.SCRATCHPAD) as directory:
+            root=Path(directory)
+            class FakeDriver:
+                def __init__(self,**_kwargs):
+                    self.vault=opencode.safety.PasswordVault()
+                    self.proc=opencode.safety.ProcReader(root/'synthetic-proc')
+                def prepare(self): pass
+                def finish(self): return {'complete':True,'processes_gone':True}
+                def observe(self,*_args): return {'release':'a'*64,'test-failpoints':'b'*64}
+            args=SimpleNamespace(self_test=False,phase=['ledger','helpers'],evidence=root/'run',
+                acquire=False,opencode=root/'pin',via_release=root/'release',via_failpoints=root/'fp',
+                fake_gate_manifest=root/'gates')
+            calls=[]
+            class CaseDriver:
+                def execute(self,operation,**kwargs):
+                    if operation=='build_hashes': return {'release':'a'*64,'test-failpoints':'b'*64}
+                    if operation=='phase_begin': calls.append(kwargs['phase'])
+            later=unittest.mock.Mock()
+            def preflight(_driver,case): case.check('FAKE preflight',True)
+            def blocked(_driver,_case): raise Blocked('FAKE record-only admission block')
+            with patch.object(opencode,'arguments',return_value=args), \
+                 patch.object(opencode,'self_test',return_value=([],1)), \
+                 patch.object(opencode,'verify_fake_gates',return_value={'verified':True}), \
+                 patch.object(opencode,'system_tools_preflight',return_value={'rg':True,'python3':True}), \
+                 patch.object(opencode,'RECOVERY_ROOT',root/'recovery'), \
+                 patch.object(opencode.safety,'verify_binary'), \
+                 patch.object(opencode_driver,'Driver',FakeDriver), \
+                 patch.object(opencode.cases,'DriverAdapter',return_value=CaseDriver()), \
+                 patch.dict(opencode.cases.PHASE_CASES,{'ledger':('compaction','usage')}), \
+                 patch.dict(opencode.cases.CASES,{'preflight':preflight,'compaction':blocked,'usage':later}), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(opencode.main([]),1)
+            later.assert_not_called()
+            self.assertEqual(calls,['preflight','ledger'])
+            summary=json.loads((args.evidence/'summary.json').read_text())
+            self.assertEqual(summary['blocks'][0]['reason'],'FAKE record-only admission block')
+            self.assertEqual(summary['failure_order'][0]['case'],'compaction')
+            self.assertEqual(json.loads((args.evidence/'ledger.json').read_text())[0]['result'],'blocked')
+
     def test_untrusted_exception_text_never_enters_block_evidence(self):
         reason=opencode.safety.blocking_record(ValueError('VENDOR PRIVATE RETURNED TEXT'))
         self.assertEqual(reason['reason'],'unexpected runner exception')

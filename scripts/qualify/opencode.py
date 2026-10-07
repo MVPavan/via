@@ -414,7 +414,8 @@ def main(argv=None):
                 if accepted != len(phase_records):
                     retain_phase(phase_records)
                 info['blocks'].extend(row['blocking'] for row in phase_records if 'blocking' in row)
-                if any(row["disposition"] == "gate" and row["result"] != "pass"
+                if any(row["result"] == "blocked" or (
+                        row["disposition"] == "gate" and row["result"] != "pass")
                        for row in phase_records):
                     break
             info["via_hashes"] = driver.observe("build_hashes")
@@ -424,8 +425,8 @@ def main(argv=None):
             retain_block(error, 'runner')
         finally:
             info["failure_order"] = [{"stage": "case", "case": row["case"], "result": row["result"]}
-                                     for row in records if row["disposition"] == "gate"
-                                     and row["result"] != "pass"]
+                                     for row in records if row["result"] == "blocked" or (
+                                         row["disposition"] == "gate" and row["result"] != "pass")]
             if "runner_error" in info:
                 info["failure_order"].append({"stage": "runner", "kind": info["runner_error"]})
             if driver is not None:

@@ -403,9 +403,9 @@ pub(crate) fn collect_available(
     }
 }
 
-/// Checks a decoded reply's CLI exit against C1 §1, including terminal wait.
+/// Checks a decoded reply's CLI exit against C1 §1, including terminal wait/result.
 pub(crate) fn cli_exit_matches(args: &[&str], status: ExitStatus, reply: Option<&Value>) -> bool {
-    if args.first() == Some(&"wait") {
+    if matches!(args.first(), Some(&"wait" | &"result")) {
         match reply.and_then(|value| value["state"].as_str()) {
             Some("completed") => status.success(),
             Some("failed" | "cancelled" | "unknown") => status.code() == Some(3),
@@ -416,7 +416,7 @@ pub(crate) fn cli_exit_matches(args: &[&str], status: ExitStatus, reply: Option<
     }
 }
 
-/// Records a successful CLI reply, including C1 §1's terminal `wait` exit 3.
+/// Records a successful CLI reply, including C1 §1's terminal `wait`/`result` exit 3.
 pub(crate) fn cli(
     sandbox: &Sandbox,
     evidence: &Evidence,

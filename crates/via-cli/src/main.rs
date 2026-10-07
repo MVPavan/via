@@ -600,7 +600,11 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         Command::Cancel(args) => cancel(&args),
         Command::Close(args) => close(args),
         Command::Result(args) => {
-            client::call("result", &json!({"address":args.address}), true, true)
+            let response = client::request("result", &json!({"address":args.address}), true)?;
+            let Some(envelope) = client::emit_response(&response, true)? else {
+                return Ok(2);
+            };
+            Ok(envelope_exit_code(&envelope))
         }
         Command::Wait(args) => wait(&args),
         Command::Events(args) => events(args),
@@ -695,11 +699,7 @@ fn spawn(args: SpawnArgs) -> anyhow::Result<i32> {
     let Some(envelope) = client::emit_response(&outcome, true)? else {
         return Ok(2);
     };
-    Ok(if envelope["state"] == "completed" {
-        0
-    } else {
-        3
-    })
+    Ok(envelope_exit_code(&envelope))
 }
 
 /// `via wait` (C1 §3.8).
@@ -717,11 +717,11 @@ fn wait(args: &WaitArgs) -> anyhow::Result<i32> {
     let Some(envelope) = client::emit_response(&response, true)? else {
         return Ok(2);
     };
-    Ok(wait_exit_code(&envelope))
+    Ok(envelope_exit_code(&envelope))
 }
 
-/// C1 §1: only these three terminal states change a successful RPC's exit to 3.
-fn wait_exit_code(envelope: &Value) -> i32 {
+/// C1 §1: foreground spawn, wait and result share the terminal-envelope exit rule.
+fn envelope_exit_code(envelope: &Value) -> i32 {
     match envelope["state"].as_str() {
         Some("failed" | "cancelled" | "unknown") => 3,
         _ => 0,
@@ -957,13 +957,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wait_exit_three_covers_exactly_c1_failed_cancelled_unknown() {
+    fn envelope_exit_three_covers_exactly_c1_failed_cancelled_unknown() {
         for state in ["failed", "cancelled", "unknown"] {
-            assert_eq!(wait_exit_code(&json!({"state": state})), 3, "{state}");
+            assert_eq!(envelope_exit_code(&json!({"state": state})), 3, "{state}");
         }
         for state in ["completed", "queued", "running", "future-state"] {
-            assert_eq!(wait_exit_code(&json!({"state": state})), 0, "{state}");
+            assert_eq!(envelope_exit_code(&json!({"state": state})), 0, "{state}");
         }
-        assert_eq!(wait_exit_code(&json!({})), 0);
+        assert_eq!(envelope_exit_code(&json!({})), 0);
     }
 }

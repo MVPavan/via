@@ -277,7 +277,7 @@ impl Sandbox {
         command.args(args);
         let captured = run_command(&mut command, within)?;
         let decoded = serde_json::from_slice::<Value>(&captured.stdout);
-        let exit_valid = if args.first() == Some(&"wait") {
+        let exit_valid = if matches!(args.first(), Some(&"wait" | &"result")) {
             match decoded
                 .as_ref()
                 .ok()

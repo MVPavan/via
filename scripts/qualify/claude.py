@@ -661,8 +661,15 @@ def keyed(servers):
             "connected": sum(1 for state in servers.values() if state == "connected")}
 
 
+def terminal_result(rc, envelope, label):
+    """C1 §1: result envelopes use exit 0 or 3; accounting validates the reply."""
+    if rc not in {0, 3} or envelope is None:
+        raise Blocked(f"{label}: no envelope from `result` (rc {rc}); spending unaccounted")
+    return envelope
+
+
 def self_test():
-    """The MCP parser's and keying's known cases; returns the failures."""
+    """Offline parser, keying and C1 result-exit cases; returns the failures."""
     failing = 'T [DEBUG] MCP server "Successfully connected" failed to connect: unavailable'
     cases = [
         (parse_mcp_debug(failing), {}),
@@ -685,6 +692,17 @@ def self_test():
         (ticks_from_uptime("10000 1\n", 100), 1000000),
         (ticks_from_uptime("1e4 1\n", 100), None),
     ]
+    for state in ('completed', 'failed', 'cancelled', 'unknown'):
+        reply = {'state': state}
+        rc = 0 if state == 'completed' else 3
+        cases.append((terminal_result(rc, reply, 'FAKE result'), reply))
+    for rc, reply in ((2, None), (2, {'state': 'failed'}), (0, None), (4, None)):
+        try:
+            terminal_result(rc, reply, 'FAKE result')
+        except Blocked:
+            cases.append((True, True))
+        else:
+            cases.append((False, True))
     return [{"got": got, "want": want} for got, want in cases if got != want]
 
 
@@ -1923,8 +1941,7 @@ def case_interrupt(run, case):
         check_launch(case, "t1", sampler.launches, mode="restricted", session=session,
                      first=True)
     rc, envelope, _ = run.via_call(case.dir, "t1-envelope", "result", receipt["turn"], "--json")
-    if rc != 0 or envelope is None:
-        raise Blocked(f"t1: no envelope from `result` (rc {rc}); spending unaccounted")
+    envelope = terminal_result(rc, envelope, "t1")
     run.account(case, "t1", envelope)  # validates the envelope first
     cancel_info = envelope["cancel"]
     case.check("turn cancelled, interrupted", envelope["state"] == "cancelled"
@@ -2428,7 +2445,7 @@ def main():
     parser.add_argument("--claude", default=shutil.which("claude"),
                         help="Claude Code executable (default: `claude` on PATH)")
     parser.add_argument("--self-test", action="store_true",
-                        help="check the MCP debug parser only, then exit")
+                        help="check offline parser and terminal-result cases, then exit")
     args = parser.parse_args()
     if args.self_test:
         failures = self_test()

@@ -55,6 +55,19 @@ class FakeDriver:
 
 
 class CasesTests(unittest.TestCase):
+    def test_record_only_block_stops_every_later_case(self):
+        driver=FakeDriver({'build_hashes':{'release':'a'*64,'test-failpoints':'b'*64},
+                           'phase_begin':None,'phase_guard':None,'phase_build':None})
+        later=mock.Mock()
+        def blocked(_driver,_case): raise cases.safety.Blocked('FAKE record-only safety stop')
+        with mock.patch.dict(cases.PHASE_CASES,{'ledger':('compaction','usage')}), \
+             mock.patch.dict(cases.CASES,{'compaction':blocked,'usage':later}):
+            records=cases.run_phase(driver,'ledger')
+        later.assert_not_called()
+        self.assertEqual(len(records),1)
+        self.assertEqual(records[0]['disposition'],'record-only')
+        self.assertEqual(records[0]['blocking']['reason'],'FAKE record-only safety stop')
+
     def hostile_driver(self):
         return FakeDriver({"fixture": "fixture", "turn": {"session_id": "s_hostile",
                               "envelope": {"state": "failed", "vendor_session_id": "ses_owned",

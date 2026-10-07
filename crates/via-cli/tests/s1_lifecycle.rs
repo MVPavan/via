@@ -322,7 +322,7 @@ impl Sandbox {
     fn ok(&self, args: &[&str]) -> TestResult<Value> {
         let captured = self.run(args)?;
         let decoded = serde_json::from_slice::<Value>(&captured.stdout);
-        let exit_valid = if args.first() == Some(&"wait") {
+        let exit_valid = if matches!(args.first(), Some(&"wait" | &"result")) {
             match decoded
                 .as_ref()
                 .ok()

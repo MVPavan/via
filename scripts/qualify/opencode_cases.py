@@ -1725,8 +1725,9 @@ def _run_phase(driver: CaseDriver, phase_name: str, *, record_sink=None) -> list
         records[-1]["both_build_hashes"] = dict(builds)
         if record_sink is not None:
             record_sink(records)
-        # A failed gate ends admission; record-only absence does not pretend to
-        # pass, but may allow another bounded observation in this phase.
-        if records[-1]["disposition"] == "gate" and records[-1]["result"] != "pass":
+        # Every safety block ends admission. A record-only absence may allow
+        # another bounded observation; a failed gate also ends the phase.
+        if records[-1]["result"] == "blocked" or (
+                records[-1]["disposition"] == "gate" and records[-1]["result"] != "pass"):
             break
     return records

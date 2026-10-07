@@ -128,6 +128,10 @@ decided in the slice that needs them, after re-probing.
   verbs one line. Exit codes: 0 success; 2 request error; 3 turn ended
   `failed`, `cancelled` or `unknown`; 4 daemon unreachable; 130 foreground
   wait interrupted (the session keeps running; the receipt was printed).
+  The terminal-envelope exit rule applies equally to foreground `spawn`,
+  `wait` and `result`: `completed` exits 0; `failed`, `cancelled` and `unknown`
+  exit 3. Receipt, status, cancel and close replies keep their success exit 0;
+  request errors keep exit 2. All three envelope verbs use one shared mapping.
   A request the CLI refuses before sending it (no handle given; a
   malformed handle or `--vendor`; an unreadable or non-JSON
   `--output-schema` file; a prompt, `cwd` or instructions path it cannot

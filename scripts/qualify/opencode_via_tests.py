@@ -6,7 +6,12 @@ substitutes spending policy; bootstrap tests exercise the real guard with
 served facts and synthetic faults. CLI, daemon, adapter, Host and Store are real.
 """
 
+from types import SimpleNamespace
+import gc
+import sqlite3
 import contextlib
+import base64
+import secrets
 import json
 import os
 from pathlib import Path
@@ -90,8 +95,7 @@ def scripted_server(cwd):
 class ViaFixture:
     """Own private roots and identities; prove shutdown before deleting them (§13)."""
     def __init__(self, kind):
-        self.temp = tempfile.TemporaryDirectory(prefix='via-oc-cli-', dir=REPO/'scratchpad')
-        self.root = Path(self.temp.name)
+        self.root = Path(tempfile.mkdtemp(prefix='via-oc-cli-', dir=REPO/'scratchpad'))
         self.kind = kind
         directory = self.root/'fake-bin'; directory.mkdir(mode=0o700)
         self.program = directory/'opencode'
@@ -162,18 +166,46 @@ class ViaFixture:
                 raise AssertionError('FAKE real-VIA audit pgrep not clear')
         finally:
             self.patches.close()
-        self.temp.cleanup()
+        identities_gone=all(self.driver.proc.gone(identity) is True
+                            for identity in self.driver.identities)
+        runtime_gone=self.driver.runtime.parent!=Path('/tmp') or not self.driver.runtime.exists()
+        if not identities_gone or not runtime_gone:
+            raise AssertionError('FAKE real-VIA roots retained: stop proof incomplete')
+        # No finalizer may remove an unproved process's state. Only now make
+        # the test-owned read-only executable directory writable for deletion.
+        (self.root/'fake-bin').chmod(0o700)
+        shutil.rmtree(self.root)
         cleanup={'build':self.kind,
             'owned_processes':len(self.driver.identities),
-            'identities_gone':all(self.driver.proc.gone(identity) is True
-                                  for identity in self.driver.identities),
+            'identities_gone':identities_gone,
             'pgrep_clear':True,'private_root_removed':not self.root.exists(),
-            'short_runtime_removed':self.driver.runtime.parent!=Path('/tmp')
-                                    or not self.driver.runtime.exists()}
+            'short_runtime_removed':runtime_gone}
         if not all(cleanup[key] is True for key in ('identities_gone','pgrep_clear',
                    'private_root_removed','short_runtime_removed')):
             raise AssertionError('FAKE real-VIA final cleanup not proved')
         CLEANUP_PROOFS.append(cleanup)
+
+
+class FixtureRetentionTests(unittest.TestCase):
+    def test_unproved_stop_retains_root_after_fixture_collection(self):
+        with tempfile.TemporaryDirectory(prefix='via-fake-source-') as directory:
+            source=Path(directory)/'fake'; source.touch()
+            def fail(): raise RuntimeError('FAKE stop proof unavailable')
+            def driver(*_args,**_kwargs):
+                return SimpleNamespace(daemon=object(),execute=lambda *_a,**_k:None,finish=fail)
+            with mock.patch.dict(PROGRAMS,{'fake':source}), mock.patch.object(runtime,'Driver',driver):
+                fixture=ViaFixture('release')
+                root=fixture.root
+                try:
+                    with self.assertRaisesRegex(RuntimeError,'stop proof unavailable'):
+                        fixture.__exit__(None,None,None)
+                    del fixture
+                    gc.collect()
+                    self.assertTrue(root.is_dir(),'unproved private root was deleted by finalizer')
+                finally:
+                    if root.exists():
+                        (root/'fake-bin').chmod(0o700)
+                        shutil.rmtree(root)
 
 
 @unittest.skipUnless(AVAILABLE, 'optional real-VIA audit: build release, failpoints and via-fake-agent')
@@ -254,6 +286,111 @@ class RealViaTests(unittest.TestCase):
                 self.assertTrue(any(row.get('charged')=='mock-only' and row.get('gate') is False
                                     and row.get('served_checks') is True for row in records))
                 self.assertTrue(d.stop()['pgrep_clear'])
+
+    def test_stop_closes_bootstrap_session_even_after_phase_deadline(self):
+        with ViaFixture('release') as fixture:
+            d=fixture.driver
+            threads,_replies=self.bootstrap_policy(fixture)
+            try: d.ensure_vendor()
+            finally:
+                for thread in threads: thread.join(5)
+            session=d._bootstrap_session
+            self.assertIsNotNone(session)
+            d.phase_deadline=time.monotonic()-1
+            d.stop()
+            with sqlite3.connect(f'file:{d.state / "store.sqlite3"}?mode=ro',uri=True) as store:
+                row=store.execute('SELECT state FROM sessions WHERE id=?',(session,)).fetchone()
+            self.assertEqual(row,('closed',))
+            verbs=[row['verb'] for row in fixture.cli_calls]
+            self.assertIn('close',verbs)
+            self.assertLess(verbs.index('close'),len(verbs)-1)
+
+    def test_terminal_cli_exit_mapping_for_result_and_foreground_spawn(self):
+        for kind in ('release','failpoints'):
+            for state in ('completed','failed','cancelled','unknown'):
+                with self.subTest(build=kind,state=state), ViaFixture(kind) as fixture:
+                    d=fixture.driver
+                    script=scripted_server(fixture.project)
+                    prompt=next(row for row in script['routes'] if row['method']=='POST'
+                                and row['path'].endswith('/prompt'))
+                    response=prompt['responses'][0]
+                    if state=='failed':
+                        response['emit'][-1]=event('session.execution.failed',error={
+                            'type':'provider.no-route','message':'FAKE terminal failure'})
+                    elif state=='cancelled':
+                        response['emit']=response['emit'][:4]
+                    elif state=='unknown':
+                        response['emit']=response['emit'][:4]
+                        sse=next(row for row in script['routes'] if row['path']=='/api/event')
+                        sse['sse']['close_after_ms']=1500
+                    prompt['responses']=[response]
+                    fixture.script.write_text(json.dumps(script))
+                    command=['spawn','--harness','opencode','--model',safety.MOCK_IDENTITY,
+                        '--cwd',str(fixture.project),'--bound','full','--network','--prompt','FAKE terminal']
+                    handle='h_'+base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip('=')
+                    cancellation=[]
+                    def cancel_pending():
+                        try:
+                            by=time.monotonic()+10
+                            while time.monotonic()<by:
+                                with sqlite3.connect(f'file:{d.state / "store.sqlite3"}?mode=ro',
+                                                     uri=True) as store:
+                                    rows=store.execute('SELECT id FROM sessions').fetchall()
+                                if rows:
+                                    session=rows[0][0]
+                                    d.handles[session]=handle
+                                    status=d.via(['status',session])
+                                    if (status.get('active_turn') or {}).get('phase')=='accepted':
+                                        d.via(['cancel',session,'--turn','1','--wait'])
+                                        cancellation.append('cancelled')
+                                        return
+                                time.sleep(.01)
+                            cancellation.append('deadline')
+                        except BaseException as error:
+                            cancellation.append(type(error).__name__)
+                    thread=threading.Thread(target=cancel_pending) if state=='cancelled' else None
+                    if thread: thread.start()
+                    try:
+                        rc,out,err=d.execute([str(d._binary),*command,'--handle-stdin','--json'],
+                            env=d.env,cwd=d.project,input=(handle+'\n').encode(),timeout=30)
+                    finally:
+                        if thread: thread.join(12)
+                    if thread:
+                        self.assertFalse(thread.is_alive())
+                        self.assertEqual(cancellation,['cancelled'])
+                    lines=out.splitlines()
+                    self.assertEqual(len(lines),2)
+                    receipt=runtime.strict_reply(lines[0],'spawn receipt')
+                    envelope=runtime.strict_reply(lines[1],'envelope')
+                    self.assertEqual(envelope['state'],state)
+                    expected=0 if state=='completed' else 3
+                    self.assertEqual(rc,expected)
+                    self.assertEqual(err,b'')
+                    d.handles[receipt['session_id']]=receipt['handle']
+                    d.secret_forms.append(receipt['handle'].encode())
+                    result=d.via(['result',receipt['turn']])
+                    self.assertEqual(result['state'],state)
+                    self.assertEqual([(row['verb'],row['exit']) for row in fixture.cli_calls
+                                      if row['verb'] in {'spawn','result'}],
+                                     [('spawn',expected),('result',expected)])
+
+    def test_foreground_driver_keeps_receipt_and_accounts_terminal_envelope(self):
+        with ViaFixture('release') as fixture:
+            d=fixture.driver
+            def spending(**_kwargs): d.last_model=safety.MOCK_IDENTITY
+            with mock.patch.object(d,'spending_check',side_effect=spending), \
+                 mock.patch.object(d,'account',wraps=d.account) as accounted:
+                envelope=d.via(['spawn','--harness','opencode','--model',safety.MOCK_IDENTITY,
+                    '--cwd',str(fixture.project),'--bound','full','--network','--prompt','FAKE foreground'])
+            self.assertEqual(envelope['state'],'completed')
+            self.assertEqual(d.last_request['receipt']['turn'],envelope['session_id']+'/1')
+            self.assertIn(envelope['session_id'],d.handles)
+            self.assertTrue(any('handle' in row for row in d.owned_replies))
+            with mock.patch.object(d,'account',wraps=d.account) as result_accounted:
+                result=d.via(['result',envelope['session_id']+'/1'])
+            self.assertEqual(result,envelope)
+            accounted.assert_called_once_with(envelope)
+            result_accounted.assert_called_once_with(envelope)
 
     def test_bootstrap_does_not_mask_the_later_namespace_fixture_configuration(self):
         with ViaFixture('release') as fixture:
@@ -393,6 +530,9 @@ class RealViaTests(unittest.TestCase):
                     if status['active_turn'] is not None and status['active_turn']['phase']=='accepted': break
                     time.sleep(.01)
                 else: self.fail('FAKE pending turn was not accepted')
+                unavailable=d.via(['result',pending['turn']])
+                self.assertEqual(unavailable['exit_code'],2)
+                self.assertEqual(unavailable['cli_error']['error']['data']['kind'],'turn_not_finished')
                 timeout=d.via(['wait',pending['turn'],'--timeout-ms','0'])
                 self.assertEqual(timeout['exit_code'],2)
                 self.assertEqual(timeout['cli_error']['error']['data']['kind'],'wait_timeout')
@@ -408,5 +548,5 @@ class RealViaTests(unittest.TestCase):
                 self.assertTrue(d.stop()['pgrep_clear'])
                 self.assertEqual({row['verb'] for row in fixture.cli_calls},
                     {'daemon','describe','spawn','wait','status','models','logs','events',
-                     'resume','cancel','close'})
+                     'resume','result','cancel','close'})
                 self.assertEqual({row['exit'] for row in fixture.cli_calls},{0,2,3})

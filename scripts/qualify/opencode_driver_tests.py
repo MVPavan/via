@@ -15,6 +15,19 @@ from opencode_driver import Driver, strict_reply, read_pages, bounded_command, i
 
 
 class DriverTests(unittest.TestCase):
+    def test_stopped_guard_refuses_bootstrap_before_any_submit_or_fixture(self):
+        with tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
+            d=Driver('release','fp','pin',Path(root)/'evidence',initialize=False)
+            d.guard.stopped=True
+            d._materialize_fixture=mock.Mock(side_effect=Blocked(
+                'FAKE fixture reached after sticky stop'))
+            d.via=mock.Mock()
+            with self.assertRaisesRegex(Blocked,'spending control previously failed'):
+                d._bootstrap_vendor()
+            d._materialize_fixture.assert_not_called()
+            d.via.assert_not_called()
+            self.assertEqual(d._bootstrap_count,0)
+
     def test_bootstrap_cli_cannot_reset_the_absolute_deadline(self):
         with tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
             d=Driver('release','fp','pin',Path(root)/'evidence',initialize=False)

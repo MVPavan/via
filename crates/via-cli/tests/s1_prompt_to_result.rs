@@ -173,7 +173,13 @@ fn cli(
             daemon::note(written.as_ref().err())
         )));
     }
-    if !capture.status.success() {
+    let exit_valid = if matches!(args.first(), Some(&"wait" | &"result")) {
+        let reply = serde_json::from_slice::<Value>(&capture.stdout);
+        daemon::cli_exit_matches(args, capture.status, reply.as_ref().ok())
+    } else {
+        capture.status.success()
+    };
+    if !exit_valid {
         return Err(ScenarioError::Failure(format!(
             "via {args:?} exited {}{}",
             capture.status,
@@ -581,7 +587,8 @@ fn s1_f30_wait_disconnect_result_survives() -> TestResult {
                 let capture = cx
                     .run(&["result", session, "--json"], Duration::from_secs(5))
                     .map_err(infra)?;
-                if capture.status.success() {
+                let reply = serde_json::from_slice::<Value>(&capture.stdout);
+                if daemon::cli_exit_matches(&["result"], capture.status, reply.as_ref().ok()) {
                     evidence
                         .write("result_after_disconnect.stdout", &capture.stdout)
                         .map_err(infra)?;

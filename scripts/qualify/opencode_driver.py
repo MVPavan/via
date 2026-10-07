@@ -480,7 +480,7 @@ class Driver:
 
     def via(self,args):
         """Attach the fixed CLI verb to any runner block before cleanup (§13)."""
-        verbs={'daemon','describe','models','spawn','resume','wait','cancel','close',
+        verbs={'daemon','describe','models','spawn','resume','wait','result','cancel','close',
                'steer','events','status','logs'}
         verb=args[0] if args and args[0] in verbs else 'unknown'
         with safety.block_context(verb=verb):
@@ -554,24 +554,37 @@ class Driver:
             self._record('cli-error',{'verb':verb,'rc':rc,'typed':True})
             # C1 §1 CLI stderr is the error object; keep the internal wrapper.
             return {'cli_error':{'error':value},'exit_code':rc}
-        schema={'status':'status','wait':'envelope','events':'events page','logs':'logs',
+        schema={'status':'status','wait':'envelope','result':'envelope','events':'events page','logs':'logs',
                 'cancel':'cancel reply'}.get(verb,'unknown')
         if verb=='daemon' and len(args)>1:
             schema='daemon status' if args[1]=='status' else 'daemon stop'
         if verb in {'models','describe'}: schema=verb
         if verb=='resume': schema='receipt'
         if verb=='spawn': schema='spawn receipt' if '--background' in args else 'envelope'
-        value=strict_reply(out,schema)
-        if 'handle' in value:
-            if type(value.get('session_id')) is not str or type(value['handle']) is not str:
+        receipt=None
+        if verb=='spawn' and '--background' not in args:
+            if len(out)>OBSERVATION_BYTES: raise Blocked('CLI response exceeds observation bound')
+            lines=out.splitlines()
+            if len(lines)!=2: raise Blocked('foreground spawn requires receipt and envelope')
+            receipt=strict_reply(lines[0],'spawn receipt')
+            value=strict_reply(lines[1],'envelope')
+            address=value['session_id']+'/'+str(value['turn'])
+            if receipt['session_id']!=value['session_id'] or receipt['turn']!=address:
+                raise Blocked('foreground spawn receipt and envelope identity differ')
+        else:
+            value=strict_reply(out,schema)
+        bearer=receipt if receipt is not None else value
+        if 'handle' in bearer:
+            if type(bearer.get('session_id')) is not str or type(bearer['handle']) is not str:
                 raise Blocked('bearer receipt malformed')
-            self.handles[value['session_id']]=value['handle']
-            self.secret_forms.append(value['handle'].encode())
-            self.bearer_forms.add(value['handle'].encode())
+            self.handles[bearer['session_id']]=bearer['handle']
+            self.secret_forms.append(bearer['handle'].encode())
+            self.bearer_forms.add(bearer['handle'].encode())
         if schema=='envelope': self.account(value)
+        if receipt is not None: self.owned_replies.append(receipt)
         self.owned_replies.append(value)
         if verb in {'spawn','resume'}:
-            internal=dict(value)
+            internal=dict(receipt if receipt is not None else value)
             if verb=='resume': internal['session_id']=args[1]
             self.last_request={'verb':verb,'receipt':internal,'prompt':prompt,'args':args}
         if verb=='cancel': self.last_cancel={'at':time.monotonic(),'reply':value,'held':dict(self._armed),
@@ -694,6 +707,7 @@ class Driver:
 
     def _bootstrap_vendor(self):
         """Labelled mock-only acquisition; failed proof cancels without releasing (§13)."""
+        if self.guard.stopped: raise Blocked('spending control previously failed')
         from opencode_cases import ResponseHold, EvidenceUnavailable
         deadline=min(time.monotonic()+BOOTSTRAP_SECONDS,self.phase_deadline or float('inf'))
         hold=ResponseHold(deadline)
@@ -1835,11 +1849,23 @@ class Driver:
                 if not release.exists(): release.touch(mode=0o600)
                 if value['kind']=='marker':
                     (folder/'marker-parent.release').touch(mode=0o600,exist_ok=True)
+        close_error=None
         if self.daemon is not None:
             alive=self.proc.alive(self.daemon)
             if alive is None: raise Blocked('private daemon stop identity uncertain')
             if alive:
                 self.proc.verify(self.daemon)
+                # §13: close the acquisition lease even after admission expires.
+                if self._bootstrap_session is not None:
+                    self._bootstrap_cleanup=True
+                    try:
+                        closed=self.via(['close',self._bootstrap_session])
+                        if closed.get('state')!='closed': raise Blocked('bootstrap cleanup close refused')
+                        self._bootstrap_session=None
+                    except BaseException as error:
+                        close_error=error
+                    finally:
+                        self._bootstrap_cleanup=False
                 reply=self.via(['daemon','stop','--force'])
                 if reply.get('exit_code'): raise Blocked('private daemon stop refused')
         deadline=time.monotonic()+90
@@ -1858,6 +1884,7 @@ class Driver:
         if self.runtime.parent==Path('/tmp') and self.runtime.name.startswith('via-ocl.'):
             shutil.rmtree(self.runtime)
         if self.pinned.exists(): safety.verify_binary(self.pinned)
+        if close_error is not None: raise close_error
         return self.stop_result
 
     def _materialize_fixture(self,name,project,description):
