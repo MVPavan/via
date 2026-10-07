@@ -48,18 +48,26 @@ is restored only inside VIA's own proxy child to the owner's existing Codex home
 that home comes from UID metadata, independent of the runner's private HOME.
 credentials stay there. auth.json is lstat'ed for existence/owner/mode only:
 never opened, copied, linked or logged. Noncredential config.toml is parsed for
-MCP keys (all profiles) and side-effect settings; only name digests reach
-evidence. Each name
-is disabled on our server's argv, together with apps and plugins; notify=[] is
-set only on that argv. Custom provider/profile/telemetry settings block preflight.
+root MCP keys and side-effect settings; only name digests reach evidence.
+Inactive profile MCP keys receive no root override; an active profile blocks.
+Each root name is disabled on our server's argv, together with apps and plugins;
+notify=[] is set only on that argv. Custom provider/profile/telemetry settings block preflight.
 Managed config and project-layer config outside that inventory block BEFORE starting Codex.
 The proxy requires config/read to expose effective features (all disabled),
 notify (empty), the default provider and every configured MCP server (disabled)
-before forwarding model/list. Unsupported/missing fields block with a reason;
-no mcpServerStatus/list, tool inventory, desktop endpoint or `codex mcp list`.
+before forwarding model/list or any thread/turn establishment. Unset provider,
+profile and provider-map fields are valid defaults; other unsupported/missing
+fields block with a reason; no mcpServerStatus/list, tool inventory, desktop endpoint or `codex mcp list`.
 The installed 0.160.1 --help confirms dotted overrides and --disable, but does
-not prove feature names, notify semantics or config/read shape/passivity. The
-native binary contains config/read and ConfigReadParams/Response identifiers;
+not prove notify semantics or config/read shape/passivity. Preflight runs
+`features list` with only the apps/plugins disables and notify=[], in an
+empty private CODEX_HOME, requiring apps/plugins to be known and disabled.
+Any startupStatus notification
+still blocks, independently of echoed config. MCP-name overrides apply only to
+the owned server using the owner's home, where config/read verifies their
+effect. They are meaningless in the empty feature-check home; 0.160.1 rejects
+those entries for lack of a transport.
+The native binary contains config/read and ConfigReadParams/Response identifiers;
 that is presence evidence only. The future live preflight must verify effective
 values before accepting turns. It does not infer safety from the July snapshot.
 
@@ -67,16 +75,21 @@ Owner home writes are accepted, not minimised: stored rollouts are needed for
 resume. Auth refresh, shell snapshots, caches, logs and system skills may also
 change; shared auth refresh may race the desktop server. No credential content
 is read. Before/after top-level counts/name digests and session-file counts/name
-digests are recorded, including the count of new session files. These metadata
-observations do not prove absence of other writes. The runner removes only its
+digests are recorded for today and tomorrow in UTC only, including the count
+of new session files. That two-day window is pinned for the whole run; older
+session directories are never enumerated. These metadata observations do not
+prove absence of other writes. The runner removes only its
 private VIA directories; owner rollouts remain for the owner to manage.
 
 Evidence: a transparent stdio proxy observes the actual adapter, checks policy
 before forwarding and records only typed numbers, fixed enums, hashes and
 Booleans. It does not store raw protocol, prompts, tool output, handles, config,
 environment values or owner paths. Responses are paired with requests; duplicate
-or unknown IDs block. VIA receipt/status/events/cancel/result/wait/close/daemon
-replies have method-specific schemas; missing/mistyped relied-on fields block.
+or unknown IDs block. Scoped notifications racing an establishing reply are
+forwarded immediately; their facts remain deferred within count/byte bounds
+until that reply proves ownership. A mismatching or missing reply blocks.
+VIA receipt/status/events/cancel/result/wait/close/daemon replies have
+method-specific schemas; missing/mistyped relied-on fields block.
 Events paginate with strict progress and deadlines. All loops have bounds.
 Signals only set a flag: no later submission, accepted turns are cancelled and
 settled where possible, cleanup always runs to its deadline, and summary is
@@ -116,6 +129,7 @@ No Linux result qualifies macOS or a broader sandbox/network matrix.
 import argparse
 import asyncio
 import copy
+import datetime
 import hashlib
 import json
 import os
@@ -381,21 +395,19 @@ def mcp_names(home):
     except (ValueError, UnicodeError):
         raise Blocked("configuration inventory unparsable") from None
 
-    def visit(table, depth=0):
-        require(depth < 32, "configuration nesting bound")
-        if isinstance(table, dict):
-            require(not any(key in table for key in
-                    ("model_provider", "profile", "model_providers", "otel")),
-                    "side-effect configuration unsupported in owner config; preflight blocked")
-            if "mcp_servers" in table:
-                require(isinstance(table["mcp_servers"], dict), "MCP inventory malformed")
-                names.update(table["mcp_servers"])
-            for value in table.values():
-                visit(value, depth + 1)
-        elif isinstance(table, list):
-            for value in table:
-                visit(value, depth + 1)
-    visit(config)
+    active = config.get("profile")
+    profiles = config.get("profiles", {})
+    if type(active) is str and type(profiles) is dict:
+        selected = profiles.get(active, {})
+        require(not (type(selected) is dict and selected.get("mcp_servers")),
+                "active profile MCP configuration unsupported; no profile selected on owned argv")
+    require(not any(key in config for key in
+            ("model_provider", "profile", "model_providers", "otel")),
+            "side-effect configuration unsupported in owner config; preflight blocked")
+    # No profile is selected by VIA; inactive profile servers are not root servers.
+    servers = config.get("mcp_servers", {})
+    require(type(servers) is dict, "MCP inventory malformed")
+    names.update(servers)
     require(len(names) <= MCP_LIMIT, "MCP inventory bound")
     for name in names:
         require(type(name) is str and re.fullmatch(r"[A-Za-z0-9_-]+", name), "unsafe MCP name")
@@ -411,8 +423,35 @@ def server_args(names):
     return args
 
 
+def feature_preflight(codex, env, work):
+    """Packet §4: native feature registry, no model or owner Codex home."""
+    with tempfile.TemporaryDirectory(prefix="feature-home-", dir=work) as root:
+        private_env = {**env, "CODEX_HOME": root}
+        try:
+            result = subprocess.run([str(codex), "features", "list", *server_args([])],
+                                    env=private_env, cwd=work,
+                                    capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            raise Blocked("features list unavailable: cannot verify apps/plugins feature names") from None
+        require(result.returncode == 0,
+                "features list unavailable under feature overrides in empty private Codex home")
+        require(len(result.stdout.encode()) <= PROC_BYTES and len(result.stderr.encode()) <= PROC_BYTES,
+                "features list output bound")
+        features = {}
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            require(len(fields) >= 3 and fields[-1] in ("true", "false"),
+                    "features list schema unsupported")
+            name = fields[0]
+            require(name not in features, "features list duplicate name")
+            features[name] = fields[-1]
+        require(all(features.get(name) == "false" for name in ("apps", "plugins")),
+                "features list cannot confirm disabled apps/plugins feature names")
+        return {"apps_disabled": True, "plugins_disabled": True, "registry_checked": True}
+
+
 def effective_config(result, names):
-    """Packet §4: effective settings preflight; missing fields never prove safety."""
+    """Packet §4: explicit disables plus unset/default provider configuration."""
     require(type(result) is dict and type(result.get("config")) is dict,
             "config/read unavailable or schema unsupported: cannot verify effective safety")
     config = result["config"]
@@ -421,9 +460,10 @@ def effective_config(result, names):
             for key in ("apps", "plugins", "memories", "hooks")),
             "config/read cannot confirm owned feature overrides")
     require(config.get("notify") == [], "config/read cannot confirm notify=[]")
-    require(config.get("model_provider") == "openai"
-            and config.get("profile", False) is None
-            and type(config.get("model_providers")) is dict and config["model_providers"] == {}
+    require((config.get("model_provider") is None or config.get("model_provider") == "openai")
+            and config.get("profile") is None
+            and (config.get("model_providers") is None
+                 or type(config.get("model_providers")) is dict and config["model_providers"] == {})
             and (config.get("otel", False) is None
                  or type(config.get("otel")) is dict and config["otel"] == {}),
             "config/read side-effect provider/profile/telemetry configuration unsupported")
@@ -438,12 +478,25 @@ def effective_config(result, names):
             "servers": len(servers), "plugins_disabled": True, "notify_empty": True}
 
 
-def owner_metadata(home):
-    """Runtime §6.1: bounded metadata only; no file content or symlink traversal."""
+def owner_metadata(home, today=None):
+    """Runtime §6.1: top-level and two UTC session days; names/counts only."""
     require(not home.is_symlink(), "owner home metadata unavailable")
     entries = list(home.iterdir())
     require(len(entries) <= PROC_COUNT, "owner metadata entry bound")
-    session_files, pending = set(), [home / "sessions"]
+    today = today or datetime.datetime.now(datetime.timezone.utc).date()
+    session_files, pending = set(), []
+    for day in (today, today + datetime.timedelta(days=1)):
+        path = home
+        # Check every ancestor without enumerating the history or following links.
+        for part in ("sessions", *day.strftime("%Y/%m/%d").split("/")):
+            path = path / part
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                break
+            require(stat.S_ISDIR(info.st_mode), "owner session metadata ancestor unsafe")
+        else:
+            pending.append(path)
     visited = 0
     while pending:
         path = pending.pop()
@@ -471,6 +524,7 @@ class Wire:
         self.initialized, self.inventory = False, False
         self.sink = sink
         self.threads, self.turns, self.notifications = set(), set(), {}
+        self.deferred, self.deferred_bytes = [], 0
 
     def fact(self, **value):
         require(len(self.facts) < REQUEST_LIMIT, "protocol evidence bound")
@@ -510,12 +564,12 @@ class Wire:
             require(params["model"] == MODEL, "model must be gpt-6-luna")
             require(params["approvalPolicy"] == "never" and params["approvalsReviewer"] == "user",
                     "never-ask/reviewer policy mismatch")
+            require(self.inventory, "MCP inventory not verified")
             fact.update(model=MODEL, never=True, reviewer_user=True)
             if method == "turn/start":
                 self.starts += 1
                 require(self.starts <= TURN_LIMIT and params["effort"] == "low",
                         "spending control: proxy starts/effort")
-                require(self.inventory, "MCP inventory not verified")
                 require(digest(params["threadId"]) in self.threads, "unowned thread request")
                 fact.update(thread=digest(params["threadId"]), schema=digest(params["outputSchema"]),
                             bound=params["sandboxPolicy"]["type"])
@@ -536,6 +590,55 @@ class Wire:
             fact["request"] = key
             self.pending[key] = fact.copy()
         return self.fact(**fact)
+
+    @staticmethod
+    def scope(method, params):
+        """Packet §3: notification scope, including errors with a thread identity."""
+        scoped_error = method == "error" and "threadId" in params
+        if not method.startswith(("thread/", "turn/", "item/")) and not scoped_error:
+            return None
+        thread = params.get("threadId")
+        if method == "thread/started":
+            thread = params.get("thread", {}).get("id")
+        require(type(thread) is str, "unowned thread notification: missing identity")
+        turn = params.get("turnId")
+        if method.startswith("turn/"):
+            turn = params.get("turn", {}).get("id", turn)
+        has_turn = (method.startswith(("turn/", "item/"))
+                    or method == "thread/tokenUsage/updated"
+                    or scoped_error and "turnId" in params)
+        require(not has_turn or type(turn) is str,
+                "unowned turn notification; correlation unavailable: missing identity")
+        return digest(thread), digest(turn) if has_turn else None
+
+    def owns(self, scope):
+        """Packet §3: only paired replies establish owned thread/turn IDs."""
+        thread, turn = scope
+        return thread in self.threads and (turn is None or (thread, turn) in self.turns)
+
+    def establishing(self, scope):
+        """Packet §3 start ordering: match only requests able to establish this scope."""
+        thread, turn = scope
+        if thread not in self.threads:
+            return {key for key, request in self.pending.items()
+                    if turn is None and (request["method"] == "thread/start"
+                    or request["method"] == "thread/resume" and request["thread"] == thread)}
+        return {key for key, request in self.pending.items()
+                if request["method"] == "turn/start" and request["thread"] == thread and turn is not None}
+
+    def resolve_deferred(self, replied):
+        """Packet §3 start ordering: publish deferred facts only after ownership proof."""
+        pending, self.deferred = self.deferred, []
+        self.deferred_bytes = 0
+        for message, candidates, size in pending:
+            candidates.discard(replied)
+            scope = self.scope(message["method"], message["params"])
+            if self.owns(scope):
+                self.incoming(message)
+            else:
+                require(bool(candidates), "unowned deferred notification after establishing reply")
+                self.deferred.append((message, candidates, size))
+                self.deferred_bytes += size
 
     def incoming(self, message):
         require(isinstance(message, dict), "protocol reply shape")
@@ -573,23 +676,24 @@ class Wire:
                 fact.update(thread=request["thread"], turn=digest(result["turn"]["id"]))
             elif method not in ("turn/interrupt", "thread/unsubscribe"):
                 raise Blocked("protocol reply method not qualified")
-            return self.fact(**fact)
+            reply = self.fact(**fact)
+            self.resolve_deferred(key)
+            return reply
         method, params = message["method"], message["params"]
         require(type(method) is str and isinstance(params, dict), "notification schema")
-        # All thread-scoped traffic, including deltas and server requests, must
-        # belong to IDs established by VIA replies, never by notifications.
-        thread_id = params.get("threadId")
-        if method == "thread/started":
-            thread_id = params.get("thread", {}).get("id")
-        if method.startswith(("thread/", "turn/", "item/")):
-            require(type(thread_id) is str and digest(thread_id) in self.threads,
-                    "unowned thread notification")
-            turn_id = params.get("turnId")
-            if method.startswith("turn/"):
-                turn_id = params.get("turn", {}).get("id", turn_id)
-            if method.startswith(("turn/", "item/")) or method == "thread/tokenUsage/updated":
-                require(type(turn_id) is str and (digest(thread_id), digest(turn_id)) in self.turns,
-                        "unowned turn notification; correlation unavailable")
+        require(method != "mcpServer/startupStatus/updated", "MCP startup observed despite disables")
+        scope = self.scope(method, params)
+        if scope is not None and not self.owns(scope):
+            candidates = self.establishing(scope) if "id" not in message else set()
+            require(bool(candidates), "unowned thread/turn notification; correlation unavailable")
+            size = len(json.dumps(message).encode())
+            require(len(self.deferred) < REQUEST_LIMIT and self.deferred_bytes + size <= TRACE_BYTES,
+                    "deferred notification bound")
+            self.deferred.append((copy.deepcopy(message), candidates, size))
+            self.deferred_bytes += size
+            # The proxy forwards this line immediately, but publishes no fact
+            # until an establishing reply proves its thread/turn ownership.
+            return None
         if method == "remoteControl/status/changed":
             require(params.get("status") == "disabled", "remote control not disabled")
         if "id" in message:
@@ -784,6 +888,7 @@ async def proxy(control, argv):
             await asyncio.wait_for(tasks[1], 10)
         else:
             require(proc.returncode is not None or not wire.pending, "server ended with pending replies")
+        require(not wire.deferred, "unowned deferred notification: establishing reply unavailable")
     except BaseException as error:
         failure = type(error).__name__
         reason = str(error) if isinstance(error, Blocked) and secret_free(str(error)) else failure
@@ -804,7 +909,8 @@ async def proxy(control, argv):
                         if wire is not None:
                             wire.fact(kind="notification_counts", counts=wire.notifications)
                             wire.fact(kind="end", complete=failure is None and not wire.pending
-                                      and not wire.server_requests, termination_signal=termination,
+                                      and not wire.server_requests and not wire.deferred,
+                                      termination_signal=termination,
                                       failure_type=failure, blocked_reason=reason, child_reaped=proc.returncode is not None)
                     finally:
                         trace.close()
@@ -931,6 +1037,7 @@ class Run(shared.Run):
             self.envelopes, self.receipts, self.checks, self.owned = [], {}, [], set()
             self.record_only, self.owner_before, self.owner_after = [], None, None
             self.blocked_reasons = []
+            self.metadata_day = datetime.datetime.now(datetime.timezone.utc).date()
         except BaseException:
             shutil.rmtree(self.work)
             raise
@@ -940,7 +1047,7 @@ class Run(shared.Run):
                 and hasattr(signal, "pidfd_send_signal"), "Linux pidfd support required")
         pins(self.via, self.codex, self.args.via_sha256, self.args.codex_sha256, self.model)
         auth = credential_metadata(self.owner_codex)
-        self.owner_before = owner_metadata(self.owner_codex)
+        self.owner_before = owner_metadata(self.owner_codex, self.metadata_day)
         names = mcp_names(self.owner_codex)
         self.vendor_args = server_args(names)
         # No project configuration layer: private server cwd/workspaces are
@@ -953,6 +1060,7 @@ class Run(shared.Run):
                 == "codex-cli " + self.args.candidate_version, "version mismatch")
         require(bool(re.fullmatch(r"\d+\.\d+\.\d+", self.args.candidate_version)),
                 "candidate version shape")
+        feature_check = feature_preflight(self.codex, self.env, self.work)
         control = {"codex": str(self.codex), "codex_hash": self.args.codex_sha256,
                    "codex_home": str(self.owner_codex), "mcp_names": names, "model": MODEL,
                    "trace_dir": str(self.trace_dir), "version": self.args.candidate_version}
@@ -968,6 +1076,7 @@ class Run(shared.Run):
         self.launcher.chmod(0o700)
         save(self.evidence / "preflight.json", {
             "candidate_version": self.args.candidate_version, "model": MODEL,
+            "feature_registry": feature_check,
             "auth_metadata": auth, "mcp_name_digests": [digest(name) for name in names],
             "binaries": {"via": self.args.via_sha256, "codex": self.args.codex_sha256,
                          "python": shared.sha256(sys.executable),
@@ -1575,7 +1684,7 @@ def cleanup(run):
         errors.append("lifecycle evidence unavailable")
     if run.owner_before is not None:
         try:
-            run.owner_after = owner_metadata(run.owner_codex)
+            run.owner_after = owner_metadata(run.owner_codex, run.metadata_day)
         except BaseException:
             errors.append("owner home metadata after run unavailable")
     return stopped, errors
@@ -1870,7 +1979,7 @@ class SafetyTests(unittest.TestCase):
         config = self.root / "config.toml"
         config.write_text('[plugins.example]\nenabled=true\n[mcp_servers.one]\ncommand="fake"\n'
                           '[profiles.test.mcp_servers.two]\ncommand="fake"\n')
-        self.assertEqual(mcp_names(self.root), ["one", "two"])
+        self.assertEqual(mcp_names(self.root), ["one"])
         for key in ('model_provider="foreign"', 'profile="other"', '[model_providers.other]', '[otel]'):
             config.write_text(key + "\n")
             with self.subTest(key=key), self.assertRaisesRegex(Blocked, "side-effect configuration"):
@@ -1937,6 +2046,225 @@ class SafetyTests(unittest.TestCase):
                 "model_providers": {}, "otel": None,
                 "mcp_servers": {"ok": {"enabled": False}}}}
 
+    def test_config_read_unset_defaults(self):
+        for omitted in (False, True):
+            candidate = self.config_fixture()
+            for key in ("model_provider", "profile", "model_providers"):
+                if omitted:
+                    candidate["config"].pop(key)
+                else:
+                    candidate["config"][key] = None
+            with self.subTest(omitted=omitted):
+                self.assertTrue(effective_config(candidate, ["ok"])["all_servers_disabled"])
+        for key in ("model_provider", "profile", "model_providers"):
+            for value in (False, [], "foreign", {"foreign": {}}):
+                candidate = self.config_fixture()
+                candidate["config"][key] = value
+                with self.subTest(key=key, value=value), self.assertRaises(Blocked):
+                    effective_config(candidate, ["ok"])
+
+    def test_mcp_startup_notification_always_blocks(self):
+        for params in ({}, {"status": "ready"}, {"status": "failed"}):
+            with self.subTest(params=params), self.assertRaisesRegex(Blocked, "MCP startup"):
+                self.owned_wire().incoming({"method": "mcpServer/startupStatus/updated",
+                                            "params": params})
+
+    def test_inventory_precedes_thread_establishment(self):
+        for method in ("thread/start", "thread/resume"):
+            params = {"model": MODEL, "approvalPolicy": "never", "approvalsReviewer": "user",
+                      "sandbox": "read-only", "threadId": "t", "excludeTurns": True}
+            with self.subTest(method=method), self.assertRaisesRegex(Blocked, "inventory"):
+                Wire("0.160.1").outgoing({"id": 1, "method": method, "params": params})
+
+    def test_feature_preflight_private_home_and_overrides(self):
+        run = self.run_object()
+        good = subprocess.CompletedProcess([], 0, "plugins experimental false\napps beta false\n", "")
+        with mock.patch.object(subprocess, "run", return_value=good) as called:
+            feature_preflight(run.codex, run.env, run.work)
+        args, kwargs = called.call_args
+        self.assertEqual(args[0], [str(run.codex), "features", "list", *server_args([])])
+        self.assertNotEqual(kwargs["env"]["CODEX_HOME"], str(run.owner_codex))
+        self.assertFalse(Path(kwargs["env"]["CODEX_HOME"]).exists())
+        self.assertEqual(kwargs["timeout"], 30)
+        self.assertNotIn("--model", args[0])
+
+    def test_feature_preflight_omits_mcp_overrides_owned_server_keeps_them(self):
+        run = self.run_object()
+        owned_args = server_args(["ok"])
+        good = subprocess.CompletedProcess([], 0, "plugins experimental false\napps beta false\n", "")
+        with mock.patch.object(subprocess, "run", return_value=good) as called:
+            feature_preflight(run.codex, run.env, run.work)
+        probe_args = called.call_args.args[0]
+        self.assertEqual(probe_args, [str(run.codex), "features", "list", "--disable", "apps",
+                                    "--disable", "plugins", "-c", "notify=[]"])
+        self.assertFalse(any("mcp_servers" in arg for arg in probe_args))
+        self.assertIn("mcp_servers.ok.enabled=false", owned_args)
+
+    def test_feature_preflight_unavailable_or_unverified_blocks(self):
+        run = self.run_object()
+        for code, text in ((1, ""), (0, "apps beta false\n"),
+                           (0, "plugins beta true\napps beta false\n"),
+                           (0, "plugins beta false\nplugins beta false\napps beta false\n")):
+            with self.subTest(code=code, text=text), \
+                 mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, text, "")), \
+                 self.assertRaisesRegex(Blocked, "features list"):
+                feature_preflight(run.codex, run.env, run.work)
+        with mock.patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired([], 30)), \
+             self.assertRaisesRegex(Blocked, "features list"):
+            feature_preflight(run.codex, run.env, run.work)
+
+    def test_run_preflight_requires_feature_proof(self):
+        for verified in (True, False):
+            with self.subTest(verified=verified), tempfile.TemporaryDirectory() as root:
+                previous, self.root = self.root, Path(root)
+                try:
+                    run = self.run_object()
+                    run.owner_codex = self.root / "owner"
+                    run.owner_codex.mkdir()
+                    (run.owner_codex / "auth.json").touch(mode=0o600)
+                    version = subprocess.CompletedProcess([], 0, "codex-cli 0.160.1\n", "")
+                    listing = subprocess.CompletedProcess([], 0, "apps beta false\n" +
+                              ("plugins experimental false\n" if verified else ""), "")
+                    with mock.patch(__name__ + ".mcp_names", return_value=["ok"]), \
+                         mock.patch.object(subprocess, "run", side_effect=[version, listing]) as called:
+                        if verified:
+                            run.preflight()
+                            proof = json.loads((run.evidence / "preflight.json").read_text())
+                            self.assertEqual(proof["feature_registry"], {"apps_disabled": True,
+                                             "plugins_disabled": True, "registry_checked": True})
+                        else:
+                            with self.assertRaisesRegex(Blocked, "features list"):
+                                run.preflight()
+                            self.assertFalse(run.launcher.exists())
+                            self.assertFalse((run.evidence / "preflight.json").exists())
+                    self.assertEqual(len(called.call_args_list), 2)
+                    self.assertIn("mcp_servers.ok.enabled=false", run.vendor_args)
+                    feature_args = called.call_args_list[1].args[0]
+                    self.assertFalse(any("mcp_servers" in arg for arg in feature_args))
+                finally:
+                    self.root = previous
+
+    def test_establishing_notifications_defer_ownership(self):
+        wire = Wire("0.160.1")
+        wire.inventory = True
+        wire.outgoing({"id": 10, "method": "thread/start", "params": {
+            "model": MODEL, "approvalPolicy": "never", "approvalsReviewer": "user",
+            "sandbox": "read-only"}})
+        wire.incoming({"method": "thread/started", "params": {"thread": {"id": "t"}}})
+        self.assertNotIn(digest("t"), wire.threads)
+        wire.incoming({"id": 10, "result": {"model": MODEL, "approvalPolicy": "never",
+                      "approvalsReviewer": "user", "thread": {"id": "t"}}})
+        wire.outgoing(self.start_message())
+        wire.incoming({"method": "turn/started", "params": {"threadId": "t", "turn": {"id": "u"}}})
+        wire.incoming({"method": "item/started", "params": {"threadId": "t", "turnId": "u",
+                      "item": {"type": "userMessage"}}})
+        wire.incoming({"method": "turn/completed", "params": {"threadId": "t",
+                      "turn": {"id": "u", "status": "completed"}}})
+        self.assertFalse(any(f["kind"] == "terminal" for f in wire.facts))
+        wire.incoming({"id": 1, "result": {"turn": {"id": "u"}}})
+        self.assertEqual(len([f for f in wire.facts if f["kind"] == "terminal"]), 1)
+        self.assertEqual(wire.deferred, [])
+
+    def test_deferred_foreign_id_blocks_on_establishing_reply(self):
+        wire = self.owned_wire()
+        wire.outgoing({**self.start_message(), "id": 2})
+        wire.incoming({"method": "turn/started", "params": {"threadId": "t", "turn": {"id": "foreign"}}})
+        with self.assertRaisesRegex(Blocked, "unowned"):
+            wire.incoming({"id": 2, "result": {"turn": {"id": "v"}}})
+
+    def test_deferred_notification_bound_and_unrelated_thread(self):
+        wire = self.owned_wire()
+        wire.outgoing({**self.start_message(), "id": 2})
+        with self.assertRaisesRegex(Blocked, "unowned"):
+            wire.incoming({"method": "turn/started", "params": {"threadId": "foreign", "turn": {"id": "v"}}})
+        with mock.patch(__name__ + ".REQUEST_LIMIT", 2):
+            for _ in range(2):
+                wire.incoming({"method": "turn/started", "params": {"threadId": "t", "turn": {"id": "v"}}})
+            with self.assertRaisesRegex(Blocked, "deferred.*bound"):
+                wire.incoming({"method": "turn/started", "params": {"threadId": "t", "turn": {"id": "v"}}})
+
+    def test_deferred_usage_error_and_resume_notifications(self):
+        wire = self.owned_wire()
+        wire.outgoing({"id": 11, "method": "thread/resume", "params": {
+            "model": MODEL, "approvalPolicy": "never", "approvalsReviewer": "user",
+            "sandbox": "read-only", "threadId": "saved", "excludeTurns": True}})
+        wire.incoming({"method": "thread/started", "params": {"thread": {"id": "saved"}}})
+        wire.incoming({"id": 11, "result": {"model": MODEL, "approvalPolicy": "never",
+                      "approvalsReviewer": "user", "thread": {"id": "saved"}}})
+        wire.outgoing({**self.start_message(), "id": 2})
+        sample = {key: 1 for key in SCHEMAS["sample"]}
+        wire.incoming({"method": "thread/tokenUsage/updated", "params": {
+            "threadId": "t", "turnId": "v", "tokenUsage": {"last": sample, "total": sample}}})
+        wire.incoming({"method": "error", "params": {"threadId": "t", "turnId": "v"}})
+        self.assertFalse(any(f["kind"] == "usage" for f in wire.facts))
+        wire.incoming({"id": 2, "result": {"turn": {"id": "v"}}})
+        self.assertEqual(len([f for f in wire.facts if f["kind"] == "usage"]), 1)
+        self.assertEqual(wire.deferred_bytes, 0)
+        self.assertEqual(wire.deferred, [])
+
+    def test_deferred_byte_bound(self):
+        wire = self.owned_wire()
+        wire.outgoing({**self.start_message(), "id": 2})
+        with mock.patch(__name__ + ".TRACE_BYTES", 8), self.assertRaisesRegex(Blocked, "deferred.*bound"):
+            wire.incoming({"method": "turn/started", "params": {"threadId": "t", "turn": {"id": "v"}}})
+
+    def test_concurrent_thread_replies_resolve_only_matching_notifications(self):
+        wire = Wire("0.160.1")
+        wire.inventory = True
+        for ident in (10, 11):
+            wire.outgoing({"id": ident, "method": "thread/start", "params": {
+                "model": MODEL, "approvalPolicy": "never", "approvalsReviewer": "user",
+                "sandbox": "read-only"}})
+        wire.incoming({"method": "thread/started", "params": {"thread": {"id": "t"}}})
+        wire.incoming({"id": 11, "result": {"model": MODEL, "approvalPolicy": "never",
+                      "approvalsReviewer": "user", "thread": {"id": "other"}}})
+        self.assertEqual(len(wire.deferred), 1)
+        wire.incoming({"id": 10, "result": {"model": MODEL, "approvalPolicy": "never",
+                      "approvalsReviewer": "user", "thread": {"id": "t"}}})
+        self.assertEqual(wire.deferred, [])
+
+    def test_metadata_never_follows_session_ancestor_symlink(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        (self.root / "sessions").symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(Blocked, "ancestor unsafe"):
+            owner_metadata(self.root)
+
+    def test_error_notification_ownership(self):
+        wire = self.owned_wire()
+        wire.incoming({"method": "error", "params": {"threadId": "t", "error": {}}})
+        wire.incoming({"method": "error", "params": {"error": {}}})
+        for params in ({"threadId": "foreign"}, {"threadId": None}, {"threadId": "t", "turnId": "foreign"}):
+            with self.subTest(params=params), self.assertRaisesRegex(Blocked, "unowned"):
+                wire.incoming({"method": "error", "params": params})
+
+    def test_active_profile_mcp_blocks_without_root_override(self):
+        config = self.root / "config.toml"
+        config.write_text('profile="active"\n[profiles.active.mcp_servers.hidden]\ncommand="fake"\n')
+        with self.assertRaisesRegex(Blocked, "active profile MCP"):
+            mcp_names(self.root)
+
+    def test_metadata_ignores_old_sessions_and_includes_tomorrow(self):
+        today = datetime.date(2026, 10, 7)
+        for day in (today - datetime.timedelta(days=1), today, today + datetime.timedelta(days=1)):
+            directory = self.root / "sessions" / day.strftime("%Y/%m/%d")
+            directory.mkdir(parents=True)
+            (directory / "one").touch()
+        original = Path.iterdir
+        def bounded(path):
+            self.assertNotEqual(path.name, "06", "old sessions traversed")
+            self.assertNotEqual(path, self.root / "sessions", "whole sessions tree traversed")
+            return original(path)
+        class Clock(datetime.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                self.assertIs(tz, datetime.timezone.utc)
+                return cls(2026, 10, 7, tzinfo=tz)
+        with mock.patch.object(Path, "iterdir", bounded), mock.patch.object(datetime, "datetime", Clock):
+            info = owner_metadata(self.root)
+        self.assertEqual(info["session_files"], 2)
+        self.assertTrue(secret_free(info))
+
     def test_config_read_checks_actual_override_results(self):
         config = self.config_fixture()
         self.assertTrue(effective_config(config, ["ok"])["all_servers_disabled"])
@@ -1990,8 +2318,8 @@ class SafetyTests(unittest.TestCase):
 
     def test_owner_home_metadata_never_reads_contents(self):
         (self.root / "auth.json").touch(mode=0o600)
-        sessions = self.root / "sessions"
-        sessions.mkdir()
+        sessions = self.root / "sessions" / datetime.datetime.now(datetime.timezone.utc).strftime("%Y/%m/%d")
+        sessions.mkdir(parents=True)
         (sessions / "one").touch()
         with mock.patch("builtins.open", side_effect=AssertionError("content read")), \
              mock.patch.object(os, "open", side_effect=AssertionError("content read")):
@@ -2516,7 +2844,8 @@ class SafetyTests(unittest.TestCase):
 
     async def proxy_fixture(self, nonempty=False, identity_error=False, pidfd_error=False,
                             termination=False, foreign=False, reused=False, after_signal=False,
-                            config=None, executable_mismatch=False, duplicate_config=False):
+                         executable_mismatch=False, duplicate_config=False, config=None,
+                         race=None, observed=None, startup=False):
         """Entire stdio exchange using fake transports; no process or real /proc."""
         binary = self.root / "fake-codex"
         binary.write_text("synthetic executable")
@@ -2547,6 +2876,17 @@ class SafetyTests(unittest.TestCase):
                           "model_provider": "openai", "profile": None, "model_providers": {},
                           "otel": None, "mcp_servers": {"foreign": {"enabled": True}} if nonempty else {}}},
                       "model/list": {"data": [], "nextCursor": None}}.get(request["method"])
+            if request["method"] == "thread/start" and race:
+                result = {"model": MODEL, "approvalPolicy": "never", "approvalsReviewer": "user",
+                          "thread": {"id": "t"}}
+            if request["method"] == "turn/start" and race:
+                for notification in (
+                    {"method": "turn/started", "params": {"threadId": "t", "turn": {"id": "u"}}},
+                    {"method": "turn/completed", "params": {"threadId": "t",
+                     "turn": {"id": "u", "status": "completed"}}}):
+                    native.feed_data(json.dumps(notification).encode() + b"\n")
+            if request["method"] == "config/read" and startup:
+                native.feed_data(b'{"method":"mcpServer/startupStatus/updated","params":{}}\n')
             if request["method"] == "config/read" and config is not None:
                 result = config
             if result is not None:
@@ -2557,6 +2897,20 @@ class SafetyTests(unittest.TestCase):
 
         async def forwarded(raw):
             response = decode_line(raw)
+            if "method" in response:
+                if observed is not None:
+                    observed.append(response["method"])
+                if race and response["method"] == "turn/started":
+                    rows = [decode_line(line) for line in next(traces.iterdir()).read_bytes().splitlines(keepends=True)]
+                    self.assertFalse(any(row["kind"] == "terminal" for row in rows))
+                    # Reply only after the early notification was forwarded.
+                    if race == "missing":
+                        native.feed_eof()
+                        upstream.feed_eof()
+                    else:
+                        native.feed_data(json.dumps({"id": 20, "result": {"turn": {
+                            "id": "u" if race == "match" else "foreign"}}}).encode() + b"\n")
+                return
             if response["id"] == 1:
                 upstream.feed_data(b'{"method":"initialized"}\n'
                                    b'{"id":2,"method":"model/list","params":{}}\n')
@@ -2568,6 +2922,15 @@ class SafetyTests(unittest.TestCase):
                     handler(sig, None)
                     if after_signal:
                         upstream.feed_data(json.dumps(self.start_message()).encode() + b"\n")
+                if race:
+                    upstream.feed_data(json.dumps({"id": 10, "method": "thread/start", "params": {
+                        "model": MODEL, "approvalPolicy": "never", "approvalsReviewer": "user",
+                        "sandbox": "read-only"}}).encode() + b"\n")
+                else:
+                    upstream.feed_eof()
+            elif response["id"] == 10:
+                upstream.feed_data(json.dumps({**self.start_message(), "id": 20}).encode() + b"\n")
+            elif response["id"] == 20:
                 upstream.feed_eof()
 
         async def connect(factory, pipe):
@@ -2613,6 +2976,37 @@ class SafetyTests(unittest.TestCase):
         facts = [decode_line(line) for line in next(traces.iterdir()).read_bytes().splitlines(keepends=True)]
         self.assertTrue(facts[-1]["complete"] and facts[-1]["child_reaped"])
         self.assertTrue(secret_free(facts))
+
+    def test_proxy_forwards_early_notification_and_checks_reply(self):
+        for race in ("match", "mismatch", "missing"):
+            with self.subTest(race=race), tempfile.TemporaryDirectory() as root:
+                previous, self.root = self.root, Path(root)
+                try:
+                    observed = []
+                    result, child, signals, sent, traces = asyncio.run(self.proxy_fixture(race=race, observed=observed))
+                    self.assertEqual(result, 0 if race == "match" else 1)
+                    self.assertIn("turn/started", observed)
+                    rows = [decode_line(line) for line in next(traces.iterdir()).read_bytes().splitlines(keepends=True)]
+                    self.assertEqual(rows[-1]["complete"], race == "match")
+                    self.assertTrue(rows[-1]["child_reaped"])
+                    self.assertEqual(len([row for row in rows if row["kind"] == "terminal"]),
+                                     1 if race == "match" else 0)
+                    if race == "missing":
+                        self.assertEqual(rows[-1]["blocked_reason"],
+                                         "unowned deferred notification: establishing reply unavailable")
+                    self.assertTrue(secret_free(rows))
+                finally:
+                    self.root = previous
+
+    def test_proxy_mcp_startup_blocks_and_reaps_child(self):
+        observed = []
+        result, child, signals, sent, traces = asyncio.run(self.proxy_fixture(startup=True, observed=observed))
+        self.assertEqual(result, 1)
+        self.assertNotIn("mcpServer/startupStatus/updated", observed)
+        rows = [decode_line(line) for line in next(traces.iterdir()).read_bytes().splitlines(keepends=True)]
+        self.assertFalse(rows[-1]["complete"])
+        self.assertTrue(rows[-1]["child_reaped"])
+        self.assertEqual(rows[-1]["blocked_reason"], "MCP startup observed despite disables")
 
     def test_proxy_nonempty_inventory_stops_before_discovery(self):
         result, child, signals, sent, traces = asyncio.run(self.proxy_fixture(nonempty=True))
