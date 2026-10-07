@@ -101,6 +101,14 @@ items, errors, requests and any changed total block. Replays have their own fact
 kind. Reports never establish IDs. Usage is matched to both its named turn and
 that turn's submitting server, so replayed history cannot inflate either the
 old turn or the new one.
+Tool/item/terminal facts retain receipt times on the host's monotonic clock,
+including deferred notifications, fixed item types and hashed item identities.
+Tool facts classify fixed error phrases and compare parsed argv with the fixed
+attempt, without retaining output. The changed-bound survey is written even
+when blocked: polling cadence, owned pid/start ticks, hashed argv/cwd/executable
+paths, fixed wrapper roles and match flags. These bounded diagnostics neither
+prove execution/refusal nor relax the exact owned-process EROFS gate. Polling
+cannot exclude a process that lives entirely between samples.
 Ownership rejections first record public method/item labels (unfamiliar labels
 are hash-only), hashed IDs, generation, ownership flags and pending requests.
 VIA receipt/status/events/cancel/result/wait/close/daemon replies have
@@ -384,6 +392,15 @@ class Proc:
         require(fd is not None, "unverifiable identity: changed process")
         try:
             return os.readlink("cwd", dir_fd=fd)
+        finally:
+            os.close(fd)
+
+    def executable_path(self, ident):
+        """Runtime §5.2: owned executable link for hash-only survey diagnostics."""
+        fd, _ = self.open(ident["pid"], ident["start_ticks"])
+        require(fd is not None, "unverifiable identity: changed process")
+        try:
+            return os.readlink("exe", dir_fd=fd)
         finally:
             os.close(fd)
 
@@ -885,7 +902,7 @@ class Wire:
             candidates.discard(replied)
             scope = self.scope(message["method"], message["params"])
             if self.owns(scope, message):
-                self.incoming(message)
+                self.incoming(message, observed_at=int(created * 1000))
             else:
                 if not candidates:
                     self.reject_ownership(message["method"], message["params"],
@@ -893,8 +910,9 @@ class Wire:
                 self.deferred.append((message, candidates, size, created))
                 self.deferred_bytes += size
 
-    def incoming(self, message):
+    def incoming(self, message, observed_at=None):
         self.deferred_timeout()
+        observed_at = int(time.monotonic() * 1000) if observed_at is None else observed_at
         require(isinstance(message, dict), "protocol reply shape")
         if "id" in message and "method" not in message:
             require(type(message["id"]) in (str, int), "protocol id shape")
@@ -978,11 +996,15 @@ class Wire:
             require(params["turn"]["status"] in ("completed", "interrupted", "failed"),
                     "terminal status missing or unqualified")
             fact.update(kind="terminal", thread=digest(params["threadId"]),
-                        turn=digest(params["turn"]["id"]), status=params["turn"]["status"])
+                        turn=digest(params["turn"]["id"]), status=params["turn"]["status"],
+                        at_ms=observed_at)
         elif method in ("item/started", "item/completed"):
             item = params["item"]
             require(item.get("type") in ("userMessage", "agentMessage", "reasoning", "plan", "commandExecution"),
                     "background agent or unqualified tool item")
+            fact.update(kind="item", thread=digest(params["threadId"]), turn=digest(params["turnId"]),
+                        item_type=item["type"], item_hash=digest(item["id"]) if type(item.get("id")) is str else None,
+                        finished=method == "item/completed", at_ms=observed_at)
             if item["type"] == "commandExecution":
                 output = item.get("aggregatedOutput")
                 require(output is None or type(output) is str, "tool output type")
@@ -991,8 +1013,16 @@ class Wire:
                 fact.update(kind="tool", thread=digest(params["threadId"]),
                             turn=digest(params["turnId"]), finished=method == "item/completed",
                             command_hash=command_digest(item.get("command")),
+                            fixed_attempt_argv=bound_probe.command_argv(item.get("command")) ==
+                                bound_probe.DeniedExecution(sys.executable, "", Path("denied.txt")).attempt,
                             exit_code=code, read_only_error=isinstance(output, str)
-                            and "Read-only file system" in output)
+                            and "Read-only file system" in output,
+                            error_flags={"syntax_error": isinstance(output, str) and
+                                ("SyntaxError" in output or "syntax error" in output.lower()),
+                                "permission_denied": isinstance(output, str) and "Permission denied" in output,
+                                "interpreter_unavailable": isinstance(output, str) and
+                                ("can't open file" in output or "No such file or directory" in output
+                                 or "command not found" in output)})
         if scope is not None and not self.owns(scope, message):
             candidates = self.establishing(scope)
             if not candidates:
@@ -1561,50 +1591,61 @@ class Run(shared.Run):
     def observe_denied_execution(self, label, target):
         """Packet §3: gate on the exact attempt/EROFS transition beneath this turn's server."""
         probe = bound_probe.DeniedExecution(sys.executable, shared.sha256(sys.executable), target)
+        survey = bound_probe.Survey(probe)
         deadline = min(time.monotonic() + POLL_S, self.spend.deadline)
         key, proc = digest(label), Proc()
-        while time.monotonic() < deadline:
-            shared.interrupt_guard()
-            facts = self.facts()
-            starts = [fact for fact in facts if fact["kind"] == "reply"
-                      and fact.get("method") == "turn/start" and fact.get("reservation") == key]
-            if starts:
-                require(len(starts) == 1, "prohibited execution native start ambiguous")
-                start = starts[0]
-                roots = [fact for fact in facts if fact["kind"] == "process" and fact["trace"] == start["trace"]]
-                require(len(roots) == 1, "prohibited execution server unavailable")
-                requests = [fact for fact in facts if fact["kind"] == "request"
-                            and fact.get("method") == "turn/start" and fact.get("reservation") == key]
-                require(len(requests) == 1 and requests[0]["bound"] == "readOnly",
-                        "prohibited execution bound unverified")
-                root = roots[0]
-                entries = os.listdir("/proc")
-                require(len(entries) <= PROC_COUNT, "process survey bound")
-                for pid in entries:
-                    shared.interrupt_guard()
-                    require(time.monotonic() < deadline, "prohibited execution observation deadline")
-                    if not pid.isdigit():
-                        continue
-                    fd, identity = proc.open(int(pid))
-                    if fd is None:
-                        continue
-                    os.close(fd)
-                    try:
-                        proc.own(identity, root)
-                    except Blocked:
-                        continue  # No foreign argv/cwd/executable reads.
-                    self.owned.add((identity["pid"], identity["start_ticks"]))
-                    observed = probe.observe(proc, identity, root)
-                    if observed is not None:
-                        observed.update(reservation=key, thread=start["thread"],
-                                        turn=start["turn"], trace=start["trace"])
-                        save(self.evidence / "changed-bound-execution.json", observed)
-                        return observed
-                if any(fact["kind"] == "terminal" and fact.get("thread") == start["thread"]
-                       and fact.get("turn") == start["turn"] and fact["trace"] == start["trace"] for fact in facts):
-                    break
-            time.sleep(0.1)
-        raise Blocked("prohibited execution not observed")
+        facts, context, outcome = [], {"reservation": key}, "blocked"
+        try:
+            while time.monotonic() < deadline:
+                shared.interrupt_guard()
+                facts = self.facts()
+                starts = [fact for fact in facts if fact["kind"] == "reply"
+                          and fact.get("method") == "turn/start" and fact.get("reservation") == key]
+                if starts:
+                    require(len(starts) == 1, "prohibited execution native start ambiguous")
+                    start = starts[0]
+                    context.update(thread=start["thread"], turn=start["turn"], trace=start["trace"])
+                    roots = [fact for fact in facts if fact["kind"] == "process" and fact["trace"] == start["trace"]]
+                    require(len(roots) == 1, "prohibited execution server unavailable")
+                    requests = [fact for fact in facts if fact["kind"] == "request"
+                                and fact.get("method") == "turn/start" and fact.get("reservation") == key]
+                    require(len(requests) == 1 and requests[0]["bound"] == "readOnly",
+                            "prohibited execution bound unverified")
+                    root = roots[0]
+                    entries = os.listdir("/proc")
+                    require(len(entries) <= PROC_COUNT, "process survey bound")
+                    survey.scan()
+                    for pid in entries:
+                        shared.interrupt_guard()
+                        require(time.monotonic() < deadline, "prohibited execution observation deadline")
+                        if not pid.isdigit():
+                            continue
+                        fd, identity = proc.open(int(pid))
+                        if fd is None:
+                            continue
+                        os.close(fd)
+                        try:
+                            proc.own(identity, root)
+                        except Blocked:
+                            continue  # No foreign argv/cwd/executable reads.
+                        self.owned.add((identity["pid"], identity["start_ticks"]))
+                        observed = probe.observe(proc, identity, root, survey)
+                        if observed is not None:
+                            observed.update(context)
+                            save(self.evidence / "changed-bound-execution.json", observed)
+                            outcome = "proven"
+                            return observed
+                    if any(fact["kind"] == "terminal" and fact.get("thread") == start["thread"]
+                           and fact.get("turn") == start["turn"] and fact["trace"] == start["trace"] for fact in facts):
+                        break
+                time.sleep(0.1)
+            raise Blocked("prohibited execution not observed")
+        finally:
+            tools = [{field: fact.get(field) for field in ("item_type", "item_hash", "at_ms", "finished",
+                      "command_hash", "fixed_attempt_argv", "exit_code", "read_only_error", "error_flags")}
+                     for fact in facts if fact["kind"] == "tool" and "turn" in context
+                     and all(fact.get(field) == context[field] for field in ("thread", "turn", "trace"))]
+            save(self.evidence / "changed-bound-survey.json", survey.snapshot(outcome, context, tools))
 
     def stop_daemon(self, final=False):
         # Refresh owned identities before surveying ancestry; still stop on a
@@ -3932,10 +3973,109 @@ class SafetyTests(unittest.TestCase):
                  {"kind": "request", "method": "turn/start", "reservation": digest("c2"), "bound": "readOnly"},
                  {"kind": "process", "trace": generation, "pid": 1, "start_ticks": 10},
                  {"kind": "terminal", "trace": generation, "thread": thread, "turn": turn}]
+        # Run 3 shape: one commandExecution start/completion, exit 2, no EROFS phrase.
+        facts.extend({"kind": "tool", "trace": generation, "thread": thread, "turn": turn,
+                      "item_type": "commandExecution", "finished": finished,
+                      "command_hash": digest("synthetic unrecognized command"),
+                      "exit_code": 2 if finished else None, "read_only_error": False}
+                     for finished in (False, True))
+        facts.append({"kind": "tool", "trace": generation, "thread": thread,
+                      "turn": digest("older turn"), "exit_code": 0})
         with mock.patch.object(run, "facts", return_value=facts), mock.patch.object(os, "listdir", return_value=[]), \
              mock.patch.object(time, "sleep") as sleep, self.assertRaisesRegex(Blocked, "not observed"):
             run.observe_denied_execution("c2", self.root / "denied.txt")
         sleep.assert_not_called()
+        self.assertTrue((run.evidence / "changed-bound-survey.json").exists())
+        recorded = json.loads((run.evidence / "changed-bound-survey.json").read_text())
+        self.assertEqual(len(recorded["tools"]), 2)
+        self.assertEqual(recorded["tools"][-1]["exit_code"], 2)
+        self.assertIs(recorded["tools"][-1]["read_only_error"], False)
+
+    def test_tool_diagnostics_record_item_type_time_and_fixed_error_flags(self):
+        wire = self.owned_wire()
+        for method in ("item/started", "item/completed"):
+            with mock.patch.object(time, "monotonic", return_value=123.456):
+                fact = wire.incoming({"method": method, "params": {"threadId": "t", "turnId": "u",
+                    "item": {"id": "synthetic-command", "type": "commandExecution",
+                             "command": bound_probe.command(sys.executable, Path("denied.txt")),
+                             "exitCode": 2 if method == "item/completed" else None,
+                             "aggregatedOutput": "SyntaxError: synthetic " + "sk-" + "x" * 48}}})
+            self.assertEqual(fact.get("item_type"), "commandExecution")
+            self.assertEqual(fact.get("at_ms"), 123456)
+            self.assertEqual(fact.get("item_hash"), digest("synthetic-command"))
+            self.assertIs(fact.get("fixed_attempt_argv"), True)
+            self.assertTrue(fact.get("error_flags", {}).get("syntax_error"))
+            self.assertTrue(secret_free(fact))
+        item = wire.incoming({"method": "item/completed", "params": {"threadId": "t", "turnId": "u",
+                              "item": {"id": "synthetic-agent", "type": "agentMessage"}}})
+        self.assertEqual(item.get("kind"), "item")
+        self.assertEqual(item.get("item_type"), "agentMessage")
+
+    def test_deferred_tool_diagnostics_keep_arrival_time(self):
+        wire = self.owned_wire()
+        message = self.start_message()
+        message["id"] = 2
+        wire.outgoing(message)
+        with mock.patch.object(time, "monotonic", return_value=100):
+            wire.incoming({"method": "item/started", "params": {"threadId": "t", "turnId": "next",
+                           "item": {"type": "commandExecution", "command": "synthetic command"}}})
+        with mock.patch.object(time, "monotonic", return_value=105):
+            wire.incoming({"id": 2, "result": {"turn": {"id": "next"}}})
+        tool = next(fact for fact in wire.facts if fact["kind"] == "tool")
+        self.assertEqual(tool["at_ms"], 100000)
+
+    def test_bound_survey_bounds_and_cadence(self):
+        probe, proc, server, tool = self.probe_fixture()
+        with mock.patch.object(time, "monotonic", return_value=0):
+            survey = bound_probe.Survey(probe)
+            survey.scan()
+        with mock.patch.object(time, "monotonic", return_value=1.25):
+            survey.scan()
+        with mock.patch.object(time, "monotonic", return_value=2):
+            survey.scan()
+        with mock.patch.object(bound_probe, "SURVEY_RECORDS", 1):
+            survey.observe(proc, tool, ["synthetic-command"])
+            with self.assertRaisesRegex(Blocked, "survey evidence bound"):
+                survey.observe(proc, tool, ["different-command"])
+        snapshot = survey.snapshot("blocked", {}, [])
+        self.assertEqual(snapshot["scan_count"], 3)
+        self.assertEqual(snapshot["max_scan_gap_ms"], 1250)
+        self.assertEqual(len(snapshot["observations"]), 1)
+        self.assertTrue(secret_free(snapshot))
+
+    def test_failed_bound_survey_records_owned_wrapper_without_accepting_it(self):
+        probe, proc, server, tool = self.probe_fixture()
+        run = self.run_object()
+        self.process(3, 0, 30)
+        wrapper = ["bwrap", "--", *probe.attempt, "sk-" + "x" * 48]
+        self.probe_argv(wrapper)
+        generation, thread, turn = digest("generation"), digest("thread"), digest("turn")
+        facts = [{"kind": "reply", "method": "turn/start", "reservation": digest("c2"),
+                  "trace": generation, "thread": thread, "turn": turn},
+                 {"kind": "request", "method": "turn/start", "reservation": digest("c2"), "bound": "readOnly"},
+                 {"kind": "process", "trace": generation, **server},
+                 {"kind": "terminal", "trace": generation, "thread": thread, "turn": turn}]
+        with mock.patch.object(sys, "executable", probe.python), mock.patch(__name__ + ".Proc", return_value=proc), \
+             mock.patch.object(run, "facts", return_value=facts), mock.patch.object(os, "listdir", return_value=["2", "3"]), \
+             mock.patch.object(proc, "content", wraps=proc.content) as content, \
+             self.assertRaisesRegex(Blocked, "not observed"):
+            run.observe_denied_execution("c2", probe.target)
+        path = run.evidence / "changed-bound-survey.json"
+        self.assertTrue(path.exists())
+        survey = json.loads(path.read_text())
+        self.assertEqual(survey["outcome"], "blocked")
+        self.assertEqual(survey["context"]["trace"], generation)
+        self.assertEqual(survey["scan_count"], 1)
+        self.assertEqual(len(survey["observations"]), 1)
+        sample = survey["observations"][0]
+        self.assertEqual(sample["argv_role"], "bwrap")
+        self.assertEqual(sample["argv_hash"], digest(wrapper))
+        self.assertTrue(sample["contains_attempt_program"])
+        self.assertTrue(sample["cwd_matches"])
+        self.assertFalse(sample["attempt_argv_matches"])
+        self.assertTrue(secret_free(survey))
+        self.assertNotIn("sk-" + "x" * 48, path.read_text())
+        self.assertFalse(any(call.args[0]["pid"] == 3 for call in content.call_args_list))
 
     def test_bound_observer_pairs_server_and_tracks_attempt_even_on_failure(self):
         probe, proc, server, tool = self.probe_fixture()
@@ -3960,6 +4100,7 @@ class SafetyTests(unittest.TestCase):
         self.assertTrue(secret_free(json.loads((run.evidence / "changed-bound-execution.json").read_text())))
         self.assertFalse(any(call.args[0] == foreign for call in content.call_args_list))
         run.owned.clear()
+        (run.evidence / "changed-bound-survey.json").unlink()
         self.probe_argv(probe.attempt)
         facts.append({"kind": "terminal", "trace": generation, "thread": thread, "turn": turn})
         with mock.patch.object(sys, "executable", probe.python), mock.patch(__name__ + ".Proc", return_value=proc), \
