@@ -90,6 +90,12 @@ forwarded immediately; their facts remain deferred within count/byte bounds
 until that reply proves ownership. A mismatching or missing reply blocks.
 Nonownership safety checks run before forwarding, and the oldest deferred entry
 has a 30 s monotonic deadline, including silence and stdout backpressure.
+Ownership lasts for the run: matched VIA replies in earlier private traces
+establish historical thread/turn IDs for later servers. Reports never establish
+IDs. Usage is matched to both its named turn and that turn's submitting server,
+so replayed history cannot inflate either the old turn or the new one.
+Ownership rejections first record public method/item labels (unfamiliar labels
+are hash-only), hashed IDs, generation, ownership flags and pending requests.
 VIA receipt/status/events/cancel/result/wait/close/daemon replies have
 method-specific schemas; missing/mistyped relied-on fields block.
 Events paginate with strict progress and deadlines. All loops have bounds.
@@ -171,6 +177,16 @@ WORKSPACE_MARKER = b"allowed"
 NO_GRANT_METHODS = ("item/commandExecution/requestApproval", "item/fileChange/requestApproval",
                     "item/permissions/requestApproval", "item/tool/requestUserInput",
                     "mcpServer/elicitation/request", "item/tool/call")
+# Packet §§3–6: public protocol labels; unfamiliar strings stay hash-only.
+PUBLIC_METHODS = frozenset(NO_GRANT_METHODS) | frozenset((
+    "initialize", "initialized", "model/list", "thread/start", "thread/resume", "turn/start",
+    "turn/interrupt", "thread/unsubscribe", "thread/started", "thread/status/changed",
+    "thread/tokenUsage/updated", "turn/started", "turn/completed", "item/started", "item/completed",
+    "item/agentMessage/delta", "error", "warning", "remoteControl/status/changed",
+    "account/updated", "account/rateLimits/updated", "mcpServer/startupStatus/updated"))
+PUBLIC_ITEM_TYPES = frozenset(("userMessage", "agentMessage", "reasoning", "plan", "commandExecution",
+                               "collabAgentToolCall", "mcpToolCall", "fileChange", "webSearch", "imageView"))
+
 SECRET = re.compile(r"(?i)(?:bearer\s+\S+|sk-[A-Za-z0-9_-]{8,}|"
                     r"(?:access_token|refresh_token|api_key|authorization|auth\.json)"
                     r"\s*[\":=]|/home/|/Users/)")
@@ -520,15 +536,89 @@ def owner_metadata(home, today=None):
             "session_files": len(session_files), "session_digests": sorted(session_files)}
 
 
+def ownership_history(directory, generation, binary_hash, version):
+    """Packet §§3/7: carry only matched VIA reply identities from this run's private traces."""
+    threads, turns = set(), set()
+    paths = list(Path(directory).glob("server-*.jsonl"))
+    require(len(paths) <= TURN_LIMIT, "ownership history generation bound")
+    ordered = []
+    for path in paths:
+        name = re.fullmatch(r"server-(\d+)-(\d+)\.jsonl", path.name)
+        require(name is not None, "ownership history filename unsupported")
+        pid, ticks = map(int, name.groups())
+        if digest((pid, ticks)) != generation:
+            ordered.append((ticks, pid, path))
+    for ticks, pid, path in sorted(ordered):
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd, "rb") as file:
+                meta = os.fstat(file.fileno())
+                require(stat.S_ISREG(meta.st_mode) and meta.st_uid == os.getuid()
+                        and stat.S_IMODE(meta.st_mode) == 0o600 and meta.st_nlink == 1,
+                        "ownership history unsafe file")
+                raw = file.read(TRACE_BYTES + 1)
+            require(len(raw) <= TRACE_BYTES, "ownership history byte bound")
+            lines = raw.splitlines(keepends=True)
+            # A concurrent owned writer may be partway through its final line.
+            if lines and not lines[-1].endswith(b"\n"):
+                lines.pop()
+            rows = [decode_line(line) for line in lines]
+            if not rows:
+                continue
+            require(len(rows) <= REQUEST_LIMIT and [row["seq"] for row in rows]
+                    == list(range(1, len(rows) + 1)), "ownership history sequence unsupported")
+            header = rows[0]
+            require(header["kind"] == "process" and type(header["pid"]) is int
+                    and type(header["start_ticks"]) is int and header["pid"] == pid
+                    and header["start_ticks"] == ticks and header["executable_hash"] == binary_hash,
+                    "ownership history generation identity mismatch")
+            pending, initialized = {}, False
+            for row in rows[1:]:
+                if row["kind"] == "request" and "request" in row:
+                    require(row["request"] not in pending, "ownership history duplicate request")
+                    pending[row["request"]] = row
+                elif row["kind"] == "reply":
+                    request = pending.pop(row["request"], None)
+                    require(request is not None and request["method"] == row["method"],
+                            "ownership history unpaired reply")
+                    method = row["method"]
+                    if method == "initialize":
+                        require(row["version"] == version, "ownership history version mismatch")
+                        initialized = True
+                    elif method in ("thread/start", "thread/resume", "turn/start"):
+                        require(initialized and request["model"] == MODEL
+                                and request["never"] is True and request["reviewer_user"] is True,
+                                "ownership history policy unverified")
+                        thread = row["thread"]
+                        require(type(thread) is str and re.fullmatch(r"[0-9a-f]{64}", thread),
+                                "ownership history thread identity unsupported")
+                        if method in ("thread/start", "thread/resume"):
+                            require(row["never"] is True and row["reviewer_user"] is True
+                                    and (method != "thread/resume" or request["thread"] == thread),
+                                    "ownership history resume/policy mismatch")
+                            threads.add(thread)
+                        else:
+                            turn = row["turn"]
+                            require(thread in threads and request["thread"] == thread
+                                    and type(turn) is str and re.fullmatch(r"[0-9a-f]{64}", turn),
+                                    "ownership history turn identity unsupported")
+                            turns.add((thread, turn))
+        except (OSError, KeyError, TypeError, ValueError):
+            raise Blocked("ownership history unreadable or schema unsupported") from None
+    return threads, turns
+
+
 class Wire:
     """Paired protocol facts, never raw content (packet §§3–7)."""
-    def __init__(self, version, sink=None):
+    def __init__(self, version, sink=None, history=None, generation=None):
         self.version, self.pending, self.facts, self.starts = version, {}, [], 0
         self.declines, self.server_requests = {}, {}
         self.initialized, self.inventory = False, False
         self.sink = sink
         self.threads, self.turns, self.notifications = set(), set(), {}
         self.deferred, self.deferred_bytes = [], 0
+        self.history, self.generation = history, generation
+        self.earlier_threads, self.earlier_turns = set(), set()
 
     def fact(self, **value):
         require(len(self.facts) < REQUEST_LIMIT, "protocol evidence bound")
@@ -537,6 +627,41 @@ class Wire:
         if self.sink:
             self.sink(value)
         return value
+
+    def refresh_history(self):
+        """Packet §3: monotonic run-wide ownership, refreshed from paired earlier replies."""
+        if self.history is not None:
+            threads, turns = self.history()
+            self.earlier_threads.update(threads)
+            self.earlier_turns.update(turns)
+
+    def reject_ownership(self, method, params, reason, scope=None, reply_request=None):
+        """Packet §§3/7: leave sanitized context before every ownership rejection."""
+        self.refresh_history()
+        nested_thread, nested_turn = params.get("thread"), params.get("turn")
+        thread = nested_thread.get("id") if method == "thread/started" and type(nested_thread) is dict \
+            else params.get("threadId")
+        turn = nested_turn.get("id", params.get("turnId")) if type(nested_turn) is dict \
+            else params.get("turnId")
+        thread = digest(thread) if type(thread) is str else None
+        turn = digest(turn) if type(turn) is str else None
+        if scope is not None:
+            thread, turn = scope
+        item = params.get("item")
+        item_type = item.get("type") if type(item) is dict else None
+        establishing = [{"method": request["method"], "request": key,
+                         "thread": request.get("thread")} for key, request in self.pending.items()
+                        if request["method"] in ("thread/start", "thread/resume", "turn/start")]
+        self.fact(kind="ownership_rejection", reason=reason,
+                  method=method if method in PUBLIC_METHODS else None, method_hash=digest(method),
+                  item_type=item_type if type(item_type) is str and item_type in PUBLIC_ITEM_TYPES else None,
+                  item_type_hash=digest(item_type) if type(item_type) is str else None,
+                  thread=thread, turn=turn, thread_owned=thread in self.threads | self.earlier_threads,
+                  turn_owned=(thread, turn) in self.turns | self.earlier_turns,
+                  turn_known_earlier=turn is not None and any(t == turn for _, t in self.earlier_turns),
+                  generation=self.generation, pending_establishing=establishing,
+                  reply_request=reply_request)
+        raise Blocked(reason)
 
     def outgoing(self, message):
         self.deferred_timeout()
@@ -575,7 +700,8 @@ class Wire:
                 self.starts += 1
                 require(self.starts <= TURN_LIMIT and params["effort"] == "low",
                         "spending control: proxy starts/effort")
-                require(digest(params["threadId"]) in self.threads, "unowned thread request")
+                if not self.owns((digest(params["threadId"]), None)):
+                    self.reject_ownership(method, params, "unowned thread request")
                 fact.update(thread=digest(params["threadId"]), schema=digest(params["outputSchema"]),
                             bound=params["sandboxPolicy"]["type"])
             else:
@@ -584,8 +710,8 @@ class Wire:
                     require(params["excludeTurns"] is True, "resume history not excluded")
                     fact.update(thread=digest(params["threadId"]), exclude_turns=True)
         elif method == "turn/interrupt":
-            require((digest(params["threadId"]), digest(params["turnId"])) in self.turns,
-                    "unowned turn interrupt")
+            if not self.owns((digest(params["threadId"]), digest(params["turnId"]))):
+                self.reject_ownership(method, params, "unowned turn interrupt")
             fact.update(thread=digest(params["threadId"]), turn=digest(params["turnId"]))
         if "id" in message:
             require(type(message["id"]) in (str, int), "protocol id shape")
@@ -596,35 +722,41 @@ class Wire:
             self.pending[key] = fact.copy()
         return self.fact(**fact)
 
-    @staticmethod
-    def scope(method, params):
+    def scope(self, method, params):
         """Packet §3: notification scope, including errors with a thread identity."""
         scoped_error = method == "error" and "threadId" in params
         if not method.startswith(("thread/", "turn/", "item/")) and not scoped_error:
             return None
         thread = params.get("threadId")
         if method == "thread/started":
-            thread = params.get("thread", {}).get("id")
-        require(type(thread) is str, "unowned thread notification: missing identity")
+            nested = params.get("thread")
+            thread = nested.get("id") if type(nested) is dict else None
+        if type(thread) is not str:
+            self.reject_ownership(method, params, "unowned thread notification: missing identity")
         turn = params.get("turnId")
         if method.startswith("turn/"):
-            turn = params.get("turn", {}).get("id", turn)
+            nested = params.get("turn")
+            turn = nested.get("id", turn) if type(nested) is dict else turn
         has_turn = (method.startswith(("turn/", "item/"))
                     or method == "thread/tokenUsage/updated"
                     or scoped_error and "turnId" in params)
-        require(not has_turn or type(turn) is str,
-                "unowned turn notification; correlation unavailable: missing identity")
+        if has_turn and type(turn) is not str:
+            self.reject_ownership(method, params,
+                                  "unowned turn notification; correlation unavailable: missing identity")
         return digest(thread), digest(turn) if has_turn else None
 
     def owns(self, scope):
         """Packet §3: only paired replies establish owned thread/turn IDs."""
         thread, turn = scope
-        return thread in self.threads and (turn is None or (thread, turn) in self.turns)
+        if thread not in self.threads or turn is not None and (thread, turn) not in self.turns:
+            self.refresh_history()
+        return thread in self.threads | self.earlier_threads and \
+            (turn is None or (thread, turn) in self.turns | self.earlier_turns)
 
     def establishing(self, scope):
         """Packet §3 start ordering: match only requests able to establish this scope."""
         thread, turn = scope
-        if thread not in self.threads:
+        if thread not in self.threads | self.earlier_threads:
             return {key for key, request in self.pending.items()
                     if turn is None and (request["method"] == "thread/start"
                     or request["method"] == "thread/resume" and request["thread"] == thread)}
@@ -636,7 +768,9 @@ class Wire:
         if not self.deferred:
             return None
         remaining = DEFER_S - (time.monotonic() - self.deferred[0][3])
-        require(remaining >= 0, "deferred notification deadline")
+        if remaining < 0:
+            message = self.deferred[0][0]
+            self.reject_ownership(message["method"], message["params"], "deferred notification deadline")
         return remaining
 
     def resolve_deferred(self, replied):
@@ -650,7 +784,9 @@ class Wire:
             if self.owns(scope):
                 self.incoming(message)
             else:
-                require(bool(candidates), "unowned deferred notification after establishing reply")
+                if not candidates:
+                    self.reject_ownership(message["method"], message["params"],
+                                          "unowned deferred notification after establishing reply")
                 self.deferred.append((message, candidates, size, created))
                 self.deferred_bytes += size
 
@@ -679,16 +815,25 @@ class Wire:
             elif method in ("thread/start", "thread/resume"):
                 require(result["model"] == MODEL and result["approvalPolicy"] == "never"
                         and result["approvalsReviewer"] == "user", "thread policy echo mismatch")
-                require(type(result["thread"]["id"]) is str, "thread identity missing")
-                thread = digest(result["thread"]["id"])
-                require(method != "thread/resume" or thread == request["thread"],
-                        "resume identity mismatch")
+                native_thread = result.get("thread")
+                thread_id = native_thread.get("id") if type(native_thread) is dict else None
+                if type(thread_id) is not str:
+                    self.reject_ownership(method, {"threadId": thread_id}, "thread identity missing",
+                                          reply_request=key)
+                thread = digest(thread_id)
+                if method == "thread/resume" and thread != request["thread"]:
+                    self.reject_ownership(method, {"threadId": thread_id}, "resume identity mismatch",
+                                          reply_request=key)
                 self.threads.add(thread)
                 fact.update(thread=thread, never=True, reviewer_user=True)
             elif method == "turn/start":
-                require(type(result["turn"]["id"]) is str, "turn/start id missing")
-                self.turns.add((request["thread"], digest(result["turn"]["id"])))
-                fact.update(thread=request["thread"], turn=digest(result["turn"]["id"]))
+                native_turn = result.get("turn")
+                turn_id = native_turn.get("id") if type(native_turn) is dict else None
+                if type(turn_id) is not str:
+                    self.reject_ownership(method, {}, "turn/start id missing",
+                                          scope=(request["thread"], None), reply_request=key)
+                self.turns.add((request["thread"], digest(turn_id)))
+                fact.update(thread=request["thread"], turn=digest(turn_id))
             elif method not in ("turn/interrupt", "thread/unsubscribe"):
                 raise Blocked("protocol reply method not qualified")
             reply = self.fact(**fact)
@@ -701,8 +846,9 @@ class Wire:
         if method == "remoteControl/status/changed":
             require(params.get("status") == "disabled", "remote control not disabled")
         if "id" in message:
-            require(scope is None or self.owns(scope),
-                    "unowned thread/turn notification; correlation unavailable")
+            if scope is not None and not self.owns(scope):
+                self.reject_ownership(method, params,
+                                      "unowned thread/turn notification; correlation unavailable")
             key = digest(message["id"])
             require(type(message["id"]) in (str, int) and key not in self.server_requests
                     and len(self.server_requests) < REQUEST_LIMIT, "duplicate/server request bound")
@@ -742,7 +888,9 @@ class Wire:
                             and "Read-only file system" in output)
         if scope is not None and not self.owns(scope):
             candidates = self.establishing(scope)
-            require(bool(candidates), "unowned thread/turn notification; correlation unavailable")
+            if not candidates:
+                self.reject_ownership(method, params,
+                                      "unowned thread/turn notification; correlation unavailable")
             size = len(json.dumps(message).encode())
             require(len(self.deferred) < REQUEST_LIMIT and self.deferred_bytes + size <= TRACE_BYTES,
                     "deferred notification bound")
@@ -832,7 +980,10 @@ async def proxy(control, argv):
             line = json.dumps({"seq": sequence, **value}, sort_keys=True).encode() + b"\n"
             require(trace.tell() + len(line) <= TRACE_BYTES, "protocol evidence byte bound")
             trace.write(line)
-        wire, write_lock = Wire(control["version"], sink), asyncio.Lock()
+        generation = digest((identity["pid"], identity["start_ticks"]))
+        history = lambda: ownership_history(control["trace_dir"], generation,
+                                            control["codex_hash"], control["version"])
+        wire, write_lock = Wire(control["version"], sink, history, generation), asyncio.Lock()
         wire.fact(kind="process", pid=identity["pid"], start_ticks=identity["start_ticks"],
                   executable_hash=executable_hash)
         reader = asyncio.StreamReader(limit=LINE_BYTES + 1)
@@ -880,7 +1031,9 @@ async def proxy(control, argv):
                 try:
                     raw = await asyncio.wait_for(proc.stdout.readline(), timeout)
                 except asyncio.TimeoutError:
-                    raise Blocked("deferred notification deadline") from None
+                    message = wire.deferred[0][0]
+                    wire.reject_ownership(message["method"], message["params"],
+                                          "deferred notification deadline")
                 if not raw:
                     return
                 message = decode_line(raw)
@@ -916,7 +1069,10 @@ async def proxy(control, argv):
             await asyncio.wait_for(tasks[1], 10)
         else:
             require(proc.returncode is not None or not wire.pending, "server ended with pending replies")
-        require(not wire.deferred, "unowned deferred notification: establishing reply unavailable")
+        if wire.deferred:
+            message = wire.deferred[0][0]
+            wire.reject_ownership(message["method"], message["params"],
+                                  "unowned deferred notification: establishing reply unavailable")
     except BaseException as error:
         failure = type(error).__name__
         reason = str(error) if isinstance(error, Blocked) and secret_free(str(error)) else failure
@@ -1391,14 +1547,16 @@ def completed(run, envelope, label):
               and envelope["failure"] is None and envelope["stop_reason"] == "end_turn")
 
 
-def turn_facts(run, envelope):
+def turn_facts(run, envelope, facts=None):
     """Exact C1 ordinal -> paired native turn identity, across server retirement."""
-    facts, thread = run.facts(), digest(envelope["vendor_session_id"])
+    facts = run.facts() if facts is None else facts
+    thread = digest(envelope["vendor_session_id"])
     starts = [fact for fact in facts if fact["kind"] == "reply" and fact["method"] == "turn/start"
               and fact["thread"] == thread]
     require(0 < envelope["turn"] <= len(starts), "turn correlation missing")
-    turn = starts[envelope["turn"] - 1]["turn"]
-    return [fact for fact in facts if fact.get("thread") == thread and fact.get("turn") == turn]
+    start = starts[envelope["turn"] - 1]
+    return [fact for fact in facts if fact.get("thread") == thread and fact.get("turn") == start["turn"]
+            and fact.get("trace") == start.get("trace")]
 
 
 def workspace_marker(path):
@@ -1589,17 +1747,11 @@ def usage(run):
     """Packet §7: whole keyless last samples vs envelopes; no cost estimation."""
     facts = run.facts(final=True)
     for envelope in run.envelopes:
-        thread = digest(envelope["vendor_session_id"])
-        terminals = [fact for fact in facts if fact["kind"] == "terminal" and fact["thread"] == thread]
-        # Match the ordinal retained turn in this stored thread, never sum a
-        # thread's cumulative total into a turn. Every start has a paired ID.
-        starts = [fact for fact in facts if fact["kind"] == "reply" and fact["method"] == "turn/start"
-                  and fact["thread"] == thread]
-        require(0 < envelope["turn"] <= len(starts), "usage turn correlation missing")
-        turn = starts[envelope["turn"] - 1]["turn"]
-        samples = [fact for fact in facts if fact["kind"] == "usage" and fact["thread"] == thread
-                   and fact["turn"] == turn]
-        run.check("usage correlated terminal", any(fact["turn"] == turn for fact in terminals))
+        # Match both the paired native turn and its submitting generation.
+        # Restored reports stay owned without becoming fresh model-call usage.
+        matched = turn_facts(run, envelope, facts)
+        samples = [fact for fact in matched if fact["kind"] == "usage"]
+        run.check("usage correlated terminal", any(fact["kind"] == "terminal" for fact in matched))
         run.check("cost unavailable", envelope["cost"] ==
                   {"usd": None, "scope": "turn", "provenance": "unavailable"})
         run.check("usage sample observed", bool(samples))
@@ -2090,6 +2242,201 @@ class SafetyTests(unittest.TestCase):
                 candidate["config"][key] = value
                 with self.subTest(key=key, value=value), self.assertRaises(Blocked):
                     effective_config(candidate, ["ok"])
+
+    def test_ownership_rejection_leaves_sanitized_fact(self):
+        for method, params in (
+            ("item/started", {"threadId": "t", "turnId": "foreign", "item": {"type": "agentMessage"}}),
+            ("thread/started", {"thread": {"id": "foreign"}}),
+            ("thread/tokenUsage/updated", {"threadId": "t"}),
+            ("turn/interrupt", {"threadId": "t", "turnId": "foreign"})):
+            with self.subTest(method=method):
+                wire = self.owned_wire()
+                wire.generation = digest("new-generation")
+                wire.outgoing({"id": 20, "method": "thread/resume", "params": {
+                    "threadId": "other", "model": MODEL, "sandbox": "read-only",
+                    "approvalPolicy": "never", "approvalsReviewer": "user", "excludeTurns": True}})
+                message = {"method": method, "params": params}
+                with self.assertRaises(Blocked):
+                    if method == "turn/interrupt":
+                        wire.outgoing({**message, "id": 21})
+                    else:
+                        wire.incoming(message)
+                fact = wire.facts[-1]
+                self.assertEqual(fact["kind"], "ownership_rejection")
+                self.assertEqual(fact["method"], method)
+                self.assertEqual(fact["generation"], wire.generation)
+                self.assertEqual(fact["thread_owned"], method != "thread/started")
+                self.assertFalse(fact["turn_known_earlier"])
+                self.assertEqual(fact["pending_establishing"], [{"method": "thread/resume",
+                                 "request": digest(20), "thread": digest("other")}])
+                self.assertEqual(fact["item_type"], "agentMessage" if method == "item/started" else None)
+                self.assertNotIn('"foreign"', json.dumps(fact))
+                self.assertTrue(secret_free(fact))
+
+    def test_rejection_never_logs_unknown_protocol_tokens(self):
+        wire = self.owned_wire()
+        message = {"method": "thread/sk-privatevalue123", "params": {
+            "threadId": "sk-privateidentity123", "item": {"type": "sk-privatetype123"}}}
+        with self.assertRaises(Blocked):
+            wire.incoming(message)
+        fact = wire.facts[-1]
+        self.assertEqual(fact["kind"], "ownership_rejection")
+        self.assertIsNone(fact["method"])
+        self.assertIsNone(fact["item_type"])
+        self.assertEqual(fact["method_hash"], digest(message["method"]))
+        self.assertTrue(secret_free(fact))
+
+    def resumed_wire(self, earlier):
+        wire = Wire("0.160.1")
+        wire.history = lambda: (earlier.threads, earlier.turns)
+        wire.generation = digest("second-generation")
+        wire.inventory = True
+        wire.outgoing({"id": 10, "method": "thread/resume", "params": {
+            "threadId": "t", "model": MODEL, "sandbox": "read-only", "approvalPolicy": "never",
+            "approvalsReviewer": "user", "excludeTurns": True}})
+        wire.incoming({"id": 10, "result": {"model": MODEL, "approvalPolicy": "never",
+                      "approvalsReviewer": "user", "thread": {"id": "t"}}})
+        return wire
+
+    def test_old_owned_turn_after_resume_passes_unknown_turn_still_blocks(self):
+        first = self.owned_wire()
+        wire = self.resumed_wire(first)
+        sample = {key: 1 for key in SCHEMAS["sample"]}
+        notification = {"method": "thread/tokenUsage/updated", "params": {
+            "threadId": "t", "turnId": "u", "tokenUsage": {"last": sample, "total": sample}}}
+        self.assertEqual(wire.incoming(notification)["turn"], digest("u"))
+        for message in (
+            {"method": "thread/started", "params": {"thread": {"id": "t"}}},
+            {"method": "turn/completed", "params": {"threadId": "t", "turn": {
+                "id": "u", "status": "completed"}}},
+            {"method": "item/started", "params": {"threadId": "t", "turnId": "u",
+                "item": {"type": "userMessage", "content": [{"text": "synthetic private text"}]}}},
+            {"method": "error", "params": {"threadId": "t", "turnId": "u"}}):
+            with self.subTest(method=message["method"]):
+                wire.incoming(message)
+        self.assertTrue(secret_free(wire.facts))
+        self.assertNotIn("synthetic private text", json.dumps(wire.facts))
+        notification["params"]["turnId"] = "never-established"
+        with self.assertRaisesRegex(Blocked, "unowned"):
+            wire.incoming(notification)
+        self.assertFalse(wire.facts[-1]["turn_known_earlier"])
+        self.assertEqual(wire.facts[-1]["thread"], digest("t"))
+        self.assertEqual(wire.facts[-1]["turn"], digest("never-established"))
+        self.assertTrue(secret_free(wire.facts[-1]))
+
+    def test_restored_samples_never_inflate_old_or_new_turn_usage(self):
+        run = self.run_object()
+        original, current = fake_envelope(), fake_envelope()
+        current["turn"] = 2
+        thread = digest(original["vendor_session_id"])
+        sample = {"inputTokens": 3, "cachedInputTokens": 1, "outputTokens": 2,
+                  "reasoningOutputTokens": 1, "totalTokens": 5}
+        original["vendor"]["total"] = sample.copy()
+        current["vendor"]["total"] = sample.copy()
+        facts = []
+        for generation, turn in (("old", "u"), ("new", "v")):
+            for fact in ({"kind": "reply", "method": "turn/start"}, {"kind": "terminal"},
+                         {"kind": "usage", "last": sample, "total": sample}):
+                facts.append({**fact, "thread": thread, "turn": digest(turn), "trace": digest(generation)})
+        restored = {"kind": "usage", "thread": thread, "turn": digest("u"),
+                    "last": sample, "total": sample, "trace": digest("new")}
+        facts.insert(3, restored)
+        run.envelopes = [original, current]
+        with mock.patch.object(run, "facts", return_value=facts):
+            self.assertNotIn(restored, turn_facts(run, original))
+            self.assertNotIn(restored, turn_facts(run, current))
+            usage(run)
+
+    def write_history(self, directory, hashed, wire=None):
+        wire = wire or self.owned_wire()
+        rows = [{"kind": "process", "pid": 3, "start_ticks": 10, "executable_hash": hashed},
+                {"kind": "reply", "method": "initialize", "version": "0.160.1", "request": digest(99)},
+                *wire.facts]
+        rows.insert(1, {"kind": "request", "method": "initialize", "request": digest(99)})
+        path = directory / "server-3-10.jsonl"
+        path.write_text("".join(json.dumps({"seq": index, **row}) + "\n"
+                               for index, row in enumerate(rows, 1)))
+        path.chmod(0o600)
+        return path
+
+    def test_ownership_history_uses_paired_replies_only(self):
+        hashed = "0" * 64
+        path = self.write_history(self.root, hashed)
+        threads, turns = ownership_history(self.root, digest((2, 20)), hashed, "0.160.1")
+        self.assertEqual(threads, {digest("t")})
+        self.assertEqual(turns, {(digest("t"), digest("u"))})
+        # Notifications and unpaired replies cannot manufacture ownership.
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        rows.append({"seq": len(rows) + 1, "kind": "terminal", "thread": digest("foreign"),
+                     "turn": digest("never-established")})
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        self.assertEqual(ownership_history(self.root, digest((2, 20)), hashed, "0.160.1"),
+                         (threads, turns))
+        rows = [row for row in rows if not (row.get("kind") == "request" and row.get("method") == "turn/start")]
+        path.write_text("".join(json.dumps({**row, "seq": i}) + "\n" for i, row in enumerate(rows, 1)))
+        with self.assertRaisesRegex(Blocked, "ownership history"):
+            ownership_history(self.root, digest((2, 20)), hashed, "0.160.1")
+
+    def test_deferred_rejection_records_prior_turn_and_pending_requests(self):
+        first = self.owned_wire()
+        wire = self.resumed_wire(first)
+        wire.outgoing({**self.start_message(), "id": 2})
+        wire.incoming({"method": "turn/started", "params": {"threadId": "t", "turn": {"id": "foreign"}}})
+        with self.assertRaisesRegex(Blocked, "unowned deferred"):
+            wire.incoming({"id": 2, "result": {"turn": {"id": "v"}}})
+        self.assertEqual(wire.facts[-1]["kind"], "ownership_rejection")
+        self.assertEqual(wire.facts[-1]["turn"], digest("foreign"))
+        self.assertEqual(wire.facts[-1]["pending_establishing"], [])
+        # A known turn under a different thread remains unowned, with its origin visible.
+        with self.assertRaisesRegex(Blocked, "unowned"):
+            wire.incoming({"method": "turn/started", "params": {"threadId": "other", "turn": {"id": "u"}}})
+        self.assertTrue(wire.facts[-1]["turn_known_earlier"])
+        self.assertFalse(wire.facts[-1]["turn_owned"])
+
+    def test_resume_mismatch_and_missing_turn_reply_leave_rejection_fact(self):
+        wire = self.owned_wire()
+        wire.outgoing({"id": 20, "method": "thread/resume", "params": {
+            "threadId": "t", "model": MODEL, "sandbox": "read-only", "approvalPolicy": "never",
+            "approvalsReviewer": "user", "excludeTurns": True}})
+        with self.assertRaisesRegex(Blocked, "resume identity mismatch"):
+            wire.incoming({"id": 20, "result": {"model": MODEL, "approvalPolicy": "never",
+                          "approvalsReviewer": "user", "thread": {"id": "foreign"}}})
+        self.assertEqual(wire.facts[-1]["kind"], "ownership_rejection")
+        self.assertEqual(wire.facts[-1]["reply_request"], digest(20))
+        wire.outgoing({**self.start_message(), "id": 21})
+        with self.assertRaisesRegex(Blocked, "turn/start id missing"):
+            wire.incoming({"id": 21, "result": {"turn": {}}})
+        self.assertEqual(wire.facts[-1]["kind"], "ownership_rejection")
+        self.assertEqual(wire.facts[-1]["thread"], digest("t"))
+        self.assertIsNone(wire.facts[-1]["turn"])
+
+    def test_ownership_history_refreshes_later_paired_replies(self):
+        hashed = "0" * 64
+        first = self.owned_wire()
+        path = self.write_history(self.root, hashed, first)
+        wire = Wire("0.160.1", history=lambda: ownership_history(
+            self.root, digest((2, 20)), hashed, "0.160.1"), generation=digest((2, 20)))
+        self.assertTrue(wire.owns((digest("t"), digest("u"))))
+        first.outgoing({**self.start_message(), "id": 2})
+        first.incoming({"id": 2, "result": {"turn": {"id": "v"}}})
+        self.write_history(self.root, hashed, first)
+        self.assertTrue(wire.owns((digest("t"), digest("v"))))
+        # A partial final record does not manufacture an identity.
+        with path.open("ab") as file:
+            file.write(b'{"kind":"reply"')
+        self.assertFalse(wire.owns((digest("t"), digest("unpaired"))))
+
+    def test_ownership_history_rejects_unsafe_or_wrong_binary_evidence(self):
+        path = self.write_history(self.root, "0" * 64)
+        with self.assertRaisesRegex(Blocked, "ownership history"):
+            ownership_history(self.root, digest((2, 20)), "1" * 64, "0.160.1")
+        path.chmod(0o644)
+        with self.assertRaisesRegex(Blocked, "ownership history"):
+            ownership_history(self.root, digest((2, 20)), "0" * 64, "0.160.1")
+        path.unlink()
+        path.symlink_to(self.root / "absent")
+        with self.assertRaisesRegex(Blocked, "ownership history"):
+            ownership_history(self.root, digest((2, 20)), "0" * 64, "0.160.1")
 
     def test_config_read_unset_otel(self):
         for value in (None, {}):
@@ -2937,7 +3284,7 @@ class SafetyTests(unittest.TestCase):
                             termination=False, foreign=False, reused=False, after_signal=False,
                             executable_mismatch=False, duplicate_config=False, config=None,
                             race=None, observed=None, startup=False, forward_pause=False,
-                            unsafe_item=False):
+                            unsafe_item=False, restored=None):
         """Entire stdio exchange using fake transports; no process or real /proc."""
         binary = self.root / "fake-codex"
         binary.write_text("synthetic executable")
@@ -2947,6 +3294,8 @@ class SafetyTests(unittest.TestCase):
         (self.root / "2/exe").symlink_to(binary)
         traces = self.root / "trace"
         traces.mkdir()
+        if restored is not None:
+            self.write_history(traces, shared.sha256(binary))
         control = {"codex": str(binary), "codex_hash": shared.sha256(binary),
                    "model": MODEL, "version": "0.160.1", "codex_home": str(self.root),
                    "mcp_names": [], "trace_dir": str(traces)}
@@ -2958,6 +3307,7 @@ class SafetyTests(unittest.TestCase):
             (self.root / "2/exe").symlink_to(other)
         child = mock.Mock(pid=2, returncode=None, stdout=native)
         sent = []
+        current_turn = "v" if restored is not None else "u"
 
         def write(raw):
             request = decode_line(raw)
@@ -2968,14 +3318,14 @@ class SafetyTests(unittest.TestCase):
                           "model_provider": "openai", "profile": None, "model_providers": {},
                           "otel": None, "mcp_servers": {"foreign": {"enabled": True}} if nonempty else {}}},
                       "model/list": {"data": [], "nextCursor": None}}.get(request["method"])
-            if request["method"] == "thread/start" and race:
+            if request["method"] in ("thread/start", "thread/resume") and race:
                 result = {"model": MODEL, "approvalPolicy": "never", "approvalsReviewer": "user",
                           "thread": {"id": "t"}}
             if request["method"] == "turn/start" and race:
                 notifications = (
-                    {"method": "turn/started", "params": {"threadId": "t", "turn": {"id": "u"}}},
+                    {"method": "turn/started", "params": {"threadId": "t", "turn": {"id": current_turn}}},
                     {"method": "turn/completed", "params": {"threadId": "t",
-                     "turn": {"id": "u", "status": "completed"}}})
+                     "turn": {"id": current_turn, "status": "completed"}}})
                 if unsafe_item:
                     notifications = ({"method": "item/started", "params": {
                         "threadId": "t", "turnId": "u", "item": {"type": "mcpToolCall"}}},)
@@ -2988,6 +3338,11 @@ class SafetyTests(unittest.TestCase):
             if result is not None:
                 raw_reply = json.dumps({"id": request["id"], "result": result}).encode() + b"\n"
                 native.feed_data(raw_reply)
+                if request["method"] == "thread/resume" and restored is not None:
+                    sample = {key: 1 for key in SCHEMAS["sample"]}
+                    native.feed_data(json.dumps({"method": "thread/tokenUsage/updated", "params": {
+                        "threadId": "t", "turnId": restored,
+                        "tokenUsage": {"last": sample, "total": sample}}}).encode() + b"\n")
                 if request["method"] == "config/read" and duplicate_config:
                     native.feed_data(raw_reply)
 
@@ -3008,7 +3363,7 @@ class SafetyTests(unittest.TestCase):
                         upstream.feed_eof()
                     else:
                         native.feed_data(json.dumps({"id": 20, "result": {"turn": {
-                            "id": "u" if race == "match" else "foreign"}}}).encode() + b"\n")
+                            "id": current_turn if race == "match" else "foreign"}}}).encode() + b"\n")
                 return
             if response["id"] == 1:
                 upstream.feed_data(b'{"method":"initialized"}\n'
@@ -3022,9 +3377,10 @@ class SafetyTests(unittest.TestCase):
                     if after_signal:
                         upstream.feed_data(json.dumps(self.start_message()).encode() + b"\n")
                 if race:
-                    upstream.feed_data(json.dumps({"id": 10, "method": "thread/start", "params": {
+                    upstream.feed_data(json.dumps({"id": 10,
+                        "method": "thread/resume" if restored is not None else "thread/start", "params": {
                         "model": MODEL, "approvalPolicy": "never", "approvalsReviewer": "user",
-                        "sandbox": "read-only"}}).encode() + b"\n")
+                        "sandbox": "read-only", "threadId": "t", "excludeTurns": True}}).encode() + b"\n")
                 else:
                     upstream.feed_eof()
             elif response["id"] == 10:
@@ -3121,6 +3477,32 @@ class SafetyTests(unittest.TestCase):
                     self.assertFalse(rows[-1]["complete"])
                     self.assertTrue(rows[-1]["child_reaped"])
                     self.assertEqual(rows[-1]["blocked_reason"], "deferred notification deadline")
+                finally:
+                    self.root = previous
+
+    def test_proxy_run_wide_history_and_unknown_rejection(self):
+        for restored in ("u", "never-established"):
+            with self.subTest(restored=restored), tempfile.TemporaryDirectory() as root:
+                previous, self.root = self.root, Path(root)
+                try:
+                    result, child, signals, sent, traces = asyncio.run(
+                        self.proxy_fixture(race="match", restored=restored))
+                    self.assertEqual(result, 0 if restored == "u" else 1)
+                    path = traces / "server-2-20.jsonl"
+                    rows = [decode_line(line) for line in path.read_bytes().splitlines(keepends=True)]
+                    self.assertTrue(rows[-1]["child_reaped"])
+                    self.assertEqual(rows[-1]["complete"], restored == "u")
+                    if restored == "u":
+                        self.assertTrue(any(row["kind"] == "usage" and row["turn"] == digest("u") for row in rows))
+                        self.assertTrue(any(row["kind"] == "reply" and row.get("method") == "turn/start"
+                                            and row["turn"] == digest("v") for row in rows))
+                    else:
+                        rejected = next(row for row in rows if row["kind"] == "ownership_rejection")
+                        self.assertEqual(rejected["method"], "thread/tokenUsage/updated")
+                        self.assertEqual(rejected["generation"], digest((2, 20)))
+                        self.assertTrue(rejected["thread_owned"])
+                        self.assertFalse(rejected["turn_known_earlier"])
+                    self.assertTrue(secret_free(rows))
                 finally:
                     self.root = previous
 
