@@ -257,7 +257,7 @@ pub(super) fn prompts(requests: &[Value]) -> Vec<&Value> {
         .collect()
 }
 #[test]
-fn oc05_c2_reopen_cancels_owned_leftover_once_without_late_revision() {
+fn oc05_c2_reopen_cancels_near_limit_leftover_with_foreign_echo_without_late_revision() {
     run(async {
         let rig = Rig::new(&json!({}));
         let cwd = rig.root().to_str().unwrap().to_owned();
@@ -281,12 +281,17 @@ fn oc05_c2_reopen_cancels_owned_leftover_once_without_late_revision() {
             .unwrap()
             .to_owned();
         let mut next = fixture(&cwd, success());
+        // §7.2 permits one unresolved VIA input; tolerate one foreign input too.
+        // Both echoed JSON strings approach §9's admission limit, including cwd.
+        let text = "x".repeat(1_048_576 - 8_192 - cwd.len() - 4);
         replace(
             &mut next,
             route(
                 "GET",
                 &format!("/api/session/{SES}/inbox"),
-                &json!([{"status":200,"json":{"data":[{"id":old},{"id":"msg_foreign"}]}}]),
+                &json!([{"status":200,"json":{"data":[
+                    {"id":old,"text":text},{"id":"msg_foreign","text":text}
+                ]}}]),
             ),
         );
         replace(

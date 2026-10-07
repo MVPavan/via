@@ -950,7 +950,8 @@ keep the lane-order outcome below.
 | C2 observations | 1,024 items / 4 MiB per session, 10 s stall | lane overflow |
 | Prompt admission (`check_turn`, `plan`) | `json_len(prompt) + json_len(cwd) ≤ 1,048,576 − 8,192` | `invalid_params` naming `prompt` |
 | Instruction entry | 262,144 encoded value bytes (§5) | `invalid_params` naming `instructions` |
-| HTTP | headers 64 KiB; response bodies 1 MiB (`/api/model` 4 MiB); JSON depth 64, 65,536 nodes | the turn `protocol`, and the generation drains (§8) |
+| HTTP | headers 64 KiB; response bodies 1 MiB (`/api/model` 4 MiB; inbox listing below); JSON depth 64, 65,536 nodes, including the larger bodies | the turn `protocol`, and the generation drains (§8) |
+| Inbox listing (`INBOX_BODY_BYTES`, `GET /api/session/{id}/inbox`) | 2,097,152 bytes: `2 × ((1,048,576 − 8,192) + 8,192)` | the turn `protocol`, and the generation drains (§8); no successor prompt on that generation |
 | Final-text candidates | 4 MiB per turn | turn `overflow` |
 | Retained per server | session states 1,024; tombstoned turns 4,096; child sessions 4,096; pending interactive requests 64; requests without a complete response 64. Session states count only sessions VIA opened; descendants count only as child mappings, and sessions of neither kind retain no state. | server generation `overflow` |
 | Correlation keys (aggregate) | caller input, assistant message, tool call and interactive request IDs of every live and tombstoned turn, and child-session IDs, together: 65,536 entries and 8 MiB of retained ID bytes per server | server generation `overflow` |
@@ -958,6 +959,22 @@ keep the lane-order outcome below.
 
 The 64 requests without a complete response are counted from their first byte;
 pool waiters count only toward the session execution rule (§7.2).
+
+**Inbox listing (owner raise-limit decision, via-4sw.3.5).** §7.2 admits
+at most one unanswered VIA input per session: a successor cannot be sent
+until its predecessor has ended or is proven not accepted, and a new
+generation cancels persisted VIA leftovers before dispatch. Allow one
+additional foreign input of the same encoded size (vendor-originated or
+another writer, L3), for two prompt echoes in total. Each gets the prompt
+admission bound plus 8 KiB for IDs, session fields, item metadata and JSON
+framing; the top-level framing shares that allowance. This is a bounded
+tolerance, not a vendor maximum: foreign writers and vendor extra fields
+have no such cap, and a larger listing still takes the HTTP-limit outcome
+above. The byte cap does not impose a two-item count cap; many smaller
+items fit subject to the unchanged JSON depth and node limits. Only this
+listing gets the new bound; prompt responses, stops, setup and other
+ordinary responses remain at 1 MiB, and `/api/model` keeps its existing
+4 MiB bound. Echoed text is discarded after decoding the listing IDs.
 
 **Prompt admission (security).** The prompt is echoed whole in the 200
 response and in `session.inbox.enqueued` (E47); OpenCode has no cap (3 MiB
