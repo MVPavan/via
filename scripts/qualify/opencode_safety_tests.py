@@ -27,6 +27,12 @@ from unittest import mock
 
 import opencode_safety as safety
 
+# Sanitized attempt 7/8 observations; FAKE test bytes never claim these hashes.
+OBSERVED_RUNTIME_OBJECTS = (
+    (6314816, 'be65f2428361c08fc717a20b67a81990e2864aa2067874d625aa590dee71fcce', 166116762),
+    (514960, 'e58979069d4f71d2e36f7dc130d6dbc671e63666fe3943fd2ed481519cbf374c', 187182346),
+    (12846400, '542c8ca18ed3ef2a555cd5d0fc6cc19dcfd1da323eaedded673326962dba766a', 172453553),
+)
 
 def fake_stat(pid=71, ticks=123, state="S"):
     # Linux stat fields 3..22; starttime is index19 after comm.
@@ -239,6 +245,231 @@ class SafetyTests(unittest.TestCase):
             artifact.chmod(mode)
             self.assertBlocked(inventory.check, 'new or changed binary appeared in private roots')
             artifact.unlink()
+
+    def git_template_fixture(self):
+        """FAKE Git templates and a vendor snapshot; no vendor runs."""
+        evidence=self.root/'evidence'; evidence.mkdir()
+        snapshot=evidence/'vendor'/'data'/'opencode'/'snapshot'
+        snapshot.mkdir(parents=True)
+        templates={f'hook-{i}.sample':b'#!/bin/sh\n# FAKE inert '+str(i).encode()
+                   for i in range(14)}
+        records=[]
+        factory=getattr(safety,'GitTemplateCopies',None)
+        policy=factory(evidence,templates,records.append) if factory else None
+        if policy: policy.register_snapshot(snapshot)
+        inventory=safety.Inventory([evidence],**({'git_templates':policy} if policy else {}))
+        git=snapshot/'project'/'tree'; (git/'hooks').mkdir(parents=True)
+        (git/'objects').mkdir(); (git/'refs').mkdir()
+        (git/'HEAD').write_text('ref: refs/heads/main\n'); (git/'config').write_text('[core]\n bare = true\n')
+        return evidence,snapshot,git,templates,records,inventory,policy
+
+    def write_fake_hook(self,path,raw):
+        path.write_bytes(raw); path.chmod(0o755)
+
+    def test_fourteen_inert_git_template_copies_are_recorded_not_passes(self):
+        _evidence,_snapshot,git,templates,records,inventory,_policy=self.git_template_fixture()
+        for name,raw in templates.items(): self.write_fake_hook(git/'hooks'/name,raw)
+        self.assertTrue(inventory.check())
+        self.assertEqual(len(records),14)
+        self.assertTrue(all(row['label']=='inert git template copy' and 'result' not in row
+                            for row in records))
+        self.assertEqual({row['name'] for row in records},set(templates))
+        self.assertTrue(inventory.check()); self.assertEqual(len(records),14)
+
+    def test_git_template_rejections(self):
+        evidence,_snapshot,git,templates,_records,inventory,policy=self.git_template_fixture()
+        name,raw=next(iter(templates.items())); hook=git/'hooks'/name
+        for bad_name,bad_raw in ((name[:-7],raw),(name,raw+b'!'),('absent.sample',raw)):
+            bad=git/'hooks'/bad_name; self.write_fake_hook(bad,bad_raw)
+            self.assertBlocked(inventory.check,'new or changed binary appeared in private roots')
+            bad.unlink()
+        for parent in (evidence/'elsewhere'/'hooks',self.root/'outside'/'hooks',
+                       evidence/'vendor'/'not-snapshot'/'hooks'):
+            parent.mkdir(parents=True); target=parent/name; self.write_fake_hook(target,raw)
+            if policy: self.assertFalse(policy.accept(target,target.lstat()))
+            if target.is_relative_to(evidence):
+                self.assertBlocked(inventory.check,'new or changed binary appeared in private roots')
+            target.unlink()
+        source=evidence/'source'; source.write_bytes(raw); source.chmod(0o755)
+        hook.symlink_to(source)
+        self.assertBlocked(inventory.check,'inventory contains unreviewed symbolic link')
+        hook.unlink(); os.link(source,hook)
+        if policy: self.assertFalse(policy.accept(hook,hook.lstat()))
+        self.assertBlocked(inventory.check,'new or changed binary appeared in private roots')
+
+    def test_git_template_requires_owned_git_directory_and_uid(self):
+        _evidence,_snapshot,git,templates,_records,inventory,policy=self.git_template_fixture()
+        name,raw=next(iter(templates.items())); hook=git/'hooks'/name
+        self.write_fake_hook(hook,raw); (git/'HEAD').unlink()
+        self.assertBlocked(inventory.check,'new or changed binary appeared in private roots')
+        (git/'HEAD').write_text('ref: refs/heads/main\n')
+        if policy:
+            row=hook.lstat(); values=list(row); values[4]=os.getuid()+1
+            self.assertFalse(policy.accept(hook,os.stat_result(values)))
+
+    def test_git_template_preflight_resolves_and_hashes_system_defaults(self):
+        factory=getattr(safety,'system_git_templates',None)
+        self.assertIsNotNone(factory)
+        templates,proof=factory(self.root/'preflight')
+        self.assertTrue(templates)
+        self.assertTrue(proof['default_copy_verified'])
+        self.assertEqual(set(proof['files']),set(templates))
+        for name,raw in templates.items():
+            self.assertEqual(proof['files'][name]['sha256'],hashlib.sha256(raw).hexdigest())
+        with mock.patch.object(safety.shutil,'which',return_value=None):
+            self.assertBlocked(lambda:factory(self.root/'unresolved'),
+                               'system Git template directory unresolvable')
+
+    def embedded_fixture(self):
+        """FAKE pinned executable with one embedded ELF range; no vendor executes."""
+        library=b'\x7fELFfixture-embedded-runtime'
+        offset=37
+        folder=self.root/'pinned'; folder.mkdir(mode=0o700)
+        binary=folder/'opencode'; binary.write_bytes(b'x'*offset+library+b'tail')
+        binary.chmod(0o500); folder.chmod(0o500)
+        roots=[self.root/'vendor'/role/'tmp' for role in ('probe','serve')]
+        for root in roots: root.mkdir(parents=True,mode=0o700)
+        patches=mock.patch.object(safety,'PINNED_SHA256',hashlib.sha256(binary.read_bytes()).hexdigest())
+        patches.start(); self.addCleanup(patches.stop)
+        rows=[]
+        factory=getattr(safety,'EmbeddedRuntime',None)
+        policy=None if factory is None else factory(binary,self.root,rows.append)
+        if policy is not None:
+            for role,root in zip(('probe','serve'),roots): policy.register_tmpdir(root,role)
+        return library,binary,roots,policy,rows
+
+    def runtime_inventory(self,roots,policy):
+        if policy is None: return safety.Inventory(roots)
+        return safety.Inventory(roots,embedded_runtime=policy)
+
+    def prove_additional_embedded_object(self,observed,suffix):
+        size,observed_hash,offset=observed
+        self.assertEqual(len(observed_hash),64)
+        _library,binary,roots,policy,rows=self.embedded_fixture()
+        # Sparse FAKE executable exercises the observed bounds and offsets offline.
+        payload=b'\x7fELF'+b'q'*(size-4)
+        binary.chmod(0o700)
+        with binary.open('r+b') as file:
+            file.seek(offset); file.write(payload)
+        binary.chmod(0o500)
+        with mock.patch.object(safety,'PINNED_SHA256',safety.sha256(binary)):
+            inventory=self.runtime_inventory([self.root/'vendor'],policy)
+            target=roots[1]/f'.bun-{os.getuid()}-0123456789abcdef.{suffix}'
+            target.write_bytes(payload)
+            self.assertTrue(inventory.check())
+        self.assertEqual(rows[0]['offset'],offset)
+        self.assertEqual(rows[0]['size'],size)
+        self.assertEqual(rows[0]['sha256'],hashlib.sha256(payload).hexdigest())
+        self.assertEqual(rows[0]['name_class'],'Bun extraction')
+        self.assertNotIn('result',rows[0])
+
+    def test_second_observed_runtime_object_is_accepted_by_embedded_bytes(self):
+        self.prove_additional_embedded_object(OBSERVED_RUNTIME_OBJECTS[1],'node')
+
+    def test_first_observed_runtime_object_remains_accepted(self):
+        self.prove_additional_embedded_object(OBSERVED_RUNTIME_OBJECTS[0],'so')
+
+    def test_third_observed_runtime_object_is_accepted_by_embedded_bytes(self):
+        self.prove_additional_embedded_object(OBSERVED_RUNTIME_OBJECTS[2],'so')
+
+    def test_embedded_runtime_wrong_name_uid_and_nested_directory_block(self):
+        library,_binary,roots,policy,_rows=self.embedded_fixture()
+        inventory=self.runtime_inventory([self.root/'vendor'],policy)
+        names=('library.so',f'.bun-{os.getuid()+1}-0123456789abcdef.so',
+               f'.bun-{os.getuid()}-nothex0123456789.so',f'.bun-{os.getuid()}-1234.node')
+        for name in names:
+            with self.subTest(name=name):
+                target=roots[0]/name; target.write_bytes(library)
+                self.assertBlocked(inventory.check,'new or changed binary appeared in private roots')
+                target.unlink()
+        nested=roots[0]/'nested'; nested.mkdir(mode=0o700)
+        (nested/f'.bun-{os.getuid()}-0123456789abcdef.so').write_bytes(library)
+        self.assertBlocked(inventory.check,'new or changed binary appeared in private roots')
+
+    def test_pinned_embedded_runtime_is_recorded_not_a_gate(self):
+        library,_binary,roots,policy,rows=self.embedded_fixture()
+        inventory=self.runtime_inventory([self.root/'vendor'],policy)
+        for root in roots: (root/f'.bun-{os.getuid()}-0123456789abcdef.so').write_bytes(library)
+        self.assertTrue(inventory.check())
+        self.assertEqual(len(rows),2)
+        for row in rows:
+            self.assertEqual(row['label'],'embedded runtime extraction')
+            self.assertEqual(row['path_class'],'vendor-private')
+            self.assertEqual(row['size'],len(library))
+            self.assertEqual(row['offset'],37)
+            self.assertEqual(row['sha256'],hashlib.sha256(library).hexdigest())
+            self.assertNotIn('result',row)
+        self.assertTrue(inventory.check())
+        self.assertEqual(len(rows),2)
+
+    def test_embedded_runtime_outside_vendor_tmpdir_still_blocks(self):
+        library,_binary,roots,policy,_rows=self.embedded_fixture()
+        inventory=self.runtime_inventory([self.root/'vendor'],policy)
+        name=f'.bun-{os.getuid()}-0123456789abcdef.so'
+        (roots[0]/name).write_bytes(library)
+        self.assertTrue(inventory.check())
+        (self.root/'vendor'/name).write_bytes(library)
+        self.assertBlocked(inventory.check,'new or changed binary appeared in private roots')
+
+    def test_embedded_runtime_bytes_not_in_binary_block(self):
+        library,_binary,roots,policy,_rows=self.embedded_fixture()
+        inventory=self.runtime_inventory([self.root/'vendor'],policy)
+        target=roots[0]/f'.bun-{os.getuid()}-0123456789abcdef.so'
+        for content in (library+b'extra',library[:-1]+b'x'):
+            target.write_bytes(content)
+            self.assertBlocked(inventory.check,'new or changed binary appeared in private roots')
+
+    def test_embedded_runtime_symlink_hardlink_and_wrong_uid_block(self):
+        library,_binary,roots,policy,_rows=self.embedded_fixture()
+        inventory=self.runtime_inventory([self.root/'vendor'],policy)
+        outside=self.root/'outside.so'; outside.write_bytes(library)
+        target=roots[0]/f'.bun-{os.getuid()}-0123456789abcdef.so'; target.symlink_to(outside)
+        self.assertBlocked(inventory.check,'inventory contains unreviewed symbolic link')
+        target.unlink(); os.link(outside,target)
+        self.assertBlocked(inventory.check,'new or changed binary appeared in private roots')
+        target.unlink(); target.write_bytes(library)
+        with mock.patch.object(safety.os,'getuid',return_value=os.getuid()+1):
+            self.assertBlocked(inventory.check,'new or changed binary appeared in private roots')
+
+    def test_embedded_runtime_pin_is_reverified_per_run_and_cache_cannot_hide_changes(self):
+        library,binary,roots,policy,_rows=self.embedded_fixture()
+        inventory=self.runtime_inventory([self.root/'vendor'],policy)
+        (roots[0]/f'.bun-{os.getuid()}-0123456789abcdef.so').write_bytes(library)
+        with mock.patch.object(safety,'verify_binary',wraps=safety.verify_binary) as verified:
+            self.assertTrue(inventory.check())
+            self.assertTrue(inventory.check())
+            other=safety.EmbeddedRuntime(binary,self.root,lambda _row:None)
+            for role,root in zip(('probe','serve'),roots):other.register_tmpdir(root,role)
+            self.assertTrue(self.runtime_inventory([self.root/'vendor'],other).check())
+            self.assertEqual(verified.call_count,2)
+        binary.chmod(0o700); binary.write_bytes(b'changed pin'); binary.chmod(0o500)
+        self.assertBlocked(inventory.check,'pinned binary changed during verification')
+        fresh=safety.EmbeddedRuntime(binary,self.root,lambda _row:None)
+        for role,root in zip(('probe','serve'),roots):fresh.register_tmpdir(root,role)
+        # Fresh runs cannot reuse the previous instance's verified hash or offsets.
+        fresh_inventory=safety.Inventory([self.root/'vendor'])
+        fresh_inventory.embedded_runtime=fresh
+        self.assertBlocked(fresh_inventory.check,'pinned binary hash mismatch')
+
+    def test_embedded_search_finds_seed_across_window_boundary(self):
+        library,_binary,roots,policy,rows=self.embedded_fixture()
+        inventory=self.runtime_inventory([self.root/'vendor'],policy)
+        (roots[0]/f'.bun-{os.getuid()}-0123456789abcdef.so').write_bytes(library)
+        with mock.patch.object(safety,'EMBEDDED_SEARCH_WINDOW',16):
+            self.assertTrue(inventory.check())
+        self.assertEqual(rows[0]['offset'],37)
+
+    def test_embedded_search_deadline_byte_and_candidate_bounds_block(self):
+        library,_binary,roots,policy,_rows=self.embedded_fixture()
+        inventory=self.runtime_inventory([self.root/'vendor'],policy)
+        (roots[0]/f'.bun-{os.getuid()}-0123456789abcdef.so').write_bytes(library)
+        policy.deadline=lambda:time.monotonic()-1
+        self.assertBlocked(inventory.check,'embedded runtime search deadline')
+        policy.deadline=None
+        with mock.patch.object(safety,'EMBEDDED_SEARCH_BYTES',len(library)+1):
+            self.assertBlocked(inventory.check,'embedded runtime search byte bound')
+        with mock.patch.object(safety,'EMBEDDED_SEARCH_CANDIDATES',0):
+            self.assertBlocked(inventory.check,'embedded runtime search candidate bound')
 
     def test_namespace_chain_is_0700_and_digest_exact(self):
         root, env = safety.create_namespace(self.root / "state")

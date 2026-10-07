@@ -261,15 +261,15 @@ def private_recovery_root():
 
 
 def system_tools_preflight():
-    """Require known system rg/python3 before acquisition or daemon preparation (§13)."""
-    for name in ("rg", "python3"):
+    """Require known system git/rg/python3 before acquisition or daemon preparation (§13)."""
+    for name in ("git", "rg", "python3"):
         candidate = shutil.which(name, path=os.pathsep.join(safety.SYSTEM_PATHS))
         if candidate is None or Path(candidate).resolve().parent not in \
                 {Path(part).resolve() for part in safety.SYSTEM_PATHS}:
             raise safety.Blocked("qualification requires system " + name)
     if not Path("/usr/bin/python3").is_file() or not os.access("/usr/bin/python3", os.X_OK):
         raise safety.Blocked("qualification requires the system fixture python3")
-    return {"rg": True, "python3": True, "system_directories_only": True}
+    return {"git": True, "rg": True, "python3": True, "system_directories_only": True}
 
 
 def protected_write(vault, path, value, secret_forms=()):
@@ -402,12 +402,14 @@ def main(argv=None):
             fake_gates = verify_fake_gates(args.fake_gate_manifest, args.via_release,
                                           args.via_failpoints)
             info["system_tools"] = system_tools_preflight()
+            template_probe=ownership.register(args.evidence/'git-template-preflight','helper')
+            templates,info['git_templates']=safety.system_git_templates(template_probe)
             pinned = acquire(args.evidence, ownership) if args.acquire else args.opencode.resolve()
             safety.verify_binary(pinned)
             from opencode_driver import Driver
             driver = Driver(via_release=args.via_release, via_failpoints=args.via_failpoints,
                             opencode=pinned, evidence=args.evidence, signals=signals,
-                            public_free=True, initialize=False, ownership=ownership)
+                            public_free=True, initialize=False, ownership=ownership,git_templates=templates)
             vault = driver.vault
             driver.fake_gate_manifest = fake_gates
             # A fresh evidence path must still find the previous stopped-daemon

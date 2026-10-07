@@ -45,6 +45,12 @@ NPM_SHA512 = ("DlV1qgEDDnVqpTWMPqv7tCHCcXodzZBFaMcxjsiYdY6E5gHH2Q68JfasVksyQ1n"
               "u6m1887WQKGhOsepE+oKyYw==")
 # Qualification plan acquisition and packet §9 observation bounds.
 ARCHIVE_BYTES = 256 * 1024 * 1024
+# Packet §13 embedded-runtime search: bounded file, windows, candidates and time.
+EMBEDDED_SEARCH_BYTES = ARCHIVE_BYTES
+EMBEDDED_SEARCH_WINDOW = 1024 * 1024
+EMBEDDED_SEARCH_SEED = 256
+EMBEDDED_SEARCH_CANDIDATES = 1024
+EMBEDDED_SEARCH_SECONDS = 30
 PROC_BYTES = 256 * 1024
 HTTP_BYTES = 16 * 1024 * 1024
 # Qualification §13 OC01: bound route normalization work and ambiguity.
@@ -926,12 +932,263 @@ def credential_metadata_only(name):
             or any(extension in lowered for extension in (".sqlite", ".db-wal", ".db-shm")))
 
 
+class EmbeddedRuntime:
+    """§13: Bun extraction bytes must occur in this run's verified pinned executable."""
+
+    def __init__(self, pinned, evidence, record, *, deadline=None):
+        self.pinned=Path(pinned)
+        self.evidence=Path(os.path.abspath(evidence))
+        self.record=record
+        self.tmpdirs={}
+        self.deadline=deadline
+        self._pin_identity=None
+        self._offsets={}
+        self._recorded=set()
+
+    def register_tmpdir(self, path, role):
+        """Register the exact private serve/probe TMPDIR in the owned launch recipe (§13)."""
+        path=Path(os.path.abspath(path))
+        if role not in {'probe','serve'} or not path.is_relative_to(self.evidence):
+            raise Blocked('embedded runtime TMPDIR provenance invalid')
+        row=path.lstat()
+        if not stat.S_ISDIR(row.st_mode) or row.st_uid!=os.getuid() \
+                or stat.S_IMODE(row.st_mode)!=0o700:
+            raise Blocked('embedded runtime TMPDIR provenance invalid')
+        self.tmpdirs[path]=role
+
+    @staticmethod
+    def _identity(row):
+        return (row.st_dev,row.st_ino,row.st_size,row.st_mode,row.st_uid,
+                row.st_nlink,row.st_mtime_ns,row.st_ctime_ns)
+
+    def _verify_pin(self):
+        if self._pin_identity is None:
+            before=self.pinned.lstat()
+            verify_binary(self.pinned,expected_sha=PINNED_SHA256)
+            if self._identity(self.pinned.lstat())!=self._identity(before):
+                raise Blocked('pinned binary changed during verification')
+            if before.st_size>EMBEDDED_SEARCH_BYTES:
+                raise Blocked('embedded runtime search byte bound')
+            self._pin_identity=self._identity(before)
+        if self._identity(self.pinned.lstat())!=self._pin_identity:
+            raise Blocked('pinned binary changed during verification')
+
+    def _find_bytes(self,raw,digest):
+        """§13: search bounded windows; cached offsets stay in this instance/run only."""
+        end=time.monotonic()+EMBEDDED_SEARCH_SECONDS
+        if self.deadline is not None: end=min(end,self.deadline())
+        def guard():
+            if time.monotonic()>=end: raise Blocked('embedded runtime search deadline')
+        guard(); self._verify_pin(); guard()
+        fd=os.open(self.pinned,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+        key=(len(raw),digest)
+        try:
+            if self._identity(os.fstat(fd))!=self._pin_identity:
+                raise Blocked('pinned binary changed during verification')
+            size=os.fstat(fd).st_size
+            offset=self._offsets.get(key)
+            if offset is not None:
+                matches=os.pread(fd,len(raw),offset)==raw
+                guard()
+                if not matches: raise Blocked('pinned binary changed during verification')
+                return offset
+            seed=raw[:EMBEDDED_SEARCH_SEED]
+            position=0; candidates=0
+            while position<size:
+                guard()
+                window=os.pread(fd,min(EMBEDDED_SEARCH_WINDOW+len(seed)-1,size-position),position)
+                if not window: raise Blocked('embedded runtime search file truncated')
+                start=0
+                while True:
+                    guard()
+                    local=window.find(seed,start)
+                    if local<0 or local>=EMBEDDED_SEARCH_WINDOW: break
+                    candidates+=1
+                    if candidates>EMBEDDED_SEARCH_CANDIDATES:
+                        raise Blocked('embedded runtime search candidate bound')
+                    offset=position+local
+                    if offset+len(raw)<=size and os.pread(fd,len(raw),offset)==raw:
+                        guard(); self._offsets[key]=offset
+                        return offset
+                    start=local+1
+                position+=EMBEDDED_SEARCH_WINDOW
+            guard()
+            return None
+        finally:
+            os.close(fd)
+            self._verify_pin()
+
+    def accept(self, path, listed):
+        """Match stable uid-owned, single-link bytes; emit provenance, never a gate (§13)."""
+        path=Path(os.path.abspath(path))
+        root=path.parent
+        name=re.fullmatch(r'\.bun-'+str(os.getuid())+r'-[0-9a-fA-F]{16}\.(?:so|node)',path.name)
+        if root not in self.tmpdirs or name is None \
+                or not stat.S_ISREG(listed.st_mode) or listed.st_uid!=os.getuid() \
+                or listed.st_nlink!=1 or not 0<listed.st_size<=EMBEDDED_SEARCH_BYTES:
+            return False
+        # Reject a changed/symlinked directory chain before opening the candidate.
+        parent=path.parent
+        while True:
+            row=parent.lstat()
+            if not stat.S_ISDIR(row.st_mode) or row.st_uid!=os.getuid():
+                return False
+            if parent==root and stat.S_IMODE(row.st_mode)!=0o700: return False
+            if parent==self.evidence: break
+            parent=parent.parent
+        fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+        with os.fdopen(fd,'rb') as file:
+            before=os.fstat(file.fileno())
+            if self._identity(before)!=self._identity(listed):
+                raise Blocked('embedded runtime file changed during verification')
+            raw=file.read(listed.st_size+1)
+            after=os.fstat(file.fileno())
+        if self._identity(after)!=self._identity(before) \
+                or self._identity(path.lstat())!=self._identity(before):
+            raise Blocked('embedded runtime file changed during verification')
+        if len(raw)!=listed.st_size: return False
+        digest=hashlib.sha256(raw).hexdigest()
+        offset=self._find_bytes(raw,digest)
+        if offset is None: return False
+        key=(path,self._identity(before))
+        if key not in self._recorded:
+            self.record({'label':'embedded runtime extraction',
+                'path':path.relative_to(self.evidence).as_posix(),'path_class':'vendor-private',
+                'name_class':'Bun extraction','tmpdir_role':self.tmpdirs[root],
+                'size':len(raw),'sha256':digest,'offset':offset,'binary_sha256':PINNED_SHA256})
+            self._recorded.add(key)
+        return True
+
+
+# §13 qualification inventory: bound the system template manifest and probe.
+GIT_TEMPLATE_BYTES=1024*1024
+GIT_TEMPLATE_FILES=128
+GIT_TEMPLATE_SECONDS=10
+
+
+def system_git_templates(root):
+    """Resolve verified system Git defaults and prove their copied bytes (§13)."""
+    created=False
+    try:
+        git=shutil.which('git',path=os.pathsep.join(SYSTEM_PATHS))
+        if git is None: raise ValueError('missing system git')
+        git=Path(git).resolve()
+        if git.parent not in {Path(part).resolve() for part in SYSTEM_PATHS}:
+            raise ValueError('non-system git')
+        git_hash=sha256(git)
+        root=Path(root)
+        root.mkdir(mode=0o700,exist_ok=False); created=True
+        env={key:str(private_directory(root/part)) for key,part in PRIVATE_PARTS.items()}
+        env.update(PATH='/usr/bin:/bin',LANG='C.UTF-8',GIT_CONFIG_NOSYSTEM='1',
+                   GIT_CONFIG_GLOBAL='/dev/null')
+        def command(args):
+            result=subprocess.run([str(git),*args],env=env,cwd=root,
+                stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,
+                timeout=GIT_TEMPLATE_SECONDS,check=True)
+            if len(result.stdout)>GIT_TEMPLATE_BYTES: raise ValueError('git output bound')
+            return result.stdout
+        # Newer Git exposes its default directly. Older relocatable builds carry
+        # share/git-core/templates, relative to the prefix of their builtin exec path.
+        try: template=Path(command(['var','GIT_TEMPLATE_DIR']).decode().strip())
+        except subprocess.CalledProcessError:
+            exec_path=Path(command(['--exec-path']).decode().strip())
+            if not exec_path.is_absolute() or exec_path.name!='git-core' \
+                    or b'\x00share/git-core/templates\x00' not in git.read_bytes():
+                raise ValueError('unknown compiled template path')
+            template=exec_path.parent.parent/'share/git-core/templates'
+        if not template.is_absolute(): raise ValueError('relative template path')
+        template=template.resolve(strict=True)
+        if template.is_relative_to(root): raise ValueError('non-system templates')
+        hooks=template/'hooks'
+        rows=sorted(hooks.iterdir())
+        if not rows or len(rows)>GIT_TEMPLATE_FILES: raise ValueError('template count bound')
+        templates={}; manifest={}
+        for path in rows:
+            row=path.lstat()
+            if not path.name.endswith('.sample') or not stat.S_ISREG(row.st_mode) \
+                    or row.st_size>GIT_TEMPLATE_BYTES: raise ValueError('unsafe system template')
+            raw=path.read_bytes()
+            if EmbeddedRuntime._identity(path.lstat())!=EmbeddedRuntime._identity(row) \
+                    or len(raw)!=row.st_size: raise ValueError('template changed')
+            templates[path.name]=raw
+            manifest[path.name]={'size':len(raw),'sha256':hashlib.sha256(raw).hexdigest()}
+        probe=root/'default-repository'
+        command(['init','--bare',str(probe)])
+        copied=probe/'hooks'
+        if {p.name for p in copied.iterdir()}!=set(templates) \
+                or any((copied/name).read_bytes()!=raw for name,raw in templates.items()) \
+                or sha256(git)!=git_hash:
+            raise ValueError('default template copy differs')
+        return templates,{'git':str(git),'git_sha256':git_hash,'template_dir':str(template),
+                          'files':manifest,'default_copy_verified':True}
+    except (OSError,ValueError,subprocess.SubprocessError) as error:
+        raise Blocked('system Git template directory unresolvable') from error
+    finally:
+        # All synchronous Git children have been waited/reaped before deletion.
+        if created and root.exists():
+            shutil.rmtree(root)
+
+
+class GitTemplateCopies:
+    """§13: inert default hook copies only in owned OpenCode snapshot Git dirs."""
+
+    def __init__(self,evidence,templates,record):
+        self.evidence=Path(os.path.abspath(evidence))
+        self.templates=dict(templates); self.record=record
+        self.snapshots=set(); self.recorded=set()
+
+    def register_snapshot(self,path):
+        path=Path(os.path.abspath(path))
+        if not path.is_relative_to(self.evidence):
+            raise Blocked('snapshot template provenance invalid')
+        self.snapshots.add(path)
+
+    def accept(self,path,listed):
+        path=Path(os.path.abspath(path)); git=path.parent.parent
+        roots=sorted(self.snapshots,key=str)
+        root=next((root for root in roots if git.is_relative_to(root)),None)
+        expected=self.templates.get(path.name)
+        if root is None or path.parent.name!='hooks' or not path.name.endswith('.sample') \
+                or expected is None or not stat.S_ISREG(listed.st_mode) \
+                or listed.st_uid!=os.getuid() or listed.st_nlink!=1 \
+                or listed.st_size!=len(expected): return False
+        parent=path.parent
+        while True:
+            row=parent.lstat()
+            if not stat.S_ISDIR(row.st_mode) or row.st_uid!=os.getuid(): return False
+            if parent==self.evidence: break
+            parent=parent.parent
+        for name,is_directory in (('HEAD',False),('config',False),('objects',True),('refs',True)):
+            try: row=(git/name).lstat()
+            except FileNotFoundError: return False
+            if row.st_uid!=os.getuid() or (stat.S_ISDIR(row.st_mode) if is_directory
+                                         else stat.S_ISREG(row.st_mode)) is not True: return False
+        fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+        with os.fdopen(fd,'rb') as file:
+            before=os.fstat(file.fileno()); raw=file.read(GIT_TEMPLATE_BYTES+1)
+            after=os.fstat(file.fileno())
+        identity=EmbeddedRuntime._identity
+        if identity(before)!=identity(listed) or identity(after)!=identity(before) \
+                or identity(path.lstat())!=identity(before):
+            raise Blocked('git template copy changed during verification')
+        if raw!=expected: return False
+        key=(path,identity(before))
+        if key not in self.recorded:
+            self.record({'label':'inert git template copy','path_class':'vendor-private',
+                'path':path.relative_to(self.evidence).as_posix(),'name':path.name,
+                'size':len(raw),'sha256':hashlib.sha256(raw).hexdigest()})
+            self.recorded.add(key)
+        return True
+
+
 class Inventory:
     """Detect package artifacts/new binaries in HOME, XDG, fixtures and namespace."""
 
-    def __init__(self, roots, *, max_entries=100000):
+    def __init__(self, roots, *, max_entries=100000, embedded_runtime=None, git_templates=None):
         self.roots = tuple(Path(root) for root in roots)
         self.max_entries = max_entries
+        self.embedded_runtime=embedded_runtime
+        self.git_templates=git_templates
         self.before = self._snapshot()
 
     def _snapshot(self):
@@ -964,6 +1221,10 @@ class Inventory:
                             prefix = file.read(4)
                         if row.st_mode & 0o111 or prefix == b"\x7fELF" \
                                 or prefix[:2] == b"MZ" or prefix in {b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf"}:
+                            if self.embedded_runtime is not None and self.embedded_runtime.accept(path,row):
+                                continue
+                            if self.git_templates is not None and self.git_templates.accept(path,row):
+                                continue
                             if row.st_size > ARCHIVE_BYTES:
                                 raise Blocked("private binary inventory size exceeds bound")
                             binaries[(index, str(path.relative_to(root)))] = (

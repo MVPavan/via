@@ -1319,9 +1319,60 @@ control proves the boundary before model qualification. The minimal PATH links
 the exact checked system `rg`; fake LSP and local helpers avoid vendor installs.
 Inventory covers private HOME/XDG, namespace and fixture `.opencode` roots;
 credential files are inspected by existence/mode only. A failed boundary or
-package/binary addition blocks. The coordinator's 2026-10-07 ruling permits
+package/binary addition blocks, subject only to the qualification exceptions below.
+The coordinator's 2026-10-07 ruling permits
 short private `/tmp/via-*` roots for hand-started processes when a scratchpad
 socket path is too long; fixture project/namespace roots remain in the worktree.
+
+**Qualification inventory amendment (owner, 2026-10-07):** OpenCode 2.0.22's
+Bun executable extracts multiple embedded runtime objects as its native
+modules initialize. This exception allows no downloaded code: the accepted
+bytes must already be part of the pinned, hash-verified executable.
+It applies only directly inside the exact TMPDIR handed to an owned private
+vendor serve or version-probe launch, under the verified private daemon recipe
+or L11 direct launch. The candidate must be a regular file owned by VIA's uid,
+with link count one and no symlink. Its name must match
+`.bun-<uid>-<16 hex>.(so|node)`, with the uid equal to VIA's uid.
+Each run verifies the pinned executable SHA-256
+`32cf5aa0a69a650e36277e3315d189835ddc79fb9aa1d0aef5025be5af5ad122`.
+Before accepting an object, a bounded search must find its exact bytes verbatim
+in that executable, returning the observed offset. The executable and object
+are each bounded to 256 MiB; the search uses 1 MiB windows with a prefix overlap
+of at most 255 bytes, at most 1,024 full candidate comparisons and a 30 s bound
+clipped to the enclosing phase/bootstrap/observation deadline. Stable file
+identities are checked throughout, and the executable stays immutable through
+the final rehash. Hash verification and search-offset caches never cross runs;
+an offset reused within one run is rechecked against the exact candidate bytes.
+Accepted extractions are evidence labelled `embedded runtime extraction`,
+with Bun name class, vendor-private path class, serve/probe TMPDIR provenance,
+size, SHA-256 and offset; they never count as a passed gate. The three observed
+objects remain sanitized test fixtures containing only sizes, hashes and offsets,
+not executable bytes. All registered states' vendor
+trees remain inventoried, including earlier namespaces and version probes.
+Any other new or changed binary, another copy outside those handed-off
+TMPDIRs, nested copy, name/uid mismatch, bytes absent from the pinned executable
+or unverifiable ownership still blocks.
+
+**Qualification inert Git template amendment (owner, 2026-10-07):** OpenCode's
+private snapshot Git repositories copy the system Git templates at initialization.
+An inventory executable is accepted only as a regular, uid-owned file with link
+count one, no symlink, directly inside such a repository's `hooks/`, below a
+registered private vendor snapshot root. The name must end in `.sample`; Git
+never executes these inert sample names. Preflight resolves the template directory
+from the verified system Git, hashes each same-named template, and verifies a
+private default Git initialization produces exactly those bytes. Unresolvable
+defaults block preflight. On older relocatable Git builds, the compiled
+`share/git-core/templates` suffix and builtin exec-path prefix resolve the default;
+the copied-byte proof confirms it. The manifest is bounded to 128 files, each
+at most 1 MiB, and each synchronous Git command to 10 s. The private probe's
+children are reaped before its directory is removed. Neither OpenCode's nor
+VIA's environment changes; no `GIT_TEMPLATE_DIR` override is used.
+Each candidate is verified byte-for-byte against the preflight template, with
+stable file identity checks. Evidence records the resolved system template dir,
+per-file hashes, and each `inert git template copy` with name, size and SHA-256;
+these records never pass a gate. A non-sample hook, changed byte, no matching
+template, symlink, hard link, copy elsewhere or outside the private snapshot
+roots still blocks. All other package and binary controls remain in force.
 
 L14 persists a stopped daemon's identity before SIGSTOP and verifies pid plus
 start ticks before SIGCONT, including recovery on the next runner start. Missing

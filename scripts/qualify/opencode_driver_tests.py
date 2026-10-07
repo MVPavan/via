@@ -15,6 +15,85 @@ from opencode_driver import Driver, strict_reply, read_pages, bounded_command, i
 
 
 class DriverTests(unittest.TestCase):
+    def test_marker_server_loss_records_only_successfully_killed_anchor(self):
+        with tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
+            d=Driver('release','fp','pin',Path(root)/'evidence',initialize=False)
+            d.daemon=Identity(69,120); d.anchor=Identity(70,122)
+            d._live_pin=mock.Mock(); d.proc=mock.Mock(); d.journal=mock.Mock()
+            d.journal._signal.side_effect=Blocked('FAKE signal failed')
+            with self.assertRaisesRegex(Blocked,'FAKE signal failed'):
+                d._operation('server_loss_for_marker',{'session':'fixture-session'})
+            self.assertIsNone(d._killed_anchor)
+            d.journal._signal.side_effect=None
+            result=d._operation('server_loss_for_marker',{'session':'fixture-session'})
+            self.assertEqual(result,{'anchor_pid_only':True})
+            self.assertEqual(d._killed_anchor,d.anchor)
+            d.proc.verify.assert_called_with(d.anchor)
+            import signal
+            d.journal._signal.assert_called_with(d.anchor,signal.SIGKILL)
+
+    def test_info_startup_503_waits_for_matching_owned_server(self):
+        with tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
+            d,record,_pending=self.vendor_observer(root)
+            d.proc.listener.return_value='http://127.0.0.1:1234'
+            with mock.patch('opencode_driver.safety.OwnedHTTP') as http, \
+                 mock.patch('opencode_driver.time.sleep'):
+                http.return_value.request.side_effect=[
+                    (503,b'{"pid":71,"version":"2.0.22"}'),
+                    (200,b'{"pid":71,"version":"2.0.22"}')]
+                d._observe_vendor()
+            self.assertEqual(http.return_value.request.call_count,2)
+            d.vault.read_once.assert_called_once()
+            self.assertEqual(d.vendor_identity,Identity(71,123))
+            self.assertEqual(d._verified_host_record['generation'],record['generation'])
+            observed=[call.args[1] for call in d._record.call_args_list
+                      if call.args[0]=='vendor-info']
+            self.assertEqual([row['status'] for row in observed],[503,200])
+
+    def test_info_pending_refuses_changed_generation(self):
+        with tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
+            d,record,_pending=self.vendor_observer(root)
+            d.proc.listener.return_value='http://127.0.0.1:1234'
+            with mock.patch('opencode_driver.safety.OwnedHTTP') as http, \
+                 mock.patch('opencode_driver.time.sleep') as sleep:
+                http.return_value.request.return_value=(503,b'{"pid":71,"version":"2.0.22"}')
+                sleep.side_effect=lambda _seconds:setattr(d._host_record,'return_value',
+                                                         {**record,'generation':'changed'})
+                with self.assertRaisesRegex(Blocked,'owned vendor info generation changed'):
+                    d._observe_vendor()
+            self.assertEqual(http.return_value.request.call_count,1)
+            self.assertIsNone(d.vendor_identity)
+
+    def test_info_pending_deadline_is_not_reset(self):
+        with tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
+            d,_record,_pending=self.vendor_observer(root)
+            d.proc.listener.return_value='http://127.0.0.1:1234'
+            with mock.patch('opencode_driver.safety.OwnedHTTP') as http, \
+                 mock.patch('opencode_driver.time.sleep') as sleep:
+                http.return_value.request.return_value=(503,b'{"pid":71,"version":"2.0.22"}')
+                sleep.side_effect=lambda _seconds:setattr(d,'_bootstrap_deadline',time.monotonic()-1)
+                with self.assertRaisesRegex(Blocked,'owned vendor info startup deadline'):
+                    d._observe_vendor()
+            self.assertEqual(http.return_value.request.call_count,1)
+            self.assertIsNone(d.vendor_identity)
+
+    def test_info_retry_never_accepts_ambiguous_or_incompatible_reply(self):
+        replies=[(503,b'{"pid":72,"version":"2.0.22"}'),
+                 (503,b'{"pid":71,"version":"2.0.24"}'),
+                 (500,b'{"pid":71,"version":"2.0.22"}'),
+                 (503,b'{"version":"2.0.22"}')]
+        for reply in replies:
+            with self.subTest(reply=reply), tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
+                d,_record,_pending=self.vendor_observer(root)
+                d.proc.listener.return_value='http://127.0.0.1:1234'
+                with mock.patch('opencode_driver.safety.OwnedHTTP') as http, \
+                     mock.patch('opencode_driver.time.sleep') as sleep:
+                    http.return_value.request.return_value=reply
+                    with self.assertRaises(Blocked): d._observe_vendor()
+                    sleep.assert_not_called()
+                self.assertEqual(http.return_value.request.call_count,1)
+                self.assertIsNone(d.vendor_identity)
+
     def vendor_observer(self, root):
         import opencode_safety as safety
         d=Driver('release','fp','pin',Path(root)/'evidence',initialize=False)
@@ -33,12 +112,13 @@ class DriverTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
             d,_record,pending=self.vendor_observer(root)
             d.proc.listener.side_effect=[pending('owned listener absent or ambiguous'),
+                                         'http://127.0.0.1:1234',
                                          'http://127.0.0.1:1234']
             with mock.patch('opencode_driver.safety.OwnedHTTP') as http, \
                  mock.patch('opencode_driver.time.sleep'):
                 http.return_value.request.return_value=(200,b'{"pid":71,"version":"2.0.22"}')
                 d._observe_vendor()
-            self.assertEqual(d.proc.listener.call_count,2)
+            self.assertEqual(d.proc.listener.call_count,3)
             d.vault.read_once.assert_called_once()
             self.assertEqual(d.vendor_identity,Identity(71,123))
             self.assertEqual(http.call_args.kwargs['deadline'],d._bootstrap_deadline)

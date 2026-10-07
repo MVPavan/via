@@ -225,7 +225,7 @@ class Driver:
 
     def __init__(self,release=None,failpoints=None,pinned=None,evidence=None,*,
                  via_release=None,via_failpoints=None,opencode=None,signals=None,
-                 proc=None,execute=None,initialize=False,public_free=False,mock_origins=(),rg=None,ownership=None):
+                 proc=None,execute=None,initialize=False,public_free=False,mock_origins=(),rg=None,ownership=None,git_templates=None):
         release=release if release is not None else via_release
         failpoints=failpoints if failpoints is not None else via_failpoints
         pinned=pinned if pinned is not None else opencode
@@ -284,6 +284,13 @@ class Driver:
         self._observation_deadline=None
         self._verified_host_record=None; self._killed_anchor=None
         self._namespace_bootstraps={}
+        self.git_templates=safety.GitTemplateCopies(
+            self.evidence,git_templates or {},lambda value:self._record('git-template-copy',value))
+        self.embedded_runtime=safety.EmbeddedRuntime(
+            self.pinned,self.evidence,lambda value:self._record('embedded-runtime',value),
+            deadline=lambda:min(self.phase_deadline or float('inf'),
+                self._bootstrap_deadline if self._bootstrap_active and self._bootstrap_deadline
+                is not None else float('inf'),self._observation_deadline or float('inf')))
         self._publication_entered=threading.Event(); self._publication_release=threading.Event()
         if initialize:
             self.prepare()
@@ -310,6 +317,12 @@ class Driver:
         namespace,env=safety.create_namespace(self.state)
         self.ownership.register(namespace,'vendor-private')
         for value in env.values(): self.ownership.register(value,'vendor-private')
+        # §2.2/§13: these exact TMPDIRs are handed to the private serve/probe recipe.
+        probe_root=self._directory(namespace.parent/'probe','vendor-private')
+        probe=self._directory(probe_root/'tmp','vendor-private')
+        self.git_templates.register_snapshot(Path(env['XDG_DATA_HOME'])/'opencode'/'snapshot')
+        self.embedded_runtime.register_tmpdir(env['TMPDIR'],'serve')
+        self.embedded_runtime.register_tmpdir(probe,'probe')
         return namespace,env
 
     def prepare(self):
@@ -331,9 +344,10 @@ class Driver:
                         VIA_RUNTIME_DIR=str(self.runtime))
         self._record('rg',rg_proof)
         # Inventory excludes helper rg's reviewed symlink; it covers Bun's HOME cache too.
-        self.inventory=safety.Inventory([self.namespace,self.home,
+        self.inventory=safety.Inventory([self.namespace.parent,self.home,
                                         *(Path(value) for value in self.env.values()
-                                          if value.startswith(str(self.evidence/'daemon-')))])
+                                          if value.startswith(str(self.evidence/'daemon-')))],
+                                        embedded_runtime=self.embedded_runtime,git_templates=self.git_templates)
         self.recover_stopped()
 
     def recover_stopped(self):
@@ -386,8 +400,10 @@ class Driver:
         roots=[self.namespace,self.home,*[Path(value) for key,value in self.env.items()
                                          if key in safety.PRIVATE_PARTS],*extra]
         roots += [row['path']/'.opencode' for row in self.fixtures.values()]
+        roots += [root.path/'vendor' for root in self.ownership.ordered()
+                  if root.state and (root.path/'vendor').is_dir()]
         if self.inventory: self.inventory.check()
-        self.inventory=safety.Inventory(roots)
+        self.inventory=safety.Inventory(roots,embedded_runtime=self.embedded_runtime,git_templates=self.git_templates)
 
     def _validate_provider_config(self,config):
         providers=config.get('providers',{})
@@ -882,11 +898,32 @@ class Driver:
         origin=self._listener_origin(record,identity)
         self._http=safety.OwnedHTTP(origin,identity,self.proc,password,
                                     deadline=self._bootstrap_deadline if self._bootstrap_active else self.phase_deadline)
-        status,raw=self._http.request('GET','/api/info')
-        value=self._json(raw)
-        _typed(value,{'pid':I,'version':S},'vendor info')
-        if status!=200 or value['pid']!=identity.pid or value['version']!='2.0.22':
-            raise Blocked('owned vendor handshake mismatch')
+        deadline=time.monotonic()+OWNED_READINESS_SECONDS
+        binding=tuple(record[key] for key in ('generation','anchor','vendor_pid','server_id'))
+        while True:
+            if self.phase_deadline is not None: deadline=min(deadline,self.phase_deadline)
+            if self._bootstrap_active and self._bootstrap_deadline is not None:
+                deadline=min(deadline,self._bootstrap_deadline)
+            if self.signals: self.signals.guard()
+            if time.monotonic()>=deadline: raise Blocked('owned vendor info startup deadline')
+            current=self._host_record()
+            if tuple(current[key] for key in ('generation','anchor','vendor_pid','server_id'))!=binding:
+                raise Blocked('owned vendor info generation changed')
+            self.proc.verify(record['anchor']); self.proc.verify(identity)
+            if self.proc.listener(identity)!=origin:
+                raise Blocked('owned vendor info listener changed')
+            status,raw=self._http.request('GET','/api/info',timeout=deadline-time.monotonic())
+            value=self._json(raw)
+            _typed(value,{'pid':I,'version':S},'vendor info')
+            matches=value['pid']==identity.pid and value['version']=='2.0.22'
+            self._record('vendor-info',{'status':status,'identity_version_match':matches,
+                                       'body_sha256':hashlib.sha256(raw).hexdigest()})
+            if not matches or status not in {200,503}:
+                raise Blocked('owned vendor handshake mismatch')
+            if status==200: break
+            # §13/§2: the checked child reports 503 while its database starts.
+            # Only this verified not-ready reply retries; admission still needs 200.
+            time.sleep(min(.02,max(0,deadline-time.monotonic())))
         self.vendor_identity=identity; self.anchor=record['anchor']
         self._verified_host_record={**record,'state_root':self.state,'vendor':identity}
         self.server_identities.add(identity)
@@ -2465,6 +2502,7 @@ print('VIA HELPER DONE')
             if not self.daemon or not self.anchor: raise Blocked('marker server-loss identities absent')
             self._live_pin(session)
             self.proc.verify(self.anchor); self.journal._signal(self.anchor,signal.SIGKILL)
+            self._killed_anchor=self.anchor
             return {'anchor_pid_only':True}
         if kind=='helper_stop_proof':
             helper=args['helper']
