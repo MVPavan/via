@@ -14,6 +14,15 @@ from claude import Blocked
 ATTEMPT_OBSERVE_S, DENIED_OBSERVE_S = 3, 2
 # Packet §8: diagnostic evidence stays bounded even with changing owned argv.
 SURVEY_RECORDS = 256
+# Packet §8 / Run 14 surveys: ordered bwrap prefix options and their value counts.
+# Only these two recorded mount layouts are admitted; values remain hash-only evidence.
+_BWRAP_HEAD = (("--as-pid-1", 0), ("--new-session", 0), ("--die-with-parent", 0),
+               ("--ro-bind", 2), ("--dev", 1), ("--perms", 1), ("--tmpfs", 1), ("--remount-ro", 1))
+_BWRAP_TAIL = (("--tmpfs", 1), ("--unshare-user", 0), ("--unshare-pid", 0), ("--unshare-ipc", 0),
+               ("--unshare-net", 0), ("--proc", 1), ("--cap-drop", 1), ("--argv0", 1))
+BWRAP_PREFIXES = (_BWRAP_HEAD + _BWRAP_TAIL,
+                  _BWRAP_HEAD + (("--bind", 2),)
+                  + (("--perms", 1), ("--tmpfs", 1), ("--remount-ro", 1)) * 4 + _BWRAP_TAIL)
 # Packet §§3/5/8: observable fixed scripts, one write attempt, bounded A/B waits.
 TOOL_PROGRAM_BYTES, A_WAIT_S, B_WAIT_S = 64 * 1024, 6, 6
 # Packet §§5/8: release polling stays inside the unchanged whole-program watchdog.
@@ -234,7 +243,8 @@ class Survey:
 class DeniedExecution:
     """Packet §§3/5: pin exact owned argv; writes additionally require the EROFS transition."""
     def __init__(self, python, python_hash, target, attempt=None, denied=None, program=None,
-                 program_hash=None, require_refusal=True, wrapper_hashes=None, wrapper_identities=None):
+                 program_hash=None, require_refusal=True, wrapper_hashes=None, wrapper_identities=None,
+                 codex_path=None):
         self.python, self.python_hash, self.target = str(Path(python).resolve()), python_hash, Path(target)
         self.attempt = attempt or [self.python, "-c", ATTEMPT_CODE, self.target.name]
         self.denied = denied or [self.python, "-c", DENIED_CODE, DENIED_TAG]
@@ -242,21 +252,75 @@ class DeniedExecution:
         self.seen, self.blockers, self.execution_observed = set(), set(), False
         self.wrapper_hashes, self.pending_wrappers = dict(wrapper_hashes or {}), {}
         self.wrapper_identities, self.verified_wrappers = dict(wrapper_identities or {}), {}
+        self.codex_path = str(Path(codex_path).resolve()) if codex_path is not None else None
 
     def require_no_blockers(self):
         """Packet §§3/7: later exact observations cannot erase an earlier deviation."""
         if self.blockers:
             raise Blocked("prohibited execution: " + ", ".join(sorted(self.blockers)))
 
-    def command_wrapper(self, argv):
-        """Packet §§3/8: prefix flags never confer ownership; the command suffix is byte-exact."""
+    def command_suffix(self, argv):
+        """Packet §8: a matching suffix is diagnostic only, never transport admission."""
         return (self.program is not None
                 and argv[-3:] == ["/bin/bash", "-lc", shlex.join(self.attempt)])
+
+    def codex_launcher(self, argv, inner=False):
+        """Packet §§3/8: exact outer/inner Run 13–14 launchers, with this turn's workspace."""
+        workspace = str(self.target.parent)
+        boundary = 8 if inner else 7
+        return (len(argv) == boundary + 4
+                and argv[1:5] == ["--sandbox-policy-cwd", workspace, "--command-cwd", workspace]
+                and argv[5] == "--permission-profile" and bool(argv[6]) and not argv[6].startswith("-")
+                and (not inner or argv[7] == "--apply-seccomp-then-exec")
+                and argv[boundary] == "--" and self.command_suffix(argv))
+
+    def command_wrapper(self, argv, executable_class):
+        """Packet §§3/8: pinned transports also need executable-specific argv structure."""
+        if self.program is None:
+            return False
+        if executable_class == "bash":
+            return argv == ["/bin/bash", "-lc", shlex.join(self.attempt)]
+        if executable_class == "codex":
+            return self.codex_launcher(argv) or self.codex_launcher(argv, inner=True)
+        if executable_class == "bwrap":
+            return self.bwrap_launcher(argv)
+        return False
+
+    def bwrap_launcher(self, argv):
+        """Packet §§3/8: parse the recorded prefix to its boundary, then an exact pinned payload."""
+        for options in BWRAP_PREFIXES:
+            index = 1
+            for flag, count in options:
+                if len(argv) <= index + count or argv[index] != flag:
+                    break
+                values = argv[index + 1:index + count + 1]
+                if any(not value or value.startswith("-") for value in values):
+                    break
+                index += 1 + count
+            else:
+                if len(argv) > index and argv[index] == "--":
+                    payload = argv[index + 1:]
+                    if payload == ["/bin/bash", "-lc", shlex.join(self.attempt)]:
+                        return True
+                    return (bool(payload) and self.codex_path is not None
+                            and payload[0] == self.codex_path and self.codex_launcher(payload, inner=True))
+        return False
+
+    def inner_chain(self, proc, identity):
+        """Packet §§3/8: the seccomp launcher must descend from an observed pinned bwrap."""
+        for (pid, ticks, _), executable_class in self.verified_wrappers.items():
+            if executable_class == "bwrap":
+                try:
+                    proc.own(identity, {"pid": pid, "start_ticks": ticks})
+                    return True
+                except (OSError, Blocked):
+                    continue
+        return False
 
     def wrapper_shape(self, argv, executable_class):
         """Packet §8: record transport shape, with no raw paths, command text or flag values."""
         flags, values = [], []
-        prefix = argv[:-3] if self.command_wrapper(argv) else argv
+        prefix = argv[:-3] if self.command_suffix(argv) else argv
         for value in prefix:
             name, separator, rest = value.partition("=")
             if re.fullmatch(r"--?[A-Za-z][A-Za-z0-9_-]*", name):
@@ -267,7 +331,8 @@ class DeniedExecution:
                 values.append(digest(value))
         return {"record_only": True, "executable_class": executable_class,
                 "argv_length": len(argv), "flag_names": flags, "value_hashes": values,
-                "suffix_matches": self.command_wrapper(argv)}
+                "suffix_matches": self.command_suffix(argv),
+                "structure_matches": self.command_wrapper(argv, executable_class)}
 
     def pair_wrappers(self, proc, identity):
         """Packet §§3/8: pending transports must be in the exact tool's pinned ancestry."""
@@ -288,7 +353,8 @@ class DeniedExecution:
             raise  # No foreign argv/executable/content reads, even on this blocked path.
         raw = proc.content(identity, "cmdline")
         try:
-            argv = raw.rstrip(b"\0").decode().split("\0")
+            # Remove only the terminator: trailing empty arguments remain deviations.
+            argv = raw.removesuffix(b"\0").decode().split("\0")
         except UnicodeError:
             raise Blocked("prohibited execution argv unverifiable") from None
         related = (str(self.program) in "\0".join(argv) if self.program is not None
@@ -311,7 +377,12 @@ class DeniedExecution:
                     # an exec/exit race cannot confer identity on a new mention.
                     executable_class = self.verified_wrappers.get(observation)
                 wrapper_shape = self.wrapper_shape(argv, executable_class)
-                if not self.command_wrapper(argv) or executable_class is None \
+                inner_chain_matches = None
+                if executable_class == "codex" and self.codex_launcher(argv, inner=True):
+                    inner_chain_matches = self.inner_chain(proc, identity)
+                wrapper_shape["inner_chain_matches"] = inner_chain_matches
+                if not self.command_wrapper(argv, executable_class) or executable_class is None \
+                        or inner_chain_matches is False \
                         or token == (server["pid"], server["start_ticks"]):
                     self.blockers.add("command deviation")
                 else:

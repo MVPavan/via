@@ -171,6 +171,14 @@ when blocked: polling cadence, owned pid/start ticks, hashed argv/cwd/executable
 paths, fixed wrapper roles and match flags. These bounded diagnostics neither
 prove execution/refusal nor relax the exact owned-process EROFS gate. Polling
 cannot exclude a process that lives entirely between samples.
+Pinned wrappers require executable-specific structure, never a suffix alone:
+Bash is exactly the admitted three-element argv; Codex launchers have only the
+recorded flags and this turn's two workspace values. Bwrap admits only Run 14's
+two ordered option layouts and an exact Bash or pinned inner Codex launcher payload.
+Only the inner launcher has one value-free --apply-seccomp-then-exec before --;
+observed inner processes require an earlier verified bwrap in their pinned ancestry.
+Unknown layouts, extra flags/positionals and changed command bytes are sticky
+deviations even if an exact Python execution follows. Transport is never proof.
 Ownership rejections first record public method/item labels (unfamiliar labels
 are hash-only), hashed IDs, generation, ownership flags and pending requests.
 VIA receipt/status/events/cancel/result/wait/close/daemon replies have
@@ -1899,7 +1907,8 @@ class Run(shared.Run):
                     attempt=spec["argv"] if spec else None, denied=spec["denied"] if spec else None,
                     program=spec["program"] if spec else None,
                     program_hash=spec["program_hash"] if spec else None, require_refusal=refusal,
-                    wrapper_hashes=self.wrapper_hashes, wrapper_identities=self.wrapper_identities)
+                    wrapper_hashes=self.wrapper_hashes, wrapper_identities=self.wrapper_identities,
+                    codex_path=self.wrapper_files.get("codex"))
         prefix = "changed-bound" if label == "c2" else "command-" + label
         survey = bound_probe.Survey(probe)
         deadline = min(time.monotonic() + POLL_S, self.spend.deadline)
@@ -4998,7 +5007,7 @@ class SafetyTests(unittest.TestCase):
             probe.observe(proc, tool, server)
 
     def wrapper_probe_fixture(self, mode="allowed"):
-        """Packet §§3/8: synthetic pinned launcher/bwrap/inner/bash ancestry and exact child."""
+        """Packet §§3/8: recorded wrapper structures with synthetic values and pinned ancestry."""
         legacy, proc, server, _ = self.probe_fixture()
         pins = {}
         for name in ("codex", "bwrap", "bash"):
@@ -5012,16 +5021,23 @@ class SafetyTests(unittest.TestCase):
         probe.wrapper_hashes = pins
         probe.wrapper_identities = {name: bound_probe.file_identity((self.root / ("wrapper-" + name)).stat())
                                     for name in pins}
+        if mode == "never-ask":
+            probe.wrapper_identities["bwrap_system"] = probe.wrapper_identities.pop("bwrap")
+        probe.codex_path = str(self.root / "wrapper-codex")
         fixture = json.loads((Path(__file__).parent / "fixtures/codex-0.160.1-wrappers.json").read_text())
         wrappers = []
-        for pid, (shape, executable) in enumerate((("launcher", "codex"), ("bwrap", "bwrap"),
-                                                   ("inner", "codex"), ("shell", "bash")), 2):
+        bwrap_shape = "bwrap_read_only" if mode in ("denied", "never-ask") else "bwrap_workspace"
+        for pid, (shape, executable) in enumerate((("outer_launcher", "codex"), (bwrap_shape, "bwrap"),
+                                                   ("inner_launcher", "codex"), ("bash", "bash")), 2):
             identity = self.process(pid, pid - 1, pid * 10)
             path = self.root / str(pid) / "exe"
             path.unlink(missing_ok=True)
             path.symlink_to(self.root / ("wrapper-" + executable))
             argv = [part.replace(fixture["command"], shlex.join(attempt))
-                    for part in fixture["suffix_shapes"][shape]]
+                        .replace(fixture["workspace"], str(probe.target.parent))
+                    for part in fixture["structures"][shape]]
+            if executable == "bwrap":
+                argv[argv.index("--") + 1] = probe.codex_path
             (self.root / str(pid) / "cmdline").write_bytes("\0".join(argv).encode() + b"\0")
             wrappers.append((identity, argv))
         tool = self.process(6, 5, 60)
@@ -5029,6 +5045,89 @@ class SafetyTests(unittest.TestCase):
         (self.root / "6/cwd").symlink_to(legacy.target.parent)
         (self.root / "6/cmdline").write_bytes("\0".join(attempt).encode() + b"\0")
         return probe, proc, server, tool, wrappers
+
+    def test_pinned_bash_prefixes_are_sticky_command_deviations(self):
+        for deviation in ("reviewer_prefix", "extra_positional", "short_shell_flag", "second_boundary"):
+            with self.subTest(deviation=deviation), tempfile.TemporaryDirectory() as root:
+                previous, self.root = self.root, Path(root)
+                try:
+                    probe, proc, server, tool, wrappers = self.wrapper_probe_fixture()
+                    identity, argv = wrappers[-1]
+                    command = shlex.join(probe.attempt)
+                    if deviation == "reviewer_prefix":
+                        argv = ["/bin/bash", "-c", 'touch unexpected.txt; exec /bin/bash -lc "$3"',
+                                "wrapper", "/bin/bash", "-lc", command]
+                    elif deviation == "extra_positional":
+                        argv = ["/bin/bash", "extra", "/bin/bash", "-lc", command]
+                    elif deviation == "short_shell_flag":
+                        argv = ["/bin/bash", "-c", command]
+                    else:
+                        argv = ["/bin/bash", "--", "--", "/bin/bash", "-lc", command]
+                    (self.root / str(identity["pid"]) / "cmdline").write_bytes("\0".join(argv).encode() + b"\0")
+                    probe.observe(proc, identity, server)
+                    with self.assertRaisesRegex(Blocked, "command deviation"):
+                        probe.require_no_blockers()
+                    with self.assertRaisesRegex(Blocked, "command deviation"):
+                        probe.observe(proc, tool, server)
+                finally:
+                    self.root = previous
+
+    def test_extra_empty_argv_is_a_sticky_deviation_for_tools_and_wrappers(self):
+        for role in ("outer_launcher", "bwrap", "bash", "python"):
+            with self.subTest(role=role), tempfile.TemporaryDirectory() as root:
+                previous, self.root = self.root, Path(root)
+                try:
+                    probe, proc, server, tool, wrappers = self.wrapper_probe_fixture()
+                    identity, argv = {"outer_launcher": wrappers[0], "bwrap": wrappers[1],
+                                      "bash": wrappers[-1], "python": (tool, probe.attempt)}[role]
+                    (self.root / str(identity["pid"]) / "cmdline").write_bytes(
+                        "\0".join([*argv, ""]).encode() + b"\0")
+                    probe.observe(proc, identity, server)
+                    with self.assertRaisesRegex(Blocked, "command deviation"):
+                        probe.require_no_blockers()
+                    (self.root / str(tool["pid"]) / "cmdline").write_bytes(
+                        "\0".join(probe.attempt).encode() + b"\0")
+                    with self.assertRaisesRegex(Blocked, "command deviation"):
+                        probe.observe(proc, tool, server)
+                finally:
+                    self.root = previous
+
+    def test_codex_launcher_structure_deviations_are_sticky(self):
+        for deviation in ("extra_flag", "repeated_flag", "missing_flag", "extra_positional",
+                          "second_boundary", "short_shell_flag", "wrong_policy_cwd", "wrong_command_cwd"):
+            with self.subTest(deviation=deviation), tempfile.TemporaryDirectory() as root:
+                previous, self.root = self.root, Path(root)
+                try:
+                    probe, proc, server, tool, wrappers = self.wrapper_probe_fixture()
+                    identity = wrappers[0][0]
+                    workspace = str(probe.target.parent)
+                    argv = ["codex-linux-sandbox", "--sandbox-policy-cwd", workspace,
+                            "--command-cwd", workspace, "--permission-profile", "synthetic-profile",
+                            "--", "/bin/bash", "-lc", shlex.join(probe.attempt)]
+                    if deviation == "extra_flag":
+                        argv[7:7] = ["--injected", "synthetic-value"]
+                    elif deviation == "repeated_flag":
+                        argv[7:7] = ["--command-cwd", workspace]
+                    elif deviation == "missing_flag":
+                        del argv[5:7]
+                    elif deviation == "extra_positional":
+                        argv.insert(7, "extra")
+                    elif deviation == "second_boundary":
+                        argv.insert(8, "--")
+                    elif deviation == "short_shell_flag":
+                        argv[-2] = "-c"
+                    elif deviation == "wrong_policy_cwd":
+                        argv[2] = str(self.root / "wrong-workspace")
+                    else:
+                        argv[4] = str(self.root / "wrong-workspace")
+                    (self.root / "2/cmdline").write_bytes("\0".join(argv).encode() + b"\0")
+                    probe.observe(proc, identity, server)
+                    with self.assertRaisesRegex(Blocked, "command deviation"):
+                        probe.require_no_blockers()
+                    with self.assertRaisesRegex(Blocked, "command deviation"):
+                        probe.observe(proc, tool, server)
+                finally:
+                    self.root = previous
 
     def test_wrapper_observation_never_reads_executable_bytes_on_the_hot_path(self):
         for failure in (OSError("synthetic exec during read"), Blocked("tool executable byte bound")):
@@ -5049,6 +5148,127 @@ class SafetyTests(unittest.TestCase):
                     probe.require_no_blockers()
                     read.assert_not_called()
                     self.assertFalse(probe.seen)
+                finally:
+                    self.root = previous
+
+    def test_bwrap_prefix_and_payload_deviations_are_sticky(self):
+        for deviation in ("extra_flag", "missing_flag", "repeated_flag", "extra_positional",
+                          "second_boundary", "short_shell_flag", "prefixed_bash", "wrong_command_cwd"):
+            with self.subTest(deviation=deviation), tempfile.TemporaryDirectory() as root:
+                previous, self.root = self.root, Path(root)
+                try:
+                    probe, proc, server, tool, wrappers = self.wrapper_probe_fixture()
+                    identity, argv = wrappers[1]
+                    boundary = argv.index("--")
+                    if deviation == "extra_flag":
+                        argv[boundary:boundary] = ["--injected", "synthetic-value"]
+                    elif deviation == "missing_flag":
+                        del argv[1]
+                    elif deviation == "repeated_flag":
+                        argv.insert(1, "--new-session")
+                    elif deviation == "extra_positional":
+                        argv.insert(boundary, "extra")
+                    elif deviation == "second_boundary":
+                        argv.insert(boundary, "--")
+                    elif deviation == "short_shell_flag":
+                        argv[-2] = "-c"
+                    elif deviation == "prefixed_bash":
+                        argv[boundary + 1:] = ["/bin/bash", "-c", 'touch unexpected.txt; exec /bin/bash -lc "$3"',
+                                              "wrapper", "/bin/bash", "-lc", shlex.join(probe.attempt)]
+                    else:
+                        argv[argv.index("--command-cwd") + 1] = str(self.root / "wrong-workspace")
+                    (self.root / str(identity["pid"]) / "cmdline").write_bytes("\0".join(argv).encode() + b"\0")
+                    probe.observe(proc, identity, server)
+                    with self.assertRaisesRegex(Blocked, "command deviation"):
+                        probe.require_no_blockers()
+                    with self.assertRaisesRegex(Blocked, "command deviation"):
+                        probe.observe(proc, tool, server)
+                finally:
+                    self.root = previous
+
+    def test_seccomp_flag_requires_the_exact_verified_inner_launcher(self):
+        for deviation in ("none", "outer", "unobserved_parent", "repeat", "value", "equals_value", "after_boundary"):
+            with self.subTest(deviation=deviation), tempfile.TemporaryDirectory() as root:
+                previous, self.root = self.root, Path(root)
+                try:
+                    probe, proc, server, tool, wrappers = self.wrapper_probe_fixture()
+                    identity, argv = wrappers[2]
+                    if deviation != "unobserved_parent":
+                        probe.observe(proc, wrappers[1][0], server)
+                    if deviation == "outer":
+                        identity = wrappers[0][0]  # Same inner argv, but above the verified bwrap.
+                    elif deviation == "repeat":
+                        argv.insert(7, "--apply-seccomp-then-exec")
+                    elif deviation == "value":
+                        argv.insert(8, "synthetic-value")
+                    elif deviation == "equals_value":
+                        argv[7] += "=synthetic-value"
+                    elif deviation == "after_boundary":
+                        argv[7], argv[8] = argv[8], argv[7]
+                    (self.root / str(identity["pid"]) / "cmdline").write_bytes("\0".join(argv).encode() + b"\0")
+                    probe.observe(proc, identity, server)
+                    if deviation == "none":
+                        probe.require_no_blockers()
+                        self.assertFalse(probe.seen)  # Neither transport is execution/refusal proof.
+                        self.assertIsNotNone(probe.observe(proc, tool, server))
+                    else:
+                        with self.assertRaisesRegex(Blocked, "command deviation"):
+                            probe.require_no_blockers()
+                        with self.assertRaisesRegex(Blocked, "command deviation"):
+                            probe.observe(proc, tool, server)
+                finally:
+                    self.root = previous
+
+    def test_bwrap_seccomp_payload_deviations_are_sticky_for_both_pins_and_layouts(self):
+        for mode in ("allowed", "denied"):
+            for deviation in ("repeat", "value", "equals_value", "after_boundary", "missing", "wrong_binary"):
+                with self.subTest(mode=mode, deviation=deviation), tempfile.TemporaryDirectory() as root:
+                    previous, self.root = self.root, Path(root)
+                    try:
+                        probe, proc, server, tool, wrappers = self.wrapper_probe_fixture(mode)
+                        if mode == "denied":
+                            # The system pin normalizes to the same bwrap structure rule.
+                            probe.wrapper_identities["bwrap_system"] = probe.wrapper_identities.pop("bwrap")
+                        identity, argv = wrappers[1]
+                        flag = argv.index("--apply-seccomp-then-exec")
+                        if deviation == "repeat":
+                            argv.insert(flag, "--apply-seccomp-then-exec")
+                        elif deviation == "value":
+                            argv.insert(flag + 1, "synthetic-value")
+                        elif deviation == "equals_value":
+                            argv[flag] += "=synthetic-value"
+                        elif deviation == "after_boundary":
+                            argv[flag], argv[flag + 1] = argv[flag + 1], argv[flag]
+                        elif deviation == "missing":
+                            del argv[flag]
+                        else:
+                            argv[argv.index("--") + 1] = "unverified-payload-executable"
+                        (self.root / str(identity["pid"]) / "cmdline").write_bytes("\0".join(argv).encode() + b"\0")
+                        probe.observe(proc, identity, server)
+                        with self.assertRaisesRegex(Blocked, "command deviation"):
+                            probe.require_no_blockers()
+                        with self.assertRaisesRegex(Blocked, "command deviation"):
+                            probe.observe(proc, tool, server)
+                    finally:
+                        self.root = previous
+
+    def test_recorded_bwrap_prefixes_admit_only_the_exact_bash_payload(self):
+        for mode in ("allowed", "never-ask"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as root:
+                previous, self.root = self.root, Path(root)
+                try:
+                    probe, proc, server, tool, wrappers = self.wrapper_probe_fixture(mode)
+                    identity, argv = wrappers[1]
+                    argv[argv.index("--") + 1:] = ["/bin/bash", "-lc", shlex.join(probe.attempt)]
+                    (self.root / str(identity["pid"]) / "cmdline").write_bytes("\0".join(argv).encode() + b"\0")
+                    survey = bound_probe.Survey(probe)
+                    self.assertIsNone(probe.observe(proc, identity, server, survey))
+                    probe.require_no_blockers()
+                    self.assertFalse(probe.seen)
+                    self.assertTrue(survey.snapshot("pending", {}, [])["observations"][0]
+                                    ["wrapper_shape"]["structure_matches"])
+                    probe.observe(proc, tool, server)
+                    self.assertFalse(probe.pending_wrappers)
                 finally:
                     self.root = previous
 
@@ -5148,7 +5368,7 @@ class SafetyTests(unittest.TestCase):
         with self.assertRaisesRegex(Blocked, "escapes pinned release"):
             run.wrapper_paths()
 
-    def test_verified_wrapper_suffix_chain_for_every_tool_mode(self):
+    def test_verified_recorded_wrapper_structures_for_every_tool_mode(self):
         for mode in ("allowed", "denied", "never-ask", "interrupt-a", "interrupt-b"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as root:
                 previous, self.root = self.root, Path(root)
@@ -5172,6 +5392,7 @@ class SafetyTests(unittest.TestCase):
                     self.assertTrue(secret_free(snapshot))
                     for sample in snapshot["observations"][:4]:
                         self.assertTrue(sample["wrapper_shape"]["suffix_matches"])
+                        self.assertTrue(sample["wrapper_shape"]["structure_matches"])
                         self.assertTrue(sample["wrapper_shape"]["record_only"])
                         self.assertIn(sample["wrapper_shape"]["executable_class"], probe.wrapper_hashes)
                     self.assertNotIn("synthetic-policy", json.dumps(snapshot))
@@ -5233,11 +5454,12 @@ class SafetyTests(unittest.TestCase):
              self.assertRaisesRegex(Blocked, "system bwrap unavailable"):
             run.wrapper_paths()
 
-    def test_run_observer_pairs_verified_suffix_wrappers_before_refusal_proof(self):
+    def test_run_observer_pairs_verified_structured_wrappers_before_refusal_proof(self):
         probe, proc, server, tool, wrappers = self.wrapper_probe_fixture("denied")
         run = self.run_object()
         run.wrapper_hashes = probe.wrapper_hashes
         run.wrapper_identities = probe.wrapper_identities
+        run.wrapper_files["codex"] = Path(probe.codex_path)
         generation, thread, turn = digest("generation"), digest("thread"), digest("turn")
         facts = [{"kind": "reply", "method": "turn/start", "reservation": digest("c2"),
                   "trace": generation, "thread": thread, "turn": turn},
