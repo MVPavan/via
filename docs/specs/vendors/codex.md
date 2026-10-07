@@ -599,9 +599,15 @@ best-effort (C2 §7 item 9): a slow denial is a failed item, but a fast denial
 emits no item, and code-mode `exec` can act with no item at all, so no item
 history proves complete denial reporting or complete tool tracking.
 
-The qualification runner's 0.160.1 candidate checks prove positive execution of
-an admitted command through matched protocol and owned-process evidence; they
-do not prove that it was the only command executed in the turn. No native
+The qualification runner disables the owner's MCP servers and plugins and
+records the limit: "shell_snapshot disabled for test isolation; the snapshot
+exec path is not qualified". Its empty-home feature preflight and owner-home
+`config/read` barrier must both confirm the snapshot switch is off before
+turns are accepted. These limits apply to the checked-set scope; enabled
+MCP/plugins and the snapshot exec path are excluded. The runner's 0.160.1
+candidate checks prove positive execution of an admitted command through
+matched protocol and owned-process evidence; they do not prove that it was
+the only command executed in the turn. No native
 per-turn tool-disable has been verified offline for this candidate. "No reported
 tool items" is therefore record-only, including the stored c3 reply. A matching
 reply does not prove unaided recall: stored-resume qualification rests on the

@@ -109,10 +109,11 @@ credentials stay there. auth.json is lstat'ed for existence/owner/mode only:
 never opened, copied, linked or logged. Noncredential config.toml is parsed for
 root MCP keys and side-effect settings; only name digests reach evidence.
 Inactive profile MCP keys receive no root override; an active profile blocks.
-Each root name is disabled on our server's argv, together with apps and plugins;
+Each root name is disabled on our server's argv, together with apps, plugins and shell_snapshot;
 notify=[] is set only on that argv. Custom provider/profile/telemetry settings block preflight.
-Qualification runs with the owner's MCP servers and plugins disabled. This test
-isolation limits the checked-set claim; it does not qualify their enabled configuration.
+Qualification runs with the owner's MCP servers and plugins disabled, and
+shell_snapshot disabled for test isolation; the snapshot exec path is not qualified.
+This isolation limits the checked-set claim; it does not qualify their enabled configuration.
 Managed config and project-layer config outside that inventory block BEFORE starting Codex.
 The proxy requires config/read to expose effective features (all disabled),
 notify (empty), the default provider and every configured MCP server (disabled)
@@ -121,8 +122,8 @@ profile and provider-map fields are valid defaults; other unsupported/missing
 fields block with a reason; no mcpServerStatus/list, tool inventory, desktop endpoint or `codex mcp list`.
 The installed 0.160.1 --help confirms dotted overrides and --disable, but does
 not prove notify semantics or config/read shape/passivity. Preflight runs
-`features list` with only the apps/plugins disables and notify=[], in an
-empty private CODEX_HOME, requiring apps/plugins to be known and disabled.
+`features list` with only the apps/plugins/shell_snapshot disables and notify=[], in an
+empty private CODEX_HOME, requiring all three to be known and disabled.
 Any startupStatus notification
 still blocks, independently of echoed config. MCP-name overrides apply only to
 the owned server using the owner's home, where config/read verifies their
@@ -133,7 +134,7 @@ that is presence evidence only. The future live preflight must verify effective
 values before accepting turns. It does not infer safety from the July snapshot.
 
 Owner home writes are accepted, not minimised: stored rollouts are needed for
-resume. Auth refresh, shell snapshots, caches, logs and system skills may also
+resume. Auth refresh, caches, logs and system skills may also
 change; shared auth refresh may race the desktop server. No credential content
 is read. Before/after top-level counts/name digests and session-file counts/name
 digests are recorded for today and tomorrow in UTC only, including the count
@@ -608,7 +609,7 @@ def mcp_names(home):
 
 def server_args(names):
     """Packet §4: root-table {} merges; disable each known server by name instead."""
-    args = ["--disable", "apps", "--disable", "plugins", "-c", "notify=[]"]
+    args = ["--disable", "apps", "--disable", "plugins", "--disable", "shell_snapshot", "-c", "notify=[]"]
     for name in names:
         require(type(name) is str and re.fullmatch(r"[A-Za-z0-9_-]+", name), "unsafe MCP name")
         args.extend(["-c", "mcp_servers." + name + ".enabled=false"])
@@ -624,7 +625,7 @@ def feature_preflight(codex, env, work):
                                     env=private_env, cwd=work,
                                     capture_output=True, text=True, timeout=30)
         except (OSError, subprocess.TimeoutExpired):
-            raise Blocked("features list unavailable: cannot verify apps/plugins feature names") from None
+            raise Blocked("features list unavailable: cannot verify apps/plugins/shell_snapshot feature names") from None
         require(result.returncode == 0,
                 "features list unavailable under feature overrides in empty private Codex home")
         require(len(result.stdout.encode()) <= PROC_BYTES and len(result.stderr.encode()) <= PROC_BYTES,
@@ -637,9 +638,10 @@ def feature_preflight(codex, env, work):
             name = fields[0]
             require(name not in features, "features list duplicate name")
             features[name] = fields[-1]
-        require(all(features.get(name) == "false" for name in ("apps", "plugins")),
-                "features list cannot confirm disabled apps/plugins feature names")
-        return {"apps_disabled": True, "plugins_disabled": True, "registry_checked": True}
+        require(all(features.get(name) == "false" for name in ("apps", "plugins", "shell_snapshot")),
+                "features list cannot confirm disabled apps/plugins/shell_snapshot feature names")
+        return {"apps_disabled": True, "plugins_disabled": True,
+                "shell_snapshot_disabled": True, "registry_checked": True}
 
 
 def effective_config(result, names):
@@ -649,7 +651,7 @@ def effective_config(result, names):
     config = result["config"]
     features, servers = config.get("features"), config.get("mcp_servers")
     require(type(features) is dict and all(features.get(key) is False
-            for key in ("apps", "plugins", "memories", "hooks")),
+            for key in ("apps", "plugins", "memories", "hooks", "shell_snapshot")),
             "config/read cannot confirm owned feature overrides")
     require(config.get("notify") == [], "config/read cannot confirm notify=[]")
     require((config.get("model_provider") is None or config.get("model_provider") == "openai")
@@ -667,7 +669,7 @@ def effective_config(result, names):
                 "config/read found enabled or unverifiable MCP server")
     require(set(names) <= servers.keys(), "config/read lost configured MCP names")
     return {"kind": "effective_config", "all_servers_disabled": True,
-            "servers": len(servers), "plugins_disabled": True, "notify_empty": True}
+            "servers": len(servers), "plugins_disabled": True, "shell_snapshot_disabled": True, "notify_empty": True}
 
 
 def owner_metadata(home, today=None):
@@ -2697,9 +2699,11 @@ def main(argv=None):
                        - set(run.owner_before["session_digests"]))
                        if run and run.owner_before is not None and run.owner_after is not None else None},
                "qualification_limits": {"owner_mcp_servers_disabled": True, "plugins_disabled": True,
+                   "shell_snapshot_disabled": True, "snapshot_exec_path_qualified": False,
                    "unaided_recall_proven": False, "command_exclusivity_proven": False,
                    "live_reasks_enabled": False,
-                   "checked_set_scope": "test isolation; owner MCP/plugin configuration excluded"},
+                   "checked_set_scope": "owner MCP/plugin configuration excluded; "
+                       "shell_snapshot disabled for test isolation; the snapshot exec path is not qualified"},
                "record_only_scope": ["no reported tool items; execution absence unproven",
                                      "never-ask denied-write command visibility",
                                      "six independent inducible no-grant paths"],
@@ -2938,7 +2942,7 @@ class SafetyTests(unittest.TestCase):
 
     def test_safe_owned_argv_and_name_validation(self):
         self.assertEqual(server_args(["ok-name_1"]), ["--disable", "apps", "--disable", "plugins",
-                         "-c", "notify=[]", "-c", "mcp_servers.ok-name_1.enabled=false"])
+                         "--disable", "shell_snapshot", "-c", "notify=[]", "-c", "mcp_servers.ok-name_1.enabled=false"])
         for name in ('a.b', '"quoted"', '', 'space name', 'a=b'):
             with self.subTest(name=name), self.assertRaisesRegex(Blocked, "MCP name"):
                 server_args([name])
@@ -3010,7 +3014,7 @@ class SafetyTests(unittest.TestCase):
         stop.assert_called_once()
 
     def config_fixture(self):
-        return {"config": {"features": {key: False for key in ("apps", "plugins", "memories", "hooks")},
+        return {"config": {"features": {key: False for key in ("apps", "plugins", "memories", "hooks", "shell_snapshot")},
                 "notify": [], "model_provider": "openai", "profile": None,
                 "model_providers": {}, "otel": None,
                 "mcp_servers": {"ok": {"enabled": False}}}}
@@ -3475,9 +3479,41 @@ class SafetyTests(unittest.TestCase):
             with self.subTest(method=method), self.assertRaisesRegex(Blocked, "inventory"):
                 Wire("0.160.1").outgoing({"id": 1, "method": method, "params": params})
 
+    def test_owned_server_disables_shell_snapshot_on_its_argv(self):
+        args = server_args(["ok"])
+        self.assertIn(("--disable", "shell_snapshot"), list(zip(args, args[1:])))
+        self.assertIn("mcp_servers.ok.enabled=false", args)
+
+    def test_feature_preflight_requires_effective_shell_snapshot_disable(self):
+        run = self.run_object()
+        for snapshot in ("shell_snapshot stable true\n", ""):
+            listing = "apps beta false\nplugins experimental false\n" + snapshot
+            with self.subTest(snapshot=snapshot), \
+                 mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, listing, "")), \
+                 self.assertRaisesRegex(Blocked, "features list"):
+                feature_preflight(run.codex, run.env, run.work)
+        good = subprocess.CompletedProcess([], 0,
+                   "apps beta false\nplugins experimental false\nshell_snapshot stable false\n", "")
+        with mock.patch.object(subprocess, "run", return_value=good):
+            self.assertTrue(feature_preflight(run.codex, run.env, run.work)["registry_checked"])
+
+    def test_config_read_requires_effective_shell_snapshot_disable(self):
+        for snapshot in (True, None, "false", "omitted"):
+            config = self.config_fixture()
+            if snapshot == "omitted":
+                config["config"]["features"].pop("shell_snapshot", None)
+            else:
+                config["config"]["features"]["shell_snapshot"] = snapshot
+            with self.subTest(snapshot=snapshot), self.assertRaisesRegex(Blocked, "owned feature overrides"):
+                effective_config(config, ["ok"])
+        config = self.config_fixture()
+        config["config"]["features"]["shell_snapshot"] = False
+        self.assertTrue(effective_config(config, ["ok"])["all_servers_disabled"])
+
     def test_feature_preflight_private_home_and_overrides(self):
         run = self.run_object()
-        good = subprocess.CompletedProcess([], 0, "plugins experimental false\napps beta false\n", "")
+        good = subprocess.CompletedProcess([], 0,
+                   "plugins experimental false\napps beta false\nshell_snapshot stable false\n", "")
         with mock.patch.object(subprocess, "run", return_value=good) as called:
             feature_preflight(run.codex, run.env, run.work)
         args, kwargs = called.call_args
@@ -3490,20 +3526,21 @@ class SafetyTests(unittest.TestCase):
     def test_feature_preflight_omits_mcp_overrides_owned_server_keeps_them(self):
         run = self.run_object()
         owned_args = server_args(["ok"])
-        good = subprocess.CompletedProcess([], 0, "plugins experimental false\napps beta false\n", "")
+        good = subprocess.CompletedProcess([], 0,
+                   "plugins experimental false\napps beta false\nshell_snapshot stable false\n", "")
         with mock.patch.object(subprocess, "run", return_value=good) as called:
             feature_preflight(run.codex, run.env, run.work)
         probe_args = called.call_args.args[0]
         self.assertEqual(probe_args, [str(run.codex), "features", "list", "--disable", "apps",
-                                    "--disable", "plugins", "-c", "notify=[]"])
+                                    "--disable", "plugins", "--disable", "shell_snapshot", "-c", "notify=[]"])
         self.assertFalse(any("mcp_servers" in arg for arg in probe_args))
         self.assertIn("mcp_servers.ok.enabled=false", owned_args)
 
     def test_feature_preflight_unavailable_or_unverified_blocks(self):
         run = self.run_object()
-        for code, text in ((1, ""), (0, "apps beta false\n"),
-                           (0, "plugins beta true\napps beta false\n"),
-                           (0, "plugins beta false\nplugins beta false\napps beta false\n")):
+        for code, text in ((1, ""), (0, "apps beta false\nshell_snapshot stable false\n"),
+                           (0, "plugins beta true\napps beta false\nshell_snapshot stable false\n"),
+                           (0, "plugins beta false\nplugins beta false\napps beta false\nshell_snapshot stable false\n")):
             with self.subTest(code=code, text=text), \
                  mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, text, "")), \
                  self.assertRaisesRegex(Blocked, "features list"):
@@ -3522,7 +3559,7 @@ class SafetyTests(unittest.TestCase):
                     run.owner_codex.mkdir()
                     (run.owner_codex / "auth.json").touch(mode=0o600)
                     version = subprocess.CompletedProcess([], 0, "codex-cli 0.160.1\n", "")
-                    listing = subprocess.CompletedProcess([], 0, "apps beta false\n" +
+                    listing = subprocess.CompletedProcess([], 0, "apps beta false\nshell_snapshot stable false\n" +
                               ("plugins experimental false\n" if verified else ""), "")
                     with mock.patch(__name__ + ".mcp_names", return_value=["ok"]), \
                          mock.patch.object(subprocess, "run", side_effect=[version, listing]) as called:
@@ -3530,7 +3567,7 @@ class SafetyTests(unittest.TestCase):
                             run.preflight()
                             proof = json.loads((run.evidence / "preflight.json").read_text())
                             self.assertEqual(proof["feature_registry"], {"apps_disabled": True,
-                                             "plugins_disabled": True, "registry_checked": True})
+                                             "plugins_disabled": True, "shell_snapshot_disabled": True, "registry_checked": True})
                         else:
                             with self.assertRaisesRegex(Blocked, "features list"):
                                 run.preflight()
@@ -5854,7 +5891,7 @@ class SafetyTests(unittest.TestCase):
             sent.append(request["method"])
             result = {"initialize": {"userAgent": "via/0.160.1"},
                       "config/read": {"config": {"features": {key: False for key in
-                          ("apps", "plugins", "memories", "hooks")}, "notify": [],
+                          ("apps", "plugins", "memories", "hooks", "shell_snapshot")}, "notify": [],
                           "model_provider": "openai", "profile": None, "model_providers": {},
                           "otel": None, "mcp_servers": {"foreign": {"enabled": True}} if nonempty else {}}},
                       "model/list": {"data": [], "nextCursor": None}}.get(request["method"])
