@@ -88,6 +88,8 @@ environment values or owner paths. Responses are paired with requests; duplicate
 or unknown IDs block. Scoped notifications racing an establishing reply are
 forwarded immediately; their facts remain deferred within count/byte bounds
 until that reply proves ownership. A mismatching or missing reply blocks.
+Nonownership safety checks run before forwarding, and the oldest deferred entry
+has a 30 s monotonic deadline, including silence and stdout backpressure.
 VIA receipt/status/events/cancel/result/wait/close/daemon replies have
 method-specific schemas; missing/mistyped relied-on fields block.
 Events paginate with strict progress and deadlines. All loops have bounds.
@@ -160,6 +162,8 @@ TURN_LIMIT, ACTIVE_LIMIT, WALL_S, RUN_S = 7, 2, 120, 1200
 LINE_BYTES, TRACE_BYTES, PROC_BYTES = 8 * 1024 * 1024, 16 * 1024 * 1024, 256 * 1024
 PAGE_LIMIT, POLL_S, PROC_COUNT = 1000, 90, 32768
 REQUEST_LIMIT = 4096
+# Packet §3 start ordering/runtime §8: qualification's pending ownership deadline.
+DEFER_S = 30
 # Packet §§4/8: finite configuration inventory and notification-method evidence.
 MCP_LIMIT, NOTIFICATION_METHOD_LIMIT = 128, 128
 # Runtime §6.1: fixed file proof, read no more than one byte beyond this marker.
@@ -464,7 +468,7 @@ def effective_config(result, names):
             and config.get("profile") is None
             and (config.get("model_providers") is None
                  or type(config.get("model_providers")) is dict and config["model_providers"] == {})
-            and (config.get("otel", False) is None
+            and (config.get("otel") is None
                  or type(config.get("otel")) is dict and config["otel"] == {}),
             "config/read side-effect provider/profile/telemetry configuration unsupported")
     require(type(servers) is dict and len(servers) <= MCP_LIMIT,
@@ -535,6 +539,7 @@ class Wire:
         return value
 
     def outgoing(self, message):
+        self.deferred_timeout()
         require(isinstance(message, dict), "protocol request shape")
         if "method" not in message:
             key = digest(message["id"])
@@ -626,21 +631,31 @@ class Wire:
         return {key for key, request in self.pending.items()
                 if request["method"] == "turn/start" and request["thread"] == thread and turn is not None}
 
+    def deferred_timeout(self):
+        """Packet §3 start ordering: bound the oldest unproved ownership to 30 s."""
+        if not self.deferred:
+            return None
+        remaining = DEFER_S - (time.monotonic() - self.deferred[0][3])
+        require(remaining >= 0, "deferred notification deadline")
+        return remaining
+
     def resolve_deferred(self, replied):
         """Packet §3 start ordering: publish deferred facts only after ownership proof."""
+        self.deferred_timeout()
         pending, self.deferred = self.deferred, []
         self.deferred_bytes = 0
-        for message, candidates, size in pending:
+        for message, candidates, size, created in pending:
             candidates.discard(replied)
             scope = self.scope(message["method"], message["params"])
             if self.owns(scope):
                 self.incoming(message)
             else:
                 require(bool(candidates), "unowned deferred notification after establishing reply")
-                self.deferred.append((message, candidates, size))
+                self.deferred.append((message, candidates, size, created))
                 self.deferred_bytes += size
 
     def incoming(self, message):
+        self.deferred_timeout()
         require(isinstance(message, dict), "protocol reply shape")
         if "id" in message and "method" not in message:
             require(type(message["id"]) in (str, int), "protocol id shape")
@@ -683,20 +698,11 @@ class Wire:
         require(type(method) is str and isinstance(params, dict), "notification schema")
         require(method != "mcpServer/startupStatus/updated", "MCP startup observed despite disables")
         scope = self.scope(method, params)
-        if scope is not None and not self.owns(scope):
-            candidates = self.establishing(scope) if "id" not in message else set()
-            require(bool(candidates), "unowned thread/turn notification; correlation unavailable")
-            size = len(json.dumps(message).encode())
-            require(len(self.deferred) < REQUEST_LIMIT and self.deferred_bytes + size <= TRACE_BYTES,
-                    "deferred notification bound")
-            self.deferred.append((copy.deepcopy(message), candidates, size))
-            self.deferred_bytes += size
-            # The proxy forwards this line immediately, but publishes no fact
-            # until an establishing reply proves its thread/turn ownership.
-            return None
         if method == "remoteControl/status/changed":
             require(params.get("status") == "disabled", "remote control not disabled")
         if "id" in message:
+            require(scope is None or self.owns(scope),
+                    "unowned thread/turn notification; correlation unavailable")
             key = digest(message["id"])
             require(type(message["id"]) in (str, int) and key not in self.server_requests
                     and len(self.server_requests) < REQUEST_LIMIT, "duplicate/server request bound")
@@ -734,6 +740,17 @@ class Wire:
                             command_hash=command_digest(item.get("command")),
                             exit_code=code, read_only_error=isinstance(output, str)
                             and "Read-only file system" in output)
+        if scope is not None and not self.owns(scope):
+            candidates = self.establishing(scope)
+            require(bool(candidates), "unowned thread/turn notification; correlation unavailable")
+            size = len(json.dumps(message).encode())
+            require(len(self.deferred) < REQUEST_LIMIT and self.deferred_bytes + size <= TRACE_BYTES,
+                    "deferred notification bound")
+            self.deferred.append((copy.deepcopy(message), candidates, size, time.monotonic()))
+            self.deferred_bytes += size
+            # Only ownership remains unproved. The proxy forwards immediately;
+            # no fact is published before a matching establishing reply.
+            return None
         if fact["kind"] == "notification":
             key = fact["method_hash"]
             require(key in self.notifications or len(self.notifications) < NOTIFICATION_METHOD_LIMIT,
@@ -859,7 +876,11 @@ async def proxy(control, argv):
         async def incoming():
             nonlocal inventory_pending
             while True:
-                raw = await proc.stdout.readline()
+                timeout = wire.deferred_timeout()
+                try:
+                    raw = await asyncio.wait_for(proc.stdout.readline(), timeout)
+                except asyncio.TimeoutError:
+                    raise Blocked("deferred notification deadline") from None
                 if not raw:
                     return
                 message = decode_line(raw)
@@ -877,7 +898,14 @@ async def proxy(control, argv):
                         wire.fact(**fact)
                 # Nonblocking bounded stdout: a daemon that stops reading cannot
                 # prevent the proxy's lifetime bound or owned-child cleanup.
-                await forward_stdout(raw)
+                timeout = wire.deferred_timeout()
+                try:
+                    await asyncio.wait_for(forward_stdout(raw), timeout)
+                except asyncio.TimeoutError:
+                    # Preserve stdout's own shorter deadline when ownership
+                    # has not expired; either timeout still blocks the run.
+                    wire.deferred_timeout()
+                    raise
 
         tasks = [asyncio.create_task(outgoing()), asyncio.create_task(incoming())]
         done, pending = await asyncio.wait(tasks, timeout=RUN_S, return_when=asyncio.FIRST_COMPLETED)
@@ -2063,6 +2091,69 @@ class SafetyTests(unittest.TestCase):
                 with self.subTest(key=key, value=value), self.assertRaises(Blocked):
                     effective_config(candidate, ["ok"])
 
+    def test_config_read_unset_otel(self):
+        for value in (None, {}):
+            candidate = self.config_fixture()
+            candidate["config"]["otel"] = value
+            self.assertTrue(effective_config(candidate, ["ok"])["all_servers_disabled"])
+        candidate["config"].pop("otel")
+        self.assertTrue(effective_config(candidate, ["ok"])["all_servers_disabled"])
+        for value in (False, [], "foreign", {"exporter": "foreign"}):
+            candidate["config"]["otel"] = value
+            with self.subTest(value=value), self.assertRaises(Blocked):
+                effective_config(candidate, ["ok"])
+
+    def test_deferred_age_blocks_late_traffic_and_reply(self):
+        for operation in ("notification", "request", "reply"):
+            with self.subTest(operation=operation), \
+                 mock.patch.object(time, "monotonic", return_value=100) as clock:
+                wire = self.owned_wire()
+                wire.outgoing({**self.start_message(), "id": 2})
+                wire.incoming({"method": "turn/started", "params": {
+                    "threadId": "t", "turn": {"id": "v"}}})
+                clock.return_value = 130
+                wire.incoming({"method": "thread/status/changed", "params": {"threadId": "t"}})
+                clock.return_value = 130.001
+                with self.assertRaisesRegex(Blocked, "deferred notification deadline"):
+                    if operation == "notification":
+                        wire.incoming({"method": "thread/status/changed", "params": {"threadId": "t"}})
+                    elif operation == "request":
+                        wire.outgoing({"id": 3, "method": "model/list", "params": {}})
+                    else:
+                        wire.incoming({"id": 2, "result": {"turn": {"id": "v"}}})
+
+    def test_unrelated_reply_does_not_reset_deferred_age(self):
+        with mock.patch.object(time, "monotonic", return_value=100) as clock:
+            wire = self.owned_wire()
+            wire.outgoing({**self.start_message(), "id": 2})
+            wire.outgoing({"id": 3, "method": "model/list", "params": {}})
+            wire.incoming({"method": "turn/started", "params": {
+                "threadId": "t", "turn": {"id": "v"}}})
+            clock.return_value = 129
+            wire.incoming({"id": 3, "result": {"data": [], "nextCursor": None}})
+            clock.return_value = 131
+            with self.assertRaisesRegex(Blocked, "deferred notification deadline"):
+                wire.resolve_deferred(digest(3))
+
+    def test_item_safety_checked_before_deferral(self):
+        for item in ({"type": "collabAgentToolCall"}, {"type": "mcpToolCall"},
+                     {"type": "commandExecution", "command": "true", "exitCode": False},
+                     {"type": "commandExecution", "command": "true", "aggregatedOutput": []}):
+            with self.subTest(item=item):
+                wire = self.owned_wire()
+                wire.outgoing({**self.start_message(), "id": 2})
+                with self.assertRaises(Blocked):
+                    wire.incoming({"method": "item/started", "params": {
+                        "threadId": "t", "turnId": "v", "item": item}})
+                self.assertEqual(wire.deferred, [])
+
+    def test_remote_control_checked_with_establishment_pending(self):
+        wire = self.owned_wire()
+        wire.outgoing({**self.start_message(), "id": 2})
+        with self.assertRaisesRegex(Blocked, "remote control"):
+            wire.incoming({"method": "remoteControl/status/changed", "params": {"status": "enabled"}})
+        self.assertEqual(wire.deferred, [])
+
     def test_mcp_startup_notification_always_blocks(self):
         for params in ({}, {"status": "ready"}, {"status": "failed"}):
             with self.subTest(params=params), self.assertRaisesRegex(Blocked, "MCP startup"):
@@ -2844,8 +2935,9 @@ class SafetyTests(unittest.TestCase):
 
     async def proxy_fixture(self, nonempty=False, identity_error=False, pidfd_error=False,
                             termination=False, foreign=False, reused=False, after_signal=False,
-                         executable_mismatch=False, duplicate_config=False, config=None,
-                         race=None, observed=None, startup=False):
+                            executable_mismatch=False, duplicate_config=False, config=None,
+                            race=None, observed=None, startup=False, forward_pause=False,
+                            unsafe_item=False):
         """Entire stdio exchange using fake transports; no process or real /proc."""
         binary = self.root / "fake-codex"
         binary.write_text("synthetic executable")
@@ -2880,10 +2972,14 @@ class SafetyTests(unittest.TestCase):
                 result = {"model": MODEL, "approvalPolicy": "never", "approvalsReviewer": "user",
                           "thread": {"id": "t"}}
             if request["method"] == "turn/start" and race:
-                for notification in (
+                notifications = (
                     {"method": "turn/started", "params": {"threadId": "t", "turn": {"id": "u"}}},
                     {"method": "turn/completed", "params": {"threadId": "t",
-                     "turn": {"id": "u", "status": "completed"}}}):
+                     "turn": {"id": "u", "status": "completed"}}})
+                if unsafe_item:
+                    notifications = ({"method": "item/started", "params": {
+                        "threadId": "t", "turnId": "u", "item": {"type": "mcpToolCall"}}},)
+                for notification in notifications:
                     native.feed_data(json.dumps(notification).encode() + b"\n")
             if request["method"] == "config/read" and startup:
                 native.feed_data(b'{"method":"mcpServer/startupStatus/updated","params":{}}\n')
@@ -2904,7 +3000,10 @@ class SafetyTests(unittest.TestCase):
                     rows = [decode_line(line) for line in next(traces.iterdir()).read_bytes().splitlines(keepends=True)]
                     self.assertFalse(any(row["kind"] == "terminal" for row in rows))
                     # Reply only after the early notification was forwarded.
-                    if race == "missing":
+                    if race == "stall":
+                        if forward_pause:
+                            await asyncio.sleep(0.1)
+                    elif race == "missing":
                         native.feed_eof()
                         upstream.feed_eof()
                     else:
@@ -3007,6 +3106,35 @@ class SafetyTests(unittest.TestCase):
         self.assertFalse(rows[-1]["complete"])
         self.assertTrue(rows[-1]["child_reaped"])
         self.assertEqual(rows[-1]["blocked_reason"], "MCP startup observed despite disables")
+
+    def test_proxy_deferred_deadline_reaps_silent_or_backpressured_child(self):
+        for paused in (False, True):
+            with self.subTest(paused=paused), tempfile.TemporaryDirectory() as root:
+                previous, self.root = self.root, Path(root)
+                try:
+                    with mock.patch(__name__ + ".DEFER_S", 0.01, create=True), \
+                         mock.patch(__name__ + ".RUN_S", 0.2):
+                        result, child, signals, sent, traces = asyncio.run(
+                            self.proxy_fixture(race="stall", forward_pause=paused))
+                    self.assertEqual(result, 1)
+                    rows = [decode_line(line) for line in next(traces.iterdir()).read_bytes().splitlines(keepends=True)]
+                    self.assertFalse(rows[-1]["complete"])
+                    self.assertTrue(rows[-1]["child_reaped"])
+                    self.assertEqual(rows[-1]["blocked_reason"], "deferred notification deadline")
+                finally:
+                    self.root = previous
+
+    def test_proxy_disallowed_deferred_item_never_reaches_stdout(self):
+        observed = []
+        with mock.patch(__name__ + ".RUN_S", 0.2):
+            result, child, signals, sent, traces = asyncio.run(
+                self.proxy_fixture(race="match", unsafe_item=True, observed=observed))
+        self.assertEqual(result, 1)
+        self.assertNotIn("item/started", observed)
+        rows = [decode_line(line) for line in next(traces.iterdir()).read_bytes().splitlines(keepends=True)]
+        self.assertFalse(rows[-1]["complete"])
+        self.assertTrue(rows[-1]["child_reaped"])
+        self.assertEqual(rows[-1]["blocked_reason"], "background agent or unqualified tool item")
 
     def test_proxy_nonempty_inventory_stops_before_discovery(self):
         result, child, signals, sent, traces = asyncio.run(self.proxy_fixture(nonempty=True))
