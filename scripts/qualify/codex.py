@@ -266,6 +266,8 @@ WALL_S, RUN_S = 120, 1200
 LINE_BYTES, TRACE_BYTES, PROC_BYTES = 8 * 1024 * 1024, 16 * 1024 * 1024, 256 * 1024
 # Packet §8: bounded executable hashing for the fixed Python bound probe.
 TOOL_EXE_BYTES = 128 * 1024 * 1024
+# Packet §8: preflight/final wrapper hashing admits the installed 289 MB native image.
+WRAPPER_EXE_BYTES = 512 * 1024 * 1024
 PAGE_LIMIT, POLL_S, PROC_COUNT = 1000, 90, 32768
 REQUEST_LIMIT = 4096
 # Packet §3 start ordering/runtime §8: qualification's pending ownership deadline.
@@ -529,6 +531,19 @@ class Proc:
         finally:
             os.close(fd)
 
+    def executable_identity(self, ident):
+        """Packet §8/runtime §5.2: pin image metadata through proc dirfds, without byte reads."""
+        fd, _ = self.open(ident["pid"], ident["start_ticks"])
+        require(fd is not None, "unverifiable identity: changed process")
+        try:
+            executable = os.open("exe", os.O_PATH | os.O_CLOEXEC, dir_fd=fd)
+            try:
+                return bound_probe.file_identity(os.fstat(executable))
+            finally:
+                os.close(executable)
+        finally:
+            os.close(fd)
+
     def own(self, ident, root):
         """Walk a fresh pinned ancestry; names/markers alone never confer ownership."""
         current, seen = ident, set()
@@ -548,14 +563,34 @@ class Proc:
         raise Blocked("foreign process: ancestry bound")
 
 
+def pin_executable(path, expected=None):
+    """Packet §8: hash one regular pinned descriptor and reject mutation during its read."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    with os.fdopen(fd, "rb") as file:
+        info = os.fstat(file.fileno())
+        require(stat.S_ISREG(info.st_mode) and info.st_size <= WRAPPER_EXE_BYTES,
+                "wrapper executable file/byte bound")
+        identity, hashed, size = bound_probe.file_identity(info), hashlib.sha256(), 0
+        while raw := file.read(1024 * 1024):
+            size += len(raw)
+            require(size <= WRAPPER_EXE_BYTES, "wrapper executable byte bound")
+            hashed.update(raw)
+        require(bound_probe.file_identity(os.fstat(file.fileno())) == identity,
+                "wrapper executable changed while hashing")
+    require(expected is None or hashed.hexdigest() == expected, "pinned-hash mismatch")
+    return {"sha256": hashed.hexdigest(), "identity": identity}
+
+
 def pins(via, codex, via_hash, codex_hash, model):
     require(model == MODEL, "model must be gpt-6-luna")
-    for path, expected in ((via, via_hash), (codex, codex_hash)):
+    for expected in (via_hash, codex_hash):
         require(bool(re.fullmatch(r"[0-9a-f]{64}", expected)), "pinned-hash missing")
-        require(shared.sha256(path) == expected, "pinned-hash mismatch")
+    require(shared.sha256(via) == via_hash, "pinned-hash mismatch")
+    native = pin_executable(codex, codex_hash)
     with open(codex, "rb") as file:
         require(file.read(4) == b"\x7fELF" and os.access(codex, os.X_OK),
                 "--codex must be the native executable, not a launcher")
+    return native
 
 
 def credential_metadata(home):
@@ -1475,6 +1510,7 @@ class Run(shared.Run):
             self.reservations = reservation_control.Reservations(self.work / "reservations.json", self.spend.deadline)
             self.tool_program, self.tool_program_hash = bound_probe.write_program(self.work)
             self.command_specs, self.command_observations, self.wrapper_hashes = {}, {}, {}
+            self.wrapper_files, self.wrapper_identities = {}, {}
             self.codex = Path(args.codex).resolve()
             self.launcher = self.work / "codex-proxy"
             self.base_env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(self.home),
@@ -1499,7 +1535,7 @@ class Run(shared.Run):
         require(not any(char.isspace() for char in sys.executable), "interpreter path whitespace unsupported")
         require(sys.platform == "linux" and hasattr(os, "pidfd_open")
                 and hasattr(signal, "pidfd_send_signal"), "Linux pidfd support required")
-        pins(self.via, self.codex, self.args.via_sha256, self.args.codex_sha256, self.model)
+        native_pin = pins(self.via, self.codex, self.args.via_sha256, self.args.codex_sha256, self.model)
         tool_bounds = bound_probe.runtime_bounds()
         self.check("tool runtime bounds below 8 s", True)
         auth = credential_metadata(self.owner_codex)
@@ -1517,7 +1553,7 @@ class Run(shared.Run):
         require(bool(re.fullmatch(r"\d+\.\d+\.\d+", self.args.candidate_version)),
                 "candidate version shape")
         feature_check = feature_preflight(self.codex, self.env, self.work)
-        self.wrapper_hashes = self.wrapper_pins()
+        self.wrapper_hashes = self.wrapper_pins(native_pin)
         control = {"codex": str(self.codex), "codex_hash": self.args.codex_sha256,
                    "codex_home": str(self.owner_codex), "mcp_names": names, "model": MODEL,
                    "trace_dir": str(self.trace_dir), "version": self.args.candidate_version,
@@ -1538,6 +1574,7 @@ class Run(shared.Run):
             "auth_metadata": auth, "mcp_name_digests": [digest(name) for name in names],
             "binaries": {"via": self.args.via_sha256, "codex": self.args.codex_sha256,
                          "wrappers": self.wrapper_hashes,
+                         "wrapper_identities": self.wrapper_identities,
                          "python": shared.sha256(sys.executable),
                          "runner": shared.sha256(__file__),
                          "lifecycle": shared.sha256(shared.__file__),
@@ -1546,13 +1583,48 @@ class Run(shared.Run):
                          "tool_program": self.tool_program_hash,
                          "proxy_launcher": shared.sha256(self.launcher)}})
 
-    def wrapper_pins(self):
-        """Packet §8: resolve system transports and record hashes, never owner configuration."""
+    def wrapper_paths(self):
+        """Packet §8: bundled transport stays beneath the pinned release; system lookup is fixed."""
+        release = self.codex.parent.parent
+        bundled = release / "codex-resources/bwrap"
         bwrap = shutil.which("bwrap", path=os.defpath)
-        require(bwrap is not None, "system bwrap unavailable for wrapper verification")
-        return {"codex": self.args.codex_sha256,
-                "bwrap": shared.sha256(Path(bwrap).resolve()),
-                "bash": shared.sha256(Path("/bin/bash").resolve())}
+        paths = {"codex": self.codex, "bash": Path("/bin/bash").resolve()}
+        if bundled.exists():
+            require(bundled.resolve().is_relative_to(release), "bundled bwrap escapes pinned release")
+            paths["bwrap"] = bundled.resolve()
+            if bwrap is not None and Path(bwrap).resolve() != paths["bwrap"]:
+                paths["bwrap_system"] = Path(bwrap).resolve()
+        else:
+            require(bwrap is not None, "system bwrap unavailable for wrapper verification")
+            paths["bwrap"] = Path(bwrap).resolve()
+        return paths
+
+    def wrapper_pins(self, native_pin=None):
+        """Packet §8: hash transport bytes once at preflight and retain their file identities."""
+        self.wrapper_files = self.wrapper_paths()
+        records = {}
+        for name, path in self.wrapper_files.items():
+            if name == "codex" and native_pin is not None:
+                require(bound_probe.file_identity(path.stat()) == native_pin["identity"],
+                        "native executable changed after preflight hash")
+                records[name] = native_pin
+            else:
+                records[name] = pin_executable(path, self.args.codex_sha256 if name == "codex" else None)
+        self.wrapper_identities = {name: record["identity"] for name, record in records.items()}
+        return {name: record["sha256"] for name, record in records.items()}
+
+    def verify_wrapper_pins(self):
+        """Packet §8: final accounting rechecks the exact preflight files, identities and hashes."""
+        shared.interrupt_guard()
+        require(bool(self.wrapper_files) and self.wrapper_files.keys() == self.wrapper_hashes.keys()
+                == self.wrapper_identities.keys(), "wrapper executable pins unavailable")
+        for name, path in self.wrapper_files.items():
+            try:
+                record = pin_executable(path, self.wrapper_hashes[name])
+                require(record["identity"] == self.wrapper_identities[name], "wrapper executable pin changed")
+            except (OSError, Blocked):
+                raise Blocked("wrapper executable pin changed") from None
+        self.check("wrapper executable pins unchanged", True)
 
     def via_call(self, directory, label, *args, timeout=60, handle=None):
         """Strict CLI reply schema; handles on stdin, no stdout/stderr persisted."""
@@ -1827,7 +1899,7 @@ class Run(shared.Run):
                     attempt=spec["argv"] if spec else None, denied=spec["denied"] if spec else None,
                     program=spec["program"] if spec else None,
                     program_hash=spec["program_hash"] if spec else None, require_refusal=refusal,
-                    wrapper_hashes=self.wrapper_hashes)
+                    wrapper_hashes=self.wrapper_hashes, wrapper_identities=self.wrapper_identities)
         prefix = "changed-bound" if label == "c2" else "command-" + label
         survey = bound_probe.Survey(probe)
         deadline = min(time.monotonic() + POLL_S, self.spend.deadline)
@@ -2156,6 +2228,7 @@ def native_disposition(run, envelope, facts=None):
 def reservation_accounting(run, facts):
     """Packet §7: reservations, receipts, envelopes and native starts are a bijection."""
     run.check_execution_observations()
+    run.verify_wrapper_pins()
     snapshot = run.reservations.snapshot()
     rows = snapshot["rows"]
     envelopes = [envelope_identity(envelope) for envelope in run.envelopes]
@@ -2804,6 +2877,13 @@ class SafetyTests(unittest.TestCase):
             os.environ.pop("CODEX_HOME", None)
             run = Run(args)
         self.addCleanup(shutil.rmtree, run.work, True)
+        paths = {"codex": codex}
+        for name in ("bwrap", "bash"):
+            path = run.work / ("synthetic-" + name)
+            path.write_bytes(("synthetic system wrapper " + name).encode())
+            paths[name] = path
+        with mock.patch.object(run, "wrapper_paths", return_value=paths):
+            run.wrapper_hashes = run.wrapper_pins()
         return run
 
     def start_message(self, model=MODEL):
@@ -4930,6 +5010,8 @@ class SafetyTests(unittest.TestCase):
         probe = bound_probe.DeniedExecution(legacy.python, legacy.python_hash, legacy.target,
                     attempt, [*attempt, "1"], program, pinned, mode in ("denied", "never-ask"))
         probe.wrapper_hashes = pins
+        probe.wrapper_identities = {name: bound_probe.file_identity((self.root / ("wrapper-" + name)).stat())
+                                    for name in pins}
         fixture = json.loads((Path(__file__).parent / "fixtures/codex-0.160.1-wrappers.json").read_text())
         wrappers = []
         for pid, (shape, executable) in enumerate((("launcher", "codex"), ("bwrap", "bwrap"),
@@ -4947,6 +5029,124 @@ class SafetyTests(unittest.TestCase):
         (self.root / "6/cwd").symlink_to(legacy.target.parent)
         (self.root / "6/cmdline").write_bytes("\0".join(attempt).encode() + b"\0")
         return probe, proc, server, tool, wrappers
+
+    def test_wrapper_observation_never_reads_executable_bytes_on_the_hot_path(self):
+        for failure in (OSError("synthetic exec during read"), Blocked("tool executable byte bound")):
+            with self.subTest(failure=type(failure).__name__), tempfile.TemporaryDirectory() as root:
+                previous, self.root = self.root, Path(root)
+                try:
+                    probe, proc, server, _, wrappers = self.wrapper_probe_fixture()
+                    probe.wrapper_identities = {}
+                    for name in probe.wrapper_hashes:
+                        info = (self.root / ("wrapper-" + name)).stat()
+                        probe.wrapper_identities[name] = (info.st_dev, info.st_ino, info.st_size,
+                                                          info.st_mtime_ns, info.st_ctime_ns)
+                    survey = bound_probe.Survey(probe)
+                    with mock.patch.object(proc, "executable_hash", side_effect=failure) as read:
+                        self.assertIsNone(probe.observe(proc, wrappers[0][0], server, survey))
+                    sample = survey.snapshot("pending", {}, [])["observations"][0]
+                    self.assertEqual(sample["wrapper_shape"]["executable_class"], "codex")
+                    probe.require_no_blockers()
+                    read.assert_not_called()
+                    self.assertFalse(probe.seen)
+                finally:
+                    self.root = previous
+
+    def test_wrapper_exec_race_preserves_only_an_exact_earlier_verified_observation(self):
+        for earlier, changed_command in ((True, False), (False, False), (True, True)):
+            with self.subTest(earlier=earlier, changed_command=changed_command), tempfile.TemporaryDirectory() as root:
+                previous, self.root = self.root, Path(root)
+                try:
+                    probe, proc, server, _, wrappers = self.wrapper_probe_fixture()
+                    identity, argv = wrappers[0]
+                    if earlier:
+                        probe.observe(proc, identity, server)
+                        probe.require_no_blockers()
+                    if changed_command:
+                        argv[-1] += " "
+                        (self.root / "2/cmdline").write_bytes("\0".join(argv).encode() + b"\0")
+                    with mock.patch.object(proc, "executable_identity", side_effect=OSError("synthetic exec race")):
+                        self.assertIsNone(probe.observe(proc, identity, server))
+                    if earlier and not changed_command:
+                        probe.require_no_blockers()
+                        self.assertEqual(len(probe.pending_wrappers), 1)
+                    else:
+                        with self.assertRaisesRegex(Blocked, "command deviation"):
+                            probe.require_no_blockers()
+                    self.assertFalse(probe.seen)
+                finally:
+                    self.root = previous
+
+    def test_final_accounting_rejects_changed_wrapper_files(self):
+        for changed in ("codex_replaced", "bwrap_bytes", "bash_metadata", "hash_only", "none"):
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory() as root:
+                previous, self.root = self.root, Path(root)
+                try:
+                    run = self.run_object()
+                    if changed == "codex_replaced":
+                        other = self.root / "replacement"
+                        other.write_bytes(run.codex.read_bytes())
+                        os.replace(other, run.codex)  # Same bytes, different file identity.
+                    elif changed in ("bwrap_bytes", "hash_only"):
+                        path = run.wrapper_files["bwrap"]
+                        path.write_bytes(b"synthetic changed wrapper")
+                        if changed == "hash_only":
+                            # Keep the identity comparison satisfied to discriminate the byte-hash gate.
+                            run.wrapper_identities["bwrap"] = bound_probe.file_identity(path.stat())
+                    elif changed == "bash_metadata":
+                        path = run.wrapper_files["bash"]
+                        info = path.stat()
+                        os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns + 1))
+                    if changed == "none":
+                        self.assertEqual(reservation_accounting(run, [])["rows"], {})
+                        self.assertTrue(all(check["pass"] for check in run.checks))
+                    else:
+                        with self.assertRaisesRegex(Blocked, "wrapper executable pin changed"):
+                            reservation_accounting(run, [])
+                finally:
+                    self.root = previous
+
+    def test_preflight_wrapper_pins_hash_native_once_and_record_only_metadata(self):
+        run = self.run_object()
+        native = pin_executable(run.codex, run.args.codex_sha256)
+        paths = dict(run.wrapper_files)
+        with mock.patch.object(run, "wrapper_paths", return_value=paths), \
+             mock.patch(__name__ + ".pin_executable", wraps=pin_executable) as hashed:
+            hashes = run.wrapper_pins(native)
+        self.assertNotIn(run.codex, [call.args[0] for call in hashed.call_args_list])
+        self.assertEqual(len(hashed.call_args_list), 2)
+        for name, path in paths.items():
+            self.assertEqual(hashes[name], shared.sha256(path))
+            self.assertEqual(run.wrapper_identities[name], bound_probe.file_identity(path.stat()))
+            self.assertEqual(len(run.wrapper_identities[name]), 5)
+        self.assertTrue(secret_free({"hashes": hashes, "identities": run.wrapper_identities}))
+        run.codex.write_bytes(b"synthetic replaced native")
+        with mock.patch.object(run, "wrapper_paths", return_value=paths), \
+             self.assertRaisesRegex(Blocked, "native executable changed"):
+            run.wrapper_pins(native)
+
+    def test_bundled_bwrap_is_pinned_under_release_and_cannot_escape_it(self):
+        run = self.run_object()
+        release = self.root / "release"
+        native = release / "bin/codex"
+        native.parent.mkdir(parents=True)
+        native.write_bytes(run.codex.read_bytes())
+        bundled = release / "codex-resources/bwrap"
+        bundled.parent.mkdir()
+        bundled.write_bytes(b"synthetic bundled wrapper")
+        run.codex = native
+        with mock.patch.object(shutil, "which", return_value=None):
+            paths = run.wrapper_paths()
+        self.assertEqual(paths["bwrap"], bundled)
+        self.assertNotIn("bwrap_system", paths)
+        hashes = run.wrapper_pins()
+        self.assertEqual(hashes["bwrap"], shared.sha256(bundled))
+        self.assertEqual(run.wrapper_identities["bwrap"], bound_probe.file_identity(bundled.stat()))
+        bundled.unlink()
+        bundled.symlink_to(self.root / "outside-release")
+        (self.root / "outside-release").write_bytes(b"synthetic foreign wrapper")
+        with self.assertRaisesRegex(Blocked, "escapes pinned release"):
+            run.wrapper_paths()
 
     def test_verified_wrapper_suffix_chain_for_every_tool_mode(self):
         for mode in ("allowed", "denied", "never-ask", "interrupt-a", "interrupt-b"):
@@ -5019,23 +5219,25 @@ class SafetyTests(unittest.TestCase):
 
     def test_wrapper_pins_resolve_system_binaries_and_block_missing_bwrap(self):
         run = self.run_object()
-        with mock.patch.object(shutil, "which", return_value=str(self.root / "system-bwrap")) as resolve, \
-             mock.patch.object(shared, "sha256", return_value="a" * 64) as hashed:
-            pins = run.wrapper_pins()
+        release = self.root / "release"
+        native = release / "bin/codex"
+        native.parent.mkdir(parents=True)
+        native.write_bytes(run.codex.read_bytes())
+        run.codex = native
+        with mock.patch.object(shutil, "which", return_value=str(self.root / "system-bwrap")) as resolve:
+            paths = run.wrapper_paths()
         resolve.assert_called_once_with("bwrap", path=os.defpath)
-        self.assertEqual(pins, {"codex": run.args.codex_sha256, "bwrap": "a" * 64, "bash": "a" * 64})
-        self.assertEqual(hashed.call_args_list, [mock.call((self.root / "system-bwrap").resolve()),
-                                                mock.call(Path("/bin/bash").resolve())])
+        self.assertEqual(paths, {"codex": native, "bwrap": (self.root / "system-bwrap").resolve(),
+                                 "bash": Path("/bin/bash").resolve()})
         with mock.patch.object(shutil, "which", return_value=None), \
-             mock.patch.object(shared, "sha256") as hashed, \
              self.assertRaisesRegex(Blocked, "system bwrap unavailable"):
-            run.wrapper_pins()
-        hashed.assert_not_called()
+            run.wrapper_paths()
 
     def test_run_observer_pairs_verified_suffix_wrappers_before_refusal_proof(self):
         probe, proc, server, tool, wrappers = self.wrapper_probe_fixture("denied")
         run = self.run_object()
         run.wrapper_hashes = probe.wrapper_hashes
+        run.wrapper_identities = probe.wrapper_identities
         generation, thread, turn = digest("generation"), digest("thread"), digest("turn")
         facts = [{"kind": "reply", "method": "turn/start", "reservation": digest("c2"),
                   "trace": generation, "thread": thread, "turn": turn},
@@ -5101,7 +5303,8 @@ class SafetyTests(unittest.TestCase):
                 refusal = mode in ("denied", "never-ask")
                 probe = bound_probe.DeniedExecution(legacy.python, legacy.python_hash, legacy.target,
                             spec["argv"], spec["denied"], spec["program"], spec["program_hash"], refusal,
-                            wrapper_hashes={"bash": legacy.python_hash})
+                            wrapper_hashes={"bash": legacy.python_hash},
+                            wrapper_identities={"bash": bound_probe.file_identity(Path(legacy.python).stat())})
                 wrapper = [part.replace(fixture["command"], command) for part in fixture["shell"]]
                 self.probe_argv(wrapper)
                 self.assertIsNone(probe.observe(proc, tool, server))
@@ -5135,7 +5338,8 @@ class SafetyTests(unittest.TestCase):
             with self.subTest(argv_hash=digest(argv)):
                 probe = bound_probe.DeniedExecution(legacy.python, legacy.python_hash, legacy.target,
                             spec["argv"], spec["denied"], spec["program"], spec["program_hash"],
-                            wrapper_hashes={"bash": legacy.python_hash})
+                            wrapper_hashes={"bash": legacy.python_hash},
+                            wrapper_identities={"bash": bound_probe.file_identity(Path(legacy.python).stat())})
                 self.probe_argv(argv)
                 probe.observe(proc, tool, server)
                 with self.assertRaisesRegex(Blocked, "command deviation"):
@@ -5146,7 +5350,8 @@ class SafetyTests(unittest.TestCase):
                     probe.require_no_blockers()
         probe = bound_probe.DeniedExecution(legacy.python, legacy.python_hash, legacy.target,
                     spec["argv"], spec["denied"], spec["program"], spec["program_hash"],
-                    wrapper_hashes={"bash": legacy.python_hash})
+                    wrapper_hashes={"bash": legacy.python_hash},
+                    wrapper_identities={"bash": bound_probe.file_identity(Path(legacy.python).stat())})
         self.probe_argv(["/bin/bash", "-lc", command])
         probe.observe(proc, tool, server)
         self.probe_argv(spec["denied"])

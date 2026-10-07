@@ -116,6 +116,11 @@ def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
+def file_identity(info):
+    """Packet §8: descriptor metadata links a live image to its preflight byte hash."""
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
 def command(python, target):
     """Packet §3: one fixed attempt, no retry; quote only runner-selected argv."""
     return shlex.join([str(Path(python).resolve()), "-c", ATTEMPT_CODE, target.name])
@@ -229,13 +234,14 @@ class Survey:
 class DeniedExecution:
     """Packet §§3/5: pin exact owned argv; writes additionally require the EROFS transition."""
     def __init__(self, python, python_hash, target, attempt=None, denied=None, program=None,
-                 program_hash=None, require_refusal=True, wrapper_hashes=None):
+                 program_hash=None, require_refusal=True, wrapper_hashes=None, wrapper_identities=None):
         self.python, self.python_hash, self.target = str(Path(python).resolve()), python_hash, Path(target)
         self.attempt = attempt or [self.python, "-c", ATTEMPT_CODE, self.target.name]
         self.denied = denied or [self.python, "-c", DENIED_CODE, DENIED_TAG]
         self.program, self.program_hash, self.require_refusal = program, program_hash, require_refusal
         self.seen, self.blockers, self.execution_observed = set(), set(), False
         self.wrapper_hashes, self.pending_wrappers = dict(wrapper_hashes or {}), {}
+        self.wrapper_identities, self.verified_wrappers = dict(wrapper_identities or {}), {}
 
     def require_no_blockers(self):
         """Packet §§3/7: later exact observations cannot erase an earlier deviation."""
@@ -292,20 +298,28 @@ class DeniedExecution:
             if related:
                 self.execution_observed = True
                 executable_class = None
-                try:
-                    hashed = proc.executable_hash(identity)
-                    executable_class = next((name for name, pinned in self.wrapper_hashes.items()
-                                             if name in ("codex", "bwrap", "bash") and hashed == pinned), None)
-                except (OSError, Blocked):
-                    pass  # An unreadable executable can never authorize a transport.
-                wrapper_shape = self.wrapper_shape(argv, executable_class)
                 token = identity["pid"], identity["start_ticks"]
+                observation = (*token, digest(argv))
+                try:
+                    metadata = proc.executable_identity(identity)
+                    executable_class = next(("bwrap" if name == "bwrap_system" else name
+                                             for name, pinned in self.wrapper_identities.items()
+                                             if name in ("codex", "bwrap", "bwrap_system", "bash")
+                                             and metadata == pinned), None)
+                except (OSError, Blocked):
+                    # Reuse only this exact earlier verified transport observation;
+                    # an exec/exit race cannot confer identity on a new mention.
+                    executable_class = self.verified_wrappers.get(observation)
+                wrapper_shape = self.wrapper_shape(argv, executable_class)
                 if not self.command_wrapper(argv) or executable_class is None \
                         or token == (server["pid"], server["start_ticks"]):
                     self.blockers.add("command deviation")
                 else:
                     if token not in self.pending_wrappers and len(self.pending_wrappers) >= SURVEY_RECORDS:
                         raise Blocked("prohibited execution wrapper evidence bound")
+                    if observation not in self.verified_wrappers and len(self.verified_wrappers) >= SURVEY_RECORDS:
+                        raise Blocked("prohibited execution wrapper evidence bound")
+                    self.verified_wrappers[observation] = executable_class
                     self.pending_wrappers[token] = identity
             if survey is not None:
                 survey.observe(proc, identity, argv, wrapper_shape)
