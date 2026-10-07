@@ -121,7 +121,10 @@ fn oc04_two_turns_and_restart_reopen_preserve_identity_and_never_resend() {
         .iter()
         .filter(|request| request["target"] == format!("/api/session/{SES}"))
         .count();
-    assert_eq!(before_reopen, 1, "turn two checks its current variant");
+    assert_eq!(
+        before_reopen, 2,
+        "each admitted turn checks its current variant"
+    );
     let third = run(async {
         let daemon = case.daemon();
         daemon.try_resume(&session, &json!({})).await.unwrap();
@@ -141,8 +144,8 @@ fn oc04_two_turns_and_restart_reopen_preserve_identity_and_never_resend() {
             .iter()
             .filter(|r| r["target"] == format!("/api/session/{SES}"))
             .count(),
-        before_reopen + 1,
-        "one identity/settings read on the new server generation"
+        before_reopen + 2,
+        "identity/settings and admitted variant reads on the new server generation"
     );
     assert_eq!(
         case.requests_to("GET", &format!("/api/session/{SES}/inbox"))

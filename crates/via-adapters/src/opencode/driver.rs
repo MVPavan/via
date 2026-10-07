@@ -555,8 +555,7 @@ async fn setup(
 }
 
 /// Everything before the prompt (§5, §6): the server, its facts, the
-/// effort's catalog check, the session's open on this generation and the
-/// variant step.
+/// effort's catalog check and the session's open on this generation.
 async fn set_up(
     facts: &mut Turn<'_>,
     settings: &Settings,
@@ -579,14 +578,12 @@ async fn set_up(
     let Some((generation, opened)) = facts.session.attach(&pin, facts.driver) else {
         return Err(Box::new(facts.rejected(StartRejected::SessionGone)));
     };
-    let (id, current) = if opened {
-        let id = facts.driver.state().identity.clone().ok_or_else(|| {
+    let id = if opened {
+        facts.driver.state().identity.clone().ok_or_else(|| {
             Box::new(facts.rejected(StartRejected::Protocol(
                 "the session is open with no identity".to_owned(),
             )))
-        })?;
-        let current = read_variant(facts, &server, &id).await?;
-        (id, current)
+        })?
     } else {
         let identity = facts.driver.state().identity.clone();
         let info = match identity {
@@ -594,16 +591,14 @@ async fn set_up(
             None => create(facts, &server, settings, digest).await?,
         };
         confirm(facts, (generation, &info.id)).await?;
-        let current = variant_of(&info);
-        (info.id, current)
+        info.id
     };
-    // The variant mutation belongs after the execution rule; the readback
-    // itself is safe before admission.
+    // §7.2, §8: both the decisive variant readback and its mutation follow admission,
+    // so an earlier driver's kept model exchange has completed before either.
     Ok(execution::Opened {
         server,
         id,
         generation,
-        variant: current,
         variant_checked,
     })
 }
@@ -1020,9 +1015,10 @@ async fn confirm(facts: &Turn<'_>, (generation, id): (u64, &str)) -> Result<(), 
 pub(super) async fn switch_variant(
     facts: &Turn<'_>,
     server: &Arc<Server>,
-    (settings, id, current): (&Settings, &str, String),
+    (settings, id): (&Settings, &str),
     digest: &str,
 ) -> Result<(), Box<TurnEnd>> {
+    let current = read_variant(facts, server, id).await?;
     if current == settings.readback_variant() {
         return Ok(());
     }

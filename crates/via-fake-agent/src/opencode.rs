@@ -52,10 +52,16 @@ const FAILED: i32 = 4;
 const CRASHED: i32 = 9;
 /// The largest request head the fake reads.
 const HEAD_BYTES: usize = 64 * 1024;
+/// Fixture-only release bounds for held-response regressions (`opencode.md` §8).
+const FIXTURE_GATE_WAIT: Duration = Duration::from_secs(5);
+const FIXTURE_GATE_POLL: Duration = Duration::from_millis(5);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Fixture {
+    /// Stored variants used by `$VARIANT` readbacks and prompt request evidence (§5).
+    #[serde(default)]
+    session_variants: std::collections::HashMap<String, String>,
     #[serde(default)]
     version: Version,
     #[serde(default)]
@@ -154,6 +160,12 @@ struct Response {
     emit_early: bool,
     #[serde(default)]
     sleep_ms: u64,
+    /// Hold this response until the fixture releases a file under its private root (§8).
+    #[serde(default)]
+    wait_for_file: Option<PathBuf>,
+    /// Apply the request's model variant immediately before the complete response (§5).
+    #[serde(default)]
+    apply_variant: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -268,6 +280,7 @@ fn run(argv0: &Path, fixture_path: &Path) -> Result<i32, Box<dyn std::error::Err
         )
     });
     let shared = Arc::new(Shared {
+        variants: std::sync::Mutex::new(fixture.session_variants.clone()),
         fixture,
         expected,
         requests: sibling(argv0, ".requests"),
@@ -346,6 +359,7 @@ fn report(argv0: &Path, password: Option<&str>) -> Result<(), Box<dyn std::error
 }
 
 struct Shared {
+    variants: std::sync::Mutex<std::collections::HashMap<String, String>>,
     fixture: Fixture,
     expected: Option<String>,
     requests: PathBuf,
@@ -390,11 +404,22 @@ fn serve(shared: &Shared, stream: TcpStream) -> Result<(), Box<dyn std::error::E
         (Some(given), Some(expected)) if given == expected => "ok",
         (Some(_), _) => "bad",
     };
+    let path = target.split('?').next().unwrap_or_default();
+    let session = path
+        .strip_prefix("/api/session/")
+        .and_then(|tail| tail.split('/').next())
+        .unwrap_or_default();
+    let variant = shared
+        .variants
+        .lock()
+        .map_err(|_| "poisoned")?
+        .get(session)
+        .cloned();
     append(
         &shared.requests,
         &json!({"pid": process::id(), "method": method, "target": target, "auth": auth,
             "body": serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null),
-            "received_ms": shared.started.elapsed().as_millis()}),
+            "received_ms": shared.started.elapsed().as_millis(), "variant": variant}),
     )?;
     let mut stream = stream;
     if auth != "ok" || matches!(shared.fixture.auth, Auth::Reject) {
@@ -408,7 +433,6 @@ fn serve(shared: &Shared, stream: TcpStream) -> Result<(), Box<dyn std::error::E
             None,
         );
     }
-    let path = target.split('?').next().unwrap_or_default();
     let found = shared.fixture.routes.iter().enumerate().find(|(_, route)| {
         route.method == method
             && (route.path == target
@@ -439,10 +463,6 @@ fn serve(shared: &Shared, stream: TcpStream) -> Result<(), Box<dyn std::error::E
     else {
         return respond(&mut stream, 500, "application/json", &[], b"{}", None);
     };
-    let session = path
-        .strip_prefix("/api/session/")
-        .and_then(|tail| tail.split('/').next())
-        .unwrap_or_default();
     reply(shared, &mut stream, &response, &body, session, path)
 }
 
@@ -459,15 +479,33 @@ fn reply(
         path.split_once("/inbox/")
             .map_or(Value::Null, |(_, id)| json!({"id":id}))
     });
-    let expand = |value: &Value| substitute(value, &input, session);
     if response.emit_early {
-        shared
-            .frames
-            .lock()
-            .map_err(|_| "poisoned")?
-            .extend(response.emit.iter().map(expand));
+        shared.frames.lock().map_err(|_| "poisoned")?.extend(
+            response
+                .emit
+                .iter()
+                .map(|value| substitute(value, &input, session, "")),
+        );
     }
     thread::sleep(Duration::from_millis(response.sleep_ms));
+    if let Some(release) = &response.wait_for_file {
+        let by = std::time::Instant::now() + FIXTURE_GATE_WAIT;
+        while !release.is_file() {
+            if std::time::Instant::now() >= by {
+                return Err("fixture response release timed out".into());
+            }
+            thread::sleep(FIXTURE_GATE_POLL);
+        }
+    }
+    let variant = {
+        let mut variants = shared.variants.lock().map_err(|_| "poisoned")?;
+        if response.apply_variant {
+            let variant = input["model"]["variant"].as_str().unwrap_or("default");
+            variants.insert(session.to_owned(), variant.to_owned());
+        }
+        variants.get(session).cloned().unwrap_or_default()
+    };
+    let expand = |value: &Value| substitute(value, &input, session, &variant);
     let (content_type, mut bytes) = match (&response.json, &response.raw) {
         (Some(value), _) => (
             "application/json",
@@ -503,8 +541,9 @@ fn reply(
     Ok(())
 }
 
-fn substitute(value: &Value, input: &Value, session: &str) -> Value {
+fn substitute(value: &Value, input: &Value, session: &str, variant: &str) -> Value {
     match value {
+        Value::String(text) if text == "$VARIANT" => Value::String(variant.to_owned()),
         Value::String(text) if text.contains("$INPUT") => {
             Value::String(text.replace("$INPUT", input["id"].as_str().unwrap_or_default()))
         }
@@ -512,13 +551,13 @@ fn substitute(value: &Value, input: &Value, session: &str) -> Value {
         Value::Array(items) => Value::Array(
             items
                 .iter()
-                .map(|item| substitute(item, input, session))
+                .map(|item| substitute(item, input, session, variant))
                 .collect(),
         ),
         Value::Object(members) => Value::Object(
             members
                 .iter()
-                .map(|(key, item)| (key.clone(), substitute(item, input, session)))
+                .map(|(key, item)| (key.clone(), substitute(item, input, session, variant)))
                 .collect(),
         ),
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => value.clone(),

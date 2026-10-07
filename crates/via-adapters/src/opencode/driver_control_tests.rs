@@ -280,7 +280,7 @@ fn oc04_c2_idle_retirement_reopens_identity_once_without_resending() {
         .await;
         row(&rig, 2, "running");
         let mut reopened = Lane::open(&rig, true);
-        let (next, _) = reopened.turn(2, None, Duration::from_secs(5)).await;
+        let (next, observations) = reopened.turn(2, None, Duration::from_secs(5)).await;
         reopened.close().await;
         let requests = rig.requests();
         rig.finish().await;
@@ -290,6 +290,14 @@ fn oc04_c2_idle_retirement_reopens_identity_once_without_resending() {
             "closing the last idle driver retires its generation"
         );
         assert_eq!(prompts(&requests).len(), 2, "each input is submitted once");
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|item| matches!(item.observation, crate::Observation::IdentityConfirmed(_)))
+                .count(),
+            1,
+            "new generation confirms the reopened identity exactly once"
+        );
         assert_eq!(
             requests
                 .iter()
@@ -304,8 +312,8 @@ fn oc04_c2_idle_retirement_reopens_identity_once_without_resending() {
                 .filter(|request| request["method"] == "GET"
                     && request["target"] == format!("/api/session/{SES}"))
                 .count(),
-            1,
-            "new generation reopens identity exactly once"
+            3,
+            "one reopen readback plus the admitted variant readback for each turn"
         );
         assert_eq!(
             requests

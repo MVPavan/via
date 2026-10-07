@@ -575,6 +575,15 @@ fn oc09_drain_preserves_an_unrelated_already_sent_turn() {
             ]),
         ),
     );
+    // §5, §7.2: the second session's admitted variant readback precedes its prompt.
+    fixture = with_route(
+        fixture,
+        route(
+            "GET",
+            &format!("/api/session/{OTHER}"),
+            json!([{"status":200,"json":other}]),
+        ),
+    );
     let mut first_begin = begin_events();
     first_begin[3]["data"]["assistantMessageID"] = json!("msg_first");
     fixture = with_route(fixture, core_opencode::prompt_route(first_begin));
@@ -797,6 +806,15 @@ fn oc09_http_limit_fails_its_turn_and_preserves_an_unrelated_sent_turn() {
             json!([
                 {"status":200,"json":info},{"status":200,"json":other}
             ]),
+        ),
+    );
+    // §5, §7.2: the second session's admitted variant readback precedes its prompt.
+    fixture = with_route(
+        fixture,
+        route(
+            "GET",
+            &format!("/api/session/{OTHER}"),
+            json!([{"status":200,"json":other}]),
         ),
     );
     let mut first_begin = begin_events();

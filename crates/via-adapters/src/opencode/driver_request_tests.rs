@@ -201,8 +201,14 @@ async fn cancelled_setup(setup: Setup) {
         (cancelled, end)
     });
     let entered = if held_pool {
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        !active.is_finished() && requests_to(&rig.requests(), &setup_target) == before
+        until(|| {
+            live.routing()
+                .state(SES)
+                .is_some_and(|state| state.pending_requests > 0)
+        })
+        .await
+            && !active.is_finished()
+            && requests_to(&rig.requests(), &setup_target) == before
     } else {
         until(|| requests_to(&rig.requests(), &setup_target) > before).await
     };
@@ -416,4 +422,166 @@ fn oc08_c2_cancelled_pending_prompt_keeps_200_and_cancels_queued_input() {
 #[test]
 fn oc08_c2_cancelled_pending_prompt_keeps_200_and_interrupts_delivered_input() {
     run(cancelled_pending_prompt(true));
+}
+
+/// §5, §7.2, §8: the kept switch changes the vendor's variant only at release.
+fn kept_variant_fixture(cwd: &str, release: &std::path::Path) -> Value {
+    let mut next = fixture(cwd, success());
+    next["session_variants"] = json!({SES:"low"});
+    for route in next["routes"].as_array_mut().unwrap() {
+        if route["path"] == "/api/model" {
+            route["responses"][0]["json"]["data"][0]["variants"] =
+                json!([{"id":"low"},{"id":"high"}]);
+        }
+        if route["path"] == "/api/session" {
+            route["responses"][0]["json"]["data"]["model"]["variant"] = json!("low");
+        }
+        if route["path"] == format!("/api/session/{SES}") {
+            route["responses"][0]["json"]["data"]["model"]["variant"] = json!("$VARIANT");
+        }
+    }
+    replace(
+        &mut next,
+        route(
+            "POST",
+            &format!("/api/session/{SES}/model"),
+            &json!([
+                {"status":204,"wait_for_file":release,"apply_variant":true},
+                {"status":204,"apply_variant":true}
+            ]),
+        ),
+    );
+    next
+}
+
+async fn successor_after_kept_variant(reopened: bool) {
+    let rig = Rig::new(&json!({}));
+    let release = rig.root().join("release-model-switch");
+    rig.fixture(&kept_variant_fixture(
+        rig.root().to_str().unwrap(),
+        &release,
+    ));
+    row(&rig, 1, "running");
+    let mut lane = Lane::open(&rig, false);
+    let (warm, _) = lane.turn(1, Some("low"), Duration::from_secs(4)).await;
+    row(&rig, 1, "completed");
+    let live = server(&lane).unwrap();
+    let model_target = format!("/api/session/{SES}/model");
+    let (context, stop) = controls(&lane, 2);
+    let active = tokio::spawn(async move {
+        let (end, _) = lane.turn_context(Some("high"), context).await;
+        (lane, end)
+    });
+    let sent = until(|| requests_to(&rig.requests(), &model_target) == 1).await;
+    cancel(&stop, Duration::from_millis(20));
+    let (lane, stopped) = active.await.unwrap();
+    let retained = live
+        .routing()
+        .state(SES)
+        .is_some_and(|state| state.pending_requests == 1);
+    let mut successor = if reopened {
+        let successor = Lane::open(&rig, true);
+        // Pin before closing the old driver: its current exchange still owns this generation.
+        let _pin = successor.driver.prepare();
+        lane.close().await;
+        successor
+    } else {
+        lane
+    };
+    row(&rig, 3, "running");
+    let instruction_target = format!("/api/experimental/session/{SES}/instructions/entries");
+    let before = requests_to(&rig.requests(), &instruction_target);
+    let (context, successor_stop) = controls(&successor, 3);
+    let (end, entered, waited, prompts_before_release) = {
+        let future = successor.turn_context(Some("low"), context);
+        tokio::pin!(future);
+        // Poll through setup; keep the successor future pinned while checking the held exchange.
+        let mut early = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(match future.as_mut().poll(cx) {
+                std::task::Poll::Ready(end) => Some(end),
+                std::task::Poll::Pending => None,
+            })
+        })
+        .await;
+        let entered = if reopened && early.is_none() {
+            // Losing the monitor consumes nothing; the same turn future remains pinned.
+            let reopen_setup = until(|| requests_to(&rig.requests(), &instruction_target) > before);
+            tokio::select! {
+                end = &mut future => { early = Some(end); false },
+                entered = reopen_setup => entered,
+            }
+        } else {
+            early.is_none()
+        };
+        // Any pre-admission read has answered before release; the earlier switch remains pending.
+        let waited = until(|| {
+            live.routing()
+                .state(SES)
+                .is_some_and(|state| state.pending_requests == 1)
+        })
+        .await;
+        let prompts_before_release = prompts(&rig.requests()).len();
+        std::fs::write(&release, b"").unwrap();
+        let (end, _) = if let Some(end) = early {
+            end
+        } else {
+            future.await
+        };
+        (end, entered, waited, prompts_before_release)
+    };
+    drop(successor_stop);
+    successor.close().await;
+    drop(stop);
+    let requests = rig.requests();
+    rig.finish().await;
+    assert!(warm.terminal.is_some(), "warmup: {warm:?}");
+    assert!(
+        sent && retained && entered && waited,
+        "held setup: {stopped:?}"
+    );
+    assert_eq!(
+        prompts_before_release, 1,
+        "successor must wait for the kept switch"
+    );
+    assert!(end.terminal.is_some(), "successor: {end:?}");
+    assert_own_variant(&requests, &model_target);
+}
+
+fn assert_own_variant(requests: &[Value], model_target: &str) {
+    let switches: Vec<_> = requests
+        .iter()
+        .filter(|request| request["target"] == model_target)
+        .map(|request| request["body"]["model"]["variant"].clone())
+        .collect();
+    assert_eq!(switches, vec![json!("high"), json!("low")]);
+    let prompts = prompts(requests);
+    assert_eq!(prompts.len(), 2, "never resend the stopped turn's prompt");
+    assert_eq!(prompts[1]["variant"], "low", "effort at prompt dispatch");
+    let prompt_index = requests
+        .iter()
+        .rposition(|request| {
+            request["target"]
+                .as_str()
+                .is_some_and(|target| target.ends_with("/prompt"))
+        })
+        .unwrap();
+    assert_eq!(
+        requests[prompt_index - 1]["target"],
+        format!("/api/session/{SES}")
+    );
+    assert_eq!(
+        requests[prompt_index - 1]["variant"],
+        "low",
+        "own switch was read back"
+    );
+}
+
+#[test]
+fn oc05_c2_kept_model_switch_is_read_after_successor_admission() {
+    run(successor_after_kept_variant(false));
+}
+
+#[test]
+fn oc05_c2_kept_model_switch_is_read_after_reopened_admission() {
+    run(successor_after_kept_variant(true));
 }

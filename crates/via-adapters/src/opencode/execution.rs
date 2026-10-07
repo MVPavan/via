@@ -71,7 +71,6 @@ pub(super) struct Opened {
     pub(super) server: Arc<Server>,
     pub(super) id: String,
     pub(super) generation: u64,
-    pub(super) variant: String,
     pub(super) variant_checked: bool,
 }
 
@@ -129,13 +128,7 @@ async fn prepare(
     {
         return Err(end);
     }
-    switch_variant(
-        facts,
-        server,
-        (settings, id, opened.variant.clone()),
-        digest,
-    )
-    .await?;
+    switch_variant(facts, server, (settings, id), digest).await?;
     let link_by = Deadline::at((Instant::now() + Duration::from_secs(3)).min(facts.wall.instant()));
     match server
         .link_turn(&facts.driver.spec.session_id, facts.number, link_by)

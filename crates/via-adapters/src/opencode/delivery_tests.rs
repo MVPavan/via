@@ -1119,6 +1119,102 @@ async fn oc09_terminal_releases_text_and_call_samples_without_losing_result() {
     assert_output_released(&delivery);
 }
 
+/// §7.3–§7.4: cleanup observations cannot replace the first native terminal snapshot.
+#[tokio::test]
+async fn oc09_repeated_terminal_during_tool_grace_keeps_first_result() {
+    let (registration, delivery, mut receiver) = setup();
+    assert!(
+        registration
+            .process(accepted(&delivery))
+            .await
+            .is_continue()
+    );
+    drop(receiver.recv().await.unwrap());
+    seed_retained_output(&registration, &delivery).await;
+    assert!(
+        registration
+            .process(cleanup_tool(&delivery, 4, ToolKind::Called))
+            .await
+            .is_continue()
+    );
+    let first_at = Instant::now();
+    let mut first = succeeded(&delivery, 5);
+    if let LaneItem::Event(event) = &mut first {
+        event.decoded_at = first_at;
+    }
+    let consumer = {
+        let registration = registration.clone();
+        tokio::spawn(async move { registration.process(first).await.is_continue() })
+    };
+    assert!(matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), delivery.decision())
+            .await
+            .unwrap(),
+        Decision::Terminal
+    ));
+    let cleanup = {
+        let delivery = delivery.clone();
+        tokio::spawn(async move {
+            delivery
+                .cleanup(crate::Deadline::at(
+                    Instant::now() + std::time::Duration::from_secs(1),
+                ))
+                .await
+        })
+    };
+    delivery.cleanup_enabled.cancelled().await;
+    assert!(consumer.await.unwrap());
+    assert!(
+        registration
+            .process(succeeded(&delivery, 6))
+            .await
+            .is_continue()
+    );
+    assert!(
+        registration
+            .process(shutdown(&delivery, 7))
+            .await
+            .is_continue()
+    );
+    assert!(
+        registration
+            .process(cleanup_tool(&delivery, 8, ToolKind::Success))
+            .await
+            .is_continue()
+    );
+    let cleanup = cleanup.await.unwrap();
+    let sealed = delivery.seal();
+    let mut final_text = Vec::new();
+    while let Ok(admitted) = receiver.try_recv() {
+        if let Observation::FinalText(text) = admitted.item.observation {
+            final_text.push(text);
+        }
+    }
+    assert_eq!(cleanup, Cleanup::Quiescent);
+    assert_eq!(final_text, ["retained result"]);
+    let terminal = sealed.terminal.unwrap();
+    assert_eq!(terminal.at, first_at);
+    assert_eq!(terminal.status, VendorTerminalStatus::Completed);
+    assert_eq!(terminal.stop_reason, crate::StopReason::EndTurn);
+    assert_eq!(terminal.usage.unwrap().input, Some(7));
+    assert!(sealed.accounted);
+    assert_output_released(&delivery);
+}
+
+fn cleanup_tool(delivery: &Delivery, order: u64, kind: ToolKind) -> LaneItem {
+    event(
+        delivery,
+        order,
+        EventData::Tool {
+            kind,
+            assistant_message_id: Some("assistant_retained".into()),
+            call_id: "call_cleanup".into(),
+            tool: Some("bash".into()),
+            error: None,
+        },
+    )
+}
+
 /// §7.4, §9: an unknown turn keeps revision candidates only until its late terminal.
 #[tokio::test]
 async fn oc09_late_terminal_releases_text_and_call_samples() {

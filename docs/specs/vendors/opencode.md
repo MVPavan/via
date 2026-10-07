@@ -890,6 +890,9 @@ setup or prompt retains its original socket and response timeout while its nativ
 proceeds independently. E56 observed that an interrupt whose header block was never
 completed had no effect; this is evidence only, not a mechanism.
 
+A stop racing a sent session create or its instruction entry can leave one
+unadopted vendor session in VIA's private data root; VIA never uses it.
+
 | Request | Complete response | Meaning |
 |---|---|---|
 | prompt | 200 JSON, `data.id` = caller ID, `data.sessionID` = session | accepted |

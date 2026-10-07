@@ -91,7 +91,11 @@ impl Registration {
             turn.text_overflow();
             return None;
         }
-        let terminal = if matches!(
+        let terminal = if state.terminal.is_some() || state.had_terminal {
+            // §7.3–§7.4: tool cleanup may release the delivery fence while the
+            // first terminal is still retained. Its snapshots remain decisive.
+            None
+        } else if matches!(
             &event.event.data,
             EventData::Inbox { kind: InboxKind::Cancelled, id }
                 if id == turn.input.as_str() && !state.delivered_once

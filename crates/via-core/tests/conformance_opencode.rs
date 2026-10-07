@@ -195,6 +195,14 @@ fn oc02_inherit_states_and_one_shared_server() {
         fixture,
         route(
             "GET",
+            &format!("/api/session/{second_id}"),
+            json!([{"status":200,"json":second_info}]),
+        ),
+    );
+    fixture = with_route(
+        fixture,
+        route(
+            "GET",
             &format!("/api/session/{second_id}/inbox"),
             json!([{"status":200,"json":{"data":[]}}]),
         ),
@@ -302,7 +310,8 @@ fn oc04_reopen_reads_back_and_a_mismatch_is_not_cached() {
         assert_eq!(
             case.requests_to("GET", &format!("/api/session/{SES}"))
                 .len(),
-            1
+            2,
+            "initial variant readback, then the mismatched reopen readback"
         );
         prompt_count(&case, 1);
         // Not cached: a fresh session's plan passes.
@@ -424,10 +433,10 @@ fn oc04_the_variant_is_switched_read_back_and_cleared() {
             route(
                 "GET",
                 &format!("/api/session/{SES}"),
-                // Turn 1's readback after its switch; turn 2's before and
-                // after clearing; turn 3's before and after its ignored
-                // switch.
+                // Each turn reads the variant after admission and reads it
+                // again after switching; turn 3's switch is ignored.
                 json!([
+                    info("default"),
                     info("high"),
                     info("high"),
                     info("default"),
