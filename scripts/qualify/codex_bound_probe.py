@@ -14,7 +14,9 @@ ATTEMPT_OBSERVE_S, DENIED_OBSERVE_S = 3, 2
 # Packet §8: diagnostic evidence stays bounded even with changing owned argv.
 SURVEY_RECORDS = 256
 # Packet §§3/5/8: observable fixed scripts, one write attempt, bounded A/B waits.
-TOOL_PROGRAM_BYTES, A_SLEEP_S, B_SLEEP_S = 64 * 1024, 6, 6
+TOOL_PROGRAM_BYTES, A_WAIT_S, B_WAIT_S = 64 * 1024, 6, 6
+# Packet §§5/8: release polling stays inside the unchanged whole-program watchdog.
+HOLD_POLL_S = 0.05
 # Packet §§5/8: one whole-program deadline, below the observed 10 s yield window.
 TOOL_WATCHDOG_S, TOOL_RUNTIME_LIMIT_S = 7, 8
 TOOL_CODE = f'''import os,signal,sys,time
@@ -62,11 +64,18 @@ elif mode in ("denied", "never-ask"):
         os.write(fd, b"forbidden")
         os.close(fd)
         raise SystemExit(23)
-elif mode == "interrupt-a":
-    time.sleep({A_SLEEP_S})
-    print(line, flush=True)
-elif mode == "interrupt-b":
-    time.sleep({B_SLEEP_S})
+elif mode in ("interrupt-a", "interrupt-b"):
+    steps = {int(A_WAIT_S / HOLD_POLL_S)} if mode == "interrupt-a" else {int(B_WAIT_S / HOLD_POLL_S)}
+    for _ in range(steps):
+        try:
+            fd = os.open(REQUEST["release"], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            time.sleep({HOLD_POLL_S})
+        else:
+            os.close(fd)
+            break
+    else:
+        raise SystemExit(26)
     print(line, flush=True)
 else:
     raise SystemExit(24)
@@ -93,11 +102,11 @@ def runtime_bounds():
     bounds = {"allowed": ATTEMPT_OBSERVE_S,
               "denied": ATTEMPT_OBSERVE_S + DENIED_OBSERVE_S,
               "never-ask": ATTEMPT_OBSERVE_S + DENIED_OBSERVE_S,
-              "interrupt-a": A_SLEEP_S, "interrupt-b": B_SLEEP_S}
+              "interrupt-a": A_WAIT_S, "interrupt-b": B_WAIT_S}
     if not 0 < TOOL_WATCHDOG_S < TOOL_RUNTIME_LIMIT_S == 8 \
             or not all(0 < seconds < TOOL_WATCHDOG_S for seconds in bounds.values()):
         raise Blocked("tool program runtime bound")
-    return {"sleep_seconds": bounds, "watchdog_seconds": TOOL_WATCHDOG_S,
+    return {"wait_seconds": bounds, "watchdog_seconds": TOOL_WATCHDOG_S,
             "limit_seconds": TOOL_RUNTIME_LIMIT_S}
 
 

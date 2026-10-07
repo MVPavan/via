@@ -35,16 +35,29 @@ are recorded; the echo proves output was seen, never execution or refusal.
 All tool modes have a seven-second watchdog and an eight-second qualification
 limit; ordinary sleeps total at most six seconds, including refused-write exec.
 The exec carries the initial deadline, never a fresh budget. Preflight checks
-these bounds. B waits six seconds under that watchdog. Before requesting A's
-interrupt, require B's exact native command-start fact and a fresh pinned-process
-proof. Reverify that same B process while awaiting A's native interrupted terminal,
+these bounds. Submit A and B before awaiting either tool, in distinct workspaces
+so native reservations are unambiguous. Each holds on a private runner release
+file for at most six seconds. This needs overlapping tool lifetimes, not one
+program outliving the other's full model latency. Before requesting A's interrupt,
+require both exact native command-start facts and fresh pinned-process proof.
+Reverify that same B process while awaiting A's native interrupted terminal,
 before waiting for VIA's cleanup/envelope. The interrupt request fact timestamps
 its pre-forward observation, not the vendor's receipt. Final same-generation
 ordering requires B's native command start before the request and command end
 after A's native interrupted terminal, with B's process verified on both sides.
 No earlier A command completion is allowed. B's verified tool/nonce must complete
 independently. It proves live tool/turn isolation across native interruption,
-without requiring B's OS process to span A's entire cleanup interval.
+without requiring B's OS process to span A's entire cleanup interval. Release B
+only after A's native interrupted terminal and B's re-verification; release A too
+so a tool surviving its turn's interrupt can finish. B must complete independently:
+its interruption in run 8 was failure cleanup, not the successful isolation phase.
+The 10 s observed minimum yield therefore still binds B, and the seven-second
+watchdog/eight-second qualification cap stays for both. Expired overlap is "not
+induced", never a VIA failure or a qualification pass. The existing ledger permits
+only pure zero-command re-asks, not rerunning an already executing pair.
+Run 8's native B terminal preceded its exact command end by 5.749 s. This survival
+is record-only; no check requires OS-process exit at native interruption. A's
+quiescent cleanup claim, when present, still requires independent process absence.
 Interrupted A deliberately has no final-output echo gate: it still requires the
 exact native command/process, interrupted terminal and cleanup disposition.
 Low effort stays fixed: runs 2/3 invoked c1, whereas run 4 emitted no command
@@ -1623,11 +1636,25 @@ class Run(shared.Run):
         require(mode in ("allowed", "denied", "interrupt-a", "interrupt-b", "never-ask"), "fixed tool action")
         field = {"allowed": "a", "denied": "b"}.get(mode, "r")
         request = {"action": mode, "field": field, "seed": argument or "VIAQUAL" + secrets.token_hex(16)}
+        release = self.work / ("release-" + digest(label)[:16]) if mode.startswith("interrupt-") else None
+        if release is not None:
+            request["release"] = str(release)
         program, pinned = bound_probe.write_program(self.work, request, "tool-" + digest(label)[:16] + ".py")
         argv = [str(Path(sys.executable).resolve()), str(program)]
         self.command_specs[label] = {"argv": argv, "denied": [*argv, "1"], "program": program,
-                                     "program_hash": pinned, "field": field, "require_started": mode == "interrupt-b"}
+                                     "program_hash": pinned, "field": field,
+                                     "require_started": release is not None, "release": release}
         return shlex.join(argv)
+
+    def release_tool(self, label):
+        """Packet §§5/8: only the runner releases its private held tool; no vendor config writes."""
+        shared.interrupt_guard()
+        release = self.command_specs[label]["release"]
+        require(release is not None and release.parent == self.work, "tool release outside private root")
+        fd = os.open(release, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        os.close(fd)
+        self.record_only.append({"observation": "tool released", "label": label,
+                                 "release_hash": digest(str(release)), "at_ms": int(time.monotonic() * 1000)})
 
     def tool_reply(self, label, envelope, facts=None):
         """Packet §8: echo proves output was seen; protocol/process gates prove effects."""
@@ -1640,8 +1667,12 @@ class Run(shared.Run):
 
     def start_tool(self, label, verb, *args, target, bound, refusal, session=None):
         """Packet §§7/8: one same-prompt re-ask only after a proven zero-command completion."""
-        primary = label
         session = self.submit(label, verb, *args, session=session)
+        return self.await_tool(label, verb, *args, target=target, bound=bound, refusal=refusal, session=session)
+
+    def await_tool(self, label, verb, *args, target, bound, refusal, session):
+        """Packet §§7/8: observe an admitted tool; preserve the same bounded miss-only re-ask."""
+        primary = label
         for attempt in range(CASE_REASK_LIMIT + 1):
             observed = self.observe_denied_execution(label, target, bound, refusal)
             if observed is not None:
@@ -1821,6 +1852,8 @@ class Run(shared.Run):
                             return None
                         break
                 time.sleep(0.1)
+            if spec and spec.get("release") is not None:
+                raise Blocked("not induced: exact interrupt tool readiness unavailable within watchdog")
             raise Blocked("prohibited execution not observed")
         finally:
             tools = [{field: fact.get(field) for field in ("item_type", "item_hash", "at_ms", "finished",
@@ -2253,21 +2286,33 @@ def conversation(run):
 
 def interrupt(run):
     """Packet §§5/8: protocol cancel, surviving tools, interleaved isolation."""
+    run.record_only.append({"observation": "prior coordinator run 8: interrupted turn retained its tool",
+                            "candidate_version": "0.160.1", "terminal_to_command_end_ms": 5749,
+                            "source": "scratchpad/qualify/codex-run8/protocol.json", "terminal_seq": 61,
+                            "command_end_seq": 63, "historical": True})
     ws = run.work / "interrupt"
     ws.mkdir(mode=0o700)
+    wa, wb = ws / "a", ws / "b"
+    wa.mkdir(mode=0o700)
+    wb.mkdir(mode=0o700)
     command_a = run.fixed_command("a1", "interrupt-a")
-    a1, a, tool = run.start_tool("a1", "spawn", *spawn_args(run, ws, fixed_prompt(command_a)),
-                               target=ws / "unused-a", bound="workspaceWrite", refusal=False)
     command_b = run.fixed_command("b1", "interrupt-b")
-    b1, b, b_tool = run.start_tool("b1", "spawn", *spawn_args(run, ws, fixed_prompt(command_b)),
-                                  target=ws / "unused-b", bound="workspaceWrite", refusal=False)
+    args_a, args_b = spawn_args(run, wa, fixed_prompt(command_a)), spawn_args(run, wb, fixed_prompt(command_b))
+    # Submit both before surveying either: model latency is paid concurrently.
+    # Distinct cwd digests let the ledger uniquely claim native thread/start.
+    a = run.submit("a1", "spawn", *args_a)
+    b = run.submit("b1", "spawn", *args_b)
+    a1, a, tool = run.await_tool("a1", "spawn", *args_a, session=a,
+                               target=wa / "unused-a", bound="workspaceWrite", refusal=False)
+    b1, b, b_tool = run.await_tool("b1", "spawn", *args_b, session=b,
+                                  target=wb / "unused-b", bound="workspaceWrite", refusal=False)
     # B's observer waits for native item/started as well as the exact process.
     # Revalidate immediately before cancellation; retain both boundary proofs.
     for name, identity in (("A", tool), ("B", b_tool)):
         fd, live = Proc().open(identity["pid"], identity["start_ticks"])
         if fd is not None:
             os.close(fd)
-        run.check(name + " tool live before interrupt",
+        run.check("not induced: " + name + " tool live before interrupt",
                   fd is not None and live is not None and live["state"] != "Z")
     b_before = run.verify_tool_running(b1, b_tool)
     save(run.evidence / "interrupt-isolation.json", {"before_request": b_before, "outcome": "pending"})
@@ -2275,6 +2320,8 @@ def interrupt(run):
                                 timeout=WALL_S + 65, handle=run.handles[a])
     run.check("cancel through VIA", rc == 0 and cancel["cancel"] is not None)
     b_after = run.observe_tool_through_interrupt(b1, b_before, tool)
+    run.release_tool(b1)
+    run.release_tool(a1)
     ended = run.finish(a1)
     run.check("actual interrupted acknowledgement", ended["state"] == "cancelled"
               and ended["stop_reason"] == "interrupted" and ended["cancel"] is not None
@@ -3774,7 +3821,7 @@ class SafetyTests(unittest.TestCase):
         for same, timing in ((True, "overlap"), (False, "overlap"),
                              (True, "completed_early"), (True, "started_late"), (True, "a_gone"),
                              (True, "tool_ended_early"), (True, "b_tool_ended_early"),
-                             (True, "b_tool_ended_before_terminal"), (True, "b_gone")):
+                             (True, "b_tool_ended_before_terminal"), (True, "b_gone"), (True, "run8")):
             with self.subTest(same=same, timing=timing), tempfile.TemporaryDirectory() as root:
                 previous, self.root = self.root, Path(root)
                 try:
@@ -3815,18 +3862,35 @@ class SafetyTests(unittest.TestCase):
                         fact["at_ms"] = seq * 100
                     order = []
 
+                    admitted = {}
+
+                    def submit(label, *args, **kwargs):
+                        order.append("submit-" + label)
+                        if label in ("a1", "b1"):
+                            admitted[label] = args[args.index("--cwd") + 1]
+                        if label == "b1" and timing == "run8":
+                            self.assertNotEqual(admitted["a1"], admitted["b1"], "concurrent native claims need distinct cwd")
+                        return "b" if label == "b1" else "a"
+
                     def observed(label, *args):
+                        if timing == "run8" and label == "a1":
+                            self.assertIn("submit-b1", order,
+                                          "Run 8: waiting 10.1s for A before starting B adds B's 6s latency")
                         order.append("observe-" + label)
                         return {"pid": 3, "start_ticks": 30} if label == "b1" else {"pid": 2, "start_ticks": 20}
 
                     def observe_terminal(*args):
+                        self.assertFalse(run.command_specs["b1"]["release"].exists())
+                        self.assertFalse(run.command_specs["a1"]["release"].exists())
                         order.append("B-after-native-terminal")
                         return {"at_ms": a_end["seq"] * 100 + 1}
 
                     def finish(label):
-                        if same and timing == "overlap" and label == "a1":
+                        if same and timing in ("overlap", "run8") and label == "a1":
                             self.assertIn("B-after-native-terminal", order,
                                           "B must be reverified at the native A terminal, before envelope cleanup")
+                            self.assertTrue(run.command_specs["b1"]["release"].is_file())
+                            self.assertTrue(run.command_specs["a1"]["release"].is_file())
                         return {"a1": ended, "b1": other, "a2": after}[label]
 
                     def via_call(*args, **kwargs):
@@ -3837,7 +3901,7 @@ class SafetyTests(unittest.TestCase):
                     run.receipts = {"a1": ({"turn": "turn-a"}, "a")}
                     status = {"vendor_identity_verified": True, "progress": {"running_tools": ["fake"]},
                               "turns": [{"state": "running"}], "cancel": {"outcome": "requested"}}
-                    with mock.patch.object(run, "submit", side_effect=["a", "b", "a"]), \
+                    with mock.patch.object(run, "submit", side_effect=submit), \
                          mock.patch.object(run, "observe_denied_execution", side_effect=observed), \
                          mock.patch.object(run, "command_protocol"), mock.patch.object(run, "tool_reply"), \
                          mock.patch.object(run, "via_call", side_effect=via_call), \
@@ -3851,17 +3915,22 @@ class SafetyTests(unittest.TestCase):
                              (None, None) if timing == "a_gone" else (123, {"state": "S"}),
                              (None, None) if timing == "b_gone" else (124, {"state": "S"}), (None, None)]), \
                          mock.patch.object(os, "close"):
-                        if same and timing == "overlap":
+                        if same and timing in ("overlap", "run8"):
                             interrupt(run)
                             self.assertLess(order.index("observe-b1"), order.index("cancel-a"))
                             self.assertEqual(order[order.index("observe-b1") + 1], "cancel-a")
                         else:
-                            reason = {"a_gone": "A tool live before interrupt", "b_gone": "B tool live before interrupt",
+                            reason = {"a_gone": "not induced: A tool live before interrupt",
+                                      "b_gone": "not induced: B tool live before interrupt",
                                       "b_tool_ended_early": "B tool spans A interrupt",
                                       "b_tool_ended_before_terminal": "B tool spans A interrupt"}.get(timing,
                                       "B continues after A cancellation" if same else "shared owned server")
                             with self.assertRaisesRegex(Blocked, reason):
                                 interrupt(run)
+                            if timing in ("a_gone", "b_gone"):
+                                self.assertNotIn("cancel-a", order)
+                                self.assertEqual([entry for entry in order if entry.startswith("submit-")],
+                                                 ["submit-a1", "submit-b1"])  # No executed-pair re-ask authority.
                 finally:
                     self.root = previous
 
@@ -4418,7 +4487,7 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(fact.get("at_ms"), 1234)
 
     def test_b_tool_leaves_six_seconds_for_verified_interrupt_overlap(self):
-        self.assertGreaterEqual(bound_probe.B_SLEEP_S, 6)
+        self.assertGreaterEqual(bound_probe.B_WAIT_S, 6)
         bounds = bound_probe.runtime_bounds()
         self.assertLess(bounds["watchdog_seconds"], bounds["limit_seconds"])
 
@@ -4508,14 +4577,19 @@ class SafetyTests(unittest.TestCase):
         for mode in ("allowed", "denied", "never-ask", "interrupt-a", "interrupt-b"):
             with self.subTest(mode=mode):
                 clock = [0.0]
-                native_os = mock.Mock(O_WRONLY=1, O_CREAT=2, O_EXCL=4, environ={})
+                native_os = mock.Mock(O_WRONLY=1, O_CREAT=2, O_EXCL=4, O_RDONLY=1, O_NOFOLLOW=2, O_NONBLOCK=4,
+                                      environ={})
                 native_os.open.return_value = 42
                 if mode in ("denied", "never-ask"):
                     native_os.open.side_effect = OSError(errno.EROFS, "synthetic refusal")
                 native_sys = mock.Mock(argv=["synthetic-script"], executable="synthetic-python")
                 native_time = mock.Mock(monotonic=lambda: clock[0])
                 native_time.sleep.side_effect = lambda seconds: clock.__setitem__(0, clock[0] + seconds)
-                request = {"action": mode, "field": "r", "seed": "VIAQUAL" + "a" * 32}
+                request = {"action": mode, "field": "r", "seed": "VIAQUAL" + "a" * 32,
+                           "release": "synthetic-release"}
+                if mode.startswith("interrupt-"):
+                    # Release at the last successful poll, exercising almost the full hold bound.
+                    native_os.open.side_effect = [FileNotFoundError()] * 119 + [42]
 
                 def resumed(*unused):
                     native_sys.argv = ["synthetic-script", "1"]
@@ -4540,7 +4614,7 @@ class SafetyTests(unittest.TestCase):
         # Only an isolated synthetic Python fixture; no VIA/vendor process or auth.
         program = self.root / "synthetic-watchdog.py"
         source = ('import signal\nsignal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})\n'
-                  'REQUEST = {"action": "interrupt-b", "field": "r", "seed": "VIAQUALsynthetic"}\n'
+                  'REQUEST = {"action": "interrupt-b", "field": "r", "seed": "VIAQUALsynthetic", "release": "synthetic-absent-release"}\n'
                   + bound_probe.TOOL_CODE)
         source = source.replace(" + 7", " + 0.05").replace(" <= 7", " <= 0.05")
         source = source.replace("time.sleep(3)", "time.sleep(0.15)")
@@ -4561,8 +4635,32 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(stopped.exception.code, 25)
         printed.assert_not_called()
 
+    def test_interrupt_tool_waits_for_runner_release_and_times_out_without_it(self):
+        for mode in ("interrupt-a", "interrupt-b"):
+            for released in (True, False):
+                with self.subTest(mode=mode, released=released):
+                    release = "synthetic-runner-release"
+                    request = {"action": mode, "field": "r", "seed": "VIAQUALsynthetic", "release": release}
+                    native_os = mock.Mock(environ={}, O_RDONLY=0, O_NOFOLLOW=1, O_NONBLOCK=2)
+                    native_os.open.side_effect = [FileNotFoundError()] * 3 + ([42] if released else [FileNotFoundError()] * 200)
+                    native_time = mock.Mock(monotonic=mock.Mock(return_value=0))
+                    with mock.patch.dict(sys.modules, {"os": native_os, "sys": mock.Mock(argv=["tool"]),
+                         "time": native_time, "signal": mock.Mock(), "secrets": mock.Mock(token_hex=lambda _: "a" * 32)}), \
+                         mock.patch("builtins.print") as printed:
+                        if released:
+                            exec(bound_probe.TOOL_CODE, {"REQUEST": request})
+                            printed.assert_called_once()
+                            native_os.close.assert_called_once_with(42)
+                        else:
+                            with self.assertRaises(SystemExit) as stopped:
+                                exec(bound_probe.TOOL_CODE, {"REQUEST": request})
+                            self.assertEqual(stopped.exception.code, 26)
+                            printed.assert_not_called()
+                    native_os.open.assert_called_with(release, 3)
+                    self.assertGreaterEqual(native_time.sleep.call_count, 3)
+
     def test_any_mode_runtime_bound_at_eight_seconds_blocks_preflight(self):
-        for name in ("A_SLEEP_S", "B_SLEEP_S", "ATTEMPT_OBSERVE_S", "DENIED_OBSERVE_S", "TOOL_WATCHDOG_S"):
+        for name in ("A_WAIT_S", "B_WAIT_S", "ATTEMPT_OBSERVE_S", "DENIED_OBSERVE_S", "TOOL_WATCHDOG_S"):
             with self.subTest(bound=name), mock.patch.object(bound_probe, name, 8):
                 with self.assertRaisesRegex(Blocked, "tool program runtime bound"):
                     bound_probe.runtime_bounds()
@@ -4576,7 +4674,7 @@ class SafetyTests(unittest.TestCase):
             errors = (None, errno.EROFS, errno.EACCES) if mode in ("denied", "never-ask") else (None,)
             for error in errors:
                 with self.subTest(mode=mode, error=error):
-                    native_os = mock.Mock(O_WRONLY=1, O_CREAT=2, O_EXCL=4,
+                    native_os = mock.Mock(O_WRONLY=1, O_CREAT=2, O_EXCL=4, O_RDONLY=1, O_NOFOLLOW=2, O_NONBLOCK=4,
                                           environ={"VIAQUAL_TOOL_DEADLINE": "7"})
                     native_os.open.return_value = 42
                     if error is not None:
@@ -4585,7 +4683,8 @@ class SafetyTests(unittest.TestCase):
                                            executable="synthetic-python")
                     native_time = mock.Mock(monotonic=mock.Mock(return_value=0))
                     entropy = mock.Mock(token_hex=mock.Mock(return_value="b" * 32))
-                    request = {"action": mode.removesuffix("-refused"), "field": "r", "seed": "VIAQUAL" + "a" * 32}
+                    request = {"action": mode.removesuffix("-refused"), "field": "r", "seed": "VIAQUAL" + "a" * 32,
+                               "release": "synthetic-release"}
                     scope = {"REQUEST": request}
                     with mock.patch.dict(sys.modules, {"os": native_os, "sys": native_sys,
                          "time": native_time, "secrets": entropy, "signal": mock.Mock()}), \
@@ -4615,6 +4714,9 @@ class SafetyTests(unittest.TestCase):
                             native_os.write.assert_not_called()
                         else:
                             native_os.execv.assert_not_called()
+                    elif mode.startswith("interrupt-"):
+                        native_os.open.assert_called_once_with("synthetic-release", 7)
+                        native_os.close.assert_called_once_with(42)
                     else:
                         native_os.open.assert_not_called()
                     if mode in ("allowed", "interrupt-a", "interrupt-b") or mode.endswith("-refused"):
@@ -4623,9 +4725,12 @@ class SafetyTests(unittest.TestCase):
                         self.assertNotIn(request["seed"], printed.call_args.args[0])
                     else:
                         printed.assert_not_called()
-                    seconds = {"interrupt-a": bound_probe.A_SLEEP_S, "interrupt-b": bound_probe.B_SLEEP_S}.get(mode,
+                    seconds = {"interrupt-a": bound_probe.A_WAIT_S, "interrupt-b": bound_probe.B_WAIT_S}.get(mode,
                                bound_probe.DENIED_OBSERVE_S if mode.endswith("-refused") else bound_probe.ATTEMPT_OBSERVE_S)
-                    native_time.sleep.assert_called_once_with(seconds)
+                    if mode.startswith("interrupt-"):
+                        native_time.sleep.assert_not_called()  # Runner has already released this synthetic latch.
+                    else:
+                        native_time.sleep.assert_called_once_with(seconds)
 
     def test_short_command_script_identity_refusal_and_tamper(self):
         legacy, proc, server, tool = self.probe_fixture()
@@ -4872,9 +4977,11 @@ class SafetyTests(unittest.TestCase):
     def test_nonce_is_fresh_even_when_the_exact_program_is_reasked(self):
         native_sys = mock.Mock(argv=["synthetic-script"], executable="synthetic-python")
         entropy = mock.Mock(token_hex=mock.Mock(side_effect=["a" * 32, "b" * 32]))
-        request = {"action": "interrupt-a", "field": "r", "seed": "VIAQUAL" + "c" * 32}
+        request = {"action": "interrupt-a", "field": "r", "seed": "VIAQUAL" + "c" * 32,
+                   "release": "synthetic-release"}
         with mock.patch.dict(sys.modules, {"sys": native_sys, "time": mock.Mock(monotonic=mock.Mock(return_value=0)),
-             "os": mock.Mock(environ={}), "signal": mock.Mock(), "secrets": entropy}), \
+             "os": mock.Mock(environ={}, O_RDONLY=0, O_NOFOLLOW=1, O_NONBLOCK=2),
+             "signal": mock.Mock(), "secrets": entropy}), \
              mock.patch("builtins.print") as printed:
             for _ in range(2):
                 exec(bound_probe.TOOL_CODE, {"REQUEST": request})
