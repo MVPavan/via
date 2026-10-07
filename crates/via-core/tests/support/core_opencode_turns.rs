@@ -5,6 +5,14 @@ use core_opencode::{
     success_events, with_route,
 };
 use serde_json::{Value, json};
+use std::time::Duration;
+
+/// OC09 (§9): first-frame fixture uses the packet's 1 MiB event cap.
+const SSE_EVENT_BYTES: usize = 1024 * 1024;
+/// OC03/OC10 (§13): bound fixture synchronization independently of vendor deadlines.
+const FIXTURE_SYNC: Duration = Duration::from_secs(2);
+/// OC10 (§10): includes the route's 3 s exit classification and bounded Host retirement.
+const FIXTURE_LOSS: Duration = Duration::from_secs(10);
 
 /// Collect first, stop every owned process, then assert. RED failures leave no
 /// vendor behind and cannot borrow the owner's `OpenCode` service.
@@ -69,7 +77,8 @@ fn oc03_sse_acceptance_precedes_the_http_response_and_is_deduplicated() {
     let cwd = case.cwd("a");
     let mut response = prompt_response(success_events("sse first"));
     response["emit_before_response"] = json!(true);
-    response["sleep_ms"] = json!(80);
+    let release = std::path::PathBuf::from(&cwd).join("release-prompt-response");
+    response["wait_for_file"] = json!(release);
     case.fixture(&with_route(
         server(&cwd, None),
         route(
@@ -78,15 +87,36 @@ fn oc03_sse_acceptance_precedes_the_http_response_and_is_deduplicated() {
             json!([response]),
         ),
     ));
-    let (envelope, events) = run(async {
+    let (envelope, events, sse_started) = run(async {
         let daemon = case.daemon();
         let (session, _) = daemon.spawn(&cwd, &json!({})).await;
+        let sse_started = tokio::time::timeout(FIXTURE_SYNC, async {
+            loop {
+                if daemon
+                    .events(&session, 1)
+                    .await
+                    .to_string()
+                    .contains("turn.started")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok();
+        // Release even a failing fixture so its kept exchange and private server can finish.
+        std::fs::write(&release, b"release").unwrap();
         let envelope = daemon.wait_result(&session, 1).await;
         let events = daemon.events(&session, 1).await;
         daemon.stop().await;
-        (envelope, events)
+        (envelope, events, sse_started)
     });
     run(case.all_gone());
+    assert!(
+        sse_started,
+        "acceptance required the still-held HTTP response"
+    );
     let envelope = envelope.unwrap();
     assert_eq!(envelope["state"], "completed", "{envelope}");
     assert_eq!(
@@ -264,10 +294,25 @@ fn oc10_eof_with_live_process_is_unknown_and_usage_unavailable() {
 
 #[test]
 fn oc10_terminal_before_loss_is_kept() {
+    let case = Case::new(&json!({}));
+    let cwd = case.cwd("a");
     let mut events = success_events("retained");
-    events.push(json!({"pause_ms":30}));
     events.push(json!({"close":true}));
-    let (envelope, _) = one(events);
+    case.fixture(&with_route(server(&cwd, None), prompt_route(events)));
+    let (envelope, lost) = run(async {
+        let daemon = case.daemon();
+        let (session, _) = daemon.spawn(&cwd, &json!({})).await;
+        let envelope = daemon.wait_result(&session, 1).await;
+        // Idle leases keep a healthy generation live: absence proves Route processed EOF/loss.
+        let lost = daemon.wait_no_servers(FIXTURE_LOSS).await;
+        let retained = daemon.wait_result(&session, 1).await;
+        daemon.stop().await;
+        assert_eq!(envelope.as_ref().ok(), retained.as_ref().ok());
+        (envelope, lost)
+    });
+    run(case.all_gone());
+    assert!(lost, "terminal fixture never observed generation loss");
+    let envelope = envelope.unwrap();
     assert_eq!(envelope["state"], "completed", "{envelope}");
     assert_eq!(envelope["final_text"], "retained", "{envelope}");
 }
@@ -847,4 +892,70 @@ fn owned_child_guard_stops_and_reaps_on_unwind() {
         elapsed < std::time::Duration::from_millis(700),
         "guard waited for natural exit instead of stopping child: {elapsed:?}"
     );
+}
+
+/// OC06 (§7.1): a duplicate vendor identity cannot steal a live driver's lane.
+#[test]
+fn oc06_duplicate_vendor_session_fails_closed_and_close_preserves_owner() {
+    let case = Case::new(&json!({}));
+    let cwd = case.cwd("a");
+    case.fixture(&server(&cwd, None));
+    let (first, duplicate, successor, first_events) = run(async {
+        let daemon = case.daemon();
+        let (owner, _) = daemon
+            .spawn(&cwd, &json!({"deadlines":{"wall_ms":2000}}))
+            .await;
+        let first = daemon.wait_result(&owner, 1).await;
+        let (other, _) = daemon
+            .spawn(&cwd, &json!({"deadlines":{"wall_ms":2000}}))
+            .await;
+        let duplicate = daemon.wait_result(&other, 1).await;
+        daemon.close(&other).await;
+        let successor = if duplicate.as_ref().is_ok_and(|end| class(end) == "protocol") {
+            daemon.try_resume(&owner, &json!({})).await.unwrap();
+            daemon.wait_result(&owner, 2).await
+        } else {
+            Ok(Value::Null)
+        };
+        let first_events = daemon.events(&owner, 1).await;
+        daemon.stop().await;
+        (first, duplicate, successor, first_events)
+    });
+    run(case.all_gone());
+    assert_eq!(first.unwrap()["state"], "completed");
+    let duplicate = duplicate.unwrap();
+    assert_eq!(class(&duplicate), "protocol", "{duplicate}");
+    assert_eq!(successor.unwrap()["state"], "completed");
+    assert!(first_events.to_string().contains("turn.ended"));
+    assert_eq!(
+        case.requests_to("POST", &format!("/api/session/{SES}/prompt"))
+            .len(),
+        2
+    );
+}
+
+/// OC01/§9: the first SSE frame has the same overflow classification as later frames.
+#[test]
+fn oc09_startup_sse_overflow_is_overflow() {
+    let case = Case::new(&json!({}));
+    let cwd = case.cwd("a");
+    let fixture = with_route(
+        server(&cwd, None),
+        json!({
+            "method":"GET","path":"/api/event",
+            "sse":{"events":[],"oversize":SSE_EVENT_BYTES+1}
+        }),
+    );
+    case.fixture(&fixture);
+    let envelope = run(async {
+        let daemon = case.daemon();
+        let (session, _) = daemon.spawn(&cwd, &json!({})).await;
+        let envelope = daemon.wait_result(&session, 1).await;
+        daemon.stop().await;
+        envelope
+    });
+    run(case.all_gone());
+    let envelope = envelope.unwrap();
+    assert_eq!(class(&envelope), "overflow", "{envelope}");
+    assert!(case.creates().is_empty());
 }

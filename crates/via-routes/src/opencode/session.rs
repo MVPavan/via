@@ -271,7 +271,7 @@ async fn call(
     deadline: Deadline,
 ) -> Result<HttpResponse, SetupError> {
     let body = body.map(serde_json::Value::to_string);
-    super::response::checked(
+    let response = super::response::checked(
         http.request(
             HttpRequest {
                 method,
@@ -284,13 +284,33 @@ async fn call(
         )
         .await,
     )
-    .map_err(SetupError::Http)
+    .map_err(SetupError::Http)?;
+    error_body(&response)?;
+    Ok(response)
+}
+
+/// §8: error statuses require decodable JSON; §4.3 keeps untrusted fields unretained.
+/// A 401 keeps its decisive precedence even when its body is malformed.
+pub(super) fn error_body(response: &HttpResponse) -> Result<(), SetupError> {
+    if !(200..300).contains(&response.status) && response.status != 401 {
+        serde_json::from_slice::<serde::de::IgnoredAny>(&response.body)
+            .map_err(|_| SetupError::Malformed)?;
+    }
+    Ok(())
 }
 
 /// A settled setting (200 or 204), else its refusal.
 fn settled(response: &HttpResponse) -> Result<(), SetupError> {
     match response.status {
-        200 | 204 => Ok(()),
+        200 | 204 => {
+            // §8 and pinned OpenAPI: model/entry settings acknowledge with no content.
+            // §5's readback checks the mutation; arbitrary JSON is not an acknowledgement shape.
+            if response.body.is_empty() {
+                Ok(())
+            } else {
+                Err(SetupError::Malformed)
+            }
+        }
         _ => Err(refused(response)),
     }
 }

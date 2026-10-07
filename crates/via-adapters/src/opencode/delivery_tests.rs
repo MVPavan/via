@@ -11,7 +11,12 @@ fn setup() -> (
     tokio::sync::mpsc::Receiver<crate::observation::Admitted>,
 ) {
     let mut router = Router::new();
-    let lane = router.attach("ses_delivery");
+    let lane = router
+        .attach(
+            "ses_delivery",
+            &crate::SessionId::try_from("s_000000000001").unwrap(),
+        )
+        .unwrap();
     let (sink, receiver) = crate::observation::observation_channel();
     let registration = Registration::new(
         lane,
@@ -423,7 +428,12 @@ fn joined_execution_events(router: &mut Router) {
 #[tokio::test]
 async fn oc06_joined_execution_keeps_last_preownership_step_and_missing_samples() {
     let mut router = Router::new();
-    let lane = router.attach("ses_joined");
+    let lane = router
+        .attach(
+            "ses_joined",
+            &crate::SessionId::try_from("s_000000000001").unwrap(),
+        )
+        .unwrap();
     let (sink, mut receiver) = crate::observation::observation_channel();
     let registration = Registration::new(
         lane.clone(),
@@ -910,7 +920,12 @@ async fn oc07_native_settlement_releases_deferred_shutdown_without_via_decline()
 /// §8–§9: positive HTTP bounds evidence survives the bounded observation queue.
 fn limit_owner(number: u32) -> (Router, Arc<Registration>, Arc<Delivery>) {
     let mut router = Router::new();
-    let lane = router.attach("ses_delivery");
+    let lane = router
+        .attach(
+            "ses_delivery",
+            &crate::SessionId::try_from("s_000000000001").unwrap(),
+        )
+        .unwrap();
     let turn = TurnNumber::try_from(number).unwrap();
     let input = format!("msg_viaLimit{number}");
     if number > 1 {

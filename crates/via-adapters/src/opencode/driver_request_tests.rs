@@ -585,3 +585,131 @@ fn oc05_c2_kept_model_switch_is_read_after_successor_admission() {
 fn oc05_c2_kept_model_switch_is_read_after_reopened_admission() {
     run(successor_after_kept_variant(true));
 }
+
+/// OC05 (§7.2, §8): an abandoned cleanup pipeline can restart after its kept GET ends.
+#[test]
+fn oc05_cancelled_reopen_cleanup_is_retried_by_successor() {
+    run(async {
+        let rig = Rig::new(&json!({}));
+        let release = rig.root().join("release-reopen-inbox");
+        let mut next = fixture(rig.root().to_str().unwrap(), success());
+        replace(
+            &mut next,
+            route(
+                "GET",
+                &format!("/api/session/{SES}/inbox"),
+                &json!([
+                    {"status":200,"json":{"data":[]},"wait_for_file":release},
+                    {"status":200,"json":{"data":[]}}
+                ]),
+            ),
+        );
+        rig.fixture(&next);
+        let warm = bootstrap(&rig).await;
+        warm.close().await;
+        row(&rig, 2, "running");
+        let mut lane = Lane::open(&rig, true);
+        let (context, stop) = controls(&lane, 2);
+        let active = tokio::spawn(async move {
+            let (end, _) = lane.turn_context(None, context).await;
+            (lane, end)
+        });
+        let target = format!("/api/session/{SES}/inbox");
+        let entered = until(|| requests_to(&rig.requests(), &target) == 1).await;
+        cancel(&stop, Duration::from_millis(20));
+        let (mut lane, stopped) = active.await.unwrap();
+        row(&rig, 2, "unknown");
+        let live = server(&lane).unwrap();
+        std::fs::write(release, b"release").unwrap();
+        let completed = until(|| {
+            live.routing()
+                .state(SES)
+                .is_some_and(|state| state.pending_requests == 0)
+        })
+        .await;
+        row(&rig, 3, "running");
+        let (end, _) = lane.turn(3, None, Duration::from_secs(2)).await;
+        let inbox_reads = requests_to(&rig.requests(), &target);
+        lane.close().await;
+        rig.finish().await;
+        assert!(
+            entered && completed,
+            "fixture did not reach/release the kept inbox GET"
+        );
+        assert!(stopped.terminal.is_none());
+        assert_eq!(
+            end.terminal.as_ref().map(|terminal| terminal.status),
+            Some(VendorTerminalStatus::Completed),
+            "{end:?}"
+        );
+        assert_eq!(inbox_reads, 2, "successor reruns abandoned cleanup");
+    });
+}
+
+async fn malformed_setup_drains(model_switch: bool) {
+    let rig = Rig::new(&json!({}));
+    let mut next = fixture(rig.root().to_str().unwrap(), success());
+    next["session_variants"] = json!({SES:"default"});
+    if model_switch {
+        replace(
+            &mut next,
+            route(
+                "POST",
+                &format!("/api/session/{SES}/model"),
+                &json!([
+                    {"status":200,"raw":"<html>untrusted</html>","apply_variant":true}
+                ]),
+            ),
+        );
+        for route in next["routes"].as_array_mut().unwrap() {
+            if route["path"] == format!("/api/session/{SES}") {
+                route["responses"][0]["json"]["data"]["model"]["variant"] = json!("$VARIANT");
+            }
+        }
+    } else {
+        let info = next["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|route| route["path"] == format!("/api/session/{SES}"))
+            .unwrap()["responses"][0]
+            .clone();
+        replace(
+            &mut next,
+            route(
+                "GET",
+                &format!("/api/session/{SES}"),
+                &json!([
+                    info, {"status":500,"raw":"{ broken-json"}
+                ]),
+            ),
+        );
+    }
+    rig.fixture(&next);
+    let mut lane = bootstrap(&rig).await;
+    let live = server(&lane).unwrap();
+    row(&rig, 2, "running");
+    let (end, _) = lane
+        .turn(2, model_switch.then_some("high"), Duration::from_secs(2))
+        .await;
+    let drained = live.is_draining();
+    let prompts = prompts(&rig.requests()).len();
+    lane.close().await;
+    rig.finish().await;
+    assert!(drained, "undecodable setup response must drain: {end:?}");
+    assert!(
+        end.terminal.is_none(),
+        "no prompt after malformed setup: {end:?}"
+    );
+    assert_eq!(prompts, 1, "only the warmup prompt was sent");
+}
+
+#[test]
+fn oc09_model_switch_200_html_drains_without_prompt() {
+    run(malformed_setup_drains(true));
+}
+
+#[test]
+fn oc09_setup_500_malformed_json_drains() {
+    run(malformed_setup_drains(false));
+}

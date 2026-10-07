@@ -115,7 +115,10 @@ impl OpenCodeSession {
             .as_ref()
             .and_then(|attached| attached.delivery.as_ref())
         {
-            delivery.server.routing().detach(&delivery.vendor_session);
+            delivery
+                .server
+                .routing()
+                .detach(&delivery.vendor_session, &delivery.registration.lane);
         }
         drop(attached);
     }
@@ -166,16 +169,16 @@ impl OpenCodeSession {
         server: &Arc<Server>,
         id: &str,
         generation: u64,
-    ) -> Arc<Registration> {
+    ) -> Result<Arc<Registration>, via_routes::opencode::router::RouterFailure> {
         let mut attached = self.attached();
         if let Some(registration) = attached
             .as_ref()
             .and_then(|attached| attached.delivery.as_ref())
             .filter(|delivery| delivery.server.id() == server.id())
         {
-            return Arc::clone(&registration.registration);
+            return Ok(Arc::clone(&registration.registration));
         }
-        let lane = server.routing().attach(id);
+        let lane = server.routing().attach(id, &driver.spec.session_id)?;
         let registration = Registration::new(
             lane,
             driver.observations.clone(),
@@ -192,7 +195,7 @@ impl OpenCodeSession {
                 registration: Arc::clone(&registration),
             });
         }
-        registration
+        Ok(registration)
     }
 }
 
@@ -852,7 +855,10 @@ async fn create(
     })
     .await
     .map_err(|error| Box::new(facts.setup_failed("session creation", error)))?;
-    server.routing().session_opened(&info.id);
+    server
+        .routing()
+        .claim_session(&info.id, &facts.driver.spec.session_id)
+        .map_err(|cause| routing_failed(facts, cause))?;
     if let Some(setting) = differs(&info, settings) {
         return Err(Box::new(
             facts.readback_refused(digest, setting_name(setting)),
@@ -894,6 +900,11 @@ async fn reopen(
     settings: &Settings,
     id: &str,
 ) -> Result<SessionInfo, Box<TurnEnd>> {
+    // §7.1: a retained confirmation cannot read or mutate another VIA session's identity.
+    server
+        .routing()
+        .claim_session(id, &facts.driver.spec.session_id)
+        .map_err(|cause| routing_failed(facts, cause))?;
     let target = id.to_owned();
     let by = facts.request_by();
     let info = tracked(server, None, move |http| async move {
@@ -909,7 +920,6 @@ async fn reopen(
             facts.rejected(StartRejected::SettingsMismatch { setting }),
         ));
     }
-    server.routing().session_opened(&info.id);
     let target = id.to_owned();
     let by = facts.request_by();
     let entry = tracked(server, Some(id), move |http| async move {
@@ -1085,4 +1095,19 @@ fn start_rejected(refusal: Refusal) -> StartRejected {
         | RefusalKind::VersionRefused
         | RefusalKind::MissingCapability { .. } => StartRejected::Protocol(refusal.message),
     }
+}
+
+/// §7.1, §9: ownership rejection belongs only to the attaching turn; bounds retain their class.
+pub(super) fn routing_failed(
+    facts: &Turn<'_>,
+    cause: via_routes::opencode::router::RouterFailure,
+) -> Box<TurnEnd> {
+    use via_routes::opencode::router::RouterFailure;
+    Box::new(facts.failed(match cause {
+        RouterFailure::Protocol => RouteError::Protocol {
+            turn: facts.number,
+            detail: "the vendor session identity could not be attached exclusively",
+        },
+        RouterFailure::Overflow => RouteError::Overflow { turn: facts.number },
+    }))
 }

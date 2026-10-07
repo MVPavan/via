@@ -120,6 +120,8 @@ pub enum LaunchFailure {
     },
     /// A demonstrated incompatibility (§2.2): `handshake_refused`, cached.
     Refused(Refusal),
+    /// §9: the startup event exceeded the same bound as any generation event.
+    Overflow,
     /// A transient startup failure (§2.2) at `step`: not cached.
     Transient {
         /// The handshake step that failed.
@@ -204,6 +206,7 @@ impl LaunchFailure {
                 false,
                 None,
             ),
+            Self::Overflow => (RouteError::Overflow { turn }, NONE, false, None),
             Self::Transient { step: name } => {
                 (RouteError::TransportLost { turn }, NONE, false, step(name))
             }

@@ -316,7 +316,7 @@ impl Delivery {
 
 /// The session's only sink producer, preserving order across turn tombstones.
 pub(super) struct Registration {
-    lane: Arc<Lane>,
+    pub(super) lane: Arc<Lane>,
     sink: ObservationSink,
     health: Arc<watch::Sender<DriverHealth>>,
     generation: u64,

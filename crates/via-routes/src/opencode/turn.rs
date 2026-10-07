@@ -303,6 +303,7 @@ pub async fn inbox(
         .await,
     )
     .map_err(super::session::SetupError::Http)?;
+    super::session::error_body(&response)?;
     if response.status != 200 {
         return Err(super::session::SetupError::Status {
             status: response.status,

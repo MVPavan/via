@@ -90,6 +90,18 @@ pub(super) async fn execute(
     submit(facts, &opened.server, &opened.id, &input, delivery, prompt).await
 }
 
+/// §7.2: dropping the caller releases only its cleanup pipeline, never a kept HTTP job.
+struct ReopenCleanup {
+    server: Arc<Server>,
+    id: String,
+}
+
+impl Drop for ReopenCleanup {
+    fn drop(&mut self) {
+        self.server.routing().abandon_reopen_cleanup(&self.id);
+    }
+}
+
 async fn prepare(
     facts: &mut Turn<'_>,
     settings: &Settings,
@@ -98,8 +110,15 @@ async fn prepare(
     activity: crate::TurnActivity,
 ) -> Result<(String, Arc<Delivery>), Box<TurnEnd>> {
     let (server, id, generation) = (&opened.server, &opened.id, opened.generation);
-    let registration = facts.session.delivery(facts.driver, server, id, generation);
+    let registration = facts
+        .session
+        .delivery(facts.driver, server, id, generation)
+        .map_err(|cause| super::driver::routing_failed(facts, cause))?;
     let first = server.routing().begin_reopen_cleanup(id);
+    let _cleanup = first.then(|| ReopenCleanup {
+        server: Arc::clone(server),
+        id: id.clone(),
+    });
     if first
         && facts.reopened
         && let Err(end) = cleanup_leftovers(facts, server, id).await
@@ -507,20 +526,22 @@ async fn cleanup_leftovers(
         if !inbox.contains(&input) {
             continue;
         }
-        server.routing().expect_cleanup_cancellation(id, &input);
+        let cancel = server.routing().expect_cleanup_cancellation(id, &input);
         if server.routing().failure().is_some() {
             return Err(Box::new(facts.rejected(StartRejected::SessionGone)));
         }
-        let target = id.to_owned();
-        let cancel_input = input.clone();
-        let by = facts.request_by();
-        let result = tracked(server, Some(id), move |http| async move {
-            requests::cancel_leftover(&http, &target, &cancel_input, by).await
-        })
-        .await;
-        result.map_err(|error| {
-            Box::new(facts.setup_failed("a leftover inbox cancellation", error))
-        })?;
+        if cancel {
+            let target = id.to_owned();
+            let cancel_input = input.clone();
+            let by = facts.request_by();
+            let result = tracked(server, Some(id), move |http| async move {
+                requests::cancel_leftover(&http, &target, &cancel_input, by).await
+            })
+            .await;
+            result.map_err(|error| {
+                Box::new(facts.setup_failed("a leftover inbox cancellation", error))
+            })?;
+        }
         let changed = server.routing().notify();
         let cancelled_by = facts.request_by();
         loop {

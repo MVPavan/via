@@ -47,7 +47,7 @@ pub struct SessionState {
     pub pending_requests: usize,
     /// Last durable sequence; absent events do not affect it.
     pub last_seq: Option<u64>,
-    /// Whether this generation has already started the one-time inbox cleanup.
+    /// Whether this generation has claimed or completed its reopen cleanup (§7.2).
     pub cleanup_started: bool,
     /// Claimed reopen cleanup lacks all required stream cancellation proofs.
     pub cleanup_pending: bool,

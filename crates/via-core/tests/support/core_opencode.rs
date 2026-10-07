@@ -104,8 +104,13 @@ pub(crate) fn catalog_entry(variants: &[&str]) -> Value {
 
 /// A `Session.Info` readback of [`SES`] at `cwd`.
 pub(crate) fn session_info(cwd: &str, variant: &str, rules: &Value) -> Value {
+    session_info_for(SES, cwd, variant, rules)
+}
+
+/// OC04/OC11 (§13): a distinct vendor session for each VIA session in shared-server fixtures.
+pub(crate) fn session_info_for(session: &str, cwd: &str, variant: &str, rules: &Value) -> Value {
     json!({"data": {
-        "id": SES, "projectID": "p", "agent": "via",
+        "id": session, "projectID": "p", "agent": "via",
         "model": {"providerID": "opencode", "id": "big-pickle", "variant": variant},
         "permissions": rules, "location": {"directory": cwd},
         "cost": 0, "tokens": {}, "time": {"created": 1, "updated": 1},
@@ -122,6 +127,11 @@ pub(crate) fn route(method: &str, path: &str, responses: Value) -> Value {
 /// A fully compatible 2.0.22 server whose session `SES` lives at `cwd`
 /// with the default rules, no variant and VIA's instructions `text`.
 pub(crate) fn server(cwd: &str, instructions: Option<&str>) -> Value {
+    server_for(SES, cwd, instructions)
+}
+
+/// OC04/OC11 (§13): compatible per-session routes, with common server routes unchanged.
+fn server_for(session: &str, cwd: &str, instructions: Option<&str>) -> Value {
     let entries = match instructions {
         Some(text) => json!({"data": [{"key": "via", "value": text}]}),
         None => json!({"data": []}),
@@ -132,21 +142,44 @@ pub(crate) fn server(cwd: &str, instructions: Option<&str>) -> Value {
         route("GET", "/api/model", json!([{"status": 200, "json": {"data": [catalog_entry(&["high"])]}}])),
         {"method": "GET", "path": "/api/event",
          "sse": {"events": [{"type": "server.connected", "properties": {}}]}},
-        route("POST", "/api/session", json!([{"status": 200, "json": session_info(cwd, "default", &rules(false))}])),
-        route("GET", &format!("/api/session/{SES}"), json!([{"status": 200, "json": session_info(cwd, "default", &rules(false))}])),
-        route("PUT", &format!("/api/experimental/session/{SES}/instructions/entries/via"), json!([{"status": 204}])),
-        route("GET", &format!("/api/experimental/session/{SES}/instructions/entries"), json!([{"status": 200, "json": entries}])),
-        route("POST", &format!("/api/session/{SES}/model"), json!([{"status": 204}])),
+        route("POST", "/api/session", json!([{"status": 200, "json": session_info_for(session, cwd, "default", &rules(false))}])),
+        route("GET", &format!("/api/session/{session}"), json!([{"status": 200, "json": session_info_for(session, cwd, "default", &rules(false))}])),
+        route("PUT", &format!("/api/experimental/session/{session}/instructions/entries/via"), json!([{"status": 204}])),
+        route("GET", &format!("/api/experimental/session/{session}/instructions/entries"), json!([{"status": 200, "json": entries}])),
+        route("POST", &format!("/api/session/{session}/model"), json!([{"status": 204}])),
     ]});
     let fixture = with_route(
         fixture,
         route(
             "GET",
-            &format!("/api/session/{SES}/inbox"),
+            &format!("/api/session/{session}/inbox"),
             json!([{"status": 200, "json": {"data": []}}]),
         ),
     );
-    with_route(fixture, prompt_route(success_events("done")))
+    with_route(
+        fixture,
+        route(
+            "POST",
+            &format!("/api/session/{session}/prompt"),
+            json!([prompt_response(success_events("done"))]),
+        ),
+    )
+}
+
+/// OC04/OC11 (§13): append only another session's routes to the same fake generation.
+pub(crate) fn with_session(
+    mut fixture: Value,
+    session: &str,
+    cwd: &str,
+    instructions: Option<&str>,
+) -> Value {
+    let mut other = server_for(session, cwd, instructions);
+    for route in other["routes"].as_array_mut().unwrap().drain(..) {
+        if route["path"].as_str().unwrap().contains(session) {
+            fixture = with_route(fixture, route);
+        }
+    }
+    fixture
 }
 
 /// A synthetic event retaining the vendor's observed envelope/data shape.
@@ -478,9 +511,8 @@ impl Case {
 }
 
 fn walk(dir: &Path, files: &mut Vec<(PathBuf, Vec<u8>)>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
+    let entries = fs::read_dir(dir)
+        .unwrap_or_else(|_error| panic!("Core secrecy scan directory read failed"));
     for entry in entries {
         let entry = entry.unwrap();
         let kind = entry.file_type().unwrap();
@@ -488,9 +520,17 @@ fn walk(dir: &Path, files: &mut Vec<(PathBuf, Vec<u8>)>) {
         if kind.is_dir() {
             walk(&path, files);
         } else if kind.is_file() {
-            files.push((path.clone(), fs::read(&path).unwrap_or_default()));
+            collect_scan_file(&path, files);
         }
     }
+}
+
+/// `OC12b` (§4.3): collect one regular file without discarding read failures.
+fn collect_scan_file(path: &Path, files: &mut Vec<(PathBuf, Vec<u8>)>) {
+    files.push((
+        path.to_owned(),
+        fs::read(path).unwrap_or_else(|_error| panic!("Core secrecy scan file read failed")),
+    ));
 }
 
 /// One daemon's Engine, whose session dispatchers run as daemon main runs
@@ -613,6 +653,17 @@ impl Daemon {
         self.engine.status(params).await.unwrap()
     }
 
+    /// OC10 (§10): observe generation retirement before ending a terminal-before-loss fixture.
+    pub(crate) async fn wait_no_servers(&self, by: Duration) -> bool {
+        tokio::time::timeout(by, async {
+            while !self.engine.servers().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
     /// Public event records for this turn.
     pub(crate) async fn events(&self, session: &SessionId, turn: u32) -> Value {
         let params: EventsParams =
@@ -690,4 +741,32 @@ pub(crate) fn class(envelope: &Value) -> &str {
 pub(crate) fn setup_succeeded(envelope: &Value) {
     assert_eq!(envelope["state"], "completed", "{envelope}");
     assert!(envelope["failure"].is_null(), "{envelope}");
+}
+
+/// `OC12b` (§4.3): missing directories are unavailable evidence, never clean scans.
+#[test]
+fn oc12b_core_scan_refuses_directory_read_errors() {
+    let root = tempfile::tempdir().unwrap();
+    let mut files = Vec::new();
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            walk(&root.path().join("absent"), &mut files);
+        }))
+        .is_err(),
+        "unreadable directory was silently skipped"
+    );
+}
+
+/// `OC12b` (§4.3): a file that disappears before its read is unavailable evidence.
+#[test]
+fn oc12b_core_scan_refuses_file_read_errors() {
+    let root = tempfile::tempdir().unwrap();
+    let mut files = Vec::new();
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            collect_scan_file(&root.path().join("absent"), &mut files);
+        }))
+        .is_err(),
+        "unreadable file was silently replaced by empty bytes"
+    );
 }

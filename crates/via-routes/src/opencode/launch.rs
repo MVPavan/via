@@ -226,13 +226,8 @@ async fn shake(
         Ok(Some(event)) if handshake::connected(event.data()) => {}
         Ok(Some(_)) => return Err(LaunchFailure::Refused(Refusal::FirstEvent)),
         Err(StreamFailure::Silent) => return Err(LaunchFailure::Deadline),
-        Ok(None)
-        | Err(
-            StreamFailure::Overflow
-            | StreamFailure::Truncated
-            | StreamFailure::Io
-            | StreamFailure::Malformed,
-        ) => {
+        Err(StreamFailure::Overflow) => return Err(LaunchFailure::Overflow),
+        Ok(None) | Err(StreamFailure::Truncated | StreamFailure::Io | StreamFailure::Malformed) => {
             return Err(LaunchFailure::Transient {
                 step: "read the first event",
             });

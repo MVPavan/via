@@ -260,6 +260,25 @@ impl Router {
         if owner.is_some() && !self.key(id) {
             return;
         }
+        // §9: normalization retains successful permission source IDs even for children.
+        // Root tool keys are already charged; otherwise charge once per owning turn.
+        if let (Some(owner), Some(call)) = (&owner, call_id)
+            && *kind == InteractiveKind::Permission
+        {
+            let key = (owner.turn, call.clone());
+            let charged = self.sessions.get(&owner.session).is_some_and(|session| {
+                session.calls.get(call) == Some(&owner.turn)
+                    || session.declined_calls.contains(&key)
+            });
+            if !charged {
+                if !self.key(call) {
+                    return;
+                }
+                if let Some(session) = self.sessions.get_mut(&owner.session) {
+                    session.declined_calls.insert(key);
+                }
+            }
+        }
         if let Some(owner) = &owner
             && let Some(session) = self.sessions.get_mut(session_id)
         {

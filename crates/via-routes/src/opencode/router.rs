@@ -7,14 +7,14 @@ use std::time::Duration;
 
 use tokio::sync::Notify;
 use tokio::time::Instant;
-use via_wire::TurnNumber;
+use via_wire::{SessionId, TurnNumber};
 
 use crate::{Deadline, DecodeWatermark};
 
 pub use super::bounds::StagingPermit;
 use super::bounds::{self, Failure, Resource, Retained, Staging};
 use super::declines::{CleanupWork, DeclineNotice, DeclineWork};
-use super::events::{DecodeError, Event, EventData, ExecutionKind, InboxKind, StepKind, ToolKind};
+use super::events::{DecodeError, Event, EventData, ExecutionKind, InboxKind, StepKind};
 use super::state::{InputPhase, InputState, SessionState};
 
 mod interactive;
@@ -411,6 +411,8 @@ impl Lane {
 
 #[derive(Default)]
 struct Session {
+    owner: Option<SessionId>,
+    declined_calls: HashSet<(TurnNumber, String)>,
     opened: bool,
     state: SessionState,
     lane: Option<Arc<Lane>>,
@@ -526,29 +528,39 @@ impl Router {
         true
     }
 
-    /// Registers a returned/read-back VIA-owned vendor session before setup (§5, §9).
-    pub fn session_opened(&mut self, session: &str) {
-        self.ensure_session(session);
+    /// §7.1: one vendor identity belongs to one VIA session throughout this generation.
+    pub fn claim_session(&mut self, session: &str, owner: &SessionId) -> Result<(), RouterFailure> {
+        if !self.ensure_session(session) {
+            return Err(self.failure().unwrap_or(RouterFailure::Protocol));
+        }
+        let session = self.sessions.entry(session.to_owned()).or_default();
+        if session.owner.as_ref().is_some_and(|kept| kept != owner) {
+            return Err(RouterFailure::Protocol);
+        }
+        session.owner = Some(owner.clone());
+        Ok(())
     }
 
-    /// Session lane for a newly opened driver; state and tombstones remain server-owned.
-    pub fn attach(&mut self, session: &str) -> Arc<Lane> {
-        if !self.ensure_session(session) {
-            return Arc::new(Lane::new(Arc::default(), self.staging.clone()));
-        }
+    /// §7.1: attach only the driver that owns this vendor identity.
+    pub fn attach(&mut self, session: &str, owner: &SessionId) -> Result<Arc<Lane>, RouterFailure> {
+        self.claim_session(session, owner)?;
         let session = self.sessions.entry(session.to_owned()).or_default();
         let lane = Arc::new(Lane::new(session.rejections.clone(), self.staging.clone()));
         session.lane = Some(lane.clone());
-        lane
+        Ok(lane)
     }
 
-    /// Driver detach cutoff; execution facts and correlation survive.
-    pub fn detach(&mut self, session: &str) -> u64 {
+    /// §7.1: detach only the lane this driver attached; a replacement remains owned.
+    pub fn detach(&mut self, session: &str, attached: &Arc<Lane>) -> u64 {
         if let Some(session) = self.sessions.get_mut(session)
-            && let Some(lane) = session.lane.take()
+            && session
+                .lane
+                .as_ref()
+                .is_some_and(|lane| Arc::ptr_eq(lane, attached))
         {
-            lane.close();
+            session.lane = None;
         }
+        attached.close();
         self.order
     }
 
@@ -706,7 +718,7 @@ impl Router {
     }
 
     /// Releases the once-only cleanup fence after every stream proof, or when
-    /// a new session needs no leftover read. Failure deliberately never calls it.
+    /// a new session needs no leftover read (§7.2). Abandonment releases the fence.
     pub fn finish_reopen_cleanup(&mut self, session: &str) {
         if !self.ensure_session(session) {
             return;
@@ -717,24 +729,52 @@ impl Router {
         self.changed.notify_waiters();
     }
 
+    /// §7.2: an abandoned cleanup can be safely retried after its kept exchanges end.
+    pub fn abandon_reopen_cleanup(&mut self, session: &str) {
+        if let Some(state) = self
+            .sessions
+            .get_mut(session)
+            .map(|session| &mut session.state)
+            && state.cleanup_pending
+        {
+            state.cleanup_started = false;
+            state.cleanup_pending = false;
+            self.changed.notify_waiters();
+        }
+    }
+
     /// Registers one recomputed own leftover before cancelling it (§7.2, §9).
-    pub fn expect_cleanup_cancellation(&mut self, session: &str, input: &str) {
+    pub fn expect_cleanup_cancellation(&mut self, session: &str, input: &str) -> bool {
         if !self.ensure_session(session) {
-            return;
+            return false;
         }
-        if self.sessions.get(session).is_some_and(|session| {
-            session.inputs.contains_key(input) || session.cleanup_expected.contains(input)
-        }) {
-            return;
+        if self
+            .sessions
+            .get(session)
+            .is_some_and(|session| session.cleanup_expected.contains(input))
+        {
+            return false;
         }
-        if !self.key(input) {
-            return;
+        let known = self
+            .sessions
+            .get(session)
+            .is_some_and(|session| session.inputs.contains_key(input));
+        if !known && !self.key(input) {
+            return false;
         }
-        self.sessions
-            .entry(session.to_owned())
-            .or_default()
-            .cleanup_expected
-            .insert(input.to_owned());
+        let session = self.sessions.entry(session.to_owned()).or_default();
+        session.cleanup_expected.insert(input.to_owned());
+        let already_claimed = session.inputs.get(input).is_some_and(|turn| {
+            let mut windows = session
+                .rejections
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            windows
+                .get_mut(turn)
+                .is_some_and(|window| std::mem::replace(&mut window.inbox_cancel, true))
+        });
+        !already_claimed
     }
 
     /// Stream evidence of a cleanup input's cancellation (a 204 is insufficient).
@@ -820,7 +860,6 @@ impl Router {
         {
             Some(assistant_message_id)
         } else if let EventData::Tool {
-            kind: ToolKind::InputStarted | ToolKind::Called,
             assistant_message_id,
             call_id,
             ..
@@ -1329,18 +1368,16 @@ fn apply(session: &mut Session, data: &EventData) -> Option<TurnNumber> {
             ..
         } => session.messages.get(assistant_message_id).copied(),
         EventData::Tool {
-            kind,
             assistant_message_id,
             call_id,
             ..
         } => {
+            // §7.1, §9: any owned tool event can retain its identity/action in normalization.
             let owner = key_owner(session, assistant_message_id.as_deref(), Some(call_id));
-            if matches!(kind, ToolKind::InputStarted | ToolKind::Called) {
-                if let Some(owner) = owner {
-                    session.calls.entry(call_id.clone()).or_insert(owner);
-                } else if session.state.running && session.state.execution_owner.is_none() {
-                    session.unowned_calls.insert(call_id.clone());
-                }
+            if let Some(owner) = owner {
+                session.calls.entry(call_id.clone()).or_insert(owner);
+            } else if session.state.running && session.state.execution_owner.is_none() {
+                session.unowned_calls.insert(call_id.clone());
             }
             owner
         }
@@ -1473,6 +1510,25 @@ mod tests {
     use super::*;
     use serde_json::{Value, json};
 
+    /// §7.1: test lanes still attach with a concrete VIA session identity.
+    fn attach(router: &mut Router, session: &str) -> Arc<Lane> {
+        router.attach(session, &via_owner()).unwrap()
+    }
+
+    /// §9: independently stated packet limits, not copied from the implementation.
+    const TEST_ID_BYTES: usize = 1024;
+    const TEST_KEY_BYTES: usize = 8 * 1024 * 1024;
+
+    fn long_call(number: usize) -> String {
+        let mut call = format!("{number:08}");
+        call.extend(std::iter::repeat_n('x', TEST_ID_BYTES - call.len()));
+        call
+    }
+
+    fn via_owner() -> SessionId {
+        SessionId::try_from("s_000000000001").unwrap()
+    }
+
     fn turn(number: u32) -> TurnNumber {
         TurnNumber::try_from(number).unwrap()
     }
@@ -1515,10 +1571,124 @@ mod tests {
         }
     }
 
+    /// §7.1: confirmed ownership outlives its lane; another VIA session cannot adopt it.
+    #[test]
+    fn oc06_detached_vendor_identity_keeps_its_via_owner() {
+        let mut router = Router::new();
+        let lane = attach(&mut router, "ses_a");
+        router.detach("ses_a", &lane);
+        let other = SessionId::try_from("s_000000000002").unwrap();
+        assert_eq!(
+            router.claim_session("ses_a", &other),
+            Err(RouterFailure::Protocol)
+        );
+        assert!(router.sessions["ses_a"].lane.is_none());
+        assert!(
+            router.failure().is_none(),
+            "other sessions retain the healthy generation"
+        );
+    }
+
+    /// §7.1: closing an older driver cannot remove a replacement lane.
+    #[test]
+    fn oc06_stale_detach_keeps_replacement_lane() {
+        let mut router = Router::new();
+        let previous = attach(&mut router, "ses_a");
+        let current = attach(&mut router, "ses_a");
+        router.detach("ses_a", &previous);
+        assert!(Arc::ptr_eq(
+            router.sessions["ses_a"].lane.as_ref().unwrap(),
+            &current
+        ));
+        router.register_turn("ses_a", "input_a".into(), turn(1));
+        router.accepted("ses_a", "input_a", Instant::now());
+        assert!(
+            matches!(current.pop(), Some(LaneItem::Accepted { owner, .. }) if owner == turn(1))
+        );
+    }
+
+    /// §9: terminal/progress tool metadata can retain a call without a prior started event.
+    #[test]
+    fn oc09_late_tool_metadata_charges_retained_call_ids() {
+        let mut router = Router::new();
+        let lane = attach(&mut router, "ses_a");
+        owned(&mut router, "ses_a", "input_a", 1);
+        apply(
+            &mut router,
+            "ses_a",
+            "session.step.started",
+            json!({"assistantMessageID":"assistant_a"}),
+            None,
+        );
+        while lane.pop().is_some() {}
+        for number in 0..=TEST_KEY_BYTES / TEST_ID_BYTES {
+            let call = long_call(number);
+            apply(
+                &mut router,
+                "ses_a",
+                "session.tool.failed",
+                json!({
+                    "assistantMessageID":"assistant_a", "id":call, "name":"bash",
+                    "error":{"type":"permission.rejected"}
+                }),
+                None,
+            );
+            while lane.pop().is_some() {}
+            if router.failure().is_none() {
+                assert_eq!(
+                    lane.failure(),
+                    None,
+                    "fixture must be valid owned tool metadata"
+                );
+            }
+            if router.failure().is_some() {
+                break;
+            }
+        }
+        assert_eq!(router.failure(), Some(RouterFailure::Overflow));
+    }
+
+    /// §9: child permission sources retained by normalization count against ID bytes.
+    #[test]
+    fn oc09_sequential_child_declines_charge_call_ids() {
+        let mut router = Router::new();
+        let lane = attach(&mut router, "ses_a");
+        owned(&mut router, "ses_a", "input_a", 1);
+        apply(
+            &mut router,
+            "ses_child",
+            "session.created",
+            json!({"parentID":"ses_a"}),
+            None,
+        );
+        while lane.pop().is_some() {}
+        for number in 0..=TEST_KEY_BYTES / TEST_ID_BYTES {
+            let call = long_call(number);
+            apply(
+                &mut router,
+                "ses_child",
+                "permission.asked",
+                json!({
+                    "id":format!("permission_{number}"),"action":"bash",
+                    "source":{"messageID":"child_assistant","id":call}
+                }),
+                None,
+            );
+            while lane.pop().is_some() {}
+            if router.failure().is_some() {
+                break;
+            }
+            let work = router.pop_pending_decline().unwrap();
+            router.finish_decline(&work, &Ok(DeclineOutcome::Declined), Instant::now());
+            while lane.pop().is_some() {}
+        }
+        assert_eq!(router.failure(), Some(RouterFailure::Overflow));
+    }
+
     #[test]
     fn oc09_response_limit_preserves_tombstone_owner_without_failing_successor() {
         let mut router = Router::new();
-        let lane = router.attach("ses_a");
+        let lane = attach(&mut router, "ses_a");
         router.register_turn("ses_a", "input_a".into(), turn(1));
         router.settle("ses_a", turn(1));
         router.register_turn("ses_a", "input_b".into(), turn(2));
@@ -1538,12 +1708,15 @@ mod tests {
     #[test]
     fn oc09_session_state_limit_is_exact() {
         let mut router = Router::new();
-        let observer = router.attach("ses_0");
+        let observer = attach(&mut router, "ses_0");
         for number in 1..1024 {
-            router.attach(&format!("ses_{number}"));
+            attach(&mut router, &format!("ses_{number}"));
         }
         assert_eq!(observer.failure(), None);
-        router.attach("ses_excess");
+        assert!(matches!(
+            router.attach("ses_excess", &via_owner()),
+            Err(RouterFailure::Overflow)
+        ));
         assert_eq!(observer.failure(), Some(LaneFailure::Overflow));
         assert_eq!(router.sessions.len(), 1024);
     }
@@ -1551,7 +1724,7 @@ mod tests {
     #[test]
     fn oc09_tombstone_limit_is_exact() {
         let mut router = Router::new();
-        let observer = router.attach("ses_a");
+        let observer = attach(&mut router, "ses_a");
         for number in 1..=4096 {
             router.register_turn("ses_a", format!("input_{number}"), turn(number));
             router.settle("ses_a", turn(number));
@@ -1565,7 +1738,7 @@ mod tests {
     #[test]
     fn oc09_child_limit_is_independent_of_driver_sessions() {
         let mut router = Router::new();
-        let observer = router.attach("ses_a");
+        let observer = attach(&mut router, "ses_a");
         owned(&mut router, "ses_a", "input_a", 1);
         while observer.pop().is_some() {}
         for number in 0..4096 {
@@ -1592,8 +1765,8 @@ mod tests {
     #[test]
     fn oc09_incomplete_request_limit_is_server_scoped_and_releases_slots() {
         let mut router = Router::new();
-        let observer = router.attach("ses_a");
-        router.attach("ses_b");
+        let observer = attach(&mut router, "ses_a");
+        attach(&mut router, "ses_b");
         for _ in 0..32 {
             router.request_started("ses_a");
             router.request_sent();
@@ -1613,7 +1786,7 @@ mod tests {
     #[test]
     fn oc09_cleanup_intents_charge_http_limit_only_after_first_byte() {
         let mut router = Router::new();
-        let lane = router.attach("ses_a");
+        let lane = attach(&mut router, "ses_a");
         for _ in 0..63 {
             router.request_started_for(None);
             router.request_sent();
@@ -1646,7 +1819,7 @@ mod tests {
     #[test]
     fn oc09_cleanup_cancel_race_keeps_tombstoned_input_authority() {
         let mut router = Router::new();
-        router.attach("ses_a");
+        attach(&mut router, "ses_a");
         router.register_turn("ses_a", "input_a".into(), turn(1));
         router.mark_sent("ses_a", "input_a");
         let by = Deadline::at(Instant::now() + Duration::from_secs(2));
@@ -1678,7 +1851,7 @@ mod tests {
     #[test]
     fn oc09_cleanup_cancel_intent_never_claims_successor_execution() {
         let mut router = Router::new();
-        router.attach("ses_a");
+        attach(&mut router, "ses_a");
         router.register_turn("ses_a", "input_a".into(), turn(1));
         router.mark_sent("ses_a", "input_a");
         router.enqueue_cleanup(
@@ -1708,7 +1881,7 @@ mod tests {
     #[test]
     fn oc09_pending_interactive_limit_is_exact() {
         let mut router = Router::new();
-        let observer = router.attach("ses_a");
+        let observer = attach(&mut router, "ses_a");
         owned(&mut router, "ses_a", "input_a", 1);
         while observer.pop().is_some() {}
         for number in 0..64 {
@@ -1735,7 +1908,7 @@ mod tests {
     #[test]
     fn oc09_correlation_key_count_includes_every_step_of_one_turn() {
         let mut router = Router::new();
-        let observer = router.attach("ses_a");
+        let observer = attach(&mut router, "ses_a");
         owned(&mut router, "ses_a", "input_a", 1);
         while observer.pop().is_some() {}
         for number in 1..65536 {
@@ -1762,7 +1935,7 @@ mod tests {
     #[test]
     fn oc09_correlation_key_byte_limit_is_exact() {
         let mut router = Router::new();
-        let observer = router.attach("ses_a");
+        let observer = attach(&mut router, "ses_a");
         owned(&mut router, "ses_a", "input_a", 1);
         while observer.pop().is_some() {}
         for number in 0..8192 {
@@ -1792,7 +1965,7 @@ mod tests {
     #[test]
     fn oc09_retained_id_above_one_kib_is_protocol() {
         let mut router = Router::new();
-        let observer = router.attach("ses_a");
+        let observer = attach(&mut router, "ses_a");
         owned(&mut router, "ses_a", "input_a", 1);
         while observer.pop().is_some() {}
         apply(
@@ -1817,18 +1990,18 @@ mod tests {
     #[test]
     fn oc09_staging_item_limit_is_shared_across_lanes() {
         let mut router = Router::new();
-        let observer = router.attach("ses_0");
+        let observer = attach(&mut router, "ses_0");
         for number in 0..64 {
             let id = format!("ses_{number}");
             if number != 0 {
-                router.attach(&id);
+                attach(&mut router, &id);
             }
             for _ in 0..16 {
                 apply(&mut router, &id, "session.renamed", json!({}), None);
             }
         }
         assert_eq!(observer.failure(), None);
-        router.attach("ses_excess");
+        attach(&mut router, "ses_excess");
         apply(
             &mut router,
             "ses_excess",
@@ -1842,11 +2015,11 @@ mod tests {
     #[test]
     fn oc09_staging_byte_limit_is_shared_across_lanes() {
         let mut router = Router::new();
-        let observer = router.attach("ses_0");
+        let observer = attach(&mut router, "ses_0");
         for number in 0..4 {
             let id = format!("ses_{number}");
             if number != 0 {
-                router.attach(&id);
+                attach(&mut router, &id);
             }
             let event = Event {
                 id: None,
@@ -1877,7 +2050,7 @@ mod tests {
             );
         }
         assert_eq!(observer.failure(), None);
-        let excess = router.attach("ses_excess");
+        let excess = attach(&mut router, "ses_excess");
         let event = Event {
             id: None,
             session_id: Some("ses_excess".into()),
@@ -1907,7 +2080,7 @@ mod tests {
     #[test]
     fn oc07_native_settlement_suppresses_failed_decline_stop_without_http_proof() {
         let mut router = Router::new();
-        let lane = router.attach("ses_a");
+        let lane = attach(&mut router, "ses_a");
         owned(&mut router, "ses_a", "input_a", 1);
         apply(
             &mut router,
@@ -1953,7 +2126,7 @@ mod tests {
     #[test]
     fn oc07_queued_native_settlement_retains_original_owner_notice() {
         let mut router = Router::new();
-        let lane = router.attach("ses_a");
+        let lane = attach(&mut router, "ses_a");
         owned(&mut router, "ses_a", "input_a", 1);
         apply(
             &mut router,
@@ -2007,7 +2180,7 @@ mod tests {
     #[test]
     fn oc11_native_settlement_keeps_old_owner_off_successor_rejections() {
         let mut router = Router::new();
-        let lane = router.attach("ses_a");
+        let lane = attach(&mut router, "ses_a");
         owned(&mut router, "ses_a", "input_a", 1);
         apply(
             &mut router,
@@ -2043,14 +2216,14 @@ mod tests {
     #[test]
     fn oc09_staging_covers_popped_items_held_by_delivery() {
         let mut router = Router::new();
-        let observer = router.attach("ses_0");
+        let observer = attach(&mut router, "ses_0");
         let mut held = Vec::new();
         for number in 0..64 {
             let id = format!("ses_{number}");
             let lane = if number == 0 {
                 observer.clone()
             } else {
-                router.attach(&id)
+                attach(&mut router, &id)
             };
             for _ in 0..16 {
                 apply(&mut router, &id, "session.renamed", json!({}), None);
@@ -2079,7 +2252,7 @@ mod tests {
     #[test]
     fn oc09_unowned_execution_keys_release_when_discarded() {
         let mut router = Router::new();
-        let lane = router.attach("ses_a");
+        let lane = attach(&mut router, "ses_a");
         apply(
             &mut router,
             "ses_a",
@@ -2116,7 +2289,7 @@ mod tests {
     #[test]
     fn oc07_descendant_request_remains_deduplicated_after_settlement() {
         let mut router = Router::new();
-        let lane = router.attach("ses_a");
+        let lane = attach(&mut router, "ses_a");
         owned(&mut router, "ses_a", "input_a", 1);
         apply(
             &mut router,
@@ -2157,7 +2330,7 @@ mod tests {
             json!({}),
             None,
         );
-        let lane = router.attach("ses_a");
+        let lane = attach(&mut router, "ses_a");
         router.register_turn("ses_a", "input_a".into(), turn(1));
         assert_eq!(lane.earliest_unobserved(turn(1)), None);
     }
@@ -2165,7 +2338,7 @@ mod tests {
     #[test]
     fn oc11_unrelated_session_rejection_never_taints_a_live_turn() {
         let mut router = Router::new();
-        let lane = router.attach("ses_a");
+        let lane = attach(&mut router, "ses_a");
         router.register_turn("ses_a", "input_a".into(), turn(1));
         router
             .malformed(DecodeError::Session("ses_b".into()))
@@ -2176,7 +2349,7 @@ mod tests {
     #[test]
     fn oc11_unknown_session_malformed_taints_only_currently_live_windows() {
         let mut router = Router::new();
-        let lane = router.attach("ses_a");
+        let lane = attach(&mut router, "ses_a");
         router.register_turn("ses_a", "input_a".into(), turn(1));
         assert_eq!(
             router.malformed(DecodeError::Generation),
@@ -2192,7 +2365,7 @@ mod tests {
     #[test]
     fn oc11_malformed_mapped_child_taints_only_its_live_root_owner() {
         let mut router = Router::new();
-        let lane = router.attach("ses_a");
+        let lane = attach(&mut router, "ses_a");
         owned(&mut router, "ses_a", "input_a", 1);
         apply(
             &mut router,
@@ -2207,8 +2380,8 @@ mod tests {
         assert_eq!(lane.failure(), Some(LaneFailure::Protocol));
         assert!(lane.earliest_unobserved(turn(1)).is_some());
         router.settle("ses_a", turn(1));
-        router.detach("ses_a");
-        let successor = router.attach("ses_a");
+        router.detach("ses_a", &lane);
+        let successor = attach(&mut router, "ses_a");
         router.register_turn("ses_a", "input_b".into(), turn(2));
         router
             .malformed(DecodeError::Session("ses_child".into()))
@@ -2220,11 +2393,11 @@ mod tests {
     #[test]
     fn oc11_prior_driver_drops_count_only_their_retained_owner_window() {
         let mut router = Router::new();
-        let previous = router.attach("ses_a");
+        let previous = attach(&mut router, "ses_a");
         router.register_turn("ses_a", "input_a".into(), turn(1));
         router.settle("ses_a", turn(1));
-        router.detach("ses_a");
-        let reopened = router.attach("ses_a");
+        router.detach("ses_a", &previous);
+        let reopened = attach(&mut router, "ses_a");
         router.register_turn("ses_a", "input_b".into(), turn(2));
         reopened.reject_unobserved(Some(turn(1)), 7);
         assert_eq!(reopened.earliest_unobserved(turn(2)), None);
@@ -2247,7 +2420,7 @@ mod tests {
     #[test]
     fn oc05_settled_never_delivered_input_ends_late_execution_before_successor() {
         let mut router = Router::new();
-        let lane = router.attach("ses_a");
+        let lane = attach(&mut router, "ses_a");
         router.register_turn("ses_a", "input_a".into(), turn(1));
         router.mark_sent("ses_a", "input_a");
         router.settle("ses_a", turn(1));
@@ -2309,7 +2482,7 @@ mod tests {
     #[test]
     fn oc05_settled_never_delivered_input_cancellation_admits_successor() {
         let mut router = Router::new();
-        let lane = router.attach("ses_a");
+        let lane = attach(&mut router, "ses_a");
         router.register_turn("ses_a", "input_a".into(), turn(1));
         router.mark_sent("ses_a", "input_a");
         router.settle("ses_a", turn(1));
@@ -2334,7 +2507,7 @@ mod tests {
     #[test]
     fn oc06_grandchild_interactive_routes_to_root_owning_turn() {
         let mut router = Router::new();
-        let lane = router.attach("ses_a");
+        let lane = attach(&mut router, "ses_a");
         owned(&mut router, "ses_a", "input_a", 1);
         apply(
             &mut router,
@@ -2374,8 +2547,8 @@ mod tests {
     #[test]
     fn oc06_interleaved_sessions_own_only_their_delivered_execution() {
         let mut router = Router::new();
-        let a = router.attach("ses_a");
-        let b = router.attach("ses_b");
+        let a = attach(&mut router, "ses_a");
+        let b = attach(&mut router, "ses_b");
         router.register_turn("ses_a", "input_a".into(), turn(1));
         apply(
             &mut router,
@@ -2409,9 +2582,9 @@ mod tests {
     #[test]
     fn oc05_detach_preserves_busy_state_and_dropped_terminal_releases_rule() {
         let mut router = Router::new();
-        let lane = router.attach("ses_a");
+        let lane = attach(&mut router, "ses_a");
         owned(&mut router, "ses_a", "input_a", 1);
-        router.detach("ses_a");
+        router.detach("ses_a", &lane);
         assert!(!router.eligible("ses_a"));
         apply(
             &mut router,
@@ -2420,7 +2593,7 @@ mod tests {
             json!({}),
             None,
         );
-        let _reopened = router.attach("ses_a");
+        let _reopened = attach(&mut router, "ses_a");
         assert!(router.eligible("ses_a"));
         assert!(lane.earliest_unobserved(turn(1)).is_some());
     }
@@ -2428,7 +2601,7 @@ mod tests {
     #[test]
     fn oc06_tombstones_keep_late_assistant_and_tool_events_off_successor() {
         let mut router = Router::new();
-        let lane = router.attach("ses_a");
+        let lane = attach(&mut router, "ses_a");
         owned(&mut router, "ses_a", "input_a", 1);
         apply(
             &mut router,
@@ -2470,7 +2643,7 @@ mod tests {
     #[test]
     fn oc06_child_interactive_routes_parent_but_child_text_is_excluded() {
         let mut router = Router::new();
-        let lane = router.attach("ses_a");
+        let lane = attach(&mut router, "ses_a");
         owned(&mut router, "ses_a", "input_a", 1);
         apply(
             &mut router,
@@ -2503,7 +2676,7 @@ mod tests {
     #[test]
     fn oc06_nonincreasing_sequence_fails_session_gaps_do_not() {
         let mut router = Router::new();
-        let lane = router.attach("ses_a");
+        let lane = attach(&mut router, "ses_a");
         apply(&mut router, "ses_a", "session.renamed", json!({}), Some(1));
         apply(&mut router, "ses_a", "session.renamed", json!({}), Some(4));
         assert_eq!(lane.failure(), None);
@@ -2514,7 +2687,7 @@ mod tests {
     #[test]
     fn oc05_state_applies_terminal_before_lane_overflow_and_usage_is_tainted() {
         let mut router = Router::new();
-        let lane = router.attach("ses_a");
+        let lane = attach(&mut router, "ses_a");
         owned(&mut router, "ses_a", "input_a", 1);
         for _ in 0..14 {
             apply(&mut router, "ses_a", "session.future", json!({}), None);
@@ -2533,7 +2706,7 @@ mod tests {
     #[test]
     fn oc06_decode_watermark_advances_on_admission_for_exact_owner_only() {
         let mut router = Router::new();
-        let lane = router.attach("ses_a");
+        let lane = attach(&mut router, "ses_a");
         let first = DecodeWatermark::default();
         let second = DecodeWatermark::default();
         lane.track(turn(1), first.clone());
@@ -2575,7 +2748,7 @@ mod tests {
     #[test]
     fn oc10_loss_report_requires_sent_unsettled_destination_not_execution_state() {
         let mut router = Router::new();
-        let _lane = router.attach("ses_a");
+        let _lane = attach(&mut router, "ses_a");
         assert!(!router.has_loss_destination());
         router.register_turn("ses_a", "input_a".into(), turn(1));
         assert!(!router.has_loss_destination());
@@ -2652,12 +2825,13 @@ mod tests {
     #[test]
     fn oc05_reopen_cleanup_is_once_only_and_blocks_until_stream_proofs_finish() {
         let mut router = Router::new();
+        let prior = attach(&mut router, "ses_a");
         assert!(router.begin_reopen_cleanup("ses_a"));
         assert!(!router.eligible("ses_a"));
         assert!(!router.begin_reopen_cleanup("ses_a"));
         assert!(!router.eligible("ses_a"));
-        router.detach("ses_a");
-        let _reopened = router.attach("ses_a");
+        router.detach("ses_a", &prior);
+        let _reopened = attach(&mut router, "ses_a");
         assert!(!router.eligible("ses_a"));
         router.finish_reopen_cleanup("ses_a");
         assert!(router.eligible("ses_a"));
@@ -2681,7 +2855,7 @@ mod tests {
     #[test]
     fn oc06_keys_of_unowned_running_execution_bind_when_own_input_joins() {
         let mut router = Router::new();
-        let lane = router.attach("ses_a");
+        let lane = attach(&mut router, "ses_a");
         router.register_turn("ses_a", "input_a".into(), turn(1));
         apply(
             &mut router,
@@ -2750,7 +2924,7 @@ mod tests {
     #[test]
     fn oc06_late_inbox_events_never_give_old_turn_a_new_execution() {
         let mut router = Router::new();
-        let lane = router.attach("ses_a");
+        let lane = attach(&mut router, "ses_a");
         owned(&mut router, "ses_a", "input_a", 1);
         apply(
             &mut router,
@@ -2810,7 +2984,7 @@ mod tests {
     #[test]
     fn oc06_joined_step_metadata_keeps_original_start_order_without_replaying() {
         let mut router = Router::new();
-        let lane = router.attach("ses_a");
+        let lane = attach(&mut router, "ses_a");
         router.register_turn("ses_a", "input_a".into(), turn(1));
         apply(
             &mut router,
@@ -2865,7 +3039,7 @@ mod tests {
     #[test]
     fn oc09_unsent_requests_do_not_consume_incomplete_response_bound() {
         let mut router = Router::new();
-        router.session_opened("ses_a");
+        router.claim_session("ses_a", &via_owner()).unwrap();
         for _ in 0..65 {
             router.request_started("ses_a");
         }

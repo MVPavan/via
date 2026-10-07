@@ -21,6 +21,7 @@ use core_opencode::{
     Case, MODEL, SES, catalog_entry, class, location_target, route, rules, server, session_info,
     setup_succeeded, with_route,
 };
+use core_opencode::{session_info_for, with_session};
 use serde_json::{Value, json};
 
 /// Runs `body` on a current-thread runtime.
@@ -287,12 +288,21 @@ fn oc04_reopen_reads_back_and_a_mismatch_is_not_cached() {
     // The new server reads back other rules.
     let mut tampered = rules(false);
     tampered.as_array_mut().unwrap().pop();
-    case.fixture(&with_route(
-        server(&cwd, None),
+    let fixture = with_route(
+        with_session(server(&cwd, None), "ses_via0002", &cwd, None),
         route(
             "GET",
             &format!("/api/session/{SES}"),
             json!([{"status": 200, "json": session_info(&cwd, "default", &tampered)}]),
+        ),
+    );
+    case.fixture(&with_route(
+        fixture,
+        route(
+            "POST",
+            "/api/session",
+            json!([{"status":200,
+            "json":session_info_for("ses_via0002", &cwd, "default", &rules(false))}]),
         ),
     ));
     run(async {
@@ -372,13 +382,13 @@ fn oc04_a_just_sent_readback_is_refused_under_its_digest() {
     // The first creation reads back the default rules, the next the
     // skills-off ones.
     case.fixture(&with_route(
-        server(&cwd, Some("Be brief.")),
+        with_session(server(&cwd, Some("Be brief.")), "ses_via0002", &cwd, Some("Be brief.")),
         route(
             "POST",
             "/api/session",
             json!([
                 {"status": 200, "json": session_info(&cwd, "default", &rules(false))},
-                {"status": 200, "json": session_info(&cwd, "default", &rules(true))},
+                {"status": 200, "json": session_info_for("ses_via0002", &cwd, "default", &rules(true))},
             ]),
         ),
     ));
@@ -514,7 +524,7 @@ fn oc11_the_variant_is_judged_per_location_in_run_turn() {
     let (a, b) = (case.cwd("a"), case.cwd("b"));
     let catalog =
         |variants: &[&str]| json!({"status": 200, "json": {"data": [catalog_entry(variants)]}});
-    let mut fixture = server(&a, None);
+    let mut fixture = with_session(server(&a, None), "ses_via0002", &b, None);
     fixture = with_route(
         fixture,
         route("GET", &location_target(&a), json!([catalog(&["high"])])),
@@ -527,8 +537,7 @@ fn oc11_the_variant_is_judged_per_location_in_run_turn() {
             json!([catalog(&["low"]), catalog(&["low", "high"])]),
         ),
     );
-    // Both sessions are `SES`: the first creation is at `a`, the second at
-    // `b`; every later readback has the variant switched to.
+    // Distinct identities at each location share one server; readbacks match their own session.
     fixture = with_route(
         fixture,
         route(
@@ -536,7 +545,7 @@ fn oc11_the_variant_is_judged_per_location_in_run_turn() {
             "/api/session",
             json!([
                 {"status": 200, "json": session_info(&a, "default", &rules(false))},
-                {"status": 200, "json": session_info(&b, "default", &rules(false))},
+                {"status": 200, "json": session_info_for("ses_via0002", &b, "default", &rules(false))},
             ]),
         ),
     );
@@ -546,6 +555,14 @@ fn oc11_the_variant_is_judged_per_location_in_run_turn() {
             "GET",
             &format!("/api/session/{SES}"),
             json!([{"status": 200, "json": session_info(&a, "high", &rules(false))}]),
+        ),
+    );
+    fixture = with_route(
+        fixture,
+        route(
+            "GET",
+            "/api/session/ses_via0002",
+            json!([{"status":200,"json":session_info_for("ses_via0002", &b, "high", &rules(false))}]),
         ),
     );
     case.fixture(&fixture);
