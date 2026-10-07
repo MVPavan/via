@@ -1238,14 +1238,27 @@ and rotation comparisons return Booleans; the password and bearer handles are
 never written. Scans cover evidence, fixture content, private logs and the
 owned VIA store. Password and bearer checks apply to every readable regular
 file in the scanned roots, including previously returned bearer handles.
-Synthetic hostile-provider values gate only VIA's evidence, phase/summary files,
-Store and stderr/undecoded captures. Observed synthetic matches in readable
-vendor-private files are a labelled file count, never a gate failure; fixture
-config values remain labelled input. Credential/config files and vendor
-databases remain metadata-only exclusions, reported as a proof limitation.
-Non-regular entries, including symlinks, are skipped and counted as metadata-only;
-the scan never follows them. Returned bearer handles join the in-memory
-forbidden forms. Structural spending controls are checked before model-capable
+Synthetic hostile-provider values gate only VIA-owned sinks: evidence and
+phase/summary files, state outside the vendor namespace, the Store,
+stderr/undecoded captures and the daemon's private HOME/XDG/TMPDIR roots.
+Every regular VIA sink is read regardless of suffix, including rotated logs
+and Store blobs; Store/WAL content uses a consistent in-memory backup. Once a
+daemon has run, its Store must exist and be regular, including after shutdown.
+Non-regular VIA roots or entries, missing required state/Store, vanished VIA
+entries and unverifiable backups block qualification. The named operational
+exceptions are the `helpers/rg` symlink and, if under evidence, the runtime
+`via.sock` and `anchors/*.sock` sockets; the daemon lock remains a regular file.
+The pinned acquisition, `acquisition-home` and `helpers` artifacts are outside
+the VIA sink set. Unexpected credential content in a VIA-owned area blocks
+without being read. Observed synthetic matches in readable vendor-private
+files are a labelled file count, never a gate failure; fixture config values
+remain labelled input. Vendor credential/config files and databases remain
+metadata-only exclusions, reported as a proof limitation. Vendor-private
+non-regular entries are skipped and counted as metadata-only; entries vanishing
+during the walk, lstat or read are skipped and counted separately as
+`vendor_private_vanished_entries`. The scan never follows non-regular entries.
+Returned bearer handles join the in-memory forbidden forms. Structural
+spending controls are checked before model-capable
 requests: known empty integrations, an environment allow-list, frozen free
 catalog/session identities, and loopback endpoints for every overridden
 provider. Missing cost is unavailable; positive cost or a paid identity stops

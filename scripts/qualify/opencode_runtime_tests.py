@@ -243,8 +243,8 @@ class RuntimeTests(unittest.TestCase):
     def test_vendor_private_synthetic_matches_are_labelled_on_each_private_root(self):
         with tempfile.TemporaryDirectory(prefix='via-runtime-') as root:
             d=self.driver(root); d.namespace=d.state/'vendor'/'opencode'/'namespace'
-            xdg=d.evidence/'daemon-data'; project=d.evidence/'fixtures'/'fixture'
-            d.env={'XDG_DATA_HOME':str(xdg)}; d.fixtures={'fixture':{'path':project}}
+            xdg=d.namespace/'data'; project=d.evidence/'fixtures'/'fixture'
+            d.namespace_env={'XDG_DATA_HOME':str(xdg)}; d.fixtures={'fixture':{'path':project}}
             for folder in (d.namespace,d.home,xdg,project):
                 folder.mkdir(parents=True,exist_ok=True); (folder/'vendor.log').write_bytes(b'fixture-provider-secret')
             d.secret_forms=[b'fixture-provider-secret']
@@ -252,21 +252,141 @@ class RuntimeTests(unittest.TestCase):
             self.assertTrue(report['secret_absent'])
             self.assertEqual(report['vendor_private_synthetic_files'],4)
 
-    def test_nonregular_scan_entries_are_metadata_only_and_never_followed(self):
+    def test_vendor_nonregular_scan_entries_are_metadata_only_and_never_followed(self):
         with tempfile.TemporaryDirectory(prefix='via-runtime-') as root:
             root=Path(root); d=self.driver(root); d.state.mkdir()
             target=root/'target.log'; target.write_bytes(b'private-password')
             directory=root/'target-directory'; directory.mkdir(); (directory/'vendor.log').write_bytes(b'private-password')
-            (d.evidence/'linked.log').symlink_to(target)
-            (d.evidence/'linked-logs').symlink_to(directory, target_is_directory=True)
-            (d.state/'store.sqlite3').symlink_to(target)
-            os.mkfifo(d.evidence/'stream.log')
+            d.namespace=d.state/'vendor'/'opencode'/'namespace'; d.namespace.mkdir(parents=True)
+            (d.namespace/'linked.log').symlink_to(target)
+            (d.namespace/'linked-logs').symlink_to(directory, target_is_directory=True)
+            (d.namespace/'opencode.db').symlink_to(target)
+            os.mkfifo(d.namespace/'stream.log')
             proc=mock.Mock(); proc.read.return_value=safety.PASSWORD_KEY+b'=private-password\0'
             d.vault.read_once(proc,safety.Identity(10,20))
             with mock.patch.object(runtime.sqlite3,'connect',side_effect=AssertionError('nonregular store read')):
                 report=d.secrecy_scan()
             self.assertTrue(report['secret_absent'])
             self.assertEqual(report['metadata_only_files'],4)
+
+    def test_via_rotated_log_and_store_blob_have_no_suffix_exemption(self):
+        for suffix in ('via.log.1','blobs/b_fixture.blob'):
+            for value in (b'private-password',b'fixture-provider-secret',b'h_private_bearer'):
+                with self.subTest(path=suffix,value=value), tempfile.TemporaryDirectory(prefix='via-runtime-') as root:
+                    d=self.driver(root); path=d.state/suffix; path.parent.mkdir(parents=True); path.write_bytes(value)
+                    proc=mock.Mock(); proc.read.return_value=safety.PASSWORD_KEY+b'=private-password\0'
+                    d.vault.read_once(proc,safety.Identity(10,20)); d.handles={'s_fixture':'h_private_bearer'}
+                    d.secret_forms=[b'fixture-provider-secret',b'h_private_bearer']
+                    self.assertFalse(d.secrecy_scan()['secret_absent'])
+
+    def test_missing_or_nonregular_store_after_daemon_run_blocks(self):
+        for kind in ('missing','symlink','directory','fifo'):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory(prefix='via-runtime-') as root:
+                d=self.driver(root); d.state.mkdir(); d._daemon_ran=True; path=d.state/'store.sqlite3'
+                if kind=='symlink':
+                    target=Path(root)/'target'; target.write_bytes(b'not a Store'); path.symlink_to(target)
+                elif kind=='directory': path.mkdir()
+                elif kind=='fifo': os.mkfifo(path)
+                with self.assertRaisesRegex(safety.Blocked,'VIA Store'):
+                    d.secrecy_scan()
+
+    def test_via_regular_config_database_and_extensionless_files_are_read(self):
+        for name in ('output.db','output.sqlite','opencode.json','extensionless'):
+            with self.subTest(name=name), tempfile.TemporaryDirectory(prefix='via-runtime-') as root:
+                d=self.driver(root); (d.evidence/name).write_bytes(b'fixture-provider-secret')
+                d.secret_forms=[b'fixture-provider-secret']
+                self.assertFalse(d.secrecy_scan()['secret_absent'])
+
+    def test_verified_fake_daemon_start_requires_store_even_after_stop(self):
+        with tempfile.TemporaryDirectory(prefix='via-runtime-') as root:
+            proc=mock.Mock(); proc.stat.return_value={'start_ticks':20}; proc.alive.return_value=False
+            d=self.driver(root,proc=proc); d.state.mkdir(); project=d.evidence/'project'; project.mkdir()
+            d.fixtures={'fixture':{'path':project,'config':{}}}; d.env={'PATH':'/usr/bin:/bin'}
+            with mock.patch.object(d,'build'), mock.patch.object(safety,'verify_binary'), \
+                 mock.patch.object(safety,'validate_path'), mock.patch.object(safety,'verify_daemon_program'), \
+                 mock.patch.object(d,'_refresh_inventory'), mock.patch.object(d,'_record'), \
+                 mock.patch.object(d,'via',return_value={'pid':10}), \
+                 mock.patch.object(d,'_locks_owned',return_value=True), \
+                 mock.patch.object(d,'_lock_free',return_value=True), \
+                 mock.patch.object(d,'_pgrep_clear',return_value=True):
+                d.start('release',project); d.stop()
+            self.assertIsNone(d.daemon)
+            with self.assertRaisesRegex(safety.Blocked,'VIA Store missing after daemon run'):
+                d.secrecy_scan()
+
+    def test_nonregular_via_roots_block_before_external_read(self):
+        for kind in ('evidence','state','daemon-home','daemon-tmp'):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory(prefix='via-runtime-') as root:
+                d=self.driver(root); target=Path(root)/'outside'; target.mkdir()
+                if kind=='evidence': path=d.evidence; path.rmdir()
+                elif kind=='state': path=d.state
+                else:
+                    path=d.evidence/kind
+                    d.env={'HOME' if kind=='daemon-home' else 'TMPDIR':str(path)}
+                path.symlink_to(target,target_is_directory=True)
+                with self.assertRaisesRegex(safety.Blocked,'VIA scan root'):
+                    d.secrecy_scan()
+
+    def test_unlisted_nonregular_via_entries_block(self):
+        for kind in ('file-link','directory-link','fifo'):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory(prefix='via-runtime-') as root:
+                d=self.driver(root); target=Path(root)/'outside'; target.mkdir()
+                path=d.evidence/'hidden.log'
+                if kind=='file-link':
+                    target=target/'target'; target.write_bytes(b'not followed'); path.symlink_to(target)
+                elif kind=='directory-link': path.symlink_to(target,target_is_directory=True)
+                else: os.mkfifo(path)
+                with self.assertRaisesRegex(safety.Blocked,'non-regular VIA scan entry'):
+                    d.secrecy_scan()
+
+    def test_only_named_operational_nonregular_entries_are_allowed(self):
+        with tempfile.TemporaryDirectory(prefix='via-runtime-') as root:
+            d=self.driver(root); d.helpers.mkdir(); d.runtime.mkdir()
+            target=Path(root)/'checked-rg'; target.write_bytes(b'fixture rg')
+            (d.helpers/'rg').symlink_to(target); (d.runtime/'daemon.lock').touch()
+            anchor=d.runtime/'anchors'/'a_fixture.sock'; anchor.parent.mkdir()
+            sockets=[]
+            try:
+                for path in (d.runtime/'via.sock',anchor):
+                    channel=runtime.socket.socket(runtime.socket.AF_UNIX); channel.bind(str(path)); sockets.append(channel)
+                self.assertTrue(d.secrecy_scan()['secret_absent'])
+                unexpected=d.runtime/'unexpected.sock'
+                channel=runtime.socket.socket(runtime.socket.AF_UNIX); channel.bind(str(unexpected)); sockets.append(channel)
+                with self.assertRaisesRegex(safety.Blocked,'non-regular VIA scan entry'):
+                    d.secrecy_scan()
+            finally:
+                for channel in sockets: channel.close()
+
+    def test_only_vendor_private_vanishing_entries_are_counted_and_skipped(self):
+        for private in (True,False):
+            for phase in ('lstat','read','directory'):
+                with self.subTest(private=private,phase=phase), tempfile.TemporaryDirectory(prefix='via-runtime-') as root:
+                    d=self.driver(root); d.namespace=d.state/'vendor'/'opencode'/'namespace'
+                    folder=(d.namespace if private else d.state)/'log'; folder.mkdir(parents=True)
+                    path=folder/('gone' if phase=='directory' else 'gone.log')
+                    if phase=='directory': path.mkdir(); (path/'child.log').write_bytes(b'clean')
+                    else: path.write_bytes(b'clean')
+                    original=Path.open if phase=='read' else Path.lstat
+                    def vanished(candidate,*args,**kwargs):
+                        if candidate==path: raise FileNotFoundError(errno.ENOENT,'fixture vanished',str(candidate))
+                        return original(candidate,*args,**kwargs)
+                    with mock.patch.object(Path,'open' if phase=='read' else 'lstat',vanished):
+                        if private:
+                            scan=d.secrecy_scan(); self.assertTrue(scan['secret_absent'])
+                            self.assertEqual(scan['vendor_private_vanished_entries'],1)
+                        else:
+                            with self.assertRaisesRegex(safety.Blocked,'VIA scan entry vanished'):
+                                d.secrecy_scan()
+
+    def test_daemon_home_xdg_and_tmp_roots_are_via_sinks(self):
+        for key,part in safety.PRIVATE_PARTS.items():
+            with self.subTest(key=key), tempfile.TemporaryDirectory(prefix='via-runtime-') as root:
+                d=self.driver(root); folder=d.evidence/('daemon-'+part); folder.mkdir()
+                d.env={key:str(folder)}; (folder/'output.log').write_bytes(b'fixture-provider-secret')
+                d.secret_forms=[b'fixture-provider-secret']
+                scan=d.secrecy_scan()
+                self.assertFalse(scan['secret_absent'])
+                self.assertEqual(scan['vendor_private_synthetic_files'],0)
 
     def test_fresh_max_steps_uses_only_mock_selector(self):
         with tempfile.TemporaryDirectory(prefix='via-runtime-') as root:

@@ -36,6 +36,7 @@ Blocked = safety.Blocked
 # Packet §9 and the reviewed qualification plan's observation/pagination bounds.
 OBSERVATION_BYTES = 16 * 1024 * 1024
 EVIDENCE_BYTES = 256 * 1024 * 1024
+SCAN_ENTRIES = 100000  # §13: bound the owned evidence/private-root walk.
 PAGE_COUNT = 1000
 SOCKET_BYTES = 107
 SSE_HANDSHAKE_SECONDS = 30  # §13 owned observer absolute header deadline.
@@ -236,7 +237,7 @@ class Driver:
         self.public_free=public_free
         self._http=None; self._binary=None; self.daemon=None; self.anchor=None; self.vendor_identity=None
         self.identities=set(); self.uncertain=[]; self.build_hashes={}; self.handles={}
-        self.bearer_forms=set()
+        self.bearer_forms=set(); self._daemon_ran=False
         self.events=[]; self.events_error=None; self._event_stop=threading.Event()
         self._event_thread=None; self._event_conn=None; self._events_lock=threading.Lock()
         self.counter=0; self.owned_replies=[]; self.secret_forms=[]; self._armed={}
@@ -402,7 +403,7 @@ class Driver:
             identity=safety.Identity(reply['pid'],row['start_ticks'])
             if not self._locks_owned(identity.pid):
                 raise Blocked('private daemon lock ownership unavailable')
-            self.daemon=identity; self.identities.add(identity)
+            self.daemon=identity; self._daemon_ran=True; self.identities.add(identity)
             self._record('daemon-start',{'verified':True,**identity.report(),'build':kind})
         except BaseException:
             self.uncertain.append('failed daemon start')
@@ -993,83 +994,151 @@ class Driver:
         return form.get('sessionID') if type(form) is dict else None
 
     def secrecy_scan(self):
-        """Gate synthetic values on VIA sinks; passwords/bearers on all readable roots (§13 L4)."""
-        private_roots={self.home,*(Path(value) for key,value in self.env.items()
-                                  if key in safety.PRIVATE_PARTS)}
-        private_roots.update(row['path'] for row in self.fixtures.values())
+        """Read every VIA sink; tolerate only vendor-private churn (§13 L4/OC12)."""
+        daemon_roots={Path(value) for key,value in self.env.items() if key in safety.PRIVATE_PARTS}
+        private_roots={self.home,*(row['path'] for row in self.fixtures.values())}
         if self.namespace is not None: private_roots.add(self.namespace)
-        roots={self.evidence,self.state,*private_roots}
+        private_roots.update(Path(value) for key,value in self.namespace_env.items()
+                             if key in safety.PRIVATE_PARTS)
+        via_roots={self.evidence,self.state,*daemon_roots}
+        roots=via_roots | private_roots
         fixture_sources={row['path']/'opencode.json' for row in self.fixtures.values()}
         db=self.state/'store.sqlite3'
-        clean=True; captures=[]; seen=set(); metadata=[]; synthetic=[]; total=0
-        vendor_synthetic=0
+        store_files={db,Path(str(db)+'-wal'),Path(str(db)+'-shm')}
+        ran=self._daemon_ran or self.daemon is not None
+        clean=True; captures=[]; seen=set(); metadata=set(); synthetic=[]; total=0
+        vendor_synthetic=0; vanished=set()
         handles={handle.encode() for handle in self.handles.values()} | self.bearer_forms
         synthetic_forms=[form for form in self.secret_forms if form and form not in handles]
+        def private(path):
+            return any(path.is_relative_to(folder) for folder in private_roots) \
+                and not any(path.is_relative_to(folder) for folder in daemon_roots)
+        def artifact(path):
+            if path.is_relative_to(self.helpers) or path.is_relative_to(self.evidence/'acquisition-home'):
+                return True
+            return path.is_relative_to(self.evidence) and bool(path.relative_to(self.evidence).parts) \
+                and path.relative_to(self.evidence).parts[0].startswith('pinned-')
+        def via(path):
+            return any(path.is_relative_to(folder) for folder in via_roots) \
+                and not private(path) and not artifact(path)
+        def remember(path):
+            seen.add(path)
+            if len(seen)>SCAN_ENTRIES: raise Blocked('private secrecy scan entry bound')
+        def unavailable(path,error):
+            if isinstance(error,FileNotFoundError) and private(path):
+                remember(path); vanished.add(path); return
+            if isinstance(error,FileNotFoundError):
+                raise Blocked('VIA scan entry vanished') from error
+            raise Blocked('private secrecy scan entry unreadable') from error
+        def nonregular(path,mode):
+            allowed=(path==self.helpers/'rg' and stat.S_ISLNK(mode)) or (stat.S_ISSOCK(mode) and (
+                path==self.runtime/'via.sock' or
+                path.parent==self.runtime/'anchors' and path.suffix=='.sock'))
+            if private(path) or allowed: metadata.add(path); return
+            raise Blocked('non-regular VIA scan entry')
+        # Roots and the Store are prerequisites, not metadata-only proof exclusions.
+        checked_roots=set()
+        for root in via_roots | {self.helpers,self.evidence/'acquisition-home'}:
+            try: info=root.lstat()
+            except FileNotFoundError:
+                if root==self.evidence or ran and root==self.state:
+                    raise Blocked('VIA scan root missing')
+                continue
+            except OSError as error: raise Blocked('VIA scan root unreadable') from error
+            if not stat.S_ISDIR(info.st_mode): raise Blocked('VIA scan root is not a directory')
+            checked_roots.add(root)
+        store_present=False
+        for path in store_files:
+            try: info=path.lstat()
+            except FileNotFoundError:
+                if path==db and ran: raise Blocked('VIA Store missing after daemon run')
+                continue
+            except OSError as error: raise Blocked('VIA Store unreadable') from error
+            if not stat.S_ISREG(info.st_mode): raise Blocked('VIA Store is not a regular file')
+            if path==db: store_present=True
         for root in roots:
             try: root_info=root.lstat()
-            except FileNotFoundError: continue
-            if not stat.S_ISDIR(root_info.st_mode):
-                if root not in seen: seen.add(root); metadata.append(root)
+            except FileNotFoundError:
+                if root in seen or root in checked_roots: unavailable(root,FileNotFoundError())
                 continue
-            def unreadable(_error): raise Blocked('private secrecy scan directory unreadable')
+            except OSError as error: unavailable(root,error); continue
+            if not stat.S_ISDIR(root_info.st_mode):
+                remember(root); nonregular(root,root_info.st_mode); continue
+            def unreadable(error):
+                if error.filename is None: raise Blocked('private secrecy scan directory unreadable') from error
+                unavailable(Path(error.filename),error)
             for directory,dirs,files in os.walk(root,followlinks=False,onerror=unreadable):
-                dirs[:]=[name for name in dirs if name!='.git']
                 for name in dirs[:]:
                     path=Path(directory)/name
-                    if not stat.S_ISDIR(path.lstat().st_mode):
-                        dirs.remove(name)
-                        if path not in seen: seen.add(path); metadata.append(path)
-                if len(seen)>100000: raise Blocked('private secrecy scan entry bound')
+                    if name=='.git' and private(path): dirs.remove(name); continue
+                    remember(path)
+                    try: info=path.lstat()
+                    except OSError as error: dirs.remove(name); unavailable(path,error); continue
+                    if not stat.S_ISDIR(info.st_mode):
+                        dirs.remove(name); nonregular(path,info.st_mode)
                 for name in files:
                     path=Path(directory)/name
                     if path in seen: continue
-                    seen.add(path)
-                    if len(seen)>100000: raise Blocked('private secrecy scan entry bound')
-                    info=path.lstat()
-                    if not stat.S_ISREG(info.st_mode): metadata.append(path); continue
-                    if path==db: continue  # Own VIA Store has a consistent in-memory backup below.
+                    remember(path)
+                    try: info=path.lstat()
+                    except OSError as error: unavailable(path,error); continue
+                    if not stat.S_ISREG(info.st_mode): nonregular(path,info.st_mode); continue
+                    if path in store_files: continue  # Consistent Store/WAL snapshot below.
+                    via_sink=via(path); source=path in fixture_sources
                     protected_directory=any(safety.credential_metadata_only(part)
                                             for part in path.relative_to(root).parts[:-1])
-                    if protected_directory or safety.credential_metadata_only(name) or name.lower().endswith('.db') \
-                            or name=='opencode.json' and path not in fixture_sources:
-                        # Authentication/config/database contents remain unread. Counts
-                        # label this proof limit without recording their private paths.
-                        metadata.append(path); continue
-                    source=path in fixture_sources
-                    readable=source or path.suffix.lower() in {'.json','.jsonl','.ndjson','.log','.txt'} \
+                    protected_name=safety.credential_metadata_only(name) or name.lower().endswith('.db') \
+                        or name=='opencode.json' and not source
+                    if protected_directory or protected_name:
+                        if via_sink:
+                            # Vendor database/config exclusions do not exempt VIA
+                            # sinks. Unexpected credentials block without reading.
+                            for part in path.relative_to(root).parts:
+                                lowered=part.lower().lstrip('.')
+                                if lowered.startswith(('auth','npmrc','netrc','bunfig.toml')) \
+                                        or 'credential' in lowered:
+                                    raise Blocked('protected content in VIA-owned scan')
+                        else: metadata.add(path); continue
+                    readable=via_sink or source or path.suffix.lower() in {'.json','.jsonl','.ndjson','.log','.txt'} \
                         or any(part in {'log','logs'} for part in path.parts) \
                         or any(token in name.lower() for token in ('stderr','stdout','output','undecoded'))
                     if not readable: continue
                     if info.st_size>OBSERVATION_BYTES: raise Blocked('evidence scan bound')
-                    total+=info.st_size
+                    try:
+                        with path.open('rb') as file: raw=file.read(OBSERVATION_BYTES+1)
+                    except OSError as error: unavailable(path,error); continue
+                    if len(raw)>OBSERVATION_BYTES: raise Blocked('evidence scan bound')
+                    total+=len(raw)
                     if total>EVIDENCE_BYTES: raise Blocked('private secrecy scan byte bound')
-                    raw=path.read_bytes()
                     protected=self.vault.leaks(raw) or any(handle in raw for handle in handles)
-                    via_sink=(path.is_relative_to(self.evidence) or path.is_relative_to(self.state)) \
-                        and not any(path.is_relative_to(folder) for folder in private_roots)
                     matched=any(form in raw for form in synthetic_forms)
                     if source: synthetic.append(path)
                     elif via_sink: protected=protected or matched
                     elif matched: vendor_synthetic+=1
                     clean=clean and not protected
                     if via_sink and path.name in {'undecoded.bin','stderr.log'}: captures.append(path.name)
-        # Never follow a non-regular Store or state directory. All other VIA Store
-        # bytes are a VIA sink, unlike the vendor's private storage above.
-        if not self.state.is_symlink() and db.exists() and stat.S_ISREG(db.lstat().st_mode):
-            if db.stat().st_size>EVIDENCE_BYTES: raise Blocked('Store scan bound')
-            with sqlite3.connect(f'file:{db}?mode=ro',uri=True) as source:
-                with sqlite3.connect(':memory:') as destination:
-                    source.backup(destination)
-                    raw=destination.serialize()
+        if store_present:
+            try:
+                info=db.lstat()
+                if not stat.S_ISREG(info.st_mode): raise Blocked('VIA Store is not a regular file')
+                if info.st_size>EVIDENCE_BYTES: raise Blocked('Store scan bound')
+                with sqlite3.connect(f'file:{db}?mode=ro',uri=True) as source:
+                    with sqlite3.connect(':memory:') as destination:
+                        source.backup(destination)
+                        raw=destination.serialize()
+            except (OSError,sqlite3.Error) as error: raise Blocked('VIA Store backup unverifiable') from error
+            if total+len(raw)>EVIDENCE_BYTES: raise Blocked('private secrecy scan byte bound')
             clean=clean and not self.vault.leaks(raw) and not any(form in raw for form in self.secret_forms) \
                 and not any(handle in raw for handle in handles)
         return {'complete':True,'secret_absent':clean,'payload_captures':len(captures),
                 'metadata_only_files':len(metadata),'synthetic_source_files':len(synthetic),
                 'vendor_private_synthetic_files':vendor_synthetic,
-                'scope':['owned-via-store','private-vendor-logs','nested-owned-evidence'],
+                'vendor_private_vanished_entries':len(vanished),
+                'scope':['owned-via-store','private-vendor-logs','nested-owned-evidence','daemon-home-xdg-tmp'],
                 'synthetic_gate_scope':'via-owned-sinks',
                 'exclusions':['vendor-auth-config-and-database-content',
-                              'synthetic-provider-values-in-private-fixture-config']}
+                              'synthetic-provider-values-in-private-fixture-config',
+                              'pinned-acquisition-and-helper-artifacts']}
 
     def seam(self,name,occurrence,action,*,target=None):
         """Arm one exact owned target; controller rejects unmatched generations/requests."""
