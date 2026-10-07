@@ -278,8 +278,15 @@ class Phase:
     build: str
 
 
+# §13: one bootstrap and the actual three walk-up sentinel turns, two requests each.
+REPOSITORY_SENTINELS = ('project-boundary','ancestor-control','namespace-boundary')
+PREFLIGHT_BOOTSTRAP_TURNS = 1
+MOCK_REQUESTS_PER_TURN = 2
+
 PHASES = (
-    Phase("preflight", 15 * 60, 0, 6, "release"),
+    Phase("preflight", 15 * 60, 0,
+          (PREFLIGHT_BOOTSTRAP_TURNS + len(REPOSITORY_SENTINELS)) * MOCK_REQUESTS_PER_TURN,
+          "release"),
     Phase("free", 40 * 60, 12, 8, "release"),
     Phase("ledger", 15 * 60, 0, 32, "release"),
     Phase("isolation", 15 * 60, 0, 32, "release"),

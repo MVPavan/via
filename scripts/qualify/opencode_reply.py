@@ -58,6 +58,8 @@ PRIVATE = frozenset({'handle','token','password','apikey','api_key','authorizati
 
 def origin_class(value):
     """§13: retain only a literal loopback host:port, never URL credentials/path."""
+    if type(value) is not str:
+        return {'class':'non-loopback-or-unverifiable'}
     try:
         parsed=urllib.parse.urlsplit(value)
         if parsed.username is not None or parsed.password is not None:
@@ -119,7 +121,7 @@ def reply_projection(raw,protected):
         return protected(raw) or any(form in raw for form in private)
     def identifier(value):
         return value if type(value) is str and len(value)<=ID_CHARS \
-            and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._/-]*',value) \
+            and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)?',value) \
             and not hidden(value.encode()) else None
     def number(value):
         try:
@@ -172,8 +174,9 @@ def reply_projection(raw,protected):
 
 class ReplyEvidence:
     """§13: retain scoped/recent projections at a block, with no raw reply cache."""
-    def __init__(self,emit,protected,context):
+    def __init__(self,emit,protected,context,*,vault=None,secret_forms=lambda:()):
         self.emit,self.protected,self.context=emit,protected,context
+        self.vault,self.secret_forms=vault,secret_forms
         self._recent=OrderedDict();self._local=threading.local();self._lock=threading.RLock()
 
     def capture(self,source,route,raw,**status):
@@ -181,8 +184,13 @@ class ReplyEvidence:
         metadata={key:value for key,value in status.items()
                   if key in {'http_status','exit_code'} and type(value) is int
                   or key in {'complete','body_read'} and type(value) is bool}
-        record={'source':source,'route':route,**metadata,**self.context(),
-                **reply_projection(raw,self.protected)}
+        # Transport finally callbacks must never replace their original outcome.
+        try:
+            record={'source':source,'route':route,**metadata,**self.context(),
+                    **reply_projection(raw,self.protected),'identity_verified':False}
+        except Exception:
+            record={'source':source,'route':route,'projection_failed':True,
+                    'identity_verified':False}
         key=(source,route,record.get('location'))
         with self._lock:
             self._recent.pop(key,None);self._recent[key]=record
@@ -190,6 +198,11 @@ class ReplyEvidence:
             for frame in getattr(self._local,'frames',[]):
                 frame.append(record)
                 if len(frame)>REPLY_CONTEXTS: del frame[0]
+
+    def snapshot(self,sources):
+        """§13: sanitized memory-only context for main-thread stream retention."""
+        with self._lock:
+            return [row for row in self._recent.values() if row['source'] in sources]
 
     def reset(self):
         """§13: a new phase cannot present earlier phase replies as current context."""
@@ -202,7 +215,8 @@ class ReplyEvidence:
             records=list(self._recent.values()) if replies is None else list(replies)
         if not records: return []
         try:
-            name=self.emit('reply-block',{'blocking':safety.blocking_record(error),
+            name=self.emit('reply-block',{'blocking':safety.blocking_record(error,
+                vault=self.vault,secret_forms=self.secret_forms()),
                 'association':'recent-context' if replies is None else 'evaluation-scope',
                 'replies':records})
             error.reply_evidence=[name] if type(name) is str else []

@@ -35,6 +35,7 @@ from opencode_safety import OwnedHTTP
 from opencode_ownership import OwnershipRegistry
 from opencode_catalog import catalog_record
 from opencode_reply import ReplyEvidence, reply_check
+from opencode_cases import REPOSITORY_SENTINELS
 
 Blocked = safety.Blocked
 # Packet §9 and the reviewed qualification plan's observation/pagination bounds.
@@ -259,7 +260,7 @@ class Driver:
         self._http=None; self._binary=None; self.daemon=None; self.anchor=None; self.vendor_identity=None
         self.identities=set(); self.uncertain=[]; self.build_hashes={}; self.handles={}
         self.bearer_forms=set()
-        self.events=[]; self.events_error=None; self._event_stop=threading.Event()
+        self.events=[]; self.events_error=None; self._event_failure=None; self._event_stop=threading.Event()
         self._event_thread=None; self._event_conn=None; self._events_lock=threading.Lock()
         self.counter=0; self.owned_replies=[]; self.secret_forms=[]; self._armed={}
         self._record_lock=threading.RLock()
@@ -296,7 +297,8 @@ class Driver:
         self._observation_deadline=None
         self._verified_host_record=None; self._killed_anchor=None
         self._namespace_bootstraps={}
-        self.reply_evidence=ReplyEvidence(self._record,self._reply_protected,self._reply_context)
+        self.reply_evidence=ReplyEvidence(self._record,self._reply_protected,self._reply_context,
+            vault=self.vault,secret_forms=lambda:(*self.secret_forms,*self.bearer_forms))
         self.git_templates=safety.GitTemplateCopies(
             self.evidence,git_templates or {},lambda value:self._record('git-template-copy',value))
         self.embedded_runtime=safety.EmbeddedRuntime(
@@ -548,11 +550,16 @@ class Driver:
     @reply_check
     def via(self,args):
         """Attach the fixed CLI verb to any runner block before cleanup (§13)."""
-        verbs={'daemon','describe','models','spawn','resume','wait','result','cancel','close',
-               'steer','events','status','logs'}
-        verb=args[0] if args and args[0] in verbs else 'unknown'
+        verb=self._cli_verb(args)
         with safety.block_context(verb=verb):
             return self._via(args)
+
+    @staticmethod
+    def _cli_verb(args):
+        """§13: CLI diagnostic routes contain only fixed verbs."""
+        verbs={'daemon','describe','models','spawn','resume','wait','result','cancel','close',
+               'steer','events','status','logs'}
+        return args[0] if args and args[0] in verbs else 'unknown'
 
     def _via(self,args):
         """Call selected private CLI; bearer handles use stdin and replies stay in memory."""
@@ -616,8 +623,8 @@ class Driver:
         try:
             command_started=time.monotonic()
             def observe(rc,out,err,**metadata):
-                self.reply_evidence.capture('via',verb,out,exit_code=rc,**metadata)
-                if err: self.reply_evidence.capture('via-stderr',verb,err,exit_code=rc,**metadata)
+                self.reply_evidence.capture('via',self._cli_verb(args),out,exit_code=rc,**metadata)
+                if err: self.reply_evidence.capture('via-stderr',self._cli_verb(args),err,exit_code=rc,**metadata)
             observers={'observe':observe} if self.execute is bounded_command else {}
             rc,out,err=self.execute([str(self._binary),*args],env=self.env,cwd=self.project,
                                     input=input,timeout=timeout,**observers)
@@ -629,7 +636,7 @@ class Driver:
         if rc==4: raise Blocked('private daemon unreachable')
         if rc not in {0,3}:
             value=strict_reply(err or out,'error')
-            self._record('cli-error',{'verb':verb,'rc':rc,'typed':True})
+            self._record('cli-error',{'verb':self._cli_verb(args),'rc':rc,'typed':True})
             # C1 §1 CLI stderr is the error object; keep the internal wrapper.
             return {'cli_error':{'error':value},'exit_code':rc}
         schema={'status':'status','wait':'envelope','result':'envelope','events':'events page','logs':'logs',
@@ -667,7 +674,7 @@ class Driver:
             self.last_request={'verb':verb,'receipt':internal,'prompt':prompt,'args':args}
         if verb=='cancel': self.last_cancel={'at':time.monotonic(),'reply':value,'held':dict(self._armed),
                                             'elapsed_ms':int((time.monotonic()-command_started)*1000)}
-        self._record('cli',{'verb':verb,'rc':rc,'schema':schema,'fields':sorted(value),
+        self._record('cli',{'verb':self._cli_verb(args),'rc':rc,'schema':schema,'fields':sorted(value),
                             'handle_persisted':False,'stderr_present':bool(err)})
         if self.inventory: self.inventory.check()
         # The bootstrap lease keeps acquisition alive until a real successor
@@ -1134,12 +1141,12 @@ class Driver:
         """Memory-only authenticated API to one positively verified owned generation."""
         if urllib.parse.urlsplit(path).path=='/api/credential':
             raise Blocked('credential read/write requires isolated direct seeding')
-        self.ensure_vendor()
-        self._http.deadline=self.phase_deadline
         if method.upper() in {'POST','PUT','PATCH'} and any(
                 word in urllib.parse.urlsplit(path).path for word in ('/prompt','/compact','/fork')):
             self.spending_check(body=body,path=path)
             self._admit_model(self.last_model)
+        else: self.ensure_vendor()
+        self._http.deadline=self.phase_deadline
         status,raw=self._request(method,path,body)
         if self.vault.leaks(raw): raise Blocked('password in vendor response')
         value=None if not raw else self._json(raw)
@@ -1167,6 +1174,7 @@ class Driver:
     @reply_check
     def _catalog(self,checked_identity=None):
         """Decode prices unchanged; retain an allow-listed view if proof fails (§13)."""
+        if checked_identity is not None: self._approved_model(checked_identity)
         self._catalog_evidence=None
         project=Path(self.project)
         location=project.relative_to(self.evidence).as_posix() if project.is_relative_to(self.evidence) \
@@ -1178,6 +1186,7 @@ class Driver:
         query=urllib.parse.urlencode({'location[directory]':str(project)})
         def read():
             nonlocal observation
+            observation=catalog_record(None,None,location,checked_identity,protected)
             status,raw=self._request('GET','/api/model?'+query,
                 timeout=max(.001,self._observation_deadline-time.monotonic()))
             observation=catalog_record(status,None,location,checked_identity,protected)
@@ -1210,14 +1219,23 @@ class Driver:
         self.catalog_cache=result
         return result
 
+    def _approved_model(self,identity):
+        """§13: unapproved identities latch the stop before acquisition or polling."""
+        if identity not in {safety.FREE_IDENTITY,safety.MOCK_IDENTITY}:
+            self.guard.stopped=True
+            raise Blocked('paid or unapproved model identity')
+
     @reply_check
     def spending_check(self,*,args=None,body=None,path=None,cost=None):
         """Recheck structure for every model-capable request, never infer zero cost."""
-        self.ensure_vendor()
-        status,raw=self._request('GET','/api/integration')
-        if status!=200: raise Blocked('integration check unavailable')
-        integration=self._json(raw)
         identity=safety.FREE_IDENTITY
+        if args and '--model' in args:
+            identity=args[args.index('--model')+1]
+            self._approved_model(identity)
+        if type(body) is dict and 'model' in body:
+            ref=body['model']; _typed(ref,{'providerID':S,'id':S},'direct requested model')
+            self._approved_model(ref['providerID']+'/'+ref['id'])
+        self.ensure_vendor()
         path_session=None
         if path:
             parts=urllib.parse.urlsplit(path).path.split('/')
@@ -1231,13 +1249,11 @@ class Driver:
                 raise Blocked('direct session model readback unavailable')
             ref=value['data'].get('model'); _typed(ref,{'providerID':S,'id':S},'direct session model')
             identity=ref['providerID']+'/'+ref['id']
-            if identity not in {safety.FREE_IDENTITY,safety.MOCK_IDENTITY}:
-                self.guard.stopped=True; raise Blocked('paid direct-session identity hard stop')
+            self._approved_model(identity)
             if body and type(body) is dict and 'model' in body:
                 ref=body['model']; _typed(ref,{'providerID':S,'id':S},'direct requested model')
                 requested=ref['providerID']+'/'+ref['id']
-                if requested not in {safety.FREE_IDENTITY,safety.MOCK_IDENTITY}:
-                    self.guard.stopped=True; raise Blocked('paid direct-request identity hard stop')
+                self._approved_model(requested)
                 if requested!=identity: raise Blocked('direct request model override differs from frozen session')
         elif args and '--model' in args: identity=args[args.index('--model')+1]
         elif body and type(body) is dict and type(body.get('model')) is dict:
@@ -1249,11 +1265,15 @@ class Driver:
             ref=value['data'].get('model')
             _typed(ref,{'providerID':S,'id':S},'session model')
             identity=ref['providerID']+'/'+ref['id']
+        self._approved_model(identity)
         provider,sep,model=identity.partition('/')
         if not sep: raise Blocked('model identity incomplete')
         names=self.vault.names(self.vendor_identity)
         if self.inventory: self.inventory.check()
         catalog=self._catalog(identity)
+        status,raw=self._request('GET','/api/integration')
+        if status!=200: raise Blocked('integration check unavailable')
+        integration=self._json(raw)
         # Effective project config is constructed before start and immutable during turns.
         row=next((row for row in self.fixtures.values() if row['path']==self.project),None)
         config=None if row is None else row['config']
@@ -1379,7 +1399,7 @@ class Driver:
     def start_event_capture(self):
         """Capture bounded owned SSE in memory for real request/action attribution."""
         self.close_event_capture()
-        self._event_stop.clear(); self.events=[]; self.events_error=None
+        self._event_stop.clear(); self.events=[]; self.events_error=None; self._event_failure=None
         parts=urllib.parse.urlsplit(self._http.origin)
         conn=http.client.HTTPConnection(parts.hostname,parts.port,timeout=1)
         self._event_conn=conn
@@ -1393,7 +1413,7 @@ class Driver:
             while not self._event_stop.wait(.01):
                 deadline=(self.phase_deadline or stream_deadline) if ready.is_set() else header_deadline
                 if time.monotonic()>=deadline:
-                    self.events_error='Deadline'; break
+                    self._stash_event_failure(Blocked('owned event stream deadline'),'Deadline'); break
             if self._event_socket:
                 try: self._event_socket.shutdown(socket.SHUT_RDWR)
                 except OSError: pass
@@ -1439,11 +1459,26 @@ class Driver:
                     elif line.startswith(b'id:'): event_id=line[3:].strip().decode('utf-8','strict')
             except BaseException as error:
                 if not self._event_stop.is_set():
-                    self.reply_evidence.block(error)
-                    self.events_error=type(error).__name__
+                    self._stash_event_failure(error,type(error).__name__)
             finally: response.close(); conn.close()
         self._event_thread=threading.Thread(target=consume,name='owned-opencode-events',daemon=True)
         self._event_thread.start()
+
+    def _stash_event_failure(self,error,kind):
+        """§13: observer threads only store sanitized context in memory."""
+        with self._events_lock:
+            if self._event_failure is None:
+                self._event_failure=(error,self.reply_evidence.snapshot(
+                    {'vendor-sse','vendor-sse-handshake'}))
+                self.events_error=kind
+
+    def _retain_event_failure(self):
+        """§13: evidence files and ownership entries are main-thread work."""
+        with self._events_lock: failure=self._event_failure
+        if failure is not None:
+            error,replies=failure
+            self.reply_evidence.block(error,replies)
+            return error
 
     def close_event_capture(self):
         self._event_stop.set()
@@ -1461,6 +1496,7 @@ class Driver:
             if self._event_watchdog.is_alive(): raise Blocked('event deadline observer stop unverified')
             self._event_watchdog=None
         self._event_socket=None
+        self._retain_event_failure()
 
     @reply_check
     def observe(self,kind,target=None):
@@ -1494,7 +1530,13 @@ class Driver:
                     'retained_bounds_proof':None,'vendor_identity':self.vendor_identity.report()}
         if kind=='native_events':
             if type(target) is dict: target=target.get('session')
-            if self.events_error: raise Blocked('native stream observation failed')
+            if self.events_error:
+                cause=self._retain_event_failure()
+                error=Blocked('native stream observation failed')
+                if cause is not None:
+                    error.reply_evidence=getattr(cause,'reply_evidence',[])
+                    if getattr(cause,'reply_retention_failed',False): error.reply_retention_failed=True
+                raise error from cause
             if not self._event_thread: raise Blocked('native stream not observed')
             sid=self._vendor_sid(target) if isinstance(target,str) and target in self.handles else target
             with self._events_lock: events=list(self.events)
@@ -2922,7 +2964,7 @@ print('VIA HELPER DONE')
 
     def finish(self):
         """Final cleanup/immutable-pin proof; uncertainty retains roots and fails closure."""
-        failures=[]
+        failures=[];traffic={'received_requests':0,'providers':0}
         try: proof=self.stop()
         except BaseException as error: failures.append(error)
         finally:
@@ -2933,13 +2975,20 @@ print('VIA HELPER DONE')
                     failure=Blocked('owned mock provider cleanup unverified')
                     failure.__cause__=error
                     failures.append(failure)
+            try:
+                traffic={'received_requests':sum(provider.requests for provider in self.mock_providers.values()),
+                         'providers':len(self.mock_providers)}
+                self._record('mock-traffic',traffic)
+            except BaseException as error:
+                failure=Blocked('mock received request aggregate unverified')
+                failure.__cause__=error;failures.append(failure)
             self.mock_providers.clear()
         if failures: raise failures[0]
         safety.verify_binary(self.pinned)
         scan=self.secrecy_scan()
         if scan['secret_absent'] is not True or scan['payload_captures']!=0:
             raise Blocked('final secrecy scan failed')
-        return {'stopped':True,**proof,'pinned_rehash':True,'secrecy_scan':scan}
+        return {'stopped':True,**proof,'pinned_rehash':True,'secrecy_scan':scan,'mock_traffic':traffic}
 
     def clear_sensitive(self):
         """Clear memory only after the entry's final protected evidence sink (§2.3)."""
@@ -2985,13 +3034,30 @@ print('VIA HELPER DONE')
         return rows
 
     def _mock_turn(self,project,prompt):
+        """§13: retain each sentinel's received requests even when its turn blocks."""
         self.start(self.phase_kind or 'release',project)
-        receipt=self.via(['spawn','--harness','opencode','--model',safety.MOCK_IDENTITY,
-                          '--cwd',str(project),'--bound','full','--network','--background','--prompt',prompt])
-        if 'cli_error' in receipt: raise Blocked('local fixture turn refused')
-        result=self.via(['wait',receipt['turn'],'--timeout-ms','180000'])
-        if result['state']!='completed': raise Blocked('local fixture turn did not complete')
-        return receipt,result
+        self.ensure_vendor()  # Bootstrap receipts are counted separately, before this baseline.
+        names=[name for name,row in self.fixtures.items() if row['path']==project]
+        if len(names)!=1 or names[0] not in self.mock_providers:
+            raise Blocked('mock fixture receipt identity unavailable')
+        name=names[0];provider=self.mock_providers[name];before=provider.requests
+        failure=None
+        try:
+            receipt=self.via(['spawn','--harness','opencode','--model',safety.MOCK_IDENTITY,
+                              '--cwd',str(project),'--bound','full','--network','--background','--prompt',prompt])
+            if 'cli_error' in receipt: raise Blocked('local fixture turn refused')
+            result=self.via(['wait',receipt['turn'],'--timeout-ms','180000'])
+            if result['state']!='completed': raise Blocked('local fixture turn did not complete')
+            return receipt,result
+        except BaseException as error:
+            failure=error;raise
+        finally:
+            try:
+                self._record('mock-receipt',{'fixture':name,'received_requests':provider.requests-before,
+                    'label':'sentinel','charged':'mock-only','gate':False})
+            except BaseException:
+                if failure is None: raise
+                failure.reply_retention_failed=True
 
     def _repository_sentinel(self):
         """First model-capable phase uses only loopback controls with nested Git sentinels."""
@@ -3001,7 +3067,9 @@ print('VIA HELPER DONE')
         safety.init_fixture_repo(nested,self.home)
         control=self._directory(outer/'walk-up-control','vendor-private')
         boundary_results=[]
-        for name,project in (('project-boundary',nested),('ancestor-control',control),('namespace-boundary',self.namespace)):
+        projects=dict(zip(REPOSITORY_SENTINELS,(nested,control,self.namespace)))
+        for name in REPOSITORY_SENTINELS:
+            project=projects[name]
             self._directory(project/'.opencode','vendor-private')
             config=self._materialize_fixture(name,project,{'provider':'mock'})
             (project/'opencode.json').write_text(json.dumps(config)); (project/'opencode.json').chmod(0o600)

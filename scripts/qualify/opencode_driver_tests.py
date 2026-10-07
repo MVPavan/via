@@ -189,7 +189,7 @@ class DriverTests(unittest.TestCase):
             with mock.patch('opencode_driver.time.sleep',side_effect=lambda _s:row.update(generation='FAKE-changed')):
                 with self.assertRaisesRegex(Blocked,'owned observation generation changed'):
                     d.spending_check(args=['spawn','--model','oclive-mock/fixture-free'])
-            self.assertEqual(d._http.request.call_count,2)  # integration plus one catalogue GET
+            self.assertEqual(d._http.request.call_count,1)  # Failed readiness never reads integration.
             paths=list(d.evidence.glob('*catalog-block.json'));self.assertEqual(len(paths),1)
             self.assertEqual(json.loads(paths[0].read_text())['models'],[])
 

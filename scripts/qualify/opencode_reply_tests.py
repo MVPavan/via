@@ -168,13 +168,15 @@ class ReplyTests(unittest.TestCase):
                 ('/api/integration',{'data':[]},'integration check unavailable'),
                 ('/api/session/ses_FAKE',{'data':{'id':'ses_FAKE',
                     'model':{'providerID':'FAKE-paid','id':'FAKE-model'}}},
-                 'paid direct-session identity hard stop')):
+                 'paid or unapproved model identity')):
             with self.subTest(route=route), tempfile.TemporaryDirectory(prefix='via-ocreply-') as root:
                 d=self.driver(root,{})
                 def request(_method,path,*_args,**_kwargs):
                     return (503 if path==route=='/api/integration' else 200,
-                            json.dumps(body if path==route else {'data':[]}).encode())
+                            json.dumps(body if path==route else {'data':{'id':'ses_FAKE','model':{'providerID':'oclive-mock','id':'fixture-free'}}}).encode())
                 d._http.request.side_effect=request
+                d._catalog=mock.Mock(return_value={'oclive-mock/fixture-free':{'free':True}})
+                d.vault.names=mock.Mock(return_value=frozenset())
                 with self.assertRaisesRegex(Blocked,reason):
                     d.spending_check(path='/api/session/ses_FAKE/prompt')
                 reply=self.retained(d)['replies'][-1]
@@ -290,6 +292,8 @@ class ReplyTests(unittest.TestCase):
                     end=time.monotonic()+5
                     while d.events_error is None and time.monotonic()<end: time.sleep(.01)
                     self.assertEqual(d.events_error,'Blocked')
+                    with self.assertRaisesRegex(Blocked,'native stream observation failed'):
+                        d.observe('native_events','ses_FAKE')
                     record=self.retained(d)
                     self.assertEqual(record['replies'][-1]['projection']['type'],'unrecognized')
                     self.assertNotIn(secret,json.dumps(record))

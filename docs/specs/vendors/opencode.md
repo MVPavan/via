@@ -1441,18 +1441,41 @@ a projection bound records explicit truncation and no projected values. Up to
 case/phase/verb. A recent-context association is labelled, rather than claiming
 one reply caused the block. Phase/summary blocking records link the retained
 file; failed retention preserves the initiating block and marks retention
-unavailable. This evidence never admits spending or counts as a gate pass.
+unavailable. Projection exceptions produce a fixed `projection_failed` record
+without replacing a transport result or its original block. Non-string origins
+are unverifiable; identifiers admit at most the single provider/model slash.
+CLI routes use fixed verbs or `unknown`. Blocking reasons are screened against
+password, bearer and synthetic forms. SSE observers stash sanitized failure
+context in memory and only the main thread writes it, including during cleanup.
+Transport captures carry `identity_verified: false`: they precede the post-read
+ownership verification and are never identity proof. This evidence never admits
+spending or counts as a gate pass.
 
 The qualification observer treats an HTTP 200, decoded catalogue as pending
-when empty or when the checked model identity is absent: provider loading can
+when empty or when an approved checked model identity is absent: provider loading can
 publish several staged updates. It repeats the location read 200 ms apart
 (§2.2), within one 30 s readiness deadline clipped to the enclosing phase or bootstrap deadline,
 re-verifying owned PID/start-ticks and Host generation before and after each
 read. A present model proceeds immediately to the unchanged explicit-zero
 price check; missing or nonzero prices block at once. Schema errors, ownership
 changes and absence at deadline expiry block, with the last sanitized catalogue
-record retained. This observation wait admits no
+record retained. Reset the diagnostic observation before each read so a failed
+read does not present the previous poll as current. An unapproved identity sets
+the spending stop latch and blocks immediately, before acquisition or a catalogue
+wait; only the frozen public-free and fixture-mock identities may wait. Read
+integration facts after catalogue readiness, immediately before admission.
+This observation wait admits no
 model request and does not change §5's fresh, no-retry effort check in VIA.
+
+**Qualification mock admission amendment (coordinator, 2026-10-07):**
+Derive the preflight request ceiling from its actual turn pattern: one labelled
+bootstrap plus each repository sentinel, times the observed two requests per
+mock turn. The current three sentinels yield eight mock requests and zero
+public requests. Persist each sentinel's received count even if its turn blocks;
+the bootstrap has its own labelled receipt. After stopping providers, retain
+the aggregate physical received count, including rejected requests, rather than
+reporting it unavailable. Crossing the derived ceiling still sets the stop latch
+and blocks. Receipts and the bootstrap are diagnostic records, never gates.
 
 ## 14. Owner questions and revisit items
 
