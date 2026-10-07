@@ -18,6 +18,7 @@ use super::events::{DecodeError, Event, EventData, ExecutionKind, InboxKind, Ste
 use super::state::{InputPhase, InputState, SessionState};
 
 mod interactive;
+mod reopen;
 
 /// Per-session ingress item limit (`opencode.md` §9).
 pub const LANE_MESSAGES: usize = 16;
@@ -429,7 +430,7 @@ struct Session {
     sent: HashSet<TurnNumber>,
     settled: HashSet<TurnNumber>,
     interactive: HashMap<(super::events::InteractiveKind, String), TurnNumber>,
-    cleanup_expected: HashSet<String>,
+    cleanup: reopen::Cleanup,
 }
 
 /// One server generation's state; its owner serializes HTTP markers and stream decode.
@@ -702,88 +703,6 @@ impl Router {
         self.changed.notify_waiters();
     }
 
-    /// Claims the generation's once-only reopen inbox cleanup, outside prompt admission.
-    pub fn begin_reopen_cleanup(&mut self, session: &str) -> bool {
-        if !self.ensure_session(session) {
-            return false;
-        }
-        let state = &mut self.sessions.entry(session.to_owned()).or_default().state;
-        if state.cleanup_started {
-            return false;
-        }
-        state.cleanup_started = true;
-        state.cleanup_pending = true;
-        self.changed.notify_waiters();
-        true
-    }
-
-    /// Releases the once-only cleanup fence after every stream proof, or when
-    /// a new session needs no leftover read (§7.2). Abandonment releases the fence.
-    pub fn finish_reopen_cleanup(&mut self, session: &str) {
-        if !self.ensure_session(session) {
-            return;
-        }
-        let state = &mut self.sessions.entry(session.to_owned()).or_default().state;
-        state.cleanup_started = true;
-        state.cleanup_pending = false;
-        self.changed.notify_waiters();
-    }
-
-    /// §7.2: an abandoned cleanup can be safely retried after its kept exchanges end.
-    pub fn abandon_reopen_cleanup(&mut self, session: &str) {
-        if let Some(state) = self
-            .sessions
-            .get_mut(session)
-            .map(|session| &mut session.state)
-            && state.cleanup_pending
-        {
-            state.cleanup_started = false;
-            state.cleanup_pending = false;
-            self.changed.notify_waiters();
-        }
-    }
-
-    /// Registers one recomputed own leftover before cancelling it (§7.2, §9).
-    pub fn expect_cleanup_cancellation(&mut self, session: &str, input: &str) -> bool {
-        if !self.ensure_session(session) {
-            return false;
-        }
-        if self
-            .sessions
-            .get(session)
-            .is_some_and(|session| session.cleanup_expected.contains(input))
-        {
-            return false;
-        }
-        let known = self
-            .sessions
-            .get(session)
-            .is_some_and(|session| session.inputs.contains_key(input));
-        if !known && !self.key(input) {
-            return false;
-        }
-        let session = self.sessions.entry(session.to_owned()).or_default();
-        session.cleanup_expected.insert(input.to_owned());
-        let already_claimed = session.inputs.get(input).is_some_and(|turn| {
-            let mut windows = session
-                .rejections
-                .0
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            windows
-                .get_mut(turn)
-                .is_some_and(|window| std::mem::replace(&mut window.inbox_cancel, true))
-        });
-        !already_claimed
-    }
-
-    /// Stream evidence of a cleanup input's cancellation (a 204 is insufficient).
-    pub fn cleanup_cancelled(&self, session: &str, input: &str) -> bool {
-        self.sessions
-            .get(session)
-            .is_some_and(|session| session.state.cleanup_cancelled(input))
-    }
-
     /// Validated HTTP acceptance enters the same ordering domain as SSE.
     pub fn accepted(&mut self, session_id: &str, input: &str, at: Instant) {
         self.order = self.order.saturating_add(1);
@@ -849,7 +768,19 @@ impl Router {
         let Some(session) = self.sessions.get(session_id) else {
             return true;
         };
-        let new = if let EventData::Step {
+        let new = if let EventData::Inbox {
+            kind: InboxKind::Cancelled | InboxKind::Delivered,
+            id,
+        } = data
+            && session.state.cleanup_started
+            && session.state.cleanup_pending
+            && !session.cleanup.contains(id)
+            && !session.inputs.contains_key(id)
+        {
+            // §7.2, §9: stream proof can precede the inbox listing; retained proof IDs
+            // share the correlation aggregate, whether or not the listing later owns them.
+            Some(id)
+        } else if let EventData::Step {
             kind: StepKind::Started,
             assistant_message_id,
             ..
@@ -873,7 +804,7 @@ impl Router {
         } else if let EventData::Compaction { key, .. } = data
             && !session.compactions.contains_key(key)
             && !session.inputs.contains_key(key)
-            && !session.cleanup_expected.contains(key)
+            && !session.cleanup.contains(key)
             && session.state.execution_owner.is_some()
         {
             Some(key)
@@ -1225,9 +1156,7 @@ fn key_owner(session: &Session, message: Option<&str>, call: Option<&str>) -> Op
 
 fn apply_inbox(session: &mut Session, kind: InboxKind, id: &str) -> Option<TurnNumber> {
     let owner = session.inputs.get(id).copied();
-    if kind == InboxKind::Cancelled && (owner.is_some() || session.cleanup_expected.contains(id)) {
-        session.state.cancelled(id);
-    }
+    reopen::observe(session, kind, id);
     if owner.is_some_and(|owner| session.delivered.contains(&owner)) {
         // A delivered input keeps its execution tombstone forever. A repeated
         // inbox event cannot claim a later execution or change its admission facts.

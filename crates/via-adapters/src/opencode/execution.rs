@@ -1,6 +1,6 @@
 //! `opencode.md` §7.2–§7.3: admission, one submission and the outcome boundary.
 
-use super::driver::{Settings, Turn, effort_offered, switch_variant, tracked};
+use super::driver::{Settings, Turn, effort_offered, switch_variant, tracked, tracked_on_sent};
 use crate::driver::turn::{CLEANUP_ALLOWANCE, unaccounted};
 use crate::opencode::delivery::{Delivery, Registration, Sealed, Stop, generation_route_error};
 use crate::opencode::launch;
@@ -90,7 +90,7 @@ pub(super) async fn execute(
     submit(facts, &opened.server, &opened.id, &input, delivery, prompt).await
 }
 
-/// §7.2: dropping the caller releases only its cleanup pipeline, never a kept HTTP job.
+/// §7.2: dropping the caller releases its listing pipeline, never a sent claim or kept HTTP job.
 struct ReopenCleanup {
     server: Arc<Server>,
     id: String,
@@ -518,52 +518,38 @@ async fn cleanup_leftovers(
     .await;
     let inbox =
         inbox.map_err(|error| Box::new(facts.setup_failed("the reopen inbox listing", error)))?;
+    let mut owned = Vec::new();
     for number in 1..facts.number.get() {
         let Ok(turn) = TurnNumber::try_from(number) else {
             continue;
         };
         let input = input_id(&facts.driver.spec.session_id, turn);
-        if !inbox.contains(&input) {
-            continue;
+        if inbox.contains(&input) {
+            owned.push(input);
         }
-        let cancel = server.routing().expect_cleanup_cancellation(id, &input);
+    }
+    let needed = server.routing().reopen_inbox(id, &owned);
+    for input in needed {
         if server.routing().failure().is_some() {
             return Err(Box::new(facts.rejected(StartRejected::SessionGone)));
         }
-        if cancel {
+        if server.routing().cleanup_needs_cancel(id, &input) {
             let target = id.to_owned();
             let cancel_input = input.clone();
             let by = facts.request_by();
-            let result = tracked(server, Some(id), move |http| async move {
+            let mark_sent = {
+                let server = Arc::clone(server);
+                let target = id.to_owned();
+                let input = input.clone();
+                move || server.routing().inbox_cancel_sent(&target, &input)
+            };
+            let result = tracked_on_sent(server, Some(id), mark_sent, move |http| async move {
                 requests::cancel_leftover(&http, &target, &cancel_input, by).await
             })
             .await;
             result.map_err(|error| {
                 Box::new(facts.setup_failed("a leftover inbox cancellation", error))
             })?;
-        }
-        let changed = server.routing().notify();
-        let cancelled_by = facts.request_by();
-        loop {
-            let notified = changed.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if server.routing().cleanup_cancelled(id, &input) {
-                break;
-            }
-            // These waits consume no cancellation proof or route state on drop.
-            tokio::select! {
-                () = &mut notified => {},
-                () = tokio::time::sleep_until(cancelled_by.instant()) => {
-                    return Err(Box::new(facts.rejected(StartRejected::VendorError(
-                        Some(VendorCode::from("session_busy".to_owned())),
-                        "a leftover input cancellation was not observed".to_owned(),
-                    ))));
-                },
-                _end = server.wait_end() => {
-                    return Err(Box::new(facts.rejected(StartRejected::SessionGone)));
-                },
-            }
         }
     }
     Ok(())

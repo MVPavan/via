@@ -39,6 +39,9 @@ mod driver_control_tests;
 mod driver_request_tests;
 
 #[cfg(test)]
+mod driver_cleanup_tests;
+
+#[cfg(test)]
 mod driver_http_limit_tests;
 
 #[cfg(test)]

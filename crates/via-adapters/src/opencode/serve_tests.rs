@@ -203,8 +203,8 @@ impl Rig {
         self.adapter.acquire(owner, capacity)
     }
 
-    /// One acquisition awaited to its launch's end.
-    async fn launch(&self) -> Result<ServerPin, LaunchError> {
+    /// §7.2, §8: one private fake generation awaited to its launch's end.
+    pub(super) async fn launch(&self) -> Result<ServerPin, LaunchError> {
         let pin = self.acquire(Box::new(())).map_err(LaunchError::from)?;
         let ready = tokio::time::timeout(WAIT, pin.ready(std::future::pending()))
             .await

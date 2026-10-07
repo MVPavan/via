@@ -713,6 +713,20 @@ where
     T: Send + 'static,
     F: std::future::Future<Output = Result<T, SetupError>> + Send + 'static,
 {
+    tracked_on_sent(server, id, || {}, request).await
+}
+
+/// §7.2, §8: route facts that describe a mutation are published only at its first byte.
+pub(super) async fn tracked_on_sent<T, F>(
+    server: &Arc<Server>,
+    id: Option<&str>,
+    on_sent: impl Fn() + Send + Sync + 'static,
+    request: impl FnOnce(via_routes::opencode::turn::HttpClient) -> F + Send + 'static,
+) -> Result<T, SetupError>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = Result<T, SetupError>> + Send + 'static,
+{
     if server.is_draining() || server.failure().is_some() || server.ended().is_some() {
         return Err(unavailable_request());
     }
@@ -725,7 +739,10 @@ where
     }
     let sent = Arc::new(via_routes::opencode::turn::SentTracker::new({
         let server = Arc::clone(server);
-        move || server.routing().request_sent()
+        move || {
+            server.routing().request_sent();
+            on_sent();
+        }
     }));
     let http = server.http().with_sent_tracker(Arc::clone(&sent));
     let finish_server = Arc::clone(server);

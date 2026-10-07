@@ -13,7 +13,8 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 use via_routes::opencode::Server;
 
-async fn until(mut predicate: impl FnMut() -> bool) -> bool {
+/// §8: bounded fixture synchronization against retained request evidence.
+pub(super) async fn until(mut predicate: impl FnMut() -> bool) -> bool {
     let by = tokio::time::Instant::now() + Duration::from_secs(2);
     loop {
         if predicate() {
@@ -26,7 +27,8 @@ async fn until(mut predicate: impl FnMut() -> bool) -> bool {
     }
 }
 
-fn server(lane: &Lane) -> Option<Arc<Server>> {
+/// §7.2: inspect the private generation pinned by a fixture driver.
+pub(super) fn server(lane: &Lane) -> Option<Arc<Server>> {
     match lane.driver.prepare() {
         Prepared::Pinned(pin) => pin
             .opencode
@@ -36,7 +38,8 @@ fn server(lane: &Lane) -> Option<Arc<Server>> {
     }
 }
 
-fn controls(lane: &Lane, number: u32) -> (TurnCx, watch::Sender<Option<StopOrder>>) {
+/// §7.4: caller controls with bounded fixture deadlines.
+pub(super) fn controls(lane: &Lane, number: u32) -> (TurnCx, watch::Sender<Option<StopOrder>>) {
     let prepared = lane.driver.prepare();
     let capacity =
         matches!(prepared, Prepared::NeedsConnection).then(|| Box::new(()) as crate::CapacityToken);
@@ -59,7 +62,8 @@ fn controls(lane: &Lane, number: u32) -> (TurnCx, watch::Sender<Option<StopOrder
     )
 }
 
-fn cancel(stop: &watch::Sender<Option<StopOrder>>, grace: Duration) {
+/// §7.4: stop only the fixture's active turn.
+pub(super) fn cancel(stop: &watch::Sender<Option<StopOrder>>, grace: Duration) {
     let attached = tokio::time::Instant::now();
     stop.send_replace(Some(StopOrder {
         cause: StopCause::Cancel,
@@ -70,7 +74,8 @@ fn cancel(stop: &watch::Sender<Option<StopOrder>>, grace: Duration) {
     }));
 }
 
-async fn bootstrap(rig: &Rig) -> Lane {
+/// §7.2: establish one completed turn and its deterministic input identity.
+pub(super) async fn bootstrap(rig: &Rig) -> Lane {
     row(rig, 1, "running");
     let mut lane = Lane::open(rig, false);
     let (end, _) = lane.turn(1, None, Duration::from_secs(4)).await;
@@ -168,7 +173,8 @@ async fn setup_pool(rig: &Rig, live: &Arc<Server>, setup: Setup) -> (JoinSet<()>
     (held, full)
 }
 
-fn requests_to(requests: &[Value], target: &str) -> usize {
+/// §8: count requests that reached the fake's endpoint.
+pub(super) fn requests_to(requests: &[Value], target: &str) -> usize {
     requests
         .iter()
         .filter(|request| request["target"] == target)

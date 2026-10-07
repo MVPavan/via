@@ -120,7 +120,16 @@ async fn cleanup_input(server: &Arc<super::Server>, work: &CleanupWork) {
         return;
     }
     let changed = server.routing().notify();
-    let sent = sent_tracker(server);
+    let sent = SentTracker::new({
+        let server = Arc::clone(server);
+        let session = work.owner.session.clone();
+        let input = work.input.clone();
+        move || {
+            let mut routing = server.routing();
+            routing.request_sent();
+            routing.inbox_cancel_sent(&session, &input);
+        }
+    });
     let response = super::turn::cancel_input_tracked(
         server.http(),
         &work.owner.session,

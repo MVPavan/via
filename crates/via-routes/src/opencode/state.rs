@@ -1,7 +1,5 @@
 //! Server-scoped admission facts, independent of outcomes (`opencode.md` §7.2).
 
-use std::collections::HashSet;
-
 use via_wire::TurnNumber;
 
 /// The route's last submitted input phase; no phase decides driver outcome.
@@ -49,10 +47,8 @@ pub struct SessionState {
     pub last_seq: Option<u64>,
     /// Whether this generation has claimed or completed its reopen cleanup (§7.2).
     pub cleanup_started: bool,
-    /// Claimed reopen cleanup lacks all required stream cancellation proofs.
+    /// Reopen listing is unfinished, an owned leftover needs DELETE, or a sent claim lacks proof.
     pub cleanup_pending: bool,
-    /// Input cancellation evidence observed in the stream, for reopen cleanup.
-    cancelled: HashSet<String>,
 }
 
 impl SessionState {
@@ -67,15 +63,6 @@ impl SessionState {
                     InputPhase::Ended | InputPhase::NotAccepted | InputPhase::NeverSent
                 )
             })
-    }
-
-    /// Whether a cleanup input has stream cancellation evidence.
-    pub fn cleanup_cancelled(&self, input_id: &str) -> bool {
-        self.cancelled.contains(input_id)
-    }
-
-    pub(super) fn cancelled(&mut self, input_id: &str) {
-        self.cancelled.insert(input_id.to_owned());
     }
 }
 

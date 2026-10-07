@@ -132,6 +132,7 @@ pub async fn create(
     let response = call(
         http,
         (Method::Post, "/api/session", Some(&body)),
+        200,
         BODY_BYTES,
         deadline,
     )
@@ -150,7 +151,14 @@ pub async fn get(
     deadline: Deadline,
 ) -> Result<Option<SessionInfo>, SetupError> {
     let target = format!("/api/session/{}", segment(id)?);
-    let response = call(http, (Method::Get, &target, None), BODY_BYTES, deadline).await?;
+    let response = call(
+        http,
+        (Method::Get, &target, None),
+        200,
+        BODY_BYTES,
+        deadline,
+    )
+    .await?;
     match response.status {
         200 => info(&response.body).map(Some).ok_or(SetupError::Malformed),
         404 => Ok(None),
@@ -174,6 +182,7 @@ pub async fn put_instructions(
     let response = call(
         http,
         (Method::Put, &target, Some(&body)),
+        204,
         BODY_BYTES,
         deadline,
     )
@@ -201,7 +210,14 @@ pub async fn instructions(
         "/api/experimental/session/{}/instructions/entries",
         segment(id)?
     );
-    let response = call(http, (Method::Get, &target, None), BODY_BYTES, deadline).await?;
+    let response = call(
+        http,
+        (Method::Get, &target, None),
+        200,
+        BODY_BYTES,
+        deadline,
+    )
+    .await?;
     if response.status != 200 {
         return Err(refused(&response));
     }
@@ -241,6 +257,7 @@ pub async fn switch_model(
     let response = call(
         http,
         (Method::Post, &target, Some(&body)),
+        204,
         BODY_BYTES,
         deadline,
     )
@@ -256,7 +273,14 @@ pub async fn catalog_at(
     deadline: Deadline,
 ) -> Result<Vec<CatalogModel>, SetupError> {
     let target = format!("/api/model?location[directory]={}", query_value(directory));
-    let response = call(http, (Method::Get, &target, None), CATALOG_BYTES, deadline).await?;
+    let response = call(
+        http,
+        (Method::Get, &target, None),
+        200,
+        CATALOG_BYTES,
+        deadline,
+    )
+    .await?;
     match response.status {
         200 => handshake::catalog(&response.body).ok_or(SetupError::Malformed),
         _ => Err(refused(&response)),
@@ -267,6 +291,7 @@ pub async fn catalog_at(
 async fn call(
     http: &HttpClient,
     (method, target, body): (Method, &str, Option<&serde_json::Value>),
+    success: u16,
     body_limit: usize,
     deadline: Deadline,
 ) -> Result<HttpResponse, SetupError> {
@@ -285,32 +310,28 @@ async fn call(
         .await,
     )
     .map_err(SetupError::Http)?;
-    error_body(&response)?;
+    complete_response(&response, success)?;
     Ok(response)
 }
 
-/// §8: error statuses require decodable JSON; §4.3 keeps untrusted fields unretained.
-/// A 401 keeps its decisive precedence even when its body is malformed.
-pub(super) fn error_body(response: &HttpResponse) -> Result<(), SetupError> {
-    if !(200..300).contains(&response.status) && response.status != 401 {
+/// §8: each endpoint has one documented success; other 2xx statuses are inconclusive.
+/// Non-2xx requires decodable JSON, except 401's decisive precedence (§4.3 allow-list).
+pub(super) fn complete_response(response: &HttpResponse, success: u16) -> Result<(), SetupError> {
+    if (200..300).contains(&response.status) {
+        if response.status != success || (success == 204 && !response.body.is_empty()) {
+            return Err(SetupError::Malformed);
+        }
+    } else if response.status != 401 {
         serde_json::from_slice::<serde::de::IgnoredAny>(&response.body)
             .map_err(|_| SetupError::Malformed)?;
     }
     Ok(())
 }
 
-/// A settled setting (200 or 204), else its refusal.
+/// §8, pinned `OpenAPI`: a settled setting has a validated 204, else its refusal.
 fn settled(response: &HttpResponse) -> Result<(), SetupError> {
     match response.status {
-        200 | 204 => {
-            // §8 and pinned OpenAPI: model/entry settings acknowledge with no content.
-            // §5's readback checks the mutation; arbitrary JSON is not an acknowledgement shape.
-            if response.body.is_empty() {
-                Ok(())
-            } else {
-                Err(SetupError::Malformed)
-            }
-        }
+        204 => Ok(()),
         _ => Err(refused(response)),
     }
 }

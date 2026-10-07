@@ -269,6 +269,34 @@ impl Drop for PendingStop<'_> {
     }
 }
 
+/// §7.4, §8: stop mutation facts become authoritative only at their first byte.
+fn stop_tracker(
+    server: &Arc<Server>,
+    session: &str,
+    input: &str,
+    delivery: &Arc<Delivery>,
+    action: Action,
+) -> requests::SentTracker {
+    requests::SentTracker::new({
+        let delivery = Arc::clone(delivery);
+        let server = Arc::clone(server);
+        let session = session.to_owned();
+        let input = input.to_owned();
+        move || {
+            {
+                let mut routing = server.routing();
+                routing.request_sent();
+                if matches!(action, Action::CancelInput(_)) {
+                    routing.inbox_cancel_sent(&session, &input);
+                }
+            }
+            if matches!(action, Action::Interrupt) {
+                delivery.note_interrupt_sent();
+            }
+        }
+    })
+}
+
 /// §8: reserve the stop pool independently of a pending general prompt.
 async fn send(
     controls: &Controls,
@@ -286,16 +314,7 @@ async fn send(
             return None;
         }
     }
-    let sent = requests::SentTracker::new({
-        let delivery = Arc::clone(delivery);
-        let server = Arc::clone(server);
-        move || {
-            server.routing().request_sent();
-            if matches!(action, Action::Interrupt) {
-                delivery.note_interrupt_sent();
-            }
-        }
-    });
+    let sent = stop_tracker(server, session, input, delivery, action);
     let mut pending = PendingStop {
         server,
         session,
