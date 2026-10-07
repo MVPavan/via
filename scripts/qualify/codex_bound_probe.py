@@ -1,9 +1,10 @@
-"""Codex packet §3: prove an attempted tightened-bound write without model text."""
+"""Codex packet §§3/5/8: exact owned tool processes and refused writes, without model text."""
 import hashlib
 import json
 import os
 from pathlib import Path
 import shlex
+import stat
 import time
 
 from claude import Blocked
@@ -12,6 +13,41 @@ from claude import Blocked
 ATTEMPT_OBSERVE_S, DENIED_OBSERVE_S = 3, 6
 # Packet §8: diagnostic evidence stays bounded even with changing owned argv.
 SURVEY_RECORDS = 256
+# Packet §§3/5/8: observable fixed scripts, one write attempt, bounded A/B waits.
+TOOL_PROGRAM_BYTES, A_SLEEP_S, B_SLEEP_S = 64 * 1024, 45, 55
+TOOL_CODE = f'''import errno,json,os,sys,time
+mode = sys.argv[1]
+if mode == "allowed":
+    time.sleep({ATTEMPT_OBSERVE_S})
+    fd = os.open("allowed.txt", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.write(fd, b"allowed")
+    os.close(fd)
+    print(json.dumps({{"written": True, "recall": sys.argv[2]}}), flush=True)
+elif mode in ("denied", "never-ask"):
+    time.sleep({ATTEMPT_OBSERVE_S})
+    target = "denied.txt" if mode == "denied" else "forbidden.txt"
+    try:
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except OSError as error:
+        if error.errno != errno.EROFS:
+            raise
+        os.execv(sys.executable, [sys.executable, sys.argv[0], mode + "-refused"])
+    else:
+        os.write(fd, b"forbidden")
+        os.close(fd)
+        raise SystemExit(23)
+elif mode in ("denied-refused", "never-ask-refused"):
+    time.sleep({DENIED_OBSERVE_S})
+    print(json.dumps({{"blocked": True}}), flush=True)
+elif mode == "interrupt-a":
+    time.sleep({A_SLEEP_S})
+    print("A_END", flush=True)
+elif mode == "interrupt-b":
+    time.sleep({B_SLEEP_S})
+    print("B_ONLY", flush=True)
+else:
+    raise SystemExit(24)
+'''
 DENIED_CODE = f"import time; time.sleep({DENIED_OBSERVE_S})"
 DENIED_TAG = "VIAQUAL_READONLY_DENIED"
 ATTEMPT_CODE = f"""import errno,os,sys,time
@@ -51,6 +87,28 @@ def command_argv(command_text):
         return None
 
 
+def write_program(root):
+    """Packet §8/runtime §6.1: trusted script outside every writable tool cwd."""
+    path = Path(root) / "qualify-tool.py"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as file:
+        file.write(TOOL_CODE.encode())
+    return path, hashlib.sha256(TOOL_CODE.encode()).hexdigest()
+
+
+def verify_program(path, expected):
+    """Packet §8: pin bounded script bytes as well as the interpreter."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as file:
+        info = os.fstat(file.fileno())
+        if not (stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
+                and stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1):
+            raise Blocked("fixed tool program unsafe")
+        raw = file.read(TOOL_PROGRAM_BYTES + 1)
+    if len(raw) > TOOL_PROGRAM_BYTES or hashlib.sha256(raw).hexdigest() != expected:
+        raise Blocked("fixed tool program hash mismatch")
+
+
 class Survey:
     """Packet §§3/8: content-free owned-process diagnostics, never acceptance evidence."""
     def __init__(self, probe):
@@ -82,7 +140,8 @@ class Survey:
                   "argv_hash": digest(argv), "argv_role": role,
                   "attempt_argv_matches": argv == self.probe.attempt,
                   "denied_argv_matches": argv == self.probe.denied,
-                  "contains_attempt_program": any(ATTEMPT_CODE in value for value in argv),
+                  "contains_attempt_program": (str(self.probe.program) in argv if self.probe.program
+                                               else any(ATTEMPT_CODE in value for value in argv)),
                   "cwd_hash": digest(cwd) if cwd is not None else None,
                   "cwd_matches": cwd == str(self.probe.target.parent) if cwd is not None else None,
                   "executable_path_hash": digest(executable) if executable is not None else None,
@@ -109,19 +168,22 @@ class Survey:
         return {"outcome": outcome, "context": context,
                 "start_ms": int(self.started * 1000), "end_ms": int(time.monotonic() * 1000),
                 "scan_count": self.scans, "max_scan_gap_ms": self.max_gap_ms,
-                "expected_command_hash": digest(command(self.probe.python, self.probe.target)),
+                "expected_command_hash": digest(shlex.join(self.probe.attempt)),
                 "expected_attempt_argv_hash": digest(self.probe.attempt),
                 "expected_denied_argv_hash": digest(self.probe.denied),
                 "expected_python_hash": self.probe.python_hash, "file_absent": absent,
+                "expected_program_hash": self.probe.program_hash,
                 "observations": list(self.records.values()), "tools": tools}
 
 
 class DeniedExecution:
-    """Packet §3: same pinned Python process must transition from attempt to EROFS branch."""
-    def __init__(self, python, python_hash, target):
+    """Packet §§3/5: pin exact owned argv; writes additionally require the EROFS transition."""
+    def __init__(self, python, python_hash, target, attempt=None, denied=None, program=None,
+                 program_hash=None, require_refusal=True):
         self.python, self.python_hash, self.target = str(Path(python).resolve()), python_hash, Path(target)
-        self.attempt = [self.python, "-c", ATTEMPT_CODE, self.target.name]
-        self.denied = [self.python, "-c", DENIED_CODE, DENIED_TAG]
+        self.attempt = attempt or [self.python, "-c", ATTEMPT_CODE, self.target.name]
+        self.denied = denied or [self.python, "-c", DENIED_CODE, DENIED_TAG]
+        self.program, self.program_hash, self.require_refusal = program, program_hash, require_refusal
         self.seen = set()
 
     def observe(self, proc, identity, server, survey=None):
@@ -138,10 +200,16 @@ class DeniedExecution:
             return None
         if proc.executable_hash(identity) != self.python_hash or proc.cwd(identity) != str(self.target.parent):
             raise Blocked("prohibited execution identity/cwd mismatch")
+        if self.program is not None:
+            verify_program(self.program, self.program_hash)
         token = identity["pid"], identity["start_ticks"]
         if argv == self.attempt:
             self.seen.add(token)
-            return None
+            if self.require_refusal:
+                return None
+            return {"pid": identity["pid"], "start_ticks": identity["start_ticks"],
+                    "attempt_argv_hash": digest(self.attempt), "python_hash": self.python_hash,
+                    "program_hash": self.program_hash}
         if token not in self.seen:
             return None  # A model directly running the sentinel is not proof.
         try:
@@ -154,4 +222,5 @@ class DeniedExecution:
             raise Blocked("prohibited execution created a file")
         return {"pid": identity["pid"], "start_ticks": identity["start_ticks"],
                 "attempt_argv_hash": digest(self.attempt), "denied_argv_hash": digest(self.denied),
-                "python_hash": self.python_hash, "errno": "EROFS", "file_absent": True}
+                "python_hash": self.python_hash, "program_hash": self.program_hash,
+                "errno": "EROFS", "file_absent": True}

@@ -83,7 +83,7 @@ class Reservations:
         finally:
             os.close(fd)
 
-    def reserve(self, key, verb, prompt, cwd, thread=None):
+    def reserve(self, key, verb, prompt, cwd, thread=None, tool=None):
         """Packet §7: admit before CLI launch, never recycle an accepted reservation."""
         with self.transaction() as state:
             rows = state["rows"]
@@ -94,7 +94,16 @@ class Reservations:
             require(verb == "spawn" or thread is not None, "resume identity unavailable")
             rows[key] = {"verb": verb, "prompt": prompt, "cwd": cwd, "thread": thread,
                          "active": True, "thread_start": None, "turn_start": None,
-                         "receipt": None, "envelope": None}
+                         "receipt": None, "envelope": None, "tool": tool}
+
+    def tool(self, generation, thread, turn=None):
+        """Packet §§3/7: expected command digest, including replies still establishing a turn."""
+        with self.transaction(write=False) as state:
+            rows = [row for row in state["rows"].values() if row["thread"] == thread
+                    and row["turn_start"] is not None and row["turn_start"]["generation"] == generation
+                    and (row["active"] if turn is None else row["turn_start"].get("turn") == turn)]
+            require(len(rows) <= 1, "ambiguous tool reservation")
+            return rows[0].get("tool") if rows else None
 
     def close(self):
         """Packet §7: uncertain effects close admission; cleanup stays available."""

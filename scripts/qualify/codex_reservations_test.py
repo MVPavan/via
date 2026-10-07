@@ -48,6 +48,17 @@ class ReservationTests(unittest.TestCase):
         with self.assertRaisesRegex(Blocked, "turn/concurrency cap"):
             Reservations(self.path).reserve(digest(8), "spawn", digest("prompt"), digest("cwd"))
 
+    def test_pending_tool_uses_active_turn_not_settled_history(self):
+        key = self.reserve()
+        self.settle(key, 0)
+        generation, thread = digest(0), digest((0, "thread"))
+        expected = {"argv": digest("short fixed command")}
+        next_key = digest(1)
+        self.ledger.reserve(next_key, "resume", digest("next prompt"), digest("cwd"), thread, expected)
+        self.ledger.claim("turn/start", generation, digest("next request"), digest("cwd"), thread,
+                          digest("next prompt"))
+        self.assertEqual(self.ledger.tool(generation, thread), expected)
+
     def test_concurrent_reservation_cap_is_atomic(self):
         admitted, refused = [], []
         barrier = threading.Barrier(3)
