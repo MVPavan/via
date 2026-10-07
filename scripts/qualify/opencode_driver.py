@@ -31,8 +31,10 @@ import time
 import urllib.parse
 
 import opencode_safety as safety
+from opencode_safety import OwnedHTTP
 from opencode_ownership import OwnershipRegistry
 from opencode_catalog import catalog_record
+from opencode_reply import ReplyEvidence, reply_check
 
 Blocked = safety.Blocked
 # Packet §9 and the reviewed qualification plan's observation/pagination bounds.
@@ -48,6 +50,7 @@ HELPER_STOP_SECONDS = 30  # §13 L14 bounded cooperative cleanup before a succes
 ANCHOR_SOCKET_TAIL = 64
 METADATA_EFFORT = 'via-qualification-metadata-only-unoffered'  # Packet §5; C1 §4.
 OWNED_READINESS_SECONDS = 30  # §13: bounded delayed facts within the enclosing phase.
+CATALOG_READY_POLL_SECONDS = .2  # §§2.2, 13: catalogue readiness, never request admission.
 BOOTSTRAP_SECONDS = 30  # §13: owned acquisition and all served-fact checks.
 BOOTSTRAP_WAIT_MS = 30000  # §13: mock completion after the response is released.
 
@@ -156,7 +159,7 @@ def read_pages(fetch, *, deadline=None):
     raise Blocked('event pagination bound')
 
 
-def bounded_command(argv, *, env, cwd=None, input=None, timeout=30):
+def bounded_command(argv, *, env, cwd=None, input=None, timeout=30, observe=None):
     """Collect owned CLI pipes only in memory with an absolute time/byte bound."""
     try:
         process=subprocess.Popen(argv,env=env,cwd=cwd,stdin=subprocess.PIPE,
@@ -165,6 +168,7 @@ def bounded_command(argv, *, env, cwd=None, input=None, timeout=30):
         raise Blocked('private command could not start') from error
     selector=selectors.DefaultSelector()
     output={}
+    complete=False
     deadline=time.monotonic()+timeout
     try:
         pending=memoryview(input or b''); written=0
@@ -192,7 +196,9 @@ def bounded_command(argv, *, env, cwd=None, input=None, timeout=30):
                 output[key.data].extend(chunk)
                 if sum(map(len,output.values()))>OBSERVATION_BYTES:
                     raise Blocked('private command observation bound')
-        return process.wait(timeout=max(0.01,deadline-time.monotonic())),bytes(output['out']),bytes(output['err'])
+        rc=process.wait(timeout=max(0.01,deadline-time.monotonic()))
+        complete=True
+        return rc,bytes(output['out']),bytes(output['err'])
     except BaseException:
         # This process is the CLI we started, never a vendor/daemon discovered by name.
         if process.poll() is None:
@@ -201,6 +207,9 @@ def bounded_command(argv, *, env, cwd=None, input=None, timeout=30):
         raise
     finally:
         selector.close()
+        if observe is not None:
+            observe(process.returncode,bytes(output.get('out',b'')),bytes(output.get('err',b'')),
+                    complete=complete)
         for stream in (process.stdin,process.stdout,process.stderr): stream.close()
 
 
@@ -253,6 +262,7 @@ class Driver:
         self.events=[]; self.events_error=None; self._event_stop=threading.Event()
         self._event_thread=None; self._event_conn=None; self._events_lock=threading.Lock()
         self.counter=0; self.owned_replies=[]; self.secret_forms=[]; self._armed={}
+        self._record_lock=threading.RLock()
         self.project=None; self.fixtures={}; self.provider_endpoints={}; self.catalog_cache={}
         self.automatic_models_proven=False
         self._catalog_evidence=None
@@ -286,6 +296,7 @@ class Driver:
         self._observation_deadline=None
         self._verified_host_record=None; self._killed_anchor=None
         self._namespace_bootstraps={}
+        self.reply_evidence=ReplyEvidence(self._record,self._reply_protected,self._reply_context)
         self.git_templates=safety.GitTemplateCopies(
             self.evidence,git_templates or {},lambda value:self._record('git-template-copy',value))
         self.embedded_runtime=safety.EmbeddedRuntime(
@@ -298,6 +309,10 @@ class Driver:
             self.prepare()
 
     def _record(self,label,value):
+        with self._record_lock:
+            return self._write_record(label,value)
+
+    def _write_record(self,label,value):
         raw=json.dumps(value,allow_nan=False).encode()
         if len(raw)>OBSERVATION_BYTES or any(form and form in raw for form in self.secret_forms):
             raise Blocked('evidence secrecy or size control failed')
@@ -308,6 +323,37 @@ class Driver:
         path=self.ownership.register(self.evidence/f'{self.counter:05d}-{label}.json',
                                      'runner-evidence',directory=False)
         self.vault.safe_write_json(path,value)
+        return path.name
+
+    def _reply_protected(self,raw):
+        return self.vault.leaks(raw) or any(form and form in raw
+            for form in (*self.secret_forms,*self.bearer_forms))
+
+    def _reply_context(self):
+        project=Path(self.project) if self.project is not None else None
+        location=project.relative_to(self.evidence).as_posix() if project is not None \
+            and project.is_relative_to(self.evidence) else 'unregistered'
+        if self._reply_protected(location.encode()): location='redacted'
+        return {'location':location}
+
+    def _request(self,method,path,*args,client=None,**kwargs):
+        """§13: retain diagnostic fields before any HTTP reply validation can block."""
+        client=self._http if client is None else client
+        def observe(status,raw,**metadata):
+            self.reply_evidence.capture('vendor',self._reply_route(path),raw,http_status=status,**metadata)
+        if isinstance(client,OwnedHTTP):
+            kwargs['observe']=observe
+        status,raw=client.request(method,path,*args,**kwargs)
+        if not isinstance(client,OwnedHTTP): observe(status,raw,complete=True)
+        return status,raw
+
+    @staticmethod
+    def _reply_route(path):
+        """§13: route classes cannot retain IDs, queries or secret-bearing path text."""
+        allowed={'api','info','integration','model','config','session','event','openapi.json',
+                 'credential','inbox','message','abort','compact','fork','permission','children'}
+        return '/'.join(part if part in allowed or part=='' else '<id>'
+                        for part in urllib.parse.urlsplit(path).path.split('/'))
 
     def _directory(self,path,kind='runner-evidence',**flags):
         """Register every created/handoff directory before its contents exist (§13)."""
@@ -499,6 +545,7 @@ class Driver:
                     else: self.identities.add(safety.Identity(pid,row['start_ticks']))
         except Blocked: self.uncertain.append('private lockers unverifiable')
 
+    @reply_check
     def via(self,args):
         """Attach the fixed CLI verb to any runner block before cleanup (§13)."""
         verbs={'daemon','describe','models','spawn','resume','wait','result','cancel','close',
@@ -568,8 +615,13 @@ class Driver:
             timeout=min(timeout,remaining)
         try:
             command_started=time.monotonic()
+            def observe(rc,out,err,**metadata):
+                self.reply_evidence.capture('via',verb,out,exit_code=rc,**metadata)
+                if err: self.reply_evidence.capture('via-stderr',verb,err,exit_code=rc,**metadata)
+            observers={'observe':observe} if self.execute is bounded_command else {}
             rc,out,err=self.execute([str(self._binary),*args],env=self.env,cwd=self.project,
-                                    input=input,timeout=timeout)
+                                    input=input,timeout=timeout,**observers)
+            if not observers: observe(rc,out,err,complete=True)
         finally:
             if prompt_path is not None: prompt_path.unlink(missing_ok=True)
         if self.vault.leaks(out) or self.vault.leaks(err) or any(form in out+err for form in self.secret_forms):
@@ -811,7 +863,7 @@ class Driver:
                 binding=value
         return verify
 
-    def _await_owned(self,read,reason,*,seconds=OWNED_READINESS_SECONDS,deadline=None):
+    def _await_owned(self,read,reason,*,seconds=OWNED_READINESS_SECONDS,deadline=None,interval=.01):
         """§13: only explicit None is pending; every poll retains identity and its bound."""
         end=min(time.monotonic()+seconds,deadline if deadline is not None else float('inf'),
                 self.phase_deadline if self.phase_deadline is not None else float('inf'),
@@ -830,7 +882,7 @@ class Driver:
                 verify()
                 if time.monotonic()>=end: raise Blocked(reason)
                 if value is not None: return value
-                time.sleep(min(.01,max(0,end-time.monotonic())))
+                time.sleep(min(interval,max(0,end-time.monotonic())))
         finally:
             self._observation_deadline=saved
 
@@ -888,6 +940,7 @@ class Driver:
             return None
         return self._await_owned(read,'L14 helper after-spawn point not reached')
 
+    @reply_check
     def _observe_vendor(self):
         """Authenticate pid/start ticks, owned listener and §2 handshake before use."""
         record=self._host_record(); self.proc.verify(record['anchor'])
@@ -914,7 +967,7 @@ class Driver:
             self.proc.verify(record['anchor']); self.proc.verify(identity)
             if self.proc.listener(identity)!=origin:
                 raise Blocked('owned vendor info listener changed')
-            status,raw=self._http.request('GET','/api/info',timeout=deadline-time.monotonic())
+            status,raw=self._request('GET','/api/info',timeout=deadline-time.monotonic())
             value=self._json(raw)
             _typed(value,{'pid':I,'version':S},'vendor info')
             matches=value['pid']==identity.pid and value['version']=='2.0.22'
@@ -975,6 +1028,7 @@ class Driver:
         self._admit_model(safety.MOCK_IDENTITY)
         return endpoints
 
+    @reply_check
     def _bootstrap_vendor(self):
         """Labelled mock-only acquisition; failed proof cancels without releasing (§13)."""
         if self.guard.stopped: raise Blocked('spending control previously failed')
@@ -1075,6 +1129,7 @@ class Driver:
         except (ValueError,UnicodeError) as error:
             raise Blocked('vendor JSON shape unavailable') from error
 
+    @reply_check
     def vendor(self,method,path,body=None):
         """Memory-only authenticated API to one positively verified owned generation."""
         if urllib.parse.urlsplit(path).path=='/api/credential':
@@ -1085,7 +1140,7 @@ class Driver:
                 word in urllib.parse.urlsplit(path).path for word in ('/prompt','/compact','/fork')):
             self.spending_check(body=body,path=path)
             self._admit_model(self.last_model)
-        status,raw=self._http.request(method,path,body)
+        status,raw=self._request(method,path,body)
         if self.vault.leaks(raw): raise Blocked('password in vendor response')
         value=None if not raw else self._json(raw)
         self._record('vendor-request',{'method':method,'status':status,
@@ -1097,6 +1152,7 @@ class Driver:
         parts=urllib.parse.urlsplit(path).path.split('/')
         return '/'.join('<id>' if part.startswith(('ses_','msg_','in_')) else part for part in parts)
 
+    @reply_check
     def transcript(self,vendorsid):
         """Read only the owned session's bounded native message history (§13 OC03)."""
         if type(vendorsid) is not str or not vendorsid.startswith('ses') or '/' in vendorsid:
@@ -1108,6 +1164,7 @@ class Driver:
             raise Blocked('native history shape unavailable')
         return value['body']['data']
 
+    @reply_check
     def _catalog(self,checked_identity=None):
         """Decode prices unchanged; retain an allow-listed view if proof fails (§13)."""
         self._catalog_evidence=None
@@ -1119,8 +1176,10 @@ class Driver:
                 for form in (*self.secret_forms,*self.bearer_forms))
         observation=catalog_record(None,None,location,checked_identity,protected)
         query=urllib.parse.urlencode({'location[directory]':str(project)})
-        try:
-            status,raw=self._http.request('GET','/api/model?'+query)
+        def read():
+            nonlocal observation
+            status,raw=self._request('GET','/api/model?'+query,
+                timeout=max(.001,self._observation_deadline-time.monotonic()))
             observation=catalog_record(status,None,location,checked_identity,protected)
             body=self._json(raw)
             observation=catalog_record(status,body,location,checked_identity,protected)
@@ -1137,20 +1196,25 @@ class Driver:
                     free=free and all(type(value) in {int,float} and math.isfinite(value) and value==0
                                      for value in (tier['input'],tier['output'],tier['cache']['read'],tier['cache']['write']))
                 result[identity]={'free':free}
+            observed=result.get(checked_identity)
+            observation['checked_model']['status']='absent' if observed is None else \
+                'explicit-zero' if observed['free'] else 'not-explicit-zero'
+            return result if result and (checked_identity is None or observed is not None) else None
+        try:
+            result=self._await_owned(read,'owned location catalog readiness deadline',
+                interval=CATALOG_READY_POLL_SECONDS)
         except Blocked:
             self._record('catalog-block',observation)
             raise
-        observed=result.get(checked_identity)
-        observation['checked_model']['status']='absent' if observed is None else \
-            'explicit-zero' if observed['free'] else 'not-explicit-zero'
         self._catalog_evidence=observation
         self.catalog_cache=result
         return result
 
+    @reply_check
     def spending_check(self,*,args=None,body=None,path=None,cost=None):
         """Recheck structure for every model-capable request, never infer zero cost."""
         self.ensure_vendor()
-        status,raw=self._http.request('GET','/api/integration')
+        status,raw=self._request('GET','/api/integration')
         if status!=200: raise Blocked('integration check unavailable')
         integration=self._json(raw)
         identity=safety.FREE_IDENTITY
@@ -1161,7 +1225,7 @@ class Driver:
                 path_session=parts[3]
                 if not path_session.startswith('ses_'): raise Blocked('direct session identity invalid')
         if path_session:
-            status,raw=self._http.request('GET','/api/session/'+path_session)
+            status,raw=self._request('GET','/api/session/'+path_session)
             value=self._json(raw)
             if status!=200 or type(value.get('data')) is not dict or value['data'].get('id')!=path_session:
                 raise Blocked('direct session model readback unavailable')
@@ -1179,7 +1243,7 @@ class Driver:
         elif body and type(body) is dict and type(body.get('model')) is dict:
             ref=body['model']; identity=ref['providerID']+'/'+ref['id']
         elif args and len(args)>1 and args[1] in self.handles:
-            sid=self._vendor_sid(args[1]); status,raw=self._http.request('GET','/api/session/'+sid)
+            sid=self._vendor_sid(args[1]); status,raw=self._request('GET','/api/session/'+sid)
             value=self._json(raw)
             if status!=200 or type(value.get('data')) is not dict: raise Blocked('session model readback unavailable')
             ref=value['data'].get('model')
@@ -1211,13 +1275,14 @@ class Driver:
                 self._record('catalog-block',self._catalog_evidence)
             raise
 
+    @reply_check
     def _auxiliary_bindings(self,identity):
         schema=self._served_schema()
         offered=schema.get('components',{}).get('schemas',{}).get('Config.InfoEncoded',{}).get('properties',{})
         if not {'model','agents','providers'}<=set(offered):
             raise Blocked('pinned effective selector readback schema unsupported')
         query=urllib.parse.urlencode({'location[directory]':str(self.project)})
-        status,raw=self._http.request('GET','/api/config?'+query)
+        status,raw=self._request('GET','/api/config?'+query)
         value=self._json(raw)
         entries=value.get('data') if type(value) is dict else value
         if status!=200 or type(entries) is not list or not entries:
@@ -1258,11 +1323,12 @@ class Driver:
             raise Blocked('effective provider endpoints differ from owned fixture')
         return bindings
 
+    @reply_check
     def _served_schema(self):
         """Verify §2 E7 before interpreting vendor-specific qualification routes."""
         if getattr(self,'_schema_generation',None)==self.vendor_identity:
             return self._pinned_schema
-        status,raw=self._http.request('GET','/openapi.json')
+        status,raw=self._request('GET','/openapi.json')
         digest=hashlib.sha256(raw).hexdigest()
         if status!=200 or digest!='540fdf565da27de9df69b6c3864582344e74ac4ffa225c283b289481d215d241':
             raise Blocked('pinned served OpenAPI differs from packet E7')
@@ -1309,6 +1375,7 @@ class Driver:
             return None
         return self._await_owned(read,'confirmed vendor session ID missing')
 
+    @reply_check
     def start_event_capture(self):
         """Capture bounded owned SSE in memory for real request/action attribution."""
         self.close_event_capture()
@@ -1335,6 +1402,8 @@ class Driver:
         try:
             conn.request('GET','/api/event',headers={'Authorization':'Basic '+auth,'Accept':'text/event-stream'})
             response=conn.getresponse()
+            self.reply_evidence.capture('vendor-sse-handshake','/api/event',b'',
+                http_status=response.status,body_read=False)
             # Normal idle SSE has no per-read timeout. The owned watchdog enforces
             # the absolute phase ceiling and shuts this saved socket down on stop.
             self._event_socket.settimeout(None)
@@ -1352,10 +1421,12 @@ class Driver:
                     if not line: raise Blocked('owned event stream ended')
                     total+=len(line); current.extend(line)
                     if len(current)>1024*1024 or total>OBSERVATION_BYTES:
+                        self.reply_evidence.capture('vendor-sse','/api/event',bytes(current),http_status=200)
                         raise Blocked('owned event capture bound')
                     if line in (b'\n',b'\r\n'):
                         if data:
                             raw=b'\n'.join(data)
+                            self.reply_evidence.capture('vendor-sse','/api/event',raw,http_status=200)
                             if self.vault.leaks(raw): raise Blocked('password in event stream')
                             value=self._json(raw)
                             if type(value) is not dict or type(value.get('type')) is not str:
@@ -1367,7 +1438,9 @@ class Driver:
                     elif line.startswith(b'data:'): data.append(line[5:].lstrip().rstrip(b'\r\n'))
                     elif line.startswith(b'id:'): event_id=line[3:].strip().decode('utf-8','strict')
             except BaseException as error:
-                if not self._event_stop.is_set(): self.events_error=type(error).__name__
+                if not self._event_stop.is_set():
+                    self.reply_evidence.block(error)
+                    self.events_error=type(error).__name__
             finally: response.close(); conn.close()
         self._event_thread=threading.Thread(target=consume,name='owned-opencode-events',daemon=True)
         self._event_thread.start()
@@ -1389,6 +1462,7 @@ class Driver:
             self._event_watchdog=None
         self._event_socket=None
 
+    @reply_check
     def observe(self,kind,target=None):
         """Return typed raw owned observations; unavailable observations always block."""
         if kind=='interruption':
@@ -1435,10 +1509,10 @@ class Driver:
                 raise Blocked('owned session history existence unverified')
             return {'complete':True,'messages':self.transcript(sid),'history_exists':result['status']==200}
         if kind=='auth_checks':
-            self.ensure_vendor(); status,_=self._http.request('GET','/api/info',authenticated=False)
+            self.ensure_vendor(); status,_=self._request('GET','/api/info',authenticated=False)
             wrong=safety.OwnedHTTP(self._http.origin,self.vendor_identity,self.proc,b'wrong-owned-fixture')
-            wrong_status,_=wrong.request('GET','/api/info')
-            good,raw=self._http.request('GET','/api/info'); info=self._json(raw)
+            wrong_status,_=self._request('GET','/api/info',client=wrong)
+            good,raw=self._request('GET','/api/info'); info=self._json(raw)
             scan=self.secrecy_scan()
             helpers=list(self.helper_ledger.values())
             if not helpers: raise Blocked('tool password absence has no captured helper evidence')
@@ -1735,6 +1809,7 @@ class Driver:
         self._armed_history.add((name,occurrence))
         self._seam_targets[(name,occurrence)]=dict(target)
 
+    @reply_check
     def seam_wait(self,name,*,timeout=30):
         if name not in self._armed: raise Blocked('seam was not armed')
         occurrence=self._armed[name]
@@ -1810,12 +1885,13 @@ class Driver:
         if holders!=[anchor.report()]: raise Blocked('namespace lock escaped anchor')
         return holders
 
+    @reply_check
     def lifecycle(self,point):
         """Capture Host identity/lock facts for an explicitly reached life-point barrier."""
         self._prepare_lifecycle(point)
         self.ensure_vendor(); record=self._host_record()
         self.proc.verify(self.daemon); self.proc.verify(self.anchor); self.proc.verify(self.vendor_identity)
-        status,raw=self._http.request('GET','/api/info'); info=self._json(raw)
+        status,raw=self._request('GET','/api/info'); info=self._json(raw)
         if status!=200 or info['pid']!=self.vendor_identity.pid: raise Blocked('vendor PID drift')
         if not self.last_request or 'session_id' not in self.last_request['receipt']:
             raise Blocked('L14 requires an active Host-backed VIA turn pin')
@@ -2021,6 +2097,7 @@ class Driver:
             self._record('l14',result)
         return result
 
+    @reply_check
     def direct_seed(self,namespace,mutation):
         """Direct credential-seeding server only while private VIA stopped (§13 L11)."""
         if self.daemon is not None or Path(namespace)!=self.namespace:
@@ -2050,11 +2127,11 @@ class Driver:
                 except safety.ListenerNotReady:
                     time.sleep(min(.01,max(0,deadline-time.monotonic())))
             http=safety.OwnedHTTP(origin,identity,self.proc,password,seeding_mode=True,deadline=deadline)
-            status,raw=http.request('GET','/api/info')
+            status,raw=self._request('GET','/api/info',client=http)
             info=self._json(raw)
             if status!=200 or info['pid']!=identity.pid or info['version']!='2.0.22':
                 raise Blocked('L11 direct identity/version mismatch')
-            status,raw=http.request('GET','/openapi.json')
+            status,raw=self._request('GET','/openapi.json',client=http)
             schema=self._json(raw)
             if status!=200: raise Blocked('L11 served schema unavailable')
             if mutation=={'schema_checked':True}:
@@ -2068,9 +2145,9 @@ class Driver:
                     'integrationID':'via-unused-qualification','label':'VIA synthetic fixture',
                     'value':{'type':'key','key':secret},'activate':True}}
             self._validate_seed_mutation(schema,mutation)
-            status,raw=http.request(mutation['method'],mutation['path'],mutation['body'])
+            status,raw=self._request(mutation['method'],mutation['path'],mutation['body'],client=http)
             if status not in {200,201,204}: raise Blocked('L11 synthetic seeding refused')
-            status,raw=http.request('GET','/api/integration')
+            status,raw=self._request('GET','/api/integration',client=http)
             integration=self._json(raw)
             if status!=200 or type(integration.get('data')) is not list: raise Blocked('L11 integration shape unknown')
             connected=any(row.get('connections') for row in integration['data'] if type(row) is dict)
@@ -2501,6 +2578,7 @@ print('VIA HELPER DONE')
             raise Blocked('owned daemon continuation unverified')
         raise Blocked('unknown L14 barrier operation')
 
+    @reply_check
     def _operation(self,kind,target):
         """Execute bounded control operations from owned evidence, with no success defaults."""
         args=target if type(target) is dict else {'session':target}
@@ -2608,7 +2686,7 @@ print('VIA HELPER DONE')
             boundary=min((row['seq'] for row in later),default=float('inf'))
             owned=[row for row in terminals if last['seq']<row['seq']<boundary]
             execution=inputid
-            model=self._http.request('GET','/api/session/'+sid)
+            model=self._request('GET','/api/session/'+sid)
             ref=self._json(model[1])['data']['model']; identity=ref['providerID']+'/'+ref['id']
             if identity not in {safety.FREE_IDENTITY,safety.MOCK_IDENTITY}:
                 self.guard.stopped=True; raise Blocked('paid model readback hard stop')

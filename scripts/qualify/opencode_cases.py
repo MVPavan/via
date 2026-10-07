@@ -339,6 +339,8 @@ def run_case(driver: CaseDriver, name: str, function: Callable, disposition="gat
             function(driver, case)
     except safety.Blocked as error:
         actual = getattr(driver, 'driver', None)
+        retainer=getattr(actual,'reply_evidence',None)
+        if retainer is not None: retainer.block(error)
         blocking = safety.blocking_record(error, stage='case',
                                          vault=getattr(actual, 'vault', None),
                                          secret_forms=getattr(actual, 'secret_forms', ()))

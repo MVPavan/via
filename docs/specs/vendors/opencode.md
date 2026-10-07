@@ -1422,6 +1422,38 @@ settings, tokens and vendor error text are discarded; known password, bearer and
 synthetic forms are redacted even in identifier fields. This record diagnoses a
 refusal and never admits spending or counts as a passed gate.
 
+Every qualification block while evaluating a vendor or VIA reply retains a
+`reply-block` record through one shared diagnostic projector. HTTP config,
+integration, catalogue, session, message, OpenAPI and `/api/info` replies, CLI
+stdout/stderr and native SSE events enter it before schema or verdict checks.
+Rejected redirects and consumed partial HTTP/CLI replies are included, labelled
+incomplete. A stream handshake records status without reading its body. The
+record retains byte count/hash, status, allow-listed IDs, fixed enums, numeric
+fields and loopback origin classes (`host:port` only). URLs, paths from replies,
+headers, credentials, bearer handles and arbitrary vendor text are discarded;
+known protected forms and fresh private-field values are redacted even when
+mirrored into IDs or across foreground spawn's receipt/envelope lines.
+
+Diagnostic traversal is bounded at 16 MiB of consumed reply, 2,048 nodes,
+depth 12 and 64 collection items; each projection is at most 64 KiB. Exceeding
+a projection bound records explicit truncation and no projected values. Up to
+32 scoped/recent projections accompany the sanitized blocking reason and its
+case/phase/verb. A recent-context association is labelled, rather than claiming
+one reply caused the block. Phase/summary blocking records link the retained
+file; failed retention preserves the initiating block and marks retention
+unavailable. This evidence never admits spending or counts as a gate pass.
+
+The qualification observer treats an HTTP 200, decoded catalogue as pending
+when empty or when the checked model identity is absent: provider loading can
+publish several staged updates. It repeats the location read 200 ms apart
+(§2.2), within one 30 s readiness deadline clipped to the enclosing phase or bootstrap deadline,
+re-verifying owned PID/start-ticks and Host generation before and after each
+read. A present model proceeds immediately to the unchanged explicit-zero
+price check; missing or nonzero prices block at once. Schema errors, ownership
+changes and absence at deadline expiry block, with the last sanitized catalogue
+record retained. This observation wait admits no
+model request and does not change §5's fresh, no-retry effort check in VIA.
+
 ## 14. Owner questions and revisit items
 
 Decided (owner, 2026-10-06): transient receipt of project provider

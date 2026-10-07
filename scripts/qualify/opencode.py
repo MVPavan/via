@@ -48,7 +48,8 @@ FAKE_GATES = ("fmt", "clippy", "clippy-failpoints", "nextest-default", "nextest-
 VERSION = "2.0.22"
 E7_SHA256 = "540fdf565da27de9df69b6c3864582344e74ac4ffa225c283b289481d215d241"
 TEST_MODULES = ("opencode_safety_tests", "opencode_cases_tests", "opencode_driver_tests", "opencode_readiness_tests",
-                "opencode_barrier_tests", "opencode_runtime_tests", "opencode_tests", "opencode_ownership_tests", "opencode_via_tests")
+                "opencode_barrier_tests", "opencode_runtime_tests", "opencode_tests", "opencode_ownership_tests", "opencode_via_tests",
+                "opencode_reply_tests")
 _ACQUISITION_ROOT = None
 
 
@@ -361,6 +362,8 @@ def main(argv=None):
             "blocks": []}
 
     def retain_block(error, stage):
+        retainer=getattr(driver,'reply_evidence',None)
+        if retainer is not None: retainer.block(error)
         block = safety.blocking_record(error, stage=stage, vault=vault,
                                        secret_forms=getattr(driver, 'secret_forms', ()))
         if block['phase'] is None:
@@ -421,6 +424,8 @@ def main(argv=None):
             adapter = cases.DriverAdapter(driver)
             for phase in phases:
                 current_phase, phase_rows = phase, []
+                retainer=getattr(driver,'reply_evidence',None)
+                if retainer is not None: retainer.reset()
                 signals.guard()
                 accepted = 0
                 def retain_phase(rows):
@@ -452,6 +457,8 @@ def main(argv=None):
                 info["failure_order"].append({"stage": "runner", "kind": info["runner_error"]})
             if driver is not None:
                 try:
+                    retainer=getattr(driver,'reply_evidence',None)
+                    if retainer is not None: retainer.reset()
                     with safety.block_context(phase='cleanup', case=None, verb=None):
                         cleanup = driver.finish()
                 except BaseException as error:

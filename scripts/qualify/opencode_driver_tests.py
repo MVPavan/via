@@ -29,26 +29,28 @@ class DriverTests(unittest.TestCase):
         d.vault.names=mock.Mock(return_value=safety.VENDOR_ENVIRONMENT)
         d._http=mock.Mock()
         raw=body if isinstance(body,bytes) else json.dumps(body).encode()
-        def request(_method,path):
+        def request(_method,path,**_kwargs):
             return (200,b'{"data":[]}') if path=='/api/integration' else (status,raw)
         d._http.request.side_effect=request
         return d
 
     def test_blocked_catalog_retains_checked_mock_location_and_price_evidence(self):
-        for cost in (None,[],[{'input':1,'output':0,'cache':{'read':0,'write':0}}]):
+        for cost in ([],[{'input':1,'output':0,'cache':{'read':0,'write':0}}]):
             with self.subTest(cost=cost), tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
-                models=[] if cost is None else [{'providerID':'oclive-mock','id':'fixture-free','cost':cost}]
+                models=[{'providerID':'oclive-mock','id':'fixture-free','cost':cost}]
                 d=self.catalog_driver(root,{'data':models})
-                with self.assertRaisesRegex(Blocked,'frozen free model absent from catalog'):
-                    d.spending_check(args=['spawn','--model','oclive-mock/fixture-free'])
+                with mock.patch('opencode_driver.time.sleep') as sleep:
+                    with self.assertRaisesRegex(Blocked,'frozen free model absent from catalog'):
+                        d.spending_check(args=['spawn','--model','oclive-mock/fixture-free'])
+                    sleep.assert_not_called()
                 paths=list(d.evidence.glob('*catalog-block.json'))
                 self.assertEqual(len(paths),1,'blocked catalogue evidence was lost')
                 observed=json.loads(paths[0].read_text())
                 self.assertEqual(observed['checked_model'],{'providerID':'oclive-mock','id':'fixture-free',
-                    'status':'absent' if cost is None else 'not-explicit-zero'})
+                    'status':'not-explicit-zero'})
                 self.assertEqual(observed['location'],'project-boundary')
                 self.assertEqual((observed['route'],observed['http_status']),('/api/model',200))
-                self.assertEqual(observed['models'][0]['cost'] if models else None,cost)
+                self.assertEqual(observed['models'][0]['cost'],models[0]['cost'])
                 self.assertTrue(d.guard.stopped)
                 self.assertTrue(all(call.args[0]=='GET' for call in d._http.request.call_args_list))
 
@@ -111,7 +113,8 @@ class DriverTests(unittest.TestCase):
             d=self.catalog_driver(root,body)
             d.vault._values[Identity(71,123)]=secrets[0].encode()
             d.bearer_forms.add(secrets[1].encode()); d.secret_forms.append(secrets[2].encode())
-            with self.assertRaisesRegex(Blocked,'frozen free model absent from catalog'):
+            d.phase_deadline=time.monotonic()+.02
+            with self.assertRaisesRegex(Blocked,'owned location catalog readiness deadline'):
                 d.spending_check(args=['spawn','--model','oclive-mock/fixture-free'])
             paths=list(d.evidence.glob('*catalog-block.json'))
             self.assertEqual(len(paths),1,'protected IDs must be redacted, not lose the record')
@@ -119,6 +122,90 @@ class DriverTests(unittest.TestCase):
             for value in secrets: self.assertNotIn(value.encode(),raw)
             rows=json.loads(raw)['models']
             self.assertTrue(all(row['providerID'] is None and row['id'] is None for row in rows))
+
+    def test_empty_location_catalog_waits_for_explicit_zero_prices(self):
+        empty={'data':[]}; ready={'data':[{'providerID':'oclive-mock','id':'fixture-free',
+            'cost':[{'input':0,'output':0,'cache':{'read':0,'write':0}}]}]}
+        with tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
+            d=self.catalog_driver(root,empty); replies=[empty,ready]
+            d.daemon=Identity(10,1);d.anchor=Identity(11,2);d.vendor_identity=Identity(12,3)
+            d.proc=mock.Mock();d._host_record=mock.Mock(return_value={
+                'generation':'FAKE-owned','server_id':'FAKE-server','anchor':d.anchor,'vendor_pid':12})
+            def request(_method,path,**_kwargs):
+                return (200,b'{"data":[]}') if path=='/api/integration' else (200,json.dumps(replies.pop(0)).encode())
+            d._http.request.side_effect=request
+            with mock.patch('opencode_driver.time.sleep'):
+                result=d.spending_check(args=['spawn','--model','oclive-mock/fixture-free'])
+            self.assertTrue(result['structural_spending_controls'])
+            self.assertEqual(replies,[])
+            for identity in (d.daemon,d.anchor,d.vendor_identity):
+                self.assertGreaterEqual(d.proc.verify.call_args_list.count(mock.call(identity)),4)
+            self.assertFalse(list(d.evidence.glob('*catalog-block.json')))
+
+    def test_staged_location_catalog_waits_for_checked_identity(self):
+        other={'data':[{'providerID':'FAKE-other','id':'FAKE-other',
+            'cost':[{'input':0,'output':0,'cache':{'read':0,'write':0}}]}]}
+        ready={'data':[{'providerID':'oclive-mock','id':'fixture-free',
+            'cost':[{'input':0,'output':0,'cache':{'read':0,'write':0}}]}]}
+        with tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
+            d=self.catalog_driver(root,other);replies=[{'data':[]},other,ready]
+            d.daemon=Identity(10,1);d.anchor=Identity(11,2);d.vendor_identity=Identity(12,3)
+            d.proc=mock.Mock();d._host_record=mock.Mock(return_value={
+                'generation':'FAKE-owned','server_id':'FAKE-server','anchor':d.anchor,'vendor_pid':12})
+            def request(_method,path,**_kwargs):
+                return (200,b'{"data":[]}') if path=='/api/integration' else (200,json.dumps(replies.pop(0)).encode())
+            d._http.request.side_effect=request
+            with mock.patch('opencode_driver.time.sleep') as sleep:
+                result=d.spending_check(args=['spawn','--model','oclive-mock/fixture-free'])
+            self.assertTrue(result['structural_spending_controls']);self.assertEqual(replies,[])
+            self.assertEqual(sleep.call_args_list,[mock.call(.2),mock.call(.2)])
+            for identity in (d.daemon,d.anchor,d.vendor_identity):
+                self.assertGreaterEqual(d.proc.verify.call_args_list.count(mock.call(identity)),6)
+            self.assertFalse(list(d.evidence.glob('*catalog-block.json')))
+
+    def test_staged_location_catalog_absence_deadline_retains_last_nonempty_reply(self):
+        other={'data':[{'providerID':'FAKE-other','id':'FAKE-other',
+            'cost':[{'input':0,'output':0,'cache':{'read':0,'write':0}}]}]}
+        with tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
+            d=self.catalog_driver(root,other);clock=[0.0];d.phase_deadline=.25
+            with mock.patch('opencode_driver.time.monotonic',side_effect=lambda:clock[0]), \
+                 mock.patch('opencode_driver.time.sleep',side_effect=lambda seconds:clock.__setitem__(0,clock[0]+seconds)):
+                with self.assertRaisesRegex(Blocked,'owned location catalog readiness deadline'):
+                    d.spending_check(args=['spawn','--model','oclive-mock/fixture-free'])
+            self.assertAlmostEqual(clock[0],.25)
+            paths=list(d.evidence.glob('*catalog-block.json'));self.assertEqual(len(paths),1)
+            value=json.loads(paths[0].read_text())
+            self.assertEqual(value['checked_model']['status'],'absent')
+            self.assertEqual(value['models'][0]['providerID'],'FAKE-other')
+            self.assertEqual(value['http_status'],200)
+
+    def test_empty_location_catalog_generation_change_blocks_before_retry(self):
+        with tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
+            d=self.catalog_driver(root,{'data':[]})
+            d.daemon=Identity(10,1);d.anchor=Identity(11,2);d.vendor_identity=Identity(12,3)
+            d.proc=mock.Mock();row={'generation':'FAKE-owned','server_id':'FAKE-server',
+                                  'anchor':d.anchor,'vendor_pid':12}
+            d._host_record=mock.Mock(side_effect=lambda:dict(row))
+            with mock.patch('opencode_driver.time.sleep',side_effect=lambda _s:row.update(generation='FAKE-changed')):
+                with self.assertRaisesRegex(Blocked,'owned observation generation changed'):
+                    d.spending_check(args=['spawn','--model','oclive-mock/fixture-free'])
+            self.assertEqual(d._http.request.call_count,2)  # integration plus one catalogue GET
+            paths=list(d.evidence.glob('*catalog-block.json'));self.assertEqual(len(paths),1)
+            self.assertEqual(json.loads(paths[0].read_text())['models'],[])
+
+    def test_empty_location_catalog_has_one_absolute_deadline_and_retains_last_reply(self):
+        with tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
+            d=self.catalog_driver(root,{'data':[]});clock=[0.0];d.phase_deadline=.25
+            with mock.patch('opencode_driver.time.monotonic',side_effect=lambda:clock[0]), \
+                 mock.patch('opencode_driver.time.sleep',side_effect=lambda seconds:clock.__setitem__(0,clock[0]+seconds)):
+                with self.assertRaisesRegex(Blocked,'owned location catalog readiness deadline'):
+                    d.spending_check(args=['spawn','--model','oclive-mock/fixture-free'])
+            self.assertAlmostEqual(clock[0],.25)
+            paths=list(d.evidence.glob('*catalog-block.json'));self.assertEqual(len(paths),1)
+            value=json.loads(paths[0].read_text());self.assertEqual(value['http_status'],200)
+            self.assertEqual(value['models'],[])
+            self.assertTrue(all(call.kwargs['timeout']<=.25 for call in d._http.request.call_args_list
+                                if call.args[1].startswith('/api/model?')))
 
     def test_marker_server_loss_records_only_successfully_killed_anchor(self):
         with tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:

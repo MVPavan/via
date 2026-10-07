@@ -110,6 +110,12 @@ def blocking_record(error, *, stage=None, vault=None, secret_forms=()):
     record.update(kind=kind if kind in kinds else 'UnexpectedException', reason=reason)
     if stage is not None:
         record['stage'] = stage
+    replies=getattr(error,'reply_evidence',None)
+    if type(replies) is list:
+        record['reply_evidence']=[name for name in replies if type(name) is str
+            and re.fullmatch(r'[0-9]+-reply-block\.json',name)]
+    if getattr(error,'reply_retention_failed',False) is True:
+        record['reply_retention_failed']=True
     return record
 
 
@@ -516,24 +522,31 @@ class _AbsoluteHTTPDeadline:
             raise Blocked("HTTP deadline helper did not join")
 
 
-def _bounded_response(connection, method, path, headers, body, *, deadline, limit):
+def _bounded_response(connection, method, path, headers, body, *, deadline, limit, observe=None):
     """Shared bounded transport for owned HTTP and unauthenticated official HTTPS."""
     with _AbsoluteHTTPDeadline(connection, deadline) as timer:
         connection.request(method, path, body=body, headers=headers)
         timer.attach()
         response = connection.getresponse()
-        timer.guard()
         data = bytearray()
-        while True:
+        complete=False
+        try:
             timer.guard()
-            chunk = response.read1(min(65536, limit + 1 - len(data)))
-            timer.guard()
-            if not chunk:
-                break
-            data.extend(chunk)
-            if len(data) > limit:
-                raise Blocked("HTTP response exceeds bound")
-        return response.status, response.getheader("Location"), bytes(data)
+            while True:
+                timer.guard()
+                chunk = response.read1(min(65536, limit + 1 - len(data)))
+                data.extend(chunk)
+                timer.guard()
+                if not chunk:
+                    complete=True
+                    break
+                if len(data) > limit:
+                    raise Blocked("HTTP response exceeds bound")
+            return response.status, response.getheader("Location"), bytes(data)
+        finally:
+            # §13: even a rejected or partial owned reply reaches the one
+            # diagnostic projector; official package fetches have no observer.
+            if observe is not None: observe(response.status,bytes(data),complete=complete)
 
 
 def official_https_get(url, *, allowed_hosts, deadline_s=120, limit=ARCHIVE_BYTES,
@@ -1359,7 +1372,7 @@ class OwnedHTTP:
         self.seeding_mode = seeding_mode
         self.deadline = deadline
 
-    def request(self, method, path, body=None, *, authenticated=True, timeout=30):
+    def request(self, method, path, body=None, *, authenticated=True, timeout=30, observe=None):
         canonical, parsed, ambiguous = normalized_api_path(path)
         credential_path = canonical.rstrip("/")
         if credential_path == "/api/credential" or credential_path.startswith("/api/credential/"):
@@ -1386,7 +1399,7 @@ class OwnedHTTP:
         connection = http.client.HTTPConnection(parts.hostname, parts.port, timeout=timeout)
         try:
             status, _location, data = _bounded_response(connection, method, path, headers, raw,
-                                                        deadline=deadline, limit=self.limit)
+                                                        deadline=deadline, limit=self.limit, observe=observe)
             if 300 <= status < 400:
                 raise Blocked("owned API redirect refused")
             self.proc.verify(self.identity)

@@ -88,6 +88,11 @@ class EntryTests(unittest.TestCase):
             self.assertEqual(block['reason'],'describe: required field missing',summary)
             self.assertEqual((block['phase'],block['case'],block['verb']),
                              ('preflight','preflight','describe'))
+            replies=sorted(args.evidence.glob('*reply-block.json'))
+            self.assertTrue(replies,'preflight schema block did not retain its reply')
+            self.assertEqual(block['reply_evidence'],[replies[0].name])
+            saved=json.loads(replies[0].read_text())
+            self.assertEqual(saved['replies'][-1]['projection']['harness'],'opencode')
             self.assertEqual(phase[0]['blocking'],block)
             self.assertEqual(phase[0]['result'],'blocked')
             self.assertEqual(summary['blocks'][1]['reason'],'FAKE cleanup stop proof unavailable')
