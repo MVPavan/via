@@ -6,7 +6,9 @@ use std::time::Duration;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use via_wire::TurnNumber;
-use via_wire::http::{BODY_BYTES, HttpClient, HttpError, HttpRequest, Method, Pool, Sent};
+use via_wire::http::{
+    BODY_BYTES, HttpClient, HttpError, HttpRequest, Method, Pool, Sent, SentTracker,
+};
 
 use crate::Deadline;
 
@@ -83,6 +85,20 @@ enum ControlWork {
     Cleanup(CleanupWork),
 }
 
+/// §8–§9: only the actual first byte enters the unanswered-request aggregate.
+fn sent_tracker(server: &Arc<super::Server>) -> SentTracker {
+    let server = Arc::clone(server);
+    SentTracker::new(move || server.routing().request_sent())
+}
+
+fn sent_evidence(tracker: &SentTracker) -> Sent {
+    if tracker.is_sent() {
+        Sent::Maybe
+    } else {
+        Sent::No
+    }
+}
+
 async fn cleanup(server: Arc<super::Server>, work: CleanupWork) {
     match work.action {
         CleanupAction::InputCancel => cleanup_input(&server, &work).await,
@@ -90,20 +106,28 @@ async fn cleanup(server: Arc<super::Server>, work: CleanupWork) {
     }
 }
 
-async fn cleanup_input(server: &super::Server, work: &CleanupWork) {
+async fn cleanup_input(server: &Arc<super::Server>, work: &CleanupWork) {
     let state = input_cleanup_state(&server.routing(), work);
     if !matches!(state, InputCleanupState::Queued) {
         // The unsent cancellation is withdrawn positively. In particular, an
         // already-delivered input needs only the original execution's interrupt.
-        server.routing().request_completed(&work.owner.session);
+        server
+            .routing()
+            .request_completed(&work.owner.session, Sent::No);
         if matches!(state, InputCleanupState::Delivered) {
             wait_cleanup_delivery(server, work).await;
         }
         return;
     }
     let changed = server.routing().notify();
-    let response =
-        super::turn::cancel_input(server.http(), &work.owner.session, &work.input, work.by);
+    let sent = sent_tracker(server);
+    let response = super::turn::cancel_input_tracked(
+        server.http(),
+        &work.owner.session,
+        &work.input,
+        work.by,
+        &sent,
+    );
     tokio::pin!(response);
     loop {
         let activity = changed.notified();
@@ -115,7 +139,7 @@ async fn cleanup_input(server: &super::Server, work: &CleanupWork) {
             // must not wait for a held DELETE response before starting interrupt.
             let cancellation = async {
                 let outcome = response.as_mut().await;
-                finish_cleanup(server, work, cancel_effect(outcome)).await
+                finish_cleanup(server, work, cancel_effect(outcome), sent_evidence(&sent)).await
             };
             let (_flow, ()) = tokio::join!(cancellation, cleanup_interrupt(server, &followup));
             return;
@@ -125,7 +149,9 @@ async fn cleanup_input(server: &super::Server, work: &CleanupWork) {
         tokio::select! {
             outcome = &mut response => {
                 if matches!(
-                    finish_cleanup(server, work, cancel_effect(outcome)).await,
+                    finish_cleanup(
+                        server, work, cancel_effect(outcome), sent_evidence(&sent),
+                    ).await,
                     CleanupFlow::Observe
                 ) {
                     wait_cleanup_delivery(server, work).await;
@@ -137,7 +163,7 @@ async fn cleanup_input(server: &super::Server, work: &CleanupWork) {
     }
 }
 
-async fn wait_cleanup_delivery(server: &super::Server, work: &CleanupWork) {
+async fn wait_cleanup_delivery(server: &Arc<super::Server>, work: &CleanupWork) {
     let changed = server.routing().notify();
     loop {
         let activity = changed.notified();
@@ -195,7 +221,7 @@ fn input_cleanup_state(routing: &super::router::Router, work: &CleanupWork) -> I
     }
 }
 
-async fn cleanup_interrupt(server: &super::Server, work: &CleanupWork) {
+async fn cleanup_interrupt(server: &Arc<super::Server>, work: &CleanupWork) {
     let still_owned = server
         .routing()
         .state(&work.owner.session)
@@ -203,18 +229,22 @@ async fn cleanup_interrupt(server: &super::Server, work: &CleanupWork) {
     if !still_owned {
         // The reserved request was never sent. Its fence prevented admission of
         // a successor while this exact original execution was checked (§7.2).
-        server.routing().request_completed(&work.owner.session);
+        server
+            .routing()
+            .request_completed(&work.owner.session, Sent::No);
         return;
     }
-    let outcome = super::turn::interrupt(server.http(), &work.owner.session, work.by)
-        .await
-        .map(|outcome| match outcome {
-            super::turn::InterruptOutcome::Settled { .. } => CleanupEffect::Settled,
-            super::turn::InterruptOutcome::Status(401) => CleanupEffect::Authentication,
-            super::turn::InterruptOutcome::Status(_)
-            | super::turn::InterruptOutcome::Inconclusive => CleanupEffect::Inconclusive,
-        });
-    finish_cleanup(server, work, outcome).await;
+    let sent = sent_tracker(server);
+    let outcome =
+        super::turn::interrupt_tracked(server.http(), &work.owner.session, work.by, &sent)
+            .await
+            .map(|outcome| match outcome {
+                super::turn::InterruptOutcome::Settled { .. } => CleanupEffect::Settled,
+                super::turn::InterruptOutcome::Status(401) => CleanupEffect::Authentication,
+                super::turn::InterruptOutcome::Status(_)
+                | super::turn::InterruptOutcome::Inconclusive => CleanupEffect::Inconclusive,
+            });
+    finish_cleanup(server, work, outcome, sent_evidence(&sent)).await;
 }
 
 enum CleanupEffect {
@@ -239,9 +269,10 @@ fn cancel_effect(
 }
 
 async fn finish_cleanup(
-    server: &super::Server,
+    server: &Arc<super::Server>,
     work: &CleanupWork,
     outcome: Result<CleanupEffect, HttpError>,
+    sent: Sent,
 ) -> CleanupFlow {
     if let Err(error) = outcome
         && error.is_response_limit()
@@ -252,7 +283,7 @@ async fn finish_cleanup(
         server.drain();
         let mut routing = server.routing();
         routing.response_limit(&work.owner.session, work.owner.turn, detected_at);
-        routing.request_completed(&work.owner.session);
+        routing.request_completed(&work.owner.session, sent);
         return CleanupFlow::Observe;
     }
     if matches!(
@@ -277,7 +308,9 @@ async fn finish_cleanup(
     }
     // Every response above is complete or positively never sent. Overflow and
     // a withdrawn stop do not themselves drain the generation (§8, §9).
-    server.routing().request_completed(&work.owner.session);
+    server
+        .routing()
+        .request_completed(&work.owner.session, sent);
     if matches!(outcome, Ok(CleanupEffect::Authentication)) {
         CleanupFlow::Finished
     } else {
@@ -286,12 +319,14 @@ async fn finish_cleanup(
 }
 
 async fn control(server: Arc<super::Server>, work: DeclineWork) {
-    let outcome = decline(
+    let sent = sent_tracker(&server);
+    let outcome = decline_with_tracker(
         server.http(),
         &work.vendor_session,
         &work.id,
         work.kind,
         work.by,
+        Some(&sent),
     )
     .await;
     let decoded_at = Instant::now();
@@ -322,7 +357,10 @@ async fn control(server: Arc<super::Server>, work: DeclineWork) {
             || response_limit
             || matches!(outcome, Err(HttpError { sent: Sent::No, .. }))
         {
-            routing.request_completed_for(work.owner.as_ref().map(|owner| owner.session.as_str()));
+            routing.request_completed_for(
+                work.owner.as_ref().map(|owner| owner.session.as_str()),
+                sent_evidence(&sent),
+            );
         }
         let disposition = routing.finish_decline(&work, &outcome, decoded_at);
         if response_limit && let Some(owner) = &work.owner {
@@ -378,16 +416,17 @@ fn prepare_stop(routing: &mut super::router::Router, owner: &DeclineOwner) -> Op
     routing.failure().is_none().then_some(by)
 }
 
-async fn stop_live(server: &super::Server, owner: &DeclineOwner, by: Deadline) {
+async fn stop_live(server: &Arc<super::Server>, owner: &DeclineOwner, by: Deadline) {
     // The claim is shared with caller cancellation and names only the still-live
     // original execution. A tombstone can never interrupt its successor (§11).
-    let result = super::turn::interrupt(server.http(), &owner.session, by).await;
+    let sent = sent_tracker(server);
+    let result = super::turn::interrupt_tracked(server.http(), &owner.session, by, &sent).await;
     if result.as_ref().is_err_and(HttpError::is_response_limit) {
         let detected_at = Instant::now();
         server.drain();
         let mut routing = server.routing();
         routing.response_limit(&owner.session, owner.turn, detected_at);
-        routing.request_completed(&owner.session);
+        routing.request_completed(&owner.session, sent_evidence(&sent));
         return;
     }
     if matches!(result, Ok(super::turn::InterruptOutcome::Status(401))) {
@@ -398,7 +437,9 @@ async fn stop_live(server: &super::Server, owner: &DeclineOwner, by: Deadline) {
     if result.is_ok() || matches!(result, Err(HttpError { sent: Sent::No, .. })) {
         // Authentication failure or unknown effects fence admission before the
         // completed response releases this session's execution-rule request (§8).
-        server.routing().request_completed(&owner.session);
+        server
+            .routing()
+            .request_completed(&owner.session, sent_evidence(&sent));
     }
 }
 
@@ -450,7 +491,7 @@ pub struct DeclineWork {
     pub owner: Option<DeclineOwner>,
     /// Original decode instant.
     pub decoded_at: Instant,
-    /// The smaller of the original operation budget and five seconds from decode.
+    /// Five seconds from decode, further bounded by a live owner's wall only.
     pub by: Deadline,
 }
 
@@ -519,6 +560,17 @@ pub async fn decline(
     kind: InteractiveKind,
     by: Deadline,
 ) -> Result<DeclineOutcome, HttpError> {
+    decline_with_tracker(http, session, id, kind, by, None).await
+}
+
+async fn decline_with_tracker(
+    http: &HttpClient,
+    session: &str,
+    id: &str,
+    kind: InteractiveKind,
+    by: Deadline,
+    tracker: Option<&SentTracker>,
+) -> Result<DeclineOutcome, HttpError> {
     let session = super::turn::path_segment(session);
     let id = super::turn::path_segment(id);
     let (method, target, body) = match kind {
@@ -533,19 +585,17 @@ pub async fn decline(
             None,
         ),
     };
-    let response = super::response::checked(
-        http.request(
-            HttpRequest {
-                method,
-                target: &target,
-                body,
-                body_limit: BODY_BYTES,
-                pool: Pool::Decline,
-            },
-            by,
-        )
-        .await,
-    )?;
+    let request = HttpRequest {
+        method,
+        target: &target,
+        body,
+        body_limit: BODY_BYTES,
+        pool: Pool::Decline,
+    };
+    let response = super::response::checked(match tracker {
+        Some(tracker) => http.request_tracked(request, by, tracker).await,
+        None => http.request(request, by).await,
+    })?;
     Ok(match response.status {
         204 => DeclineOutcome::Declined,
         404 => DeclineOutcome::Gone,

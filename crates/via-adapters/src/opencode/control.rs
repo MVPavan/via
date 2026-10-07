@@ -46,7 +46,7 @@ struct StopBounds {
     wall: Deadline,
 }
 
-/// §7.4: run only after the prompt/setup future was dropped, fixing its sent boundary.
+/// §7.4: the turn pipeline stopped; its current sent HTTP exchange stays generation-owned.
 pub(super) async fn finish(facts: &mut Turn<'_>, controls: &Controls) -> TurnEnd {
     let initial_cause = cause(facts, controls);
     let Some(running) = facts.running.as_mut() else {
@@ -57,18 +57,8 @@ pub(super) async fn finish(facts: &mut Turn<'_>, controls: &Controls) -> TurnEnd
     let input = running.input.clone();
     let delivery = Arc::clone(&running.delivery);
     facts.submitted = running.sent.is_sent();
-    if running.prompt_pending {
-        if facts.submitted {
-            // The dropped socket cannot provide a complete response. Stops remain
-            // allowed while this generation drains; the prompt is never retried.
-            server.drain();
-        } else {
-            let mut routing = server.routing();
-            routing.request_completed(&session);
-            routing.never_sent(&session, &input);
-            running.prompt_pending = false;
-        }
-    }
+    // The generation owns the pending prompt exchange and its accounting. A stop
+    // changes only the input's native cancel/interrupt path, never its HTTP timeout.
     if !facts.submitted {
         return result(facts, controls, Some(initial_cause), Cleanup::Quiescent);
     }
@@ -271,7 +261,9 @@ impl Drop for PendingStop<'_> {
             if self.sent.is_sent() {
                 self.server.drain();
             } else {
-                self.server.routing().request_completed(self.session);
+                self.server
+                    .routing()
+                    .request_completed(self.session, requests::Sent::No);
             }
         }
     }
@@ -280,7 +272,7 @@ impl Drop for PendingStop<'_> {
 /// §8: reserve the stop pool independently of a pending general prompt.
 async fn send(
     controls: &Controls,
-    server: &Server,
+    server: &Arc<Server>,
     session: &str,
     input: &str,
     delivery: &Arc<Delivery>,
@@ -296,7 +288,9 @@ async fn send(
     }
     let sent = requests::SentTracker::new({
         let delivery = Arc::clone(delivery);
+        let server = Arc::clone(server);
         move || {
+            server.routing().request_sent();
             if matches!(action, Action::Interrupt) {
                 delivery.note_interrupt_sent();
             }
@@ -417,7 +411,12 @@ fn finish_request(
     }
     // A successor cannot become eligible before an inconclusive response fences setup.
     if complete {
-        server.routing().request_completed(session);
+        let evidence = if sent.is_sent() {
+            requests::Sent::Maybe
+        } else {
+            requests::Sent::No
+        };
+        server.routing().request_completed(session, evidence);
     }
 }
 

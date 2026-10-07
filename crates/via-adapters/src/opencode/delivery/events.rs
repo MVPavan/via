@@ -115,6 +115,11 @@ impl Registration {
                     .map(Observation::FinalText),
             );
         }
+        if terminal.is_some() {
+            // The output observations and terminal own their snapshots now.
+            // Keep only attribution/control evidence for subsequent late events.
+            state.normalizer.retire_output();
+        }
         Some(Normalized {
             observations,
             terminal,

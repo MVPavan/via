@@ -925,12 +925,15 @@ impl Servers {
         if (*holders > 0 && !live.is_draining())
             || live.failure().is_some()
             || live.routing().has_running_sent_turns()
+            || live.has_request_jobs()
         {
             return None;
         }
         let (key, live) = (*key, Arc::clone(live));
         // From here an end of its stream is the retirement, not a loss.
-        live.retire();
+        if !live.try_retire() {
+            return None;
+        }
         let stdio = live.stdio().clone();
         instance.entry = Entry::Retiring {
             stdio: Some(stdio),

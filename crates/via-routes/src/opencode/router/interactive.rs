@@ -269,6 +269,10 @@ impl Router {
             .as_ref()
             .and_then(|owner| self.sessions.get(&owner.session))
             .and_then(|session| {
+                // A late request has its own timeout; its owner's operation ended (§11).
+                if session.settled.contains(&owner.as_ref()?.turn) {
+                    return None;
+                }
                 session
                     .rejections
                     .0
@@ -426,5 +430,57 @@ impl Router {
         } else {
             DeclineDisposition::Tombstone
         }
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::opencode::events::decode;
+
+    fn decline_deadline(wall: Instant, settled: bool, decoded_at: Instant) -> Instant {
+        let mut router = Router::new();
+        let turn = TurnNumber::try_from(1).unwrap();
+        router.register_turn_with_deadline("ses_a", "input_a".into(), turn, Deadline::at(wall));
+        router
+            .sessions
+            .get_mut("ses_a")
+            .unwrap()
+            .state
+            .execution_owner = Some(turn);
+        if settled {
+            router.settle("ses_a", turn);
+        }
+        let event = decode(
+            &serde_json::to_vec(&json!({
+                "id":"event_a", "type":"form.created",
+                "data":{"form":{"id":"form_a", "sessionID":"ses_a"}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        router.dispatch(event, decoded_at);
+        let work = router.pop_pending_decline().unwrap();
+        assert_eq!(work.owner.unwrap().turn, turn);
+        work.by.instant()
+    }
+
+    #[test]
+    fn oc07_tombstoned_owner_gets_decline_timeout_after_its_wall_expired() {
+        let decoded_at = Instant::now();
+        let wall = decoded_at - std::time::Duration::from_secs(1);
+        assert_eq!(
+            decline_deadline(wall, true, decoded_at),
+            decoded_at + DECLINE_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn oc07_live_owner_decline_keeps_original_wall_bound() {
+        let decoded_at = Instant::now();
+        let wall = decoded_at + std::time::Duration::from_secs(1);
+        assert_eq!(decline_deadline(wall, false, decoded_at), wall);
     }
 }

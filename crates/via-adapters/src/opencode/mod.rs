@@ -24,6 +24,7 @@ mod execution;
 mod launch;
 mod normalize;
 mod plan;
+mod request;
 
 #[cfg(test)]
 mod normalize_tests;
@@ -33,6 +34,9 @@ mod driver_tests;
 
 #[cfg(test)]
 mod driver_control_tests;
+
+#[cfg(test)]
+mod driver_request_tests;
 
 #[cfg(test)]
 mod driver_http_limit_tests;

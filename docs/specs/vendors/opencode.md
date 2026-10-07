@@ -885,7 +885,9 @@ or decline never waits for the session's pending prompt.
 withdrawn only before that (runtime §4's existing rule). Each request has a
 response timeout: a decline 5 s, a stop its order's `force_at` or S1's
 cleanup bound, others `min(remaining wall, 30 s)`; at the timeout VIA closes
-the socket. E56 observed that an interrupt whose header block was never
+the socket. Caller stop or session close withdraws unsent setup or prompt requests, but a sent
+setup or prompt retains its original socket and response timeout while its native stop
+proceeds independently. E56 observed that an interrupt whose header block was never
 completed had no effect; this is evidence only, not a mechanism.
 
 | Request | Complete response | Meaning |
@@ -946,6 +948,9 @@ keep the lane-order outcome below.
 | Retained per server | session states 1,024; tombstoned turns 4,096; child sessions 4,096; pending interactive requests 64; requests without a complete response 64. Session states count only sessions VIA opened; descendants count only as child mappings, and sessions of neither kind retain no state. | server generation `overflow` |
 | Correlation keys (aggregate) | caller input, assistant message, tool call and interactive request IDs of every live and tombstoned turn, and child-session IDs, together: 65,536 entries and 8 MiB of retained ID bytes per server | server generation `overflow` |
 | Liveness | heartbeats every 15 s (E18); 45 s without a byte | transport loss (§10) |
+
+The 64 requests without a complete response are counted from their first byte;
+pool waiters count only toward the session execution rule (§7.2).
 
 **Prompt admission (security).** The prompt is echoed whole in the 200
 response and in `session.inbox.enqueued` (E47); OpenCode has no cap (3 MiB
@@ -1009,6 +1014,8 @@ rules (§5) allow everything except `question` and the denied tools. Any
 interactive request on the server is declined within
 `min(remaining operation budget, 5 s)` from decode (C2 A6) on the decline
 pool; never `once` or `always`.
+For a tombstoned owner, the decline uses its own 5 s timeout from decode,
+even when the owner's operation budget has expired (§8).
 
 | Request | Decline | Settlement |
 |---|---|---|

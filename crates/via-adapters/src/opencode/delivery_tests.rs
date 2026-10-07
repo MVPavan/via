@@ -1079,3 +1079,160 @@ async fn oc09_processed_late_response_limit_preserves_earlier_text_overflow() {
         "post-force HTTP bounds evidence cannot erase an earlier finite overflow"
     );
 }
+
+/// §9: terminal snapshots own the final text and aggregate, not retained tombstones.
+#[tokio::test]
+async fn oc09_terminal_releases_text_and_call_samples_without_losing_result() {
+    let (registration, delivery, mut receiver) = setup();
+    assert!(
+        registration
+            .process(accepted(&delivery))
+            .await
+            .is_continue()
+    );
+    drop(receiver.recv().await.unwrap());
+    seed_retained_output(&registration, &delivery).await;
+    let consumer = {
+        let registration = registration.clone();
+        let terminal = succeeded(&delivery, 4);
+        tokio::spawn(async move { registration.process(terminal).await.is_continue() })
+    };
+    assert!(matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), delivery.decision())
+            .await
+            .unwrap(),
+        Decision::Terminal
+    ));
+    let result = delivery.seal();
+    assert!(consumer.await.unwrap());
+    assert_eq!(result.terminal.unwrap().usage.unwrap().input, Some(7));
+    assert!(result.accounted);
+    let mut final_text = Vec::new();
+    while let Ok(admitted) = receiver.try_recv() {
+        if let Observation::FinalText(text) = admitted.item.observation {
+            final_text.push(text);
+        }
+    }
+    assert_eq!(final_text, ["retained result"]);
+    assert_output_released(&delivery);
+    seed_retained_output(&registration, &delivery).await;
+    assert_output_released(&delivery);
+}
+
+/// §7.4, §9: an unknown turn keeps revision candidates only until its late terminal.
+#[tokio::test]
+async fn oc09_late_terminal_releases_text_and_call_samples() {
+    let (registration, delivery, mut receiver) = setup();
+    assert!(
+        registration
+            .process(accepted(&delivery))
+            .await
+            .is_continue()
+    );
+    drop(receiver.recv().await.unwrap());
+    seed_retained_output(&registration, &delivery).await;
+    assert!(delivery.seal().terminal.is_none());
+    assert_eq!(delivery.lock().normalizer.final_text(), ["retained result"]);
+    assert!(
+        registration
+            .process(succeeded(&delivery, 4))
+            .await
+            .is_continue()
+    );
+    let mut final_text = Vec::new();
+    let mut revision = false;
+    while let Ok(admitted) = receiver.try_recv() {
+        match admitted.item.observation {
+            Observation::FinalText(text) => final_text.push(text),
+            Observation::LateTerminal(terminal) => {
+                assert_eq!(terminal.usage, Some(UsageSample::default()));
+                revision = true;
+            }
+            Observation::Accepted(_)
+            | Observation::IdentityConfirmed(_)
+            | Observation::Progress(_)
+            | Observation::ActionDenied(_)
+            | Observation::RequestDeclined(_)
+            | Observation::SteerDelivered { .. }
+            | Observation::Warning(_)
+            | Observation::VendorClosed(_)
+            | Observation::ResumeMismatch { .. } => {}
+        }
+    }
+    assert_eq!(final_text, ["retained result"]);
+    assert!(revision);
+    assert_output_released(&delivery);
+}
+
+/// C2 §3 cutoff, §9: stopped late admission cannot retain revision candidates.
+#[tokio::test]
+async fn oc09_late_observation_cutoff_releases_unknown_turn_candidates() {
+    let (registration, delivery, mut receiver) = setup();
+    assert!(
+        registration
+            .process(accepted(&delivery))
+            .await
+            .is_continue()
+    );
+    drop(receiver.recv().await.unwrap());
+    seed_retained_output(&registration, &delivery).await;
+    assert!(delivery.seal().terminal.is_none());
+    registration.fail(Stop::Detached);
+    assert_output_released(&delivery);
+}
+
+async fn seed_retained_output(registration: &Registration, delivery: &Delivery) {
+    assert!(
+        registration
+            .process(event(
+                delivery,
+                2,
+                EventData::Text {
+                    kind: TextKind::Ended,
+                    assistant_message_id: "assistant_retained".into(),
+                    ordinal: 0,
+                    text: "retained result".into(),
+                }
+            ))
+            .await
+            .is_continue()
+    );
+    assert!(
+        registration
+            .process(event(
+                delivery,
+                3,
+                EventData::Step {
+                    kind: via_routes::opencode::events::StepKind::Ended,
+                    assistant_message_id: "assistant_retained".into(),
+                    finish: Some("stop".into()),
+                    tokens: Some(via_routes::opencode::events::Tokens {
+                        input: Some(7),
+                        output: Some(3),
+                        ..Default::default()
+                    }),
+                    cost: Some(0.25),
+                }
+            ))
+            .await
+            .is_continue()
+    );
+}
+
+fn assert_output_released(delivery: &Delivery) {
+    let state = delivery.lock();
+    assert!(
+        state.normalizer.final_text().is_empty(),
+        "tombstones retain no text candidates"
+    );
+    assert_eq!(
+        state.normalizer.usage().input,
+        None,
+        "tombstones retain no call samples"
+    );
+    assert_eq!(
+        state.normalizer.cost(),
+        None,
+        "tombstones retain no cost samples"
+    );
+}

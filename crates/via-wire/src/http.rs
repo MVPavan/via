@@ -134,6 +134,8 @@ pub enum Sent {
 /// The callback must be synchronous and bounded; it runs once after the first write.
 pub struct SentTracker {
     sent: AtomicBool,
+    /// Serializes withdrawal with the first nonblocking write, never an await (§8).
+    first_byte_closed: Mutex<bool>,
     changed: Notify,
     on_sent: Box<dyn Fn() + Send + Sync>,
 }
@@ -143,6 +145,7 @@ impl SentTracker {
     pub fn new(on_sent: impl Fn() + Send + Sync + 'static) -> Self {
         Self {
             sent: AtomicBool::new(false),
+            first_byte_closed: Mutex::new(false),
             changed: Notify::new(),
             on_sent: Box::new(on_sent),
         }
@@ -151,6 +154,19 @@ impl SentTracker {
     /// Whether this request wrote any byte (§8).
     pub fn is_sent(&self) -> bool {
         self.sent.load(Ordering::Acquire)
+    }
+
+    /// Withdraws before the first byte, or retains an already-sent exchange (§8).
+    pub fn withdraw_before_send(&self) -> bool {
+        let mut closed = self
+            .first_byte_closed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if self.is_sent() {
+            return false;
+        }
+        *closed = true;
+        true
     }
 
     /// Waits for first-byte evidence; cancellation preserves the evidence (§8).
@@ -240,6 +256,7 @@ impl HttpError {
 
 /// A client of one loopback server: its port, its Basic credentials and
 /// its pools. `Debug` shows the port only.
+#[derive(Clone)]
 pub struct HttpClient {
     port: u16,
     /// `Basic <base64(user:password)>`, never shown.
@@ -247,7 +264,8 @@ pub struct HttpClient {
     decline: Arc<Semaphore>,
     stop: Arc<Semaphore>,
     general: Arc<Semaphore>,
-    general_closed: Mutex<bool>,
+    general_closed: Arc<Mutex<bool>>,
+    tracker: Option<Arc<SentTracker>>,
 }
 
 impl fmt::Debug for HttpClient {
@@ -273,7 +291,17 @@ impl HttpClient {
             decline: Arc::new(Semaphore::new(DECLINE_CONNECTIONS)),
             stop: Arc::new(Semaphore::new(STOP_CONNECTIONS)),
             general: Arc::new(Semaphore::new(GENERAL_CONNECTIONS)),
-            general_closed: Mutex::new(false),
+            general_closed: Arc::new(Mutex::new(false)),
+            tracker: None,
+        }
+    }
+
+    /// A one-request view sharing pools and the drain gate, with first-byte proof (§8).
+    #[must_use]
+    pub fn with_sent_tracker(&self, tracker: Arc<SentTracker>) -> Self {
+        Self {
+            tracker: Some(tracker),
+            ..self.clone()
         }
     }
 
@@ -309,6 +337,9 @@ impl HttpClient {
         request: HttpRequest<'_>,
         deadline: Deadline,
     ) -> Result<HttpResponse, HttpError> {
+        if let Some(tracker) = &self.tracker {
+            return self.request_tracked(request, deadline, tracker).await;
+        }
         let mut sent = Sent::No;
         let exchange = self.exchange(request, &mut sent, None);
         match timeout_at(deadline.instant(), exchange).await {
@@ -359,7 +390,7 @@ impl HttpClient {
             request.body,
             "application/json",
         );
-        let gate = (request.pool == Pool::General).then_some(&self.general_closed);
+        let gate = (request.pool == Pool::General).then_some(self.general_closed.as_ref());
         write_tracked(&mut stream, head.as_bytes(), sent, tracker, gate).await?;
         if let Some(body) = request.body {
             write_tracked(&mut stream, body, sent, tracker, gate).await?;
@@ -466,7 +497,17 @@ async fn write_tracked(
             } else {
                 None
             };
-            if guard.as_deref() == Some(&true) {
+            let withdrawn = if *sent == Sent::No {
+                tracker.map(|tracker| {
+                    tracker
+                        .first_byte_closed
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                })
+            } else {
+                None
+            };
+            if guard.as_deref() == Some(&true) || withdrawn.as_deref() == Some(&true) {
                 return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
             }
             // A tracked first write exposes only an incomplete request prefix.

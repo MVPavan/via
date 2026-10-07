@@ -365,7 +365,7 @@ pub(crate) async fn run_turn(
         cx.activity,
         &spec.prompt,
     ));
-    // Dropping setup retains request accounting; a running guard seals its turn.
+    // A dropped setup withdraws unsent HTTP; generation-owned sent HTTP keeps its timeout.
     let outcome = tokio::select! {
         biased;
         () = ended => None,
@@ -704,27 +704,17 @@ async fn unchecked_credentials(facts: &Turn<'_>, server: &ServerFacts) -> Result
         .await
 }
 
-/// §8: a cancelled setup request has no complete effect proof; drain instead of resending.
-struct PendingRequest<'a> {
-    server: &'a Server,
-    completed: bool,
-}
-
-impl Drop for PendingRequest<'_> {
-    fn drop(&mut self) {
-        if !self.completed {
-            self.server.drain();
-        }
-    }
-}
-
 /// §7.2, §8: request accounting survives cancellation and driver replacement.
-/// Only a complete response or positive never-sent evidence releases it.
-pub(super) async fn tracked<T>(
-    server: &Server,
+/// A caller stops its setup pipeline, while the generation owns its current sent request.
+pub(super) async fn tracked<T, F>(
+    server: &Arc<Server>,
     id: Option<&str>,
-    request: impl std::future::Future<Output = Result<T, SetupError>>,
-) -> Result<T, SetupError> {
+    request: impl FnOnce(via_routes::opencode::turn::HttpClient) -> F + Send + 'static,
+) -> Result<T, SetupError>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = Result<T, SetupError>> + Send + 'static,
+{
     if server.is_draining() || server.failure().is_some() || server.ended().is_some() {
         return Err(unavailable_request());
     }
@@ -735,12 +725,52 @@ pub(super) async fn tracked<T>(
             return Err(unavailable_request());
         }
     }
-    let mut pending = PendingRequest {
+    let sent = Arc::new(via_routes::opencode::turn::SentTracker::new({
+        let server = Arc::clone(server);
+        move || server.routing().request_sent()
+    }));
+    let http = server.http().with_sent_tracker(Arc::clone(&sent));
+    let finish_server = Arc::clone(server);
+    let id = id.map(str::to_owned);
+    let pending_id = id.clone();
+    super::request::owned(
         server,
-        completed: false,
-    };
-    let outcome = request.await;
-    pending.completed = true;
+        Arc::clone(&sent),
+        request(http),
+        move |outcome| async move {
+            let evidence = if sent.is_sent() {
+                via_routes::opencode::turn::Sent::Maybe
+            } else {
+                via_routes::opencode::turn::Sent::No
+            };
+            let Some(outcome) = outcome else {
+                finish_server
+                    .routing()
+                    .request_completed_for(id.as_deref(), evidence);
+                return Err(unavailable_request());
+            };
+            finish_setup(&finish_server, id.as_deref(), &outcome, evidence);
+            outcome
+        },
+    )
+    .await
+    .unwrap_or_else(|| {
+        // Failed job admission or generation cancellation proves no reusable destination.
+        // Release this caller's execution-rule accounting without releasing a sent slot.
+        server
+            .routing()
+            .request_completed_for(pending_id.as_deref(), via_routes::opencode::turn::Sent::No);
+        Err(unavailable_request())
+    })
+}
+
+/// §8: a complete response has its meaning even after the originating caller stopped.
+fn finish_setup<T>(
+    server: &Server,
+    id: Option<&str>,
+    outcome: &Result<T, SetupError>,
+    sent: via_routes::opencode::turn::Sent,
+) {
     let complete = match &outcome {
         Err(SetupError::Http(error)) => error.sent == via_routes::opencode::turn::Sent::No,
         Ok(_) | Err(SetupError::Status { .. } | SetupError::Malformed) => true,
@@ -755,9 +785,8 @@ pub(super) async fn tracked<T>(
     }
     // Fence an inconclusive generation before releasing the request admission rule.
     if complete {
-        server.routing().request_completed_for(id);
+        server.routing().request_completed_for(id, sent);
     }
-    outcome
 }
 
 /// §8: a failed or draining generation cannot admit a new request byte.
@@ -774,16 +803,16 @@ fn unavailable_request() -> SetupError {
 /// naming `effort`, nothing sent.
 pub(super) async fn effort_offered(
     facts: &Turn<'_>,
-    server: &Server,
+    server: &Arc<Server>,
     settings: &Settings,
     variant: &str,
 ) -> Result<(), Box<TurnEnd>> {
     let id = facts.driver.state().identity.clone();
-    let catalog = tracked(
-        server,
-        id.as_deref(),
-        session::catalog_at(server.http(), &settings.cwd, facts.request_by()),
-    )
+    let cwd = settings.cwd.clone();
+    let by = facts.request_by();
+    let catalog = tracked(server, id.as_deref(), move |http| async move {
+        session::catalog_at(&http, &cwd, by).await
+    })
     .await
     .map_err(|error| Box::new(facts.setup_failed("the location's model listing", error)))?;
     let offered = catalog.iter().any(|model| {
@@ -805,21 +834,27 @@ pub(super) async fn effort_offered(
 /// readback must equal what was just sent.
 async fn create(
     facts: &Turn<'_>,
-    server: &Server,
+    server: &Arc<Server>,
     settings: &Settings,
     digest: &str,
 ) -> Result<SessionInfo, Box<TurnEnd>> {
-    let new = NewSession {
-        model: &settings.model,
-        agent: AGENT,
-        directory: &settings.cwd,
-        permissions: &settings.rules,
-    };
-    let info = tracked(
-        server,
-        None,
-        session::create(server.http(), new, facts.request_by()),
-    )
+    let model = settings.model.clone();
+    let cwd = settings.cwd.clone();
+    let permissions = settings.rules.clone();
+    let by = facts.request_by();
+    let info = tracked(server, None, move |http| async move {
+        session::create(
+            &http,
+            NewSession {
+                model: &model,
+                agent: AGENT,
+                directory: &cwd,
+                permissions: &permissions,
+            },
+            by,
+        )
+        .await
+    })
     .await
     .map_err(|error| Box::new(facts.setup_failed("session creation", error)))?;
     server.routing().session_opened(&info.id);
@@ -832,18 +867,19 @@ async fn create(
         return Err(Box::new(facts.readback_refused(digest, "location")));
     }
     if let Some(text) = &settings.instructions {
-        tracked(
-            server,
-            Some(&info.id),
-            session::put_instructions(server.http(), &info.id, text, facts.request_by()),
-        )
+        let id = info.id.clone();
+        let entry = text.clone();
+        let by = facts.request_by();
+        tracked(server, Some(&info.id), move |http| async move {
+            session::put_instructions(&http, &id, &entry, by).await
+        })
         .await
         .map_err(|error| Box::new(facts.setup_failed("the instruction entry", error)))?;
-        let entry = tracked(
-            server,
-            Some(&info.id),
-            session::instructions(server.http(), &info.id, facts.request_by()),
-        )
+        let id = info.id.clone();
+        let by = facts.request_by();
+        let entry = tracked(server, Some(&info.id), move |http| async move {
+            session::instructions(&http, &id, by).await
+        })
         .await
         .map_err(|error| Box::new(facts.setup_failed("the instruction listing", error)))?;
         if entry != Entry::Text(text.clone()) {
@@ -859,15 +895,15 @@ async fn create(
 /// fault, `SettingsMismatch`, not cached.
 async fn reopen(
     facts: &Turn<'_>,
-    server: &Server,
+    server: &Arc<Server>,
     settings: &Settings,
     id: &str,
 ) -> Result<SessionInfo, Box<TurnEnd>> {
-    let info = tracked(
-        server,
-        None,
-        session::get(server.http(), id, facts.request_by()),
-    )
+    let target = id.to_owned();
+    let by = facts.request_by();
+    let info = tracked(server, None, move |http| async move {
+        session::get(&http, &target, by).await
+    })
     .await
     .map_err(|error| Box::new(facts.setup_failed("the session readback", error)))?;
     let Some(info) = info.filter(|info| info.id == id && info.directory == settings.cwd) else {
@@ -879,11 +915,11 @@ async fn reopen(
         ));
     }
     server.routing().session_opened(&info.id);
-    let entry = tracked(
-        server,
-        Some(id),
-        session::instructions(server.http(), id, facts.request_by()),
-    )
+    let target = id.to_owned();
+    let by = facts.request_by();
+    let entry = tracked(server, Some(id), move |http| async move {
+        session::instructions(&http, &target, by).await
+    })
     .await
     .map_err(|error| Box::new(facts.setup_failed("the instruction listing", error)))?;
     let expected = settings
@@ -942,12 +978,16 @@ fn variant_of(info: &SessionInfo) -> String {
 }
 
 /// The session's current variant, read back.
-async fn read_variant(facts: &Turn<'_>, server: &Server, id: &str) -> Result<String, Box<TurnEnd>> {
-    match tracked(
-        server,
-        None,
-        session::get(server.http(), id, facts.request_by()),
-    )
+async fn read_variant(
+    facts: &Turn<'_>,
+    server: &Arc<Server>,
+    id: &str,
+) -> Result<String, Box<TurnEnd>> {
+    let target = id.to_owned();
+    let by = facts.request_by();
+    match tracked(server, Some(id), move |http| async move {
+        session::get(&http, &target, by).await
+    })
     .await
     {
         Ok(Some(info)) => Ok(variant_of(&info)),
@@ -979,7 +1019,7 @@ async fn confirm(facts: &Turn<'_>, (generation, id): (u64, &str)) -> Result<(), 
 /// still differing is an ignored switch, refused as just sent.
 pub(super) async fn switch_variant(
     facts: &Turn<'_>,
-    server: &Server,
+    server: &Arc<Server>,
     (settings, id, current): (&Settings, &str, String),
     digest: &str,
 ) -> Result<(), Box<TurnEnd>> {
@@ -990,11 +1030,11 @@ pub(super) async fn switch_variant(
         variant: settings.variant.clone(),
         ..settings.model.clone()
     };
-    tracked(
-        server,
-        Some(id),
-        session::switch_model(server.http(), id, &model, facts.request_by()),
-    )
+    let target = id.to_owned();
+    let by = facts.request_by();
+    tracked(server, Some(id), move |http| async move {
+        session::switch_model(&http, &target, &model, by).await
+    })
     .await
     .map_err(|error| Box::new(facts.setup_failed("the model switch", error)))?;
     let switched = read_variant(facts, server, id).await?;

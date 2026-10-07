@@ -47,7 +47,6 @@ pub(super) struct Running {
     pub(super) input: String,
     pub(super) delivery: Arc<Delivery>,
     pub(super) sent: Arc<requests::SentTracker>,
-    pub(super) prompt_pending: bool,
     pub(super) request_loss: Option<GenerationEnd>,
     pub(super) cleanup: Option<crate::Cleanup>,
     pub(super) acknowledgement_cutoff: Option<Deadline>,
@@ -59,15 +58,7 @@ pub(super) struct Running {
 impl Drop for Running {
     fn drop(&mut self) {
         if !self.finished {
-            if self.prompt_pending {
-                if self.sent.is_sent() {
-                    self.server.drain();
-                } else {
-                    let mut routing = self.server.routing();
-                    routing.request_completed(&self.session);
-                    routing.never_sent(&self.session, &self.input);
-                }
-            }
+            // The original HTTP job remains with the generation, including on abandonment.
             self.delivery.seal();
             self.server.routing().settle(&self.session, self.turn);
             crate::driver::latch(&self.health, DriverFailure::TurnAbandoned);
@@ -180,7 +171,11 @@ async fn prepare(
         let server = Arc::clone(server);
         let id = id.clone();
         let input = input.clone();
-        move || server.routing().mark_sent(&id, &input)
+        move || {
+            let mut routing = server.routing();
+            routing.request_sent();
+            routing.mark_sent(&id, &input);
+        }
     }));
     facts.running = Some(Running {
         server: Arc::clone(server),
@@ -188,7 +183,6 @@ async fn prepare(
         input: input.clone(),
         delivery: Arc::clone(&delivery),
         sent,
-        prompt_pending: true,
         request_loss: None,
         cleanup: None,
         acknowledgement_cutoff: None,
@@ -248,39 +242,135 @@ async fn admit_ready(
     }
 }
 
-/// §8: a dropped socket fixes first-byte evidence before drain withdrawal is reported.
+/// The original response has already been classified under generation ownership (§8).
+struct PromptResponse {
+    outcome: Result<Submission, requests::HttpError>,
+    loss: Option<GenerationEnd>,
+}
+
+/// §8: caller cancellation withdraws only before the first byte; no prompt is retried.
 async fn prompt_response(
-    facts: &mut Turn<'_>,
-    server: &Server,
+    facts: &Turn<'_>,
+    server: &Arc<Server>,
     id: &str,
     input: &str,
     prompt: &str,
-    sent: &requests::SentTracker,
-) -> Option<Result<Submission, requests::HttpError>> {
-    // Dropping the request closes its socket. The retained first-byte tracker
-    // proves whether cancellation may withdraw it or must preserve its effects.
-    let outcome = {
-        let response =
-            requests::prompt_tracked(server.http(), id, input, prompt, facts.request_by(), sent);
-        tokio::pin!(response);
-        tokio::select! {
-            biased;
-            () = server.wait_draining() => {
-                if sent.is_sent() {
-                    response.await
-                } else {
-                    server.routing().request_completed(id);
-                    server.routing().never_sent(id, input);
-                    if let Some(running) = facts.running.as_mut() {
-                        running.prompt_pending = false;
-                    }
-                    return None;
-                }
-            },
-            outcome = &mut response => outcome,
-        }
+    sent: Arc<requests::SentTracker>,
+    delivery: Arc<Delivery>,
+) -> Option<PromptResponse> {
+    let by = facts.request_by();
+    let wall = facts.wall;
+    let turn = facts.number;
+    let request_server = Arc::clone(server);
+    let (target, caller, text) = (id.to_owned(), input.to_owned(), prompt.to_owned());
+    let request_sent = Arc::clone(&sent);
+    let exchange = async move {
+        requests::prompt_tracked(
+            request_server.http(),
+            &target,
+            &caller,
+            &text,
+            by,
+            &request_sent,
+        )
+        .await
     };
-    Some(outcome)
+    let finish_server = Arc::clone(server);
+    let (target, caller) = (id.to_owned(), input.to_owned());
+    let result = super::request::owned(
+        server,
+        Arc::clone(&sent),
+        exchange,
+        move |outcome| async move {
+            let Some(outcome) = outcome else {
+                let mut routing = finish_server.routing();
+                routing.request_completed(&target, requests::Sent::No);
+                routing.never_sent(&target, &caller);
+                return None;
+            };
+            let loss = classify_prompt(
+                &finish_server,
+                &target,
+                &caller,
+                &delivery,
+                turn,
+                wall,
+                &outcome,
+            )
+            .await;
+            Some(PromptResponse { outcome, loss })
+        },
+    )
+    .await;
+    match result {
+        Some(response) => response,
+        None if sent.is_sent() => Some(PromptResponse {
+            outcome: Err(requests::HttpError {
+                sent: requests::Sent::Maybe,
+                kind: requests::HttpFailure::Io,
+                response_status: None,
+            }),
+            loss: Some(server.wait_end().await),
+        }),
+        None => {
+            server.routing().request_completed(id, requests::Sent::No);
+            server.routing().never_sent(id, input);
+            None
+        }
+    }
+}
+
+/// §8, §10: effects and loss classification survive a dropped result receiver.
+async fn classify_prompt(
+    server: &Server,
+    id: &str,
+    input: &str,
+    delivery: &Delivery,
+    turn: TurnNumber,
+    wall: Deadline,
+    outcome: &Result<Submission, requests::HttpError>,
+) -> Option<GenerationEnd> {
+    match outcome {
+        Ok(Submission::Accepted) => {
+            let mut routing = server.routing();
+            routing.request_completed(id, requests::Sent::Maybe);
+            routing.accepted(id, input, Instant::now());
+        }
+        Ok(Submission::Status(400 | 404 | 401)) => {
+            if matches!(outcome, Ok(Submission::Status(401))) {
+                server.fail_protocol();
+            }
+            let mut routing = server.routing();
+            routing.request_completed(id, requests::Sent::Maybe);
+            routing.not_accepted(id, input);
+        }
+        Ok(Submission::Status(_) | Submission::Inconclusive) => {
+            server.routing().inconclusive(id, input, Instant::now());
+            server.drain();
+            server
+                .routing()
+                .request_completed(id, requests::Sent::Maybe);
+        }
+        Err(error) if error.is_response_limit() => {
+            let detected_at = Instant::now();
+            server.drain();
+            let mut routing = server.routing();
+            routing.response_limit(id, turn, detected_at);
+            routing.request_completed(id, requests::Sent::Maybe);
+            delivery.response_limit();
+        }
+        Err(error) if error.sent == requests::Sent::No => {
+            let mut routing = server.routing();
+            routing.request_completed(id, requests::Sent::No);
+            routing.never_sent(id, input);
+        }
+        Err(_) => {
+            // Place the boundary before Host's wait so later acceptance cannot erase it.
+            server.routing().inconclusive(id, input, Instant::now());
+            return server.request_lost(wall).await;
+        }
+    }
+    None
 }
 
 async fn submit(
@@ -291,38 +381,33 @@ async fn submit(
     delivery: Arc<Delivery>,
     prompt: &str,
 ) -> TurnEnd {
-    let sent = facts
+    let Some(sent) = facts
         .running
         .as_ref()
-        .map(|running| Arc::clone(&running.sent));
-    let Some(sent) = sent else {
+        .map(|running| Arc::clone(&running.sent))
+    else {
         return facts.rejected(StartRejected::SessionGone);
     };
-    let Some(outcome) = prompt_response(facts, server, id, input, prompt, &sent).await else {
+    let response = prompt_response(
+        facts,
+        server,
+        id,
+        input,
+        prompt,
+        Arc::clone(&sent),
+        Arc::clone(&delivery),
+    )
+    .await;
+    facts.submitted = sent.is_sent();
+    let Some(response) = response else {
         let _sealed = ordered_result(facts, None);
         return facts.rejected(StartRejected::SessionGone);
     };
-    facts.submitted = sent.is_sent();
-    match outcome {
-        Ok(Submission::Accepted) => {
-            {
-                let mut routing = server.routing();
-                routing.request_completed(id);
-                routing.accepted(id, input, Instant::now());
-            }
-            if let Some(running) = facts.running.as_mut() {
-                running.prompt_pending = false;
-            }
-        }
+    if let Some(running) = facts.running.as_mut() {
+        running.request_loss = response.loss;
+    }
+    match response.outcome {
         Ok(Submission::Status(status @ (400 | 404))) => {
-            {
-                let mut routing = server.routing();
-                routing.request_completed(id);
-                routing.not_accepted(id, input);
-            }
-            if let Some(running) = facts.running.as_mut() {
-                running.prompt_pending = false;
-            }
             let mut end = ordered_result(facts, None);
             if end.terminal.is_none() {
                 end = facts.rejected(if status == 404 {
@@ -334,15 +419,6 @@ async fn submit(
             return end;
         }
         Ok(Submission::Status(401)) => {
-            server.fail_protocol();
-            {
-                let mut routing = server.routing();
-                routing.request_completed(id);
-                routing.not_accepted(id, input);
-            }
-            if let Some(running) = facts.running.as_mut() {
-                running.prompt_pending = false;
-            }
             facts.submitted = false;
             return ordered_result(
                 facts,
@@ -352,77 +428,21 @@ async fn submit(
                 }),
             );
         }
-        Ok(Submission::Status(_) | Submission::Inconclusive) => {
-            {
-                let mut routing = server.routing();
-                routing.inconclusive(id, input, Instant::now());
-            }
-            if let Some(running) = facts.running.as_mut() {
-                running.prompt_pending = false;
-            }
-            server.drain();
-            server.routing().request_completed(id);
+        Err(error) if error.is_response_limit() || response.loss.is_some() => {
+            return ordered_result(facts, None);
         }
-        Err(error) => {
-            if let Some(end) = failed_prompt(facts, server, id, input, error).await {
-                return end;
+        Err(error) if error.sent == requests::Sent::No => {
+            facts.submitted = false;
+            let mut end = ordered_result(facts, None);
+            if end.terminal.is_none() && (server.is_draining() || server.failure().is_some()) {
+                end = facts.rejected(StartRejected::SessionGone);
             }
+            return end;
         }
+        Ok(Submission::Accepted | Submission::Status(_) | Submission::Inconclusive) | Err(_) => {}
     }
     delivery.decision().await;
     complete(facts).await
-}
-
-/// §8, §10: place unknown submission before Host's bounded loss classification wait.
-async fn failed_prompt(
-    facts: &mut Turn<'_>,
-    server: &Server,
-    id: &str,
-    input: &str,
-    error: requests::HttpError,
-) -> Option<TurnEnd> {
-    if error.is_response_limit() {
-        // §8–§9: bounds evidence decides this turn, while other sent turns drain.
-        let detected_at = Instant::now();
-        server.drain();
-        {
-            let mut routing = server.routing();
-            routing.response_limit(id, facts.number, detected_at);
-            routing.request_completed(id);
-        }
-        if let Some(running) = facts.running.as_mut() {
-            running.prompt_pending = false;
-            running.delivery.response_limit();
-        }
-        return Some(ordered_result(facts, None));
-    }
-    if error.sent == requests::Sent::No {
-        {
-            let mut routing = server.routing();
-            routing.request_completed(id);
-            routing.never_sent(id, input);
-        }
-        if let Some(running) = facts.running.as_mut() {
-            running.prompt_pending = false;
-        }
-        facts.submitted = false;
-        let mut end = ordered_result(facts, None);
-        if end.terminal.is_none() && (server.is_draining() || server.failure().is_some()) {
-            end = facts.rejected(StartRejected::SessionGone);
-        }
-        return Some(end);
-    }
-    // The boundary precedes Host's wait: acceptance arriving during that
-    // wait can never turn an unknown submission into an accepted one.
-    server.routing().inconclusive(id, input, Instant::now());
-    server.drain();
-    if let Some(end) = server.request_lost(facts.wall).await {
-        if let Some(running) = facts.running.as_mut() {
-            running.request_loss = Some(end);
-        }
-        return Some(ordered_result(facts, None));
-    }
-    None
 }
 
 /// §7.4: the retained terminal stands while reported tool items finish within grace.
@@ -475,14 +495,14 @@ async fn wait_eligible(server: &Server, id: &str, by: Deadline) -> bool {
 
 async fn cleanup_leftovers(
     facts: &Turn<'_>,
-    server: &Server,
+    server: &Arc<Server>,
     id: &str,
 ) -> Result<(), Box<TurnEnd>> {
-    let inbox = tracked(
-        server,
-        Some(id),
-        requests::inbox(server.http(), id, facts.request_by()),
-    )
+    let target = id.to_owned();
+    let by = facts.request_by();
+    let inbox = tracked(server, Some(id), move |http| async move {
+        requests::inbox(&http, &target, by).await
+    })
     .await;
     let inbox =
         inbox.map_err(|error| Box::new(facts.setup_failed("the reopen inbox listing", error)))?;
@@ -498,11 +518,12 @@ async fn cleanup_leftovers(
         if server.routing().failure().is_some() {
             return Err(Box::new(facts.rejected(StartRejected::SessionGone)));
         }
-        let result = tracked(
-            server,
-            Some(id),
-            requests::cancel_leftover(server.http(), id, &input, facts.request_by()),
-        )
+        let target = id.to_owned();
+        let cancel_input = input.clone();
+        let by = facts.request_by();
+        let result = tracked(server, Some(id), move |http| async move {
+            requests::cancel_leftover(&http, &target, &cancel_input, by).await
+        })
         .await;
         result.map_err(|error| {
             Box::new(facts.setup_failed("a leftover inbox cancellation", error))

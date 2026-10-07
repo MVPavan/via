@@ -324,6 +324,15 @@ pub(super) struct Registration {
     last_at: Mutex<Instant>,
 }
 
+/// C2 §3, §9: dropping the consumer closes late-output retention even on task cancellation.
+struct OutputCutoff<'a>(&'a Registration);
+
+impl Drop for OutputCutoff<'_> {
+    fn drop(&mut self) {
+        self.0.retire_output();
+    }
+}
+
 impl Registration {
     pub(super) fn new(
         lane: Arc<Lane>,
@@ -403,6 +412,14 @@ impl Registration {
         let turns = self.turns.lock().unwrap_or_else(PoisonError::into_inner);
         for turn in turns.values() {
             turn.stop(stop);
+            turn.lock().normalizer.retire_output();
+        }
+    }
+
+    fn retire_output(&self) {
+        let turns = self.turns.lock().unwrap_or_else(PoisonError::into_inner);
+        for turn in turns.values() {
+            turn.lock().normalizer.retire_output();
         }
     }
 
@@ -462,6 +479,7 @@ impl Registration {
     /// Ordered queue entries always precede the server's loss signal. A stopped
     /// consumer cannot leave a pending sink reservation capable of sending later.
     pub(super) async fn run(self: Arc<Self>, cancel: CancellationToken, server: Arc<Server>) {
+        let _output_cutoff = OutputCutoff(&self);
         loop {
             if let Some(failure) = self.lane.failure() {
                 self.health_failure(failure);

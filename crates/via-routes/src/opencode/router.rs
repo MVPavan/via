@@ -433,6 +433,8 @@ struct Session {
 /// One server generation's state; its owner serializes HTTP markers and stream decode.
 pub struct Router {
     sessions: HashMap<String, Session>,
+    // Unsettled sent destinations keep a draining generation alive (§8).
+    sent_turns: usize,
     children: HashMap<String, (String, TurnNumber)>,
     order: u64,
     changed: Arc<Notify>,
@@ -459,6 +461,7 @@ impl Router {
         let staging = Arc::new(Staging::new(failure.clone()));
         Self {
             sessions: HashMap::new(),
+            sent_turns: 0,
             children: HashMap::new(),
             order: 0,
             changed,
@@ -600,8 +603,9 @@ impl Router {
         if let Some(session) = self.sessions.get_mut(session)
             && let Some(turn) = session.inputs.get(input)
             && !session.settled.contains(turn)
+            && session.sent.insert(*turn)
         {
-            session.sent.insert(*turn);
+            self.sent_turns += 1;
         }
         self.phase(session, input, InputPhase::Sent);
     }
@@ -621,8 +625,9 @@ impl Router {
     fn remove_sent(&mut self, session: &str, input: &str) {
         if let Some(session) = self.sessions.get_mut(session)
             && let Some(turn) = session.inputs.get(input)
+            && session.sent.remove(turn)
         {
-            session.sent.remove(turn);
+            self.sent_turns -= 1;
         }
     }
 
@@ -650,33 +655,38 @@ impl Router {
         self.changed.notify_waiters();
     }
 
-    /// Counts a session request before send (`opencode.md` §7.2, §9).
+    /// Counts an operation before its pool wait for the execution rule (§7.2).
     pub fn request_started(&mut self, session: &str) {
         self.request_started_for(Some(session));
     }
 
-    /// Counts all HTTP requests, including setup before a vendor ID exists (§8, §9).
+    /// Counts setup and pool waiters for successor admission, not the sent bound (§7.2).
     pub fn request_started_for(&mut self, session: Option<&str>) {
-        if !self.reserve(Resource::Request) {
-            return;
-        }
         if let Some(session) = session.and_then(|session| self.sessions.get_mut(session)) {
             session.state.pending_requests += 1;
         }
         self.changed.notify_waiters();
     }
 
-    /// Complete response or proven withdrawal releases one pending request (§7.2).
-    pub fn request_completed(&mut self, session: &str) {
-        self.request_completed_for(Some(session));
+    /// Reserves the incomplete-response bound only at the first request byte (§8, §9).
+    pub fn request_sent(&mut self) {
+        self.reserve(Resource::Request);
+        self.changed.notify_waiters();
     }
 
-    /// Releases a counted HTTP request, including setup without a vendor ID (§8, §9).
-    pub fn request_completed_for(&mut self, session: Option<&str>) {
+    /// Complete response or proven withdrawal releases successor admission (§7.2).
+    pub fn request_completed(&mut self, session: &str, sent: super::turn::Sent) {
+        self.request_completed_for(Some(session), sent);
+    }
+
+    /// Releases the sent bound only for a request that actually wrote a byte (§8, §9).
+    pub fn request_completed_for(&mut self, session: Option<&str>, sent: super::turn::Sent) {
         if let Some(session) = session.and_then(|session| self.sessions.get_mut(session)) {
             session.state.pending_requests = session.state.pending_requests.saturating_sub(1);
         }
-        self.retained.release(Resource::Request);
+        if sent == super::turn::Sent::Maybe {
+            self.retained.release(Resource::Request);
+        }
         self.changed.notify_waiters();
     }
 
@@ -841,9 +851,7 @@ impl Router {
     /// Whether a sent turn still has a result destination for a server-loss
     /// leftover report; execution admission facts never decide this boundary.
     pub fn has_loss_destination(&self) -> bool {
-        self.sessions
-            .values()
-            .any(|session| !session.sent.is_empty())
+        self.sent_turns > 0
     }
 
     /// Marks a turn settled while retaining every learned correlation key.
@@ -860,7 +868,9 @@ impl Router {
         }
         if let Some(session) = self.sessions.get_mut(session) {
             session.settled.insert(turn);
-            session.sent.remove(&turn);
+            if session.sent.remove(&turn) {
+                self.sent_turns -= 1;
+            }
             session.rejections.settle(turn);
         }
         self.changed.notify_waiters();
@@ -1586,42 +1596,51 @@ mod tests {
         router.attach("ses_b");
         for _ in 0..32 {
             router.request_started("ses_a");
+            router.request_sent();
             router.request_started("ses_b");
+            router.request_sent();
         }
         assert_eq!(observer.failure(), None);
-        router.request_completed("ses_a");
+        router.request_completed("ses_a", super::super::turn::Sent::Maybe);
         router.request_started("ses_b");
+        router.request_sent();
         assert_eq!(observer.failure(), None);
         router.request_started("ses_a");
+        router.request_sent();
         assert_eq!(observer.failure(), Some(LaneFailure::Overflow));
     }
 
     #[test]
-    fn oc09_cleanup_intents_share_pending_http_limit() {
+    fn oc09_cleanup_intents_charge_http_limit_only_after_first_byte() {
         let mut router = Router::new();
         let lane = router.attach("ses_a");
         for _ in 0..63 {
             router.request_started_for(None);
+            router.request_sent();
         }
         owned(&mut router, "ses_a", "input_a", 1);
         router.mark_sent("ses_a", "input_a");
         let by = Deadline::at(Instant::now() + Duration::from_secs(2));
         router.enqueue_cleanup("ses_a", turn(1), by);
         router.enqueue_cleanup("ses_a", turn(1), by);
-        assert_eq!(
-            router.failure(),
-            None,
-            "repeated cleanup reserves no second slot"
-        );
+        assert_eq!(router.failure(), None);
         assert_eq!(router.state("ses_a").unwrap().pending_requests, 1);
         let work = router.pop_pending_cleanup().unwrap();
         assert!(matches!(work.action, CleanupAction::Interrupt));
         assert!(router.pop_pending_cleanup().is_none());
+        router.request_sent();
+        assert_eq!(
+            router.failure(),
+            None,
+            "the first cleanup fits the sent bound"
+        );
         owned(&mut router, "ses_b", "input_b", 1);
         router.mark_sent("ses_b", "input_b");
         router.enqueue_cleanup("ses_b", turn(1), by);
+        assert_eq!(router.failure(), None, "queued cleanup is withdrawable");
+        assert!(router.pop_pending_cleanup().is_some());
+        router.request_sent();
         assert_eq!(lane.failure(), Some(LaneFailure::Overflow));
-        assert!(router.pop_pending_cleanup().is_none());
     }
 
     #[test]
@@ -1676,7 +1695,7 @@ mod tests {
             json!({"inboxID":"input_a"}),
             None,
         );
-        router.request_completed("ses_a");
+        router.request_completed("ses_a", super::super::turn::Sent::Maybe);
         assert!(router.eligible("ses_a"));
         owned(&mut router, "ses_a", "input_b", 2);
         assert!(router.followup_cleanup(&work).is_none());
@@ -2590,6 +2609,29 @@ mod tests {
     }
 
     #[test]
+    fn oc09_running_sent_turns_survive_other_session_settlement_and_duplicate_controls() {
+        let mut router = Router::new();
+        router.register_turn("ses_a", "input_a".into(), turn(1));
+        router.register_turn("ses_b", "input_b".into(), turn(1));
+        router.mark_sent("ses_a", "input_a");
+        router.mark_sent("ses_a", "input_a");
+        router.mark_sent("ses_b", "input_b");
+        router.not_accepted("ses_a", "input_a");
+        router.not_accepted("ses_a", "input_a");
+        router.settle("ses_a", turn(1));
+        assert!(router.has_running_sent_turns());
+        router.never_sent("ses_b", "input_b");
+        router.never_sent("ses_b", "input_b");
+        assert!(!router.has_running_sent_turns());
+        router.mark_sent("ses_b", "input_b");
+        assert!(router.has_running_sent_turns());
+        router.settle("ses_b", turn(1));
+        router.settle("ses_b", turn(1));
+        router.mark_sent("ses_b", "input_b");
+        assert!(!router.has_running_sent_turns());
+    }
+
+    #[test]
     fn oc10_loss_report_excludes_withdrawn_and_proven_not_accepted_inputs() {
         let mut router = Router::new();
         router.register_turn("ses_a", "input_a".into(), turn(1));
@@ -2819,5 +2861,19 @@ mod tests {
             None,
         );
         assert!(routed(lane.pop()).joined_steps.is_empty());
+    }
+    #[test]
+    fn oc09_unsent_requests_do_not_consume_incomplete_response_bound() {
+        let mut router = Router::new();
+        router.session_opened("ses_a");
+        for _ in 0..65 {
+            router.request_started("ses_a");
+        }
+        assert_eq!(router.failure(), None, "pool waiters have no vendor effect");
+        assert_eq!(router.state("ses_a").unwrap().pending_requests, 65);
+        for _ in 0..65 {
+            router.request_completed("ses_a", super::super::turn::Sent::No);
+        }
+        assert_eq!(router.state("ses_a").unwrap().pending_requests, 0);
     }
 }

@@ -877,3 +877,67 @@ async fn reserved_pools_hold_two_each_and_are_isolated() {
     }
     peer.abort();
 }
+
+/// A caller can synchronously withdraw an owned worker before any byte (§8).
+#[tokio::test]
+async fn withdrawn_tracker_prevents_a_later_worker_first_byte() {
+    let (listener, client) = listener().await;
+    let tracker = std::sync::Arc::new(SentTracker::new(|| panic!("withdrawn request was sent")));
+    assert!(tracker.withdraw_before_send());
+    let client = client.with_sent_tracker(std::sync::Arc::clone(&tracker));
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut byte = [0];
+        assert_eq!(stream.read(&mut byte).await.unwrap(), 0);
+    });
+    let error = client
+        .request(get("/withdrawn"), within(2))
+        .await
+        .unwrap_err();
+    peer.await.unwrap();
+    assert_eq!(error.sent, Sent::No);
+    assert!(!tracker.is_sent());
+}
+
+/// Withdrawal cannot close an exchange which already crossed the first-byte boundary (§8).
+#[tokio::test]
+async fn sent_tracker_refuses_withdrawal_and_keeps_its_complete_response() {
+    let (listener, client) = listener().await;
+    let tracker = std::sync::Arc::new(SentTracker::new(|| {}));
+    let peer = serve_once(
+        listener,
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}".to_vec(),
+    );
+    let view = client.with_sent_tracker(std::sync::Arc::clone(&tracker));
+    let request = view.request(get("/sent"), within(2));
+    tokio::pin!(request);
+    // Both waits preserve tracker evidence and the pinned response future.
+    tokio::select! {
+        () = tracker.sent() => {},
+        result = &mut request => {
+            assert_eq!(result.unwrap().status, 200);
+            assert!(!tracker.withdraw_before_send());
+            peer.await.unwrap();
+            return;
+        },
+    }
+    assert!(!tracker.withdraw_before_send());
+    assert_eq!(request.await.unwrap().status, 200);
+    peer.await.unwrap();
+}
+
+/// A tracked per-request view shares the original generation's drain gate (§8).
+#[tokio::test]
+async fn tracked_client_view_preserves_the_shared_general_gate() {
+    let (_listener, client) = listener().await;
+    let tracker = std::sync::Arc::new(SentTracker::new(|| panic!("drained request was sent")));
+    let view = client.with_sent_tracker(tracker);
+    client.close_general(|| ());
+    assert_eq!(
+        view.request(get("/drained"), within(2))
+            .await
+            .unwrap_err()
+            .sent,
+        Sent::No
+    );
+}

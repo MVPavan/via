@@ -5,7 +5,7 @@
 //! execution facts under §7.2. It also owns the never-ask pump (§11) and
 //! drains unknown request effects without ending already-sent turns (§8).
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
@@ -19,6 +19,8 @@ use super::events::{self, DecodeError};
 use super::router::{Router, RouterFailure};
 use super::servers::Servers;
 use crate::codex::{ConnectionLoss, LossCause};
+
+mod requests;
 
 /// §9: 45 s without a byte on the event stream is transport loss.
 pub const SILENCE: Duration = Duration::from_secs(45);
@@ -71,6 +73,10 @@ pub struct Server {
     routing: Mutex<Router>,
     /// One snapshot, completed before server loss reaches any driver.
     leftovers: Mutex<Option<via_wire::LeftoverReport>>,
+    /// Current HTTP operations remain generation-owned through their §8 timeout.
+    requests: Mutex<JoinSet<()>>,
+    /// Includes sent setup whose original caller no longer waits (§8).
+    request_jobs: AtomicUsize,
 }
 
 impl std::fmt::Debug for Server {
@@ -108,6 +114,8 @@ impl Server {
             discarded: AtomicU64::new(0),
             routing: Mutex::new(routing),
             leftovers: Mutex::new(None),
+            requests: Mutex::new(JoinSet::new()),
+            request_jobs: AtomicUsize::new(0),
         }
     }
 
@@ -254,6 +262,7 @@ impl Server {
 
     /// Marks the generation retiring (before its stdin closes).
     pub(crate) fn retire(&self) {
+        let _requests = self.requests.lock().unwrap_or_else(PoisonError::into_inner);
         self.http
             .close_general(|| self.retiring.store(true, Ordering::Release));
         self.activity.notify_waiters();
@@ -324,6 +333,7 @@ pub(crate) async fn run(
     // A completed pump needs no cancellation; its outcome is already collected.
     let _cancelled = cancel.send(());
     finish_tasks(&mut tasks).await;
+    server.finish_requests().await;
     let end = if retired {
         GenerationEnd::Retired
     } else {
@@ -360,6 +370,11 @@ async fn read(
             _outcome = tasks.join_next(), if !tasks.is_empty() => {
                 // The pump stays until cancellation; panic or early return fails closed.
                 return LossCause::Protocol;
+            },
+            outcome = server.next_request() => {
+                if outcome.is_err() {
+                    return LossCause::Protocol;
+                }
             },
             event = stream.next_event(SILENCE) => match event {
                 Ok(Some(event)) => {

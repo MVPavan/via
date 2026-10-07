@@ -438,7 +438,7 @@ async fn retired_after_setup(rig: &Rig) -> bool {
 }
 
 #[test]
-fn oc05_c2_cancelled_setup_drains_and_rejects_pinned_reopened_prompt() {
+fn oc05_c2_timed_out_setup_drains_and_rejects_pinned_reopened_prompt() {
     run(async {
         let rig = Rig::new(&json!({}));
         let cwd = rig.root().to_str().unwrap().to_owned();
@@ -470,7 +470,16 @@ fn oc05_c2_cancelled_setup_drains_and_rejects_pinned_reopened_prompt() {
             }
         );
         let was_pinned = matches!(held, Prepared::Pinned(_));
-        let draining = matches!(inspector.driver.prepare(), Prepared::NeedsConnection);
+        let by = tokio::time::Instant::now() + Duration::from_secs(1);
+        let draining = loop {
+            if matches!(inspector.driver.prepare(), Prepared::NeedsConnection) {
+                break true;
+            }
+            if tokio::time::Instant::now() >= by {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
         let retired = retired_after_setup(&rig).await;
         first.close().await;
         row(&rig, 1, "failed");
@@ -484,7 +493,7 @@ fn oc05_c2_cancelled_setup_drains_and_rejects_pinned_reopened_prompt() {
         let requests = rig.requests();
         rig.finish().await;
         assert!(was_pinned, "capture the old pin before the setup timeout");
-        assert!(draining, "§8 withdraws an unanswered setup generation");
+        assert!(draining, "§8 drains after the sent setup response timeout");
         assert!(retired, "§8 retires despite the old pin and idle driver");
         assert!(end.terminal.is_none());
         assert!(

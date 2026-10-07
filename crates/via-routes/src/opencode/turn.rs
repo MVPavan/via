@@ -1,12 +1,12 @@
 //! Turn submission and reopen inbox cleanup (§6, §7.2). No request is retried.
 
 use serde::Deserialize;
-use via_wire::http::{BODY_BYTES, HttpClient, HttpRequest, HttpResponse, Method, Pool};
+use via_wire::http::{BODY_BYTES, HttpRequest, HttpResponse, Method, Pool};
 use via_wire::json_limits;
 
 use crate::Deadline;
 /// Wire-owned request evidence used by adapter cancellation (`opencode.md` §7.4, §8).
-pub use via_wire::http::{HttpError, HttpFailure, Sent, SentTracker};
+pub use via_wire::http::{HttpClient, HttpError, HttpFailure, Sent, SentTracker};
 
 /// The inbox has the ordinary HTTP response limit (`opencode.md` §9).
 /// The packet grants a larger body only to `/api/model`, not echoed inboxes.

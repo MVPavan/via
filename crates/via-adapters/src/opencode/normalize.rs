@@ -19,6 +19,13 @@ const FINAL_TEXT_CANDIDATE_BYTES: usize = 4 * 1024 * 1024;
 /// §9: a logical charge for each ordinal's key, String and map bookkeeping, even empty text.
 const FINAL_TEXT_ENTRY_BYTES: usize = 64;
 
+/// §9: output snapshots retire once, while tombstone attribution remains available.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum OutputRetention {
+    Pending,
+    Retired,
+}
+
 /// Only events already attributed to this turn enter its normalizer.
 pub(super) struct Normalizer {
     last_step: Option<String>,
@@ -27,6 +34,7 @@ pub(super) struct Normalizer {
     text_bytes: usize,
     text_overflow: bool,
     samples: BTreeMap<String, Sample>,
+    output_retention: OutputRetention,
     interval_unverified: bool,
     via_interrupt: bool,
     declined_calls: BTreeSet<String>,
@@ -48,11 +56,22 @@ impl Normalizer {
             text_bytes: 0,
             text_overflow: false,
             samples: BTreeMap::new(),
+            output_retention: OutputRetention::Pending,
             interval_unverified: false,
             via_interrupt: false,
             declined_calls: BTreeSet::new(),
             tool_actions: BTreeMap::new(),
         }
+    }
+
+    /// §9, C2 §3: terminal snapshots or closed late admission release bulky output state.
+    pub(super) fn retire_output(&mut self) {
+        self.output_retention = OutputRetention::Retired;
+        self.text.clear();
+        self.text_bytes = 0;
+        self.samples.clear();
+        self.last_step = None;
+        self.finish = None;
     }
 
     /// `opencode.md` §7.4: caller-owned interrupt evidence, not an HTTP acknowledgement.
@@ -220,7 +239,7 @@ impl Normalizer {
 
     /// §9: reject before copying, release replacements, and keep turn overflow sticky.
     fn retain_text(&mut self, ordinal: u64, text: &str) {
-        if self.text_overflow {
+        if self.output_retention == OutputRetention::Retired || self.text_overflow {
             return;
         }
         let replaced = self
@@ -250,6 +269,9 @@ impl Normalizer {
     }
 
     fn start_step(&mut self, assistant_message_id: &str) {
+        if self.output_retention == OutputRetention::Retired {
+            return;
+        }
         // Every known call needs an end sample; no end must not leave
         // the aggregate reporting only the other calls' usage.
         self.samples
@@ -294,14 +316,16 @@ impl Normalizer {
             total: None,
             interval_unverified,
         };
-        self.samples.insert(
-            key.to_owned(),
-            Sample {
-                usage: usage.clone(),
-                cost,
-                cache_write: tokens.and_then(|tokens| tokens.cache_write),
-            },
-        );
+        if self.output_retention == OutputRetention::Pending {
+            self.samples.insert(
+                key.to_owned(),
+                Sample {
+                    usage: usage.clone(),
+                    cost,
+                    cache_write: tokens.and_then(|tokens| tokens.cache_write),
+                },
+            );
+        }
         vec![Observation::Progress(ProgressMarks {
             usage: Some(usage),
             ..ProgressMarks::default()
