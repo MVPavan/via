@@ -15,15 +15,17 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
+from opencode_cases import Case, DriverAdapter, case_anchor
 from opencode_driver import Driver
 from opencode_safety import Blocked, Identity, ProcReader, StopJournal, PRIVATE_PARTS
 
 # Each role is a plain stdlib Python fake. No daemon/vendor executable is invoked.
 FAKE_ROLES = r'''
-import ctypes,json,os,signal,subprocess,sys,time
+import ctypes,json,os,signal,subprocess,sys,threading,time
 from pathlib import Path
 root=Path(sys.argv[2]); role=sys.argv[1]; mode=sys.argv[3]
 libc=ctypes.CDLL(None,use_errno=True)
@@ -55,6 +57,9 @@ elif role=='anchor':
     publish('anchor.json',{**identity(),'vendor_pid':child.pid})
     while True: time.sleep(.01)
 elif role=='daemon':
+    def worker():
+        while True: time.sleep(.005)
+    threading.Thread(target=worker,daemon=True).start()
     read_end,write_end=os.pipe()
     stderr_read,stderr_write=os.pipe()
     os.set_blocking(stderr_read,False)
@@ -198,55 +203,199 @@ class OwnedBarrierFixture:
 
 
 class BarrierTests(unittest.TestCase):
-    def test_l14_cooperative_parent_death_while_real_daemon_stopped(self):
+    def run_staged_case(self, fixture):
+        """Use the live case/adapter chain; only fixture acquisition is synthetic."""
+        driver = fixture.driver
+        adapter = DriverAdapter(driver)
+        adapter.end = time.monotonic() + 10
+        case = Case("anchor")
+        source = driver.observe
+        successors = []
+
+        def observed(kind, target=None):
+            if kind == "interruption":
+                return {"interrupted": False}
+            if kind == "lifecycle_capabilities":
+                return {"source_schema_proven": True, "points": {"publication": True}}
+            if kind == "lifecycle_successor":
+                predecessor = Identity(**target["predecessor"])
+                self.assertTrue(fixture.proc.gone(predecessor))
+                successors.append(predecessor)
+                # The acquired generation is synthetic; death and signal replies are real.
+                return {"admitted": True, "parallel_servers": 0, "password_changed": True}
+            return source(kind, target)
+
+        sample = {"host_launched": True, "reached": True, "live_pin": True,
+                  "retirement_inflight": False, "lock_holders": [driver.anchor.report()],
+                  "anchor_identity": driver.anchor.report(),
+                  "daemon_identity": driver.daemon.report(),
+                  "vendor_identity": driver.vendor_identity.report(),
+                  "info_pid": driver.vendor_identity.pid, "record_pid": driver.vendor_identity.pid}
+        with mock.patch("opencode_cases.L14_POINTS", ("publication",)), \
+                mock.patch.object(driver, "lifecycle", return_value=sample), \
+                mock.patch.object(driver, "observe", side_effect=observed), \
+                mock.patch.object(driver, "signal_barrier", wraps=driver.signal_barrier) as calls:
+            try:
+                case_anchor(adapter, case)
+            finally:
+                operations = [call.args[0]["operation"] for call in calls.call_args_list]
+                self.assertEqual(operations, ["daemon_sigstop", "anchor_sigkill",
+                                              "vendor_death", "daemon_sigcont"])
+        self.assertEqual(len(successors), 1)
+        self.assertEqual(case.finish()["result"], "pass")
+        return case
+
+    def assert_resumed(self, fixture):
+        self.assertTrue(fixture.proc.alive(fixture.identities["daemon"]))
+        self.assertNotIn(fixture.proc.stat(fixture.identities["daemon"].pid)["state"], {"T", "t"})
+        self.assertFalse(fixture.driver.journal.path.exists())
+
+    def test_l14_cooperative_live_case_staged_chain(self):
         with OwnedBarrierFixture("cooperative") as fixture:
-            result = fixture.driver.signal_barrier(fixture.sample())
-            for fact in ("daemon_stopped", "stop_identity_persisted", "stdin_held",
-                         "anchor_pid_only", "vendor_gone_within_1s", "daemon_resumed"):
-                self.assertIs(result[fact], True)
-            self.assertLess(result["death_elapsed_s"], 1)
+            case = self.run_staged_case(fixture)
             self.assertTrue(fixture.proc.gone(fixture.identities["vendor"]))
             self.assertTrue(fixture.proc.gone(fixture.identities["anchor"]))
-            self.assertTrue(fixture.proc.alive(fixture.identities["daemon"]))
-            self.assertNotIn(fixture.proc.stat(fixture.identities["daemon"].pid)["state"], {"T", "t"})
-            self.assertFalse(fixture.driver.journal.path.exists())
-            # Driver retains the real-vendor N5 limit; fake stderr reader never closed.
-            self.assertIs(result["stderr_sigpipe_limitation"], True)
+            self.assert_resumed(fixture)
+            self.assertTrue(any("SIGPIPE" in note for note in case.limitations))
 
-    def test_l14_survivor_fails_death_proof_resumes_and_fences_successor(self):
+    def test_l14_survivor_live_case_staged_chain_resumes_and_fences(self):
         with OwnedBarrierFixture("survivor") as fixture:
             started = time.monotonic()
             with self.assertRaisesRegex(Blocked, "vendor survived"):
-                fixture.driver.signal_barrier(fixture.sample())
+                self.run_staged_case(fixture)
             self.assertGreaterEqual(time.monotonic() - started, 1)
             self.assertTrue(fixture.proc.alive(fixture.identities["vendor"]))
             written = fixture.wait_json("stderr-written.json")
             self.assertTrue(written["written"])
             self.assertEqual(written["pid"], fixture.identities["vendor"].pid)
             self.assertTrue(fixture.wait_json("stderr-drained.json")["received"])
-            self.assertNotIn(fixture.proc.stat(fixture.identities["daemon"].pid)["state"], {"T", "t"})
-            self.assertFalse(fixture.driver.journal.path.exists())
-            # Exercise actual admission guard: a real living predecessor blocks before launch.
+            self.assert_resumed(fixture)
             with mock.patch.object(fixture.driver, "ensure_vendor") as launch:
                 with self.assertRaisesRegex(Blocked, "predecessor not gone"):
                     fixture.driver.observe("lifecycle_successor", {
                         "predecessor": fixture.identities["vendor"].report()})
                 launch.assert_not_called()
-            evidence = list(fixture.driver.evidence.glob("*-l14.json"))
-            self.assertEqual(len(evidence), 1)
-            result = json.loads(evidence[0].read_bytes())
-            self.assertIs(result["vendor_gone_within_1s"], False)
-            self.assertIs(result["daemon_resumed"], True)
+
+    def test_l14_staged_stop_polls_lagging_worker_before_kill(self):
+        with OwnedBarrierFixture("cooperative") as fixture:
+            taskroot = Path("/proc") / str(fixture.driver.daemon.pid) / "task"
+            workers = [int(path.name) for path in taskroot.iterdir()
+                       if int(path.name) != fixture.driver.daemon.pid]
+            self.assertTrue(workers)
+            original = fixture.driver.proc.parse_stat
+            lagged = []
+
+            def parsed(raw, pid):
+                row = original(raw, pid)
+                if pid == workers[0] and row["state"] in {"T", "t"} and not lagged:
+                    lagged.append(pid)
+                    return {**row, "state": "R"}
+                return row
+
+            started = time.monotonic()
+            with mock.patch.object(fixture.driver.proc, "parse_stat", side_effect=parsed):
+                self.run_staged_case(fixture)
+            self.assertLess(time.monotonic() - started, 5)
+            self.assertEqual(lagged, [workers[0]])
+            self.assert_resumed(fixture)
+
+    def test_l14_staged_unstopped_worker_exhausts_five_second_bound(self):
+        with OwnedBarrierFixture("cooperative") as fixture:
+            driver = fixture.driver
+            taskroot = Path("/proc") / str(driver.daemon.pid) / "task"
+            worker = next(int(path.name) for path in taskroot.iterdir()
+                          if int(path.name) != driver.daemon.pid)
+            original = driver.proc.parse_stat
+            ticks = []
+
+            def clock():
+                ticks.append(len(ticks))
+                return float(ticks[-1])
+
+            def unstopped(raw, pid):
+                row = original(raw, pid)
+                return {**row, "state": "R"} if pid == worker else row
+
+            try:
+                with mock.patch("opencode_driver.time",
+                                SimpleNamespace(monotonic=clock, sleep=time.sleep)), \
+                        mock.patch.object(driver.proc, "parse_stat", side_effect=unstopped):
+                    with self.assertRaisesRegex(Blocked, "thread-group stop deadline exhausted"):
+                        driver.signal_barrier({"operation": "daemon_sigstop",
+                                               "identity": driver.daemon.report()})
+            finally:
+                driver.signal_barrier({"operation": "daemon_sigcont", "identity": driver.daemon.report()})
+            self.assertEqual(ticks[-1], 5)
+            self.assertIsNone(driver._sigkill_at)
+            self.assertTrue(fixture.proc.alive(fixture.identities["anchor"]))
+            self.assert_resumed(fixture)
+
+    def test_l14_staged_stopped_group_at_deadline_cannot_pass(self):
+        with OwnedBarrierFixture("cooperative") as fixture:
+            driver = fixture.driver
+            observed_threads = []
+            original = driver.proc.parse_stat
+
+            def stopped(raw, pid):
+                row = original(raw, pid)
+                if pid != driver.daemon.pid:
+                    observed_threads.append(row["state"])
+                return row
+
+            # The leader is really stopped; model the elapsed leader wait/scan
+            # reaching the shared deadline before all-thread proof is accepted.
+            clock = mock.Mock(side_effect=[0.0, 5.0])
+            try:
+                with mock.patch("opencode_driver.time",
+                                SimpleNamespace(monotonic=clock, sleep=time.sleep)), \
+                        mock.patch.object(driver.proc, "parse_stat", side_effect=stopped):
+                    with self.assertRaisesRegex(Blocked, "thread-group stop deadline exhausted"):
+                        driver.signal_barrier({"operation": "daemon_sigstop",
+                                               "identity": driver.daemon.report()})
+            finally:
+                driver.signal_barrier({"operation": "daemon_sigcont", "identity": driver.daemon.report()})
+            self.assertTrue(observed_threads)
+            self.assertTrue(all(state in {"T", "t"} for state in observed_threads))
+            self.assertIsNone(driver._sigkill_at)
+            self.assertTrue(fixture.proc.alive(fixture.identities["anchor"]))
+            self.assert_resumed(fixture)
+
+    def test_l14_staged_missing_daemon_row_blocks_without_killing_anchor(self):
+        with OwnedBarrierFixture("cooperative") as fixture:
+            driver = fixture.driver
+            driver.signal_barrier({"operation": "daemon_sigstop", "identity": driver.daemon.report()})
+            original = driver.proc.stat
+            daemon_reads = []
+
+            def vanished(pid):
+                if pid == driver.daemon.pid:
+                    daemon_reads.append(pid)
+                    # verify(alive) reads twice; the subsequent independent sample vanishes.
+                    if len(daemon_reads) == 3:
+                        return None
+                return original(pid)
+
+            try:
+                with mock.patch.object(driver.proc, "stat", side_effect=vanished):
+                    with self.assertRaisesRegex(Blocked, "daemon barrier not held"):
+                        driver.signal_barrier({"operation": "anchor_sigkill",
+                                               "identity": driver.anchor.report(), "group": False})
+            finally:
+                driver.signal_barrier({"operation": "daemon_sigcont", "identity": driver.daemon.report()})
+            self.assertTrue(fixture.proc.alive(fixture.identities["anchor"]))
+            self.assert_resumed(fixture)
 
     def test_l14_prekill_observation_failure_still_resumes_owned_daemon(self):
         with OwnedBarrierFixture("cooperative") as fixture:
-            with mock.patch.object(fixture.driver, "_stdin_held", side_effect=Blocked("stdin uncertain")):
+            with mock.patch.object(fixture.driver, "_stdin_held", side_effect=Blocked("stdin uncertain")), \
+                    mock.patch.object(fixture.driver, "_staged_signal", wraps=fixture.driver._staged_signal) as staged:
                 with self.assertRaisesRegex(Blocked, "stdin uncertain"):
                     fixture.driver.signal_barrier(fixture.sample())
+                self.assertEqual([call.args[0]["operation"] for call in staged.call_args_list],
+                                 ["daemon_sigstop", "daemon_sigcont"])
             self.assertTrue(fixture.proc.alive(fixture.identities["anchor"]))
             self.assertTrue(fixture.proc.alive(fixture.identities["vendor"]))
-            self.assertNotIn(fixture.proc.stat(fixture.identities["daemon"].pid)["state"], {"T", "t"})
-            self.assertFalse(fixture.driver.journal.path.exists())
+            self.assert_resumed(fixture)
 
 
 def test_names():

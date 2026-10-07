@@ -1202,7 +1202,7 @@ stands. Items that gate route enablement (L4, L5, L14) say so.
 | L10 macOS | Platform deferred | Run OC01–OC12 on macOS under the platform contract |
 | L11 new-version credential shape | A new version's `/api/integration` may change shape or carry values | Before a version joins `checked`, rerun E41's synthetic-credential probe with every other gate (L4, L5, L14) |
 | L12 other unobserved | `superseded` and `inactivity` interrupt reasons; agent `steps`; durable replay; `OPENCODE_DISABLE_AUTOUPDATE` behaviour; truncated-body handling (E56) | Probe each at the next pin review |
-| L14 (gate) server dies with its anchor | The fence (§3.2) holds only while the server keeps the parent-death signal Host set, stays the process Host spawned, and never holds `server.lock`; OC02b shows Host's side with a fake vendor, not the real server's behaviour | **Gates route enablement and every pin review.** With the pinned real OpenCode, each sample is one server generation started through the real Host launch with a test barrier, e.g. SIGSTOP of the private daemon, holding Host and the route from retiring the generation or closing its stdin, and driven to a point in its life: just after publication, during and after each spawn path (the model's tool runner, location and session shells, a project MCP stdio server, LSP and a plugin spawn), after each reload the version offers (for example a project configuration change or instance disposal, where the API has one), and after a long run. At each point: (1) a same-uid scan of `/proc/*/fdinfo` finds the `server.lock` flock line only on the anchor's descriptor, never on the server or any descendant; (2) `/api/info.pid` equals the spawned pid, and the server record names it; (3) `SIGKILL` the anchor's pid alone, never its group; (4) the server process (pid and start ticks) is gone within 1 s, and a new generation's configuration admits after its predecessor check. Step 4 after the reload points shows the parent-death signal still in force at the tested life points; it observes the effect directly, where `exe`, `comm` and the start ticks cannot (a self re-exec from a worker leaves all three unchanged). It does not prove that the server never executes from a non-leader thread (§3.2), only that no sampled point lost the signal. **Pass:** every sample. **Fail:** any server surviving its anchor, any lock line outside the anchor, or a server whose pid differs from the spawned one; OpenCode qualification then fails until resolved |
+| L14 (gate) server dies with its anchor | The fence (§3.2) holds only while the server keeps the parent-death signal Host set, stays the process Host spawned, and never holds `server.lock`; OC02b shows Host's side with a fake vendor, not the real server's behaviour | **Gates route enablement and every pin review.** With the pinned real OpenCode, each sample is one server generation started through the real Host launch with a test barrier, e.g. SIGSTOP of the private daemon, holding Host and the route from retiring the generation or closing its stdin, and driven to a point in its life: just after publication, during and after each spawn path (the model's tool runner, location and session shells, a project MCP stdio server, LSP when offered by the pinned configured-read probe, and a plugin spawn), after each reload the version offers (for example a project configuration change or instance disposal, where the API has one), and after a long run. At each point: (1) a same-uid scan of `/proc/*/fdinfo` finds the `server.lock` flock line only on the anchor's descriptor, never on the server or any descendant; (2) `/api/info.pid` equals the spawned pid, and the server record names it; (3) `SIGKILL` the anchor's pid alone, never its group; (4) the server process (pid and start ticks) is gone within 1 s, and a new generation's configuration admits after its predecessor check. Step 4 after the reload points shows the parent-death signal still in force at the tested life points; it observes the effect directly, where `exe`, `comm` and the start ticks cannot (a self re-exec from a worker leaves all three unchanged). It does not prove that the server never executes from a non-leader thread (§3.2), only that no sampled point lost the signal. **Pass:** every sample. **Fail:** any server surviving its anchor, any lock line outside the anchor, or a server whose pid differs from the spawned one; OpenCode qualification then fails until resolved |
 
 ### Qualification runner
 
@@ -1215,27 +1215,37 @@ scratchpad, and either `--opencode` for the verified read-only pin or `--acquire
 for official exact-version acquisition. Both VIA hashes are recorded. Seam
 cases use the test-only build; L14 and the other gates use release VIA.
 Before acquisition or any start, `--fake-gate-manifest` (defaulting to the
-worktree's saved qualification artifact) must show successful fake gates and
-the required seam tests, bound to the current Rust source and both supplied
+`scratchpad/execution/oc-live/fake-gate-manifest.json`) must show successful fake
+gates and the required seam tests, bound to the current Rust source and both supplied
 VIA hashes. Missing or stale proof blocks; a live observation never substitutes
 an invented fake-control result.
 
 The runner carries `claude.py`'s cooperative same-user threat model, strict
 reply schemas, bounded loops, deferred signals, pid plus start-tick identities,
 positive stop proofs and rule that unverifiable evidence never passes. Pinned
-acquisition uses plain HTTPS, never npm/npx; npm SHA-512 precedes extraction and
-the packet's SHA-256 follows it. Size bounds, a read-only binary/directory and
-an end re-hash apply. The owner's 2.0.24 on PATH stays refused.
+acquisition uses plain HTTPS, never npm/npx. Registry SHA-512 and unpacked size
+must equal the runner's reviewed constants before the archive is fetched; the
+archive SHA-512 is verified before decompression, and the packet's binary
+SHA-256 follows extraction. The reviewed unpacked size is 204482252 bytes.
+An alternative npm platform archive needs the same reviewed archive anchors;
+unanchored GitHub fallback is disabled. A read-only binary/directory and an
+end re-hash apply. The owner's 2.0.24 on PATH stays refused. System `rg` and
+`python3` are checked before acquisition.
 
 The qualification-only password exception reads the exact password key once
 from the verified owned vendor's initial environment, in memory only. Evidence
 and rotation comparisons return Booleans; the password and bearer handles are
-never written. Structural spending controls are checked before model-capable
-requests: known empty integrations, an environment allow-list, frozen free
+never written. Scans cover evidence, fixture content, private logs and the
+owned VIA store. Credential/config files and vendor databases remain
+metadata-only exclusions, reported as a proof limitation; synthetic provider
+values in their fixture config are labelled input, never evidence of secrecy.
+Returned bearer handles join the in-memory forbidden forms. Structural spending
+controls are checked before model-capable requests: known empty integrations, an environment allow-list, frozen free
 catalog/session identities, and loopback endpoints for every overridden
 provider. Missing cost is unavailable; positive cost or a paid identity stops
-admission. Public-free results and synthetic token/cache/compaction observations
-are labelled separately. No network-destination sampling can establish a gate.
+admission. Session shell requests consume no model turn unless they invoke a
+model-capable path. Public-free results and synthetic token/cache/compaction
+observations are labelled separately. No network-destination sampling can establish a gate.
 
 The private namespace's 0700 directory chain and fixture Git repositories with
 private initial commits prevent untested ancestor walk-up. A mandatory sentinel
@@ -1248,13 +1258,39 @@ short private `/tmp/via-*` roots for hand-started processes when a scratchpad
 socket path is too long; fixture project/namespace roots remain in the worktree.
 
 L14 persists a stopped daemon's identity before SIGSTOP and verifies pid plus
-start ticks before SIGCONT, including recovery on the next runner start. A
+start ticks before SIGCONT, including recovery on the next runner start. Missing
+recovery parents are created privately without changing existing common
+parents. A definitively exited old identity clears its journal with a record
+and no signal; a reused pid never authorizes signalling its new identity.
+SIGINT, SIGTERM, SIGHUP and SIGQUIT are deferred through continuation and
+cleanup. Run under tmux or nohup; SIGKILL cannot run cooperative cleanup.
+Providers are shut down in `finally`, even if process cleanup fails. A
 death sample can also be caused by SIGPIPE on stderr; the runner records this
 limitation, rather than claiming a unique signal cause. OC03 proves only that
 history still exists. Inheritance is frozen by daemon configuration: requested
 states use fresh private daemons, two locations with the same fixed inheritance
 share one server, and the cross-request same-server case retains OC02 fake
 proof. No daemon reload command or new per-request CLI setting is introduced.
+
+A configured fake LSP receives a custom fixture extension and an attempted
+native file-read tool call through the mock provider. Served config, the actual
+read attempt and mock receipt establish the probe; a bounded absence of its
+spawn marker records `lsp: not offered by pinned 2.0.22`. That exception skips
+only L5/L14 LSP checks. A positive probe requires a read and observed LSP spawn
+in the L5 fixture and each L14 LSP sample. Missing read-attempt evidence blocks
+the probe. Other lifecycle points come from observed process/API/config evidence. An absent
+reload/disposal API is a labelled limitation; an offered but unsampled path
+cannot pass. Synthetic compaction and cache observations carry the `FAKE` label.
+The current runner defers L1 collision observations, L6 alternate field forms
+and L12 other shapes until a bounded trigger exists, without turning an empty
+observation into a pass.
+
+Each turn keeps the supported `full` bound: C1 advertises only `full` (§5), so
+this runner cannot select a narrower network bound without a separate public
+contract change. Incremental phase records survive a later infrastructure
+failure, with the same password/bearer checks as the final evidence sink. SSE
+handshakes use a bounded timeout; accepted streams clear that socket timeout
+and retain the absolute phase watchdog.
 
 ## 14. Owner questions and revisit items
 

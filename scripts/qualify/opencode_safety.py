@@ -17,6 +17,8 @@ import io
 import json
 import math
 import os
+import posixpath
+import re
 from pathlib import Path, PurePosixPath
 import shutil
 import select
@@ -36,12 +38,17 @@ from dataclasses import dataclass
 
 PINNED_SHA256 = "32cf5aa0a69a650e36277e3315d189835ddc79fb9aa1d0aef5025be5af5ad122"
 NPM_URL = "https://registry.npmjs.org/@opencode/cli-linux-x64/-/cli-linux-x64-2.0.22.tgz"
+# Packet §§2, 13 qualification acquisition: reviewed unpacked archive size.
+NPM_UNPACKED_SIZE = 204482252
 NPM_SHA512 = ("DlV1qgEDDnVqpTWMPqv7tCHCcXodzZBFaMcxjsiYdY6E5gHH2Q68JfasVksyQ1n"
               "u6m1887WQKGhOsepE+oKyYw==")
 # Qualification plan acquisition and packet §9 observation bounds.
 ARCHIVE_BYTES = 256 * 1024 * 1024
 PROC_BYTES = 256 * 1024
 HTTP_BYTES = 16 * 1024 * 1024
+# Qualification §13 OC01: bound route normalization work and ambiguity.
+API_PATH_BYTES = 8 * 1024
+API_DECODE_ROUNDS = 8
 PASSWORD_KEY = b"OPENCODE_PASSWORD"
 FREE_IDENTITY = "opencode/mimo-v2.6-flash-free"
 MOCK_IDENTITY = "oclive-mock/fixture-free"
@@ -650,11 +657,14 @@ def _fetch_worker():
 
 
 def extract_pinned_npm(archive, directory, *, integrity=NPM_SHA512,
-                       unpacked_size=204482252, expected_sha=PINNED_SHA256,
+                       unpacked_size=NPM_UNPACKED_SIZE, expected_sha=PINNED_SHA256,
                        binary_name="package/bin/opencode"):
     """Verify SHA-512 before bounded regular-entry extraction, then packet SHA-256."""
+    if not isinstance(integrity, str) or integrity.removeprefix("sha512-") != NPM_SHA512 \
+            or type(unpacked_size) is not int or unpacked_size != NPM_UNPACKED_SIZE:
+        raise Blocked("npm metadata does not match reviewed pin")
     if len(archive) > ARCHIVE_BYTES or base64.b64encode(hashlib.sha512(archive).digest()).decode() \
-            != integrity.removeprefix("sha512-"):
+            != NPM_SHA512:
         raise Blocked("npm archive integrity mismatch")
     seen, total, binary = set(), 0, None
     try:
@@ -698,8 +708,13 @@ def extract_pinned_npm(archive, directory, *, integrity=NPM_SHA512,
     return binary_path
 
 
-def extract_pinned_release(archive, directory, *, expected_sha=PINNED_SHA256):
-    """Official same-tag release bytes still require bounded archive and packet pin."""
+def extract_pinned_release(archive, directory, *, expected_sha=PINNED_SHA256, archive_sha512=None):
+    """Only a separately reviewed pre-parse archive hash admits release extraction."""
+    if not archive_sha512:
+        raise Blocked("official release pre-parse hash required")
+    if not isinstance(archive_sha512, str) or base64.b64encode(
+            hashlib.sha512(archive).digest()).decode() != archive_sha512.removeprefix("sha512-"):
+        raise Blocked("official release archive integrity mismatch")
     if len(archive) > ARCHIVE_BYTES:
         raise Blocked("official release download exceeds bound")
     seen, total, binary = set(), 0, None
@@ -986,6 +1001,44 @@ def loopback_origin(value):
     return f"http://127.0.0.1:{port}"
 
 
+def normalized_api_path(path):
+    """Repeated decoding guards credential routes; reject ambiguous routes (§13 OC01)."""
+    if not isinstance(path, str):
+        raise Blocked("ambiguous API path")
+    try:
+        if len(path.encode("ascii")) > API_PATH_BYTES:
+            raise Blocked("ambiguous API path")
+    except UnicodeError as error:
+        raise Blocked("ambiguous API path") from error
+    if not path.startswith("/") or path.startswith("//") or "\r" in path or "\n" in path:
+        raise Blocked("API path changes owned origin")
+    if any(ord(char) < 32 or ord(char) == 127 for char in path) or "#" in path:
+        raise Blocked("ambiguous API path")
+    parts = urllib.parse.urlsplit(path)
+    if parts.netloc or parts.scheme:
+        raise Blocked("API path changes owned origin")
+    if parts.fragment:
+        raise Blocked("ambiguous API path")
+    decoded = parts.path
+    for _iteration in range(API_DECODE_ROUNDS):
+        if re.search(r"%(?![0-9A-Fa-f]{2})", decoded):
+            raise Blocked("ambiguous API path")
+        try:
+            following = urllib.parse.unquote(decoded, encoding="utf-8", errors="strict")
+        except UnicodeError as error:
+            raise Blocked("ambiguous API path") from error
+        if following == decoded:
+            break
+        decoded = following
+    else:
+        raise Blocked("ambiguous API path")
+    if any(ord(char) < 32 or ord(char) == 127 for char in decoded) \
+            or any(char in decoded for char in ("\\", ";", "?", "#")):
+        raise Blocked("ambiguous API path")
+    canonical = "/" + posixpath.normpath(decoded).lstrip("/")
+    return canonical, parts, decoded != parts.path or canonical != parts.path
+
+
 class OwnedHTTP:
     """Authenticated requests to one verified generation; no proxy or redirects."""
 
@@ -997,14 +1050,14 @@ class OwnedHTTP:
         self.seeding_mode = seeding_mode
 
     def request(self, method, path, body=None, *, authenticated=True, timeout=30):
-        if not path.startswith("/") or path.startswith("//") or "\r" in path or "\n" in path \
-                or urllib.parse.urlsplit(path).netloc:
-            raise Blocked("API path changes owned origin")
-        credential_path = urllib.parse.urlsplit(path).path.rstrip("/")
+        canonical, parsed, ambiguous = normalized_api_path(path)
+        credential_path = canonical.rstrip("/")
         if credential_path == "/api/credential" or credential_path.startswith("/api/credential/"):
             if not (self.seeding_mode is True and method == "POST"
-                    and credential_path == "/api/credential"):
+                    and path == "/api/credential" and not parsed.query):
                 raise Blocked("credential endpoint forbidden")
+        if ambiguous:
+            raise Blocked("ambiguous API path")
         self.proc.verify(self.identity)
         parts = urllib.parse.urlsplit(self.origin)
         headers = {"Content-Type": "application/json"}
@@ -1045,7 +1098,7 @@ class DeferredSignals:
             raise Blocked("qualification interrupted")
 
     def __enter__(self):
-        for signum in (signal.SIGINT, signal.SIGTERM):
+        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
             self._previous[signum] = signal.signal(signum, self.record)
         return self
 
@@ -1059,6 +1112,7 @@ class StopJournal:
 
     def __init__(self, path, proc, *, sender=None):
         self.path, self.proc, self.sender = Path(path), proc, sender
+        self.recovery_fact = None
 
     def _signal(self, identity, signum):
         self.proc.verify(identity)
@@ -1099,6 +1153,7 @@ class StopJournal:
         raise Blocked("daemon SIGSTOP barrier unverified; journal retained")
 
     def recover(self):
+        self.recovery_fact = None
         if not self.path.exists():
             return False
         try:
@@ -1112,9 +1167,31 @@ class StopJournal:
             identity = Identity(data["pid"], data["start_ticks"])
         except (OSError, ValueError, TypeError) as error:
             raise Blocked("stopped-daemon journal unreadable") from error
-        # A reused PID never authorizes SIGCONT; retain uncertainty for review.
+        proof = None
+        try:
+            current = self.proc.stat(identity.pid)
+            if current is not None and current["start_ticks"] != identity.start_ticks:
+                # Different start ticks prove the recorded identity ended; never signal its replacement.
+                alive, proof = False, "pid_reused"
+            else:
+                alive = self.proc.alive(identity)
+                if alive is None:
+                    raise Blocked("stopped-daemon journal identity uncertain; retained")
+                after = self.proc.stat(identity.pid)
+                if after is not None and after["start_ticks"] != identity.start_ticks:
+                    alive, proof = False, "pid_reused"
+        except Blocked as error:
+            raise Blocked("stopped-daemon journal identity uncertain; retained") from error
+        if alive is False:
+            self.path.unlink()
+            self.recovery_fact = {"identity": identity.report(),
+                                  "disposition": "already_gone", "signalled": False}
+            if proof is not None:
+                self.recovery_fact["proof"] = proof
+            return True
         self._signal(identity, signal.SIGCONT)
         self.path.unlink()
+        self.recovery_fact = {"identity": identity.report(), "disposition": "resumed", "signalled": True}
         return True
 
     def resume(self, identity):

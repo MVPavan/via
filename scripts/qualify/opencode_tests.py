@@ -86,7 +86,7 @@ class EntryTests(unittest.TestCase):
                     self.assertRaises(Blocked):
                 opencode.acquire(Path(root))
             self.assertEqual(calls, ["@opencode/cli-linux-x64", "@opencode/cli-linux-x64-baseline"])
-            release.assert_called_once()
+            release.assert_not_called()
 
     def test_release_tag_and_asset_required_before_download(self):
         invalid = ({"tag_name": "v2.0.24", "draft": False, "assets": []},
@@ -96,11 +96,159 @@ class EntryTests(unittest.TestCase):
             with patch.object(opencode, "official_get", return_value=json.dumps(release).encode()) as get, \
                     self.assertRaises(Blocked):
                 opencode.acquire_release(Path("unused-fixture"))
-            self.assertEqual(get.call_count, 1)
+            get.assert_not_called()
 
     def test_acquisition_requires_private_context_before_any_network(self):
         with self.assertRaises(Blocked):
             opencode.official_get("https://registry.npmjs.org/fixture", allowed_hosts={"registry.npmjs.org"})
+
+    def test_changed_registry_anchor_stops_before_archive_download_or_parse(self):
+        for field, changed in (("integrity", "sha512-" + "A" * 88),
+                               ("unpackedSize", 204482253)):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                dist = {"tarball": opencode.safety.NPM_URL,
+                        "integrity": "sha512-" + opencode.safety.NPM_SHA512,
+                        "unpackedSize": 204482252, field: changed}
+                with patch.object(opencode, "package_manifest", return_value=dist), \
+                        patch.object(opencode, "official_get", return_value=b"unparsed fixture") as get, \
+                        patch.object(opencode.safety, "extract_pinned_npm", return_value=Path("pin")) as parse:
+                    with self.assertRaisesRegex(Blocked, "no official same-version artifact"):
+                        opencode.acquire(Path(directory))
+                    get.assert_not_called()
+                    parse.assert_not_called()
+
+    def test_unanchored_release_fallback_stops_before_network(self):
+        release = {"tag_name": "v2.0.22", "draft": False, "assets": [{
+            "name": "opencode-linux-x64.tar.gz",
+            "browser_download_url": "https://github.com/anomalyco/opencode/releases/download/v2.0.22/fixture.tgz"}]}
+        with patch.object(opencode, "official_get", side_effect=[json.dumps(release).encode(),
+                                                                b"unparsed archive"]) as get, \
+                patch.object(opencode.safety, "extract_pinned_release", return_value=Path("pin")) as parse:
+            with self.assertRaisesRegex(Blocked, "pre-extraction archive pin"):
+                opencode.acquire_release(Path("unused-fixture"))
+            get.assert_not_called()
+            parse.assert_not_called()
+
+    def test_partial_phase_records_survive_a_later_infrastructure_failure(self):
+        self._entry_partial_fixture(missing_recovery_parent=False)
+
+    def test_phase_sink_receives_completed_row_before_later_guard_failure(self):
+        class FakeDriver:
+            guards = 0
+            def execute(self, action, **_fields):
+                if action == "build_hashes":
+                    return {"release": "a" * 64, "test-failpoints": "b" * 64}
+                if action == "phase_guard":
+                    self.guards += 1
+                    if self.guards == 2:
+                        raise Blocked("later infrastructure failure")
+                return {}
+        records = []
+        first = {"case": "free", "disposition": "gate", "result": "pass"}
+        with patch.dict(opencode.cases.PHASE_CASES, {"free": ("free", "continuity")}), \
+                patch.object(opencode.cases, "run_case", return_value=first), \
+                self.assertRaisesRegex(Blocked, "later infrastructure failure"):
+            opencode.cases.run_phase(FakeDriver(), "free",
+                                    record_sink=lambda rows: records.extend(rows))
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["case"], "free")
+        self.assertEqual(records[0]["via_build"]["sha256"], "a" * 64)
+
+    def test_recovery_parent_is_created_before_prepare(self):
+        self._entry_partial_fixture(missing_recovery_parent=True)
+
+    def test_missing_system_tools_stop_before_acquisition(self):
+        with tempfile.TemporaryDirectory(prefix="oc-entry-", dir=opencode.SCRATCHPAD) as directory:
+            root = Path(directory)
+            args = SimpleNamespace(self_test=False, phase=["preflight"], evidence=root / "run",
+                                   acquire=True, opencode=None, via_release=root / "release",
+                                   via_failpoints=root / "failpoints", fake_gate_manifest=root / "fake-gates")
+            with patch.object(opencode, "arguments", return_value=args), \
+                    patch.object(opencode, "self_test", return_value=([], 1)), \
+                    patch.object(opencode, "verify_fake_gates", return_value={"verified": True}), \
+                    patch.object(opencode.shutil, "which", return_value=None), \
+                    patch.object(opencode, "acquire", side_effect=Blocked("must not acquire")) as acquire, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(opencode.main([]), 1)
+            acquire.assert_not_called()
+
+    def test_recovery_common_parents_need_not_be_chmodded(self):
+        with tempfile.TemporaryDirectory(prefix="oc-entry-", dir=opencode.SCRATCHPAD) as directory:
+            parent = Path(directory) / "shared-scratch-parent"
+            parent.mkdir(mode=0o755)
+            target = parent / "recovery"
+            with patch.object(opencode, "RECOVERY_ROOT", target):
+                self.assertEqual(opencode.private_recovery_root(), target)
+            self.assertEqual(parent.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(target.stat().st_mode & 0o777, 0o700)
+
+    def test_bearer_in_final_cleanup_cannot_reach_evidence(self):
+        import opencode_driver
+        with tempfile.TemporaryDirectory(prefix="oc-entry-", dir=opencode.SCRATCHPAD) as directory:
+            root = Path(directory)
+            class FakeDriver:
+                def __init__(self, **_arguments):
+                    self.vault = opencode.safety.PasswordVault()
+                    self.secret_forms = [b"h_private_fake_fixture"]
+                    self.proc = opencode.safety.ProcReader(root / "synthetic-proc")
+                def prepare(self): pass
+                def observe(self, _kind): return {}
+                def finish(self): return {"stopped": True, "echo": "h_private_fake_fixture"}
+                def clear_sensitive(self): self.secret_forms.clear()
+            args = SimpleNamespace(self_test=False, phase=["preflight"], evidence=root / "run",
+                                   acquire=False, opencode=root / "fixture-pin",
+                                   via_release=root / "release", via_failpoints=root / "failpoints",
+                                   fake_gate_manifest=root / "fake-gates")
+            record = {"case": "preflight", "disposition": "gate", "result": "pass", "checks": []}
+            with patch.object(opencode, "arguments", return_value=args), \
+                    patch.object(opencode, "self_test", return_value=([], 1)), \
+                    patch.object(opencode, "verify_fake_gates", return_value={"verified": True}), \
+                    patch.object(opencode, "RECOVERY_ROOT", root / "recovery"), \
+                    patch.object(opencode.safety, "verify_binary"), \
+                    patch.object(opencode_driver, "Driver", FakeDriver), \
+                    patch.object(opencode.cases, "run_phase", return_value=[record]), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(opencode.main([]), 1)
+            self.assertFalse((args.evidence / "summary.json").exists())
+            for path in args.evidence.glob("*.json"):
+                self.assertNotIn(b"h_private_fake_fixture", path.read_bytes())
+
+    def _entry_partial_fixture(self, *, missing_recovery_parent):
+        import opencode_driver
+        with tempfile.TemporaryDirectory(prefix="oc-entry-", dir=opencode.SCRATCHPAD) as directory:
+            root = Path(directory)
+            recovery = root / "new-parent" / "recovery" if missing_recovery_parent else root / "recovery"
+            calls = []
+            class FakeDriver:
+                def __init__(self, **_arguments):
+                    self.vault = opencode.safety.PasswordVault()
+                    self.proc = opencode.safety.ProcReader(root / "synthetic-proc")
+                def prepare(self): calls.append("prepare")
+                def observe(self, _kind): return {}
+                def finish(self): return {"stopped": True}
+                def clear_sensitive(self): self.vault.clear()
+            args = SimpleNamespace(self_test=False, phase=["free"], evidence=root / "run",
+                                   acquire=False, opencode=root / "fixture-pin",
+                                   via_release=root / "release", via_failpoints=root / "failpoints",
+                                   fake_gate_manifest=root / "fake-gates")
+            record = {"case": "preflight", "disposition": "gate", "result": "pass", "checks": []}
+            def phase(_adapter, _name, *, record_sink=None):
+                if record_sink is not None: record_sink([record])
+                raise Blocked("later fake phase infrastructure failed")
+            with patch.object(opencode, "arguments", return_value=args), \
+                    patch.object(opencode, "self_test", return_value=([], 1)), \
+                    patch.object(opencode, "verify_fake_gates", return_value={"verified": True}), \
+                    patch.object(opencode, "RECOVERY_ROOT", recovery), \
+                    patch.object(opencode.safety, "verify_binary"), \
+                    patch.object(opencode_driver, "Driver", FakeDriver), \
+                    patch.object(opencode.cases, "run_phase", side_effect=phase), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(opencode.main([]), 1)
+            self.assertEqual(calls, ["prepare"])
+            summary = json.loads((args.evidence / "summary.json").read_bytes())
+            self.assertEqual(summary["cases"], [record])
+            self.assertEqual(json.loads((args.evidence / "preflight.json").read_bytes()), [record])
+            self.assertEqual(summary["result"], "blocked")
 
     def test_fake_gate_proof_binds_both_builds_source_tests_and_success(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -300,7 +448,7 @@ class EntryTests(unittest.TestCase):
                                    acquire=False, opencode=root / "fixture-pin",
                                    via_release=root / "release", via_failpoints=root / "failpoints",
                                    fake_gate_manifest=root / "fake-gates")
-            def records(_adapter, phase):
+            def records(_adapter, phase, **_options):
                 return [{"case": name, "disposition": "gate", "result": "pass", "checks": []}
                         for name in opencode.cases.PHASE_CASES[phase]]
             with patch.object(opencode, "arguments", return_value=args), \

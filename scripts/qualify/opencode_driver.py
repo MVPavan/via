@@ -9,6 +9,7 @@ remain in memory; raw vendor responses never become evidence files.
 import base64
 import datetime
 import contextlib
+import errno
 import fcntl
 import hashlib
 import http.client
@@ -38,6 +39,7 @@ EVIDENCE_BYTES = 256 * 1024 * 1024
 PAGE_COUNT = 1000
 SOCKET_BYTES = 107
 SSE_HANDSHAKE_SECONDS = 30  # §13 owned observer absolute header deadline.
+WAIT_REPLY_MARGIN_SECONDS = 10  # §13: allow the CLI to return its bounded wait reply.
 HELPER_STOP_SECONDS = 30  # §13 L14 bounded cooperative cleanup before a successor.
 ANCHOR_SOCKET_TAIL = 64
 
@@ -293,7 +295,10 @@ class Driver:
 
     def recover_stopped(self):
         """Recover the parent-root persisted SIGSTOP identity after verified PID/ticks (N6)."""
-        return self.journal.recover()
+        recovered=self.journal.recover()
+        if self.journal.recovery_fact is not None:
+            self._record('recovery',self.journal.recovery_fact)
+        return recovered
 
     def build(self,kind):
         """Hash selected prebuilt VIA binaries; never builds or acquires implicitly (N4)."""
@@ -468,7 +473,14 @@ class Driver:
             if any(flag in args for flag in ('--handle','--handle-file')):
                 raise Blocked('bearer handle must remain in memory')
             args.append('--handle-stdin'); input=(self.handles[args[1]]+'\n').encode()+(input or b'')
-        timeout=180 if verb=='wait' else 30
+        timeout=30
+        if verb=='wait':
+            cli_timeout=180000
+            if '--timeout-ms' in args:
+                try: cli_timeout=int(args[args.index('--timeout-ms')+1])
+                except (ValueError,IndexError) as error: raise Blocked('invalid CLI wait timeout') from error
+                if not 0<=cli_timeout<=180000: raise Blocked('CLI wait timeout exceeds phase ceiling')
+            timeout=cli_timeout/1000+WAIT_REPLY_MARGIN_SECONDS
         if self.phase_deadline and not cleanup: timeout=min(timeout,max(0.01,self.phase_deadline-time.monotonic()))
         try:
             command_started=time.monotonic()
@@ -497,6 +509,7 @@ class Driver:
             if type(value.get('session_id')) is not str or type(value['handle']) is not str:
                 raise Blocked('bearer receipt malformed')
             self.handles[value['session_id']]=value['handle']
+            self.secret_forms.append(value['handle'].encode())
         if schema=='envelope': self.account(value)
         self.owned_replies.append(value)
         if verb in {'spawn','resume'}:
@@ -567,7 +580,7 @@ class Driver:
             raise Blocked('credential read/write requires isolated direct seeding')
         self.ensure_vendor()
         if method.upper() in {'POST','PUT','PATCH'} and any(
-                word in path for word in ('/prompt','/shell','/compact','/fork')):
+                word in urllib.parse.urlsplit(path).path for word in ('/prompt','/compact','/fork')):
             self.spending_check(body=body,path=path)
             self._admit_model(self.last_model)
         status,raw=self._http.request(method,path,body)
@@ -781,7 +794,11 @@ class Driver:
         self._event_watchdog.start()
         try:
             conn.request('GET','/api/event',headers={'Authorization':'Basic '+auth,'Accept':'text/event-stream'})
-            response=conn.getresponse(); ready.set()
+            response=conn.getresponse()
+            # Normal idle SSE has no per-read timeout. The owned watchdog enforces
+            # the absolute phase ceiling and shuts this saved socket down on stop.
+            self._event_socket.settimeout(None)
+            ready.set()
         except BaseException as error:
             self.close_event_capture()
             raise Blocked('owned event handshake failed within absolute deadline') from error
@@ -974,18 +991,52 @@ class Driver:
         return form.get('sessionID') if type(form) is dict else None
 
     def secrecy_scan(self):
-        """Boolean-only scans; never read vendor auth/config/database credential content."""
-        paths=list(self.evidence.glob('*.json'))
-        paths += [path for path in self.state.rglob('*') if path.is_file()
-                  and ('stderr' in path.name or path.name=='undecoded.bin')]
-        clean=True; captures=[]
-        for path in paths:
-            if path.stat().st_size>OBSERVATION_BYTES: raise Blocked('evidence scan bound')
-            raw=path.read_bytes()
-            clean=clean and not self.vault.leaks(raw) and not any(form in raw for form in self.secret_forms)
-            if path.name in {'undecoded.bin','stderr.log'}: captures.append(path.name)
-        # Our own VIA Store may carry provider echoes, so inspect its byte-level backup in memory.
+        """Scan owned evidence/logs; label credential metadata and synthetic source (§13 L4)."""
+        roots={self.evidence,self.state,self.home}
+        if self.namespace is not None: roots.add(self.namespace)
+        roots.update(Path(value) for key,value in self.env.items() if key in safety.PRIVATE_PARTS)
+        roots.update(row['path'] for row in self.fixtures.values())
+        fixture_sources={row['path']/'opencode.json' for row in self.fixtures.values()}
         db=self.state/'store.sqlite3'
+        clean=True; captures=[]; seen=set(); metadata=[]; synthetic=[]; total=0
+        handles=[handle.encode() for handle in self.handles.values()]
+        for root in roots:
+            if not root.exists(): continue
+            def unreadable(_error): raise Blocked('private secrecy scan directory unreadable')
+            for directory,dirs,files in os.walk(root,followlinks=False,onerror=unreadable):
+                dirs[:]=[name for name in dirs if name!='.git']
+                for name in files:
+                    path=Path(directory)/name
+                    if path in seen: continue
+                    seen.add(path)
+                    if len(seen)>100000: raise Blocked('private secrecy scan entry bound')
+                    info=path.lstat()
+                    if path==db: continue  # Own VIA Store has a consistent in-memory backup below.
+                    protected_directory=any(safety.credential_metadata_only(part)
+                                            for part in path.relative_to(root).parts[:-1])
+                    if protected_directory or safety.credential_metadata_only(name) or name.lower().endswith('.db') \
+                            or name=='opencode.json' and path not in fixture_sources:
+                        # Authentication/config/database contents remain unread. Counts
+                        # label this proof limit without recording their private paths.
+                        metadata.append(path); continue
+                    source=path in fixture_sources
+                    readable=source or path.suffix.lower() in {'.json','.jsonl','.ndjson','.log','.txt'} \
+                        or any(part in {'log','logs'} for part in path.parts) \
+                        or any(token in name.lower() for token in ('stderr','stdout','output','undecoded'))
+                    if not readable: continue
+                    if not stat.S_ISREG(info.st_mode): raise Blocked('private scan artifact is not regular')
+                    if info.st_size>OBSERVATION_BYTES: raise Blocked('evidence scan bound')
+                    total+=info.st_size
+                    if total>EVIDENCE_BYTES: raise Blocked('private secrecy scan byte bound')
+                    raw=path.read_bytes()
+                    protected=self.vault.leaks(raw) or any(handle in raw for handle in handles)
+                    # Fixture config intentionally contains synthetic provider keys;
+                    # it never gets an exception for a password or bearer handle.
+                    if source: synthetic.append(path)
+                    else: protected=protected or any(form in raw for form in self.secret_forms)
+                    clean=clean and not protected
+                    if path.name in {'undecoded.bin','stderr.log'}: captures.append(path.name)
+        # Our own VIA Store may carry provider echoes, so inspect its byte-level backup in memory.
         if db.exists():
             if db.stat().st_size>EVIDENCE_BYTES: raise Blocked('Store scan bound')
             with sqlite3.connect(f'file:{db}?mode=ro',uri=True) as source:
@@ -993,7 +1044,11 @@ class Driver:
                     source.backup(destination)
                     raw=destination.serialize()
             clean=clean and not self.vault.leaks(raw) and not any(form in raw for form in self.secret_forms)
-        return {'complete':True,'secret_absent':clean,'payload_captures':len(captures)}
+        return {'complete':True,'secret_absent':clean,'payload_captures':len(captures),
+                'metadata_only_files':len(metadata),'synthetic_source_files':len(synthetic),
+                'scope':['owned-via-store','private-vendor-logs','nested-owned-evidence'],
+                'exclusions':['vendor-auth-config-and-database-content',
+                              'synthetic-provider-values-in-private-fixture-config']}
 
     def seam(self,name,occurrence,action,*,target=None):
         """Arm one exact owned target; controller rejects unmatched generations/requests."""
@@ -1088,7 +1143,18 @@ class Driver:
                 if before is None: continue
                 identity=safety.Identity(before['pid'],before['start_ticks'])
                 for fdinfo in (directory/'fdinfo').iterdir():
-                    raw=self.proc.read(identity,'fdinfo/'+fdinfo.name)
+                    name='fdinfo/'+fdinfo.name
+                    try: raw=self.proc.read(identity,name)
+                    except (OSError,Blocked) as error:
+                        cause=error if isinstance(error,OSError) else error.__cause__
+                        if isinstance(cause,OSError) and cause.errno in {errno.ENOENT,errno.ESRCH} \
+                                and cause.filename==name:
+                            # An individual closed fd cannot retain the namespace lock.
+                            # Stable process identity is still required; directory errors
+                            # and hidden/reused process identities remain unverifiable.
+                            self.proc.verify(identity)
+                            continue
+                        raise
                     if any(lockid.encode() in line and b'FLOCK' in line for line in raw.splitlines()):
                         holders.append(identity.report())
             except (OSError,Blocked):
@@ -1152,8 +1218,8 @@ class Driver:
                'session_shell_during','session_shell_after','mcp_during','mcp_after','lsp_during',
                'lsp_after','plugin_during','plugin_after','long_run','reload','disposal'}
         if point not in known: raise Blocked('unrecognized lifecycle recipe')
-        if point.startswith('lsp_'):
-            raise Blocked('pinned LSP runtime unverified: accepted config conflicts with source/docs')
+        if point.startswith('lsp_') and getattr(self,'_lsp_result',{}).get('spawned') is not True:
+            raise Blocked('LSP lifecycle requires the positive configured-read probe')
         if point=='long_run':
             sample=getattr(self,'_long_run_sample',None)
             if not sample or sample.get('vendor')!=self.vendor_identity or not self.proc.alive(self.vendor_identity):
@@ -1267,7 +1333,7 @@ class Driver:
         raise Blocked('stopped daemon stdin writer not proved')
 
     def signal_barrier(self,sample):
-        """L14: stopped private release daemon, anchor PID alone, one-second death proof."""
+        """L14: one staged signal path for the live case and owned fake controls."""
         if self.phase_kind!='release': raise Blocked('L14 requires release VIA build')
         if 'operation' in sample: return self._staged_signal(sample)
         _typed(sample,{'daemon':dict,'anchor':dict,'vendor':dict,'reached':B,'live_pin':B,
@@ -1283,26 +1349,19 @@ class Driver:
                 'anchor_pid_only':False,'vendor_gone_within_1s':False,'daemon_resumed':False,
                 'stderr_sigpipe_limitation':True}
         try:
-            self.journal.stop(self.daemon)
-            result.update(daemon_stopped=True,stop_identity_persisted=True)
-            result['stdin_held']=self._stdin_held(self.daemon,self.vendor_identity)
-            self.proc.verify(self.anchor)
-            started=time.monotonic(); self.journal._signal(self.anchor,signal.SIGKILL)
-            result['anchor_pid_only']=True
-            while time.monotonic()-started<1:
-                state=self.proc.stat(self.daemon.pid)
-                if not state or state['start_ticks']!=self.daemon.start_ticks or state['state'] not in {'T','t'}:
-                    raise Blocked('daemon barrier lost during death observation')
-                gone=self.proc.gone(self.vendor_identity)
-                if gone:
-                    result['vendor_gone_within_1s']=True
-                    result['death_elapsed_s']=time.monotonic()-started
-                    break
-                time.sleep(0.005)
-            if not result['vendor_gone_within_1s']: raise Blocked('vendor survived anchor or death unverifiable')
+            stopped=self.signal_barrier({'operation':'daemon_sigstop','identity':sample['daemon']})
+            result.update(daemon_stopped=stopped['all_threads_stopped'],
+                          stop_identity_persisted=stopped['persisted'],stdin_held=stopped['stdin_writer_open'])
+            if result['stdin_held'] is not True: raise Blocked('stopped daemon stdin writer not proved')
+            killed=self.signal_barrier({'operation':'anchor_sigkill','identity':sample['anchor'],'group':False})
+            result['anchor_pid_only']=killed['pid_only']
+            death=self.signal_barrier({'operation':'vendor_death','identity':sample['vendor'],
+                                       'deadline':killed['monotonic']+1.0})
+            result.update(vendor_gone_within_1s=death['gone'] and death['certain'],
+                          death_elapsed_s=death['elapsed_seconds'])
         finally:
-            self.journal.resume(self.daemon)
-            result['daemon_resumed']=True
+            resumed=self.signal_barrier({'operation':'daemon_sigcont','identity':sample['daemon']})
+            result['daemon_resumed']=resumed['identity_verified']
             self._record('l14',result)
         return result
 
@@ -1561,7 +1620,7 @@ class Driver:
         if description.get('fake_lsp'):
             helper=self._helper_fixture(project,'lsp')
             config['lsp']={'via-fixture':{'command':['/usr/bin/python3',str(helper)],
-                                        'extensions':['.via_ocl_fixture']}}
+                                        'extensions':['.via_ocl_fixture'],'disabled':False}}
             (project/'fixture.via_ocl_fixture').write_text('VIA fixture\n')
         if description.get('mcp') is True:
             helper=self._helper_fixture(project,'mcp')
@@ -1597,6 +1656,10 @@ class Driver:
                                            'agent':description['subagent'],
                                            'prompt':'Attempt the project ask-rule shell action.'}},
                 {'name':'shell','arguments':{'command':'/usr/bin/true'}}]
+        if description.get('fake_lsp') and name in self.mock_providers and (
+                name=='lsp-probe' or name.endswith(('lsp_during','lsp_after')) or
+                (name=='never-ask' and getattr(self,'_lsp_result',{}).get('spawned') is True)):
+            self.mock_providers[name].script.insert(0,{'fixture_read':'fixture.via_ocl_fixture'})
         return config
 
     def _helper_fixture(self,project,kind,separate_group=False,barrier_seconds=180):
@@ -1696,15 +1759,29 @@ print('VIA HELPER DONE')
         identity=safety.Identity(**sample['identity'])
         if operation=='daemon_sigstop':
             if identity!=self.daemon: raise Blocked('foreign daemon barrier')
+            deadline=time.monotonic()+5
+            self._sigkill_at=None
             self.journal.stop(identity)
             try:
                 taskroot=self.proc.root/str(identity.pid)/'task'
-                rows=list(taskroot.iterdir())
-                if not rows: raise Blocked('daemon thread-group unavailable')
-                for thread in rows:
-                    raw=(thread/'stat').read_bytes()
-                    parsed=self.proc.parse_stat(raw,int(thread.name))
-                    if parsed['state'] not in {'T','t'}: raise Blocked('daemon thread not stopped')
+                while True:
+                    self.proc.verify(identity)
+                    rows=list(taskroot.iterdir())
+                    if not rows: raise Blocked('daemon thread-group unavailable')
+                    stopped=True
+                    for thread in rows:
+                        try:
+                            raw=(thread/'stat').read_bytes()
+                        except FileNotFoundError:
+                            # A worker may exit before the group stop settles; rescan the group.
+                            stopped=False
+                            continue
+                        parsed=self.proc.parse_stat(raw,int(thread.name))
+                        stopped=stopped and parsed['state'] in {'T','t'}
+                    if time.monotonic()>=deadline:
+                        raise Blocked('daemon thread-group stop deadline exhausted')
+                    if stopped: break
+                    time.sleep(.005)
                 held=self._stdin_held(identity,self.vendor_identity)
             except BaseException:
                 self.journal.resume(identity); raise
@@ -1714,7 +1791,8 @@ print('VIA HELPER DONE')
                 raise Blocked('anchor-only signal authority absent')
             self.proc.verify(self.daemon)
             row=self.proc.stat(self.daemon.pid)
-            if row['state'] not in {'T','t'}: raise Blocked('daemon barrier not held')
+            if not row or row['start_ticks']!=self.daemon.start_ticks or row['state'] not in {'T','t'}:
+                raise Blocked('daemon barrier not held')
             self.proc.verify(identity)
             self._sigkill_at=time.monotonic(); self.journal._signal(identity,signal.SIGKILL)
             return {'pid_only':True,'monotonic':float(self._sigkill_at)}
@@ -1735,7 +1813,14 @@ print('VIA HELPER DONE')
         if operation=='daemon_sigcont':
             if identity!=self.daemon: raise Blocked('foreign daemon continuation')
             self.journal.resume(identity)
-            return {'identity_verified':True}
+            deadline=time.monotonic()+5
+            while time.monotonic()<deadline:
+                self.proc.verify(identity)
+                row=self.proc.stat(identity.pid)
+                if row and row['start_ticks']==identity.start_ticks and row['state'] not in {'T','t'}:
+                    return {'identity_verified':True}
+                time.sleep(.005)
+            raise Blocked('owned daemon continuation unverified')
         raise Blocked('unknown L14 barrier operation')
 
     def _operation(self,kind,target):
@@ -2044,9 +2129,15 @@ print('VIA HELPER DONE')
 
     def finish(self):
         """Final cleanup/immutable-pin proof; uncertainty retains roots and fails closure."""
-        proof=self.stop()
-        for provider in self.mock_providers.values(): provider.__exit__(None,None,None)
-        self.mock_providers.clear()
+        try: proof=self.stop()
+        finally:
+            self._publication_release.set()
+            failures=[]
+            for provider in self.mock_providers.values():
+                try: provider.__exit__(None,None,None)
+                except Exception as error: failures.append(error)
+            self.mock_providers.clear()
+            if failures: raise Blocked('owned mock provider cleanup unverified') from failures[0]
         safety.verify_binary(self.pinned)
         scan=self.secrecy_scan()
         if scan['secret_absent'] is not True or scan['payload_captures']!=0:
@@ -2066,10 +2157,10 @@ print('VIA HELPER DONE')
         before=self._anchor_rows()
         probe=self.namespace.parent/'probe'
         before_probe=self._tree_identity(probe)
-        description=self.via(['describe','--harness','opencode','--model',safety.FREE_IDENTITY,
+        description=self.via(['describe','--harness','opencode','--model',safety.MOCK_IDENTITY,
                               '--cwd',str(project),'--bound','full','--network'])
         support=description['capabilities']['params']['max_steps']['support']
-        refused=self.via(['spawn','--harness','opencode','--model',safety.FREE_IDENTITY,
+        refused=self.via(['spawn','--harness','opencode','--model',safety.MOCK_IDENTITY,
                           '--cwd',str(project),'--bound','full','--network','--max-steps',str(value),
                           '--prompt','VIA preflight','--background'])
         error=refused.get('cli_error',{}).get('error',{})
@@ -2208,20 +2299,136 @@ print('VIA HELPER DONE')
         afterids={row['id'] for row in after['body']['data']}
         return {'code':'resume_mismatch','creates':len(afterids-beforeids)}
 
+    def _lsp_probe(self):
+        """One configured read and owned readiness barrier, never silence alone (§13 L5/L14)."""
+        if getattr(self,'_lsp_result',None) is not None:
+            return dict(self._lsp_result)
+        if getattr(self,'_lsp_probe_started',False):
+            raise Blocked('single LSP configured-read probe was incomplete')
+        self._lsp_probe_started=True
+        previous_project,previous_request=self.project,self.last_request
+        previous_endpoints,previous_model=dict(self.provider_endpoints),self.last_model
+        receipt=None; prepared=False
+        try:
+            project=self.fixture('lsp-probe',{'provider':'mock','fake_lsp':True,'helper':'tool'})
+            self.start('release',project)
+            prepared=True
+            receipt=self.via(['spawn','--harness','opencode','--model',safety.MOCK_IDENTITY,
+                             '--cwd',str(project),'--bound','full','--network','--background',
+                             '--prompt','Read fixture.via_ocl_fixture with the offered read tool, '
+                                        'then hold the private tool helper.'])
+            if 'cli_error' in receipt: raise Blocked('configured LSP probe refused')
+            self.ensure_vendor()
+            pin=self._operation('helper_barrier',{'helper':'tool'})
+            if pin.get('owned') is not True or pin.get('started') is not True:
+                raise Blocked('LSP readiness probe lacks an owned live pin')
+            schema=self._served_schema()
+            properties=schema.get('components',{}).get('schemas',{}).get('Config.InfoEncoded',{}).get('properties',{})
+            if 'lsp' not in properties: raise Blocked('LSP configuration readback schema unavailable')
+            query=urllib.parse.urlencode({'location[directory]':str(project)})
+            reply=self.vendor('GET','/api/config?'+query)
+            entries=reply.get('body',{}).get('data')
+            if reply.get('status')!=200 or type(entries) is not list:
+                raise Blocked('LSP effective configuration sources unavailable')
+            expected=self.fixtures['lsp-probe']['config']['lsp']['via-fixture']
+            effective=None
+            for entry in entries:
+                if type(entry) is not dict: raise Blocked('LSP configuration entry shape unavailable')
+                info=entry.get('info')
+                if entry.get('type')=='document' and type(info) is dict and 'lsp' in info:
+                    effective=info['lsp']
+            if type(effective) is not dict or effective.get('via-fixture')!=expected:
+                raise Blocked('configured fake LSP command was not read back')
+            provider=self.mock_providers['lsp-probe']; mock=provider.receipt()
+            if mock.get('received') is not True or mock.get('model_matches') is not True:
+                raise Blocked('LSP probe mock request receipt unavailable')
+            calls=mock.get('read_calls')
+            if type(calls) is not list or not calls or any(row.get('schema_checked') is not True for row in calls):
+                raise Blocked('actual offered read schema unavailable for LSP probe')
+            sid=self._vendor_sid(receipt['session_id'])
+            events=self.observe('native_events',sid)['events']
+            called={row.get('data',{}).get('id') for row in events
+                    if row.get('type')=='session.tool.called' and row.get('data',{}).get('name')=='read'}
+            succeeded={row.get('data',{}).get('id') for row in events if row.get('type')=='session.tool.success'}
+            if not any(row.get('id') in called & succeeded for row in calls):
+                raise Blocked('configured fixture file read was not actually completed')
+            beginning=time.monotonic(); deadline=beginning+5
+            if self.phase_deadline is not None and deadline>self.phase_deadline:
+                raise Blocked('phase has insufficient LSP readiness budget')
+            spawned=False; marker=self._helper_folder(project)/'lsp.json'
+            while True:
+                if self.signals: self.signals.guard()
+                self.proc.verify(self.vendor_identity)
+                if marker.exists():
+                    helpers=self.observe('helper_observations')['helpers']
+                    spawned=any(row.get('kind')=='lsp' and row.get('ready') is True for row in helpers)
+                    if not spawned: raise Blocked('LSP readiness identity unverifiable')
+                    break
+                if time.monotonic()>=deadline: break
+                time.sleep(min(.02,max(0,deadline-time.monotonic())))
+            if self.inventory: self.inventory.check()
+            result={'complete':True,'spawned':spawned,'config_checked':True,'mock_received':True,
+                    'read_attempted':True,'readiness_checked':True,'pin_owned':True,
+                    'readiness_seconds':5.0 if not spawned else time.monotonic()-beginning,
+                    'readiness_elapsed_seconds':time.monotonic()-beginning,
+                    'disposition':'offered' if spawned else 'lsp: not offered by pinned 2.0.22'}
+        finally:
+            try:
+                if prepared:
+                    self._operation('helper_release',{'helper':'tool'})
+                    if receipt is not None and 'turn' in receipt:
+                        self.via(['wait',receipt['turn'],'--timeout-ms','180000'])
+            finally:
+                if previous_project is not None:
+                    self.project=previous_project
+                    self.last_request=previous_request
+                    self.provider_endpoints=previous_endpoints
+                    self.last_model=previous_model
+        self._lsp_result=result
+        self._record('lsp-probe',result)
+        return dict(result)
+
     def _lifecycle_capabilities(self):
-        self.ensure_vendor(); status,raw=self._http.request('GET','/openapi.json')
-        if status!=200: raise Blocked('pinned served schema unavailable')
-        schema=self._json(raw); paths=schema.get('paths')
-        if type(paths) is not dict: raise Blocked('pinned served path evidence absent')
-        required={'/api/session/{sessionID}/shell','/api/shell','/api/mcp'}
-        if not required<=set(paths): raise Blocked('required spawn API absent')
-        points={name:True for name in ('publication','tool_during','tool_after','location_shell_during',
-                 'location_shell_after','session_shell_during','session_shell_after','mcp_during','mcp_after',
-                 'lsp_during','lsp_after','plugin_during','plugin_after','long_run')}
-        points['reload']='/api/location/reload' in paths
-        points['disposal']=any('dispose' in path for path in paths)
+        """Offered samples require served operations and observed helper recipes (§13 L14)."""
+        self.ensure_vendor(); schema=self._served_schema(); paths=schema['paths']
+        probe=self._lsp_probe()
         self._lifecycle_schema=schema
-        return {'source_schema_proven':True,'points':points,'schema_sha256':hashlib.sha256(raw).hexdigest()}
+        def operation(path,verb):
+            return type(paths.get(path,{}).get(verb)) is dict
+        core=operation('/api/session','post') and operation('/api/session/{sessionID}/prompt','post') \
+            and operation('/api/event','get') and probe.get('pin_owned') is True \
+            and probe.get('mock_received') is True
+        def shell(path):
+            row=paths.get(path,{}).get('post')
+            if type(row) is not dict: return False
+            body=row.get('requestBody',{}).get('content',{}).get('application/json',{}).get('schema')
+            try: self._schema_body(schema,body,{'command':'/usr/bin/true'})
+            except Blocked: return False
+            return core
+        properties=schema.get('components',{}).get('schemas',{}).get('Config.InfoEncoded',{}).get('properties',{})
+        helpers={row.get('kind') for row in self.helper_ledger.values() if row.get('ready') is True}
+        mcp=core and 'mcp' in properties and operation('/api/mcp','get') and 'mcp' in helpers
+        plugin=core and 'plugins' in properties and 'plugin' in helpers
+        lsp=core and probe.get('spawned') is True
+        long_run=getattr(self,'_long_run_sample',{})
+        points={'publication':core,'tool_during':core,'tool_after':core,
+                'location_shell_during':shell('/api/shell'),'location_shell_after':shell('/api/shell'),
+                'session_shell_during':shell('/api/session/{sessionID}/shell'),
+                'session_shell_after':shell('/api/session/{sessionID}/shell'),
+                'mcp_during':mcp,'mcp_after':mcp,'plugin_during':plugin,'plugin_after':plugin,
+                'lsp_during':lsp,'lsp_after':lsp,
+                'long_run':core and long_run.get('completed_tail') is True}
+        reload=paths.get('/api/location/reload',{}).get('post')
+        points['reload']=core and type(reload) is dict and 'requestBody' not in reload
+        disposal=any('dispose' in path for path in paths)
+        points['disposal']=False  # No reviewed live-pin operation recipe is implemented.
+        notes={'reload':('reload: not offered by pinned 2.0.22 (served schema)' if type(reload) is not dict
+                         else 'reload: deferred; offered schema has no reviewed held-pin recipe'),
+               'disposal':('disposal: deferred; offered operation has no reviewed held-pin recipe' if disposal
+                           else 'disposal: not offered by pinned 2.0.22 (served schema)')}
+        return {'source_schema_proven':True,'points':points,'lsp_probe':probe,'notes':notes,
+                'optional_offered':{'reload':type(reload) is dict,'disposal':disposal},
+                'schema_sha256':'540fdf565da27de9df69b6c3864582344e74ac4ffa225c283b289481d215d241'}
 
     def _bounded_probe(self,item,limit):
         if type(limit) is not int or not 0<limit<=12: raise Blocked('probe attempt cap invalid')

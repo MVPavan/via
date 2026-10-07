@@ -7,9 +7,14 @@ import json
 import socket
 import threading
 import time
+import tempfile
+from pathlib import Path
+from unittest import mock
 import unittest
+from types import SimpleNamespace
 
 import opencode_cases as cases
+import opencode_driver as transport
 
 
 def sample_event(seq, kind, data, session="ses_owned", **extra):
@@ -194,8 +199,44 @@ class CasesTests(unittest.TestCase):
     def test_record_only_absence_not_pass(self):
         driver = FakeDriver({"bounded_probe": {"attempts": 3, "observations": []}})
         result = cases.run_case(driver, "forms", cases.CASES["forms"], "record-only")
+        self.assertEqual(result["result"], "deferred")
+        self.assertEqual(result["disposition"], "deferred-with-reason")
+        self.assertEqual(driver.calls, [])
+
+    def lsp_proof(self, spawned=False):
+        return {"complete": True, "spawned": spawned, "config_checked": True,
+                "mock_received": True, "read_attempted": True, "readiness_checked": True,
+                "readiness_seconds": .1, "pin_owned": True,
+                "disposition": "offered" if spawned else "lsp: not offered by pinned 2.0.22"}
+
+    def never_ask_driver(self, spawned=False):
+        result = self.write_driver().replies["turn"]
+        return FakeDriver({"set_inherit": None, "fixture": "fixture", "turn": result,
+                           "lsp_probe": self.lsp_proof(spawned),
+                           "permission_observations": {"attempts": [{"callID": "call_denied",
+                               "child_session": "ses_child", "deny_rule": True, "asked": False,
+                               "disposition": "action.denied"}], "unhandled_asks": 0},
+                           "helper_observations": {"mcp_started": True, "plugin_started": True,
+                               "hook_started": True, "fake_lsp_started": spawned,
+                               "package_inventory_clean": True, "binary_inventory_clean": True}})
+
+    def test_l5_negative_configured_read_probe_is_an_explicit_limitation(self):
+        result = cases.run_case(self.never_ask_driver(), "never_ask", cases.case_never_ask)
+        self.assertEqual(result["result"], "pass")
+        self.assertIn("lsp: not offered by pinned 2.0.22", result["limitations"])
+
+    def test_l5_no_actual_read_cannot_claim_lsp_not_offered(self):
+        driver = self.never_ask_driver()
+        driver.replies["lsp_probe"]["read_attempted"] = False
+        result = cases.run_case(driver, "never_ask", cases.case_never_ask)
         self.assertEqual(result["result"], "not_observable")
-        self.assertEqual(result["disposition"], "record-only")
+        self.assertNotIn("lsp: not offered by pinned 2.0.22", result["limitations"])
+
+    def test_l5_positive_probe_requires_current_fixture_lsp_spawn(self):
+        driver = self.never_ask_driver(spawned=True)
+        driver.replies["helper_observations"]["fake_lsp_started"] = False
+        result = cases.run_case(driver, "never_ask", cases.case_never_ask)
+        self.assertEqual(result["result"], "fail")
 
     def test_native_cursor_reordering_blocks(self):
         rows = ledger_events()
@@ -448,6 +489,32 @@ class CasesTests(unittest.TestCase):
         self.assertEqual(next(args["point"] for name, args in driver.calls if name == "lifecycle_prepare"),
                          "long_run")
 
+    def test_l14_conditional_lsp_and_optional_skips_are_labelled(self):
+        driver = self.anchor_driver()
+        capabilities = driver.replies["lifecycle_capabilities"]
+        for point in ("lsp_during", "lsp_after", "reload", "disposal"):
+            capabilities["points"][point] = False
+        capabilities["lsp_probe"] = self.lsp_proof()
+        capabilities["notes"] = {"reload": "reload: not offered by served schema",
+                                 "disposal": "disposal: not offered by served schema"}
+        capabilities["optional_offered"] = {"reload": False, "disposal": False}
+        result = cases.run_case(driver, "anchor", cases.case_anchor)
+        self.assertEqual(result["result"], "pass")
+        self.assertEqual(sum(name == "daemon_sigcont" for name, _ in driver.calls), 12)
+        self.assertIn("lsp: not offered by pinned 2.0.22", result["limitations"])
+        self.assertTrue(any("reload:" in note for note in result["limitations"]))
+        self.assertTrue(any("disposal:" in note for note in result["limitations"]))
+
+    def test_l14_offered_but_unsampled_disposal_cannot_pass(self):
+        driver = self.anchor_driver()
+        offered = driver.replies["lifecycle_capabilities"]
+        offered["points"]["disposal"] = False
+        offered["notes"] = {"disposal": "disposal: deferred; no reviewed held-pin recipe"}
+        offered["optional_offered"] = {"disposal": True}
+        result = cases.run_case(driver, "anchor", cases.case_anchor)
+        self.assertEqual(result["result"], "not_observable")
+        self.assertTrue(any("disposal: deferred" in note for note in result["limitations"]))
+
     def test_l14_survivor_fails_and_daemon_resumes(self):
         driver = self.anchor_driver(gone=False)
         result = cases.run_case(driver, "anchor", cases.case_anchor)
@@ -486,6 +553,32 @@ class CasesTests(unittest.TestCase):
 
 
 class ProviderTests(unittest.TestCase):
+    def test_fixture_read_uses_only_actual_offered_path_schema(self):
+        for key in ("filePath", "path"):
+            with self.subTest(key=key), cases.LoopbackProvider(
+                    script=[{"fixture_read": "fixture.via_ocl_fixture"}]) as provider:
+                tools = [{"type": "function", "function": {"name": "read", "parameters": {
+                    "type": "object", "properties": {key: {"type": "string"}},
+                    "required": [key], "additionalProperties": False}}}]
+                status, body = self.request(provider, tools=tools)
+                self.assertEqual(status, 200)
+                call = json.loads(body)["choices"][0]["message"]["tool_calls"][0]
+                self.assertEqual(json.loads(call["function"]["arguments"]),
+                                 {key: "fixture.via_ocl_fixture"})
+                self.assertEqual(provider.receipt()["read_calls"],
+                                 [{"id": call["id"], "schema_checked": True}])
+
+    def test_unoffered_read_or_unsupported_path_cannot_prove_probe(self):
+        for name, key in (("shell", "command"), ("read", "filename")):
+            with self.subTest(name=name), cases.LoopbackProvider(
+                    script=[{"fixture_read": "fixture.via_ocl_fixture"}]) as provider:
+                tools = [{"type": "function", "function": {"name": name, "parameters": {
+                    "type": "object", "properties": {key: {"type": "string"}},
+                    "required": [key]}}}]
+                status, _ = self.request(provider, tools=tools)
+                self.assertEqual(status, 400)
+                self.assertEqual(provider.receipt()["read_calls"], [])
+
     def test_slow_headers_share_one_absolute_deadline(self):
         provider = cases.LoopbackProvider()
         provider.CONNECTION_SECONDS = .1
@@ -756,6 +849,130 @@ class AdapterTests(unittest.TestCase):
                         build="test-failpoints")
         adapter.execute("phase_build", build="release")
         self.assertEqual(raw.kinds, ["failpoints", "release"])
+
+
+class ConfiguredLspDriverTests(unittest.TestCase):
+    def test_l5_fixture_reads_custom_file_only_after_positive_probe(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            for spawned in (False, True):
+                driver = transport.Driver.__new__(transport.Driver)
+                driver._lsp_result = {"spawned": spawned}
+                driver.mock_providers = {}
+                driver.mock_origins = set()
+                driver.guard = SimpleNamespace(mock_origins=frozenset())
+                driver._mock_request_admit = mock.Mock()
+                driver._helper_fixture = mock.Mock(return_value=project / "lsp-helper.py")
+                provider = SimpleNamespace(script=[], endpoint="http://127.0.0.1:12345/v1",
+                                           __enter__=mock.Mock())
+                with mock.patch.object(cases, "LoopbackProvider", return_value=provider):
+                    config = driver._materialize_fixture("never-ask", project, {
+                        "provider": "mock", "fake_lsp": True, "subagent": "oclive-ask"})
+                self.assertEqual("fixture_read" in provider.script[0], spawned)
+                if spawned:
+                    self.assertEqual(provider.script[0], {"fixture_read": "fixture.via_ocl_fixture"})
+                self.assertEqual(config["lsp"]["via-fixture"]["extensions"], [".via_ocl_fixture"])
+
+    def fixture_driver(self, root, *, spawned=True, actual_read=True, cleanup_error=False):
+        driver = transport.Driver.__new__(transport.Driver)
+        project = root / "probe"
+        project.mkdir()
+        folder = root / "helpers"
+        folder.mkdir()
+        if spawned:
+            (folder / "lsp.json").write_text("{}")
+        expected = {"command": ["fixture-helper"], "extensions": [".via_ocl_fixture"],
+                    "disabled": False}
+        driver.project = root / "retained"
+        driver.last_request = {"session_id": "retained-session"}
+        driver.provider_endpoints = {"retained": "loopback"}
+        driver.last_model = "retained-model"
+        driver.fixtures = {"lsp-probe": {"config": {"lsp": {"via-fixture": expected}}}}
+        driver.mock_providers = {"lsp-probe": SimpleNamespace(receipt=lambda: {
+            "received": True, "model_matches": True,
+            "read_calls": [{"id": "read-1", "schema_checked": True}]})}
+        driver.phase_deadline = None
+        driver.signals = None
+        driver.proc = SimpleNamespace(verify=mock.Mock())
+        driver.vendor_identity = object()
+        driver.inventory = SimpleNamespace(check=mock.Mock())
+        driver.fixture = mock.Mock(return_value=project)
+        driver.start = mock.Mock()
+        driver.ensure_vendor = mock.Mock()
+        driver._served_schema = mock.Mock(return_value={"components": {"schemas": {
+            "Config.InfoEncoded": {"properties": {"lsp": {}}}}}})
+        driver.vendor = mock.Mock(return_value={"status": 200, "body": {"data": [
+            {"type": "document", "info": {"lsp": {"via-fixture": expected}}}]}})
+        driver._vendor_sid = mock.Mock(return_value="vendor-probe")
+        events = ([{"type": "session.tool.called", "data": {"id": "read-1", "name": "read"}},
+                   {"type": "session.tool.success", "data": {"id": "read-1"}}]
+                  if actual_read else [])
+        driver.observe = mock.Mock(side_effect=lambda kind, *_: {
+            "events": events} if kind == "native_events" else {
+                "helpers": [{"kind": "lsp", "ready": True}]})
+        driver._helper_folder = mock.Mock(return_value=folder)
+        driver._record = mock.Mock()
+        def operation(name, _):
+            if name == "helper_release" and cleanup_error:
+                raise transport.Blocked("fake cleanup unavailable")
+            return {"owned": True, "started": True}
+        driver._operation = mock.Mock(side_effect=operation)
+        driver.via = mock.Mock(side_effect=lambda args: {
+            "turn": "probe:1", "session_id": "probe"} if args[0] == "spawn" else {})
+        return driver
+
+    def test_actual_read_positive_probe_is_cached_and_restores_retained_request(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            driver = self.fixture_driver(Path(temporary))
+            result = driver._lsp_probe()
+            self.assertTrue(result["spawned"])
+            self.assertEqual(result["disposition"], "offered")
+            self.assertEqual(driver.last_request, {"session_id": "retained-session"})
+            self.assertEqual(driver._lsp_probe(), result)
+            self.assertEqual(driver.fixture.call_count, 1)
+            self.assertEqual(driver.via.call_args_list[-1].args[0][0], "wait")
+
+    def test_actual_read_negative_probe_observes_full_bounded_window(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            driver = self.fixture_driver(Path(temporary), spawned=False)
+            clock = [0.0]
+            with mock.patch.object(transport.time, "monotonic", side_effect=lambda: clock[0]), \
+                 mock.patch.object(transport.time, "sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
+                result = driver._lsp_probe()
+            self.assertFalse(result["spawned"])
+            self.assertEqual(result["readiness_seconds"], 5)
+            self.assertGreaterEqual(result["readiness_elapsed_seconds"], 5)
+            self.assertEqual(result["disposition"], "lsp: not offered by pinned 2.0.22")
+
+    def test_missing_actual_read_blocks_without_negative_or_retry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            driver = self.fixture_driver(Path(temporary), actual_read=False)
+            with self.assertRaisesRegex(transport.Blocked, "not actually completed"):
+                driver._lsp_probe()
+            self.assertFalse(hasattr(driver, "_lsp_result"))
+            with self.assertRaisesRegex(transport.Blocked, "single LSP configured-read probe was incomplete"):
+                driver._lsp_probe()
+            self.assertEqual(driver.fixture.call_count, 1)
+
+    def test_probe_cleanup_failure_restores_retained_request_and_never_caches_pass(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            driver = self.fixture_driver(Path(temporary), cleanup_error=True)
+            with self.assertRaisesRegex(transport.Blocked, "fake cleanup unavailable"):
+                driver._lsp_probe()
+            self.assertEqual(driver.last_request, {"session_id": "retained-session"})
+            self.assertFalse(hasattr(driver, "_lsp_result"))
+
+    def test_lifecycle_capabilities_require_served_operations_and_helper_evidence(self):
+        driver = transport.Driver.__new__(transport.Driver)
+        driver.ensure_vendor = mock.Mock()
+        driver._served_schema = mock.Mock(return_value={"paths": {}, "components": {}})
+        driver._lsp_probe = mock.Mock(return_value={"spawned": False, "pin_owned": True,
+                                                   "mock_received": True})
+        driver.helper_ledger = {}
+        proof = driver._lifecycle_capabilities()
+        self.assertTrue(all(value is False for value in proof["points"].values()))
+        self.assertFalse(proof["optional_offered"]["reload"])
+        self.assertIn("not offered", proof["notes"]["disposal"])
 
 
 def self_test():

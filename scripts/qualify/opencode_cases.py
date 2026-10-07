@@ -248,6 +248,8 @@ class DriverAdapter:
             if member(info, "version", str) != "2.0.22":
                 raise QualificationFailure("checked vendor info version changed")
             return {"pid": member(info, "pid", int)}
+        if operation == "lsp_probe":
+            return self.driver._lsp_probe()
         if operation == "permission_observations":
             return permission_attempts(self.driver.observe(operation, args["session"]))
         if operation == "helper_observations":
@@ -714,6 +716,8 @@ class LoopbackProvider:
         self.cache_read, self.cache_write, self.text = cache_read, cache_write, text
         self.script = [] if script is None else list(script)
         self.script_cursor = 0
+        self.scripted_tools = set()
+        self.read_calls = []
         self.markers = {} if markers is None else dict(markers)
         self.observed_markers = {name: False for name in self.markers}
         self.models = set()
@@ -896,6 +900,16 @@ class LoopbackProvider:
                                          for item in value.get("tools", [])
                                          if type(item) is dict and type(item.get("function")) is dict
                                          and type(item["function"].get("name")) is str}
+                            if "fixture_read" in scripted:
+                                parameters = available.get("read", {}).get("parameters", {})
+                                properties = parameters.get("properties", {})
+                                paths = [name for name in ("filePath", "path")
+                                         if type(properties.get(name)) is dict and properties[name].get("type") == "string"]
+                                required = parameters.get("required", [])
+                                if len(paths) != 1 or type(required) is not list or not set(required) <= {paths[0]}:
+                                    self.reply(400, b'{"error":{"type":"fixture.read-unavailable"}}')
+                                    return
+                                scripted = {"name": "read", "arguments": {paths[0]: scripted["fixture_read"]}}
                             if scripted["name"] not in available:
                                 self.reply(400, b'{"error":{"type":"fixture.tool-unavailable"}}')
                                 return
@@ -912,6 +926,9 @@ class LoopbackProvider:
                             tool_call = {"id": "call_fixture_" + str(provider.requests),
                                          "type": "function", "function": {"name": scripted["name"],
                                               "arguments": json.dumps(arguments)}}
+                            provider.scripted_tools.add(scripted["name"])
+                            if scripted["name"] == "read":
+                                provider.read_calls.append({"id": tool_call["id"], "schema_checked": True})
                         result = {"id": "chatcmpl_fixture", "object": "chat.completion",
                                   "created": 1, "model": provider.model,
                                   "choices": [{"index": 0, "message": {"role": "assistant",
@@ -969,6 +986,7 @@ class LoopbackProvider:
     def receipt(self):
         return {"received": self.received, "model_matches": self.model_matches,
                 "requests": self.requests, "mode": "mock", "models": sorted(self.models),
+                "scripted_tools": sorted(self.scripted_tools), "read_calls": list(self.read_calls),
                 "admission_blocked": self.admission_blocked, **self.observed_markers}
 
     def __exit__(self, *_args):
@@ -1092,7 +1110,26 @@ def permission_attempts(raw: dict) -> dict:
     return {"attempts": attempts, "unhandled_asks": unhandled}
 
 
+def checked_lsp_probe(case: Case, raw: dict) -> bool:
+    """Conditional LSP disposition requires an actual configured read (§13 L5/L14)."""
+    for key in ("complete", "config_checked", "mock_received", "read_attempted", "readiness_checked", "pin_owned"):
+        if member(raw, key, bool) is not True:
+            raise EvidenceUnavailable("LSP configured-read probe lacks " + key)
+    seconds = member(raw, "readiness_seconds", float)
+    if not 0 <= seconds <= 5:
+        raise EvidenceUnavailable("LSP readiness probe exceeds its bound")
+    spawned = member(raw, "spawned", bool)
+    expected = "offered" if spawned else "lsp: not offered by pinned 2.0.22"
+    if member(raw, "disposition", str) != expected:
+        raise EvidenceUnavailable("LSP disposition disagrees with the configured-read probe")
+    if not spawned and expected not in case.limitations:
+        case.limitations.append(expected)
+    case.check("configured LSP tool-read and readiness probe observed", member(raw, "read_attempted", bool))
+    return spawned
+
+
 def case_never_ask(driver: CaseDriver, case: Case) -> None:
+    lsp_spawned = checked_lsp_probe(case, driver.execute("lsp_probe"))
     driver.execute("set_inherit", settings={"skills": "off"})
     project = fixture(driver, "never-ask", provider="mock", fake_lsp=True,
                       mcp=True, plugin=True, hook=True, subagent="oclive-ask",
@@ -1123,9 +1160,11 @@ def case_never_ask(driver: CaseDriver, case: Case) -> None:
                        in {"action.denied", "tool_unavailable"})
     case.check("no unattributed unhandled ask", member(observation, "unhandled_asks", int) == 0)
     helpers = driver.execute("helper_observations")
-    for key in ("mcp_started", "plugin_started", "hook_started", "fake_lsp_started",
+    for key in ("mcp_started", "plugin_started", "hook_started",
                 "package_inventory_clean", "binary_inventory_clean"):
         case.check(key, member(helpers, key, bool))
+    if lsp_spawned:
+        case.check("required configured fake LSP spawned", member(helpers, "fake_lsp_started", bool))
 
 
 def case_marker(driver: CaseDriver, case: Case) -> None:
@@ -1348,7 +1387,7 @@ def case_identity(driver: CaseDriver, case: Case) -> None:
     guard = driver.execute("seam_observation", point=point)
     case.check("exactly one identity lookup", member(guard, "acknowledged", list) == [1])
     control = driver.execute("identity_duplicate_control", point=point)
-    case.check("duplicate guard sensitivity", member(control, "second_occurrence_failed", bool))
+    case.check("FAKE source/build-bound duplicate guard sensitivity", member(control, "second_occurrence_failed", bool))
     missing = driver.execute("missing_vendor_session", session=first["session_id"])
     case.check("missing ID resume mismatch", member(missing, "code", str) == "resume_mismatch")
     case.check("no replacement created", member(missing, "creates", int) == 0)
@@ -1416,6 +1455,14 @@ def case_long_run(driver: CaseDriver, case: Case) -> None:
                <= 20 * 60)
 
 
+def case_deferred(_driver: CaseDriver, case: Case, item: str) -> None:
+    """Unimplemented bounded live triggers stay deferred, never pass (§13 L1/L6/L12)."""
+    case.disposition = "deferred-with-reason"
+    case.result = "deferred"
+    case.reason = item + ": no reviewed bounded trigger; a freshly restarted capture cannot prove this row"
+    case.limitations.append(case.reason)
+
+
 def case_record(driver: CaseDriver, case: Case, item: str, limit: int) -> None:
     observation = driver.execute("bounded_probe", item=item, attempt_limit=limit)
     attempts = member(observation, "attempts", int)
@@ -1470,8 +1517,19 @@ def case_anchor(driver: CaseDriver, case: Case) -> None:
         if point not in points or type(points[point]) is not bool:
             raise EvidenceUnavailable("missing lifecycle capability " + point)
         if not points[point]:
+            if point in {"lsp_during", "lsp_after"}:
+                if checked_lsp_probe(case, member(offered, "lsp_probe", dict)):
+                    raise EvidenceUnavailable("LSP offered probe disagrees with lifecycle capability")
+                continue
             if point not in {"reload", "disposal"}:
                 raise EvidenceUnavailable("required spawn life point unavailable: " + point)
+            note = member(member(offered, "notes", dict), point, str)
+            if not note:
+                raise EvidenceUnavailable("optional lifecycle skip is unlabelled")
+            case.limitations.append(note)
+            optional = offered.get("optional_offered")
+            if type(optional) is dict and member(optional, point, bool):
+                raise EvidenceUnavailable("offered lifecycle operation was not sampled: " + point)
             continue
         sample = driver.execute("lifecycle_prepare", point=point, build="release")
         case.check("Host-launched pinned generation", member(sample, "host_launched", bool))
@@ -1539,12 +1597,12 @@ OC_DISPOSITIONS = {
 }
 
 L_DISPOSITIONS = {
-    "L1": ("record-only", "collision", 12), "L2": ("gate", "write_cancel", 2),
+    "L1": ("deferred-with-reason", "collision", 0), "L2": ("gate", "write_cancel", 2),
     "L3": ("gate", "foreign", 1), "L4": ("gate", "hostile_provider", 8),
-    "L5": ("gate", "never_ask", 1), "L6": ("record-only", "forms", 3),
+    "L5": ("gate", "never_ask", 1), "L6": ("deferred-with-reason", "forms", 0),
     "L7": ("record-only", "compaction", 3), "L8": ("record-only", "error_shapes", 9),
     "L9": ("record-only", "long_run", 32), "L10": ("deferred-with-reason", "macos", 0),
-    "L11": ("gate", "credential_shape", 1), "L12": ("record-only", "other", 10),
+    "L11": ("gate", "credential_shape", 1), "L12": ("deferred-with-reason", "other", 0),
     "L14": ("gate", "anchor", 32),
 }
 
@@ -1556,10 +1614,10 @@ CASES = {
     "write_cancel": case_write_cancel, "foreign": case_foreign,
     "transport_loss": case_transport_loss, "identity": case_identity,
     "compaction": case_compaction, "long_run": case_long_run, "anchor": case_anchor,
-    "collision": lambda driver, case: case_record(driver, case, "collision", 12),
-    "forms": lambda driver, case: case_record(driver, case, "forms", 3),
+    "collision": lambda driver, case: case_deferred(driver, case, "collision"),
+    "forms": lambda driver, case: case_deferred(driver, case, "forms"),
     "error_shapes": case_error_shapes,
-    "other": lambda driver, case: case_record(driver, case, "other", 10),
+    "other": lambda driver, case: case_deferred(driver, case, "other"),
 }
 
 PHASE_CASES = {
@@ -1573,7 +1631,7 @@ PHASE_CASES = {
 }
 
 
-def run_phase(driver: CaseDriver, phase_name: str) -> list[dict]:
+def run_phase(driver: CaseDriver, phase_name: str, *, record_sink=None) -> list[dict]:
     phase = next((row for row in PHASES if row.name == phase_name), None)
     if phase is None:
         raise EvidenceUnavailable("unknown phase")
@@ -1588,15 +1646,17 @@ def run_phase(driver: CaseDriver, phase_name: str) -> list[dict]:
     records = []
     for name in PHASE_CASES[phase_name]:
         driver.execute("phase_guard")
-        if name in {"collision", "forms", "compaction", "error_shapes", "other"}:
+        if name in {"compaction", "error_shapes"}:
             driver.execute("phase_build", build="release")
         disposition = "record-only" if name in {"collision", "forms", "compaction",
                                                "error_shapes", "other", "long_run"} else "gate"
         records.append(run_case(driver, name, CASES[name], disposition))
-        build_kind = ("release" if name in {"collision", "forms", "compaction", "error_shapes", "other"}
+        build_kind = ("release" if name in {"compaction", "error_shapes"}
                       else phase.build)
         records[-1]["via_build"] = {"kind": build_kind, "sha256": builds[build_kind]}
         records[-1]["both_build_hashes"] = dict(builds)
+        if record_sink is not None:
+            record_sink(records)
         # A failed gate ends admission; record-only absence does not pretend to
         # pass, but may allow another bounded observation in this phase.
         if records[-1]["disposition"] == "gate" and records[-1]["result"] != "pass":

@@ -14,6 +14,8 @@ import importlib
 import json
 import os
 import stat
+import shutil
+import secrets
 from pathlib import Path
 import sys
 import time
@@ -44,7 +46,7 @@ FAKE_GATES = ("fmt", "clippy", "clippy-failpoints", "nextest-default", "nextest-
 VERSION = "2.0.22"
 E7_SHA256 = "540fdf565da27de9df69b6c3864582344e74ac4ffa225c283b289481d215d241"
 TEST_MODULES = ("opencode_safety_tests", "opencode_cases_tests", "opencode_driver_tests",
-                "opencode_barrier_tests", "opencode_tests")
+                "opencode_barrier_tests", "opencode_runtime_tests", "opencode_tests")
 _ACQUISITION_ROOT = None
 
 
@@ -195,22 +197,20 @@ def package_manifest(package):
 
 
 def acquire(evidence):
-    """Try npm, same-tag official GitHub, then baseline; every binary must match §2."""
+    """Only pre-anchored official npm archives may reach decompression (packet §2)."""
     home = safety.private_directory(evidence / "acquisition-home")
     unavailable = []
     with acquisition_home(home):
-        for name in ("@opencode/cli-linux-x64", "github", "@opencode/cli-linux-x64-baseline"):
+        for name in ("@opencode/cli-linux-x64", "@opencode/cli-linux-x64-baseline"):
             destination = evidence / ("pinned-" + str(len(unavailable)))
             try:
-                if name == "github":
-                    return acquire_release(destination)
                 dist = package_manifest(name)
+                if dist["integrity"] != "sha512-" + safety.NPM_SHA512 \
+                        or dist["unpackedSize"] != safety.NPM_UNPACKED_SIZE:
+                    raise safety.Blocked("registry archive anchor differs from reviewed pin")
                 raw = official_get(dist["tarball"], allowed_hosts={"registry.npmjs.org"})
-                integrity = dist["integrity"]
-                if not integrity.startswith("sha512-"):
-                    raise safety.Blocked("npm SHA-512 anchor unavailable")
-                return safety.extract_pinned_npm(raw, destination, integrity=integrity[7:],
-                                                 unpacked_size=dist["unpackedSize"])
+                return safety.extract_pinned_npm(raw, destination, integrity=safety.NPM_SHA512,
+                                                 unpacked_size=safety.NPM_UNPACKED_SIZE)
             except (safety.Blocked, ValueError, OSError):
                 # Retain only source identity. No raw HTTP errors, headers or URLs.
                 unavailable.append(name)
@@ -218,23 +218,53 @@ def acquire(evidence):
 
 
 def acquire_release(destination):
-    """Exact-tag GitHub fallback, with official asset identity and HTTPS origins."""
-    raw = official_get(
-        "https://api.github.com/repos/anomalyco/opencode/releases/tags/v" + VERSION,
-        allowed_hosts={"api.github.com"}, limit=1024 * 1024)
-    release = json.loads(raw)
-    if type(release) is not dict or release.get("tag_name") != "v" + VERSION \
-            or release.get("draft") is not False or type(release.get("assets")) is not list:
-        raise safety.Blocked("official release tag unavailable")
-    assets = [row for row in release["assets"] if type(row) is dict
-              and row.get("name") == "opencode-linux-x64.tar.gz"]
-    if len(assets) != 1 or type(assets[0].get("browser_download_url")) is not str:
-        raise safety.Blocked("official Linux release asset unavailable")
-    raw = official_get(
-        assets[0]["browser_download_url"], allowed_hosts={"github.com"},
-        redirect_hosts={"github.com", "release-assets.githubusercontent.com",
-                        "objects.githubusercontent.com"})
-    return safety.extract_pinned_release(raw, destination)
+    """Unanchored GitHub archives are disabled before network or parsing (packet §2)."""
+    raise safety.Blocked("GitHub fallback has no reviewed pre-extraction archive pin")
+
+
+def private_recovery_root():
+    """Create/check the private recovery chain below scratchpad (packet §13 N6)."""
+    path = SCRATCHPAD
+    for part in RECOVERY_ROOT.relative_to(SCRATCHPAD).parts:
+        path = path / part
+        if path == RECOVERY_ROOT or not path.exists():
+            safety.private_directory(path)
+        else:
+            row = path.lstat()
+            if not stat.S_ISDIR(row.st_mode) or row.st_uid != os.getuid() \
+                    or stat.S_IMODE(row.st_mode) & 0o022:
+                raise safety.Blocked("recovery parent is unsafe")
+    return path
+
+
+def system_tools_preflight():
+    """Require known system rg/python3 before acquisition or daemon preparation (§13)."""
+    for name in ("rg", "python3"):
+        candidate = shutil.which(name, path=os.pathsep.join(safety.SYSTEM_PATHS))
+        if candidate is None or Path(candidate).resolve().parent not in \
+                {Path(part).resolve() for part in safety.SYSTEM_PATHS}:
+            raise safety.Blocked("qualification requires system " + name)
+    if not Path("/usr/bin/python3").is_file() or not os.access("/usr/bin/python3", os.X_OK):
+        raise safety.Blocked("qualification requires the system fixture python3")
+    return {"rg": True, "python3": True, "system_directories_only": True}
+
+
+def protected_write(vault, path, value, secret_forms=()):
+    """Scan every current bearer/synthetic form before creating evidence (§13 L4)."""
+    raw = json.dumps(value, allow_nan=False).encode()
+    if any(form and form in raw for form in secret_forms):
+        raise safety.Blocked("bearer or synthetic secret rejected from evidence")
+    vault.safe_write_json(path, value)
+
+
+def persist_phase(evidence, phase, rows, vault, secret_forms=()):
+    """Publish each protected partial phase snapshot atomically (packet §13 M9)."""
+    pending = evidence / (phase + "." + secrets.token_hex(8) + ".pending")
+    try:
+        protected_write(vault, pending, rows, secret_forms)
+        pending.replace(evidence / (phase + ".json"))
+    finally:
+        pending.unlink(missing_ok=True)
 
 
 def selected_phases(requested):
@@ -291,6 +321,7 @@ def main(argv=None):
                 raise safety.Blocked("offline self-tests failed")
             fake_gates = verify_fake_gates(args.fake_gate_manifest, args.via_release,
                                           args.via_failpoints)
+            info["system_tools"] = system_tools_preflight()
             pinned = acquire(args.evidence) if args.acquire else args.opencode.resolve()
             safety.verify_binary(pinned)
             from opencode_driver import Driver
@@ -302,16 +333,22 @@ def main(argv=None):
             # A fresh evidence path must still find the previous stopped-daemon
             # journal (N6). Its private root is fixed within this worktree.
             driver.journal = safety.StopJournal(
-                safety.private_directory(RECOVERY_ROOT) / "stopped-daemon.json", driver.proc)
+                private_recovery_root() / "stopped-daemon.json", driver.proc)
             driver.prepare()
             adapter = cases.DriverAdapter(driver)
             for phase in phases:
                 signals.guard()
-                phase_records = cases.run_phase(adapter, phase)
-                vault.safe_write_json(args.evidence / (phase + ".json"), phase_records)
-                # A rejected record must not re-enter the final sink after
-                # cleanup. Keep the memory-only guard alive through both sinks.
-                records.extend(phase_records)
+                accepted = 0
+                def retain_phase(rows):
+                    nonlocal accepted
+                    persist_phase(args.evidence, phase, rows, vault,
+                                  getattr(driver, "secret_forms", ()))
+                    # Only published, scanned records can reach the final sink.
+                    records.extend(rows[accepted:])
+                    accepted = len(rows)
+                phase_records = cases.run_phase(adapter, phase, record_sink=retain_phase)
+                if accepted != len(phase_records):
+                    retain_phase(phase_records)
                 if any(row["disposition"] == "gate" and row["result"] != "pass"
                        for row in phase_records):
                     break
@@ -339,7 +376,8 @@ def main(argv=None):
                 info["result"] = "blocked"
             info.update(ended_at=time.time(), cases=records, cleanup=cleanup)
             try:
-                vault.safe_write_json(args.evidence / "summary.json", info)
+                protected_write(vault, args.evidence / "summary.json", info,
+                                getattr(driver, "secret_forms", ()))
             except safety.Blocked:
                 info["result"] = "blocked"
                 info["summary_rejected"] = True
