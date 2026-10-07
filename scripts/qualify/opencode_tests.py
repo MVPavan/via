@@ -354,6 +354,8 @@ class EntryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="oc-entry-", dir=opencode.SCRATCHPAD) as directory:
             parent = Path(directory) / "shared-scratch-parent"
             parent.mkdir(mode=0o755)
+            # Establish the asserted mode independently of the caller's umask.
+            parent.chmod(0o755)
             target = parent / "recovery"
             with patch.object(opencode, "RECOVERY_ROOT", target):
                 self.assertEqual(opencode.private_recovery_root(), target)

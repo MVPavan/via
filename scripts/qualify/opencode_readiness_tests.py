@@ -3,6 +3,8 @@ import json
 import sqlite3
 import tempfile
 import time
+import threading
+from types import SimpleNamespace
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -12,6 +14,134 @@ from opencode_safety import Blocked, Identity
 
 
 class ReadinessTests(unittest.TestCase):
+    def host_handover(self):
+        d=self.driver; d.state.mkdir(mode=0o700,exist_ok=True)
+        path=d.state/'store.sqlite3'
+        with sqlite3.connect(path) as db:
+            db.execute('DROP TABLE IF EXISTS anchors')
+            db.execute('CREATE TABLE anchors (generation,pid,start_ticks,vendor_pid,phase,owner_server,absence_time)')
+            db.executemany('INSERT INTO anchors VALUES (?,?,?,?,?,?,?)',[
+                ('own',12,2,13,'arm_intent','owned-server',None),
+                ('next',22,4,23,'arm_intent','next-server',None)])
+        if '_host_record' in d.__dict__: del d._host_record
+        path.chmod(0o600)
+        d._verified_host_record={**self.record,'phase':'arm_intent','state_root':d.state,'vendor':d.vendor_identity}
+        d.proc.alive.side_effect=lambda identity: identity not in {Identity(12,2),Identity(13,3)}
+        d.proc.stat.side_effect=lambda pid: {'pid':pid,'start_ticks':4 if pid==22 else 5,
+            'ppid':11 if pid==22 else 22}
+        return path
+
+    def test_owned_dead_predecessor_waits_for_absence_commit(self):
+        def commit(seconds):
+            self.clock[0]+=seconds
+            with sqlite3.connect(path) as db:
+                db.execute("UPDATE anchors SET absence_time='proved' WHERE generation='own'")
+                db.execute("UPDATE anchors SET pid=22,start_ticks=4,vendor_pid=23,phase='arm_intent' WHERE generation='next'")
+        for stage in ('intent','identified','arm_intent'):
+            with self.subTest(stage=stage):
+                path=self.host_handover()
+                with sqlite3.connect(path) as db:
+                    db.execute("UPDATE anchors SET pid=?,start_ticks=?,vendor_pid=?,phase=? WHERE generation='next'",
+                        (None if stage=='intent' else 22,None if stage=='intent' else 4,
+                         23 if stage=='arm_intent' else None,stage))
+                with mock.patch.object(transport.time,'sleep',side_effect=commit):
+                    result=self.driver._host_record(allow_absent=True)
+                self.assertEqual(result['generation'],'next')
+                self.assertEqual(result['anchor'],Identity(22,4))
+        self.assertGreater(self.clock[0],0)
+        self.assertIn(mock.call(self.driver.daemon),self.driver.proc.verify.call_args_list)
+        for fault,reason in (('unknown','owned Host generation ambiguous'),
+                             ('live','owned Host generation ambiguous'),
+                             ('uncertain','owned Host predecessor identity unverifiable'),
+                             ('unsafe','owned Host handover Store unsafe'),
+                             ('ancestry','owned Host successor ancestry changed')):
+            with self.subTest(fault=fault):
+                path=self.host_handover()
+                if fault=='unknown': self.driver._verified_host_record=None
+                elif fault=='live': self.driver.proc.alive.side_effect=None; self.driver.proc.alive.return_value=True
+                elif fault=='uncertain': self.driver.proc.alive.side_effect=None; self.driver.proc.alive.return_value=None
+                elif fault=='unsafe': path.chmod(0o644)
+                elif fault=='ancestry': self.driver.proc.stat.side_effect=lambda pid:{'start_ticks':4,'ppid':999}
+                before=self.clock[0]
+                with self.assertRaisesRegex(Blocked,reason): self.driver._host_record(allow_absent=True)
+                self.assertEqual(self.clock[0],before)
+
+    def test_owned_handover_cannot_extend_phase_deadline(self):
+        for state in ('gone','going'):
+            with self.subTest(state=state):
+                self.host_handover(); self.clock[0]=0; self.driver.phase_deadline=.03
+                if state=='going':
+                    self.driver._killed_anchor=self.driver.anchor
+                    self.driver.proc.alive.side_effect=None; self.driver.proc.alive.return_value=True
+                with self.assertRaisesRegex(Blocked,'owned Host predecessor absence deadline'):
+                    self.driver._host_record(allow_absent=True)
+                self.assertGreaterEqual(self.clock[0],.03)
+                self.assertLessEqual(self.clock[0],.04)
+        path=self.host_handover(); self.clock[0]=0; self.driver.phase_deadline=.03
+        def changed(seconds):
+            self.clock[0]+=seconds
+            with sqlite3.connect(path) as db:
+                db.execute("UPDATE anchors SET generation='other' WHERE generation='next'")
+        with mock.patch.object(transport.time,'sleep',side_effect=changed), \
+             self.assertRaisesRegex(Blocked,'owned Host handover successor changed'):
+            self.driver._host_record(allow_absent=True)
+
+    def test_native_string_session_with_false_verification_blocks_immediately(self):
+        self.driver.handles['s_owned']='fake-memory-only-handle'
+        self.driver.via=mock.Mock(return_value={'state':'running',
+            'vendor_identity_verified':False,'vendor_session_id':'ses_owned'})
+        with self.assertRaisesRegex(Blocked,'native session identity unverified'):
+            self.driver._vendor_sid('s_owned')
+        self.driver.via.assert_called_once()
+        self.assertEqual(self.clock[0],0)
+
+    def publication(self,die):
+        d=self.driver; current=Identity(13,4)
+        if die: d.vendor_identity=current
+        provider=SimpleNamespace(); threads=[]; errors=[]; verified=threading.Event()
+        d._lifecycle_schema={}; d.stop=mock.Mock(); d.start=mock.Mock()
+        d.fixture=mock.Mock(return_value=Path(self.root.name))
+        d.mock_providers={'l14-1-publication':provider}
+        d._mock_request_admit=mock.Mock()
+        d._await_owned=mock.Mock(side_effect=lambda read,*args:read())
+        def verify(identity):
+            if identity!=current: raise Blocked('stale publication identity')
+            verified.set()
+        d.proc.verify.side_effect=verify; d.proc.alive.return_value=True
+        def submit(_):
+            def request():
+                try: provider.admit_request('fixture-free')
+                except BaseException as error: errors.append(error)
+            thread=threading.Thread(target=request); threads.append(thread); thread.start()
+            self.assertTrue(d._publication_entered.wait(1))
+            # The request is already in its hold while ensure_vendor is pending.
+            threading.Event().wait(.03)
+            return {'session_id':'s_owned','turn':'s_owned/1'}
+        def ensure():
+            if not die: self.assertEqual(d.proc.verify.call_count,0)
+            d.vendor_identity=current
+        d.via=mock.Mock(side_effect=submit); d.ensure_vendor=mock.Mock(side_effect=ensure)
+        try:
+            d._prepare_lifecycle('publication')
+            self.assertTrue(verified.wait(1))
+            if die:
+                d.proc.alive.return_value=False
+                threads[0].join(1)
+                self.assertFalse(threads[0].is_alive())
+                self.assertFalse(d._publication_release.is_set())
+            self.assertFalse(errors)
+        finally:
+            d._publication_release.set()
+            for thread in threads: thread.join(1)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertTrue(all(call.args==(current,) for call in d.proc.verify.call_args_list))
+
+    def test_publication_waits_for_current_generation_verification(self):
+        self.publication(False)
+
+    def test_publication_intentional_vendor_death_ends_hold_without_refusal(self):
+        self.publication(True)
+
     def setUp(self):
         self.root = tempfile.TemporaryDirectory(prefix='via-ocreadiness-')
         self.addCleanup(self.root.cleanup)

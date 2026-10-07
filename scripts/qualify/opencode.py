@@ -391,7 +391,7 @@ def main(argv=None):
             info["self_tests"] = count
             skipped=getattr(self_test,'skipped',[])
             cleanup_proofs=getattr(self_test,'real_via_cleanup',[])
-            admission={'count':count,'failed':[test_identity(value) for value in failures],
+            admission={'count':count,'failed':failures,
                 'skipped_count':len(skipped) if type(skipped) is list else 0,
                 'real_via_cleanup':cleanup_proofs if type(cleanup_proofs) is list else []}
             info['self_test_admission']=admission

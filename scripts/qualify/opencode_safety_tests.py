@@ -35,6 +35,27 @@ def fake_stat(pid=71, ticks=123, state="S"):
 
 
 class SafetyTests(unittest.TestCase):
+    def test_pidfd_proves_exit_when_second_stat_is_reaped(self):
+        proc=safety.ProcReader()
+        poll=mock.Mock(); poll.poll.return_value=[(99, safety.select.POLLIN)]
+        with mock.patch.object(proc,'stat',side_effect=[{'start_ticks':123},None]), \
+             mock.patch.object(safety.os,'pidfd_open',return_value=99), \
+             mock.patch.object(safety.select,'poll',return_value=poll), \
+             mock.patch.object(safety.os,'close') as close:
+            self.assertIs(proc.alive(self.identity),False)
+            poll.register.assert_called_once_with(99,safety.select.POLLIN)
+            close.assert_called_once_with(99)
+
+    def test_hidden_entry_with_live_pidfd_stays_unverifiable(self):
+        proc=safety.ProcReader()
+        poll=mock.Mock(); poll.poll.return_value=[]
+        with mock.patch.object(proc,'stat',side_effect=[{'start_ticks':123},None]), \
+             mock.patch.object(safety.os,'pidfd_open',return_value=99), \
+             mock.patch.object(safety.select,'poll',return_value=poll), \
+             mock.patch.object(safety.os,'close'):
+            self.assertIsNone(proc.alive(self.identity))
+            poll.poll.assert_called_once_with(0)
+
     def test_owned_metadata_requests_share_the_bootstrap_absolute_deadline(self):
         client=safety.OwnedHTTP('http://127.0.0.1:1234',self.identity,self.proc,b'synthetic-password')
         limit=time.monotonic()+1
@@ -233,6 +254,8 @@ class SafetyTests(unittest.TestCase):
         state = self.root / "state"
         state.mkdir(mode=0o700)
         (state / "vendor").mkdir(mode=0o755)
+        # The live supervisor's 0077 umask must not repair this hostile fixture.
+        (state / "vendor").chmod(0o755)
         self.assertBlocked(lambda: safety.create_namespace(state), 'private directory chain is unsafe')
 
     def test_password_read_once_and_never_written(self):

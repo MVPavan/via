@@ -282,6 +282,7 @@ class Driver:
         self._bootstrap_cleanup=False; self._bootstrap_count=0
         self._bootstrap_deadline=None
         self._observation_deadline=None
+        self._verified_host_record=None; self._killed_anchor=None
         self._namespace_bootstraps={}
         self._publication_entered=threading.Event(); self._publication_release=threading.Event()
         if initialize:
@@ -618,26 +619,107 @@ class Driver:
         return value
 
     def _host_record(self,*,allow_absent=False):
+        """§13: retry only an owned, verified predecessor's pending absence commit."""
         path=self.state/'store.sqlite3'
-        try:
-            with sqlite3.connect(f'file:{path}?mode=ro',uri=True,timeout=1) as connection:
-                rows=connection.execute('SELECT generation,pid,start_ticks,vendor_pid,phase,owner_server '
-                                        'FROM anchors WHERE owner_server IS NOT NULL '
-                                        'AND absence_time IS NULL').fetchall()
-        except (sqlite3.Error,OSError) as error:
-            raise Blocked('owned Host launch record unavailable') from error
-        if len(rows)>1: raise Blocked('owned Host generation ambiguous')
+        deadline=min(time.monotonic()+OWNED_READINESS_SECONDS,
+                     self.phase_deadline if self.phase_deadline is not None else float('inf'),
+                     self._bootstrap_deadline if self._bootstrap_active and self._bootstrap_deadline is not None
+                     else float('inf'), self._observation_deadline if self._observation_deadline is not None
+                     else float('inf'))
+        successor=None; binding=None; daemon=self.daemon; state_root=self.state
+        while True:
+            try:
+                with contextlib.closing(sqlite3.connect(f'file:{path}?mode=ro',uri=True,timeout=1)) as connection:
+                    rows=connection.execute('SELECT generation,pid,start_ticks,vendor_pid,phase,owner_server '
+                                            'FROM anchors WHERE owner_server IS NOT NULL '
+                                            'AND absence_time IS NULL').fetchall()
+            except (sqlite3.Error,OSError) as error:
+                raise Blocked('owned Host launch record unavailable') from error
+            if successor is not None:
+                if self.daemon!=daemon or self.state!=state_root:
+                    raise Blocked('owned Host handover daemon changed')
+                self.proc.verify(daemon)
+                if self.signals: self.signals.guard()
+                if time.monotonic()>=deadline: raise Blocked('owned Host predecessor absence deadline')
+                if not any(row[0]==successor for row in rows):
+                    raise Blocked('owned Host handover successor changed')
+            if len(rows)<=1: break
+            pending=self._owned_host_handover(rows)
+            if pending is None: raise Blocked('owned Host generation ambiguous')
+            if successor is not None and pending['generation']!=successor:
+                raise Blocked('owned Host handover successor changed')
+            if binding is not None and any(binding[key] is not None and pending[key]!=binding[key]
+                                          for key in ('server_id','anchor','vendor')):
+                raise Blocked('owned Host handover successor changed')
+            binding=pending; successor=pending['generation']
+            if time.monotonic()>=deadline: raise Blocked('owned Host predecessor absence deadline')
+            time.sleep(min(.01,max(0,deadline-time.monotonic())))
         if not rows:
             if allow_absent: return None
             raise Blocked('owned Host generation absent')
+        generation,pid,ticks,vendor_pid,phase,server_id=rows[0]
+        if binding is not None:
+            if server_id!=binding['server_id'] or (binding['anchor'] is not None
+                    and (pid,ticks)!=(binding['anchor'].pid,binding['anchor'].start_ticks)) or (binding['vendor'] is not None
+                    and vendor_pid!=binding['vendor'].pid):
+                raise Blocked('owned Host handover successor changed')
+            for identity in (binding['anchor'],binding['vendor']):
+                if identity is not None: self.proc.verify(identity)
         # One not-yet-armed intent is pending; never filter it out of an
         # ambiguity check or retry an unreadable/invalid Store.
-        if any(value is None for value in rows[0][1:4]):
+        if any(value is None for value in (pid,ticks,vendor_pid)):
             if allow_absent: return None
             raise Blocked('owned Host child identity not yet recorded')
-        generation,pid,ticks,vendor_pid,phase,server_id=rows[0]
         return {'generation':generation,'anchor':safety.Identity(pid,ticks),
                 'vendor_pid':vendor_pid,'phase':phase,'server_id':server_id}
+
+    def _owned_host_handover(self,rows):
+        """§13: private Host intent plus captured predecessor identity, never a row-count guess."""
+        known=self._verified_host_record
+        if len(rows)!=2 or known is None or known['state_root']!=self.state or self.daemon is None:
+            return None
+        self.proc.verify(self.daemon)
+        predecessor=(known['generation'],known['anchor'].pid,known['anchor'].start_ticks,
+                     known['vendor_pid'],known['phase'],known['server_id'])
+        if rows.count(predecessor)!=1: return None
+        current=next(row for row in rows if row!=predecessor)
+        generation,pid,ticks,vendor_pid,phase,server=current
+        if type(generation) is not str or not generation or generation==known['generation'] \
+                or type(server) is not str or not server or server==known['server_id'] \
+                or phase not in {'intent','identified','arm_intent'}:
+            return None
+        # These are the private daemon's Host intents, not foreign live rows.
+        # Once an identity is durable it must still match its owned ancestry.
+        try:
+            state=self.state.lstat(); store=(self.state/'store.sqlite3').lstat()
+        except OSError as error:
+            raise Blocked('owned Host handover Store unsafe') from error
+        if not stat.S_ISDIR(state.st_mode) or stat.S_IMODE(state.st_mode)!=0o700 \
+                or not stat.S_ISREG(store.st_mode) or stat.S_IMODE(store.st_mode)!=0o600 \
+                or state.st_uid!=os.getuid() or store.st_uid!=os.getuid():
+            raise Blocked('owned Host handover Store unsafe')
+        anchor=None; vendor=None
+        if pid is None or ticks is None:
+            if phase!='intent' or any(value is not None for value in (pid,ticks,vendor_pid)):
+                return None
+        else:
+            anchor=safety.Identity(pid,ticks); self.proc.verify(anchor)
+            row=self.proc.stat(pid)
+            if row is None or row['start_ticks']!=ticks or row['ppid']!=self.daemon.pid:
+                raise Blocked('owned Host successor ancestry changed')
+            self.identities.add(anchor)
+            if vendor_pid is not None:
+                row=self.proc.stat(vendor_pid)
+                if row is None or row['ppid']!=pid:
+                    raise Blocked('owned Host successor ancestry changed')
+                vendor=safety.Identity(vendor_pid,row['start_ticks']); self.proc.verify(vendor)
+                self.identities.add(vendor)
+        states=[self.proc.alive(identity) for identity in (known['anchor'],known['vendor'])]
+        if any(value is None for value in states):
+            raise Blocked('owned Host predecessor identity unverifiable')
+        gone=all(value is False for value in states)
+        going=self._killed_anchor==known['anchor'] and all(type(value) is bool for value in states)
+        return {'generation':generation,'server_id':server,'anchor':anchor,'vendor':vendor} if gone or going else None
 
     def ensure_vendor(self):
         """Acquire through one held mock turn, then authenticate the Host child (§13)."""
@@ -806,6 +888,7 @@ class Driver:
         if status!=200 or value['pid']!=identity.pid or value['version']!='2.0.22':
             raise Blocked('owned vendor handshake mismatch')
         self.vendor_identity=identity; self.anchor=record['anchor']
+        self._verified_host_record={**record,'state_root':self.state,'vendor':identity}
         self.server_identities.add(identity)
         self.identities.update((identity,self.anchor))
         rotated=None if previous is None else self.vault.changed(previous,identity)
@@ -1153,7 +1236,10 @@ class Driver:
         def read():
             value=self.via(['status',session])
             sid=value.get('vendor_session_id')
-            if type(sid) is str and value.get('vendor_identity_verified') is True: return sid
+            if type(sid) is str:
+                if value.get('vendor_identity_verified') is not True:
+                    raise Blocked('native session identity unverified')
+                return sid
             if sid is not None and type(sid) is not str:
                 raise Blocked('native session identity malformed')
             if value.get('state')!='running': raise Blocked('session ended before native creation')
@@ -1734,13 +1820,27 @@ class Driver:
         if point=='publication':
             provider=self.mock_providers['l14-'+str(self.lifecycle_counter)+'-'+point]
             self._publication_entered.clear(); self._publication_release.clear()
+            verified=threading.Event(); generation=[]
             def publication_request(model):
                 self._mock_request_admit(model); self._publication_entered.set()
                 deadline=min(self.phase_deadline or float('inf'),time.monotonic()+180)
                 while not self._publication_release.wait(.01):
-                    self.proc.verify(self.vendor_identity)
                     if self.signals: self.signals.guard()
                     if time.monotonic()>=deadline: raise Blocked('publication response barrier deadline')
+                    # The request can arrive before ensure_vendor finishes.
+                    # Publish only that completed observation, never a stale
+                    # field left over from the retired predecessor.
+                    if not verified.is_set(): continue
+                    identity=generation[0]
+                    alive=self.proc.alive(identity)
+                    if alive is False: return  # L14 intentionally killed this generation.
+                    if alive is None: raise Blocked('publication vendor identity unverifiable')
+                    if self.vendor_identity!=identity:
+                        raise Blocked('publication vendor generation changed')
+                    try: self.proc.verify(identity)
+                    except Blocked:
+                        if self.proc.gone(identity): return
+                        raise
             provider.admit_request=publication_request
         receipt=self.via(['spawn','--harness','opencode','--model',safety.MOCK_IDENTITY,
                           '--cwd',str(project),'--bound','full','--network','--background',
@@ -1748,6 +1848,8 @@ class Driver:
         if 'cli_error' in receipt: raise Blocked('fresh L14 turn refused')
         self.ensure_vendor()
         if point=='publication':
+            if self.vendor_identity is None: raise Blocked('publication verified vendor identity absent')
+            generation.append(self.vendor_identity); verified.set()
             self._await_owned(lambda:True if self._publication_entered.is_set() else None,
                               'publication model request unobserved')
             return
@@ -2306,6 +2408,7 @@ print('VIA HELPER DONE')
                 raise Blocked('daemon barrier not held')
             self.proc.verify(identity)
             self._sigkill_at=time.monotonic(); self.journal._signal(identity,signal.SIGKILL)
+            self._killed_anchor=identity
             return {'pid_only':True,'monotonic':float(self._sigkill_at)}
         if operation=='vendor_death':
             if identity!=self.vendor_identity or self._sigkill_at is None:

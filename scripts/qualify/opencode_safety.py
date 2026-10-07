@@ -213,16 +213,18 @@ class ProcReader:
         except OSError as error:
             return False if error.errno == errno.ESRCH else None
         try:
+            poll = select.poll()
+            poll.register(pidfd, select.POLLIN)
             try:
                 after = self.stat(identity.pid)
             except Blocked:
-                return None
+                after = None
             if after is None:
-                return None
+                # A reaped proc entry is definitive only if this open pidfd
+                # proves exit. A hidden entry with a live pidfd stays unknown.
+                return False if poll.poll(0) else None
             if after["start_ticks"] != identity.start_ticks:
                 return False
-            poll = select.poll()
-            poll.register(pidfd, select.POLLIN)
             return not bool(poll.poll(0))
         finally:
             os.close(pidfd)

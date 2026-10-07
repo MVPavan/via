@@ -55,6 +55,31 @@ class FakeDriver:
 
 
 class CasesTests(unittest.TestCase):
+    def test_identity_case_acquires_generation_before_arming_retired_host(self):
+        retired=False; calls=[]
+        first={'session_id':'s_owned','envelope':{'vendor_session_id':'ses_owned'}}
+        def execute(operation,**args):
+            nonlocal retired
+            calls.append(operation)
+            if operation=='idle_retirement': retired=True
+            elif operation=='owned_server_identity': retired=False
+            elif operation=='seam_arm':
+                if retired: raise transport.Blocked('owned Host generation absent')
+            elif operation=='start_turn': return {'session_id':'s_owned'}
+            elif operation=='seam_wait': return {'occurrence':1}
+            elif operation=='wait_turn': return {'state':'completed'}
+            elif operation=='seam_observation': return {'acknowledged':[1]}
+            elif operation=='identity_duplicate_control': return {'second_occurrence_failed':True}
+            elif operation=='missing_vendor_session': return {'code':'resume_mismatch','creates':0}
+            return {}
+        driver=SimpleNamespace(execute=execute)
+        with mock.patch.object(cases,'fixture',return_value='fixture'), \
+             mock.patch.object(cases,'turn',return_value=first), \
+             mock.patch.object(cases,'completed'):
+            cases.case_identity(driver,cases.Case('identity'))
+        self.assertLess(calls.index('idle_retirement'),calls.index('owned_server_identity'))
+        self.assertLess(calls.index('owned_server_identity'),calls.index('seam_arm'))
+
     def test_record_only_block_stops_every_later_case(self):
         driver=FakeDriver({'build_hashes':{'release':'a'*64,'test-failpoints':'b'*64},
                            'phase_begin':None,'phase_guard':None,'phase_build':None})

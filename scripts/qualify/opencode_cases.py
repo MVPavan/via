@@ -1435,6 +1435,9 @@ def case_identity(driver: CaseDriver, case: Case) -> None:
     first = turn(driver, project, "Reply READY.")
     completed(case, first)
     driver.execute("idle_retirement", session=first["session_id"])
+    # Arm the reopen seam against the acquired successor's exact generation.
+    # The retired Host row is deliberately absent; acquisition is mock-only.
+    driver.execute("owned_server_identity")
     point = SEAMS["identity"]
     context = {"session": first["session_id"],
                "vendor_session": first["envelope"]["vendor_session_id"]}
