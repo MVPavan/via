@@ -61,6 +61,7 @@ pub(crate) fn assert_private(path: &Path) -> TestResult {
 /// daemon guard of the sandbox records into.
 pub(crate) struct Sandbox {
     _root: tempfile::TempDir,
+    private_home: Option<PathBuf>,
     pub(crate) teardown: outer_cleanup::Teardown,
     /// Daemon generations started so far, naming each one's trace header
     /// and cleanup report.
@@ -100,6 +101,7 @@ impl Sandbox {
         fs::write(&fixture_path, serde_json::to_vec(fixture)?)?;
         Ok(Self {
             _root: root,
+            private_home: None,
             teardown: outer_cleanup::Teardown::new(),
             generations: AtomicUsize::new(0),
             via,
@@ -111,10 +113,33 @@ impl Sandbox {
         })
     }
 
+    /// `OpenCode` fake isolation (opencode.md §13): private HOME/XDG for every child.
+    pub(crate) fn new_private(fixture: &Value) -> TestResult<Self> {
+        let mut sandbox = Self::new(fixture)?;
+        let home = sandbox
+            .fixture
+            .parent()
+            .ok_or("missing sandbox root")?
+            .join("home");
+        private_dir(&home)?;
+        for name in ["config", "data", "cache", "tmp"] {
+            private_dir(&home.join(name))?;
+        }
+        sandbox.private_home = Some(home);
+        Ok(sandbox)
+    }
+
     pub(crate) fn command(&self) -> Command {
         let mut command = Command::new(&self.via);
         command.env_clear();
         command.env("PATH", std::env::var_os("PATH").unwrap_or_default());
+        if let Some(home) = &self.private_home {
+            command.current_dir(home).env("HOME", home);
+            command.env("XDG_CONFIG_HOME", home.join("config"));
+            command.env("XDG_DATA_HOME", home.join("data"));
+            command.env("XDG_CACHE_HOME", home.join("cache"));
+            command.env("TMPDIR", home.join("tmp"));
+        }
         command.env("VIA_STATE_DIR", &self.state);
         command.env("VIA_RUNTIME_DIR", &self.runtime);
         command.env("VIA_FAKE_AGENT_BINARY", &self.fake);

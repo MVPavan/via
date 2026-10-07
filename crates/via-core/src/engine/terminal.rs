@@ -1048,6 +1048,34 @@ mod tests {
         }
     }
 
+    /// `OpenCode` §3.2/§12: the existing launch carrier keeps VIA's predecessor detail in C1.
+    #[test]
+    fn opencode_predecessor_launch_detail_reaches_c1_failure_message() {
+        let turn = TurnNumber::try_from(1).unwrap();
+        let detail = "previous server pid 4242 (started 2026-10-01 09:15:00 UTC) still present; \
+                      before stopping it, check that it is VIA's OpenCode server";
+        let terminal = failed_terminal(AdapterError::Route(RouteFailure {
+            shared: true,
+            launch: Some(Box::new(via_adapters::LaunchCause {
+                step: "check previous server",
+                kind: None,
+                detail: Some(detail.to_owned()),
+            })),
+            ..route_failure(RouteError::TransportLost { turn })
+        }));
+        assert_eq!(terminal.state, "failed");
+        let failure = terminal.failure.expect("a launch failure");
+        assert_eq!(failure.class, FailureClass::SubmitFailed);
+        assert_eq!(
+            failure.data,
+            Some(serde_json::json!({"reason":"launch_failed"}))
+        );
+        assert!(
+            failure.message.contains(detail),
+            "VIA-owned predecessor detail was lost"
+        );
+    }
+
     fn vendor_terminal(status: via_adapters::VendorTerminalStatus) -> via_adapters::VendorTerminal {
         via_adapters::VendorTerminal {
             at: tokio::time::Instant::now(),

@@ -6,6 +6,7 @@
 #[path = "support/daemon.rs"]
 #[expect(dead_code, reason = "shared support; this file uses part of it")]
 mod daemon;
+mod opencode;
 #[path = "support/outer_cleanup.rs"]
 mod outer_cleanup;
 #[path = "support/scenario.rs"]

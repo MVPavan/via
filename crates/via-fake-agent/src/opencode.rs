@@ -631,6 +631,9 @@ fn stream_events(
                 return Ok(());
             } else if frame["exit"] == true {
                 process::exit(CRASHED);
+            } else if let Some(raw) = frame["raw_chunk"].as_str() {
+                // OC12b: partial/oversize SSE bytes without a framing repair.
+                chunk(stream, raw.as_bytes())?;
             } else if let Some(raw) = frame["raw_data"].as_str() {
                 chunk(stream, format!("data: {raw}\n\n").as_bytes())?;
             } else {

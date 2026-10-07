@@ -1346,7 +1346,7 @@ async fn stop(stdio: WireSender) -> Outcome {
 /// The most integration IDs a credential refusal names.
 const NAMED_INTEGRATIONS: usize = 16;
 
-/// §4.3 `unexpected_credential_state`: VIA's text naming only the
+/// §4.3 `unexpected_credential_state`: VIA's failed step and only the
 /// integrations that hold a connection, at most [`NAMED_INTEGRATIONS`].
 fn credential_detail(integrations: &[String]) -> String {
     let named = integrations
@@ -1362,8 +1362,8 @@ fn credential_detail(integrations: &[String]) -> String {
         String::new()
     };
     format!(
-        "unexpected_credential_state: VIA's OpenCode data holds connections for \
-         integrations {named}{more}"
+        "check credential state: unexpected_credential_state: VIA's OpenCode data \
+         holds connections for integrations {named}{more}"
     )
 }
 
@@ -1478,7 +1478,7 @@ mod tests {
         let two = vec!["acme-cloud".to_owned(), "other".to_owned()];
         let detail = credential_detail(&two);
         assert!(
-            detail.starts_with("unexpected_credential_state: "),
+            detail.starts_with("check credential state: unexpected_credential_state: "),
             "{detail}"
         );
         assert!(
@@ -1505,6 +1505,15 @@ mod tests {
         };
         let detail = predecessor_detail(&alive).unwrap_or_default();
         assert!(detail.starts_with(&alive.to_string()), "{detail}");
+        assert!(detail.contains(" UTC"), "start time omitted UTC: {detail}");
+        let error = via_wire::WireError::Host(via_wire::HostError::Fence(Box::new(alive)));
+        let turn = TurnNumber::try_from(1).unwrap_or_else(|_| unreachable!());
+        let routed = super::acquire_failure(&error, &["2.0.22"]).route_failure(turn);
+        assert_eq!(
+            routed.launch.and_then(|launch| launch.detail).as_deref(),
+            Some(detail.as_str()),
+            "acquisition mapping lost the predecessor detail"
+        );
         assert!(
             detail.contains("TZ=UTC ps -o lstart= -p 4242") && detail.contains("/proc/4242/cwd"),
             "{detail}"
