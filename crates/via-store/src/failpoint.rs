@@ -20,6 +20,8 @@
 //! also persist. The action `value` carries `"value"` too, a number the
 //! point reports in place of the one it would read ([`value`], §13.1
 //! `store.statvfs.free_bytes`); it may persist.
+//! `OpenCode` §13 qualification points additionally require an exact `target`
+//! object. Unrelated contexts do not consume occurrences or produce markers.
 //!
 //! A process VIA spawns without its environment, such as Host's anchor, is
 //! activated with the daemon's directory and token through [`activate`].
@@ -27,7 +29,7 @@
 use std::{
     collections::HashMap,
     fs::{self, OpenOptions},
-    io::{self, Write},
+    io::{self, Read, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock, PoisonError},
@@ -40,6 +42,10 @@ use serde::Deserialize;
 const DIR_ENV: &str = "VIA_FAILPOINT_DIR";
 const TOKEN_ENV: &str = "VIA_FAILPOINT_TOKEN";
 const POLL: Duration = Duration::from_millis(5);
+// OpenCode §13: private selector commands never carry payloads or credentials.
+const COMMAND_BYTES: u64 = 4096;
+const TARGET_FIELDS: usize = 8;
+const TARGET_VALUE_BYTES: usize = 1024;
 
 /// What a matching hit does.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -93,6 +99,8 @@ struct Command {
     /// wait, or the value to report.
     #[serde(default)]
     value: Option<u64>,
+    #[serde(default)]
+    target: Option<HashMap<String, String>>,
 }
 
 impl Command {
@@ -102,6 +110,25 @@ impl Command {
         let valued = matches!(self.action, Action::Delay | Action::Value);
         (!self.persist || valued || self.action == Action::FailIo)
             && (self.value.is_some() == valued)
+            && self.target.as_ref().is_none_or(|target| {
+                !target.is_empty()
+                    && target.len() <= TARGET_FIELDS
+                    && target.iter().all(|(key, value)| {
+                        !key.is_empty()
+                            && key.len() <= 64
+                            && !value.is_empty()
+                            && value.len() <= TARGET_VALUE_BYTES
+                    })
+            })
+    }
+
+    fn matches(&self, context: &[(&str, &str)]) -> bool {
+        self.target.as_ref().is_some_and(|target| {
+            target.len() == context.len()
+                && context
+                    .iter()
+                    .all(|(key, value)| target.get(*key).is_some_and(|expected| expected == value))
+        })
     }
 
     fn act(&self) -> Act {
@@ -196,16 +223,83 @@ impl Controller {
     /// Acts only once the acknowledgement is published: a failed write is
     /// returned instead, and no injected action runs.
     fn enter(&self, point: &'static str) -> io::Result<Option<(u64, Act)>> {
+        self.enter_for(point, None)
+    }
+
+    fn read_command(&self, point: &'static str) -> Option<Vec<u8>> {
+        let Ok(file) = fs::File::open(self.dir.join(format!("{point}.json"))) else {
+            return None;
+        };
+        let mut bytes = Vec::new();
+        if file
+            .take(COMMAND_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+            || bytes.len() as u64 > COMMAND_BYTES
+        {
+            // Missing, oversized or unreadable test input cannot activate a point.
+            return None;
+        }
+        Some(bytes)
+    }
+
+    fn targeted_command(&self, point: &'static str, context: &[(&str, &str)]) -> bool {
+        let Some(bytes) = self.read_command(point) else {
+            return false;
+        };
+        match serde_json::from_slice::<Command>(&bytes) {
+            Ok(command) => {
+                command.token == self.token && command.valid() && command.matches(context)
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn enter_for(
+        &self,
+        point: &'static str,
+        context: Option<&[(&str, &str)]>,
+    ) -> io::Result<Option<(u64, Act)>> {
+        self.enter_for_facts(point, context, None)
+    }
+
+    fn enter_for_facts(
+        &self,
+        point: &'static str,
+        context: Option<&[(&str, &str)]>,
+        facts: Option<&[(&str, u64)]>,
+    ) -> io::Result<Option<(u64, Act)>> {
+        if let Some(facts) = facts {
+            let written = facts.iter().find(|(key, _)| *key == "written");
+            let length = facts.iter().find(|(key, _)| *key == "body_length");
+            if facts.len() != 2
+                || !matches!((written, length), (Some((_, written)), Some((_, length)))
+                    if written <= length)
+            {
+                return Err(io::Error::other("invalid private Wire byte facts"));
+            }
+        }
+        let bytes = self.read_command(point);
+        let command = bytes
+            .as_ref()
+            .map(|bytes| serde_json::from_slice::<Command>(bytes));
+        match (&command, context) {
+            (Some(Ok(command)), Some(context))
+                if command.token == self.token && command.valid() && command.matches(context) => {}
+            (_, Some(_)) => return Ok(None),
+            (Some(Ok(command)), None) if command.target.is_some() => return Ok(None),
+            (_, None) => {}
+        }
         let occurrence = {
             let mut hits = self.hits.lock().unwrap_or_else(PoisonError::into_inner);
             let count = hits.entry(point).or_insert(0);
             *count += 1;
             *count
         };
-        let Ok(bytes) = fs::read(self.dir.join(format!("{point}.json"))) else {
+        let Some(command) = command else {
             return Ok(None);
         };
-        let command = match serde_json::from_slice::<Command>(&bytes) {
+        let command = match command {
             Ok(command) if command.token == self.token && command.valid() => command,
             // Never echo the command or its token.
             _ => {
@@ -222,12 +316,16 @@ impl Controller {
         if !armed {
             return Ok(None);
         }
-        let ack = serde_json::json!({
+        let mut ack = serde_json::json!({
             "point": point,
             "occurrence": occurrence,
             "action": command.action.as_str(),
             "pid": std::process::id(),
         });
+        if let Some(facts) = facts {
+            let fields: HashMap<_, _> = facts.iter().copied().collect();
+            ack["facts"] = serde_json::json!(fields);
+        }
         // Without a published acknowledgement the harness could not tell entry
         // from absence, so the action never runs unacknowledged.
         self.write_marker(point, occurrence, "ack", ack.to_string().as_bytes())?;
@@ -302,10 +400,39 @@ pub fn hit(point: &'static str) -> io::Result<()> {
 /// Enters `point` from an async task; a pause yields to the runtime. An
 /// acknowledgement that cannot be written is returned as the point's error.
 pub async fn hit_async(point: &'static str) -> io::Result<()> {
+    hit_async_for(point, None, None).await
+}
+
+/// `OpenCode` §13: checks a complete private selector without counting a hit.
+pub fn target_matches(point: &'static str, context: &[(&str, &str)]) -> bool {
+    controller().is_some_and(|controller| controller.targeted_command(point, context))
+}
+
+/// `OpenCode` §13: enters only for the exact owned request/generation context.
+/// A mismatching or absent selector cannot consume an occurrence or act.
+pub async fn hit_async_targeted(point: &'static str, context: &[(&str, &str)]) -> io::Result<()> {
+    hit_async_for(point, Some(context), None).await
+}
+
+/// `OpenCode` §13 L2: acknowledges completed body bytes at a targeted Wire boundary.
+/// Only `written` and `body_length` numeric facts are accepted; no payload is recorded.
+pub async fn hit_async_targeted_with_facts(
+    point: &'static str,
+    context: &[(&str, &str)],
+    facts: &[(&str, u64)],
+) -> io::Result<()> {
+    hit_async_for(point, Some(context), Some(facts)).await
+}
+
+async fn hit_async_for(
+    point: &'static str,
+    context: Option<&[(&str, &str)]>,
+    facts: Option<&[(&str, u64)]>,
+) -> io::Result<()> {
     let Some(controller) = controller() else {
         return Ok(());
     };
-    match controller.enter(point)? {
+    match controller.enter_for_facts(point, context, facts)? {
         // A value is for [`value`] points; elsewhere the point continues.
         None | Some((_, Act::Value(_))) => Ok(()),
         Some((_, Act::Crash)) => std::process::abort(),
@@ -377,6 +504,162 @@ mod tests {
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
             .expect("shared mode");
         assert!(Controller::new(dir.path().to_owned(), TOKEN.to_owned()).is_err());
+    }
+
+    /// `OpenCode` §13: private request selectors are accepted without leaking their values.
+    #[test]
+    fn a_targeted_command_accepts_a_bounded_exact_context() {
+        let command = serde_json::from_value::<super::Command>(serde_json::json!({
+            "token": TOKEN, "occurrence": 1, "action": "pause",
+            "target": {"generation": "server-private", "session": "session-private"}
+        }));
+        assert!(
+            command.is_ok(),
+            "the private target is a recognized command field"
+        );
+        assert!(command.unwrap().valid());
+    }
+
+    /// `OpenCode` §13: foreign targets and untargeted calls cannot consume the owned hit.
+    #[test]
+    fn targeted_context_does_not_consume_foreign_or_unscoped_hits() {
+        let dir = private_dir();
+        let controller = Controller::new(dir.path().to_owned(), TOKEN.to_owned()).expect("valid");
+        let command = serde_json::json!({
+            "token": TOKEN, "occurrence": 1, "action": "fail_io",
+            "target": {"generation":"owned", "session":"session", "request":"input"}
+        });
+        std::fs::write(dir.path().join("t.point.json"), command.to_string()).expect("arm");
+        for context in [
+            [
+                ("generation", "foreign"),
+                ("session", "session"),
+                ("request", "input"),
+            ],
+            [
+                ("generation", "owned"),
+                ("session", "foreign"),
+                ("request", "input"),
+            ],
+            [
+                ("generation", "owned"),
+                ("session", "session"),
+                ("request", "foreign"),
+            ],
+        ] {
+            assert_eq!(
+                controller.enter_for("t.point", Some(&context)).unwrap(),
+                None
+            );
+        }
+        assert_eq!(controller.enter("t.point").unwrap(), None);
+        assert_eq!(
+            controller
+                .enter_for("t.point", Some(&[("generation", "owned")]))
+                .unwrap(),
+            None
+        );
+        let owned = [
+            ("generation", "owned"),
+            ("session", "session"),
+            ("request", "input"),
+        ];
+        assert!(controller.targeted_command("t.point", &owned));
+        assert_eq!(
+            controller.enter_for("t.point", Some(&owned)).unwrap(),
+            Some((1, Act::FailIo))
+        );
+        let ack = std::fs::read_to_string(dir.path().join("t.point.1.ack")).unwrap();
+        assert!(!ack.contains("owned") && !ack.contains("session") && !ack.contains("input"));
+    }
+
+    /// `OpenCode` §13: malformed or oversized selectors remain inactive.
+    #[test]
+    fn targeted_context_requires_a_bounded_complete_selector() {
+        let dir = private_dir();
+        let controller = Controller::new(dir.path().to_owned(), TOKEN.to_owned()).expect("valid");
+        let context = [("generation", "owned")];
+        for target in [
+            serde_json::json!({}),
+            serde_json::json!({"generation": "x".repeat(1025)}),
+        ] {
+            let command = serde_json::json!({
+                "token": TOKEN, "occurrence": 1, "action": "fail_io", "target": target
+            });
+            std::fs::write(dir.path().join("t.point.json"), command.to_string()).unwrap();
+            assert!(!controller.targeted_command("t.point", &context));
+            assert_eq!(
+                controller.enter_for("t.point", Some(&context)).unwrap(),
+                None
+            );
+        }
+        let mut command = serde_json::json!({
+            "token": TOKEN, "occurrence": 1, "action": "fail_io", "target": {"generation":"owned"}
+        })
+        .to_string();
+        command.push_str(&" ".repeat(4097));
+        std::fs::write(dir.path().join("t.point.json"), command).unwrap();
+        assert!(!controller.targeted_command("t.point", &context));
+        assert_eq!(
+            controller.enter_for("t.point", Some(&context)).unwrap(),
+            None
+        );
+        std::fs::write(
+            dir.path().join("t.point.json"),
+            serde_json::json!({
+                "token": TOKEN, "occurrence": 1, "action": "fail_io"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            controller.enter_for("t.point", Some(&context)).unwrap(),
+            None
+        );
+    }
+
+    /// `OpenCode` §13 L2: byte facts are numeric and never include the request target.
+    #[test]
+    fn targeted_wire_acknowledges_only_completed_body_offsets() {
+        let dir = private_dir();
+        let controller = Controller::new(dir.path().to_owned(), TOKEN.to_owned()).expect("valid");
+        let context = [("port", "12345"), ("request", "/api/session/owned/prompt")];
+        std::fs::write(
+            dir.path().join("t.point.json"),
+            serde_json::json!({
+                "token": TOKEN, "occurrence": 1, "action": "fail_io",
+                "target": {"port":"12345", "request":"/api/session/owned/prompt"}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        for facts in [
+            [("written", 4097), ("body_length", 4096)],
+            [("secret", 1024), ("body_length", 4096)],
+        ] {
+            assert!(
+                controller
+                    .enter_for_facts("t.point", Some(&context), Some(&facts))
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            controller
+                .enter_for_facts(
+                    "t.point",
+                    Some(&context),
+                    Some(&[("written", 1024), ("body_length", 4096)])
+                )
+                .unwrap(),
+            Some((1, Act::FailIo))
+        );
+        let raw = std::fs::read_to_string(dir.path().join("t.point.1.ack")).unwrap();
+        let ack: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            ack["facts"],
+            serde_json::json!({"written":1024,"body_length":4096})
+        );
+        assert!(!raw.contains("/api/session") && !raw.contains(TOKEN));
     }
 
     #[test]

@@ -28,6 +28,12 @@ import time
 from pathlib import Path
 
 POINTS = [
+    # OpenCode §13 L2/L3/OC04: private targeted qualification barriers.
+    "wire.http.body_after_prefix",
+    "wire.http.before_response",
+    "adapters.opencode.prompt_after_eligibility",
+    "routes.opencode.before_event_read",
+    "adapters.opencode.reopen_identity_read",
     "store.spawn.before_commit",
     "store.spawn.after_commit",
     "core.intent.after_commit",

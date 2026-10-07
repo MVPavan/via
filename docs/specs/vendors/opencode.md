@@ -951,7 +951,7 @@ keep the lane-order outcome below.
 | Prompt admission (`check_turn`, `plan`) | `json_len(prompt) + json_len(cwd) ≤ 1,048,576 − 8,192` | `invalid_params` naming `prompt` |
 | Instruction entry | 262,144 encoded value bytes (§5) | `invalid_params` naming `instructions` |
 | HTTP | headers 64 KiB; response bodies 1 MiB (`/api/model` 4 MiB; inbox listing below); JSON depth 64, 65,536 nodes, including the larger bodies | the turn `protocol`, and the generation drains (§8) |
-| Inbox listing (`INBOX_BODY_BYTES`, `GET /api/session/{id}/inbox`) | 2,097,152 bytes: `2 × ((1,048,576 − 8,192) + 8,192)` | the turn `protocol`, and the generation drains (§8); no successor prompt on that generation |
+| Inbox listing (`INBOX_BODY_BYTES`, `GET /api/session/{id}/inbox`) | 2,097,152 bytes: `2 × ((1,048,576 − 8,192) + 8,192)` | the turn `protocol`, and the generation drains (§8); no prompt for this turn; the draining generation admits no new turns |
 | Final-text candidates | 4 MiB per turn | turn `overflow` |
 | Retained per server | session states 1,024; tombstoned turns 4,096; child sessions 4,096; pending interactive requests 64; requests without a complete response 64. Session states count only sessions VIA opened; descendants count only as child mappings, and sessions of neither kind retain no state. | server generation `overflow` |
 | Correlation keys (aggregate) | caller input, assistant message, tool call and interactive request IDs of every live and tombstoned turn, and child-session IDs, together: 65,536 entries and 8 MiB of retained ID bytes per server | server generation `overflow` |
@@ -970,7 +970,12 @@ admission bound plus 8 KiB for IDs, session fields, item metadata and JSON
 framing; the top-level framing shares that allowance. This is a bounded
 tolerance, not a vendor maximum: foreign writers and vendor extra fields
 have no such cap, and a larger listing still takes the HTTP-limit outcome
-above. The byte cap does not impose a two-item count cap; many smaller
+above. Foreign items exceeding this bound make every reopen of that session
+fail `protocol` and drain the shared generation. Other sessions retain their
+sent turns but lose that server until a new generation is admitted. Revisit
+this bounded foreign tolerance when L3 observes larger persisted inboxes;
+it does not promise cleanup of an arbitrarily large foreign listing.
+The byte cap does not impose a two-item count cap; many smaller
 items fit subject to the unchanged JSON depth and node limits. Only this
 listing gets the new bound; prompt responses, stops, setup and other
 ordinary responses remain at 1 MiB, and `/api/model` keeps its existing
@@ -1197,7 +1202,59 @@ stands. Items that gate route enablement (L4, L5, L14) say so.
 | L10 macOS | Platform deferred | Run OC01–OC12 on macOS under the platform contract |
 | L11 new-version credential shape | A new version's `/api/integration` may change shape or carry values | Before a version joins `checked`, rerun E41's synthetic-credential probe with every other gate (L4, L5, L14) |
 | L12 other unobserved | `superseded` and `inactivity` interrupt reasons; agent `steps`; durable replay; `OPENCODE_DISABLE_AUTOUPDATE` behaviour; truncated-body handling (E56) | Probe each at the next pin review |
-| L14 (gate) server dies with its anchor | The fence (§3.2) holds only while the server keeps the parent-death signal Host set, stays the process Host spawned, and never holds `server.lock`; OC02b shows Host's side with a fake vendor, not the real server's behaviour | **Gates route enablement and every pin review.** With the pinned real OpenCode, each sample is one server generation started through the real Host launch (a `test-failpoints` build of VIA, a test barrier holding Host and the route from retiring the generation or closing its stdin), driven to a point in its life: just after publication, during and after each spawn path (the model's tool runner, location and session shells, a project MCP stdio server, LSP and a plugin spawn), after each reload the version offers (for example a project configuration change or instance disposal, where the API has one), and after a long run. At each point: (1) a same-uid scan of `/proc/*/fdinfo` finds the `server.lock` flock line only on the anchor's descriptor, never on the server or any descendant; (2) `/api/info.pid` equals the spawned pid, and the server record names it; (3) `SIGKILL` the anchor's pid alone, never its group; (4) the server process (pid and start ticks) is gone within 1 s, and a new generation's configuration admits after its predecessor check. Step 4 after the reload points shows the parent-death signal still in force at the tested life points; it observes the effect directly, where `exe`, `comm` and the start ticks cannot (a self re-exec from a worker leaves all three unchanged). It does not prove that the server never executes from a non-leader thread (§3.2), only that no sampled point lost the signal. **Pass:** every sample. **Fail:** any server surviving its anchor, any lock line outside the anchor, or a server whose pid differs from the spawned one; OpenCode qualification then fails until resolved |
+| L14 (gate) server dies with its anchor | The fence (§3.2) holds only while the server keeps the parent-death signal Host set, stays the process Host spawned, and never holds `server.lock`; OC02b shows Host's side with a fake vendor, not the real server's behaviour | **Gates route enablement and every pin review.** With the pinned real OpenCode, each sample is one server generation started through the real Host launch with a test barrier, e.g. SIGSTOP of the private daemon, holding Host and the route from retiring the generation or closing its stdin, and driven to a point in its life: just after publication, during and after each spawn path (the model's tool runner, location and session shells, a project MCP stdio server, LSP and a plugin spawn), after each reload the version offers (for example a project configuration change or instance disposal, where the API has one), and after a long run. At each point: (1) a same-uid scan of `/proc/*/fdinfo` finds the `server.lock` flock line only on the anchor's descriptor, never on the server or any descendant; (2) `/api/info.pid` equals the spawned pid, and the server record names it; (3) `SIGKILL` the anchor's pid alone, never its group; (4) the server process (pid and start ticks) is gone within 1 s, and a new generation's configuration admits after its predecessor check. Step 4 after the reload points shows the parent-death signal still in force at the tested life points; it observes the effect directly, where `exe`, `comm` and the start ticks cannot (a self re-exec from a worker leaves all three unchanged). It does not prove that the server never executes from a non-leader thread (§3.2), only that no sampled point lost the signal. **Pass:** every sample. **Fail:** any server surviving its anchor, any lock line outside the anchor, or a server whose pid differs from the spawned one; OpenCode qualification then fails until resolved |
+
+### Qualification runner
+
+`scripts/qualify/opencode.py --self-test` runs only fakes, loopback mocks and
+synthetic process observations. Building this runner or passing its self-tests
+does not pass any live row. Live invocation is explicitly opt-in with `--live`,
+two prebuilt VIA artifacts (`--via` for release and `--via-failpoints` for the
+test-only build), a new private `--evidence` directory in the worktree's
+scratchpad, and either `--opencode` for the verified read-only pin or `--acquire`
+for official exact-version acquisition. Both VIA hashes are recorded. Seam
+cases use the test-only build; L14 and the other gates use release VIA.
+Before acquisition or any start, `--fake-gate-manifest` (defaulting to the
+worktree's saved qualification artifact) must show successful fake gates and
+the required seam tests, bound to the current Rust source and both supplied
+VIA hashes. Missing or stale proof blocks; a live observation never substitutes
+an invented fake-control result.
+
+The runner carries `claude.py`'s cooperative same-user threat model, strict
+reply schemas, bounded loops, deferred signals, pid plus start-tick identities,
+positive stop proofs and rule that unverifiable evidence never passes. Pinned
+acquisition uses plain HTTPS, never npm/npx; npm SHA-512 precedes extraction and
+the packet's SHA-256 follows it. Size bounds, a read-only binary/directory and
+an end re-hash apply. The owner's 2.0.24 on PATH stays refused.
+
+The qualification-only password exception reads the exact password key once
+from the verified owned vendor's initial environment, in memory only. Evidence
+and rotation comparisons return Booleans; the password and bearer handles are
+never written. Structural spending controls are checked before model-capable
+requests: known empty integrations, an environment allow-list, frozen free
+catalog/session identities, and loopback endpoints for every overridden
+provider. Missing cost is unavailable; positive cost or a paid identity stops
+admission. Public-free results and synthetic token/cache/compaction observations
+are labelled separately. No network-destination sampling can establish a gate.
+
+The private namespace's 0700 directory chain and fixture Git repositories with
+private initial commits prevent untested ancestor walk-up. A mandatory sentinel
+control proves the boundary before model qualification. The minimal PATH links
+the exact checked system `rg`; fake LSP and local helpers avoid vendor installs.
+Inventory covers private HOME/XDG, namespace and fixture `.opencode` roots;
+credential files are inspected by existence/mode only. A failed boundary or
+package/binary addition blocks. The coordinator's 2026-10-07 ruling permits
+short private `/tmp/via-*` roots for hand-started processes when a scratchpad
+socket path is too long; fixture project/namespace roots remain in the worktree.
+
+L14 persists a stopped daemon's identity before SIGSTOP and verifies pid plus
+start ticks before SIGCONT, including recovery on the next runner start. A
+death sample can also be caused by SIGPIPE on stderr; the runner records this
+limitation, rather than claiming a unique signal cause. OC03 proves only that
+history still exists. Inheritance is frozen by daemon configuration: requested
+states use fresh private daemons, two locations with the same fixed inheritance
+share one server, and the cross-request same-server case retains OC02 fake
+proof. No daemon reload command or new per-request CLI setting is introduced.
 
 ## 14. Owner questions and revisit items
 

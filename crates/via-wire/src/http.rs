@@ -60,6 +60,10 @@ const STOP_CONNECTIONS: usize = 2;
 /// See [`DECLINE_CONNECTIONS`].
 const GENERAL_CONNECTIONS: usize = 4;
 
+/// Qualification's actual body prefix (`vendors/opencode.md` §13 L2).
+#[cfg(feature = "test-failpoints")]
+const QUALIFICATION_BODY_PREFIX_BYTES: usize = 1024;
+
 /// A request method.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Method {
@@ -393,7 +397,27 @@ impl HttpClient {
         let gate = (request.pool == Pool::General).then_some(self.general_closed.as_ref());
         write_tracked(&mut stream, head.as_bytes(), sent, tracker, gate).await?;
         if let Some(body) = request.body {
-            write_tracked(&mut stream, body, sent, tracker, gate).await?;
+            self.write_body(&mut stream, request, body, sent, tracker, gate)
+                .await?;
+        }
+        #[cfg(feature = "test-failpoints")]
+        if tracker.is_some()
+            && request.pool == Pool::General
+            && request.method == Method::Post
+            && let Some(body) = request.body
+        {
+            let port = self.port.to_string();
+            let body_length =
+                u64::try_from(body.len()).map_err(|_| HttpError::new(*sent, HttpFailure::Io))?;
+            // A cancelled barrier drops this socket without reading or retrying;
+            // SentTracker and the stop pool's independent permits remain intact (§13 L2).
+            via_store::failpoint::hit_async_targeted_with_facts(
+                "wire.http.before_response",
+                &[("port", port.as_str()), ("request", request.target)],
+                &[("written", body_length), ("body_length", body_length)],
+            )
+            .await
+            .map_err(|_| HttpError::new(*sent, HttpFailure::Io))?;
         }
         let mut reader = Reader::new(stream);
         let head = reader.read_final_head().await?;
@@ -422,6 +446,49 @@ impl HttpClient {
             status: head.status,
             body,
         })
+    }
+
+    /// `vendors/opencode.md` §13 L2: retain the selected prefix's suffix in this exchange only.
+    async fn write_body(
+        &self,
+        stream: &mut TcpStream,
+        request: HttpRequest<'_>,
+        body: &[u8],
+        sent: &mut Sent,
+        tracker: Option<&SentTracker>,
+        gate: Option<&Mutex<bool>>,
+    ) -> Result<(), HttpError> {
+        #[cfg(feature = "test-failpoints")]
+        {
+            let port = self.port.to_string();
+            let context = [("port", port.as_str()), ("request", request.target)];
+            if tracker.is_some()
+                && request.pool == Pool::General
+                && request.method == Method::Post
+                && body.len() > QUALIFICATION_BODY_PREFIX_BYTES
+                && via_store::failpoint::target_matches("wire.http.body_after_prefix", &context)
+            {
+                let (prefix, suffix) = body.split_at(QUALIFICATION_BODY_PREFIX_BYTES);
+                write_tracked(stream, prefix, sent, tracker, gate).await?;
+                let written = u64::try_from(prefix.len())
+                    .map_err(|_| HttpError::new(*sent, HttpFailure::Io))?;
+                let body_length = u64::try_from(body.len())
+                    .map_err(|_| HttpError::new(*sent, HttpFailure::Io))?;
+                // The completed prefix is never resent. Cancellation closes the
+                // fresh socket; only this future retains the remaining offset (§13 L2).
+                via_store::failpoint::hit_async_targeted_with_facts(
+                    "wire.http.body_after_prefix",
+                    &context,
+                    &[("written", written), ("body_length", body_length)],
+                )
+                .await
+                .map_err(|_| HttpError::new(*sent, HttpFailure::Io))?;
+                return write_tracked(stream, suffix, sent, tracker, gate).await;
+            }
+        }
+        #[cfg(not(feature = "test-failpoints"))]
+        let _ = request;
+        write_tracked(stream, body, sent, tracker, gate).await
     }
 
     /// Opens an event stream (`GET target`, `Accept: text/event-stream`)

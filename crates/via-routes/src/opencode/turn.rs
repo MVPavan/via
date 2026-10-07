@@ -570,10 +570,12 @@ mod tests {
     #[tokio::test]
     async fn oc05_inbox_listing_accepts_exact_bound_and_rejects_one_byte_over() {
         // §9: two admitted prompt echoes, each with 8 KiB framing allowance.
+        // Each plain ASCII prompt spends two JSON quote bytes; an empty cwd
+        // spends two more, so the text length subtracts four admission bytes.
         const LISTING_BYTES: usize = 2 * 1_048_576;
         let body = serde_json::to_vec(&json!({"data":[
-            {"id":"msg_via0123456789abcdefghijkl","text":"a".repeat(1_048_576 - 8_192 - 2)},
-            {"id":"msg_foreign","text":"b".repeat(1_048_576 - 8_192 - 2)}
+            {"id":"msg_via0123456789abcdefghijkl","text":"a".repeat(1_048_576 - 8_192 - 4)},
+            {"id":"msg_foreign","text":"b".repeat(1_048_576 - 8_192 - 4)}
         ]}))
         .unwrap();
         assert!(body.len() < LISTING_BYTES);

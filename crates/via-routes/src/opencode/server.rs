@@ -363,6 +363,20 @@ async fn read(
         if let Some(cause) = server.lifecycle() {
             return cause;
         }
+        #[cfg(feature = "test-failpoints")]
+        {
+            // §13: a test pause consumes no event bytes and owns no routing lock.
+            // The harness releases it before shutdown; fail_io loses only this stream.
+            if via_wire::failpoint::hit_async_targeted(
+                "routes.opencode.before_event_read",
+                &[("generation", server.id().as_str())],
+            )
+            .await
+            .is_err()
+            {
+                return LossCause::TransportLost;
+            }
+        }
         // Readers retain partial framing; Notify is enabled before lifecycle checks.
         tokio::select! {
             biased;

@@ -719,3 +719,191 @@ fn oc09_model_switch_200_html_drains_without_prompt() {
 fn oc09_setup_500_malformed_json_drains() {
     run(malformed_setup_drains(false));
 }
+
+/// §13 L2/L3: private commands with release-on-drop for every fixture pause.
+#[cfg(feature = "test-failpoints")]
+pub(super) struct Points {
+    dir: tempfile::TempDir,
+}
+
+#[cfg(feature = "test-failpoints")]
+impl Points {
+    /// §13: activate only a private fixture-owned controller directory.
+    pub(super) fn new() -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        via_routes::failpoint::activate(dir.path(), "oc-live-seams-private-token").unwrap();
+        Self { dir }
+    }
+
+    /// §13: arm one exact owned context without persisting request bodies or secrets.
+    pub(super) fn arm(&self, point: &str, occurrence: u64, action: &str, target: Value) {
+        let mut command = json!({"token":"oc-live-seams-private-token", "occurrence":occurrence,
+            "action":action});
+        command["target"] = target;
+        std::fs::write(
+            self.dir.path().join(format!("{point}.json")),
+            command.to_string(),
+        )
+        .unwrap();
+    }
+
+    /// §13: positive proof that the armed occurrence was reached.
+    pub(super) fn entered(&self, point: &str, occurrence: u64) -> bool {
+        self.dir
+            .path()
+            .join(format!("{point}.{occurrence}.ack"))
+            .is_file()
+    }
+
+    /// §13: release only an occurrence owned by this fixture.
+    pub(super) fn release(&self, point: &str, occurrence: u64) {
+        std::fs::write(
+            self.dir
+                .path()
+                .join(format!("{point}.{occurrence}.release")),
+            b"",
+        )
+        .unwrap();
+    }
+}
+
+#[cfg(feature = "test-failpoints")]
+impl Drop for Points {
+    fn drop(&mut self) {
+        for point in [
+            "adapters.opencode.prompt_after_eligibility",
+            "adapters.opencode.reopen_identity_read",
+            "routes.opencode.before_event_read",
+        ] {
+            for occurrence in 1..=4 {
+                self.release(point, occurrence);
+            }
+        }
+    }
+}
+
+/// §13 L3: a foreign execution inserted at the barrier is never owned by VIA.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn oc_live_prompt_barrier_rechecks_foreign_execution_before_submission() {
+    run(async {
+        let points = Points::new();
+        let point = "adapters.opencode.prompt_after_eligibility";
+        let rig = Rig::new(&json!({}));
+        let cwd = rig.root().to_str().unwrap().to_owned();
+        rig.fixture(&fixture(&cwd, success()));
+        let mut lane = bootstrap(&rig).await;
+        let live = server(&lane).unwrap();
+        let input = super::execution::input_id(
+            &crate::SessionId::try_from(super::driver_tests::SID).unwrap(),
+            TurnNumber::try_from(2).unwrap(),
+        );
+        points.arm(
+            point,
+            1,
+            "pause",
+            json!({"generation": live.id().as_str(),
+            "session":super::driver_tests::SID,"request":input}),
+        );
+        row(&rig, 2, "running");
+        let turn = tokio::spawn(async move {
+            let result = lane.turn(2, None, Duration::from_secs(5)).await;
+            (lane, result)
+        });
+        let entered = until(|| points.entered(point, 1)).await;
+        let count_at_barrier = prompts(&rig.requests()).len();
+        for (kind, data) in [
+            (
+                "session.inbox.enqueued",
+                json!({"sessionID":SES,"inboxID":"msg_foreign"}),
+            ),
+            ("session.execution.started", json!({"sessionID":SES})),
+            (
+                "session.inbox.delivered",
+                json!({"sessionID":SES,"inboxID":"msg_foreign"}),
+            ),
+        ] {
+            live.routing().dispatch(
+                via_routes::opencode::events::decode(
+                    &serde_json::to_vec(&event(kind, &data)).unwrap(),
+                )
+                .unwrap(),
+                tokio::time::Instant::now(),
+            );
+        }
+        points.release(point, 1);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let held_by_foreign = prompts(&rig.requests()).len() == 1 && !turn.is_finished();
+        live.routing().dispatch(
+            via_routes::opencode::events::decode(
+                &serde_json::to_vec(&event(
+                    "session.execution.succeeded",
+                    &json!({"sessionID":SES}),
+                ))
+                .unwrap(),
+            )
+            .unwrap(),
+            tokio::time::Instant::now(),
+        );
+        let (lane, (end, _)) = turn.await.unwrap();
+        lane.close().await;
+        let count = prompts(&rig.requests()).len();
+        rig.finish().await;
+        assert!(entered, "the exact eligibility boundary must be observed");
+        assert_eq!(
+            count_at_barrier, 1,
+            "successor has sent no prompt at the barrier"
+        );
+        assert!(
+            held_by_foreign,
+            "foreign terminal must not complete VIA's successor"
+        );
+        assert!(end.terminal.is_some());
+        assert_eq!(
+            count, 2,
+            "the successor is submitted once after foreign execution ends"
+        );
+    });
+}
+
+/// §13: stale generation/session/request selectors cannot pause an owned turn.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn oc_live_prompt_barrier_ignores_stale_and_foreign_targets() {
+    run(async {
+        let points = Points::new();
+        let point = "adapters.opencode.prompt_after_eligibility";
+        let rig = Rig::new(&json!({}));
+        let cwd = rig.root().to_str().unwrap().to_owned();
+        rig.fixture(&fixture(&cwd, success()));
+        let mut lane = bootstrap(&rig).await;
+        let generation = server(&lane).unwrap().id().as_str().to_owned();
+        for number in 2..=4 {
+            let input = super::execution::input_id(
+                &crate::SessionId::try_from(super::driver_tests::SID).unwrap(),
+                TurnNumber::try_from(number).unwrap(),
+            );
+            let mut target = json!({"generation":generation,
+                "session":super::driver_tests::SID,"request":input});
+            match number {
+                2 => target["generation"] = json!("v_stale"),
+                3 => target["session"] = json!("s_foreign"),
+                4 => target["request"] = json!("msg_foreign"),
+                _ => unreachable!(),
+            }
+            row(&rig, number, "running");
+            points.arm(point, 1, "pause", target);
+            let (end, _) = lane.turn(number, None, Duration::from_secs(3)).await;
+            assert!(end.terminal.is_some());
+            row(&rig, number, "completed");
+        }
+        lane.close().await;
+        rig.finish().await;
+        assert!(
+            !points.entered(point, 1),
+            "mismatches consume no targeted occurrence"
+        );
+    });
+}

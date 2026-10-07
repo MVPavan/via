@@ -1,0 +1,1141 @@
+#!/usr/bin/env python3
+"""Owned-process qualification controls; vendors/opencode.md §§2–4, 9, 13.
+
+Only explicit acquisition/start methods have effects. Importing this module never
+reads caller configuration, starts a daemon, downloads a binary, or calls a model.
+The threat model is claude.py's cooperative same-user model, not a sandbox against
+hostile same-user mutation. Every uncertain observation blocks its predicate.
+"""
+
+import base64
+import errno
+import contextlib
+import hashlib
+import gzip
+import http.client
+import io
+import json
+import math
+import os
+from pathlib import Path, PurePosixPath
+import shutil
+import select
+import selectors
+import socket
+import threading
+import signal
+import stat
+import subprocess
+import sys
+import tarfile
+import time
+import tomllib
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+
+PINNED_SHA256 = "32cf5aa0a69a650e36277e3315d189835ddc79fb9aa1d0aef5025be5af5ad122"
+NPM_URL = "https://registry.npmjs.org/@opencode/cli-linux-x64/-/cli-linux-x64-2.0.22.tgz"
+NPM_SHA512 = ("DlV1qgEDDnVqpTWMPqv7tCHCcXodzZBFaMcxjsiYdY6E5gHH2Q68JfasVksyQ1n"
+              "u6m1887WQKGhOsepE+oKyYw==")
+# Qualification plan acquisition and packet §9 observation bounds.
+ARCHIVE_BYTES = 256 * 1024 * 1024
+PROC_BYTES = 256 * 1024
+HTTP_BYTES = 16 * 1024 * 1024
+PASSWORD_KEY = b"OPENCODE_PASSWORD"
+FREE_IDENTITY = "opencode/mimo-v2.6-flash-free"
+MOCK_IDENTITY = "oclive-mock/fixture-free"
+SYSTEM_PATHS = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
+PRIVATE_PARTS = {"HOME": "home", "XDG_CONFIG_HOME": "config", "XDG_DATA_HOME": "data",
+                 "XDG_STATE_HOME": "state", "XDG_CACHE_HOME": "cache",
+                 "XDG_RUNTIME_DIR": "runtime", "TMPDIR": "tmp"}
+VENDOR_ENVIRONMENT = frozenset({"PATH", "LANG", "OPENCODE_CONFIG_CONTENT",
+                              "OPENCODE_DISABLE_AUTOUPDATE", "OPENCODE_PASSWORD",
+                              "VIA_PROCESS_MARKER", *PRIVATE_PARTS})
+
+
+class Blocked(Exception):
+    """Required proof unavailable or a qualification safety control failed (§13)."""
+
+
+def require_proof(value, reason):
+    """Only literal True proves a predicate; missing evidence never passes (§13)."""
+    if value is not True:
+        raise Blocked(reason)
+
+
+@dataclass(frozen=True)
+class Identity:
+    """A process identity, never merely a PID (packet §3.2)."""
+    pid: int
+    start_ticks: int
+
+    def __post_init__(self):
+        if type(self.pid) is not int or self.pid <= 0 or type(self.start_ticks) is not int \
+                or self.start_ticks < 0:
+            raise Blocked("invalid process identity")
+
+    def report(self):
+        return {"pid": self.pid, "start_ticks": self.start_ticks}
+
+
+class ProcReader:
+    """Stable descriptor reads with PID/start-tick checks; synthetic root supported."""
+
+    def __init__(self, root=Path("/proc")):
+        self.root = Path(root)
+
+    @staticmethod
+    def parse_stat(raw, pid):
+        try:
+            fields = raw[raw.rindex(b")") + 2:].split()
+            if int(raw.split(b" ", 1)[0]) != pid or fields[0] not in {
+                    b"R", b"S", b"D", b"Z", b"T", b"t", b"X", b"x", b"K", b"W", b"P", b"I"}:
+                raise ValueError("stat identity or state invalid")
+            return {"pid": pid, "state": fields[0].decode("ascii"),
+                    "ppid": int(fields[1]), "start_ticks": int(fields[19])}
+        except (ValueError, IndexError, UnicodeError) as error:
+            raise Blocked("unverifiable process stat") from error
+
+    def stat(self, pid):
+        try:
+            with (self.root / str(pid) / "stat").open("rb") as stream:
+                raw = stream.read(PROC_BYTES + 1)
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise Blocked("unreadable process stat") from error
+        if len(raw) > PROC_BYTES:
+            raise Blocked("process stat exceeds bound")
+        return self.parse_stat(raw, pid)
+
+    @contextlib.contextmanager
+    def opened(self, identity):
+        try:
+            fd = os.open(self.root / str(identity.pid), os.O_RDONLY | os.O_DIRECTORY
+                         | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError as error:
+            raise Blocked("owned process identity unavailable") from error
+        try:
+            self._verify_fd(fd, identity)
+            yield fd
+            self._verify_fd(fd, identity)
+        finally:
+            os.close(fd)
+
+    def _verify_fd(self, fd, identity):
+        try:
+            with os.fdopen(os.open("stat", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd), "rb") as file:
+                raw = file.read(PROC_BYTES + 1)
+        except OSError as error:
+            raise Blocked("owned identity became unverifiable") from error
+        if len(raw) > PROC_BYTES or self.parse_stat(raw, identity.pid)["start_ticks"] \
+                != identity.start_ticks:
+            raise Blocked("owned process identity changed")
+
+    def read(self, identity, name, limit=PROC_BYTES):
+        if name not in {"environ", "cmdline", "status", "stat", "net/tcp"} \
+                and not (name.startswith("fdinfo/") and name[7:].isdigit()):
+            raise Blocked("unapproved proc read")
+        with self.opened(identity) as fd:
+            try:
+                with os.fdopen(os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd), "rb") as file:
+                    raw = file.read(limit + 1)
+            except OSError as error:
+                raise Blocked("owned process observation unreadable") from error
+            if len(raw) > limit:
+                raise Blocked("owned process observation exceeds bound")
+            return raw
+
+    def alive(self, identity):
+        try:
+            row = self.stat(identity.pid)
+        except Blocked:
+            return None
+        if row is not None and row["start_ticks"] != identity.start_ticks:
+            return False
+        if self.root != Path("/proc"):
+            return row is not None and row["state"] != "Z"
+        # A hidden proc entry or a zombie leader with live threads is not exit proof.
+        if not hasattr(os, "pidfd_open"):
+            return None
+        try:
+            pidfd = os.pidfd_open(identity.pid)
+        except OSError as error:
+            return False if error.errno == errno.ESRCH else None
+        try:
+            try:
+                after = self.stat(identity.pid)
+            except Blocked:
+                return None
+            if after is None:
+                return None
+            if after["start_ticks"] != identity.start_ticks:
+                return False
+            poll = select.poll()
+            poll.register(pidfd, select.POLLIN)
+            return not bool(poll.poll(0))
+        finally:
+            os.close(pidfd)
+
+    def verify(self, identity):
+        require_proof(self.alive(identity), "owned process is not verified alive")
+
+    def gone(self, identity):
+        return self.alive(identity) is False
+
+    def listener(self, identity):
+        """Discover exactly one IPv4 loopback listener belonging to this vendor."""
+        with self.opened(identity) as fd:
+            try:
+                socket_fd = os.open("fd", os.O_RDONLY | os.O_DIRECTORY, dir_fd=fd)
+                try:
+                    inodes = set()
+                    for entry in os.listdir(socket_fd):
+                        target = os.readlink(entry, dir_fd=socket_fd)
+                        if target.startswith("socket:[") and target.endswith("]"):
+                            inodes.add(target[8:-1])
+                finally:
+                    os.close(socket_fd)
+            except OSError as error:
+                raise Blocked("owned listener descriptor evidence unavailable") from error
+        raw = self.read(identity, "net/tcp")
+        candidates = set()
+        for line in raw.decode("ascii", "strict").splitlines()[1:]:
+            fields = line.split()
+            if len(fields) < 10:
+                raise Blocked("unverifiable socket metadata")
+            if fields[3] == "0A" and fields[9] in inodes:
+                address, port = fields[1].split(":")
+                if address != "0100007F":
+                    raise Blocked("owned listener is not IPv4 loopback")
+                candidates.add(int(port, 16))
+        if len(candidates) != 1 or 0 in candidates:
+            raise Blocked("owned listener absent or ambiguous")
+        self.verify(identity)
+        return f"http://127.0.0.1:{candidates.pop()}"
+
+
+class PasswordVault:
+    """Once-per-generation memory-only password; Boolean leak/rotation proofs (§2.3)."""
+
+    def __init__(self):
+        self._values = {}
+        self._attempted = set()
+        self._names = {}
+
+    def __repr__(self):
+        return "PasswordVault(<redacted>)"
+
+    def read_once(self, proc, identity):
+        if identity in self._attempted:
+            if identity in self._values:
+                return self._values[identity]
+            raise Blocked("password observation already failed for generation")
+        self._attempted.add(identity)
+        raw = proc.read(identity, "environ")
+        if not raw or not raw.endswith(b"\0"):
+            raise Blocked("truncated password observation")
+        found = []
+        names = set()
+        offset = 0
+        while offset < len(raw):
+            end = raw.index(b"\0", offset)
+            separator = raw.find(b"=", offset, end)
+            if separator < offset:
+                raise Blocked("environment entry key unverifiable")
+            key = raw[offset:separator]
+            try:
+                decoded_key = key.decode("ascii", "strict")
+            except UnicodeError as error:
+                raise Blocked("environment key is not ASCII") from error
+            if decoded_key in names:
+                raise Blocked("environment key duplicated")
+            names.add(decoded_key)
+            if key == PASSWORD_KEY:
+                # No other value is sliced, decoded, inspected or retained.
+                found.append(raw[separator + 1:end])
+            offset = end + 1
+        del raw
+        if len(found) != 1 or not found[0] or b"\n" in found[0] or b"\r" in found[0]:
+            raise Blocked("password observation missing or ambiguous")
+        self._values[identity] = found[0]
+        self._names[identity] = frozenset(names)
+        return found[0]
+
+    def names(self, identity):
+        """Environment key names from the same once-only read; never values."""
+        if identity not in self._names:
+            raise Blocked("environment names unavailable")
+        return self._names[identity]
+
+    def changed(self, before, after):
+        if before not in self._values or after not in self._values:
+            raise Blocked("password rotation evidence unavailable")
+        changed = self._values[before] != self._values[after]
+        require_proof(changed, "password did not rotate")
+        return True
+
+    def leaks(self, evidence):
+        if isinstance(evidence, str):
+            evidence = evidence.encode()
+        if not isinstance(evidence, bytes):
+            raise Blocked("secret scan input is not bounded bytes")
+        candidates = [evidence]
+        try:
+            parsed = json.loads(evidence)
+        except (ValueError, UnicodeError):
+            parsed = None
+        except RecursionError as error:
+            raise Blocked("secret scan JSON depth exceeds bound") from error
+        stack, nodes = [(parsed, 0)], 0
+        while stack:
+            value, depth = stack.pop()
+            nodes += 1
+            if nodes > 65536 or depth > 64:
+                raise Blocked("secret scan JSON structure exceeds packet bound")
+            if isinstance(value, str):
+                try:
+                    candidates.append(value.encode("utf-8"))
+                except UnicodeError as error:
+                    raise Blocked("secret scan string encoding unverifiable") from error
+            elif isinstance(value, dict):
+                stack.extend((item, depth + 1) for pair in value.items() for item in pair)
+            elif isinstance(value, list):
+                stack.extend((item, depth + 1) for item in value)
+        for candidate in candidates:
+            decoded_url = urllib.parse.unquote_to_bytes(candidate)
+            decoded_form = urllib.parse.unquote_to_bytes(candidate.replace(b"+", b" "))
+            for password in self._values.values():
+                if password.hex().encode() in candidate.lower():
+                    return True
+                forms = (password, base64.b64encode(password),
+                         base64.b64encode(b"opencode:" + password),
+                         urllib.parse.quote_from_bytes(password).encode(),
+                         password.hex().encode())
+                try:
+                    forms += (json.dumps(password.decode("utf-8", "strict"))[1:-1].encode(),)
+                except UnicodeError:
+                    pass
+                if any(form and (form in candidate or form in decoded_url or form in decoded_form)
+                       for form in forms):
+                    return True
+        return False
+
+    def safe_write_json(self, path, value):
+        raw = (json.dumps(value, sort_keys=True, indent=1, allow_nan=False) + "\n").encode()
+        if self.leaks(raw):
+            raise Blocked("secret present in evidence; evidence not written")
+        path = Path(path)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(raw)
+
+    def clear(self):
+        self._values.clear()
+        self._names.clear()
+        # Python cannot guarantee zeroization of immutable bytes; never persist them.
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_binary(path, expected_sha=PINNED_SHA256, expected_size=None):
+    """Check immutable dedicated binary/directory and pin before any start (§2)."""
+    path = Path(path)
+    try:
+        info = path.lstat()
+        parent = path.parent.lstat()
+    except OSError as error:
+        raise Blocked("pinned binary unavailable") from error
+    if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o500 \
+            or not stat.S_ISDIR(parent.st_mode) or stat.S_IMODE(parent.st_mode) != 0o500 \
+            or not 0 < info.st_size <= ARCHIVE_BYTES \
+            or (expected_size is not None and info.st_size != expected_size):
+        raise Blocked("pinned binary size or read-only mode mismatch")
+    if sha256(path) != expected_sha:
+        raise Blocked("pinned binary hash mismatch")
+    after = path.stat()
+    if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) \
+            != (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns):
+        raise Blocked("pinned binary changed during verification")
+    return {"sha256": expected_sha, "size": info.st_size,
+            "device": info.st_dev, "inode": info.st_ino}
+
+
+def verify_daemon_program(config, pinned, expected_sha=PINNED_SHA256, expected_size=None):
+    """Explicit daemon harness program must resolve to the pin before every start."""
+    if not isinstance(config, dict):
+        try:
+            config = tomllib.loads(Path(config).read_text())
+        except (OSError, ValueError) as error:
+            raise Blocked("private daemon configuration unreadable") from error
+    try:
+        program = config["harnesses"]["opencode"]["binary"]
+    except (KeyError, TypeError) as error:
+        raise Blocked("explicit pinned OpenCode program is required") from error
+    if not isinstance(program, str) or not Path(program).is_absolute() \
+            or Path(program).resolve() != Path(pinned).resolve():
+        raise Blocked("daemon program does not resolve to pinned binary")
+    return verify_binary(pinned, expected_sha, expected_size)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise Blocked("download redirect refused")
+
+
+class _OfficialRedirect(urllib.request.HTTPRedirectHandler):
+    """Bounded public GitHub asset redirects; default npm/API downloads refuse them."""
+
+    def __init__(self, hosts):
+        super().__init__()
+        permitted = {"github.com", "release-assets.githubusercontent.com",
+                     "objects.githubusercontent.com"}
+        if not set(hosts) <= permitted:
+            raise Blocked("unapproved release redirect host")
+        self.hosts, self.count = frozenset(hosts), 0
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        self.count += 1
+        parts = urllib.parse.urlsplit(newurl)
+        if self.count > 3 or parts.scheme != "https" or parts.hostname not in self.hosts \
+                or parts.username or parts.password or parts.fragment \
+                or parts.port not in {None, 443} or req.has_header("Authorization"):
+            raise Blocked("official release redirect refused")
+        # No header copy: credentials cannot be forwarded even if a caller regresses.
+        return urllib.request.Request(newurl, headers={"User-Agent": "VIA-qualification"})
+
+
+class _AbsoluteHTTPDeadline:
+    """Interrupt headers/body at one monotonic deadline; join its only helper thread."""
+
+    def __init__(self, connection, deadline):
+        self.connection, self.deadline = connection, deadline
+        self.done, self.expired = threading.Event(), threading.Event()
+        self.active_socket = None
+        self.thread = threading.Thread(target=self._watch, name="via-oc-http-deadline")
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def _watch(self):
+        if not self.done.wait(max(0, self.deadline - time.monotonic())):
+            self.expired.set()
+            self._abort()
+
+    def attach(self):
+        self.active_socket = self.connection.sock
+        if self.expired.is_set():
+            self._abort()
+            raise Blocked("HTTP absolute deadline exceeded")
+
+    def _abort(self):
+        # Shutdown does not take the buffered-reader lock held by read1/getresponse.
+        for active in (self.active_socket, self.connection.sock):
+            if active is not None:
+                try:
+                    active.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+    def guard(self):
+        if self.expired.is_set() or time.monotonic() >= self.deadline:
+            raise Blocked("HTTP absolute deadline exceeded")
+
+    def __exit__(self, *_args):
+        self.done.set()
+        self.thread.join(timeout=1)
+        if self.thread.is_alive():
+            raise Blocked("HTTP deadline helper did not join")
+
+
+def _bounded_response(connection, method, path, headers, body, *, deadline, limit):
+    """Shared bounded transport for owned HTTP and unauthenticated official HTTPS."""
+    with _AbsoluteHTTPDeadline(connection, deadline) as timer:
+        connection.request(method, path, body=body, headers=headers)
+        timer.attach()
+        response = connection.getresponse()
+        timer.guard()
+        data = bytearray()
+        while True:
+            timer.guard()
+            chunk = response.read1(min(65536, limit + 1 - len(data)))
+            timer.guard()
+            if not chunk:
+                break
+            data.extend(chunk)
+            if len(data) > limit:
+                raise Blocked("HTTP response exceeds bound")
+        return response.status, response.getheader("Location"), bytes(data)
+
+
+def official_https_get(url, *, allowed_hosts, deadline_s=120, limit=ARCHIVE_BYTES,
+                       redirect_hosts=()):
+    """Plain HTTPS without urllib proxy/config; joined watchdog bounds headers/body."""
+    deadline = time.monotonic() + deadline_s
+    redirect = _OfficialRedirect(redirect_hosts) if redirect_hosts else _NoRedirect()
+    current = url
+    while True:
+        parts = urllib.parse.urlsplit(current)
+        if parts.scheme != "https" or parts.hostname not in (set(allowed_hosts) | set(redirect_hosts)) \
+                or parts.username or parts.password or parts.fragment \
+                or parts.port not in {None, 443}:
+            raise Blocked("unapproved official package origin")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise Blocked("official package download deadline exceeded")
+        connection = http.client.HTTPSConnection(parts.hostname, parts.port or 443,
+                                                  timeout=remaining)
+        try:
+            path = urllib.parse.urlunsplit(("", "", parts.path or "/", parts.query, ""))
+            status, location, data = _bounded_response(
+                connection, "GET", path, {"User-Agent": "VIA-qualification"}, None,
+                deadline=deadline, limit=limit)
+            if 300 <= status < 400:
+                if not location:
+                    raise Blocked("official package redirect missing destination")
+                target = urllib.parse.urljoin(current, location)
+                request = urllib.request.Request(current)
+                redirected = redirect.redirect_request(request, None, status, "redirect", {}, target)
+                if redirected is None:
+                    raise Blocked("official package redirect refused")
+                current = redirected.full_url
+                continue
+            if status != 200:
+                raise Blocked("official package GET did not succeed")
+            return data
+        except (OSError, ValueError, http.client.HTTPException) as error:
+            raise Blocked("official package GET unavailable") from error
+        finally:
+            connection.close()
+
+
+def _fetch_private_environment(home):
+    home = private_directory(home)
+    roots = {key: str(private_directory(home / ("worker-" + part)))
+             for key, part in PRIVATE_PARTS.items() if key != "HOME"}
+    return {"HOME": str(home), **roots, "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
+
+
+def _known_interpreter():
+    interpreter = Path(sys.executable).resolve()
+    if interpreter.parent not in {Path(part).resolve() for part in SYSTEM_PATHS} \
+            or not interpreter.is_file() or not os.access(interpreter, os.X_OK):
+        raise Blocked("qualification helper interpreter is not a known system executable")
+    return interpreter
+
+
+def supervised_official_get(url, *, private_home, allowed_hosts, deadline_s=120,
+                            limit=ARCHIVE_BYTES, redirect_hosts=()):
+    """Own/reap one private stdlib child; parent deadline also bounds DNS/connect."""
+    if type(deadline_s) not in {int, float} or not math.isfinite(deadline_s) \
+            or not 0 < deadline_s <= 120 or type(limit) is not int or not 0 < limit <= ARCHIVE_BYTES:
+        raise Blocked("official fetch bounds invalid")
+    request = json.dumps({"url": url, "allowed_hosts": sorted(allowed_hosts),
+                          "redirect_hosts": sorted(redirect_hosts),
+                          "deadline_s": deadline_s, "limit": limit}, allow_nan=False).encode()
+    if len(request) > 4096:
+        raise Blocked("official fetch request exceeds bound")
+    env = _fetch_private_environment(Path(private_home))
+    interpreter = _known_interpreter()
+    child = None
+    identity = None
+    proc = ProcReader()
+    selector = selectors.DefaultSelector()
+    output, stderr_bytes, sent = bytearray(), 0, 0
+    deadline = time.monotonic() + deadline_s
+    try:
+        child = subprocess.Popen([str(interpreter), "-I", "-S", str(Path(__file__).resolve()),
+                                  "--fetch-worker"], env=env, cwd=private_home,
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        row = proc.stat(child.pid)
+        if row is None:
+            raise Blocked("official fetch helper identity unavailable")
+        identity = Identity(child.pid, row["start_ticks"])
+        for stream, label, event in ((child.stdin, "stdin", selectors.EVENT_WRITE),
+                                     (child.stdout, "stdout", selectors.EVENT_READ),
+                                     (child.stderr, "stderr", selectors.EVENT_READ)):
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, event, label)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise Blocked("supervised official fetch absolute deadline exceeded")
+            events = selector.select(min(remaining, 0.05))
+            for key, _mask in events:
+                if key.data == "stdin":
+                    try:
+                        count = os.write(key.fd, request[sent:])
+                    except BrokenPipeError:
+                        count = 0
+                    sent += count
+                    if sent == len(request) or count == 0:
+                        selector.unregister(key.fileobj)
+                        key.fileobj.close()
+                else:
+                    raw = os.read(key.fd, 65536)
+                    if not raw:
+                        selector.unregister(key.fileobj)
+                        key.fileobj.close()
+                    elif key.data == "stdout":
+                        output.extend(raw)
+                        if len(output) > limit:
+                            raise Blocked("official fetch output exceeds bound")
+                    else:
+                        stderr_bytes += len(raw)
+                        if stderr_bytes > 4096:
+                            raise Blocked("official fetch diagnostics exceed bound")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise Blocked("supervised official fetch absolute deadline exceeded")
+        child.wait(timeout=remaining)
+        if child.returncode != 0 or stderr_bytes:
+            raise Blocked("official fetch helper blocked; diagnostics discarded")
+        return bytes(output)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise Blocked("supervised official fetch unavailable") from error
+    finally:
+        selector.close()
+        if child is not None:
+            if child.poll() is None:
+                # The direct Popen handle and pidfd bind this helper, never an owner process.
+                try:
+                    pidfd = os.pidfd_open(child.pid)
+                    try:
+                        if identity is not None:
+                            proc.verify(identity)
+                        signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                    finally:
+                        os.close(pidfd)
+                except ProcessLookupError:
+                    pass
+                child.wait(timeout=2)
+            for stream in (child.stdin, child.stdout, child.stderr):
+                if stream is not None:
+                    stream.close()
+            # Reap plus targeted pgrep prove the helper PID is absent; no by-name signals.
+            checked = subprocess.run(["/usr/bin/pgrep", "-P", str(os.getpid())], env=env,
+                                     cwd=private_home, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     timeout=2, check=False)
+            if checked.returncode not in {0, 1} or checked.stderr \
+                    or str(child.pid).encode() in checked.stdout.split() \
+                    or (identity is not None and not proc.gone(identity)):
+                raise Blocked("official fetch helper stop proof unavailable")
+
+
+def _fetch_worker():
+    """Private child protocol: bounded JSON in, package bytes out, fixed failure only."""
+    try:
+        raw = sys.stdin.buffer.read(4097)
+        if len(raw) > 4096:
+            raise Blocked("request bound")
+        request = json.loads(raw)
+        if set(request) != {"url", "allowed_hosts", "redirect_hosts", "deadline_s", "limit"}:
+            raise Blocked("request schema")
+        data = official_https_get(**request)
+        sys.stdout.buffer.write(data)
+        sys.stdout.buffer.flush()
+        return 0
+    except Exception:
+        # Never emit arbitrary exception strings, request URLs or environment values.
+        sys.stderr.buffer.write(b"blocked\n")
+        return 2
+
+
+def extract_pinned_npm(archive, directory, *, integrity=NPM_SHA512,
+                       unpacked_size=204482252, expected_sha=PINNED_SHA256,
+                       binary_name="package/bin/opencode"):
+    """Verify SHA-512 before bounded regular-entry extraction, then packet SHA-256."""
+    if len(archive) > ARCHIVE_BYTES or base64.b64encode(hashlib.sha512(archive).digest()).decode() \
+            != integrity.removeprefix("sha512-"):
+        raise Blocked("npm archive integrity mismatch")
+    seen, total, binary = set(), 0, None
+    try:
+        with gzip.GzipFile(fileobj=io.BytesIO(archive), mode="rb") as compressed:
+            decoded = compressed.read(ARCHIVE_BYTES + 1)
+        if len(decoded) > ARCHIVE_BYTES:
+            raise Blocked("npm aggregate decompression exceeds bound")
+        with tarfile.open(fileobj=io.BytesIO(decoded), mode="r:") as tar:
+            for entry in tar:
+                path = PurePosixPath(entry.name)
+                if entry.name in seen or path.is_absolute() or ".." in path.parts \
+                        or "\\" in entry.name or not entry.isfile() \
+                        or entry.size < 0 or entry.size > ARCHIVE_BYTES:
+                    raise Blocked("unsafe npm archive member")
+                seen.add(entry.name)
+                total += entry.size
+                if total > ARCHIVE_BYTES or len(seen) > 32:
+                    raise Blocked("npm decompression bound exceeded")
+                stream = tar.extractfile(entry)
+                if stream is None:
+                    raise Blocked("npm archive member unavailable")
+                content = stream.read(entry.size + 1)
+                if len(content) != entry.size:
+                    raise Blocked("npm archive declared size mismatch")
+                if entry.name == binary_name:
+                    binary = content
+        if total != unpacked_size or binary is None or not binary \
+                or hashlib.sha256(binary).hexdigest() != expected_sha:
+            raise Blocked("extracted pinned binary size or hash mismatch")
+    except (tarfile.TarError, OSError, EOFError) as error:
+        raise Blocked("npm archive unverifiable") from error
+    directory = Path(directory)
+    directory.mkdir(mode=0o700)
+    binary_path = directory / "opencode"
+    fd = os.open(binary_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o500)
+    with os.fdopen(fd, "wb") as file:
+        file.write(binary)
+    binary_path.chmod(0o500)
+    directory.chmod(0o500)
+    verify_binary(binary_path, expected_sha, len(binary))
+    return binary_path
+
+
+def extract_pinned_release(archive, directory, *, expected_sha=PINNED_SHA256):
+    """Official same-tag release bytes still require bounded archive and packet pin."""
+    if len(archive) > ARCHIVE_BYTES:
+        raise Blocked("official release download exceeds bound")
+    seen, total, binary = set(), 0, None
+    try:
+        with gzip.GzipFile(fileobj=io.BytesIO(archive), mode="rb") as compressed:
+            decoded = compressed.read(ARCHIVE_BYTES + 1)
+        if len(decoded) > ARCHIVE_BYTES:
+            raise Blocked("official release decompression exceeds bound")
+        with tarfile.open(fileobj=io.BytesIO(decoded), mode="r:") as tar:
+            for entry in tar:
+                path = PurePosixPath(entry.name)
+                if entry.name in seen or path.is_absolute() or ".." in path.parts \
+                        or "\\" in entry.name or not (entry.isfile() or entry.isdir()) \
+                        or entry.size < 0 or entry.size > ARCHIVE_BYTES:
+                    raise Blocked("unsafe official release archive member")
+                seen.add(entry.name)
+                total += entry.size
+                if total > ARCHIVE_BYTES or len(seen) > 32:
+                    raise Blocked("official release extraction bound exceeded")
+                if entry.isdir():
+                    continue
+                stream = tar.extractfile(entry)
+                if stream is None:
+                    raise Blocked("official release archive member unavailable")
+                content = stream.read(entry.size + 1)
+                if len(content) != entry.size:
+                    raise Blocked("official release declared size mismatch")
+                if path.name == "opencode":
+                    if binary is not None:
+                        raise Blocked("official release binary ambiguous")
+                    binary = content
+        if not binary or hashlib.sha256(binary).hexdigest() != expected_sha:
+            raise Blocked("official release pinned binary hash mismatch")
+    except (tarfile.TarError, OSError, EOFError) as error:
+        raise Blocked("official release archive unverifiable") from error
+    directory = Path(directory)
+    directory.mkdir(mode=0o700)
+    binary_path = directory / "opencode"
+    fd = os.open(binary_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o500)
+    with os.fdopen(fd, "wb") as file:
+        file.write(binary)
+    binary_path.chmod(0o500)
+    directory.chmod(0o500)
+    verify_binary(binary_path, expected_sha, len(binary))
+    return binary_path
+
+
+def namespace_name():
+    digest = hashlib.sha256()
+    for field in (b"via-opencode-namespace-v1", b"opencode-free-anonymous-v1",
+                  (1).to_bytes(8, "little")):
+        digest.update(len(field).to_bytes(8, "little"))
+        digest.update(field)
+    return digest.hexdigest()[:16]
+
+
+def private_directory(path):
+    """Create one 0700 directory; reject existing symlink or unsafe mode (N1)."""
+    path = Path(path)
+    try:
+        path.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    row = path.lstat()
+    if not stat.S_ISDIR(row.st_mode) or stat.S_IMODE(row.st_mode) != 0o700 \
+            or row.st_uid != os.getuid():
+        raise Blocked("private directory chain is unsafe")
+    return path
+
+
+def create_namespace(state):
+    """Exact §3.2 namespace and seven roots, including vendor/opencode 0700 chain."""
+    state = private_directory(state)
+    vendor = private_directory(state / "vendor")
+    route = private_directory(vendor / "opencode")
+    root = private_directory(route / namespace_name())
+    return root, {key: str(private_directory(root / part))
+                  for key, part in PRIVATE_PARTS.items()}
+
+
+def init_fixture_repo(path, home, *, sentinel=False):
+    """A new private Git fixture with an initial private-identity commit (N2)."""
+    path, home = Path(path), Path(home)
+    if (path / ".git").exists():
+        raise Blocked("fixture Git repository already exists")
+    private_directory(path)
+    private_directory(home)
+    template = private_directory(home / "git-empty-template")
+    env = {"HOME": str(home), "XDG_CONFIG_HOME": str(home), "PATH": "/usr/bin:/bin",
+           "LANG": "C.UTF-8", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+           "GIT_AUTHOR_NAME": "VIA fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+           "GIT_COMMITTER_NAME": "VIA fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid"}
+    (path / "AGENTS.md").write_text("VIA_LOCAL_AGENT_SENTINEL\n")
+    if sentinel:
+        (path / "AGENTS.md").write_text("VIA_ANCESTOR_AGENTS_SENTINEL\n")
+        skill = path / ".claude" / "skills" / "via-sentinel"
+        skill.mkdir(parents=True, mode=0o700)
+        (skill / "SKILL.md").write_text("---\nname: via-sentinel\n"
+                                        "description: VIA_ANCESTOR_SKILL_SENTINEL\n---\n"
+                                        "VIA_ANCESTOR_SKILL_SENTINEL\n")
+        for directory, marker in ((".claude", "VIA_ANCESTOR_CLAUDE_AGENT_SENTINEL"),
+                                  (".opencode", "VIA_ANCESTOR_OPENCODE_AGENT_SENTINEL")):
+            agents = path / directory / "agents"
+            agents.mkdir(parents=True, mode=0o700)
+            (agents / "via-sentinel.md").write_text(
+                "---\ndescription: local walk-up sentinel\nmode: subagent\n---\n" + marker + "\n")
+    for args in (("init", "--template=" + str(template), "."),
+                 ("add", "--", "AGENTS.md", *([".claude", ".opencode"] if sentinel else [])),
+                 ("-c", "commit.gpgsign=false", "commit", "-m", "fixture root")):
+        try:
+            result = subprocess.run(["/usr/bin/git", *args], cwd=path, env=env,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    timeout=30, check=False)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise Blocked("private fixture Git initialization unavailable") from error
+        if result.returncode:
+            raise Blocked("private fixture Git initialization failed")
+    return path
+
+
+def validate_path(value, helper_dir, *, system_dirs=SYSTEM_PATHS):
+    """Refuse empty/relative/user-bin PATH entries; exact private helper is allowed."""
+    helper = Path(helper_dir).resolve()
+    allowed = {Path(part).resolve() for part in system_dirs}
+    entries = value.split(os.pathsep)
+    if not entries or any(not part or not Path(part).is_absolute() for part in entries):
+        raise Blocked("unsafe PATH entry")
+    for part in entries:
+        resolved = Path(part).resolve()
+        if resolved != helper and resolved not in allowed:
+            raise Blocked("unsafe PATH outside system/helper directories")
+    if helper not in {Path(part).resolve() for part in entries}:
+        raise Blocked("private helper directory absent from PATH")
+    return True
+
+
+def build_minimal_path(helper_dir, rg=None, *, system_dirs=SYSTEM_PATHS):
+    """Link exactly a checked system rg into the helper directory (N8)."""
+    helper = private_directory(helper_dir)
+    rg = Path(rg or shutil.which("rg", path=os.pathsep.join(system_dirs)) or "")
+    allowed = {Path(part).resolve() for part in system_dirs}
+    if not rg.is_absolute() or rg.resolve().parent not in allowed \
+            or not rg.is_file() or not os.access(rg, os.X_OK):
+        raise Blocked("known rg is not a system executable")
+    target = helper / "rg"
+    if target.exists() or target.is_symlink():
+        if not target.is_symlink() or target.resolve() != rg.resolve():
+            raise Blocked("fixture rg link does not match checked system executable")
+    else:
+        target.symlink_to(rg.resolve())
+    value = os.pathsep.join((str(helper), *system_dirs))
+    validate_path(value, helper, system_dirs=system_dirs)
+    return value, {"rg_sha256": sha256(rg), "rg_system_directory": True}
+
+
+def credential_metadata_only(name):
+    """Credential/config databases are never opened by inventory (qualification privacy)."""
+    lowered = name.lower().lstrip(".")
+    return (lowered.startswith("auth") or "credential" in lowered
+            or lowered.startswith(("npmrc", "netrc", "bunfig.toml"))
+            or lowered.startswith("opencode.db")
+            or any(extension in lowered for extension in (".sqlite", ".db-wal", ".db-shm")))
+
+
+class Inventory:
+    """Detect package artifacts/new binaries in HOME, XDG, fixtures and namespace."""
+
+    def __init__(self, roots, *, max_entries=100000):
+        self.roots = tuple(Path(root) for root in roots)
+        self.max_entries = max_entries
+        self.before = self._snapshot()
+
+    def _snapshot(self):
+        entries, binaries = 0, {}
+        for index, root in enumerate(self.roots):
+            if not root.is_dir() or root.is_symlink():
+                raise Blocked("inventory root unavailable or unsafe")
+            def unreadable(_error):
+                raise Blocked("private inventory contains unreadable directory")
+            for folder, dirs, files in os.walk(root, followlinks=False, onerror=unreadable):
+                for name in (*dirs, *files):
+                    entries += 1
+                    if entries > self.max_entries:
+                        raise Blocked("private inventory exceeds bound")
+                    if name in {"node_modules", "package.json"}:
+                        raise Blocked("package artifact appeared in private roots")
+                    path = Path(folder) / name
+                    row = path.lstat()
+                    if stat.S_ISLNK(row.st_mode):
+                        raise Blocked("inventory contains unreviewed symbolic link")
+                    if stat.S_ISREG(row.st_mode):
+                        protected = credential_metadata_only(name)
+                        if protected:
+                            if row.st_mode & 0o111:
+                                binaries[(index, str(path.relative_to(root)))] = (
+                                    "metadata-only", row.st_dev, row.st_ino, row.st_size,
+                                    row.st_mode, row.st_mtime_ns, row.st_ctime_ns)
+                            continue
+                        with path.open("rb") as file:
+                            prefix = file.read(4)
+                        if row.st_mode & 0o111 or prefix == b"\x7fELF" \
+                                or prefix[:2] == b"MZ" or prefix in {b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf"}:
+                            if row.st_size > ARCHIVE_BYTES:
+                                raise Blocked("private binary inventory size exceeds bound")
+                            binaries[(index, str(path.relative_to(root)))] = (
+                                row.st_dev, row.st_ino, row.st_size, sha256(path))
+        return binaries
+
+    def check(self):
+        if self._snapshot() != self.before:
+            raise Blocked("new or changed binary appeared in private roots")
+        return True
+
+
+class SpendingGuard:
+    """Structural controls before every model-capable request; missing cost is null."""
+
+    def __init__(self, *, allowed_environment=VENDOR_ENVIRONMENT,
+                 owned_mock_origins=(), public_free=False):
+        self.allowed_environment = frozenset(allowed_environment)
+        self.mock_origins = frozenset(owned_mock_origins)
+        for origin in self.mock_origins:
+            loopback_origin(origin)
+        self.public_free = public_free
+        self.stopped = False
+
+    def check(self, *, integration, environment_names, catalog, provider, model,
+              project_providers, cost=None, mock_received=None):
+        if self.stopped:
+            raise Blocked("spending control previously failed")
+        try:
+            if not isinstance(integration, dict) or not isinstance(integration.get("data"), list) \
+                    or not set(integration) <= {"data", "location"}:
+                raise Blocked("integration credential-free shape unverifiable")
+            for item in integration["data"]:
+                if not isinstance(item, dict) or not isinstance(item.get("id"), str) \
+                        or not set(item) <= {"id", "name", "methods", "connections"} \
+                        or not isinstance(item.get("connections"), list) \
+                        or item["connections"] != []:
+                    raise Blocked("integration is not proven credential-free")
+            if frozenset(environment_names) != self.allowed_environment:
+                raise Blocked("environment allow-list failed")
+            identity = f"{provider}/{model}"
+            if identity not in {FREE_IDENTITY, MOCK_IDENTITY}:
+                raise Blocked("paid or unapproved model identity")
+            if not isinstance(catalog, dict) or not isinstance(catalog.get(identity), dict) \
+                    or catalog[identity].get("free") is not True:
+                raise Blocked("frozen free model absent from catalog")
+            if not isinstance(project_providers, dict):
+                raise Blocked("effective project providers unverifiable")
+            for endpoint in project_providers.values():
+                if loopback_origin(endpoint) not in self.mock_origins:
+                    raise Blocked("project provider does not point to owned loopback mock")
+            overridden = provider in project_providers
+            if identity == MOCK_IDENTITY and not overridden:
+                raise Blocked("fixture provider endpoint absent")
+            if not overridden and not (self.public_free and identity == FREE_IDENTITY):
+                raise Blocked("public model mode not explicitly admitted")
+            if overridden and mock_received is False:
+                raise Blocked("provider override did not reach mock")
+            if cost is not None:
+                if type(cost) not in {int, float} or not math.isfinite(cost) or cost < 0:
+                    raise Blocked("cost evidence invalid")
+                if cost > 0:
+                    raise Blocked("positive cost hard stop")
+        except (Blocked, TypeError, ValueError) as error:
+            self.stopped = True
+            if isinstance(error, Blocked):
+                raise
+            raise Blocked("structural spending evidence unverifiable") from error
+        return {"structural_spending_controls": True,
+                "cost": cost, "cost_available": cost is not None}
+
+
+def loopback_origin(value):
+    parts = urllib.parse.urlsplit(value)
+    try:
+        port = parts.port
+    except ValueError as error:
+        raise Blocked("invalid owned listener port") from error
+    if parts.scheme != "http" or parts.hostname != "127.0.0.1" \
+            or not port or parts.username or parts.password:
+        raise Blocked("endpoint is not unauthenticated IPv4 loopback")
+    return f"http://127.0.0.1:{port}"
+
+
+class OwnedHTTP:
+    """Authenticated requests to one verified generation; no proxy or redirects."""
+
+    def __init__(self, origin, identity, proc, password, *, limit=HTTP_BYTES, seeding_mode=False):
+        self.origin = loopback_origin(origin)
+        if origin.rstrip("/") != self.origin:
+            raise Blocked("owned API origin includes a path")
+        self.identity, self.proc, self.password, self.limit = identity, proc, password, limit
+        self.seeding_mode = seeding_mode
+
+    def request(self, method, path, body=None, *, authenticated=True, timeout=30):
+        if not path.startswith("/") or path.startswith("//") or "\r" in path or "\n" in path \
+                or urllib.parse.urlsplit(path).netloc:
+            raise Blocked("API path changes owned origin")
+        credential_path = urllib.parse.urlsplit(path).path.rstrip("/")
+        if credential_path == "/api/credential" or credential_path.startswith("/api/credential/"):
+            if not (self.seeding_mode is True and method == "POST"
+                    and credential_path == "/api/credential"):
+                raise Blocked("credential endpoint forbidden")
+        self.proc.verify(self.identity)
+        parts = urllib.parse.urlsplit(self.origin)
+        headers = {"Content-Type": "application/json"}
+        if authenticated:
+            headers["Authorization"] = "Basic " + base64.b64encode(
+                b"opencode:" + self.password).decode("ascii")
+        raw = None if body is None else json.dumps(body, allow_nan=False).encode()
+        if raw is not None and len(raw) > self.limit:
+            raise Blocked("owned API request exceeds bound")
+        deadline = time.monotonic() + timeout
+        connection = http.client.HTTPConnection(parts.hostname, parts.port, timeout=timeout)
+        try:
+            status, _location, data = _bounded_response(connection, method, path, headers, raw,
+                                                        deadline=deadline, limit=self.limit)
+            if 300 <= status < 400:
+                raise Blocked("owned API redirect refused")
+            self.proc.verify(self.identity)
+            return status, data
+        except (OSError, http.client.HTTPException) as error:
+            raise Blocked("owned API observation unavailable") from error
+        finally:
+            connection.close()
+
+
+class DeferredSignals:
+    """Record interruption only; cleanup may resume stopped owned daemons (§13 L14)."""
+
+    def __init__(self):
+        self.interrupted = None
+        self._previous = {}
+
+    def record(self, signum, _frame=None):
+        if self.interrupted is None:
+            self.interrupted = signal.Signals(signum).name
+
+    def guard(self):
+        if self.interrupted is not None:
+            raise Blocked("qualification interrupted")
+
+    def __enter__(self):
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            self._previous[signum] = signal.signal(signum, self.record)
+        return self
+
+    def __exit__(self, *_args):
+        for signum, handler in self._previous.items():
+            signal.signal(signum, handler)
+
+
+class StopJournal:
+    """Persist a stopped daemon identity before SIGSTOP; verify before recovery (N6)."""
+
+    def __init__(self, path, proc, *, sender=None):
+        self.path, self.proc, self.sender = Path(path), proc, sender
+
+    def _signal(self, identity, signum):
+        self.proc.verify(identity)
+        if self.sender is not None:
+            # An injected sender is only for synthetic-proc self-tests.
+            self.sender(identity.pid, signum)
+            return
+        if self.proc.root != Path("/proc") or not hasattr(os, "pidfd_open") \
+                or not hasattr(signal, "pidfd_send_signal"):
+            raise Blocked("stable owned signal unavailable")
+        try:
+            pidfd = os.pidfd_open(identity.pid)
+            try:
+                self.proc.verify(identity)
+                signal.pidfd_send_signal(pidfd, signum)
+            finally:
+                os.close(pidfd)
+        except OSError as error:
+            raise Blocked("stable owned signal failed") from error
+
+    def stop(self, identity):
+        self.proc.verify(identity)
+        if self.path.exists():
+            raise Blocked("stopped-daemon recovery journal already exists")
+        data = json.dumps({"version": 1, **identity.report()}).encode()
+        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as file:
+            file.write(data)
+            file.flush()
+            os.fsync(file.fileno())
+        self._signal(identity, signal.SIGSTOP)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            row = self.proc.stat(identity.pid)
+            if row and row["start_ticks"] == identity.start_ticks and row["state"] in {"T", "t"}:
+                return
+            time.sleep(0.01)
+        raise Blocked("daemon SIGSTOP barrier unverified; journal retained")
+
+    def recover(self):
+        if not self.path.exists():
+            return False
+        try:
+            row = self.path.lstat()
+            if not stat.S_ISREG(row.st_mode) or stat.S_IMODE(row.st_mode) != 0o600 \
+                    or row.st_uid != os.getuid() or row.st_size > 4096:
+                raise Blocked("stopped-daemon journal unsafe")
+            data = json.loads(self.path.read_bytes())
+            if set(data) != {"version", "pid", "start_ticks"} or data["version"] != 1:
+                raise Blocked("stopped-daemon journal invalid")
+            identity = Identity(data["pid"], data["start_ticks"])
+        except (OSError, ValueError, TypeError) as error:
+            raise Blocked("stopped-daemon journal unreadable") from error
+        # A reused PID never authorizes SIGCONT; retain uncertainty for review.
+        self._signal(identity, signal.SIGCONT)
+        self.path.unlink()
+        return True
+
+    def resume(self, identity):
+        if self.path.exists():
+            self.recover()
+        else:
+            self._signal(identity, signal.SIGCONT)
+
+
+def stop_proof(*, process_states, locks_free, uncertain=(), pgrep_clear=None):
+    """Every tracked identity gone, both locks free, no uncertainty, targeted pgrep."""
+    require_proof(not uncertain, "sticky process uncertainty remains")
+    if len(locks_free) != 2 or any(value is not True for value in locks_free):
+        raise Blocked("private daemon/store lock absence unverified")
+    if any(value is not False for value in process_states):
+        raise Blocked("owned process stop unverified")
+    require_proof(pgrep_clear, "targeted pgrep absence unverified")
+    return True
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["--fetch-worker"]:
+        raise SystemExit(_fetch_worker())
+    raise SystemExit(2)
