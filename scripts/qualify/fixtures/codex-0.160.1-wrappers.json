@@ -1,0 +1,16 @@
+{
+  "source": "Coordinator Run 11 rollout: unified_exec_startup commandExecution; paths replaced with synthetic paths.",
+  "command": "/usr/bin/python3.12 /tmp/via-codex-qual.fixture/tool-fixture.py",
+  "shell": [
+    "/bin/bash",
+    "-lc",
+    "/usr/bin/python3.12 /tmp/via-codex-qual.fixture/tool-fixture.py"
+  ],
+  "suffix_rule_source": "Coordinator ruling: synthetic launcher chain, executable pins plus exact command suffix; prefix values are not acceptance evidence.",
+  "suffix_shapes": {
+    "launcher": ["codex-linux-sandbox", "--sandbox-policy", "synthetic-policy", "--", "/bin/bash", "-lc", "/usr/bin/python3.12 /tmp/via-codex-qual.fixture/tool-fixture.py"],
+    "bwrap": ["bwrap", "--ro-bind", "/synthetic/source", "/synthetic/destination", "--", "/bin/bash", "-lc", "/usr/bin/python3.12 /tmp/via-codex-qual.fixture/tool-fixture.py"],
+    "inner": ["synthetic-inner", "--synthetic-inner-flag=synthetic-value", "--", "/bin/bash", "-lc", "/usr/bin/python3.12 /tmp/via-codex-qual.fixture/tool-fixture.py"],
+    "shell": ["/bin/bash", "-lc", "/usr/bin/python3.12 /tmp/via-codex-qual.fixture/tool-fixture.py"]
+  }
+}

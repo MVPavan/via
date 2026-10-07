@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import stat
 import time
@@ -168,7 +169,7 @@ class Survey:
             self.max_gap_ms = max(self.max_gap_ms, int((now - self.last_scan) * 1000))
         self.last_scan, self.scans = now, self.scans + 1
 
-    def observe(self, proc, identity, argv):
+    def observe(self, proc, identity, argv, wrapper_shape=None):
         """Runtime §5.2: caller has proved ancestry before any content read."""
         now = int(time.monotonic() * 1000)
         cwd = executable = None
@@ -186,12 +187,13 @@ class Survey:
                   "argv_hash": digest(argv), "argv_role": role,
                   "attempt_argv_matches": argv == self.probe.attempt,
                   "denied_argv_matches": argv == self.probe.denied,
-                  "contains_attempt_program": (str(self.probe.program) in argv if self.probe.program
+                  "contains_attempt_program": (str(self.probe.program) in "\0".join(argv) if self.probe.program
                                                else any(ATTEMPT_CODE in value for value in argv)),
                   "cwd_hash": digest(cwd) if cwd is not None else None,
                   "cwd_matches": cwd == str(self.probe.target.parent) if cwd is not None else None,
                   "executable_path_hash": digest(executable) if executable is not None else None,
-                  "python_path_matches": executable == self.probe.python if executable is not None else None}
+                  "python_path_matches": executable == self.probe.python if executable is not None else None,
+                  "wrapper_shape": wrapper_shape}
         key = digest(sample)
         if key not in self.records:
             if len(self.records) >= SURVEY_RECORDS:
@@ -227,40 +229,95 @@ class Survey:
 class DeniedExecution:
     """Packet §§3/5: pin exact owned argv; writes additionally require the EROFS transition."""
     def __init__(self, python, python_hash, target, attempt=None, denied=None, program=None,
-                 program_hash=None, require_refusal=True):
+                 program_hash=None, require_refusal=True, wrapper_hashes=None):
         self.python, self.python_hash, self.target = str(Path(python).resolve()), python_hash, Path(target)
         self.attempt = attempt or [self.python, "-c", ATTEMPT_CODE, self.target.name]
         self.denied = denied or [self.python, "-c", DENIED_CODE, DENIED_TAG]
         self.program, self.program_hash, self.require_refusal = program, program_hash, require_refusal
         self.seen, self.blockers, self.execution_observed = set(), set(), False
+        self.wrapper_hashes, self.pending_wrappers = dict(wrapper_hashes or {}), {}
 
     def require_no_blockers(self):
         """Packet §§3/7: later exact observations cannot erase an earlier deviation."""
         if self.blockers:
             raise Blocked("prohibited execution: " + ", ".join(sorted(self.blockers)))
 
+    def command_wrapper(self, argv):
+        """Packet §§3/8: prefix flags never confer ownership; the command suffix is byte-exact."""
+        return (self.program is not None
+                and argv[-3:] == ["/bin/bash", "-lc", shlex.join(self.attempt)])
+
+    def wrapper_shape(self, argv, executable_class):
+        """Packet §8: record transport shape, with no raw paths, command text or flag values."""
+        flags, values = [], []
+        prefix = argv[:-3] if self.command_wrapper(argv) else argv
+        for value in prefix:
+            name, separator, rest = value.partition("=")
+            if re.fullmatch(r"--?[A-Za-z][A-Za-z0-9_-]*", name):
+                flags.append(name)
+                if separator:
+                    values.append(digest(rest))
+            else:
+                values.append(digest(value))
+        return {"record_only": True, "executable_class": executable_class,
+                "argv_length": len(argv), "flag_names": flags, "value_hashes": values,
+                "suffix_matches": self.command_wrapper(argv)}
+
+    def pair_wrappers(self, proc, identity):
+        """Packet §§3/8: pending transports must be in the exact tool's pinned ancestry."""
+        for wrapper in self.pending_wrappers.values():
+            try:
+                proc.own(identity, wrapper)
+            except Blocked:
+                self.blockers.add("command deviation")
+                self.require_no_blockers()
+        self.pending_wrappers.clear()
+
     def observe(self, proc, identity, server, survey=None):
         """Packet §3/runtime §5.2: ancestry first, then descriptor-pinned executable/argv/cwd."""
-        proc.own(identity, server)
+        try:
+            proc.own(identity, server)
+        except Blocked:
+            self.blockers.add("command deviation")
+            raise  # No foreign argv/executable/content reads, even on this blocked path.
         raw = proc.content(identity, "cmdline")
         try:
             argv = raw.rstrip(b"\0").decode().split("\0")
         except UnicodeError:
             raise Blocked("prohibited execution argv unverifiable") from None
-        if survey is not None:
-            survey.observe(proc, identity, argv)
         related = (str(self.program) in "\0".join(argv) if self.program is not None
                    else any(ATTEMPT_CODE in value for value in argv))
+        wrapper_shape = None
         if argv not in (self.attempt, self.denied):
             if related:
                 self.execution_observed = True
-                self.blockers.add("command deviation")
+                executable_class = None
+                try:
+                    hashed = proc.executable_hash(identity)
+                    executable_class = next((name for name, pinned in self.wrapper_hashes.items()
+                                             if name in ("codex", "bwrap", "bash") and hashed == pinned), None)
+                except (OSError, Blocked):
+                    pass  # An unreadable executable can never authorize a transport.
+                wrapper_shape = self.wrapper_shape(argv, executable_class)
+                token = identity["pid"], identity["start_ticks"]
+                if not self.command_wrapper(argv) or executable_class is None \
+                        or token == (server["pid"], server["start_ticks"]):
+                    self.blockers.add("command deviation")
+                else:
+                    if token not in self.pending_wrappers and len(self.pending_wrappers) >= SURVEY_RECORDS:
+                        raise Blocked("prohibited execution wrapper evidence bound")
+                    self.pending_wrappers[token] = identity
+            if survey is not None:
+                survey.observe(proc, identity, argv, wrapper_shape)
             return None
+        if survey is not None:
+            survey.observe(proc, identity, argv)
         self.execution_observed = True
         if proc.executable_hash(identity) != self.python_hash or proc.cwd(identity) != str(self.target.parent):
             raise Blocked("prohibited execution identity/cwd mismatch")
         if self.program is not None:
             verify_program(self.program, self.program_hash)
+        self.pair_wrappers(proc, identity)
         token = identity["pid"], identity["start_ticks"]
         if argv == self.attempt:
             self.seen.add(token)

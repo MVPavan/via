@@ -433,6 +433,7 @@ class Proc:
     """Pid/start identity and content through /proc dirfds; synthetic root in tests."""
     def __init__(self, root=Path("/proc")):
         self.root = root
+        self.executable_hashes = {}
 
     @staticmethod
     def read_fd(directory, name):
@@ -510,11 +511,20 @@ class Proc:
             executable = os.open("exe", os.O_RDONLY, dir_fd=fd)
             hashed, size = hashlib.sha256(), 0
             with os.fdopen(executable, "rb") as file:
+                info = os.fstat(file.fileno())
+                key = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+                if key in self.executable_hashes:
+                    return self.executable_hashes[key]
                 while raw := file.read(1024 * 1024):
                     size += len(raw)
                     require(size <= TOOL_EXE_BYTES, "tool executable byte bound")
                     hashed.update(raw)
-            return hashed.hexdigest()
+                after = os.fstat(file.fileno())
+                require(key == (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns),
+                        "tool executable changed while hashing")
+            require(len(self.executable_hashes) < bound_probe.SURVEY_RECORDS, "tool executable hash evidence bound")
+            self.executable_hashes[key] = hashed.hexdigest()
+            return self.executable_hashes[key]
         finally:
             os.close(fd)
 
@@ -1462,7 +1472,7 @@ class Run(shared.Run):
             self.trace_dir.mkdir(mode=0o700)
             self.reservations = reservation_control.Reservations(self.work / "reservations.json", self.spend.deadline)
             self.tool_program, self.tool_program_hash = bound_probe.write_program(self.work)
-            self.command_specs, self.command_observations = {}, {}
+            self.command_specs, self.command_observations, self.wrapper_hashes = {}, {}, {}
             self.codex = Path(args.codex).resolve()
             self.launcher = self.work / "codex-proxy"
             self.base_env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(self.home),
@@ -1505,6 +1515,7 @@ class Run(shared.Run):
         require(bool(re.fullmatch(r"\d+\.\d+\.\d+", self.args.candidate_version)),
                 "candidate version shape")
         feature_check = feature_preflight(self.codex, self.env, self.work)
+        self.wrapper_hashes = self.wrapper_pins()
         control = {"codex": str(self.codex), "codex_hash": self.args.codex_sha256,
                    "codex_home": str(self.owner_codex), "mcp_names": names, "model": MODEL,
                    "trace_dir": str(self.trace_dir), "version": self.args.candidate_version,
@@ -1524,6 +1535,7 @@ class Run(shared.Run):
             "feature_registry": feature_check, "tool_runtime_bounds": tool_bounds,
             "auth_metadata": auth, "mcp_name_digests": [digest(name) for name in names],
             "binaries": {"via": self.args.via_sha256, "codex": self.args.codex_sha256,
+                         "wrappers": self.wrapper_hashes,
                          "python": shared.sha256(sys.executable),
                          "runner": shared.sha256(__file__),
                          "lifecycle": shared.sha256(shared.__file__),
@@ -1531,6 +1543,14 @@ class Run(shared.Run):
                          "bound_probe": shared.sha256(bound_probe.__file__),
                          "tool_program": self.tool_program_hash,
                          "proxy_launcher": shared.sha256(self.launcher)}})
+
+    def wrapper_pins(self):
+        """Packet §8: resolve system transports and record hashes, never owner configuration."""
+        bwrap = shutil.which("bwrap", path=os.defpath)
+        require(bwrap is not None, "system bwrap unavailable for wrapper verification")
+        return {"codex": self.args.codex_sha256,
+                "bwrap": shared.sha256(Path(bwrap).resolve()),
+                "bash": shared.sha256(Path("/bin/bash").resolve())}
 
     def via_call(self, directory, label, *args, timeout=60, handle=None):
         """Strict CLI reply schema; handles on stdin, no stdout/stderr persisted."""
@@ -1679,7 +1699,8 @@ class Run(shared.Run):
     def check_execution_observations(self):
         """Packet §§3/7: sticky process observations also constrain final accounting."""
         for label, observation in self.command_observations.items():
-            self.check("execution observations admissible " + label, not observation["blockers"])
+            self.check("execution observations admissible " + label,
+                       not observation["blockers"] and not observation.get("unpaired_wrappers", 0))
 
     def require_execution_absence(self, label):
         """Packet §7: missing items and samples cannot prove a program never ran."""
@@ -1803,7 +1824,8 @@ class Run(shared.Run):
         probe = bound_probe.DeniedExecution(sys.executable, shared.sha256(sys.executable), target,
                     attempt=spec["argv"] if spec else None, denied=spec["denied"] if spec else None,
                     program=spec["program"] if spec else None,
-                    program_hash=spec["program_hash"] if spec else None, require_refusal=refusal)
+                    program_hash=spec["program_hash"] if spec else None, require_refusal=refusal,
+                    wrapper_hashes=self.wrapper_hashes)
         prefix = "changed-bound" if label == "c2" else "command-" + label
         survey = bound_probe.Survey(probe)
         deadline = min(time.monotonic() + POLL_S, self.spend.deadline)
@@ -1882,7 +1904,8 @@ class Run(shared.Run):
             raise Blocked("prohibited execution not observed")
         finally:
             self.command_observations[label] = {"execution_observed": probe.execution_observed,
-                                                "blockers": sorted(probe.blockers)}
+                                                "blockers": sorted(probe.blockers),
+                                                "unpaired_wrappers": len(probe.pending_wrappers)}
             tools = [{field: fact.get(field) for field in ("item_type", "item_hash", "at_ms", "finished",
                       "command_hash", "argv_hash", "fixed_attempt_argv", "exit_code", "read_only_error", "error_flags")}
                      for fact in facts if fact["kind"] == "tool" and "turn" in context
@@ -4856,6 +4879,247 @@ class SafetyTests(unittest.TestCase):
         program.write_text("synthetic tampered program")
         with self.assertRaisesRegex(Blocked, "program hash"):
             probe.observe(proc, tool, server)
+
+    def wrapper_probe_fixture(self, mode="allowed"):
+        """Packet §§3/8: synthetic pinned launcher/bwrap/inner/bash ancestry and exact child."""
+        legacy, proc, server, _ = self.probe_fixture()
+        pins = {}
+        for name in ("codex", "bwrap", "bash"):
+            binary = self.root / ("wrapper-" + name)
+            binary.write_bytes(("synthetic wrapper " + name).encode())
+            pins[name] = shared.sha256(binary)
+        program, pinned = bound_probe.write_program(self.root, {"action": mode, "seed": "VIAQUALsynthetic"})
+        attempt = [legacy.python, str(program)]
+        probe = bound_probe.DeniedExecution(legacy.python, legacy.python_hash, legacy.target,
+                    attempt, [*attempt, "1"], program, pinned, mode in ("denied", "never-ask"))
+        probe.wrapper_hashes = pins
+        fixture = json.loads((Path(__file__).parent / "fixtures/codex-0.160.1-wrappers.json").read_text())
+        wrappers = []
+        for pid, (shape, executable) in enumerate((("launcher", "codex"), ("bwrap", "bwrap"),
+                                                   ("inner", "codex"), ("shell", "bash")), 2):
+            identity = self.process(pid, pid - 1, pid * 10)
+            path = self.root / str(pid) / "exe"
+            path.unlink(missing_ok=True)
+            path.symlink_to(self.root / ("wrapper-" + executable))
+            argv = [part.replace(fixture["command"], shlex.join(attempt))
+                    for part in fixture["suffix_shapes"][shape]]
+            (self.root / str(pid) / "cmdline").write_bytes("\0".join(argv).encode() + b"\0")
+            wrappers.append((identity, argv))
+        tool = self.process(6, 5, 60)
+        (self.root / "6/exe").symlink_to(legacy.python)
+        (self.root / "6/cwd").symlink_to(legacy.target.parent)
+        (self.root / "6/cmdline").write_bytes("\0".join(attempt).encode() + b"\0")
+        return probe, proc, server, tool, wrappers
+
+    def test_verified_wrapper_suffix_chain_for_every_tool_mode(self):
+        for mode in ("allowed", "denied", "never-ask", "interrupt-a", "interrupt-b"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as root:
+                previous, self.root = self.root, Path(root)
+                try:
+                    probe, proc, server, tool, wrappers = self.wrapper_probe_fixture(mode)
+                    survey = bound_probe.Survey(probe)
+                    for identity, _ in wrappers:
+                        self.assertIsNone(probe.observe(proc, identity, server, survey))
+                        probe.require_no_blockers()
+                    self.assertFalse(probe.seen)
+                    self.assertEqual(len(probe.pending_wrappers), 4)
+                    proof = probe.observe(proc, tool, server, survey)
+                    if probe.require_refusal:
+                        self.assertIsNone(proof)
+                        (self.root / "6/cmdline").write_bytes("\0".join(probe.denied).encode() + b"\0")
+                        proof = probe.observe(proc, tool, server, survey)
+                        self.assertEqual(proof["errno"], "EROFS")
+                    self.assertEqual(proof["program_hash"], probe.program_hash)
+                    self.assertFalse(probe.pending_wrappers)
+                    snapshot = survey.snapshot("proven", {}, [])
+                    self.assertTrue(secret_free(snapshot))
+                    for sample in snapshot["observations"][:4]:
+                        self.assertTrue(sample["wrapper_shape"]["suffix_matches"])
+                        self.assertTrue(sample["wrapper_shape"]["record_only"])
+                        self.assertIn(sample["wrapper_shape"]["executable_class"], probe.wrapper_hashes)
+                    self.assertNotIn("synthetic-policy", json.dumps(snapshot))
+                    self.assertNotIn("synthetic-value", json.dumps(snapshot))
+                    self.assertNotIn(str(self.root), json.dumps(snapshot))
+                finally:
+                    self.root = previous
+
+    def test_wrapper_suffix_rejections_are_sticky(self):
+        for deviation in ("one_byte", "extra_argument", "unverified_executable", "exec_changed", "foreign", "sibling"):
+            with self.subTest(deviation=deviation), tempfile.TemporaryDirectory() as root:
+                previous, self.root = self.root, Path(root)
+                try:
+                    probe, proc, server, tool, wrappers = self.wrapper_probe_fixture()
+                    identity, argv = wrappers[0]
+                    if deviation == "one_byte":
+                        argv[-1] += " "
+                    elif deviation == "extra_argument":
+                        argv.append("extra")
+                    elif deviation in ("unverified_executable", "exec_changed"):
+                        if deviation == "exec_changed":
+                            probe.observe(proc, identity, server)
+                            probe.require_no_blockers()
+                        (self.root / "2/exe").unlink()
+                        (self.root / "2/exe").symlink_to(probe.python)
+                    elif deviation == "foreign":
+                        self.process(2, 0, 20)
+                    elif deviation == "sibling":
+                        self.process(6, 1, 60)
+                        (self.root / "6/cmdline").write_bytes("\0".join(probe.attempt).encode() + b"\0")
+                    (self.root / "2/cmdline").write_bytes("\0".join(argv).encode() + b"\0")
+                    if deviation == "foreign":
+                        with mock.patch.object(proc, "content") as read, self.assertRaisesRegex(Blocked, "foreign process"):
+                            probe.observe(proc, identity, server)
+                        read.assert_not_called()
+                    else:
+                        probe.observe(proc, identity, server)
+                        if deviation == "sibling":
+                            with self.assertRaisesRegex(Blocked, "command deviation"):
+                                probe.observe(proc, tool, server)
+                    with self.assertRaisesRegex(Blocked, "command deviation"):
+                        probe.require_no_blockers()
+                finally:
+                    self.root = previous
+
+    def test_wrapper_pins_resolve_system_binaries_and_block_missing_bwrap(self):
+        run = self.run_object()
+        with mock.patch.object(shutil, "which", return_value=str(self.root / "system-bwrap")) as resolve, \
+             mock.patch.object(shared, "sha256", return_value="a" * 64) as hashed:
+            pins = run.wrapper_pins()
+        resolve.assert_called_once_with("bwrap", path=os.defpath)
+        self.assertEqual(pins, {"codex": run.args.codex_sha256, "bwrap": "a" * 64, "bash": "a" * 64})
+        self.assertEqual(hashed.call_args_list, [mock.call((self.root / "system-bwrap").resolve()),
+                                                mock.call(Path("/bin/bash").resolve())])
+        with mock.patch.object(shutil, "which", return_value=None), \
+             mock.patch.object(shared, "sha256") as hashed, \
+             self.assertRaisesRegex(Blocked, "system bwrap unavailable"):
+            run.wrapper_pins()
+        hashed.assert_not_called()
+
+    def test_run_observer_pairs_verified_suffix_wrappers_before_refusal_proof(self):
+        probe, proc, server, tool, wrappers = self.wrapper_probe_fixture("denied")
+        run = self.run_object()
+        run.wrapper_hashes = probe.wrapper_hashes
+        generation, thread, turn = digest("generation"), digest("thread"), digest("turn")
+        facts = [{"kind": "reply", "method": "turn/start", "reservation": digest("c2"),
+                  "trace": generation, "thread": thread, "turn": turn},
+                 {"kind": "request", "method": "turn/start", "reservation": digest("c2"), "bound": "readOnly"},
+                 {"kind": "process", "trace": generation, **server}]
+        with mock.patch.object(sys, "executable", probe.python):
+            command = run.fixed_command("c2", "denied")
+            spec = run.command_specs["c2"]
+            for identity, argv in wrappers:
+                argv[-1] = command
+                (self.root / str(identity["pid"]) / "cmdline").write_bytes("\0".join(argv).encode() + b"\0")
+            (self.root / "6/cmdline").write_bytes("\0".join(spec["argv"]).encode() + b"\0")
+
+            def refused(_):
+                (self.root / "6/cmdline").write_bytes("\0".join(spec["denied"]).encode() + b"\0")
+
+            with mock.patch(__name__ + ".Proc", return_value=proc), mock.patch.object(run, "facts", return_value=facts), \
+                 mock.patch.object(os, "listdir", return_value=["2", "3", "4", "5", "6"]), \
+                 mock.patch.object(time, "sleep", side_effect=refused):
+                proof = run.observe_denied_execution("c2", probe.target)
+        self.assertEqual(proof["errno"], "EROFS")
+        self.assertFalse(run.command_observations["c2"]["blockers"])
+        self.assertEqual(run.command_observations["c2"]["unpaired_wrappers"], 0)
+        run.check_execution_observations()
+        survey = json.loads((run.evidence / "changed-bound-survey.json").read_text())
+        self.assertEqual(survey["outcome"], "proven")
+        self.assertEqual(sum(sample["wrapper_shape"] is not None for sample in survey["observations"]), 4)
+        self.assertTrue(secret_free(survey))
+
+    def test_unpaired_wrapper_chain_cannot_pass_final_accounting_or_authorize_refusal(self):
+        probe, proc, server, tool, wrappers = self.wrapper_probe_fixture("denied")
+        for identity, _ in wrappers:
+            probe.observe(proc, identity, server)
+        self.assertFalse(probe.seen)
+        (self.root / "6/cmdline").write_bytes("\0".join(probe.denied).encode() + b"\0")
+        self.assertIsNone(probe.observe(proc, tool, server))
+        with self.assertRaisesRegex(Blocked, "unpaired refusal suffix"):
+            probe.require_no_blockers()
+        run = self.run_object()
+        run.command_observations["c2"] = {"execution_observed": True, "blockers": [], "unpaired_wrappers": 4}
+        with self.assertRaisesRegex(Blocked, "execution observations admissible"):
+            run.check_execution_observations()
+
+    def test_other_tool_programs_are_not_confused_with_this_wrapper_chain(self):
+        probe, proc, server, _, wrappers = self.wrapper_probe_fixture()
+        identity, argv = wrappers[-1]
+        argv[-1] = shlex.join([probe.python, str(self.root / "other-tool.py")])
+        (self.root / str(identity["pid"]) / "cmdline").write_bytes("\0".join(argv).encode() + b"\0")
+        self.assertIsNone(probe.observe(proc, identity, server))
+        probe.require_no_blockers()
+        self.assertFalse(probe.execution_observed)
+        self.assertFalse(probe.pending_wrappers)
+
+    def test_codex_01601_shell_wrapper_is_transport_for_every_tool_mode(self):
+        fixture = json.loads((Path(__file__).parent / "fixtures/codex-0.160.1-wrappers.json").read_text())
+        legacy, proc, server, tool = self.probe_fixture()
+        run = self.run_object()
+        for label, mode in (("c1", "allowed"), ("c2", "denied"), ("n1", "never-ask"),
+                            ("a1", "interrupt-a"), ("b1", "interrupt-b")):
+            with self.subTest(label=label), mock.patch.object(sys, "executable", legacy.python):
+                command = run.fixed_command(label, mode)
+                spec = run.command_specs[label]
+                refusal = mode in ("denied", "never-ask")
+                probe = bound_probe.DeniedExecution(legacy.python, legacy.python_hash, legacy.target,
+                            spec["argv"], spec["denied"], spec["program"], spec["program_hash"], refusal,
+                            wrapper_hashes={"bash": legacy.python_hash})
+                wrapper = [part.replace(fixture["command"], command) for part in fixture["shell"]]
+                self.probe_argv(wrapper)
+                self.assertIsNone(probe.observe(proc, tool, server))
+                probe.require_no_blockers()
+                self.assertTrue(probe.execution_observed)
+                self.assertFalse(probe.seen)  # Transport cannot pair a refusal suffix.
+                self.probe_argv(spec["argv"])
+                proof = probe.observe(proc, tool, server)
+                if refusal:
+                    self.assertIsNone(proof)
+                    self.probe_argv(spec["denied"])
+                    proof = probe.observe(proc, tool, server)
+                    self.assertEqual(proof["errno"], "EROFS")
+                self.assertEqual(proof["program_hash"], spec["program_hash"])
+
+    def test_codex_shell_wrapper_deviations_and_unpaired_suffix_stay_sticky(self):
+        legacy, proc, server, tool = self.probe_fixture()
+        run = self.run_object()
+        with mock.patch.object(sys, "executable", legacy.python):
+            command = run.fixed_command("c2", "denied")
+        spec = run.command_specs["c2"]
+        variants = [["/bin/bash", "-lc", command + " "], ["/bin/bash", "-lc", command + " extra"],
+                    ["/bin/bash", "-lc", shlex.join(spec["denied"])], ["/bin/bash", "-c", command],
+                    ["/usr/bin/bash", "-lc", command], ["bash", "-lc", command],
+                    ["/bin/bash", "-lc", command, "extra"], ["unknown", command]]
+        # Normalizing whitespace or quoting must never authorize changed command bytes.
+        variants.extend([["/bin/bash", "-lc", command[:index] + " " + command[index:]]
+                         for index in range(len(command) + 1)
+                         if not command.index(str(spec["program"])) < index < len(command)])
+        for argv in variants:
+            with self.subTest(argv_hash=digest(argv)):
+                probe = bound_probe.DeniedExecution(legacy.python, legacy.python_hash, legacy.target,
+                            spec["argv"], spec["denied"], spec["program"], spec["program_hash"],
+                            wrapper_hashes={"bash": legacy.python_hash})
+                self.probe_argv(argv)
+                probe.observe(proc, tool, server)
+                with self.assertRaisesRegex(Blocked, "command deviation"):
+                    probe.require_no_blockers()
+                self.probe_argv(["/bin/bash", "-lc", command])
+                probe.observe(proc, tool, server)
+                with self.assertRaisesRegex(Blocked, "command deviation"):
+                    probe.require_no_blockers()
+        probe = bound_probe.DeniedExecution(legacy.python, legacy.python_hash, legacy.target,
+                    spec["argv"], spec["denied"], spec["program"], spec["program_hash"],
+                    wrapper_hashes={"bash": legacy.python_hash})
+        self.probe_argv(["/bin/bash", "-lc", command])
+        probe.observe(proc, tool, server)
+        self.probe_argv(spec["denied"])
+        probe.observe(proc, tool, server)
+        with self.assertRaisesRegex(Blocked, "unpaired refusal suffix"):
+            probe.require_no_blockers()
+        foreign = self.process(3, 0, 40)
+        with mock.patch.object(proc, "content") as read, self.assertRaisesRegex(Blocked, "foreign process"):
+            probe.observe(proc, foreign, server)
+        read.assert_not_called()
 
     def test_allowed_script_process_requires_exact_argv_and_program(self):
         legacy, proc, server, tool = self.probe_fixture()
