@@ -35,13 +35,16 @@ are recorded; the echo proves output was seen, never execution or refusal.
 All tool modes have a seven-second watchdog and an eight-second qualification
 limit; ordinary sleeps total at most six seconds, including refused-write exec.
 The exec carries the initial deadline, never a fresh budget. Preflight checks
-these bounds. Both A and B are short: observe A's exact tool, then B's, recheck
-both pinned process identities are live, and request A's interrupt immediately.
-There is no status-poll delay after B's tool starts. Final same-generation
-ordering requires B's command to span A's interrupt request, no earlier A
-command completion, and A natively interrupted before B's native completion.
-B's verified tool/nonce must complete independently. It proves live tool/turn
-isolation without requiring B's OS process to span A's entire cleanup interval.
+these bounds. B waits six seconds under that watchdog. Before requesting A's
+interrupt, require B's exact native command-start fact and a fresh pinned-process
+proof. Reverify that same B process while awaiting A's native interrupted terminal,
+before waiting for VIA's cleanup/envelope. The interrupt request fact timestamps
+its pre-forward observation, not the vendor's receipt. Final same-generation
+ordering requires B's native command start before the request and command end
+after A's native interrupted terminal, with B's process verified on both sides.
+No earlier A command completion is allowed. B's verified tool/nonce must complete
+independently. It proves live tool/turn isolation across native interruption,
+without requiring B's OS process to span A's entire cleanup interval.
 Interrupted A deliberately has no final-output echo gate: it still requires the
 exact native command/process, interrupted terminal and cleanup disposition.
 Low effort stays fixed: runs 2/3 invoked c1, whereas run 4 emitted no command
@@ -881,7 +884,8 @@ class Wire:
         elif method == "turn/interrupt":
             if not self.owns((digest(params["threadId"]), digest(params["turnId"]))):
                 self.reject_ownership(method, params, "unowned turn interrupt")
-            fact.update(thread=digest(params["threadId"]), turn=digest(params["turnId"]))
+            fact.update(thread=digest(params["threadId"]), turn=digest(params["turnId"]),
+                        at_ms=int(time.monotonic() * 1000))  # Pre-forward observation.
         if "id" in message:
             require(type(message["id"]) in (str, int), "protocol id shape")
             key = digest(message["id"])
@@ -1622,7 +1626,7 @@ class Run(shared.Run):
         program, pinned = bound_probe.write_program(self.work, request, "tool-" + digest(label)[:16] + ".py")
         argv = [str(Path(sys.executable).resolve()), str(program)]
         self.command_specs[label] = {"argv": argv, "denied": [*argv, "1"], "program": program,
-                                     "program_hash": pinned, "field": field}
+                                     "program_hash": pinned, "field": field, "require_started": mode == "interrupt-b"}
         return shlex.join(argv)
 
     def tool_reply(self, label, envelope, facts=None):
@@ -1788,7 +1792,23 @@ class Run(shared.Run):
                         self.owned.add((identity["pid"], identity["start_ticks"]))
                         observed = probe.observe(proc, identity, root, survey)
                         if observed is not None:
-                            observed.update(context)
+                            if spec and spec["require_started"]:
+                                matched = [fact for fact in facts if all(fact.get(field) == context[field]
+                                           for field in ("thread", "turn", "trace")) and fact["kind"] == "tool"]
+                                begun = [fact for fact in matched if not fact["finished"]]
+                                if not begun:
+                                    continue  # Process birth can precede delivery of item/started.
+                                require(len(begun) == 1 and len(matched) == 1
+                                        and begun[0].get("item_type") == "commandExecution"
+                                        and begun[0].get("argv_hash") == digest(spec["argv"])
+                                        and type(begun[0].get("item_hash")) is str
+                                        and type(begun[0].get("at_ms")) is int,
+                                        "interrupt tool native start unverified")
+                                require(identity["state"] in ("R", "S", "D"), "interrupt tool no longer running")
+                                observed.update(protocol_start_seq=begun[0]["seq"],
+                                                protocol_start_ms=begun[0]["at_ms"], item_hash=begun[0]["item_hash"])
+                            observed.update(context, cwd_hash=digest(proc.cwd(identity)),
+                                            at_ms=int(time.monotonic() * 1000))
                             save(self.evidence / (prefix + "-execution.json"), observed)
                             outcome = "proven"
                             return observed
@@ -1808,6 +1828,57 @@ class Run(shared.Run):
                      for fact in facts if fact["kind"] == "tool" and "turn" in context
                      and all(fact.get(field) == context[field] for field in ("thread", "turn", "trace"))]
             save(self.evidence / (prefix + "-survey.json"), survey.snapshot(outcome, context, tools))
+
+    def verify_tool_running(self, label, proof, facts=None):
+        """Packet §§5/8: revalidate the exact pinned tool under its submitting server."""
+        shared.interrupt_guard()
+        spec, proc = self.command_specs[label], Proc()
+        roots = [fact for fact in (self.facts() if facts is None else facts)
+                 if fact["kind"] == "process" and fact.get("trace") == proof["trace"]]
+        require(len(roots) == 1, "interrupt tool server unavailable")
+        fd, identity = proc.open(proof["pid"], proof["start_ticks"])
+        if fd is not None:
+            os.close(fd)
+        require(identity is not None and identity["state"] in ("R", "S", "D"),
+                "B tool no longer running across interrupt")
+        # Read cwd only after owned ancestry, and pin it to the first proof.
+        proc.own(identity, roots[0])
+        cwd = proc.cwd(identity)
+        require(digest(cwd) == proof["cwd_hash"], "interrupt tool workspace changed")
+        probe = bound_probe.DeniedExecution(spec["argv"][0], proof["python_hash"],
+                    Path(cwd) / "unused-b", attempt=spec["argv"], denied=spec["denied"],
+                    program=spec["program"], program_hash=spec["program_hash"], require_refusal=False)
+        observed = probe.observe(proc, identity, roots[0])
+        require(observed is not None and observed["attempt_argv_hash"] == proof["attempt_argv_hash"],
+                "B tool identity changed across interrupt")
+        return {**proof, **observed, "at_ms": int(time.monotonic() * 1000)}
+
+    def observe_tool_through_interrupt(self, label, before, interrupted):
+        """Packet §§5/8: B stays verifiably running through A's native interrupted terminal."""
+        deadline = min(time.monotonic() + bound_probe.TOOL_RUNTIME_LIMIT_S, self.spend.deadline)
+        evidence = {"before_request": before, "outcome": "blocked"}
+        try:
+            while time.monotonic() < deadline:
+                shared.interrupt_guard()
+                facts = self.facts()
+                terminals = [fact for fact in facts if fact["kind"] == "terminal"
+                             and all(fact.get(field) == interrupted[field] for field in ("thread", "turn", "trace"))]
+                # Read the terminal first, then obtain fresh process evidence. A later
+                # envelope may wait for cleanup and is not the overlap boundary.
+                if terminals:
+                    evidence["terminal"] = terminals[0]
+                    require(len(terminals) == 1 and terminals[0]["status"] == "interrupted",
+                            "A native interrupted terminal unverified")
+                evidence["last_check_ms"] = int(time.monotonic() * 1000)
+                after = self.verify_tool_running(label, before, facts)
+                evidence["last_running"] = after
+                if terminals:
+                    evidence["outcome"] = "proven"
+                    return after
+                time.sleep(0.05)
+            raise Blocked("native interrupt observation deadline")
+        finally:
+            save(self.evidence / "interrupt-isolation.json", evidence)
 
     def stop_daemon(self, final=False):
         # Refresh owned identities before surveying ancestry; still stop on a
@@ -2190,17 +2261,20 @@ def interrupt(run):
     command_b = run.fixed_command("b1", "interrupt-b")
     b1, b, b_tool = run.start_tool("b1", "spawn", *spawn_args(run, ws, fixed_prompt(command_b)),
                                   target=ws / "unused-b", bound="workspaceWrite", refusal=False)
-    # Both exact tools must still be live. Interrupt immediately after this
-    # proof: no status polling or long B sleep supplies the overlap.
+    # B's observer waits for native item/started as well as the exact process.
+    # Revalidate immediately before cancellation; retain both boundary proofs.
     for name, identity in (("A", tool), ("B", b_tool)):
         fd, live = Proc().open(identity["pid"], identity["start_ticks"])
         if fd is not None:
             os.close(fd)
         run.check(name + " tool live before interrupt",
                   fd is not None and live is not None and live["state"] != "Z")
+    b_before = run.verify_tool_running(b1, b_tool)
+    save(run.evidence / "interrupt-isolation.json", {"before_request": b_before, "outcome": "pending"})
     rc, cancel, _ = run.via_call(run.evidence, "cancel-a", "cancel", a, "--json",
                                 timeout=WALL_S + 65, handle=run.handles[a])
     run.check("cancel through VIA", rc == 0 and cancel["cancel"] is not None)
+    b_after = run.observe_tool_through_interrupt(b1, b_before, tool)
     ended = run.finish(a1)
     run.check("actual interrupted acknowledgement", ended["state"] == "cancelled"
               and ended["stop_reason"] == "interrupted" and ended["cancel"] is not None
@@ -2244,7 +2318,8 @@ def interrupt(run):
     b_tools_started = [fact for fact in b_facts if fact["kind"] == "tool" and not fact["finished"]]
     b_tools_ended = [fact for fact in b_facts if fact["kind"] == "tool" and fact["finished"]]
     run.check("B tool spans A interrupt", len(b_tools_started) == len(b_tools_ended) == 1
-              and b_tools_started[0]["seq"] < requests[0]["seq"] < b_tools_ended[0]["seq"])
+              and b_tools_started[0]["seq"] < requests[0]["seq"] < a_ends[0]["seq"] < b_tools_ended[0]["seq"]
+              and b_before["at_ms"] <= requests[0]["at_ms"] <= a_ends[0]["at_ms"] <= b_after["at_ms"])
     types = [event["type"] for event in run.events(run.receipts[a1][0]["turn"])]
     expected = ["cancel.requested", "cancel.settled", "turn.ended"]
     run.check("cancel events ordered", all(kind in types for kind in expected)
@@ -3698,7 +3773,8 @@ class SafetyTests(unittest.TestCase):
     def test_interrupt_proves_shared_trace_without_process_count(self):
         for same, timing in ((True, "overlap"), (False, "overlap"),
                              (True, "completed_early"), (True, "started_late"), (True, "a_gone"),
-                             (True, "tool_ended_early"), (True, "b_tool_ended_early"), (True, "b_gone")):
+                             (True, "tool_ended_early"), (True, "b_tool_ended_early"),
+                             (True, "b_tool_ended_before_terminal"), (True, "b_gone")):
             with self.subTest(same=same, timing=timing), tempfile.TemporaryDirectory() as root:
                 previous, self.root = self.root, Path(root)
                 try:
@@ -3729,17 +3805,29 @@ class SafetyTests(unittest.TestCase):
                     elif timing == "tool_ended_early":
                         rows.insert(rows.index(request), {"kind": "tool", "finished": True,
                                     "thread": digest("a"), "turn": digest("ua"), "trace": "same"})
-                    elif timing == "b_tool_ended_early":
+                    elif timing in ("b_tool_ended_early", "b_tool_ended_before_terminal"):
                         rows.remove(b_tool_end)
-                        rows.insert(rows.index(request), b_tool_end)
+                        boundary = request if timing == "b_tool_ended_early" else a_end
+                        rows.insert(rows.index(boundary), b_tool_end)
                     facts = [{"kind": "process"} for _ in range(3 if same else 2)] + rows
                     for seq, fact in enumerate(facts, 1):
                         fact["seq"] = seq
+                        fact["at_ms"] = seq * 100
                     order = []
 
                     def observed(label, *args):
                         order.append("observe-" + label)
                         return {"pid": 3, "start_ticks": 30} if label == "b1" else {"pid": 2, "start_ticks": 20}
+
+                    def observe_terminal(*args):
+                        order.append("B-after-native-terminal")
+                        return {"at_ms": a_end["seq"] * 100 + 1}
+
+                    def finish(label):
+                        if same and timing == "overlap" and label == "a1":
+                            self.assertIn("B-after-native-terminal", order,
+                                          "B must be reverified at the native A terminal, before envelope cleanup")
+                        return {"a1": ended, "b1": other, "a2": after}[label]
 
                     def via_call(*args, **kwargs):
                         order.append(args[1])
@@ -3753,7 +3841,9 @@ class SafetyTests(unittest.TestCase):
                          mock.patch.object(run, "observe_denied_execution", side_effect=observed), \
                          mock.patch.object(run, "command_protocol"), mock.patch.object(run, "tool_reply"), \
                          mock.patch.object(run, "via_call", side_effect=via_call), \
-                         mock.patch.object(run, "finish", side_effect=[ended, other, after]), \
+                         mock.patch.object(run, "finish", side_effect=finish), \
+                         mock.patch.object(run, "observe_tool_through_interrupt", side_effect=observe_terminal), \
+                         mock.patch.object(run, "verify_tool_running", return_value={"at_ms": b_tool["seq"] * 100}), \
                          mock.patch.object(run, "facts", return_value=facts), \
                          mock.patch.object(run, "events", return_value=[{"type": t} for t in
                              ("cancel.requested", "cancel.settled", "turn.ended")]), \
@@ -3767,7 +3857,8 @@ class SafetyTests(unittest.TestCase):
                             self.assertEqual(order[order.index("observe-b1") + 1], "cancel-a")
                         else:
                             reason = {"a_gone": "A tool live before interrupt", "b_gone": "B tool live before interrupt",
-                                      "b_tool_ended_early": "B tool spans A interrupt"}.get(timing,
+                                      "b_tool_ended_early": "B tool spans A interrupt",
+                                      "b_tool_ended_before_terminal": "B tool spans A interrupt"}.get(timing,
                                       "B continues after A cancellation" if same else "shared owned server")
                             with self.assertRaisesRegex(Blocked, reason):
                                 interrupt(run)
@@ -4224,6 +4315,112 @@ class SafetyTests(unittest.TestCase):
 
     def probe_argv(self, argv):
         (self.root / "2/cmdline").write_bytes("\0".join(argv).encode() + b"\0")
+
+    def test_run7_process_first_waits_for_native_tool_start(self):
+        probe, proc, server, tool = self.probe_fixture()
+        run = self.run_object()
+        clock = [344703.722]
+        thread, turn, trace = digest("B"), digest("B-turn"), digest("server")
+        facts = [{"kind": "process", "trace": trace, **server},
+                 {"kind": "reply", "method": "turn/start", "reservation": digest("b1"),
+                  "thread": thread, "turn": turn, "trace": trace},
+                 {"kind": "request", "method": "turn/start", "reservation": digest("b1"),
+                  "bound": "workspaceWrite", "trace": trace}]
+        with mock.patch.object(sys, "executable", str(probe.python)):
+            run.fixed_command("b1", "interrupt-b")
+            spec = run.command_specs["b1"]
+            self.assertTrue(spec["require_started"])
+            self.probe_argv(spec["argv"])
+            run.spend.deadline = clock[0] + 10
+
+            def next_frame(_):
+                clock[0] = 344703.760
+                facts.append({"kind": "tool", "item_type": "commandExecution", "item_hash": digest("item"),
+                              "argv_hash": digest(spec["argv"]), "thread": thread, "turn": turn,
+                              "trace": trace, "finished": False, "seq": 55, "at_ms": 344703760})
+
+            with mock.patch.object(run, "facts", return_value=facts), \
+                 mock.patch(__name__ + ".Proc", return_value=proc), \
+                 mock.patch.object(os, "listdir", return_value=["2"]), \
+                 mock.patch.object(time, "monotonic", side_effect=lambda: clock[0]), \
+                 mock.patch.object(time, "sleep", side_effect=next_frame) as slept:
+                proof = run.observe_denied_execution("b1", probe.target, "workspaceWrite", False)
+            self.assertTrue(slept.called, "Run 7: process sight alone must not release the cancel barrier")
+            self.assertEqual(proof["protocol_start_seq"], 55)
+            self.assertGreaterEqual(proof["at_ms"], 344703760)
+
+    def test_B_process_is_reverified_after_native_A_terminal_before_envelope(self):
+        for change in (None, "gone", "reused", "zombie", "argv", "foreign", "cwd", "program", "executable"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as root:
+                previous, self.root = self.root, Path(root)
+                try:
+                    probe, proc, server, tool = self.probe_fixture()
+                    run = self.run_object()
+                    clock = [100.0]
+                    trace = digest("server")
+                    before = {**tool, "trace": trace, "thread": digest("B"), "turn": digest("B-turn"),
+                              "cwd_hash": digest(str(probe.target.parent)), "at_ms": 100000}
+                    interrupted = {"trace": trace, "thread": digest("A"), "turn": digest("A-turn")}
+                    terminal = {**interrupted, "kind": "terminal", "status": "interrupted", "at_ms": 100100}
+                    facts = [{"kind": "process", "trace": trace, **server}]
+                    with mock.patch.object(sys, "executable", str(probe.python)):
+                        run.fixed_command("b1", "interrupt-b")
+                        spec = run.command_specs["b1"]
+                        self.probe_argv(spec["argv"])
+                        before.update(attempt_argv_hash=digest(spec["argv"]),
+                                      python_hash=shared.sha256(probe.python), program_hash=spec["program_hash"])
+                        run.spend.deadline = 110
+
+                        def native_terminal(_):
+                            clock[0] = 100.1
+                            facts.append(terminal)
+                            if change == "gone":
+                                shutil.rmtree(self.root / "2")
+                            elif change == "reused":
+                                self.process(2, 1, 21)
+                            elif change == "zombie":
+                                stat_path = self.root / "2/stat"
+                                stat_path.write_text(stat_path.read_text().replace(") S ", ") Z "))
+                            elif change == "argv":
+                                self.probe_argv([str(probe.python), "different-program"])
+                            elif change == "foreign":
+                                self.process(2, 0, 20)
+                            elif change == "cwd":
+                                (self.root / "2/cwd").unlink()
+                                (self.root / "2/cwd").symlink_to(run.work)
+                            elif change == "program":
+                                spec["program"].write_text("different program")
+                            elif change == "executable":
+                                Path(probe.python).write_bytes(b"different interpreter")
+
+                        with mock.patch.object(run, "facts", return_value=facts), \
+                             mock.patch(__name__ + ".Proc", return_value=proc), \
+                             mock.patch.object(time, "monotonic", side_effect=lambda: clock[0]), \
+                             mock.patch.object(time, "sleep", side_effect=native_terminal):
+                            if change is None:
+                                after = run.observe_tool_through_interrupt("b1", before, interrupted)
+                                self.assertGreaterEqual(after["at_ms"], terminal["at_ms"])
+                                self.assertEqual((after["pid"], after["start_ticks"]), (2, 20))
+                            else:
+                                with self.assertRaises(Blocked):
+                                    run.observe_tool_through_interrupt("b1", before, interrupted)
+                    evidence = json.loads((run.evidence / "interrupt-isolation.json").read_text())
+                    self.assertTrue(secret_free(evidence))
+                    self.assertEqual(evidence["outcome"], "proven" if change is None else "blocked")
+                    self.assertEqual(evidence["terminal"], terminal)
+                finally:
+                    self.root = previous
+
+    def test_interrupt_request_fact_has_monotonic_time(self):
+        wire = self.owned_wire()
+        with mock.patch.object(time, "monotonic", return_value=1.234):
+            fact = wire.outgoing({"id": 22, "method": "turn/interrupt", "params": {"threadId": "t", "turnId": "u"}})
+        self.assertEqual(fact.get("at_ms"), 1234)
+
+    def test_b_tool_leaves_six_seconds_for_verified_interrupt_overlap(self):
+        self.assertGreaterEqual(bound_probe.B_SLEEP_S, 6)
+        bounds = bound_probe.runtime_bounds()
+        self.assertLess(bounds["watchdog_seconds"], bounds["limit_seconds"])
 
     def test_denied_execution_requires_same_owned_process_transition(self):
         probe, proc, server, tool = self.probe_fixture()

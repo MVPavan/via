@@ -14,7 +14,7 @@ ATTEMPT_OBSERVE_S, DENIED_OBSERVE_S = 3, 2
 # Packet §8: diagnostic evidence stays bounded even with changing owned argv.
 SURVEY_RECORDS = 256
 # Packet §§3/5/8: observable fixed scripts, one write attempt, bounded A/B waits.
-TOOL_PROGRAM_BYTES, A_SLEEP_S, B_SLEEP_S = 64 * 1024, 6, 3
+TOOL_PROGRAM_BYTES, A_SLEEP_S, B_SLEEP_S = 64 * 1024, 6, 6
 # Packet §§5/8: one whole-program deadline, below the observed 10 s yield window.
 TOOL_WATCHDOG_S, TOOL_RUNTIME_LIMIT_S = 7, 8
 TOOL_CODE = f'''import os,signal,sys,time
