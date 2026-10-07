@@ -31,12 +31,14 @@ import time
 import urllib.parse
 
 import opencode_safety as safety
+from opencode_ownership import OwnershipRegistry
 
 Blocked = safety.Blocked
 # Packet §9 and the reviewed qualification plan's observation/pagination bounds.
 OBSERVATION_BYTES = 16 * 1024 * 1024
 EVIDENCE_BYTES = 256 * 1024 * 1024
 SCAN_ENTRIES = 100000  # §13: bound the owned evidence/private-root walk.
+SCAN_ATTEMPTS = 3  # §13: restart the whole scan on transient VIA-owned churn.
 PAGE_COUNT = 1000
 SOCKET_BYTES = 107
 SSE_HANDSHAKE_SECONDS = 30  # §13 owned observer absolute header deadline.
@@ -210,12 +212,16 @@ def input_id(session,turn):
     return 'msg_via'+''.join(reversed(digits))
 
 
+class _ScanVanished(Exception):
+    """A VIA disappearance requires a full bounded rescan (packet §13)."""
+
+
 class Driver:
     """Owned private driver for the reviewed phases; public secrets never persisted."""
 
     def __init__(self,release=None,failpoints=None,pinned=None,evidence=None,*,
                  via_release=None,via_failpoints=None,opencode=None,signals=None,
-                 proc=None,execute=None,initialize=False,public_free=False,mock_origins=(),rg=None):
+                 proc=None,execute=None,initialize=False,public_free=False,mock_origins=(),rg=None,ownership=None):
         release=release if release is not None else via_release
         failpoints=failpoints if failpoints is not None else via_failpoints
         pinned=pinned if pinned is not None else opencode
@@ -225,6 +231,7 @@ class Driver:
         self.paths={'release':Path(release).resolve(),'failpoints':Path(failpoints).resolve()}
         self.pinned=Path(pinned).resolve()
         self.evidence=Path(evidence).resolve()
+        self.ownership=ownership or OwnershipRegistry(self.evidence)
         self.evidence.mkdir(parents=True,mode=0o700,exist_ok=True)
         if stat.S_IMODE(self.evidence.stat().st_mode)!=0o700:
             raise Blocked('evidence root is not private')
@@ -237,7 +244,7 @@ class Driver:
         self.public_free=public_free
         self._http=None; self._binary=None; self.daemon=None; self.anchor=None; self.vendor_identity=None
         self.identities=set(); self.uncertain=[]; self.build_hashes={}; self.handles={}
-        self.bearer_forms=set(); self._daemon_ran=False
+        self.bearer_forms=set()
         self.events=[]; self.events_error=None; self._event_stop=threading.Event()
         self._event_thread=None; self._event_conn=None; self._events_lock=threading.Lock()
         self.counter=0; self.owned_replies=[]; self.secret_forms=[]; self._armed={}
@@ -246,6 +253,12 @@ class Driver:
         self.phase_deadline=None; self.phase_kind=None; self.stop_result=None
         self.state=self.evidence/'state'; self.runtime=self.evidence/'runtime'
         self.helpers=self.evidence/'helpers'; self.home=self.evidence/'home'
+        self.ownership.register_state(self.state)
+        self.ownership.register(self.home,'vendor-private')
+        self.ownership.register(self.helpers,'helper')
+        self.ownership.register(self.runtime,'via-owned',runtime=True)
+        if self.pinned.is_relative_to(self.evidence):
+            self.ownership.register(self.pinned,'helper',directory=False)
         self.env={}; self.namespace=None; self.namespace_env={}; self.inventory=None
         self.journal=safety.StopJournal(self.evidence.parent/'stopped-daemon.json',self.proc)
         self.mock_providers={}; self.last_model=None; self.last_request=None; self.last_cancel=None
@@ -271,20 +284,36 @@ class Driver:
         if used+len(raw)>EVIDENCE_BYTES:
             raise Blocked('run evidence bound')
         self.counter+=1
-        self.vault.safe_write_json(self.evidence/f'{self.counter:05d}-{label}.json',value)
+        path=self.ownership.register(self.evidence/f'{self.counter:05d}-{label}.json',
+                                     'runner-evidence',directory=False)
+        self.vault.safe_write_json(path,value)
+
+    def _directory(self,path,kind='runner-evidence',**flags):
+        """Register every created/handoff directory before its contents exist (§13)."""
+        return safety.private_directory(self.ownership.register(path,kind,**flags))
+
+    def _create_namespace(self):
+        """Register the whole state/vendor tree and each private namespace root (§13)."""
+        self.ownership.register_state(self.state)
+        namespace,env=safety.create_namespace(self.state)
+        self.ownership.register(namespace,'vendor-private')
+        for value in env.values(): self.ownership.register(value,'vendor-private')
+        return namespace,env
 
     def prepare(self):
         """Create exact namespace/private roots and reviewed minimal PATH (N1–N3,N8,N9)."""
-        for directory in (self.home,self.state,self.helpers): safety.private_directory(directory)
-        self.namespace,self.namespace_env=safety.create_namespace(self.state)
+        for directory in (self.home,self.state,self.helpers):
+            safety.private_directory(directory)  # Already registered at initial handoff.
+        self.namespace,self.namespace_env=self._create_namespace()
         safety.init_fixture_repo(self.namespace,self.home)
         path,rg_proof=safety.build_minimal_path(self.helpers,self.rg)
         if len(os.fsencode(self.runtime))+ANCHOR_SOCKET_TAIL>SOCKET_BYTES:
             # Coordinator ruling N9 explicitly authorizes short /tmp/via-* runtime roots.
             self.runtime=Path(tempfile.mkdtemp(prefix='via-ocl.',dir='/tmp'))
+            self.ownership.register(self.runtime,'via-owned',runtime=True)
             self._record('runtime',{'short_root':True,'authority':'coordinator N9 socket ruling'})
         else: safety.private_directory(self.runtime)
-        self.env={key:str(safety.private_directory(self.evidence/('daemon-'+part)))
+        self.env={key:str(self._directory(self.evidence/('daemon-'+part),'via-owned'))
                   for key,part in safety.PRIVATE_PARTS.items()}
         self.env.update(PATH=path,LANG='C.UTF-8',VIA_STATE_DIR=str(self.state),
                         VIA_RUNTIME_DIR=str(self.runtime))
@@ -327,10 +356,10 @@ class Driver:
         """Initialize and commit a private fixture Git boundary, never the worktree Git."""
         if not name or not name.replace('-','').replace('_','').isalnum() or name in self.fixtures:
             raise Blocked('unsafe or duplicate fixture name')
-        root=safety.private_directory(self.evidence/'fixtures')
-        project=root/name
+        root=self._directory(self.evidence/'fixtures','vendor-private')
+        project=self.ownership.register(root/name,'vendor-private')
         safety.init_fixture_repo(project,self.home)
-        opencode=safety.private_directory(project/'.opencode')
+        opencode=self._directory(project/'.opencode','vendor-private')
         config=dict(config)
         if name=='long-run': self._long_run_started=time.monotonic()
         config=self._materialize_fixture(name,project,config)
@@ -387,7 +416,7 @@ class Driver:
         env=dict(self.env)
         env.pop('VIA_FAILPOINT_DIR',None); env.pop('VIA_FAILPOINT_TOKEN',None)
         if kind=='failpoints':
-            directory=safety.private_directory(self.evidence/('failpoints-'+secrets.token_hex(8)))
+            directory=self._directory(self.evidence/('failpoints-'+secrets.token_hex(8)))
             self._token=secrets.token_hex(24)
             env.update(VIA_FAILPOINT_DIR=str(directory),VIA_FAILPOINT_TOKEN=self._token)
         elif kind!='release': raise Blocked('invalid VIA build selection')
@@ -403,7 +432,7 @@ class Driver:
             identity=safety.Identity(reply['pid'],row['start_ticks'])
             if not self._locks_owned(identity.pid):
                 raise Blocked('private daemon lock ownership unavailable')
-            self.daemon=identity; self._daemon_ran=True; self.identities.add(identity)
+            self.daemon=identity; self.ownership.daemon_started(self.state); self.identities.add(identity)
             self._record('daemon-start',{'verified':True,**identity.report(),'build':kind})
         except BaseException:
             self.uncertain.append('failed daemon start')
@@ -465,7 +494,8 @@ class Driver:
                     raw=prompt.encode()
                     if self.vault.leaks(raw) or any(form and form in raw for form in self.secret_forms):
                         raise Blocked('private prompt file would contain a protected secret')
-                    prompt_path=self.evidence/('prompt-'+secrets.token_hex(8)+'.tmp')
+                    prompt_path=self.ownership.register(self.evidence/('prompt-'+secrets.token_hex(8)+'.tmp'),
+                                                        'runner-evidence',directory=False)
                     fd=os.open(prompt_path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
                     with os.fdopen(fd,'wb') as output: output.write(raw)
                     args[index:index+2]=['--prompt-file',str(prompt_path)]
@@ -994,113 +1024,108 @@ class Driver:
         return form.get('sessionID') if type(form) is dict else None
 
     def secrecy_scan(self):
-        """Read every VIA sink; tolerate only vendor-private churn (§13 L4/OC12)."""
-        daemon_roots={Path(value) for key,value in self.env.items() if key in safety.PRIVATE_PARTS}
-        private_roots={self.home,*(row['path'] for row in self.fixtures.values())}
-        if self.namespace is not None: private_roots.add(self.namespace)
-        private_roots.update(Path(value) for key,value in self.namespace_env.items()
-                             if key in safety.PRIVATE_PARTS)
-        via_roots={self.evidence,self.state,*daemon_roots}
-        roots=via_roots | private_roots
-        fixture_sources={row['path']/'opencode.json' for row in self.fixtures.values()}
-        db=self.state/'store.sqlite3'
-        store_files={db,Path(str(db)+'-wal'),Path(str(db)+'-shm')}
-        ran=self._daemon_ran or self.daemon is not None
+        """Restart the whole registered-root scan on VIA churn, at most 3 times (§13)."""
+        for attempt in range(1,SCAN_ATTEMPTS+1):
+            try:
+                result=self._secrecy_scan_once()
+                result['scan_attempts']=attempt
+                return result
+            except _ScanVanished as error:
+                if attempt==SCAN_ATTEMPTS: raise Blocked('VIA scan entry vanished after 3 scans') from error
+
+    def _secrecy_scan_once(self):
+        """Scan immutable ownership history; Store backups cover every state (§13 L4/L11)."""
         clean=True; captures=[]; seen=set(); metadata=set(); synthetic=[]; total=0
         vendor_synthetic=0; vanished=set()
         handles={handle.encode() for handle in self.handles.values()} | self.bearer_forms
         synthetic_forms=[form for form in self.secret_forms if form and form not in handles]
-        def private(path):
-            return any(path.is_relative_to(folder) for folder in private_roots) \
-                and not any(path.is_relative_to(folder) for folder in daemon_roots)
-        def artifact(path):
-            if path.is_relative_to(self.helpers) or path.is_relative_to(self.evidence/'acquisition-home'):
-                return True
-            return path.is_relative_to(self.evidence) and bool(path.relative_to(self.evidence).parts) \
-                and path.relative_to(self.evidence).parts[0].startswith('pinned-')
-        def via(path):
-            return any(path.is_relative_to(folder) for folder in via_roots) \
-                and not private(path) and not artifact(path)
+        fixture_sources={row['path']/'opencode.json' for row in self.fixtures.values()}
+        states=[root for root in self.ownership.ordered() if root.state]
+        store_files={path for root in states for path in (
+            root.path/'store.sqlite3',root.path/'store.sqlite3-wal',root.path/'store.sqlite3-shm')}
+        databases=[]; checked_roots=set()
         def remember(path):
             seen.add(path)
             if len(seen)>SCAN_ENTRIES: raise Blocked('private secrecy scan entry bound')
         def unavailable(path,error):
-            if isinstance(error,FileNotFoundError) and private(path):
-                remember(path); vanished.add(path); return
+            root=self.ownership.classify(path)
             if isinstance(error,FileNotFoundError):
-                raise Blocked('VIA scan entry vanished') from error
+                if root is not None and root.kind=='vendor-private':
+                    remember(path); vanished.add(path); return
+                raise _ScanVanished() from error
             raise Blocked('private secrecy scan entry unreadable') from error
         def nonregular(path,mode):
-            allowed=(path==self.helpers/'rg' and stat.S_ISLNK(mode)) or (stat.S_ISSOCK(mode) and (
-                path==self.runtime/'via.sock' or
-                path.parent==self.runtime/'anchors' and path.suffix=='.sock'))
-            if private(path) or allowed: metadata.add(path); return
+            root=self.ownership.classify(path)
+            if root is not None and root.kind=='vendor-private' or self.ownership.allowed_nonregular(path,mode):
+                metadata.add(path); return
             raise Blocked('non-regular VIA scan entry')
-        # Roots and the Store are prerequisites, not metadata-only proof exclusions.
-        checked_roots=set()
-        for root in via_roots | {self.helpers,self.evidence/'acquisition-home'}:
-            try: info=root.lstat()
+        def protected(raw,via_sink):
+            return self.vault.leaks(raw) or any(handle in raw for handle in handles) \
+                or via_sink and any(form in raw for form in synthetic_forms)
+        for root in self.ownership.ordered():
+            if not root.directory or root.kind=='vendor-private': continue
+            try: info=root.path.lstat()
             except FileNotFoundError:
-                if root==self.evidence or ran and root==self.state:
+                if root.path==self.evidence or root.state and root.started:
                     raise Blocked('VIA scan root missing')
                 continue
             except OSError as error: raise Blocked('VIA scan root unreadable') from error
             if not stat.S_ISDIR(info.st_mode): raise Blocked('VIA scan root is not a directory')
-            checked_roots.add(root)
-        store_present=False
-        for path in store_files:
-            try: info=path.lstat()
+            checked_roots.add(root.path)
+        for state_root in states:
+            db=state_root.path/'store.sqlite3'
+            for path in (db,Path(str(db)+'-wal'),Path(str(db)+'-shm')):
+                try: info=path.lstat()
+                except FileNotFoundError:
+                    if path==db and state_root.started: raise Blocked('VIA Store missing after daemon run')
+                    continue
+                except OSError as error: raise Blocked('VIA Store unreadable') from error
+                if not stat.S_ISREG(info.st_mode): raise Blocked('VIA Store is not a regular file')
+                if path==db: databases.append(path)
+        for walk_root in self.ownership.walks():
+            try: info=walk_root.lstat()
             except FileNotFoundError:
-                if path==db and ran: raise Blocked('VIA Store missing after daemon run')
+                if walk_root in checked_roots: unavailable(walk_root,FileNotFoundError())
                 continue
-            except OSError as error: raise Blocked('VIA Store unreadable') from error
-            if not stat.S_ISREG(info.st_mode): raise Blocked('VIA Store is not a regular file')
-            if path==db: store_present=True
-        for root in roots:
-            try: root_info=root.lstat()
-            except FileNotFoundError:
-                if root in seen or root in checked_roots: unavailable(root,FileNotFoundError())
-                continue
-            except OSError as error: unavailable(root,error); continue
-            if not stat.S_ISDIR(root_info.st_mode):
-                remember(root); nonregular(root,root_info.st_mode); continue
+            except OSError as error: unavailable(walk_root,error); continue
+            if not stat.S_ISDIR(info.st_mode):
+                remember(walk_root); nonregular(walk_root,info.st_mode); continue
             def unreadable(error):
                 if error.filename is None: raise Blocked('private secrecy scan directory unreadable') from error
                 unavailable(Path(error.filename),error)
-            for directory,dirs,files in os.walk(root,followlinks=False,onerror=unreadable):
+            for directory,dirs,files in os.walk(walk_root,followlinks=False,onerror=unreadable):
+                dirs.sort(); files.sort()
                 for name in dirs[:]:
-                    path=Path(directory)/name
-                    if name=='.git' and private(path): dirs.remove(name); continue
+                    path=Path(directory)/name; root=self.ownership.classify(path)
+                    if name=='.git' and root is not None and root.kind=='vendor-private':
+                        dirs.remove(name); continue
                     remember(path)
                     try: info=path.lstat()
                     except OSError as error: dirs.remove(name); unavailable(path,error); continue
                     if not stat.S_ISDIR(info.st_mode):
                         dirs.remove(name); nonregular(path,info.st_mode)
                 for name in files:
-                    path=Path(directory)/name
-                    if path in seen: continue
+                    path=Path(directory)/name; root=self.ownership.classify(path)
                     remember(path)
                     try: info=path.lstat()
                     except OSError as error: unavailable(path,error); continue
                     if not stat.S_ISREG(info.st_mode): nonregular(path,info.st_mode); continue
-                    if path in store_files: continue  # Consistent Store/WAL snapshot below.
-                    via_sink=via(path); source=path in fixture_sources
-                    protected_directory=any(safety.credential_metadata_only(part)
-                                            for part in path.relative_to(root).parts[:-1])
-                    protected_name=safety.credential_metadata_only(name) or name.lower().endswith('.db') \
-                        or name=='opencode.json' and not source
-                    if protected_directory or protected_name:
+                    if root is None: raise Blocked('unregistered evidence file')
+                    if path in store_files: continue  # Every state's consistent backup below.
+                    via_sink=root.kind in {'via-owned','runner-evidence'}
+                    source=path in fixture_sources
+                    parts=path.relative_to(root.path).parts
+                    protected_name=any(safety.credential_metadata_only(part) for part in parts) \
+                        or name.lower().endswith('.db') or name=='opencode.json' and not source
+                    if protected_name:
                         if via_sink:
-                            # Vendor database/config exclusions do not exempt VIA
-                            # sinks. Unexpected credentials block without reading.
-                            for part in path.relative_to(root).parts:
+                            for part in parts:
                                 lowered=part.lower().lstrip('.')
-                                if lowered.startswith(('auth','npmrc','netrc','bunfig.toml')) \
-                                        or 'credential' in lowered:
+                                if lowered.startswith(('auth','npmrc','netrc','bunfig.toml')) or 'credential' in lowered:
                                     raise Blocked('protected content in VIA-owned scan')
                         else: metadata.add(path); continue
                     readable=via_sink or source or path.suffix.lower() in {'.json','.jsonl','.ndjson','.log','.txt'} \
-                        or any(part in {'log','logs'} for part in path.parts) \
+                        or any(part in {'log','logs'} for part in parts) \
                         or any(token in name.lower() for token in ('stderr','stdout','output','undecoded'))
                     if not readable: continue
                     if info.st_size>OBSERVATION_BYTES: raise Blocked('evidence scan bound')
@@ -1110,14 +1135,12 @@ class Driver:
                     if len(raw)>OBSERVATION_BYTES: raise Blocked('evidence scan bound')
                     total+=len(raw)
                     if total>EVIDENCE_BYTES: raise Blocked('private secrecy scan byte bound')
-                    protected=self.vault.leaks(raw) or any(handle in raw for handle in handles)
-                    matched=any(form in raw for form in synthetic_forms)
+                    clean=clean and not protected(raw,via_sink)
                     if source: synthetic.append(path)
-                    elif via_sink: protected=protected or matched
-                    elif matched: vendor_synthetic+=1
-                    clean=clean and not protected
+                    elif root.kind=='vendor-private' and any(form in raw for form in synthetic_forms):
+                        vendor_synthetic+=1
                     if via_sink and path.name in {'undecoded.bin','stderr.log'}: captures.append(path.name)
-        if store_present:
+        for db in databases:
             try:
                 info=db.lstat()
                 if not stat.S_ISREG(info.st_mode): raise Blocked('VIA Store is not a regular file')
@@ -1126,19 +1149,19 @@ class Driver:
                     with sqlite3.connect(':memory:') as destination:
                         source.backup(destination)
                         raw=destination.serialize()
+            except FileNotFoundError as error: unavailable(db,error)
             except (OSError,sqlite3.Error) as error: raise Blocked('VIA Store backup unverifiable') from error
-            if total+len(raw)>EVIDENCE_BYTES: raise Blocked('private secrecy scan byte bound')
-            clean=clean and not self.vault.leaks(raw) and not any(form in raw for form in self.secret_forms) \
-                and not any(handle in raw for handle in handles)
+            total+=len(raw)
+            if total>EVIDENCE_BYTES: raise Blocked('private secrecy scan byte bound')
+            clean=clean and not protected(raw,True)
         return {'complete':True,'secret_absent':clean,'payload_captures':len(captures),
                 'metadata_only_files':len(metadata),'synthetic_source_files':len(synthetic),
                 'vendor_private_synthetic_files':vendor_synthetic,
-                'vendor_private_vanished_entries':len(vanished),
-                'scope':['owned-via-store','private-vendor-logs','nested-owned-evidence','daemon-home-xdg-tmp'],
+                'vendor_private_vanished_entries':len(vanished),'store_backups':len(databases),
+                'scope':['all-registered-states','all-registered-vendor-roots','registered-evidence','daemon-home-xdg-tmp'],
                 'synthetic_gate_scope':'via-owned-sinks',
                 'exclusions':['vendor-auth-config-and-database-content',
-                              'synthetic-provider-values-in-private-fixture-config',
-                              'pinned-acquisition-and-helper-artifacts']}
+                              'synthetic-provider-values-in-private-fixture-config','registered-helper-artifacts']}
 
     def seam(self,name,occurrence,action,*,target=None):
         """Arm one exact owned target; controller rejects unmatched generations/requests."""
@@ -1717,8 +1740,8 @@ class Driver:
             config['mcp']={'servers':{'via-fixture':{'type':'local','command':['/usr/bin/python3',str(helper)],
                            'timeout':{'startup':10000,'catalog':10000,'execution':10000}}}}
         if description.get('plugin') or description.get('hook'):
-            plugins=safety.private_directory(project/'.opencode'/'plugins')
-            directory=safety.private_directory(plugins/'via-fixture')
+            plugins=self._directory(project/'.opencode'/'plugins','vendor-private')
+            directory=self._directory(plugins/'via-fixture','vendor-private')
             plugin_helper=self._helper_fixture(project,'plugin')
             hook_helper=self._helper_fixture(project,'hook') if description.get('hook') else None
             # Pinned v2.0.22 promise/plugin.ts defines {id,setup}; an absolute
@@ -1734,7 +1757,7 @@ class Driver:
             (directory/'index.js').write_text(code); (directory/'index.js').chmod(0o400)
             config['plugins']=[str(directory)]
         if description.get('skills')=='off':
-            skill=project/'.claude'/'skills'/'private-fixture'
+            skill=self.ownership.register(project/'.claude'/'skills'/'private-fixture','vendor-private')
             skill.mkdir(parents=True,mode=0o700)
             (skill/'SKILL.md').write_text('---\nname: private-fixture\ndescription: VIA sentinel\n---\nVIA_PRIVATE_SKILL\n')
         if name=='long-run': self._helper_fixture(project,'tool',barrier_seconds=1800)
@@ -1758,7 +1781,7 @@ class Driver:
             raise Blocked('helper barrier exceeds reviewed phase bound')
         if type(kind) is not str or not kind.replace('_','').isalnum():
             raise Blocked('unsafe helper kind')
-        observations=safety.private_directory(project/'.opencode'/'observations')
+        observations=self._directory(project/'.opencode'/'observations','vendor-private')
         self.helper_channels[str(project)]=observations
         path=project/'.opencode'/f'{kind}-helper.py'
         code='''#!/usr/bin/python3
@@ -1961,8 +1984,9 @@ print('VIA HELPER DONE')
             return self._operation('idle_retirement',args)
         if kind=='namespace':
             self.stop()
-            self.state=safety.private_directory(self.evidence/'credential-state')
-            self.namespace,self.namespace_env=safety.create_namespace(self.state)
+            self.state=self.ownership.register_state(self.evidence/'l11-state')
+            safety.private_directory(self.state)
+            self.namespace,self.namespace_env=self._create_namespace()
             safety.init_fixture_repo(self.namespace,self.home)
             self.env['VIA_STATE_DIR']=str(self.state)
             self._refresh_inventory()
@@ -2219,15 +2243,19 @@ print('VIA HELPER DONE')
 
     def finish(self):
         """Final cleanup/immutable-pin proof; uncertainty retains roots and fails closure."""
+        failures=[]
         try: proof=self.stop()
+        except BaseException as error: failures.append(error)
         finally:
             self._publication_release.set()
-            failures=[]
             for provider in self.mock_providers.values():
                 try: provider.__exit__(None,None,None)
-                except Exception as error: failures.append(error)
+                except BaseException as error:
+                    failure=Blocked('owned mock provider cleanup unverified')
+                    failure.__cause__=error
+                    failures.append(failure)
             self.mock_providers.clear()
-            if failures: raise Blocked('owned mock provider cleanup unverified') from failures[0]
+        if failures: raise failures[0]
         safety.verify_binary(self.pinned)
         scan=self.secrecy_scan()
         if scan['secret_absent'] is not True or scan['payload_captures']!=0:
@@ -2288,14 +2316,14 @@ print('VIA HELPER DONE')
 
     def _repository_sentinel(self):
         """First model-capable phase uses only loopback controls with nested Git sentinels."""
-        outer=safety.private_directory(self.evidence/'ancestor-fixture')
+        outer=self._directory(self.evidence/'ancestor-fixture','vendor-private')
         safety.init_fixture_repo(outer,self.home,sentinel=True)
-        nested=outer/'project-boundary'
+        nested=self.ownership.register(outer/'project-boundary','vendor-private')
         safety.init_fixture_repo(nested,self.home)
-        control=safety.private_directory(outer/'walk-up-control')
+        control=self._directory(outer/'walk-up-control','vendor-private')
         boundary_results=[]
         for name,project in (('project-boundary',nested),('ancestor-control',control),('namespace-boundary',self.namespace)):
-            safety.private_directory(project/'.opencode')
+            self._directory(project/'.opencode','vendor-private')
             config=self._materialize_fixture(name,project,{'provider':'mock'})
             (project/'opencode.json').write_text(json.dumps(config)); (project/'opencode.json').chmod(0o600)
             self.fixtures[name]={'path':project,'config':config}

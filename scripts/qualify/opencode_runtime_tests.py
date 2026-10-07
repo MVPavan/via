@@ -94,7 +94,7 @@ class RuntimeTests(unittest.TestCase):
                     providers.append(types.SimpleNamespace(__exit__=close))
                 d.mock_providers=dict(enumerate(providers))
                 with mock.patch.object(d,'stop',side_effect=safety.Blocked('owned stop uncertainty')):
-                    reason='owned mock provider cleanup unverified' if failing_provider else 'owned stop uncertainty'
+                    reason='owned stop uncertainty'  # Original cleanup failure takes precedence.
                     with self.assertRaisesRegex(safety.Blocked,reason): d.finish()
                 self.assertEqual(calls,[0,1]); self.assertFalse(d.mock_providers)
 
@@ -140,7 +140,9 @@ class RuntimeTests(unittest.TestCase):
             d._binary=Path('release')
             with mock.patch.object(d,'spending_check'),mock.patch.object(d,'_admit_model'):
                 d.via(['spawn','--background','--prompt','fixture'])
-            path=d.evidence/'nested'/'output.json'; path.parent.mkdir(); path.write_text('{"echo":"h_fake_bearer"}')
+            path=d.evidence/'nested'/'output.json'
+            d.ownership.register(path.parent,'runner-evidence')
+            path.parent.mkdir(); path.write_text('{"echo":"h_fake_bearer"}')
             self.assertIn(b'h_fake_bearer',d.secret_forms)
             self.assertFalse(d.secrecy_scan()['secret_absent'])
 
@@ -149,17 +151,19 @@ class RuntimeTests(unittest.TestCase):
             root=Path(root); d=self.driver(root); d.secret_forms=[b'fixture-secret']
             d.namespace=root/'namespace'; d.namespace.mkdir(); d.home=root/'home'; d.home.mkdir()
             project=root/'project'; project.mkdir(); config=project/'opencode.json'
+            for folder in (d.namespace,d.home,project): d.ownership.register(folder,'vendor-private')
             config.write_text('{"synthetic":"fixture-secret"}')
             d.fixtures={'fixture':{'path':project}}
             auth=d.home/'auth.json'; auth.write_text('fixture-secret')
             database=d.namespace/'opencode.db'; database.write_bytes(b'fixture-secret')
             log=d.namespace/'logs'/'vendor.log'; log.parent.mkdir(); log.write_text('clean')
             nested=d.evidence/'nested'/'output.json'; nested.parent.mkdir(); nested.write_text('{}')
-            original=Path.read_bytes
-            def read(path):
+            d.ownership.register(nested.parent,'runner-evidence')
+            original=Path.open
+            def read(path,*args,**kwargs):
                 if path in {auth,database}: raise AssertionError('credential content read')
-                return original(path)
-            with mock.patch.object(Path,'read_bytes',read):
+                return original(path,*args,**kwargs)
+            with mock.patch.object(Path,'open',read):
                 report=d.secrecy_scan(); self.assertTrue(report['secret_absent'])
                 self.assertGreaterEqual(report['metadata_only_files'],2)
                 self.assertEqual(report['synthetic_source_files'],1)
@@ -237,6 +241,9 @@ class RuntimeTests(unittest.TestCase):
                           'phase':d.evidence/'hostile.json','summary':d.evidence/'summary.json',
                           'stderr':d.state/'capture'/'stderr.log',
                           'undecoded':d.state/'capture'/'undecoded.bin'}[sink]
+                    if sink=='evidence': d.ownership.register(path.parent,'runner-evidence')
+                    elif sink in {'phase','summary'}:
+                        d.ownership.register(path,'runner-evidence',directory=False)
                     path.parent.mkdir(parents=True,exist_ok=True); path.write_bytes(b'fixture-provider-secret')
                 self.assertFalse(d.secrecy_scan()['secret_absent'])
 
@@ -245,6 +252,7 @@ class RuntimeTests(unittest.TestCase):
             d=self.driver(root); d.namespace=d.state/'vendor'/'opencode'/'namespace'
             xdg=d.namespace/'data'; project=d.evidence/'fixtures'/'fixture'
             d.namespace_env={'XDG_DATA_HOME':str(xdg)}; d.fixtures={'fixture':{'path':project}}
+            d.ownership.register(project,'vendor-private')
             for folder in (d.namespace,d.home,xdg,project):
                 folder.mkdir(parents=True,exist_ok=True); (folder/'vendor.log').write_bytes(b'fixture-provider-secret')
             d.secret_forms=[b'fixture-provider-secret']
@@ -282,7 +290,7 @@ class RuntimeTests(unittest.TestCase):
     def test_missing_or_nonregular_store_after_daemon_run_blocks(self):
         for kind in ('missing','symlink','directory','fifo'):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory(prefix='via-runtime-') as root:
-                d=self.driver(root); d.state.mkdir(); d._daemon_ran=True; path=d.state/'store.sqlite3'
+                d=self.driver(root); d.state.mkdir(); d.ownership.daemon_started(d.state); path=d.state/'store.sqlite3'
                 if kind=='symlink':
                     target=Path(root)/'target'; target.write_bytes(b'not a Store'); path.symlink_to(target)
                 elif kind=='directory': path.mkdir()
@@ -293,7 +301,8 @@ class RuntimeTests(unittest.TestCase):
     def test_via_regular_config_database_and_extensionless_files_are_read(self):
         for name in ('output.db','output.sqlite','opencode.json','extensionless'):
             with self.subTest(name=name), tempfile.TemporaryDirectory(prefix='via-runtime-') as root:
-                d=self.driver(root); (d.evidence/name).write_bytes(b'fixture-provider-secret')
+                d=self.driver(root); d.ownership.register(d.evidence/name,'runner-evidence',directory=False)
+                (d.evidence/name).write_bytes(b'fixture-provider-secret')
                 d.secret_forms=[b'fixture-provider-secret']
                 self.assertFalse(d.secrecy_scan()['secret_absent'])
 
@@ -323,6 +332,7 @@ class RuntimeTests(unittest.TestCase):
                 else:
                     path=d.evidence/kind
                     d.env={'HOME' if kind=='daemon-home' else 'TMPDIR':str(path)}
+                    d.ownership.register(path,'via-owned')
                 path.symlink_to(target,target_is_directory=True)
                 with self.assertRaisesRegex(safety.Blocked,'VIA scan root'):
                     d.secrecy_scan()
@@ -382,6 +392,7 @@ class RuntimeTests(unittest.TestCase):
         for key,part in safety.PRIVATE_PARTS.items():
             with self.subTest(key=key), tempfile.TemporaryDirectory(prefix='via-runtime-') as root:
                 d=self.driver(root); folder=d.evidence/('daemon-'+part); folder.mkdir()
+                d.ownership.register(folder,'via-owned')
                 d.env={key:str(folder)}; (folder/'output.log').write_bytes(b'fixture-provider-secret')
                 d.secret_forms=[b'fixture-provider-secret']
                 scan=d.secrecy_scan()
@@ -406,11 +417,11 @@ class RuntimeTests(unittest.TestCase):
             d=self.driver(root); d.home.mkdir()
             directory=d.home/'credentials'; directory.mkdir()
             protected=directory/'entry.json'; protected.write_text('synthetic credential')
-            original=Path.read_bytes
-            def read(path):
+            original=Path.open
+            def read(path,*args,**kwargs):
                 if path==protected: raise AssertionError('credential directory contents read')
-                return original(path)
-            with mock.patch.object(Path,'read_bytes',read):
+                return original(path,*args,**kwargs)
+            with mock.patch.object(Path,'open',read):
                 scan=d.secrecy_scan()
             self.assertEqual(scan['metadata_only_files'],1)
 
@@ -418,6 +429,7 @@ class RuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='via-runtime-') as root:
             root=Path(root); d=self.driver(root)
             project=root/'project'; project.mkdir(); source=project/'opencode.json'
+            d.ownership.register(project,'vendor-private')
             d.fixtures={'fixture':{'path':project}}; d.secret_forms=[b'synthetic-provider']
             d.handles={'s_fixture':'h_memory_bearer'}
             proc=mock.Mock(); proc.read.return_value=safety.PASSWORD_KEY+b'=private-password\0'

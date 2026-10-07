@@ -23,6 +23,7 @@ import unittest
 
 import opencode_cases as cases
 import opencode_safety as safety
+from opencode_ownership import OwnershipRegistry
 
 REPO = Path(__file__).resolve().parents[2]
 SCRATCHPAD = REPO / "scratchpad"
@@ -46,7 +47,7 @@ FAKE_GATES = ("fmt", "clippy", "clippy-failpoints", "nextest-default", "nextest-
 VERSION = "2.0.22"
 E7_SHA256 = "540fdf565da27de9df69b6c3864582344e74ac4ffa225c283b289481d215d241"
 TEST_MODULES = ("opencode_safety_tests", "opencode_cases_tests", "opencode_driver_tests",
-                "opencode_barrier_tests", "opencode_runtime_tests", "opencode_tests")
+                "opencode_barrier_tests", "opencode_runtime_tests", "opencode_tests", "opencode_ownership_tests")
 _ACQUISITION_ROOT = None
 
 
@@ -196,13 +197,15 @@ def package_manifest(package):
     return dist
 
 
-def acquire(evidence):
+def acquire(evidence, ownership=None):
     """Only pre-anchored official npm archives may reach decompression (packet §2)."""
-    home = safety.private_directory(evidence / "acquisition-home")
+    ownership = ownership or OwnershipRegistry(evidence)
+    home = safety.private_directory(ownership.register(evidence / "acquisition-home", "helper"))
     unavailable = []
     with acquisition_home(home):
         for name in ("@opencode/cli-linux-x64", "@opencode/cli-linux-x64-baseline"):
             destination = evidence / ("pinned-" + str(len(unavailable)))
+            ownership.register(destination, "helper")
             try:
                 dist = package_manifest(name)
                 if dist["integrity"] != "sha512-" + safety.NPM_SHA512 \
@@ -257,9 +260,12 @@ def protected_write(vault, path, value, secret_forms=()):
     vault.safe_write_json(path, value)
 
 
-def persist_phase(evidence, phase, rows, vault, secret_forms=()):
+def persist_phase(evidence, phase, rows, vault, secret_forms=(), ownership=None):
     """Publish each protected partial phase snapshot atomically (packet §13 M9)."""
     pending = evidence / (phase + "." + secrets.token_hex(8) + ".pending")
+    if ownership is not None:
+        ownership.register(pending, "runner-evidence", directory=False)
+        ownership.register(evidence / (phase + ".json"), "runner-evidence", directory=False)
     try:
         protected_write(vault, pending, rows, secret_forms)
         pending.replace(evidence / (phase + ".json"))
@@ -304,6 +310,7 @@ def main(argv=None):
         print(json.dumps({"self_test": "pass" if not failures else "fail", "tests": count,
                           "failures": failures}, sort_keys=True))
         return bool(failures)
+    ownership = OwnershipRegistry(args.evidence)
     # Validate existing ancestors; never chmod/recreate somebody else's directory.
     relative = args.evidence.relative_to(REPO)
     root = REPO
@@ -328,12 +335,12 @@ def main(argv=None):
             fake_gates = verify_fake_gates(args.fake_gate_manifest, args.via_release,
                                           args.via_failpoints)
             info["system_tools"] = system_tools_preflight()
-            pinned = acquire(args.evidence) if args.acquire else args.opencode.resolve()
+            pinned = acquire(args.evidence, ownership) if args.acquire else args.opencode.resolve()
             safety.verify_binary(pinned)
             from opencode_driver import Driver
             driver = Driver(via_release=args.via_release, via_failpoints=args.via_failpoints,
                             opencode=pinned, evidence=args.evidence, signals=signals,
-                            public_free=True, initialize=False)
+                            public_free=True, initialize=False, ownership=ownership)
             vault = driver.vault
             driver.fake_gate_manifest = fake_gates
             # A fresh evidence path must still find the previous stopped-daemon
@@ -348,7 +355,7 @@ def main(argv=None):
                 def retain_phase(rows):
                     nonlocal accepted
                     persist_phase(args.evidence, phase, rows, vault,
-                                  getattr(driver, "secret_forms", ()))
+                                  getattr(driver, "secret_forms", ()), ownership)
                     # Only published, scanned records can reach the final sink.
                     records.extend(rows[accepted:])
                     accepted = len(rows)
@@ -363,11 +370,17 @@ def main(argv=None):
             # No arbitrary exception string can leak a password, handle or raw response.
             info["runner_error"] = type(error).__name__
         finally:
+            info["failure_order"] = [{"stage": "case", "case": row["case"], "result": row["result"]}
+                                     for row in records if row["disposition"] == "gate"
+                                     and row["result"] != "pass"]
+            if "runner_error" in info:
+                info["failure_order"].append({"stage": "runner", "kind": info["runner_error"]})
             if driver is not None:
                 try:
                     cleanup = driver.finish()
                 except BaseException as error:
                     info["cleanup_error"] = type(error).__name__
+                    info["failure_order"].append({"stage": "cleanup", "kind": info["cleanup_error"]})
                 try:
                     # Qualification cannot outlive the source/build evidence
                     # admitted before acquisition and the first daemon start.
@@ -376,12 +389,14 @@ def main(argv=None):
                     info["fake_gates_reverified"] = True
                 except BaseException as error:
                     info["proof_error"] = type(error).__name__
+                    info["failure_order"].append({"stage": "proof", "kind": info["proof_error"]})
             info.update(summary_verdict(records, phases, cleanup, bool(signals.interrupted)))
             if any(key in info for key in ("runner_error", "cleanup_error", "proof_error")) \
                     or signals.interrupted:
                 info["result"] = "blocked"
             info.update(ended_at=time.time(), cases=records, cleanup=cleanup)
             try:
+                ownership.register(args.evidence / "summary.json", "runner-evidence", directory=False)
                 protected_write(vault, args.evidence / "summary.json", info,
                                 getattr(driver, "secret_forms", ()))
             except safety.Blocked:

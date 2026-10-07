@@ -15,6 +15,32 @@ from opencode_safety import Blocked
 
 
 class EntryTests(unittest.TestCase):
+    def test_original_runner_failure_precedes_cleanup_failure_in_summary(self):
+        import opencode_driver
+        with tempfile.TemporaryDirectory(prefix="oc-entry-", dir=opencode.SCRATCHPAD) as directory:
+            root=Path(directory)
+            class FakeDriver:
+                def __init__(self,**kwargs):
+                    self.vault=opencode.safety.PasswordVault()
+                    self.proc=opencode.safety.ProcReader(root/'synthetic-proc')
+                def prepare(self): raise ValueError('FAKE original setup failure')
+                def finish(self): raise Blocked('FAKE secondary cleanup failure')
+            args=SimpleNamespace(self_test=False,phase=['preflight'],evidence=root/'run',
+                                 acquire=False,opencode=root/'fake-pin',via_release=root/'release',
+                                 via_failpoints=root/'fp',fake_gate_manifest=root/'gates')
+            with patch.object(opencode,'arguments',return_value=args), \
+                 patch.object(opencode,'self_test',return_value=([],1)), \
+                 patch.object(opencode,'verify_fake_gates',return_value={'verified':True}), \
+                 patch.object(opencode,'system_tools_preflight',return_value={'rg':True,'python3':True}), \
+                 patch.object(opencode,'RECOVERY_ROOT',root/'recovery'), \
+                 patch.object(opencode.safety,'verify_binary'), patch.object(opencode_driver,'Driver',FakeDriver), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(opencode.main([]),1)
+            summary=json.loads((args.evidence/'summary.json').read_text())
+            self.assertEqual(summary['failure_order'],[
+                {'stage':'runner','kind':'ValueError'},{'stage':'cleanup','kind':'Blocked'}])
+            self.assertEqual(summary['result'],'blocked')
+
     def test_plain_invocation_cannot_start_live(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             opencode.arguments([])

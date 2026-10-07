@@ -1239,13 +1239,29 @@ never written. Scans cover evidence, fixture content, private logs and the
 owned VIA store. Password and bearer checks apply to every readable regular
 file in the scanned roots, including previously returned bearer handles.
 Synthetic hostile-provider values gate only VIA-owned sinks: evidence and
-phase/summary files, state outside the vendor namespace, the Store,
+phase/summary files, state outside the vendor tree, the Store,
 stderr/undecoded captures and the daemon's private HOME/XDG/TMPDIR roots.
+One ownership registry retains every created or handed-off root for the entire
+run, with a fixed VIA-owned, vendor-private, runner-evidence or helper class.
+Each path uses its longest registered prefix; active state/namespace switches
+never remove or reclassify earlier roots. Every state's whole `vendor/` tree
+is vendor-private, including the version-check probe. The evidence directory
+is a discovery boundary: evidence files and directories are registered when
+written or created, and an uncovered regular file blocks with
+`unregistered evidence file`. Credential-name checks inspect only path parts
+below the classified root. L11 uses the neutral directory name `l11-state`.
 Every regular VIA sink is read regardless of suffix, including rotated logs
-and Store blobs; Store/WAL content uses a consistent in-memory backup. Once a
-daemon has run, its Store must exist and be regular, including after shutdown.
+and Store blobs; every registered state's Store/WAL content uses a consistent
+in-memory backup. Only a state whose daemon actually started requires a Store,
+including after shutdown. Cleanup preserves the original failure ahead of
+secondary provider-shutdown errors; an unstarted L11 state does not create a
+spurious missing-Store failure. The summary's `failure_order` lists the original
+case/runner failure before cleanup and proof failures, using safe identities
+and exception kinds rather than arbitrary exception text.
 Non-regular VIA roots or entries, missing required state/Store, vanished VIA
-entries and unverifiable backups block qualification. The named operational
+entries persisting through three whole-scan attempts, and unverifiable backups
+block qualification. A transient VIA disappearance restarts the entire scan.
+Traversal and Store backup order are deterministic. The named operational
 exceptions are the `helpers/rg` symlink and, if under evidence, the runtime
 `via.sock` and `anchors/*.sock` sockets; the daemon lock remains a regular file.
 The pinned acquisition, `acquisition-home` and `helpers` artifacts are outside
