@@ -207,7 +207,7 @@ class CasesTests(unittest.TestCase):
         return {"complete": True, "spawned": spawned, "config_checked": True,
                 "mock_received": True, "read_attempted": True, "readiness_checked": True,
                 "readiness_seconds": .1, "pin_owned": True,
-                "disposition": "offered" if spawned else "lsp: not offered by pinned 2.0.22"}
+                "disposition": "offered" if spawned else "lsp: not offered by pinned 2.0.22 (read trigger; 5 s readiness window)"}
 
     def never_ask_driver(self, spawned=False):
         result = self.write_driver().replies["turn"]
@@ -220,17 +220,22 @@ class CasesTests(unittest.TestCase):
                                "hook_started": True, "fake_lsp_started": spawned,
                                "package_inventory_clean": True, "binary_inventory_clean": True}})
 
+    def test_negative_lsp_limitation_names_read_trigger_and_window(self):
+        case=cases.Case("lsp", "gate")
+        self.assertFalse(cases.checked_lsp_probe(case,self.lsp_proof(False)))
+        self.assertEqual(case.limitations,["lsp: not offered by pinned 2.0.22 (read trigger; 5 s readiness window)"])
+
     def test_l5_negative_configured_read_probe_is_an_explicit_limitation(self):
         result = cases.run_case(self.never_ask_driver(), "never_ask", cases.case_never_ask)
         self.assertEqual(result["result"], "pass")
-        self.assertIn("lsp: not offered by pinned 2.0.22", result["limitations"])
+        self.assertIn("lsp: not offered by pinned 2.0.22 (read trigger; 5 s readiness window)", result["limitations"])
 
     def test_l5_no_actual_read_cannot_claim_lsp_not_offered(self):
         driver = self.never_ask_driver()
         driver.replies["lsp_probe"]["read_attempted"] = False
         result = cases.run_case(driver, "never_ask", cases.case_never_ask)
         self.assertEqual(result["result"], "not_observable")
-        self.assertNotIn("lsp: not offered by pinned 2.0.22", result["limitations"])
+        self.assertNotIn("lsp: not offered by pinned 2.0.22 (read trigger; 5 s readiness window)", result["limitations"])
 
     def test_l5_positive_probe_requires_current_fixture_lsp_spawn(self):
         driver = self.never_ask_driver(spawned=True)
@@ -501,7 +506,7 @@ class CasesTests(unittest.TestCase):
         result = cases.run_case(driver, "anchor", cases.case_anchor)
         self.assertEqual(result["result"], "pass")
         self.assertEqual(sum(name == "daemon_sigcont" for name, _ in driver.calls), 12)
-        self.assertIn("lsp: not offered by pinned 2.0.22", result["limitations"])
+        self.assertIn("lsp: not offered by pinned 2.0.22 (read trigger; 5 s readiness window)", result["limitations"])
         self.assertTrue(any("reload:" in note for note in result["limitations"]))
         self.assertTrue(any("disposal:" in note for note in result["limitations"]))
 
@@ -942,7 +947,7 @@ class ConfiguredLspDriverTests(unittest.TestCase):
             self.assertFalse(result["spawned"])
             self.assertEqual(result["readiness_seconds"], 5)
             self.assertGreaterEqual(result["readiness_elapsed_seconds"], 5)
-            self.assertEqual(result["disposition"], "lsp: not offered by pinned 2.0.22")
+            self.assertEqual(result["disposition"], "lsp: not offered by pinned 2.0.22 (read trigger; 5 s readiness window)")
 
     def test_missing_actual_read_blocks_without_negative_or_retry(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -1119,7 +1119,7 @@ def checked_lsp_probe(case: Case, raw: dict) -> bool:
     if not 0 <= seconds <= 5:
         raise EvidenceUnavailable("LSP readiness probe exceeds its bound")
     spawned = member(raw, "spawned", bool)
-    expected = "offered" if spawned else "lsp: not offered by pinned 2.0.22"
+    expected = "offered" if spawned else "lsp: not offered by pinned 2.0.22 (read trigger; 5 s readiness window)"
     if member(raw, "disposition", str) != expected:
         raise EvidenceUnavailable("LSP disposition disagrees with the configured-read probe")
     if not spawned and expected not in case.limitations:

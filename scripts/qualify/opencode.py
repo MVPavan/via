@@ -284,11 +284,17 @@ def summary_verdict(records, phases, cleanup, interrupted):
     proven_stop = type(cleanup) is dict and cleanup.get("stopped") is True
     passed = (all_phases and complete and bool(gates) and proven_stop and not interrupted
               and all(row["result"] == "pass" for row in gates))
+    deferred = {"L10": "native macOS unavailable"}
+    recorded = {row["case"]: row for row in records
+                if row["disposition"] == "deferred-with-reason"}
+    for live, (disposition, case, _limit) in cases.L_DISPOSITIONS.items():
+        if disposition == "deferred-with-reason" and live != "L10":
+            deferred[live] = recorded.get(case, {}).get("reason", case + ": no reviewed bounded trigger")
     return {"result": "pass" if passed else "not_passed", "coverage_complete": complete,
             "all_phases_selected": all_phases, "daemons_stopped": proven_stop,
             "gate_count": len(gates), "gate_passed": sum(row["result"] == "pass" for row in gates),
             "record_only_count": sum(row["disposition"] == "record-only" for row in records),
-            "deferred": {"L10": "native macOS unavailable"}}
+            "deferred": deferred, "deferred_count": len(deferred)}
 
 
 def main(argv=None):

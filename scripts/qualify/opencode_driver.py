@@ -236,6 +236,7 @@ class Driver:
         self.public_free=public_free
         self._http=None; self._binary=None; self.daemon=None; self.anchor=None; self.vendor_identity=None
         self.identities=set(); self.uncertain=[]; self.build_hashes={}; self.handles={}
+        self.bearer_forms=set()
         self.events=[]; self.events_error=None; self._event_stop=threading.Event()
         self._event_thread=None; self._event_conn=None; self._events_lock=threading.Lock()
         self.counter=0; self.owned_replies=[]; self.secret_forms=[]; self._armed={}
@@ -510,6 +511,7 @@ class Driver:
                 raise Blocked('bearer receipt malformed')
             self.handles[value['session_id']]=value['handle']
             self.secret_forms.append(value['handle'].encode())
+            self.bearer_forms.add(value['handle'].encode())
         if schema=='envelope': self.account(value)
         self.owned_replies.append(value)
         if verb in {'spawn','resume'}:
@@ -991,26 +993,40 @@ class Driver:
         return form.get('sessionID') if type(form) is dict else None
 
     def secrecy_scan(self):
-        """Scan owned evidence/logs; label credential metadata and synthetic source (§13 L4)."""
-        roots={self.evidence,self.state,self.home}
-        if self.namespace is not None: roots.add(self.namespace)
-        roots.update(Path(value) for key,value in self.env.items() if key in safety.PRIVATE_PARTS)
-        roots.update(row['path'] for row in self.fixtures.values())
+        """Gate synthetic values on VIA sinks; passwords/bearers on all readable roots (§13 L4)."""
+        private_roots={self.home,*(Path(value) for key,value in self.env.items()
+                                  if key in safety.PRIVATE_PARTS)}
+        private_roots.update(row['path'] for row in self.fixtures.values())
+        if self.namespace is not None: private_roots.add(self.namespace)
+        roots={self.evidence,self.state,*private_roots}
         fixture_sources={row['path']/'opencode.json' for row in self.fixtures.values()}
         db=self.state/'store.sqlite3'
         clean=True; captures=[]; seen=set(); metadata=[]; synthetic=[]; total=0
-        handles=[handle.encode() for handle in self.handles.values()]
+        vendor_synthetic=0
+        handles={handle.encode() for handle in self.handles.values()} | self.bearer_forms
+        synthetic_forms=[form for form in self.secret_forms if form and form not in handles]
         for root in roots:
-            if not root.exists(): continue
+            try: root_info=root.lstat()
+            except FileNotFoundError: continue
+            if not stat.S_ISDIR(root_info.st_mode):
+                if root not in seen: seen.add(root); metadata.append(root)
+                continue
             def unreadable(_error): raise Blocked('private secrecy scan directory unreadable')
             for directory,dirs,files in os.walk(root,followlinks=False,onerror=unreadable):
                 dirs[:]=[name for name in dirs if name!='.git']
+                for name in dirs[:]:
+                    path=Path(directory)/name
+                    if not stat.S_ISDIR(path.lstat().st_mode):
+                        dirs.remove(name)
+                        if path not in seen: seen.add(path); metadata.append(path)
+                if len(seen)>100000: raise Blocked('private secrecy scan entry bound')
                 for name in files:
                     path=Path(directory)/name
                     if path in seen: continue
                     seen.add(path)
                     if len(seen)>100000: raise Blocked('private secrecy scan entry bound')
                     info=path.lstat()
+                    if not stat.S_ISREG(info.st_mode): metadata.append(path); continue
                     if path==db: continue  # Own VIA Store has a consistent in-memory backup below.
                     protected_directory=any(safety.credential_metadata_only(part)
                                             for part in path.relative_to(root).parts[:-1])
@@ -1024,29 +1040,34 @@ class Driver:
                         or any(part in {'log','logs'} for part in path.parts) \
                         or any(token in name.lower() for token in ('stderr','stdout','output','undecoded'))
                     if not readable: continue
-                    if not stat.S_ISREG(info.st_mode): raise Blocked('private scan artifact is not regular')
                     if info.st_size>OBSERVATION_BYTES: raise Blocked('evidence scan bound')
                     total+=info.st_size
                     if total>EVIDENCE_BYTES: raise Blocked('private secrecy scan byte bound')
                     raw=path.read_bytes()
                     protected=self.vault.leaks(raw) or any(handle in raw for handle in handles)
-                    # Fixture config intentionally contains synthetic provider keys;
-                    # it never gets an exception for a password or bearer handle.
+                    via_sink=(path.is_relative_to(self.evidence) or path.is_relative_to(self.state)) \
+                        and not any(path.is_relative_to(folder) for folder in private_roots)
+                    matched=any(form in raw for form in synthetic_forms)
                     if source: synthetic.append(path)
-                    else: protected=protected or any(form in raw for form in self.secret_forms)
+                    elif via_sink: protected=protected or matched
+                    elif matched: vendor_synthetic+=1
                     clean=clean and not protected
-                    if path.name in {'undecoded.bin','stderr.log'}: captures.append(path.name)
-        # Our own VIA Store may carry provider echoes, so inspect its byte-level backup in memory.
-        if db.exists():
+                    if via_sink and path.name in {'undecoded.bin','stderr.log'}: captures.append(path.name)
+        # Never follow a non-regular Store or state directory. All other VIA Store
+        # bytes are a VIA sink, unlike the vendor's private storage above.
+        if not self.state.is_symlink() and db.exists() and stat.S_ISREG(db.lstat().st_mode):
             if db.stat().st_size>EVIDENCE_BYTES: raise Blocked('Store scan bound')
             with sqlite3.connect(f'file:{db}?mode=ro',uri=True) as source:
                 with sqlite3.connect(':memory:') as destination:
                     source.backup(destination)
                     raw=destination.serialize()
-            clean=clean and not self.vault.leaks(raw) and not any(form in raw for form in self.secret_forms)
+            clean=clean and not self.vault.leaks(raw) and not any(form in raw for form in self.secret_forms) \
+                and not any(handle in raw for handle in handles)
         return {'complete':True,'secret_absent':clean,'payload_captures':len(captures),
                 'metadata_only_files':len(metadata),'synthetic_source_files':len(synthetic),
+                'vendor_private_synthetic_files':vendor_synthetic,
                 'scope':['owned-via-store','private-vendor-logs','nested-owned-evidence'],
+                'synthetic_gate_scope':'via-owned-sinks',
                 'exclusions':['vendor-auth-config-and-database-content',
                               'synthetic-provider-values-in-private-fixture-config']}
 
@@ -2146,7 +2167,7 @@ print('VIA HELPER DONE')
 
     def clear_sensitive(self):
         """Clear memory only after the entry's final protected evidence sink (§2.3)."""
-        self.vault.clear(); self.secret_forms.clear(); self.handles.clear()
+        self.vault.clear(); self.secret_forms.clear(); self.handles.clear(); self.bearer_forms.clear()
 
     def _fresh_max_steps(self,value):
         """Refuse non-null max_steps before any vendor metadata acquisition (§13 OC11)."""
@@ -2371,7 +2392,7 @@ print('VIA HELPER DONE')
                     'read_attempted':True,'readiness_checked':True,'pin_owned':True,
                     'readiness_seconds':5.0 if not spawned else time.monotonic()-beginning,
                     'readiness_elapsed_seconds':time.monotonic()-beginning,
-                    'disposition':'offered' if spawned else 'lsp: not offered by pinned 2.0.22'}
+                    'disposition':'offered' if spawned else 'lsp: not offered by pinned 2.0.22 (read trigger; 5 s readiness window)'}
         finally:
             try:
                 if prepared:

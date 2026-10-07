@@ -165,7 +165,108 @@ class RuntimeTests(unittest.TestCase):
                 self.assertEqual(report['synthetic_source_files'],1)
                 for path in (log,nested):
                     path.write_text('fixture-secret')
-                    self.assertFalse(d.secrecy_scan()['secret_absent']); path.write_text('clean')
+                    scan=d.secrecy_scan()
+                    self.assertIs(scan['secret_absent'],path==log)
+                    self.assertEqual(scan['vendor_private_synthetic_files'],int(path==log))
+                    path.write_text('clean')
+
+    def hostile_case(self, driver):
+        from opencode_cases import HOSTILE_OUTPUT_VERBS, case_hostile_provider, run_case
+        replies={'fixture':'fixture', 'turn':{'session_id':'s_fixture',
+                 'envelope':{'state':'failed','vendor_session_id':'ses_fixture','final_text':None}, 'vendor_error_observed':True},
+                 'mock_receipt':{'received':True,'model_matches':True},
+                 'hostile_output_matrix':{'complete':True,'verbs':list(HOSTILE_OUTPUT_VERBS),'event_pages':1}}
+        def execute(operation, **_args):
+            return driver.secrecy_scan() if operation=='secrecy_scan' else replies[operation]
+        return run_case(types.SimpleNamespace(execute=execute), 'hostile_provider', case_hostile_provider)
+
+    def test_synthetic_namespace_log_passes_l4_and_finish(self):
+        with tempfile.TemporaryDirectory(prefix='via-runtime-') as root:
+            d=self.driver(root); d.namespace=d.state/'vendor'/'opencode'/'namespace'
+            log=d.namespace/'log'/'vendor.log'; log.parent.mkdir(parents=True)
+            log.write_bytes(b'fixture-provider-secret'); d.secret_forms=[b'fixture-provider-secret']
+            with self.subTest(proof='l4'):
+                self.assertEqual(self.hostile_case(d)['result'],'pass')
+            with self.subTest(proof='finish'), mock.patch.object(d,'stop',return_value={'proven':True}), \
+                 mock.patch.object(safety,'verify_binary'):
+                self.assertTrue(d.finish()['stopped'])
+            report=d.secrecy_scan()
+            self.assertEqual(report['vendor_private_synthetic_files'],1)
+
+    def test_password_and_handle_in_vendor_log_still_fail_l4_and_finish(self):
+        for value in (b'private-password',b'h_private_bearer'):
+            with self.subTest(value=value), tempfile.TemporaryDirectory(prefix='via-runtime-') as root:
+                d=self.driver(root); d.namespace=d.state/'vendor'/'opencode'/'namespace'
+                log=d.namespace/'log'/'vendor.log'; log.parent.mkdir(parents=True); log.write_bytes(value)
+                proc=mock.Mock(); proc.read.return_value=safety.PASSWORD_KEY+b'=private-password\0'
+                d.vault.read_once(proc,safety.Identity(10,20))
+                d.handles={'s_fixture':'h_private_bearer'}
+                d.secret_forms=[b'fixture-provider-secret',b'h_private_bearer']
+                self.assertEqual(self.hostile_case(d)['result'],'fail')
+                with mock.patch.object(d,'stop',return_value={'proven':True}), \
+                     mock.patch.object(safety,'verify_binary'), \
+                     self.assertRaisesRegex(safety.Blocked,'final secrecy scan failed'):
+                    d.finish()
+
+    def test_prior_bearer_stays_protected_in_vendor_log_after_rotation(self):
+        with tempfile.TemporaryDirectory(prefix='via-runtime-') as root:
+            replies=[{'session_id':'s_fixture','turn':'s_fixture/'+str(number),'handle':handle,
+                      'effective':{'effort':None,'max_steps':None}}
+                     for number,handle in ((1,'h_old_bearer'),(2,'h_next_bearer'))]
+            d=self.driver(root,execute=mock.Mock(side_effect=[(0,json.dumps(reply).encode(),b'') for reply in replies]))
+            d._binary=Path('release')
+            with mock.patch.object(d,'spending_check'),mock.patch.object(d,'_admit_model'):
+                for _ in replies: d.via(['spawn','--background','--prompt','fixture'])
+            d.namespace=d.state/'vendor'/'opencode'/'namespace'
+            log=d.namespace/'log'/'vendor.log'; log.parent.mkdir(parents=True); log.write_bytes(b'h_old_bearer')
+            self.assertEqual(d.handles['s_fixture'],'h_next_bearer')
+            self.assertFalse(d.secrecy_scan()['secret_absent'])
+            d.clear_sensitive()
+            self.assertFalse(d.bearer_forms)
+
+    def test_synthetic_values_still_fail_each_via_sink(self):
+        for sink in ('evidence','phase','summary','stderr','undecoded','store'):
+            with self.subTest(sink=sink), tempfile.TemporaryDirectory(prefix='via-runtime-') as root:
+                d=self.driver(root); d.state.mkdir(); d.secret_forms=[b'fixture-provider-secret']
+                if sink=='store':
+                    with runtime.sqlite3.connect(d.state/'store.sqlite3') as db:
+                        db.execute('CREATE TABLE fixture (value TEXT)')
+                        db.execute('INSERT INTO fixture VALUES (?)',('fixture-provider-secret',))
+                else:
+                    path={'evidence':d.evidence/'nested'/'output.json',
+                          'phase':d.evidence/'hostile.json','summary':d.evidence/'summary.json',
+                          'stderr':d.state/'capture'/'stderr.log',
+                          'undecoded':d.state/'capture'/'undecoded.bin'}[sink]
+                    path.parent.mkdir(parents=True,exist_ok=True); path.write_bytes(b'fixture-provider-secret')
+                self.assertFalse(d.secrecy_scan()['secret_absent'])
+
+    def test_vendor_private_synthetic_matches_are_labelled_on_each_private_root(self):
+        with tempfile.TemporaryDirectory(prefix='via-runtime-') as root:
+            d=self.driver(root); d.namespace=d.state/'vendor'/'opencode'/'namespace'
+            xdg=d.evidence/'daemon-data'; project=d.evidence/'fixtures'/'fixture'
+            d.env={'XDG_DATA_HOME':str(xdg)}; d.fixtures={'fixture':{'path':project}}
+            for folder in (d.namespace,d.home,xdg,project):
+                folder.mkdir(parents=True,exist_ok=True); (folder/'vendor.log').write_bytes(b'fixture-provider-secret')
+            d.secret_forms=[b'fixture-provider-secret']
+            report=d.secrecy_scan()
+            self.assertTrue(report['secret_absent'])
+            self.assertEqual(report['vendor_private_synthetic_files'],4)
+
+    def test_nonregular_scan_entries_are_metadata_only_and_never_followed(self):
+        with tempfile.TemporaryDirectory(prefix='via-runtime-') as root:
+            root=Path(root); d=self.driver(root); d.state.mkdir()
+            target=root/'target.log'; target.write_bytes(b'private-password')
+            directory=root/'target-directory'; directory.mkdir(); (directory/'vendor.log').write_bytes(b'private-password')
+            (d.evidence/'linked.log').symlink_to(target)
+            (d.evidence/'linked-logs').symlink_to(directory, target_is_directory=True)
+            (d.state/'store.sqlite3').symlink_to(target)
+            os.mkfifo(d.evidence/'stream.log')
+            proc=mock.Mock(); proc.read.return_value=safety.PASSWORD_KEY+b'=private-password\0'
+            d.vault.read_once(proc,safety.Identity(10,20))
+            with mock.patch.object(runtime.sqlite3,'connect',side_effect=AssertionError('nonregular store read')):
+                report=d.secrecy_scan()
+            self.assertTrue(report['secret_absent'])
+            self.assertEqual(report['metadata_only_files'],4)
 
     def test_fresh_max_steps_uses_only_mock_selector(self):
         with tempfile.TemporaryDirectory(prefix='via-runtime-') as root:

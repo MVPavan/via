@@ -1236,11 +1236,17 @@ The qualification-only password exception reads the exact password key once
 from the verified owned vendor's initial environment, in memory only. Evidence
 and rotation comparisons return Booleans; the password and bearer handles are
 never written. Scans cover evidence, fixture content, private logs and the
-owned VIA store. Credential/config files and vendor databases remain
-metadata-only exclusions, reported as a proof limitation; synthetic provider
-values in their fixture config are labelled input, never evidence of secrecy.
-Returned bearer handles join the in-memory forbidden forms. Structural spending
-controls are checked before model-capable requests: known empty integrations, an environment allow-list, frozen free
+owned VIA store. Password and bearer checks apply to every readable regular
+file in the scanned roots, including previously returned bearer handles.
+Synthetic hostile-provider values gate only VIA's evidence, phase/summary files,
+Store and stderr/undecoded captures. Observed synthetic matches in readable
+vendor-private files are a labelled file count, never a gate failure; fixture
+config values remain labelled input. Credential/config files and vendor
+databases remain metadata-only exclusions, reported as a proof limitation.
+Non-regular entries, including symlinks, are skipped and counted as metadata-only;
+the scan never follows them. Returned bearer handles join the in-memory
+forbidden forms. Structural spending controls are checked before model-capable
+requests: known empty integrations, an environment allow-list, frozen free
 catalog/session identities, and loopback endpoints for every overridden
 provider. Missing cost is unavailable; positive cost or a paid identity stops
 admission. Session shell requests consume no model turn unless they invoke a
@@ -1275,15 +1281,18 @@ proof. No daemon reload command or new per-request CLI setting is introduced.
 A configured fake LSP receives a custom fixture extension and an attempted
 native file-read tool call through the mock provider. Served config, the actual
 read attempt and mock receipt establish the probe; a bounded absence of its
-spawn marker records `lsp: not offered by pinned 2.0.22`. That exception skips
-only L5/L14 LSP checks. A positive probe requires a read and observed LSP spawn
+spawn marker records
+`lsp: not offered by pinned 2.0.22 (read trigger; 5 s readiness window)`.
+That exception skips only L5/L14 LSP checks. A positive probe requires a read and observed LSP spawn
 in the L5 fixture and each L14 LSP sample. Missing read-attempt evidence blocks
 the probe. Other lifecycle points come from observed process/API/config evidence. An absent
 reload/disposal API is a labelled limitation; an offered but unsampled path
 cannot pass. Synthetic compaction and cache observations carry the `FAKE` label.
 The current runner defers L1 collision observations, L6 alternate field forms
 and L12 other shapes until a bounded trigger exists, without turning an empty
-observation into a pass.
+observation into a pass. The summary lists these declared deferrals alongside
+L10, counts all four separately from record-only observations, and keeps any
+recorded deferral reason. This count does not change the verdict.
 
 Each turn keeps the supported `full` bound: C1 advertises only `full` (§5), so
 this runner cannot select a narrower network bound without a separate public

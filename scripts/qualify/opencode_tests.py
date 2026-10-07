@@ -60,6 +60,24 @@ class EntryTests(unittest.TestCase):
         self.assertEqual(opencode.summary_verdict(records, ["seams"], {"stopped": True}, False)
                          ["gate_passed"], 0)
 
+    def test_summary_declared_deferrals_include_every_deferred_live_row(self):
+        verdict=opencode.summary_verdict([], ["preflight"], {"stopped":True}, False)
+        self.assertEqual(set(verdict["deferred"]),{"L1","L6","L10","L12"})
+        self.assertEqual(verdict["deferred_count"],4)
+        self.assertEqual(verdict["record_only_count"],0)
+        self.assertEqual(verdict["result"],"not_passed")
+
+    def test_summary_uses_recorded_deferral_reasons_without_counting_gate_passes(self):
+        records=[opencode.cases.run_case(None,name,opencode.cases.CASES[name],"record-only")
+                 for name in ("collision","forms","other")]
+        verdict=opencode.summary_verdict(records,["seams"],{"stopped":True},False)
+        self.assertEqual(set(verdict["deferred"]),{"L1","L6","L10","L12"})
+        self.assertEqual(verdict["deferred_count"],4)
+        for row,live in zip(records,("L1","L6","L12")):
+            self.assertEqual(verdict["deferred"][live],row["reason"])
+        self.assertEqual(verdict["record_only_count"],0)
+        self.assertEqual(verdict["gate_passed"],0)
+
     def test_private_acquisition_environment_restored_after_error(self):
         before = dict(os.environ)
         with self.assertRaises(Blocked):
