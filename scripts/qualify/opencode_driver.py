@@ -45,6 +45,9 @@ SSE_HANDSHAKE_SECONDS = 30  # §13 owned observer absolute header deadline.
 WAIT_REPLY_MARGIN_SECONDS = 10  # §13: allow the CLI to return its bounded wait reply.
 HELPER_STOP_SECONDS = 30  # §13 L14 bounded cooperative cleanup before a successor.
 ANCHOR_SOCKET_TAIL = 64
+METADATA_EFFORT = 'via-qualification-metadata-only-unoffered'  # Packet §5; C1 §4.
+BOOTSTRAP_SECONDS = 30  # §13: owned acquisition and all served-fact checks.
+BOOTSTRAP_WAIT_MS = 30000  # §13: mock completion after the response is released.
 
 
 def _typed(value, schema, where):
@@ -88,7 +91,7 @@ SCHEMAS = {
                'warnings': [{'code':S}], 'vendor_identity_verified': B,
                'progress': (dict,type(None)), 'turns': [{'state':S}]},
     'logs': {'transcript': S+N},
-    'error': {'error': {'code': I,'message': S,'data':{'kind':S}}},
+    'error': {'code': I,'message': S,'data':{'kind':S}},
     'daemon stop': {'stopping':B},
     'describe': {'harness':S,'capabilities':{'params':{'max_steps':{'support':S}}}},
     'models': {'models':list},
@@ -272,6 +275,12 @@ class Driver:
         self.fake_gate_manifest=None
         self._armed_history=set()
         self._seam_targets={}
+        self._metadata_command=None; self._metadata_active=False
+        self._bootstrap_command=None; self._bootstrap_session=None; self._bootstrap_active=False
+        self._bootstrap_config=None
+        self._bootstrap_cleanup=False; self._bootstrap_count=0
+        self._bootstrap_deadline=None
+        self._namespace_bootstraps={}
         self._publication_entered=threading.Event(); self._publication_release=threading.Event()
         if initialize:
             self.prepare()
@@ -470,16 +479,29 @@ class Driver:
         except Blocked: self.uncertain.append('private lockers unverifiable')
 
     def via(self,args):
+        """Attach the fixed CLI verb to any runner block before cleanup (§13)."""
+        verbs={'daemon','describe','models','spawn','resume','wait','cancel','close',
+               'steer','events','status','logs'}
+        verb=args[0] if args and args[0] in verbs else 'unknown'
+        with safety.block_context(verb=verb):
+            return self._via(args)
+
+    def _via(self,args):
         """Call selected private CLI; bearer handles use stdin and replies stay in memory."""
         if not self._binary: raise Blocked('VIA build not selected')
         args=list(args)
         if not args: raise Blocked('CLI verb missing')
         verb=args[0]
         if verb in {'spawn','resume','steer'} and '--max-steps' not in args:
-            self.spending_check(args=args)
-            self._admit_model(self.last_model)
+            # §13 allows only the exact held mock bootstrap and the fixed L11
+            # credential-fence probe. L11's unoffered effort (§5) is a second
+            # fence before native session creation. Ordinary turns always check.
+            if args!=self._metadata_command and args!=self._bootstrap_command:
+                self.spending_check(args=args)
+                self._admit_model(self.last_model)
         if '--json' not in args: args.append('--json')
-        cleanup=verb=='daemon' and len(args)>1 and args[1]=='stop'
+        cleanup=(verb=='daemon' and len(args)>1 and args[1]=='stop') or (
+            self._bootstrap_cleanup and verb in {'cancel','close'})
         if self.phase_deadline and not cleanup and time.monotonic()>=self.phase_deadline:
             raise Blocked('phase deadline')
         if len(args)>1 and args[1] in self.handles and any(flag in args for flag in ('--handle','--handle-file')):
@@ -514,6 +536,10 @@ class Driver:
                 if not 0<=cli_timeout<=180000: raise Blocked('CLI wait timeout exceeds phase ceiling')
             timeout=cli_timeout/1000+WAIT_REPLY_MARGIN_SECONDS
         if self.phase_deadline and not cleanup: timeout=min(timeout,max(0.01,self.phase_deadline-time.monotonic()))
+        if self._bootstrap_active and self._bootstrap_deadline is not None and not cleanup:
+            remaining=self._bootstrap_deadline-time.monotonic()
+            if remaining<=0: raise Blocked('bootstrap CLI deadline')
+            timeout=min(timeout,remaining)
         try:
             command_started=time.monotonic()
             rc,out,err=self.execute([str(self._binary),*args],env=self.env,cwd=self.project,
@@ -525,10 +551,9 @@ class Driver:
         if rc==4: raise Blocked('private daemon unreachable')
         if rc not in {0,3}:
             value=strict_reply(err or out,'error')
-            if 'error' not in value and 'code' not in value:
-                raise Blocked('CLI error schema unverifiable')
             self._record('cli-error',{'verb':verb,'rc':rc,'typed':True})
-            return {'cli_error':value,'exit_code':rc}
+            # C1 §1 CLI stderr is the error object; keep the internal wrapper.
+            return {'cli_error':{'error':value},'exit_code':rc}
         schema={'status':'status','wait':'envelope','events':'events page','logs':'logs',
                 'cancel':'cancel reply'}.get(verb,'unknown')
         if verb=='daemon' and len(args)>1:
@@ -554,9 +579,25 @@ class Driver:
         self._record('cli',{'verb':verb,'rc':rc,'schema':schema,'fields':sorted(value),
                             'handle_persisted':False,'stderr_present':bool(err)})
         if self.inventory: self.inventory.check()
+        # The bootstrap lease keeps acquisition alive until a real successor
+        # session has attached. Then close it so retirement/session counts are
+        # governed by the case's sessions, not the acquisition helper.
+        bootstrap=self._bootstrap_session
+        target=value.get('session_id')
+        if bootstrap and not self._bootstrap_active and target!=bootstrap and target in self.handles:
+            if schema=='envelope' and type(value.get('vendor_session_id')) is str:
+                # A historical envelope is not proof of a current lease. The
+                # status path below confirms generation and open admission.
+                self.via(['status',target])
+            elif verb=='status' and value.get('vendor_identity_verified') is True \
+                    and value.get('admission')=='open' and value.get('state') in {'idle','running'} \
+                    and type(value.get('vendor_session_id')) is str:
+                self._bootstrap_session=None
+                closed=self.via(['close',bootstrap])
+                if closed.get('state')!='closed': raise Blocked('bootstrap lease handoff failed')
         return value
 
-    def _host_record(self):
+    def _host_record(self,*,allow_absent=False):
         path=self.state/'store.sqlite3'
         try:
             with sqlite3.connect(f'file:{path}?mode=ro',uri=True,timeout=1) as connection:
@@ -566,17 +607,28 @@ class Driver:
         except (sqlite3.Error,OSError) as error:
             raise Blocked('owned Host launch record unavailable') from error
         rows=[row for row in rows if row[1] and row[2] is not None and row[3]]
+        if allow_absent and not rows: return None
         if len(rows)!=1: raise Blocked('owned Host generation ambiguous')
         generation,pid,ticks,vendor_pid,phase,server_id=rows[0]
         return {'generation':generation,'anchor':safety.Identity(pid,ticks),
                 'vendor_pid':vendor_pid,'phase':phase,'server_id':server_id}
 
     def ensure_vendor(self):
-        """Acquire through VIA models, then authenticate exactly the Host-recorded child."""
+        """Acquire through one held mock turn, then authenticate the Host child (§13)."""
         if not self.daemon: raise Blocked('owned daemon required')
         if self._http and self.vendor_identity and self.proc.alive(self.vendor_identity) is True:
             return
-        self.via(['models','--harness','opencode'])
+        if self._bootstrap_active: raise Blocked('recursive bootstrap acquisition')
+        record=self._host_record(allow_absent=True)
+        if record is not None:
+            row=self.proc.stat(record['vendor_pid'])
+            if row is not None and self.proc.alive(safety.Identity(row['pid'],row['start_ticks'])) is True:
+                self._observe_vendor()
+                return
+        self._bootstrap_vendor()
+
+    def _observe_vendor(self):
+        """Authenticate pid/start ticks, owned listener and §2 handshake before use."""
         record=self._host_record(); self.proc.verify(record['anchor'])
         row=self.proc.stat(record['vendor_pid'])
         if row is None or row['ppid']!=record['anchor'].pid:
@@ -585,7 +637,8 @@ class Driver:
         previous=self.vendor_identity
         password=self.vault.read_once(self.proc,identity)
         origin=self.proc.listener(identity)
-        self._http=safety.OwnedHTTP(origin,identity,self.proc,password)
+        self._http=safety.OwnedHTTP(origin,identity,self.proc,password,
+                                    deadline=self._bootstrap_deadline if self._bootstrap_active else None)
         status,raw=self._http.request('GET','/api/info')
         value=self._json(raw)
         _typed(value,{'pid':I,'version':S},'vendor info')
@@ -600,6 +653,142 @@ class Driver:
                                     'password_changed':rotated,'password_written':False})
         if self._event_generation!=identity:
             self.start_event_capture(); self._event_generation=identity
+
+    def _bootstrap_static(self,config):
+        """Check the credential-free namespace, private environment and mock selectors (§13)."""
+        allowed={*safety.PRIVATE_PARTS,'PATH','LANG','VIA_STATE_DIR','VIA_RUNTIME_DIR'}
+        if self.phase_kind=='failpoints': allowed|={'VIA_FAILPOINT_DIR','VIA_FAILPOINT_TOKEN'}
+        if set(self.env)!=allowed or set(self.namespace_env)!=set(safety.PRIVATE_PARTS):
+            raise Blocked('bootstrap environment allow-list failed')
+        safety.validate_path(self.env['PATH'],self.helpers)
+        for key in safety.PRIVATE_PARTS:
+            via_root=Path(self.env[key])
+            owner=self.ownership.classify(via_root)
+            if owner is None or owner.kind!='via-owned' or via_root.is_symlink() or not via_root.is_dir():
+                raise Blocked('bootstrap daemon environment is not private')
+            root=Path(self.namespace_env[key])
+            if not root.is_relative_to(self.namespace) or root.is_symlink() or not root.is_dir():
+                raise Blocked('bootstrap namespace environment is not private')
+        if config.get('model')!=safety.MOCK_IDENTITY or set(config.get('providers',{}))!={'oclive-mock'}:
+            raise Blocked('bootstrap frozen mock model missing')
+        row=config['providers']['oclive-mock']
+        if set(config)!={'providers','model','agents'} \
+                or set(row)!={'name','package','env','settings','models'} \
+                or row.get('env')!=[] or row.get('package')!='@ai-sdk/openai-compatible' \
+                or set(row.get('settings',{}))!={'baseURL','apiKey'} \
+                or row['settings']['apiKey']!='fixture-unused' \
+                or set(row.get('models',{}))!={'fixture-free'} \
+                or row['models']['fixture-free'].get('cost')!={'input':0,'output':0,'cache':{'read':0,'write':0}}:
+            raise Blocked('bootstrap provider credential-free shape failed')
+        required={'via','title','summary','compaction','explore','general','build','plan'}
+        agents=config.get('agents',{})
+        if set(agents)!=required or any(row!={'model':safety.MOCK_IDENTITY} for row in agents.values()):
+            raise Blocked('bootstrap auxiliary model selectors are not frozen')
+        endpoints=self._validate_provider_config(config)
+        path=self.namespace/'opencode.json'
+        if path.is_symlink() or not path.is_file() or path.stat().st_size>OBSERVATION_BYTES \
+                or self._json(path.read_bytes())!=config:
+            raise Blocked('bootstrap namespace configuration drift')
+        self._admit_model(safety.MOCK_IDENTITY)
+        return endpoints
+
+    def _bootstrap_vendor(self):
+        """Labelled mock-only acquisition; failed proof cancels without releasing (§13)."""
+        from opencode_cases import ResponseHold, EvidenceUnavailable
+        deadline=min(time.monotonic()+BOOTSTRAP_SECONDS,self.phase_deadline or float('inf'))
+        hold=ResponseHold(deadline)
+        saved=(self.project,self.provider_endpoints,self.last_model,self.last_request)
+        receipt=None; provider=None; checked=False; cancelled=False; cleanup_failed=False
+        requests_before=0
+        self._bootstrap_count+=1
+        name='bootstrap-'+str(self._bootstrap_count)
+        try:
+            cached=self._namespace_bootstraps.get(self.namespace)
+            # The sentinel may intentionally replace the namespace project
+            # config. Reuse that registered fixture's provider; bootstrap
+            # bookkeeping must never mask the case's effective configuration.
+            namespace_fixture=next((row for row in self.fixtures.values()
+                                    if row['path']==self.namespace),None)
+            if namespace_fixture is not None:
+                config=namespace_fixture['config']
+                endpoints=self._validate_provider_config(config)
+                matches=[value for value in self.mock_providers.values()
+                         if value.endpoint==endpoints.get('oclive-mock')]
+                if len(matches)!=1: raise Blocked('bootstrap namespace mock provider ambiguous')
+                cached=(config,matches[0])
+                self._namespace_bootstraps[self.namespace]=cached
+            if cached is None:
+                config=self._materialize_fixture(name,self.namespace,{'provider':'mock','response_hold':hold})
+                provider=self.mock_providers[name]
+                fd=os.open(self.namespace/'opencode.json',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+                with os.fdopen(fd,'w') as output: json.dump(config,output,allow_nan=False)
+                self._namespace_bootstraps[self.namespace]=(config,provider)
+            else:
+                config,provider=cached
+                provider.response_hold=hold
+                requests_before=provider.requests
+            self.project=self.namespace
+            self._bootstrap_config=config
+            self.provider_endpoints=self._bootstrap_static(config)
+            command=['spawn','--harness','opencode','--model',safety.MOCK_IDENTITY,
+                     '--cwd',str(self.namespace),'--bound','full','--network','--background',
+                     '--label','qualification-bootstrap-mock-only','--prompt','Reply BOOTSTRAP.']
+            self.last_model=safety.MOCK_IDENTITY
+            self._bootstrap_command=command; self._bootstrap_active=True
+            self._bootstrap_deadline=deadline
+            receipt=self.via(command)
+            if receipt.get('exit_code'): raise Blocked('bootstrap spawn refused')
+            while True:
+                if self.signals: self.signals.guard()
+                if time.monotonic()>=deadline: raise Blocked('bootstrap owned-server deadline')
+                try: self._host_record(); break
+                except Blocked: time.sleep(.02)
+            self._observe_vendor()
+            self.spending_check(args=command)
+            # The session's frozen identity is served evidence too; the request
+            # alone is insufficient. Status is bounded and carries no raw text.
+            while True:
+                if self.signals: self.signals.guard()
+                if time.monotonic()>=deadline: raise Blocked('bootstrap session readiness deadline')
+                status=self.via(['status',receipt['session_id']])
+                sid=status.get('vendor_session_id')
+                if status.get('vendor_identity_verified') is True and type(sid) is str: break
+                time.sleep(.02)
+            self.spending_check(path='/api/session/'+urllib.parse.quote(sid,safe='')+'/prompt')
+            if self.last_model!=safety.MOCK_IDENTITY: raise Blocked('bootstrap served model is not mock')
+            if provider.admission_blocked or self.guard.stopped: raise Blocked('bootstrap mock admission failed')
+            checked=True
+            try: hold.release()
+            except EvidenceUnavailable as error:
+                raise Blocked('bootstrap response hold expired or aborted') from error
+            self._bootstrap_deadline=None; self._http.deadline=None
+            envelope=self.via(['wait',receipt['turn'],'--timeout-ms',str(BOOTSTRAP_WAIT_MS)])
+            if envelope.get('state')!='completed': raise Blocked('bootstrap mock turn did not complete')
+            if provider.requests<=requests_before or not provider.model_matches:
+                raise Blocked('bootstrap mock request unobserved')
+            self._bootstrap_session=receipt['session_id']
+        except BaseException:
+            hold.abort()
+            if receipt and type(receipt.get('session_id')) is str and type(receipt.get('turn')) is str:
+                self._bootstrap_cleanup=True
+                try:
+                    reply=self.via(['cancel',receipt['session_id'],'--turn',receipt['turn'].rsplit('/',1)[1]])
+                    cancelled=not reply.get('exit_code')
+                except BaseException:
+                    cleanup_failed=True
+                finally: self._bootstrap_cleanup=False
+            raise
+        finally:
+            self._bootstrap_command=None; self._bootstrap_active=False
+            self._bootstrap_deadline=None
+            if self._http is not None: self._http.deadline=None
+            self._bootstrap_config=None
+            self.project,self.provider_endpoints,self.last_model,self.last_request=saved
+            self._record('bootstrap',{'label':'qualification-bootstrap-mock-only','charged':'mock-only',
+                'gate':False,'static_checks':receipt is not None,'served_checks':checked,
+                'response_released':hold.released,'response_aborted':hold.aborted,
+                'cancel_requested':cancelled,'cleanup_failed':cleanup_failed,
+                'public_requests':0,'mock_requests':0 if provider is None else provider.requests-requests_before})
 
     @staticmethod
     def _json(raw):
@@ -704,7 +893,9 @@ class Driver:
         catalog=self._catalog()
         # Effective project config is constructed before start and immutable during turns.
         row=next((row for row in self.fixtures.values() if row['path']==self.project),None)
-        endpoints={} if row is None else self._validate_provider_config(row['config'])
+        config=None if row is None else row['config']
+        if self._bootstrap_active: config=self._bootstrap_config
+        endpoints={} if config is None else self._validate_provider_config(config)
         if endpoints!=self.provider_endpoints:
             raise Blocked('project provider configuration drift')
         bindings=self._auxiliary_bindings(identity)
@@ -1626,6 +1817,8 @@ class Driver:
     def stop(self):
         """Stop all observed owned generations, then prove locks and identities absent."""
         if self.journal.path.exists(): self.journal.recover()
+        for provider in self.mock_providers.values():
+            if provider.response_hold is not None: provider.response_hold.abort()
         self._publication_release.set()
         for name,occurrence in sorted(self._armed_history):
             directory=Path(self.env['VIA_FAILPOINT_DIR'])
@@ -1660,6 +1853,7 @@ class Driver:
         self.stop_result={'complete':True,'proven':True,'processes_gone':True,'locks_free':True,'pgrep_clear':True}
         self._record('daemon-stop',self.stop_result)
         self.daemon=None; self.anchor=None; self._http=None
+        self._bootstrap_session=None
         self._armed={}; self._armed_history=set(); self._seam_targets={}; self._event_generation=None
         if self.runtime.parent==Path('/tmp') and self.runtime.name.startswith('via-ocl.'):
             shutil.rmtree(self.runtime)
@@ -1672,7 +1866,7 @@ class Driver:
         config={key:value for key,value in description.items() if key in
                 {'providers','model','agents','permissions','lsp','mcp','plugins','instructions','compaction'}}
         descriptors={'provider','response','hostile_keys','context','helper','separate_group','fake_lsp',
-                     'subagent','subagent_permission','skills','instructions','large_fields','script','mcp','plugin','hook','cache_read','cache_write','script_after_setup'}
+                     'subagent','subagent_permission','skills','instructions','large_fields','script','mcp','plugin','hook','cache_read','cache_write','script_after_setup','response_hold'}
         unknown=set(description)-set(config)-descriptors
         if unknown: raise Blocked('unknown fixture configuration descriptor')
         public_free=name=='public-free' or description.get('provider')=='public-free'
@@ -1688,7 +1882,7 @@ class Driver:
                      'ancestor_skills':'VIA_ANCESTOR_SKILL_SENTINEL'}
             provider=LoopbackProvider(mode=description.get('response','normal'),markers=markers,
                                       script=description.get('script',[]),cache_read=description.get('cache_read',7),
-                                      cache_write=description.get('cache_write',3))
+                                      cache_write=description.get('cache_write',3),response_hold=description.get('response_hold'))
             if description.get('large_fields'):
                 provider.text=('VIA escape "\\\\\\n\\t雪 '*4096)
             provider.admit_request=self._mock_request_admit
@@ -2591,22 +2785,33 @@ print('VIA HELPER DONE')
     def _credential_refusal(self):
         self.start('release',self.namespace)
         before=self._anchor_rows()
-        # Metadata acquisition alone exercises the handshake credential fence; no prompt.
-        result=self.via(['models','--harness','opencode'])
-        if 'cli_error' in result:
-            error=result['cli_error']['error']; data=error.get('data')
-            code=data.get('kind2') if type(data) is dict else None
-        else:
-            rows=result.get('models')
-            if type(rows) is not list: raise Blocked('credential refusal result missing')
-            refused=[row for row in rows if 'unexpected_credential_state' in json.dumps(row)]
-            if not refused: raise Blocked('credential refusal not observable')
-            code='unexpected_credential_state'
-        if code!='unexpected_credential_state': raise Blocked('known credentials not refused')
-        # A second metadata acquisition must make a fresh attempt (transient refusal, not cache).
-        after=self._anchor_rows(); self.via(['models','--harness','opencode']); twice=self._anchor_rows()
-        if len(twice)<=len(after) or len(after)<=len(before): raise Blocked('credential refusal caching proof unavailable')
-        return {'code':code,'cached':False,'session_creates':0,'prompt_submits':0,'credential_gets':0}
+        # C1 §3.13 models only lists. A spawn runs §4.3's credential
+        # handshake; the deliberately unoffered effort is a second, pre-native
+        # refusal fence should the known-credential check unexpectedly admit.
+        command=['spawn','--harness','opencode','--model',safety.MOCK_IDENTITY,
+                 '--cwd',str(self.namespace),'--bound','full','--network',
+                 '--effort',METADATA_EFFORT,'--background','--prompt','VIA FENCE ONLY','--json']
+        def attempt():
+            self._metadata_command=command; self._metadata_active=True
+            try:
+                receipt=self.via(command)
+                if 'cli_error' in receipt: raise Blocked('credential acquisition refused before dispatch')
+                result=self.via(['wait',receipt['turn'],'--timeout-ms','30000'])
+                failure=result.get('failure') or {}
+                # The fixed step is authored by VIA, not the vendor. Keep only
+                # its Boolean match; never write the returned message.
+                if result['state']!='failed' or failure.get('class')!='submit_failed' \
+                        or (failure.get('data') or {}).get('reason')!='launch_failed' \
+                        or 'check credential state' not in failure.get('message','') \
+                        or result['vendor_session_id'] is not None:
+                    raise Blocked('known credentials not refused')
+            finally:
+                self._metadata_command=None; self._metadata_active=False
+        attempt(); after=self._anchor_rows(); attempt(); twice=self._anchor_rows()
+        if len(twice)<=len(after) or len(after)<=len(before):
+            raise Blocked('credential refusal caching proof unavailable')
+        return {'code':'unexpected_credential_state','cached':False,'via_sessions_created':2,
+                'session_creates':0,'prompt_submits':0,'credential_gets':0}
 
     def _near_limit_inbox(self,args):
         """Park bounded synthetic queue data against a real VIA receipt/claim (§9 OC05)."""
@@ -2721,6 +2926,8 @@ print('VIA HELPER DONE')
 
     def _mock_request_admit(self,model):
         """Count every local provider request, including title/child/compaction calls."""
+        if self._metadata_active:
+            self.guard.stopped=True; raise Blocked('model request during metadata acquisition')
         if model!='fixture-free':
             self.guard.stopped=True; raise Blocked('paid or unexpected auxiliary mock identity')
         if self.signals: self.signals.guard()

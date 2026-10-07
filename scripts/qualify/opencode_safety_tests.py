@@ -35,6 +35,18 @@ def fake_stat(pid=71, ticks=123, state="S"):
 
 
 class SafetyTests(unittest.TestCase):
+    def test_owned_metadata_requests_share_the_bootstrap_absolute_deadline(self):
+        client=safety.OwnedHTTP('http://127.0.0.1:1234',self.identity,self.proc,b'synthetic-password')
+        limit=time.monotonic()+1
+        client.deadline=limit
+        with mock.patch.object(safety,'_bounded_response',return_value=(200,None,b'{}')) as transport:
+            client.request('GET','/api/info')
+            self.assertLessEqual(transport.call_args.kwargs['deadline'],limit)
+        client.deadline=time.monotonic()-1
+        with mock.patch.object(safety,'_bounded_response') as transport:
+            self.assertBlocked(lambda:client.request('GET','/api/info'),'owned API absolute deadline exhausted')
+            transport.assert_not_called()
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="via-oc-safety-")
         self.root = Path(self.temp.name)

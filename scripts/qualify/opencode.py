@@ -47,13 +47,15 @@ FAKE_GATES = ("fmt", "clippy", "clippy-failpoints", "nextest-default", "nextest-
 VERSION = "2.0.22"
 E7_SHA256 = "540fdf565da27de9df69b6c3864582344e74ac4ffa225c283b289481d215d241"
 TEST_MODULES = ("opencode_safety_tests", "opencode_cases_tests", "opencode_driver_tests",
-                "opencode_barrier_tests", "opencode_runtime_tests", "opencode_tests", "opencode_ownership_tests")
+                "opencode_barrier_tests", "opencode_runtime_tests", "opencode_tests", "opencode_ownership_tests", "opencode_via_tests")
 _ACQUISITION_ROOT = None
 
 
 def self_test():
-    """Run fake/mock/synthetic-proc checks only; return failures and actual count."""
+    """Run offline checks, including the optional real-VIA/scripted-fake audit (§13)."""
     suite = unittest.TestSuite()
+    audit = importlib.import_module('opencode_via_tests')
+    audit.CLEANUP_PROOFS.clear()
     for name in TEST_MODULES:
         suite.addTests(unittest.defaultTestLoader.loadTestsFromModule(importlib.import_module(name)))
     # Failure tracebacks can contain arbitrary evidence. Only test identities
@@ -61,8 +63,17 @@ def self_test():
     result = unittest.TestResult()
     suite.run(result)
     failed = [test.id() for test, _trace in result.failures + result.errors]
-    failed.extend(test.id() for test, _reason in result.skipped)
+    self_test.skipped = [{'test': test.id(), 'reason': reason}
+                         for test, reason in result.skipped
+                         if test.id().startswith('opencode_via_tests.RealViaTests.')]
+    failed.extend(test.id() for test, _reason in result.skipped
+                  if not test.id().startswith('opencode_via_tests.RealViaTests.'))
+    self_test.real_via_cleanup = list(audit.CLEANUP_PROOFS)
     return failed, result.testsRun
+
+
+self_test.real_via_cleanup = []
+self_test.skipped = []
 
 
 def arguments(argv=None):
@@ -296,11 +307,20 @@ def summary_verdict(records, phases, cleanup, interrupted):
     for live, (disposition, case, _limit) in cases.L_DISPOSITIONS.items():
         if disposition == "deferred-with-reason" and live != "L10":
             deferred[live] = recorded.get(case, {}).get("reason", case + ": no reviewed bounded trigger")
-    return {"result": "pass" if passed else "not_passed", "coverage_complete": complete,
+    blocked = any(row.get('result') == 'blocked' for row in records)
+    return {"result": "blocked" if blocked else "pass" if passed else "not_passed", "coverage_complete": complete,
             "all_phases_selected": all_phases, "daemons_stopped": proven_stop,
             "gate_count": len(gates), "gate_passed": sum(row["result"] == "pass" for row in gates),
             "record_only_count": sum(row["disposition"] == "record-only" for row in records),
             "deferred": deferred, "deferred_count": len(deferred)}
+
+
+def runner_source_manifest():
+    """Record the exact Python runner and self-test sources admitted for this run (§13)."""
+    files = {path.relative_to(REPO).as_posix(): safety.sha256(path)
+             for path in sorted(Path(__file__).parent.glob('opencode*.py'))}
+    digest = hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()
+    return {'sha256': digest, 'files': files}
 
 
 def main(argv=None):
@@ -308,7 +328,9 @@ def main(argv=None):
     if args.self_test:
         failures, count = self_test()
         print(json.dumps({"self_test": "pass" if not failures else "fail", "tests": count,
-                          "failures": failures}, sort_keys=True))
+                          "failures": failures, "skipped": self_test.skipped,
+                          "executed": count-len(self_test.skipped),
+                          "real_via_cleanup": self_test.real_via_cleanup}, sort_keys=True))
         return bool(failures)
     ownership = OwnershipRegistry(args.evidence)
     # Validate existing ancestors; never chmod/recreate somebody else's directory.
@@ -322,12 +344,38 @@ def main(argv=None):
             safety.private_directory(root)
     vault = safety.PasswordVault()
     records, cleanup, driver = [], {}, None
+    current_phase, phase_rows = 'setup', []
     phases = selected_phases(args.phase)
     info = {"runner": "scripts/qualify/opencode.py", "vendor_version": VERSION,
             "started_at": time.time(), "phases": phases, "oc_rows": cases.OC_DISPOSITIONS,
-            "live_rows": cases.L_DISPOSITIONS, "openapi_e7_sha256": E7_SHA256}
+            "live_rows": cases.L_DISPOSITIONS, "openapi_e7_sha256": E7_SHA256,
+            "blocks": []}
+
+    def retain_block(error, stage):
+        block = safety.blocking_record(error, stage=stage, vault=vault,
+                                       secret_forms=getattr(driver, 'secret_forms', ()))
+        if block['phase'] is None:
+            block['phase'] = current_phase
+        info['blocks'].append(block)
+        name = 'summary-blocks' if block['phase'] == 'summary' else block['phase']
+        rows = list(phase_rows) if name == current_phase else []
+        rows.append({'case': block['case'], 'phase': name, 'result': 'blocked',
+                     'reason': block['reason'], 'blocking': block})
+        try:
+            persist_phase(args.evidence, name, rows, vault,
+                          getattr(driver, 'secret_forms', ()), ownership)
+        except BaseException as publication_error:
+            # A failed evidence sink must not hide the initiating safety stop.
+            info['blocks'].append(safety.blocking_record(
+                publication_error, stage='evidence', vault=vault,
+                secret_forms=getattr(driver, 'secret_forms', ())))
+        return block
+
     with safety.DeferredSignals() as signals:
         try:
+            info['runner_source'] = runner_source_manifest()
+            ownership.register(args.evidence / 'runner-manifest.json', 'runner-evidence', directory=False)
+            protected_write(vault, args.evidence / 'runner-manifest.json', info['runner_source'])
             failures, count = self_test()
             info["self_tests"] = count
             if failures:
@@ -347,21 +395,25 @@ def main(argv=None):
             # journal (N6). Its private root is fixed within this worktree.
             driver.journal = safety.StopJournal(
                 private_recovery_root() / "stopped-daemon.json", driver.proc)
-            driver.prepare()
+            with safety.block_context(phase='prepare'):
+                driver.prepare()
             adapter = cases.DriverAdapter(driver)
             for phase in phases:
+                current_phase, phase_rows = phase, []
                 signals.guard()
                 accepted = 0
                 def retain_phase(rows):
-                    nonlocal accepted
+                    nonlocal accepted, phase_rows
                     persist_phase(args.evidence, phase, rows, vault,
                                   getattr(driver, "secret_forms", ()), ownership)
                     # Only published, scanned records can reach the final sink.
                     records.extend(rows[accepted:])
                     accepted = len(rows)
+                    phase_rows = list(rows)
                 phase_records = cases.run_phase(adapter, phase, record_sink=retain_phase)
                 if accepted != len(phase_records):
                     retain_phase(phase_records)
+                info['blocks'].extend(row['blocking'] for row in phase_records if 'blocking' in row)
                 if any(row["disposition"] == "gate" and row["result"] != "pass"
                        for row in phase_records):
                     break
@@ -369,6 +421,7 @@ def main(argv=None):
         except BaseException as error:
             # No arbitrary exception string can leak a password, handle or raw response.
             info["runner_error"] = type(error).__name__
+            retain_block(error, 'runner')
         finally:
             info["failure_order"] = [{"stage": "case", "case": row["case"], "result": row["result"]}
                                      for row in records if row["disposition"] == "gate"
@@ -377,10 +430,12 @@ def main(argv=None):
                 info["failure_order"].append({"stage": "runner", "kind": info["runner_error"]})
             if driver is not None:
                 try:
-                    cleanup = driver.finish()
+                    with safety.block_context(phase='cleanup', case=None, verb=None):
+                        cleanup = driver.finish()
                 except BaseException as error:
                     info["cleanup_error"] = type(error).__name__
                     info["failure_order"].append({"stage": "cleanup", "kind": info["cleanup_error"]})
+                    retain_block(error, 'cleanup')
                 try:
                     # Qualification cannot outlive the source/build evidence
                     # admitted before acquisition and the first daemon start.
@@ -390,6 +445,15 @@ def main(argv=None):
                 except BaseException as error:
                     info["proof_error"] = type(error).__name__
                     info["failure_order"].append({"stage": "proof", "kind": info["proof_error"]})
+                    with safety.block_context(phase='proof', case=None, verb=None):
+                        retain_block(error, 'proof')
+            try:
+                with safety.block_context(phase='proof', case=None, verb=None):
+                    if 'runner_source' in info and runner_source_manifest() != info['runner_source']:
+                        raise safety.Blocked('runner source changed during qualification')
+            except BaseException as error:
+                info['proof_error'] = type(error).__name__
+                retain_block(error, 'proof')
             info.update(summary_verdict(records, phases, cleanup, bool(signals.interrupted)))
             if any(key in info for key in ("runner_error", "cleanup_error", "proof_error")) \
                     or signals.interrupted:
@@ -399,9 +463,17 @@ def main(argv=None):
                 ownership.register(args.evidence / "summary.json", "runner-evidence", directory=False)
                 protected_write(vault, args.evidence / "summary.json", info,
                                 getattr(driver, "secret_forms", ()))
-            except safety.Blocked:
+            except safety.Blocked as error:
                 info["result"] = "blocked"
                 info["summary_rejected"] = True
+                with safety.block_context(phase='summary', case=None, verb=None):
+                    retain_block(error, 'evidence')
+                # If a returned cleanup object was unsafe, retain only fixed diagnostics.
+                fallback = {key: info[key] for key in ('result', 'gate_count', 'gate_passed',
+                                                      'blocks', 'runner_source', 'summary_rejected')
+                            if key in info}
+                protected_write(vault, args.evidence / 'summary.json', fallback,
+                                getattr(driver, 'secret_forms', ()))
             finally:
                 if driver is not None and hasattr(driver, "clear_sensitive"):
                     driver.clear_sensitive()

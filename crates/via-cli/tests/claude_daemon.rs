@@ -344,15 +344,19 @@ impl Deployment {
     /// One successful CLI call's JSON output.
     fn ok(&self, evidence: &Evidence, name: &str, args: &[&str]) -> Result<Value, ScenarioError> {
         let capture = self.run(evidence, name, args)?;
-        check(capture.status.success(), || {
-            format!(
-                "via {args:?} exited {}: {}{}",
-                capture.status,
-                String::from_utf8_lossy(&capture.stderr),
-                capture.notes()
-            )
-        })?;
-        serde_json::from_slice(&capture.stdout).map_err(infra)
+        let decoded = serde_json::from_slice::<Value>(&capture.stdout);
+        check(
+            daemon::cli_exit_matches(args, capture.status, decoded.as_ref().ok()),
+            || {
+                format!(
+                    "via {args:?} exited {}: {}{}",
+                    capture.status,
+                    String::from_utf8_lossy(&capture.stderr),
+                    capture.notes()
+                )
+            },
+        )?;
+        decoded.map_err(infra)
     }
 
     /// One CLI call refused with request error `kind`: the error object.

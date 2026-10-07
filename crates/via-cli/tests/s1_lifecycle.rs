@@ -321,7 +321,21 @@ impl Sandbox {
     /// One successful CLI call's JSON output.
     fn ok(&self, args: &[&str]) -> TestResult<Value> {
         let captured = self.run(args)?;
-        if !captured.status.success() {
+        let decoded = serde_json::from_slice::<Value>(&captured.stdout);
+        let exit_valid = if args.first() == Some(&"wait") {
+            match decoded
+                .as_ref()
+                .ok()
+                .and_then(|value| value["state"].as_str())
+            {
+                Some("completed") => captured.status.success(),
+                Some("failed" | "cancelled" | "unknown") => captured.status.code() == Some(3),
+                _ => false,
+            }
+        } else {
+            captured.status.success()
+        };
+        if !exit_valid {
             return Err(format!(
                 "via {args:?} exited {}: {}",
                 captured.status,
@@ -329,7 +343,7 @@ impl Sandbox {
             )
             .into());
         }
-        Ok(serde_json::from_slice(&captured.stdout)?)
+        Ok(decoded?)
     }
 
     #[cfg(feature = "test-failpoints")]

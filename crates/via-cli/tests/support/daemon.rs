@@ -7,7 +7,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -403,7 +403,20 @@ pub(crate) fn collect_available(
     }
 }
 
-/// Runs one successful CLI call and records its output as evidence.
+/// Checks a decoded reply's CLI exit against C1 §1, including terminal wait.
+pub(crate) fn cli_exit_matches(args: &[&str], status: ExitStatus, reply: Option<&Value>) -> bool {
+    if args.first() == Some(&"wait") {
+        match reply.and_then(|value| value["state"].as_str()) {
+            Some("completed") => status.success(),
+            Some("failed" | "cancelled" | "unknown") => status.code() == Some(3),
+            _ => false,
+        }
+    } else {
+        status.success()
+    }
+}
+
+/// Records a successful CLI reply, including C1 §1's terminal `wait` exit 3.
 pub(crate) fn cli(
     sandbox: &Sandbox,
     evidence: &Evidence,
@@ -421,7 +434,9 @@ pub(crate) fn cli(
             note(written.as_ref().err())
         )));
     }
-    if !capture.status.success() {
+    let decoded = serde_json::from_slice::<Value>(&capture.stdout);
+    let exit_valid = cli_exit_matches(args, capture.status, decoded.as_ref().ok());
+    if !exit_valid {
         return Err(failure(format!(
             "via {args:?} exited {}: {}{}",
             capture.status,
@@ -430,7 +445,7 @@ pub(crate) fn cli(
         )));
     }
     written?;
-    serde_json::from_slice(&capture.stdout).map_err(infra)
+    decoded.map_err(infra)
 }
 
 /// Runs one CLI call that must be refused with request error `kind`; returns

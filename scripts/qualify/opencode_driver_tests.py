@@ -15,6 +15,88 @@ from opencode_driver import Driver, strict_reply, read_pages, bounded_command, i
 
 
 class DriverTests(unittest.TestCase):
+    def test_bootstrap_cli_cannot_reset_the_absolute_deadline(self):
+        with tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
+            d=Driver('release','fp','pin',Path(root)/'evidence',initialize=False)
+            d._binary=Path('fake-via'); d._bootstrap_active=True
+            d._bootstrap_deadline=time.monotonic()-1
+            d.execute=mock.Mock(return_value=(0,b'{"models":[]}',b''))
+            with self.assertRaisesRegex(Blocked,'bootstrap CLI deadline'):
+                d.via(['models','--harness','opencode'])
+            d.execute.assert_not_called()
+
+    def test_bootstrap_lease_handoff_requires_a_current_open_successor(self):
+        for current in (False,True):
+            with self.subTest(current=current), tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
+                d=Driver('release','fp','pin',Path(root)/'evidence',initialize=False)
+                d._binary=Path('fake-via'); d._bootstrap_session='s_bootstrap'
+                d.handles={'s_bootstrap':'test-boot-handle','s_other':'test-other-handle'}
+                envelope={'session_id':'s_other','vendor_session_id':'ses_old','state':'completed'}
+                status={'session_id':'s_other','vendor_session_id':'ses_old',
+                        'vendor_identity_verified':current,'admission':'open' if current else 'closed',
+                        'state':'idle' if current else 'closed'}
+                calls=[]
+                def execute(argv,**kwargs):
+                    calls.append(argv[1])
+                    reply={'wait':envelope,'status':status,'close':{'state':'closed'}}[argv[1]]
+                    return 0,json.dumps(reply).encode(),b''
+                d.execute=execute; d.account=mock.Mock(); d._record=mock.Mock()
+                # This unit exercises handoff, not the schema already covered
+                # by the real CLI audit. No fake response substitutes live proof.
+                with mock.patch('opencode_driver.strict_reply',side_effect=lambda raw,_schema:json.loads(raw)):
+                    d.via(['wait','s_other/1','--timeout-ms','0'])
+                self.assertEqual('close' in calls,current)
+                self.assertEqual(d._bootstrap_session,None if current else 's_bootstrap')
+
+    def test_existing_owned_server_is_observed_without_another_bootstrap(self):
+        with tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
+            d=Driver('release','fp','pin',Path(root)/'evidence',initialize=False)
+            d.daemon=Identity(10,1); d.proc=mock.Mock()
+            d._host_record=mock.Mock(return_value={'vendor_pid':12,'anchor':Identity(11,2)})
+            d.proc.stat.return_value={'pid':12,'start_ticks':3,'ppid':11}
+            d.proc.alive.return_value=True
+            d._observe_vendor=mock.Mock()
+            d._bootstrap_vendor=mock.Mock(side_effect=AssertionError('second bootstrap attempted'))
+            d.ensure_vendor()
+            d._observe_vendor.assert_called_once_with()
+            d._bootstrap_vendor.assert_not_called()
+
+    def test_bootstrap_static_checks_precede_any_via_spawn(self):
+        for changed,reason in (('environment','environment allow-list'),
+                               ('model','frozen mock model'),
+                               ('credential','credential-free shape'),
+                               ('endpoint','owned loopback mock'),
+                               ('disk','configuration drift')):
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
+                d=Driver('release','fp','pin',Path(root)/'evidence',initialize=False)
+                d.prepare(); d.phase_kind='release'; d.set_phase_budget(0,32)
+                d._binary=Path('unused'); d.execute=mock.Mock()
+                materialize=d._materialize_fixture
+                def mutated(name,project,description):
+                    config=materialize(name,project,description)
+                    if changed=='environment': d.env['UNEXPECTED_TEST_KEY']='fixture'
+                    if changed=='model': config['model']='paid/fixture'
+                    if changed=='credential': config['providers']['oclive-mock']['env']=['FAKE_CREDENTIAL']
+                    if changed=='endpoint': config['providers']['oclive-mock']['settings']['baseURL']='http://127.0.0.1:1/v1'
+                    return config
+                original=d._bootstrap_static
+                def drift(config):
+                    if changed=='disk': (d.namespace/'opencode.json').write_text('{}')
+                    return original(config)
+                try:
+                    with mock.patch.object(d,'_materialize_fixture',side_effect=mutated), \
+                         mock.patch.object(d,'_bootstrap_static',side_effect=drift):
+                        with self.assertRaisesRegex(Blocked,reason): d._bootstrap_vendor()
+                    d.execute.assert_not_called()
+                    provider=d.mock_providers['bootstrap-1']
+                    self.assertFalse(provider.response_hold.released)
+                    self.assertTrue(provider.response_hold.aborted)
+                    self.assertEqual(d.phase_mock_left,32)
+                    self.assertEqual(d.phase_public_left,0)
+                finally:
+                    for provider in d.mock_providers.values(): provider.__exit__(None,None,None)
+                    if d.runtime.parent==Path('/tmp'): __import__('shutil').rmtree(d.runtime)
+
     def test_hostile_fixture_covers_variant_endpoint_and_permission_slots(self):
         with tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
             root=Path(root); d=Driver('release','fp','pin',root/'evidence',initialize=False)
@@ -70,6 +152,16 @@ class DriverTests(unittest.TestCase):
             with self.subTest(raw=raw), self.assertRaises(Blocked):
                 strict_reply(raw, 'daemon status')
         self.assertEqual(strict_reply(b'{"pid":4}', 'daemon status'), {'pid':4})
+
+    def test_cli_error_schema_is_the_bare_c1_stderr_object(self):
+        """C1 §1 CLI stderr removes the JSON-RPC error wrapper."""
+        value={'code':-32602,'message':'refused',
+               'data':{'kind':'invalid_params','field':'max_steps'}}
+        self.assertEqual(strict_reply(json.dumps(value).encode(),'error'),value)
+        for malformed in ({'error':value},{**value,'code':True},
+                          {'code':-32602,'message':'refused','data':{}}):
+            with self.subTest(malformed=malformed), self.assertRaises(Blocked):
+                strict_reply(json.dumps(malformed).encode(),'error')
 
     def test_pagination_missing_cursor_never_passes(self):
         for page in ({'events':[], 'more':True, 'next_after':0},
@@ -476,7 +568,7 @@ class DriverTests(unittest.TestCase):
                     return 0,json.dumps({'harness':'opencode','capabilities':{'params':{
                         'max_steps':{'support':'unsupported'}}}}).encode(),b''
                 if argv[1]=='spawn' and '--max-steps' in argv:
-                    return 2,b'',b'{"error":{"code":-32602,"message":"refused","data":{"kind":"invalid_params","field":"max_steps"}}}'
+                    return 2,b'',b'{"code":-32602,"message":"refused","data":{"kind":"invalid_params","field":"max_steps"}}'
                 if argv[1]=='spawn':
                     return 0,b'{"session_id":"s_fixture","turn":"s_fixture/1","handle":"h_memory","effective":{"effort":null,"max_steps":null}}',b''
                 if argv[1]=='wait': return 0,json.dumps(envelope).encode(),b''

@@ -17,6 +17,7 @@ import socket
 import threading
 import time
 import urllib.parse
+import opencode_safety as safety
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
@@ -332,13 +333,24 @@ def member(value: Any, key: str, kind: type) -> Any:
 
 def run_case(driver: CaseDriver, name: str, function: Callable, disposition="gate") -> dict:
     case = Case(name, disposition)
+    blocking = None
     try:
-        function(driver, case)
+        with safety.block_context(case=name):
+            function(driver, case)
+    except safety.Blocked as error:
+        actual = getattr(driver, 'driver', None)
+        blocking = safety.blocking_record(error, stage='case',
+                                         vault=getattr(actual, 'vault', None),
+                                         secret_forms=getattr(actual, 'secret_forms', ()))
+        case.result, case.reason = 'blocked', blocking['reason']
     except QualificationFailure as error:
         case.result, case.reason = "fail", str(error)
     except EvidenceUnavailable as error:
         case.result, case.reason = "not_observable", str(error)
-    return case.finish()
+    record = case.finish()
+    if blocking is not None:
+        record['blocking'] = blocking
+    return record
 
 
 def native_events(driver: CaseDriver, session: str) -> list:
@@ -691,6 +703,37 @@ HOSTILE_OUTPUT_PAGES = 64  # Packet §13 L4: bounded output secrecy matrix.
 HOSTILE_OUTPUT_VERBS = ("wait", "status", "events", "models", "describe", "logs")
 
 
+class ResponseHold:
+    """Withhold every bootstrap response until §13 served spending proof succeeds."""
+
+    def __init__(self, deadline):
+        self.deadline = deadline
+        self.released = self.aborted = False
+        self._condition = threading.Condition()
+
+    def release(self):
+        with self._condition:
+            if self.aborted or time.monotonic() >= self.deadline:
+                raise EvidenceUnavailable("bootstrap response hold expired or aborted")
+            self.released = True
+            self._condition.notify_all()
+
+    def abort(self):
+        with self._condition:
+            self.aborted = True
+            self._condition.notify_all()
+
+    def wait(self):
+        with self._condition:
+            while not self.released and not self.aborted:
+                remaining = self.deadline - time.monotonic()
+                if remaining <= 0:
+                    self.aborted = True
+                    break
+                self._condition.wait(remaining)
+            return self.released and not self.aborted
+
+
 class LoopbackProvider:
     """Nonforwarding OpenAI-compatible fixture provider (packet §13 L4/L7).
 
@@ -708,7 +751,7 @@ class LoopbackProvider:
 
     def __init__(self, mode="normal", model="fixture-free", secret=None,
                  cache_read=7, cache_write=3, text="MOCK READY", script=None, markers=None,
-                 admit_request=None):
+                 admit_request=None, response_hold=None):
         if mode not in {"normal", *HOSTILE_RESPONSES, "rate_limit", "quota", "context"}:
             raise ValueError("unknown mock response mode")
         self.mode, self.model = mode, model
@@ -723,6 +766,7 @@ class LoopbackProvider:
         self.models = set()
         self.admit_request = admit_request
         self.admission_blocked = False
+        self.response_hold = response_hold
         self.received, self.model_matches, self.requests = False, False, 0
         self.server = self.thread = None
         self._lock = threading.Lock()
@@ -855,6 +899,10 @@ class LoopbackProvider:
                                 # No exception string, request, or header reaches
                                 # stderr/evidence. The owner's guard is sticky.
                                 provider.admission_blocked = True
+                                if provider.response_hold is not None:
+                                    provider.response_hold.abort()
+                                    self.close_connection = True
+                                    return
                                 self.reply(403, b'{"error":{"type":"fixture.admission-stop"}}')
                                 return
                     messages = json.dumps(value.get("messages", [])) if type(value) is dict else ""
@@ -964,11 +1012,23 @@ class LoopbackProvider:
                     self.close_connection = True
 
             def reply(self, status, body, content_type="application/json"):
+                if provider.response_hold is not None and not provider.response_hold.wait():
+                    self.close_connection = True
+                    return
+                self.connection.settimeout(provider.CONNECTION_SECONDS)
                 self.send_response(status)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+
+            def send_error(self, code, message=None, explain=None):
+                # Invalid bootstrap requests cannot bypass the response barrier.
+                if provider.response_hold is not None:
+                    provider.response_hold.abort()
+                    self.close_connection = True
+                    return
+                super().send_error(code, message, explain)
 
         self.server = Server(("127.0.0.1", 0), Handler)
         self.server.timeout = 1
@@ -993,6 +1053,8 @@ class LoopbackProvider:
         if self._closing:
             return
         deadline = time.monotonic() + self.STOP_SECONDS
+        if self.response_hold is not None:
+            self.response_hold.abort()
         try:
             with self._lock:
                 self._closing = True
@@ -1632,6 +1694,12 @@ PHASE_CASES = {
 
 
 def run_phase(driver: CaseDriver, phase_name: str, *, record_sink=None) -> list[dict]:
+    """Keep phase context even when a setup/guard block precedes its first case (§13)."""
+    with safety.block_context(phase=phase_name):
+        return _run_phase(driver, phase_name, record_sink=record_sink)
+
+
+def _run_phase(driver: CaseDriver, phase_name: str, *, record_sink=None) -> list[dict]:
     phase = next((row for row in PHASES if row.name == phase_name), None)
     if phase is None:
         raise EvidenceUnavailable("unknown phase")

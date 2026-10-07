@@ -15,6 +15,75 @@ from opencode_safety import Blocked
 
 
 class EntryTests(unittest.TestCase):
+    def test_optional_real_via_skips_are_reported_without_passing_as_executed(self):
+        class Optional(unittest.TestCase):
+            def runTest(self): self.skipTest('optional real-VIA audit: binaries absent')
+        optional=Optional()
+        optional.id=lambda:'opencode_via_tests.RealViaTests.test_fixture'
+        with patch.object(opencode,'TEST_MODULES',('opencode_via_tests',)), \
+                patch.object(opencode.unittest.defaultTestLoader,'loadTestsFromModule',
+                             return_value=unittest.TestSuite([optional])):
+            failed,count=opencode.self_test()
+        self.assertEqual(failed,[])
+        self.assertEqual(count,1)
+        self.assertEqual(opencode.self_test.skipped,[{'test':optional.id(),
+            'reason':'optional real-VIA audit: binaries absent'}])
+
+    def test_preflight_schema_block_reason_reaches_summary_and_phase(self):
+        import opencode_driver
+        with tempfile.TemporaryDirectory(prefix="oc-entry-", dir=opencode.SCRATCHPAD) as directory:
+            root=Path(directory)
+            class FakeDriver(opencode_driver.Driver):
+                def __init__(self, **kwargs):
+                    super().__init__(**kwargs, execute=lambda *_a, **_k:
+                                     (0,b'{"harness":"opencode"}',b''))
+                def prepare(self):
+                    self._binary=root/'release'; self.project=root; self.env={}
+                def build(self, _kind): return 'a'*64
+                def observe(self, kind, _args=None):
+                    if kind=='build_hashes':
+                        return {'release':'a'*64,'failpoints':'b'*64}
+                    if kind=='interruption': return {'interrupted':False}
+                    if kind=='fresh_max_steps': return self.via(['describe'])
+                    raise AssertionError('unexpected FAKE observation')
+                def finish(self): raise Blocked('FAKE cleanup stop proof unavailable')
+            args=SimpleNamespace(self_test=False,phase=['preflight'],evidence=root/'run',
+                                 acquire=False,opencode=root/'fake-pin',via_release=root/'release',
+                                 via_failpoints=root/'fp',fake_gate_manifest=root/'gates')
+            with patch.object(opencode,'arguments',return_value=args), \
+                 patch.object(opencode,'self_test',return_value=([],1)), \
+                 patch.object(opencode,'verify_fake_gates',return_value={'verified':True}), \
+                 patch.object(opencode,'RECOVERY_ROOT',root/'recovery'), \
+                 patch.object(opencode.safety,'verify_binary'), \
+                 patch.object(opencode_driver,'Driver',FakeDriver), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(opencode.main([]),1)
+            summary=json.loads((args.evidence/'summary.json').read_text())
+            phase=json.loads((args.evidence/'preflight.json').read_text())
+            block=summary['blocks'][0]
+            self.assertEqual(block['reason'],'describe: required field missing',summary)
+            self.assertEqual((block['phase'],block['case'],block['verb']),
+                             ('preflight','preflight','describe'))
+            self.assertEqual(phase[0]['blocking'],block)
+            self.assertEqual(phase[0]['result'],'blocked')
+            self.assertEqual(summary['blocks'][1]['reason'],'FAKE cleanup stop proof unavailable')
+            cleanup=json.loads((args.evidence/'cleanup.json').read_text())
+            self.assertEqual(cleanup[0]['blocking'],summary['blocks'][1])
+            self.assertEqual(summary['result'],'blocked')
+            self.assertEqual(len(summary['runner_source']['sha256']),64)
+
+    def test_untrusted_exception_text_never_enters_block_evidence(self):
+        reason=opencode.safety.blocking_record(ValueError('VENDOR PRIVATE RETURNED TEXT'))
+        self.assertEqual(reason['reason'],'unexpected runner exception')
+        self.assertNotIn('VENDOR PRIVATE',json.dumps(reason))
+
+    def test_protected_match_in_runner_block_reason_is_redacted(self):
+        reason=opencode.safety.blocking_record(
+            Blocked('FAKE stop echoed protected-fixture-value'),
+            secret_forms=[b'protected-fixture-value'])
+        self.assertEqual(reason['reason'],'blocking reason matched protected material')
+        self.assertNotIn('protected-fixture-value',json.dumps(reason))
+
     def test_original_runner_failure_precedes_cleanup_failure_in_summary(self):
         import opencode_driver
         with tempfile.TemporaryDirectory(prefix="oc-entry-", dir=opencode.SCRATCHPAD) as directory:
@@ -253,7 +322,9 @@ class EntryTests(unittest.TestCase):
                     patch.object(opencode.cases, "run_phase", return_value=[record]), \
                     contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(opencode.main([]), 1)
-            self.assertFalse((args.evidence / "summary.json").exists())
+            fallback=json.loads((args.evidence / "summary.json").read_text())
+            self.assertEqual(fallback['result'],'blocked')
+            self.assertTrue(fallback['summary_rejected'])
             for path in args.evidence.glob("*.json"):
                 self.assertNotIn(b"h_private_fake_fixture", path.read_bytes())
 
@@ -291,7 +362,9 @@ class EntryTests(unittest.TestCase):
             self.assertEqual(calls, ["prepare"])
             summary = json.loads((args.evidence / "summary.json").read_bytes())
             self.assertEqual(summary["cases"], [record])
-            self.assertEqual(json.loads((args.evidence / "preflight.json").read_bytes()), [record])
+            partial=json.loads((args.evidence / "preflight.json").read_bytes())
+            self.assertEqual(partial[0],record)
+            self.assertEqual(partial[1]['blocking']['reason'],'later fake phase infrastructure failed')
             self.assertEqual(summary["result"], "blocked")
 
     def test_fake_gate_proof_binds_both_builds_source_tests_and_success(self):
@@ -471,7 +544,9 @@ class EntryTests(unittest.TestCase):
                     contextlib.redirect_stdout(output):
                 self.assertEqual(opencode.main([]), 1)
             self.assertEqual(json.loads(output.getvalue())["result"], "blocked")
-            self.assertFalse((args.evidence / "summary.json").exists())
+            fallback=json.loads((args.evidence / "summary.json").read_text())
+            self.assertEqual(fallback['result'],'blocked')
+            self.assertTrue(fallback['summary_rejected'])
             self.assertFalse(instances[0].vault.leaks(password))
             for artifact in args.evidence.glob("*.json"):
                 self.assertNotIn(password, artifact.read_bytes())

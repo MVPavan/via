@@ -558,6 +558,59 @@ class CasesTests(unittest.TestCase):
 
 
 class ProviderTests(unittest.TestCase):
+    def test_bootstrap_hold_withholds_headers_until_release_and_stops_on_abort(self):
+        for action in ('release','abort'):
+            with self.subTest(action=action):
+                hold=cases.ResponseHold(time.monotonic()+5)
+                replies=[]
+                with cases.LoopbackProvider(response_hold=hold) as provider:
+                    def request():
+                        try: replies.append(self.request(provider)[0])
+                        except OSError: replies.append('closed')
+                    thread=threading.Thread(target=request)
+                    thread.start()
+                    try:
+                        deadline=time.monotonic()+2
+                        while not provider.received and time.monotonic()<deadline: time.sleep(.01)
+                        self.assertTrue(provider.received)
+                        self.assertEqual(replies,[])
+                        getattr(hold,action)()
+                    finally:
+                        if not hold.released: hold.abort()
+                        thread.join(3)
+                    self.assertFalse(thread.is_alive())
+                    self.assertEqual(replies,[200 if action=='release' else 'closed'])
+                    if action=='abort':
+                        with self.assertRaisesRegex(cases.EvidenceUnavailable,'expired or aborted'):
+                            hold.release()
+                        self.assertFalse(hold.released)
+
+    def test_bootstrap_rejected_identity_aborts_without_sending_even_error_headers(self):
+        hold=cases.ResponseHold(time.monotonic()+5)
+        with cases.LoopbackProvider(response_hold=hold) as provider:
+            with self.assertRaises(OSError): self.request(provider,model='paid-model')
+            self.assertTrue(hold.aborted)
+            self.assertFalse(hold.released)
+
+    def test_bootstrap_provider_shutdown_wakes_held_non_daemon_handler(self):
+        hold=cases.ResponseHold(time.monotonic()+30)
+        provider=cases.LoopbackProvider(response_hold=hold).__enter__()
+        def request():
+            try: self.request(provider)
+            except OSError: pass
+        thread=threading.Thread(target=request); thread.start()
+        try:
+            deadline=time.monotonic()+2
+            while not provider.received and time.monotonic()<deadline: time.sleep(.01)
+            self.assertTrue(provider.received)
+        finally:
+            provider.__exit__(None,None,None)
+            thread.join(3)
+        self.assertTrue(hold.aborted)
+        self.assertFalse(hold.released)
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(any(thread.is_alive() for thread in provider._handlers))
+
     def test_fixture_read_uses_only_actual_offered_path_schema(self):
         for key in ("filePath", "path"):
             with self.subTest(key=key), cases.LoopbackProvider(

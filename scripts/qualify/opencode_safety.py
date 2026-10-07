@@ -10,6 +10,7 @@ hostile same-user mutation. Every uncertain observation blocks its predicate.
 import base64
 import errno
 import contextlib
+import contextvars
 import hashlib
 import gzip
 import http.client
@@ -63,6 +64,43 @@ VENDOR_ENVIRONMENT = frozenset({"PATH", "LANG", "OPENCODE_CONFIG_CONTENT",
 
 class Blocked(Exception):
     """Required proof unavailable or a qualification safety control failed (§13)."""
+
+
+_BLOCK_CONTEXT = contextvars.ContextVar('opencode_block_context', default={})
+BLOCK_REASON_CHARS = 2048  # Packet §13: bounded runner-authored blocking diagnostics.
+
+
+@contextlib.contextmanager
+def block_context(**fields):
+    """Retain runner-selected case/phase/verb at the first failure boundary (§13)."""
+    current = {**_BLOCK_CONTEXT.get(), **fields}
+    token = _BLOCK_CONTEXT.set(current)
+    try:
+        yield
+    except BaseException as error:
+        error.block_context = {**current, **getattr(error, 'block_context', {})}
+        raise
+    finally:
+        _BLOCK_CONTEXT.reset(token)
+
+
+def blocking_record(error, *, stage=None, vault=None, secret_forms=()):
+    """Only runner-authored Blocked text may cross the diagnostic sink (§13)."""
+    kinds = {'Blocked', 'EvidenceUnavailable', 'QualificationFailure', 'ValueError',
+             'KeyError', 'TypeError', 'OSError', 'RuntimeError', 'AssertionError',
+             'KeyboardInterrupt', 'SystemExit', 'InterruptedError'}
+    kind = type(error).__name__
+    reason = str(error) if type(error) is Blocked else 'unexpected runner exception'
+    raw = reason.encode()
+    if (vault is not None and vault.leaks(raw)) or any(form and form in raw for form in secret_forms):
+        reason = 'blocking reason matched protected material'
+    reason = ' '.join(reason.split())[:BLOCK_REASON_CHARS] or 'runner block without a message'
+    context = getattr(error, 'block_context', _BLOCK_CONTEXT.get())
+    record = {key: context.get(key) for key in ('phase', 'case', 'verb')}
+    record.update(kind=kind if kind in kinds else 'UnexpectedException', reason=reason)
+    if stage is not None:
+        record['stage'] = stage
+    return record
 
 
 def require_proof(value, reason):
@@ -1042,12 +1080,14 @@ def normalized_api_path(path):
 class OwnedHTTP:
     """Authenticated requests to one verified generation; no proxy or redirects."""
 
-    def __init__(self, origin, identity, proc, password, *, limit=HTTP_BYTES, seeding_mode=False):
+    def __init__(self, origin, identity, proc, password, *, limit=HTTP_BYTES, seeding_mode=False,
+                 deadline=None):
         self.origin = loopback_origin(origin)
         if origin.rstrip("/") != self.origin:
             raise Blocked("owned API origin includes a path")
         self.identity, self.proc, self.password, self.limit = identity, proc, password, limit
         self.seeding_mode = seeding_mode
+        self.deadline = deadline
 
     def request(self, method, path, body=None, *, authenticated=True, timeout=30):
         canonical, parsed, ambiguous = normalized_api_path(path)
@@ -1068,6 +1108,11 @@ class OwnedHTTP:
         if raw is not None and len(raw) > self.limit:
             raise Blocked("owned API request exceeds bound")
         deadline = time.monotonic() + timeout
+        if self.deadline is not None:
+            deadline = min(deadline, self.deadline)
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
+                raise Blocked("owned API absolute deadline exhausted")
         connection = http.client.HTTPConnection(parts.hostname, parts.port, timeout=timeout)
         try:
             status, _location, data = _bounded_response(connection, method, path, headers, raw,

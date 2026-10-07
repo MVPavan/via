@@ -1214,6 +1214,10 @@ test-only build), a new private `--evidence` directory in the worktree's
 scratchpad, and either `--opencode` for the verified read-only pin or `--acquire`
 for official exact-version acquisition. Both VIA hashes are recorded. Seam
 cases use the test-only build; L14 and the other gates use release VIA.
+When all three built artifacts (release VIA, failpoints VIA and
+`via-fake-agent`) are present, self-tests also run the real VIA CLI interaction
+audit against the scripted OpenCode fake. Missing artifacts are reported as
+optional skips, never as executed tests or live qualification.
 Before acquisition or any start, `--fake-gate-manifest` (defaulting to the
 `scratchpad/execution/oc-live/fake-gate-manifest.json`) must show successful fake
 gates and the required seam tests, bound to the current Rust source and both supplied
@@ -1287,6 +1291,27 @@ provider. Missing cost is unavailable; positive cost or a paid identity stops
 admission. Session shell requests consume no model turn unless they invoke a
 model-capable path. Public-free results and synthetic token/cache/compaction
 observations are labelled separately. No network-destination sampling can establish a gate.
+
+**Qualification plan amendment (owner ruling):** `via models` only lists
+models on an acquired server; it does not acquire one. For each required
+acquisition, the runner may submit one labelled
+`qualification-bootstrap-mock-only` turn to its owned loopback mock. Before
+the spawn it verifies the namespace configuration's credential-free provider
+shape, loopback-only endpoints, private environment allow-list and frozen mock
+model/auxiliary selectors. Every mock response (including an error) is held
+until pid/start-tick identity, the owned listener and §2 handshake are verified,
+and all four structural spending checks above pass on served facts, including
+the native session's mock identity. A failed check aborts the hold, requests
+cancellation and blocks; the response is never released. Acquisition/checks
+have a 30 s absolute bound, followed by a bounded 30 s mock completion wait
+within the remaining phase deadline. Missing or invalid proof blocks.
+The bootstrap is evidence labelled as non-gating, charged only to the phase's
+existing physical mock-request ceiling (including auxiliary requests), and
+never charged to the public-free budget. It keeps a lease until a case session
+has demonstrably attached; the runner then closes the bootstrap session so it
+does not alter later session-count or retirement observations. Failure and
+cleanup abort all outstanding holds. This exception adds no C1 API, result
+field or outcome and permits no paid provider/model.
 
 The private namespace's 0700 directory chain and fixture Git repositories with
 private initial commits prevent untested ancestor walk-up. A mandatory sentinel
