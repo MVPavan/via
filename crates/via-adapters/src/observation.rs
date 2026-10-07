@@ -365,6 +365,29 @@ pub struct LeftoverReport {
     pub incomplete: bool,
 }
 
+// C2 AD20: carry Host's passive snapshot without changing its scope or evidence.
+impl From<via_routes::LeftoverReport> for LeftoverReport {
+    fn from(report: via_routes::LeftoverReport) -> Self {
+        Self {
+            scope: match report.scope {
+                via_routes::LeftoverScope::Turn => LeftoverScope::Turn,
+                via_routes::LeftoverScope::Server => LeftoverScope::Server,
+            },
+            processes: report
+                .processes
+                .into_iter()
+                .map(|process| LeftoverProcess {
+                    pid: process.pid,
+                    comm: process.comm,
+                    started_at: process.started_at,
+                })
+                .collect(),
+            total: report.total,
+            incomplete: report.incomplete,
+        }
+    }
+}
+
 /// Process and cleanup facts of a turn (C2 §4.1), on every outcome: the
 /// cleanup gate always has facts.
 #[derive(Clone, Debug, Eq, PartialEq)]

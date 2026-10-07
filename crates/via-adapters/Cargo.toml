@@ -17,8 +17,8 @@ tokio-util = { workspace = true, features = ["rt"] }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# "process": the daemon's uid, which owns Pi's private agent directory
-# (Pi packet §4.3).
+# "process": the daemon uid that owns its managed directories (runtime §6.1;
+# OpenCode namespaces and Pi's private agent directory).
 rustix = { workspace = true, features = ["fs", "process"] }
 # The expected Claude session UUID (ruling Q4) and the Codex launch digest.
 sha2 = { workspace = true }

@@ -100,7 +100,7 @@ pub struct ServerFacts {
 }
 
 /// Why a launch failed, as each of its waiters' turns reports it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LaunchFailure {
     /// Host's acquisition failed: its evidence.
     Acquire {
@@ -817,6 +817,7 @@ impl Servers {
             launch: Some(LaunchCause {
                 step: "mint a server id",
                 kind: None,
+                detail: None,
             }),
         })?;
         spec.owner = ProcessOwner::Server {

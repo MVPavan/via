@@ -191,9 +191,11 @@ mod fake;
 mod harness;
 mod instance;
 pub mod observation;
+mod opencode;
 mod passthrough;
 mod pi;
 mod plan;
+mod private_dir;
 mod runtime;
 mod set;
 

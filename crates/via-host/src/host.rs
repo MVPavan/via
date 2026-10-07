@@ -563,7 +563,11 @@ impl HostError {
             | Self::Stopped
             | Self::LinksUnread => return None,
         };
-        Some(crate::LaunchCause { step, kind })
+        Some(crate::LaunchCause {
+            step,
+            kind,
+            detail: None,
+        })
     }
 
     /// A launch step's failure with its operating-system error.
@@ -689,6 +693,10 @@ pub struct AcquiredProcess {
     /// data passed through Wire to the route (runtime §5; `OpenCode`'s
     /// `/api/info` check). It is evidence, never signalling authority.
     pub vendor_pid: u32,
+    /// When Host received the anchor's `Spawned` reply, before the vendor
+    /// facts' journal commit: the vendor's start as the route times it
+    /// (`OpenCode` §2.2's handshake bound runs from it).
+    pub spawned_at: Instant,
 }
 
 struct StartedAnchor {
@@ -864,6 +872,10 @@ pub struct ProcessControl {
     anchor_dir: PathBuf,
     /// The vendor's stderr bytes under `CountOnly` (runtime §4).
     stderr_bytes: StderrCount,
+    /// Report-only launch facts; absent on recovered controls.
+    vendor_marker: Option<String>,
+    vendor_start_ticks: Option<u64>,
+    tasks: Arc<StdMutex<HostTasks>>,
 }
 
 /// The latest count of the vendor's stderr bytes the anchor reported with
@@ -1660,7 +1672,7 @@ impl Host {
         } = self
             .start_anchor(spec.owner.clone(), spec.capacity.take(), stderr, state)
             .await?;
-        let vendor = vendor_config(&spec)?;
+        let (vendor, vendor_marker) = vendor_config(&spec)?;
         configure(&control, vendor).await?;
         let arm = self
             .journal
@@ -1687,18 +1699,7 @@ impl Host {
         }
         // This is the only ARM send for this generation; errors never cause retry.
         launch.put(pipes);
-        let reply = control
-            .lock()
-            .await
-            .transact(
-                &Request::Arm {
-                    generation: generation.clone(),
-                },
-                1024,
-            )
-            .await
-            .map_err(HostError::launch("send ARM"))?;
-        let vendor_pid = spawned(reply)?;
+        let (vendor_pid, vendor_start_ticks, spawned_at) = send_arm(&control, &generation).await?;
         // The group's exit watch, which the ledger's `Armed` entry reads.
         let (sender, exits) = watch::channel(None);
         // Design §6.8 [r6.1]: armed right after `Spawned`; an early stop
@@ -1750,6 +1751,9 @@ impl Host {
             uncertain: self.uncertain.clone(),
             anchor_dir: self.anchor_dir.clone(),
             stderr_bytes: StderrCount::default(),
+            vendor_marker: Some(vendor_marker),
+            vendor_start_ticks,
+            tasks: self.tasks.clone(),
         };
         let count_only = spec.stderr == crate::StderrCapture::CountOnly;
         self.track_control(&control, sender, count_only);
@@ -1758,6 +1762,7 @@ impl Host {
             control,
             exits,
             vendor_pid,
+            spawned_at,
         })
     }
 
@@ -1849,6 +1854,9 @@ impl Host {
                     uncertain: self.uncertain.clone(),
                     anchor_dir: self.anchor_dir.clone(),
                     stderr_bytes: StderrCount::default(),
+                    vendor_marker: None,
+                    vendor_start_ticks: None,
+                    tasks: self.tasks.clone(),
                 };
                 let close = control
                     .close(CloseRequest {
@@ -2335,6 +2343,64 @@ impl ProcessControl {
         }
     }
 
+    /// Runs an explicit report-only scan after close, for an existing result
+    /// destination. Ordinary close, recovery and shutdown never invoke it.
+    /// The original close deadline is not extended by the one-second scan cap.
+    pub async fn report_leftovers(
+        &self,
+        scope: crate::LeftoverScope,
+        close_by: Deadline,
+    ) -> crate::LeftoverReport {
+        let now = Instant::now();
+        let deadline = close_by.instant().min(now + Duration::from_secs(1));
+        let Some(marker) = self
+            .vendor_marker
+            .as_ref()
+            .filter(|_| self.vendor_start_ticks.is_some())
+        else {
+            return crate::LeftoverReport::incomplete(scope);
+        };
+        if now >= deadline {
+            return crate::LeftoverReport::incomplete(scope);
+        }
+        let state = crate::leftovers::ScanState::new(scope);
+        let cancellation = crate::leftovers::CancelScan(state.clone());
+        let worker_state = state.clone();
+        let marker = marker.as_bytes().to_vec();
+        let bound = self.vendor_start_ticks;
+        let (finished, mut result) = watch::channel(false);
+        let task = tokio::task::spawn_blocking(move || {
+            let report = crate::leftovers::scan(
+                std::path::Path::new("/proc"),
+                &marker,
+                bound,
+                scope,
+                deadline,
+                &worker_state,
+            );
+            *worker_state
+                .report
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = report;
+            finished.send_replace(true);
+            Ok(())
+        });
+        self.tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .track(task);
+        // Dropping or timing out the caller stops subsequent scanner reads;
+        // Host retains and joins the blocking task, which checks the deadline
+        // before every bounded read. Only public progress survives the timeout.
+        let completed = timeout_at(deadline, result.changed()).await;
+        drop(cancellation);
+        let mut report = state.snapshot();
+        if !matches!(completed, Ok(Ok(()))) {
+            report.incomplete = true;
+        }
+        report
+    }
+
     /// Commits the link of the `running` turn `(session, turn)` to this
     /// shared server's anchor (design item 1, runtime §6 `server_turns`),
     /// before the turn's first vendor byte. A turn-owned control has no
@@ -2401,8 +2467,9 @@ fn fence_options_valid(spec: &PrivateProcessSpec) -> Result<(), &'static str> {
 /// The vendor launch configuration, with Host's own random
 /// `VIA_PROCESS_MARKER` added to the allow-listed environment (design §9),
 /// and the spec's fence and stderr options (runtime §5).
-fn vendor_config(spec: &PrivateProcessSpec) -> Result<VendorConfig, HostError> {
-    Ok(vendor_config_marked(spec, linux::random_hex()?))
+fn vendor_config(spec: &PrivateProcessSpec) -> Result<(VendorConfig, String), HostError> {
+    let marker = linux::random_hex()?;
+    Ok((vendor_config_marked(spec, marker.clone()), marker))
 }
 
 /// [`vendor_config`] with `marker` as `VIA_PROCESS_MARKER`.
@@ -2581,9 +2648,30 @@ fn write_bootstrap(path: &PathBuf, bootstrap: &Bootstrap) -> Result<(), HostErro
 }
 
 /// The vendor's pid from the anchor's reply to ARM, or why there is none.
-fn spawned(reply: Reply) -> Result<u32, HostError> {
+/// Sends the generation's one ARM and reads its `Spawned` reply: the
+/// vendor pid and the instant Host received it.
+async fn send_arm(
+    control: &Mutex<ControlConnection>,
+    generation: &str,
+) -> Result<(u32, Option<u64>, Instant), HostError> {
+    let reply = control
+        .lock()
+        .await
+        .transact(
+            &Request::Arm {
+                generation: generation.to_owned(),
+            },
+            1024,
+        )
+        .await
+        .map_err(HostError::launch("send ARM"))?;
+    let (vendor_pid, start_ticks) = spawned(reply)?;
+    Ok((vendor_pid, start_ticks, Instant::now()))
+}
+
+fn spawned(reply: Reply) -> Result<(u32, Option<u64>), HostError> {
     match reply {
-        Reply::Spawned { pid } => Ok(pid),
+        Reply::Spawned { pid, start_ticks } => Ok((pid, start_ticks)),
         Reply::Error { code, errno } => Err(anchor_refused(&code, errno)),
         // Runtime §5: the record write failed; the child was killed.
         Reply::Fence { refusal } => Err(HostError::Fence(Box::new(refusal))),

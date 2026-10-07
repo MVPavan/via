@@ -516,6 +516,12 @@ impl Engine {
     /// then the closure pass; and every receipted turn is checked for a
     /// durable terminal. Every step shares the caller's absolute deadline.
     pub async fn shutdown(&self, deadline: Deadline) -> EngineShutdown {
+        // Terminal records now carry a leftover snapshot. Keep that retained
+        // state behind one allocation rather than growing every shutdown caller.
+        Box::pin(self.shutdown_inner(deadline)).await
+    }
+
+    async fn shutdown_inner(&self, deadline: Deadline) -> EngineShutdown {
         // Unprovable group absence must not consume the finalization reserve.
         let host_by = deadline
             .instant()

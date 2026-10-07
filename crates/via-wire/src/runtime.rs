@@ -276,10 +276,12 @@ impl WireError {
             Self::Evidence(error) => Some(via_host::LaunchCause {
                 step: "create the evidence folder",
                 kind: Some(error.kind()),
+                detail: None,
             }),
             Self::Io(error) => Some(via_host::LaunchCause {
                 step: "vendor pipe",
                 kind: Some(error.kind()),
+                detail: None,
             }),
             Self::Acquire { cause, .. } => cause.launch_cause(),
             Self::Deadline | Self::Cancelled | Self::Woken | Self::Message(_) => None,
@@ -435,6 +437,7 @@ async fn open(
         control,
         exits,
         vendor_pid,
+        spawned_at,
     } = match acquired {
         Ok(acquired) => acquired,
         Err((cause, evidence)) => {
@@ -460,7 +463,7 @@ async fn open(
     };
     Ok(connection::open(
         pipes,
-        (control, exits, fenced.then_some(vendor_pid)),
+        (control, exits, fenced.then_some((vendor_pid, spawned_at))),
         (folder, tasks, capture),
         (waits, inbound),
         stragglers,

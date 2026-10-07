@@ -195,7 +195,11 @@ pub type StopSources = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
 /// after its forced cleanup and bounded drain, and the two facts Core's stop
 /// outcome needs (AD4 Core handoff).
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
-#[error("{cause}{}", undecoded_note(.undecoded.as_deref()))]
+#[error(
+    "{cause}{}{}",
+    launch_note(.launch.as_deref()),
+    undecoded_note(.undecoded.as_deref())
+)]
 #[expect(
     clippy::struct_excessive_bools,
     reason = "each flag is a distinct, independent fact of the evidence"
@@ -231,6 +235,14 @@ pub struct RouteFailure {
     pub launch: Option<Box<LaunchCause>>,
 }
 
+/// `: <detail>` when a launch failure carries VIA's detail, else nothing.
+fn launch_note(launch: Option<&LaunchCause>) -> String {
+    launch
+        .and_then(|launch| launch.detail.as_deref())
+        .map(|detail| format!(": {detail}"))
+        .unwrap_or_default()
+}
+
 /// `; <note>` when an undecoded message was kept, else nothing.
 fn undecoded_note(note: Option<&str>) -> String {
     note.map(|note| format!("; {note}")).unwrap_or_default()
@@ -239,6 +251,7 @@ fn undecoded_note(note: Option<&str>) -> String {
 pub mod claude;
 pub mod codex;
 mod fake;
+pub mod opencode;
 pub mod pi;
 mod private;
 mod runtime;
@@ -262,8 +275,9 @@ pub use via_wire::failpoint;
 /// Runtime §8's JSON structure limits, for a route's own bounded reads.
 pub use via_wire::json_limits;
 pub use via_wire::{
-    CapacityToken, EnvAllowList, PrivateProcessSpec, ProcessOwner, ReprobeReport, RuntimeConfig,
-    RuntimeResources, SessionId, StderrCapture, WireCleanup, WireError, WireRecovery, WireShutdown,
+    CapacityToken, CommitOutcome, EnvAllowList, LeftoverProcess, LeftoverReport, LeftoverScope,
+    PrivateProcessSpec, ProcessOwner, ReprobeReport, RuntimeConfig, RuntimeResources, SessionId,
+    StderrCapture, VersionProbe, WireCleanup, WireError, WireRecovery, WireShutdown,
     WireTurnRecovery,
 };
 

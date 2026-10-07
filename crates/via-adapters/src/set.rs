@@ -72,7 +72,13 @@ impl AdapterSet {
         let recovery = match adapter {
             // Neither the fake nor the vendor stubs resume: the context is
             // not used, and nothing is started.
-            Some(Adapter::Fake(_) | Adapter::Claude(_) | Adapter::Codex(_) | Adapter::Pi(_))
+            Some(
+                Adapter::Fake(_)
+                | Adapter::Claude(_)
+                | Adapter::Codex(_)
+                | Adapter::Pi(_)
+                | Adapter::OpenCode(_),
+            )
             | None => {
                 drop(cx);
                 recovery_by_facts(facts)
@@ -82,18 +88,25 @@ impl AdapterSet {
     }
 
     /// Drains lower process owners before Store shutdown and returns
-    /// passive facts. A shared-server registry is fenced first, then joined
-    /// beside Host's shutdown (which closes every live server) until the
-    /// deadline's finalization reserve; its unjoined and failed tasks fold
-    /// into the report (x.3.2 X0 item 2.7).
+    /// passive facts. Each shared-server registry (Codex's, `OpenCode`'s)
+    /// is fenced first, then joined beside Host's shutdown (which closes
+    /// every live server) until the deadline's finalization reserve; their
+    /// unjoined and failed tasks fold into the report (x.3.2 X0 item 2.7).
     pub async fn shutdown(
         &self,
         deadline: Deadline,
         turns: &[(SessionId, TurnNumber)],
     ) -> AdapterShutdown {
         let servers = self.codex.as_ref().map(|codex| Arc::clone(codex.servers()));
+        let opencode = self
+            .opencode
+            .as_ref()
+            .map(|opencode| Arc::clone(opencode.registry()));
         if let Some(servers) = &servers {
             servers.fence();
+        }
+        if let Some(opencode) = &opencode {
+            opencode.fence();
         }
         let cutoff = Deadline::at(
             deadline
@@ -102,10 +115,21 @@ impl AdapterSet {
                 .unwrap_or_else(|| deadline.instant()),
         );
         let joined = async {
-            match &servers {
-                Some(servers) => servers.join(cutoff).await,
-                None => (0, 0),
-            }
+            let codex = async {
+                match &servers {
+                    Some(servers) => servers.join(cutoff).await,
+                    None => (0, 0),
+                }
+            };
+            let opencode = async {
+                match &opencode {
+                    Some(opencode) => opencode.join(cutoff).await,
+                    None => (0, 0),
+                }
+            };
+            let ((codex_unjoined, codex_failed), (unjoined, failed)) =
+                tokio::join!(codex, opencode);
+            (codex_unjoined + unjoined, codex_failed + failed)
         };
         let (report, (unjoined, failed)) =
             tokio::join!(self.runtime.shutdown(deadline, turns), joined);

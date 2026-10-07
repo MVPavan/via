@@ -22,6 +22,7 @@ use crate::driver::DriverKind;
 use crate::fake::FakeAdapter;
 use crate::harness::{FAKE, HARNESSES, Harness};
 use crate::instance::{InstanceCache, resolve_binary};
+use crate::opencode::{self, OpenCodeAdapter};
 use crate::passthrough::VendorArgs;
 use crate::pi::{self, PiAdapter};
 use crate::{AdapterError, RuntimeConfig, RuntimeResources};
@@ -672,6 +673,8 @@ pub(crate) enum Adapter<'a> {
     Codex(&'a Arc<CodexAdapter>),
     /// Pi (`pi-rpc`).
     Pi(&'a Arc<PiAdapter>),
+    /// `OpenCode` (`opencode-serve`).
+    OpenCode(&'a Arc<OpenCodeAdapter>),
 }
 
 impl<'a> Adapter<'a> {
@@ -682,16 +685,19 @@ impl<'a> Adapter<'a> {
             Self::Claude(_) => claude::HARNESS,
             Self::Codex(_) => codex::HARNESS,
             Self::Pi(_) => pi::HARNESS,
+            Self::OpenCode(_) => opencode::HARNESS,
         }
     }
 
     /// Its catalog: bundled, or for Codex what the live server of the
-    /// harness's configured `inherit` discovered (none before discovery).
+    /// harness's configured `inherit` discovered (none before discovery),
+    /// and for `OpenCode` its live server's.
     fn catalog(self, config: &AdapterConfig) -> Cow<'a, [CatalogModel]> {
         match self {
             Self::Fake(fake) => Cow::Borrowed(fake.catalog()),
             Self::Claude(claude) => Cow::Borrowed(claude.catalog()),
             Self::Pi(pi) => Cow::Borrowed(pi.catalog()),
+            Self::OpenCode(opencode) => Cow::Owned(opencode.listed()),
             Self::Codex(codex) => Cow::Owned(
                 Harness::parse(codex::HARNESS)
                     .map(|harness| codex.listed(config.inherit(harness)))
@@ -704,7 +710,7 @@ impl<'a> Adapter<'a> {
     fn source(self) -> ModelSource {
         match self {
             Self::Fake(_) | Self::Claude(_) | Self::Pi(_) => ModelSource::Bundled,
-            Self::Codex(_) => ModelSource::Discovered,
+            Self::Codex(_) | Self::OpenCode(_) => ModelSource::Discovered,
         }
     }
 
@@ -717,6 +723,9 @@ impl<'a> Adapter<'a> {
             Self::Codex(codex) => {
                 DriverKind::Codex(Arc::new(codex::CodexSession::new(Arc::clone(codex))))
             }
+            Self::OpenCode(opencode) => DriverKind::OpenCode(Arc::new(
+                opencode::OpenCodeSession::new(Arc::clone(opencode)),
+            )),
         }
     }
 }
@@ -729,6 +738,7 @@ pub struct AdapterSet {
     pub(crate) claude: Option<Arc<ClaudeAdapter>>,
     pub(crate) codex: Option<Arc<CodexAdapter>>,
     pub(crate) pi: Option<Arc<PiAdapter>>,
+    pub(crate) opencode: Option<Arc<OpenCodeAdapter>>,
     /// The rest of the start-time configuration (design §5.4).
     config: AdapterConfig,
     /// The Route runtime: Wire and Host, which own every connection.
@@ -792,6 +802,16 @@ impl AdapterSet {
                 runtime.vendor_state_dir().to_path_buf(),
             ))
         });
+        // The server takes the daemon's `PATH`, as Codex's does (packet
+        // §4.1).
+        let opencode = binary(opencode::HARNESS).map(|binary| {
+            Arc::new(OpenCodeAdapter::new(
+                binary,
+                Arc::clone(&instances),
+                config.env().var("PATH"),
+                Arc::clone(&runtime),
+            ))
+        });
         Ok(Self {
             fake: config
                 .take_fake()
@@ -799,6 +819,7 @@ impl AdapterSet {
             claude,
             codex,
             pi,
+            opencode,
             config,
             runtime,
             #[cfg(feature = "test-failpoints")]
@@ -816,6 +837,7 @@ impl AdapterSet {
                 claude::HARNESS => self.claude.as_ref().map(Adapter::Claude),
                 codex::HARNESS => self.codex.as_ref().map(Adapter::Codex),
                 pi::HARNESS => self.pi.as_ref().map(Adapter::Pi),
+                opencode::HARNESS => self.opencode.as_ref().map(Adapter::OpenCode),
                 // No adapter serves this harness in this build.
                 _ => None,
             },
@@ -827,6 +849,7 @@ impl AdapterSet {
         [
             self.claude.as_ref().map(Adapter::Claude),
             self.codex.as_ref().map(Adapter::Codex),
+            self.opencode.as_ref().map(Adapter::OpenCode),
             self.pi.as_ref().map(Adapter::Pi),
             self.fake.as_ref().map(Adapter::Fake),
         ]
@@ -835,12 +858,18 @@ impl AdapterSet {
     }
 
     /// The live shared servers (C2 §2 `servers`): a pure in-memory
-    /// snapshot of the Codex registry, each server with the sessions
-    /// leasing it (x.3.2 X4 D2); the per-turn routes list none.
+    /// snapshot of the Codex and `OpenCode` registries, each server with
+    /// the sessions leasing it (x.3.2 X4 D2); the per-turn routes list
+    /// none.
     pub fn servers(&self) -> Vec<ServerReport> {
-        self.codex
+        let mut reports = self
+            .codex
             .as_ref()
-            .map_or_else(Vec::new, |codex| codex.server_reports())
+            .map_or_else(Vec::new, |codex| codex.server_reports());
+        if let Some(opencode) = &self.opencode {
+            reports.extend(opencode.server_reports());
+        }
+        reports
     }
 
     /// Each shared server that ended, oldest first (at most 16), as its
@@ -926,6 +955,9 @@ impl AdapterSet {
             Some(Adapter::Codex(codex)) => {
                 return codex.plan(harness, req, self.config.inherit(harness));
             }
+            Some(Adapter::OpenCode(opencode)) => {
+                return opencode.plan(harness, req, self.config.inherit(harness));
+            }
             Some(Adapter::Pi(pi)) => {
                 let model = ModelChoice {
                     requested: req.model.clone(),
@@ -983,6 +1015,9 @@ impl AdapterSet {
             }
             Some(Adapter::Codex(codex)) => {
                 return codex.check_turn(route, &session.adapter_version, turn);
+            }
+            Some(Adapter::OpenCode(opencode)) => {
+                return opencode.check_turn(route, &session.adapter_version, turn);
             }
             Some(Adapter::Pi(pi)) => {
                 PiAdapter::check_version(route, &session.adapter_version)?;
@@ -1111,6 +1146,7 @@ mod tests {
             (crate::claude::HARNESS, "claude-cli"),
             (crate::codex::HARNESS, "codex-app-server"),
             (crate::pi::HARNESS, "pi-rpc"),
+            (crate::opencode::HARNESS, "opencode-serve"),
         ] {
             assert_eq!(Harness::parse(name).map(Harness::route), Some(route));
         }
