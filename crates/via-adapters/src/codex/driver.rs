@@ -1333,7 +1333,7 @@ async fn turn(
     let Some((connection, server)) = pin.live() else {
         return facts.failed(RouteError::TransportLost { turn }, None);
     };
-    let catalog = adopt(&mut facts, pin.server(), &server, (&mut orders, &mut force)).await;
+    let catalog = adopt(&mut facts, pin.server(), &server);
     let Some(generation) = session.attach(&pin, &connection, driver) else {
         return facts.failed(RouteError::TransportLost { turn }, None);
     };
@@ -1755,17 +1755,13 @@ fn admit(
     }
 }
 
-/// Packet §3: wait at most one second for the best-effort catalog write.
-const CATALOG_WRITE_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
-
 /// Records the live server's facts the turn reports (its instance and
 /// version) and caches its model catalog for instance `id`, which it
 /// returns.
-async fn adopt(
+fn adopt(
     facts: &mut Turn<'_>,
     id: &via_routes::codex::ServerId,
     server: &via_routes::codex::ServerFacts,
-    (orders, force): (&mut Orders, &mut ForceWatch),
 ) -> Arc<[DiscoveredModel]> {
     let adapter = &facts.session.adapter;
     facts.instance = Some(instance_report(&server.user_agent));
@@ -1785,23 +1781,11 @@ async fn adopt(
     ) {
         let saved = Arc::clone(&adapter.saved_catalog);
         let vendor = adapter.servers.vendor_state_dir().to_path_buf();
-        let write = facts
-            .driver
-            .tracker
-            .spawn_blocking(move || saved.persist(&vendor));
-        // Cancellation leaves only a cache write, owned until completion by
-        // the driver's tracker; it never submits vendor work. Cache I/O is
-        // best effort and cannot change a turn's public outcome (packet §3).
-        let until = orders
-            .wall
-            .instant()
-            .min(Instant::now() + CATALOG_WRITE_WAIT);
-        tokio::select! {
-            // Cache errors do not prevent use of this complete live catalog.
-            _written = tokio::time::timeout_at(until, write) => {}
-            _ordered = orders.ordered() => {}
-            () = forced(force) => {}
-        }
+        // Packet §3: the driver's tracker owns this best-effort write
+        // through Engine stop's Host bound, without delaying the turn.
+        facts.driver.tracker.spawn_blocking(move || {
+            let _ = saved.persist(&vendor);
+        });
     }
     catalog
 }

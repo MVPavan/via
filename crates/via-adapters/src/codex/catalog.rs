@@ -5,7 +5,6 @@
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use rustix::fd::OwnedFd;
@@ -18,7 +17,8 @@ use super::normalize::DiscoveredModel;
 const SNAPSHOT_BYTES: usize = via_routes::codex::MODEL_BYTES + 4096;
 /// VIA-owned state, never a Codex configuration file (runtime §6.1).
 const FILE: &str = ".via-catalog.json";
-static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+/// Packet §3: one crash leftover, serialized by the writer and data-root locks.
+const TEMP: &str = ".via-catalog.tmp";
 
 /// Only normalized public fields and the observed vendor version; the
 /// recipe is an opaque digest, never environment values or a program path.
@@ -42,7 +42,8 @@ pub(super) struct Catalog {
 
 impl Catalog {
     /// Bootstrap-only bounded read; absent, unsafe or corrupt caches are
-    /// misses. A live discovery can still replace an unusable cache.
+    /// misses. Live discovery can replace a corrupt private file; unsafe
+    /// targets remain misses until removed (runtime §6.1 forbids repair).
     pub(super) fn load(vendor: &Path) -> Self {
         Self {
             // A cache miss affects discovery only; it is never recovery evidence.
@@ -142,6 +143,24 @@ fn read(vendor: &Path) -> io::Result<Option<Snapshot>> {
     Ok(Some(snapshot))
 }
 
+/// Runtime §6.1: an absent or private regular target may be replaced;
+/// unsafe targets are refused without opening, following or repairing them.
+fn private_target(dir: &OwnedFd, name: &str) -> io::Result<bool> {
+    match rustix::fs::statat(dir, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat)
+            if rustix::fs::FileType::from_raw_mode(stat.st_mode)
+                != rustix::fs::FileType::RegularFile
+                || stat.st_uid != crate::private_dir::daemon_uid()
+                || stat.st_mode & 0o777 != 0o600 =>
+        {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        }
+        Ok(_) => Ok(true),
+        Err(rustix::io::Errno::NOENT) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Synced temporary file then atomic rename; failures before rename leave
 /// the old complete file intact. A failed directory sync after rename
 /// leaves a complete visible replacement whose durability is uncertain.
@@ -151,27 +170,15 @@ fn write(vendor: &Path, snapshot: &Snapshot) -> io::Result<()> {
         return Err(io::Error::from(io::ErrorKind::InvalidData));
     }
     let dir = directory(vendor)?;
-    // Reject unsafe existing targets without opening or changing them.
-    match rustix::fs::statat(&dir, FILE, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(stat)
-            if rustix::fs::FileType::from_raw_mode(stat.st_mode)
-                != rustix::fs::FileType::RegularFile
-                || stat.st_uid != crate::private_dir::daemon_uid()
-                || stat.st_mode & 0o777 != 0o600 =>
-        {
-            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
-        }
-        Ok(_) | Err(rustix::io::Errno::NOENT) => {}
-        Err(error) => return Err(error.into()),
+    private_target(&dir, FILE)?;
+    // The writer mutex and sole-daemon data-root lock exclude other
+    // writers. Reclaim only a private fixed-name crash leftover (packet §3).
+    if private_target(&dir, TEMP)? {
+        rustix::fs::unlinkat(&dir, TEMP, rustix::fs::AtFlags::empty())?;
     }
-    let temp = format!(
-        ".via-catalog-{}-{}.tmp",
-        std::process::id(),
-        TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    );
     let fd = rustix::fs::openat(
         &dir,
-        &temp,
+        TEMP,
         OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::from_raw_mode(0o600),
     )?;
@@ -179,13 +186,13 @@ fn write(vendor: &Path, snapshot: &Snapshot) -> io::Result<()> {
         let mut file = File::from(fd);
         file.write_all(&bytes)?;
         file.sync_all()?;
-        rustix::fs::renameat(&dir, &temp, &dir, FILE)?;
+        rustix::fs::renameat(&dir, TEMP, &dir, FILE)?;
         rustix::fs::fsync(&dir)?;
         Ok(())
     })();
     // After rename the temporary name is absent; on failure cleanup is
     // best effort and never unlinks the previous complete snapshot.
-    let _ = rustix::fs::unlinkat(&dir, &temp, rustix::fs::AtFlags::empty());
+    let _ = rustix::fs::unlinkat(&dir, TEMP, rustix::fs::AtFlags::empty());
     result
 }
 
@@ -268,6 +275,41 @@ mod tests {
                     .is_none()
             );
         }
+        write(root.path(), &snapshot("recovered")).unwrap();
+        assert_eq!(
+            read(root.path()).unwrap().unwrap().models[0].model,
+            "recovered"
+        );
+    }
+
+    /// Packet §3, runtime §6.1: one private crash leftover is reclaimed;
+    /// an unsafe temporary target is refused without following or repair.
+    #[test]
+    fn a_stale_private_temporary_file_does_not_accumulate() {
+        let root = root();
+        write(root.path(), &snapshot("old")).unwrap();
+        let temp = root.path().join("codex/.via-catalog.tmp");
+        std::fs::write(&temp, "interrupted write").unwrap();
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600)).unwrap();
+        write(root.path(), &snapshot("new")).unwrap();
+        assert_eq!(read(root.path()).unwrap().unwrap().models[0].model, "new");
+        assert_eq!(
+            std::fs::read_dir(temp.parent().unwrap()).unwrap().count(),
+            1
+        );
+
+        let outside = root.path().join("outside");
+        std::fs::write(&outside, "untouched").unwrap();
+        std::os::unix::fs::symlink(&outside, &temp).unwrap();
+        assert!(write(root.path(), &snapshot("unsafe")).is_err());
+        assert!(std::fs::symlink_metadata(&temp).unwrap().is_symlink());
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "untouched");
+        std::fs::remove_file(&temp).unwrap();
+        std::fs::write(&temp, "wrong mode").unwrap();
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(write(root.path(), &snapshot("unsafe")).is_err());
+        assert_eq!(std::fs::read_to_string(&temp).unwrap(), "wrong mode");
+        assert_eq!(read(root.path()).unwrap().unwrap().models[0].model, "new");
     }
 
     /// Delayed persistence reads the latest complete discovery; it cannot

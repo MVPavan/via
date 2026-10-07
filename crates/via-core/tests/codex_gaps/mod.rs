@@ -232,15 +232,19 @@ fn codex_catalog_replaces_only_after_complete_discovery() {
     let full = echo_copy(C1_PROMPT);
     let mut partial = full.clone();
     let mut steps = full["steps"].as_array().unwrap()[..6].to_vec();
-    let page = steps[5]["emit"]["line"].as_str().unwrap();
-    steps[5]["emit"]["line"] =
-        json!(page.replace("\"nextCursor\":null", "\"nextCursor\":\"next\""));
-    assert!(
-        steps[5]["emit"]["line"]
-            .as_str()
-            .unwrap()
-            .contains("\"nextCursor\":\"next\"")
-    );
+    let handshake = steps[1]["emit"]["line"].as_str().unwrap();
+    steps[1]["emit"]["line"] = json!(handshake.replace("0.159.2", "0.161.0"));
+    let line = steps[5]["emit"]["line"]
+        .as_str()
+        .unwrap()
+        .replace("${models}", "999");
+    let mut page: Value = serde_json::from_str(&line).unwrap();
+    let mut partial_model = page["result"]["data"][0].clone();
+    partial_model["id"] = json!("gpt-6-partial");
+    partial_model["model"] = json!("gpt-6-partial");
+    page["result"]["data"] = json!([partial_model]);
+    page["result"]["nextCursor"] = json!("next");
+    steps[5]["emit"]["line"] = json!(page.to_string().replace("\"id\":999", "\"id\":${models}"));
     steps.extend([
         json!({"expect":{"line":{"method":"model/list","params":{"cursor":"next"}},"capture":{"page":"/id"}}}),
         json!({"emit":{"line":"{\"id\":${page},\"error\":{\"code\":-32603,\"message\":\"discovery failed\"}}"}}),
@@ -265,41 +269,47 @@ fn codex_catalog_replaces_only_after_complete_discovery() {
         json!(page.to_string().replace("\"id\":999", "\"id\":${models}"));
     let replay = json!({"source":NAME,"lifetimes":[full, partial, replacement]});
     let case = codex_case(&root, NAME, replay);
-    let listed = |daemon: &Daemon, count: usize| {
+    let original = ["gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"];
+    let listed = |daemon: &Daemon, expected: &[&str], version: &str| {
         let params = serde_json::from_value(json!({"harness":"codex"})).unwrap();
         let models = daemon.engine.models(&params);
-        assert_eq!(
-            models["models"].as_array().unwrap().len(),
-            count,
-            "{models}"
-        );
+        let names: Vec<_> = models["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| model["model"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, expected, "{models}");
         assert!(!models.to_string().contains("synthetic-catalog-secret"));
+        let params = serde_json::from_value(json!({"model":"gpt-6-luna"})).unwrap();
+        let described = daemon.engine.describe(&params).unwrap();
+        assert_eq!(described["vendor_version"], version, "{described}");
     };
     run(async {
         let daemon = Daemon::open_with(&root, case.config());
         c1_turn(&daemon, &case, 1).await;
-        listed(&daemon, 3);
+        listed(&daemon, &original, "0.159.2");
         daemon.stop().await;
     });
     run(async {
         let daemon = Daemon::open_with(&root, case.config());
-        listed(&daemon, 3);
+        listed(&daemon, &original, "0.159.2");
         let session = daemon.spawn(C1_PROMPT, &codex_spawn(&case, 60_000)).await;
         let failed = daemon.wait(&session, 1).await;
         assert_eq!(class(&failed), "protocol", "{failed}");
-        listed(&daemon, 3);
+        listed(&daemon, &original, "0.159.2");
         daemon.stop().await;
     });
     run(async {
         let daemon = Daemon::open_with(&root, case.config());
-        listed(&daemon, 3);
+        listed(&daemon, &original, "0.159.2");
         c1_turn(&daemon, &case, 3).await;
-        listed(&daemon, 1);
+        listed(&daemon, &["gpt-6-luna"], "0.160.0");
         daemon.stop().await;
     });
     run(async {
         let daemon = Daemon::open_with(&root, case.config());
-        listed(&daemon, 1);
+        listed(&daemon, &["gpt-6-luna"], "0.160.0");
         let params = serde_json::from_value(json!({"model":"gpt-6-luna"})).unwrap();
         assert_eq!(
             daemon.engine.describe(&params).unwrap()["vendor_version"],
