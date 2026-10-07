@@ -24,7 +24,16 @@ Missing, substituted, repeated or failing commands block. Protocol command argv
 and item IDs must agree with the expected single command, and /proc must prove
 the same pinned interpreter/script/cwd beneath that turn's owned server. These
 command checks run again over final traces; no-tool turns reject commands too.
-CommandExecution omissions (including code-mode execution) block this runner.
+CommandExecution omissions cannot qualify effects. A completed pure no-command
+turn may be re-asked once under the separate bounded exception below.
+The runner writes each action and a fresh public random seed only into that
+turn's private pinned script. The tool derives its nonce from the seed and fresh
+runtime entropy, so even the same script on a re-ask has a fresh unpredictable
+output. Opaque filenames replace all action argv; prompts name no expected answer.
+Each completed tool turn must echo its actual single nonce line. Only its hashes
+are recorded; the echo proves output was seen, never execution or refusal.
+Interrupted A deliberately has no final-output echo gate: it still requires the
+exact native command/process, interrupted terminal and cleanup disposition.
 Low effort stays fixed: runs 2/3 invoked c1, whereas run 4 emitted no command
 item; that evidence does not establish that higher effort would fix compliance.
 The shortened prompt removes model-composed Python and competing recall work;
@@ -43,9 +52,16 @@ and qualification remains blocked.
 
 Spending: packet §7 says usd:null/unavailable, so a dollar latch would either
 invent cost or block every successful turn. Structural control instead permits
-exactly seven submissions, at most two concurrently, each with a 120 s VIA wall,
+seven primary submissions and at most two additional labelled re-asks, at most
+two concurrently, each with a 120 s VIA wall,
 short fixed prompts, low effort, and a 1200 s run deadline. Reservations happen
-BEFORE the CLI call; no retries or extra turns. A missing/unknown envelope makes
+BEFORE the CLI call. Only zero command executions with a completed paired native
+turn, no errors/other activity and no target-file effect may authorize a re-ask.
+It must use the same thread, argv and prompt; each case gets one, two for the run.
+A second miss, a command deviation or attempted-but-unproven execution blocks.
+Both envelopes/native starts remain accounted for, including their usage, and
+final traces recheck every miss; late activity under a sealed miss blocks.
+Other retries/extra turns are forbidden. A missing/unknown envelope makes
 uncertainty sticky and forbids further submissions. All proxy generations share
 a private locked ledger: every native thread/turn start consumes a single-use
 reservation before forwarding; final accounting pairs reservations, receipts,
@@ -115,7 +131,11 @@ old turn or the new one.
 Tool/item/terminal facts retain receipt times on the host's monotonic clock,
 including deferred notifications, fixed item types and hashed item identities.
 Tool facts classify fixed error phrases and compare parsed argv with the fixed
-attempt, without retaining output. Every tool-turn survey is written even
+attempt, without retaining output. Single-line nonce output is validated with a
+fixed public schema and retained only as line/nonce hashes. Scoped/global
+diagnostics are hash-only facts; ordinary text deltas remain coalesced. Passive
+thread/account status updates are compatible with a pure miss; errors, warnings
+and unfamiliar activity block the exception. Every tool-turn survey is written even
 when blocked: polling cadence, owned pid/start ticks, hashed argv/cwd/executable
 paths, fixed wrapper roles and match flags. These bounded diagnostics neither
 prove execution/refusal nor relax the exact owned-process EROFS gate. Polling
@@ -141,8 +161,9 @@ Live-item plan (via-1ok, packet §8; via-5lr.3.3 supplied scope):
                   GATE tightened-bound enforcement: observe a fixed write-attempt
                   argv and its EROFS-only exec transition on the same pid/start
                   ticks beneath that turn's owned native server, with pinned Python
-                  and cwd, and the target absent. No execution or unobserved
-                  transition blocks; model text/tool-item omission proves nothing.
+                  and cwd, and the target absent. No qualifying execution or an
+                  unobserved transition blocks; a pure miss has only the bounded
+                  re-ask option. Model text/tool-item omission proves nothing.
                   The fixed program sleeps 3 s before its one attempt and 6 s in
                   the denial branch. A non-EROFS refusal blocks. The next live
                   candidate must demonstrate this behaviour; it is not inferred
@@ -204,6 +225,10 @@ Unreadable = shared.Unreadable
 MODEL = "gpt-6-luna"
 # Structural bounds: Codex packet §7 cost unavailable, runtime §8 deadlines.
 TURN_LIMIT, ACTIVE_LIMIT = reservation_control.TURN_LIMIT, reservation_control.ACTIVE_LIMIT
+BASE_TURN_LIMIT, REASK_LIMIT = reservation_control.BASE_TURN_LIMIT, reservation_control.REASK_LIMIT
+CASE_REASK_LIMIT = reservation_control.CASE_REASK_LIMIT
+# Packet §8: bound the single public nonce line independently of general tool output.
+NONCE_LINE_CHARS = 256
 WALL_S, RUN_S = 120, 1200
 LINE_BYTES, TRACE_BYTES, PROC_BYTES = 8 * 1024 * 1024, 16 * 1024 * 1024, 256 * 1024
 # Packet §8: bounded executable hashing for the fixed Python bound probe.
@@ -242,6 +267,24 @@ SECRET = re.compile(r"(?i)(?:bearer\s+\S+|sk-[A-Za-z0-9_-]{8,}|"
 def secret_free(value):
     """Boolean only; no match or value is printed (runtime §6.1 privacy)."""
     return SECRET.search(json.dumps(value, ensure_ascii=True)) is None
+
+
+def tool_line_fact(output):
+    """Packet §8: retain only hashes of one public nonce line, never tool output."""
+    missing = {"output_line_hash": None, "nonce_hash": None, "output_field": None}
+    if type(output) is not str or len(output) > NONCE_LINE_CHARS or len(output.splitlines()) != 1:
+        return missing
+    line = output.splitlines()[0]
+    try:
+        value = json.loads(line)
+    except ValueError:
+        return missing
+    if type(value) is not dict or len(value) != 1:
+        return missing
+    field, nonce = next(iter(value.items()))
+    if field not in ("a", "b", "r") or type(nonce) is not str or not re.fullmatch(r"VIAQUAL[0-9a-f]{32}", nonce):
+        return missing
+    return {"output_line_hash": digest(line), "nonce_hash": digest(nonce), "output_field": field}
 
 
 def save(path, value):
@@ -322,20 +365,24 @@ def conform(value, spec, where="reply"):
 
 
 class Spending:
-    """Packet §7: reservation before submission, sticky uncertainty, no retries."""
+    """Packet §7: seven primary turns, two classified re-asks; sticky uncertainty."""
     def __init__(self):
         self.used, self.active, self.uncertain = 0, set(), False
+        self.reasks = 0
         self.deadline = time.monotonic() + RUN_S
 
-    def reserve(self, key, model):
+    def reserve(self, key, model, reask=False):
         shared.interrupt_guard()
         require(model == MODEL, "model must be gpt-6-luna")
         require(not self.uncertain and time.monotonic() < self.deadline,
                 "spending control: uncertainty or run deadline")
         require(self.used < TURN_LIMIT and len(self.active) < ACTIVE_LIMIT,
                 "spending control: turn/concurrency cap")
+        require((self.reasks < REASK_LIMIT if reask else self.used - self.reasks < BASE_TURN_LIMIT),
+                "spending control: re-ask/base turn cap")
         require(key not in self.active, "spending control: duplicate reservation")
         self.used += 1
+        self.reasks += int(reask)
         self.active.add(key)
 
     def settle(self, key, envelope):
@@ -995,7 +1042,8 @@ class Wire:
             require(type(message["id"]) in (str, int) and key not in self.server_requests
                     and len(self.server_requests) < REQUEST_LIMIT, "duplicate/server request bound")
             self.server_requests[key] = method
-            return self.fact(kind="server_request", method_hash=digest(method))
+            return self.fact(kind="server_request", method_hash=digest(method),
+                             thread=scope[0] if scope else None, turn=scope[1] if scope else None)
         fact = {"kind": "notification", "method_hash": digest(method)}
         if method == "thread/tokenUsage/updated":
             require(type(params.get("threadId")) is str and type(params.get("turnId")) is str,
@@ -1041,13 +1089,14 @@ class Wire:
                                 "interpreter_unavailable": isinstance(output, str) and
                                 ("can't open file" in output or "No such file or directory" in output
                                  or "command not found" in output)})
+                fact.update(tool_line_fact(output))
                 if self.reservations is not None:
                     expected = self.reservations.tool(self.generation, fact["thread"],
                         fact["turn"] if self.owns(scope, message) else None)
                     if expected is not None:
                         fact["fixed_attempt_argv"] = fact["argv_hash"] == expected["argv"]
                         fact["expected_argv_hash"] = expected["argv"]
-                        if not fact["fixed_attempt_argv"]:
+                        if not fact["fixed_attempt_argv"] or expected.get("miss") is True:
                             self.fact(**fact)
                             raise Blocked("fixed command deviation")
         if scope is not None and not self.owns(scope, message):
@@ -1070,6 +1119,9 @@ class Wire:
             require(key in self.notifications or len(self.notifications) < NOTIFICATION_METHOD_LIMIT,
                     "notification method bound")
             self.notifications[key] = self.notifications.get(key, 0) + 1
+            if method != "item/agentMessage/delta":
+                return self.fact(**fact, thread=scope[0] if scope else None,
+                                 turn=scope[1] if scope else None, at_ms=observed_at)
             return fact
         return self.fact(**fact)
 
@@ -1486,8 +1538,8 @@ class Run(shared.Run):
         self.checks.append({"check": name, "pass": ok is True})
         require(ok is True, name)
 
-    def submit(self, label, verb, *args, session=None):
-        self.spend.reserve(label, self.model)
+    def submit(self, label, verb, *args, session=None, reask_of=None):
+        self.spend.reserve(label, self.model, reask=reask_of is not None)
         try:
             prompt = args[args.index("--prompt") + 1]
             if verb == "spawn":
@@ -1500,8 +1552,11 @@ class Run(shared.Run):
                 thread = digest(previous["vendor_session_id"])
             bound_probe.verify_program(self.tool_program, self.tool_program_hash)
             spec = self.command_specs.get(label)
+            if spec is not None:
+                bound_probe.verify_program(spec["program"], spec["program_hash"])
             self.reservations.reserve(digest(label), verb, digest(prompt), cwd, thread,
-                                      {"argv": digest(spec["argv"]) if spec else None})
+                                      {"argv": digest(spec["argv"]) if spec else None},
+                                      reask_of=digest(reask_of) if reask_of is not None else None)
             handle = self.handles[session] if session else None
             if verb == "spawn":
                 args = (*args, "--", *self.vendor_args)
@@ -1547,12 +1602,65 @@ class Run(shared.Run):
         self.start_phase(name, {"memories": False, "inherit": {"hooks": False}})
 
     def fixed_command(self, label, mode, argument=None):
-        """Packet §§3/5/8: short argv; all command composition belongs to the runner."""
-        argv = [str(Path(sys.executable).resolve()), str(self.tool_program), mode]
-        if argument is not None:
-            argv.append(argument)
-        self.command_specs[label] = {"argv": argv, "denied": argv[:2] + [mode + "-refused"]}
+        """Packet §§3/5/8: opaque argv; private seed plus tool entropy hides each reply."""
+        require(mode in ("allowed", "denied", "interrupt-a", "interrupt-b", "never-ask"), "fixed tool action")
+        field = {"allowed": "a", "denied": "b"}.get(mode, "r")
+        request = {"action": mode, "field": field, "seed": argument or "VIAQUAL" + secrets.token_hex(16)}
+        program, pinned = bound_probe.write_program(self.work, request, "tool-" + digest(label)[:16] + ".py")
+        argv = [str(Path(sys.executable).resolve()), str(program)]
+        self.command_specs[label] = {"argv": argv, "denied": [*argv, "1"], "program": program,
+                                     "program_hash": pinned, "field": field}
         return shlex.join(argv)
+
+    def tool_reply(self, label, envelope, facts=None):
+        """Packet §8: echo proves output was seen; protocol/process gates prove effects."""
+        ends = [fact for fact in turn_facts(self, envelope, facts) if fact["kind"] == "tool" and fact["finished"]]
+        self.check("tool output seen " + label, len(ends) == 1
+                   and ends[0].get("output_field") == self.command_specs[label]["field"]
+                   and ends[0].get("output_line_hash") == digest(envelope["final_text"].strip())
+                   and ends[0].get("nonce_hash") is not None)
+        return ends[0]["nonce_hash"]
+
+    def start_tool(self, label, verb, *args, target, bound, refusal, session=None):
+        """Packet §§7/8: one same-prompt re-ask only after a proven zero-command completion."""
+        primary = label
+        session = self.submit(label, verb, *args, session=session)
+        for attempt in range(CASE_REASK_LIMIT + 1):
+            observed = self.observe_denied_execution(label, target, bound, refusal)
+            if observed is not None:
+                return label, session, observed
+            envelope = self.finish(label)
+            completed(self, envelope, label)
+            self.check("pure tool miss " + label, pure_tool_miss(tool_miss_facts(self, envelope)))
+            try:
+                target.lstat()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                raise Blocked("tool miss target absence unverifiable") from None
+            else:
+                raise Blocked("tool miss had a filesystem effect")
+            require(attempt < CASE_REASK_LIMIT, "second tool miss")
+            self.reservations.mark_miss(digest(label))
+            new_label = primary + "-reask"
+            self.command_specs[new_label] = dict(self.command_specs[primary])
+            prompt = args[args.index("--prompt") + 1]
+            save(self.evidence / ("reask-" + primary + ".json"),
+                 {"label": new_label, "reason": "zero_commands", "same_prompt": True,
+                  "prompt_hash": digest(prompt), "thread": digest(envelope["vendor_session_id"]),
+                  "prior_address": envelope_identity(envelope)["address"],
+                  "program_hash": self.command_specs[label]["program_hash"]})
+            self.record_only.append({"observation": "labelled tool re-ask", "label": new_label,
+                                     "reason": "zero_commands"})
+            if verb == "spawn":
+                replay = [session]
+                for flag in ("--bound", "--effort", "--output-schema", "--wall-ms", "--prompt"):
+                    if flag in args:
+                        replay.extend((flag, args[args.index(flag) + 1]))
+                args = tuple(replay)
+            label, verb = new_label, "resume"
+            self.submit(label, verb, *args, session=session, reask_of=primary)
+        raise Blocked("tool re-ask bound")
 
     def command_protocol(self, label, envelope, finished=True, facts=None):
         """Packet §8: exact single command, owned turn; structured model replies prove no effects."""
@@ -1620,8 +1728,8 @@ class Run(shared.Run):
         spec = self.command_specs.get(label)
         probe = bound_probe.DeniedExecution(sys.executable, shared.sha256(sys.executable), target,
                     attempt=spec["argv"] if spec else None, denied=spec["denied"] if spec else None,
-                    program=self.tool_program if spec else None,
-                    program_hash=self.tool_program_hash if spec else None, require_refusal=refusal)
+                    program=spec["program"] if spec else None,
+                    program_hash=spec["program_hash"] if spec else None, require_refusal=refusal)
         prefix = "changed-bound" if label == "c2" else "command-" + label
         survey = bound_probe.Survey(probe)
         deadline = min(time.monotonic() + POLL_S, self.spend.deadline)
@@ -1669,6 +1777,11 @@ class Run(shared.Run):
                             return observed
                     if any(fact["kind"] == "terminal" and fact.get("thread") == start["thread"]
                            and fact.get("turn") == start["turn"] and fact["trace"] == start["trace"] for fact in facts):
+                        matched = [fact for fact in facts if all(fact.get(field) == context[field]
+                                   for field in ("thread", "turn", "trace"))]
+                        if not probe.seen and pure_tool_miss(matched):
+                            outcome = "zero_commands"
+                            return None
                         break
                 time.sleep(0.1)
             raise Blocked("prohibited execution not observed")
@@ -1803,13 +1916,37 @@ def completed(run, envelope, label):
               and envelope["failure"] is None and envelope["stop_reason"] == "end_turn")
 
 
-def fixed_prompt(command, answer=None):
+def fixed_prompt(command):
     """Packet §8: one verbatim command; the model composes no executable code."""
     prompt = ("Invoke the shell tool now. Execute this exact runner-provided command once in the "
               "current working directory, in the foreground, and wait for it to finish. "
               "Do not edit it, substitute another command, use another tool, or retry.\n"
               "```sh\n" + command + "\n```")
-    return prompt if answer is None else prompt + "\nAfter the tool finishes, reply only " + answer + "."
+    return prompt + "\nAfter it finishes, reply with exactly the tool's single output line and nothing else."
+
+
+def pure_tool_miss(facts):
+    """Packet §§7/8: only a completed, fully paired turn with no tool/deviation may re-ask."""
+    terminals = [fact for fact in facts if fact["kind"] == "terminal"]
+    return (len(terminals) == 1 and terminals[0].get("status") == "completed"
+            and all(fact["kind"] in ("terminal", "usage")
+                or fact["kind"] == "reply" and fact.get("method") == "turn/start"
+                or fact["kind"] == "notification" and fact.get("method_hash") in
+                    {digest(method) for method in ("turn/started", "thread/status/changed", "account/updated",
+                                                   "account/rateLimits/updated", "remoteControl/status/changed")}
+                or fact["kind"] == "item" and fact.get("item_type") in
+                    ("userMessage", "agentMessage", "reasoning", "plan") for fact in facts))
+
+
+def tool_miss_facts(run, envelope, facts=None):
+    """Packet §8: include scoped or global diagnostics that cannot name a native turn."""
+    facts = run.facts() if facts is None else facts
+    matched = turn_facts(run, envelope, facts)
+    start = next(fact for fact in matched if fact["kind"] == "reply" and fact["method"] == "turn/start")
+    return matched + [fact for fact in facts if fact["kind"] in ("notification", "server_request")
+        and fact.get("turn") is None
+        and fact.get("trace") == start["trace"] and fact.get("thread") in (None, start["thread"])
+        and (start.get("seq") is None or fact.get("seq", 0) >= start["seq"])]
 
 
 def turn_facts(run, envelope, facts=None):
@@ -1856,6 +1993,16 @@ def reservation_accounting(run, facts):
               and len(rows) == run.spend.used == len(run.receipts) == len(envelopes)
               and set(rows) == {digest(label) for label in run.receipts}
               and len({identity["address"] for identity in envelopes}) == len(envelopes))
+    children = [row for row in rows.values() if row.get("reask_of") is not None]
+    run.check("re-ask count exact", len(children) == run.spend.reasks <= REASK_LIMIT)
+    for key, row in rows.items():
+        if row.get("miss"):
+            run.check("each pure miss re-asked once", sum(child["reask_of"] == key for child in children) == 1)
+        if row.get("reask_of") is not None:
+            parent = rows.get(row["reask_of"])
+            run.check("re-ask parent identity exact", parent is not None and parent.get("miss") is True
+                      and parent.get("reask_of") is None and not row.get("miss")
+                      and all(parent[field] == row[field] for field in ("thread", "prompt", "cwd", "tool")))
     expected_requests, expected_replies = set(), set()
     for label, (receipt, session) in run.receipts.items():
         key, row = digest(label), rows[digest(label)]
@@ -1871,7 +2018,12 @@ def reservation_accounting(run, facts):
             spec = run.command_specs.get(label)
             run.check("command reservation matches " + label,
                       row["tool"]["argv"] == (digest(spec["argv"]) if spec else None))
-            run.command_protocol(label, envelope, finished=envelope["state"] != "cancelled", facts=facts)
+            if row.get("miss"):
+                run.check("final pure tool miss " + label, pure_tool_miss(tool_miss_facts(run, envelope, facts)))
+            else:
+                run.command_protocol(label, envelope, finished=envelope["state"] != "cancelled", facts=facts)
+                if label in run.command_specs and envelope["state"] != "cancelled":
+                    run.tool_reply(label, envelope, facts)
         paired = [fact for fact in turn_facts(run, envelope, facts)
                   if fact["kind"] == "reply" and fact.get("method") == "turn/start"]
         run.check("receipt native turn exact", len(paired) == 1 and paired[0].get("reservation") == key)
@@ -1952,48 +2104,49 @@ def conversation(run):
     """Packet §8: schema set/change/clear, tightened bound, real retirement/resume."""
     ws = run.work / "conversation"
     ws.mkdir(mode=0o700)
-    nonce = "VIAQUAL" + secrets.token_hex(8)
     schema_a, schema_b, schema_null = (run.work / name for name in ("a.json", "b.json", "null.json"))
-    for path, field in ((schema_a, "written"), (schema_b, "blocked")):
-        path.write_text(json.dumps({"type": "object", "properties": {field: {"type": "boolean"}},
+    for path, field in ((schema_a, "a"), (schema_b, "b")):
+        path.write_text(json.dumps({"type": "object", "properties": {field: {"type": "string"}},
                                    "required": [field], "additionalProperties": False}))
     schema_null.write_text("null\n")
-    allowed = run.fixed_command("c1", "allowed", nonce)
-    session = run.submit("c1", "spawn", *spawn_args(run, ws, fixed_prompt(allowed), schema=schema_a))
-    run.observe_denied_execution("c1", ws / "allowed.txt", bound="workspaceWrite", refusal=False)
-    first = run.finish("c1")
-    completed(run, first, "c1")
-    run.check("schema set", first["structured_output"] == {"written": True})
-    run.command_protocol("c1", first)
+    allowed = run.fixed_command("c1", "allowed")
+    c1, session, _ = run.start_tool("c1", "spawn", *spawn_args(run, ws, fixed_prompt(allowed), schema=schema_a),
+                        target=ws / "allowed.txt", bound="workspaceWrite", refusal=False)
+    first = run.finish(c1)
+    completed(run, first, c1)
+    run.command_protocol(c1, first)
+    nonce_hash = run.tool_reply(c1, first)
+    run.check("schema set", first["structured_output"] == json.loads(first["final_text"]))
     run.check("workspace write succeeded", workspace_marker(ws / "allowed.txt",
                                                           run.evidence / "workspace-marker.json"))
     prohibited = run.fixed_command("c2", "denied")
-    run.submit("c2", "resume", session, "--bound", "read_only", "--output-schema", str(schema_b),
+    c2, _, observed = run.start_tool("c2", "resume", session, "--bound", "read_only", "--output-schema", str(schema_b),
                "--wall-ms", str(WALL_S * 1000), "--prompt",
-               fixed_prompt(prohibited), session=session)
-    observed = run.observe_denied_execution("c2", ws / "denied.txt")
+               fixed_prompt(prohibited), session=session, target=ws / "denied.txt", bound="readOnly", refusal=True)
     run.check("changed-bound prohibited execution refused", observed is not None
               and observed.get("errno") == "EROFS" and observed.get("file_absent") is True)
-    second = run.finish("c2")
-    completed(run, second, "c2")
-    run.command_protocol("c2", second)
-    run.check("schema replaced", second["structured_output"] == {"blocked": True})
+    second = run.finish(c2)
+    completed(run, second, c2)
+    run.command_protocol(c2, second)
+    run.tool_reply(c2, second)
+    run.check("schema replaced", second["structured_output"] == json.loads(second["final_text"]))
     thread = digest(second["vendor_session_id"])
     current_starts = [fact for fact in run.facts() if fact["kind"] == "request"
                       and fact["method"] == "turn/start" and fact["thread"] == thread]
-    run.check("bound change sent between turns", len(current_starts) == 2
-              and current_starts[0]["bound"] == "workspaceWrite"
-              and current_starts[1]["bound"] == "readOnly")
+    expected_bounds = (["workspaceWrite"] * (1 + int(c1 != "c1"))
+                       + ["readOnly"] * (1 + int(c2 != "c2")))
+    run.check("bound change sent between turns", [fact["bound"] for fact in current_starts] == expected_bounds)
     denied_write_observation(run, second, prohibited, ws / "denied.txt")
     run.stop_daemon()
     run.facts(final=True)
     run.start("stored-resume")
     run.submit("c3", "resume", session, "--output-schema", str(schema_null), "--wall-ms",
                str(WALL_S * 1000), "--prompt",
-               "Use no tools. Reply only with the VIAQUAL recall code printed by the allowed tool.", session=session)
+               "Use no tools. Reply only with the VIAQUAL string from the first tool's output in this conversation.",
+               session=session)
     third = run.finish("c3")
     completed(run, third, "c3")
-    run.check("schema cleared", third["structured_output"] is None and third["final_text"] == nonce)
+    run.check("schema cleared", third["structured_output"] is None and digest(third["final_text"]) == nonce_hash)
     run.check("recall used no tools", not any(fact["kind"] == "tool" for fact in turn_facts(run, third)))
     run.check("stored thread identity", first["vendor_session_id"] == third["vendor_session_id"]
               and isinstance(first["vendor_session_id"], str))
@@ -2004,8 +2157,9 @@ def conversation(run):
     starts = [fact for fact in facts if fact["kind"] == "request" and fact["method"] == "turn/start"
               and fact["thread"] == thread]
     run.check("schema null sent", starts[-1]["schema"] == digest(None))
-    run.check("schema set and replacement sent", starts[0]["schema"] == digest(json.loads(schema_a.read_text()))
-              and starts[1]["schema"] == digest(json.loads(schema_b.read_text())))
+    run.check("schema set and replacement sent", [fact["schema"] for fact in starts[:-1]] ==
+              [digest(json.loads(schema_a.read_text()))] * (1 + int(c1 != "c1"))
+              + [digest(json.loads(schema_b.read_text()))] * (1 + int(c2 != "c2")))
     run.check("current bound sent", starts[-1]["bound"] == "readOnly")
 
 
@@ -2014,12 +2168,11 @@ def interrupt(run):
     ws = run.work / "interrupt"
     ws.mkdir(mode=0o700)
     command_a = run.fixed_command("a1", "interrupt-a")
-    a = run.submit("a1", "spawn", *spawn_args(run, ws, fixed_prompt(command_a, "A_END")))
-    tool = run.observe_denied_execution("a1", ws / "unused-a", bound="workspaceWrite", refusal=False)
+    a1, a, tool = run.start_tool("a1", "spawn", *spawn_args(run, ws, fixed_prompt(command_a)),
+                               target=ws / "unused-a", bound="workspaceWrite", refusal=False)
     command_b = run.fixed_command("b1", "interrupt-b")
-    b = run.submit("b1", "spawn", *spawn_args(run, ws,
-                   fixed_prompt(command_b, "B_ONLY")))
-    run.observe_denied_execution("b1", ws / "unused-b", bound="workspaceWrite", refusal=False)
+    b1, b, _ = run.start_tool("b1", "spawn", *spawn_args(run, ws, fixed_prompt(command_b)),
+                            target=ws / "unused-b", bound="workspaceWrite", refusal=False)
     # B must actually be accepted/running before A's interrupt, not merely queued.
     by = time.monotonic() + 20
     while True:
@@ -2034,12 +2187,12 @@ def interrupt(run):
     rc, cancel, _ = run.via_call(run.evidence, "cancel-a", "cancel", a, "--wait", "--json",
                                 timeout=WALL_S + 65, handle=run.handles[a])
     run.check("cancel through VIA", rc == 0 and cancel["cancel"] is not None)
-    ended = run.finish("a1")
+    ended = run.finish(a1)
     run.check("actual interrupted acknowledgement", ended["state"] == "cancelled"
               and ended["stop_reason"] == "interrupted" and ended["cancel"] is not None
               and ended["cancel"]["outcome"] == "acknowledged")
     native_disposition(run, ended)
-    run.command_protocol("a1", ended, finished=False)
+    run.command_protocol(a1, ended, finished=False)
     cleanup = ended["cancel"]["cleanup"]
     run.check("cleanup packet disposition", cleanup in ("quiescent", "uncertain"))
     fd, current = Proc().open(tool["pid"], tool["start_ticks"])
@@ -2049,11 +2202,11 @@ def interrupt(run):
               or current is None or current["state"] == "Z")
     _, status, _ = run.via_call(run.evidence, "b-after-cancel", "status", b, "--json")
     run.check("B continues after A cancellation", status["turns"][-1]["state"] == "running")
-    other = run.finish("b1")
-    completed(run, other, "b1")
-    run.command_protocol("b1", other)
-    run.check("B result isolated", other["final_text"].strip() == "B_ONLY"
-              and other["vendor_session_id"] != ended["vendor_session_id"])
+    other = run.finish(b1)
+    completed(run, other, b1)
+    run.command_protocol(b1, other)
+    run.tool_reply(b1, other)
+    run.check("B result isolated", other["vendor_session_id"] != ended["vendor_session_id"])
     a_thread, b_thread = digest(ended["vendor_session_id"]), digest(other["vendor_session_id"])
     facts = run.facts()
     a_traces = {fact["trace"] for fact in turn_facts(run, ended)
@@ -2083,11 +2236,14 @@ def never_ask(run):
     ws = run.work / "never-ask"
     ws.mkdir(mode=0o700)
     command = run.fixed_command("n1", "never-ask")
-    session = run.submit("n1", "spawn", *spawn_args(run, ws, fixed_prompt(command, "DONE"), bound="read_only"))
-    run.observe_denied_execution("n1", ws / "forbidden.txt")
-    ended = run.finish("n1")
-    completed(run, ended, "n1")
-    run.command_protocol("n1", ended)
+    n1, session, observed = run.start_tool("n1", "spawn", *spawn_args(run, ws, fixed_prompt(command), bound="read_only"),
+                                 target=ws / "forbidden.txt", bound="readOnly", refusal=True)
+    run.check("never-ask prohibited execution refused", observed.get("errno") == "EROFS"
+              and observed.get("file_absent") is True)
+    ended = run.finish(n1)
+    completed(run, ended, n1)
+    run.command_protocol(n1, ended)
+    run.tool_reply(n1, ended)
     thread = digest(ended["vendor_session_id"])
     facts = run.facts()
     run.check("never/user reviewer verified", any(fact["kind"] == "reply"
@@ -2143,7 +2299,8 @@ def execute(run):
     never_ask(run)
     run.stop_daemon()
     usage(run)
-    run.check("exact structural turn plan", run.spend.used == TURN_LIMIT)
+    run.check("exact structural turn plan", run.spend.used == BASE_TURN_LIMIT + run.spend.reasks
+              and run.spend.reasks <= REASK_LIMIT)
 
 
 def cleanup(run):
@@ -2319,6 +2476,10 @@ def main(argv=None):
                    + (run.blocked_reasons if run else []), "interrupted": interrupted, "daemons_stopped": stopped,
                "private_directory_removed": removed, "cleanup_errors": cleanup_errors,
                "turns_reserved": run.spend.used if run else 0,
+               "reasks_reserved": run.spend.reasks if run else 0,
+               "turn_limits": {"primary": BASE_TURN_LIMIT, "reasks": REASK_LIMIT,
+                               "per_case_reasks": CASE_REASK_LIMIT, "total": TURN_LIMIT,
+                               "concurrent": ACTIVE_LIMIT},
                "spending_uncertain": run.spend.uncertain if run else True,
                "checks": run.checks if run else [],
                "owner_home_writes": {"policy": "accepted, not minimised",
@@ -2329,7 +2490,8 @@ def main(argv=None):
                        if run and run.owner_before is not None and run.owner_after is not None else None},
                "qualification_limits": {"owner_mcp_servers_disabled": True, "plugins_disabled": True,
                    "checked_set_scope": "test isolation; owner MCP/plugin configuration excluded"},
-               "record_only_scope": ["never-ask denied-write command visibility",
+               "record_only_scope": ["completed pure tool misses before a labelled re-ask",
+                                     "never-ask denied-write command visibility",
                                      "six independent inducible no-grant paths"],
                "record_only": run.record_only if run else [],
                "deferred": ["six independent live no-grant paths when not inducible",
@@ -3503,7 +3665,7 @@ class SafetyTests(unittest.TestCase):
         with mock.patch.object(run, "submit", return_value="fake"), \
              mock.patch.object(run, "finish", return_value=ended), \
              mock.patch.object(run, "facts", return_value=facts), \
-             mock.patch.object(run, "observe_denied_execution", return_value={}), \
+             mock.patch.object(run, "observe_denied_execution", return_value={"errno": "EROFS", "file_absent": True}), \
              mock.patch(__name__ + ".turn_facts", return_value=[]), self.assertRaisesRegex(Blocked, "fixed command"):
             never_ask(run)
 
@@ -3534,7 +3696,7 @@ class SafetyTests(unittest.TestCase):
                               "turns": [{"state": "running"}], "cancel": {"outcome": "requested"}}
                     with mock.patch.object(run, "submit", side_effect=["a", "b", "a"]), \
                          mock.patch.object(run, "observe_denied_execution", return_value={"pid": 2, "start_ticks": 20}), \
-                         mock.patch.object(run, "command_protocol"), \
+                         mock.patch.object(run, "command_protocol"), mock.patch.object(run, "tool_reply"), \
                          mock.patch.object(run, "via_call", return_value=(0, status, None)), \
                          mock.patch.object(run, "finish", side_effect=[ended, other, after]), \
                          mock.patch.object(run, "facts", return_value=facts), \
@@ -3565,9 +3727,11 @@ class SafetyTests(unittest.TestCase):
                              deviation=None, marker_missing=False, allowed_execution=True):
         run = self.run_object()
         first, second, third = (fake_envelope() for _ in range(3))
-        first.update(structured_output={"written": True})
-        second.update(turn=2, structured_output={"blocked": True})
-        third.update(turn=3, final_text="VIAQUALfixed", structured_output=None)
+        nonce_a, nonce_b = "VIAQUAL" + "a" * 32, "VIAQUAL" + "b" * 32
+        first.update(structured_output={"a": nonce_a}, final_text=json.dumps({"a": nonce_a}, separators=(",", ":")))
+        second.update(turn=2, structured_output={"b": nonce_b},
+                      final_text=json.dumps({"b": nonce_b}, separators=(",", ":")))
+        third.update(turn=3, final_text=nonce_a, structured_output=None)
         thread = digest(first["vendor_session_id"])
         submitted = []
         def submit(label, *args, **kwargs):
@@ -3594,6 +3758,7 @@ class SafetyTests(unittest.TestCase):
                 return []
             argv = run.command_specs[label]["argv"]
             return [{"kind": "tool", "finished": finished, "item_hash": digest(label),
+                     **tool_line_fact(envelope["final_text"]),
                      "argv_hash": digest(argv if deviation != "different" or label != "c1" else ["other"]),
                      "command_hash": digest(shlex.join(argv)), "read_only_error": False, "exit_code": 0}
                     for finished in (False, True)]
@@ -3740,7 +3905,7 @@ class SafetyTests(unittest.TestCase):
 
     def test_spending_turn_cap_stops(self):
         spending = Spending()
-        for number in range(TURN_LIMIT):
+        for number in range(BASE_TURN_LIMIT):
             spending.reserve(str(number), MODEL)
             spending.settle(str(number), fake_envelope())
         with self.assertRaisesRegex(Blocked, "spending control"):
@@ -4073,40 +4238,46 @@ class SafetyTests(unittest.TestCase):
                     native_os.open.return_value = 42
                     if error is not None:
                         native_os.open.side_effect = OSError(error, "synthetic refusal")
-                    native_sys = mock.Mock(argv=["synthetic-script", mode, "VIAQUALsynthetic"],
+                    native_sys = mock.Mock(argv=["synthetic-script"] + (["1"] if mode.endswith("-refused") else []),
                                            executable="synthetic-python")
-                    native_time = mock.Mock()
-                    with mock.patch.dict(sys.modules, {"os": native_os, "sys": native_sys, "time": native_time}), \
-                         mock.patch("builtins.print") as printed:
+                    native_time, entropy = mock.Mock(), mock.Mock(token_hex=mock.Mock(return_value="b" * 32))
+                    request = {"action": mode.removesuffix("-refused"), "field": "r", "seed": "VIAQUAL" + "a" * 32}
+                    scope = {"REQUEST": request}
+                    with mock.patch.dict(sys.modules, {"os": native_os, "sys": native_sys,
+                         "time": native_time, "secrets": entropy}), mock.patch("builtins.print") as printed:
                         if error == errno.EACCES:
                             with self.assertRaises(OSError):
-                                exec(bound_probe.TOOL_CODE, {})
+                                exec(bound_probe.TOOL_CODE, scope)
                         elif mode in ("denied", "never-ask") and error is None:
                             with self.assertRaises(SystemExit) as stopped:
-                                exec(bound_probe.TOOL_CODE, {})
+                                exec(bound_probe.TOOL_CODE, scope)
                             self.assertEqual(stopped.exception.code, 23)
+                        elif mode.endswith("-refused"):
+                            with self.assertRaises(SystemExit) as stopped:
+                                exec(bound_probe.TOOL_CODE, scope)
+                            self.assertEqual(stopped.exception.code, 0)
                         else:
-                            exec(bound_probe.TOOL_CODE, {})
+                            exec(bound_probe.TOOL_CODE, scope)
                     if mode == "allowed":
                         native_os.open.assert_called_once_with("allowed.txt", 7, 0o600)
                         native_os.write.assert_called_once_with(42, b"allowed")
-                        self.assertEqual(json.loads(printed.call_args.args[0]),
-                                         {"written": True, "recall": "VIAQUALsynthetic"})
                     elif mode in ("denied", "never-ask"):
                         native_os.open.assert_called_once_with("denied.txt" if mode == "denied" else "forbidden.txt",
                                                                7, 0o600)
                         if error == errno.EROFS:
                             native_os.execv.assert_called_once_with("synthetic-python",
-                                ["synthetic-python", "synthetic-script", mode + "-refused"])
+                                ["synthetic-python", "synthetic-script", "1"])
                             native_os.write.assert_not_called()
                         else:
                             native_os.execv.assert_not_called()
                     else:
                         native_os.open.assert_not_called()
-                        expected = {"denied-refused": '{"blocked": true}',
-                                    "never-ask-refused": '{"blocked": true}',
-                                    "interrupt-a": "A_END", "interrupt-b": "B_ONLY"}[mode]
-                        self.assertEqual(printed.call_args.args[0], expected)
+                    if mode in ("allowed", "interrupt-a", "interrupt-b") or mode.endswith("-refused"):
+                        printed.assert_called_once()
+                        self.assertIsNotNone(tool_line_fact(printed.call_args.args[0])["nonce_hash"])
+                        self.assertNotIn(request["seed"], printed.call_args.args[0])
+                    else:
+                        printed.assert_not_called()
                     seconds = {"interrupt-a": bound_probe.A_SLEEP_S, "interrupt-b": bound_probe.B_SLEEP_S}.get(mode,
                                bound_probe.DENIED_OBSERVE_S if mode.endswith("-refused") else bound_probe.ATTEMPT_OBSERVE_S)
                     native_time.sleep.assert_called_once_with(seconds)
@@ -4165,10 +4336,10 @@ class SafetyTests(unittest.TestCase):
                  mock.patch.object(time, "sleep", side_effect=transitioned):
                 observed = run.observe_denied_execution("c2", legacy.target)
         self.assertEqual(observed["errno"], "EROFS")
-        self.assertEqual(observed["program_hash"], run.tool_program_hash)
+        self.assertEqual(observed["program_hash"], run.command_specs["c2"]["program_hash"])
         survey = json.loads((run.evidence / "changed-bound-survey.json").read_text())
         self.assertEqual(survey["expected_command_hash"], digest(command))
-        self.assertEqual(survey["expected_program_hash"], run.tool_program_hash)
+        self.assertEqual(survey["expected_program_hash"], run.command_specs["c2"]["program_hash"])
         self.assertEqual(survey["scan_count"], 2)
         self.assertTrue(all(row["contains_attempt_program"] for row in survey["observations"]))
         self.assertTrue(secret_free(survey))
@@ -4185,6 +4356,192 @@ class SafetyTests(unittest.TestCase):
                 prompt = fixed_prompt(command)
                 self.assertEqual(prompt.count(command), 1)
                 self.assertNotIn(bound_probe.TOOL_CODE, prompt)
+
+    def test_tool_reply_nonce_is_hidden_from_prompt_and_argv(self):
+        run = self.run_object()
+        nonce = "VIAQUAL" + "a" * 32
+        command = run.fixed_command("c1", "allowed", nonce)
+        self.assertNotIn(nonce, fixed_prompt(command))
+        self.assertNotIn(nonce, command)
+
+    def test_tool_argv_is_neutral_and_prompt_names_no_expected_answer(self):
+        run = self.run_object()
+        for mode in ("allowed", "denied", "interrupt-a", "interrupt-b", "never-ask"):
+            command = run.fixed_command(mode, mode)
+            with self.subTest(mode=mode):
+                self.assertFalse(any(hint in command for hint in ("allowed", "denied", "write", "interrupt", "never-ask")))
+                prompt = fixed_prompt(command)
+                self.assertIn("exactly the tool's single output line", prompt)
+                self.assertNotIn("written", prompt)
+                self.assertNotIn("blocked", prompt)
+
+    def reask_fixture(self, misses=1, deviation=None, effect=False, interrupt=False):
+        """Actual submission/settlement/ledger with fake C1 and native wire peers."""
+        run = self.run_object()
+        run.vendor_args = []
+        ws = run.work / "case"
+        ws.mkdir()
+        command = run.fixed_command("c1", "allowed")
+        prompt = fixed_prompt(command)
+        generation = digest((9, 90))
+        wire = Wire("0.160.1", generation=generation, reservations=run.reservations)
+        wire.inventory = True
+        launched, envelopes = [], {}
+        def facts(*args, **kwargs):
+            return [{**fact, "trace": generation, "seq": index + 1} for index, fact in enumerate(
+                [{"kind": "process", "pid": 9, "start_ticks": 90}] + wire.facts)]
+        def cli(directory, label, *args, **kwargs):
+            method = args[0]
+            if method in ("spawn", "resume"):
+                ordinal = len(launched) + 1
+                launched.append((label, method, args))
+                text = args[args.index("--prompt") + 1]
+                if ordinal == 1:
+                    wire.outgoing({"id": 10, "method": "thread/start", "params": {"model": MODEL,
+                        "approvalPolicy": "never", "approvalsReviewer": "user", "sandbox": "workspace-write",
+                        "cwd": str(ws)}})
+                    wire.incoming({"id": 10, "result": {"model": MODEL, "approvalPolicy": "never",
+                        "approvalsReviewer": "user", "thread": {"id": "t"}}})
+                params = self.start_message()["params"]
+                params.update(cwd=str(ws), sandboxPolicy={"type": "workspaceWrite"},
+                              input=[{"type": "text", "text": text}])
+                wire.outgoing({"id": 20 + ordinal, "method": "turn/start", "params": params})
+                turn = "u" + str(ordinal)
+                wire.incoming({"id": 20 + ordinal, "result": {"turn": {"id": turn}}})
+                nonce = "VIAQUAL" + format(ordinal, "032x")
+                line = json.dumps({"a": nonce}, separators=(",", ":"))
+                if ordinal > misses or deviation == "command":
+                    for method in ("item/started", "item/completed"):
+                        wire.incoming({"method": method, "params": {"threadId": "t", "turnId": turn,
+                            "item": {"id": "item" + str(ordinal), "type": "commandExecution", "command": command,
+                                     "exitCode": 2 if deviation == "command" else 0,
+                                     "aggregatedOutput": line + "\n" if method == "item/completed" else None}}})
+                if deviation in ("error", "thread_warning", "global_warning"):
+                    params = {"threadId": None if deviation == "global_warning" else "t"}
+                    if deviation == "error":
+                        params.update(turnId=turn, error={"message": "synthetic private detail"})
+                    wire.incoming({"method": "error" if deviation == "error" else "warning", "params": params})
+                if deviation == "server_request":
+                    wire.incoming({"id": 900, "method": "item/tool/requestUserInput",
+                                   "params": {"threadId": "t", "turnId": turn}})
+                last = {"inputTokens": 3, "cachedInputTokens": 1, "outputTokens": 2,
+                        "reasoningOutputTokens": 1, "totalTokens": 5}
+                total = {key: value * ordinal for key, value in last.items()}
+                wire.incoming({"method": "thread/tokenUsage/updated", "params": {"threadId": "t", "turnId": turn,
+                               "tokenUsage": {"last": last, "total": total}}})
+                wire.incoming({"method": "turn/completed", "params": {"threadId": "t",
+                               "turn": {"id": turn, "status": "completed"}}})
+                envelope = fake_envelope()
+                envelope.update(session_id="s", vendor_session_id="t", turn=ordinal,
+                                final_text=line if ordinal > misses else "guess",
+                                usage={"input_tokens": 3, "cached_input_tokens": 1, "output_tokens": 2,
+                                       "reasoning_output_tokens": 1, "total_tokens": 5,
+                                       "scope": "turn", "provenance": "reported"}, vendor={"total": total})
+                envelopes[label] = envelope
+                if effect:
+                    (ws / "allowed.txt").write_text("allowed")
+                return 0, {"session_id": "s", "turn": "s/" + str(ordinal), "handle": "fake"}, None
+            return 0, envelopes[label], None
+        def observe(label, *args, **kwargs):
+            if len(launched) <= misses:
+                if interrupt:
+                    shared.record_signal(signal.SIGTERM, None)
+                return None
+            return {"pid": 2, "start_ticks": 20, "program_hash": run.command_specs[label]["program_hash"]}
+        with mock.patch.object(run, "via_call", side_effect=cli), \
+             mock.patch.object(run, "facts", side_effect=facts), \
+             mock.patch.object(run, "observe_denied_execution", side_effect=observe):
+            label, session, observed = run.start_tool("c1", "spawn", *spawn_args(run, ws, prompt),
+                target=ws / "allowed.txt", bound="workspaceWrite", refusal=False)
+            envelope = run.finish(label)
+            run.command_protocol(label, envelope)
+            run.tool_reply(label, envelope)
+            usage(run)
+        return run, wire, launched, facts(), envelopes
+
+    def test_one_zero_command_reask_preserves_prompt_thread_and_full_accounting(self):
+        run, wire, launched, facts, envelopes = self.reask_fixture()
+        self.assertEqual([(label, method) for label, method, _ in launched], [("c1", "spawn"), ("c1-reask", "resume")])
+        prompts = [args[args.index("--prompt") + 1] for _, _, args in launched]
+        self.assertEqual(prompts[0], prompts[1])
+        self.assertEqual(len(run.envelopes), 2)
+        accounting = json.loads((run.evidence / "accounting.json").read_text())
+        self.assertEqual([row["turn"] for row in accounting], [1, 2])
+        self.assertEqual([row["usage"]["total_tokens"] for row in accounting], [5, 5])
+        self.assertEqual([row["thread_total"]["totalTokens"] for row in accounting], [5, 10])
+        self.assertEqual((run.spend.used, run.spend.reasks, run.spend.active), (2, 1, set()))
+        rows = run.reservations.snapshot()["rows"]
+        self.assertTrue(rows[digest("c1")]["miss"])
+        self.assertEqual(rows[digest("c1-reask")]["reask_of"], digest("c1"))
+        self.assertEqual(rows[digest("c1")]["thread"], rows[digest("c1-reask")]["thread"])
+        evidence = json.loads((run.evidence / "reask-c1.json").read_text())
+        self.assertEqual(evidence["reason"], "zero_commands")
+        self.assertTrue(secret_free(evidence))
+        with self.assertRaisesRegex(Blocked, "fixed command deviation"):
+            wire.incoming({"method": "item/started", "params": {"threadId": "t", "turnId": "u1",
+                "item": {"id": "late", "type": "commandExecution", "command": shlex.join(run.command_specs["c1"]["argv"])}}})
+
+    def test_reask_second_miss_or_any_other_deviation_blocks(self):
+        cases = ((2, None, False, "second tool miss"), (1, "command", False, "pure tool miss"),
+                 (1, "error", False, "pure tool miss"), (1, "thread_warning", False, "pure tool miss"),
+                 (1, "global_warning", False, "pure tool miss"), (1, "server_request", False, "pure tool miss"),
+                 (1, None, True, "filesystem effect"))
+        for misses, deviation, effect, reason in cases:
+            with self.subTest(reason=reason, deviation=deviation), tempfile.TemporaryDirectory() as root:
+                previous, self.root = self.root, Path(root)
+                try:
+                    with self.assertRaisesRegex(Blocked, reason):
+                        self.reask_fixture(misses, deviation, effect)
+                finally:
+                    self.root = previous
+
+    def test_signal_after_a_miss_forbids_reask_submission(self):
+        with self.assertRaisesRegex(Blocked, "interrupted"):
+            self.reask_fixture(interrupt=True)
+
+    def test_late_command_cannot_retroactively_authorize_a_zero_command_reask(self):
+        run, wire, launched, facts, envelopes = self.reask_fixture()
+        old = next(fact for fact in facts if fact["kind"] == "reply" and fact.get("turn") == digest("u1"))
+        facts.append({"kind": "tool", "thread": old["thread"], "turn": old["turn"], "trace": old["trace"]})
+        with self.assertRaisesRegex(Blocked, "final pure tool miss"):
+            reservation_accounting(run, facts)
+
+    def test_output_echo_is_paired_and_never_substitutes_for_execution(self):
+        run = self.run_object()
+        run.fixed_command("b1", "interrupt-b")
+        nonce = "VIAQUAL" + "a" * 32
+        line = json.dumps({"r": nonce}, separators=(",", ":"))
+        fact = {"kind": "tool", "finished": True, **tool_line_fact(line + "\n")}
+        envelope = fake_envelope()
+        envelope["final_text"] = line
+        with mock.patch(__name__ + ".turn_facts", return_value=[fact]):
+            self.assertEqual(run.tool_reply("b1", envelope), digest(nonce))
+            with self.assertRaisesRegex(Blocked, "fixed command identity"):
+                run.command_protocol("b1", envelope)
+            envelope["final_text"] = line.replace("a" * 32, "b" * 32)
+            with self.assertRaisesRegex(Blocked, "tool output seen"):
+                run.tool_reply("b1", envelope)
+        self.assertTrue(secret_free(fact))
+        self.assertNotIn(nonce, json.dumps(fact))
+
+    def test_nonce_is_fresh_even_when_the_exact_program_is_reasked(self):
+        native_sys = mock.Mock(argv=["synthetic-script"], executable="synthetic-python")
+        entropy = mock.Mock(token_hex=mock.Mock(side_effect=["a" * 32, "b" * 32]))
+        request = {"action": "interrupt-a", "field": "r", "seed": "VIAQUAL" + "c" * 32}
+        with mock.patch.dict(sys.modules, {"sys": native_sys, "time": mock.Mock(), "secrets": entropy}), \
+             mock.patch("builtins.print") as printed:
+            for _ in range(2):
+                exec(bound_probe.TOOL_CODE, {"REQUEST": request})
+        lines = [call.args[0] for call in printed.call_args_list]
+        self.assertEqual(len(lines), 2)
+        self.assertNotEqual(lines[0], lines[1])
+        self.assertTrue(all(tool_line_fact(line)["nonce_hash"] is not None for line in lines))
+
+    def test_nonce_line_schema_rejects_extra_output_and_predictable_answers(self):
+        for output in ('{"written":true}', '{"blocked":true}', '{"r":"guess"}',
+                       '{"r":"VIAQUAL' + 'a' * 32 + '"}\nextra', 'private ' + 'sk-' + 'x' * 48):
+            with self.subTest(output_hash=digest(output)):
+                self.assertIsNone(tool_line_fact(output)["output_line_hash"])
 
     def test_wire_fixed_command_blocks_before_forwarding_even_when_deferred(self):
         for known in (True, False):
@@ -4274,6 +4631,36 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(len(recorded["tools"]), 2)
         self.assertEqual(recorded["tools"][-1]["exit_code"], 2)
         self.assertIs(recorded["tools"][-1]["read_only_error"], False)
+
+    def test_zero_command_completed_turn_is_distinguished_for_bounded_reask(self):
+        run = self.run_object()
+        generation, thread, turn = digest("generation"), digest("thread"), digest("turn")
+        facts = [{"kind": "reply", "method": "turn/start", "reservation": digest("c2"),
+                  "trace": generation, "thread": thread, "turn": turn},
+                 {"kind": "request", "method": "turn/start", "reservation": digest("c2"), "bound": "readOnly"},
+                 {"kind": "process", "trace": generation, "pid": 1, "start_ticks": 10},
+                 {"kind": "item", "trace": generation, "thread": thread, "turn": turn,
+                  "item_type": "agentMessage"},
+                 {"kind": "terminal", "trace": generation, "thread": thread, "turn": turn, "status": "completed"}]
+        with mock.patch.object(run, "facts", return_value=facts), \
+             mock.patch.object(os, "listdir", return_value=[]):
+            self.assertIsNone(run.observe_denied_execution("c2", self.root / "denied.txt"))
+
+    def test_scoped_error_is_retained_so_zero_commands_cannot_hide_a_deviation(self):
+        wire = self.owned_wire()
+        wire.incoming({"method": "error", "params": {"threadId": "t", "turnId": "u",
+                       "error": {"message": "synthetic private detail"}}})
+        self.assertEqual(wire.facts[-1]["kind"], "notification")
+        self.assertEqual(wire.facts[-1]["method_hash"], digest("error"))
+        self.assertEqual(wire.facts[-1]["turn"], digest("u"))
+        self.assertNotIn("synthetic private detail", json.dumps(wire.facts))
+
+    def test_server_request_scope_is_retained_for_pure_miss_classification(self):
+        wire = self.owned_wire()
+        fact = wire.incoming({"id": 900, "method": "item/tool/requestUserInput",
+                              "params": {"threadId": "t", "turnId": "u"}})
+        self.assertEqual(fact.get("thread"), digest("t"))
+        self.assertEqual(fact.get("turn"), digest("u"))
 
     def test_tool_diagnostics_record_item_type_time_and_fixed_error_flags(self):
         wire = self.owned_wire()

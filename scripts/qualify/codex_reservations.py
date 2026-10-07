@@ -9,8 +9,11 @@ import time
 
 from claude import Blocked
 
-# Packet §7/runtime §8: seven submissions, two active, bounded private ledger/lock.
-TURN_LIMIT, ACTIVE_LIMIT, LEDGER_BYTES, LOCK_S = 7, 2, 256 * 1024, 2
+# Packet §7/runtime §8: seven base submissions plus two verified no-command re-asks.
+BASE_TURN_LIMIT, REASK_LIMIT, ACTIVE_LIMIT, LEDGER_BYTES, LOCK_S = 7, 2, 2, 256 * 1024, 2
+# Packet §8 qualification: owner-authorized exception, once per zero-command case.
+CASE_REASK_LIMIT = 1
+TURN_LIMIT = BASE_TURN_LIMIT + REASK_LIMIT
 
 
 def require(ok, reason):
@@ -83,18 +86,41 @@ class Reservations:
         finally:
             os.close(fd)
 
-    def reserve(self, key, verb, prompt, cwd, thread=None, tool=None):
+    def reserve(self, key, verb, prompt, cwd, thread=None, tool=None, reask_of=None):
         """Packet §7: admit before CLI launch, never recycle an accepted reservation."""
         with self.transaction() as state:
             rows = state["rows"]
             require(not state["closed"] and time.monotonic() < state["deadline"], "closed or expired")
             require(len(rows) < TURN_LIMIT and sum(row["active"] for row in rows.values()) < ACTIVE_LIMIT,
                     "turn/concurrency cap")
+            if reask_of is None:
+                require(sum(row["reask_of"] is None for row in rows.values()) < BASE_TURN_LIMIT,
+                        "base turn cap")
+            else:
+                parent = rows.get(reask_of)
+                require(sum(row["reask_of"] is not None for row in rows.values()) < REASK_LIMIT,
+                        "re-ask cap")
+                require(parent is not None and parent["miss"] and parent["reask_of"] is None
+                        and not parent["active"] and verb == "resume" and parent["thread"] == thread
+                        and parent["prompt"] == prompt and parent["cwd"] == cwd and parent["tool"] == tool
+                        and not any(row["reask_of"] == reask_of for row in rows.values()),
+                        "re-ask is not a unique same-thread same-prompt tool miss")
             require(key not in rows and verb in ("spawn", "resume"), "duplicate or invalid submission")
             require(verb == "spawn" or thread is not None, "resume identity unavailable")
             rows[key] = {"verb": verb, "prompt": prompt, "cwd": cwd, "thread": thread,
                          "active": True, "thread_start": None, "turn_start": None,
-                         "receipt": None, "envelope": None, "tool": tool}
+                         "receipt": None, "envelope": None, "tool": tool,
+                         "miss": False, "reask_of": reask_of}
+
+    def mark_miss(self, key):
+        """Packet §§7/8: only a settled first tool miss may authorize one same-thread re-ask."""
+        with self.transaction() as state:
+            row = state["rows"][key]
+            require(not row["active"] and row["envelope"] is not None
+                    and row["envelope"]["state"] == "completed" and row["reask_of"] is None
+                    and row["tool"] is not None and row["tool"]["argv"] is not None
+                    and not row["miss"], "invalid tool miss")
+            row["miss"] = True
 
     def tool(self, generation, thread, turn=None):
         """Packet §§3/7: expected command digest, including replies still establishing a turn."""
@@ -103,6 +129,8 @@ class Reservations:
                     and row["turn_start"] is not None and row["turn_start"]["generation"] == generation
                     and (row["active"] if turn is None else row["turn_start"].get("turn") == turn)]
             require(len(rows) <= 1, "ambiguous tool reservation")
+            if rows and rows[0]["miss"]:
+                return {**rows[0]["tool"], "miss": True}
             return rows[0].get("tool") if rows else None
 
     def close(self):

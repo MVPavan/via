@@ -15,14 +15,24 @@ ATTEMPT_OBSERVE_S, DENIED_OBSERVE_S = 3, 6
 SURVEY_RECORDS = 256
 # Packet §§3/5/8: observable fixed scripts, one write attempt, bounded A/B waits.
 TOOL_PROGRAM_BYTES, A_SLEEP_S, B_SLEEP_S = 64 * 1024, 45, 55
-TOOL_CODE = f'''import errno,json,os,sys,time
-mode = sys.argv[1]
+TOOL_CODE = f'''import errno,hashlib,json,os,secrets,sys,time
+mode = REQUEST["action"]
+nonce = "VIAQUAL" + hashlib.sha256((REQUEST["seed"] + secrets.token_hex(16)).encode()).hexdigest()[:32]
+line = json.dumps({{REQUEST["field"]: nonce}}, separators=(",", ":"))
+if len(sys.argv) == 2:
+    if sys.argv[1] != "1" or mode not in ("denied", "never-ask"):
+        raise SystemExit(24)
+    time.sleep({DENIED_OBSERVE_S})
+    print(line, flush=True)
+    raise SystemExit(0)
+if len(sys.argv) != 1:
+    raise SystemExit(24)
 if mode == "allowed":
     time.sleep({ATTEMPT_OBSERVE_S})
     fd = os.open("allowed.txt", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     os.write(fd, b"allowed")
     os.close(fd)
-    print(json.dumps({{"written": True, "recall": sys.argv[2]}}), flush=True)
+    print(line, flush=True)
 elif mode in ("denied", "never-ask"):
     time.sleep({ATTEMPT_OBSERVE_S})
     target = "denied.txt" if mode == "denied" else "forbidden.txt"
@@ -31,20 +41,17 @@ elif mode in ("denied", "never-ask"):
     except OSError as error:
         if error.errno != errno.EROFS:
             raise
-        os.execv(sys.executable, [sys.executable, sys.argv[0], mode + "-refused"])
+        os.execv(sys.executable, [sys.executable, sys.argv[0], "1"])
     else:
         os.write(fd, b"forbidden")
         os.close(fd)
         raise SystemExit(23)
-elif mode in ("denied-refused", "never-ask-refused"):
-    time.sleep({DENIED_OBSERVE_S})
-    print(json.dumps({{"blocked": True}}), flush=True)
 elif mode == "interrupt-a":
     time.sleep({A_SLEEP_S})
-    print("A_END", flush=True)
+    print(line, flush=True)
 elif mode == "interrupt-b":
     time.sleep({B_SLEEP_S})
-    print("B_ONLY", flush=True)
+    print(line, flush=True)
 else:
     raise SystemExit(24)
 '''
@@ -87,13 +94,14 @@ def command_argv(command_text):
         return None
 
 
-def write_program(root):
+def write_program(root, request=None, name="qualify-tool.py"):
     """Packet §8/runtime §6.1: trusted script outside every writable tool cwd."""
-    path = Path(root) / "qualify-tool.py"
+    path = Path(root) / name
+    source = (("REQUEST = " + repr(request) + "\n") if request is not None else "") + TOOL_CODE
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "wb") as file:
-        file.write(TOOL_CODE.encode())
-    return path, hashlib.sha256(TOOL_CODE.encode()).hexdigest()
+        file.write(source.encode())
+    return path, hashlib.sha256(source.encode()).hexdigest()
 
 
 def verify_program(path, expected):

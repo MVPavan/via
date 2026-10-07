@@ -45,7 +45,7 @@ class ReservationTests(unittest.TestCase):
         for index in range(7):
             key = self.reserve(index)
             self.settle(key, index)
-        with self.assertRaisesRegex(Blocked, "turn/concurrency cap"):
+        with self.assertRaisesRegex(Blocked, "base turn cap"):
             Reservations(self.path).reserve(digest(8), "spawn", digest("prompt"), digest("cwd"))
 
     def test_pending_tool_uses_active_turn_not_settled_history(self):
@@ -77,6 +77,80 @@ class ReservationTests(unittest.TestCase):
             self.assertFalse(thread.is_alive())
         self.assertEqual(len(admitted), 2)
         self.assertEqual(len(refused), 1)
+
+    def test_only_two_same_prompt_same_thread_reasks_extend_the_seven_turn_cap(self):
+        for index in range(7):
+            key = digest(index)
+            self.ledger.reserve(key, "spawn", digest("prompt"), digest("cwd"),
+                                tool={"argv": digest("fixed command")})
+            self.settle(key, index)
+        for index in (0, 1):
+            self.ledger.mark_miss(digest(index))
+            self.ledger.reserve(digest((index, "reask")), "resume", digest("prompt"), digest("cwd"),
+                digest((index, "thread")), {"argv": digest("fixed command")}, reask_of=digest(index))
+        with self.assertRaises(Blocked):
+            self.ledger.reserve(digest("ordinary eighth"), "spawn", digest("prompt"), digest("cwd"))
+        self.assertEqual(len(self.ledger.snapshot()["rows"]), 9)
+
+    def test_reasks_require_a_proven_miss_and_identical_submission_identity(self):
+        key, tool = digest(0), {"argv": digest("fixed command")}
+        self.ledger.reserve(key, "spawn", digest("prompt"), digest("cwd"), tool=tool)
+        self.settle(key, 0)
+        thread = digest((0, "thread"))
+        with self.assertRaisesRegex(Blocked, "unique same-thread same-prompt"):
+            self.ledger.reserve(digest("unmarked"), "resume", digest("prompt"), digest("cwd"), thread,
+                                tool, reask_of=key)
+        self.ledger.mark_miss(key)
+        cases = (("spawn", digest("prompt"), digest("cwd"), thread, tool),
+                 ("resume", digest("changed"), digest("cwd"), thread, tool),
+                 ("resume", digest("prompt"), digest("changed"), thread, tool),
+                 ("resume", digest("prompt"), digest("cwd"), digest("foreign"), tool),
+                 ("resume", digest("prompt"), digest("cwd"), thread, {"argv": digest("other command")}))
+        for index, (verb, prompt, cwd, candidate_thread, candidate_tool) in enumerate(cases):
+            with self.subTest(index=index), self.assertRaisesRegex(Blocked, "unique same-thread same-prompt"):
+                self.ledger.reserve(digest(index + 10), verb, prompt, cwd, candidate_thread, candidate_tool, reask_of=key)
+        self.ledger.reserve(digest("valid"), "resume", digest("prompt"), digest("cwd"), thread, tool, reask_of=key)
+        with self.assertRaisesRegex(Blocked, "unique same-thread same-prompt"):
+            self.ledger.reserve(digest("duplicate"), "resume", digest("prompt"), digest("cwd"), thread, tool, reask_of=key)
+        self.assertEqual(len(self.ledger.snapshot()["rows"]), 2)
+
+    def test_non_tool_turns_and_failed_or_active_turns_cannot_be_marked_as_misses(self):
+        key = self.reserve()
+        with self.assertRaisesRegex(Blocked, "invalid tool miss"):
+            self.ledger.mark_miss(key)
+
+        self.settle(key, 0)
+        with self.assertRaisesRegex(Blocked, "invalid tool miss"):
+            self.ledger.mark_miss(key)
+        with self.ledger.transaction() as state:
+            state["rows"][key]["tool"] = {"argv": digest("fixed command")}
+            state["rows"][key]["envelope"]["state"] = "failed"
+        with self.assertRaisesRegex(Blocked, "invalid tool miss"):
+            self.ledger.mark_miss(key)
+
+    def test_reask_cap_is_two_even_when_total_and_concurrency_have_room(self):
+        tool = {"argv": digest("fixed command")}
+        for index in range(3):
+            key = digest(index)
+            self.ledger.reserve(key, "spawn", digest("prompt"), digest("cwd"), tool=tool)
+            self.settle(key, index)
+            self.ledger.mark_miss(key)
+        for index in (0, 1):
+            key, generation, thread = digest((index, "reask")), digest(index), digest((index, "thread"))
+            self.ledger.reserve(key, "resume", digest("prompt"), digest("cwd"), thread, tool, reask_of=digest(index))
+            request = digest((index, "reask request"))
+            self.ledger.claim("turn/start", generation, request, digest("cwd"), thread, digest("prompt"))
+            self.ledger.reply(key, "turn/start", generation, request, thread, digest((index, "new turn")))
+            identity = {"session": digest((index, "session")), "address": digest((index, "new address")),
+                        "thread": thread, "turn": 2, "state": "completed", "stop_reason": "end_turn"}
+            self.ledger.receipt(key, {field: identity[field] for field in ("session", "address")})
+            self.ledger.settle(key, identity)
+            with self.assertRaisesRegex(Blocked, "invalid tool miss"):
+                self.ledger.mark_miss(key)
+        self.assertEqual(len(self.ledger.snapshot()["rows"]), 5)
+        with self.assertRaisesRegex(Blocked, "re-ask cap"):
+            self.ledger.reserve(digest("third"), "resume", digest("prompt"), digest("cwd"),
+                                digest((2, "thread")), tool, reask_of=digest(2))
 
     def test_native_claim_is_single_use_across_generations(self):
         key = self.reserve()
