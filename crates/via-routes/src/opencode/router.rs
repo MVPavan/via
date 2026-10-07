@@ -665,6 +665,13 @@ impl Router {
                 last.phase = phase;
             }
         }
+        if matches!(phase, InputPhase::NotAccepted | InputPhase::NeverSent)
+            && let Some(session) = self.sessions.get_mut(session)
+        {
+            // §7.2, §8: typed rejection or positive withdrawal proves this input's
+            // fate in either order with every producer's first-byte DELETE claim.
+            reopen::prove_input_fate(session, input);
+        }
         self.changed.notify_waiters();
     }
 
@@ -2768,6 +2775,77 @@ mod tests {
         router.finish_reopen_cleanup("ses_new");
         assert!(!router.begin_reopen_cleanup("ses_new"));
         assert!(router.eligible("ses_new"));
+    }
+
+    #[test]
+    fn oc05_never_sent_resolves_cancel_claim_in_both_orders() {
+        for proof_first in [false, true] {
+            let mut router = Router::new();
+            attach(&mut router, "ses_a");
+            router.register_turn("ses_a", "input_a".into(), turn(1));
+            router.mark_sent("ses_a", "input_a");
+            if proof_first {
+                router.never_sent("ses_a", "input_a");
+            }
+            router.inbox_cancel_sent("ses_a", "input_a");
+            if !proof_first {
+                router.never_sent("ses_a", "input_a");
+            }
+            assert!(router.eligible("ses_a"), "proof_first={proof_first}");
+        }
+    }
+
+    #[test]
+    fn oc05_proven_input_fate_survives_successor_registration() {
+        for withdrawn in [false, true] {
+            let mut router = Router::new();
+            attach(&mut router, "ses_a");
+            router.register_turn("ses_a", "input_a".into(), turn(1));
+            router.mark_sent("ses_a", "input_a");
+            if withdrawn {
+                router.never_sent("ses_a", "input_a");
+            } else {
+                router.not_accepted("ses_a", "input_a");
+            }
+            router.settle("ses_a", turn(1));
+            assert!(router.eligible("ses_a"));
+            router.register_turn("ses_a", "input_b".into(), turn(2));
+            router.inbox_cancel_sent("ses_a", "input_a");
+            assert!(!router.state("ses_a").unwrap().cleanup_pending);
+            assert_eq!(
+                router
+                    .state("ses_a")
+                    .unwrap()
+                    .last
+                    .as_ref()
+                    .unwrap()
+                    .input_id,
+                "input_b"
+            );
+        }
+    }
+
+    #[test]
+    fn oc05_unknown_preacceptance_end_is_not_cancel_claim_proof() {
+        let mut router = Router::new();
+        attach(&mut router, "ses_a");
+        router.register_turn("ses_a", "input_a".into(), turn(1));
+        router.mark_sent("ses_a", "input_a");
+        router.inbox_cancel_sent("ses_a", "input_a");
+        router.settle("ses_a", turn(1));
+        router.begin_reopen_cleanup("ses_a");
+        assert!(router.reopen_inbox("ses_a", &[]).is_empty());
+        router.finish_reopen_cleanup("ses_a");
+        assert!(router.state("ses_a").unwrap().cleanup_pending);
+        assert!(!router.eligible("ses_a"));
+        apply(
+            &mut router,
+            "ses_a",
+            "session.inbox.cancelled",
+            json!({"inboxID":"input_a"}),
+            None,
+        );
+        assert!(router.eligible("ses_a"));
     }
 
     #[test]

@@ -812,7 +812,11 @@ one of VIA's recomputed caller IDs for the session (a leftover input of an
 `unknown` turn, E53): `DELETE …/inbox/{id}`, then wait for its
 `inbox.cancelled` (the 204 proves nothing, E48). The cleanup records
 nothing and revises no turn. Other items are left to the vendor; foreign
-inbox writers are a qualification item (§13).
+inbox writers are a qualification item (§13). A sent cancel claim on any path
+is resolved only by proof of that input's fate (stream cancellation or
+delivery, typed non-acceptance under §8, or positive withdrawal before send)
+or the generation ending; proof is retained in either ordering with the claim,
+and delivery still waits for the execution rule above.
 
 ### 7.3 Terminal and final text
 

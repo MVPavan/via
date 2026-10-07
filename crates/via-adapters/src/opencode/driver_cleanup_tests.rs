@@ -449,3 +449,189 @@ fn oc09_model_switch_201_html_drains_without_prompt() {
 fn oc09_session_create_201_malformed_drains_without_prompt() {
     run(unexpected_success(false));
 }
+
+/// §7.4, §8, §9: both control producers share first-byte claims and typed fate proof.
+async fn rejected_prompt_cancel_claim(proof_first: bool, overflow: bool) {
+    let rig = Rig::new(&json!({}));
+    let mut next = fixture(rig.root().to_str().unwrap(), success());
+    let prompt_gate = rig.root().join("release-rejected-prompt");
+    let pool_gate = rig.root().join("release-cancel-pool");
+    let delete_gate = rig.root().join("release-cancel-response");
+    replace(
+        &mut next,
+        route(
+            "POST",
+            &format!("/api/session/{SES}/prompt"),
+            &json!([
+                {"status":200,"json":{"data":{"id":"$INPUT","sessionID":"$SESSION"}},
+                 "emit":success()},
+                {"status":400,"json":{"_tag":"InvalidRequestError"},
+                 "wait_for_file":prompt_gate},
+                {"status":200,"json":{"data":{"id":"$INPUT","sessionID":"$SESSION"}},
+                 "emit":success()}
+            ]),
+        ),
+    );
+    replace(
+        &mut next,
+        route(
+            "DELETE",
+            &format!("/api/session/{SES}/inbox/*"),
+            &json!([{"status":204,"wait_for_file":delete_gate}]),
+        ),
+    );
+    replace(
+        &mut next,
+        route(
+            "POST",
+            "/api/session/ses_cancel_hold*",
+            &json!([{"status":200,"json":{"interrupted":false},"wait_for_file":pool_gate}]),
+        ),
+    );
+    rig.fixture(&next);
+    let mut lane = bootstrap(&rig).await;
+    let live = server(&lane).unwrap();
+    let mut holds = JoinSet::new();
+    if proof_first {
+        for index in 0..2 {
+            let live = Arc::clone(&live);
+            holds.spawn(async move {
+                turn::interrupt(
+                    live.http(),
+                    &format!("ses_cancel_hold{index}"),
+                    Deadline::at(tokio::time::Instant::now() + Duration::from_secs(4)),
+                )
+                .await
+            });
+        }
+        assert!(
+            until(|| rig
+                .requests()
+                .iter()
+                .filter(|request| {
+                    request["target"]
+                        .as_str()
+                        .is_some_and(|target| target.contains("ses_cancel_hold"))
+                })
+                .count()
+                == 2)
+            .await,
+            "stop pool did not fill"
+        );
+    }
+    row(&rig, 2, "running");
+    let (context, stop) = controls(&lane, 2);
+    let active = tokio::spawn(async move {
+        let (end, _) = lane.turn_context(None, context).await;
+        (lane, end)
+    });
+    assert!(
+        until(|| prompts(&rig.requests()).len() == 2).await,
+        "prompt was not sent"
+    );
+    let input = prompts(&rig.requests())[1]["body"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    if overflow {
+        // Exercise the generation-owned overflow pump without coupling this race to
+        // observation saturation; the lane-overflow fixtures cover its producer.
+        live.routing().enqueue_cleanup(
+            SES,
+            crate::TurnNumber::try_from(2).unwrap(),
+            Deadline::at(tokio::time::Instant::now() + Duration::from_secs(3)),
+        );
+    } else {
+        cancel(&stop, Duration::from_secs(1));
+    }
+    let delete = format!("/api/session/{SES}/inbox/{input}");
+    if proof_first {
+        assert!(
+            until(|| live
+                .routing()
+                .state(SES)
+                .is_some_and(|state| { state.pending_requests == 2 }))
+            .await,
+            "DELETE intent did not reach the full stop pool"
+        );
+        assert_eq!(
+            requests_to(&rig.requests(), &delete),
+            0,
+            "DELETE must still be unsent"
+        );
+        std::fs::write(&prompt_gate, b"release").unwrap();
+        assert!(
+            until(|| live.routing().state(SES).is_some_and(|state| {
+                state.last.as_ref().is_some_and(|last| {
+                    last.phase == via_routes::opencode::state::InputPhase::NotAccepted
+                })
+            }))
+            .await,
+            "typed 400 was not classified before DELETE first byte"
+        );
+        std::fs::write(&pool_gate, b"release").unwrap();
+        while let Some(result) = holds.join_next().await {
+            result.unwrap().unwrap();
+        }
+    }
+    assert!(
+        until(|| requests_to(&rig.requests(), &delete) == 1).await,
+        "DELETE was not sent"
+    );
+    if !proof_first {
+        assert!(
+            live.routing().state(SES).unwrap().cleanup_pending,
+            "claim was not created"
+        );
+        std::fs::write(&prompt_gate, b"release").unwrap();
+    }
+    std::fs::write(&delete_gate, b"release").unwrap();
+    let (mut lane, end) = active.await.unwrap();
+    row(&rig, 2, "unknown");
+    let released = until(|| {
+        live.routing()
+            .state(SES)
+            .is_some_and(|state| state.pending_requests == 0)
+    })
+    .await;
+    let unfenced = !live.routing().state(SES).unwrap().cleanup_pending;
+    row(&rig, 3, "running");
+    let (successor, _) = lane.turn(3, None, RETRY_WALL).await;
+    let healthy = !live.is_draining();
+    let prompt_count = prompts(&rig.requests()).len();
+    let delete_count = requests_to(&rig.requests(), &delete);
+    lane.close().await;
+    drop(live);
+    rig.finish().await;
+    assert!(
+        released && healthy,
+        "requests did not settle normally: {end:?}"
+    );
+    assert!(
+        unfenced,
+        "typed non-acceptance left a cancel claim unresolved"
+    );
+    assert!(completed(&successor), "successor blocked: {successor:?}");
+    assert_eq!(prompt_count, 3, "one prompt per turn; never resend");
+    assert_eq!(delete_count, 1, "at most one sent DELETE per input");
+}
+
+#[test]
+fn oc08_live_cancel_claim_before_typed_rejection_releases_successor() {
+    run(rejected_prompt_cancel_claim(false, false));
+}
+
+#[test]
+fn oc08_live_cancel_claim_after_typed_rejection_releases_successor() {
+    run(rejected_prompt_cancel_claim(true, false));
+}
+
+#[test]
+fn oc09_overflow_cancel_claim_before_typed_rejection_releases_successor() {
+    run(rejected_prompt_cancel_claim(false, true));
+}
+
+#[test]
+fn oc09_overflow_cancel_claim_after_typed_rejection_releases_successor() {
+    run(rejected_prompt_cancel_claim(true, true));
+}

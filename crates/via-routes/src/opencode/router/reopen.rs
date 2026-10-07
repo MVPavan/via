@@ -3,14 +3,14 @@
 use std::collections::HashMap;
 use std::sync::PoisonError;
 
-use super::{InboxKind, InputPhase, Router, Session};
+use super::{InboxKind, Router, Session};
 
-/// §7.2: listing membership never substitutes for a sent DELETE's stream proof.
+/// §7.2, §8: listing membership never substitutes for proof of an input's fate.
 #[derive(Default)]
 struct Leftover {
     listed: bool,
     sent: bool,
-    observed: bool,
+    proven: bool,
 }
 
 /// §7.2, §9: IDs share the correlation budget and live until the generation ends.
@@ -35,7 +35,7 @@ impl Cleanup {
             || self
                 .inputs
                 .values()
-                .any(|input| !input.observed && (input.listed || input.sent))
+                .any(|input| !input.proven && (input.listed || input.sent))
     }
 
     pub(super) fn contains(&self, input: &str) -> bool {
@@ -47,17 +47,29 @@ fn refresh(session: &mut Session) {
     session.state.cleanup_pending = session.cleanup.pending();
 }
 
-/// §7.2: only stream cancellation or delivery resolves a sent claim.
-pub(super) fn observe(session: &mut Session, kind: InboxKind, input: &str) {
-    if matches!(kind, InboxKind::Cancelled | InboxKind::Delivered)
-        && (session.cleanup.contains(input)
-            || (session.state.cleanup_started && session.state.cleanup_pending))
+/// §7.2, §8: stream cancellation/delivery and proven non-acceptance resolve claims.
+/// Preserve proof per input even before a DELETE claim or after successor registration.
+pub(super) fn prove_input_fate(session: &mut Session, input: &str) {
+    if session.inputs.contains_key(input)
+        || session.cleanup.contains(input)
+        || (session.state.cleanup_started && session.state.cleanup_pending)
     {
-        // An in-flight listing may name this input later. Reserve its key in the
-        // ingress path before retaining proof; foreign inputs never become DELETE candidates.
-        let leftover = session.cleanup.inputs.entry(input.to_owned()).or_default();
-        leftover.observed = true;
+        // Known inputs already own a correlation key. In-flight listing proofs
+        // reserve theirs in ingress; foreign inputs never become DELETE candidates.
+        session
+            .cleanup
+            .inputs
+            .entry(input.to_owned())
+            .or_default()
+            .proven = true;
         refresh(session);
+    }
+}
+
+/// §7.2: a stream fact resolves the DELETE claim; delivery still fences on execution.
+pub(super) fn observe(session: &mut Session, kind: InboxKind, input: &str) {
+    if matches!(kind, InboxKind::Cancelled | InboxKind::Delivered) {
+        prove_input_fate(session, input);
     }
 }
 
@@ -78,7 +90,7 @@ impl Router {
         true
     }
 
-    /// §7.2: mark a completed listing pipeline; outstanding claims still fence admission.
+    /// §7.2: a completed listing leaves claims fenced until an input's fate is proven.
     pub fn finish_reopen_cleanup(&mut self, session: &str) {
         if !self.ensure_session(session) {
             return;
@@ -121,10 +133,8 @@ impl Router {
                 return Vec::new();
             }
             let session = self.sessions.entry(session_id.to_owned()).or_default();
-            let observed = observed_input(session, input);
             let leftover = session.cleanup.inputs.entry(input.clone()).or_default();
             leftover.listed = true;
-            leftover.observed |= observed;
         }
         let session = self.sessions.entry(session_id.to_owned()).or_default();
         refresh(session);
@@ -141,7 +151,7 @@ impl Router {
         self.sessions
             .get(session)
             .and_then(|session| session.cleanup.inputs.get(input))
-            .is_some_and(|leftover| leftover.listed && !leftover.sent && !leftover.observed)
+            .is_some_and(|leftover| leftover.listed && !leftover.sent && !leftover.proven)
     }
 
     /// §7.2, §8: create a claim only in `SentTracker`'s synchronous first-byte callback.
@@ -158,10 +168,8 @@ impl Router {
             return;
         }
         let session = self.sessions.entry(session_id.to_owned()).or_default();
-        let observed = observed_input(session, input);
         let leftover = session.cleanup.inputs.entry(input.to_owned()).or_default();
         leftover.sent = true;
-        leftover.observed |= observed;
         if let Some(turn) = session.inputs.get(input)
             && let Some(window) = session
                 .rejections
@@ -175,16 +183,4 @@ impl Router {
         refresh(session);
         self.changed.notify_waiters();
     }
-}
-
-fn observed_input(session: &Session, input: &str) -> bool {
-    session
-        .inputs
-        .get(input)
-        .is_some_and(|owner| session.delivered.contains(owner))
-        || session
-            .state
-            .last
-            .as_ref()
-            .is_some_and(|last| last.input_id == input && last.phase == InputPhase::Ended)
 }
