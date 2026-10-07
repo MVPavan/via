@@ -91,9 +91,12 @@ until that reply proves ownership. A mismatching or missing reply blocks.
 Nonownership safety checks run before forwarding, and the oldest deferred entry
 has a 30 s monotonic deadline, including silence and stdout backpressure.
 Ownership lasts for the run: matched VIA replies in earlier private traces
-establish historical thread/turn IDs for later servers. Reports never establish
-IDs. Usage is matched to both its named turn and that turn's submitting server,
-so replayed history cannot inflate either the old turn or the new one.
+establish threads for later servers. Historical turn IDs permit only a usage
+notification replaying the thread's last recorded earlier total; turn activity,
+items, errors, requests and any changed total block. Replays have their own fact
+kind. Reports never establish IDs. Usage is matched to both its named turn and
+that turn's submitting server, so replayed history cannot inflate either the
+old turn or the new one.
 Ownership rejections first record public method/item labels (unfamiliar labels
 are hash-only), hashed IDs, generation, ownership flags and pending requests.
 VIA receipt/status/events/cancel/result/wait/close/daemon replies have
@@ -172,6 +175,11 @@ REQUEST_LIMIT = 4096
 DEFER_S = 30
 # Packet §§4/8: finite configuration inventory and notification-method evidence.
 MCP_LIMIT, NOTIFICATION_METHOD_LIMIT = 128, 128
+# Packet §§3/7: reserve one rejection and both teardown facts. Each pending
+# establishing entry has two 64-character digests and a fixed public method;
+# 256 bytes per entry plus bounded method counts and fixed fields cover them.
+CONTROL_FACTS = 3
+CONTROL_BYTES = REQUEST_LIMIT * 256 + NOTIFICATION_METHOD_LIMIT * 96 + 4096
 # Runtime §6.1: fixed file proof, read no more than one byte beyond this marker.
 WORKSPACE_MARKER = b"allowed"
 NO_GRANT_METHODS = ("item/commandExecution/requestApproval", "item/fileChange/requestApproval",
@@ -536,9 +544,10 @@ def owner_metadata(home, today=None):
             "session_files": len(session_files), "session_digests": sorted(session_files)}
 
 
-def ownership_history(directory, generation, binary_hash, version):
+def ownership_history(directory, generation, binary_hash, version, cache=None):
     """Packet §§3/7: carry only matched VIA reply identities from this run's private traces."""
-    threads, turns = set(), set()
+    threads, turns, totals = set(), set(), {}
+    cache = {} if cache is None else cache
     paths = list(Path(directory).glob("server-*.jsonl"))
     require(len(paths) <= TURN_LIMIT, "ownership history generation bound")
     ordered = []
@@ -550,19 +559,24 @@ def ownership_history(directory, generation, binary_hash, version):
             ordered.append((ticks, pid, path))
     for ticks, pid, path in sorted(ordered):
         try:
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
             with os.fdopen(fd, "rb") as file:
                 meta = os.fstat(file.fileno())
                 require(stat.S_ISREG(meta.st_mode) and meta.st_uid == os.getuid()
                         and stat.S_IMODE(meta.st_mode) == 0o600 and meta.st_nlink == 1,
                         "ownership history unsafe file")
-                raw = file.read(TRACE_BYTES + 1)
-            require(len(raw) <= TRACE_BYTES, "ownership history byte bound")
-            lines = raw.splitlines(keepends=True)
-            # A concurrent owned writer may be partway through its final line.
-            if lines and not lines[-1].endswith(b"\n"):
-                lines.pop()
-            rows = [decode_line(line) for line in lines]
+                identity = (meta.st_dev, meta.st_ino, meta.st_size, meta.st_mtime_ns, meta.st_ctime_ns)
+                if path in cache and cache[path][0] == identity:
+                    rows = cache[path][1]
+                else:
+                    raw = file.read(TRACE_BYTES + 1)
+                    require(len(raw) <= TRACE_BYTES, "ownership history byte bound")
+                    lines = raw.splitlines(keepends=True)
+                    # A concurrent owned writer may be partway through its final line.
+                    if lines and not lines[-1].endswith(b"\n"):
+                        lines.pop()
+                    rows = [decode_line(line) for line in lines]
+                    cache[path] = identity, rows
             if not rows:
                 continue
             require(len(rows) <= REQUEST_LIMIT and [row["seq"] for row in rows]
@@ -572,7 +586,7 @@ def ownership_history(directory, generation, binary_hash, version):
                     and type(header["start_ticks"]) is int and header["pid"] == pid
                     and header["start_ticks"] == ticks and header["executable_hash"] == binary_hash,
                     "ownership history generation identity mismatch")
-            pending, initialized = {}, False
+            pending, initialized, submitted = {}, False, set()
             for row in rows[1:]:
                 if row["kind"] == "request" and "request" in row:
                     require(row["request"] not in pending, "ownership history duplicate request")
@@ -603,9 +617,18 @@ def ownership_history(directory, generation, binary_hash, version):
                                     and type(turn) is str and re.fullmatch(r"[0-9a-f]{64}", turn),
                                     "ownership history turn identity unsupported")
                             turns.add((thread, turn))
+                            submitted.add((thread, turn))
+                elif row["kind"] == "usage":
+                    require((row["thread"], row["turn"]) in submitted,
+                            "ownership history usage outside submitting generation")
+                    conform(row["total"], "sample", "ownership history total")
+                    totals[row["thread"]] = {key: row["total"][key] for key in SCHEMAS["sample"]}
         except (OSError, KeyError, TypeError, ValueError):
             raise Blocked("ownership history unreadable or schema unsupported") from None
-    return threads, turns
+    for path in list(cache):
+        if path not in paths:
+            del cache[path]
+    return threads, turns, totals
 
 
 class Wire:
@@ -619,21 +642,29 @@ class Wire:
         self.deferred, self.deferred_bytes = [], 0
         self.history, self.generation = history, generation
         self.earlier_threads, self.earlier_turns = set(), set()
+        self.earlier_totals, self.evidence_bytes = {}, 0
 
     def fact(self, **value):
-        require(len(self.facts) < REQUEST_LIMIT, "protocol evidence bound")
+        control = value.get("kind") in ("ownership_rejection", "notification_counts", "end")
+        require(len(self.facts) < REQUEST_LIMIT - (0 if control else CONTROL_FACTS),
+                "protocol evidence bound")
         require(secret_free(value), "secret-free protocol evidence")
-        self.facts.append(value)
+        size = len(json.dumps({"seq": len(self.facts) + 1, **value}, sort_keys=True).encode()) + 1
+        require(self.evidence_bytes + size <= TRACE_BYTES - (0 if control else CONTROL_BYTES),
+                "protocol evidence byte bound")
         if self.sink:
             self.sink(value)
+        self.facts.append(value)
+        self.evidence_bytes += size
         return value
 
     def refresh_history(self):
         """Packet §3: monotonic run-wide ownership, refreshed from paired earlier replies."""
         if self.history is not None:
-            threads, turns = self.history()
+            threads, turns, totals = self.history()
             self.earlier_threads.update(threads)
             self.earlier_turns.update(turns)
+            self.earlier_totals.update(totals)
 
     def reject_ownership(self, method, params, reason, scope=None, reply_request=None):
         """Packet §§3/7: leave sanitized context before every ownership rejection."""
@@ -647,6 +678,9 @@ class Wire:
         turn = digest(turn) if type(turn) is str else None
         if scope is not None:
             thread, turn = scope
+        if (thread, turn) in self.earlier_turns and (thread, turn) not in self.turns \
+                and reason.startswith("unowned"):
+            reason = "historical turn traffic is not an exact usage replay"
         item = params.get("item")
         item_type = item.get("type") if type(item) is dict else None
         establishing = [{"method": request["method"], "request": key,
@@ -723,9 +757,9 @@ class Wire:
         return self.fact(**fact)
 
     def scope(self, method, params):
-        """Packet §3: notification scope, including errors with a thread identity."""
-        scoped_error = method == "error" and "threadId" in params
-        if not method.startswith(("thread/", "turn/", "item/")) and not scoped_error:
+        """Packet §3: scope every explicit identity, including errors and server requests."""
+        if not method.startswith(("thread/", "turn/", "item/")) \
+                and "threadId" not in params and "turnId" not in params:
             return None
         thread = params.get("threadId")
         if method == "thread/started":
@@ -738,24 +772,34 @@ class Wire:
             nested = params.get("turn")
             turn = nested.get("id", turn) if type(nested) is dict else turn
         has_turn = (method.startswith(("turn/", "item/"))
-                    or method == "thread/tokenUsage/updated"
-                    or scoped_error and "turnId" in params)
+                    or method == "thread/tokenUsage/updated" or "turnId" in params)
         if has_turn and type(turn) is not str:
             self.reject_ownership(method, params,
                                   "unowned turn notification; correlation unavailable: missing identity")
         return digest(thread), digest(turn) if has_turn else None
 
-    def owns(self, scope):
-        """Packet §3: only paired replies establish owned thread/turn IDs."""
+    def owns(self, scope, message=None):
+        """Packet §§3/7: old turns permit only exact total replays, never new activity."""
         thread, turn = scope
         if thread not in self.threads or turn is not None and (thread, turn) not in self.turns:
             self.refresh_history()
-        return thread in self.threads | self.earlier_threads and \
-            (turn is None or (thread, turn) in self.turns | self.earlier_turns)
+        if thread not in self.threads | self.earlier_threads:
+            return False
+        if turn is None or (thread, turn) in self.turns:
+            return True
+        if (thread, turn) not in self.earlier_turns or message is None or "id" in message \
+                or message.get("method") != "thread/tokenUsage/updated":
+            return False
+        usage = message["params"].get("tokenUsage")
+        total = usage.get("total") if type(usage) is dict else None
+        return type(total) is dict and thread in self.earlier_totals and \
+            {key: total.get(key) for key in SCHEMAS["sample"]} == self.earlier_totals[thread]
 
     def establishing(self, scope):
         """Packet §3 start ordering: match only requests able to establish this scope."""
         thread, turn = scope
+        if scope in self.earlier_turns:
+            return set()
         if thread not in self.threads | self.earlier_threads:
             return {key for key, request in self.pending.items()
                     if turn is None and (request["method"] == "thread/start"
@@ -781,7 +825,7 @@ class Wire:
         for message, candidates, size, created in pending:
             candidates.discard(replied)
             scope = self.scope(message["method"], message["params"])
-            if self.owns(scope):
+            if self.owns(scope, message):
                 self.incoming(message)
             else:
                 if not candidates:
@@ -846,7 +890,7 @@ class Wire:
         if method == "remoteControl/status/changed":
             require(params.get("status") == "disabled", "remote control not disabled")
         if "id" in message:
-            if scope is not None and not self.owns(scope):
+            if scope is not None and not self.owns(scope, message):
                 self.reject_ownership(method, params,
                                       "unowned thread/turn notification; correlation unavailable")
             key = digest(message["id"])
@@ -886,7 +930,7 @@ class Wire:
                             command_hash=command_digest(item.get("command")),
                             exit_code=code, read_only_error=isinstance(output, str)
                             and "Read-only file system" in output)
-        if scope is not None and not self.owns(scope):
+        if scope is not None and not self.owns(scope, message):
             candidates = self.establishing(scope)
             if not candidates:
                 self.reject_ownership(method, params,
@@ -899,6 +943,8 @@ class Wire:
             # Only ownership remains unproved. The proxy forwards immediately;
             # no fact is published before a matching establishing reply.
             return None
+        if fact["kind"] == "usage" and scope not in self.turns:
+            fact["kind"] = "replay"
         if fact["kind"] == "notification":
             key = fact["method_hash"]
             require(key in self.notifications or len(self.notifications) < NOTIFICATION_METHOD_LIMIT,
@@ -981,8 +1027,9 @@ async def proxy(control, argv):
             require(trace.tell() + len(line) <= TRACE_BYTES, "protocol evidence byte bound")
             trace.write(line)
         generation = digest((identity["pid"], identity["start_ticks"]))
+        history_cache = {}
         history = lambda: ownership_history(control["trace_dir"], generation,
-                                            control["codex_hash"], control["version"])
+                                            control["codex_hash"], control["version"], history_cache)
         wire, write_lock = Wire(control["version"], sink, history, generation), asyncio.Lock()
         wire.fact(kind="process", pid=identity["pid"], start_ticks=identity["start_ticks"],
                   executable_hash=executable_hash)
@@ -2288,7 +2335,8 @@ class SafetyTests(unittest.TestCase):
 
     def resumed_wire(self, earlier):
         wire = Wire("0.160.1")
-        wire.history = lambda: (earlier.threads, earlier.turns)
+        wire.history = lambda: (earlier.threads, earlier.turns,
+            {fact["thread"]: fact["total"] for fact in earlier.facts if fact["kind"] == "usage"})
         wire.generation = digest("second-generation")
         wire.inventory = True
         wire.outgoing({"id": 10, "method": "thread/resume", "params": {
@@ -2304,18 +2352,29 @@ class SafetyTests(unittest.TestCase):
         sample = {key: 1 for key in SCHEMAS["sample"]}
         notification = {"method": "thread/tokenUsage/updated", "params": {
             "threadId": "t", "turnId": "u", "tokenUsage": {"last": sample, "total": sample}}}
-        self.assertEqual(wire.incoming(notification)["turn"], digest("u"))
+        first.incoming(notification)
+        self.assertEqual(wire.incoming(notification)["kind"], "replay")
+        wire.incoming({"method": "thread/started", "params": {"thread": {"id": "t"}}})
+        # Even a pending new turn cannot authorize activity under the old ID.
+        wire.outgoing({**self.start_message(), "id": 20})
         for message in (
-            {"method": "thread/started", "params": {"thread": {"id": "t"}}},
+            {"method": "turn/started", "params": {"threadId": "t", "turn": {"id": "u"}}},
             {"method": "turn/completed", "params": {"threadId": "t", "turn": {
                 "id": "u", "status": "completed"}}},
             {"method": "item/started", "params": {"threadId": "t", "turnId": "u",
                 "item": {"type": "userMessage", "content": [{"text": "synthetic private text"}]}}},
-            {"method": "error", "params": {"threadId": "t", "turnId": "u"}}):
-            with self.subTest(method=message["method"]):
+            {"method": "error", "params": {"threadId": "t", "turnId": "u"}},
+            {"id": 99, "method": "item/commandExecution/requestApproval", "params": {
+                "threadId": "t", "turnId": "u"}},
+            {"id": 100, **notification}):
+            with self.subTest(method=message["method"]), self.assertRaises(Blocked):
                 wire.incoming(message)
+            self.assertEqual(wire.facts[-1]["kind"], "ownership_rejection")
+            self.assertTrue(wire.facts[-1]["turn_known_earlier"])
+            self.assertEqual(wire.deferred, [])
         self.assertTrue(secret_free(wire.facts))
         self.assertNotIn("synthetic private text", json.dumps(wire.facts))
+        wire.incoming({"id": 20, "result": {"turn": {"id": "new"}}})
         notification["params"]["turnId"] = "never-established"
         with self.assertRaisesRegex(Blocked, "unowned"):
             wire.incoming(notification)
@@ -2323,6 +2382,161 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(wire.facts[-1]["thread"], digest("t"))
         self.assertEqual(wire.facts[-1]["turn"], digest("never-established"))
         self.assertTrue(secret_free(wire.facts[-1]))
+
+    def test_exact_usage_replay_uses_latest_thread_total(self):
+        first = self.owned_wire()
+        sample = {key: 1 for key in SCHEMAS["sample"]}
+        first.incoming({"method": "thread/tokenUsage/updated", "params": {
+            "threadId": "t", "turnId": "u", "tokenUsage": {"last": sample, "total": sample}}})
+        first.outgoing({**self.start_message(), "id": 2})
+        first.incoming({"id": 2, "result": {"turn": {"id": "v"}}})
+        latest = {key: 2 for key in SCHEMAS["sample"]}
+        first.incoming({"method": "thread/tokenUsage/updated", "params": {
+            "threadId": "t", "turnId": "v", "tokenUsage": {"last": sample, "total": latest}}})
+        wire = self.resumed_wire(first)
+        replay = wire.incoming({"method": "thread/tokenUsage/updated", "params": {
+            "threadId": "t", "turnId": "u", "tokenUsage": {"last": sample, "total": latest}}})
+        self.assertEqual(replay["kind"], "replay")
+        self.assertEqual(replay["turn"], digest("u"))
+        self.assertEqual(replay["total"], latest)
+        self.assertFalse(any(fact["kind"] == "usage" for fact in wire.facts))
+        wire.outgoing({**self.start_message(), "id": 2})
+        wire.incoming({"id": 2, "result": {"turn": {"id": "new"}}})
+        fresh = wire.incoming({"method": "thread/tokenUsage/updated", "params": {
+            "threadId": "t", "turnId": "new", "tokenUsage": {"last": sample, "total": latest}}})
+        self.assertEqual(fresh["kind"], "usage")
+
+    def test_grown_or_changed_old_turn_total_blocks(self):
+        sample = {key: 2 for key in SCHEMAS["sample"]}
+        for field in SCHEMAS["sample"]:
+            for delta in (-1, 1):
+                with self.subTest(field=field, delta=delta):
+                    first = self.owned_wire()
+                    first.incoming({"method": "thread/tokenUsage/updated", "params": {
+                        "threadId": "t", "turnId": "u", "tokenUsage": {"last": sample, "total": sample}}})
+                    wire = self.resumed_wire(first)
+                    changed = {**sample, field: sample[field] + delta}
+                    with self.assertRaises(Blocked):
+                        wire.incoming({"method": "thread/tokenUsage/updated", "params": {
+                            "threadId": "t", "turnId": "u", "tokenUsage": {"last": sample, "total": changed}}})
+                    self.assertEqual(wire.facts[-1]["kind"], "ownership_rejection")
+                    self.assertTrue(wire.facts[-1]["turn_known_earlier"])
+                    self.assertFalse(any(fact["kind"] in ("usage", "replay") for fact in wire.facts))
+
+    def test_old_turn_without_recorded_total_blocks(self):
+        wire = self.resumed_wire(self.owned_wire())
+        sample = {key: 0 for key in SCHEMAS["sample"]}
+        with self.assertRaises(Blocked):
+            wire.incoming({"method": "thread/tokenUsage/updated", "params": {
+                "threadId": "t", "turnId": "u", "tokenUsage": {"last": sample, "total": sample}}})
+        self.assertEqual(wire.facts[-1]["kind"], "ownership_rejection")
+
+    def test_old_turn_activity_blocks_even_with_new_start_pending(self):
+        for message in (
+            {"method": "turn/started", "params": {"threadId": "t", "turn": {"id": "u"}}},
+            {"method": "turn/completed", "params": {"threadId": "t", "turn": {"id": "u", "status": "completed"}}},
+            {"method": "item/started", "params": {"threadId": "t", "turnId": "u", "item": {
+                "type": "commandExecution", "command": "printf synthetic", "exitCode": 0}}},
+            {"method": "error", "params": {"threadId": "t", "turnId": "u"}},
+            {"method": "thread/status/changed", "params": {"threadId": "t", "turnId": "u"}},
+            {"id": 98, "method": "mcpServer/elicitation/request", "params": {"threadId": "t", "turnId": "u"}},
+            {"id": 99, "method": "item/commandExecution/requestApproval", "params": {"threadId": "t", "turnId": "u"}}):
+            with self.subTest(method=message["method"]):
+                wire = self.resumed_wire(self.owned_wire())
+                wire.outgoing({**self.start_message(), "id": 20})
+                with self.assertRaises(Blocked):
+                    wire.incoming(message)
+                self.assertEqual(wire.facts[-1]["kind"], "ownership_rejection")
+                self.assertEqual(wire.deferred, [])
+
+    def test_rejection_has_room_after_regular_fact_limit(self):
+        wire = self.owned_wire()
+        with mock.patch(__name__ + ".REQUEST_LIMIT", 10):
+            with self.assertRaisesRegex(Blocked, "protocol evidence bound"):
+                for _ in range(10):
+                    wire.fact(kind="synthetic")
+            with self.assertRaisesRegex(Blocked, "unowned"):
+                wire.incoming({"method": "error", "params": {"threadId": "foreign"}})
+            self.assertEqual(wire.facts[-1]["kind"], "ownership_rejection")
+            wire.fact(kind="notification_counts", counts={})
+            wire.fact(kind="end", complete=False, child_reaped=True)
+            self.assertLessEqual(len(wire.facts), 10)
+
+    def test_rejection_has_room_after_regular_byte_limit(self):
+        path = self.root / "bounded-trace"
+        with path.open("wb") as trace:
+            sequence = 0
+            def sink(value):
+                nonlocal sequence
+                sequence += 1
+                line = json.dumps({"seq": sequence, **value}, sort_keys=True).encode() + b"\n"
+                require(trace.tell() + len(line) <= TRACE_BYTES, "protocol evidence byte bound")
+                trace.write(line)
+            wire = Wire("0.160.1", sink=sink)
+            for index in range(REQUEST_LIMIT):
+                wire.pending[digest(index)] = {"method": "thread/resume", "thread": digest("t")}
+            with mock.patch(__name__ + ".TRACE_BYTES", 2 * 1024 * 1024):
+                with self.assertRaisesRegex(Blocked, "protocol evidence byte bound"):
+                    for _ in range(REQUEST_LIMIT):
+                        wire.fact(kind="synthetic", padding="x" * 512)
+                with self.assertRaisesRegex(Blocked, "unowned"):
+                    wire.incoming({"method": "error", "params": {"threadId": "foreign"}})
+                self.assertEqual(wire.facts[-1]["kind"], "ownership_rejection")
+                self.assertEqual(len(wire.facts[-1]["pending_establishing"]), REQUEST_LIMIT)
+                wire.fact(kind="notification_counts", counts={digest(index): 1
+                          for index in range(NOTIFICATION_METHOD_LIMIT)})
+                wire.fact(kind="end", complete=False, child_reaped=True)
+                self.assertEqual(trace.tell(), wire.evidence_bytes)
+                self.assertLessEqual(trace.tell(), TRACE_BYTES)
+
+    def test_ownership_history_cache_refreshes_only_changed_files(self):
+        hashed, cache = "0" * 64, {}
+        first = self.owned_wire()
+        sample = {key: 1 for key in SCHEMAS["sample"]}
+        first.incoming({"method": "thread/tokenUsage/updated", "params": {
+            "threadId": "t", "turnId": "u", "tokenUsage": {"last": sample, "total": sample}}})
+        path = self.write_history(self.root, hashed, first)
+        load = lambda: ownership_history(self.root, digest((2, 20)), hashed, "0.160.1", cache)
+        with mock.patch(__name__ + ".decode_line", wraps=decode_line) as decode:
+            result = load()
+            self.assertEqual(result[2], {digest("t"): sample})
+            reads = decode.call_count
+            self.assertGreater(reads, 0)
+            self.assertEqual(load(), result)
+            self.assertEqual(decode.call_count, reads)
+            larger = {key: 2 for key in SCHEMAS["sample"]}
+            first.incoming({"method": "thread/tokenUsage/updated", "params": {
+                "threadId": "t", "turnId": "u", "tokenUsage": {"last": sample, "total": larger}}})
+            self.write_history(self.root, hashed, first)
+            self.assertEqual(load()[2], {digest("t"): larger})
+            self.assertGreater(decode.call_count, reads)
+            reads = decode.call_count
+            replacement = self.root / "replacement"
+            replacement.write_bytes(path.read_bytes())
+            replacement.chmod(0o600)
+            stamp = path.stat().st_mtime_ns
+            os.utime(replacement, ns=(stamp, stamp))
+            replacement.replace(path)
+            self.assertEqual(load()[2], {digest("t"): larger})
+            self.assertGreater(decode.call_count, reads)
+            # A newly discovered generation must refresh the thread baseline,
+            # while the unchanged earlier generation remains cached.
+            rows = [json.loads(line) for line in path.read_text().splitlines()]
+            rows[0].update(pid=4, start_ticks=30)
+            latest = {key: 3 for key in SCHEMAS["sample"]}
+            rows[-1]["total"] = latest
+            added = self.root / "server-4-30.jsonl"
+            added.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            added.chmod(0o600)
+            reads = decode.call_count
+            self.assertEqual(load()[2], {digest("t"): latest})
+            self.assertEqual(decode.call_count - reads, len(rows))
+            reads = decode.call_count
+            self.assertEqual(load()[2], {digest("t"): latest})
+            self.assertEqual(decode.call_count, reads)
+            path.chmod(0o644)
+            with self.assertRaisesRegex(Blocked, "unsafe file"):
+                load()
 
     def test_restored_samples_never_inflate_old_or_new_turn_usage(self):
         run = self.run_object()
@@ -2362,16 +2576,17 @@ class SafetyTests(unittest.TestCase):
     def test_ownership_history_uses_paired_replies_only(self):
         hashed = "0" * 64
         path = self.write_history(self.root, hashed)
-        threads, turns = ownership_history(self.root, digest((2, 20)), hashed, "0.160.1")
+        threads, turns, totals = ownership_history(self.root, digest((2, 20)), hashed, "0.160.1")
         self.assertEqual(threads, {digest("t")})
         self.assertEqual(turns, {(digest("t"), digest("u"))})
+        self.assertEqual(totals, {})
         # Notifications and unpaired replies cannot manufacture ownership.
         rows = [json.loads(line) for line in path.read_text().splitlines()]
         rows.append({"seq": len(rows) + 1, "kind": "terminal", "thread": digest("foreign"),
                      "turn": digest("never-established")})
         path.write_text("".join(json.dumps(row) + "\n" for row in rows))
         self.assertEqual(ownership_history(self.root, digest((2, 20)), hashed, "0.160.1"),
-                         (threads, turns))
+                         (threads, turns, totals))
         rows = [row for row in rows if not (row.get("kind") == "request" and row.get("method") == "turn/start")]
         path.write_text("".join(json.dumps({**row, "seq": i}) + "\n" for i, row in enumerate(rows, 1)))
         with self.assertRaisesRegex(Blocked, "ownership history"):
@@ -2416,11 +2631,14 @@ class SafetyTests(unittest.TestCase):
         path = self.write_history(self.root, hashed, first)
         wire = Wire("0.160.1", history=lambda: ownership_history(
             self.root, digest((2, 20)), hashed, "0.160.1"), generation=digest((2, 20)))
-        self.assertTrue(wire.owns((digest("t"), digest("u"))))
+        self.assertTrue(wire.owns((digest("t"), None)))
+        self.assertIn((digest("t"), digest("u")), wire.earlier_turns)
+        self.assertFalse(wire.owns((digest("t"), digest("u"))))
         first.outgoing({**self.start_message(), "id": 2})
         first.incoming({"id": 2, "result": {"turn": {"id": "v"}}})
         self.write_history(self.root, hashed, first)
-        self.assertTrue(wire.owns((digest("t"), digest("v"))))
+        self.assertFalse(wire.owns((digest("t"), digest("v"))))
+        self.assertIn((digest("t"), digest("v")), wire.earlier_turns)
         # A partial final record does not manufacture an identity.
         with path.open("ab") as file:
             file.write(b'{"kind":"reply"')
@@ -3284,7 +3502,7 @@ class SafetyTests(unittest.TestCase):
                             termination=False, foreign=False, reused=False, after_signal=False,
                             executable_mismatch=False, duplicate_config=False, config=None,
                             race=None, observed=None, startup=False, forward_pause=False,
-                            unsafe_item=False, restored=None):
+                            unsafe_item=False, restored=None, replay_growth=False):
         """Entire stdio exchange using fake transports; no process or real /proc."""
         binary = self.root / "fake-codex"
         binary.write_text("synthetic executable")
@@ -3295,7 +3513,11 @@ class SafetyTests(unittest.TestCase):
         traces = self.root / "trace"
         traces.mkdir()
         if restored is not None:
-            self.write_history(traces, shared.sha256(binary))
+            earlier = self.owned_wire()
+            sample = {key: 1 for key in SCHEMAS["sample"]}
+            earlier.incoming({"method": "thread/tokenUsage/updated", "params": {
+                "threadId": "t", "turnId": "u", "tokenUsage": {"last": sample, "total": sample}}})
+            self.write_history(traces, shared.sha256(binary), earlier)
         control = {"codex": str(binary), "codex_hash": shared.sha256(binary),
                    "model": MODEL, "version": "0.160.1", "codex_home": str(self.root),
                    "mcp_names": [], "trace_dir": str(traces)}
@@ -3340,9 +3562,10 @@ class SafetyTests(unittest.TestCase):
                 native.feed_data(raw_reply)
                 if request["method"] == "thread/resume" and restored is not None:
                     sample = {key: 1 for key in SCHEMAS["sample"]}
+                    total = {key: 2 for key in SCHEMAS["sample"]} if replay_growth else sample
                     native.feed_data(json.dumps({"method": "thread/tokenUsage/updated", "params": {
                         "threadId": "t", "turnId": restored,
-                        "tokenUsage": {"last": sample, "total": sample}}}).encode() + b"\n")
+                        "tokenUsage": {"last": sample, "total": total}}}).encode() + b"\n")
                 if request["method"] == "config/read" and duplicate_config:
                     native.feed_data(raw_reply)
 
@@ -3481,19 +3704,22 @@ class SafetyTests(unittest.TestCase):
                     self.root = previous
 
     def test_proxy_run_wide_history_and_unknown_rejection(self):
-        for restored in ("u", "never-established"):
-            with self.subTest(restored=restored), tempfile.TemporaryDirectory() as root:
+        for restored, growth in (("u", False), ("u", True), ("never-established", False)):
+            with self.subTest(restored=restored, growth=growth), tempfile.TemporaryDirectory() as root:
                 previous, self.root = self.root, Path(root)
                 try:
+                    observed = []
                     result, child, signals, sent, traces = asyncio.run(
-                        self.proxy_fixture(race="match", restored=restored))
-                    self.assertEqual(result, 0 if restored == "u" else 1)
+                        self.proxy_fixture(race="match", restored=restored,
+                                           replay_growth=growth, observed=observed))
+                    accepted = restored == "u" and not growth
+                    self.assertEqual(result, 0 if accepted else 1)
                     path = traces / "server-2-20.jsonl"
                     rows = [decode_line(line) for line in path.read_bytes().splitlines(keepends=True)]
                     self.assertTrue(rows[-1]["child_reaped"])
-                    self.assertEqual(rows[-1]["complete"], restored == "u")
-                    if restored == "u":
-                        self.assertTrue(any(row["kind"] == "usage" and row["turn"] == digest("u") for row in rows))
+                    self.assertEqual(rows[-1]["complete"], accepted)
+                    if accepted:
+                        self.assertTrue(any(row["kind"] == "replay" and row["turn"] == digest("u") for row in rows))
                         self.assertTrue(any(row["kind"] == "reply" and row.get("method") == "turn/start"
                                             and row["turn"] == digest("v") for row in rows))
                     else:
@@ -3501,7 +3727,8 @@ class SafetyTests(unittest.TestCase):
                         self.assertEqual(rejected["method"], "thread/tokenUsage/updated")
                         self.assertEqual(rejected["generation"], digest((2, 20)))
                         self.assertTrue(rejected["thread_owned"])
-                        self.assertFalse(rejected["turn_known_earlier"])
+                        self.assertEqual(rejected["turn_known_earlier"], restored == "u")
+                        self.assertNotIn("thread/tokenUsage/updated", observed)
                     self.assertTrue(secret_free(rows))
                 finally:
                     self.root = previous
