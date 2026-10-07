@@ -177,6 +177,8 @@ class ReplyTests(unittest.TestCase):
                 d._http.request.side_effect=request
                 d._catalog=mock.Mock(return_value={'oclive-mock/fixture-free':{'free':True}})
                 d.vault.names=mock.Mock(return_value=frozenset())
+                d._auxiliary_bindings=mock.Mock(return_value=['oclive-mock/fixture-free']*9)
+                d.automatic_models_proven=True  # Earlier fixture proof, before this isolated integration refusal.
                 with self.assertRaisesRegex(Blocked,reason):
                     d.spending_check(path='/api/session/ses_FAKE/prompt')
                 reply=self.retained(d)['replies'][-1]

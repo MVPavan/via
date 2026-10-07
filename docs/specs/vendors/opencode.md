@@ -1463,9 +1463,24 @@ record retained. Reset the diagnostic observation before each read so a failed
 read does not present the previous poll as current. An unapproved identity sets
 the spending stop latch and blocks immediately, before acquisition or a catalogue
 wait; only the frozen public-free and fixture-mock identities may wait. Read
-integration facts after catalogue readiness, immediately before admission.
+integration facts after catalogue and effective-config readiness, immediately before admission.
 This observation wait admits no
 model request and does not change §5's fresh, no-retry effort check in VIA.
+
+After the runner writes a fixture config, its effective-endpoint observation
+may wait only while the served provider map is empty or exactly matches the
+previous fixture map verified for that location and owned process generation.
+Compare the same provider IDs and owned loopback host:port; an unverified prior
+map cannot justify a retry. Poll the config read 200 ms apart within the existing
+30 s readiness ceiling, clipped to phase/bootstrap deadlines, checking signals
+and re-verifying PID/start-ticks and Host generation before and after every read.
+Any other map (including an unknown provider, foreign/non-loopback endpoint or
+third port) blocks immediately. Schema errors and explicit selector drift still
+block immediately. The expected map proceeds only with all frozen selectors
+verified; reaching it clears the reload allowance. Deadline expiry blocks with
+the last sanitized reply retained. Read integration after both catalogue and
+effective-config readiness, immediately before the spending guard. This wait
+admits no model request and requires no config.updated event as proof.
 
 **Qualification mock admission amendment (coordinator, 2026-10-07):**
 Derive the preflight request ceiling from its actual turn pattern: one labelled

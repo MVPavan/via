@@ -51,6 +51,7 @@ HELPER_STOP_SECONDS = 30  # §13 L14 bounded cooperative cleanup before a succes
 ANCHOR_SOCKET_TAIL = 64
 METADATA_EFFORT = 'via-qualification-metadata-only-unoffered'  # Packet §5; C1 §4.
 OWNED_READINESS_SECONDS = 30  # §13: bounded delayed facts within the enclosing phase.
+CONFIG_READY_POLL_SECONDS = .2  # §13: only empty or verified previous endpoint maps wait.
 CATALOG_READY_POLL_SECONDS = .2  # §§2.2, 13: catalogue readiness, never request admission.
 BOOTSTRAP_SECONDS = 30  # §13: owned acquisition and all served-fact checks.
 BOOTSTRAP_WAIT_MS = 30000  # §13: mock completion after the response is released.
@@ -297,6 +298,7 @@ class Driver:
         self._observation_deadline=None
         self._verified_host_record=None; self._killed_anchor=None
         self._namespace_bootstraps={}
+        self._verified_endpoint_maps={}; self._endpoint_reloads={}
         self.reply_evidence=ReplyEvidence(self._record,self._reply_protected,self._reply_context,
             vault=self.vault,secret_forms=lambda:(*self.secret_forms,*self.bearer_forms))
         self.git_templates=safety.GitTemplateCopies(
@@ -440,8 +442,7 @@ class Driver:
         if name=='long-run': self._long_run_started=time.monotonic()
         config=self._materialize_fixture(name,project,config)
         self._validate_provider_config(config)
-        fd=os.open(project/'opencode.json',os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
-        with os.fdopen(fd,'w') as file: json.dump(config,file,allow_nan=False)
+        self._write_fixture_config(project,config,exclusive=True)
         self.fixtures[name]={'path':project,'config':config}
         self._refresh_inventory([opencode])
         return project
@@ -1065,8 +1066,7 @@ class Driver:
             if cached is None:
                 config=self._materialize_fixture(name,self.namespace,{'provider':'mock','response_hold':hold})
                 provider=self.mock_providers[name]
-                fd=os.open(self.namespace/'opencode.json',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
-                with os.fdopen(fd,'w') as output: json.dump(config,output,allow_nan=False)
+                self._write_fixture_config(self.namespace,config,exclusive=True)
                 self._namespace_bootstraps[self.namespace]=(config,provider)
             else:
                 config,provider=cached
@@ -1271,9 +1271,6 @@ class Driver:
         names=self.vault.names(self.vendor_identity)
         if self.inventory: self.inventory.check()
         catalog=self._catalog(identity)
-        status,raw=self._request('GET','/api/integration')
-        if status!=200: raise Blocked('integration check unavailable')
-        integration=self._json(raw)
         # Effective project config is constructed before start and immutable during turns.
         row=next((row for row in self.fixtures.values() if row['path']==self.project),None)
         config=None if row is None else row['config']
@@ -1287,6 +1284,9 @@ class Driver:
         if provider in endpoints:
             self._last_auxiliary_bindings=bindings
         self.last_model=identity
+        status,raw=self._request('GET','/api/integration')
+        if status!=200: raise Blocked('integration check unavailable')
+        integration=self._json(raw)
         try:
             return self.guard.check(integration=integration,environment_names=names,catalog=catalog,
                                     provider=provider,model=model,project_providers=endpoints,cost=cost)
@@ -1295,20 +1295,40 @@ class Driver:
                 self._record('catalog-block',self._catalog_evidence)
             raise
 
-    @reply_check
-    def _auxiliary_bindings(self,identity):
-        schema=self._served_schema()
-        offered=schema.get('components',{}).get('schemas',{}).get('Config.InfoEncoded',{}).get('properties',{})
-        if not {'model','agents','providers'}<=set(offered):
-            raise Blocked('pinned effective selector readback schema unsupported')
-        query=urllib.parse.urlencode({'location[directory]':str(self.project)})
-        status,raw=self._request('GET','/api/config?'+query)
+    def _config_identity(self):
+        """§13: a previous served map belongs to one owned state and process generation."""
+        return self.state,self.daemon,self.anchor,self.vendor_identity
+
+    @staticmethod
+    def _endpoint_map(endpoints):
+        """§13: compare provider IDs and owned loopback host:port, without URL paths."""
+        from opencode_reply import origin_class
+        return {name:origin_class(endpoint)['host_port'] for name,endpoint in endpoints.items()}
+
+    def _write_fixture_config(self,project,config,*,exclusive=False):
+        """§13: only a runner config write arms the narrowly bounded reload observation."""
+        project=Path(project)
+        expected=self._endpoint_map(self._validate_provider_config(config))
+        binding=self._config_identity()
+        prior=self._verified_endpoint_maps.get(project)
+        previous=None
+        if prior is not None and prior['identity']==binding and self.vendor_identity is not None:
+            self._owned_observation_guard()()
+            previous=dict(prior['endpoints'])
+        flags=os.O_WRONLY|os.O_CREAT|os.O_NOFOLLOW|(os.O_EXCL if exclusive else os.O_TRUNC)
+        fd=os.open(project/'opencode.json',flags,0o600)
+        with os.fdopen(fd,'w') as output: json.dump(config,output,allow_nan=False)
+        self._endpoint_reloads[project]={'identity':binding,'previous':previous,'expected':expected}
+
+    def _effective_configuration(self,project):
+        """§13/E54: merge only allow-listed selectors and provider configuration in memory."""
+        query=urllib.parse.urlencode({'location[directory]':str(project)})
+        status,raw=self._request('GET','/api/config?'+query,
+            timeout=max(.001,self._observation_deadline-time.monotonic()))
         value=self._json(raw)
         entries=value.get('data') if type(value) is dict else value
-        if status!=200 or type(entries) is not list or not entries:
+        if status!=200 or type(entries) is not list:
             raise Blocked('effective configuration sources unobservable')
-        # Config.Entry documents are ordered low-to-high priority (E54). Never
-        # persist their provider secrets; inspect only selectors and endpoints.
         effective={}; agents={}; providers={}
         for entry in entries:
             if type(entry) is not dict or entry.get('type') not in {'document','directory'}:
@@ -1324,23 +1344,54 @@ class Driver:
                 for name,row in info[key].items():
                     if type(row) is not dict: raise Blocked('configuration selector entry unknown')
                     merged[name]={**merged.get(name,{}),**row}
+        return effective,agents,providers
+
+    @reply_check
+    def _auxiliary_bindings(self,identity):
+        schema=self._served_schema()
+        offered=schema.get('components',{}).get('schemas',{}).get('Config.InfoEncoded',{}).get('properties',{})
+        if not {'model','agents','providers'}<=set(offered):
+            raise Blocked('pinned effective selector readback schema unsupported')
+        project=Path(self.project);reload=self._endpoint_reloads.get(project)
+        expected=self._endpoint_map(self.provider_endpoints)
         def selector(model):
             if type(model) is str: return model.split('#',1)[0]
             if type(model) is dict and type(model.get('providerID')) is str and type(model.get('model')) is str:
                 return model['providerID']+'/'+model['model']
             raise Blocked('effective model selector unknown')
-        if 'model' not in effective: raise Blocked('effective default model unavailable')
-        bindings=[selector(effective['model'])]
-        required={'via','title','summary','compaction','explore','general','build','plan'}
-        if not required<=set(agents): raise Blocked('effective auxiliary agent selectors incomplete')
-        for name,row in agents.items():
-            if row.get('disabled') is True: continue
-            if 'model' not in row: raise Blocked('effective auxiliary model is not frozen')
-            bindings.append(selector(row['model']))
-        if any(model!=identity for model in bindings):
-            self.guard.stopped=True; raise Blocked('auxiliary model drift or paid identity')
-        if self._validate_provider_config({'providers':providers})!=self.provider_endpoints:
-            raise Blocked('effective provider endpoints differ from owned fixture')
+        def read():
+            effective,agents,providers=self._effective_configuration(project)
+            endpoints=self._validate_provider_config({'providers':providers})
+            observed=self._endpoint_map(endpoints)
+            bindings=[]
+            if 'model' in effective: bindings.append(selector(effective['model']))
+            for row in agents.values():
+                if row.get('disabled') is not True and 'model' in row:
+                    bindings.append(selector(row['model']))
+            if any(model!=identity for model in bindings):
+                self.guard.stopped=True; raise Blocked('auxiliary model drift or paid identity')
+            required={'via','title','summary','compaction','explore','general','build','plan'}
+            complete='model' in effective and required<=set(agents) and all(
+                row.get('disabled') is True or 'model' in row for row in agents.values())
+            if observed==expected and endpoints==self.provider_endpoints and complete:
+                return bindings
+            if reload is not None and reload['expected']==expected:
+                previous=reload['previous']
+                if not observed:
+                    return None
+                if previous is not None and observed==previous:
+                    if reload['identity']!=self._config_identity():
+                        raise Blocked('effective configuration previous generation changed')
+                    return None
+            if observed!=expected or endpoints!=self.provider_endpoints:
+                raise Blocked('effective provider endpoints differ from owned fixture')
+            if 'model' not in effective: raise Blocked('effective default model unavailable')
+            if not required<=set(agents): raise Blocked('effective auxiliary agent selectors incomplete')
+            raise Blocked('effective auxiliary model is not frozen')
+        bindings=self._await_owned(read,'owned effective configuration readiness deadline',
+                                   interval=CONFIG_READY_POLL_SECONDS)
+        self._verified_endpoint_maps[project]={'identity':self._config_identity(),'endpoints':expected}
+        self._endpoint_reloads.pop(project,None)
         return bindings
 
     @reply_check
@@ -3072,7 +3123,7 @@ print('VIA HELPER DONE')
             project=projects[name]
             self._directory(project/'.opencode','vendor-private')
             config=self._materialize_fixture(name,project,{'provider':'mock'})
-            (project/'opencode.json').write_text(json.dumps(config)); (project/'opencode.json').chmod(0o600)
+            self._write_fixture_config(project,config)
             self.fixtures[name]={'path':project,'config':config}
             self._refresh_inventory([project/'.opencode'])
             self._mock_turn(project,'Read the project instructions and reply READY.')

@@ -841,7 +841,7 @@ class DriverTests(unittest.TestCase):
             info={'model':identity,'agents':{name:{'model':identity} for name in
                   ('via','title','summary','compaction','explore','general','build','plan')}}
             class HTTP:
-                def request(self,method,path):
+                def request(self,method,path,*,timeout=None):
                     if '/api/agent' in path: raise AssertionError('empty inventory cannot prove config')
                     return 200,json.dumps([{'type':'document','info':info}]).encode()
             d._http=HTTP()
