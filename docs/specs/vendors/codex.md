@@ -33,8 +33,11 @@ fallback; no experimental capability is sent by default. Record observed
 binary and adapter versions. The version rule is C2 §5 (owner OD1): the
 instance version is parsed from `initialize.userAgent`: drop the
 `<clientInfo.name>/` prefix VIA itself sent, then read up to the first space
-(qualified on the 0.159.2 fixtures, `via-5lr.3.1`); `checked` is 0.159.2 (fixtures and re-probes) and
-0.160.0 (live rounds 1 and 2 through VIA, 2026-10-05/06); a version outside the adapter's `checked` set is
+(qualified on the 0.159.2 fixtures, `via-5lr.3.1`); `checked` is 0.159.2
+(fixtures and re-probes), 0.160.0 (live rounds 1 and 2 through VIA,
+2026-10-05/06), and 0.160.1 (qualification run 15 of
+`scripts/qualify/codex.py`, after critical-review hardening); each is
+`tested`. A version outside the adapter's `checked` set is
 `untested` and warns; only a failed handshake check (policy and sandbox echo)
 refuses, as `submit_failed` with `failure.data.reason:"handshake_refused"`,
 cached per C2 §5 under the server key plus exactly what the echo check
@@ -43,6 +46,25 @@ mode and policy as derived from its bound; the approval policy and
 reviewer are constants), so a refusal never refuses another bound, model
 or directory sharing the server. A plan naming no bound or cwd matches
 no cached refusal.
+
+Qualification run 15 on 0.160.1 (2026-10-07, `gpt-6-luna`;
+`scripts/qualify/codex.py`, gitignored evidence in
+`scratchpad/qualify/codex-run15/`) puts this version in the checked set.
+Its `summary.json` result is `pass`: 230/230 checks passed, seven turns
+reserved, zero re-asks, spending accounting certain, no run interruption or
+cleanup errors, every daemon proven stopped and the private run directory
+removed. Spending certainty refers to the structural turn/time/concurrency
+control, not a dollar cap; Codex cost remains unavailable (§7).
+
+The qualified scope excludes the owner's enabled MCP servers and plugins:
+the runner disabled both, and disabled `shell_snapshot` on its own server
+argv for test isolation. The snapshot exec path is not qualified; VIA's
+production argv is unchanged. No-tool observations and command-exclusivity
+claims are record-only, not proof of unaided recall or absence of additional
+executions. Automatic re-asks were disabled. Stored resume rests on matched
+stored thread identity and a real resume with `excludeTurns:true` (§5).
+Earlier live runs described below are pre-hardening detail for their stated
+versions and cases; they do not substitute for run 15's 0.160.1 qualification.
 
 Local primary sources live under
 `scratchpad/execution/rust-foundation-release/codex-evidence/`:
@@ -60,8 +82,9 @@ enforcement**: the re-probe found that the model attempted the write through
 code-mode `exec`, and no item appeared (`via-5lr.3.4` later proved it
 through VIA, §3). C5 used a
 persistent thread; an ephemeral resume failed with `no rollout found`.
-C6 proved only one tool-free turn with seven environment variables. These
-are bounded observations, not guarantees for arbitrary tools/platforms.
+C6 observed one turn reporting no tool items with seven environment variables.
+That item absence does not prove no execution. These are bounded observations,
+not guarantees for arbitrary tools/platforms.
 Raw probe artifacts remain private; public fixtures must be sanitized.
 
 ## 2. Responsibilities and minimal interface
@@ -211,10 +234,40 @@ version. `model/list` is paginated (`nextCursor`); the driver follows it to
 the end within a bounded page count and byte budget. If a non-null
 `nextCursor` remains at either bound, discovery fails as a protocol
 failure and nothing is cached: a partial catalog is never used or published
-as complete. Model-only resolution fails `unknown_model` before discovery, and an
-explicit model passes to the vendor. A bad model or failed auth fails after
-acceptance as a Failed terminal (C2 §2). Effort (C2 §5): canonical efforts
-are checked in `plan` against the compiled mapping; model-advertised efforts
+as complete. VIA also retains the last complete discovery, its vendor
+version and opaque recipe digest in `<state>/vendor/codex/.via-catalog.json`
+(via-3fc, live round 1 finding (2026-10-05)). This bounded private file contains only
+normalized public model names, advertised efforts, hidden/default flags and
+the version; never raw replies or environment values. The snapshot is replaced
+by a synced temporary file and atomic rename, within discovery's 1 MiB byte
+budget plus 4 KiB of snapshot header. Bootstrap reads it without following
+symlinks; absent, unsafe, oversized or corrupt files are cache misses.
+`models` and model resolution use a matching recipe's saved complete catalog
+after retirement or daemon restart. A complete live discovery replaces the
+in-memory snapshot; failed or partial discovery never does. Persistence replaces
+an absent or corrupt private file. An unsafe target is never repaired and remains
+a bootstrap cache miss until removed (runtime §6.1). Effort validation still uses
+only the live instance's discovery. Writing the snapshot is best effort on a
+driver-owned blocking task, with no in-turn wait; the tracker retains the writer
+through shutdown, within Engine stop's Host bound. One fixed temporary filename,
+under the writer mutex and sole-daemon data-root lock, bounds crash leftovers to
+one file; the next write removes a private stale temporary file before creation.
+An unsafe temporary target is refused without repair. An I/O failure before
+rename leaves the preceding complete snapshot; a failed directory sync after
+rename leaves the new complete file visible, with its durability uncertain.
+Neither changes a turn's public outcome. Delayed writers serialize and write the
+current snapshot, never overwrite it with an older discovery. Only one recipe's
+last complete snapshot is persisted; another recipe must discover its own catalog.
+`describe.vendor_version` survives a restart for that matching recipe. A different
+recipe (for example, different `vendor_args`) reports `null`/`untested` after
+restart until the daemon observes a complete discovery for this program path;
+during that daemon lifetime the observed version applies across its recipes
+(C2 §5 OD1). This narrower restart fallback avoids persisting program paths.
+Model-only resolution fails `unknown_model` before any matching discovery, and
+an explicit model passes to the vendor. A bad model or failed auth fails after
+acceptance as a Failed terminal (C2 §2). A saved default may be stale; a bad
+model then fails after acceptance, just as an explicit model does. Effort (C2 §5):
+canonical efforts are checked in `plan` against the compiled mapping; model-advertised efforts
 are checked against `model/list` inside `run_turn` before `thread/start` or
 `thread/resume` (so a rejected submission creates no vendor thread) and
 therefore before `turn/start`, and a
@@ -483,8 +536,9 @@ passes unverified with C1's `vendor_passthrough` warning: the switches
 any other feature. `--disable hooks` stays VIA's (`inherit`), never the
 caller's.
 
-Live through VIA on 0.160.0 (run 6, 2026-10-06, `gpt-6-luna`, bead
-via-jne; evidence in `scratchpad/execution/codex-live/run-6/`, gitignored),
+Pre-hardening live detail through VIA on 0.160.0 (run 6, 2026-10-06,
+`gpt-6-luna`, bead via-jne; evidence in
+`scratchpad/execution/codex-live/run-6/`, gitignored),
 with a warm home and sessions started concurrently:
 - A session with `-- --strict-config` and one without were started
   together while an earlier `--strict-config` session's server was still
@@ -567,6 +621,28 @@ retries; `tooManyDenials` and `flexUnavailable` → `vendor_error`. Denials are
 best-effort (C2 §7 item 9): a slow denial is a failed item, but a fast denial
 emits no item, and code-mode `exec` can act with no item at all, so no item
 history proves complete denial reporting or complete tool tracking.
+
+The qualification runner disables the owner's MCP servers and plugins and
+records the limit: "shell_snapshot disabled for test isolation; the snapshot
+exec path is not qualified". Its empty-home feature preflight and owner-home
+`config/read` barrier must both confirm the snapshot switch is off before
+turns are accepted. These limits apply to the checked-set scope; enabled
+MCP/plugins and the snapshot exec path are excluded. Qualification run 15's
+0.160.1 checks prove positive execution of an admitted command through
+matched protocol and owned-process evidence; they do not prove that it was
+the only command executed in the turn. No native
+per-turn tool-disable has been verified offline for 0.160.1. "No reported
+tool items" is therefore record-only, including the stored c3 reply. A matching
+reply does not prove unaided recall: stored-resume qualification rests on the
+stored thread identity after daemon retirement and the real `thread/resume`
+request with `excludeTurns:true`. Sampling plus missing command items cannot
+prove the runner's programs never executed, so automatic zero-command re-asks
+were disabled in run 15. Enabling them requires a verified complete
+execution-absence mechanism.
+Observed command deviations and unpaired refusal suffixes remain sticky blockers
+through admission and final accounting. This does not change the adapter's
+request or result contract.
+
 `instant_interrupt` is a watch item for P7. `write_stdin_approval` (now
 stable and on) produces approval requests only under an approval policy
 other than `never`; under `never` any such request is declined like the

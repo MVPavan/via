@@ -1484,7 +1484,7 @@ fn sigterm() -> Value {
 /// `discovered`, a model-only plan resolves Codex from it, and a plan
 /// naming no model takes its default. Before discovery there is none.
 /// The session stays open until shutdown, so its server is live when the
-/// checks run (fix r2 #11: a retired instance's catalog is gone).
+/// checks run; via-3fc also retains it after retirement.
 #[test]
 fn codex_discovery_feeds_models() {
     let name = "codex_discovery_feeds_models";
@@ -4389,8 +4389,8 @@ fn codex_acceptance_is_in_the_decode_fence() {
 /// launches a second server, which discovers the catalog again (lifetime
 /// 2 expects its `model/list`); `main`'s resumed `ultra` turn is refused
 /// from that catalog while the server lives. Once `main` closed too, its
-/// server retired and `models` lists nothing: a retired instance's
-/// catalog is gone.
+/// server retired and `models` still lists the complete discovery
+/// (via-3fc). Saved catalogs do not supply live effort checks.
 #[test]
 fn codex_retired_catalog_is_rediscovered() {
     let name = "codex_retired_catalog_is_rediscovered";
@@ -4422,10 +4422,12 @@ fn codex_retired_catalog_is_rediscovered() {
         "after_open": {"first": 0, "main": 0}, "after_turn": [1, 2, 2, 2]});
     check_variant_then(name, &replay, &expect, |pure| {
         let models = pure.set.models(Some("codex"));
-        if models.is_empty() {
+        if models.len() == 3 && models.iter().any(|model| model.model == "gpt-6-luna") {
             Ok(())
         } else {
-            Err(format!("a retired server's catalog is listed: {models:?}"))
+            Err(format!(
+                "the complete retired catalog is missing: {models:?}"
+            ))
         }
     })
     .unwrap();

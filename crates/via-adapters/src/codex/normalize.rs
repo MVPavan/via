@@ -79,7 +79,8 @@ pub(crate) struct CatalogPage {
 }
 
 /// A model as `model/list` advertises it.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct DiscoveredModel {
     /// The model name `thread/start` takes.
     pub(crate) model: String,

@@ -6,6 +6,7 @@
 //! inherited configuration, the server key); its driver runs each turn on
 //! a shared `codex app-server` (x.3.2 X3).
 
+mod catalog;
 mod delivery;
 mod driver;
 #[cfg(test)]
@@ -72,6 +73,8 @@ pub(crate) struct CodexAdapter {
     /// instance that discovered it and counts only while that instance is
     /// live, so a later instance of the key discovers its own.
     catalogs: Mutex<BTreeMap<String, Discovered>>,
+    /// Packet §3: one complete public catalog retained across daemon lifetimes.
+    saved_catalog: Arc<catalog::Catalog>,
 }
 
 /// A catalog and the server instance that discovered it.
@@ -93,6 +96,7 @@ impl CodexAdapter {
         (env, settings): (&BootstrapEnv, CodexSettings),
         runtime: Arc<RouteRuntime>,
     ) -> Self {
+        let saved_catalog = Arc::new(catalog::Catalog::load(runtime.vendor_state_dir()));
         Self {
             binary,
             instances,
@@ -100,6 +104,7 @@ impl CodexAdapter {
             settings,
             servers: Servers::new(runtime, normalize::DECLINES),
             catalogs: Mutex::default(),
+            saved_catalog,
         }
     }
 
@@ -206,17 +211,42 @@ impl CodexAdapter {
 
     /// Keeps the whole catalog instance `server` of server key `key`
     /// discovered.
-    fn discovered(&self, key: String, server: ServerId, models: Arc<[DiscoveredModel]>) {
-        self.catalogs
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(key, (server, models));
+    fn discovered(
+        &self,
+        key: String,
+        server: ServerId,
+        models: Arc<[DiscoveredModel]>,
+        vendor_version: Option<String>,
+    ) -> bool {
+        let mut catalogs = self.catalogs.lock().unwrap_or_else(PoisonError::into_inner);
+        if catalogs
+            .get(&key)
+            .is_some_and(|(known, _)| *known == server)
+        {
+            return false;
+        }
+        self.saved_catalog.replace(catalog::Snapshot {
+            key: key.clone(),
+            vendor_version,
+            models: models.to_vec(),
+        });
+        catalogs.insert(key, (server, models));
+        true
+    }
+
+    /// Packet §3: live catalog first, then the saved complete recipe's catalog.
+    fn model_catalog(&self, key: &str) -> Option<Arc<[DiscoveredModel]>> {
+        self.catalog(key).or_else(|| {
+            self.saved_catalog
+                .for_key(key)
+                .map(|snapshot| snapshot.models.into())
+        })
     }
 
     /// The models `requested`'s server discovered (C1 §3.13 `models`, and
     /// model-only resolution): none before its discovery.
     pub(crate) fn listed(&self, requested: Inherit) -> Vec<CatalogModel> {
-        self.catalog(&self.server_key(requested, &VendorArgs::default()))
+        self.model_catalog(&self.server_key(requested, &VendorArgs::default()))
             .iter()
             .flat_map(|catalog| catalog.iter())
             .map(|model| CatalogModel {
@@ -240,7 +270,7 @@ impl CodexAdapter {
     ) -> Result<RoutePlan, Refusal> {
         let route = harness.route();
         let key = self.server_key(requested, &req.vendor_args);
-        let catalog = self.catalog(&key);
+        let catalog = self.model_catalog(&key);
         let model = resolved_model(req.model.as_deref(), catalog.as_deref()).ok_or_else(|| {
             Refusal::new(
                 RefusalKind::UnknownModel,
@@ -275,7 +305,14 @@ impl CodexAdapter {
             .clone()
             .filter(|bound| plan::sandbox(bound).is_ok());
         let (inherit, switch_warning) = effective_inherit(&plan::categories(), requested);
-        let vendor_version = self.instances.last_version(harness.name(), &self.binary);
+        let vendor_version = self
+            .instances
+            .last_version(harness.name(), &self.binary)
+            .or_else(|| {
+                self.saved_catalog
+                    .for_key(&key)
+                    .and_then(|snapshot| snapshot.vendor_version)
+            });
         let sandbox = req
             .bound
             .as_ref()

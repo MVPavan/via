@@ -1773,7 +1773,20 @@ fn adopt(
     let catalog: Arc<[DiscoveredModel]> = server.models.iter().map(normalize::discovered).collect();
     let spec = &facts.driver.spec;
     let key = adapter.server_key(spec.inherit.requested, &spec.vendor_args);
-    adapter.discovered(key, id.clone(), Arc::clone(&catalog));
+    if adapter.discovered(
+        key,
+        id.clone(),
+        Arc::clone(&catalog),
+        normalize::instance_version(&server.user_agent).map(str::to_owned),
+    ) {
+        let saved = Arc::clone(&adapter.saved_catalog);
+        let vendor = adapter.servers.vendor_state_dir().to_path_buf();
+        // Packet §3: the driver's tracker owns this best-effort write
+        // through Engine stop's Host bound, without delaying the turn.
+        facts.driver.tracker.spawn_blocking(move || {
+            let _ = saved.persist(&vendor);
+        });
+    }
     catalog
 }
 
