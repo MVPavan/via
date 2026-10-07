@@ -10,12 +10,28 @@ import time
 from claude import Blocked
 
 # Packet §3: this second argv is reachable only after the fixed attempt gets EROFS.
-ATTEMPT_OBSERVE_S, DENIED_OBSERVE_S = 3, 6
+ATTEMPT_OBSERVE_S, DENIED_OBSERVE_S = 3, 2
 # Packet §8: diagnostic evidence stays bounded even with changing owned argv.
 SURVEY_RECORDS = 256
 # Packet §§3/5/8: observable fixed scripts, one write attempt, bounded A/B waits.
-TOOL_PROGRAM_BYTES, A_SLEEP_S, B_SLEEP_S = 64 * 1024, 45, 55
-TOOL_CODE = f'''import errno,hashlib,json,os,secrets,sys,time
+TOOL_PROGRAM_BYTES, A_SLEEP_S, B_SLEEP_S = 64 * 1024, 6, 3
+# Packet §§5/8: one whole-program deadline, below the observed 10 s yield window.
+TOOL_WATCHDOG_S, TOOL_RUNTIME_LIMIT_S = 7, 8
+TOOL_CODE = f'''import os,signal,sys,time
+# Only this child's environment carries the deadline across the EROFS exec.
+# Initial invocations overwrite it; the exec branch never gains another budget.
+if len(sys.argv) == 1:
+    deadline = time.monotonic() + {TOOL_WATCHDOG_S}
+    os.environ["VIAQUAL_TOOL_DEADLINE"] = str(deadline)
+else:
+    deadline = float(os.environ["VIAQUAL_TOOL_DEADLINE"])
+remaining = deadline - time.monotonic()
+if not 0 < remaining <= {TOOL_WATCHDOG_S}:
+    raise SystemExit(25)
+signal.signal(signal.SIGALRM, signal.SIG_DFL)
+signal.pthread_sigmask(signal.SIG_UNBLOCK, {{signal.SIGALRM}})
+signal.setitimer(signal.ITIMER_REAL, remaining)
+import errno,hashlib,json,secrets
 mode = REQUEST["action"]
 nonce = "VIAQUAL" + hashlib.sha256((REQUEST["seed"] + secrets.token_hex(16)).encode()).hexdigest()[:32]
 line = json.dumps({{REQUEST["field"]: nonce}}, separators=(",", ":"))
@@ -70,6 +86,19 @@ else:
     os.close(fd)
     raise SystemExit(23)
 """
+
+
+def runtime_bounds():
+    """Packet §§5/8: every successful mode prints inside one sub-eight-second watchdog."""
+    bounds = {"allowed": ATTEMPT_OBSERVE_S,
+              "denied": ATTEMPT_OBSERVE_S + DENIED_OBSERVE_S,
+              "never-ask": ATTEMPT_OBSERVE_S + DENIED_OBSERVE_S,
+              "interrupt-a": A_SLEEP_S, "interrupt-b": B_SLEEP_S}
+    if not 0 < TOOL_WATCHDOG_S < TOOL_RUNTIME_LIMIT_S == 8 \
+            or not all(0 < seconds < TOOL_WATCHDOG_S for seconds in bounds.values()):
+        raise Blocked("tool program runtime bound")
+    return {"sleep_seconds": bounds, "watchdog_seconds": TOOL_WATCHDOG_S,
+            "limit_seconds": TOOL_RUNTIME_LIMIT_S}
 
 
 def digest(value):
