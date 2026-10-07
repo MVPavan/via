@@ -1,0 +1,162 @@
+"""Codex packet §§3/7: private run-wide native submission authority and accounting."""
+import contextlib
+import fcntl
+import json
+import os
+from pathlib import Path
+import stat
+import time
+
+from claude import Blocked
+
+# Packet §7/runtime §8: seven submissions, two active, bounded private ledger/lock.
+TURN_LIMIT, ACTIVE_LIMIT, LEDGER_BYTES, LOCK_S = 7, 2, 256 * 1024, 2
+
+
+def require(ok, reason):
+    """Packet §7: unavailable control evidence cannot authorize native work."""
+    if not ok:
+        raise Blocked("reservation control: " + reason)
+
+
+class Reservations:
+    """Packet §7: every proxy consumes the same atomic, single-use reservations."""
+    def __init__(self, path, deadline=None):
+        self.path = Path(path)
+        self.lock = self.path.with_suffix(".lock")
+        if deadline is not None:
+            fd = os.open(self.lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            os.close(fd)
+            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w") as file:
+                json.dump({"version": 1, "deadline": deadline, "closed": False, "rows": {}}, file)
+                file.flush()
+                os.fsync(file.fileno())
+
+    @staticmethod
+    def private(fd):
+        info = os.fstat(fd)
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
+                and stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1, "unsafe file")
+
+    @contextlib.contextmanager
+    def transaction(self, write=True):
+        fd = os.open(self.lock, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            self.private(fd)
+            deadline = time.monotonic() + LOCK_S
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    require(time.monotonic() < deadline, "lock deadline")
+                    time.sleep(0.01)
+            source = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(source, "rb") as file:
+                self.private(file.fileno())
+                raw = file.read(LEDGER_BYTES + 1)
+            require(len(raw) <= LEDGER_BYTES, "byte bound")
+            try:
+                state = json.loads(raw)
+                require(state["version"] == 1 and type(state["closed"]) is bool
+                        and type(state["rows"]) is dict and len(state["rows"]) <= TURN_LIMIT,
+                        "schema or turn bound")
+            except (KeyError, TypeError, ValueError):
+                raise Blocked("reservation control: unreadable schema") from None
+            yield state
+            if write:
+                raw = json.dumps(state, sort_keys=True).encode()
+                require(len(raw) <= LEDGER_BYTES, "byte bound")
+                temporary = self.path.with_suffix(".tmp")
+                target = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                try:
+                    with os.fdopen(target, "wb") as file:
+                        file.write(raw)
+                        file.flush()
+                        os.fsync(file.fileno())
+                    os.replace(temporary, self.path)
+                finally:
+                    temporary.unlink(missing_ok=True)
+        except OSError:
+            raise Blocked("reservation control: file or lock unverifiable") from None
+        finally:
+            os.close(fd)
+
+    def reserve(self, key, verb, prompt, cwd, thread=None):
+        """Packet §7: admit before CLI launch, never recycle an accepted reservation."""
+        with self.transaction() as state:
+            rows = state["rows"]
+            require(not state["closed"] and time.monotonic() < state["deadline"], "closed or expired")
+            require(len(rows) < TURN_LIMIT and sum(row["active"] for row in rows.values()) < ACTIVE_LIMIT,
+                    "turn/concurrency cap")
+            require(key not in rows and verb in ("spawn", "resume"), "duplicate or invalid submission")
+            require(verb == "spawn" or thread is not None, "resume identity unavailable")
+            rows[key] = {"verb": verb, "prompt": prompt, "cwd": cwd, "thread": thread,
+                         "active": True, "thread_start": None, "turn_start": None,
+                         "receipt": None, "envelope": None}
+
+    def close(self):
+        """Packet §7: uncertain effects close admission; cleanup stays available."""
+        with self.transaction() as state:
+            state["closed"] = True
+
+    def claim(self, method, generation, request, cwd, thread=None, prompt=None):
+        """Packet §§3/7: consume exactly one compatible reservation before forwarding."""
+        with self.transaction() as state:
+            require(not state["closed"] and time.monotonic() < state["deadline"], "closed or expired")
+            rows = state["rows"]
+            require(sum(row["active"] for row in rows.values()) <= ACTIVE_LIMIT, "concurrency cap")
+            field = "turn_start" if method == "turn/start" else "thread_start"
+            candidates = []
+            for key, row in rows.items():
+                if not row["active"] or row[field] is not None or row["cwd"] != cwd:
+                    continue
+                if method == "thread/start" and row["verb"] == "spawn" and row["thread"] is None:
+                    candidates.append(key)
+                elif method == "thread/resume" and row["verb"] == "resume" and row["thread"] == thread:
+                    candidates.append(key)
+                elif method == "turn/start" and row["thread"] == thread and row["prompt"] == prompt:
+                    candidates.append(key)
+            require(len(candidates) == 1, "native start has no unique reservation")
+            key = candidates[0]
+            rows[key][field] = {"generation": generation, "request": request, "method": method}
+            return key
+
+    def reply(self, key, method, generation, request, thread, turn=None):
+        """Packet §3: replies bind claims to exact native IDs, never notifications."""
+        with self.transaction() as state:
+            row = state["rows"][key]
+            field = "turn_start" if method == "turn/start" else "thread_start"
+            claim = row[field]
+            require(claim is not None and claim["generation"] == generation
+                    and claim["request"] == request and claim["method"] == method, "unpaired native reply")
+            require(row["thread"] in (None, thread), "native thread mismatch")
+            require("thread" not in claim, "duplicate native reply")
+            row["thread"] = claim["thread"] = thread
+            if method == "turn/start":
+                require(turn is not None, "native turn missing")
+                claim["turn"] = turn
+
+    def receipt(self, key, receipt):
+        """C1 §4/packet §7: bind each CLI receipt once, without raw IDs."""
+        with self.transaction() as state:
+            row = state["rows"][key]
+            require(row["receipt"] is None, "duplicate receipt")
+            row["receipt"] = receipt
+
+    def settle(self, key, envelope):
+        """Packet §7: release concurrency only after both C1 results and native mapping."""
+        with self.transaction() as state:
+            row = state["rows"][key]
+            require(row["active"] and row["receipt"] is not None and row["envelope"] is None,
+                    "unknown or duplicate settlement")
+            require(row["receipt"]["session"] == envelope["session"]
+                    and row["receipt"]["address"] == envelope["address"]
+                    and row["thread"] == envelope["thread"], "receipt/envelope identity mismatch")
+            row["envelope"], row["active"] = envelope, False
+
+    def snapshot(self):
+        """Packet §7: bounded public-field ledger for final one-to-one verification."""
+        with self.transaction(write=False) as state:
+            return state

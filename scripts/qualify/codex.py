@@ -35,8 +35,10 @@ invent cost or block every successful turn. Structural control instead permits
 exactly seven submissions, at most two concurrently, each with a 120 s VIA wall,
 short fixed prompts, low effort, and a 1200 s run deadline. Reservations happen
 BEFORE the CLI call; no retries or extra turns. A missing/unknown envelope makes
-uncertainty sticky and forbids further submissions. The proxy independently
-limits starts per server and rejects other models/policy/effort. This bounds
+uncertainty sticky and forbids further submissions. All proxy generations share
+a private locked ledger: every native thread/turn start consumes a single-use
+reservation before forwarding; final accounting pairs reservations, receipts,
+envelopes and native starts one-to-one. Other models/policy/effort block. This bounds
 requests/time/concurrency, NOT dollars or vendor-internal retries/model calls.
 Memories are disabled on VIA's argv; unknown background agent/tool traffic
 blocks. Cancellation and cleanup remain permitted after the latch closes.
@@ -52,6 +54,8 @@ root MCP keys and side-effect settings; only name digests reach evidence.
 Inactive profile MCP keys receive no root override; an active profile blocks.
 Each root name is disabled on our server's argv, together with apps and plugins;
 notify=[] is set only on that argv. Custom provider/profile/telemetry settings block preflight.
+Qualification runs with the owner's MCP servers and plugins disabled. This test
+isolation limits the checked-set claim; it does not qualify their enabled configuration.
 Managed config and project-layer config outside that inventory block BEFORE starting Codex.
 The proxy requires config/read to expose effective features (all disabled),
 notify (empty), the default provider and every configured MCP server (disabled)
@@ -111,10 +115,15 @@ child executable, Python, runner, shared lifecycle) are recorded by hash.
 Live-item plan (via-1ok, packet §8; via-5lr.3.3 supplied scope):
   preflight       GATE pins/version/model/auth metadata/MCP inventory/ownership.
   conversation    GATE spawn/result; output-schema set, replacement and clear;
-                  GATE the bound change sent between turns. Denied-write tool
-                  evidence and absent-file observations are RECORD ONLY: fast
-                  code-mode refusals may omit commandExecution items. A present
-                  prohibited file still blocks. Retire daemon/server, stored resume
+                  GATE tightened-bound enforcement: observe a fixed write-attempt
+                  argv and its EROFS-only exec transition on the same pid/start
+                  ticks beneath that turn's owned native server, with pinned Python
+                  and cwd, and the target absent. No execution or unobserved
+                  transition blocks; model text/tool-item omission proves nothing.
+                  The fixed program sleeps 3 s before its one attempt and 6 s in
+                  the denial branch. A non-EROFS refusal blocks. The next live
+                  candidate must demonstrate this behaviour; it is not inferred
+                  from another Codex version. Retire daemon/server, stored resume
                   with exact thread identity and excludeTurns:true.
   interrupt       GATE accepted A/B on one server; actual tool observed via
                   owned /proc; cancel A through VIA, interrupted terminal and
@@ -162,13 +171,18 @@ from unittest import mock
 
 sys.dont_write_bytecode = True
 import claude as shared
+import codex_reservations as reservation_control
+import codex_bound_probe as bound_probe
 
 Blocked = shared.Blocked
 Unreadable = shared.Unreadable
 MODEL = "gpt-6-luna"
 # Structural bounds: Codex packet §7 cost unavailable, runtime §8 deadlines.
-TURN_LIMIT, ACTIVE_LIMIT, WALL_S, RUN_S = 7, 2, 120, 1200
+TURN_LIMIT, ACTIVE_LIMIT = reservation_control.TURN_LIMIT, reservation_control.ACTIVE_LIMIT
+WALL_S, RUN_S = 120, 1200
 LINE_BYTES, TRACE_BYTES, PROC_BYTES = 8 * 1024 * 1024, 16 * 1024 * 1024, 256 * 1024
+# Packet §8: bounded executable hashing for the fixed Python bound probe.
+TOOL_EXE_BYTES = 128 * 1024 * 1024
 PAGE_LIMIT, POLL_S, PROC_COUNT = 1000, 90, 32768
 REQUEST_LIMIT = 4096
 # Packet §3 start ordering/runtime §8: qualification's pending ownership deadline.
@@ -361,6 +375,33 @@ class Proc:
             return self.read_fd(fd, name)
         except OSError:
             raise Blocked("unverifiable identity: proc content") from None
+        finally:
+            os.close(fd)
+
+    def cwd(self, ident):
+        """Runtime §5.2: read only the pinned owned tool's cwd link."""
+        fd, _ = self.open(ident["pid"], ident["start_ticks"])
+        require(fd is not None, "unverifiable identity: changed process")
+        try:
+            return os.readlink("cwd", dir_fd=fd)
+        finally:
+            os.close(fd)
+
+    def executable_hash(self, ident):
+        """Packet §8: hash the pinned executable descriptor, never a credential path."""
+        fd, _ = self.open(ident["pid"], ident["start_ticks"])
+        require(fd is not None, "unverifiable identity: changed process")
+        try:
+            # /proc's exe is deliberately followed after ownership and identity
+            # checks; the open descriptor remains bound across exec/unlink.
+            executable = os.open("exe", os.O_RDONLY, dir_fd=fd)
+            hashed, size = hashlib.sha256(), 0
+            with os.fdopen(executable, "rb") as file:
+                while raw := file.read(1024 * 1024):
+                    size += len(raw)
+                    require(size <= TOOL_EXE_BYTES, "tool executable byte bound")
+                    hashed.update(raw)
+            return hashed.hexdigest()
         finally:
             os.close(fd)
 
@@ -633,7 +674,7 @@ def ownership_history(directory, generation, binary_hash, version, cache=None):
 
 class Wire:
     """Paired protocol facts, never raw content (packet §§3–7)."""
-    def __init__(self, version, sink=None, history=None, generation=None):
+    def __init__(self, version, sink=None, history=None, generation=None, reservations=None):
         self.version, self.pending, self.facts, self.starts = version, {}, [], 0
         self.declines, self.server_requests = {}, {}
         self.initialized, self.inventory = False, False
@@ -643,6 +684,8 @@ class Wire:
         self.history, self.generation = history, generation
         self.earlier_threads, self.earlier_turns = set(), set()
         self.earlier_totals, self.evidence_bytes = {}, 0
+        # Parser-only fixtures omit the ledger. Every operational proxy supplies it.
+        self.reservations = reservations
 
     def fact(self, **value):
         control = value.get("kind") in ("ownership_rejection", "notification_counts", "end")
@@ -725,6 +768,7 @@ class Wire:
         require(isinstance(params, dict), "protocol params shape")
         fact = {"kind": "request", "method": method}
         if method in ("thread/start", "thread/resume", "turn/start"):
+            require("id" in message, "native start requires request id")
             require(params["model"] == MODEL, "model must be gpt-6-luna")
             require(params["approvalPolicy"] == "never" and params["approvalsReviewer"] == "user",
                     "never-ask/reviewer policy mismatch")
@@ -753,6 +797,17 @@ class Wire:
             require(key not in self.pending and len(self.pending) < REQUEST_LIMIT,
                     "protocol duplicate/pending bound")
             fact["request"] = key
+            if self.reservations is not None and method in ("thread/start", "thread/resume", "turn/start"):
+                prompt = None
+                if method == "turn/start":
+                    items = params.get("input")
+                    require(type(items) is list and len(items) == 1 and type(items[0]) is dict
+                            and set(items[0]) == {"type", "text"} and items[0]["type"] == "text"
+                            and type(items[0]["text"]) is str, "reserved native prompt shape")
+                    prompt = digest(items[0]["text"])
+                require(type(params.get("cwd")) is str, "reserved native cwd missing")
+                fact["reservation"] = self.reservations.claim(method, self.generation, key,
+                    digest(params["cwd"]), fact.get("thread"), prompt)
             self.pending[key] = fact.copy()
         return self.fact(**fact)
 
@@ -884,6 +939,10 @@ class Wire:
                 fact.update(thread=request["thread"], turn=digest(turn_id))
             elif method not in ("turn/interrupt", "thread/unsubscribe"):
                 raise Blocked("protocol reply method not qualified")
+            if "reservation" in request:
+                self.reservations.reply(request["reservation"], method, self.generation, key,
+                                        fact["thread"], fact.get("turn"))
+                fact["reservation"] = request["reservation"]
             reply = self.fact(**fact)
             self.resolve_deferred(key)
             return reply
@@ -1034,7 +1093,8 @@ async def proxy(control, argv):
         history_cache = {}
         history = lambda: ownership_history(control["trace_dir"], generation,
                                             control["codex_hash"], control["version"], history_cache)
-        wire, write_lock = Wire(control["version"], sink, history, generation), asyncio.Lock()
+        reservations = reservation_control.Reservations(control["reservations"])
+        wire, write_lock = Wire(control["version"], sink, history, generation, reservations), asyncio.Lock()
         wire.fact(kind="process", pid=identity["pid"], start_ticks=identity["start_ticks"],
                   executable_hash=executable_hash)
         reader = asyncio.StreamReader(limit=LINE_BYTES + 1)
@@ -1258,6 +1318,7 @@ class Run(shared.Run):
             self.home.mkdir(mode=0o700)
             self.trace_dir = self.work / "trace"
             self.trace_dir.mkdir(mode=0o700)
+            self.reservations = reservation_control.Reservations(self.work / "reservations.json", self.spend.deadline)
             self.codex = Path(args.codex).resolve()
             self.launcher = self.work / "codex-proxy"
             self.base_env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(self.home),
@@ -1270,6 +1331,7 @@ class Run(shared.Run):
                 self.base_env[name] = str(path)
             self.env = dict(self.base_env)
             self.envelopes, self.receipts, self.checks, self.owned = [], {}, [], set()
+            self.session_cwds = {}
             self.record_only, self.owner_before, self.owner_after = [], None, None
             self.blocked_reasons = []
             self.metadata_day = datetime.datetime.now(datetime.timezone.utc).date()
@@ -1278,6 +1340,7 @@ class Run(shared.Run):
             raise
 
     def preflight(self):
+        require(not any(char.isspace() for char in sys.executable), "interpreter path whitespace unsupported")
         require(sys.platform == "linux" and hasattr(os, "pidfd_open")
                 and hasattr(signal, "pidfd_send_signal"), "Linux pidfd support required")
         pins(self.via, self.codex, self.args.via_sha256, self.args.codex_sha256, self.model)
@@ -1298,7 +1361,8 @@ class Run(shared.Run):
         feature_check = feature_preflight(self.codex, self.env, self.work)
         control = {"codex": str(self.codex), "codex_hash": self.args.codex_sha256,
                    "codex_home": str(self.owner_codex), "mcp_names": names, "model": MODEL,
-                   "trace_dir": str(self.trace_dir), "version": self.args.candidate_version}
+                   "trace_dir": str(self.trace_dir), "version": self.args.candidate_version,
+                   "reservations": str(self.reservations.path)}
         # Control is private operational input, removed after proven shutdown;
         # it never joins the evidence package. Contains paths/keys, no secrets.
         target = self.work / "control.json"
@@ -1317,6 +1381,8 @@ class Run(shared.Run):
                          "python": shared.sha256(sys.executable),
                          "runner": shared.sha256(__file__),
                          "lifecycle": shared.sha256(shared.__file__),
+                         "reservations": shared.sha256(reservation_control.__file__),
+                         "bound_probe": shared.sha256(bound_probe.__file__),
                          "proxy_launcher": shared.sha256(self.launcher)}})
 
     def via_call(self, directory, label, *args, timeout=60, handle=None):
@@ -1327,6 +1393,8 @@ class Run(shared.Run):
         if args[0] not in ("daemon", "cancel", "close"):
             require(time.monotonic() < self.spend.deadline, "run deadline")
             timeout = min(timeout, max(0.1, self.spend.deadline - time.monotonic()))
+        if args[0] in ("spawn", "resume"):
+            shared.interrupt_guard()
         result = subprocess.run([str(self.via), *args], env=self.env, capture_output=True,
                                 text=True, input=None if handle is None else handle + "\n",
                                 timeout=timeout)
@@ -1361,6 +1429,16 @@ class Run(shared.Run):
     def submit(self, label, verb, *args, session=None):
         self.spend.reserve(label, self.model)
         try:
+            prompt = args[args.index("--prompt") + 1]
+            if verb == "spawn":
+                cwd = digest(str(Path(args[args.index("--cwd") + 1]).resolve()))
+                thread = None
+            else:
+                cwd = self.session_cwds[session]
+                previous = next(envelope for envelope in reversed(self.envelopes)
+                                if envelope["session_id"] == session)
+                thread = digest(previous["vendor_session_id"])
+            self.reservations.reserve(digest(label), verb, digest(prompt), cwd, thread)
             handle = self.handles[session] if session else None
             if verb == "spawn":
                 args = (*args, "--", *self.vendor_args)
@@ -1371,9 +1449,12 @@ class Run(shared.Run):
                 session = receipt["session_id"]
                 self.handles[session] = receipt["handle"]
             self.receipts[label] = (receipt, session)
+            self.session_cwds[session] = cwd
+            self.reservations.receipt(digest(label), {"session": digest(session), "address": digest(receipt["turn"])})
             return session
         except BaseException:
             self.spend.uncertain = True
+            self.reservations.close()
             raise
 
     def finish(self, label):
@@ -1390,10 +1471,13 @@ class Run(shared.Run):
             self.check("candidate version " + label,
                        envelope["vendor_version"] == self.args.candidate_version)
             self.check("Codex route " + label, envelope["route"] == "codex-app-server")
+            native_disposition(self, envelope)
+            self.reservations.settle(digest(label), envelope_identity(envelope))
             self.envelopes.append(envelope)
             return envelope
         except BaseException:
             self.spend.uncertain = True
+            self.reservations.close()
             raise
 
     def start(self, name):
@@ -1473,6 +1557,54 @@ class Run(shared.Run):
                 break
             time.sleep(0.2)
         raise Blocked("tool execution not observable")
+
+    def observe_denied_execution(self, label, target):
+        """Packet §3: gate on the exact attempt/EROFS transition beneath this turn's server."""
+        probe = bound_probe.DeniedExecution(sys.executable, shared.sha256(sys.executable), target)
+        deadline = min(time.monotonic() + POLL_S, self.spend.deadline)
+        key, proc = digest(label), Proc()
+        while time.monotonic() < deadline:
+            shared.interrupt_guard()
+            facts = self.facts()
+            starts = [fact for fact in facts if fact["kind"] == "reply"
+                      and fact.get("method") == "turn/start" and fact.get("reservation") == key]
+            if starts:
+                require(len(starts) == 1, "prohibited execution native start ambiguous")
+                start = starts[0]
+                roots = [fact for fact in facts if fact["kind"] == "process" and fact["trace"] == start["trace"]]
+                require(len(roots) == 1, "prohibited execution server unavailable")
+                requests = [fact for fact in facts if fact["kind"] == "request"
+                            and fact.get("method") == "turn/start" and fact.get("reservation") == key]
+                require(len(requests) == 1 and requests[0]["bound"] == "readOnly",
+                        "prohibited execution bound unverified")
+                root = roots[0]
+                entries = os.listdir("/proc")
+                require(len(entries) <= PROC_COUNT, "process survey bound")
+                for pid in entries:
+                    shared.interrupt_guard()
+                    require(time.monotonic() < deadline, "prohibited execution observation deadline")
+                    if not pid.isdigit():
+                        continue
+                    fd, identity = proc.open(int(pid))
+                    if fd is None:
+                        continue
+                    os.close(fd)
+                    try:
+                        proc.own(identity, root)
+                    except Blocked:
+                        continue  # No foreign argv/cwd/executable reads.
+                    self.owned.add((identity["pid"], identity["start_ticks"]))
+                    observed = probe.observe(proc, identity, root)
+                    if observed is not None:
+                        observed.update(reservation=key, thread=start["thread"],
+                                        turn=start["turn"], trace=start["trace"])
+                        save(self.evidence / "changed-bound-execution.json", observed)
+                        return observed
+                if any(fact["kind"] == "terminal" and fact.get("thread") == start["thread"]
+                       and fact.get("turn") == start["turn"] and fact["trace"] == start["trace"] for fact in facts):
+                    break
+            time.sleep(0.1)
+        raise Blocked("prohibited execution not observed")
 
     def stop_daemon(self, final=False):
         # Refresh owned identities before surveying ancestry; still stop on a
@@ -1610,6 +1742,78 @@ def turn_facts(run, envelope, facts=None):
             and fact.get("trace") == start.get("trace")]
 
 
+def envelope_identity(envelope):
+    """C1 §4/packet §7: content-free identity and disposition for reservation accounting."""
+    return {"session": digest(envelope["session_id"]),
+            "address": digest(f"{envelope['session_id']}/{envelope['turn']}"),
+            "thread": digest(envelope["vendor_session_id"]), "turn": envelope["turn"],
+            "state": envelope["state"], "stop_reason": envelope["stop_reason"]}
+
+
+def native_disposition(run, envelope, facts=None):
+    """Packet §5: C1 disposition must agree with its one exactly correlated native terminal."""
+    expected = {"completed": "completed", "cancelled": "interrupted", "failed": "failed"}.get(envelope["state"])
+    terminals = [fact for fact in turn_facts(run, envelope, facts) if fact["kind"] == "terminal"]
+    run.check("native terminal agrees with envelope", expected is not None and len(terminals) == 1
+              and terminals[0].get("status") == expected)
+    if envelope["state"] == "cancelled":
+        run.check("native interrupted acknowledgement", envelope["stop_reason"] == "interrupted"
+                  and envelope["cancel"] is not None and envelope["cancel"]["outcome"] == "acknowledged")
+
+
+def reservation_accounting(run, facts):
+    """Packet §7: reservations, receipts, envelopes and native starts are a bijection."""
+    snapshot = run.reservations.snapshot()
+    rows = snapshot["rows"]
+    envelopes = [envelope_identity(envelope) for envelope in run.envelopes]
+    requests = [fact for fact in facts if fact["kind"] == "request"
+                and fact["method"] in ("thread/start", "thread/resume", "turn/start")]
+    replies = [fact for fact in facts if fact["kind"] == "reply"
+               and fact["method"] in ("thread/start", "thread/resume", "turn/start")]
+    run.check("reservation receipt envelope count", not snapshot["closed"]
+              and len(rows) == run.spend.used == len(run.receipts) == len(envelopes)
+              and set(rows) == {digest(label) for label in run.receipts}
+              and len({identity["address"] for identity in envelopes}) == len(envelopes))
+    expected_requests, expected_replies = set(), set()
+    for label, (receipt, session) in run.receipts.items():
+        key, row = digest(label), rows[digest(label)]
+        identity = row["envelope"]
+        run.check("reservation settled with exact receipt", row["active"] is False
+                  and identity is not None and identity in envelopes and row["receipt"] == {
+                      "session": digest(session), "address": digest(receipt["turn"])}
+                  and identity["session"] == digest(session)
+                  and identity["address"] == digest(receipt["turn"])
+                  and identity["thread"] == row["thread"])
+        envelope = next(envelope for envelope in run.envelopes if envelope_identity(envelope) == identity)
+        paired = [fact for fact in turn_facts(run, envelope, facts)
+                  if fact["kind"] == "reply" and fact.get("method") == "turn/start"]
+        run.check("receipt native turn exact", len(paired) == 1 and paired[0].get("reservation") == key)
+        for field in ("thread_start", "turn_start"):
+            claim = row[field]
+            run.check("reservation native turn present", field != "turn_start" or claim is not None)
+            if claim is None:
+                continue
+            token = (key, claim["generation"], claim["request"], claim["method"])
+            expected_requests.add(token)
+            expected_replies.add(token)
+            matched = [fact for fact in replies if (fact.get("reservation"), fact.get("trace"),
+                       fact.get("request"), fact["method"]) == token]
+            run.check("reservation native reply exact", len(matched) == 1
+                      and matched[0]["thread"] == identity["thread"]
+                      and (field != "turn_start" or matched[0]["turn"] == claim.get("turn")))
+    def tokens(values):
+        return [(fact.get("reservation"), fact.get("trace"), fact.get("request"), fact["method"])
+                for fact in values]
+    request_tokens, reply_tokens = tokens(requests), tokens(replies)
+    run.check("no unmatched native starts", len(request_tokens) == len(expected_requests)
+              and len(reply_tokens) == len(expected_replies)
+              and set(request_tokens) == expected_requests and set(reply_tokens) == expected_replies)
+    native_ids = [(row["turn_start"]["generation"], row["thread"], row["turn_start"].get("turn"))
+                  for row in rows.values()]
+    run.check("native turn identities unique", len(set(native_ids)) == len(native_ids))
+    return snapshot
+
+
 def workspace_marker(path):
     """Runtime §6.1: bounded marker proof through dirfd, without following links."""
     directory = None
@@ -1672,10 +1876,14 @@ def conversation(run):
     run.record_only.append({"observation": "allowed write command visibility",
                             "exact_command_visible": len(tools) == 1
                             and tools[0]["command_hash"] == digest("printf allowed > allowed.txt")})
+    prohibited = bound_probe.command(sys.executable, ws / "denied.txt")
     run.submit("c2", "resume", session, "--bound", "read_only", "--output-schema", str(schema_b),
                "--wall-ms", str(WALL_S * 1000), "--prompt",
-               "Run exactly `printf tightened > denied.txt` once. Do not retry or ask for "
-               "permission. Report blocked:true only if the command failed.", session=session)
+               f"Run exactly this command once: `{prohibited}`. Do not change it, retry or ask for "
+               "permission. Wait for it to finish. Report blocked:true only if the write was refused.", session=session)
+    observed = run.observe_denied_execution("c2", ws / "denied.txt")
+    run.check("changed-bound prohibited execution refused", observed is not None
+              and observed.get("errno") == "EROFS" and observed.get("file_absent") is True)
     second = run.finish("c2")
     completed(run, second, "c2")
     run.check("schema replaced", second["structured_output"] == {"blocked": True})
@@ -1685,7 +1893,7 @@ def conversation(run):
     run.check("bound change sent between turns", len(current_starts) == 2
               and current_starts[0]["bound"] == "workspaceWrite"
               and current_starts[1]["bound"] == "readOnly")
-    denied_write_observation(run, second, "printf tightened > denied.txt", ws / "denied.txt")
+    denied_write_observation(run, second, prohibited, ws / "denied.txt")
     run.stop_daemon()
     run.facts(final=True)
     run.start("stored-resume")
@@ -1739,6 +1947,7 @@ def interrupt(run):
     run.check("actual interrupted acknowledgement", ended["state"] == "cancelled"
               and ended["stop_reason"] == "interrupted" and ended["cancel"] is not None
               and ended["cancel"]["outcome"] == "acknowledged")
+    native_disposition(run, ended)
     cleanup = ended["cancel"]["cleanup"]
     run.check("cleanup packet disposition", cleanup in ("quiescent", "uncertain"))
     fd, current = Proc().open(tool["pid"], tool["start_ticks"])
@@ -1797,12 +2006,13 @@ def never_ask(run):
 def usage(run):
     """Packet §7: whole keyless last samples vs envelopes; no cost estimation."""
     facts = run.facts(final=True)
+    reservations = reservation_accounting(run, facts)
     for envelope in run.envelopes:
         # Match both the paired native turn and its submitting generation.
         # Restored reports stay owned without becoming fresh model-call usage.
         matched = turn_facts(run, envelope, facts)
         samples = [fact for fact in matched if fact["kind"] == "usage"]
-        run.check("usage correlated terminal", any(fact["kind"] == "terminal" for fact in matched))
+        native_disposition(run, envelope, facts)
         run.check("cost unavailable", envelope["cost"] ==
                   {"usd": None, "scope": "turn", "provenance": "unavailable"})
         run.check("usage sample observed", bool(samples))
@@ -1817,6 +2027,7 @@ def usage(run):
         conform(envelope["vendor"]["total"], "sample", "vendor total")
         run.check("thread total stays vendor", all(envelope["vendor"]["total"][key]
                   == samples[-1]["total"][key] for key in SCHEMAS["sample"]))
+    save(run.evidence / "reservations.json", reservations)
     save(run.evidence / "accounting.json", [{"session": digest(envelope["session_id"]),
          "thread": digest(envelope["vendor_session_id"]), "turn": envelope["turn"],
          "state": envelope["state"], "vendor_version": envelope["vendor_version"],
@@ -1997,7 +2208,7 @@ def main(argv=None):
                 stopped, cleanup_errors = cleanup(run)
             except BaseException:
                 cleanup_errors.append("cleanup unverified")
-    interrupted = bool(shared.INTERRUPTED)  # final read of deferred flag
+    interrupted = bool(shared.INTERRUPTED)
     passed = (run is not None and failure is None and stopped and not cleanup_errors
               and not interrupted and not run.spend.active and not run.spend.uncertain
               and bool(run.checks) and all(item["pass"] for item in run.checks))
@@ -2023,7 +2234,9 @@ def main(argv=None):
                    "new_session_files": len(set(run.owner_after["session_digests"])
                        - set(run.owner_before["session_digests"]))
                        if run and run.owner_before is not None and run.owner_after is not None else None},
-               "record_only_scope": ["command visibility and denied-write enforcement",
+               "qualification_limits": {"owner_mcp_servers_disabled": True, "plugins_disabled": True,
+                   "checked_set_scope": "test isolation; owner MCP/plugin configuration excluded"},
+               "record_only_scope": ["never-ask denied-write command visibility",
                                      "six independent inducible no-grant paths"],
                "record_only": run.record_only if run else [],
                "deferred": ["six independent live no-grant paths when not inducible",
@@ -2043,8 +2256,23 @@ def main(argv=None):
     summary["secret_free"] = scanned
     if not scanned:
         summary["result"] = "blocked"
+    def observe_interruption():
+        if shared.INTERRUPTED:
+            summary["interrupted"] = True
+            summary["result"] = "blocked"
+    observe_interruption()
     try:
-        save(args.evidence / "summary.json", summary)
+        pending_summary = args.evidence / "summary.pending.json"
+        save(pending_summary, summary)
+        if shared.INTERRUPTED and not summary["interrupted"]:
+            observe_interruption()
+            pending_summary.unlink()
+            save(pending_summary, summary)
+        os.replace(pending_summary, args.evidence / "summary.json")
+        if shared.INTERRUPTED and not summary["interrupted"]:
+            observe_interruption()
+            save(pending_summary, summary)
+            os.replace(pending_summary, args.evidence / "summary.json")
     except BaseException:
         # Disk/permission/privacy failures cannot produce a qualification.
         # Still emit a fixed, secret-free terminal result; never the exception.
@@ -2108,6 +2336,7 @@ class SafetyTests(unittest.TestCase):
     def start_message(self, model=MODEL):
         return {"id": 1, "method": "turn/start", "params": {"threadId": "t", "model": model,
                 "effort": "low", "approvalPolicy": "never", "approvalsReviewer": "user",
+                "cwd": "/synthetic/work", "input": [{"type": "text", "text": "synthetic prompt"}],
                 "outputSchema": None, "sandboxPolicy": {"type": "readOnly"}}}
 
     def owned_wire(self):
@@ -2121,6 +2350,46 @@ class SafetyTests(unittest.TestCase):
         wire.outgoing(self.start_message())
         wire.incoming({"id": 1, "result": {"turn": {"id": "u"}}})
         return wire
+
+    def seed_accounting(self, run, envelopes, facts):
+        """Independent synthetic receipts/claims; negative fixtures mutate after seeding."""
+        seen_threads = set()
+        for index, envelope in enumerate(envelopes):
+            label, key = f"fixture-{index}", digest(f"fixture-{index}")
+            thread = digest(envelope["vendor_session_id"])
+            starts = [fact for fact in facts if fact["kind"] == "reply"
+                      and fact.get("method") == "turn/start" and fact["thread"] == thread]
+            start = starts[envelope["turn"] - 1]
+            generation = start.get("trace", digest("fixture-generation"))
+            cwd, prompt = digest("cwd"), digest(index)
+            run.spend.reserve(label, MODEL)
+            run.reservations.reserve(key, "resume" if thread in seen_threads else "spawn", prompt, cwd,
+                                     thread if thread in seen_threads else None)
+            if thread not in seen_threads:
+                attach = digest((index, "attach"))
+                run.reservations.claim("thread/start", generation, attach, cwd)
+                run.reservations.reply(key, "thread/start", generation, attach, thread)
+                facts.extend([{"kind": "request", "method": "thread/start", "reservation": key,
+                               "trace": generation, "request": attach},
+                              {"kind": "reply", "method": "thread/start", "reservation": key,
+                               "trace": generation, "request": attach, "thread": thread}])
+                seen_threads.add(thread)
+            request = digest((index, "start"))
+            run.reservations.claim("turn/start", generation, request, cwd, thread, prompt)
+            run.reservations.reply(key, "turn/start", generation, request, thread, start["turn"])
+            start.update(reservation=key, request=request, trace=generation)
+            facts.append({"kind": "request", "method": "turn/start", "reservation": key,
+                          "trace": generation, "request": request, "thread": thread})
+            for fact in facts:
+                if fact.get("thread") == thread and fact.get("turn") == start["turn"]:
+                    fact.setdefault("trace", generation)
+                    if fact["kind"] == "terminal":
+                        fact.setdefault("status", "completed")
+            address = f"{envelope['session_id']}/{envelope['turn']}"
+            run.receipts[label] = ({"turn": address}, envelope["session_id"])
+            run.reservations.receipt(key, {"session": digest(envelope["session_id"]), "address": digest(address)})
+            run.reservations.settle(key, envelope_identity(envelope))
+            run.spend.settle(label, envelope)
 
     def test_recorded_fixture_server_lines(self):
         # Replay every emitted line, pairing IDs from recorded client captures.
@@ -2560,6 +2829,7 @@ class SafetyTests(unittest.TestCase):
                     "last": sample, "total": sample, "trace": digest("new")}
         facts.insert(3, restored)
         run.envelopes = [original, current]
+        self.seed_accounting(run, run.envelopes, facts)
         with mock.patch.object(run, "facts", return_value=facts):
             self.assertNotIn(restored, turn_facts(run, original))
             self.assertNotIn(restored, turn_facts(run, current))
@@ -3036,6 +3306,7 @@ class SafetyTests(unittest.TestCase):
                 previous, self.root = self.root, Path(root)
                 try:
                     shared.INTERRUPTED.clear()
+
                     run = self.run_object()
                     run.checks = [{"check": "synthetic proof", "pass": True}]
                     run.daemons = [{"stopped": True}]
@@ -3061,6 +3332,72 @@ class SafetyTests(unittest.TestCase):
                     self.assertIn(mock.call(signal.SIGHUP, shared.record_signal), signals.call_args_list)
                     self.assertEqual(summary["owner_home_writes"]["policy"], "accepted, not minimised")
                     self.assertIsInstance(summary["record_only"], list)
+                finally:
+                    self.root = previous
+                    shared.INTERRUPTED.clear()
+
+    def test_signal_during_hashing_never_launches_submission(self):
+        for verb in ("spawn", "resume"):
+            with self.subTest(verb=verb):
+                shared.INTERRUPTED.clear()
+                run = self.run_object()
+                def hashed(_):
+                    shared.record_signal(signal.SIGTERM, None)
+                    return run.args.via_sha256
+                with mock.patch.object(shared, "sha256", side_effect=hashed), \
+                     mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "{}", "")) as called, \
+                     self.assertRaisesRegex(Blocked, "interrupted"):
+                    run.via_call(run.evidence, "submission", verb, "--json")
+                called.assert_not_called()
+
+    def test_signal_during_final_removal_or_scan_blocks_publication(self):
+        for boundary in ("removal", "scan", "publication", "rename"):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as root:
+                previous, self.root = self.root, Path(root)
+                try:
+                    shared.INTERRUPTED.clear()
+                    run = self.run_object()
+                    run.checks = [{"check": "synthetic proof", "pass": True}]
+                    run.daemons = [{"stopped": True}]
+                    evidence = self.root / "scratchpad" / "result"
+                    original_remove, original_scan, original_save = shutil.rmtree, package_secret_free, save
+                    original_replace = os.replace
+                    def remove(*args, **kwargs):
+                        result = original_remove(*args, **kwargs)
+                        if boundary == "removal":
+                            shared.record_signal(signal.SIGTERM, None)
+                        return result
+                    def scan(*args):
+                        result = original_scan(*args)
+                        if boundary == "scan":
+                            shared.record_signal(signal.SIGHUP, None)
+                        return result
+                    def saved(path, value):
+                        result = original_save(path, value)
+                        if boundary == "publication" and path.name == "summary.pending.json":
+                            shared.record_signal(signal.SIGINT, None)
+                        return result
+                    def replaced(source, target):
+                        result = original_replace(source, target)
+                        if boundary == "rename" and target.name == "summary.json":
+                            shared.record_signal(signal.SIGINT, None)
+                        return result
+                    with mock.patch(__name__ + ".__file__", str(self.root / "scripts/qualify/codex.py")), \
+                         mock.patch(__name__ + ".Run", return_value=run), \
+                         mock.patch(__name__ + ".execute"), \
+                         mock.patch(__name__ + ".cleanup", return_value=(True, [])), \
+                         mock.patch.object(shutil, "rmtree", side_effect=remove), \
+                         mock.patch(__name__ + ".package_secret_free", side_effect=scan), \
+                         mock.patch(__name__ + ".save", side_effect=saved), \
+                         mock.patch.object(os, "replace", side_effect=replaced), \
+                         mock.patch.object(signal, "signal"), mock.patch("builtins.print"):
+                        result = main(["--run", "--via", str(run.via), "--codex", str(run.codex),
+                                       "--via-sha256", run.args.via_sha256, "--codex-sha256", run.args.codex_sha256,
+                                       "--evidence", str(evidence)])
+                    self.assertEqual(result, 2)
+                    summary = json.loads((evidence / "summary.json").read_text())
+                    self.assertEqual(summary["result"], "blocked")
+                    self.assertTrue(summary["interrupted"])
                 finally:
                     self.root = previous
                     shared.INTERRUPTED.clear()
@@ -3094,7 +3431,10 @@ class SafetyTests(unittest.TestCase):
                         {"kind": "reply", "method": "turn/start", "thread": digest("b"), "turn": digest("ub"),
                          "trace": "same" if same else "different"},
                         {"kind": "request", "method": "turn/interrupt", "thread": digest("a")},
-                        {"kind": "terminal", "thread": digest("b"), "status": "completed"},
+                        {"kind": "terminal", "thread": digest("a"), "turn": digest("ua"),
+                         "status": "interrupted", "trace": "same"},
+                        {"kind": "terminal", "thread": digest("b"), "turn": digest("ub"), "status": "completed",
+                         "trace": "same" if same else "different"},
                     ]
                     run.handles = {"a": "fake"}
                     run.receipts = {"a1": ({"turn": "turn-a"}, "a")}
@@ -3128,7 +3468,7 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(counts["item/tool/call"], 0)
         self.assertEqual(len(counts), 6)
 
-    def conversation_fixture(self, wrong_bound=False, marker_link=False):
+    def conversation_fixture(self, wrong_bound=False, marker_link=False, observed_execution=True):
         run = self.run_object()
         first, second, third = (fake_envelope() for _ in range(3))
         first.update(structured_output={"written": True})
@@ -3158,6 +3498,8 @@ class SafetyTests(unittest.TestCase):
              mock.patch.object(run, "finish", side_effect=[first, second, third]), \
              mock.patch.object(run, "facts", side_effect=facts), \
              mock.patch.object(run, "stop_daemon"), mock.patch.object(run, "start"), \
+             mock.patch.object(run, "observe_denied_execution", return_value={"errno": "EROFS", "file_absent": True},
+                               side_effect=None if observed_execution else Blocked("prohibited execution not observed")), \
              mock.patch(__name__ + ".turn_facts", return_value=[]), \
              mock.patch.object(secrets, "token_hex", return_value="fixed"):
             conversation(run)
@@ -3167,6 +3509,24 @@ class SafetyTests(unittest.TestCase):
         run = self.conversation_fixture()
         self.assertTrue(all(check["pass"] for check in run.checks))
         self.assertTrue(any(row["observation"] == "denied write" for row in run.record_only))
+
+    def test_changed_bound_without_execution_never_passes(self):
+        with self.assertRaisesRegex(Blocked, "prohibited execution"):
+            self.conversation_fixture(observed_execution=False)
+
+    def test_interpreter_whitespace_stops_before_preflight_processes(self):
+        run = self.run_object()
+        version = subprocess.CompletedProcess([], 0, "codex-cli 0.160.1\n", "")
+        with mock.patch.object(sys, "executable", "/synthetic/Project Name/python"), \
+             mock.patch(__name__ + ".pins"), mock.patch(__name__ + ".credential_metadata", return_value={}), \
+             mock.patch(__name__ + ".owner_metadata", return_value={}), \
+             mock.patch(__name__ + ".mcp_names", return_value=[]), \
+             mock.patch(__name__ + ".feature_preflight", return_value={}), \
+             mock.patch.object(shared, "sha256", return_value="0" * 64), \
+             mock.patch.object(subprocess, "run", return_value=version) as called, \
+             self.assertRaisesRegex(Blocked, "interpreter.*whitespace"):
+            run.preflight()
+        called.assert_not_called()
 
     def test_wrong_bound_between_turns_blocks_even_with_absent_file(self):
         with self.assertRaisesRegex(Blocked, "bound change sent between turns"):
@@ -3485,6 +3845,176 @@ class SafetyTests(unittest.TestCase):
         with self.assertRaisesRegex(Blocked, "unverifiable"):
             command_digest(None)
 
+    def probe_fixture(self):
+        python = self.root / "python"
+        python.write_bytes(b"synthetic pinned interpreter")
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        server, tool = self.process(1, 0, 10), self.process(2, 1, 20)
+        (self.root / "2/exe").symlink_to(python)
+        (self.root / "2/cwd").symlink_to(workspace)
+        probe = bound_probe.DeniedExecution(python, shared.sha256(python), workspace / "denied.txt")
+        return probe, Proc(self.root), server, tool
+
+    def probe_argv(self, argv):
+        (self.root / "2/cmdline").write_bytes("\0".join(argv).encode() + b"\0")
+
+    def test_denied_execution_requires_same_owned_process_transition(self):
+        probe, proc, server, tool = self.probe_fixture()
+        self.probe_argv(probe.denied)
+        self.assertIsNone(probe.observe(proc, tool, server))  # Direct sentinel is not proof.
+        self.probe_argv(probe.attempt)
+        self.assertIsNone(probe.observe(proc, tool, server))
+        self.probe_argv(probe.denied)
+        fact = probe.observe(proc, tool, server)
+        self.assertEqual(fact["errno"], "EROFS")
+        self.assertTrue(fact["file_absent"] and secret_free(fact))
+        self.assertEqual(fact["attempt_argv_hash"], digest(probe.attempt))
+        self.assertEqual(fact["denied_argv_hash"], digest(probe.denied))
+        probe.target.write_text("synthetic forbidden write")
+        with self.assertRaisesRegex(Blocked, "created a file"):
+            probe.observe(proc, tool, server)
+
+    def test_denied_execution_rejects_reuse_cwd_binary_and_foreign_content(self):
+        probe, proc, server, tool = self.probe_fixture()
+        self.probe_argv(probe.attempt)
+        probe.observe(proc, tool, server)
+        (self.root / "2/cwd").unlink()
+        (self.root / "2/cwd").symlink_to(self.root)
+        with self.assertRaisesRegex(Blocked, "identity/cwd mismatch"):
+            probe.observe(proc, tool, server)
+        (self.root / "2/cwd").unlink()
+        (self.root / "2/cwd").symlink_to(probe.target.parent)
+        (self.root / "python").write_bytes(b"replaced interpreter")
+        with self.assertRaisesRegex(Blocked, "identity/cwd mismatch"):
+            probe.observe(proc, tool, server)
+        self.process(2, 1, 30)
+        with self.assertRaisesRegex(Blocked, "unverifiable identity"):
+            probe.observe(proc, tool, server)
+        foreign = self.process(3, 0, 40)
+        with mock.patch.object(proc, "content") as read, self.assertRaisesRegex(Blocked, "foreign process"):
+            probe.observe(proc, foreign, server)
+        read.assert_not_called()
+
+    def test_fixed_attempt_enters_sentinel_only_on_erofs(self):
+        import errno
+        for error in (None, errno.EROFS, errno.EACCES):
+            with self.subTest(error=error):
+                native_os = mock.Mock(O_WRONLY=1, O_CREAT=2, O_EXCL=4)
+                native_os.open.return_value = 42
+                if error is not None:
+                    native_os.open.side_effect = OSError(error, "synthetic refusal")
+                native_sys = mock.Mock(argv=["-c", "denied.txt"], executable="synthetic-python")
+                native_time = mock.Mock()
+                with mock.patch.dict(sys.modules, {"os": native_os, "sys": native_sys, "time": native_time}):
+                    if error == errno.EROFS:
+                        exec(bound_probe.ATTEMPT_CODE, {})
+                        native_os.execv.assert_called_once_with("synthetic-python", ["synthetic-python", "-c",
+                            bound_probe.DENIED_CODE, bound_probe.DENIED_TAG])
+                        native_os.write.assert_not_called()
+                    elif error is None:
+                        with self.assertRaises(SystemExit) as stopped:
+                            exec(bound_probe.ATTEMPT_CODE, {})
+                        self.assertEqual(stopped.exception.code, 23)
+                        native_os.execv.assert_not_called()
+                    else:
+                        with self.assertRaises(OSError):
+                            exec(bound_probe.ATTEMPT_CODE, {})
+                        native_os.execv.assert_not_called()
+                native_os.open.assert_called_once_with("denied.txt", 7, 0o600)
+                native_time.sleep.assert_called_once_with(3)
+
+    def test_unobserved_attempt_at_native_completion_blocks(self):
+        run = self.run_object()
+        generation, thread, turn = digest("generation"), digest("thread"), digest("turn")
+        facts = [{"kind": "reply", "method": "turn/start", "reservation": digest("c2"),
+                  "trace": generation, "thread": thread, "turn": turn},
+                 {"kind": "request", "method": "turn/start", "reservation": digest("c2"), "bound": "readOnly"},
+                 {"kind": "process", "trace": generation, "pid": 1, "start_ticks": 10},
+                 {"kind": "terminal", "trace": generation, "thread": thread, "turn": turn}]
+        with mock.patch.object(run, "facts", return_value=facts), mock.patch.object(os, "listdir", return_value=[]), \
+             mock.patch.object(time, "sleep") as sleep, self.assertRaisesRegex(Blocked, "not observed"):
+            run.observe_denied_execution("c2", self.root / "denied.txt")
+        sleep.assert_not_called()
+
+    def test_bound_observer_pairs_server_and_tracks_attempt_even_on_failure(self):
+        probe, proc, server, tool = self.probe_fixture()
+        foreign = self.process(3, 0, 40)
+        run = self.run_object()
+        generation, thread, turn = digest("generation"), digest("thread"), digest("turn")
+        facts = [{"kind": "reply", "method": "turn/start", "reservation": digest("c2"),
+                  "trace": generation, "thread": thread, "turn": turn},
+                 {"kind": "request", "method": "turn/start", "reservation": digest("c2"), "bound": "readOnly"},
+                 {"kind": "process", "trace": generation, **server}]
+        self.probe_argv(probe.attempt)
+        def transitioned(_):
+            self.probe_argv(probe.denied)
+        with mock.patch.object(sys, "executable", probe.python), mock.patch(__name__ + ".Proc", return_value=proc), \
+             mock.patch.object(run, "facts", return_value=facts), mock.patch.object(os, "listdir", return_value=["2", "3"]), \
+             mock.patch.object(time, "sleep", side_effect=transitioned), \
+             mock.patch.object(proc, "content", wraps=proc.content) as content:
+            observed = run.observe_denied_execution("c2", probe.target)
+        self.assertEqual(observed["trace"], generation)
+        self.assertEqual(observed["turn"], turn)
+        self.assertEqual(observed["reservation"], digest("c2"))
+        self.assertTrue(secret_free(json.loads((run.evidence / "changed-bound-execution.json").read_text())))
+        self.assertFalse(any(call.args[0] == foreign for call in content.call_args_list))
+        run.owned.clear()
+        self.probe_argv(probe.attempt)
+        facts.append({"kind": "terminal", "trace": generation, "thread": thread, "turn": turn})
+        with mock.patch.object(sys, "executable", probe.python), mock.patch(__name__ + ".Proc", return_value=proc), \
+             mock.patch.object(run, "facts", return_value=facts), mock.patch.object(os, "listdir", return_value=["2"]), \
+             self.assertRaisesRegex(Blocked, "not observed"):
+            run.observe_denied_execution("c2", probe.target)
+        self.assertIn((tool["pid"], tool["start_ticks"]), run.owned)
+
+    def test_native_start_without_id_never_bypasses_reservation(self):
+        run = self.run_object()
+        wire = Wire("0.160.1", reservations=run.reservations)
+        wire.inventory = True
+        with self.assertRaisesRegex(Blocked, "native start requires request id"):
+            wire.outgoing({"method": "thread/start", "params": {"model": MODEL,
+                "approvalPolicy": "never", "approvalsReviewer": "user", "sandbox": "read-only",
+                "cwd": "/synthetic/work"}})
+
+    def test_bound_observation_deadline_is_checked_inside_process_survey(self):
+        run = self.run_object()
+        generation, thread, turn = digest("generation"), digest("thread"), digest("turn")
+        facts = [{"kind": "reply", "method": "turn/start", "reservation": digest("c2"),
+                  "trace": generation, "thread": thread, "turn": turn},
+                 {"kind": "request", "method": "turn/start", "reservation": digest("c2"), "bound": "readOnly"},
+                 {"kind": "process", "trace": generation, "pid": 1, "start_ticks": 10},
+                 {"kind": "terminal", "trace": generation, "thread": thread, "turn": turn}]
+        now = [0]
+        def expired(*_):
+            now[0] = POLL_S + 1
+            return None, None
+        proc = mock.Mock(open=mock.Mock(side_effect=expired))
+        with mock.patch(__name__ + ".Proc", return_value=proc), mock.patch.object(run, "facts", return_value=facts), \
+             mock.patch.object(os, "listdir", return_value=["2", "3"]), \
+             mock.patch.object(time, "monotonic", side_effect=lambda: now[0]), \
+             self.assertRaisesRegex(Blocked, "observation deadline"):
+            run.observe_denied_execution("c2", self.root / "denied.txt")
+        self.assertEqual(proc.open.call_count, 1)
+
+    def test_swapped_receipts_cannot_swap_native_turns(self):
+        run = self.run_object()
+        one, two = fake_envelope(), fake_envelope()
+        two["turn"] = 2
+        thread = digest(one["vendor_session_id"])
+        facts = [{"kind": "reply", "method": "turn/start", "thread": thread, "turn": digest(index)}
+                 for index in (1, 2)]
+        run.envelopes = [one, two]
+        self.seed_accounting(run, run.envelopes, facts)
+        keys = [digest(f"fixture-{index}") for index in (0, 1)]
+        with run.reservations.transaction() as state:
+            rows = state["rows"]
+            for field in ("receipt", "envelope"):
+                rows[keys[0]][field], rows[keys[1]][field] = rows[keys[1]][field], rows[keys[0]][field]
+        run.receipts["fixture-0"], run.receipts["fixture-1"] = run.receipts["fixture-1"], run.receipts["fixture-0"]
+        with self.assertRaisesRegex(Blocked, "receipt native turn exact"):
+            reservation_accounting(run, facts)
+
     def test_complete_trace_required(self):
         run = self.run_object()
         path = run.trace_dir / "fake.jsonl"
@@ -3512,17 +4042,40 @@ class SafetyTests(unittest.TestCase):
                     "reasoning_output_tokens", "total_tokens"):
             envelope["usage"][key] *= 2
         run.envelopes = [envelope]
+        self.seed_accounting(run, run.envelopes, facts)
         with mock.patch.object(run, "facts", return_value=facts):
             usage(run)
             envelope["usage"]["input_tokens"] += 1
             with self.assertRaisesRegex(Blocked, "keyless last sum"):
                 usage(run)
 
+    def test_usage_rejects_unmatched_native_start_and_contradictory_terminal(self):
+        for defect in ("extra_start", "terminal"):
+            with self.subTest(defect=defect):
+                run = self.run_object()
+                envelope = fake_envelope("cancelled")
+                envelope.update(stop_reason="interrupted", cancel={"outcome": "acknowledged", "cleanup": "quiescent"})
+                thread, turn = digest(envelope["vendor_session_id"]), digest("u")
+                sample = {"inputTokens": 3, "cachedInputTokens": 1, "outputTokens": 2,
+                          "reasoningOutputTokens": 1, "totalTokens": 5}
+                envelope["vendor"]["total"] = sample
+                run.envelopes = [envelope]
+                facts = [{"kind": "reply", "method": "turn/start", "thread": thread, "turn": turn},
+                         {"kind": "terminal", "thread": thread, "turn": turn,
+                          "status": "completed" if defect == "terminal" else "interrupted"},
+                         {"kind": "usage", "thread": thread, "turn": turn, "last": sample, "total": sample}]
+                self.seed_accounting(run, run.envelopes, facts)
+                if defect == "extra_start":
+                    facts.append({"kind": "reply", "method": "turn/start", "thread": digest("extra"), "turn": digest("unsubmitted")})
+                with mock.patch.object(run, "facts", return_value=facts), mock.patch(__name__ + ".save"), \
+                     self.assertRaises(Blocked):
+                    usage(run)
+
     async def proxy_fixture(self, nonempty=False, identity_error=False, pidfd_error=False,
                             termination=False, foreign=False, reused=False, after_signal=False,
                             executable_mismatch=False, duplicate_config=False, config=None,
                             race=None, observed=None, startup=False, forward_pause=False,
-                            unsafe_item=False, restored=None, replay_growth=False):
+                            unsafe_item=False, restored=None, replay_growth=False, reserved=True):
         """Entire stdio exchange using fake transports; no process or real /proc."""
         binary = self.root / "fake-codex"
         binary.write_text("synthetic executable")
@@ -3532,6 +4085,11 @@ class SafetyTests(unittest.TestCase):
         (self.root / "2/exe").symlink_to(binary)
         traces = self.root / "trace"
         traces.mkdir()
+        reservations = reservation_control.Reservations(self.root / "reservations.json", time.monotonic() + RUN_S)
+        if reserved and race:
+            reservations.reserve(digest("fixture"), "resume" if restored is not None else "spawn",
+                                 digest("synthetic prompt"), digest("/synthetic/work"),
+                                 digest("t") if restored is not None else None)
         if restored is not None:
             earlier = self.owned_wire()
             sample = {key: 1 for key in SCHEMAS["sample"]}
@@ -3540,7 +4098,7 @@ class SafetyTests(unittest.TestCase):
             self.write_history(traces, shared.sha256(binary), earlier)
         control = {"codex": str(binary), "codex_hash": shared.sha256(binary),
                    "model": MODEL, "version": "0.160.1", "codex_home": str(self.root),
-                   "mcp_names": [], "trace_dir": str(traces)}
+                   "mcp_names": [], "trace_dir": str(traces), "reservations": str(reservations.path)}
         upstream, native = asyncio.StreamReader(), asyncio.StreamReader()
         if executable_mismatch:
             other = self.root / "changed-native"
@@ -3623,7 +4181,8 @@ class SafetyTests(unittest.TestCase):
                     upstream.feed_data(json.dumps({"id": 10,
                         "method": "thread/resume" if restored is not None else "thread/start", "params": {
                         "model": MODEL, "approvalPolicy": "never", "approvalsReviewer": "user",
-                        "sandbox": "read-only", "threadId": "t", "excludeTurns": True}}).encode() + b"\n")
+                        "sandbox": "read-only", "threadId": "t", "excludeTurns": True,
+                        "cwd": "/synthetic/work"}}).encode() + b"\n")
                 else:
                     upstream.feed_eof()
             elif response["id"] == 10:
@@ -3674,6 +4233,13 @@ class SafetyTests(unittest.TestCase):
         facts = [decode_line(line) for line in next(traces.iterdir()).read_bytes().splitlines(keepends=True)]
         self.assertTrue(facts[-1]["complete"] and facts[-1]["child_reaped"])
         self.assertTrue(secret_free(facts))
+
+    def test_proxy_without_reservation_never_forwards_start(self):
+        result, child, signals, sent, traces = asyncio.run(self.proxy_fixture(race="match", reserved=False))
+        self.assertEqual(result, 1)
+        self.assertNotIn("thread/start", sent)
+        self.assertNotIn("turn/start", sent)
+        self.assertIsNotNone(child.returncode)
 
     def test_proxy_forwards_early_notification_and_checks_reply(self):
         for race in ("match", "mismatch", "missing"):
@@ -3893,6 +4459,8 @@ class SafetyTests(unittest.TestCase):
 def self_test():
     """No real vendor, credentials, owner services or daemon; synthetic fixtures only."""
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(SafetyTests)
+    import codex_reservations_test
+    suite.addTests(unittest.defaultTestLoader.loadTestsFromModule(codex_reservations_test))
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     return 0 if result.wasSuccessful() else 1
 
