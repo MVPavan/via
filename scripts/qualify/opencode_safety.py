@@ -66,6 +66,10 @@ class Blocked(Exception):
     """Required proof unavailable or a qualification safety control failed (§13)."""
 
 
+class ListenerNotReady(Blocked):
+    """§13/§2: a verified child has no listener yet; ownership errors still block."""
+
+
 _BLOCK_CONTEXT = contextvars.ContextVar('opencode_block_context', default={})
 BLOCK_REASON_CHARS = 2048  # Packet §13: bounded runner-authored blocking diagnostics.
 
@@ -255,6 +259,9 @@ class ProcReader:
                 if address != "0100007F":
                     raise Blocked("owned listener is not IPv4 loopback")
                 candidates.add(int(port, 16))
+        if not candidates:
+            self.verify(identity)
+            raise ListenerNotReady("owned listener absent or ambiguous")
         if len(candidates) != 1 or 0 in candidates:
             raise Blocked("owned listener absent or ambiguous")
         self.verify(identity)

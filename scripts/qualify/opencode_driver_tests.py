@@ -15,6 +15,72 @@ from opencode_driver import Driver, strict_reply, read_pages, bounded_command, i
 
 
 class DriverTests(unittest.TestCase):
+    def vendor_observer(self, root):
+        import opencode_safety as safety
+        d=Driver('release','fp','pin',Path(root)/'evidence',initialize=False)
+        record={'anchor':Identity(70,122),'vendor_pid':71,'generation':'owned-generation',
+                'phase':'arm_intent','server_id':'owned-server'}
+        d._host_record=mock.Mock(return_value=record)
+        d.proc=mock.Mock()
+        d.proc.stat.return_value={'pid':71,'start_ticks':123,'ppid':70}
+        d.vault.read_once=mock.Mock(return_value=b'synthetic-password')
+        d._record=mock.Mock(); d.start_event_capture=mock.Mock()
+        d._bootstrap_active=True; d._bootstrap_deadline=time.monotonic()+1
+        pending=getattr(safety,'ListenerNotReady',Blocked)
+        return d,record,pending
+
+    def test_owned_vendor_waits_for_listener_without_rereading_password(self):
+        with tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
+            d,_record,pending=self.vendor_observer(root)
+            d.proc.listener.side_effect=[pending('owned listener absent or ambiguous'),
+                                         'http://127.0.0.1:1234']
+            with mock.patch('opencode_driver.safety.OwnedHTTP') as http, \
+                 mock.patch('opencode_driver.time.sleep'):
+                http.return_value.request.return_value=(200,b'{"pid":71,"version":"2.0.22"}')
+                d._observe_vendor()
+            self.assertEqual(d.proc.listener.call_count,2)
+            d.vault.read_once.assert_called_once()
+            self.assertEqual(d.vendor_identity,Identity(71,123))
+            self.assertEqual(http.call_args.kwargs['deadline'],d._bootstrap_deadline)
+            self.assertTrue(any(call.args[0]=='vendor-listener' and call.args[1]['ready']
+                                for call in d._record.call_args_list))
+
+    def test_owned_listener_never_resets_bootstrap_deadline(self):
+        with tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
+            d,_record,_pending=self.vendor_observer(root)
+            d._bootstrap_deadline=time.monotonic()-1
+            d.proc.listener.return_value='http://127.0.0.1:1234'
+            with mock.patch('opencode_driver.safety.OwnedHTTP') as http:
+                http.return_value.request.return_value=(200,b'{"pid":71,"version":"2.0.22"}')
+                with self.assertRaisesRegex(Blocked,'owned listener startup deadline'):
+                    d._observe_vendor()
+                http.assert_not_called()
+            d.proc.listener.assert_not_called()
+
+    def test_ambiguous_listener_is_a_hard_stop_without_retry(self):
+        with tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
+            d,_record,_pending=self.vendor_observer(root)
+            d.proc.listener.side_effect=Blocked('owned listener absent or ambiguous')
+            with mock.patch('opencode_driver.safety.OwnedHTTP') as http:
+                with self.assertRaisesRegex(Blocked,'owned listener absent or ambiguous'):
+                    d._observe_vendor()
+                http.assert_not_called()
+            d.proc.listener.assert_called_once()
+
+    def test_listener_wait_refuses_a_changed_host_generation(self):
+        with tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
+            d,record,pending=self.vendor_observer(root)
+            changed={**record,'generation':'other-generation'}
+            d._host_record.side_effect=[record,record,changed]
+            d.proc.listener.side_effect=[pending('owned listener absent or ambiguous'),
+                                         'http://127.0.0.1:1234']
+            with mock.patch('opencode_driver.safety.OwnedHTTP') as http, \
+                 mock.patch('opencode_driver.time.sleep'):
+                with self.assertRaisesRegex(Blocked,'owned listener generation changed while starting'):
+                    d._observe_vendor()
+                http.assert_not_called()
+            d.proc.listener.assert_called_once()
+
     def test_stopped_guard_refuses_bootstrap_before_any_submit_or_fixture(self):
         with tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
             d=Driver('release','fp','pin',Path(root)/'evidence',initialize=False)

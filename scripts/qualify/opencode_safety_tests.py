@@ -47,6 +47,22 @@ class SafetyTests(unittest.TestCase):
             self.assertBlocked(lambda:client.request('GET','/api/info'),'owned API absolute deadline exhausted')
             transport.assert_not_called()
 
+    def test_no_listener_is_retryable_but_multiple_owned_listeners_block(self):
+        fd=self.root/'proc/71/fd'; fd.mkdir()
+        net=self.root/'proc/71/net'; net.mkdir()
+        tcp=net/'tcp'; tcp.write_text('header\n')
+        with self.assertRaises(safety.Blocked) as absent:
+            self.proc.listener(self.identity)
+        self.assertIsInstance(absent.exception,getattr(safety,'ListenerNotReady',()))
+        for inode,port in ((999,'3039'),(998,'303A')):
+            (fd/str(inode)).symlink_to('socket:['+str(inode)+']')
+            with tcp.open('a') as stream:
+                stream.write('0: 0100007F:'+port+' 00000000:0000 0A 0:0 00:0 0 1000 0 '+str(inode)+'\n')
+        with self.assertRaises(safety.Blocked) as ambiguous:
+            self.proc.listener(self.identity)
+        self.assertNotIsInstance(ambiguous.exception,getattr(safety,'ListenerNotReady',()))
+        self.assertEqual(str(ambiguous.exception),'owned listener absent or ambiguous')
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="via-oc-safety-")
         self.root = Path(self.temp.name)

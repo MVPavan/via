@@ -640,6 +640,35 @@ class Driver:
                 return
         self._bootstrap_vendor()
 
+    def _listener_origin(self, record, identity):
+        """§13/§2: await startup under the existing bound; never retry uncertain ownership."""
+        started=time.monotonic(); deadline=started+BOOTSTRAP_SECONDS
+        if self.phase_deadline is not None: deadline=min(deadline,self.phase_deadline)
+        if self._bootstrap_active and self._bootstrap_deadline is not None:
+            deadline=min(deadline,self._bootstrap_deadline)
+        binding=tuple(record[key] for key in ('generation','anchor','vendor_pid','server_id'))
+        checks=0; ready=False
+        try:
+            while True:
+                if self.signals: self.signals.guard()
+                if time.monotonic()>=deadline: raise Blocked('owned listener startup deadline')
+                current=self._host_record()
+                if tuple(current[key] for key in ('generation','anchor','vendor_pid','server_id'))!=binding:
+                    raise Blocked('owned listener generation changed while starting')
+                self.proc.verify(record['anchor']); self.proc.verify(identity)
+                checks+=1
+                try:
+                    origin=self.proc.listener(identity)
+                except safety.ListenerNotReady:
+                    time.sleep(min(.02,max(0,deadline-time.monotonic())))
+                    continue
+                if time.monotonic()>=deadline: raise Blocked('owned listener startup deadline')
+                ready=True
+                return origin
+        finally:
+            self._record('vendor-listener',{'owned_pid':identity.pid,'checks':checks,'ready':ready,
+                'elapsed_ms':int((time.monotonic()-started)*1000)})
+
     def _observe_vendor(self):
         """Authenticate pid/start ticks, owned listener and §2 handshake before use."""
         record=self._host_record(); self.proc.verify(record['anchor'])
@@ -649,7 +678,7 @@ class Driver:
         identity=safety.Identity(row['pid'],row['start_ticks']); self.proc.verify(identity)
         previous=self.vendor_identity
         password=self.vault.read_once(self.proc,identity)
-        origin=self.proc.listener(identity)
+        origin=self._listener_origin(record,identity)
         self._http=safety.OwnedHTTP(origin,identity,self.proc,password,
                                     deadline=self._bootstrap_deadline if self._bootstrap_active else None)
         status,raw=self._http.request('GET','/api/info')
