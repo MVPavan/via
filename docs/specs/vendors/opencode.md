@@ -1261,16 +1261,22 @@ and exception kinds rather than arbitrary exception text.
 Non-regular VIA roots or entries, missing required state/Store, vanished VIA
 entries persisting through three whole-scan attempts, and unverifiable backups
 block qualification. A transient VIA disappearance restarts the entire scan.
+Protected matches already observed survive retries; a later scan cannot erase
+evidence that a secret was written.
 Traversal and Store backup order are deterministic. The named operational
-exceptions are the `helpers/rg` symlink and, if under evidence, the runtime
-`via.sock` and `anchors/*.sock` sockets; the daemon lock remains a regular file.
+exceptions are the `helpers/rg` symlink and `via.sock` and `anchors/*.sock`
+sockets in the registered runtime root (evidence or the N9 short `/tmp` root);
+the daemon lock remains a regular file.
 The pinned acquisition, `acquisition-home` and `helpers` artifacts are outside
 the VIA sink set. Unexpected credential content in a VIA-owned area blocks
 without being read. Observed synthetic matches in readable vendor-private
 files are a labelled file count, never a gate failure; fixture config values
 remain labelled input. Vendor credential/config files and databases remain
-metadata-only exclusions, reported as a proof limitation. Vendor-private
-non-regular entries are skipped and counted as metadata-only; entries vanishing
+metadata-only exclusions, reported as a proof limitation. `server.lock` in the
+vendor-private namespace is also never read by the secrecy scan: it is VIA's
+fixed binary fence record (§3.2), containing identities rather than arbitrary
+content. Vendor-private non-regular entries are skipped and counted as
+metadata-only; entries vanishing
 during the walk, lstat or read are skipped and counted separately as
 `vendor_private_vanished_entries`. The scan never follows non-regular entries.
 Returned bearer handles join the in-memory forbidden forms. Structural

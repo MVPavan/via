@@ -153,6 +153,27 @@ class OwnershipTests(unittest.TestCase):
                     else:
                         self.assertTrue(d.secrecy_scan()['secret_absent']); self.assertEqual(len(calls),2)
 
+    def test_leak_seen_before_vanishing_survives_whole_scan_retry(self):
+        for value in (b'private-password',b'h_private_bearer',b'fixture-provider-secret'):
+            with self.subTest(value=value), tempfile.TemporaryDirectory(prefix='via-ownership-') as root:
+                d=self.driver(root); d.state.mkdir()
+                leaking=d.state/'a.log'; leaking.write_bytes(value)
+                rotating=d.state/'b.log'; rotating.write_bytes(b'clean')
+                proc=mock.Mock(); proc.read.return_value=safety.PASSWORD_KEY+b'=private-password\0'
+                d.vault.read_once(proc,safety.Identity(11,20))
+                d.handles={'s_fixture':'h_private_bearer'}; d.secret_forms=[b'fixture-provider-secret']
+                original=Path.open; calls=[]
+                def vanished(path,*args,**kwargs):
+                    if path==rotating:
+                        calls.append(path)
+                        if len(calls)==1:
+                            leaking.unlink()
+                            raise FileNotFoundError(str(path))
+                    return original(path,*args,**kwargs)
+                with mock.patch.object(Path,'open',vanished): result=d.secrecy_scan()
+                self.assertEqual(result['scan_attempts'],2)
+                self.assertFalse(result['secret_absent'])
+
     def test_new_unstarted_state_does_not_require_a_store(self):
         with tempfile.TemporaryDirectory(prefix='via-ownership-') as root:
             d=self.driver(root); d.state.mkdir(); store(d.state)

@@ -1025,15 +1025,20 @@ class Driver:
 
     def secrecy_scan(self):
         """Restart the whole registered-root scan on VIA churn, at most 3 times (§13)."""
+        leak_seen=False
+        def record_leak():
+            nonlocal leak_seen
+            leak_seen=True
         for attempt in range(1,SCAN_ATTEMPTS+1):
             try:
-                result=self._secrecy_scan_once()
+                result=self._secrecy_scan_once(record_leak)
+                result['secret_absent']=result['secret_absent'] and not leak_seen
                 result['scan_attempts']=attempt
                 return result
             except _ScanVanished as error:
                 if attempt==SCAN_ATTEMPTS: raise Blocked('VIA scan entry vanished after 3 scans') from error
 
-    def _secrecy_scan_once(self):
+    def _secrecy_scan_once(self,record_leak):
         """Scan immutable ownership history; Store backups cover every state (§13 L4/L11)."""
         clean=True; captures=[]; seen=set(); metadata=set(); synthetic=[]; total=0
         vendor_synthetic=0; vanished=set()
@@ -1060,8 +1065,10 @@ class Driver:
                 metadata.add(path); return
             raise Blocked('non-regular VIA scan entry')
         def protected(raw,via_sink):
-            return self.vault.leaks(raw) or any(handle in raw for handle in handles) \
+            matched=self.vault.leaks(raw) or any(handle in raw for handle in handles) \
                 or via_sink and any(form in raw for form in synthetic_forms)
+            if matched: record_leak()
+            return matched
         for root in self.ownership.ordered():
             if not root.directory or root.kind=='vendor-private': continue
             try: info=root.path.lstat()

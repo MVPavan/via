@@ -43,7 +43,7 @@ class OwnershipRegistry:
         return path
 
     def register_state(self, path):
-        """Own a state and privatize its entire vendor tree, including probes (§13)."""
+        """Own state; vendor/ includes probes and unread fixed server.lock records (§13)."""
         path = self.register(path, 'via-owned', state=True)
         self.register(path / 'vendor', 'vendor-private')
         return path
