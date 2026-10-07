@@ -47,12 +47,29 @@ scratchpad plus Host's anchor socket suffix exceeds Unix's limit. CODEX_HOME
 is restored only inside VIA's own proxy child to the owner's existing Codex home;
 that home comes from UID metadata, independent of the runner's private HOME.
 credentials stay there. auth.json is lstat'ed for existence/owner/mode only:
-never opened, copied, linked or logged. Noncredential config.toml is parsed only
-for MCP table keys (all profiles); only name digests reach evidence. Each name
-is disabled on our server's argv, together with built-in apps. Managed config
-and project-layer config outside that inventory block BEFORE starting Codex.
-The owned server's paginated MCP inventory is an additional empty-inventory
-gate before forwarding model/list. No desktop endpoint or `codex mcp list`.
+never opened, copied, linked or logged. Noncredential config.toml is parsed for
+MCP keys (all profiles) and side-effect settings; only name digests reach
+evidence. Each name
+is disabled on our server's argv, together with apps and plugins; notify=[] is
+set only on that argv. Custom provider/profile/telemetry settings block preflight.
+Managed config and project-layer config outside that inventory block BEFORE starting Codex.
+The proxy requires config/read to expose effective features (all disabled),
+notify (empty), the default provider and every configured MCP server (disabled)
+before forwarding model/list. Unsupported/missing fields block with a reason;
+no mcpServerStatus/list, tool inventory, desktop endpoint or `codex mcp list`.
+The installed 0.160.1 --help confirms dotted overrides and --disable, but does
+not prove feature names, notify semantics or config/read shape/passivity. The
+native binary contains config/read and ConfigReadParams/Response identifiers;
+that is presence evidence only. The future live preflight must verify effective
+values before accepting turns. It does not infer safety from the July snapshot.
+
+Owner home writes are accepted, not minimised: stored rollouts are needed for
+resume. Auth refresh, shell snapshots, caches, logs and system skills may also
+change; shared auth refresh may race the desktop server. No credential content
+is read. Before/after top-level counts/name digests and session-file counts/name
+digests are recorded, including the count of new session files. These metadata
+observations do not prove absence of other writes. The runner removes only its
+private VIA directories; owner rollouts remain for the owner to manage.
 
 Evidence: a transparent stdio proxy observes the actual adapter, checks policy
 before forwarding and records only typed numbers, fixed enums, hashes and
@@ -64,22 +81,24 @@ Events paginate with strict progress and deadlines. All loops have bounds.
 Signals only set a flag: no later submission, accepted turns are cancelled and
 settled where possible, cleanup always runs to its deadline, and summary is
 blocked. A Boolean secret scan runs before any evidence write and on the final
-package; it never prints matching bytes. Binaries (VIA, Codex launcher, actual
+package; it never prints matching bytes. Binaries (VIA, pinned native Codex, actual
 child executable, Python, runner, shared lifecycle) are recorded by hash.
 
 Live-item plan (via-1ok, packet §8; via-5lr.3.3 supplied scope):
   preflight       GATE pins/version/model/auth metadata/MCP inventory/ownership.
   conversation    GATE spawn/result; output-schema set, replacement and clear;
-                  tighten workspace_write to read_only with a positive failed
-                  command AND absent file; retire daemon/server, stored resume
+                  GATE the bound change sent between turns. Denied-write tool
+                  evidence and absent-file observations are RECORD ONLY: fast
+                  code-mode refusals may omit commandExecution items. A present
+                  prohibited file still blocks. Retire daemon/server, stored resume
                   with exact thread identity and excludeTurns:true.
   interrupt       GATE accepted A/B on one server; actual tool observed via
                   owned /proc; cancel A through VIA, interrupted terminal and
                   acknowledged cleanup; B remains running after A interrupt,
                   then returns only its answer; A resumes successfully.
   never_ask       GATE never/user reviewer in real outbound and echoed thread
-                  settings; read_only prohibited write actually fails, no grant.
-                  RECORD ONLY counts of inducible no-grant request paths.
+                  settings; no reply grants permission. RECORD ONLY denied-write
+                  observations and counts of inducible no-grant request paths.
                   DEFER six independent inducible paths when vendor never asks:
                   pinned schemas/fakes cover them; absence alone proves nothing.
   usage           GATE keyless last samples, matched thread/turn, summed to C1
@@ -127,6 +146,13 @@ TURN_LIMIT, ACTIVE_LIMIT, WALL_S, RUN_S = 7, 2, 120, 1200
 LINE_BYTES, TRACE_BYTES, PROC_BYTES = 8 * 1024 * 1024, 16 * 1024 * 1024, 256 * 1024
 PAGE_LIMIT, POLL_S, PROC_COUNT = 1000, 90, 32768
 REQUEST_LIMIT = 4096
+# Packet §§4/8: finite configuration inventory and notification-method evidence.
+MCP_LIMIT, NOTIFICATION_METHOD_LIMIT = 128, 128
+# Runtime §6.1: fixed file proof, read no more than one byte beyond this marker.
+WORKSPACE_MARKER = b"allowed"
+NO_GRANT_METHODS = ("item/commandExecution/requestApproval", "item/fileChange/requestApproval",
+                    "item/permissions/requestApproval", "item/tool/requestUserInput",
+                    "mcpServer/elicitation/request", "item/tool/call")
 SECRET = re.compile(r"(?i)(?:bearer\s+\S+|sk-[A-Za-z0-9_-]{8,}|"
                     r"(?:access_token|refresh_token|api_key|authorization|auth\.json)"
                     r"\s*[\":=]|/home/|/Users/)")
@@ -156,7 +182,7 @@ def command_digest(command):
     try:
         argv = shlex.split(command)
     except ValueError:
-        raise Blocked("command execution unparsable") from None
+        return digest(command)
     if len(argv) == 3 and Path(argv[0]).name in ("sh", "bash", "dash", "zsh") \
             and argv[1] in ("-c", "-lc"):
         command = argv[2]
@@ -320,6 +346,9 @@ def pins(via, codex, via_hash, codex_hash, model):
     for path, expected in ((via, via_hash), (codex, codex_hash)):
         require(bool(re.fullmatch(r"[0-9a-f]{64}", expected)), "pinned-hash missing")
         require(shared.sha256(path) == expected, "pinned-hash mismatch")
+    with open(codex, "rb") as file:
+        require(file.read(4) == b"\x7fELF" and os.access(codex, os.X_OK),
+                "--codex must be the native executable, not a launcher")
 
 
 def credential_metadata(home):
@@ -336,7 +365,6 @@ def credential_metadata(home):
 def mcp_names(home):
     """Only noncredential config keys; managed layers cannot be qualified here."""
     require(not Path("/etc/codex").exists(), "managed Codex configuration is unsupported")
-    require(not (home / "plugins").exists(), "plugin-provided MCP inventory unsupported")
     path = home / "config.toml"
     names = set()
     if not path.is_symlink() and not path.exists():
@@ -356,7 +384,9 @@ def mcp_names(home):
     def visit(table, depth=0):
         require(depth < 32, "configuration nesting bound")
         if isinstance(table, dict):
-            require(not table.get("plugins"), "plugin-provided MCP inventory unsupported")
+            require(not any(key in table for key in
+                    ("model_provider", "profile", "model_providers", "otel")),
+                    "side-effect configuration unsupported in owner config; preflight blocked")
             if "mcp_servers" in table:
                 require(isinstance(table["mcp_servers"], dict), "MCP inventory malformed")
                 names.update(table["mcp_servers"])
@@ -366,16 +396,71 @@ def mcp_names(home):
             for value in table:
                 visit(value, depth + 1)
     visit(config)
-    require(len(names) <= 128, "MCP inventory bound")
+    require(len(names) <= MCP_LIMIT, "MCP inventory bound")
+    for name in names:
+        require(type(name) is str and re.fullmatch(r"[A-Za-z0-9_-]+", name), "unsafe MCP name")
     return sorted(names)
 
 
 def server_args(names):
     """Packet §4: root-table {} merges; disable each known server by name instead."""
-    args = ["--disable", "apps"]
+    args = ["--disable", "apps", "--disable", "plugins", "-c", "notify=[]"]
     for name in names:
-        args.extend(["-c", "mcp_servers." + json.dumps(name) + ".enabled=false"])
+        require(type(name) is str and re.fullmatch(r"[A-Za-z0-9_-]+", name), "unsafe MCP name")
+        args.extend(["-c", "mcp_servers." + name + ".enabled=false"])
     return args
+
+
+def effective_config(result, names):
+    """Packet §4: effective settings preflight; missing fields never prove safety."""
+    require(type(result) is dict and type(result.get("config")) is dict,
+            "config/read unavailable or schema unsupported: cannot verify effective safety")
+    config = result["config"]
+    features, servers = config.get("features"), config.get("mcp_servers")
+    require(type(features) is dict and all(features.get(key) is False
+            for key in ("apps", "plugins", "memories", "hooks")),
+            "config/read cannot confirm owned feature overrides")
+    require(config.get("notify") == [], "config/read cannot confirm notify=[]")
+    require(config.get("model_provider") == "openai"
+            and config.get("profile", False) is None
+            and type(config.get("model_providers")) is dict and config["model_providers"] == {}
+            and (config.get("otel", False) is None
+                 or type(config.get("otel")) is dict and config["otel"] == {}),
+            "config/read side-effect provider/profile/telemetry configuration unsupported")
+    require(type(servers) is dict and len(servers) <= MCP_LIMIT,
+            "config/read MCP inventory unavailable")
+    for name, server in servers.items():
+        require(type(name) is str and re.fullmatch(r"[A-Za-z0-9_-]+", name), "unsafe MCP name")
+        require(type(server) is dict and server.get("enabled") is False,
+                "config/read found enabled or unverifiable MCP server")
+    require(set(names) <= servers.keys(), "config/read lost configured MCP names")
+    return {"kind": "effective_config", "all_servers_disabled": True,
+            "servers": len(servers), "plugins_disabled": True, "notify_empty": True}
+
+
+def owner_metadata(home):
+    """Runtime §6.1: bounded metadata only; no file content or symlink traversal."""
+    require(not home.is_symlink(), "owner home metadata unavailable")
+    entries = list(home.iterdir())
+    require(len(entries) <= PROC_COUNT, "owner metadata entry bound")
+    session_files, pending = set(), [home / "sessions"]
+    visited = 0
+    while pending:
+        path = pending.pop()
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        visited += 1
+        require(visited <= PROC_COUNT, "owner session metadata bound")
+        require(not stat.S_ISLNK(info.st_mode), "owner session metadata symlink unsupported")
+        if stat.S_ISDIR(info.st_mode):
+            pending.extend(path.iterdir())
+            require(len(pending) + visited <= PROC_COUNT, "owner session metadata bound")
+        elif stat.S_ISREG(info.st_mode):
+            session_files.add(digest(str(path.relative_to(home))))
+    return {"top_entries": len(entries), "entry_digests": sorted(digest(p.name) for p in entries),
+            "session_files": len(session_files), "session_digests": sorted(session_files)}
 
 
 class Wire:
@@ -385,6 +470,7 @@ class Wire:
         self.declines, self.server_requests = {}, {}
         self.initialized, self.inventory = False, False
         self.sink = sink
+        self.threads, self.turns, self.notifications = set(), set(), {}
 
     def fact(self, **value):
         require(len(self.facts) < REQUEST_LIMIT, "protocol evidence bound")
@@ -430,6 +516,7 @@ class Wire:
                 require(self.starts <= TURN_LIMIT and params["effort"] == "low",
                         "spending control: proxy starts/effort")
                 require(self.inventory, "MCP inventory not verified")
+                require(digest(params["threadId"]) in self.threads, "unowned thread request")
                 fact.update(thread=digest(params["threadId"]), schema=digest(params["outputSchema"]),
                             bound=params["sandboxPolicy"]["type"])
             else:
@@ -438,6 +525,8 @@ class Wire:
                     require(params["excludeTurns"] is True, "resume history not excluded")
                     fact.update(thread=digest(params["threadId"]), exclude_turns=True)
         elif method == "turn/interrupt":
+            require((digest(params["threadId"]), digest(params["turnId"])) in self.turns,
+                    "unowned turn interrupt")
             fact.update(thread=digest(params["threadId"]), turn=digest(params["turnId"]))
         if "id" in message:
             require(type(message["id"]) in (str, int), "protocol id shape")
@@ -472,18 +561,37 @@ class Wire:
             elif method in ("thread/start", "thread/resume"):
                 require(result["model"] == MODEL and result["approvalPolicy"] == "never"
                         and result["approvalsReviewer"] == "user", "thread policy echo mismatch")
+                require(type(result["thread"]["id"]) is str, "thread identity missing")
                 thread = digest(result["thread"]["id"])
                 require(method != "thread/resume" or thread == request["thread"],
                         "resume identity mismatch")
+                self.threads.add(thread)
                 fact.update(thread=thread, never=True, reviewer_user=True)
             elif method == "turn/start":
                 require(type(result["turn"]["id"]) is str, "turn/start id missing")
+                self.turns.add((request["thread"], digest(result["turn"]["id"])))
                 fact.update(thread=request["thread"], turn=digest(result["turn"]["id"]))
             elif method not in ("turn/interrupt", "thread/unsubscribe"):
                 raise Blocked("protocol reply method not qualified")
             return self.fact(**fact)
         method, params = message["method"], message["params"]
         require(type(method) is str and isinstance(params, dict), "notification schema")
+        # All thread-scoped traffic, including deltas and server requests, must
+        # belong to IDs established by VIA replies, never by notifications.
+        thread_id = params.get("threadId")
+        if method == "thread/started":
+            thread_id = params.get("thread", {}).get("id")
+        if method.startswith(("thread/", "turn/", "item/")):
+            require(type(thread_id) is str and digest(thread_id) in self.threads,
+                    "unowned thread notification")
+            turn_id = params.get("turnId")
+            if method.startswith("turn/"):
+                turn_id = params.get("turn", {}).get("id", turn_id)
+            if method.startswith(("turn/", "item/")) or method == "thread/tokenUsage/updated":
+                require(type(turn_id) is str and (digest(thread_id), digest(turn_id)) in self.turns,
+                        "unowned turn notification; correlation unavailable")
+        if method == "remoteControl/status/changed":
+            require(params.get("status") == "disabled", "remote control not disabled")
         if "id" in message:
             key = digest(message["id"])
             require(type(message["id"]) in (str, int) and key not in self.server_requests
@@ -510,7 +618,7 @@ class Wire:
                         turn=digest(params["turn"]["id"]), status=params["turn"]["status"])
         elif method in ("item/started", "item/completed"):
             item = params["item"]
-            require(item.get("type") in ("agentMessage", "reasoning", "plan", "commandExecution"),
+            require(item.get("type") in ("userMessage", "agentMessage", "reasoning", "plan", "commandExecution"),
                     "background agent or unqualified tool item")
             if item["type"] == "commandExecution":
                 output = item.get("aggregatedOutput")
@@ -522,6 +630,12 @@ class Wire:
                             command_hash=command_digest(item.get("command")),
                             exit_code=code, read_only_error=isinstance(output, str)
                             and "Read-only file system" in output)
+        if fact["kind"] == "notification":
+            key = fact["method_hash"]
+            require(key in self.notifications or len(self.notifications) < NOTIFICATION_METHOD_LIMIT,
+                    "notification method bound")
+            self.notifications[key] = self.notifications.get(key, 0) + 1
+            return fact
         return self.fact(**fact)
 
 
@@ -571,7 +685,7 @@ async def proxy(control, argv):
     def defer(sig, frame):
         nonlocal termination
         termination = signal.Signals(sig).name
-    handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+    handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
     for sig in handlers:
         signal.signal(sig, defer)
     try:
@@ -583,9 +697,10 @@ async def proxy(control, argv):
         for sig, handler in handlers.items():
             signal.signal(sig, handler)
         raise
-    pidfd, trace, wire, tasks, failure = None, None, None, [], None
+    pidfd, trace, wire, tasks, failure, reason = None, None, None, [], None, None
     try:
         pidfd, identity, executable_hash = pin_child(proc)
+        require(executable_hash == control["codex_hash"], "native executable pinned-hash mismatch")
         trace_path = Path(control["trace_dir"]) / f"server-{identity['pid']}-{identity['start_ticks']}.jsonl"
         trace_fd = os.open(trace_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         trace = os.fdopen(trace_fd, "wb", buffering=0)
@@ -604,6 +719,7 @@ async def proxy(control, argv):
                                                           sys.stdin.buffer)
         inventory_reply = asyncio.Queue(maxsize=1)
         inventory_id = "via-qualification-inventory-" + secrets.token_hex(12)
+        inventory_pending = False
 
         async def send(message):
             async with write_lock:
@@ -611,16 +727,14 @@ async def proxy(control, argv):
                 await proc.stdin.drain()
 
         async def inventory():
-            # Empty first page AND null cursor are required. Following any
-            # nonempty/partial page would already violate the safety gate.
-            await send({"id": inventory_id, "method": "mcpServerStatus/list", "params": {}})
+            nonlocal inventory_pending
+            inventory_pending = True
+            # Ask for effective configuration, never MCP status/tool inventory.
+            # Unsupported or missing effective settings cannot establish safety.
+            await send({"id": inventory_id, "method": "config/read", "params": {"includeLayers": False}})
             result = await asyncio.wait_for(inventory_reply.get(), 10)
-            require(isinstance(result, dict) and type(result.get("data")) is list
-                    and "nextCursor" in result, "MCP inventory unverifiable")
-            require(result["data"] == [] and result["nextCursor"] is None,
-                    "MCP inventory is not empty")
+            wire.fact(**effective_config(result, control["mcp_names"]))
             wire.inventory = True
-            wire.fact(kind="mcp_inventory", empty=True)
 
         async def outgoing():
             while True:
@@ -639,14 +753,18 @@ async def proxy(control, argv):
                 await send(message)
 
         async def incoming():
+            nonlocal inventory_pending
             while True:
                 raw = await proc.stdout.readline()
                 if not raw:
                     return
                 message = decode_line(raw)
                 if message.get("id") == inventory_id:
-                    require("result" in message and "error" not in message, "MCP inventory refused")
-                    await inventory_reply.put(message["result"])
+                    require(inventory_pending and "method" not in message,
+                            "config/read duplicate or uncorrelated reply")
+                    inventory_pending = False
+                    require("result" in message and "error" not in message, "config/read preflight refused or unsupported")
+                    inventory_reply.put_nowait(message["result"])
                     continue
                 wire.incoming(message)
                 if wire.initialized and message.get("id") is not None \
@@ -668,6 +786,7 @@ async def proxy(control, argv):
             require(proc.returncode is not None or not wire.pending, "server ended with pending replies")
     except BaseException as error:
         failure = type(error).__name__
+        reason = str(error) if isinstance(error, Blocked) and secret_free(str(error)) else failure
     finally:
         for task in tasks:
             task.cancel()
@@ -683,9 +802,10 @@ async def proxy(control, argv):
                 if trace is not None:
                     try:
                         if wire is not None:
+                            wire.fact(kind="notification_counts", counts=wire.notifications)
                             wire.fact(kind="end", complete=failure is None and not wire.pending
                                       and not wire.server_requests, termination_signal=termination,
-                                      failure_type=failure, child_reaped=proc.returncode is not None)
+                                      failure_type=failure, blocked_reason=reason, child_reaped=proc.returncode is not None)
                     finally:
                         trace.close()
             finally:
@@ -787,31 +907,40 @@ class Run(shared.Run):
                                            claude=args.codex, evidence=args.evidence))
         self.args, self.spend = args, Spending()
         self.owner_codex = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".codex"
+        require("CODEX_HOME" not in os.environ or Path(os.environ["CODEX_HOME"]).resolve()
+                == self.owner_codex.resolve(), "CODEX_HOME disagrees with owner home")
         self.work = Path(tempfile.mkdtemp(prefix="via-codex-qual.", dir="/tmp"))
-        self.state, self.runtime = self.work / "state", self.work / "rt"
-        self.runtime.mkdir(mode=0o700)
-        self.home = self.work / "home"
-        self.home.mkdir(mode=0o700)
-        self.trace_dir = self.work / "trace"
-        self.trace_dir.mkdir(mode=0o700)
-        self.codex = Path(args.codex).resolve()
-        self.launcher = self.work / "codex-proxy"
-        self.base_env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(self.home),
-                         "USER": "via-qualification", "LOGNAME": "via-qualification",
-                         "LANG": "C.UTF-8", "VIA_STATE_DIR": str(self.state),
-                         "VIA_RUNTIME_DIR": str(self.runtime)}
-        for name in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_RUNTIME_DIR"):
-            path = self.work / name.lower()
-            path.mkdir(mode=0o700)
-            self.base_env[name] = str(path)
-        self.env = dict(self.base_env)
-        self.envelopes, self.receipts, self.checks, self.owned = [], {}, [], set()
+        try:
+            self.state, self.runtime = self.work / "state", self.work / "rt"
+            self.runtime.mkdir(mode=0o700)
+            self.home = self.work / "home"
+            self.home.mkdir(mode=0o700)
+            self.trace_dir = self.work / "trace"
+            self.trace_dir.mkdir(mode=0o700)
+            self.codex = Path(args.codex).resolve()
+            self.launcher = self.work / "codex-proxy"
+            self.base_env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(self.home),
+                             "USER": "via-qualification", "LOGNAME": "via-qualification",
+                             "LANG": "C.UTF-8", "VIA_STATE_DIR": str(self.state),
+                             "VIA_RUNTIME_DIR": str(self.runtime)}
+            for name in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_RUNTIME_DIR"):
+                path = self.work / name.lower()
+                path.mkdir(mode=0o700)
+                self.base_env[name] = str(path)
+            self.env = dict(self.base_env)
+            self.envelopes, self.receipts, self.checks, self.owned = [], {}, [], set()
+            self.record_only, self.owner_before, self.owner_after = [], None, None
+            self.blocked_reasons = []
+        except BaseException:
+            shutil.rmtree(self.work)
+            raise
 
     def preflight(self):
         require(sys.platform == "linux" and hasattr(os, "pidfd_open")
                 and hasattr(signal, "pidfd_send_signal"), "Linux pidfd support required")
         pins(self.via, self.codex, self.args.via_sha256, self.args.codex_sha256, self.model)
         auth = credential_metadata(self.owner_codex)
+        self.owner_before = owner_metadata(self.owner_codex)
         names = mcp_names(self.owner_codex)
         self.vendor_args = server_args(names)
         # No project configuration layer: private server cwd/workspaces are
@@ -948,7 +1077,7 @@ class Run(shared.Run):
             for row in rows:
                 if row["kind"] in ("process", "executable"):
                     self.owned.add((row["pid"], row["start_ticks"]))
-                found.append(row)
+                found.append({**row, "trace": digest((rows[0]["pid"], rows[0]["start_ticks"]))})
         require(not final or bool(found), "no owned server trace")
         return found
 
@@ -1002,13 +1131,23 @@ class Run(shared.Run):
         raise Blocked("tool execution not observable")
 
     def stop_daemon(self, final=False):
+        # Refresh owned identities before surveying ancestry; still stop on a
+        # malformed trace, then report that uncertainty after the stop attempt.
+        inspection_error = None
+        try:
+            self.facts()
+        except BaseException as error:
+            inspection_error = error
         # Include proxy children/tools already identified even if reparented.
         if self.daemons:
             record = self.daemon_unverified or self.daemons[-1]
             known = {tuple(item) for item in record.get("descendants_watched", [])}
             known.update(self.owned)
             record["descendants_watched"] = sorted(known)
-        return super().stop_daemon(final=final)
+        result = super().stop_daemon(final=final)
+        if inspection_error is not None:
+            raise Blocked("trace inspection unavailable during daemon stop") from None
+        return result
 
     def start_phase(self, name, codex_config, home=None):
         self.stop_daemon()
@@ -1125,11 +1264,44 @@ def turn_facts(run, envelope):
     return [fact for fact in facts if fact.get("thread") == thread and fact.get("turn") == turn]
 
 
-def exact_command(run, envelope, command):
+def workspace_marker(path):
+    """Runtime §6.1: bounded marker proof through dirfd, without following links."""
+    directory = None
+    try:
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        before = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+        require(stat.S_ISREG(before.st_mode) and before.st_uid == os.getuid()
+                and before.st_nlink == 1, "workspace marker unverifiable")
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+        with os.fdopen(fd, "rb") as file:
+            after = os.fstat(file.fileno())
+            require((before.st_dev, before.st_ino) == (after.st_dev, after.st_ino)
+                    and after.st_nlink == 1, "workspace marker unverifiable")
+            return file.read(len(WORKSPACE_MARKER) + 1) == WORKSPACE_MARKER
+    except OSError:
+        raise Blocked("workspace marker unverifiable") from None
+    finally:
+        if directory is not None:
+            os.close(directory)
+
+
+def denied_write_observation(run, envelope, command, target):
+    """Packet §3: absent protocol tool evidence cannot qualify bound enforcement."""
     tools = [fact for fact in turn_facts(run, envelope) if fact["kind"] == "tool" and fact["finished"]]
-    run.check("exact command for bound proof", len(tools) == 1
-              and tools[0]["command_hash"] == digest(command))
-    return tools[0]
+    try:
+        target.lstat()
+    except FileNotFoundError:
+        absent = True
+    except OSError:
+        raise Blocked("prohibited file absence unverifiable") from None
+    else:
+        absent = False
+    require(absent, "prohibited write created a file")
+    proven = (len(tools) == 1 and tools[0]["command_hash"] == digest(command)
+              and tools[0]["read_only_error"] and type(tools[0]["exit_code"]) is int
+              and tools[0]["exit_code"] != 0)
+    run.record_only.append({"observation": "denied write", "file_absent": absent,
+                            "exact_command_refusal_visible": proven})
 
 
 def conversation(run):
@@ -1149,8 +1321,11 @@ def conversation(run):
     first = run.finish("c1")
     completed(run, first, "c1")
     run.check("schema set", first["structured_output"] == {"written": True})
-    run.check("workspace write succeeded", (ws / "allowed.txt").read_text() == "allowed")
-    exact_command(run, first, "printf allowed > allowed.txt")
+    run.check("workspace write succeeded", workspace_marker(ws / "allowed.txt"))
+    tools = [fact for fact in turn_facts(run, first) if fact["kind"] == "tool" and fact["finished"]]
+    run.record_only.append({"observation": "allowed write command visibility",
+                            "exact_command_visible": len(tools) == 1
+                            and tools[0]["command_hash"] == digest("printf allowed > allowed.txt")})
     run.submit("c2", "resume", session, "--bound", "read_only", "--output-schema", str(schema_b),
                "--wall-ms", str(WALL_S * 1000), "--prompt",
                "Run exactly `printf tightened > denied.txt` once. Do not retry or ask for "
@@ -1159,10 +1334,12 @@ def conversation(run):
     completed(run, second, "c2")
     run.check("schema replaced", second["structured_output"] == {"blocked": True})
     thread = digest(second["vendor_session_id"])
-    tool = exact_command(run, second, "printf tightened > denied.txt")
-    run.check("tightened bound actual failed write and no file",
-              tool["read_only_error"] and type(tool["exit_code"]) is int and tool["exit_code"] != 0
-              and not (ws / "denied.txt").exists())
+    current_starts = [fact for fact in run.facts() if fact["kind"] == "request"
+                      and fact["method"] == "turn/start" and fact["thread"] == thread]
+    run.check("bound change sent between turns", len(current_starts) == 2
+              and current_starts[0]["bound"] == "workspaceWrite"
+              and current_starts[1]["bound"] == "readOnly")
+    denied_write_observation(run, second, "printf tightened > denied.txt", ws / "denied.txt")
     run.stop_daemon()
     run.facts(final=True)
     run.start("stored-resume")
@@ -1231,9 +1408,11 @@ def interrupt(run):
               and other["vendor_session_id"] != ended["vendor_session_id"])
     a_thread, b_thread = digest(ended["vendor_session_id"]), digest(other["vendor_session_id"])
     facts = run.facts()
-    # One initialized process in this generation and distinct turn ownership.
-    process_count = sum(fact["kind"] == "process" for fact in facts)
-    run.check("shared owned server", process_count == 2)  # one retired + one current
+    a_traces = {fact["trace"] for fact in turn_facts(run, ended)
+                if fact["kind"] == "reply" and fact["method"] == "turn/start"}
+    b_traces = {fact["trace"] for fact in turn_facts(run, other)
+                if fact["kind"] == "reply" and fact["method"] == "turn/start"}
+    run.check("shared owned server", len(a_traces) == 1 and a_traces == b_traces)
     run.check("interrupt targets A", any(fact["kind"] == "request"
               and fact["method"] == "turn/interrupt" and fact["thread"] == a_thread
               for fact in facts))
@@ -1252,7 +1431,7 @@ def interrupt(run):
 
 
 def never_ask(run):
-    """Packet §4: reviewer and never in real requests; denied write is positive evidence."""
+    """Packet §4: reviewer/never gate; refused-write visibility is record-only."""
     ws = run.work / "never-ask"
     ws.mkdir(mode=0o700)
     session = run.submit("n1", "spawn", *spawn_args(run, ws,
@@ -1266,9 +1445,7 @@ def never_ask(run):
     run.check("never/user reviewer verified", any(fact["kind"] == "reply"
               and fact["method"] == "thread/start" and fact["thread"] == thread
               and fact["never"] and fact["reviewer_user"] for fact in facts))
-    tool = exact_command(run, ended, "printf forbidden > forbidden.txt")
-    run.check("never-ask positive bound refusal", not (ws / "forbidden.txt").exists()
-              and tool["read_only_error"] and type(tool["exit_code"]) is int and tool["exit_code"] != 0)
+    denied_write_observation(run, ended, "printf forbidden > forbidden.txt", ws / "forbidden.txt")
 
 
 def usage(run):
@@ -1362,8 +1539,28 @@ def cleanup(run):
     try:
         facts = run.facts(final=True)
         save(run.evidence / "protocol.json", facts)
+        counts = {method: 0 for method in NO_GRANT_METHODS}
+        unknown = {}
+        for fact in facts:
+            if fact["kind"] == "decline":
+                known = next((method for method in NO_GRANT_METHODS
+                              if digest(method) == fact["method_hash"]), None)
+                if known is None:
+                    key = fact["method_hash"]
+                    unknown[key] = unknown.get(key, 0) + 1
+                else:
+                    counts[known] += 1
+        run.record_only.append({"observation": "no-grant paths", "per_method_counts": counts,
+                                "unknown_method_digest_counts": unknown})
     except BaseException:
         errors.append("complete protocol evidence unavailable")
+        try:
+            partial = run.facts()
+            run.blocked_reasons.extend(row["blocked_reason"] for row in partial
+                                       if row.get("blocked_reason") is not None)
+            save(run.evidence / "protocol.json", {"complete": False, "facts": partial})
+        except BaseException:
+            errors.append("partial protocol evidence unavailable")
     try:
         save(run.evidence / "lifecycle.json", [{"phase": record["phase"],
              "pid": record.get("pid"), "start_ticks": record.get("start_ticks"),
@@ -1376,6 +1573,11 @@ def cleanup(run):
              "no_uncertainty": record.get("undecided") == []} for record in run.daemons])
     except BaseException:
         errors.append("lifecycle evidence unavailable")
+    if run.owner_before is not None:
+        try:
+            run.owner_after = owner_metadata(run.owner_codex)
+        except BaseException:
+            errors.append("owner home metadata after run unavailable")
     return stopped, errors
 
 
@@ -1439,15 +1641,16 @@ def main(argv=None):
     require(not args.evidence.exists(), "evidence must be new")
     args.evidence.mkdir(parents=True, mode=0o700)
     os.chmod(args.evidence, 0o700)
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, shared.record_signal)
-    run, failure, stopped, cleanup_errors = None, None, False, []
+    run, failure, stopped, cleanup_errors, reason = None, None, False, [], None
     try:
         run = Run(args)
         execute(run)
     except BaseException as error:
         # Never echo a possibly secret-bearing exception, path or vendor reply.
         failure = type(error).__name__
+        reason = str(error) if isinstance(error, Blocked) and secret_free(str(error)) else failure
     finally:
         if run is not None:
             try:
@@ -1468,11 +1671,21 @@ def main(argv=None):
     passed = passed and removed
     summary = {"runner": "scripts/qualify/codex.py", "result": "pass" if passed else "blocked",
                "candidate_version": args.candidate_version, "model": MODEL,
-               "error_type": failure, "interrupted": interrupted, "daemons_stopped": stopped,
+               "error_type": failure, "blocked_reasons": ([reason] if reason else [])
+                   + (run.blocked_reasons if run else []), "interrupted": interrupted, "daemons_stopped": stopped,
                "private_directory_removed": removed, "cleanup_errors": cleanup_errors,
                "turns_reserved": run.spend.used if run else 0,
                "spending_uncertain": run.spend.uncertain if run else True,
                "checks": run.checks if run else [],
+               "owner_home_writes": {"policy": "accepted, not minimised",
+                   "before": run.owner_before if run else None,
+                   "after": run.owner_after if run else None,
+                   "new_session_files": len(set(run.owner_after["session_digests"])
+                       - set(run.owner_before["session_digests"]))
+                       if run and run.owner_before is not None and run.owner_after is not None else None},
+               "record_only_scope": ["command visibility and denied-write enforcement",
+                                     "six independent inducible no-grant paths"],
+               "record_only": run.record_only if run else [],
                "deferred": ["six independent live no-grant paths when not inducible",
                             "usage scope upgrade", "steer/rejoin", "macOS/broader bound matrix"]}
     # Preflight failures may leave no daemon but still only private generated
@@ -1539,13 +1752,16 @@ class SafetyTests(unittest.TestCase):
     def run_object(self):
         via, codex = self.root / "via", self.root / "codex"
         via.write_text("fake via")
-        codex.write_text("fake codex")
+        codex.write_bytes(b"\x7fELFsynthetic codex")
+        codex.chmod(0o700)
         evidence = self.root / "evidence"
         evidence.mkdir(exist_ok=True)
         args = argparse.Namespace(via=via, codex=codex, model=MODEL, evidence=evidence,
                                   via_sha256=shared.sha256(via), codex_sha256=shared.sha256(codex),
                                   candidate_version="0.160.1")
-        run = Run(args)
+        with mock.patch.dict(os.environ):
+            os.environ.pop("CODEX_HOME", None)
+            run = Run(args)
         self.addCleanup(shutil.rmtree, run.work, True)
         return run
 
@@ -1553,6 +1769,443 @@ class SafetyTests(unittest.TestCase):
         return {"id": 1, "method": "turn/start", "params": {"threadId": "t", "model": model,
                 "effort": "low", "approvalPolicy": "never", "approvalsReviewer": "user",
                 "outputSchema": None, "sandboxPolicy": {"type": "readOnly"}}}
+
+    def owned_wire(self):
+        wire = Wire("0.160.1")
+        wire.inventory = True
+        wire.outgoing({"id": 10, "method": "thread/start", "params": {
+            "model": MODEL, "approvalPolicy": "never", "approvalsReviewer": "user",
+            "sandbox": "read-only"}})
+        wire.incoming({"id": 10, "result": {"model": MODEL, "approvalPolicy": "never",
+                      "approvalsReviewer": "user", "thread": {"id": "t"}}})
+        wire.outgoing(self.start_message())
+        wire.incoming({"id": 1, "result": {"turn": {"id": "u"}}})
+        return wire
+
+    def test_recorded_fixture_server_lines(self):
+        # Replay every emitted line, pairing IDs from recorded client captures.
+        # Historical models differ from Luna: only that policy field is adapted.
+        # Recorded negative RPC replies remain expected refusals, never passes.
+        fixtures = Path(__file__).resolve().parents[2] / "crates/via-adapters/tests/fixtures/codex"
+        streams = messages = notifications = refusals = 0
+        paths = sorted(fixtures.glob("*.replay.json"))
+        self.assertTrue(paths)
+        for path in paths:
+            wire, count, variables = Wire("0.159.2"), 0, {}
+            for step in json.loads(path.read_text())["steps"]:
+                expected = step.get("expect", {})
+                for variable, pointer in expected.get("capture", {}).items():
+                    self.assertEqual(pointer, "/id")
+                    variables[variable] = len(variables) + 1
+                    request = expected["line"]
+                    params = request.get("params", {})
+                    fact = {"method": request["method"]}
+                    if "threadId" in params:
+                        fact["thread"] = digest(params["threadId"])
+                    wire.pending[digest(variables[variable])] = fact
+                raw = step.get("emit", {}).get("line")
+                if not raw:
+                    continue
+                frame = json.loads(re.sub(r"\$\{([^}]+)\}", lambda m: str(variables[m[1]]), raw)) \
+                    if type(raw) is str else raw
+                with self.subTest(fixture=path.name, message=count):
+                    if "id" in frame and "error" in frame and "method" not in frame:
+                        with self.assertRaisesRegex(Blocked, "request refused"):
+                            wire.incoming(frame)
+                        refusals += 1
+                    elif "id" in frame and wire.pending.get(digest(frame["id"]), {}).get("method") == "turn/steer":
+                        # Steer is explicitly outside the first-release scope.
+                        with self.assertRaisesRegex(Blocked, "method not qualified"):
+                            wire.incoming(frame)
+                        refusals += 1
+                    else:
+                        result = frame.get("result", {})
+                        with mock.patch(__name__ + ".MODEL", result.get("model", MODEL)):
+                            wire.incoming(frame)
+                count += 1
+                notifications += "method" in frame
+            streams += bool(count)
+            messages += count
+        self.assertEqual(streams, 14)
+        self.assertEqual(notifications, 240)
+        self.assertEqual(refusals, 3)
+        self.assertGreater(messages, notifications)
+
+    def test_owned_thread_and_turn_notifications(self):
+        frames = [
+            {"method": "thread/started", "params": {"thread": {"id": "t"}}},
+            {"method": "turn/started", "params": {"threadId": "t", "turn": {"id": "u"}}},
+            {"method": "item/started", "params": {"threadId": "t", "turnId": "u",
+                                                   "item": {"type": "userMessage"}}},
+        ]
+        for frame in frames:
+            self.owned_wire().incoming(frame)
+            bad = copy.deepcopy(frame)
+            if "threadId" in bad["params"]:
+                bad["params"]["threadId"] = "foreign"
+            else:
+                bad["params"]["thread"]["id"] = "foreign"
+            with self.subTest(method=bad["method"]), self.assertRaisesRegex(Blocked, "unowned"):
+                self.owned_wire().incoming(bad)
+        for method, params in (
+            ("item/completed", {"threadId": "t", "turnId": "foreign", "item": {"type": "reasoning"}}),
+            ("turn/completed", {"threadId": "t", "turn": {"id": "foreign", "status": "completed"}}),
+            ("thread/tokenUsage/updated", {"threadId": "t", "turnId": "foreign",
+                "tokenUsage": {key: {"inputTokens": 1, "cachedInputTokens": 1, "outputTokens": 1,
+                                     "reasoningOutputTokens": 1, "totalTokens": 2}
+                               for key in ("last", "total")}}),
+        ):
+            with self.subTest(method=method), self.assertRaisesRegex(Blocked, "unowned"):
+                self.owned_wire().incoming({"method": method, "params": params})
+
+    def test_safe_owned_argv_and_name_validation(self):
+        self.assertEqual(server_args(["ok-name_1"]), ["--disable", "apps", "--disable", "plugins",
+                         "-c", "notify=[]", "-c", "mcp_servers.ok-name_1.enabled=false"])
+        for name in ('a.b', '"quoted"', '', 'space name', 'a=b'):
+            with self.subTest(name=name), self.assertRaisesRegex(Blocked, "MCP name"):
+                server_args([name])
+
+    def test_plugins_and_profile_inventory(self):
+        (self.root / "plugins").mkdir()
+        config = self.root / "config.toml"
+        config.write_text('[plugins.example]\nenabled=true\n[mcp_servers.one]\ncommand="fake"\n'
+                          '[profiles.test.mcp_servers.two]\ncommand="fake"\n')
+        self.assertEqual(mcp_names(self.root), ["one", "two"])
+        for key in ('model_provider="foreign"', 'profile="other"', '[model_providers.other]', '[otel]'):
+            config.write_text(key + "\n")
+            with self.subTest(key=key), self.assertRaisesRegex(Blocked, "side-effect configuration"):
+                mcp_names(self.root)
+
+    def test_remote_control_must_be_disabled(self):
+        for status in ('enabled', None, False):
+            with self.subTest(status=status), self.assertRaisesRegex(Blocked, "remote control"):
+                Wire("0.160.1").incoming({"method": "remoteControl/status/changed",
+                                        "params": {"status": status}})
+
+    def test_unparsable_command_uses_raw_digest(self):
+        self.assertEqual(command_digest("printf 'unclosed"), digest("printf 'unclosed"))
+
+    def test_chatty_deltas_are_coalesced(self):
+        wire = self.owned_wire()
+        for _ in range(REQUEST_LIMIT + 1):
+            wire.incoming({"method": "item/agentMessage/delta", "params": {
+                "threadId": "t", "turnId": "u", "delta": "ignored"}})
+        self.assertLess(len(wire.facts), 10)
+        self.assertEqual(wire.notifications[digest("item/agentMessage/delta")], REQUEST_LIMIT + 1)
+
+    def test_launcher_is_not_a_native_pin(self):
+        run = self.run_object()
+        run.codex.write_text("#!/usr/bin/env node\n")
+        with self.assertRaisesRegex(Blocked, "native executable"):
+            pins(run.via, run.codex, shared.sha256(run.via), shared.sha256(run.codex), MODEL)
+
+    def test_codex_home_disagreement_blocks_constructor(self):
+        run = self.run_object()
+        unexpected = None
+        try:
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(self.root / "foreign")}), \
+                 self.assertRaisesRegex(Blocked, "CODEX_HOME"):
+                unexpected = Run(run.args)
+        finally:
+            if unexpected is not None:
+                shutil.rmtree(unexpected.work)
+
+    def test_constructor_failure_removes_private_root(self):
+        run = self.run_object()
+        work = self.root / "failed-constructor"
+        work.mkdir()
+        with mock.patch.object(tempfile, "mkdtemp", return_value=str(work)), \
+             mock.patch.object(Path, "mkdir", side_effect=OSError("synthetic")), \
+             self.assertRaises(OSError):
+            Run(run.args)
+        self.assertFalse(work.exists())
+
+    def test_stop_refreshes_reparented_trace_identity(self):
+        run = self.run_object()
+        run.daemons = [{"descendants_watched": []}]
+        def refresh(*args, **kwargs):
+            run.owned.add((2, 20))
+        with mock.patch.object(run, "facts", side_effect=refresh), \
+             mock.patch.object(shared.Run, "stop_daemon") as stop:
+            run.stop_daemon()
+        self.assertIn((2, 20), run.daemons[0]["descendants_watched"])
+        stop.assert_called_once()
+
+    def config_fixture(self):
+        return {"config": {"features": {key: False for key in ("apps", "plugins", "memories", "hooks")},
+                "notify": [], "model_provider": "openai", "profile": None,
+                "model_providers": {}, "otel": None,
+                "mcp_servers": {"ok": {"enabled": False}}}}
+
+    def test_config_read_checks_actual_override_results(self):
+        config = self.config_fixture()
+        self.assertTrue(effective_config(config, ["ok"])["all_servers_disabled"])
+        for change in (lambda c: c["mcp_servers"]["ok"].update(enabled=True),
+                       lambda c: c["features"].update(plugins=True),
+                       lambda c: c.update(notify=["foreign-command"]),
+                       lambda c: c.update(model_provider="foreign"),
+                       lambda c: c.update(profile="foreign"),
+                       lambda c: c.update(model_providers={"foreign": {}}),
+                       lambda c: c.update(otel={"exporter": "foreign"}),
+                       lambda c: c.pop("notify"),
+                       lambda c: c["mcp_servers"].pop("ok"),
+                       lambda c: c["mcp_servers"].update({'"ok"': {"enabled": False}})):
+            candidate = copy.deepcopy(config)
+            change(candidate["config"])
+            with self.subTest(candidate=digest(candidate)), self.assertRaises(Blocked):
+                effective_config(candidate, ["ok"])
+
+    def test_proxy_config_schema_miss_blocks_before_discovery(self):
+        result, child, signals, sent, traces = asyncio.run(self.proxy_fixture(config={"config": {}}))
+        self.assertEqual(result, 1)
+        self.assertNotIn("model/list", sent)
+        self.assertNotIn("mcpServerStatus/list", sent)
+        self.assertNotIn("turn/start", sent)
+        rows = [decode_line(line) for line in next(traces.iterdir()).read_bytes().splitlines(keepends=True)]
+        self.assertEqual(rows[-1]["blocked_reason"], "config/read cannot confirm owned feature overrides")
+
+    def test_proxy_native_hash_mismatch_blocks_before_handshake(self):
+        result, child, signals, sent, traces = asyncio.run(self.proxy_fixture(executable_mismatch=True))
+        self.assertEqual(result, 1)
+        self.assertEqual(sent, [])
+        child.wait.assert_awaited()
+
+    def test_proxy_term_and_hup_refuse_later_turn(self):
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            with self.subTest(signal=sig.name):
+                # A separate synthetic root for each complete exchange.
+                with tempfile.TemporaryDirectory() as root:
+                    previous, self.root = self.root, Path(root)
+                    try:
+                        result, child, signals, sent, traces = asyncio.run(
+                            self.proxy_fixture(termination=sig, after_signal=True))
+                        self.assertEqual(result, 1)
+                        self.assertNotIn("turn/start", sent)
+                        rows = [decode_line(line) for line in next(traces.iterdir()).read_bytes().splitlines(keepends=True)]
+                        self.assertEqual(rows[-1]["termination_signal"], sig.name)
+                        self.assertTrue(rows[-1]["child_reaped"])
+                        self.assertFalse(rows[-1]["complete"])
+                    finally:
+                        self.root = previous
+
+    def test_owner_home_metadata_never_reads_contents(self):
+        (self.root / "auth.json").touch(mode=0o600)
+        sessions = self.root / "sessions"
+        sessions.mkdir()
+        (sessions / "one").touch()
+        with mock.patch("builtins.open", side_effect=AssertionError("content read")), \
+             mock.patch.object(os, "open", side_effect=AssertionError("content read")):
+            before = owner_metadata(self.root)
+        (sessions / "two").touch()
+        with mock.patch("builtins.open", side_effect=AssertionError("content read")), \
+             mock.patch.object(os, "open", side_effect=AssertionError("content read")):
+            after = owner_metadata(self.root)
+        self.assertEqual(after["session_files"] - before["session_files"], 1)
+        self.assertEqual(len(set(after["session_digests"]) - set(before["session_digests"])), 1)
+        self.assertNotIn("auth.json", json.dumps(after))
+        self.assertTrue(secret_free(after))
+
+    def test_bound_without_tool_evidence_is_only_recorded(self):
+        run = self.run_object()
+        with mock.patch(__name__ + ".turn_facts", return_value=[]):
+            denied_write_observation(run, fake_envelope(), "fixed", self.root / "absent")
+        self.assertEqual(run.checks, [])
+        self.assertEqual(run.record_only, [{"observation": "denied write", "file_absent": True,
+                                         "exact_command_refusal_visible": False}])
+        target = self.root / "present"
+        target.touch()
+        with mock.patch(__name__ + ".turn_facts", return_value=[]), self.assertRaisesRegex(Blocked, "created"):
+            denied_write_observation(run, fake_envelope(), "fixed", target)
+
+    def test_stop_attempts_cleanup_despite_bad_trace(self):
+        run = self.run_object()
+        with mock.patch.object(run, "facts", side_effect=Blocked("synthetic trace")), \
+             mock.patch.object(shared.Run, "stop_daemon") as stop, \
+             self.assertRaisesRegex(Blocked, "trace inspection"):
+            run.stop_daemon(final=True)
+        stop.assert_called_once_with(final=True)
+
+    def test_main_pass_logic_and_signal_registration(self):
+        for state, expected in (("clear", "pass"), ("interrupted", "blocked"),
+                                ("active", "blocked"), ("uncertain", "blocked")):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as root:
+                previous, self.root = self.root, Path(root)
+                try:
+                    shared.INTERRUPTED.clear()
+                    run = self.run_object()
+                    run.checks = [{"check": "synthetic proof", "pass": True}]
+                    run.daemons = [{"stopped": True}]
+                    evidence = self.root / "scratchpad" / "result"
+                    if state == "active":
+                        run.spend.active.add("unsettled")
+                    if state == "uncertain":
+                        run.spend.uncertain = True
+                    def executed(_):
+                        if state == "interrupted":
+                            shared.record_signal(signal.SIGHUP, None)
+                    with mock.patch(__name__ + ".__file__", str(self.root / "scripts/qualify/codex.py")), \
+                         mock.patch(__name__ + ".Run", return_value=run), \
+                         mock.patch(__name__ + ".execute", side_effect=executed), \
+                         mock.patch(__name__ + ".cleanup", return_value=(True, [])), \
+                         mock.patch.object(signal, "signal") as signals, mock.patch("builtins.print"):
+                        rc = main(["--run", "--via", str(run.via), "--codex", str(run.codex),
+                                   "--via-sha256", run.args.via_sha256, "--codex-sha256", run.args.codex_sha256,
+                                   "--evidence", str(evidence)])
+                    self.assertEqual(rc, 0 if expected == "pass" else 2)
+                    summary = json.loads((evidence / "summary.json").read_text())
+                    self.assertEqual(summary["result"], expected)
+                    self.assertIn(mock.call(signal.SIGHUP, shared.record_signal), signals.call_args_list)
+                    self.assertEqual(summary["owner_home_writes"]["policy"], "accepted, not minimised")
+                    self.assertIsInstance(summary["record_only"], list)
+                finally:
+                    self.root = previous
+                    shared.INTERRUPTED.clear()
+
+    def test_never_ask_missing_tool_is_record_only(self):
+        run = self.run_object()
+        ended = fake_envelope()
+        facts = [{"kind": "reply", "method": "thread/start", "never": True,
+                  "reviewer_user": True, "thread": digest(ended["vendor_session_id"])}]
+        with mock.patch.object(run, "submit", return_value="fake"), \
+             mock.patch.object(run, "finish", return_value=ended), \
+             mock.patch.object(run, "facts", return_value=facts), \
+             mock.patch(__name__ + ".turn_facts", return_value=[]):
+            never_ask(run)
+        self.assertTrue(all(check["pass"] for check in run.checks))
+        self.assertFalse(run.record_only[0]["exact_command_refusal_visible"])
+
+    def test_interrupt_proves_shared_trace_without_process_count(self):
+        for same in (True, False):
+            with self.subTest(same=same), tempfile.TemporaryDirectory() as root:
+                previous, self.root = self.root, Path(root)
+                try:
+                    run = self.run_object()
+                    ended, other, after = fake_envelope("cancelled"), fake_envelope(), fake_envelope()
+                    ended.update(stop_reason="interrupted", cancel={"outcome": "acknowledged", "cleanup": "quiescent"},
+                                 vendor_session_id="a")
+                    other.update(final_text="B_ONLY", vendor_session_id="b")
+                    after.update(final_text="A_AFTER", vendor_session_id="a")
+                    facts = [{"kind": "process"}] * (3 if same else 2) + [
+                        {"kind": "reply", "method": "turn/start", "thread": digest("a"), "turn": digest("ua"), "trace": "same"},
+                        {"kind": "reply", "method": "turn/start", "thread": digest("b"), "turn": digest("ub"),
+                         "trace": "same" if same else "different"},
+                        {"kind": "request", "method": "turn/interrupt", "thread": digest("a")},
+                        {"kind": "terminal", "thread": digest("b"), "status": "completed"},
+                    ]
+                    run.handles = {"a": "fake"}
+                    run.receipts = {"a1": ({"turn": "turn-a"}, "a")}
+                    status = {"vendor_identity_verified": True, "progress": {"running_tools": ["fake"]},
+                              "turns": [{"state": "running"}], "cancel": {"outcome": "requested"}}
+                    with mock.patch.object(run, "submit", side_effect=["a", "b", "a"]), \
+                         mock.patch.object(run, "observe_tool", return_value={"pid": 2, "start_ticks": 20}), \
+                         mock.patch.object(run, "via_call", return_value=(0, status, None)), \
+                         mock.patch.object(run, "finish", side_effect=[ended, other, after]), \
+                         mock.patch.object(run, "facts", return_value=facts), \
+                         mock.patch.object(run, "events", return_value=[{"type": t} for t in
+                             ("cancel.requested", "cancel.settled", "turn.ended")]), \
+                         mock.patch.object(Proc, "open", return_value=(None, None)):
+                        if same:
+                            interrupt(run)
+                        else:
+                            with self.assertRaisesRegex(Blocked, "shared owned server"):
+                                interrupt(run)
+                finally:
+                    self.root = previous
+
+    def test_cleanup_counts_declines_explicitly(self):
+        run = self.run_object()
+        facts = [{"kind": "decline", "method_hash": digest(NO_GRANT_METHODS[0])}]
+        with mock.patch.object(run, "facts", return_value=facts), \
+             mock.patch.object(run, "stop_daemon"), \
+             mock.patch(__name__ + ".save"):
+            cleanup(run)
+        counts = run.record_only[0]["per_method_counts"]
+        self.assertEqual(counts["item/commandExecution/requestApproval"], 1)
+        self.assertEqual(counts["item/tool/call"], 0)
+        self.assertEqual(len(counts), 6)
+
+    def conversation_fixture(self, wrong_bound=False, marker_link=False):
+        run = self.run_object()
+        first, second, third = (fake_envelope() for _ in range(3))
+        first.update(structured_output={"written": True})
+        second.update(turn=2, structured_output={"blocked": True})
+        third.update(turn=3, final_text="VIAQUALfixed", structured_output=None)
+        thread = digest(first["vendor_session_id"])
+        submitted = []
+        def submit(label, *args, **kwargs):
+            submitted.append(label)
+            if label == "c1":
+                marker = run.work / "conversation/allowed.txt"
+                if marker_link:
+                    target = self.root / "private-target"
+                    target.write_text("allowed")
+                    marker.symlink_to(target)
+                else:
+                    marker.write_text("allowed")
+            return "fake"
+        def facts(*args, **kwargs):
+            return [{"kind": "request", "method": "thread/resume", "thread": thread,
+                     "exclude_turns": True, "bound": "read-only"}] + [
+                {"kind": "request", "method": "turn/start", "thread": thread, "bound": bound,
+                 "schema": digest(json.loads((run.work / name).read_text()))}
+                for name, bound in list(zip(("a.json", "b.json", "null.json"),
+                    ("workspaceWrite", "workspaceWrite" if wrong_bound else "readOnly", "readOnly")))[:len(submitted)]]
+        with mock.patch.object(run, "submit", side_effect=submit), \
+             mock.patch.object(run, "finish", side_effect=[first, second, third]), \
+             mock.patch.object(run, "facts", side_effect=facts), \
+             mock.patch.object(run, "stop_daemon"), mock.patch.object(run, "start"), \
+             mock.patch(__name__ + ".turn_facts", return_value=[]), \
+             mock.patch.object(secrets, "token_hex", return_value="fixed"):
+            conversation(run)
+        return run
+
+    def test_conversation_can_observe_writes_without_tool_items(self):
+        run = self.conversation_fixture()
+        self.assertTrue(all(check["pass"] for check in run.checks))
+        self.assertTrue(any(row["observation"] == "denied write" for row in run.record_only))
+
+    def test_wrong_bound_between_turns_blocks_even_with_absent_file(self):
+        with self.assertRaisesRegex(Blocked, "bound change sent between turns"):
+            self.conversation_fixture(wrong_bound=True)
+
+    def test_all_six_no_grant_reply_shapes(self):
+        replies = [{"decision": "decline"}, {"decision": "decline"}, {"permissions": {}},
+                   {"answers": {}}, {"action": "decline", "content": None},
+                   {"contentItems": [], "success": False}]
+        for method, reply in zip(NO_GRANT_METHODS, replies):
+            with self.subTest(method=method):
+                wire = self.owned_wire()
+                wire.incoming({"id": 20, "method": method, "params": {"threadId": "t", "turnId": "u"}})
+                self.assertTrue(wire.outgoing({"id": 20, "result": reply})["no_grant"])
+                wire.incoming({"id": 21, "method": method, "params": {"threadId": "t", "turnId": "u"}})
+                with self.assertRaisesRegex(Blocked, "granted"):
+                    wire.outgoing({"id": 21, "result": {}})
+
+    def test_proxy_duplicate_preflight_reply_blocks(self):
+        result, child, signals, sent, traces = asyncio.run(self.proxy_fixture(duplicate_config=True))
+        self.assertEqual(result, 1)
+        self.assertNotIn("turn/start", sent)
+        rows = [decode_line(line) for line in next(traces.iterdir()).read_bytes().splitlines(keepends=True)]
+        self.assertEqual(rows[-1]["blocked_reason"], "config/read duplicate or uncorrelated reply")
+        self.assertFalse(rows[-1]["complete"])
+        self.assertTrue(rows[-1]["child_reaped"])
+
+    def test_workspace_marker_never_follows_a_symlink(self):
+        with self.assertRaisesRegex(Blocked, "workspace marker unverifiable"):
+            self.conversation_fixture(marker_link=True)
+
+    def test_denied_file_absence_requires_metadata_proof(self):
+        run = self.run_object()
+        target = self.root / "dangling"
+        target.symlink_to(self.root / "missing")
+        with mock.patch(__name__ + ".turn_facts", return_value=[]), \
+             self.assertRaisesRegex(Blocked, "created a file"):
+            denied_write_observation(run, fake_envelope(), "fixed", target)
+        target.unlink()
+        with mock.patch(__name__ + ".turn_facts", return_value=[]), \
+             mock.patch.object(Path, "lstat", side_effect=PermissionError("synthetic")), \
+             self.assertRaisesRegex(Blocked, "absence unverifiable"):
+            denied_write_observation(run, fake_envelope(), "fixed", target)
 
     def test_pinned_hash_mismatch_stops(self):
         run = self.run_object()
@@ -1639,13 +2292,20 @@ class SafetyTests(unittest.TestCase):
         with self.assertRaisesRegex(Blocked, "changed process"):
             Proc(self.root).content(identity, "cmdline")
 
-    def test_foreign_process_stops_without_signal(self):
-        root = self.process(9, 0, 90)
+    def test_foreign_process_stops_before_content_read(self):
+        run = self.run_object()
+        run.daemon = self.process(9, 0, 90)
         self.process(1, 0, 10)
-        foreign = self.process(2, 1, 20)
-        with mock.patch.object(signal, "pidfd_send_signal") as send, self.assertRaisesRegex(Blocked, "foreign"):
-            Proc(self.root).own(foreign, root)
-        send.assert_not_called()
+        self.process(2, 1, 20)
+        proc = Proc(self.root)
+        status = {"progress": {"running_tools": ["fake"]}, "turns": [{"state": "completed"}]}
+        with mock.patch(__name__ + ".Proc", return_value=proc), \
+             mock.patch.object(proc, "content") as content, \
+             mock.patch.object(os, "listdir", return_value=["2"]), \
+             mock.patch.object(run, "via_call", return_value=(0, status, None)), \
+             self.assertRaisesRegex(Blocked, "not observable"):
+            run.observe_tool("fake", "foreign-marker")
+        content.assert_not_called()
 
     def test_owned_identity_and_descriptor_read(self):
         root = self.process(1, 0, 10)
@@ -1692,14 +2352,15 @@ class SafetyTests(unittest.TestCase):
     def test_credential_metadata_never_reads(self):
         target = self.root / "auth.json"
         target.touch(mode=0o600)
-        with mock.patch("builtins.open", side_effect=AssertionError("credential read")):
+        with mock.patch("builtins.open", side_effect=AssertionError("credential read")), \
+             mock.patch.object(os, "open", side_effect=AssertionError("credential read")):
             self.assertTrue(credential_metadata(self.root)["private_mode"])
         target.chmod(0o644)
         with self.assertRaises(Blocked):
             credential_metadata(self.root)
 
     def test_credential_location_survives_private_runner_home(self):
-        with mock.patch.dict(os.environ, {"HOME": str(self.root / "private-home")}), \
+        with mock.patch.dict(os.environ, {"HOME": str(self.root / "private-home"), "CODEX_HOME": ""}), \
              mock.patch.object(pwd, "getpwuid", return_value=argparse.Namespace(pw_dir=str(self.root))):
             run = self.run_object()
         self.assertEqual(run.owner_codex, self.root / ".codex")
@@ -1744,11 +2405,11 @@ class SafetyTests(unittest.TestCase):
             Wire("0.160.1").outgoing(self.start_message())
 
     def test_proxy_spending_cap(self):
-        wire = Wire("0.160.1")
-        wire.inventory = True
+        wire = self.owned_wire()
+        wire.starts = 0
         for number in range(TURN_LIMIT):
             message = self.start_message()
-            message["id"] = number
+            message["id"] = number + 100
             wire.outgoing(message)
         with self.assertRaisesRegex(Blocked, "spending control"):
             wire.outgoing({**self.start_message(), "id": TURN_LIMIT})
@@ -1761,16 +2422,16 @@ class SafetyTests(unittest.TestCase):
             wire.outgoing(message)
 
     def test_no_grant_and_wrong_grant_stop(self):
-        wire = Wire("0.160.1")
-        wire.incoming({"id": 1, "method": "item/commandExecution/requestApproval", "params": {}})
+        wire = self.owned_wire()
+        wire.incoming({"id": 1, "method": "item/commandExecution/requestApproval", "params": {"threadId": "t", "turnId": "u"}})
         with self.assertRaisesRegex(Blocked, "granted"):
             wire.outgoing({"id": 1, "result": {"decision": "accept"}})
-        wire.incoming({"id": 2, "method": "item/fileChange/requestApproval", "params": {}})
+        wire.incoming({"id": 2, "method": "item/fileChange/requestApproval", "params": {"threadId": "t", "turnId": "u"}})
         fact = wire.outgoing({"id": 2, "result": {"decision": "decline"}})
         self.assertTrue(fact["no_grant"])
 
     def test_usage_provenance_fixture(self):
-        wire = Wire("0.160.1")
+        wire = self.owned_wire()
         sample = {"inputTokens": 3, "cachedInputTokens": 1, "outputTokens": 2,
                   "reasoningOutputTokens": 1, "totalTokens": 5}
         message = {"method": "thread/tokenUsage/updated", "params": {
@@ -1798,7 +2459,7 @@ class SafetyTests(unittest.TestCase):
         message = {"method": "item/started", "params": {"threadId": "t", "turnId": "u",
                    "item": {"type": "collabAgentToolCall"}}}
         with self.assertRaisesRegex(Blocked, "background agent"):
-            Wire("0.160.1").incoming(message)
+            self.owned_wire().incoming(message)
 
     def test_bound_proof_requires_the_exact_command(self):
         run = self.run_object()
@@ -1807,12 +2468,14 @@ class SafetyTests(unittest.TestCase):
                          digest("printf tightened > denied.txt"))
         unrelated = {"kind": "tool", "finished": True, "exit_code": 1,
                      "read_only_error": True, "command_hash": digest("unrelated failing command")}
-        with mock.patch(__name__ + ".turn_facts", return_value=[unrelated]), \
-             self.assertRaisesRegex(Blocked, "exact command"):
-            exact_command(run, envelope, "printf tightened > denied.txt")
+        target = self.root / "absent"
+        with mock.patch(__name__ + ".turn_facts", return_value=[unrelated]):
+            denied_write_observation(run, envelope, "printf tightened > denied.txt", target)
+        self.assertFalse(run.record_only[-1]["exact_command_refusal_visible"])
         unrelated["command_hash"] = digest("printf tightened > denied.txt")
         with mock.patch(__name__ + ".turn_facts", return_value=[unrelated]):
-            self.assertEqual(exact_command(run, envelope, "printf tightened > denied.txt"), unrelated)
+            denied_write_observation(run, envelope, "printf tightened > denied.txt", target)
+        self.assertTrue(run.record_only[-1]["exact_command_refusal_visible"])
 
     def test_missing_command_is_not_evidence(self):
         with self.assertRaisesRegex(Blocked, "unverifiable"):
@@ -1852,7 +2515,8 @@ class SafetyTests(unittest.TestCase):
                 usage(run)
 
     async def proxy_fixture(self, nonempty=False, identity_error=False, pidfd_error=False,
-                            termination=False, foreign=False, reused=False):
+                            termination=False, foreign=False, reused=False, after_signal=False,
+                            config=None, executable_mismatch=False, duplicate_config=False):
         """Entire stdio exchange using fake transports; no process or real /proc."""
         binary = self.root / "fake-codex"
         binary.write_text("synthetic executable")
@@ -1866,6 +2530,11 @@ class SafetyTests(unittest.TestCase):
                    "model": MODEL, "version": "0.160.1", "codex_home": str(self.root),
                    "mcp_names": [], "trace_dir": str(traces)}
         upstream, native = asyncio.StreamReader(), asyncio.StreamReader()
+        if executable_mismatch:
+            other = self.root / "changed-native"
+            other.write_text("untrusted native replacement")
+            (self.root / "2/exe").unlink()
+            (self.root / "2/exe").symlink_to(other)
         child = mock.Mock(pid=2, returncode=None, stdout=native)
         sent = []
 
@@ -1873,10 +2542,18 @@ class SafetyTests(unittest.TestCase):
             request = decode_line(raw)
             sent.append(request["method"])
             result = {"initialize": {"userAgent": "via/0.160.1"},
-                      "mcpServerStatus/list": {"data": [{}] if nonempty else [], "nextCursor": None},
+                      "config/read": {"config": {"features": {key: False for key in
+                          ("apps", "plugins", "memories", "hooks")}, "notify": [],
+                          "model_provider": "openai", "profile": None, "model_providers": {},
+                          "otel": None, "mcp_servers": {"foreign": {"enabled": True}} if nonempty else {}}},
                       "model/list": {"data": [], "nextCursor": None}}.get(request["method"])
+            if request["method"] == "config/read" and config is not None:
+                result = config
             if result is not None:
-                native.feed_data(json.dumps({"id": request["id"], "result": result}).encode() + b"\n")
+                raw_reply = json.dumps({"id": request["id"], "result": result}).encode() + b"\n"
+                native.feed_data(raw_reply)
+                if request["method"] == "config/read" and duplicate_config:
+                    native.feed_data(raw_reply)
 
         async def forwarded(raw):
             response = decode_line(raw)
@@ -1885,9 +2562,12 @@ class SafetyTests(unittest.TestCase):
                                    b'{"id":2,"method":"model/list","params":{}}\n')
             elif response["id"] == 2:
                 if termination:
-                    handler = signal.getsignal(signal.SIGTERM)
+                    sig = termination if type(termination) is signal.Signals else signal.SIGTERM
+                    handler = signal.getsignal(sig)
                     self.assertTrue(callable(handler), "proxy must defer Host TERM")
-                    handler(signal.SIGTERM, None)
+                    handler(sig, None)
+                    if after_signal:
+                        upstream.feed_data(json.dumps(self.start_message()).encode() + b"\n")
                 upstream.feed_eof()
 
         async def connect(factory, pipe):
@@ -1929,7 +2609,7 @@ class SafetyTests(unittest.TestCase):
     def test_proxy_complete_fake_exchange(self):
         result, child, signals, sent, traces = asyncio.run(self.proxy_fixture())
         self.assertEqual(result, 0)
-        self.assertEqual(sent, ["initialize", "initialized", "mcpServerStatus/list", "model/list"])
+        self.assertEqual(sent, ["initialize", "initialized", "config/read", "model/list"])
         facts = [decode_line(line) for line in next(traces.iterdir()).read_bytes().splitlines(keepends=True)]
         self.assertTrue(facts[-1]["complete"] and facts[-1]["child_reaped"])
         self.assertTrue(secret_free(facts))
@@ -1979,6 +2659,7 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(result, 0)
         facts = [decode_line(line) for line in next(traces.iterdir()).read_bytes().splitlines(keepends=True)]
         self.assertTrue(facts[-1]["complete"] and facts[-1]["child_reaped"])
+        self.assertEqual(facts[-1]["termination_signal"], "SIGTERM")
 
     def test_cli_wrong_model_never_starts_process(self):
         with mock.patch.object(subprocess, "run") as called, \
