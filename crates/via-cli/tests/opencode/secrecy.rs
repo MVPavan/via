@@ -85,21 +85,31 @@ fn private_config(path: &Path, secrets: &Value) -> Result<(), ScenarioError> {
 #[cfg(target_os = "linux")]
 fn password(case: &Case, scan: &mut Scan) -> Result<(), ScenarioError> {
     let reports = case.reports()?;
-    let pid = reports
-        .last()
-        .and_then(|report| report["pid"].as_u64())
-        .ok_or_else(|| failure("owned fake server PID missing"))?;
-    let environment = fs::read(format!("/proc/{pid}/environ"))
-        .map_err(|_| failure("owned fake environment unreadable"))?;
-    let password = environment
-        .split(|byte| *byte == 0)
-        .find_map(|entry| entry.strip_prefix(b"OPENCODE_PASSWORD="))
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| failure("owned fake password missing"))?;
-    scan.add(password.to_vec())?;
-    let argv = fs::read(format!("/proc/{pid}/cmdline"))
-        .map_err(|_| failure("owned fake argv unreadable"))?;
-    scan.bytes(&argv)?;
+    if reports.is_empty() {
+        return Err(failure("owned fake server reports missing"));
+    }
+    let mut arguments = Vec::new();
+    for report in &reports {
+        let pid = report["pid"]
+            .as_u64()
+            .ok_or_else(|| failure("owned fake server PID missing"))?;
+        let environment = fs::read(format!("/proc/{pid}/environ"))
+            .map_err(|_| failure("owned fake environment unreadable"))?;
+        let password = environment
+            .split(|byte| *byte == 0)
+            .find_map(|entry| entry.strip_prefix(b"OPENCODE_PASSWORD="))
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| failure("owned fake password missing"))?;
+        scan.add_password(password)?;
+        arguments.push(
+            fs::read(format!("/proc/{pid}/cmdline"))
+                .map_err(|_| failure("owned fake argv unreadable"))?,
+        );
+    }
+    // Every report/argv is checked against every collected password representation.
+    for argv in arguments {
+        scan.bytes(&argv)?;
+    }
     for report in reports {
         scan.value(&report)?;
     }
@@ -111,6 +121,36 @@ fn password(_case: &Case, _scan: &mut Scan) -> Result<(), ScenarioError> {
     Err(failure(
         "password scan requires the Linux fake qualification host",
     ))
+}
+
+/// OC12/`OC12b` scan roots; fake stimuli are outside VIA-owned surfaces (§4.3).
+fn file_surfaces(case: &Case, artifact: &Path, scan: &Scan) -> Result<(), ScenarioError> {
+    scan.tree(case.state())?;
+    scan.tree(case.runtime())?;
+    scan.tree(&case.home())?;
+    scan.tree(artifact)
+}
+
+/// §4.3: a planted secret in runtime, HOME or TMPDIR must fail the actual surface scan.
+#[test]
+fn oc12b_file_scan_covers_runtime_home_and_tmpdir() -> TestResult {
+    let case = Case::new()?;
+    let needle = b"synthetic-surface-only-provider-sentinel";
+    let scan = Scan::new(vec![needle.to_vec()]);
+    for file in [
+        case.cwd("runtime/probe"),
+        case.cwd("home/probe"),
+        case.cwd("home/tmp/probe"),
+    ] {
+        fs::write(&file, needle)?;
+        assert!(
+            file_surfaces(&case, case.state(), &scan).is_err(),
+            "planted secret in an owned directory escaped the scan"
+        );
+        fs::remove_file(file)?;
+        assert!(file_surfaces(&case, case.state(), &scan).is_ok());
+    }
+    Ok(())
 }
 
 fn surfaces(
@@ -144,8 +184,7 @@ fn surfaces(
         scan.value(&call(raw, "logs", &json!({"session":session}))?)?;
     }
     case.collect(evidence)?;
-    scan.tree(case.state())?;
-    scan.tree(&evidence.dir)?;
+    file_surfaces(case, &evidence.dir, scan)?;
     if case.requests()?.iter().any(|request| {
         request["target"].as_str().is_some_and(|target| {
             target.starts_with("/api/config")
@@ -238,6 +277,7 @@ fn oc12b_two_locations_provider_secrets_and_oc12_password_absent_from_daemon_sur
     case.fixture(&fixture)?;
     case.scenario_scanned(
         "oc12b_two_locations_and_password",
+        true,
         |case, evidence, raw| {
             let mut sessions = Vec::new();
             for location in ["a", "b"] {
@@ -254,11 +294,28 @@ fn oc12b_two_locations_provider_secrets_and_oc12_password_absent_from_daemon_sur
             password(case, &mut scan.borrow_mut())?;
             surfaces(case, evidence, raw, &sessions, &scan.borrow(), true)
         },
-        |case, artifact| {
-            scan.borrow().tree(case.state())?;
-            scan.borrow().tree(artifact)
-        },
+        |case, artifact| file_surfaces(case, artifact, &scan.borrow()),
     )
+}
+
+/// Expected rejection outcomes follow `opencode.md` §2.2, §9 and §10.
+fn rejected_outcome(envelope: &Value, kind: &str) -> Result<(), ScenarioError> {
+    let (state, class, reason) = match kind {
+        "http-malformed" | "http-truncated" => ("failed", "submit_failed", Some("launch_failed")),
+        "http-oversize" => ("failed", "protocol", None),
+        "sse-oversize" => ("failed", "overflow", None),
+        "sse-unterminated" => ("unknown", "", None),
+        _ => return Err(failure("unknown secrecy fixture kind")),
+    };
+    let failure_data = &envelope["failure"];
+    if envelope["state"] != state
+        || failure_data["class"].as_str().unwrap_or_default() != class
+        || failure_data["data"]["reason"].as_str() != reason
+        || (state == "unknown" && !failure_data.is_null())
+    {
+        return Err(failure("malformed secrecy fixture had the wrong outcome"));
+    }
+    Ok(())
 }
 
 /// Raw-body fixtures put synthetic bytes first, before malformed or excessive input (§13 `OC12b`).
@@ -269,6 +326,7 @@ fn rejected_payload(name: &str, kind: &str) -> TestResult {
     strings(&synthetic, &mut needles);
     let scan = Scan::new(needles);
     let secret_prefix = synthetic.to_string();
+    let expected_partial_bytes = b"data: ".len() + secret_prefix.len();
     let mut fixture = fixtures::server(&case.cwd("a"));
     match kind {
         "http-malformed" => {
@@ -322,12 +380,21 @@ fn rejected_payload(name: &str, kind: &str) -> TestResult {
     case.fixture(&fixture)?;
     case.scenario_scanned(
         name,
+        true,
         |case, evidence, raw| {
             let session = spawn(raw, &case.cwd("a"), &json!({}))?;
             let envelope = wait_turn(raw, &session, 1)?;
             scan.value(&envelope)?;
-            if envelope["state"] == "completed" {
-                return Err(failure("malformed secrecy fixture unexpectedly completed"));
+            rejected_outcome(&envelope, kind)?;
+            if kind == "sse-unterminated"
+                && !case.audit("frames")?.iter().any(|frame| {
+                    frame["raw_chunk_bytes"].as_u64() == Some(expected_partial_bytes as u64)
+                        && frame["terminated"] == false
+                })
+            {
+                return Err(failure(
+                    "unterminated SSE fixture did not write its partial frame",
+                ));
             }
             let endpoint = if kind.starts_with("http-") {
                 "/api/model".to_owned()
@@ -345,10 +412,7 @@ fn rejected_payload(name: &str, kind: &str) -> TestResult {
             }
             surfaces(case, evidence, raw, &[session], &scan, false)
         },
-        |case, artifact| {
-            scan.tree(case.state())?;
-            scan.tree(artifact)
-        },
+        |case, artifact| file_surfaces(case, artifact, &scan),
     )
 }
 

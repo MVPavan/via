@@ -56,6 +56,7 @@ fn oc01_daemon_version_probe_refusal_is_bounded_and_cached() -> TestResult {
     case.fixture(&fixture)?;
     case.scenario(
         "oc01_daemon_version_probe_refusal",
+        false,
         |case, evidence, raw| {
             let session = spawn(raw, &cwd, &json!({"allow_untested":true}))?;
             let envelope = wait_turn(raw, &session, 1)?;
@@ -80,7 +81,9 @@ fn oc01_daemon_version_probe_refusal_is_bounded_and_cached() -> TestResult {
                     "bound":{"mode":"full","extra_write_dirs":[],"network":true}}),
             )?;
             check(
-                cached["error"]["data"]["reason"] == "handshake_refused",
+                cached["error"]["code"] == -32009
+                    && cached["error"]["data"]["kind"] == "harness_unavailable"
+                    && cached["error"]["data"]["reason"] == "handshake_refused",
                 "Version refusal was not cached by binary identity",
             )?;
             check(
@@ -93,6 +96,8 @@ fn oc01_daemon_version_probe_refusal_is_bounded_and_cached() -> TestResult {
 }
 
 /// OC01 §2.2: the server's unchecked version reaches the public envelope after retirement.
+/// Cache and immediate replaced-binary admission run through the real adapter in Core's
+/// `conformance_opencode::oc01_an_unchecked_version_is_refused_and_cached_by_binary`.
 #[test]
 fn oc01_daemon_info_refusal_names_found_version_and_checked_set() -> TestResult {
     let case = Case::new()?;
@@ -105,7 +110,7 @@ fn oc01_daemon_info_refusal_names_found_version_and_checked_set() -> TestResult 
             json!([{"status":200,"json":{"version":"2.0.23","pid":"$PID"}}]),
         ),
     ))?;
-    case.scenario("oc01_daemon_info_refusal", |case, evidence, raw| {
+    case.scenario("oc01_daemon_info_refusal", true, |case, evidence, raw| {
         let session = spawn(raw, &cwd, &json!({}))?;
         let envelope = wait_turn(raw, &session, 1)?;
         failed(&envelope, "handshake_refused")?;
@@ -133,23 +138,27 @@ fn oc01_daemon_probe_launch_failure_is_not_cached() -> TestResult {
     let mut fixture = fixtures::server(&cwd);
     fixture["version"] = json!({"output":"opencode v2.0.22","code":3});
     case.fixture(&fixture)?;
-    case.scenario("oc01_daemon_probe_launch_failure", |case, evidence, raw| {
-        let session = spawn(raw, &cwd, &json!({}))?;
-        let envelope = wait_turn(raw, &session, 1)?;
-        failed(&envelope, "launch_failed")?;
-        check(case.reports()?.is_empty(), "Failed probe launched a server")?;
-        case.fixture(&fixtures::server(&cwd))?;
-        let next = spawn(raw, &cwd, &json!({}))?;
-        check(
-            wait_turn(raw, &next, 1)?["state"] == "completed",
-            "Transient probe failure was cached",
-        )?;
-        check(
-            case.versions()?.len() == 2,
-            "Retry did not perform its own probe",
-        )?;
-        record(evidence, &envelope)
-    })
+    case.scenario(
+        "oc01_daemon_probe_launch_failure",
+        true,
+        |case, evidence, raw| {
+            let session = spawn(raw, &cwd, &json!({}))?;
+            let envelope = wait_turn(raw, &session, 1)?;
+            failed(&envelope, "launch_failed")?;
+            check(case.reports()?.is_empty(), "Failed probe launched a server")?;
+            case.fixture(&fixtures::server(&cwd))?;
+            let next = spawn(raw, &cwd, &json!({}))?;
+            check(
+                wait_turn(raw, &next, 1)?["state"] == "completed",
+                "Transient probe failure was cached",
+            )?;
+            check(
+                case.versions()?.len() == 2,
+                "Retry did not perform its own probe",
+            )?;
+            record(evidence, &envelope)
+        },
+    )
 }
 
 /// OC01 §2.2: /api/model 503 is transient, not retried within the acquisition or cached.
@@ -165,7 +174,7 @@ fn oc01_daemon_catalog_503_is_not_retried_or_cached() -> TestResult {
             json!([{"status":503,"json":{"untrusted":"opaque vendor failure"}}]),
         ),
     ))?;
-    case.scenario("oc01_daemon_catalog_503", |case, evidence, raw| {
+    case.scenario("oc01_daemon_catalog_503", true, |case, evidence, raw| {
         let session = spawn(raw, &cwd, &json!({}))?;
         let envelope = wait_turn(raw, &session, 1)?;
         failed(&envelope, "launch_failed")?;
@@ -208,31 +217,35 @@ fn oc02_daemon_credential_refusal_names_only_integration_ids() -> TestResult {
             {"id":"plain","connections":[]}]}}]),
         ),
     ))?;
-    case.scenario("oc02_daemon_credential_refusal", |case, evidence, raw| {
-        let session = spawn(raw, &cwd, &json!({}))?;
-        let envelope = wait_turn(raw, &session, 1)?;
-        failed(&envelope, "launch_failed")?;
-        let detail = message(&envelope);
-        check(
-            detail.contains("check credential state")
-                && detail.contains("acme-cloud")
-                && detail.contains("other")
-                && !detail.contains("plain")
-                && !detail.contains("IGNORED"),
-            "Credential refusal did not preserve the VIA-owned step and integration IDs",
-        )?;
-        check(
-            request_count(case, "POST", "/api/session")? == 0,
-            "A credential-refused server created a session",
-        )?;
-        case.fixture(&fixtures::server(&cwd))?;
-        let next = spawn(raw, &cwd, &json!({}))?;
-        check(
-            wait_turn(raw, &next, 1)?["state"] == "completed",
-            "Credential-state refusal was cached",
-        )?;
-        record(evidence, &envelope)
-    })
+    case.scenario(
+        "oc02_daemon_credential_refusal",
+        true,
+        |case, evidence, raw| {
+            let session = spawn(raw, &cwd, &json!({}))?;
+            let envelope = wait_turn(raw, &session, 1)?;
+            failed(&envelope, "launch_failed")?;
+            let detail = message(&envelope);
+            check(
+                detail.contains("check credential state")
+                    && detail.contains("acme-cloud")
+                    && detail.contains("other")
+                    && !detail.contains("plain")
+                    && !detail.contains("IGNORED"),
+                "Credential refusal did not preserve the VIA-owned step and integration IDs",
+            )?;
+            check(
+                request_count(case, "POST", "/api/session")? == 0,
+                "A credential-refused server created a session",
+            )?;
+            case.fixture(&fixtures::server(&cwd))?;
+            let next = spawn(raw, &cwd, &json!({}))?;
+            check(
+                wait_turn(raw, &next, 1)?["state"] == "completed",
+                "Credential-state refusal was cached",
+            )?;
+            record(evidence, &envelope)
+        },
+    )
 }
 
 /// OC02 §4.3: an unknown integration shape proceeds and warns on its public envelope.
@@ -252,6 +265,7 @@ fn oc02_daemon_unknown_credential_shape_warns_and_proceeds() -> TestResult {
     ))?;
     case.scenario(
         "oc02_daemon_unknown_credential_shape",
+        true,
         |_, evidence, raw| {
             let session = spawn(raw, &cwd, &json!({}))?;
             let envelope = wait_turn(raw, &session, 1)?;

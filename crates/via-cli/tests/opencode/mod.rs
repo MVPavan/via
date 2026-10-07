@@ -19,8 +19,8 @@ use crate::scenario::{ScenarioError, run_scenario};
 use crate::support::evidence::Evidence;
 
 const HANDLE: &str = crate::HANDLE;
-/// C1 §3.6: a bounded daemon wait, covering the fake's handshake and terminal.
-const WAIT_MS: u32 = 30_000;
+/// C1 §3.6: the wait matches `Raw::open_at`'s 10 s socket read timeout.
+const WAIT_MS: u32 = 10_000;
 
 /// One private daemon and fake deployment (opencode.md §13, fakes only).
 struct Case {
@@ -70,6 +70,14 @@ impl Case {
     }
     fn vendor(&self) -> &Path {
         &self.vendor
+    }
+
+    fn runtime(&self) -> &Path {
+        &self.sandbox.runtime
+    }
+
+    fn home(&self) -> PathBuf {
+        self.root.join("home")
     }
 
     fn namespace(&self) -> PathBuf {
@@ -131,14 +139,16 @@ impl Case {
     fn scenario(
         &self,
         name: &str,
+        folders_expected: bool,
         action: impl FnOnce(&Self, &Evidence, &mut Raw) -> Result<(), ScenarioError>,
     ) -> TestResult {
-        self.scenario_scanned(name, action, |_, _| Ok(()))
+        self.scenario_scanned(name, folders_expected, action, |_, _| Ok(()))
     }
 
     fn scenario_scanned(
         &self,
         name: &str,
+        folders_expected: bool,
         action: impl FnOnce(&Self, &Evidence, &mut Raw) -> Result<(), ScenarioError>,
         after: impl Fn(&Self, &Path) -> Result<(), ScenarioError>,
     ) -> TestResult {
@@ -146,7 +156,7 @@ impl Case {
         let stimulus = self.root.join("opencode-stimulus.json");
         fs::copy(self.program.with_extension("opencode.json"), &stimulus)?;
         let mut evidence = Evidence::new(name, &self.sandbox.fake, &stimulus)?;
-        evidence.folders_expected = name != "oc01_daemon_version_probe_refusal";
+        evidence.folders_expected = folders_expected;
         evidence.write("envelopes.ndjson", b"")?;
         evidence.write("events.ndjson", b"")?;
         let report = run_scenario(
