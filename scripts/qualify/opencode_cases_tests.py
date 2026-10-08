@@ -266,8 +266,8 @@ class CasesTests(unittest.TestCase):
         return FakeDriver({"set_inherit": None, "fixture": "fixture", "turn": result,
                            "lsp_probe": self.lsp_proof(spawned),
                            "permission_observations": {"attempts": [{"callID": "call_denied",
-                               "child_session": "ses_child", "deny_rule": True, "asked": False,
-                               "disposition": "action.denied"}], "unhandled_asks": 0},
+                               "child_session": "ses_child", "deny_rule": True, "asked": True,
+                               "reply": "reject", "settled": True, "decline_ms": None}], "unhandled_asks": 0},
                            "helper_observations": {"mcp_started": True, "plugin_started": True,
                                "hook_started": True, "fake_lsp_started": spawned,
                                "package_inventory_clean": True, "binary_inventory_clean": True}})

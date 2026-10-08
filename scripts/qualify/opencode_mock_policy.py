@@ -6,7 +6,7 @@ COMPACTION_TEMPLATE_OFFSET = 145633783
 TITLE_ATTEMPTS = 2
 BOOTSTRAP_REQUESTS = 2
 REQUEST_MARGIN = 2
-HOSTILE_PRIMARY_ATTEMPTS = {'error':11,'malformed':1,'oversized':1,'truncated':11,'auth':1}
+HOSTILE_PRIMARY_ATTEMPTS = {'error':11,'malformed':1,'oversized':1,'truncated':11}
 HOSTILE_PHASE_REQUESTS = 2 * sum(HOSTILE_PRIMARY_ATTEMPTS[name] + TITLE_ATTEMPTS
     + BOOTSTRAP_REQUESTS + REQUEST_MARGIN for name in ('error','malformed','oversized','truncated'))
 NATIVE_SSE_PENDING_BYTES = 10485760  # §13 L4: pinned upstream cap at byte 144448787.

@@ -256,7 +256,7 @@ class ProcReader:
             raise Blocked("owned process identity changed")
 
     def read(self, identity, name, limit=PROC_BYTES):
-        if name not in {"environ", "cmdline", "status", "stat", "net/tcp"} \
+        if name not in {"environ", "cmdline", "status", "stat", "comm", "net/tcp"} \
                 and not (name.startswith("fdinfo/") and name[7:].isdigit()):
             raise Blocked("unapproved proc read")
         with self.opened(identity) as fd:
@@ -1289,9 +1289,17 @@ class Inventory:
     def _snapshot(self):
         entries, binaries = 0, {}
         self.snapshot_metadata={}
-        for index, root in enumerate(self.roots):
+        roots=[]
+        for index,original in enumerate(self.roots):
+            root=original.absolute()
             if not root.is_dir() or root.is_symlink():
                 raise Blocked("inventory root unavailable or unsafe")
+            if root not in {path for _index,path in roots}:roots.append((index,root))
+        # §13: count each owned path once. Validate every supplied root first;
+        # the outermost traversal still inspects every nested binary/package.
+        roots=[(index,root) for index,root in roots
+               if not any(root!=other and root.is_relative_to(other) for _i,other in roots)]
+        for index,root in roots:
             def unreadable(error):
                 # A gone child cannot hold a current artifact. Missing baseline
                 # binaries still differ in check(); the root must remain readable.

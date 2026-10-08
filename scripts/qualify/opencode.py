@@ -53,7 +53,7 @@ TEST_MODULES = ("opencode_safety_tests", "opencode_cases_tests", "opencode_drive
                 "opencode_barrier_tests", "opencode_runtime_tests", "opencode_tests", "opencode_ownership_tests", "opencode_via_tests",
                 "opencode_reply_tests", "opencode_review_tests", "opencode_config_tests", "opencode_isolation_tests",
                 "opencode_event_tests", "opencode_runroot_tests", "opencode_daemon_tests", "opencode_c1_tests",
-                "opencode_diagnostic_tests", "opencode_round31_tests")
+                "opencode_diagnostic_tests", "opencode_round31_tests", "opencode_lockscan_tests", "opencode_round44_tests")
 _ACQUISITION_ROOT = None
 
 
@@ -432,6 +432,9 @@ def main(argv=None):
                             public_free=not bool(diagnostic_selection), initialize=False, ownership=ownership,git_templates=templates,run_root=run_root,
                             diagnostic_mock_only=bool(diagnostic_selection))
             driver.diagnostic_mock_only=bool(diagnostic_selection)
+            own=safety.ProcReader().stat(os.getpid())
+            if own is None:raise safety.Blocked('runner process birth unverifiable')
+            driver._run_start_ticks=own['start_ticks']
             vault = driver.vault
             driver.fake_gate_manifest = fake_gates
             # A fresh evidence path must still find the previous stopped-daemon
@@ -564,7 +567,7 @@ def main(argv=None):
                 vault.clear()
     print(json.dumps({key: info[key] for key in ("result", "gate_count", "gate_passed")},
                      sort_keys=True))
-    return 0 if info["result"] in {"pass","diagnostic_pass"} else 1
+    return 0 if info["result"]=='pass' else 4 if info["result"]=='diagnostic_pass' else 1
 
 
 if __name__ == "__main__":

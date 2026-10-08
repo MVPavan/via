@@ -1318,6 +1318,7 @@ def case_never_ask(driver: CaseDriver, case: Case) -> None:
         else:
             case.check("attempt denied or unavailable", member(attempt, "disposition", str)
                        in {"action.denied", "tool_unavailable"})
+    case.check("actual child ask rejected by VIA", any(member(attempt,"asked",bool) for attempt in attempts))
     case.check("no unattributed unhandled ask", member(observation, "unhandled_asks", int) == 0)
     helpers = driver.execute("helper_observations")
     for key in ("mcp_started", "plugin_started", "hook_started",
@@ -1761,12 +1762,12 @@ OC_DISPOSITIONS = {
 
 L_DISPOSITIONS = {
     "L1": ("deferred-with-reason", "collision", 0), "L2": ("gate", "write_cancel", 2),
-    "L3": ("gate", "foreign", 1), "L4": ("gate", "hostile_provider", 8),
+    "L3": ("gate", "foreign", 1), "L4": ("gate", "hostile_provider", HOSTILE_PHASE_REQUESTS),
     "L5": ("gate", "never_ask", 1), "L6": ("deferred-with-reason", "forms", 0),
     "L7": ("record-only", "compaction", 3), "L8": ("record-only", "error_shapes", 9),
     "L9": ("record-only", "long_run", 32), "L10": ("deferred-with-reason", "macos", 0),
     "L11": ("gate", "credential_shape", 1), "L12": ("deferred-with-reason", "other", 0),
-    "L14": ("gate", "anchor", 32),
+    "L14": ("gate", "anchor", ANCHOR_PHASE_REQUESTS),
 }
 
 CASES = {

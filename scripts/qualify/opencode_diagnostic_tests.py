@@ -18,6 +18,65 @@ from opencode_safety_tests import fake_cli_generation
 
 
 class DiagnosticTests(unittest.TestCase):
+    def test_diagnostic_success_has_a_distinct_nonzero_main_exit(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory(dir=opencode.SCRATCHPAD) as folder:
+            root=Path(folder);work=root/'private';work.mkdir(mode=0o700)
+            args=SimpleNamespace(self_test=False,phase=[],evidence=root/'evidence',acquire=False,
+                opencode=root/'FAKE-pin',via_release=root/'release',via_failpoints=root/'fp',
+                fake_gate_manifest=root/'manifest',diagnostic_mock_case=['usage'])
+            class Driver:
+                def __init__(self,**_kwargs):
+                    self.vault=safety.PasswordVault();self.proc=safety.ProcReader(root/'proc')
+                def prepare(self):pass
+                def observe(self,*_args):return {}
+                def finish(self):return {'proven':True,'stopped':True}
+                def clear_sensitive(self):pass
+            def phase(_adapter,name,**_kwargs):
+                return [{'case':'preflight' if name=='preflight' else 'usage',
+                         'disposition':'gate','result':'pass','checks':[]}]
+            with mock.patch.object(opencode,'arguments',return_value=args), \
+                 mock.patch.object(opencode,'self_test',return_value=([],1)), \
+                 mock.patch.object(opencode,'verify_fake_gates',return_value={}), \
+                 mock.patch.object(opencode,'system_tools_preflight',return_value={}), \
+                 mock.patch.object(opencode,'private_recovery_root',return_value=root), \
+                 mock.patch.object(opencode.runroots,'create_run_root',return_value=work), \
+                 mock.patch.object(opencode.runroots,'check_ancestors',return_value={}), \
+                 mock.patch.object(opencode.runroots,'discovery_strings',return_value={}), \
+                 mock.patch.object(opencode.runroots,'remove_run_root',return_value={'removed':True}), \
+                 mock.patch.object(safety,'system_git_templates',return_value=({},{})), \
+                 mock.patch.object(safety,'verify_binary'),mock.patch.object(runtime,'Driver',Driver), \
+                 mock.patch.object(cases,'run_phase',side_effect=phase),contextlib.redirect_stdout(io.StringIO()):
+                rc=opencode.main([])
+            summary=json.loads((args.evidence/'summary.json').read_text())
+            self.assertEqual(summary['result'],'diagnostic_pass')
+            self.assertEqual(summary['runner_source'],opencode.runner_source_manifest())
+            self.assertEqual(rc,4)
+
+    def test_redaction_blocks_casefolded_and_repeated_url_encoded_root_leftovers(self):
+        import urllib.parse
+        from opencode_diagnostic import redact
+        root=Path('/FAKE/private/run-root')
+        for text in (str(root).upper(),urllib.parse.quote(str(root),safe='').lower(),
+                     urllib.parse.quote(urllib.parse.quote(str(root),safe=''),safe='')):
+            with self.subTest(text=text),self.assertRaisesRegex(safety.Blocked,'run root'):
+                redact(text,root)
+
+    def test_mock_log_lines_name_session_or_location_context_association(self):
+        from opencode_diagnostic import capture
+        from opencode_ownership import OwnershipRegistry
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);work=root/'private';work.mkdir();evidence=root/'evidence';evidence.mkdir()
+            owned=OwnershipRegistry(evidence);owned.register(work,'vendor-private')
+            project=work/'project'
+            (work/'opencode.log').write_text('INFO location services booted directory='+str(project)+'\n'
+                'ERROR FAKE location failure\nERROR sessionID=ses_FAKE_enrolled FAKE session failure\n'
+                'ERROR sessionID=ses_FAKE_foreign NEVER_RETAIN_FOREIGN\n')
+            rows=capture(work,owned,{'ses_FAKE_enrolled':{'model':safety.MOCK_IDENTITY,'project':project}})
+            self.assertEqual([row.get('association') for row in rows['log_lines']],
+                             ['location-context','session-id'])
+            self.assertNotIn('NEVER_RETAIN_FOREIGN',json.dumps(rows))
+
     def test_url_encoded_run_root_is_redacted(self):
         import urllib.parse
         from opencode_diagnostic import redact

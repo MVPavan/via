@@ -16,6 +16,7 @@ MOCK_CASES={'usage':'ledger','compaction':'ledger','config':'isolation',
             'credential_shape':'credentials'}
 DIAGNOSTIC_BYTES=1024*1024  # §13: error/log text is bounded separately from payloads.
 DIAGNOSTIC_ROWS=1024  # §13: only enrolled mock-session failures, no database dump.
+DIAGNOSTIC_DECODE_ROUNDS=4  # §13: bound the write-time encoded-root check.
 
 
 def exception_sites(error):
@@ -59,12 +60,23 @@ def redact(text,root,replacements=()):
         pairs.extend((form,b'<redacted>') for form in forms)
     for value,replacement in sorted(pairs,key=lambda pair:(-len(pair[0]),pair[0])):
         raw=raw.replace(value,replacement)
-    return raw.decode('utf-8','replace')
+    result=raw.decode('utf-8','replace');decoded=result
+    for _ in range(DIAGNOSTIC_DECODE_ROUNDS):
+        if root_text.casefold() in decoded.casefold():
+            raise safety.Blocked('mock diagnostic run root remains after redaction')
+        following=urllib.parse.unquote(decoded)
+        if following==decoded:return result
+        decoded=following
+    if root_text.casefold() in decoded.casefold():
+        raise safety.Blocked('mock diagnostic run root remains after redaction')
+    if urllib.parse.unquote(decoded)!=decoded:
+        raise safety.Blocked('mock diagnostic run root decoding unverifiable')
+    return result
 
 
 def capture(root,ownership,sessions,*,replacements=()):
     """Read only errors/log windows for enrolled, verified mock identities (§13)."""
-    from opencode_runroot import _regular, _diagnostic
+    from opencode_runroot import _regular, _diagnostic, NATIVE_BYTES
     root=Path(root)
     for sid,row in sessions.items():
         if type(sid) is not str or not re.fullmatch(r'ses_[A-Za-z0-9_]+',sid) \
@@ -103,7 +115,7 @@ def capture(root,ownership,sessions,*,replacements=()):
                     if len(messages)>DIAGNOSTIC_ROWS:raise safety.Blocked('mock diagnostic row bound')
                     found=[]
                     for seq,raw in messages:
-                        if type(raw) is not str or len(raw.encode())>DIAGNOSTIC_BYTES:
+                        if type(raw) is not str or len(raw.encode())>NATIVE_BYTES:
                             raise safety.Blocked('mock diagnostic message bound')
                         found.extend({'seq':seq,**item} for item in errors(json.loads(raw)))
                     if messages:rows.append({'sessionID':sid,'model':safety.MOCK_IDENTITY,
@@ -123,7 +135,8 @@ def capture(root,ownership,sessions,*,replacements=()):
                 if ids-sessions.keys():continue
                 if not (ids or relevant):continue
                 if not (ids or re.search(r'\berror\b',line,re.I)):continue
-                log_rows.append({'source':path.relative_to(root).as_posix(),'line':number,'text':safe(line)})
+                log_rows.append({'source':path.relative_to(root).as_posix(),'line':number,'text':safe(line),
+                                 'association':'session-id' if ids else 'location-context'})
                 if len(log_rows)>DIAGNOSTIC_ROWS:raise safety.Blocked('mock diagnostic log row bound')
         return {'mode':'mock-only','sessions':rows,'log_lines':log_rows}
     return read()

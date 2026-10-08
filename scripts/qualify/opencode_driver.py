@@ -328,6 +328,8 @@ class Driver:
         self._timeline_lock=threading.RLock(); self._timelines=[]
         self.helper_channels={}; self.helper_generations={}; self.lifecycle_counter=0
         self.helper_origins={}; self.server_identities=set()
+        self._server_roots=set();self._first_server_ticks=None;self._run_start_ticks=None
+        self._lock_scan_exclusions=set()
         self.fake_gate_manifest=None
         self._armed_history=set()
         self._seam_targets={}
@@ -1353,6 +1355,11 @@ class Driver:
         if row is None or row['ppid']!=record['anchor'].pid:
             raise Blocked('vendor is not Host anchor child')
         identity=safety.Identity(row['pid'],row['start_ticks']); self._verify(identity,'vendor')
+        if self._first_server_ticks is None:
+            self._first_server_ticks=record['anchor'].start_ticks
+            self._record('first-server-generation',{'anchor':record['anchor'].report(),
+                'vendor':identity.report(),'start_ticks':self._first_server_ticks})
+        self._server_roots.update((record['anchor'],identity))
         previous=self.vendor_identity
         password=self.vault.read_once(self.proc,identity)
         origin=self._listener_origin(record,identity)
@@ -1443,6 +1450,7 @@ class Driver:
         hold=ResponseHold(deadline)
         saved=(self.project,self.provider_endpoints,self.last_model,self.last_request)
         receipt=None; provider=None; checked=False; cancelled=False; cleanup_failed=False
+        terminal_state=None;terminal_failure_class=None
         requests_before=0
         self._bootstrap_count+=1
         name='bootstrap-'+str(self._bootstrap_count)
@@ -1501,6 +1509,10 @@ class Driver:
                 raise Blocked('bootstrap response hold expired or aborted') from error
             self._bootstrap_deadline=None; self._http.deadline=self.phase_deadline
             envelope=self.via(['wait',receipt['turn'],'--timeout-ms',str(BOOTSTRAP_WAIT_MS)])
+            terminal_state=envelope.get('state') if envelope.get('state') in TERMINAL_STATES else 'other'
+            failure=envelope.get('failure')
+            if type(failure) is dict:
+                terminal_failure_class=failure.get('class') if failure.get('class') in FAILURE_CLASSES else 'other'
             if envelope.get('state')!='completed': raise Blocked('bootstrap mock turn did not complete')
             if provider.requests<=requests_before or not provider.model_matches:
                 raise Blocked('bootstrap mock request unobserved')
@@ -1526,6 +1538,7 @@ class Driver:
                 'gate':False,'static_checks':receipt is not None,'served_checks':checked,
                 'response_released':hold.released,'response_aborted':hold.aborted,
                 'cancel_requested':cancelled,'cleanup_failed':cleanup_failed,
+                'terminal_state':terminal_state,'terminal_failure_class':terminal_failure_class,
                 'public_requests':0,'mock_requests':0 if provider is None else provider.requests-requests_before})
 
     @staticmethod
@@ -1899,7 +1912,11 @@ class Driver:
                     total+=len(line); current.extend(line)
                     if len(current)>1024*1024 or total>OBSERVATION_BYTES:
                         self.reply_evidence.capture('vendor-sse','/api/event',bytes(current),http_status=200)
-                        raise Blocked('owned event capture bound')
+                        error=Blocked('owned event capture bound')
+                        error.event_bound={'line_bytes':len(line),'frame_bytes':len(current),
+                            'prior_data_bytes':sum(map(len,data))+max(0,len(data)-1),
+                            'complete_line':line.endswith(b'\n'),'total_bytes':total}
+                        raise error
                     if line in (b'\n',b'\r\n'):
                         if data:
                             raw=b'\n'.join(data)
@@ -1936,6 +1953,8 @@ class Driver:
         with self._events_lock: failure=self._event_failure
         if failure is not None:
             error,replies=failure
+            if hasattr(error,'event_bound'):
+                self._record('native-event-bound',error.event_bound)
             self.reply_evidence.block(error,replies)
             return error
 
@@ -2365,38 +2384,64 @@ class Driver:
         holders=[]
         for directory in self.proc.root.iterdir():
             if not directory.name.isdigit(): continue
-            identity=None
-            try:
-                if directory.stat().st_uid!=os.getuid(): continue
-                before=self.proc.stat(int(directory.name))
-                if before is None: continue
-                identity=safety.Identity(before['pid'],before['start_ticks'])
-                for fdinfo in (directory/'fdinfo').iterdir():
-                    name='fdinfo/'+fdinfo.name
-                    try: raw=self.proc.read(identity,name)
-                    except (OSError,Blocked) as error:
-                        cause=error if isinstance(error,OSError) else error.__cause__
-                        if isinstance(cause,OSError) and cause.errno in {errno.ENOENT,errno.ESRCH} \
-                                and cause.filename==name:
-                            # An individual closed fd cannot retain the namespace lock.
-                            # Stable process identity is still required; directory errors
-                            # and hidden/reused process identities remain unverifiable.
-                            self._verify(identity)
-                            continue
-                        raise
-                    if any(lockid.encode() in line and b'FLOCK' in line for line in raw.splitlines()):
-                        holders.append(identity.report())
-            except (OSError,Blocked) as error:
-                # A present stat can describe an exited process. Only pidfd-
-                # grounded False permits skipping; hidden/live directories block.
-                alive=self.proc.alive(identity) if identity is not None else None
-                if alive is False:continue
-                role=self._process_role(identity) if identity is not None else 'host'
-                self._record('lock-scan-block',{'pid':int(directory.name),
-                    'start_ticks':identity.start_ticks if identity else None,
-                    'role':role,'liveness':alive if type(alive) is bool else None,
-                    'os_error':safety.os_error_record(error)})
-                raise safety.process_block(role,alive,'same-uid lock descriptor scan unverifiable') from error
+            for scan_attempt in range(2):
+                identity=None
+                try:
+                    if directory.stat().st_uid!=os.getuid(): break
+                    before=self.proc.stat(int(directory.name))
+                    if before is None: break
+                    identity=safety.Identity(before['pid'],before['start_ticks'])
+                    found=[]
+                    for fdinfo in (directory/'fdinfo').iterdir():
+                        name='fdinfo/'+fdinfo.name
+                        try: raw=self.proc.read(identity,name)
+                        except (OSError,Blocked) as error:
+                            cause=error if isinstance(error,OSError) else error.__cause__
+                            if isinstance(cause,OSError) and cause.errno in {errno.ENOENT,errno.ESRCH} \
+                                    and cause.filename==name:
+                                self._verify(identity)
+                                continue  # A verified closed descriptor cannot retain the lock.
+                            raise
+                        if any(lockid.encode() in line and b'FLOCK' in line for line in raw.splitlines()):
+                            found.append(identity.report())
+                    self.proc.verify(identity)
+                    holders.extend(found)
+                    break
+                except (OSError,Blocked) as error:
+                    # A present stat can describe an exited process. Only pidfd-
+                    # grounded False permits skipping; hidden/live directories block.
+                    cause=error if isinstance(error,OSError) else error.__cause__
+                    if identity is None and isinstance(cause,OSError) and cause.errno in {errno.ENOENT,errno.ESRCH} \
+                            and cause.filename==str(directory):
+                        break  # Process directory disappeared before the uid snapshot.
+                    if identity is not None:
+                        current=self.proc.stat(identity.pid)
+                        if current is not None and current['start_ticks']!=identity.start_ticks:
+                            if scan_attempt==0:continue  # Inspect the replacement once; never omit its descriptors.
+                            raise Blocked('lock descriptor process identity changed twice') from error
+                    alive=self.proc.alive(identity) if identity is not None else None
+                    if alive is False:break
+                    role=self._process_role(identity) if identity is not None else 'host'
+                    os_error=safety.os_error_record(error)
+                    if identity is not None and alive is True and role=='host' and os_error is not None:
+                        from opencode_lockscan import historical_exception
+                        try:
+                            outside=historical_exception(self.proc,identity,
+                                self._server_roots|{anchor}|({self.vendor_identity} if self.vendor_identity else set()),
+                                self._first_server_ticks,self._run_start_ticks)
+                        except Blocked:
+                            outside=None  # Ambiguous lineage never permits an unreadable process.
+                        if outside is not None:
+                            key=(identity,os_error['errno'])
+                            if key not in self._lock_scan_exclusions:
+                                self._record('lock-scan-exclusion',{**outside,'errno':os_error['errno']})
+                                self._lock_scan_exclusions.add(key)
+                            break
+                    self._record('lock-scan-block',{'pid':int(directory.name),
+                        'start_ticks':identity.start_ticks if identity else None,
+                        'role':role,'liveness':alive if type(alive) is bool else None,
+                        'os_error':os_error})
+                    raise safety.process_block(role,alive,'same-uid lock descriptor scan unverifiable') from error
         unique={tuple(sorted(row.items())) for row in holders}
         holders=[dict(row) for row in unique]
         if holders!=[anchor.report()]: raise Blocked('namespace lock escaped anchor')
@@ -2625,6 +2670,24 @@ class Driver:
             self._record('l14',result)
         return result
 
+    def _check_seed_connections(self,integration,*,seeded):
+        """L11: an empty baseline followed by precisely the owned synthetic credential (§13)."""
+        if type(integration) is not dict or type(integration.get('data')) is not list:
+            raise Blocked('L11 integration shape unknown')
+        connections=[]
+        for row in integration['data']:
+            if type(row) is not dict or type(row.get('id')) is not str or type(row.get('connections')) is not list:
+                raise Blocked('L11 integration connection shape unknown')
+            connections.extend((row['id'],connection) for connection in row['connections'])
+        if not seeded:
+            if connections:raise Blocked('L11 pre-seed integration already connected')
+            return
+        if len(connections)!=1:raise Blocked('L11 expected exactly one new connection')
+        provider,connection=connections[0]
+        if provider!=safety.MOCK_IDENTITY.split('/')[0] or type(connection) is not dict \
+                or connection.get('type')!='credential' or connection.get('label')!='VIA synthetic fixture':
+            raise Blocked('L11 seeded connection identity differs')
+
     def _prepare_l11_mock_provider(self):
         """§13 L11: register a known integration persistently, with model admission closed."""
         config=self._materialize_fixture('l11-seed',self.namespace,{'provider':'mock'})
@@ -2692,14 +2755,16 @@ class Driver:
                 mutation={'method':'POST','path':'/api/credential','body':{
                     'integrationID':safety.MOCK_IDENTITY.split('/')[0],'label':'VIA synthetic fixture',
                     'value':{'type':'key','key':secret},'activate':True}}
+            status,raw=self._request('GET','/api/integration',client=http)
+            if status!=200:raise Blocked('L11 pre-seed integration unavailable')
+            self._check_seed_connections(self._json(raw),seeded=False)
             self._validate_seed_mutation(schema,mutation)
             status,raw=self._request(mutation['method'],mutation['path'],mutation['body'],client=http)
             if status not in {200,201,204}: raise Blocked('L11 synthetic seeding refused')
             status,raw=self._request('GET','/api/integration',client=http)
             integration=self._json(raw)
-            if status!=200 or type(integration.get('data')) is not list: raise Blocked('L11 integration shape unknown')
-            connected=any(row.get('connections') for row in integration['data'] if type(row) is dict)
-            if not connected: raise Blocked('L11 seeded connection not observable')
+            if status!=200:raise Blocked('L11 seeded integration unavailable')
+            self._check_seed_connections(integration,seeded=True)
             if any(form in raw for form in self.secret_forms): raise Blocked('L11 synthetic secret appeared in integration')
             result={'complete':True,'exact_namespace_layout':True,'chain_0700':True,
                     'known_connection_shape':True,'secret_absent_from_integration':True,'model_requests':0}

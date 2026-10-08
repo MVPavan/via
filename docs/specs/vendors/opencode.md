@@ -1210,7 +1210,7 @@ stands. Items that gate route enablement (L4, L5, L14) say so.
 | L10 macOS | Platform deferred | Run OC01–OC12 on macOS under the platform contract |
 | L11 new-version credential shape | A new version's `/api/integration` may change shape or carry values | Before a version joins `checked`, rerun E41's synthetic-credential probe with every other gate (L4, L5, L14) |
 | L12 other unobserved | `superseded` and `inactivity` interrupt reasons; agent `steps`; durable replay; `OPENCODE_DISABLE_AUTOUPDATE` behaviour; truncated-body handling (E56) | Probe each at the next pin review |
-| L14 (gate) server dies with its anchor | The fence (§3.2) holds only while the server keeps the parent-death signal Host set, stays the process Host spawned, and never holds `server.lock`; OC02b shows Host's side with a fake vendor, not the real server's behaviour | **Gates route enablement and every pin review.** With the pinned real OpenCode, each sample is one server generation started through the real Host launch with a test barrier, e.g. SIGSTOP of the private daemon, holding Host and the route from retiring the generation or closing its stdin, and driven to a point in its life: just after publication, during and after each spawn path (the model's tool runner, location and session shells, a project MCP stdio server, LSP when offered by the pinned configured-read probe, and a plugin spawn), after each reload the version offers (for example a project configuration change or instance disposal, where the API has one), and after a long run. At each point: (1) a same-uid scan of `/proc/*/fdinfo` finds the `server.lock` flock line only on the anchor's descriptor, never on the server or any descendant; (2) `/api/info.pid` equals the spawned pid, and the server record names it; (3) `SIGKILL` the anchor's pid alone, never its group; (4) the server process (pid and start ticks) is gone within 1 s, and a new generation's configuration admits after its predecessor check. Step 4 after the reload points shows the parent-death signal still in force at the tested life points; it observes the effect directly, where `exe`, `comm` and the start ticks cannot (a self re-exec from a worker leaves all three unchanged). It does not prove that the server never executes from a non-leader thread (§3.2), only that no sampled point lost the signal. **Pass:** every sample. **Fail:** any server surviving its anchor, any lock line outside the anchor, or a server whose pid differs from the spawned one; OpenCode qualification then fails until resolved |
+| L14 (gate) server dies with its anchor | The fence (§3.2) holds only while the server keeps the parent-death signal Host set, stays the process Host spawned, and never holds `server.lock`; OC02b shows Host's side with a fake vendor, not the real server's behaviour | **Gates route enablement and every pin review.** With the pinned real OpenCode, each sample is one server generation started through the real Host launch with a test barrier, e.g. SIGSTOP of the private daemon, holding Host and the route from retiring the generation or closing its stdin, and driven to a point in its life: just after publication, during and after each spawn path (the model's tool runner, location and session shells, a project MCP stdio server, LSP when offered by the pinned configured-read probe, and a plugin spawn), after each reload the version offers (for example a project configuration change or instance disposal, where the API has one), and after a long run. At each point: (1) a scan of every readable same-uid `/proc/*/fdinfo` finds the `server.lock` flock line only on the anchor's descriptor, never on the server or any descendant; anchor, server and all descendants must be fully readable; an unreadable outsider is excluded only with verified pre-run/pre-first-generation birth and ancestry, retaining PID/start ticks, fixed comm class and errno; (2) `/api/info.pid` equals the spawned pid, and the server record names it; (3) `SIGKILL` the anchor's pid alone, never its group; (4) the server process (pid and start ticks) is gone within 1 s, and a new generation's configuration admits after its predecessor check. Step 4 after the reload points shows the parent-death signal still in force at the tested life points; it observes the effect directly, where `exe`, `comm` and the start ticks cannot (a self re-exec from a worker leaves all three unchanged). It does not prove that the server never executes from a non-leader thread (§3.2), only that no sampled point lost the signal. **Pass:** every sample. **Fail:** any server surviving its anchor, any lock line outside the anchor, or a server whose pid differs from the spawned one; OpenCode qualification then fails until resolved |
 
 ### Qualification runner
 
@@ -1438,7 +1438,12 @@ path and every password/bearer representation before the protected evidence
 write, then run the ordinary whole-root secrecy scan. Public-free sessions
 retain only closed projections, never this text. Diagnostic runs retain the
 ordinary identity, ancestor, spending and cleanup proofs and report
-`diagnostic_pass` separately from qualification.
+`diagnostic_pass` separately from qualification (exit 4, versus qualification
+pass exit 0 or block/failure exit 1). Every diagnostic summary records the exact
+runner source manifest/hash. Mock diagnostics check case-folded URL-decoded
+text for any remaining private run root after redaction; ambiguity blocks.
+Error log lines associated only by an enrolled location boot are labelled
+`location-context`, rather than claiming session attribution.
 The usage/cache fixture uses a 32,768-token mock context to measure its scripted
 tool steps without triggering automatic compaction first. L7's separate mock
 fixture retains its small context. The first mock-only usage diagnostic showed
@@ -1827,21 +1832,50 @@ hashed relative name, size and content hash, fixed name class, executable/ELF
 flags, uid/link facts, registered-TMPDIR and Git-template/marker booleans.
 It retains neither unknown local names nor file content and does not change
 the admission rule. Omitted rows are counted.
-The L14 descriptor scan skips an unreadable process only when its saved
-PID/start ticks have pidfd-grounded liveness `False`; a surviving stat entry
-alone is not liveness proof. `True` or unknown still blocks, retaining the
-PID/start ticks, fixed role, liveness and errno/step without paths.
+The L14 descriptor scan inspects every readable same-uid process. The anchor,
+server and all descendants must be fully readable. An unreadable outsider may
+be excluded only when its verified start ticks strictly predate the first
+verified server generation and it is outside every registered anchor/server
+tree. The runner conservatively also requires birth before the runner itself,
+so an unreadable process born during the run blocks. Birth boundaries and owned
+roots remain fixed across generations and namespace rotations. Exclusions
+record PID, start ticks, fixed comm class and errno, as record-only findings.
+Unknown ancestry or liveness blocks; pidfd-proven absence can be skipped.
+A process directory disappearing before the uid snapshot is absent; a reused
+PID is rescanned once using the replacement identity, never omitted. A second
+identity change blocks. Readable outsiders holding the lock always fail.
 
 L11 seeds the registered loopback mock integration, not an unknown integration
 ID: pinned `Integration.list` enumerates registered integrations (byte
 144,986,350), while credential creation alone does not register one. The
 namespace's persistent fixture config registers the mock before the direct
 seed server starts, so both that server and the subsequent VIA-owned server
-see the same integration. No model request is admitted in this phase.
+see the same integration. The integration read before credential creation must show no connections;
+the read afterwards must show exactly one new `oclive-mock` connection with
+`type: credential` and `label: VIA synthetic fixture`. Any pre-existing,
+additional or differently labelled connection blocks. No model request is
+admitted in this phase.
 
 Cleanup's embedded-runtime provenance checks retain their own bounded search
 window after a phase expires. Expired admission and observation deadlines do
 not disable cleanup or extend any model-capable request deadline.
+
+The pinned binary exposes the promise plugin permission `evaluate` hook at
+byte 146,023,383; the evaluator invokes it at 145,097,933. The shell permission
+action is `shell` (constant at 145,733,769), not `bash`. L5 requires at least
+one actual child ask correlated with VIA's rejected native permission reply;
+denied actions without an ask cannot pass this gate.
+
+The private binary/package inventory validates every supplied root and scans
+only the outermost roots, counting each entry once when namespace and vendor
+roots overlap. Its 100,000-entry bound remains unchanged.
+
+Mock-only error projection accepts a stored message up to the existing 16 MiB
+native-message input bound, while retaining at most 1 MiB of redacted error/log
+text. Near-limit fixture text is discarded, never exported. Bootstrap records
+retain only the terminal state and fixed failure class; observer bound records
+retain line/frame/prior-data/total byte counts and line-completion Boolean.
+These diagnostic records do not change VIA's 1 MiB SSE line/event contract.
 
 ## 14. Owner questions and revisit items
 
