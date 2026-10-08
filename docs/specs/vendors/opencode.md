@@ -1452,10 +1452,26 @@ projection, including when the helper has already exited; it proves no spawn
 or ownership. A snapshot observer retains the projection before blocking.
 No failed helper attempt causes an automatic model re-ask.
 Native session-ID readiness uses C1 §3.7's session state `active`, distinct
-from the active turn's `running` state. An active session with no native ID
-is pending under the existing ownership-verified readiness deadline; a string
-ID with false verification still blocks immediately. Reply diagnostics retain
-both closed state fields without retaining message content.
+from the active turn's `running` state. An active, admission-open session with
+no native ID is pending under the existing ownership-verified readiness
+deadline; a string ID with false verification still blocks immediately.
+Before dispatch, an admission-open `idle` or `active` session is also pending
+only when `active_turn` is null and `turns` identifies exactly the current
+receipted turn as `queued` (C1 §§3.2, 3.7, 7.2). Live acceptance pins then wait
+for that turn's `running/submitting` to become `running/accepted`; a queued
+`active_turn` is not a C1 state. Closing, ended or ambiguous evidence blocks.
+Each poll re-verifies ownership and obeys the phase/readiness deadline.
+Reply diagnostics retain both closed state fields without message content.
+CLI transport bounds allow default `cancel --wait`'s 10 s acknowledgement
+window and 60 s cleanup window, plus the existing 10 s reply margin. Close
+allows the CLI's default 10 s deadline plus 30 s terminal allowance and the
+same margin; a foreground spawn uses the reviewed 180 s wait ceiling plus
+that margin. Every bound remains clipped to the phase deadline; timeout never
+resends a mutation. Typed envelope checks distinguish nullable `unavailable`
+provenance from the three C1 scopes and require a nonnegative `revision`.
+Close checks its used members (`session_id`, closed state, turn-address list,
+cleanup); Store-derived close replays may omit the unused `leftovers` member,
+so its omission proves no cleanup or leftovers property.
 The public cancellation prompt names the exact project-relative command
 `/usr/bin/python3 .opencode/tool-helper.py`; no private absolute path is sent
 to the public provider. The hash-verified 2.0.22 embedded source defaults

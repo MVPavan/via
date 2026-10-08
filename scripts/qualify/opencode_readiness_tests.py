@@ -329,7 +329,7 @@ class ReadinessTests(unittest.TestCase):
     def test_native_session_id_waits_for_background_creation(self):
         self.driver.handles['s_owned'] = 'fake-memory-only-handle'
         self.driver.via = mock.Mock(side_effect=[
-            {'state': 'active', 'vendor_identity_verified': False, 'vendor_session_id': None},
+            {'state': 'active', 'admission': 'open', 'vendor_identity_verified': False, 'vendor_session_id': None},
             {'state': 'active', 'vendor_identity_verified': True, 'vendor_session_id': 'ses_owned'}])
         self.assertEqual(self.driver._vendor_sid('s_owned'), 'ses_owned')
         self.assertEqual(self.driver.via.call_count, 2)
@@ -337,7 +337,7 @@ class ReadinessTests(unittest.TestCase):
     def test_native_session_id_waits_on_c1_active_session_not_turn_state(self):
         self.driver.handles['s_owned']='fake-memory-only-handle'
         self.driver.via=mock.Mock(side_effect=[
-            {'state':'active','active_turn':{'state':'running','phase':'submitting'},
+            {'state':'active','admission':'open','active_turn':{'state':'running','phase':'submitting'},
              'vendor_identity_verified':False,'vendor_session_id':None},
             {'state':'active','active_turn':{'state':'running','phase':'accepted'},
              'vendor_identity_verified':True,'vendor_session_id':'ses_owned'}])
@@ -493,9 +493,9 @@ class ReadinessTests(unittest.TestCase):
     def test_live_pin_waits_for_via_to_commit_native_acceptance(self):
         self.driver.via = mock.Mock(side_effect=[
             {'state': 'active', 'admission': 'open', 'vendor_identity_verified': True,
-             'active_turn': {'phase': 'submitting'}},
+             'active_turn': {'state': 'running', 'phase': 'submitting'}},
             {'state': 'active', 'admission': 'open', 'vendor_identity_verified': True,
-             'active_turn': {'phase': 'accepted'}}])
+             'active_turn': {'state': 'running', 'phase': 'accepted'}}])
         self.driver.journal._signal = mock.Mock()
         result = self.driver._operation('server_loss_for_marker', {'session': 's_owned'})
         self.assertTrue(result['anchor_pid_only']); self.assertEqual(self.driver.via.call_count, 2)

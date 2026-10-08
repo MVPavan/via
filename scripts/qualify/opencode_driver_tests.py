@@ -1059,7 +1059,7 @@ class DriverTests(unittest.TestCase):
                 def verify(self,identity):
                     if identity.start_ticks!=7: raise Blocked('fixture PID reused')
             calls=[]
-            envelope={'session_id':'s_fixture','turn':1,'state':'completed','failure':None,
+            envelope={'session_id':'s_fixture','turn':1,'revision':0,'state':'completed','failure':None,
                       'stop_reason':'end_turn','vendor_version':'2.0.22','vendor_session_id':'ses_fixture',
                       'final_text':'VIA FREE READY','structured_output':None,'steps':1,'cancel':None,
                       'cost':{'usd':0,'scope':'turn'},'usage':{'scope':'turn','input_tokens':1,

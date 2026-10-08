@@ -211,6 +211,35 @@ class FixtureRetentionTests(unittest.TestCase):
 
 @unittest.skipUnless(AVAILABLE, 'optional real-VIA audit: build release, failpoints and via-fake-agent')
 class RealViaTests(unittest.TestCase):
+    def test_slow_native_creation_keeps_running_and_session_states_distinct(self):
+        """C1 §§3.7,7.2: use the fake's real delay while VIA commits creation."""
+        for kind in ('release','failpoints'):
+            with self.subTest(build=kind),ViaFixture(kind) as fixture:
+                driver=fixture.driver
+                script=scripted_server(fixture.project)
+                creation=next(row for row in script['routes']
+                              if row['method']=='POST' and row['path']=='/api/session')
+                release=fixture.root/'FAKE-native-create.release'
+                creation['responses'][0]['wait_for_file']=str(release)
+                fixture.script.write_text(json.dumps(script))
+                def spending(**_kwargs):driver.last_model=safety.MOCK_IDENTITY
+                with mock.patch.object(driver,'spending_check',side_effect=spending):
+                    receipt=driver.via(['spawn','--harness','opencode','--model',safety.MOCK_IDENTITY,
+                        '--cwd',str(fixture.project),'--bound','full','--network',
+                        '--background','--prompt','FAKE delayed native creation'])
+                    def submitting():
+                        row=driver.via(['status',receipt['session_id']])
+                        return row if row['active_turn'] is not None else None
+                    try:status=driver._await_owned(submitting,'FAKE turn did not dispatch')
+                    finally:release.touch(mode=0o600)
+                    self.assertEqual(status['state'],'active')
+                    self.assertIsNone(status['vendor_session_id'])
+                    self.assertEqual(status['active_turn']['state'],'running')
+                    self.assertEqual(status['active_turn']['phase'],'submitting')
+                    self.assertEqual(driver._vendor_sid(receipt['session_id']),SES)
+                    self.assertEqual(driver.via(['wait',receipt['turn'],
+                                                '--timeout-ms','10000'])['state'],'completed')
+
     def test_disk_floor_blocks_preflight_with_retained_fixed_numeric_cause(self):
         with ViaFixture('release',auto_start=False) as fixture:
             driver=fixture.driver

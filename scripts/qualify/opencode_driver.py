@@ -38,6 +38,7 @@ from opencode_catalog import catalog_record
 from opencode_reply import ReplyEvidence, reply_check
 from opencode_cases import REPOSITORY_SENTINELS
 from opencode_events import terminal_event
+from opencode_c1 import TERMINAL_STATES, SCOPES, CANCEL_OUTCOMES, CLEANUP_STATES, ERROR_CODES
 from opencode_runroot import ANCHOR_SOCKET_TAIL, SOCKET_BYTES
 
 Blocked = safety.Blocked
@@ -49,6 +50,10 @@ SCAN_ATTEMPTS = 3  # §13: restart the whole scan on transient VIA-owned churn.
 PAGE_COUNT = 1000
 SSE_HANDSHAKE_SECONDS = 30  # §13 owned observer absolute header deadline.
 WAIT_REPLY_MARGIN_SECONDS = 10  # §13: allow the CLI to return its bounded wait reply.
+CANCEL_ACK_SECONDS = 10  # C1 §3.5; Core DEFAULT_FORCE_AFTER_MS.
+CANCEL_CLEANUP_SECONDS = 60  # C1 §3.5 pending reported-tool cleanup, before settlement.
+CLOSE_REPLY_SECONDS = 40  # CLI close: default 10 s close + 30 s terminal read allowance.
+FOREGROUND_WAIT_SECONDS = 180  # §13: same ceiling as this runner's explicit wait calls.
 HELPER_STOP_SECONDS = 30  # §13 L14 bounded cooperative cleanup before a successor.
 IDLE_RETIREMENT_SECONDS = 90  # §13: natural exit of each process, clipped to its phase.
 CLEANUP_SECONDS = 180  # §13: bounded mock abort/retries, then natural daemon idle shutdown.
@@ -85,7 +90,7 @@ SCHEMAS = {
     'receipt': {'turn': S, 'effective': {'effort': S+N, 'max_steps': I+N}},
     'spawn receipt': {'session_id': S, 'turn': S, 'handle': S,
                       'effective': {'effort': S+N, 'max_steps': I+N}},
-    'envelope': {'session_id': S, 'turn': I, 'state': S, 'failure': (dict,type(None)),
+    'envelope': {'session_id': S, 'turn': I, 'revision': I, 'state': S, 'failure': (dict,type(None)),
                  'stop_reason': S+N, 'vendor_version': S+N, 'vendor_session_id': S+N,
                  'final_text': S+N, 'structured_output': object, 'steps': I+N,
                  'cancel': (dict,type(None)),
@@ -96,6 +101,8 @@ SCHEMAS = {
                  'denied_actions': [{'kind': S,'target': S,'event_seq': I}],
                  'denied_actions_total': I, 'auto_declined_requests_total': I},
     'cancel reply': {'turn':S,'state': S, 'already_terminal':B,'cancel': (dict,type(None))},
+    # Store-derived close replays may omit leftovers; no verdict reads that member.
+    'close': {'session_id':S,'state':S,'cancelled_turns':[S],'cleanup':S},
     'events page': {'events': [{'seq': I,'type': S}], 'more': B,'next_after': I},
     'status': {'inherit': {key:S for key in ('agents','hooks','instruction_files',
                                           'mcp_servers','plugins','skills')},
@@ -122,18 +129,28 @@ def strict_reply(raw, schema):
         if type(value) is not dict: raise Blocked('CLI reply object missing')
         return value
     _typed(value,SCHEMAS[schema],schema)
-    if schema=='cancel reply' and value['state'] not in {'running','completed','failed','cancelled','unknown'}:
+    if schema=='error' and value['data']['kind'] in ERROR_CODES \
+            and value['code']!=ERROR_CODES[value['data']['kind']]:
+        raise Blocked('C1 error code and kind differ')
+    if schema=='close' and (value['state']!='closed' or value['cleanup'] not in {'quiescent','uncertain'}):
+        raise Blocked('close state or cleanup invalid')
+    if schema=='cancel reply' and value['state'] not in TERMINAL_STATES|{'running'}:
         raise Blocked('cancel state invalid')
+    if schema in {'envelope','cancel reply'} and value['cancel'] is not None:
+        _typed(value['cancel'],{'outcome':S,'cleanup':S},'cancel')
+        if value['cancel']['outcome'] not in CANCEL_OUTCOMES or value['cancel']['cleanup'] not in CLEANUP_STATES:
+            raise Blocked('cancel outcome or cleanup invalid')
     if schema=='envelope':
-        if value['state'] not in {'completed','failed','cancelled','unknown'}:
+        if value['state'] not in TERMINAL_STATES:
             raise Blocked('envelope terminal state invalid')
+        if value['revision']<0:raise Blocked('negative envelope revision')
         if value['failure'] is not None:
             _typed(value['failure'],{'class':S,'message':S},'failure')
         if value['cancel'] is not None:
             _typed(value['cancel'],{'outcome':S,'cleanup':S},'cancel')
-        if value['cost']['scope'] not in {'turn','vendor_interval','session_cumulative','unavailable'}:
+        if value['cost']['scope'] not in SCOPES:
             raise Blocked('cost scope invalid')
-        if value['usage']['scope'] not in {'turn','vendor_interval','session_cumulative','unavailable'}:
+        if value['usage']['scope'] not in SCOPES:
             raise Blocked('usage scope invalid')
         if any(type(value['usage'][key]) is int and value['usage'][key]<0
                for key in ('input_tokens','cached_input_tokens','output_tokens')):
@@ -837,6 +854,16 @@ class Driver:
                 raise Blocked('bearer handle must remain in memory')
             args.append('--handle-stdin'); input=(self.handles[args[1]]+'\n').encode()+(input or b'')
         timeout=30
+        if verb=='cancel' and '--wait' in args:
+            grace=CANCEL_ACK_SECONDS
+            if '--force-after' in args:
+                try:grace=int(args[args.index('--force-after')+1])/1000
+                except (ValueError,IndexError) as error:raise Blocked('invalid CLI cancel grace') from error
+                if not 0<=grace<=FOREGROUND_WAIT_SECONDS:raise Blocked('CLI cancel grace exceeds phase ceiling')
+            timeout=grace+CANCEL_CLEANUP_SECONDS+WAIT_REPLY_MARGIN_SECONDS
+        if verb=='close':timeout=CLOSE_REPLY_SECONDS+WAIT_REPLY_MARGIN_SECONDS
+        if verb=='spawn' and '--background' not in args:
+            timeout=FOREGROUND_WAIT_SECONDS+WAIT_REPLY_MARGIN_SECONDS
         if verb=='wait':
             cli_timeout=180000
             if '--timeout-ms' in args:
@@ -876,7 +903,7 @@ class Driver:
             # C1 §1 CLI stderr is the error object; keep the internal wrapper.
             return {'cli_error':{'error':value},'exit_code':rc}
         schema={'status':'status','wait':'envelope','result':'envelope','events':'events page','logs':'logs',
-                'cancel':'cancel reply'}.get(verb,'unknown')
+                'cancel':'cancel reply','close':'close'}.get(verb,'unknown')
         if verb=='daemon' and len(args)>1:
             schema='daemon status' if args[1]=='status' else 'daemon stop'
         if verb in {'models','describe'}: schema=verb
@@ -1158,14 +1185,31 @@ class Driver:
         """§13 L14/marker: a tool spawn can precede VIA's acceptance commit."""
         def read():
             value=self.via(['status',session]); active=value.get('active_turn')
+            if self._queued_status(value,session):return None
             if value.get('state')!='active' or value.get('admission')!='open' or type(active) is not dict:
                 raise Blocked('live turn pin ended or admission changed')
             phase=active.get('phase')
-            if phase not in {'submitting','accepted'} and not (phase is None and active.get('state')=='queued'):
+            if active.get('state')!='running' or phase not in {'submitting','accepted'}:
                 raise Blocked('live turn phase unrecognized')
             if phase=='accepted' and value.get('vendor_identity_verified') is True: return value
             return None
         return self._await_owned(read,'live turn pin acceptance deadline')
+
+    def _queued_status(self,value,session):
+        """C1 §§3.2,3.7,7.2: only this receipted queued turn is pending dispatch."""
+        if value.get('state') not in {'idle','active'} or value.get('admission')!='open' \
+                or value.get('session_id')!=session or value.get('active_turn') is not None:
+            return False
+        receipt=(self.last_request or {}).get('receipt',{})
+        address=receipt.get('turn')
+        if receipt.get('session_id')!=session or type(address) is not str \
+                or not address.startswith(session+'/'):return False
+        try:number=int(address.rsplit('/',1)[1])
+        except ValueError:return False
+        turns=value.get('turns')
+        if number<1 or type(turns) is not list:return False
+        matching=[row for row in turns if type(row) is dict and type(row.get('n')) is int and row['n']==number]
+        return len(matching)==1 and matching[0].get('state')=='queued'
 
     def _await_helper_point(self,helper,point):
         """§13 L14: wait for an atomic update of the already captured helper identity."""
@@ -1686,7 +1730,9 @@ class Driver:
             if sid is not None and type(sid) is not str:
                 raise Blocked('native session identity malformed')
             # C1 §§1,3.7: status.state is the session state, not a turn state.
-            if value.get('state')!='active': raise Blocked('session ended before native creation')
+            if (value.get('state')!='active' or value.get('admission')!='open') \
+                    and not self._queued_status(value,session):
+                raise Blocked('session ended before native creation')
             return None
         return self._await_owned(read,'confirmed vendor session ID missing')
 

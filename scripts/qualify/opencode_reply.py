@@ -14,6 +14,8 @@ import urllib.parse
 from collections import OrderedDict
 
 import opencode_safety as safety
+from opencode_c1 import (EVENT_TYPES, ERROR_CODES, CANCEL_OUTCOMES, CLEANUP_STATES,
+                        FAILURE_CLASSES, WARNING_CODES, STOP_REASONS, DENIAL_KINDS)
 
 REPLY_BYTES = 16 * 1024 * 1024  # §9/§13: the runner's existing observation cap.
 PROJECTION_BYTES = 64 * 1024  # §13: diagnostic fields, not a second payload sink.
@@ -25,7 +27,8 @@ ID_CHARS = 256  # §13: same identifier policy as catalogue diagnostic evidence.
 
 IDS = frozenset({'id','providerID','modelID','sessionID','session_id','vendor_session_id',
                  'inboxID','inputID','messageID','parentID','agentID','model','agent','harness'})
-NUMBERS = frozenset({'pid','code','seq','turn','next_after','steps','max_steps','usd',
+NUMBERS = frozenset({'pid','code','seq','turn','n','revision','current_step','queue_position',
+    'event_seq','next_after','steps','max_steps','usd',
     'input','output','cache_read','cache_write','read','write','context','total',
     'input_tokens','output_tokens','cached_input_tokens','reasoning_output_tokens',
     'total_tokens','tokens_input','tokens_output','tokens_cache_read','tokens_cache_write',
@@ -34,7 +37,8 @@ NUMBERS = frozenset({'pid','code','seq','turn','next_after','steps','max_steps',
 BOOLS = frozenset({'more','stopping','already_terminal','vendor_identity_verified',
                   'complete','received','model_matches','disabled','accepted','enabled','below_free_floor'})
 ENUM_KEYS = frozenset({'type','state','status','scope','support','kind','kind2','class','outcome',
-                       'cleanup','admission','phase','effect','action','version_status'})
+                       'cleanup','admission','phase','effect','action','version_status','field',
+                       'provenance','stop_reason'})
 ENUMS = frozenset({'document','directory','running','active','idle','queued','submitting','accepted',
     'completed','failed','cancelled','unknown','closed','open','fenced','closing',
     'turn','vendor_interval','session_cumulative','unavailable','reported','derived',
@@ -48,8 +52,8 @@ ENUMS = frozenset({'document','directory','running','active','idle','queued','su
     'session.message.updated','session.message.created','session.execution.started',
     'session.execution.succeeded','session.execution.failed','session.execution.interrupted',
     'session.inbox.enqueued','session.inbox.delivered','session.inbox.cancelled',
-    'turn.queued','turn.submitted','turn.started','turn.ended','turn.completed','turn.failed',
-    'turn.cancelled','turn.unknown','action.denied','session.opened','session.closed'})
+    'max_steps','model','tools','estimated'})|EVENT_TYPES|frozenset(ERROR_CODES) \
+    |CANCEL_OUTCOMES|CLEANUP_STATES|FAILURE_CLASSES|WARNING_CODES|STOP_REASONS|DENIAL_KINDS
 CONTAINERS = frozenset({'data','info','model','cost','usage','cache','settings','effective',
     'failure','error','cancel','progress','capabilities','params','max_steps','events',
     'content','snapshot','turns','active_turn','inherit','warnings','denied_actions','limits','disk','storage'})
@@ -154,6 +158,9 @@ def reply_projection(raw,protected):
                     result[field]=walk(item,field,depth+1)
                 elif field in IDS:
                     result[field]=number(item) if type(item) is int else identifier(item)
+                elif field=='code' and type(item) is str:
+                    result[field]=item if item in WARNING_CODES|{'launch_failed'} \
+                        and not hidden(item.encode()) else 'unrecognized'
                 elif field in NUMBERS: result[field]=number(item)
                 elif field in BOOLS: result[field]=item if type(item) is bool else None
                 elif field in ENUM_KEYS:
