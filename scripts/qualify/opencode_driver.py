@@ -3037,9 +3037,12 @@ print('VIA HELPER DONE')
             return receipt
         if kind=='helper_barrier':
             helper=args['helper']; path=self._helper_folder(self.project)/(helper+'.json')
+            readiness_seen=False;not_ready_seen=False
             def read():
+                nonlocal readiness_seen,not_ready_seen
                 try: raw=path.read_bytes()
                 except FileNotFoundError: return None
+                readiness_seen=True
                 if len(raw)>OBSERVATION_BYTES: raise Blocked('helper observation bound')
                 row=self._json(raw)
                 _typed(row,{'pid':I,'start_ticks':I,'ready':B,'kind':S},'helper readiness')
@@ -3047,11 +3050,22 @@ print('VIA HELPER DONE')
                 self._verify(identity)
                 if row['kind']!=helper or not self._descends_from(identity,self.vendor_identity):
                     raise Blocked('helper readiness did not come from owned generation')
-                if row['ready'] is not True: return None
+                if row['ready'] is not True:
+                    not_ready_seen=True
+                    return None
                 self.identities.add(identity); self.helper_ledger[identity]=dict(row)
                 self.helper_generations[identity]=self.vendor_identity; self.helper_origins[identity]=path.parent
                 return {'started':True,'owned':True,**row}
-            return self._await_owned(read,'helper barrier not reached')
+            try:return self._await_owned(read,'helper barrier not reached')
+            except Blocked as error:
+                if str(error)=='helper barrier not reached':
+                    try:
+                        self._record('helper-readiness',{'timed_out':True,
+                            'folder_exists':path.parent.exists(),'readiness_file_exists':path.exists(),
+                            'readiness_seen':readiness_seen,'not_ready_seen':not_ready_seen})
+                    except BaseException:
+                        error.helper_readiness_retention_failed=True
+                raise
         if kind=='helper_release':
             path=self._helper_folder(self.project)/(args['helper']+'.release')
             fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600); os.close(fd)
@@ -3234,6 +3248,13 @@ print('VIA HELPER DONE')
     def finish(self):
         """Final cleanup/immutable-pin proof; uncertainty retains roots and fails closure."""
         failures=[];traffic={'received_requests':0,'providers':0}
+        diagnostic_error=None
+        if self.external_root:
+            try:
+                from opencode_runroot import vendor_message_facts
+                self._record('native-messages-before-cleanup',{'sources':vendor_message_facts(
+                    self.work,self._reply_protected,self.ownership)})
+            except BaseException as error:diagnostic_error=error
         try: proof=self.stop()
         except BaseException as error: failures.append(error)
         finally:
@@ -3261,6 +3282,7 @@ print('VIA HELPER DONE')
                 failure=Blocked('mock received request aggregate unverified')
                 failure.__cause__=error;failures.append(failure)
             self.mock_providers.clear()
+        if diagnostic_error is not None:failures.append(diagnostic_error)
         if failures: raise failures[0]
         safety.verify_binary(self.pinned)
         if self.external_root:

@@ -3,6 +3,7 @@ import hashlib
 import functools
 import json
 import mmap
+import math
 import os
 from pathlib import Path
 import re
@@ -25,6 +26,19 @@ DISCOVERY_OFFSETS = 16  # §13: bounded fixed-name binary-string evidence per na
 CLEANUP_ENTRIES = 100000  # §13: same bounded private-tree walk as the secrecy scan.
 NATIVE_ROWS = 4096  # §13: bounded diagnostic rows, never unbounded storage copies.
 NATIVE_BYTES = 16 * 1024 * 1024  # §13: same observation limit as the driver.
+NATIVE_PARTS = 65536  # §13: bounded content-free message/part diagnostic export.
+# §13/E8/E34/E37: pinned 2.0.22 native tool names and closed diagnostic enums.
+BUILTIN_TOOLS = frozenset({'shell','glob','read','grep','webfetch','websearch','write',
+                          'edit','subagent','execute','patch','question','skill'})
+PART_TYPES = frozenset({'text','reasoning','tool','file','agent','subtask','compaction',
+                       'step-start','step-finish','patch','snapshot','retry'})
+FINISH_REASONS = frozenset({'stop','length','tool-calls','content-filter','error','unknown'})
+ERROR_NAMES = frozenset({'provider.auth','provider.rate-limit','provider.quota',
+    'provider.content-filter','provider.transport','provider.internal','provider.invalid-output',
+    'provider.invalid-request','provider.unsupported-operation','provider.no-route',
+    'provider.timeout','provider.unknown','provider.error','aborted','unknown',
+    'permission.rejected','tool.execution'})
+TOOL_STATUSES = frozenset({'pending','running','completed','error'})
 MARKERS = {'local_marker':'VIA_LOCAL_AGENT_SENTINEL',
            'ancestor_agents':'VIA_ANCESTOR_AGENTS_SENTINEL',
            'ancestor_skills':'VIA_ANCESTOR_SKILL_SENTINEL'}
@@ -195,9 +209,84 @@ def _diagnostic(function):
     @functools.wraps(function)
     def checked(*args,**kwargs):
         try: return function(*args,**kwargs)
-        except (sqlite3.Error,ValueError,AttributeError,TypeError,OSError) as error:
+        except (sqlite3.Error,ValueError,AttributeError,TypeError,OSError,RecursionError) as error:
             raise safety.Blocked('native diagnostic unavailable') from error
     return checked
+
+
+def _message_rows(conn,protected):
+    """Closed §13/E8 projections: no message/part text, arguments, output or paths."""
+    def label(value,allowed):
+        return value if type(value) is str and value in allowed \
+            and not protected(value.encode()) else 'other'
+    def error_name(value):
+        if value is None:return None
+        if type(value) is not dict:return 'other'
+        return label(value.get('type',value.get('name')),ERROR_NAMES)
+    def count(value):
+        return value if type(value) in {int,float} and 0<=value<=2**63-1 \
+            and math.isfinite(value) else None
+    out=[];part_count=0
+    for sid,kind,seq,raw in _rows(conn,
+            'SELECT session_id,type,seq,data FROM session_message ORDER BY session_id,seq'):
+        if type(sid) is not str or not re.fullmatch(r'ses_[A-Za-z0-9_]+',sid) \
+                or len(sid)>256 or protected(sid.encode()):
+            raise safety.Blocked('native message session identity unverifiable')
+        if type(seq) is not int or not 0<=seq<=2**63-1:
+            raise safety.Blocked('native message sequence unverifiable')
+        if type(raw) is not str or len(raw.encode())>NATIVE_BYTES:
+            raise safety.Blocked('native message diagnostic bound')
+        data=json.loads(raw)
+        if type(data) is not dict:raise safety.Blocked('native message shape unavailable')
+        role=label(kind,{'user','assistant','system','tool'})
+        content=data.get('content',[])
+        if type(content) is not list:raise safety.Blocked('native message parts unavailable')
+        files=data.get('files',[])
+        if type(files) is not list:raise safety.Blocked('native message attachment shape unavailable')
+        if part_count+len(content)+len(files)+int('text' in data)>NATIVE_PARTS:
+            raise safety.Blocked('native message part diagnostic bound')
+        parts=[]
+        for part in content:
+            if type(part) is not dict:raise safety.Blocked('native message part shape unavailable')
+            item={'sessionID':sid,'type':label(part.get('type'),PART_TYPES)}
+            if part.get('type')=='tool':
+                state=part.get('state',{})
+                if type(state) is not dict:state={}
+                status=label(state.get('status'),TOOL_STATUSES|{'streaming'})
+                item.update(tool_name=label(part.get('name',part.get('tool')),BUILTIN_TOOLS),
+                    status='pending' if status=='streaming' else None if status=='other' else status,
+                    error_name=error_name(state.get('error')))
+            parts.append(item)
+        # Native user/system messages store text and attachments outside content.
+        if 'text' in data:parts.append({'sessionID':sid,'type':'text'})
+        parts.extend({'sessionID':sid,'type':'file'} for _ in files)
+        part_count+=len(parts)
+        tokens=data.get('tokens')
+        usage=None
+        if type(tokens) is dict:
+            cache=tokens.get('cache',{})
+            if type(cache) is not dict:cache={}
+            usage={**{key:count(tokens.get(key)) for key in ('input','output','reasoning')},
+                   'cache_read':count(cache.get('read')),'cache_write':count(cache.get('write'))}
+        out.append({'sessionID':sid,'seq':seq,'role':role,'parts':parts,
+            'finish':None if data.get('finish') is None else label(data['finish'],FINISH_REASONS),
+            'error_name':error_name(data.get('error')),'tokens':usage})
+    return out
+
+
+@_diagnostic
+def vendor_message_facts(root,protected,ownership):
+    """Snapshot every owned native session's messages before cleanup can fail (§13)."""
+    root=Path(root);out=[]
+    for database in sorted(root.rglob('opencode.db')):
+        classified=ownership.classify(database)
+        if classified is None or classified.kind!='vendor-private':
+            raise safety.Blocked('native vendor database ownership unverifiable')
+        _regular(database)
+        with sqlite3.connect('file:'+str(database)+'?mode=ro',uri=True,timeout=1) as conn:
+            out.append({'path':database.relative_to(root).as_posix(),
+                'class':'native-vendor-session-storage','messages':_message_rows(conn,protected)})
+    return out
 
 
 @_diagnostic
@@ -260,9 +349,7 @@ def native_facts(root,protected,ownership):
                 sessions.append({'location':location.relative_to(root).as_posix(),
                     'facts':project({'id':sid,'model':json.loads(model) if model else None,
                                      'cost':{'usd':cost},'tokens_input':tin,'tokens_output':tout})})
-            messages=[{'type':kind if kind in {'user','assistant','idle','tool','error','compaction'} else 'other',
-                       'seq':seq,'facts':reply_projection(raw.encode(),protected)}
-                for kind,seq,raw in _rows(conn,'SELECT type,seq,data FROM session_message ORDER BY seq')]
+            messages=_message_rows(conn,protected)
         out.append({'path':database.relative_to(root).as_posix(),'class':'native-vendor-session-storage',
                     'sessions':sessions,'messages':messages,'instruction_state':instruction_facts(database)})
     for state in (entry for entry in ownership.ordered() if entry.state and entry.started):

@@ -155,6 +155,8 @@ def blocking_record(error, *, stage=None, vault=None, secret_forms=()):
         record['reply_retention_failed']=True
     if getattr(error,'mock_receipt_failed',False) is True:
         record['mock_receipt_failed']=True
+    if getattr(error,'helper_readiness_retention_failed',False) is True:
+        record['helper_readiness_retention_failed']=True
     return record
 
 

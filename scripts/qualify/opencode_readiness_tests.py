@@ -232,6 +232,41 @@ class ReadinessTests(unittest.TestCase):
             self.driver._operation('helper_barrier', {'helper': 'tool'})
         self.assertNotIn(Identity(14, 4), self.driver.identities)
 
+    def test_helper_timeout_retains_presence_and_not_ready_observations(self):
+        for mode in ('absent-folder','absent-file','not-ready','vanished-not-ready'):
+            with self.subTest(mode=mode):
+                self.clock[0]=0;self.driver.phase_deadline=.03
+                folder=Path(self.root.name)/mode
+                self.driver._helper_folder=mock.Mock(return_value=folder)
+                self.driver._descends_from=mock.Mock(return_value=True)
+                if mode!='absent-folder':folder.mkdir()
+                readiness=folder/'tool.json'
+                if mode in {'not-ready','vanished-not-ready'}:
+                    readiness.write_text(json.dumps({'pid':14,'start_ticks':4,'ready':False,'kind':'tool'}))
+                def wait(seconds):
+                    self.clock[0]+=seconds
+                    if mode=='vanished-not-ready':readiness.unlink(missing_ok=True)
+                self.driver._record.reset_mock()
+                with mock.patch.object(transport.time,'sleep',side_effect=wait):
+                    with self.assertRaisesRegex(Blocked,'^helper barrier not reached$'):
+                        self.driver._operation('helper_barrier',{'helper':'tool'})
+                records=[call.args[1] for call in self.driver._record.call_args_list
+                         if call.args[0]=='helper-readiness']
+                self.assertEqual(len(records),1,'helper timeout lacks diagnostic evidence')
+                self.assertEqual(records[0],{'timed_out':True,'folder_exists':mode!='absent-folder',
+                    'readiness_file_exists':mode=='not-ready',
+                    'readiness_seen':mode in {'not-ready','vanished-not-ready'},
+                    'not_ready_seen':mode in {'not-ready','vanished-not-ready'}})
+
+    def test_helper_timeout_retention_failure_preserves_reason_and_flags_uncertainty(self):
+        self.driver.phase_deadline=.03
+        self.driver._helper_folder=mock.Mock(return_value=Path(self.root.name)/'missing')
+        self.driver._record.side_effect=Blocked('FAKE evidence sink refused')
+        with self.assertRaisesRegex(Blocked,'^helper barrier not reached$') as raised:
+            self.driver._operation('helper_barrier',{'helper':'tool'})
+        from opencode_safety import blocking_record
+        self.assertTrue(blocking_record(raised.exception).get('helper_readiness_retention_failed'))
+
     def test_helper_wait_rejects_changed_parent_before_readiness(self):
         folder = Path(self.root.name) / 'observations'; folder.mkdir()
         self.driver._helper_folder = mock.Mock(return_value=folder)

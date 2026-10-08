@@ -1407,6 +1407,20 @@ owned-process/pgrep/lock absence proof, retain allow-listed native session,
 message, instruction, log and consistent VIA Store projections, reapply the
 secrecy scan, and remove the private run root with an absence record. Raw
 storage, log text, credentials and bearer handles are never copied to evidence.
+Every native case-session message and part is retained as a closed diagnostic
+projection linked by `sessionID` and message sequence: role, part type, native
+built-in tool name (otherwise `other`), tool status, finish reason, fixed E34
+error name (otherwise `other`) and token counts. The E8 `streaming` tool state
+maps to `pending`; an unavailable status/count remains null. Unknown part and
+finish labels become `other`. Text, tool arguments, tool output and paths are
+never retained in these projections. Read-only message snapshots precede
+cleanup, preserving case evidence even if cleanup fails; after successful
+cleanup the final native export includes the settled projections. Message and
+part exports retain the existing byte/row bounds and a 65,536-part bound.
+On a helper-barrier timeout, retain only folder/readiness-file presence,
+whether readiness was seen and whether a non-ready file was seen. Failure to
+retain that evidence preserves the timeout and marks retention uncertainty.
+No failed helper attempt causes an automatic model re-ask.
 The minimal PATH links the exact checked system `rg`; fake LSP/local helpers
 avoid vendor installs. Inventory still covers all private HOME/XDG, namespace
 and fixture `.opencode` roots. Credential files remain existence/mode only;

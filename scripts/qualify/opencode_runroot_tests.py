@@ -1,6 +1,7 @@
 """Review-29 offline ownership, discovery and diagnostic regressions (§13)."""
 
 import contextlib
+import json
 import os
 from pathlib import Path
 import shutil
@@ -40,6 +41,109 @@ def private_runtime():
 
 
 class RunRootTests(unittest.TestCase):
+    def message_database(self,base):
+        database=base/'vendor'/'opencode.db';database.parent.mkdir(parents=True)
+        with sqlite3.connect(database) as conn:
+            conn.execute('CREATE TABLE session_v2 (id,directory,model,cost,tokens_input,tokens_output)')
+            conn.execute('CREATE TABLE session_message (session_id,type,seq,data)')
+            conn.execute('CREATE TABLE instruction_state (session_id,epoch_start,through_seq,initial_values,current_values)')
+            for sid in ('ses_FAKE_pass','ses_FAKE_block'):
+                conn.execute('INSERT INTO session_v2 VALUES (?,?,?,?,?,?)',(sid,str(base),None,0,0,0))
+        return database
+
+    def test_native_messages_link_sessions_and_retain_only_closed_diagnostic_fields(self):
+        secret='FAKE-private-content-path-token'
+        with tempfile.TemporaryDirectory(prefix='via-ocnative-') as folder:
+            base=Path(folder);database=self.message_database(base)
+            messages=[('ses_FAKE_pass','assistant',1,{
+                'finish':'tool-calls','error':None,'tokens':{'input':10,'output':3,'reasoning':2,
+                    'cache':{'read':4,'write':0}},'content':[
+                    {'type':'reasoning','text':secret},
+                    {'type':'tool','name':'shell','state':{'status':'running','input':{'command':secret},'output':secret}},
+                    {'type':'text','text':secret}]}),
+                ('ses_FAKE_block','assistant',1,{'finish':'error',
+                    'error':{'type':'provider.rate-limit','message':secret,'response':{'body':secret}},
+                    'tokens':{'input':5,'output':0,'reasoning':0,'cache':{'read':0,'write':0}},
+                    'content':[{'type':'tool','name':secret,'state':{'status':'error',
+                        'error':{'type':secret},'input':secret,'content':secret}},
+                        {'type':secret,'text':secret,'path':secret}]}),
+                ('ses_FAKE_block','user',2,{'text':secret,'files':[{'path':secret}]}),
+                ('ses_FAKE_block','assistant',3,{'finish':secret,'error':{'name':secret},'content':[
+                    {'type':'tool','name':'read','state':{'status':'streaming','input':secret}}]})]
+            with sqlite3.connect(database) as conn:
+                conn.executemany('INSERT INTO session_message VALUES (?,?,?,?)',[
+                    (*row[:3],json.dumps(row[3])) for row in messages])
+            ownership=mock.Mock();ownership.classify.return_value.kind='vendor-private'
+            ownership.ordered.return_value=[]
+            result=roots.native_facts(base,lambda raw:secret.encode() in raw,ownership)[0]['messages']
+            self.assertEqual([row.get('sessionID') for row in result],
+                             ['ses_FAKE_block']*3+['ses_FAKE_pass'])
+            failed=result[0];passed=result[-1]
+            self.assertEqual(failed.get('role'),'assistant')
+            self.assertEqual(failed.get('error_name'),'provider.rate-limit')
+            self.assertEqual(failed.get('finish'),'error')
+            self.assertEqual(failed['parts'][0]['tool_name'],'other')
+            self.assertEqual(failed['parts'][0]['status'],'error')
+            self.assertEqual(failed['parts'][0]['error_name'],'other')
+            self.assertEqual(failed['parts'][1]['type'],'other')
+            self.assertEqual(passed['parts'][1]['tool_name'],'shell')
+            self.assertEqual(passed['parts'][1]['status'],'running')
+            self.assertEqual(passed['tokens'],{'input':10,'output':3,'reasoning':2,'cache_read':4,'cache_write':0})
+            self.assertEqual(result[2]['parts'][0]['status'],'pending')
+            self.assertEqual(result[2]['finish'],'other')
+            self.assertEqual([part['type'] for part in result[1]['parts']],['text','file'])
+            self.assertTrue(all(part['sessionID']==row['sessionID'] for row in result for part in row['parts']))
+            encoded=json.dumps(result).encode()
+            self.assertNotIn(secret.encode(),encoded)
+            for forbidden in ('text','input','output','path','content','response'):
+                for row in result:
+                    self.assertNotIn(forbidden,row)
+                    self.assertTrue(all(forbidden not in part for part in row['parts']))
+
+    def test_message_snapshot_survives_cleanup_failure_without_raw_content(self):
+        with tempfile.TemporaryDirectory(prefix='via-ocnative-') as folder:
+            base=Path(folder);work=base/'run';work.mkdir(mode=0o700)
+            d=transport.Driver('release','fp','pin',base/'evidence',run_root=work)
+            database=self.message_database(work);d.ownership.register(database.parent,'vendor-private')
+            with sqlite3.connect(database) as conn:
+                conn.execute('INSERT INTO session_message VALUES (?,?,?,?)',
+                    ('ses_FAKE_block','assistant',1,json.dumps({'content':[{'type':'text','text':'FAKE-private-text'}]})))
+            d.stop=mock.Mock(side_effect=safety.Blocked('FAKE original cleanup failure'))
+            with self.assertRaisesRegex(safety.Blocked,'^FAKE original cleanup failure$'):d.finish()
+            files=list(d.evidence.glob('*native-messages-before-cleanup.json'))
+            self.assertEqual(len(files),1,'case message evidence disappeared with cleanup failure')
+            raw=files[0].read_bytes();self.assertNotIn(b'FAKE-private-text',raw)
+            self.assertEqual(json.loads(raw)['sources'][0]['messages'][0]['sessionID'],'ses_FAKE_block')
+
+    def test_native_message_unknown_counts_and_protected_enum_values_never_leak(self):
+        with tempfile.TemporaryDirectory(prefix='via-ocnative-') as folder:
+            base=Path(folder);database=self.message_database(base)
+            data={'tokens':{'input':-1,'output':True,'reasoning':float('nan'),
+                'cache':{'read':2**70,'write':0}},'content':[{'type':'tool','name':'shell',
+                'state':{'status':'FAKE-private-status','input':'FAKE-private-argument'}}]}
+            with sqlite3.connect(database) as conn:
+                conn.execute('INSERT INTO session_message VALUES (?,?,?,?)',
+                    ('ses_FAKE_pass','assistant',1,json.dumps(data)))
+            ownership=mock.Mock();ownership.classify.return_value.kind='vendor-private'
+            ownership.ordered.return_value=[]
+            row=roots.native_facts(base,lambda raw:b'shell' in raw,ownership)[0]['messages'][0]
+            self.assertEqual(row['tokens'],{'input':None,'output':None,'reasoning':None,
+                                          'cache_read':None,'cache_write':0})
+            self.assertEqual(row['parts'][0]['tool_name'],'other')
+            self.assertIsNone(row['parts'][0]['status'])
+            self.assertNotIn(b'FAKE-private',json.dumps(row).encode())
+            for fault in ('identity','sequence','shape','bound'):
+                with self.subTest(fault=fault),sqlite3.connect(database) as conn:
+                    conn.execute('DELETE FROM session_message')
+                    conn.execute('INSERT INTO session_message VALUES (?,?,?,?)',
+                        ('bad/path' if fault=='identity' else 'ses_FAKE_pass','assistant',
+                         -1 if fault=='sequence' else 1,
+                         json.dumps({'content':{} if fault=='shape' else [{},{}]})))
+                    conn.commit()
+                    with mock.patch.object(roots,'NATIVE_PARTS',1 if fault=='bound' else 65536):
+                        with self.assertRaisesRegex(safety.Blocked,'native message'):
+                            roots.native_facts(base,lambda raw:False,ownership)
+
     def test_floor_refusal_is_reported_before_invalid_params_schema_assertions(self):
         with tempfile.TemporaryDirectory(prefix='via-ocfloor-') as folder:
             d=transport.Driver('release','fp','pin',Path(folder)/'evidence')
