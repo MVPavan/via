@@ -161,7 +161,7 @@ class OwnedBarrierFixture:
                 if identity is None:
                     continue
                 if self.proc.alive(identity) is True:
-                    sender._signal(identity, signal.SIGKILL)
+                    sender._signal(identity, signal.SIGKILL, role=role)
                 elif self.proc.alive(identity) is None:
                     raise Blocked("fake cleanup identity uncertain")
             self.handle.wait(timeout=2)

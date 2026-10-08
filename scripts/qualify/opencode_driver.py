@@ -678,7 +678,27 @@ class Driver:
         return result
 
     def _locks_owned(self,pid):
-        return all((pid,'FLOCK') in rows for rows in self._lock_rows().values())
+        return all(rows==[(pid,'FLOCK')] for rows in self._lock_rows().values())
+
+    def _bind_cli_generation(self):
+        """§13: a served reply must belong to the registered private daemon."""
+        if self.daemon is None:return  # start() verifies and registers its first status reply.
+        identity=self.daemon;holders=self._lock_rows()
+        if set(holders)!=set(self._lock_paths()):
+            raise Blocked('CLI daemon generation lock ownership changed')
+        if any((pid,kind)!=(identity.pid,'FLOCK') for rows in holders.values() for pid,kind in rows):
+            raise Blocked('CLI daemon generation lock ownership changed')
+        alive=self.proc.alive(identity)
+        if alive is False:
+            # Only clean idle evidence can end this generation; never adopt an
+            # unseen holder or attach another generation's reply to this one.
+            self._refresh_daemon(restart=False)
+            return
+        if alive is not True:
+            raise safety.process_block('daemon',alive,'CLI daemon generation unverifiable')
+        if not all(rows==[(identity.pid,'FLOCK')] for rows in holders.values()):
+            raise Blocked('CLI daemon generation lock ownership changed')
+        self._verify(identity,'daemon')
 
     def _discover_private_lockers(self,*,strict=False):
         """§13: retain unseen daemon generations by private locks/HOME, never by name."""
@@ -823,6 +843,8 @@ class Driver:
             observers={'observe':observe} if self.execute is bounded_command else {}
             rc,out,err=self.execute([str(self._binary),*args],env=self.env,cwd=self.project,
                                     input=input,timeout=timeout,**observers)
+            if not (verb=='daemon' and len(args)>1 and args[1]=='stop'):
+                self._bind_cli_generation()
             if not observers: observe(rc,out,err,complete=True)
         finally:
             if prompt_path is not None: prompt_path.unlink(missing_ok=True)
@@ -1948,7 +1970,7 @@ class Driver:
             if len(seen)>SCAN_ENTRIES: raise Blocked('private secrecy scan entry bound')
         def unavailable(path,error):
             root=self.ownership.classify(path)
-            if isinstance(error,FileNotFoundError):
+            if isinstance(error,FileNotFoundError) or isinstance(error,OSError) and error.errno in {errno.ENOENT,errno.ESRCH}:
                 if root is not None and root.kind=='vendor-private':
                     remember(path); vanished.add(path); return
                 raise _ScanVanished() from error
@@ -2350,8 +2372,18 @@ class Driver:
             fds=os.open('fd',os.O_RDONLY|os.O_DIRECTORY,dir_fd=fd)
             try:
                 for entry in os.listdir(fds):
-                    if os.readlink(entry,dir_fd=fds)!=pipe: continue
-                    raw=self.proc.read(daemon,'fdinfo/'+entry)
+                    try:
+                        if os.readlink(entry,dir_fd=fds)!=pipe: continue
+                    except OSError as error:
+                        if error.errno not in {errno.ENOENT,errno.ESRCH}:raise
+                        self._verify(daemon,'daemon');continue
+                    name='fdinfo/'+entry
+                    try:raw=self.proc.read(daemon,name)
+                    except Blocked as error:
+                        cause=error.__cause__
+                        if not isinstance(cause,OSError) or cause.errno not in {errno.ENOENT,errno.ESRCH} \
+                                or cause.filename!=name:raise
+                        self._verify(daemon,'daemon');continue
                     lines=[line for line in raw.splitlines() if line.startswith(b'flags:')]
                     if len(lines)==1 and int(lines[0].split()[1],8)&os.O_ACCMODE in {os.O_WRONLY,os.O_RDWR}:
                         return True
@@ -2852,7 +2884,7 @@ print('VIA HELPER DONE')
             if not row or row['start_ticks']!=self.daemon.start_ticks or row['state'] not in {'T','t'}:
                 raise Blocked('daemon barrier not held')
             self._verify(identity)
-            self._sigkill_at=time.monotonic(); self.journal._signal(identity,signal.SIGKILL)
+            self._sigkill_at=time.monotonic(); self.journal._signal(identity,signal.SIGKILL,role='anchor')
             self._killed_anchor=identity
             return {'pid_only':True,'monotonic':float(self._sigkill_at)}
         if operation=='vendor_death':
@@ -2910,7 +2942,7 @@ print('VIA HELPER DONE')
         if kind=='server_loss_for_marker':
             if not self.daemon or not self.anchor: raise Blocked('marker server-loss identities absent')
             self._live_pin(session)
-            self._verify(self.anchor); self.journal._signal(self.anchor,signal.SIGKILL)
+            self._verify(self.anchor); self.journal._signal(self.anchor,signal.SIGKILL,role='anchor')
             self._killed_anchor=self.anchor
             return {'anchor_pid_only':True}
         if kind=='helper_stop_proof':
@@ -3751,7 +3783,7 @@ print('VIA HELPER DONE')
         self._record('near-limit-seed',{'source':'synthetic queue seeding against real VIA receipt',
                      'owned_claim_verified':True,'count':len(data),'prompt_bytes':actual_prompt_bytes,
                      'cwd_json_bytes':cwd_bytes})
-        crashed=self.daemon; self._verify(crashed); self.journal._signal(crashed,signal.SIGKILL)
+        crashed=self.daemon; self._verify(crashed); self.journal._signal(crashed,signal.SIGKILL,role='daemon')
         self._await_gone([crashed],'owned VIA crash absence unverifiable')
         if not self.proc.gone(crashed): raise Blocked('owned VIA crash absence unverifiable')
         self.daemon=None; self._armed={}; self._armed_history=set(); self._seam_targets={}

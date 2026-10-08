@@ -11,6 +11,7 @@ from unittest import mock
 from opencode_driver import Driver
 import opencode_safety as safety
 import opencode_via_tests as audit
+from opencode_safety_tests import fake_stat
 
 
 class DaemonGenerationTests(unittest.TestCase):
@@ -86,6 +87,44 @@ class DaemonGenerationTests(unittest.TestCase):
         (d.state/'via.log').write_text(json.dumps({'daemon_shutdown':summary})+'\n')
         (d.state/'via.log').chmod(0o600)
         return d,summary
+
+    def test_cli_reply_cannot_be_served_by_unregistered_successor(self):
+        # G1 verified alive before execute; G2 writes the sole clean-idle record.
+        # A later log-offset proof must never reinterpret that as G1's clean end.
+        for holders in ([(125,'FLOCK')],[(123,'FLOCK'),(125,'FLOCK')]):
+            with self.subTest(holders=holders),tempfile.TemporaryDirectory(prefix='via-oc-daemon-') as root:
+                d,_=self.fixture(root);d._binary=Path('FAKE-via')
+                d.proc.alive.return_value=True
+                d._lock_rows=mock.Mock(return_value={path:holders for path in d._lock_paths()})
+                def served(*args,**kwargs):
+                    d.proc.alive.return_value=False
+                    return 0,b'{"pid":125}',b''
+                d.execute=mock.Mock(side_effect=served)
+                d.start=mock.Mock()
+                with self.assertRaisesRegex(safety.Blocked,'CLI daemon generation lock ownership changed'):
+                    d.via(['daemon','status'])
+                d.execute.assert_called_once();d.start.assert_not_called()
+
+    def test_stopped_daemon_fd_snapshot_skips_closed_entries_and_keeps_identity_checks(self):
+        with tempfile.TemporaryDirectory(prefix='via-oc-daemon-') as root:
+            d,_=self.fixture(root)
+            vendor=safety.Identity(124,457);d.vendor_identity=vendor
+            d.proc=safety.ProcReader(Path(root)/'proc')
+            for identity in (d.daemon,vendor):
+                folder=d.proc.root/str(identity.pid);(folder/'fd').mkdir(parents=True)
+                (folder/'stat').write_bytes(fake_stat(
+                    pid=identity.pid,ticks=identity.start_ticks,state='T'))
+            (d.proc.root/'124/fd/0').symlink_to('pipe:[7788]')
+            (d.proc.root/'123/fd/7').symlink_to('pipe:[7788]')
+            (d.proc.root/'123/fdinfo').mkdir()
+            (d.proc.root/'123/fdinfo/7').write_bytes(b'flags: 01\n')
+            readlink=safety.os.readlink
+            def gone(entry,*,dir_fd):
+                if entry=='8':raise FileNotFoundError(safety.errno.ENOENT,'FAKE closed fd')
+                return readlink(entry,dir_fd=dir_fd)
+            with mock.patch.object(safety.os,'listdir',return_value=['8','7']), \
+                    mock.patch.object(safety.os,'readlink',side_effect=gone):
+                self.assertTrue(d._stdin_held(d.daemon,vendor))
 
     def test_unclean_idle_evidence_never_adopts_a_generation(self):
         for fault in ('locks','open-turn','missing-log','incomplete','non-idle','unknown'):

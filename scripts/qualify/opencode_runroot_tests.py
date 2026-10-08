@@ -372,6 +372,27 @@ class RunRootTests(unittest.TestCase):
             self.assertEqual(len(result), 3)
             self.assertTrue(all(row['locations'] == ['project'] for source in result for row in source['log_facts']))
 
+    def test_cleanup_permission_repair_never_swallows_walk_errors(self):
+        root=Path(tempfile.mkdtemp(prefix=roots.RUN_PREFIX,dir='/tmp'))
+        actual=shutil.rmtree;calls=0
+        def removal(path,**kwargs):
+            nonlocal calls
+            calls+=1
+            if calls==1:kwargs['onexc'](None,str(root),PermissionError())
+            else:actual(path,**kwargs)
+        def unreadable(path,*,onerror=None,**kwargs):
+            if onerror:onerror(PermissionError(13,'FAKE unreadable',str(root/'child')))
+            return iter(())
+        try:
+            with mock.patch.dict(os.environ,{'XDG_RUNTIME_DIR':'/tmp'}), \
+                    mock.patch.object(roots.shutil,'rmtree',side_effect=removal), \
+                    mock.patch.object(roots.os,'walk',side_effect=unreadable):
+                with self.assertRaisesRegex(safety.Blocked,'private run root removal unverified'):
+                    roots.remove_run_root(root,PROOF)
+            self.assertTrue(root.exists(),'unreadable walk must not claim removal')
+        finally:
+            if root.exists():actual(root)
+
     def test_readonly_owned_nested_directories_are_removed_after_proof(self):
         root = Path(tempfile.mkdtemp(prefix=roots.RUN_PREFIX, dir='/tmp'))
         nested = root / 'nested'; nested.mkdir()

@@ -1271,8 +1271,13 @@ class Inventory:
         for index, root in enumerate(self.roots):
             if not root.is_dir() or root.is_symlink():
                 raise Blocked("inventory root unavailable or unsafe")
-            def unreadable(_error):
-                raise Blocked("private inventory contains unreadable directory")
+            def unreadable(error):
+                # A gone child cannot hold a current artifact. Missing baseline
+                # binaries still differ in check(); the root must remain readable.
+                if error.errno in {errno.ENOENT,errno.ESRCH} and error.filename is not None \
+                        and Path(error.filename)!=root and Path(error.filename).is_relative_to(root):
+                    return
+                raise Blocked("private inventory contains unreadable directory") from error
             for folder, dirs, files in os.walk(root, followlinks=False, onerror=unreadable):
                 for name in (*dirs, *files):
                     entries += 1
@@ -1281,29 +1286,35 @@ class Inventory:
                     if name in {"node_modules", "package.json"}:
                         raise Blocked("package artifact appeared in private roots")
                     path = Path(folder) / name
-                    row = path.lstat()
-                    if stat.S_ISLNK(row.st_mode):
-                        raise Blocked("inventory contains unreviewed symbolic link")
-                    if stat.S_ISREG(row.st_mode):
-                        protected = credential_metadata_only(name)
-                        if protected:
-                            if row.st_mode & 0o111:
+                    try:
+                        row = path.lstat()
+                        if stat.S_ISLNK(row.st_mode):
+                            raise Blocked("inventory contains unreviewed symbolic link")
+                        if stat.S_ISREG(row.st_mode):
+                            protected = credential_metadata_only(name)
+                            if protected:
+                                if row.st_mode & 0o111:
+                                    binaries[(index, str(path.relative_to(root)))] = (
+                                        "metadata-only", row.st_dev, row.st_ino, row.st_size,
+                                        row.st_mode, row.st_mtime_ns, row.st_ctime_ns)
+                                continue
+                            with path.open("rb") as file:
+                                prefix = file.read(4)
+                            if row.st_mode & 0o111 or prefix == b"\x7fELF" \
+                                    or prefix[:2] == b"MZ" or prefix in {b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf"}:
+                                if self.embedded_runtime is not None and self.embedded_runtime.accept(path,row):
+                                    continue
+                                if self.git_templates is not None and self.git_templates.accept(path,row):
+                                    continue
+                                if row.st_size > ARCHIVE_BYTES:
+                                    raise Blocked("private binary inventory size exceeds bound")
                                 binaries[(index, str(path.relative_to(root)))] = (
-                                    "metadata-only", row.st_dev, row.st_ino, row.st_size,
-                                    row.st_mode, row.st_mtime_ns, row.st_ctime_ns)
+                                    row.st_dev, row.st_ino, row.st_size, sha256(path))
+                    except OSError as error:
+                        if error.errno in {errno.ENOENT,errno.ESRCH}:
+                            # Snapshot absence is safe; baseline loss still fails check().
                             continue
-                        with path.open("rb") as file:
-                            prefix = file.read(4)
-                        if row.st_mode & 0o111 or prefix == b"\x7fELF" \
-                                or prefix[:2] == b"MZ" or prefix in {b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf"}:
-                            if self.embedded_runtime is not None and self.embedded_runtime.accept(path,row):
-                                continue
-                            if self.git_templates is not None and self.git_templates.accept(path,row):
-                                continue
-                            if row.st_size > ARCHIVE_BYTES:
-                                raise Blocked("private binary inventory size exceeds bound")
-                            binaries[(index, str(path.relative_to(root)))] = (
-                                row.st_dev, row.st_ino, row.st_size, sha256(path))
+                        raise Blocked("private inventory entry unreadable") from error
         return binaries
 
     def check(self):
@@ -1506,8 +1517,7 @@ class StopJournal:
         self.path, self.proc, self.sender = Path(path), proc, sender
         self.recovery_fact = None
 
-    def _signal(self, identity, signum):
-        role='anchor' if signum==signal.SIGKILL else 'daemon'
+    def _signal(self, identity, signum, *, role):
         with block_context(process_role=role): self.proc.verify(identity)
         if self.sender is not None:
             # An injected sender is only for synthetic-proc self-tests.
@@ -1536,7 +1546,7 @@ class StopJournal:
             file.write(data)
             file.flush()
             os.fsync(file.fileno())
-        self._signal(identity, signal.SIGSTOP)
+        self._signal(identity, signal.SIGSTOP, role='daemon')
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             row = self.proc.stat(identity.pid)
@@ -1582,7 +1592,7 @@ class StopJournal:
             if proof is not None:
                 self.recovery_fact["proof"] = proof
             return True
-        self._signal(identity, signal.SIGCONT)
+        self._signal(identity, signal.SIGCONT, role='daemon')
         self.path.unlink()
         self.recovery_fact = {"identity": identity.report(), "disposition": "resumed", "signalled": True}
         return True
@@ -1591,7 +1601,7 @@ class StopJournal:
         if self.path.exists():
             self.recover()
         else:
-            self._signal(identity, signal.SIGCONT)
+            self._signal(identity, signal.SIGCONT, role='daemon')
 
 
 def stop_proof(*, process_states, locks_free, uncertain=(), pgrep_clear=None):

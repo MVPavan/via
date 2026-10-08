@@ -222,7 +222,7 @@ class DriverTests(unittest.TestCase):
             self.assertEqual(d._killed_anchor,d.anchor)
             d.proc.verify.assert_called_with(d.anchor)
             import signal
-            d.journal._signal.assert_called_with(d.anchor,signal.SIGKILL)
+            d.journal._signal.assert_called_with(d.anchor,signal.SIGKILL,role='anchor')
 
     def test_info_startup_503_waits_for_matching_owned_server(self):
         with tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
@@ -770,6 +770,7 @@ class DriverTests(unittest.TestCase):
             d._binary=root/'release'; d.env={'VIA_FAILPOINT_DIR':str(root)}; d.handles['s_fixture']='memory-handle'
             d.daemon=Identity(7,9); d._armed[point]=1; d._event_thread=object()
             d.proc=mock.Mock(); d.proc.alive.return_value=True
+            d._lock_rows=mock.Mock(return_value={path:[(7,'FLOCK')] for path in d._lock_paths()})
             d.owned_replies=[{'session_id':'s_fixture','vendor_session_id':'ses_fixture'}]
             d.build_hashes={'release':'a'*64,'failpoints':'b'*64}
             d.fake_gate_manifest={'verified':True,'via_builds':dict(d.build_hashes),'source_sha256':'c'*64,'tests':[name]}

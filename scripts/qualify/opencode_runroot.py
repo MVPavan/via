@@ -176,7 +176,8 @@ def remove_run_root(root,proof):
         # Repair the whole tree once, then retry; never weaken a file or follow a link.
         count=0
         root.chmod(0o700,follow_symlinks=False)
-        for current,directories,_files in os.walk(root,followlinks=False):
+        def unreadable(error):raise error  # Never claim removal after an incomplete repair walk.
+        for current,directories,_files in os.walk(root,followlinks=False,onerror=unreadable):
             for name in directories:
                 path=Path(current)/name;info=path.lstat();count+=1
                 if count>CLEANUP_ENTRIES: raise safety.Blocked('run root cleanup entry bound')

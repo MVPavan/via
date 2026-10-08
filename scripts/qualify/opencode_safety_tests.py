@@ -281,6 +281,46 @@ class SafetyTests(unittest.TestCase):
                 self.assertBlocked(inventory.check, 'package artifact appeared in private roots')
                 target.rmdir() if target.is_dir() else target.unlink()
 
+    def test_inventory_vanishing_snapshot_entries_do_not_hide_baseline_changes(self):
+        root=self.root/'inventory';root.mkdir()
+        inventory=safety.Inventory([root])
+        entry=root/'ephemeral';entry.write_bytes(b'FAKE temporary metadata')
+        for operation in ('lstat','open'):
+            original=getattr(Path,operation)
+            def gone(path,*args,**kwargs):
+                if path==entry:raise FileNotFoundError(safety.errno.ENOENT,'FAKE vanished')
+                return original(path,*args,**kwargs)
+            with self.subTest(operation=operation),mock.patch.object(Path,operation,gone):
+                self.assertTrue(inventory.check())
+        entry.unlink()
+        binary=root/'existing';binary.write_bytes(b'\x7fELF FAKE baseline')
+        inventory=safety.Inventory([root]);binary.unlink()
+        self.assertBlocked(inventory.check,'new or changed binary appeared in private roots')
+
+    def test_inventory_walk_error_skips_gone_subtree_but_not_root_or_permissions(self):
+        root=self.root/'inventory';root.mkdir();inventory=safety.Inventory([root])
+        def walk(path,*,onerror,**kwargs):
+            onerror(FileNotFoundError(safety.errno.ENOENT,'FAKE vanished',str(root/'child')))
+            return iter(())
+        with mock.patch.object(safety.os,'walk',side_effect=walk):
+            self.assertTrue(inventory.check())
+        for path,code in ((root,safety.errno.ENOENT),(root/'child',safety.errno.EACCES)):
+            def failed(_path,*,onerror,**kwargs):
+                onerror(OSError(code,'FAKE failure',str(path)));return iter(())
+            with mock.patch.object(safety.os,'walk',side_effect=failed):
+                self.assertBlocked(inventory.check,'private inventory contains unreadable directory')
+
+    def test_stop_signal_uses_explicit_caller_role(self):
+        journal=safety.StopJournal(self.root/'journal',self.proc,sender=mock.Mock())
+        def unverified(identity):
+            raise safety.process_block(safety._BLOCK_CONTEXT.get()['process_role'],False,
+                                       'owned process is not verified alive')
+        with mock.patch.object(self.proc,'verify',side_effect=unverified):
+            with self.assertRaises(safety.Blocked) as caught:
+                journal._signal(self.identity,signal.SIGKILL,role='daemon')
+        self.assertEqual(safety.blocking_record(caught.exception)['process'],
+                         {'role':'daemon','liveness':False})
+
     def test_new_binary_and_binary_magic_stops(self):
         root = self.root / "home"
         root.mkdir()

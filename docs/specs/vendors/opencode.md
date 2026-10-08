@@ -1337,7 +1337,11 @@ CLI acquisition identifies the new daemon through its status reply and both
 owned locks, using the same private state/runtime/HOME as the first start.
 Each start and proven clean idle end is retained as a numbered generation;
 every process-verification block retains a fixed role and false/unknown
-liveness. No daemon identity is renewed from elapsed time alone.
+liveness. No daemon identity is renewed from elapsed time alone. After every
+CLI execution except `daemon stop`, both private locks must have exactly the
+registered PID as their sole FLOCK holder before its reply is trusted. A foreign,
+additional or unregistered holder blocks; a definitively ended generation goes
+through the same clean-idle proof, never adoption from a later shutdown record.
 Cleanup also discovers daemon generations started by a private CLI before the
 runner registered them: an invoking-user process must hold a private daemon or
 Store FLOCK and have the exact private HOME, with pid/start ticks re-verified
@@ -1345,7 +1349,12 @@ around those observations. Its PID/start ticks are retained immediately after
 ownership proof. Cleanup waits up to 180 s for observed processes to exit and
 both locks to be released; an ambiguous holder or identity blocks. This covers
 bounded mock-abort retries followed by the designed idle shutdown without
-keepalives or signalling a newly discovered process.
+keepalives or signalling a newly discovered process. This backstop is limited:
+unregistered processes are discoverable by private lock ownership or an
+absolute private-run-root argument. A child with only relative arguments and
+no private lock can evade that supplemental search; tracked identities and
+helper lineage/markers remain the primary process proof. This is a recorded
+qualification limitation, not a universal proof against hostile descendants.
 Each local mock admits at most the phase's physical-request ceiling; retries
 are included. Each provider also has at most 64 handled connections (16 active,
 5 s header/body deadline), and exceeding that transport ceiling blocks closure.
@@ -1588,7 +1597,12 @@ admits no model request and requires no config.updated event as proof.
 Derive the preflight request ceiling from its actual turn pattern: one labelled
 bootstrap plus each repository sentinel, times the observed two requests per
 mock turn. The current three sentinels yield eight mock requests and zero
-public requests. Persist each sentinel's received count even if its turn blocks;
+public requests. The bound deliberately allows one preflight daemon generation:
+an idle exit within preflight requires another two-request bootstrap charged
+to the same eight-request ceiling, which can block that phase. The runner does
+not replenish or enlarge a phase ceiling when a daemon restarts; later phases
+use their existing finite ceilings and count every re-bootstrap request.
+Persist each sentinel's received count even if its turn blocks;
 the bootstrap has its own labelled receipt. A sentinel receipt explicitly
 includes any re-bootstrap traffic during its spawn and records that bootstrap
 count, so it is not a pure sentinel-only request count. Receipt publication
