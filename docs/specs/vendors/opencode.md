@@ -1442,6 +1442,26 @@ never retained in these projections. Read-only message snapshots precede
 cleanup, preserving case evidence even if cleanup fails; after successful
 cleanup the final native export includes the settled projections. Message and
 part exports retain the existing byte/row bounds and a 65,536-part bound.
+Public-free helper readiness allows 120 s for the model to produce its tool
+call; loopback mock helpers and other owned readiness facts retain the 30 s
+bound. Both waits check identity and signals each poll and clip to the current
+phase deadline. The cancellation helper's barrier remains 180 s after readiness
+and the prompt requests a shell timeout of 180,000 ms from tool launch. These
+bounds outlast the immediate cancel point and its bounded acknowledgement and
+cleanup; the model-readiness wait does not consume the running helper's barrier.
+For every admitted public-free case turn, retain a closed timeline linked by
+VIA session/turn and native `sessionID`, with elapsed milliseconds from CLI
+submission dispatch: first assistant message, first tool part, verified helper
+readiness, and native terminal. The pinned E8 `session.step.started` creates the
+assistant message; `session.tool.input.started` creates its tool part. Timings
+use the owned SSE observer's local monotonic receipt time, not vendor clocks,
+and the verified helper observation. Only events after the exact owned input's
+delivery and before the next delivery/terminal count, from the same owned
+vendor generation. Missing milestones remain null; these diagnostics never
+pass a gate. Preserve accumulated observations across event-capture resets and
+export before and after cleanup, including blocked cases. Retain no message,
+tool input/output, path or exception text. The timeline count is bounded by
+the sum of the phase public-turn ceilings.
 On a helper-barrier timeout, retain only folder/readiness-file presence,
 whether readiness was seen and whether a non-ready file was seen. Failure to
 retain that evidence preserves the timeout and marks retention uncertainty.

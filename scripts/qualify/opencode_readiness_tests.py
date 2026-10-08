@@ -14,6 +14,108 @@ from opencode_safety import Blocked, Identity
 
 
 class ReadinessTests(unittest.TestCase):
+    def test_public_helper_waits_past_thirty_seconds_and_mock_does_not(self):
+        import opencode_safety as safety
+        folder=Path(self.root.name)/'late-helper';folder.mkdir()
+        d=self.driver;d._helper_folder=mock.Mock(return_value=folder)
+        d._descends_from=mock.Mock(return_value=True);d.phase_deadline=200
+        for model in (safety.MOCK_IDENTITY,safety.FREE_IDENTITY):
+            with self.subTest(model=model):
+                self.clock[0]=0;(folder/'tool.json').unlink(missing_ok=True)
+                d.last_request['model']=model
+                def advance(seconds):
+                    self.clock[0]+=seconds
+                    if self.clock[0]>=40:
+                        (folder/'tool.json').write_text(json.dumps({
+                            'pid':14,'start_ticks':4,'ready':True,'kind':'tool'}))
+                with mock.patch.object(transport.time,'sleep',side_effect=advance):
+                    if model==safety.MOCK_IDENTITY:
+                        with self.assertRaisesRegex(Blocked,'helper barrier not reached'):
+                            d._operation('helper_barrier',{'helper':'tool','session':'s_owned'})
+                        self.assertAlmostEqual(self.clock[0],30)
+                    else:
+                        self.assertTrue(d._operation('helper_barrier',{
+                            'helper':'tool','session':'s_owned'})['owned'])
+                        self.assertGreaterEqual(self.clock[0],40)
+
+    def test_public_helper_bound_still_clips_to_phase_and_checks_identity(self):
+        import opencode_safety as safety
+        d=self.driver;d.last_request['model']=safety.FREE_IDENTITY
+        d.phase_deadline=45;d._helper_folder=mock.Mock(return_value=Path(self.root.name)/'missing')
+        with self.assertRaisesRegex(Blocked,'helper barrier not reached'):
+            d._operation('helper_barrier',{'helper':'tool','session':'s_owned'})
+        self.assertEqual(self.clock[0],45)
+        self.clock[0]=0;d.proc.verify.side_effect=Blocked('owned process identity changed')
+        with self.assertRaisesRegex(Blocked,'identity changed'):
+            d._operation('helper_barrier',{'helper':'tool','session':'s_owned'})
+        self.assertEqual(self.clock[0],0)
+
+    def test_public_timeline_is_closed_correlated_and_survives_capture_reset(self):
+        import opencode_safety as safety
+        d=self.driver;generation=d.vendor_identity
+        receipt={'session_id':'s_owned','turn':'s_owned/1'}
+        d._timeline_submit(receipt,safety.FREE_IDENTITY,0,generation)
+        sid='ses_FAKE_owned';d._timeline_bind('s_owned',sid,turn=1)
+        def event(kind,at,**fields):
+            return {'type':kind,'_observed_at':at,'data':{'sessionID':sid,**fields}}
+        d._timeline_event(event('session.step.started',.5,assistantMessageID='FAKE-before-delivery'),generation)
+        d._timeline_event(event('session.inbox.delivered',1,inboxID=transport.input_id('s_owned',1)),generation)
+        d._timeline_event(event('session.step.started',2,assistantMessageID='FAKE-private'),Identity(99,9))
+        d._timeline_event(event('session.step.started',2,assistantMessageID='FAKE-private'),generation)
+        d._timeline_event(event('session.tool.input.started',3,assistantMessageID='FAKE-private',
+            id='FAKE-private',name='shell',text='FAKE-private'),generation)
+        self.clock[0]=4;d._timeline_ready('s_owned',120)
+        d._timeline_event(event('session.execution.interrupted',5,reason='FAKE-private'),generation)
+        d.events=[];d.vendor_identity=Identity(23,5)
+        d._timeline_submit({'session_id':'s_mock','turn':'s_mock/1'},safety.MOCK_IDENTITY,6,d.vendor_identity)
+        d._timeline_flush('model-timelines')
+        rows=d._record.call_args.args[1]['turns']
+        self.assertEqual(len(rows),1)
+        self.assertEqual(rows[0]['elapsed_ms'],{'first_assistant':2000,'first_tool':3000,
+            'readiness':4000,'terminal':5000})
+        self.assertEqual(rows[0]['sessionID'],sid)
+        self.assertEqual(rows[0]['terminal'],'interrupted')
+        self.assertNotIn('FAKE-private',json.dumps(rows))
+
+    def test_timeline_replays_buffered_delivery_but_excludes_foreign_work(self):
+        import opencode_safety as safety
+        d=self.driver;sid='ses_FAKE_owned';generation=d.vendor_identity
+        d._timeline_submit({'session_id':'s_owned','turn':'s_owned/1'},safety.FREE_IDENTITY,0,generation)
+        def event(kind,at,**fields):
+            return {'type':kind,'_observed_at':at,'data':{'sessionID':sid,**fields}}
+        d.events=[event('session.inbox.delivered',1,inboxID=transport.input_id('s_owned',1)),
+            event('session.step.started',2,assistantMessageID='FAKE-private'),
+            event('session.inbox.delivered',3,inboxID='msg_FAKE_foreign'),
+            event('session.tool.input.started',4,assistantMessageID='FAKE-private'),
+            event('session.execution.succeeded',5)]
+        d._timeline_bind('s_owned',sid,turn=1);d._timeline_flush('model-timelines')
+        row=d._record.call_args.args[1]['turns'][0]
+        self.assertEqual(row['elapsed_ms'],{'first_assistant':2000,'first_tool':None,
+            'readiness':None,'terminal':None})
+        self.assertTrue(row['delivery_observed'])
+        self.assertNotIn('FAKE-private',json.dumps(row))
+
+    def test_cli_spawn_resume_and_wait_register_each_public_turn(self):
+        from opencode_c1_tests import envelope
+        from opencode_safety_tests import fake_cli_generation
+        import opencode_safety as safety
+        d=self.driver;fake_cli_generation(d);d._binary=Path('FAKE-via')
+        d.last_model=safety.FREE_IDENTITY;d.spending_check=mock.Mock();d._admit_model=mock.Mock()
+        d.execute=mock.Mock(return_value=(0,json.dumps({'session_id':'s_FAKE','turn':'s_FAKE/1',
+            'handle':'h_FAKE_timing','effective':{'effort':None,'max_steps':None}}).encode(),b''))
+        d.via(['spawn','--background','--prompt','FAKE-private'])
+        result=envelope();d.execute.return_value=(0,json.dumps(result).encode(),b'')
+        d.via(['wait','s_FAKE/1','--timeout-ms','0'])
+        d.execute.return_value=(0,json.dumps({'turn':'s_FAKE/2',
+            'effective':{'effort':None,'max_steps':None}}).encode(),b'')
+        d.via(['resume','s_FAKE','--prompt','FAKE-private'])
+        d._timeline_flush('model-timelines')
+        rows=d._record.call_args.args[1]['turns']
+        self.assertEqual([row['turn'] for row in rows],[1,2])
+        self.assertEqual(rows[0]['sessionID'],'ses_FAKE')
+        self.assertNotIn('FAKE-private',json.dumps(rows))
+        self.assertNotIn('h_FAKE_timing',json.dumps(rows))
+
     def host_handover(self):
         d=self.driver; d.state.mkdir(mode=0o700,exist_ok=True)
         path=d.state/'store.sqlite3'
@@ -253,7 +355,7 @@ class ReadinessTests(unittest.TestCase):
                 records=[call.args[1] for call in self.driver._record.call_args_list
                          if call.args[0]=='helper-readiness']
                 self.assertEqual(len(records),1,'helper timeout lacks diagnostic evidence')
-                self.assertEqual(records[0],{'timed_out':True,'folder_exists':mode!='absent-folder',
+                self.assertEqual(records[0],{'timed_out':True,'bound_seconds':30,'folder_exists':mode!='absent-folder',
                     'readiness_file_exists':mode=='not-ready',
                     'readiness_seen':mode in {'not-ready','vanished-not-ready'},
                     'not_ready_seen':mode in {'not-ready','vanished-not-ready'},'failure':None})

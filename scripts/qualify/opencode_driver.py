@@ -36,7 +36,7 @@ from opencode_safety import OwnedHTTP
 from opencode_ownership import OwnershipRegistry
 from opencode_catalog import catalog_record
 from opencode_reply import ReplyEvidence, reply_check
-from opencode_cases import REPOSITORY_SENTINELS
+from opencode_cases import REPOSITORY_SENTINELS, PHASES
 from opencode_events import terminal_event
 from opencode_c1 import TERMINAL_STATES, SCOPES, CANCEL_OUTCOMES, CLEANUP_STATES, ERROR_CODES
 from opencode_runroot import ANCHOR_SOCKET_TAIL, SOCKET_BYTES
@@ -59,6 +59,8 @@ IDLE_RETIREMENT_SECONDS = 90  # §13: natural exit of each process, clipped to i
 CLEANUP_SECONDS = 180  # §13: bounded mock abort/retries, then natural daemon idle shutdown.
 METADATA_EFFORT = 'via-qualification-metadata-only-unoffered'  # Packet §5; C1 §4.
 OWNED_READINESS_SECONDS = 30  # §13: bounded delayed facts within the enclosing phase.
+PUBLIC_HELPER_READINESS_SECONDS = 120  # §13: free-model latency before helper readiness.
+PUBLIC_TIMELINES = sum(phase.public_turns for phase in PHASES)  # §13 per-phase admissions.
 CONFIG_READY_POLL_SECONDS = .2  # §13: only empty or verified previous endpoint maps wait.
 CATALOG_READY_POLL_SECONDS = .2  # §§2.2, 13: catalogue readiness, never request admission.
 BOOTSTRAP_SECONDS = 30  # §13: owned acquisition and all served-fact checks.
@@ -310,6 +312,7 @@ class Driver:
         self.phase_public_left=None; self.phase_mock_left=None; self.helper_ledger={}
         self._cancel_diagnostic_session=None
         self._phase_public_used=0
+        self._timeline_lock=threading.RLock(); self._timelines=[]
         self.helper_channels={}; self.helper_generations={}; self.lifecycle_counter=0
         self.helper_origins={}; self.server_identities=set()
         self.fake_gate_manifest=None
@@ -355,6 +358,75 @@ class Driver:
                                      'runner-evidence',directory=False)
         self.vault.safe_write_json(path,value)
         return path.name
+
+    def _timeline_submit(self,receipt,model,submitted_at,generation):
+        """§13: begin content-free timing at an admitted public CLI submission."""
+        if model!=safety.FREE_IDENTITY:return
+        session=receipt['session_id'];address=receipt['turn']
+        prefix,number=address.rsplit('/',1)
+        if prefix!=session or not number.isdecimal() or not 0<int(number)<2**32:
+            raise Blocked('public timeline turn identity malformed')
+        with self._timeline_lock:
+            if len(self._timelines)>=PUBLIC_TIMELINES:raise Blocked('public timeline admission bound')
+            self._timelines.append({'session_id':session,'turn':int(number),'sessionID':None,
+                'model':model,'elapsed_ms':dict.fromkeys(('first_assistant','first_tool','readiness','terminal')),
+                'terminal':None,'readiness_bound_seconds':None,'delivery_observed':False,
+                '_submitted':submitted_at,'_generation':generation,'_closed':False})
+
+    def _timeline_bind(self,session,sid,*,turn=None):
+        """§13: correlate buffered observations without mixing daemon/vendor generations."""
+        with self._events_lock:events=list(self.events)
+        with self._timeline_lock:
+            for row in self._timelines:
+                if row['session_id']==session and row['_generation']==self.vendor_identity \
+                        and (turn is None or row['turn']==turn):
+                    if row['sessionID'] not in (None,sid):raise Blocked('public timeline session changed')
+                    row['sessionID']=sid
+        for event in events:self._timeline_event(event,self.vendor_identity)
+
+    def _timeline_event(self,event,generation):
+        """§13/E8: timestamp first native assistant/tool creation inside the owned input interval."""
+        at=event.get('_observed_at');data=event.get('data',event)
+        if type(at) not in {int,float} or not math.isfinite(at) or type(data) is not dict:return
+        kind=event.get('type');sid=self._event_session(event)
+        with self._timeline_lock:
+            for row in self._timelines:
+                if row['_generation']!=generation or row['sessionID']!=sid or sid is None \
+                        or at<row['_submitted'] or row['_closed']:continue
+                if kind=='session.inbox.delivered':
+                    owned=data.get('inboxID',data.get('id'))==input_id(row['session_id'],row['turn'])
+                    if owned:row['delivery_observed']=True
+                    elif row['delivery_observed']:row['_closed']=True
+                    continue
+                if not row['delivery_observed']:continue
+                milestone=None
+                if kind=='session.step.started' and type(data.get('assistantMessageID')) is str:
+                    milestone='first_assistant'
+                elif kind=='session.tool.input.started' and type(data.get('assistantMessageID')) is str:
+                    milestone='first_tool'
+                elif kind in {'session.execution.succeeded','session.execution.failed','session.execution.interrupted'}:
+                    milestone='terminal';row['terminal']=kind.rsplit('.',1)[1];row['_closed']=True
+                if milestone and row['elapsed_ms'][milestone] is None:
+                    row['elapsed_ms'][milestone]=int((at-row['_submitted'])*1000)
+
+    def _timeline_ready(self,session,seconds,*,observed=True):
+        """§13: mark only verified helper readiness for the current admitted public turn."""
+        with self._timeline_lock:
+            rows=[row for row in self._timelines if row['session_id']==session
+                  and row['_generation']==self.vendor_identity and not row['_closed']]
+            if rows:
+                row=rows[-1]
+                row['readiness_bound_seconds']=seconds
+                if observed and row['elapsed_ms']['readiness'] is None:
+                    row['elapsed_ms']['readiness']=int(max(0,time.monotonic()-row['_submitted'])*1000)
+
+    def _timeline_flush(self,label):
+        """§13: persist closed observed latencies; absent milestones remain unavailable."""
+        with self._timeline_lock:
+            rows=[{key:(dict(value) if type(value) is dict else value)
+                   for key,value in row.items() if not key.startswith('_')} for row in self._timelines]
+        if rows:self._record(label,{'submission_basis':'CLI-dispatch',
+            'observation_basis':'owned-SSE-receipt-and-verified-helper-readiness','turns':rows})
 
     def _reply_protected(self,raw):
         return self.vault.leaks(raw) or any(form and form in raw
@@ -883,6 +955,7 @@ class Driver:
             timeout=min(timeout,remaining)
         try:
             command_started=time.monotonic()
+            submitted_model=self.last_model;submitted_generation=self.vendor_identity
             def observe(rc,out,err,**metadata):
                 self.reply_evidence.capture('via',self._cli_verb(args),out,exit_code=rc,**metadata)
                 if err: self.reply_evidence.capture('via-stderr',self._cli_verb(args),err,exit_code=rc,**metadata)
@@ -928,13 +1001,21 @@ class Driver:
             self.handles[bearer['session_id']]=bearer['handle']
             self.secret_forms.append(bearer['handle'].encode())
             self.bearer_forms.add(bearer['handle'].encode())
-        if schema=='envelope': self.account(value)
+        if verb in {'spawn','resume'}:
+            timing=dict(receipt if receipt is not None else value)
+            if verb=='resume':timing['session_id']=args[1]
+            self._timeline_submit(timing,submitted_model,command_started,submitted_generation)
+        if schema=='envelope':
+            if self._timelines:
+                self._timeline_bind(value['session_id'],value['vendor_session_id'],turn=value['turn'])
+            self.account(value)
         if receipt is not None: self.owned_replies.append(receipt)
         self.owned_replies.append(value)
         if verb in {'spawn','resume'}:
             internal=dict(receipt if receipt is not None else value)
             if verb=='resume': internal['session_id']=args[1]
-            self.last_request={'verb':verb,'receipt':internal,'prompt':prompt,'args':args}
+            self.last_request={'verb':verb,'receipt':internal,'prompt':prompt,'args':args,
+                               'model':submitted_model}
         if verb=='cancel': self.last_cancel={'at':time.monotonic(),'reply':value,'held':dict(self._armed),
                                             'elapsed_ms':int((time.monotonic()-command_started)*1000)}
         self._record('cli',{'verb':self._cli_verb(args),'rc':rc,'schema':schema,'fields':sorted(value),
@@ -1718,6 +1799,7 @@ class Driver:
     def _vendor_sid(self,session):
         for reply in reversed(self.owned_replies):
             if reply.get('session_id')==session and type(reply.get('vendor_session_id')) is str:
+                self._timeline_bind(session,reply['vendor_session_id'])
                 return reply['vendor_session_id']
         if session not in self.handles: raise Blocked('confirmed vendor session ID missing')
         def read():
@@ -1726,6 +1808,7 @@ class Driver:
             if type(sid) is str:
                 if value.get('vendor_identity_verified') is not True:
                     raise Blocked('native session identity unverified')
+                self._timeline_bind(session,sid)
                 return sid
             if sid is not None and type(sid) is not str:
                 raise Blocked('native session identity malformed')
@@ -1774,6 +1857,7 @@ class Driver:
             raise Blocked('owned event handshake failed within absolute deadline') from error
         if response.status!=200:
             response.close(); self.close_event_capture(); raise Blocked('owned native event stream unavailable')
+        generation=self.vendor_identity
         def consume():
             current=bytearray(); data=[]; event_id=None; total=0
             try:
@@ -1793,8 +1877,10 @@ class Driver:
                             if type(value) is not dict or type(value.get('type')) is not str:
                                 raise Blocked('native event shape unavailable')
                             with self._events_lock:
-                                self.events.append({'seq':len(self.events)+1,'vendor_event_id':event_id,
-                                                    '_observed_at':time.monotonic(),**value})
+                                event={'seq':len(self.events)+1,'vendor_event_id':event_id,
+                                       **value,'_observed_at':time.monotonic()}
+                                self.events.append(event)
+                            self._timeline_event(event,generation)
                         current.clear(); data=[]; event_id=None
                     elif line.startswith(b'data:'): data.append(line[5:].lstrip().rstrip(b'\r\n'))
                     elif line.startswith(b'id:'): event_id=line[3:].strip().decode('utf-8','strict')
@@ -3206,6 +3292,11 @@ def fail_closed(error,reached):
         if kind=='helper_barrier':
             if args.get('cancel_diagnostic') is True:
                 self._cancel_diagnostic_session=self._vendor_sid(args['session'])
+            request=self.last_request or {};receipt=request.get('receipt',{})
+            session=args.get('session',receipt.get('session_id'))
+            public=request.get('model')==safety.FREE_IDENTITY and session==receipt.get('session_id')
+            seconds=PUBLIC_HELPER_READINESS_SECONDS if public else OWNED_READINESS_SECONDS
+            if public:self._timeline_ready(session,seconds,observed=False)
             helper=args['helper']; path=self._helper_folder(self.project)/(helper+'.json')
             readiness_seen=False;not_ready_seen=False;failure_seen=None
             def read():
@@ -3231,11 +3322,14 @@ def fail_closed(error,reached):
                 self.identities.add(identity); self.helper_ledger[identity]=dict(row)
                 self.helper_generations[identity]=self.vendor_identity; self.helper_origins[identity]=path.parent
                 return {'started':True,'owned':True,**row}
-            try:return self._await_owned(read,'helper barrier not reached')
+            try:
+                result=self._await_owned(read,'helper barrier not reached',seconds=seconds)
+                if public:self._timeline_ready(session,seconds)
+                return result
             except Blocked as error:
                 if str(error)=='helper barrier not reached':
                     try:
-                        self._record('helper-readiness',{'timed_out':True,
+                        self._record('helper-readiness',{'timed_out':True,'bound_seconds':seconds,
                             'folder_exists':path.parent.exists(),'readiness_file_exists':path.exists(),
                             'readiness_seen':readiness_seen,'not_ready_seen':not_ready_seen,
                             'failure':failure_seen})
@@ -3425,13 +3519,16 @@ def fail_closed(error,reached):
         """Final cleanup/immutable-pin proof; uncertainty retains roots and fails closure."""
         failures=[];traffic={'received_requests':0,'providers':0}
         diagnostic_error=None
+        try:self._timeline_flush('model-timelines-before-cleanup')
+        except BaseException as error:diagnostic_error=error
         if self.external_root:
             try:
                 from opencode_runroot import vendor_message_facts
                 self._record('native-messages-before-cleanup',{'sources':vendor_message_facts(
                     self.work,self._reply_protected,self.ownership,
                     cancel_session=self._cancel_diagnostic_session)})
-            except BaseException as error:diagnostic_error=error
+            except BaseException as error:
+                if diagnostic_error is None:diagnostic_error=error
         try: proof=self.stop()
         except BaseException as error: failures.append(error)
         finally:
@@ -3463,6 +3560,9 @@ def fail_closed(error,reached):
                 failure=Blocked('mock received request aggregate unverified')
                 failure.__cause__=error;failures.append(failure)
             self.mock_providers.clear()
+        try:self._timeline_flush('model-timelines')
+        except BaseException as error:
+            if diagnostic_error is None:diagnostic_error=error
         if diagnostic_error is not None:
             diagnostic_error.diagnostic_failure=True
             failures.append(diagnostic_error)
