@@ -51,7 +51,7 @@ class IsolationTests(unittest.TestCase):
         module=self.module()
         for name in module.DISCOVERY_NAMES:
             with self.subTest(name=name),tempfile.TemporaryDirectory(prefix='via-ocisolation-') as folder:
-                base=Path(folder);root=base/'run';root.mkdir()
+                base=Path(folder);root=base/'run';root.mkdir(mode=0o700);root.chmod(0o700)
                 path=base/name;path.parent.mkdir(parents=True,exist_ok=True);path.touch()
                 with mock.patch.object(Path,'read_bytes',side_effect=AssertionError('must not read')):
                     with self.assertRaisesRegex(safety.Blocked,'ancestor discovery source present'):
@@ -189,7 +189,7 @@ class IsolationTests(unittest.TestCase):
     def test_ancestor_block_retains_path_classes_and_checked_names(self):
         module=self.module()
         with tempfile.TemporaryDirectory(prefix='via-ocisolation-') as folder:
-            base=Path(folder);root=base/'run';root.mkdir();(base/'AGENTS.md').touch()
+            base=Path(folder);root=base/'run';root.mkdir(mode=0o700);root.chmod(0o700);(base/'AGENTS.md').touch()
             with self.assertRaisesRegex(safety.Blocked,'ancestor discovery source present') as raised:
                 module.check_ancestors(root)
             record=raised.exception.ancestor_discovery

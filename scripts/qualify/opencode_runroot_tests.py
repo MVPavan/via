@@ -178,6 +178,43 @@ class RunRootTests(unittest.TestCase):
                 d.stop.assert_called_once(); native.assert_not_called()
                 d.secrecy_scan.assert_not_called()
 
+    def test_cli_launches_and_probes_recheck_before_execution(self):
+        for verb in ('describe','models','spawn','resume','steer'):
+            with self.subTest(verb=verb), private_runtime() as base:
+                d=self.driver(base);d._binary=Path('FAKE-via')
+                d.spending_check=mock.Mock();d._admit_model=mock.Mock()
+                d.execute=mock.Mock(side_effect=AssertionError('FAKE launch reached'))
+                (base/'AGENTS.md').touch()
+                with self.assertRaisesRegex(safety.Blocked,'ancestor discovery source present'):
+                    d.via([verb])
+                d.execute.assert_not_called();d.spending_check.assert_not_called()
+
+    def test_metadata_attempt_rechecks_after_initial_start(self):
+        with private_runtime() as base:
+            d=self.driver(base);d.namespace=d.work/'namespace';d.start=mock.Mock()
+            def rows():
+                (base/'AGENTS.md').touch()
+                return []
+            d._anchor_rows=mock.Mock(side_effect=rows)
+            d.via=mock.Mock(side_effect=AssertionError('FAKE metadata launch reached'))
+            with self.assertRaisesRegex(safety.Blocked,'ancestor discovery source present'):
+                d._credential_refusal()
+            d.via.assert_not_called()
+
+    def test_phase_begin_and_end_bracket_autonomous_host_launches(self):
+        from opencode_cases import DriverAdapter
+        for stage in ('phase_begin','phase_end'):
+            with self.subTest(stage=stage),private_runtime() as base:
+                d=self.driver(base);d.build=mock.Mock();d.set_phase_budget=mock.Mock()
+                adapter=DriverAdapter(d)
+                if stage=='phase_end':
+                    adapter.execute('phase_begin',phase='FAKE',seconds=30,
+                                    public_turns=0,mock_turns=0,build='release')
+                (base/'AGENTS.md').touch()
+                with self.assertRaisesRegex(safety.Blocked,'ancestor discovery source present'):
+                    adapter.execute(stage,phase='FAKE',seconds=30,
+                                    public_turns=0,mock_turns=0,build='release')
+
     def test_context_is_checked_conservatively(self):
         self.assertIn('CONTEXT.md', roots.DISCOVERY_NAMES)
 

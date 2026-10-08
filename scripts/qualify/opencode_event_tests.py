@@ -21,6 +21,16 @@ class EventTests(unittest.TestCase):
             d.via=mock.Mock(return_value={'events':rows,'more':False,'next_after':rows[-1]['seq'] if rows else 0})
             return d._operation('via_events',{'session':SESSION,'turn':turn})
 
+    def test_terminal_event_missing_or_nonstring_type_blocks(self):
+        from opencode_events import terminal_event
+        for kind in (None,1,True,{},[]):
+            with self.subTest(kind=kind):
+                row=event(1,state='completed')
+                if kind is None: row.pop('type')
+                else: row['type']=kind
+                with self.assertRaisesRegex(Blocked,'^C1 event type unavailable$'):
+                    terminal_event([row],SESSION,1)
+
     def test_c1_turn_ended_starts_at_revision_zero_without_a_revision_member(self):
         observed=self.observe([event(1,'turn.queued'),event(2,state='completed')])
         self.assertTrue(observed['complete']);self.assertEqual(observed['terminal_revision'],0)

@@ -1343,10 +1343,18 @@ source blocks. `CONTEXT.md` discovery is unverified (no literal in the pinned
 binary) and is conservatively checked. Each run scans the hash-verified pinned
 binary for these fixed names and records bounded literal offsets, never raw
 strings. Evidence records the checked names, ancestor path/owner classes and
-modes. Repeat the full check before every `start`, mock bootstrap and direct
-vendor seeding, and in `finish` after process cleanup and before native reads
-or the secrecy scan. A later planted discovery source or weakened ownership
-or mode blocks admission.
+modes. Repeat the full check before every `start`, mock bootstrap, direct
+vendor seeding, L11 metadata attempt, and CLI `describe`/`models` probe or
+`spawn`/`resume`/`steer` submission (including driven successor generations).
+Fresh phase-begin and phase-end checks bracket Host's autonomous launches;
+these are phase bracketing, not a per-launch interception inside Host. Failure
+cleanup's `finish` check also brackets an interrupted phase after process
+cleanup and before native reads or the secrecy scan. A later planted discovery
+source or weakened ownership or mode blocks admission.
+The runtime parent on this host is a RAM-backed per-login tmpfs (about 3 GiB);
+capacity exhaustion or disappearance at last logout blocks qualification.
+Every safety/driver block caused by an OS error retains only its fixed errno
+name and trusted code step/line, never the OS message, filename or path.
 
 The qualification daemon config sets a positive `disk.free_floor` of 1 GiB
 (C1 §3.14). VIA's production default is 5 GiB; this host's protected runtime

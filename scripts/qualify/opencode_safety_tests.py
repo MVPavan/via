@@ -140,6 +140,52 @@ class SafetyTests(unittest.TestCase):
         vault.read_once(self.proc, self.identity)
         return vault
 
+    def test_oserror_block_retains_errno_and_trusted_step_without_private_text(self):
+        import opencode_driver as driver
+        for code in (safety.errno.ENOENT,safety.errno.EACCES,safety.errno.ENOSPC,987654,None):
+            for layer in ('safety','driver'):
+                with self.subTest(errno=code,layer=layer):
+                    error=OSError(code,'FAKE PRIVATE MESSAGE','/FAKE-PRIVATE-PATH')
+                    try:
+                        if layer=='safety':
+                            opened=safety.os.open
+                            def read_failure(name,*args,**kwargs):
+                                if name=='environ': raise error
+                                return opened(name,*args,**kwargs)
+                            with mock.patch.object(safety.os,'open',side_effect=read_failure):
+                                self.proc.read(self.identity,'environ')
+                        else:
+                            with mock.patch.object(driver.subprocess,'Popen',side_effect=error):
+                                driver.bounded_command(['FAKE'],env={})
+                    except safety.Blocked as blocked:
+                        record=safety.blocking_record(blocked)
+                    else: self.fail('FAKE error did not block')
+                    expected=safety.errno.errorcode.get(code,'UNAVAILABLE')
+                    self.assertEqual(record['os_error']['errno'],expected)
+                    step=('opencode_safety.ProcReader.read' if layer=='safety'
+                          else 'opencode_driver.bounded_command')
+                    self.assertEqual(record['os_error']['step'],step)
+                    self.assertGreater(record['os_error']['line'],0)
+                    raw=json.dumps(record)
+                    self.assertNotIn('PRIVATE',raw);self.assertNotIn('/FAKE',raw)
+
+    def test_oserror_diagnostics_survive_a_block_wrapper_and_evidence_write(self):
+        error=PermissionError(safety.errno.EACCES,'FAKE PRIVATE MESSAGE','/FAKE-PRIVATE-PATH')
+        try:
+            try:
+                with mock.patch.object(Path,'open',side_effect=error):
+                    self.proc.stat(71)
+            except safety.Blocked as inner:
+                raise safety.Blocked('FAKE wrapped stop') from inner
+        except safety.Blocked as blocked:
+            record=safety.blocking_record(blocked)
+        self.vault().safe_write_json(self.root/'block.json',record)
+        saved=json.loads((self.root/'block.json').read_text())
+        self.assertEqual(saved['os_error']['errno'],'EACCES')
+        self.assertEqual(saved['os_error']['step'],'opencode_safety.ProcReader.stat')
+        self.assertEqual(saved['reason'],'FAKE wrapped stop')
+        self.assertNotIn('PRIVATE',(self.root/'block.json').read_text())
+
     def test_pinned_hash_mismatch_stops(self):
         binary, _sha = self.binary()
         self.assertBlocked(lambda: safety.verify_binary(binary, "0" * 64), 'pinned binary hash mismatch')

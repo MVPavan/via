@@ -68,7 +68,7 @@ def full_sequence(secret_namespace=None):
                 def execute(self,kind,**args):
                     if kind=='namespace': return d._operation(kind,args)
                     if kind=='build_hashes': return {'release':'1'*64,'test-failpoints':'2'*64}
-                    if kind in {'phase_begin','phase_guard','phase_build'}: return {}
+                    if kind in {'phase_begin','phase_end','phase_guard','phase_build'}: return {}
                     if kind=='daemon_stop_proof': return {'proven':True}
                     if kind=='direct_seed': return {key:True for key in (
                         'exact_namespace_layout','chain_0700','known_connection_shape',

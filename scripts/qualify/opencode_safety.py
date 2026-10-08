@@ -94,6 +94,36 @@ def block_context(**fields):
         _BLOCK_CONTEXT.reset(token)
 
 
+# §13: exception/traceback diagnostics stay bounded and retain no OS text or paths.
+OS_ERROR_CHAIN = 16
+OS_ERROR_FRAMES = 64
+
+
+def os_error_record(error):
+    """Retain fixed errno and trusted code step from a bounded cause chain (§13)."""
+    seen=set()
+    for _ in range(OS_ERROR_CHAIN):
+        if error is None or id(error) in seen: return None
+        seen.add(id(error))
+        if isinstance(error,OSError):
+            code=error.errno
+            name=errno.errorcode.get(code,'UNAVAILABLE') if type(code) is int else 'UNAVAILABLE'
+            record={'errno':name,'step':'unavailable','line':0}
+            trace=error.__traceback__
+            for _ in range(OS_ERROR_FRAMES):
+                if trace is None: break
+                frame=trace.tb_frame
+                module=frame.f_globals.get('__name__')
+                if module in {'opencode_safety','opencode_driver'}:
+                    step=frame.f_code.co_qualname.replace('.<locals>.','.')
+                    if re.fullmatch(r'[A-Za-z_][A-Za-z_0-9.]{0,255}',step):
+                        record.update(step=module+'.'+step,line=trace.tb_lineno)
+                trace=trace.tb_next
+            return record
+        error=error.__cause__ if error.__cause__ is not None else error.__context__
+    return None
+
+
 def blocking_record(error, *, stage=None, vault=None, secret_forms=()):
     """Only runner-authored Blocked text may cross the diagnostic sink (§13)."""
     kinds = {'Blocked', 'EvidenceUnavailable', 'QualificationFailure', 'ValueError',
@@ -108,6 +138,8 @@ def blocking_record(error, *, stage=None, vault=None, secret_forms=()):
     context = getattr(error, 'block_context', _BLOCK_CONTEXT.get())
     record = {key: context.get(key) for key in ('phase', 'case', 'verb')}
     record.update(kind=kind if kind in kinds else 'UnexpectedException', reason=reason)
+    os_failure=os_error_record(error)
+    if os_failure is not None: record['os_error']=os_failure
     if stage is not None:
         record['stage'] = stage
     replies=getattr(error,'reply_evidence',None)

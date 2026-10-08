@@ -54,12 +54,16 @@ class DriverAdapter:
 
     def execute(self, operation: str, **args):
         if operation == "phase_begin":
+            self.driver._check_ancestors("phase-begin")
             self.end = time.monotonic() + args["seconds"]
             self.driver.phase_deadline = self.end
             self.public_left, self.mock_left = args["public_turns"], args["mock_turns"]
             self.driver.set_phase_budget(args["public_turns"], args["mock_turns"])
             self.kind = "failpoints" if args["build"] == "test-failpoints" else "release"
             self.driver.build(self.kind)
+            return None
+        if operation == "phase_end":
+            self.driver._check_ancestors("phase-end")
             return None
         if operation == "phase_guard":
             if self.end is None or time.monotonic() >= self.end:
@@ -1743,4 +1747,5 @@ def _run_phase(driver: CaseDriver, phase_name: str, *, record_sink=None) -> list
         if records[-1]["result"] == "blocked" or (
                 records[-1]["disposition"] == "gate" and records[-1]["result"] != "pass"):
             break
+    driver.execute("phase_end")
     return records

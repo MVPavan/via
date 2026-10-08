@@ -589,6 +589,9 @@ class Driver:
         args=list(args)
         if not args: raise Blocked('CLI verb missing')
         verb=args[0]
+        # §13: probes and submitted turns can cause Host to launch a vendor or successor.
+        if verb in {'describe','models','spawn','resume','steer'}:
+            self._check_ancestors('cli-'+verb)
         if verb in {'spawn','resume','steer'} and '--max-steps' not in args:
             # §13 allows only the exact held mock bootstrap and the fixed L11
             # credential-fence probe. L11's unoffered effort (§5) is a second
@@ -3451,6 +3454,7 @@ print('VIA HELPER DONE')
                  '--cwd',str(self.namespace),'--bound','full','--network',
                  '--effort',METADATA_EFFORT,'--background','--prompt','VIA FENCE ONLY','--json']
         def attempt():
+            self._check_ancestors('metadata')
             self._metadata_command=command; self._metadata_active=True
             try:
                 receipt=self.via(command)

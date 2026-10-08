@@ -82,7 +82,7 @@ class CasesTests(unittest.TestCase):
 
     def test_record_only_block_stops_every_later_case(self):
         driver=FakeDriver({'build_hashes':{'release':'a'*64,'test-failpoints':'b'*64},
-                           'phase_begin':None,'phase_guard':None,'phase_build':None})
+                           'phase_begin':None,'phase_end':None,'phase_guard':None,'phase_build':None})
         later=mock.Mock()
         def blocked(_driver,_case): raise cases.safety.Blocked('FAKE record-only safety stop')
         with mock.patch.dict(cases.PHASE_CASES,{'ledger':('compaction','usage')}), \
@@ -822,6 +822,11 @@ class FakeCliDriver:
     def __init__(self):
         self.commands = []
         self.kinds = []
+        self.ancestor_stages = []
+
+    def _check_ancestors(self, stage):
+        # FAKE launch adapter; real discovery/mode checks are RunRootTests' boundary.
+        self.ancestor_stages.append(stage)
 
     def build(self, kind):
         self.kinds.append(kind)

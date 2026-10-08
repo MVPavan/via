@@ -13,7 +13,9 @@ def terminal_event(events, session, turn, *, required=True):
             raise Blocked('C1 event session differs')
         if row.get('turn') != turn:
             continue
-        kind = row['type']
+        kind = row.get('type')
+        if type(kind) is not str:
+            raise Blocked('C1 event type unavailable')
         if kind == 'turn.ended':
             if terminal is not None or row.get('late') is True:
                 raise Blocked('C1 turn terminal sequence invalid')
