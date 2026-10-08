@@ -2,6 +2,8 @@
 """Fake-only driver checks for vendors/opencode.md §§2–4 and 13."""
 import importlib.util
 import json
+import os
+import subprocess
 import tempfile
 import time
 import threading
@@ -15,6 +17,62 @@ from opencode_driver import Driver, strict_reply, read_pages, bounded_command, i
 
 
 class DriverTests(unittest.TestCase):
+    def test_helper_readiness_survives_an_already_detached_shell(self):
+        """FAKE the pinned Shell.create detached launch with the real fixture helper (§13)."""
+        import opencode_safety as safety
+        for detached in (True,False):
+            with self.subTest(detached=detached), tempfile.TemporaryDirectory(prefix='via-oc-helper-') as folder:
+                base=Path(folder);project=base/'project';project.mkdir(mode=0o700)
+                (project/'.opencode').mkdir(mode=0o700)
+                d=Driver('release','fp','pin',base/'evidence',initialize=False)
+                d._helper_fixture(project,'tool',separate_group=True)
+                observation=d._helper_folder(project)/'tool.json'
+                release=observation.with_suffix('.release')
+                env={key:str(safety.private_directory(base/part))
+                     for key,part in safety.PRIVATE_PARTS.items()}
+                env.update(PATH='/usr/bin:/bin',LANG='C.UTF-8',VIA_PROCESS_MARKER='FAKE-helper')
+                process=subprocess.Popen(['/bin/bash','-c',safety.CANCEL_HELPER_COMMAND],
+                    cwd=project,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                    start_new_session=detached)
+                identity=None;ready=False
+                try:
+                    end=time.monotonic()+2
+                    while not observation.exists() and process.poll() is None and time.monotonic()<end:
+                        time.sleep(.01)
+                    ready=observation.exists()
+                    if ready:
+                        row=json.loads(observation.read_text())
+                        identity=Identity(row['pid'],row['start_ticks'])
+                        self.assertEqual(identity.pid,process.pid)
+                        self.assertEqual(row['pgid'],identity.pid)
+                        self.assertEqual(os.getsid(identity.pid),identity.pid)
+                        self.assertIs(d.proc.alive(identity),True)
+                        self.assertTrue(row['ready'])
+                finally:
+                    release.touch(mode=0o600)
+                    try:_,stderr=process.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill();process.communicate(timeout=5)
+                        stderr=b''
+                self.assertTrue(ready,'helper readiness unavailable: setsid EPERM'
+                                if b'PermissionError: [Errno 1]' in stderr else 'helper readiness unavailable')
+                self.assertEqual(process.returncode,0)
+                self.assertIs(d.proc.alive(identity),False)
+
+    def test_cancel_diagnostics_register_only_the_verified_cancellation_session(self):
+        for diagnostic in (False,True):
+            with self.subTest(diagnostic=diagnostic), tempfile.TemporaryDirectory() as folder:
+                d=Driver('release','fp','pin',Path(folder)/'evidence',initialize=False)
+                d.project=Path(folder)
+                d._helper_folder=mock.Mock(return_value=Path(folder))
+                d._vendor_sid=mock.Mock(return_value='ses_FAKE_cancel')
+                d._await_owned=mock.Mock(return_value={'started':True,'owned':True})
+                d._operation('helper_barrier',{'helper':'tool','session':'s_FAKE',
+                                             'cancel_diagnostic':diagnostic})
+                self.assertEqual(getattr(d,'_cancel_diagnostic_session',None),
+                                 'ses_FAKE_cancel' if diagnostic else None)
+                self.assertEqual(d._vendor_sid.call_count,int(diagnostic))
+
     def catalog_driver(self,root,body,status=200):
         """FAKE per-location API replies; the real spending guard remains active."""
         import opencode_safety as safety

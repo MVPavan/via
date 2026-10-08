@@ -215,7 +215,7 @@ def _diagnostic(function):
     return checked
 
 
-def _message_rows(conn,protected):
+def _message_rows(conn,protected,*,cancel_session=None):
     """Closed §13/E8 projections: no message/part text, arguments, output or paths."""
     def label(value,allowed):
         return value if type(value) is str and value in allowed \
@@ -257,6 +257,12 @@ def _message_rows(conn,protected):
                 item.update(tool_name=label(part.get('name',part.get('tool')),BUILTIN_TOOLS),
                     status='pending' if status=='streaming' else None if status=='other' else status,
                     error_name=error_name(state.get('error')))
+                if sid==cancel_session and item['tool_name']=='shell':
+                    arguments=state.get('input')
+                    command=arguments.get('command') if type(arguments) is dict else None
+                    item.update(command_equals_expected=type(command) is str
+                                and command==safety.CANCEL_HELPER_COMMAND,
+                                mentions_tool_helper=type(command) is str and 'tool-helper.py' in command)
             parts.append(item)
         # Native user/system messages store text and attachments outside content.
         if 'text' in data:parts.append({'sessionID':sid,'type':'text'})
@@ -276,7 +282,7 @@ def _message_rows(conn,protected):
 
 
 @_diagnostic
-def vendor_message_facts(root,protected,ownership):
+def vendor_message_facts(root,protected,ownership,*,cancel_session=None):
     """Snapshot every owned native session's messages before cleanup can fail (§13)."""
     root=Path(root);out=[]
     for database in sorted(root.rglob('opencode.db')):
@@ -286,7 +292,8 @@ def vendor_message_facts(root,protected,ownership):
         _regular(database)
         with sqlite3.connect('file:'+str(database)+'?mode=ro',uri=True,timeout=1) as conn:
             out.append({'path':database.relative_to(root).as_posix(),
-                'class':'native-vendor-session-storage','messages':_message_rows(conn,protected)})
+                'class':'native-vendor-session-storage',
+                'messages':_message_rows(conn,protected,cancel_session=cancel_session)})
     return out
 
 
@@ -331,7 +338,7 @@ def instruction_facts(database,session=None):
 
 
 @_diagnostic
-def native_facts(root,protected,ownership):
+def native_facts(root,protected,ownership,*,cancel_session=None):
     """Read only owned native session/log/Store tables; retain closed projections (§13)."""
     root=Path(root);out=[]
     def project(value):
@@ -350,7 +357,7 @@ def native_facts(root,protected,ownership):
                 sessions.append({'location':location.relative_to(root).as_posix(),
                     'facts':project({'id':sid,'model':json.loads(model) if model else None,
                                      'cost':{'usd':cost},'tokens_input':tin,'tokens_output':tout})})
-            messages=_message_rows(conn,protected)
+            messages=_message_rows(conn,protected,cancel_session=cancel_session)
         out.append({'path':database.relative_to(root).as_posix(),'class':'native-vendor-session-storage',
                     'sessions':sessions,'messages':messages,'instruction_state':instruction_facts(database)})
     for state in (entry for entry in ownership.ordered() if entry.state and entry.started):

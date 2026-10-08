@@ -38,6 +38,8 @@ import urllib.request
 from dataclasses import dataclass
 
 PINNED_SHA256 = "32cf5aa0a69a650e36277e3315d189835ddc79fb9aa1d0aef5025be5af5ad122"
+# §13: public cancellation names only a system interpreter and a project-relative helper.
+CANCEL_HELPER_COMMAND = '/usr/bin/python3 .opencode/tool-helper.py'
 NPM_URL = "https://registry.npmjs.org/@opencode/cli-linux-x64/-/cli-linux-x64-2.0.22.tgz"
 # Packet §§2, 13 qualification acquisition: reviewed unpacked archive size.
 NPM_UNPACKED_SIZE = 204482252

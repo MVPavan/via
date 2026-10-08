@@ -41,6 +41,38 @@ def private_runtime():
 
 
 class RunRootTests(unittest.TestCase):
+    def test_cancellation_command_diagnostics_are_booleans_and_session_scoped(self):
+        expected='/usr/bin/python3 .opencode/tool-helper.py'
+        secret='FAKE-private-command-never-export'
+        with tempfile.TemporaryDirectory(prefix='via-ocnative-') as folder:
+            base=Path(folder);database=self.message_database(base)
+            def tool(command,name='shell'):
+                return {'type':'tool','name':name,'state':{'status':'running',
+                        'input':{'command':command},'output':secret}}
+            with sqlite3.connect(database) as conn:
+                for sid in ('ses_FAKE_pass','ses_FAKE_block'):
+                    conn.execute('INSERT INTO session_message VALUES (?,?,?,?)',
+                        (sid,'assistant',1,json.dumps({'content':[
+                            tool(expected),tool('echo tool-helper.py '+secret),
+                            tool(secret),tool(None),tool(expected,'read')]})))
+            ownership=mock.Mock();ownership.classify.return_value.kind='vendor-private'
+            ownership.ordered.return_value=[]
+            exports=[roots.vendor_message_facts(base,lambda raw:secret.encode() in raw,
+                                               ownership,cancel_session='ses_FAKE_block'),
+                     roots.native_facts(base,lambda raw:secret.encode() in raw,
+                                        ownership,cancel_session='ses_FAKE_block')]
+            for exported in exports:
+                cancelled,other=exported[0]['messages']
+                self.assertEqual([(p.get('command_equals_expected'),p.get('mentions_tool_helper'))
+                                  for p in cancelled['parts']],
+                                 [(True,True),(False,True),(False,False),(False,False),(None,None)])
+                self.assertTrue(all('command_equals_expected' not in p
+                                    and 'mentions_tool_helper' not in p for p in other['parts']))
+                encoded=json.dumps(exported)
+                self.assertNotIn(expected,encoded)
+                self.assertNotIn('tool-helper.py',encoded)
+                self.assertNotIn(secret,encoded)
+
     def message_database(self,base):
         database=base/'vendor'/'opencode.db';database.parent.mkdir(parents=True)
         with sqlite3.connect(database) as conn:
@@ -104,16 +136,24 @@ class RunRootTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='via-ocnative-') as folder:
             base=Path(folder);work=base/'run';work.mkdir(mode=0o700)
             d=transport.Driver('release','fp','pin',base/'evidence',run_root=work)
+            d._cancel_diagnostic_session='ses_FAKE_block'
             database=self.message_database(work);d.ownership.register(database.parent,'vendor-private')
             with sqlite3.connect(database) as conn:
                 conn.execute('INSERT INTO session_message VALUES (?,?,?,?)',
-                    ('ses_FAKE_block','assistant',1,json.dumps({'content':[{'type':'text','text':'FAKE-private-text'}]})))
+                    ('ses_FAKE_block','assistant',1,json.dumps({'content':[
+                        {'type':'text','text':'FAKE-private-text'},
+                        {'type':'tool','name':'shell','state':{'status':'running',
+                            'input':{'command':safety.CANCEL_HELPER_COMMAND}}}]})))
             d.stop=mock.Mock(side_effect=safety.Blocked('FAKE original cleanup failure'))
             with self.assertRaisesRegex(safety.Blocked,'^FAKE original cleanup failure$'):d.finish()
             files=list(d.evidence.glob('*native-messages-before-cleanup.json'))
             self.assertEqual(len(files),1,'case message evidence disappeared with cleanup failure')
             raw=files[0].read_bytes();self.assertNotIn(b'FAKE-private-text',raw)
             self.assertEqual(json.loads(raw)['sources'][0]['messages'][0]['sessionID'],'ses_FAKE_block')
+            part=json.loads(raw)['sources'][0]['messages'][0]['parts'][1]
+            self.assertIs(part['command_equals_expected'],True)
+            self.assertIs(part['mentions_tool_helper'],True)
+            self.assertNotIn(safety.CANCEL_HELPER_COMMAND.encode(),raw)
 
     def test_native_message_unknown_counts_and_protected_enum_values_never_leak(self):
         with tempfile.TemporaryDirectory(prefix='via-ocnative-') as folder:

@@ -543,10 +543,13 @@ def owned_text_and_tools(events: list, session: str, input_id: str) -> dict:
 def case_cancel(driver: CaseDriver, case: Case) -> None:
     project = fixture(driver, "tool-barrier", provider="public-free", helper="tool", separate_group=True)
     pending = driver.execute("start_turn", project=project, mode="public-free",
-                             prompt="Run the local fixture helper until it is released.")
+                             prompt="Use the shell tool to run exactly this command from the project "
+                             "directory and wait for it to finish in the foreground. "
+                             "Set the shell timeout to 180000 milliseconds:\n"
+                             + safety.CANCEL_HELPER_COMMAND)
     session = member(pending, "session_id", str)
     try:
-        active = driver.execute("helper_barrier", session=session, helper="tool")
+        active = driver.execute("helper_barrier", session=session, helper="tool", cancel_diagnostic=True)
         case.check("owned active tool barrier", member(active, "started", bool)
                    and member(active, "owned", bool))
         cancel = driver.execute("cancel", session=session)

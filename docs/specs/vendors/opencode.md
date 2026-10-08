@@ -1430,6 +1430,24 @@ On a helper-barrier timeout, retain only folder/readiness-file presence,
 whether readiness was seen and whether a non-ready file was seen. Failure to
 retain that evidence preserves the timeout and marks retention uncertainty.
 No failed helper attempt causes an automatic model re-ask.
+The public cancellation prompt names the exact project-relative command
+`/usr/bin/python3 .opencode/tool-helper.py`; no private absolute path is sent
+to the public provider. The hash-verified 2.0.22 embedded source defaults
+`Shell.create`'s cwd to `Location.directory` (byte offset 145237309); the shell
+tool forwards its optional `workdir` as cwd. Thus the default is the case's
+session/project location (§5). Its foreground timeout defaults to 120,000 ms
+(offsets 145733777 and 145738014); the prompt explicitly requests 180,000 ms
+in the foreground. The helper's own barrier lasts 180 s, and cancellation
+follows the bounded 30 s readiness wait without another model request.
+The pinned shell launches detached (offset 145237865). A helper already
+leading its own session preserves that session; it calls `setsid()` only
+otherwise, avoiding `EPERM` before publishing readiness. Offline fixtures
+cover both an already detached shell and a helper that creates its session.
+For that cancellation session only, native shell-part projections additionally
+retain two Booleans: `command_equals_expected` and `mentions_tool_helper`.
+These compare E7's `state.input.command` in memory; command text is never
+retained. Other public-free prompts ask only for fixed replies or conversation
+recall; they require no fixture discovery. Mock scripts remain unchanged.
 The minimal PATH links the exact checked system `rg`; fake LSP/local helpers
 avoid vendor installs. Inventory still covers all private HOME/XDG, namespace
 and fixture `.opencode` roots. Credential files remain existence/mode only;

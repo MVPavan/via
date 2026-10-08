@@ -290,6 +290,7 @@ class Driver:
         self._event_socket=None; self._event_watchdog=None
         self._idle_retired=False; self._last_lifecycle=None; self.inherit_settings={}
         self.phase_public_left=None; self.phase_mock_left=None; self.helper_ledger={}
+        self._cancel_diagnostic_session=None
         self._phase_public_used=0
         self.helper_channels={}; self.helper_generations={}; self.lifecycle_counter=0
         self.helper_origins={}; self.server_identities=set()
@@ -2771,7 +2772,8 @@ if kind=='marker':
         while not (pathlib.Path(OBSERVATIONS)/'marker-parent.release').exists() and time.monotonic()<end:
             time.sleep(.01)
         sys.exit(0)
-if SEPARATE:
+# §13: the pinned shell may exec this helper as an already detached session leader.
+if SEPARATE and os.getsid(0)!=os.getpid():
     os.setsid()
 root=pathlib.Path(OBSERVATIONS)
 raw=pathlib.Path('/proc/self/stat').read_bytes()
@@ -3068,6 +3070,8 @@ print('VIA HELPER DONE')
                 self.guard.stopped=True; raise Blocked('overridden provider failed mock receipt')
             return receipt
         if kind=='helper_barrier':
+            if args.get('cancel_diagnostic') is True:
+                self._cancel_diagnostic_session=self._vendor_sid(args['session'])
             helper=args['helper']; path=self._helper_folder(self.project)/(helper+'.json')
             readiness_seen=False;not_ready_seen=False
             def read():
@@ -3285,7 +3289,8 @@ print('VIA HELPER DONE')
             try:
                 from opencode_runroot import vendor_message_facts
                 self._record('native-messages-before-cleanup',{'sources':vendor_message_facts(
-                    self.work,self._reply_protected,self.ownership)})
+                    self.work,self._reply_protected,self.ownership,
+                    cancel_session=self._cancel_diagnostic_session)})
             except BaseException as error:diagnostic_error=error
         try: proof=self.stop()
         except BaseException as error: failures.append(error)
@@ -3324,7 +3329,8 @@ print('VIA HELPER DONE')
                 if expected is not None and safety.sha256(path)!=expected:
                     raise Blocked('private VIA build changed during qualification')
             from opencode_runroot import native_facts
-            self._record('native-records',{'sources':native_facts(self.work,self._reply_protected,self.ownership)})
+            self._record('native-records',{'sources':native_facts(self.work,self._reply_protected,self.ownership,
+                cancel_session=self._cancel_diagnostic_session)})
         scan=self.secrecy_scan()
         if scan['secret_absent'] is not True or scan['payload_captures']!=0:
             raise Blocked('final secrecy scan failed')

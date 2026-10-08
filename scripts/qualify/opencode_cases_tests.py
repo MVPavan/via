@@ -55,6 +55,20 @@ class FakeDriver:
 
 
 class CasesTests(unittest.TestCase):
+    def test_public_cancel_names_exact_relative_helper_command_without_discovery(self):
+        project='/FAKE/private/project-not-for-public-provider'
+        driver=FakeDriver({'fixture':project,'start_turn':{'session_id':'s_FAKE'},
+                           'helper_release':None})
+        with self.assertRaises(cases.EvidenceUnavailable):
+            cases.case_cancel(driver,cases.Case('cancel'))
+        submitted=next(args for name,args in driver.calls if name=='start_turn')
+        self.assertIn('/usr/bin/python3 .opencode/tool-helper.py',submitted['prompt'])
+        self.assertIn('project directory',submitted['prompt'])
+        self.assertIn('180000',submitted['prompt'])
+        self.assertNotIn(project,submitted['prompt'])
+        barrier=next(args for name,args in driver.calls if name=='helper_barrier')
+        self.assertTrue(barrier.get('cancel_diagnostic'))
+
     def test_identity_case_acquires_generation_before_arming_retired_host(self):
         retired=False; calls=[]
         first={'session_id':'s_owned','envelope':{'vendor_session_id':'ses_owned'}}
