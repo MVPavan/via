@@ -957,6 +957,52 @@ class SafetyTests(unittest.TestCase):
             self.assertBlocked(wrong_stop, "positive cost hard stop")
 
 
+    def test_owned_listener_skips_a_descriptor_closed_after_listing(self):
+        directory=self.root/'proc/71'
+        (directory/'fd').mkdir(); (directory/'net').mkdir()
+        (directory/'fd/7').symlink_to('socket:[7788]')
+        (directory/'net/tcp').write_text(
+            'header\n0: 0100007F:1234 00000000:0000 0A 0:0 00:0 0 1000 0 7788\n')
+        readlink=safety.os.readlink
+        for code in (safety.errno.ENOENT,safety.errno.ESRCH):
+            with self.subTest(errno=code):
+                def observed(entry,*,dir_fd):
+                    if entry=='8': raise OSError(code,'FAKE closed descriptor')
+                    return readlink(entry,dir_fd=dir_fd)
+                with mock.patch.object(safety.os,'listdir',return_value=['8','7']), \
+                     mock.patch.object(safety.os,'readlink',side_effect=observed):
+                    self.assertEqual(self.proc.listener(self.identity),'http://127.0.0.1:4660')
+
+    def test_owned_listener_closed_only_descriptor_is_pending(self):
+        directory=self.root/'proc/71'
+        (directory/'fd').mkdir(); (directory/'net').mkdir()
+        (directory/'net/tcp').write_text('header\n')
+        closed=FileNotFoundError(safety.errno.ENOENT,'FAKE closed descriptor')
+        with mock.patch.object(safety.os,'listdir',return_value=['8']), \
+             mock.patch.object(safety.os,'readlink',side_effect=closed):
+            with self.assertRaises(safety.ListenerNotReady):
+                self.proc.listener(self.identity)
+
+    def test_owned_listener_unreadable_descriptor_or_directory_blocks(self):
+        (self.root/'proc/71/fd').mkdir()
+        reason='owned listener descriptor evidence unavailable'
+        with mock.patch.object(safety.os,'listdir',side_effect=PermissionError()):
+            self.assertBlocked(lambda:self.proc.listener(self.identity),reason)
+        for code in (safety.errno.EACCES,safety.errno.EPERM):
+            with self.subTest(errno=code), \
+                 mock.patch.object(safety.os,'listdir',return_value=['8']), \
+                 mock.patch.object(safety.os,'readlink',side_effect=OSError(code,'FAKE unreadable')):
+                self.assertBlocked(lambda:self.proc.listener(self.identity),reason)
+
+    def test_owned_listener_closed_descriptor_still_reverifies_identity(self):
+        (self.root/'proc/71/fd').mkdir()
+        def closed(*_args,**_kwargs):
+            (self.root/'proc/71/stat').write_bytes(fake_stat(ticks=999))
+            raise FileNotFoundError(safety.errno.ENOENT,'FAKE closed descriptor')
+        with mock.patch.object(safety.os,'listdir',return_value=['8']), \
+             mock.patch.object(safety.os,'readlink',side_effect=closed):
+            self.assertBlocked(lambda:self.proc.listener(self.identity),'owned process identity changed')
+
     def test_owned_listener_uses_only_verified_fd(self):
         directory = self.root / "proc" / "71"
         (directory / "fd").mkdir()

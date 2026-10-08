@@ -257,7 +257,14 @@ class ProcReader:
                 try:
                     inodes = set()
                     for entry in os.listdir(socket_fd):
-                        target = os.readlink(entry, dir_fd=socket_fd)
+                        try:
+                            target = os.readlink(entry, dir_fd=socket_fd)
+                        except OSError as error:
+                            # §13: a closed descriptor is absent; directory and
+                            # identity uncertainty still block the observation.
+                            if error.errno in {errno.ENOENT, errno.ESRCH}:
+                                continue
+                            raise
                         if target.startswith("socket:[") and target.endswith("]"):
                             inodes.add(target[8:-1])
                 finally:
