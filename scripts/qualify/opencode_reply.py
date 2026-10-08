@@ -50,13 +50,13 @@ NUMBERS = frozenset({'pid','code','seq','turn','n','revision','current_step','qu
     'duration_ms','denied_actions_total','auto_declined_requests_total','size','count',
     'free_bytes','floor_bytes','free_floor','statusCode'})
 BOOLS = frozenset({'more','stopping','already_terminal','vendor_identity_verified',
-                  'complete','received','model_matches','disabled','accepted','enabled','below_free_floor','isRetryable'})
+                  'incomplete','complete','received','model_matches','disabled','accepted','enabled','below_free_floor','isRetryable'})
 ENUM_KEYS = frozenset({'type','state','status','scope','support','kind','kind2','class','outcome',
                        'cleanup','admission','phase','effect','action','version_status','field',
                        'provenance','stop_reason'})
 ENUMS = frozenset({'document','directory','running','active','idle','queued','submitting','accepted',
     'completed','failed','cancelled','unknown','closed','open','fenced','closing',
-    'turn','vendor_interval','session_cumulative','unavailable','reported','derived',
+    'server','turn','vendor_interval','session_cumulative','unavailable','reported','derived',
     'supported','unsupported','native','best_effort','tested','untested','allow','deny','ask',
     'shell','read','write','edit','task','subagent','question','text','tool','reasoning',
     'deprecated','alpha','beta','stable','preview','done','none','pending','interrupted',
@@ -70,7 +70,7 @@ ENUMS = frozenset({'document','directory','running','active','idle','queued','su
     'max_steps','model','tools','estimated'})|EVENT_TYPES|frozenset(ERROR_CODES) \
     |CANCEL_OUTCOMES|CLEANUP_STATES|FAILURE_CLASSES|WARNING_CODES|STOP_REASONS|DENIAL_KINDS
 CONTAINERS = frozenset({'data','info','model','cost','usage','cache','settings','effective',
-    'failure','error','cancel','progress','capabilities','params','max_steps','events',
+    'leftovers','processes','failure','error','cancel','progress','capabilities','params','max_steps','events',
     'content','snapshot','turns','active_turn','inherit','warnings','denied_actions','limits','disk','storage'})
 MAPS = frozenset({'providers','agents','models','variants'})
 PRIVATE = frozenset({'handle','token','password','apikey','api_key','authorization',

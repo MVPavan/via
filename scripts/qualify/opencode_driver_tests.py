@@ -359,22 +359,22 @@ class DriverTests(unittest.TestCase):
             self.assertTrue(all(call.kwargs['timeout']<=.25 for call in d._http.request.call_args_list
                                 if call.args[1].startswith('/api/model?')))
 
-    def test_marker_server_loss_records_only_successfully_killed_anchor(self):
+    def test_marker_server_loss_keeps_anchor_control_and_checks_vendor_identity(self):
         with tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
             d=Driver('release','fp','pin',Path(root)/'evidence',initialize=False)
-            d.daemon=Identity(69,120); d.anchor=Identity(70,122)
-            d._live_pin=mock.Mock(); d.proc=mock.Mock(); d.journal=mock.Mock()
+            d.daemon=Identity(69,120);d.anchor=Identity(70,122);d.vendor_identity=Identity(71,123)
+            d._live_pin=mock.Mock();d.proc=mock.Mock();d.journal=mock.Mock()
             d.journal._signal.side_effect=Blocked('FAKE signal failed')
             with self.assertRaisesRegex(Blocked,'FAKE signal failed'):
                 d._operation('server_loss_for_marker',{'session':'fixture-session'})
             self.assertIsNone(d._killed_anchor)
             d.journal._signal.side_effect=None
             result=d._operation('server_loss_for_marker',{'session':'fixture-session'})
-            self.assertEqual(result,{'anchor_pid_only':True})
-            self.assertEqual(d._killed_anchor,d.anchor)
-            d.proc.verify.assert_called_with(d.anchor)
+            self.assertEqual(result,{'vendor_pid_only':True})
+            self.assertIsNone(d._killed_anchor)
+            d.proc.verify.assert_called_with(d.vendor_identity)
             import signal
-            d.journal._signal.assert_called_with(d.anchor,signal.SIGKILL,role='anchor')
+            d.journal._signal.assert_called_with(d.vendor_identity,signal.SIGKILL,role='vendor')
 
     def test_info_startup_503_waits_for_matching_owned_server(self):
         with tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
@@ -940,9 +940,9 @@ class DriverTests(unittest.TestCase):
             d.fake_gate_manifest['tests']=[]
             with self.assertRaises(Blocked): d.observe('cancel_timing',{'session':'s_fixture'})
 
-    def test_claimed_near_limit_queue_parking_crash_and_successor_fake(self):
+    def test_claimed_near_limit_queue_parking_cancel_and_successor_fake(self):
         with tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:
-            root=Path(root); project=root/'project'; project.mkdir(); calls=[]; inbox=[]; crashed=False
+            root=Path(root); project=root/'project'; project.mkdir(); calls=[]; inbox=[]
             d=Driver('release','fp','pin',root/'evidence',initialize=False)
             d.daemon=Identity(7,9); d.proc=mock.Mock(); d.proc.gone.return_value=True
             d.proc.alive.return_value=False
@@ -951,7 +951,6 @@ class DriverTests(unittest.TestCase):
                     {'type':'object','properties':{'id':{'type':'string'},'text':{'type':'string'},'delivery':{'type':'string','enum':['queue']}},
                      'required':['id','text'],'additionalProperties':False}}}}}}}}
             def via(args):
-                nonlocal crashed
                 calls.append(('via',args[0]))
                 if args[0]=='status': return {'active_turn':{'n':2,'phase':'submitting'}}
                 if args[0]=='resume':
@@ -960,7 +959,9 @@ class DriverTests(unittest.TestCase):
                         self.assertEqual(len(json.dumps(prompt).encode())+len(json.dumps(str(project.resolve())).encode()),1024*1024-8192)
                         return {'turn':'s_fixture/2'}
                     inbox.remove(expected); return {'turn':'s_fixture/3'}
-                if args[0]=='wait': return {'state':'unknown' if args[1].endswith('/2') else 'completed'}
+                if args[0]=='cancel': return {'state':'running'}
+                if args[0]=='wait': return {'state':'cancelled' if args[1].endswith('/2') else 'completed',
+                    'cancel':{'cleanup':'quiescent'} if args[1].endswith('/2') else None}
                 raise AssertionError(args)
             def vendor(method,path,body=None):
                 calls.append((method,path))
@@ -982,7 +983,7 @@ class DriverTests(unittest.TestCase):
                 result=d._near_limit_inbox({'count':2,'prompt_bytes':1024*1024-8192})
             self.assertTrue(result['successor_completed']); self.assertEqual(result['owned_deletes'],1)
             self.assertEqual(result['foreign_deletes'],0); self.assertIn('synthetic',result['seed_source'])
-            self.assertEqual(len(inbox),1); kill.assert_called_once(); self.assertEqual(stop.call_count,2)
+            self.assertEqual(len(inbox),1); kill.assert_not_called(); self.assertEqual(stop.call_count,2)
 
     def test_marker_release_releases_parent_and_child_channels(self):
         with tempfile.TemporaryDirectory(prefix='via-ocdriver-') as root:

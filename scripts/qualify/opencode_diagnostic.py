@@ -9,7 +9,11 @@ import urllib.parse
 import opencode_safety as safety
 
 # §13: only cases whose model-capable operations are scripted loopback requests.
-MOCK_CASES={'usage':'ledger','compaction':'ledger'}
+MOCK_CASES={'usage':'ledger','compaction':'ledger','config':'isolation',
+            'hostile_provider':'hostile','never_ask':'helpers','marker':'helpers','auth':'helpers',
+            'write_cancel':'seams','foreign':'seams','transport_loss':'seams','identity':'seams',
+            'error_shapes':'seams','long_run':'long_run','anchor':'anchor',
+            'credential_shape':'credentials'}
 DIAGNOSTIC_BYTES=1024*1024  # §13: error/log text is bounded separately from payloads.
 DIAGNOSTIC_ROWS=1024  # §13: only enrolled mock-session failures, no database dump.
 

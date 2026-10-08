@@ -536,6 +536,20 @@ class RealViaTests(unittest.TestCase):
     def test_release_cli_call_matrix(self):
         self.call_matrix('release')
 
+    def test_release_cli_call_matrix_awaits_delayed_pending_acceptance(self):
+        """A healthy native response may exceed the matrix's former five-second poll."""
+        original=scripted_server
+        def delayed(cwd):
+            script=original(cwd)
+            prompt=next(row for row in script['routes']
+                        if row['method']=='POST' and row['path'].endswith('/prompt'))
+            prompt['responses'][3]['sleep_ms']=5500
+            return script
+        # Keep the CLI matrix and owning readiness probe real; only the fake's
+        # fourth prompt response is delayed within the fixture's phase budget.
+        with mock.patch(__name__+'.scripted_server',side_effect=delayed):
+            self.call_matrix('release')
+
     def test_failpoints_cli_call_matrix(self):
         self.call_matrix('failpoints')
 
@@ -580,12 +594,13 @@ class RealViaTests(unittest.TestCase):
                 extra=d.via(['resume',session,'--prompt','FAKE small'])
                 self.assertEqual(d.via(['wait',extra['turn'],'--timeout-ms','10000'])['state'],'completed')
                 pending=d.via(['resume',session,'--prompt','FAKE pending'])
-                by=time.monotonic()+5
-                while time.monotonic()<by:
+                turn_number=int(pending['turn'].rsplit('/',1)[1])
+                def accepted():
                     status=d.via(['status',session])
-                    if status['active_turn'] is not None and status['active_turn']['phase']=='accepted': break
-                    time.sleep(.01)
-                else: self.fail('FAKE pending turn was not accepted')
+                    active=status['active_turn']
+                    return status if active is not None and active['n']==turn_number \
+                        and active['phase']=='accepted' else None
+                d._await_owned(accepted,'FAKE pending turn was not accepted')
                 unavailable=d.via(['result',pending['turn']])
                 self.assertEqual(unavailable['exit_code'],2)
                 self.assertEqual(unavailable['cli_error']['error']['data']['kind'],'turn_not_finished')

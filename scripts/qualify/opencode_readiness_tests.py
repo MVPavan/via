@@ -403,6 +403,7 @@ class ReadinessTests(unittest.TestCase):
         self.driver.namespace_env = {}; self.driver.env = {'PATH': '/usr/bin:/bin'}
         self.driver._locks_free = mock.Mock(return_value=True)
         self.driver._generated_vendor_config = mock.Mock(return_value={})
+        self.driver._prepare_l11_mock_provider = mock.Mock()
         self.driver._pgrep_clear = mock.Mock(return_value=True)
         self.driver.vault.read_once = mock.Mock(return_value=b'fixture-password')
         self.driver.proc.stat.return_value = {'pid': 31, 'start_ticks': 3}
@@ -505,6 +506,7 @@ class ReadinessTests(unittest.TestCase):
         self.driver.namespace_env = {}; self.driver.env = {'PATH': '/usr/bin:/bin'}
         self.driver._locks_free = mock.Mock(return_value=True)
         self.driver._generated_vendor_config = mock.Mock(return_value={})
+        self.driver._prepare_l11_mock_provider = mock.Mock()
         self.driver._pgrep_clear = mock.Mock(return_value=True)
         self.driver.vault.read_once = mock.Mock(return_value=b'fixture-password')
         self.driver.proc.stat.return_value = {'pid': 31, 'start_ticks': 3}
@@ -600,7 +602,7 @@ class ReadinessTests(unittest.TestCase):
              'active_turn': {'state': 'running', 'phase': 'accepted'}}])
         self.driver.journal._signal = mock.Mock()
         result = self.driver._operation('server_loss_for_marker', {'session': 's_owned'})
-        self.assertTrue(result['anchor_pid_only']); self.assertEqual(self.driver.via.call_count, 2)
+        self.assertTrue(result['vendor_pid_only']); self.assertEqual(self.driver.via.call_count, 2)
         self.driver.journal._signal.assert_called_once()
 
     def test_duplicate_sse_delivery_is_not_retried(self):

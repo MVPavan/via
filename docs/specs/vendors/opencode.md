@@ -1428,8 +1428,11 @@ storage, credentials and bearer handles are never copied to evidence. The owner
 authorized a mock-only diagnostic exception (2026-10-08):
 `--diagnostic-mock-case usage` runs preflight plus that explicitly named scripted
 case, with zero public-turn admission and only `oclive-mock/fixture-free`
-approved. `compaction` may also be explicitly named; neither selection qualifies
-the route. Only enrolled mock sessions may export bounded native error names
+approved. Named mock cases also cover compaction, configuration, hostile
+providers, helpers/authentication, the VIA seams, the bounded long run, anchor
+lifetimes and credential seeding; public free/result/continuity/cancel cases
+cannot be selected. No diagnostic selection qualifies the route.
+Only enrolled mock sessions may export bounded native error names
 and messages and relevant private vendor log lines. Replace the private run-root
 path and every password/bearer representation before the protected evidence
 write, then run the ordinary whole-root secrecy scan. Public-free sessions
@@ -1441,7 +1444,12 @@ tool steps without triggering automatic compaction first. L7's separate mock
 fixture retains its small context. The first mock-only usage diagnostic showed
 `compaction.failed` with "Compaction summary did not match the required template"
 at the former 4,096-token context; its canned tool/final response is not a
-compaction summary. Mock-only error/log exports run before cleanup and again
+compaction summary. For L7, the mock recognizes the pinned initial-summary and
+checkpoint-update prompts and returns the template's Objective, Requirements,
+Decisions, Work State (Completed/Active/Blocked), Next Move, Relevant Files and
+Important Context headings. Normal requests keep their ordinary tool recipe.
+The template starts at byte 145,633,783 of the pinned binary, with native
+validation at byte 145,639,418. Mock-only error/log exports run before cleanup and again
 after a proven stop, so the final export includes the vendor logger's flush.
 Root removal uses the current `stop_result` process/lock/pgrep proof even if
 native diagnostic retention subsequently fails. That diagnostic failure is
@@ -1725,6 +1733,115 @@ After stopping providers, retain
 the aggregate physical received count, including rejected requests, rather than
 reporting it unavailable. Crossing the derived ceiling still sets the stop latch
 and blocks. Receipts and the bootstrap are diagnostic records, never gates.
+
+**L4 retry-budget derivation (2026-10-08):** The pinned binary's primary retry
+schedule at byte 145,631,595 allows ten retries (eleven attempts), with nominal
+delays 2, 4, 8, then seven 10-second waits and 0.8–1.2 jitter (at most 100.8
+seconds total scheduled delay). Local fixtures supply no retry hints; the
+vendor otherwise caps such a hint at 15 minutes. HTTP 500 is retryable;
+authentication 401/403 is not. Invalid provider output is retryable only for
+`incomplete-stream`; transport errors generally retry, with only three retries
+for timeouts. Native title generation makes at most two separate attempts
+(selected model then primary fallback when the model references differ), with
+no title retry schedule; this accounts for thirteen observed physical requests
+in a retryable hostile fixture.
+
+Malformed fixtures now deliver a delimited invalid SSE JSON event; oversized
+fixtures exceed the pinned provider parser's 10,485,760-character pending-event cap
+(the fixture is ASCII, so its byte count is identical)
+(byte 144,448,787) without a delimiter. Both produce nonretryable native decode
+or size failures instead of only an incomplete-stream failure. Reserve per
+provider its allowed primary attempts, two title attempts, two bootstrap
+requests and a fixed two-request margin: seventeen for HTTP 500 and truncated
+transport, seven for malformed/oversized and authentication. The eight L4
+providers sum to `2 × (17 + 7 + 7 + 17) = 96` physical requests with zero public
+admission. Per-provider and shared phase latches both enforce these ceilings;
+phase deadlines still apply. VIA's separate 1 MiB malformed/oversized HTTP/SSE
+matrix remains fake OC12b proof. These are finite fixed-fixture bounds, not a
+general bound on user-supplied retry hooks.
+
+**Mock-fixture control corrections (2026-10-08):** L2 keeps the original
+HTTP exchange paused through the observation: releasing it first can let the
+vendor finish normally. Its positive drain proof has a phase-clipped 40-second
+ceiling (30-second prompt HTTP deadline, three-second exit classification,
+five-second retirement and two seconds fixed margin), verifies vendor/anchor
+absence and committed Host retirement, and then discards the old SSE client.
+The near-limit reopen fixture cancels its unsent held claim and verifies
+`cancelled` with quiescent cleanup before restarting. Crash recovery would
+leave an `unknown` predecessor and C1 P6 would correctly cancel the successor
+before native reopen, so it cannot test this adapter cleanup path.
+
+The never-ask fixture's project plugin requests `ask` only for an actual
+scripted child shell action; VIA's rejected native permission reply must be
+observed. The marker control kills the verified vendor alone, preserving the
+anchor's control channel so Host can positively report server loss; L14 still
+kills the anchor alone. A matching entry in Host's incomplete leftover report
+is positive evidence for that particular process, while incompleteness still
+qualifies the full set and cannot prove absence. The LSP probe joins the read
+tool's started/called/success events by session, assistant message and tool ID;
+the called event itself has no tool-name field. Configuration is read from
+the served top-level config array.
+
+The missing-ID control verifies a native 404 after acquiring the successor,
+then checks the mock fixture's served configuration, catalogue and integration
+without demanding readback from the deleted session. Only its exact resume
+command receives the metadata refusal fence; every provider request during
+that control is rejected and latches a hard stop. The native-session baseline
+is taken after bootstrap, so bootstrap sessions are not replacement sessions.
+
+L14's maximum implemented mock budget is derived separately: fourteen fresh
+points each reserve two bootstrap, two primary/title and two successor
+bootstrap requests; `tool_after` and the two LSP reads add three requests;
+the retained L9 successor adds two; a cold capability probe adds six; a fixed
+two-request margin yields `14 × 6 + 3 + 2 + 6 + 2 = 97`. Unoffered points
+remain limitations and consume no requests. Every physical request counts.
+L9's existing 32-request ceiling covers sixteen primary calls, eight fresh
+session titles and two bootstrap calls (26), with six remaining; successful
+resumed sessions do not generate a new title (pinned bytes 146,057,477 and
+139,304,790). A fail-I/O transport seam has no pause to release; its helper
+still receives cleanup independently.
+
+L8's quota mock uses HTTP 400 with the recognized `insufficient_quota` error
+code. The generic label `quota` is not recognized by the pinned provider
+classifier (bytes 144,457,358 and 144,459,955) and produces
+`provider.invalid-request`; the recognized code produces `provider.quota`
+(byte 145,110,279). HTTP 429 is reserved for the separate rate-limit control.
+
+L9 reserves the last 30 seconds of its existing 20-minute phase for final
+snapshot and generation proof. Sampling consumes the earlier bounded window;
+its elapsed duration is recorded. This prevents the phase watchdog from
+closing SSE at the same instant the final snapshot is read. Neither the
+phase deadline nor model/request ceilings increase.
+Its scripted shell call explicitly requests 1,800,000 ms, matching the
+30-minute helper barrier and outlasting sampling plus the first L14 sample.
+The pinned foreground shell default is only 120,000 ms (bytes 145,733,777
+and 145,738,014); omitting the timeout lets the shell finish long before L9.
+The held turn also explicitly sets VIA's positive per-turn `idle_ms` to
+1,800,000 (C1 §3.2); its silent helper otherwise hits the 600,000 ms default
+before the sample ends. The normal wall deadline and phase ceiling remain
+unchanged. This qualifies the intentional bounded fixture, not an idle
+deadline exemption.
+
+An inventory mismatch retains up to 128 closed difference rows: root index,
+hashed relative name, size and content hash, fixed name class, executable/ELF
+flags, uid/link facts, registered-TMPDIR and Git-template/marker booleans.
+It retains neither unknown local names nor file content and does not change
+the admission rule. Omitted rows are counted.
+The L14 descriptor scan skips an unreadable process only when its saved
+PID/start ticks have pidfd-grounded liveness `False`; a surviving stat entry
+alone is not liveness proof. `True` or unknown still blocks, retaining the
+PID/start ticks, fixed role, liveness and errno/step without paths.
+
+L11 seeds the registered loopback mock integration, not an unknown integration
+ID: pinned `Integration.list` enumerates registered integrations (byte
+144,986,350), while credential creation alone does not register one. The
+namespace's persistent fixture config registers the mock before the direct
+seed server starts, so both that server and the subsequent VIA-owned server
+see the same integration. No model request is admitted in this phase.
+
+Cleanup's embedded-runtime provenance checks retain their own bounded search
+window after a phase expires. Expired admission and observation deadlines do
+not disable cleanup or extend any model-capable request deadline.
 
 ## 14. Owner questions and revisit items
 

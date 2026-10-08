@@ -414,6 +414,18 @@ class CasesTests(unittest.TestCase):
                            "write_observation": {"enqueues": 0, "submits": 1,
                                                   "indeterminate": True, "drained": True}})
 
+    def test_transport_fail_io_has_no_pause_to_release_and_always_releases_helper(self):
+        driver=self.write_driver()
+        driver.replies.update({'wait_turn':{'state':'unknown','turn':2,'cost':{'usd':None},
+            'usage':{'input_tokens':None,'cached_input_tokens':None,'output_tokens':None}},
+            'loss_observation':{'accepted_before_loss':True,'via_terminal_admitted':False}})
+        def release(_):raise transport.Blocked('no entered pause remains to release')
+        driver.replies['seam_release']=release
+        result=cases.run_case(driver,'transport_loss',cases.case_transport_loss)
+        self.assertEqual(result['result'],'pass')
+        self.assertFalse(any(name=='seam_release' for name,_ in driver.calls))
+        self.assertTrue(any(name=='helper_release' for name,_ in driver.calls))
+
     def test_l2_partial_live_progress_and_fake_pool_are_distinct(self):
         driver = self.write_driver()
         result = cases.run_case(driver, "write_cancel", cases.case_write_cancel)
@@ -423,6 +435,16 @@ class CasesTests(unittest.TestCase):
         observed = [args for name, args in driver.calls if name == "write_observation"]
         self.assertTrue(all(args["turn_number"] == 2 and args["context"]["vendor_session"] == "ses_owned"
                             for args in observed))
+
+    def test_l2_keeps_original_http_barrier_held_until_drain_observation(self):
+        driver = self.write_driver()
+        self.assertEqual(cases.run_case(driver, "write_cancel", cases.case_write_cancel)["result"], "pass")
+        for point in (cases.SEAMS['partial'], cases.SEAMS['response']):
+            observed = next(i for i,(name,args) in enumerate(driver.calls)
+                            if name=='write_observation' and args['point']==point)
+            released = next(i for i,(name,args) in enumerate(driver.calls)
+                            if name=='seam_release' and args['point']==point)
+            self.assertLess(observed,released)
 
     def test_l2_released_prompt_or_unbound_pool_control_fails(self):
         for driver in (self.write_driver(held=False), self.write_driver(manifest=False)):
@@ -474,6 +496,15 @@ class CasesTests(unittest.TestCase):
     def test_l9_estimated_retained_keys_are_not_live_evidence(self):
         result = cases.run_case(self.long_run_driver(retained=12), "long_run", cases.case_long_run, "record-only")
         self.assertEqual(result["result"], "not_observable")
+
+    def test_l9_silent_helper_has_an_explicit_idle_deadline_past_the_sample(self):
+        driver = self.long_run_driver()
+        result = cases.run_case(driver, "long_run", cases.case_long_run, "record-only")
+        self.assertEqual(result["result"], "pass")
+        pending = next(args for name, args in driver.calls if name == "start_turn")
+        self.assertEqual(pending.get("params", {}).get("idle_ms"), 1800000)
+        phase = next(row for row in cases.PHASES if row.name == "long_run")
+        self.assertGreater(pending["params"]["idle_ms"], phase.seconds * 1000)
 
     def foreign_driver(self, foreign_active=True):
         result = {"session_id": "s1", "turn": "s1/1", "model": "oclive-mock/fixture-free",
@@ -985,6 +1016,17 @@ class FakeCliDriver:
 
 
 class AdapterTests(unittest.TestCase):
+    def test_resumed_turn_forwards_positive_core_deadline_overrides(self):
+        raw = FakeCliDriver()
+        adapter = cases.DriverAdapter(raw)
+        adapter.execute("phase_begin", seconds=60, public_turns=0, mock_turns=1, build="release")
+        adapter.execute("start_turn", project="fixture", prompt="FAKE held helper", mode="mock",
+                        session="s1", params={"idle_ms": 1800000, "wall_ms": 1800000})
+        command = next(command for command in raw.commands if command[0] == "resume")
+        self.assertIn("--idle-ms", command)
+        self.assertEqual(command[command.index("--idle-ms") + 1], "1800000")
+        self.assertEqual(command[command.index("--wall-ms") + 1], "1800000")
+
     def test_l4_adapter_invokes_all_output_commands_and_pages_events(self):
         class MatrixDriver(FakeCliDriver):
             def via(self, command):
@@ -1064,6 +1106,24 @@ class AdapterTests(unittest.TestCase):
 
 
 class ConfiguredLspDriverTests(unittest.TestCase):
+    def test_read_completion_joins_native_input_start_without_called_name(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            driver = self.fixture_driver(Path(temporary))
+            events = [
+                {"type": "session.tool.input.started", "data": {
+                    "sessionID": "vendor-probe", "assistantMessageID": "FAKE-message",
+                    "id": "read-1", "name": "read"}}]
+            events = events[:1] + [{"type": kind, "data": {
+                "sessionID": "vendor-probe", "assistantMessageID": "FAKE-message",
+                "id": "read-1"}} for kind in ("session.tool.called", "session.tool.success")]
+            driver.observe = mock.Mock(side_effect=lambda kind, *_: {
+                "events": events} if kind == "native_events" else {
+                    "helpers": [{"kind": "lsp", "ready": True}]})
+            clock = [0.0]
+            with mock.patch.object(transport.time, "monotonic", side_effect=lambda: clock[0]), \
+                 mock.patch.object(transport.time, "sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
+                self.assertTrue(driver._lsp_probe()["spawned"])
+
     def test_l5_fixture_reads_custom_file_only_after_positive_probe(self):
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
@@ -1117,11 +1177,12 @@ class ConfiguredLspDriverTests(unittest.TestCase):
         driver.ensure_vendor = mock.Mock()
         driver._served_schema = mock.Mock(return_value={"components": {"schemas": {
             "Config.InfoEncoded": {"properties": {"lsp": {}}}}}})
-        driver.vendor = mock.Mock(return_value={"status": 200, "body": {"data": [
-            {"type": "document", "info": {"lsp": {"via-fixture": expected}}}]}})
+        driver.vendor = mock.Mock(return_value={"status": 200, "body": [
+            {"type": "document", "info": {"lsp": {"via-fixture": expected}}}]})
         driver._vendor_sid = mock.Mock(return_value="vendor-probe")
-        events = ([{"type": "session.tool.called", "data": {"id": "read-1", "name": "read"}},
-                   {"type": "session.tool.success", "data": {"id": "read-1"}}]
+        events = ([{"type": kind, "data": {"sessionID": "vendor-probe",
+                    "assistantMessageID": "FAKE-message", "id": "read-1", "name": "read"}}
+                   for kind in ("session.tool.input.started", "session.tool.called", "session.tool.success")]
                   if actual_read else [])
         driver.observe = mock.Mock(side_effect=lambda kind, *_: {
             "events": events} if kind == "native_events" else {

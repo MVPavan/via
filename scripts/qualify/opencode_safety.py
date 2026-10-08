@@ -1269,18 +1269,26 @@ class GitTemplateCopies:
         return True
 
 
+# §13 qualification evidence: cap a difference record independently of the file inventory.
+INVENTORY_DIFF_ROWS=128
+
+
 class Inventory:
     """Detect package artifacts/new binaries in HOME, XDG, fixtures and namespace."""
 
-    def __init__(self, roots, *, max_entries=100000, embedded_runtime=None, git_templates=None):
+    def __init__(self, roots, *, max_entries=100000, embedded_runtime=None, git_templates=None,
+                 record=lambda _row: None):
         self.roots = tuple(Path(root) for root in roots)
         self.max_entries = max_entries
         self.embedded_runtime=embedded_runtime
         self.git_templates=git_templates
+        self.record=record
         self.before = self._snapshot()
+        self.before_metadata=dict(self.snapshot_metadata)
 
     def _snapshot(self):
         entries, binaries = 0, {}
+        self.snapshot_metadata={}
         for index, root in enumerate(self.roots):
             if not root.is_dir() or root.is_symlink():
                 raise Blocked("inventory root unavailable or unsafe")
@@ -1321,8 +1329,26 @@ class Inventory:
                                     continue
                                 if row.st_size > ARCHIVE_BYTES:
                                     raise Blocked("private binary inventory size exceeds bound")
-                                binaries[(index, str(path.relative_to(root)))] = (
+                                key=(index, str(path.relative_to(root)))
+                                binaries[key] = (
                                     row.st_dev, row.st_ino, row.st_size, sha256(path))
+                                # Closed diagnostics: local names remain hashes unless
+                                # they are already in the verified system-template set.
+                                template=self.git_templates.templates.get(name) if self.git_templates else None
+                                bun=re.fullmatch(r'\.bun-[0-9]+-[0-9a-fA-F]{16}\.(?:so|node)',name)
+                                self.snapshot_metadata[key]={
+                                    'name_class':'git sample' if template is not None else
+                                                 'Bun extraction' if bun else 'other',
+                                    'executable':bool(row.st_mode & 0o111),'elf':prefix==b'\x7fELF',
+                                    'uid_matches':row.st_uid==os.getuid(),'link_count':row.st_nlink,
+                                    'direct_tmpdir':self.embedded_runtime is not None
+                                        and path.parent in self.embedded_runtime.tmpdirs,
+                                    'direct_hooks':path.parent.name=='hooks',
+                                    'template_matches':template is not None
+                                        and hashlib.sha256(template).hexdigest()==binaries[key][-1],
+                                    'repository_markers':{part:(path.parent.parent/part).exists()
+                                        for part in ('HEAD','config','objects','refs')}
+                                        if path.parent.name=='hooks' else {}}
                     except OSError as error:
                         if error.errno in {errno.ENOENT,errno.ESRCH} and error.filename is not None \
                                 and Path(os.fsdecode(error.filename))==path:
@@ -1332,7 +1358,23 @@ class Inventory:
         return binaries
 
     def check(self):
-        if self._snapshot() != self.before:
+        after=self._snapshot()
+        if after != self.before:
+            changed=sorted(key for key in self.before.keys() | after.keys()
+                           if self.before.get(key)!=after.get(key))
+            differences=[]
+            # §13 qualification evidence: bounded closed projection, never file content/names.
+            for key in changed[:INVENTORY_DIFF_ROWS]:
+                value=after.get(key,self.before.get(key))
+                metadata=self.snapshot_metadata.get(key,self.before_metadata.get(key,{}))
+                protected=value[0]=='metadata-only'
+                differences.append({'root_index':key[0],
+                    'path_sha256':hashlib.sha256(key[1].encode()).hexdigest(),
+                    'change':'removed' if key not in after else 'added' if key not in self.before else 'changed',
+                    'size':value[3] if protected else value[2],
+                    'sha256':None if protected else value[-1],**metadata})
+            self.record({'differences':differences,'total':len(changed),
+                         'omitted':max(0,len(changed)-INVENTORY_DIFF_ROWS)})
             raise Blocked("new or changed binary appeared in private roots")
         return True
 

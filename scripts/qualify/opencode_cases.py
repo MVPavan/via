@@ -18,8 +18,12 @@ import threading
 import time
 import urllib.parse
 import opencode_safety as safety
+from opencode_mock_policy import HOSTILE_PHASE_REQUESTS, ANCHOR_PHASE_REQUESTS
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
+
+# Packet §13 L9: a silent thirty-minute helper must outlast the twenty-minute sample.
+LONG_RUN_IDLE_MS = 1800 * 1000
 
 
 class EvidenceUnavailable(Exception):
@@ -106,7 +110,7 @@ class DriverAdapter:
                         "--model", "opencode/mimo-v2.6-flash-free" if mode == "public-free"
                         else "oclive-mock/fixture-free", "--bound", "full", "--network"])
             params = args.get("params", {})
-            for key in ("effort", "max_steps"):
+            for key in ("effort", "max_steps", "wall_ms", "idle_ms"):
                 if key in params:
                     command.extend(["--" + key.replace("_", "-"), str(params[key])])
             if session is None:
@@ -294,11 +298,11 @@ PHASES = (
     Phase("free", 40 * 60, 12, 8, "release"),
     Phase("ledger", 15 * 60, 0, 32, "release"),
     Phase("isolation", 15 * 60, 0, 32, "release"),
-    Phase("hostile", 15 * 60, 0, 32, "release"),
+    Phase("hostile", 15 * 60, 0, HOSTILE_PHASE_REQUESTS, "release"),
     Phase("helpers", 15 * 60, 6, 32, "release"),
     Phase("seams", 45 * 60, 12, 32, "test-failpoints"),
     Phase("long_run", 20 * 60, 0, 32, "release"),
-    Phase("anchor", 120 * 60, 24, 32, "release"),
+    Phase("anchor", 120 * 60, 24, ANCHOR_PHASE_REQUESTS, "release"),
     Phase("credentials", 10 * 60, 0, 0, "release"),
 )
 
@@ -973,9 +977,12 @@ class LoopbackProvider:
                         self.reply(500, json.dumps({"error": {"message": provider.secret,
                                                                "type": "provider.error"}}).encode())
                     elif provider.mode == "malformed":
-                        self.reply(200, (provider.secret + "{broken").encode())
+                        self.reply(200, ('data: {' + provider.secret + 'broken\n\n').encode(),
+                                   'text/event-stream')
                     elif provider.mode == "oversized":
-                        self.reply(200, provider.secret.encode() + b"x" * (1024 * 1024 + 1))
+                        from opencode_mock_policy import NATIVE_SSE_PENDING_BYTES
+                        self.reply(200, b'data: ' + provider.secret.encode()
+                                   + b'x' * (NATIVE_SSE_PENDING_BYTES + 1), 'text/event-stream')
                     elif provider.mode == "truncated":
                         body = provider.secret.encode()
                         self.send_response(200)
@@ -987,14 +994,20 @@ class LoopbackProvider:
                         self.close_connection = True
                     elif provider.mode in {"rate_limit", "quota", "context"}:
                         status = 429 if provider.mode == "rate_limit" else 400
-                        self.reply(status, json.dumps({"error": {"type": provider.mode,
-                                                                  "message": "fixture"}}).encode())
+                        error={"type":provider.mode,"message":"fixture"}
+                        # §13 L8: pinned classifier recognizes this quota token,
+                        # not the generic fixture label (binary byte 144457358).
+                        if provider.mode=="quota":error["code"]="insufficient_quota"
+                        self.reply(status,json.dumps({"error":error}).encode())
                     else:
+                        from opencode_mock_policy import compaction_request, COMPACTION_SUMMARY
+                        summary = compaction_request(value.get('messages'))
+                        text = COMPACTION_SUMMARY if summary else provider.text
                         # Auxiliary title/summary requests omit tools; they
                         # cannot consume a primary tool recipe. Their physical
                         # requests still consume the shared admission budget.
                         scripted = None
-                        if value.get("tools") and provider.script_cursor < len(provider.script):
+                        if not summary and value.get("tools") and provider.script_cursor < len(provider.script):
                             scripted = provider.script[provider.script_cursor]
                             provider.script_cursor += 1
                         tool_call = None
@@ -1035,7 +1048,7 @@ class LoopbackProvider:
                         result = {"id": "chatcmpl_fixture", "object": "chat.completion",
                                   "created": 1, "model": provider.model,
                                   "choices": [{"index": 0, "message": {"role": "assistant",
-                                                                             "content": provider.text},
+                                                                             "content": text},
                                                "finish_reason": "stop"}],
                                   "usage": {"prompt_tokens": 20 + provider.cache_read,
                                             "completion_tokens": 5,
@@ -1051,13 +1064,14 @@ class LoopbackProvider:
                             self.response_shape={'finish_reason':result['choices'][0]['finish_reason'],
                                 'scripted_tool':None if tool_call is None else
                                     scripted['name'] if scripted['name'] in BUILTIN_TOOLS else 'other',
-                                'message_role':'assistant','content_present':bool(provider.text),
+                                'message_role':'assistant','content_present':bool(text),
+                                'compaction_summary':summary,
                                 'usage':result['usage'],
                                 'shape':'chat.completion.chunk' if value.get('stream') is True else 'chat.completion',
                                 'stream_frames':2 if value.get('stream') is True else 0}
                         if value.get("stream") is True:
                             chunks = []
-                            delta = {"role": "assistant", "content": provider.text}
+                            delta = {"role": "assistant", "content": text}
                             if tool_call is not None:
                                 delta["tool_calls"] = [{"index": 0, **tool_call}]
                             for delta, finish in ((delta, None),
@@ -1430,11 +1444,11 @@ def case_write_cancel(driver: CaseDriver, case: Case) -> None:
                 # A retry is a failing, exact-target second occurrence. Release
                 # the original occurrence even after this activation replaces it.
                 driver.execute("seam_arm", point=point, occurrence=2, action="fail_io", context=context)
+                result = driver.execute("write_observation", session=pending["session_id"],
+                                        turn_number=context["turn_number"], point=point, context=context)
         finally:
             if mode == "response":
                 driver.execute("helper_release", helper="write")
-        result = driver.execute("write_observation", session=pending["session_id"],
-                                turn_number=context["turn_number"], point=point, context=context)
         case.check("zero or one enqueue", member(result, "enqueues", int) in {0, 1})
         case.check("never resubmitted", member(result, "submits", int) == 1)
         if member(result, "indeterminate", bool):
@@ -1510,7 +1524,6 @@ def case_transport_loss(driver: CaseDriver, case: Case) -> None:
         case.check("no known terminal admitted on VIA's lost transport",
                    member(observation, "via_terminal_admitted", bool) is False)
     finally:
-        driver.execute("seam_release", point=point, occurrence=1)
         driver.execute("helper_release", helper="tool")
 
 
@@ -1587,7 +1600,8 @@ def case_long_run(driver: CaseDriver, case: Case) -> None:
     driver.execute("long_run_barrier_prepare", project=project, session=sessions[-1],
                    helper="tool", barrier_seconds=1800)
     pending = driver.execute("start_turn", project=project, session=sessions[-1], mode="mock",
-                             prompt="Run the long-run fixture helper and hold its barrier.")
+                             prompt="Run the long-run fixture helper and hold its barrier.",
+                             params={"idle_ms": LONG_RUN_IDLE_MS})
     case.check("final L9 turn keeps the owned session", member(pending, "session_id", str) == sessions[-1])
     barrier = driver.execute("helper_barrier", session=sessions[-1], helper="tool")
     case.check("final L9 helper owns the retained generation", member(barrier, "owned", bool)

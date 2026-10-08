@@ -60,6 +60,10 @@ IDLE_RETIREMENT_SECONDS = 90  # §13: natural exit of each process, clipped to i
 CLEANUP_SECONDS = 180  # §13: bounded mock abort/retries, then natural daemon idle shutdown.
 METADATA_EFFORT = 'via-qualification-metadata-only-unoffered'  # Packet §5; C1 §4.
 OWNED_READINESS_SECONDS = 30  # §13: bounded delayed facts within the enclosing phase.
+# §8/§13 L2: HTTP 30 s + exit classification 3 s + retirement 5 s + fixed 2 s margin.
+WRITE_DRAIN_SECONDS = 40
+L9_FINISH_SECONDS = OWNED_READINESS_SECONDS  # §13 L9: snapshot before the phase watchdog.
+LONG_RUN_SHELL_TIMEOUT_MS = 1800 * 1000  # §13 L9/L14: match the bounded thirty-minute helper.
 PUBLIC_HELPER_READINESS_SECONDS = 120  # §13: free-model latency before helper readiness.
 PUBLIC_TIMELINES = sum(phase.public_turns for phase in PHASES)  # §13 per-phase admissions.
 CONFIG_READY_POLL_SECONDS = .2  # §13: only empty or verified previous endpoint maps wait.
@@ -289,6 +293,7 @@ class Driver:
         self.public_free=public_free
         self.diagnostic_mock_only=diagnostic_mock_only
         self._diagnostic_sessions={};self._submitted_models={}
+        self._mock_provider_left={}
         self._http=None; self._binary=None; self.daemon=None; self.anchor=None; self.vendor_identity=None
         self.identities=set(); self.uncertain=[]; self.build_hashes={}; self.handles={}
         self.bearer_forms=set()
@@ -330,6 +335,7 @@ class Driver:
         self._bootstrap_command=None; self._bootstrap_session=None; self._bootstrap_active=False
         self._bootstrap_config=None
         self._bootstrap_cleanup=False; self._bootstrap_count=0
+        self._cleanup_active=False
         self._bootstrap_deadline=None
         self._observation_deadline=None
         self._verified_host_record=None; self._killed_anchor=None
@@ -343,7 +349,7 @@ class Driver:
             self.work,git_templates or {},lambda value:self._record('git-template-copy',value))
         self.embedded_runtime=safety.EmbeddedRuntime(
             self.pinned,self.work,lambda value:self._record('embedded-runtime',value),
-            deadline=lambda:min(self.phase_deadline or float('inf'),
+            deadline=lambda:float('inf') if self._cleanup_active else min(self.phase_deadline or float('inf'),
                 self._bootstrap_deadline if self._bootstrap_active and self._bootstrap_deadline
                 is not None else float('inf'),self._observation_deadline or float('inf')))
         self._publication_entered=threading.Event(); self._publication_release=threading.Event()
@@ -510,7 +516,8 @@ class Driver:
         self.inventory=safety.Inventory([self.namespace.parent,self.home,
                                         *(Path(value) for value in self.env.values()
                                           if value.startswith(str(self.work/'daemon-')))],
-                                        embedded_runtime=self.embedded_runtime,git_templates=self.git_templates)
+                                        embedded_runtime=self.embedded_runtime,git_templates=self.git_templates,
+                                        record=lambda row:self._record('inventory-block',row))
         self.recover_stopped()
 
     def _copy_programs(self):
@@ -577,7 +584,8 @@ class Driver:
         roots += [root.path/'vendor' for root in self.ownership.ordered()
                   if root.state and (root.path/'vendor').is_dir()]
         if self.inventory: self.inventory.check()
-        self.inventory=safety.Inventory(roots,embedded_runtime=self.embedded_runtime,git_templates=self.git_templates)
+        self.inventory=safety.Inventory(roots,embedded_runtime=self.embedded_runtime,git_templates=self.git_templates,
+                                        record=lambda row:self._record('inventory-block',row))
 
     def _validate_provider_config(self,config):
         providers=config.get('providers',{})
@@ -900,7 +908,8 @@ class Driver:
             raise Blocked('CLI requires registered daemon generation')
         if verb in {'spawn','resume','steer'} and '--max-steps' not in args:
             # §13 allows only the exact held mock bootstrap and the fixed L11
-            # credential-fence probe. L11's unoffered effort (§5) is a second
+            # credential-fence probe or verified missing-ID mock refusal control.
+            # L11's unoffered effort (§5) is a second
             # fence before native session creation. Ordinary turns always check.
             if args!=self._metadata_command and args!=self._bootstrap_command:
                 self.spending_check(args=args)
@@ -2066,7 +2075,11 @@ class Driver:
             report=reports[-1]
             _typed(report,{'scope':S,'processes':[{'pid':I,'started_at':S}],'incomplete':B},'Host leftovers')
             matches=any(row['pid']==identity.pid and row['started_at']==started for row in report['processes'])
-            if not matches or report['incomplete']: raise Blocked('Host exact-marker helper proof unavailable')
+            self._record('marker-leftover-proof',{'helper_identity_listed':matches,
+                'report_incomplete':report['incomplete'],'listed_processes':len(report['processes']),
+                'report_scope':report['scope']})
+            # C1 §5: incomplete qualifies the full set, not a positively observed entry.
+            if not matches: raise Blocked('Host exact-marker helper proof unavailable')
             vendor_stat=self.proc.stat(self.vendor_identity.pid)
             separate=helper.get('pgid')==identity.pid
             return {'complete':True,'separate_group':separate,'host_leftovers':report,
@@ -2352,6 +2365,7 @@ class Driver:
         holders=[]
         for directory in self.proc.root.iterdir():
             if not directory.name.isdigit(): continue
+            identity=None
             try:
                 if directory.stat().st_uid!=os.getuid(): continue
                 before=self.proc.stat(int(directory.name))
@@ -2372,13 +2386,21 @@ class Driver:
                         raise
                     if any(lockid.encode() in line and b'FLOCK' in line for line in raw.splitlines()):
                         holders.append(identity.report())
-            except (OSError,Blocked):
-                # Vanishing unrelated entries are harmless only when disappearance can be proved.
-                if self.proc.stat(int(directory.name)) is not None:
-                    raise Blocked('same-uid lock descriptor scan unverifiable')
+            except (OSError,Blocked) as error:
+                # A present stat can describe an exited process. Only pidfd-
+                # grounded False permits skipping; hidden/live directories block.
+                alive=self.proc.alive(identity) if identity is not None else None
+                if alive is False:continue
+                role=self._process_role(identity) if identity is not None else 'host'
+                self._record('lock-scan-block',{'pid':int(directory.name),
+                    'start_ticks':identity.start_ticks if identity else None,
+                    'role':role,'liveness':alive if type(alive) is bool else None,
+                    'os_error':safety.os_error_record(error)})
+                raise safety.process_block(role,alive,'same-uid lock descriptor scan unverifiable') from error
         unique={tuple(sorted(row.items())) for row in holders}
         holders=[dict(row) for row in unique]
         if holders!=[anchor.report()]: raise Blocked('namespace lock escaped anchor')
+        self._verify(anchor,'anchor')
         return holders
 
     @reply_check
@@ -2603,6 +2625,27 @@ class Driver:
             self._record('l14',result)
         return result
 
+    def _prepare_l11_mock_provider(self):
+        """§13 L11: register a known integration persistently, with model admission closed."""
+        config=self._materialize_fixture('l11-seed',self.namespace,{'provider':'mock'})
+        self._validate_provider_config(config)
+        self._write_fixture_config(self.namespace,config)
+        self._refresh_inventory()
+
+    def _direct_seed_info(self,http,identity,deadline):
+        """§13 L11: only matching owned startup 503 is pending; ambiguity blocks."""
+        while True:
+            if self.signals: self.signals.guard()
+            self._verify(identity)
+            if time.monotonic()>=deadline: raise Blocked('L11 direct info startup deadline')
+            status,raw=self._request('GET','/api/info',client=http)
+            info=self._json(raw)
+            if type(info) is not dict or info.get('pid')!=identity.pid \
+                    or info.get('version')!='2.0.22' or status not in {200,503}:
+                raise Blocked('L11 direct identity/version mismatch')
+            if status==200: return
+            time.sleep(min(.02,max(0,deadline-time.monotonic())))
+
     @reply_check
     def direct_seed(self,namespace,mutation):
         """Direct credential-seeding server only while private VIA stopped (§13 L11)."""
@@ -2611,6 +2654,7 @@ class Driver:
             raise Blocked('L11 requires exact stopped VIA namespace')
         if not self._locks_free(): raise Blocked('L11 private VIA locks not free')
         safety.verify_binary(self.pinned)
+        if mutation=={'schema_checked':True}: self._prepare_l11_mock_provider()
         config=self._generated_vendor_config()
         env=dict(self.namespace_env)
         env.update(PATH=self.env['PATH'],LANG='C.UTF-8',OPENCODE_DISABLE_AUTOUPDATE='1',
@@ -2634,10 +2678,7 @@ class Driver:
                 except safety.ListenerNotReady:
                     time.sleep(min(.01,max(0,deadline-time.monotonic())))
             http=safety.OwnedHTTP(origin,identity,self.proc,password,seeding_mode=True,deadline=deadline)
-            status,raw=self._request('GET','/api/info',client=http)
-            info=self._json(raw)
-            if status!=200 or info['pid']!=identity.pid or info['version']!='2.0.22':
-                raise Blocked('L11 direct identity/version mismatch')
+            self._direct_seed_info(http,identity,deadline)
             status,raw=self._request('GET','/openapi.json',client=http)
             schema=self._json(raw)
             if status!=200: raise Blocked('L11 served schema unavailable')
@@ -2649,7 +2690,7 @@ class Driver:
                     raise Blocked('L11 pinned synthetic key schema differs')
                 secret=secrets.token_hex(32); self.secret_forms.append(secret.encode())
                 mutation={'method':'POST','path':'/api/credential','body':{
-                    'integrationID':'via-unused-qualification','label':'VIA synthetic fixture',
+                    'integrationID':safety.MOCK_IDENTITY.split('/')[0],'label':'VIA synthetic fixture',
                     'value':{'type':'key','key':secret},'activate':True}}
             self._validate_seed_mutation(schema,mutation)
             status,raw=self._request(mutation['method'],mutation['path'],mutation['body'],client=http)
@@ -2821,7 +2862,7 @@ class Driver:
 
     def _materialize_fixture(self,name,project,description):
         """Create reviewed local mock/helpers from case descriptors, never install packages."""
-        from opencode_cases import LoopbackProvider
+        from opencode_cases import LoopbackProvider, HOSTILE_RESPONSES
         config={key:value for key,value in description.items() if key in
                 {'providers','model','agents','permissions','lsp','mcp','plugins','instructions','compaction'}}
         descriptors={'provider','response','hostile_keys','context','helper','separate_group','fake_lsp',
@@ -2845,7 +2886,12 @@ class Driver:
                                       retain_exchanges=name=='usage-cache')
             if description.get('large_fields'):
                 provider.text=('VIA escape "\\\\\\n\\t雪 '*4096)
-            provider.admit_request=self._mock_request_admit
+            if description.get('hostile_keys') and description.get('response') in HOSTILE_RESPONSES:
+                from opencode_mock_policy import hostile_budget
+                budget=hostile_budget(description['response'])
+                self._mock_provider_left[name]=budget['requests']
+                self._record('mock-provider-budget',{'fixture':name,**budget})
+            provider.admit_request=lambda model:self._mock_request_admit(model,fixture=name)
             provider.__enter__(); self.mock_providers[name]=provider
             origin=safety.loopback_origin(provider.endpoint); self.mock_origins.add(origin)
             self.guard.mock_origins=frozenset(self.mock_origins)
@@ -2914,6 +2960,12 @@ class Driver:
                 +"  start("+json.dumps(str(plugin_helper))+");\n"
             if hook_helper:
                 code+="  await ctx.tool.hook('execute.before', async () => { start("+json.dumps(str(hook_helper))+"); });\n"
+            if name=='never-ask':
+                # §13 L5/§11: ask on an actual child action; only interactive child events reach C1.
+                code+="  await ctx.permission.hook('evaluate', async event => {\n" \
+                      +"    if (event.agent==='oclive-ask' && event.action==='shell' && event.source?.type==='tool') {\n" \
+                      +"      event.effect='ask'; event.message='VIA private fixture ask';\n" \
+                      +"    }\n  });\n"
             code+="  return () => { for (const child of children) { if (child.exitCode===null) child.kill('SIGTERM'); } };\n }\n};\n"
             (directory/'index.js').write_text(code); (directory/'index.js').chmod(0o400)
             config['plugins']=[str(directory)]
@@ -3187,9 +3239,12 @@ def fail_closed(error,reached):
         if kind=='server_loss_for_marker':
             if not self.daemon or not self.anchor: raise Blocked('marker server-loss identities absent')
             self._live_pin(session)
-            self._verify(self.anchor); self.journal._signal(self.anchor,signal.SIGKILL,role='anchor')
-            self._killed_anchor=self.anchor
-            return {'anchor_pid_only':True}
+            if not self.vendor_identity: raise Blocked('marker vendor identity absent')
+            # §10: Host confirms the vendor's exit through its still-live anchor.
+            # Killing the anchor instead loses that control and can yield unknown.
+            self._verify(self.vendor_identity)
+            self.journal._signal(self.vendor_identity,signal.SIGKILL,role='vendor')
+            return {'vendor_pid_only':True}
         if kind=='helper_stop_proof':
             helper=args['helper']
             rows=[(identity,row) for identity,row in self.helper_ledger.items() if row.get('kind')==helper]
@@ -3222,7 +3277,8 @@ def fail_closed(error,reached):
             provider=next((p for name,p in self.mock_providers.items()
                            if self.fixtures.get(name,{}).get('path')==self.project),None)
             if provider is None: raise Blocked('long-run mock provider absent')
-            provider.script.append({'name':'shell','arguments':{'command':'/usr/bin/python3 '+str(path)}})
+            provider.script.append({'name':'shell','arguments':{'command':'/usr/bin/python3 '+str(path),
+                'timeout':LONG_RUN_SHELL_TIMEOUT_MS}})
             return {'prepared':True,'helper':'tool','barrier_seconds':1800}
         if kind=='repository_sentinel': return self._repository_sentinel()
         if kind in {'idle_retirement','daemon_restart'}:
@@ -3398,6 +3454,7 @@ def fail_closed(error,reached):
                     'native_user_interrupted':bool(interrupts),
                     'sourcebound_pool_test':proof}
         if kind=='write_observation':
+            retiring=self._host_record()
             events=self.observe('native_events',self._vendor_sid(session))['events']
             number=args.get('turn_number')
             if type(number) is not int: raise Blocked('write observation current turn unavailable')
@@ -3412,6 +3469,25 @@ def fail_closed(error,reached):
             acks=[row for row in self._acknowledgements(args['point']) if row['_target']==target]
             if not acks: raise Blocked('written request observation absent')
             reply=self.via(['wait',self.last_request['receipt']['turn'],'--timeout-ms','180000'])
+            # §8/§13 L2: keep the original HTTP pause through its own deadline.
+            # Core unknown alone does not establish an inconclusive HTTP result.
+            original=[row for row in acks if row.get('occurrence')==1]
+            release=Path(self.env['VIA_FAILPOINT_DIR'])/(args['point']+'.1.release')
+            if len(original)!=1 or release.exists():
+                raise Blocked('original HTTP deadline barrier not held')
+            deadline=min(time.monotonic()+WRITE_DRAIN_SECONDS,self.phase_deadline or float('inf'))
+            self._await_gone([self.vendor_identity,self.anchor],'indeterminate generation drain unverified',
+                             seconds=max(0,deadline-time.monotonic()),guard=lambda:self._verify(self.daemon))
+            while True:
+                if self.signals:self.signals.guard()
+                self._verify(self.daemon)
+                current=self._host_record(allow_absent=True)
+                if current is None:break
+                if current!=retiring:raise Blocked('draining Host generation changed')
+                if time.monotonic()>=deadline:raise Blocked('draining Host absence commit unverified')
+                time.sleep(min(.02,max(0,deadline-time.monotonic())))
+            self.close_event_capture()
+            self._http=None
             return {'enqueues':len(enqueued),'submits':len(acks),'indeterminate':reply['state']=='unknown',
                     'drained':self.proc.gone(self.vendor_identity)}
         if kind=='foreign_prompt':
@@ -3473,7 +3549,8 @@ def fail_closed(error,reached):
         if kind=='memory_tail':
             final=None
             beginning=time.monotonic()
-            deadline=min(args['deadline'],self.phase_deadline or args['deadline'])
+            deadline=min(args['deadline'],self.phase_deadline or args['deadline'])-L9_FINISH_SECONDS
+            if deadline<=beginning:raise Blocked('L9 sampling window exhausted before completion reserve')
             while time.monotonic()<deadline:
                 if self.signals: self.signals.guard()
                 if deadline-time.monotonic()>1:
@@ -3493,6 +3570,7 @@ def fail_closed(error,reached):
             if len(helpers)!=1: raise Blocked('L9 final held helper identity unverified')
             self._long_run_sample['helper']=helpers[0].report()
             return {'complete':True,'final_sample':True,'large_fields_seen':large,
+                    'finish_reserve_seconds':L9_FINISH_SECONDS,
                     'public_requests':self._phase_public_used,'sample':final,
                     'duration_seconds':self._long_run_sample['duration_seconds'],
                     'observed_session_count':len(self._l9_sessions)}
@@ -3541,6 +3619,12 @@ def fail_closed(error,reached):
 
     def finish(self):
         """Final cleanup/immutable-pin proof; uncertainty retains roots and fails closure."""
+        self._cleanup_active=True
+        try: return self._finish()
+        finally: self._cleanup_active=False
+
+    def _finish(self):
+        """§13: cleanup proofs use their own bounds even after a phase expires."""
         failures=[];traffic={'received_requests':0,'providers':0}
         diagnostic_error=None
         if self.diagnostic_mock_only:
@@ -3803,14 +3887,28 @@ def fail_closed(error,reached):
     def _missing_vendor_session(self,session):
         sid=self._vendor_sid(session)
         if not self.provider_endpoints: raise Blocked('missing-ID control requires disposable mock namespace')
-        before=self.vendor('GET','/api/session')
         removed=self.vendor('DELETE','/api/session/'+sid)
         if removed['status'] not in {200,204}: raise Blocked('owned vendor session delete refused')
         self._idle_retired=False
         self._operation('idle_retirement',{'session':session})
-        reply=self.via(['resume',session,'--prompt','VIA missing-ID control'])
-        if 'cli_error' in reply: raise Blocked('missing-ID resume not receipted')
-        envelope=self.via(['wait',reply['turn'],'--timeout-ms','180000'])
+        self.ensure_vendor()
+        # Establish the baseline after successor bootstrap; that bootstrap's
+        # native session is owned auxiliary work, never a replacement for sid.
+        before=self.vendor('GET','/api/session')
+        missing=self.vendor('GET','/api/session/'+sid)
+        if missing['status']!=404: raise Blocked('missing-ID refusal control lacks verified missing session')
+        if self.last_model!=safety.MOCK_IDENTITY:
+            raise Blocked('missing-ID refusal control requires mock identity')
+        self.spending_check(args=['spawn','--model',safety.MOCK_IDENTITY,'--cwd',str(self.project)])
+        command=['resume',session,'--prompt','VIA missing-ID control']
+        self._metadata_command=command;self._metadata_active=True
+        try:
+            reply=self.via(command)
+            if 'cli_error' in reply: raise Blocked('missing-ID resume not receipted')
+            envelope=self.via(['wait',reply['turn'],'--timeout-ms','180000'])
+            if self.guard.stopped: raise Blocked('missing-ID control attempted model work')
+        finally:
+            self._metadata_command=None;self._metadata_active=False
         if envelope['failure'] is None or envelope['failure']['class']!='resume_mismatch':
             raise Blocked('missing-ID resume_mismatch absent')
         after=self.vendor('GET','/api/session')
@@ -3848,7 +3946,7 @@ def fail_closed(error,reached):
             if 'lsp' not in properties: raise Blocked('LSP configuration readback schema unavailable')
             query=urllib.parse.urlencode({'location[directory]':str(project)})
             reply=self.vendor('GET','/api/config?'+query)
-            entries=reply.get('body',{}).get('data')
+            entries=reply.get('body')
             if reply.get('status')!=200 or type(entries) is not list:
                 raise Blocked('LSP effective configuration sources unavailable')
             expected=self.fixtures['lsp-probe']['config']['lsp']['via-fixture']
@@ -3868,10 +3966,18 @@ def fail_closed(error,reached):
                 raise Blocked('actual offered read schema unavailable for LSP probe')
             sid=self._vendor_sid(receipt['session_id'])
             def read_completed(events):
-                called={row.get('data',{}).get('id') for row in events
-                        if row.get('type')=='session.tool.called' and row.get('data',{}).get('name')=='read'}
-                succeeded={row.get('data',{}).get('id') for row in events if row.get('type')=='session.tool.success'}
-                return any(row.get('id') in called & succeeded for row in calls)
+                # §13: the native called event omits name; input.started owns it.
+                def key(row):
+                    data=row.get('data',{})
+                    return (data.get('sessionID'),data.get('assistantMessageID'),data.get('id'))
+                started={key(row) for row in events
+                         if row.get('type')=='session.tool.input.started'
+                         and row.get('data',{}).get('name')=='read'}
+                called={key(row) for row in events if row.get('type')=='session.tool.called'}
+                succeeded={key(row) for row in events if row.get('type')=='session.tool.success'}
+                completed={row[2] for row in started & called & succeeded
+                           if row[0]==sid and all(type(value) is str for value in row)}
+                return any(row.get('id') in completed for row in calls)
             self._await_native(sid,read_completed,'configured fixture file read was not actually completed')
             beginning=time.monotonic(); deadline=beginning+5
             if self.phase_deadline is not None and deadline>self.phase_deadline:
@@ -4017,6 +4123,14 @@ def fail_closed(error,reached):
         return {'code':'unexpected_credential_state','cached':False,'via_sessions_created':2,
                 'session_creates':0,'prompt_submits':0,'credential_gets':0}
 
+    def _settle_near_limit_claim(self,pending):
+        """C1 P6: settle the held unsent claim before restart; unknown fences successors."""
+        session,number=pending['turn'].rsplit('/',1)
+        self.via(['cancel',session,'--turn',number])
+        terminal=self.via(['wait',pending['turn'],'--timeout-ms','180000'])
+        if terminal.get('state')!='cancelled' or (terminal.get('cancel') or {}).get('cleanup')!='quiescent':
+            raise Blocked('near-limit predecessor not safely settled')
+
     def _near_limit_inbox(self,args):
         """Park bounded synthetic queue data against a real VIA receipt/claim (§9 OC05)."""
         if args['count']!=2 or args['prompt_bytes']!=1024*1024-8192:
@@ -4069,20 +4183,27 @@ def fail_closed(error,reached):
         self._record('near-limit-seed',{'source':'synthetic queue seeding against real VIA receipt',
                      'owned_claim_verified':True,'count':len(data),'prompt_bytes':actual_prompt_bytes,
                      'cwd_json_bytes':cwd_bytes})
-        crashed=self.daemon; self._verify(crashed); self.journal._signal(crashed,signal.SIGKILL,role='daemon')
-        self._await_gone([crashed],'owned VIA crash absence unverifiable')
-        if not self.proc.gone(crashed): raise Blocked('owned VIA crash absence unverifiable')
-        self.daemon=None; self._armed={}; self._armed_history=set(); self._seam_targets={}
-        # No graceful cancel may delete the queued claim before reopen cleanup.
+        # The claim has not crossed the eligibility barrier, so cancelling it
+        # withdraws only VIA work. A crash would recover unknown and C1 P6
+        # would cancel the successor before the adapter can reopen anything.
+        self._settle_near_limit_claim(pending)
         self.stop(); self.start('failpoints',project); self.ensure_vendor()
         durable=self.vendor('GET','/api/session/'+sid+'/inbox')
         items=durable['body'].get('data')
         if type(items) is not list or {row.get('id') for row in items}!={expected,foreign}:
             raise Blocked('parked near-limit queue durability unobserved')
-        recovered=self.via(['wait',pending['turn'],'--timeout-ms','180000'])
-        if recovered['state']!='unknown': raise Blocked('crashed owned turn not recovered unknown')
+        from opencode_reply import reply_projection
+        status=self.via(['status',session])
+        self._record('near-limit-via-state',{'stage':'before-successor',
+            **reply_projection(json.dumps(status).encode(),self.reply_evidence.protected)})
         successor=self.via(['resume',session,'--prompt','VIA SUCCESSOR'])
         envelope=self.via(['wait',successor['turn'],'--timeout-ms','180000'])
+        if envelope['state']!='completed':
+            events=read_pages(lambda after:self.via(['events',session,'--after',str(after)]))
+            self._record('near-limit-via-state',{'stage':'successor-incomplete',
+                **reply_projection(json.dumps({'data':{'snapshot':envelope,'events':events}}).encode(),
+                                   self.reply_evidence.protected)})
+            raise Blocked('near-limit successor did not complete')
         events=self._await_native(sid,lambda rows:any(row['type']=='session.inbox.cancelled'
             and row.get('data',row).get('inboxID',row.get('data',row).get('id'))==expected for row in rows),
             'owned near-limit cancellation event unobservable')
@@ -4130,7 +4251,7 @@ def fail_closed(error,reached):
         if not overridden:
             setattr(self,field,remaining-1); self._phase_public_used+=1
 
-    def _mock_request_admit(self,model):
+    def _mock_request_admit(self,model,*,fixture=None):
         """Count every local provider request, including title/child/compaction calls."""
         if self._metadata_active:
             self.guard.stopped=True; raise Blocked('model request during metadata acquisition')
@@ -4141,6 +4262,10 @@ def fail_closed(error,reached):
             self.guard.stopped=True; raise Blocked('mock request after phase deadline')
         if self.guard.stopped or self.phase_mock_left is None or self.phase_mock_left<=0:
             self.guard.stopped=True; raise Blocked('mock model request ceiling exhausted')
+        if fixture in self._mock_provider_left:
+            if self._mock_provider_left[fixture]<=0:
+                self.guard.stopped=True; raise Blocked('mock provider request ceiling exhausted')
+            self._mock_provider_left[fixture]-=1
         self.phase_mock_left-=1
 
     def _started_at(self,ticks):

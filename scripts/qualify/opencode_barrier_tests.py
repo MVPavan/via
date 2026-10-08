@@ -334,13 +334,30 @@ class BarrierTests(unittest.TestCase):
         with OwnedBarrierFixture("cooperative") as fixture:
             driver = fixture.driver
             observed_threads = []
+            settled = [False]
             original = driver.proc.parse_stat
 
             def stopped(raw, pid):
                 row = original(raw, pid)
                 if pid != driver.daemon.pid:
+                    # Deterministic reproduction of asynchronous worker stop.
+                    if not settled[0]:row={**row,"state":"R"}
                     observed_threads.append(row["state"])
                 return row
+
+            real_stop=driver.journal.stop
+            def stop_group(identity):
+                real_stop(identity)
+                deadline=time.monotonic()+5
+                while True:
+                    fixture.proc.verify(identity)
+                    rows=list((fixture.proc.root/str(identity.pid)/'task').iterdir())
+                    states=[original((row/'stat').read_bytes(),int(row.name))['state'] for row in rows]
+                    if states and all(state in {'T','t'} for state in states):
+                        settled[0]=True
+                        return
+                    if time.monotonic()>=deadline:raise Blocked('FAKE group preparation deadline')
+                    time.sleep(.005)
 
             # The leader is really stopped; model the elapsed leader wait/scan
             # reaching the shared deadline before all-thread proof is accepted.
@@ -348,7 +365,8 @@ class BarrierTests(unittest.TestCase):
             try:
                 with mock.patch("opencode_driver.time",
                                 SimpleNamespace(monotonic=clock, sleep=time.sleep)), \
-                        mock.patch.object(driver.proc, "parse_stat", side_effect=stopped):
+                        mock.patch.object(driver.proc, "parse_stat", side_effect=stopped), \
+                        mock.patch.object(driver.journal,"stop",side_effect=stop_group):
                     with self.assertRaisesRegex(Blocked, "thread-group stop deadline exhausted"):
                         driver.signal_barrier({"operation": "daemon_sigstop",
                                                "identity": driver.daemon.report()})
