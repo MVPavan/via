@@ -513,6 +513,9 @@ class RealViaTests(unittest.TestCase):
                     'requests': [(row['method'],row['target'].split('?')[0])
                                  for row in fixture.requests()]})
                 session=receipt['session_id']
+                event_proof=d._operation('via_events',{'session':session,'turn':envelope['turn']})
+                self.assertTrue(event_proof['complete'])
+                self.assertEqual(event_proof['terminal_revision'],envelope['revision'])
                 self.assertEqual(d.via(['status',session])['session_id'],session)
                 self.assertTrue(d.via(['models','--harness','opencode'])['models'])
                 self.assertEqual(d.via(['logs',receipt['turn']])['session_id'],session)

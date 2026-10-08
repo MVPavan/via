@@ -36,6 +36,7 @@ from opencode_ownership import OwnershipRegistry
 from opencode_catalog import catalog_record
 from opencode_reply import ReplyEvidence, reply_check
 from opencode_cases import REPOSITORY_SENTINELS
+from opencode_events import terminal_event
 
 Blocked = safety.Blocked
 # Packet §9 and the reviewed qualification plan's observation/pagination bounds.
@@ -2769,10 +2770,8 @@ print('VIA HELPER DONE')
             return {'stop_proven':True,'vendor_session_id':sid}
         if kind=='via_events':
             events=read_pages(lambda after:self.via(['events',session,'--after',str(after)]))
-            terminal=[row for row in events if row['type'] in {'turn.completed','turn.failed','turn.cancelled','turn.unknown','turn.terminal'}]
-            if not terminal or type(terminal[-1].get('revision')) is not int:
-                raise Blocked('terminal event revision unavailable')
-            return {'complete':True,'events':events,'terminal_revision':terminal[-1]['revision']}
+            terminal=terminal_event(events,session,args.get('turn'))
+            return {'complete':True,'events':events,'terminal_revision':terminal['revision']}
         if kind=='turn_identity':
             envelope=args['envelope']; sid=envelope['vendor_session_id']
             inputid=input_id(session,envelope['turn'])
@@ -2920,9 +2919,10 @@ print('VIA HELPER DONE')
             number=args.get('turn_number')
             if type(number) is not int: raise Blocked('loss current turn number missing')
             current=[row for row in events if row.get('turn')==number]
-            accepted=any(row['type']=='turn.accepted' for row in current)
-            terminal=any(row['type'] in {'turn.completed','turn.failed','turn.cancelled'} for row in current)
-            return {'accepted_before_loss':accepted,'via_terminal_admitted':terminal}
+            accepted=any(row['type']=='turn.started' for row in current)
+            terminal=terminal_event(events,session,number,required=False)
+            known=terminal is not None and terminal['state']!='unknown'
+            return {'accepted_before_loss':accepted,'via_terminal_admitted':known}
         if kind=='seam_observation':
             return {'acknowledged':[row['occurrence'] for row in self._acknowledgements(args['point'])]}
         if kind=='missing_vendor_session': return self._missing_vendor_session(session)
@@ -3220,10 +3220,10 @@ print('VIA HELPER DONE')
         absent=not own and not any(row.get('inboxID',row.get('id'))==expected for row in enqueued)
         c1=read_pages(lambda after:self.via(['events',session,'--after',str(after)]))
         current=[row for row in c1 if row.get('turn')==number]
-        terminal=[row for row in current if row['type'] in {'turn.completed','turn.failed','turn.cancelled','turn.unknown'}]
-        accepted=any(row['type']=='turn.accepted' for row in current)
+        terminal=terminal_event(c1,session,number,required=False)
+        accepted=any(row['type']=='turn.started' for row in current)
         result={'owned_not_submitted':absent,
-                'foreign_not_credited':not any(row['type']=='turn.completed' for row in terminal),
+                'foreign_not_credited':terminal is None or terminal['state']!='completed',
                 'foreign_not_cancelled':not any(row.get('inboxID',row.get('id'))==self._foreign['id'] for row in cancelled)
                     and (held or bool(foreign_terminal))
                     and not any(row['type']=='session.execution.interrupted' for row in foreign_terminal)}

@@ -444,7 +444,8 @@ def case_free(driver: CaseDriver, case: Case) -> None:
                   background=True)
     envelope = completed(case, result, public=True)
     case.check("nonempty final text", bool(envelope["final_text"].strip()))
-    events = driver.execute("via_events", session=result["session_id"])
+    events = driver.execute("via_events", session=result["session_id"],
+                            turn=member(envelope, "turn", int))
     case.check("events fully paginated", member(events, "complete", bool))
     case.check("events agree with envelope", member(events, "terminal_revision", int)
                == member(envelope, "revision", int))
