@@ -12,6 +12,7 @@ from unittest import mock
 import opencode_driver as transport
 import opencode_safety as safety
 import opencode_reply_tests as replies
+from opencode_runroot_tests import private_runtime
 
 
 class IsolationTests(unittest.TestCase):
@@ -32,19 +33,19 @@ class IsolationTests(unittest.TestCase):
             self.assertFalse((d.evidence/'state').exists())
 
     def test_fresh_root_is_owned_private_and_has_bounded_socket_geometry(self):
-        module=self.module();root=module.create_run_root()
-        try:
-            self.assertEqual(root.parent,Path('/tmp'))
-            self.assertEqual(stat.S_IMODE(root.stat().st_mode),0o700)
-            self.assertEqual(root.stat().st_uid,os.getuid())
-            self.assertLessEqual(len(os.fsencode(root/'runtime'))+transport.ANCHOR_SOCKET_TAIL,
-                                 transport.SOCKET_BYTES)
-            # Sandbox mounts can inject /tmp/.git; isolate the absence fixture.
-            with mock.patch.object(Path,'lstat',side_effect=FileNotFoundError):
+        module=self.module()
+        with private_runtime() as parent:
+            root=module.create_run_root()
+            try:
+                self.assertEqual(root.parent,parent)
+                self.assertEqual(stat.S_IMODE(root.stat().st_mode),0o700)
+                self.assertEqual(root.stat().st_uid,os.getuid())
+                self.assertLessEqual(len(os.fsencode(root/'runtime'))+transport.ANCHOR_SOCKET_TAIL,
+                                     transport.SOCKET_BYTES)
                 proof=module.check_ancestors(root)
-            self.assertEqual(proof['ancestors'],['temporary-directory','filesystem-root'])
-            self.assertIn('.claude/skills',proof['checked_names'])
-        finally: root.rmdir()
+                self.assertEqual(proof['ancestors'],['runtime-parent','ancestor-1','filesystem-root'])
+                self.assertIn('.claude/skills',proof['checked_names'])
+            finally: root.rmdir()
 
     def test_every_discovery_name_blocks_without_reading_its_contents(self):
         module=self.module()
@@ -67,15 +68,17 @@ class IsolationTests(unittest.TestCase):
             self.assertEqual(target.stat().st_nlink,1)
 
     def test_cleanup_requires_process_proof_and_removes_only_exact_fresh_root(self):
-        module=self.module();root=module.create_run_root()
-        try:
-            with self.assertRaisesRegex(safety.Blocked,'run root cleanup needs process absence'):
-                module.remove_run_root(root,{'processes_gone':False})
-            self.assertTrue(root.exists())
-            self.assertTrue(module.remove_run_root(root,{'proven':True,'processes_gone':True,'pgrep_clear':True})['removed'])
-            self.assertFalse(root.exists())
-        finally:
-            if root.exists(): root.rmdir()
+        module=self.module()
+        with private_runtime():
+            root=module.create_run_root()
+            try:
+                with self.assertRaisesRegex(safety.Blocked,'run root cleanup needs process absence'):
+                    module.remove_run_root(root,{'processes_gone':False})
+                self.assertTrue(root.exists())
+                self.assertTrue(module.remove_run_root(root,{'proven':True,'processes_gone':True,'pgrep_clear':True})['removed'])
+                self.assertFalse(root.exists())
+            finally:
+                if root.exists(): root.rmdir()
 
     def sentinel(self,folder,*,skills=True,agents=False,sensitive=True):
         d=transport.Driver('release','fp','pin',Path(folder)/'evidence');d.prepare()
@@ -191,19 +194,21 @@ class IsolationTests(unittest.TestCase):
                 module.check_ancestors(root)
             record=raised.exception.ancestor_discovery
             self.assertIn('AGENTS.md',record['checked_names'])
-            self.assertEqual(record['ancestors'],['ancestor-0'])
+            self.assertEqual(record['ancestors'],['runtime-parent'])
             self.assertFalse(record['clear'])
 
     def test_cleanup_removes_readonly_program_directory_after_proof(self):
-        module=self.module();root=module.create_run_root()
-        binary=root/'bin';binary.mkdir(mode=0o700)
-        (binary/'FAKE').write_bytes(b'FAKE');(binary/'FAKE').chmod(0o500);binary.chmod(0o500)
-        try:
-            module.remove_run_root(root,{'proven':True,'processes_gone':True,'pgrep_clear':True})
-            self.assertFalse(root.exists())
-        finally:
-            if binary.exists(): binary.chmod(0o700);(binary/'FAKE').unlink();binary.rmdir()
-            if root.exists(): root.rmdir()
+        module=self.module()
+        with private_runtime():
+            root=module.create_run_root()
+            binary=root/'bin';binary.mkdir(mode=0o700)
+            (binary/'FAKE').write_bytes(b'FAKE');(binary/'FAKE').chmod(0o500);binary.chmod(0o500)
+            try:
+                module.remove_run_root(root,{'proven':True,'processes_gone':True,'pgrep_clear':True})
+                self.assertFalse(root.exists())
+            finally:
+                if binary.exists(): binary.chmod(0o700);(binary/'FAKE').unlink();binary.rmdir()
+                if root.exists(): root.rmdir()
 
     def test_private_programs_are_readonly_before_pinned_readback(self):
         with tempfile.TemporaryDirectory(prefix='via-ocisolation-') as folder:

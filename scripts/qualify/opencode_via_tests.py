@@ -94,9 +94,10 @@ def scripted_server(cwd):
 
 class ViaFixture:
     """Own private roots and identities; prove shutdown before deleting them (§13)."""
-    def __init__(self, kind):
+    def __init__(self, kind, *, auto_start=True):
         self.root = Path(tempfile.mkdtemp(prefix='via-oc-cli-', dir=REPO/'scratchpad'))
         self.kind = kind
+        self.auto_start = auto_start
         directory = self.root/'fake-bin'; directory.mkdir(mode=0o700)
         self.program = directory/'opencode'
         shutil.copyfile(PROGRAMS['fake'], self.program); self.program.chmod(0o500)
@@ -141,7 +142,7 @@ class ViaFixture:
             self.driver.set_phase_budget(0, 32)
             self.project = self.driver.fixture('cli-audit', {'provider': 'mock'})
             self.script.write_text(json.dumps(scripted_server(self.project)))
-            self.driver.start(self.kind, self.project)
+            if self.auto_start: self.driver.start(self.kind, self.project)
             return self
         except BaseException:
             self.__exit__(None, None, None)
@@ -210,6 +211,29 @@ class FixtureRetentionTests(unittest.TestCase):
 
 @unittest.skipUnless(AVAILABLE, 'optional real-VIA audit: build release, failpoints and via-fake-agent')
 class RealViaTests(unittest.TestCase):
+    def test_disk_floor_blocks_preflight_with_retained_fixed_numeric_cause(self):
+        with ViaFixture('release',auto_start=False) as fixture:
+            driver=fixture.driver
+            # A bounded synthetic capacity refusal, on a real private VIA daemon;
+            # unsupported max_steps still causes no vendor acquisition/model call.
+            with mock.patch.object(runtime,'QUALIFICATION_FREE_FLOOR_BYTES',1<<62):
+                with self.assertRaisesRegex(safety.Blocked,
+                        '^private VIA state is below its configured disk free floor$'):
+                    driver._operation('fresh_max_steps',{'max_steps':1})
+            retained=list(driver.evidence.glob('*reply-block.json'))
+            self.assertTrue(retained)
+            record=json.loads(retained[-1].read_text())
+            replies=[row for row in record['replies'] if row['source']=='via-stderr']
+            self.assertTrue(replies)
+            data=replies[-1]['projection']['data']
+            self.assertEqual(data['kind'],'admission_refused')
+            self.assertEqual(data['kind2'],'disk_free_floor')
+            self.assertEqual(data['floor_bytes'],1<<62)
+            self.assertIs(type(data['free_bytes']),int)
+            self.assertLess(data['free_bytes'],data['floor_bytes'])
+            self.assertNotIn('message',replies[-1]['projection'])
+            self.assertEqual(fixture.requests(),[])
+
     def bootstrap_policy(self, fixture, *, reject=None):
         """FAKE routes supply served facts; a test peer drives the owned mock only."""
         d=fixture.driver

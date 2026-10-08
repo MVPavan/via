@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -21,6 +22,22 @@ class EntryTests(unittest.TestCase):
             'checked_names':list(opencode.runroots.DISCOVERY_NAMES),
             'ancestors':['temporary-directory','filesystem-root'],'clear':True})
         ancestors.start();self.addCleanup(ancestors.stop)
+        # FAKE entry transports never start processes; runtime ownership and
+        # binary strings are exercised separately by the run-root regressions.
+        holder=tempfile.TemporaryDirectory(prefix='oc-entry-roots-',dir=opencode.SCRATCHPAD)
+        self.addCleanup(holder.cleanup)
+        def allocate():
+            return Path(tempfile.mkdtemp(prefix=opencode.runroots.RUN_PREFIX,dir=holder.name))
+        def remove(root,proof):
+            if any(proof.get(key) is not True for key in ('proven','processes_gone','pgrep_clear')):
+                raise Blocked('run root cleanup needs process absence')
+            shutil.rmtree(root)
+            return {'removed':True,'path_class':'private-external-run-root','name':root.name}
+        for name,function in (('create_run_root',allocate),('remove_run_root',remove)):
+            fixture=patch.object(opencode.runroots,name,side_effect=function)
+            fixture.start();self.addCleanup(fixture.stop)
+        strings=patch.object(opencode.runroots,'discovery_strings',return_value={'basis':'FAKE'})
+        strings.start();self.addCleanup(strings.stop)
 
     def test_optional_real_via_skips_are_reported_without_passing_as_executed(self):
         class Optional(unittest.TestCase):

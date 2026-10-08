@@ -1321,18 +1321,40 @@ does not alter later session-count or retirement observations. Failure and
 cleanup abort all outstanding holds. This exception adds no C1 API, result
 field or outcome and permits no paid provider/model.
 
-**Qualification run-root amendment (owner, 2026-10-07):** Every vendor/VIA-visible
-controlled path lives under one fresh, owned 0700 `/tmp/via-oc-qual.*` root:
+**Qualification run-root amendment (owner, 2026-10-07; isolation ruling 2026-10-08):**
+Every vendor/VIA-visible controlled path lives under one fresh, owned 0700
+`via-oc-qual.*` root directly inside the invoking user's `XDG_RUNTIME_DIR`:
 fixture projects, namespace cwd, HOME/XDG/TMPDIR, all VIA states/runtime,
 vendor namespaces, helpers, prompt/failpoint files and private copies of both
 VIA builds and the pinned vendor executable. No repository path is handed to
 them. System tools remain verified system executables. Only sanitized evidence
 is written to the worktree's scratchpad, through the existing secrecy controls.
-The ancestor preflight checks every parent through `/`, by existence only, for
+The runtime parent must be a canonical, non-symlink directory owned by the
+invoking user with mode 0700. Every ancestor through `/` must be root-owned
+or owned by the invoking user and have no group/other write permission. An
+unset, unsafe or excessively long runtime parent blocks; there is no `/tmp`
+fallback. Root resolution must equal its lexical path. The runtime socket
+path plus the reserved 64-byte anchor suffix must fit 107 bytes.
+The ancestor check also tests every parent through `/`, by existence only, for
 `.claude`, `.agents`, `.claude/skills`, `.agents/skills`, `.claude/agents`, `.opencode`,
-`opencode.json`, `opencode.jsonc`, `AGENTS.md`, `CLAUDE.md` and `.git`
+`opencode.json`, `opencode.jsonc`, `AGENTS.md`, `CLAUDE.md`, `CONTEXT.md` and `.git`
 (E12/E13 and pinned-binary strings); any present or unverifiable discovery
-source blocks. Evidence records the names and ancestor path classes.
+source blocks. `CONTEXT.md` discovery is unverified (no literal in the pinned
+binary) and is conservatively checked. Each run scans the hash-verified pinned
+binary for these fixed names and records bounded literal offsets, never raw
+strings. Evidence records the checked names, ancestor path/owner classes and
+modes. Repeat the full check before every `start`, mock bootstrap and direct
+vendor seeding, and in `finish` after process cleanup and before native reads
+or the secrecy scan. A later planted discovery source or weakened ownership
+or mode blocks admission.
+
+The qualification daemon config sets a positive `disk.free_floor` of 1 GiB
+(C1 §3.14). VIA's production default is 5 GiB; this host's protected runtime
+filesystem has about 3 GiB total, so that default would refuse every new turn
+before vendor acquisition. The private qualification override preserves the
+disk guard; it does not change VIA's default or the spending controls. A disk
+refusal still blocks, retaining the fixed `admission_refused`/`disk_free_floor`
+kinds and numeric `free_bytes`/`floor_bytes`, without the returned message text.
 
 Private initial Git commits and the exact namespace's 0700 chain remain.
 The nested boundary/control sentinel stays inside its owned outer fixture.

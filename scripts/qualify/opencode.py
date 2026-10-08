@@ -51,7 +51,7 @@ E7_SHA256 = "540fdf565da27de9df69b6c3864582344e74ac4ffa225c283b289481d215d241"
 TEST_MODULES = ("opencode_safety_tests", "opencode_cases_tests", "opencode_driver_tests", "opencode_readiness_tests",
                 "opencode_barrier_tests", "opencode_runtime_tests", "opencode_tests", "opencode_ownership_tests", "opencode_via_tests",
                 "opencode_reply_tests", "opencode_review_tests", "opencode_config_tests", "opencode_isolation_tests",
-                "opencode_event_tests")
+                "opencode_event_tests", "opencode_runroot_tests")
 _ACQUISITION_ROOT = None
 
 
@@ -416,6 +416,7 @@ def main(argv=None):
             templates,info['git_templates']=safety.system_git_templates(template_probe)
             pinned = acquire(args.evidence, ownership) if args.acquire else args.opencode.resolve()
             safety.verify_binary(pinned)
+            info['discovery_strings']=runroots.discovery_strings(pinned)
             from opencode_driver import Driver
             driver = Driver(via_release=args.via_release, via_failpoints=args.via_failpoints,
                             opencode=pinned, evidence=args.evidence, signals=signals,

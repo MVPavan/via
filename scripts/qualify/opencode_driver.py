@@ -37,6 +37,7 @@ from opencode_catalog import catalog_record
 from opencode_reply import ReplyEvidence, reply_check
 from opencode_cases import REPOSITORY_SENTINELS
 from opencode_events import terminal_event
+from opencode_runroot import ANCHOR_SOCKET_TAIL, SOCKET_BYTES
 
 Blocked = safety.Blocked
 # Packet §9 and the reviewed qualification plan's observation/pagination bounds.
@@ -45,17 +46,16 @@ EVIDENCE_BYTES = 256 * 1024 * 1024
 SCAN_ENTRIES = 100000  # §13: bound the owned evidence/private-root walk.
 SCAN_ATTEMPTS = 3  # §13: restart the whole scan on transient VIA-owned churn.
 PAGE_COUNT = 1000
-SOCKET_BYTES = 107
 SSE_HANDSHAKE_SECONDS = 30  # §13 owned observer absolute header deadline.
 WAIT_REPLY_MARGIN_SECONDS = 10  # §13: allow the CLI to return its bounded wait reply.
 HELPER_STOP_SECONDS = 30  # §13 L14 bounded cooperative cleanup before a successor.
-ANCHOR_SOCKET_TAIL = 64
 METADATA_EFFORT = 'via-qualification-metadata-only-unoffered'  # Packet §5; C1 §4.
 OWNED_READINESS_SECONDS = 30  # §13: bounded delayed facts within the enclosing phase.
 CONFIG_READY_POLL_SECONDS = .2  # §13: only empty or verified previous endpoint maps wait.
 CATALOG_READY_POLL_SECONDS = .2  # §§2.2, 13: catalogue readiness, never request admission.
 BOOTSTRAP_SECONDS = 30  # §13: owned acquisition and all served-fact checks.
 BOOTSTRAP_WAIT_MS = 30000  # §13: mock completion after the response is released.
+QUALIFICATION_FREE_FLOOR_BYTES = 1024 * 1024 * 1024  # §13 run root; C1 §3.14 disk guard.
 
 
 def _typed(value, schema, where):
@@ -490,6 +490,7 @@ class Driver:
 
     def start(self,kind,project):
         """Start only explicit private VIA config and verify both locks/PID identity."""
+        self._check_ancestors('start')
         project=Path(project)
         if self.daemon is not None and self.phase_kind==kind:
             self.proc.verify(self.daemon)
@@ -506,7 +507,8 @@ class Driver:
         safety.verify_binary(self.pinned)
         safety.validate_path(self.env['PATH'],self.helpers)
         self.project=Path(project)
-        config={'harnesses':{'opencode':{'binary':str(self.pinned),'inherit':self.inherit_settings}}}
+        config={'harnesses':{'opencode':{'binary':str(self.pinned),'inherit':self.inherit_settings}},
+                'disk':{'free_floor':QUALIFICATION_FREE_FLOOR_BYTES}}
         safety.verify_daemon_program(config,self.pinned)
         fd=os.open(self.state/'daemon.json',os.O_WRONLY|os.O_CREAT|os.O_TRUNC|os.O_NOFOLLOW,0o600)
         with os.fdopen(fd,'w') as file: json.dump(config,file)
@@ -1059,6 +1061,7 @@ class Driver:
     def _bootstrap_vendor(self):
         """Labelled mock-only acquisition; failed proof cancels without releasing (§13)."""
         if self.guard.stopped: raise Blocked('spending control previously failed')
+        self._check_ancestors('bootstrap')
         from opencode_cases import ResponseHold, EvidenceUnavailable
         deadline=min(time.monotonic()+BOOTSTRAP_SECONDS,self.phase_deadline or float('inf'))
         hold=ResponseHold(deadline)
@@ -2213,6 +2216,7 @@ class Driver:
     @reply_check
     def direct_seed(self,namespace,mutation):
         """Direct credential-seeding server only while private VIA stopped (§13 L11)."""
+        self._check_ancestors('direct-seed')
         if self.daemon is not None or Path(namespace)!=self.namespace:
             raise Blocked('L11 requires exact stopped VIA namespace')
         if not self._locks_free(): raise Blocked('L11 private VIA locks not free')
@@ -3056,6 +3060,7 @@ print('VIA HELPER DONE')
         if failures: raise failures[0]
         safety.verify_binary(self.pinned)
         if self.external_root:
+            self._check_ancestors('finish')
             for kind,path in self.paths.items():
                 expected=self.build_hashes.get(kind)
                 if expected is not None and safety.sha256(path)!=expected:
@@ -3066,6 +3071,16 @@ print('VIA HELPER DONE')
         if scan['secret_absent'] is not True or scan['payload_captures']!=0:
             raise Blocked('final secrecy scan failed')
         return {'stopped':True,**proof,'pinned_rehash':True,'secrecy_scan':scan,'mock_traffic':traffic}
+
+    def _check_ancestors(self,stage):
+        """Repeat §13 external-root checks before admission and final native/secret reads."""
+        if not self.external_root: return
+        from opencode_runroot import check_ancestors
+        try: report=check_ancestors(self.work)
+        except Blocked as error:
+            self._record('ancestor-check',{'stage':stage,**getattr(error,'ancestor_discovery',{})})
+            raise
+        self._record('ancestor-check',{'stage':stage,**report})
 
     def clear_sensitive(self):
         """Clear memory only after the entry's final protected evidence sink (§2.3)."""
@@ -3087,6 +3102,11 @@ print('VIA HELPER DONE')
                           '--cwd',str(project),'--bound','full','--network','--max-steps',str(value),
                           '--prompt','VIA preflight','--background'])
         error=refused.get('cli_error',{}).get('error',{})
+        data=error.get('data')
+        if error.get('code')==-32012 and type(data) is dict \
+                and data.get('kind')=='admission_refused' and data.get('kind2')=='disk_free_floor':
+            _typed(data,{'free_bytes':I,'floor_bytes':I},'disk free floor refusal')
+            raise Blocked('private VIA state is below its configured disk free floor')
         _typed(error,{'code':I,'data':{'kind':S,'field':S}},'max_steps refusal')
         if error['data']['kind']!='invalid_params' or error['data']['field']!='max_steps':
             raise Blocked('max_steps did not refuse before acquisition')

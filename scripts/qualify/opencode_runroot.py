@@ -1,6 +1,8 @@
 """Private external run roots and sanitized native diagnostics (OpenCode §13)."""
 import hashlib
+import functools
 import json
+import mmap
 import os
 from pathlib import Path
 import re
@@ -14,8 +16,13 @@ from opencode_reply import reply_projection
 
 # §13: source E12/E13 and strings in the hash-verified 2.0.22 executable.
 DISCOVERY_NAMES = ('.claude','.agents','.claude/skills','.agents/skills','.claude/agents','.opencode',
-                   'opencode.json','opencode.jsonc','AGENTS.md','CLAUDE.md','.git')
+                   'opencode.json','opencode.jsonc','AGENTS.md','CLAUDE.md','CONTEXT.md','.git')
 RUN_PREFIX = 'via-oc-qual.'  # §13: runtime plus the reserved anchor tail fits 107 bytes.
+SOCKET_BYTES = 107  # §13: Unix listener path bound, including the reserved anchor tail.
+ANCHOR_SOCKET_TAIL = 64  # §13: maximum runtime-to-anchor socket suffix.
+RUN_SUFFIX_BYTES = 8  # §13: tempfile's random suffix; actual allocation is checked too.
+DISCOVERY_OFFSETS = 16  # §13: bounded fixed-name binary-string evidence per name.
+CLEANUP_ENTRIES = 100000  # §13: same bounded private-tree walk as the secrecy scan.
 NATIVE_ROWS = 4096  # §13: bounded diagnostic rows, never unbounded storage copies.
 NATIVE_BYTES = 16 * 1024 * 1024  # §13: same observation limit as the driver.
 MARKERS = {'local_marker':'VIA_LOCAL_AGENT_SENTINEL',
@@ -24,22 +31,65 @@ MARKERS = {'local_marker':'VIA_LOCAL_AGENT_SENTINEL',
 
 
 def create_run_root():
-    """Create a fresh owned 0700 root directly in /tmp, independent of TMPDIR (§13)."""
-    return safety.private_directory(Path(tempfile.mkdtemp(prefix=RUN_PREFIX,dir='/tmp')))
+    """Allocate only below safe canonical XDG_RUNTIME_DIR; no /tmp fallback (§13)."""
+    value=os.environ.get('XDG_RUNTIME_DIR')
+    if not value: raise safety.Blocked('runtime directory unavailable')
+    parent=Path(value)
+    try:
+        info=parent.lstat()
+        valid=parent.is_absolute() and parent.resolve(strict=True)==parent \
+            and stat.S_ISDIR(info.st_mode) and info.st_uid==os.getuid() \
+            and stat.S_IMODE(info.st_mode)==0o700
+    except (OSError,RuntimeError) as error:
+        raise safety.Blocked('runtime directory unsafe') from error
+    if not valid: raise safety.Blocked('runtime directory unsafe')
+    pending=parent/(RUN_PREFIX+'x'*RUN_SUFFIX_BYTES)
+    check_ancestors(pending,pending=True)
+    if len(os.fsencode(pending/'runtime'))+ANCHOR_SOCKET_TAIL>SOCKET_BYTES:
+        raise safety.Blocked('runtime socket path bound')
+    lexical=Path(tempfile.mkdtemp(prefix=RUN_PREFIX,dir=parent))
+    resolved=lexical.resolve(strict=True)
+    if resolved!=lexical or lexical.parent!=parent:
+        raise safety.Blocked('run root canonical identity differs')
+    root=safety.private_directory(resolved)
+    if len(os.fsencode(root/'runtime'))+ANCHOR_SOCKET_TAIL>SOCKET_BYTES:
+        root.rmdir()
+        raise safety.Blocked('runtime socket path bound')
+    return root
 
 
-def check_ancestors(root):
-    """Existence-only discovery checks; never inspect ancestor file contents (§13)."""
+def check_ancestors(root,*,pending=False):
+    """Verify canonical ownership/modes and existence-only discovery names (§13)."""
+    root=Path(root)
     checked=[]
-    ancestors=list(Path(root).parents)
+    metadata=[]
+    ancestors=list(root.parents)
     report={'checked_names':list(DISCOVERY_NAMES),'ancestors':checked,'clear':False,
-            'basis':'pinned 2.0.22 E12/E13 and binary strings'}
+            'directories':metadata,'basis':'pinned 2.0.22 E12/E13, binary strings; CONTEXT.md conservative'}
     def blocked(reason):
         error=safety.Blocked(reason);error.ancestor_discovery=report;return error
+    try:
+        if not root.is_absolute() or root.resolve(strict=not pending)!=root:
+            raise blocked('run root canonical identity differs')
+        if not pending:
+            own=root.lstat()
+            if not stat.S_ISDIR(own.st_mode) or own.st_uid!=os.getuid() \
+                    or stat.S_IMODE(own.st_mode)!=0o700:
+                raise blocked('run root ownership or mode unsafe')
+    except (OSError,RuntimeError) as error: raise blocked('run root identity unverifiable') from error
     for index,ancestor in enumerate(ancestors):
         label='filesystem-root' if ancestor==Path('/') else (
-            'temporary-directory' if ancestor==Path('/tmp') else 'ancestor-'+str(index))
+            'runtime-parent' if index==0 else 'ancestor-'+str(index))
         checked.append(label)
+        try: info=ancestor.lstat()
+        except OSError as error: raise blocked('ancestor directory unverifiable') from error
+        safe=stat.S_ISDIR(info.st_mode) and info.st_uid in {0,os.getuid()} and not info.st_mode&0o022
+        if index==0:
+            safe=safe and info.st_uid==os.getuid() and stat.S_IMODE(info.st_mode)==0o700
+        metadata.append({'path_class':label,'owner_class':'invoking-user' if info.st_uid==os.getuid()
+                         else 'root' if info.st_uid==0 else 'foreign',
+                         'mode':format(stat.S_IMODE(info.st_mode),'04o'),'safe':bool(safe)})
+        if not safe: raise blocked('ancestor directory unsafe: '+label)
         for name in DISCOVERY_NAMES:
             try: (ancestor/name).lstat()
             except FileNotFoundError: continue
@@ -47,6 +97,26 @@ def check_ancestors(root):
             raise blocked('ancestor discovery source present: '+name+' at '+label)
     report['clear']=True
     return report
+
+
+def discovery_strings(binary):
+    """Record fixed discovery-name offsets in the hash-verified pinned bytes (§13)."""
+    proof=safety.verify_binary(binary)
+    found={}
+    with Path(binary).open('rb') as file,mmap.mmap(file.fileno(),0,access=mmap.ACCESS_READ) as data:
+        for name in DISCOVERY_NAMES:
+            needle=name.encode();offsets=[];start=0
+            for _ in range(DISCOVERY_OFFSETS):
+                offset=data.find(needle,start)
+                if offset<0: break
+                offsets.append(offset);start=offset+len(needle)
+            found[name]={'literal_present':bool(offsets),'offsets':offsets,
+                         'basis':'literal-string' if offsets else 'source-or-conservative'}
+    if safety.sha256(binary)!=proof['sha256']:
+        raise safety.Blocked('discovery binary changed during string scan')
+    return {'binary_sha256':proof['sha256'],'binary_size':proof['size'],
+            'names':found,'checked_names':list(DISCOVERY_NAMES),
+            'context_discovery':'unverified; conservatively checked'}
 
 
 def copy_program(source,destination):
@@ -70,9 +140,14 @@ def remove_run_root(root,proof):
     if any(proof.get(key) is not True for key in ('proven','processes_gone','pgrep_clear')):
         raise safety.Blocked('run root cleanup needs process absence')
     root=Path(root)
-    if root.parent!=Path('/tmp') or not root.name.startswith(RUN_PREFIX):
+    parent=os.environ.get('XDG_RUNTIME_DIR')
+    if not parent or root.parent!=Path(parent) or not root.name.startswith(RUN_PREFIX):
         raise safety.Blocked('run root cleanup path is not owned')
-    safety.private_directory(root)
+    try: info=root.lstat()
+    except FileNotFoundError:
+        return {'removed':True,'already_absent':True,'path_class':'private-external-run-root','name':root.name}
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or root.resolve(strict=True)!=root:
+        raise safety.Blocked('run root cleanup ownership uncertain')
     binary=root/'bin'
     if binary.exists() or binary.is_symlink():
         info=binary.lstat()
@@ -80,7 +155,26 @@ def remove_run_root(root,proof):
             raise safety.Blocked('run program directory cleanup ownership uncertain')
         # Read-only for the run; writable only now, after process absence proof.
         binary.chmod(0o700,follow_symlinks=False)
-    shutil.rmtree(root)
+    class RetryRemoval(Exception): pass
+    def repair(_function,_path,error):
+        if not isinstance(error,PermissionError): raise error
+        # Restore only owned non-symlink directories, after the process proof.
+        # Repair the whole tree once, then retry; never weaken a file or follow a link.
+        count=0
+        root.chmod(0o700,follow_symlinks=False)
+        for current,directories,_files in os.walk(root,followlinks=False):
+            for name in directories:
+                path=Path(current)/name;info=path.lstat();count+=1
+                if count>CLEANUP_ENTRIES: raise safety.Blocked('run root cleanup entry bound')
+                if stat.S_ISDIR(info.st_mode):
+                    if info.st_uid!=os.getuid(): raise safety.Blocked('run root cleanup directory ownership uncertain')
+                    path.chmod(0o700,follow_symlinks=False)
+        raise RetryRemoval
+    try: shutil.rmtree(root,onexc=repair)
+    except RetryRemoval:
+        try: shutil.rmtree(root)
+        except OSError as error: raise safety.Blocked('private run root removal unverified') from error
+    except OSError as error: raise safety.Blocked('private run root removal unverified') from error
     if root.exists() or root.is_symlink(): raise safety.Blocked('private run root remains')
     return {'removed':True,'path_class':'private-external-run-root','name':root.name}
 
@@ -97,6 +191,16 @@ def _rows(conn,query,args=()):
     return rows
 
 
+def _diagnostic(function):
+    @functools.wraps(function)
+    def checked(*args,**kwargs):
+        try: return function(*args,**kwargs)
+        except (sqlite3.Error,ValueError,AttributeError,TypeError,OSError) as error:
+            raise safety.Blocked('native diagnostic unavailable') from error
+    return checked
+
+
+@_diagnostic
 def instruction_facts(database,session=None):
     """Keep instruction-state hashes and sentinel Booleans, never instruction text (§13)."""
     _regular(database);out=[]
@@ -136,6 +240,7 @@ def instruction_facts(database,session=None):
     return out
 
 
+@_diagnostic
 def native_facts(root,protected,ownership):
     """Read only owned native session/log/Store tables; retain closed projections (§13)."""
     root=Path(root);out=[]
@@ -172,6 +277,8 @@ def native_facts(root,protected,ownership):
             events=[project({'type':kind}) for (kind,) in _rows(conn,'SELECT type FROM events ORDER BY rowid')]
         out.append({'path':database.relative_to(root).as_posix(),'class':'via-store-backup',
                     'sessions':sessions,'turns':turns,'events':events})
+    projects=[(os.fsencode(path.parent),path.parent.relative_to(root).as_posix())
+              for path in sorted(root.rglob('opencode.json'))]
     for path in sorted(root.rglob('*.log')):
         classified=ownership.classify(path)
         if classified is None: raise safety.Blocked('native log ownership unverifiable')
@@ -184,9 +291,8 @@ def native_facts(root,protected,ownership):
             if not labels: continue
             stamp=re.search(rb'\b(\d{4}-\d\d-\d\d[T ]\d\d:\d\d:\d\d(?:\.\d+)?)',line)
             locations=[]
-            for project in sorted(root.rglob('opencode.json')):
-                if os.fsencode(project.parent) in line:
-                    locations.append(project.parent.relative_to(root).as_posix())
+            for encoded,relative in projects:
+                if encoded in line: locations.append(relative)
             rows.append({'line':number,'sha256':hashlib.sha256(line).hexdigest(),'labels':labels,
                 'time':stamp[1].decode() if stamp else None,'locations':locations})
             if len(rows)>NATIVE_ROWS: raise safety.Blocked('native log diagnostic row bound')
