@@ -725,12 +725,12 @@ class Driver:
         if alive is False:
             # Only clean idle evidence can end this generation; never adopt an
             # unseen holder or attach another generation's reply to this one.
-            self._refresh_daemon(restart=False)
+            self._refresh_daemon(restart=True)
             return
         if alive is not True:
             raise safety.process_block('daemon',alive,'CLI daemon generation unverifiable')
         if not all(rows==[(identity.pid,'FLOCK')] for rows in holders.values()):
-            self._refresh_daemon(restart=False,idle_exit_pending=True)
+            self._refresh_daemon(restart=True,idle_exit_pending=True)
             return
         self._verify(identity,'daemon')
 
@@ -2732,7 +2732,8 @@ class Driver:
                      'ancestor_skills':'VIA_ANCESTOR_SKILL_SENTINEL'}
             provider=LoopbackProvider(mode=description.get('response','normal'),markers=markers,
                                       script=description.get('script',[]),cache_read=description.get('cache_read',7),
-                                      cache_write=description.get('cache_write',3),response_hold=description.get('response_hold'))
+                                      cache_write=description.get('cache_write',3),response_hold=description.get('response_hold'),
+                                      retain_exchanges=name=='usage-cache')
             if description.get('large_fields'):
                 provider.text=('VIA escape "\\\\\\n\\t雪 '*4096)
             provider.admit_request=self._mock_request_admit
@@ -2876,8 +2877,7 @@ if kind in {'lsp','mcp'}:
             value['point']=kind+'_after'
             persist()
         except BaseException as error:
-            record_failure(error,'release')
-            raise
+            fail_closed(error,'release')
     threading.Thread(target=released,daemon=True).start()
 if kind=='mcp':
     step='protocol'
@@ -2921,7 +2921,7 @@ else:
 value['point']=kind+'_after'; value['ready']=True
 step='complete'
 persist()
-print('VIA HELPER DONE')
+if not failure_seen.is_set(): print('VIA HELPER DONE')
 '''
         header,body=code.split('kind=KIND',1)
         reporter='''kind=KIND
@@ -2941,11 +2941,16 @@ def record_failure(error,reached):
         temporary=root/(kind+'.'+str(os.getpid())+'.failure.tmp')
         temporary.write_text(json.dumps(failure)); temporary.chmod(0o600)
         temporary.replace(root/(kind+'.json'))
+def fail_closed(error,reached):
+    try:
+        record_failure(error,reached)
+    finally:
+        try: os.write(2,b'VIA fixture helper failed\\n')
+        finally: os._exit(1)
 '''
         handler='''except BaseException as error:
     if isinstance(error,SystemExit) and error.code in (None,0): raise
-    record_failure(error,step)
-    raise
+    fail_closed(error,step)
 '''
         code=header+reporter+'try:\n'+textwrap.indent('kind=KIND'+body,'    ')+handler
         code=code.replace('EXCEPTION_CLASSES',repr(tuple(sorted(safety.HELPER_EXCEPTION_CLASSES))))
@@ -3448,6 +3453,10 @@ def record_failure(error,reached):
                          'unreleased_responses':sum(row['unreleased_responses'] for row in receipts),
                          'providers':len(receipts),'receipts':receipts}
                 self._record('mock-traffic',traffic)
+                usage_provider=self.mock_providers.get('usage-cache')
+                if usage_provider is not None:
+                    self._record('mock-exchanges',{'fixture':'usage-cache',
+                        'exchanges':usage_provider.exchange_records()})
                 if any(row['connection_limit_reached'] for row in receipts):
                     failures.append(Blocked('mock provider connection ceiling exhausted'))
             except BaseException as error:

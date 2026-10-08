@@ -83,6 +83,26 @@ class RunRootTests(unittest.TestCase):
                 conn.execute('INSERT INTO session_v2 VALUES (?,?,?,?,?,?)',(sid,str(base),None,0,0,0))
         return database
 
+    def test_pinned_error_classes_and_closed_http_facts(self):
+        with tempfile.TemporaryDirectory(prefix='via-ocnative-') as folder:
+            base=Path(folder);database=self.message_database(base)
+            errors=[{'name':name,'data':{'statusCode':429,'isRetryable':True,
+                'message':'FAKE-private','responseHeaders':{'authorization':'FAKE-private'}}}
+                for name in ('MessageOutputLengthError','ProviderAuthError','MessageAbortedError',
+                    'StructuredOutputError','APIError','ContextOverflowError','ContentFilterError')]
+            errors += [{'type':'tool.interrupted','statusCode':503,'isRetryable':False},
+                       {'name':'FAKE-private','statusCode':True,'isRetryable':'FAKE-private'}]
+            with sqlite3.connect(database) as conn:
+                conn.executemany('INSERT INTO session_message VALUES (?,?,?,?)',[
+                    ('ses_FAKE_pass','assistant',i,json.dumps({'error':error,'content':[]}))
+                    for i,error in enumerate(errors)])
+                result=roots._message_rows(conn,lambda raw:b'FAKE-private' in raw)
+            self.assertEqual([row['error_name'] for row in result],
+                [error.get('name',error.get('type')) for error in errors[:-1]]+['other'])
+            self.assertEqual([(row['statusCode'],row['isRetryable']) for row in result],
+                [(429,True)]*7+[(503,False),(None,None)])
+            self.assertNotIn('FAKE-private',json.dumps(result))
+
     def test_native_messages_link_sessions_and_retain_only_closed_diagnostic_fields(self):
         secret='FAKE-private-content-path-token'
         with tempfile.TemporaryDirectory(prefix='via-ocnative-') as folder:

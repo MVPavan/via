@@ -754,8 +754,9 @@ class ResponseHold:
 class LoopbackProvider:
     """Nonforwarding OpenAI-compatible fixture provider (packet §13 L4/L7).
 
-    Request bodies and synthetic secrets are memory-only. Receipt metadata is
-    Boolean/count/model identity only. Unexpected models fail locally.
+    Request bodies and synthetic secrets are memory-only.
+    Closed request/response shapes may be retained for the usage fixture only;
+    no message content, tool arguments, headers or secrets. Unexpected models fail locally.
     """
 
     BODY_BYTES = 2 * 1024 * 1024  # §9 admission plus bounded local fixture framing.
@@ -765,10 +766,11 @@ class LoopbackProvider:
     TOTAL_CONNECTIONS = 64  # §13 32 physical requests plus bounded invalid peers.
     CONNECTION_SECONDS = 5  # §13 every local observation has an absolute ceiling.
     STOP_SECONDS = 5  # §13 positive owned-thread stop proof.
+    MESSAGE_ROLES = 64  # §13 bounded closed mock request-shape diagnostic.
 
     def __init__(self, mode="normal", model="fixture-free", secret=None,
                  cache_read=7, cache_write=3, text="MOCK READY", script=None, markers=None,
-                 admit_request=None, response_hold=None):
+                 admit_request=None, response_hold=None, retain_exchanges=False):
         if mode not in {"normal", *HOSTILE_RESPONSES, "rate_limit", "quota", "context"}:
             raise ValueError("unknown mock response mode")
         self.mode, self.model = mode, model
@@ -778,6 +780,8 @@ class LoopbackProvider:
         self.script_cursor = 0
         self.scripted_tools = set()
         self.read_calls = []
+        self.retain_exchanges = retain_exchanges
+        self._exchanges = []
         self.markers = {} if markers is None else dict(markers)
         self.observed_markers = {name: False for name in self.markers}
         self.models = set()
@@ -792,6 +796,23 @@ class LoopbackProvider:
         self._connections = set()
         self._handlers = []
         self._closing = False
+
+    def _exchange_request(self, value):
+        """Retain bounded closed usage-fixture request shapes only (packet §13 L7)."""
+        if not self.retain_exchanges:return None
+        def role(item):
+            value=item.get('role') if type(item) is dict else None
+            return value if type(value) is str and value in {'system','user','assistant','tool'} else 'other'
+        messages=value.get('messages',[])
+        request={'model':'fixture-free' if value.get('model')=='fixture-free' else 'other',
+            'stream':value.get('stream') is True,'tools_present':bool(value.get('tools')),
+            'message_roles':[role(item) for item in messages[:self.MESSAGE_ROLES]] if type(messages) is list else []}
+        self._exchanges.append({'request':request,'response':None})
+        return self._exchanges[-1]
+
+    def exchange_records(self):
+        """Copy closed usage shapes after owned handlers stop (packet §13 L7)."""
+        with self._lock:return json.loads(json.dumps(self._exchanges))
 
     def _connection_done(self, request):
         with self._lock:
@@ -913,6 +934,7 @@ class LoopbackProvider:
                     with provider._lock:
                         provider.received = True
                         provider.requests += 1
+                        self.exchange = provider._exchange_request(value) if type(value) is dict else None
                         if type(value) is dict and type(value.get("model")) is str:
                             provider.models.add(value["model"])
                         try:
@@ -1022,6 +1044,15 @@ class LoopbackProvider:
                         if tool_call is not None:
                             result["choices"][0]["message"]["tool_calls"] = [tool_call]
                             result["choices"][0]["finish_reason"] = "tool_calls"
+                        if provider.retain_exchanges:
+                            from opencode_runroot import BUILTIN_TOOLS
+                            self.response_shape={'finish_reason':result['choices'][0]['finish_reason'],
+                                'scripted_tool':None if tool_call is None else
+                                    scripted['name'] if scripted['name'] in BUILTIN_TOOLS else 'other',
+                                'message_role':'assistant','content_present':bool(provider.text),
+                                'usage':result['usage'],
+                                'shape':'chat.completion.chunk' if value.get('stream') is True else 'chat.completion',
+                                'stream_frames':2 if value.get('stream') is True else 0}
                         if value.get("stream") is True:
                             chunks = []
                             delta = {"role": "assistant", "content": provider.text}
@@ -1043,6 +1074,17 @@ class LoopbackProvider:
                     self.close_connection = True
 
             def reply(self, status, body, content_type="application/json"):
+                exchange=getattr(self,'exchange',None)
+                if exchange is not None:
+                    errors={b'{"error":{"type":"fixture.tool-schema"}}':'fixture.tool-schema',
+                            b'{"error":{"type":"fixture.tool-unavailable"}}':'fixture.tool-unavailable',
+                            b'{"error":{"type":"fixture.read-unavailable"}}':'fixture.read-unavailable',
+                            b'{"error":{"type":"fixture.admission-stop"}}':'fixture.admission-stop'}
+                    shape=getattr(self,'response_shape',{})
+                    with provider._lock:
+                        exchange['response']={**shape,'status':status,'served':False,
+                            'transport':'sse' if content_type=='text/event-stream' else 'json',
+                            'error_type':errors.get(body)}
                 if provider.response_hold is not None and not provider.response_hold.wait():
                     with provider._lock:
                         provider.unreleased_responses += 1
@@ -1054,6 +1096,9 @@ class LoopbackProvider:
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+                self.wfile.flush()
+                if exchange is not None:
+                    with provider._lock:exchange['response']['served']=True
 
             def send_error(self, code, message=None, explain=None):
                 # Invalid bootstrap requests cannot bypass the response barrier.

@@ -13,7 +13,7 @@ import stat
 import tempfile
 
 import opencode_safety as safety
-from opencode_reply import reply_projection
+from opencode_reply import reply_projection, VENDOR_ERROR_NAMES
 
 # §13: source E12/E13 and strings in the hash-verified 2.0.22 executable.
 DISCOVERY_NAMES = ('.claude','.agents','.claude/skills','.agents/skills','.claude/agents','.opencode',
@@ -33,11 +33,7 @@ BUILTIN_TOOLS = frozenset({'shell','glob','read','grep','webfetch','websearch','
 PART_TYPES = frozenset({'text','reasoning','tool','file','agent','subtask','compaction',
                        'step-start','step-finish','patch','snapshot','retry'})
 FINISH_REASONS = frozenset({'stop','length','tool-calls','content-filter','error','unknown'})
-ERROR_NAMES = frozenset({'provider.auth','provider.rate-limit','provider.quota',
-    'provider.content-filter','provider.transport','provider.internal','provider.invalid-output',
-    'provider.invalid-request','provider.unsupported-operation','provider.no-route',
-    'provider.timeout','provider.unknown','provider.error','aborted','unknown',
-    'permission.rejected','tool.execution'})
+ERROR_NAMES = VENDOR_ERROR_NAMES
 TOOL_STATUSES = frozenset({'pending','running','completed','error'})
 MARKERS = {'local_marker':'VIA_LOCAL_AGENT_SENTINEL',
            'ancestor_agents':'VIA_ANCESTOR_AGENTS_SENTINEL',
@@ -224,6 +220,14 @@ def _message_rows(conn,protected,*,cancel_session=None):
         if value is None:return None
         if type(value) is not dict:return 'other'
         return label(value.get('type',value.get('name')),ERROR_NAMES)
+    def error_http(value):
+        if type(value) is not dict:return {'statusCode':None,'isRetryable':None}
+        details=value.get('data',value)
+        if type(details) is not dict:details={}
+        status=details.get('statusCode')
+        retryable=details.get('isRetryable')
+        return {'statusCode':status if type(status) is int and 100<=status<=599 else None,
+                'isRetryable':retryable if type(retryable) is bool else None}
     def count(value):
         return value if type(value) in {int,float} and 0<=value<=2**63-1 \
             and math.isfinite(value) else None
@@ -256,7 +260,7 @@ def _message_rows(conn,protected,*,cancel_session=None):
                 status=label(state.get('status'),TOOL_STATUSES|{'streaming'})
                 item.update(tool_name=label(part.get('name',part.get('tool')),BUILTIN_TOOLS),
                     status='pending' if status=='streaming' else None if status=='other' else status,
-                    error_name=error_name(state.get('error')))
+                    error_name=error_name(state.get('error')),**error_http(state.get('error')))
                 if sid==cancel_session and item['tool_name']=='shell':
                     arguments=state.get('input')
                     command=arguments.get('command') if type(arguments) is dict else None
@@ -277,7 +281,7 @@ def _message_rows(conn,protected,*,cancel_session=None):
                    'cache_read':count(cache.get('read')),'cache_write':count(cache.get('write'))}
         out.append({'sessionID':sid,'seq':seq,'role':role,'parts':parts,
             'finish':None if data.get('finish') is None else label(data['finish'],FINISH_REASONS),
-            'error_name':error_name(data.get('error')),'tokens':usage})
+            'error_name':error_name(data.get('error')),**error_http(data.get('error')),'tokens':usage})
     return out
 
 

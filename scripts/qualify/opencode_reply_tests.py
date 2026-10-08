@@ -38,6 +38,16 @@ class ReplyTests(unittest.TestCase):
         self.assertTrue(files,'blocked reply was not retained')
         return json.loads(files[-1].read_text())
 
+    def test_vendor_error_reply_retains_closed_class_and_http_facts(self):
+        from opencode_reply import reply_projection
+        raw=json.dumps({'error':{'name':'APIError','data':{'statusCode':429,
+            'isRetryable':True,'message':'FAKE-private','responseHeaders':{'authorization':'FAKE-private'},
+            'responseBody':'FAKE-private'}}}).encode()
+        record=reply_projection(raw,lambda raw:b'FAKE-private' in raw)
+        self.assertEqual(record['projection']['error'],{'name':'APIError',
+            'data':{'statusCode':429,'isRetryable':True}})
+        self.assertNotIn('FAKE-private',json.dumps(record))
+
     def test_config_endpoint_block_retains_ids_and_origin_classes_without_secrets(self):
         secret='FAKE-private-provider-token'
         handle='h_FAKE-private-handle'

@@ -15,22 +15,29 @@ from opencode_safety_tests import fake_stat
 
 
 class DaemonGenerationTests(unittest.TestCase):
-    def test_clean_dead_generation_at_bind_cannot_leave_later_wait_unbound(self):
+    def test_clean_dead_generation_at_bind_restarts_before_later_wait(self):
         with tempfile.TemporaryDirectory(prefix='via-oc-daemon-') as root:
             d,_=self.fixture(root);d._binary=Path('FAKE-via')
-            d._lock_rows=mock.Mock(return_value={path:[] for path in d._lock_paths()})
+            successor=safety.Identity(125,458)
+            d._lock_rows=mock.Mock(side_effect=lambda:{path:[(125,'FLOCK')]
+                if d.daemon==successor else [] for path in d._lock_paths()})
+            def started(kind,project):
+                self.assertEqual((kind,project),('release',Path(root)))
+                d.daemon=successor;d.proc.alive.return_value=True
+            d.start=mock.Mock(side_effect=started);d._verify=mock.Mock()
             d._bind_cli_generation()
-            self.assertIsNone(d.daemon)
+            d.start.assert_called_once()
+            self.assertEqual(d.daemon,successor)
             d.execute=mock.Mock(return_value=(2,b'',
                 b'{"code":-32001,"message":"FAKE terminal refusal","data":{"kind":"not_found"}}'))
-            with self.assertRaisesRegex(safety.Blocked,'CLI requires registered daemon generation'):
-                d.via(['wait','s_FAKE/1','--timeout-ms','0'])
-            d.execute.assert_not_called()
+            self.assertEqual(d.via(['wait','s_FAKE/1','--timeout-ms','0'])['cli_error']['error']['data']['kind'],'not_found')
+            d.execute.assert_called_once()
 
     def test_alive_daemon_releasing_locks_finishes_the_same_clean_idle_proof(self):
         for fault in (None,'unknown','open-work'):
             with self.subTest(fault=fault),tempfile.TemporaryDirectory(prefix='via-oc-daemon-') as root:
                 d,_=self.fixture(root);d.proc.alive.return_value=True
+                d.start=mock.Mock()
                 d._lock_rows=mock.Mock(side_effect=lambda:{
                     path:[] if index==0 or d.proc.alive.return_value is not True else [(123,'FLOCK')]
                     for index,path in enumerate(d._lock_paths())})
@@ -43,7 +50,7 @@ class DaemonGenerationTests(unittest.TestCase):
                         with self.assertRaises(safety.Blocked):d._bind_cli_generation()
                     else:d._bind_cli_generation()
                 if not fault:
-                    self.assertIsNone(d.daemon)
+                    d.start.assert_called_once_with('release',Path(root))
                     ended=list(d.evidence.glob('*daemon-generation.json'))
                     self.assertEqual(json.loads(ended[0].read_text())['event'],'clean-idle-exit')
 

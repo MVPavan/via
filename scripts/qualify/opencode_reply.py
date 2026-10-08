@@ -17,6 +17,21 @@ import opencode_safety as safety
 from opencode_c1 import (EVENT_TYPES, ERROR_CODES, CANCEL_OUTCOMES, CLEANUP_STATES,
                         FAILURE_CLASSES, WARNING_CODES, STOP_REASONS, DENIAL_KINDS)
 
+# §13: SessionV1 and SDK error literals from hash-verified 2.0.22; never error text.
+VENDOR_ERROR_NAMES = frozenset({'provider.auth','provider.rate-limit','provider.quota',
+    'provider.content-filter','provider.transport','provider.internal','provider.invalid-output',
+    'provider.invalid-request','provider.unsupported-operation','provider.no-route',
+    'provider.timeout','provider.unknown','provider.error','aborted','unknown',
+    'permission.rejected','tool.execution','tool.interrupted',
+    # Hash-verified 2.0.22 SessionV1 error union at executable offset 144406910.
+    'MessageOutputLengthError','ProviderAuthError','MessageAbortedError',
+    'StructuredOutputError','APIError','ContextOverflowError','ContentFilterError',
+    'AI_APICallError','AI_DownloadError','AI_EmptyResponseBodyError',
+    'AI_InvalidArgumentError','AI_InvalidPromptError','AI_InvalidResponseDataError',
+    'AI_JSONParseError','AI_LoadAPIKeyError','AI_LoadSettingError',
+    'AI_NoContentGeneratedError','AI_NoSuchModelError','AI_TooManyEmbeddingValuesForCallError',
+    'AI_TypeValidationError','AI_UnsupportedFunctionalityError'})
+
 REPLY_BYTES = 16 * 1024 * 1024  # §9/§13: the runner's existing observation cap.
 PROJECTION_BYTES = 64 * 1024  # §13: diagnostic fields, not a second payload sink.
 PROJECTION_NODES = 2048  # §13: bounded diagnostic traversal, including discarded fields.
@@ -33,9 +48,9 @@ NUMBERS = frozenset({'pid','code','seq','turn','n','revision','current_step','qu
     'input_tokens','output_tokens','cached_input_tokens','reasoning_output_tokens',
     'total_tokens','tokens_input','tokens_output','tokens_cache_read','tokens_cache_write',
     'duration_ms','denied_actions_total','auto_declined_requests_total','size','count',
-    'free_bytes','floor_bytes','free_floor'})
+    'free_bytes','floor_bytes','free_floor','statusCode'})
 BOOLS = frozenset({'more','stopping','already_terminal','vendor_identity_verified',
-                  'complete','received','model_matches','disabled','accepted','enabled','below_free_floor'})
+                  'complete','received','model_matches','disabled','accepted','enabled','below_free_floor','isRetryable'})
 ENUM_KEYS = frozenset({'type','state','status','scope','support','kind','kind2','class','outcome',
                        'cleanup','admission','phase','effect','action','version_status','field',
                        'provenance','stop_reason'})
@@ -163,8 +178,11 @@ def reply_projection(raw,protected):
                         and not hidden(item.encode()) else 'unrecognized'
                 elif field in NUMBERS: result[field]=number(item)
                 elif field in BOOLS: result[field]=item if type(item) is bool else None
+                elif field=='name' and key=='error':
+                    result[field]=item if type(item) is str and item in VENDOR_ERROR_NAMES \
+                        and not hidden(item.encode()) else 'other'
                 elif field in ENUM_KEYS:
-                    result[field]=item if type(item) is str and item in ENUMS \
+                    result[field]=item if type(item) is str and item in ENUMS|VENDOR_ERROR_NAMES \
                         and not hidden(item.encode()) else 'unrecognized'
                 elif field in {'version','vendor_version'}:
                     result[field]=item if type(item) is str and re.fullmatch(r'\d+\.\d+\.\d+',item) \

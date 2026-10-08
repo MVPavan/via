@@ -39,8 +39,12 @@ class DriverTests(unittest.TestCase):
                         if row.get('ready') is False:break
                     time.sleep(.01)
             finally:
-                try:process.communicate(timeout=5)
+                try:stdout,stderr=process.communicate(timeout=5)
                 except subprocess.TimeoutExpired:process.kill();process.communicate(timeout=5)
+            self.assertEqual(stdout,b'')
+            self.assertEqual(stderr,b'VIA fixture helper failed\n')
+            self.assertEqual(process.returncode,1)
+            if row is None and observation.exists():row=json.loads(observation.read_text())
             self.assertIsNotNone(row)
             self.assertIs(row.get('ready'),False)
             self.assertEqual(row['failure'],{'exception_class':'PermissionError','errno':'EACCES','step':'release'})
@@ -60,7 +64,11 @@ class DriverTests(unittest.TestCase):
                 script="import os,runpy\ndef fail(*args):\n raise PermissionError(13,'FAKE-private-message','/FAKE-private-path')\nos.getsid=fail\nos.fork=fail\nrunpy.run_path("+repr(str(helper))+",run_name='__main__')"
                 result=subprocess.run(['/usr/bin/python3','-c',script],cwd=project,env=env,
                                       capture_output=True,timeout=5,check=False)
-                self.assertNotEqual(result.returncode,0)
+                self.assertEqual(result.returncode,1)
+                self.assertEqual(result.stdout,b'')
+                self.assertEqual(result.stderr,b'VIA fixture helper failed\n')
+                self.assertNotIn(str(base).encode(),result.stdout+result.stderr)
+                self.assertNotIn(b'FAKE-private',result.stdout+result.stderr)
                 observation=d._helper_folder(project)/(kind+'.json')
                 self.assertTrue(observation.exists(),'exception disappeared before readiness')
                 row=json.loads(observation.read_text())

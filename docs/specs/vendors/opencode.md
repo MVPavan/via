@@ -1432,7 +1432,10 @@ invalidates an earlier stop proof, so it cannot remove a later live generation.
 Every native case-session message and part is retained as a closed diagnostic
 projection linked by `sessionID` and message sequence: role, part type, native
 built-in tool name (otherwise `other`), tool status, finish reason, fixed E34
-error name (otherwise `other`) and token counts. The E8 `streaming` tool state
+error name (otherwise `other`) and token counts. The closed error-name set also
+includes the SessionV1 and AI SDK classes found in the hash-verified 2.0.22
+executable. Retain numeric `statusCode` and Boolean `isRetryable` when present
+in the error or its `data`, without response bodies or headers. The E8 `streaming` tool state
 maps to `pending`; an unavailable status/count remains null. Unknown part and
 finish labels become `other`. Text, tool arguments, tool output and paths are
 never retained in these projections. Read-only message snapshots precede
@@ -1447,10 +1450,18 @@ with its fixed exception class (otherwise `other`), errno name if available,
 and step: initialization, fork, session, identity, readiness, protocol, barrier,
 release or complete. No exception message or path is recorded. Release-thread
 exceptions use the same writer; a failure latch prevents a later ready record
-from overwriting the failure. The barrier timeout exports only that closed
+from overwriting the failure. After recording failure, the helper writes only
+`VIA fixture helper failed` to stderr and exits with status 1; no traceback or
+exception message reaches the shell or provider. The barrier timeout exports only that closed
 projection, including when the helper has already exited; it proves no spawn
 or ownership. A snapshot observer retains the projection before blocking.
 No failed helper attempt causes an automatic model re-ask.
+The usage-cache mock retains each request's closed model/stream/tool-presence/
+message-role shape and its response status, completion/chunk shape, scripted
+built-in tool name, finish reason and served usage/cache counts. No content,
+arguments, header values or credentials are retained. These diagnostics are
+exported after owned handlers stop, even when the case or cleanup fails; they
+are not qualification or spending proof.
 Native session-ID readiness uses C1 §3.7's session state `active`, distinct
 from the active turn's `running` state. An active, admission-open session with
 no native ID is pending under the existing ownership-verified readiness

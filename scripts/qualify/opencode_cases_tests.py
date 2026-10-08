@@ -728,11 +728,12 @@ class ProviderTests(unittest.TestCase):
                 client.close()
         self.assertIsNone(provider.secret)
 
-    def request(self, provider, model="fixture-free", stream=False, tools=None):
+    def request(self, provider, model="fixture-free", stream=False, tools=None, messages=None):
         conn = http.client.HTTPConnection("127.0.0.1", provider.server.server_port, timeout=3)
         value = {"model": model, "stream": stream}
         if tools is not None:
             value["tools"] = tools
+        if messages is not None:value["messages"]=messages
         conn.request("POST", "/v1/chat/completions", json.dumps(value),
                      {"Content-Type": "application/json"})
         response = conn.getresponse()
@@ -741,6 +742,68 @@ class ProviderTests(unittest.TestCase):
         finally:
             conn.close()
         return response.status, body
+
+    def test_usage_exchange_retains_shapes_and_served_cache_without_content(self):
+        tools=[{'type':'function','function':{'name':'shell','parameters':{
+            'type':'object','properties':{'command':{'type':'string'}},
+            'required':['command'],'additionalProperties':False}}}]
+        with cases.LoopbackProvider(retain_exchanges=True,
+                script=[{'name':'shell','arguments':{'command':'FAKE-private-command'}}],
+                text='FAKE-private-response') as provider:
+            self.assertEqual(self.request(provider,tools=tools,messages=[{'role':'user','content':'FAKE-private-content'}])[0],200)
+            rows=provider.exchange_records()
+            self.assertEqual(len(rows),1)
+            self.assertEqual(rows[0]['request'],{'model':'fixture-free','stream':False,
+                'tools_present':True,'message_roles':['user']})
+            self.assertEqual(rows[0]['response']['status'],200)
+            self.assertEqual(rows[0]['response']['finish_reason'],'tool_calls')
+            self.assertEqual(rows[0]['response']['scripted_tool'],'shell')
+            self.assertEqual(rows[0]['response']['usage']['prompt_tokens_details'],
+                {'cached_tokens':7,'cache_write_tokens':3})
+            self.assertNotIn('FAKE-private',json.dumps(rows))
+
+    def test_usage_exchange_retains_stream_shapes_after_handlers_stop(self):
+        with cases.LoopbackProvider(retain_exchanges=True) as provider:
+            status,body=self.request(provider,stream=True,messages=[
+                {'role':'system','content':'FAKE-private'},
+                {'role':'assistant','content':'FAKE-private'},
+                {'role':'tool','content':'FAKE-private'},{'role':'FAKE-private'}])
+            self.assertEqual(status,200)
+            self.assertEqual(body.count(b'data: '),3)
+        row=provider.exchange_records()[0]
+        self.assertEqual(row['request']['message_roles'],['system','assistant','tool','other'])
+        self.assertTrue(row['request']['stream'])
+        self.assertEqual(row['response']['shape'],'chat.completion.chunk')
+        self.assertEqual(row['response']['stream_frames'],2)
+        self.assertEqual(row['response']['transport'],'sse')
+        self.assertTrue(row['response']['served'])
+        self.assertNotIn('FAKE-private',json.dumps(row))
+
+    def test_usage_exchanges_survive_cleanup_failure(self):
+        with tempfile.TemporaryDirectory(prefix='via-oc-exchange-') as root:
+            d=transport.Driver('release','fp','pin',Path(root)/'evidence',initialize=False)
+            provider=cases.LoopbackProvider(retain_exchanges=True).__enter__()
+            d.mock_providers={'usage-cache':provider}
+            self.request(provider,stream=True)
+            d.stop=mock.Mock(side_effect=cases.safety.Blocked('FAKE original cleanup failure'))
+            with self.assertRaisesRegex(cases.safety.Blocked,'^FAKE original cleanup failure$'):d.finish()
+            record=json.loads(next(d.evidence.glob('*mock-exchanges.json')).read_text())
+            self.assertEqual(record['fixture'],'usage-cache')
+            self.assertEqual(len(record['exchanges']),1)
+            self.assertEqual(record['exchanges'][0]['response']['status'],200)
+            self.assertFalse(provider.thread.is_alive())
+            self.assertEqual(d.mock_providers,{})
+
+    def test_usage_exchange_retains_fixture_schema_refusal(self):
+        tools=[{'type':'function','function':{'name':'shell','parameters':{
+            'type':'object','required':['command','FAKE-private-parameter']}}}]
+        with cases.LoopbackProvider(retain_exchanges=True,
+                script=[{'name':'shell','arguments':{'command':'FAKE-private-command'}}]) as provider:
+            self.assertEqual(self.request(provider,tools=tools)[0],400)
+            rows=provider.exchange_records()
+            self.assertEqual(rows[0]['response']['error_type'],'fixture.tool-schema')
+            self.assertEqual(rows[0]['response']['status'],400)
+            self.assertNotIn('FAKE-private',json.dumps(rows))
 
     def test_nonforwarding_mock_receipt_and_identity(self):
         with cases.LoopbackProvider() as provider:
