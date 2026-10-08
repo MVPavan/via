@@ -51,7 +51,7 @@ E7_SHA256 = "540fdf565da27de9df69b6c3864582344e74ac4ffa225c283b289481d215d241"
 TEST_MODULES = ("opencode_safety_tests", "opencode_cases_tests", "opencode_driver_tests", "opencode_readiness_tests",
                 "opencode_barrier_tests", "opencode_runtime_tests", "opencode_tests", "opencode_ownership_tests", "opencode_via_tests",
                 "opencode_reply_tests", "opencode_review_tests", "opencode_config_tests", "opencode_isolation_tests",
-                "opencode_event_tests", "opencode_runroot_tests")
+                "opencode_event_tests", "opencode_runroot_tests", "opencode_daemon_tests")
 _ACQUISITION_ROOT = None
 
 
@@ -77,9 +77,9 @@ def self_test():
     failed = [test_identity(test.id()) for test, _trace in result.failures + result.errors]
     self_test.skipped = [{'test': test.id(), 'reason': reason}
                          for test, reason in result.skipped
-                         if test.id().startswith('opencode_via_tests.RealViaTests.')]
+                         if test.id().startswith(('opencode_via_tests.RealViaTests.', 'opencode_daemon_tests.RealDaemonTests.'))]
     failed.extend(test.id() for test, _reason in result.skipped
-                  if not test.id().startswith('opencode_via_tests.RealViaTests.'))
+                  if not test.id().startswith(('opencode_via_tests.RealViaTests.', 'opencode_daemon_tests.RealDaemonTests.')))
     self_test.real_via_cleanup = list(audit.CLEANUP_PROOFS)
     return failed, result.testsRun
 
@@ -516,6 +516,8 @@ def main(argv=None):
                     or signals.interrupted:
                 info["result"] = "blocked"
             info.update(ended_at=time.time(), cases=records, cleanup=cleanup)
+            if driver is not None:
+                info['daemon_generations']=getattr(driver,'daemon_generations',[])
             try:
                 ownership.register(args.evidence / "summary.json", "runner-evidence", directory=False)
                 protected_write(vault, args.evidence / "summary.json", info,

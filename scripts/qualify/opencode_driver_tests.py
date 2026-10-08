@@ -769,6 +769,7 @@ class DriverTests(unittest.TestCase):
             d=Driver('release','fp','pin',root/'evidence',execute=lambda *_,**__: (0,json.dumps(reply).encode(),b''),initialize=False)
             d._binary=root/'release'; d.env={'VIA_FAILPOINT_DIR':str(root)}; d.handles['s_fixture']='memory-handle'
             d.daemon=Identity(7,9); d._armed[point]=1; d._event_thread=object()
+            d.proc=mock.Mock(); d.proc.alive.return_value=True
             d.owned_replies=[{'session_id':'s_fixture','vendor_session_id':'ses_fixture'}]
             d.build_hashes={'release':'a'*64,'failpoints':'b'*64}
             d.fake_gate_manifest={'verified':True,'via_builds':dict(d.build_hashes),'source_sha256':'c'*64,'tests':[name]}
@@ -904,6 +905,7 @@ class DriverTests(unittest.TestCase):
             class Proc:
                 def __init__(self): self.root=procroot
                 def stat(self,pid): return {'pid':pid,'start_ticks':7,'state':'S','ppid':1}
+                def alive(self,identity): return identity.start_ticks==7
                 def verify(self,identity):
                     if identity.start_ticks!=7: raise Blocked('fixture PID reused')
             calls=[]

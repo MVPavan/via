@@ -49,6 +49,7 @@ PAGE_COUNT = 1000
 SSE_HANDSHAKE_SECONDS = 30  # §13 owned observer absolute header deadline.
 WAIT_REPLY_MARGIN_SECONDS = 10  # §13: allow the CLI to return its bounded wait reply.
 HELPER_STOP_SECONDS = 30  # §13 L14 bounded cooperative cleanup before a successor.
+IDLE_RETIREMENT_SECONDS = 90  # §13: natural exit of each process, clipped to its phase.
 METADATA_EFFORT = 'via-qualification-metadata-only-unoffered'  # Packet §5; C1 §4.
 OWNED_READINESS_SECONDS = 30  # §13: bounded delayed facts within the enclosing phase.
 CONFIG_READY_POLL_SECONDS = .2  # §13: only empty or verified previous endpoint maps wait.
@@ -303,6 +304,7 @@ class Driver:
         self._verified_host_record=None; self._killed_anchor=None
         self._namespace_bootstraps={}
         self._verified_endpoint_maps={}; self._endpoint_reloads={}
+        self._daemon_log_mark=None; self.daemon_generations=[]
         self.reply_evidence=ReplyEvidence(self._record,self._reply_protected,self._reply_context,
             vault=self.vault,secret_forms=lambda:(*self.secret_forms,*self.bearer_forms))
         self.git_templates=safety.GitTemplateCopies(
@@ -351,7 +353,8 @@ class Driver:
             self.reply_evidence.capture('vendor',self._reply_route(path),raw,http_status=status,**metadata)
         if isinstance(client,OwnedHTTP):
             kwargs['observe']=observe
-        status,raw=client.request(method,path,*args,**kwargs)
+        with safety.block_context(process_role='vendor'):
+            status,raw=client.request(method,path,*args,**kwargs)
         if not isinstance(client,OwnedHTTP): observe(status,raw,complete=True)
         return status,raw
 
@@ -492,8 +495,9 @@ class Driver:
         """Start only explicit private VIA config and verify both locks/PID identity."""
         self._check_ancestors('start')
         project=Path(project)
+        if self.daemon is not None: self._refresh_daemon(restart=False)
         if self.daemon is not None and self.phase_kind==kind:
-            self.proc.verify(self.daemon)
+            self._verify(self.daemon)
             if project not in [row['path'] for row in self.fixtures.values()] and project!=self.namespace:
                 raise Blocked('project is outside initialized private fixtures')
             self.project=project
@@ -525,19 +529,132 @@ class Driver:
         for row in self.fixtures.values():
             if row['path']==self.project: self.provider_endpoints=self._validate_provider_config(row['config'])
         self._refresh_inventory()
+        log_mark=self._daemon_log_checkpoint()
         try:
             reply=self.via(['daemon','status'])
             row=self.proc.stat(reply['pid'])
-            if row is None: raise Blocked('private daemon PID disappeared')
+            if row is None: raise safety.process_block('daemon',None,'private daemon PID disappeared')
             identity=safety.Identity(reply['pid'],row['start_ticks'])
+            self._verify(identity,'daemon')
             if not self._locks_owned(identity.pid):
                 raise Blocked('private daemon lock ownership unavailable')
+            self._verify(identity,'daemon')
             self.daemon=identity; self.ownership.daemon_started(self.state); self.identities.add(identity)
+            self._daemon_log_mark=log_mark
+            self.daemon_generations.append({'generation':len(self.daemon_generations)+1,
+                **identity.report(),'build':kind})
+            self._record('daemon-generation',{'event':'started',**self.daemon_generations[-1]})
             self._record('daemon-start',{'verified':True,**identity.report(),'build':kind})
         except BaseException:
             self.uncertain.append('failed daemon start')
             self._discover_private_lockers()
             raise
+
+    def _verify(self,identity,role=None):
+        """Attach the identity's fixed role without changing process proof (§13)."""
+        role=role or self._process_role(identity)
+        with safety.block_context(process_role=role):
+            self.proc.verify(identity)
+
+    def _process_role(self,identity):
+        """Classify saved identities without observing the process again (§13)."""
+        daemon=identity==self.daemon or any((row['pid'],row['start_ticks'])==
+            (identity.pid,identity.start_ticks) for row in self.daemon_generations)
+        return ('daemon' if daemon else 'anchor' if identity==self.anchor
+                else 'vendor' if identity==self.vendor_identity or identity in self.server_identities
+                else 'helper' if identity in self.helper_ledger else 'host')
+
+    def _daemon_log_checkpoint(self):
+        """Bind shutdown proof to bytes written after this generation starts (§13)."""
+        try: info=(self.state/'via.log').lstat()
+        except FileNotFoundError: return {'device':None,'inode':None,'offset':0}
+        except OSError as error: raise Blocked('daemon idle exit log checkpoint unavailable') from error
+        if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or info.st_nlink!=1:
+            raise Blocked('daemon idle exit log checkpoint unsafe')
+        return {'device':info.st_dev,'inode':info.st_ino,'offset':info.st_size}
+
+    def _idle_exit_summary(self):
+        """Only the current private generation's bounded shutdown record proves exit (§13)."""
+        mark=self._daemon_log_mark
+        if mark is None: raise Blocked('daemon idle exit generation checkpoint missing')
+        records=[]; matched=mark['inode'] is None
+        for name in ('via.log.1','via.log'):
+            path=self.state/name
+            try: fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+            except FileNotFoundError: continue
+            except OSError as error: raise Blocked('daemon idle exit log unavailable') from error
+            with os.fdopen(fd,'rb') as stream:
+                info=os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or info.st_nlink!=1:
+                    raise Blocked('daemon idle exit log unsafe')
+                same=(info.st_dev,info.st_ino)==(mark['device'],mark['inode'])
+                if not matched and not same: continue
+                if same:
+                    if info.st_size<mark['offset']: raise Blocked('daemon idle exit log shrank')
+                    stream.seek(mark['offset']); matched=True
+                elif name=='via.log.1': continue
+                raw=stream.read(OBSERVATION_BYTES+1)
+                if len(raw)>OBSERVATION_BYTES: raise Blocked('daemon idle exit log bound')
+            for line in raw.splitlines():
+                try: value=json.loads(line)
+                except (ValueError,UnicodeError): continue
+                if type(value) is dict and type(value.get('daemon_shutdown')) is dict:
+                    records.append(value['daemon_shutdown'])
+        if not matched or len(records)!=1: raise Blocked('daemon idle exit record missing or ambiguous')
+        value=records[0]
+        required={'mode':'idle','entry':'entered','disposition':'clean','store':'joined',
+            'pending_joins':0,'failed_joins':0,'uncertain_owners':0,'host_failure':None,
+            'uncommitted_turns':0,'unresolved_turns':0,'store_failed':False,'blob_tasks':0,
+            'unstarted_dispatchers':0,'unclosed_sessions':0,'unjoined_dispatchers':0}
+        if any(type(value.get(key)) is not type(expected) or value.get(key)!=expected
+               for key,expected in required.items()):
+            raise Blocked('daemon idle exit record is not a clean idle shutdown')
+        return required
+
+    def _refresh_daemon(self,*,restart=True):
+        """Accept only a proven clean idle end, then identify a fresh private daemon (§13)."""
+        if self.daemon is None: return
+        identity=self.daemon; alive=self.proc.alive(identity)
+        if alive is True: return
+        if alive is not False:
+            raise safety.process_block('daemon',alive,'owned process is not verified alive')
+        try:
+            if not self._locks_free(): raise Blocked('daemon idle exit locks not released')
+            state=self.state.lstat()
+            if not stat.S_ISDIR(state.st_mode) or state.st_uid!=os.getuid() \
+                    or stat.S_IMODE(state.st_mode)!=0o700:
+                raise Blocked('daemon idle exit state unsafe')
+            path=self.state/'store.sqlite3'
+            info=path.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or info.st_nlink!=1 \
+                    or stat.S_IMODE(info.st_mode)!=0o600:
+                raise Blocked('daemon idle exit Store unsafe')
+            with contextlib.closing(sqlite3.connect(f'file:{path}?mode=ro',uri=True,timeout=1)) as store:
+                open_turns=store.execute("SELECT count(*) FROM turns WHERE ended_seq IS NULL "
+                    "OR state NOT IN ('completed','failed','cancelled','unknown')").fetchone()[0]
+            if open_turns!=0: raise Blocked('daemon idle exit has open accepted work')
+            summary=self._idle_exit_summary()
+            after=self.proc.alive(identity)
+            if after is not False:
+                raise safety.process_block('daemon',after,'daemon idle exit ownership changed')
+            if not self._locks_free(): raise Blocked('daemon idle exit ownership changed')
+        except (OSError,sqlite3.Error) as error:
+            raise safety.process_block('daemon',False,'daemon idle exit evidence unavailable') from error
+        except Blocked as error:
+            if not hasattr(error,'process_liveness'):
+                error.process_role='daemon'; error.process_liveness=False
+            raise
+        record=self._record('daemon-generation',{'event':'clean-idle-exit',
+            'generation':len(self.daemon_generations),**identity.report(),
+            'locks_released':True,'open_turns':open_turns,'shutdown':summary})
+        if self.daemon_generations:
+            self.daemon_generations[-1].update(clean_idle_exit=True,exit_record=record)
+        self.close_event_capture()
+        self.daemon=None; self.anchor=None; self.vendor_identity=None; self._http=None
+        self._verified_host_record=None; self._event_generation=None
+        self._bootstrap_session=None; self._daemon_log_mark=None
+        self._armed={}; self._armed_history=set(); self._seam_targets={}
+        if restart: self.start(self.phase_kind,self.project)
 
     def _lock_paths(self): return (self.runtime/'daemon.lock',self.state/'store.lock')
 
@@ -592,6 +709,8 @@ class Driver:
         # §13: probes and submitted turns can cause Host to launch a vendor or successor.
         if verb in {'describe','models','spawn','resume','steer'}:
             self._check_ancestors('cli-'+verb)
+        if self.daemon is not None and not (verb=='daemon' and len(args)>1 and args[1]=='stop'):
+            self._refresh_daemon()
         if verb in {'spawn','resume','steer'} and '--max-steps' not in args:
             # §13 allows only the exact held mock bootstrap and the fixed L11
             # credential-fence probe. L11's unoffered effort (§5) is a second
@@ -740,7 +859,7 @@ class Driver:
             if successor is not None:
                 if self.daemon!=daemon or self.state!=state_root:
                     raise Blocked('owned Host handover daemon changed')
-                self.proc.verify(daemon)
+                self._verify(daemon)
                 if self.signals: self.signals.guard()
                 if time.monotonic()>=deadline: raise Blocked('owned Host predecessor absence deadline')
                 if not any(row[0]==successor for row in rows):
@@ -766,7 +885,7 @@ class Driver:
                     and vendor_pid!=binding['vendor'].pid):
                 raise Blocked('owned Host handover successor changed')
             for identity in (binding['anchor'],binding['vendor']):
-                if identity is not None: self.proc.verify(identity)
+                if identity is not None: self._verify(identity)
         # One not-yet-armed intent is pending; never filter it out of an
         # ambiguity check or retry an unreadable/invalid Store.
         if any(value is None for value in (pid,ticks,vendor_pid)):
@@ -780,7 +899,7 @@ class Driver:
         known=self._verified_host_record
         if len(rows)!=2 or known is None or known['state_root']!=self.state or self.daemon is None:
             return None
-        self.proc.verify(self.daemon)
+        self._verify(self.daemon)
         predecessor=(known['generation'],known['anchor'].pid,known['anchor'].start_ticks,
                      known['vendor_pid'],known['phase'],known['server_id'])
         if rows.count(predecessor)!=1: return None
@@ -805,7 +924,7 @@ class Driver:
             if phase!='intent' or any(value is not None for value in (pid,ticks,vendor_pid)):
                 return None
         else:
-            anchor=safety.Identity(pid,ticks); self.proc.verify(anchor)
+            anchor=safety.Identity(pid,ticks); self._verify(anchor)
             row=self.proc.stat(pid)
             if row is None or row['start_ticks']!=ticks or row['ppid']!=self.daemon.pid:
                 raise Blocked('owned Host successor ancestry changed')
@@ -814,11 +933,12 @@ class Driver:
                 row=self.proc.stat(vendor_pid)
                 if row is None or row['ppid']!=pid:
                     raise Blocked('owned Host successor ancestry changed')
-                vendor=safety.Identity(vendor_pid,row['start_ticks']); self.proc.verify(vendor)
+                vendor=safety.Identity(vendor_pid,row['start_ticks']); self._verify(vendor)
                 self.identities.add(vendor)
         states=[self.proc.alive(identity) for identity in (known['anchor'],known['vendor'])]
         if any(value is None for value in states):
-            raise Blocked('owned Host predecessor identity unverifiable')
+            role='anchor' if states[0] is None else 'vendor'
+            raise safety.process_block(role,None,'owned Host predecessor identity unverifiable')
         gone=all(value is False for value in states)
         going=self._killed_anchor==known['anchor'] and all(type(value) is bool for value in states)
         return {'generation':generation,'server_id':server,'anchor':anchor,'vendor':vendor} if gone or going else None
@@ -826,10 +946,11 @@ class Driver:
     def ensure_vendor(self):
         """Acquire through one held mock turn, then authenticate the Host child (§13)."""
         if not self.daemon: raise Blocked('owned daemon required')
-        self.proc.verify(self.daemon)
+        self._refresh_daemon()
+        self._verify(self.daemon)
         if self._http and self.vendor_identity:
             alive=self.proc.alive(self.vendor_identity)
-            if alive is None: raise Blocked('owned vendor identity unverifiable')
+            if alive is None: raise safety.process_block('vendor',None,'owned vendor identity unverifiable')
             if alive is True:
                 self._owned_observation_guard()()
                 return
@@ -837,10 +958,10 @@ class Driver:
         record=self._host_record(allow_absent=True)
         if record is not None:
             row=self.proc.stat(record['vendor_pid'])
-            if row is None: raise Blocked('owned vendor identity unverifiable')
+            if row is None: raise safety.process_block('vendor',None,'owned vendor identity unverifiable')
             identity=safety.Identity(row['pid'],row['start_ticks'])
             alive=self.proc.alive(identity)
-            if alive is None: raise Blocked('owned vendor identity unverifiable')
+            if alive is None: raise safety.process_block('vendor',None,'owned vendor identity unverifiable')
             if alive is True:
                 self._observe_vendor()
                 return
@@ -861,7 +982,7 @@ class Driver:
                 current=self._host_record()
                 if tuple(current[key] for key in ('generation','anchor','vendor_pid','server_id'))!=binding:
                     raise Blocked('owned listener generation changed while starting')
-                self.proc.verify(record['anchor']); self.proc.verify(identity)
+                self._verify(record['anchor']); self._verify(identity)
                 checks+=1
                 try:
                     origin=self.proc.listener(identity)
@@ -884,7 +1005,7 @@ class Driver:
             current=tuple(getattr(self,key,None) for key in ('daemon','anchor','vendor_identity'))
             if current!=identities: raise Blocked('owned observation generation changed')
             for identity in identities:
-                if identity is not None: self.proc.verify(identity)
+                if identity is not None: self._verify(identity)
             if identities[1] is not None and identities[2] is not None:
                 record=self._host_record()
                 value=tuple(record[key] for key in ('generation','anchor','vendor_pid','server_id'))
@@ -931,7 +1052,10 @@ class Driver:
         if self.phase_deadline is not None: end=min(end,self.phase_deadline)
         while True:
             states=[self.proc.alive(identity) for identity in identities]
-            if any(state is None for state in states): raise Blocked('owned disappearance identity unverifiable')
+            if any(state is None for state in states):
+                identity=identities[states.index(None)]
+                raise safety.process_block(self._process_role(identity),None,
+                                           'owned disappearance identity unverifiable')
             if all(state is False for state in states): return
             if self.signals: self.signals.guard()
             if time.monotonic()>=end: raise Blocked(reason)
@@ -966,20 +1090,20 @@ class Driver:
             if safety.Identity(value['pid'],value['start_ticks'])!=identity:
                 raise Blocked('helper after-point identity changed')
             alive=self.proc.alive(identity)
-            if alive is None: raise Blocked('helper after-point identity unverifiable')
+            if alive is None: raise safety.process_block('helper',None,'helper after-point identity unverifiable')
             if value['point']==point: return value
-            if alive is False: raise Blocked('helper ended before after-point publication')
+            if alive is False: raise safety.process_block('helper',False,'helper ended before after-point publication')
             return None
         return self._await_owned(read,'L14 helper after-spawn point not reached')
 
     @reply_check
     def _observe_vendor(self):
         """Authenticate pid/start ticks, owned listener and §2 handshake before use."""
-        record=self._host_record(); self.proc.verify(record['anchor'])
+        record=self._host_record(); self._verify(record['anchor'],'anchor')
         row=self.proc.stat(record['vendor_pid'])
         if row is None or row['ppid']!=record['anchor'].pid:
             raise Blocked('vendor is not Host anchor child')
-        identity=safety.Identity(row['pid'],row['start_ticks']); self.proc.verify(identity)
+        identity=safety.Identity(row['pid'],row['start_ticks']); self._verify(identity,'vendor')
         previous=self.vendor_identity
         password=self.vault.read_once(self.proc,identity)
         origin=self._listener_origin(record,identity)
@@ -996,7 +1120,7 @@ class Driver:
             current=self._host_record()
             if tuple(current[key] for key in ('generation','anchor','vendor_pid','server_id'))!=binding:
                 raise Blocked('owned vendor info generation changed')
-            self.proc.verify(record['anchor']); self.proc.verify(identity)
+            self._verify(record['anchor']); self._verify(identity)
             if self.proc.listener(identity)!=origin:
                 raise Blocked('owned vendor info listener changed')
             status,raw=self._request('GET','/api/info',timeout=deadline-time.monotonic())
@@ -1111,7 +1235,7 @@ class Driver:
             while True:
                 if self.signals: self.signals.guard()
                 if time.monotonic()>=deadline: raise Blocked('bootstrap owned-server deadline')
-                self.proc.verify(self.daemon)
+                self._verify(self.daemon)
                 if self._host_record(allow_absent=True) is not None: break
                 time.sleep(min(.02,max(0,deadline-time.monotonic())))
             self._observe_vendor()
@@ -1482,7 +1606,7 @@ class Driver:
         self._event_conn=conn
         password=self._http.password
         auth=base64.b64encode(b'opencode:'+password).decode()
-        self.proc.verify(self.vendor_identity)
+        self._verify(self.vendor_identity)
         conn.connect(); self._event_socket=conn.sock
         ready=threading.Event(); header_deadline=time.monotonic()+SSE_HANDSHAKE_SECONDS
         stream_deadline=self.phase_deadline or time.monotonic()+120*60
@@ -1688,7 +1812,7 @@ class Driver:
             marker=[row for row in helpers if row.get('kind')=='marker']
             if len(marker)!=1: raise Blocked('marker helper identity ambiguous')
             helper=marker[0]; identity=safety.Identity(helper['pid'],helper['start_ticks'])
-            self.proc.verify(identity)
+            self._verify(identity)
             started=self._started_at(identity.start_ticks)
             report=reports[-1]
             _typed(report,{'scope':S,'processes':[{'pid':I,'started_at':S}],'incomplete':B},'Host leftovers')
@@ -1719,7 +1843,7 @@ class Driver:
             _typed(value,{'pid':I,'start_ticks':I,'password_key_absent':B},'helper')
             identity=safety.Identity(value['pid'],value['start_ticks'])
             if self.proc.alive(identity) is True:
-                self.proc.verify(identity)
+                self._verify(identity)
                 if identity in self.helper_ledger and self.helper_generations.get(identity)!=self.vendor_identity:
                     raise Blocked('helper readiness generation changed')
                 if identity not in self.helper_ledger and not self._descends_from(identity,self.vendor_identity):
@@ -1990,7 +2114,7 @@ class Driver:
                             # An individual closed fd cannot retain the namespace lock.
                             # Stable process identity is still required; directory errors
                             # and hidden/reused process identities remain unverifiable.
-                            self.proc.verify(identity)
+                            self._verify(identity)
                             continue
                         raise
                     if any(lockid.encode() in line and b'FLOCK' in line for line in raw.splitlines()):
@@ -2009,7 +2133,7 @@ class Driver:
         """Capture Host identity/lock facts for an explicitly reached life-point barrier."""
         self._prepare_lifecycle(point)
         self.ensure_vendor(); record=self._host_record()
-        self.proc.verify(self.daemon); self.proc.verify(self.anchor); self.proc.verify(self.vendor_identity)
+        self._verify(self.daemon); self._verify(self.anchor); self._verify(self.vendor_identity)
         status,raw=self._request('GET','/api/info'); info=self._json(raw)
         if status!=200 or info['pid']!=self.vendor_identity.pid: raise Blocked('vendor PID drift')
         if not self.last_request or 'session_id' not in self.last_request['receipt']:
@@ -2065,7 +2189,7 @@ class Driver:
                 raise Blocked('L14 long-run requires the retained L9 generation and final sample')
             if sample.get('completed_tail') is not True:
                 raise Blocked('L9 bounded tail not completed')
-            self.proc.verify(safety.Identity(**sample['helper']))
+            self._verify(safety.Identity(**sample['helper']))
             return
         if self.daemon: self.stop()
         self.lifecycle_counter+=1
@@ -2092,10 +2216,10 @@ class Driver:
                     identity=generation[0]
                     alive=self.proc.alive(identity)
                     if alive is False: return  # L14 intentionally killed this generation.
-                    if alive is None: raise Blocked('publication vendor identity unverifiable')
+                    if alive is None: raise safety.process_block('vendor',None,'publication vendor identity unverifiable')
                     if self.vendor_identity!=identity:
                         raise Blocked('publication vendor generation changed')
-                    try: self.proc.verify(identity)
+                    try: self._verify(identity)
                     except Blocked:
                         if self.proc.gone(identity): return
                         raise
@@ -2195,7 +2319,7 @@ class Driver:
         if identities['daemon']!=self.daemon or identities['anchor']!=self.anchor \
                 or identities['vendor']!=self.vendor_identity:
             raise Blocked('L14 sample generation changed')
-        for identity in identities.values(): self.proc.verify(identity)
+        for identity in identities.values(): self._verify(identity)
         result={'daemon_stopped':False,'stop_identity_persisted':False,'stdin_held':False,
                 'anchor_pid_only':False,'vendor_gone_within_1s':False,'daemon_resumed':False,
                 'stderr_sigpipe_limitation':True}
@@ -2241,7 +2365,7 @@ class Driver:
             deadline=min(time.monotonic()+30,self.phase_deadline or float('inf'))
             while True:
                 if self.signals: self.signals.guard()
-                self.proc.verify(identity)
+                self._verify(identity)
                 if time.monotonic()>=deadline: raise Blocked('L11 direct listener startup deadline')
                 try: origin=self.proc.listener(identity); break
                 except safety.ListenerNotReady:
@@ -2280,7 +2404,7 @@ class Driver:
             process.stdin.close()
             try: process.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                if identity: self.proc.verify(identity); process.kill()
+                if identity: self._verify(identity); process.kill()
                 process.wait(timeout=5)
             process.stdout.close()
             if identity and not self.proc.gone(identity): raise Blocked('L11 direct vendor stop unverified')
@@ -2382,9 +2506,9 @@ class Driver:
         close_error=None
         if self.daemon is not None:
             alive=self.proc.alive(self.daemon)
-            if alive is None: raise Blocked('private daemon stop identity uncertain')
+            if alive is None: raise safety.process_block('daemon',None,'private daemon stop identity uncertain')
             if alive:
-                self.proc.verify(self.daemon)
+                self._verify(self.daemon)
                 # §13: close the acquisition lease even after admission expires.
                 if self._bootstrap_session is not None:
                     self._bootstrap_cleanup=True
@@ -2400,9 +2524,16 @@ class Driver:
                 if reply.get('exit_code'): raise Blocked('private daemon stop refused')
         deadline=time.monotonic()+90
         while time.monotonic()<deadline:
-            states=[self.proc.alive(identity) for identity in self.identities]
+            owned=sorted(self.identities,key=lambda value:(value.pid,value.start_ticks))
+            states=[self.proc.alive(identity) for identity in owned]
             locks=[self._lock_free(path) for path in self._lock_paths()]
-            if any(state is None for state in states) or any(lock is None for lock in locks):
+            if any(state is None for state in states):
+                # Retain the identity corresponding to the original observation,
+                # rather than sampling again during cleanup diagnostics.
+                identity=owned[states.index(None)]
+                raise safety.process_block(self._process_role(identity),None,
+                                           'owned stop identity or lock unverifiable')
+            if any(lock is None for lock in locks):
                 raise Blocked('owned stop identity or lock unverifiable')
             if all(state is False for state in states) and locks==[True,True]: break
             time.sleep(0.02)
@@ -2638,7 +2769,7 @@ print('VIA HELPER DONE')
             try:
                 taskroot=self.proc.root/str(identity.pid)/'task'
                 while True:
-                    self.proc.verify(identity)
+                    self._verify(identity)
                     rows=list(taskroot.iterdir())
                     if not rows: raise Blocked('daemon thread-group unavailable')
                     stopped=True
@@ -2662,11 +2793,11 @@ print('VIA HELPER DONE')
         if operation=='anchor_sigkill':
             if identity!=self.anchor or sample.get('group') is not False:
                 raise Blocked('anchor-only signal authority absent')
-            self.proc.verify(self.daemon)
+            self._verify(self.daemon)
             row=self.proc.stat(self.daemon.pid)
             if not row or row['start_ticks']!=self.daemon.start_ticks or row['state'] not in {'T','t'}:
                 raise Blocked('daemon barrier not held')
-            self.proc.verify(identity)
+            self._verify(identity)
             self._sigkill_at=time.monotonic(); self.journal._signal(identity,signal.SIGKILL)
             self._killed_anchor=identity
             return {'pid_only':True,'monotonic':float(self._sigkill_at)}
@@ -2676,7 +2807,7 @@ print('VIA HELPER DONE')
             deadline=sample['deadline']
             if deadline>self._sigkill_at+1.000001: raise Blocked('death window exceeds one second')
             while time.monotonic()<=deadline:
-                self.proc.verify(self.daemon)
+                self._verify(self.daemon)
                 row=self.proc.stat(self.daemon.pid)
                 if not row or row['start_ticks']!=self.daemon.start_ticks or row['state'] not in {'T','t'}:
                     raise Blocked('daemon resumed during death proof')
@@ -2690,7 +2821,7 @@ print('VIA HELPER DONE')
             self.journal.resume(identity)
             deadline=time.monotonic()+5
             while time.monotonic()<deadline:
-                self.proc.verify(identity)
+                self._verify(identity)
                 row=self.proc.stat(identity.pid)
                 if row and row['start_ticks']==identity.start_ticks and row['state'] not in {'T','t'}:
                     return {'identity_verified':True}
@@ -2725,7 +2856,7 @@ print('VIA HELPER DONE')
         if kind=='server_loss_for_marker':
             if not self.daemon or not self.anchor: raise Blocked('marker server-loss identities absent')
             self._live_pin(session)
-            self.proc.verify(self.anchor); self.journal._signal(self.anchor,signal.SIGKILL)
+            self._verify(self.anchor); self.journal._signal(self.anchor,signal.SIGKILL)
             self._killed_anchor=self.anchor
             return {'anchor_pid_only':True}
         if kind=='helper_stop_proof':
@@ -2771,8 +2902,15 @@ print('VIA HELPER DONE')
                 if identity is None: raise Blocked('idle predecessor identity absent')
                 self.close_event_capture()
                 # Idle retirement is a vendor route policy; do not manufacture it by signalling.
-                self._await_gone([identity],'idle retirement not reached in bound',seconds=90)
+                self._await_gone([identity],'idle retirement not reached in bound',
+                                 seconds=IDLE_RETIREMENT_SECONDS)
                 if not self.proc.gone(identity): raise Blocked('idle retirement not reached in bound')
+                # §13: Host stops the vendor before final daemon shutdown releases
+                # its locks. Wait for the natural idle end, without any CLI probe,
+                # so the next bootstrap cannot auto-start behind a saved live PID.
+                if self.daemon is None: raise Blocked('idle daemon identity absent')
+                self._await_gone([self.daemon],'daemon idle exit not reached in bound',
+                                 seconds=IDLE_RETIREMENT_SECONDS)
                 self._http=None; self._event_generation=None; self._idle_retired=True
             return {'stop_proven':True,'vendor_session_id':sid}
         if kind=='via_events':
@@ -2852,7 +2990,7 @@ print('VIA HELPER DONE')
                 row=self._json(raw)
                 _typed(row,{'pid':I,'start_ticks':I,'ready':B,'kind':S},'helper readiness')
                 identity=safety.Identity(row['pid'],row['start_ticks'])
-                self.proc.verify(identity)
+                self._verify(identity)
                 if row['kind']!=helper or not self._descends_from(identity,self.vendor_identity):
                     raise Blocked('helper readiness did not come from owned generation')
                 if row['ready'] is not True: return None
@@ -2949,9 +3087,9 @@ print('VIA HELPER DONE')
                      if self.helper_generations.get(identity)==predecessor]
             for identity in helpers:
                 alive=self.proc.alive(identity)
-                if alive is None: raise Blocked('predecessor helper identity unverifiable')
+                if alive is None: raise safety.process_block('helper',None,'predecessor helper identity unverifiable')
                 if alive is False: continue
-                self.proc.verify(identity)
+                self._verify(identity)
                 folder=self.helper_origins.get(identity)
                 name=self.helper_ledger[identity].get('kind')
                 if folder is None or type(name) is not str or not name.replace('-','').replace('_','').isalnum():
@@ -3027,7 +3165,7 @@ print('VIA HELPER DONE')
 
     def _descends_from(self,identity,ancestor):
         if ancestor is None: return False
-        self.proc.verify(identity); self.proc.verify(ancestor)
+        self._verify(identity); self._verify(ancestor)
         pid=identity.pid; seen=set()
         for _ in range(1000):
             if pid in seen: raise Blocked('process ancestry cycle')
@@ -3528,7 +3666,7 @@ print('VIA HELPER DONE')
         self._record('near-limit-seed',{'source':'synthetic queue seeding against real VIA receipt',
                      'owned_claim_verified':True,'count':len(data),'prompt_bytes':actual_prompt_bytes,
                      'cwd_json_bytes':cwd_bytes})
-        crashed=self.daemon; self.proc.verify(crashed); self.journal._signal(crashed,signal.SIGKILL)
+        crashed=self.daemon; self._verify(crashed); self.journal._signal(crashed,signal.SIGKILL)
         self._await_gone([crashed],'owned VIA crash absence unverifiable')
         if not self.proc.gone(crashed): raise Blocked('owned VIA crash absence unverifiable')
         self.daemon=None; self._armed={}; self._armed_history=set(); self._seam_targets={}

@@ -481,7 +481,7 @@ class ReadinessTests(unittest.TestCase):
 
     def test_ensure_vendor_never_bootstraps_when_existing_identity_is_unverifiable(self):
         self.driver._http = mock.Mock()
-        self.driver.proc.alive.return_value = None
+        self.driver.proc.alive.side_effect=lambda identity: True if identity==self.driver.daemon else None
         self.driver.proc.stat.return_value = {'pid': 13, 'start_ticks': 3, 'ppid': 12}
         self.driver._bootstrap_vendor = mock.Mock()
         with self.assertRaisesRegex(Blocked, 'vendor identity unverifiable'):

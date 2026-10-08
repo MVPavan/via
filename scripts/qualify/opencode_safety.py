@@ -140,6 +140,11 @@ def blocking_record(error, *, stage=None, vault=None, secret_forms=()):
     record.update(kind=kind if kind in kinds else 'UnexpectedException', reason=reason)
     os_failure=os_error_record(error)
     if os_failure is not None: record['os_error']=os_failure
+    if hasattr(error,'process_liveness') or 'process_role' in context:
+        role=getattr(error,'process_role',context.get('process_role','host'))
+        liveness=getattr(error,'process_liveness',None)
+        record['process']={'role':role if role in PROCESS_ROLES else 'host',
+                           'liveness':liveness if type(liveness) is bool else None}
     if stage is not None:
         record['stage'] = stage
     replies=getattr(error,'reply_evidence',None)
@@ -151,6 +156,17 @@ def blocking_record(error, *, stage=None, vault=None, secret_forms=()):
     if getattr(error,'mock_receipt_failed',False) is True:
         record['mock_receipt_failed']=True
     return record
+
+
+PROCESS_ROLES = frozenset({'daemon','anchor','vendor','host','helper'})
+
+
+def process_block(role, value, reason):
+    """Fixed role and tri-state liveness accompany process-proof failures (§13)."""
+    error=Blocked(reason)
+    error.process_role=role if role in PROCESS_ROLES else 'host'
+    error.process_liveness=value if type(value) is bool else None
+    return error
 
 
 def require_proof(value, reason):
@@ -276,7 +292,10 @@ class ProcReader:
             os.close(pidfd)
 
     def verify(self, identity):
-        require_proof(self.alive(identity), "owned process is not verified alive")
+        value=self.alive(identity)
+        if value is not True:
+            raise process_block(_BLOCK_CONTEXT.get().get('process_role','host'),value,
+                                "owned process is not verified alive")
 
     def gone(self, identity):
         return self.alive(identity) is False
@@ -1422,7 +1441,8 @@ class OwnedHTTP:
                 raise Blocked("credential endpoint forbidden")
         if ambiguous:
             raise Blocked("ambiguous API path")
-        self.proc.verify(self.identity)
+        with block_context(process_role='vendor'):
+            self.proc.verify(self.identity)
         parts = urllib.parse.urlsplit(self.origin)
         headers = {"Content-Type": "application/json"}
         if authenticated:
@@ -1443,7 +1463,8 @@ class OwnedHTTP:
                                                         deadline=deadline, limit=self.limit, observe=observe)
             if 300 <= status < 400:
                 raise Blocked("owned API redirect refused")
-            self.proc.verify(self.identity)
+            with block_context(process_role='vendor'):
+                self.proc.verify(self.identity)
             return status, data
         except (OSError, http.client.HTTPException) as error:
             raise Blocked("owned API observation unavailable") from error
@@ -1484,7 +1505,8 @@ class StopJournal:
         self.recovery_fact = None
 
     def _signal(self, identity, signum):
-        self.proc.verify(identity)
+        role='anchor' if signum==signal.SIGKILL else 'daemon'
+        with block_context(process_role=role): self.proc.verify(identity)
         if self.sender is not None:
             # An injected sender is only for synthetic-proc self-tests.
             self.sender(identity.pid, signum)
@@ -1495,7 +1517,7 @@ class StopJournal:
         try:
             pidfd = os.pidfd_open(identity.pid)
             try:
-                self.proc.verify(identity)
+                with block_context(process_role=role): self.proc.verify(identity)
                 signal.pidfd_send_signal(pidfd, signum)
             finally:
                 os.close(pidfd)
@@ -1503,7 +1525,7 @@ class StopJournal:
             raise Blocked("stable owned signal failed") from error
 
     def stop(self, identity):
-        self.proc.verify(identity)
+        with block_context(process_role='daemon'): self.proc.verify(identity)
         if self.path.exists():
             raise Blocked("stopped-daemon recovery journal already exists")
         data = json.dumps({"version": 1, **identity.report()}).encode()
@@ -1545,12 +1567,12 @@ class StopJournal:
             else:
                 alive = self.proc.alive(identity)
                 if alive is None:
-                    raise Blocked("stopped-daemon journal identity uncertain; retained")
+                    raise process_block('daemon',None,"stopped-daemon journal identity uncertain; retained")
                 after = self.proc.stat(identity.pid)
                 if after is not None and after["start_ticks"] != identity.start_ticks:
                     alive, proof = False, "pid_reused"
         except Blocked as error:
-            raise Blocked("stopped-daemon journal identity uncertain; retained") from error
+            raise process_block('daemon',None,"stopped-daemon journal identity uncertain; retained") from error
         if alive is False:
             self.path.unlink()
             self.recovery_fact = {"identity": identity.report(),

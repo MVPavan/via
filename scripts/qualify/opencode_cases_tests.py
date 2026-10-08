@@ -976,6 +976,8 @@ class ConfiguredLspDriverTests(unittest.TestCase):
 
     def fixture_driver(self, root, *, spawned=True, actual_read=True, cleanup_error=False):
         driver = transport.Driver.__new__(transport.Driver)
+        driver.daemon_generations=[]
+        driver.server_identities=set(); driver.helper_ledger={}
         project = root / "probe"
         project.mkdir()
         folder = root / "helpers"

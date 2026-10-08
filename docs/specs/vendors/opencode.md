@@ -1321,6 +1321,24 @@ does not alter later session-count or retirement observations. Failure and
 cleanup abort all outstanding holds. This exception adds no C1 API, result
 field or outcome and permits no paid provider/model.
 
+**Qualification daemon-generation amendment (owner, 2026-10-08):**
+The runner exercises VIA's designed 60 s daemon idle exit without keepalives.
+Retirement waits for both the vendor and daemon to exit (90 s for each,
+clipped to the phase deadline), using process observations only. Vendor death
+can precede the daemon's final shutdown and lock release; returning during that
+interval could let a CLI auto-start a successor behind the saved daemon identity.
+A saved pid/start-tick identity is replaced only when liveness is definitively
+false, both private daemon/Store locks are released, the private Store has no
+open accepted work, and `via.log` contains the generation's own clean `idle`
+`daemon_shutdown` record. A bounded log checkpoint taken before each start
+excludes shutdown records from older generations (including one log rotation).
+Missing, incomplete, non-idle or unverifiable evidence blocks. The next private
+CLI acquisition identifies the new daemon through its status reply and both
+owned locks, using the same private state/runtime/HOME as the first start.
+Each start and proven clean idle end is retained as a numbered generation;
+every process-verification block retains a fixed role and false/unknown
+liveness. No daemon identity is renewed from elapsed time alone.
+
 **Qualification run-root amendment (owner, 2026-10-07; isolation ruling 2026-10-08):**
 Every vendor/VIA-visible controlled path lives under one fresh, owned 0700
 `via-oc-qual.*` root directly inside the invoking user's `XDG_RUNTIME_DIR`:
