@@ -640,6 +640,14 @@ applied: the session runs on the same server, its effective state is
 `config_switch_unverified`. Skills are the one category a session can turn
 off, by its own permission rule (§5).
 
+In default/skills-on sessions, pinned OpenCode 2.0.22 also loads skill
+descriptions from directories above the project's Git root (qualification
+attempt 15, native `instruction_state` and `instruction_blob`, confirmed
+2026-10-07). The effective skills state remains `unknown`. Skills requested
+`off` still uses the session deny rule; whether that rule also removes ancestor
+skill descriptions from instructions is **unverified**: attempt 15 did not
+exercise skills-off. Ancestor `AGENTS.md` did not cross the nested Git boundary.
+
 C1 freezes effective states at spawn, so the frozen state is what the recipe
 guarantees; later evidence (`/api/mcp`, `/api/plugin`, instruction deltas)
 is a diagnostic only.
@@ -647,7 +655,7 @@ is a diagnostic only.
 | Category (OD2 default) | Requested on | Requested off |
 |---|---|---|
 | instruction files (on) | `unknown`: project `AGENTS.md` per location loads (E12, E54); user-level instructions are private and empty | `unknown`: not applied, project files still load |
-| skills (on) | `unknown`: project skills load (E12); user-level skills are private and empty | `off`: session rule `{skill,*,deny}` (§5, E12) |
+| skills (on) | `unknown`: project and ancestor skills above the Git root load (E12; qualification attempt 15); user-level skills are private and empty | `off`: session rule `{skill,*,deny}` (§5, E12) |
 | agents (on) | `unknown`: project agents load (source), no inventory (`/api/agent` returns `[]`, E11); VIA always runs its own `via` agent | `unknown`: not applied |
 | plugins (on) | `unknown`: project plugins load (source) | `unknown`: not applied |
 | MCP servers (off) | `unknown`: project MCP loads (source) | `unknown`: not applied; the MCP resource helpers are denied (§5) |
@@ -1313,16 +1321,34 @@ does not alter later session-count or retirement observations. Failure and
 cleanup abort all outstanding holds. This exception adds no C1 API, result
 field or outcome and permits no paid provider/model.
 
-The private namespace's 0700 directory chain and fixture Git repositories with
-private initial commits prevent untested ancestor walk-up. A mandatory sentinel
-control proves the boundary before model qualification. The minimal PATH links
-the exact checked system `rg`; fake LSP and local helpers avoid vendor installs.
-Inventory covers private HOME/XDG, namespace and fixture `.opencode` roots;
-credential files are inspected by existence/mode only. A failed boundary or
-package/binary addition blocks, subject only to the qualification exceptions below.
-The coordinator's 2026-10-07 ruling permits
-short private `/tmp/via-*` roots for hand-started processes when a scratchpad
-socket path is too long; fixture project/namespace roots remain in the worktree.
+**Qualification run-root amendment (owner, 2026-10-07):** Every vendor/VIA-visible
+controlled path lives under one fresh, owned 0700 `/tmp/via-oc-qual.*` root:
+fixture projects, namespace cwd, HOME/XDG/TMPDIR, all VIA states/runtime,
+vendor namespaces, helpers, prompt/failpoint files and private copies of both
+VIA builds and the pinned vendor executable. No repository path is handed to
+them. System tools remain verified system executables. Only sanitized evidence
+is written to the worktree's scratchpad, through the existing secrecy controls.
+The ancestor preflight checks every parent through `/`, by existence only, for
+`.claude`, `.agents`, `.claude/skills`, `.agents/skills`, `.claude/agents`, `.opencode`,
+`opencode.json`, `opencode.jsonc`, `AGENTS.md`, `CLAUDE.md` and `.git`
+(E12/E13 and pinned-binary strings); any present or unverifiable discovery
+source blocks. Evidence records the names and ancestor path classes.
+
+Private initial Git commits and the exact namespace's 0700 chain remain.
+The nested boundary/control sentinel stays inside its owned outer fixture.
+Ancestor instructions crossing the Git boundary, a missing local marker or
+an insensitive control still stops qualification. Ancestor skills crossing is
+a **record-only vendor finding**, with native instruction-state references,
+independent blob SHA-256 hashes and marker Booleans; it is neither a pass nor
+a stop. The ancestor control must remain sensitive to both markers. After
+owned-process/pgrep/lock absence proof, retain allow-listed native session,
+message, instruction, log and consistent VIA Store projections, reapply the
+secrecy scan, and remove the private run root with an absence record. Raw
+storage, log text, credentials and bearer handles are never copied to evidence.
+The minimal PATH links the exact checked system `rg`; fake LSP/local helpers
+avoid vendor installs. Inventory still covers all private HOME/XDG, namespace
+and fixture `.opencode` roots. Credential files remain existence/mode only;
+package/binary additions still block except the reviewed exceptions below.
 
 **Qualification inventory amendment (owner, 2026-10-07):** OpenCode 2.0.22's
 Bun executable extracts multiple embedded runtime objects as its native
@@ -1487,7 +1513,13 @@ Derive the preflight request ceiling from its actual turn pattern: one labelled
 bootstrap plus each repository sentinel, times the observed two requests per
 mock turn. The current three sentinels yield eight mock requests and zero
 public requests. Persist each sentinel's received count even if its turn blocks;
-the bootstrap has its own labelled receipt. After stopping providers, retain
+the bootstrap has its own labelled receipt. A sentinel receipt explicitly
+includes any re-bootstrap traffic during its spawn and records that bootstrap
+count, so it is not a pure sentinel-only request count. Receipt publication
+failure has a distinct `mock_receipt_failed` flag and never replaces the first
+block or claims a reply-retention failure. Refresh the HTTP phase deadline
+before every admission read, including when a generation survives a phase.
+After stopping providers, retain
 the aggregate physical received count, including rejected requests, rather than
 reporting it unavailable. Crossing the derived ceiling still sets the stop latch
 and blocks. Receipts and the bootstrap are diagnostic records, never gates.

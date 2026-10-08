@@ -154,6 +154,7 @@ class ConfigTests(unittest.TestCase):
                     d._last_auxiliary_bindings=d._auxiliary_bindings(safety.MOCK_IDENTITY)
             d._materialize_fixture=mock.Mock(side_effect=materialize)
             d._mock_turn=mock.Mock(side_effect=turn)
+            d._instruction_facts=mock.Mock(return_value=[{'source':'FAKE-native-instruction-state'}])
             with mock.patch.object(safety,'init_fixture_repo',side_effect=lambda path,*_a,**_k:Path(path).mkdir(parents=True,exist_ok=True)), \
                  mock.patch.object(transport.time,'sleep') as sleep:
                 self.assertTrue(d._repository_sentinel()['namespace_boundary'])

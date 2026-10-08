@@ -15,6 +15,13 @@ from opencode_safety import Blocked
 
 
 class EntryTests(unittest.TestCase):
+    def setUp(self):
+        # Entry tests script admission; ancestor discovery is independently tested.
+        ancestors=patch.object(opencode.runroots,'check_ancestors',return_value={
+            'checked_names':list(opencode.runroots.DISCOVERY_NAMES),
+            'ancestors':['temporary-directory','filesystem-root'],'clear':True})
+        ancestors.start();self.addCleanup(ancestors.stop)
+
     def test_optional_real_via_skips_are_reported_without_passing_as_executed(self):
         class Optional(unittest.TestCase):
             def runTest(self): self.skipTest('optional real-VIA audit: binaries absent')

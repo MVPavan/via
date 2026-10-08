@@ -237,7 +237,7 @@ class Driver:
 
     def __init__(self,release=None,failpoints=None,pinned=None,evidence=None,*,
                  via_release=None,via_failpoints=None,opencode=None,signals=None,
-                 proc=None,execute=None,initialize=False,public_free=False,mock_origins=(),rg=None,ownership=None,git_templates=None):
+                 proc=None,execute=None,initialize=False,public_free=False,mock_origins=(),rg=None,ownership=None,git_templates=None,run_root=None):
         release=release if release is not None else via_release
         failpoints=failpoints if failpoints is not None else via_failpoints
         pinned=pinned if pinned is not None else opencode
@@ -269,8 +269,11 @@ class Driver:
         self.automatic_models_proven=False
         self._catalog_evidence=None
         self.phase_deadline=None; self.phase_kind=None; self.stop_result=None
-        self.state=self.evidence/'state'; self.runtime=self.evidence/'runtime'
-        self.helpers=self.evidence/'helpers'; self.home=self.evidence/'home'
+        self.work=Path(run_root).resolve() if run_root is not None else self.evidence
+        self.external_root=run_root is not None
+        if self.external_root: self.ownership.register(self.work,'helper',recursive=False)
+        self.state=self.work/'state'; self.runtime=self.work/'runtime'
+        self.helpers=self.work/'helpers'; self.home=self.work/'home'
         self.ownership.register_state(self.state)
         self.ownership.register(self.home,'vendor-private')
         self.ownership.register(self.helpers,'helper')
@@ -302,9 +305,9 @@ class Driver:
         self.reply_evidence=ReplyEvidence(self._record,self._reply_protected,self._reply_context,
             vault=self.vault,secret_forms=lambda:(*self.secret_forms,*self.bearer_forms))
         self.git_templates=safety.GitTemplateCopies(
-            self.evidence,git_templates or {},lambda value:self._record('git-template-copy',value))
+            self.work,git_templates or {},lambda value:self._record('git-template-copy',value))
         self.embedded_runtime=safety.EmbeddedRuntime(
-            self.pinned,self.evidence,lambda value:self._record('embedded-runtime',value),
+            self.pinned,self.work,lambda value:self._record('embedded-runtime',value),
             deadline=lambda:min(self.phase_deadline or float('inf'),
                 self._bootstrap_deadline if self._bootstrap_active and self._bootstrap_deadline
                 is not None else float('inf'),self._observation_deadline or float('inf')))
@@ -335,8 +338,8 @@ class Driver:
 
     def _reply_context(self):
         project=Path(self.project) if self.project is not None else None
-        location=project.relative_to(self.evidence).as_posix() if project is not None \
-            and project.is_relative_to(self.evidence) else 'unregistered'
+        location=project.relative_to(self.work).as_posix() if project is not None \
+            and project.is_relative_to(self.work) else 'unregistered'
         if self._reply_protected(location.encode()): location='redacted'
         return {'location':location}
 
@@ -379,18 +382,21 @@ class Driver:
 
     def prepare(self):
         """Create exact namespace/private roots and reviewed minimal PATH (N1–N3,N8,N9)."""
+        if self.external_root:
+            self._copy_programs()
         for directory in (self.home,self.state,self.helpers):
             safety.private_directory(directory)  # Already registered at initial handoff.
         self.namespace,self.namespace_env=self._create_namespace()
         safety.init_fixture_repo(self.namespace,self.home)
         path,rg_proof=safety.build_minimal_path(self.helpers,self.rg)
         if len(os.fsencode(self.runtime))+ANCHOR_SOCKET_TAIL>SOCKET_BYTES:
+            if self.external_root: raise Blocked('private run root socket path exceeds bound')
             # Coordinator ruling N9 explicitly authorizes short /tmp/via-* runtime roots.
             self.runtime=Path(tempfile.mkdtemp(prefix='via-ocl.',dir='/tmp'))
             self.ownership.register(self.runtime,'via-owned',runtime=True)
             self._record('runtime',{'short_root':True,'authority':'coordinator N9 socket ruling'})
         else: safety.private_directory(self.runtime)
-        self.env={key:str(self._directory(self.evidence/('daemon-'+part),'via-owned'))
+        self.env={key:str(self._directory(self.work/('daemon-'+part),'via-owned'))
                   for key,part in safety.PRIVATE_PARTS.items()}
         self.env.update(PATH=path,LANG='C.UTF-8',VIA_STATE_DIR=str(self.state),
                         VIA_RUNTIME_DIR=str(self.runtime))
@@ -398,9 +404,21 @@ class Driver:
         # Inventory excludes helper rg's reviewed symlink; it covers Bun's HOME cache too.
         self.inventory=safety.Inventory([self.namespace.parent,self.home,
                                         *(Path(value) for value in self.env.values()
-                                          if value.startswith(str(self.evidence/'daemon-')))],
+                                          if value.startswith(str(self.work/'daemon-')))],
                                         embedded_runtime=self.embedded_runtime,git_templates=self.git_templates)
         self.recover_stopped()
+
+    def _copy_programs(self):
+        """Execute only private copies bound to the admitted source/build hashes (§13)."""
+        import opencode_runroot as roots
+        binary_root=self._directory(self.work/'bin','helper')
+        safety.verify_binary(self.pinned)
+        self.pinned=roots.copy_program(self.pinned,binary_root/'opencode')
+        self.paths={kind:roots.copy_program(path,binary_root/('via-'+kind))
+                    for kind,path in self.paths.items()}
+        binary_root.chmod(0o500)
+        safety.verify_binary(self.pinned)
+        self.embedded_runtime.pinned=self.pinned
 
     def recover_stopped(self):
         """Recover the parent-root persisted SIGSTOP identity after verified PID/ticks (N6)."""
@@ -434,7 +452,7 @@ class Driver:
         """Initialize and commit a private fixture Git boundary, never the worktree Git."""
         if not name or not name.replace('-','').replace('_','').isalnum() or name in self.fixtures:
             raise Blocked('unsafe or duplicate fixture name')
-        root=self._directory(self.evidence/'fixtures','vendor-private')
+        root=self._directory(self.work/'fixtures','vendor-private')
         project=self.ownership.register(root/name,'vendor-private')
         safety.init_fixture_repo(project,self.home)
         opencode=self._directory(project/'.opencode','vendor-private')
@@ -495,7 +513,7 @@ class Driver:
         env=dict(self.env)
         env.pop('VIA_FAILPOINT_DIR',None); env.pop('VIA_FAILPOINT_TOKEN',None)
         if kind=='failpoints':
-            directory=self._directory(self.evidence/('failpoints-'+secrets.token_hex(8)))
+            directory=self._directory(self.work/('failpoints-'+secrets.token_hex(8)))
             self._token=secrets.token_hex(24)
             env.update(VIA_FAILPOINT_DIR=str(directory),VIA_FAILPOINT_TOKEN=self._token)
         elif kind!='release': raise Blocked('invalid VIA build selection')
@@ -592,7 +610,7 @@ class Driver:
                     raw=prompt.encode()
                     if self.vault.leaks(raw) or any(form and form in raw for form in self.secret_forms):
                         raise Blocked('private prompt file would contain a protected secret')
-                    prompt_path=self.ownership.register(self.evidence/('prompt-'+secrets.token_hex(8)+'.tmp'),
+                    prompt_path=self.ownership.register(self.work/('prompt-'+secrets.token_hex(8)+'.tmp'),
                                                         'runner-evidence',directory=False)
                     fd=os.open(prompt_path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
                     with os.fdopen(fd,'wb') as output: output.write(raw)
@@ -1177,7 +1195,7 @@ class Driver:
         if checked_identity is not None: self._approved_model(checked_identity)
         self._catalog_evidence=None
         project=Path(self.project)
-        location=project.relative_to(self.evidence).as_posix() if project.is_relative_to(self.evidence) \
+        location=project.relative_to(self.work).as_posix() if project.is_relative_to(self.work) \
                  else 'unregistered'
         def protected(raw):
             return self.vault.leaks(raw) or any(form and form in raw
@@ -1236,6 +1254,7 @@ class Driver:
             ref=body['model']; _typed(ref,{'providerID':S,'id':S},'direct requested model')
             self._approved_model(ref['providerID']+'/'+ref['id'])
         self.ensure_vendor()
+        self._http.deadline=self.phase_deadline
         path_session=None
         if path:
             parts=urllib.parse.urlsplit(path).path.split('/')
@@ -2322,7 +2341,7 @@ class Driver:
 
     def _pgrep_clear(self):
         """Targeted read-only pgrep, never signals a name/marker match."""
-        rc,out,_=self.execute(['/usr/bin/pgrep','-f','--',str(self.evidence)],env=self.env,timeout=10)
+        rc,out,_=self.execute(['/usr/bin/pgrep','-f','--',str(self.work)],env=self.env,timeout=10)
         if rc not in {0,1}: return None
         if rc==1: return True
         try: pids={int(line) for line in out.splitlines()}
@@ -2716,7 +2735,7 @@ print('VIA HELPER DONE')
             return self._operation('idle_retirement',args)
         if kind=='namespace':
             self.stop()
-            self.state=self.ownership.register_state(self.evidence/'l11-state')
+            self.state=self.ownership.register_state(self.work/'l11-state')
             safety.private_directory(self.state)
             self.namespace,self.namespace_env=self._create_namespace()
             safety.init_fixture_repo(self.namespace,self.home)
@@ -3036,6 +3055,13 @@ print('VIA HELPER DONE')
             self.mock_providers.clear()
         if failures: raise failures[0]
         safety.verify_binary(self.pinned)
+        if self.external_root:
+            for kind,path in self.paths.items():
+                expected=self.build_hashes.get(kind)
+                if expected is not None and safety.sha256(path)!=expected:
+                    raise Blocked('private VIA build changed during qualification')
+            from opencode_runroot import native_facts
+            self._record('native-records',{'sources':native_facts(self.work,self._reply_protected,self.ownership)})
         scan=self.secrecy_scan()
         if scan['secret_absent'] is not True or scan['payload_captures']!=0:
             raise Blocked('final secrecy scan failed')
@@ -3092,6 +3118,7 @@ print('VIA HELPER DONE')
         if len(names)!=1 or names[0] not in self.mock_providers:
             raise Blocked('mock fixture receipt identity unavailable')
         name=names[0];provider=self.mock_providers[name];before=provider.requests
+        bootstrap_before=self._bootstrap_count
         failure=None
         try:
             receipt=self.via(['spawn','--harness','opencode','--model',safety.MOCK_IDENTITY,
@@ -3105,14 +3132,25 @@ print('VIA HELPER DONE')
         finally:
             try:
                 self._record('mock-receipt',{'fixture':name,'received_requests':provider.requests-before,
-                    'label':'sentinel','charged':'mock-only','gate':False})
+                    'label':'sentinel','charged':'mock-only','gate':False,
+                    'count_scope':'includes-rebootstrap-traffic',
+                    'rebootstraps_during_turn':self._bootstrap_count-bootstrap_before})
             except BaseException:
                 if failure is None: raise
-                failure.reply_retention_failed=True
+                failure.mock_receipt_failed=True
+
+    def _instruction_facts(self):
+        """Read owned native instruction-state hashes/marker Booleans only (§13)."""
+        from opencode_runroot import instruction_facts
+        rows=[]
+        for database in sorted(self.namespace.rglob('opencode.db')):
+            rows.extend(instruction_facts(database))
+        if not rows: raise Blocked('native instruction-state evidence unavailable')
+        return rows
 
     def _repository_sentinel(self):
         """First model-capable phase uses only loopback controls with nested Git sentinels."""
-        outer=self._directory(self.evidence/'ancestor-fixture','vendor-private')
+        outer=self._directory(self.work/'ancestor-fixture','vendor-private')
         safety.init_fixture_repo(outer,self.home,sentinel=True)
         nested=self.ownership.register(outer/'project-boundary','vendor-private')
         safety.init_fixture_repo(nested,self.home)
@@ -3134,10 +3172,15 @@ print('VIA HELPER DONE')
             boundary_results.append(receipt)
         project,control,namespace=boundary_results
         if not control['ancestor_agents'] or not control['ancestor_skills']:
-            raise Blocked('ancestor sentinel control not sensitive; outside-repo fallback needs owner')
+            raise Blocked('ancestor sentinel control not sensitive')
         for result in (project,namespace):
-            if not result['local_marker'] or result['ancestor_agents'] or result['ancestor_skills']:
+            if not result['local_marker'] or result['ancestor_agents']:
                 raise Blocked('vendor repository walk-up crossed private Git boundary')
+        native=self._instruction_facts()
+        self._record('ancestor-skills',{'disposition':'record-only','gate':False,
+            'crossed':project['ancestor_skills'],'namespace_crossed':namespace['ancestor_skills'],
+            'native_instruction_state':native,'marker_receipts':[{key:row[key] for key in
+                ('local_marker','ancestor_agents','ancestor_skills')} for row in boundary_results]})
         models=[]
         for result in boundary_results:
             observed=result.get('models')
@@ -3147,7 +3190,7 @@ print('VIA HELPER DONE')
         self.admit_automatic_models(models,mock_received=all(row['received'] for row in boundary_results),
                                     configuration_immutable=bool(self._last_auxiliary_bindings))
         return {'project_boundary':True,'namespace_boundary':True,'ancestor_control_sensitive':True,
-                'ancestor_skills_absent':True,'ancestor_agents_absent':True,'private_git_commit':True}
+                'ancestor_agents_absent':True,'private_git_commit':True}
 
     def _foreign_observation(self,session,args,held=False):
         if not hasattr(self,'_foreign'): raise Blocked('foreign input not injected')

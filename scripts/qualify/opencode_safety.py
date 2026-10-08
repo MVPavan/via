@@ -116,6 +116,8 @@ def blocking_record(error, *, stage=None, vault=None, secret_forms=()):
             and re.fullmatch(r'[0-9]+-reply-block\.json',name)]
     if getattr(error,'reply_retention_failed',False) is True:
         record['reply_retention_failed']=True
+    if getattr(error,'mock_receipt_failed',False) is True:
+        record['mock_receipt_failed']=True
     return record
 
 

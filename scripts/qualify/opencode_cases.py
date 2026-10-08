@@ -434,7 +434,7 @@ def case_preflight(driver: CaseDriver, case: Case) -> None:
     case.check("launch observation began before request", member(observation, "watch_before", bool))
     sentinel = driver.execute("repository_sentinel")
     for key in ("project_boundary", "namespace_boundary", "ancestor_control_sensitive",
-                "ancestor_skills_absent", "ancestor_agents_absent", "private_git_commit"):
+                "ancestor_agents_absent", "private_git_commit"):
         case.check(key, member(sentinel, key, bool))
 
 

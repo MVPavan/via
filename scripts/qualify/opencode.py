@@ -24,6 +24,7 @@ import unittest
 
 import opencode_cases as cases
 import opencode_safety as safety
+import opencode_runroot as runroots
 from opencode_ownership import OwnershipRegistry
 
 REPO = Path(__file__).resolve().parents[2]
@@ -49,7 +50,7 @@ VERSION = "2.0.22"
 E7_SHA256 = "540fdf565da27de9df69b6c3864582344e74ac4ffa225c283b289481d215d241"
 TEST_MODULES = ("opencode_safety_tests", "opencode_cases_tests", "opencode_driver_tests", "opencode_readiness_tests",
                 "opencode_barrier_tests", "opencode_runtime_tests", "opencode_tests", "opencode_ownership_tests", "opencode_via_tests",
-                "opencode_reply_tests", "opencode_review_tests", "opencode_config_tests")
+                "opencode_reply_tests", "opencode_review_tests", "opencode_config_tests", "opencode_isolation_tests")
 _ACQUISITION_ROOT = None
 
 
@@ -354,6 +355,7 @@ def main(argv=None):
             safety.private_directory(root)
     vault = safety.PasswordVault()
     records, cleanup, driver = [], {}, None
+    run_root = None
     current_phase, phase_rows = 'setup', []
     phases = selected_phases(args.phase)
     info = {"runner": "scripts/qualify/opencode.py", "vendor_version": VERSION,
@@ -405,14 +407,18 @@ def main(argv=None):
             fake_gates = verify_fake_gates(args.fake_gate_manifest, args.via_release,
                                           args.via_failpoints)
             info["system_tools"] = system_tools_preflight()
-            template_probe=ownership.register(args.evidence/'git-template-preflight','helper')
+            run_root=runroots.create_run_root()
+            ownership.register(run_root,'helper',recursive=False)
+            info['run_root']={'name':run_root.name,'path_class':'private-external-run-root'}
+            info['ancestor_discovery']=runroots.check_ancestors(run_root)
+            template_probe=ownership.register(run_root/'git-template-preflight','helper')
             templates,info['git_templates']=safety.system_git_templates(template_probe)
             pinned = acquire(args.evidence, ownership) if args.acquire else args.opencode.resolve()
             safety.verify_binary(pinned)
             from opencode_driver import Driver
             driver = Driver(via_release=args.via_release, via_failpoints=args.via_failpoints,
                             opencode=pinned, evidence=args.evidence, signals=signals,
-                            public_free=True, initialize=False, ownership=ownership,git_templates=templates)
+                            public_free=True, initialize=False, ownership=ownership,git_templates=templates,run_root=run_root)
             vault = driver.vault
             driver.fake_gate_manifest = fake_gates
             # A fresh evidence path must still find the previous stopped-daemon
@@ -448,6 +454,7 @@ def main(argv=None):
         except BaseException as error:
             # No arbitrary exception string can leak a password, handle or raw response.
             info["runner_error"] = type(error).__name__
+            if hasattr(error,'ancestor_discovery'): info['ancestor_discovery']=error.ancestor_discovery
             retain_block(error, 'runner')
         finally:
             info["failure_order"] = [{"stage": "case", "case": row["case"], "result": row["result"]}
@@ -483,6 +490,25 @@ def main(argv=None):
             except BaseException as error:
                 info['proof_error'] = type(error).__name__
                 retain_block(error, 'proof')
+            if run_root is not None:
+                try:
+                    root_proof=cleanup if cleanup.get('proven') is True else None
+                    # Before any owned process was admitted, only the synchronous
+                    # template probe can have used this root; it has already returned.
+                    unused=driver is None or getattr(driver,'external_root',False) is not True \
+                        or not getattr(driver,'identities',()) and getattr(driver,'daemon',None) is None
+                    if unused and not root_proof:
+                        import subprocess
+                        result=subprocess.run(['/usr/bin/pgrep','-f','--',str(run_root)],
+                            capture_output=True,timeout=10,check=False)
+                        root_proof={'proven':result.returncode==1,'processes_gone':result.returncode==1,
+                                    'pgrep_clear':result.returncode==1}
+                    removed=runroots.remove_run_root(run_root,root_proof or {})
+                    info['run_root_cleanup']=removed
+                except BaseException as error:
+                    info['cleanup_error']=type(error).__name__
+                    with safety.block_context(phase='cleanup',case=None,verb=None):
+                        retain_block(error,'cleanup')
             info.update(summary_verdict(records, phases, cleanup, bool(signals.interrupted)))
             if any(key in info for key in ("runner_error", "cleanup_error", "proof_error")) \
                     or signals.interrupted:
